@@ -1434,7 +1434,6 @@ fn apply_sorted_pivot_tail(
 /// fixed block with a branchless `&=` accumulator gives a countable inner loop that
 /// widens to a packed compare, and the early exit survives at block granularity.
 fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
-    const BLOCK: usize = 8;
     let bound = left.len().min(right.len());
     // MEASUREMENT-ONLY ARM, AND IT PRODUCES WRONG ANSWERS ON PURPOSE. Claiming the whole
     // compared region matches skips every column read the comparison performs, which is
@@ -1451,12 +1450,34 @@ fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
     if SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
         return bound;
     }
-    let mut span = 0usize;
+    let span = scan_matched_prefix(left, right, bound);
+    // THE VALID A/B ARM. Running the identical scan a second time and discarding the
+    // answer holds WORK constant — the factorization is bit-identical because the returned
+    // value is unchanged — so a whole-program totals diff isolates the marginal cost of one
+    // comparison with no line attribution. `black_box` stops the optimizer folding the two
+    // passes, which would silently make the arm measure nothing.
+    if SPLU_DOUBLE_COLUMN_COMPARE_MEASUREMENT_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        let repeated = scan_matched_prefix(left, right, bound);
+        std::hint::black_box(repeated);
+        SPLU_DOUBLE_COLUMN_COMPARE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     #[cfg(test)]
     MATCHED_RUN_PROFILE.with(|cell| {
         let (calls, total_span, total_bound) = cell.get();
-        cell.set((calls + 1, total_span, total_bound + bound));
+        cell.set((calls + 1, total_span + span, total_bound + bound));
     });
+    #[cfg(test)]
+    LAST_MATCHED_RUN.with(|cell| cell.set(span));
+    span
+}
+
+/// The comparison itself: length of the common prefix of `left` and `right` within `bound`.
+///
+/// Split out of `matched_run_length` so it can be invoked twice by the measurement arm.
+/// The shipping path calls it exactly once and it inlines as before.
+fn scan_matched_prefix(left: &[u32], right: &[u32], bound: usize) -> usize {
+    const BLOCK: usize = 8;
+    let mut span = 0usize;
     while span + BLOCK <= bound {
         let mut all_equal = true;
         for offset in 0..BLOCK {
@@ -1470,15 +1491,9 @@ fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
     while span < bound && left[span] == right[span] {
         span += 1;
     }
-    #[cfg(test)]
-    MATCHED_RUN_PROFILE.with(|cell| {
-        let (calls, total_span, total_bound) = cell.get();
-        cell.set((calls, total_span + span, total_bound));
-    });
-    #[cfg(test)]
-    LAST_MATCHED_RUN.with(|cell| cell.set(span));
     span
 }
+
 
 
 #[derive(Debug, Clone, Copy)]
@@ -14075,6 +14090,83 @@ mod tests {
     }
 
     #[test]
+    fn doubled_column_compare_is_bit_identical_and_takes_effect() {
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        assert!(
+            !SPLU_DOUBLE_COLUMN_COMPARE_MEASUREMENT_ONLY.load(Ordering::Relaxed),
+            "the doubling arm must ship disabled"
+        );
+
+        // BIT-IDENTITY IS THE VALIDITY CONTROL THE SKIP ARM COULD NOT SATISFY. Requiring it
+        // is what distinguishes an arm that costs more doing the same work from one that
+        // does different (or less) work -- the confound that made the skip arm's totals
+        // meaningless.
+        let matrix = splu_dirichlet_laplacian_3d(8);
+        let single = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("single-compare factorization");
+
+        SPLU_DOUBLE_COLUMN_COMPARE_HITS.store(0, Ordering::Relaxed);
+        SPLU_DOUBLE_COLUMN_COMPARE_MEASUREMENT_ONLY.store(true, Ordering::Relaxed);
+        let doubled = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("doubled-compare factorization");
+        let hits = SPLU_DOUBLE_COLUMN_COMPARE_HITS.load(Ordering::Relaxed);
+        SPLU_DOUBLE_COLUMN_COMPARE_MEASUREMENT_ONLY.store(false, Ordering::Relaxed);
+
+        assert_eq!(doubled.row_perm, single.row_perm, "row_perm");
+        assert_eq!(doubled.fill_perm, single.fill_perm, "fill_perm");
+        assert_eq!(
+            factor_value_bits(&doubled.l_rows),
+            factor_value_bits(&single.l_rows),
+            "L bits must be identical -- doubling changes cost, never results"
+        );
+        assert_eq!(
+            factor_value_bits(&doubled.u_rows),
+            factor_value_bits(&single.u_rows),
+            "U bits must be identical"
+        );
+
+        // ENABLED IS NOT THE SAME AS TOOK EFFECT. Without this the optimizer could fold
+        // the second pass away and the A/B would measure nothing while looking healthy.
+        assert!(hits > 0, "the doubling arm must actually execute extra passes, got {hits}");
+
+        // And it must not fire when disabled, or the counter is measuring the wrong thing.
+        SPLU_DOUBLE_COLUMN_COMPARE_HITS.store(0, Ordering::Relaxed);
+        NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("disabled-arm factorization");
+        assert_eq!(
+            SPLU_DOUBLE_COLUMN_COMPARE_HITS.load(Ordering::Relaxed),
+            0,
+            "the doubling arm fired while disabled"
+        );
+    }
+
+    #[test]
+    #[ignore = "A/B totals arm: run under callgrind, comparison run ONCE (shipping)"]
+    fn ab_totals_compare_single() {
+        let matrix = splu_dirichlet_laplacian_3d(10);
+        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("factorization");
+        println!("arm=compare-single n={}", lu.n);
+    }
+
+    #[test]
+    #[ignore = "A/B totals arm: run under callgrind, comparison run TWICE (same result)"]
+    fn ab_totals_compare_doubled() {
+        use std::sync::atomic::Ordering;
+        SPLU_DOUBLE_COLUMN_COMPARE_MEASUREMENT_ONLY.store(true, Ordering::Relaxed);
+        let matrix = splu_dirichlet_laplacian_3d(10);
+        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("factorization");
+        let hits = SPLU_DOUBLE_COLUMN_COMPARE_HITS.load(Ordering::Relaxed);
+        SPLU_DOUBLE_COLUMN_COMPARE_MEASUREMENT_ONLY.store(false, Ordering::Relaxed);
+        println!("arm=compare-doubled n={} extra_passes={hits}", lu.n);
+    }
+
+    #[test]
     #[ignore = "A/B totals arm: run under callgrind, comparison ENABLED (shipping behaviour)"]
     fn ab_totals_column_compare_enabled() {
         let matrix = splu_dirichlet_laplacian_3d(10);
@@ -24161,6 +24253,28 @@ pub static SPLU_PARTIAL_INPLACE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
 ///
 /// Kept rather than deleted so the invalidation is visible instead of rediscovered.
 /// Never enable outside a measurement. Default off, pinned by a test.
+/// Run the merge's column comparison TWICE and use the same answer.
+///
+/// THE VALID REPLACEMENT for the skip arm below, which was withdrawn because it corrupted
+/// the factor, aborted early, and therefore measured truncated work rather than cost.
+/// Doubling holds work constant by construction: the returned value is unchanged, so the
+/// factorization is **bit-identical** and performs exactly the same updates. A
+/// whole-program totals diff between this arm and the shipping one is then precisely the
+/// marginal cost of one comparison, with no line attribution — which matters because ~60%
+/// of `linalg.rs` cost lands on pseudo-lines where inlined code carries no line info.
+///
+/// **It measures instructions cleanly and misses only as a LOWER bound**, since the second
+/// pass finds the lines warm. That asymmetry is itself evidence: the merge touches those
+/// same column lines anyway, which is why the comparison shows almost no misses today.
+///
+/// Default off. Enabling it does not change any result, only the cost.
+#[doc(hidden)]
+pub static SPLU_DOUBLE_COLUMN_COMPARE_MEASUREMENT_ONLY: PerfToggle = PerfToggle::new(false);
+/// Extra comparison passes actually executed — proves the arm took effect rather than
+/// merely being enabled.
+#[doc(hidden)]
+pub static SPLU_DOUBLE_COLUMN_COMPARE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]

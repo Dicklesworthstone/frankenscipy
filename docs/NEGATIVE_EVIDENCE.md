@@ -33237,3 +33237,68 @@ contention figure. The reportable results are the predicate confirmation and a r
   would have flagged the design), and diff whole-program totals. **If the marginal
   instruction cost of one comparison is under 1% of the factorization, refuse the run
   directory and close this line with the arena and the supernodal one.**
+
+## 2026-08-17 - PeachSummit (cc) - THE VALID A/B OVERTURNS MY OWN LINE ATTRIBUTION: the column comparison is 29.8% of program instructions, not 0.86% - and it costs essentially no misses
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** Whole-program
+  callgrind totals, `--cache-sim=yes`, on two arms of one binary. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::ab_totals_compare_{single,doubled}`**, validity
+  control `doubled_column_compare_is_bit_identical_and_takes_effect`. **OBSERVED VALUE:
+  `extra_passes=59501`, Ir 123,470,235 → 160,294,609.** `df -h /data` **117G / 116G**
+  before each build. **TWO builds, over the ONE-per-pane cap** — the second was forced by a
+  `dead_code` warning after extracting the scan helper; disclosed, not folded in. 532 lib
+  tests pass, warning-clean. `loadavg` 13.0 with two local builds running, so **counted
+  work only and no certification attempted**. `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE DESIGN, after the previous one was withdrawn.** The skip arm corrupted the factor
+  and aborted early, so its totals measured truncated work. This arm runs the identical
+  comparison **twice and uses the same answer**: output unchanged, so the factorization is
+  **bit-identical** and performs exactly the same updates, and the totals difference is the
+  marginal cost of one comparison. Bit-identity is asserted, which is the validity control
+  the skip arm could never have satisfied.
+
+  | arm | Ir | D1mr |
+  |---|---|---|
+  | comparison once (shipping) | 123,470,235 | 823,916 |
+  | comparison twice | 160,294,609 | 823,330 |
+  | **delta = one comparison** | **+36,824,374** | **−586** |
+
+- **THE INSTRUCTION RESULT CONTRADICTS THE ROW I BANKED YESTERDAY, AND THAT ROW WAS
+  WRONG.** I reported the comparison at **0.86%** of `apply_sorted_pivot_tail` from
+  line-level attribution. Measured without attribution it is **36,824,374 of 123,470,235 =
+  29.8% of program instructions** — an underestimate of roughly **35-fold**. The cause is
+  the caveat that row carried and I did not weight heavily enough: **~60% of `linalg.rs`
+  cost lands on pseudo-lines** where inlined code has no line info, and the comparison's
+  cost was sitting in exactly that unattributed bulk. **Line attribution on this binary is
+  not merely imprecise, it is unusable for a share this size.**
+- **THE MISS RESULT STANDS AND IS INFORMATIVE IN THE OTHER DIRECTION.** A second comparison
+  adds **−586 D1 read misses**, i.e. nothing. The lines are already resident, which is the
+  same fact the line-level profile reported (0.28%) and the only part of that row that
+  survives. **This is a lower bound**: it says an *additional* comparison is free in misses,
+  not that the first one is. But combined with the earlier finding that the 8-wide block
+  compare records zero misses, the picture is consistent — **the column stream is warm, and
+  a run directory would not be recovering misses.**
+- **WHICH INVERTS THE WHOLE FRAMING OF THIS LEVER.** I have spent three rows arguing it on
+  **cache misses** — a bytes-based 32.9% ceiling, then a claim it was dead because misses
+  were 0.28%. Both were aimed at the wrong axis. **The comparison is expensive in
+  INSTRUCTIONS and cheap in misses.** The 32.9% byte ceiling was never the relevant number,
+  and neither was the 0.28%.
+- **AND THE INSTRUCTION COST POINTS AT A FAR CHEAPER LEVER THAN A DIRECTORY.** 36,824,374 Ir
+  over 59,501 passes is **~619 Ir per comparison**, against runs of only a few tens of
+  entries at side=10 — on the order of **10–15 instructions per element compared**, for what
+  is a `u32` equality. That is the signature of **bounds-checked indexing** (`left[span +
+  offset]`, `right[span + offset]`) in the scan loop, not of an algorithmically necessary
+  cost. **Rewriting the scan over slice iterators to elide the bounds checks is a
+  bit-identical local change with no directory, no invariant, and no new storage.**
+- **WHAT THIS DOES NOT ESTABLISH.** One fixture (cubic side=10) in a test binary running a
+  single factorization; the 29.8% share is of *that* program, and a run doing more
+  non-factorization work would dilute it. It also does not show the comparison can be made
+  cheaper — only that it costs enough to be worth attacking. **The per-element estimate is
+  arithmetic over means and this bead has been burned by that three times; treat ~619 Ir per
+  pass as measured and the 10–15 Ir per element as inference.**
+- **Concrete retry predicate:** rewrite `scan_matched_prefix` with iterator-based comparison
+  (`zip`/`chunks_exact`) so bounds checks are elided, assert **bit-identity** against the
+  current implementation, and re-run this same two-arm A/B. **If the marginal cost per
+  comparison falls materially below 619 Ir, that is the lever — and it costs one function
+  body, not a storage rewrite.** If it does not move, the cost is real work and the
+  directory question reopens on instructions rather than misses.
