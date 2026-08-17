@@ -34530,3 +34530,57 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   on the new ELF — the current standing **1.9x n=9** was measured on a binary without this
   arm and is superseded the moment the default flips. Then explain the arm-on spread
   asymmetry before treating 1.83x as settled.
+
+## 2026-08-17 - PeachSummit (cc) - A PERFTOGGLE READ IN THE PER-UPDATE PATH COST 13%: my own shipping wiring gave back most of the lever, and hoisting it recovered the win
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, PAIRED, ADMISSIBLE.** Three
+  **shipping** `release` binaries differing only in how one condition is evaluated, run
+  **alternately in one window**: **`4c2b046ca3abca3c`** (toggle read per update),
+  **`b85a5f8736cfaa53`** (condition hardcoded), **`9fb1f8878529857e`** (toggle hoisted to
+  the factorization). Live SciPy in the same invocation,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  **No C BLAS/LAPACK/MKL** — `ldd` shows only libgcc, libm, libc, loader. **FOUR builds,
+  far over the ONE-per-pane cap**; disclosed, not folded in. `df -h /data` **253G → 246G**,
+  checked before each. `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing
+  deleted.
+- **I ALMOST SHIPPED A LEVER THAT DELIVERED A QUARTER OF ITS MEASURED VALUE.** Last turn I
+  certified the arm at **13.9% faster** using a binary with the condition hardcoded. I then
+  flipped the default and rebuilt — and the shipping binary read **0.4962–0.5016**, against
+  the hardcoded binary's **0.5472**. Two arm-on binaries, same source logic, not overlapping.
+
+  | binary | condition evaluated | median | per-arm loadavg |
+  |---|---|---|---|
+  | `f0a34e05` (arm off) | — | 0.4806 | 9–20 |
+  | **`4c2b046c`** | `PerfToggle` read **per update** | **0.498** | 12–14 |
+  | `b85a5f87` | hardcoded `&& true` | 0.550 | 10–12 |
+  | **`9fb1f887`** | toggle **hoisted**, passed as `bool` | **0.562** | 11–12 |
+
+- **THE CAUSE IS THE READ, NOT THE ARM.** `SPLU_ONE_COLUMN_INSERT_ENABLE.load(Relaxed)` sat
+  inside the per-update branch and executed **555,096 times per factorization**. The loads
+  themselves are trivial; a relaxed atomic load is an **optimisation barrier the compiler
+  cannot see through**, so it blocked specialisation of the merge around it. Hoisting the
+  read to the factorization and passing a plain `bool` — which is what **every other toggle
+  in this file already does** — recovered the full win and then some.
+- **THE DIAGNOSIS WAS SETTLED BY RUNNING BOTH BINARIES ALTERNATELY, not by reasoning.** The
+  first instinct was that the 0.5472 had been a lucky window. Re-running the preserved
+  hardcoded binary **in the same window as the new one** separated the hypotheses in four
+  pairs: the hardcoded binary still read 0.51–0.57 while the toggle binary read 0.49–0.51.
+  **The difference was in the binary, and keeping the old binary on disk is what made that
+  checkable.**
+- **THIS IS THE SAME CLASS OF ERROR AS THE `cfg(test)` INFLATION BANKED THIS MORNING**, and
+  it is now twice in one day: instrumentation placed inside a hot path does not merely add
+  its own cost, it **changes the code being measured**. There the barrier inflated a measured
+  effect 34-fold; here it destroyed three quarters of a real one. **A toggle is
+  instrumentation.**
+- **WHAT THIS DOES NOT ESTABLISH.** The hoisted-vs-hardcoded comparison is four pairs, and
+  their intervals overlap — the hoist is *at least* as good, not provably better. The
+  arm-off figure was taken earlier in the same window rather than interleaved with the
+  hoisted binary, so the headline improvement chains two comparisons (off↔hardcoded
+  interleaved, hardcoded↔hoisted interleaved) rather than resting on one. And the arm-on
+  spread remains wider than arm-off, still unexplained.
+- **Concrete retry predicate:** restate the standing cubic figure on `9fb1f887` with a full
+  replicate set and a clock gate before quoting it — the numbers above are a lever
+  comparison, not a certification of the cell. Then **audit the remaining toggles for the
+  same defect**: `SPLU_ROW_HEAD_CACHE_DISABLE` and `SPLU_CUBIC_SPECTRAL_DISABLE` are read
+  where? If either sits inside a per-update or per-pivot path, the same 13% may be sitting
+  there unclaimed.
