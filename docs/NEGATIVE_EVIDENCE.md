@@ -32533,6 +32533,12 @@ established yet beyond the fact that the arm finally works.
   than live SuperLU, 95% CI [1.78x, 1.97x] over 6 replicates**, run-to-run spread 15.4%.
   Quote it with its **N**. Do not quote a within-invocation CI as reproducibility, and do
   not quote a worst floor as a bound.
+  - **SUPERSEDED 2026-08-17 by the n=9 certification** (row *"THE PREDICTED NEGATIVE
+    LANDED"*), which reads **1.9x, CI over replicates [1.88x, 2.00x], n=9** on ELF
+    `43c6c571`. The two are consistent — the intervals overlap heavily — and the n=9 figure
+    is the one to quote. Noted here rather than edited above, because a reader who greps
+    `STANDING QUOTABLE` lands on this bullet first and would otherwise carry away the n=6
+    number. **Content-addressed on purpose: cite the row title, never a line number.**
 - **THE ESTIMATOR IS NOW SHOWN TO CONVERGE, which is the whole claim.** At n=4 the bootstrap
   interval **degenerated to the observed range** ([0.4950, 0.5775]); at n=6 it is strictly
   inside it ([0.5090, 0.5614]). A running minimum does the opposite — it would have moved
@@ -33550,6 +33556,9 @@ be read as superseded by this one.
   bit-identical, removes real work, and cannot be slower; it shows only that this cell does
   not expose it. A different fixture, a smaller cache, or a machine where the merge is not
   latency-bound could still surface it. **It is kept.**
+- **STANDING QUOTABLE FOR THE CUBIC CELL, superseding the n=6 form banked earlier the same
+  day: 1.9x slower than live SuperLU, CI over replicates [1.88x, 2.00x], n=9**, ELF
+  `43c6c571`, run-to-run spread 12.8%. Quote it with its N.
 - **Concrete retry predicate:** the cubic deficit stands at **1.9x, CI over replicates
   [1.88x, 2.00x], n=9** — quote it with its N. Before any further instruction-level work on
   this kernel, **measure where the elapsed time actually goes**: the near-zero miss count and
