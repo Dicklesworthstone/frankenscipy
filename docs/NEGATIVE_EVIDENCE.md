@@ -34958,3 +34958,58 @@ this fleet will hand you a green build of code you did not write.
 own samples were `vmstat` 3s `id=33` and `mpstat` 2s `idle=55.88`, `iowait=0.00` —
 same ballpark, host genuinely busy, so nothing was certified. loadavg
 22.13/25.20/25.83, local MHz spread 1429-4179 (2.92x).
+
+## 2026-08-17 - PeachSummit (cc) - STATE OF PLAY AFTER BOTH LEVERS: 5.74 Ir per element-update against SuperLU's 4.05, and the column comparison is now the largest removable item at 19.88% - but it stays closed
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** **COUNTED MECHANISM:**
+  the both-levers binary retires **20,324,342,581 instructions**, of which
+  `matched_run_length` accounts for **4,039,969,875** — **byte-for-byte the same absolute
+  figure it recorded before either lever landed**. Callgrind on the **shipping-profile**
+  binary `a88d162fba5586b5`, side=16, no `cfg(test)` code in the measured region. **NO
+  BUILD.** `df -h /data` **212G**. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **I VERIFIED CPU IDLE MYSELF AND IT IS NOT STABLE ENOUGH TO CERTIFY AGAINST.** The tick
+  reported 25%; `vmstat` sampled **84%, 49%, 24% in three consecutive seconds**, with
+  `loadavg` 30.92/26.74/26.28. **A single idle reading — mine or anyone's — is not a
+  description of this host right now.** Interleaved pairing survives that; restating an
+  *absolute* standing figure would not, which is why this turn is counted work.
+- **THE COMPOSITION NOW, per element-update:**
+
+  | share | Ir/element | function |
+  |---|---|---|
+  | 45.71% | 2.62 | `apply_sorted_pivot_tail` (inclusive) |
+  | **19.88%** | **1.14** | **`matched_run_length`** |
+  | 11.86% | 0.68 | `factorize_csr` |
+  | 3.76% | 0.22 | `__memcpy` |
+  | 3.15% | 0.18 | `merge_sorted_remainder` |
+  | 2.86% | 0.16 | `select_sorted_pivot_row` |
+  | 2.79% | 0.16 | `_int_malloc` |
+  | | **5.74** | **program total** (SuperLU: 4.05) |
+
+- **THE COMPARISON'S ABSOLUTE COST IS IDENTICAL BEFORE AND AFTER BOTH LEVERS —
+  4,039,969,875 both times — and its SHARE rose from 14.66% to 19.88% purely because the
+  program around it shrank.** That is the arithmetic of a denominator, not a regression, and
+  it is worth stating because a share that grows while nothing changed is exactly the kind
+  of number that gets misread as a new problem.
+- **IT REMAINS CLOSED, and the closure survives re-examination at the new denominator.**
+  Removing the comparison requires knowing two different rows share a column pattern, which
+  needs a symbolic phase; ours costs **3,008,581,116 Ir per factorization** against the
+  comparison's **109,188,375** — still **28x what it saves**, unchanged by the levers since
+  neither touched either quantity. The entry condition stands: make `symbolic_fill_pattern`
+  28-fold cheaper first.
+- **WHAT IS LEFT IS CONCENTRATED AND HARD.** `apply_sorted_pivot_tail`'s own body plus the
+  comparison is **65.6%** of the program. The comparison scans ~160 `u32` columns per call at
+  **1.14 Ir per element compared** — close to the floor for a load-compare-accumulate, so
+  there is little to win by making the scan cheaper rather than avoiding it. **The remaining
+  1.69 Ir/element gap to SuperLU is not sitting in an obvious line item.**
+- **WHAT THIS DOES NOT ESTABLISH.** Instruction shares, not time; the timed figures are
+  banked separately (9–11% for the cancellation skip, 1.61x deficit with both levers in the
+  paired runs). Neither does it establish that SuperLU's 4.05 is achievable by this
+  algorithm — it is a right-looking elimination and SuperLU is left-looking supernodal, and
+  the supernodal line here closed on a measured no-crossover result.
+- **Concrete retry predicate:** the next real question is no longer "which line item" but
+  **whether this elimination shape can reach 4.05 at all**. Before more micro-levers, count
+  what SuperLU actually does per element — its supernodal panels perform dense BLAS-3 style
+  updates, so a like-for-like comparison needs **its** update count, not just its
+  instruction total. If SuperLU performs materially fewer element-updates for the same fill,
+  the remaining gap is algorithmic and no amount of kernel work closes it.
