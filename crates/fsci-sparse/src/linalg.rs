@@ -1748,6 +1748,17 @@ thread_local! {
         const { std::cell::Cell::new((0, 0)) };
     static LIVE_ROW_ADJACENCY_AFTER_ELIMINATION: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
+    /// `(row visits, cache lines those visits span, visits that fit in ONE line)`.
+    ///
+    /// THE CEILING ON THE WHOLE ARENA IDEA, and it is cheap where the arena is not.
+    /// Adjacency between two rows can only ever save the miss at the BOUNDARY between
+    /// them — at most one cache line per row visit. Everything a visit reads beyond that
+    /// first line is a compulsory miss that no layout can remove, because the data has to
+    /// come from memory once whatever order it sits in. So the arena's ceiling is
+    /// `visits / lines`: if a visit spans 36 lines, perfect adjacency removes at most
+    /// 1/36 of the stream, and the rewrite is dead before it is written.
+    static ROW_VISIT_SPAN: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 /// How CLUSTERED the rows eliminated at one pivot are, by row index.
@@ -2558,6 +2569,10 @@ impl NativeSparseLu {
         // pays nothing and the release instruction stream is unchanged.
         #[cfg(test)]
         LIVE_ROW_ADJACENCY_AS_BUILT.with(|cell| cell.set(row_allocation_adjacency(&rows)));
+        // Per-factorization, so each call reports its own visits rather than a running
+        // total across every factorization the test process has performed.
+        #[cfg(test)]
+        ROW_VISIT_SPAN.with(|cell| cell.set((0, 0, 0)));
         // Candidate rows come from FIRST-COLUMN buckets, not from full column
         // membership, and that difference is the second half of frankenscipy-fnnbd.
         //
@@ -2724,6 +2739,18 @@ impl NativeSparseLu {
                     continue;
                 };
                 let target = &mut trailing_rows[row - (k + 1)];
+                // Measured BEFORE the update, so it is what this visit reads.
+                #[cfg(test)]
+                ROW_VISIT_SPAN.with(|cell| {
+                    let (visits, lines, single) = cell.get();
+                    let entries = target.live_vals().len();
+                    // Two streams are walked per visit -- `vals` (8 bytes) and `cols`
+                    // (4 bytes) -- and each has its own boundary that adjacency could
+                    // save, so each is counted.
+                    let spanned = (entries * std::mem::size_of::<f64>()).div_ceil(64).max(1)
+                        + (entries * std::mem::size_of::<u32>()).div_ceil(64).max(1);
+                    cell.set((visits + 1, lines + spanned, single + usize::from(spanned <= 2)));
+                });
                 let multiplier = value / pivot;
                 if multiplier != 0.0 {
                     l_rows[row].push((k, multiplier));
@@ -13703,6 +13730,98 @@ mod tests {
             "on no fixture did reserving hold the layout fixed across the elimination -- \
              the one property this pass does deliver is absent, so it is inert"
         );
+    }
+
+    /// Diagonally dominant tridiagonal: 3 entries per row, no fill, no pivoting.
+    fn plain_tridiagonal_csr(n: usize) -> CsrMatrix {
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        for row in 0..n {
+            if row > 0 {
+                rows.push(row);
+                columns.push(row - 1);
+                data.push(-1.0);
+            }
+            rows.push(row);
+            columns.push(row);
+            data.push(4.0);
+            if row + 1 < n {
+                rows.push(row);
+                columns.push(row + 1);
+                data.push(-1.0);
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, false)
+            .expect("tridiagonal COO")
+            .to_csr()
+            .expect("tridiagonal CSR")
+    }
+
+    #[test]
+    fn row_visit_span_separates_a_one_line_sweep_from_a_many_line_one() {
+        // TWO ARMS, because this counter's job is to BOUND a rewrite and both failure
+        // modes are silent. A counter stuck reporting many lines per visit would kill the
+        // arena on no evidence; one stuck reporting a single line would greenlight it.
+
+        // MUST REPORT ~1 LINE: a tridiagonal matrix. Rows hold 3 entries, so vals is 24
+        // bytes and cols is 12 -- one line each, and adjacency between rows is exactly
+        // the kind of saving that matters.
+        let thin = plain_tridiagonal_csr(256);
+        let lu = NativeSparseLu::factorize_csr(&thin, 1.0, PermutationOrdering::Natural)
+            .expect("tridiagonal factorization");
+        assert_eq!(lu.n, 256);
+        let (visits, lines, single) = ROW_VISIT_SPAN.with(|cell| cell.get());
+        assert!(visits > 0, "the recorder must fire -- zero visits measures nothing");
+        assert_eq!(
+            lines,
+            visits * 2,
+            "a 3-entry row spans exactly one vals line and one cols line per visit"
+        );
+        assert_eq!(single, visits, "every tridiagonal visit is a single-line sweep");
+
+        // MUST REPORT MANY LINES: the measured cell, where rows carry hundreds of
+        // entries. If this arm also read ~1 line per visit the counter would be blind.
+        let fat = splu_dirichlet_laplacian_3d(8);
+        let lu = NativeSparseLu::factorize_csr(&fat, 1.0, PermutationOrdering::Colamd)
+            .expect("cubic factorization");
+        assert_eq!(lu.n, 512);
+        let (visits, lines, single) = ROW_VISIT_SPAN.with(|cell| cell.get());
+        assert!(visits > 0, "the recorder must fire on the cubic cell too");
+        assert!(
+            lines > visits * 4,
+            "the measured cell's visits must span many lines each, or this counter is \
+             not discriminating -- got {lines} lines over {visits} visits"
+        );
+        assert!(
+            single * 2 < visits,
+            "most cubic visits must NOT be single-line sweeps -- got {single}/{visits}"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
+    fn arena_ceiling_from_row_visit_spans() {
+        // THE BOUND THE ARENA HAS TO CLEAR, computed before the rewrite rather than after.
+        // Adjacency can only remove the miss at the boundary between two rows: at most one
+        // line per stream per visit. Everything past that first line is compulsory.
+        for side in [8usize, 16] {
+            let matrix = splu_dirichlet_laplacian_3d(side);
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            assert_eq!(lu.n, side * side * side);
+            let (visits, lines, single) = ROW_VISIT_SPAN.with(|cell| cell.get());
+            // Two streams per visit, so a perfectly adjacent layout saves at most two
+            // lines per visit -- one boundary on `vals`, one on `cols`.
+            let ceiling = 100.0 * (2 * visits) as f64 / lines.max(1) as f64;
+            println!(
+                "side={side}  visits={visits}  lines={lines}  \
+                 lines/visit={:.1}  single-line visits={single} ({:.1}%)  \
+                 ARENA CEILING <= {ceiling:.1}% of the row-stream misses",
+                lines as f64 / visits.max(1) as f64,
+                100.0 * single as f64 / visits.max(1) as f64
+            );
+        }
     }
 
     #[test]

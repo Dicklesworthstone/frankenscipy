@@ -32317,3 +32317,60 @@ established yet beyond the fact that the arm finally works.
   floor: cubic deficit **at most 1.89x** (worst CI floor 0.5291, rounds=41), scattered family
   no worse than **1.2106x**. The lever ships **off** (`SPLU_RESERVE_FROM_SYMBOLIC_ENABLE`) and
   is kept in-tree because it is the apparatus any successor needs.
+
+## 2026-08-17 - PeachSummit (cc) - THE ARENA IS DEAD BEFORE IT IS WRITTEN: a row visit spans 32.0 cache lines, so perfect adjacency can remove at most 6.3% of the row-stream misses, and the ceiling FALLS as n grows
+
+- **Bead: `frankenscipy-u7biq` (arena).** **Result class: COUNTED BOUND.** Cache lines
+  spanned per row visit, counted inside the elimination — **no timing, no A/A null, no
+  ratio**, so **no per-arm MHz and no quiescence gate applies**. `df -h /data` re-checked
+  before the build: **162G**; `loadavg` **22.5**/21.8/34.6. **ONE build.** 526 lib tests
+  pass, warning-clean. `host_identity=thinkstation1`. Nothing deleted.
+- **THE QUESTION NOBODY HAD ASKED, three rows into this bead.** Two preconditions were
+  cleared (candidate sweeps contiguous in row index; the layout genuinely destroyed by
+  growth) and one design refuted (reserve-in-order). All of it assumed **adjacency would
+  help if achieved**. It never checked *how much*. Adjacency can only remove the miss at the
+  **boundary** between two rows — at most one cache line per stream per visit. Everything a
+  visit reads past that first line is **compulsory**: the data must come from memory once,
+  in whatever order it sits.
+
+  | cubic, Colamd | visits | lines | lines/visit | single-line visits | **arena ceiling** |
+  |---|---|---|---|---|---|
+  | side=8 | 19,054 | 175,824 | 9.2 | 2.9% | **≤ 21.7%** |
+  | **side=16 (the measured cell)** | **592,108** | **18,939,494** | **32.0** | **0.7%** | **≤ 6.3%** |
+
+- **AND THE ROW-STREAM IS ONLY 53.91% OF D1 READ MISSES**, so the arena's ceiling against
+  *total* read misses on the measured cell is **6.3% × 53.91% ≈ 3.4%** — for a storage
+  rewrite of the entire factor. That is not a lever, and it is bounded from above, not
+  estimated.
+- **THE SCALING IS THE WRONG WAY ROUND, which settles it.** The ceiling falls **21.7% →
+  6.3%** from side=8 to side=16, because rows fatten as fill accumulates and the boundary
+  line becomes a smaller share of each sweep. The cubic cell is exactly where the deficit
+  lives, and it is exactly where the arena is worth least. Any larger problem is worse.
+- **THE PREFETCH OBJECTION, and why it does not rescue this.** A miss-count bound is not a
+  time bound: adjacency also lets the hardware prefetcher run across a row boundary, which
+  hides latency without removing misses. But the sweep **inside** a row is already
+  sequential over 32 lines, so the prefetcher is already working for all but the boundary —
+  adjacency extends its reach by roughly 1 line in 32. The prefetch argument is bounded by
+  the same ratio that bounds the miss argument.
+- **THE COUNTER DISCRIMINATES — two arms, one that must read ~1 line and one that must read
+  many.** A tridiagonal factor (3 entries per row) reads **exactly** one `vals` line and one
+  `cols` line per visit, with 100% of visits single-line — asserted as exact equality, so a
+  counter stuck reporting "many" fails it. The cubic cell reads 32.0 lines/visit with 0.7%
+  single-line — so a counter stuck reporting "one" fails that. **Both failure modes here are
+  silent and both are fatal**: one kills the arena on no evidence, the other greenlights it.
+- **WHAT I SHOULD HAVE DONE THREE ROWS EARLIER.** This costs one build and one counter, and
+  it was available before the index-contiguity row, before the adjacency row, and before the
+  reserve lever was written and refuted. The supernodal line closed on exactly this pattern —
+  a mechanism that was plausible, fitted the numbers, and was never pre-costed. **The
+  pre-costing question is "how much can this possibly be worth", and it belongs before the
+  preconditions, not after them.**
+- **WHAT THIS DOES NOT ESTABLISH.** It bounds *adjacency*, not every possible storage change.
+  A layout that reduced the **number of lines a visit spans** — narrower entries (u32 columns
+  are already u32; f32 values would change results and are refused), or not re-reading rows
+  at all — attacks the compulsory part and is not bounded by this row. That is a different
+  lever and would need its own pre-costing.
+- **Concrete retry predicate:** the arena is **refused, not deferred**. Re-open only if
+  someone measures the row-stream miss share above 53.91%, or shows lines-per-visit below
+  ~4 on a cell that matters — `arena_ceiling_from_row_visit_spans` prints both numbers on
+  demand. Do not re-open it on a locality argument: locality is now bounded at ≤6.3% of
+  53.91% on the cell that carries the deficit.
