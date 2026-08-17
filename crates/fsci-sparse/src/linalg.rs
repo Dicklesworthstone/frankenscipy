@@ -13066,6 +13066,78 @@ mod tests {
     /// `#[ignore]` because it factors a real grid and is far too slow for the
     /// normal suite; run it deliberately with
     /// `cargo test -p fsci-sparse --lib merge_shape -- --ignored --nocapture`.
+    /// The harness's `scattered_pentadiagonal`, reproduced so the merge-shape diagnostic
+    /// can run on the cell we WIN, not only the one we lose.
+    ///
+    /// A pentadiagonal band whose rows and columns are shuffled by a fixed xorshift
+    /// permutation: 5 nonzeros per row wherever the band is complete, scattered so the
+    /// pattern is not banded. Same construction and same seed as the harness bin, so the
+    /// diagnostic describes the fixture the standing 1.69x row was measured on.
+    fn scattered_pentadiagonal_csr(side: usize) -> CsrMatrix {
+        let n = side * side * side;
+        let mut permutation: Vec<usize> = (0..n).collect();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for index in (1..n).rev() {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            permutation.swap(index, (state >> 11) as usize % (index + 1));
+        }
+        let (mut rows, mut cols, mut data) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            for offset in [-2_i64, -1, 0, 1, 2] {
+                let j = i as i64 + offset;
+                if j >= 0 && (j as usize) < n {
+                    rows.push(permutation[i]);
+                    cols.push(permutation[j as usize]);
+                    data.push(if offset == 0 { 6.0 } else { -1.0 });
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("scattered COO")
+            .to_csr()
+            .expect("scattered CSR")
+    }
+
+    #[test]
+    #[ignore = "diagnostic: why the sign flips with density, run with --ignored --nocapture"]
+    fn merge_shape_cubic_versus_scattered() {
+        // THE MECHANISM BEHIND THE STANDING DENSITY RESULT, tested rather than asserted.
+        //
+        // We are 1.9x SLOWER on cubic and 1.69x FASTER on scattered with the SAME kernel.
+        // That has been recorded as an empirical regularity for days without a mechanism.
+        // The candidate, from reading the merge: the full in-place fast path fires only
+        // when EVERY tail column coincides with the target's live head, and it measured
+        // `inplace_share_of_calls = 0.106` on cubic -- so 89.4% of cubic updates pay a
+        // scratch merge plus a copy-back. Scattered rows hold ~5 nonzeros, so their tails
+        // are short and a complete match is far more likely.
+        //
+        // PREDICTION: `inplace_share_of_calls` is near 1.0 on scattered and near 0.1 on
+        // cubic. If it is, the density result is explained -- we win exactly where we skip
+        // the merge machinery. If scattered's share is also low, the explanation is wrong
+        // and the sign flip is something else.
+        for (label, matrix) in [
+            ("cubic    ", splu_dirichlet_laplacian_3d(10)),
+            ("scattered", scattered_pentadiagonal_csr(10)),
+        ] {
+            let _ = take_merge_shape();
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            let shape = take_merge_shape();
+            let calls = shape.merges + shape.inplace;
+            println!(
+                "{label} n={} stored_nnz={} merges={} inplace={}                  inplace_share_of_calls={:.3} mean_run_length={:.2}",
+                lu.n,
+                lu.stored_nnz(),
+                shape.merges,
+                shape.inplace,
+                shape.inplace as f64 / calls.max(1) as f64,
+                shape.run_elements as f64 / shape.runs.max(1) as f64,
+            );
+        }
+    }
+
     #[test]
     #[ignore = "diagnostic: factors a real grid, run explicitly with --ignored --nocapture"]
     fn merge_shape_on_the_cubic_fixture() {
