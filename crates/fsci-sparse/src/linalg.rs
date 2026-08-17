@@ -2313,7 +2313,6 @@ impl NativeSparseLu {
     ///
     /// The caller falls back to `factorize_csr`, whose result this must equal bit for bit
     /// — asserted by `supernodal_elimination_is_bit_identical_to_the_sequential_one`.
-    #[allow(dead_code)] // staged capability: reached through a default-OFF toggle
     fn factorize_csr_supernodal(
         a: &CsrMatrix,
         diag_pivot_thresh: f64,
@@ -3517,8 +3516,38 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
                 SparseLuInternal::PeriodicCuboidSpectral(plan),
             )
         } else {
-            let native =
-                NativeSparseLu::factorize_csr(&csr, options.diag_pivot_thresh, options.ordering)?;
+            // THE SUPERNODAL ARM (frankenscipy-9nw95), reachable at last. It plans blocks
+            // symbolically and applies a whole supernode while the target row is loaded
+            // ONCE, which is aimed at the 53.91% of D1 read misses spent streaming
+            // target-row values. It DECLINES -- returning `None` -- when the plan cannot
+            // be trusted: no exploitable width, or a row interchange that invalidates
+            // every block boundary the symbolic pass computed. Falling through to the
+            // sequential path is then not a failure, it is the design.
+            //
+            // The tolerance is 8 because that is where the structure was measured: exact
+            // supernodes on the loss fixture average width 1.10 (useless), relaxed ones
+            // at t=8 average 5.35.
+            let native = if SPLU_SUPERNODAL_ENABLE.load(std::sync::atomic::Ordering::Relaxed) {
+                match NativeSparseLu::factorize_csr_supernodal(
+                    &csr,
+                    options.diag_pivot_thresh,
+                    options.ordering,
+                    SUPERNODAL_RELAXATION_TOLERANCE,
+                ) {
+                    Some(blocked) => {
+                        SPLU_SUPERNODAL_FACTOR_HITS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        blocked
+                    }
+                    None => NativeSparseLu::factorize_csr(
+                        &csr,
+                        options.diag_pivot_thresh,
+                        options.ordering,
+                    )?,
+                }
+            } else {
+                NativeSparseLu::factorize_csr(&csr, options.diag_pivot_thresh, options.ordering)?
+            };
             (
                 SparseBackend::NativeSparseLu,
                 native.ordering_used,
@@ -12724,6 +12753,54 @@ mod tests {
             head[1].to_bits(),
             (-14.0f64).to_bits(),
             "the head must be left updated, since the blocked tail application reads it"
+        );
+    }
+
+    #[test]
+    fn splu_supernodal_arm_is_bit_identical_through_the_public_entry_point() {
+        // The driver is tested at `factorize_csr` level, but the DISPATCH is new code:
+        // it reads a toggle, calls the blocked path, and falls back when that declines.
+        // A wrapper that silently never called the blocked path, or called it and
+        // returned the wrong branch, would pass every test above. This exercises `splu`
+        // itself and checks the hit counter proves which arm ran.
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // ABOVE THE DENSE GUARD, deliberately. `splu` densifies small or structurally
+        // dense input to an n x n dense LU, so a small fixture never reaches the native
+        // sparse path and the supernodal arm cannot run at all -- the first version of
+        // this test used n=36 and failed exactly there, which the unit tests could not
+        // have caught because they call `factorize_csr_supernodal` directly.
+        let matrix = laplacian_2d_for_mmd(16);
+        let csc = matrix.to_csc().expect("csc");
+        let options = LuOptions {
+            mode: RuntimeMode::Strict,
+            ordering: PermutationOrdering::Natural,
+            diag_pivot_thresh: 0.0,
+        };
+
+        SPLU_SUPERNODAL_ENABLE.store(false, Ordering::Relaxed);
+        let sequential = splu(&csc, options).expect("sequential splu");
+        let before = SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed);
+        SPLU_SUPERNODAL_ENABLE.store(true, Ordering::Relaxed);
+        let blocked = splu(&csc, options).expect("supernodal splu");
+        let took_effect = SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed) > before;
+        SPLU_SUPERNODAL_ENABLE.store(false, Ordering::Relaxed);
+
+        assert!(
+            took_effect,
+            "the supernodal arm was enabled but declined on this fixture, so this test \
+             compared the sequential path with itself and proved nothing"
+        );
+        let rhs: Vec<f64> = (0..matrix.shape().rows).map(|i| 1.0 + (i % 5) as f64).collect();
+        let a = splu_solve(&sequential, &rhs).expect("sequential solve");
+        let b = splu_solve(&blocked, &rhs).expect("supernodal solve");
+        assert_eq!(
+            a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "the supernodal arm must solve BIT-identically through the public entry point"
         );
     }
 
@@ -21993,6 +22070,34 @@ pub static SPLU_CUBIC_SPECTRAL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
 ///   than as a proxy, has everything needed here to reverse this.
 ///
 /// ACCURACY CONTRACT, unchanged: **BIT-IDENTICAL, unconditionally.**
+/// Relaxation tolerance the supernodal arm plans with: how many rows two columns' L
+/// patterns may differ by and still share a block, padded with explicit zeros.
+///
+/// **8 is a measured choice, not a round number.** On the loss fixture, EXACT supernodes
+/// (tolerance 0) average width **1.10** — no structure to block over — while tolerance 8
+/// averages **5.35**. Each padded row is a multiply-add computing nothing, so the
+/// tolerance buys target-row traffic at the price of arithmetic; 8 is where the measured
+/// width becomes worth having. Raising it further is not free and must be re-measured.
+const SUPERNODAL_RELAXATION_TOLERANCE: usize = 8;
+
+/// Plan the elimination in blocks and apply a whole supernode per target-row touch.
+///
+/// ACCURACY CONTRACT: **BIT-IDENTICAL, unconditionally.** Blocking reorders memory
+/// traffic and nothing else — every `(row, col)` receives the same updates in the same
+/// pivot order — and `supernodal_elimination_is_bit_identical_to_the_sequential_one`
+/// asserts the whole factorization as raw bits, including relaxed blocks.
+///
+/// **Defaults OFF: unmeasured.** The driver is correct and reachable, but no timing or
+/// counted row exists for it yet.
+#[doc(hidden)]
+pub static SPLU_SUPERNODAL_ENABLE: PerfToggle = PerfToggle::new(false);
+/// Factorizations the supernodal arm actually planned and ran. It DECLINES on matrices
+/// with no exploitable width or any row interchange, so this counter distinguishes
+/// "enabled" from "took effect" — a distinction that has already caught one silent
+/// mis-measurement in this harness.
+#[doc(hidden)]
+pub static SPLU_SUPERNODAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_PARTIAL_INPLACE_ENABLE: PerfToggle = PerfToggle::new(true);
 /// Factorizations that took the partial in-place arm.
