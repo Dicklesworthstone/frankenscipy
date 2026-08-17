@@ -34237,3 +34237,88 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   specialised insertion path be written, and it must be **bit-identical** to the current
   merge, which is available as a control here because the arithmetic and its rounding are
   unchanged by where the entries are written.
+
+## 2026-08-17 - PeachSummit (cc) - THE EXACT-CANCELLATION CHECK NEVER FIRES: zero drops in 592,108 updates, for 24.9% of the merge body - it is pure overhead on the measured cell
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::cancellation_drop_rate_on_the_measured_cell`**
+  (diagnostic, `--ignored --nocapture`), control
+  `cancellation_drops_are_counted_and_separated_from_head_drops`. **OBSERVED VALUE:
+  `drops=0 at_head=0` at both side=8 (19,054 updates) and side=16 (592,108 updates).**
+  **ONE build** — the first after the freeze, `cargo test -p fsci-sparse --lib`, **536
+  passed / 0 failed**. `df -h /data` **281G** immediately before it. `loadavg`
+  7.16/5.44/5.51. **Counted, not timed.** **No C BLAS/LAPACK/MKL.**
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **ZERO IS A REAL ZERO, WHICH IS THE ONLY REASON THIS ROW EXISTS.** A counter that never
+  fires is indistinguishable from a counter wired to nothing, and this bead has already
+  banked one all-zero reading it could not defend (`candidate_rejection_rate`, where no
+  must-hit arm could be constructed). Here the must-hit arm exists and passes: a 4×4 fixture
+  whose elimination cancels exactly (`2/2 = 1`, then `1 − 1·1 = 0`) and which is
+  **nonsingular by construction** (det −6) so the factorization completes and reaches the
+  counter. The obvious 3×3 version of that fixture cancels *and* is singular, so it returns
+  `SingularMatrix` before the counter is touched — it would have read zero drops while
+  proving nothing.
+- **SO THE CHECK COSTS 24.9% OF THE MERGE BODY AND DROPS NOTHING.** It is 0.97 Ir per
+  element-update — **24% of SuperLU's entire 4.05 budget** — spent detecting an event that
+  does not occur on this fixture family. The in-tree comment calls exact cancellation "rare";
+  measured, on the cell that carries the deficit, it is **absent**.
+- **AND THE COST SIDE OF REMOVING IT IS ZERO ON THIS CELL, not merely small.** The earlier
+  source-reading analysis established that a retained zero at a row's HEAD costs a wasted
+  candidate visit. With `at_head=0` there are no such zeros, because there are no zeros at
+  all: **removing the check leaves the factor bit-identical on this fixture**, since nothing
+  was ever being dropped.
+- **WHAT THIS DOES NOT ESTABLISH, and it is what stops this being a finished lever.**
+  Removing the check is **not** bit-identical in general — the 4×4 control proves cancellation
+  can occur, and on such a matrix the stored pattern would gain an explicit zero. That is what
+  SuperLU does and is numerically harmless, but it is a **semantic change**, so bit-identity
+  is unavailable as a control and parity against SciPy would carry the whole burden. Two
+  fixture families on one host; a matrix with structured exact cancellation could behave
+  differently.
+- **Concrete retry predicate:** implement removal behind a default-off toggle, assert the
+  factor is **byte-identical on the cubic and scattered fixtures** (which it must be, since
+  drops are zero there), assert parity against SciPy on a fixture that **does** cancel, and
+  measure the instruction delta on a **shipping** binary. Expected saving ~12.5% of program
+  instructions — **below the ~13% detection floor for a timed certification**, so bank it as
+  counted and do not spend a certification window on it alone.
+
+## 2026-08-17 - PeachSummit (cc) - WHY THE DENSITY SIGN FLIPS, CONFIRMED: the in-place fast path fires on 100% of scattered updates and 10.6% of cubic ones
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::merge_shape_cubic_versus_scattered`**
+  (diagnostic, `--ignored --nocapture`). **OBSERVED VALUE: cubic `merges=51382
+  inplace=6080 inplace_share_of_calls=0.106`; scattered `merges=0 inplace=1997
+  inplace_share_of_calls=1.000`.** Same build as the row above; **no additional build**.
+  `loadavg` 7.16/5.44/5.51. **Counted, not timed.** `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE PREDICTION WAS WRITTEN INTO THE TEST BEFORE IT RAN, and it is confirmed exactly.**
+  The standing density result — **a deficit on cubic and a win on scattered, same
+  kernel** (both certified in the replicate rows of 2026-08-17) — had been recorded as an empirical regularity for days with no mechanism. The
+  candidate, from reading the merge: the full in-place fast path fires only when EVERY tail
+  column coincides with the target's live head, so short scattered tails should match
+  completely and long cubic tails should not.
+
+  | fixture | merges | in-place | **in-place share** |
+  |---|---|---|---|
+  | cubic (n=1000) | 51,382 | 6,080 | **0.106** |
+  | **scattered (n=1000)** | **0** | 1,997 | **1.000** |
+
+  **Scattered performs no scratch merges at all.** Not few — zero. Every update takes the
+  in-place path, so it pays no scratch write, no `merge_sorted_remainder`, and no copy-back.
+- **THAT IS THE MECHANISM FOR THE WHOLE DENSITY RESULT.** We win exactly where the merge
+  machinery is skipped and lose exactly where 89.4% of updates pay it. The regularity is no
+  longer an observation about density; it is a consequence of a branch condition.
+- **AND IT VALIDATES THE TARGET THIS BEAD HAS BEEN ATTACKING.** Every lever here has aimed at
+  the merge machinery — arena, run directory, remainder path, cancellation. The cell where
+  that machinery is absent is the cell we win on. The machinery is the right
+  target, and the two-fold instruction excess should fall as its share does.
+- **WHAT THIS DOES NOT ESTABLISH.** It explains the *sign*, not the *size*: it does not show
+  that eliminating the merge on cubic would produce a comparable win there, because cubic's
+  rows are far denser and carry costs scattered never incurs. `mean_run_length` reads 0.00 on
+  scattered only because runs are counted inside `merge_sorted_remainder`, which never
+  executes — that is consistency, not a separate finding. One size (n=1000) per family.
+- **Concrete retry predicate:** measure `inplace_share_of_calls` at side=16 as well, since
+  the cubic share may fall further with density and the two cells here are n=1000 only. Then
+  ask the question this reframes: the fast path is rejected on 89.4% of cubic updates by a
+  **single condition** — that the match covers the *entire* tail. The partial path already
+  handles a prefix; **what fraction of those 89.4% miss by only one or two columns** is now
+  the sharpest open question on this bead, and it is a structural count.
