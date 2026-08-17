@@ -179,16 +179,44 @@ for raw_line in sys.stdin.buffer:
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
+            // scipy1 pins every BLAS thread variable to 1. scipyN keeps default
+            // parallelism but is now CAPPED AT THE CPUSET rather than left
+            // unbounded (frankenscipy-ll0kk).
+            //
+            // WHY THIS CHANGED, and it is a deliberate change of meaning:
+            // unbounded, OpenBLAS spawned 16 threads on a cpuset of 8 and 20 on
+            // a cpuset of 10 -- 2x oversubscribed in both cases. The arm then
+            // returned 0.0092x-0.0192x, i.e. claiming we were 50-100x faster
+            // than LAPACK dsyevd, which is not a measurement, and it drove the
+            // worker's loadavg from 2.07 to 9.85 DURING a single cell, widening
+            // every null in the run and depressing our own arm. The harness was
+            // paying the full measurement-integrity cost of an arm whose
+            // numbers were then discarded as implausible.
+            //
+            // "Default BLAS parallelism, not exceeding the cores we were given"
+            // is what any sane deployment does, and unlike the unbounded form it
+            // is measurable. This arm no longer answers "what does an
+            // unconfigured SciPy do on an oversubscribed box"; it answers "what
+            // does a default-threaded SciPy do with this cpuset".
+            let thread_keys = [
+                "OPENBLAS_NUM_THREADS",
+                "OMP_NUM_THREADS",
+                "MKL_NUM_THREADS",
+                "BLIS_NUM_THREADS",
+                "VECLIB_MAXIMUM_THREADS",
+                "NUMEXPR_NUM_THREADS",
+            ];
             if pin_threads {
-                for key in [
-                    "OPENBLAS_NUM_THREADS",
-                    "OMP_NUM_THREADS",
-                    "MKL_NUM_THREADS",
-                    "BLIS_NUM_THREADS",
-                    "VECLIB_MAXIMUM_THREADS",
-                    "NUMEXPR_NUM_THREADS",
-                ] {
+                for key in thread_keys {
                     command.env(key, "1");
+                }
+            } else {
+                let cap = blas_thread_cap(
+                    std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+                )
+                .to_string();
+                for key in thread_keys {
+                    command.env(key, &cap);
                 }
             }
             let mut child = command
@@ -432,6 +460,18 @@ for raw_line in sys.stdin.buffer:
     /// factor; CONTENTION is what actually breaks the arm.
     pub fn scipyn_plausible(ratio_p50: f64) -> bool {
         ratio_p50 >= MIN_PLAUSIBLE_INCUMBENT_RATIO
+    }
+
+    /// Thread cap for the default-parallelism SciPy arm: the cpuset size, never
+    /// zero.
+    ///
+    /// Leaving this unbounded is what made the arm unreportable -- see the call
+    /// site. An unknown cpuset (0) falls back to 1 rather than to "unlimited",
+    /// because the failure mode of guessing high is a thrashing incumbent and a
+    /// fabricated speedup, while the failure mode of guessing low is a slower
+    /// but honest arm.
+    pub fn blas_thread_cap(cpuset: usize) -> usize {
+        cpuset.max(1)
     }
 
     /// Reported alongside, never instead: a warning, not a verdict.
@@ -1100,6 +1140,28 @@ mod tests {
         assert!(contention_ratio(0.100, 0.100) <= MAX_TOLERABLE_CONTENTION);
         // Degenerate input must not produce a verdict.
         assert!(contention_ratio(0.0, 0.118).is_nan());
+    }
+
+    #[test]
+    fn blas_thread_cap_never_exceeds_the_cpuset_and_never_returns_zero() {
+        use super::bench::{blas_thread_cap, scipyn_oversubscribed};
+
+        // The two observed oversubscriptions that made the arm unreportable:
+        // 16 threads on a cpuset of 8, and 20 on a cpuset of 10.
+        assert_eq!(blas_thread_cap(8), 8, "cap must equal the cpuset");
+        assert_eq!(blas_thread_cap(10), 10);
+        // With the cap applied, neither case is oversubscribed any more -- which
+        // is the whole point of the change.
+        assert!(!scipyn_oversubscribed(blas_thread_cap(8), 8));
+        assert!(!scipyn_oversubscribed(blas_thread_cap(10), 10));
+        // ...whereas the values actually observed were.
+        assert!(scipyn_oversubscribed(16, 8));
+        assert!(scipyn_oversubscribed(20, 10));
+
+        // An unknown cpuset must not become "unlimited": guessing high gives a
+        // thrashing incumbent and a fabricated speedup, guessing low gives a
+        // slower but honest arm.
+        assert_eq!(blas_thread_cap(0), 1, "unknown cpuset must floor at 1");
     }
 
     #[test]
