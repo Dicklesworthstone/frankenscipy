@@ -35148,3 +35148,47 @@ is downgraded to a single within-worker observation.
   element-update and we now spend 5.74; **count SuperLU's element-updates**, because if it
   performs materially fewer for the same fill, the residual gap is algorithmic and further
   kernel work cannot close it.
+
+## 2026-08-17 - PeachSummit (cc) - SCATTERED RE-MEASURED AND REFUSED ON THE CLOCK GATE: the figures show no regression, but the gate fails at side=20 for the first time and the row is not certified
+
+- **Bead: `frankenscipy-llywn`.** **Result class: MEASURED AND REFUSED.** The ratios below
+  are recorded so the work is auditable and the refusal checkable — **they are not certified
+  and must not supersede the standing scattered figure.** Shipping binary
+  `frankenscipy_engine_sha256=f8c08a45a3de2521` (both levers). **NO BUILD.** `df -h /data`
+  **207G**. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **I VERIFIED IDLE MYSELF AND IT DID NOT MATCH THE BRIEF, AGAIN.** The tick reported 82%;
+  `vmstat` read **61/61/62%** at the start — stable, but well below the ≈83% idle band the
+  standing scattered figure was taken in. **Per-replicate idle then swung 43%–87%** while
+  loadavg held near 20, which for a fixture this fast is a large relative disturbance.
+- **THE MEASUREMENT, recorded and not certified.** 8 attempts, **2 void**, 6 admissible:
+  `n=6 median=1.6297 ci95_across_replicates=[1.4848,1.7112] observed_range=[1.4808,1.7271]
+  spread=15.1%`, against the standing `n=8 median=1.6850 ci95=[1.6296,1.7653]`. **The
+  intervals overlap heavily, so there is no evidence the levers hurt scattered** — which was
+  the specific worry, since the fast path there uses the cancellation loop this change
+  touches.
+- **BUT THE CLOCK GATE FAILS: `clock_gate: FAIL median=0.9692 n=3 spread=0.0176`.** Probes
+  read 0.9776 / 0.9600 / 0.9692 at `rounds=501`. A must-pass control in the same session
+  returns `PASS median=1.0041` on the cubic triple, so the gate is discriminating and not
+  stuck. **By the gate's own criterion this row is clock-biased and refused.**
+- **AND IT CONTRADICTS MY EARLIER READING OF THIS GATE.** Side=20 **passed** at 0.9822 with
+  `rounds=121` earlier today; at `rounds=501` it now reads 0.9600–0.9776. I had once
+  proposed that these ratios converge toward 1.0 as sampling improves — a hypothesis already
+  refuted on other cells, and refuted again here in the opposite direction: **more samples
+  made it worse.** The scattered family's clock behaviour is not a sampling artefact and is
+  not understood.
+- **THE BIAS DIRECTION MATTERS AND IS FAVOURABLE TO HONESTY.** The ratio below 1.0 means the
+  FrankenSciPy arm ran on **slower** cores than SciPy's. Any residual clock effect therefore
+  **understates** our advantage on this cell — so refusing the row costs us a number that
+  would have been flattering, not one that would have been damaging.
+- **WHAT THIS DOES NOT ESTABLISH.** It does not show the levers are neutral on scattered —
+  only that this attempt cannot decide it. Nor does it explain why the cubic cell's gate
+  passes comfortably (1.0041, spread 0.0024) while scattered's fails on the same host in the
+  same session; the obvious difference is fixture duration, and the obvious explanation
+  (ramp) is already refuted.
+- **Concrete retry predicate:** the standing scattered figure **remains 1.69x CI[1.63,1.77]
+  n=8 on the pre-lever binary**, and must be quoted with the caveat that it has not been
+  re-measured on the shipping default. To settle it, either find a window where the
+  scattered clock gate passes on a median of three probes, or **pair the binaries
+  interleaved** — a paired design cancels a clock bias that affects both arms equally, which
+  an absolute measurement cannot, and it is how both cubic levers were resolved.
