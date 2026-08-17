@@ -32948,3 +32948,61 @@ contention figure. The reportable results are the predicate confirmation and a r
   least three probes** rather than one. Until then sides 10 and 14 stay in the old
   worst-floor form. The refusal row of 2026-08-17 stands as to its *conclusion* (they were
   not certified) but its *mechanism* is withdrawn.
+
+## 2026-08-17 - PeachSummit (cc) - THE FIRST PRE-COSTING TO COME BACK POSITIVE: matched runs average 159.5 entries, so a run directory could remove up to 32.9% of the row stream - five times the arena's ceiling, and it GROWS with n
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** A structural count of the
+  merge kernel's column comparisons. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::run_directory_ceiling_from_matched_run_lengths`**
+  (diagnostic, `--ignored --nocapture`), control
+  `matched_run_profile_separates_a_long_run_from_a_shattered_one`. **OBSERVED VALUE:
+  `calls=600459 matched=95765716 compared=96380657` at side=16.** `df -h /data` **112G**
+  immediately before the build, `loadavg` 22.81 falling. **ONE build.** 528 lib tests pass,
+  warning-clean. `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **THIS IS THE LEVER THE ARENA BOUND EXPLICITLY LEFT OPEN.** That row killed locality — a
+  row visit spans 32.0 cache lines so adjacency removes at most 6.3% of the row-stream
+  misses — and named the exception: *"a layout that reduces the NUMBER of lines a visit
+  spans attacks the compulsory part and is not bounded by this row."* Columns are **4 of
+  the 12 bytes per entry**, and `matched_run_length` streams **both** column arrays purely
+  to CONFIRM an equality that, if it could be known cheaply, would not need reading at all.
+
+  | cubic, RCM (`Colamd` alias) | calls | matched | compared | match rate | **mean run** | column removable | **row-stream ceiling** |
+  |---|---|---|---|---|---|---|---|
+  | side=8 | 20,093 | 767,570 | 789,209 | 97.3% | **38.2** | ≤94.8% | **≤31.6%** |
+  | **side=16** | 600,459 | 95,765,716 | 96,380,657 | **99.4%** | **159.5** | ≤98.7% | **≤32.9%** |
+
+  A directory of one `(u32 start, u32 len)` pair per run costs 8 bytes per RUN against 4
+  bytes per ENTRY, so at mean run length R it removes `(1 − 2/R)` of the column stream and
+  a third of that from the whole row stream.
+- **AND IT SCALES THE RIGHT WAY, which is what separates it from the arena.** The arena's
+  ceiling FELL with size — 21.7% at side=8 to 6.3% at side=16 — because rows fatten and the
+  boundary line becomes a smaller share of each sweep. This one **rises**: mean run 38.2 →
+  159.5, ceiling 31.6% → 32.9%. The cubic cell is where the deficit lives, and unlike every
+  previous lever this is where it is worth **most**.
+- **THE STRUCTURAL FACT UNDERNEATH, and it is worth stating separately.** A 99.4% match rate
+  over runs averaging 159.5 entries means the target row and the pivot tail have **very
+  nearly identical column patterns over long spans**. The merge is therefore almost always a
+  pure AXPY at aligned positions, with the column arrays read only to re-derive an alignment
+  that already held on the previous pivot.
+- **THE COUNTER DISCRIMINATES — four arms through the real function.** Identical slices read
+  `(1 call, 64 matched, 64 compared)`; slices agreeing nowhere read `(1, 0, 64)`, so a
+  counter measuring slice length rather than agreement fails; a run ending mid-slice reads
+  20, exercising both the 8-wide block path and the scalar tail; and three calls accumulate
+  to 192 rather than overwriting. **A counter stuck reporting long runs would greenlight a
+  rewrite that saves nothing** — that arm is the one that matters here, and it fails.
+- **WHAT THIS DOES NOT ESTABLISH, and the discipline that makes me say it loudly.** A
+  ceiling is **not a gain**. This bounds the column stream a directory could remove; it does
+  not show the directory can be maintained cheaply, that the invariant proving alignment is
+  cheaper than the comparison it replaces, or that removing 32.9% of the row stream moves
+  elapsed time at all — the vals stream (8 of 12 bytes) stays compulsory, and row-stream
+  misses are 53.91% of D1 read misses, so the ceiling against total read misses is
+  **≈17.7%**. Three mechanisms banked on this bead fitted the numbers and failed on test.
+  **The difference here is only that the bound is large rather than small; a large ceiling
+  refutes nothing and promises nothing.**
+- **Concrete retry predicate:** before writing the directory, pre-cost the **maintenance**
+  side the same way this pre-costed the saving — count how often a row's column pattern
+  CHANGES between consecutive pivots that touch it. If patterns churn every pivot, the
+  directory must be rebuilt as often as it is read and the 32.9% is unreachable; if patterns
+  are stable across many pivots, the invariant is cheap and the lever is live. **That is one
+  more counter and no rewrite**, and it is the question that killed the reserve lever when it
+  was asked too late.
