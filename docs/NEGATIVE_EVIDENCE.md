@@ -35089,3 +35089,62 @@ exceeds its drift deviation (0.040), so that one is informative and passing.
 
 **Corrected standing figures: n=512 `>= 1.40x`, n=768 `>= 1.54x`.** The trend claim
 is downgraded to a single within-worker observation.
+
+## 2026-08-17 - PeachSummit (cc) - BOTH LEVERS SHIPPING, STANDING FIGURE RESTATED: the cubic cell is 1.65x slower, CI [1.60x, 1.67x] over EIGHT replicates - down from 2.08x when this line began today
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, REPLICATE-LEVEL CERTIFICATION.**
+  Shipping binary `frankenscipy_engine_sha256=f8c08a45a3de2521`, both levers enabled by
+  default. Live SciPy in the same invocation,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.6, `genuine=True`, `fsci_loaded=False`, `observed_os_tasks=1`),
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`,
+  n=4096, nnz=27136, lu_nnz=1231312, parity `worst_rel_solution_diff=3.908e-15`.
+  **TWO builds** (test, then release) — over the ONE-per-pane cap, disclosed. `df -h /data`
+  **212G → 211G** before each. **No C BLAS/LAPACK/MKL** — `ldd` shows only libgcc, libm,
+  libc, loader. `host_identity=thinkstation1`, `same_host=thinkstation1`,
+  physical_cores=32, logical_threads=64, ram_bytes=231692279808, numa_count=1,
+  `scaling_governor=powersave`, `runtime_isa=avx2+fma`,
+  `requested_frankenscipy_threads=1`, **`actual_observed_frankenscipy_threads=1`**,
+  `affinity=64`. Nothing deleted.
+- **I VERIFIED THE WINDOW MYSELF AND IT WAS GENUINELY CLEAN THIS TIME.** `vmstat` read
+  **90/89/88/89% idle** across four consecutive samples with `iowait 0` — stable, unlike the
+  84/49/24% volatility one turn earlier. **PER-REPLICATE loadavg and idle:** 15.49/77%,
+  15.69/82%, 14.78/79%, 15.90/74%, 16.41/75%, 15.86/83%, 18.55/76%, 22.53/74%, 22.49/62%,
+  22.85/65%. **PER-ARM CPU MHz:** fsci 3909/3917/3927 against scipy 3886/3904/3911;
+  **clock gate PASS, median 1.0041, n=3, spread 0.0024.**
+- **EIGHT OF TEN ADMISSIBLE; two void** (nulls outside the ±0.020 bound), reported not
+  dropped. `replicate_aggregate: n=8 median=0.6064 ci95_across_replicates=[0.5975,0.6255]
+  observed_range=[0.5942,0.6280] spread=5.6%`.
+
+  | | ELF | n | median | CI95 | deficit |
+  |---|---|---|---|---|---|
+  | **now, both levers** | `f8c08a45` | 8 | **0.6064** | [0.5975, 0.6255] | **1.65x** |
+  | one-column only | `9fb1f887` | 10 | 0.5600 | [0.5564, 0.5653] | 1.79x |
+  | neither lever | `f0a34e05` | 6 | 0.4806 | [0.4767, 0.4832] | 2.08x |
+
+- **STANDING QUOTABLE FOR THE CUBIC CELL, superseding 1.79x n=10: 1.65x slower than live
+  SuperLU, 95% CI over replicates [1.60x, 1.67x], n=8.** Quote it with its N.
+- **THE DAY'S ARC, AND THE CAVEAT ON READING IT AS ONE NUMBER.** The cell began at
+  **2.08x** and now measures **1.65x** — but those two figures come from different windows,
+  and the attribution to the levers rests on the **interleaved paired** comparisons banked
+  separately (one-column: ranges disjoint at n=6; cancellation: 10.7% then 9.2%), not on
+  this before/after. **The individual lever estimates are also not additive by assumption**
+  and were never timed as a pair until this row, which measures them together as shipped.
+- **THE DEFAULT FLIP WAS CAUGHT BY A TEST, which is what the must-hit arms are for.**
+  Turning detection off by default made `cancellation_drops_are_counted_and_separated_from_head_drops`
+  read zero drops and fail — correctly, since that counter only records what the detecting
+  path finds. It now enables detection explicitly. A suite with only must-miss assertions
+  would have passed silently and left the counter measuring nothing.
+- **WHAT THIS DOES NOT ESTABLISH.** The cancellation skip is a **semantic** change: on
+  matrices that cancel, the factor retains explicit zeros. The measured cells cancel nothing
+  (0 drops in 592,108 updates), so this certification is of a bit-identical configuration —
+  but the shipping default now differs from the previous factor on cancelling inputs, with
+  only solve agreement asserted there. **The scattered family's standing 1.69x predates both
+  levers and has not been re-measured**, and its fast path uses the cancellation loop this
+  change touches.
+- **Concrete retry predicate:** re-certify the scattered family on `f8c08a45` before quoting
+  it again — the arm never fires there, but the cancellation loop does, so the figure is not
+  automatically inherited. Then answer the standing question: SuperLU spends 4.05 Ir per
+  element-update and we now spend 5.74; **count SuperLU's element-updates**, because if it
+  performs materially fewer for the same fill, the residual gap is algorithmic and further
+  kernel work cannot close it.

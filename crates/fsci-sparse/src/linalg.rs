@@ -14713,8 +14713,9 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         assert!(
-            !SPLU_SKIP_CANCELLATION_ENABLE.load(Ordering::Relaxed),
-            "skipping cancellation is a semantic change and must ship disabled until measured"
+            SPLU_SKIP_CANCELLATION_ENABLE.load(Ordering::Relaxed),
+            "skipping cancellation ships ENABLED on two timed estimates (9-11%); a sibling \
+             leaving it off would silently measure the superseded path"
         );
 
         // WHERE NOTHING CANCELS, THE CONTRACT IS BIT-IDENTITY. The drop counter reads zero
@@ -14732,7 +14733,7 @@ mod tests {
             SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
             let skipped = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
                 .unwrap_or_else(|e| panic!("skipping on {label}: {e:?}"));
-            SPLU_SKIP_CANCELLATION_ENABLE.store(false, Ordering::Relaxed);
+            SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
 
             assert_eq!(drops, 0, "{label} was expected to cancel nothing, got {drops} drops");
             assert_eq!(
@@ -14759,7 +14760,8 @@ mod tests {
         SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
         let skipped = NativeSparseLu::factorize_csr(&cancelling, 1.0, PermutationOrdering::Natural)
             .expect("skipping on the cancelling fixture");
-        SPLU_SKIP_CANCELLATION_ENABLE.store(false, Ordering::Relaxed);
+        // Restore the SHIPPING default, which is now `true`.
+        SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
 
         assert!(drops > 0, "the cancelling fixture must actually cancel, got {drops}");
         let rhs = vec![1.0, 2.0, 3.0, 4.0];
@@ -14777,6 +14779,16 @@ mod tests {
 
     #[test]
     fn cancellation_drops_are_counted_and_separated_from_head_drops() {
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // DETECTION IS NOW OFF BY DEFAULT, so this test must turn it back on: the drop
+        // counter only records what the detecting path finds, and with the shipping default
+        // it would read zero everywhere and assert nothing. The flip caught this, which is
+        // the point of asserting a must-HIT arm rather than only a must-miss one.
+        SPLU_SKIP_CANCELLATION_ENABLE.store(false, Ordering::Relaxed);
+
         // MUST HIT: a factorization that genuinely cancels. Without this arm a counter
         // reading zero everywhere would be indistinguishable from a counter that never
         // fires, and "cancellation is rare" would be unfalsifiable.
@@ -14804,6 +14816,7 @@ mod tests {
             (0, 0),
             "a fill-free factorization cannot cancel"
         );
+        SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
     }
 
     #[test]
@@ -25172,9 +25185,19 @@ pub static SPLU_ONE_COLUMN_INSERT_HITS: std::sync::atomic::AtomicUsize =
 /// per element would reintroduce the defect that cost 13% one turn earlier: a runtime
 /// condition inside the hot loop is an optimisation barrier.
 ///
-/// Default OFF: unmeasured.
+/// **SHIPS ON, on two independent timed estimates.** Counted: 24,653,806,631 instructions
+/// with detection against 20,324,342,581 without, a 17.6% reduction taking the cell from
+/// 6.96 to 5.74 Ir per element-update. Timed, interleaving the two binaries in one window
+/// so drift cancels: **10.7% faster at n=4/5 and 9.2% at n=6/7**, medians clearly separated
+/// with CIs across replicates clear of each other. The honest figure is **9-11%**, not a
+/// single number, and the deficit falls from about 1.76x to about 1.61x.
+///
+/// The drop counter reads **zero on both measured fixtures**, so on those cells this is
+/// bit-identical and the test asserts exactly that. On a matrix that genuinely cancels it
+/// is a SEMANTIC change -- the factor retains an explicit zero, as SuperLU's does -- and
+/// there the test asserts only that the solves agree.
 #[doc(hidden)]
-pub static SPLU_SKIP_CANCELLATION_ENABLE: PerfToggle = PerfToggle::new(false);
+pub static SPLU_SKIP_CANCELLATION_ENABLE: PerfToggle = PerfToggle::new(true);
 #[doc(hidden)]
 pub static SPLU_ROW_CAPACITY_HEADROOM: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(1);
