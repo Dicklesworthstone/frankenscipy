@@ -140,7 +140,23 @@ CONTRACT_KEYWORDS = (
 
 def contract_stated(doc: str) -> bool:
     d = doc.lower()
-    return any(k in d for k in CONTRACT_KEYWORDS)
+    if any(k in d for k in CONTRACT_KEYWORDS):
+        return True
+    # The in-crate ratchet ALSO accepts a bare numeric tolerance -- a token like
+    # `1e-15` states a bound without using any of the keywords above. Omitting
+    # this clause is why an earlier version of this script reported 12 and 26
+    # uncontracted where the Rust tests reported 11 and 25: off by exactly one in
+    # both crates, in the same direction, which is what finally gave it away.
+    #
+    # A commit message of mine claimed this predicate mirrored the in-crate one
+    # "keyword for keyword". It copied the keyword list and missed this clause.
+    # That is precisely the drift the sync note warns about, committed by the
+    # person who wrote the warning.
+    for word in d.split():
+        w = word.strip("".join(c for c in word if not (c.isalnum() or c in ".-")))
+        if "e-" in w and w[:1].isdigit():
+            return True
+    return False
 
 
 # Must-hit / must-miss on the contract predicate, before it is trusted anywhere.

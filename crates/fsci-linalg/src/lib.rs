@@ -34779,7 +34779,7 @@ mod proptest_tests {
     /// lowered with it in the same commit. It does not attempt to fix the
     /// backlog -- it stops the backlog growing, which is the part that can be
     /// done in one commit and held.
-    const UNCONTRACTED_TOGGLE_BUDGET: usize = 26;
+    const UNCONTRACTED_TOGGLE_BUDGET: usize = 25;
 
     fn accuracy_contract_is_stated(doc: &str) -> bool {
         let d = doc.to_ascii_lowercase();
@@ -34866,6 +34866,21 @@ mod proptest_tests {
             uncontracted.len(),
             UNCONTRACTED_TOGGLE_BUDGET,
             &uncontracted[..uncontracted.len().min(5)]
+        );
+
+        // Report the live count (`-- --nocapture`), as the fsci-stats ratchet does.
+        //
+        // A budget can only be tightened safely when the true count is readable
+        // WITHOUT deliberately failing the test. This ratchet was silent, and that
+        // silence is part of how it sat at 35 against a true count of 26: the only
+        // way to learn the number was to set the budget to 0 and read the failure
+        // message, which is a thing nobody does routinely -- and which, as it
+        // turned out, verified the budget rather than the predicate.
+        eprintln!(
+            "drqu7 fsci-linalg: {} perf statics, {} uncontracted, budget {}",
+            total,
+            uncontracted.len(),
+            UNCONTRACTED_TOGGLE_BUDGET
         );
     }
     type MatrixFunction = fn(&[Vec<f64>], DecompOptions) -> Result<Vec<Vec<f64>>, LinalgError>;
