@@ -4425,6 +4425,16 @@ pub fn randomized_svd(
 /// serial pass (the ORIG behaviour); default `false` fans the scatter across cores with privatized
 /// per-thread sketches merged at the end. Byte-identical below the gate. `#[doc(hidden)]` — A/B gate.
 #[doc(hidden)]
+/// A/B switch: force the count-sketch scatter onto its serial path.
+///
+/// CONTRACT, size-dependent. BELOW the parallel gate the single-thread path IS
+/// the original scatter and the two settings are byte-identical, so an A/B there
+/// is vacuous. ABOVE it each worker keeps a PRIVATE sketch over its row chunk
+/// and the partials are summed, so per-bucket float accumulation reassociates in
+/// the merge: agreement is within per-op ULP tolerance, not bit for bit.
+///
+/// Bucket assignment and signs are unchanged by the split -- only the order in
+/// which contributions to a bucket are added differs.
 pub static CWT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -9744,6 +9754,13 @@ pub fn fractional_matrix_power(
 /// Runtime switch to force the original strided `khatri_rao` build for
 /// same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]` -- internal.
 #[doc(hidden)]
+/// A/B switch: force the Khatri-Rao product onto its original strided fill.
+///
+/// CONTRACT: BYTE-IDENTICAL either way. Output row `r = i*p + k` holds
+/// `result[r][j] = a[i][j] * b[k][j]`: every element is ONE multiplication of
+/// the same two operands, with no sum and therefore no reassociation. The arms
+/// differ in memory traversal only -- the parallel one builds each row
+/// row-major, the legacy one writes column-major into a row-major buffer.
 pub static KHATRI_RAO_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -10143,6 +10160,13 @@ pub fn solve_toeplitz_many(
 /// `false` fans the scan across cores for large matrices. Byte-identical (deterministic bool).
 /// `#[doc(hidden)]` — internal A/B perf gate.
 #[doc(hidden)]
+/// A/B switch: force the symmetry predicate onto its serial path.
+///
+/// CONTRACT: IDENTICAL either way, exactly and not merely to tolerance. The
+/// parallel arm splits over ROWS and combines with a boolean AND; no floating
+/// point is accumulated across threads, so there is nothing to reassociate. The
+/// comparison each worker performs is the same equality on the same pair of
+/// elements regardless of which thread performs it.
 pub static ISSYMMETRIC_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -10247,6 +10271,18 @@ pub static NORM_ONE_FORCE_LEGACY: std::sync::atomic::AtomicBool =
 /// privatized per-thread column accumulators merged at the end. Byte-identical below the gate.
 /// `#[doc(hidden)]` — internal A/B gate.
 #[doc(hidden)]
+/// A/B switch: force the 1-norm onto its serial column-sum pass.
+///
+/// CONTRACT, and it is NOT uniform across the input size, which is the part
+/// worth reading twice. BELOW the parallel gate both settings run the same
+/// serial pass and are byte-identical -- so an A/B there compares a path with
+/// itself and proves nothing. ABOVE the gate the parallel arm gives each worker
+/// a private `col_sums` over its row chunk and merges the partials, so each
+/// column's sum of absolute values REGROUPS by chunk: agreement is to about
+/// 1e-15, within per-op ULP tolerance, not bit for bit.
+///
+/// NaN behaviour is preserved either way: a NaN in a column propagates into that
+/// column's merged sum and then through the NaN-aware max, as in the serial arm.
 pub static NORM_ONE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -10255,6 +10291,18 @@ pub static NORM_ONE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// across rows for LARGE matrices only, then `sqrt`. WITHIN per-op ULP tolerance vs the column-major
 /// sum (applied above the gate; small matrices keep nalgebra exactly). `#[doc(hidden)]` — A/B gate.
 #[doc(hidden)]
+/// A/B switch: restore the legacy Frobenius norm (copy into a `DMatrix`, then
+/// nalgebra's `norm`).
+///
+/// CONTRACT: the two arms agree WITHIN PER-OP ULP TOLERANCE, not bit for bit,
+/// and only above the size gate. nalgebra sums the squares column-major over a
+/// copy; the current path sums them row-major in one contiguous pass fanned
+/// across rows. Same value mathematically, different summation order, so the
+/// low bits differ.
+///
+/// Below the gate the legacy path is what runs in BOTH settings, so small
+/// matrices -- and any bit-exact test written against them -- keep nalgebra's
+/// exact result and an A/B there compares a path with itself.
 pub static NORM_FRO_FORCE_LEGACY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -14388,6 +14436,13 @@ fn golub_kahan_bidiagonal_reduction(
 /// across cores. Byte-identical (each `data[col*m + row]` written once, value independent of order).
 /// `#[doc(hidden)]` — the A/B knob.
 #[doc(hidden)]
+/// A/B switch: force the row-major to column-major gather onto its serial path.
+///
+/// CONTRACT: BYTE-IDENTICAL either way. This is pure data movement -- each
+/// destination element is written exactly once, from one source element, with
+/// no arithmetic -- so the parallel arm differs only in which core performs the
+/// copy. The `n` column blocks are independent, which is why they can be fanned
+/// at all.
 pub static DMATRIX_FROM_ROWS_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -34724,7 +34779,7 @@ mod proptest_tests {
     /// lowered with it in the same commit. It does not attempt to fix the
     /// backlog -- it stops the backlog growing, which is the part that can be
     /// done in one commit and held.
-    const UNCONTRACTED_TOGGLE_BUDGET: usize = 41;
+    const UNCONTRACTED_TOGGLE_BUDGET: usize = 35;
 
     fn accuracy_contract_is_stated(doc: &str) -> bool {
         let d = doc.to_ascii_lowercase();
