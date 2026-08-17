@@ -1,0 +1,5 @@
+stage shares of native eigh, by size (frankenscipy-ll0kk)
+     n     total_ms    reduce%     solve%      back%  note
+   512         52.2      55.6%      18.4%      26.0%  97% of wall accounted
+   768        154.9      62.2%      13.6%      24.2%  98% of wall accounted
+  1024        368.7      61.5%      12.3%      26.2%  99% of wall accounted

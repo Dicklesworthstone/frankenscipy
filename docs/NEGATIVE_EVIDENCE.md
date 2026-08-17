@@ -35866,3 +35866,64 @@ and 6.86%, `smt_present=false`, 8-CPU cpuset. Local host when the run was launch
 
 **Standing figures: n=512 `>= 1.37x`, n=768 `>= 1.52x`, n=1024 `>= 1.58x`, all
 cross-worker worsts; and the deficit PEAKS at n=768 on both workers measured.**
+
+## 2026-08-17 - RainyPrairie (cc) - WHERE THE eigh CONSTANT SITS: the Householder reduction is 56-62% of runtime at every size — and the stage mix does NOT explain the n=768 bump
+
+- **Bead: `frankenscipy-ll0kk`** (eigh stage attribution), lane shared with
+  `frankenscipy-5f06d`. **Result class: INSTRUMENTATION READOUT, not a timing
+  certification.** `df -h /data` read **199G** before the build. Nothing deleted.
+  Worker **`ovh-a`** (`RCH_WORKER=ovh-a`). New driver
+  `crates/fsci-linalg/src/bin/perf_eigh_stages.rs`. Raw table:
+  `tests/artifacts/perf/2026-08-17-eigh-stage-shares/stage_shares_ovha.txt`.
+  No native BLAS/LAPACK/MKL in the resolved graph.
+
+**THE COUNTERS EXISTED AND HAD NO DRIVER.** `EIGH_NATIVE_STAGE_TIMING` and
+`EIGH_NATIVE_STAGE_NANOS` were added to answer ll0kk's re-scoped question — "the gap
+is a constant factor, so where does the constant sit" — and were read only by a unit
+test. This binary is the driver they never had.
+
+| n | total | reduce | solve | back | accounted |
+|---|---|---|---|---|---|
+| 512 | 52.2 ms | **55.6%** | 18.4% | 26.0% | 97% |
+| 768 | 154.9 ms | **62.2%** | 13.6% | 24.2% | 98% |
+| 1024 | 368.7 ms | **61.5%** | 12.3% | 26.2% | 99% |
+
+**THE ANSWER IS THE HOUSEHOLDER TRIDIAGONALISATION.** It is 56-62% of runtime at
+every size and its share is essentially flat — precisely the signature of a constant
+factor, and consistent with ll0kk's flat-ratio finding rather than with an
+asymptotic wall. Back-transform holds a steady 24-26%; the tridiagonal solve shrinks
+from 18.4% to 12.3% as expected for the lower-order stage. The two cubic stages
+together are 82-88%.
+
+**AND IT DOES NOT EXPLAIN THE n=768 BUMP, which is worth saying because it was the
+obvious hypothesis.** The stage mix at 768 and 1024 is nearly identical (62.2/13.6/24.2
+versus 61.5/12.3/26.2), yet the vs-SciPy ratio peaks at 768 on all three workers
+measured. So the bump is NOT a change in which stage dominates; it is something
+within a stage at that size — blocking or cache behaviour — and this instrument
+cannot see it. A finding that eliminates the leading hypothesis is still the useful
+half of the run.
+
+**THE OBVIOUS ATTACK ON `reduce` IS ALREADY REFUTED, per ll0kk**: the blocked dsytrd
+reduction measured SLOWER (0.5-0.81x). So "the reduction dominates" does not imply
+"block the reduction" — that was tried and lost. Anyone taking this next needs a
+different approach to the same stage, and now has a number saying how much is on the
+table: ~60% of eigh.
+
+**PROVENANCE AND HONESTY ABOUT WHAT THIS IS.** No incumbent arm, no A/A null, no
+margin, no certification — it is wall time accumulated inside three stages of one
+implementation, and the binary's own docs say so. It does not need a quiet host to
+be meaningful because it reports SHARES. Two controls are built in: the run REFUSES
+if all counters are zero (which would happen if the nalgebra route ran instead, and
+would otherwise print a clean and entirely empty table), and it reports what
+fraction of wall time the stages account for — 97-99% here, so nothing large is
+happening outside them.
+
+**MY OWN PRIOR ROW NEEDS A CORRECTION IN EMPHASIS.** I reported the n=768 peak
+replicating across two workers as a new finding. The `EIGH_NATIVE_STAGE_TIMING` doc
+block already recorded the same shape from hz2 — 1.82x at 512, 2.23x at 768, 1.81x
+at 1024. My rows are a second and third independent confirmation, which is worth
+more than a discovery claim would have been, but the shape was known and I should
+have found that doc block before presenting it as new.
+
+**HOST STATE.** Local: `vmstat` 3s `id=83`, `mpstat` 2s `idle=83.08`, `iowait=0.04`,
+loadavg 16.37/19.65/19.19, zero rustc. Local MHz spread 1429-4280.
