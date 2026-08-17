@@ -48,6 +48,7 @@ mod bench {
 import hashlib
 import os
 import sys
+import collections
 import threading
 import time
 
@@ -68,13 +69,27 @@ if not np.array_equal(A, A.T):
 
 PEAK_TASKS = len(os.listdir("/proc/self/task"))
 STOP = threading.Event()
+# Thread NAMES, not just the count (frankenscipy-ll0kk). Capping
+# OPENBLAS_NUM_THREADS and its five siblings at the cpuset left the count at 20
+# on a 10-core box, unchanged, so those variables were never what spawned them.
+# /proc/<tid>/comm says WHAT the threads are -- OpenBLAS workers are named
+# openblas-*, a Python pool is Thread-N, and anything else points somewhere new.
+THREAD_NAMES = {}
 
 def poll_tasks():
     global PEAK_TASKS
     while not STOP.is_set():
-        count = len(os.listdir("/proc/self/task"))
+        tids = os.listdir("/proc/self/task")
+        count = len(tids)
         if count > PEAK_TASKS:
             PEAK_TASKS = count
+        for tid in tids:
+            if tid not in THREAD_NAMES:
+                try:
+                    with open(f"/proc/self/task/{tid}/comm") as fh:
+                        THREAD_NAMES[tid] = fh.read().strip()
+                except OSError:
+                    pass
         STOP.wait(0.002)
 
 POLLER = threading.Thread(target=poll_tasks, daemon=True)
@@ -109,6 +124,7 @@ print(
     f" affinity={len(os.sched_getaffinity(0))}"
     f" cpus_allowed={sorted(os.sched_getaffinity(0))}"
     f" peak_tasks={PEAK_TASKS}"
+    f" thread_names={sorted(collections.Counter(THREAD_NAMES.values()).items())}"
     f" fsci_loaded={fsci_loaded}"
     f" genuine={scipy.__version__ == '1.17.1' and not fsci_loaded}",
     flush=True,

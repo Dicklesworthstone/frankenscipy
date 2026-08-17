@@ -31622,3 +31622,73 @@ answered, `scipyN` stays unreportable and `scipy1` remains the only usable incum
   supernodal codes avoid this by storing the factor in dense blocks so there is no union
   to pad; that is a storage rewrite, and it is the honest precondition this bead has been
   circling.
+
+## CERTIFIED: eigh native at n=512 is at least 1.25x slower than 1-thread SciPy — first cell to clear the margin gate (frankenscipy-ll0kk)
+
+**RainyPrairie, 2026-08-17.** The first eigh cell all session to pass both the bracketing test
+and the 2x margin. It also **corrects a conclusion I banked one row earlier**, and settles the
+scipyN question by showing the arm flipping state inside a single run.
+
+- **harness:** `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs` (`... -- 512 15 3`)
+- **RCH_WORKER=vmi1149989**, avx512f=false, affinity 10, **nproc=10**
+- **executed ELF:** `elf_sha256=1c028370e265f72c5d991b34b32f2a0750177845772d513dd2c5e0578346e165`
+- **incumbent:** `decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361`
+- **PER-ARM LOADAVG:** `loadavg_pre=9.02`, `loadavg_post=9.88` after cell 1 and **5.40** after
+  cell 2 — the box got quieter under the run rather than louder, the opposite of every earlier
+  attempt.
+- **PER-ARM CPU MHz:** every CPU our arm touched (cpu0-cpu9) reported **3195 MHz**, spread
+  **1.00x**, `smt_present=false`, both arms unpinned across the full cpuset.
+- **AGREEMENT BEFORE TIMING:** worst relative eigenvalue difference 1.070e-14 / 7.611e-14.
+- **CV is provenance only.**
+
+**THE CERTIFIED CELL (impl=native):**
+
+| | median | ci95 | cv |
+|---|---|---|---|
+| NULL fsci/fsci | 1.0160x | [0.8626, 1.3723] | 13.32% |
+| NULL sp1/sp1 | 1.0111x | [0.9558, 1.1116] | 4.52% |
+| **fsci/scipy1** | **2.3270x** | **[1.2546, 4.1717]** | 28.46% |
+
+`margin fsci/scipy1 = 3.56x` against the required 2.00x; both nulls bracket 1.0; harness
+verdict `nulls=PASS`. Absolute medians: **fsci 80.132ms against scipy1 35.375ms**.
+
+**Worst bound quoted, the bound closest to parity:** eigh's native path at n=512 is **at least
+1.25x slower** than SciPy with BLAS pinned to one thread. The median is 2.33x, but the interval
+is wide (cv 28.46%) and one certified cell is one cell — the quotable claim is the lower bound.
+
+The nalgebra cell in the same invocation did NOT certify: margin 1.75x, `nulls=FAIL`. Both are
+reported; only the native one is claimed.
+
+**CORRECTION TO THE PREVIOUS ROW.** One row earlier I wrote that capping the default-BLAS arm's
+threads "changed nothing" and that "the mechanism is refuted, not just this implementation".
+That was over-concluded from a single run. On the SAME binary, this run shows three of the
+predicted effects clearly present:
+
+| clause | previous run | this run |
+|---|---|---|
+| `sp1/sp1` null tightens | cv 17-45%, [0.4258, 1.1741] | **cv 4.19-4.52%, [0.9299, 1.0740]** |
+| `loadavg_post` stays near pre | 3.83 rose to 15.97 | **9.02 to 9.88, then fell to 5.40** |
+| scipyN becomes reportable | 0.0105x, void | **0.4114x in cell 1** |
+
+I falsified a mechanism on one observation of something that varies between runs — the same
+error I have been catching elsewhere, made here in the direction of rejecting a fix that
+largely works.
+
+**THE scipyN ARM IS INTERMITTENT, and this run proves it within one invocation**: cell 1
+returned 0.4114x and was marked reportable; cell 2 returned 0.0136x (7168ms against scipy1's
+35ms) and was voided. Same binary, same worker, minutes apart. Any single-run verdict about
+that arm — mine included, in both directions — is unsound.
+
+**THE THREAD COUNTS ARE NOW EXPLAINED, and not as I assumed.** Thread names come back
+`[('python3.13', 20)]`: no `openblas-*`, so naming does not discriminate. The counts do.
+`scipy1` requests 1 thread and shows **2**; `scipyN` requests 10 (the cpuset cap) and shows
+**20**. Exactly twice the request in both arms. The environment variables ARE honoured — there
+are two pools of the requested size — so the cap is right in mechanism and wrong in VALUE.
+
+**Concrete retry predicate.** Request `cpuset/2`, not `cpuset`: on this 10-core worker that
+means 5, and the falsifiable prediction is **10 observed threads and `oversubscribed=false`**.
+If the count comes back 10 the model holds and the arm stops oversubscribing; if it comes back
+20 again the doubling is not tied to the request and the model is wrong. Do not quote any
+scipyN ratio until that lands — the arm has now been observed both plausible and pathological
+in the same run. For the certified `scipy1` comparison, replicate on a second worker before
+treating 1.25x as settled; one cell is not a result.
