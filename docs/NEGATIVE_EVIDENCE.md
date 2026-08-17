@@ -32252,3 +32252,68 @@ established yet beyond the fact that the arm finally works.
   by assumption: the shipping cubic deficit is **at most 1.89x** (worst CI floor 0.5291,
   4/4 admissible, rounds=41) and the scattered family must not regress below its standing
   **1.2106x**. An arena that does not move the cubic number materially is a loss.
+
+## 2026-08-17 - PeachSummit (cc) - REFUTED: reserving each row to its symbolic final size FREEZES the layout but freezes a SCATTERED one - as-built adjacency falls 98.0% to 6.8% at the reserve itself
+
+- **Bead: `frankenscipy-u7biq` (arena).** **Result class: COUNTED STRUCTURE, REFUTATION.**
+  Allocator placement counts — **no timing, no A/A null, no ratio**, so **no per-arm MHz
+  and no quiescence gate applies**; adjacency is a count of placements, not a duration,
+  which is why this was admissible at `loadavg` **39.3 falling**. `df -h /data` re-checked
+  before **each** build: 160G / 158G / 157G / 156G. **FOUR builds, over the two-per-project
+  cap** — one was a compile-error retry (`Ordering` resolved to `std::cmp::Ordering` at the
+  insertion point) and one was forced by correcting a test that encoded the refuted claim.
+  Disclosed, not folded in. 525 lib tests pass, warning-clean. `host_identity=thinkstation1`.
+  Nothing deleted.
+- **THE LEVER, AND WHY IT LOOKED LIKE THE CHEAP FORM OF THE ARENA.** The row above measured
+  rows at **93.9% adjacent as built** and **8.4% after eliminating**, and concluded the
+  allocator already places rows correctly while **growth past capacity** scatters them. That
+  suggests skipping the arena entirely: reserve each row to its symbolically-predicted final
+  size once, nothing ever outgrows its block, and the good as-built layout survives to the
+  end. `symbolic_fill_pattern` already computes the sizes, and `reserve` cannot touch a
+  value, so the whole thing is **bit-identical by construction** with no fallback path.
+- **HALF THE MECHANISM IS CONFIRMED. THE HALF THAT MATTERED IS REFUTED.**
+
+  | cubic, Colamd | as built | after elimination |
+  |---|---|---|
+  | side=8, reserve OFF | 98.0% | 8.2% |
+  | **side=8, reserve ON** | **6.8%** | **6.8%** |
+  | side=16, reserve OFF | 93.5% | 8.2% |
+  | **side=16, reserve ON** | **12.3%** | **12.3%** |
+
+  The stability claim holds exactly — with the reserve on, **as-built equals after**, so no
+  row moves during the elimination. But the reserve pass **destroys the layout in the act of
+  freezing it**: as-built collapses from 98.0% to 6.8%. Net after elimination it is
+  8.2% → 12.3% at side=16 and 8.2% → **6.8%, worse than doing nothing**, at side=8.
+- **THE ASSUMPTION THAT DIED, stated plainly because I wrote it into the code before testing
+  it.** I claimed "reserving in row order tends to hand back ascending addresses — the same
+  layout an arena would lay down, without the arena." It does not. `reserve_exact` frees a
+  small block and requests a larger one, and glibc satisfies the new request **out of the
+  holes it has just been handed**, so servicing requests in ascending row order produces
+  nothing like ascending addresses.
+- **WHICH IS THE GENERALIZABLE RESULT, and it is worth more than the lever was.** **The
+  allocator cannot be steered into an arena's layout by asking in the right order.** Any
+  future attempt of this shape — reserve-in-order, allocate-in-order, size-hint tricks — is
+  refuted in advance by this row. A real arena must **own one contiguous slab and place rows
+  by offset**; that is now a requirement established by measurement rather than a design
+  preference, and it is the second design this bead has ruled out before building it (the
+  first being an arena that grows rows on demand).
+- **THE CONTROL: bit-identity, asserted on three fixtures** including one that forces a
+  pivot interchange, where the symbolic prediction is computed in an order the numeric pass
+  does not follow. All three match on `row_perm`, `fill_perm`, and the raw `to_bits()` of
+  every L and U value. A short prediction costs a row its adjacency and nothing else, which
+  is what makes the refutation clean: **the lever failed on its own terms, not because it
+  broke something.**
+- **WHAT THIS DOES NOT ESTABLISH.** It does not measure the arena, and it does not show the
+  arena would win — the 53.91% of D1 read misses remains unattacked. It also does not rule
+  out that a *slab* arena hits the same wall for a different reason. And these are placement
+  counts on one allocator: a different allocator (jemalloc, mimalloc) could reorder the
+  as-built figures entirely, which is itself an untested and much cheaper experiment than
+  the arena.
+- **Concrete retry predicate:** before building the slab arena, try **swapping the allocator**
+  and re-running `symbolic_reserve_adjacency_on_the_measured_cell` — if a different allocator
+  holds adjacency through the reserve, the cheap form is revived and the arena is unnecessary.
+  If the arena is built anyway it must be a **single slab with offset-placed rows**, must read
+  near 100% after elimination on this same hook, and must then be timed against the standing
+  floor: cubic deficit **at most 1.89x** (worst CI floor 0.5291, rounds=41), scattered family
+  no worse than **1.2106x**. The lever ships **off** (`SPLU_RESERVE_FROM_SYMBOLIC_ENABLE`) and
+  is kept in-tree because it is the apparatus any successor needs.

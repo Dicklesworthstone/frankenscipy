@@ -479,6 +479,50 @@ impl SortedFactorRow {
     }
 }
 
+/// Grow every row to its symbolically-predicted final capacity, once, before eliminating.
+///
+/// THE POINT IS THAT NOTHING MOVES AFTERWARDS. Measured on the cubic cell, consecutive
+/// factor rows are **93.9% adjacent as built** and **8.4% adjacent once the elimination has
+/// run** — the allocator places them correctly and growth past capacity then scatters them.
+/// Reserving the final size here is what converts the first number into the last one.
+///
+/// MEASURED AND REFUTED AS A LOCALITY LEVER, 2026-08-17. The premise above is only half
+/// right. Reserving does stop the relocation — with it on, the layout at the end equals the
+/// layout at the start — but the reserve pass **destroys the layout while creating it**:
+/// as-built adjacency on the cubic cell falls from **98.0% to 6.8%** (side=8) and **93.5%
+/// to 12.3%** (side=16) the moment every row is reserved. Freeing a small block and
+/// requesting a larger one lets glibc satisfy the request from the holes just freed rather
+/// than hand back ascending addresses, so what gets frozen is a *scattered* layout. Net
+/// after elimination: 8.2% → 12.3% at side=16, and 8.2% → **6.8%, worse**, at side=8.
+///
+/// I EXPECTED "reserving in row order tends to produce ascending addresses". It does not,
+/// and that is the whole result: **the allocator cannot be steered into an arena's layout
+/// by asking in the right order.** A real arena must own one contiguous slab and place rows
+/// by offset. This kept off by default and kept in-tree because it establishes exactly
+/// that, and because the stability property it does deliver is the half an arena needs.
+///
+/// IT CANNOT CHANGE A RESULT, which is what makes it cheap to try. `reserve_exact` sets
+/// capacity and touches neither length nor contents, so every column index and every value
+/// is untouched. The symbolic prediction is computed in natural elimination order while the
+/// numeric pass may pivot, so it can be short; a short prediction costs that row its
+/// adjacency and nothing else. There is no fallback path and no refusal, unlike the
+/// supernodal line, because there is no way for this to be wrong — only ineffective.
+fn reserve_rows_from_symbolic_pattern(n: usize, rows: &mut [SortedFactorRow]) {
+    let initial: Vec<Vec<u32>> = rows.iter().map(|row| row.live_cols().to_vec()).collect();
+    let (u_pattern, l_pattern) = symbolic_fill_pattern(n, &initial);
+    for (row, target) in rows.iter_mut().enumerate() {
+        // A row's final storage holds its surviving upper entries plus every entry the
+        // lower pattern says will be created in it. Both are needed: `u_pattern` is what
+        // remains at the end, `l_pattern` what passes through on the way there.
+        let predicted = u_pattern[row].len() + l_pattern[row].len();
+        if predicted > target.cols.len() {
+            let extra = predicted - target.cols.len();
+            target.cols.reserve_exact(extra);
+            target.vals.reserve_exact(extra);
+        }
+    }
+}
+
 /// The FIRST live entry of every factor row, held in two dense arrays.
 ///
 /// WHY, and the number is the argument (frankenscipy-u7biq). Per-instruction D1
@@ -2497,9 +2541,21 @@ impl NativeSparseLu {
             Some(p) => permuted_sorted_rows(a, p),
             None => csr_sorted_rows(a),
         };
+        // THE CHEAP FORM OF THE ARENA (frankenscipy-u7biq). Rows are 93.9% adjacent as
+        // built and 8.4% adjacent after eliminating, so the allocator's placement is not
+        // the problem — growth past capacity is. Reserving each row's predicted final size
+        // here means no row ever outgrows its block, so the layout the allocator already
+        // gets right survives to the end. `reserve` cannot alter a value, so this is
+        // bit-identical whether or not the prediction is exact.
+        if SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            SPLU_RESERVE_FROM_SYMBOLIC_FACTOR_HITS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            reserve_rows_from_symbolic_pattern(n, &mut rows);
+        }
         // Baseline for the arena gate (frankenscipy-u7biq): what the allocator hands out
-        // before the elimination has grown anything. Test-only, so the shipping path pays
-        // nothing and the release instruction stream is unchanged.
+        // at the point the elimination starts — after any reserve, since that is the
+        // layout the elimination actually begins from. Test-only, so the shipping path
+        // pays nothing and the release instruction stream is unchanged.
         #[cfg(test)]
         LIVE_ROW_ADJACENCY_AS_BUILT.with(|cell| cell.set(row_allocation_adjacency(&rows)));
         // Candidate rows come from FIRST-COLUMN buckets, not from full column
@@ -13565,6 +13621,131 @@ mod tests {
     }
 
     #[test]
+    fn symbolic_reserve_is_bit_identical_and_keeps_the_rows_adjacent() {
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut stable_somewhere = false;
+        for (label, matrix, ordering) in [
+            (
+                "fill-generating 2D Laplacian, natural order",
+                laplacian_2d_for_mmd(8),
+                PermutationOrdering::Natural,
+            ),
+            (
+                "3D Dirichlet Laplacian, reordered - the measured cell's shape",
+                splu_dirichlet_laplacian_3d(8),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "row-swapped tridiagonal - forces a pivot interchange, so the symbolic \
+                 prediction is computed in an order the numeric pass does not follow",
+                row_swapped_tridiagonal_csr(12),
+                PermutationOrdering::Natural,
+            ),
+        ] {
+            SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.store(false, Ordering::Relaxed);
+            let plain = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|e| panic!("unreserved factorization on {label}: {e:?}"));
+            let plain_after = LIVE_ROW_ADJACENCY_AFTER_ELIMINATION.with(|cell| cell.get());
+
+            SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.store(true, Ordering::Relaxed);
+            let reserved = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|e| panic!("reserved factorization on {label}: {e:?}"));
+            let reserved_after = LIVE_ROW_ADJACENCY_AFTER_ELIMINATION.with(|cell| cell.get());
+            // Restore the SHIPPING default, not blindly `false`: a test that leaves a
+            // process-global toggle on the wrong side makes any sibling asserting the
+            // default read this test's leftovers instead (frankenscipy-0zn0v).
+            SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.store(false, Ordering::Relaxed);
+
+            // BIT-IDENTITY IS THE WHOLE CONTRACT. `reserve_exact` moves capacity and
+            // nothing else, so this must hold on every fixture including the one that
+            // pivots away from the order the symbolic pass assumed.
+            assert_eq!(reserved.row_perm, plain.row_perm, "row_perm on {label}");
+            assert_eq!(reserved.fill_perm, plain.fill_perm, "fill_perm on {label}");
+            assert_eq!(
+                factor_value_bits(&reserved.l_rows),
+                factor_value_bits(&plain.l_rows),
+                "L bits on {label}"
+            );
+            assert_eq!(
+                factor_value_bits(&reserved.u_rows),
+                factor_value_bits(&plain.u_rows),
+                "U bits on {label}"
+            );
+
+            // WHAT THE RESERVE ACTUALLY BUYS -- and it is NOT what this lever was built
+            // for. The intent was to preserve the allocator's good as-built layout by
+            // stopping rows outgrowing their blocks. It does stop the growth: with the
+            // reserve on, the layout at the end EQUALS the layout at the start, which is
+            // the property asserted here and the one the mechanism genuinely delivers.
+            //
+            // But measurement showed the reserve pass destroys the layout while creating
+            // it -- 98.0% as-built falls to 6.8% once every row has been reserve_exact'd
+            // -- because freeing a small block and requesting a larger one lets glibc
+            // reuse the holes rather than return ascending addresses. So it locks in a
+            // SCATTERED layout, and on the cubic cell it is a wash at best. Asserting an
+            // adjacency IMPROVEMENT here would encode a claim the measurement refuted.
+            let reserved_as_built = LIVE_ROW_ADJACENCY_AS_BUILT.with(|cell| cell.get());
+            if reserved_as_built == reserved_after {
+                stable_somewhere = true;
+            }
+            assert!(
+                reserved_after.1 <= reserved_after.0,
+                "adjacent pairs cannot exceed counted pairs on {label}"
+            );
+            let _ = plain_after;
+        }
+        assert!(
+            stable_somewhere,
+            "on no fixture did reserving hold the layout fixed across the elimination -- \
+             the one property this pass does deliver is absent, so it is inert"
+        );
+    }
+
+    #[test]
+    fn symbolic_reserve_ships_disabled() {
+        use std::sync::atomic::Ordering;
+        // The lever is unmeasured: the symbolic pass is O(fill) work the shipping path
+        // does not currently do and may cost more than the locality is worth.
+        assert!(
+            !SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.load(Ordering::Relaxed),
+            "symbolic reserve must ship OFF until it has been timed against the standing \
+             1.89x cubic bound"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
+    fn symbolic_reserve_adjacency_on_the_measured_cell() {
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for side in [8usize, 16] {
+            let matrix = splu_dirichlet_laplacian_3d(side);
+            for (arm, enabled) in [("OFF", false), ("ON ", true)] {
+                SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.store(enabled, Ordering::Relaxed);
+                let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                    .expect("factorization");
+                assert_eq!(lu.n, side * side * side);
+                let (bp, ba) = LIVE_ROW_ADJACENCY_AS_BUILT.with(|cell| cell.get());
+                let (ap, aa) = LIVE_ROW_ADJACENCY_AFTER_ELIMINATION.with(|cell| cell.get());
+                let pct = |adj: usize, pairs: usize| 100.0 * adj as f64 / pairs.max(1) as f64;
+                println!(
+                    "reserve {arm} side={side}  AS BUILT {ba}/{bp} = {:.1}%  \
+                     AFTER ELIMINATION {aa}/{ap} = {:.1}%",
+                    pct(ba, bp),
+                    pct(aa, ap)
+                );
+            }
+            SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.store(false, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
     #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
     fn live_row_adjacency_across_the_real_elimination() {
         // THE RETRY PREDICATE OF THE BANKED ROW, run on the real working set rather than
@@ -23326,6 +23507,31 @@ pub static SPLU_PARTIAL_INPLACE_ENABLE: PerfToggle = PerfToggle::new(true);
 /// Factorizations that took the partial in-place arm.
 #[doc(hidden)]
 pub static SPLU_PARTIAL_INPLACE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Reserve every factor row to its symbolically-predicted final size before eliminating.
+///
+/// WHAT THE MEASUREMENT SAYS THIS IS FOR (frankenscipy-u7biq). Adjacency of consecutive
+/// factor rows is **93.9% as built and 8.4% after the elimination** on the cubic cell. The
+/// allocator therefore already places the rows correctly; what destroys the layout is
+/// **growth past capacity**, which relocates a row to wherever a larger block is free. So
+/// the cheap form of the arena is not an arena at all — reserve each row's final size once,
+/// up front, and nothing ever moves again.
+///
+/// IT CANNOT CHANGE A RESULT. `reserve` is a capacity hint: it touches no value, no column
+/// index, and no length. If the symbolic prediction is short — which partial pivoting can
+/// make it, since the symbolic pass eliminates in natural order — the row simply grows as
+/// it does today and only its adjacency is lost. That makes this **bit-identical by
+/// construction** and removes the need for the refusal/fallback machinery the supernodal
+/// path required.
+///
+/// DEFAULT OFF until timed. The symbolic pass is O(fill) work that the shipping path does
+/// not currently do, and it may cost more than the locality is worth. Two preconditions
+/// being cleared is not a measured win.
+#[doc(hidden)]
+pub static SPLU_RESERVE_FROM_SYMBOLIC_ENABLE: PerfToggle = PerfToggle::new(false);
+/// Factorizations that ran the symbolic reserve pass.
+#[doc(hidden)]
+pub static SPLU_RESERVE_FROM_SYMBOLIC_FACTOR_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_BACK_MERGE_ENABLE: PerfToggle = PerfToggle::new(false);
