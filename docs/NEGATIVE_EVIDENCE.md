@@ -32638,3 +32638,65 @@ established yet beyond the fact that the arm finally works.
   worst-floor convention". If a re-expressed side=10 or side=14 lands materially below its
   old floor, the old convention was flattering the family and every figure derived from it
   needs revisiting.
+
+## 2026-08-17 - PeachSummit (cc) - "the rejected candidates are pure overhead" IS WORTH ZERO: rejections are 0.0% on every fixture including one that forces pivot interchanges - but I have no must-hit arm, so read the caveat
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** This refutes a claim the
+  source makes about **what the code does** — how often the candidate loop rejects — not a
+  claim about speed. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::candidate_rejection_rate_on_the_measured_cell`**
+  (diagnostic, `--ignored --nocapture`), with its control
+  `candidate_admission_counts_are_ordered_and_fire_on_both_fixtures`. Candidate
+  admission counts inside the elimination — **no timing and no ratio of any kind**, so the null-gate, per-arm MHz and quiescence
+  requirements do not apply: this is a
+  structural count, and counting candidates does not become an A/B measurement by sitting
+  next to one. `df -h /data` re-checked before each build:
+  **165G / 165G**. **TWO builds**, within cap. `loadavg` 17.42/17.80/20.15 — settled, though
+  no certification was attempted this turn. 527 lib tests pass, warning-clean.
+  `host_identity=thinkstation1`, **`same_host=thinkstation1`** (single local host, no rch
+  worker involved). **OBSERVED VALUE RETURNED BY THE PROBE: `REJECTED=0` on all three
+  fixtures** — counts tabulated below. Nothing deleted.
+- **THE CLAIM BEING PRE-COSTED IS ONE THE CODE MAKES ABOUT ITSELF.** The candidate loop in
+  `factorize_csr` carries the comment *"the rejected candidates are pure overhead, and on
+  the legacy arm each one still pays the full 56-byte header miss to learn it has nothing to
+  do"*. That is an invitation to tighten the bucket, and **no row in this ledger had ever
+  said how many rejected candidates there are.** Asked before building anything, which is
+  the discipline the supernodal line and the arena were both missing.
+
+  | fixture | bucket | examined (> k) | accepted | **rejected** |
+  |---|---|---|---|---|
+  | cubic side=8 | 19,566 | 19,054 (97.4%) | 19,054 | **0 (0.0%)** |
+  | **cubic side=16 (the measured cell)** | 596,204 | 592,108 (99.3%) | 592,108 | **0 (0.0%)** |
+  | row-swapped tridiagonal (forces interchanges) | 511 | 255 (49.9%) | 255 | **0 (0.0%)** |
+
+- **THE LEVER IS DEAD ON THESE FIXTURES.** Every candidate that reaches the head check goes
+  on to update. There is no rejected-candidate overhead to reclaim, so tightening the bucket
+  cannot pay. The only loss is at the cheap `> k` integer filter, which drops **0.7%** on the
+  measured cell — 4,096 entries out of 596,204, tested by a comparison and not by a memory
+  touch. **Killed for two builds, before a line of the lever was written.**
+- **THE CAVEAT, AND IT IS A REAL HOLE IN THIS ROW.** The rejection the loop describes is
+  caused by a pivot interchange leaving a stale label in a bucket. I included a fixture that
+  forces interchanges precisely so a zero could not be an artifact of never pivoting — and it
+  **still read zero**. But that means **I have no must-hit arm: I could not construct any case
+  that produces a nonzero rejection.** By this ledger's own two-arm rule, a counter that has
+  only ever read zero cannot distinguish *"rejections are rare"* from *"the counter is at the
+  wrong site"* from *"the branch is unreachable"*. The ordering invariants are asserted
+  (accepted ≤ examined ≤ bucket, all three firing, on both a filling and a non-filling
+  fixture), which rules out a dead counter, but **not** a mis-sited one.
+- **WHICH LEAVES A SEPARATE QUESTION WORTH SOMEONE'S TIME, and it is not a performance one.**
+  If that branch is genuinely unreachable, it is dead code on a hot path and the `continue`
+  is a silent no-op that has been reasoned about in comments for months. Either it should be
+  proven reachable with a constructed case, or it should become an assertion. **This row does
+  not settle which**, and it would be wrong to delete a defensive branch on the strength of
+  three fixtures reading zero.
+- **WHAT THIS DOES NOT ESTABLISH.** Three fixtures on one ordering path
+  (`ReverseCuthillMcKee` is what `Colamd` actually dispatches to — see the standing note on
+  that aliasing). A matrix with genuinely unpredictable pivoting, or a different ordering,
+  could exhibit rejections. The measured cell is the one that carries the deficit and it
+  reads exactly zero, so **the lever is refused for the cell that matters** regardless.
+- **Concrete retry predicate:** do not build bucket-tightening. If someone wants to reopen
+  it, the entry condition is a **constructed fixture that makes `candidate_rejection_rate_on_the_measured_cell`
+  print a nonzero REJECTED count** — that is simultaneously the must-hit arm this row lacks
+  and the proof that there is anything to reclaim. Absent that, the branch's status (rare vs
+  unreachable) should be settled by construction or assertion, not by another performance
+  attempt.

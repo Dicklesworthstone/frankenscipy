@@ -1759,6 +1759,18 @@ thread_local! {
     /// 1/36 of the stream, and the rewrite is dead before it is written.
     static ROW_VISIT_SPAN: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
+    /// `(bucket entries, entries surviving the > k filter, entries that actually update)`.
+    ///
+    /// PRE-COSTING A LEVER THE CODE ALREADY ADVERTISES. The candidate loop carries a
+    /// comment saying "the rejected candidates are pure overhead", and no row in this
+    /// ledger says how many there are. If rejections dominate, tightening the bucket is a
+    /// cheap win against the 592,108 visits on the cubic cell; if they are rare, the idea
+    /// is dead and must not be built.
+    ///
+    /// This is the question the supernodal line and the arena were both built without —
+    /// "how much can this possibly be worth" — asked BEFORE writing anything.
+    static CANDIDATE_ADMISSION: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 /// How CLUSTERED the rows eliminated at one pivot are, by row index.
@@ -2573,6 +2585,8 @@ impl NativeSparseLu {
         // total across every factorization the test process has performed.
         #[cfg(test)]
         ROW_VISIT_SPAN.with(|cell| cell.set((0, 0, 0)));
+        #[cfg(test)]
+        CANDIDATE_ADMISSION.with(|cell| cell.set((0, 0, 0)));
         // Candidate rows come from FIRST-COLUMN buckets, not from full column
         // membership, and that difference is the second half of frankenscipy-fnnbd.
         //
@@ -2668,6 +2682,11 @@ impl NativeSparseLu {
             // See docs/NEGATIVE_EVIDENCE.md, 2026-08-16.
             let candidates = &candidate_rows[..candidate_len];
             #[cfg(test)]
+            CANDIDATE_ADMISSION.with(|cell| {
+                let (bucket, examined, accepted) = cell.get();
+                cell.set((bucket + candidates.len(), examined, accepted));
+            });
+            #[cfg(test)]
             assert_row_heads_project_rows(&rows, &heads, k, "before pivot selection");
             let pivot_row = select_sorted_pivot_row(
                 &rows,
@@ -2727,6 +2746,11 @@ impl NativeSparseLu {
                 // the rejected candidates are pure overhead, and on the legacy arm
                 // each one still pays the full 56-byte header miss to learn it has
                 // nothing to do.
+                #[cfg(test)]
+                CANDIDATE_ADMISSION.with(|cell| {
+                    let (bucket, examined, accepted) = cell.get();
+                    cell.set((bucket, examined + 1, accepted));
+                });
                 let head = if use_heads {
                     heads.entry_at(row, k)
                 } else {
@@ -2738,6 +2762,11 @@ impl NativeSparseLu {
                 let Some(value) = head else {
                     continue;
                 };
+                #[cfg(test)]
+                CANDIDATE_ADMISSION.with(|cell| {
+                    let (bucket, examined, accepted) = cell.get();
+                    cell.set((bucket, examined, accepted + 1));
+                });
                 let target = &mut trailing_rows[row - (k + 1)];
                 // Measured BEFORE the update, so it is what this visit reads.
                 #[cfg(test)]
@@ -13797,6 +13826,88 @@ mod tests {
             single * 2 < visits,
             "most cubic visits must NOT be single-line sweeps -- got {single}/{visits}"
         );
+    }
+
+    #[test]
+    fn candidate_admission_counts_are_ordered_and_fire_on_both_fixtures() {
+        // The three counters nest by construction: every accepted candidate survived the
+        // filter, and every filtered candidate came from a bucket. A recorder that fired
+        // at the wrong site would break that ordering, and then any rejection RATE read
+        // off it would be meaningless.
+        for (label, matrix, ordering) in [
+            (
+                "tridiagonal, no fill",
+                plain_tridiagonal_csr(256),
+                PermutationOrdering::Natural,
+            ),
+            (
+                "the measured cell's shape",
+                splu_dirichlet_laplacian_3d(8),
+                PermutationOrdering::Colamd,
+            ),
+        ] {
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .unwrap_or_else(|e| panic!("factorization on {label}: {e:?}"));
+            assert!(lu.n > 0);
+            let (bucket, examined, accepted) = CANDIDATE_ADMISSION.with(|cell| cell.get());
+            assert!(bucket > 0, "the bucket counter must fire on {label}");
+            assert!(
+                examined <= bucket,
+                "filtered candidates cannot exceed bucket entries on {label}: \
+                 {examined} > {bucket}"
+            );
+            assert!(
+                accepted <= examined,
+                "accepted candidates cannot exceed examined on {label}: \
+                 {accepted} > {examined}"
+            );
+            assert!(accepted > 0, "some candidate must actually update on {label}");
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
+    fn candidate_rejection_rate_on_the_measured_cell() {
+        // HOW MUCH IS "the rejected candidates are pure overhead" ACTUALLY WORTH? The
+        // candidate loop says it; nothing measures it. If rejections are a large share of
+        // the 592,108 visits, tightening the bucket is cheap and worth building. If they
+        // are rare, the idea is dead and this row says so before anyone writes it.
+        // The rejection the loop describes is caused by a PIVOT INTERCHANGE leaving a
+        // stale label in a bucket, so a fixture set that never pivots cannot exhibit it
+        // and a zero read there would prove nothing about the claim. The swapped
+        // tridiagonal forces interchanges and is included for exactly that reason.
+        for (label, matrix, ordering) in [
+            (
+                "cubic side=8".to_string(),
+                splu_dirichlet_laplacian_3d(8),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "cubic side=16 (the measured cell)".to_string(),
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "row-swapped tridiagonal (FORCES interchanges)".to_string(),
+                row_swapped_tridiagonal_csr(256),
+                PermutationOrdering::Natural,
+            ),
+        ] {
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .expect("factorization");
+            assert!(lu.n > 0);
+            let (bucket, examined, accepted) = CANDIDATE_ADMISSION.with(|cell| cell.get());
+            let pct = |part: usize, whole: usize| 100.0 * part as f64 / whole.max(1) as f64;
+            println!(
+                "{label}  bucket={bucket}  examined={examined} ({:.1}% of bucket)  \
+                 accepted={accepted} ({:.1}% of examined)  \
+                 REJECTED={} ({:.1}% of examined)",
+                pct(examined, bucket),
+                pct(accepted, examined),
+                examined - accepted,
+                pct(examined - accepted, examined)
+            );
+        }
     }
 
     #[test]
