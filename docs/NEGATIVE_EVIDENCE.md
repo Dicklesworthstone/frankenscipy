@@ -33556,3 +33556,65 @@ be read as superseded by this one.
   this null result together point at latency or dependency stalls rather than issue
   bandwidth, which is a different profile (`perf stat` cycles/stalls, not callgrind Ir) and a
   different class of lever.
+
+## 2026-08-17 - PeachSummit (cc) - I MEASURED THE KERNEL IN A BINARY THAT PERTURBS IT: the scan rewrite is worth 24.5% in the test binary and 0.72% in the shipping one, a 34-fold inflation - which fully explains the null timed result
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM, SELF-CORRECTION.**
+  `perf stat --no-inherit` on the **shipping** `release` binary, both scan variants, same
+  workload. **OBSERVED VALUE: 32,256,050,913 instructions (indexed) against 32,024,204,633
+  (iterator).** **ONE build** — the indexed variant, built to obtain the missing arm.
+  `df -h /data` **100G** immediately before it. `loadavg` **13.24 / 16.19 / 18.14** at start,
+  17.89 at the profiled run; **counted work, not timed, so no ratio and no clock gate
+  applies**. **No C BLAS/LAPACK/MKL**: `ldd` shows only `libgcc_s`, `libm`, `libc`, loader.
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted; the temporary
+  revert is preserved in `git stash` rather than discarded.
+- **THE PUZZLE THIS RESOLVES.** The previous row certified that a **5.6-fold** instruction
+  cut in the merge's column comparison moved the timed cubic figure by nothing. That is
+  strange when the shipping binary issues at **IPC 2.25–2.29**: at that efficiency a real
+  instruction cut should show up in elapsed time almost proportionally. Either the cut was
+  not real or the profile was not of the shipping code.
+- **IT WAS NOT OF THE SHIPPING CODE.**
+
+  | binary | instructions removed by the rewrite | share of the run |
+  |---|---|---|
+  | test (`cfg(test)`, counters live) | 30,299,105 | **24.54%** |
+  | **shipping (`release`)** | **231,846,280** | **0.72%** |
+
+  **The test-binary measurement inflated the effect 34-fold.** `matched_run_length` carries
+  `cfg(test)` thread-local recorders (`MATCHED_RUN_PROFILE`, `LAST_MATCHED_RUN`) immediately
+  around the scan, and those accesses act as optimization barriers: in the test build the
+  indexed scan's bounds checks could not be hoisted or elided, in the shipping build they
+  largely already were. **I profiled the instrumentation, not the kernel.**
+- **AND IT PREDICTS THE NULL RESULT EXACTLY.** 0.72% fewer instructions at IPC ~2.27 is an
+  expected effect of about **0.72% on elapsed time**, against a measured run-to-run spread of
+  **12.8%**. The certification could not possibly have detected it. **The null was not
+  evidence that instructions fail to predict time in this kernel — it was evidence that the
+  instruction saving was 34x smaller than I reported.** The previous row drew the wrong
+  conclusion from a correct measurement, and that conclusion is withdrawn.
+- **THREE ROWS ARE CORRECTED BY THIS, and the corrections run the other way from the
+  original claims.** "The comparison is 29.8% of program instructions" holds only for the
+  instrumented binary. "5.6x cheaper" is a ratio within that binary and does not transfer.
+  "The run directory's ceiling is 9.49%" was computed from those same test-binary totals and
+  is therefore **also inflated** — the true ceiling is smaller still, which strengthens the
+  refusal rather than reopening it. **The refusal stands on firmer ground than when I made
+  it.**
+- **THE TRANSFERABLE RULE, and it is not specific to this kernel.** The project's counted
+  rows are taken under `cfg(test)` diagnostics that live **inside the hot path**. That is
+  fine for structural counts — run lengths, churn rates, prefix shares are unaffected by
+  optimization barriers — but it is **invalid for cost attribution**, because the barriers
+  change the very code being costed. **Any instruction or cycle measurement intended to
+  transfer to shipping must be taken on a binary without `cfg(test)` instrumentation in the
+  measured region**, and `release-lines` is not sufficient on its own since it still compiles
+  test code when built via `cargo test`.
+- **WHAT THIS DOES NOT ESTABLISH.** The rewrite is still bit-identical and still removes
+  231.8M instructions; it is **kept**, it simply is not the lever I claimed. This also does
+  not identify what does dominate the cubic cell — IPC 2.25–2.29 with 12.08% L1 load misses
+  says the factorization is issuing well and is not obviously stalled, which is itself
+  awkward for a cell running **1.9x** behind SuperLU and is the next thing to explain.
+- **Concrete retry predicate:** the binary currently at `target/release/perf_splu`
+  (`87925e66715a96c8...`) is the **indexed** variant and must be rebuilt before any
+  certification — a row taken on it would not describe shipping source. Then, before any
+  further micro-optimisation: SuperLU is doing the same factorization in roughly half the
+  elapsed time at comparable issue efficiency, so **the gap is algorithmic or in total work,
+  not in instruction quality** — count total work (flops, fill, updates) on both sides
+  before optimising instructions again.
