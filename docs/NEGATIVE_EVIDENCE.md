@@ -35568,3 +35568,59 @@ inside the 1.05x bar. Local host: `vmstat` 3s `id=89`, `mpstat` 2s `idle=80.14`,
   update. Independently, the honest ceiling on further constant-factor work is now visible:
   **1.74 Ir per update, or about 30% of our current cost**, and every lever should be sized
   against that rather than against the original two-fold gap.
+
+## 2026-08-17 - RainyPrairie (cc) - THE TREND DOES NOT CONTINUE: n=1024 comes in BELOW n=768, so the vs-incumbent gap is a bump not a slope — while the IMPL gap keeps growing
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification.** **Result class: MEASURED,
+  PINNED, EXTRAPOLATION REFUTED.** `df -h /data` read **203G** immediately before the
+  run (205G after). Nothing deleted. Worker **`ovh-a`** (`RCH_WORKER=ovh-a`),
+  `elf_sha256=41ea51c90cddf2ec50b16d0bf3337537ef0a8a8d779c00a4cf5bc7b48c1895cf`.
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-n1024/eigh_n1024_ovha_pinned.log`.
+  No native BLAS/LAPACK/MKL in the resolved graph.
+
+**I PREDICTED ONE ROW AGO THAT n=1024 WOULD SHOW WHETHER THE ~+13% PER STEP
+"CONTINUES OR SATURATES". IT DOES NEITHER — IT REVERSES.**
+
+| n | impl | ratio p50 | ci95 | margin | nulls |
+|---|---|---|---|---|---|
+| 512 | native | 1.5196x | [1.3973, 1.5566] | 10.83x | PASS |
+| 768 | native | 1.7921x | [1.6194, 1.8688] | 7.94x | PASS |
+| **1024** | **native** | **1.6616x** | **[1.6422, 1.7049]** | 14.09x | PASS |
+| 1024 | nalgebra | 1.6091x | [1.5844, 2.2108] | 39.83x | PASS |
+
+- **512 → 768 growth is SOLID**: the native intervals [1.3973, 1.5566] and
+  [1.6194, 1.8688] are **disjoint**.
+- **768 → 1024 is NOT growth**: the p50 falls from 1.7921x to 1.6616x, and the
+  intervals overlap, so a decline is not established either. What IS established is
+  that continued growth is not.
+
+**So the vs-incumbent deficit is a BUMP AROUND n=768, not a slope.** My previous row
+called it "~+13-20% per size step, replicated within each of two workers" — the
+replication was real, but treating two points as a slope and extrapolating was not
+warranted, and one more point refutes the extrapolation. Two points cannot
+distinguish a trend from a bump; three can, which is the whole reason this run was
+worth its slot.
+
+**THE IMPL GAP, BY CONTRAST, IS GENUINELY MONOTONE — and every cell certifies.**
+
+    n=512   IMPL 1.3891x, 1.3991x
+    n=768   IMPL 1.5272x, 1.4465x
+    n=1024  IMPL 1.5897x, 1.5299x     margins 69.69x and 26.88x
+
+The native path pulls further ahead of nalgebra as n grows, cleanly, on this worker.
+That the two curves behave differently — IMPL rising while fsci/scipy1 does not — is
+itself informative: whatever costs us against SciPy at n=768 is not the same thing
+that separates our two internal implementations.
+
+**BOUND AT n=1024: `>= 1.58x`**, from the nalgebra cell's 1.5844 lower bound.
+Standing figures are now n=512 `>= 1.37x`, n=768 `>= 1.52x`, n=1024 `>= 1.58x` —
+and those are cross-worker worsts at 512 and 768 but SINGLE-WORKER at 1024, which is
+a weaker basis and is flagged as such.
+
+**PER-ARM LOAD AND CLOCKS.** `loadavg_pre=4.19 3.82 3.16` on a 16-CPU cpuset;
+`loadavg_post` 6.34 and 9.57 — the largest in-run rise seen on this worker, which
+n=1024's ~520 ms nalgebra measurements explain. `nalg/nalg` null cv 0.34% and 0.88%,
+`sp1/sp1` 0.59% and 1.33% — the tightness held at the largest size. Contention 0.7463x
+and 0.7322x, both below 1.0 ("resident" faster than "alone"), so uninformative again.
+`smt_present=true`, `governor=powersave`. Local host: `vmstat` 3s `id=70`, `mpstat`
+2s `idle=79.97`, `iowait=0.06`, loadavg 11.25/13.56/15.91, one rustc running.
