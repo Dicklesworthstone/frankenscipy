@@ -2360,6 +2360,21 @@ impl NativeSparseLu {
         // has been weakened and the symbolic plan is no longer sound.
         let row_perm: Vec<usize> = (0..n).collect();
         let mut l_rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+        // THE HEAD PROJECTION IS SHIPPING AND MUST NOT BE DROPPED HERE. This is a second
+        // elimination, so it has to consult the same control and maintain the same
+        // structure the sequential path does -- otherwise an A/B against it compares
+        // "supernodal WITHOUT the head cache" against "sequential WITH it" and the
+        // supernodal arm is charged for a lever it simply failed to use. The harness
+        // refused exactly that row (`row_head_cache_toggle_reads=0`) before this existed.
+        //
+        // It is also built ONCE. The first version rebuilt `RowHeads::from_rows` at every
+        // pivot, which is O(n) per pivot and O(n^2) overall -- a cost that would have
+        // swamped the traffic this whole lever exists to remove.
+        let mut heads = RowHeads::from_rows(&rows);
+        let use_heads = !SPLU_ROW_HEAD_CACHE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        if use_heads {
+            SPLU_ROW_HEAD_CACHE_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let widest = rows.iter().map(SortedFactorRow::len).max().unwrap_or(0);
         let mut scratch = SortedFactorRow::with_capacity(widest);
         let mut blocked = SortedFactorRow::with_capacity(widest);
@@ -2391,7 +2406,17 @@ impl NativeSparseLu {
                     .collect();
                 let mut candidates = inside.clone();
                 candidates.push(pivot_col);
-                if select_sorted_pivot_row(&rows, &RowHeads::from_rows(&rows), false, &candidates, pivot_col, diag_pivot_thresh).ok()? != pivot_col {
+                if select_sorted_pivot_row(
+                    &rows,
+                    &heads,
+                    use_heads,
+                    &candidates,
+                    pivot_col,
+                    diag_pivot_thresh,
+                )
+                .ok()?
+                    != pivot_col
+                {
                     // A swap invalidates every block boundary the symbolic pass computed.
                     return None;
                 }
@@ -2422,6 +2447,8 @@ impl NativeSparseLu {
                             false,
                         );
                     }
+                    let next = target.first();
+                    heads.set(row, next);
                 }
             }
 
@@ -2510,7 +2537,9 @@ impl NativeSparseLu {
                         }
                     }
                 }
-                if let Some((next_col, _)) = rows[row].first() {
+                let next = rows[row].first();
+                heads.set(row, next);
+                if let Some((next_col, _)) = next {
                     next_in_bucket[row] = bucket_head[next_col];
                     bucket_head[next_col] = row;
                 }

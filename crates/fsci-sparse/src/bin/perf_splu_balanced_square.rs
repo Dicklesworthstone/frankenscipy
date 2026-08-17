@@ -42,7 +42,8 @@ mod bench {
     use fsci_sparse::{
         CooMatrix, CscMatrix, FormatConvertible, LuOptions, SPLU_BACK_MERGE_ENABLE,
         SPLU_BACK_MERGE_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
-        SPLU_PARTIAL_INPLACE_ENABLE, SPLU_PARTIAL_INPLACE_FACTOR_HITS,
+        SPLU_PARTIAL_INPLACE_ENABLE, SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_SUPERNODAL_ENABLE,
+        SPLU_SUPERNODAL_FACTOR_HITS,
         SPLU_ROW_HEAD_CACHE_DISABLE, SPLU_ROW_HEAD_CACHE_FACTOR_HITS, Shape2D, splu,
         splu_factor_payload_bytes, splu_solve,
     };
@@ -107,6 +108,9 @@ mod bench {
         /// bare invocation came to measure the non-shipping arm while calling itself the
         /// shipping configuration.
         partial_inplace_enabled: bool,
+        /// Which side of `SPLU_SUPERNODAL_ENABLE` the FrankenSciPy arm runs.
+        /// Defaults to `false`, tracking the library default.
+        supernodal_enabled: bool,
     }
 
     fn parse_optional_usize(
@@ -133,6 +137,7 @@ usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [o
   on|off    row-head-cache arm (default on, the shipping layout)
   on|off    back-merge arm (default off, the unmeasured lever)
   on|off    partial-inplace-prefix arm (default on, tracks the library default)
+  on|off    supernodal-blocking arm (default off, tracks the library default)
 
 Prints elf_sha256, provenance, per-round ratios, both A/A nulls and a
 bootstrap-median CI. The ELF SHA-256 is self-reported from inside the process
@@ -150,7 +155,7 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
     }
 
     fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
-        if args.len() > 9 {
+        if args.len() > 10 {
             return Err(format!(
                 "expected at most seven arguments: [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [on|off], got {}",
                 args.len() - 1
@@ -207,6 +212,13 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
         // reported `partial_inplace_factor_hits=0` while calling itself the shipping
         // configuration. The hit counter caught it. A harness default that drifts from
         // the library default is worse than having no default at all.
+        let supernodal_enabled = match args.get(9).map(String::as_str).unwrap_or("off") {
+            "on" => true,
+            "off" => false,
+            other => {
+                return Err(format!("supernodal arm must be `on` or `off`, got {other:?}"));
+            }
+        };
         let partial_inplace_enabled = match args.get(8).map(String::as_str).unwrap_or("on") {
             "on" => true,
             "off" => false,
@@ -234,6 +246,7 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
             head_cache_enabled,
             back_merge_enabled,
             partial_inplace_enabled,
+            supernodal_enabled,
             fixture,
         })
     }
@@ -744,6 +757,7 @@ for raw_line in sys.stdin.buffer:
             head_cache_enabled,
             back_merge_enabled,
             partial_inplace_enabled,
+            supernodal_enabled,
         } = config;
 
         // Provenance, self-reported from inside this process. `observed_*` are
@@ -794,6 +808,17 @@ for raw_line in sys.stdin.buffer:
         SPLU_PARTIAL_INPLACE_ENABLE.store(partial_inplace_enabled, Ordering::Relaxed);
         let partial_inplace_hits_before = SPLU_PARTIAL_INPLACE_FACTOR_HITS.load(Ordering::Relaxed);
         SPLU_PARTIAL_INPLACE_ENABLE.reset_load_count();
+        SPLU_SUPERNODAL_ENABLE.store(supernodal_enabled, Ordering::Relaxed);
+        let supernodal_hits_before = SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed);
+        SPLU_SUPERNODAL_ENABLE.reset_load_count();
+        println!(
+            "supernodal_arm={}",
+            if supernodal_enabled {
+                "ENABLED (symbolic plan, blocked update)"
+            } else {
+                "DISABLED (per-pivot elimination)"
+            }
+        );
         println!(
             "partial_inplace_arm={}",
             if partial_inplace_enabled {
@@ -1046,6 +1071,19 @@ for raw_line in sys.stdin.buffer:
             "the partial-inplace arm did not take effect: \
              enabled={partial_inplace_enabled} but {partial_inplace_hits} took it"
         );
+
+        // DECLINING IS LEGITIMATE for this arm -- it refuses matrices with no exploitable
+        // width or any row interchange -- so this REPORTS hits rather than asserting them.
+        // A row where the arm was enabled and hits are zero measured the SEQUENTIAL path
+        // and must be read as such, not as a supernodal result.
+        let supernodal_hits =
+            SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed) - supernodal_hits_before;
+        println!(
+            "execution_proof: supernodal_enabled={supernodal_enabled} \
+             supernodal_factor_hits={supernodal_hits} \
+             supernodal_toggle_reads={}",
+            SPLU_SUPERNODAL_ENABLE.load_count(),
+        );
         // Reported, never gated on — see `host_mean_busy`.
         println!(
             "pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy={pre_busy:.3}) \
@@ -1144,6 +1182,7 @@ for raw_line in sys.stdin.buffer:
                     head_cache_enabled: true,
                     back_merge_enabled: false,
                     partial_inplace_enabled: true,
+                    supernodal_enabled: false,
                 })
             );
         }
@@ -1161,6 +1200,7 @@ for raw_line in sys.stdin.buffer:
                     head_cache_enabled: true,
                     back_merge_enabled: false,
                     partial_inplace_enabled: true,
+                    supernodal_enabled: false,
                 })
             );
         }
