@@ -35252,3 +35252,54 @@ certified, direction inconsistent. It is not a sampling problem and it is not a 
 problem; it is a between-host problem. Either pin the comparison to a named worker
 and report it as such, or drop it. Running more cells on random draws will keep
 producing this.
+
+## 2026-08-17 - PeachSummit (cc) - SCATTERED SETTLED BY PAIRING, NOT BY CERTIFICATION: the cancellation skip is worth +3.1% there against +9-11% on cubic, and the clock gate now fails REPRODUCIBLY at 90% idle
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, PAIRED, ADMISSIBLE (paired arm);
+  MEASURED AND REFUSED (absolute arm).** Two **shipping-profile** binaries alternated in one
+  window: **`b85a5f8736cfaa53`** (cancellation DETECTING) and **`f8c08a45a3de2521`**
+  (SKIPPING, the shipping default). **NO BUILD.** Live SciPy in the same invocation,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  `df -h /data` **205G**. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE WINDOW WAS GENUINELY CLEAN AND MATCHED THE BRIEF THIS TIME.** `vmstat` read
+  **90/91/91% idle**, `iowait 0`, `loadavg` 9.61 falling. Per-replicate idle 78–92%,
+  loadavg 8.86–10.63 — recorded per replicate.
+- **THE PAIRED RESULT, which is the part that survives.** 16 attempts, 4 void, 6 admissible
+  per arm:
+
+  | arm | n | median | CI95 across replicates | spread |
+  |---|---|---|---|---|
+  | detecting `b85a5f87` | 6 | 1.6200 | [1.5880, 1.7665] | 12.0% |
+  | **skipping (shipping) `f8c08a45`** | 6 | **1.6710** | [1.6050, 1.8215] | 20.5% |
+
+  **+3.1% on scattered, against +9–11% for the same lever on cubic.** That difference is
+  exactly what the structure predicts: scattered takes the in-place fast path on **100%** of
+  updates and its rows hold ~5 entries, so the cancellation loop it skips is short. **No
+  regression — the specific worry that motivated re-measuring scattered is answered.**
+- **THE ABSOLUTE FIGURE IS STILL REFUSED, and now for a reason that is not the window.**
+  `clock_gate: FAIL median=0.9655 n=3 spread=0.0216` on probes 0.9755/0.9655/0.9539. The gate
+  failed at **61% idle** last turn and fails again at **90% idle** now — **reproducible
+  across a 30-point swing in idle, so it is not load.** The cubic cell's gate passes
+  comfortably on the same host in the same sessions (1.0041, spread 0.0024).
+- **AND THE PAIRED DESIGN IS PRECISELY THE ANSWER TO THAT, as predicted before running it.**
+  A clock bias that affects both arms equally cancels in a paired ratio and does not cancel
+  in an absolute one. The previous row's retry predicate said so and this row confirms it:
+  **the same session yields a refused absolute figure and a usable paired one.**
+- **A MECHANISM IS VISIBLE IN THE PROBE COUNTS, and it is not the one I proposed before.**
+  The FrankenSciPy arm supplies ~620 running samples against SciPy's ~1000 on this fixture —
+  because we are ~1.6x faster here, our arm occupies proportionally less wall time. **The
+  earlier "governor ramp" story was refuted; this is a sampling-asymmetry story and it is
+  untested.** The bias direction is against us — our arm reads the *lower* clock — so
+  refusing costs a number that would have flattered us.
+- **WHAT THIS DOES NOT ESTABLISH.** The paired +3.1% has overlapping ranges and n=6 per arm;
+  it establishes "no regression, small gain", not a precise figure. The standing scattered
+  figure remains **1.69x CI[1.63,1.77] n=8** on the pre-lever binary and is still not
+  re-certified on the shipping default — but it is now supported by a paired measurement
+  showing the shipping default is, if anything, slightly better.
+- **Concrete retry predicate:** stop trying to certify scattered absolutely until the clock
+  gate is understood. **Test the sampling-asymmetry hypothesis directly**: equalise the
+  arms' sample counts by probing with the SciPy arm's rounds scaled down, or sample MHz per
+  arm over equal wall-time slices rather than equal round counts. If the ratio moves toward
+  1.0 when sample counts are matched, the gate is measuring its own sampling and needs
+  fixing rather than obeying.
