@@ -118,6 +118,61 @@ assert (3 > 0) and not (0 > 0), "gate comparison is broken"
 assert not (2 > 2) and (3 > 2), "gate cap comparison is off by one"
 
 
+# The drqu7 accuracy-contract predicate, mirrored KEYWORD FOR KEYWORD from the
+# in-crate ratchets in fsci-stats and fsci-linalg. If the two ever disagree the
+# fleet number stops matching the per-crate budgets, which is worse than having no
+# fleet number at all -- so this list must be kept in sync with
+# `accuracy_contract_is_stated` in those crates rather than "improved" here.
+CONTRACT_KEYWORDS = (
+    "byte-identical",
+    "byte identical",
+    "bit-identical",
+    "bit identical",
+    "identical output",
+    "identical result",
+    "ulp",
+    "toleran",
+    "reassoc",
+    "agrees to",
+    "not bit",
+)
+
+
+def contract_stated(doc: str) -> bool:
+    d = doc.lower()
+    return any(k in d for k in CONTRACT_KEYWORDS)
+
+
+# Must-hit / must-miss on the contract predicate, before it is trusted anywhere.
+assert contract_stated("/// CONTRACT: BYTE-IDENTICAL either way."), "predicate misses a real contract"
+assert not contract_stated("/// A/B switch: force the serial path."), "predicate matches a bare description"
+
+
+def contract_scan(src: str, names: set[str]) -> tuple[list[str], list[str]]:
+    """Split `names` by whether the comment block above the declaration states a
+    contract. Walks upward over `//`, `///` and `#[...]` lines, so a `#[doc(hidden)]`
+    between the doc block and the declaration does not hide the contract."""
+    lines = src.split("\n")
+    contracted, bare = [], []
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*pub static ([A-Z0-9_]+)\s*:", line)
+        if not m or m.group(1) not in names:
+            continue
+        doc, j = [], i - 1
+        while j >= 0 and (
+            lines[j].strip().startswith(("//", "#["))
+            or not lines[j].strip()
+            and doc
+        ):
+            if lines[j].strip().startswith("//"):
+                doc.insert(0, lines[j].strip())
+            elif not lines[j].strip():
+                break
+            j -= 1
+        (contracted if contract_stated(" ".join(doc)) else bare).append(m.group(1))
+    return contracted, bare
+
+
 def test_regions(src: str) -> list[tuple[int, int]]:
     """Byte extents of every `#[cfg(test)] mod ... { ... }` body."""
     regions = []
@@ -162,8 +217,10 @@ def census(crate: str) -> int:
         return 1
 
     test_chunks, lib_chunks, names_all, counters = [], [], set(), set()
+    whole_source = []
     for path in src_files:
         src = Path(path).read_text()
+        whole_source.append(src)
         names_all.update(re.findall(DECL, src))
         counters.update(re.findall(COUNTER, src))
         regions = test_regions(src)
@@ -222,8 +279,14 @@ def census(crate: str) -> int:
             print(f"{crate}: CONTROL FAILED: {f}")
         return 1
 
+    contracted, bare = contract_scan("\n".join(whole_source), set(names))
     print(f"{crate}")
     print(f"  A/B switches                 {len(names)}")
+    if names:
+        print(
+            f"  no accuracy contract (drqu7) {len(bare)}"
+            f"  [{len(contracted)} contracted]"
+        )
     if counters:
         undriven_counters = sorted(
             c for c in counters if c not in test_code and c not in bin_code

@@ -34779,7 +34779,7 @@ mod proptest_tests {
     /// lowered with it in the same commit. It does not attempt to fix the
     /// backlog -- it stops the backlog growing, which is the part that can be
     /// done in one commit and held.
-    const UNCONTRACTED_TOGGLE_BUDGET: usize = 35;
+    const UNCONTRACTED_TOGGLE_BUDGET: usize = 26;
 
     fn accuracy_contract_is_stated(doc: &str) -> bool {
         let d = doc.to_ascii_lowercase();
@@ -34831,6 +34831,15 @@ mod proptest_tests {
                 if t.starts_with("//") {
                     doc.push(' ');
                     doc.push_str(t);
+                } else if t.starts_with("#[") {
+                    // SKIP ATTRIBUTES. `#[doc(hidden)]` routinely sits between the
+                    // doc block and the declaration, and stopping here made this
+                    // scan blind to 113 of the 125 fsci-stats toggles it was
+                    // reporting as uncontracted. The budget was measuring an
+                    // artefact of this walk rather than the state of the crate,
+                    // which is why it could be called "zero slack" while actually
+                    // carrying 112.
+                    continue;
                 } else {
                     break;
                 }
