@@ -34584,3 +34584,58 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   same defect**: `SPLU_ROW_HEAD_CACHE_DISABLE` and `SPLU_CUBIC_SPECTRAL_DISABLE` are read
   where? If either sits inside a per-update or per-pivot path, the same 13% may be sitting
   there unclaimed.
+
+## 2026-08-17 - PeachSummit (cc) - STANDING FIGURE RESTATED: the cubic cell is 1.79x slower, CI [1.77x, 1.80x] over TEN replicates - down from 1.9x, on the tightest replicate set this bead has produced
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, REPLICATE-LEVEL CERTIFICATION.**
+  **NO BUILD** — the shipping binary
+  `frankenscipy_engine_sha256=9fb1f8878529857e` was compiled last turn, so this measures in
+  a window it was not built in. `df -h /data` **239G**. **No C BLAS/LAPACK/MKL**: `ldd`
+  reports only `libgcc_s`, `libm`, `libc`, loader. The linear algebra is this project's own
+  safe Rust; the incumbent is live SciPy/SuperLU.
+- **HARNESS/PROVENANCE.** `perf_splu 16 41 16 off cubic on off on off`, balanced-square
+  ABBAABBA, live SciPy in the same invocation.
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.6, `genuine=True`, `fsci_loaded=False`, `observed_os_tasks=1`),
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`,
+  n=4096, nnz=27136, lu_nnz=1231312. Parity gated first:
+  `worst_rel_solution_diff=3.908e-15`. `host_identity=thinkstation1`,
+  `same_host=thinkstation1`, physical_cores=32, logical_threads=64,
+  ram_bytes=231692279808, numa_count=1, `scaling_governor=powersave`,
+  `runtime_isa=avx2+fma`, `requested_frankenscipy_threads=1`,
+  **`actual_observed_frankenscipy_threads=1`**, `affinity=64`.
+- **PER-ARM LOADAVG, per replicate:** 6.87, 8.20, 8.49, 8.38, 8.40, 8.80, 9.94, 17.13,
+  15.78, 25.65. **`host_mean_busy` 0.088–0.228** across all pre/post samples — the quietest
+  band this cell has been measured in. **PER-ARM CPU MHz:** fsci 4126/4104/4010 against
+  scipy 4122/4059/3996. **Clock gate PASS, median 1.0034, n=3, spread 0.0103**, with a
+  negative control in the same invocation reporting **FAIL median=0.9500** on a failing
+  triple, so the gate is discriminating and not stuck open.
+- **TEN ADMISSIBLE REPLICATES, ZERO VOID.** `replicate_aggregate: n=10 median=0.5600
+  ci95_across_replicates=[0.5564,0.5653] observed_range=[0.5512,0.5680] spread=3.0%`.
+
+  | | n | median | CI95 across replicates | spread | deficit |
+  |---|---|---|---|---|---|
+  | **now, ELF `9fb1f887`** | 10 | **0.5600** | [0.5564, 0.5653] | **3.0%** | **1.79x** |
+  | standing, ELF `43c6c571` | 9 | 0.5223 | [0.4995, 0.5324] | 12.8% | 1.9x |
+
+- **STANDING QUOTABLE FOR THE CUBIC CELL, superseding the n=9 form: 1.79x slower than live
+  SuperLU, 95% CI over replicates [1.77x, 1.80x], n=10.** Quote it with its N.
+- **THE SPREAD COLLAPSED FROM 12.8% TO 3.0%, and that is not the lever.** The previous set
+  was taken at loadavg 17–44 with `host_mean_busy` reaching 0.321; this one at 0.088–0.228.
+  **The 12.8% figure this bead used as a detection floor for days was a property of the
+  windows it was sampled in, not of the measurement.** Two rows have now been decided by
+  that distinction — the one-column arm was screened out on the old floor and then resolved
+  cleanly once paired within a window — so the floor should be quoted with the conditions
+  that produced it or not quoted at all.
+- **WHAT THIS DOES NOT ESTABLISH.** The improvement from 1.9x to 1.79x is not cleanly
+  attributable to the one-column arm by *this* row alone: the two figures come from
+  different windows, and the window changed enormously. The **attribution** rests on the
+  interleaved paired comparisons banked earlier today (arm off 0.4806 against arm on 0.550
+  in one window), not on this before/after. This row establishes the current figure and its
+  precision; it does not re-prove the lever.
+- **Concrete retry predicate:** the scattered family is still quoted from a binary without
+  this arm — but the arm never fires there (the fast path takes 100% of scattered updates),
+  so its 1.69x CI[1.63,1.77] n=8 stands unless someone measures otherwise. Sides 10 and 14
+  remain refused on the clock gate. Next lever: audit the remaining toggles for the
+  per-update read defect found this morning, then re-derive Ir per element-update on
+  `9fb1f887` — it was 7.78 before the arm and the counted saving predicts ~6.9.
