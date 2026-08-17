@@ -35013,3 +35013,79 @@ same ballpark, host genuinely busy, so nothing was certified. loadavg
   updates, so a like-for-like comparison needs **its** update count, not just its
   instruction total. If SuperLU performs materially fewer element-updates for the same fill,
   the remaining gap is algorithmic and no amount of kernel work closes it.
+
+## 2026-08-17 - RainyPrairie (cc) - MY OWN n=768 BOUND IS REFUTED BY A DISJOINT INTERVAL, the "grows with n" claim is much weaker than I stated, and IMPL CERTIFIES for the first time — with the OPPOSITE sign
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification.** **Result class: SELF-REFUTATION
+  + FIRST CERTIFIED IMPL CELL.** `df -h /data` read **210G** immediately before the run.
+  Nothing deleted. Harness `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`, worker
+  **fixmydocuments**,
+  `elf_sha256=41ea51c90cddf2ec50b16d0bf3337537ef0a8a8d779c00a4cf5bc7b48c1895cf`.
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-768-second-worker/eigh_n768_fixmydocuments.log`.
+  No native BLAS/LAPACK/MKL in the resolved graph.
+
+**A NEW WORKER CLASS, and it matters for everything below.** `fixmydocuments`:
+16 CPUs, `governor=powersave`, **`smt_present=true`** — the first SMT worker seen on
+this bead — and `loadavg_pre=1.33` on 16 CPUs (8%), by far the quietest measurement
+taken. Per-cell MHz spread 1.06x and 1.27x over a HETEROGENEOUS set: cores at
+~3.5 GHz alongside cores at ~4.4 GHz in the same cpuset.
+
+**REFUTATION 1: my n=768 bound of `>= 2.14x` does not survive.**
+
+| worker | impl | ratio p50 | ci95 | margin | nulls |
+|---|---|---|---|---|---|
+| vmi1293453 | nalgebra | 2.613x | [2.135, 3.031] | 4.59x | PASS |
+| vmi1293453 | native | 2.753x | [2.393, 4.215] | 5.90x | PASS |
+| fixmydocuments | native | **1.761x** | **[1.541, 1.832]** | 8.01x | PASS |
+| fixmydocuments | nalgebra | 1.732x | — | 5.51x | **FAIL → VOID** |
+
+The new admissible cell's ci95 UPPER bound is **1.832**, below the previous worst
+LOWER bound of **2.135**. **The intervals are disjoint.** This is not a wider
+estimate of the same quantity; the two workers disagree outright. Corrected worst
+admissible lower bound at n=768: **`>= 1.54x`**.
+
+**REFUTATION 2: "the loss GROWS with n" is much weaker than I wrote it.** I banked
+that from n=512 `>=1.40x` versus n=768 `>=2.14x` — but those bounds pooled DIFFERENT
+workers at each size, and worker identity turns out to dominate. The only valid
+comparison is within a worker, and exactly one worker has both sizes: vmi1293453,
+2.295x at n=512 rising to 2.613x/2.753x at n=768. Across workers n=768 now spans
+1.76x-2.75x, which OVERLAPS n=512's 1.75x-2.30x. **One within-worker comparison is
+the entire basis for the trend**, and I stated it as though four cells supported it.
+
+**FIRST CERTIFIED IMPL CELL, after nine consecutive failures — and the sign is
+reversed.**
+
+    fixmydocuments nalgebra  IMPL 1.3788x  ci95 [1.3377, 1.3888]  margin 39.24x  CERTIFIED
+    fixmydocuments native    IMPL 1.3213x  ci95 [1.2182, 1.3662]  margin 14.77x  CERTIFIED
+
+The ratio is nalgebra/native, so **the native path is 1.32-1.38x FASTER than
+nalgebra** here. On vmi1293453 the uncertified p50s ran 0.591-0.875 — nalgebra
+faster, the opposite direction. I twice declined to claim that pattern because its
+null bracketed it; that restraint is now doubly justified, since the certified
+result points the other way.
+
+**WHAT MADE IT CERTIFY IS THE HOST, NOT THE STATISTICS.** The `nalg/nalg` null ran
+**cv 0.37% and 1.09%** here against 6.08-25.24% on the loaded workers. That is
+precisely what the min_of=8 refutation predicted: the residual variance was systemic
+rather than one-sided sampling noise, so more sampling could not remove it and a
+quiet host could. The refutation said "change the harness or the conditions"; the
+conditions were the answer.
+
+**CAVEAT ON THE CERTIFIED CELL, stated because it is easy to over-read.** It is one
+worker, of a class not seen before on this bead (SMT, powersave, heterogeneous
+clocks). A certified margin bounds sampling error on THIS host; it says nothing
+about the other three. The n=768 refutation above is exactly what happens when a
+single-worker result is generalised.
+
+**PER-ARM LOAD AND CLOCKS.** `loadavg_pre=1.33 1.78 2.47`; `loadavg_post` 2.16 and
+3.94. nalgebra cell mhz [3352..3542] spread 1.06x; native cell mhz [3505..4434]
+spread 1.27x; `smt_present=true`, arms unpinned on the full 16-CPU cpuset. Local
+host at the time: `vmstat` 3s `id=75`, `mpstat` 2s `idle=73.61`, `iowait=0.02`,
+loadavg 16.54/21.37/25.55.
+
+**CONTENTION, within tolerance for once.** 0.8063x and 0.9242x against the 1.05x
+bar, drift 0.7951x and 1.0399x. The native cell's contention deviation (0.076)
+exceeds its drift deviation (0.040), so that one is informative and passing.
+
+**Corrected standing figures: n=512 `>= 1.40x`, n=768 `>= 1.54x`.** The trend claim
+is downgraded to a single within-worker observation.
