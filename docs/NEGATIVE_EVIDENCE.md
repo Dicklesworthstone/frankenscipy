@@ -35192,3 +35192,63 @@ is downgraded to a single within-worker observation.
   scattered clock gate passes on a median of three probes, or **pair the binaries
   interleaved** — a paired design cancels a clock bias that affects both arms equally, which
   an absolute measurement cannot, and it is how both cubic levers were resolved.
+
+## 2026-08-17 - RainyPrairie (cc) - THE CERTIFIED IMPL DIRECTION DOES NOT REPLICATE: it is worker-bound, and "a quiet host is what certifies it" — my own explanation from the previous row — is wrong
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification.** **Result class: FAILED
+  REPLICATION + SELF-CORRECTION.** `df -h /data` read **208G** immediately before the
+  run. Nothing deleted. Worker **vmi1293453**,
+  `elf_sha256=5a704bfe7362fb43a764de4067b76e85abd4588f29dc920fbad21926750b0082`.
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-impl-replication/eigh_n768_vmi1293453_quiet.log`.
+  No native BLAS/LAPACK/MKL in the resolved graph.
+
+**THE REPLICATION FAILED, WHICH IS WHY IT WAS WORTH RUNNING.** The previous row
+certified `IMPL nalg/native` at 1.3788x and 1.3213x on `fixmydocuments` — the native
+path FASTER — and I explicitly flagged that it needed a second quiet worker before
+anyone acted on it. It does not survive:
+
+| worker | load | IMPL p50 | margin | verdict | direction |
+|---|---|---|---|---|---|
+| fixmydocuments | 1.33/16 | 1.3788, 1.3213 | 39.24x, 14.77x | **CERTIFIED** | native faster |
+| vmi1293453 | **1.94/8 (quiet)** | 0.8987, 0.9018 | 0.22x, 0.11x | not certified | **nalgebra faster** |
+| vmi1293453 | 11.12/8 (loaded) | 0.591-0.875 | 0.31-0.89x | not certified | nalgebra faster |
+
+**The IMPL comparison is WORKER-BOUND.** Nobody should act on "native is faster" —
+it is a property of one host, not of the code.
+
+**AND MY EXPLANATION FOR THE CERTIFICATION WAS WRONG.** I wrote that "what made it
+certify is the HOST, NOT THE STATISTICS", meaning quietness. This run makes vmi1293453
+quiet — `loadavg_pre=1.94` on 8 CPUs, comparable to fixmydocuments' 1.33 on 16 — and
+its `nalg/nalg` null is STILL cv **17.74% and 25.11%**, against fixmydocuments'
+**0.37% and 1.09%**. Quietness is not the variable. Some property of that specific
+worker — timer resolution, frequency behaviour under `powersave`, SMT scheduling —
+gives it two-orders-tighter nulls, and I do not know which. "A quiet host fixes it"
+was a plausible story fitted to one observation, and one more draw refuted it.
+
+**A REAL AND USEFUL RESULT DID COME OUT: the vs-incumbent ratio is stable WITHIN a
+worker across load states, and varies BETWEEN workers.**
+
+    vmi1293453 loaded (11.12):  2.613x, 2.753x
+    vmi1293453 quiet  (1.94):   2.5415x, 2.5246x
+    fixmydocuments quiet:       1.761x
+
+A 6x change in host load moves the ratio by ~5%, while changing worker moves it by
+~45%. **Cross-worker variation dominates and load barely matters** — which retires
+the load-artefact worry properly, and says any future bound must be quoted across
+workers or not at all.
+
+**BOUND UNCHANGED at n=768: `>= 1.54x`.** Both new cells are admissible (margins
+5.54x and 2.55x, nulls PASS) at 2.5415x [1.7918, 2.7468] and 2.5246x [2.2557,
+4.2042], but neither lowers the worst admissible lower bound, which remains
+fixmydocuments' 1.541.
+
+**PER-ARM LOAD AND CLOCKS.** `loadavg_pre=1.94 1.52 1.69`; `loadavg_post` 3.00 and
+2.64. All cores 3195 MHz, spread 1.00x, `smt_present=false`, arms unpinned on the
+8-CPU cpuset. Local host: `vmstat` 3s `id=61`, `mpstat` 2s `idle=75.32`,
+`iowait=0.02`, loadavg 17.28/21.54/24.39.
+
+**WHAT TO DO WITH THE IMPL COMPARISON.** Ten cells across four workers, one
+certified, direction inconsistent. It is not a sampling problem and it is not a load
+problem; it is a between-host problem. Either pin the comparison to a named worker
+and report it as such, or drop it. Running more cells on random draws will keep
+producing this.
