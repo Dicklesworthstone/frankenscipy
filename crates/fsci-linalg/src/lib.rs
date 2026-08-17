@@ -8,15 +8,14 @@ pub mod cossin;
 // Worker reuse across a factorization's panels; substrate for frankenscipy-ua3gn,
 // not yet wired into any factorization. See panel_pool.rs.
 //
-// DELIBERATELY NOT DECLARED YET, so Cargo does not compile the file. The module is
-// written and its first compile error (a `!`-typed panic closure that would not
-// coerce in a boxed cast) is fixed, but rch then refused two builds with
-// `queue_timeout` and the fix has never been type-checked. An unreferenced .rs
-// file in src/ is inert; a broken `mod` declaration breaks `cargo test -p
-// fsci-linalg` for every pane in the fleet. Uncomment the line below and build:
-//   RCH_REQUIRE_REMOTE=1 RCH_CARGO_WRAPPER_BYPASS=1 env -u CARGO_TARGET_DIR \
-//     rch exec -- cargo test -p fsci-linalg --lib -- --nocapture panel_pool
-// mod panel_pool;
+// DECLARED DELIBERATELY, and the reason is frankenscipy-ozg54. This module shipped
+// undeclared because its fix was unverified: rch worker vmi1153651 served a
+// snapshot that was current as of the last COMMIT but dropped the UNCOMMITTED
+// working-tree edit, so three consecutive builds returned exit 0 while compiling
+// none of it. Committing the declaration is therefore the only way to get the file
+// in front of a compiler, AND it is a direct test of that diagnosis: if committed
+// edits do reach the worker, the test count moves 596 -> 602.
+mod panel_pool;
 
 // Tiled (PLASMA-style) Cholesky — foundation for the task-DAG dense-lane
 // restructure (increment 1: tiled-storage sequential factor, not yet wired into
