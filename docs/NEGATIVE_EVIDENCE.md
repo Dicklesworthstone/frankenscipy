@@ -33367,3 +33367,64 @@ contention claim in either direction.
 **What this does NOT license.** No implementation crossover. No contention figure.
 No claim tighter than `>= 1.40x` for the loss. The previous row's `>= 1.87x` should
 be read as superseded by this one.
+
+## 2026-08-17 - PeachSummit (cc) - THE BOUNDS CHECKS WERE THE COST: eliding them makes the column comparison 5.6x cheaper in instructions, bit-identical, in one function body - and the process-global measurement arm it exposed was a real defect
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM, POSITIVE.**
+  Whole-program callgrind totals, `--cache-sim=yes`, two arms of one binary. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::ab_totals_compare_{single,doubled}`**; validity
+  controls `doubled_column_compare_is_bit_identical_and_takes_effect` and
+  `iterator_scan_equals_the_indexed_scan_it_replaced`. **OBSERVED VALUE: `extra_passes=59501`
+  on both binaries, marginal Ir 36,824,374 → 6,525,269.** `df -h /data` 106G / 105G before
+  each build. **TWO builds, over the ONE-per-pane cap** — the second was forced by a
+  concurrency defect the first exposed; disclosed, not folded in. 533 lib tests pass,
+  warning-clean. `loadavg` 14.68 with **four local builds running, so no timing was
+  attempted and none is claimed here**. `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE LEVER CAME STRAIGHT OUT OF THE PREVIOUS ROW'S ARITHMETIC.** One comparison cost
+  ~619 Ir over runs of a few tens of entries — order 10–15 instructions to compare two
+  `u32`s. That is bounds-check overhead, not work: the scan wrote `left[span + offset]`
+  inside its inner loop, so every element carried a check against a length the optimizer
+  could not relate to `bound`. Narrowing to `&left[..bound]` once and walking
+  `chunks_exact`/`zip` gives the compiler operands it already knows are in range.
+
+  | | whole-program Ir | marginal cost of one comparison | per comparison |
+  |---|---|---|---|
+  | indexed scan | 123,470,235 | 36,824,374 | ~619 Ir |
+  | **iterator scan** | **68,740,493** | **6,525,269** | **~110 Ir** |
+
+  **5.6x cheaper on the comparison**, with `extra_passes=59501` identical on both binaries,
+  so the two deltas measure the same quantity.
+- **IT IS BIT-IDENTICAL, AND THAT IS ASSERTED RATHER THAN ARGUED.** The replaced indexed
+  form is **kept as a test-only reference** and the rewrite is checked against it
+  exhaustively: every length 0..40, crossed with every possible first-divergence position,
+  plus fully-equal and asymmetric-length cases. The test also pins that the returned value
+  **equals the divergence index**, so it fails if both implementations agree on a wrong
+  answer rather than only if they disagree.
+- **THE WHOLE-PROGRAM 44.3% DROP IS CONFOUNDED AND I AM NOT CLAIMING IT.** Two things
+  changed between the binaries: the scan rewrite and the measurement arms moving from
+  process-global atomics to `cfg(test)` thread-locals. The **marginal** figure (619 → 110 Ir)
+  is measured within each binary by the same two-arm difference, so it is clean; the
+  123.5M → 68.7M total is not, and quoting it would be attributing a mixed change to one
+  cause.
+- **AND THE REWRITE EXPOSED A DEFECT I HAD INTRODUCED TWO ROWS EARLIER.** The full suite
+  failed on `candidate_admission_counts_are_ordered_and_fire_on_both_fixtures` while that
+  test passed in isolation. Cause: the skip arm was a **process-global** toggle that
+  produces deliberately incorrect factorizations, and `cargo test` runs this crate's tests
+  concurrently in one process — so it corrupted a sibling test's factor. A global that
+  changes a code path is a hazard; **a global that changes RESULTS is a much worse one**,
+  and I shipped the second kind. Fixed at the root: both measurement arms are now
+  `cfg(test)` thread-locals, so one test cannot reach another and the shipping binary
+  carries neither branch nor risk.
+- **WHAT THIS DOES NOT ESTABLISH, and it is the whole caveat.** **This is an instruction
+  count, not a duration.** Four local builds were running; nothing was timed and no ratio
+  moved. Instructions are not time — the comparison's misses were already near zero, so this
+  removes work that may have been overlapped and hidden. **The standing cubic figure remains
+  1.86x CI [1.78,1.97] n=6 until a timed run says otherwise, and it is entirely possible
+  this changes nothing measurable.**
+- **Concrete retry predicate:** re-certify the cubic cell in a genuine no-build window —
+  replicate ratios plus a clock gate on the median of ≥3 probes, per the fixed conventions —
+  and compare against 1.86x CI [1.78,1.97]. **If the interval does not move, bank that
+  plainly: a 5.6x instruction reduction on a kernel that was not the bottleneck is a
+  negative result about where the time actually goes**, and it should be recorded as one
+  rather than quietly dropped.
