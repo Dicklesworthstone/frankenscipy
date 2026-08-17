@@ -34376,3 +34376,58 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   detection floor, and therefore worth exactly one certification window if the counted delta
   survives. **It must be bit-identical**, which is available as a control here because the
   arithmetic and its rounding are unchanged by where the entry is written.
+
+## 2026-08-17 - PeachSummit (cc) - CONFIRMED IN ONE PROFILE: the remainder path costs 198 Ir per rejected update, and the cross-row estimate I flagged as unsafe was right within 5%
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** Callgrind call counts
+  and inclusive costs from a **single** run of the **shipping** `release` binary
+  `5e8bf41a397a2109`, side=16 — no `cfg(test)` code in the measured region. **ONE build.**
+  `df -h /data` **275G** immediately before it. `loadavg` 7.67/10.56/9.48 at start, 6.66 at
+  the profiled run. **Counted, not timed.** **No C BLAS/LAPACK/MKL.**
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **COUNTED MECHANISM, from the one profile:** `merge_sorted_remainder` retires
+  **2,861,226,169 instructions** across 20,538,552 calls, vs **1,213,213,628
+  instructions** in `__memcpy` across 85,039,362 calls, out of a program total of
+  27,558,614,242. No wall-clock reading is involved anywhere in this row.
+- **THE RETRY PREDICATE THIS DISCHARGES.** Two rows ago I derived "146.1 Ir per call" for
+  `merge_sorted_remainder` by dividing one run's instruction total by a call count taken
+  from a *different* run's diagnostic, and flagged it as **exactly the cross-row arithmetic
+  this bead has been burned by three times** — requiring confirmation in a single profile
+  before any code was written against it.
+
+  | quantity | single-profile value | earlier cross-row estimate |
+  |---|---|---|
+  | `merge_sorted_remainder` calls per factorization | **555,096** | 529,345 (derived) |
+  | Ir per call | **139.3** | 146.1 |
+  | `__memcpy` calls per factorization | 2,298,361 | — |
+  | Ir per memcpy | 14.3 | — |
+  | memcpys per remainder call | **4.1** | — |
+  | **cost per rejected update** | **198 Ir** | — |
+
+- **THE ESTIMATE HELD, WITHIN 5%, AND SAYING SO MATTERS AS MUCH AS THE NUMBER.** The
+  discipline that produced three withdrawn rows also produced one flagged estimate that
+  turned out fine. **Flagging is not the same as being wrong**, and a ledger that only
+  records the cases where caution was vindicated by a refutation teaches the wrong lesson.
+  The caution was still correct: the call count could have been off by 40x and nothing in
+  the earlier row would have caught it.
+- **AND THE CONSISTENCY IS EXACT WHERE IT SHOULD BE.** 555,096 calls per factorization
+  equals, to the unit, the `rejected=555096` count from the fast-path shortfall histogram
+  and the 555,357 pattern-changing updates measured independently. Three diagnostics
+  written days apart, on different counters, agree — which is the strongest available
+  evidence that the instrumentation describes the elimination and not itself.
+- **WHAT IT SIZES.** Each of the 555,096 rejected updates pays **139.3 Ir of merge plus 4.1
+  memcpys at 14.3 Ir**, totalling **198 Ir**, for what the shortfall histogram says is —
+  94% of the time — the insertion of **one column**. Together that is **14.8% of the
+  program**, confirmed from one run rather than assembled from two.
+- **WHAT THIS DOES NOT ESTABLISH.** It does not show a specialised one-column path would be
+  cheaper than 198 Ir; it must still locate the insertion point and shift the tail, and the
+  4.1 memcpys per call include the `truncate`/`extend_from_slice` that any in-place
+  insertion also performs. **The saving is the difference between 198 Ir and whatever the
+  specialised path costs, and that number does not exist yet.**
+- **Concrete retry predicate:** implement the one-column insertion path behind a default-off
+  toggle, assert **bit-identity** (available here, since the arithmetic and its rounding do
+  not depend on where the entry is written), and measure the counted delta on a shipping
+  binary. **Screen it against the standing floor before certifying:** if the delta is under
+  ~13% of the program it should be banked as counted and NOT given a certification window on
+  its own — but it may be paired with removing the exact-cancellation check (~12.5%, and
+  measured to drop nothing on this cell), and the two together would clear the floor.
