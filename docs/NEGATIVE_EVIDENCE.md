@@ -33489,3 +33489,70 @@ be read as superseded by this one.
   elapsed time
   says the bottleneck is elsewhere, and it must be banked as a negative rather than left
   implied.
+
+## 2026-08-17 - PeachSummit (cc) - THE PREDICTED NEGATIVE LANDED: a 5.6-fold instruction cut in the merge's comparison moves the timed cubic figure by nothing detectable
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, REPLICATE-LEVEL, NEGATIVE — and
+  banked because it is negative.** The previous row committed in advance: *"If the
+  certification shows no movement at all, that is the more important result... it must be
+  banked as a negative rather than left implied."* It shows no movement.
+- **NO BUILD THIS TURN.** The ELF
+  `43c6c5717630c332f9fe7a6aa4ff18d2a9ec93d73b2bff24fbd3a6b10dcdf98c` was compiled last turn
+  specifically so this would not be measured in the window it was built in. `df -h /data`
+  **100G**.
+- **NO C BLAS, LAPACK OR MKL — verified, not asserted.** `ldd` on the measured binary
+  reports exactly `linux-vdso`, `libgcc_s`, `libm`, `libc`, `ld-linux`. The linear algebra
+  is this project's own safe Rust; the incumbent is live SciPy/SuperLU.
+- **HARNESS/PROVENANCE.** `perf_splu 16 41 16 off cubic on off on off`, balanced-square
+  ABBAABBA, live SciPy in the same invocation.
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.6, `genuine=True`, `fsci_loaded=False`, `observed_os_tasks=1`),
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`,
+  n=4096, nnz=27136, lu_nnz=1231312, parity `worst_rel_solution_diff=3.908e-15`.
+  `host_identity=thinkstation1`, `same_host=thinkstation1`, physical_cores=32,
+  logical_threads=64, ram_bytes=231692279808, numa_count=1, `scaling_governor=powersave`,
+  `runtime_isa=avx2+fma`, `requested_frankenscipy_threads=1`,
+  **`actual_observed_frankenscipy_threads=1`**, `affinity=64`. Execution proof:
+  `fsci_backend=NativeSparseLu`, `fsci_ordering=ReverseCuthillMcKee`,
+  `cubic_spectral_factor_hits=0` against 181 toggle reads, `partial_inplace_factor_hits=181`,
+  `supernodal_factor_hits=0`.
+- **PER-ARM LOADAVG, recorded per replicate as required:** 17.27, 44.00, 33.78, 32.40,
+  31.16, 28.47, 31.16, 27.30, 16.86 (1-minute, at each arm's start);
+  `host_mean_busy` 0.153 pre / 0.321 post. **PER-ARM CPU MHz, running-state-conditioned:**
+  fsci 3966/3922/3958 against scipy 3943/3894/3915.
+- **THE CLOCK GATE PASSES ON THE MEDIAN OF THREE, per the convention fixed after a single
+  probe was found unreproducible:** `clock_gate: PASS median=1.0074 n=3 spread=0.0051
+  bar=+/-0.02`. Negative control exercised in the same invocation: a failing triple reports
+  `FAIL median=0.9532`, so the gate is discriminating and not stuck open.
+- **THE RESULT: NINE ADMISSIBLE REPLICATES, ZERO VOID.**
+
+  | | n | median | CI95 across replicates | spread |
+  |---|---|---|---|---|
+  | **after the scan rewrite** | 9 | **0.5223** | **[0.4995, 0.5324]** | 12.8% |
+  | before (standing, 2026-08-17) | 6 | 0.5365 | [0.5090, 0.5614] | 15.4% |
+
+  The intervals **overlap heavily**, and the new median is nominally *lower*. **There is no
+  detectable improvement.** A 5.6-fold instruction reduction in the comparison — 618.9 to
+  109.7 Ir per pass, 82.3% of that kernel's cost — produced no movement a nine-replicate
+  measurement can see.
+- **WHY THIS IS THE USEFUL RESULT.** It says plainly where the elapsed time is *not*. The
+  merge's column comparison was ~30% of program instructions and is now ~9.5%, and the cell
+  did not move: **that work was already overlapped or hidden, exactly as the near-zero miss
+  count predicted.** Instruction count is not a proxy for elapsed time in this kernel, and
+  three rows of this bead were argued on instruction and byte shares that this contradicts.
+- **WHAT I WILL NOT CLAIM: that the change made anything worse.** The nominal drop 0.5365 →
+  0.5223 sits inside overlapping intervals, and the two sets were taken in **different
+  windows** — the standing n=6 ran at `host_mean_busy` 0.155–0.179, this n=9 at loadavg 17–44
+  with `busy` reaching 0.321. Window is a sufficient explanation for a difference this size,
+  and this project has already retracted one "the bound widened" claim built on exactly that
+  confound.
+- **WHAT THIS DOES NOT ESTABLISH.** It does not show the rewrite is worthless — it is
+  bit-identical, removes real work, and cannot be slower; it shows only that this cell does
+  not expose it. A different fixture, a smaller cache, or a machine where the merge is not
+  latency-bound could still surface it. **It is kept.**
+- **Concrete retry predicate:** the cubic deficit stands at **1.9x, CI over replicates
+  [1.88x, 2.00x], n=9** — quote it with its N. Before any further instruction-level work on
+  this kernel, **measure where the elapsed time actually goes**: the near-zero miss count and
+  this null result together point at latency or dependency stalls rather than issue
+  bandwidth, which is a different profile (`perf stat` cycles/stalls, not callgrind Ir) and a
+  different class of lever.
