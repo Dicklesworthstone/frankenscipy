@@ -34859,3 +34859,52 @@ wa=0`, and `mpstat` over 1s gave `idle 49.80` with `iowait 0.62`. So idle was
 23-50%, not 88% — the box was 50-77% busy. The zero-iowait half of the brief held.
 loadavg 26.60/30.76/26.80, local MHz spread 1429-4217 (2.95x). No row certified on
 this window.
+
+## 2026-08-17 - PeachSummit (cc) - THE CANCELLATION SKIP CONFIRMED AT 9.2%, AND MY "RANGES DISJOINT" CLAIM FROM n=4/5 DOES NOT SURVIVE n=6/7
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, PAIRED, ADMISSIBLE.** Same two
+  **shipping** binaries as the previous row, alternated again with more replicates:
+  `frankenscipy_engine_sha256` **`78c6daee700b0303`** (detecting) and
+  **`a88d162fba5586b5`** (skipping). **NO BUILD** — both were already on disk, so this
+  measures in a window neither was built in. Live SciPy in the same invocation,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+  `df -h /data` **214G**. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **I READ CPU IDLE MYSELF AND IT DID NOT MATCH THE BRIEF.** The tick reported "idle only
+  24%"; `vmstat` read **75% idle** at the start, and per-replicate idle ranged **27%–87%**
+  with load 14.6–34.1. Recorded per replicate alongside loadavg, as required. **PER-ARM CPU
+  MHz:** fsci 3979/3932/4025 against scipy 3978/3884/4013; **clock gate PASS, median 1.0028,
+  n=3, spread 0.0120.**
+- **THIRTEEN OF SIXTEEN REPLICATES ADMISSIBLE; three void** (two detecting, one skipping),
+  all at the loaded end — the gate again converting load spikes into voids rather than
+  numbers.
+
+  | | n | median | CI95 across replicates | observed range | spread |
+  |---|---|---|---|---|---|
+  | detecting | 6 | 0.5696 | [0.5613, 0.6064] | [0.5609, **0.6368**] | 13.3% |
+  | **skipping** | 7 | **0.6222** | [0.6140, 0.6374] | [**0.5890**, 0.6837] | 15.2% |
+
+  **9.2% faster**, cubic deficit **1.76x → 1.61x**.
+- **AND THE CLAIM I MADE LAST TURN DOES NOT SURVIVE.** I reported the ranges as "completely
+  disjoint" on n=4/5. At n=6/7 they **overlap**: a detecting replicate reached 0.6368 and a
+  skipping one fell to 0.5890. **Disjointness was a small-sample artifact.** What survives
+  is the median separation — 0.5696 against 0.6222, with the CIs across replicates still
+  clear of one another — and the effect size shrinks from 10.7% to **9.2%** as the tails
+  fill in. **The lever is real; my characterisation of the evidence was over-strong, and the
+  fix was simply more replicates.**
+- **THE SPREADS ALSO TELL A DIFFERENT STORY THAN LAST TURN.** Both arms now show 13–15%
+  spread, against 3.4% and 0.8% before. Same binaries, same design, one turn apart: **spread
+  is a property of the window, not of the arm**, which is the same lesson that retired the
+  12.8% "detection floor" — and it means the previous row's 0.8% skipping spread should not
+  be quoted as a property of that binary.
+- **WHAT THIS DOES NOT ESTABLISH.** Still a semantic change: matrices that cancel retain
+  explicit zeros, asserted only by solve agreement, not by bits. Still one cell, one host.
+  And two independent estimates now exist for the same lever — 10.7% and 9.2% — which is
+  itself the honest summary: **the effect is roughly 9–11%, not a single figure.**
+- **Concrete retry predicate:** the two estimates agree well enough to act on. Flip
+  `SPLU_SKIP_CANCELLATION_ENABLE` to `true` **together with** re-certifying the standing
+  cubic figure on the new default, since 1.79x n=10 was measured on a detecting binary; and
+  re-check the scattered family, whose fast path uses the same cancellation loop and whose
+  standing 1.69x predates both levers. **Do not quote a combined "levers together" figure
+  without measuring it** — the one-column and cancellation arms have never been timed as a
+  pair, and their counted savings are not additive by assumption.
