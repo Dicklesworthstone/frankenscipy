@@ -33805,3 +33805,70 @@ be read as superseded by this one.
   updates, not cheaper ones** — and the supernodal line already closed that route with a
   measured no-crossover result, so the honest position is that **this cell may be near the
   limit of what this elimination design can reach.**
+
+## 2026-08-17 - RainyPrairie (cc) - THE eigh LOSS GROWS WITH n, measured on the quietest worker yet: n=768 is >=2.14x slower where n=512 is >=1.40x, and one cell VOIDED itself
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification.** **Result class: MEASURED,
+  vs-incumbent LOSS, SIZE TREND, 3 of 4 cells admissible.** `df -h /data` read **97G**
+  immediately before the run. Nothing deleted. Harness
+  `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`, worker **vmi1293453**,
+  `elf_sha256=50ec58f4f0afd68a7c015cb878d458a82f91c4307a65f92e14350ce76a51bf88`.
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-size-trend/eigh_n512_n768_vmi1293453.log`.
+  **No native BLAS/LAPACK/MKL in the resolved graph** — gated by
+  `no_native_blas_smuggling` in `fsci-linalg`, green in this build.
+
+| n | impl | fsci | scipy1 | ratio p50 | ci95 | margin | nulls |
+|---|---|---|---|---|---|---|---|
+| 512 | nalgebra | 89.6 ms | 39.3 ms | 2.295x | [1.708, 2.960] | 2.63x | PASS |
+| 512 | native | 81.0 ms | 38.7 ms | 2.200x | [1.826, 2.724] | 1.22x | **FAIL → VOID** |
+| 768 | nalgebra | 264.4 ms | 98.0 ms | 2.613x | [2.135, 3.031] | 4.59x | PASS |
+| 768 | native | 286.4 ms | 97.0 ms | 2.753x | [2.393, 4.215] | 5.90x | PASS |
+
+**THE HEADLINE IS THE TREND, WHICH IS NEW.** Every previous row on this bead sat at
+n=512 alone, so nothing said whether the gap widens. It does:
+
+    n=512   worst admissible ci95 lower bound  >= 1.40x   (across 2 workers, 5 cells)
+    n=768   worst admissible ci95 lower bound  >= 2.14x
+
+A conservative bound that RISES with n is not a noisier version of the same number;
+it means the deficit is asymptotic rather than a fixed overhead, and quoting the
+n=512 figure as "the" eigh loss understates what happens at the sizes that matter.
+
+**ONE CELL VOIDED ITSELF AND IS EXCLUDED.** `n=512 impl=native` returned
+`nulls=FAIL` with a margin of 1.22x against the required 2.00x — its `sp1/sp1` null
+ran cv=28.59% with ci95 [0.834, 1.984], wide enough to bracket the effect it was
+supposed to bound. Its p50 of 2.200x sits comfortably inside the story the other
+three tell, which is exactly why it is worth saying that it was dropped: an
+agreeable number that fails its own gate is the easiest kind to keep by accident.
+
+**THE LOSS IS NOT A LOAD ARTEFACT, and this run is what rules that out.** This is
+the same worker (vmi1293453) that earlier today reported 2.073x at
+`loadavg_pre=11.12` on 8 CPUs — 139% utilisation. Today it ran at
+`loadavg_pre=2.18` (27%), the quietest measurement on this bead, and the ratio went
+**UP**, to 2.295x. Absolute times fell as expected (fsci 225.8 → 89.6 ms, scipy1
+107.6 → 39.3 ms) but the PAIRED RATIO did not improve. Host load was never the
+explanation.
+
+**PER-ARM LOAD AND CLOCKS, as required.** `loadavg_pre=2.18 2.05 1.79`;
+`loadavg_post` 3.38 / 3.24 / 2.55 / 2.38 across the four cells. All cores
+**3195 MHz, spread 1.00x, `smt_present=false`**, arms unpinned on the full 8-CPU
+cpuset. `scipyN` reportable and NOT oversubscribed (`peak_tasks=8`, `cpuset=8`) in
+every cell. Arm agreement `worst_rel_diff` 1.07e-14 to 7.61e-14.
+
+**IMPLEMENTATION COMPARISON STILL NOT CERTIFIED — cells six through nine.** `IMPL
+nalg/native` margins were 0.89x, 0.31x, 0.44x and 0.69x against 2.00x. The p50 is
+consistently below 1.0 (0.591, 0.801, 0.820, 0.875), which is suggestive and is NOT
+a result: the `nalg/nalg` null runs cv 6-25% and keeps bracketing the effect. Nine
+cells is enough to stop re-running this comparison and change the harness or the
+question instead.
+
+**CONTENTION, mostly discarded again.** Three of four cells exceeded the 1.05x
+tolerance. For `n=512 nalgebra` the drift (1.3377x) exceeds the contention it
+measures (1.2651x), so that figure is discarded under the standing rule. For
+`n=768 nalgebra` contention 1.1896x against drift 1.1198x is marginally
+informative and suggests a real residual of roughly 1.19x even on a quiet host.
+`n=768 native` came in at 0.9979x, inside tolerance.
+
+**What this does NOT license.** No implementation crossover. No revision to the
+n=512 bound, which stays at `>= 1.40x` from the worst admissible lower bound across
+both workers. The new claim is the n=768 bound and the direction of the trend.
