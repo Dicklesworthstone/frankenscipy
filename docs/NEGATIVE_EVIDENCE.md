@@ -35669,3 +35669,54 @@ and 0.7322x, both below 1.0 ("resident" faster than "alone"), so uninformative a
   should have its bias direction checked before it is either trusted or discarded.** A sweep
   of older rows for `cargo test` harness lines would say how many others are affected; that
   is a cheap audit and has not been done.
+
+## 2026-08-17 - PeachSummit (cc) - STANDING CUBIC FIGURE TIGHTENED: 1.60x slower, CI [1.59x, 1.61x] over TWELVE replicates with ZERO void - the strongest set this bead has produced
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, REPLICATE-LEVEL CERTIFICATION.**
+  Shipping binary `frankenscipy_engine_sha256=f8c08a45a3de2521`, both levers enabled. **NO
+  BUILD** — compiled two turns ago, so this measures in a window it was not built in. Live
+  SciPy in the same invocation,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.6, `genuine=True`, `fsci_loaded=False`, `observed_os_tasks=1`),
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`,
+  n=4096, nnz=27136, lu_nnz=1231312, parity `worst_rel_solution_diff=3.908e-15`.
+  `df -h /data` **203G**. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **WINDOW, VERIFIED BY ME AND SLIGHTLY BELOW THE BRIEF.** The tick reported 87% idle;
+  `vmstat` read **76/79/80/80%** — stable, `iowait 0`, `loadavg` 9.21 falling. **Per-replicate
+  loadavg / idle:** 10.66/80, 11.25/85, 10.97/86, 12.41/78, 14.99/81, 13.45/86, 12.46/87,
+  10.83/89, 12.23/77, 13.67/77, 15.07/84, 19.13/85. **PER-ARM CPU MHz:** fsci
+  4020/4062/4048 against scipy 4009/4038/4013; **clock gate PASS, median 1.0060, n=3,
+  spread 0.0062**, with a negative control in the same session returning **FAIL 0.9500**.
+- **TWELVE OF TWELVE ADMISSIBLE, ZERO VOID** — the first full set this bead has produced.
+  `replicate_aggregate: n=12 median=0.6237 ci95_across_replicates=[0.6215,0.6287]
+  observed_range=[0.6160,0.6793] spread=10.1%`.
+
+  | | ELF | n | median | CI95 | deficit |
+  |---|---|---|---|---|---|
+  | **now** | `f8c08a45` | **12** | **0.6237** | **[0.6215, 0.6287]** | **1.60x** |
+  | previous standing | `f8c08a45` | 8 | 0.6064 | [0.5975, 0.6255] | 1.65x |
+
+- **STANDING QUOTABLE FOR THE CUBIC CELL, superseding 1.65x n=8: 1.60x slower than live
+  SuperLU, 95% CI over replicates [1.59x, 1.61x], n=12.** Quote it with its N.
+- **THE CI IS THE TIGHTEST YET AND THE SPREAD IS NOT.** The interval is **0.0072 wide**
+  against 0.0280 for the n=8 set, but the observed **range** is 10.1% because of a single
+  replicate at 0.6793 — every other reading falls in 0.6160–0.6334, a span of 2.8%. **A
+  bootstrap median over twelve replicates is insensitive to that outlier; a worst-floor
+  convention would have been dominated by it**, which is the concrete case for the estimator
+  this bead switched to.
+- **SAME BINARY, DIFFERENT WINDOW, DIFFERENT NUMBER — and the two are consistent.** The n=8
+  set read 0.6064 at idle 62–83%; this n=12 set reads 0.6237 at idle 76–89%. The intervals
+  do **not** overlap ([0.5975,0.6255] vs [0.6215,0.6287] touch only at the edge), so **the
+  quieter window measures the same binary as measurably faster.** That is a property of the
+  host, not of the code, and it is the fourth time on this bead that window has moved an
+  absolute figure by more than a lever did.
+- **WHAT THIS DOES NOT ESTABLISH.** Absolute figures on this host are window-dependent at
+  the few-percent level, so **1.60x is this binary in this window**, not a portable constant.
+  Lever attribution continues to rest on interleaved paired comparisons, never on before/after
+  across windows.
+- **Concrete retry predicate:** quote **1.60x CI[1.59,1.61] n=12** for the cubic cell and
+  always with its N and its window. The scattered family remains at **1.69x CI[1.63,1.77]
+  n=8** on the pre-lever binary, supported but not superseded by the paired +3.1% result.
+  Next substantive work is the **1.74 Ir-per-update constant-factor ceiling**, not further
+  certification of this cell.
