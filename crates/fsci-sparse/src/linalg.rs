@@ -1266,15 +1266,21 @@ fn apply_sorted_pivot_tail(
             let negated = -multiplier;
             #[cfg(test)]
             record_merge_shape(|shape| shape.inplace += 1);
-            let mut cancelled = false;
+            // MIN-MAGNITUDE, NOT A BOOL -- see `merge_sorted_remainder`'s run kernel for
+            // the full argument. This loop and the partial-prefix loop below are where
+            // the measured cost actually is: the profile attributes 843,250,868
+            // `vcmpeqpd`/`vextractf128`/`vpackssdw` each to `apply_sorted_pivot_tail`,
+            // which is these two loops, not the remainder kernel.
+            let mut smallest_magnitude = f64::INFINITY;
             {
                 let updated = &mut target.vals[base..base + width];
                 for index in 0..width {
                     let value = updated[index] + negated * tail_vals[index];
                     updated[index] = value;
-                    cancelled |= value == 0.0;
+                    smallest_magnitude = smallest_magnitude.min(value.abs());
                 }
             }
+            let cancelled = smallest_magnitude == 0.0;
             target.start += skip;
             if cancelled {
                 let mut write = target.start;
@@ -1336,15 +1342,16 @@ fn apply_sorted_pivot_tail(
         // would only add a wasted scan, so both fall through to the plain merge.
         if matched > 0 && matched < tail_cols.len() {
             let negated = -multiplier;
-            let mut cancelled = false;
+            let mut smallest_magnitude = f64::INFINITY;
             {
                 let updated = &mut target.vals[base..base + matched];
                 for index in 0..matched {
                     let value = updated[index] + negated * tail_vals[index];
                     updated[index] = value;
-                    cancelled |= value == 0.0;
+                    smallest_magnitude = smallest_magnitude.min(value.abs());
                 }
             }
+            let cancelled = smallest_magnitude == 0.0;
 
             // Merge ONLY what is left, into the shared scratch exactly as the full
             // path does, so the remainder's arithmetic is the same code.
