@@ -33065,3 +33065,64 @@ contention figure. The reportable results are the predicate confirmation and a r
   and this line closes with the arena and the supernodal one. **Also re-derive the saving
   ceiling counting only the READ half of the column stream**, since the 32.9% figure is now
   known to include traffic a directory cannot remove.
+
+## 2026-08-17 - PeachSummit (cc) - THE RUN DIRECTORY CLEARS BOTH SIDES: 97.7% of each row survives an update untouched, only 3.9 entries are rewritten, and that also dissolves the write-traffic hazard I raised against my own ceiling
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** Paired structural counts —
+  matched prefix and live row length recorded **on the same update**. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::run_directory_prefix_stability`** (diagnostic,
+  `--ignored --nocapture`), control `prefix_stability_pairs_a_run_with_the_row_it_updated`.
+  **OBSERVED VALUE: `changing_updates=553357 mean_live_row=166.4 mean_matched_prefix=162.5`
+  at side=16.** `df -h /data` **125G** immediately before the build, **ONE build**,
+  `loadavg` 18.33 with one local build running — **so no certification was attempted**.
+  530 lib tests pass, warning-clean. `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE QUESTION THE PREVIOUS ROW COULD NOT ANSWER.** Churn frequency (93.5% of updates)
+  and churn magnitude (2.09 columns) pointed opposite ways. What decides it is **where the
+  divergence sits in the row**: `matched_run_length` returns a common PREFIX, so every
+  inserted column lands at or after it and everything before it is untouched.
+
+  | cubic, RCM (`Colamd` alias) | changing updates | mean live row | mean matched prefix | **prefix share** | rewritten tail |
+  |---|---|---|---|---|---|
+  | side=8 | 16,312 | 44.2 | 40.4 | **91.4%** | 3.8 entries |
+  | **side=16** | 553,357 | 166.4 | 162.5 | **97.7%** | **3.9 entries** |
+
+- **BOTH SIDES OF THE PRE-COSTING NOW CLEAR, WHICH HAS NOT HAPPENED ON THIS BEAD BEFORE.**
+  Saving: matched runs average 159.5 entries, ceiling ≤32.9% of the row stream, and it
+  **rises** with n. Maintenance: **97.7% of the structure survives each update**, only ~3.9
+  entries are rewritten, and that also **rises** with n (91.4% → 97.7%). The arena failed
+  precisely here — its ceiling fell with n and its layout was destroyed by growth.
+- **AND IT DISSOLVES THE HAZARD I RAISED AGAINST MY OWN CEILING.** Last row I warned that
+  the 32.9% was computed as though the column stream were read-only, when 93.5% of updates
+  must *insert* columns and therefore write. Measured: inserting ~2 columns at offset ~162
+  of a 166-entry row shifts only the ~3.9-entry tail. **Write traffic is about 4 entries per
+  update against a read of the full ~162-entry prefix**, so the read half dominates by
+  roughly 40:1 and the ceiling survives essentially intact. The hazard was real and is now
+  answered with a number rather than dropped.
+- **I MEASURED RATHER THAN DIVIDED ONE MEAN BY ANOTHER, and it mattered.** From the two
+  earlier rows I could have inferred a row of ~171 entries against a matched run of 159.5,
+  implying a rewritten tail of ~11 entries. Measured on the same update, the true figures
+  are 166.4 and 162.5, tail **3.9** — the inference would have overstated the maintenance
+  cost by nearly threefold. This bead has been burned three times by exactly that kind of
+  cross-row arithmetic.
+- **THE COUNTER DISCRIMINATES, and the must-NOT-FIRE arm is the load-bearing one.** A
+  fill-free tridiagonal factor has no pattern-changing update, so the counter must record
+  **exactly zero pairs** — asserted, and it passes. A counter that fired there would be
+  pairing runs with updates that inserted nothing, describing the wrong population entirely
+  while printing a plausible stability figure. The prefix invariant is asserted directly
+  (`matched_total ≤ live_total`), since a run exceeding its row would make "the tail beyond
+  the run" negative.
+- **WHAT THIS STILL DOES NOT ESTABLISH, and it is the same sentence as last time.** Two
+  cleared preconditions are **not a gain**. Nothing here shows the alignment invariant is
+  cheaper to check than the comparison it replaces, that a directory's own reads do not eat
+  the saving, or that removing a third of the row stream moves elapsed time at all — the
+  vals stream stays compulsory and row-stream misses are 53.91% of D1 read misses, capping
+  this at ≈17.7% of read misses. **The supernodal line also cleared every structural
+  precondition it was given and still lost, because the dense scatter's marginal cost turned
+  out identical to the merge's.**
+- **Concrete retry predicate:** the next step is a **costed prototype, not a rewrite** —
+  implement the directory behind a default-off toggle, assert bit-identity against the
+  current merge, and measure **instructions per element-update** with callgrind against the
+  standing **15.00 Ir** the supernodal line established as the bar. If it does not beat
+  15.00 Ir per element, it loses for the same reason supernodal did and this line closes.
+  Only if it clears that bar should it be timed against the standing cubic figure.

@@ -1460,6 +1460,8 @@ fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
         let (calls, total_span, total_bound) = cell.get();
         cell.set((calls, total_span + span, total_bound));
     });
+    #[cfg(test)]
+    LAST_MATCHED_RUN.with(|cell| cell.set(span));
     span
 }
 
@@ -1817,6 +1819,28 @@ thread_local! {
     /// and the lever is live.** This is the question that killed the reserve lever when it
     /// was asked too late.
     static PATTERN_CHURN: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
+    /// Span returned by the most recent `matched_run_length` call, so a call site can pair
+    /// the run it got with the row it was updating.
+    static LAST_MATCHED_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `(pattern-changing updates, total live length before, total matched run)`.
+    ///
+    /// THE COUNTER THAT DECIDES THE RUN DIRECTORY. Churn frequency (93.5%) and churn
+    /// magnitude (2.09 columns) pointed opposite ways and neither could settle it. What
+    /// settles it is **where the divergence sits inside the row**: `matched_run_length`
+    /// returns the length of a common PREFIX, so every inserted column necessarily lands at
+    /// or after it, and everything before it is untouched.
+    ///
+    /// So the directory's runs covering `[0, matched)` survive each update, and only the
+    /// tail beyond `matched` is rewritten. **If `matched` covers most of the row the
+    /// structure is nearly stable and maintenance is cheap; if it covers little, most of
+    /// the directory is rebuilt every update and the lever is dead.**
+    ///
+    /// Aggregates from the two rows above imply a row of about 171 live entries against a
+    /// matched run of 159.5 — which would make the rewritten tail tiny — **but that is
+    /// division of one mean by another, exactly the inference this bead has been burned by
+    /// three times. This measures the two quantities on the same update instead.**
+    static PREFIX_STABILITY: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
 }
 
@@ -2638,6 +2662,8 @@ impl NativeSparseLu {
         MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
         #[cfg(test)]
         PATTERN_CHURN.with(|cell| cell.set((0, 0, 0)));
+        #[cfg(test)]
+        PREFIX_STABILITY.with(|cell| cell.set((0, 0, 0)));
         // Candidate rows come from FIRST-COLUMN buckets, not from full column
         // membership, and that difference is the second half of frankenscipy-fnnbd.
         //
@@ -2840,6 +2866,12 @@ impl NativeSparseLu {
                 // row did not already hold — which is precisely "the pattern changed".
                 #[cfg(test)]
                 let columns_before = target.cols.len();
+                // Live length is what a directory would have to describe; the retired
+                // prefix below `start` is not part of the row any more.
+                #[cfg(test)]
+                let live_before = target.live_cols().len();
+                #[cfg(test)]
+                LAST_MATCHED_RUN.with(|cell| cell.set(usize::MAX));
                 if pivot_tail_cols.is_empty() {
                     // Nothing to propagate, but the retired pivot column still has
                     // to go and the row still has to find its next bucket.
@@ -2861,6 +2893,18 @@ impl NativeSparseLu {
                     let (updates, changed, added) = cell.get();
                     let grew = target.cols.len().saturating_sub(columns_before);
                     cell.set((updates + 1, changed + usize::from(grew > 0), added + grew));
+                    // Only pattern-CHANGING updates matter here: an update that inserts
+                    // nothing leaves the directory alone whatever its run length was.
+                    // `usize::MAX` means no comparison ran on this update, so there is no
+                    // run to pair with the row and it is excluded rather than counted as
+                    // zero -- counting it as zero would understate prefix stability.
+                    let matched = LAST_MATCHED_RUN.with(|run| run.get());
+                    if grew > 0 && matched != usize::MAX {
+                        PREFIX_STABILITY.with(|stability| {
+                            let (n, live_total, matched_total) = stability.get();
+                            stability.set((n + 1, live_total + live_before, matched_total + matched));
+                        });
+                    }
                 });
                 // ONE `first()` FEEDS BOTH. The row has to find its next bucket
                 // anyway, so recording the head here is two stores on top of a
@@ -13968,6 +14012,58 @@ mod tests {
             changed <= updates,
             "changed updates cannot exceed total updates: {changed} > {updates}"
         );
+    }
+
+    #[test]
+    fn prefix_stability_pairs_a_run_with_the_row_it_updated() {
+        // The invariant this counter rests on is that `matched_run_length` returns a
+        // common PREFIX, so a recorded run can never exceed the row it was measured
+        // against. If it could, "the tail beyond the run" would be negative and the
+        // stability figure meaningless.
+        let matrix = splu_dirichlet_laplacian_3d(8);
+        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("cubic factorization");
+        assert_eq!(lu.n, 512);
+        let (n, live_total, matched_total) = PREFIX_STABILITY.with(|cell| cell.get());
+        assert!(n > 0, "the counter must fire on a filling factor");
+        assert!(
+            matched_total <= live_total,
+            "a matched PREFIX cannot exceed the row it was matched against: \
+             {matched_total} > {live_total}"
+        );
+
+        // MUST NOT FIRE: no fill means no pattern-changing update, so there is nothing to
+        // pair. A counter that fired here would be recording updates that never inserted a
+        // column, and its stability figure would describe the wrong population.
+        let thin = plain_tridiagonal_csr(256);
+        NativeSparseLu::factorize_csr(&thin, 1.0, PermutationOrdering::Natural)
+            .expect("tridiagonal factorization");
+        let (n, _, _) = PREFIX_STABILITY.with(|cell| cell.get());
+        assert_eq!(n, 0, "a fill-free factor has no pattern-changing update to pair");
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
+    fn run_directory_prefix_stability() {
+        // THE DECIDING MEASUREMENT. Inserted columns land at or after the matched prefix,
+        // so runs covering [0, matched) survive an update and only the tail beyond it is
+        // rewritten. Large prefix share => cheap maintenance => the directory is live.
+        for side in [8usize, 16] {
+            let matrix = splu_dirichlet_laplacian_3d(side);
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            assert_eq!(lu.n, side * side * side);
+            let (n, live_total, matched_total) = PREFIX_STABILITY.with(|cell| cell.get());
+            let mean_live = live_total as f64 / n.max(1) as f64;
+            let mean_matched = matched_total as f64 / n.max(1) as f64;
+            println!(
+                "side={side}  changing_updates={n}  mean_live_row={mean_live:.1}  \
+                 mean_matched_prefix={mean_matched:.1}  \
+                 PREFIX SHARE={:.1}%  rewritten tail={:.1} entries",
+                100.0 * mean_matched / mean_live.max(1.0),
+                mean_live - mean_matched
+            );
+        }
     }
 
     #[test]
