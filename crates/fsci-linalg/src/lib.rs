@@ -13212,8 +13212,29 @@ pub fn eigh_subset(
         });
     };
 
-    // Back-transform ONLY the selected columns: eigvecs(A) = Q * eigvecs(T).
-    let k = hi - lo + 1;
+    let eigenvectors = back_transform_selected_columns(&vectors, &reflectors, rows);
+    Ok(EighResult {
+        eigenvalues,
+        eigenvectors,
+    })
+}
+
+/// Apply the tridiagonalization's reflectors to a restricted eigenvector block:
+/// `eigvecs(A) = Q * eigvecs(T)`, for the selected columns only.
+///
+/// This is the whole point of the subset entry points -- it is the O(n^3) stage
+/// of a dense symmetric eigensolve, and running it on `k` columns instead of `n`
+/// makes it O(n^2 k). Shared by both dense subset functions so the index and
+/// value forms cannot drift apart.
+fn back_transform_selected_columns(
+    vectors: &[Vec<f64>],
+    reflectors: &[HouseholderReflector],
+    rows: usize,
+) -> Vec<Vec<f64>> {
+    let k = vectors.first().map_or(0, Vec::len);
+    if k == 0 {
+        return vec![Vec::new(); rows];
+    }
     let mut block = DMatrix::<f64>::zeros(rows, k);
     for (r, row) in vectors.iter().enumerate() {
         for (c, &v) in row.iter().enumerate() {
@@ -13221,11 +13242,88 @@ pub fn eigh_subset(
         }
     }
     let worker_count = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    apply_left_reflectors_column_chunks(&mut block, &reflectors, worker_count);
-
-    let eigenvectors = (0..rows)
+    apply_left_reflectors_column_chunks(&mut block, reflectors, worker_count);
+    (0..rows)
         .map(|r| (0..k).map(|c| block[(r, c)]).collect::<Vec<f64>>())
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+/// Dense symmetric eigenproblem restricted to a VALUE RANGE.
+///
+/// Matches `scipy.linalg.eigh(a, subset_by_value=[vl, vu])`: the interval is
+/// HALF-OPEN, `vl < lambda <= vu`, and a decreasing or NaN range is refused
+/// rather than silently swapped.
+///
+/// Completes the subset family: index and value forms now exist on both the
+/// tridiagonal and the dense entry points, and all four share one reduction and
+/// one back-transform.
+pub fn eigh_subset_by_value(
+    a: &[Vec<f64>],
+    select_range: (f64, f64),
+    eigvals_only: bool,
+    options: DecompOptions,
+) -> Result<EighResult, LinalgError> {
+    let (rows, cols) = matrix_shape(a)?;
+    if rows != cols {
+        return Err(LinalgError::ExpectedSquareMatrix);
+    }
+    let (vl, vu) = select_range;
+    if vl.is_nan() || vu.is_nan() || vl > vu {
+        return Err(LinalgError::InvalidArgument {
+            detail: format!(
+                "subset_by_value ({vl}, {vu}) must be a 2-element range in nondecreasing order"
+            ),
+        });
+    }
+    if options.check_finite {
+        for row in a {
+            for &v in row {
+                if !v.is_finite() {
+                    return Err(LinalgError::NonFiniteInput);
+                }
+            }
+        }
+    }
+    hardened_dimension_check(options.mode, rows, cols)?;
+
+    // Below the reduction floor, solve fully and filter. The matching
+    // eigenvalues are contiguous because the spectrum is ascending.
+    if rows < 3 {
+        let full = eigh(a, options)?;
+        let keep: Vec<usize> = full
+            .eigenvalues
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| **w > vl && **w <= vu)
+            .map(|(i, _)| i)
+            .collect();
+        let eigenvalues: Vec<f64> = keep.iter().map(|&i| full.eigenvalues[i]).collect();
+        let eigenvectors = if eigvals_only {
+            Vec::new()
+        } else {
+            full.eigenvectors
+                .iter()
+                .map(|r| keep.iter().map(|&c| r[c]).collect::<Vec<f64>>())
+                .collect()
+        };
+        return Ok(EighResult {
+            eigenvalues,
+            eigenvectors,
+        });
+    }
+
+    let matrix = dmatrix_from_rows(a)?;
+    let (diag, offdiag, reflectors) = symmetric_tridiagonalize_native(&matrix);
+    let (eigenvalues, vectors) =
+        eigh_tridiagonal_subset_by_value(&diag, &offdiag, select_range, eigvals_only, options)?;
+
+    let Some(vectors) = vectors else {
+        return Ok(EighResult {
+            eigenvalues,
+            eigenvectors: Vec::new(),
+        });
+    };
+    let eigenvectors = back_transform_selected_columns(&vectors, &reflectors, rows);
     Ok(EighResult {
         eigenvalues,
         eigenvectors,
@@ -30381,6 +30479,101 @@ mod tests {
                 assert!((dot - want).abs() < 1e-12, "v{i}.v{j} = {dot}, expected {want}");
             }
         }
+    }
+
+    #[test]
+    fn eigh_subset_by_value_selects_the_same_block_as_the_index_form() {
+        let n = 6usize;
+        let mut seed: u64 = 0x51ed_270f_a3b1_c4d9;
+        let mut rng = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 11) as f64) / (1u64 << 53) as f64 - 0.5
+        };
+        let mut a = vec![vec![0.0_f64; n]; n];
+        for i in 0..n {
+            for j in 0..=i {
+                let v = rng();
+                a[i][j] = v;
+                a[j][i] = v;
+            }
+        }
+        let opts = DecompOptions::default();
+        let full = eigh(&a, opts).expect("full");
+
+        // Pick a window strictly BETWEEN eigenvalues so the selection cannot
+        // turn on an ulp -- the boundary sensitivity filed as j7gfa.
+        let (lo, hi) = (1usize, 3usize);
+        let vl = 0.5 * (full.eigenvalues[lo - 1] + full.eigenvalues[lo]);
+        let vu = 0.5 * (full.eigenvalues[hi] + full.eigenvalues[hi + 1]);
+
+        let by_value = eigh_subset_by_value(&a, (vl, vu), false, opts).expect("by value");
+        let by_index = eigh_subset(&a, (lo, hi), false, opts).expect("by index");
+
+        // THE POINT: a value window enclosing exactly indices lo..=hi must give
+        // the SAME block as asking for those indices, bit for bit -- both route
+        // through one reduction and one back-transform, so anything else means
+        // the two entry points have drifted apart.
+        assert_eq!(by_value.eigenvalues.len(), hi - lo + 1);
+        for (i, (v, x)) in by_value
+            .eigenvalues
+            .iter()
+            .zip(&by_index.eigenvalues)
+            .enumerate()
+        {
+            assert_eq!(v.to_bits(), x.to_bits(), "eigenvalue {i} differs by value vs index");
+        }
+        for r in 0..n {
+            for c in 0..(hi - lo + 1) {
+                assert_eq!(
+                    by_value.eigenvectors[r][c].to_bits(),
+                    by_index.eigenvectors[r][c].to_bits(),
+                    "vector ({r},{c}) differs by value vs index"
+                );
+            }
+        }
+
+        // Dense residual on the ORIGINAL matrix, so this is not merely internal
+        // self-consistency.
+        for c in 0..(hi - lo + 1) {
+            let mut worst = 0.0_f64;
+            for row in 0..n {
+                let av: f64 = (0..n).map(|k| a[row][k] * by_value.eigenvectors[k][c]).sum();
+                worst =
+                    worst.max((av - by_value.eigenvalues[c] * by_value.eigenvectors[row][c]).abs());
+            }
+            assert!(worst < 1e-9, "column {c} dense residual {worst}");
+        }
+
+        // A window below the whole spectrum selects nothing, and that is an
+        // answer: empty values with an n x 0 block.
+        let below = full.eigenvalues[0] - 10.0;
+        let (empty_vals, empty_vecs) = {
+            let r = eigh_subset_by_value(&a, (below - 1.0, below), false, opts).expect("empty");
+            (r.eigenvalues, r.eigenvectors)
+        };
+        assert!(empty_vals.is_empty());
+        assert_eq!(empty_vecs.len(), n, "still n rows");
+        assert!(empty_vecs[0].is_empty(), "zero columns");
+
+        // eigvals_only skips the back-transform.
+        let only = eigh_subset_by_value(&a, (vl, vu), true, opts).expect("eigvals only");
+        assert_eq!(only.eigenvalues.len(), hi - lo + 1);
+        assert!(only.eigenvectors.is_empty());
+
+        // MUST-MISS: reversed and NaN ranges refused; non-square refused.
+        for bad in [(1.0_f64, -1.0_f64), (f64::NAN, 1.0), (1.0, f64::NAN)] {
+            assert!(matches!(
+                eigh_subset_by_value(&a, bad, true, opts),
+                Err(LinalgError::InvalidArgument { .. })
+            ));
+        }
+        let oblong = vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        assert!(matches!(
+            eigh_subset_by_value(&oblong, (0.0, 1.0), true, opts),
+            Err(LinalgError::ExpectedSquareMatrix)
+        ));
     }
 
     #[test]
