@@ -33006,3 +33006,62 @@ contention figure. The reportable results are the predicate confirmation and a r
   are stable across many pivots, the invariant is cheap and the lever is live. **That is one
   more counter and no rewrite**, and it is the question that killed the reserve lever when it
   was asked too late.
+
+## 2026-08-17 - PeachSummit (cc) - THE RUN DIRECTORY IS UNDECIDED, NOT CLEARED: patterns churn on 93.5% of updates, but each churn adds only 2.09 columns, and this measurement CANNOT tell a cheap incremental update from a rebuild
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** A structural count of how
+  often the merge inserts a column. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::run_directory_maintenance_cost_from_pattern_churn`**
+  (diagnostic, `--ignored --nocapture`), control
+  `pattern_churn_separates_a_fill_free_factor_from_a_filling_one`. **OBSERVED VALUE:
+  `updates=592108 pattern-changing=553357 columns_added=1158949` at side=16.** `df -h /data`
+  **127G** immediately before the build, `loadavg` 15.54 — **three local builds were running,
+  so this is a counted row and no certification was attempted**. **ONE build.** 529 lib
+  tests pass, warning-clean. `host_identity=thinkstation1`, `same_host=thinkstation1`.
+  Nothing deleted.
+- **THIS IS THE RETRY PREDICATE OF THE ROW ABOVE, RUN BEFORE THE REWRITE.** The saving side
+  came back large — matched runs average 159.5 entries so a run directory could remove up to
+  32.9% of the row stream — and that row refused to call it live until the **maintenance**
+  side was costed the same way, because a directory rebuilt as often as it is read saves
+  nothing.
+
+  | cubic, RCM (`Colamd` alias) | updates | pattern-changing | columns added | per changing update | stable |
+  |---|---|---|---|---|---|
+  | side=8 | 19,054 | 16,312 (85.6%) | 35,144 | 2.15 | 14.4% |
+  | **side=16** | 592,108 | **553,357 (93.5%)** | 1,158,949 | **2.09** | 6.5% |
+
+- **THE FREQUENCY LOOKS FATAL AND THE MAGNITUDE DOES NOT, WHICH IS WHY THIS DECIDES
+  NOTHING.** Read one way, 93.5% churn means the directory is invalidated on almost every
+  update and the 32.9% ceiling is unreachable. Read the other way, **each churn inserts
+  2.09 columns into a row whose matched run is 159.5 entries** — a perturbation of about 1.3%
+  of the run, which an incremental structure could absorb by splitting or extending one run
+  in O(1) rather than rebuilding. **Both readings fit these numbers, and this counter cannot
+  separate them.**
+- **WHAT WOULD SEPARATE THEM, stated precisely because I have three times banked the
+  reading that suited me.** The question is **where** the inserted columns land relative to
+  the matched run. Arithmetic from the row above: the compared bound averages
+  96,380,657/600,459 ≈ **160.5 entries** against a matched run of 159.5, so the comparison
+  spans essentially the whole pivot tail and nearly all of it matches. If the ~2 inserted
+  columns fall **after** the matched prefix, the directory's existing runs survive untouched
+  and maintenance is O(1) — the lever is live. If they fall **inside** the prefix, every
+  insertion splits a run in the middle and the structure is rewritten — the lever is dead.
+  **These counts are equally consistent with both.**
+- **AND THERE IS A SECOND HAZARD THE SAVING-SIDE ROW DID NOT ACCOUNT FOR.** On 93.5% of
+  updates the merge must insert columns, which means it is already **writing** the column
+  array on almost every update. A directory that avoids *reading* columns does not avoid
+  that write. The saving of 32.9% was computed as though the column stream were read-only;
+  it is not, and the true ceiling is lower by however much of that stream is write traffic —
+  **an amount this row does not measure and the previous row did not consider.**
+- **THE COUNTER DISCRIMINATES, and the must-MISS arm is the load-bearing one here.** A
+  tridiagonal factor generates no fill, so no update can insert a column: asserted as
+  **exactly `(0 changed, 0 added)`**, and it passes. A counter stuck reporting "no change"
+  would have declared the directory cheap to maintain and greenlit the rewrite on false
+  evidence — that arm fails it. The filling fixture is the must-hit arm, with the nesting
+  invariants (`changed ≤ updates`, `added ≥ changed`) asserted alongside.
+- **Concrete retry predicate:** one more counter and still no rewrite — record, per
+  pattern-changing update, the **offset of the first inserted column relative to the matched
+  run length**. If the median offset is at or beyond the run, maintenance is O(1) and the
+  directory proceeds to a costed prototype; if it is inside the run, the lever is refused
+  and this line closes with the arena and the supernodal one. **Also re-derive the saving
+  ceiling counting only the READ half of the column stream**, since the 32.9% figure is now
+  known to include traffic a directory cannot remove.

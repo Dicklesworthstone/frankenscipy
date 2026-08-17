@@ -1800,6 +1800,24 @@ thread_local! {
     /// before writing the lever, which is the discipline three previous lines lacked.
     static MATCHED_RUN_PROFILE: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
+    /// `(row updates, updates that added a column, columns added)`.
+    ///
+    /// THE MAINTENANCE SIDE OF THE RUN-DIRECTORY LEVER, pre-costed before the rewrite.
+    /// The saving side came back large — matched runs average 159.5 entries, so a
+    /// directory could remove up to 32.9% of the row stream. That is worthless if the
+    /// directory has to be rebuilt as often as it is read.
+    ///
+    /// A row's column pattern changes exactly when the merge inserts a column the row did
+    /// not already hold, and the backing `cols` length grows only then (`drop_first`
+    /// advances `start` and leaves the length alone). So the churn rate is the fraction of
+    /// updates that grow the row.
+    ///
+    /// **If patterns churn on most updates the directory is rebuilt constantly and the
+    /// 32.9% is unreachable; if they are stable across many pivots the invariant is cheap
+    /// and the lever is live.** This is the question that killed the reserve lever when it
+    /// was asked too late.
+    static PATTERN_CHURN: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 /// How CLUSTERED the rows eliminated at one pivot are, by row index.
@@ -2618,6 +2636,8 @@ impl NativeSparseLu {
         CANDIDATE_ADMISSION.with(|cell| cell.set((0, 0, 0)));
         #[cfg(test)]
         MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
+        #[cfg(test)]
+        PATTERN_CHURN.with(|cell| cell.set((0, 0, 0)));
         // Candidate rows come from FIRST-COLUMN buckets, not from full column
         // membership, and that difference is the second half of frankenscipy-fnnbd.
         //
@@ -2815,6 +2835,11 @@ impl NativeSparseLu {
                 if multiplier != 0.0 {
                     l_rows[row].push((k, multiplier));
                 }
+                // Column count BEFORE the update. `drop_first` only advances `start`, so
+                // the backing length grows exactly when the merge inserts a column the
+                // row did not already hold — which is precisely "the pattern changed".
+                #[cfg(test)]
+                let columns_before = target.cols.len();
                 if pivot_tail_cols.is_empty() {
                     // Nothing to propagate, but the retired pivot column still has
                     // to go and the row still has to find its next bucket.
@@ -2831,6 +2856,12 @@ impl NativeSparseLu {
                         partial_inplace,
                     );
                 }
+                #[cfg(test)]
+                PATTERN_CHURN.with(|cell| {
+                    let (updates, changed, added) = cell.get();
+                    let grew = target.cols.len().saturating_sub(columns_before);
+                    cell.set((updates + 1, changed + usize::from(grew > 0), added + grew));
+                });
                 // ONE `first()` FEEDS BOTH. The row has to find its next bucket
                 // anyway, so recording the head here is two stores on top of a
                 // load the loop already made — no extra traversal, and it keeps
@@ -13898,6 +13929,69 @@ mod tests {
         }
         let (calls, span, _) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
         assert_eq!((calls, span), (3, 192), "counts must accumulate, not overwrite");
+    }
+
+    #[test]
+    fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
+        // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
+        // stuck reporting "no change" would declare the run directory cheap to maintain
+        // and greenlight the rewrite on false evidence.
+
+        // MUST NOT CHURN: a tridiagonal factor generates no fill, so no update can insert
+        // a column and the pattern is fixed for every row.
+        let thin = plain_tridiagonal_csr(256);
+        let lu = NativeSparseLu::factorize_csr(&thin, 1.0, PermutationOrdering::Natural)
+            .expect("tridiagonal factorization");
+        assert_eq!(lu.n, 256);
+        let (updates, changed, added) = PATTERN_CHURN.with(|cell| cell.get());
+        assert!(updates > 0, "the churn counter must fire");
+        assert_eq!(
+            (changed, added),
+            (0, 0),
+            "a fill-free factor cannot change any row's pattern -- {changed}/{updates} \
+             updates reported a change, so the counter is reporting churn that did not \
+             happen"
+        );
+
+        // MUST CHURN: the cubic cell creates ~1.19M fill entries, so columns are inserted.
+        let fat = splu_dirichlet_laplacian_3d(8);
+        let lu = NativeSparseLu::factorize_csr(&fat, 1.0, PermutationOrdering::Colamd)
+            .expect("cubic factorization");
+        assert_eq!(lu.n, 512);
+        let (updates, changed, added) = PATTERN_CHURN.with(|cell| cell.get());
+        assert!(updates > 0 && changed > 0, "a filling factor must change patterns");
+        assert!(
+            added >= changed,
+            "an update that changed a pattern added at least one column: {added} < {changed}"
+        );
+        assert!(
+            changed <= updates,
+            "changed updates cannot exceed total updates: {changed} > {updates}"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factorizes the measured cell, run with --ignored --nocapture"]
+    fn run_directory_maintenance_cost_from_pattern_churn() {
+        // THE OTHER HALF OF THE RUN-DIRECTORY PRE-COSTING. The saving side measured a
+        // ceiling of 32.9% of the row stream. That is unreachable if the directory must be
+        // rebuilt as often as it is read, so this measures how often a row's pattern
+        // actually moves.
+        for side in [8usize, 16] {
+            let matrix = splu_dirichlet_laplacian_3d(side);
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            assert_eq!(lu.n, side * side * side);
+            let (updates, changed, added) = PATTERN_CHURN.with(|cell| cell.get());
+            println!(
+                "side={side}  updates={updates}  pattern-changing={changed} ({:.1}%)  \
+                 columns added={added}  mean added per changing update={:.2}  \
+                 STABLE UPDATES={:.1}%",
+                100.0 * changed as f64 / updates.max(1) as f64,
+                added as f64 / changed.max(1) as f64,
+                100.0 * (updates - changed) as f64 / updates.max(1) as f64
+            );
+        }
     }
 
     #[test]
