@@ -35,8 +35,16 @@
 //! Ratio convention is `t_scipy / t_fsci`, matching the ledgers: > 1 means
 //! FrankenSciPy is faster.
 //!
-//! Run: `cargo run --release -p fsci-sparse --bin perf_splu_balanced_square \
-//!        --features sparse-incumbent-bench -- [side] [rounds]`
+//! Run: `cargo build --release -p fsci-sparse --bin perf_splu`, then invoke the
+//! executable directly. The bin is named `perf_splu`, NOT after this file — the
+//! previous instruction here named the file and would simply fail. `--features
+//! sparse-incumbent-bench` is not needed either; that feature is an empty
+//! compatibility stub (see this crate's `Cargo.toml`).
+//!
+//! Do NOT measure in a window you built in, and take the executable path from
+//! `--message-format=json` rather than assuming it: a stale binary from a previous
+//! turn's temporary edit has been profiled by mistake once, caught only because the
+//! ELF SHA-256 is checked before every profile.
 
 mod bench {
     use fsci_sparse::{
@@ -127,7 +135,9 @@ mod bench {
     }
 
     const USAGE: &str = "\
-usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [on|off] [on|off]
+usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [on|off] \
+                 [on|off] [on|off]
+       perf_splu aggregate <ratio> <ratio> <ratio> ...
 
   side      grid side (default 24, minimum 4)
   rounds    balanced-square rounds (default 41, minimum 9)
@@ -138,6 +148,13 @@ usage: perf_splu [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [o
   on|off    back-merge arm (default off, the unmeasured lever)
   on|off    partial-inplace-prefix arm (default on, tracks the library default)
   on|off    supernodal-blocking arm (default off, tracks the library default)
+
+  aggregate combine ratios from INDEPENDENT invocations into one reportable
+            figure: median with a bootstrap interval over the REPLICATES, plus
+            the observed range. Refuses fewer than three. The per-run ci95 this
+            harness prints bootstraps over rounds inside ONE process and is far
+            too narrow to describe reproducibility -- replicates of one binary
+            on one cell have been measured spanning 13-15%.
 
 Prints elf_sha256, provenance, per-round ratios, both A/A nulls and a
 bootstrap-median CI. The ELF SHA-256 is self-reported from inside the process
@@ -157,7 +174,8 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
     fn parse_run_config(args: &[String]) -> Result<RunConfig, String> {
         if args.len() > 10 {
             return Err(format!(
-                "expected at most seven arguments: [side] [rounds] [warmup] [on|off] [cubic|scattered] [on|off] [on|off], got {}",
+                "expected at most nine arguments: [side] [rounds] [warmup] [on|off] \
+                 [cubic|scattered] [on|off] [on|off] [on|off] [on|off], got {}",
                 args.len() - 1
             ));
         }
