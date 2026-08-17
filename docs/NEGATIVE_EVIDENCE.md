@@ -34753,3 +34753,54 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   it to be visible**; if it is not, the divergence between a 17.6% instruction reduction and
   an unmoved clock is the most informative result available on this bead and must be banked
   as such. Only then flip the default, and re-run the parity gate on a fixture that cancels.
+
+## 2026-08-17 - PeachSummit (cc) - THE CANCELLATION SKIP IS A TIMED WIN: 10.7% faster, ranges disjoint, deficit 1.77x to 1.60x - and the timed gain is SMALLER than the counted one
+
+- **Bead: `frankenscipy-llywn`.** **Result class: TIMED, PAIRED, ADMISSIBLE.** Two
+  **shipping** `release` binaries differing only in whether cancellation is detected, run
+  **alternately in one window**: `frankenscipy_engine_sha256` **`78c6daee700b0303`**
+  (detecting, shipping default) and **`a88d162fba5586b5`** (skipping). Live SciPy in the
+  same invocation,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.6). `perf_splu 16 41 16 off cubic on off on off`, n=4096,
+  nnz=27136. **ONE build** (the detecting reference; the skipping binary was preserved from
+  the previous turn's pricing build). `df -h /data` **215G**. **No C BLAS/LAPACK/MKL** —
+  `ldd` reports only libgcc, libm, libc, loader. `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE WINDOW WAS NOT AS QUIET AS REPORTED, and I recorded what I measured.** The tick
+  reported load 12; `uptime` read **29.37 / 27.32 / 24.55** when I checked, and it rose to
+  **55.83** by the end with one replicate seeing **78.93**. The interleaved design is what
+  makes the comparison survive that — both arms saw the same drift — but the absolute
+  figures below are not from a quiet host and should not be read as such.
+- **PER-ARM LOADAVG, per replicate:** detect 25.74, 19.14, 16.76, 15.16, 15.27, 14.93;
+  skip 21.55, 17.64, 15.79, 13.61, 16.00, 78.93. **PER-ARM CPU MHz:** fsci 3907/4015/3972
+  against scipy 3885/4005/3966; **clock gate PASS, median 1.0025, n=3, spread 0.0040.**
+- **THREE OF TWELVE REPLICATES VOID, and the voids are reported not dropped quietly.** Two
+  detecting replicates (nulls 1.0160, 1.0038 — the first outside the ±0.020 bound) and one
+  skipping replicate (null 1.0231, taken at loadavg 78.93). The gate did its job: the
+  load spike produced a void rather than a number.
+
+  | | admissible n | median | CI95 across replicates | range | spread |
+  |---|---|---|---|---|---|
+  | detecting | 4 | 0.5646 | [0.5521, 0.5715] | [0.5521, 0.5715] | 3.4% |
+  | **skipping** | 5 | **0.6251** | [0.6206, 0.6258] | [0.6206, 0.6258] | **0.8%** |
+
+  **The ranges are disjoint** — the lowest skipping replicate (0.6206) exceeds the highest
+  detecting one (0.5715). **10.7% faster**, and the cubic deficit falls **1.77x → 1.60x**.
+- **THE TIMED GAIN IS SMALLER THAN THE COUNTED ONE — 10.7% against 17.6% — and that is the
+  opposite of the one-column arm**, where timed (13.9%) exceeded counted (10.8%). Neither
+  direction is anomalous, and the pair together is the useful observation: **instruction
+  count is not a scaled proxy for time in this kernel in either direction.** Removing a
+  compare from a packed loop frees issue slots that were partly hidden by other work;
+  removing a call frees memory traffic that instructions never counted.
+- **WHAT THIS DOES NOT ESTABLISH.** n=4 on the detecting arm is thin — the tool's minimum is
+  3 — and both arms were measured under rising load. This is a **semantic** change: on
+  matrices that cancel, the factor retains explicit zeros, and only the solve is asserted to
+  agree there, not the bits. **The measured cells cancel nothing, so the lever is
+  bit-identical exactly where it was certified and semantic exactly where it was not.**
+- **Concrete retry predicate:** re-run this pairing in a genuinely quiet window (`host_mean_busy`
+  below ~0.15) with at least six admissible replicates per arm before flipping the default,
+  and re-run the parity gate on a fixture that cancels. **If the default is flipped, every
+  standing cubic figure is superseded** — the current 1.79x n=10 was measured on a detecting
+  binary — and the scattered family must be re-checked too, since the fast path there takes
+  every update and the cancellation loop it uses is the one this arm changes.
