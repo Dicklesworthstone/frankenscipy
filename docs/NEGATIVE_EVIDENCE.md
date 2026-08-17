@@ -33686,3 +33686,61 @@ be read as superseded by this one.
   `__memcpy` at 5.12% — count allocations per factorization before proposing any reuse
   scheme. **Do not begin either without a shipping-binary before/after, measured the way this
   row was.**
+
+## 2026-08-17 - PeachSummit (cc) - ALLOCATION TRAFFIC IS 13.4 REALLOCS PER ROW - and the reserve lever that should fix it makes every allocator counter WORSE, refuting my own reopening
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** Allocator and memcpy **call
+  counts** from callgrind. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::ab_alloc_reserve_{off,on}`**, one factorization
+  each, cubic side=10, Colamd. **OBSERVED VALUE: `reserve_hits=1`, malloc 17,858 → 38,408.**
+  **ONE build.** `df -h /data` **98G** immediately before it. `loadavg` 21.87/18.85/17.86 at
+  start; **counted, not timed** — no ratio, no clock gate. **No C BLAS/LAPACK/MKL.** 533 lib
+  tests pass. `host_identity=thinkstation1`, `same_host=thinkstation1`. Nothing deleted.
+- **CALL COUNTS ARE VALID ON A TEST BINARY, WHICH IS WHY THIS ROW EXISTS AT ALL.** The
+  34-fold inflation banked earlier today makes instruction *costs* from `cfg(test)` builds
+  worthless. **Call counts are structural** — how many times a `Vec` outgrows its capacity is
+  fixed by the growth pattern, not by whether an optimisation barrier blocked inlining — so
+  this measurement transfers. The distinction is the one that row established.
+- **THE TRAFFIC, from the shipping-binary profile, per factorization of a 1000-row matrix:**
+  **16,651 mallocs, 13,423 reallocs, 18,362 frees, 221,961 memcpys** — i.e. **13.4
+  reallocations and 222 memcpy calls per row**. That is the allocator cost behind
+  `_int_malloc` at 3.86% and `__memcpy` at 5.12% of the program, and it independently
+  confirms the growth behaviour measured structurally days ago (row adjacency collapsing
+  93.9% → 8.4% because every row is repeatedly relocated).
+- **SO I REOPENED THE SYMBOLIC-RESERVE LEVER, and I was right to and wrong about it.** That
+  lever was **refused on locality grounds** — it froze a scattered layout — and its effect on
+  **allocation count** was never measured. Reserving each row to its predicted final size
+  should eliminate the 13.4 reallocations. Measured, on identical fixtures:
+
+  | | reserve OFF | reserve ON | |
+  |---|---|---|---|
+  | `_int_malloc` | 17,858 | **38,408** | 2.15-fold WORSE |
+  | `realloc` | 13,482 | **23,877** | 1.77-fold WORSE |
+  | `_int_free_chunk` | 19,018 | **42,086** | 2.21-fold WORSE |
+  | `__memcpy` | 222,625 | **349,200** | 1.57-fold WORSE |
+
+  **Every counter moves the wrong way.** `reserve_hits=1` confirms the arm executed, so this
+  is not a no-op reading.
+- **THE MECHANISM, and it is why the idea was self-defeating.** `reserve_rows_from_symbolic_pattern`
+  calls `symbolic_fill_pattern`, which allocates **three `Vec<Vec<u32>>` of length n** — the
+  initial pattern, the upper pattern and the lower pattern — each of whose inner vectors grows
+  as fill accumulates. **The symbolic pass allocates more than the reserve saves.** And
+  reallocations did not merely fail to fall to zero, they **rose**, which additionally means
+  the prediction `u_pattern[row].len() + l_pattern[row].len()` is **short** of the true final
+  size, so rows still grow after being reserved.
+- **THIS IS THE SECOND INDEPENDENT REFUTATION OF THE SAME LEVER**, on a different axis from
+  the first. It stays default-off and in-tree, and its doc comment already carries the
+  locality refutation; this row adds the allocation one. **A lever refused twice for
+  unrelated reasons should not be reopened a third time without a new mechanism.**
+- **WHAT THIS DOES NOT ESTABLISH.** It does not show the 13.4 reallocations per row are
+  *unavoidable* — only that **this** way of avoiding them costs more than it saves. A scheme
+  that reused a per-row scratch buffer, or grew rows geometrically with a better initial
+  guess than the symbolic pass, is untouched by this result. It also measures call counts,
+  not time; allocator cost is 9% of instructions and nothing here shows what that is worth
+  in elapsed time.
+- **Concrete retry predicate:** if allocation traffic is attacked again, the entry condition
+  is a scheme whose **own** allocation count is measured first and is smaller than the
+  ~48,436 operations per factorization it would replace — the symbolic pass failed exactly
+  that test and would have been rejected before implementation had it been asked. **Cheapest
+  untested candidate: raise the initial row capacity by a constant factor at construction and
+  count reallocations**, which costs one number and no new data structure.

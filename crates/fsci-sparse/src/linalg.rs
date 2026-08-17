@@ -14231,6 +14231,35 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "A/B alloc arm: run under callgrind, symbolic reserve OFF (shipping)"]
+    fn ab_alloc_reserve_off() {
+        use std::sync::atomic::Ordering;
+        SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.store(false, Ordering::Relaxed);
+        let lu = NativeSparseLu::factorize_csr(
+            &splu_dirichlet_laplacian_3d(10),
+            1.0,
+            PermutationOrdering::Colamd,
+        )
+        .expect("factorization");
+        println!("arm=reserve-off n={}", lu.n);
+    }
+
+    #[test]
+    #[ignore = "A/B alloc arm: run under callgrind, symbolic reserve ON"]
+    fn ab_alloc_reserve_on() {
+        use std::sync::atomic::Ordering;
+        SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.store(true, Ordering::Relaxed);
+        let lu = NativeSparseLu::factorize_csr(
+            &splu_dirichlet_laplacian_3d(10),
+            1.0,
+            PermutationOrdering::Colamd,
+        );
+        let hits = SPLU_RESERVE_FROM_SYMBOLIC_FACTOR_HITS.load(Ordering::Relaxed);
+        SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.store(false, Ordering::Relaxed);
+        println!("arm=reserve-on ok={} reserve_hits={hits}", lu.is_ok());
+    }
+
+    #[test]
     #[ignore = "A/B totals arm: run under callgrind, comparison run ONCE (shipping)"]
     fn ab_totals_compare_single() {
         let matrix = splu_dirichlet_laplacian_3d(10);
