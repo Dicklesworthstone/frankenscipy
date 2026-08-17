@@ -32097,7 +32097,7 @@ established yet beyond the fact that the arm finally works.
 
   | fixture / ordering | candidates | index span | **slots per needed row** |
   |---|---|---|---|
-  | **cubic side=16, Colamd (the shipping ordering)** | 592,107 | 592,107 | **1.00** |
+  | **cubic side=16, RCM (the shipping ordering; `Colamd` aliases to it)** | 592,107 | 592,107 | **1.00** |
   | cubic side=16, natural order | 986,894 | 1,015,679 | 1.03 |
 
 - **THE PRECONDITION IS MET, AND EXACTLY.** Under the ordering the shipping path actually
@@ -32141,7 +32141,7 @@ established yet beyond the fact that the arm finally works.
   and this ledger should say so before a rewrite is started.*
 - **THE FIRST HALF OF THAT WORRY IS CONFIRMED — the rows really are already adjacent.**
 
-  | state of the factor rows, cubic side=16 Colamd | pairs | adjacent | **% adjacent** |
+  | state of the factor rows, cubic side=16 RCM (`Colamd` alias) | pairs | adjacent | **% adjacent** |
   |---|---|---|---|
   | **as built** (one `Vec` per row, allocated in row order) | 4095 | 4071 | **99.4%** |
   | **after ONE growth per row** | 4095 | 214 | **5.2%** |
@@ -32207,7 +32207,7 @@ established yet beyond the fact that the arm finally works.
   that row is refuted and the arena should not be written.* The hook was committed
   uncompiled (`167ba81a7`) under the host build freeze; this is it built and run.
 
-  | cubic, Colamd | as built | **after the REAL elimination** |
+  | cubic, RCM (`Colamd` alias) | as built | **after the REAL elimination** |
   |---|---|---|
   | side=8, n=512 | 501/511 = 98.0% | 36/511 = **7.0%** |
   | **side=16, n=4096** | 3847/4095 = 93.9% | 344/4095 = **8.4%** |
@@ -32273,7 +32273,7 @@ established yet beyond the fact that the arm finally works.
   value, so the whole thing is **bit-identical by construction** with no fallback path.
 - **HALF THE MECHANISM IS CONFIRMED. THE HALF THAT MATTERED IS REFUTED.**
 
-  | cubic, Colamd | as built | after elimination |
+  | cubic, RCM (`Colamd` alias) | as built | after elimination |
   |---|---|---|
   | side=8, reserve OFF | 98.0% | 8.2% |
   | **side=8, reserve ON** | **6.8%** | **6.8%** |
@@ -32333,7 +32333,7 @@ established yet beyond the fact that the arm finally works.
   visit reads past that first line is **compulsory**: the data must come from memory once,
   in whatever order it sits.
 
-  | cubic, Colamd | visits | lines | lines/visit | single-line visits | **arena ceiling** |
+  | cubic, RCM (`Colamd` alias) | visits | lines | lines/visit | single-line visits | **arena ceiling** |
   |---|---|---|---|---|---|
   | side=8 | 19,054 | 175,824 | 9.2 | 2.9% | **≤ 21.7%** |
   | **side=16 (the measured cell)** | **592,108** | **18,939,494** | **32.0** | **0.7%** | **≤ 6.3%** |
@@ -32836,3 +32836,54 @@ contention figure. The reportable results are the predicate confirmation and a r
   side=20's 0.9822 roughly unchanged; if it does not, the hypothesis is refuted and the
   asymmetry is something else.** Until then, sides 10 and 14 remain quoted in the old
   worst-floor form and the scattered family must still not be quoted as a whole.
+
+## 2026-08-17 - PeachSummit (cc) - CORRECTION to five of my own rows: every "Colamd" I wrote was REVERSE CUTHILL-MCKEE, and that is not cosmetic - it explains the 1.00 contiguity I banked as a discovery
+
+- **Bead: `frankenscipy-llywn` / `frankenscipy-u7biq`.** **Result class: BEHAVIORAL.** A
+  labelling audit of my own entries against what the code dispatches to. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::sparse_lu_fill_ordering`** and the existing test
+  **`splu_reports_the_ordering_that_actually_ran`**. **OBSERVED VALUE: `Colamd` returns
+  `(reverse_cuthill_mckee(a), PermutationOrdering::ReverseCuthillMcKee)`** — the code
+  reports honestly; the prose in my rows did not. **No builds, no benchmarks, no
+  measurements** — disk 29G, below the 42G floor. `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE MISLABEL.** Five rows banked between 2026-08-16 and today head their tables
+  "cubic side=16, **Colamd**", "cubic, **Colamd**", and once "**Colamd** (the shipping
+  ordering)". `PermutationOrdering::Colamd` is an **alias**: every non-Natural, non-MMD
+  request maps to `reverse_cuthill_mckee`, and COLAMD is not implemented. The affected
+  tables are the index-contiguity row, the adjacency row, the real-elimination adjacency
+  row, the symbolic-reserve refutation, and the arena-ceiling bound.
+- **NOTHING NUMERIC CHANGES.** The binary, fixture and dispatch were identical throughout;
+  `execution_proof` in every timed row already printed `fsci_ordering=ReverseCuthillMcKee`,
+  so the machine-checkable provenance was correct all along and only my prose was wrong.
+  **No ratio, count or bound moves.**
+- **BUT IT IS NOT COSMETIC, AND THIS IS THE PART WORTH BANKING.** The index-contiguity row
+  reported **1.00 slots per needed row** and presented it as a discovered property, with
+  natural order's 1.03 as the discriminating control. Under the correct name that result is
+  much less surprising: **RCM is a bandwidth-reducing ordering — clustering nonzeros near
+  the diagonal is its defining purpose** — so candidate row-index runs being contiguous is
+  close to what the algorithm is *for*. I banked "the precondition is met, and exactly" as
+  though the structure were fortunate, when it was largely built in by the ordering that
+  ran. The number stands; **my framing of it as a finding overstated it.**
+- **AND IT WOULD HAVE MISLED A SUCCESSOR IN A SPECIFIC WAY** — the reason
+  `frankenscipy-h4yov` cared enough to write a test for it. A reader seeing "Colamd" would
+  believe our ordering already matches SuperLU's, and would either skip the ordering as a
+  lever or misattribute a fill difference to something else. The fill-parity claims in this
+  ledger (1.19M vs SuperLU's 1.23M; 43,994 vs 48,000) are therefore **RCM matching COLAMD's
+  fill on these fixtures**, which is a stronger and more surprising statement than the one I
+  appeared to be making, not a weaker one.
+- **WHY THE ERROR SURVIVED FIVE ROWS.** I passed `PermutationOrdering::Colamd` in the test
+  fixtures and copied that identifier into the prose, while the harness output beside it
+  said `ReverseCuthillMcKee` every time. The contradiction was on screen in the same rows
+  and I did not read it. **Machine-emitted provenance and hand-written prose disagreed for
+  two days, and only the prose was wrong** — which is an argument for tables in this ledger
+  quoting `execution_proof` fields verbatim rather than restating them.
+- **WHAT THIS DOES NOT ESTABLISH.** It does not show RCM is the right ordering, nor that
+  COLAMD would do better — the ordering was A/B'd once (row of 16019: `Colamd`(→RCM) vs
+  `MmdAtPlusA` true min-degree) and was not the bottleneck, and that conclusion is untouched.
+  It also does not re-open the arena: the ceiling bound of ≤6.3% was computed from visit
+  spans, which do not depend on what the ordering is called.
+- **Concrete retry predicate:** none — this is a correction, not a hypothesis. The forward
+  rule it implies: **quote the ordering from `execution_proof: fsci_ordering=...`, never
+  from the enum variant passed in.** If a future row's table header disagrees with the
+  `execution_proof` line printed in the same row, the header is wrong.
