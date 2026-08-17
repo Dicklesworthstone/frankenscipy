@@ -34431,3 +34431,52 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   ~13% of the program it should be banked as counted and NOT given a certification window on
   its own — but it may be paired with removing the exact-cancellation check (~12.5%, and
   measured to drop nothing on this cell), and the two together would clear the floor.
+
+## 2026-08-17 - PeachSummit (cc) - THE ONE-COLUMN ARM REMOVES 10.8% OF PROGRAM INSTRUCTIONS, BIT-IDENTICALLY - and it lands just under the detection floor, so it must not be certified alone
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** Callgrind
+  whole-program totals on two **shipping** `release` binaries, side=16, no `cfg(test)` code
+  in the measured region. **COUNTED MECHANISM:** the arm-off binary retires
+  **27,558,614,242 instructions** vs **24,575,206,129** for the arm-on binary, a difference
+  of **2,983,408,113**. No wall-clock reading is involved. **ONE build** (the arm-on
+  binary; the arm-off profile is the one banked earlier today).
+  `df -h /data` **264G / 263G**. `loadavg` **33.25 / 51.43 / 32.81** at start, 27.13 at the
+  build — **three external builds were running, so nothing was timed and no certification
+  was attempted**. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted; the temporary force-on edit is in `git stash`.
+
+  | | arm off `5e8bf41a` | arm on `b85a5f87` | change |
+  |---|---|---|---|
+  | program total | 27,558,614,242 | **24,575,206,129** | **−10.8%** |
+  | `merge_sorted_remainder` | 2,861,226,169 | 640,592,729 | **−77.6%** |
+  | `__memcpy` | 1,213,213,628 | 765,009,453 | −36.9% |
+  | Ir per element-update | 7.78 | **6.94** | target is SuperLU's 4.05 |
+
+- **THE PREDICTION WAS 13.9% AND THE RESULT IS 10.8%, which is the useful kind of miss.**
+  The ceiling was computed as "the remainder path is 14.8% of the program and 94% of its
+  invocations are this shape". The arm does not remove that machinery entirely — it still
+  locates the insertion point and shifts the tail — so `merge_sorted_remainder` falls by
+  77.6% rather than 94%, and `__memcpy` by only 36.9% because `Vec::insert` performs the
+  same memmove the `extend_from_slice` did. **The pre-cost was an upper bound and behaved
+  like one.**
+- **IT IS BIT-IDENTICAL, asserted on four fixtures** including one that forces pivot
+  interchanges and one (scattered) where the arm must never fire: `row_perm`, `fill_perm`,
+  raw L and U bits, and `stored_nnz` all match. That control is available here precisely
+  because the arithmetic does not depend on where the entry is written.
+- **AND IT LANDS UNDER THE FLOOR, WHICH DECIDES WHAT HAPPENS NEXT.** Run-to-run spread on
+  this cell is **12.8%**; this saving is **10.8%**. **A certification would almost certainly
+  return a null**, exactly as the scan rewrite's 0.72% did. By the screening rule this bead
+  adopted, that window must not be spent on this lever alone. **The honest position is that
+  the improvement is real and counted, and our harness cannot resolve it in isolation.**
+- **WHAT THIS DOES NOT ESTABLISH.** It is instructions, not elapsed time; the earlier scan
+  rewrite is the standing reminder that the two can diverge, though that case was an
+  instrumentation artefact rather than a real instruction reduction and this one is measured
+  on shipping binaries at both ends. The arm-off baseline predates the toggle by one commit,
+  so it lacks the ~555K predicated loads per factorization the shipping arm-off path now
+  carries — worth **≈0.15%**, which flatters this result by that much and no more.
+- **Concrete retry predicate:** do NOT flip the default and certify on this alone. Pair it
+  with removing the exact-cancellation check — measured to drop **zero** entries on this
+  cell and worth **~12.5%** — and certify the two together, where the combined ~23% clears
+  the 12.8% floor decisively. If the paired certification moves the cubic figure, both
+  levers ship; if it does not, that is a far more interesting result than either lever, and
+  it says the remaining excess is not where the instruction counts say it is.
