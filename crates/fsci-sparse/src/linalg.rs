@@ -1530,10 +1530,18 @@ fn sparse_lu_fill_ordering(
 /// would be the easy error: a pattern that is silently too small would make a blocked
 /// kernel write outside the structure it allocated.
 ///
-/// Returns one sorted column list per row, in the permuted index space the elimination
-/// works in.
+/// Returns `(u_pattern, l_pattern)`: per row, the columns surviving in U, and the pivots
+/// that eliminated it — which IS that row's L pattern.
+///
+/// **BOTH ARE NEEDED AND ONLY ONE IS OBVIOUS.** The elimination retires each pivot column
+/// as it consumes it, so the pattern left at the end is U alone; the L entries have been
+/// consumed and thrown away. Supernodes are grouped over **L**, so a symbolic pass that
+/// returns only the surviving pattern cannot drive them — it hands the partition an empty
+/// lower triangle and silently produces `n` supernodes of width 1. Recording the pivot at
+/// the moment it eliminates a row costs one push and is the only place the information
+/// exists.
 #[allow(dead_code)] // staged capability: consumed by the supernodal driver
-fn symbolic_fill_pattern(n: usize, initial: &[Vec<u32>]) -> Vec<Vec<u32>> {
+fn symbolic_fill_pattern(n: usize, initial: &[Vec<u32>]) -> (Vec<Vec<u32>>, Vec<Vec<u32>>) {
     let mut pattern: Vec<Vec<u32>> = initial.to_vec();
     // First-column buckets, exactly as the numeric elimination uses: at pivot `k` a row
     // holds column `k` precisely when its minimum live column is `k`, so the candidate
@@ -1551,6 +1559,7 @@ fn symbolic_fill_pattern(n: usize, initial: &[Vec<u32>]) -> Vec<Vec<u32>> {
         }
     }
 
+    let mut lower: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut merged: Vec<u32> = Vec::new();
     for k in 0..n {
         let mut member = bucket_head[k];
@@ -1571,6 +1580,9 @@ fn symbolic_fill_pattern(n: usize, initial: &[Vec<u32>]) -> Vec<Vec<u32>> {
             if row <= k {
                 continue;
             }
+            // Row `row` is eliminated at pivot `k`, so `k` is an L entry of that row.
+            // This is the only moment the fact exists: the column is retired next.
+            lower[row].push(k as u32);
             cursor[row] += 1; // the retired pivot column
             merged.clear();
             let live = &pattern[row][cursor[row].min(pattern[row].len())..];
@@ -1603,7 +1615,7 @@ fn symbolic_fill_pattern(n: usize, initial: &[Vec<u32>]) -> Vec<Vec<u32>> {
             }
         }
     }
-    pattern
+    (pattern, lower)
 }
 
 /// The `w` multipliers a trailing row owes a supernode, formed in pivot order.
@@ -1853,6 +1865,48 @@ fn supernode_widths_relaxed(
             }
         }
     }
+    partition_columns_into_supernodes(n, &columns, tolerance)
+}
+
+/// Supernode widths read off a SYMBOLIC pattern rather than a finished factor.
+///
+/// THE CONNECTOR THE DRIVER NEEDS (frankenscipy-9nw95). `supernode_widths_relaxed` takes
+/// `l_rows` — a factor that already exists — which is useless to a numeric pass that
+/// wants to know its blocks *before* it runs. `symbolic_fill_pattern` produces the
+/// pattern in advance; this turns that pattern into the same partition, so the sequence
+/// symbolic → supernodes → blocked numeric can actually be assembled.
+///
+/// The pattern is row-wise over the whole factor, so column `c`'s L-pattern is every row
+/// `r > c` whose row pattern contains `c` — the same relation
+/// `supernode_widths_relaxed` extracts from `l_rows`, taken from predicted structure
+/// instead of computed values.
+///
+/// **The two agree exactly when the symbolic pattern equals the numeric one**, i.e. when
+/// nothing cancelled; where cancellation dropped an entry the symbolic partition is the
+/// conservative one, which is the safe direction for sizing blocks.
+/// `supernode_widths_agree_between_symbolic_and_numeric` pins that.
+#[allow(dead_code)] // staged capability: consumed by the supernodal driver
+fn supernode_widths_from_symbolic(n: usize, l_pattern: &[Vec<u32>], tolerance: usize) -> Vec<usize> {
+    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (row, cols) in l_pattern.iter().enumerate() {
+        for &col in cols {
+            if (col as usize) < n {
+                columns[col as usize].push(row);
+            }
+        }
+    }
+    partition_columns_into_supernodes(n, &columns, tolerance)
+}
+
+/// Greedy left-to-right partition of column patterns into supernodes.
+///
+/// Shared by the numeric and symbolic entry points so the two cannot drift: a partition
+/// rule duplicated in two places is a partition rule that will disagree with itself.
+fn partition_columns_into_supernodes(
+    n: usize,
+    columns: &[Vec<usize>],
+    tolerance: usize,
+) -> Vec<usize> {
     // COMPARED AGAINST THE SUPERNODE'S REPRESENTATIVE, not against the previous column.
     // A pairwise-adjacent rule is transitive by accident: each neighbour differs by at
     // most `t`, so a chain of small differences merges columns that share nothing, and
@@ -12117,6 +12171,86 @@ mod tests {
     }
 
     #[test]
+    fn supernode_widths_agree_between_symbolic_and_numeric() {
+        // THE CONNECTOR'S CONTRACT. The driver will read supernodes off the SYMBOLIC
+        // pattern, before any value exists. That is only sound if it yields the same
+        // partition the finished factor would have given -- otherwise the numeric pass
+        // would be handed blocks that do not describe what it goes on to build.
+        for (label, matrix) in [
+            ("fill-generating 2D Laplacian", laplacian_2d_for_mmd(6)),
+            ("3D Dirichlet Laplacian", splu_dirichlet_laplacian_3d(3)),
+        ] {
+            let n = matrix.shape().rows;
+            let factored = NativeSparseLu::factorize_csr(&matrix, 0.0, PermutationOrdering::Natural)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            assert_eq!(
+                factored.row_perm,
+                (0..n).collect::<Vec<_>>(),
+                "{label}: only comparable when no row interchange happened"
+            );
+
+            let initial: Vec<Vec<u32>> = (0..n)
+                .map(|row| {
+                    let span = matrix.indptr()[row]..matrix.indptr()[row + 1];
+                    let mut cols: Vec<u32> = span
+                        .filter(|&i| matrix.data()[i] != 0.0)
+                        .map(|i| matrix.indices()[i] as u32)
+                        .collect();
+                    cols.sort_unstable();
+                    cols
+                })
+                .collect();
+            let (_u_pattern, predicted_l) = symbolic_fill_pattern(n, &initial);
+
+            // The agreement is conditional on the two patterns being the same, so check
+            // that first rather than assuming it: where cancellation dropped an entry
+            // the symbolic partition is legitimately the more conservative one.
+            let numeric_l: Vec<Vec<u32>> = {
+                let mut rows: Vec<Vec<u32>> = vec![Vec::new(); n];
+                for (row, entries) in factored.l_rows.iter().enumerate() {
+                    for &(col, _) in entries {
+                        rows[row].push(col as u32);
+                    }
+                    rows[row].sort_unstable();
+                }
+                rows
+            };
+            // The symbolic L pattern is a superset of the numeric one wherever a
+            // multiplier came out exactly zero (the elimination does not store those).
+            let cancellation_free = (0..n).all(|row| {
+                numeric_l[row]
+                    .iter()
+                    .all(|c| predicted_l[row].binary_search(c).is_ok())
+                    && predicted_l[row].len() == numeric_l[row].len()
+            });
+
+            for tolerance in [0usize, 8] {
+                let from_symbolic = supernode_widths_from_symbolic(n, &predicted_l, tolerance);
+                assert_eq!(
+                    from_symbolic.iter().sum::<usize>(),
+                    n,
+                    "{label}: the symbolic partition must still cover every column"
+                );
+                if cancellation_free {
+                    let from_numeric =
+                        supernode_widths_relaxed(n, &factored.l_rows, tolerance);
+                    assert_eq!(
+                        from_symbolic, from_numeric,
+                        "{label} at tolerance {tolerance}: symbolic and numeric \
+                         partitions must agree when nothing cancelled"
+                    );
+                }
+            }
+            assert!(
+                cancellation_free,
+                "{label}: these fixtures are chosen to be cancellation-free, so if this \
+                 trips the comparison above was silently skipped and the test proved \
+                 nothing"
+            );
+        }
+    }
+
+    #[test]
     fn symbolic_fill_covers_the_numeric_pattern() {
         // THE CONTRACT, and it is containment rather than equality. A symbolic pass
         // cannot see exact cancellation, so it predicts positions the numeric pass may
@@ -12150,7 +12284,7 @@ mod tests {
                     cols
                 })
                 .collect();
-            let predicted = symbolic_fill_pattern(n, &initial);
+            let (predicted, _lower) = symbolic_fill_pattern(n, &initial);
 
             let mut numeric_entries = 0usize;
             for (row, entries) in factored.u_rows.iter().enumerate() {
