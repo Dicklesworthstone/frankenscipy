@@ -7320,6 +7320,21 @@ pub fn eigvalsh_tridiagonal(
 /// (eigenvalues, eigenvectors) where eigenvectors is None if eigvals_only=true.
 /// Symmetric tridiagonal eigenproblem restricted to a VALUE RANGE.
 ///
+/// BOUNDARY SEMANTICS ARE EXACT-ARITHMETIC-DEFINED, and selection counts at a
+/// bound lying within an ulp of an eigenvalue are UNSPECIFIED. The rule below
+/// is applied to the eigenvalues this crate computes; a different
+/// implementation computing that eigenvalue one ulp the other side of `vu` will
+/// select a different number of them from the same request. Measured against
+/// scipy 1.17.1 on d=[1,2,3,4,5], e=[0.5;4] with `select_range=(2.0, 3.0)`:
+/// scipy returns one eigenvalue and this returns none, because the value near 3
+/// is 2.9999999999999996 there and 3.0000000000000004 here. Neither is wrong
+/// (frankenscipy-j7gfa).
+///
+/// So: conformance tests for this function must keep their bounds AWAY from the
+/// spectrum. A test that pins a count at an exact bound is pinning a rounding
+/// coincidence and will flip on an unrelated change to either eigenvalue
+/// routine.
+///
 /// Matches `scipy.linalg.eigh_tridiagonal(d, e, select='v', select_range=(vl, vu))`:
 /// the interval is HALF-OPEN, `vl < lambda <= vu`, and `select_range` must be
 /// nondecreasing — scipy raises
@@ -7487,6 +7502,25 @@ pub fn eigh_tridiagonal_subset(
     Ok((selected, Some(vectors)))
 }
 
+/// EIGVALS_ONLY IS NOT "THE FULL SOLVE MINUS THE VECTORS", and callers should
+/// not assume it is. The two branches reach their eigenvalues by different
+/// routes and agree only to tolerance, not bit for bit.
+///
+/// SciPy behaves the SAME WAY, which is why this is documented rather than
+/// fixed. Measured on scipy 1.17.1 with d=[1,2,3,4,5], e=[0.5;4], four of the
+/// five eigenvalues differ between `eigvals_only=True` and `False`:
+///
+/// ```text
+///   0.7745646675365595  vs  0.7745646675365596
+///   1.976556019596902   vs  1.9765560195969023
+///   3.0000000000000004  vs  2.9999999999999996
+///   4.023443980403099   vs  4.023443980403098
+/// ```
+///
+/// The consequence worth knowing: anything keyed on EXACT eigenvalue equality
+/// across the two calls -- a cache, a memo table, a golden comparison, a
+/// bit-identity A/B gate -- will see drift that has nothing to do with the
+/// input. Compare to tolerance (frankenscipy-6phz3).
 pub fn eigh_tridiagonal(
     d: &[f64],
     e: &[f64],
@@ -30679,6 +30713,39 @@ mod tests {
             eigh_subset(&oblong, (0, 0), true, opts),
             Err(LinalgError::ExpectedSquareMatrix)
         ));
+    }
+
+    #[test]
+    fn eigvals_only_and_full_agree_to_tolerance_but_not_to_bits() {
+        // Pins the CONTRACT, not a coincidence: the two branches of
+        // eigh_tridiagonal reach their eigenvalues by different routes.
+        // scipy 1.17.1 does the same -- four of these five differ bitwise
+        // between eigvals_only=True and False there too -- so this is matched
+        // behaviour, documented rather than fixed (frankenscipy-6phz3).
+        let d = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let e = [0.5, 0.5, 0.5, 0.5];
+        let opts = DecompOptions::default();
+
+        let (only, none) = eigh_tridiagonal(&d, &e, true, opts).expect("eigvals only");
+        assert!(none.is_none(), "eigvals_only must not return vectors");
+        let (full, vecs) = eigh_tridiagonal(&d, &e, false, opts).expect("full");
+        assert!(vecs.is_some(), "the full solve must return vectors");
+
+        assert_eq!(only.len(), full.len());
+        for (i, (a, b)) in only.iter().zip(&full).enumerate() {
+            // The contract IS agreement to tolerance...
+            assert!(
+                (a - b).abs() < 1e-12,
+                "eigenvalue {i}: eigvals_only {a} vs full {b} exceeds tolerance"
+            );
+        }
+
+        // ...and bit identity is deliberately NOT asserted, in either
+        // direction. Asserting the values DIFFER would pin a rounding
+        // coincidence, and if a future change made both routes identical that
+        // would be an improvement, not a regression -- a test that failed on it
+        // would be wrong. Tolerance is the contract; the expectation about bits
+        // belongs in the doc comment, which is where it now lives.
     }
 
     #[test]
