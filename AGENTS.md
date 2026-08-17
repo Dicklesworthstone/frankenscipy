@@ -987,6 +987,47 @@ NEVER EVER DO THAT AGAIN. The answer is literally ALWAYS the same: those are cha
 
 ---
 
+## Perf-toggle drivers: the census gate (frankenscipy-5f06d)
+
+Every `pub static FOO_FORCE_SERIAL: AtomicBool` is an A/B lever, and a lever
+nothing drives is a lever whose claim cannot be checked. Four crates are at zero
+undriven and are held there by a gate:
+
+    python3 scripts/toggle_driver_census.py --gate fsci-stats fsci-linalg fsci-ndimage fsci-spatial
+
+Exit 0 means clean, **2** means a switch has no driver, 1 means the probe's own
+controls failed and its numbers are meaningless. Run it after adding a toggle.
+
+**If it fails you have two options, and raising the cap is not one of them:** give
+the toggle a driver sized ABOVE its work gate, or retire it explicitly with a
+comment. `--max-undriven N` exists for crates that are not yet at zero
+(fsci-sparse is at 1), not as a way to make a red go green.
+
+Three things about this that cost real time to learn:
+
+- **Size the fixture above the gate, and check the WORKER EXPRESSION, not just the
+  gate condition.** Twice a fixture satisfied the documented gate and still ran a
+  single worker: `CWT_FORCE_SERIAL` gates on `m*n >= 1<<22` but spawns on
+  `m / (1<<15)`, and `ND_FILTER_FORCE_SCALAR` has no size gate at all yet needs an
+  innermost run wider than `8 + kernel_width` or every pixel takes the border
+  fallback. Below the gate both settings run the same code and the test proves
+  nothing while looking correct. Bind fixture sizes with `const` assertions so
+  shrinking one fails the build.
+- **A toggle with no size gate can still be confounded by one.** If the arm it is
+  compared against is itself size-gated, flipping your toggle alone moves two
+  levers. `TVAR_FORCE_COLLECT` and `NORM_ONE_FORCE_LEGACY` both read
+  "byte-identical" and both DRIFT for this reason. Pin the sibling toggle.
+- **An all-exact slice needs its must-hit arm on the DETECTOR.** When every claim
+  is bit-identity, "nothing differed" is the passing outcome and is
+  indistinguishable from a comparison too blunt to see a difference. Assert that a
+  1-ULP perturbation and a signed zero are both visible, and compare with
+  `to_bits` — `-0.0 == 0.0` is true, so `==` accepts a lost sign.
+
+The in-crate `drqu7` ratchet is a **different** gate: it counts whether a toggle
+has an accuracy CONTRACT, not whether anything runs both arms. Both are needed —
+five fsci-linalg toggles were contracted on 2026-08-16 and still undriven a day
+later, and the ratchet counted them as paid.
+
 ## Note on Built-in TODO Functionality
 
 Also, if I ask you to explicitly use your built-in TODO functionality, don't complain about this and say you need to use beads. You can use built-in TODOs if I tell you specifically to do so. Always comply with such orders.

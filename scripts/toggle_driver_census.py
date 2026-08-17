@@ -59,7 +59,29 @@ import re
 import sys
 from pathlib import Path
 
-CRATES = sys.argv[1:] or ["fsci-stats"]
+ARGS = sys.argv[1:]
+
+# `--gate` turns the census from a report into an ENFORCEABLE invariant: exit
+# non-zero if any crate carries more undriven A/B switches than the cap.
+#
+# Without this the four crates driven to zero can regress silently -- nothing
+# stops a new `pub static FOO_FORCE_SERIAL` landing with no driver, which is how
+# the original 51-toggle backlog accumulated in the first place. A report nobody
+# runs is not a ratchet.
+#
+# It also closes a gap in the drqu7 ratchet, which lives in the crates and counts
+# a toggle as paid once it has a CONTRACT -- whether or not anything ever runs
+# both arms. Five fsci-linalg toggles were contracted on 2026-08-16 and undriven
+# until 2026-08-17. Documentation and verification are different properties and
+# need different gates; this is the one for verification. The in-crate ratchet
+# cannot do this job: a `#[cfg(test)]` test sees only what `include_str!` can
+# reach, and fsci-stats drives 64 of its toggles from 205 separate perf bins.
+GATE = "--gate" in ARGS
+MAX_UNDRIVEN = 0
+for i, a in enumerate(ARGS):
+    if a == "--max-undriven" and i + 1 < len(ARGS):
+        MAX_UNDRIVEN = int(ARGS[i + 1])
+CRATES = [a for a in ARGS if not a.startswith("--") and not a.isdigit()] or ["fsci-stats"]
 
 # A/B SWITCHES ONLY. `pub static NAME: AtomicUsize`/`AtomicU64` declarations are
 # COUNTERS -- instrumentation incremented with `fetch_add`, with no second arm to
@@ -88,6 +110,12 @@ if re.findall(DECL, _HIT) != ["EXAMPLE_FORCE_SERIAL"] or re.findall(DECL, _MISS)
         "CONTROL FAILED: the declaration pattern does not match its own fixture; "
         "every count it would print is meaningless"
     )
+
+
+# Must-hit / must-miss on the GATE comparison, not just on the pattern. A gate
+# that never fires is indistinguishable from a clean tree.
+assert (3 > 0) and not (0 > 0), "gate comparison is broken"
+assert not (2 > 2) and (3 > 2), "gate cap comparison is off by one"
 
 
 def test_regions(src: str) -> list[tuple[int, int]]:
@@ -210,6 +238,15 @@ def census(crate: str) -> int:
     for n in nowhere:
         print(f"      {n}")
     assert len(lib_body) > 0
+    if GATE and len(nowhere) > MAX_UNDRIVEN:
+        print(
+            f"  GATE FAILED: {len(nowhere)} undriven A/B switches, cap is "
+            f"{MAX_UNDRIVEN}. Either give each one a driver sized ABOVE its work "
+            f"gate, or retire it explicitly with a comment (frankenscipy-5f06d "
+            f"remedy b). Raising the cap to make this pass is not one of the two "
+            f"options."
+        )
+        return 2
     return 0
 
 
