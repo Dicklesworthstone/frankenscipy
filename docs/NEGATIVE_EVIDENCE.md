@@ -33988,3 +33988,67 @@ both workers. The new claim is the n=768 bound and the direction of the trend.
   measured region**, which is precisely the mistake that produced the last three invalid
   numbers. **If the clean upper bound is below ~10% of the program, refuse the lever a third
   time and record it as closed for good.**
+
+## 2026-08-17 - RainyPrairie (cc) - PREREGISTERED PREDICTION REFUTED: raising min_of 2 -> 8 does NOT tighten the eigh null, so "measure harder" is closed off — and the IMPL direction is worker-specific
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification.** **Result class: REFUTED
+  PREDICTION / METHOD.** `df -h /data` read **92G** immediately before the run.
+  Nothing deleted. Harness `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`,
+  worker **vmi1153651**,
+  `elf_sha256=365dee830d08712aedb2f2026f36c479ada4b6ba4e1227e81bb6126af9f13be4`.
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-minof-refutation/eigh_n512_minof8_vmi1153651.log`.
+  No native BLAS/LAPACK/MKL in the resolved graph.
+
+**THE PREDICTION, WRITTEN BEFORE THE RUN.** Nine cells had failed `IMPL_CERTIFIED`
+because the `nalg/nalg` null (cv 6-25%) is as wide as the effect it must bound
+(~15-20%). The harness takes `min_of` as an argument and had been running at **2**,
+which is very low for one-sided noise: contention can only ever make a timing
+slower, so min-of-k converges to the true floor as k grows. I predicted that
+raising `min_of` to 8 would tighten that null materially, and stated the falsifier
+— if it did not tighten, the variance is not one-sided sampling noise and the
+estimator was never the problem.
+
+**IT DID NOT TIGHTEN.**
+
+    nalg/nalg null cv, min_of=2 (4 cells):  25.24%  12.69%  18.64%  6.08%
+    nalg/nalg null cv, min_of=8 (2 cells):  11.74%   8.52%
+
+Squarely inside the existing spread, at 4x the sampling cost. The IMPL margins did
+not improve either — **0.05x and 0.50x** against the required 2.00x, where min_of=2
+had produced 0.89x/0.31x/0.44x/0.69x. One of them is the worst margin recorded on
+this bead.
+
+**SO "MEASURE HARDER" IS CLOSED OFF, and that is the point of banking this.** The
+residual variance is run-to-run and systemic rather than one-sided sampling noise,
+so neither more rounds nor a higher `min_of` will certify this comparison. Anyone
+returning to it needs a different harness design — interleaved paired sampling at
+finer granularity, or pinned arms — or a different question. Four more cells at
+`min_of=16` would be a waste of a quiet window, and now there is a row saying so.
+
+**A SECOND FINDING, and it vindicates a hedge rather than a claim.** Last row I
+noted the IMPL p50 was consistently below 1.0 (0.591, 0.801, 0.820, 0.875) and
+explicitly called it *suggestive and NOT a result* because the null bracketed it.
+On this third worker the p50 is **0.987 and 1.105** — it straddles 1.0 and reverses
+direction. The "nalgebra is consistently faster than native" pattern is
+**worker-specific, not a property of the code**. Had that been asserted from four
+same-worker cells it would now be a retraction.
+
+**THIS WORKER IS A DIFFERENT HARDWARE CLASS, which is worth recording given how
+much cross-worker spread has cost this bead.** vmi1153651 reports **2795 MHz**,
+where vmi1293453 and vmi1227854 both report 3195 MHz — all with `spread=1.00x` and
+`smt_present=false`. Three workers, two clock classes.
+
+**PER-ARM LOAD AND CLOCKS.** `loadavg_pre=7.26 8.26 8.46` on a 10-CPU cpuset;
+`loadavg_post` 4.25 and 6.91. All cores 2795 MHz, spread 1.00x, arms unpinned.
+
+**NO ADMISSIBLE LOSS CELLS FROM THIS RUN.** `fsci/scipy1` came in at 1.727x and
+1.644x with margins of **1.73x and 1.00x** — both below the 2.00x bar, so neither
+contributes to the loss bound. They are consistent with the banked `>= 1.40x` at
+n=512 but add nothing to it. Contention was uninformative again in both cells,
+reporting ratios BELOW 1.0 (0.7711, 0.7886 — "resident" faster than "alone", which
+is not physical) against drift of 1.4159x and 0.7911x; the alone samples simply
+landed in a slower stretch than the resident ones.
+
+**What this does NOT license.** No revision to any loss bound. No implementation
+claim in either direction. The result is methodological: the estimator is not the
+bottleneck, and the IMPL direction does not survive a change of worker.
