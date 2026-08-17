@@ -35405,3 +35405,61 @@ reportable ONLY as `ovh-a`-pinned.
   genuinely runs on parked cores, the mean is right and the scattered cell is genuinely
   clock-biased. **Until then the gate stays as it is, and scattered stays settled by pairing
   rather than by certification.**
+
+## 2026-08-17 - RainyPrairie (cc) - THE SIZE TREND IS BACK, properly this time: measured WITHIN a pinned worker and replicated on a second, ~+13-20% from n=512 to n=768 on both
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification.** **Result class: MEASURED,
+  PINNED, WITHIN-WORKER TREND REPLICATED.** `df -h /data` read **204G** immediately
+  before the run. Nothing deleted. Worker **`ovh-a`** (`RCH_WORKER=ovh-a`, hostname
+  `fixmydocuments`),
+  `elf_sha256=41ea51c90cddf2ec50b16d0bf3337537ef0a8a8d779c00a4cf5bc7b48c1895cf`.
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-pinned-trend/eigh_n512_n768_ovha_pinned.log`.
+  No native BLAS/LAPACK/MKL in the resolved graph.
+
+**I DOWNGRADED THIS CLAIM TWO ROWS AGO AND IT NOW EARNS ITS WAY BACK — by a different
+route.** The original "loss grows with n" pooled DIFFERENT workers at each size,
+which worker-dominance made worthless. Pinning allows the only valid form of the
+comparison: same worker, both sizes, same run.
+
+| n | impl | fsci | scipy1 | ratio p50 | ci95 | margin | nulls |
+|---|---|---|---|---|---|---|---|
+| 512 | nalgebra | 53.5 ms | 33.9 ms | 1.5758x | [1.3665, 2.0965] | 4.92x | PASS |
+| 512 | native | 48.9 ms | 32.1 ms | 1.5196x | [1.3973, 1.5566] | 10.83x | PASS |
+| 768 | nalgebra | 140.7 ms | 79.4 ms | 1.7168x | [1.5989, 2.7346] | 6.80x | **FAIL → VOID** |
+| 768 | native | 145.3 ms | 80.4 ms | 1.7921x | [1.6194, 1.8688] | 7.94x | PASS |
+
+**AND IT REPLICATES ACROSS TWO WORKERS AT VERY DIFFERENT ABSOLUTE LEVELS:**
+
+    ovh-a       n=512  1.52-1.58   ->  n=768  1.71-1.79    ~ +13-15%
+    vmi1293453  n=512  2.295       ->  n=768  2.52-2.75    ~ +10-20%
+
+The absolute ratios differ by ~45% between these hosts — the cross-worker effect
+that broke the earlier claim — but the RELATIVE growth from n=512 to n=768 is
+~+13-20% on both. **A within-worker trend that survives a change of worker is a
+different and much stronger object than the pooled comparison I originally banked.**
+
+**IMPL CERTIFIES IN ALL FOUR CELLS and grows with n too.** 1.3891x and 1.3991x at
+n=512 (margins 5.20x, 43.22x); 1.5272x and 1.4465x at n=768 (margins 67.29x,
+17.00x). Native faster than nalgebra throughout, and the gap widens with size. Still
+`ovh-a`-PINNED — vmi1293453 gives 0.90x — so this remains a statement about this
+host.
+
+**BOUNDS TIGHTEN SLIGHTLY.** The n=512 cells here carry ci95 lower bounds of 1.3665
+and 1.3973, so the worst admissible lower bound at n=512 becomes **`>= 1.37x`**
+(from 1.40x). n=768 unchanged at **`>= 1.52x`**. Both still cross-worker worsts,
+which after this row is the only defensible way to quote them.
+
+**ONE CELL VOIDED ITSELF AGAIN and is excluded**: `n=768 nalgebra`, `nulls=FAIL`,
+whose `fsci/scipy1` ci95 ran [1.5989, 2.7346] — a 71% wide interval, against the
+native cell's 15% at the same size and worker. Its p50 of 1.7168x agrees with
+everything else, which is exactly why it is worth naming as dropped.
+
+**PER-ARM LOAD AND CLOCKS.** `loadavg_pre=3.77 2.60 2.86` on a 16-CPU cpuset;
+`loadavg_post` 4.22 / 4.51 / 3.09 across cells. `smt_present=true`,
+`governor=powersave`. `nalg/nalg` null cv 3.09%, 0.37%, 0.30%, 0.96% — this worker's
+characteristic tightness held across both sizes. Contention 1.0004x at n=768 native,
+inside the 1.05x bar. Local host: `vmstat` 3s `id=89`, `mpstat` 2s `idle=80.14`,
+`iowait=0.13`, loadavg 11.31/13.56/17.27, zero rustc.
+
+**Standing figures: n=512 `>= 1.37x`, n=768 `>= 1.52x`, and the growth from 512 to
+768 is ~+13-20%, replicated within each of two workers.**
