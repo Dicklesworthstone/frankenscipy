@@ -34908,3 +34908,53 @@ this window.
   standing 1.69x predates both levers. **Do not quote a combined "levers together" figure
   without measuring it** — the one-column and cancellation arms have never been timed as a
   pair, and their counted savings are not additive by assumption.
+
+## 2026-08-17 - RainyPrairie (cc) - CORRECTION to my own ozg54 row: the discriminating variable is the WORKER, not commit state — and the ua3gn panel pool now compiles and passes 6/6
+
+- **Beads: `frankenscipy-ozg54`, `frankenscipy-ua3gn`.** **Result class: CORRECTION +
+  CAPABILITY VERIFIED.** `df -h /data` read **212G** before the build. Nothing
+  deleted. No timing claim. Worker **vmi1227854**.
+
+**THE CAPABILITY RESULT FIRST.** With the `mod` declaration committed, the ua3gn
+panel pool compiles and all six tests pass; the fsci-linalg lib test count moves
+**596 → 602** and every test appears by name. The substrate is real: workers persist
+across batches, tasks write disjoint slots, a single-worker pool degenerates
+correctly, an empty batch returns, and a panicking task does not hang the batch.
+The compile fix that the one non-stale worker had found is confirmed correct — a
+diverging closure infers `!`, which will not coerce inside a `Box<dyn FnOnce()>`
+cast, and an explicit `-> ()` pins it where a trailing semicolon did not.
+
+**NOW THE CORRECTION, WHICH IS THE MORE USEFUL HALF.** Earlier today I wrote that
+the rch sync "appears to honour committed state and drop uncommitted
+modifications". The general form of that is refuted by evidence I ALREADY HAD when
+I wrote it:
+
+| worker | build | what it showed |
+|---|---|---|
+| vmi1227854 | 1 | saw the **UNCOMMITTED** edit — failed *inside* `panel_pool.rs:312` |
+| vmi1227854 | 5 | sees the committed edit — 6 tests, 596 → 602 |
+| vmi1153651 | 2-4 | did **not** see the uncommitted edit, while holding older commits |
+| vmi1153651 | — | with the edit committed: **never tested** |
+
+vmi1227854 honoured an uncommitted edit perfectly well. So commit state is not the
+discriminating variable — **the worker is**. My commit-state story was an
+over-inference from one worker's behaviour that the other worker's behaviour, in a
+build I had already run, directly contradicted.
+
+**WHAT REMAINS ESTABLISHED:** vmi1153651 served a snapshot missing source present in
+the working tree and returned exit 0 three times having compiled none of it, and the
+test count is what caught it. Exit status, absence of warnings, and the ELF sha
+would all have passed.
+
+**WHAT IS NOT ESTABLISHED:** any mechanism. Whether vmi1153651 would now serve the
+committed edit is untested — the clean experiment is to force that specific worker
+and rebuild, which I have not done and whose result I am not claiming.
+
+**The practical advice does not depend on the mechanism** and is unchanged: verify
+freshness from a property of the SOURCE UNDER TEST, because at least one worker in
+this fleet will hand you a green build of code you did not write.
+
+**HOST STATE, verified rather than taken on report.** The brief said idle 27%; my
+own samples were `vmstat` 3s `id=33` and `mpstat` 2s `idle=55.88`, `iowait=0.00` —
+same ballpark, host genuinely busy, so nothing was certified. loadavg
+22.13/25.20/25.83, local MHz spread 1429-4179 (2.92x).
