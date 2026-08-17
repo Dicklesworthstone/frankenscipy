@@ -33302,3 +33302,68 @@ contention figure. The reportable results are the predicate confirmation and a r
   comparison falls materially below 619 Ir, that is the lever — and it costs one function
   body, not a storage rewrite.** If it does not move, the cost is real work and the
   directory question reopens on instructions rather than misses.
+
+## 2026-08-17 - RainyPrairie (cc) - REPLICATED ON A SECOND WORKER, AND IT CORRECTS MY OWN BOUND FROM EARLIER TODAY: eigh n=512 is 1.75-2.15x slower, conservative bound >=1.40x, NOT >=1.87x
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification.** **Result class: MEASURED,
+  vs-incumbent LOSS, REPLICATED across two workers; PRIOR BOUND CORRECTED DOWNWARD.**
+  `df -h /data` read **117G** immediately before the run. Nothing deleted. Harness
+  `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`, worker **vmi1227854**,
+  `elf_sha256=0c02bec1da06f53f4c17e30006bb892c73cdb9b719f64965c61ce6ad8bb48111`.
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-second-worker/eigh_n512_vmi1227854.log`.
+
+**FOUR CELLS, TWO WORKERS, ALL AGAINST SciPy 1.17.1 PINNED TO ONE BLAS THREAD:**
+
+| worker | impl | fsci | scipy1 | ratio p50 | ci95 | margin |
+|---|---|---|---|---|---|---|
+| vmi1293453 | nalgebra | 225.8 ms | 107.6 ms | 2.073x | [1.870, 2.780] | 3.99x |
+| vmi1293453 | native | 279.1 ms | 106.3 ms | 2.148x | [1.664, 3.775] | 3.01x |
+| vmi1227854 | nalgebra | 63.5 ms | 35.5 ms | **1.749x** | [1.596, 1.909] | 5.43x |
+| vmi1227854 | native | 65.8 ms | 35.7 ms | **1.779x** | [1.403, 2.060] | 3.92x |
+
+**THE LOSS REPLICATES. THE BOUND I BANKED THIS MORNING DOES NOT.** I quoted
+`>= 1.87x slower`, taking the lower ci95 bound of the tightest cell on a single
+worker. The second worker's tightest cell has an UPPER bound of 1.909x and a point
+estimate of 1.749x — the intervals barely graze, and 1.87x sits at the extreme
+edge of what this worker can support rather than being a floor beneath it.
+
+The error is mine and it is a specific one: **I applied "quote the worst bound,
+never the single best reading" WITHIN a worker and forgot to apply it ACROSS
+workers.** A per-worker lower bound is not a bound on the quantity; it is a bound
+conditional on that host. **Corrected conservative figure: `>= 1.40x slower`**, the
+worst ci95 lower bound of all four cells, with a p50 range of **1.75x - 2.15x**.
+
+**WHAT DOES REPLICATE, and it is the part worth keeping:** direction and rough
+magnitude. Four cells on two workers, every one a loss, every `fsci/scipy1` margin
+clearing the 2.00x bar (3.01x to 5.43x), every null passing. FrankenSciPy `eigh` at
+n=512 is somewhere between 1.4x and 2.2x slower than single-threaded SciPy, and no
+reading suggests otherwise.
+
+**THE ABSOLUTE TIMES DIFFER BY 3.5x BETWEEN WORKERS AND THE RATIOS BY ONLY 18%.**
+fsci 225.8 ms vs 63.5 ms (3.56x), scipy1 107.6 ms vs 35.5 ms (3.03x) — both arms
+scale together, which is exactly what a paired ratio is for. But the ratios are NOT
+identical (2.07 vs 1.75), so the pairing compresses host variation without
+eliminating it. **Anyone quoting a single-worker interval as if it bounded the
+quantity is understating the uncertainty by roughly the residual 18%.** Both
+workers report a flat 3195 MHz with `spread=1.00x` and `smt_present=false`, so the
+difference is load, not clocks: `loadavg_pre` was 11.12 on an 8-CPU cpuset (139%)
+versus 5.47 on 10 (55%).
+
+**PER-ARM LOAD AND CLOCKS, as required.** `loadavg_pre=5.47 8.56 6.94`;
+`loadavg_post=5.74` (nalgebra cell) and `5.32` (native cell) — flat across the run,
+so the harness is not loading its own host, which is the fix landed earlier today
+holding up on a second machine. `scipyN` reportable and NOT oversubscribed
+(`peak_tasks=10` on `cpuset=10`) in both cells. All cores 3195 MHz, spread 1.00x.
+
+**NOT CERTIFIED, TWICE OVER.** `IMPL_CERTIFIED=false` again (margins 0.57x and
+0.49x against 2.00x) — that is the fourth and fifth cell to fail it, and the
+`nalg/nalg` null keeps bracketing the effect. And **both contention checks exceeded
+tolerance**: 1.0898x and 1.1520x against 1.05x. For the nalgebra cell the drift
+(1.1576x) exceeds the contention it is measuring, so that figure is discarded under
+the standing rule; for the native cell drift is 0.8854x (a 1.13x swing) against
+contention of 1.152x, which is too close to separate. Neither supports a clean
+contention claim in either direction.
+
+**What this does NOT license.** No implementation crossover. No contention figure.
+No claim tighter than `>= 1.40x` for the loss. The previous row's `>= 1.87x` should
+be read as superseded by this one.
