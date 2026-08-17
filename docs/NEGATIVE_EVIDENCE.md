@@ -32700,3 +32700,72 @@ established yet beyond the fact that the arm finally works.
   and the proof that there is anything to reclaim. Absent that, the branch's status (rare vs
   unreachable) should be settled by construction or assertion, not by another performance
   attempt.
+
+## 2026-08-17 - RainyPrairie (cc) - THE RETRY PREDICATE IS CONFIRMED ON ALL THREE STATED PREDICTIONS, and the eigh n=512 cell is a LOSS: >=1.87x slower than 1-thread SciPy
+
+- **Bead: `frankenscipy-5f06d` lane / eigh certification blocker.** **Result class: MEASURED,
+  vs-incumbent LOSS, retry predicate CONFIRMED.** `df -h /data` read **165G** before the build
+  and again before the run. Nothing deleted. Harness
+  `crates/fsci-linalg/src/bin/perf_eigh_vs_scipy.rs`, worker **vmi1293453**,
+  `elf_sha256=08af9b6dd37ef397915e8aa5d8114123062121b654df854ca29609c93b24a560`.
+  Raw log: `tests/artifacts/perf/2026-08-17-eigh-retry-predicate/eigh_n512_vmi1293453.log`.
+
+**THE PREDICATE WAS WRITTEN IN ADVANCE ON 2026-08-16 AND ALL THREE PARTS HELD.** The earlier
+row diagnosed the harness's own `scipyN` arm as the contention source (16 BLAS threads on a
+cpuset of 8) and predicted, falsifiably, that capping it would do three things:
+
+| prediction, stated before the fix | outcome |
+|---|---|
+| `loadavg_post` stays near `loadavg_pre` | **HELD** 11.12 -> 12.05 (nalgebra cell), 11.12 -> 7.85 (native cell) |
+| `sp1/sp1` null tightens well below cv 16-45% | **HELD** cv **1.81%** and **2.61%**, ci95 [0.9649,1.0287] and [0.9318,1.0197] |
+| `fsci/scipy1` margin clears 2.00x with no code change | **HELD** **3.99x** and **3.01x** |
+
+`scipyN` is additionally now `REPORTABLE=true` (was false, ratios 0.0117x/0.0092x against a
+0.10x floor) and `oversubscribed=false` at `peak_tasks=8` on `cpuset=8`. The diagnosis was
+right and the arm is usable again.
+
+**THE HEADLINE IS A LOSS AND IT REPLICATES ACROSS TWO INDEPENDENT CELLS.** At n=512,
+FrankenSciPy `eigh` against SciPy 1.17.1 pinned to one BLAS thread:
+
+| cell | fsci median | scipy1 median | ratio p50 | ci95 | margin |
+|---|---|---|---|---|---|
+| impl=nalgebra | 225.789 ms | 107.638 ms | 2.073x SLOWER | [1.8701, 2.7801] | 3.99x |
+| impl=native   | 279.123 ms | 106.270 ms | 2.148x SLOWER | [1.6636, 3.7752] | 3.01x |
+
+**Quoted conservatively as `>= 1.87x slower`** -- the lower ci95 bound of the tighter cell,
+not the p50 and not the worse cell. Both cells agree to within 4% on the point estimate, which
+is the part worth trusting; the interval is what bounds it.
+
+**THE IMPLEMENTATION COMPARISON REMAINS UNCERTIFIED, for the third time.** `IMPL nalg/native`
+read 0.6943x and 0.7051x with margins of **0.60x and 0.53x** against the required 2.00x, so
+`IMPL_CERTIFIED=false` in both cells. The `nalg/nalg` null is simply too wide (cv 17-18%,
+ci95 up to [0.9774,1.5534]) to resolve an effect of that size. This is consistent with my own
+withdrawn crossover claim of 2026-08-16 and I am not re-asserting it: a null that brackets the
+effect is a null, however many times it is re-run.
+
+**THE HOST WAS NOT QUIET AND THAT IS THE CAVEAT ON EVERYTHING ABOVE.** `loadavg_pre=11.12` on
+an **8-CPU cpuset** is 139% utilization before either arm starts. The alone-sample drift
+controls confirm it: the nalgebra cell drifted **1.5004x** between its pre and post alone
+samples (196.063 ms -> 294.173 ms) while reporting a contention ratio of 1.3772x, so
+**the contention figure is discarded** -- the drift exceeds the effect it is trying to
+measure, which is precisely the discard rule. The native cell drifted 0.5585x
+(380.437 ms -> 212.460 ms). The `fsci/scipy1` numbers survive this because their margin is
+3.99x, an effect far larger than the drift; the contention and IMPL numbers do not.
+
+**A METHOD NOTE THAT GENERALISES, AND IT COST ME THIS CELL'S CLEANLINESS.** I checked local
+quiescence before starting, as instructed, and the local box was genuinely settled --
+loadavg 12.46/15.06/20.08 on 64 cores, converging downward. **That check does not govern.**
+The measurement executes on an rch worker, and the worker recorded `loadavg_pre=11.12` on 8
+CPUs at the same moment. Local quiescence is not evidence of worker quiescence and never was;
+the two hosts are unrelated. Any future certification gate has to read the WORKER's loadavg,
+which this harness already prints, rather than the pane's.
+
+**PLACEMENT AND MHz, recorded as required, and clean.** Both arms unpinned across the full
+8-CPU cpuset. All cores at **3195 MHz, spread 1.00x, `smt_present=false`** -- no SMT sharing
+is possible on this worker and no frequency dispersion to attribute anything to. (The LOCAL
+host showed 1429-4091 MHz, a 2.86x spread, which is another reason the local reading is not
+the relevant one.) Agreement between arms held at `worst_rel_diff=1.070e-14` and `7.611e-14`.
+
+**What this does NOT license.** No claim that eigh got faster, no implementation crossover, no
+contention figure. The reportable results are the predicate confirmation and a replicated
+`>= 1.87x` loss to single-threaded SciPy at n=512.
