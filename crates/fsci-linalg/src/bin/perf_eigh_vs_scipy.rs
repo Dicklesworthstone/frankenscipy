@@ -487,7 +487,33 @@ for raw_line in sys.stdin.buffer:
     /// fabricated speedup, while the failure mode of guessing low is a slower
     /// but honest arm.
     pub fn blas_thread_cap(cpuset: usize) -> usize {
-        cpuset.max(1)
+        (cpuset / OBSERVED_THREADS_PER_REQUESTED).max(1)
+    }
+
+    /// Threads the SciPy arm actually materialises per thread it is asked for.
+    ///
+    /// MEASURED, not assumed (frankenscipy-ll0kk,
+    /// tests/artifacts/perf/2026-08-16-eigh-subset-and-contention/eigh_threadnames_certified.log):
+    ///
+    ///   scipy1 requests 1 thread  -> 2 observed
+    ///   scipyN requests 10        -> 20 observed
+    ///
+    /// Exactly twice the request in both arms, so the environment variables ARE
+    /// honoured and there are two pools of the requested size. An earlier row
+    /// concluded the opposite -- that the variables did nothing -- from a single
+    /// run in which the arm was misbehaving for an unrelated reason; the counts
+    /// above are what settled it.
+    ///
+    /// Thread NAMES do not help here: all twenty come back as `python3.13`,
+    /// with no `openblas-*` among them, so the pools cannot be told apart by
+    /// name. The count is the only signal, which is why the ratio is encoded as
+    /// a constant with its evidence rather than inferred at runtime.
+    const OBSERVED_THREADS_PER_REQUESTED: usize = 2;
+
+    /// What the arm will actually spawn if asked for `requested` threads.
+    /// Used by the tests to state the invariant the cap exists to preserve.
+    pub fn expected_threads(requested: usize) -> usize {
+        requested * OBSERVED_THREADS_PER_REQUESTED
     }
 
     /// Reported alongside, never instead: a warning, not a verdict.
@@ -1159,25 +1185,44 @@ mod tests {
     }
 
     #[test]
-    fn blas_thread_cap_never_exceeds_the_cpuset_and_never_returns_zero() {
-        use super::bench::{blas_thread_cap, scipyn_oversubscribed};
+    fn blas_thread_cap_accounts_for_the_measured_thread_doubling() {
+        use super::bench::{blas_thread_cap, expected_threads, scipyn_oversubscribed};
 
-        // The two observed oversubscriptions that made the arm unreportable:
-        // 16 threads on a cpuset of 8, and 20 on a cpuset of 10.
-        assert_eq!(blas_thread_cap(8), 8, "cap must equal the cpuset");
-        assert_eq!(blas_thread_cap(10), 10);
-        // With the cap applied, neither case is oversubscribed any more -- which
-        // is the whole point of the change.
-        assert!(!scipyn_oversubscribed(blas_thread_cap(8), 8));
-        assert!(!scipyn_oversubscribed(blas_thread_cap(10), 10));
-        // ...whereas the values actually observed were.
+        // THE INVARIANT THE CAP EXISTS FOR: what the arm SPAWNS must fit the
+        // cpuset, not what it is ASKED for. The first version capped the
+        // request at the cpuset and still oversubscribed 2x, because the arm
+        // materialises two threads per thread requested -- measured, scipy1
+        // asks 1 and shows 2, scipyN asked 10 and showed 20.
+        for cpuset in [2usize, 4, 8, 10, 16, 64] {
+            let req = blas_thread_cap(cpuset);
+            assert!(
+                expected_threads(req) <= cpuset,
+                "cpuset {cpuset}: requesting {req} spawns {} which exceeds it",
+                expected_threads(req)
+            );
+            assert!(
+                !scipyn_oversubscribed(expected_threads(req), cpuset),
+                "cpuset {cpuset} must not be oversubscribed after capping"
+            );
+        }
+
+        // The concrete workers this was measured on.
+        assert_eq!(blas_thread_cap(10), 5, "10-core worker must request 5");
+        assert_eq!(blas_thread_cap(8), 4, "8-core worker must request 4");
+
+        // MUST-MISS: the values ACTUALLY OBSERVED before the correction were
+        // oversubscribed, and must still be flagged as such -- otherwise this
+        // test would pass against a detector that flags nothing.
         assert!(scipyn_oversubscribed(16, 8));
         assert!(scipyn_oversubscribed(20, 10));
 
-        // An unknown cpuset must not become "unlimited": guessing high gives a
-        // thrashing incumbent and a fabricated speedup, guessing low gives a
-        // slower but honest arm.
+        // Degenerate cpusets floor at one thread rather than becoming
+        // "unlimited": guessing high gives a thrashing incumbent and a
+        // fabricated speedup, guessing low gives a slower but honest arm. A
+        // 1-core cpuset therefore still asks for 1 and knowingly spawns 2 --
+        // there is no smaller request available.
         assert_eq!(blas_thread_cap(0), 1, "unknown cpuset must floor at 1");
+        assert_eq!(blas_thread_cap(1), 1, "single-core cpuset floors at 1");
     }
 
     #[test]
