@@ -34639,3 +34639,65 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   remain refused on the clock gate. Next lever: audit the remaining toggles for the
   per-update read defect found this morning, then re-derive Ir per element-update on
   `9fb1f887` — it was 7.78 before the arm and the counted saving predicts ~6.9.
+
+## 2026-08-17 - PeachSummit (cc) - TOGGLE AUDIT CLEAN, and the shipping binary now spends 6.96 Ir per element-update against 7.78 - 22% of the gap to SuperLU closed
+
+- **Bead: `frankenscipy-llywn`.** **Result class: COUNTED MECHANISM.** **COUNTED MECHANISM:**
+  the shipping binary retires **24,653,806,631 instructions** for 37 factorizations against
+  **27,558,614,242** before the one-column arm, with `merge_sorted_remainder` at
+  **640,592,729** vs 2,861,226,169. Callgrind on **shipping** `release`
+  `9fb1f8878529857e`, side=16, no `cfg(test)` code in the measured region. **NO BUILD** —
+  the binary was compiled two turns ago. `df -h /data` **233G → 221G**. `loadavg`
+  10.86/13.93/14.42 at start, 6.69 at the end; **counted, not timed**, so no clock gate
+  applies. **No C BLAS/LAPACK/MKL.** `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE AUDIT THE PREVIOUS ROW DEMANDED, and it comes back clean.** After finding that a
+  `PerfToggle` read inside the per-update path cost **13%**, every remaining toggle read in
+  a production path was checked against its enclosing function:
+
+  | toggle | read in | frequency |
+  |---|---|---|
+  | `SPLU_ROW_HEAD_CACHE_DISABLE` | `factorize_csr`, `factorize_csr_supernodal` | once per factorization |
+  | `SPLU_BACK_MERGE_ENABLE` | same | once per factorization |
+  | `SPLU_PARTIAL_INPLACE_ENABLE` | same | once per factorization |
+  | `SPLU_ONE_COLUMN_INSERT_ENABLE` | same (hoisted last turn) | once per factorization |
+  | `SPLU_RESERVE_FROM_SYMBOLIC_ENABLE` | `factorize_csr` | once per factorization |
+  | `SPLU_SUPERNODAL_ENABLE`, `*_CUBIC_SPECTRAL_*` | `spsolve_banded_direct` | once per solve |
+
+  **No other toggle has the defect.** The one-column arm was the only offender, and it is
+  fixed.
+- **ONE EXCEPTION, recorded rather than waved past.** `SPLU_ROW_CAPACITY_HEADROOM` is read
+  through `row_capacity_headroom()` inside `sorted_row_from_entries`, i.e. **once per row**
+  — 4,096 times per factorization at side=16, against the 555,096 that made the one-column
+  read expensive, and it sits **before** the construction loop rather than inside it, so it
+  does not separate a hot loop from its context. **It is 135x rarer and differently placed,
+  so I am not claiming it is free — only that the argument that condemned the other read
+  does not transfer.** It has not been measured.
+- **AND THE COUNTED SAVING LANDED WHERE PREDICTED.**
+
+  | | before the arm | now, `9fb1f887` |
+  |---|---|---|
+  | program total (37 factorizations) | 27,558,614,242 | **24,653,806,631** |
+  | `merge_sorted_remainder` | 2,861,226,169 | **640,592,729** |
+  | `__memcpy` | 1,213,213,628 | **764,950,127** |
+  | **Ir per element-update** | 7.78 | **6.96** |
+
+  The counted prediction from the forced binary was **6.94**; the shipping hoisted binary
+  reads **6.96**. **The lever transferred to shipping intact**, which is exactly what the
+  toggle-read defect had prevented one turn earlier.
+- **WHERE THIS LEAVES THE CAMPAIGN.** SuperLU spends **4.05** Ir per element-update; we
+  spent 7.78 and now spend 6.96, so **22% of the instruction gap is closed**. The remaining
+  excess is 2.91 Ir per element-update, and `apply_sorted_pivot_tail` is now **55.43%** of
+  the program — a larger share than before, because the machinery around it shrank while its
+  own body did not.
+- **WHAT THIS DOES NOT ESTABLISH.** Instructions are not time; the timed figure is banked
+  separately at 1.79x CI[1.77,1.80] n=10. The 22% is progress against the *instruction*
+  gap, and the two need not move together — this bead has one row where they diverged by
+  34-fold for instrumentation reasons and one where the timed gain exceeded the counted one.
+- **Concrete retry predicate:** the exact-cancellation check is now the largest identified
+  item left — it never fires (0 drops in 592,108 updates), cannot be made cheaper by
+  changing its accumulator, and is worth ~12.5% of the old program. Removing it is a
+  **semantic** change (structural zeros would be retained), so bit-identity is unavailable
+  and parity against SciPy must carry the control. Measure the retained-zero cost first:
+  with 0 drops on this cell, removal is bit-identical *here*, so the risk is entirely on
+  fixtures that do cancel.
