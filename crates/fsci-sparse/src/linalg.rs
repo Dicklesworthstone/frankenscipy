@@ -12786,6 +12786,62 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "diagnostic: factors the measured cell, run with --ignored --nocapture"]
+    fn supernodal_arm_plans_or_declines_on_the_measured_cell() {
+        // ASK BEFORE SPENDING A CERTIFICATION WINDOW. The driver refuses on ANY row
+        // interchange, because a partial-pivoting swap invalidates every block boundary
+        // the symbolic pass computed. The harness measures with `diag_pivot_thresh = 1.0`
+        // — full partial pivoting — and an ordering chosen for fill, not for stability.
+        // If the driver declines under those exact conditions then the lever cannot be
+        // measured on the cell it was built for, and the certification would quietly
+        // report the SEQUENTIAL path with `supernodal_factor_hits = 0`.
+        //
+        // That is a cheap question and an expensive surprise, so it is asked here.
+        for (label, matrix, ordering, thresh) in [
+            (
+                "measured cell: cubic side=10, Colamd, thresh=1.0 (harness conditions)",
+                splu_dirichlet_laplacian_3d(10),
+                PermutationOrdering::Colamd,
+                1.0,
+            ),
+            (
+                "same cell, diagonal-favouring thresh=0.0",
+                splu_dirichlet_laplacian_3d(10),
+                PermutationOrdering::Colamd,
+                0.0,
+            ),
+            (
+                "same cell, natural order, thresh=0.0",
+                splu_dirichlet_laplacian_3d(10),
+                PermutationOrdering::Natural,
+                0.0,
+            ),
+        ] {
+            let n = matrix.shape().rows;
+            let planned = NativeSparseLu::factorize_csr_supernodal(
+                &matrix,
+                thresh,
+                ordering,
+                SUPERNODAL_RELAXATION_TOLERANCE,
+            );
+            let sequential = NativeSparseLu::factorize_csr(&matrix, thresh, ordering)
+                .expect("sequential factorization");
+            let pivoted = sequential.row_perm != (0..n).collect::<Vec<_>>();
+            println!(
+                "supernodal plan on {label}: n={n} outcome={} sequential_pivoted={pivoted}",
+                if planned.is_some() { "PLANNED" } else { "DECLINED" }
+            );
+            if let Some(blocked) = planned {
+                assert_eq!(
+                    factor_value_bits(&blocked.u_rows),
+                    factor_value_bits(&sequential.u_rows),
+                    "{label}: a planned factorization must still be bit-identical"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn splu_supernodal_arm_is_bit_identical_through_the_public_entry_point() {
         // The driver is tested at `factorize_csr` level, but the DISPATCH is new code:
         // it reads a toggle, calls the blocked path, and falls back when that declines.
