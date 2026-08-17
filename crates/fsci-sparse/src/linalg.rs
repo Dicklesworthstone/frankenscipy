@@ -1474,6 +1474,62 @@ fn sparse_lu_fill_ordering(
     }
 }
 
+/// How DENSE a supernode's L block actually is, if the factor were stored in blocks.
+///
+/// THE NUMBER THAT COSTS THE STORAGE REWRITE (frankenscipy-9nw95). Every blocked-update
+/// design on this bead has now failed, and the remaining path — the one real supernodal
+/// codes take — is to store the factor in **dense blocks** so the update becomes a
+/// BLAS-shaped kernel instead of a merge over sparse rows. That rewrite invalidates the
+/// `SortedFactorRow` representation several landed levers are built on, so it must be
+/// priced BEFORE it is started, not after.
+///
+/// THE PRICE IS BLOCK DENSITY. A supernode of width `w` whose columns collectively touch
+/// `r` rows below the diagonal occupies a dense `w × r` block. If the block is nearly
+/// full, a dense kernel does barely more arithmetic than the sparse one and wins on
+/// memory layout — which is exactly why SuperLU is fast. If it is mostly zeros, the dense
+/// kernel does `1 / density` times the flops, and the rewrite is dead on arrival however
+/// well it is engineered.
+///
+/// **This bead has twice been steered by a plausible mechanism that counting refuted, so
+/// the point of this function is to answer the question before any code is committed to
+/// it.** It reads the symbolic pattern only: no factorization, no numeric values.
+///
+/// Returns `(stored_entries, block_area)` summed over supernodes of width ≥ 2 — blocks of
+/// width 1 are excluded because a 1-column "block" is just a sparse column and tells you
+/// nothing about whether blocking would pay.
+#[allow(dead_code)] // diagnostic: consumed by `supernode_block_density_on_the_measured_cell`
+fn supernode_block_density(l_pattern: &[Vec<u32>], widths: &[usize]) -> (usize, usize) {
+    let n = l_pattern.len();
+    // Column-wise L: which rows each column touches below the diagonal.
+    let mut columns: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (row, cols) in l_pattern.iter().enumerate() {
+        for &col in cols {
+            if (col as usize) < n {
+                columns[col as usize].push(row);
+            }
+        }
+    }
+    let mut stored = 0usize;
+    let mut area = 0usize;
+    let mut start = 0usize;
+    let mut rows_touched: Vec<usize> = Vec::new();
+    for &width in widths {
+        let end = start + width;
+        if width >= 2 {
+            rows_touched.clear();
+            for col in start..end {
+                stored += columns[col].len();
+                rows_touched.extend(columns[col].iter().copied());
+            }
+            rows_touched.sort_unstable();
+            rows_touched.dedup();
+            area += width * rows_touched.len();
+        }
+        start = end;
+    }
+    (stored, area)
+}
+
 /// How much MORE work a blocked update would do than the sequential one, per block.
 ///
 /// THE GATE ANY FUTURE SUPERNODAL ATTEMPT MUST PASS (frankenscipy-9nw95). The driver
@@ -12868,6 +12924,82 @@ mod tests {
             (-14.0f64).to_bits(),
             "the head must be left updated, since the blocked tail application reads it"
         );
+    }
+
+    #[test]
+    fn supernode_block_density_separates_a_full_block_from_a_hollow_one() {
+        // TWO ARMS, because a density counter that always answered "dense" would greenlight
+        // the storage rewrite and a counter that always answered "sparse" would kill it.
+        // Both extremes are constructed and both must come out.
+
+        // FULL: columns 0 and 1 both touch rows 2 and 3. Block is 2x2 and holds 4 entries.
+        let full = vec![vec![], vec![], vec![0u32, 1], vec![0, 1]];
+        let (stored, area) = supernode_block_density(&full, &[2, 1, 1]);
+        assert_eq!((stored, area), (4, 4), "a full block must price at density 1.0");
+
+        // HOLLOW: column 0 touches row 2, column 1 touches row 3. The block still spans
+        // 2 columns x 2 rows, but holds only 2 entries -- dense storage would do double
+        // the flops.
+        let hollow = vec![vec![], vec![], vec![0u32], vec![1]];
+        let (stored, area) = supernode_block_density(&hollow, &[2, 1, 1]);
+        assert_eq!(
+            (stored, area),
+            (2, 4),
+            "a hollow block must price at density 0.5, i.e. 2x the flops"
+        );
+
+        // Width-1 groups are excluded: a one-column block is just a sparse column and
+        // says nothing about whether blocking pays.
+        let (stored, area) = supernode_block_density(&hollow, &[1, 1, 1, 1]);
+        assert_eq!(
+            (stored, area),
+            (0, 0),
+            "width-1 groups must not be counted, or the density is diluted by columns \
+             that would never be blocked"
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic: factors the measured cell, run with --ignored --nocapture"]
+    fn supernode_block_density_on_the_measured_cell() {
+        // COST THE STORAGE REWRITE BEFORE STARTING IT. Dense-block storage is the only
+        // remaining supernodal path, and it invalidates the SortedFactorRow
+        // representation several landed levers are built on. If the blocks are hollow,
+        // a dense kernel does 1/density times the flops and the rewrite cannot win no
+        // matter how well it is engineered.
+        for (label, matrix, ordering) in [
+            (
+                "THE MEASURED CELL: cubic side=16, Colamd",
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "scattered-like: 2D Laplacian 32, Colamd",
+                laplacian_2d_for_mmd(32),
+                PermutationOrdering::Colamd,
+            ),
+        ] {
+            let n = matrix.shape().rows;
+            let fill_perm = sparse_lu_fill_ordering(&matrix, n, ordering).0;
+            let rows = match &fill_perm {
+                Some(p) => permuted_sorted_rows(&matrix, p),
+                None => csr_sorted_rows(&matrix),
+            };
+            let initial: Vec<Vec<u32>> = rows.iter().map(|r| r.live_cols().to_vec()).collect();
+            let (_u, l_pattern) = symbolic_fill_pattern(n, &initial);
+            for tolerance in [0usize, SUPERNODAL_RELAXATION_TOLERANCE, 32] {
+                let widths = supernode_widths_from_symbolic(n, &l_pattern, tolerance);
+                let blocked_cols: usize = widths.iter().filter(|&&w| w >= 2).sum();
+                let (stored, area) = supernode_block_density(&l_pattern, &widths);
+                let density = if area == 0 { 0.0 } else { stored as f64 / area as f64 };
+                println!(
+                    "block density {label} t={tolerance}: cols_in_blocks={blocked_cols}/{n} \
+                     stored={stored} block_area={area} density={density:.3} \
+                     flop_multiplier={:.2}x",
+                    if density > 0.0 { 1.0 / density } else { f64::INFINITY }
+                );
+            }
+        }
     }
 
     #[test]

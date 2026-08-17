@@ -31749,3 +31749,57 @@ treating 1.25x as settled; one cell is not a result.
   than a merge over sparse rows. That is a storage rewrite, it invalidates the
   `SortedFactorRow` representation the last several levers were built on, and it should
   be costed as such before anyone starts.
+
+## 2026-08-16 - PeachSummit (cc) - THE STORAGE REWRITE PRICES FAVOURABLY: supernode blocks are 97.2% DENSE at the measured cell, so a BLAS-shaped kernel would cost 1.03x the flops
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: COUNTED STRUCTURE.** Symbolic counts —
+  **no timing, no A/A null**, and no factorization: this reads the predicted pattern only.
+  `df -h /data` **159G**, **one build**, warning-clean, `loadavg` 26.1/26.4/26.2.
+  **HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` fixtures**,
+  `host_identity=thinkstation1`. Nothing deleted.
+- **WHY THIS, AND WHY BEFORE ANY CODE.** Every blocked-update design on this bead has
+  failed, and the remaining path is the one real supernodal codes take: store the factor
+  in **dense blocks** so the update is a BLAS-shaped kernel rather than a merge over
+  sparse rows. **That rewrite invalidates the `SortedFactorRow` representation several
+  landed levers are built on.** This bead has already twice been steered by a plausible
+  mechanism that counting refuted, so the precondition is priced first.
+- **THE PRICE IS BLOCK DENSITY.** A supernode of width `w` touching `r` rows below the
+  diagonal occupies a dense `w × r` block. Near-full, and a dense kernel does barely more
+  arithmetic than the sparse one while winning on layout — which is why SuperLU is fast.
+  Mostly zeros, and it does `1 / density` times the flops and cannot win however well it
+  is engineered.
+
+  | fixture | tolerance | cols in blocks | stored | block area | **density** | flop multiplier |
+  |---|---|---|---|---|---|---|
+  | cubic side=16 (measured cell) | 0 | 482 / 4,096 | 59,401 | 59,642 | 0.996 | 1.00x |
+  | **cubic side=16 (measured cell)** | **8** | **4,096 / 4,096** | 592,108 | 609,342 | **0.972** | **1.03x** |
+  | cubic side=16 | 32 | 4,096 / 4,096 | 592,108 | 661,923 | 0.895 | 1.12x |
+  | 2D Laplacian 32 | 8 | 1,024 / 1,024 | 22,320 | 26,768 | 0.834 | 1.20x |
+  | 2D Laplacian 32 | **32** | 1,024 / 1,024 | 22,320 | 238,286 | **0.094** | **10.68x** |
+
+- **THE PRECONDITION PASSES, and this is the first positive structural result on this bead
+  in several turns.** At the tolerance the campaign already selected, **every column of the
+  measured cell sits in a supernode of width ≥ 2, and those blocks are 97.2% full.** Dense
+  storage would waste **3%** of its arithmetic there. The wasted-flops failure mode — the
+  one that would have killed the rewrite outright — **does not occur.**
+- **AND IT BOUNDS THE TOLERANCE, which was previously chosen only from width.** At `t=32`
+  the 2D fixture collapses to **9.4% density and a 10.68x flop multiplier**: the wider
+  supernodes are bought by admitting rows almost none of the columns touch. **`t=32` is
+  refuted as a setting**, and the reason is now visible rather than assumed — width alone
+  never showed it, because width kept rising while the blocks hollowed out.
+- **WHAT THIS DOES NOT SAY.** High density removes ONE failure mode. It does **not**
+  predict a win: the blocked-update rejections on this bead were about work done in the
+  driver, not wasted flops, and a dense-block rewrite would have its own implementation
+  cost that this number says nothing about. **It is a green light to cost the rewrite
+  further, not to start writing it.**
+- **LANDED SO THE NEXT ATTEMPT CAN PRICE ITSELF:** `supernode_block_density` computes
+  stored entries against block area from the symbolic L pattern alone, with a two-arm test
+  pinning a full block at exactly density 1.0 and a hollow one at exactly 0.5, and
+  excluding width-1 groups so the figure is not diluted by columns that would never be
+  blocked.
+- **Concrete retry predicate:** before any storage rewrite, run this counter on the
+  fixtures that matter and require density **above ~0.9 at the tolerance being proposed**
+  — the measured cell clears that at `t=8` and fails it at `t=32`. Then, and separately,
+  cost the rewrite's own implementation: the three levers this bead has rejected all
+  failed on driver overhead rather than on the structure they exploited, and density says
+  nothing about that.
