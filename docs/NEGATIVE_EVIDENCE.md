@@ -32191,3 +32191,64 @@ established yet beyond the fact that the arm finally works.
   from `symbolic_fill_pattern`, so that no row ever moves — and it must then be measured
   against the standing floor, not assumed: the shipping cubic deficit is **at most 1.89x**
   and any arena that does not move that number is a loss.
+
+## 2026-08-17 - PeachSummit (cc) - THE STAND-IN HELD: the REAL elimination collapses row adjacency 93.9% -> 8.4%, so the arena's second precondition is CONFIRMED rather than refuted
+
+- **Bead: `frankenscipy-u7biq` (arena).** **Result class: COUNTED STRUCTURE.** Address
+  deltas between consecutive live factor rows, recorded inside the factorization — **no
+  timing, no A/A null, no ratio**, so **no per-arm MHz and no quiescence gate applies**.
+  Adjacency is a **count of allocator placements, not a duration**, which is why this was
+  admissible at `loadavg` **35.89**/51.42/63.91 when a timed row would not have been.
+  `df -h /data` **166G** checked before the build, **ONE build** (debug), warning-clean,
+  `host_identity=thinkstation1`. Nothing deleted.
+- **THIS DISCHARGES THE BLOCKING CAVEAT ON THE ROW OF 2026-08-16.** That row measured
+  adjacency across a **synthetic** growth — 8 elements pushed onto each row — and stated
+  its own refutation condition: *if the real elimination leaves the rows mostly adjacent,
+  that row is refuted and the arena should not be written.* The hook was committed
+  uncompiled (`167ba81a7`) under the host build freeze; this is it built and run.
+
+  | cubic, Colamd | as built | **after the REAL elimination** |
+  |---|---|---|
+  | side=8, n=512 | 501/511 = 98.0% | 36/511 = **7.0%** |
+  | **side=16, n=4096** | 3847/4095 = 93.9% | 344/4095 = **8.4%** |
+
+  Against the stand-in's 99.4% → 5.2%. **The synthetic growth was directionally right and
+  quantitatively close**, and two independent sizes agree, so the collapse is a property
+  of the elimination and not of one fixture.
+- **THE CONTROL IS A FACTORIZATION THAT DOES NO WORK.** A diagonal matrix generates no
+  fill, so no row is ever grown or reallocated and the layout at the end must equal the
+  layout at the start — asserted as **exact equality**, and it passes. Had that arm shown a
+  collapse, the hook would have been measuring something other than relocation and every
+  figure above would be an artifact. `drop_first` only advances `start` and leaves the
+  backing `Vec` untouched, which is why exact equality is the right assertion there rather
+  than a tolerance.
+- **BOTH RECORDS COME FROM ONE INVOCATION**, taken where the rows are constructed and again
+  at the last statement before `rows` is consumed into `u_rows`. Comparing an as-built
+  figure from one process against a post-elimination figure from another would confound the
+  elimination's effect with everything else that had touched the heap between them.
+- **THE ONE NUMBER THAT MOVED, and it is worth naming rather than smoothing.** As-built
+  reads **93.9%** here against **99.4%** in the stand-in measurement, on the same fixture.
+  The difference is that this hook runs inside `factorize_csr`, so the elimination's own
+  setup allocations (`l_rows`, the bucket arrays, the scratch row) are interleaved with the
+  factor rows; the earlier figure was taken on rows built in isolation. **The in-situ number
+  is the honest one** — 93.9% is what the allocator actually delivers in the real call.
+- **WHAT IS NOW ESTABLISHED, AND WHAT IS STILL NOT.** Two preconditions are cleared with
+  measurement: candidate sweeps are contiguous in row index (1.00 slots per needed row), and
+  the memory layout that would make that pay is **genuinely destroyed by the elimination**
+  rather than already free. **Neither is a measured speedup.** The arena remains unbuilt and
+  unmeasured, and the standing prior should stay disciplined: two supernodal drivers died
+  holding mechanisms that were plausible, fitted the numbers, and were wrong.
+- **AND THE REQUIREMENT THIS PINS DOWN IS NOT "ALLOCATE CONTIGUOUSLY".** A naive arena that
+  appended rows in row order and grew them on demand would reproduce exactly this 8.4%
+  collapse, because the collapse is caused by **growth past capacity**, not by initial
+  placement — the as-built figures show the allocator already gets placement right. The
+  arena pays only if every row is placed at **final size and never moves**, which requires a
+  per-row symbolic fill count up front. `symbolic_fill_pattern` computes exactly that and is
+  already in-tree, left from the closed supernodal line.
+- **Concrete retry predicate:** build the arena **sized per row from `symbolic_fill_pattern`**
+  — any version that grows rows on demand is refuted in advance by this row — and re-measure
+  adjacency with this same hook, which must read near 100% after elimination or the arena is
+  not doing what it was built to do. Only then time it, against the standing floor and not
+  by assumption: the shipping cubic deficit is **at most 1.89x** (worst CI floor 0.5291,
+  4/4 admissible, rounds=41) and the scattered family must not regress below its standing
+  **1.2106x**. An arena that does not move the cubic number materially is a loss.
