@@ -1474,6 +1474,127 @@ fn sparse_lu_fill_ordering(
     }
 }
 
+/// Apply a supernode to one target row through a DENSE ACCUMULATOR.
+///
+/// THE KERNEL THE BEAD HAS BEEN CIRCLING SINCE IT WAS FILED (frankenscipy-9nw95), which
+/// names "the dense scatter" as the prerequisite. Three merge-based drivers have been
+/// rejected; the pre-costing says the structure is there (5.08x fewer target-row touches,
+/// blocks 97.2% dense) and that the **implementation** is the entire remaining risk. This
+/// is that implementation, and it is deliberately landed ALONE — not wired into an
+/// elimination — because every previous attempt was measured only after wiring, by which
+/// point the driver's overhead had swamped whatever the kernel did.
+///
+/// HOW IT DIFFERS FROM THE MERGE. `apply_supernode_tails` walks two sorted column arrays
+/// and branches per element. This scatters the target row into a dense workspace indexed
+/// BY COLUMN, applies the `w` updates as straight-line indexed arithmetic with no
+/// comparisons at all, then gathers the result back. That is what makes a supernodal code
+/// fast: inside a block there is no merge, only arithmetic.
+///
+/// THE WORKSPACE IS NOT CLEARED BETWEEN CALLS. Zeroing an `n`-sized accumulator per row
+/// would cost more than the merge it replaces — that is the classic trap in this design.
+/// `marker` holds a generation stamp per column; a slot is live only if its stamp equals
+/// the current one, so reuse is O(touched) rather than O(n).
+///
+/// BIT-IDENTITY: each element accumulates `target` then pivots `0..w` **in order**, the
+/// same association the sequential elimination uses, so the result agrees to the bit.
+/// Cancellation is refused exactly as in `apply_supernode_tails`: an entry that EXISTS
+/// driven to zero while pivots remain would be dropped by the sequential path and
+/// re-filled by the next pivot.
+///
+/// Returns `false` if the row must be replayed sequentially.
+#[allow(dead_code)] // staged: to be instruction-counted against the merge before wiring
+fn dense_scatter_block_update(
+    target: &SortedFactorRow,
+    skip: usize,
+    multipliers: &[f64],
+    tail_cols: &[u32],
+    tail_vals_flat: &[f64],
+    accumulator: &mut [f64],
+    marker: &mut [u32],
+    generation: u32,
+    out: &mut SortedFactorRow,
+) -> bool {
+    let width = multipliers.len();
+    let span = tail_cols.len();
+    debug_assert_eq!(tail_vals_flat.len(), width * span);
+
+    let base = target.start + skip;
+    let live_cols = &target.cols[base..];
+    let live_vals = &target.vals[base..];
+
+    // SCATTER: the target row into the accumulator. Every column it occupies is stamped
+    // with this generation, so the gather below can tell live slots from stale ones.
+    for (&col, &value) in live_cols.iter().zip(live_vals) {
+        let slot = col as usize;
+        accumulator[slot] = value;
+        marker[slot] = generation;
+    }
+
+    // ACCUMULATE: `w` dense updates, no comparisons. A column the target lacks is stamped
+    // on first touch and starts from zero, which is what the sequential path's fill does.
+    for (k, &multiplier) in multipliers.iter().enumerate() {
+        let tail = &tail_vals_flat[k * span..(k + 1) * span];
+        let negated = -multiplier;
+        for (&col, &tail_value) in tail_cols.iter().zip(tail) {
+            let slot = col as usize;
+            let previous = if marker[slot] == generation {
+                accumulator[slot]
+            } else {
+                marker[slot] = generation;
+                0.0
+            };
+            let updated = previous + negated * tail_value;
+            // An EXISTING entry driven to zero with pivots remaining diverges from the
+            // sequential path, which drops it and lets the next pivot re-fill it.
+            if updated == 0.0 && previous != 0.0 && k + 1 < width {
+                return false;
+            }
+            accumulator[slot] = updated;
+        }
+    }
+
+    // GATHER: back into sorted order. The union of the target's columns and the tail's is
+    // already sorted on each side, so this is a merge of two sorted key lists — but it
+    // carries no arithmetic, which is the point.
+    out.cols.clear();
+    out.vals.clear();
+    out.start = 0;
+    let (mut left, mut right) = (0usize, 0usize);
+    let push = |out: &mut SortedFactorRow, col: u32, accumulator: &[f64]| {
+        let value = accumulator[col as usize];
+        if value != 0.0 {
+            out.cols.push(col);
+            out.vals.push(value);
+        }
+    };
+    while left < live_cols.len() && right < span {
+        match live_cols[left].cmp(&tail_cols[right]) {
+            std::cmp::Ordering::Less => {
+                push(out, live_cols[left], accumulator);
+                left += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                push(out, tail_cols[right], accumulator);
+                right += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                push(out, live_cols[left], accumulator);
+                left += 1;
+                right += 1;
+            }
+        }
+    }
+    while left < live_cols.len() {
+        push(out, live_cols[left], accumulator);
+        left += 1;
+    }
+    while right < span {
+        push(out, tail_cols[right], accumulator);
+        right += 1;
+    }
+    true
+}
+
 /// How many target-row TOUCHES blocking would actually remove.
 ///
 /// THE BENEFIT SIDE, AND THE NUMBER THIS BEAD HAS BEEN ASSUMING (frankenscipy-9nw95).
@@ -12971,6 +13092,76 @@ mod tests {
             head[1].to_bits(),
             (-14.0f64).to_bits(),
             "the head must be left updated, since the blocked tail application reads it"
+        );
+    }
+
+    #[test]
+    fn dense_scatter_block_update_matches_the_merge_kernel_bit_for_bit() {
+        // The merge kernel is already proven bit-identical to the sequential elimination,
+        // so agreeing with IT transitively proves the dense path too -- and compares the
+        // two candidate kernels directly, which is the comparison that matters.
+        let tail_cols: Vec<u32> = vec![2, 5, 7, 9];
+        let tail_vals_flat: Vec<f64> = vec![
+            0.1, 0.3, 0.0, 0.7, // pivot 0 -- includes a padded zero
+            1.7, 0.0, 2.9, 0.11, // pivot 1
+            0.013, 5.3, 1.9, 0.0, // pivot 2
+        ];
+        let multipliers = vec![0.37f64, 1.9, 0.21];
+        let row = sorted_row_from_entries(vec![(2, 4.0), (5, 6.0), (11, 8.0)]);
+
+        let mut merged = SortedFactorRow::default();
+        assert!(
+            apply_supernode_tails(&row, &mut merged, 0, &multipliers, &tail_cols, &tail_vals_flat),
+            "the merge kernel must apply on this input"
+        );
+
+        let n = 16usize;
+        let mut accumulator = vec![0.0f64; n];
+        let mut marker = vec![0u32; n];
+        let mut dense = SortedFactorRow::default();
+        assert!(
+            dense_scatter_block_update(
+                &row,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+                &mut accumulator,
+                &mut marker,
+                1,
+                &mut dense,
+            ),
+            "the dense kernel must apply on the same input"
+        );
+
+        let m: Vec<(usize, u64)> = merged.pairs().map(|(c, v)| (c, v.to_bits())).collect();
+        let d: Vec<(usize, u64)> = dense.pairs().map(|(c, v)| (c, v.to_bits())).collect();
+        assert_eq!(
+            d, m,
+            "the dense-accumulator kernel must equal the merge kernel BIT for BIT"
+        );
+
+        // THE STALE-SLOT TRAP, which is the whole reason `marker` exists. Running again
+        // with a NEW generation and a DIFFERENT row must not see any of the values left
+        // behind in the accumulator by the call above.
+        let other = sorted_row_from_entries(vec![(5, 1.0)]);
+        let mut second = SortedFactorRow::default();
+        assert!(dense_scatter_block_update(
+            &other,
+            0,
+            &[0.0f64],
+            &[9u32],
+            &[0.0f64],
+            &mut accumulator,
+            &mut marker,
+            2,
+            &mut second,
+        ));
+        assert_eq!(
+            second.pairs().collect::<Vec<_>>(),
+            vec![(5, 1.0)],
+            "a new generation must ignore every slot the previous call left dirty -- \
+             without the marker this row would inherit columns 2, 7 and 11"
         );
     }
 
