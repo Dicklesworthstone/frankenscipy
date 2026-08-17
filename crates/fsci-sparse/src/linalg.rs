@@ -1436,6 +1436,21 @@ fn apply_sorted_pivot_tail(
 fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
     const BLOCK: usize = 8;
     let bound = left.len().min(right.len());
+    // MEASUREMENT-ONLY ARM, AND IT PRODUCES WRONG ANSWERS ON PURPOSE. Claiming the whole
+    // compared region matches skips every column read the comparison performs, which is
+    // the strict upper bound on what ANY correct run-directory could recover: a correct
+    // implementation must do everything this arm does and then maintain an invariant on
+    // top. Diffing whole-program `Ir`/`D1mr` between this arm and the shipping one needs
+    // no line attribution, which is the point — the line-level profile put ~60% of cost on
+    // pseudo-lines and could not settle the question.
+    //
+    // Returning `bound` is in range by construction (`span <= bound` always holds), so
+    // this cannot index out of bounds; it only makes the merge treat non-matching columns
+    // as matching, which corrupts values. Default OFF, pinned by
+    // `column_compare_skip_ships_disabled`.
+    if SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return bound;
+    }
     let mut span = 0usize;
     #[cfg(test)]
     MATCHED_RUN_PROFILE.with(|cell| {
@@ -14015,6 +14030,75 @@ mod tests {
     }
 
     #[test]
+    fn column_compare_skip_ships_disabled_and_actually_changes_the_factor() {
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // SHIPS OFF. This arm corrupts values by design, so the default is not a
+        // preference -- it is the only safe setting.
+        assert!(
+            !SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY.load(Ordering::Relaxed),
+            "the measurement-only skip arm must ship disabled"
+        );
+
+        // AND IT MUST ACTUALLY BE LIVE. If enabling it left the factor unchanged, the arm
+        // would be measuring nothing and the upper bound derived from it would be a
+        // measurement of the toggle load alone. On a fixture whose match rate is 97.3%
+        // rather than 100%, assuming a full match must change the answer.
+        let matrix = splu_dirichlet_laplacian_3d(8);
+        let correct = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("correct factorization");
+        SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY.store(true, Ordering::Relaxed);
+        let skipped = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd);
+        SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY.store(false, Ordering::Relaxed);
+
+        // The arm may legitimately fail outright (a corrupted pattern can hit a zero
+        // pivot); either way it must not silently agree with the correct factor.
+        match skipped {
+            Ok(skipped) => assert_ne!(
+                factor_value_bits(&skipped.u_rows),
+                factor_value_bits(&correct.u_rows),
+                "the skip arm produced a bit-identical factor -- it is not live, so any \
+                 bound measured from it would be meaningless"
+            ),
+            Err(_) => {}
+        }
+
+        // Restore is asserted rather than assumed: a leaked `true` would corrupt every
+        // sibling test in this process (frankenscipy-0zn0v).
+        assert!(
+            !SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY.load(Ordering::Relaxed),
+            "the skip arm must be restored to disabled before the guard drops"
+        );
+    }
+
+    #[test]
+    #[ignore = "A/B totals arm: run under callgrind, comparison ENABLED (shipping behaviour)"]
+    fn ab_totals_column_compare_enabled() {
+        let matrix = splu_dirichlet_laplacian_3d(10);
+        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("factorization");
+        println!("arm=compare-enabled n={}", lu.n);
+    }
+
+    #[test]
+    #[ignore = "A/B totals arm: run under callgrind, comparison SKIPPED (incorrect, bound only)"]
+    fn ab_totals_column_compare_skipped() {
+        use std::sync::atomic::Ordering;
+        SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY.store(true, Ordering::Relaxed);
+        let result = NativeSparseLu::factorize_csr(
+            &splu_dirichlet_laplacian_3d(10),
+            1.0,
+            PermutationOrdering::Colamd,
+        );
+        SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY.store(false, Ordering::Relaxed);
+        // The factor is wrong on purpose; only the instruction and miss totals matter.
+        println!("arm=compare-skipped ok={}", result.is_ok());
+    }
+
+    #[test]
     fn prefix_stability_pairs_a_run_with_the_row_it_updated() {
         // The invariant this counter rests on is that `matched_run_length` returns a
         // common PREFIX, so a recorded run can never exceed the row it was measured
@@ -24050,6 +24134,35 @@ pub static SPLU_PARTIAL_INPLACE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
 /// DEFAULT OFF until timed. The symbolic pass is O(fill) work that the shipping path does
 /// not currently do, and it may cost more than the locality is worth. Two preconditions
 /// being cleared is not a measured win.
+/// Skip the merge's column comparison entirely and assume the whole region matches.
+///
+/// **THIS PRODUCES INCORRECT FACTORIZATIONS. It exists only to bound a lever.** The
+/// run-directory idea was to avoid reading target columns over the matched prefix; the
+/// line-level profile put that comparison at 0.86% of the merge's instructions and 0.28%
+/// of its read misses, but ~60% of cost landed on pseudo-lines so the attribution could
+/// not settle it. This arm removes the comparison outright, so a whole-program diff of
+/// `Ir` and `D1mr` against the shipping arm gives the **upper bound** on what a correct
+/// directory could recover — with no line attribution involved.
+///
+/// **INVALID FOR THAT PURPOSE — MEASURED AND WITHDRAWN 2026-08-17. DO NOT USE IT TO BOUND
+/// ANYTHING.** The A/B it was built for is confounded: a wrong `matched` corrupts the
+/// merge's structure, the factorization hits a zero pivot and **aborts early**
+/// (`ok=false`), and the arm therefore does an order of magnitude less WORK rather than
+/// the same work more cheaply. Whole-program totals read 110,255,080 Ir / 821,055 D1mr for
+/// the shipping arm against 10,819,198 / 53,517 for this one — a difference that is almost
+/// entirely truncated work, and quoting it as a saving would have been badly wrong.
+///
+/// THE CORRECTED DESIGN is to make the comparison run **twice** and use the same result:
+/// output is unchanged, so the factorization is bit-identical and does identical work, and
+/// the totals difference is exactly the marginal cost of one comparison. That measures the
+/// instruction cost cleanly. It measures the MISS cost as a lower bound only, since the
+/// second pass finds the lines warm — which is itself the point, because the merge touches
+/// those same column lines anyway.
+///
+/// Kept rather than deleted so the invalidation is visible instead of rediscovered.
+/// Never enable outside a measurement. Default off, pinned by a test.
+#[doc(hidden)]
+pub static SPLU_SKIP_COLUMN_COMPARE_MEASUREMENT_ONLY: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_RESERVE_FROM_SYMBOLIC_ENABLE: PerfToggle = PerfToggle::new(false);
 /// Factorizations that ran the symbolic reserve pass.

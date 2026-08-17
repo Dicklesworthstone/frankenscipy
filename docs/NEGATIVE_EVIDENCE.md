@@ -33181,3 +33181,59 @@ contention figure. The reportable results are the predicate confirmation and a r
   entirely, refuse the lever** — that is the upper bound on what any correct implementation
   could recover, since a correct one must still do everything the skipping arm does plus
   maintain an invariant.
+
+## 2026-08-17 - PeachSummit (cc) - I INVALIDATED MY OWN A/B BEFORE REPORTING IT: the skip arm aborts early, so its apparent 90% "saving" is truncated work, not cost
+
+- **Bead: `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** A refutation of an
+  experimental *design* — mine, from the previous row. **Probe:
+  `crates/fsci-sparse/src/linalg.rs::tests::ab_totals_column_compare_{enabled,skipped}`**
+  under `valgrind --tool=callgrind --cache-sim=yes`, plus the control
+  `column_compare_skip_ships_disabled_and_actually_changes_the_factor`. **OBSERVED VALUE:
+  the skipped arm returns `ok=false`.** `df -h /data` **119G** immediately before the
+  build, **ONE build** (`release-lines`), `loadavg` 15.1 with two local builds running —
+  **counted work only, no certification attempted**. `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. Nothing deleted.
+- **THE DESIGN I PROPOSED LAST ROW, AND WHY IT LOOKED SOUND.** Line-level attribution put
+  the column comparison at 0.86% of instructions and 0.28% of read misses, but ~60% of cost
+  landed on pseudo-lines, so I proposed settling it on **whole-program totals**: run an arm
+  that skips the comparison outright, diff `Ir` and `D1mr`, and take the difference as the
+  upper bound on any correct run directory. Totals need no attribution, so the pseudo-line
+  problem disappears.
+- **THE NUMBERS IT PRODUCED, WHICH I AM NOT BANKING AS A RESULT.**
+
+  | arm | Ir | D1mr |
+  |---|---|---|
+  | comparison enabled (shipping) | 110,255,080 | 821,055 |
+  | comparison skipped | 10,819,198 | 53,517 |
+
+  Read naively that is a **90% instruction reduction and a 94% miss reduction** — which
+  would have resurrected the run directory outright and contradicted the previous row.
+- **IT IS AN ARTEFACT, AND THE CHECK THAT CAUGHT IT WAS ONE LINE.** Skipping the comparison
+  makes the merge treat non-matching columns as matching, which corrupts the factor's
+  structure until the elimination hits a zero pivot and **returns early**: the arm prints
+  `ok=false`. It does roughly a tenth of the WORK, so its totals measure a truncated
+  factorization, not a cheaper one. **A valid A/B must hold work constant and vary only
+  cost; this varied both.**
+- **THE CONTROL SAID THE ARM WAS "LIVE" AND THAT WAS NOT ENOUGH.** I asserted the skip arm
+  changes the factor — it does — and treated that as licence to measure it. Changing the
+  output and doing the same work are different properties, and only the second makes a
+  totals diff meaningful. **A liveness control is not a validity control**, and that
+  distinction is the transferable lesson here.
+- **THE CORRECTED DESIGN, which holds work constant by construction:** run the comparison
+  **twice** and use the same result. The factorization is then **bit-identical** and does
+  identical work, so the totals difference is exactly the marginal cost of one comparison.
+  It measures instructions cleanly. For misses it yields a **lower** bound, because the
+  second pass finds the lines warm — and that is itself informative: it is the same reason
+  the comparison shows almost no misses today, namely that those column lines are resident
+  when it runs.
+- **WHAT THE EVIDENCE STILL SAYS ABOUT THE LEVER.** Nothing here rehabilitates it. The
+  line-level figures (0.86% of instructions, 0.28% of misses) stand as the only valid
+  measurement of the comparison's cost, weakened by attribution quality but not contradicted
+  — the 90%/94% figures are now known to measure something else entirely. **The run
+  directory remains where the previous row left it: probably dead, pending one clean
+  measurement.**
+- **Concrete retry predicate:** implement the double-comparison arm, assert **bit-identity**
+  against the shipping arm (which the skip arm could never have satisfied, and that alone
+  would have flagged the design), and diff whole-program totals. **If the marginal
+  instruction cost of one comparison is under 1% of the factorization, refuse the run
+  directory and close this line with the arena and the supernodal one.**
