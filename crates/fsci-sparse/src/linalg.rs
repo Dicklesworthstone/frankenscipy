@@ -26934,3 +26934,341 @@ mod lsqr_x0_tests {
         );
     }
 }
+
+/// Transpose-Free Quasi-Minimal Residual -- `scipy.sparse.linalg.tfqmr`.
+///
+/// One of the two iterative solvers SciPy ships that this crate did not have; the
+/// other is `gcrotmk`, which is a much larger piece of work (Krylov subspace
+/// recycling with outer and inner iterations) and is not attempted here.
+///
+/// TFQMR (Freund 1993) is a transpose-free variant of QMR for general nonsymmetric
+/// systems. Its appeal over BiCGSTAB is a smoother residual curve -- it quasi-minimizes
+/// rather than letting the residual oscillate -- at essentially the same cost per
+/// iteration. Like BiCGSTAB it can break down, and that case is returned as an error
+/// rather than silently continuing with a poisoned iterate.
+///
+/// Ported from `_isolve/tfqmr.py`, equation numbers referring to Freund's paper as
+/// SciPy's comments do. Two structural details are easy to get wrong and are called
+/// out at their sites: `alpha` and `u_next` are computed only on EVEN iterations and
+/// deliberately persist into the following odd one, so they are declared outside the
+/// loop rather than inside the even branch.
+///
+/// DIFFERENCES FROM SciPy, stated rather than left to be found:
+///
+/// * No preconditioner. SciPy takes `M`; this is the unpreconditioned solver, i.e.
+///   `M = I`. Adding it is mechanical -- every `A*v` in the recurrence becomes
+///   `M*(A*v)` -- but a preconditioned solver whose preconditioner is untested is
+///   worse than one that says it has none.
+/// * The stopping test is SciPy's, `tau * sqrt(iter+1) < atol` -- the QMR bound on
+///   the true residual, not the true residual itself -- with `atol` taken as
+///   `options.tol * ||r0||` so that `tol` keeps the RELATIVE meaning it has for every
+///   other solver in this crate. SciPy resolves atol/rtol separately through
+///   `_get_atol_rtol`, which this crate has no equivalent of.
+/// * `residual_norm` is recomputed as the true `||Ax - b|| / ||b||` on return rather
+///   than reported from `tau`. The QMR bound is an upper bound and can sit well above
+///   the achieved residual, so reporting it would understate the result.
+pub fn tfqmr(
+    a: &CsrMatrix,
+    b: &[f64],
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: "TFQMR requires a square matrix".to_string(),
+        });
+    }
+    let n = shape.rows;
+    if b.len() != n {
+        return Err(SparseError::IncompatibleShape {
+            message: "rhs length must match matrix rows".to_string(),
+        });
+    }
+    validate_iterative_finite_inputs(a, b, x0, options)?;
+
+    let mut x: Vec<f64> = match x0 {
+        Some(initial) => {
+            if initial.len() != n {
+                return Err(SparseError::IncompatibleShape {
+                    message: "initial guess length must match matrix rows".to_string(),
+                });
+            }
+            initial.to_vec()
+        }
+        None => vec![0.0; n],
+    };
+
+    let b_norm = vec_norm(b);
+    if rhs_is_zero(b_norm) {
+        return Ok(IterativeSolveResult {
+            solution: vec![0.0; n],
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+
+    // SciPy caps at min(10000, n*10) here rather than using the bare n*10 the Krylov
+    // family uses (`_isolve/tfqmr.py:110-111`); that cap is part of the incumbent's
+    // behaviour, so it is honoured when the caller expresses no preference.
+    let max_iter = options
+        .max_iter
+        .unwrap_or_else(|| n.saturating_mul(10).min(10_000));
+
+    let ax = csr_matvec(a, &x);
+    let r: Vec<f64> = b.iter().zip(&ax).map(|(bi, axi)| bi - axi).collect();
+
+    // `rstar` is the shadow residual, held fixed at r0. Because it EQUALS r0, the
+    // first `rho` is exactly ||r0||^2 and is therefore real and non-negative -- SciPy
+    // notes the same thing, which is what lets a complex implementation take `.real`
+    // there without losing anything.
+    let rstar = r.clone();
+    let mut u = r.clone();
+    let mut w = r.clone();
+    let mut v = csr_matvec(a, &r);
+    let mut uhat = v.clone();
+    let mut d = vec![0.0_f64; n];
+    let mut theta = 0.0_f64;
+    let mut eta = 0.0_f64;
+    let mut rho = dot_product(&rstar, &r);
+    let mut rho_last = rho;
+    let r0_norm = rho.sqrt();
+    let mut tau = r0_norm;
+    if r0_norm == 0.0 {
+        return Ok(IterativeSolveResult {
+            solution: x,
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+    let atol = options.tol * r0_norm;
+
+    // Carried ACROSS the even/odd pair on purpose: both are set on an even iteration
+    // and consumed on the odd one that follows.
+    let mut alpha = 0.0_f64;
+    let mut u_next = vec![0.0_f64; n];
+
+    for iteration in 0..max_iter {
+        let even = iteration % 2 == 0;
+        if even {
+            let vtrstar = dot_product(&rstar, &v);
+            if vtrstar == 0.0 {
+                // Freund's breakdown. Returning an error rather than a converged=false
+                // result distinguishes "the method failed" from "ran out of budget",
+                // which a caller choosing a fallback solver needs to tell apart.
+                return Err(SparseError::SingularMatrix {
+                    message: format!(
+                        "TFQMR broke down at iteration {iteration}: the shadow residual \
+                         is orthogonal to the search direction"
+                    ),
+                });
+            }
+            alpha = rho / vtrstar;
+            for i in 0..n {
+                u_next[i] = u[i] - alpha * v[i]; // (5.6)
+            }
+        }
+        for i in 0..n {
+            w[i] -= alpha * uhat[i]; // (5.8)
+        }
+        let d_scale = theta * theta / alpha * eta; // (5.5)
+        for i in 0..n {
+            d[i] = u[i] + d_scale * d[i];
+        }
+        theta = vec_norm(&w) / tau; // (5.2)
+        let c = (1.0 / (1.0 + theta * theta)).sqrt();
+        tau *= theta * c;
+        eta = c * c * alpha; // (5.4)
+        for i in 0..n {
+            x[i] += eta * d[i];
+        }
+
+        // The QMR bound on the true residual, which is what SciPy tests. It is an
+        // UPPER bound, so passing it means the true residual is at least this good.
+        if tau * ((iteration + 1) as f64).sqrt() < atol {
+            let ax = csr_matvec(a, &x);
+            let residual_norm = vec_norm_diff(&ax, b) / b_norm;
+            return Ok(IterativeSolveResult {
+                solution: x,
+                converged: true,
+                iterations: iteration + 1,
+                residual_norm,
+            });
+        }
+
+        if even {
+            uhat = csr_matvec(a, &u_next);
+            u.copy_from_slice(&u_next);
+            rho_last = rho;
+        } else {
+            rho = dot_product(&rstar, &w); // (5.7)
+            let beta = rho / rho_last;
+            for i in 0..n {
+                u[i] = w[i] + beta * u[i];
+                v[i] = beta * uhat[i] + beta * beta * v[i];
+            }
+            uhat = csr_matvec(a, &u);
+            for i in 0..n {
+                v[i] += uhat[i];
+            }
+        }
+    }
+
+    let ax = csr_matvec(a, &x);
+    let residual_norm = vec_norm_diff(&ax, b) / b_norm;
+    Ok(IterativeSolveResult {
+        solution: x,
+        converged: residual_norm <= options.tol,
+        iterations: max_iter,
+        residual_norm,
+    })
+}
+
+/// TFQMR -- `scipy.sparse.linalg.tfqmr`, previously missing from this crate.
+#[cfg(test)]
+mod tfqmr_tests {
+    use super::{
+        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, bicgstab, gmres,
+        tfqmr,
+    };
+
+    /// NONSYMMETRIC and diagonally dominant. Nonsymmetric because TFQMR exists for
+    /// exactly that case and a symmetric fixture would let a subtly wrong recurrence
+    /// pass; diagonally dominant so every solver compared against it converges,
+    /// making disagreement attributable to the port rather than to the problem.
+    fn nonsymmetric() -> (CsrMatrix, Vec<f64>) {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(4, 4),
+            vec![4.0, 1.0, 4.0, 1.0, 1.0, 4.0, 1.0, 1.0, 4.0],
+            vec![0, 0, 1, 1, 2, 2, 2, 3, 3],
+            vec![0, 1, 1, 2, 0, 2, 3, 1, 3],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        (a, vec![1.0, 2.0, 3.0, 4.0])
+    }
+
+    fn opts() -> IterativeSolveOptions {
+        IterativeSolveOptions {
+            tol: 1e-12,
+            max_iter: Some(500),
+            ..IterativeSolveOptions::default()
+        }
+    }
+
+    /// MUST-HIT on the defining property: the returned x must satisfy A x = b. This
+    /// is checked against the SYSTEM, not against another solver, so it stands even
+    /// if every other solver in the crate shared a defect.
+    #[test]
+    fn tfqmr_solves_the_system() {
+        let (a, b) = nonsymmetric();
+        let r = tfqmr(&a, &b, None, opts()).expect("tfqmr");
+        assert!(
+            r.converged,
+            "did not converge on a diagonally dominant 4x4 (residual {})",
+            r.residual_norm
+        );
+        assert!(
+            r.solution.iter().all(|v| v.is_finite()),
+            "non-finite solution: {:?}",
+            r.solution
+        );
+
+        let dense = [
+            [4.0, 1.0, 0.0, 0.0],
+            [0.0, 4.0, 1.0, 0.0],
+            [1.0, 0.0, 4.0, 1.0],
+            [0.0, 1.0, 0.0, 4.0],
+        ];
+        let mut worst = 0.0_f64;
+        for i in 0..4 {
+            let ax: f64 = (0..4).map(|j| dense[i][j] * r.solution[j]).sum();
+            worst = worst.max((ax - b[i]).abs());
+        }
+        assert!(worst < 1e-9, "A x - b is {worst}; x = {:?}", r.solution);
+    }
+
+    /// THE DECISIVE TEST FOR A NEW SOLVER: it must agree with solvers that were
+    /// already here. A fresh port can satisfy its own residual check while
+    /// implementing a slightly different method -- agreement with TWO independent
+    /// existing algorithms, on a system with a unique solution, is what rules that
+    /// out. This is the same cross-check that guards the damped least-squares ports.
+    #[test]
+    fn tfqmr_agrees_with_bicgstab_and_gmres() {
+        let (a, b) = nonsymmetric();
+        let t = tfqmr(&a, &b, None, opts()).expect("tfqmr");
+        let bi = bicgstab(&a, &b, None, opts()).expect("bicgstab");
+        let gm = gmres(&a, &b, None, opts()).expect("gmres");
+        for i in 0..4 {
+            assert!(
+                (t.solution[i] - bi.solution[i]).abs() < 1e-8,
+                "tfqmr and bicgstab disagree at {i}: {} vs {}",
+                t.solution[i],
+                bi.solution[i]
+            );
+            assert!(
+                (t.solution[i] - gm.solution[i]).abs() < 1e-8,
+                "tfqmr and gmres disagree at {i}: {} vs {}",
+                t.solution[i],
+                gm.solution[i]
+            );
+        }
+    }
+
+    /// A warm start reaches the same solution. The system has a unique answer, so the
+    /// guess may change the path but not the destination.
+    #[test]
+    fn a_warm_start_reaches_the_same_solution() {
+        let (a, b) = nonsymmetric();
+        let cold = tfqmr(&a, &b, None, opts()).expect("cold");
+        let guess: Vec<f64> = cold.solution.iter().map(|v| v + 0.5).collect();
+        let warm = tfqmr(&a, &b, Some(&guess), opts()).expect("warm");
+        for i in 0..4 {
+            assert!(
+                (cold.solution[i] - warm.solution[i]).abs() < 1e-8,
+                "warm start landed elsewhere at {i}: {} vs {}",
+                cold.solution[i],
+                warm.solution[i]
+            );
+        }
+    }
+
+    /// Degenerate inputs, each with the arm that keeps the assertion honest.
+    #[test]
+    fn degenerate_inputs_are_handled() {
+        let (a, _b) = nonsymmetric();
+
+        // Zero right-hand side: x = 0, no iterations.
+        let zero = tfqmr(&a, &[0.0; 4], None, opts()).expect("zero rhs");
+        assert_eq!(zero.iterations, 0);
+        assert!(zero.solution.iter().all(|v| *v == 0.0));
+
+        // Non-square is rejected. MUST-MISS below keeps this from passing by
+        // rejecting everything.
+        let rect = CooMatrix::from_triplets(
+            Shape2D::new(3, 2),
+            vec![1.0, 1.0],
+            vec![0, 1],
+            vec![0, 1],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        assert!(
+            matches!(
+                tfqmr(&rect, &[1.0, 2.0, 3.0], None, opts()),
+                Err(SparseError::InvalidShape { .. })
+            ),
+            "a 3x2 matrix was accepted"
+        );
+        assert!(
+            tfqmr(&a, &[1.0, 2.0, 3.0, 4.0], None, opts()).is_ok(),
+            "a square system was rejected"
+        );
+    }
+}

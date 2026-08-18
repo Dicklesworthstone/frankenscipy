@@ -161,7 +161,11 @@ pub use linalg::{
     lgmres,
     lgmres_batch,
     lsmr,
+    lsmr_damped,
+    lsmr_regularized,
     lsqr,
+    lsqr_damped,
+    lsqr_regularized,
     matrix_power,
     minimum_spanning_tree,
     minres,
@@ -209,6 +213,7 @@ pub use linalg::{
     strongly_connected_components,
     structural_rank,
     svds,
+    tfqmr,
     topological_sort,
 };
 pub use ops::{
