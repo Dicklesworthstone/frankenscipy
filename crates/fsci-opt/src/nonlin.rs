@@ -2210,6 +2210,67 @@ mod nonlin_tests {
         }
     }
 
+    /// The augmentation must ADD to the inner iteration budget rather than consume it.
+    ///
+    /// This is the defect the large-n sweep measured: with `inner_maxiter = 20` and a
+    /// full `outer_k = 10` augmentation, spending the budget on the augmentation leaves
+    /// 10 Krylov directions where SciPy builds 30, and the shortfall grows exactly as
+    /// the augmentation fills. Counted rather than timed, so it is deterministic and a
+    /// contended host cannot obscure it.
+    #[test]
+    fn augmentation_adds_to_the_inner_budget_rather_than_consuming_it() {
+        let n = 24;
+        // A linear residual, so the operator is constant and the only thing that varies
+        // between the two measurements below is the size of the augmentation.
+        let amul = |x: &[f64]| -> Vec<f64> {
+            (0..n)
+                .map(|i| 4.0 * x[i] - x[(i + 1) % n] - 0.5 * x[(i + n - 1) % n])
+                .collect()
+        };
+        let inner_maxiter = 6;
+        let x0 = vec![0.0; n];
+        let f0 = amul(&x0);
+        let rhs = pseudo(1717, n);
+
+        // No augmentation yet: at most `inner_maxiter` products.
+        let mut j = KrylovJacobian::new(amul, None, inner_maxiter, 4);
+        j.setup(&x0, &f0);
+        let before = j.function_evaluations();
+        // A tolerance of zero prevents an early exit from truncating the count, so the
+        // budget is what bounds it.
+        j.solve(&rhs, 0.0, InnerMethod::Lgmres);
+        let plain = j.function_evaluations() - before;
+        assert!(
+            plain <= inner_maxiter,
+            "a solve with no augmentation used {plain} products, over the budget of \
+             {inner_maxiter}"
+        );
+
+        // Build the augmentation up, then measure a solve with it in hand.
+        for _ in 0..4 {
+            j.solve(&rhs, 0.0, InnerMethod::Lgmres);
+        }
+        let k = j.augmentation_rank();
+        assert!(k > 0, "no augmentation accumulated, so the comparison is empty");
+        let mid = j.function_evaluations();
+        j.solve(&rhs, 0.0, InnerMethod::Lgmres);
+        let augmented = j.function_evaluations() - mid;
+
+        // MUST-HIT: the augmented solve does strictly MORE work, not the same amount
+        // redistributed.
+        assert!(
+            augmented > plain,
+            "an augmented solve used {augmented} products against {plain} unaugmented; \
+             the augmentation is being taken out of the Krylov budget instead of added \
+             to it -- the defect measured at large n"
+        );
+        assert!(
+            augmented <= inner_maxiter + k,
+            "an augmented solve used {augmented} products, over the budget of \
+             {inner_maxiter} + {k}"
+        );
+    }
+
     // ── Mixing and Anderson Jacobians ───────────────────────────────────────
 
     use super::{
@@ -3443,14 +3504,33 @@ where
         dx
     }
 
-    /// Generalised conjugate residual, optionally seeded with augmentation directions.
+    /// Generalised conjugate residual over the augmented subspace.
     ///
-    /// GCR rather than an Arnoldi GMRES because augmentation drops straight in: a
-    /// direction is a direction, whether it came from the current Krylov sequence or
-    /// from a previous Newton step, so the augmented subspace needs no special basis
-    /// bookkeeping. Over the same subspace GCR minimises the same residual GMRES does.
+    /// The augmented subspace is `span(outer_v) + K_m(A, r0)`, and TWO details of how
+    /// SciPy builds it were measured to matter; both were wrong here before and the
+    /// ledger has the cost curve.
     ///
-    /// The paired update is what keeps it honest: whenever `A z` is orthogonalised
+    /// # The augmentation ADDS to the iteration budget
+    ///
+    /// `_fgmres` opens with `m = m + len(outer_v)`. The augmentation directions are
+    /// extra work, not a substitute for Krylov work. Spending the budget on them
+    /// instead -- which is what a plain `for j in 0..inner_maxiter` does -- leaves
+    /// `inner_maxiter - k` Krylov directions, so with the defaults `inner_maxiter = 20`
+    /// and `outer_k = 10` the subspace collapses from 30 directions to 10 once the
+    /// augmentation fills. The shortfall grows precisely as the augmentation fills,
+    /// which is why the measured deficit grew with problem size rather than sitting at
+    /// a constant factor.
+    ///
+    /// # The Krylov directions come from the BASIS, not from the running residual
+    ///
+    /// After the augmentation vectors, SciPy takes `z = v0` once and then `z = vs[-1]`
+    /// -- the most recent orthonormal basis vector of the image space. Seeding from the
+    /// current residual instead is ORTHODIR: it spans the same space in exact
+    /// arithmetic, but it reseeds from a vector that has already been reduced by the
+    /// augmentation corrections, so the Krylov part explores a smaller space than
+    /// `K_m(A, r0)` and loses orthogonality faster.
+    ///
+    /// The paired update is what keeps the rest honest: whenever `A z` is orthogonalised
     /// against an earlier image, the SAME coefficient is applied to `z`, so the stored
     /// pair always satisfies `q_j = A z_j` exactly and the residual bookkeeping stays
     /// consistent with the operator.
@@ -3467,15 +3547,31 @@ where
         let mut zs: Vec<Vec<f64>> = Vec::new();
         let mut qs: Vec<Vec<f64>> = Vec::new();
 
-        for j in 0..self.inner_maxiter {
-            // Seed with an augmentation direction while any remain, then fall back to
-            // the current residual -- the ordinary Krylov choice.
+        // The original residual direction, kept because the Krylov part must be seeded
+        // from it rather than from the residual as it stands after the augmentation
+        // corrections have been applied.
+        let v0 = r.clone();
+        // `m = m + len(outer_v)`: the augmentation is additional work, not a substitute
+        // for Krylov work.
+        let budget = self.inner_maxiter + augment.len();
+
+        for j in 0..budget {
             let mut z = if j < augment.len() {
                 augment[j].clone()
+            } else if j == augment.len() {
+                v0.clone()
             } else {
-                r.clone()
+                // The last orthonormal image-space vector -- SciPy's `vs[-1]`. Falling
+                // back to `v0` only if nothing has been stored, which cannot happen
+                // once j exceeds the augmentation count but keeps the index total.
+                qs.last().cloned().unwrap_or_else(|| v0.clone())
             };
             let mut w = self.matvec(&z);
+            // Magnitude BEFORE orthogonalisation: the breakdown test below is relative
+            // to it, because what matters is how much of `w` survived, not its absolute
+            // size. An absolute floor would fire on every direction of a small-scale
+            // problem and on none of a large-scale one.
+            let w_norm0 = norm(&w);
 
             // Modified Gram-Schmidt against the previous images, applying every
             // coefficient to `z` as well so the pair stays exact.
@@ -3490,10 +3586,18 @@ where
                     }
                 }
             }
+            // SciPy's `if not (hcur[-1] > eps * w_norm)` -- a direction that is
+            // almost entirely explained by the existing basis contributes nothing, and
+            // normalising what is left would amplify rounding noise into the solution.
+            // This fires in practice: repeated solves of the same system produce
+            // identical augmentation directions, so every one after the first is
+            // already in the space.
             let nw = norm(&w);
-            if nw == 0.0 || !nw.is_finite() {
-                // The direction added nothing; with an augmentation seed that just means
-                // it was already in the space, so continue rather than give up.
+            if !(nw > f64::EPSILON * w_norm0) || !nw.is_finite() {
+                // An augmentation direction that lies in the space already contributes
+                // nothing; skip it and keep going, since the Krylov directions after it
+                // are still worth building. A Krylov direction that collapses means the
+                // space is exhausted, which is a genuine stop.
                 if j < augment.len() {
                     continue;
                 }
