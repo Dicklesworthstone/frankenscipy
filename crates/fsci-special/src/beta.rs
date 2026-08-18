@@ -4158,15 +4158,28 @@ mod tests {
             );
         }
 
-        // WHY the kernel exists, asserted rather than asserted-about. If either of
-        // these ever stops holding, `ncfdtr` improved and this comment is the thing
-        // to revisit -- not a reason for the kernel to fail.
-        assert_eq!(
-            1.0 - ncfdtr(3.0, 5.0, 2.0, 1e12),
-            0.0,
-            "the subtraction is supposed to collapse here; that is the premise"
-        );
-        assert_eq!(1.0 - ncfdtr(5.0, 200.0, 3.0, 1e4), 0.0);
+        // WHY the kernel exists, asserted rather than asserted-about: `1 - ncfdtr`
+        // has NO correct digits at these arguments.
+        //
+        // The first version of this check asserted the subtraction returns exactly
+        // 0.0, which is what SciPy's ncfdtr does. Ours does not -- it returns
+        // 1.1102230246251565e-15, one ulp of 1.0, against a true 2.3304e-29. That
+        // is not a milder failure than zero, it is a WORSE one: zero is visibly
+        // wrong, whereas a plausible-looking 1e-15 is the double-precision noise
+        // floor wearing the costume of an answer. The assertion is therefore on
+        // the relative error, which catches both shapes and does not depend on
+        // which side of 1.0 the cdf happens to land.
+        for (dfn, dfd, nc, f, truth) in [
+            (3.0, 5.0, 2.0, 1e12, 2.330_354_877_710_844e-29),
+            (5.0, 200.0, 3.0, 1e4, 4.498_173_170_614_720e-230),
+        ] {
+            let naive = 1.0 - ncfdtr(dfn, dfd, nc, f);
+            let rel = ((naive - truth) / truth).abs();
+            assert!(
+                rel > 0.99,
+                "premise: `1 - ncfdtr` should be worthless at ({dfn}, {dfd}, {nc},                  {f:e}) -- got {naive:e} against a true {truth:e} (rel {rel:e}). If                  this now agrees, `ncfdtr` improved and this kernel's motivation,                  not its correctness, is what needs revisiting"
+            );
+        }
 
         // Complementarity, but only mid-range, where the subtraction is still
         // accurate enough for the comparison to mean anything.

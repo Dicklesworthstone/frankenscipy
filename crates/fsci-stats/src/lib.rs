@@ -57668,63 +57668,14 @@ impl<D: ContinuousDistribution> Truncated<D> {
         self.mass
     }
 
-    /// `P(lo < X ≤ hi)` computed on whichever tail keeps the subtraction small.
-    ///
-    /// `F(hi) − F(lo)` when the interval sits in the left half, `S(lo) − S(hi)`
-    /// otherwise. The guard is `!(lo < hi)` rather than `lo >= hi` so a NaN bound
-    /// short-circuits to zero instead of slipping through a false comparison —
-    /// the same NaN-aware shape as `tanh_sinh_integrate` (frankenscipy-023vy).
+    /// `P(lo < X ≤ hi)`; see [`interval_probability`].
     fn interval_mass(dist: &D, lo: f64, hi: f64) -> f64 {
-        if !(lo < hi) {
-            return 0.0;
-        }
-        if lo == f64::NEG_INFINITY {
-            return if hi == f64::INFINITY {
-                1.0
-            } else {
-                dist.cdf(hi)
-            };
-        }
-        if hi == f64::INFINITY {
-            return dist.sf(lo);
-        }
-        let f_lo = dist.cdf(lo);
-        let f_hi = dist.cdf(hi);
-        if f_lo + f_hi <= 1.0 {
-            f_hi - f_lo
-        } else {
-            dist.sf(lo) - dist.sf(hi)
-        }
+        interval_probability(dist, lo, hi)
     }
 
-    /// `ln P(lo < X ≤ hi)`, finite where [`Self::interval_mass`] underflows.
-    ///
-    /// Same branch choice, then a log-space subtraction
-    /// `ln(A − B) = ln A + ln(1 − exp(ln B − ln A))` with `A` the larger operand,
-    /// so the `exp` argument is never positive.
+    /// `ln P(lo < X ≤ hi)`; see [`log_interval_probability`].
     fn log_interval_mass(dist: &D, lo: f64, hi: f64) -> f64 {
-        if !(lo < hi) {
-            return f64::NEG_INFINITY;
-        }
-        if lo == f64::NEG_INFINITY {
-            return if hi == f64::INFINITY {
-                0.0
-            } else {
-                dist.logcdf(hi)
-            };
-        }
-        if hi == f64::INFINITY {
-            return dist.logsf(lo);
-        }
-        let (big, small) = if dist.cdf(lo) + dist.cdf(hi) <= 1.0 {
-            (dist.logcdf(hi), dist.logcdf(lo))
-        } else {
-            (dist.logsf(lo), dist.logsf(hi))
-        };
-        if small == f64::NEG_INFINITY {
-            return big;
-        }
-        big + (-(small - big).exp()).ln_1p()
+        log_interval_probability(dist, lo, hi)
     }
 
     /// The truncated quantile at `t ∈ (0, 1)`, mapped through whichever side of
@@ -57742,6 +57693,80 @@ impl<D: ContinuousDistribution> Truncated<D> {
         // pdf/cdf/sf are right and only the quantile needs the support re-imposed.
         x.clamp(self.lb, self.ub)
     }
+}
+
+/// `P(lo < X ≤ hi)` computed on whichever tail keeps the subtraction small.
+///
+/// `F(hi) − F(lo)` when the interval sits in the left half, `S(lo) − S(hi)`
+/// otherwise. Both are the same exact quantity; the test picks the pair whose
+/// difference is not swamped by its own operands. The textbook `F(hi) − F(lo)`
+/// alone is exactly zero for a standard normal on `[30, 40]`, where the survival
+/// side still returns 4.906713927147908e-198.
+///
+/// The guard is `!(lo < hi)` rather than `lo >= hi` so a NaN bound short-circuits
+/// to zero instead of slipping through a false comparison — the same NaN-aware
+/// shape as `tanh_sinh_integrate` (frankenscipy-023vy).
+///
+/// # What it cannot fix
+///
+/// When the RESULT is small because the interval is narrow — `P(−ε < X < ε)` for
+/// a density that is finite at 0 — both operands are near ½ on either side and
+/// there is no branch that avoids the cancellation. Recovering that needs the
+/// pdf (the mass is ≈ 2ε·f(0)), not the cdf, so it is a limit of the interface
+/// rather than of the branch choice. The failure is graceful: relative accuracy
+/// degrades as the interval narrows, it does not jump to zero.
+fn interval_probability<D: ContinuousDistribution>(dist: &D, lo: f64, hi: f64) -> f64 {
+    if !(lo < hi) {
+        return 0.0;
+    }
+    if lo == f64::NEG_INFINITY {
+        return if hi == f64::INFINITY {
+            1.0
+        } else {
+            dist.cdf(hi)
+        };
+    }
+    if hi == f64::INFINITY {
+        return dist.sf(lo);
+    }
+    let f_lo = dist.cdf(lo);
+    let f_hi = dist.cdf(hi);
+    if f_lo + f_hi <= 1.0 {
+        f_hi - f_lo
+    } else {
+        dist.sf(lo) - dist.sf(hi)
+    }
+}
+
+/// `ln P(lo < X ≤ hi)`, finite where [`interval_probability`] underflows.
+///
+/// Same branch choice, then a log-space subtraction
+/// `ln(A − B) = ln A + ln(1 − exp(ln B − ln A))` with `A` the larger operand, so
+/// the `exp` argument is never positive. On `[40, 50]` for a standard normal
+/// BOTH linear branches are exactly 0.0 while this returns −804.608.
+fn log_interval_probability<D: ContinuousDistribution>(dist: &D, lo: f64, hi: f64) -> f64 {
+    if !(lo < hi) {
+        return f64::NEG_INFINITY;
+    }
+    if lo == f64::NEG_INFINITY {
+        return if hi == f64::INFINITY {
+            0.0
+        } else {
+            dist.logcdf(hi)
+        };
+    }
+    if hi == f64::INFINITY {
+        return dist.logsf(lo);
+    }
+    let (big, small) = if dist.cdf(lo) + dist.cdf(hi) <= 1.0 {
+        (dist.logcdf(hi), dist.logcdf(lo))
+    } else {
+        (dist.logsf(lo), dist.logsf(hi))
+    };
+    if small == f64::NEG_INFINITY {
+        return big;
+    }
+    big + (-(small - big).exp()).ln_1p()
 }
 
 impl<D: ContinuousDistribution> ContinuousDistribution for Truncated<D> {
@@ -97431,8 +97456,10 @@ mod clttw_tie_predicate_is_exact {
     fn a_five_e_minus_thirteen_gap_is_not_a_tie() {
         let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let distinct = [1.0, 1.0 + 5e-13, 2.0, 3.0];
-        let tied = [1.0, 1.0, 2.0, 3.0];
+        // Annotated: `to_bits` below is called before inference has pinned the
+        // element type from the later `rankdata_ties_with_tie_sum` call.
+        let distinct: [f64; 4] = [1.0, 1.0 + 5e-13, 2.0, 3.0];
+        let tied: [f64; 4] = [1.0, 1.0, 2.0, 3.0];
 
         // The fixture only means anything if the two values really are distinct
         // bit patterns; if 5e-13 were absorbed by rounding at this magnitude the
@@ -97512,32 +97539,71 @@ mod clttw_tie_predicate_is_exact {
     }
 
     /// END TO END: the divergence has to reach the p-value, or it is a curiosity
-    /// rather than a conformance defect. Paired samples whose absolute differences
-    /// contain the near-tie must give a DIFFERENT answer from ones where those two
-    /// differences are exactly equal.
+    /// rather than a conformance defect.
+    ///
+    /// # The fixture size is load-bearing, and my first one was wrong
+    ///
+    /// This test used six pairs and asserted only that the two p-values DIFFER. It
+    /// failed, and the failure was mine, not the code's. `wilcoxon` has three
+    /// branches, and the tie correction `Σ(t³−t)/48` lives in exactly one of them:
+    ///
+    ///   * no ties, no dropped zeros, n ≤ 1000  → exact signed-rank distribution
+    ///   * ties or zeros, and `x.len() ≤ 13`    → exact PERMUTATION test (qghyr)
+    ///   * otherwise                            → normal approximation ← the correction
+    ///
+    /// At n = 6 the tied arm lands in the permutation branch, where the p-value is
+    /// a discrete count and the correction cannot reach it. Both arms returned
+    /// 0.03125 — and so does SciPy, for the same reason, so fsci was matching the
+    /// incumbent exactly. Fifteen pairs clears the `≤ 13` cutoff and puts the tied
+    /// arm in the approximation, which is the only place the predicate can show up.
+    ///
+    /// Asserting the two GOLDENS rather than just inequality: "they differ" would
+    /// have passed on a fixture where they differ for the wrong reason.
     #[test]
     fn the_predicate_reaches_the_wilcoxon_pvalue() {
         let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        // Differences: 1.0, 1.0+5e-13, 2.0, 3.0, 4.0, 5.0 (all positive, no zeros,
-        // which wilcoxon would otherwise drop).
-        let x = vec![1.0, 1.0 + 5e-13, 2.0, 3.0, 4.0, 5.0];
-        let y = vec![0.0; 6];
-        let near = wilcoxon(&x, &y);
+        // Differences 1.0, 1.0+5e-13, 2.0 .. 14.0 — fifteen, all positive, no zeros
+        // for wilcoxon to drop.
+        let mut x = vec![1.0, 1.0 + 5e-13];
+        x.extend((2..15).map(f64::from));
+        let y = vec![0.0; x.len()];
+        assert!(
+            x.len() > 13,
+            "the fixture must clear the permutation-test cutoff or the tie \
+             correction is unreachable and this test proves nothing"
+        );
 
+        let near = wilcoxon(&x, &y);
         let mut x_tied = x.clone();
         x_tied[1] = 1.0; // now an exact tie
         let exact = wilcoxon(&x_tied, &y);
 
+        // The predicate itself, both arms, so a failure below is localised.
+        let (_, ts_near) = rankdata_ties_with_tie_sum(&x, RankTieMethod::Average);
+        let (_, ts_exact) = rankdata_ties_with_tie_sum(&x_tied, RankTieMethod::Average);
+        assert_eq!(ts_near, 0.0, "MUST-MISS: a 5e-13 gap is not a tie group");
+        assert_eq!(ts_exact, 6.0, "MUST-HIT: the exact pair is a tie group of 2");
+
+        // scipy.stats.wilcoxon(x, y) — the near-tie arm has no ties, so it takes the
+        // exact signed-rank distribution; the tied arm takes the approximation.
+        let want_near = 6.103_515_625e-5;
+        let want_exact = 6.533_107_814_151_376e-4;
         assert!(
-            near.pvalue.is_finite() && exact.pvalue.is_finite(),
-            "wilcoxon returned a non-finite p-value on a well-formed fixture"
+            ((near.pvalue - want_near) / want_near).abs() < 1e-12,
+            "near-tie p = {}, scipy = {want_near}",
+            near.pvalue
+        );
+        assert!(
+            ((exact.pvalue - want_exact) / want_exact).abs() < 1e-12,
+            "exact-tie p = {}, scipy = {want_exact}",
+            exact.pvalue
         );
         assert_ne!(
             near.pvalue.to_bits(),
             exact.pvalue.to_bits(),
             "a 5e-13 gap and an exact tie produced the SAME p-value, which means the \
-             tie predicate is not distinguishing them -- the tolerance is back"
+             tie predicate is not reaching the answer -- the tolerance is back"
         );
     }
 }
@@ -97592,16 +97658,29 @@ mod wofb_noncentral_survival_is_direct {
             );
         }
 
-        // The premise, asserted. Both cdfs still saturate -- that is not a defect
-        // in them, it is why the survival needs its own kernel. If either of these
-        // ever stops holding, the cdf improved and this test's motivation (not its
-        // correctness) should be revisited.
-        assert_eq!(
-            1.0 - NoncentralChiSquared::new(3.0, 2.0).cdf(150.0),
-            0.0,
-            "the ncx2 cdf is supposed to saturate here; that is the premise"
-        );
-        assert_eq!(1.0 - NoncentralF::new(5.0, 200.0, 3.0).cdf(1e4), 0.0);
+        // The premise: `1 - cdf` has NO correct digits at these arguments. Asserted
+        // on the RELATIVE error rather than on `== 0.0`, because the subtraction
+        // fails in two shapes and only one of them is zero -- it can also land a
+        // ulp off 1.0 and return ~1e-16, which is worse, being wrong while looking
+        // like an answer. Both shapes give rel ~ 1.
+        for (label, naive, truth) in [
+            (
+                "ncx2(3, 2) at 150",
+                1.0 - NoncentralChiSquared::new(3.0, 2.0).cdf(150.0),
+                1.044_927_027_553_426_6e-26,
+            ),
+            (
+                "ncf(5, 200, 3) at 1e4",
+                1.0 - NoncentralF::new(5.0, 200.0, 3.0).cdf(1e4),
+                4.498_173_170_614_720e-230,
+            ),
+        ] {
+            let rel = ((naive - truth) / truth).abs();
+            assert!(
+                rel > 0.99,
+                "premise: 1 - cdf should be worthless for {label} -- got {naive:e}                  against a true {truth:e} (rel {rel:e})"
+            );
+        }
 
         // nc = 0 degenerates to the central distributions, which already compute
         // their survival directly. NOTE this diverges from the incumbent on
