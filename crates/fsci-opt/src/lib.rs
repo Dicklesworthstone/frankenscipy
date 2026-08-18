@@ -8654,3 +8654,636 @@ mod tests {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Quasi-Newton Hessian update strategies — scipy.optimize.BFGS / SR1
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Whether a strategy approximates the Hessian or its inverse.
+///
+/// `scipy.optimize`'s `approx_type`. The two are not interchangeable: every update
+/// formula below swaps the roles of `delta_x` and `delta_grad` depending on which is
+/// being maintained, so a strategy initialized for one and used as the other produces
+/// a matrix that is neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HessianApproxType {
+    /// Approximate the Hessian `B`.
+    Hess,
+    /// Approximate the inverse Hessian `H`.
+    InvHess,
+}
+
+/// What BFGS does when the curvature condition is violated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BfgsExceptionStrategy {
+    /// Leave the matrix untouched for that step. Default, with `min_curvature = 1e-8`.
+    SkipUpdate,
+    /// Interpolate between the BFGS result and the unmodified matrix (Powell damping).
+    /// Default `min_curvature = 0.2`.
+    DampUpdate,
+}
+
+/// BFGS quasi-Newton approximation — `scipy.optimize.BFGS`.
+///
+/// This crate already has a `bfgs` MINIMIZER; what it did not have is BFGS as a
+/// reusable Hessian-approximation strategy. They are different things: the optimizer
+/// owns a loop, this owns a matrix and can be handed to any method that wants curvature
+/// information -- which is how `trust-constr` and friends consume it in SciPy.
+///
+/// # The curvature condition is the whole subtlety
+///
+/// The BFGS update preserves positive-definiteness only while `s·y > 0`. In exact
+/// arithmetic a Wolfe line search guarantees it; in floating point it can fail, and
+/// applying the formula anyway yields an indefinite matrix that then sends the caller
+/// in an ascent direction. SciPy offers two responses and so does this: skip the step,
+/// or damp it by interpolating `z` toward `Mw` so the condition holds by construction.
+///
+/// A SECOND guard exists for the same reason: if `wMw <= 0` -- impossible in exact
+/// arithmetic, reachable through roundoff -- the matrix is REINITIALIZED to a scaled
+/// identity rather than updated. Without it, one bad step poisons every subsequent one.
+#[derive(Debug, Clone)]
+pub struct BfgsHessian {
+    n: usize,
+    approx_type: HessianApproxType,
+    /// Row-major `n x n`.
+    matrix: Vec<f64>,
+    min_curvature: f64,
+    exception_strategy: BfgsExceptionStrategy,
+    first_iteration: bool,
+}
+
+/// Symmetric-rank-1 quasi-Newton approximation — `scipy.optimize.SR1`.
+///
+/// SR1 does NOT preserve positive-definiteness, by design: it can represent indefinite
+/// curvature, which is what makes it useful inside trust-region methods that can
+/// exploit negative curvature and useless for line-search methods that cannot. Its
+/// only safeguard is skipping the update when the denominator is small relative to the
+/// vectors involved, since that is where the rank-1 formula becomes numerically
+/// meaningless.
+#[derive(Debug, Clone)]
+pub struct Sr1Hessian {
+    n: usize,
+    approx_type: HessianApproxType,
+    matrix: Vec<f64>,
+    min_denominator: f64,
+    first_iteration: bool,
+}
+
+/// `y_norm2 / |s·y|` for a Hessian, `|s·y| / y_norm2` for its inverse.
+///
+/// Nocedal & Wright formula (6.20): the scaling that makes the initial identity a
+/// reasonable guess at the true curvature, applied on the FIRST update rather than at
+/// initialization because it needs a step to estimate from. Degenerate inputs fall
+/// back to 1 rather than dividing by zero.
+fn auto_scale(delta_x: &[f64], delta_grad: &[f64], approx: HessianApproxType) -> f64 {
+    let s_norm2: f64 = delta_x.iter().map(|v| v * v).sum();
+    let y_norm2: f64 = delta_grad.iter().map(|v| v * v).sum();
+    let ys: f64 = delta_grad
+        .iter()
+        .zip(delta_x)
+        .map(|(y, s)| y * s)
+        .sum::<f64>()
+        .abs();
+    if ys == 0.0 || y_norm2 == 0.0 || s_norm2 == 0.0 {
+        return 1.0;
+    }
+    match approx {
+        HessianApproxType::Hess => y_norm2 / ys,
+        HessianApproxType::InvHess => ys / y_norm2,
+    }
+}
+
+fn identity_scaled(n: usize, scale: f64) -> Vec<f64> {
+    let mut m = vec![0.0; n * n];
+    for i in 0..n {
+        m[i * n + i] = scale;
+    }
+    m
+}
+
+fn mat_vec(matrix: &[f64], n: usize, p: &[f64]) -> Vec<f64> {
+    (0..n)
+        .map(|i| (0..n).map(|j| matrix[i * n + j] * p[j]).sum())
+        .collect()
+}
+
+impl BfgsHessian {
+    /// `exception_strategy` defaults `min_curvature` to SciPy's values: `1e-8` for
+    /// `SkipUpdate`, `0.2` for `DampUpdate`. Pass `None` to take the default.
+    #[must_use]
+    pub fn new(exception_strategy: BfgsExceptionStrategy, min_curvature: Option<f64>) -> Self {
+        let min_curvature = min_curvature.unwrap_or(match exception_strategy {
+            BfgsExceptionStrategy::SkipUpdate => 1e-8,
+            BfgsExceptionStrategy::DampUpdate => 0.2,
+        });
+        Self {
+            n: 0,
+            approx_type: HessianApproxType::Hess,
+            matrix: Vec::new(),
+            min_curvature,
+            exception_strategy,
+            first_iteration: true,
+        }
+    }
+
+    /// Start a fresh approximation of dimension `n`, as the identity.
+    pub fn initialize(&mut self, n: usize, approx_type: HessianApproxType) {
+        self.n = n;
+        self.approx_type = approx_type;
+        self.matrix = identity_scaled(n, 1.0);
+        self.first_iteration = true;
+    }
+
+    /// Absorb one step. `delta_x = x2 - x1`, `delta_grad = grad(x2) - grad(x1)`.
+    ///
+    /// A zero step or a zero gradient change is ignored, matching SciPy: the first
+    /// carries no information, and the second means the function looked linear over
+    /// the step, where a quasi-Newton update has nothing to learn.
+    pub fn update(&mut self, delta_x: &[f64], delta_grad: &[f64]) {
+        if self.n == 0 || delta_x.len() != self.n || delta_grad.len() != self.n {
+            return;
+        }
+        if delta_x.iter().all(|v| *v == 0.0) || delta_grad.iter().all(|v| *v == 0.0) {
+            return;
+        }
+        if self.first_iteration {
+            let scale = auto_scale(delta_x, delta_grad, self.approx_type);
+            self.matrix = identity_scaled(self.n, scale);
+            self.first_iteration = false;
+        }
+
+        // `w` and `z` swap roles with the approximation type; the rest of the formula
+        // is identical, which is why SciPy writes it once.
+        let (w, z_in): (&[f64], &[f64]) = match self.approx_type {
+            HessianApproxType::Hess => (delta_x, delta_grad),
+            HessianApproxType::InvHess => (delta_grad, delta_x),
+        };
+        let mut z = z_in.to_vec();
+
+        let mut wz: f64 = w.iter().zip(&z).map(|(a, b)| a * b).sum();
+        let mut mw = mat_vec(&self.matrix, self.n, w);
+        let mut wmw: f64 = mw.iter().zip(w).map(|(a, b)| a * b).sum();
+
+        if wmw <= 0.0 {
+            // Roundoff has made the matrix indefinite. Reinitialize rather than
+            // update; continuing would carry the damage forward indefinitely.
+            let scale = auto_scale(delta_x, delta_grad, self.approx_type);
+            self.matrix = identity_scaled(self.n, scale);
+            mw = mat_vec(&self.matrix, self.n, w);
+            wmw = mw.iter().zip(w).map(|(a, b)| a * b).sum();
+        }
+
+        if wz <= self.min_curvature * wmw {
+            match self.exception_strategy {
+                BfgsExceptionStrategy::SkipUpdate => return,
+                BfgsExceptionStrategy::DampUpdate => {
+                    let denom = 1.0 - wz / wmw;
+                    if denom == 0.0 {
+                        return;
+                    }
+                    let update_factor = (1.0 - self.min_curvature) / denom;
+                    for (zi, mwi) in z.iter_mut().zip(&mw) {
+                        *zi = update_factor * *zi + (1.0 - update_factor) * mwi;
+                    }
+                    wz = w.iter().zip(&z).map(|(a, b)| a * b).sum();
+                }
+            }
+        }
+        if wz == 0.0 || wmw == 0.0 {
+            return;
+        }
+
+        let n = self.n;
+        match self.approx_type {
+            // B <- B - (Bs)(Bs)^T / (s^T B s) + y y^T / (s^T y)   -- N&W (6.19)
+            HessianApproxType::Hess => {
+                for i in 0..n {
+                    for j in 0..n {
+                        self.matrix[i * n + j] +=
+                            -mw[i] * mw[j] / wmw + z[i] * z[j] / wz;
+                    }
+                }
+            }
+            // H <- H + ((Hy)^T y + s^T y)/(s^T y)^2 * s s^T
+            //        - ((Hy) s^T + s (Hy)^T) / (s^T y)            -- N&W (6.17)
+            HessianApproxType::InvHess => {
+                let coeff = (wmw + wz) / (wz * wz);
+                for i in 0..n {
+                    for j in 0..n {
+                        self.matrix[i * n + j] +=
+                            coeff * z[i] * z[j] - (mw[i] * z[j] + z[i] * mw[j]) / wz;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Matrix-vector product with the current approximation.
+    #[must_use]
+    pub fn dot(&self, p: &[f64]) -> Vec<f64> {
+        mat_vec(&self.matrix, self.n, p)
+    }
+
+    /// The current approximation, row-major `n x n`.
+    #[must_use]
+    pub fn get_matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+}
+
+impl Sr1Hessian {
+    /// `min_denominator` defaults to SciPy's `1e-8`.
+    #[must_use]
+    pub fn new(min_denominator: Option<f64>) -> Self {
+        Self {
+            n: 0,
+            approx_type: HessianApproxType::Hess,
+            matrix: Vec::new(),
+            min_denominator: min_denominator.unwrap_or(1e-8),
+            first_iteration: true,
+        }
+    }
+
+    /// Start a fresh approximation of dimension `n`, as the identity.
+    pub fn initialize(&mut self, n: usize, approx_type: HessianApproxType) {
+        self.n = n;
+        self.approx_type = approx_type;
+        self.matrix = identity_scaled(n, 1.0);
+        self.first_iteration = true;
+    }
+
+    /// Absorb one step.
+    pub fn update(&mut self, delta_x: &[f64], delta_grad: &[f64]) {
+        if self.n == 0 || delta_x.len() != self.n || delta_grad.len() != self.n {
+            return;
+        }
+        if delta_x.iter().all(|v| *v == 0.0) || delta_grad.iter().all(|v| *v == 0.0) {
+            return;
+        }
+        if self.first_iteration {
+            let scale = auto_scale(delta_x, delta_grad, self.approx_type);
+            self.matrix = identity_scaled(self.n, scale);
+            self.first_iteration = false;
+        }
+
+        let (w, z): (&[f64], &[f64]) = match self.approx_type {
+            HessianApproxType::Hess => (delta_x, delta_grad),
+            HessianApproxType::InvHess => (delta_grad, delta_x),
+        };
+        let mw = mat_vec(&self.matrix, self.n, w);
+        let diff: Vec<f64> = z.iter().zip(&mw).map(|(zi, m)| zi - m).collect();
+        let denominator: f64 = w.iter().zip(&diff).map(|(a, b)| a * b).sum();
+
+        // The skip test is RELATIVE to the vectors, not an absolute floor: an absolute
+        // epsilon on a quantity carrying the units of the problem is a scale bug, and
+        // would skip every update on a small-scale problem while never firing on a
+        // large one.
+        let w_norm = w.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let diff_norm = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if denominator.abs() <= self.min_denominator * w_norm * diff_norm {
+            return;
+        }
+
+        // Rank-1: M <- M + (z - Mw)(z - Mw)^T / w·(z - Mw)
+        let n = self.n;
+        for i in 0..n {
+            for j in 0..n {
+                self.matrix[i * n + j] += diff[i] * diff[j] / denominator;
+            }
+        }
+    }
+
+    /// Matrix-vector product with the current approximation.
+    #[must_use]
+    pub fn dot(&self, p: &[f64]) -> Vec<f64> {
+        mat_vec(&self.matrix, self.n, p)
+    }
+
+    /// The current approximation, row-major `n x n`.
+    #[must_use]
+    pub fn get_matrix(&self) -> &[f64] {
+        &self.matrix
+    }
+}
+
+
+/// Quasi-Newton Hessian update strategies.
+///
+/// Every test here is anchored on the SECANT CONDITION, which is the defining property
+/// of both strategies and holds EXACTLY in arithmetic rather than approximately: after
+/// absorbing `(s, y)` the approximation satisfies `B s = y` (or `H y = s`). Testing
+/// against it means these tests state what the code must be, not what it currently
+/// happens to produce.
+#[cfg(test)]
+mod hessian_update_strategy_tests {
+    use super::{
+        BfgsExceptionStrategy, BfgsHessian, HessianApproxType, Sr1Hessian,
+    };
+
+    /// A fixed SPD matrix. Steps are drawn against it so that `y = A s` is a genuine
+    /// curvature pair and the strategies have something true to converge to.
+    const A: [[f64; 3]; 3] = [
+        [4.0, 1.0, 0.5],
+        [1.0, 3.0, -0.25],
+        [0.5, -0.25, 2.0],
+    ];
+
+    fn a_times(s: &[f64]) -> Vec<f64> {
+        (0..3).map(|i| (0..3).map(|j| A[i][j] * s[j]).sum()).collect()
+    }
+
+    fn dot(a: &[f64], b: &[f64]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    /// Three linearly independent steps and the gradient changes they induce.
+    fn steps() -> Vec<(Vec<f64>, Vec<f64>)> {
+        [
+            vec![1.0, 0.0, 0.0],
+            vec![0.3, 1.0, -0.2],
+            vec![-0.5, 0.4, 1.0],
+        ]
+        .into_iter()
+        .map(|s| {
+            let y = a_times(&s);
+            (s, y)
+        })
+        .collect()
+    }
+
+    /// MUST-HIT: `B s = y` after the update, for the pair just absorbed.
+    /// MUST-MISS: it does NOT hold for a pair that was never absorbed -- otherwise the
+    /// assertion above could be passed by any matrix that happened to look like `A`.
+    #[test]
+    fn bfgs_satisfies_the_secant_condition() {
+        let (s, y) = steps().remove(0);
+        let mut b = BfgsHessian::new(BfgsExceptionStrategy::SkipUpdate, None);
+        b.initialize(3, HessianApproxType::Hess);
+        b.update(&s, &y);
+
+        let bs = b.dot(&s);
+        for i in 0..3 {
+            assert!(
+                (bs[i] - y[i]).abs() < 1e-12,
+                "secant condition violated at {i}: B s = {:?}, y = {y:?}",
+                bs
+            );
+        }
+
+        // MUST-MISS: an unrelated step is not reproduced by a rank-2 update built from
+        // a single different step.
+        let (s2, y2) = steps().remove(2);
+        let bs2 = b.dot(&s2);
+        assert!(
+            (0..3).any(|i| (bs2[i] - y2[i]).abs() > 1e-6),
+            "the approximation reproduced a step it never saw ({bs2:?} vs {y2:?}); the \
+             secant check above would then be vacuous"
+        );
+    }
+
+    /// The same property for the inverse branch: `H y = s`.
+    #[test]
+    fn bfgs_inverse_satisfies_the_secant_condition() {
+        let (s, y) = steps().remove(1);
+        let mut h = BfgsHessian::new(BfgsExceptionStrategy::SkipUpdate, None);
+        h.initialize(3, HessianApproxType::InvHess);
+        h.update(&s, &y);
+
+        let hy = h.dot(&y);
+        for i in 0..3 {
+            assert!(
+                (hy[i] - s[i]).abs() < 1e-12,
+                "inverse secant condition violated at {i}: H y = {hy:?}, s = {s:?}"
+            );
+        }
+    }
+
+    /// The two branches are written as two different formulas -- N&W (6.19) and (6.17)
+    /// -- and this is what ties them together: fed the SAME steps, the Hessian and the
+    /// inverse-Hessian approximations must be actual inverses of each other. A sign or
+    /// index slip in either formula that still satisfied its own secant condition would
+    /// be caught here and nowhere else.
+    ///
+    /// The initial scalings are reciprocal by construction (`y2/|sy|` against
+    /// `|sy|/y2`), so the relation holds from the first update onward, not just
+    /// asymptotically.
+    #[test]
+    fn the_hessian_and_inverse_branches_are_mutual_inverses() {
+        let mut b = BfgsHessian::new(BfgsExceptionStrategy::SkipUpdate, None);
+        let mut h = BfgsHessian::new(BfgsExceptionStrategy::SkipUpdate, None);
+        b.initialize(3, HessianApproxType::Hess);
+        h.initialize(3, HessianApproxType::InvHess);
+        for (s, y) in steps() {
+            b.update(&s, &y);
+            h.update(&s, &y);
+        }
+
+        let bm = b.get_matrix();
+        let hm = h.get_matrix();
+        for i in 0..3 {
+            for j in 0..3 {
+                let prod: f64 = (0..3).map(|k| hm[i * 3 + k] * bm[k * 3 + j]).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (prod - want).abs() < 1e-9,
+                    "H B is not the identity at ({i}, {j}): {prod} != {want}"
+                );
+            }
+        }
+    }
+
+    /// After `n` linearly independent steps on a quadratic, SR1 reproduces the TRUE
+    /// Hessian exactly -- Nocedal & Wright Theorem 6.1. This is finite termination, not
+    /// asymptotic convergence, so a loose bound here would be hiding something.
+    ///
+    /// Note this is an SR1 property and NOT a BFGS one, which is easy to get backwards.
+    /// SR1 is hereditary: every past secant condition survives later updates. BFGS
+    /// preserves only the most recent one unless the directions are conjugate, so
+    /// asserting the same thing of BFGS would fail against arbitrary independent steps.
+    /// It is the exact trade for which SR1 gives up positive-definiteness.
+    #[test]
+    fn three_independent_steps_recover_the_exact_hessian() {
+        let mut b = Sr1Hessian::new(None);
+        b.initialize(3, HessianApproxType::Hess);
+        for (s, y) in steps() {
+            b.update(&s, &y);
+        }
+        let m = b.get_matrix();
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (m[i * 3 + j] - A[i][j]).abs() < 1e-9,
+                    "entry ({i}, {j}) is {} but the true Hessian has {}",
+                    m[i * 3 + j],
+                    A[i][j]
+                );
+            }
+        }
+    }
+
+    /// SR1 satisfies the secant condition too, and -- unlike BFGS -- it does so even
+    /// when the curvature is NEGATIVE. That is the whole reason to reach for SR1: it
+    /// can represent indefinite curvature, which trust-region methods exploit. BFGS
+    /// would have refused this step entirely.
+    #[test]
+    fn sr1_satisfies_the_secant_condition_including_negative_curvature() {
+        let (s, y) = steps().remove(0);
+        let mut b = Sr1Hessian::new(None);
+        b.initialize(3, HessianApproxType::Hess);
+        b.update(&s, &y);
+        let bs = b.dot(&s);
+        for i in 0..3 {
+            assert!((bs[i] - y[i]).abs() < 1e-12, "SR1 secant violated at {i}");
+        }
+
+        // Negative curvature: s . y < 0. SR1 absorbs it.
+        let s_neg = vec![0.0, 1.0, 0.0];
+        let y_neg = vec![0.1, -2.0, 0.3];
+        assert!(dot(&s_neg, &y_neg) < 0.0, "the test pair is not negative curvature");
+        b.update(&s_neg, &y_neg);
+        let bs_neg = b.dot(&s_neg);
+        for i in 0..3 {
+            assert!(
+                (bs_neg[i] - y_neg[i]).abs() < 1e-10,
+                "SR1 did not absorb a negative-curvature step at {i}: {} vs {}",
+                bs_neg[i],
+                y_neg[i]
+            );
+        }
+        // And the result is genuinely indefinite -- SR1 does not pretend otherwise.
+        assert!(
+            dot(&s_neg, &b.dot(&s_neg)) < 0.0,
+            "SR1 produced a positive-definite matrix from a negative-curvature step, \
+             which would mean it silently discarded the information"
+        );
+    }
+
+    /// `skip_update` leaves the matrix BIT-identical when the curvature condition
+    /// fails, and updates it when the condition holds. Both arms are required: a guard
+    /// that skipped everything would pass the first check alone.
+    #[test]
+    fn skip_update_declines_exactly_the_bad_steps() {
+        let (s, y) = steps().remove(0);
+        let mut b = BfgsHessian::new(BfgsExceptionStrategy::SkipUpdate, None);
+        b.initialize(3, HessianApproxType::Hess);
+        b.update(&s, &y);
+        let before: Vec<u64> = b.get_matrix().iter().map(|v| v.to_bits()).collect();
+
+        // MUST-HIT the guard: s . y < 0.
+        let s_bad = vec![0.0, 1.0, 0.0];
+        let y_bad = vec![0.0, -3.0, 0.0];
+        assert!(dot(&s_bad, &y_bad) < 0.0);
+        b.update(&s_bad, &y_bad);
+        let after: Vec<u64> = b.get_matrix().iter().map(|v| v.to_bits()).collect();
+        assert_eq!(before, after, "a curvature-violating step was absorbed anyway");
+
+        // MUST-MISS the guard: a good step still gets through.
+        let (s_ok, y_ok) = steps().remove(2);
+        b.update(&s_ok, &y_ok);
+        let after_ok: Vec<u64> = b.get_matrix().iter().map(|v| v.to_bits()).collect();
+        assert_ne!(before, after_ok, "a valid step was skipped as well");
+    }
+
+    /// Powell damping replaces the curvature condition with an EXACT identity:
+    /// interpolating `z` toward `Mw` by `(1 - mc)/(1 - wz/wMw)` makes the new
+    /// `w . z` equal `mc * wMw` precisely. So this is checkable to rounding rather
+    /// than by "the matrix looks reasonable".
+    ///
+    /// `B' s = z'` after the update (the other two terms cancel), which is how the
+    /// test reaches an internal quantity without exposing one.
+    #[test]
+    fn damp_update_lands_on_the_minimum_curvature_exactly() {
+        let (s, y) = steps().remove(0);
+        let mut b = BfgsHessian::new(BfgsExceptionStrategy::DampUpdate, None);
+        b.initialize(3, HessianApproxType::Hess);
+        b.update(&s, &y);
+
+        let s_bad = vec![0.0, 1.0, 0.0];
+        let y_bad = vec![0.0, -3.0, 0.0];
+        let wmw = dot(&s_bad, &b.dot(&s_bad));
+        assert!(wmw > 0.0, "the pre-update matrix is not positive definite");
+
+        b.update(&s_bad, &y_bad);
+        let wz_new = dot(&s_bad, &b.dot(&s_bad));
+        let want = 0.2 * wmw; // default min_curvature for damp_update
+        assert!(
+            (wz_new - want).abs() < 1e-10 * want.abs().max(1.0),
+            "damped curvature is {wz_new}, expected exactly {want}"
+        );
+        // Damping exists to KEEP positive definiteness; the point is lost if it does
+        // not. Positive `mc` and positive `wMw` make the damped curvature positive.
+        assert!(wz_new > 0.0, "damping left the matrix without positive curvature");
+    }
+
+    /// Zero steps and zero gradient changes carry no curvature information and are
+    /// ignored rather than dividing by zero. Paired with a must-miss so this cannot
+    /// pass by ignoring everything.
+    #[test]
+    fn degenerate_steps_are_ignored() {
+        let mut b = BfgsHessian::new(BfgsExceptionStrategy::SkipUpdate, None);
+        b.initialize(3, HessianApproxType::Hess);
+        let base: Vec<u64> = b.get_matrix().iter().map(|v| v.to_bits()).collect();
+
+        b.update(&[0.0, 0.0, 0.0], &[1.0, 2.0, 3.0]);
+        assert_eq!(
+            base,
+            b.get_matrix().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "a zero step changed the approximation"
+        );
+        b.update(&[1.0, 2.0, 3.0], &[0.0, 0.0, 0.0]);
+        assert_eq!(
+            base,
+            b.get_matrix().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "a zero gradient change changed the approximation"
+        );
+        // Mismatched lengths are ignored rather than panicking or reading past the end.
+        b.update(&[1.0, 2.0], &[1.0, 2.0]);
+        assert_eq!(
+            base,
+            b.get_matrix().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "a wrong-length step changed the approximation"
+        );
+
+        // MUST-MISS.
+        let (s, y) = steps().remove(0);
+        b.update(&s, &y);
+        assert_ne!(
+            base,
+            b.get_matrix().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "a valid step was ignored too"
+        );
+    }
+
+    /// The first update replaces the identity with a SCALED identity (N&W 6.20) before
+    /// applying the update, and the two approximation types scale reciprocally. Without
+    /// this the initial matrix carries the units of nothing in particular and the first
+    /// few steps are wasted rediscovering the problem's scale.
+    #[test]
+    fn the_first_update_rescales_the_initial_identity() {
+        // A problem scaled by 1000 must produce a correspondingly scaled matrix; a
+        // plain identity start would not.
+        let s = vec![1.0, 0.0, 0.0];
+        let y = vec![1000.0, 0.0, 0.0];
+
+        let mut b = BfgsHessian::new(BfgsExceptionStrategy::SkipUpdate, None);
+        b.initialize(3, HessianApproxType::Hess);
+        b.update(&s, &y);
+        // Untouched directions keep the auto scale y_norm2 / |s . y| = 1e6 / 1e3 = 1e3.
+        let m = b.get_matrix();
+        assert!(
+            (m[4] - 1000.0).abs() < 1e-9,
+            "expected the untouched diagonal to hold the auto scale 1000, got {}",
+            m[4]
+        );
+
+        let mut h = BfgsHessian::new(BfgsExceptionStrategy::SkipUpdate, None);
+        h.initialize(3, HessianApproxType::InvHess);
+        h.update(&s, &y);
+        let hm = h.get_matrix();
+        assert!(
+            (hm[4] - 1e-3).abs() < 1e-12,
+            "the inverse branch should scale reciprocally to 1e-3, got {}",
+            hm[4]
+        );
+    }
+}
