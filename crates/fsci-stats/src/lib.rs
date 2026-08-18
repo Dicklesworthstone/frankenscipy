@@ -17953,9 +17953,27 @@ impl RvDiscrete {
     }
 
     /// Percent point function (inverse CDF).
+    /// Percent-point function (inverse CDF): the smallest support point whose CDF reaches
+    /// `q`.
+    ///
+    /// `q == 0.0` returns `xk[0] - 1.0`, one below the lower support bound. That is scipy's
+    /// convention for DISCRETE distributions and it is not arbitrary: `ppf(q)` is
+    /// `inf{x : cdf(x) >= q}`, and every point of the support already satisfies
+    /// `cdf(x) >= 0`, so the infimum falls below the support entirely. Verified against
+    /// scipy 1.17.1 across three supports — `[1,2,3]` gives 0.0, `[5,6,7]` gives 4.0,
+    /// `[-2,0,4]` gives -3.0 — and the same rule already appears twice in this file, in
+    /// `RandInt::ppf` (`low - 1`) and `LogSeries::ppf` (`0.0`, its support starting at 1).
+    ///
+    /// Without the special case the loop returned `xk[0]`, because `cdf_vals[0] >= 0.0` is
+    /// trivially true — a point INSIDE the support for a quantile no outcome attains.
+    ///
+    /// `xk` is sorted ascending by the constructor, so `xk[0]` is the lower bound.
     pub fn ppf(&self, q: f64) -> f64 {
         if !(0.0..=1.0).contains(&q) {
             return f64::NAN;
+        }
+        if q == 0.0 {
+            return self.xk[0] - 1.0;
         }
         for (i, &cdf_val) in self.cdf_vals.iter().enumerate() {
             if cdf_val >= q {
@@ -57413,6 +57431,21 @@ mod tests {
             "a point 5e-11 off the support has zero mass, as scipy has it"
         );
         assert_eq!(rd.pmf(2.5), 0.0, "unchanged: a clearly off-support point");
+
+        // ppf at q = 0 is ONE BELOW the support, scipy's discrete convention:
+        // inf{x : cdf(x) >= 0} falls below every support point. scipy 1.17.1 gives
+        // 0.0 for xk=[1,2,3], 4.0 for [5,6,7], -3.0 for [-2,0,4]. We returned xk[0].
+        assert_eq!(rd.ppf(0.0), 0.0, "ppf(0) is one below the lower support bound");
+        let shifted = RvDiscrete::new(vec![5.0, 6.0, 7.0], vec![0.2, 0.3, 0.5]);
+        assert_eq!(shifted.ppf(0.0), 4.0, "the rule tracks the support, not zero");
+        let negative = RvDiscrete::new(vec![-2.0, 0.0, 4.0], vec![0.2, 0.3, 0.5]);
+        assert_eq!(negative.ppf(0.0), -3.0, "and holds for a negative support");
+        // Unchanged, so the special case cannot have swallowed the general path.
+        assert_eq!(rd.ppf(0.1), 1.0);
+        assert_eq!(rd.ppf(0.5), 2.0);
+        assert_eq!(rd.ppf(1.0), 3.0);
+        assert!(rd.ppf(-0.1).is_nan());
+        assert!(rd.ppf(1.1).is_nan());
     }
 
     /// `frankenscipy-clttw`: these three functions grouped ties by a TOLERANCE
