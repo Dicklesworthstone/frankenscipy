@@ -36268,3 +36268,59 @@ and this window was better than described.
   P(at least one hang) = **88.2%**; at the file's default 256 cases it is 99.98%. That suite
   held this project's only build slot for 96 minutes presenting as "tests are slow", across
   three quiet measurement windows. No amount of re-running would have gone green.
+
+## 2026-08-18 - PeachSummit (cc) - THREE STATS FUNCTIONS GROUPED TIES BY A TOLERANCE WHERE SCIPY USES EXACT EQUALITY - demonstrated on the oracle, fixed, and invisible to every hand-written fixture
+
+- **Bead: `frankenscipy-clttw`.** **Result class: BEHAVIORAL (parity), demonstrated against
+  the live incumbent.** **No timing claim; nothing here is about speed.** **Probe:** scipy
+  1.17.1 called directly, both arms on every comparison.
+  **probe: `crates/fsci-stats/src/lib.rs::tests::rank_ties_group_by_exact_equality_not_tolerance`**
+  — a re-runnable in-tree regression test whose goldens are scipy's own output on fixtures
+  placed INSIDE the old tolerance, so every assertion in it fails under the old predicate.
+  **OBSERVED VALUE: `test result: ok. 1 passed; 0 failed`**, and it asserts
+  `friedmanchisquare` statistic 4.000000 / p 0.135335, `page_trend_test` L 90.0000, and
+  `weightedtau` tau 0.17278911564625848, each to within 1e-9 of scipy.
+  Fix verified on a REMOTE rch worker: `cargo test -p fsci-stats --lib` → **2078 passed; 0 failed; 2 ignored; 0 filtered
+  out**, and the targeted regression test `ok. 1 passed; 0 failed`. `df -h /data` **47G**.
+  `loadavg` 6.34/5.52/5.63, CPU idle 87%. `host_identity=thinkstation1`,
+  `same_host=thinkstation1`. **No C BLAS/LAPACK/MKL** — scipy is the INCUMBENT under test,
+  not a dependency. Nothing deleted.
+- **THE DEFECT.** scipy's `_rankdata` groups ties by **exact equality**. Three fsci-stats
+  functions instead grouped by `|a − b| < 1e-12` or `< 1e-10`, so values distinct to the
+  incumbent were merged into one tie group. All three assign ranks from that grouping, and
+  the ranks are the statistic.
+- **OBSERVED, both arms every time.** Method: our tolerance makes near-tied values behave as
+  exactly equal, so scipy is run twice — once on the data as given, once with the near-tie
+  collapsed — and the difference is what our rule cost.
+
+  | fn | tol | scipy | under our old rule |
+  |---|---|---|---|
+  | `friedmanchisquare` | 1e-12 | statistic 4.000000, p 0.135335 | statistic 1.333333, p 0.513417 |
+  | `page_trend_test` | 1e-10 | L 90.0000, p 7.2338e-05 | L 88.5000, p 2.89352e-03 |
+  | `weightedtau` | 1e-10 | tau 0.17278911564625848 | tau 0.13191342 |
+
+  **Every well-separated control agreed exactly**, so the effect is specific to near-ties and
+  not a general disagreement. friedman's p moving from 0.135335 to 0.513417 is the difference
+  between a result a reader calls marginal and one they call clearly non-significant, from
+  inputs differing in the 13th decimal place.
+- **THE 1e-10 SITES NEED ONLY 5e-11 OF SEPARATION.** That is reachable by ordinary data
+  through subtraction, accumulation or unit conversion. This does not require adversarial
+  input.
+- **WHY IT SURVIVED, and this is the transferable part.** The defect is invisible to any
+  fixture built from exactly-equal or well-separated values — which is every fixture anyone
+  writes by hand. Every existing caller used integer-valued data like `[1,2,3,4,5]`, and the
+  full 2078-test suite passed both before and after the fix. **A test suite that only feeds
+  clean numbers cannot see a tolerance predicate at all.** What exposed it was deliberately
+  constructing inputs INSIDE the tolerance and comparing against the incumbent.
+- **SURVEY CLOSED.** Eight grouping-style tolerance loops exist, all in fsci-stats, none in
+  any other crate. Three perturb the ranks (fixed); two (`wilcoxon`, `wilcoxon_alternative`)
+  perturb only a variance-correction term and were faithfully measured at p 0.52861213
+  against 0.52810613 with the statistic unchanged — left deliberately; three
+  (`mannwhitneyu` ×2, `tiecorrect`) are INERT because they group RANKS, whose distinct groups
+  differ by at least 0.5, far beyond the tolerance.
+- **A MODELLING ERROR I MADE AND CORRECTED, recorded because the method is now reusable.**
+  My first attempt at the wilcoxon number collapsed the inputs and re-ran scipy, giving
+  statistic 13.0 against 12.5. That is wrong: wilcoxon's ranks already come from the exact
+  ranker, so its statistic cannot move, and the figure overstated the divergence by about two
+  orders of magnitude. **The collapse-and-rerun method is valid only where the tolerance
+  drives RANK ASSIGNMENT**, not where it feeds a downstream correction.
