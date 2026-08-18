@@ -58585,6 +58585,273 @@ where
     })
 }
 
+/// A distribution defined by a histogram: piecewise-constant pdf, piecewise-linear cdf.
+///
+/// Matches `scipy.stats.rv_histogram((counts, edges), density=...)`.
+///
+/// # The `density` flag is not cosmetic
+///
+/// It decides what the counts MEAN, and the two readings disagree whenever the
+/// bins are not equal-width:
+///
+/// * `density = true` — each count is a HEIGHT, so bin `i` carries probability
+///   proportional to `count_i · width_i`. This is what `numpy.histogram(...,
+///   density=True)` produces.
+/// * `density = false` — each count is a FREQUENCY, so bin `i` carries
+///   probability proportional to `count_i` alone, and the pdf is that divided by
+///   the width. This is what raw `numpy.histogram` counts are.
+///
+/// For `counts = [2, 5, 3]` on edges `[0, 1, 3, 4]` the two give `pdf(2.0)` of
+/// 0.3333… and 0.25, and means of 2.1 and 2.15. SciPy's `density=None` emits a
+/// `RuntimeWarning` and assumes `true` when the widths vary; this takes the flag
+/// explicitly instead, because a warning is not a decision and the caller is the
+/// only one who knows which their counts are.
+///
+/// # Numerics
+///
+/// Everything is exact — no quadrature and no iteration:
+///
+/// * `sf` accumulates from the TOP edge down rather than as `1 − cdf`, so the
+///   right tail keeps its precision (the same discipline as the rest of this
+///   crate's `sf` overrides).
+/// * `var` uses `Σ pᵢ[(mᵢ − μ)² + wᵢ²/12]` — the parallel-axis form, exact for a
+///   piecewise-uniform density — rather than `E[X²] − μ²`, which differences two
+///   comparable numbers to get a small one whenever the support sits away from
+///   the origin.
+/// * `ppf`/`isf` binary-search the cumulative edges and interpolate within the
+///   located bin, so they invert `cdf`/`sf` exactly rather than approximately.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramDistribution {
+    /// Bin edges, ascending, length `bins + 1`.
+    edges: Vec<f64>,
+    /// Probability density per bin, length `bins`; `Σ densityᵢ · widthᵢ = 1`.
+    density: Vec<f64>,
+    /// `cum[i] = P(X < edges[i])`, length `bins + 1`, `cum[0] = 0`.
+    cum: Vec<f64>,
+    /// `upper[i] = P(X > edges[i])`, length `bins + 1`, `upper[bins] = 0`.
+    /// Carried so `sf` never has to be `1 − cdf`.
+    upper: Vec<f64>,
+}
+
+impl HistogramDistribution {
+    /// Build from bin `counts` and `bins + 1` ascending `edges`.
+    ///
+    /// # Errors
+    ///
+    /// Fewer than one bin, a length mismatch, a non-finite or negative count, a
+    /// non-finite or non-ascending edge, or a total mass of zero.
+    pub fn new(counts: &[f64], edges: &[f64], density: bool) -> Result<Self, StatsError> {
+        let bins = counts.len();
+        if bins == 0 || edges.len() != bins + 1 {
+            return Err(StatsError::InvalidArgument(format!(
+                "expected {} edges for {bins} counts, got {}",
+                bins + 1,
+                edges.len()
+            )));
+        }
+        if counts.iter().any(|c| !c.is_finite() || *c < 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "counts must be finite and non-negative".to_string(),
+            ));
+        }
+        if edges.iter().any(|e| !e.is_finite()) {
+            return Err(StatsError::InvalidArgument(
+                "bin edges must be finite".to_string(),
+            ));
+        }
+        if edges.windows(2).any(|w| w[1] <= w[0]) {
+            return Err(StatsError::InvalidArgument(
+                "bin edges must be strictly ascending".to_string(),
+            ));
+        }
+
+        // Unnormalised probability per bin. This is the whole content of the
+        // `density` flag: a height must be multiplied by its width to become a
+        // mass, a frequency is already one.
+        let mass: Vec<f64> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| if density { c * (edges[i + 1] - edges[i]) } else { c })
+            .collect();
+        let total: f64 = mass.iter().sum();
+        if !(total > 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "the histogram carries no probability mass".to_string(),
+            ));
+        }
+
+        let dens: Vec<f64> = mass
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| m / total / (edges[i + 1] - edges[i]))
+            .collect();
+
+        // Cumulative from the bottom and from the top, each accumulated in its
+        // own direction so neither is a subtraction of the other.
+        let mut cum = vec![0.0; bins + 1];
+        for i in 0..bins {
+            cum[i + 1] = cum[i] + mass[i] / total;
+        }
+        let mut upper = vec![0.0; bins + 1];
+        for i in (0..bins).rev() {
+            upper[i] = upper[i + 1] + mass[i] / total;
+        }
+
+        Ok(Self {
+            edges: edges.to_vec(),
+            density: dens,
+            cum,
+            upper,
+        })
+    }
+
+    /// Lower and upper edges of the support.
+    #[must_use]
+    pub fn support(&self) -> (f64, f64) {
+        (self.edges[0], self.edges[self.edges.len() - 1])
+    }
+
+    /// Index of the bin containing `x`, for `x` strictly inside the support.
+    fn bin_of(&self, x: f64) -> usize {
+        // partition_point gives the count of edges <= x; the bin index is one
+        // less, clamped so x exactly at the top edge lands in the last bin.
+        let idx = self.edges.partition_point(|&e| e <= x);
+        idx.saturating_sub(1).min(self.density.len() - 1)
+    }
+}
+
+impl ContinuousDistribution for HistogramDistribution {
+    fn pdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if x < lo || x > hi {
+            return 0.0;
+        }
+        self.density[self.bin_of(x)]
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if x <= lo {
+            return 0.0;
+        }
+        if x >= hi {
+            return 1.0;
+        }
+        let i = self.bin_of(x);
+        (self.cum[i] + self.density[i] * (x - self.edges[i])).clamp(0.0, 1.0)
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if x <= lo {
+            return 1.0;
+        }
+        if x >= hi {
+            return 0.0;
+        }
+        // Accumulated from the TOP edge down, not as 1 − cdf.
+        let i = self.bin_of(x);
+        (self.upper[i + 1] + self.density[i] * (self.edges[i + 1] - x)).clamp(0.0, 1.0)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if q == 0.0 {
+            return lo;
+        }
+        if q == 1.0 {
+            return hi;
+        }
+        // Last edge whose cumulative is <= q; that edge starts the bin holding q.
+        let i = self
+            .cum
+            .partition_point(|&c| c <= q)
+            .saturating_sub(1)
+            .min(self.density.len() - 1);
+        let d = self.density[i];
+        if d == 0.0 {
+            // An empty bin has no interior to interpolate into.
+            return self.edges[i + 1];
+        }
+        (self.edges[i] + (q - self.cum[i]) / d).clamp(lo, hi)
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if q == 0.0 {
+            return hi;
+        }
+        if q == 1.0 {
+            return lo;
+        }
+        // Mirror of `ppf` on the survival scale: `upper` descends, so find the
+        // first edge whose upper tail has dropped to `q` or below. Working here
+        // rather than calling ppf(1 − q) keeps a small q exact.
+        let i = self
+            .upper
+            .partition_point(|&u| u > q)
+            .saturating_sub(1)
+            .min(self.density.len() - 1);
+        let d = self.density[i];
+        if d == 0.0 {
+            return self.edges[i];
+        }
+        (self.edges[i + 1] - (q - self.upper[i + 1]) / d).clamp(lo, hi)
+    }
+
+    fn mean(&self) -> f64 {
+        // Σ pᵢ · midpointᵢ, exact for a piecewise-uniform density.
+        let mut m = 0.0;
+        for i in 0..self.density.len() {
+            let (a, b) = (self.edges[i], self.edges[i + 1]);
+            m += self.density[i] * (b - a) * 0.5 * (a + b);
+        }
+        m
+    }
+
+    fn var(&self) -> f64 {
+        let mu = self.mean();
+        // Parallel axis: each bin contributes its own uniform variance w²/12 plus
+        // the offset of its centre. No E[X²] − μ² anywhere.
+        let mut v = 0.0;
+        for i in 0..self.density.len() {
+            let (a, b) = (self.edges[i], self.edges[i + 1]);
+            let w = b - a;
+            let p = self.density[i] * w;
+            let d = 0.5 * (a + b) - mu;
+            v += p * (d * d + w * w / 12.0);
+        }
+        v
+    }
+
+    fn entropy(&self) -> f64 {
+        // −Σ ∫ f ln f = −Σ pᵢ ln densityᵢ. Empty bins contribute 0 (0·ln 0 → 0).
+        let mut h = 0.0;
+        for i in 0..self.density.len() {
+            let d = self.density[i];
+            if d > 0.0 {
+                h -= d * (self.edges[i + 1] - self.edges[i]) * d.ln();
+            }
+        }
+        h
+    }
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
@@ -99777,5 +100044,186 @@ mod truncnormal_renormaliser_is_not_a_cancelling_difference {
             ((kept - 2.866_515_718_791_933e-7) / 2.866_515_718_791_933e-7).abs() < 1e-13,
             "the survival-side mass is the one scipy agrees with, got {kept:e}"
         );
+    }
+}
+
+#[cfg(test)]
+mod histogram_distribution_matches_scipy {
+    use super::{ContinuousDistribution, HistogramDistribution};
+
+    const COUNTS: [f64; 3] = [2.0, 5.0, 3.0];
+    /// NON-uniform widths 1, 2, 1 — the only shape where `density` changes the answer.
+    const WIDE: [f64; 4] = [0.0, 1.0, 3.0, 4.0];
+    /// Uniform widths, where both readings of the counts agree.
+    const EVEN: [f64; 4] = [0.0, 1.0, 2.0, 3.0];
+
+    /// `scipy.stats.rv_histogram((counts, edges), density=True)`.
+    #[test]
+    fn density_true_matches_scipy() {
+        let h = HistogramDistribution::new(&COUNTS, &WIDE, true).expect("valid histogram");
+        // x, pdf, cdf, sf
+        for (x, p, c, s) in [
+            (
+                0.5,
+                0.133_333_333_333_333_33,
+                0.066_666_666_666_666_666,
+                0.933_333_333_333_333_35,
+            ),
+            (
+                2.0,
+                0.333_333_333_333_333_31,
+                0.466_666_666_666_666_67,
+                0.533_333_333_333_333_33,
+            ),
+            (
+                3.5,
+                0.200_000_000_000_000_01,
+                0.899_999_999_999_999_91,
+                0.100_000_000_000_000_09,
+            ),
+        ] {
+            for (got, want, what) in [(h.pdf(x), p, "pdf"), (h.cdf(x), c, "cdf"), (h.sf(x), s, "sf")]
+            {
+                assert!(
+                    ((got - want) / want).abs() < 1e-14,
+                    "{what}({x}) = {got}, scipy = {want}"
+                );
+            }
+            // cdf and sf are accumulated in OPPOSITE directions, so this is a
+            // real constraint rather than an identity of the implementation.
+            assert!((h.cdf(x) + h.sf(x) - 1.0).abs() < 1e-15, "cdf+sf at {x}");
+        }
+        for (q, want_ppf, want_isf) in [
+            (0.05, 0.375, 3.75),
+            (0.5, 2.100_000_000_000_000_1, 2.1),
+            (0.95, 3.75, 0.375_000_000_000_000_33),
+        ] {
+            assert!(
+                (h.ppf(q) - want_ppf).abs() < 1e-13,
+                "ppf({q}) = {}, scipy = {want_ppf}",
+                h.ppf(q)
+            );
+            assert!(
+                (h.isf(q) - want_isf).abs() < 1e-13,
+                "isf({q}) = {}, scipy = {want_isf}",
+                h.isf(q)
+            );
+        }
+        assert!((h.mean() - 2.1).abs() < 1e-14, "mean = {}", h.mean());
+        assert!(
+            (h.var() - 0.989_999_999_999_999_3).abs() < 1e-13,
+            "var = {}",
+            h.var()
+        );
+        assert!(
+            (h.entropy() - 1.322_949_511_004_528_6).abs() < 1e-13,
+            "entropy = {}",
+            h.entropy()
+        );
+    }
+
+    /// The `density` flag is the point of this test: the SAME counts and edges
+    /// give different answers, and scipy only guesses (with a warning) which was
+    /// meant. If the flag were ignored, one of these two blocks would fail.
+    #[test]
+    fn density_false_reads_the_counts_as_frequencies() {
+        let f = HistogramDistribution::new(&COUNTS, &WIDE, false).expect("valid histogram");
+        assert!((f.pdf(0.5) - 0.2).abs() < 1e-15, "pdf(0.5) = {}", f.pdf(0.5));
+        assert!((f.pdf(2.0) - 0.25).abs() < 1e-15, "pdf(2.0) = {}", f.pdf(2.0));
+        assert!(
+            (f.cdf(2.0) - 0.449_999_999_999_999_96).abs() < 1e-15,
+            "cdf(2.0) = {}",
+            f.cdf(2.0)
+        );
+        assert!((f.mean() - 2.15).abs() < 1e-14, "mean = {}", f.mean());
+        assert!(
+            (f.var() - 1.310_833_333_333_332_2).abs() < 1e-13,
+            "var = {}",
+            f.var()
+        );
+
+        // MUST-MISS control: with UNIFORM widths the flag makes no difference, so
+        // a test that only ever used even bins could not detect it being ignored.
+        let a = HistogramDistribution::new(&COUNTS, &EVEN, true).expect("valid");
+        let b = HistogramDistribution::new(&COUNTS, &EVEN, false).expect("valid");
+        for x in [0.5, 1.5, 2.5] {
+            assert_eq!(
+                a.pdf(x).to_bits(),
+                b.pdf(x).to_bits(),
+                "uniform bins must be insensitive to `density` at {x}"
+            );
+        }
+        // And that even-bin case against scipy.
+        assert!((b.pdf(1.5) - 0.5).abs() < 1e-15);
+        assert!((b.cdf(1.5) - 0.449_999_999_999_999_96).abs() < 1e-15);
+        assert!((b.sf(1.5) - 0.55).abs() < 1e-15);
+        assert!((b.mean() - 1.6).abs() < 1e-14);
+        assert!((b.var() - 0.573_333_333_333_332_8).abs() < 1e-13);
+        assert!((b.ppf(0.5) - 1.6).abs() < 1e-13);
+        assert!((b.entropy() - 1.029_653_014_064_573_7).abs() < 1e-13);
+    }
+
+    #[test]
+    fn empty_bins_support_edges_and_round_trips() {
+        // A zero-count bin has no interior to interpolate into.
+        let z = HistogramDistribution::new(&[2.0, 0.0, 3.0], &EVEN, false).expect("valid");
+        assert_eq!(z.pdf(1.5), 0.0);
+        assert!((z.cdf(1.5) - 0.4).abs() < 1e-15);
+        assert!((z.ppf(0.4) - 2.0).abs() < 1e-15, "ppf(0.4) = {}", z.ppf(0.4));
+
+        let h = HistogramDistribution::new(&COUNTS, &WIDE, true).expect("valid");
+        assert_eq!(h.support(), (0.0, 4.0));
+        // Outside and at the support edges.
+        assert_eq!(h.pdf(-1.0), 0.0);
+        assert_eq!(h.pdf(5.0), 0.0);
+        assert_eq!(h.cdf(0.0), 0.0);
+        assert_eq!(h.cdf(4.0), 1.0);
+        assert_eq!(h.sf(0.0), 1.0);
+        assert_eq!(h.sf(4.0), 0.0);
+        assert_eq!(h.ppf(0.0), 0.0);
+        assert_eq!(h.ppf(1.0), 4.0);
+        assert_eq!(h.isf(0.0), 4.0);
+        assert_eq!(h.isf(1.0), 0.0);
+        assert!(h.pdf(f64::NAN).is_nan());
+        assert!(h.cdf(f64::NAN).is_nan());
+        assert!(h.ppf(-0.1).is_nan());
+        assert!(h.isf(1.1).is_nan());
+
+        // ppf inverts cdf, and isf inverts sf, exactly enough to round trip.
+        for q in [0.01, 0.3, 0.5, 0.77, 0.99] {
+            assert!((h.cdf(h.ppf(q)) - q).abs() < 1e-13, "ppf/cdf round trip at {q}");
+            assert!((h.sf(h.isf(q)) - q).abs() < 1e-13, "isf/sf round trip at {q}");
+        }
+    }
+
+    #[test]
+    fn malformed_input_is_rejected() {
+        assert!(HistogramDistribution::new(&[], &[0.0], true).is_err(), "no bins");
+        assert!(
+            HistogramDistribution::new(&COUNTS, &[0.0, 1.0, 2.0], true).is_err(),
+            "needs one more edge than counts"
+        );
+        assert!(
+            HistogramDistribution::new(&[1.0, -1.0, 1.0], &EVEN, true).is_err(),
+            "negative count"
+        );
+        assert!(
+            HistogramDistribution::new(&[1.0, f64::NAN, 1.0], &EVEN, true).is_err(),
+            "non-finite count"
+        );
+        assert!(
+            HistogramDistribution::new(&COUNTS, &[0.0, 2.0, 1.0, 3.0], true).is_err(),
+            "edges must ascend"
+        );
+        assert!(
+            HistogramDistribution::new(&COUNTS, &[0.0, 1.0, 1.0, 3.0], true).is_err(),
+            "zero-width bin"
+        );
+        assert!(
+            HistogramDistribution::new(&[0.0, 0.0, 0.0], &EVEN, true).is_err(),
+            "no mass at all"
+        );
+        // MUST-MISS control: the well-formed input these are contrasted with.
+        assert!(HistogramDistribution::new(&COUNTS, &EVEN, true).is_ok());
     }
 }
