@@ -4266,11 +4266,24 @@ impl StudentizedRange {
     }
 
     /// Percent-point (inverse CDF) function via bisection on the monotone CDF.
+    /// Percent-point function. `p` outside `[0, 1]` is NaN, matching scipy and matching
+    /// every other `ppf` in this crate.
+    ///
+    /// This used to clamp instead: `p <= 0.0` returned 0.0 and `p >= 1.0` returned
+    /// infinity, so `ppf(-0.5)` reported the support's lower bound and `ppf(1.5)` reported
+    /// infinity — both plausible-looking answers to a question with no answer. scipy 1.17.1
+    /// with `k = 3, df = 10` gives NaN for both, and 0.0 / inf only at exactly 0 and 1.
+    ///
+    /// In-range behaviour is unchanged: `p == 0.0` still yields 0.0, `p == 1.0` still yields
+    /// infinity, and the Illinois root-find below is untouched.
     pub fn ppf(&self, p: f64) -> f64 {
-        if p <= 0.0 {
+        if !(0.0..=1.0).contains(&p) {
+            return f64::NAN;
+        }
+        if p == 0.0 {
             return 0.0;
         }
-        if p >= 1.0 {
+        if p == 1.0 {
             return f64::INFINITY;
         }
         let lo = 0.0_f64;
@@ -57446,6 +57459,24 @@ mod tests {
         assert_eq!(rd.ppf(1.0), 3.0);
         assert!(rd.ppf(-0.1).is_nan());
         assert!(rd.ppf(1.1).is_nan());
+
+        // StudentizedRange::ppf used to CLAMP out-of-range p instead of rejecting it:
+        // ppf(-0.5) gave 0.0 and ppf(1.5) gave +inf — plausible answers to a question
+        // with no answer. scipy 1.17.1 (k=3, df=10) gives NaN for both, and 0.0 / inf
+        // only at exactly 0 and 1.
+        let sr = StudentizedRange::new(3, 10.0);
+        assert!(sr.ppf(-0.5).is_nan(), "p < 0 has no quantile");
+        assert!(sr.ppf(1.5).is_nan(), "p > 1 has no quantile");
+        assert_eq!(sr.ppf(0.0), 0.0, "unchanged at the lower boundary");
+        assert_eq!(sr.ppf(1.0), f64::INFINITY, "unchanged at the upper boundary");
+        // The interior is untouched by this change. Asserted as a property rather than a
+        // golden: scipy gives 1.6446888587137876 here, but that value comes from its own
+        // adaptive integrator and pinning it would test the quadrature, not this guard.
+        let mid = sr.ppf(0.5);
+        assert!(
+            mid.is_finite() && mid > 0.0,
+            "interior quantile should still solve, got {mid}"
+        );
     }
 
     /// `frankenscipy-clttw`: these three functions grouped ties by a TOLERANCE
