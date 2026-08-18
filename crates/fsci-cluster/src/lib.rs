@@ -5311,30 +5311,16 @@ pub fn maxdists(z: &[[f64; 4]]) -> Vec<f64> {
 /// Matches `scipy.cluster.hierarchy.maxinconsts(Z, R)`. Like [`maxdists`] but
 /// propagates the inconsistency coefficient (column 3 of the inconsistency
 /// matrix `R` from [`inconsistent`]) instead of the link height.
+///
+/// This IS [`max_rstat`] with `i = 3` — verified against the incumbent, where
+/// `maxRstat(Z, R, 3)` and `maxinconsts(Z, R)` are element-for-element equal — so
+/// it delegates rather than carrying a second copy of the traversal.
+///
+/// # Errors
+///
+/// `Z` and `R` having different row counts.
 pub fn maxinconsts(z: &[[f64; 4]], r: &[[f64; 4]]) -> Result<Vec<f64>, ClusterError> {
-    if z.len() != r.len() {
-        return Err(ClusterError::InvalidArgument(
-            "Z and R must have the same number of rows".to_string(),
-        ));
-    }
-    if z.is_empty() {
-        return Ok(vec![]);
-    }
-    let n = z.len() + 1;
-    let mut mi = vec![0.0_f64; z.len()];
-    for (i, row) in z.iter().enumerate() {
-        let mut m = r[i][3];
-        let c1 = row[0] as usize;
-        let c2 = row[1] as usize;
-        if c1 >= n {
-            m = m.max(mi[c1 - n]);
-        }
-        if c2 >= n {
-            m = m.max(mi[c2 - n]);
-        }
-        mi[i] = m;
-    }
-    Ok(mi)
+    max_rstat(z, r, 3)
 }
 
 /// Find the root linkage node of each flat cluster.
@@ -11361,5 +11347,125 @@ mod tests {
             "nmi perfect got {}, expected 1.0",
             score
         );
+    }
+}
+
+#[cfg(test)]
+mod max_rstat_matches_scipy {
+    use super::{max_rstat, maxinconsts};
+
+    /// `linkage(X, 'average')` for a 7-point fixture, taken from the incumbent so
+    /// this tests `max_rstat` and not `linkage`.
+    const Z: [[f64; 4]; 6] = [
+        [2.0, 3.0, 0.282_842_712_474_619_06, 2.0],
+        [0.0, 1.0, 0.360_555_127_546_398_96, 2.0],
+        [4.0, 5.0, 0.500_000_000_000_000_11, 2.0],
+        [7.0, 8.0, 1.316_739_431_232_531_6, 4.0],
+        [6.0, 9.0, 3.457_038_224_229_381_6, 3.0],
+        [10.0, 11.0, 3.875_372_344_345_360_3, 7.0],
+    ];
+    /// `inconsistent(Z, 2)` from the incumbent.
+    const R: [[f64; 4]; 6] = [
+        [0.282_842_712_474_619_06, 0.0, 1.0, 0.0],
+        [0.360_555_127_546_398_96, 0.0, 1.0, 0.0],
+        [0.500_000_000_000_000_11, 0.0, 1.0, 0.0],
+        [
+            0.653_379_090_417_849_92,
+            0.575_799_453_966_743_59,
+            3.0,
+            1.152_068_374_231_204_6,
+        ],
+        [
+            1.978_519_112_114_690_8,
+            2.090_941_780_580_422,
+            2.0,
+            0.707_106_781_186_547_68,
+        ],
+        [
+            2.883_049_999_935_757_5,
+            1.372_496_796_803_865_7,
+            3.0,
+            0.723_005_217_003_365_4,
+        ],
+    ];
+
+    /// All four columns against `scipy.cluster.hierarchy.maxRstat(Z, R, i)`.
+    ///
+    /// All four matter: a subtree maximum that simply echoed its own row would
+    /// pass on columns 0 and 2 (monotone up the tree here) and fail on 1 and 3,
+    /// where the propagated value comes from a CHILD and not the row itself.
+    #[test]
+    fn every_column_matches_scipy() {
+        let want: [[f64; 6]; 4] = [
+            [
+                0.282_842_712_474_619_06,
+                0.360_555_127_546_398_96,
+                0.500_000_000_000_000_11,
+                0.653_379_090_417_849_92,
+                1.978_519_112_114_690_8,
+                2.883_049_999_935_757_5,
+            ],
+            [
+                0.0,
+                0.0,
+                0.0,
+                0.575_799_453_966_743_59,
+                2.090_941_780_580_422,
+                2.090_941_780_580_422,
+            ],
+            [1.0, 1.0, 1.0, 3.0, 2.0, 3.0],
+            [
+                0.0,
+                0.0,
+                0.0,
+                1.152_068_374_231_204_6,
+                0.707_106_781_186_547_68,
+                1.152_068_374_231_204_6,
+            ],
+        ];
+        for (field, expected) in want.iter().enumerate() {
+            let got = max_rstat(&Z, &R, field).expect("valid field");
+            assert_eq!(got.len(), expected.len());
+            for (k, (&g, &w)) in got.iter().zip(expected.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "max_rstat(field={field})[{k}] = {g}, scipy = {w}"
+                );
+            }
+        }
+
+        // The propagation is load-bearing, not incidental: on column 1 the last
+        // row's own R value is 1.3724967968038657, but the answer is its child's
+        // 2.090941780580422. A no-op implementation returning `R[k][field]` would
+        // pass columns 0 and 2 and fail here.
+        assert!(
+            R[5][1] < max_rstat(&Z, &R, 1).unwrap()[5],
+            "the subtree maximum must come from a child, not the row itself"
+        );
+    }
+
+    /// `maxinconsts` is the `field = 3` case, and scipy agrees element for
+    /// element. Asserting BIT equality rather than closeness: they are now the
+    /// same code path, so anything less would not notice if that stopped being
+    /// true.
+    #[test]
+    fn maxinconsts_is_the_field_three_case() {
+        let a = maxinconsts(&Z, &R).expect("same rows");
+        let b = max_rstat(&Z, &R, 3).expect("valid field");
+        assert_eq!(a.len(), b.len());
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert_eq!(x.to_bits(), y.to_bits());
+        }
+    }
+
+    #[test]
+    fn rejects_a_bad_field_and_mismatched_rows() {
+        assert!(max_rstat(&Z, &R, 4).is_err(), "field 4 is out of range");
+        assert!(max_rstat(&Z, &R[..5], 0).is_err(), "row counts differ");
+        // Empty is not an error, it is an empty answer -- matching maxdists.
+        assert_eq!(max_rstat(&[], &[], 0).expect("empty"), Vec::<f64>::new());
+        // MUST-MISS control for the field guard: 3 is the last valid one.
+        assert!(max_rstat(&Z, &R, 3).is_ok(), "field 3 must still be accepted");
     }
 }
