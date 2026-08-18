@@ -30582,7 +30582,12 @@ pub fn mannwhitneyu(x: &[f64], y: &[f64]) -> TtestResult {
     }
 
     let values: Vec<f64> = combined.iter().map(|&(v, _)| v).collect();
-    let ranks = rankdata_average(&values);
+    // Ranks AND the tie sum from ONE pass, replacing a `ranks.clone()` + second sort
+    // below (`frankenscipy-921i0`). BYTE-IDENTICAL: the old loop grouped sorted RANKS
+    // within 1e-12, a tolerance that cannot bite because distinct average-rank groups
+    // differ by at least 0.5; ranks are monotone in values, so the groups and their
+    // ascending order are exactly those of the ranking pass.
+    let (ranks, tie_correction) = rankdata_ties_with_tie_sum(&values, RankTieMethod::Average);
 
     // U statistic: sum of ranks of x - n1*(n1+1)/2
     let rank_sum_x: f64 = ranks
@@ -30605,21 +30610,7 @@ pub fn mannwhitneyu(x: &[f64], y: &[f64]) -> TtestResult {
 
     // Tie correction: sum_t (t^3 - t) over each tied rank group.
     // Implemented by counting equal-rank groups in the sorted ranks.
-    let mut sorted_ranks = ranks.clone();
-    sorted_ranks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mut tie_correction = 0.0_f64;
-    let mut i = 0;
-    while i < sorted_ranks.len() {
-        let mut j = i + 1;
-        while j < sorted_ranks.len() && (sorted_ranks[j] - sorted_ranks[i]).abs() < 1e-12 {
-            j += 1;
-        }
-        let t = (j - i) as f64;
-        if t > 1.0 {
-            tie_correction += t * t * t - t;
-        }
-        i = j;
-    }
+    // `tie_correction` came back from the ranking pass above.
 
     // scipy returns the U statistic for the first sample (U1), not min(U1, U2).
     // For an untied small sample it uses the exact null distribution instead of
@@ -30792,7 +30783,12 @@ pub fn mannwhitneyu_alternative(x: &[f64], y: &[f64], alternative: &str) -> Ttes
     }
 
     let values: Vec<f64> = combined.iter().map(|&(v, _)| v).collect();
-    let ranks = rankdata_average(&values);
+    // Ranks AND the tie sum from ONE pass, replacing a `ranks.clone()` + second sort
+    // below (`frankenscipy-921i0`). BYTE-IDENTICAL: the old loop grouped sorted RANKS
+    // within 1e-12, a tolerance that cannot bite because distinct average-rank groups
+    // differ by at least 0.5; ranks are monotone in values, so the groups and their
+    // ascending order are exactly those of the ranking pass.
+    let (ranks, tie_correction) = rankdata_ties_with_tie_sum(&values, RankTieMethod::Average);
 
     let rank_sum_x: f64 = ranks
         .iter()
@@ -30808,21 +30804,7 @@ pub fn mannwhitneyu_alternative(x: &[f64], y: &[f64], alternative: &str) -> Ttes
     let n = n1f + n2f;
 
     // br-nknp: tie correction for sigma (matches scipy default).
-    let mut sorted_ranks = ranks.clone();
-    sorted_ranks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mut tie_correction = 0.0_f64;
-    let mut i = 0;
-    while i < sorted_ranks.len() {
-        let mut j = i + 1;
-        while j < sorted_ranks.len() && (sorted_ranks[j] - sorted_ranks[i]).abs() < 1e-12 {
-            j += 1;
-        }
-        let t = (j - i) as f64;
-        if t > 1.0 {
-            tie_correction += t * t * t - t;
-        }
-        i = j;
-    }
+    // `tie_correction` came back from the ranking pass above.
     // Exact null distribution for an untied small sample (scipy method='auto').
     // The reported statistic is always U1 (for x). frankenscipy-vwmup
     if mwu_use_exact(n1, n2, tie_correction == 0.0) {
@@ -31386,7 +31368,13 @@ pub fn kruskal(groups: &[&[f64]]) -> TtestResult {
             df: f64::NAN,
         };
     }
-    let ranks = rankdata_average(&all_values);
+    // Ranks AND the tie-correction sum from ONE pass. The tie structure is already
+    // known where the ranks are assigned, so the previous `all_values.clone()` +
+    // second sort recomputed what this pass had in hand — the same shape scipy avoids
+    // via `_rankdata(..., return_ties=True)` (`frankenscipy-921i0`). BYTE-IDENTICAL:
+    // the old loop grouped `sorted_values[j] == sorted_values[i]`, the same `==` over
+    // the same values in the same ascending order, summing the same `t` values.
+    let (ranks, tie_sum) = rankdata_ties_with_tie_sum(&all_values, RankTieMethod::Average);
 
     // Compute H statistic: H = (12/(N(N+1))) * Σ(R_i²/n_i) - 3(N+1)
     let mut offset = 0;
@@ -31401,21 +31389,8 @@ pub fn kruskal(groups: &[&[f64]]) -> TtestResult {
 
     // Tie correction. scipy divides H by C = 1 - Σ(t³-t)/(N³-N) where the
     // sum is over each tie-group size t in the combined sorted observations.
-    let mut sorted_values = all_values.clone();
-    sorted_values.sort_unstable_by(|a, b| a.total_cmp(b));
-    let mut tie_sum = 0.0_f64;
-    let mut i = 0;
-    while i < sorted_values.len() {
-        let mut j = i + 1;
-        while j < sorted_values.len() && sorted_values[j] == sorted_values[i] {
-            j += 1;
-        }
-        let t = (j - i) as f64;
-        if t > 1.0 {
-            tie_sum += t * t * t - t;
-        }
-        i = j;
-    }
+    // `tie_sum` came back from the ranking pass above; the clone + second sort that
+    // used to recompute it here is gone.
     let c = 1.0 - tie_sum / (nf * nf * nf - nf);
     let h = if c > 0.0 {
         h_uncorrected / c
@@ -33125,10 +33100,28 @@ fn rankdata_average(data: &[f64]) -> Vec<f64> {
 }
 
 fn rankdata_ties(data: &[f64], method: RankTieMethod) -> Vec<f64> {
+    rankdata_ties_with_tie_sum(data, method).0
+}
+
+/// Ranks PLUS the tie-correction sum `Σ(t³ − t)`, computed in the SAME pass.
+///
+/// This mirrors why scipy's `_rankdata(..., return_ties=True)` exists
+/// (`scipy/stats/_stats_py.py`): the tie structure is already known at the point
+/// the ranks are assigned, so recomputing it afterwards costs a second sort of
+/// the same data. scipy returns a full vector carrying each group's size at its
+/// first sorted position; every caller here needs only the scalar, so this
+/// returns `Σ(t³ − t)` directly (`frankenscipy-921i0`).
+///
+/// BYTE-IDENTICAL to the `clone + sort + regroup` code it replaces at each call
+/// site: the groups are delimited by the same `==` predicate over the same values
+/// in the same ascending order, so the same `t` values are summed in the same
+/// order, and `t == 1` contributes exactly `0.0`.
+fn rankdata_ties_with_tie_sum(data: &[f64], method: RankTieMethod) -> (Vec<f64>, f64) {
     let n = data.len();
     if data.iter().any(|v| v.is_nan()) {
-        return vec![f64::NAN; n];
+        return (vec![f64::NAN; n], f64::NAN);
     }
+    let mut tie_sum = 0.0_f64;
 
     // Radix argsort (non-comparison, O(n·passes)) for large n. The tie groups are
     // delimited by value `==` (so ±0.0 group together) exactly as below; the
@@ -33158,10 +33151,14 @@ fn rankdata_ties(data: &[f64], method: RankTieMethod) -> Vec<f64> {
             for &p in &perm[i..j] {
                 ranks[p as usize] = tie_rank;
             }
+            let t = (j - i) as f64;
+            if t > 1.0 {
+                tie_sum += t * t * t - t;
+            }
             i = j;
             dense_rank += 1.0;
         }
-        return ranks;
+        return (ranks, tie_sum);
     }
 
     let mut indexed: Vec<(f64, usize)> = data
@@ -33194,11 +33191,15 @@ fn rankdata_ties(data: &[f64], method: RankTieMethod) -> Vec<f64> {
         for item in &indexed[i..j] {
             ranks[item.1] = tie_rank;
         }
+        let t = (j - i) as f64;
+        if t > 1.0 {
+            tie_sum += t * t * t - t;
+        }
         i = j;
         dense_rank += 1.0;
     }
 
-    ranks
+    (ranks, tie_sum)
 }
 
 /// Compute ranks with ordinal tie-breaking.
@@ -57208,6 +57209,54 @@ pub fn kendall_distance(rank1: &[usize], rank2: &[usize]) -> usize {
 )]
 mod tests {
     use super::*;
+
+    /// `frankenscipy-921i0`: `kruskal` and `mannwhitneyu` used to compute their tie
+    /// correction by CLONING the data and sorting it a SECOND time, recomputing a tie
+    /// structure the ranking pass had already established. scipy avoids exactly this via
+    /// `_rankdata(..., return_ties=True)`; `rankdata_ties_with_tie_sum` is the same idea,
+    /// returning the scalar `Σ(t³ − t)` our callers actually need.
+    ///
+    /// This pins the TIE path specifically, which is the only path the change can affect —
+    /// with no ties the correction is `0.0` either way and the test would prove nothing.
+    /// Goldens are scipy 1.17.1 on the same fixtures.
+    ///
+    /// The removal is byte-identical by construction: the deleted loops grouped by the
+    /// same `==` over the same values in the same ascending order (kruskal), or over
+    /// sorted RANKS within a 1e-12 window that cannot bite because distinct average-rank
+    /// groups differ by at least 0.5 (mannwhitneyu). Same `t` values, same summation order.
+    #[test]
+    fn tie_correction_from_the_ranking_pass_matches_scipy() {
+        // kruskal with ties WITHIN and ACROSS groups
+        let a = [1.0, 2.0, 2.0, 3.0, 5.0];
+        let b = [2.0, 3.0, 3.0, 4.0, 6.0];
+        let c = [1.0, 1.0, 4.0, 5.0, 5.0];
+        let k = kruskal(&[&a[..], &b[..], &c[..]]);
+        assert!(
+            (k.statistic - 0.943_646_408_839_778_1).abs() < 1e-12,
+            "kruskal H {} != scipy 0.9436464088397781",
+            k.statistic
+        );
+        assert!(
+            (k.pvalue - 0.623_863_799_530_720_4).abs() < 1e-12,
+            "kruskal p {} != scipy 0.6238637995307204",
+            k.pvalue
+        );
+
+        // mannwhitneyu with ties in both samples
+        let x = [1.0, 2.0, 2.0, 3.0, 5.0, 5.0];
+        let y = [2.0, 3.0, 3.0, 4.0, 6.0, 6.0];
+        let m = mannwhitneyu(&x, &y);
+        assert!(
+            (m.statistic - 11.0).abs() < 1e-12,
+            "mannwhitneyu U {} != scipy 11.0",
+            m.statistic
+        );
+        assert!(
+            (m.pvalue - 0.289_362_615_318_698_2).abs() < 1e-12,
+            "mannwhitneyu p {} != scipy 0.2893626153186982",
+            m.pvalue
+        );
+    }
 
     /// `frankenscipy-clttw`: these three functions grouped ties by a TOLERANCE
     /// (`|a-b| < 1e-12` / `< 1e-10`) where scipy's `_rankdata` groups by EXACT equality.
