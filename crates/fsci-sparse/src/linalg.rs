@@ -7333,7 +7333,7 @@ pub fn lsqr(
     b: &[f64],
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
-    lsqr_impl(a, b, 0.0, options)
+    lsqr_impl(a, b, 0.0, None, options)
 }
 
 /// LSQR with Tikhonov regularization -- `scipy.sparse.linalg.lsqr(A, b, damp=...)`.
@@ -7372,13 +7372,65 @@ pub fn lsqr_damped(
             message: format!("lsqr damp must be finite, got {damp}"),
         });
     }
-    lsqr_impl(a, b, damp, options)
+    lsqr_impl(a, b, damp, None, options)
+}
+
+/// LSQR with regularization AND a warm start -- the general entry point.
+///
+/// `scipy.sparse.linalg.lsqr(A, b, damp=..., x0=...)`. `lsqr` and `lsqr_damped` are
+/// thin wrappers over this.
+///
+/// `x0` restarts the iteration from the residual of the guess, `beta*u = b - A x`,
+/// which is the invariant SciPy states at that point (`_isolve/lsqr.py:372-382`), and
+/// `x` begins at the guess so the correction accumulates into it directly.
+///
+/// WHEN BOTH ARE GIVEN, THE DAMPING APPLIES TO THE CORRECTION, so the problem
+/// minimized is
+///
+///     ||A x - b||^2 + damp^2 ||x - x0||^2
+///
+/// not `||A x - b||^2 + damp^2 ||x||^2`. SciPy documents this indirectly rather than
+/// in prose: its `r2norm` is `sqrt(||r||^2 + damp^2 ||x - x0||^2)` and its `arnorm`
+/// is `||A^T r - damp^2 (x - x0)||` (`_isolve/lsqr.py:180, 187`), both carrying
+/// `x - x0`. With a nonzero guess, damping therefore pulls the answer toward the
+/// GUESS rather than toward the origin -- a caller expecting
+/// ridge-regression-toward-zero gets shrinkage toward their starting point.
+///
+/// SciPy's own docstring only offers the manual recipe -- solve `A dx = r0`, then add
+/// -- "if damp == 0", which is a hint at this and not a statement of it. The
+/// behaviour is a consequence of damping the correction, not a special case, and it
+/// is the same in `lsmr_regularized`.
+pub fn lsqr_regularized(
+    a: &CsrMatrix,
+    b: &[f64],
+    damp: f64,
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    if !damp.is_finite() {
+        return Err(SparseError::NonFiniteInput {
+            message: format!("lsqr damp must be finite, got {damp}"),
+        });
+    }
+    if let Some(start) = x0 {
+        let n = a.shape().cols;
+        if start.len() != n {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "lsqr x0 length {} must match matrix columns {n}",
+                    start.len()
+                ),
+            });
+        }
+    }
+    lsqr_impl(a, b, damp, x0, options)
 }
 
 fn lsqr_impl(
     a: &CsrMatrix,
     b: &[f64],
     damp: f64,
+    x0: Option<&[f64]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
     // Accumulates SciPy's `res2 = sum(psi**2)`; stays exactly 0 when damp == 0,
@@ -7412,7 +7464,35 @@ fn lsqr_impl(
 
     // Initialize: β₁u₁ = b
     let mut beta = b_norm;
-    let mut u: Vec<f64> = b.iter().map(|bi| bi / beta).collect();
+    // `beta*u = b - A x` is the invariant SciPy states at this point
+    // (`_isolve/lsqr.py:372-382`); with a guess the residual is of the guess, not
+    // of the origin. `beta_0` drives the iteration; `b_norm` remains the
+    // denominator of the reported relative residual, which is relative to `b`
+    // wherever the solve started.
+    let (mut u, beta_0) = match x0 {
+        None => (b.to_vec(), beta),
+        Some(start) => {
+            let ax0 = csr_matvec(a, start);
+            let residual: Vec<f64> =
+                b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
+            let norm = vec_norm(&residual);
+            (residual, norm)
+        }
+    };
+    if beta_0 == 0.0 {
+        // The guess already satisfies the system; there is no correction and
+        // dividing by the residual norm below would produce NaN.
+        return Ok(IterativeSolveResult {
+            solution: x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec),
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+    beta = beta_0;
+    for entry in &mut u {
+        *entry /= beta_0;
+    }
 
     // α₁v₁ = A^T u₁
     let atb = csc_matvec(&a_csc, &u);
@@ -7441,7 +7521,9 @@ fn lsqr_impl(
     }
 
     let mut w = v.clone();
-    let mut x = vec![0.0; n];
+    // Starts at the guess; the recurrence accumulates the CORRECTION into it,
+    // which is what makes `x0 + dx` fall out without a separate final add.
+    let mut x = x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec);
 
     let mut phi_bar = beta;
     let mut rho_bar = alpha;
@@ -7702,6 +7784,25 @@ pub fn lsmr_damped(
 ///
 /// A guess that already solves the system exactly returns immediately: there is no
 /// correction to compute, and normalizing by a zero residual would produce NaN.
+///
+/// CORRECTION TO WHAT `lsmr_damped` SAYS, when BOTH `damp` and `x0` are supplied.
+/// `lsmr_damped`'s doc gives the regularized normal equations as
+/// `(A^T A + damp^2 I) x = A^T b`, which is right only for a cold start. With a
+/// guess the iteration solves for the CORRECTION and the damping applies to the
+/// correction, so the problem actually minimized is
+///
+///     ||A x - b||^2 + damp^2 ||x - x0||^2
+///
+/// i.e. `(A^T A + damp^2 I)(x - x0) = A^T (b - A x0)`. SciPy documents the same
+/// thing indirectly rather than in prose: its `r2norm` is
+/// `sqrt(||r||^2 + damp^2 ||x - x0||^2)` and its `arnorm` is
+/// `||A^T r - damp^2 (x - x0)||` (`_isolve/lsqr.py:180, 187`), both of which carry
+/// `x - x0` and not `x`.
+///
+/// This is a real difference, not a technicality: with a nonzero `x0`, damping
+/// pulls the answer toward the GUESS rather than toward the origin. A caller who
+/// supplies both expecting ridge-regression-toward-zero gets shrinkage toward
+/// their starting point instead.
 pub fn lsmr_regularized(
     a: &CsrMatrix,
     b: &[f64],
@@ -26666,6 +26767,169 @@ mod lsmr_x0_tests {
         let ok = vec![0.0, 0.0];
         assert!(
             lsmr_regularized(&a, &b, 0.0, Some(&ok), opts()).is_ok(),
+            "a correctly sized guess was rejected"
+        );
+    }
+}
+
+/// Warm starts for LSQR, and the damp/x0 interaction both least-squares solvers share.
+#[cfg(test)]
+mod lsqr_x0_tests {
+    use super::{
+        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsmr_regularized,
+        lsqr, lsqr_regularized,
+    };
+
+    fn overdetermined() -> (CsrMatrix, Vec<f64>) {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 2),
+            vec![1.0, 1.0, 1.0, 2.0, 1.0, 3.0],
+            vec![0, 0, 1, 1, 2, 2],
+            vec![0, 1, 0, 1, 0, 1],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        (a, vec![2.0, 3.0, 5.0])
+    }
+
+    fn opts() -> IterativeSolveOptions {
+        IterativeSolveOptions {
+            tol: 1e-12,
+            max_iter: Some(200),
+            ..IterativeSolveOptions::default()
+        }
+    }
+
+    /// MUST-MISS: `x0 = None` is the cold path, bit for bit.
+    #[test]
+    fn no_guess_is_bit_identical_to_plain_lsqr() {
+        let (a, b) = overdetermined();
+        let plain = lsqr(&a, &b, opts()).expect("plain");
+        let general = lsqr_regularized(&a, &b, 0.0, None, opts()).expect("x0=None");
+        for (i, (x, y)) in plain.solution.iter().zip(&general.solution).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "component {i}: {x} vs {y}");
+        }
+        assert_eq!(plain.iterations, general.iterations);
+        assert_eq!(plain.residual_norm.to_bits(), general.residual_norm.to_bits());
+    }
+
+    /// MUST-HIT: a warm start reaches the same unique minimizer, from a guess that is
+    /// genuinely wrong.
+    #[test]
+    fn a_warm_start_converges_to_the_same_solution() {
+        let (a, b) = overdetermined();
+        let cold = lsqr(&a, &b, opts()).expect("cold");
+        let guess = vec![cold.solution[0] - 0.4, cold.solution[1] + 0.3];
+        let warm = lsqr_regularized(&a, &b, 0.0, Some(&guess), opts()).expect("warm");
+        for (i, (c, w)) in cold.solution.iter().zip(&warm.solution).enumerate() {
+            assert!(
+                (c - w).abs() < 1e-8,
+                "warm start landed elsewhere at {i}: cold {c} vs warm {w}"
+            );
+        }
+        let moved: f64 = guess
+            .iter()
+            .zip(&cold.solution)
+            .map(|(g, c)| (g - c).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            moved > 0.1,
+            "the guess was already the answer ({moved}); this test would pass even if \
+             x0 were ignored"
+        );
+    }
+
+    /// THE INTERACTION, pinned because it is the part a caller will get wrong.
+    ///
+    /// With both `damp` and `x0`, the penalty is on `x - x0`, NOT on `x`. So a
+    /// nonzero guess plus damping shrinks the answer toward THE GUESS, and the
+    /// solution must satisfy `(A^T A + damp^2 I)(x - x0) = A^T (b - A x0)`.
+    ///
+    /// The check is that defining relation rather than a stored constant, and the
+    /// must-miss is that the answer is NOT what the naive reading -- shrinkage toward
+    /// the origin -- would give. Without that second arm, an implementation that
+    /// damped toward zero would still satisfy a loose tolerance on this fixture.
+    #[test]
+    fn damp_with_a_guess_shrinks_toward_the_guess_not_the_origin() {
+        let (a, b) = overdetermined();
+        let damp = 0.75_f64;
+        let guess = vec![5.0, -3.0];
+        let r = lsqr_regularized(&a, &b, damp, Some(&guess), opts()).expect("damped warm");
+
+        let dense = [[1.0, 1.0], [1.0, 2.0], [1.0, 3.0]];
+        let x = &r.solution;
+        // residual of (A^T A + damp^2 I)(x - x0) - A^T (b - A x0)
+        let mut ax0 = [0.0f64; 3];
+        for (i, row) in dense.iter().enumerate() {
+            ax0[i] = row[0] * guess[0] + row[1] * guess[1];
+        }
+        let mut worst = 0.0_f64;
+        for j in 0..2 {
+            let mut lhs = damp * damp * (x[j] - guess[j]);
+            for k in 0..2 {
+                let ata: f64 = (0..3).map(|i| dense[i][j] * dense[i][k]).sum();
+                lhs += ata * (x[k] - guess[k]);
+            }
+            let rhs: f64 = (0..3).map(|i| dense[i][j] * (b[i] - ax0[i])).sum();
+            worst = worst.max((lhs - rhs).abs());
+        }
+        assert!(
+            worst < 1e-7,
+            "damped warm start violates (A^T A + damp^2 I)(x - x0) = A^T (b - A x0) \
+             by {worst}; x = {x:?}"
+        );
+
+        // MUST-MISS: it is NOT the shrink-toward-origin answer.
+        let toward_origin =
+            lsqr_regularized(&a, &b, damp, None, opts()).expect("damped cold");
+        let apart: f64 = toward_origin
+            .solution
+            .iter()
+            .zip(x)
+            .map(|(o, w)| (o - w).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            apart > 1e-3,
+            "damping with a guess produced the same answer as damping toward the \
+             origin (max difference {apart}); the penalty is not being applied to \
+             x - x0"
+        );
+    }
+
+    /// LSQR and LSMR must agree on the damped warm-started problem too. They reach it
+    /// by different recurrences, so agreement is evidence both x0 paths are right --
+    /// the same cross-check that guards the damping ports.
+    #[test]
+    fn damped_warm_lsqr_and_lsmr_agree() {
+        let (a, b) = overdetermined();
+        let damp = 0.75_f64;
+        let guess = vec![5.0, -3.0];
+        let q = lsqr_regularized(&a, &b, damp, Some(&guess), opts()).expect("lsqr");
+        let m = lsmr_regularized(&a, &b, damp, Some(&guess), opts()).expect("lsmr");
+        for (i, (x, y)) in q.solution.iter().zip(&m.solution).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-6,
+                "lsqr and lsmr disagree on the damped warm start at {i}: {x} vs {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_mis_sized_guess_is_rejected() {
+        let (a, b) = overdetermined();
+        let bad = vec![1.0, 2.0, 3.0];
+        assert!(
+            matches!(
+                lsqr_regularized(&a, &b, 0.0, Some(&bad), opts()),
+                Err(SparseError::IncompatibleShape { .. })
+            ),
+            "a length-3 guess for a 2-column matrix was accepted"
+        );
+        let ok = vec![0.0, 0.0];
+        assert!(
+            lsqr_regularized(&a, &b, 0.0, Some(&ok), opts()).is_ok(),
             "a correctly sized guess was rejected"
         );
     }
