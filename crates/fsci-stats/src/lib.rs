@@ -29900,7 +29900,7 @@ pub fn friedmanchisquare(groups: &[&[f64]]) -> TtestResult {
         let mut i = 0;
         while i < k {
             let mut j = i + 1;
-            while j < k && (vals[j].0 - vals[i].0).abs() < 1e-12 {
+            while j < k && vals[j].0 == vals[i].0 {
                 j += 1;
             }
             // Positions i..j all tied — average rank
@@ -38195,7 +38195,7 @@ pub fn page_trend_test(data: &[&[f64]]) -> PageTrendResult {
         let mut i = 0;
         while i < k {
             let mut j = i + 1;
-            while j < k && (indexed[j].1 - indexed[i].1).abs() < 1e-10 {
+            while j < k && indexed[j].1 == indexed[i].1 {
                 j += 1;
             }
             let avg_rank = (i + 1 + j) as f64 / 2.0;
@@ -38396,7 +38396,7 @@ fn rank_values(data: &[f64]) -> Vec<f64> {
     let mut i = 0;
     while i < n {
         let mut j = i + 1;
-        while j < n && (indexed[j].1 - indexed[i].1).abs() < 1e-10 {
+        while j < n && indexed[j].1 == indexed[i].1 {
             j += 1;
         }
         let avg_rank = (i + j - 1) as f64 / 2.0;
@@ -57208,6 +57208,57 @@ pub fn kendall_distance(rank1: &[usize], rank2: &[usize]) -> usize {
 )]
 mod tests {
     use super::*;
+
+    /// `frankenscipy-clttw`: these three functions grouped ties by a TOLERANCE
+    /// (`|a-b| < 1e-12` / `< 1e-10`) where scipy's `_rankdata` groups by EXACT equality.
+    /// Values distinct to scipy were merged into one tie group, changing the ranks — and
+    /// the ranks are the statistic.
+    ///
+    /// Measured on scipy 1.17.1 before the fix: friedman's statistic was **3x** off
+    /// (4.000000 -> 1.333333, p 0.135 -> 0.513), page_trend's p-value **40x** off
+    /// (7.23e-05 -> 2.89e-03), and weightedtau's tau **24%** off (0.17279 -> 0.13191).
+    ///
+    /// Goldens below are scipy's own output on these exact fixtures. Each input contains a
+    /// pair separated by less than the OLD tolerance (5e-13 against 1e-12; 5e-11 against
+    /// 1e-10), so under the old predicate every assertion here fails.
+    #[test]
+    fn rank_ties_group_by_exact_equality_not_tolerance() {
+        let d12 = 5e-13;
+        let s0 = [1.0, 2.0, 4.0, 7.0, 3.0, 6.0];
+        let s1 = [1.0 + d12, 2.0 + d12, 4.0 + d12, 7.0 + d12, 3.0 + d12, 6.0 + d12];
+        let s2 = [3.0, 5.0, 1.0, 2.0, 8.0, 9.0];
+        let fr = friedmanchisquare(&[&s0[..], &s1[..], &s2[..]]);
+        assert!(
+            (fr.statistic - 4.0).abs() < 1e-9,
+            "friedman statistic {} != scipy 4.0 (tolerance grouping gives 1.3333)",
+            fr.statistic
+        );
+        assert!(
+            (fr.pvalue - 0.135_335_283_236_612_7).abs() < 1e-9,
+            "friedman pvalue {} != scipy 0.1353352832366127",
+            fr.pvalue
+        );
+
+        let d10 = 5e-11;
+        let r0 = [1.0, 1.0 + d10, 3.0, 4.0];
+        let r1 = [2.0, 2.0 + d10, 5.0, 6.0];
+        let r2 = [3.0, 3.0 + d10, 7.0, 8.0];
+        let pt = page_trend_test(&[&r0[..], &r1[..], &r2[..]]);
+        assert!(
+            (pt.statistic - 90.0).abs() < 1e-9,
+            "page_trend L {} != scipy 90.0 (tolerance grouping gives 88.5)",
+            pt.statistic
+        );
+
+        let x = [1.0, 1.0 + d10, 3.0, 4.0, 5.0, 6.0];
+        let y = [2.0, 5.0, 1.0, 6.0, 3.0, 4.0];
+        let tau = weightedtau(&x, &y);
+        assert!(
+            (tau - 0.172_789_115_646_258_48).abs() < 1e-9,
+            "weightedtau {} != scipy 0.17278911564625848 (tolerance grouping gives 0.13191)",
+            tau
+        );
+    }
 
     #[test]
     fn gstd_par_reductions_match_serial_below_gate() {
