@@ -8967,6 +8967,66 @@ impl Sr1Hessian {
 }
 
 
+/// The interface both quasi-Newton strategies present
+/// -- `scipy.optimize.HessianUpdateStrategy`.
+///
+/// Without this, `BfgsHessian` and `Sr1Hessian` are two unrelated types and a method
+/// that wants curvature information has to pick one at compile time. The whole point of
+/// separating a strategy from an optimizer is that the CALLER chooses, so a trust-region
+/// method can be handed SR1 for its indefinite curvature and a line-search method BFGS
+/// for its definiteness, without either method knowing which it got.
+///
+/// The inherent methods on both types are kept and are what the delegating trait
+/// methods call, so nothing here forces an import on callers who only ever use one
+/// strategy concretely.
+pub trait HessianUpdateStrategy {
+    /// Start a fresh approximation of dimension `n`.
+    ///
+    /// `approx_type` is not a formatting choice: every update formula swaps the roles
+    /// of `delta_x` and `delta_grad` depending on it, so a strategy initialized for one
+    /// and read as the other holds a matrix that is neither.
+    fn initialize(&mut self, n: usize, approx_type: HessianApproxType);
+
+    /// Absorb one step: `delta_x = x2 - x1`, `delta_grad = grad(x2) - grad(x1)`.
+    fn update(&mut self, delta_x: &[f64], delta_grad: &[f64]);
+
+    /// Matrix-vector product with the current approximation.
+    fn dot(&self, p: &[f64]) -> Vec<f64>;
+
+    /// The current approximation, row-major `n x n`.
+    fn get_matrix(&self) -> &[f64];
+}
+
+impl HessianUpdateStrategy for BfgsHessian {
+    fn initialize(&mut self, n: usize, approx_type: HessianApproxType) {
+        BfgsHessian::initialize(self, n, approx_type);
+    }
+    fn update(&mut self, delta_x: &[f64], delta_grad: &[f64]) {
+        BfgsHessian::update(self, delta_x, delta_grad);
+    }
+    fn dot(&self, p: &[f64]) -> Vec<f64> {
+        BfgsHessian::dot(self, p)
+    }
+    fn get_matrix(&self) -> &[f64] {
+        BfgsHessian::get_matrix(self)
+    }
+}
+
+impl HessianUpdateStrategy for Sr1Hessian {
+    fn initialize(&mut self, n: usize, approx_type: HessianApproxType) {
+        Sr1Hessian::initialize(self, n, approx_type);
+    }
+    fn update(&mut self, delta_x: &[f64], delta_grad: &[f64]) {
+        Sr1Hessian::update(self, delta_x, delta_grad);
+    }
+    fn dot(&self, p: &[f64]) -> Vec<f64> {
+        Sr1Hessian::dot(self, p)
+    }
+    fn get_matrix(&self) -> &[f64] {
+        Sr1Hessian::get_matrix(self)
+    }
+}
+
 /// Quasi-Newton Hessian update strategies.
 ///
 /// Every test here is anchored on the SECANT CONDITION, which is the defining property
@@ -9285,5 +9345,36 @@ mod hessian_update_strategy_tests {
             "the inverse branch should scale reciprocally to 1e-3, got {}",
             hm[4]
         );
+    }
+
+    /// The trait is the reason these types exist as strategies rather than as two more
+    /// optimizers, so it gets exercised through a `dyn` reference: the two are driven
+    /// identically and must each still satisfy their own secant condition. Declaring
+    /// the trait without ever calling through it would leave object-safety and the
+    /// delegation untested.
+    #[test]
+    fn both_strategies_are_usable_through_the_trait() {
+        use super::HessianUpdateStrategy;
+
+        let mut bfgs = BfgsHessian::new(BfgsExceptionStrategy::SkipUpdate, None);
+        let mut sr1 = Sr1Hessian::new(None);
+        let strategies: [&mut dyn HessianUpdateStrategy; 2] = [&mut bfgs, &mut sr1];
+
+        for strategy in strategies {
+            strategy.initialize(3, HessianApproxType::Hess);
+            let (s, y) = steps().remove(0);
+            strategy.update(&s, &y);
+            let bs = strategy.dot(&s);
+            for i in 0..3 {
+                assert!(
+                    (bs[i] - y[i]).abs() < 1e-12,
+                    "a strategy driven through the trait broke the secant condition \
+                     at {i}: {} vs {}",
+                    bs[i],
+                    y[i]
+                );
+            }
+            assert_eq!(strategy.get_matrix().len(), 9);
+        }
     }
 }
