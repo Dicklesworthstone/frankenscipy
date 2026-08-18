@@ -10482,10 +10482,34 @@ fn poly_multiply(a: &[f64], b: &[f64]) -> Vec<f64> {
     result
 }
 
-/// Remove trailing near-zero coefficients from a polynomial.
+/// Remove trailing zero coefficients from a polynomial, by EXACT comparison.
+///
+/// `frankenscipy-jyfke`. This used `p[end - 1].abs() < 1e-15`, and the tolerance was
+/// the defect: trailing coefficients carry the roots at the origin, so discarding a
+/// tiny-but-nonzero one DELETES A ZERO of the polynomial rather than tidying it.
+///
+/// SciPy trims with exact zero -- `scipy/signal/_polyutils.py::_trim_zeros` tests
+/// `if i != 0.` and nothing else -- and `sos2zpk` does not trail-trim at all on that
+/// path, delegating per-section to `tf2zpk` -> `normalize`, which trims only LEADING
+/// coefficients. So exact comparison is both the faithful rule and the conservative
+/// one: it can only ever keep a coefficient the old rule would have dropped.
+///
+/// The error the tolerance caused grows as the preceding coefficient shrinks, since
+/// the discarded root is approximately `-b2/b1`. Measured on the oracle for a section
+/// `[1, b1, b2]` with `b2 = 9e-16`, every row of which the old predicate trimmed:
+///
+///     b1 = 2      scipy root -4.5e-16      ours 0    error 4.5e-16
+///     b1 = 1e-6   scipy root -9.008e-10    ours 0    error 9.0e-10
+///     b1 = 1e-10  scipy |z| ~ 3e-8         ours 0    error 3.0e-08
+///
+/// At `b1 = 1e-10` the disagreement is STRUCTURAL rather than numeric: SciPy returns a
+/// complex-conjugate pair, while trimming yields a real root plus a padded exact zero.
+///
+/// An exactly-zero trailing coefficient is still trimmed, which is unchanged and
+/// remains correct: that root really is at the origin, and the caller pads it back.
 fn trim_trailing_zeros(p: &[f64]) -> Vec<f64> {
     let mut end = p.len();
-    while end > 1 && p[end - 1].abs() < 1e-15 {
+    while end > 1 && p[end - 1] == 0.0 {
         end -= 1;
     }
     p[..end].to_vec()
@@ -34687,5 +34711,103 @@ mod tests {
                 "instantaneous_frequency[{i}] = {ri}, expected ~{freq}"
             );
         }
+    }
+}
+
+/// frankenscipy-jyfke — a tiny nonzero trailing coefficient must not be discarded.
+#[cfg(test)]
+mod jyfke_trailing_trim_is_exact {
+    use super::{SosSection, sos2zpk};
+
+    /// THE GATE IS A DEFINING PROPERTY, not SciPy's digits.
+    ///
+    /// For a monic section `z^2 + b1*z + b2`, the PRODUCT OF THE ZEROS IS EXACTLY
+    /// `b2` (Vieta). Dropping the trailing coefficient replaces the small root with
+    /// zero, which sends that product to zero — so the product is precisely the
+    /// quantity the defect destroys, and it detects the defect without asserting a
+    /// value this bead never executed against fsci. The bead is explicit that its
+    /// table came from SciPy's source plus oracle arithmetic and was NOT run here,
+    /// so pinning its exact digits would be pinning an unverified number.
+    ///
+    /// `b1 = 1e-6`, `b2 = 9e-16`: the old `|c| < 1e-15` predicate trimmed this, and
+    /// the discarded root is about `-b2/b1 = -9e-10` — nine orders of magnitude away
+    /// from the zero it was replaced with.
+    #[test]
+    fn a_tiny_nonzero_trailing_coefficient_keeps_its_root() {
+        let b1 = 1e-6_f64;
+        let b2 = 9e-16_f64;
+        // MUST-HIT on the fixture: the coefficient has to be small enough that the
+        // OLD predicate would have trimmed it, or this test proves nothing about the
+        // change.
+        assert!(
+            b2.abs() < 1e-15 && b2 != 0.0,
+            "fixture coefficient {b2} is not in the range the old tolerance trimmed"
+        );
+
+        let sos: Vec<SosSection> = vec![[1.0, b1, b2, 1.0, 0.5, 0.1]];
+        let z = sos2zpk(&sos);
+
+        assert_eq!(z.zeros_re.len(), 2, "a 3-coefficient numerator has two zeros");
+        // Product of the zeros, as complex numbers.
+        let (r0, i0) = (z.zeros_re[0], z.zeros_im[0]);
+        let (r1, i1) = (z.zeros_re[1], z.zeros_im[1]);
+        let prod_re = r0 * r1 - i0 * i1;
+        let prod_im = r0 * i1 + i0 * r1;
+
+        assert!(
+            prod_im.abs() < 1e-24,
+            "the zeros' product has an imaginary part {prod_im}; for real coefficients \
+             it must be real"
+        );
+        assert!(
+            (prod_re - b2).abs() < 1e-3 * b2,
+            "the zeros' product is {prod_re}, but Vieta requires b2 = {b2}. A product \
+             of zero means the trailing coefficient was TRIMMED and its root deleted, \
+             which is the jyfke defect"
+        );
+        // Stated separately because it is the symptom a reader would look for.
+        assert!(
+            !(r0 == 0.0 && i0 == 0.0) && !(r1 == 0.0 && i1 == 0.0),
+            "one of the zeros is exactly at the origin, which is what trimming a \
+             nonzero trailing coefficient produces"
+        );
+    }
+
+    /// MUST-MISS: an EXACTLY zero trailing coefficient still trims, and that is
+    /// correct — the root really is at the origin. A fix that stopped trimming
+    /// altogether would pass the test above and change this behaviour silently.
+    #[test]
+    fn an_exactly_zero_trailing_coefficient_still_yields_a_root_at_the_origin() {
+        let sos: Vec<SosSection> = vec![[1.0, 0.5, 0.0, 1.0, 0.5, 0.1]];
+        let z = sos2zpk(&sos);
+        assert_eq!(z.zeros_re.len(), 2, "the section still reports two zeros");
+        let at_origin = z
+            .zeros_re
+            .iter()
+            .zip(&z.zeros_im)
+            .filter(|(r, i)| **r == 0.0 && **i == 0.0)
+            .count();
+        assert_eq!(
+            at_origin, 1,
+            "expected exactly one zero at the origin for a numerator [1, 0.5, 0]"
+        );
+    }
+
+    /// MUST-MISS: ordinary coefficients are untouched by the change. The section
+    /// `[1, 0.5, 0.06]` has zeros -0.2 and -0.3, neither near the old threshold.
+    #[test]
+    fn ordinary_coefficients_are_unaffected() {
+        let sos: Vec<SosSection> = vec![[1.0, 0.5, 0.06, 1.0, 0.5, 0.1]];
+        let z = sos2zpk(&sos);
+        let mut re: Vec<f64> = z.zeros_re.clone();
+        re.sort_by(f64::total_cmp);
+        assert!(
+            (re[0] + 0.3).abs() < 1e-12 && (re[1] + 0.2).abs() < 1e-12,
+            "ordinary section zeros moved: {re:?} (expected -0.3 and -0.2)"
+        );
+        assert!(
+            z.zeros_im.iter().all(|v| v.abs() < 1e-12),
+            "real zeros gained an imaginary part"
+        );
     }
 }
