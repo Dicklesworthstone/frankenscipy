@@ -31958,6 +31958,18 @@ established yet beyond the fact that the arm finally works.
   cell's supernodes reach it, or accept that this cell's `w ≈ 5` is below the useful range
   for scatter/gather and that a genuinely BLAS-shaped kernel over dense blocks — not a
   scatter into a sparse row — is the only remaining form of this idea.
+- **2026-08-18 BIAS AUDIT (`scripts/audit_instrumented_cost_rows.py`, selftest PASS in
+  both heading dialects) — THE CONCLUSION HOLDS A FORTIORI; THE NUMBERS DO NOT TRANSFER.**
+  This row's harness is a `--release` **test** binary, so `cfg(test)` was live and
+  `record_merge_shape` executed inside `merge_sorted_remainder`'s per-element loop —
+  **3 call sites, verified by reading `a524d1a42` itself**, not inferred. The competing
+  kernel `dense_scatter_block_update` carries **zero** such sites. The instrumentation
+  therefore inflated **the merge alone — the arm this row declares the winner.** Removing
+  it lowers the merge and widens the gap, so *"the dense scatter loses to the merge"* is
+  **firmer than measured**, not weaker. What does NOT survive is the magnitude: 1.475x,
+  1.222x and the per-call Ir are ratios inside an instrumented binary and are not shipping
+  figures. The 17% marker-hoisting gain is likewise in-binary. Structural facts
+  (call counts, the scatter/gather shape argument) are unaffected by barriers and stand.
 
 ## 2026-08-16 - PeachSummit (cc) - THERE IS NO CROSSOVER WIDTH: the dense scatter has IDENTICAL marginal cost to the merge (15.06 vs 15.00 Ir/element) plus constant overhead, so it never wins - the supernodal line is closed
 
@@ -32014,6 +32026,17 @@ established yet beyond the fact that the arm finally works.
   successor is a kernel that costs **under 15.00 Ir per element-update** on this
   workload — `SUPERNODE_AB_WIDTH` and the harness are committed, so that is one command
   to check before any design is defended.
+- **2026-08-18 BIAS AUDIT (`scripts/audit_instrumented_cost_rows.py`) — THE REFUTATION
+  HOLDS A FORTIORI AND IS STRENGTHENED.** Same harness and same asymmetry as the previous
+  row: `record_merge_shape` ran per element in `merge_sorted_remainder` (3 sites at
+  `a524d1a42`), `dense_scatter_block_update` had none. The instrumentation is **per
+  element**, so it enters the *slope*, not just the intercept: the merge's true marginal
+  cost is **below the measured 15.00 Ir/element**, while the dense path's 15.06 is
+  uninflated. The measured margin of 1.0038 is therefore a **lower bound** on the dense
+  path's per-element disadvantage. "The ratio approaches 1 from above and never crosses"
+  survives with more room, and **there is still no crossover width**. The constant
+  difference (18,032,285 ± 185,560) and the per-width Ir totals are in-binary numbers and
+  should not be quoted as shipping cost.
 
 ## 2026-08-16 - PeachSummit (cc) - THE SHIPPING DEFICIT DROPS BELOW 2x for the first time: at least 0.5291x, at most 1.89x - an improvement that had been landed but never measured
 
@@ -34280,6 +34303,19 @@ bottleneck, and the IMPL direction does not survive a change of worker.
   measure the instruction delta on a **shipping** binary. Expected saving ~12.5% of program
   instructions — **below the ~13% detection floor for a timed certification**, so bank it as
   counted and do not spend a certification window on it alone.
+- **2026-08-18 BIAS AUDIT (`scripts/audit_instrumented_cost_rows.py`) — THE STRUCTURAL
+  HALF STANDS, THE SHARE-OF-BODY HALF IS WITHDRAWN.** This row was taken under
+  `cargo test -p fsci-sparse --lib`, i.e. with `cfg(test)` counters live in the merge.
+  That splits the row cleanly along the line established the same week: **`drops=0
+  at_head=0` across 19,054 and 592,108 updates is a STRUCTURAL count** — an optimisation
+  barrier does not change how many entries a check drops — and it keeps its must-hit
+  control (the nonsingular 4×4, det −6). It stands as written. **The cost attribution does
+  not:** "24.9% of the merge body", "0.97 Ir per element-update" and the comparison against
+  SuperLU's 4.05 budget were all read out of an instrumented binary and are **withdrawn as
+  quantities**. The qualitative finding they supported — that the check does work the cell
+  never uses — rests on the drop count, not on the share, and is unaffected. The lever this
+  row motivated was subsequently built and certified on uninstrumented binaries; that
+  measurement, not this one, is the cost of record.
 
 ## 2026-08-17 - PeachSummit (cc) - WHY THE DENSITY SIGN FLIPS, CONFIRMED: the in-place fast path fires on 100% of scattered updates and 10.6% of cubic ones
 
