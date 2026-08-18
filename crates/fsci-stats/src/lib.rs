@@ -16577,6 +16577,23 @@ impl TruncNormal {
         assert!(a < b, "a must be less than b");
         Self { a, b }
     }
+
+    /// `Φ(b) − Φ(a)`, the renormalising mass — computed on whichever tail keeps
+    /// the subtraction small.
+    ///
+    /// Written literally, that difference is exactly ZERO for `a = 30, b = 40`,
+    /// because both operands round to 1.0. Every method here divides by it, so the
+    /// whole distribution collapsed: `pdf` was identically 0 across its entire
+    /// support where `scipy.stats.truncnorm.pdf(30.5, 30, 40)` is 8.107714e-06.
+    /// The survival-side form `S(a) − S(b)` gives 4.906713927147908e-198 for the
+    /// same interval. It is not only an extreme-case problem — on `[5, 10]` the
+    /// two forms already disagree in the 10th significant digit.
+    ///
+    /// [`interval_probability`] makes that choice; this is a thin alias so the
+    /// seven call sites below cannot drift apart again. frankenscipy-45de1.
+    fn mass(&self) -> f64 {
+        interval_probability(&Normal::standard(), self.a, self.b)
+    }
 }
 
 impl ContinuousDistribution for TruncNormal {
@@ -16591,7 +16608,7 @@ impl ContinuousDistribution for TruncNormal {
             return 0.0;
         }
         let phi_x = (-x * x / 2.0).exp() / (2.0 * PI).sqrt();
-        let norm = standard_normal_cdf(self.b) - standard_normal_cdf(self.a);
+        let norm = self.mass();
         if norm > 0.0 { phi_x / norm } else { 0.0 }
     }
 
@@ -16602,10 +16619,30 @@ impl ContinuousDistribution for TruncNormal {
         if x >= self.b {
             return 1.0;
         }
-        let phi_a = standard_normal_cdf(self.a);
-        let norm = standard_normal_cdf(self.b) - phi_a;
+        // BOTH the numerator and the denominator are interval masses, and both
+        // cancel for the same reason, so both go through the tail choice.
+        let norm = self.mass();
         if norm > 0.0 {
-            (standard_normal_cdf(x) - phi_a) / norm
+            (interval_probability(&Normal::standard(), self.a, x) / norm).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        if x <= self.a {
+            return 1.0;
+        }
+        if x >= self.b {
+            return 0.0;
+        }
+        // Its own interval mass, NOT 1 − cdf. Previously there was no `sf` here at
+        // all, so the trait default subtracted — and the upper part of the interval
+        // is exactly where that has already lost its digits.
+        // scipy.stats.truncnorm.sf(32, 30, 40) = 1.08655699900926376e-34.
+        let norm = self.mass();
+        if norm > 0.0 {
+            (interval_probability(&Normal::standard(), x, self.b) / norm).clamp(0.0, 1.0)
         } else {
             0.0
         }
@@ -16614,7 +16651,7 @@ impl ContinuousDistribution for TruncNormal {
     fn mean(&self) -> f64 {
         let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
-        let norm = standard_normal_cdf(self.b) - standard_normal_cdf(self.a);
+        let norm = self.mass();
         if norm > 0.0 {
             (phi_a - phi_b) / norm
         } else {
@@ -16625,7 +16662,7 @@ impl ContinuousDistribution for TruncNormal {
     fn var(&self) -> f64 {
         let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
-        let norm = standard_normal_cdf(self.b) - standard_normal_cdf(self.a);
+        let norm = self.mass();
         if norm <= 0.0 {
             return 0.0;
         }
@@ -16639,7 +16676,7 @@ impl ContinuousDistribution for TruncNormal {
         // where Δ = Φ(b) − Φ(a). (Standard normal truncation.)
         let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
-        let delta = standard_normal_cdf(self.b) - standard_normal_cdf(self.a);
+        let delta = self.mass();
         if delta <= 0.0 {
             return f64::NAN;
         }
@@ -16654,7 +16691,7 @@ impl ContinuousDistribution for TruncNormal {
         let (a, b) = (self.a, self.b);
         let phi_a = (-a * a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-b * b / 2.0).exp() / (2.0 * PI).sqrt();
-        let z = standard_normal_cdf(b) - standard_normal_cdf(a);
+        let z = self.mass();
         if z <= 0.0 {
             return f64::NAN;
         }
@@ -16673,7 +16710,7 @@ impl ContinuousDistribution for TruncNormal {
         let (a, b) = (self.a, self.b);
         let phi_a = (-a * a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-b * b / 2.0).exp() / (2.0 * PI).sqrt();
-        let z = standard_normal_cdf(b) - standard_normal_cdf(a);
+        let z = self.mass();
         if z <= 0.0 {
             return f64::NAN;
         }
@@ -98772,14 +98809,20 @@ mod truncate_matches_scipy {
             );
         }
 
-        // And the incumbent-in-tree really does fail here. If this ever starts
-        // passing, TruncNormal was fixed and this assertion is the place to look.
-        assert_eq!(
-            TruncNormal::new(30.0, 40.0).pdf(32.0),
-            0.0,
-            "TruncNormal is expected to return 0 here; that is frankenscipy's own \
-             instance of the cancellation this type avoids"
-        );
+        // This used to assert `TruncNormal::new(30, 40).pdf(32) == 0.0` -- the
+        // in-tree instance of the same cancellation, filed as frankenscipy-45de1.
+        // That bead is now FIXED, so the two implementations must AGREE instead.
+        // Keeping the check rather than deleting it: it is now a cross-validation
+        // between a generic construction and a closed-form one, which is a stronger
+        // statement than either makes against scipy alone.
+        let concrete = TruncNormal::new(30.0, 40.0);
+        for x in [30.5, 32.0, 35.0] {
+            let (g, c) = (t.pdf(x), concrete.pdf(x));
+            assert!(
+                ((g - c) / c).abs() < 1e-12,
+                "generic pdf({x}) = {g:e} but TruncNormal gives {c:e}"
+            );
+        }
     }
 
     /// Even a mild interval loses digits to the subtractive form: on [5, 10] the
@@ -99627,5 +99670,112 @@ mod goodness_of_fit_matches_scipy {
         let empty: Result<super::GofOutcome<Normal>, _> =
             goodness_of_fit(&[], GofStatistic::AndersonDarling, 99, 1);
         assert!(empty.is_err(), "an empty sample cannot be fitted");
+    }
+}
+
+#[cfg(test)]
+mod truncnormal_renormaliser_is_not_a_cancelling_difference {
+    use super::{ContinuousDistribution, Normal, TruncNormal, standard_normal_cdf};
+
+    /// frankenscipy-45de1: every method of `TruncNormal` divided by `Φ(b) − Φ(a)`,
+    /// which is exactly ZERO on `[30, 40]`. The distribution was identically zero
+    /// across its own support.
+    #[test]
+    fn the_collapsed_interval_now_matches_scipy() {
+        // The premise, on the real arithmetic: the literal difference is STILL 0,
+        // so the fix is doing the work rather than the base cdf having improved.
+        assert_eq!(
+            standard_normal_cdf(40.0) - standard_normal_cdf(30.0),
+            0.0,
+            "premise: the textbook renormaliser is exactly zero here"
+        );
+
+        let d = TruncNormal::new(30.0, 40.0);
+        // x, scipy.stats.truncnorm pdf, sf
+        for (x, want_pdf, want_sf) in [
+            (30.5, 8.107_714_218_413_067e-6, 2.655_418_539_828_012e-7),
+            (32.0, 3.559_136_079_029_236e-26, 1.111_147_029_246_309e-27),
+            (35.0, 8.030_621_584_304_054e-70, 2.292_594_846_926_951e-71),
+        ] {
+            for (got, want, what) in [(d.pdf(x), want_pdf, "pdf"), (d.sf(x), want_sf, "sf")] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-9,
+                    "TruncNormal(30, 40).{what}({x}) = {got:e}, scipy = {want:e}"
+                );
+            }
+        }
+        // The moments divide by the same mass, so they were broken too.
+        let (m, v) = (d.mean(), d.var());
+        assert!(
+            ((m - 3.003_325_966_743_637e1) / 3.003_325_966_743_637e1).abs() < 1e-9,
+            "mean = {m}, scipy = 30.033259667436372"
+        );
+        assert!(
+            ((v - 1.103_771_430_859_046e-3) / 1.103_771_430_859_046e-3).abs() < 1e-7,
+            "var = {v}, scipy = 0.0011037714308590463"
+        );
+    }
+
+    /// REGRESSION GUARD, and the more important half: benign intervals must be
+    /// UNCHANGED. A fix that repaired the extreme case while perturbing ordinary
+    /// use would be a worse defect than the one it closed.
+    #[test]
+    fn ordinary_intervals_are_unchanged_and_still_match_scipy() {
+        for (a, b, x, want_pdf, want_cdf, want_sf) in [
+            (
+                -1.0,
+                2.0,
+                -0.25,
+                4.723_560_479_546_409e-1,
+                2.964_085_228_515_105e-1,
+                7.035_914_771_484_896e-1,
+            ),
+            (
+                5.0,
+                10.0,
+                6.25,
+                4.583_968_647_168_819e-3,
+                9.992_840_564_551_017e-1,
+                7.159_435_448_983_936e-4,
+            ),
+        ] {
+            let d = TruncNormal::new(a, b);
+            for (got, want, what) in [
+                (d.pdf(x), want_pdf, "pdf"),
+                (d.cdf(x), want_cdf, "cdf"),
+                (d.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-11,
+                    "TruncNormal({a}, {b}).{what}({x}) = {got:e}, scipy = {want:e}"
+                );
+            }
+            // cdf and sf are now computed independently; they must still close.
+            assert!((d.cdf(x) + d.sf(x) - 1.0).abs() < 1e-12);
+            // Support edges.
+            assert_eq!(d.cdf(a), 0.0);
+            assert_eq!(d.cdf(b), 1.0);
+            assert_eq!(d.sf(a), 1.0);
+            assert_eq!(d.sf(b), 0.0);
+            assert_eq!(d.pdf(a - 1.0), 0.0);
+        }
+
+        // `[5, 10]` is where the two forms first visibly part -- the survival side
+        // is the correct one and the naive one is already wrong at the 10th digit.
+        // Pinning the direction, so a future "simplification" back to the plain
+        // subtraction is caught here rather than out in the tail.
+        let naive = standard_normal_cdf(10.0) - standard_normal_cdf(5.0);
+        let kept = Normal::standard().sf(5.0) - Normal::standard().sf(10.0);
+        assert_ne!(
+            naive.to_bits(),
+            kept.to_bits(),
+            "the two renormalisers should still differ on [5, 10]"
+        );
+        assert!(
+            ((kept - 2.866_515_718_791_933e-7) / 2.866_515_718_791_933e-7).abs() < 1e-13,
+            "the survival-side mass is the one scipy agrees with, got {kept:e}"
+        );
     }
 }
