@@ -1708,9 +1708,23 @@ struct SplineFlags {
     compact_disabled: bool,
 }
 
+/// How many times `SplineFlags::resolve` has run — `frankenscipy-22van` gate (a).
+///
+/// The bead requires the read FREQUENCY be bounded structurally before the lever is
+/// believed, and a structural count is exactly what survives instrumentation: adding
+/// a counter perturbs timing, but it cannot change how many times a call happens.
+/// (Which is also why this must NOT be used to read cost — the bead is explicit that
+/// `cfg(test)` counters in this path are themselves optimisation barriers, so the
+/// specialisation half has to be an A/B of two SHIPPING binaries.)
+#[cfg(test)]
+pub(crate) static SPLINE_FLAGS_RESOLVE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl SplineFlags {
     /// Read both atomics ONCE. Call this OUTSIDE any per-pixel loop.
     fn resolve() -> Self {
+        #[cfg(test)]
+        SPLINE_FLAGS_RESOLVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Self {
             offsets: !NDIMAGE_SPLINE_OFFSET_DISABLE.load(std::sync::atomic::Ordering::Relaxed),
             compact_disabled: NDIMAGE_BSPLINE_COMPACT_DISABLE
@@ -13489,6 +13503,53 @@ mod zoom_separable_ab_tests {
 
 #[cfg(test)]
 mod tests {
+    /// `frankenscipy-22van`: hoisting the spline knobs out of the per-pixel path must not
+    /// change a single bit.
+    ///
+    /// `sample_interpolated` used to read `NDIMAGE_SPLINE_OFFSET_DISABLE` on every pixel and
+    /// `compute_axis_support` read `NDIMAGE_BSPLINE_COMPACT_DISABLE` once per axis per pixel.
+    /// Both now arrive pre-resolved from the caller. `NDIMAGE_SPLINE_FLAG_HOIST_DISABLE`
+    /// restores the per-call read, so the two shapes can be compared inside ONE binary —
+    /// which is the whole reason that knob exists.
+    ///
+    /// The fixture uses NON-INTEGER shifts deliberately: an integer shift takes the cardinal
+    /// fast path and never reaches the spline sampler, so both arms would run identical code
+    /// and the comparison would prove nothing. Order 3 gives a 4-tap support per axis, so the
+    /// hoisted flag is genuinely consulted many times per pixel.
+    #[test]
+    fn spline_flag_hoist_is_bit_identical_to_the_per_call_read() {
+        use std::sync::atomic::Ordering;
+
+        let shape = vec![9usize, 11];
+        let mut input = NdArray::zeros(shape.clone());
+        for (i, slot) in input.data.iter_mut().enumerate() {
+            // Irrational-ish and non-separable so no coincidence can mask a difference.
+            *slot = ((i as f64) * 0.6180339887498949).sin() * 3.0 + (i as f64) * 0.25;
+        }
+
+        // Non-integer on both axes => the general per-pixel spline path.
+        let shifts = [0.37, -0.61];
+
+        NDIMAGE_SPLINE_FLAG_HOIST_DISABLE.store(true, Ordering::Relaxed);
+        let per_call = shift(&input, &shifts, 3, BoundaryMode::Reflect, 0.0)
+            .expect("per-call-read arm");
+        NDIMAGE_SPLINE_FLAG_HOIST_DISABLE.store(false, Ordering::Relaxed);
+        let hoisted = shift(&input, &shifts, 3, BoundaryMode::Reflect, 0.0).expect("hoisted arm");
+
+        assert_eq!(per_call.shape, hoisted.shape, "shape must not depend on the knob");
+        assert!(
+            per_call.data.iter().any(|v| *v != 0.0 && v.is_finite()),
+            "degenerate fixture: an all-zero output would compare equal while proving nothing"
+        );
+        for (i, (a, b)) in per_call.data.iter().zip(hoisted.data.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "pixel {i}: per-call read {a} vs hoisted {b}"
+            );
+        }
+    }
+
     // scipy reference values are transcribed at the precision scipy printed them,
     // e.g. 5.3000000000000007 rather than 5.3. The extra digits are the GOLDEN --
     // they record what the incumbent actually returned, and rounding them by hand
@@ -22204,6 +22265,74 @@ mod toggle_ab_nd_filter_scalar {
             (got - expect).abs() <= 1e-9 * expect.abs().max(1.0),
             "the interior pixel disagrees with the correlation definition: got \
              {got}, expected {expect}"
+        );
+    }
+}
+
+/// frankenscipy-22van gate (a) — the knob read is PER TRANSFORM, not per pixel.
+///
+/// The hoist put both `NDIMAGE_SPLINE_OFFSET_DISABLE` and
+/// `NDIMAGE_BSPLINE_COMPACT_DISABLE` behind one `SplineFlags::resolve()` outside the
+/// pixel loop. Nothing structural stopped a later edit from moving that call back
+/// inside, and the symptom would be invisible: the results stay byte-identical and
+/// only the specialisation is lost. This pins the frequency.
+///
+/// It measures a COUNT, never a cost. The bead is explicit that `cfg(test)` counters
+/// in this path are optimisation barriers, so the half of the gate that decides
+/// whether the lever is worth anything must be an A/B of two shipping binaries. This
+/// is the other half: the one that says the read is not per pixel.
+#[cfg(test)]
+mod van22_knob_read_is_per_transform {
+    use super::{
+        BoundaryMode, NdArray, SPLINE_FLAGS_RESOLVE_COUNT, shift,
+    };
+    use std::sync::atomic::Ordering;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn resolve_runs_per_transform_not_per_pixel() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Big enough that per-pixel and per-transform differ by orders of magnitude:
+        // 64x64 = 4096 pixels. A count of ~1 and a count of ~4096 cannot be confused.
+        const W: usize = 64;
+        const PIXELS: usize = W * W;
+        let data: Vec<f64> = (0..PIXELS as u64)
+            .map(|i| ((i.wrapping_mul(2_654_435_761) % 1009) as f64) / 1009.0)
+            .collect();
+        let input = NdArray::new(data, vec![W, W]).expect("fixture");
+
+        SPLINE_FLAGS_RESOLVE_COUNT.store(0, Ordering::Relaxed);
+        let out = shift(&input, &[0.5, -0.25], 3, BoundaryMode::Reflect, 0.0)
+            .expect("shift failed on a well-formed fixture");
+        let count = SPLINE_FLAGS_RESOLVE_COUNT.load(Ordering::Relaxed);
+
+        assert_eq!(out.size(), PIXELS, "the transform did not produce a full image");
+
+        // MUST-HIT: the counter has to move at all. A resolve that is never called —
+        // because the code was refactored past it — would give a count of 0 and
+        // trivially satisfy any "not per pixel" bound.
+        assert!(
+            count >= 1,
+            "SplineFlags::resolve was never called, so this test is bounding nothing"
+        );
+
+        // THE GATE. Per-transform means a small constant, possibly one per worker in
+        // the parallel arm; per-pixel means PIXELS. The bound is deliberately loose
+        // — one per worker plus slack — because the claim is an ORDER OF MAGNITUDE,
+        // not an exact count, and pinning an exact count would make this test fail on
+        // a machine with a different core count for no defect.
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1);
+        let ceiling = (workers * 4).max(16);
+        assert!(
+            count <= ceiling,
+            "SplineFlags::resolve ran {count} times for {PIXELS} pixels (ceiling \
+             {ceiling} = 4 per worker on {workers} workers). Anything near {PIXELS} \
+             means the read is back inside the pixel loop — results stay \
+             byte-identical, so no other test would notice"
         );
     }
 }
