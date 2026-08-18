@@ -57937,6 +57937,388 @@ pub fn truncate<D: ContinuousDistribution>(dist: D, lb: f64, ub: f64) -> Truncat
     Truncated::new(dist, lb, ub)
 }
 
+/// `E[g(X)]` by tanh-sinh quadrature in the PROBABILITY variable.
+///
+/// `X = F⁻¹(U)` for uniform `U`, so `E[g(X)] = ∫₀¹ g(F⁻¹(t)) dt`. Integrating in
+/// `t` rather than in `x` makes the domain `(0, 1)` whatever the base support is,
+/// and the base quantile diverging at the ends is the integrable endpoint
+/// singularity the double-exponential rule exists for.
+fn transform_mean<D: ContinuousDistribution>(dist: &D, g: impl Fn(f64) -> f64) -> f64 {
+    tanh_sinh_integrate(|t| g(dist.ppf(t)), 0.0, 1.0)
+}
+
+/// `Var[g(X)]` as `E[(g(X) − μ)²]`, NOT `E[g²] − μ²` — the central form cannot
+/// have a large mean cancel the variance away.
+fn transform_var<D: ContinuousDistribution>(dist: &D, g: impl Fn(f64) -> f64, mean: f64) -> f64 {
+    if !mean.is_finite() {
+        return f64::NAN;
+    }
+    tanh_sinh_integrate(
+        |t| {
+            let d = g(dist.ppf(t)) - mean;
+            d * d
+        },
+        0.0,
+        1.0,
+    )
+}
+
+/// `Y = eˣ` for `X ~ dist`. Matches `scipy.stats.exp(X)`.
+///
+/// Support `(0, ∞)`. A strictly increasing map, so the cdf and sf pass straight
+/// through with no reordering: `F_Y(y) = F_X(ln y)`, `S_Y(y) = S_X(ln y)`. The
+/// survival therefore inherits whatever accuracy the base has in ITS right tail
+/// rather than being reconstructed as `1 − cdf` — the point of the sf overrides
+/// across this crate.
+///
+/// `exp(Normal(μ, σ))` is the lognormal, which is the cheapest way to check this
+/// against something already trusted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExpOf<D: ContinuousDistribution> {
+    dist: D,
+}
+
+impl<D: ContinuousDistribution> ExpOf<D> {
+    #[must_use]
+    pub fn new(dist: D) -> Self {
+        Self { dist }
+    }
+
+    /// The underlying distribution `X`.
+    #[must_use]
+    pub fn base(&self) -> &D {
+        &self.dist
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for ExpOf<D> {
+    fn pdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return 0.0;
+        }
+        self.dist.pdf(y.ln()) / y
+    }
+
+    fn logpdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        // `- ln y` rather than `/ y`, so a density that underflows in linear space
+        // still reports a finite log.
+        self.dist.logpdf(y.ln()) - y.ln()
+    }
+
+    fn cdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return 0.0;
+        }
+        self.dist.cdf(y.ln())
+    }
+
+    fn sf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return 1.0;
+        }
+        self.dist.sf(y.ln())
+    }
+
+    fn logcdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        self.dist.logcdf(y.ln())
+    }
+
+    fn logsf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return 0.0;
+        }
+        self.dist.logsf(y.ln())
+    }
+
+    fn ppf(&self, p: f64) -> f64 {
+        self.dist.ppf(p).exp()
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        // Through the base's OWN isf, so a small q is never turned into `1 - q`.
+        self.dist.isf(q).exp()
+    }
+
+    fn mean(&self) -> f64 {
+        transform_mean(&self.dist, f64::exp)
+    }
+
+    fn var(&self) -> f64 {
+        transform_var(&self.dist, f64::exp, self.mean())
+    }
+}
+
+/// `Y = ln X` for a non-negative `X ~ dist`. Matches `scipy.stats.log(X)`.
+///
+/// Strictly increasing, so like [`ExpOf`] the cdf and sf pass straight through:
+/// `F_Y(y) = F_X(eʸ)`, `S_Y(y) = S_X(eʸ)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogOf<D: ContinuousDistribution> {
+    dist: D,
+}
+
+impl<D: ContinuousDistribution> LogOf<D> {
+    /// Panics if `dist` puts mass below zero, where the logarithm is undefined.
+    ///
+    /// SciPy raises `NotImplementedError` here after inspecting `X.support()`.
+    /// `ContinuousDistribution` exposes no support, so the equivalent test is
+    /// `cdf(0) == 0` — which is the same statement about where the mass is, made
+    /// with the interface that exists rather than one that does not.
+    #[must_use]
+    pub fn new(dist: D) -> Self {
+        assert!(
+            dist.cdf(0.0) == 0.0,
+            "the logarithm of a random variable needs a non-negative support, but \
+             cdf(0) = {} puts mass below zero",
+            dist.cdf(0.0)
+        );
+        Self { dist }
+    }
+
+    /// The underlying distribution `X`.
+    #[must_use]
+    pub fn base(&self) -> &D {
+        &self.dist
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for LogOf<D> {
+    fn pdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.pdf(y.exp()) * y.exp()
+    }
+
+    fn logpdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.logpdf(y.exp()) + y
+    }
+
+    fn cdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.cdf(y.exp())
+    }
+
+    fn sf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.sf(y.exp())
+    }
+
+    fn logcdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.logcdf(y.exp())
+    }
+
+    fn logsf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.logsf(y.exp())
+    }
+
+    fn ppf(&self, p: f64) -> f64 {
+        self.dist.ppf(p).ln()
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        self.dist.isf(q).ln()
+    }
+
+    fn mean(&self) -> f64 {
+        transform_mean(&self.dist, f64::ln)
+    }
+
+    fn var(&self) -> f64 {
+        transform_var(&self.dist, f64::ln, self.mean())
+    }
+}
+
+/// `Y = |X|` for `X ~ dist`, the folded distribution. Matches `scipy.stats.abs(X)`.
+///
+/// NOT monotone, so unlike [`ExpOf`] and [`LogOf`] both halves of the base
+/// contribute at every point:
+///
+/// ```text
+///   f_Y(y) = f(y) + f(−y)
+///   F_Y(y) = P(−y ≤ X ≤ y)
+///   S_Y(y) = S(y) + F(−y)
+/// ```
+///
+/// The two tail terms of `S_Y` are the base's own `sf` and `cdf`, ADDED. No
+/// subtraction appears in the survival at all, so `|X|` keeps its right tail for
+/// exactly as long as the base keeps both of its own — better conditioned than
+/// the cdf, which is a difference by nature.
+///
+/// `F_Y` goes through [`interval_probability`], so it subtracts on whichever side
+/// is small. That handles a fold placed far out in one tail; it cannot help when
+/// `y` itself is tiny, because `P(−ε < X < ε)` is a narrow interval around a
+/// finite density and no branch avoids that cancellation — see the note on
+/// [`interval_probability`]. `logcdf` via [`log_interval_probability`] is the
+/// route that survives further.
+///
+/// Note there is no `ppf` override: the fold has no closed-form quantile, so the
+/// trait's bisection is used, which is why `mean`/`var` are defined below in
+/// terms of the BASE quantile rather than this type's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AbsOf<D: ContinuousDistribution> {
+    dist: D,
+}
+
+impl<D: ContinuousDistribution> AbsOf<D> {
+    #[must_use]
+    pub fn new(dist: D) -> Self {
+        Self { dist }
+    }
+
+    /// The underlying distribution `X`.
+    #[must_use]
+    pub fn base(&self) -> &D {
+        &self.dist
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for AbsOf<D> {
+    fn pdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return 0.0;
+        }
+        // Outside the base support its pdf is already 0, so no support test is
+        // needed here -- SciPy needs one only because it masks arrays.
+        self.dist.pdf(y) + self.dist.pdf(-y)
+    }
+
+    fn logpdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        // log-sum-exp of the two folded halves, so the fold stays finite where
+        // both densities have underflowed.
+        let a = self.dist.logpdf(y);
+        let b = self.dist.logpdf(-y);
+        if a == f64::NEG_INFINITY && b == f64::NEG_INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        let hi = a.max(b);
+        hi + ((a - hi).exp() + (b - hi).exp()).ln()
+    }
+
+    fn cdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return 0.0;
+        }
+        interval_probability(&self.dist, -y, y).clamp(0.0, 1.0)
+    }
+
+    fn sf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return 1.0;
+        }
+        // Two tails ADDED, never `1 - cdf`.
+        (self.dist.sf(y) + self.dist.cdf(-y)).clamp(0.0, 1.0)
+    }
+
+    fn logcdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        log_interval_probability(&self.dist, -y, y)
+    }
+
+    fn logsf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return 0.0;
+        }
+        let a = self.dist.logsf(y);
+        let b = self.dist.logcdf(-y);
+        if a == f64::NEG_INFINITY && b == f64::NEG_INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        let hi = a.max(b);
+        hi + ((a - hi).exp() + (b - hi).exp()).ln()
+    }
+
+    fn mean(&self) -> f64 {
+        // E|X| = ∫₀¹ |F⁻¹(t)| dt through the BASE quantile -- this type's own ppf
+        // is a bisection, and using it here would nest a root-find inside every
+        // quadrature node for no gain in accuracy.
+        transform_mean(&self.dist, f64::abs)
+    }
+
+    fn var(&self) -> f64 {
+        transform_var(&self.dist, f64::abs, self.mean())
+    }
+}
+
+/// `eˣ` as a distribution. Matches `scipy.stats.exp(X)`.
+#[must_use]
+pub fn exp_of<D: ContinuousDistribution>(dist: D) -> ExpOf<D> {
+    ExpOf::new(dist)
+}
+
+/// `ln X` as a distribution. Matches `scipy.stats.log(X)`. Panics unless the
+/// support is non-negative.
+#[must_use]
+pub fn log_of<D: ContinuousDistribution>(dist: D) -> LogOf<D> {
+    LogOf::new(dist)
+}
+
+/// `|X|` as a distribution. Matches `scipy.stats.abs(X)`.
+#[must_use]
+pub fn abs_of<D: ContinuousDistribution>(dist: D) -> AbsOf<D> {
+    AbsOf::new(dist)
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
@@ -98441,5 +98823,326 @@ mod truncate_matches_scipy {
             t.mean()
         );
         assert!(t.var().is_nan());
+    }
+}
+
+#[cfg(test)]
+mod transforms_match_scipy {
+    use super::{
+        AbsOf, ContinuousDistribution, HalfNormal, LogOf, Lognormal, Normal, Uniform, abs_of,
+        exp_of, log_of,
+    };
+
+    /// `exp(X)`, `abs(X)`, `log(X)` against `scipy.stats.exp/abs/log`.
+    #[test]
+    fn pdf_cdf_sf_match_scipy() {
+        // exp(Normal()) -- x, pdf, cdf, ccdf
+        for (x, want_pdf, want_cdf, want_sf) in [
+            (
+                0.5,
+                6.274_960_771_159_244e-1,
+                2.441_085_957_855_827e-1,
+                7.558_914_042_144_173e-1,
+            ),
+            (1.0, 3.989_422_804_014_327e-1, 5.0e-1, 5.0e-1),
+            (
+                3.0,
+                7.272_825_613_999_470e-2,
+                8.640_313_923_585_756e-1,
+                1.359_686_076_414_244e-1,
+            ),
+        ] {
+            let y = exp_of(Normal::standard());
+            for (got, want, what) in [
+                (y.pdf(x), want_pdf, "pdf"),
+                (y.cdf(x), want_cdf, "cdf"),
+                (y.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(rel < 1e-12, "exp(Normal).{what}({x}) = {got}, scipy = {want}");
+            }
+        }
+
+        // abs(Normal()) -- the symmetric fold.
+        for (x, want_pdf, want_cdf, want_sf) in [
+            (
+                0.25,
+                7.733_362_336_056_985e-1,
+                1.974_126_513_658_474e-1,
+                8.025_873_486_341_526e-1,
+            ),
+            (
+                1.0,
+                4.839_414_490_382_867e-1,
+                6.826_894_921_370_859e-1,
+                3.173_105_078_629_141e-1,
+            ),
+            (
+                2.5,
+                3.505_660_098_713_708e-2,
+                9.875_806_693_484_477e-1,
+                1.241_933_065_155_226e-2,
+            ),
+        ] {
+            let y = abs_of(Normal::standard());
+            for (got, want, what) in [
+                (y.pdf(x), want_pdf, "pdf"),
+                (y.cdf(x), want_cdf, "cdf"),
+                (y.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(rel < 1e-12, "abs(Normal).{what}({x}) = {got}, scipy = {want}");
+            }
+        }
+
+        // abs of an ASYMMETRIC base -- the case where both folded halves carry
+        // different mass, so a fold that only doubled one side would pass the
+        // symmetric rows above and fail here.
+        for (x, want_pdf, want_cdf, want_sf) in [
+            (
+                0.25,
+                5.239_990_657_025_129e-1,
+                1.321_534_888_960_238e-1,
+                8.678_465_111_039_761e-1,
+            ),
+            (
+                1.0,
+                4.293_216_640_823_135e-1,
+                4.957_641_100_843_811e-1,
+                5.042_358_899_156_191e-1,
+            ),
+            (
+                3.0,
+                6.950_393_176_934_426e-2,
+                9.593_597_738_088_753e-1,
+                4.064_022_619_112_470e-2,
+            ),
+        ] {
+            let y = abs_of(Normal::new(0.7, 1.3));
+            for (got, want, what) in [
+                (y.pdf(x), want_pdf, "pdf"),
+                (y.cdf(x), want_cdf, "cdf"),
+                (y.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-12,
+                    "abs(Normal(0.7, 1.3)).{what}({x}) = {got}, scipy = {want}"
+                );
+            }
+        }
+
+        // log(Uniform(1, 4)) -- scipy.stats.Uniform(a=1, b=4) is loc=1, scale=3.
+        for (x, want_pdf, want_cdf, want_sf) in [
+            (
+                0.3,
+                4.499_529_358_586_677e-1,
+                1.166_196_025_253_344e-1,
+                8.833_803_974_746_656e-1,
+            ),
+            (
+                1.0,
+                9.060_939_428_196_817e-1,
+                5.727_606_094_863_483e-1,
+                4.272_393_905_136_516e-1,
+            ),
+            (
+                1.3,
+                1.223_098_889_206_415e0,
+                8.897_655_558_730_815e-1,
+                1.102_344_441_269_185e-1,
+            ),
+        ] {
+            let y = log_of(Uniform::new(1.0, 3.0));
+            for (got, want, what) in [
+                (y.pdf(x), want_pdf, "pdf"),
+                (y.cdf(x), want_cdf, "cdf"),
+                (y.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-12,
+                    "log(Uniform(1,4)).{what}({x}) = {got}, scipy = {want}"
+                );
+            }
+        }
+    }
+
+    /// CROSS-CHECK AGAINST SEPARATELY-WRITTEN CODE IN THIS TREE, which is worth
+    /// more than another golden: `Lognormal` and `HalfNormal` are concrete
+    /// implementations of exactly these two transforms, written independently of
+    /// the generic machinery. A wrong Jacobian, a dropped `1/y`, or a fold that
+    /// doubles instead of adding shows up here immediately and without SciPy.
+    #[test]
+    fn the_transforms_agree_with_the_concrete_distributions_they_reproduce() {
+        // exp(N(0,1)) is lognorm(s = 1, scale = 1).
+        let generic = exp_of(Normal::standard());
+        let concrete = Lognormal::new(1.0, 1.0);
+        for x in [0.05, 0.5, 1.0, 2.0, 7.5] {
+            for (g, c, what) in [
+                (generic.pdf(x), concrete.pdf(x), "pdf"),
+                (generic.cdf(x), concrete.cdf(x), "cdf"),
+                (generic.sf(x), concrete.sf(x), "sf"),
+            ] {
+                assert!(
+                    ((g - c) / c).abs() < 1e-12,
+                    "exp(Normal).{what}({x}) = {g} but Lognormal gives {c}"
+                );
+            }
+        }
+
+        // |N(0,1)| is the half-normal.
+        let folded = abs_of(Normal::standard());
+        let half = HalfNormal;
+        for x in [0.0, 0.3, 1.0, 2.0, 4.0] {
+            for (g, c, what) in [
+                (folded.pdf(x), half.pdf(x), "pdf"),
+                (folded.cdf(x), half.cdf(x), "cdf"),
+            ] {
+                assert!(
+                    (g - c).abs() < 1e-12,
+                    "abs(Normal).{what}({x}) = {g} but HalfNormal gives {c}"
+                );
+            }
+        }
+        // sf compared relatively, since it is the small one out in the tail --
+        // an absolute check there would pass on anything.
+        for x in [1.0, 3.0, 6.0] {
+            let (g, c) = (folded.sf(x), half.sf(x));
+            assert!(
+                ((g - c) / c).abs() < 1e-11,
+                "abs(Normal).sf({x}) = {g:e} but HalfNormal gives {c:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn moments_match_scipy() {
+        // Tolerance 1e-6 relative, and the reason is specific rather than
+        // defensive: these are quadratures of a BASE QUANTILE, so they inherit
+        // `Normal::ppf`'s ~3e-9 rational approximation, and exp(ppf(t)) in
+        // particular grows fast near t = 1 where the rule has fewest nodes. Still
+        // far tighter than a wrong Jacobian, which moves these by percent.
+        for (label, got_mean, got_var, want_mean, want_var) in [
+            (
+                "exp(Normal)",
+                exp_of(Normal::standard()).mean(),
+                exp_of(Normal::standard()).var(),
+                1.648_721_270_700_128e0,
+                4.670_774_270_471_607e0,
+            ),
+            (
+                "abs(Normal)",
+                abs_of(Normal::standard()).mean(),
+                abs_of(Normal::standard()).var(),
+                7.978_845_608_028_653e-1,
+                3.633_802_276_324_187e-1,
+            ),
+            (
+                "abs(Normal(0.7, 1.3))",
+                abs_of(Normal::new(0.7, 1.3)).mean(),
+                abs_of(Normal::new(0.7, 1.3)).var(),
+                1.184_089_942_312_417e0,
+                7.779_310_085_145_781e-1,
+            ),
+            (
+                "log(Uniform(1, 4))",
+                log_of(Uniform::new(1.0, 3.0)).mean(),
+                log_of(Uniform::new(1.0, 3.0)).var(),
+                8.483_924_814_931_875e-1,
+                1.458_613_085_898_641e-1,
+            ),
+        ] {
+            let rm = ((got_mean - want_mean) / want_mean).abs();
+            assert!(
+                rm < 1e-6,
+                "{label}.mean() = {got_mean}, scipy = {want_mean} (rel {rm:e})"
+            );
+            let rv = ((got_var - want_var) / want_var).abs();
+            assert!(
+                rv < 1e-6,
+                "{label}.var() = {got_var}, scipy = {want_var} (rel {rv:e})"
+            );
+        }
+    }
+
+    /// Identities that need no golden and hold for any base.
+    #[test]
+    fn structural_identities() {
+        let base = Normal::new(-0.4, 1.7);
+
+        // log(exp(X)) is X again. Composing the two inverse transforms is the
+        // sharpest check on the pair of Jacobians: they must cancel exactly.
+        let round_trip = log_of(exp_of(base));
+        for x in [-2.0, 0.0, 1.5] {
+            assert!(
+                (round_trip.cdf(x) - base.cdf(x)).abs() < 1e-13,
+                "log(exp(X)).cdf({x}) drifted from the base"
+            );
+            assert!(
+                ((round_trip.pdf(x) - base.pdf(x)) / base.pdf(x)).abs() < 1e-12,
+                "log(exp(X)).pdf({x}) drifted from the base"
+            );
+        }
+
+        // Monotone transforms move the quantile, not the probability.
+        let e = exp_of(base);
+        for p in [0.01, 0.5, 0.99] {
+            assert!(
+                (e.cdf(e.ppf(p)) - p).abs() < 1e-10,
+                "exp(X) ppf/cdf round trip at p={p}"
+            );
+            assert!(
+                (e.sf(e.isf(p)) - p).abs() < 1e-10,
+                "exp(X) isf/sf round trip at p={p}"
+            );
+        }
+
+        // The fold: cdf + sf = 1 with both sides computed independently, and the
+        // total mass of the two halves equals the base's whole mass.
+        let f = abs_of(base);
+        for y in [0.0, 0.5, 2.0, 6.0] {
+            assert!(
+                (f.cdf(y) + f.sf(y) - 1.0).abs() < 1e-12,
+                "abs(X) cdf+sf at {y}"
+            );
+        }
+        // |X| never takes a negative value.
+        assert_eq!(f.pdf(-0.5), 0.0);
+        assert_eq!(f.cdf(-0.5), 0.0);
+        assert_eq!(f.sf(-0.5), 1.0);
+
+        // logs agree with the logs of the values where those are representable.
+        for y in [0.3, 1.0, 3.0] {
+            assert!((f.logpdf(y) - f.pdf(y).ln()).abs() < 1e-10, "abs logpdf");
+            assert!((f.logsf(y) - f.sf(y).ln()).abs() < 1e-10, "abs logsf");
+            assert!((e.logpdf(y) - e.pdf(y).ln()).abs() < 1e-10, "exp logpdf");
+            assert!((e.logcdf(y) - e.cdf(y).ln()).abs() < 1e-10, "exp logcdf");
+        }
+
+        // exp(X) has support (0, inf).
+        assert_eq!(e.pdf(0.0), 0.0);
+        assert_eq!(e.cdf(0.0), 0.0);
+        assert_eq!(e.sf(0.0), 1.0);
+        assert_eq!(e.cdf(-1.0), 0.0);
+        assert!(e.pdf(f64::NAN).is_nan());
+        assert!(f.cdf(f64::NAN).is_nan());
+    }
+
+    /// `log` needs a non-negative support, and says so at construction rather
+    /// than returning NaN later. SciPy raises `NotImplementedError` from
+    /// `X.support()`; `ContinuousDistribution` has no support, so the equivalent
+    /// statement about where the mass is uses `cdf(0)`.
+    #[test]
+    #[should_panic(expected = "non-negative support")]
+    fn log_of_a_two_sided_distribution_panics() {
+        let _ = LogOf::new(Normal::standard());
+    }
+
+    #[test]
+    fn log_accepts_a_distribution_supported_on_the_positive_half_line() {
+        // Uniform(1, 4) starts above zero, so this must NOT panic.
+        let y = log_of(Uniform::new(1.0, 3.0));
+        assert!(y.pdf(0.5) > 0.0);
     }
 }
