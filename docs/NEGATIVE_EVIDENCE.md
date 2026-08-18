@@ -36182,3 +36182,25 @@ and this window was better than described.
 - **NOT ESTABLISHED.** The scanner resolves only names defined exactly once tree-wide and
   cannot see trait dispatch, function pointers, or stored closures; instances may exist
   that it cannot reach. It has no trip counts — "inside a loop" was narrowed to 3 by hand.
+- **2026-08-18, SAME DAY, SELF-AUDIT: WHEN I WROTE "hand-reading all 18" I HAD READ
+  ABOUT FOUR.** The other ~14 I classified from their function names, which is inference
+  presented as inspection — the exact defect this ledger has burned rows on before. I have
+  now actually read all 18. **The conclusion survives unchanged: still 3 kept, still 15
+  dismissed.** Two of the dismissals turn out to rest on better reasons than the ones I
+  assumed, which is why the read was worth doing:
+  - `fsci-fft/src/transforms.rs:848` — I assumed "once per recursion node", which would
+    have been O(n) reads against O(n log n) work and arguably worth a look. Wrong: the
+    load sits inside the `p == n` **large-prime** branch AND is short-circuited behind
+    `largest_prime_factor(n - 1) <= 13 &&`, so the overwhelming majority of recursion
+    nodes never evaluate it at all. Safely negligible, for a different reason.
+  - `fsci-opt/src/minimize.rs:2539` — lexically inside the Cholesky `row`/`column`/`inner`
+    loop nest, which looked per-element. It is a **bailout `return`** taken on a
+    non-finite or non-positive pivot, so it executes at most once per factorization.
+  - Confirmed as originally characterised: `pooled_variance` per GROUP (≥2 groups, each
+    call O(n) over that group); `iterate_structure` per DILATION COUNT;
+    `separable_minmax_filter` per AXIS (ndim); `trust_region_exact_step` a bounded
+    `for _ in 0..60`; `savemat_text` per ARRAY; `cholesky_..._scratch` per PANEL;
+    `symmetric_tridiagonalize_native` per COLUMN against O((n−k)²) work per call;
+    `solve_least_squares` per JACOBIAN.
+  **The number did not move. The warrant for it did**, and only the second version is
+  worth anything.
