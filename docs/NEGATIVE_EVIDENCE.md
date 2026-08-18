@@ -36080,3 +36080,56 @@ measured rather than taken on report: `vmstat` 3s `id=84 wa=0`, `mpstat` 2s
 1429-4115. **The turn's brief reported iowait at 8% with three builds; I measured
 0.00% on both samplers**, so the disk contention had cleared before the run started
 and this window was better than described.
+
+## 2026-08-18 - PeachSummit (cc) - THE TOGGLE-BARRIER DEFECT DOES NOT RECUR: 332 perf-toggle statics, 8 reads inside a loop, 0 of them per-element - the blast radius is the one site already fixed
+
+- **Bead: `frankenscipy-drqu7` (adjacent).** **Result class: BEHAVIORAL (source-structural).**
+  **NO BUILD, NO TIMING** — this is a static property of the source and needs neither.
+  frankenscipy's one build slot was held by an unrelated conformance run throughout.
+  **Probe: `scripts/audit_toggle_reads_in_loops.py`**, `--selftest` **PASS 4/4**.
+  `df -h /data` **62G**. `loadavg` 5.80/8.07/10.30, CPU idle 89%.
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. **No C BLAS/LAPACK/MKL.**
+  Nothing deleted.
+- **WHY THIS WAS WORTH SCANNING FOR.** An earlier row on this cell established that a
+  toggle load placed inside a per-update branch is an **optimisation barrier**, not a
+  cheap load: the surrounding kernel loses specialisation, and hoisting the read to the
+  call boundary and passing a plain `bool` recovered the loss. That is a **static**
+  code shape, so if it recurred anywhere else in the tree it could be found by reading
+  source rather than by spending builds.
+- **THE PROBE HAS BOTH ARMS, which is the only reason the count below is reportable.**
+  `--selftest` carries two **must-hit** cases (a read in a loop; a read in a nested
+  loop, asserting `depth=2`) and two **must-miss** cases: a read **hoisted above** the
+  loop with a `bool` used inside, and a read inside a `#[cfg(test)] mod`. A scanner that
+  matched everything and a scanner that matched nothing would both print a tidy number.
+- **OBSERVED, over `crates/`:** **332 toggle statics** (313 `AtomicBool` + 19
+  `PerfToggle`, across 14 crates); **8 reads lexically inside a loop**; on reading all 8,
+  **0 are inside a per-element loop.**
+
+  | site | verdict |
+  |---|---|
+  | `fsci-cluster/src/lib.rs:7490` `KMEDOIDS_COST_FUSE_DISABLE` | read once per CLUSTER; the M(M−1)/2 pair work is inside the selected arm |
+  | `fsci-ndimage/src/lib.rs:1376` `NDIMAGE_SPLINE_PREFILTER_FORCE_SERIAL` | read once per AXIS to size the thread pool |
+  | `fsci-integrate/src/bdf.rs:741` `BDF_FORCE_DENSE_NEWTON` | read once per STEP; guards the factorization choice |
+  | `fsci-integrate/src/bdf.rs:768` `BDF_FORCE_TEMP_SYSTEM_BUILD` | read once per factorization; the O(n²) build is inside the arm |
+  | `fsci-integrate/src/radau.rs:647` `RADAU_FORCE_DIAGONAL_RESCAN` | read once per STEP |
+  | `fsci-integrate/src/radau.rs:711` `RADAU_FORCE_PER_ITER_ALLOC` | read ONCE **above** `for k in 0..NEWTON_MAXITER`, used as a `bool` inside |
+  | `fsci-odr/src/lib.rs:1000` `ODR_LMSTEP_HOIST_DISABLE` | read once per Jacobian, above the ≤8 damping retries |
+  | `fsci-integrate/src/bin/perf_bdf_diag_newton.rs:126` `AXIS_SYSBUILD` | a perf binary, not shipping code |
+
+- **`radau.rs:711` IS THE CORRECT PATTERN IN THE WILD, not a hit.** `let force_alloc =
+  RADAU_FORCE_PER_ITER_ALLOC.load(...)` sits **above** the Newton loop and is consumed as
+  a plain `bool` inside it — exactly the shape the splu fix converged on, arrived at
+  independently. The scanner flags it only because the *enclosing step* loop is itself a
+  loop; the discriminator that matters is **trip count of the innermost enclosing loop**,
+  not lexical nesting.
+- **SO THE SCAN'S OWN CRITERION IS COARSER THAN THE DEFECT**, and I am recording that
+  rather than papering over it: "inside a loop" over-selects by 8, and every one of the 8
+  had to be read to be cleared. A future tightening would need per-loop trip-count
+  reasoning, which static text cannot supply. The 8:0 ratio is the useful output — the
+  manual pass is cheap at this size and the probe makes it complete.
+- **WHAT THIS ESTABLISHES.** The barrier defect is **bounded to the single splu site
+  already fixed**; there is no second instance waiting in the tree, and no further builds
+  should be spent hunting one. **WHAT IT DOES NOT ESTABLISH:** it says nothing about
+  toggles read once per call in a function that is *itself* called per element — the
+  scanner's scope is lexical, and that shape would pass it while costing the same. No such
+  case was looked for here.
