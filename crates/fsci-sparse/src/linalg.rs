@@ -7540,9 +7540,71 @@ pub fn lsqr(
 ///
 /// See `scipy_default_iteration_limits` below for the faithful values and why the
 /// flip has not been made yet.
+/// LSMR for the plain least-squares problem, `min ||Ax - b||`.
+///
+/// Equivalent to `lsmr_damped(a, b, 0.0, options)`, and BIT-FOR-BIT what this
+/// function computed before `damp` existed: at `damp = 0` the regularizing rotation
+/// is the identity, so no term in the recurrence changes value.
 pub fn lsmr(
     a: &CsrMatrix,
     b: &[f64],
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    lsmr_impl(a, b, 0.0, options)
+}
+
+/// LSMR with Tikhonov regularization — `scipy.sparse.linalg.lsmr(A, b, damp=...)`.
+///
+/// Solves the damped least-squares problem
+///
+///     min || [ A      ] x - [ b ] ||
+///         || [ damp*I ]     [ 0 ] ||₂
+///
+/// which is the regularized normal equations `(AᵀA + damp²I) x = Aᵀb`. A positive
+/// `damp` makes the system nonsingular even when `A` is rank-deficient, which is the
+/// reason to reach for it: the undamped solve on a rank-deficient `A` has no unique
+/// answer, and LSMR converges to whichever one the iteration lands on.
+///
+/// WHY THIS IS A SEPARATE FUNCTION rather than a field on `IterativeSolveOptions`.
+/// That struct is shared by all eleven iterative solvers and is constructed with
+/// FULL literals at 82 sites against only 10 uses of `..Default::default()`, so a new
+/// field would be a compile error at roughly seventy call sites — a change that
+/// cannot be validated under a build freeze and that would land in several crates at
+/// once. `damp` is also meaningless for the nine Krylov solvers, which do not accept
+/// it in SciPy either. An additive function costs nothing and breaks nothing.
+///
+/// TWO DELIBERATE DIFFERENCES FROM SciPy, stated rather than left to be discovered:
+///
+/// * `residual_norm` stays the relative residual of the ORIGINAL system,
+///   `||Ax - b|| / ||b||`, because that is what the field means for every solver in
+///   this crate. SciPy's `normr` is the residual of the AUGMENTED system and so
+///   includes the `damp*x` block; the two agree only at `damp = 0`.
+/// * `damp` is not validated against being negative. `damp` enters only as
+///   `damp²` through a Givens rotation, so a negative value behaves exactly as its
+///   absolute value rather than doing something undefined; rejecting it would be a
+///   stricter contract than the incumbent's, which does not check either.
+///
+/// A non-finite `damp` IS rejected, since that would poison the rotation and
+/// propagate NaN into every subsequent iterate — the same reason
+/// `validate_iterative_finite_inputs` exists for `a` and `b`.
+pub fn lsmr_damped(
+    a: &CsrMatrix,
+    b: &[f64],
+    damp: f64,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    if !damp.is_finite() {
+        return Err(SparseError::NonFiniteInput {
+            message: format!("lsmr damp must be finite, got {damp}"),
+        });
+    }
+    lsmr_impl(a, b, damp, options)
+}
+
+fn lsmr_impl(
+    a: &CsrMatrix,
+    b: &[f64],
+    damp: f64,
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
     let shape = a.shape();
@@ -7641,7 +7703,13 @@ pub fn lsmr(
             }
         }
 
-        let (c_hat, s_hat, alpha_hat) = symmetric_orthogonalization(alpha_bar, 0.0);
+        // Qhat_{k,2k+1}: this is where SciPy passes `damp`
+        // (`_isolve/lsmr.py:344`, `_sym_ortho(alphabar, damp)`). With damp = 0 the
+        // rotation is the identity — `c_hat = 1`, `s_hat = 0` — so `beta_check`
+        // below is exactly zero and the regularization term drops out of the
+        // residual recurrence without a branch. That is why the undamped path is
+        // bit-for-bit what it was before `damp` existed.
+        let (c_hat, s_hat, alpha_hat) = symmetric_orthogonalization(alpha_bar, damp);
         let rho_old = rho;
         let (c, s, next_rho) = symmetric_orthogonalization(alpha_hat, beta);
         rho = next_rho;
@@ -26029,5 +26097,138 @@ mod scipy_default_iteration_limits {
         // half that is correct — otherwise a reader could take the file as saying
         // every default is wrong.
         assert_eq!(scipy_krylov(37), 370);
+    }
+}
+
+/// Tikhonov-regularized LSMR — `scipy.sparse.linalg.lsmr(A, b, damp=...)`.
+#[cfg(test)]
+mod lsmr_damp_tests {
+    use super::{
+        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsmr, lsmr_damped,
+    };
+
+    /// A rank-deficient 3x2: both columns identical, so `AᵀA` is singular and the
+    /// UNDAMPED problem has no unique minimizer. This is the case `damp` exists for.
+    fn rank_deficient() -> (CsrMatrix, Vec<f64>) {
+        // Built the way the existing lsmr tests in this file build theirs: COO
+        // triplets then `to_csr`. All six entries are 1.0, so both columns are
+        // identical and `AᵀA` is singular.
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 2),
+            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            vec![0, 0, 1, 1, 2, 2],
+            vec![0, 1, 0, 1, 0, 1],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        (a, vec![1.0, 2.0, 3.0])
+    }
+
+    fn opts() -> IterativeSolveOptions {
+        IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(200),
+            ..IterativeSolveOptions::default()
+        }
+    }
+
+    /// MUST-MISS: at `damp = 0` the damped entry point is the undamped one,
+    /// BIT FOR BIT. The regularizing rotation is the identity there, so no term in
+    /// the recurrence takes a different value — not "agrees to tolerance", the same
+    /// bits. If this ever fails, adding `damp` changed the existing path, which is
+    /// the one thing the refactor was required not to do.
+    #[test]
+    fn damp_zero_is_bit_identical_to_plain_lsmr() {
+        let (a, b) = rank_deficient();
+        let plain = lsmr(&a, &b, opts()).expect("plain lsmr");
+        let damped = lsmr_damped(&a, &b, 0.0, opts()).expect("damp=0");
+        assert_eq!(
+            plain.solution.len(),
+            damped.solution.len(),
+            "solution lengths differ"
+        );
+        for (i, (x, y)) in plain.solution.iter().zip(&damped.solution).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "component {i} differs at damp=0: {x} vs {y}"
+            );
+        }
+        assert_eq!(plain.iterations, damped.iterations, "iteration counts differ");
+        assert_eq!(
+            plain.residual_norm.to_bits(),
+            damped.residual_norm.to_bits(),
+            "residual norms differ at damp=0"
+        );
+    }
+
+    /// MUST-HIT: damping actually regularizes. For the singular fixture the damped
+    /// normal equations `(AᵀA + damp²I) x = Aᵀb` have the unique minimum-norm-ish
+    /// solution, and the defining check is that residual, not a stored constant:
+    /// the returned `x` must satisfy those equations.
+    #[test]
+    fn a_positive_damp_solves_the_regularized_normal_equations() {
+        let (a, b) = rank_deficient();
+        let damp = 0.5_f64;
+        let r = lsmr_damped(&a, &b, damp, opts()).expect("damped lsmr");
+        assert_eq!(r.solution.len(), 2);
+        assert!(
+            r.solution.iter().all(|v| v.is_finite()),
+            "damped solve produced non-finite components: {:?}",
+            r.solution
+        );
+
+        // (AᵀA + damp²I) x - Aᵀb, computed densely from the fixture.
+        let dense = [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
+        let x = &r.solution;
+        let mut worst = 0.0_f64;
+        for j in 0..2 {
+            let mut lhs = damp * damp * x[j];
+            for k in 0..2 {
+                let ata: f64 = (0..3).map(|i| dense[i][j] * dense[i][k]).sum();
+                lhs += ata * x[k];
+            }
+            let atb: f64 = (0..3).map(|i| dense[i][j] * b[i]).sum();
+            worst = worst.max((lhs - atb).abs());
+        }
+        assert!(
+            worst < 1e-8,
+            "damped solution violates (AᵀA + damp²I)x = Aᵀb by {worst}; x = {x:?}"
+        );
+
+        // And it must differ from the undamped answer, or the parameter did nothing.
+        let plain = lsmr(&a, &b, opts()).expect("plain lsmr");
+        let moved: f64 = plain
+            .solution
+            .iter()
+            .zip(x)
+            .map(|(p, d)| (p - d).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            moved > 1e-6,
+            "damp=0.5 produced the same solution as damp=0 (max component change \
+             {moved}); the parameter is not reaching the iteration"
+        );
+    }
+
+    /// A non-finite `damp` is rejected rather than poisoning the rotation and
+    /// propagating NaN into every subsequent iterate.
+    #[test]
+    fn a_non_finite_damp_is_rejected() {
+        let (a, b) = rank_deficient();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                matches!(
+                    lsmr_damped(&a, &b, bad, opts()),
+                    Err(SparseError::NonFiniteInput { .. })
+                ),
+                "damp = {bad} was accepted"
+            );
+        }
+        // MUST-MISS: an ordinary damp is NOT rejected, or the guard would be
+        // satisfying the test above by refusing everything.
+        assert!(lsmr_damped(&a, &b, 0.25, opts()).is_ok(), "0.25 was rejected");
     }
 }
