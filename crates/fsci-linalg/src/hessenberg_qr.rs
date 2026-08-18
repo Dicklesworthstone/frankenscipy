@@ -91,6 +91,19 @@ impl Mat {
     fn add(&mut self, i: usize, j: usize, v: f64) {
         self.d[i * self.n + j] += v;
     }
+
+    fn identity(n: usize) -> Self {
+        let mut d = vec![0.0; n * n];
+        for i in 0..n {
+            d[i * n + i] = 1.0;
+        }
+        Self { n, d }
+    }
+
+    fn into_rows(self) -> Vec<Vec<f64>> {
+        let n = self.n;
+        self.d.chunks(n).map(<[f64]>::to_vec).collect()
+    }
 }
 
 /// Reduce to upper Hessenberg form by Householder similarity.
@@ -99,7 +112,7 @@ impl Mat {
 /// reflector applied from the LEFT to rows `k+1..n` and from the RIGHT to columns
 /// `k+1..n`. Applying both sides keeps the transform a similarity, so the spectrum
 /// is preserved exactly — which is the only property the eigenvalue path needs.
-fn to_hessenberg(h: &mut Mat) {
+fn to_hessenberg(h: &mut Mat, z: &mut Mat) {
     let n = h.n;
     if n < 3 {
         return;
@@ -155,6 +168,23 @@ fn to_hessenberg(h: &mut Mat) {
                 h.add(i, j, -f * v[j]);
             }
         }
+        // Accumulate the same reflector into the basis. `A = Q T Q^T` with `Q` the
+        // product of every reflector applied on the left, so `Q` is built by
+        // applying each one to `Z` FROM THE RIGHT. Getting this side wrong yields a
+        // `Z` that is still orthogonal and still passes a `Z^T Z = I` check while
+        // being the transpose of the basis the caller needs -- which is why the
+        // test asserts the reconstruction `Z T Z^T = A`, not orthogonality alone.
+        for i in 0..n {
+            let mut dot = 0.0;
+            for j in k + 1..n {
+                dot += z.get(i, j) * v[j];
+            }
+            let f = two_over * dot;
+            for j in k + 1..n {
+                z.add(i, j, -f * v[j]);
+            }
+        }
+
         // The annihilated entries are set exactly rather than left as rounding
         // residue, so the deflation test below sees clean structural zeros.
         h.set(k + 1, k, beta);
@@ -218,21 +248,42 @@ pub(crate) fn eigenvalues_francis(
     eps: f64,
     max_sweeps_per_eigenvalue: usize,
 ) -> Result<Vec<Eigenvalue>, LinalgError> {
+    Ok(real_schur_francis(a, eps, max_sweeps_per_eigenvalue)?.0)
+}
+
+/// Real Schur decomposition `A = Z T Z^T` by the same iteration.
+///
+/// Returns `(eigenvalues, T, Z)` with `T` quasi-triangular (1x1 and 2x2 diagonal
+/// blocks) and `Z` orthogonal, both row-major.
+///
+/// WHY THIS SHAPE. `eig` already has working, tested eigenvector back-substitution
+/// downstream of `schur.unpack()`. Producing the same `(Z, T)` pair makes this a
+/// DROP-IN for `bounded_schur` and reuses that code, instead of reimplementing
+/// LAPACK `dtrevc` alongside it. Less new surface is the point: the sez4r defect is
+/// in the iteration, not in the back-substitution, so the back-substitution should
+/// not be rewritten to fix it.
+pub(crate) fn real_schur_francis(
+    a: &[Vec<f64>],
+    eps: f64,
+    max_sweeps_per_eigenvalue: usize,
+) -> Result<(Vec<Eigenvalue>, Vec<Vec<f64>>, Vec<Vec<f64>>), LinalgError> {
     let n = a.len();
     let mut out = vec![Eigenvalue { re: 0.0, im: 0.0 }; n];
     if n == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new(), Vec::new()));
     }
     if n == 1 {
         out[0] = Eigenvalue {
             re: a[0][0],
             im: 0.0,
         };
-        return Ok(out);
+        return Ok((out, vec![vec![a[0][0]]], vec![vec![1.0]]));
     }
 
+    let n_full = n;
     let mut h = Mat::from_rows(a);
-    to_hessenberg(&mut h);
+    let mut z = Mat::identity(n);
+    to_hessenberg(&mut h, &mut z);
 
     // `ihi` is the inclusive high index of the active block. Deflation shrinks it
     // from the bottom, which is the direction the subdiagonal test scans.
@@ -382,6 +433,20 @@ pub(crate) fn eigenvalues_francis(
                             h.add(i, cj, -f * vj);
                         }
                     }
+                    // Same reflector into the basis, from the right, over ALL rows
+                    // -- `Z` has no active window, since every row of the basis is
+                    // touched by every sweep even when `H`'s active block has
+                    // shrunk to the bottom corner.
+                    for i in 0..n_full {
+                        let mut dot = 0.0;
+                        for (vj, &cj) in v.iter().zip(rows.iter()) {
+                            dot += z.get(i, cj) * vj;
+                        }
+                        let f = two_over * dot;
+                        for (vj, &cj) in v.iter().zip(rows.iter()) {
+                            z.add(i, cj, -f * vj);
+                        }
+                    }
                 }
             }
             // Recompute the bulge for the next position from the updated matrix.
@@ -396,7 +461,7 @@ pub(crate) fn eigenvalues_francis(
         total += 1;
     }
 
-    Ok(out)
+    Ok((out, h.into_rows(), z.into_rows()))
 }
 
 #[cfg(test)]
@@ -539,5 +604,86 @@ mod tests {
         // Reaching this line at all is the termination assertion: the pre-fix
         // behaviour was an infinite loop, which no assertion can catch because the
         // test never returns to evaluate one.
+    }
+
+    /// THE STRONG CHECK ON THE BASIS: `Z T Z^T` must reconstruct `A`.
+    ///
+    /// Orthogonality alone (`Z^T Z = I`) is NOT sufficient and would pass on a
+    /// transposed basis, which is the easiest way to get the accumulation side
+    /// wrong -- each reflector has to be applied to `Z` from the RIGHT because `Q`
+    /// is the product of the reflectors applied to `H` from the left. A transposed
+    /// `Z` is still perfectly orthogonal and still has the right eigenvalues on
+    /// `T`'s diagonal, so only reconstruction catches it.
+    ///
+    /// It also checks `T`'s structure: everything below the first subdiagonal must
+    /// be zero, and a non-zero subdiagonal entry may only belong to a 2x2 block,
+    /// never to two adjacent ones.
+    #[test]
+    fn schur_pair_reconstructs_the_original_matrix() {
+        for (n, seed) in [(5usize, 201u64), (6, 319), (5, 0), (8, 42)] {
+            let a = make_diag_dominant(n, seed);
+            let (_eigs, t, z) = super::real_schur_francis(&a, f64::EPSILON, budget())
+                .unwrap_or_else(|e| panic!("({n},{seed}) did not converge: {e:?}"));
+            assert_eq!(t.len(), n);
+            assert_eq!(z.len(), n);
+
+            // Z orthogonal.
+            for i in 0..n {
+                for j in 0..n {
+                    let dot: f64 = (0..n).map(|k| z[k][i] * z[k][j]).sum();
+                    let want = if i == j { 1.0 } else { 0.0 };
+                    assert!(
+                        (dot - want).abs() < 1e-9,
+                        "({n},{seed}) Z is not orthogonal at ({i},{j}): {dot}"
+                    );
+                }
+            }
+
+            // Z T Z^T == A, entrywise. This is what a transposed basis fails.
+            let mut zt = vec![vec![0.0f64; n]; n];
+            for i in 0..n {
+                for j in 0..n {
+                    zt[i][j] = (0..n).map(|k| z[i][k] * t[k][j]).sum();
+                }
+            }
+            let mut recon = vec![vec![0.0f64; n]; n];
+            for i in 0..n {
+                for j in 0..n {
+                    recon[i][j] = (0..n).map(|k| zt[i][k] * z[j][k]).sum();
+                }
+            }
+            let scale: f64 = a.iter().flatten().fold(0.0f64, |m, v| m.max(v.abs()));
+            for i in 0..n {
+                for j in 0..n {
+                    assert!(
+                        (recon[i][j] - a[i][j]).abs() < 1e-9 * (scale + 1.0),
+                        "({n},{seed}) Z T Z^T != A at ({i},{j}): {} vs {}",
+                        recon[i][j],
+                        a[i][j]
+                    );
+                }
+            }
+
+            // T is quasi-triangular: nothing below the first subdiagonal, and no
+            // two ADJACENT non-zero subdiagonal entries (that would be a 3x3 block,
+            // which the real Schur form does not have).
+            for i in 0..n {
+                for j in 0..i.saturating_sub(1) {
+                    assert!(
+                        t[i][j].abs() < 1e-9 * (scale + 1.0),
+                        "({n},{seed}) T has a non-zero below the subdiagonal at ({i},{j})"
+                    );
+                }
+            }
+            for i in 2..n {
+                let a1 = t[i][i - 1].abs() > 1e-9 * (scale + 1.0);
+                let a2 = t[i - 1][i - 2].abs() > 1e-9 * (scale + 1.0);
+                assert!(
+                    !(a1 && a2),
+                    "({n},{seed}) T has adjacent non-zero subdiagonals at {i}, i.e. a \
+                     3x3 block, which the real Schur form cannot contain"
+                );
+            }
+        }
     }
 }
