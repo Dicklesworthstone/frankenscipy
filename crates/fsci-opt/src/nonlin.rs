@@ -1135,7 +1135,12 @@ where
     let gamma = 0.9;
     let eta_max = 0.9999;
     let eta_threshold = 0.1;
-    let mut eta = 1e-3;
+    // Annotated because `eta.min(..)` below is a method call on the inference
+    // variable, and method resolution runs before the later `eta = eta_max.min(
+    // eta_a)` could unify it with f64 (E0689). f64 is not a choice here: `tol`
+    // feeds `newton_direction(&[f64], rtol: f64)` and `eta_a` is computed from
+    // `fx_norm`, so every other constraint on this value is already f64.
+    let mut eta: f64 = 1e-3;
 
     let mut iterations = 0usize;
     let mut success = false;

@@ -25,12 +25,25 @@ pub use minimize::{
     minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit, nelder_mead,
     newton_cg, powell, select_minimize_method, trust_exact,
 };
+// NOTE on the two `anderson` functions, resolved conservatively rather than by
+// picking a winner. `root::anderson(func, x0, tol, maxiter, m, beta) ->
+// Result<MultivariateRootResult, OptError>` predates the nonlin family;
+// `nonlin::anderson(func, x0, options: NonlinOptions) -> NonlinResult` arrived
+// with 642079dc4 and collided with it at this glob (E0252), which left the
+// crate uncompilable and -- because HFDT takes fsci-stats as a PATH dependency
+// -- red-lined the entire hedge_fund_data_tool workspace.
+//
+// Dropping either from the public surface is a breaking API decision that
+// belongs to this crate's author, so neither is dropped: the pre-existing
+// unqualified name is left alone and the newcomer is re-exported as
+// `anderson_nonlin`. Rename it freely; the point of this edit is only that a
+// crate which does not build is strictly worse than either naming.
 pub use nonlin::{
     AndersonJacobian, BroydenJacobian, BroydenVariant, DiagBroydenJacobian,
     ExcitingMixingJacobian, InnerMethod, InverseJacobian, Jacobian, KrylovJacobian,
     LineSearch, LinearMixingJacobian, LowRankMatrix, NonlinJacobian, NonlinOptions,
-    NonlinResult, ReductionMethod, anderson, broyden1_lowrank, broyden2_lowrank,
-    diag_broyden, exciting_mixing, linear_mixing, nonlin_solve,
+    NonlinResult, ReductionMethod, anderson as anderson_nonlin, broyden1_lowrank,
+    broyden2_lowrank, diag_broyden, exciting_mixing, linear_mixing, nonlin_solve,
 };
 pub use root::{
     MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult,
