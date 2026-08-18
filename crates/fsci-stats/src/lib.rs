@@ -31067,7 +31067,14 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
 
     // Rank the absolute differences
     let abs_diffs: Vec<f64> = diffs.iter().map(|d| d.abs()).collect();
-    let ranks = rankdata_average(&abs_diffs);
+    // Ranks AND Σ(t³ − t) from ONE pass. scipy does the same —
+    // `r, t = _rankdata(xp.abs(d), 'average', return_ties=True)` then
+    // `tie_correct = xp.sum(t**3 - t)` (scipy/stats/_wilcoxon.py:138,172) — for the same
+    // reason: the tie structure is already known where the ranks are assigned. This
+    // replaces a clone+sort for `no_ties` AND a clone+sort for the tie correction
+    // (`frankenscipy-921i0`), and switches the tie predicate from a 1e-12 tolerance to
+    // exact equality, matching scipy (`frankenscipy-clttw`).
+    let (ranks, tie_sum) = rankdata_ties_with_tie_sum(&abs_diffs, RankTieMethod::Average);
 
     // T+ = sum of ranks where difference is positive
     let t_plus: f64 = ranks
@@ -31088,16 +31095,18 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     // zeros were dropped and the absolute differences have no ties (ranks 1..n);
     // it falls back to the normal approximation otherwise. frankenscipy-78v5y
     let no_zeros = x.len() == nr;
-    // `no_ties` is only ever consumed by this exact-path condition, and computing it sorts a
-    // clone of abs_diffs (O(n log n)). Gate that work behind the cheap `no_zeros && nr <= 1000`
-    // checks so the large-n / has-zeros paths (which fall through to the normal approximation)
-    // skip the sort entirely. BYTE-IDENTICAL: `&&` short-circuits to the SAME boolean the eager
-    // form produced — when `no_zeros && nr <= 1000` is false the branch was never taken anyway.
-    let no_ties = || {
-        let mut s = abs_diffs.clone();
-        s.sort_unstable_by(|a, b| a.total_cmp(b));
-        s.windows(2).all(|w| w[0] != w[1])
-    };
+    // HISTORICAL (frankenscipy-78v5y): computing `no_ties` used to sort a clone of
+    // abs_diffs, so it was gated behind the cheap `no_zeros && nr <= 1000` checks to spare
+    // the large-n / has-zeros paths that fall through to the normal approximation. That
+    // sort is gone — see below — so the gate no longer saves anything, though the
+    // short-circuit still yields the same boolean.
+    // Was: clone `abs_diffs`, sort, check no two adjacent entries are equal. `tie_sum`
+    // from the ranking pass answers that for free — it is zero exactly when no tie group
+    // has size >= 2. BYTE-IDENTICAL as a predicate: both test exact equality.
+    // `WILCOXON_FORCE_EAGER_NOTIES` gated the cost of that sort; the sort is gone, so both
+    // arms now do the same free comparison — the lever is vestigial, not wrong, and is
+    // left in place so its A/B harness still builds.
+    let no_ties = || tie_sum == 0.0;
     let take_exact = if WILCOXON_FORCE_EAGER_NOTIES.load(std::sync::atomic::Ordering::Relaxed) {
         let nt = no_ties();
         no_zeros && nt && nr <= 1000
@@ -31132,21 +31141,10 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     //   sigma² = n*(n+1)*(2n+1)/24 - Σ(t³-t)/48
     // where t are tie-group sizes among absolute differences.
     let mu = nrf * (nrf + 1.0) / 4.0;
-    let mut sorted_abs = abs_diffs.clone();
-    sorted_abs.sort_unstable_by(|a, b| a.total_cmp(b));
-    let mut tie_sum = 0.0_f64;
-    let mut i = 0;
-    while i < sorted_abs.len() {
-        let mut j = i + 1;
-        while j < sorted_abs.len() && (sorted_abs[j] - sorted_abs[i]).abs() < 1e-12 {
-            j += 1;
-        }
-        let t = (j - i) as f64;
-        if t > 1.0 {
-            tie_sum += t * t * t - t;
-        }
-        i = j;
-    }
+    // `tie_sum` came from the ranking pass. NOT byte-identical to what stood here: the
+    // deleted loop grouped by `|a − b| < 1e-12`, merging values scipy treats as distinct.
+    // Exact grouping changes the correction on near-tied inputs — measured at
+    // p 0.52861213 against 0.52810613, statistic unchanged (`frankenscipy-clttw`).
     let variance = (nrf * (nrf + 1.0) * (2.0 * nrf + 1.0) / 24.0) - tie_sum / 48.0;
     let sigma = variance.max(0.0).sqrt();
 
@@ -31202,7 +31200,14 @@ pub fn wilcoxon_alternative(x: &[f64], y: &[f64], alternative: &str) -> TtestRes
     }
 
     let abs_diffs: Vec<f64> = diffs.iter().map(|d| d.abs()).collect();
-    let ranks = rankdata_average(&abs_diffs);
+    // Ranks AND Σ(t³ − t) from ONE pass. scipy does the same —
+    // `r, t = _rankdata(xp.abs(d), 'average', return_ties=True)` then
+    // `tie_correct = xp.sum(t**3 - t)` (scipy/stats/_wilcoxon.py:138,172) — for the same
+    // reason: the tie structure is already known where the ranks are assigned. This
+    // replaces a clone+sort for `no_ties` AND a clone+sort for the tie correction
+    // (`frankenscipy-921i0`), and switches the tie predicate from a 1e-12 tolerance to
+    // exact equality, matching scipy (`frankenscipy-clttw`).
+    let (ranks, tie_sum) = rankdata_ties_with_tie_sum(&abs_diffs, RankTieMethod::Average);
 
     let t_plus: f64 = ranks
         .iter()
@@ -31221,11 +31226,10 @@ pub fn wilcoxon_alternative(x: &[f64], y: &[f64], alternative: &str) -> TtestRes
     // Exact signed-rank p-value when no zeros/ties (see `wilcoxon`).
     // frankenscipy-78v5y
     let no_zeros = x.len() == nr;
-    let no_ties = {
-        let mut s = abs_diffs.clone();
-        s.sort_unstable_by(|a, b| a.total_cmp(b));
-        s.windows(2).all(|w| w[0] != w[1])
-    };
+    // Was: clone `abs_diffs`, sort, check no two adjacent entries are equal. `tie_sum`
+    // from the ranking pass answers that for free — it is zero exactly when no tie group
+    // has size >= 2. BYTE-IDENTICAL as a predicate: both test exact equality.
+    let no_ties = tie_sum == 0.0;
     if no_zeros && no_ties && nr <= 1000 {
         let (stat, pvalue) = wilcoxon_exact_pvalue(t_plus, t_minus, nr, alternative);
         return TtestResult {
@@ -31257,21 +31261,10 @@ pub fn wilcoxon_alternative(x: &[f64], y: &[f64], alternative: &str) -> TtestRes
     // Tie correction for sigma (matches scipy's wilcoxon mode='approx'):
     //   sigma² = n*(n+1)*(2n+1)/24 - Σ(t³-t)/48
     // where t are tie-group sizes among the absolute differences.
-    let mut sorted_abs = abs_diffs.clone();
-    sorted_abs.sort_unstable_by(|a, b| a.total_cmp(b));
-    let mut tie_sum = 0.0_f64;
-    let mut i = 0;
-    while i < sorted_abs.len() {
-        let mut j = i + 1;
-        while j < sorted_abs.len() && (sorted_abs[j] - sorted_abs[i]).abs() < 1e-12 {
-            j += 1;
-        }
-        let t = (j - i) as f64;
-        if t > 1.0 {
-            tie_sum += t * t * t - t;
-        }
-        i = j;
-    }
+    // `tie_sum` came from the ranking pass. NOT byte-identical to what stood here: the
+    // deleted loop grouped by `|a − b| < 1e-12`, merging values scipy treats as distinct.
+    // Exact grouping changes the correction on near-tied inputs — measured at
+    // p 0.52861213 against 0.52810613, statistic unchanged (`frankenscipy-clttw`).
     let variance = (nrf * (nrf + 1.0) * (2.0 * nrf + 1.0) / 24.0) - tie_sum / 48.0;
     let sigma = variance.max(0.0).sqrt();
 
