@@ -1731,6 +1731,9 @@ impl SplineFlags {
     }
 }
 
+// Eighth parameter is the once-resolved compact-support knob, forwarded rather than
+// re-loaded per tap (`frankenscipy-22van`).
+#[allow(clippy::too_many_arguments)]
 fn compute_axis_support(
     coord: f64,
     coeff_len: usize,
@@ -1914,6 +1917,12 @@ fn compute_axis_support(
     true
 }
 
+// Eight parameters because the geometry (input, coeffs, coords, offsets, order, mode,
+// cval) is the sampler's specification and the eighth is the once-resolved knob pair
+// (`frankenscipy-22van`). Bundling the geometry into a struct would hide at the call site
+// exactly the arguments a reader needs to see, which is the reasoning already recorded on
+// `build_axis_offset_supports`.
+#[allow(clippy::too_many_arguments)]
 fn sample_interpolated(
     input: &NdArray,
     coeffs: &NdArray,
