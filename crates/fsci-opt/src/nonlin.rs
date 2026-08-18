@@ -121,6 +121,19 @@ pub enum ReductionMethod {
     Restart,
     /// Drop the oldest stored vectors until the cap is met.
     Simple,
+    /// Keep only the most significant SVD components -- the "Broyden Rank Reduction
+    /// Inverse" of Van der Rotten's thesis.
+    ///
+    /// The other two policies choose by AGE, which is a proxy for relevance and not a
+    /// good one: the oldest stored direction may still carry the largest part of the
+    /// operator. This one chooses by singular value, so what is discarded is the part
+    /// of the update that contributes least, measured rather than guessed.
+    ///
+    /// `to_retain` defaults to `max_rank - 2`, as in SciPy.
+    Svd {
+        /// How many components survive a reduction.
+        to_retain: Option<usize>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -367,6 +380,243 @@ impl LowRankMatrix {
             self.ds.remove(0);
         }
     }
+
+    /// Retain only the `to_retain` most significant SVD components
+    /// -- `LowRankMatrix.svd_reduce`, the Van der Rotten limited-memory Broyden update.
+    ///
+    /// # The decomposition is of an m-sized problem, not an n-sized one
+    ///
+    /// Naively this asks for the SVD of an `n x m` matrix, which for large `n` is
+    /// exactly the cost the low-rank representation exists to avoid. It is not needed.
+    /// Take the economic QR `D = Q R`; then
+    ///
+    /// ```text
+    ///     C D^T = (C R^T) Q^T
+    /// ```
+    ///
+    /// so the operator is unchanged by replacing `C` with `C R^T` and `D` with `Q`.
+    /// The remaining SVD is of `C R^T`, and since `Q` has orthonormal columns, the
+    /// singular values wanted are those of an `m x m` problem. Every dense step is
+    /// sized by the retained rank.
+    ///
+    /// # Why the rotation needs no explicit inverse
+    ///
+    /// SciPy computes `C <- C inv(W^H)` and `D <- D W`. Written with a ONE-SIDED Jacobi
+    /// SVD the inverse disappears: the method returns the already-rotated `C V = U S`
+    /// directly, and `V` is orthogonal so `inv(V^T) = V`. Both updates become a right
+    /// multiplication by `V`, and no inverse of a possibly ill-conditioned factor is
+    /// ever formed.
+    ///
+    /// The columns are then ordered by singular value and truncated, so what is dropped
+    /// is the smallest part of the operator in the Frobenius norm.
+    pub fn svd_reduce(&mut self, max_rank: usize, to_retain: Option<usize>) {
+        if self.collapsed.is_some() || self.cs.is_empty() {
+            return;
+        }
+        // SciPy's bookkeeping: p caps at the dimension, q defaults to p - 2 and is
+        // clamped below p so a reduction always removes at least one component.
+        let mut p = max_rank;
+        let mut q = to_retain.unwrap_or_else(|| p.saturating_sub(2));
+        p = p.min(self.cs[0].len());
+        q = q.min(p.saturating_sub(1));
+        let m = self.cs.len();
+        if m < p {
+            // Below the cap there is nothing to do; reducing here would discard
+            // information the caller still has room for.
+            return;
+        }
+        if q == 0 {
+            self.cs.clear();
+            self.ds.clear();
+            return;
+        }
+
+        let (qm, r) = economic_qr(&self.ds);
+        // C1 = C R^T, i.e. column j of C1 is sum_k C[:, k] * R[j][k].
+        let n = self.cs[0].len();
+        let mut c1: Vec<Vec<f64>> = Vec::with_capacity(m);
+        for j in 0..m {
+            let mut col = vec![0.0; n];
+            for k in j..m {
+                let rjk = r[j][k];
+                if rjk != 0.0 {
+                    for (ci, ck) in col.iter_mut().zip(&self.cs[k]) {
+                        *ci += rjk * ck;
+                    }
+                }
+            }
+            c1.push(col);
+        }
+
+        let v = one_sided_jacobi(&mut c1);
+        // D2 = Q V.
+        let mut d2: Vec<Vec<f64>> = Vec::with_capacity(m);
+        for j in 0..m {
+            let mut col = vec![0.0; n];
+            for k in 0..m {
+                // `v[j]` is COLUMN j of V, so `v[j][k]` is `V[k][j]` -- the entry that
+                // multiplies Q's k-th column when forming `D2 = Q V`. Indexing this the
+                // other way round yields `Q V^T`, which is orthogonal, plausible, and
+                // silently changes the operator.
+                let vkj = v[j][k];
+                if vkj != 0.0 {
+                    for (di, qk) in col.iter_mut().zip(&qm[k]) {
+                        *di += vkj * qk;
+                    }
+                }
+            }
+            d2.push(col);
+        }
+
+        c1.truncate(q);
+        d2.truncate(q);
+        self.cs = c1;
+        self.ds = d2;
+    }
+}
+
+/// Economic QR of the matrix whose COLUMNS are `cols`, by modified Gram-Schmidt with
+/// one reorthogonalisation pass.
+///
+/// Returns `(q_cols, r)` with `r[i][j]` the upper-triangular factor, satisfying
+/// `A = Q R`. Reorthogonalising once is the standard "twice is enough" remedy: plain
+/// modified Gram-Schmidt loses orthogonality in proportion to the condition number, and
+/// Broyden directions become nearly dependent exactly when a reduction is due, which is
+/// the worst case for it.
+///
+/// A column that is annihilated by the projection leaves a zero on the diagonal and a
+/// zero `Q` column. That is deliberate: `A = Q R` still holds, so the caller's
+/// `C R^T Q^T = C A^T` identity survives a rank-deficient input rather than the routine
+/// having to reject it.
+fn economic_qr(cols: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let m = cols.len();
+    let n = if m == 0 { 0 } else { cols[0].len() };
+    let mut q: Vec<Vec<f64>> = Vec::with_capacity(m);
+    let mut r = vec![vec![0.0; m]; m];
+
+    for j in 0..m {
+        let mut v = cols[j].clone();
+        for _pass in 0..2 {
+            for i in 0..j {
+                let proj: f64 = q[i].iter().zip(&v).map(|(a, b)| a * b).sum();
+                if proj != 0.0 {
+                    r[i][j] += proj;
+                    for (vi, qi) in v.iter_mut().zip(&q[i]) {
+                        *vi -= proj * qi;
+                    }
+                }
+            }
+        }
+        let nrm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        r[j][j] = nrm;
+        if nrm > 0.0 && nrm.is_finite() {
+            for vi in v.iter_mut() {
+                *vi /= nrm;
+            }
+            q.push(v);
+        } else {
+            q.push(vec![0.0; n]);
+        }
+    }
+    (q, r)
+}
+
+/// One-sided Jacobi SVD of the matrix whose COLUMNS are `a`, rotating `a` IN PLACE.
+///
+/// On return `a` holds `A V` -- that is, `u_i * s_i` in each column, ordered by
+/// descending singular value -- and the returned value holds the columns of the
+/// orthogonal `V`, so that `A = U S V^T`.
+///
+/// One-sided Jacobi is chosen over a bidiagonalisation here for two reasons: it is a
+/// few dozen lines of safe Rust with no BLAS behind it, and it computes small singular
+/// values to high RELATIVE accuracy, which is the property that matters when the whole
+/// purpose is to decide which components are small enough to discard.
+fn one_sided_jacobi(a: &mut [Vec<f64>]) -> Vec<Vec<f64>> {
+    let m = a.len();
+    let mut v: Vec<Vec<f64>> = (0..m)
+        .map(|i| {
+            let mut col = vec![0.0; m];
+            col[i] = 1.0;
+            col
+        })
+        .collect();
+    if m < 2 {
+        sort_by_column_norm(a, &mut v);
+        return v;
+    }
+
+    // Enough sweeps for convergence in practice; Jacobi is quadratically convergent and
+    // m is the retained rank, not the dimension. The loop exits early once no rotation
+    // exceeds the threshold, so the bound only caps a pathological case.
+    let max_sweeps = 30;
+    for _sweep in 0..max_sweeps {
+        let mut rotated = false;
+        for pi in 0..(m - 1) {
+            for qi in (pi + 1)..m {
+                let alpha: f64 = a[pi].iter().map(|x| x * x).sum();
+                let beta: f64 = a[qi].iter().map(|x| x * x).sum();
+                let gamma: f64 = a[pi].iter().zip(&a[qi]).map(|(x, y)| x * y).sum();
+                if gamma == 0.0 || !gamma.is_finite() {
+                    continue;
+                }
+                // Relative threshold: two columns are orthogonal enough when their
+                // inner product is negligible against their own magnitudes. An
+                // absolute test would never fire on a large-scale problem and always
+                // fire on a small one.
+                if gamma.abs() <= f64::EPSILON * (alpha * beta).sqrt() {
+                    continue;
+                }
+                rotated = true;
+                let zeta = (beta - alpha) / (2.0 * gamma);
+                let t = if zeta >= 0.0 {
+                    1.0 / (zeta + (1.0 + zeta * zeta).sqrt())
+                } else {
+                    -1.0 / (-zeta + (1.0 + zeta * zeta).sqrt())
+                };
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let sn = c * t;
+                for k in 0..a[pi].len() {
+                    let (x, y) = (a[pi][k], a[qi][k]);
+                    a[pi][k] = c * x - sn * y;
+                    a[qi][k] = sn * x + c * y;
+                }
+                for k in 0..m {
+                    let (x, y) = (v[pi][k], v[qi][k]);
+                    v[pi][k] = c * x - sn * y;
+                    v[qi][k] = sn * x + c * y;
+                }
+            }
+        }
+        if !rotated {
+            break;
+        }
+    }
+    sort_by_column_norm(a, &mut v);
+    v
+}
+
+/// Order both column sets by descending column norm of `a` -- descending singular
+/// value. Jacobi produces no particular order, and the truncation that follows is only
+/// meaningful once the smallest components are last.
+fn sort_by_column_norm(a: &mut [Vec<f64>], v: &mut [Vec<f64>]) {
+    let mut order: Vec<usize> = (0..a.len()).collect();
+    let norms: Vec<f64> = a
+        .iter()
+        .map(|col| col.iter().map(|x| x * x).sum::<f64>())
+        .collect();
+    order.sort_by(|&i, &j| {
+        norms[j]
+            .partial_cmp(&norms[i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let a_sorted: Vec<Vec<f64>> = order.iter().map(|&i| a[i].clone()).collect();
+    let v_sorted: Vec<Vec<f64>> = order.iter().map(|&i| v[i].clone()).collect();
+    for (slot, col) in a.iter_mut().zip(a_sorted) {
+        *slot = col;
+    }
+    for (slot, col) in v.iter_mut().zip(v_sorted) {
+        *slot = col;
+    }
 }
 
 /// Partial-pivoting LU solve of a row-major `n x n` system, destroying `a`.
@@ -527,6 +777,7 @@ impl BroydenJacobian {
             match self.reduction {
                 ReductionMethod::Restart => self.gm.restart_reduce(target),
                 ReductionMethod::Simple => self.gm.simple_reduce(target),
+                ReductionMethod::Svd { to_retain } => self.gm.svd_reduce(target, to_retain),
             }
         }
     }
@@ -638,7 +889,7 @@ impl Jacobian for BroydenJacobian {
 mod nonlin_tests {
     use super::{
         BroydenJacobian, BroydenVariant, InverseJacobian, Jacobian, LowRankMatrix,
-        ReductionMethod, lu_solve_in_place,
+        ReductionMethod, economic_qr, lu_solve_in_place, one_sided_jacobi,
     };
 
     const N: usize = 5;
@@ -976,5 +1227,279 @@ mod nonlin_tests {
             lu_solve_in_place(&mut singular, &[1.0, 1.0], 2).is_none(),
             "a singular system produced an answer"
         );
+    }
+
+    /// Build a matrix whose OLDEST terms are the large ones and whose newest are
+    /// negligible. This is the case the SVD policy exists for, and the one where
+    /// choosing by age gets it exactly backwards.
+    fn skewed_terms() -> LowRankMatrix {
+        let mut m = LowRankMatrix::new(-1.0, 6);
+        for k in 0..4u64 {
+            let scale = if k < 2 { 1.0 } else { 1e-6 };
+            let c: Vec<f64> = pseudo(k + 1, 6).iter().map(|x| x * scale).collect();
+            m.append(c, pseudo(k + 101, 6));
+        }
+        m
+    }
+
+    fn operator_error(reduced: &LowRankMatrix, reference: &[f64]) -> f64 {
+        max_diff(&reduced.to_dense(), reference)
+    }
+
+    /// The whole justification for the SVD policy in one comparison: it keeps what is
+    /// LARGE, while restart and simple keep what is RECENT, and recency is a proxy for
+    /// relevance that can be arbitrarily wrong.
+    ///
+    /// MUST-HIT: reducing 4 terms to 2 by singular value costs ~1e-7 here.
+    /// MUST-MISS: the same reduction by age costs ~0.93 -- six orders of magnitude
+    /// worse -- so the first number cannot be explained by the operator being easy to
+    /// approximate, or by the reduction having quietly done nothing.
+    #[test]
+    fn svd_reduce_keeps_the_largest_components_not_the_newest() {
+        let reference = skewed_terms().to_dense();
+
+        let mut by_svd = skewed_terms();
+        by_svd.svd_reduce(4, Some(2));
+        assert_eq!(by_svd.rank(), 2, "svd_reduce did not retain exactly 2 components");
+        let svd_err = operator_error(&by_svd, &reference);
+        assert!(
+            svd_err < 1e-5,
+            "svd_reduce lost {svd_err}; it should have kept the two dominant terms"
+        );
+
+        let mut by_age = skewed_terms();
+        by_age.simple_reduce(2);
+        let age_err = operator_error(&by_age, &reference);
+        assert!(
+            age_err > 0.1,
+            "keeping the newest two cost only {age_err}; the test data does not \
+             actually distinguish the policies"
+        );
+        assert!(
+            svd_err < age_err / 1000.0,
+            "svd_reduce ({svd_err}) is not decisively better than age-based \
+             ({age_err}); the ranking by singular value is not doing its job"
+        );
+    }
+
+    /// Below the cap there is nothing to reduce, and reducing anyway would throw away
+    /// information the caller still has room for.
+    #[test]
+    fn svd_reduce_does_nothing_below_the_cap() {
+        let mut below = skewed_terms();
+        let before = below.to_dense();
+        // 4 stored terms, cap of 5: `m < p`, so this must be a no-op.
+        below.svd_reduce(5, Some(2));
+        assert_eq!(below.rank(), 4, "reduced below the cap");
+        assert!(
+            max_diff(&below.to_dense(), &before) < 1e-12,
+            "a no-op reduction changed the operator"
+        );
+
+        // MUST-MISS: at the cap it does reduce, so the check above is detecting the
+        // threshold rather than a routine that never fires.
+        let mut at = skewed_terms();
+        at.svd_reduce(4, Some(2));
+        assert_eq!(at.rank(), 2, "reduction did not fire at the cap");
+    }
+
+    /// `to_retain` defaults to `max_rank - 2`, as in SciPy.
+    #[test]
+    fn svd_reduce_defaults_to_retain_two_fewer() {
+        let mut m = skewed_terms();
+        m.svd_reduce(4, None);
+        assert_eq!(m.rank(), 2, "default to_retain is not max_rank - 2");
+    }
+
+    /// `A = Q R` with `Q` orthonormal, including for a RANK-DEFICIENT input, where the
+    /// routine leaves a zero column and a zero pivot rather than failing. The caller's
+    /// operator identity depends on the factorisation holding in that case too.
+    #[test]
+    fn economic_qr_factors_its_input_including_rank_deficient_ones() {
+        let full: Vec<Vec<f64>> = (0..3).map(|k| pseudo(k + 11, 6)).collect();
+        let dup = vec![pseudo(11, 6), pseudo(12, 6), pseudo(11, 6)];
+
+        for (label, cols) in [("full rank", full), ("rank deficient", dup)] {
+            let (q, r) = economic_qr(&cols);
+            let m = cols.len();
+            for j in 0..m {
+                let rebuilt: Vec<f64> = (0..6)
+                    .map(|i| (0..m).map(|k| q[k][i] * r[k][j]).sum())
+                    .collect();
+                assert!(
+                    max_diff(&rebuilt, &cols[j]) < 1e-10,
+                    "{label}: column {j} does not satisfy A = Q R"
+                );
+            }
+            // Nonzero Q columns are orthonormal; the deficient one is exactly zero.
+            for i in 0..m {
+                let nrm: f64 = q[i].iter().map(|x| x * x).sum::<f64>().sqrt();
+                assert!(
+                    nrm < 1e-12 || (nrm - 1.0).abs() < 1e-10,
+                    "{label}: Q column {i} has norm {nrm}, neither unit nor zero"
+                );
+                for j in (i + 1)..m {
+                    let ip: f64 = q[i].iter().zip(&q[j]).map(|(a, b)| a * b).sum();
+                    assert!(
+                        ip.abs() < 1e-10,
+                        "{label}: Q columns {i} and {j} are not orthogonal ({ip})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The Jacobi SVD is checked against INVARIANTS rather than a reference
+    /// implementation, which this crate does not have: the output columns are mutually
+    /// orthogonal, `V` is orthogonal, the rotation reproduces `A V`, and the singular
+    /// values satisfy two exact identities -- their squares sum to the Frobenius norm
+    /// and their product is `det(A^T A)`. Together those pin the spectrum without
+    /// anything to compare against.
+    #[test]
+    fn the_jacobi_svd_is_an_orthogonal_rotation_with_the_right_spectrum() {
+        let original: Vec<Vec<f64>> = (0..3).map(|k| pseudo(k + 21, 7)).collect();
+        let mut a = original.clone();
+        let v = one_sided_jacobi(&mut a);
+        let m = 3;
+
+        // V orthogonal.
+        for i in 0..m {
+            for j in 0..m {
+                let ip: f64 = v[i].iter().zip(&v[j]).map(|(x, y)| x * y).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((ip - want).abs() < 1e-10, "V is not orthogonal at ({i}, {j})");
+            }
+        }
+        // The rotated matrix is A V: column j is sum_k A[:,k] V[k][j], and V[k][j] is
+        // `v[j][k]` because `v[j]` is column j.
+        for j in 0..m {
+            let want: Vec<f64> = (0..7)
+                .map(|i| (0..m).map(|k| original[k][i] * v[j][k]).sum())
+                .collect();
+            assert!(
+                max_diff(&a[j], &want) < 1e-10,
+                "rotated column {j} is not (A V) column {j}"
+            );
+        }
+        // Output columns are mutually orthogonal -- that is what "one-sided Jacobi has
+        // converged" means.
+        for i in 0..m {
+            for j in (i + 1)..m {
+                let ip: f64 = a[i].iter().zip(&a[j]).map(|(x, y)| x * y).sum();
+                let scale = norm_of(&a[i]) * norm_of(&a[j]);
+                assert!(
+                    ip.abs() < 1e-9 * scale.max(1.0),
+                    "columns {i} and {j} are not orthogonal after convergence ({ip})"
+                );
+            }
+        }
+
+        let svals: Vec<f64> = a.iter().map(|c| norm_of(c)).collect();
+        // Sorted descending, without which the truncation is meaningless.
+        for w in svals.windows(2) {
+            assert!(w[0] >= w[1], "singular values are not sorted descending: {svals:?}");
+        }
+        // Sum of squares = squared Frobenius norm of the input.
+        let frob2: f64 = original.iter().flat_map(|c| c.iter()).map(|x| x * x).sum();
+        let sum_sq: f64 = svals.iter().map(|s| s * s).sum();
+        assert!(
+            (sum_sq - frob2).abs() < 1e-9 * frob2,
+            "sum of squared singular values {sum_sq} != Frobenius norm squared {frob2}"
+        );
+        // Product of squares = det(A^T A), computed independently by LU.
+        let mut gram = vec![0.0; m * m];
+        for i in 0..m {
+            for j in 0..m {
+                gram[i * m + j] = original[i].iter().zip(&original[j]).map(|(x, y)| x * y).sum();
+            }
+        }
+        let det = det_via_lu(&mut gram, m);
+        let prod_sq: f64 = svals.iter().map(|s| s * s).product();
+        assert!(
+            (prod_sq - det).abs() < 1e-6 * det.abs().max(1.0),
+            "product of squared singular values {prod_sq} != det(A^T A) {det}"
+        );
+    }
+
+    fn norm_of(v: &[f64]) -> f64 {
+        v.iter().map(|x| x * x).sum::<f64>().sqrt()
+    }
+
+    /// Determinant by the same elimination the solver uses, for an independent check on
+    /// the singular values. Sign tracking matters: an even number of row swaps must not
+    /// flip it.
+    fn det_via_lu(a: &mut [f64], n: usize) -> f64 {
+        let mut det = 1.0;
+        let mut perm: Vec<usize> = (0..n).collect();
+        for k in 0..n {
+            let mut piv = k;
+            let mut best = a[perm[k] * n + k].abs();
+            for i in (k + 1)..n {
+                let v = a[perm[i] * n + k].abs();
+                if v > best {
+                    best = v;
+                    piv = i;
+                }
+            }
+            if best == 0.0 {
+                return 0.0;
+            }
+            if piv != k {
+                perm.swap(k, piv);
+                det = -det;
+            }
+            let pk = perm[k];
+            det *= a[pk * n + k];
+            for i in (k + 1)..n {
+                let pi = perm[i];
+                let factor = a[pi * n + k] / a[pk * n + k];
+                for j in (k + 1)..n {
+                    a[pi * n + j] -= factor * a[pk * n + j];
+                }
+            }
+        }
+        det
+    }
+
+    /// A Broyden run driven with the SVD policy still satisfies the secant condition and
+    /// stays within its rank cap. The reduction runs BEFORE each append, so the cap is
+    /// what bounds memory across the whole run.
+    #[test]
+    fn the_svd_policy_bounds_rank_without_breaking_the_secant_condition() {
+        let mut x = vec![1.0, 1.2, 0.9, 0.4, 1.1];
+        let mut f = residual(&x);
+        let mut j = BroydenJacobian::new(
+            BroydenVariant::First,
+            None,
+            // `to_retain` is explicit here: with a cap of 3 SciPy's own default
+            // arithmetic gives `q = (3 - 1) - 2 = 0`, which clears the matrix and would
+            // quietly turn this into a test of the restart policy.
+            ReductionMethod::Svd { to_retain: Some(2) },
+            Some(4),
+        );
+        j.setup(&x, &f);
+
+        for step in 0..8 {
+            let dir = j.solve_ref(&f);
+            let next: Vec<f64> = x.iter().zip(&dir).map(|(a, b)| a - b).collect();
+            let next_f = residual(&next);
+            let df: Vec<f64> = next_f.iter().zip(&f).map(|(a, b)| a - b).collect();
+            let dx: Vec<f64> = next.iter().zip(&x).map(|(a, b)| a - b).collect();
+
+            j.update(&next, &next_f);
+            x = next;
+            f = next_f;
+
+            assert!(
+                j.rank() <= 3,
+                "step {step}: rank {} exceeded the cap of 3",
+                j.rank()
+            );
+            assert!(
+                max_diff(&j.solve_ref(&df), &dx) < 1e-8,
+                "step {step}: the most recent secant condition was not restored after \
+                 reduction"
+            );
+        }
     }
 }
