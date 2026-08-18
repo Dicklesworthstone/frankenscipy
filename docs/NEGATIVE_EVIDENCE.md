@@ -36580,3 +36580,48 @@ routine's Givens solve is optimal over the space its own directions span -- resi
 against an explicit least-squares solve over `span(A Z)` was 1.000000000 on three
 independent instances. That is the property that would break if the `Z`-versus-`V`
 distinction, the Givens bookkeeping, or the back-substitution were wrong.
+
+## SECOND CORRECTION — the "15x" LGMRES figure was also wrong, and the augmentation does NOT pay on any operator I tested
+
+2026-08-18, same day, before any rebuild. Host loadavg 9.43/9.07/14.06, CPU MHz ~4000.
+This is the second time I have attached an over-favourable number to this fix and had to
+withdraw it, which is itself the finding worth recording.
+
+The correction above replaced "13 orders of magnitude" with "about 15x on the final
+residual after six cycles". **That 15x is also wrong.** It compared the two paths at equal
+CYCLES, and an augmented cycle consumes `inner_m + outer_k` Arnoldi steps against
+`inner_m` for an unaugmented one. Equal cycles is unequal work, and the comparison
+flattered the augmented side by exactly the extra work it was doing.
+
+Re-measured at EQUAL TOTAL ARNOLDI STEPS, augmentation loses everywhere I tested:
+
+| comparison | result |
+|---|---|
+| 8 random dense systems, n=60, 40-step budget | median residual ratio **0.190** — augmented leaves ~5x MORE residual |
+| iterations to converge, 10 random dense systems | augmented used strictly MORE steps in **10 of 10** |
+| convection-diffusion, n=100, beta=0.95 | 273 steps augmented against 147 unaugmented |
+| convection-diffusion, n=100, beta=0.99 | 273 against 142 |
+
+**A SCARE THAT WAS MY OWN MEASUREMENT ERROR, NOT A DEFECT.** An intermediate run showed
+the augmented path stuck at residual 4.47e-01 where unaugmented reached 2.9e-07, which
+looked like a bug in the port. It was not: I had capped the budget at 120 Arnoldi steps
+and that solve needs 273. Checked against the incumbent directly, the port converges and
+matches scipy on the same operators — scipy `lgmres(inner_m=5, outer_k=3)` reaches
+9.56e-11 where this port reaches 7.19e-11.
+
+**WHAT SURVIVES, AND IT IS ENOUGH TO JUSTIFY THE CHANGE:**
+
+ * The restructure is a CONFORMANCE fix. The function claimed to match
+   `scipy.sparse.linalg.lgmres` and did not — it minimised over the augmentation span and
+   the Krylov space separately instead of jointly. It now does what the incumbent does.
+   Matching the peer is the goal; beating it was never the claim.
+ * The solve is optimal over the space its own directions span: ratio 1.000000000 against
+   an explicit least-squares solve, three independent instances.
+ * It converges and agrees with scipy's residuals on three operators.
+
+**WHAT DOES NOT SURVIVE:** any claim that this fix makes lgmres faster or stronger. On
+every operator tested the augmentation costs more total work than `outer_k = 0`, and
+SciPy shows the same behaviour, so this is a property of the METHOD rather than of the
+port. LGMRES earns its keep where restarted GMRES stagnates; none of my test operators
+stagnate, and I have not yet built one that does. Anyone wanting a benefit row here needs
+a genuinely stagnating operator first.

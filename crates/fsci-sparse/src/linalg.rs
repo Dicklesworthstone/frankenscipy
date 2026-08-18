@@ -22052,6 +22052,153 @@ mod tests {
 
     // ── LGMRES iterative solver tests ───────────────────────────────
 
+        /// A non-symmetric convection-diffusion operator, the shape LGMRES is meant for.
+    fn convection_diffusion_csr(n: usize, beta: f64, diag: f64) -> CsrMatrix {
+        let mut rows: Vec<usize> = Vec::new();
+        let mut cols: Vec<usize> = Vec::new();
+        let mut data: Vec<f64> = Vec::new();
+        for i in 0..n {
+            if i > 0 {
+                rows.push(i);
+                cols.push(i - 1);
+                data.push(-1.0 - beta);
+            }
+            rows.push(i);
+            cols.push(i);
+            data.push(diag);
+            if i + 1 < n {
+                rows.push(i);
+                cols.push(i + 1);
+                data.push(-1.0 + beta);
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("convection-diffusion COO")
+            .to_csr()
+            .expect("convection-diffusion CSR")
+    }
+
+    /// Augmentation must not change WHERE the solve lands, only how it gets there.
+    ///
+    /// Both settings solve the same system to the same tolerance, so the solutions must
+    /// agree far more tightly than the tolerance itself. The must-miss is that the two
+    /// settings do NOT take the same number of iterations -- if they did, the
+    /// augmentation would not be reaching the Arnoldi basis at all and the agreement
+    /// above would be trivial.
+    #[test]
+    fn lgmres_augmentation_changes_the_path_but_not_the_solution() {
+        let a = convection_diffusion_csr(60, 0.6, 4.0);
+        let b = vec![1.0; 60];
+
+        let plain = lgmres(
+            &a,
+            &b,
+            None,
+            LgmresOptions {
+                tol: 1e-10,
+                max_iter: Some(5000),
+                inner_m: 5,
+                outer_k: 0,
+            },
+        )
+        .expect("lgmres works");
+        let augmented = lgmres(
+            &a,
+            &b,
+            None,
+            LgmresOptions {
+                tol: 1e-10,
+                max_iter: Some(5000),
+                inner_m: 5,
+                outer_k: 3,
+            },
+        )
+        .expect("lgmres works");
+
+        assert!(plain.converged, "unaugmented solve did not converge");
+        assert!(augmented.converged, "augmented solve did not converge");
+        assert_close_slice(&plain.solution, &augmented.solution, 1e-6);
+
+        // Both are genuine solutions of the system, not merely of each other.
+        let ax = csr_matvec(&a, &augmented.solution);
+        assert_close_slice(&ax, &b, 1e-8);
+
+        // MUST-MISS: the augmentation is actually active.
+        assert_ne!(
+            plain.iterations, augmented.iterations,
+            "both settings used {} iterations; the augmentation vectors are not \
+             entering the Arnoldi basis",
+            plain.iterations
+        );
+    }
+
+    /// The augmentation ADDS to the inner budget, so an augmented cycle costs more
+    /// Arnoldi steps than an unaugmented one. This pins the cost, not a benefit.
+    ///
+    /// Measured, and worth stating plainly: on every operator tested the augmented
+    /// configuration consumed MORE total inner steps than `outer_k = 0`. LGMRES earns
+    /// its keep on problems where restarted GMRES stagnates; where it does not stagnate,
+    /// the extra directions are simply extra work. That is a property of the method
+    /// rather than of this port, and SciPy behaves the same way.
+    #[test]
+    fn lgmres_augmentation_costs_extra_inner_steps() {
+        let a = convection_diffusion_csr(60, 0.6, 4.0);
+        let b = vec![1.0; 60];
+        let opts = |outer_k| LgmresOptions {
+            tol: 1e-10,
+            max_iter: Some(5000),
+            inner_m: 5,
+            outer_k,
+        };
+
+        let plain = lgmres(&a, &b, None, opts(0)).expect("lgmres works");
+        let augmented = lgmres(&a, &b, None, opts(3)).expect("lgmres works");
+        assert!(plain.converged && augmented.converged);
+        assert!(
+            augmented.iterations > plain.iterations,
+            "augmented used {} inner steps against {} unaugmented; the augmentation is \
+             being taken out of the Krylov budget instead of added to it",
+            augmented.iterations,
+            plain.iterations
+        );
+    }
+
+    /// `outer_k = 0` must be exactly the unaugmented path: with no stored vectors the
+    /// direction at every step is the previous basis vector, so the flexible Arnoldi
+    /// degenerates to ordinary GMRES. Checked against `gmres` on the same system.
+    #[test]
+    fn lgmres_without_augmentation_agrees_with_gmres() {
+        let a = convection_diffusion_csr(40, 0.6, 4.0);
+        let b = vec![1.0; 40];
+
+        let l = lgmres(
+            &a,
+            &b,
+            None,
+            LgmresOptions {
+                tol: 1e-10,
+                max_iter: Some(5000),
+                inner_m: 30,
+                outer_k: 0,
+            },
+        )
+        .expect("lgmres works");
+        let g = gmres(
+            &a,
+            &b,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-10,
+                max_iter: Some(5000),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("gmres works");
+
+        assert!(l.converged && g.converged, "both should converge");
+        assert_close_slice(&l.solution, &g.solution, 1e-7);
+    }
+
     #[test]
     fn lgmres_diagonally_dominant_converges() {
         let a = diagonally_dominant_csr_3x3();
