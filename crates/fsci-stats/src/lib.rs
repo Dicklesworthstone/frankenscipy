@@ -17921,9 +17921,18 @@ impl RvDiscrete {
     }
 
     /// Probability mass function.
+    /// Probability mass at `x`, which must be EXACTLY a support point.
+    ///
+    /// scipy's `rv_discrete(values=(xk, pk)).pmf` matches exactly: with `xk = [1, 2, 3]`,
+    /// `pmf(2.0)` is 0.3 while `pmf(2.0 + 5e-11)` is **0.0**. This used to match within
+    /// `1e-10`, so it returned 0.3 for a point that is not in the support — assigning an
+    /// atom's entire mass to a neighbour of it.
+    ///
+    /// Conforming input is unaffected: an exact support point compared with `==` is the same
+    /// point the tolerance admitted.
     pub fn pmf(&self, x: f64) -> f64 {
         for (i, &xi) in self.xk.iter().enumerate() {
-            if (x - xi).abs() < 1e-10 {
+            if x == xi {
                 return self.pk[i];
             }
         }
@@ -57392,6 +57401,18 @@ mod tests {
             f64::NEG_INFINITY,
             "non-integer counts must be rejected, as scipy rejects them at validation"
         );
+
+        // Third instance of the same family: RvDiscrete matched its support within 1e-10.
+        // scipy `rv_discrete(values=([1,2,3],[0.2,0.3,0.5]))` gives pmf(2.0) = 0.3 and
+        // pmf(2.0 + 5e-11) = 0.0 — an atom's mass belongs to its point, not its neighbourhood.
+        let rd = RvDiscrete::new(vec![1.0, 2.0, 3.0], vec![0.2, 0.3, 0.5]);
+        assert_eq!(rd.pmf(2.0), 0.3, "exact support point keeps its mass");
+        assert_eq!(
+            rd.pmf(2.0 + 5e-11),
+            0.0,
+            "a point 5e-11 off the support has zero mass, as scipy has it"
+        );
+        assert_eq!(rd.pmf(2.5), 0.0, "unchanged: a clearly off-support point");
     }
 
     /// `frankenscipy-clttw`: these three functions grouped ties by a TOLERANCE
