@@ -9487,6 +9487,48 @@ pub static SMOOTHBISPLINE_EVAL_MANY_FORCE_SCALAR: std::sync::atomic::AtomicBool 
     std::sync::atomic::AtomicBool::new(false);
 
 impl SmoothBivariateSpline {
+    /// Build directly from an already-fitted representation.
+    ///
+    /// Used by `LSQBivariateSpline`, whose knots come from the caller rather than
+    /// from the smoothing search. Everything downstream -- evaluation, derivatives,
+    /// the integral -- is identical once the knots and coefficients exist, so this
+    /// exists to share that machinery instead of duplicating a second evaluator.
+    ///
+    /// The residual is computed here with the same `compute_residual` the smoothing
+    /// constructor uses, so the number means the same thing in both types rather
+    /// than being a similarly-named quantity computed a second way.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_fitted(
+        kx: usize,
+        ky: usize,
+        bbox: [f64; 4],
+        tx: Vec<f64>,
+        ty: Vec<f64>,
+        coeffs: Vec<f64>,
+        nx_coeffs: usize,
+        ny_coeffs: usize,
+        smoothing_factor: f64,
+        x: &[f64],
+        y: &[f64],
+        z: &[f64],
+        weights: &[f64],
+    ) -> Self {
+        let mut spline = Self {
+            kx,
+            ky,
+            bbox,
+            tx,
+            ty,
+            coeffs,
+            nx_coeffs,
+            ny_coeffs,
+            residual: 0.0,
+            smoothing_factor,
+        };
+        spline.residual = spline.compute_residual(x, y, z, weights);
+        spline
+    }
+
     pub fn new(
         x: &[f64],
         y: &[f64],
@@ -15012,6 +15054,393 @@ mod tests {
         assert!(
             (result - 15.0).abs() < 1e-10,
             "polyval got {result}, expected 15"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LSQBivariateSpline — least-squares bivariate spline on USER-SUPPLIED knots
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Least-squares bivariate spline with knots chosen by the CALLER
+/// -- `scipy.interpolate.LSQBivariateSpline`.
+///
+/// `SmoothBivariateSpline` picks its own knots to hit a smoothing target; this fixes
+/// them and solves the resulting linear least-squares problem. That is the whole
+/// difference, and it is the reason the type exists: when the knot placement is
+/// dictated by the problem -- a known breakpoint, a grid shared with other data, a
+/// reproducible fit -- an adaptive knot chooser is not a convenience but a source of
+/// results that move when the data moves slightly.
+///
+/// # Construction
+///
+/// `tx` and `ty` are the INTERIOR knots only. The full knot vectors are formed by
+/// clamping each end with `degree + 1` copies of the bounding-box edge, which is the
+/// standard B-spline convention and what FITPACK's `surfit` expects when `iopt = -1`.
+///
+/// A fit is only determined when there are at least as many samples as coefficients,
+/// and there are `(len(tx) + kx + 1) * (len(ty) + ky + 1)` of those. Fewer samples
+/// leaves the system underdetermined, which is rejected rather than solved: an
+/// underdetermined least-squares problem has infinitely many exact solutions and
+/// returning whichever one the solver lands on would be a silently arbitrary answer.
+///
+/// # Implementation
+///
+/// This delegates to `SmoothBivariateSpline`'s fitted representation with a smoothing
+/// factor of zero, so evaluation, grid evaluation, derivatives and the integral are
+/// the SAME code paths that type already uses -- including its parallel `eval_many`
+/// and `eval_grid`. Duplicating a second bivariate evaluator to gain a different
+/// constructor would be the wrong trade.
+#[derive(Debug, Clone)]
+pub struct LSQBivariateSpline {
+    inner: SmoothBivariateSpline,
+}
+
+impl LSQBivariateSpline {
+    /// Fit with the given interior knots.
+    ///
+    /// `bbox` defaults to the data's bounding box when `options.bbox` is not set,
+    /// matching `SmoothBivariateSpline`.
+    pub fn new(
+        x: &[f64],
+        y: &[f64],
+        z: &[f64],
+        tx_interior: &[f64],
+        ty_interior: &[f64],
+        options: SmoothBivariateSplineOptions,
+    ) -> Result<Self, InterpError> {
+        let n = x.len();
+        if y.len() != n {
+            return Err(InterpError::LengthMismatch {
+                x_len: n,
+                y_len: y.len(),
+            });
+        }
+        if z.len() != n {
+            return Err(InterpError::InvalidArgument {
+                detail: format!("z must have same length as x and y, got {}", z.len()),
+            });
+        }
+        let kx = options.kx;
+        let ky = options.ky;
+        if n == 0 {
+            return Err(InterpError::InvalidArgument {
+                detail: "LSQBivariateSpline requires at least one sample".to_string(),
+            });
+        }
+
+        let (x_lo, x_hi) = bounds_of(x);
+        let (y_lo, y_hi) = bounds_of(y);
+        let bbox = options.bbox.unwrap_or([x_lo, x_hi, y_lo, y_hi]);
+
+        check_interior_knots(tx_interior, bbox[0], bbox[1], "tx")?;
+        check_interior_knots(ty_interior, bbox[2], bbox[3], "ty")?;
+
+        let nx_coeffs = tx_interior.len() + kx + 1;
+        let ny_coeffs = ty_interior.len() + ky + 1;
+        // Underdetermined systems are refused rather than solved; see the type docs.
+        if nx_coeffs * ny_coeffs > n {
+            return Err(InterpError::InvalidArgument {
+                detail: format!(
+                    "LSQBivariateSpline needs at least {} samples for {} x {} \
+                     coefficients, got {n}",
+                    nx_coeffs * ny_coeffs,
+                    nx_coeffs,
+                    ny_coeffs
+                ),
+            });
+        }
+
+        let tx = clamped_knot_vector(tx_interior, bbox[0], bbox[1], kx);
+        let ty = clamped_knot_vector(ty_interior, bbox[2], bbox[3], ky);
+
+        let weights: Vec<f64> = match &options.weights {
+            Some(w) if w.len() == n => w.clone(),
+            Some(w) => {
+                return Err(InterpError::InvalidArgument {
+                    detail: format!("weights length {} must match samples {n}", w.len()),
+                });
+            }
+            None => vec![1.0; n],
+        };
+
+        // Smoothing factor 0: pure least squares on the fixed knots, which is what
+        // distinguishes this from the smoothing fit.
+        let coeffs = smooth_bivariate_solve_coefficients(SmoothBivariateLinearSystem {
+            x,
+            y,
+            z,
+            weights: &weights,
+            tx: &tx,
+            ty: &ty,
+            kx,
+            ky,
+            smoothing_factor: 0.0,
+            eps: options.eps,
+        })?;
+
+        Ok(Self {
+            inner: SmoothBivariateSpline::from_fitted(
+                kx, ky, bbox, tx, ty, coeffs, nx_coeffs, ny_coeffs, 0.0, x, y, z,
+                &weights,
+            ),
+        })
+    }
+
+    /// Evaluate at a single point.
+    #[must_use]
+    pub fn eval(&self, x: f64, y: f64) -> f64 {
+        self.inner.eval(x, y)
+    }
+
+    /// Evaluate at scattered points.
+    #[must_use]
+    pub fn eval_many(&self, x: &[f64], y: &[f64]) -> Vec<f64> {
+        self.inner.eval_many(x, y)
+    }
+
+    /// Evaluate on the grid `x` x `y`.
+    #[must_use]
+    pub fn eval_grid(&self, x: &[f64], y: &[f64]) -> Vec<Vec<f64>> {
+        self.inner.eval_grid(x, y)
+    }
+
+    /// Mixed partial derivative of order `(dx, dy)`.
+    #[must_use]
+    pub fn eval_derivative(&self, x: f64, y: f64, dx: usize, dy: usize) -> f64 {
+        self.inner.eval_derivative(x, y, dx, dy)
+    }
+
+    /// Integral over the rectangle.
+    #[must_use]
+    pub fn integral(&self, xa: f64, xb: f64, ya: f64, yb: f64) -> f64 {
+        self.inner.integral(xa, xb, ya, yb)
+    }
+
+    /// Weighted sum of squared residuals of the fit.
+    #[must_use]
+    pub fn residual(&self) -> f64 {
+        self.inner.residual()
+    }
+
+    /// `(kx, ky)`.
+    #[must_use]
+    pub fn degrees(&self) -> (usize, usize) {
+        self.inner.degrees()
+    }
+
+    /// Full knot vectors, including the clamped ends.
+    #[must_use]
+    pub fn knots(&self) -> (&[f64], &[f64]) {
+        self.inner.knots()
+    }
+
+    /// Fitted coefficients.
+    #[must_use]
+    pub fn coefficients(&self) -> &[f64] {
+        self.inner.coefficients()
+    }
+}
+
+/// Min and max of a slice, used for the default bounding box.
+fn bounds_of(v: &[f64]) -> (f64, f64) {
+    v.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+        (lo.min(x), hi.max(x))
+    })
+}
+
+/// Interior knots must be finite, strictly increasing, and strictly inside the
+/// bounding box.
+///
+/// Strictly inside matters: a knot sitting exactly on an edge duplicates a clamped
+/// boundary knot, which raises the multiplicity there beyond `degree + 1` and makes
+/// the basis singular. FITPACK rejects it, and so does this -- a fit that came back
+/// with NaN coefficients from a singular basis would be far harder to diagnose than
+/// a message naming the offending knot.
+fn check_interior_knots(
+    knots: &[f64],
+    lo: f64,
+    hi: f64,
+    label: &str,
+) -> Result<(), InterpError> {
+    for (i, &k) in knots.iter().enumerate() {
+        if !k.is_finite() {
+            return Err(InterpError::InvalidArgument {
+                detail: format!("{label} interior knot {i} is not finite: {k}"),
+            });
+        }
+        if k <= lo || k >= hi {
+            return Err(InterpError::InvalidArgument {
+                detail: format!(
+                    "{label} interior knot {i} = {k} must lie strictly inside \
+                     ({lo}, {hi})"
+                ),
+            });
+        }
+        if i > 0 && k <= knots[i - 1] {
+            return Err(InterpError::InvalidArgument {
+                detail: format!(
+                    "{label} interior knots must be strictly increasing; knot {i} = \
+                     {k} does not exceed {}",
+                    knots[i - 1]
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Full knot vector: `degree + 1` copies of `lo`, the interior knots, then
+/// `degree + 1` copies of `hi`.
+fn clamped_knot_vector(interior: &[f64], lo: f64, hi: f64, degree: usize) -> Vec<f64> {
+    let mut knots = Vec::with_capacity(interior.len() + 2 * (degree + 1));
+    for _ in 0..=degree {
+        knots.push(lo);
+    }
+    knots.extend_from_slice(interior);
+    for _ in 0..=degree {
+        knots.push(hi);
+    }
+    knots
+}
+
+/// `LSQBivariateSpline` -- least squares on caller-supplied knots.
+#[cfg(test)]
+mod lsq_bivariate_spline_tests {
+    use super::{LSQBivariateSpline, SmoothBivariateSplineOptions};
+
+    /// A grid of samples from a bilinear surface, which a degree-1 spline can
+    /// represent EXACTLY. That exactness is what makes the first test a statement
+    /// about correctness rather than about tolerance.
+    fn bilinear_samples() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        let mut z = Vec::new();
+        for i in 0..8 {
+            for j in 0..8 {
+                let xi = i as f64 / 7.0 * 4.0;
+                let yj = j as f64 / 7.0 * 4.0;
+                x.push(xi);
+                y.push(yj);
+                z.push(2.0 + 3.0 * xi - 1.5 * yj + 0.5 * xi * yj);
+            }
+        }
+        (x, y, z)
+    }
+
+    fn opts(kx: usize, ky: usize) -> SmoothBivariateSplineOptions {
+        SmoothBivariateSplineOptions {
+            kx,
+            ky,
+            ..SmoothBivariateSplineOptions::default()
+        }
+    }
+
+    /// MUST-HIT: a bilinear surface is in the span of a bidegree-(1,1) spline, so the
+    /// least-squares fit must reproduce it to rounding at the sample points AND
+    /// between them. Checking only at the samples would not distinguish a genuine fit
+    /// from one that happened to interpolate.
+    #[test]
+    fn a_bilinear_surface_is_reproduced_exactly() {
+        let (x, y, z) = bilinear_samples();
+        let spline = LSQBivariateSpline::new(&x, &y, &z, &[2.0], &[2.0], opts(1, 1))
+            .expect("fit");
+
+        for (i, (&xi, &yi)) in x.iter().zip(&y).enumerate() {
+            let got = spline.eval(xi, yi);
+            assert!(
+                (got - z[i]).abs() < 1e-8,
+                "sample {i} at ({xi}, {yi}): got {got} want {}",
+                z[i]
+            );
+        }
+        // Between the samples, where an interpolant that merely hit the data points
+        // could still be wrong.
+        for (px, py) in [(0.7_f64, 1.3_f64), (2.4, 3.1), (3.9, 0.2)] {
+            let want = 2.0 + 3.0 * px - 1.5 * py + 0.5 * px * py;
+            let got = spline.eval(px, py);
+            assert!(
+                (got - want).abs() < 1e-8,
+                "off-sample ({px}, {py}): got {got} want {want}"
+            );
+        }
+        assert!(
+            spline.residual() < 1e-12,
+            "an exactly representable surface should leave no residual, got {}",
+            spline.residual()
+        );
+    }
+
+    /// The knots the caller gives are the knots that are used -- the point of the
+    /// type. The full vectors must be the interior knots clamped by `degree + 1`
+    /// copies of each bounding-box edge.
+    #[test]
+    fn the_supplied_knots_are_the_knots_used() {
+        let (x, y, z) = bilinear_samples();
+        let tx = [1.0_f64, 2.5];
+        let ty = [3.0_f64];
+        let spline = LSQBivariateSpline::new(&x, &y, &z, &tx, &ty, opts(1, 1)).expect("fit");
+        let (kx_knots, ky_knots) = spline.knots();
+
+        assert_eq!(kx_knots, &[0.0, 0.0, 1.0, 2.5, 4.0, 4.0]);
+        assert_eq!(ky_knots, &[0.0, 0.0, 3.0, 4.0, 4.0]);
+    }
+
+    /// Invalid knot sets are rejected with the reason named, each paired with a
+    /// must-miss so the guard cannot pass by refusing everything.
+    #[test]
+    fn invalid_knots_are_rejected() {
+        let (x, y, z) = bilinear_samples();
+
+        // Not strictly increasing.
+        assert!(
+            LSQBivariateSpline::new(&x, &y, &z, &[2.0, 2.0], &[2.0], opts(1, 1)).is_err(),
+            "duplicate interior knots were accepted"
+        );
+        // On the boundary: this duplicates a clamped end knot and makes the basis
+        // singular, which is why it is refused rather than fitted.
+        assert!(
+            LSQBivariateSpline::new(&x, &y, &z, &[0.0], &[2.0], opts(1, 1)).is_err(),
+            "a knot on the lower bbox edge was accepted"
+        );
+        assert!(
+            LSQBivariateSpline::new(&x, &y, &z, &[4.0], &[2.0], opts(1, 1)).is_err(),
+            "a knot on the upper bbox edge was accepted"
+        );
+        assert!(
+            LSQBivariateSpline::new(&x, &y, &z, &[f64::NAN], &[2.0], opts(1, 1)).is_err(),
+            "a non-finite knot was accepted"
+        );
+        // MUST-MISS.
+        assert!(
+            LSQBivariateSpline::new(&x, &y, &z, &[2.0], &[2.0], opts(1, 1)).is_ok(),
+            "a valid knot set was rejected"
+        );
+    }
+
+    /// An underdetermined system is refused rather than solved. With cubic degrees and
+    /// several interior knots the coefficient count exceeds the sample count, and any
+    /// answer returned there would be one of infinitely many exact solutions -- chosen
+    /// by the solver rather than by the data.
+    #[test]
+    fn an_underdetermined_fit_is_refused() {
+        // 9 samples, but a bidegree-(3,3) fit with 2 interior knots each way needs
+        // (2+4) * (2+4) = 36 coefficients.
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        let mut z = Vec::new();
+        for i in 0..3 {
+            for j in 0..3 {
+                x.push(i as f64);
+                y.push(j as f64);
+                z.push((i + j) as f64);
+            }
+        }
+        let err = LSQBivariateSpline::new(&x, &y, &z, &[0.8, 1.4], &[0.8, 1.4], opts(3, 3));
+        assert!(
+            err.is_err(),
+            "a 36-coefficient fit to 9 samples was accepted; the system is \
+             underdetermined and its solution is arbitrary"
         );
     }
 }
