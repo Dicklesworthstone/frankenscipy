@@ -2455,7 +2455,22 @@ impl ContinuousDistribution for NoncentralChiSquared {
     }
 
     fn sf(&self, x: f64) -> f64 {
-        1.0 - self.cdf(x)
+        // Survival computed DIRECTLY, never as 1 − cdf. The cdf saturates to 1.0
+        // in the right tail, where the subtraction returns exactly 0 while
+        // scipy.stats.ncx2.sf(150, 3, 2) = 1.0449270275534266e-26 — and it is
+        // already wrong in the 4th digit by x = 80. `chndtrc` walks the same
+        // Poisson mixture as `chndtr` with the UPPER incomplete gamma; the stable
+        // recurrence direction reverses between the two. frankenscipy-wofb.
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x <= 0.0 {
+            return 1.0;
+        }
+        if self.nc == 0.0 {
+            return ChiSquared::new(self.df).sf(x);
+        }
+        fsci_special::gamma::chndtrc(x, self.df, self.nc).clamp(0.0, 1.0)
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -3619,7 +3634,23 @@ impl ContinuousDistribution for NoncentralF {
     }
 
     fn sf(&self, x: f64) -> f64 {
-        1.0 - self.cdf(x)
+        // Survival computed DIRECTLY, never as 1 − cdf — the same correction
+        // `FDistribution::sf` already carries, and for the same reason. The F tail
+        // is polynomial, so the subtraction erodes silently long before it
+        // collapses: against scipy.stats.ncf.sf at dfn=3, dfd=5, nc=2 it holds 3
+        // digits at f=1e6 and returns 0.0 at f=1e12 (true 2.3303549e-29); at
+        // dfn=5, dfd=200, nc=3, f=1e4 it returns 0.0 for a true 4.4981732e-230.
+        // frankenscipy-wofb.
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x <= 0.0 {
+            return 1.0;
+        }
+        if self.nc == 0.0 {
+            return FDistribution::new(self.dfn, self.dfd).sf(x);
+        }
+        fsci_special::ncfdtrc(self.dfn, self.dfd, self.nc, x).clamp(0.0, 1.0)
     }
 
     fn ppf(&self, q: f64) -> f64 {
@@ -96888,5 +96919,97 @@ mod clttw_tie_predicate_is_exact {
             "a 5e-13 gap and an exact tie produced the SAME p-value, which means the \
              tie predicate is not distinguishing them -- the tolerance is back"
         );
+    }
+}
+
+#[cfg(test)]
+mod wofb_noncentral_survival_is_direct {
+    use super::{ContinuousDistribution, NoncentralChiSquared, NoncentralF};
+
+    /// `NoncentralChiSquared::sf` and `NoncentralF::sf` against scipy, at the
+    /// arguments where the `1 - cdf` they used to be is provably wrong.
+    ///
+    /// Checked RELATIVELY. An absolute tolerance passes trivially on every row
+    /// below 1e-13 -- i.e. on every row that motivated the change -- so it would
+    /// certify precisely nothing. The `1 - cdf` column is carried in the source so
+    /// the regression these guard against stays visible without a git archaeology
+    /// trip.
+    #[test]
+    fn noncentral_survival_is_direct_not_one_minus_cdf() {
+        // x, df, nc, scipy.stats.ncx2.sf, what 1 - cdf gave.
+        let ncx2 = [
+            (10.0, 3.0, 2.0, 1.014_350_364_860_013_6e-1, "1.014350e-01 ok"),
+            (5.0, 7.0, 20.0, 9.992_803_076_754_801_5e-1, "9.992803e-01 ok"),
+            (80.0, 3.0, 2.0, 1.626_871_961_685_991_5e-13, "1.627587e-13, 4th digit"),
+            (150.0, 3.0, 2.0, 1.044_927_027_553_426_6e-26, "0.0 COLLAPSED"),
+            (300.0, 10.0, 50.0, 3.224_568_183_927_314_4e-23, "0.0 COLLAPSED"),
+        ];
+        for (x, df, nc, want, note) in ncx2 {
+            let got = NoncentralChiSquared::new(df, nc).sf(x);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < 1e-9,
+                "ncx2({df}, {nc}).sf({x}) = {got:e}, scipy = {want:e} (rel {rel:e}); \
+                 1 - cdf gave {note}"
+            );
+        }
+
+        // f, dfn, dfd, nc, scipy.stats.ncf.sf, what 1 - cdf gave.
+        let ncf = [
+            (20.0, 3.0, 5.0, 2.0, 9.362_115_386_065_090e-3, "9.362115e-03 ok"),
+            (100.0, 10.0, 10.0, 40.0, 1.168_395_145_190_737e-5, "1.168395e-05 ok"),
+            (1e6, 3.0, 5.0, 2.0, 2.330_338_627_458_045e-14, "2.331468e-14, 3 digits"),
+            (1e12, 3.0, 5.0, 2.0, 2.330_354_877_710_844e-29, "0.0 COLLAPSED"),
+            (1e4, 5.0, 200.0, 3.0, 4.498_173_170_614_720e-230, "0.0 COLLAPSED"),
+        ];
+        for (x, dfn, dfd, nc, want, note) in ncf {
+            let got = NoncentralF::new(dfn, dfd, nc).sf(x);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < 1e-9,
+                "ncf({dfn}, {dfd}, {nc}).sf({x:e}) = {got:e}, scipy = {want:e} \
+                 (rel {rel:e}); 1 - cdf gave {note}"
+            );
+        }
+
+        // The premise, asserted. Both cdfs still saturate -- that is not a defect
+        // in them, it is why the survival needs its own kernel. If either of these
+        // ever stops holding, the cdf improved and this test's motivation (not its
+        // correctness) should be revisited.
+        assert_eq!(
+            1.0 - NoncentralChiSquared::new(3.0, 2.0).cdf(150.0),
+            0.0,
+            "the ncx2 cdf is supposed to saturate here; that is the premise"
+        );
+        assert_eq!(1.0 - NoncentralF::new(5.0, 200.0, 3.0).cdf(1e4), 0.0);
+
+        // nc = 0 degenerates to the central distributions, which already compute
+        // their survival directly. NOTE this diverges from the incumbent on
+        // purpose: scipy.stats.ncf.sf(1e4, 5, 200, 0) returns -1.0, while
+        // scipy.stats.f.sf(1e4, 5, 200) = 8.213081274649901e-238. Returning a
+        // negative probability to "match scipy" would be the wrong call.
+        let central_chi2 = NoncentralChiSquared::new(3.0, 0.0).sf(150.0);
+        let want_chi2 = 2.634_913_928_488_041_6e-32;
+        assert!(
+            ((central_chi2 - want_chi2) / want_chi2).abs() < 1e-12,
+            "nc=0 should give chi2.sf(150, 3) = {want_chi2:e}, got {central_chi2:e}"
+        );
+        let central_f = NoncentralF::new(5.0, 200.0, 0.0).sf(1e4);
+        let want_f = 8.213_081_274_649_901e-238;
+        assert!(
+            ((central_f - want_f) / want_f).abs() < 1e-9,
+            "nc=0 should give f.sf(1e4, 5, 200) = {want_f:e}, got {central_f:e}"
+        );
+
+        // Boundaries, and mid-range complementarity where 1 - cdf is still sound.
+        assert_eq!(NoncentralChiSquared::new(3.0, 2.0).sf(0.0), 1.0);
+        assert_eq!(NoncentralChiSquared::new(3.0, 2.0).sf(-1.0), 1.0);
+        assert!(NoncentralChiSquared::new(3.0, 2.0).sf(f64::NAN).is_nan());
+        assert_eq!(NoncentralF::new(3.0, 5.0, 2.0).sf(0.0), 1.0);
+        assert!(NoncentralF::new(3.0, 5.0, 2.0).sf(f64::NAN).is_nan());
+        let d = NoncentralChiSquared::new(3.0, 2.0);
+        assert!((d.cdf(4.0) + d.sf(4.0) - 1.0).abs() < 1e-12);
+        let g = NoncentralF::new(3.0, 5.0, 2.0);
+        assert!((g.cdf(3.0) + g.sf(3.0) - 1.0).abs() < 1e-12);
     }
 }
