@@ -5,6 +5,18 @@
 // in progress — see bead frankenscipy-5tmu1).
 pub mod cossin;
 
+// Francis double-shift QR with LAPACK's exceptional shifts; the PARITY half of
+// frankenscipy-sez4r, where bounded_schur was only the robustness half.
+//
+// DELIBERATELY NOT DECLARED. Written under a build freeze (/data 34G, 99% used) and
+// committed uncompiled by instruction. An unreferenced .rs file in src/ is inert; a
+// broken `mod` declaration breaks `cargo test -p fsci-linalg` for every pane in the
+// fleet, and the first build after the freeze lifts should not be someone else's
+// accident. Uncomment and run:
+//   RCH_REQUIRE_REMOTE=1 RCH_CARGO_WRAPPER_BYPASS=1 env -u CARGO_TARGET_DIR \
+//     rch exec -- cargo test -p fsci-linalg --lib -- --nocapture hessenberg_qr
+// mod hessenberg_qr;
+
 // Worker reuse across a factorization's panels; substrate for frankenscipy-ua3gn,
 // not yet wired into any factorization. See panel_pool.rs.
 //
