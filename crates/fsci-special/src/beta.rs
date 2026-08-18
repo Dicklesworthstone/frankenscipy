@@ -638,6 +638,166 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     total.clamp(0.0, 1.0)
 }
 
+/// Non-central F **survival** function: `P(X > f)`.
+///
+/// The complement of [`ncfdtr`], computed directly rather than as
+/// `1 - ncfdtr(...)`. Matches `scipy.stats.ncf.sf(f, dfn, dfd, nc)`.
+///
+/// # Why this is a separate kernel and not `1.0 - ncfdtr(...)`
+///
+/// Once the CDF rounds to 1.0 the subtraction returns exactly zero, and it has
+/// already lost most of its digits well before that. Measured against
+/// `scipy.stats.ncf.sf`:
+///
+/// ```text
+///   dfn dfd  nc  f       true sf              1 - ncfdtr
+///   3   5    2   1e6     2.3303386e-14        2.3314684e-14   (3 digits left)
+///   3   5    2   1e12    2.3303549e-29        0.0
+///   5   200  3   1e4     4.4981732e-230       0.0
+/// ```
+///
+/// The F tail is polynomial, so the collapse arrives later than it does for the
+/// noncentral χ² (see [`crate::gamma::chndtrc`]) — but when it arrives it is just
+/// as total, and the erosion before it is silent.
+///
+/// # Method
+///
+/// The same Poisson(nc/2) mixture as [`ncfdtr`], carrying the COMPLEMENTARY
+/// regularized incomplete beta
+///
+/// ```text
+///   ncfdtrc = Σ_{j≥0} e^{−λ} λ^j/j! · Q_y(dfn/2 + j, dfd/2),
+///   Q_y(a, b) = 1 − I_y(a, b) = I_{1−y}(b, a),
+///   λ = nc/2,  y = dfn·f / (dfn·f + dfd)
+/// ```
+///
+/// Two things here are load-bearing, and both are places where the obvious
+/// transcription of [`ncfdtr`] would silently reintroduce the very cancellation
+/// this function exists to avoid:
+///
+/// 1. **The stable direction REVERSES.** [`ncfdtr`] walks the incomplete-beta
+///    first-parameter recurrence and notes that the DOWNWARD branch is stable,
+///    because `I` grows toward 1 by ADDING positive `u`. For the complement the
+///    signs flip — `Q(a+1) = Q(a) + u(a)` upward, `Q(a−1) = Q(a) − u(a−1)`
+///    downward — so it is the UPWARD branch that adds and is stable. That is also
+///    the branch carrying the dominant mass here: `Q` increases with `a`, hence
+///    with `j`. The downward branch subtracts; its terms are small in BOTH factors
+///    (small Poisson weight and small `Q`), so its cancellation is subdominant, and
+///    when it drives `q` to zero we stop rather than propagate a negative. The
+///    resulting error is bounded by the discarded below-mode mass instead of
+///    contaminating the total.
+///
+/// 2. **`1 − y` is formed exactly, never by subtraction.** `1 − y = dfd/(dfn·f + dfd)`
+///    in closed form. For a right-tail query `y → 1`, so evaluating `1.0 - y` would
+///    throw away exactly the digits the answer is made of. That exact `y1` feeds both
+///    the anchor and the `(1−y)^b` factor of `u` (as `b·ln(y1)`, where [`ncfdtr`] can
+///    afford `ln_1p(−y)`).
+///
+/// The anchor `Q_y(a₀, b)` is `I_{1−y}(b, a₀)` evaluated directly by
+/// [`betainc_scalar`] — a series/continued-fraction evaluation that underflows
+/// gracefully — so no probability is ever obtained by subtracting from one.
+///
+/// Boundaries: `f ≤ 0 → 1`, `nc = 0` degenerates to the central `I_{1−y}(dfd/2, dfn/2)`,
+/// non-positive `dfn`/`dfd` or negative `nc` → NaN.
+#[must_use]
+pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
+    if dfn.is_nan() || dfd.is_nan() || nc.is_nan() || f.is_nan() {
+        return f64::NAN;
+    }
+    if dfn <= 0.0 || dfd <= 0.0 || nc < 0.0 {
+        return f64::NAN;
+    }
+    if f <= 0.0 {
+        return 1.0;
+    }
+    let denom = dfn * f + dfd;
+    if !denom.is_finite() {
+        // dfn·f overflowed; the whole mass is below f.
+        return 0.0;
+    }
+    let y = dfn * f / denom;
+    // 1 − y in closed form. NOT `1.0 - y`: for a tail query y → 1 and the
+    // subtraction would discard the digits this function is built to keep.
+    let y1 = dfd / denom;
+    let b = 0.5 * dfd;
+    if nc == 0.0 {
+        // Central F survival: Q_y(dfn/2, dfd/2) = I_{1−y}(dfd/2, dfn/2).
+        return betainc_scalar(b, 0.5 * dfn, y1, RuntimeMode::Strict)
+            .unwrap_or(f64::NAN)
+            .clamp(0.0, 1.0);
+    }
+    let lam = nc / 2.0;
+    let j0 = lam.floor();
+    let logw0 =
+        -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
+    let w0 = logw0.exp();
+
+    let a0 = 0.5 * dfn + j0;
+    // Q_y(a0, b) = I_{1−y}(b, a0), computed DIRECTLY — never 1 − I_y(a0, b).
+    let q0 = betainc_scalar(b, a0, y1, RuntimeMode::Strict).unwrap_or(f64::NAN);
+    // u(a) = y^a (1−y)^b · Γ(a+b)/(Γ(a+1)Γ(b)), the recurrence increment shared
+    // with `ncfdtr`; (1−y)^b taken as b·ln(y1) so it stays exact for y → 1.
+    let u0 = (a0 * y.ln() + b * y1.ln()
+        + gammaln_scalar(a0 + b, RuntimeMode::Strict).unwrap_or(f64::NAN)
+        - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
+        - gammaln_scalar(b, RuntimeMode::Strict).unwrap_or(f64::NAN))
+    .exp();
+
+    let mut total = 0.0_f64;
+    // Upward from the Poisson mode: Q(a+1) = Q(a) + u(a). THE STABLE DIRECTION
+    // for the complement, and the one carrying the dominant mass.
+    let mut w = w0;
+    let mut j = j0;
+    let mut a = a0;
+    let mut q = q0;
+    let mut u = u0;
+    let mut steps = 0;
+    while steps < 100_000 {
+        total += w * q.clamp(0.0, 1.0);
+        q += u;
+        if q > 1.0 {
+            // Saturated: every remaining above-mode term contributes its full
+            // Poisson weight. Keep summing (the weight test below terminates) —
+            // breaking here would DISCARD the residual tail mass rather than the
+            // negligible quantity `ncfdtr`'s mirrored `p <= 0` exit discards.
+            q = 1.0;
+        }
+        j += 1.0;
+        u *= y * (a + b) / (a + 1.0);
+        a += 1.0;
+        w *= lam / j;
+        if w < 1e-300 || (w < 1e-14 * total.max(1e-300) && j > lam) {
+            break;
+        }
+        steps += 1;
+    }
+    // Downward from the mode: Q(a−1) = Q(a) − u(a−1). Subtractive, hence the
+    // cancellation-prone branch — but small in both factors, and stopped at zero.
+    w = w0;
+    j = j0;
+    a = a0;
+    q = q0;
+    u = u0;
+    while j > 0.0 {
+        w *= j / lam;
+        u *= a / (y * (a - 1.0 + b));
+        q -= u;
+        if q <= 0.0 {
+            // Cancellation floor. Remaining below-mode terms are smaller still;
+            // stopping bounds the error by the discarded mass instead of
+            // propagating a negative Q into the sum.
+            break;
+        }
+        j -= 1.0;
+        a -= 1.0;
+        total += w * q.clamp(0.0, 1.0);
+        if w < 1e-14 * total.max(1e-300) {
+            break;
+        }
+    }
+    total.clamp(0.0, 1.0)
+}
+
 /// Inverse of [`ncfdtr`] in the argument `f`.
 ///
 /// Returns `f` such that `ncfdtr(dfn, dfd, nc, f) = p`, matching
@@ -3966,6 +4126,82 @@ mod tests {
         assert!(
             (result - 1.8124611228116756).abs() < 1e-6,
             "stdtrit(10, 0.95) got {result}, expected 1.8124611228116756"
+        );
+    }
+
+    /// `ncfdtrc` against `scipy.stats.ncf.sf`, chosen where `1 - ncfdtr` fails.
+    ///
+    /// The goldens span 227 orders of magnitude and are checked RELATIVELY: an
+    /// absolute tolerance would be trivially satisfied at the small end, which is
+    /// the only end where a survival function earns its keep. Each row carries the
+    /// `1 - ncfdtr` value it is contrasted with, so what this kernel buys is
+    /// visible in the source rather than only in a commit message.
+    #[test]
+    fn ncfdtrc_matches_scipy_survival_where_one_minus_cdf_erodes_then_collapses() {
+        // dfn, dfd, nc, f, scipy.stats.ncf.sf, and what 1 - ncfdtr gives instead.
+        let cases = [
+            (3.0, 5.0, 2.0, 20.0, 9.362_115_386_065_090e-3, "9.362115e-03 ok"),
+            (2.0, 20.0, 1.0, 60.0, 3.851_245_644_126_540e-8, "3.851246e-08 ok"),
+            (10.0, 10.0, 40.0, 100.0, 1.168_395_145_190_737e-5, "1.168395e-05 ok"),
+            (5.0, 10.0, 3.0, 500.0, 8.759_364_975_614_790e-11, "8.759360e-11, 7 digits"),
+            (3.0, 5.0, 2.0, 1e6, 2.330_338_627_458_045e-14, "2.331468e-14, 3 digits"),
+            (3.0, 5.0, 2.0, 1e12, 2.330_354_877_710_844e-29, "0.0 COLLAPSED"),
+            (5.0, 200.0, 3.0, 1e4, 4.498_173_170_614_720e-230, "0.0 COLLAPSED"),
+        ];
+        for (dfn, dfd, nc, f, want, note) in cases {
+            let got = ncfdtrc(dfn, dfd, nc, f);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < 1e-9,
+                "ncfdtrc({dfn}, {dfd}, {nc}, {f:e}) = {got:e}, scipy = {want:e} \
+                 (rel {rel:e}); 1 - ncfdtr gives {note}"
+            );
+        }
+
+        // WHY the kernel exists, asserted rather than asserted-about. If either of
+        // these ever stops holding, `ncfdtr` improved and this comment is the thing
+        // to revisit -- not a reason for the kernel to fail.
+        assert_eq!(
+            1.0 - ncfdtr(3.0, 5.0, 2.0, 1e12),
+            0.0,
+            "the subtraction is supposed to collapse here; that is the premise"
+        );
+        assert_eq!(1.0 - ncfdtr(5.0, 200.0, 3.0, 1e4), 0.0);
+
+        // Complementarity, but only mid-range, where the subtraction is still
+        // accurate enough for the comparison to mean anything.
+        let x = 3.0;
+        let (p, q) = (ncfdtr(3.0, 5.0, 2.0, x), ncfdtrc(3.0, 5.0, 2.0, x));
+        assert!(
+            (p + q - 1.0).abs() < 1e-12,
+            "cdf {p} + sf {q} = {} should be 1 mid-range",
+            p + q
+        );
+
+        // Boundaries.
+        assert_eq!(ncfdtrc(3.0, 5.0, 2.0, 0.0), 1.0);
+        assert_eq!(ncfdtrc(3.0, 5.0, 2.0, -1.0), 1.0);
+        assert!(ncfdtrc(3.0, 5.0, 2.0, f64::NAN).is_nan());
+        assert!(ncfdtrc(0.0, 5.0, 2.0, 1.0).is_nan());
+        assert!(ncfdtrc(3.0, 5.0, -1.0, 1.0).is_nan());
+        assert_eq!(ncfdtrc(3.0, 5.0, 2.0, f64::INFINITY), 0.0);
+
+        // nc = 0 degenerates to the central F survival. This is a DELIBERATE
+        // DIVERGENCE from the incumbent: scipy.stats.ncf.sf(1e4, 5, 200, 0)
+        // returns -1.0 (its cdf saturates to 1.0 and the complement goes wrong),
+        // while scipy.stats.f.sf(1e4, 5, 200) = 8.213081274649901e-238. A
+        // probability of -1 is not a value worth reproducing, so this kernel
+        // returns the central result and is checked against `f.sf`.
+        let central = ncfdtrc(5.0, 200.0, 0.0, 1e4);
+        let want_central = 8.213_081_274_649_901e-238;
+        assert!(
+            ((central - want_central) / want_central).abs() < 1e-9,
+            "nc=0 should give the central F survival {want_central:e}, got {central:e}"
+        );
+        let mid = ncfdtrc(3.0, 5.0, 0.0, 2.0);
+        assert!(
+            (mid - 0.232_623_918_000_078_6).abs() < 1e-12,
+            "nc=0 mid-range should match scipy.stats.f.sf(2, 3, 5), got {mid}"
         );
     }
 }

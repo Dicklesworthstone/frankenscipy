@@ -49,10 +49,10 @@ pub use beta::{
     BETA_DISPATCH_PLAN, bdtr, bdtrc, bdtri, bdtrik, bdtrin, beta, betainc, betainc_scalar,
     betaincc, betaincc_scalar, betainccinv, betainccinv_scalar, betaln, betaln_scalar, btdtr,
     btdtrc, btdtri, btdtria, btdtrib, fdtr, fdtrc, fdtri, fdtridfd, log_betainc_scalar, nbdtr,
-    nbdtrc, nbdtri, nbdtrik, nbdtrik_many, nbdtrin, ncfdtr, ncfdtri, ncfdtri_many, ncfdtridfd,
-    ncfdtridfd_many, ncfdtridfn, ncfdtridfn_many, ncfdtrinc, ncfdtrinc_many, nctdtr, nctdtr_many,
-    nctdtridf, nctdtridf_many, nctdtrinc, nctdtrinc_many, nctdtrit, nctdtrit_many, stdtr, stdtrc,
-    stdtridf, stdtrit, stdtrit_many,
+    nbdtrc, nbdtri, nbdtrik, nbdtrik_many, nbdtrin, ncfdtr, ncfdtrc, ncfdtri, ncfdtri_many,
+    ncfdtridfd, ncfdtridfd_many, ncfdtridfn, ncfdtridfn_many, ncfdtrinc, ncfdtrinc_many,
+    nctdtr, nctdtr_many, nctdtridf, nctdtridf_many, nctdtrinc, nctdtrinc_many, nctdtrit,
+    nctdtrit_many, stdtr, stdtrc, stdtridf, stdtrit, stdtrit_many,
 };
 pub use convenience::{
     CONVENIENCE_DISPATCH_PLAN,
