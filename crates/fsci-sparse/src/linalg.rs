@@ -27272,3 +27272,242 @@ mod tfqmr_tests {
         );
     }
 }
+
+/// Does the sparsity pattern make `a` lower and/or upper triangular?
+/// -- `scipy.sparse.linalg.is_sptriangular`.
+///
+/// Returns `(lower, upper)`. A diagonal matrix is BOTH, and a matrix with no stored
+/// entries is both vacuously -- there is no entry off the diagonal to violate either
+/// claim. A non-triangular pattern is neither.
+///
+/// ONLY THE STRUCTURE IS EXAMINED, exactly as SciPy documents: stored zeros count as
+/// entries. A matrix carrying an explicit 0.0 above the diagonal is NOT reported
+/// upper-triangular, because the answer describes the sparsity pattern rather than
+/// the values, and a caller dispatching to a triangular solve on the strength of it
+/// would be reading the wrong property otherwise. Callers who want the value-aware
+/// answer must prune explicit zeros first.
+///
+/// If `a` is not square, entries outside the leading square block still participate,
+/// which is SciPy's behaviour too -- its docstring notes the portions outside the
+/// upper-left square "do not affect its triangular structure", meaning a wide or tall
+/// matrix is judged on the same `col <= row` test throughout.
+#[must_use]
+pub fn is_sptriangular(a: &CsrMatrix) -> (bool, bool) {
+    let rows = a.shape().rows;
+    let indptr = a.indptr();
+    let indices = a.indices();
+
+    let mut lower = true;
+    let mut upper = true;
+
+    // SciPy probes three representative lines first (middle, first, last) and bails
+    // out early if both flags are already false. That is an OPTIMIZATION with no
+    // effect on the answer -- the full scan below would reach the same verdict -- and
+    // it is kept because the early exit is what makes this cheap on a large
+    // non-triangular matrix, which is the common case when the question is being
+    // asked at all.
+    if rows > 0 {
+        for probe in [rows / 2, 0, rows - 1] {
+            for idx in indptr[probe]..indptr[probe + 1] {
+                let col = indices[idx];
+                upper = upper && col >= probe;
+                lower = lower && col <= probe;
+            }
+            if !upper && !lower {
+                return (false, false);
+            }
+        }
+    }
+
+    for row in 0..rows {
+        for idx in indptr[row]..indptr[row + 1] {
+            let col = indices[idx];
+            upper = upper && col >= row;
+            lower = lower && col <= row;
+            if !upper && !lower {
+                return (false, false);
+            }
+        }
+    }
+    (lower, upper)
+}
+
+/// Lower and upper bandwidth of the sparsity pattern
+/// -- `scipy.sparse.linalg.spbandwidth`.
+///
+/// Returns `(lower, upper)`, both non-negative: `lower` is how far below the diagonal
+/// the furthest stored entry sits and `upper` how far above. A diagonal matrix gives
+/// `(0, 0)`; a lower-triangular one gives `(k, 0)`.
+///
+/// DISTINCT FROM the crate-private `csr_bandwidth`, which returns a SINGLE
+/// half-bandwidth `max(|col - row|)`. That number cannot tell a lower-triangular
+/// banded matrix from a symmetric one of the same width, which is precisely the
+/// distinction a solver dispatching to a triangular or one-sided banded routine needs.
+/// The two are related by `csr_bandwidth == max(lower, upper)`, and the pair is
+/// strictly more informative.
+///
+/// Like `is_sptriangular`, this reads the PATTERN: an explicitly stored zero counts
+/// toward the bandwidth. An empty matrix is `(0, 0)`, matching SciPy, whose `dok`
+/// branch appends a 0 to the gap list for exactly this reason.
+#[must_use]
+pub fn spbandwidth(a: &CsrMatrix) -> (usize, usize) {
+    let rows = a.shape().rows;
+    let indptr = a.indptr();
+    let indices = a.indices();
+
+    let mut lower = 0usize;
+    let mut upper = 0usize;
+    for row in 0..rows {
+        for idx in indptr[row]..indptr[row + 1] {
+            let col = indices[idx];
+            // `gap = col - row` in SciPy; computed here as two unsigned branches so
+            // there is no signed intermediate to overflow on a large index.
+            if col >= row {
+                upper = upper.max(col - row);
+            } else {
+                lower = lower.max(row - col);
+            }
+        }
+    }
+    (lower, upper)
+}
+
+/// Sparsity-structure predicates -- `is_sptriangular` and `spbandwidth`.
+#[cfg(test)]
+mod structure_predicate_tests {
+    use super::{CooMatrix, CsrMatrix, Shape2D, csr_bandwidth, is_sptriangular, spbandwidth};
+
+    fn build(n: usize, entries: &[(usize, usize)]) -> CsrMatrix {
+        let vals: Vec<f64> = entries.iter().map(|_| 1.0).collect();
+        let rows: Vec<usize> = entries.iter().map(|(r, _)| *r).collect();
+        let cols: Vec<usize> = entries.iter().map(|(_, c)| *c).collect();
+        CooMatrix::from_triplets(Shape2D::new(n, n), vals, rows, cols, true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+    }
+
+    /// SciPy's own docstring examples, used as the fixtures so the expected values
+    /// are the incumbent's rather than mine: a lower-triangular 3x3 gives
+    /// `(True, False)` and a 3x3 identity gives `(True, True)`.
+    #[test]
+    fn matches_the_incumbents_documented_examples() {
+        // [[3,0,0],[1,-1,0],[2,0,1]]
+        let lower = build(3, &[(0, 0), (1, 0), (1, 1), (2, 0), (2, 2)]);
+        assert_eq!(is_sptriangular(&lower), (true, false));
+
+        let identity = build(3, &[(0, 0), (1, 1), (2, 2)]);
+        assert_eq!(
+            is_sptriangular(&identity),
+            (true, true),
+            "a diagonal matrix is BOTH lower and upper triangular"
+        );
+    }
+
+    /// The four structural cases, including the two that are easy to get backwards.
+    #[test]
+    fn the_four_cases_are_distinguished() {
+        let upper = build(4, &[(0, 0), (0, 3), (1, 2), (2, 2), (3, 3)]);
+        assert_eq!(is_sptriangular(&upper), (false, true));
+
+        let strictly_lower = build(4, &[(1, 0), (2, 0), (3, 2)]);
+        assert_eq!(is_sptriangular(&strictly_lower), (true, false));
+
+        let full = build(3, &[(0, 2), (2, 0)]);
+        assert_eq!(
+            is_sptriangular(&full),
+            (false, false),
+            "one entry each side of the diagonal is neither"
+        );
+
+        // Empty: vacuously both. There is no off-diagonal entry to violate either
+        // claim, and SciPy agrees by construction since `all()` of an empty set is
+        // true.
+        let empty = build(3, &[]);
+        assert_eq!(is_sptriangular(&empty), (true, true));
+    }
+
+    /// Bandwidths, and the asymmetry the single half-bandwidth cannot express.
+    #[test]
+    fn bandwidth_reports_each_side_separately() {
+        let diagonal = build(4, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
+        assert_eq!(spbandwidth(&diagonal), (0, 0));
+
+        // Lower triangular with a furthest entry 3 below the diagonal.
+        let lower = build(4, &[(3, 0), (1, 1), (2, 1)]);
+        assert_eq!(spbandwidth(&lower), (3, 0));
+
+        // Upper triangular, 2 above.
+        let upper = build(4, &[(0, 2), (1, 1)]);
+        assert_eq!(spbandwidth(&upper), (0, 2));
+
+        let empty = build(3, &[]);
+        assert_eq!(spbandwidth(&empty), (0, 0), "an empty pattern has no band");
+    }
+
+    /// THE INVARIANT TYING THE TWO TOGETHER, which is stronger evidence than either
+    /// test alone: they read the same pattern through different arithmetic, so they
+    /// must agree. If `is_sptriangular` says lower, `spbandwidth`'s UPPER must be 0,
+    /// and conversely. A sign error in either one breaks this while leaving that
+    /// function's own tests passing.
+    ///
+    /// It also pins the documented relationship to the existing single-number
+    /// helper: `csr_bandwidth == max(lower, upper)`.
+    #[test]
+    fn the_two_predicates_agree_with_each_other() {
+        let fixtures = [
+            vec![(0usize, 0usize), (1, 1), (2, 2), (3, 3)],
+            vec![(3, 0), (1, 1), (2, 1)],
+            vec![(0, 2), (1, 1)],
+            vec![(0, 3), (3, 0), (2, 2)],
+            vec![],
+        ];
+        for entries in &fixtures {
+            let m = build(4, entries);
+            let (lower, upper) = is_sptriangular(&m);
+            let (lo_bw, up_bw) = spbandwidth(&m);
+            assert_eq!(
+                lower,
+                up_bw == 0,
+                "is_sptriangular says lower={lower} but the upper bandwidth is \
+                 {up_bw}; the two disagree about {entries:?}"
+            );
+            assert_eq!(
+                upper,
+                lo_bw == 0,
+                "is_sptriangular says upper={upper} but the lower bandwidth is \
+                 {lo_bw}; the two disagree about {entries:?}"
+            );
+            assert_eq!(
+                csr_bandwidth(&m),
+                lo_bw.max(up_bw),
+                "the single half-bandwidth must be max(lower, upper) for {entries:?}"
+            );
+        }
+    }
+
+    /// The answer is about the PATTERN, not the values: an explicitly stored zero
+    /// above the diagonal keeps the matrix from being lower-triangular. This is the
+    /// behaviour SciPy documents, and it is worth pinning because it is the one a
+    /// caller is most likely to assume otherwise -- dispatching to a triangular
+    /// solve on a value-aware reading would be wrong.
+    #[test]
+    fn stored_zeros_count_as_structure() {
+        let m = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, 0.0],
+            vec![0, 0],
+            vec![0, 1],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        assert_eq!(
+            is_sptriangular(&m),
+            (false, true),
+            "an explicit zero at (0,1) is still an entry above the diagonal"
+        );
+        assert_eq!(spbandwidth(&m), (0, 1));
+    }
+}

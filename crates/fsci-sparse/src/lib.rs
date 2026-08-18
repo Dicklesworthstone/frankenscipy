@@ -160,6 +160,7 @@ pub use linalg::{
     laplacian,
     lgmres,
     lgmres_batch,
+    is_sptriangular,
     lsmr,
     lsmr_damped,
     lsmr_regularized,
@@ -213,6 +214,7 @@ pub use linalg::{
     strongly_connected_components,
     structural_rank,
     svds,
+    spbandwidth,
     tfqmr,
     topological_sort,
 };
