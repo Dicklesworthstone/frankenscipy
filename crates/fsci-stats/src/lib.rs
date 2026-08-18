@@ -7774,14 +7774,29 @@ impl Multinomial {
         Self { n, p: p.to_vec() }
     }
 
-    /// Log probability mass function. Returns `-inf` unless the counts are
-    /// non-negative and sum to `n` (scipy's convention).
+    /// Log probability mass function. Returns `-inf` unless the counts are non-negative
+    /// INTEGERS summing EXACTLY to `n`.
+    ///
+    /// Both conditions are the incumbent's, verified against scipy 1.17.1 rather than
+    /// assumed. `multinomial.logpmf` returns `-inf` for a sum that misses `n` by 5e-10, and
+    /// `-inf` for `[2.5, 3, 4.5]` with `n = 10` — which sums to `n` exactly but is not a
+    /// count vector.
+    ///
+    /// This used to admit a `1e-9` tolerance on the sum and never checked integrality, so it
+    /// returned a FINITE value in both of those cases while claiming to follow "scipy's
+    /// convention". That is the same defect shape as `frankenscipy-clttw`: a tolerance
+    /// standing in for an exact predicate the reference actually uses.
+    ///
+    /// Conforming input — non-negative integers summing to `n` — is unaffected: it passed
+    /// the old check and passes the new one, and nothing downstream of the guard changed.
     pub fn logpmf(&self, x: &[f64]) -> f64 {
         if x.len() != self.p.len() {
             return f64::NEG_INFINITY;
         }
         let sum: f64 = x.iter().sum();
-        if (sum - self.n as f64).abs() > 1e-9 || x.iter().any(|&xi| xi < 0.0) {
+        if sum != self.n as f64
+            || x.iter().any(|&xi| xi < 0.0 || xi.floor() != xi)
+        {
             return f64::NEG_INFINITY;
         }
         let mut lp = ln_gamma(self.n as f64 + 1.0);
@@ -57293,6 +57308,50 @@ mod tests {
             near_r.pvalue,
             exact_r.pvalue
         );
+    }
+
+    /// `Multinomial::logpmf` must reject what scipy rejects.
+    ///
+    /// Verified against scipy 1.17.1 rather than assumed — `multinomial.logpmf` with
+    /// `n = 10`, `p = [0.2, 0.3, 0.5]` returns:
+    ///   [2, 3, 5]              -> -2.4645159601402664
+    ///   [2, 3, 5.0000000005]   -> -inf   (sum misses n by 5e-10)
+    ///   [2, 3, 5.001]          -> -inf
+    ///   [2.5, 3, 4.5]          -> -inf   (sums to n EXACTLY, but not integers)
+    ///
+    /// The old guard used `(sum - n).abs() > 1e-9` and no integrality test, so the second
+    /// and fourth rows returned FINITE values while the doc claimed "scipy's convention".
+    ///
+    /// BOTH ARMS. The conforming row is the must-hit: without it a guard that rejected
+    /// everything would pass every -inf assertion below while destroying the function.
+    #[test]
+    fn multinomial_logpmf_support_is_exact_and_integral_like_scipy() {
+        let p = [0.2, 0.3, 0.5];
+        let dist = Multinomial::new(10, &p);
+
+        // MUST-HIT: a genuine count vector still evaluates, and to scipy's value.
+        let ok = dist.logpmf(&[2.0, 3.0, 5.0]);
+        assert!(
+            (ok - (-2.464_515_960_140_266_4)).abs() < 1e-12,
+            "conforming logpmf {ok} != scipy -2.4645159601402664"
+        );
+
+        // MUST-MISS: sum misses n by 5e-10 — inside the old 1e-9 tolerance.
+        assert_eq!(
+            dist.logpmf(&[2.0, 3.0, 5.000_000_000_5]),
+            f64::NEG_INFINITY,
+            "a 5e-10 sum deviation must be outside the support, as scipy has it"
+        );
+        // MUST-MISS: sums to n EXACTLY but the counts are not integers.
+        assert_eq!(
+            dist.logpmf(&[2.5, 3.0, 4.5]),
+            f64::NEG_INFINITY,
+            "non-integer counts must be outside the support even when they sum to n"
+        );
+        // Unchanged behaviours, asserted so the tightening did not overreach.
+        assert_eq!(dist.logpmf(&[2.0, 3.0, 5.001]), f64::NEG_INFINITY);
+        assert_eq!(dist.logpmf(&[-1.0, 4.0, 7.0]), f64::NEG_INFINITY);
+        assert_eq!(dist.logpmf(&[2.0, 3.0]), f64::NEG_INFINITY, "wrong length");
     }
 
     /// `frankenscipy-clttw`: these three functions grouped ties by a TOLERANCE
