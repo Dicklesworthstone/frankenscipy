@@ -11777,7 +11777,36 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
     debug_assert!(w.len() >= active);
 
     let data = matrix.as_slice();
-    if EIGH_DSYMV_FORCE_DOUBLE_READ.load(std::sync::atomic::Ordering::Relaxed) {
+    // Dispatch order matters: the parallel gather is checked FIRST because it is
+    // bit-identical to the double-read arm (same operand order — see that function's doc),
+    // so selecting it must not also require setting the double-read knob.
+    //
+    // The work gate is deliberate. This matvec runs once per Householder column, so for a
+    // small trailing block the fan-out would pay `rayon::scope` for a few hundred flops. The
+    // gate keeps the parallel arm to blocks where the O(active²) work can repay it, and
+    // below it the arm falls through to exactly the code that runs today — so a
+    // mis-chosen threshold costs nothing but a missed opportunity, never a wrong answer.
+    //
+    // These reads are per COLUMN, not per element, so they are not the per-item barrier
+    // shape that cost 13% in fsci-sparse's merge; hoisting them further would mean
+    // threading state through `symmetric_tridiagonalize_native` for no measurable gain.
+    let parallel_gather = EIGH_DSYMV_PARALLEL_GATHER.load(std::sync::atomic::Ordering::Relaxed)
+        && active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE;
+    if parallel_gather {
+        let nthreads = std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(active / EIGH_DSYMV_PARALLEL_MIN_ROWS_PER_THREAD)
+            .max(1);
+        symmetric_lower_matvec_double_read_gather_parallel(
+            data,
+            n,
+            start,
+            &reflector.values,
+            p,
+            nthreads,
+        );
+    } else if EIGH_DSYMV_FORCE_DOUBLE_READ.load(std::sync::atomic::Ordering::Relaxed) {
         symmetric_lower_matvec_double_read(data, n, start, &reflector.values, p);
     } else {
         symmetric_lower_matvec_one_pass(data, n, start, &reflector.values, p);
@@ -13265,6 +13294,15 @@ pub static EIGH_INVITER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// was worth 2.2-3.5x bit-identically elsewhere in the fleet.
 pub static EIGH_RANK2_UPDATE_FORCE_SCALAR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Smallest trailing block for which the parallel gather is even considered. Below this the
+/// per-column `rayon::scope` costs more than the matvec it splits, and the dispatch falls
+/// through to the serial one-pass arm that runs today (`frankenscipy-ll0kk`).
+const EIGH_DSYMV_PARALLEL_MIN_ACTIVE: usize = 512;
+
+/// Rows a worker must be given before another is added, so a 512-row block does not fan out
+/// across 64 threads to do eight rows each.
+const EIGH_DSYMV_PARALLEL_MIN_ROWS_PER_THREAD: usize = 128;
 
 /// Route the tridiagonalisation's dsymv to the row-parallel GATHER variant
 /// (`frankenscipy-ll0kk`). Default `false`; nothing reads it yet, so it is inert until a
@@ -22859,6 +22897,65 @@ mod tests {
     // Matrix reconstruction/parity checks legitimately index by (i, j); golden
     // fixtures occasionally coincide with named constants like 1/√2.
     #![allow(clippy::needless_range_loop, clippy::approx_constant)]
+
+    /// `frankenscipy-ll0kk`: the row-parallel GATHER dsymv must be BIT-IDENTICAL to the
+    /// scatter it mirrors, not merely close.
+    ///
+    /// The claim is about operand ORDER: the scatter accumulates `product[i]` over ascending
+    /// `col_offset` from `0.0`, and the gather sums the same terms for the same `i` in the
+    /// same ascending order from the same `0.0`. This test is what makes that claim falsifiable
+    /// rather than an argument in a doc comment.
+    ///
+    /// Note the two functions read the SAME entries — `data[row*n+col]` above the diagonal,
+    /// `data[col*n+row]` on or below — so the fixture does NOT need to be symmetric for them
+    /// to agree. An asymmetric fixture is therefore the stronger choice: it would expose a
+    /// transposed index in either implementation, which a symmetric one would silently hide.
+    #[test]
+    fn parallel_gather_dsymv_is_bit_identical_to_the_double_read_scatter() {
+        let n = 640usize;
+        let start = 7usize;
+        let active = n - start;
+        assert!(
+            active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE,
+            "fixture below the parallel gate; the arms would not differ in shape"
+        );
+
+        // Deliberately ASYMMETRIC and irrational-ish, so a transposed read cannot coincide.
+        let data: Vec<f64> = (0..n * n)
+            .map(|i| {
+                let x = ((i as u64).wrapping_mul(6_364_136_223_846_793_005) >> 11) as f64;
+                x / (u64::MAX >> 11) as f64 - 0.5
+            })
+            .collect();
+        // Include exact zeros in the vector: both arms skip `v_col == 0.0`, and dropping that
+        // skip is NOT a no-op for signed zeros, so the fixture must exercise it.
+        let vector: Vec<f64> = (0..active)
+            .map(|j| if j % 37 == 0 { 0.0 } else { ((j % 13) as f64 - 6.0) / 7.0 })
+            .collect();
+
+        let mut serial = vec![0.0f64; active];
+        symmetric_lower_matvec_double_read(&data, n, start, &vector, &mut serial);
+
+        for nthreads in [2usize, 4, 8] {
+            let mut parallel = vec![0.0f64; active];
+            symmetric_lower_matvec_double_read_gather_parallel(
+                &data, n, start, &vector, &mut parallel, nthreads,
+            );
+            for (i, (a, b)) in serial.iter().zip(parallel.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "nthreads={nthreads} row {i}: scatter {a} vs gather {b}"
+                );
+            }
+        }
+
+        // Guard against a vacuous pass: an all-zero product would compare equal trivially.
+        assert!(
+            serial.iter().any(|v| *v != 0.0 && v.is_finite()),
+            "fixture produced a degenerate all-zero product"
+        );
+    }
     use std::sync::atomic::Ordering;
 
     use super::*;
