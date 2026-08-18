@@ -6706,25 +6706,59 @@ pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgEr
             }
             *col = v;
         }
+        // RESTORING THE PHASE IS NOT OPTIONAL, and it is the part of dgebak that is
+        // easy to forget. Upstream, every complex eigenvector was rotated so its
+        // largest-magnitude component is real and positive -- LAPACK's convention,
+        // and what SciPy returns. Multiplying by `T` changes the magnitudes, so a
+        // different component is now the largest and that rotation no longer holds.
+        // Renormalizing the length alone would leave unit vectors carrying an
+        // ARBITRARY PHASE: still correct eigenvectors, still unit norm, and no
+        // longer comparable to SciPy's element by element. So the same rotation is
+        // re-applied here, in the same form as the upstream site.
         let mut c = 0usize;
         while c < rows {
             let is_pair = block_starts.get(c).is_some_and(|&(_, b)| b)
                 && c + 1 < rows
                 && block_starts.get(c + 1).is_some_and(|&(_, b)| b);
-            let span = if is_pair { 2 } else { 1 };
-            let norm: f64 = (c..c + span)
-                .flat_map(|k| eigvec_cols[k].iter())
-                .map(|x| x * x)
-                .sum::<f64>()
-                .sqrt();
-            if norm > 0.0 {
-                for k in c..c + span {
-                    for x in &mut eigvec_cols[k] {
+            if is_pair {
+                let mut piv = 0usize;
+                let mut best = -1.0_f64;
+                for r in 0..rows {
+                    let (re, im) = (eigvec_cols[c][r], eigvec_cols[c + 1][r]);
+                    let mag = re * re + im * im;
+                    if mag > best {
+                        best = mag;
+                        piv = r;
+                    }
+                }
+                let theta = eigvec_cols[c + 1][piv].atan2(eigvec_cols[c][piv]);
+                let (ct, st) = (theta.cos(), theta.sin());
+                let mut nrm = 0.0_f64;
+                for r in 0..rows {
+                    let (re, im) = (eigvec_cols[c][r], eigvec_cols[c + 1][r]);
+                    let nr = re * ct + im * st;
+                    let ni = im * ct - re * st;
+                    eigvec_cols[c][r] = nr;
+                    eigvec_cols[c + 1][r] = ni;
+                    nrm += nr * nr + ni * ni;
+                }
+                let nrm = nrm.sqrt();
+                if nrm > 0.0 {
+                    for r in 0..rows {
+                        eigvec_cols[c][r] /= nrm;
+                        eigvec_cols[c + 1][r] /= nrm;
+                    }
+                }
+                c += 2;
+            } else {
+                let norm: f64 = eigvec_cols[c].iter().map(|x| x * x).sum::<f64>().sqrt();
+                if norm > 0.0 {
+                    for x in &mut eigvec_cols[c] {
                         *x /= norm;
                     }
                 }
+                c += 1;
             }
-            c += span;
         }
     }
 
@@ -41244,5 +41278,104 @@ mod toggle_ab_eig_balance {
             worst_residual(&m, &balanced) < 1e-8,
             "balanced arm broke the defining relation on an already-balanced matrix"
         );
+    }
+
+    /// A fixture mixing a genuine conjugate pair with a real pair, badly scaled the
+    /// same exact way. `[[0,1],[-1,0]]` contributes eigenvalues +/- i; `[[3,1],[1,2]]`
+    /// contributes (5 +/- sqrt(5))/2.
+    fn badly_scaled_with_complex() -> Vec<Vec<f64>> {
+        let m = vec![
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![-1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 3.0, 1.0],
+            vec![0.0, 0.0, 1.0, 2.0],
+        ];
+        let d = [1.0, 1024.0, 1.0 / 1024.0, 65536.0];
+        let n = 4;
+        let mut a = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i][j] = d[i] * m[i][j] / d[j];
+            }
+        }
+        a
+    }
+
+    /// THE PHASE CONVENTION SURVIVES THE BACK-TRANSFORM.
+    ///
+    /// This is a property the residual test CANNOT check, and that is the whole
+    /// reason it exists separately: any phase rotation of a complex eigenvector is
+    /// still an eigenvector, so `A v = lambda v` holds no matter what phase comes
+    /// out. But LAPACK -- and therefore SciPy -- returns the vector rotated so its
+    /// largest-magnitude component is REAL AND POSITIVE, and callers compare against
+    /// that element by element.
+    ///
+    /// `eig` establishes that convention upstream. Multiplying by the balancing
+    /// transform changes the component magnitudes, so a different component becomes
+    /// the largest and the rotation no longer holds; renormalizing length alone
+    /// would leave a unit vector with an arbitrary phase. A test that only checked
+    /// norms and residuals would pass on exactly that.
+    #[test]
+    fn the_lapack_phase_convention_survives_balancing() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let a = badly_scaled_with_complex();
+
+        for balanced in [false, true] {
+            EIG_BALANCE.store(balanced, Ordering::Relaxed);
+            let r = eig(&a, DecompOptions::default());
+            EIG_BALANCE.store(false, Ordering::Relaxed);
+            let r = r.unwrap_or_else(|e| panic!("eig failed (balanced={balanced}): {e:?}"));
+
+            let n = a.len();
+            // MUST-HIT on the fixture: it has to actually contain a conjugate pair,
+            // or this test would pass by never entering the branch it checks.
+            let pairs = r.eigenvalues_im.iter().filter(|v| v.abs() > 1e-9).count();
+            assert!(
+                pairs >= 2,
+                "fixture produced no conjugate pair (balanced={balanced}), so the \
+                 phase convention is never exercised"
+            );
+
+            let mut c = 0usize;
+            while c < n {
+                if r.eigenvalues_im[c].abs() > 1e-9 {
+                    let re: Vec<f64> = (0..n).map(|i| r.eigenvectors[i][c]).collect();
+                    let im: Vec<f64> = (0..n).map(|i| r.eigenvectors[i][c + 1]).collect();
+                    let mut piv = 0usize;
+                    let mut best = -1.0f64;
+                    for i in 0..n {
+                        let mag = re[i] * re[i] + im[i] * im[i];
+                        if mag > best {
+                            best = mag;
+                            piv = i;
+                        }
+                    }
+                    assert!(
+                        im[piv].abs() < 1e-9,
+                        "balanced={balanced}: largest component of the complex \
+                         eigenvector at column {c} is not real (im = {}), so the \
+                         LAPACK phase convention was lost -- the vector is still a \
+                         valid eigenvector, which is why the residual test cannot \
+                         see this",
+                        im[piv]
+                    );
+                    assert!(
+                        re[piv] > 0.0,
+                        "balanced={balanced}: largest component at column {c} is real \
+                         but negative ({}), which is half the convention",
+                        re[piv]
+                    );
+                    let nrm: f64 = re.iter().chain(im.iter()).map(|x| x * x).sum::<f64>();
+                    assert!(
+                        (nrm - 1.0).abs() < 1e-9,
+                        "balanced={balanced}: complex pair at column {c} is not unit \
+                         norm ({nrm}); the pair must share ONE factor"
+                    );
+                    c += 2;
+                } else {
+                    c += 1;
+                }
+            }
+        }
     }
 }
