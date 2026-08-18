@@ -57251,6 +57251,50 @@ mod tests {
         );
     }
 
+    /// `frankenscipy-clttw` — the wilcoxon half, which the three-function test above does
+    /// NOT cover.
+    ///
+    /// `wilcoxon` took its ranks from the exact ranker all along; only its tie CORRECTION
+    /// grouped by `|a − b| < 1e-12`. That correction is consumed solely on the normal
+    /// approximation, so a fixture must contain a GENUINE tie (to force that path) as well
+    /// as a NEAR-tie (to expose the predicate). A clean fixture exercises neither, which is
+    /// why every existing wilcoxon test passed both before and after the fix.
+    ///
+    /// NO GOLDEN IS HARDCODED, deliberately. Which branch the implementation takes decides
+    /// what the right number is, and a value I could not execute would be a guess wearing a
+    /// constant's clothing. Instead this asserts the INVARIANT that the predicate change is
+    /// about: two inputs scipy treats as different must not collapse to the same answer.
+    /// scipy 1.17.1 gives p 0.875 for the 5e-13-separated pair and 0.921875 once it is made
+    /// exactly equal; under the old tolerance both inputs produced the SAME result, so this
+    /// assertion fails on the old predicate and holds on the new one.
+    #[test]
+    fn wilcoxon_tie_correction_separates_near_ties_from_exact_ties() {
+        // |d| = 3 appears twice: a genuine tie, forcing the normal-approximation path where
+        // the tie correction is actually used.
+        let near: [f64; 8] = [3.0, -3.0, 5.0, -(5.0 + 5e-13), 7.0, -9.0, 11.0, -13.0];
+        // Same data with the near-tied pair collapsed to an EXACT tie.
+        let exact: [f64; 8] = [3.0, -3.0, 5.0, -5.0, 7.0, -9.0, 11.0, -13.0];
+        let zeros = [0.0f64; 8];
+
+        let near_r = wilcoxon(&near, &zeros);
+        let exact_r = wilcoxon(&exact, &zeros);
+
+        assert!(
+            near_r.pvalue.is_finite() && exact_r.pvalue.is_finite(),
+            "degenerate fixture: near p={} exact p={}",
+            near_r.pvalue,
+            exact_r.pvalue
+        );
+        assert_ne!(
+            near_r.pvalue.to_bits(),
+            exact_r.pvalue.to_bits(),
+            "wilcoxon merged a 5e-13 separation into an exact tie: near p={} exact p={}. \
+             scipy distinguishes these (0.875 vs 0.921875); a tolerance predicate does not.",
+            near_r.pvalue,
+            exact_r.pvalue
+        );
+    }
+
     /// `frankenscipy-clttw`: these three functions grouped ties by a TOLERANCE
     /// (`|a-b| < 1e-12` / `< 1e-10`) where scipy's `_rankdata` groups by EXACT equality.
     /// Values distinct to scipy were merged into one tie group, changing the ranks — and
@@ -96510,6 +96554,155 @@ mod tests {
                 && !CONTINGENCY_SORT_FORCE_SERIAL.load(Ordering::Relaxed),
             "a toggle was left flipped, which would leak into every later test \
              sharing TOGGLE_LOCK"
+        );
+    }
+}
+
+/// frankenscipy-clttw — the tie predicate must be EXACT EQUALITY, not a tolerance.
+///
+/// `scipy.stats.wilcoxon` derives its tie counts from the same ranking pass that
+/// produces the ranks (`_wilcoxon.py:138`), and `_rankdata` groups by exact
+/// equality. fsci used to clone the absolute differences, sort them a second time,
+/// and group with `(a - b).abs() < 1e-12`. The variance formula already matched —
+/// fsci's `tie_sum/48` against scipy's `tie_correct/2/24` is the same expression —
+/// so ONLY the grouping predicate diverged, and that was enough to change the
+/// p-value.
+///
+/// The fixture below is not invented: it is the pair the bead established against
+/// the live oracle, with both arms observed.
+///
+///     _rankdata([[1.0, 1.0+5e-13, 2.0, 3.0]], 'average', return_ties=True)
+///         -> t [1,1,1,1], tie_correct 0.0     MUST-MISS: 5e-13 apart is DISTINCT
+///     _rankdata([[1.0, 1.0,       2.0, 3.0]], 'average', return_ties=True)
+///         -> tie_correct 6.0                  MUST-HIT:  identical is TIED
+///
+/// The two values differ by 5e-13 and print identically as `1.`, which is exactly
+/// why a tolerance looks harmless and is not.
+#[cfg(test)]
+mod clttw_tie_predicate_is_exact {
+    use super::{
+        RANKDATA_RADIX_DISABLE, RankTieMethod, rankdata_ties_with_tie_sum, wilcoxon,
+    };
+    use std::sync::atomic::Ordering;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `tie_sum` is fsci's spelling of scipy's `tie_correct = sum(t**3 - t)`, so
+    /// these constants come straight from the oracle transcript.
+    const DISTINCT_TIE_CORRECT: f64 = 0.0;
+    const TIED_TIE_CORRECT: f64 = 6.0;
+
+    #[test]
+    fn a_five_e_minus_thirteen_gap_is_not_a_tie() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let distinct = [1.0, 1.0 + 5e-13, 2.0, 3.0];
+        let tied = [1.0, 1.0, 2.0, 3.0];
+
+        // The fixture only means anything if the two values really are distinct
+        // bit patterns; if 5e-13 were absorbed by rounding at this magnitude the
+        // test would be asserting something vacuous.
+        assert_ne!(
+            distinct[0].to_bits(),
+            distinct[1].to_bits(),
+            "the fixture's two values are the same f64, so this test cannot \
+             distinguish an exact predicate from a tolerant one"
+        );
+
+        let (_r, distinct_sum) =
+            rankdata_ties_with_tie_sum(&distinct, RankTieMethod::Average);
+        let (_r, tied_sum) = rankdata_ties_with_tie_sum(&tied, RankTieMethod::Average);
+
+        assert_eq!(
+            distinct_sum, DISTINCT_TIE_CORRECT,
+            "values 5e-13 apart were grouped as a tie (tie_sum {distinct_sum}); scipy's \
+             _rankdata groups by EXACT equality and reports 0.0 here"
+        );
+        assert_eq!(
+            tied_sum, TIED_TIE_CORRECT,
+            "identical values were not grouped (tie_sum {tied_sum}); scipy reports 6.0"
+        );
+    }
+
+    /// BOTH RANKING PATHS MUST AGREE. `rankdata_ties_with_tie_sum` has a radix path
+    /// above `RANKDATA_RADIX_MIN` and a comparison path below it, each with its own
+    /// tie-grouping scan. A tolerance could creep back into either one
+    /// independently, and the small fixture above only ever exercises the
+    /// comparison path.
+    #[test]
+    fn the_radix_and_comparison_paths_group_ties_identically() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Large enough to cross the radix threshold, with the near-tie repeated
+        // throughout so the grouping scan meets it many times rather than once.
+        let n = (1usize << 14) + 64;
+        let data: Vec<f64> = (0..n)
+            .map(|i| {
+                let base = (i / 4) as f64;
+                match i % 4 {
+                    0 => base,
+                    1 => base + 5e-13, // near-tie: must NOT group
+                    2 => base + 1.0,
+                    _ => base + 1.0,   // exact tie: MUST group
+                }
+            })
+            .collect();
+
+        RANKDATA_RADIX_DISABLE.store(true, Ordering::Relaxed);
+        let (ranks_cmp, sum_cmp) = rankdata_ties_with_tie_sum(&data, RankTieMethod::Average);
+        RANKDATA_RADIX_DISABLE.store(false, Ordering::Relaxed);
+        let (ranks_radix, sum_radix) = rankdata_ties_with_tie_sum(&data, RankTieMethod::Average);
+        RANKDATA_RADIX_DISABLE.store(false, Ordering::Relaxed);
+
+        assert_eq!(
+            sum_cmp, sum_radix,
+            "the two ranking paths disagree on tie_sum ({sum_cmp} vs {sum_radix}); one \
+             of them is grouping by something other than exact equality"
+        );
+        assert!(
+            ranks_cmp
+                .iter()
+                .zip(&ranks_radix)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the two ranking paths produce different ranks; the radix path documents \
+             itself as byte-identical to the comparison path"
+        );
+        // MUST-HIT: the fixture has to contain real ties, or agreeing on zero
+        // proves nothing.
+        assert!(
+            sum_cmp > 0.0,
+            "the fixture produced no ties at all (tie_sum {sum_cmp}), so both paths \
+             agreeing says nothing about how they group"
+        );
+    }
+
+    /// END TO END: the divergence has to reach the p-value, or it is a curiosity
+    /// rather than a conformance defect. Paired samples whose absolute differences
+    /// contain the near-tie must give a DIFFERENT answer from ones where those two
+    /// differences are exactly equal.
+    #[test]
+    fn the_predicate_reaches_the_wilcoxon_pvalue() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Differences: 1.0, 1.0+5e-13, 2.0, 3.0, 4.0, 5.0 (all positive, no zeros,
+        // which wilcoxon would otherwise drop).
+        let x = vec![1.0, 1.0 + 5e-13, 2.0, 3.0, 4.0, 5.0];
+        let y = vec![0.0; 6];
+        let near = wilcoxon(&x, &y);
+
+        let mut x_tied = x.clone();
+        x_tied[1] = 1.0; // now an exact tie
+        let exact = wilcoxon(&x_tied, &y);
+
+        assert!(
+            near.pvalue.is_finite() && exact.pvalue.is_finite(),
+            "wilcoxon returned a non-finite p-value on a well-formed fixture"
+        );
+        assert_ne!(
+            near.pvalue.to_bits(),
+            exact.pvalue.to_bits(),
+            "a 5e-13 gap and an exact tie produced the SAME p-value, which means the \
+             tie predicate is not distinguishing them -- the tolerance is back"
         );
     }
 }
