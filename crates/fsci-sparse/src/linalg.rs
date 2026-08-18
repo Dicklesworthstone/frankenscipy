@@ -7629,7 +7629,7 @@ pub fn lsmr(
     b: &[f64],
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
-    lsmr_impl(a, b, 0.0, options)
+    lsmr_impl(a, b, 0.0, None, options)
 }
 
 /// LSMR with Tikhonov regularization — `scipy.sparse.linalg.lsmr(A, b, damp=...)`.
@@ -7677,13 +7677,62 @@ pub fn lsmr_damped(
             message: format!("lsmr damp must be finite, got {damp}"),
         });
     }
-    lsmr_impl(a, b, damp, options)
+    lsmr_impl(a, b, damp, None, options)
+}
+
+/// LSMR with regularization AND a warm start -- the general entry point.
+///
+/// `scipy.sparse.linalg.lsmr(A, b, damp=..., x0=...)`. `lsmr` and `lsmr_damped` are
+/// thin wrappers over this; three separate combinations of two optional features is
+/// how an API accretes into eight, so the general form is the one that carries the
+/// implementation.
+///
+/// WHAT `x0` ACTUALLY DOES, since "initial guess" undersells the bookkeeping: the
+/// iteration restarts from the RESIDUAL of the guess, `u = b - A x0`, and accumulates
+/// the correction into `x`, which begins at `x0` rather than at zero
+/// (`_isolve/lsmr.py:243-245`).
+///
+/// The trap is that `||b - A x0||` and `||b||` are the same number ONLY when `x0` is
+/// absent. The first drives the iteration; the second is the denominator of the
+/// reported relative residual, which stays relative to `b` no matter where the solve
+/// started. Using the first as the denominator would make a warm start look better
+/// than a cold one on the same problem purely by rescaling its own yardstick -- the
+/// solver would appear to improve as the guess improved, which is precisely backwards
+/// as a quality measure.
+///
+/// A guess that already solves the system exactly returns immediately: there is no
+/// correction to compute, and normalizing by a zero residual would produce NaN.
+pub fn lsmr_regularized(
+    a: &CsrMatrix,
+    b: &[f64],
+    damp: f64,
+    x0: Option<&[f64]>,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    if !damp.is_finite() {
+        return Err(SparseError::NonFiniteInput {
+            message: format!("lsmr damp must be finite, got {damp}"),
+        });
+    }
+    if let Some(start) = x0 {
+        let n = a.shape().cols;
+        if start.len() != n {
+            return Err(SparseError::IncompatibleShape {
+                message: format!(
+                    "lsmr x0 length {} must match matrix columns {n}",
+                    start.len()
+                ),
+            });
+        }
+    }
+    lsmr_impl(a, b, damp, x0, options)
 }
 
 fn lsmr_impl(
     a: &CsrMatrix,
     b: &[f64],
     damp: f64,
+    x0: Option<&[f64]>,
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
     let shape = a.shape();
@@ -7708,7 +7757,39 @@ fn lsmr_impl(
 
     let max_iter = options.max_iter.unwrap_or(n * 10);
     let a_csc = a.to_csc()?;
-    let mut u: Vec<f64> = b.iter().map(|entry| entry / b_norm).collect();
+    // With an initial guess the iteration starts from the RESIDUAL of that
+    // guess, `u = b - A x0`, and accumulates the correction into `x` -- SciPy
+    // does exactly this (`_isolve/lsmr.py:243-245`).
+    //
+    // `beta_0` and `b_norm` are the same number only when `x0` is absent, and
+    // conflating them is the easy mistake here: `beta_0` drives the ITERATION
+    // while `b_norm` is the denominator of the reported RELATIVE RESIDUAL, which
+    // stays relative to `b` regardless of where the solve started. Reusing
+    // `beta_0` as the denominator would make a warm start look better than a
+    // cold one on the same problem purely by rescaling its own yardstick.
+    let (mut u, beta_0) = match x0 {
+        None => (b.to_vec(), b_norm),
+        Some(start) => {
+            let ax0 = csr_matvec(a, start);
+            let residual: Vec<f64> =
+                b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
+            let norm = vec_norm(&residual);
+            (residual, norm)
+        }
+    };
+    if beta_0 == 0.0 {
+        // The guess already solves the system exactly; there is no correction to
+        // compute and dividing by `beta_0` below would produce NaN.
+        return Ok(IterativeSolveResult {
+            solution: x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec),
+            converged: true,
+            iterations: 0,
+            residual_norm: 0.0,
+        });
+    }
+    for entry in &mut u {
+        *entry /= beta_0;
+    }
     let mut v = csc_matvec(&a_csc, &u);
     let mut alpha = vec_norm(&v);
     // α = ‖Aᵀu‖ with u already normalized, so it carries the units of ‖A‖: a
@@ -7720,11 +7801,16 @@ fn lsmr_impl(
     // on `alpha > 0` / `beta > 0`, never on eps. α = 0 means Aᵀb = 0, where
     // x = 0 really is the exact least-squares solution.
     if alpha == 0.0 {
+        // A^T r = 0 at the starting point, so the starting point already
+        // minimizes -- x0 if one was given, else 0. The reported residual is
+        // that point's, which is 1.0 only in the cold-start case where the
+        // residual IS b.
+        let residual_norm = beta_0 / b_norm;
         return Ok(IterativeSolveResult {
-            solution: vec![0.0; n],
-            converged: 1.0 <= options.tol,
+            solution: x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec),
+            converged: residual_norm <= options.tol,
             iterations: 0,
-            residual_norm: 1.0,
+            residual_norm,
         });
     }
     for entry in &mut v {
@@ -7733,7 +7819,7 @@ fn lsmr_impl(
 
     // Fong & Saunders, Algorithm 6.1.  These rotations distinguish LSMR
     // from LSQR even though both use Golub-Kahan bidiagonalization.
-    let mut beta = b_norm;
+    let mut beta = beta_0;
     let mut alpha_bar = alpha;
     let mut rho = 1.0;
     let mut rho_bar = 1.0;
@@ -7753,7 +7839,7 @@ fn lsmr_impl(
     // (frankenscipy-7crv5), accumulated from the bidiagonal entries as SciPy
     // accumulates `normA2`.
     let mut a_norm_sq = 0.0_f64;
-    let mut x = vec![0.0; n];
+    let mut x = x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec);
     let mut av = vec![0.0; m];
     let mut atu = vec![0.0; n];
 
@@ -26451,5 +26537,136 @@ mod lsqr_damp_tests {
             );
         }
         assert!(lsqr_damped(&a, &b, 0.25, opts()).is_ok(), "0.25 was rejected");
+    }
+}
+
+/// Warm starts for LSMR -- `scipy.sparse.linalg.lsmr(A, b, x0=...)`.
+#[cfg(test)]
+mod lsmr_x0_tests {
+    use super::{
+        CooMatrix, CsrMatrix, IterativeSolveOptions, SparseError, Shape2D, lsmr,
+        lsmr_regularized,
+    };
+
+    /// Well-conditioned 3x2 with a unique least-squares solution, so a warm start
+    /// has a definite answer to converge to.
+    fn overdetermined() -> (CsrMatrix, Vec<f64>) {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 2),
+            vec![1.0, 1.0, 1.0, 2.0, 1.0, 3.0],
+            vec![0, 0, 1, 1, 2, 2],
+            vec![0, 1, 0, 1, 0, 1],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        (a, vec![2.0, 3.0, 5.0])
+    }
+
+    fn opts() -> IterativeSolveOptions {
+        IterativeSolveOptions {
+            tol: 1e-12,
+            max_iter: Some(200),
+            ..IterativeSolveOptions::default()
+        }
+    }
+
+    /// MUST-MISS: `x0 = None` is the cold path, BIT FOR BIT. The residual of a zero
+    /// guess is `b` itself and its norm is `||b||`, so every value the iteration sees
+    /// is the one it saw before `x0` existed.
+    #[test]
+    fn no_guess_is_bit_identical_to_plain_lsmr() {
+        let (a, b) = overdetermined();
+        let plain = lsmr(&a, &b, opts()).expect("plain");
+        let general = lsmr_regularized(&a, &b, 0.0, None, opts()).expect("x0=None");
+        for (i, (x, y)) in plain.solution.iter().zip(&general.solution).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "component {i}: {x} vs {y}");
+        }
+        assert_eq!(plain.iterations, general.iterations);
+        assert_eq!(
+            plain.residual_norm.to_bits(),
+            general.residual_norm.to_bits()
+        );
+    }
+
+    /// MUST-HIT: a warm start reaches the SAME minimizer as a cold one. The least
+    /// squares solution is unique here, so the starting point may change the path but
+    /// must not change the destination -- which is the property a broken `x0` breaks.
+    #[test]
+    fn a_warm_start_converges_to_the_same_solution() {
+        let (a, b) = overdetermined();
+        let cold = lsmr(&a, &b, opts()).expect("cold");
+        let guess = vec![cold.solution[0] + 0.35, cold.solution[1] - 0.2];
+        let warm = lsmr_regularized(&a, &b, 0.0, Some(&guess), opts()).expect("warm");
+
+        for (i, (c, w)) in cold.solution.iter().zip(&warm.solution).enumerate() {
+            assert!(
+                (c - w).abs() < 1e-8,
+                "warm start landed elsewhere at {i}: cold {c} vs warm {w}"
+            );
+        }
+        // The guess must actually have been WRONG, or "same destination" is trivial.
+        let moved: f64 = guess
+            .iter()
+            .zip(&cold.solution)
+            .map(|(g, c)| (g - c).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            moved > 0.1,
+            "the fixture's guess was already the answer ({moved}); this test would \
+             pass even if x0 were ignored entirely"
+        );
+    }
+
+    /// A guess that is already the exact solution returns immediately rather than
+    /// dividing by a zero residual. `[0,0]` against `b = 0` is the clean case: the
+    /// residual is exactly zero, and the old code would have produced NaN by
+    /// normalizing `u` by it.
+    #[test]
+    fn an_exact_guess_returns_without_iterating() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(2, 2),
+            vec![1.0, 1.0],
+            vec![0, 1],
+            vec![0, 1],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let b = vec![3.0, -4.0];
+        // A is the identity, so x0 = b solves it exactly.
+        let r = lsmr_regularized(&a, &b, 0.0, Some(&b.clone()), opts()).expect("exact");
+        assert_eq!(r.iterations, 0, "an exact guess should not iterate");
+        assert!(r.converged, "an exact guess is converged");
+        assert_eq!(r.residual_norm, 0.0, "residual of an exact guess is zero");
+        assert!(
+            r.solution.iter().all(|v| v.is_finite()),
+            "exact guess produced non-finite output: {:?}",
+            r.solution
+        );
+    }
+
+    /// A wrongly sized guess is rejected rather than silently indexing past the end
+    /// or solving a different problem.
+    #[test]
+    fn a_mis_sized_guess_is_rejected() {
+        let (a, b) = overdetermined();
+        let bad = vec![1.0, 2.0, 3.0]; // n is 2, not 3
+        assert!(
+            matches!(
+                lsmr_regularized(&a, &b, 0.0, Some(&bad), opts()),
+                Err(SparseError::IncompatibleShape { .. })
+            ),
+            "a length-3 guess for a 2-column matrix was accepted"
+        );
+        // MUST-MISS: a correctly sized guess is not rejected, or the guard could be
+        // passing the test above by refusing every guess.
+        let ok = vec![0.0, 0.0];
+        assert!(
+            lsmr_regularized(&a, &b, 0.0, Some(&ok), opts()).is_ok(),
+            "a correctly sized guess was rejected"
+        );
     }
 }
