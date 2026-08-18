@@ -36454,3 +36454,47 @@ this up needs a quiet window: re-run `drive3.sh`, and reject the result unless p
 loadavg is stable across the whole run rather than merely low at the start. Note that the
 Newton-Krylov COUNTED metric (nfev) would survive a contended window unharmed — counts
 are deterministic — so if only the counts are wanted, contention is not a reason to wait.
+
+## Large-n follow-up, load-independent metrics only — Broyden parity HOLDS, Newton-Krylov step quality DEGRADES
+
+2026-08-18, re-run after the contended attempt above was discarded. Host was NOT quiet
+(loadavg 54.9–106.4 across the run, CPU idle 42–63%, iowait 1–15%, MHz 3872–4057), so
+this run deliberately collected ONLY metrics that a contended host cannot corrupt:
+deterministic evaluation counts and exact residual values. No wall-clock ratio was taken
+and none is reported. Same binaries, sha-verified byte-identical to the banked rows.
+Determinism confirmed by two independent passes returning identical counts.
+
+### Broyden: exact parity extends to n = 32768
+
+| n | fsci final residual | scipy final residual | rel diff |
+|---|---|---|---|
+| 8192 | 5.327782e0 | 5.327782e+00 | 0.00e+00 |
+| 16384 | 7.271271e0 | 7.271271e+00 | 0.00e+00 |
+| 32768 | 1.058844e1 | 1.058844e+01 | 0.00e+00 |
+
+Parity now holds to every printed digit across n = 64 … 32768, a 512x range.
+
+### Newton-Krylov: OUR DEFICIT GROWS WITH n AND BECOMES A CONVERGENCE FAILURE
+
+| n | fsci LGMRES nfev / Newton | scipy nfev / Newton | our evaluation cost | outcome |
+|---|---|---|---|---|
+| 6400 | 358 / 17 | 277 / 8 | 1.29x | both converge |
+| 9216 | 526 / 25 | 356 / 10 | 1.48x | both converge |
+| 16384 | 841 / 40 | 479 / 13 | 1.76x | **we hit the 40-step cap at 1.297e-7; scipy converged** |
+
+**THIS SHARPENS A FINDING PREVIOUSLY RECORDED AS A CURIOSITY INTO A REAL DEFECT.** The
+earlier sweep (n ≤ 4096) showed evaluation-count PARITY with our Newton step count merely
+higher, and the note said "worth chasing; not chased here". That reading was too kind:
+extended to larger n the evaluation cost diverges — 1.29x, 1.48x, 1.76x — and at n=16384
+we fail to converge inside a budget scipy clears in 13 Newton steps. The small-n parity
+was the tail of a trend, not a plateau.
+
+Suspected cause, unchanged and now worth acting on: our GCR seeds the augmentation
+directions FIRST and then falls back to the residual, whereas LGMRES proper augments the
+Krylov basis rather than pre-empting it. Pre-empting spends the early iterations on
+stale directions, which costs more the larger the space is.
+
+**THE AUGMENTATION ITSELF IS STILL DOING ITS JOB** — this is a deficit against SciPy, not
+against no augmentation. At n=16384 both of our arms hit the identical 841-evaluation cap,
+and at that equal budget LGMRES reaches 1.297e-7 where plain GMRES reaches 1.300e0: seven
+orders of magnitude, same cost. The mechanism is right; the basis construction is not.
