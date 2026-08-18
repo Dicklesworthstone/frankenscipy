@@ -222,6 +222,109 @@ fn eig2x2(a: f64, b: f64, c: f64, d: f64) -> (Eigenvalue, Eigenvalue) {
     }
 }
 
+/// Standardize the 2x2 diagonal blocks of a converged quasi-triangular `T`, in the
+/// sense of LAPACK `dlanv2`: any block whose eigenvalues are REAL is split by a
+/// rotation that drives its subdiagonal entry to exactly zero, leaving two 1x1
+/// blocks. Blocks with a genuine conjugate pair are left alone.
+///
+/// ## Why this is not optional
+///
+/// The QR sweep deflates a trailing 2x2 as soon as its leading subdiagonal is
+/// negligible, and reads the eigenvalues off it directly. That is correct for the
+/// EIGENVALUES, and it is exactly what the eigenvalue-only path does. But it leaves
+/// `T` carrying a 2x2 block that may have real eigenvalues and a non-zero
+/// subdiagonal, and `eig`'s downstream classifier decides "complex pair" purely on
+/// whether that subdiagonal is negligible.
+///
+/// Feeding it such a block produces a WRONG ANSWER, not a rounding difference:
+/// `eig` computes `im = sqrt(max(-disc, 0))/2` and pushes `re = trace/2` TWICE, so a
+/// block with real distinct eigenvalues `l1 != l2` is reported as the repeated
+/// value `(l1+l2)/2` twice, and both are then routed through the complex
+/// eigenvector packing. nalgebra's Schur standardizes, which is why the existing
+/// path never exhibits this; a replacement that does not standardize would
+/// introduce it.
+///
+/// ## The construction
+///
+/// LAPACK's real branch, with its own scaling. `z` is the discriminant expressed so
+/// that the comparison against `4*eps` decides real-versus-complex WITHOUT forming
+/// a difference of two nearly equal numbers, and the rotation is built from
+/// `hypot(c, z)` so it stays normalized when `c` is tiny.
+fn standardize_2x2_blocks(t: &mut Mat, z: &mut Mat, eps: f64) {
+    let n = t.n;
+    if n < 2 {
+        return;
+    }
+    let mut k = 0usize;
+    while k + 1 < n {
+        let c = t.get(k + 1, k);
+        if c == 0.0 {
+            k += 1;
+            continue;
+        }
+        let a = t.get(k, k);
+        let b = t.get(k, k + 1);
+        let d = t.get(k + 1, k + 1);
+
+        let temp = a - d;
+        let p = 0.5 * temp;
+        let bcmax = b.abs().max(c.abs());
+        let bcmis = b.abs().min(c.abs()) * b.signum() * c.signum();
+        let scale = p.abs().max(bcmax);
+        if scale == 0.0 {
+            k += 2;
+            continue;
+        }
+        let zz = (p / scale) * p + (bcmax / scale) * bcmis;
+
+        if zz >= 4.0 * eps {
+            // Real eigenvalues: split the block.
+            let zz = p + p.signum() * scale.sqrt() * zz.sqrt();
+            if zz == 0.0 {
+                k += 2;
+                continue;
+            }
+            let tau = c.hypot(zz);
+            let cs = zz / tau;
+            let sn = c / tau;
+
+            // Rotate rows k, k+1 of T across all columns, then columns k, k+1
+            // across all rows -- a similarity, so the spectrum is untouched.
+            for j in 0..n {
+                let x = t.get(k, j);
+                let y = t.get(k + 1, j);
+                t.set(k, j, cs * x + sn * y);
+                t.set(k + 1, j, cs * y - sn * x);
+            }
+            for i in 0..n {
+                let x = t.get(i, k);
+                let y = t.get(i, k + 1);
+                t.set(i, k, cs * x + sn * y);
+                t.set(i, k + 1, cs * y - sn * x);
+            }
+            // The same rotation into the basis, from the right, so `Z T Z^T = A`
+            // still holds afterwards.
+            for i in 0..n {
+                let x = z.get(i, k);
+                let y = z.get(i, k + 1);
+                z.set(i, k, cs * x + sn * y);
+                z.set(i, k + 1, cs * y - sn * x);
+            }
+            // Set the annihilated entry EXACTLY rather than leaving rounding
+            // residue: the downstream classifier compares it against a relative
+            // tolerance, and residue of the wrong magnitude would keep the block
+            // classified as complex, which is the whole failure being fixed.
+            t.set(k + 1, k, 0.0);
+            k += 1;
+        } else {
+            // Genuine conjugate pair: leave it. `eig` derives the pair from the
+            // block's trace and determinant and does not require LAPACK's further
+            // normalization to equal diagonal entries.
+            k += 2;
+        }
+    }
+}
+
 /// LAPACK `dlahqr`'s exceptional-shift constants.
 const DAT1: f64 = 0.75;
 const DAT2: f64 = -0.4375;
@@ -461,6 +564,11 @@ pub(crate) fn real_schur_francis(
         total += 1;
     }
 
+    // Standardize before returning: the eigenvalues in `out` were read off the
+    // blocks during deflation and are already correct, but `T` itself must satisfy
+    // the caller's structural expectation.
+    standardize_2x2_blocks(&mut h, &mut z, eps);
+
     Ok((out, h.into_rows(), z.into_rows()))
 }
 
@@ -685,5 +793,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A 2x2 block with REAL eigenvalues must come back SPLIT, not left as a block.
+    ///
+    /// This is the must-hit for `standardize_2x2_blocks`, and it is worth stating
+    /// what it prevents rather than only what it checks. `eig` classifies a diagonal
+    /// block as a complex pair purely on whether its subdiagonal is negligible, then
+    /// computes `im = sqrt(max(-disc,0))/2` and pushes `re = trace/2` TWICE. So an
+    /// unsplit real block does not produce a slightly-off answer -- it reports two
+    /// copies of the AVERAGE of the two eigenvalues and routes them through the
+    /// complex eigenvector packing. The symmetric fixture below has eigenvalues
+    /// (5 +/- sqrt(5))/2, i.e. 3.618 and 1.382, which would be reported as 2.5 twice.
+    #[test]
+    fn real_2x2_blocks_are_split_not_left_as_pairs() {
+        // Eigenvalues (5 +/- sqrt(5))/2 -- real and distinct.
+        let a = vec![vec![3.0, 1.0], vec![1.0, 2.0]];
+        let (eigs, t, _z) = super::real_schur_francis(&a, f64::EPSILON, budget()).unwrap();
+
+        assert!(
+            t[1][0].abs() < 1e-300,
+            "the real 2x2 block was not split: T[1][0] = {}, which eig would read as \
+             a complex pair and report as trace/2 twice",
+            t[1][0]
+        );
+        assert!(
+            eigs.iter().all(|e| e.im == 0.0),
+            "real eigenvalues came back with an imaginary part: {eigs:?}"
+        );
+        let mut got: Vec<f64> = vec![t[0][0], t[1][1]];
+        got.sort_by(f64::total_cmp);
+        let want = [(5.0 - 5.0f64.sqrt()) / 2.0, (5.0 + 5.0f64.sqrt()) / 2.0];
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert!(
+                (g - w).abs() < 1e-12,
+                "split diagonal {got:?} does not carry the true eigenvalues {want:?}"
+            );
+        }
+        // MUST-MISS: the two must be DISTINCT on the diagonal. If standardization
+        // ever collapsed them to the average this assertion is what notices.
+        assert!(
+            (got[1] - got[0]).abs() > 1.0,
+            "the split produced two near-equal diagonal entries {got:?}, which is the \
+             trace/2-twice failure appearing in a different place"
+        );
+    }
+
+    /// MUST-MISS for the same routine: a genuine conjugate pair must NOT be split.
+    /// A standardizer that splits everything would pass the test above and destroy
+    /// every complex eigenvalue in the library.
+    #[test]
+    fn complex_2x2_blocks_are_left_intact() {
+        // Eigenvalues +/- i.
+        let a = vec![vec![0.0, 1.0], vec![-1.0, 0.0]];
+        let (eigs, t, _z) = super::real_schur_francis(&a, f64::EPSILON, budget()).unwrap();
+        assert!(
+            t[1][0].abs() > 1e-6,
+            "a genuine conjugate pair was split (T[1][0] = {}), which would turn every \
+             complex eigenvalue into a bogus real one",
+            t[1][0]
+        );
+        assert!(
+            eigs.iter().any(|e| e.im.abs() > 0.5),
+            "expected a conjugate pair, got {eigs:?}"
+        );
     }
 }
