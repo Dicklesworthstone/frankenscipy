@@ -11635,6 +11635,87 @@ fn symmetric_lower_matvec_double_read(
     }
 }
 
+/// Row-parallel symmetric lower matvec — the byte-identical GATHER twin of
+/// [`symmetric_lower_matvec_double_read`] (`frankenscipy-ll0kk`, eigh tridiagonalisation).
+///
+/// ## Why this shape and not the obvious one
+///
+/// The tridiagonalisation spends ~57% of its time in this dsymv, once per column, and it is
+/// serial. The obvious fan-out — split `symmetric_lower_matvec_one_pass` across threads —
+/// is NOT available: that variant touches each stored element once and scatters it into TWO
+/// outputs, so threads would race on `product`, and privatising `product` per thread would
+/// change the summation order and lose byte-identity.
+///
+/// The double-read variant reads the matrix twice but each output element's sum is
+/// independent, which is what makes a safe split possible. Rewriting it as a GATHER — for
+/// each output `i`, sum over `j` — gives every thread a disjoint slice of `product` with no
+/// sharing at all.
+///
+/// ## Why it is BIT-IDENTICAL to the scatter it mirrors
+///
+/// In `symmetric_lower_matvec_double_read` the outer loop runs `col_offset = j` ascending,
+/// and for each `j` every output row receives exactly one contribution (rows `< j` from the
+/// upper branch, rows `>= j` from the lower). So `product[i]` accumulates terms in ASCENDING
+/// `j`, starting from `0.0`. This gather sums the same terms for the same `i` in the same
+/// ascending `j` order, from the same `0.0`. Identical operand order in floating point is
+/// identical arithmetic — this cannot differ, which is stronger than "a fixture did not
+/// expose a drift".
+///
+/// The `v_col == 0.0` skip is preserved for the same reason: `acc + 0.0 * x` is not
+/// unconditionally `acc` (it is not, for `acc = -0.0` or a NaN `x`), so dropping the skip
+/// would be a real change rather than a cosmetic one.
+///
+/// ## Status
+///
+/// Gated OFF by `EIGH_DSYMV_PARALLEL_GATHER` and used nowhere by default, so it cannot alter
+/// any result until something routes to it deliberately. UNBUILT and UNMEASURED: whether the
+/// doubled read traffic is repaid by the fan-out is exactly what ll0kk has to measure, and
+/// the honest possibility is that it is not.
+#[allow(dead_code, clippy::needless_range_loop)]
+fn symmetric_lower_matvec_double_read_gather_parallel(
+    data: &[f64],
+    n: usize,
+    start: usize,
+    vector: &[f64],
+    product: &mut [f64],
+    nthreads: usize,
+) {
+    let active = vector.len();
+    if active == 0 {
+        return;
+    }
+    let chunk = active.div_ceil(nthreads.max(1));
+    rayon::scope(|scope| {
+        for (chunk_index, out) in product[..active].chunks_mut(chunk).enumerate() {
+            let base = chunk_index * chunk;
+            scope.spawn(move |_| {
+                for (local, slot) in out.iter_mut().enumerate() {
+                    let row_offset = base + local;
+                    let row = start + row_offset;
+                    let mut acc = 0.0f64;
+                    // Ascending j, exactly the order the scatter accumulates into this slot.
+                    for col_offset in 0..active {
+                        let v_col = vector[col_offset];
+                        if v_col == 0.0 {
+                            continue;
+                        }
+                        let col = start + col_offset;
+                        // row < col reads the transposed (upper) position; row >= col reads
+                        // the stored lower position. Same two branches as the scatter.
+                        let a = if row_offset < col_offset {
+                            data[row * n + col]
+                        } else {
+                            data[col * n + row]
+                        };
+                        acc += a * v_col;
+                    }
+                    *slot = acc;
+                }
+            });
+        }
+    });
+}
+
 #[allow(dead_code, clippy::needless_range_loop)]
 fn symmetric_lower_matvec_one_pass(
     data: &[f64],
@@ -13183,6 +13264,14 @@ pub static EIGH_INVITER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// `perf_jagged_vec_inner_loop_devectorization`, where binding operands as slices
 /// was worth 2.2-3.5x bit-identically elsewhere in the fleet.
 pub static EIGH_RANK2_UPDATE_FORCE_SCALAR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Route the tridiagonalisation's dsymv to the row-parallel GATHER variant
+/// (`frankenscipy-ll0kk`). Default `false`; nothing reads it yet, so it is inert until a
+/// call site opts in. Byte-identical to `symmetric_lower_matvec_double_read` by operand
+/// order, not by tolerance — see that function's doc.
+#[doc(hidden)]
+pub static EIGH_DSYMV_PARALLEL_GATHER: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Benchmark-only same-ELF control for the pre-2026-07-31 symmetric matvec.
