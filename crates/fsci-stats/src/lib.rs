@@ -58319,6 +58319,235 @@ pub fn abs_of<D: ContinuousDistribution>(dist: D) -> AbsOf<D> {
     AbsOf::new(dist)
 }
 
+/// Which statistic [`goodness_of_fit`] compares against its Monte Carlo null.
+///
+/// Matches the `statistic=` argument of `scipy.stats.goodness_of_fit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GofStatistic {
+    /// Anderson-Darling. `scipy` spelling `"ad"`; weights the tails heavily.
+    AndersonDarling,
+    /// Kolmogorov-Smirnov. `scipy` spelling `"ks"`; the largest ecdf gap.
+    KolmogorovSmirnov,
+    /// Cramer-von Mises. `scipy` spelling `"cvm"`; integrated squared gap.
+    CramerVonMises,
+    /// Filliben's probability-plot correlation. `scipy` spelling `"filliben"`.
+    Filliben,
+}
+
+impl GofStatistic {
+    /// Which tail of the null is evidence AGAINST the fit.
+    ///
+    /// Three of the four are distances, so LARGE is bad. Filliben is a
+    /// CORRELATION, so small is bad — SciPy carries this as the attribute
+    /// `_filliben.alternative = 'less'`, and getting it backwards produces a
+    /// p-value that is confidently wrong rather than obviously wrong.
+    #[must_use]
+    pub fn alternative(self) -> &'static str {
+        match self {
+            Self::Filliben => "less",
+            _ => "greater",
+        }
+    }
+}
+
+/// One goodness-of-fit statistic for a FITTED distribution and a sample.
+///
+/// Each formula is SciPy's (`scipy/stats/_fit.py`), transcribed with its
+/// numerically important choices kept:
+///
+/// * Anderson-Darling sums `logcdf(x_i) + logsf(x_{n+1-i})`, NOT `ln(cdf)` and
+///   `ln(sf)`. That is the whole reason the statistic is usable in the tails, and
+///   it is why this crate's ~50 `logcdf`/`logsf` overrides pay off here: a
+///   distribution that only had `ln(cdf(x))` would return `-inf` for any sample
+///   point far enough out and take the statistic to NaN.
+/// * Cramer-von Mises keeps the `1/(12n)` offset rather than folding it in.
+/// * Filliben uses the EXACT uniform order-statistic medians — the median of
+///   `Beta(k, n+1-k)` — where the original paper used the approximation
+///   `(k - 0.3175)/(n + 0.365)`. SciPy made the same substitution and says so.
+#[must_use]
+pub fn gof_statistic<D: ContinuousDistribution>(
+    dist: &D,
+    data: &[f64],
+    which: GofStatistic,
+) -> f64 {
+    let n = data.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    let nf = n as f64;
+    let mut x = data.to_vec();
+    x.sort_unstable_by(f64::total_cmp);
+
+    match which {
+        GofStatistic::AndersonDarling => {
+            let mut s = 0.0;
+            for i in 0..n {
+                let w = (2 * (i + 1) - 1) as f64 / nf;
+                s += w * (dist.logcdf(x[i]) + dist.logsf(x[n - 1 - i]));
+            }
+            -nf - s
+        }
+        GofStatistic::KolmogorovSmirnov => {
+            let mut d_plus = f64::NEG_INFINITY;
+            let mut d_minus = f64::NEG_INFINITY;
+            for (i, &xi) in x.iter().enumerate() {
+                let f = dist.cdf(xi);
+                d_plus = d_plus.max((i + 1) as f64 / nf - f);
+                d_minus = d_minus.max(f - i as f64 / nf);
+            }
+            d_plus.max(d_minus)
+        }
+        GofStatistic::CramerVonMises => {
+            let mut acc = 0.0;
+            for (i, &xi) in x.iter().enumerate() {
+                let u = (2 * (i + 1) - 1) as f64 / (2.0 * nf);
+                let d = u - dist.cdf(xi);
+                acc += d * d;
+            }
+            1.0 / (12.0 * nf) + acc
+        }
+        GofStatistic::Filliben => {
+            // Order-statistic medians of the uniform, mapped through the fitted
+            // quantile: the y-axis of a probability plot.
+            let m: Vec<f64> = (1..=n)
+                .map(|k| {
+                    let median = BetaDist::new(k as f64, (n + 1 - k) as f64).median();
+                    dist.ppf(median)
+                })
+                .collect();
+            pearson_correlation_of(&x, &m)
+        }
+    }
+}
+
+/// Pearson r of two equal-length slices, as Filliben's statistic needs it.
+///
+/// Centred sums rather than the `E[XY] - E[X]E[Y]` shortcut: the shortcut
+/// differences two large numbers to get a small one, and a probability plot's
+/// whole point is that its correlation sits very close to 1.
+fn pearson_correlation_of(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len();
+    if n != b.len() || n == 0 {
+        return f64::NAN;
+    }
+    let nf = n as f64;
+    let ma = a.iter().sum::<f64>() / nf;
+    let mb = b.iter().sum::<f64>() / nf;
+    let mut num = 0.0;
+    let mut sa = 0.0;
+    let mut sb = 0.0;
+    for (&ai, &bi) in a.iter().zip(b.iter()) {
+        let (da, db) = (ai - ma, bi - mb);
+        num += da * db;
+        sa += da * da;
+        sb += db * db;
+    }
+    let den = (sa * sb).sqrt();
+    if den == 0.0 { f64::NAN } else { num / den }
+}
+
+/// Outcome of [`goodness_of_fit`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct GofOutcome<D> {
+    /// The null-hypothesis distribution, fitted to `data`.
+    pub fitted: D,
+    /// The statistic observed on `data` under `fitted`.
+    pub statistic: f64,
+    /// Monte Carlo p-value.
+    pub pvalue: f64,
+    /// The simulated null distribution, one entry per Monte Carlo sample.
+    pub null_distribution: Vec<f64>,
+    /// How many Monte Carlo samples FAILED to refit — see the note on
+    /// [`goodness_of_fit`] about the direction of the bias they introduce.
+    pub failed_fits: usize,
+}
+
+/// Monte Carlo goodness-of-fit test against a distribution FAMILY.
+///
+/// Matches `scipy.stats.goodness_of_fit(dist, data, statistic=...)` for the case
+/// where all parameters are unknown, which is the case the test exists for: once
+/// parameters are estimated from the same data, the classical null distributions
+/// of these statistics no longer apply, and simulating the null is the fix.
+///
+/// The procedure, following SciPy:
+///
+/// 1. fit `D` to `data`, giving the null-hypothesis distribution
+/// 2. observe the statistic on `data` under that fit
+/// 3. draw `n_mc_samples` samples of the same size from it, REFITTING `D` to each
+///    one before computing its statistic — refitting is what makes the null
+///    account for parameter estimation, and skipping it is the classic way to get
+///    an anticonservative p-value
+/// 4. p = (#{null at least as extreme} + 1) / (n_mc_samples + 1)
+///
+/// # Requires a fittable family
+///
+/// Returns `Err(FitError::NotImplemented)` when `D` does not override `try_fit`,
+/// which is the trait default. `try_fit` rather than `fit` deliberately: `fit`
+/// panics, and a generic driver that panics on an unfittable family is not usable
+/// as a library.
+///
+/// # Resamples that fail to refit
+///
+/// A Monte Carlo sample can be degenerate enough that `try_fit` fails on it. Such
+/// a sample contributes NaN to the null distribution, and since every NaN
+/// comparison is false it is never counted as extreme — which biases the p-value
+/// DOWNWARD, toward rejecting the fit. `failed_fits` reports how many, so the
+/// caller can see the bias rather than inherit it silently. It is not silently
+/// dropped from the denominator either, because renormalising would be a
+/// different test.
+///
+/// # Difference from SciPy, stated
+///
+/// SciPy's `monte_carlo_test` compares with a tolerance, `null >= observed - γ`
+/// where `γ = |eps · observed|`; this crate's `monte_carlo_test` compares
+/// exactly. The two differ only when a resample reproduces the observed statistic
+/// to within a rounding step, which for continuous statistics is rare — but it is
+/// a real difference and it makes this p-value very slightly the larger of the
+/// two. Filed rather than patched here, since changing the shared
+/// `monte_carlo_test` would move every other caller's numbers.
+pub fn goodness_of_fit<D>(
+    data: &[f64],
+    which: GofStatistic,
+    n_mc_samples: usize,
+    seed: u64,
+) -> Result<GofOutcome<D>, FitError>
+where
+    D: ContinuousDistribution + Copy + Sync,
+{
+    let fitted = D::try_fit(data)?;
+    let n = data.len();
+
+    let rvs = move |s: u64| -> Vec<f64> {
+        let mut rng = StdRng::seed_from_u64(s);
+        fitted.rvs(n, &mut rng)
+    };
+    // Each resample is REFITTED before its statistic is taken; see step 3 above.
+    let statistic_fn = move |sample: &[f64]| -> f64 {
+        match D::try_fit(sample) {
+            Ok(refit) => gof_statistic(&refit, sample, which),
+            Err(_) => f64::NAN,
+        }
+    };
+
+    let mc = monte_carlo_test(
+        data,
+        rvs,
+        statistic_fn,
+        n_mc_samples,
+        seed,
+        which.alternative(),
+    );
+    let failed_fits = mc.null_distribution.iter().filter(|v| v.is_nan()).count();
+
+    Ok(GofOutcome {
+        fitted,
+        statistic: mc.statistic,
+        pvalue: mc.pvalue,
+        null_distribution: mc.null_distribution,
+        failed_fits,
+    })
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
@@ -99144,5 +99373,259 @@ mod transforms_match_scipy {
         // Uniform(1, 4) starts above zero, so this must NOT panic.
         let y = log_of(Uniform::new(1.0, 3.0));
         assert!(y.pdf(0.5) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod goodness_of_fit_matches_scipy {
+    use super::{
+        ContinuousDistribution, GofStatistic, Normal, SeedableRng, gof_statistic,
+        goodness_of_fit,
+    };
+
+    /// A sample that really is normal, and one that visibly is not. Both arms are
+    /// needed: a statistic that returned a constant would pass either alone.
+    const NORMALISH: [f64; 20] = [
+        0.32, -1.15, 0.78, 2.01, -0.44, 1.33, -0.07, 0.95, -1.72, 0.51, 1.88, -0.63, 0.22,
+        -0.11, 1.04, 0.67, -1.29, 0.41, 1.55, -0.86,
+    ];
+    const SKEWED: [f64; 15] = [
+        0.05, 0.11, 0.19, 0.27, 0.38, 0.52, 0.71, 0.95, 1.28, 1.74, 2.4, 3.35, 4.8, 7.1, 11.2,
+    ];
+
+    /// The FIT first, on its own, so a mismatch below is attributable.
+    /// `scipy.stats.norm.fit` is the MLE with ddof = 0.
+    #[test]
+    fn the_normal_fit_matches_scipy_norm_fit() {
+        let f = Normal::try_fit(&NORMALISH).expect("normal fit");
+        assert!(
+            (f.loc - 0.269_999_999_999_999_96).abs() < 1e-15,
+            "loc = {}, scipy = 0.26999999999999996",
+            f.loc
+        );
+        assert!(
+            (f.scale - 1.029_572_726_911_508_7).abs() < 1e-15,
+            "scale = {}, scipy = 1.0295727269115087",
+            f.scale
+        );
+    }
+
+    /// The four statistics against `scipy.stats._fit`, evaluated at the SAME
+    /// fitted parameters so this tests the formulas and nothing else.
+    #[test]
+    fn the_four_statistics_match_scipy() {
+        // Fitted parameters supplied literally rather than via try_fit, so a fit
+        // regression cannot masquerade as a statistic regression.
+        let d = Normal::new(0.269_999_999_999_999_96, 1.029_572_726_911_508_7);
+        for (which, want, tol, why) in [
+            (
+                GofStatistic::AndersonDarling,
+                1.475_404_376_344_506_8e-1,
+                1e-12,
+                "logcdf/logsf are accurate for Normal",
+            ),
+            (
+                GofStatistic::KolmogorovSmirnov,
+                8.063_344_572_644_426e-2,
+                1e-12,
+                "cdf only",
+            ),
+            (
+                GofStatistic::CramerVonMises,
+                1.957_814_319_998_112e-2,
+                1e-12,
+                "cdf only",
+            ),
+            (
+                // Looser DELIBERATELY: Filliben is the only one that inverts the
+                // distribution, and `Normal::ppf` is a rational approximation good
+                // to ~3e-9, so nothing built on it can be tighter. Tightening this
+                // would be asserting against the approximation, not the formula.
+                GofStatistic::Filliben,
+                9.950_384_208_640_177e-1,
+                1e-8,
+                "goes through Normal::ppf",
+            ),
+        ] {
+            let got = gof_statistic(&d, &NORMALISH, which);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < tol,
+                "{which:?} = {got:e}, scipy = {want:e} (rel {rel:e}; tol {tol:e} because {why})"
+            );
+        }
+
+        // Same four on the skewed fixture, whose fitted normal is a bad fit --
+        // so every distance is LARGER and the correlation is SMALLER. A statistic
+        // insensitive to the data would pass the block above and fail here.
+        let db = Normal::new(2.336_666_666_666_666_4, 3.061_408_535_661_685);
+        for (which, want, tol) in [
+            (GofStatistic::AndersonDarling, 1.523_851_273_486_347e0, 1e-12),
+            (GofStatistic::KolmogorovSmirnov, 2.439_308_121_399_081e-1, 1e-12),
+            (GofStatistic::CramerVonMises, 2.706_468_784_149_458e-1, 1e-12),
+            (GofStatistic::Filliben, 8.533_739_288_191_515e-1, 1e-8),
+        ] {
+            let got = gof_statistic(&db, &SKEWED, which);
+            let rel = ((got - want) / want).abs();
+            assert!(rel < tol, "skewed {which:?} = {got:e}, scipy = {want:e}");
+        }
+    }
+
+    /// The direction of Filliben's alternative, which is the one thing here that
+    /// can be confidently wrong rather than obviously wrong.
+    ///
+    /// Filliben is a CORRELATION: a good fit pushes it UP toward 1, where the other
+    /// three are distances pushed DOWN toward 0. So a bad fit must lower it, and
+    /// its p-value must come from the LOWER tail. If `alternative()` returned
+    /// "greater" for it, the statistic assertions above would all still pass and
+    /// the p-values would simply be reported the wrong way round.
+    #[test]
+    fn filliben_is_a_correlation_so_its_evidence_is_in_the_lower_tail() {
+        assert_eq!(GofStatistic::Filliben.alternative(), "less");
+        assert_eq!(GofStatistic::AndersonDarling.alternative(), "greater");
+        assert_eq!(GofStatistic::KolmogorovSmirnov.alternative(), "greater");
+        assert_eq!(GofStatistic::CramerVonMises.alternative(), "greater");
+
+        let good = Normal::new(0.269_999_999_999_999_96, 1.029_572_726_911_508_7);
+        let bad = Normal::new(2.336_666_666_666_666_4, 3.061_408_535_661_685);
+        let r_good = gof_statistic(&good, &NORMALISH, GofStatistic::Filliben);
+        let r_bad = gof_statistic(&bad, &SKEWED, GofStatistic::Filliben);
+        assert!(
+            r_bad < r_good,
+            "a bad fit must LOWER the probability-plot correlation: {r_bad} vs {r_good}"
+        );
+        // The other three move the opposite way on the same pair.
+        for which in [
+            GofStatistic::AndersonDarling,
+            GofStatistic::KolmogorovSmirnov,
+            GofStatistic::CramerVonMises,
+        ] {
+            assert!(
+                gof_statistic(&bad, &SKEWED, which) > gof_statistic(&good, &NORMALISH, which),
+                "{which:?} is a distance, so a bad fit must RAISE it"
+            );
+        }
+    }
+
+    /// The Monte Carlo p-value. Its exact value depends on the RNG, so this
+    /// asserts what is reproducible: a genuinely normal sample is not rejected,
+    /// and a visibly skewed one is — for all four statistics. That two-arm shape
+    /// is the point; a driver that always returned 1.0, or always 1/(n+1), would
+    /// pass one arm and fail the other.
+    ///
+    /// SciPy on the same fixtures (its own RNG, n_mc_samples = 999): normal
+    /// p = 0.98/0.969/0.978/0.991, skewed p = 0.001/0.014/0.001/0.002.
+    #[test]
+    fn the_monte_carlo_pvalue_separates_a_good_fit_from_a_bad_one() {
+        for which in [
+            GofStatistic::AndersonDarling,
+            GofStatistic::KolmogorovSmirnov,
+            GofStatistic::CramerVonMises,
+            GofStatistic::Filliben,
+        ] {
+            let good: super::GofOutcome<Normal> =
+                goodness_of_fit(&NORMALISH, which, 999, 20260818).expect("fit");
+            let bad: super::GofOutcome<Normal> =
+                goodness_of_fit(&SKEWED, which, 999, 20260818).expect("fit");
+
+            assert!(
+                (0.0..=1.0).contains(&good.pvalue) && (0.0..=1.0).contains(&bad.pvalue),
+                "{which:?}: p-values must be probabilities, got {} and {}",
+                good.pvalue,
+                bad.pvalue
+            );
+            assert_eq!(good.null_distribution.len(), 999);
+            assert_eq!(
+                good.failed_fits, 0,
+                "{which:?}: no resample of a normal fixture should fail to refit"
+            );
+            assert!(
+                good.pvalue > 0.20,
+                "{which:?}: a genuinely normal sample was rejected at p = {}",
+                good.pvalue
+            );
+            assert!(
+                bad.pvalue < 0.05,
+                "{which:?}: a visibly skewed sample was NOT rejected, p = {}",
+                bad.pvalue
+            );
+            // The smallest attainable p is 1/(n+1); anything below means the
+            // count or the denominator is wrong.
+            assert!(
+                bad.pvalue >= 1.0 / 1000.0,
+                "{which:?}: p = {} is below the 1/(n_mc+1) floor",
+                bad.pvalue
+            );
+        }
+    }
+
+    /// The null distribution must be REFIT per resample, not scored against the
+    /// original fit. Skipping the refit is the classic way to get an
+    /// anticonservative test, and it shows up as a null distribution that sits
+    /// systematically ABOVE the correctly-refit one for a distance statistic.
+    #[test]
+    fn the_null_is_built_by_refitting_each_resample() {
+        let res: super::GofOutcome<Normal> =
+            goodness_of_fit(&NORMALISH, GofStatistic::AndersonDarling, 499, 7).expect("fit");
+        let fitted = Normal::try_fit(&NORMALISH).expect("fit");
+        assert_eq!(res.fitted, fitted, "the reported fit is the null-hypothesis fit");
+
+        // Score the same statistic WITHOUT refitting, on samples from the null.
+        // The no-refit statistic is stochastically larger, because refitting
+        // absorbs some of each sample's deviation.
+        let mut no_refit = Vec::new();
+        let mut rng = super::StdRng::seed_from_u64(99);
+        for _ in 0..499 {
+            let sample = fitted.rvs(NORMALISH.len(), &mut rng);
+            no_refit.push(gof_statistic(&fitted, &sample, GofStatistic::AndersonDarling));
+        }
+        let mean_of = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let refit_mean = mean_of(&res.null_distribution);
+        let plain_mean = mean_of(&no_refit);
+        assert!(
+            plain_mean > refit_mean * 1.2,
+            "the refit null should sit well below the no-refit one \
+             (refit {refit_mean:.4}, no-refit {plain_mean:.4}); if they match, \
+             the resamples are probably not being refit"
+        );
+    }
+
+    /// A family with no `try_fit` returns an error instead of panicking, which is
+    /// the whole reason the driver uses `try_fit` rather than `fit`.
+    ///
+    /// `ExpOf<Normal>` is the example precisely because it is one of mine and has
+    /// no fit: the transform types do not implement MLE for the composed family,
+    /// so they exercise the trait default. My first draft used `HalfNormal`, which
+    /// turned out to override `try_fit` — the assertion would have been vacuous in
+    /// the opposite direction, passing only if the driver were broken.
+    #[test]
+    fn an_unfittable_family_is_an_error_not_a_panic() {
+        let res = goodness_of_fit::<super::ExpOf<Normal>>(
+            &NORMALISH,
+            GofStatistic::KolmogorovSmirnov,
+            9,
+            1,
+        );
+        assert!(
+            matches!(res, Err(super::FitError::NotImplemented { .. })),
+            "a family with no try_fit override must be Err(NotImplemented), not a panic"
+        );
+        // MUST-MISS control: a family that DOES implement it succeeds on the same
+        // call, so the error above is about the family and not about the driver.
+        let ok: Result<super::GofOutcome<super::HalfNormal>, _> = goodness_of_fit(
+            &[0.4, 0.9, 1.3, 0.2, 2.1, 0.7, 1.6],
+            GofStatistic::KolmogorovSmirnov,
+            9,
+            1,
+        );
+        assert!(ok.is_ok(), "HalfNormal does override try_fit, so this must succeed");
+    }
+
+    #[test]
+    fn degenerate_inputs() {
+        assert!(gof_statistic(&Normal::standard(), &[], GofStatistic::AndersonDarling).is_nan());
+        let empty: Result<super::GofOutcome<Normal>, _> =
+            goodness_of_fit(&[], GofStatistic::AndersonDarling, 99, 1);
+        assert!(empty.is_err(), "an empty sample cannot be fitted");
     }
 }
