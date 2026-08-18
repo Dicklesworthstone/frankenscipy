@@ -23731,6 +23731,78 @@ mod tests {
         }
     }
 
+    /// `frankenscipy-ua3gn`: dispatching the panel TRSM onto rayon's persistent pool must
+    /// not change a single bit of the factor.
+    ///
+    /// The parallel TRSM used to fan out with `std::thread::scope`, spawning and joining OS
+    /// threads once per panel; it now uses `rayon::scope`, matching what
+    /// `cholesky_syrk_parallel_rows` in this file already does. `CHOL_PANEL_TRSM_STD_SCOPE`
+    /// restores the old arm so the two live in one binary.
+    ///
+    /// Identity is structural, not incidental: both arms hand the SAME `chunk_rows` slices to
+    /// the same `cholesky_panel_trsm_blocked_fma_rows`, whose row arithmetic is
+    /// chunking-independent, and neither scope imposes an order. What this test actually
+    /// guards is that the rewrite did not perturb the CHUNKING — an off-by-one in
+    /// `chunks_mut` would still produce a valid factor, just a different one.
+    ///
+    /// The MACs override forces the fan-out at unit-test sizes, and the panel counter is the
+    /// must-hit arm: without it a gate change could send BOTH arms down the serial path and
+    /// the comparison would pass while exercising nothing.
+    #[test]
+    fn cholesky_panel_trsm_rayon_dispatch_is_bit_identical_to_thread_scope() {
+        CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
+        for &n in &[420usize, 600] {
+            let mut a = vec![vec![0.0; n]; n];
+            for i in 0..n {
+                for j in 0..=i {
+                    let value = if i == j {
+                        (n as f64) * 3.0 + (i as f64) * 0.01
+                    } else {
+                        1.0 / ((i - j + 1) as f64)
+                    };
+                    a[i][j] = value;
+                    a[j][i] = value;
+                }
+            }
+
+            let before = CHOL_PANEL_TRSM_PAR_PANELS.load(std::sync::atomic::Ordering::Relaxed);
+            CHOL_PANEL_TRSM_STD_SCOPE.store(true, std::sync::atomic::Ordering::Relaxed);
+            let thread_scope = cholesky_lower_blocked_with_kernels::<
+                TRSM_KERNEL_BLOCKED_FMA,
+                SYRK_KERNEL_MR4_NR8_FMA,
+            >(&a, n, 128)
+            .expect("thread::scope TRSM factor");
+            CHOL_PANEL_TRSM_STD_SCOPE.store(false, std::sync::atomic::Ordering::Relaxed);
+            let rayon_dispatch = cholesky_lower_blocked_with_kernels::<
+                TRSM_KERNEL_BLOCKED_FMA,
+                SYRK_KERNEL_MR4_NR8_FMA,
+            >(&a, n, 128)
+            .expect("rayon TRSM factor");
+            let spawned =
+                CHOL_PANEL_TRSM_PAR_PANELS.load(std::sync::atomic::Ordering::Relaxed) - before;
+
+            assert!(
+                spawned > 0,
+                "execution proof failed: no panel took the parallel branch at n={n}, so \
+                 neither arm exercised the dispatch under test"
+            );
+            assert_eq!(
+                thread_scope.len(),
+                rayon_dispatch.len(),
+                "factor length differs at n={n}"
+            );
+            for (i, (a_bits, b_bits)) in thread_scope.iter().zip(rayon_dispatch.iter()).enumerate()
+            {
+                assert_eq!(
+                    a_bits.to_bits(),
+                    b_bits.to_bits(),
+                    "n={n} entry {i}: thread::scope {a_bits} vs rayon {b_bits}"
+                );
+            }
+        }
+        CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[test]
     fn cholesky_panel_trsm_parallel_is_bit_identical() {
         // 4-row-aligned chunking preserves every row-block grouping, so the fanned
