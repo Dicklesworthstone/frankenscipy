@@ -27511,3 +27511,299 @@ mod structure_predicate_tests {
         assert_eq!(spbandwidth(&m), (0, 1));
     }
 }
+
+/// Action of the matrix exponential on a vector -- `scipy.sparse.linalg.expm_multiply`.
+///
+/// Computes `exp(t*A) @ b` WITHOUT ever forming `exp(A)`. That is the whole point:
+/// `expm` on a sparse matrix produces a dense result, so for a large `A` the
+/// exponential is unrepresentable while its action on one vector is cheap. This crate
+/// had `expm` and not this, which meant the only route to `exp(A) b` was the one that
+/// cannot be taken at scale.
+///
+/// # Algorithm
+///
+/// SciPy's `_expm_multiply_simple_core` (Al-Mohy & Higham 2011), ported directly:
+/// shift by the mean of the diagonal, scale into `s` steps, and sum a truncated
+/// Taylor series in each, with the early exit `c1 + c2 <= tol * ||F||_inf`.
+///
+/// The trace shift is not cosmetic. Writing `A = mu*I + A'` with `mu = tr(A)/n` makes
+/// `exp(tA) = exp(t*mu) * exp(tA')`, and `A'` has its spectrum centred, so the Taylor
+/// series sees a smaller argument. Without it a matrix like `-1000*I` needs enormous
+/// `s` to be stable, and with it that case is exact in one step.
+///
+/// # THE DIFFERENCE FROM SciPy, and it is a real one
+///
+/// SciPy chooses the scaling `s` and truncation order `m*` with `_fragment_3_1`, a
+/// search over the Al-Mohy & Higham parameter table using estimates of `||A^p||^(1/p)`
+/// for several `p`. That table is the paper's main contribution and is NOT reproduced
+/// here. This picks `s` from the simple, conservative bound `ceil(||tA'||_1)` so that
+/// each step advances by a unit of 1-norm, and lets the series-termination test decide
+/// the order.
+///
+/// The consequence is stated plainly rather than left to be discovered: this may take
+/// MORE matrix-vector products than SciPy for the same accuracy -- it is a worse
+/// parameter choice, not a different answer. Accuracy is governed by the same
+/// termination test, so results agree to tolerance; only the work differs. Anyone
+/// benchmarking this against SciPy should expect to lose, and the fix is to port the
+/// table rather than to tune the bound.
+///
+/// # Parameters
+///
+/// `tol` is the relative tolerance for the series termination, defaulting to `2^-53`
+/// (SciPy's `u_d`) when a non-positive value is passed.
+pub fn expm_multiply(
+    a: &CsrMatrix,
+    b: &[f64],
+    t: f64,
+    tol: f64,
+) -> SparseResult<Vec<f64>> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: "expm_multiply requires a square matrix".to_string(),
+        });
+    }
+    let n = shape.rows;
+    if b.len() != n {
+        return Err(SparseError::IncompatibleShape {
+            message: format!("vector length {} must match matrix rows {n}", b.len()),
+        });
+    }
+    if !t.is_finite() || b.iter().any(|v| !v.is_finite()) {
+        return Err(SparseError::NonFiniteInput {
+            message: "expm_multiply requires finite t and b".to_string(),
+        });
+    }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let tol = if tol > 0.0 { tol } else { f64::EPSILON / 2.0 /* 2^-53, SciPy's u_d; EPSILON is 2^-52 */ };
+
+    // mu = tr(A)/n, and A' = A - mu*I. Only the diagonal is touched, so the shift
+    // costs one pass over the stored entries rather than a matrix copy.
+    let mut trace = 0.0_f64;
+    for row in 0..n {
+        for idx in a.indptr()[row]..a.indptr()[row + 1] {
+            if a.indices()[idx] == row {
+                trace += a.data()[idx];
+            }
+        }
+    }
+    let mu = trace / n as f64;
+
+    // ||t*A'||_1, the max absolute column sum, which is what bounds the growth of the
+    // Taylor terms.
+    let mut col_sums = vec![0.0_f64; shape.cols];
+    for row in 0..n {
+        for idx in a.indptr()[row]..a.indptr()[row + 1] {
+            let col = a.indices()[idx];
+            let shifted = if col == row {
+                a.data()[idx] - mu
+            } else {
+                a.data()[idx]
+            };
+            col_sums[col] += shifted.abs();
+        }
+    }
+    let a1_norm = col_sums.iter().fold(0.0_f64, |m, v| m.max(*v));
+    let scaled = (t.abs() * a1_norm).ceil();
+    // At least one step; the cast is guarded because `scaled` can be huge for a
+    // badly scaled operator and saturating there is better than wrapping to a tiny s.
+    let s: usize = if scaled.is_finite() && scaled >= 1.0 {
+        (scaled as u64).min(1_000_000) as usize
+    } else {
+        1
+    };
+
+    // A' * v, computed without materialising the shifted matrix.
+    let shifted_matvec = |v: &[f64]| -> Vec<f64> {
+        let mut out = csr_matvec(a, v);
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot -= mu * v[i];
+        }
+        out
+    };
+    let inf_norm = |v: &[f64]| -> f64 { v.iter().fold(0.0_f64, |m, x| m.max(x.abs())) };
+
+    let mut f = b.to_vec();
+    let mut work = b.to_vec();
+    let eta = (t * mu / s as f64).exp();
+    // The truncation order is bounded so a non-converging series cannot spin; SciPy's
+    // m_star comes from its table and is finite for the same reason.
+    const MAX_TERMS: usize = 200;
+
+    for _ in 0..s {
+        let mut c1 = inf_norm(&work);
+        for j in 0..MAX_TERMS {
+            let coeff = t / (s as f64 * (j + 1) as f64);
+            let next = shifted_matvec(&work);
+            for (slot, value) in work.iter_mut().zip(&next) {
+                *slot = coeff * value;
+            }
+            let c2 = inf_norm(&work);
+            for (slot, value) in f.iter_mut().zip(&work) {
+                *slot += value;
+            }
+            if c1 + c2 <= tol * inf_norm(&f) {
+                break;
+            }
+            c1 = c2;
+        }
+        for slot in &mut f {
+            *slot *= eta;
+        }
+        work.copy_from_slice(&f);
+    }
+
+    Ok(f)
+}
+
+/// `expm_multiply` -- the action of the matrix exponential on a vector.
+#[cfg(test)]
+mod expm_multiply_tests {
+    use super::{
+        CooMatrix, CsrMatrix, ExpmOptions, Shape2D, SparseError, expm, expm_multiply,
+    };
+
+    fn diag(values: &[f64]) -> CsrMatrix {
+        let n = values.len();
+        CooMatrix::from_triplets(
+            Shape2D::new(n, n),
+            values.to_vec(),
+            (0..n).collect(),
+            (0..n).collect(),
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr")
+    }
+
+    /// MUST-HIT against a CLOSED FORM, not against another implementation: for a
+    /// diagonal `A`, `exp(tA) b` is `exp(t*d_i) * b_i` elementwise, with no algorithm
+    /// in the middle to share a defect.
+    ///
+    /// The fixture includes a strongly negative entry because that is where the trace
+    /// shift earns its place: without it the Taylor series for `-8` needs a large `s`
+    /// to stay stable, and a version that dropped the shift would show up here as a
+    /// loss of accuracy rather than as an outright failure.
+    #[test]
+    fn diagonal_matches_the_closed_form() {
+        let d = [0.5_f64, -8.0, 2.0, 0.0];
+        let a = diag(&d);
+        let b = [1.0_f64, 2.0, -1.5, 3.0];
+        let t = 0.75_f64;
+        let got = expm_multiply(&a, &b, t, 0.0).expect("expm_multiply");
+        assert_eq!(got.len(), 4);
+        for i in 0..4 {
+            let want = (t * d[i]).exp() * b[i];
+            assert!(
+                (got[i] - want).abs() <= 1e-10 * want.abs().max(1.0),
+                "component {i}: got {} want {want}",
+                got[i]
+            );
+        }
+    }
+
+    /// THE CROSS-CHECK, and the decisive test for this function: `expm_multiply(A, b)`
+    /// must equal `expm(A) @ b`. The two share no code -- one forms the dense
+    /// exponential, the other never does -- so agreement is evidence for both.
+    ///
+    /// `t = 1` so the comparison needs no scaled copy of `A`, keeping the fixture the
+    /// same matrix in both arms.
+    #[test]
+    fn agrees_with_forming_the_dense_exponential() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![0.3, 0.2, -0.4, 0.1, 0.5, -0.2],
+            vec![0, 0, 1, 1, 2, 2],
+            vec![0, 2, 1, 0, 2, 1],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let b = [1.0_f64, -2.0, 0.5];
+
+        let action = expm_multiply(&a, &b, 1.0, 0.0).expect("expm_multiply");
+        let dense = expm(&a, ExpmOptions::default()).expect("expm");
+        for i in 0..3 {
+            let want: f64 = (0..3).map(|j| dense[i][j] * b[j]).sum();
+            assert!(
+                (action[i] - want).abs() <= 1e-9 * want.abs().max(1.0),
+                "component {i}: action {} vs expm(A)@b {want}",
+                action[i]
+            );
+        }
+    }
+
+    /// `t = 0` gives `exp(0) b = b`, and it must come back UNCHANGED rather than
+    /// merely close -- there is no series to sum, so any drift here means the shift or
+    /// the scaling ran when it should not have.
+    #[test]
+    fn t_zero_returns_b_unchanged() {
+        let a = diag(&[3.0, -1.0]);
+        let b = [2.5_f64, -0.75];
+        let got = expm_multiply(&a, &b, 0.0, 0.0).expect("t=0");
+        for i in 0..2 {
+            assert_eq!(
+                got[i].to_bits(),
+                b[i].to_bits(),
+                "component {i} changed at t=0: {} vs {}",
+                got[i],
+                b[i]
+            );
+        }
+    }
+
+    /// Shape and finiteness guards, each with the arm that stops it passing by
+    /// rejecting everything.
+    #[test]
+    fn invalid_inputs_are_rejected() {
+        let a = diag(&[1.0, 2.0]);
+        assert!(
+            matches!(
+                expm_multiply(&a, &[1.0, 2.0, 3.0], 1.0, 0.0),
+                Err(SparseError::IncompatibleShape { .. })
+            ),
+            "a length-3 vector for a 2x2 matrix was accepted"
+        );
+        assert!(
+            matches!(
+                expm_multiply(&a, &[1.0, f64::NAN], 1.0, 0.0),
+                Err(SparseError::NonFiniteInput { .. })
+            ),
+            "a NaN in b was accepted"
+        );
+        assert!(
+            matches!(
+                expm_multiply(&a, &[1.0, 2.0], f64::INFINITY, 0.0),
+                Err(SparseError::NonFiniteInput { .. })
+            ),
+            "a non-finite t was accepted"
+        );
+        let rect = CooMatrix::from_triplets(
+            Shape2D::new(2, 3),
+            vec![1.0],
+            vec![0],
+            vec![0],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        assert!(
+            matches!(
+                expm_multiply(&rect, &[1.0, 2.0], 1.0, 0.0),
+                Err(SparseError::InvalidShape { .. })
+            ),
+            "a non-square matrix was accepted"
+        );
+        // MUST-MISS: a well-formed call still succeeds.
+        assert!(
+            expm_multiply(&a, &[1.0, 2.0], 1.0, 0.0).is_ok(),
+            "a valid call was rejected"
+        );
+    }
+}

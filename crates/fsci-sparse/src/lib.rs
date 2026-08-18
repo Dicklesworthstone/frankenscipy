@@ -151,6 +151,7 @@ pub use linalg::{
     eigs,
     eigsh,
     expm,
+    expm_multiply,
     floyd_warshall,
     gmres,
     gmres_batch,
