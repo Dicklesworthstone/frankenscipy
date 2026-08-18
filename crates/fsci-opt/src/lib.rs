@@ -26,8 +26,9 @@ pub use minimize::{
     newton_cg, powell, select_minimize_method, trust_exact,
 };
 pub use nonlin::{
-    BroydenJacobian, BroydenVariant, InnerMethod, InverseJacobian, Jacobian, KrylovJacobian,
-    LowRankMatrix, ReductionMethod,
+    AndersonJacobian, BroydenJacobian, BroydenVariant, DiagBroydenJacobian,
+    ExcitingMixingJacobian, InnerMethod, InverseJacobian, Jacobian, KrylovJacobian,
+    LinearMixingJacobian, LowRankMatrix, ReductionMethod,
 };
 pub use root::{
     MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult,

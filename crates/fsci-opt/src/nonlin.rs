@@ -1503,6 +1503,332 @@ mod nonlin_tests {
         }
     }
 
+    // ── Mixing and Anderson Jacobians ───────────────────────────────────────
+
+    use super::{
+        AndersonJacobian, DiagBroydenJacobian, ExcitingMixingJacobian, LinearMixingJacobian,
+    };
+
+    /// Build the dense operator a `Jacobian` represents, column by column, by applying
+    /// it to the basis. Used to check the transpose operations against an EXPLICIT
+    /// transpose rather than against another formula.
+    fn dense_of(n: usize, apply: impl Fn(&[f64]) -> Vec<f64>) -> Vec<Vec<f64>> {
+        (0..n)
+            .map(|j| {
+                let mut e = vec![0.0; n];
+                e[j] = 1.0;
+                apply(&e)
+            })
+            .collect() // column j
+    }
+
+    fn transposed(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let n = cols.len();
+        (0..n).map(|j| (0..n).map(|i| cols[i][j]).collect()).collect()
+    }
+
+    fn max_diff_cols(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| max_diff(x, y))
+            .fold(0.0, f64::max)
+    }
+
+    /// Linear mixing holds a FIXED Jacobian, so `update` must change nothing at all.
+    /// Paired with DiagBroyden on the identical steps, which must change, so this is a
+    /// statement about linear mixing rather than about the steps being uninformative.
+    #[test]
+    fn linear_mixing_never_updates_but_diag_broyden_does() {
+        let x0 = vec![1.0, 2.0, 3.0, 4.0];
+        let f0 = vec![0.5, -0.25, 0.75, -1.0];
+        let probe = pseudo(404, 4);
+
+        let mut lm = LinearMixingJacobian::new(Some(0.4));
+        lm.setup(&x0, &f0);
+        let before = lm.solve_ref(&probe);
+
+        let mut db = DiagBroydenJacobian::new(Some(0.4));
+        db.setup(&x0, &f0);
+        let db_before = db.solve_ref(&probe);
+        // Both start as the same scalar operator, which is what makes the pairing fair.
+        assert!(
+            max_diff(&before, &db_before) < 1e-12,
+            "the two methods do not start from the same operator"
+        );
+
+        let x1 = vec![1.3, 2.1, 2.6, 4.2];
+        let f1 = vec![0.2, -0.4, 0.5, -0.6];
+        lm.update(&x1, &f1);
+        db.update(&x1, &f1);
+
+        assert!(
+            lm.solve_ref(&probe)
+                .iter()
+                .zip(&before)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "linear mixing changed its operator on update"
+        );
+        // MUST-MISS.
+        assert!(
+            max_diff(&db.solve_ref(&probe), &db_before) > 1e-6,
+            "DiagBroyden also ignored the step, so the check above says nothing about \
+             linear mixing specifically"
+        );
+    }
+
+    /// DiagBroyden satisfies the secant condition ONLY in the coordinate the step
+    /// touched -- exactly, to rounding -- and structurally cannot satisfy it elsewhere,
+    /// because a diagonal operator applied to a single-coordinate step is zero in every
+    /// other slot. That is the method's defining limitation rather than a defect, and
+    /// the test states both halves so neither can be mistaken for the other.
+    #[test]
+    fn diag_broyden_matches_the_secant_condition_only_where_the_step_moved() {
+        let n = 5;
+        let k = 2;
+        let alpha = 0.4;
+        let x0 = vec![0.0; n];
+        let f0 = vec![0.0; n];
+        let mut db = DiagBroydenJacobian::new(Some(alpha));
+        db.setup(&x0, &f0);
+
+        let mut x1 = vec![0.0; n];
+        x1[k] = 0.75;
+        let df = pseudo(5, n);
+        // f0 is zero, so df is the new residual outright.
+        db.update(&x1, &df);
+
+        let jdx = db.matvec(&x1);
+        assert!(
+            (jdx[k] - df[k]).abs() < 1e-12,
+            "the moved coordinate does not satisfy the secant condition: {} vs {}",
+            jdx[k],
+            df[k]
+        );
+        for i in 0..n {
+            if i != k {
+                assert_eq!(jdx[i], 0.0, "a diagonal operator responded off-coordinate");
+                assert!(
+                    df[i].abs() > 1e-3,
+                    "the test data has a near-zero residual at {i}, so the limitation \
+                     below is not actually exercised"
+                );
+            }
+        }
+        // The full-vector condition therefore FAILS, and by a wide margin.
+        assert!(
+            max_diff(&jdx, &df) > 0.1,
+            "the full secant condition appears to hold, which a diagonal approximation \
+             cannot do here -- the test data must be degenerate"
+        );
+    }
+
+    /// Exciting mixing grows the step where the residual keeps its sign, resets it
+    /// where the sign flips, and saturates at `alphamax`. All three are exact.
+    #[test]
+    fn exciting_mixing_grows_resets_and_saturates() {
+        let alpha = 0.3;
+        let x = vec![0.0; 4];
+        let last_f = vec![1.0, -1.0, 2.0, -0.5];
+        let mut em = ExcitingMixingJacobian::new(Some(alpha), Some(1.0));
+        em.setup(&x, &last_f);
+        assert_eq!(em.beta(), &[0.3, 0.3, 0.3, 0.3]);
+
+        // Signs: keep, keep, flip, flip.
+        let f = vec![0.5, -2.0, -1.0, 0.25];
+        em.update(&x, &f);
+        let b = em.beta();
+        for (i, want) in [0.6, 0.6, 0.3, 0.3].into_iter().enumerate() {
+            assert!(
+                (b[i] - want).abs() < 1e-12,
+                "beta[{i}] is {} but should be {want}",
+                b[i]
+            );
+        }
+
+        // Saturation: repeated sign-keeping must stop at alphamax and not run away.
+        let mut sat = ExcitingMixingJacobian::new(Some(alpha), Some(1.0));
+        let one = vec![1.0];
+        let origin = [0.0];
+        sat.setup(&origin, &one);
+        for _ in 0..10 {
+            sat.update(&origin, &one);
+        }
+        assert!(
+            (sat.beta()[0] - 1.0).abs() < 1e-12,
+            "beta did not saturate at alphamax, reached {}",
+            sat.beta()[0]
+        );
+        // MUST-MISS: a larger cap is actually reached, so the clamp above is the clamp
+        // and not an accident of the growth rate.
+        let mut wide = ExcitingMixingJacobian::new(Some(alpha), Some(5.0));
+        wide.setup(&origin, &one);
+        for _ in 0..10 {
+            wide.update(&origin, &one);
+        }
+        assert!(
+            wide.beta()[0] > 1.5,
+            "with alphamax = 5 the step should have grown past 1.5, got {}",
+            wide.beta()[0]
+        );
+    }
+
+    /// Anderson keeps two SEPARATELY written formulas -- one for the inverse, one for
+    /// the forward product, with different matrices -- and they must be actual inverses
+    /// of each other. Neither is derivable from the other by inspection, so this is the
+    /// check that catches a slip in either.
+    #[test]
+    fn anderson_forward_and_inverse_products_are_inverses() {
+        let n = 6;
+        let mut a = AndersonJacobian::new(Some(0.35), Some(0.01), Some(5));
+        let x0 = vec![0.0; n];
+        let f0 = vec![0.0; n];
+        a.setup(&x0, &f0);
+        // Three history pairs, built by feeding cumulative points.
+        let mut x = x0.clone();
+        let mut f = f0.clone();
+        for k in 0..3u64 {
+            let dx = pseudo(k + 1, n);
+            let df = pseudo(k + 51, n);
+            for i in 0..n {
+                x[i] += dx[i];
+                f[i] += df[i];
+            }
+            a.update(&x, &f);
+        }
+        assert_eq!(a.history_len(), 3);
+
+        let jinv = dense_of(n, |v| a.solve_ref(v));
+        let jfwd = dense_of(n, |v| a.matvec(v));
+        for i in 0..n {
+            for j in 0..n {
+                let prod: f64 = (0..n).map(|k| jfwd[k][i] * jinv[j][k]).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (prod - want).abs() < 1e-8,
+                    "J * J^-1 is not the identity at ({i}, {j}): {prod}"
+                );
+            }
+        }
+    }
+
+    /// The transpose operations are DERIVED here rather than ported -- SciPy's Anderson
+    /// does not define them -- so they are checked against an explicit dense transpose
+    /// of the very operators they claim to transpose, and the operator is confirmed
+    /// non-symmetric so the check cannot pass trivially.
+    #[test]
+    fn anderson_transposes_match_an_explicit_dense_transpose() {
+        let n = 6;
+        let mut a = AndersonJacobian::new(Some(0.35), Some(0.01), Some(5));
+        let zeros = vec![0.0; n];
+        a.setup(&zeros, &zeros);
+        let mut x = vec![0.0; n];
+        let mut f = vec![0.0; n];
+        for k in 0..3u64 {
+            let dx = pseudo(k + 1, n);
+            let df = pseudo(k + 51, n);
+            for i in 0..n {
+                x[i] += dx[i];
+                f[i] += df[i];
+            }
+            a.update(&x, &f);
+        }
+
+        let jinv = dense_of(n, |v| a.solve_ref(v));
+        let jfwd = dense_of(n, |v| a.matvec(v));
+        let rs = dense_of(n, |v| a.rsolve(v));
+        let rm = dense_of(n, |v| a.rmatvec(v));
+
+        assert!(
+            max_diff_cols(&rs, &transposed(&jinv)) < 1e-9,
+            "rsolve is not the transpose of the inverse product"
+        );
+        assert!(
+            max_diff_cols(&rm, &transposed(&jfwd)) < 1e-9,
+            "rmatvec is not the transpose of the forward product"
+        );
+        // MUST-MISS: the operator is genuinely non-symmetric, so the two checks above
+        // are not satisfied by any operator that ignored the transpose entirely.
+        assert!(
+            max_diff_cols(&jinv, &transposed(&jinv)) > 0.1,
+            "the Anderson operator is symmetric on this history; the transpose tests \
+             cannot distinguish a correct implementation from a no-op"
+        );
+    }
+
+    /// The history is capped at `m`, and `m = 0` disables the method entirely -- it
+    /// degenerates to linear mixing, which is what SciPy does and is worth pinning
+    /// because it is the one setting that silently changes the algorithm.
+    #[test]
+    fn anderson_history_is_capped_and_zero_m_degenerates_to_linear_mixing() {
+        let n = 4;
+        let alpha = 0.35;
+        let mut a = AndersonJacobian::new(Some(alpha), Some(0.01), Some(2));
+        let zeros = vec![0.0; n];
+        a.setup(&zeros, &zeros);
+        let mut x = vec![0.0; n];
+        let mut f = vec![0.0; n];
+        for k in 0..5u64 {
+            for i in 0..n {
+                x[i] += pseudo(k + 1, n)[i];
+                f[i] += pseudo(k + 71, n)[i];
+            }
+            a.update(&x, &f);
+            assert!(a.history_len() <= 2, "history exceeded m = 2");
+        }
+        assert_eq!(a.history_len(), 2, "history never filled to m");
+
+        let mut zero = AndersonJacobian::new(Some(alpha), Some(0.01), Some(0));
+        let zeros = vec![0.0; n];
+        zero.setup(&zeros, &zeros);
+        zero.update(&x, &f);
+        assert_eq!(zero.history_len(), 0, "m = 0 still accumulated history");
+        let probe = pseudo(808, n);
+        let want: Vec<f64> = probe.iter().map(|v| -alpha * v).collect();
+        assert!(
+            max_diff(&zero.solve_ref(&probe), &want) < 1e-12,
+            "with m = 0 the step is not plain linear mixing"
+        );
+    }
+
+    /// All four new strategies drive through the trait, alongside the two already
+    /// there. A trait with six implementors is only worth having if calling through it
+    /// actually works for each.
+    #[test]
+    fn every_strategy_drives_through_the_trait() {
+        let n = 4;
+        let x0 = vec![1.0, 2.0, 3.0, 4.0];
+        let f0 = vec![0.5, -0.25, 0.75, -1.0];
+        let x1 = vec![1.3, 2.1, 2.6, 4.2];
+        let f1 = vec![0.2, -0.4, 0.5, -0.6];
+
+        let mut lm = LinearMixingJacobian::new(Some(0.4));
+        let mut db = DiagBroydenJacobian::new(Some(0.4));
+        let mut em = ExcitingMixingJacobian::new(Some(0.4), None);
+        let mut an = AndersonJacobian::new(Some(0.4), None, None);
+        let mut br = BroydenJacobian::first();
+        let strategies: [&mut dyn Jacobian; 5] =
+            [&mut lm, &mut db, &mut em, &mut an, &mut br];
+
+        for (i, s) in strategies.into_iter().enumerate() {
+            s.setup(&x0, &f0);
+            assert_eq!(s.dimension(), n, "strategy {i} reported the wrong dimension");
+            s.update(&x1, &f1);
+            let probe = pseudo(909, n);
+            let step = s.solve_ref(&probe);
+            assert_eq!(step.len(), n, "strategy {i} returned the wrong length");
+            assert!(
+                step.iter().all(|v| v.is_finite()),
+                "strategy {i} produced a non-finite step"
+            );
+            // Every one of these is a descent-direction approximation of -J^-1, so a
+            // nonzero residual must produce a nonzero step.
+            assert!(
+                norm_of(&step) > 1e-12,
+                "strategy {i} returned an all-zero step for a nonzero residual"
+            );
+        }
+    }
+
     // ── KrylovJacobian ──────────────────────────────────────────────────────
 
     use super::{InnerMethod, KrylovJacobian};
@@ -1728,6 +2054,510 @@ mod nonlin_tests {
     }
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Simple mixing Jacobians — scipy.optimize LinearMixing / DiagBroyden / ExcitingMixing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Shared auto-scaling for the mixing methods.
+///
+/// `GenericBroyden.setup`'s heuristic: `alpha = 0.5 * max(||x0||, 1) / ||f0||`, or 1
+/// when the residual already vanishes. Every method below inherits it, so it lives here
+/// rather than being written out four times with four chances to diverge.
+fn auto_alpha(x0: &[f64], f0: &[f64]) -> f64 {
+    let nf = norm(f0);
+    if nf != 0.0 {
+        0.5 * norm(x0).max(1.0) / nf
+    } else {
+        1.0
+    }
+}
+
+/// Scalar Jacobian approximation `J = -1/alpha * I` -- `scipy.optimize.LinearMixing`.
+///
+/// The Jacobian never changes; `update` is genuinely a no-op, which is not an oversight
+/// but the definition of the method. It is the crudest member of the family and is here
+/// because it is the right baseline: an adaptive method that fails to beat plain linear
+/// mixing on a problem is not earning its bookkeeping there.
+#[derive(Debug, Clone)]
+pub struct LinearMixingJacobian {
+    alpha: Option<f64>,
+    n: usize,
+}
+
+impl LinearMixingJacobian {
+    /// `alpha = None` auto-scales on setup.
+    #[must_use]
+    pub fn new(alpha: Option<f64>) -> Self {
+        Self { alpha, n: 0 }
+    }
+    fn a(&self) -> f64 {
+        self.alpha.unwrap_or(1.0)
+    }
+}
+
+impl Jacobian for LinearMixingJacobian {
+    fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        if self.alpha.is_none() {
+            self.alpha = Some(auto_alpha(x0, f0));
+        }
+    }
+    fn solve_ref(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().map(|x| -x * self.a()).collect()
+    }
+    fn matvec(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().map(|x| -x / self.a()).collect()
+    }
+    fn rsolve(&self, v: &[f64]) -> Vec<f64> {
+        self.solve_ref(v)
+    }
+    fn rmatvec(&self, v: &[f64]) -> Vec<f64> {
+        self.matvec(v)
+    }
+    /// Deliberately empty: the whole point of linear mixing is a fixed Jacobian.
+    fn update(&mut self, _x: &[f64], _f: &[f64]) {}
+    fn dimension(&self) -> usize {
+        self.n
+    }
+}
+
+/// Diagonal Jacobian approximation `J = -diag(d)` -- `scipy.optimize.DiagBroyden`.
+///
+/// Broyden's rank-1 update restricted to the diagonal: each entry absorbs only the part
+/// of the secant condition its own coordinate explains. That buys O(n) memory and O(n)
+/// work per step, and buys nothing at all on a problem whose coupling is off the
+/// diagonal -- the honest limit of the method rather than a defect of it.
+#[derive(Debug, Clone)]
+pub struct DiagBroydenJacobian {
+    alpha: Option<f64>,
+    d: Vec<f64>,
+    last_x: Vec<f64>,
+    last_f: Vec<f64>,
+    n: usize,
+}
+
+impl DiagBroydenJacobian {
+    /// `alpha = None` auto-scales on setup.
+    #[must_use]
+    pub fn new(alpha: Option<f64>) -> Self {
+        Self {
+            alpha,
+            d: Vec::new(),
+            last_x: Vec::new(),
+            last_f: Vec::new(),
+            n: 0,
+        }
+    }
+
+    /// The current diagonal.
+    #[must_use]
+    pub fn diagonal(&self) -> &[f64] {
+        &self.d
+    }
+}
+
+impl Jacobian for DiagBroydenJacobian {
+    fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        if self.alpha.is_none() {
+            self.alpha = Some(auto_alpha(x0, f0));
+        }
+        self.d = vec![1.0 / self.alpha.unwrap_or(1.0); self.n];
+        self.last_x = x0.to_vec();
+        self.last_f = f0.to_vec();
+    }
+    fn solve_ref(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().zip(&self.d).map(|(x, d)| -x / d).collect()
+    }
+    fn matvec(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().zip(&self.d).map(|(x, d)| -x * d).collect()
+    }
+    fn rsolve(&self, v: &[f64]) -> Vec<f64> {
+        self.solve_ref(v)
+    }
+    fn rmatvec(&self, v: &[f64]) -> Vec<f64> {
+        self.matvec(v)
+    }
+    fn update(&mut self, x: &[f64], f: &[f64]) {
+        if x.len() != self.n || f.len() != self.n {
+            return;
+        }
+        let dx: Vec<f64> = x.iter().zip(&self.last_x).map(|(a, b)| a - b).collect();
+        let df: Vec<f64> = f.iter().zip(&self.last_f).map(|(a, b)| a - b).collect();
+        let dx_norm2: f64 = dx.iter().map(|v| v * v).sum();
+        // A zero step carries no information and would divide by zero.
+        if dx_norm2 > 0.0 && dx_norm2.is_finite() {
+            for i in 0..self.n {
+                self.d[i] -= (df[i] + self.d[i] * dx[i]) * dx[i] / dx_norm2;
+            }
+        }
+        self.last_x = x.to_vec();
+        self.last_f = f.to_vec();
+    }
+    fn dimension(&self) -> usize {
+        self.n
+    }
+}
+
+/// Diagonal Jacobian with a per-coordinate adaptive step
+/// -- `scipy.optimize.ExcitingMixing`.
+///
+/// A coordinate whose residual KEEPS ITS SIGN is being approached steadily, so its step
+/// grows by `alpha`; one whose residual flips sign has overshot, so its step is reset to
+/// `alpha` outright. That asymmetry -- grow slowly, reset hard -- is the whole method,
+/// and it is a heuristic rather than an approximation of anything: no secant condition
+/// is involved, which is why it has no convergence theory and is judged only by results.
+#[derive(Debug, Clone)]
+pub struct ExcitingMixingJacobian {
+    alpha: Option<f64>,
+    alphamax: f64,
+    beta: Vec<f64>,
+    last_f: Vec<f64>,
+    n: usize,
+}
+
+impl ExcitingMixingJacobian {
+    /// `alpha = None` auto-scales on setup; `alphamax` defaults to 1.0.
+    #[must_use]
+    pub fn new(alpha: Option<f64>, alphamax: Option<f64>) -> Self {
+        Self {
+            alpha,
+            alphamax: alphamax.unwrap_or(1.0),
+            beta: Vec::new(),
+            last_f: Vec::new(),
+            n: 0,
+        }
+    }
+
+    /// The current per-coordinate steps.
+    #[must_use]
+    pub fn beta(&self) -> &[f64] {
+        &self.beta
+    }
+}
+
+impl Jacobian for ExcitingMixingJacobian {
+    fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        if self.alpha.is_none() {
+            self.alpha = Some(auto_alpha(x0, f0));
+        }
+        self.beta = vec![self.alpha.unwrap_or(1.0); self.n];
+        self.last_f = f0.to_vec();
+    }
+    fn solve_ref(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().zip(&self.beta).map(|(x, b)| -x * b).collect()
+    }
+    fn matvec(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().zip(&self.beta).map(|(x, b)| -x / b).collect()
+    }
+    fn rsolve(&self, v: &[f64]) -> Vec<f64> {
+        self.solve_ref(v)
+    }
+    fn rmatvec(&self, v: &[f64]) -> Vec<f64> {
+        self.matvec(v)
+    }
+    fn update(&mut self, _x: &[f64], f: &[f64]) {
+        if f.len() != self.n {
+            return;
+        }
+        let alpha = self.alpha.unwrap_or(1.0);
+        for i in 0..self.n {
+            // Compared against the PREVIOUS residual, which is why `last_f` is
+            // refreshed only after the whole sweep.
+            if f[i] * self.last_f[i] > 0.0 {
+                self.beta[i] += alpha;
+            } else {
+                self.beta[i] = alpha;
+            }
+            self.beta[i] = self.beta[i].clamp(0.0, self.alphamax);
+        }
+        self.last_f = f.to_vec();
+    }
+    fn dimension(&self) -> usize {
+        self.n
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Anderson mixing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Anderson mixing -- `scipy.optimize.Anderson`.
+///
+/// Rather than maintaining a Jacobian, this keeps the last `m` steps and residual
+/// changes and, at each solve, picks the combination of them that best cancels the
+/// current residual in a least-squares sense. It is Anderson acceleration in the shape
+/// of a Jacobian object, and it is often the strongest of these methods where the
+/// Jacobian is badly conditioned but the iterates lie near a low-dimensional manifold.
+///
+/// # `w0` regularises a problem that is rank-deficient exactly when it matters
+///
+/// The normal-equations matrix is `a[i][j] = (1 + w0^2 delta_ij) <df_i, df_j>`. Stored
+/// residual differences become nearly parallel as the iteration converges -- that is
+/// what converging means -- so `a` approaches singular precisely when the method is
+/// working. The `w0^2` ridge on the diagonal is what keeps the solve meaningful there.
+/// When it fails anyway the history is DISCARDED and the step falls back to plain
+/// linear mixing, which is SciPy's behaviour and the right one: a stale history is worse
+/// than no history.
+#[derive(Debug, Clone)]
+pub struct AndersonJacobian {
+    alpha: Option<f64>,
+    w0: f64,
+    m: usize,
+    dxs: Vec<Vec<f64>>,
+    dfs: Vec<Vec<f64>>,
+    /// Normal-equations matrix, row-major, rebuilt on every update.
+    a: Vec<f64>,
+    last_x: Vec<f64>,
+    last_f: Vec<f64>,
+    n: usize,
+}
+
+impl AndersonJacobian {
+    /// SciPy's defaults are `w0 = 0.01` and `m = 5`; `alpha = None` auto-scales.
+    #[must_use]
+    pub fn new(alpha: Option<f64>, w0: Option<f64>, m: Option<usize>) -> Self {
+        Self {
+            alpha,
+            w0: w0.unwrap_or(0.01),
+            m: m.unwrap_or(5),
+            dxs: Vec::new(),
+            dfs: Vec::new(),
+            a: Vec::new(),
+            last_x: Vec::new(),
+            last_f: Vec::new(),
+            n: 0,
+        }
+    }
+
+    /// Number of retained history pairs.
+    #[must_use]
+    pub fn history_len(&self) -> usize {
+        self.dxs.len()
+    }
+
+    fn alpha_v(&self) -> f64 {
+        self.alpha.unwrap_or(1.0)
+    }
+
+    /// `b[i][j] = <df_i, dx_j> - delta_ij <df_i, df_i> w0^2 alpha`, the matrix the
+    /// FORWARD product uses. Unlike `a` it is NOT symmetric, which is why the transpose
+    /// operation below solves with its transpose instead of reusing the same matrix.
+    fn b_matrix(&self) -> Vec<f64> {
+        let k = self.dxs.len();
+        let mut b = vec![0.0; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut v: f64 = self.dfs[i]
+                    .iter()
+                    .zip(&self.dxs[j])
+                    .map(|(p, q)| p * q)
+                    .sum();
+                if i == j && self.w0 != 0.0 {
+                    let dd: f64 = self.dfs[i].iter().map(|p| p * p).sum();
+                    v -= dd * self.w0 * self.w0 * self.alpha_v();
+                }
+                b[i * k + j] = v;
+            }
+        }
+        b
+    }
+
+    fn dots_with(vecs: &[Vec<f64>], f: &[f64]) -> Vec<f64> {
+        vecs.iter()
+            .map(|v| v.iter().zip(f).map(|(p, q)| p * q).sum())
+            .collect()
+    }
+}
+
+impl Jacobian for AndersonJacobian {
+    fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        if self.alpha.is_none() {
+            self.alpha = Some(auto_alpha(x0, f0));
+        }
+        self.dxs.clear();
+        self.dfs.clear();
+        self.a.clear();
+        self.last_x = x0.to_vec();
+        self.last_f = f0.to_vec();
+    }
+
+    fn solve_ref(&self, f: &[f64]) -> Vec<f64> {
+        let alpha = self.alpha_v();
+        let mut dx: Vec<f64> = f.iter().map(|v| -alpha * v).collect();
+        let k = self.dxs.len();
+        if k == 0 {
+            return dx;
+        }
+        let rhs = Self::dots_with(&self.dfs, f);
+        let mut a = self.a.clone();
+        // A singular history falls back to plain linear mixing rather than inventing a
+        // step; the `&mut` path additionally clears it.
+        let Some(gamma) = lu_solve_in_place(&mut a, &rhs, k) else {
+            return dx;
+        };
+        for m in 0..k {
+            let g = gamma[m];
+            for i in 0..self.n {
+                dx[i] += g * (self.dxs[m][i] + alpha * self.dfs[m][i]);
+            }
+        }
+        dx
+    }
+
+    /// As `solve_ref`, but discards a history that has gone singular so the next step
+    /// starts clean -- SciPy resets the same way.
+    fn solve(&mut self, f: &[f64]) -> Vec<f64> {
+        let k = self.dxs.len();
+        if k > 0 {
+            let rhs = Self::dots_with(&self.dfs, f);
+            let mut a = self.a.clone();
+            if lu_solve_in_place(&mut a, &rhs, k).is_none() {
+                self.dxs.clear();
+                self.dfs.clear();
+                self.a.clear();
+            }
+        }
+        self.solve_ref(f)
+    }
+
+    fn matvec(&self, f: &[f64]) -> Vec<f64> {
+        let alpha = self.alpha_v();
+        let mut dx: Vec<f64> = f.iter().map(|v| -v / alpha).collect();
+        let k = self.dxs.len();
+        if k == 0 {
+            return dx;
+        }
+        let rhs = Self::dots_with(&self.dfs, f);
+        let mut b = self.b_matrix();
+        let Some(gamma) = lu_solve_in_place(&mut b, &rhs, k) else {
+            return dx;
+        };
+        for m in 0..k {
+            let g = gamma[m];
+            for i in 0..self.n {
+                dx[i] += g * (self.dfs[m][i] + self.dxs[m][i] / alpha);
+            }
+        }
+        dx
+    }
+
+    /// `(J^-1)^T v`.
+    ///
+    /// SciPy does not define this, so it is DERIVED rather than ported, and the tests
+    /// check it against an explicit dense transpose instead of against a formula.
+    /// Writing the inverse as `-alpha I + U a^-1 D^T` with `U = [dx_m + alpha df_m]` and
+    /// `D = [df_m]`, its transpose is `-alpha I + D a^-T U^T`; `a` is SYMMETRIC, so the
+    /// same matrix serves both directions.
+    fn rsolve(&self, v: &[f64]) -> Vec<f64> {
+        let alpha = self.alpha_v();
+        let mut out: Vec<f64> = v.iter().map(|x| -alpha * x).collect();
+        let k = self.dxs.len();
+        if k == 0 {
+            return out;
+        }
+        let u: Vec<Vec<f64>> = (0..k)
+            .map(|m| {
+                self.dxs[m]
+                    .iter()
+                    .zip(&self.dfs[m])
+                    .map(|(a, b)| a + alpha * b)
+                    .collect()
+            })
+            .collect();
+        let rhs = Self::dots_with(&u, v);
+        let mut a = self.a.clone();
+        let Some(gamma) = lu_solve_in_place(&mut a, &rhs, k) else {
+            return out;
+        };
+        for m in 0..k {
+            let g = gamma[m];
+            for i in 0..self.n {
+                out[i] += g * self.dfs[m][i];
+            }
+        }
+        out
+    }
+
+    /// `J^T v`, derived the same way from `-I/alpha + V b^-1 D^T` with
+    /// `V = [df_m + dx_m/alpha]`. Here `b` is NOT symmetric, so this solves against its
+    /// transpose rather than reusing the forward matrix -- the one place the two
+    /// directions genuinely differ.
+    fn rmatvec(&self, v: &[f64]) -> Vec<f64> {
+        let alpha = self.alpha_v();
+        let mut out: Vec<f64> = v.iter().map(|x| -x / alpha).collect();
+        let k = self.dxs.len();
+        if k == 0 {
+            return out;
+        }
+        let vmat: Vec<Vec<f64>> = (0..k)
+            .map(|m| {
+                self.dfs[m]
+                    .iter()
+                    .zip(&self.dxs[m])
+                    .map(|(a, b)| a + b / alpha)
+                    .collect()
+            })
+            .collect();
+        let rhs = Self::dots_with(&vmat, v);
+        let b = self.b_matrix();
+        let mut bt = vec![0.0; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                bt[i * k + j] = b[j * k + i];
+            }
+        }
+        let Some(gamma) = lu_solve_in_place(&mut bt, &rhs, k) else {
+            return out;
+        };
+        for m in 0..k {
+            let g = gamma[m];
+            for i in 0..self.n {
+                out[i] += g * self.dfs[m][i];
+            }
+        }
+        out
+    }
+
+    fn update(&mut self, x: &[f64], f: &[f64]) {
+        if x.len() != self.n || f.len() != self.n || self.m == 0 {
+            return;
+        }
+        let dx: Vec<f64> = x.iter().zip(&self.last_x).map(|(a, b)| a - b).collect();
+        let df: Vec<f64> = f.iter().zip(&self.last_f).map(|(a, b)| a - b).collect();
+        self.last_x = x.to_vec();
+        self.last_f = f.to_vec();
+
+        self.dxs.push(dx);
+        self.dfs.push(df);
+        while self.dxs.len() > self.m {
+            self.dxs.remove(0);
+            self.dfs.remove(0);
+        }
+
+        let k = self.dxs.len();
+        let mut a = vec![0.0; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let wd = if i == j { self.w0 * self.w0 } else { 0.0 };
+                let d: f64 = self.dfs[i]
+                    .iter()
+                    .zip(&self.dfs[j])
+                    .map(|(p, q)| p * q)
+                    .sum();
+                a[i * k + j] = (1.0 + wd) * d;
+            }
+        }
+        self.a = a;
+    }
+
+    fn dimension(&self) -> usize {
+        self.n
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // KrylovJacobian
