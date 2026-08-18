@@ -36328,7 +36328,7 @@ and this window was better than described.
 ## Low-rank Broyden Jacobian vs `scipy.optimize.BroydenFirst` — win is the interpreter tax and it EXPIRES by n=4096
 
 Measured 2026-08-18, `crates/fsci-opt/src/bin/perf_broyden_lowrank.rs`
-(`MARKER=broyden-lowrank-v1-steps30`), release, ELF sha `847e3817d795150b`.
+(`MARKER=broyden-lowrank-v1-steps30`), release, executed-ELF-sha256 `847e3817d795150bd80508e111544cd235a6dab26744db912f27343906c13607`.
 Worker: this host (64-core, `/proc/cpuinfo` model as recorded in the run log).
 Harness: `scratchpad/drive.sh`, 5 interleaved replicates per size + a 3-replicate A/A null.
 Per-arm environment recorded on every stamp; loadavg 22.5–24.8 (1-min), CPU idle 54–76%,
