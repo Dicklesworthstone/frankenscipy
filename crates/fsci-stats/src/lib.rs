@@ -926,9 +926,11 @@ fn simpson_integrate(f: impl Fn(f64) -> f64, a: f64, b: f64, n: usize) -> f64 {
 /// is non-finite (weight underflowed to 0 against an `inf` sample) contribute
 /// 0, which is the correct limit for an integrable singularity.
 ///
-/// Currently consumed only by the pdf-normalization regression guards; gated to
-/// the test build to avoid shipping dead code until a production caller needs it.
-#[cfg(test)]
+/// The gate the original comment reserved has been claimed: `OrderStatistic`'s
+/// `mean`/`var` integrate the base quantile against a Beta weight over `(0, 1)`,
+/// which is exactly the open-interval, endpoint-clustered case this rule exists
+/// for (the base `ppf` diverges at both ends for an unbounded support). It is
+/// therefore no longer `#[cfg(test)]`; the pdf-normalization guards still use it.
 fn tanh_sinh_integrate(f: impl Fn(f64) -> f64, a: f64, b: f64) -> f64 {
     // NOT `a >= b` (frankenscipy-023vy). This guard is deliberately NaN-aware:
     // with a NaN endpoint every comparison is false, so `!(a < b)` is true and
@@ -57292,6 +57294,251 @@ pub fn kendall_distance(rank1: &[usize], rank2: &[usize]) -> usize {
     kendall_strict_inversions(&rank2_in_rank1_order) as usize
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// Order statistics (frankenscipy-wofb follow-on)
+// ══════════════════════════════════════════════════════════════════════
+
+/// The distribution of the `r`-th order statistic of `n` iid draws from `dist`.
+///
+/// Matches `scipy.stats.order_statistic(X, r=r, n=n)`. Sort `n` observations of
+/// a continuous random variable `X` into `X₍₁₎ ≤ … ≤ X₍ₙ₎`; this is the
+/// distribution of `X₍ᵣ₎`. `r = 1` is the sample minimum, `r = n` the maximum.
+///
+/// # How it is computed
+///
+/// `X = F⁻¹(U)` for a standard uniform `U`, and the order statistics of `U` are
+/// Beta distributed, so everything reduces to a regularized incomplete beta of
+/// the base distribution's own cdf:
+///
+/// ```text
+///   f₍ᵣ₎(x) = f(x) · F(x)^{r−1} · S(x)^{n−r} / B(r, n−r+1)
+///   F₍ᵣ₎(x) = I_{F(x)}(r, n−r+1)
+///   S₍ᵣ₎(x) = I_{S(x)}(n−r+1, r)
+/// ```
+///
+/// where `S = 1 − F` is the base survival function.
+///
+/// # Divergence from SciPy, and why it is deliberate
+///
+/// SciPy computes the complement as `betaincc(r, n−r+1, F(x))` — it feeds the
+/// **cdf** into the complementary incomplete beta. Once `F(x)` rounds to 1.0
+/// that returns exactly zero, so the survival of an order statistic collapses
+/// in the right tail even when every ingredient is representable. Measured on
+/// `stats.order_statistic(stats.Normal(), r=5, n=5)`, the sample maximum:
+///
+/// ```text
+///   x      scipy ccdf        exact 1 − (1 − S)^5
+///   5      1.4332570e-06     1.4332570e-06      agree
+///   8      3.3306691e-15     3.1104803e-15      7% high
+///   10     0.0               3.8099265e-23
+///   37     0.0               2.8627856e-299
+/// ```
+///
+/// This implementation uses the reflection `I_x(a,b) = 1 − I_{1−x}(b,a)` to feed
+/// the base **survival** function in instead: `I_{S(x)}(n−r+1, r)`. `S(x)` is
+/// computed directly by the base distribution (this crate overrides `sf` on ~50
+/// distributions precisely so it does not go through `1 − cdf`), so no quantity
+/// in the tail is ever obtained by subtracting from one. Same identity, same
+/// answer where SciPy is accurate, and it keeps going where SciPy stops.
+///
+/// `logcdf`/`logsf` follow the same split through `log_betainc_scalar`, which is
+/// finite where the incomplete beta itself underflows.
+///
+/// # Moments
+///
+/// `mean` and `var` have no closed form in general. They are computed as
+/// `E[F⁻¹(U)]` with `U ~ Beta(r, n−r+1)` — a tanh-sinh quadrature over the OPEN
+/// interval `(0, 1)`. Integrating in the probability variable rather than in `x`
+/// is what makes the domain finite whatever the base support is, and the base
+/// `ppf` diverging at the ends is exactly the integrable endpoint singularity
+/// the double-exponential rule is for. `var` integrates `(F⁻¹(u) − mean)²`
+/// rather than differencing `E[X²] − mean²`, so a large mean does not cancel
+/// away the variance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrderStatistic<D: ContinuousDistribution> {
+    dist: D,
+    r: u64,
+    n: u64,
+}
+
+impl<D: ContinuousDistribution> OrderStatistic<D> {
+    /// `r`-th order statistic of `n` draws. `1 ≤ r ≤ n`.
+    ///
+    /// SciPy's own guard here is looser than its error message: it rejects
+    /// non-integer and NEGATIVE `r`/`n` while its message says "positive
+    /// integers", so `r = 0` passes the check and is caught later by the
+    /// parameter domain `[1, n]`. This asserts the documented domain directly.
+    #[must_use]
+    pub fn new(dist: D, r: u64, n: u64) -> Self {
+        assert!(n > 0, "n must be at least 1, got {n}");
+        assert!(r > 0, "r must be at least 1, got {r}");
+        assert!(r <= n, "r must not exceed n, got r={r} n={n}");
+        Self { dist, r, n }
+    }
+
+    /// The underlying distribution `X`.
+    #[must_use]
+    pub fn base(&self) -> &D {
+        &self.dist
+    }
+
+    /// The rank `r`.
+    #[must_use]
+    pub fn rank(&self) -> u64 {
+        self.r
+    }
+
+    /// The sample size `n`.
+    #[must_use]
+    pub fn sample_size(&self) -> u64 {
+        self.n
+    }
+
+    /// Beta shape parameters of the induced uniform order statistic:
+    /// `U₍ᵣ₎ ~ Beta(r, n−r+1)`. `r ≤ n` is enforced in `new`, so `n − r + 1 ≥ 1`
+    /// and the subtraction is done in u64 before widening -- no cast can be
+    /// negative and no f64 rounding can reorder the two.
+    fn beta_shapes(&self) -> (f64, f64) {
+        (self.r as f64, (self.n - self.r + 1) as f64)
+    }
+
+    /// E[g(F⁻¹(U))] with `U ~ Beta(r, n−r+1)`, by tanh-sinh quadrature on (0,1).
+    fn beta_weighted(&self, g: impl Fn(f64) -> f64) -> f64 {
+        let (a, b) = self.beta_shapes();
+        let ln_b = ln_beta(a, b);
+        tanh_sinh_integrate(
+            |u| {
+                // Beta(a, b) density in log space; the quadrature never samples
+                // u = 0 or 1, so the logs are finite at every node it uses.
+                let ln_w = (a - 1.0) * u.ln() + (b - 1.0) * (-u).ln_1p() - ln_b;
+                let w = ln_w.exp();
+                if w == 0.0 {
+                    // Underflowed weight against a possibly infinite quantile:
+                    // the limit is 0, and 0 * inf would be NaN.
+                    return 0.0;
+                }
+                w * g(self.dist.ppf(u))
+            },
+            0.0,
+            1.0,
+        )
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for OrderStatistic<D> {
+    fn pdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (a, b) = self.beta_shapes();
+        // powf(0.0, 0.0) == 1.0 in Rust, so the r = 1 and r = n edges are already
+        // right without a special case: F^0 and S^0 stay 1 even where F or S is 0.
+        // (The 0^0 hazard SciPy patches around lives in LOG space -- see logpdf.)
+        let f = self.dist.pdf(x);
+        let big_f = self.dist.cdf(x);
+        let s = self.dist.sf(x);
+        let direct = f * big_f.powf(a - 1.0) * s.powf(b - 1.0) / ln_beta(a, b).exp();
+        if direct.is_finite() {
+            return direct;
+        }
+        // For large n, B(r, n−r+1) underflows while F^{r−1} does too, so the
+        // direct product is 0 * inf = NaN. SciPy's `_pdf_formula` has the same
+        // shape and the same failure; the log form stays finite, so fall back to
+        // it rather than propagate the NaN.
+        self.logpdf(x).exp()
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (a, b) = self.beta_shapes();
+        let log_f = self.dist.logpdf(x);
+        let log_big_f = self.dist.logcdf(x);
+        let log_s = self.dist.logsf(x);
+        // 0 * -inf is NaN but the corresponding factor is 0^0 = 1, i.e. log 0.
+        // SciPy carries the same two guards for the same reason.
+        let term_lo = if a == 1.0 { 0.0 } else { (a - 1.0) * log_big_f };
+        let term_hi = if b == 1.0 { 0.0 } else { (b - 1.0) * log_s };
+        log_f + term_lo + term_hi - ln_beta(a, b)
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (a, b) = self.beta_shapes();
+        regularized_incomplete_beta(a, b, self.dist.cdf(x)).clamp(0.0, 1.0)
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        // I_{S(x)}(n−r+1, r), NOT betaincc(r, n−r+1, F(x)). See the type doc: the
+        // second form is SciPy's and it returns 0 once F(x) rounds to 1.
+        let (a, b) = self.beta_shapes();
+        regularized_incomplete_beta(b, a, self.dist.sf(x)).clamp(0.0, 1.0)
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (a, b) = self.beta_shapes();
+        fsci_special::log_betainc_scalar(a, b, self.dist.cdf(x))
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (a, b) = self.beta_shapes();
+        fsci_special::log_betainc_scalar(b, a, self.dist.sf(x))
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let (a, b) = self.beta_shapes();
+        self.dist
+            .ppf(fsci_special::betaincinv_scalar(a, b, q).clamp(0.0, 1.0))
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        // Invert on the SURVIVAL scale and hand the base its own `isf`, so a
+        // small q never has to become `1 - q` first.
+        let (a, b) = self.beta_shapes();
+        self.dist
+            .isf(fsci_special::betaincinv_scalar(b, a, q).clamp(0.0, 1.0))
+    }
+
+    fn mean(&self) -> f64 {
+        self.beta_weighted(|x| x)
+    }
+
+    fn var(&self) -> f64 {
+        let mu = self.mean();
+        if !mu.is_finite() {
+            return f64::NAN;
+        }
+        self.beta_weighted(|x| (x - mu) * (x - mu))
+    }
+}
+
+/// The distribution of the `r`-th order statistic of `n` iid draws from `dist`.
+///
+/// Free-function spelling of [`OrderStatistic::new`], matching
+/// `scipy.stats.order_statistic(X, r=r, n=n)`. Panics unless `1 ≤ r ≤ n`.
+#[must_use]
+pub fn order_statistic<D: ContinuousDistribution>(dist: D, r: u64, n: u64) -> OrderStatistic<D> {
+    OrderStatistic::new(dist, r, n)
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
@@ -97011,5 +97258,329 @@ mod wofb_noncentral_survival_is_direct {
         assert!((d.cdf(4.0) + d.sf(4.0) - 1.0).abs() < 1e-12);
         let g = NoncentralF::new(3.0, 5.0, 2.0);
         assert!((g.cdf(3.0) + g.sf(3.0) - 1.0).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod order_statistic_matches_scipy {
+    use super::{ContinuousDistribution, Normal, OrderStatistic, order_statistic};
+
+    /// pdf/cdf/sf against `scipy.stats.order_statistic(stats.Normal(), r=r, n=n)`
+    /// in the range where SciPy is accurate.
+    #[test]
+    fn pdf_cdf_sf_match_scipy_mid_range() {
+        // r, n, x, scipy pdf, scipy cdf, scipy ccdf
+        let cases = [
+            (
+                1,
+                5,
+                -1.0,
+                6.062_179_301_420_636e-1,
+                5.784_297_695_424_548e-1,
+                4.215_702_304_575_452e-1,
+            ),
+            (1, 5, 0.0, 1.246_694_626_254_477e-1, 9.687_5e-1, 3.125e-2),
+            (
+                1,
+                5,
+                1.5,
+                1.290_006_479_080_637e-5,
+                9.999_986_691_889_694e-1,
+                1.330_811_030_624_574e-6,
+            ),
+            (
+                3,
+                5,
+                -1.0,
+                1.293_424_165_278_066e-1,
+                3.103_497_992_812_083e-2,
+                9.689_650_200_718_791e-1,
+            ),
+            (3, 5, 0.0, 7.480_167_757_526_863e-1, 5.0e-1, 5.0e-1),
+            (
+                3,
+                5,
+                1.5,
+                1.510_216_958_412_121e-2,
+                9.973_090_772_965_121e-1,
+                2.690_922_703_487_961e-3,
+            ),
+            (
+                5,
+                5,
+                -1.0,
+                7.665_679_600_171_073e-4,
+                1.005_245_858_513_858e-4,
+                9.998_994_754_141_486e-1,
+            ),
+            (5, 5, 0.0, 1.246_694_626_254_477e-1, 3.125e-2, 9.687_5e-1),
+            (
+                5,
+                5,
+                1.5,
+                4.911_162_373_689_541e-1,
+                7.077_125_446_876_039e-1,
+                2.922_874_553_123_961e-1,
+            ),
+            (
+                2,
+                7,
+                -1.0,
+                6.797_301_110_926_495e-1,
+                3.076_774_137_564_610e-1,
+                6.923_225_862_435_390e-1,
+            ),
+            (2, 7, 0.0, 2.618_058_715_134_402e-1, 9.375e-1, 6.25e-2),
+            (
+                2,
+                7,
+                1.5,
+                6.755_629_675_724_769e-6,
+                9.999_994_132_837_492e-1,
+                5.867_162_507_663_507e-7,
+            ),
+        ];
+        for (r, n, x, want_pdf, want_cdf, want_sf) in cases {
+            let y = order_statistic(Normal::standard(), r, n);
+            for (got, want, what) in [
+                (y.pdf(x), want_pdf, "pdf"),
+                (y.cdf(x), want_cdf, "cdf"),
+                (y.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-10,
+                    "order_statistic(Normal, r={r}, n={n}).{what}({x}) = {got:e}, \
+                     scipy = {want:e} (rel {rel:e})"
+                );
+            }
+        }
+    }
+
+    /// THE POINT OF THE TYPE. SciPy's survival goes through
+    /// `betaincc(r, n-r+1, F(x))`; once `F(x)` rounds to 1.0 that is identically
+    /// zero. Feeding the base SURVIVAL into the reflected incomplete beta keeps
+    /// the tail alive.
+    ///
+    /// The goldens here are NOT from `scipy.stats.order_statistic` -- it cannot
+    /// produce them, which is the whole point. For r = n = 5 the survival is
+    /// exactly `1 - (1 - S)^5`, evaluated as `-expm1(5*log1p(-S))`; each value was
+    /// independently reproduced through SciPy's own `special.betainc(1, 5, S)`,
+    /// so the identity and the primitive agree and only the plumbing differs.
+    #[test]
+    fn survival_of_the_sample_maximum_survives_a_saturated_cdf() {
+        let y = order_statistic(Normal::standard(), 5, 5);
+
+        // The premise, asserted rather than described: the base cdf really has
+        // saturated at x = 10, so EVERY route through it returns 0 -- there is
+        // nothing left in F(x) to compute with.
+        assert_eq!(
+            Normal::standard().cdf(10.0),
+            1.0,
+            "premise: the normal cdf saturates here, so betaincc(r, n-r+1, F) is 0"
+        );
+        assert!(
+            Normal::standard().sf(10.0) > 0.0,
+            "premise: the SURVIVAL at the same point is still representable"
+        );
+
+        // x, exact 1 - (1 - S)^5   (scipy's order_statistic ccdf in the comment)
+        let cases = [
+            (8.0, 3.110_480_287_135_866e-15),   // scipy: 3.330669e-15, 7% high
+            (10.0, 3.809_926_512_080_235e-23),  // scipy: 0.0
+            (20.0, 1.376_812_059_303_078e-88),  // scipy: 0.0
+            (37.0, 2.862_785_611_261_963e-299), // scipy: 0.0
+        ];
+        for (x, want) in cases {
+            let got = y.sf(x);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < 1e-9,
+                "max-of-5 sf({x}) = {got:e}, exact = {want:e} (rel {rel:e}). A failure \
+                 here is a finding about betainc_scalar at tiny x, not about the identity"
+            );
+        }
+
+        // logsf stays finite through the same route.
+        let got = y.logsf(10.0);
+        let want = -5.162_184_723_807_838e1;
+        assert!(
+            (got - want).abs() < 1e-9,
+            "max-of-5 logsf(10) = {got}, expected {want}"
+        );
+    }
+
+    /// Moments by tanh-sinh quadrature of the base quantile against the Beta
+    /// weight.
+    ///
+    /// The tolerance is 1e-7 relative, and the binding constraint is NOT the
+    /// quadrature: the integrand calls `Normal`'s `ppf`, a rational approximation
+    /// good to ~3e-9 absolute, so no moment built on it can be tighter than that.
+    /// Stating the real limit beats asserting 1e-14 and loosening it later. It is
+    /// still three orders tighter than any formula error would be -- a swapped
+    /// Beta shape moves these by percent.
+    #[test]
+    fn mean_and_var_match_scipy() {
+        // r, n, scipy mean, scipy variance
+        let cases = [
+            (1, 5, -1.162_964_473_640_520e0, 4.475_340_690_206_621e-1),
+            (5, 5, 1.162_964_473_640_520e0, 4.475_340_690_206_621e-1),
+            (2, 7, -7.573_742_706_388_729e-1, 2.567_328_861_621_016e-1),
+        ];
+        for (r, n, want_mean, want_var) in cases {
+            let y = order_statistic(Normal::standard(), r, n);
+            let rel_m = ((y.mean() - want_mean) / want_mean).abs();
+            assert!(
+                rel_m < 1e-7,
+                "order_statistic(Normal, {r}, {n}).mean() = {}, scipy = {want_mean} \
+                 (rel {rel_m:e})",
+                y.mean()
+            );
+            let rel_v = ((y.var() - want_var) / want_var).abs();
+            assert!(
+                rel_v < 1e-7,
+                "order_statistic(Normal, {r}, {n}).var() = {}, scipy = {want_var} (rel {rel_v:e})",
+                y.var()
+            );
+        }
+        // The median order statistic of an odd sample is symmetric about 0, so
+        // scipy's mean there is -2.6e-18 -- a RELATIVE test against it would be
+        // meaningless. Assert what is actually true.
+        let mid = order_statistic(Normal::standard(), 3, 5);
+        assert!(
+            mid.mean().abs() < 1e-9,
+            "median-of-5 mean should be 0 by symmetry, got {}",
+            mid.mean()
+        );
+        let want_var = 2.868_336_616_058_765e-1;
+        assert!(
+            ((mid.var() - want_var) / want_var).abs() < 1e-7,
+            "median-of-5 var = {}, scipy = {want_var}",
+            mid.var()
+        );
+    }
+
+    /// ppf/isf round-trip through the beta inverse and the base quantile.
+    #[test]
+    fn ppf_and_isf_match_scipy() {
+        // r, n, q, scipy icdf, scipy iccdf
+        let cases = [
+            (1, 5, 0.05, -2.318_679_209_826_409e0, -1.238_431_617_706_278e-1),
+            (1, 5, 0.5, -1.128_997_535_296_102e0, -1.128_997_535_296_102e0),
+            (1, 5, 0.95, -1.238_431_617_706_281e-1, -2.318_679_209_826_408e0),
+            (3, 5, 0.05, -8.806_435_950_364_639e-1, 8.806_435_950_364_639e-1),
+            (3, 5, 0.95, 8.806_435_950_364_635e-1, -8.806_435_950_364_635e-1),
+        ];
+        for (r, n, q, want_ppf, want_isf) in cases {
+            let y = order_statistic(Normal::standard(), r, n);
+            assert!(
+                (y.ppf(q) - want_ppf).abs() < 1e-9,
+                "order_statistic(Normal, {r}, {n}).ppf({q}) = {}, scipy = {want_ppf}",
+                y.ppf(q)
+            );
+            assert!(
+                (y.isf(q) - want_isf).abs() < 1e-9,
+                "order_statistic(Normal, {r}, {n}).isf({q}) = {}, scipy = {want_isf}",
+                y.isf(q)
+            );
+        }
+    }
+
+    /// Structural identities that hold for ANY base distribution, so a wrong
+    /// index or a swapped Beta shape shows up without a golden.
+    #[test]
+    fn structural_identities() {
+        let base = Normal::new(0.3, 2.0);
+
+        // n = 1 is the base distribution itself: I_F(1, 1) = F.
+        let one = order_statistic(base, 1, 1);
+        for x in [-2.0, 0.0, 1.7] {
+            assert!((one.cdf(x) - base.cdf(x)).abs() < 1e-13, "n=1 cdf at {x}");
+            assert!((one.pdf(x) - base.pdf(x)).abs() < 1e-13, "n=1 pdf at {x}");
+            assert!((one.sf(x) - base.sf(x)).abs() < 1e-13, "n=1 sf at {x}");
+        }
+
+        // Minimum and maximum have elementary closed forms:
+        //   P(min > x) = S^n,  P(max <= x) = F^n.
+        let n = 6u64;
+        let lo = order_statistic(base, 1, n);
+        let hi = order_statistic(base, n, n);
+        for x in [-1.0, 0.4, 2.5] {
+            let want_lo = base.sf(x).powi(n as i32);
+            let want_hi = base.cdf(x).powi(n as i32);
+            assert!(
+                ((lo.sf(x) - want_lo) / want_lo).abs() < 1e-12,
+                "min-of-{n} sf at {x}: {} vs S^n {want_lo}",
+                lo.sf(x)
+            );
+            assert!(
+                ((hi.cdf(x) - want_hi) / want_hi).abs() < 1e-12,
+                "max-of-{n} cdf at {x}: {} vs F^n {want_hi}",
+                hi.cdf(x)
+            );
+        }
+
+        // The ranks partition: Σ_r pdf_r(x) = n · f(x), since exactly one of the
+        // n sorted positions is occupied. Catches an off-by-one in either Beta
+        // shape, which the min/max checks alone cannot.
+        let x = 0.9;
+        let total: f64 = (1..=n).map(|r| order_statistic(base, r, n).pdf(x)).sum();
+        let want = n as f64 * base.pdf(x);
+        assert!(
+            ((total - want) / want).abs() < 1e-12,
+            "Σ_r pdf_r({x}) = {total}, expected n·f = {want}"
+        );
+
+        // Reflection: the r-th smallest of X is the (n−r+1)-th largest of −X.
+        // With a symmetric base centred at loc, that is a mirror about loc.
+        let sym = Normal::standard();
+        for r in 1..=n {
+            let a = order_statistic(sym, r, n);
+            let b = order_statistic(sym, n - r + 1, n);
+            assert!(
+                (a.cdf(0.75) - b.sf(-0.75)).abs() < 1e-12,
+                "reflection failed at r={r}"
+            );
+        }
+
+        // logpdf agrees with ln(pdf) where the pdf is representable, including
+        // the r=1 and r=n edges where the log form has a 0·(−∞) to dodge.
+        for (r, nn) in [(1u64, 4u64), (4, 4), (2, 4)] {
+            let y = order_statistic(sym, r, nn);
+            for x in [-1.5, 0.0, 1.5] {
+                let d = (y.logpdf(x) - y.pdf(x).ln()).abs();
+                assert!(d < 1e-10, "logpdf vs ln(pdf) at r={r} n={nn} x={x}: {d:e}");
+            }
+        }
+    }
+
+    #[test]
+    fn boundaries_and_domain() {
+        let y = order_statistic(Normal::standard(), 2, 4);
+        assert!(y.pdf(f64::NAN).is_nan());
+        assert!(y.cdf(f64::NAN).is_nan());
+        assert!(y.sf(f64::NAN).is_nan());
+        assert!(y.ppf(-0.1).is_nan());
+        assert!(y.ppf(1.1).is_nan());
+        assert!(y.isf(-0.1).is_nan());
+        assert_eq!(y.rank(), 2);
+        assert_eq!(y.sample_size(), 4);
+        assert_eq!(y.base().loc, 0.0);
+        // cdf + sf = 1 mid-range, where neither is at risk.
+        assert!((y.cdf(0.3) + y.sf(0.3) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    #[should_panic(expected = "r must not exceed n")]
+    fn rank_above_sample_size_panics() {
+        let _ = OrderStatistic::new(Normal::standard(), 5, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "r must be at least 1")]
+    fn rank_zero_panics() {
+        // SciPy lets r = 0 past its own check (its message says "positive
+        // integers" but the test is `r < 0`); it is rejected here at construction.
+        let _ = OrderStatistic::new(Normal::standard(), 0, 4);
     }
 }
