@@ -29,7 +29,8 @@ pub use nonlin::{
     AndersonJacobian, BroydenJacobian, BroydenVariant, DiagBroydenJacobian,
     ExcitingMixingJacobian, InnerMethod, InverseJacobian, Jacobian, KrylovJacobian,
     LineSearch, LinearMixingJacobian, LowRankMatrix, NonlinJacobian, NonlinOptions,
-    NonlinResult, ReductionMethod, anderson, broyden1_lowrank, broyden2_lowrank,
+    NonlinMethod, NonlinResult, ReductionMethod, anderson, broyden1_lowrank,
+    broyden2_lowrank, root_nonlin,
     diag_broyden, exciting_mixing, linear_mixing, nonlin_solve,
 };
 pub use root::{
