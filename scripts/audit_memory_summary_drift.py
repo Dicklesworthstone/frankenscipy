@@ -16,6 +16,18 @@ exactly like a fresh one.
 
 The check is deliberately CRUDE and reports CANDIDATES, not verdicts -- every hit must be
 read. It exists to bound the search, not to replace it.
+
+KNOWN BLIND SPOT, found the hard way 2026-08-18. This compares a file's SUMMARY against
+its own BODY, so it cannot see a file that is internally CONSISTENT and externally WRONG.
+conformance_fsci_iterative_solver_stubs passed this check cleanly -- index and body both
+said "lsmr -> lsqr still open" -- while a cross-reference buried in a DIFFERENT memory
+(correctness_absolute_epsilon_on_dimensioned_quantity) said that note was stale, and a
+source read settled it: lsmr is a real ~219-line Fong & Saunders Algorithm 6.1
+implementation that never calls lsqr.
+
+Agreement between a summary and its body is not evidence that either is true. Cross-file
+contradictions need a different probe, and any claim ABOUT SOURCE has to be settled by
+reading the source.
 """
 import os
 import re
