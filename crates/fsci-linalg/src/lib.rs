@@ -5458,6 +5458,21 @@ const CHOL_FACTOR_FLAT_MIN_DIM: usize = 256;
 pub static CHOL_FACTOR_FLAT_MIN_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Restore the spawn-per-panel TRSM arm: `std::thread::scope` with a fresh OS thread per
+/// row chunk, joined before the next panel (`frankenscipy-ua3gn`).
+///
+/// Default `false` = dispatch onto rayon's persistent pool, which is what
+/// `cholesky_syrk_parallel_rows` in this file already does for the trailing SYRK. This knob
+/// exists so the two can be A/B'd inside ONE binary rather than against a differently
+/// compiled one — the comparison this project has repeatedly had to discard.
+///
+/// BYTE-IDENTICAL either way: both arms hand disjoint `&mut` row ranges to the same
+/// `cholesky_panel_trsm_blocked_fma_rows`, whose arithmetic is chunking-independent, and
+/// neither scope imposes an order.
+#[doc(hidden)]
+pub static CHOL_PANEL_TRSM_STD_SCOPE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A/B switch: force the blocked-FMA panel TRSM onto its serial path. Same-binary
 /// A/B only; the parallel split is byte-identical (4-row-aligned chunks), so either
 /// setting produces the same factor bits.
@@ -21278,18 +21293,59 @@ fn cholesky_panel_trsm_blocked_fma_in(
     }
     CHOL_PANEL_TRSM_PAR_PANELS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let chunk_rows = (m2 / 4).div_ceil(nthreads) * 4;
-    let ok = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
+
+    // `std::thread::scope` SPAWNS OS THREADS AND JOINS THEM, once per panel. The k-loop runs
+    // this for every panel, so at n=1000 the spawn/join is paid ~n/kb times and is the
+    // measured obstacle on `frankenscipy-ua3gn`: fan-out goes NET NEGATIVE below ~15M MACs
+    // per panel, which gates the parallel TRSM off at exactly the sizes where the dense-BLAS
+    // wall is worst.
+    //
+    // `rayon::scope` dispatches onto rayon's PERSISTENT pool instead, so a panel costs a
+    // work-queue push rather than a thread spawn. This is not a new dependency or a new
+    // concurrency model: `cholesky_syrk_parallel_rows` in this same file already fans the
+    // trailing SYRK out with `rayon::scope`, and this brings the TRSM into line with it.
+    //
+    // BYTE-IDENTICAL: the chunks are disjoint `&mut` row ranges and each is solved by the
+    // same `cholesky_panel_trsm_blocked_fma_rows`, whose row arithmetic does not depend on
+    // chunking (its own doc says serial and fanned-out runs agree bit for bit). Neither scope
+    // imposes an order, and no chunk reads another's output.
+    //
+    // `CHOL_PANEL_TRSM_STD_SCOPE` restores the spawn-per-panel arm so the two can be measured
+    // against each other inside ONE binary (`frankenscipy-ua3gn`).
+    if CHOL_PANEL_TRSM_STD_SCOPE.load(std::sync::atomic::Ordering::Relaxed) {
+        let ok = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for rows in trailing.chunks_mut(chunk_rows * n) {
+                handles.push(scope.spawn(move || {
+                    cholesky_panel_trsm_blocked_fma_rows(panel, l11t, rows, n, k, kb).is_some()
+                }));
+            }
+            handles
+                .into_iter()
+                .all(|handle| handle.join().expect("panel TRSM worker panicked"))
+        });
+        return if ok { Some(()) } else { None };
+    }
+
+    // Failure is reported through a shared flag because `rayon::scope`'s spawned closures
+    // return `()`. Relaxed is sufficient: the flag is only read after `rayon::scope` returns,
+    // which already synchronises with every task.
+    let failed = std::sync::atomic::AtomicBool::new(false);
+    rayon::scope(|scope| {
         for rows in trailing.chunks_mut(chunk_rows * n) {
-            handles.push(scope.spawn(move || {
-                cholesky_panel_trsm_blocked_fma_rows(panel, l11t, rows, n, k, kb).is_some()
-            }));
+            let failed = &failed;
+            scope.spawn(move |_| {
+                if cholesky_panel_trsm_blocked_fma_rows(panel, l11t, rows, n, k, kb).is_none() {
+                    failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
         }
-        handles
-            .into_iter()
-            .all(|handle| handle.join().expect("panel TRSM worker panicked"))
     });
-    if ok { Some(()) } else { None }
+    if failed.load(std::sync::atomic::Ordering::Relaxed) {
+        None
+    } else {
+        Some(())
+    }
 }
 
 /// Per-chunk core of [`cholesky_panel_trsm_blocked_fma`]: solves a 4-row-aligned
