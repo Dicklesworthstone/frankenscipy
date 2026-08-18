@@ -4,6 +4,7 @@ pub mod audit;
 pub mod curvefit;
 pub mod linesearch;
 pub mod minimize;
+pub mod nonlin;
 pub mod root;
 pub mod types;
 
@@ -23,6 +24,9 @@ pub use minimize::{
     TRUST_EXACT_FOLD_SHIFT_DISABLE, bfgs, cg_pr_plus, get_optimize_traces, lbfgsb, minimize,
     minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit, nelder_mead,
     newton_cg, powell, select_minimize_method, trust_exact,
+};
+pub use nonlin::{
+    BroydenJacobian, BroydenVariant, InverseJacobian, Jacobian, LowRankMatrix, ReductionMethod,
 };
 pub use root::{
     MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult,

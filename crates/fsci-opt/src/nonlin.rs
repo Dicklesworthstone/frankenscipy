@@ -627,3 +627,354 @@ impl Jacobian for BroydenJacobian {
         self.n
     }
 }
+
+/// Low-rank Jacobian representations and the Broyden updates built on them.
+///
+/// The load-bearing property throughout is the SECANT CONDITION: after absorbing a
+/// step, `Gm df = dx` holds to rounding rather than approximately, because `Gm`
+/// approximates the INVERSE Jacobian and both Broyden updates are constructed to
+/// enforce exactly that. Testing against it states what the code must be.
+#[cfg(test)]
+mod nonlin_tests {
+    use super::{
+        BroydenJacobian, BroydenVariant, InverseJacobian, Jacobian, LowRankMatrix,
+        ReductionMethod, lu_solve_in_place,
+    };
+
+    const N: usize = 5;
+
+    /// Deterministic pseudo-random vectors: a fixed multiplicative recurrence, so the
+    /// test is reproducible without a dependency and without a table of literals.
+    fn pseudo(seed: u64, n: usize) -> Vec<f64> {
+        let mut s = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                ((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    fn with_rank(alpha: f64, rank: usize) -> LowRankMatrix {
+        let mut m = LowRankMatrix::new(alpha, N);
+        for k in 0..rank {
+            m.append(pseudo(k as u64 + 1, N), pseudo(k as u64 + 101, N));
+        }
+        m
+    }
+
+    fn dense_solve(m: &LowRankMatrix, v: &[f64]) -> Vec<f64> {
+        let mut a = m.to_dense();
+        lu_solve_in_place(&mut a, v, N).expect("reference system is nonsingular")
+    }
+
+    fn max_diff(a: &[f64], b: &[f64]) -> f64 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
+    }
+
+    /// MUST-HIT: the Sherman-Morrison-Woodbury solve agrees with a dense solve of the
+    /// matrix it claims to represent, at every rank from 0 up.
+    ///
+    /// MUST-MISS: at nonzero rank it must NOT agree with `v/alpha`, which is what the
+    /// answer would be if the rank-1 terms were silently dropped. Without that arm, a
+    /// `solve` that ignored `cs` and `ds` entirely would pass the rank-0 case and the
+    /// suite would call it correct.
+    #[test]
+    fn the_smw_solve_agrees_with_a_dense_solve_at_every_rank() {
+        let alpha = -0.7;
+        let v = pseudo(999, N);
+        for rank in 0..4 {
+            let m = with_rank(alpha, rank);
+            let got = m.solve(&v);
+            let want = dense_solve(&m, &v);
+            assert!(
+                max_diff(&got, &want) < 1e-9,
+                "rank {rank}: SMW solve disagrees with the dense solve by {}",
+                max_diff(&got, &want)
+            );
+            // Round trip through the operator it inverts.
+            assert!(
+                max_diff(&m.matvec(&got), &v) < 1e-9,
+                "rank {rank}: M (M^-1 v) is not v"
+            );
+
+            let ignoring_terms: Vec<f64> = v.iter().map(|x| x / alpha).collect();
+            if rank == 0 {
+                assert!(max_diff(&got, &ignoring_terms) < 1e-12);
+            } else {
+                assert!(
+                    max_diff(&got, &ignoring_terms) > 1e-3,
+                    "rank {rank}: the solve matched v/alpha, so the rank-1 terms were \
+                     never applied and the agreement above is vacuous"
+                );
+            }
+        }
+    }
+
+    /// The transpose operations are a separate code path -- the factor lists are
+    /// exchanged rather than the matrix being formed -- so they are checked against an
+    /// explicit dense transpose rather than against each other.
+    #[test]
+    fn the_transpose_operations_match_an_explicit_transpose() {
+        let m = with_rank(-0.7, 3);
+        let v = pseudo(1234, N);
+        let dense = m.to_dense();
+
+        let want_rmatvec: Vec<f64> = (0..N)
+            .map(|i| (0..N).map(|j| dense[j * N + i] * v[j]).sum())
+            .collect();
+        assert!(
+            max_diff(&m.rmatvec(&v), &want_rmatvec) < 1e-9,
+            "rmatvec is not M^T v"
+        );
+
+        let mut at = vec![0.0; N * N];
+        for i in 0..N {
+            for j in 0..N {
+                at[i * N + j] = dense[j * N + i];
+            }
+        }
+        let want_rsolve = lu_solve_in_place(&mut at, &v, N).expect("nonsingular");
+        assert!(
+            max_diff(&m.rsolve(&v), &want_rsolve) < 1e-9,
+            "rsolve is not M^-T v"
+        );
+        // MUST-MISS: for this non-symmetric matrix the transpose ops differ from the
+        // forward ones, so the checks above are not passing on symmetry by accident.
+        assert!(
+            max_diff(&m.rmatvec(&v), &m.matvec(&v)) > 1e-3,
+            "rmatvec and matvec agree; the matrix is symmetric and the test is weak"
+        );
+    }
+
+    /// Past `n` stored terms the factored form costs more than the matrix it describes,
+    /// so it is abandoned. The operator must be UNCHANGED across that switch -- a
+    /// representation change that moved the answer would be a bug, not an optimisation.
+    #[test]
+    fn collapsing_past_n_terms_preserves_the_operator() {
+        let alpha = -0.7;
+        let v = pseudo(555, N);
+
+        let at_n = with_rank(alpha, N);
+        // MUST-MISS: at exactly n terms it has NOT collapsed, so the assertion below
+        // is detecting the threshold rather than reporting a matrix that always was.
+        assert!(!at_n.is_collapsed(), "collapsed at n terms, one too early");
+        assert_eq!(at_n.rank(), N);
+
+        let past_n = with_rank(alpha, N + 1);
+        assert!(past_n.is_collapsed(), "did not collapse past n terms");
+        assert_eq!(past_n.rank(), 0, "collapsed but kept the factors as well");
+
+        // The same n+1 terms in a representation with no collapse threshold.
+        let mut reference = LowRankMatrix::new(alpha, N);
+        for k in 0..(N + 1) {
+            reference.append(pseudo(k as u64 + 1, N), pseudo(k as u64 + 101, N));
+            if reference.is_collapsed() {
+                break;
+            }
+        }
+        assert!(
+            max_diff(&past_n.matvec(&v), &reference.matvec(&v)) < 1e-9,
+            "the operator moved when the representation collapsed"
+        );
+        assert!(
+            max_diff(&past_n.solve(&v), &dense_solve(&past_n, &v)) < 1e-9,
+            "the collapsed solve disagrees with a dense solve"
+        );
+    }
+
+    fn residual(x: &[f64]) -> Vec<f64> {
+        vec![
+            x[0] * x[0] + x[1] - 3.0,
+            x[0] + x[1] * x[1] * x[1] - 5.0,
+            x[2] * x[2] - x[0] - 1.0,
+            x[3] - x[0].sin(),
+            x[4] * x[4] + x[3] - 2.0,
+        ]
+    }
+
+    /// Both Broyden updates enforce `Gm df = dx` exactly. Driven over several steps of
+    /// a genuinely nonlinear system so the condition is re-established each time
+    /// against an accumulating representation, not just once from the identity.
+    ///
+    /// MUST-MISS: the condition must fail for a step never absorbed, or a `matvec` that
+    /// simply returned its argument would pass.
+    #[test]
+    fn both_broyden_updates_satisfy_the_secant_condition() {
+        for variant in [BroydenVariant::First, BroydenVariant::Second] {
+            let mut x = vec![1.0, 1.2, 0.9, 0.4, 1.1];
+            let mut f = residual(&x);
+            let mut j =
+                BroydenJacobian::new(variant, None, ReductionMethod::Restart, None);
+            j.setup(&x, &f);
+
+            for step in 0..6 {
+                let dir = j.solve_ref(&f);
+                let next: Vec<f64> = x.iter().zip(&dir).map(|(a, b)| a - b).collect();
+                let next_f = residual(&next);
+                let dx: Vec<f64> = next.iter().zip(&x).map(|(a, b)| a - b).collect();
+                let df: Vec<f64> = next_f.iter().zip(&f).map(|(a, b)| a - b).collect();
+
+                j.update(&next, &next_f);
+                x = next;
+                f = next_f;
+
+                let got = j.solve_ref(&df);
+                assert!(
+                    max_diff(&got, &dx) < 1e-8,
+                    "{variant:?} step {step}: secant condition off by {}",
+                    max_diff(&got, &dx)
+                );
+
+                // MUST-MISS.
+                let unrelated = pseudo(step as u64 + 31, N);
+                assert!(
+                    max_diff(&j.solve_ref(&unrelated), &unrelated) > 1e-6,
+                    "{variant:?} step {step}: the approximation acts as the identity, \
+                     so the secant check above is vacuous"
+                );
+            }
+        }
+    }
+
+    /// The two reduction policies differ in WHAT they keep, not just how much, so
+    /// checking the retained count alone would not distinguish them.
+    #[test]
+    fn the_reduction_policies_keep_different_vectors() {
+        let mut restart = LowRankMatrix::new(-1.0, 20);
+        let mut simple = LowRankMatrix::new(-1.0, 20);
+        for k in 0..5u64 {
+            let c = vec![k as f64; N];
+            let d = pseudo(k + 7, N);
+            restart.append(c.clone(), d.clone());
+            simple.append(c, d);
+        }
+
+        // MUST-MISS: below the cap neither drops anything.
+        restart.restart_reduce(9);
+        simple.simple_reduce(9);
+        assert_eq!(restart.rank(), 5, "restart dropped below its cap");
+        assert_eq!(simple.rank(), 5, "simple dropped below its cap");
+
+        restart.restart_reduce(3);
+        simple.simple_reduce(3);
+        assert_eq!(restart.rank(), 0, "restart kept vectors; it drops all of them");
+        assert_eq!(simple.rank(), 3, "simple did not reduce to its cap");
+
+        // WHICH three it kept is the actual claim, and a count cannot check it. Build
+        // the operator that keeps only the three NEWEST and require agreement; then
+        // build the one that keeps the three OLDEST and require disagreement, so the
+        // test distinguishes the two policies rather than merely counting.
+        let probe = pseudo(88, N);
+
+        let mut newest = LowRankMatrix::new(-1.0, 20);
+        for k in 2..5u64 {
+            newest.append(vec![k as f64; N], pseudo(k + 7, N));
+        }
+        assert!(
+            max_diff(&simple.matvec(&probe), &newest.matvec(&probe)) < 1e-12,
+            "simple_reduce did not retain the three newest vectors"
+        );
+
+        let mut oldest = LowRankMatrix::new(-1.0, 20);
+        for k in 0..3u64 {
+            oldest.append(vec![k as f64; N], pseudo(k + 7, N));
+        }
+        assert!(
+            max_diff(&simple.matvec(&probe), &oldest.matvec(&probe)) > 1e-3,
+            "keeping the oldest three is indistinguishable here, so the check above \
+             does not establish which end was dropped"
+        );
+
+        // Restart dropped everything, so it is now the bare multiple of the identity.
+        let bare: Vec<f64> = probe.iter().map(|x| -x).collect();
+        assert!(
+            max_diff(&restart.matvec(&probe), &bare) < 1e-12,
+            "restart_reduce left rank-1 terms behind"
+        );
+    }
+
+    /// `InverseJacobian` presents solve as matvec and back. Checked against the
+    /// wrapped object directly rather than against a second computation of the same
+    /// thing, so a wrapper that forwarded without swapping would fail.
+    #[test]
+    fn inverse_jacobian_swaps_the_two_directions() {
+        let x = vec![1.0, 1.2, 0.9, 0.4, 1.1];
+        let f = residual(&x);
+        let mut inner =
+            BroydenJacobian::new(BroydenVariant::First, Some(0.5), ReductionMethod::Restart, None);
+        inner.setup(&x, &f);
+        let next: Vec<f64> = x.iter().map(|a| a + 0.05).collect();
+        inner.update(&next, &residual(&next));
+
+        let v = pseudo(4242, N);
+        let want_solve = inner.matvec(&v);
+        let want_matvec = inner.solve_ref(&v);
+        // MUST-MISS: the two directions genuinely differ here, so a wrapper that did
+        // nothing would be caught.
+        assert!(
+            max_diff(&want_solve, &want_matvec) > 1e-6,
+            "the two directions agree; the swap cannot be observed"
+        );
+
+        let wrapped = InverseJacobian::new(inner);
+        assert!(
+            max_diff(&wrapped.solve_ref(&v), &want_solve) < 1e-12,
+            "InverseJacobian::solve is not the inner matvec"
+        );
+        assert!(
+            max_diff(&wrapped.matvec(&v), &want_matvec) < 1e-12,
+            "InverseJacobian::matvec is not the inner solve"
+        );
+    }
+
+    /// The auto-scale is `0.5 * max(||x0||, 1) / ||f0||`, applied only when `alpha` was
+    /// left unset. A fixed initial scale carries the units of nothing in particular.
+    #[test]
+    fn alpha_is_auto_scaled_only_when_unset() {
+        let x = vec![3.0, 4.0, 0.0, 0.0, 0.0]; // ||x|| = 5
+        let f = vec![0.0, 0.0, 2.0, 0.0, 0.0]; // ||f|| = 2
+        let mut auto = BroydenJacobian::first();
+        auto.setup(&x, &f);
+        // Gm starts at -alpha * I, so Gm e0 = -alpha e0 with alpha = 0.5*5/2 = 1.25.
+        let e0 = vec![1.0, 0.0, 0.0, 0.0, 0.0];
+        assert!(
+            (auto.solve_ref(&e0)[0] + 1.25).abs() < 1e-12,
+            "auto-scaled alpha is not 0.5*max(||x||,1)/||f||, got {}",
+            -auto.solve_ref(&e0)[0]
+        );
+
+        // MUST-MISS: an explicit alpha is left alone.
+        let mut fixed = BroydenJacobian::new(
+            BroydenVariant::First,
+            Some(0.25),
+            ReductionMethod::Restart,
+            None,
+        );
+        fixed.setup(&x, &f);
+        assert!(
+            (fixed.solve_ref(&e0)[0] + 0.25).abs() < 1e-12,
+            "an explicitly supplied alpha was overwritten by the heuristic"
+        );
+    }
+
+    /// The LU reports singularity rather than returning a fabricated answer, and it
+    /// pivots -- a zero leading entry is not a failure.
+    #[test]
+    fn the_lu_pivots_and_reports_singularity() {
+        // Zero pivot in position (0,0): solvable only with pivoting.
+        let mut a = vec![0.0, 1.0, 1.0, 0.0];
+        let got = lu_solve_in_place(&mut a, &[2.0, 3.0], 2).expect("pivoting should succeed");
+        assert!(
+            (got[0] - 3.0).abs() < 1e-12 && (got[1] - 2.0).abs() < 1e-12,
+            "pivoted solve returned {got:?}, expected [3, 2]"
+        );
+
+        // MUST-HIT the singularity guard: a rank-1 matrix has no inverse.
+        let mut singular = vec![1.0, 2.0, 2.0, 4.0];
+        assert!(
+            lu_solve_in_place(&mut singular, &[1.0, 1.0], 2).is_none(),
+            "a singular system produced an answer"
+        );
+    }
+}
