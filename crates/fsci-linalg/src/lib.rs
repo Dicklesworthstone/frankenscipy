@@ -6339,6 +6339,42 @@ fn schur_magnitude_scale(t: &DMatrix<f64>, rows: usize) -> f64 {
     })
 }
 
+/// Schur decomposition with a FINITE iteration budget.
+///
+/// `nalgebra`'s `Matrix::schur()` calls `Schur::new`, which passes `max_niter = 0`, and
+/// nalgebra documents that as *"the algorithm continues indefinitely until convergence."*
+/// Its guard is `niter += 1; if niter == max_niter { return None }`, so at 0 it counts
+/// 1,2,3,… and can never fire. A matrix whose implicit-QR iteration does not converge
+/// therefore makes the call NEVER RETURN — unkillable by the caller, and it takes the
+/// process with it.
+///
+/// Measured (`frankenscipy-sez4r`): 230 of 7000 benign diagonally-dominant fixtures hang,
+/// rising with dimension (0% at n≤4, 8.6% at n=8), and one of them survived 100,000 sweeps
+/// on a 5×5 — four orders of magnitude past "slow". SciPy converges on all 7000.
+///
+/// The budget is LAPACK `dlahqr`'s own, `30·max(10, n)`. That is not a guess: sweeping the
+/// whole fixture family at this bound reproduced the non-converging set EXACTLY (25/25 at
+/// n=5, 49/49 at n=6, 70/70 at n=7) with **zero** false failures. `f64::EPSILON` is exactly
+/// what `Schur::new` passes via `default_epsilon()`, so every case that converges today
+/// still converges and yields bit-identical results — only the cap is new.
+///
+/// This is a ROBUSTNESS fix, not a parity fix. It converts a hang into a catchable error;
+/// it does not recover the eigenvalues SciPy returns for those matrices. The underlying
+/// non-convergence is still open on `frankenscipy-sez4r`.
+fn bounded_schur(
+    m: DMatrix<f64>,
+) -> Result<nalgebra::linalg::Schur<f64, Dyn>, LinalgError> {
+    let n = m.nrows();
+    let max_niter = 30 * n.max(10);
+    nalgebra::linalg::Schur::try_new(m, f64::EPSILON, max_niter).ok_or_else(|| {
+        LinalgError::ConvergenceFailure {
+            detail: format!(
+                "Schur iteration failed to converge for a {n}x{n} matrix after {max_niter} sweeps"
+            ),
+        }
+    })
+}
+
 pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     if rows != cols {
@@ -6360,8 +6396,7 @@ pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgEr
     // Use Schur decomposition: A = Q T Q^T, eigenvalues on diagonal of T
     // For real matrices, Schur form has 1×1 blocks (real eigenvalues) and
     // 2×2 blocks (complex conjugate pairs) on the diagonal.
-    let schur = matrix.clone().schur();
-    let (q_mat, t_mat) = schur.unpack();
+    let schur = bounded_schur(matrix.clone())?;    let (q_mat, t_mat) = schur.unpack();
 
     let mut eigenvalues_re = Vec::with_capacity(rows);
     let mut eigenvalues_im = Vec::with_capacity(rows);
@@ -6598,8 +6633,7 @@ pub fn eigvals(
     // The eigenvalues come from the same nalgebra Schur form `T` with the same block
     // logic, so they are bit-identical to `eig(a)`'s — ~2x faster when the
     // eigenvectors are unneeded (mirrors `scipy.linalg.eigvals` vs `eig`).
-    let schur = matrix.clone().schur();
-    let (_q_mat, t_mat) = schur.unpack();
+    let schur = bounded_schur(matrix.clone())?;    let (_q_mat, t_mat) = schur.unpack();
 
     let mut eigenvalues_re = Vec::with_capacity(rows);
     let mut eigenvalues_im = Vec::with_capacity(rows);
@@ -7790,8 +7824,7 @@ pub fn schur(a: &[Vec<f64>], options: DecompOptions) -> Result<SchurResult, Lina
     }
 
     let matrix = dmatrix_from_rows(a)?;
-    let schur_decomp = matrix.schur();
-    let (q_mat, t_mat) = schur_decomp.unpack();
+    let schur_decomp = bounded_schur(matrix)?;    let (q_mat, t_mat) = schur_decomp.unpack();
 
     emit_trace(LinalgTrace {
         operation: "schur",
@@ -7926,8 +7959,7 @@ pub fn qz(a: &[Vec<f64>], b: &[Vec<f64>], options: DecompOptions) -> Result<QzRe
 
     // Real Schur of A·B⁻¹ = Q·T·Qᵀ gives the orthogonal Q and a real
     // quasi-upper-triangular T.
-    let schur_decomp = (&a_mat * &b_inv).schur();
-    let (q_mat, _t_mat) = schur_decomp.unpack();
+    let schur_decomp = bounded_schur(&a_mat * &b_inv)?;    let (q_mat, _t_mat) = schur_decomp.unpack();
 
     // Choose an orthogonal Z that upper-triangularizes Qᵀ·B. Writing
     // C = Qᵀ·B, an RQ factorization C = R·Zᵀ yields BB = Qᵀ·B·Z = R
@@ -9070,8 +9102,7 @@ fn logm_general(
     n: usize,
     options: DecompOptions,
 ) -> Result<Vec<Vec<f64>>, LinalgError> {
-    let schur = matrix.clone().schur();
-    let (q, t) = schur.unpack();
+    let schur = bounded_schur(matrix.clone())?;    let (q, t) = schur.unpack();
 
     let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
     let result = if has_complex_block {
@@ -9172,8 +9203,7 @@ pub fn sqrtm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
         // complex Schur–Parlett evaluator — the real-diagonal scalar Parlett below
         // is wrong across those blocks. An all-real spectrum keeps the real path
         // (and its negative-eigenvalue NaN behavior).
-        let schur = matrix.clone().schur();
-        let (q, t) = schur.unpack();
+        let schur = bounded_schur(matrix.clone())?;        let (q, t) = schur.unpack();
         let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
         let result = if has_complex_block {
             schur_parlett_complex(&q, &t, n, |z| z.sqrt())
@@ -9360,8 +9390,7 @@ pub fn signm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
     // spectrum the real Schur form has 2×2 blocks whose individual diagonal
     // entries can differ in sign from Re λ, so funm(_, sign) on the real diagonal
     // is wrong; route those through the complex Schur–Parlett evaluator.
-    let schur = m.clone().schur();
-    let (q, t) = schur.unpack();
+    let schur = bounded_schur(m.clone())?;    let (q, t) = schur.unpack();
     let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
     if has_complex_block {
         let result = schur_parlett_complex(&q, &t, n, |z| {
@@ -9671,8 +9700,7 @@ pub fn funm(
 
     // General: use Schur decomposition A = Q T Q^T
     // Then f(A) = Q f(T) Q^T via Parlett's recurrence
-    let schur = matrix.clone().schur();
-    let (q, t) = schur.unpack();
+    let schur = bounded_schur(matrix.clone())?;    let (q, t) = schur.unpack();
 
     let mut ft = DMatrix::<f64>::zeros(n, n);
     // Diagonal: f(T[i,i])
@@ -9741,8 +9769,7 @@ pub fn fractional_matrix_power(
         return funm(a, |x| x.powf(p), options);
     }
 
-    let schur = matrix.clone().schur();
-    let (q, t) = schur.unpack();
+    let schur = bounded_schur(matrix.clone())?;    let (q, t) = schur.unpack();
     let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
     if has_complex_block {
         let result = schur_parlett_complex(&q, &t, n, |z| (z.ln() * Complex::new(p, 0.0)).exp());
@@ -15890,10 +15917,8 @@ pub fn solve_sylvester(
     let q_mat = dmatrix_from_rows(q)?;
 
     // Schur decompositions: A = U T_A U^T, B = V T_B V^T
-    let schur_a = a_mat.clone().schur();
-    let (u, ta) = schur_a.unpack();
-    let schur_b = b_mat.clone().schur();
-    let (v, tb) = schur_b.unpack();
+    let schur_a = bounded_schur(a_mat.clone())?;    let (u, ta) = schur_a.unpack();
+    let schur_b = bounded_schur(b_mat.clone())?;    let (v, tb) = schur_b.unpack();
 
     // Transform Q: F = U^T Q V
     let f = u.transpose() * &q_mat * &v;
@@ -16089,8 +16114,7 @@ pub fn solve_discrete_lyapunov(
     let a_mat = dmatrix_from_rows(a)?;
     let q_mat = dmatrix_from_rows(q)?;
 
-    let (u, t) = a_mat.clone().schur().unpack();
-    let c = -(u.transpose() * &q_mat * &u); // C = -U^T Q U
+    let (u, t) = bounded_schur(a_mat.clone())?.unpack();    let c = -(u.transpose() * &q_mat * &u); // C = -U^T Q U
 
     // When T is strictly upper triangular (A has only real eigenvalues — the
     // common case) each 1×1-block system (T[j,j]·T − I) is upper triangular and
@@ -22514,6 +22538,63 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    /// `frankenscipy-sez4r`: `eig` used to HANG FOREVER on these matrices.
+    ///
+    /// nalgebra's `Schur::new` passes `max_niter = 0`, which its own docs define as
+    /// "continues indefinitely until convergence", and its guard `niter == max_niter`
+    /// can never fire at 0. Measured: **230 of 7000** `make_diag_dominant` fixtures never
+    /// converge (0% at n≤4 rising to 8.6% at n=8), and `(5,201)` was still iterating at
+    /// 10,000,000 sweeps. SciPy converges on all 7000. `bounded_schur` caps the iteration
+    /// at LAPACK `dlahqr`'s own `30·max(10,n)` and returns `ConvergenceFailure` instead.
+    ///
+    /// BOTH ARMS ARE LOAD-BEARING. Without the must-miss set, this test would pass just as
+    /// happily if `bounded_schur` returned `ConvergenceFailure` for *every* input — which is
+    /// exactly what a too-tight bound would do. The bound was chosen by sweeping all 7000
+    /// fixtures at K=300 and confirming it fails precisely the 230 that never converge and
+    /// nothing else.
+    ///
+    /// NOTE: if the bound is ever removed, the must-hit arm does not fail — it HANGS.
+    #[test]
+    fn eig_bounds_the_schur_iteration_instead_of_hanging() {
+        // Verbatim from `fsci-conformance`'s metamorphic fixtures so the cases match.
+        fn make_diag_dominant(n: usize, seed: u64) -> Vec<Vec<f64>> {
+            let mut a = vec![vec![0.0; n]; n];
+            for i in 0..n {
+                for j in 0..n {
+                    let r = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000)
+                        as f64
+                        / 1000.0;
+                    a[i][j] = if i == j { (n as f64) * 2.0 + r } else { r - 0.5 };
+                }
+            }
+            a
+        }
+
+        // MUST-HIT: known non-converging cases now return an error rather than hanging.
+        for (n, seed) in [(5usize, 201u64), (5, 213), (5, 234), (6, 319), (6, 335)] {
+            let a = make_diag_dominant(n, seed);
+            match eig(&a, DecompOptions::default()) {
+                Err(LinalgError::ConvergenceFailure { .. }) => {}
+                other => panic!(
+                    "({n},{seed}) should not converge; expected ConvergenceFailure, got {other:?}"
+                ),
+            }
+        }
+
+        // MUST-MISS: cases that converged before must still converge, to the same answer.
+        for (n, seed) in [(5usize, 0u64), (6, 0), (8, 42), (8, 999)] {
+            let a = make_diag_dominant(n, seed);
+            let res = eig(&a, DecompOptions::default())
+                .unwrap_or_else(|e| panic!("({n},{seed}) regressed to {e:?}"));
+            let trace: f64 = (0..n).map(|i| a[i][i]).sum();
+            let sum: f64 = res.eigenvalues_re.iter().sum();
+            assert!(
+                (sum - trace).abs() < 1e-9 * (trace.abs() + 1.0),
+                "({n},{seed}) trace identity broken: {sum} vs {trace}"
+            );
+        }
+    }
 
     #[test]
     fn rsf2csf_matches_scipy() {
