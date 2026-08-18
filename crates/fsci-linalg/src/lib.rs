@@ -6373,6 +6373,33 @@ fn schur_magnitude_scale(t: &DMatrix<f64>, rows: usize) -> f64 {
 /// This is a ROBUSTNESS fix, not a parity fix. It converts a hang into a catchable error;
 /// it does not recover the eigenvalues SciPy returns for those matrices. The underlying
 /// non-convergence is still open on `frankenscipy-sez4r`.
+/// Balance before the eigendecomposition, as LAPACK `dgeev` does — `frankenscipy-sez4r`.
+///
+/// Default `false`. SciPy's `eig` calls `?geev`, which balances internally by
+/// default (`JOB='B'`): a permutation isolating already-triangular eigenvalues,
+/// then power-of-two diagonal scaling so each row and its column have comparable
+/// norms. We have that routine already, as the public `matrix_balance`, but `eig`
+/// never used it — so on badly scaled input we were handing the QR iteration a
+/// matrix SciPy would never give it.
+///
+/// CONTRACT: NOT bit-identical, and the eigenvalues are mathematically unchanged.
+/// Balancing is a similarity `B = T^-1 A T`, so `A` and `B` have the same spectrum
+/// exactly; the scaling factors are integer powers of two, so the transform itself
+/// introduces no rounding at all. What DOES change is the arithmetic the iteration
+/// then performs, so expect agreement to about 1e-12 relative rather than bit for
+/// bit — better agreement on badly scaled input, where the whole point is that the
+/// unbalanced iteration loses accuracy.
+///
+/// Eigenvectors DO require a back-transform: if `y` is an eigenvector of `B` then
+/// `T y` is one of `A`. That is LAPACK's `dgebak`. This implementation multiplies
+/// by the transform matrix `matrix_balance` already returns rather than
+/// re-deriving the permutation-and-scale application, because the convention is
+/// easy to get subtly wrong and the matrix is already covered by that function's
+/// own tests. It costs an O(n^2) product per vector, which is not the dominant
+/// term next to the O(n^3) decomposition.
+pub static EIG_BALANCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Route `eig` through the in-crate Francis QR (`hessenberg_qr`) instead of
 /// nalgebra's Schur — `frankenscipy-sez4r`.
 ///
@@ -6460,12 +6487,22 @@ pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgEr
         });
     }
 
-    let matrix = dmatrix_from_rows(a)?;
+    // Balance first when asked, as `dgeev` does. The Schur decomposition is then
+    // taken of the BALANCED matrix, and the eigenvectors are back-transformed at
+    // the end. Eigenvalues need no back-transform: balancing is a similarity.
+    let balance = if EIG_BALANCE.load(std::sync::atomic::Ordering::Relaxed) {
+        Some(matrix_balance(a, true, true)?)
+    } else {
+        None
+    };
+    let work: &[Vec<f64>] = balance.as_ref().map_or(a, |b| b.balanced.as_slice());
+
+    let matrix = dmatrix_from_rows(work)?;
 
     // Use Schur decomposition: A = Q T Q^T, eigenvalues on diagonal of T
     // For real matrices, Schur form has 1×1 blocks (real eigenvalues) and
     // 2×2 blocks (complex conjugate pairs) on the diagonal.
-    let (q_mat, t_mat) = eig_schur_pair(a, &matrix)?;
+    let (q_mat, t_mat) = eig_schur_pair(work, &matrix)?;
 
     let mut eigenvalues_re = Vec::with_capacity(rows);
     let mut eigenvalues_im = Vec::with_capacity(rows);
@@ -6650,6 +6687,45 @@ pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgEr
             }
         }
         eigvec_cols[col_idx] = v;
+    }
+
+    // dgebak: undo the balancing on the eigenvectors. `y` is an eigenvector of the
+    // balanced `B`, so `T y` is one of `A`.
+    //
+    // A conjugate pair occupies TWO columns as (Re, Im) of one complex vector, so
+    // the pair is renormalized with a SINGLE shared factor. Scaling the two columns
+    // independently would rotate the complex vector in the plane and change the
+    // eigenvector, while leaving both columns looking individually well-formed --
+    // which is exactly the kind of error a per-column norm check would not catch.
+    if let Some(b) = balance.as_ref() {
+        let transform = &b.transform;
+        for col in &mut eigvec_cols {
+            let mut v = vec![0.0_f64; rows];
+            for (i, slot) in v.iter_mut().enumerate() {
+                *slot = (0..rows).map(|k| transform[i][k] * col[k]).sum();
+            }
+            *col = v;
+        }
+        let mut c = 0usize;
+        while c < rows {
+            let is_pair = block_starts.get(c).is_some_and(|&(_, b)| b)
+                && c + 1 < rows
+                && block_starts.get(c + 1).is_some_and(|&(_, b)| b);
+            let span = if is_pair { 2 } else { 1 };
+            let norm: f64 = (c..c + span)
+                .flat_map(|k| eigvec_cols[k].iter())
+                .map(|x| x * x)
+                .sum::<f64>()
+                .sqrt();
+            if norm > 0.0 {
+                for k in c..c + span {
+                    for x in &mut eigvec_cols[k] {
+                        *x /= norm;
+                    }
+                }
+            }
+            c += span;
+        }
     }
 
     // Transpose eigvec_cols (per-column-as-vec) into row-major Vec<Vec<f64>>
@@ -41028,5 +41104,145 @@ mod toggle_ab_eig_francis_schur {
                  trace identity: {sum} vs {trace}"
             );
         }
+    }
+}
+
+/// frankenscipy-sez4r — driver for `EIG_BALANCE`.
+///
+/// The back-transform is the part most likely to be subtly wrong, so it is gated on
+/// the DEFINING PROPERTY rather than on how it was built: `A v = lambda v`. A
+/// back-transform that applied the inverse transform, or applied it on the wrong
+/// side, would still produce plausible-looking unit vectors and would still pass any
+/// check of their norms. Only the residual catches it.
+#[cfg(test)]
+mod toggle_ab_eig_balance {
+    use super::{DecompOptions, EIG_BALANCE, eig};
+    use std::sync::atomic::Ordering;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// `A = D M D^-1` with `D` a diagonal of POWERS OF TWO, so the construction
+    /// itself is exact and `A` has precisely `M`'s spectrum. The spread of `D` is
+    /// what makes `A` badly scaled and is exactly what balancing is meant to undo.
+    fn badly_scaled() -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+        let m = vec![
+            vec![4.0, 1.0, 2.0, 0.5],
+            vec![1.0, 3.0, 0.25, 1.5],
+            vec![2.0, 0.25, 5.0, 1.0],
+            vec![0.5, 1.5, 1.0, 6.0],
+        ];
+        let d = [1.0, 1024.0, 1.0 / 1024.0, 65536.0];
+        let n = 4;
+        let mut a = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i][j] = d[i] * m[i][j] / d[j];
+            }
+        }
+        (a, m)
+    }
+
+    /// Residual of the eigenpairs against the defining relation, in LAPACK's real
+    /// packing: a conjugate pair occupies two columns as (Re, Im), and satisfies
+    /// `A vr = re*vr - im*vi` together with `A vi = re*vi + im*vr`.
+    fn worst_residual(a: &[Vec<f64>], r: &super::EigResult) -> f64 {
+        let n = a.len();
+        let col = |c: usize| -> Vec<f64> { (0..n).map(|i| r.eigenvectors[i][c]).collect() };
+        let mul = |v: &[f64]| -> Vec<f64> {
+            (0..n)
+                .map(|i| (0..n).map(|k| a[i][k] * v[k]).sum())
+                .collect()
+        };
+        let scale = a.iter().flatten().fold(1.0f64, |m, v| m.max(v.abs()));
+        let mut worst: f64 = 0.0;
+        let mut c = 0usize;
+        while c < n {
+            let im = r.eigenvalues_im[c];
+            let re = r.eigenvalues_re[c];
+            if im == 0.0 {
+                let v = col(c);
+                let av = mul(&v);
+                for i in 0..n {
+                    worst = worst.max((av[i] - re * v[i]).abs() / scale);
+                }
+                c += 1;
+            } else {
+                let (vr, vi) = (col(c), col(c + 1));
+                let (avr, avi) = (mul(&vr), mul(&vi));
+                for i in 0..n {
+                    worst = worst.max((avr[i] - (re * vr[i] - im * vi[i])).abs() / scale);
+                    worst = worst.max((avi[i] - (re * vi[i] + im * vr[i])).abs() / scale);
+                }
+                c += 2;
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn balanced_eigenpairs_satisfy_the_defining_relation() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (a, m) = badly_scaled();
+
+        EIG_BALANCE.store(true, Ordering::Relaxed);
+        let balanced = eig(&a, DecompOptions::default());
+        EIG_BALANCE.store(false, Ordering::Relaxed);
+        let balanced = balanced.expect("balanced eig failed on a well-conditioned matrix");
+
+        // THE BACK-TRANSFORM GATE. If dgebak were applied on the wrong side, or
+        // inverted, the vectors would still be unit-norm and would still look
+        // sensible -- this is the assertion that would fail.
+        let res = worst_residual(&a, &balanced);
+        assert!(
+            res < 1e-8,
+            "balanced eigenpairs violate A v = lambda v (worst scaled residual {res}); \
+             the dgebak back-transform is wrong, not the decomposition"
+        );
+
+        // Eigenvalues must equal M's, since A = D M D^-1 is an exact similarity.
+        let mut got: Vec<f64> = balanced.eigenvalues_re.clone();
+        let mut want: Vec<f64> = eig(&m, DecompOptions::default())
+            .expect("reference eig failed")
+            .eigenvalues_re;
+        got.sort_by(f64::total_cmp);
+        want.sort_by(f64::total_cmp);
+        for (g, w) in got.iter().zip(&want) {
+            assert!(
+                (g - w).abs() < 1e-9 * (w.abs() + 1.0),
+                "balanced spectrum {got:?} does not match the similar matrix's {want:?}"
+            );
+        }
+    }
+
+    /// MUST-MISS: on an already-balanced matrix the toggle must not change the
+    /// answer. If this fails while the test above passes, balancing is perturbing
+    /// inputs that never needed it.
+    #[test]
+    fn balancing_does_not_disturb_an_already_balanced_matrix() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (_a, m) = badly_scaled();
+
+        EIG_BALANCE.store(false, Ordering::Relaxed);
+        let plain = eig(&m, DecompOptions::default()).expect("plain eig failed");
+        EIG_BALANCE.store(true, Ordering::Relaxed);
+        let balanced = eig(&m, DecompOptions::default());
+        EIG_BALANCE.store(false, Ordering::Relaxed);
+        let balanced = balanced.expect("balanced eig failed");
+
+        let mut x = plain.eigenvalues_re.clone();
+        let mut y = balanced.eigenvalues_re.clone();
+        x.sort_by(f64::total_cmp);
+        y.sort_by(f64::total_cmp);
+        for (p, b) in x.iter().zip(&y) {
+            assert!(
+                (p - b).abs() < 1e-9 * (p.abs() + 1.0),
+                "balancing changed the spectrum of an already-balanced matrix: \
+                 {x:?} vs {y:?}"
+            );
+        }
+        assert!(
+            worst_residual(&m, &balanced) < 1e-8,
+            "balanced arm broke the defining relation on an already-balanced matrix"
+        );
     }
 }
