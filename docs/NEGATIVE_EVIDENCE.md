@@ -36204,3 +36204,67 @@ and this window was better than described.
     `solve_least_squares` per JACOBIAN.
   **The number did not move. The warrant for it did**, and only the second version is
   worth anything.
+
+## 2026-08-18 - PeachSummit (cc) - eig NEVER RETURNS on 230 of 7000 benign matrices, and TWO mechanisms I proposed for it are refuted - the hang is bounded, the cause is not
+
+- **Bead: `frankenscipy-sez4r`.** **Result class: COUNTED MECHANISM** (deterministic
+  reproduction counts) **plus two REFUTATIONS.** **No timing claim of any kind.**
+  **Probe:** `crates/fsci-linalg/src/bin/eig_sweep_probe.rs`, one case per PROCESS with the
+  OS `timeout` as executioner, because a non-terminating loop cannot be killed from inside
+  Rust. Controls: `(2,0)` OK 3.553e-15, `(8,999)` OK 3.695e-13, bad args → exit 2, so a
+  timeout is distinguishable from a usage failure. `df -h /data` **58G** before the one
+  local build; later runs reused that binary. `loadavg` 6.63/6.77/7.73, CPU idle 90%.
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. **No C BLAS/LAPACK/MKL** — the
+  scipy arm is the INCUMBENT under test, not a dependency. Nothing deleted.
+- **OBSERVED, full sweep of the fixture space the hung metamorphic test draws from
+  (`make_diag_dominant`, n ∈ 2..8 × seed ∈ 0..999):**
+
+  | n | timeouts / 1000 | rate |
+  |---|---|---|
+  | 2, 3, 4 | 0 | 0% |
+  | 5 | 25 | 2.5% |
+  | 6 | 49 | 4.9% |
+  | 7 | 70 | 7.0% |
+  | 8 | 86 | 8.6% |
+  | **total** | **230 / 7000** | **3.29%** |
+
+  **Zero non-timeout anomalies** — no error returns, no wrong answers. The failure mode is
+  purely non-termination, and the rate is monotone in dimension.
+- **IT IS NEVER, NOT SLOWLY, and a timeout alone could not have said so.** A `timeout` kill
+  proves only that 2 seconds elapsed. Calling `Schur::try_new` with an explicit bound
+  separates the cases: `(5,201)` returns NOCONV at K=50, K=1,000 and **K=100,000**, and was
+  still iterating at K=10,000,000. Four known-good controls CONV at K=100,000. A 5×5 Francis
+  iteration converges in of order 10–20 sweeps and LAPACK gives up at 300.
+- **THE INCUMBENT CONVERGES ON ALL 7000**, worst |Σλ.real − trace| = 8.527e-14. So the inputs
+  are benign and the defect is ours.
+- **REFUTATION 1 — balancing.** I proposed that LAPACK balances and nalgebra does not.
+  Measured over the fixture space: worst condition number **1.32**, worst row-norm ratio
+  **1.240**. Balancing targets ratios ≫ 1. There is nothing to balance.
+- **REFUTATION 2 — exceptional-shift stagnation, which I had already written up as ROOT
+  CAUSE and had to retract.** nalgebra genuinely has no exceptional-shift path (the word
+  "shift" appears once in `schur.rs`), and I promoted that FACT to a CAUSE without testing
+  it. A Francis double-shift model in numpy, with the same trailing-2×2 shift selection,
+  **converges on the hanging fixtures in 7–13 iterations**, and adding exceptional shifts
+  changes nothing. The model uses explicit shifts rather than nalgebra's implicit bulge
+  chase, so it does not prove nalgebra must converge — it proves my stated reason was
+  unsupported.
+- **AND I CITED THE WRONG SOURCE VERSION WHILE DOING IT.** `find … | head -1` picked
+  nalgebra **0.33.3** from a registry holding four unpacked versions; `Cargo.lock` pins
+  **0.35.0**. Re-verified against 0.35.0: `Schur::new` still passes `max_niter = 0`, still
+  documented as "continues indefinitely", the guard still cannot fire, and there is still no
+  exceptional shift — so every substantive claim survived, but only because I checked.
+  0.35.0 additionally adds an absolute `eps²` deflation threshold, which is strictly MORE
+  permissive and therefore makes the persistence of the hang more surprising, not less.
+- **WHAT SHIPPED, and what it does NOT fix.** `bounded_schur` at all 12 shipping call sites
+  (`eig`, `eigvals`, `schur`, `qz`, `sqrtm`, `signm`, `funm`, `fractional_matrix_power`,
+  `solve_sylvester` ×2, `solve_discrete_lyapunov`, `logm_general`), capping the iteration at
+  LAPACK `dlahqr`'s own `30·max(10,n)`. The bound is **measured, not chosen**: sweeping all
+  7000 at that bound reproduces the non-converging set EXACTLY (25/25, 49/49, 70/70, 86/86)
+  with **zero** false failures, and `f64::EPSILON` is what `Schur::new` already passes, so
+  converging results are bit-identical. **This is a robustness fix, not a parity fix** — it
+  converts an unkillable hang into a catchable `ConvergenceFailure` on 3.29% of cases where
+  scipy returns correct eigenvalues. The cause remains open.
+- **WHY IT MATTERED BEYOND `eig`.** The metamorphic suite draws 64 cases from this space, so
+  P(at least one hang) = **88.2%**; at the file's default 256 cases it is 99.98%. That suite
+  held this project's only build slot for 96 minutes presenting as "tests are slow", across
+  three quiet measurement windows. No amount of re-running would have gone green.
