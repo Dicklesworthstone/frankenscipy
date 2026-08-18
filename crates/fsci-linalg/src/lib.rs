@@ -8,11 +8,17 @@ pub mod cossin;
 // Francis double-shift QR with LAPACK's exceptional shifts; the PARITY half of
 // frankenscipy-sez4r, where bounded_schur was only the robustness half.
 //
-// DELIBERATELY NOT DECLARED. Written under a build freeze (/data 34G, 99% used) and
-// committed uncompiled by instruction. An unreferenced .rs file in src/ is inert; a
-// broken `mod` declaration breaks `cargo test -p fsci-linalg` for every pane in the
-// fleet, and the first build after the freeze lifts should not be someone else's
-// accident. Uncomment and run:
+// DECLARED BUT NEVER COMPILED. This comment previously read "DELIBERATELY NOT DECLARED"
+// while the `mod` line below was live — the module was declared in a later commit and the
+// warning above it was left describing the old state. That is the worst of both: the next
+// person to build this crate compiles ~860 lines that no compiler has ever seen, while
+// reading a comment telling them it cannot happen. Corrected rather than reverted, because
+// undeclaring it now would silently drop the parity work out of the build instead.
+//
+// So, plainly: the FIRST `cargo test -p fsci-linalg` after the disk throttle lifts will
+// compile this module for the first time, and it may fail. That is expected, it is not a
+// regression in anyone else's work, and it should not be diagnosed as one. It carries its
+// own tests:
 //   RCH_REQUIRE_REMOTE=1 RCH_CARGO_WRAPPER_BYPASS=1 env -u CARGO_TARGET_DIR \
 //     rch exec -- cargo test -p fsci-linalg --lib -- --nocapture hessenberg_qr
 mod hessenberg_qr;
@@ -36270,8 +36276,16 @@ mod proptest_tests {
             let a_mat = dmatrix_from_rows(a).unwrap();
             let b_mat = dmatrix_from_rows(b).unwrap();
             let q_mat = dmatrix_from_rows(q).unwrap();
-            let (u, ta) = a_mat.clone().schur().unpack();
-            let (v, tb) = b_mat.clone().schur().unpack();
+            // `bounded_schur`, not `.schur()`. These were the last two unbounded
+            // constructors left in the crate (frankenscipy-sez4r): `.schur()` passes
+            // `max_niter = 0`, which nalgebra's own doc defines as iterating until
+            // convergence and never giving up, so a non-converging input hangs the
+            // process rather than failing it. That this one sits in an `#[ignore]`d perf
+            // witness makes it rarer, not safe -- and the comment above says both arms
+            // SHARE the Schur reduction, so using a different one here would also make
+            // the comparison measure something it does not claim to.
+            let (u, ta) = bounded_schur(a_mat.clone()).expect("Schur A converges").unpack();
+            let (v, tb) = bounded_schur(b_mat.clone()).expect("Schur B converges").unpack();
             let f = u.transpose() * &q_mat * &v;
             let mn = m * n;
             let mut system = DMatrix::<f64>::zeros(mn, mn);
