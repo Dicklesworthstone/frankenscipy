@@ -2374,6 +2374,109 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     total.clamp(0.0, 1.0)
 }
 
+/// Noncentral chi-square SURVIVAL function — the complement of [`chndtr`], matching
+/// `scipy.stats.ncx2.sf(x, df, nc)`.
+///
+/// ## Why this exists rather than `1 - chndtr`
+///
+/// `chndtr` saturates at 1.0 in the right tail, so the complement computed by subtraction
+/// collapses to exactly ZERO while the true survival is still finite. Measured against
+/// scipy 1.17.1 at `df = 3, nc = 2`:
+///
+/// | x | `ncx2.sf` | `1 - cdf` |
+/// |---|---|---|
+/// | 80 | 1.626871961685992e-13 | 1.627587e-13 (4 digits wrong) |
+/// | 150 | 1.044927027553427e-26 | **0.0** |
+///
+/// A tail p-value of 1e-26 reported as zero is not a rounding difference; it is the
+/// difference between a computable result and "impossible".
+///
+/// ## Method
+///
+/// Identical Poisson-mixture walk to [`chndtr`], with the regularized UPPER incomplete
+/// gamma in place of the lower:
+///
+/// ```text
+/// sf(x) = Σ_j  pois(j; nc/2) · Q(df/2 + j, x/2)
+/// ```
+///
+/// The incomplete-gamma recurrence is the mirror of the one in `chndtr`. From
+/// `P(a+1,y) = P(a,y) − t(a)` and `Q = 1 − P`:
+///
+/// ```text
+/// Q(a+1, y) = Q(a, y) + t(a),    t(a+1) = t(a)·y/(a+1)   (upward)
+/// Q(a−1, y) = Q(a, y) − t(a−1),  t(a−1) = t(a)·a/y       (downward)
+/// ```
+///
+/// **The stable direction is reversed relative to `chndtr`.** There the downward branch
+/// was stable because `P` grew toward 1 by ADDING positive `t`; here it is the UPWARD
+/// branch that adds, while the downward branch subtracts and is the cancellation-prone
+/// one. That asymmetry is the whole reason this is a separate kernel rather than
+/// `1 - chndtr`, and inverting it by copy-paste would reintroduce the cancellation in a
+/// less obvious place.
+#[must_use]
+pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
+    if x.is_nan() || df.is_nan() || nc.is_nan() {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return 1.0;
+    }
+    if nc <= 0.0 {
+        return chdtrc(df, x);
+    }
+    let lam = nc / 2.0;
+    let j0 = lam.floor();
+    let logw0 =
+        -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
+    let w0 = logw0.exp();
+
+    let y = x / 2.0;
+    let a0 = 0.5 * df + j0;
+    let q0 = chdtrc(df + 2.0 * j0, x); // = Q(a0, y), computed directly, never as 1 - P
+    let t0 =
+        (a0 * y.ln() - y - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)).exp();
+
+    let mut total = 0.0_f64;
+    // Upward from the mode: Q grows by adding positive t — the stable direction here.
+    let mut w = w0;
+    let mut j = j0;
+    let mut a = a0;
+    let mut q = q0;
+    let mut t = t0;
+    let mut steps = 0;
+    while steps < 100_000 {
+        total += w * q.clamp(0.0, 1.0);
+        q += t;
+        j += 1.0;
+        a += 1.0;
+        t *= y / a;
+        w *= lam / j;
+        if w < 1e-300 || (w < 1e-17 * total.max(1e-300) && j > lam) {
+            break;
+        }
+        steps += 1;
+    }
+    // Downward from the mode.
+    w = w0;
+    j = j0;
+    a = a0;
+    q = q0;
+    t = t0;
+    while j > 0.0 {
+        w *= j / lam;
+        t *= a / y;
+        q -= t;
+        j -= 1.0;
+        a -= 1.0;
+        total += w * q.clamp(0.0, 1.0);
+        if w < 1e-17 * total.max(1e-300) {
+            break;
+        }
+    }
+    total.clamp(0.0, 1.0)
+}
+
 /// Inverse of [`chndtr`] in the argument `x`.
 ///
 /// Returns `x` such that `chndtr(x, df, nc) = p`, matching
@@ -4774,6 +4877,50 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `chndtrc` must hold precision where `1 - chndtr` collapses.
+    ///
+    /// Goldens are scipy 1.17.1 `ncx2.sf`. The x = 150 row is the point of the kernel:
+    /// `chndtr(150, 3, 2)` is exactly 1.0 in double precision, so the subtraction gives
+    /// 0.0 while the true survival is 1.04e-26. A relative check is used because the
+    /// values span 26 orders of magnitude and an absolute tolerance would be vacuous at
+    /// the small end — which is the only end that matters here.
+    #[test]
+    fn chndtrc_matches_scipy_survival_where_one_minus_cdf_collapses() {
+        // (x, df, nc, scipy ncx2.sf)
+        let cases = [
+            (10.0_f64, 3.0_f64, 2.0_f64, 1.014_350_364_860_014e-1),
+            (80.0, 3.0, 2.0, 1.626_871_961_685_992e-13),
+            (150.0, 3.0, 2.0, 1.044_927_027_553_427e-26),
+            (5.0, 7.0, 20.0, 9.992_803_076_754_802e-1),
+        ];
+        for (x, df, nc, expected) in cases {
+            let got = chndtrc(x, df, nc);
+            let rel = ((got - expected) / expected).abs();
+            assert!(
+                rel < 1e-10,
+                "chndtrc({x}, {df}, {nc}) = {got}, scipy {expected}, rel {rel:e}"
+            );
+        }
+
+        // The defect this replaces: subtraction is exactly zero at x = 150 while the
+        // kernel is not. If this assertion ever fails, `1 - chndtr` became viable and
+        // the kernel could be reconsidered — it does not mean the kernel is wrong.
+        assert_eq!(
+            1.0 - chndtr(150.0, 3.0, 2.0),
+            0.0,
+            "the subtraction is expected to collapse here; that is why chndtrc exists"
+        );
+        assert!(chndtrc(150.0, 3.0, 2.0) > 0.0, "the kernel must not collapse");
+
+        // Complementarity in the range where subtraction IS accurate, and the boundaries.
+        let mid = chndtrc(10.0, 3.0, 2.0) + chndtr(10.0, 3.0, 2.0);
+        assert!((mid - 1.0).abs() < 1e-12, "cdf + sf should be 1 mid-range, got {mid}");
+        assert_eq!(chndtrc(0.0, 3.0, 2.0), 1.0, "sf below the support is 1");
+        assert!(chndtrc(f64::NAN, 3.0, 2.0).is_nan(), "NaN propagates");
+        // nc = 0 degenerates to the central complement.
+        assert_eq!(chndtrc(10.0, 3.0, 0.0), chdtrc(3.0, 10.0));
     }
 
     #[test]
