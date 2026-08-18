@@ -1502,4 +1502,487 @@ mod nonlin_tests {
             );
         }
     }
+
+    // ── KrylovJacobian ──────────────────────────────────────────────────────
+
+    use super::{InnerMethod, KrylovJacobian};
+
+    /// `F_i = x_i^2 + 0.1 x_{i+1}`, whose Jacobian is known in closed form, so the
+    /// finite-difference operator can be checked against the truth rather than against
+    /// another approximation.
+    fn quad_residual(x: &[f64]) -> Vec<f64> {
+        let n = x.len();
+        (0..n).map(|i| x[i] * x[i] + 0.1 * x[(i + 1) % n]).collect()
+    }
+
+    fn quad_jacobian_times(x: &[f64], v: &[f64]) -> Vec<f64> {
+        let n = x.len();
+        (0..n)
+            .map(|i| 2.0 * x[i] * v[i] + 0.1 * v[(i + 1) % n])
+            .collect()
+    }
+
+    /// MUST-HIT: the directional derivative agrees with the analytic Jacobian.
+    /// MUST-MISS: it does NOT agree with a perturbed Jacobian, so the agreement is
+    /// evidence about the operator and not about the tolerance being loose.
+    #[test]
+    fn the_finite_difference_operator_matches_the_analytic_jacobian() {
+        let x: Vec<f64> = (0..8).map(|i| 1.0 + 0.1 * i as f64).collect();
+        let f = quad_residual(&x);
+        let mut j = KrylovJacobian::with_defaults(quad_residual);
+        j.setup(&x, &f);
+
+        let v = pseudo(77, 8);
+        let got = j.matvec(&v);
+        let want = quad_jacobian_times(&x, &v);
+        let scale = want.iter().fold(0.0_f64, |a, b| a.max(b.abs()));
+        assert!(
+            max_diff(&got, &want) < 1e-6 * scale,
+            "FD operator differs from the analytic Jacobian by {}",
+            max_diff(&got, &want)
+        );
+
+        let wrong: Vec<f64> = want.iter().map(|v| v * 1.01).collect();
+        assert!(
+            max_diff(&got, &wrong) > 1e-4 * scale,
+            "the FD operator matches a 1%-perturbed Jacobian equally well; the check \
+             above cannot distinguish a correct operator from a wrong one"
+        );
+    }
+
+    /// The differencing scale is SciPy's, and this recovers it exactly rather than
+    /// trusting the code that computed it.
+    ///
+    /// For `F(x) = x .* x` the difference quotient is `2 x_i v_i + h v_i^2` with
+    /// `h = omega / ||v||`, so the step actually taken can be solved for from the
+    /// output and compared against `rdiff * max(1, ||x||_inf) / max(1, ||f||_inf)`.
+    /// A test that recomputed the formula and compared it to itself would prove nothing.
+    #[test]
+    fn the_differencing_scale_is_the_scipy_expression() {
+        let square = |x: &[f64]| -> Vec<f64> { x.iter().map(|v| v * v).collect() };
+        // ||x||_inf = 3.0, ||f||_inf = 9.0, both above 1, so neither guard is active
+        // and a formula that dropped either term would give a different answer.
+        let x = vec![3.0, 1.0, -2.0, 0.5];
+        let f = square(&x);
+        // rdiff is set LARGE on purpose. The quantity being recovered is the
+        // second-order remainder of the difference quotient, and at the default
+        // sqrt(eps) it sits about 500x BELOW the cancellation noise of the quotient
+        // itself -- the recovered value comes back with the wrong sign. The formula is
+        // linear in rdiff, so measuring it at a step where it is resolvable pins it
+        // exactly; the default value is pinned separately below, by bit-identity.
+        let rdiff = 1e-2;
+        let mut j = KrylovJacobian::new(square, Some(rdiff), 20, 10);
+        j.setup(&x, &f);
+
+        let v = vec![1.0, -1.0, 0.5, 2.0];
+        let got = j.matvec(&v);
+        let vnorm = norm_of(&v);
+        let want_h = rdiff * 3.0_f64.max(1.0) / 9.0_f64.max(1.0) / vnorm;
+
+        // Recover h from the component with the largest v_i^2, where the recovery is
+        // best conditioned -- this is a difference of nearly equal numbers.
+        let idx = (0..4).max_by(|&a, &b| v[a].abs().partial_cmp(&v[b].abs()).unwrap()).unwrap();
+        let recovered = (got[idx] - 2.0 * x[idx] * v[idx]) / (v[idx] * v[idx]);
+        assert!(
+            (recovered - want_h).abs() < 1e-8 * want_h,
+            "recovered step {recovered} does not match SciPy's {want_h}"
+        );
+
+        // MUST-MISS: the scale root.rs's newton_krylov uses is materially different, so
+        // the check above is not passing on any plausible formula.
+        let other_h = rdiff * (1.0 + norm_of(&x)) / vnorm;
+        assert!(
+            (recovered - other_h).abs() > 1e-2 * other_h,
+            "SciPy's scale and the rdiff*(1+||x||_2)/||v|| scale are indistinguishable \
+             on this input; the test does not pin the formula"
+        );
+
+        // The DEFAULT rdiff is sqrt(eps). Checked by bit-identity against an explicit
+        // sqrt(eps) rather than by recovering the step, which is exactly the
+        // measurement that fails at that magnitude.
+        let mut defaulted = KrylovJacobian::with_defaults(square);
+        defaulted.setup(&x, &f);
+        let mut explicit = KrylovJacobian::new(square, Some(f64::EPSILON.sqrt()), 20, 10);
+        explicit.setup(&x, &f);
+        let a = defaulted.matvec(&v);
+        let b = explicit.matvec(&v);
+        assert!(
+            a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "the default rdiff is not sqrt(eps)"
+        );
+        // MUST-MISS: a different rdiff gives a different answer, so bit-identity above
+        // is evidence rather than a property of the operator being insensitive.
+        let mut other = KrylovJacobian::new(square, Some(1e-3), 20, 10);
+        other.setup(&x, &f);
+        let c = other.matvec(&v);
+        assert!(
+            a.iter().zip(&c).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "changing rdiff did not change the product; the bit-identity check is vacuous"
+        );
+    }
+
+    /// The inner solver actually solves. Driven on a LINEAR residual, where the
+    /// finite-difference operator is exact, so any error is the Krylov method's.
+    #[test]
+    fn the_inner_solver_solves_the_newton_system() {
+        // F(x) = A x with A strictly diagonally dominant, hence nonsingular.
+        let n = 12;
+        let amul = |x: &[f64]| -> Vec<f64> {
+            (0..n)
+                .map(|i| {
+                    4.0 * x[i] - x[(i + 1) % n] - 0.5 * x[(i + n - 1) % n]
+                })
+                .collect()
+        };
+        let x0 = vec![0.0; n];
+        let f0 = amul(&x0);
+        for method in [InnerMethod::Gmres, InnerMethod::Lgmres] {
+            let mut j = KrylovJacobian::new(amul, None, 30, 10);
+            j.setup(&x0, &f0);
+            let rhs = pseudo(303, n);
+            let dx = j.solve(&rhs, 1e-10, method);
+            let back = amul(&dx);
+            assert!(
+                max_diff(&back, &rhs) < 1e-6,
+                "{method:?}: J dx does not reproduce the right-hand side, off by {}",
+                max_diff(&back, &rhs)
+            );
+            // MUST-MISS: a nonzero right-hand side must not be answered with zero.
+            assert!(
+                norm_of(&dx) > 1e-6,
+                "{method:?}: returned an all-but-zero step for a nonzero rhs"
+            );
+        }
+    }
+
+    /// The augmentation is carried across Newton steps and capped at `outer_k`.
+    /// Plain GMRES must carry none, or the two modes are the same code.
+    #[test]
+    fn the_augmentation_is_carried_and_capped() {
+        let n = 10;
+        let mut x: Vec<f64> = (0..n).map(|i| 1.0 + 0.05 * i as f64).collect();
+        let mut f = quad_residual(&x);
+        let mut j = KrylovJacobian::new(quad_residual, None, 8, 3);
+        j.setup(&x, &f);
+
+        for step in 0..6 {
+            let rhs: Vec<f64> = f.iter().map(|v| -v).collect();
+            let dx = j.solve(&rhs, 1e-6, InnerMethod::Lgmres);
+            for (xi, di) in x.iter_mut().zip(&dx) {
+                *xi += di;
+            }
+            f = quad_residual(&x);
+            j.update(&x, &f);
+            assert!(
+                j.augmentation_rank() <= 3,
+                "step {step}: augmentation rank {} exceeded outer_k = 3",
+                j.augmentation_rank()
+            );
+        }
+        assert_eq!(
+            j.augmentation_rank(),
+            3,
+            "the augmentation never filled up; it is not being carried across steps"
+        );
+
+        // MUST-MISS: the plain GMRES mode accumulates nothing.
+        let mut g = KrylovJacobian::new(quad_residual, None, 8, 3);
+        let x2: Vec<f64> = (0..n).map(|i| 1.0 + 0.05 * i as f64).collect();
+        let f2 = quad_residual(&x2);
+        g.setup(&x2, &f2);
+        for _ in 0..6 {
+            let rhs: Vec<f64> = f2.iter().map(|v| -v).collect();
+            g.solve(&rhs, 1e-6, InnerMethod::Gmres);
+        }
+        assert_eq!(
+            g.augmentation_rank(),
+            0,
+            "the plain GMRES mode accumulated augmentation directions"
+        );
+    }
+
+    /// Every product costs exactly one residual evaluation, and a zero direction costs
+    /// none. That count is the real cost model for a matrix-free method, so it is worth
+    /// pinning rather than inferring.
+    #[test]
+    fn products_cost_one_evaluation_and_zero_directions_cost_none() {
+        let x = vec![1.0, 2.0, 3.0];
+        let f = quad_residual(&x);
+        let mut j = KrylovJacobian::with_defaults(quad_residual);
+        j.setup(&x, &f);
+        assert_eq!(j.function_evaluations(), 0, "setup should evaluate nothing");
+
+        j.matvec(&[1.0, 0.0, 0.0]);
+        assert_eq!(j.function_evaluations(), 1);
+        j.matvec(&[0.0, 1.0, 1.0]);
+        assert_eq!(j.function_evaluations(), 2);
+
+        // MUST-MISS the counter: a zero direction short-circuits.
+        let z = j.matvec(&[0.0, 0.0, 0.0]);
+        assert_eq!(
+            j.function_evaluations(),
+            2,
+            "a zero direction consumed an evaluation"
+        );
+        assert!(z.iter().all(|v| *v == 0.0), "a zero direction gave a nonzero product");
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KrylovJacobian
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Matrix-free Jacobian applied by finite differences -- `scipy.optimize.KrylovJacobian`.
+///
+/// The Jacobian is never formed. `J v` is estimated as a directional derivative of the
+/// residual, and the Newton system is solved by an inner Krylov method that only ever
+/// asks for products. Memory is O(n * inner_maxiter) regardless of how dense the true
+/// Jacobian is, which is what makes this the method of choice for discretised PDEs.
+///
+/// # The differencing scale is the whole numerical difficulty
+///
+/// A directional derivative `(F(x + h v) - F(x)) / h` is a fight between truncation
+/// error, which falls with `h`, and cancellation, which grows as `h` shrinks and the two
+/// residuals agree to more digits. SciPy picks
+///
+/// ```text
+///     omega = rdiff * max(1, ||x||_inf) / max(1, ||f||_inf),   h = omega / ||v||
+/// ```
+///
+/// with `rdiff = sqrt(eps)`, and this implementation uses the same expression. The two
+/// guards matter and are easy to drop: dividing by `max(1, ||f||_inf)` shrinks the step
+/// when the residual is large, where the difference would otherwise be swamped, and
+/// scaling by `1/||v||` makes the step invariant to the length of the direction the
+/// Krylov method happens to hand over -- without it the estimate degrades as the basis
+/// vectors change scale.
+///
+/// `root.rs`'s existing `newton_krylov` uses `rdiff * (1 + ||x||_2) / ||v||`, which drops
+/// the residual term and uses a different norm. This type exists partly to carry SciPy's
+/// actual choice.
+///
+/// # Why this does not implement the `Jacobian` trait
+///
+/// The trait requires `rmatvec` and `rsolve`. A finite-difference operator has NO
+/// transpose: `J^T v` is not a directional derivative of `F` in any direction, and
+/// producing one would need a second, different approximation the caller did not ask
+/// for. Implementing them to satisfy a signature -- by returning the forward result, or
+/// zeros, or by panicking at runtime -- would each be worse than not offering them.
+/// SciPy's `KrylovJacobian` likewise defines only `matvec` and `solve`.
+pub struct KrylovJacobian<F> {
+    func: F,
+    x0: Vec<f64>,
+    f0: Vec<f64>,
+    rdiff: f64,
+    omega: f64,
+    inner_maxiter: usize,
+    outer_k: usize,
+    /// Augmentation directions carried across outer Newton steps -- LGMRES's `outer_v`.
+    outer_v: Vec<Vec<f64>>,
+    /// Residual evaluations consumed, the honest cost measure for a matrix-free method.
+    nfev: usize,
+    n: usize,
+}
+
+/// Which inner Krylov method solves the Newton system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InnerMethod {
+    /// Restarted GMRES with no augmentation.
+    Gmres,
+    /// GMRES augmented with directions carried over from previous Newton steps.
+    ///
+    /// The augmentation is the point: a restarted Krylov method throws away everything
+    /// it learned at each restart, and across a Newton iteration it throws away
+    /// everything it learned about a Jacobian that has barely changed. Keeping a few
+    /// directions recovers the components a restart would otherwise have to rediscover.
+    Lgmres,
+}
+
+impl<F> KrylovJacobian<F>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    /// `rdiff` defaults to `sqrt(f64::EPSILON)`, `inner_maxiter` to 20 and `outer_k` to
+    /// 10, matching SciPy.
+    pub fn new(func: F, rdiff: Option<f64>, inner_maxiter: usize, outer_k: usize) -> Self {
+        Self {
+            func,
+            x0: Vec::new(),
+            f0: Vec::new(),
+            rdiff: rdiff.unwrap_or_else(|| f64::EPSILON.sqrt()),
+            omega: 0.0,
+            inner_maxiter,
+            outer_k,
+            outer_v: Vec::new(),
+            nfev: 0,
+            n: 0,
+        }
+    }
+
+    /// SciPy's defaults throughout.
+    pub fn with_defaults(func: F) -> Self {
+        Self::new(func, None, 20, 10)
+    }
+
+    /// Residual evaluations consumed so far.
+    ///
+    /// For a matrix-free method this, not wall time, is the cost that matters: every
+    /// Krylov product is one call to `F`, and on the problems this method is for that
+    /// call dominates everything else by orders of magnitude.
+    pub fn function_evaluations(&self) -> usize {
+        self.nfev
+    }
+
+    /// Number of augmentation directions currently carried.
+    pub fn augmentation_rank(&self) -> usize {
+        self.outer_v.len()
+    }
+
+    fn update_diff_step(&mut self) {
+        let mx = self.x0.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+        let mf = self.f0.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+        self.omega = self.rdiff * mx.max(1.0) / mf.max(1.0);
+    }
+
+    /// Prepare for a solve at `x0` with residual `f0`.
+    pub fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        self.x0 = x0.to_vec();
+        self.f0 = f0.to_vec();
+        self.outer_v.clear();
+        self.update_diff_step();
+    }
+
+    /// Move to a new point. The augmentation directions are DELIBERATELY kept.
+    ///
+    /// SciPy carries `outer_v` across nonlinear steps but explicitly does not carry the
+    /// matching `A v` products, because the Jacobian may have moved. This does the same:
+    /// the directions are reused, their images are recomputed against the current
+    /// Jacobian. Reusing stale products would be the cheap-looking mistake -- it saves
+    /// the evaluations that make the augmentation correct.
+    pub fn update(&mut self, x: &[f64], f: &[f64]) {
+        self.x0 = x.to_vec();
+        self.f0 = f.to_vec();
+        self.update_diff_step();
+    }
+
+    /// `J v`, by a directional derivative of the residual.
+    ///
+    /// Costs exactly one residual evaluation. A zero direction short-circuits: the
+    /// derivative is zero and the scaling would divide by zero.
+    pub fn matvec(&mut self, v: &[f64]) -> Vec<f64> {
+        let nv = norm(v);
+        if nv == 0.0 {
+            return vec![0.0; self.n];
+        }
+        let sc = self.omega / nv;
+        let xp: Vec<f64> = self.x0.iter().zip(v).map(|(a, b)| a + sc * b).collect();
+        let fp = (self.func)(&xp);
+        self.nfev += 1;
+        fp.iter()
+            .zip(&self.f0)
+            .map(|(a, b)| (a - b) / sc)
+            .collect()
+    }
+
+    /// Solve `J dx = rhs` with the inner Krylov method, to relative tolerance `rtol`.
+    ///
+    /// Returns the step and leaves the augmentation updated when running LGMRES.
+    pub fn solve(&mut self, rhs: &[f64], rtol: f64, method: InnerMethod) -> Vec<f64> {
+        let augment = match method {
+            InnerMethod::Gmres => Vec::new(),
+            InnerMethod::Lgmres => self.outer_v.clone(),
+        };
+        let dx = self.gcr_solve(rhs, rtol, &augment);
+        if method == InnerMethod::Lgmres && self.outer_k > 0 {
+            let nd = norm(&dx);
+            if nd > 0.0 && nd.is_finite() {
+                self.outer_v.push(dx.iter().map(|v| v / nd).collect());
+                while self.outer_v.len() > self.outer_k {
+                    self.outer_v.remove(0);
+                }
+            }
+        }
+        dx
+    }
+
+    /// Generalised conjugate residual, optionally seeded with augmentation directions.
+    ///
+    /// GCR rather than an Arnoldi GMRES because augmentation drops straight in: a
+    /// direction is a direction, whether it came from the current Krylov sequence or
+    /// from a previous Newton step, so the augmented subspace needs no special basis
+    /// bookkeeping. Over the same subspace GCR minimises the same residual GMRES does.
+    ///
+    /// The paired update is what keeps it honest: whenever `A z` is orthogonalised
+    /// against an earlier image, the SAME coefficient is applied to `z`, so the stored
+    /// pair always satisfies `q_j = A z_j` exactly and the residual bookkeeping stays
+    /// consistent with the operator.
+    fn gcr_solve(&mut self, rhs: &[f64], rtol: f64, augment: &[Vec<f64>]) -> Vec<f64> {
+        let n = rhs.len();
+        let mut x = vec![0.0; n];
+        let mut r = rhs.to_vec();
+        let rhs_norm = norm(rhs);
+        if rhs_norm == 0.0 {
+            return x;
+        }
+        let target = rtol * rhs_norm;
+
+        let mut zs: Vec<Vec<f64>> = Vec::new();
+        let mut qs: Vec<Vec<f64>> = Vec::new();
+
+        for j in 0..self.inner_maxiter {
+            // Seed with an augmentation direction while any remain, then fall back to
+            // the current residual -- the ordinary Krylov choice.
+            let mut z = if j < augment.len() {
+                augment[j].clone()
+            } else {
+                r.clone()
+            };
+            let mut w = self.matvec(&z);
+
+            // Modified Gram-Schmidt against the previous images, applying every
+            // coefficient to `z` as well so the pair stays exact.
+            for i in 0..qs.len() {
+                let beta: f64 = qs[i].iter().zip(&w).map(|(a, b)| a * b).sum();
+                if beta != 0.0 {
+                    for (wi, qi) in w.iter_mut().zip(&qs[i]) {
+                        *wi -= beta * qi;
+                    }
+                    for (zi, zzi) in z.iter_mut().zip(&zs[i]) {
+                        *zi -= beta * zzi;
+                    }
+                }
+            }
+            let nw = norm(&w);
+            if nw == 0.0 || !nw.is_finite() {
+                // The direction added nothing; with an augmentation seed that just means
+                // it was already in the space, so continue rather than give up.
+                if j < augment.len() {
+                    continue;
+                }
+                break;
+            }
+            for wi in w.iter_mut() {
+                *wi /= nw;
+            }
+            for zi in z.iter_mut() {
+                *zi /= nw;
+            }
+
+            let alpha: f64 = w.iter().zip(&r).map(|(a, b)| a * b).sum();
+            for (xi, zi) in x.iter_mut().zip(&z) {
+                *xi += alpha * zi;
+            }
+            for (ri, wi) in r.iter_mut().zip(&w) {
+                *ri -= alpha * wi;
+            }
+            zs.push(z);
+            qs.push(w);
+
+            if norm(&r) <= target {
+                break;
+            }
+        }
+        x
+    }
 }
