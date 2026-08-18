@@ -57539,6 +57539,379 @@ pub fn order_statistic<D: ContinuousDistribution>(dist: D, r: u64, n: u64) -> Or
     OrderStatistic::new(dist, r, n)
 }
 
+/// Any continuous distribution restricted to `[lb, ub]` and renormalised.
+///
+/// Matches `scipy.stats.truncate(X, lb, ub)`. Either bound may be infinite; the
+/// default `(-inf, inf)` leaves the distribution unchanged.
+///
+/// ```text
+///   mass    = P(lb < X ≤ ub)
+///   pdf(x)  = f(x) / mass                    for lb ≤ x ≤ ub, else 0
+///   cdf(x)  = P(lb < X ≤ x) / mass
+///   sf(x)   = P(x < X ≤ ub) / mass
+/// ```
+///
+/// # The interval mass is where truncation goes wrong
+///
+/// The textbook form `F(ub) − F(lb)` cancels catastrophically when both bounds
+/// sit in the right tail, and SciPy knows it — `TruncatedDistribution` opens with
+/// the TODO "consider avoiding catastrophic cancellation by using appropriate
+/// tail", and its `_logcdf_dispatch` carries the aside "of course, if this result
+/// is small we could compute with the other tail". This crate's own
+/// [`TruncNormal`] has the unmitigated version of the same expression.
+///
+/// Measured on a standard normal truncated to `[30, 40]`:
+///
+/// ```text
+///   Φ(40) − Φ(30)  =  0.0                        both operands round to 1.0
+///   S(30) − S(40)  =  4.906713927147908e-198     the same quantity, kept
+/// ```
+///
+/// so the subtractive form makes the pdf identically zero across the whole
+/// support. It is not only an extreme-case problem: on `[5, 10]` the two forms
+/// already disagree in the 10th digit (2.866515719235352e-07 against
+/// 2.866515718791933e-07).
+///
+/// Every interval mass here is therefore computed by
+/// [`Self::interval_mass`], which subtracts on whichever side is small:
+/// `F(hi) − F(lo)` when `F(lo) + F(hi) ≤ 1` and `S(lo) − S(hi)` otherwise. Both
+/// are the same exact quantity; the test picks the pair whose difference is not
+/// swamped by its own operands. `sf` is computed as its own interval mass rather
+/// than as `1 − cdf`, so the right tail never inherits the left one's rounding.
+///
+/// A `log_mass` is kept alongside, so `logpdf`/`logcdf`/`logsf` stay finite even
+/// where the mass itself underflows — the `[30, 40]` case above is only 1e-198,
+/// and a slightly wider one is not representable at all while its logarithm still
+/// is.
+///
+/// # Limits
+///
+/// The cdf-side branch is bounded by the base cdf's own underflow: an interval
+/// deep in the LEFT tail, where `F(lo)` and `F(hi)` both flush to zero, still
+/// yields a zero mass. Carrying the construction entirely in log space would fix
+/// that too; `log_mass` covers the reporting paths but the linear `mass` is what
+/// `pdf`/`cdf`/`sf` divide by.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Truncated<D: ContinuousDistribution> {
+    dist: D,
+    lb: f64,
+    ub: f64,
+    mass: f64,
+    log_mass: f64,
+    /// Whether the interval sits in the right half, so quantile mapping should go
+    /// through the base `isf` rather than its `ppf`.
+    survival_side: bool,
+    /// `F(lb)` — the cdf-side anchor for quantile mapping.
+    f_lb: f64,
+    /// `S(ub)` — the survival-side anchor.
+    s_ub: f64,
+}
+
+impl<D: ContinuousDistribution> Truncated<D> {
+    /// Truncate `dist` to `[lb, ub]`. Either bound may be infinite.
+    ///
+    /// Panics unless `lb < ub`, or if the interval carries no representable
+    /// probability mass even in log space (which means the truncation is empty as
+    /// far as this base distribution can tell).
+    #[must_use]
+    pub fn new(dist: D, lb: f64, ub: f64) -> Self {
+        assert!(lb < ub, "lb must be less than ub, got lb={lb} ub={ub}");
+        let mass = Self::interval_mass(&dist, lb, ub);
+        let log_mass = Self::log_interval_mass(&dist, lb, ub);
+        assert!(
+            log_mass > f64::NEG_INFINITY,
+            "the interval [{lb}, {ub}] carries no representable probability mass"
+        );
+        let f_lb = if lb == f64::NEG_INFINITY {
+            0.0
+        } else {
+            dist.cdf(lb)
+        };
+        let s_ub = if ub == f64::INFINITY { 0.0 } else { dist.sf(ub) };
+        // Which half the interval sits in. This only picks a BRANCH, so reading
+        // F(ub) straight off the base cdf is fine here even though the mass above
+        // deliberately avoids differencing two such values.
+        let f_ub = if ub == f64::INFINITY { 1.0 } else { dist.cdf(ub) };
+        Self {
+            dist,
+            lb,
+            ub,
+            mass,
+            log_mass,
+            survival_side: f_lb + f_ub > 1.0,
+            f_lb,
+            s_ub,
+        }
+    }
+
+    /// The underlying distribution `X`.
+    #[must_use]
+    pub fn base(&self) -> &D {
+        &self.dist
+    }
+
+    /// The lower truncation bound.
+    #[must_use]
+    pub fn lower(&self) -> f64 {
+        self.lb
+    }
+
+    /// The upper truncation bound.
+    #[must_use]
+    pub fn upper(&self) -> f64 {
+        self.ub
+    }
+
+    /// `P(lb < X ≤ ub)` under the UNtruncated distribution — the renormaliser.
+    #[must_use]
+    pub fn mass(&self) -> f64 {
+        self.mass
+    }
+
+    /// `P(lo < X ≤ hi)` computed on whichever tail keeps the subtraction small.
+    ///
+    /// `F(hi) − F(lo)` when the interval sits in the left half, `S(lo) − S(hi)`
+    /// otherwise. The guard is `!(lo < hi)` rather than `lo >= hi` so a NaN bound
+    /// short-circuits to zero instead of slipping through a false comparison —
+    /// the same NaN-aware shape as `tanh_sinh_integrate` (frankenscipy-023vy).
+    fn interval_mass(dist: &D, lo: f64, hi: f64) -> f64 {
+        if !(lo < hi) {
+            return 0.0;
+        }
+        if lo == f64::NEG_INFINITY {
+            return if hi == f64::INFINITY {
+                1.0
+            } else {
+                dist.cdf(hi)
+            };
+        }
+        if hi == f64::INFINITY {
+            return dist.sf(lo);
+        }
+        let f_lo = dist.cdf(lo);
+        let f_hi = dist.cdf(hi);
+        if f_lo + f_hi <= 1.0 {
+            f_hi - f_lo
+        } else {
+            dist.sf(lo) - dist.sf(hi)
+        }
+    }
+
+    /// `ln P(lo < X ≤ hi)`, finite where [`Self::interval_mass`] underflows.
+    ///
+    /// Same branch choice, then a log-space subtraction
+    /// `ln(A − B) = ln A + ln(1 − exp(ln B − ln A))` with `A` the larger operand,
+    /// so the `exp` argument is never positive.
+    fn log_interval_mass(dist: &D, lo: f64, hi: f64) -> f64 {
+        if !(lo < hi) {
+            return f64::NEG_INFINITY;
+        }
+        if lo == f64::NEG_INFINITY {
+            return if hi == f64::INFINITY {
+                0.0
+            } else {
+                dist.logcdf(hi)
+            };
+        }
+        if hi == f64::INFINITY {
+            return dist.logsf(lo);
+        }
+        let (big, small) = if dist.cdf(lo) + dist.cdf(hi) <= 1.0 {
+            (dist.logcdf(hi), dist.logcdf(lo))
+        } else {
+            (dist.logsf(lo), dist.logsf(hi))
+        };
+        if small == f64::NEG_INFINITY {
+            return big;
+        }
+        big + (-(small - big).exp()).ln_1p()
+    }
+
+    /// The truncated quantile at `t ∈ (0, 1)`, mapped through whichever side of
+    /// the base distribution keeps the argument away from its saturating end.
+    fn quantile(&self, t: f64) -> f64 {
+        let x = if self.survival_side {
+            self.dist.isf(self.s_ub + (1.0 - t) * self.mass)
+        } else {
+            self.dist.ppf(self.f_lb + t * self.mass)
+        };
+        // The anchor can UNDERFLOW: for a standard normal on [30, 40], S(40) is
+        // 7e-350 and flushes to 0, so the mapping loses the upper bound entirely
+        // and runs off toward +inf as t -> 1. The mass is unaffected (S(40)/S(30)
+        // is ~1e-152, far below anything double precision distinguishes), so
+        // pdf/cdf/sf are right and only the quantile needs the support re-imposed.
+        x.clamp(self.lb, self.ub)
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for Truncated<D> {
+    fn pdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x < self.lb || x > self.ub {
+            return 0.0;
+        }
+        if self.mass > 0.0 {
+            self.dist.pdf(x) / self.mass
+        } else {
+            // The mass underflowed but its logarithm did not; go through logs
+            // rather than divide by zero.
+            self.logpdf(x).exp()
+        }
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x < self.lb || x > self.ub {
+            return f64::NEG_INFINITY;
+        }
+        self.dist.logpdf(x) - self.log_mass
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x <= self.lb {
+            return 0.0;
+        }
+        if x >= self.ub {
+            return 1.0;
+        }
+        if self.mass > 0.0 {
+            (Self::interval_mass(&self.dist, self.lb, x) / self.mass).clamp(0.0, 1.0)
+        } else {
+            // Linear mass underflowed; the ratio would be 0/0 = NaN. The logs are
+            // still finite, so take the quotient there.
+            (Self::log_interval_mass(&self.dist, self.lb, x) - self.log_mass)
+                .exp()
+                .clamp(0.0, 1.0)
+        }
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x <= self.lb {
+            return 1.0;
+        }
+        if x >= self.ub {
+            return 0.0;
+        }
+        // Its own interval mass, NOT 1 − cdf: the upper part of the interval is
+        // exactly where the subtractive form has already lost its digits.
+        if self.mass > 0.0 {
+            (Self::interval_mass(&self.dist, x, self.ub) / self.mass).clamp(0.0, 1.0)
+        } else {
+            (Self::log_interval_mass(&self.dist, x, self.ub) - self.log_mass)
+                .exp()
+                .clamp(0.0, 1.0)
+        }
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x <= self.lb {
+            return f64::NEG_INFINITY;
+        }
+        if x >= self.ub {
+            return 0.0;
+        }
+        Self::log_interval_mass(&self.dist, self.lb, x) - self.log_mass
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        if x <= self.lb {
+            return 0.0;
+        }
+        if x >= self.ub {
+            return f64::NEG_INFINITY;
+        }
+        Self::log_interval_mass(&self.dist, x, self.ub) - self.log_mass
+    }
+
+    fn ppf(&self, p: f64) -> f64 {
+        if !(0.0..=1.0).contains(&p) {
+            return f64::NAN;
+        }
+        if p == 0.0 {
+            return self.lb;
+        }
+        if p == 1.0 {
+            return self.ub;
+        }
+        self.quantile(p)
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return self.ub;
+        }
+        if q == 1.0 {
+            return self.lb;
+        }
+        // On the survival side this never forms `1 − q`, so a small q keeps every
+        // digit it arrived with.
+        let x = if self.survival_side {
+            self.dist.isf(self.s_ub + q * self.mass)
+        } else {
+            self.dist.ppf(self.f_lb + (1.0 - q) * self.mass)
+        };
+        x.clamp(self.lb, self.ub)
+    }
+
+    fn mean(&self) -> f64 {
+        // E[X] = ∫₀¹ F⁻¹(t) dt over the TRUNCATED quantile, so the integrand is
+        // bounded whenever the bounds are and the domain is always (0, 1).
+        if self.mass == 0.0 {
+            // The quantile mapping runs through the base ppf/isf on a LINEAR
+            // probability scale, which has nothing left to work with once the mass
+            // underflows -- every t would map to the same bound. `pdf`/`cdf`/`sf`
+            // still work here via `log_mass`, but recovering a quantile would need
+            // an inverse-log-survival on the base, which the trait does not have.
+            // NaN says so; returning the bound would be a plausible wrong answer.
+            return f64::NAN;
+        }
+        tanh_sinh_integrate(|t| self.quantile(t), 0.0, 1.0)
+    }
+
+    fn var(&self) -> f64 {
+        let mu = self.mean();
+        if !mu.is_finite() {
+            return f64::NAN;
+        }
+        tanh_sinh_integrate(
+            |t| {
+                let d = self.quantile(t) - mu;
+                d * d
+            },
+            0.0,
+            1.0,
+        )
+    }
+}
+
+/// Restrict `dist` to `[lb, ub]` and renormalise.
+///
+/// Free-function spelling of [`Truncated::new`], matching
+/// `scipy.stats.truncate(X, lb, ub)`.
+#[must_use]
+pub fn truncate<D: ContinuousDistribution>(dist: D, lb: f64, ub: f64) -> Truncated<D> {
+    Truncated::new(dist, lb, ub)
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
@@ -97582,5 +97955,412 @@ mod order_statistic_matches_scipy {
         // SciPy lets r = 0 past its own check (its message says "positive
         // integers" but the test is `r < 0`); it is rejected here at construction.
         let _ = OrderStatistic::new(Normal::standard(), 0, 4);
+    }
+}
+
+#[cfg(test)]
+mod truncate_matches_scipy {
+    use super::{ContinuousDistribution, Normal, TruncNormal, Truncated, truncate};
+
+    /// pdf/cdf/sf against `scipy.stats.truncnorm`, from a benign interval out to
+    /// one where the textbook renormaliser is not representable at all.
+    #[test]
+    fn pdf_cdf_sf_match_scipy_truncnorm() {
+        // lb, ub, x, scipy pdf, scipy cdf, scipy sf
+        let cases = [
+            (
+                -1.0,
+                2.0,
+                -0.25,
+                4.723_560_479_546_409e-1,
+                2.964_085_228_515_105e-1,
+                7.035_914_771_484_896e-1,
+            ),
+            (
+                -1.0,
+                2.0,
+                0.5,
+                4.300_850_759_232_248e-1,
+                6.508_804_213_366_272e-1,
+                3.491_195_786_633_728e-1,
+            ),
+            (
+                0.0,
+                3.0,
+                0.75,
+                6.039_052_854_217_726e-1,
+                5.482_253_920_013_680e-1,
+                4.517_746_079_986_320e-1,
+            ),
+            (
+                0.0,
+                3.0,
+                1.5,
+                2.597_364_267_141_115e-1,
+                8.687_309_939_798_628e-1,
+                1.312_690_060_201_372e-1,
+            ),
+            (
+                5.0,
+                10.0,
+                6.25,
+                4.583_968_647_168_819e-3,
+                9.992_840_564_551_017e-1,
+                7.159_435_448_983_936e-4,
+            ),
+            (
+                5.0,
+                10.0,
+                7.5,
+                8.492_262_983_490_379e-7,
+                9.999_998_886_839_639e-1,
+                1.113_160_360_932_425e-7,
+            ),
+        ];
+        for (lb, ub, x, want_pdf, want_cdf, want_sf) in cases {
+            let t = truncate(Normal::standard(), lb, ub);
+            for (got, want, what) in [
+                (t.pdf(x), want_pdf, "pdf"),
+                (t.cdf(x), want_cdf, "cdf"),
+                (t.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-9,
+                    "truncate(Normal, {lb}, {ub}).{what}({x}) = {got:e}, \
+                     scipy = {want:e} (rel {rel:e})"
+                );
+            }
+        }
+    }
+
+    /// THE POINT OF THE TYPE, and a defect in this crate's own `TruncNormal`.
+    ///
+    /// `TruncNormal::pdf` divides by `standard_normal_cdf(b) - standard_normal_cdf(a)`.
+    /// On `[30, 40]` both operands round to 1.0, so that renormaliser is exactly
+    /// zero and the pdf is identically zero across the entire support, while
+    /// `scipy.stats.truncnorm.pdf(30.5, 30, 40)` is 8.107714e-06.
+    #[test]
+    fn interval_mass_survives_where_the_textbook_difference_does_not() {
+        // The premise, asserted on the real arithmetic rather than described.
+        let n = Normal::standard();
+        assert_eq!(
+            n.cdf(40.0) - n.cdf(30.0),
+            0.0,
+            "premise: the subtractive renormaliser is exactly zero here"
+        );
+        let by_survival = n.sf(30.0) - n.sf(40.0);
+        let want_mass = 4.906_713_927_147_908e-198;
+        assert!(
+            ((by_survival - want_mass) / want_mass).abs() < 1e-12,
+            "the same mass off the survival side should be {want_mass:e}, got {by_survival:e}"
+        );
+
+        let t = truncate(n, 30.0, 40.0);
+        assert!(
+            ((t.mass() - want_mass) / want_mass).abs() < 1e-12,
+            "Truncated picked the wrong branch: mass = {:e}",
+            t.mass()
+        );
+
+        // x, scipy sf, scipy pdf
+        let cases = [
+            (30.5, 2.655_418_539_828_012e-7, 8.107_714_218_413_067e-6),
+            (32.0, 1.111_147_029_246_309e-27, 3.559_136_079_029_236e-26),
+            (35.0, 2.292_594_846_926_951e-71, 8.030_621_584_304_054e-70),
+        ];
+        for (x, want_sf, want_pdf) in cases {
+            let got_sf = t.sf(x);
+            let got_pdf = t.pdf(x);
+            assert!(
+                ((got_sf - want_sf) / want_sf).abs() < 1e-9,
+                "truncate(Normal, 30, 40).sf({x}) = {got_sf:e}, scipy = {want_sf:e}"
+            );
+            assert!(
+                ((got_pdf - want_pdf) / want_pdf).abs() < 1e-9,
+                "truncate(Normal, 30, 40).pdf({x}) = {got_pdf:e}, scipy = {want_pdf:e}"
+            );
+        }
+
+        // And the incumbent-in-tree really does fail here. If this ever starts
+        // passing, TruncNormal was fixed and this assertion is the place to look.
+        assert_eq!(
+            TruncNormal::new(30.0, 40.0).pdf(32.0),
+            0.0,
+            "TruncNormal is expected to return 0 here; that is frankenscipy's own \
+             instance of the cancellation this type avoids"
+        );
+    }
+
+    /// Even a mild interval loses digits to the subtractive form: on [5, 10] the
+    /// two renormalisers already disagree in the 10th significant figure.
+    #[test]
+    fn the_two_renormalisers_diverge_long_before_they_collapse() {
+        let n = Normal::standard();
+        let naive = n.cdf(10.0) - n.cdf(5.0);
+        let kept = n.sf(5.0) - n.sf(10.0);
+        let want = 2.866_515_718_791_933e-7;
+        assert!(
+            ((kept - want) / want).abs() < 1e-13,
+            "survival-side mass = {kept:e}, scipy = {want:e}"
+        );
+        let naive_rel = ((naive - want) / want).abs();
+        assert!(
+            naive_rel > 1e-11 && naive_rel < 1e-6,
+            "expected the naive form to be wrong at the ~1e-10 level here, \
+             got rel {naive_rel:e} -- if it is now exact, the base cdf improved"
+        );
+        assert!(
+            truncate(n, 5.0, 10.0).mass() == kept,
+            "Truncated should take the survival branch on [5, 10]"
+        );
+    }
+
+    #[test]
+    fn moments_match_scipy() {
+        // lb, ub, scipy mean, scipy var. Tolerance 1e-7 relative: the integrand
+        // calls the base quantile, and `Normal::ppf` is a rational approximation
+        // good to ~3e-9 absolute, so nothing built on it can be tighter. Still
+        // orders below any formula error.
+        let cases = [
+            (-1.0, 2.0, 2.296_371_790_913_290e-1, 5.197_625_392_115_339e-1),
+            (0.0, 3.0, 7.911_568_260_634_169e-1, 3.474_078_012_358_018e-1),
+            (5.0, 10.0, 5.186_503_967_125_851e0, 3.269_643_461_706_051e-2),
+            (30.0, 40.0, 3.003_325_966_743_637e1, 1.103_771_430_859_046e-3),
+        ];
+        for (lb, ub, want_mean, want_var) in cases {
+            let t = truncate(Normal::standard(), lb, ub);
+            let rel_m = ((t.mean() - want_mean) / want_mean).abs();
+            assert!(
+                rel_m < 1e-7,
+                "truncate(Normal, {lb}, {ub}).mean() = {}, scipy = {want_mean} \
+                 (rel {rel_m:e})",
+                t.mean()
+            );
+            let rel_v = ((t.var() - want_var) / want_var).abs();
+            assert!(
+                rel_v < 1e-7,
+                "truncate(Normal, {lb}, {ub}).var() = {}, scipy = {want_var} \
+                 (rel {rel_v:e})",
+                t.var()
+            );
+        }
+    }
+
+    #[test]
+    fn ppf_and_isf_match_scipy() {
+        // lb, ub, q, scipy ppf, scipy isf
+        let cases = [
+            (
+                -1.0,
+                2.0,
+                0.05,
+                -8.431_045_589_489_478e-1,
+                1.524_596_682_775_978e0,
+            ),
+            (
+                -1.0,
+                2.0,
+                0.5,
+                1.711_639_180_178_248e-1,
+                1.711_639_180_178_250e-1,
+            ),
+            (
+                -1.0,
+                2.0,
+                0.95,
+                1.524_596_682_775_978e0,
+                -8.431_045_589_489_475e-1,
+            ),
+            (
+                30.0,
+                40.0,
+                0.05,
+                3.000_170_783_452_132e1,
+                3.009_958_224_500_945e1,
+            ),
+            (
+                30.0,
+                40.0,
+                0.5,
+                3.002_307_046_782_731e1,
+                3.002_307_046_782_731e1,
+            ),
+            (
+                30.0,
+                40.0,
+                0.95,
+                3.009_958_224_500_946e1,
+                3.000_170_783_452_132e1,
+            ),
+        ];
+        for (lb, ub, q, want_ppf, want_isf) in cases {
+            let t = truncate(Normal::standard(), lb, ub);
+            assert!(
+                (t.ppf(q) - want_ppf).abs() < 1e-8,
+                "truncate(Normal, {lb}, {ub}).ppf({q}) = {}, scipy = {want_ppf}",
+                t.ppf(q)
+            );
+            assert!(
+                (t.isf(q) - want_isf).abs() < 1e-8,
+                "truncate(Normal, {lb}, {ub}).isf({q}) = {}, scipy = {want_isf}",
+                t.isf(q)
+            );
+        }
+    }
+
+    /// Identities that hold for any base and any bounds, so a swapped branch or a
+    /// mis-signed anchor shows up without a golden.
+    #[test]
+    fn structural_identities() {
+        let base = Normal::new(0.5, 1.5);
+
+        // Infinite bounds leave the distribution alone.
+        let all = truncate(base, f64::NEG_INFINITY, f64::INFINITY);
+        assert_eq!(all.mass(), 1.0);
+        for x in [-2.0, 0.5, 3.0] {
+            assert!((all.cdf(x) - base.cdf(x)).abs() < 1e-14, "untruncated cdf");
+            assert!((all.pdf(x) - base.pdf(x)).abs() < 1e-14, "untruncated pdf");
+            assert!((all.sf(x) - base.sf(x)).abs() < 1e-14, "untruncated sf");
+        }
+
+        // One-sided truncation: mass is a single tail, no subtraction involved.
+        let right = truncate(base, 2.0, f64::INFINITY);
+        assert!((right.mass() - base.sf(2.0)).abs() < 1e-16);
+        let left = truncate(base, f64::NEG_INFINITY, 2.0);
+        assert!((left.mass() - base.cdf(2.0)).abs() < 1e-16);
+
+        for (lb, ub) in [(-1.0, 2.0), (2.0, 6.0), (-4.0, -1.0)] {
+            let t = truncate(base, lb, ub);
+            let mid = 0.5 * (lb + ub);
+
+            // cdf + sf = 1, with each side computed independently.
+            assert!(
+                (t.cdf(mid) + t.sf(mid) - 1.0).abs() < 1e-12,
+                "cdf+sf at [{lb},{ub}]"
+            );
+            // Ratio of pdfs is unchanged by truncation -- the renormaliser is a
+            // constant, so any error in it cancels here and only a wrong SHAPE
+            // shows up.
+            let x1 = lb + 0.25 * (ub - lb);
+            let x2 = lb + 0.75 * (ub - lb);
+            let got = t.pdf(x1) / t.pdf(x2);
+            let want = base.pdf(x1) / base.pdf(x2);
+            assert!(
+                ((got - want) / want).abs() < 1e-12,
+                "pdf ratio changed under truncation on [{lb},{ub}]"
+            );
+            // Round trip through the quantile.
+            for p in [0.1, 0.5, 0.9] {
+                let back = t.cdf(t.ppf(p));
+                assert!((back - p).abs() < 1e-7, "ppf/cdf round trip at p={p}");
+            }
+            // Outside the support.
+            assert_eq!(t.pdf(lb - 1.0), 0.0);
+            assert_eq!(t.pdf(ub + 1.0), 0.0);
+            assert_eq!(t.cdf(lb), 0.0);
+            assert_eq!(t.cdf(ub), 1.0);
+            assert_eq!(t.sf(lb), 1.0);
+            assert_eq!(t.sf(ub), 0.0);
+            // logs agree with the logs of the values, where those are finite.
+            assert!(
+                (t.logpdf(mid) - t.pdf(mid).ln()).abs() < 1e-10,
+                "logpdf vs ln(pdf) on [{lb},{ub}]"
+            );
+            assert!(
+                (t.logcdf(mid) - t.cdf(mid).ln()).abs() < 1e-10,
+                "logcdf vs ln(cdf) on [{lb},{ub}]"
+            );
+            assert!(
+                (t.logsf(mid) - t.sf(mid).ln()).abs() < 1e-10,
+                "logsf vs ln(sf) on [{lb},{ub}]"
+            );
+        }
+    }
+
+    /// `logpdf` stays finite where the linear mass has underflowed -- the reason
+    /// `log_mass` is carried separately.
+    #[test]
+    fn log_forms_outlive_the_linear_mass() {
+        let t = truncate(Normal::standard(), 30.0, 40.0);
+        let lp = t.logpdf(32.0);
+        assert!(lp.is_finite(), "logpdf should be finite, got {lp}");
+        // ln(3.559136079029236e-26)
+        let want = 3.559_136_079_029_236e-26_f64.ln();
+        assert!(
+            (lp - want).abs() < 1e-9,
+            "logpdf(32) = {lp}, expected {want}"
+        );
+        assert!(t.logsf(32.0).is_finite());
+        assert!(t.logcdf(32.0).is_finite());
+    }
+
+    #[test]
+    fn boundaries_and_domain() {
+        let t = truncate(Normal::standard(), -1.0, 2.0);
+        assert!(t.pdf(f64::NAN).is_nan());
+        assert!(t.cdf(f64::NAN).is_nan());
+        assert!(t.sf(f64::NAN).is_nan());
+        assert!(t.ppf(-0.1).is_nan());
+        assert!(t.ppf(1.1).is_nan());
+        assert!(t.isf(1.1).is_nan());
+        assert_eq!(t.ppf(0.0), -1.0);
+        assert_eq!(t.ppf(1.0), 2.0);
+        assert_eq!(t.isf(0.0), 2.0);
+        assert_eq!(t.isf(1.0), -1.0);
+        assert_eq!(t.lower(), -1.0);
+        assert_eq!(t.upper(), 2.0);
+        assert_eq!(t.base().loc, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "lb must be less than ub")]
+    fn inverted_bounds_panic() {
+        let _ = Truncated::new(Normal::standard(), 2.0, 1.0);
+    }
+
+    /// The regime where the linear mass is EXACTLY ZERO and the type still works.
+    ///
+    /// On `[40, 50]` both `S(40)` and `S(50)` underflow, so `S(40) − S(50)` is
+    /// 0.0 -- there is no branch of the subtractive form that survives. `log_mass`
+    /// does (`logsf(40) = −804.608`), so `pdf`/`cdf`/`sf` go through the logs and
+    /// still match SciPy.
+    #[test]
+    fn the_log_route_carries_an_interval_whose_linear_mass_is_zero() {
+        let n = Normal::standard();
+        assert_eq!(
+            n.sf(40.0) - n.sf(50.0),
+            0.0,
+            "premise: BOTH forms of the linear mass are zero here"
+        );
+        assert_eq!(n.cdf(50.0) - n.cdf(40.0), 0.0);
+
+        let t = truncate(n, 40.0, 50.0);
+        assert_eq!(t.mass(), 0.0, "the linear mass really is zero");
+
+        let got_pdf = t.pdf(41.0);
+        let want_pdf = 1.031_346_230_207_573e-16;
+        assert!(
+            ((got_pdf - want_pdf) / want_pdf).abs() < 1e-9,
+            "pdf(41) = {got_pdf:e}, scipy.stats.truncnorm = {want_pdf:e}"
+        );
+        let got_sf = t.sf(41.0);
+        let want_sf = 2.513_984_854_965_205e-18;
+        assert!(
+            ((got_sf - want_sf) / want_sf).abs() < 1e-9,
+            "sf(41) = {got_sf:e}, scipy.stats.truncnorm = {want_sf:e}"
+        );
+        assert!(t.logpdf(41.0).is_finite());
+
+        // Moments are NOT recoverable here and say so rather than returning a
+        // bound. The quantile mapping is on a linear probability scale that has
+        // underflowed; only an inverse-log-survival on the base could fix it, and
+        // `ContinuousDistribution` has no such method.
+        assert!(
+            t.mean().is_nan(),
+            "mean should be NaN when the linear mass underflows, got {}",
+            t.mean()
+        );
+        assert!(t.var().is_nan());
     }
 }
