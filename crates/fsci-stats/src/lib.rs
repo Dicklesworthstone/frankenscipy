@@ -59240,6 +59240,263 @@ mod mixture_matches_scipy {
     }
 }
 
+/// O(1) sampling from a finite discrete distribution, by Walker's alias method.
+///
+/// Matches `scipy.stats.sampling.DiscreteAliasUrn(pv, domain=...)`, which reaches
+/// the same algorithm through UNU.RAN. Setup is O(k); every draw afterwards costs
+/// one table lookup and one comparison, independent of `k` — the point of the
+/// method, against the O(k) scan or O(log k) binary search of a cumulative table.
+///
+/// The probability vector need not be normalised; only the ratios matter. With
+/// `domain = None` the support is `0 ..= k-1`, matching SciPy's default; a domain
+/// start shifts it, so `domain = (5, 6)` over two weights yields 5 and 6.
+///
+/// # Construction
+///
+/// Vose's variant: scale the probabilities by `k` so the mean bucket is exactly
+/// 1, then repeatedly pair an under-full bucket with an over-full one, filling
+/// the first from the second. Each pairing finalises one bucket, so the loop runs
+/// at most `k` times and needs no re-scan.
+///
+/// # Two uniforms per draw, deliberately
+///
+/// The common single-uniform trick reuses `u·k`'s fractional part as the coin
+/// flip. That saves a draw but makes the coin a deterministic function of the
+/// bucket index, and the low bits it relies on are the least well-behaved part of
+/// a float uniform. Two independent uniforms cost one extra call and keep the
+/// draw exactly the intended distribution, which is the whole reason to prefer an
+/// alias table over an approximation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscreteAliasUrn {
+    /// Per-bucket probability of keeping the bucket rather than its alias.
+    prob: Vec<f64>,
+    /// Per-bucket fallback.
+    alias: Vec<usize>,
+    /// Normalised probabilities, kept so [`Self::pmf`] can report exactly what
+    /// the table was built from.
+    probabilities: Vec<f64>,
+    /// First value of the support.
+    offset: i64,
+}
+
+impl DiscreteAliasUrn {
+    /// Build the alias table from an unnormalised probability vector.
+    ///
+    /// # Errors
+    ///
+    /// An empty vector, a non-finite or negative weight, or a total of zero.
+    pub fn new(pv: &[f64], domain_start: i64) -> Result<Self, StatsError> {
+        let k = pv.len();
+        if k == 0 {
+            return Err(StatsError::InvalidArgument(
+                "the probability vector must be non-empty".to_string(),
+            ));
+        }
+        if pv.iter().any(|p| !p.is_finite() || *p < 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "probabilities must be finite and non-negative".to_string(),
+            ));
+        }
+        let total: f64 = pv.iter().sum();
+        if !(total > 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "the probability vector carries no mass".to_string(),
+            ));
+        }
+        let probabilities: Vec<f64> = pv.iter().map(|p| p / total).collect();
+
+        // Scaled so the average bucket is exactly 1.
+        let mut scaled: Vec<f64> = probabilities.iter().map(|p| p * k as f64).collect();
+        let mut small: Vec<usize> = Vec::new();
+        let mut large: Vec<usize> = Vec::new();
+        for (i, &s) in scaled.iter().enumerate() {
+            if s < 1.0 { small.push(i) } else { large.push(i) }
+        }
+
+        let mut prob = vec![1.0_f64; k];
+        let mut alias: Vec<usize> = (0..k).collect();
+        // PEEK before popping. `(small.pop(), large.pop())` in the pattern would
+        // pop BOTH stacks and then fail the match when one is empty, silently
+        // dropping the element it took from the other. The bucket would survive
+        // (prob is pre-filled with 1.0 and alias with self, which is the correct
+        // treatment for a full bucket), so the bug would not show in any result —
+        // which is exactly why it is worth not writing.
+        while let (Some(&l), Some(&g)) = (small.last(), large.last()) {
+            small.pop();
+            large.pop();
+            prob[l] = scaled[l];
+            alias[l] = g;
+            // The large bucket gives away exactly the deficit of the small one.
+            scaled[g] = (scaled[g] + scaled[l]) - 1.0;
+            if scaled[g] < 1.0 { small.push(g) } else { large.push(g) }
+        }
+        // Whatever remains is full to within rounding; pin it so no draw can fall
+        // through to a stale alias.
+        for i in small.into_iter().chain(large) {
+            prob[i] = 1.0;
+            alias[i] = i;
+        }
+
+        Ok(Self {
+            prob,
+            alias,
+            probabilities,
+            offset: domain_start,
+        })
+    }
+
+    /// The normalised probability of each support point, in order.
+    #[must_use]
+    pub fn pmf(&self) -> &[f64] {
+        &self.probabilities
+    }
+
+    /// Inclusive `(first, last)` values of the support.
+    #[must_use]
+    pub fn support(&self) -> (i64, i64) {
+        (self.offset, self.offset + self.probabilities.len() as i64 - 1)
+    }
+
+    /// One draw.
+    pub fn sample_one(&self, rng: &mut impl Rng) -> i64 {
+        let k = self.prob.len();
+        let bucket = ((rng.random::<f64>() * k as f64) as usize).min(k - 1);
+        let coin: f64 = rng.random();
+        let idx = if coin < self.prob[bucket] {
+            bucket
+        } else {
+            self.alias[bucket]
+        };
+        self.offset + idx as i64
+    }
+
+    /// `n` draws.
+    #[must_use]
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<i64> {
+        (0..n).map(|_| self.sample_one(rng)).collect()
+    }
+
+    /// The probability the table actually assigns to support index `i`.
+    ///
+    /// `(prob[i] + Σ_{j : alias[j] = i} (1 − prob[j])) / k` — the chance of
+    /// landing in bucket `i` and keeping it, plus the chance of landing in any
+    /// bucket that aliases to it and losing the coin. This is what makes the
+    /// table testable ALGEBRAICALLY rather than by sampling: it must reproduce
+    /// `pmf()` exactly, with no Monte Carlo tolerance anywhere.
+    #[must_use]
+    pub fn table_probability(&self, i: usize) -> f64 {
+        let k = self.prob.len();
+        if i >= k {
+            return 0.0;
+        }
+        let mut p = self.prob[i];
+        for j in 0..k {
+            if j != i && self.alias[j] == i {
+                p += 1.0 - self.prob[j];
+            }
+        }
+        p / k as f64
+    }
+}
+
+#[cfg(test)]
+mod discrete_alias_urn_matches_scipy {
+    use super::DiscreteAliasUrn;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    /// THE test: the table must reproduce the requested distribution EXACTLY, as
+    /// algebra, with no sampling and no tolerance for Monte Carlo error.
+    ///
+    /// A sampling test can only bound the error at ~1/√n, which is far too loose
+    /// to catch a table that is subtly wrong — a swapped alias or a mis-split
+    /// bucket moves a probability by a few percent and hides inside the noise of
+    /// any affordable sample size.
+    #[test]
+    fn the_alias_table_reproduces_the_distribution_exactly() {
+        for pv in [
+            vec![0.1, 0.4, 0.3, 0.2],
+            vec![1.0],
+            vec![0.5, 0.5],
+            vec![1.0, 0.0, 3.0], // a zero-probability point must stay unreachable
+            vec![7.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            vec![1e-9, 1.0, 1e-9],
+        ] {
+            let urn = DiscreteAliasUrn::new(&pv, 0).expect("valid pv");
+            let total: f64 = pv.iter().sum();
+            for (i, &raw) in pv.iter().enumerate() {
+                let want = raw / total;
+                let got = urn.table_probability(i);
+                assert!(
+                    (got - want).abs() < 1e-15,
+                    "pv {pv:?}: table gives {got} for index {i}, requested {want}"
+                );
+            }
+            // And the table is a distribution in its own right.
+            let sum: f64 = (0..pv.len()).map(|i| urn.table_probability(i)).sum();
+            assert!((sum - 1.0).abs() < 1e-14, "pv {pv:?}: table sums to {sum}");
+        }
+    }
+
+    /// Sampling only has to show the table is actually being USED as built --
+    /// the exactness is established above. Tolerance is set from the binomial
+    /// standard error at this n, not chosen to make the test pass.
+    #[test]
+    fn draws_follow_the_table_and_respect_the_domain() {
+        let pv = [0.1, 0.4, 0.3, 0.2];
+        let urn = DiscreteAliasUrn::new(&pv, 0).expect("valid");
+        let mut rng = StdRng::seed_from_u64(20260818);
+        let n = 200_000;
+        let draws = urn.sample(n, &mut rng);
+        let mut counts = [0usize; 4];
+        for d in &draws {
+            assert!((0..4).contains(d), "draw {d} outside the support");
+            counts[*d as usize] += 1;
+        }
+        for (i, &want) in pv.iter().enumerate() {
+            let got = counts[i] as f64 / n as f64;
+            // 5 standard errors: sqrt(p(1-p)/n) is at most ~0.0011 here.
+            let se = (want * (1.0 - want) / n as f64).sqrt();
+            assert!(
+                (got - want).abs() < 5.0 * se,
+                "index {i}: empirical {got}, requested {want} (5 se = {})",
+                5.0 * se
+            );
+        }
+
+        // A zero-probability point must NEVER be drawn -- a must-miss control
+        // that a table sampling uniformly would fail immediately.
+        let sparse = DiscreteAliasUrn::new(&[1.0, 0.0, 1.0], 0).expect("valid");
+        let mut rng2 = StdRng::seed_from_u64(4);
+        assert!(
+            sparse.sample(50_000, &mut rng2).iter().all(|&d| d != 1),
+            "a zero-weight point was drawn"
+        );
+
+        // domain start shifts the support, as scipy's `domain=(5, 6)` does.
+        let shifted = DiscreteAliasUrn::new(&[1.0, 3.0], 5).expect("valid");
+        assert_eq!(shifted.support(), (5, 6));
+        let mut rng3 = StdRng::seed_from_u64(11);
+        assert!(
+            shifted.sample(1000, &mut rng3).iter().all(|&d| d == 5 || d == 6),
+            "a draw escaped the shifted domain"
+        );
+    }
+
+    #[test]
+    fn validation() {
+        assert!(DiscreteAliasUrn::new(&[], 0).is_err(), "empty");
+        assert!(DiscreteAliasUrn::new(&[1.0, -1.0], 0).is_err(), "negative");
+        assert!(DiscreteAliasUrn::new(&[1.0, f64::NAN], 0).is_err(), "non-finite");
+        assert!(DiscreteAliasUrn::new(&[0.0, 0.0], 0).is_err(), "no mass");
+        // MUST-MISS control for the guards above.
+        assert!(DiscreteAliasUrn::new(&[0.0, 1.0], 0).is_ok(), "one zero is fine");
+        // Unnormalised input is normalised, not rejected.
+        let a = DiscreteAliasUrn::new(&[2.0, 6.0], 0).expect("valid");
+        let b = DiscreteAliasUrn::new(&[0.25, 0.75], 0).expect("valid");
+        assert_eq!(a.pmf(), b.pmf());
+    }
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
