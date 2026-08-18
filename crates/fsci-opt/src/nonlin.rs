@@ -885,6 +885,416 @@ impl Jacobian for BroydenJacobian {
 /// step, `Gm df = dx` holds to rounding rather than approximately, because `Gm`
 /// approximates the INVERSE Jacobian and both Broyden updates are constructed to
 /// enforce exactly that. Testing against it states what the code must be.
+// ─────────────────────────────────────────────────────────────────────────────
+// nonlin_solve — the driver that turns a Jacobian approximation into a solver
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// What `nonlin_solve` actually needs from a Jacobian approximation.
+///
+/// Narrower than [`Jacobian`] on purpose. The solver never forms a transpose, and
+/// `KrylovJacobian` cannot provide one, so requiring the full trait would exclude the
+/// matrix-free method from its own driver. Each type implements this explicitly rather
+/// than through a blanket impl over `Jacobian`, because a blanket impl plus a manual one
+/// for `KrylovJacobian` is a coherence conflict -- rustc will not reason negatively
+/// about the missing `Jacobian` impl even though one does not exist.
+pub trait NonlinJacobian {
+    /// Prepare at `x0` with residual `f0`.
+    fn setup_at(&mut self, x0: &[f64], f0: &[f64]);
+    /// Move to `x` with residual `f`.
+    fn absorb(&mut self, x: &[f64], f: &[f64]);
+    /// Approximate Newton direction: solve `J dx = rhs` to relative tolerance `rtol`.
+    ///
+    /// `rtol` is honoured by the iterative methods and ignored by the direct ones,
+    /// which have no inner tolerance to honour.
+    fn newton_direction(&mut self, rhs: &[f64], rtol: f64) -> Vec<f64>;
+}
+
+macro_rules! impl_nonlin_jacobian {
+    ($ty:ty) => {
+        impl NonlinJacobian for $ty {
+            fn setup_at(&mut self, x0: &[f64], f0: &[f64]) {
+                <Self as Jacobian>::setup(self, x0, f0)
+            }
+            fn absorb(&mut self, x: &[f64], f: &[f64]) {
+                <Self as Jacobian>::update(self, x, f)
+            }
+            fn newton_direction(&mut self, rhs: &[f64], _rtol: f64) -> Vec<f64> {
+                <Self as Jacobian>::solve(self, rhs)
+            }
+        }
+    };
+}
+
+impl_nonlin_jacobian!(BroydenJacobian);
+impl_nonlin_jacobian!(AndersonJacobian);
+impl_nonlin_jacobian!(DiagBroydenJacobian);
+impl_nonlin_jacobian!(LinearMixingJacobian);
+impl_nonlin_jacobian!(ExcitingMixingJacobian);
+
+impl<F> NonlinJacobian for KrylovJacobian<F>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    fn setup_at(&mut self, x0: &[f64], f0: &[f64]) {
+        KrylovJacobian::setup(self, x0, f0)
+    }
+    fn absorb(&mut self, x: &[f64], f: &[f64]) {
+        KrylovJacobian::update(self, x, f)
+    }
+    /// The one implementation that genuinely uses `rtol`: it is the inner Krylov
+    /// tolerance, and the whole point of the forcing sequence below is to choose it.
+    fn newton_direction(&mut self, rhs: &[f64], rtol: f64) -> Vec<f64> {
+        KrylovJacobian::solve(self, rhs, rtol, InnerMethod::Lgmres)
+    }
+}
+
+/// Which line search `nonlin_solve` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LineSearch {
+    /// Take the full step. Fast when it works, divergent when it does not.
+    None,
+    /// Armijo backtracking with quadratic then cubic interpolation. SciPy's default.
+    #[default]
+    Armijo,
+}
+
+/// Stopping rule -- `scipy.optimize.nonlin.TerminationCondition`.
+///
+/// Terminates when the residual is small in BOTH an absolute and a relative sense, and
+/// the step is small in both senses too. Defaults leave the relative and step-size
+/// bounds at infinity so that, out of the box, only `f_tol` binds -- the same shape
+/// SciPy ships, where the extra conditions are opt-in rather than silently active.
+#[derive(Debug, Clone, Copy)]
+pub struct NonlinOptions {
+    /// Absolute residual tolerance. Default `eps^(1/3)`, as in SciPy -- deliberately
+    /// loose, because the residual of a finite-difference method cannot be driven to
+    /// `eps` and asking for it only buys wasted iterations.
+    pub f_tol: f64,
+    /// Residual tolerance relative to the initial residual. Default infinite.
+    pub f_rtol: f64,
+    /// Absolute step tolerance. Default infinite.
+    pub x_tol: f64,
+    /// Step tolerance relative to `||x||`. Default infinite.
+    pub x_rtol: f64,
+    /// Maximum outer iterations. `None` uses SciPy's `100 * (n + 1)`.
+    pub maxiter: Option<usize>,
+    /// Line search.
+    pub line_search: LineSearch,
+}
+
+impl Default for NonlinOptions {
+    fn default() -> Self {
+        Self {
+            f_tol: f64::EPSILON.cbrt(),
+            f_rtol: f64::INFINITY,
+            x_tol: f64::INFINITY,
+            x_rtol: f64::INFINITY,
+            maxiter: None,
+            line_search: LineSearch::Armijo,
+        }
+    }
+}
+
+/// Outcome of [`nonlin_solve`].
+#[derive(Debug, Clone)]
+pub struct NonlinResult {
+    /// Final iterate.
+    pub x: Vec<f64>,
+    /// Residual there.
+    pub fun: Vec<f64>,
+    /// Whether the termination condition was met, as opposed to the iteration cap.
+    pub success: bool,
+    /// Outer iterations performed.
+    pub iterations: usize,
+    /// Residual evaluations consumed.
+    pub function_calls: usize,
+    /// Human-readable status.
+    pub message: String,
+}
+
+/// Max-norm. SciPy's `tol_norm` default, and NOT the 2-norm.
+///
+/// The distinction is not cosmetic at large `n`: the 2-norm of a residual grows like
+/// `sqrt(n)` for a fixed per-component error, so a 2-norm tolerance silently tightens as
+/// the problem grows while a max-norm one means the same thing at every size.
+fn max_norm(v: &[f64]) -> f64 {
+    v.iter().fold(0.0_f64, |a, b| a.max(b.abs()))
+}
+
+/// Armijo backtracking with quadratic then cubic interpolation
+/// -- `scipy.optimize._linesearch.scalar_search_armijo`.
+///
+/// Returns `None` when no step above `amin` satisfies the sufficient-decrease
+/// condition; the caller then takes the full step, which is what SciPy does and is a
+/// deliberate gamble rather than a failure.
+fn scalar_search_armijo(
+    mut phi: impl FnMut(f64) -> f64,
+    phi0: f64,
+    derphi0: f64,
+    c1: f64,
+    amin: f64,
+) -> Option<(f64, f64)> {
+    let alpha0 = 1.0;
+    let phi_a0 = phi(alpha0);
+    if phi_a0 <= phi0 + c1 * alpha0 * derphi0 {
+        return Some((alpha0, phi_a0));
+    }
+
+    // Minimiser of the quadratic through phi(0), phi'(0), phi(alpha0).
+    let denom = phi_a0 - phi0 - derphi0 * alpha0;
+    if denom == 0.0 || !denom.is_finite() {
+        return None;
+    }
+    let mut alpha1 = -derphi0 * alpha0 * alpha0 / 2.0 / denom;
+    let mut phi_a1 = phi(alpha1);
+    if phi_a1 <= phi0 + c1 * alpha1 * derphi0 {
+        return Some((alpha1, phi_a1));
+    }
+
+    let mut alpha0 = alpha0;
+    let mut phi_a0 = phi_a0;
+    while alpha1 > amin {
+        let factor = alpha0 * alpha0 * alpha1 * alpha1 * (alpha1 - alpha0);
+        if factor == 0.0 || !factor.is_finite() {
+            return None;
+        }
+        let d0 = phi_a1 - phi0 - derphi0 * alpha1;
+        let d1 = phi_a0 - phi0 - derphi0 * alpha0;
+        let a = (alpha0 * alpha0 * d0 - alpha1 * alpha1 * d1) / factor;
+        let b = (-alpha0 * alpha0 * alpha0 * d0 + alpha1 * alpha1 * alpha1 * d1) / factor;
+        if a == 0.0 || !a.is_finite() || !b.is_finite() {
+            return None;
+        }
+        let mut alpha2 = (-b + (b * b - 3.0 * a * derphi0).abs().sqrt()) / (3.0 * a);
+        let phi_a2 = phi(alpha2);
+        if phi_a2 <= phi0 + c1 * alpha2 * derphi0 {
+            return Some((alpha2, phi_a2));
+        }
+        // Guard against a cubic step that barely moves, or moves the wrong way: halve
+        // instead. Without it the loop can stall short of `amin` and never terminate.
+        if (alpha1 - alpha2) > alpha1 / 2.0 || (1.0 - alpha2 / alpha1) < 0.96 {
+            alpha2 = alpha1 / 2.0;
+        }
+        alpha0 = alpha1;
+        alpha1 = alpha2;
+        phi_a0 = phi_a1;
+        // SciPy carries the phi value computed at the PRE-adjustment alpha2 here, even
+        // when the halving above replaced it. Reproduced deliberately: re-evaluating
+        // would be tidier but would cost an extra residual call per backtrack and would
+        // put this on a different iterate sequence than the incumbent.
+        phi_a1 = phi_a2;
+    }
+    None
+}
+
+/// Solve `F(x) = 0` with a Jacobian approximation -- `scipy.optimize.nonlin_solve`.
+///
+/// This is the driver every one of SciPy's `broyden1`, `anderson`, `linearmixing`,
+/// `diagbroyden`, `excitingmixing` and `newton_krylov` wrappers is built from, and
+/// having it means those are one line each rather than six near-copies of a Newton loop.
+///
+/// # The forcing sequence is the part worth porting carefully
+///
+/// For an inexact method the inner solve tolerance controls the whole cost profile:
+/// solve too tightly and every outer step overpays, too loosely and the outer iteration
+/// stops converging. SciPy uses the Eisenstat-Walker choice with safeguarding,
+///
+/// ```text
+///     eta_A = gamma * ||F_new||^2 / ||F_old||^2
+///     eta   = min(eta_max, eta_A)                        if gamma*eta^2 < 0.1
+///     eta   = min(eta_max, max(eta_A, gamma*eta^2))      otherwise
+/// ```
+///
+/// so the inner tolerance tightens quadratically as the outer residual falls, and the
+/// safeguard stops a single good step from collapsing it prematurely. `root.rs`'s
+/// existing `newton_krylov` instead uses a fixed `clamp(0.1*||F||, 1e-10, 0.1)`, which
+/// has no memory of the previous step at all.
+pub fn nonlin_solve<F, J>(
+    func: F,
+    x0: &[f64],
+    jacobian: &mut J,
+    options: NonlinOptions,
+) -> NonlinResult
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+    J: NonlinJacobian,
+{
+    let n = x0.len();
+    let mut calls = 0usize;
+    let mut x = x0.to_vec();
+    let mut fx = func(&x);
+    calls += 1;
+    let mut fx_norm = max_norm(&fx);
+    let f0_norm = fx_norm;
+    let mut dx = vec![f64::INFINITY; n];
+
+    jacobian.setup_at(&x, &fx);
+    let maxiter = options.maxiter.unwrap_or(100 * (n + 1));
+
+    // Eisenstat-Walker parameters, SciPy's values.
+    let gamma = 0.9;
+    let eta_max = 0.9999;
+    let eta_threshold = 0.1;
+    let mut eta = 1e-3;
+
+    let mut iterations = 0usize;
+    let mut success = false;
+
+    for _ in 0..maxiter {
+        // The condition is checked BEFORE the step, so a starting point that already
+        // satisfies it costs no iterations -- and `dx` starts at infinity so the step
+        // conditions cannot be met vacuously on the first pass.
+        if fx_norm == 0.0
+            || (fx_norm <= options.f_tol
+                && fx_norm / options.f_rtol <= f0_norm
+                && max_norm(&dx) <= options.x_tol
+                && max_norm(&dx) / options.x_rtol <= max_norm(&x))
+        {
+            success = true;
+            break;
+        }
+        iterations += 1;
+
+        let tol = eta.min(eta * fx_norm);
+        let step = jacobian.newton_direction(&fx, tol);
+        dx = step.iter().map(|v| -v).collect();
+
+        let fx_norm_new;
+        match options.line_search {
+            LineSearch::None => {
+                for (xi, di) in x.iter_mut().zip(&dx) {
+                    *xi += di;
+                }
+                fx = func(&x);
+                calls += 1;
+                fx_norm_new = max_norm(&fx);
+            }
+            LineSearch::Armijo => {
+                // phi(s) = ||F(x + s dx)||^2, so phi'(0) = -2||F||^2 in exact
+                // arithmetic; SciPy passes -phi0 rather than -2*phi0, and this matches
+                // it rather than the derivative, because the Armijo constant is
+                // calibrated against that choice.
+                let phi0: f64 = fx.iter().map(|v| v * v).sum();
+                let base_x = x.clone();
+                let mut best: Option<(f64, Vec<f64>)> = None;
+                let mut inner_calls = 0usize;
+                // Scoped so the closure's mutable borrows of `best` and `inner_calls`
+                // are definitively released before either is read below.
+                let found = {
+                    let mut phi = |s: f64| -> f64 {
+                        let xt: Vec<f64> =
+                            base_x.iter().zip(&dx).map(|(a, b)| a + s * b).collect();
+                        let v = func(&xt);
+                        inner_calls += 1;
+                        let p: f64 = v.iter().map(|q| q * q).sum();
+                        best = Some((s, v));
+                        p
+                    };
+                    scalar_search_armijo(&mut phi, phi0, -phi0, 1e-4, 1e-2)
+                };
+                calls += inner_calls;
+                let s = found.map(|(s, _)| s).unwrap_or(1.0);
+                for (xi, (bx, di)) in x.iter_mut().zip(base_x.iter().zip(&dx)) {
+                    *xi = bx + s * di;
+                }
+                // Reuse the residual only when it belongs to the step actually taken.
+                match &best {
+                    Some((bs, bf)) if *bs == s => fx = bf.clone(),
+                    _ => {
+                        fx = func(&x);
+                        calls += 1;
+                    }
+                }
+                fx_norm_new = max_norm(&fx);
+            }
+        }
+
+        jacobian.absorb(&x, &fx);
+
+        let eta_a = if fx_norm > 0.0 {
+            gamma * (fx_norm_new * fx_norm_new) / (fx_norm * fx_norm)
+        } else {
+            eta_max
+        };
+        eta = if gamma * eta * eta < eta_threshold {
+            eta_max.min(eta_a)
+        } else {
+            eta_max.min(eta_a.max(gamma * eta * eta))
+        };
+        fx_norm = fx_norm_new;
+    }
+
+    NonlinResult {
+        message: if success {
+            "A solution was found at the specified tolerance.".to_string()
+        } else {
+            "The maximum number of iterations allowed has been reached.".to_string()
+        },
+        x,
+        fun: fx,
+        success,
+        iterations,
+        function_calls: calls,
+    }
+}
+
+/// `scipy.optimize.anderson`.
+pub fn anderson<F>(func: F, x0: &[f64], options: NonlinOptions) -> NonlinResult
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let mut j = AndersonJacobian::new(None, None, None);
+    nonlin_solve(func, x0, &mut j, options)
+}
+
+/// `scipy.optimize.linearmixing`.
+pub fn linear_mixing<F>(func: F, x0: &[f64], options: NonlinOptions) -> NonlinResult
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let mut j = LinearMixingJacobian::new(None);
+    nonlin_solve(func, x0, &mut j, options)
+}
+
+/// `scipy.optimize.diagbroyden`.
+pub fn diag_broyden<F>(func: F, x0: &[f64], options: NonlinOptions) -> NonlinResult
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let mut j = DiagBroydenJacobian::new(None);
+    nonlin_solve(func, x0, &mut j, options)
+}
+
+/// `scipy.optimize.excitingmixing`.
+pub fn exciting_mixing<F>(func: F, x0: &[f64], options: NonlinOptions) -> NonlinResult
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let mut j = ExcitingMixingJacobian::new(None, None);
+    nonlin_solve(func, x0, &mut j, options)
+}
+
+/// `scipy.optimize.broyden1`, on the LOW-RANK representation.
+///
+/// Distinct from `root::broyden1`, which stores a dense `n x n` inverse Jacobian. Same
+/// method, same iterates; O(n*m) memory instead of O(n^2).
+pub fn broyden1_lowrank<F>(func: F, x0: &[f64], options: NonlinOptions) -> NonlinResult
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let mut j = BroydenJacobian::first();
+    nonlin_solve(func, x0, &mut j, options)
+}
+
+/// `scipy.optimize.broyden2`, on the low-rank representation.
+pub fn broyden2_lowrank<F>(func: F, x0: &[f64], options: NonlinOptions) -> NonlinResult
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let mut j = BroydenJacobian::second();
+    nonlin_solve(func, x0, &mut j, options)
+}
+
 #[cfg(test)]
 mod nonlin_tests {
     use super::{
