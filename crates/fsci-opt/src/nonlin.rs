@@ -121,6 +121,19 @@ pub enum ReductionMethod {
     Restart,
     /// Drop the oldest stored vectors until the cap is met.
     Simple,
+    /// Keep only the most significant SVD components -- the "Broyden Rank Reduction
+    /// Inverse" of Van der Rotten's thesis.
+    ///
+    /// The other two policies choose by AGE, which is a proxy for relevance and not a
+    /// good one: the oldest stored direction may still carry the largest part of the
+    /// operator. This one chooses by singular value, so what is discarded is the part
+    /// of the update that contributes least, measured rather than guessed.
+    ///
+    /// `to_retain` defaults to `max_rank - 2`, as in SciPy.
+    Svd {
+        /// How many components survive a reduction.
+        to_retain: Option<usize>,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -367,6 +380,243 @@ impl LowRankMatrix {
             self.ds.remove(0);
         }
     }
+
+    /// Retain only the `to_retain` most significant SVD components
+    /// -- `LowRankMatrix.svd_reduce`, the Van der Rotten limited-memory Broyden update.
+    ///
+    /// # The decomposition is of an m-sized problem, not an n-sized one
+    ///
+    /// Naively this asks for the SVD of an `n x m` matrix, which for large `n` is
+    /// exactly the cost the low-rank representation exists to avoid. It is not needed.
+    /// Take the economic QR `D = Q R`; then
+    ///
+    /// ```text
+    ///     C D^T = (C R^T) Q^T
+    /// ```
+    ///
+    /// so the operator is unchanged by replacing `C` with `C R^T` and `D` with `Q`.
+    /// The remaining SVD is of `C R^T`, and since `Q` has orthonormal columns, the
+    /// singular values wanted are those of an `m x m` problem. Every dense step is
+    /// sized by the retained rank.
+    ///
+    /// # Why the rotation needs no explicit inverse
+    ///
+    /// SciPy computes `C <- C inv(W^H)` and `D <- D W`. Written with a ONE-SIDED Jacobi
+    /// SVD the inverse disappears: the method returns the already-rotated `C V = U S`
+    /// directly, and `V` is orthogonal so `inv(V^T) = V`. Both updates become a right
+    /// multiplication by `V`, and no inverse of a possibly ill-conditioned factor is
+    /// ever formed.
+    ///
+    /// The columns are then ordered by singular value and truncated, so what is dropped
+    /// is the smallest part of the operator in the Frobenius norm.
+    pub fn svd_reduce(&mut self, max_rank: usize, to_retain: Option<usize>) {
+        if self.collapsed.is_some() || self.cs.is_empty() {
+            return;
+        }
+        // SciPy's bookkeeping: p caps at the dimension, q defaults to p - 2 and is
+        // clamped below p so a reduction always removes at least one component.
+        let mut p = max_rank;
+        let mut q = to_retain.unwrap_or_else(|| p.saturating_sub(2));
+        p = p.min(self.cs[0].len());
+        q = q.min(p.saturating_sub(1));
+        let m = self.cs.len();
+        if m < p {
+            // Below the cap there is nothing to do; reducing here would discard
+            // information the caller still has room for.
+            return;
+        }
+        if q == 0 {
+            self.cs.clear();
+            self.ds.clear();
+            return;
+        }
+
+        let (qm, r) = economic_qr(&self.ds);
+        // C1 = C R^T, i.e. column j of C1 is sum_k C[:, k] * R[j][k].
+        let n = self.cs[0].len();
+        let mut c1: Vec<Vec<f64>> = Vec::with_capacity(m);
+        for j in 0..m {
+            let mut col = vec![0.0; n];
+            for k in j..m {
+                let rjk = r[j][k];
+                if rjk != 0.0 {
+                    for (ci, ck) in col.iter_mut().zip(&self.cs[k]) {
+                        *ci += rjk * ck;
+                    }
+                }
+            }
+            c1.push(col);
+        }
+
+        let v = one_sided_jacobi(&mut c1);
+        // D2 = Q V.
+        let mut d2: Vec<Vec<f64>> = Vec::with_capacity(m);
+        for j in 0..m {
+            let mut col = vec![0.0; n];
+            for k in 0..m {
+                // `v[j]` is COLUMN j of V, so `v[j][k]` is `V[k][j]` -- the entry that
+                // multiplies Q's k-th column when forming `D2 = Q V`. Indexing this the
+                // other way round yields `Q V^T`, which is orthogonal, plausible, and
+                // silently changes the operator.
+                let vkj = v[j][k];
+                if vkj != 0.0 {
+                    for (di, qk) in col.iter_mut().zip(&qm[k]) {
+                        *di += vkj * qk;
+                    }
+                }
+            }
+            d2.push(col);
+        }
+
+        c1.truncate(q);
+        d2.truncate(q);
+        self.cs = c1;
+        self.ds = d2;
+    }
+}
+
+/// Economic QR of the matrix whose COLUMNS are `cols`, by modified Gram-Schmidt with
+/// one reorthogonalisation pass.
+///
+/// Returns `(q_cols, r)` with `r[i][j]` the upper-triangular factor, satisfying
+/// `A = Q R`. Reorthogonalising once is the standard "twice is enough" remedy: plain
+/// modified Gram-Schmidt loses orthogonality in proportion to the condition number, and
+/// Broyden directions become nearly dependent exactly when a reduction is due, which is
+/// the worst case for it.
+///
+/// A column that is annihilated by the projection leaves a zero on the diagonal and a
+/// zero `Q` column. That is deliberate: `A = Q R` still holds, so the caller's
+/// `C R^T Q^T = C A^T` identity survives a rank-deficient input rather than the routine
+/// having to reject it.
+fn economic_qr(cols: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let m = cols.len();
+    let n = if m == 0 { 0 } else { cols[0].len() };
+    let mut q: Vec<Vec<f64>> = Vec::with_capacity(m);
+    let mut r = vec![vec![0.0; m]; m];
+
+    for j in 0..m {
+        let mut v = cols[j].clone();
+        for _pass in 0..2 {
+            for i in 0..j {
+                let proj: f64 = q[i].iter().zip(&v).map(|(a, b)| a * b).sum();
+                if proj != 0.0 {
+                    r[i][j] += proj;
+                    for (vi, qi) in v.iter_mut().zip(&q[i]) {
+                        *vi -= proj * qi;
+                    }
+                }
+            }
+        }
+        let nrm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        r[j][j] = nrm;
+        if nrm > 0.0 && nrm.is_finite() {
+            for vi in v.iter_mut() {
+                *vi /= nrm;
+            }
+            q.push(v);
+        } else {
+            q.push(vec![0.0; n]);
+        }
+    }
+    (q, r)
+}
+
+/// One-sided Jacobi SVD of the matrix whose COLUMNS are `a`, rotating `a` IN PLACE.
+///
+/// On return `a` holds `A V` -- that is, `u_i * s_i` in each column, ordered by
+/// descending singular value -- and the returned value holds the columns of the
+/// orthogonal `V`, so that `A = U S V^T`.
+///
+/// One-sided Jacobi is chosen over a bidiagonalisation here for two reasons: it is a
+/// few dozen lines of safe Rust with no BLAS behind it, and it computes small singular
+/// values to high RELATIVE accuracy, which is the property that matters when the whole
+/// purpose is to decide which components are small enough to discard.
+fn one_sided_jacobi(a: &mut [Vec<f64>]) -> Vec<Vec<f64>> {
+    let m = a.len();
+    let mut v: Vec<Vec<f64>> = (0..m)
+        .map(|i| {
+            let mut col = vec![0.0; m];
+            col[i] = 1.0;
+            col
+        })
+        .collect();
+    if m < 2 {
+        sort_by_column_norm(a, &mut v);
+        return v;
+    }
+
+    // Enough sweeps for convergence in practice; Jacobi is quadratically convergent and
+    // m is the retained rank, not the dimension. The loop exits early once no rotation
+    // exceeds the threshold, so the bound only caps a pathological case.
+    let max_sweeps = 30;
+    for _sweep in 0..max_sweeps {
+        let mut rotated = false;
+        for pi in 0..(m - 1) {
+            for qi in (pi + 1)..m {
+                let alpha: f64 = a[pi].iter().map(|x| x * x).sum();
+                let beta: f64 = a[qi].iter().map(|x| x * x).sum();
+                let gamma: f64 = a[pi].iter().zip(&a[qi]).map(|(x, y)| x * y).sum();
+                if gamma == 0.0 || !gamma.is_finite() {
+                    continue;
+                }
+                // Relative threshold: two columns are orthogonal enough when their
+                // inner product is negligible against their own magnitudes. An
+                // absolute test would never fire on a large-scale problem and always
+                // fire on a small one.
+                if gamma.abs() <= f64::EPSILON * (alpha * beta).sqrt() {
+                    continue;
+                }
+                rotated = true;
+                let zeta = (beta - alpha) / (2.0 * gamma);
+                let t = if zeta >= 0.0 {
+                    1.0 / (zeta + (1.0 + zeta * zeta).sqrt())
+                } else {
+                    -1.0 / (-zeta + (1.0 + zeta * zeta).sqrt())
+                };
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let sn = c * t;
+                for k in 0..a[pi].len() {
+                    let (x, y) = (a[pi][k], a[qi][k]);
+                    a[pi][k] = c * x - sn * y;
+                    a[qi][k] = sn * x + c * y;
+                }
+                for k in 0..m {
+                    let (x, y) = (v[pi][k], v[qi][k]);
+                    v[pi][k] = c * x - sn * y;
+                    v[qi][k] = sn * x + c * y;
+                }
+            }
+        }
+        if !rotated {
+            break;
+        }
+    }
+    sort_by_column_norm(a, &mut v);
+    v
+}
+
+/// Order both column sets by descending column norm of `a` -- descending singular
+/// value. Jacobi produces no particular order, and the truncation that follows is only
+/// meaningful once the smallest components are last.
+fn sort_by_column_norm(a: &mut [Vec<f64>], v: &mut [Vec<f64>]) {
+    let mut order: Vec<usize> = (0..a.len()).collect();
+    let norms: Vec<f64> = a
+        .iter()
+        .map(|col| col.iter().map(|x| x * x).sum::<f64>())
+        .collect();
+    order.sort_by(|&i, &j| {
+        norms[j]
+            .partial_cmp(&norms[i])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let a_sorted: Vec<Vec<f64>> = order.iter().map(|&i| a[i].clone()).collect();
+    let v_sorted: Vec<Vec<f64>> = order.iter().map(|&i| v[i].clone()).collect();
+    for (slot, col) in a.iter_mut().zip(a_sorted) {
+        *slot = col;
+    }
+    for (slot, col) in v.iter_mut().zip(v_sorted) {
+        *slot = col;
+    }
 }
 
 /// Partial-pivoting LU solve of a row-major `n x n` system, destroying `a`.
@@ -527,6 +777,7 @@ impl BroydenJacobian {
             match self.reduction {
                 ReductionMethod::Restart => self.gm.restart_reduce(target),
                 ReductionMethod::Simple => self.gm.simple_reduce(target),
+                ReductionMethod::Svd { to_retain } => self.gm.svd_reduce(target, to_retain),
             }
         }
     }
@@ -638,7 +889,7 @@ impl Jacobian for BroydenJacobian {
 mod nonlin_tests {
     use super::{
         BroydenJacobian, BroydenVariant, InverseJacobian, Jacobian, LowRankMatrix,
-        ReductionMethod, lu_solve_in_place,
+        ReductionMethod, economic_qr, lu_solve_in_place, one_sided_jacobi,
     };
 
     const N: usize = 5;
@@ -976,5 +1227,1592 @@ mod nonlin_tests {
             lu_solve_in_place(&mut singular, &[1.0, 1.0], 2).is_none(),
             "a singular system produced an answer"
         );
+    }
+
+    /// Build a matrix whose OLDEST terms are the large ones and whose newest are
+    /// negligible. This is the case the SVD policy exists for, and the one where
+    /// choosing by age gets it exactly backwards.
+    fn skewed_terms() -> LowRankMatrix {
+        let mut m = LowRankMatrix::new(-1.0, 6);
+        for k in 0..4u64 {
+            let scale = if k < 2 { 1.0 } else { 1e-6 };
+            let c: Vec<f64> = pseudo(k + 1, 6).iter().map(|x| x * scale).collect();
+            m.append(c, pseudo(k + 101, 6));
+        }
+        m
+    }
+
+    fn operator_error(reduced: &LowRankMatrix, reference: &[f64]) -> f64 {
+        max_diff(&reduced.to_dense(), reference)
+    }
+
+    /// The whole justification for the SVD policy in one comparison: it keeps what is
+    /// LARGE, while restart and simple keep what is RECENT, and recency is a proxy for
+    /// relevance that can be arbitrarily wrong.
+    ///
+    /// MUST-HIT: reducing 4 terms to 2 by singular value costs ~1e-7 here.
+    /// MUST-MISS: the same reduction by age costs ~0.93 -- six orders of magnitude
+    /// worse -- so the first number cannot be explained by the operator being easy to
+    /// approximate, or by the reduction having quietly done nothing.
+    #[test]
+    fn svd_reduce_keeps_the_largest_components_not_the_newest() {
+        let reference = skewed_terms().to_dense();
+
+        let mut by_svd = skewed_terms();
+        by_svd.svd_reduce(4, Some(2));
+        assert_eq!(by_svd.rank(), 2, "svd_reduce did not retain exactly 2 components");
+        let svd_err = operator_error(&by_svd, &reference);
+        assert!(
+            svd_err < 1e-5,
+            "svd_reduce lost {svd_err}; it should have kept the two dominant terms"
+        );
+
+        let mut by_age = skewed_terms();
+        by_age.simple_reduce(2);
+        let age_err = operator_error(&by_age, &reference);
+        assert!(
+            age_err > 0.1,
+            "keeping the newest two cost only {age_err}; the test data does not \
+             actually distinguish the policies"
+        );
+        assert!(
+            svd_err < age_err / 1000.0,
+            "svd_reduce ({svd_err}) is not decisively better than age-based \
+             ({age_err}); the ranking by singular value is not doing its job"
+        );
+    }
+
+    /// Below the cap there is nothing to reduce, and reducing anyway would throw away
+    /// information the caller still has room for.
+    #[test]
+    fn svd_reduce_does_nothing_below_the_cap() {
+        let mut below = skewed_terms();
+        let before = below.to_dense();
+        // 4 stored terms, cap of 5: `m < p`, so this must be a no-op.
+        below.svd_reduce(5, Some(2));
+        assert_eq!(below.rank(), 4, "reduced below the cap");
+        assert!(
+            max_diff(&below.to_dense(), &before) < 1e-12,
+            "a no-op reduction changed the operator"
+        );
+
+        // MUST-MISS: at the cap it does reduce, so the check above is detecting the
+        // threshold rather than a routine that never fires.
+        let mut at = skewed_terms();
+        at.svd_reduce(4, Some(2));
+        assert_eq!(at.rank(), 2, "reduction did not fire at the cap");
+    }
+
+    /// `to_retain` defaults to `max_rank - 2`, as in SciPy.
+    #[test]
+    fn svd_reduce_defaults_to_retain_two_fewer() {
+        let mut m = skewed_terms();
+        m.svd_reduce(4, None);
+        assert_eq!(m.rank(), 2, "default to_retain is not max_rank - 2");
+    }
+
+    /// `A = Q R` with `Q` orthonormal, including for a RANK-DEFICIENT input, where the
+    /// routine leaves a zero column and a zero pivot rather than failing. The caller's
+    /// operator identity depends on the factorisation holding in that case too.
+    #[test]
+    fn economic_qr_factors_its_input_including_rank_deficient_ones() {
+        let full: Vec<Vec<f64>> = (0..3).map(|k| pseudo(k + 11, 6)).collect();
+        let dup = vec![pseudo(11, 6), pseudo(12, 6), pseudo(11, 6)];
+
+        for (label, cols) in [("full rank", full), ("rank deficient", dup)] {
+            let (q, r) = economic_qr(&cols);
+            let m = cols.len();
+            for j in 0..m {
+                let rebuilt: Vec<f64> = (0..6)
+                    .map(|i| (0..m).map(|k| q[k][i] * r[k][j]).sum())
+                    .collect();
+                assert!(
+                    max_diff(&rebuilt, &cols[j]) < 1e-10,
+                    "{label}: column {j} does not satisfy A = Q R"
+                );
+            }
+            // Nonzero Q columns are orthonormal; the deficient one is exactly zero.
+            for i in 0..m {
+                let nrm: f64 = q[i].iter().map(|x| x * x).sum::<f64>().sqrt();
+                assert!(
+                    nrm < 1e-12 || (nrm - 1.0).abs() < 1e-10,
+                    "{label}: Q column {i} has norm {nrm}, neither unit nor zero"
+                );
+                for j in (i + 1)..m {
+                    let ip: f64 = q[i].iter().zip(&q[j]).map(|(a, b)| a * b).sum();
+                    assert!(
+                        ip.abs() < 1e-10,
+                        "{label}: Q columns {i} and {j} are not orthogonal ({ip})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The Jacobi SVD is checked against INVARIANTS rather than a reference
+    /// implementation, which this crate does not have: the output columns are mutually
+    /// orthogonal, `V` is orthogonal, the rotation reproduces `A V`, and the singular
+    /// values satisfy two exact identities -- their squares sum to the Frobenius norm
+    /// and their product is `det(A^T A)`. Together those pin the spectrum without
+    /// anything to compare against.
+    #[test]
+    fn the_jacobi_svd_is_an_orthogonal_rotation_with_the_right_spectrum() {
+        let original: Vec<Vec<f64>> = (0..3).map(|k| pseudo(k + 21, 7)).collect();
+        let mut a = original.clone();
+        let v = one_sided_jacobi(&mut a);
+        let m = 3;
+
+        // V orthogonal.
+        for i in 0..m {
+            for j in 0..m {
+                let ip: f64 = v[i].iter().zip(&v[j]).map(|(x, y)| x * y).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((ip - want).abs() < 1e-10, "V is not orthogonal at ({i}, {j})");
+            }
+        }
+        // The rotated matrix is A V: column j is sum_k A[:,k] V[k][j], and V[k][j] is
+        // `v[j][k]` because `v[j]` is column j.
+        for j in 0..m {
+            let want: Vec<f64> = (0..7)
+                .map(|i| (0..m).map(|k| original[k][i] * v[j][k]).sum())
+                .collect();
+            assert!(
+                max_diff(&a[j], &want) < 1e-10,
+                "rotated column {j} is not (A V) column {j}"
+            );
+        }
+        // Output columns are mutually orthogonal -- that is what "one-sided Jacobi has
+        // converged" means.
+        for i in 0..m {
+            for j in (i + 1)..m {
+                let ip: f64 = a[i].iter().zip(&a[j]).map(|(x, y)| x * y).sum();
+                let scale = norm_of(&a[i]) * norm_of(&a[j]);
+                assert!(
+                    ip.abs() < 1e-9 * scale.max(1.0),
+                    "columns {i} and {j} are not orthogonal after convergence ({ip})"
+                );
+            }
+        }
+
+        let svals: Vec<f64> = a.iter().map(|c| norm_of(c)).collect();
+        // Sorted descending, without which the truncation is meaningless.
+        for w in svals.windows(2) {
+            assert!(w[0] >= w[1], "singular values are not sorted descending: {svals:?}");
+        }
+        // Sum of squares = squared Frobenius norm of the input.
+        let frob2: f64 = original.iter().flat_map(|c| c.iter()).map(|x| x * x).sum();
+        let sum_sq: f64 = svals.iter().map(|s| s * s).sum();
+        assert!(
+            (sum_sq - frob2).abs() < 1e-9 * frob2,
+            "sum of squared singular values {sum_sq} != Frobenius norm squared {frob2}"
+        );
+        // Product of squares = det(A^T A), computed independently by LU.
+        let mut gram = vec![0.0; m * m];
+        for i in 0..m {
+            for j in 0..m {
+                gram[i * m + j] = original[i].iter().zip(&original[j]).map(|(x, y)| x * y).sum();
+            }
+        }
+        let det = det_via_lu(&mut gram, m);
+        let prod_sq: f64 = svals.iter().map(|s| s * s).product();
+        assert!(
+            (prod_sq - det).abs() < 1e-6 * det.abs().max(1.0),
+            "product of squared singular values {prod_sq} != det(A^T A) {det}"
+        );
+    }
+
+    fn norm_of(v: &[f64]) -> f64 {
+        v.iter().map(|x| x * x).sum::<f64>().sqrt()
+    }
+
+    /// Determinant by the same elimination the solver uses, for an independent check on
+    /// the singular values. Sign tracking matters: an even number of row swaps must not
+    /// flip it.
+    fn det_via_lu(a: &mut [f64], n: usize) -> f64 {
+        let mut det = 1.0;
+        let mut perm: Vec<usize> = (0..n).collect();
+        for k in 0..n {
+            let mut piv = k;
+            let mut best = a[perm[k] * n + k].abs();
+            for i in (k + 1)..n {
+                let v = a[perm[i] * n + k].abs();
+                if v > best {
+                    best = v;
+                    piv = i;
+                }
+            }
+            if best == 0.0 {
+                return 0.0;
+            }
+            if piv != k {
+                perm.swap(k, piv);
+                det = -det;
+            }
+            let pk = perm[k];
+            det *= a[pk * n + k];
+            for i in (k + 1)..n {
+                let pi = perm[i];
+                let factor = a[pi * n + k] / a[pk * n + k];
+                for j in (k + 1)..n {
+                    a[pi * n + j] -= factor * a[pk * n + j];
+                }
+            }
+        }
+        det
+    }
+
+    /// A Broyden run driven with the SVD policy still satisfies the secant condition and
+    /// stays within its rank cap. The reduction runs BEFORE each append, so the cap is
+    /// what bounds memory across the whole run.
+    #[test]
+    fn the_svd_policy_bounds_rank_without_breaking_the_secant_condition() {
+        let mut x = vec![1.0, 1.2, 0.9, 0.4, 1.1];
+        let mut f = residual(&x);
+        let mut j = BroydenJacobian::new(
+            BroydenVariant::First,
+            None,
+            // `to_retain` is explicit here: with a cap of 3 SciPy's own default
+            // arithmetic gives `q = (3 - 1) - 2 = 0`, which clears the matrix and would
+            // quietly turn this into a test of the restart policy.
+            ReductionMethod::Svd { to_retain: Some(2) },
+            Some(4),
+        );
+        j.setup(&x, &f);
+
+        for step in 0..8 {
+            let dir = j.solve_ref(&f);
+            let next: Vec<f64> = x.iter().zip(&dir).map(|(a, b)| a - b).collect();
+            let next_f = residual(&next);
+            let df: Vec<f64> = next_f.iter().zip(&f).map(|(a, b)| a - b).collect();
+            let dx: Vec<f64> = next.iter().zip(&x).map(|(a, b)| a - b).collect();
+
+            j.update(&next, &next_f);
+            x = next;
+            f = next_f;
+
+            assert!(
+                j.rank() <= 3,
+                "step {step}: rank {} exceeded the cap of 3",
+                j.rank()
+            );
+            assert!(
+                max_diff(&j.solve_ref(&df), &dx) < 1e-8,
+                "step {step}: the most recent secant condition was not restored after \
+                 reduction"
+            );
+        }
+    }
+
+    // ── Mixing and Anderson Jacobians ───────────────────────────────────────
+
+    use super::{
+        AndersonJacobian, DiagBroydenJacobian, ExcitingMixingJacobian, LinearMixingJacobian,
+    };
+
+    /// Build the dense operator a `Jacobian` represents, column by column, by applying
+    /// it to the basis. Used to check the transpose operations against an EXPLICIT
+    /// transpose rather than against another formula.
+    fn dense_of(n: usize, apply: impl Fn(&[f64]) -> Vec<f64>) -> Vec<Vec<f64>> {
+        (0..n)
+            .map(|j| {
+                let mut e = vec![0.0; n];
+                e[j] = 1.0;
+                apply(&e)
+            })
+            .collect() // column j
+    }
+
+    fn transposed(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let n = cols.len();
+        (0..n).map(|j| (0..n).map(|i| cols[i][j]).collect()).collect()
+    }
+
+    fn max_diff_cols(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| max_diff(x, y))
+            .fold(0.0, f64::max)
+    }
+
+    /// Linear mixing holds a FIXED Jacobian, so `update` must change nothing at all.
+    /// Paired with DiagBroyden on the identical steps, which must change, so this is a
+    /// statement about linear mixing rather than about the steps being uninformative.
+    #[test]
+    fn linear_mixing_never_updates_but_diag_broyden_does() {
+        let x0 = vec![1.0, 2.0, 3.0, 4.0];
+        let f0 = vec![0.5, -0.25, 0.75, -1.0];
+        let probe = pseudo(404, 4);
+
+        let mut lm = LinearMixingJacobian::new(Some(0.4));
+        lm.setup(&x0, &f0);
+        let before = lm.solve_ref(&probe);
+
+        let mut db = DiagBroydenJacobian::new(Some(0.4));
+        db.setup(&x0, &f0);
+        let db_before = db.solve_ref(&probe);
+        // Both start as the same scalar operator, which is what makes the pairing fair.
+        assert!(
+            max_diff(&before, &db_before) < 1e-12,
+            "the two methods do not start from the same operator"
+        );
+
+        let x1 = vec![1.3, 2.1, 2.6, 4.2];
+        let f1 = vec![0.2, -0.4, 0.5, -0.6];
+        lm.update(&x1, &f1);
+        db.update(&x1, &f1);
+
+        assert!(
+            lm.solve_ref(&probe)
+                .iter()
+                .zip(&before)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "linear mixing changed its operator on update"
+        );
+        // MUST-MISS.
+        assert!(
+            max_diff(&db.solve_ref(&probe), &db_before) > 1e-6,
+            "DiagBroyden also ignored the step, so the check above says nothing about \
+             linear mixing specifically"
+        );
+    }
+
+    /// DiagBroyden satisfies the secant condition ONLY in the coordinate the step
+    /// touched -- exactly, to rounding -- and structurally cannot satisfy it elsewhere,
+    /// because a diagonal operator applied to a single-coordinate step is zero in every
+    /// other slot. That is the method's defining limitation rather than a defect, and
+    /// the test states both halves so neither can be mistaken for the other.
+    #[test]
+    fn diag_broyden_matches_the_secant_condition_only_where_the_step_moved() {
+        let n = 5;
+        let k = 2;
+        let alpha = 0.4;
+        let x0 = vec![0.0; n];
+        let f0 = vec![0.0; n];
+        let mut db = DiagBroydenJacobian::new(Some(alpha));
+        db.setup(&x0, &f0);
+
+        let mut x1 = vec![0.0; n];
+        x1[k] = 0.75;
+        let df = pseudo(5, n);
+        // f0 is zero, so df is the new residual outright.
+        db.update(&x1, &df);
+
+        let jdx = db.matvec(&x1);
+        assert!(
+            (jdx[k] - df[k]).abs() < 1e-12,
+            "the moved coordinate does not satisfy the secant condition: {} vs {}",
+            jdx[k],
+            df[k]
+        );
+        for i in 0..n {
+            if i != k {
+                assert_eq!(jdx[i], 0.0, "a diagonal operator responded off-coordinate");
+                assert!(
+                    df[i].abs() > 1e-3,
+                    "the test data has a near-zero residual at {i}, so the limitation \
+                     below is not actually exercised"
+                );
+            }
+        }
+        // The full-vector condition therefore FAILS, and by a wide margin.
+        assert!(
+            max_diff(&jdx, &df) > 0.1,
+            "the full secant condition appears to hold, which a diagonal approximation \
+             cannot do here -- the test data must be degenerate"
+        );
+    }
+
+    /// Exciting mixing grows the step where the residual keeps its sign, resets it
+    /// where the sign flips, and saturates at `alphamax`. All three are exact.
+    #[test]
+    fn exciting_mixing_grows_resets_and_saturates() {
+        let alpha = 0.3;
+        let x = vec![0.0; 4];
+        let last_f = vec![1.0, -1.0, 2.0, -0.5];
+        let mut em = ExcitingMixingJacobian::new(Some(alpha), Some(1.0));
+        em.setup(&x, &last_f);
+        assert_eq!(em.beta(), &[0.3, 0.3, 0.3, 0.3]);
+
+        // Signs: keep, keep, flip, flip.
+        let f = vec![0.5, -2.0, -1.0, 0.25];
+        em.update(&x, &f);
+        let b = em.beta();
+        for (i, want) in [0.6, 0.6, 0.3, 0.3].into_iter().enumerate() {
+            assert!(
+                (b[i] - want).abs() < 1e-12,
+                "beta[{i}] is {} but should be {want}",
+                b[i]
+            );
+        }
+
+        // Saturation: repeated sign-keeping must stop at alphamax and not run away.
+        let mut sat = ExcitingMixingJacobian::new(Some(alpha), Some(1.0));
+        let one = vec![1.0];
+        let origin = [0.0];
+        sat.setup(&origin, &one);
+        for _ in 0..10 {
+            sat.update(&origin, &one);
+        }
+        assert!(
+            (sat.beta()[0] - 1.0).abs() < 1e-12,
+            "beta did not saturate at alphamax, reached {}",
+            sat.beta()[0]
+        );
+        // MUST-MISS: a larger cap is actually reached, so the clamp above is the clamp
+        // and not an accident of the growth rate.
+        let mut wide = ExcitingMixingJacobian::new(Some(alpha), Some(5.0));
+        wide.setup(&origin, &one);
+        for _ in 0..10 {
+            wide.update(&origin, &one);
+        }
+        assert!(
+            wide.beta()[0] > 1.5,
+            "with alphamax = 5 the step should have grown past 1.5, got {}",
+            wide.beta()[0]
+        );
+    }
+
+    /// Anderson keeps two SEPARATELY written formulas -- one for the inverse, one for
+    /// the forward product, with different matrices -- and they must be actual inverses
+    /// of each other. Neither is derivable from the other by inspection, so this is the
+    /// check that catches a slip in either.
+    #[test]
+    fn anderson_forward_and_inverse_products_are_inverses() {
+        let n = 6;
+        let mut a = AndersonJacobian::new(Some(0.35), Some(0.01), Some(5));
+        let x0 = vec![0.0; n];
+        let f0 = vec![0.0; n];
+        a.setup(&x0, &f0);
+        // Three history pairs, built by feeding cumulative points.
+        let mut x = x0.clone();
+        let mut f = f0.clone();
+        for k in 0..3u64 {
+            let dx = pseudo(k + 1, n);
+            let df = pseudo(k + 51, n);
+            for i in 0..n {
+                x[i] += dx[i];
+                f[i] += df[i];
+            }
+            a.update(&x, &f);
+        }
+        assert_eq!(a.history_len(), 3);
+
+        let jinv = dense_of(n, |v| a.solve_ref(v));
+        let jfwd = dense_of(n, |v| a.matvec(v));
+        for i in 0..n {
+            for j in 0..n {
+                let prod: f64 = (0..n).map(|k| jfwd[k][i] * jinv[j][k]).sum();
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!(
+                    (prod - want).abs() < 1e-8,
+                    "J * J^-1 is not the identity at ({i}, {j}): {prod}"
+                );
+            }
+        }
+    }
+
+    /// The transpose operations are DERIVED here rather than ported -- SciPy's Anderson
+    /// does not define them -- so they are checked against an explicit dense transpose
+    /// of the very operators they claim to transpose, and the operator is confirmed
+    /// non-symmetric so the check cannot pass trivially.
+    #[test]
+    fn anderson_transposes_match_an_explicit_dense_transpose() {
+        let n = 6;
+        let mut a = AndersonJacobian::new(Some(0.35), Some(0.01), Some(5));
+        let zeros = vec![0.0; n];
+        a.setup(&zeros, &zeros);
+        let mut x = vec![0.0; n];
+        let mut f = vec![0.0; n];
+        for k in 0..3u64 {
+            let dx = pseudo(k + 1, n);
+            let df = pseudo(k + 51, n);
+            for i in 0..n {
+                x[i] += dx[i];
+                f[i] += df[i];
+            }
+            a.update(&x, &f);
+        }
+
+        let jinv = dense_of(n, |v| a.solve_ref(v));
+        let jfwd = dense_of(n, |v| a.matvec(v));
+        let rs = dense_of(n, |v| a.rsolve(v));
+        let rm = dense_of(n, |v| a.rmatvec(v));
+
+        assert!(
+            max_diff_cols(&rs, &transposed(&jinv)) < 1e-9,
+            "rsolve is not the transpose of the inverse product"
+        );
+        assert!(
+            max_diff_cols(&rm, &transposed(&jfwd)) < 1e-9,
+            "rmatvec is not the transpose of the forward product"
+        );
+        // MUST-MISS: the operator is genuinely non-symmetric, so the two checks above
+        // are not satisfied by any operator that ignored the transpose entirely.
+        assert!(
+            max_diff_cols(&jinv, &transposed(&jinv)) > 0.1,
+            "the Anderson operator is symmetric on this history; the transpose tests \
+             cannot distinguish a correct implementation from a no-op"
+        );
+    }
+
+    /// The history is capped at `m`, and `m = 0` disables the method entirely -- it
+    /// degenerates to linear mixing, which is what SciPy does and is worth pinning
+    /// because it is the one setting that silently changes the algorithm.
+    #[test]
+    fn anderson_history_is_capped_and_zero_m_degenerates_to_linear_mixing() {
+        let n = 4;
+        let alpha = 0.35;
+        let mut a = AndersonJacobian::new(Some(alpha), Some(0.01), Some(2));
+        let zeros = vec![0.0; n];
+        a.setup(&zeros, &zeros);
+        let mut x = vec![0.0; n];
+        let mut f = vec![0.0; n];
+        for k in 0..5u64 {
+            for i in 0..n {
+                x[i] += pseudo(k + 1, n)[i];
+                f[i] += pseudo(k + 71, n)[i];
+            }
+            a.update(&x, &f);
+            assert!(a.history_len() <= 2, "history exceeded m = 2");
+        }
+        assert_eq!(a.history_len(), 2, "history never filled to m");
+
+        let mut zero = AndersonJacobian::new(Some(alpha), Some(0.01), Some(0));
+        let zeros = vec![0.0; n];
+        zero.setup(&zeros, &zeros);
+        zero.update(&x, &f);
+        assert_eq!(zero.history_len(), 0, "m = 0 still accumulated history");
+        let probe = pseudo(808, n);
+        let want: Vec<f64> = probe.iter().map(|v| -alpha * v).collect();
+        assert!(
+            max_diff(&zero.solve_ref(&probe), &want) < 1e-12,
+            "with m = 0 the step is not plain linear mixing"
+        );
+    }
+
+    /// All four new strategies drive through the trait, alongside the two already
+    /// there. A trait with six implementors is only worth having if calling through it
+    /// actually works for each.
+    #[test]
+    fn every_strategy_drives_through_the_trait() {
+        let n = 4;
+        let x0 = vec![1.0, 2.0, 3.0, 4.0];
+        let f0 = vec![0.5, -0.25, 0.75, -1.0];
+        let x1 = vec![1.3, 2.1, 2.6, 4.2];
+        let f1 = vec![0.2, -0.4, 0.5, -0.6];
+
+        let mut lm = LinearMixingJacobian::new(Some(0.4));
+        let mut db = DiagBroydenJacobian::new(Some(0.4));
+        let mut em = ExcitingMixingJacobian::new(Some(0.4), None);
+        let mut an = AndersonJacobian::new(Some(0.4), None, None);
+        let mut br = BroydenJacobian::first();
+        let strategies: [&mut dyn Jacobian; 5] =
+            [&mut lm, &mut db, &mut em, &mut an, &mut br];
+
+        for (i, s) in strategies.into_iter().enumerate() {
+            s.setup(&x0, &f0);
+            assert_eq!(s.dimension(), n, "strategy {i} reported the wrong dimension");
+            s.update(&x1, &f1);
+            let probe = pseudo(909, n);
+            let step = s.solve_ref(&probe);
+            assert_eq!(step.len(), n, "strategy {i} returned the wrong length");
+            assert!(
+                step.iter().all(|v| v.is_finite()),
+                "strategy {i} produced a non-finite step"
+            );
+            // Every one of these is a descent-direction approximation of -J^-1, so a
+            // nonzero residual must produce a nonzero step.
+            assert!(
+                norm_of(&step) > 1e-12,
+                "strategy {i} returned an all-zero step for a nonzero residual"
+            );
+        }
+    }
+
+    // ── KrylovJacobian ──────────────────────────────────────────────────────
+
+    use super::{InnerMethod, KrylovJacobian};
+
+    /// `F_i = x_i^2 + 0.1 x_{i+1}`, whose Jacobian is known in closed form, so the
+    /// finite-difference operator can be checked against the truth rather than against
+    /// another approximation.
+    fn quad_residual(x: &[f64]) -> Vec<f64> {
+        let n = x.len();
+        (0..n).map(|i| x[i] * x[i] + 0.1 * x[(i + 1) % n]).collect()
+    }
+
+    fn quad_jacobian_times(x: &[f64], v: &[f64]) -> Vec<f64> {
+        let n = x.len();
+        (0..n)
+            .map(|i| 2.0 * x[i] * v[i] + 0.1 * v[(i + 1) % n])
+            .collect()
+    }
+
+    /// MUST-HIT: the directional derivative agrees with the analytic Jacobian.
+    /// MUST-MISS: it does NOT agree with a perturbed Jacobian, so the agreement is
+    /// evidence about the operator and not about the tolerance being loose.
+    #[test]
+    fn the_finite_difference_operator_matches_the_analytic_jacobian() {
+        let x: Vec<f64> = (0..8).map(|i| 1.0 + 0.1 * i as f64).collect();
+        let f = quad_residual(&x);
+        let mut j = KrylovJacobian::with_defaults(quad_residual);
+        j.setup(&x, &f);
+
+        let v = pseudo(77, 8);
+        let got = j.matvec(&v);
+        let want = quad_jacobian_times(&x, &v);
+        let scale = want.iter().fold(0.0_f64, |a, b| a.max(b.abs()));
+        assert!(
+            max_diff(&got, &want) < 1e-6 * scale,
+            "FD operator differs from the analytic Jacobian by {}",
+            max_diff(&got, &want)
+        );
+
+        let wrong: Vec<f64> = want.iter().map(|v| v * 1.01).collect();
+        assert!(
+            max_diff(&got, &wrong) > 1e-4 * scale,
+            "the FD operator matches a 1%-perturbed Jacobian equally well; the check \
+             above cannot distinguish a correct operator from a wrong one"
+        );
+    }
+
+    /// The differencing scale is SciPy's, and this recovers it exactly rather than
+    /// trusting the code that computed it.
+    ///
+    /// For `F(x) = x .* x` the difference quotient is `2 x_i v_i + h v_i^2` with
+    /// `h = omega / ||v||`, so the step actually taken can be solved for from the
+    /// output and compared against `rdiff * max(1, ||x||_inf) / max(1, ||f||_inf)`.
+    /// A test that recomputed the formula and compared it to itself would prove nothing.
+    #[test]
+    fn the_differencing_scale_is_the_scipy_expression() {
+        let square = |x: &[f64]| -> Vec<f64> { x.iter().map(|v| v * v).collect() };
+        // ||x||_inf = 3.0, ||f||_inf = 9.0, both above 1, so neither guard is active
+        // and a formula that dropped either term would give a different answer.
+        let x = vec![3.0, 1.0, -2.0, 0.5];
+        let f = square(&x);
+        // rdiff is set LARGE on purpose. The quantity being recovered is the
+        // second-order remainder of the difference quotient, and at the default
+        // sqrt(eps) it sits about 500x BELOW the cancellation noise of the quotient
+        // itself -- the recovered value comes back with the wrong sign. The formula is
+        // linear in rdiff, so measuring it at a step where it is resolvable pins it
+        // exactly; the default value is pinned separately below, by bit-identity.
+        let rdiff = 1e-2;
+        let mut j = KrylovJacobian::new(square, Some(rdiff), 20, 10);
+        j.setup(&x, &f);
+
+        let v = vec![1.0, -1.0, 0.5, 2.0];
+        let got = j.matvec(&v);
+        let vnorm = norm_of(&v);
+        let want_h = rdiff * 3.0_f64.max(1.0) / 9.0_f64.max(1.0) / vnorm;
+
+        // Recover h from the component with the largest v_i^2, where the recovery is
+        // best conditioned -- this is a difference of nearly equal numbers.
+        let idx = (0..4).max_by(|&a, &b| v[a].abs().partial_cmp(&v[b].abs()).unwrap()).unwrap();
+        let recovered = (got[idx] - 2.0 * x[idx] * v[idx]) / (v[idx] * v[idx]);
+        assert!(
+            (recovered - want_h).abs() < 1e-8 * want_h,
+            "recovered step {recovered} does not match SciPy's {want_h}"
+        );
+
+        // MUST-MISS: the scale root.rs's newton_krylov uses is materially different, so
+        // the check above is not passing on any plausible formula.
+        let other_h = rdiff * (1.0 + norm_of(&x)) / vnorm;
+        assert!(
+            (recovered - other_h).abs() > 1e-2 * other_h,
+            "SciPy's scale and the rdiff*(1+||x||_2)/||v|| scale are indistinguishable \
+             on this input; the test does not pin the formula"
+        );
+
+        // The DEFAULT rdiff is sqrt(eps). Checked by bit-identity against an explicit
+        // sqrt(eps) rather than by recovering the step, which is exactly the
+        // measurement that fails at that magnitude.
+        let mut defaulted = KrylovJacobian::with_defaults(square);
+        defaulted.setup(&x, &f);
+        let mut explicit = KrylovJacobian::new(square, Some(f64::EPSILON.sqrt()), 20, 10);
+        explicit.setup(&x, &f);
+        let a = defaulted.matvec(&v);
+        let b = explicit.matvec(&v);
+        assert!(
+            a.iter().zip(&b).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "the default rdiff is not sqrt(eps)"
+        );
+        // MUST-MISS: a different rdiff gives a different answer, so bit-identity above
+        // is evidence rather than a property of the operator being insensitive.
+        let mut other = KrylovJacobian::new(square, Some(1e-3), 20, 10);
+        other.setup(&x, &f);
+        let c = other.matvec(&v);
+        assert!(
+            a.iter().zip(&c).any(|(p, q)| p.to_bits() != q.to_bits()),
+            "changing rdiff did not change the product; the bit-identity check is vacuous"
+        );
+    }
+
+    /// The inner solver actually solves. Driven on a LINEAR residual, where the
+    /// finite-difference operator is exact, so any error is the Krylov method's.
+    #[test]
+    fn the_inner_solver_solves_the_newton_system() {
+        // F(x) = A x with A strictly diagonally dominant, hence nonsingular.
+        let n = 12;
+        let amul = |x: &[f64]| -> Vec<f64> {
+            (0..n)
+                .map(|i| {
+                    4.0 * x[i] - x[(i + 1) % n] - 0.5 * x[(i + n - 1) % n]
+                })
+                .collect()
+        };
+        let x0 = vec![0.0; n];
+        let f0 = amul(&x0);
+        for method in [InnerMethod::Gmres, InnerMethod::Lgmres] {
+            let mut j = KrylovJacobian::new(amul, None, 30, 10);
+            j.setup(&x0, &f0);
+            let rhs = pseudo(303, n);
+            let dx = j.solve(&rhs, 1e-10, method);
+            let back = amul(&dx);
+            assert!(
+                max_diff(&back, &rhs) < 1e-6,
+                "{method:?}: J dx does not reproduce the right-hand side, off by {}",
+                max_diff(&back, &rhs)
+            );
+            // MUST-MISS: a nonzero right-hand side must not be answered with zero.
+            assert!(
+                norm_of(&dx) > 1e-6,
+                "{method:?}: returned an all-but-zero step for a nonzero rhs"
+            );
+        }
+    }
+
+    /// The augmentation is carried across Newton steps and capped at `outer_k`.
+    /// Plain GMRES must carry none, or the two modes are the same code.
+    #[test]
+    fn the_augmentation_is_carried_and_capped() {
+        let n = 10;
+        let mut x: Vec<f64> = (0..n).map(|i| 1.0 + 0.05 * i as f64).collect();
+        let mut f = quad_residual(&x);
+        let mut j = KrylovJacobian::new(quad_residual, None, 8, 3);
+        j.setup(&x, &f);
+
+        for step in 0..6 {
+            let rhs: Vec<f64> = f.iter().map(|v| -v).collect();
+            let dx = j.solve(&rhs, 1e-6, InnerMethod::Lgmres);
+            for (xi, di) in x.iter_mut().zip(&dx) {
+                *xi += di;
+            }
+            f = quad_residual(&x);
+            j.update(&x, &f);
+            assert!(
+                j.augmentation_rank() <= 3,
+                "step {step}: augmentation rank {} exceeded outer_k = 3",
+                j.augmentation_rank()
+            );
+        }
+        assert_eq!(
+            j.augmentation_rank(),
+            3,
+            "the augmentation never filled up; it is not being carried across steps"
+        );
+
+        // MUST-MISS: the plain GMRES mode accumulates nothing.
+        let mut g = KrylovJacobian::new(quad_residual, None, 8, 3);
+        let x2: Vec<f64> = (0..n).map(|i| 1.0 + 0.05 * i as f64).collect();
+        let f2 = quad_residual(&x2);
+        g.setup(&x2, &f2);
+        for _ in 0..6 {
+            let rhs: Vec<f64> = f2.iter().map(|v| -v).collect();
+            g.solve(&rhs, 1e-6, InnerMethod::Gmres);
+        }
+        assert_eq!(
+            g.augmentation_rank(),
+            0,
+            "the plain GMRES mode accumulated augmentation directions"
+        );
+    }
+
+    /// Every product costs exactly one residual evaluation, and a zero direction costs
+    /// none. That count is the real cost model for a matrix-free method, so it is worth
+    /// pinning rather than inferring.
+    #[test]
+    fn products_cost_one_evaluation_and_zero_directions_cost_none() {
+        let x = vec![1.0, 2.0, 3.0];
+        let f = quad_residual(&x);
+        let mut j = KrylovJacobian::with_defaults(quad_residual);
+        j.setup(&x, &f);
+        assert_eq!(j.function_evaluations(), 0, "setup should evaluate nothing");
+
+        j.matvec(&[1.0, 0.0, 0.0]);
+        assert_eq!(j.function_evaluations(), 1);
+        j.matvec(&[0.0, 1.0, 1.0]);
+        assert_eq!(j.function_evaluations(), 2);
+
+        // MUST-MISS the counter: a zero direction short-circuits.
+        let z = j.matvec(&[0.0, 0.0, 0.0]);
+        assert_eq!(
+            j.function_evaluations(),
+            2,
+            "a zero direction consumed an evaluation"
+        );
+        assert!(z.iter().all(|v| *v == 0.0), "a zero direction gave a nonzero product");
+    }
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Simple mixing Jacobians — scipy.optimize LinearMixing / DiagBroyden / ExcitingMixing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Shared auto-scaling for the mixing methods.
+///
+/// `GenericBroyden.setup`'s heuristic: `alpha = 0.5 * max(||x0||, 1) / ||f0||`, or 1
+/// when the residual already vanishes. Every method below inherits it, so it lives here
+/// rather than being written out four times with four chances to diverge.
+fn auto_alpha(x0: &[f64], f0: &[f64]) -> f64 {
+    let nf = norm(f0);
+    if nf != 0.0 {
+        0.5 * norm(x0).max(1.0) / nf
+    } else {
+        1.0
+    }
+}
+
+/// Scalar Jacobian approximation `J = -1/alpha * I` -- `scipy.optimize.LinearMixing`.
+///
+/// The Jacobian never changes; `update` is genuinely a no-op, which is not an oversight
+/// but the definition of the method. It is the crudest member of the family and is here
+/// because it is the right baseline: an adaptive method that fails to beat plain linear
+/// mixing on a problem is not earning its bookkeeping there.
+#[derive(Debug, Clone)]
+pub struct LinearMixingJacobian {
+    alpha: Option<f64>,
+    n: usize,
+}
+
+impl LinearMixingJacobian {
+    /// `alpha = None` auto-scales on setup.
+    #[must_use]
+    pub fn new(alpha: Option<f64>) -> Self {
+        Self { alpha, n: 0 }
+    }
+    fn a(&self) -> f64 {
+        self.alpha.unwrap_or(1.0)
+    }
+}
+
+impl Jacobian for LinearMixingJacobian {
+    fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        if self.alpha.is_none() {
+            self.alpha = Some(auto_alpha(x0, f0));
+        }
+    }
+    fn solve_ref(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().map(|x| -x * self.a()).collect()
+    }
+    fn matvec(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().map(|x| -x / self.a()).collect()
+    }
+    fn rsolve(&self, v: &[f64]) -> Vec<f64> {
+        self.solve_ref(v)
+    }
+    fn rmatvec(&self, v: &[f64]) -> Vec<f64> {
+        self.matvec(v)
+    }
+    /// Deliberately empty: the whole point of linear mixing is a fixed Jacobian.
+    fn update(&mut self, _x: &[f64], _f: &[f64]) {}
+    fn dimension(&self) -> usize {
+        self.n
+    }
+}
+
+/// Diagonal Jacobian approximation `J = -diag(d)` -- `scipy.optimize.DiagBroyden`.
+///
+/// Broyden's rank-1 update restricted to the diagonal: each entry absorbs only the part
+/// of the secant condition its own coordinate explains. That buys O(n) memory and O(n)
+/// work per step, and buys nothing at all on a problem whose coupling is off the
+/// diagonal -- the honest limit of the method rather than a defect of it.
+#[derive(Debug, Clone)]
+pub struct DiagBroydenJacobian {
+    alpha: Option<f64>,
+    d: Vec<f64>,
+    last_x: Vec<f64>,
+    last_f: Vec<f64>,
+    n: usize,
+}
+
+impl DiagBroydenJacobian {
+    /// `alpha = None` auto-scales on setup.
+    #[must_use]
+    pub fn new(alpha: Option<f64>) -> Self {
+        Self {
+            alpha,
+            d: Vec::new(),
+            last_x: Vec::new(),
+            last_f: Vec::new(),
+            n: 0,
+        }
+    }
+
+    /// The current diagonal.
+    #[must_use]
+    pub fn diagonal(&self) -> &[f64] {
+        &self.d
+    }
+}
+
+impl Jacobian for DiagBroydenJacobian {
+    fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        if self.alpha.is_none() {
+            self.alpha = Some(auto_alpha(x0, f0));
+        }
+        self.d = vec![1.0 / self.alpha.unwrap_or(1.0); self.n];
+        self.last_x = x0.to_vec();
+        self.last_f = f0.to_vec();
+    }
+    fn solve_ref(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().zip(&self.d).map(|(x, d)| -x / d).collect()
+    }
+    fn matvec(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().zip(&self.d).map(|(x, d)| -x * d).collect()
+    }
+    fn rsolve(&self, v: &[f64]) -> Vec<f64> {
+        self.solve_ref(v)
+    }
+    fn rmatvec(&self, v: &[f64]) -> Vec<f64> {
+        self.matvec(v)
+    }
+    fn update(&mut self, x: &[f64], f: &[f64]) {
+        if x.len() != self.n || f.len() != self.n {
+            return;
+        }
+        let dx: Vec<f64> = x.iter().zip(&self.last_x).map(|(a, b)| a - b).collect();
+        let df: Vec<f64> = f.iter().zip(&self.last_f).map(|(a, b)| a - b).collect();
+        let dx_norm2: f64 = dx.iter().map(|v| v * v).sum();
+        // A zero step carries no information and would divide by zero.
+        if dx_norm2 > 0.0 && dx_norm2.is_finite() {
+            for i in 0..self.n {
+                self.d[i] -= (df[i] + self.d[i] * dx[i]) * dx[i] / dx_norm2;
+            }
+        }
+        self.last_x = x.to_vec();
+        self.last_f = f.to_vec();
+    }
+    fn dimension(&self) -> usize {
+        self.n
+    }
+}
+
+/// Diagonal Jacobian with a per-coordinate adaptive step
+/// -- `scipy.optimize.ExcitingMixing`.
+///
+/// A coordinate whose residual KEEPS ITS SIGN is being approached steadily, so its step
+/// grows by `alpha`; one whose residual flips sign has overshot, so its step is reset to
+/// `alpha` outright. That asymmetry -- grow slowly, reset hard -- is the whole method,
+/// and it is a heuristic rather than an approximation of anything: no secant condition
+/// is involved, which is why it has no convergence theory and is judged only by results.
+#[derive(Debug, Clone)]
+pub struct ExcitingMixingJacobian {
+    alpha: Option<f64>,
+    alphamax: f64,
+    beta: Vec<f64>,
+    last_f: Vec<f64>,
+    n: usize,
+}
+
+impl ExcitingMixingJacobian {
+    /// `alpha = None` auto-scales on setup; `alphamax` defaults to 1.0.
+    #[must_use]
+    pub fn new(alpha: Option<f64>, alphamax: Option<f64>) -> Self {
+        Self {
+            alpha,
+            alphamax: alphamax.unwrap_or(1.0),
+            beta: Vec::new(),
+            last_f: Vec::new(),
+            n: 0,
+        }
+    }
+
+    /// The current per-coordinate steps.
+    #[must_use]
+    pub fn beta(&self) -> &[f64] {
+        &self.beta
+    }
+}
+
+impl Jacobian for ExcitingMixingJacobian {
+    fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        if self.alpha.is_none() {
+            self.alpha = Some(auto_alpha(x0, f0));
+        }
+        self.beta = vec![self.alpha.unwrap_or(1.0); self.n];
+        self.last_f = f0.to_vec();
+    }
+    fn solve_ref(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().zip(&self.beta).map(|(x, b)| -x * b).collect()
+    }
+    fn matvec(&self, v: &[f64]) -> Vec<f64> {
+        v.iter().zip(&self.beta).map(|(x, b)| -x / b).collect()
+    }
+    fn rsolve(&self, v: &[f64]) -> Vec<f64> {
+        self.solve_ref(v)
+    }
+    fn rmatvec(&self, v: &[f64]) -> Vec<f64> {
+        self.matvec(v)
+    }
+    fn update(&mut self, _x: &[f64], f: &[f64]) {
+        if f.len() != self.n {
+            return;
+        }
+        let alpha = self.alpha.unwrap_or(1.0);
+        for i in 0..self.n {
+            // Compared against the PREVIOUS residual, which is why `last_f` is
+            // refreshed only after the whole sweep.
+            if f[i] * self.last_f[i] > 0.0 {
+                self.beta[i] += alpha;
+            } else {
+                self.beta[i] = alpha;
+            }
+            self.beta[i] = self.beta[i].clamp(0.0, self.alphamax);
+        }
+        self.last_f = f.to_vec();
+    }
+    fn dimension(&self) -> usize {
+        self.n
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Anderson mixing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Anderson mixing -- `scipy.optimize.Anderson`.
+///
+/// Rather than maintaining a Jacobian, this keeps the last `m` steps and residual
+/// changes and, at each solve, picks the combination of them that best cancels the
+/// current residual in a least-squares sense. It is Anderson acceleration in the shape
+/// of a Jacobian object, and it is often the strongest of these methods where the
+/// Jacobian is badly conditioned but the iterates lie near a low-dimensional manifold.
+///
+/// # `w0` regularises a problem that is rank-deficient exactly when it matters
+///
+/// The normal-equations matrix is `a[i][j] = (1 + w0^2 delta_ij) <df_i, df_j>`. Stored
+/// residual differences become nearly parallel as the iteration converges -- that is
+/// what converging means -- so `a` approaches singular precisely when the method is
+/// working. The `w0^2` ridge on the diagonal is what keeps the solve meaningful there.
+/// When it fails anyway the history is DISCARDED and the step falls back to plain
+/// linear mixing, which is SciPy's behaviour and the right one: a stale history is worse
+/// than no history.
+#[derive(Debug, Clone)]
+pub struct AndersonJacobian {
+    alpha: Option<f64>,
+    w0: f64,
+    m: usize,
+    dxs: Vec<Vec<f64>>,
+    dfs: Vec<Vec<f64>>,
+    /// Normal-equations matrix, row-major, rebuilt on every update.
+    a: Vec<f64>,
+    last_x: Vec<f64>,
+    last_f: Vec<f64>,
+    n: usize,
+}
+
+impl AndersonJacobian {
+    /// SciPy's defaults are `w0 = 0.01` and `m = 5`; `alpha = None` auto-scales.
+    #[must_use]
+    pub fn new(alpha: Option<f64>, w0: Option<f64>, m: Option<usize>) -> Self {
+        Self {
+            alpha,
+            w0: w0.unwrap_or(0.01),
+            m: m.unwrap_or(5),
+            dxs: Vec::new(),
+            dfs: Vec::new(),
+            a: Vec::new(),
+            last_x: Vec::new(),
+            last_f: Vec::new(),
+            n: 0,
+        }
+    }
+
+    /// Number of retained history pairs.
+    #[must_use]
+    pub fn history_len(&self) -> usize {
+        self.dxs.len()
+    }
+
+    fn alpha_v(&self) -> f64 {
+        self.alpha.unwrap_or(1.0)
+    }
+
+    /// `b[i][j] = <df_i, dx_j> - delta_ij <df_i, df_i> w0^2 alpha`, the matrix the
+    /// FORWARD product uses. Unlike `a` it is NOT symmetric, which is why the transpose
+    /// operation below solves with its transpose instead of reusing the same matrix.
+    fn b_matrix(&self) -> Vec<f64> {
+        let k = self.dxs.len();
+        let mut b = vec![0.0; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut v: f64 = self.dfs[i]
+                    .iter()
+                    .zip(&self.dxs[j])
+                    .map(|(p, q)| p * q)
+                    .sum();
+                if i == j && self.w0 != 0.0 {
+                    let dd: f64 = self.dfs[i].iter().map(|p| p * p).sum();
+                    v -= dd * self.w0 * self.w0 * self.alpha_v();
+                }
+                b[i * k + j] = v;
+            }
+        }
+        b
+    }
+
+    fn dots_with(vecs: &[Vec<f64>], f: &[f64]) -> Vec<f64> {
+        vecs.iter()
+            .map(|v| v.iter().zip(f).map(|(p, q)| p * q).sum())
+            .collect()
+    }
+}
+
+impl Jacobian for AndersonJacobian {
+    fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        if self.alpha.is_none() {
+            self.alpha = Some(auto_alpha(x0, f0));
+        }
+        self.dxs.clear();
+        self.dfs.clear();
+        self.a.clear();
+        self.last_x = x0.to_vec();
+        self.last_f = f0.to_vec();
+    }
+
+    fn solve_ref(&self, f: &[f64]) -> Vec<f64> {
+        let alpha = self.alpha_v();
+        let mut dx: Vec<f64> = f.iter().map(|v| -alpha * v).collect();
+        let k = self.dxs.len();
+        if k == 0 {
+            return dx;
+        }
+        let rhs = Self::dots_with(&self.dfs, f);
+        let mut a = self.a.clone();
+        // A singular history falls back to plain linear mixing rather than inventing a
+        // step; the `&mut` path additionally clears it.
+        let Some(gamma) = lu_solve_in_place(&mut a, &rhs, k) else {
+            return dx;
+        };
+        for m in 0..k {
+            let g = gamma[m];
+            for i in 0..self.n {
+                dx[i] += g * (self.dxs[m][i] + alpha * self.dfs[m][i]);
+            }
+        }
+        dx
+    }
+
+    /// As `solve_ref`, but discards a history that has gone singular so the next step
+    /// starts clean -- SciPy resets the same way.
+    fn solve(&mut self, f: &[f64]) -> Vec<f64> {
+        let k = self.dxs.len();
+        if k > 0 {
+            let rhs = Self::dots_with(&self.dfs, f);
+            let mut a = self.a.clone();
+            if lu_solve_in_place(&mut a, &rhs, k).is_none() {
+                self.dxs.clear();
+                self.dfs.clear();
+                self.a.clear();
+            }
+        }
+        self.solve_ref(f)
+    }
+
+    fn matvec(&self, f: &[f64]) -> Vec<f64> {
+        let alpha = self.alpha_v();
+        let mut dx: Vec<f64> = f.iter().map(|v| -v / alpha).collect();
+        let k = self.dxs.len();
+        if k == 0 {
+            return dx;
+        }
+        let rhs = Self::dots_with(&self.dfs, f);
+        let mut b = self.b_matrix();
+        let Some(gamma) = lu_solve_in_place(&mut b, &rhs, k) else {
+            return dx;
+        };
+        for m in 0..k {
+            let g = gamma[m];
+            for i in 0..self.n {
+                dx[i] += g * (self.dfs[m][i] + self.dxs[m][i] / alpha);
+            }
+        }
+        dx
+    }
+
+    /// `(J^-1)^T v`.
+    ///
+    /// SciPy does not define this, so it is DERIVED rather than ported, and the tests
+    /// check it against an explicit dense transpose instead of against a formula.
+    /// Writing the inverse as `-alpha I + U a^-1 D^T` with `U = [dx_m + alpha df_m]` and
+    /// `D = [df_m]`, its transpose is `-alpha I + D a^-T U^T`; `a` is SYMMETRIC, so the
+    /// same matrix serves both directions.
+    fn rsolve(&self, v: &[f64]) -> Vec<f64> {
+        let alpha = self.alpha_v();
+        let mut out: Vec<f64> = v.iter().map(|x| -alpha * x).collect();
+        let k = self.dxs.len();
+        if k == 0 {
+            return out;
+        }
+        let u: Vec<Vec<f64>> = (0..k)
+            .map(|m| {
+                self.dxs[m]
+                    .iter()
+                    .zip(&self.dfs[m])
+                    .map(|(a, b)| a + alpha * b)
+                    .collect()
+            })
+            .collect();
+        let rhs = Self::dots_with(&u, v);
+        let mut a = self.a.clone();
+        let Some(gamma) = lu_solve_in_place(&mut a, &rhs, k) else {
+            return out;
+        };
+        for m in 0..k {
+            let g = gamma[m];
+            for i in 0..self.n {
+                out[i] += g * self.dfs[m][i];
+            }
+        }
+        out
+    }
+
+    /// `J^T v`, derived the same way from `-I/alpha + V b^-1 D^T` with
+    /// `V = [df_m + dx_m/alpha]`. Here `b` is NOT symmetric, so this solves against its
+    /// transpose rather than reusing the forward matrix -- the one place the two
+    /// directions genuinely differ.
+    fn rmatvec(&self, v: &[f64]) -> Vec<f64> {
+        let alpha = self.alpha_v();
+        let mut out: Vec<f64> = v.iter().map(|x| -x / alpha).collect();
+        let k = self.dxs.len();
+        if k == 0 {
+            return out;
+        }
+        let vmat: Vec<Vec<f64>> = (0..k)
+            .map(|m| {
+                self.dfs[m]
+                    .iter()
+                    .zip(&self.dxs[m])
+                    .map(|(a, b)| a + b / alpha)
+                    .collect()
+            })
+            .collect();
+        let rhs = Self::dots_with(&vmat, v);
+        let b = self.b_matrix();
+        let mut bt = vec![0.0; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                bt[i * k + j] = b[j * k + i];
+            }
+        }
+        let Some(gamma) = lu_solve_in_place(&mut bt, &rhs, k) else {
+            return out;
+        };
+        for m in 0..k {
+            let g = gamma[m];
+            for i in 0..self.n {
+                out[i] += g * self.dfs[m][i];
+            }
+        }
+        out
+    }
+
+    fn update(&mut self, x: &[f64], f: &[f64]) {
+        if x.len() != self.n || f.len() != self.n || self.m == 0 {
+            return;
+        }
+        let dx: Vec<f64> = x.iter().zip(&self.last_x).map(|(a, b)| a - b).collect();
+        let df: Vec<f64> = f.iter().zip(&self.last_f).map(|(a, b)| a - b).collect();
+        self.last_x = x.to_vec();
+        self.last_f = f.to_vec();
+
+        self.dxs.push(dx);
+        self.dfs.push(df);
+        while self.dxs.len() > self.m {
+            self.dxs.remove(0);
+            self.dfs.remove(0);
+        }
+
+        let k = self.dxs.len();
+        let mut a = vec![0.0; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let wd = if i == j { self.w0 * self.w0 } else { 0.0 };
+                let d: f64 = self.dfs[i]
+                    .iter()
+                    .zip(&self.dfs[j])
+                    .map(|(p, q)| p * q)
+                    .sum();
+                a[i * k + j] = (1.0 + wd) * d;
+            }
+        }
+        self.a = a;
+    }
+
+    fn dimension(&self) -> usize {
+        self.n
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KrylovJacobian
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Matrix-free Jacobian applied by finite differences -- `scipy.optimize.KrylovJacobian`.
+///
+/// The Jacobian is never formed. `J v` is estimated as a directional derivative of the
+/// residual, and the Newton system is solved by an inner Krylov method that only ever
+/// asks for products. Memory is O(n * inner_maxiter) regardless of how dense the true
+/// Jacobian is, which is what makes this the method of choice for discretised PDEs.
+///
+/// # The differencing scale is the whole numerical difficulty
+///
+/// A directional derivative `(F(x + h v) - F(x)) / h` is a fight between truncation
+/// error, which falls with `h`, and cancellation, which grows as `h` shrinks and the two
+/// residuals agree to more digits. SciPy picks
+///
+/// ```text
+///     omega = rdiff * max(1, ||x||_inf) / max(1, ||f||_inf),   h = omega / ||v||
+/// ```
+///
+/// with `rdiff = sqrt(eps)`, and this implementation uses the same expression. The two
+/// guards matter and are easy to drop: dividing by `max(1, ||f||_inf)` shrinks the step
+/// when the residual is large, where the difference would otherwise be swamped, and
+/// scaling by `1/||v||` makes the step invariant to the length of the direction the
+/// Krylov method happens to hand over -- without it the estimate degrades as the basis
+/// vectors change scale.
+///
+/// `root.rs`'s existing `newton_krylov` uses `rdiff * (1 + ||x||_2) / ||v||`, which drops
+/// the residual term and uses a different norm. This type exists partly to carry SciPy's
+/// actual choice.
+///
+/// # Why this does not implement the `Jacobian` trait
+///
+/// The trait requires `rmatvec` and `rsolve`. A finite-difference operator has NO
+/// transpose: `J^T v` is not a directional derivative of `F` in any direction, and
+/// producing one would need a second, different approximation the caller did not ask
+/// for. Implementing them to satisfy a signature -- by returning the forward result, or
+/// zeros, or by panicking at runtime -- would each be worse than not offering them.
+/// SciPy's `KrylovJacobian` likewise defines only `matvec` and `solve`.
+pub struct KrylovJacobian<F> {
+    func: F,
+    x0: Vec<f64>,
+    f0: Vec<f64>,
+    rdiff: f64,
+    omega: f64,
+    inner_maxiter: usize,
+    outer_k: usize,
+    /// Augmentation directions carried across outer Newton steps -- LGMRES's `outer_v`.
+    outer_v: Vec<Vec<f64>>,
+    /// Residual evaluations consumed, the honest cost measure for a matrix-free method.
+    nfev: usize,
+    n: usize,
+}
+
+/// Which inner Krylov method solves the Newton system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InnerMethod {
+    /// Restarted GMRES with no augmentation.
+    Gmres,
+    /// GMRES augmented with directions carried over from previous Newton steps.
+    ///
+    /// The augmentation is the point: a restarted Krylov method throws away everything
+    /// it learned at each restart, and across a Newton iteration it throws away
+    /// everything it learned about a Jacobian that has barely changed. Keeping a few
+    /// directions recovers the components a restart would otherwise have to rediscover.
+    Lgmres,
+}
+
+impl<F> KrylovJacobian<F>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    /// `rdiff` defaults to `sqrt(f64::EPSILON)`, `inner_maxiter` to 20 and `outer_k` to
+    /// 10, matching SciPy.
+    pub fn new(func: F, rdiff: Option<f64>, inner_maxiter: usize, outer_k: usize) -> Self {
+        Self {
+            func,
+            x0: Vec::new(),
+            f0: Vec::new(),
+            rdiff: rdiff.unwrap_or_else(|| f64::EPSILON.sqrt()),
+            omega: 0.0,
+            inner_maxiter,
+            outer_k,
+            outer_v: Vec::new(),
+            nfev: 0,
+            n: 0,
+        }
+    }
+
+    /// SciPy's defaults throughout.
+    pub fn with_defaults(func: F) -> Self {
+        Self::new(func, None, 20, 10)
+    }
+
+    /// Residual evaluations consumed so far.
+    ///
+    /// For a matrix-free method this, not wall time, is the cost that matters: every
+    /// Krylov product is one call to `F`, and on the problems this method is for that
+    /// call dominates everything else by orders of magnitude.
+    pub fn function_evaluations(&self) -> usize {
+        self.nfev
+    }
+
+    /// Number of augmentation directions currently carried.
+    pub fn augmentation_rank(&self) -> usize {
+        self.outer_v.len()
+    }
+
+    fn update_diff_step(&mut self) {
+        let mx = self.x0.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+        let mf = self.f0.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
+        self.omega = self.rdiff * mx.max(1.0) / mf.max(1.0);
+    }
+
+    /// Prepare for a solve at `x0` with residual `f0`.
+    pub fn setup(&mut self, x0: &[f64], f0: &[f64]) {
+        self.n = x0.len();
+        self.x0 = x0.to_vec();
+        self.f0 = f0.to_vec();
+        self.outer_v.clear();
+        self.update_diff_step();
+    }
+
+    /// Move to a new point. The augmentation directions are DELIBERATELY kept.
+    ///
+    /// SciPy carries `outer_v` across nonlinear steps but explicitly does not carry the
+    /// matching `A v` products, because the Jacobian may have moved. This does the same:
+    /// the directions are reused, their images are recomputed against the current
+    /// Jacobian. Reusing stale products would be the cheap-looking mistake -- it saves
+    /// the evaluations that make the augmentation correct.
+    pub fn update(&mut self, x: &[f64], f: &[f64]) {
+        self.x0 = x.to_vec();
+        self.f0 = f.to_vec();
+        self.update_diff_step();
+    }
+
+    /// `J v`, by a directional derivative of the residual.
+    ///
+    /// Costs exactly one residual evaluation. A zero direction short-circuits: the
+    /// derivative is zero and the scaling would divide by zero.
+    pub fn matvec(&mut self, v: &[f64]) -> Vec<f64> {
+        let nv = norm(v);
+        if nv == 0.0 {
+            return vec![0.0; self.n];
+        }
+        let sc = self.omega / nv;
+        let xp: Vec<f64> = self.x0.iter().zip(v).map(|(a, b)| a + sc * b).collect();
+        let fp = (self.func)(&xp);
+        self.nfev += 1;
+        fp.iter()
+            .zip(&self.f0)
+            .map(|(a, b)| (a - b) / sc)
+            .collect()
+    }
+
+    /// Solve `J dx = rhs` with the inner Krylov method, to relative tolerance `rtol`.
+    ///
+    /// Returns the step and leaves the augmentation updated when running LGMRES.
+    pub fn solve(&mut self, rhs: &[f64], rtol: f64, method: InnerMethod) -> Vec<f64> {
+        let augment = match method {
+            InnerMethod::Gmres => Vec::new(),
+            InnerMethod::Lgmres => self.outer_v.clone(),
+        };
+        let dx = self.gcr_solve(rhs, rtol, &augment);
+        if method == InnerMethod::Lgmres && self.outer_k > 0 {
+            let nd = norm(&dx);
+            if nd > 0.0 && nd.is_finite() {
+                self.outer_v.push(dx.iter().map(|v| v / nd).collect());
+                while self.outer_v.len() > self.outer_k {
+                    self.outer_v.remove(0);
+                }
+            }
+        }
+        dx
+    }
+
+    /// Generalised conjugate residual, optionally seeded with augmentation directions.
+    ///
+    /// GCR rather than an Arnoldi GMRES because augmentation drops straight in: a
+    /// direction is a direction, whether it came from the current Krylov sequence or
+    /// from a previous Newton step, so the augmented subspace needs no special basis
+    /// bookkeeping. Over the same subspace GCR minimises the same residual GMRES does.
+    ///
+    /// The paired update is what keeps it honest: whenever `A z` is orthogonalised
+    /// against an earlier image, the SAME coefficient is applied to `z`, so the stored
+    /// pair always satisfies `q_j = A z_j` exactly and the residual bookkeeping stays
+    /// consistent with the operator.
+    fn gcr_solve(&mut self, rhs: &[f64], rtol: f64, augment: &[Vec<f64>]) -> Vec<f64> {
+        let n = rhs.len();
+        let mut x = vec![0.0; n];
+        let mut r = rhs.to_vec();
+        let rhs_norm = norm(rhs);
+        if rhs_norm == 0.0 {
+            return x;
+        }
+        let target = rtol * rhs_norm;
+
+        let mut zs: Vec<Vec<f64>> = Vec::new();
+        let mut qs: Vec<Vec<f64>> = Vec::new();
+
+        for j in 0..self.inner_maxiter {
+            // Seed with an augmentation direction while any remain, then fall back to
+            // the current residual -- the ordinary Krylov choice.
+            let mut z = if j < augment.len() {
+                augment[j].clone()
+            } else {
+                r.clone()
+            };
+            let mut w = self.matvec(&z);
+
+            // Modified Gram-Schmidt against the previous images, applying every
+            // coefficient to `z` as well so the pair stays exact.
+            for i in 0..qs.len() {
+                let beta: f64 = qs[i].iter().zip(&w).map(|(a, b)| a * b).sum();
+                if beta != 0.0 {
+                    for (wi, qi) in w.iter_mut().zip(&qs[i]) {
+                        *wi -= beta * qi;
+                    }
+                    for (zi, zzi) in z.iter_mut().zip(&zs[i]) {
+                        *zi -= beta * zzi;
+                    }
+                }
+            }
+            let nw = norm(&w);
+            if nw == 0.0 || !nw.is_finite() {
+                // The direction added nothing; with an augmentation seed that just means
+                // it was already in the space, so continue rather than give up.
+                if j < augment.len() {
+                    continue;
+                }
+                break;
+            }
+            for wi in w.iter_mut() {
+                *wi /= nw;
+            }
+            for zi in z.iter_mut() {
+                *zi /= nw;
+            }
+
+            let alpha: f64 = w.iter().zip(&r).map(|(a, b)| a * b).sum();
+            for (xi, zi) in x.iter_mut().zip(&z) {
+                *xi += alpha * zi;
+            }
+            for (ri, wi) in r.iter_mut().zip(&w) {
+                *ri -= alpha * wi;
+            }
+            zs.push(z);
+            qs.push(w);
+
+            if norm(&r) <= target {
+                break;
+            }
+        }
+        x
     }
 }

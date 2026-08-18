@@ -36324,3 +36324,110 @@ and this window was better than described.
   ranker, so its statistic cannot move, and the figure overstated the divergence by about two
   orders of magnitude. **The collapse-and-rerun method is valid only where the tolerance
   drives RANK ASSIGNMENT**, not where it feeds a downstream correction.
+
+## Low-rank Broyden Jacobian vs `scipy.optimize.BroydenFirst` — win is the interpreter tax and it EXPIRES by n=4096
+
+Measured 2026-08-18, `crates/fsci-opt/src/bin/perf_broyden_lowrank.rs`
+(`MARKER=broyden-lowrank-v1-steps30`), release, executed-ELF-sha256 `847e3817d795150bd80508e111544cd235a6dab26744db912f27343906c13607`.
+Worker: this host (64-core, `/proc/cpuinfo` model as recorded in the run log).
+Harness: `scratchpad/drive.sh`, 5 interleaved replicates per size + a 3-replicate A/A null.
+Per-arm environment recorded on every stamp; loadavg 22.5–24.8 (1-min), CPU idle 54–76%,
+iowait 0%, CPU MHz 1429–4089 across stamps.
+
+**NOT A QUIET WINDOW, SO NOT CERTIFIED.** Load sat above 22 with four other projects
+building. The rows below are reported as measured, not as an `IMPL_CERTIFIED` claim.
+
+| n | fsci low-rank | scipy BroydenFirst | ratio | per-rep range | A/A null range |
+|---|---|---|---|---|---|
+| 64 | 101 µs | 2520 µs | **25.22x** | 17.86–30.36 | 0.798–1.275 |
+| 256 | 440 µs | 2877 µs | **7.04x** | 5.78–7.74 | 1.076–1.128 |
+| 1024 | 1851 µs | 3538 µs | **1.91x** | 1.85–2.45 | 0.714–1.040 |
+| 4096 | 6264 µs | 6626 µs | 1.03x | 0.84–1.22 | 0.959–1.050 |
+
+**THE n=4096 ROW IS A NULL RESULT AND IS RECORDED AS ONE.** Its per-replicate range
+(0.84–1.22) lies entirely inside the A/A null range at that size (0.959–1.050 median-wise,
+and the paired spread is comparable). There is NO established difference against SciPy at
+n=4096. Anyone quoting "25x faster than scipy's Broyden" from the n=64 row without the
+size sweep is quoting a constant that has already expired by the largest size tested.
+
+This is the `a + b·n` shape already banked for SciPy's pure-Python iterative solvers: the
+interpreter dispatch cost `a` is what we win and it is fixed, while `b·n` is numpy's
+vectorised inner loop, which we do not beat. Extrapolating past n=4096 would predict us
+LOSING, and that has not been measured.
+
+**THE REPRESENTATION CHANGE IS THE REAL RESULT, AND IT IS AGAINST OUR OWN PRIOR CODE.**
+Same step sequence, same update rule, dense `n x n` storage as `root.rs`'s `broyden1` uses:
+
+| n | low-rank | dense | ratio |
+|---|---|---|---|
+| 64 | 101 µs | 292 µs | 2.85x |
+| 256 | 440 µs | 6973 µs | 15.85x |
+| 1024 | 1851 µs | 169384 µs | **91.86x** |
+
+That ratio GROWS with n, which is what O(n·m) against O(n^2) predicts, and it is the
+claim the module was written to support. n=4096 dense was not run (134 MB of matrix).
+
+**PARITY IS EXACT.** Driven through the identical step sequence, the final residual matches
+scipy to every printed digit at all four sizes — relative difference 0.00e+00 at n = 64,
+256, 1024, 4096. The port reproduces `BroydenFirst`'s iterates, not merely its convergence.
+
+**CONFOUND WORTH NAMING:** the per-arm MHz stamps differ within a replicate (e.g. rep 1:
+fsci 3243 MHz, scipy 4089 MHz). That biases AGAINST the fsci arm, so the wins above are
+conservative and the n=4096 null is if anything generous to us.
+
+## Matrix-free Newton-Krylov vs `scipy.optimize.KrylovJacobian` — the win is COUNTED, the wall-clock win expires again
+
+Measured 2026-08-18, `crates/fsci-opt/src/bin/perf_newton_krylov.rs`
+(`MARKER=newton-krylov-bratu-v1`), release,
+executed-ELF-sha256 `64da05610698a4e8c6e7d0374806e5e5c1965d606dd17aff0b49551a5dc465d4`.
+Problem: 2D Bratu `lap(u) + exp(u) = 0`, zero Dirichlet, five-point Laplacian.
+Identical outer Newton loop in both arms (no line search), `eta = 1e-3`, `tol = 1e-8`,
+`inner_maxiter = 20`, `outer_k = 10`.
+Harness: `scratchpad/drive2.sh`, 5 interleaved replicates + 3-replicate A/A null.
+loadavg 35.8-41.2 (1-min), CPU idle 51-59%, iowait 0%, MHz 3114-3918.
+
+**LOAD WAS 35-41. THE TIMED ROWS ARE NOT CERTIFIED. The counted rows do not care** — nfev
+came back as a single identical value across all five replicates AND both sides of the
+A/A null at every size, so the count is deterministic and load-independent. That is why
+it is the headline here and the milliseconds are not.
+
+### Counted: residual evaluations to reach `||F|| < 1e-8`
+
+| n | LGMRES nfev | plain GMRES nfev | augmentation saves | scipy nfev | vs scipy |
+|---|---|---|---|---|---|
+| 256 | 71 (4 Newton) | 84 (4) | 1.18x | 74 (4) | 1.042x |
+| 1024 | 127 (6) | 295 (14) | 2.32x | 126 (4) | 0.992x |
+| 2304 | 190 (9) | 673 (32) | 3.54x | 202 (6) | 1.063x |
+| 4096 | 274 (13) | 841 (40) | **3.07x, and plain GMRES DID NOT CONVERGE** | 239 (7) | 0.872x |
+
+**At n=4096 the augmentation is the difference between converging and not.** Plain
+restarted GMRES exhausted 40 Newton steps at residual 6.0e-6; the augmented solve reached
+3.3e-9 in 13. That is a correctness-class difference, not a speed one, and it is the
+justification for carrying `outer_v` across nonlinear steps.
+
+**Against SciPy the evaluation count is parity: 0.87x-1.06x, no trend.** We are neither
+better nor worse at the metric that decides cost for a matrix-free method.
+
+**A FINDING THAT IS NOT IN OUR FAVOUR, RECORDED BECAUSE IT POINTS SOMEWHERE.** Our Newton
+step count is consistently HIGHER than scipy's (4/6/9/13 against 4/4/6/7) while the total
+evaluation count matches. SciPy's inner solve is therefore producing a BETTER step per
+solve, and we are only breaking even because we spend fewer evaluations per step. The
+likely cause is that our GCR seeds the augmentation directions first and then falls back
+to the residual, whereas LGMRES proper augments the Krylov basis rather than pre-empting
+it. Worth chasing; not chased here.
+
+### Timed: wall clock (NOT certified, load 35-41)
+
+| n | fsci | scipy | ratio | per-rep range | A/A null range |
+|---|---|---|---|---|---|
+| 256 | 0.510 ms | 6.287 ms | 12.02x | 10.72–12.88 | 0.998–1.059 |
+| 1024 | 4.337 ms | 11.437 ms | 2.63x | 2.21–3.25 | 0.939–1.072 |
+| 2304 | 12.603 ms | 23.141 ms | 1.82x | 1.59–1.86 | 0.931–1.000 |
+| 4096 | 34.372 ms | 34.608 ms | 1.02x | 0.97–1.06 | 0.941–0.997 |
+
+**The n=4096 timed row is a null, exactly as in the Broyden sweep.** Its range (0.97-1.06)
+straddles 1.0 and overlaps the A/A null. Two independent methods in this module now show
+the same shape: a large constant-factor win at small n that decays to nothing by n=4096.
+This is the interpreter-tax model, and it should now be the DEFAULT EXPECTATION for any
+fsci-vs-scipy row in this crate rather than a surprise — a win quoted at small n without a
+size sweep should be assumed to expire.
