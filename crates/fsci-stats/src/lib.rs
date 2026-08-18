@@ -8009,14 +8009,32 @@ impl DirichletMultinomial {
         }
     }
 
-    /// Log probability mass function. Returns `-inf` unless the counts are
-    /// non-negative and sum to `n`.
+    /// Log probability mass function. Returns `-inf` unless the counts are non-negative
+    /// INTEGERS summing EXACTLY to `n`.
+    ///
+    /// Both conditions are the incumbent's, checked against scipy 1.17.1 rather than
+    /// assumed. With `alpha = [1, 2, 3]`, `n = 6`:
+    ///   `logpmf([1, 2, 3])`  -> -2.7343675094195836
+    ///   `logpmf([1, 2, 4])`  -> -inf                       (integers, wrong sum: exact test)
+    ///   `logpmf([1, 2, 3.0000000005])` -> **raises** `ValueError: x must contain only
+    ///   non-negative integers` — scipy rejects non-integer counts at validation.
+    ///
+    /// This used to admit a `1e-9` tolerance on the sum and never tested integrality, so
+    /// that third case returned a FINITE value. Since this returns `f64` and cannot raise,
+    /// `-inf` is the mapping: it is the value scipy gives for every other out-of-support
+    /// input, and it keeps a non-count vector from producing a plausible density.
+    /// Deliberate deviation, recorded rather than silent — the API shape differs, the
+    /// admitted SET does not.
+    ///
+    /// Conforming input — non-negative integers summing to `n` — is unaffected: sums of
+    /// integers differ from `n` by at least 1, so the old tolerance never bit there, and
+    /// nothing downstream of the guard changed.
     pub fn logpmf(&self, x: &[f64]) -> f64 {
         if x.len() != self.alpha.len() {
             return f64::NEG_INFINITY;
         }
         let sum: f64 = x.iter().sum();
-        if (sum - self.n as f64).abs() > 1e-9 || x.iter().any(|&xi| xi < 0.0) {
+        if sum != self.n as f64 || x.iter().any(|&xi| xi < 0.0 || xi.floor() != xi) {
             return f64::NEG_INFINITY;
         }
         let mut lp = ln_gamma(self.alpha_sum) - ln_gamma(self.n as f64 + self.alpha_sum)
@@ -57352,6 +57370,28 @@ mod tests {
         assert_eq!(dist.logpmf(&[2.0, 3.0, 5.001]), f64::NEG_INFINITY);
         assert_eq!(dist.logpmf(&[-1.0, 4.0, 7.0]), f64::NEG_INFINITY);
         assert_eq!(dist.logpmf(&[2.0, 3.0]), f64::NEG_INFINITY, "wrong length");
+
+        // Same defect, same fix, in DirichletMultinomial. scipy 1.17.1 with
+        // alpha = [1,2,3], n = 6: logpmf([1,2,3]) = -2.7343675094195836,
+        // logpmf([1,2,4]) = -inf, and logpmf([1,2,3.0000000005]) RAISES because the
+        // counts are not integers. We return -inf there instead of raising, because
+        // this API returns f64 — the admitted SET matches, the failure shape differs.
+        let dm = DirichletMultinomial::new(&[1.0, 2.0, 3.0], 6);
+        let dm_ok = dm.logpmf(&[1.0, 2.0, 3.0]);
+        assert!(
+            (dm_ok - (-2.734_367_509_419_583_6)).abs() < 1e-12,
+            "dirichlet-multinomial logpmf {dm_ok} != scipy -2.7343675094195836"
+        );
+        assert_eq!(
+            dm.logpmf(&[1.0, 2.0, 4.0]),
+            f64::NEG_INFINITY,
+            "integers summing to 7 with n=6 are outside the support"
+        );
+        assert_eq!(
+            dm.logpmf(&[1.0, 2.0, 3.000_000_000_5]),
+            f64::NEG_INFINITY,
+            "non-integer counts must be rejected, as scipy rejects them at validation"
+        );
     }
 
     /// `frankenscipy-clttw`: these three functions grouped ties by a TOLERANCE
