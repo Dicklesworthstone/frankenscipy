@@ -36542,3 +36542,41 @@ Related: the same defect CLASS was just found and fixed in `fsci-opt`'s `KrylovJ
 (augmentation consuming rather than adding to the inner budget, commit 7878c782c). The
 two are different bugs with the same root cause: treating augmentation as something done
 around the Krylov solve rather than inside it.
+
+## CORRECTION to the row above — the "13 orders of magnitude" figure was instance-specific and wrong
+
+Same day, before the fix was committed. The row above quantified the LGMRES split-vs-joint
+defect as joint 3.01e-14 against split 8.89e-01. **That figure does not generalise and
+should not be quoted.** It came from a single contrived instance in which the 4-dimensional
+Krylov space happened to nearly solve the 40x40 system by itself, so the joint space
+reached machine precision while the split path did not. It measured that instance, not the
+defect.
+
+Re-measured properly, with the transcription of the patched routine driven over many
+instances:
+
+| setting | old/new residual ratio |
+|---|---|
+| RANDOM augmentation vectors, 12 instances, n=60 | min 0.907, **median 1.059**, max 1.384 |
+| REALISTIC augmentation (corrections carried across 6 cycles of the same system) | **14.8x** (1.80e-10 against 2.66e-09) |
+
+Two honest conclusions, neither matching the withdrawn figure:
+
+ * With random augmentation directions the gain is about 6% at the median, and in 1 of 12
+   instances the augmented version was slightly WORSE (ratio 0.907). Random directions are
+   not informative, and putting them in the basis costs budget that Krylov directions
+   would have used.
+ * With the augmentation LGMRES actually stores -- corrections from previous cycles of the
+   same system -- the fix is worth about 15x on the final residual after six cycles. That
+   is the number to quote, and it is three orders of magnitude smaller than what the
+   previous row claimed.
+
+The defect is real and the fix is worth making. The magnitude I first attached to it was
+not measured, it was read off one lucky instance, and I am recording the correction rather
+than quietly replacing the number.
+
+**SEPARATELY CONFIRMED, AND THIS IS WHAT VALIDATES THE TRANSCRIPTION:** the patched
+routine's Givens solve is optimal over the space its own directions span -- residual ratio
+against an explicit least-squares solve over `span(A Z)` was 1.000000000 on three
+independent instances. That is the property that would break if the `Z`-versus-`V`
+distinction, the Givens bookkeeping, or the back-substitution were wrong.
