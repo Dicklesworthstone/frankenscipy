@@ -5,9 +5,15 @@
 //! hung thread cannot be killed from inside Rust. So each case runs in its own process and
 //! the OS `timeout` command is the only reliable executioner.
 //!
-//! Usage:  eig_sweep_probe <n> <seed>
-//! Exit 0 = converged, prints `OK n seed <residual>`. A timeout kill (124 from `timeout`)
-//! is the signal we are hunting.
+//! Usage:  eig_sweep_probe <n> <seed> [max_niter]
+//!
+//! Without `max_niter`: calls `fsci_linalg::eig` exactly as callers do. Exit 0 = converged,
+//! prints `OK n seed <residual>`. A timeout kill (124 from `timeout`) is the signal.
+//!
+//! With `max_niter`: calls nalgebra's `Schur::try_new` DIRECTLY with that bound, which is
+//! the only way to ask the question the timeout cannot answer — does the iteration NEVER
+//! converge, or does it converge after some huge but finite number of sweeps? A `timeout`
+//! kill proves neither. Prints `CONV n seed K` or `NOCONV n seed K`.
 //!
 //! `make_diag_dominant` is copied VERBATIM from
 //! `crates/fsci-conformance/src/metamorphic.rs` so the fixture is bit-identical to the one
@@ -29,8 +35,8 @@ fn make_diag_dominant(n: usize, seed: u64) -> Vec<Vec<f64>> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 3 {
-        eprintln!("usage: eig_sweep_probe <n> <seed>");
+    if args.len() < 3 || args.len() > 4 {
+        eprintln!("usage: eig_sweep_probe <n> <seed> [max_niter]");
         std::process::exit(2);
     }
     let n: usize = args[1].parse().expect("n");
@@ -38,6 +44,18 @@ fn main() {
 
     let a = make_diag_dominant(n, seed);
     let trace: f64 = (0..n).map(|i| a[i][i]).sum();
+
+    // Bounded mode: ask nalgebra directly whether it converges within K sweeps.
+    if let Some(k) = args.get(3) {
+        let max_niter: usize = k.parse().expect("max_niter");
+        let m = nalgebra::DMatrix::<f64>::from_fn(n, n, |i, j| a[i][j]);
+        let eps = f64::EPSILON;
+        match nalgebra::linalg::Schur::try_new(m, eps, max_niter) {
+            Some(_) => println!("CONV {n} {seed} {max_niter}"),
+            None => println!("NOCONV {n} {seed} {max_niter}"),
+        }
+        return;
+    }
 
     match eig(&a, DecompOptions::default()) {
         Ok(res) => {
