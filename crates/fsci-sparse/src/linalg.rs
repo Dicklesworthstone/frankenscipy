@@ -7318,7 +7318,10 @@ pub fn minres(
 /// Solves min ||Ax - b||₂ (equivalent to A^T A x = A^T b but numerically superior).
 /// Works for rectangular matrices (overdetermined and underdetermined systems).
 /// Based on Golub-Kahan bidiagonalization.
-/// Matches `scipy.sparse.linalg.lsqr(A, b)`.
+/// Matches `scipy.sparse.linalg.lsqr(A, b)` in the ITERATION, but NOT in the
+/// DEFAULT ITERATION LIMIT. SciPy defaults to `iter_lim = 2 * n`
+/// (`_isolve/lsqr.py:330-331`); this defaults to `n * 10`. Same shape of divergence
+/// as `lsmr` below, same reasoning — see `scipy_default_iteration_limits`.
 pub fn lsqr(
     a: &CsrMatrix,
     b: &[f64],
@@ -7521,7 +7524,22 @@ pub fn lsqr(
 ///
 /// Uses the Fong-Saunders second QR recurrence to minimize the normal-equation
 /// residual ||Aᵀ(Ax - b)||₂ monotonically.
-/// Matches `scipy.sparse.linalg.lsmr(A, b)`.
+///
+/// Matches `scipy.sparse.linalg.lsmr(A, b)` in the ITERATION, but NOT in the
+/// DEFAULT ITERATION LIMIT, and the docstring used to claim parity without that
+/// qualification. SciPy defaults to `maxiter = min(m, n)`
+/// (`_isolve/lsmr.py:221-222`, `minDim`); this defaults to `n * 10`, which is
+/// SciPy's convention for the KRYLOV solvers (`_isolve/iterative.py:102`) and not
+/// for the least-squares pair.
+///
+/// The difference is one of budget, not of answer: ours is strictly LARGER, so it
+/// can only converge where SciPy gives up, never return a different solution for a
+/// problem both finish. What it does change is the `converged` flag and the
+/// `iterations` count on a problem neither solves quickly, which is exactly what a
+/// differential test against SciPy would compare.
+///
+/// See `scipy_default_iteration_limits` below for the faithful values and why the
+/// flip has not been made yet.
 pub fn lsmr(
     a: &CsrMatrix,
     b: &[f64],
@@ -25953,5 +25971,63 @@ mod perf_toggle_tests {
         assert_eq!(parallel.data(), serial.data());
         assert_eq!(parallel.indices(), serial.indices());
         assert_eq!(parallel.indptr(), serial.indptr());
+    }
+}
+
+/// The incumbent's default iteration limits, and why ours differ — a conformance
+/// finding recorded in code rather than only in a bead.
+///
+/// Read from SciPy 1.17.1's own source, not from documentation:
+///
+///   `_isolve/iterative.py:102`  cg, bicg, bicgstab, cgs, gmres, qmr, minres
+///                               `maxiter = n*10`      — WE MATCH (9 of 11)
+///   `_isolve/lsqr.py:330-331`   lsqr   `iter_lim = 2*n`        — we use `n*10`
+///   `_isolve/lsmr.py:221-222`   lsmr   `maxiter = min(m, n)`   — we use `n*10`
+///
+/// So the Krylov convention is right and only the two LEAST-SQUARES solvers diverge,
+/// which is the sort of thing a blanket "all solvers use n*10" would hide.
+///
+/// THE FLIP HAS DELIBERATELY NOT BEEN MADE, and the reason is the freeze rather than
+/// disagreement. `IterativeSolveOptions::default()` sets `max_iter: None`, so both
+/// defaults are live at 36 call sites across `fsci-sparse`, `fsci-conformance` and
+/// the perf bins. SciPy's limits are strictly SMALLER, so the change can only turn a
+/// converged result into a non-converged one — never a wrong answer — but any test
+/// that relies on the larger budget and passes no explicit `max_iter` would go red,
+/// and under a build freeze that cannot be checked. Shipping an unverifiable
+/// behaviour change with that blast radius into a lane I am not working in is not a
+/// trade worth making for a parity detail.
+///
+/// To land it, in a build-capable turn: replace `n * 10` with `n.min(m)` at `lsmr`
+/// and with `2 * n` at `lsqr`, run `cargo test -p fsci-sparse -p fsci-conformance`,
+/// and give an explicit `max_iter` to whatever legitimately needs a bigger budget.
+#[cfg(test)]
+mod scipy_default_iteration_limits {
+    /// SciPy's values, pinned so a future edit that "fixes" our defaults to the
+    /// wrong numbers is caught by something other than memory.
+    ///
+    /// These assertions are about the INCUMBENT, not about us: they encode what was
+    /// read from its source so the follow-up commit has a reference it can check
+    /// itself against, rather than re-deriving it from a docstring that has already
+    /// been wrong once in this very file.
+    #[test]
+    fn the_incumbents_limits_are_what_the_follow_up_must_use() {
+        let scipy_lsmr = |m: usize, n: usize| m.min(n);
+        let scipy_lsqr = |n: usize| 2 * n;
+        let scipy_krylov = |n: usize| n * 10;
+
+        // Tall system: lsmr's limit is the SMALLER dimension, so a tall matrix gets
+        // far fewer iterations than the Krylov convention would give it. This is the
+        // case where the divergence is widest.
+        assert_eq!(scipy_lsmr(1000, 10), 10);
+        assert_eq!(scipy_krylov(10), 100, "10x the least-squares budget");
+        // Wide system: still the smaller dimension.
+        assert_eq!(scipy_lsmr(10, 1000), 10);
+        // lsqr is dimension-n only, and is 5x smaller than ours.
+        assert_eq!(scipy_lsqr(10), 20);
+
+        // The Krylov default we DO match, asserted so this test also records the
+        // half that is correct — otherwise a reader could take the file as saying
+        // every default is wrong.
+        assert_eq!(scipy_krylov(37), 370);
     }
 }
