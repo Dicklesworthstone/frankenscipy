@@ -15,7 +15,7 @@ pub mod cossin;
 // accident. Uncomment and run:
 //   RCH_REQUIRE_REMOTE=1 RCH_CARGO_WRAPPER_BYPASS=1 env -u CARGO_TARGET_DIR \
 //     rch exec -- cargo test -p fsci-linalg --lib -- --nocapture hessenberg_qr
-// mod hessenberg_qr;
+mod hessenberg_qr;
 
 // Worker reuse across a factorization's panels; substrate for frankenscipy-ua3gn,
 // not yet wired into any factorization. See panel_pool.rs.
@@ -6373,6 +6373,34 @@ fn schur_magnitude_scale(t: &DMatrix<f64>, rows: usize) -> f64 {
 /// This is a ROBUSTNESS fix, not a parity fix. It converts a hang into a catchable error;
 /// it does not recover the eigenvalues SciPy returns for those matrices. The underlying
 /// non-convergence is still open on `frankenscipy-sez4r`.
+/// Route `eig` through the in-crate Francis QR (`hessenberg_qr`) instead of
+/// nalgebra's Schur — `frankenscipy-sez4r`.
+///
+/// Default `false`: `bounded_schur` remains the shipped path until the new
+/// iteration has been compiled and checked against the named fixtures.
+///
+/// CONTRACT: NOT BIT-IDENTICAL, and deliberately so. The two arms are DIFFERENT
+/// ALGORITHMS — nalgebra's shift-free implicit double-shift QR versus a Francis
+/// double-shift with LAPACK's exceptional shifts — so they take different numbers
+/// of sweeps with different shifts and their roundings cannot agree bit for bit.
+/// Expect agreement to about 1e-12 relative on inputs where BOTH converge, and
+/// expect the EIGENVALUE ORDER to differ, since deflation order is a property of
+/// the iteration.
+///
+/// THIS CORRECTS MY OWN PLAN. The note recorded on sez4r for this step asked for a
+/// "bit-identity gate on the cases that already converge". That was overstated: no
+/// gate of that kind can pass between two distinct iterations, and had it been
+/// written as specified it would have failed for the right reason and been
+/// misread as a defect in the new path. The gate is a tolerance gate on the SORTED
+/// spectrum plus the trace identity, which is what actually distinguishes "same
+/// answer, different arithmetic path" from "different answer".
+///
+/// On inputs where nalgebra does NOT converge there is nothing to compare: the old
+/// arm returns `ConvergenceFailure` and the new one is expected to return a
+/// spectrum. That asymmetry is the entire point of the change.
+pub static EIG_USE_FRANCIS_SCHUR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn bounded_schur(
     m: DMatrix<f64>,
 ) -> Result<nalgebra::linalg::Schur<f64, Dyn>, LinalgError> {
@@ -6385,6 +6413,35 @@ fn bounded_schur(
             ),
         }
     })
+}
+
+
+/// Produce the `(Q, T)` pair `eig` consumes, from whichever iteration is selected.
+///
+/// Both arms return the SAME SHAPE, so everything downstream — the block scan, the
+/// complex-pair detection, the eigenvector back-substitution — is shared and
+/// untouched. That is the reason `hessenberg_qr` returns a Schur pair rather than
+/// eigenvalues alone: the defect on sez4r is in the iteration, so only the
+/// iteration is replaced.
+fn eig_schur_pair(
+    a: &[Vec<f64>],
+    matrix: &DMatrix<f64>,
+) -> Result<(DMatrix<f64>, DMatrix<f64>), LinalgError> {
+    if EIG_USE_FRANCIS_SCHUR.load(std::sync::atomic::Ordering::Relaxed) {
+        let n = a.len();
+        // `real_schur_francis` budgets PER EIGENVALUE and multiplies by n, while
+        // `bounded_schur` budgets a TOTAL. Convert so the new arm is never given a
+        // smaller budget than the old one: for n >= 10 this is LAPACK's 30, and for
+        // small n it rounds up to preserve bounded_schur's floor of 30*10.
+        let per_eigenvalue = (30 * n.max(10)).div_ceil(n.max(1));
+        let (_eigs, t_rows, z_rows) =
+            crate::hessenberg_qr::real_schur_francis(a, f64::EPSILON, per_eigenvalue)?;
+        let t = dmatrix_from_rows(&t_rows)?;
+        let q = dmatrix_from_rows(&z_rows)?;
+        return Ok((q, t));
+    }
+    let schur = bounded_schur(matrix.clone())?;
+    Ok(schur.unpack())
 }
 
 pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgError> {
@@ -6408,7 +6465,7 @@ pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgEr
     // Use Schur decomposition: A = Q T Q^T, eigenvalues on diagonal of T
     // For real matrices, Schur form has 1×1 blocks (real eigenvalues) and
     // 2×2 blocks (complex conjugate pairs) on the diagonal.
-    let schur = bounded_schur(matrix.clone())?;    let (q_mat, t_mat) = schur.unpack();
+    let (q_mat, t_mat) = eig_schur_pair(a, &matrix)?;
 
     let mut eigenvalues_re = Vec::with_capacity(rows);
     let mut eigenvalues_im = Vec::with_capacity(rows);
@@ -40847,5 +40904,129 @@ mod toggle_ab_eigh_rank2_update {
              the reduction feeds the back-transform, so vectors are the more \
              sensitive check of the two"
         );
+    }
+}
+
+/// frankenscipy-sez4r — driver for `EIG_USE_FRANCIS_SCHUR`.
+///
+/// Both arms are compared on inputs where the OLD one already converges, which is
+/// the only place a comparison is meaningful: on the fixtures nalgebra cannot do,
+/// the old arm returns `ConvergenceFailure` and there is nothing to compare against.
+#[cfg(test)]
+mod toggle_ab_eig_francis_schur {
+    use super::{DecompOptions, EIG_USE_FRANCIS_SCHUR, LinalgError, eig};
+    use std::sync::atomic::Ordering;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn make_diag_dominant(n: usize, seed: u64) -> Vec<Vec<f64>> {
+        let mut a = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                let r = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000) as f64
+                    / 1000.0;
+                a[i][j] = if i == j { (n as f64) * 2.0 + r } else { r - 0.5 };
+            }
+        }
+        a
+    }
+
+    /// The two arms are DIFFERENT ALGORITHMS, so this is a tolerance gate on the
+    /// SORTED spectrum, not a bit-identity gate.
+    ///
+    /// My own plan note on sez4r asked for bit-identity here. That was wrong and is
+    /// corrected at the toggle's doc: nalgebra's shift-free iteration and a Francis
+    /// sweep with exceptional shifts take different numbers of steps with different
+    /// shifts, so their roundings cannot agree bit for bit, and the deflation ORDER
+    /// differs too. Sorting first is therefore part of the comparison, not a
+    /// convenience.
+    #[test]
+    fn francis_arm_agrees_with_nalgebra_where_both_converge() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        for (n, seed) in [(5usize, 0u64), (6, 0), (8, 42), (8, 999), (4, 7)] {
+            let a = make_diag_dominant(n, seed);
+
+            EIG_USE_FRANCIS_SCHUR.store(false, Ordering::Relaxed);
+            let old = eig(&a, DecompOptions::default())
+                .unwrap_or_else(|e| panic!("({n},{seed}) baseline arm regressed: {e:?}"));
+            EIG_USE_FRANCIS_SCHUR.store(true, Ordering::Relaxed);
+            let new = eig(&a, DecompOptions::default());
+            EIG_USE_FRANCIS_SCHUR.store(false, Ordering::Relaxed);
+
+            let new = new.unwrap_or_else(|e| {
+                panic!(
+                    "({n},{seed}) converges under nalgebra but NOT under the Francis \
+                     arm: {e:?}. That is a regression, not a robustness win -- the new \
+                     iteration must be a superset of the old one's successes"
+                )
+            });
+
+            let mut a_re = old.eigenvalues_re.clone();
+            let mut b_re = new.eigenvalues_re.clone();
+            a_re.sort_by(f64::total_cmp);
+            b_re.sort_by(f64::total_cmp);
+            assert_eq!(a_re.len(), b_re.len(), "({n},{seed}) eigenvalue count differs");
+
+            let scale = a_re.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+            for (i, (x, y)) in a_re.iter().zip(&b_re).enumerate() {
+                assert!(
+                    (x - y).abs() < 1e-9 * scale,
+                    "({n},{seed}) sorted eigenvalue {i} differs beyond tolerance: \
+                     {x} vs {y}"
+                );
+            }
+
+            // The trace identity is checked on the NEW arm independently, because
+            // agreeing with the old arm is not the same as being right -- if both
+            // paths shared an upstream defect this comparison would pass on two
+            // identically wrong spectra.
+            let trace: f64 = (0..n).map(|i| a[i][i]).sum();
+            let sum: f64 = new.eigenvalues_re.iter().sum();
+            assert!(
+                (sum - trace).abs() < 1e-9 * (trace.abs() + 1.0),
+                "({n},{seed}) Francis arm breaks the trace identity: {sum} vs {trace}"
+            );
+        }
+    }
+
+    /// MUST-HIT on the toggle itself: the five fixtures that nalgebra cannot do
+    /// must FAIL on the default arm and SUCCEED on the Francis arm. Without this
+    /// the tolerance test above would pass unchanged if the toggle did nothing at
+    /// all, since it only exercises inputs both arms handle.
+    #[test]
+    fn the_toggle_changes_behaviour_on_the_non_converging_fixtures() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        for (n, seed) in [(5usize, 201u64), (5, 213), (5, 234), (6, 319), (6, 335)] {
+            let a = make_diag_dominant(n, seed);
+
+            EIG_USE_FRANCIS_SCHUR.store(false, Ordering::Relaxed);
+            let old = eig(&a, DecompOptions::default());
+            EIG_USE_FRANCIS_SCHUR.store(true, Ordering::Relaxed);
+            let new = eig(&a, DecompOptions::default());
+            EIG_USE_FRANCIS_SCHUR.store(false, Ordering::Relaxed);
+
+            assert!(
+                matches!(old, Err(LinalgError::ConvergenceFailure { .. })),
+                "({n},{seed}) was expected to be a non-converging fixture for the \
+                 default arm; if it now converges the fixture set is stale and this \
+                 test is no longer testing the toggle"
+            );
+            let new = new.unwrap_or_else(|e| {
+                panic!(
+                    "({n},{seed}) still does not converge on the Francis arm: {e:?}. \
+                     The exceptional shifts are then not the answer, and the sez4r \
+                     diagnosis is wrong rather than incomplete"
+                )
+            });
+            let trace: f64 = (0..n).map(|i| a[i][i]).sum();
+            let sum: f64 = new.eigenvalues_re.iter().sum();
+            assert!(
+                (sum - trace).abs() < 1e-9 * (trace.abs() + 1.0),
+                "({n},{seed}) Francis arm converged to a spectrum that breaks the \
+                 trace identity: {sum} vs {trace}"
+            );
+        }
     }
 }
