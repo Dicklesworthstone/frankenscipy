@@ -59497,6 +59497,322 @@ mod discrete_alias_urn_matches_scipy {
     }
 }
 
+/// Discrete sampling and quantiles by indexed search over a guide table.
+///
+/// Matches `scipy.stats.sampling.DiscreteGuideTable(pv, domain=..., guide_factor=...)`.
+///
+/// A cumulative table gives `ppf(u) = min{ i : cdf[i] ≥ u }`, which is O(log k) by
+/// binary search. The guide table makes it O(1) amortised: `m = guide_factor · k`
+/// evenly spaced entries record where to START the search for a `u` in each
+/// `[j/m, (j+1)/m)` slice, so the forward scan from there is short and bounded on
+/// average by `1/guide_factor`.
+///
+/// # How this differs from [`DiscreteAliasUrn`], and why both exist
+///
+/// The alias method draws in O(1) but has NO quantile — its table is a set of
+/// paired buckets, not an ordering, so there is nothing to invert. The guide table
+/// costs a short scan per draw and in exchange gives `ppf`, which is what you need
+/// for common random numbers, for coupling two samplers on one uniform stream, and
+/// for quasi-Monte-Carlo input. Neither dominates; they are different tools.
+///
+/// # The `≥` in `min{ i : cdf[i] ≥ u }` is not a detail
+///
+/// It is inclusive, matching SciPy: for `pv = [0.1, 0.4, 0.3, 0.2]`, `ppf(0.1)` is
+/// 0 and not 1, and `ppf(0.5)` is 1 and not 2. Flipping it to `>` shifts the whole
+/// quantile function by one index at every internal boundary — a bug invisible to
+/// any sampling test, since the boundaries are a measure-zero set of uniforms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscreteGuideTable {
+    /// Cumulative probabilities, ascending, with the last pinned to exactly 1.0.
+    cdf: Vec<f64>,
+    /// `guide[j]` is the smallest `i` with `cdf[i] ≥ j/m`.
+    guide: Vec<usize>,
+    /// Normalised probabilities.
+    probabilities: Vec<f64>,
+    /// First value of the support.
+    offset: i64,
+}
+
+impl DiscreteGuideTable {
+    /// Build from an unnormalised probability vector.
+    ///
+    /// `guide_factor` is the guide entries per support point; SciPy's default is
+    /// 1. Larger trades memory for a shorter scan.
+    ///
+    /// # Errors
+    ///
+    /// An empty vector, a non-finite or negative weight, a total of zero, or a
+    /// non-positive, non-finite `guide_factor`.
+    pub fn new(pv: &[f64], domain_start: i64, guide_factor: f64) -> Result<Self, StatsError> {
+        let k = pv.len();
+        if k == 0 {
+            return Err(StatsError::InvalidArgument(
+                "the probability vector must be non-empty".to_string(),
+            ));
+        }
+        if pv.iter().any(|p| !p.is_finite() || *p < 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "probabilities must be finite and non-negative".to_string(),
+            ));
+        }
+        if !(guide_factor > 0.0) || !guide_factor.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "guide_factor must be positive and finite, got {guide_factor}"
+            )));
+        }
+        let total: f64 = pv.iter().sum();
+        if !(total > 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "the probability vector carries no mass".to_string(),
+            ));
+        }
+        let probabilities: Vec<f64> = pv.iter().map(|p| p / total).collect();
+
+        let mut cdf = Vec::with_capacity(k);
+        let mut acc = 0.0;
+        for &p in &probabilities {
+            acc += p;
+            cdf.push(acc);
+        }
+        // Pin the top. Accumulated rounding can leave the last entry a few ulps
+        // below 1.0, and then a `u` in that gap would scan off the end.
+        cdf[k - 1] = 1.0;
+
+        let m = ((guide_factor * k as f64).ceil() as usize).max(1);
+        let mut guide = vec![0_usize; m];
+        let mut i = 0_usize;
+        for (j, g) in guide.iter_mut().enumerate() {
+            // CONSERVATIVE target. At lookup `j = floor(u·m)` guarantees `u ≥ j/m`
+            // in REAL arithmetic, but `j as f64 / m as f64` can round UP by up to
+            // half an ulp — leaving a sliver of `u` that maps to `j` while sitting
+            // below the value the guide was built against. Starting the scan too
+            // early is always safe (it only moves forward); starting too late
+            // returns a wrong index. So nudge the target down.
+            let t = j as f64 / m as f64;
+            let target = t - t * f64::EPSILON;
+            while i < k - 1 && cdf[i] < target {
+                i += 1;
+            }
+            *g = i;
+        }
+
+        Ok(Self {
+            cdf,
+            guide,
+            probabilities,
+            offset: domain_start,
+        })
+    }
+
+    /// The normalised probability of each support point, in order.
+    #[must_use]
+    pub fn pmf(&self) -> &[f64] {
+        &self.probabilities
+    }
+
+    /// Inclusive `(first, last)` values of the support.
+    #[must_use]
+    pub fn support(&self) -> (i64, i64) {
+        (self.offset, self.offset + self.probabilities.len() as i64 - 1)
+    }
+
+    /// `min{ i : cdf[i] ≥ u }`, shifted onto the support. `u ≤ 0` gives the first
+    /// point, `u ≥ 1` the last; a NaN `u` gives the first, since every comparison
+    /// against it is false.
+    #[must_use]
+    pub fn ppf(&self, u: f64) -> i64 {
+        let k = self.cdf.len();
+        if !(u > 0.0) {
+            return self.offset;
+        }
+        if u >= 1.0 {
+            return self.offset + k as i64 - 1;
+        }
+        let m = self.guide.len();
+        let j = ((u * m as f64) as usize).min(m - 1);
+        let mut i = self.guide[j];
+        // `u >= j/m` and `guide[j]` is the first index reaching `j/m`, so the
+        // answer is at or after it — the scan only ever moves forward.
+        while i < k - 1 && self.cdf[i] < u {
+            i += 1;
+        }
+        self.offset + i as i64
+    }
+
+    /// One draw.
+    pub fn sample_one(&self, rng: &mut impl Rng) -> i64 {
+        self.ppf(rng.random::<f64>())
+    }
+
+    /// `n` draws.
+    #[must_use]
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<i64> {
+        (0..n).map(|_| self.sample_one(rng)).collect()
+    }
+}
+
+#[cfg(test)]
+mod discrete_guide_table_matches_scipy {
+    use super::{DiscreteAliasUrn, DiscreteGuideTable};
+    use rand::{SeedableRng, rngs::StdRng};
+
+    const PV: [f64; 4] = [0.1, 0.4, 0.3, 0.2];
+
+    /// The guide table is an optimisation of a search, so the test is whether it
+    /// finds what an exhaustive search finds — checked EXACTLY over a dense grid
+    /// rather than sampled.
+    #[test]
+    fn ppf_agrees_with_exhaustive_search_everywhere() {
+        for gf in [0.25, 1.0, 4.0] {
+            let t = DiscreteGuideTable::new(&PV, 0, gf).expect("valid");
+            // The reference cdf must be built the SAME way the implementation
+            // builds its own -- normalised by the total and with the top pinned to
+            // 1.0. Accumulating the raw weights instead would leave the two
+            // differing by an ulp at the last entry, and this test would fail on
+            // that rather than on anything about the guide table.
+            let total: f64 = PV.iter().sum();
+            let mut cdf: Vec<f64> = PV
+                .iter()
+                .scan(0.0, |a, p| {
+                    *a += p / total;
+                    Some(*a)
+                })
+                .collect();
+            cdf[PV.len() - 1] = 1.0;
+            for step in 1..=20_000_u32 {
+                let u = f64::from(step) / 20_000.0;
+                let want = cdf
+                    .iter()
+                    .position(|&c| c >= u)
+                    .unwrap_or(PV.len() - 1) as i64;
+                let got = t.ppf(u);
+                assert!(
+                    got == want,
+                    "guide_factor {gf}: ppf({u}) = {got}, exhaustive search = {want}"
+                );
+            }
+        }
+    }
+
+    /// scipy's published values, and the boundary convention they pin.
+    ///
+    /// `min{i : cdf[i] >= u}` is INCLUSIVE. At u = 0.1 and u = 0.5 -- exactly on
+    /// cdf entries -- an exclusive `>` would return 1 and 2 instead of 0 and 1.
+    /// No sampling test could see that: the boundaries are a measure-zero set.
+    #[test]
+    fn the_boundary_convention_matches_scipy() {
+        let t = DiscreteGuideTable::new(&PV, 0, 1.0).expect("valid");
+        for (u, want) in [
+            (0.05, 0),
+            (0.1, 0),
+            (0.5, 1),
+            (0.8, 2),
+            (0.95, 3),
+        ] {
+            assert_eq!(t.ppf(u), want, "scipy ppf({u}) is {want}");
+        }
+        // Each support point owns the half-open interval (cdf[i-1], cdf[i]], and
+        // its width IS its probability. Probing both sides of every internal
+        // boundary is what makes the whole quantile function pinned, not just the
+        // five points above.
+        let mut acc = 0.0;
+        for (i, &p) in PV.iter().enumerate() {
+            let lo = acc;
+            acc += p;
+            assert_eq!(t.ppf(acc), i as i64, "the upper edge belongs to {i}");
+            assert_eq!(
+                t.ppf(lo + (acc - lo) * 0.5),
+                i as i64,
+                "the interior belongs to {i}"
+            );
+            if i + 1 < PV.len() {
+                assert_eq!(
+                    t.ppf(acc + 1e-12),
+                    i as i64 + 1,
+                    "just past the edge belongs to {}",
+                    i + 1
+                );
+            }
+        }
+        // Out of range and NaN.
+        assert_eq!(t.ppf(0.0), 0);
+        assert_eq!(t.ppf(-1.0), 0);
+        assert_eq!(t.ppf(1.0), 3);
+        assert_eq!(t.ppf(2.0), 3);
+        assert_eq!(t.ppf(f64::NAN), 0);
+    }
+
+    /// CROSS-CHECK against the alias urn: two unrelated algorithms, built from the
+    /// same weights, must agree on the distribution. The guide table's implied
+    /// probability for `i` is the width of its half-open interval; the urn's comes
+    /// from its bucket-and-alias table. Neither is derived from the other.
+    #[test]
+    fn the_two_discrete_samplers_agree_on_the_distribution() {
+        for pv in [
+            vec![0.1, 0.4, 0.3, 0.2],
+            vec![1.0],
+            vec![7.0, 1.0, 1.0, 1.0],
+            vec![1.0, 0.0, 3.0],
+        ] {
+            let urn = DiscreteAliasUrn::new(&pv, 0).expect("valid");
+            let tab = DiscreteGuideTable::new(&pv, 0, 1.0).expect("valid");
+            assert_eq!(urn.pmf(), tab.pmf(), "normalisation differs for {pv:?}");
+            for i in 0..pv.len() {
+                let from_urn = urn.table_probability(i);
+                let from_tab = tab.pmf()[i];
+                assert!(
+                    (from_urn - from_tab).abs() < 1e-15,
+                    "{pv:?}: alias table gives {from_urn} for {i}, guide table {from_tab}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draws_and_domain_and_validation() {
+        let t = DiscreteGuideTable::new(&PV, 0, 1.0).expect("valid");
+        let mut rng = StdRng::seed_from_u64(20260818);
+        let n = 200_000;
+        let mut counts = [0usize; 4];
+        for d in t.sample(n, &mut rng) {
+            assert!((0..4).contains(&d), "draw {d} outside the support");
+            counts[d as usize] += 1;
+        }
+        for (i, &want) in PV.iter().enumerate() {
+            let got = counts[i] as f64 / n as f64;
+            let se = (want * (1.0 - want) / n as f64).sqrt();
+            assert!(
+                (got - want).abs() < 5.0 * se,
+                "index {i}: empirical {got}, requested {want}"
+            );
+        }
+
+        // domain start, as scipy's `domain=(5, 6)`; scipy's ppf(0.5) there is 6.
+        let shifted = DiscreteGuideTable::new(&[1.0, 3.0], 5, 1.0).expect("valid");
+        assert_eq!(shifted.support(), (5, 6));
+        assert_eq!(shifted.ppf(0.5), 6);
+        assert_eq!(shifted.ppf(0.25), 5);
+
+        // A zero-weight point is never returned: its interval has zero width.
+        let sparse = DiscreteGuideTable::new(&[1.0, 0.0, 1.0], 0, 1.0).expect("valid");
+        for step in 1..=5000_u32 {
+            assert_ne!(
+                sparse.ppf(f64::from(step) / 5000.0),
+                1,
+                "a zero-weight point was returned"
+            );
+        }
+
+        assert!(DiscreteGuideTable::new(&[], 0, 1.0).is_err(), "empty");
+        assert!(DiscreteGuideTable::new(&[1.0, -1.0], 0, 1.0).is_err(), "negative");
+        assert!(DiscreteGuideTable::new(&[0.0, 0.0], 0, 1.0).is_err(), "no mass");
+        assert!(DiscreteGuideTable::new(&PV, 0, 0.0).is_err(), "guide_factor 0");
+        assert!(DiscreteGuideTable::new(&PV, 0, -1.0).is_err(), "guide_factor < 0");
+        // MUST-MISS control for the guide_factor guard.
+        assert!(DiscreteGuideTable::new(&PV, 0, 0.5).is_ok(), "0.5 is legal");
+    }
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
@@ -63916,6 +64232,92 @@ mod tests {
     // rather than assumed. Deep-tail quantiles (q = 1e-10 and q = 1-1e-6) are
     // included deliberately -- that is where a bracket-width-terminated inverse
     // fails while every central quantile still looks fine.
+
+    /// Perturb a golden by enough to break any tolerance these suites declare.
+    ///
+    /// Pure and env-free so it can be tested directly; [`negative_control`] decides
+    /// WHEN to apply it. The additive term is not decoration: a golden of exactly 0.0
+    /// is unperturbable by multiplication, and a control that silently fails to perturb
+    /// is worse than no control, because it reports a passing "failing arm".
+    #[cfg(test)]
+    fn perturb_for_control(golden: f64) -> f64 {
+        golden * (1.0 + 1e-6) + 1e-300
+    }
+
+    /// Return `golden`, or a deliberately wrong value when a control is armed for
+    /// `label` via the `FSCI_NEGATIVE_CONTROL` environment variable.
+    ///
+    /// # Why this exists
+    ///
+    /// The standing two-arm rule requires observing the FAILING arm, and the usual way
+    /// to get one is to edit a golden constant, run, and restore. That is what put a red
+    /// golden on `main` (frankenscipy-hld7v): an auto-commit swept the perturbed value
+    /// mid-window and shipped it under the message "correct gamma ppf(1e-10) scipy
+    /// golden digit", which asserts the opposite of what the diff did. The hazard is
+    /// structural rather than a slip -- the verification standard REQUIRES transiting
+    /// through a state where the tree is deliberately wrong, so any sweep-the-tree
+    /// auto-commit will eventually capture one, and the diff looks like a plausible
+    /// constant tweak.
+    ///
+    /// This removes the window instead of shortening it. The perturbation lives in the
+    /// environment, never in the file, so there is nothing to sweep, nothing to restore,
+    /// and no moment at which a commit of this path would be wrong. Arm it with
+    /// `FSCI_NEGATIVE_CONTROL=<label>` (or `ALL`), run, observe the failure, unset.
+    ///
+    /// It announces itself on stderr because a silent perturbation would let a run that
+    /// believes it is checking the real golden report success against a fake one.
+    #[cfg(test)]
+    fn negative_control(label: &str, golden: f64) -> f64 {
+        match std::env::var("FSCI_NEGATIVE_CONTROL") {
+            Ok(armed) if armed == label || armed == "ALL" => {
+                let perturbed = perturb_for_control(golden);
+                eprintln!(
+                    "NEGATIVE CONTROL ARMED [{label}]: golden {golden:e} -> {perturbed:e}; \
+                     this run is EXPECTED to fail and proves nothing if it passes"
+                );
+                perturbed
+            }
+            _ => golden,
+        }
+    }
+
+    /// The control mechanism itself needs both arms, or it is one more thing asserting
+    /// its own correctness.
+    #[test]
+    fn the_negative_control_perturbs_enough_to_break_the_tolerances_it_guards() {
+        // MUST-HIT: the perturbation exceeds every tolerance these suites declare. The
+        // loosest in the gamma/beta golden test is 1e-9.
+        for golden in [0.000_503_653_813_032_831_1_f64, 1.0, 28.0, -3.5, 1e-300] {
+            let p = perturb_for_control(golden);
+            let denom = golden.abs().max(f64::MIN_POSITIVE);
+            let rel = (p - golden).abs() / denom;
+            assert!(
+                rel > 1e-9,
+                "perturbing {golden:e} gave {p:e}, a relative change of {rel:e} which \
+                 would NOT break a 1e-9 tolerance -- the failing arm would pass"
+            );
+        }
+        // The zero case is why the additive term is there; multiplication alone leaves
+        // it untouched and the control would silently do nothing.
+        assert_ne!(
+            perturb_for_control(0.0),
+            0.0,
+            "a zero golden was left unperturbed"
+        );
+
+        // MUST-MISS: with nothing armed the golden is returned BIT-identically, so an
+        // ordinary run is unaffected. Reading the env here rather than setting it keeps
+        // this free of the process-global races that setting it would introduce.
+        let g = 0.000_503_653_813_032_831_1_f64;
+        if std::env::var("FSCI_NEGATIVE_CONTROL").is_err() {
+            assert_eq!(
+                negative_control("gamma_ppf_1e-10", g).to_bits(),
+                g.to_bits(),
+                "an unarmed control altered the golden"
+            );
+        }
+    }
+
     #[test]
     fn gamma_beta_pdf_cdf_ppf_match_exact_scipy_values() {
         // Relative comparison: these span ~1e-4 to ~28, so a single absolute
@@ -63955,6 +64357,12 @@ mod tests {
             (0.975, 10.114_998_160_055_01),
             (0.999_999, 27.638_164_072_373_63),
         ] {
+            // Routed through `negative_control` so the failing arm can be produced
+            // WITHOUT editing this constant. `ppf(1e-10)` is the exact golden an
+            // auto-commit swept mid-control and pushed red to main (frankenscipy-hld7v);
+            // it is wired first because it is the one that has already been damaged
+            // once. Arm with `FSCI_NEGATIVE_CONTROL=gamma_ppf`.
+            let want = negative_control("gamma_ppf", want);
             close(g.ppf(q), want, 1e-9, &format!("gamma ppf({q})"));
         }
 
