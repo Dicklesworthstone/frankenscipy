@@ -36498,3 +36498,47 @@ stale directions, which costs more the larger the space is.
 against no augmentation. At n=16384 both of our arms hit the identical 841-evaluation cap,
 and at that equal budget LGMRES reaches 1.297e-7 where plain GMRES reaches 1.300e0: seven
 orders of magnitude, same cost. The mechanism is right; the basis construction is not.
+
+## `fsci-sparse::lgmres` is not LGMRES — the augmentation never enters the minimisation
+
+2026-08-18, source read plus a numpy quantification; no rebuild involved, so the disk
+throttle does not bear on it. Host quiet at the time: loadavg 4.85/11.94/24.82, CPU
+MHz 3800-4200 range.
+
+`crates/fsci-sparse/src/linalg.rs::lgmres` carries the docstring "Matches
+`scipy.sparse.linalg.lgmres(A, b)`". It does not. What it does, per outer cycle, is:
+
+ 1. project the residual onto each stored `(z, Az)` pair SEQUENTIALLY, updating `x`;
+ 2. run an **unaugmented** inner GMRES on the deflated residual;
+ 3. store the correction for the next cycle.
+
+Real LGMRES (`scipy`'s `_fgmres`, shared with `gcrotmk`) puts the augmentation vectors
+INTO THE ARNOLDI BASIS, so the least-squares step minimises over
+`span(outer_v) + K_m(A, r0)` **jointly**. Minimising over one subspace and then the other
+is equal to the joint minimisation only when the two are A-orthogonal, which they are not.
+
+**QUANTIFIED, AND IT REORDERED WHAT IS WORTH FIXING.** On a 40x40 diagonally dominant
+system with `outer_k = 3` and a 4-dimensional Krylov space:
+
+| what | residual |
+|---|---|
+| joint minimisation over `span(outer_v) + K_m` | 3.01e-14 |
+| span-then-Krylov, i.e. what this code does | 8.89e-01 |
+
+That is the whole defect. By contrast the *sequential* projection in step 1 — which is
+not an orthogonal projection onto the span, since the `Az` vectors are never
+orthogonalised against each other — costs a ratio of **1.0006** against a true span
+projection, even at `max|cos| = 0.43` between the stored directions. Iterating the
+sequential sweep 50 times reproduces the span projection exactly, confirming a single
+sweep is the only shortfall and that it is negligible.
+
+**I WAS ABOUT TO FIX THE HARMLESS ONE.** Orthogonalising the `Az` vectors is the small,
+obvious, self-contained change, and it buys 0.06%. Measuring first is what stopped it
+from being committed as though it mattered. The structural fix — passing `outer_v` into
+the inner iteration so the Arnoldi basis is genuinely augmented — is the only change that
+addresses the 13-order gap, and it is not small.
+
+Related: the same defect CLASS was just found and fixed in `fsci-opt`'s `KrylovJacobian`
+(augmentation consuming rather than adding to the inner budget, commit 7878c782c). The
+two are different bugs with the same root cause: treating augmentation as something done
+around the Krylov solve rather than inside it.
