@@ -36133,3 +36133,52 @@ and this window was better than described.
   toggles read once per call in a function that is *itself* called per element — the
   scanner's scope is lexical, and that shape would pass it while costing the same. No such
   case was looked for here.
+
+## 2026-08-18 - PeachSummit (cc) - PASS 2 FINDS WHAT PASS 1 STRUCTURALLY CANNOT: a per-pixel toggle read in ndimage's sample_interpolated - and my first two control sets both passed while the probe was broken
+
+- **Bead: `frankenscipy-22van` (filed by this row).** **Result class: BEHAVIORAL
+  (source-structural).** **NO BUILD, NO TIMING.** frankenscipy's one build slot was held
+  by an unrelated conformance run throughout. **Probe:
+  `scripts/audit_toggle_reads_in_loops.py --callsites`**, `--selftest` **PASS 5/5 (pass 1)
+  + 4/4 (pass 2)**. `df -h /data` **61G**. `loadavg` 9.01/11.13/11.28.
+  `host_identity=thinkstation1`, `same_host=thinkstation1`. **No C BLAS/LAPACK/MKL.**
+  Nothing deleted.
+- **THE GAP THIS CLOSES WAS NAMED IN MY OWN PRIOR ROW.** That row recorded, as explicitly
+  NOT established, that "a toggle read once per call, in a function that is itself called
+  per element, would pass this scanner while costing the same. No such case was looked
+  for." This is that search.
+- **OBSERVED:** 301 fns hold a top-level toggle read (unambiguous names, shipping files
+  only: **86 of 1657** `.rs` files); **18** are called from inside a loop; hand-reading all
+  18 leaves **3** that are per-element or near it.
+
+  | site | read | frequency |
+  |---|---|---|
+  | `fsci-ndimage/src/lib.rs:1920` `sample_interpolated` | `NDIMAGE_SPLINE_OFFSET_DISABLE` | **per PIXEL** (called from `shift`:9745 and the parallel closure above it) |
+  | `fsci-ndimage/src/lib.rs:1818` `compute_axis_support` | `NDIMAGE_BSPLINE_COMPACT_DISABLE` | **per AXIS per PIXEL** (from `sample_interpolated`:1922) |
+  | `fsci-ndimage/src/lib.rs:7571` `median_of_values` | `MEDIAN_FORCE_SORT` | per GROUP; each call does `to_vec()` + quickselect, so expect little |
+
+  The other 15 are per-step / per-panel / per-iteration / per-axis and are not worth touching.
+- **THE FIRST SITE IS THE SAME MECHANISM AS THE SPLU ONE, not merely the same shape.** The
+  toggle decides BOTH whether taps are pre-multiplied by stride AND which leaf consumes
+  them — it gates a branch the compiler could otherwise specialise out of the pixel loop.
+  The geometric transforms are the per-pixel hot path of this module. **This row claims
+  no speed and measures no time.** **Unmeasured**: whether the
+  hoist pays is a build question and the bead preregisters a gate that bounds BOTH read
+  frequency AND specialisation, because a gate that checks one of two costs licenses
+  nothing (`frankenscipy-xup61`).
+- **AND THE METHODOLOGICAL RESULT, which cost two wrong answers before a right one.** Pass
+  2's first run returned **1533 hits** and every one was noise: it matched generic names
+  (`new(`, `solve(`, `run(`) and attributed each to one arbitrary definition, so `Vec::new`
+  calls in benches "read" an interpolate toggle. **My controls passed anyway.** They used a
+  uniquely-named helper, so both arms varied LOOP CONTEXT and neither varied NAME
+  RESOLUTION — the dimension that was broken. Second run returned 28, of which **10 were
+  A/B verification tests** that toggle in a loop by design; the `#[cfg(test)]` in those
+  files sits several lines above `mod tests` and my adjacency-based filter cleared on a
+  tidy synthetic and failed on the real shape.
+- **SO: TWO ARMS PROVE NOTHING IF THE ARMS ARE CHOSEN KINDLY.** A control built from an
+  idealised snippet validates the easy dimension. Both fixes are now controls in
+  `--selftest`: an ambiguous name must be DROPPED, and a `#[cfg(test)]` attribute NOT
+  adjacent to its `mod` must still be excluded. 1533 -> 28 -> 18, and the 18 were read.
+- **NOT ESTABLISHED.** The scanner resolves only names defined exactly once tree-wide and
+  cannot see trait dispatch, function pointers, or stored closures; instances may exist
+  that it cannot reach. It has no trip counts — "inside a loop" was narrowed to 3 by hand.
