@@ -149,6 +149,26 @@ impl BoundedPlanCache {
         true
     }
 
+    /// Store under `config`, WHICH ALSO REPLACES THE CACHE'S CONFIG.
+    ///
+    /// The config change is persistent, not scoped to this call, and on the
+    /// process-global cache that is load-bearing rather than incidental
+    /// (`frankenscipy-6d400`). `shared_cache_roundtrip_works` depends on it: it
+    /// stores with `capacity: 4096` precisely so that entries inserted by
+    /// production `fft()` calls running in OTHER tests — which take no test lock,
+    /// because they are not tests — cannot evict its key before the lookup.
+    ///
+    /// That argument holds only while nothing resets the config underneath it, and
+    /// the one thing that does is `clear_shared_plan_cache`, which assigns a
+    /// `BoundedPlanCache::default()` and so restores the DEFAULT capacity. Every
+    /// caller of that is serialised behind `shared_cache_test_lock`, verified by
+    /// reading both `plan.rs` and `transforms.rs`, so a clear cannot land while the
+    /// roundtrip holds the lock.
+    ///
+    /// If a future test calls `clear_shared_plan_cache` without that guard, the
+    /// roundtrip becomes flaky again — with the same signature as 6d400 and none of
+    /// the same cause. That is why the coupling is written down here rather than
+    /// left to be re-derived.
     fn store_with_config(&mut self, metadata: PlanMetadata, config: PlanCacheConfig) -> bool {
         self.config = config;
         self.store(metadata)
