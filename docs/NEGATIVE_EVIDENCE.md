@@ -36431,3 +36431,26 @@ the same shape: a large constant-factor win at small n that decays to nothing by
 This is the interpreter-tax model, and it should now be the DEFAULT EXPECTATION for any
 fsci-vs-scipy row in this crate rather than a surprise — a win quoted at small n without a
 size sweep should be assumed to expire.
+
+## Large-n extension of the Broyden and Newton-Krylov sweeps — ATTEMPTED, DISCARDED, still open
+
+2026-08-18. Both banked sweeps stop at n=4096, where each ratio is a null, and the ledger
+records a PREDICTION that was explicitly not measured: that past n=4096 the fsci-vs-scipy
+ratio keeps falling and would cross below 1.0. This was an attempt to test it using the
+same two release binaries, sha-verified byte-identical to the ones that produced the
+banked rows (`847e3817...c13607`, `64da0561...c465d4`), extended to n = 8192/16384/32768
+for Broyden and m = 80/96/128 for Newton-Krylov.
+
+**DISCARDED WITHOUT BEING READ.** The host went from loadavg 22.97 to 88.09 across the
+run, CPU idle 0%, with other projects' harnesses running concurrently and this sweep
+adding to the contention. 30 timed rows were collected and none are reportable: the
+in-run load drift is larger than the effect being measured, which is the standing
+discard rule. The sweep was stopped early rather than allowed to finish, since finishing
+would have produced more unusable rows and more contention. Log quarantined as
+`measure3.DISCARDED-contended.log`.
+
+**THE PREDICTION REMAINS UNTESTED.** It is not supported and not refuted. Anyone picking
+this up needs a quiet window: re-run `drive3.sh`, and reject the result unless per-arm
+loadavg is stable across the whole run rather than merely low at the start. Note that the
+Newton-Krylov COUNTED metric (nfev) would survive a contended window unharmed — counts
+are deterministic — so if only the counts are wanted, contention is not a reason to wait.
