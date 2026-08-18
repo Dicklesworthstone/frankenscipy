@@ -7322,11 +7322,68 @@ pub fn minres(
 /// DEFAULT ITERATION LIMIT. SciPy defaults to `iter_lim = 2 * n`
 /// (`_isolve/lsqr.py:330-331`); this defaults to `n * 10`. Same shape of divergence
 /// as `lsmr` below, same reasoning — see `scipy_default_iteration_limits`.
+/// LSQR for the plain least-squares problem, `min ||Ax - b||`.
+///
+/// Equivalent to `lsqr_damped(a, b, 0.0, options)`, and BIT-FOR-BIT what this
+/// function computed before `damp` existed: the damping rotation is skipped by an
+/// explicit branch rather than folded into the arithmetic, so the undamped path runs
+/// the same operations in the same order.
 pub fn lsqr(
     a: &CsrMatrix,
     b: &[f64],
     options: IterativeSolveOptions,
 ) -> SparseResult<IterativeSolveResult> {
+    lsqr_impl(a, b, 0.0, options)
+}
+
+/// LSQR with Tikhonov regularization -- `scipy.sparse.linalg.lsqr(A, b, damp=...)`.
+///
+/// Solves `min || [A; damp*I] x - [b; 0] ||`, i.e. the regularized normal equations
+/// `(A^T A + damp^2 I) x = A^T b`.
+///
+/// LSQR'S DAMPING IS NOT LSMR'S, which is why this is a separate piece of work rather
+/// than a copy of `lsmr_damped`. LSMR folds `damp` into the first rotation of its
+/// second QR recurrence (`_sym_ortho(alphabar, damp)`); LSQR instead applies an EXTRA
+/// plane rotation that eliminates the damping parameter and alters the diagonal of
+/// the lower-bidiagonal matrix, producing `psi`, which then accumulates into the
+/// residual estimate as `res2` (`_isolve/lsqr.py:441-452, 494-496`). Porting LSMR's
+/// treatment here would have compiled, run, and been wrong.
+///
+/// Three places had to change together, and missing any one leaves a plausible-looking
+/// solver with an inconsistent stopping test:
+///   * the rotation itself, ahead of the beta-eliminating one;
+///   * both residual estimates, which become `sqrt(phi_bar^2 + res2)` -- SciPy's
+///     `rnorm = sqrt(res1 + res2)`;
+///   * the running `||A||` estimate, which gains `damp^2` because the operator being
+///     normed is the AUGMENTED one (`_isolve/lsqr.py:435`).
+///
+/// Same two documented differences from SciPy as `lsmr_damped`: `residual_norm` stays
+/// the ORIGINAL system's relative residual rather than the augmented system's, and a
+/// negative `damp` is accepted because it enters only as `damp^2`. A non-finite damp
+/// is rejected.
+pub fn lsqr_damped(
+    a: &CsrMatrix,
+    b: &[f64],
+    damp: f64,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    if !damp.is_finite() {
+        return Err(SparseError::NonFiniteInput {
+            message: format!("lsqr damp must be finite, got {damp}"),
+        });
+    }
+    lsqr_impl(a, b, damp, options)
+}
+
+fn lsqr_impl(
+    a: &CsrMatrix,
+    b: &[f64],
+    damp: f64,
+    options: IterativeSolveOptions,
+) -> SparseResult<IterativeSolveResult> {
+    // Accumulates SciPy's `res2 = sum(psi**2)`; stays exactly 0 when damp == 0,
+    // so every residual expression below is unchanged on the undamped path.
+    let mut res2 = 0.0_f64;
     let shape = a.shape();
     let m = shape.rows;
     let n = shape.cols;
@@ -7424,9 +7481,27 @@ pub fn lsqr(
             }
         }
 
+        // Plane rotation eliminating the damping parameter, which alters the
+        // diagonal of the lower-bidiagonal matrix (`_isolve/lsqr.py:441-452`).
+        // SciPy branches on a positive damp and notes the else-arm is exactly
+        // `cs1 = 1, sn1 = 0`; keeping that branch rather than folding it means
+        // the undamped path performs the SAME operations it always did, so it
+        // stays bit-for-bit identical rather than merely equivalent.
+        let (rho_bar_damped, psi) = if damp > 0.0 {
+            let rho_bar1 = (rho_bar * rho_bar + damp * damp).sqrt();
+            let cs1 = rho_bar / rho_bar1;
+            let sn1 = damp / rho_bar1;
+            let psi = sn1 * phi_bar;
+            phi_bar *= cs1;
+            (rho_bar1, psi)
+        } else {
+            (rho_bar, 0.0)
+        };
+        res2 += psi * psi;
+
         // Construct and apply rotation
-        let rho = (rho_bar * rho_bar + beta * beta).sqrt();
-        let cs = rho_bar / rho;
+        let rho = (rho_bar_damped * rho_bar_damped + beta * beta).sqrt();
+        let cs = rho_bar_damped / rho;
         let sn = beta / rho;
         let theta = sn * alpha;
         rho_bar = -cs * alpha;
@@ -7462,7 +7537,9 @@ pub fn lsqr(
         }
 
         // Check convergence — SciPy's istop=1: the residual itself is small.
-        let res_norm = phi_bar.abs() / b_norm;
+        // SciPy's `rnorm = sqrt(res1 + res2)` with `res1 = phibar**2`. With
+        // damp == 0 res2 is 0 and this is `phi_bar.abs()` exactly.
+        let res_norm = (phi_bar * phi_bar + res2).sqrt() / b_norm;
         if res_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
@@ -7488,10 +7565,12 @@ pub fn lsqr(
         // removed an absolute gate there for good reasons that still hold. A
         // missing stopping criterion is not fixed by clamping the recurrence
         // that runs on past it.
-        a_norm_sq += alpha * alpha + beta * beta;
+        // SciPy adds `dampsq` here too (`_isolve/lsqr.py:435`): the norm being
+        // estimated is that of the AUGMENTED operator [[A]; [damp*I]].
+        a_norm_sq += alpha * alpha + beta * beta + damp * damp;
         let a_norm = a_norm_sq.sqrt();
         let ar_norm = alpha * (sn * phi).abs();
-        let r_norm = phi_bar.abs();
+        let r_norm = (phi_bar * phi_bar + res2).sqrt();
         if ar_norm > 0.0
             && a_norm > 0.0
             && r_norm > 0.0
@@ -26230,5 +26309,147 @@ mod lsmr_damp_tests {
         // MUST-MISS: an ordinary damp is NOT rejected, or the guard would be
         // satisfying the test above by refusing everything.
         assert!(lsmr_damped(&a, &b, 0.25, opts()).is_ok(), "0.25 was rejected");
+    }
+}
+
+/// Tikhonov-regularized LSQR -- `scipy.sparse.linalg.lsqr(A, b, damp=...)`.
+#[cfg(test)]
+mod lsqr_damp_tests {
+    use super::{
+        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsqr, lsqr_damped,
+    };
+
+    /// Rank-deficient 3x2: both columns identical, so `A^T A` is singular and the
+    /// UNDAMPED problem has no unique minimizer. That is the case damp exists for.
+    fn rank_deficient() -> (CsrMatrix, Vec<f64>) {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 2),
+            vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            vec![0, 0, 1, 1, 2, 2],
+            vec![0, 1, 0, 1, 0, 1],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        (a, vec![1.0, 2.0, 3.0])
+    }
+
+    fn opts() -> IterativeSolveOptions {
+        IterativeSolveOptions {
+            tol: 1e-10,
+            max_iter: Some(200),
+            ..IterativeSolveOptions::default()
+        }
+    }
+
+    /// MUST-MISS: at damp = 0 the damped entry point is the undamped one, BIT FOR
+    /// BIT. The damping rotation is skipped by an explicit branch, so the old path
+    /// executes the same operations in the same order -- not "agrees to tolerance".
+    /// This is the assertion that fails if adding damp perturbed the existing solver,
+    /// which is the one outcome the refactor was required to avoid.
+    #[test]
+    fn damp_zero_is_bit_identical_to_plain_lsqr() {
+        let (a, b) = rank_deficient();
+        let plain = lsqr(&a, &b, opts()).expect("plain lsqr");
+        let damped = lsqr_damped(&a, &b, 0.0, opts()).expect("damp=0");
+        assert_eq!(plain.solution.len(), damped.solution.len());
+        for (i, (x, y)) in plain.solution.iter().zip(&damped.solution).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "component {i} differs at damp=0: {x} vs {y}"
+            );
+        }
+        assert_eq!(plain.iterations, damped.iterations, "iteration counts differ");
+        assert_eq!(
+            plain.residual_norm.to_bits(),
+            damped.residual_norm.to_bits(),
+            "residual norms differ at damp=0"
+        );
+    }
+
+    /// MUST-HIT, gated on the DEFINING PROPERTY rather than a stored constant: the
+    /// returned x must satisfy the regularized normal equations.
+    ///
+    /// This is also the check that would catch porting LSMR's damping treatment into
+    /// LSQR by mistake. That error compiles and runs and produces a plausible vector;
+    /// what it does not do is satisfy these equations.
+    #[test]
+    fn a_positive_damp_solves_the_regularized_normal_equations() {
+        let (a, b) = rank_deficient();
+        let damp = 0.5_f64;
+        let r = lsqr_damped(&a, &b, damp, opts()).expect("damped lsqr");
+        assert_eq!(r.solution.len(), 2);
+        assert!(
+            r.solution.iter().all(|v| v.is_finite()),
+            "damped solve produced non-finite components: {:?}",
+            r.solution
+        );
+
+        let dense = [[1.0, 1.0], [1.0, 1.0], [1.0, 1.0]];
+        let x = &r.solution;
+        let mut worst = 0.0_f64;
+        for j in 0..2 {
+            let mut lhs = damp * damp * x[j];
+            for k in 0..2 {
+                let ata: f64 = (0..3).map(|i| dense[i][j] * dense[i][k]).sum();
+                lhs += ata * x[k];
+            }
+            let atb: f64 = (0..3).map(|i| dense[i][j] * b[i]).sum();
+            worst = worst.max((lhs - atb).abs());
+        }
+        assert!(
+            worst < 1e-8,
+            "damped solution violates (A^T A + damp^2 I)x = A^T b by {worst}; x = {x:?}"
+        );
+
+        let plain = lsqr(&a, &b, opts()).expect("plain lsqr");
+        let moved: f64 = plain
+            .solution
+            .iter()
+            .zip(x)
+            .map(|(p, d)| (p - d).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            moved > 1e-6,
+            "damp=0.5 produced the same solution as damp=0 (max change {moved}); the \
+             parameter is not reaching the iteration"
+        );
+    }
+
+    /// LSQR and LSMR must AGREE on the damped problem, because both minimize the same
+    /// functional. They reach it by different recurrences -- LSMR folds damp into its
+    /// second QR rotation, LSQR applies an extra rotation and carries `psi` into the
+    /// residual -- so agreement here is evidence that BOTH ports are right, in a way
+    /// neither test alone provides.
+    #[test]
+    fn damped_lsqr_and_lsmr_agree() {
+        let (a, b) = rank_deficient();
+        let damp = 0.5_f64;
+        let q = lsqr_damped(&a, &b, damp, opts()).expect("lsqr");
+        let m = super::lsmr_damped(&a, &b, damp, opts()).expect("lsmr");
+        for (i, (x, y)) in q.solution.iter().zip(&m.solution).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-7,
+                "lsqr and lsmr disagree on the damped minimizer at {i}: {x} vs {y}. \
+                 They solve the same problem, so one of the two dampings is wrong"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_finite_damp_is_rejected() {
+        let (a, b) = rank_deficient();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                matches!(
+                    lsqr_damped(&a, &b, bad, opts()),
+                    Err(SparseError::NonFiniteInput { .. })
+                ),
+                "damp = {bad} was accepted"
+            );
+        }
+        assert!(lsqr_damped(&a, &b, 0.25, opts()).is_ok(), "0.25 was rejected");
     }
 }
