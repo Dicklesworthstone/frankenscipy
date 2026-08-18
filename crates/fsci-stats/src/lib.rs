@@ -16648,6 +16648,62 @@ impl ContinuousDistribution for TruncNormal {
         }
     }
 
+    /// The quantile, kept inside the support.
+    ///
+    /// The trait default returns `-inf` at `q = 0` and `+inf` at `q = 1`, which is right
+    /// for a distribution on the whole line and wrong for a truncated one: the support
+    /// IS `[a, b]`, so those are the two quantiles that are known exactly.
+    /// `scipy.stats.truncnorm.ppf(0, 30, 40)` is 30 and `ppf(1, 30, 40)` is 40.
+    ///
+    /// The interior is left to the default bisection, which is sound here because `cdf`
+    /// now goes through the tail-choosing interval mass. Its result is clamped for the
+    /// same reason `Truncated::quantile` clamps: on `[30, 40]` the bracketing anchors
+    /// are built from `mean` and `std`, both of which are computed from quantities that
+    /// underflow, so the search can step outside a support it should never leave.
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return self.a;
+        }
+        if q == 1.0 {
+            return self.b;
+        }
+        let x = ppf_bisection(|x| self.cdf(x), q, self.mean(), self.std());
+        x.clamp(self.a, self.b)
+    }
+
+    /// Inverse survival function, with the same endpoints reflected.
+    ///
+    /// `isf(0)` is the upper bound and `isf(1)` the lower — the mirror of `ppf`. Left to
+    /// the trait default these are `+inf` and `-inf`, and fixing only `ppf` would leave
+    /// the two functions disagreeing about where the distribution lives.
+    ///
+    /// The interior keeps the trait's own tail discipline rather than reinventing it:
+    /// `1 - q` is used only while it is representable, and below that the accurate `sf`
+    /// is inverted directly. Routing everything through `ppf(1 - q)` would reintroduce
+    /// precisely the underflow the default was written to avoid — for `q` under about
+    /// 1.1e-16, `1 - q` rounds to 1.0 and the answer collapses to the upper bound.
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return self.b;
+        }
+        if q == 1.0 {
+            return self.a;
+        }
+        let p = 1.0 - q;
+        let x = if p < 1.0 {
+            ppf_bisection(|x| self.cdf(x), p, self.mean(), self.std())
+        } else {
+            isf_bisection(|x| self.sf(x), q, self.mean(), self.std())
+        };
+        x.clamp(self.a, self.b)
+    }
+
     fn mean(&self) -> f64 {
         let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
@@ -58852,6 +58908,338 @@ impl ContinuousDistribution for HistogramDistribution {
     }
 }
 
+/// A weighted mixture of distributions of the same kind.
+///
+/// Matches `scipy.stats.Mixture(components, weights=...)`. Every method is a
+/// weighted sum over the components, which is what makes the type worth having:
+/// each one is exact, with no quadrature and no iteration.
+///
+/// ```text
+///   pdf(x) = Σ wᵢ · fᵢ(x)      cdf(x) = Σ wᵢ · Fᵢ(x)      sf(x) = Σ wᵢ · Sᵢ(x)
+/// ```
+///
+/// # Why `sf` is its own sum
+///
+/// Summing the component SURVIVALS rather than forming `1 − cdf` is the whole
+/// difference between a usable tail and none. On `0.4·N(−2, 1) + 0.6·N(2, 1.5)`
+/// at `x = 20`, the survival is 1.0658892672465918e-33 while `1 − cdf` is exactly
+/// **0.0** — the cdf has saturated and there is nothing left in it to subtract
+/// from. `logcdf`/`logsf` use the log-sum-exp of the components' own log forms,
+/// so they stay finite past where the linear sums underflow.
+///
+/// # Homogeneous components, and why
+///
+/// `Vec<D>` means every component is the SAME type: `Mixture<Normal>` cannot hold
+/// a Gamma. SciPy allows heterogeneous components because its components are
+/// Python objects. The Rust equivalent would be `Vec<Box<dyn
+/// ContinuousDistribution>>`, which is not available here — `rvs` takes
+/// `&mut impl Rng`, a generic parameter, so the trait is not object-safe. That is
+/// a property of the trait, not a decision made here.
+///
+/// # Weights
+///
+/// SciPy requires the weights to sum to 1 and raises otherwise. These are
+/// normalised instead, which cannot change the resulting distribution: a mixture
+/// is defined by the weight RATIOS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mixture<D: ContinuousDistribution> {
+    components: Vec<D>,
+    /// Normalised so `Σ weights = 1`.
+    weights: Vec<f64>,
+}
+
+impl<D: ContinuousDistribution> Mixture<D> {
+    /// Build a mixture from components and their (unnormalised) weights.
+    ///
+    /// # Errors
+    ///
+    /// No components, a length mismatch, a non-finite or negative weight, or a
+    /// total weight of zero.
+    pub fn new(components: Vec<D>, weights: &[f64]) -> Result<Self, StatsError> {
+        if components.is_empty() {
+            return Err(StatsError::InvalidArgument(
+                "a mixture needs at least one component".to_string(),
+            ));
+        }
+        if weights.len() != components.len() {
+            return Err(StatsError::InvalidArgument(format!(
+                "expected {} weights for {} components, got {}",
+                components.len(),
+                components.len(),
+                weights.len()
+            )));
+        }
+        if weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "weights must be finite and non-negative".to_string(),
+            ));
+        }
+        let total: f64 = weights.iter().sum();
+        if !(total > 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "the weights carry no mass".to_string(),
+            ));
+        }
+        Ok(Self {
+            components,
+            weights: weights.iter().map(|w| w / total).collect(),
+        })
+    }
+
+    /// The component distributions.
+    #[must_use]
+    pub fn components(&self) -> &[D] {
+        &self.components
+    }
+
+    /// The normalised weights.
+    #[must_use]
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
+
+    /// `Σ wᵢ · f(componentᵢ)`.
+    fn blend(&self, f: impl Fn(&D) -> f64) -> f64 {
+        self.components
+            .iter()
+            .zip(self.weights.iter())
+            .map(|(c, &w)| w * f(c))
+            .sum()
+    }
+
+    /// `ln Σ wᵢ · exp(g(componentᵢ))`, evaluated as a log-sum-exp so it stays
+    /// finite where every component's linear value has underflowed.
+    fn log_blend(&self, g: impl Fn(&D) -> f64) -> f64 {
+        let terms: Vec<f64> = self
+            .components
+            .iter()
+            .zip(self.weights.iter())
+            .map(|(c, &w)| if w > 0.0 { w.ln() + g(c) } else { f64::NEG_INFINITY })
+            .collect();
+        let hi = terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if hi == f64::NEG_INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        hi + terms.iter().map(|t| (t - hi).exp()).sum::<f64>().ln()
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for Mixture<D> {
+    fn pdf(&self, x: f64) -> f64 {
+        self.blend(|c| c.pdf(x))
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        self.log_blend(|c| c.logpdf(x))
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        self.blend(|c| c.cdf(x)).clamp(0.0, 1.0)
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        // The component SURVIVALS, summed. Never 1 − cdf; see the type doc.
+        self.blend(|c| c.sf(x)).clamp(0.0, 1.0)
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        self.log_blend(|c| c.logcdf(x))
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
+        self.log_blend(|c| c.logsf(x))
+    }
+
+    fn mean(&self) -> f64 {
+        self.blend(|c| c.mean())
+    }
+
+    fn var(&self) -> f64 {
+        // Parallel axis: Σ wᵢ[σᵢ² + (μᵢ − μ)²]. NOT E[X²] − μ², which differences
+        // two comparable numbers whenever the components sit away from 0.
+        let mu = self.mean();
+        self.blend(|c| {
+            let d = c.mean() - mu;
+            c.var() + d * d
+        })
+    }
+
+    fn skewness(&self) -> f64 {
+        // Third central moment of a mixture, shifting each component onto the
+        // mixture mean: μ₃ = Σ wᵢ[μ₃ᵢ + 3dᵢσᵢ² + dᵢ³], dᵢ = μᵢ − μ.
+        let mu = self.mean();
+        let var = self.var();
+        if !(var > 0.0) {
+            return f64::NAN;
+        }
+        let m3 = self.blend(|c| {
+            let (d, s) = (c.mean() - mu, c.std());
+            c.skewness() * s * s * s + 3.0 * d * s * s + d * d * d
+        });
+        m3 / var.powf(1.5)
+    }
+
+    fn kurtosis(&self) -> f64 {
+        // μ₄ = Σ wᵢ[μ₄ᵢ + 4dᵢμ₃ᵢ + 6dᵢ²σᵢ² + dᵢ⁴].
+        //
+        // The +3 and −3 are conversions, not fudge: this crate's `kurtosis` is
+        // EXCESS (Normal returns 0.0), so each component's raw fourth moment is
+        // (excessᵢ + 3)σᵢ⁴ and the mixture's is converted back on the way out.
+        // SciPy's `Mixture.kurtosis()` is NON-excess, so its published value for
+        // the same mixture is 3 larger than this one.
+        let mu = self.mean();
+        let var = self.var();
+        if !(var > 0.0) {
+            return f64::NAN;
+        }
+        let m4 = self.blend(|c| {
+            let (d, s) = (c.mean() - mu, c.std());
+            let s2 = s * s;
+            let m3i = c.skewness() * s * s2;
+            (c.kurtosis() + 3.0) * s2 * s2 + 4.0 * d * m3i + 6.0 * d * d * s2 + d * d * d * d
+        });
+        m4 / (var * var) - 3.0
+    }
+}
+
+#[cfg(test)]
+mod mixture_matches_scipy {
+    use super::{ContinuousDistribution, Mixture, Normal};
+
+    fn fixture() -> Mixture<Normal> {
+        // scipy: Mixture([Normal(mu=-2, sigma=1), Normal(mu=2, sigma=1.5)],
+        //                weights=[0.4, 0.6])
+        Mixture::new(
+            vec![Normal::new(-2.0, 1.0), Normal::new(2.0, 1.5)],
+            &[0.4, 0.6],
+        )
+        .expect("valid mixture")
+    }
+
+    #[test]
+    fn pdf_cdf_sf_and_moments_match_scipy() {
+        let m = fixture();
+        for (x, p, c, s) in [
+            (
+                -3.0,
+                9.740_520_140_617_380e-2,
+                6.371_953_777_250_093e-2,
+                9.362_804_622_274_992e-1,
+            ),
+            (
+                0.0,
+                8.720_041_647_567_267e-2,
+                4.456_266_790_562_491e-1,
+                5.543_733_209_437_510e-1,
+            ),
+            (
+                2.5,
+                1.509_596_845_736_400e-1,
+                7.783_338_368_216_919e-1,
+                2.216_661_631_783_081e-1,
+            ),
+            (
+                7.0,
+                6.169_115_985_164_424e-4,
+                9.997_425_638_000_820e-1,
+                2.574_361_999_181_024e-4,
+            ),
+        ] {
+            for (got, want, what) in
+                [(m.pdf(x), p, "pdf"), (m.cdf(x), c, "cdf"), (m.sf(x), s, "sf")]
+            {
+                assert!(
+                    ((got - want) / want).abs() < 1e-13,
+                    "{what}({x}) = {got:e}, scipy = {want:e}"
+                );
+            }
+        }
+        assert!((m.mean() - 0.4).abs() < 1e-14, "mean = {}", m.mean());
+        assert!((m.var() - 5.59).abs() < 1e-13, "var = {}", m.var());
+        assert!(
+            (m.skewness() - 3.994_994_729_573_627e-2).abs() < 1e-13,
+            "skewness = {}",
+            m.skewness()
+        );
+        // scipy reports 1.986543181825455 NON-excess; this crate's convention is
+        // excess, so the same mixture is 3 lower. Getting this backwards would
+        // leave every other assertion here passing.
+        assert!(
+            (m.kurtosis() - (1.986_543_181_825_455 - 3.0)).abs() < 1e-13,
+            "kurtosis = {} (excess); scipy's non-excess value is 1.986543181825455",
+            m.kurtosis()
+        );
+    }
+
+    /// THE POINT OF SUMMING SURVIVALS. At x = 20 the cdf has saturated, so
+    /// `1 − cdf` is exactly zero while the true survival is 1.07e-33.
+    #[test]
+    fn the_tail_survives_a_saturated_cdf() {
+        let m = fixture();
+        assert_eq!(
+            1.0 - m.cdf(20.0),
+            0.0,
+            "premise: the mixture cdf saturates here"
+        );
+        let want = 1.065_889_267_246_592e-33;
+        let got = m.sf(20.0);
+        assert!(
+            ((got - want) / want).abs() < 1e-11,
+            "sf(20) = {got:e}, scipy = {want:e}"
+        );
+        assert!(m.logsf(20.0).is_finite());
+        // Further out still, where even the linear sum of survivals underflows,
+        // the log form must stay finite.
+        assert!(m.logsf(60.0).is_finite(), "logsf(60) = {}", m.logsf(60.0));
+    }
+
+    #[test]
+    fn structural_identities_and_validation() {
+        let m = fixture();
+        // A one-component mixture is that component.
+        let single = Mixture::new(vec![Normal::new(0.5, 2.0)], &[1.0]).expect("valid");
+        let base = Normal::new(0.5, 2.0);
+        for x in [-1.0, 0.5, 3.0] {
+            assert!((single.pdf(x) - base.pdf(x)).abs() < 1e-15);
+            assert!((single.cdf(x) - base.cdf(x)).abs() < 1e-15);
+            assert!((single.sf(x) - base.sf(x)).abs() < 1e-15);
+        }
+        // Weights are normalised, so ratios are what matter.
+        let scaled = Mixture::new(
+            vec![Normal::new(-2.0, 1.0), Normal::new(2.0, 1.5)],
+            &[40.0, 60.0],
+        )
+        .expect("valid");
+        assert_eq!(scaled.weights(), m.weights());
+        assert!((scaled.pdf(0.3) - m.pdf(0.3)).abs() < 1e-15);
+        assert_eq!(m.components().len(), 2);
+        // cdf + sf = 1, each summed independently.
+        for x in [-4.0, 0.0, 5.0] {
+            assert!((m.cdf(x) + m.sf(x) - 1.0).abs() < 1e-14);
+            assert!((m.logpdf(x) - m.pdf(x).ln()).abs() < 1e-12);
+        }
+
+        assert!(Mixture::<Normal>::new(vec![], &[]).is_err(), "no components");
+        assert!(
+            Mixture::new(vec![Normal::standard()], &[0.5, 0.5]).is_err(),
+            "length mismatch"
+        );
+        assert!(
+            Mixture::new(vec![Normal::standard(), Normal::standard()], &[1.0, -1.0]).is_err(),
+            "negative weight"
+        );
+        assert!(
+            Mixture::new(vec![Normal::standard(), Normal::standard()], &[0.0, 0.0]).is_err(),
+            "no weight mass"
+        );
+        // MUST-MISS control: a zero weight is fine as long as some weight remains.
+        assert!(
+            Mixture::new(vec![Normal::standard(), Normal::new(3.0, 1.0)], &[0.0, 1.0]).is_ok(),
+            "one zero weight is legal"
+        );
+    }
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
@@ -99090,6 +99478,55 @@ mod truncate_matches_scipy {
                 "generic pdf({x}) = {g:e} but TruncNormal gives {c:e}"
             );
         }
+    }
+
+    /// A truncated distribution's extreme quantiles are its BOUNDS, and they are the two
+    /// values known exactly. The trait default answers `-inf` and `+inf`, which is right
+    /// on the whole line and wrong here; `scipy.stats.truncnorm.ppf(0, 30, 40)` is 30 and
+    /// `ppf(1, 30, 40)` is 40.
+    ///
+    /// This is the remaining half of frankenscipy-45de1: `pdf`, `cdf` and `sf` were fixed
+    /// when the bead was filed, but the bead also asked for `ppf`, and the concrete type
+    /// overrode neither it nor `isf`.
+    #[test]
+    fn truncnormal_extreme_quantiles_are_the_support_bounds() {
+        let d = TruncNormal::new(30.0, 40.0);
+        assert_eq!(d.ppf(0.0), 30.0, "ppf(0) must be the lower bound");
+        assert_eq!(d.ppf(1.0), 40.0, "ppf(1) must be the upper bound");
+        assert_eq!(d.isf(0.0), 40.0, "isf(0) must be the upper bound");
+        assert_eq!(d.isf(1.0), 30.0, "isf(1) must be the lower bound");
+
+        // Interior quantiles stay inside the support and track scipy. This
+        // distribution is crushed against its lower edge -- scipy's median is
+        // 30.023070467827313 -- so a quantile that escaped upward would be far outside.
+        let median = d.ppf(0.5);
+        assert!(
+            (median - 30.023_070_467_827_313).abs() < 1e-6,
+            "ppf(0.5) = {median}, scipy gives 30.023070467827313"
+        );
+        for q in [1e-12, 0.25, 0.5, 0.75] {
+            let x = d.ppf(q);
+            assert!(
+                (30.0..=40.0).contains(&x),
+                "ppf({q}) = {x} escaped the support [30, 40]"
+            );
+        }
+
+        // MUST-MISS: on a benign support the same calls are not merely clamped to the
+        // bounds -- the interior is a real inversion, not the endpoint logic firing.
+        let benign = TruncNormal::new(-1.0, 2.0);
+        assert_eq!(benign.ppf(0.0), -1.0);
+        assert_eq!(benign.ppf(1.0), 2.0);
+        let mid = benign.ppf(0.5);
+        assert!(
+            (mid - 0.171_163_918_017_824_82).abs() < 1e-9,
+            "ppf(0.5) on [-1, 2] = {mid}, scipy gives 0.17116391801782482"
+        );
+        assert!(
+            mid > -1.0 && mid < 2.0,
+            "the interior quantile landed on a bound, so the test cannot tell the \
+             inversion from the clamp"
+        );
     }
 
     /// Even a mild interval loses digits to the subtractive form: on [5, 10] the
