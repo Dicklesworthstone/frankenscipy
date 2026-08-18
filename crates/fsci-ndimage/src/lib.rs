@@ -1575,6 +1575,10 @@ fn build_axis_offset_supports(
     order: usize,
     mode: BoundaryMode,
     premultiply: bool,
+    // Resolved once by the caller alongside `premultiply`, for the same reason
+    // (`frankenscipy-22van`): this builder runs per AXIS, but the knob it forwards is
+    // consumed per TAP inside `compute_axis_support`.
+    compact_disabled: bool,
     coord_of: impl Fn(usize, usize) -> f64,
 ) -> Vec<AxisSupport> {
     (0..out_shape.len())
@@ -1590,6 +1594,7 @@ fn build_axis_offset_supports(
                         coord_offsets[axis],
                         order,
                         mode,
+                        compact_disabled,
                         &mut s,
                     ) {
                         if premultiply {
@@ -1680,6 +1685,52 @@ fn sample_separable_combine(coeffs: &NdArray, bases: &[&[(usize, f64)]], offsets
 /// Extracted verbatim from `sample_interpolated`'s per-axis loop so the general
 /// per-pixel path and the separable zoom path share EXACTLY the same weights.
 /// Returns `false` when the coordinate maps out of range (→ the pixel is `cval`).
+/// The two spline A/B knobs, resolved ONCE and carried by value
+/// (`frankenscipy-22van`).
+///
+/// `sample_interpolated` is called once PER PIXEL, and it read both
+/// `NDIMAGE_SPLINE_OFFSET_DISABLE` and (via `compute_axis_support`)
+/// `NDIMAGE_BSPLINE_COMPACT_DISABLE` on every one of those calls. A relaxed atomic load
+/// inside a per-item path is not merely a cheap load: it is an optimisation barrier the
+/// compiler cannot see through, and it blocks specialisation of the surrounding loop. The
+/// same shape cost a measured 13% on `fsci-sparse`'s splu merge, where hoisting the read to
+/// the call boundary and passing a plain `bool` recovered all of it.
+///
+/// So the caller resolves both knobs once, before its pixel loop, and threads this value
+/// down. Two flags rather than two parameters because they must come from the SAME resolve:
+/// `offsets` decides both whether taps are pre-multiplied by stride and which leaf consumes
+/// them, and reading it twice can tear that pair (the latent panic fixed in 0a7086e76).
+#[derive(Debug, Clone, Copy)]
+struct SplineFlags {
+    /// Taps pre-multiplied by stride so the leaf indexes `coeffs.data` directly.
+    offsets: bool,
+    /// Use the full `2·order+1` window instead of the compact support.
+    compact_disabled: bool,
+}
+
+impl SplineFlags {
+    /// Read both atomics ONCE. Call this OUTSIDE any per-pixel loop.
+    fn resolve() -> Self {
+        Self {
+            offsets: !NDIMAGE_SPLINE_OFFSET_DISABLE.load(std::sync::atomic::Ordering::Relaxed),
+            compact_disabled: NDIMAGE_BSPLINE_COMPACT_DISABLE
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// The A/B baseline: re-read per call, reproducing the pre-22van behaviour exactly.
+    /// Selected by `NDIMAGE_SPLINE_FLAG_HOIST_DISABLE`, so the hoist can be measured
+    /// against the shape it replaced inside one binary.
+    #[inline]
+    fn resolve_or_reread(hoisted: Self) -> Self {
+        if NDIMAGE_SPLINE_FLAG_HOIST_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::resolve()
+        } else {
+            hoisted
+        }
+    }
+}
+
 fn compute_axis_support(
     coord: f64,
     coeff_len: usize,
@@ -1687,6 +1738,7 @@ fn compute_axis_support(
     coord_offset: f64,
     order: usize,
     mode: BoundaryMode,
+    compact_disabled: bool,
     support: &mut Vec<(usize, f64)>,
 ) -> bool {
     support.clear();
@@ -1815,7 +1867,7 @@ fn compute_axis_support(
         // `weight != 0.0` filter drops. Deriving the bounds from `f` by INTEGER arithmetic is
         // load-bearing — the obvious `(cc - half).floor()` rounds a coordinate one ULP below an
         // integer back onto it and silently drops a legitimate ~8.9e-16 tap.
-        let span = if NDIMAGE_BSPLINE_COMPACT_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
+        let span = if compact_disabled {
             // ORIG comparator: the full `2·order+1` window.
             (order as isize, order as isize)
         } else {
@@ -1870,6 +1922,7 @@ fn sample_interpolated(
     order: usize,
     mode: BoundaryMode,
     cval: f64,
+    flags: SplineFlags,
 ) -> f64 {
     if order == 0 {
         // scipy rounds the (unmapped) coordinate via floor(coord + 0.5) — half
@@ -1914,10 +1967,13 @@ fn sample_interpolated(
         if bases.len() < n {
             bases.resize_with(n, Vec::new);
         }
-        // Read the A/B knob ONCE and thread it through: it decides BOTH whether the taps get
-        // pre-multiplied by stride AND which leaf consumes them. Reading it twice lets a
-        // concurrent toggle tear the pair (the latent panic fixed in 0a7086e76).
-        let offsets = !NDIMAGE_SPLINE_OFFSET_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // The knobs arrive already resolved from the CALLER, which reads them once outside
+        // its pixel loop (`frankenscipy-22van`). `resolve_or_reread` restores the old
+        // per-call read when `NDIMAGE_SPLINE_FLAG_HOIST_DISABLE` is set, so the hoist has an
+        // A/B baseline in the same binary. Both flags still come from a single resolve, so
+        // the premultiply/leaf pair cannot tear (the latent panic fixed in 0a7086e76).
+        let flags = SplineFlags::resolve_or_reread(flags);
+        let offsets = flags.offsets;
         for axis in 0..n {
             if !compute_axis_support(
                 coords[axis],
@@ -1926,6 +1982,7 @@ fn sample_interpolated(
                 coord_offsets[axis],
                 order,
                 mode,
+                flags.compact_disabled,
                 &mut bases[axis],
             ) {
                 return cval;
@@ -9698,7 +9755,10 @@ pub fn shift(
         if order >= 2 {
             let coeffs = &spline.coeffs;
             // ONE read: the tap representation and the leaf kind must agree (see the fn doc).
-            let offsets = !NDIMAGE_SPLINE_OFFSET_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+            // `SplineFlags::resolve` also carries the compact-support knob
+            // (`frankenscipy-22van`).
+            let flags = SplineFlags::resolve();
+            let offsets = flags.offsets;
             let axis_supports = build_axis_offset_supports(
                 coeffs,
                 &in_shape,
@@ -9707,6 +9767,7 @@ pub fn shift(
                 order,
                 mode,
                 offsets,
+                flags.compact_disabled,
                 |axis, o| o as f64 - shift_values[axis],
             );
             let axis_supports = &axis_supports;
@@ -9714,6 +9775,8 @@ pub fn shift(
                 sample_separable_pixel(coeffs, axis_supports, oidx, cval, offsets)
             });
         } else {
+            // Resolve ONCE, outside the pixel closure (`frankenscipy-22van`).
+            let flags = SplineFlags::resolve();
             fill_pixels_parallel_indexed(&mut output, kernel_work, |_flat, out_idx| {
                 let coords: Vec<f64> = out_idx
                     .iter()
@@ -9728,6 +9791,7 @@ pub fn shift(
                     order,
                     mode,
                     cval,
+                    flags,
                 )
             });
         }
@@ -9735,6 +9799,8 @@ pub fn shift(
     }
 
     // Legacy serial per-pixel path (retained as the same-binary A/B baseline).
+    // Resolve ONCE, outside the loop (`frankenscipy-22van`).
+    let flags = SplineFlags::resolve();
     for flat in 0..input.size() {
         let out_idx = input.unravel(flat);
         let coords: Vec<f64> = out_idx
@@ -9750,6 +9816,7 @@ pub fn shift(
             order,
             mode,
             cval,
+            flags,
         );
     }
 
@@ -9772,6 +9839,18 @@ pub static NDIMAGE_ZOOM_SEPARABLE_DISABLE: std::sync::atomic::AtomicBool =
 /// (reading it twice tears the premultiply/leaf pair).
 #[doc(hidden)]
 pub static NDIMAGE_SPLINE_OFFSET_DISABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Restore the PRE-hoist behaviour: re-read the spline knobs inside every
+/// `sample_interpolated` call instead of taking them from the caller's one-shot
+/// `SplineFlags::resolve` (`frankenscipy-22van`).
+///
+/// This exists so the hoist can be measured against the exact shape it replaced, inside a
+/// single binary, rather than against a differently-compiled one. Default `false` = hoisted.
+/// BYTE-IDENTICAL either way: both arms read the same two atomics and branch identically;
+/// only WHERE the read happens changes.
+#[doc(hidden)]
+pub static NDIMAGE_SPLINE_FLAG_HOIST_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Same-binary A/B toggle for `compute_axis_support`'s cardinal-B-spline tap loop: when `true`,
@@ -9854,7 +9933,11 @@ pub fn zoom(
     if order >= 2 && !NDIMAGE_ZOOM_SEPARABLE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
         let coeffs = &spline.coeffs;
         // ONE read: the tap representation and the leaf kind must agree (see the fn doc).
-        let offsets = !NDIMAGE_SPLINE_OFFSET_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // `SplineFlags::resolve` also carries the compact-support knob, which
+        // `build_axis_offset_supports` forwards into `compute_axis_support`
+        // (`frankenscipy-22van`).
+        let flags = SplineFlags::resolve();
+        let offsets = flags.offsets;
         let axis_supports = build_axis_offset_supports(
             coeffs,
             &in_shape,
@@ -9863,6 +9946,7 @@ pub fn zoom(
             order,
             mode,
             offsets,
+            flags.compact_disabled,
             |axis, o| {
                 if out_shape[axis] <= 1 || in_shape[axis] <= 1 {
                     0.0
@@ -9898,6 +9982,7 @@ pub fn zoom(
             order,
             mode,
             cval,
+            flags,
         )
     });
 
@@ -9980,6 +10065,9 @@ pub fn rotate(
     // `flat = r*out_cols + c` in parallel — bit-identical to the sequential (r, c) loop.
     let _ = out_rows;
     let kernel_work = (order + 1) * (order + 1);
+    // Resolve the spline knobs ONCE, outside the per-pixel work below
+    // (`frankenscipy-22van`).
+    let flags = SplineFlags::resolve();
     fill_pixels_parallel(&mut output, kernel_work, |flat, _scratch| {
         let dy = (flat / out_cols) as f64 - cy_out;
         let dx = (flat % out_cols) as f64 - cx_out;
@@ -9993,6 +10081,7 @@ pub fn rotate(
             order,
             mode,
             cval,
+            flags,
         )
     });
 
@@ -10368,6 +10457,9 @@ pub fn map_coordinates(
     let spline = prefilter_spline_coefficients(input, order, mode)?;
     // Each query point is an independent interpolation of the read-only spline
     // coefficients; fill the disjoint output indices in parallel — bit-identical.
+    // Resolve the spline knobs ONCE, outside the per-pixel work below
+    // (`frankenscipy-22van`).
+    let flags = SplineFlags::resolve();
     let point = |p: usize| -> f64 {
         let coords: Vec<f64> = coordinates.iter().map(|c| c[p]).collect();
         sample_interpolated(
@@ -10378,6 +10470,7 @@ pub fn map_coordinates(
             order,
             mode,
             cval,
+            flags,
         )
     };
     let kernel_work = (order + 1).saturating_pow(ndim as u32);
@@ -11272,7 +11365,11 @@ pub fn affine_transform(
         let in_shape = input.shape.clone();
         let coeffs = &spline.coeffs;
         // ONE read: the tap representation and the leaf kind must agree (see the fn doc).
-        let offsets = !NDIMAGE_SPLINE_OFFSET_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // `SplineFlags::resolve` also carries the compact-support knob, which
+        // `build_axis_offset_supports` forwards into `compute_axis_support`
+        // (`frankenscipy-22van`).
+        let flags = SplineFlags::resolve();
+        let offsets = flags.offsets;
         let axis_supports = build_axis_offset_supports(
             coeffs,
             &in_shape,
@@ -11281,6 +11378,7 @@ pub fn affine_transform(
             order,
             mode,
             offsets,
+            flags.compact_disabled,
             |axis, o| matrix[axis][axis] * o as f64 + matrix[axis][2],
         );
         let axis_supports = &axis_supports;
@@ -11303,6 +11401,7 @@ pub fn affine_transform(
             order,
             mode,
             cval,
+            flags,
         )
     });
 
@@ -12662,6 +12761,9 @@ where
     let kernel_work = (order + 1).saturating_pow(input.ndim() as u32);
     let oshape = &out_shape;
     let mapping = &mapping;
+    // Resolve the spline knobs ONCE, outside the per-pixel work below
+    // (`frankenscipy-22van`).
+    let flags = SplineFlags::resolve();
     fill_pixels_parallel(&mut output, kernel_work, |flat, _scratch| {
         let mut out_coord = Vec::with_capacity(oshape.len());
         let mut remaining = flat;
@@ -12679,6 +12781,7 @@ where
             order,
             mode,
             cval,
+            flags,
         )
     });
 
@@ -18302,6 +18405,7 @@ mod tests {
         let fast = zoom_order1_reflect_2d_fast(&input, &new_shape);
 
         let mut generic = NdArray::zeros(new_shape.clone());
+        let flags = SplineFlags::resolve();
         for flat in 0..generic.size() {
             let out_idx = unravel_with_shape(flat, &new_shape);
             let coords: Vec<f64> = out_idx
@@ -18323,6 +18427,7 @@ mod tests {
                 1,
                 BoundaryMode::Reflect,
                 0.0,
+                flags,
             );
         }
 
