@@ -11492,17 +11492,36 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
     }
 
     let data = matrix.as_mut_slice();
+    let force_scalar = EIGH_RANK2_UPDATE_FORCE_SCALAR.load(std::sync::atomic::Ordering::Relaxed);
     for col_offset in 0..active {
         let w_col = w[col_offset];
         let col = start + col_offset;
         let v_col = reflector.values[col_offset];
         let col_base = col * n;
-        for row_offset in col_offset..active {
-            let w_row = w[row_offset];
-            let row = start + row_offset;
-            let v_row = reflector.values[row_offset];
-            let update = v_row * w_col + w_row * v_col;
-            data[col_base + row] -= update;
+        if force_scalar {
+            for row_offset in col_offset..active {
+                let w_row = w[row_offset];
+                let row = start + row_offset;
+                let v_row = reflector.values[row_offset];
+                let update = v_row * w_col + w_row * v_col;
+                data[col_base + row] -= update;
+            }
+        } else {
+            // Same arithmetic, same order, same operands -- the ONLY change is that
+            // the three operands are bound as contiguous slices before the loop
+            // instead of being indexed inside it. `data[col_base + row]` with the
+            // index computed per iteration hides from LLVM both that the walk is
+            // contiguous and that `data`, `values` and `w` cannot alias, which is
+            // enough to stop it vectorizing a loop that is otherwise a textbook
+            // fused pair of AXPYs.
+            let lo = col_base + start + col_offset;
+            let hi = col_base + start + active;
+            let seg = &mut data[lo..hi];
+            let vs = &reflector.values[col_offset..active];
+            let ws = &w[col_offset..active];
+            for ((slot, &v_row), &w_row) in seg.iter_mut().zip(vs).zip(ws) {
+                *slot -= v_row * w_col + w_row * v_col;
+            }
         }
     }
 }
@@ -12917,6 +12936,32 @@ fn tridiagonal_eigenvector_residual_max(
 /// Byte-identical either way (each column is a pure, deterministic function of its
 /// index; parallelism only changes which thread runs which column).
 pub static EIGH_INVITER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Same-ELF A/B for the Householder rank-2 trailing update, the second of the two
+/// O(n^2)-per-step halves of the tridiagonal reduction.
+///
+/// WHY THIS ONE. The stage counters (frankenscipy-ll0kk, driver
+/// `perf_eigh_stages`) put the reduction at 56-62% of `eigh` at every size from
+/// n=512 to 1024, with a flat share -- the signature of a constant factor rather
+/// than an asymptotic wall. Blocking that reduction is already refuted on that
+/// bead (blocked dsytrd measured 0.5-0.81x, i.e. SLOWER), so the remaining route is
+/// to make the existing unblocked kernel cheaper. This is half of it.
+///
+/// CONTRACT: BIT-IDENTICAL either way. The default arm performs exactly the same
+/// subtractions on exactly the same operands in exactly the same order; the ONLY
+/// difference is that `data`, `reflector.values` and `w` are bound as contiguous
+/// SLICES before the inner loop rather than indexed inside it. No FMA contraction
+/// is introduced (`v_row * w_col + w_row * v_col` stays two multiplies and an add,
+/// with no `mul_add`), and no reassociation occurs, so this cannot move a single
+/// bit. Setting this flag restores the indexed form for measurement.
+///
+/// The indexed form hides two facts from the optimizer that the slice form makes
+/// obvious: that the walk over `row_offset` is contiguous in memory, and that the
+/// three operands cannot alias. That is the same devectorization shape recorded in
+/// `perf_jagged_vec_inner_loop_devectorization`, where binding operands as slices
+/// was worth 2.2-3.5x bit-identically elsewhere in the fleet.
+pub static EIGH_RANK2_UPDATE_FORCE_SCALAR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Benchmark-only same-ELF control for the pre-2026-07-31 symmetric matvec.
@@ -40606,6 +40651,108 @@ mod no_native_blas_smuggling {
                 .take(20)
                 .any(|l| l.trim() == "#![forbid(unsafe_code)]"),
             "fsci-linalg no longer forbids unsafe code in its first 20 lines"
+        );
+    }
+}
+
+/// frankenscipy-ll0kk — driver for `EIGH_RANK2_UPDATE_FORCE_SCALAR`.
+///
+/// The toggle claims BIT-IDENTICAL, and that claim is strong precisely because the
+/// rewrite is supposed to change only how the operands reach the optimizer. If a
+/// single bit moves, the rewrite reassociated or contracted something and the perf
+/// number it was written to chase would be measuring a different computation.
+#[cfg(test)]
+mod toggle_ab_eigh_rank2_update {
+    use super::{
+        DecompOptions, EIGH_RANK2_UPDATE_FORCE_SCALAR, PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE, eigh,
+    };
+    use std::sync::atomic::Ordering;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn rank2_update_rewrite_is_bit_identical() {
+        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // MUST-HIT / MUST-MISS on the detector: this test's whole content is a
+        // bit comparison, so a comparison that cannot see a difference would pass
+        // it vacuously. `to_bits`, since `-0.0 == 0.0`.
+        assert!(
+            f64::from_bits(1.25f64.to_bits() ^ 1).to_bits() != 1.25f64.to_bits()
+                && 0.0f64.to_bits() != (-0.0f64).to_bits(),
+            "the bit comparison is blind"
+        );
+
+        // n must exceed 2 or the reduction loop never runs; 96 gives ~94 reflector
+        // steps, so the kernel is entered thousands of times and a difference in
+        // any one of them survives into the spectrum.
+        const N: usize = 96;
+        const _: () = assert!(N > 2);
+        let a: Vec<Vec<f64>> = (0..N)
+            .map(|i| {
+                (0..N)
+                    .map(|j| {
+                        let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
+                        let k = (lo as u64).wrapping_mul(2_654_435_761).wrapping_add(hi as u64);
+                        let v = ((k % 100_003) as f64) / 100_003.0;
+                        if i == j { v + N as f64 } else { v }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // Force the native route, or small n takes nalgebra and this kernel never
+        // runs -- the comparison would pass while exercising nothing.
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(1, Ordering::Relaxed);
+
+        EIGH_RANK2_UPDATE_FORCE_SCALAR.store(true, Ordering::Relaxed);
+        let scalar = eigh(&a, DecompOptions::default()).expect("eigh scalar arm");
+        EIGH_RANK2_UPDATE_FORCE_SCALAR.store(false, Ordering::Relaxed);
+        let sliced = eigh(&a, DecompOptions::default()).expect("eigh sliced arm");
+
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, Ordering::Relaxed);
+
+        assert_eq!(scalar.eigenvalues.len(), N, "wrong eigenvalue count");
+        assert!(
+            scalar.eigenvalues.iter().all(|v| v.is_finite()),
+            "fixture produced non-finite eigenvalues; a NaN spectrum compares \
+             unequal for the wrong reason"
+        );
+        // The fixture must be non-degenerate, or equal eigenvalues would make the
+        // comparison insensitive to most of the kernel's output.
+        let spread = scalar.eigenvalues[N - 1] - scalar.eigenvalues[0];
+        assert!(
+            spread > 1.0,
+            "eigenvalue spread {spread} is too small; a near-degenerate spectrum \
+             would compare equal regardless of the kernel"
+        );
+
+        let first_diff = scalar
+            .eigenvalues
+            .iter()
+            .zip(&sliced.eigenvalues)
+            .position(|(x, y)| x.to_bits() != y.to_bits());
+        assert!(
+            first_diff.is_none(),
+            "EIGH_RANK2_UPDATE_FORCE_SCALAR is documented BIT-IDENTICAL and is not: \
+             eigenvalues first differ at index {first_diff:?}. The rewrite only \
+             rebinds operands as slices, so any difference means it reassociated or \
+             contracted an FMA -- in which case the perf number it chases would be \
+             measuring a different computation"
+        );
+
+        let vec_diff = scalar
+            .eigenvectors
+            .iter()
+            .zip(&sliced.eigenvectors)
+            .position(|(r1, r2)| {
+                r1.iter().zip(r2).any(|(x, y)| x.to_bits() != y.to_bits())
+            });
+        assert!(
+            vec_diff.is_none(),
+            "eigenvectors differ at row {vec_diff:?} though the eigenvalues agree; \
+             the reduction feeds the back-transform, so vectors are the more \
+             sensitive check of the two"
         );
     }
 }
