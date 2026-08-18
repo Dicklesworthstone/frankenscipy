@@ -498,19 +498,23 @@ pub(crate) fn real_schur_francis(
         let h10 = h.get(ilo + 1, ilo);
         let mut x = h00 * h00 + h.get(ilo, ilo + 1) * h10 - s_tr * h00 + s_det;
         let mut y = h10 * (h00 + h.get(ilo + 1, ilo + 1) - s_tr);
-        let mut z = h10 * h.get(ilo + 2, ilo + 1);
+        // NOT `z`: the enclosing function already binds `z` to the BASIS matrix,
+        // and this scalar shadowed it, so the basis accumulation below silently
+        // addressed an f64. Named for what it is -- the third component of the
+        // bulge vector (x, y, zb).
+        let mut zb = h10 * h.get(ilo + 2, ilo + 1);
 
         for k in ilo..ihi - 1 {
             // A 3-element Householder reflector zeroing y and z.
-            let norm_sq = x * x + y * y + z * z;
+            let norm_sq = x * x + y * y + zb * zb;
             if norm_sq != 0.0 {
                 let norm = norm_sq.sqrt();
                 let beta = if x >= 0.0 { -norm } else { norm };
                 let v0 = x - beta;
-                let vnorm_sq = v0 * v0 + y * y + z * z;
+                let vnorm_sq = v0 * v0 + y * y + zb * zb;
                 if vnorm_sq != 0.0 {
                     let two_over = 2.0 / vnorm_sq;
-                    let v = [v0, y, z];
+                    let v = [v0, y, zb];
                     let rows = [k, k + 1, k + 2];
                     let last = (k + 3).min(ihi + 1);
 
@@ -556,7 +560,7 @@ pub(crate) fn real_schur_francis(
             if k + 1 < ihi {
                 x = h.get(k + 1, k);
                 y = h.get(k + 2, k);
-                z = if k + 3 <= ihi { h.get(k + 3, k) } else { 0.0 };
+                zb = if k + 3 <= ihi { h.get(k + 3, k) } else { 0.0 };
             }
         }
 
