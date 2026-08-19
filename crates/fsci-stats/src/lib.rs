@@ -59813,6 +59813,241 @@ mod discrete_guide_table_matches_scipy {
     }
 }
 
+/// Sampling from an arbitrary (possibly unnormalised) density by the
+/// ratio-of-uniforms method.
+///
+/// Matches `scipy.stats.sampling.RatioUniforms(pdf, umax=, vmin=, vmax=, c=)`.
+///
+/// Draw `u ~ U(0, umax)` and `v ~ U(vmin, vmax)`; accept `x = v/u + c` when
+/// `u² ≤ f(x)`. The accepted points are distributed exactly as `f`, whatever its
+/// normalising constant, because the region
+///
+/// ```text
+///   A = { (u, v) : 0 < u ≤ √f(v/u + c) }
+/// ```
+///
+/// has area `½∫f` and the map `(u, v) ↦ v/u + c` pushes the uniform distribution
+/// on `A` onto `f`. The rectangle `[0, umax] × [vmin, vmax]` must CONTAIN `A`;
+/// the caller supplies it, exactly as SciPy does, because computing it needs
+/// suprema of `√f` and `x√f` that only the caller knows.
+///
+/// Efficiency is `area(A) / area(rectangle)`, so a loose rectangle costs draws
+/// but never correctness — a rectangle that is too SMALL is the error that
+/// silently returns the wrong distribution, since the missing corner of `A` is
+/// simply never sampled and nothing in the loop can notice.
+///
+/// # Bounded, not "expected to terminate"
+///
+/// A pdf that is zero everywhere the rectangle reaches never accepts, and the
+/// natural loop then spins forever. SciPy guards this by raising after 50000
+/// fruitless tries; this returns `Err` after the same budget PER DRAW, which is
+/// stricter than SciPy's per-batch count and easier to reason about. An
+/// unbounded retry loop is the shape that produced this project's worst defect
+/// (`eig` hanging on `max_niter = 0`), and it is not worth repeating for a
+/// sampler.
+#[derive(Debug, Clone)]
+pub struct RatioUniforms<F> {
+    pdf: F,
+    umax: f64,
+    vmin: f64,
+    vmax: f64,
+    c: f64,
+}
+
+impl<F: Fn(f64) -> f64> RatioUniforms<F> {
+    /// Retries allowed for a single draw before giving up.
+    pub const MAX_TRIES: usize = 50_000;
+
+    /// Build a sampler for `pdf` over the bounding rectangle
+    /// `[0, umax] × [vmin, vmax]`, with location shift `c` (SciPy's default 0).
+    ///
+    /// # Errors
+    ///
+    /// `umax` not positive, `vmin` not below `vmax`, or any bound non-finite.
+    pub fn new(pdf: F, umax: f64, vmin: f64, vmax: f64, c: f64) -> Result<Self, StatsError> {
+        if !(umax > 0.0) || !umax.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "umax must be positive and finite, got {umax}"
+            )));
+        }
+        if !(vmin < vmax) || !vmin.is_finite() || !vmax.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "need finite vmin < vmax, got vmin={vmin} vmax={vmax}"
+            )));
+        }
+        if !c.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "c must be finite, got {c}"
+            )));
+        }
+        Ok(Self {
+            pdf,
+            umax,
+            vmin,
+            vmax,
+            c,
+        })
+    }
+
+    /// One draw, or `Err` if [`Self::MAX_TRIES`] rejections pass without an
+    /// acceptance.
+    ///
+    /// # Errors
+    ///
+    /// The retry budget being exhausted, which in practice means the rectangle
+    /// encloses almost no probability mass.
+    pub fn try_sample_one(&self, rng: &mut impl Rng) -> Result<f64, StatsError> {
+        for _ in 0..Self::MAX_TRIES {
+            let u = self.umax * rng.random::<f64>();
+            if u <= 0.0 {
+                // u = 0 would divide by zero; it has probability zero but a
+                // uniform on [0, 1) can return exactly 0.0.
+                continue;
+            }
+            let v = self.vmin + (self.vmax - self.vmin) * rng.random::<f64>();
+            let x = v / u + self.c;
+            if u * u <= (self.pdf)(x) {
+                return Ok(x);
+            }
+        }
+        Err(StatsError::InvalidArgument(format!(
+            "ratio-of-uniforms rejected {} candidates without an acceptance; the \
+             bounding rectangle probably encloses no mass of the density",
+            Self::MAX_TRIES
+        )))
+    }
+
+    /// `n` draws.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_sample_one`].
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Result<Vec<f64>, StatsError> {
+        (0..n).map(|_| self.try_sample_one(rng)).collect()
+    }
+}
+
+#[cfg(test)]
+mod ratio_uniforms_matches_scipy {
+    use super::{RatioUniforms, StatsError};
+    use rand::{SeedableRng, rngs::StdRng};
+
+    /// `√(2/e)`, the supremum of `|x|·√f` for `f(x) = exp(−x²/2)`: the tight `v`
+    /// bound for a standard normal. `√f` peaks at 1, so `umax = 1`.
+    const V_NORMAL: f64 = 0.857_763_884_960_706_8;
+
+    /// The method's whole claim is that accepted points follow `f` regardless of
+    /// its normalisation, so the test uses an UNNORMALISED density -- `exp(−x²/2)`
+    /// without the `1/√(2π)` -- and requires standard-normal moments out of it.
+    /// Normalising the fixture would test something weaker than the claim.
+    #[test]
+    fn an_unnormalised_gaussian_yields_standard_normal_moments() {
+        let r = RatioUniforms::new(|x: f64| (-x * x / 2.0).exp(), 1.0, -V_NORMAL, V_NORMAL, 0.0)
+            .expect("valid bounds");
+        let mut rng = StdRng::seed_from_u64(20260819);
+        let n = 200_000;
+        let s = r.sample(n, &mut rng).expect("acceptance within budget");
+        assert_eq!(s.len(), n);
+
+        let mean = s.iter().sum::<f64>() / n as f64;
+        let var = s.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+        // Tolerances are 5 standard errors computed from n, not chosen to pass:
+        // se(mean) = 1/√n, se(var) = √(2/n) for a normal.
+        let se_mean = (1.0 / n as f64).sqrt();
+        let se_var = (2.0 / n as f64).sqrt();
+        assert!(
+            mean.abs() < 5.0 * se_mean,
+            "mean {mean}, tolerance {}",
+            5.0 * se_mean
+        );
+        assert!(
+            (var - 1.0).abs() < 5.0 * se_var,
+            "var {var}, tolerance {}",
+            5.0 * se_var
+        );
+        // Symmetry is a second, independent handle on the same sample: a shifted
+        // or one-sided acceptance region would move this while leaving the
+        // variance alone.
+        let above = s.iter().filter(|x| **x > 0.0).count() as f64 / n as f64;
+        assert!((above - 0.5).abs() < 5.0 * (0.25 / n as f64).sqrt(), "P(X>0) = {above}");
+    }
+
+    /// A bounded support, where the rectangle is exact and every accepted point
+    /// must lie inside `[0, 1]` -- a hard constraint, not a statistical one.
+    #[test]
+    fn a_uniform_density_stays_inside_its_support() {
+        let r = RatioUniforms::new(
+            |x: f64| if (0.0..=1.0).contains(&x) { 1.0 } else { 0.0 },
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+        )
+        .expect("valid bounds");
+        let mut rng = StdRng::seed_from_u64(7);
+        let n = 100_000;
+        let s = r.sample(n, &mut rng).expect("acceptance within budget");
+        assert!(
+            s.iter().all(|x| (0.0..=1.0).contains(x)),
+            "a draw escaped the support"
+        );
+        let mean = s.iter().sum::<f64>() / n as f64;
+        assert!((mean - 0.5).abs() < 5.0 * (1.0 / 12.0 / n as f64).sqrt(), "mean {mean}");
+    }
+
+    /// The location shift `c` moves the whole distribution and nothing else.
+    #[test]
+    fn the_shift_translates_the_sample() {
+        let shifted =
+            RatioUniforms::new(|x: f64| (-x * x / 2.0).exp(), 1.0, -V_NORMAL, V_NORMAL, 3.0)
+                .expect("valid bounds");
+        let mut rng = StdRng::seed_from_u64(11);
+        let n = 100_000;
+        let s = shifted.sample(n, &mut rng).expect("acceptance");
+        let mean = s.iter().sum::<f64>() / n as f64;
+        // `c` shifts the ARGUMENT of the pdf, so with the pdf still centred at 0
+        // the sample centres at c.
+        assert!((mean - 3.0).abs() < 5.0 * (1.0 / n as f64).sqrt(), "mean {mean}");
+    }
+
+    /// MUST-HIT for the retry budget. A density that is zero across the whole
+    /// rectangle can never be accepted, and the natural loop spins forever. This
+    /// has to come back as an error, promptly.
+    #[test]
+    fn an_impossible_density_errors_instead_of_hanging() {
+        let r = RatioUniforms::new(|_x: f64| 0.0, 1.0, -1.0, 1.0, 0.0).expect("valid bounds");
+        let mut rng = StdRng::seed_from_u64(1);
+        let err = r.try_sample_one(&mut rng);
+        assert!(
+            matches!(err, Err(StatsError::InvalidArgument(_))),
+            "a never-accepting density must return Err, not loop"
+        );
+        // MUST-MISS control: the same shape with a density that CAN be accepted
+        // succeeds, so the error above is about the density and not the budget.
+        let ok = RatioUniforms::new(|_x: f64| 1.0, 1.0, -1.0, 1.0, 0.0).expect("valid bounds");
+        assert!(ok.try_sample_one(&mut rng).is_ok());
+    }
+
+    #[test]
+    fn validation() {
+        let f = |x: f64| (-x * x / 2.0).exp();
+        assert!(RatioUniforms::new(f, 0.0, -1.0, 1.0, 0.0).is_err(), "umax 0");
+        assert!(RatioUniforms::new(f, -1.0, -1.0, 1.0, 0.0).is_err(), "umax < 0");
+        assert!(RatioUniforms::new(f, 1.0, 1.0, 1.0, 0.0).is_err(), "vmin == vmax");
+        assert!(RatioUniforms::new(f, 1.0, 2.0, 1.0, 0.0).is_err(), "vmin > vmax");
+        assert!(
+            RatioUniforms::new(f, f64::INFINITY, -1.0, 1.0, 0.0).is_err(),
+            "non-finite umax"
+        );
+        assert!(
+            RatioUniforms::new(f, 1.0, -1.0, 1.0, f64::NAN).is_err(),
+            "non-finite c"
+        );
+        // MUST-MISS control for the guards above.
+        assert!(RatioUniforms::new(f, 1.0, -1.0, 1.0, 0.0).is_ok());
+    }
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
