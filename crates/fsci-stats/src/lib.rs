@@ -4961,6 +4961,18 @@ pub static WEIBULL_FIT_LN_REUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Same-binary A/B toggle for the Weibull/WeibullMax density shape factors.
+///
+/// CONTRACT: NOT byte-identical; agrees to a few ulp, ~1e-15 relative. The fast arm
+/// computes `bc = base^c` once and forms `base^(c−1)` as `bc / base`, replacing a second
+/// `powf` with a divide. Those are the same value mathematically and different values in
+/// floating point: `powf` is correctly rounded to within its own error bound, and
+/// `bc / base` carries the rounding of `bc` through an additional division, so the two
+/// disagree in the last place or two.
+///
+/// Sibling `WEIBULL_FIT_LN_REUSE_DISABLE` states the same shape of contract for the fit
+/// loop, and adds the part that matters there — the fixed point is unchanged. No such
+/// claim is made here because this toggle feeds `pdf`/`logpdf` directly, where the
+/// returned value IS the result and there is no iteration to absorb the difference.
 pub static WEIBULL_DENSITY_REUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -33131,6 +33143,16 @@ enum RankTieMethod {
 
 /// Same-binary A/B toggle for the radix-argsort fast path in the rank engine.
 /// When true, `rankdata_ties`/`rankdata_ordinal` fall back to the comparison sort.
+///
+/// CONTRACT: BYTE-IDENTICAL ranks either way, on every input including NaN and −0.0.
+/// This is stronger than "both sort correctly" and the reason is worth stating, because
+/// the obvious worry — an unstable comparison sort against a stable radix one — would
+/// break ORDINAL ranks, which are assigned by sorted position rather than by value. It
+/// does not: the radix path sorts the `total_cmp` key transform, so it reproduces
+/// `total_cmp` order exactly (−0.0 before +0.0, NaN ordered rather than incomparable),
+/// and LSD radix is stable with indices seeded `0..n`, so equal keys — which are equal
+/// BITS — come out in ascending index order. That is precisely the
+/// `total_cmp.then(index)` comparator the fallback uses.
 pub static RANKDATA_RADIX_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -50170,6 +50192,13 @@ pub struct ProbplotResult {
 /// Toggle forcing the probability-plot theoretical-quantile maps (`probplot`,
 /// `probplot_quantiles`) onto the serial path, for A/B measurement. Default
 /// `false` = the per-point `ndtri`/`ppf` evals fan across cores.
+///
+/// CONTRACT: BYTE-IDENTICAL either way, on every input. The parallel arm is a pure MAP —
+/// each output depends only on its own input, and `par_continuous_map` preserves index
+/// order — so no value is ever combined with another and there is no summation order to
+/// change. That is what makes this exact, and it is the property to check if the body is
+/// ever rewritten: the moment a reduction appears between the points, the contract
+/// becomes a tolerance rather than an identity.
 pub static PROBPLOT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -56029,6 +56058,17 @@ pub fn durbin_watson(residuals: &[f64]) -> f64 {
 /// Returns autocorrelation at lags 0, 1, ..., max_lag.
 /// Same-binary A/B toggle for the FFT (Wiener–Khinchin) autocorrelation path.
 /// When true, `acf` always takes the direct O(n·lags) dot path.
+///
+/// CONTRACT: NOT byte-identical, and not claimed to be. The two arms compute the same
+/// mathematical quantity by different routes — a forward/inverse transform pair against
+/// an explicit dot product — so they differ at the level the FFT's own error bound
+/// allows, which grows like `eps·log n` rather than staying fixed. Expect agreement to
+/// roughly 1e-12 relative on the lags that carry signal.
+///
+/// The absolute difference is NOT a useful bound here and should not be used as one:
+/// autocorrelation at high lag decays toward zero, so a difference that is negligible
+/// against lag 0 can be a large RELATIVE error on a lag whose true value is near zero.
+/// Any A/B on this toggle should compare relative to each lag's own magnitude.
 pub static ACF_FFT_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
