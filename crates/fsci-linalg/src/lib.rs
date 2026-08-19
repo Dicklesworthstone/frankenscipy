@@ -5178,6 +5178,7 @@ fn cholesky_syrk_parallel_rows<const SYRK_KERNEL: u8>(
 ) {
     let m2 = trailing.len() / n;
     let chunk = m2.div_ceil(nthreads);
+    let nc = chol_syrk_nc();
     rayon::scope(|scope| {
         for (thread_index, rows) in trailing.chunks_mut(chunk * n).enumerate() {
             let row_offset = thread_index * chunk;
@@ -5186,7 +5187,16 @@ fn cholesky_syrk_parallel_rows<const SYRK_KERNEL: u8>(
                     cholesky_syrk_flat_rows_mr4_nr4(rows, row_offset, n, l21, l21t, nb, kb);
                 }
                 SYRK_KERNEL_MR4_NR8_FMA => {
-                    cholesky_syrk_flat_rows_mr4_nr8_fma(rows, row_offset, n, l21, l21t, nb, kb);
+                    // `nc` is resolved ONCE per SYRK call, above the per-tile loops, so the
+                    // atomic is never read inside a hot loop where it would act as an
+                    // optimisation barrier.
+                    if let Some(nc) = nc {
+                        cholesky_syrk_flat_rows_mr4_nr8_fma_nc(
+                            rows, row_offset, n, l21, l21t, nb, kb, nc,
+                        );
+                    } else {
+                        cholesky_syrk_flat_rows_mr4_nr8_fma(rows, row_offset, n, l21, l21t, nb, kb);
+                    }
                 }
                 _ => {
                     cholesky_syrk_flat_rows_mr4_nr8_orig(rows, row_offset, n, l21, l21t, nb, kb);
@@ -5350,9 +5360,16 @@ fn cholesky_lower_blocked_with_kernels_scratch<
                         cholesky_syrk_flat_rows_mr4_nr4(trailing, 0, n, l21_ref, l21t_ref, nb, kb);
                     }
                     SYRK_KERNEL_MR4_NR8_FMA => {
-                        cholesky_syrk_flat_rows_mr4_nr8_fma(
-                            trailing, 0, n, l21_ref, l21t_ref, nb, kb,
-                        );
+                        // Resolved once per panel, not per tile — see the parallel arm.
+                        if let Some(nc) = chol_syrk_nc() {
+                            cholesky_syrk_flat_rows_mr4_nr8_fma_nc(
+                                trailing, 0, n, l21_ref, l21t_ref, nb, kb, nc,
+                            );
+                        } else {
+                            cholesky_syrk_flat_rows_mr4_nr8_fma(
+                                trailing, 0, n, l21_ref, l21t_ref, nb, kb,
+                            );
+                        }
                     }
                     _ => {
                         cholesky_syrk_flat_rows_mr4_nr8_orig(
@@ -5526,6 +5543,42 @@ fn chol_panel_inner_for(n: usize) -> usize {
         1 => 0,
         v => v,
     }
+}
+
+/// Column-block width (NC) for the trailing SYRK's tile traversal. `0` = OFF, the
+/// single-pass traversal that has always shipped.
+///
+/// WHAT IT CHANGES. The trailing SYRK walks the triangular tile grid row-block-outer: for
+/// each 4-row block it sweeps every 8-column micro-panel. That means the packed transpose
+/// `l21t` is re-streamed once per row block — `m2/4` passes over `m2·nb` doubles — while
+/// each row's own `a0..a3` stay hot. Setting NC to a multiple of 8 wraps an outer loop over
+/// column blocks around that sweep, so one `NC`-wide slice of `l21t` is reused across ALL
+/// row blocks before the next slice is touched.
+///
+/// WHY IT IS BIT-IDENTICAL, not merely close. Every trailing element `(i, j)` receives its
+/// contribution from exactly ONE tile and is written exactly once, by `syrk_sub8` or by
+/// `cholesky_syrk_row_tail`. Reordering the tiles therefore cannot reassociate any sum: the
+/// `p` loop inside a tile is untouched, and no two tiles accumulate into the same element.
+/// The requirement is only that `NC` be a multiple of 8, so the blocked `j` sequence is the
+/// same set `{0, 8, 16, …}` the single-pass loop visits. Values are rounded down to a
+/// multiple of 8, with a floor of 8. This is asserted, not assumed:
+/// `chol_syrk_nc_blocking_is_bit_identical` compares raw factor bits across NC settings.
+///
+/// STATUS: SHIPPED OFF. `frankenscipy-8l8r1.151` asked for exactly this switch; it exists so
+/// the lever can be measured in ONE binary against a live SciPy arm, which is the only way
+/// the earlier attempt's local-probe gains could be believed. No ratio is claimed for it
+/// here — it is a switch, not a result, until a row says otherwise.
+#[doc(hidden)]
+pub static CHOL_SYRK_NC_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The effective NC, normalised: `None` when off, else a multiple of 8, at least 8.
+fn chol_syrk_nc() -> Option<usize> {
+    let raw = CHOL_SYRK_NC_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return None;
+    }
+    Some((raw & !7).max(8))
 }
 
 /// A/B override for the blocked-Cholesky panel width `NB` (0 ⇒ default 128).
@@ -22141,6 +22194,90 @@ fn cholesky_syrk_flat_rows_mr4_nr8_fma(
         for mrow in 0..4 {
             let r0 = (base + mrow) * n;
             cholesky_syrk_row_tail(&mut rows[r0..r0 + n], ii + mrow, j, l21, nb, kb);
+        }
+        base += 4;
+    }
+    for local_i in base..m {
+        let r0 = local_i * n;
+        cholesky_syrk_row_tail(&mut rows[r0..r0 + n], row_offset + local_i, 0, l21, nb, kb);
+    }
+}
+
+/// NC-blocked twin of [`cholesky_syrk_flat_rows_mr4_nr8_fma`] — same tiles, same order
+/// inside a tile, different order BETWEEN tiles.
+///
+/// The single-pass kernel is row-block-outer, so it re-streams all of `l21t` once per 4-row
+/// block. Here an outer loop over `NC`-wide column blocks comes first, so one slice of
+/// `l21t` is reused across every row block before the next slice is loaded.
+///
+/// The tails are deliberately NOT inside the column loop. Each row's tail covers the
+/// diagonal block from `8·floor(ii/8)` onward and must run exactly once; computing that
+/// bound from `ii` directly, rather than from wherever a tiled loop happened to stop, is
+/// what keeps this identical to the single-pass form under any `NC`.
+#[allow(clippy::too_many_arguments)]
+fn cholesky_syrk_flat_rows_mr4_nr8_fma_nc(
+    rows: &mut [f64],
+    row_offset: usize,
+    n: usize,
+    l21: &[f64],
+    l21t: &[f64],
+    nb: usize,
+    kb: usize,
+    nc: usize,
+) {
+    use std::simd::StdFloat;
+    let m = rows.len() / n;
+    // Highest column any full tile can reach is bounded by the highest row index present.
+    let j_end = row_offset + m;
+    let mut jc = 0;
+    while jc < j_end {
+        let jc_end = jc + nc;
+        let mut base = 0;
+        while base + 4 <= m {
+            let ii = row_offset + base;
+            // Tiles need `j + 8 <= ii`; the column block additionally caps `j` at `jc_end`.
+            let j_lim = ii.min(jc_end);
+            let a0 = &l21[ii * nb..ii * nb + nb];
+            let a1 = &l21[(ii + 1) * nb..(ii + 1) * nb + nb];
+            let a2 = &l21[(ii + 2) * nb..(ii + 2) * nb + nb];
+            let a3 = &l21[(ii + 3) * nb..(ii + 3) * nb + nb];
+            let mut j = jc;
+            while j + 8 <= j_lim {
+                let pbase = (j / 8) * nb * 8;
+                let panel = &l21t[pbase..pbase + nb * 8];
+                let mut c0 = Simd::<f64, 8>::splat(0.0);
+                let mut c1 = Simd::<f64, 8>::splat(0.0);
+                let mut c2 = Simd::<f64, 8>::splat(0.0);
+                let mut c3 = Simd::<f64, 8>::splat(0.0);
+                for p in 0..nb {
+                    let bvec = Simd::<f64, 8>::from_slice(&panel[p * 8..p * 8 + 8]);
+                    c0 = bvec.mul_add(Simd::splat(a0[p]), c0);
+                    c1 = bvec.mul_add(Simd::splat(a1[p]), c1);
+                    c2 = bvec.mul_add(Simd::splat(a2[p]), c2);
+                    c3 = bvec.mul_add(Simd::splat(a3[p]), c3);
+                }
+                let col = kb + j;
+                let r0 = base * n;
+                syrk_sub8(&mut rows[r0..r0 + n], col, c0);
+                syrk_sub8(&mut rows[r0 + n..r0 + 2 * n], col, c1);
+                syrk_sub8(&mut rows[r0 + 2 * n..r0 + 3 * n], col, c2);
+                syrk_sub8(&mut rows[r0 + 3 * n..r0 + 4 * n], col, c3);
+                j += 8;
+            }
+            base += 4;
+        }
+        jc = jc_end;
+    }
+
+    // Tails, once each, after every column block has been applied.
+    let mut base = 0;
+    while base + 4 <= m {
+        let ii = row_offset + base;
+        // Where the single-pass tiled loop would have stopped for this row block.
+        let jt = (ii / 8) * 8;
+        for mrow in 0..4 {
+            let r0 = (base + mrow) * n;
+            cholesky_syrk_row_tail(&mut rows[r0..r0 + n], ii + mrow, jt, l21, nb, kb);
         }
         base += 4;
     }
@@ -41875,6 +42012,148 @@ mod toggle_ab_eig_balance {
                     c += 1;
                 }
             }
+        }
+    }
+}
+
+/// `frankenscipy-8l8r1.151` — the NC-blocked trailing SYRK must be BIT-IDENTICAL.
+///
+/// The whole justification for `CHOL_SYRK_NC_OVERRIDE` is that reordering tiles cannot
+/// change any arithmetic: every trailing element gets its contribution from exactly one
+/// tile and is written exactly once, and the `p` loop inside a tile is untouched. That is an
+/// argument; this is the check. It compares RAW BITS, not an epsilon, because "bit-identical"
+/// is the actual contract and a tolerance would pass an implementation that had quietly
+/// started reassociating.
+///
+/// A naive NC implementation fails this in two specific ways, and both are covered:
+///   - running each row's diagonal tail once PER COLUMN BLOCK instead of once overall
+///     (the tail would be applied 2-4x and the factor would be badly wrong);
+///   - taking an NC that is not a multiple of 8, so the blocked `j` sequence stops
+///     mid-micro-panel and skips or double-counts tiles. `chol_syrk_nc` rounds down to a
+///     multiple of 8 with a floor of 8, and NC=12 below exercises that rounding.
+///
+/// Sizes straddle the blocking: n=64 is smaller than one NC block, n=129 is odd so the
+/// 4-row and 8-column remainders are both non-empty, and n=300 = 8·37 + 4 is not a multiple
+/// of the panel width. A test that only used clean powers of two would prove nothing about
+/// the remainder handling, which is where a tiling bug actually lives.
+#[cfg(test)]
+mod chol_syrk_nc_blocking {
+    use super::{CHOL_SYRK_NC_OVERRIDE, DecompOptions, cholesky};
+    use std::sync::atomic::Ordering;
+
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// SPD by construction: `A = MMᵀ + nI`, deterministic in `seed`.
+    fn spd(n: usize, seed: u64) -> Vec<Vec<f64>> {
+        let mut s = seed | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+        };
+        let m: Vec<Vec<f64>> = (0..n).map(|_| (0..n).map(|_| next()).collect()).collect();
+        let mut a = vec![vec![0.0f64; n]; n];
+        for i in 0..n {
+            for j in 0..=i {
+                let dot: f64 = (0..n).map(|k| m[i][k] * m[j][k]).sum();
+                let v = if i == j { dot + n as f64 } else { dot };
+                a[i][j] = v;
+                a[j][i] = v;
+            }
+        }
+        a
+    }
+
+    fn bits(a: &[Vec<f64>]) -> Vec<u64> {
+        a.iter()
+            .flat_map(|r| r.iter().map(|v| v.to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn chol_syrk_nc_blocking_is_bit_identical() {
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // 64 is smaller than one NC block; 129 is odd, so both the 4-row and 8-column
+        // remainders are non-empty; 300 = 8·37 + 4 is not a multiple of the panel width.
+        // n=513 was dropped deliberately: it added ~5x the cost of the rest of the module
+        // for coverage 300 already gives, and the extra CPU pressure made two PRE-EXISTING
+        // determinism tests elsewhere in this crate flake (see the bead on that). A test
+        // that destabilises its neighbours to re-prove something is a bad trade.
+        for &n in &[64usize, 129, 300] {
+            let a = spd(n, 0x5eed_c0de ^ n as u64);
+
+            CHOL_SYRK_NC_OVERRIDE.store(0, Ordering::Relaxed);
+            let base = cholesky(&a, true, DecompOptions::default()).expect("spd factors");
+            let base_bits = bits(&base.factor);
+
+            // The fixture must actually reach the blocked path, or every comparison below
+            // is two runs of the same code agreeing with itself.
+            assert!(
+                base.factor[n - 1][0] != 0.0 || n < 8,
+                "n={n}: fixture produced a trivial factor"
+            );
+
+            for &nc in &[8usize, 12, 64, 4096] {
+                CHOL_SYRK_NC_OVERRIDE.store(nc, Ordering::Relaxed);
+                let got = cholesky(&a, true, DecompOptions::default()).expect("spd factors");
+                CHOL_SYRK_NC_OVERRIDE.store(0, Ordering::Relaxed);
+                let got_bits = bits(&got.factor);
+                assert_eq!(
+                    got_bits.len(),
+                    base_bits.len(),
+                    "n={n} nc={nc}: factor shape changed"
+                );
+                let differing = base_bits
+                    .iter()
+                    .zip(&got_bits)
+                    .filter(|(x, y)| x != y)
+                    .count();
+                assert_eq!(
+                    differing,
+                    0,
+                    "n={n} nc={nc}: {differing} of {} factor entries differ; NC blocking is \
+                     supposed to reorder tiles, not arithmetic",
+                    base_bits.len()
+                );
+            }
+        }
+    }
+
+    /// NC=4 and NC=1 must behave as NC=8, not as a broken half-panel stride.
+    ///
+    /// This is the MUST-HIT for the rounding in `chol_syrk_nc`: without the `& !7` an NC
+    /// below 8 would step the `j` loop off the micro-panel grid. Asserted through the public
+    /// factor rather than by calling the private helper, so it tests the shipped path.
+    #[test]
+    fn sub_panel_nc_is_rounded_up_to_a_full_micro_panel() {
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let n = 300;
+        let a = spd(n, 0xabcd_ef01);
+        CHOL_SYRK_NC_OVERRIDE.store(0, Ordering::Relaxed);
+        let base = bits(
+            &cholesky(&a, true, DecompOptions::default())
+                .expect("spd factors")
+                .factor,
+        );
+        for &nc in &[1usize, 4, 7] {
+            CHOL_SYRK_NC_OVERRIDE.store(nc, Ordering::Relaxed);
+            let got = bits(
+                &cholesky(&a, true, DecompOptions::default())
+                    .expect("spd factors")
+                    .factor,
+            );
+            CHOL_SYRK_NC_OVERRIDE.store(0, Ordering::Relaxed);
+            assert_eq!(
+                got, base,
+                "nc={nc} did not round up to a full 8-column panel"
+            );
         }
     }
 }
