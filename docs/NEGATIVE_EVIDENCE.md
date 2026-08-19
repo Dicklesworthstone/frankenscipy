@@ -38237,3 +38237,142 @@ open question. One fresh worker does not generalise — ozg54's own history is t
 the discriminating variable, and RainyPrairie already retracted one over-inference from a single
 worker's behaviour. The experiment remains open and now has a cheaper instrument to run it with
 when vmi1153651 returns.
+
+## 2026-08-19 — frankenscipy-zdom3 — periodic-cuboid spsolve — DECISION=KEEP, and a 124.677x LOSS became an 84.155x WIN
+
+The bead's own admitted profile (2026-08-01, SilverRiver) measured the untouched public
+`spsolve` at **124.677x SLOWER than live SciPy** on a shifted periodic cuboid. That is the gap
+this bead existed to close. It is now closed and reversed, on the pre-registered completion
+fixture, with every gate the pre-registration named.
+
+    PERIODIC_CUBOID_SPSOLVE_DECISION=KEEP   competitive_claim=PASS
+
+Result class: CAMPAIGN-WIN
+Incumbent ratio: SciPy / FrankenSciPy = 84.155362x
+Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.spsolve`, timed side-by-side with the
+candidate and the same-ELF control in the same-invocation (all three arms inside one process,
+interleaved with their A/A nulls; the side-by-side same-invocation raw sample vectors are in the
+artifact committed with this row).
+physical_cores=32 numa_nodes=1 affinity=1
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.127)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.151)
+frankenscipy-engine-sha256 = 8a70edaa243deabffc7dbf3b446656e66d050d4d07b9aaecf58072594d1a0eae
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+harness=crates/fsci-sparse/src/bin/perf_spsolve.rs (mode --periodic-cuboid-spsolve-live)
+same_host=thinkstation1 (LOCAL run, not an rch worker; RCH_WORKER=none, both arms on this host)
+host identity=thinkstation1 physical cores=32 logical threads=64 RAM=231692279808 bytes
+NUMA count=1 requested threads=1 actual observed worker threads=1 (both arms)
+runtime-detected ISA=avx2+fma (avx512f=false) affinity/cpuset=cpu 1 only (SMT siblings 1,33)
+CPU frequency governor=powersave (amd-pstate-epp, 1429008-4561833 kHz; cpu 1 read 1429 MHz)
+host-wide pre-measurement quiescence=0.127 mean busy (pinned 0.070, sibling 0.000) admitted=true
+host-wide post-measurement quiescence=0.151 mean busy (pinned 0.090, sibling 0.020) admitted=true
+iowait=0 loadavg=9.69/9.16/7.01
+
+Engine artifact SHA-256, two distinct named artifacts:
+  executed-binary ELF SHA-256 = 8a70edaa243deabffc7dbf3b446656e66d050d4d07b9aaecf58072594d1a0eae
+    (self-reported in-process; artifact name: target/release/perf_spsolve)
+  SciPy engine SHA-256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+    (artifact name: scipy/sparse/linalg/_dsolve/linsolve.py, scipy 1.17.1 / numpy 2.4.3)
+
+A/A NULL AND MARGIN. All A/A nulls were run in the same invocation and their medians agree
+within 2% (`null_medians_within_2pct=true`). The decision applies a 2x A/A-null margin: the
+harness computed `twice_widest_null_threshold=1.036594` and required both ratios' CI lows to
+clear it — maintenance CI low 67.167557 and competitive CI low 83.491034 both exceed it by more
+than sixty-fold, and the gate flags read
+`maintenance_ci_low_at_least_1_20_and_beyond_2x_null=true` and
+`competitive_ci_low_beyond_2x_null=true`.
+
+CV IS PROVENANCE ONLY and was not used for the decision: `cv_used_for_decision=false`. The
+decision is taken from the bootstrap-median CIs alone.
+
+
+| arm | p50 | p95 | p99 | CV |
+|---|---|---|---|---|
+| candidate (spectral route) | **6.077 ms** | 6.161 ms | 8.407 ms | 8.21% |
+| same-ELF control (ordered-tree) | 410.137 ms | 426.117 ms | 429.728 ms | 1.71% |
+| live SciPy 1.17.1 | 510.074 ms | 518.259 ms | 521.631 ms | 1.20% |
+
+**Competitive ratio: live SciPy / candidate = 84.155362x**, bootstrap median CI95
+[83.491034, 84.628940], registered minimum 1.0.
+Maintenance ratio: control / candidate = 67.602163x, CI95 [67.167557, 68.437788], registered
+minimum 1.20 and twice-widest-null threshold 1.036594.
+
+Both are reported and labelled, because only the first is a win: the 67.6x is fsci-against-fsci
+and is maintenance by the campaign's own rule. The 84.2x is the row.
+
+### Every pre-registered gate, as adjudicated by the harness
+
+    null_medians_within_2pct=true
+    candidate_p50_at_least_registered_minimum=true   (6.077 ms >= 5.000 ms)
+    maintenance_ci_low_at_least_1_20_and_beyond_2x_null=true
+    competitive_ci_low_beyond_2x_null=true
+    cv_used_for_decision=false          <- CV is provenance only, per the corrected gate
+
+Fixture is the pre-registration's completion criterion verbatim: 9x11x13 periodic cuboid,
+shift 0.001, weights -0.75/-1/-1.25, 32 independent public `spsolve` calls with fresh solver
+state per call, 41184 materialized components, 21 rounds, all A/A nulls run.
+
+### Parity, checked before any timing
+
+    candidate_hits=32  control_hits=0
+    candidate_max_relative_residual=2.056e-12   control=2.986e-12   relative_l2=1.793e-13
+    live_reported_max_relative_residual=1.497e-12  live_recomputed=1.497e-12
+    relative_l2=1.226e-13   component_mismatches=0
+
+`candidate_hits=32 / control_hits=0` is the switch counter the pre-registration demanded: it
+proves the spectral route actually fired on all 32 calls and that the control ran the old path,
+so this is not one code path timed twice. The live arm's residual was RECOMPUTED locally rather
+than trusted from the oracle.
+
+### Provenance
+
+Host thinkstation1, AMD Ryzen Threadripper PRO 5975WX, 32 physical / 64 logical, 1 NUMA node,
+216 GiB. **Pinned to cpu 1 alone** (SMT siblings 1,33), governor `powersave`, amd-pstate-epp,
+1429–4562 MHz, cpu 1 reading 1429 MHz at the run. Runtime ISA avx2+fma, no avx512f.
+Threads: requested 1, **observed 1** on both arms. iowait 0 throughout.
+
+Per-arm load, sampled by the harness at all three phases and all three admitted:
+
+| phase | pinned cpu 1 | sibling 33 | host mean | limit |
+|---|---|---|---|---|
+| preflight | 0.070 | 0.000 | 0.127 | 0.200 |
+| measurement | 0.104 | 0.020 | 0.137 | 0.200 |
+| post | 0.090 | 0.020 | 0.151 | 0.200 |
+
+loadavg 9.69 / 9.16 / 7.01 at completion. fsci ELF sha256
+`8a70edaa243deabffc7dbf3b446656e66d050d4d07b9aaecf58072594d1a0eae`; SciPy engine
+`scipy/sparse/linalg/_dsolve/linsolve.py` sha256
+`a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`; scipy 1.17.1 / numpy 2.4.3,
+`genuine=True`, `fsci_loaded=False`. `ldd` on our binary: no BLAS, LAPACK or MKL.
+Booking `trj_booking_claim_message_id=33731`, verified `persisted=true`.
+
+### It took four attempts, and the three refusals are the interesting part
+
+Attempts 1–3 were REFUSED by the harness's own load gates, and each refusal is worth recording
+because none of them was a bad measurement — all three completed their rounds:
+
+| attempt | pinned cpu | refused at | reason |
+|---|---|---|---|
+| 1 | 11 | post | pinned busy 0.320 |
+| 2 | 7 | measurement | SMT sibling 39 spiked to 0.357 |
+| 3 | 25 | post | pinned 0.061 and sibling 0.092 both fine — **host mean 0.208 vs a 0.200 limit** |
+
+Attempt 3 is the one to note. The pinned core and its sibling were quiet; the run was rejected
+on a host-wide aggregate that a single-CPU-pinned job influences only through shared memory
+bandwidth. On a box where nine projects build continuously, host mean busy sits at 0.12–0.25,
+so that gate is a coin flip rather than a criterion. It did not block this row in the end, and
+I am not proposing to weaken it — but it is the same rule-shape as the unsatisfiable
+`host_wide_quiescence` gate recorded elsewhere in this ledger, and anyone re-running should
+expect to spend several attempts on it.
+
+The method that worked: sample `/proc/stat` per-CPU, pick the quietest SMT sibling PAIR (not
+just the quietest logical CPU — attempt 2 died because the sibling was loaded), and dispatch
+immediately.
+
+### What this does not claim
+
+One fixture, one size, one boundary condition. The recognizer was deliberately NOT widened
+first — RainyPrairie's note is explicit that the odd / >=9 / pairwise-distinct guards are a real
+coverage gap filed separately as `frankenscipy-g68jq`, and that changing them before this
+measurement landed would have invalidated the comparison against the admitted 124.677x profile.
+That widening is now unblocked and is the natural follow-on.
