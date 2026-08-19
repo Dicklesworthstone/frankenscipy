@@ -262,6 +262,16 @@ fn standardize_2x2_blocks(t: &mut Mat, z: &mut Mat, eps: f64) {
             k += 1;
             continue;
         }
+        // A 2x2 block must be PRECEDED by a zero subdiagonal, or it is not a block --
+        // two adjacent nonzero subdiagonals mean the region never finished converging.
+        // Standardizing there would rotate a nonzero `t[k][k-1]` down into `(k+1, k-1)`
+        // and leave the matrix no longer quasi-triangular, which is exactly the
+        // structural failure this guard prevents. LAPACK has the same precondition: it
+        // calls `dlanv2` only on regions it has already deflated.
+        if k > 0 && t.get(k, k - 1) != 0.0 {
+            k += 1;
+            continue;
+        }
         let a = t.get(k, k);
         let b = t.get(k, k + 1);
         let d = t.get(k + 1, k + 1);
@@ -288,15 +298,26 @@ fn standardize_2x2_blocks(t: &mut Mat, z: &mut Mat, eps: f64) {
             let cs = zz / tau;
             let sn = c / tau;
 
-            // Rotate rows k, k+1 of T across all columns, then columns k, k+1
-            // across all rows -- a similarity, so the spectrum is untouched.
-            for j in 0..n {
+            // Rotate rows k, k+1 from column k onward, then columns k, k+1 down to
+            // row k+1 -- a similarity, so the spectrum is untouched.
+            //
+            // THE WINDOWS ARE LOAD-BEARING, not an optimisation. Rotating the rows
+            // across ALL columns mixes row k into row k+1, and row k can carry a
+            // nonzero subdiagonal entry at column k-1; that injects a nonzero at
+            // (k+1, k-1), which is BELOW the subdiagonal and destroys the quasi-
+            // triangular structure the caller is promised. LAPACK avoids it the same
+            // way: its `DROT` on the rows starts at column I, and the one on the
+            // columns stops at row I+1.
+            //
+            // Skipping those entries is only sound because the guard above ensures
+            // `t[k][k-1]` is zero, so nothing is dropped from the similarity.
+            for j in k..n {
                 let x = t.get(k, j);
                 let y = t.get(k + 1, j);
                 t.set(k, j, cs * x + sn * y);
                 t.set(k + 1, j, cs * y - sn * x);
             }
-            for i in 0..n {
+            for i in 0..=(k + 1) {
                 let x = t.get(i, k);
                 let y = t.get(i, k + 1);
                 t.set(i, k, cs * x + sn * y);
@@ -504,8 +525,19 @@ pub(crate) fn real_schur_francis(
         // bulge vector (x, y, zb).
         let mut zb = h10 * h.get(ilo + 2, ilo + 1);
 
-        for k in ilo..ihi - 1 {
-            // A 3-element Householder reflector zeroing y and z.
+        // `k` runs to `ihi - 1` INCLUSIVE. LAPACK's `dlahqr` is `DO K = M, I-1`, and
+        // the final position is where the bulge is expelled off the bottom of the
+        // active block. Stopping one short leaves it sitting below the subdiagonal --
+        // on a 3x3 active block the loop then ran exactly once, created the bulge at
+        // (ilo+2, ilo), and never chased it out.
+        for k in ilo..ihi {
+            // Three elements while there is room, two at the last position: LAPACK's
+            // `NR = MIN(3, I-K+1)`. A 3-element reflector at the last position would
+            // reach row `ihi + 1`, outside the active block.
+            let nr = (ihi - k + 1).min(3);
+            if nr < 3 {
+                zb = 0.0;
+            }
             let norm_sq = x * x + y * y + zb * zb;
             if norm_sq != 0.0 {
                 let norm = norm_sq.sqrt();
@@ -514,9 +546,11 @@ pub(crate) fn real_schur_francis(
                 let vnorm_sq = v0 * v0 + y * y + zb * zb;
                 if vnorm_sq != 0.0 {
                     let two_over = 2.0 / vnorm_sq;
-                    let v = [v0, y, zb];
-                    let rows = [k, k + 1, k + 2];
-                    let last = (k + 3).min(ihi + 1);
+                    let v_all = [v0, y, zb];
+                    let rows_all = [k, k + 1, k + 2];
+                    let v = &v_all[..nr];
+                    let rows = &rows_all[..nr];
+                    let last = (k + nr).min(ihi + 1);
 
                     // Left application over the affected columns.
                     //
@@ -577,7 +611,7 @@ pub(crate) fn real_schur_francis(
                     // bulge means removing it, not leaving it small.
                     if k > ilo {
                         h.set(k + 1, k - 1, 0.0);
-                        if k + 2 <= ihi {
+                        if nr == 3 && k + 2 <= ihi {
                             h.set(k + 2, k - 1, 0.0);
                         }
                     }
@@ -810,7 +844,14 @@ mod tests {
                 for j in 0..i.saturating_sub(1) {
                     assert!(
                         t[i][j].abs() < 1e-9 * (scale + 1.0),
-                        "({n},{seed}) T has a non-zero below the subdiagonal at ({i},{j})"
+                        "({n},{seed}) T has a non-zero below the subdiagonal at \
+                         ({i},{j}): {} against a bound of {:e}. The MAGNITUDE is the \
+                         diagnosis: rounding-level residue means the sweep is right and \
+                         the cleanup is missing, while an O(1) value means the structure \
+                         itself is wrong. Subdiagonal for context: {:?}",
+                        t[i][j],
+                        1e-9 * (scale + 1.0),
+                        (1..n).map(|r| t[r][r - 1]).collect::<Vec<_>>()
                     );
                 }
             }
