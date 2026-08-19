@@ -10006,6 +10006,15 @@ pub fn coshm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
 /// same-binary A/B benchmarks. Defaults off — `tanhm` shares the Padé polynomials
 /// between `expm(A)` and `expm(-A)` via `expm_pm`. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BIT-IDENTICAL either way. `tanhm` needs both `exp(A)` and `exp(-A)`; the
+/// shared arm forms them in ONE pass (shared Padé factors plus a second LU solve) instead
+/// of two independent `expm` runs. Negation is exact in IEEE-754 and the matmul reduction
+/// order is unchanged, so `expm_pm`'s `e_neg` equals `expm_adaptive(−A)` bit for bit.
+///
+/// The comparator is chosen to keep the A/B honest: the two-run arm calls `expm_adaptive`,
+/// NOT the fixed-degree-13 kernel, so both arms scale-and-square at the same adaptive
+/// order. Comparing against the fixed-degree kernel would have measured an order
+/// difference and reported it as the shared-factor saving.
 pub static TANHM_SHARED_PADE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -13507,6 +13516,20 @@ pub static EIGH_DSYMV_PARALLEL_GATHER: std::sync::atomic::AtomicBool =
 /// The production path visits each stored lower-triangle value once. Setting
 /// this flag restores the former strided-upper plus contiguous-lower double
 /// read without changing the rest of the dense `eigh` implementation.
+/// CONTRACT: BIT-IDENTICAL either way on finite data, asserted by
+/// `symmetric_lower_matvec_one_pass_matches_double_read_bits` (and by
+/// `parallel_gather_dsymv_is_bit_identical_to_the_double_read_scatter` for the threaded
+/// arm). The one-pass form touches each lower-triangle element ONCE, using it for both the
+/// `A[i][j]·v[j]` and the mirrored `A[i][j]·v[i]` contribution, where the double-read form
+/// reads both triangles. The accumulation order into each output entry is the same
+/// increasing-column order on both, which is what preserves the bits -- halving the reads
+/// does not halve or reorder the sum.
+///
+/// The "finite data" qualifier is not boilerplate. The one-pass arm SKIPS terms whose
+/// vector element is exactly zero, and skipping is equivalent to adding only while the
+/// matrix entry is finite: `inf · 0.0` is NaN on the double-read arm and simply absent on
+/// the one-pass arm. Inside `eigh`'s tridiagonalisation the input is validated finite
+/// before reaching here, so the precondition holds where the toggle is live.
 pub static EIGH_DSYMV_FORCE_DOUBLE_READ: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -15189,21 +15212,57 @@ const FULL_RANK_TALL_PINV_RIGHT_INVERSE_REL_TOL: f64 = 1e-8;
 /// cosm/sinm Padé kernel (instead of the 2n×2n real block solve) for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: NOT bit-identical -- two different solves of the same system. The default
+/// route rewrites the complex `n×n` solve as a real `2n×2n` block solve through the
+/// parallel blocked LU; forcing this toggle keeps nalgebra's complex LU. Real-block and
+/// complex LU pivot on different quantities and perform a different number of eliminations,
+/// so they agree to conditioning-scaled roundoff rather than exactly.
+///
+/// Below n=256 the toggle is INERT: the gate is `n < 256 || <toggle>`, so the complex arm
+/// runs on both settings and an A/B measured under the crossover compares a path against
+/// itself. That is a real hazard for anyone benchmarking this -- an A/A null wearing an A/B
+/// label -- so size the fixture above the gate before reading anything into the result.
 pub static COSM_NALGEBRA_COMPLEX_SOLVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Runtime switch to force nalgebra's original Cholesky matrix-RHS solve for
 /// same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: NOT bit-identical. This selects between a custom triangular solve against the
+/// Cholesky factor and nalgebra's own Cholesky matrix-RHS solve. Both solve the same
+/// triangular system, but with different blocking and update order, so they agree to
+/// substitution roundoff rather than exactly.
+///
+/// GAP, stated rather than glossed: driven by `linalg_bench` only, with no in-crate A/B
+/// correctness test. Unlike the layout-only toggles next to it, the identity here is NOT
+/// structural -- the arithmetic genuinely differs -- so this one is argued rather than
+/// asserted, and it is one of the two in this file that most deserves a test.
 pub static DISABLE_TALL_PINV_TRSM: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Runtime switch to force the row-major TRSM route to remain single-threaded
 /// for same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The row-major TRSM's parallelism is across
+/// independent right-hand-side COLUMNS -- each column's back-substitution is a separate
+/// chain against the same triangular factor, and no column enters another's result.
+/// Threading changes who runs which column, not the order of operations within one.
+///
+/// Had the split gone across the substitution itself, the sequential dependency would have
+/// made this either wrong or a tolerance; splitting across RHS columns is the shape that
+/// keeps it an identity.
 pub static DISABLE_TALL_PINV_TRSM_THREADS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Runtime switch to force the tall `pinv` route to materialize `A⁺·A` for
 /// same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The certificate needs a scalar summary of `A⁺·A`;
+/// the streaming arm accumulates it entry by entry as the products are formed, the forced
+/// arm materialises the whole matrix first and reduces afterwards. Each entry is the same
+/// dot product accumulated in the same order in both, and the reduction over entries visits
+/// them in the same order -- materialising changes WHEN a value is stored, not what it is or
+/// how the summary combines them.
+///
+/// The saving is an `n×n` allocation and a second pass over it, which is why this is worth
+/// a toggle at all despite being an identity.
 pub static DISABLE_TALL_PINV_STREAMING_CERT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Runtime switch to force the tall `pinv` streaming certificate to read the
@@ -15211,29 +15270,81 @@ pub static DISABLE_TALL_PINV_STREAMING_CERT: std::sync::atomic::AtomicBool =
 /// copy for same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]`;
 /// internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way -- LAYOUT ONLY. Both arms compute the same values
+/// with the same arithmetic in the same order; they differ in which buffer those values
+/// are read from or written into (the row-major public output copy versus the column-major `DMatrix` result -- the same numbers in two layouts). No operand is recombined, so there is nothing
+/// for a different memory order to reassociate.
+///
+/// Driven by `linalg_bench` only -- there is no in-crate A/B correctness test on this
+/// toggle. For a layout-only change that is defensible, since the identity is structural
+/// rather than numerical, but it means the claim rests on reading the code and not on an
+/// assertion. Noted rather than glossed.
 pub static DISABLE_TALL_PINV_ROW_MAJOR_CERT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Runtime switch to force the tall `pinv` TRSM route to solve into the
 /// column-major `DMatrix` result before copying to public rows. Defaults off.
 /// `#[doc(hidden)]`; internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way -- LAYOUT ONLY. Both arms compute the same values
+/// with the same arithmetic in the same order; they differ in which buffer those values
+/// are read from or written into (solving directly into row-major public rows versus solving into the column-major `DMatrix` and copying afterwards). No operand is recombined, so there is nothing
+/// for a different memory order to reassociate.
+///
+/// Driven by `linalg_bench` only -- there is no in-crate A/B correctness test on this
+/// toggle. For a layout-only change that is defensible, since the identity is structural
+/// rather than numerical, but it means the claim rests on reading the code and not on an
+/// assertion. Noted rather than glossed.
 pub static DISABLE_TALL_PINV_ROW_MAJOR_SOLVE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Runtime switch to force the tall `pinv` TRSM route to copy RHS values from
 /// the materialized `Aᵀ` matrix. Defaults off. `#[doc(hidden)]`; internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way -- LAYOUT ONLY. Both arms compute the same values
+/// with the same arithmetic in the same order; they differ in which buffer those values
+/// are read from or written into (reading RHS values through the transposed view versus copying them from a materialised `Aᵀ`). No operand is recombined, so there is nothing
+/// for a different memory order to reassociate.
+///
+/// Driven by `linalg_bench` only -- there is no in-crate A/B correctness test on this
+/// toggle. For a layout-only change that is defensible, since the identity is structural
+/// rather than numerical, but it means the claim rests on reading the code and not on an
+/// assertion. Noted rather than glossed.
 pub static DISABLE_TALL_PINV_TRANSPOSE_RHS_COPY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Runtime switch to force full-row-rank wide `pinv` through the public SVD
 /// route for same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]`;
 /// internal.
 #[doc(hidden)]
+/// CONTRACT: NOT bit-identical -- different algorithms. The fast arm solves a full-row-rank
+/// wide `pinv` through a Cholesky factorization of `A·Aᵀ`; forcing this toggle routes
+/// through the public SVD instead. Cholesky on the normal equations SQUARES the condition
+/// number, so the two agree to a bound that degrades with conditioning, and the gap is a
+/// property of the input rather than a fixed tolerance.
+///
+/// That is precisely why the route is gated on full row rank and on the rcond check next
+/// door (see [`DISABLE_WIDE_PINV_DIAG_RCOND_GATE`]) rather than taken unconditionally.
+///
+/// GAP, stated rather than glossed: this toggle is driven by `linalg_bench` only. There is
+/// no in-crate test comparing the two arms, so the bound above is argued from the algorithm
+/// and not measured here. Of the nineteen toggles in this file it and the TRSM route are
+/// the two whose contracts most deserve an A/B test.
 pub static DISABLE_WIDE_PINV_CHOLESKY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Runtime switch to force full-row-rank wide `pinv` through the older
 /// eigenspectrum rcond gate before the Cholesky solve. Defaults off.
 /// `#[doc(hidden)]`; internal.
 #[doc(hidden)]
+/// CONTRACT: this toggle changes a DECISION, not an arithmetic path. Both arms estimate
+/// whether `A·Aᵀ` is well enough conditioned for the Cholesky route; the default uses the
+/// diagonal-based rcond gate, this forces the older eigenspectrum gate. Where the two gates
+/// agree, the answer is bit-identical, because the same route then runs. Where they
+/// disagree, the difference is not a rounding difference at all -- it is Cholesky versus
+/// SVD (see [`DISABLE_WIDE_PINV_CHOLESKY`]), and the two answers differ by whatever the
+/// conditioning implies.
+///
+/// A toggle like this cannot be characterised by a tolerance, and reporting one would be
+/// misleading. The meaningful A/B measurement is how OFTEN the gates disagree and in which
+/// direction -- a gate that admits Cholesky on a matrix the other refuses is the failure
+/// mode worth counting, not the ulps.
 pub static DISABLE_WIDE_PINV_DIAG_RCOND_GATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Loose conditioning sanity floor for the solve-only normal-equations lstsq
@@ -18215,6 +18326,18 @@ pub fn pascal(n: usize, symmetric: bool) -> Vec<Vec<f64>> {
 }
 
 #[doc(hidden)]
+/// CONTRACT: BIT-IDENTICAL up to n = 29 or so, then diverging -- and the boundary is
+/// arithmetic, not a bug. Both arms build the symmetric Pascal matrix in exact integer
+/// values: the serial arm forms `L` then `S = L·Lᵀ` (multiply-adds), the quadratic arm uses
+/// the grid recurrence `S[i][j] = S[i-1][j] + S[i][j-1]` (additions only). While every
+/// entry `C(i+j, i)` stays below 2⁵³ each is exactly representable and both arms land on
+/// the same f64, so the identity is exact rather than approximate.
+///
+/// Past 2⁵³ the two roundings part company, which is exactly what the existing test
+/// encodes and worth reading as a specification rather than a compromise:
+/// `pascal_symmetric_quadratic_matches_serial_reference` uses `assert_eq!` -- bit
+/// equality -- for n in {0, 1, 2, 5, 8}, and drops to 1e-12 RELATIVE only at n=32, where
+/// `C(62,31)` is well past the exactly-representable range.
 pub static PASCAL_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -18319,6 +18442,12 @@ pub fn invpascal(n: usize, kind: &str) -> Vec<Vec<f64>> {
 /// Runtime switch to force the serial `dft_matrix` build for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The fan-out is across ROWS, each built by the same
+/// `build_row` closure from the row index alone -- a closed-form `exp(-2πi·jk/n)` per cell
+/// that depends on nothing another row computes. Threads produce disjoint row ranges
+/// reassembled in index order.
+///
+/// A map over independent outputs, not a split reduction.
 pub static DFT_MATRIX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -18493,6 +18622,10 @@ pub fn leslie(f_vals: &[f64], s_vals: &[f64]) -> Result<Vec<Vec<f64>>, LinalgErr
 /// Runtime switch to force the serial `convolution_matrix` build for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. Rows of the convolution matrix are independent
+/// shifted copies of the kernel, each built by the same `build_row` from its own row index;
+/// threads fill disjoint ranges reassembled in order. No cell's value depends on another
+/// row, so there is no reduction for the thread count to split.
 pub static CONVMAT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -18683,6 +18816,10 @@ pub fn kron(a: &[Vec<f64>], b: &[Vec<f64>]) -> Vec<Vec<f64>> {
 /// Runtime switch to force the serial `vander` build for same-binary A/B benchmarks.
 /// Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. Each Vandermonde row is the successive powers of
+/// one sample point, built by the same `build_row` from that point alone. The powers within
+/// a row accumulate in the same order on both arms -- the parallelism is ACROSS rows, never
+/// within one -- so the value of every cell is independent of the thread count.
 pub static VANDER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -18786,6 +18923,15 @@ pub fn helmert(n: usize) -> Vec<Vec<f64>> {
 /// Runtime switch to force the original serial `helmert`/`helmert_full` build
 /// for same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way, and this one is checkable by inspection: `helmert_row`
+/// and the row loop inside `helmert_full_serial` contain the SAME two expressions --
+/// `scale = 1/√(i(i+1))` filled across the first `i` entries and `-(i)·scale` on the
+/// diagonal -- with the first row `1/√n` in both. The toggle changes only whether those rows
+/// are produced by a full serial build that then discards row 0, or generated directly per
+/// row and fanned out across threads.
+///
+/// Rows are independent by construction (row `i` depends only on `i` and `n`), so the
+/// fan-out is a map over independent outputs rather than a split reduction.
 pub static HELMERT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -19649,6 +19795,14 @@ fn diagonal_rows_are_valid(rows: &[Vec<f64>], first_row: usize, tol: f64) -> boo
 
 /// When `true`, [`is_diagonal`] uses its original serial scan.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way -- and the output is a BOOL, which makes the
+/// argument stronger than usual. Each row is scanned by the same predicate against the same
+/// `tol`, the per-row answers are combined by conjunction, and conjunction is associative
+/// AND exact: there is no floating-point accumulation anywhere for a scheduling change to
+/// reorder.
+///
+/// The cheap early rejection is kept ahead of the scoped-thread startup, so a matrix that
+/// can be refused on shape alone is refused before either arm pays for threads.
 pub static IS_DIAGONAL_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -20976,6 +21130,24 @@ fn lu_subst_factored_f32(factors: &LuFactorsFlatF32, rhs: &[f64]) -> Option<Vec<
 /// Runtime switch to force the exact f64 LU route (bit-reproducible factors; also the
 /// f64 arm of the same-worker A/B benchmark). Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: NOT bit-identical -- but SELF-VALIDATING, which is a stronger property than a
+/// tolerance. The fast arm follows LAPACK's `dsgesv` strategy: factor `A` once in f32, then
+/// recover f64 accuracy by iterative refinement (`r = b − A·x` in f64, `A·d = r` through the
+/// f32 factors, `x += d`).
+///
+/// The refined `x` is returned ONLY when its measured f64 backward error clears
+/// `8·n·ε·(‖A‖·‖x‖ + ‖b‖)`; otherwise the routine returns `None` and the caller solves
+/// exactly in f64. Note the shape of that bar -- it scales with `‖A‖·‖x‖ + ‖b‖`, the
+/// natural units of the residual, rather than being a bare epsilon compared against a
+/// dimensioned quantity. That distinction has cost this project real bugs elsewhere; here
+/// it is done correctly and the bound is the standard LAPACK backward-error criterion.
+///
+/// So the contract is not "close enough" but "at least as good as the f64 LU it replaces,
+/// verified per call". An ill-conditioned system where the f32 factors cannot converge
+/// falls back unchanged rather than returning a worse answer.
+/// `lu_solve_mixed_precision_matches_f64_and_falls_back` drives BOTH arms: a diagonally
+/// dominant case that must be ACCEPTED and match the f64 reference, and a case that must be
+/// DECLINED.
 pub static DISABLE_MIXED_LU: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -20983,6 +21155,20 @@ pub static DISABLE_MIXED_LU: std::sync::atomic::AtomicBool =
 /// This exists for same-worker A/B Criterion evidence; production default is the
 /// flat blocked factor path for large matrices.
 #[doc(hidden)]
+/// CONTRACT: the flat blocked path is used only where it SELF-GUARDS back to the generic
+/// route, so the returned value matches. For `det`, `det_flat_lu_product` reads
+/// `sign(P)·∏Uᵢᵢ` and returns `None` -- falling through to nalgebra -- when the product
+/// would overflow or the matrix is singular, which are exactly the cases where the flat
+/// product and the generic path could disagree.
+///
+/// What this toggle changes is STORAGE and blocking, not the elimination: the same partial
+/// pivoting on the same matrix. Where both arms complete they are NOT bit-identical -- they
+/// agree to the reassociation of a reordered blocked update, since blocking changes the
+/// order in which trailing updates are applied.
+///
+/// Also reachable via `FSCI_DISABLE_FLAT_LU_FACTOR` in the environment, read once through a
+/// `OnceLock` -- so the escape hatch cannot be flipped mid-process and cannot introduce a
+/// per-call atomic read into the factorization's hot loop.
 pub static DISABLE_FLAT_LU_FACTOR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
