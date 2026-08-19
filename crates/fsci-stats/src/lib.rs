@@ -36235,6 +36235,17 @@ pub fn hdquantiles_sd(data: &[f64], prob: &[f64]) -> Vec<f64> {
 ///
 /// Toggle forcing [`mjci`]'s per-breakpoint incomplete-beta map onto the serial
 /// path, for A/B measurement. Default `false` = the breakpoints fan across cores.
+///
+/// CONTRACT: BYTE-IDENTICAL either way. Only the `regularized_incomplete_beta` map over
+/// breakpoints is parallelised, and `par_continuous_map` preserves index order, so the
+/// `cdfs` vector is bit-for-bit the same in both arms. The reduction that follows — the
+/// `c1`/`c2` accumulation of `(cdfs[j] - cdfs[j-1])` weights over the order statistics —
+/// is OUTSIDE the toggled region and runs sequentially either way, so the one place
+/// summation order could matter is untouched.
+///
+/// That is the whole distinction these toggles keep turning on: parallelising a map is
+/// exact, parallelising a reduction is not. Here the split is on the map side of the
+/// line, and it stays exact only while it remains there.
 pub static MJCI_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
