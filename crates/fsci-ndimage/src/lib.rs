@@ -9800,7 +9800,13 @@ pub fn shift(
         } else {
             // Resolve ONCE, outside the pixel closure (`frankenscipy-22van`).
             let flags = SplineFlags::resolve();
-            fill_pixels_parallel_indexed(&mut output, kernel_work, |_flat, out_idx| {
+            // Resolved on THIS path. The other binding lives inside the branch that returns
+    // early, so it is out of scope here, and exactly one of the two runs per call --
+    // which is what `van22_knob_read_is_per_transform` asserts. Resolving inside the
+    // closure instead would read the toggles once PER PIXEL, the hot-path regression
+    // that bead exists to prevent.
+    let flags = SplineFlags::resolve();
+    fill_pixels_parallel_indexed(&mut output, kernel_work, |_flat, out_idx| {
                 let coords: Vec<f64> = out_idx
                     .iter()
                     .enumerate()
@@ -9985,6 +9991,12 @@ pub fn zoom(
         return Ok(output);
     }
 
+    // Resolved on THIS path. The other binding lives inside the branch that returns
+    // early, so it is out of scope here, and exactly one of the two runs per call --
+    // which is what `van22_knob_read_is_per_transform` asserts. Resolving inside the
+    // closure instead would read the toggles once PER PIXEL, the hot-path regression
+    // that bead exists to prevent.
+    let flags = SplineFlags::resolve();
     fill_pixels_parallel_indexed(&mut output, kernel_work, |_flat, out_idx| {
         let coords: Vec<f64> = out_idx
             .iter()
@@ -11411,6 +11423,9 @@ pub fn affine_transform(
         return Ok(output);
     }
 
+    // Same fallthrough as the indexed variant above: the other binding sits inside
+    // the early-returning branch. One resolve per call on either path, never per pixel.
+    let flags = SplineFlags::resolve();
     fill_pixels_parallel(&mut output, kernel_work, |flat, _scratch| {
         let r = (flat / cols) as f64;
         let c = (flat % cols) as f64;
@@ -13503,6 +13518,14 @@ mod zoom_separable_ab_tests {
 
 #[cfg(test)]
 mod tests {
+    // Inner attribute, so it must lead the module body -- it was sitting further down,
+    // after other items, which is an outright parse error rather than a lint. Moved
+    // rather than deleted: the goldens below really are transcribed at the precision
+    // scipy printed them (5.3000000000000007, not 5.3), and those digits ARE the
+    // measurement -- rounding them by hand would turn a measured comparison into an
+    // approximate one (frankenscipy-iit9c).
+    #![allow(clippy::excessive_precision)]
+
     /// `frankenscipy-22van`: hoisting the spline knobs out of the per-pixel path must not
     /// change a single bit.
     ///
@@ -13549,12 +13572,6 @@ mod tests {
             );
         }
     }
-
-    // scipy reference values are transcribed at the precision scipy printed them,
-    // e.g. 5.3000000000000007 rather than 5.3. The extra digits are the GOLDEN --
-    // they record what the incumbent actually returned, and rounding them by hand
-    // would turn a measured comparison into an approximate one (frankenscipy-iit9c).
-    #![allow(clippy::excessive_precision)]
 
     /// frankenscipy-iit9c. `uniform_knot_at` and `bspline_local_support` are
     /// documented AS equivalences: the first is "the closed-form knot value of
