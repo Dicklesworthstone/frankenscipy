@@ -39269,3 +39269,89 @@ levers; the decomposition into ~5 points serial rate and ~40 points threading.
 WITHDRAWN: "dsyrk threads the basin shape for 1.5x"; "the ceiling is our partition"; "1.5x is
 available at the basin shape"; and the recommendation to build a packed L2-resident partition on
 the strength of it. That recommendation may still be right, but it is no longer evidenced.
+
+## 2026-08-19 — frankenscipy-gykw5 — the contradiction is resolved: threading the SAME updates at the SAME dispatch points inside the factor is worth EXACTLY 1.000x
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_chol_vs_scipy.rs (arm FSCI_CHOL_CAP_ISOLATE)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms one process, ABBA-interleaved)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=1 (base arm) and 64 (capped arm); actual observed worker threads
+  1 and 64 via the shared rayon pool
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.400)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.291)
+frankenscipy-engine-sha256 = built from crates/fsci-linalg at this commit with the cap/isolate arm
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+Same-invocation A/A null: 1.046
+Counted mechanism: `MATMUL_PAR_DISPATCHES` — both arms dispatch at the SAME points (gate 32M
+  open in both); only the worker count differs
+Decision: base/capped = 1.000x against a 2x A/A-null margin of [0.908, 1.092]; squarely
+  IN-FLOOR, and the point estimate is exactly unity.
+CV is provenance only and was not used for this decision.
+
+### The control that was missing
+
+Every previous cap/gate arm compared "shipped default" (gate closed, nothing dispatched) against
+"gate open, N workers". That confounds two changes: opening the gate, and threading. The
+isolating control holds the gate OPEN in both arms and varies ONLY the worker count:
+
+| arm | gate | workers | dispatch points |
+|---|---|---|---|
+| base | 32M (open) | **1** | identical |
+| capped | 32M (open) | **64** | identical |
+
+    n=832   base/capped = 1.000x   null_cap = 1.046   cap_gates = PASS
+    raw: 1.0138 0.9998 0.9894 0.9854 1.0135 1.0211 1.0161 0.9234 0.9484 1.1253 1.0075 1.0134
+         0.9149 0.9659 0.9996
+
+**Exactly unity.** Threading the trailing updates inside the factorisation, at the same points,
+with the same code, is worth nothing at all.
+
+### This resolves the contradiction, and the resolution is about my BENCH, not the kernel
+
+Last row: the same kernel at the same shape threads **1.326x** when called standalone. Now: the
+same kernel, threaded at the same points inside the factor, is **1.000x**. Both measurements are
+gated and stable. So the 1.326x is real for the microbench and does NOT transfer.
+
+The most likely reason is cache state, and it is a property of how the microbench is built. In
+`perf_syrk_partition_vs_blas` the SAME `l21` and `l21t` buffers (721 KB at m=704, nb=128) are
+reused on every timed iteration, so after the first they are resident and the update is
+compute-bound — where extra workers help. In the factor, `copy_l21_and_pack_transpose` produces a
+FRESH panel for every k-step, and the trailing block is a different region each time, so each
+update arrives cold and is memory-bound — where extra workers do not help, because they are all
+waiting on the same fill.
+
+That is consistent with everything else on this bead: six tuning levers neutral or worse, and now
+a clean 1.000x when the gate is removed as a variable. **The trailing update in the real factor
+is memory-bound at these sizes, and no scheduling change addresses a memory-bound kernel.**
+
+### The methodological finding, which generalises past this bead
+
+A repeated-call microbench of a memory-bound kernel measures the WARM-CACHE case. It reported
+1.326x for a step that delivers 1.000x in situ — a 33-point overstatement, with healthy A/A
+nulls (1.007–1.019) on both sides. The null cannot see this: both arms of the microbench are
+equally warm.
+
+Anything in this repo that benchmarks a kernel by calling it in a loop on the same buffers is
+exposed to the same error. The defence is the one used here: re-measure the effect AT ITS CALL
+SITE with everything else held fixed, and treat the standalone number as an upper bound until
+it is confirmed in place.
+
+### What this does to the bead
+
+The remaining hypothesis on gykw5 — build a packed, L2-resident partition to capture threading
+gains — is now weakly supported at best. If the update is memory-bound in situ, a better
+partition changes which core waits on memory, not how long. Before anyone builds it, the thing
+worth measuring is the trailing update's achieved BANDWIDTH in the factor against the machine's
+STREAM ceiling. If it is already near the roof, the basin is a bandwidth wall and gykw5 should be
+closed as one; if it is far below, the partition is worth building after all.
+
+### Honest limits
+
+- One size (n=832), one gate value (32M, 2 dispatch points), one fixture family.
+- The cache-state explanation is the leading hypothesis and is NOT established. The experiment
+  that would establish it is to re-run the microbench with freshly packed `l21`/`l21t` per
+  iteration and see whether 1.326x falls toward 1.0.
+- Ambient was 0.29–0.40 host-mean-busy; the cell passed its own gates but this was not a quiet
+  window.

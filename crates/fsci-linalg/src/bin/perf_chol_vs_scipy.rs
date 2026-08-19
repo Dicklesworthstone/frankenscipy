@@ -907,6 +907,8 @@ for raw_line in sys.stdin.buffer:
         // frankenscipy-gykw5 granularity arm: panel width under test.
         // frankenscipy-gykw5: fatter-granule arm. Needs BOTH a lowered gate (so anything is
         // threaded at all in the basin) and a thread cap (so each worker gets real work).
+        // Baseline for the cap arm: shipped default, or gate-open-single-thread.
+        let isolate = std::env::var("FSCI_CHOL_CAP_ISOLATE").is_ok_and(|v| v != "0");
         let cap_arm: usize = std::env::var("FSCI_CHOL_THREAD_CAP")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -943,7 +945,7 @@ for raw_line in sys.stdin.buffer:
         );
         println!(
             "sizes={sizes:?} replicates={replicates} reps={reps} min_of={min_of} seed={seed:#x} \
-             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy} trsm_ab={trsm_arm} trsm_macs={macs_arm} matmul_macs={mm_arm} nb={nb_arm} thread_cap={cap_arm}"
+             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy} trsm_ab={trsm_arm} trsm_macs={macs_arm} matmul_macs={mm_arm} nb={nb_arm} thread_cap={cap_arm} cap_isolate={isolate}"
         );
 
         for &n in &sizes {
@@ -1246,10 +1248,17 @@ for raw_line in sys.stdin.buffer:
                     r_nb.push(base_a.min(base_b) / wide_a.min(wide_b));
                 }
                 if cap_arm > 0 && mm_arm > 0 {
-                    let base_a = time_fsci_capped(&a, reps, min_of, 0, 0);
+                    // `FSCI_CHOL_CAP_ISOLATE=1` changes the BASELINE from "shipped default"
+                    // (gate closed, nothing dispatched) to "gate open but capped to ONE
+                    // thread". That removes the gate as a variable: both arms then dispatch at
+                    // exactly the same points and run exactly the same code, differing ONLY in
+                    // worker count. It is the control that separates "threading does not help
+                    // in the factor" from "the gate change itself costs something".
+                    let (bg, bc) = if isolate { (mm_arm, 1) } else { (0, 0) };
+                    let base_a = time_fsci_capped(&a, reps, min_of, bg, bc);
                     let cap_a = time_fsci_capped(&a, reps, min_of, mm_arm, cap_arm);
                     let cap_b = time_fsci_capped(&a, reps, min_of, mm_arm, cap_arm);
-                    let base_b = time_fsci_capped(&a, reps, min_of, 0, 0);
+                    let base_b = time_fsci_capped(&a, reps, min_of, bg, bc);
                     null_cap.push(base_a.max(base_b) / base_a.min(base_b));
                     // > 1 means the lowered-gate + capped-threads arm is faster than default.
                     r_cap.push(base_a.min(base_b) / cap_a.min(cap_b));
@@ -1332,8 +1341,9 @@ for raw_line in sys.stdin.buffer:
                         .join(",")
                 );
                 println!(
-                    "n={n} CAP_ARM gate={mm_arm} cap={cap_arm} default/capped={cmed:.3}x \
-                     (>1 = fatter granules faster) null_cap={cnull:.3} cap_gates={}",
+                    "n={n} CAP_ARM gate={mm_arm} cap={cap_arm} isolate={isolate} \
+                     base/capped={cmed:.3}x (>1 = the capped arm is faster) \
+                     null_cap={cnull:.3} cap_gates={}",
                     if ok && load_ok { "PASS" } else { "FAIL" }
                 );
             }
