@@ -38179,3 +38179,61 @@ one line — unset the hard-coded default, or have the guard treat a `BlackThrus
 `AGENT_NAME` at `:637`. A guard that silently self-approves for the one identity every
 unconfigured shell carries is strictly worse than one that blocks, because it fails open for
 precisely the commits nobody is watching.
+
+## 2026-08-19 — frankenscipy-ozg54 — a zero-footprint source-freshness marker, and why the named experiment could not run
+
+ozg54's outstanding item is explicit: "Whether vmi1153651 would now serve the COMMITTED edit is
+untested. The clean experiment is to force that specific worker and rebuild." I tried to run
+exactly that and could not, for a reason worth recording:
+
+    RCH_WORKER=vmi1153651 …  [RCH-I001] 'vmi1153651' is draining/unreachable
+    RCH_WORKER=vmi1227854 …  [RCH-I001] 'vmi1227854' is operator-disabled (admin_disabled)
+
+Both named workers — the suspect AND the known-good control that honoured an uncommitted edit —
+are currently unavailable. `rch workers list` still shows both with a filled status dot, so the
+listing does not distinguish "configured" from "usable"; the refusal only appears on dispatch.
+Anyone re-attempting this experiment should expect that and not read the dot as availability.
+
+### The reusable part: a NEWLY REGISTERED BIN TARGET is a better freshness marker
+
+The bead already identified that location-citing diagnostics are self-checking (line numbers
+move) while pass/fail counts are not, and RainyPrairie's follow-up used a test count. Both work.
+Both also have a problem in this repo: they require EDITING the tree, and `frankenscipy-hld7v`
+records two incidents of an in-flight probe being swept into a commit on main. A freshness
+method that requires adding a scratch test module is unsafe while that bug is open.
+
+A `[[bin]]` registration avoids it entirely. Commit `0b6ef7d4c` registered `perf_cdf` in
+`crates/fsci-special/Cargo.toml` (it had been excluded by `autobins = false`). That gives a
+marker with three properties the other two lack:
+
+1. **Zero tree footprint at probe time.** The marker is already committed and is a change you
+   wanted anyway. Nothing needs to be added or stripped, so nothing can be swept.
+2. **A structural, unambiguous failure.** A stale worker does not report shifted line numbers or
+   a smaller count — it reports `error: no bin target named 'perf_cdf' in 'fsci-special'
+   package` and exits non-zero. That is a different message, not a different number, so it
+   cannot be confused with a genuine lint or test delta.
+3. **It works with `cargo check`.** No linking, no run, no timing — so it is admissible under
+   any load and costs one short remote job.
+
+Probe, run at loadavg 54 (correctness only, no timing claimed):
+
+    RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
+      cargo check -p fsci-special --bin perf_cdf --features ndtri-isafloor-bench
+
+    -> remote hz2 (39.9s), exit 0
+       "Checking fsci-special v0.1.0", "Finished `dev` profile … in 8.42s"
+       occurrences of "no bin target": 0
+
+**hz2 served source containing a `[[bin]]` entry committed minutes earlier.** That is a positive
+freshness datum for hz2 under the strongest available marker.
+
+### What this does and does not establish
+
+ESTABLISHES: hz2 is fresh as of this run; the marker method works and is safe to use while
+hld7v is open; the two workers ozg54 names are both currently undispatchable.
+
+DOES NOT ESTABLISH, and I am not claiming it: anything about vmi1153651, which is the whole
+open question. One fresh worker does not generalise — ozg54's own history is that the WORKER is
+the discriminating variable, and RainyPrairie already retracted one over-inference from a single
+worker's behaviour. The experiment remains open and now has a cheaper instrument to run it with
+when vmi1153651 returns.
