@@ -5002,16 +5002,46 @@ pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
 
 /// Forces `gmres_batch` onto the ordered sequential route (A/B control).
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. A `*_batch` call solves INDEPENDENT systems
+/// against one shared operator, so no right-hand side's iteration reads or writes any
+/// other's state -- there is no cross-system reduction for a scheduling change to
+/// reassociate. Each system runs the identical Krylov recurrence in the identical order
+/// whichever thread executes it.
+///
+/// That independence is the whole justification, and it is the property to re-check if
+/// the batch ever gains shared state: a pooled workspace, a shared preconditioner
+/// refreshed per system, or an early-exit that consults other systems' progress would
+/// each turn this from an identity into a tolerance.
 pub static GMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Forces `qmr_batch` onto the ordered sequential route (A/B control).
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. A `*_batch` call solves INDEPENDENT systems
+/// against one shared operator, so no right-hand side's iteration reads or writes any
+/// other's state -- there is no cross-system reduction for a scheduling change to
+/// reassociate. Each system runs the identical Krylov recurrence in the identical order
+/// whichever thread executes it.
+///
+/// That independence is the whole justification, and it is the property to re-check if
+/// the batch ever gains shared state: a pooled workspace, a shared preconditioner
+/// refreshed per system, or an early-exit that consults other systems' progress would
+/// each turn this from an identity into a tolerance.
 pub static QMR_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Forces `lgmres_batch` onto the ordered sequential route (A/B control).
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. A `*_batch` call solves INDEPENDENT systems
+/// against one shared operator, so no right-hand side's iteration reads or writes any
+/// other's state -- there is no cross-system reduction for a scheduling change to
+/// reassociate. Each system runs the identical Krylov recurrence in the identical order
+/// whichever thread executes it.
+///
+/// That independence is the whole justification, and it is the property to re-check if
+/// the batch ever gains shared state: a pooled workspace, a shared preconditioner
+/// refreshed per system, or an early-exit that consults other systems' progress would
+/// each turn this from an identity into a tolerance.
 pub static LGMRES_BATCH_FORCE_SEQUENTIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -5048,6 +5078,16 @@ fn iterative_batch_pool(workers: usize) -> Option<std::sync::Arc<rayon::ThreadPo
 
 /// Disables the once-per-solve `u32` column-index narrowing (A/B control).
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The switch changes how column indices are
+/// STORED -- `u32` instead of `usize` -- not what is computed with them. Both arms
+/// address the same matrix entries and feed the identical `f64` values through the
+/// identical arithmetic, so the narrowing is a memory-traffic change with no numerical
+/// content whatsoever.
+///
+/// The guard alongside it is load-bearing rather than defensive: narrowing is skipped
+/// when `n > u32::MAX`, because past that an index genuinely does not fit and the
+/// conversion would silently wrap to address the wrong element. The contract is exact
+/// only because that case never takes this path.
 pub static CG_NARROW_INDICES_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -25127,6 +25167,16 @@ pub static LAPLACIAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// internal.
 #[cfg(any(test, feature = "sparse-incumbent-bench"))]
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. Both arms build the SAME Laplacian from the SAME
+/// pre-computed degree vector -- `degree` is calculated once and passed to whichever path
+/// runs -- so the entries are formed by the same expression and differ only in whether
+/// they are written into a dense buffer first and converted, or emitted straight into
+/// CSR. Neither route sums anything the other does not.
+///
+/// The dense route exists as a REFERENCE, not an optimisation: it is the obvious
+/// construction to check the direct one against, which is why forcing it is a debugging
+/// switch rather than a performance lever. It costs O(n^2) memory and is not a fallback
+/// anything should reach for at scale.
 pub static LAPLACIAN_FORCE_DENSE_REFERENCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
