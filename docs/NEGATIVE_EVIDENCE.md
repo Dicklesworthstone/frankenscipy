@@ -37446,6 +37446,38 @@ the admit direction rests on the recorded ambient of the earlier window rather t
 fresh run. One consistency signal worth noting from a refused run at ambient 40.61: n=512
 read 1.408x against the quiet window's 1.407x, but it is refused and not counted.
 
+### CERTIFIED 2026-08-19: n=2048 passes every gate on the shipped binary
+
+The promoting re-run finally landed a window. executed-ELF-sha256
+`9746dee0254b0c01c564c72446298baa4f738a22d406161bb954371a3073897a`, self-reported from
+`/proc/self/exe`, matching the committed source.
+
+| n | fsci (s) | scipy1 (s) | scipyN (s) | **scipy1/fsci** | **scipyN/fsci** | null_fsci | null_scipy1 | ambient | clock ratio | gates |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 2048 | 1.441e-1 | 2.539e-1 | 1.743e-1 | **1.782x** | **1.204x** | 1.020 | 1.017 | 28.46/30 | 1.087 | **PASS** |
+
+Per-arm, per-replicate: fsci 3053-3440 MHz at loadavg 28.5-31.0; scipy1 2280-3243 MHz;
+scipyN 3841-3972 MHz, 64 observed tasks. Backward error ours 2.163e-16 against SciPy's
+2.103e-16, budget 7.276e-12. iowait 0. n=256 and n=512 were refused in the same run on
+ambient 32.73, so this is one certified cell, not three.
+
+**So the standing, gated position is: `cholesky` beats the strongest live SciPy arm by
+1.204x and single-threaded SciPy by 1.782x at n=2048, in pure safe Rust against OpenBLAS
+`dpotrf`, with no BLAS linked on our side.** The incumbent again ran on faster cores
+(scipyN 3841-3972 MHz against our 3053-3440), so 1.204x remains a floor.
+
+THE CERTIFIED NUMBER IS LOWER THAN THE PROVISIONAL ONE, AND THAT IS THE POINT. The
+provisional reading was 2.041x / 1.407x at ambient 20.60; the certified reading is
+1.782x / 1.204x at ambient 28.46. Same code, same fixture, same protocol — the ratio decays
+monotonically with ambient load across three independent windows now (20.6 → 28.5 → 60+),
+which is the load-dependence argued above, measured a third time and in the direction the
+argument predicts. Quote the certified row, not the provisional one.
+
+The gate's ADMIT arm is now observed live, which closes the honest limit recorded above: it
+had only ever been seen refusing. It refused n=256 and n=512 at ambient 32.73 and admitted
+n=2048 at 28.46 in the SAME invocation — a must-hit and a must-miss four seconds apart, on
+the same binary, distinguished only by the variable the gate reads.
+
 ### The re-run that would promote the provisional rows
 
 Rebuild (already committed) and run, with `uptime` checked immediately before and the
