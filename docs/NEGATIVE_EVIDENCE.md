@@ -37069,3 +37069,59 @@ The likely cause is architectural rather than a defect: scipy's `ppf` is one vec
 over the whole array, ours is a scalar loop with a per-element binary search over ~980 nodes. A
 batched `ppf_many` that hoists the search would be the thing to try, and until it is measured
 there is no claim here.
+
+## Order-invariantly, the Francis arm designs filters CLOSER to SciPy than nalgebra — on all six
+
+2026-08-19. **Result class: BEHAVIORAL.** same_host: thinkstation1 (both arms in one
+process on one machine). Probe: `diff_butter_eig_arms`
+(`MARKER=butter-eig-arms-v1`), executed-ELF-sha256 `0e7711642dbc7c04c4b74a46e67dbfba6ebb5fe70c501be89b6dbca65214619c`, scored by
+`scratchpad/mag_arm.py` against `scipy.signal.sosfreqz` in the same invocation.
+Per-arm: fsci loadavg [65.97 43.77 21.64] 3279 MHz; scipy loadavg [65.97 43.77 21.64]
+4111 MHz. Exact magnitudes, no timing.
+
+The previous row left "how much worse is Francis inside `tf2sos`" unmeasured. Measured
+order-invariantly — peak-relative max deviation of the SOS cascade's `|H(w)|` over 64
+frequencies — the premise is wrong. Francis does not deviate more; it deviates LESS, on
+every case. Deviation of a response magnitude, not of a runtime.
+
+**OBSERVED:**
+
+| case | nalgebra vs scipy | francis vs scipy |
+|---|---|---|
+| lp4 Wn=0.2 | 3.608e-14 | **9.326e-15** |
+| lp6 Wn=0.3 | 3.542e-14 | **1.921e-14** |
+| lp8 Wn=0.15 | 2.146e-11 | **1.135e-11** |
+| hp5 Wn=0.4 | 2.043e-14 | **6.217e-15** |
+| lp10 Wn=0.25 | 2.593e-12 | **1.068e-12** |
+| lp12 Wn=0.1 | 1.685e-06 | **1.088e-06** |
+
+Francis closer on 6 of 6. Every Francis figure is a SMALLER DEVIATION than its
+nalgebra counterpart on the same filter. These are accuracy figures in the response
+magnitude; nothing here is a duration and no speed comparison is made or implied.
+
+### A THIRD BAD METRIC I CAUGHT BEFORE REPORTING IT
+
+The first peak-relative run was not peak-relative: it divided each frequency bin by ITS
+OWN magnitude. A Butterworth stopband decays toward zero, so that turned a 8.6e-16
+absolute difference into **8.613e+284** — scipy's highpass response at DC is exactly
+`0.0` and ours is 8.6e-16. It also produced 968 and 2.1 for the two high-order lowpasses.
+I was one step from reporting "both arms are catastrophically wrong at order >= 8", which
+is false: their responses agree with SciPy to 1e-6 or better everywhere.
+
+This is the same error I wrote a CONTRACT about earlier today, on `ACF_FFT_DISABLE` —
+that an absolute bound is wrong where the signal decays, and there the fix was to go
+relative. Here the signal also decays and the fix is the opposite: go peak-relative. The
+transferable rule is not "relative good, absolute bad" but "normalise by a quantity that
+does not vanish where the answer does".
+
+### WHAT THIS MEANS FOR THE BLOCKED FLIP, stated carefully
+
+The conformance test that blocks shipping pins SciPy's SOS coefficient ARRAY element-wise
+and fails on a 1.3e-6 difference in one coefficient. On the filter's actual BEHAVIOUR the
+Francis arm is closer to SciPy than the arm we ship. Those are not contradictory — a
+coefficient can differ while the cascade's response improves — but it does mean the test
+currently blocks a change that makes the filter better.
+
+**NOT re-flipped on this evidence.** Deciding whether conformance means "the same
+coefficients" or "the same filter" changes what the project asserts about SciPy parity,
+and that is a standard to agree rather than a call to make inside a measurement row.

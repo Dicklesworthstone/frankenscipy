@@ -15,7 +15,7 @@
 //! same on a loaded host.
 
 use fsci_linalg::EIG_USE_FRANCIS_SCHUR;
-use fsci_signal::{FilterType, butter};
+use fsci_signal::{FilterType, butter, butter_sos, sosfreqz};
 use std::sync::atomic::Ordering;
 
 const MARKER: &str = "butter-eig-arms-v1";
@@ -39,6 +39,21 @@ fn main() {
             // sections and reports nonsense — the first pass at this printed relative
             // errors of 1e11 for exactly that reason. `b` and `a` are ordered by
             // descending power, which is canonical, so the comparison is meaningful.
+            // The SOS cascade's FREQUENCY RESPONSE, which is invariant to section
+            // ORDER. That invariance is the whole point: comparing sos coefficients
+            // element-wise against SciPy compares differently-ordered sections and
+            // produced a relative error of 1.3e11 on a filter coefficient, which is a
+            // harness artefact rather than a measurement. |H(w)| is the same number
+            // whichever order the sections are cascaded in, so it sizes the real
+            // difference.
+            if let Ok(sos) = butter_sos(*order, &[*wn], *btype)
+                && let Ok(fr) = sosfreqz(&sos, Some(64))
+            {
+                let mags: Vec<String> =
+                    fr.h_mag.iter().map(|m| format!("{m:.17e}")).collect();
+                println!("MAG arm={arm} case={label} {}", mags.join(","));
+            }
+
             match butter(*order, &[*wn], *btype) {
                 Ok(ba) => {
                     let flat: Vec<String> = ba
