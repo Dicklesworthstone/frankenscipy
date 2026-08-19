@@ -37125,3 +37125,46 @@ currently blocks a change that makes the filter better.
 **NOT re-flipped on this evidence.** Deciding whether conformance means "the same
 coefficients" or "the same filter" changes what the project asserts about SciPy parity,
 and that is a standard to agree rather than a call to make inside a measurement row.
+
+## The two "4e-3 from SciPy" eig fixtures: conditioning RULED OUT, `eig` is losing a conjugate pair
+
+2026-08-19. **Result class: BEHAVIORAL.** same_host: thinkstation1 (probe and incumbent in
+one invocation). Probe: `scipy.linalg.eig` on `make_diag_dominant(n, seed)`, the same
+fixture generator as the metamorphic suite, plus its left/right eigenvectors for the
+condition numbers. Per-arm: scipy loadavg [44.45 37.78 30.85], 3889 MHz, iowait 1%.
+Filed as frankenscipy-unevl.
+
+Two fixtures of 7000 sit 4e-3 to 8e-3 from SciPy in BOTH Schur routines — n=5 seed=766
+(7.853e-03 nalgebra, 3.927e-03 francis) and n=8 seed=777 (6.336e-03 in both). Every other
+fixture agrees to 1e-13 or better.
+
+**CONDITIONING WAS CHECKED FIRST AND CAME BACK NEGATIVE**, which is what the filed bead
+asked for and the cheapest way to decide whether there is a defect at all:
+
+| fixture | min eigenvalue gap | cond(V) | max eigenvalue condition number | error this predicts |
+|---|---|---|---|---|
+| n=5 seed=766 | 1.066e-14 | 5.019e+01 | 1.766e+01 | 3.9e-15 |
+| n=8 seed=777 | 8.882e-16 | 2.841e+01 | 9.923e+00 | 2.2e-15 |
+
+The eigenvalues are WELL conditioned. Predicted perturbation ~1e-15 is twelve orders below
+the observed 4e-3, so ill-conditioning does not explain it and cannot be used to excuse it.
+
+**OBSERVED — what the spectra actually are.** SciPy returns, for both matrices,
+eigenvalues whose REAL PARTS ARE ALL IDENTICAL:
+
+    n=5 seed=766:  10.5 five times, one conjugate pair at ±0.041231056256i
+    n=8 seed=777:  16.5 eight times, one conjugate pair at ±0.104537074763i
+
+Everything else is exactly real. So each spectrum is one clustered real value plus a
+single small imaginary pair.
+
+**THEREFORE THE DIAGNOSIS IS STRUCTURAL, NOT NUMERICAL.** A deviation of 4e-3 against
+`|λ| ≈ 10.5` is an absolute ~0.04 — which IS the magnitude of the imaginary part
+(0.0412). Neither arm is accumulating error; one of them is LOSING or MISPLACING the
+conjugate pair, returning it as real or attaching it to the wrong eigenvalue.
+
+That is the same defect class as the complex-pair flattening already fixed on the Francis
+path: a 2x2 block whose realness test must decide on a spectrum where every real part
+coincides, so the discriminant is the only signal and it is tiny. **This must not be
+closed by widening a tolerance** — the fixture family (all real parts equal, one small
+conjugate pair) is the cheapest regression test available for that classifier.
