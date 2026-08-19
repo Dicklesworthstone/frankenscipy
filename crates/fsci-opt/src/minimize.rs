@@ -2302,6 +2302,11 @@ pub static TRUST_EXACT_FOLD_SHIFT_DISABLE: std::sync::atomic::AtomicBool =
 /// `n` row allocations and pointer-chasing while preserving every arithmetic operation.
 /// `#[doc(hidden)]` — same-binary A/B knob.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The switch changes only the LAYOUT of the
+/// augmented matrix -- one flat `Vec<f64>` against `n` separately-allocated rows -- and
+/// the elimination performs the same operations on the same values in the same order in
+/// both. Nothing is reassociated, so there is no rounding difference to bound; the win is
+/// allocation count and locality, not arithmetic.
 pub static TRUST_EXACT_FLAT_AUGMENTED_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -2310,6 +2315,20 @@ pub static TRUST_EXACT_FLAT_AUGMENTED_DISABLE: std::sync::atomic::AtomicBool =
 /// back to Gauss-Jordan if the factorization detects a non-positive or non-finite pivot.
 /// `#[doc(hidden)]` — same-binary A/B knob.
 #[doc(hidden)]
+/// CONTRACT: NOT byte-identical, and not merely reordered -- the two arms run DIFFERENT
+/// ALGORITHMS. The fast arm factors the trust-region subproblem's matrix by Cholesky; the
+/// slow arm solves it by pivoted elimination. Both are backward-stable for a symmetric
+/// positive-definite system, so they agree to roughly the conditioning of that system
+/// times machine epsilon -- expect ~1e-14 relative on the well-conditioned subproblems
+/// this path sees, not bit equality.
+///
+/// There is one region where they ARE identical, and it is worth naming because it makes
+/// the toggle look exact under casual testing: when the factorization detects a
+/// non-positive or non-finite pivot the fast arm ABANDONS Cholesky and calls the same
+/// pivoted solve the slow arm uses. On any input that trips that check both arms execute
+/// identical code and return identical bits. A test that only exercised
+/// nearly-singular matrices would therefore see bit equality and conclude the wrong
+/// contract.
 pub static TRUST_EXACT_CHOLESKY_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
