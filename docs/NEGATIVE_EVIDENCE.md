@@ -39177,3 +39177,95 @@ capturing even most of it would move n=832 from 0.62x to roughly 0.95x against `
   this row claims only that THE SHAPE IS THREADABLE, not that our kernel can hit dsyrk's rate.
 - Nulls of 1.03–1.09 are looser than this ledger's better cells; the effect is 5–20x the null,
   so the verdict is not close, but a quieter window would tighten it.
+
+## 2026-08-19 — frankenscipy-gykw5 — RETRACTION of the "partition ceiling" row above, and the corrected picture
+
+The row above concluded "it is a PARTITION ceiling, not a bandwidth wall — OpenBLAS threads the
+exact basin shape for 1.508x [and] our fan-out there yields nothing". **Both halves of that are
+now withdrawn.** I found the problems by fixing my own harness, and the corrected instrument
+says something different and better grounded.
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_syrk_partition_vs_blas.rs (corrected)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both thread counts one invocation, ABBA)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=1 and 64; actual observed worker threads 1 and 127 tasks (blas
+  arm, printed by the arm); ours uses the shared rayon pool
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.173)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.313)
+frankenscipy-engine-sha256 = built from crates/fsci-linalg with the bench entry point; the
+  DECIDED claim below is the `ours` self-scaling ratio only
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+Same-invocation A/A null: ours 1.0065 (1-thread) and 1.0192 (N-thread) at m=704
+Decision: candidate CI — the `ours` self-scaling ratio is judged against a 2x A/A-null margin
+  (~1.04); 1.326x and ~2.1x both clear it decisively. The `blas` arm is NOT decided — see below.
+CV is provenance only and was not used for this decision.
+
+### Defect 1 — my bench timed the fixture, not the kernel
+
+`bench_trailing_syrk` allocated and packed ~500k doubles INSIDE the timed region, on every call.
+That constant is added to both arms, which pulls any ratio TOWARD 1.0. The first reading with it
+in place was `ours = 0.633x` — "our parallel SYRK is 58% slower than serial". With preparation
+hoisted out of the timer the same shape reads **1.326x**. The 0.633x was the fixture, not the
+kernel, and it was pointing the wrong way.
+
+### Defect 2 — the BLAS arm is not a measurement
+
+Each `blas` cell spawns a SEPARATE python process, so every sample pays interpreter start, numpy
+import and OpenBLAS pool creation. Three consecutive runs at the SAME shape (m=1920):
+
+| run | blas threading speedup | null_blas_1 | null_blas_n |
+|---|---|---|---|
+| 1 | 1.444x | 1.034 | **1.471** |
+| 2 | 1.177x | 1.053 | **1.196** |
+| 3 | **0.898x** | **1.479** | 1.063 |
+
+Speedups from 0.898x to 1.444x with nulls up to 1.48. **The 1.508x I published for the basin
+shape sits inside that spread.** It is not a certifiable number and the conclusion built on it —
+"dsyrk threads this shape, therefore the ceiling is ours" — is withdrawn. Not refuted; unproven.
+
+Our arm, by contrast, is stable across the same three runs: 2.134x, 1.935x, 2.087x, with nulls
+of 1.007–1.019. The asymmetry is exactly what you would expect from one in-process arm and one
+process-per-sample arm, and it is the harness's fault, not OpenBLAS's.
+
+### The corrected finding, which is stable and matters
+
+| shape | ours 1 thread | ours N threads | **ours threading speedup** | null |
+|---|---|---|---|---|
+| m=704, k=128 (**basin**, n=832) | 0.008211 s | 0.006191 s | **1.326x** | 1.007 / 1.019 |
+| m=1920, k=128 (n=2048) | 0.067268 s | 0.030628 s | **~2.1x** (2.134 / 1.935 / 2.087) | 1.010 |
+
+Folds are bit-equal between the serial and threaded arms at both shapes
+(`-7.734914200e3`, `-1.885184317e4`), so the two arms compute the same update.
+
+**OUR PARALLEL SYRK SCALES AT THE BASIN SHAPE — 1.326x.** That directly contradicts the claim in
+the row above that "our fan-out there yields nothing". It yields nothing IN THE FULL
+FACTORISATION, because the 64M gate never invokes it (measured: `MATMUL_PAR_DISPATCHES = 0`), and
+when the gate is forced open the whole-factor result is neutral or worse. But the kernel itself,
+called at that shape, threads perfectly respectably.
+
+### The real open question, restated correctly
+
+The contradiction is now sharp and is the thing to chase:
+
+* Isolated: the trailing SYRK at m=704, k=128 threads **1.326x**.
+* In the factor: forcing that same update to thread is **neutral to 26% worse** (six levers).
+
+Something in the full-factor context eats the 1.33x. Candidates, none tested: the per-panel
+`copy_l21_and_pack_transpose` cost is paid whether or not the update threads and may dominate at
+this size; `rayon::scope` set-up is paid per panel rather than once; or the isolated bench
+re-runs one update on warm caches while the factor's updates each arrive cold. The way to settle
+it is to instrument the factor's own trailing update — time the SYRK call site inside the
+k-loop rather than a standalone replica.
+
+That is a different experiment from anything on this bead so far, and it does not need a new
+kernel either.
+
+### What stands and what does not
+
+STANDS: the basin itself (six certified loss cells, worst 0.621x); the six refuted tuning
+levers; the decomposition into ~5 points serial rate and ~40 points threading.
+WITHDRAWN: "dsyrk threads the basin shape for 1.5x"; "the ceiling is our partition"; "1.5x is
+available at the basin shape"; and the recommendation to build a packed L2-resident partition on
+the strength of it. That recommendation may still be right, but it is no longer evidenced.

@@ -32,7 +32,7 @@ fn main() {
 
 #[cfg(unix)]
 fn main() {
-    use fsci_linalg::{MATMUL_PAR_DISPATCHES, MATMUL_PAR_MAX_THREADS_OVERRIDE, matmul};
+    use fsci_linalg::{bench_trailing_syrk_prepare, bench_trailing_syrk_run};
     use std::hint::black_box;
     use std::process::Command;
     use std::sync::atomic::Ordering;
@@ -61,27 +61,32 @@ fn main() {
     let a: Vec<Vec<f64>> = (0..m).map(|_| (0..k).map(|_| next()).collect()).collect();
     let at: Vec<Vec<f64>> = (0..k).map(|j| (0..m).map(|i| a[i][j]).collect()).collect();
 
-    let time_ours = |cap: usize| -> (f64, usize) {
-        MATMUL_PAR_MAX_THREADS_OVERRIDE.store(cap, Ordering::Relaxed);
-        MATMUL_PAR_DISPATCHES.store(0, Ordering::Relaxed);
-        // Warm-up outside every timer.
-        let w = matmul(&a, &at).expect("matmul");
-        black_box(w[0][0]);
+    // OUR trailing SYRK, at the same shape, timed in isolation via the bench entry point.
+    // This is the arm the first version of this binary got wrong: it timed the public `matmul`,
+    // which is a general GEMM on a different gate and is not what the factor calls. This calls
+    // the SAME kernel the factor uses, at the SAME shape, so the self-scaling ratio is real.
+    // Fixture built ONCE, outside every timer. `trailing` is destructively updated, so each
+    // timed iteration works on a fresh clone — the clone is inside the timer for both arms
+    // equally and is far smaller than the update itself.
+    let (trailing0, l21, l21t) = bench_trailing_syrk_prepare(m, k, 0xC0DE);
+
+    let time_ours = |nthreads: usize| -> (f64, f64) {
+        let mut warm = trailing0.clone();
+        let fold = bench_trailing_syrk_run(&mut warm, &l21, &l21t, m, k, nthreads);
+        black_box(fold);
         let mut best = f64::INFINITY;
         for _ in 0..min_of {
             let t0 = Instant::now();
             for _ in 0..reps {
-                let c = matmul(black_box(&a), black_box(&at)).expect("matmul");
-                black_box(c[0][0]);
+                let mut t = trailing0.clone();
+                black_box(bench_trailing_syrk_run(&mut t, &l21, &l21t, m, k, nthreads));
             }
             let dt = t0.elapsed().as_secs_f64();
             if dt < best {
                 best = dt;
             }
         }
-        let disp = MATMUL_PAR_DISPATCHES.load(Ordering::Relaxed);
-        MATMUL_PAR_MAX_THREADS_OVERRIDE.store(0, Ordering::Relaxed);
-        (best, disp)
+        (best, fold)
     };
 
     const ORACLE: &str = r#"
@@ -150,12 +155,12 @@ print(f"seconds={best:.9f} threads_env={os.environ.get('OPENBLAS_NUM_THREADS','u
     );
 
     // ABBA over the four cells so drift cannot land on one side.
-    let (ours_1a, d1) = time_ours(1);
+    let (ours_1a, fold1) = time_ours(1);
     let blas_1a = time_blas(1);
-    let (ours_na, dn) = time_ours(0);
+    let (ours_na, foldn) = time_ours(threads);
     let blas_na = time_blas(threads);
     let blas_nb = time_blas(threads);
-    let (ours_nb, _) = time_ours(0);
+    let (ours_nb, _) = time_ours(threads);
     let blas_1b = time_blas(1);
     let (ours_1b, _) = time_ours(1);
 
@@ -170,8 +175,13 @@ print(f"seconds={best:.9f} threads_env={os.environ.get('OPENBLAS_NUM_THREADS','u
     let b1 = parse(&blas_1a).min(parse(&blas_1b));
     let bn = parse(&blas_na).min(parse(&blas_nb));
 
-    println!("ours_1thread={o1:.9}s dispatches={d1}");
-    println!("ours_nthread={on:.9}s dispatches={dn}");
+    println!("ours_1thread={o1:.9}s fold={fold1:.9e}");
+    println!("ours_nthread={on:.9}s fold={foldn:.9e}");
+    // The two arms must compute the SAME result, or the ratio compares two computations.
+    assert!(
+        (fold1 - foldn).abs() <= 1e-9 * fold1.abs().max(1.0),
+        "serial and threaded SYRK disagree: {fold1:.17e} vs {foldn:.17e}"
+    );
     println!("blas_1thread={b1:.9}s  [{}]", blas_1a);
     println!("blas_nthread={bn:.9}s  [{}]", blas_na);
     // A/A nulls: the same configuration timed twice within the interleave.
@@ -185,20 +195,16 @@ print(f"seconds={best:.9f} threads_env={os.environ.get('OPENBLAS_NUM_THREADS','u
         parse(&blas_1a).max(parse(&blas_1b)) / parse(&blas_1a).min(parse(&blas_1b)),
         parse(&blas_na).max(parse(&blas_nb)) / parse(&blas_na).min(parse(&blas_nb))
     );
-    // THE ANSWER is the BLAS side. Ours is reported but must NOT be read as the Cholesky
-    // trailing update — see the warning printed with it.
+    // THE ANSWER: each side's OWN threading speedup at the SAME shape, same invocation.
     println!(
-        "THREADING_SPEEDUP blas={:.3}x  (>1 = threading helps OpenBLAS at this shape)",
+        "THREADING_SPEEDUP ours={:.3}x blas={:.3}x  (>1 = threading helps that side)",
+        o1 / on,
         b1 / bn
     );
     println!(
-        "WITHDRAWN ours_threading_speedup={:.3}x ours_dispatches={dn} -- NOT COMPARABLE: the \
-         public `matmul` gates on `matmul_ws_thread_count`, NOT the `matmul_thread_count` this \
-         binary's counter and cap hook, so `dispatches=0` even uncapped and the thread cap does \
-         nothing. `matmul` is also a general GEMM computing the FULL m x m product, while \
-         Cholesky's trailing update uses its own packed triangular kernels and dsyrk computes \
-         only the triangle. Any absolute ours/blas ratio from this binary is therefore \
-         meaningless and is deliberately not printed.",
-        o1 / on
+        "serial_rate_ratio ours_1/blas_1={:.3}x  (>1 = OpenBLAS faster single-threaded; note \
+         dsyrk computes only the TRIANGLE while this kernel updates the full trailing block, so \
+         a factor ~2 of this is shape, not rate)",
+        o1 / b1
     );
 }

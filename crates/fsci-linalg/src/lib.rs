@@ -5167,6 +5167,86 @@ fn cholesky_lower_blocked_with_panel_trsm<const TRSM_KERNEL: u8>(
 /// Update disjoint trailing Cholesky row chunks through Rayon’s persistent worker
 /// pool. The row kernels never reduce across chunks, so their floating-point
 /// operation order is the same as the serial row walk.
+/// Bench-only entry point for the trailing SYRK, at an arbitrary shape and thread count.
+///
+/// `frankenscipy-gykw5`. Every ratio measured on that bead so far runs a WHOLE Cholesky, which
+/// confounds the trailing update with the panel factor, the TRSM, the packing and the gate. The
+/// open question is narrower than that: OpenBLAS's `dsyrk` gets 1.508x from 64 threads at the
+/// basin shape (m=704, k=128) — what does OUR parallel SYRK get at the same shape?
+///
+/// This exposes exactly that one call so it can be timed in isolation. It does the same packing
+/// the factor does (`copy_l21_and_pack_transpose`) OUTSIDE the timed region is the caller's job;
+/// here the pack is included so the measured thing is one full trailing update as the factor
+/// performs it.
+///
+/// Not a public API in any real sense — `#[doc(hidden)]`, takes raw flat buffers, and exists so
+/// a measurement does not have to guess. `nthreads <= 1` runs the serial kernel, which is what
+/// makes a self-scaling ratio possible from one binary.
+#[doc(hidden)]
+#[must_use]
+pub fn bench_trailing_syrk_prepare(
+    m2: usize,
+    nb: usize,
+    seed: u64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    // A trailing block of m2 x m2 laid out with row stride `m2`, and an m2 x nb panel, exactly
+    // the shapes `cholesky_lower_blocked_with_kernels_scratch` hands the SYRK.
+    let mut s = seed | 1;
+    let mut next = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
+    };
+    let n = m2;
+    let mut trailing: Vec<f64> = (0..m2 * n).map(|_| next()).collect();
+    let l21: Vec<f64> = (0..m2 * nb).map(|_| next()).collect();
+    // Pack the transpose the same way the factor does: micro-panels of 8 rows.
+    let npanels = m2.div_ceil(8);
+    let mut l21t = vec![0.0f64; npanels * nb * 8];
+    for panel in 0..npanels {
+        for p in 0..nb {
+            for lane in 0..8 {
+                let row = panel * 8 + lane;
+                l21t[panel * nb * 8 + p * 8 + lane] =
+                    if row < m2 { l21[row * nb + p] } else { 0.0 };
+            }
+        }
+    }
+    let _ = n;
+    (trailing, l21, l21t)
+}
+
+/// Run ONE trailing SYRK over buffers from [`bench_trailing_syrk_prepare`].
+///
+/// The split matters: the first version of this entry point allocated and packed inside the
+/// timed region, so ~500k doubles of fixture construction were charged to BOTH arms. That is a
+/// constant added to numerator and denominator, which pulls any ratio TOWARD 1.0 — it made the
+/// measured parallel penalty look smaller than it is, not larger. Preparing outside the timer
+/// is what makes the number the kernel's.
+///
+/// `trailing` is consumed fresh per call by the caller (the update is destructive), so the
+/// caller must re-clone it between timed iterations.
+#[doc(hidden)]
+pub fn bench_trailing_syrk_run(
+    trailing: &mut [f64],
+    l21: &[f64],
+    l21t: &[f64],
+    m2: usize,
+    nb: usize,
+    nthreads: usize,
+) -> f64 {
+    let n = m2;
+    if nthreads <= 1 {
+        cholesky_syrk_flat_rows_mr4_nr8_fma(trailing, 0, n, l21, l21t, nb, 0);
+    } else {
+        cholesky_syrk_parallel_rows::<SYRK_KERNEL_MR4_NR8_FMA>(
+            trailing, n, l21, l21t, nb, 0, nthreads,
+        );
+    }
+    trailing.iter().fold(0.0f64, |acc, v| acc + *v)
+}
+
 fn cholesky_syrk_parallel_rows<const SYRK_KERNEL: u8>(
     trailing: &mut [f64],
     n: usize,

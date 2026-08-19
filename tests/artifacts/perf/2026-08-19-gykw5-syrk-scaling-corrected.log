@@ -1,0 +1,9 @@
+shape m=704 k=128 macs=63.4M reps=5 min_of=9 host_threads=64 loadavg=16.91 13.96 13.11 26/5225 3958514
+ours_1thread=0.007965549s fold=-7.734914200e3
+ours_nthread=0.007760130s fold=-7.734914200e3
+blas_1thread=0.006309360s  [seconds=0.006309360 threads_env=1 scipy=1.17.1 numpy=2.4.6 shape=(704, 704) tasks=1]
+blas_nthread=0.028001210s  [seconds=0.029999508 threads_env=64 scipy=1.17.1 numpy=2.4.6 shape=(704, 704) tasks=127]
+null_ours_1=1.0309 null_ours_n=1.3292
+null_blas_1=1.0143 null_blas_n=1.0714
+THREADING_SPEEDUP ours=1.026x blas=0.225x  (>1 = threading helps that side)
+serial_rate_ratio ours_1/blas_1=1.262x  (>1 = OpenBLAS faster single-threaded; note dsyrk computes only the TRIANGLE while this kernel updates the full trailing block, so a factor ~2 of this is shape, not rate)
