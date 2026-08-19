@@ -4626,11 +4626,29 @@ pub fn short_time_energy(x: &[f64], frame_len: usize, hop_len: usize) -> Vec<f64
 
 /// Same-binary A/B toggle for the FFT (Wiener–Khinchin) autocorrelation path.
 /// When true, [`autocorrelation`] always takes the direct O(n·lags) dot path.
+/// CONTRACT: NOT byte-identical. This selects between two different algorithms: the
+/// direct O(n*lags) dot sweep and Wiener-Khinchin, `IFFT(|FFT(centered, zero-padded)|^2)`.
+/// The FFT arm reassociates the same sums through log-depth butterflies and adds twiddle
+/// rounding, so the two agree only to FFT roundoff.
+///
+/// MEASURED, not asserted: `autocorrelation_fft_matches_direct_within_tolerance` holds the
+/// two arms to 1e-11 ABSOLUTE at n=8192 across max_lag in {64, 512, n-1}, on a normalised
+/// autocorrelation whose values are bounded by 1. The gate is set above the sizes that
+/// test pins deliberately, so the exact-tolerance cases never take the FFT path in the
+/// first place.
 pub static AUTOCORR_FFT_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Same-binary A/B toggle for the parallel-across-lags direct autocorrelation path.
 /// When true, the direct dot sweep stays single-threaded.
+/// CONTRACT: BYTE-IDENTICAL either way. The fan-out is across LAGS, and each lag is an
+/// independent dot product whose own summation stays serial inside `acf_lag`. Threads
+/// write to disjoint `chunks_mut` slices at fixed indices, so neither the value of any
+/// lag nor the position it lands in depends on the thread count.
+///
+/// The reduction being parallelised is therefore the outer map, not the inner sum -- had
+/// the split gone the other way, across the n terms of one lag's dot, the contract would
+/// be a reassociation tolerance instead of an identity.
 pub static AUTOCORR_PAR_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

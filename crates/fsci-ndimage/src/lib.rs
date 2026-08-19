@@ -197,6 +197,21 @@ fn reflect_convolve1d_sources(len: usize, kernel_len: usize) -> Vec<usize> {
 /// correlate1d order. The axis-0 pass is reformulated as contiguous axpy passes
 /// over each row, making the hot loop stride-1 instead of gathering at
 /// `cols` stride.
+/// CONTRACT: NOT byte-identical -- agrees to floating-point REASSOCIATION only, a few ulps
+/// on the kernel sum. The axpy arm folds symmetric tap PAIRS, accumulating
+/// `w*(hi+lo)` outward from the centre; the per-pixel arm accumulates `w*x` per tap in
+/// index order. Those are the same sum in exact arithmetic and different roundings in
+/// f64, both by the association (`w*a + w*b` vs `w*(a+b)`) and by the summation order
+/// (centre-outward vs left-to-right).
+///
+/// PRECONDITION, and the reason this is worth writing down: the pair fold reads
+/// `kernel[mid-offset]` for BOTH taps, so it is only valid on a SYMMETRIC kernel. On an
+/// antisymmetric one -- a first-derivative-of-Gaussian, `order=1` -- it would not be a
+/// few ulps off, it would be flatly wrong, since the two taps that should cancel would
+/// instead add. What makes that safe here is structural rather than checked: this
+/// function is `gaussian_filter_2d_reflect_order0` and calls `gaussian_kernel1d(sigma, 0,
+/// radius)` with the order hardcoded to 0. If this ever grows an `order` parameter, the
+/// axpy arm must be gated on the kernel actually being symmetric.
 pub static GAUSSIAN_2D_AXPY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -3731,6 +3746,20 @@ fn uniform_filter_along_axis(
 /// as a reference oracle and for same-process interleaved A/B benchmarking under
 /// fleet contention (separate-run benches drift ~2×; only an in-process toggle is
 /// reliable). frankenscipy van-Herk lever.
+/// CONTRACT: IDENTICAL OUTPUT either way, and exactly so rather than to a tolerance,
+/// because min and max SELECT an input value rather than computing a new one. Van
+/// Herk-Gil-Werman rebuilds the window from prefix and suffix running extrema instead of
+/// rescanning it, which changes how many comparisons happen and in what order but not
+/// which element wins: extremum is associative, and no arithmetic is performed on the
+/// values, so there is no rounding for a different evaluation tree to expose.
+///
+/// That holds only while the comparator is a TOTAL order, which is why the comparator is
+/// a parameter rather than a constant. `f64::max`/`f64::min` are not a total order in the
+/// presence of NaN (they absorb it) or -0.0 (they do not distinguish it from +0.0), so
+/// they are selected only when `needs_total_cmp` is false -- i.e. when the data provably
+/// contains neither -- and `tc_max`/`tc_min` carry scipy's total-order tie-breaks and NaN
+/// propagation otherwise. Both arms of the toggle take the SAME comparator, so the
+/// identity is between the two window algorithms and does not depend on that choice.
 pub static MINMAX_FILTER_HGW: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 

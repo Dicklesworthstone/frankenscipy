@@ -2191,6 +2191,17 @@ pub fn nystroem(
 /// Force-serial toggle for the Nyström RBF `E`-block fill, used only by the A/B perf harness
 /// (`bin/perf_rbf_nystroem`) to compare the parallel row-fill against the original serial
 /// `.iter().map().collect()` inside one binary. Production code leaves it `false`.
+/// CONTRACT: BYTE-IDENTICAL either way. The fan-out is across ROWS of the landmark kernel
+/// block `E`, and each row is `row(x_i)` -- the m kernel evaluations between one data
+/// point and the m landmarks, depending on nothing any other row computes. Threads take
+/// disjoint `chunks_mut` of the output and fill fixed indices, so both the values and
+/// their order are independent of the thread count.
+///
+/// Note the scope of that claim: it covers only the construction of `E`. The Nystrom
+/// approximation itself is inexact by design -- `Z*Z^T` approximates the full kernel, and
+/// is equal to it only when the kernel's numerical rank is at most m -- but that
+/// approximation is identical under both arms of this toggle, which changes how `E` is
+/// filled and not what is in it.
 pub static NYSTROEM_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

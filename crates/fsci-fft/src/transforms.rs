@@ -117,6 +117,18 @@ static COOLEY_TUKEY_BACKEND: CooleyTukeyBackend = CooleyTukeyBackend;
 /// Runtime switch to force the Bluestein path for large-prime FFTs (bypassing the
 /// Rader route) for same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]`.
 #[doc(hidden)]
+/// CONTRACT: NOT bit-identical. Rader and Bluestein are different factorisations of the
+/// same prime-length DFT -- Rader maps it to a cyclic convolution of length n-1 via a
+/// primitive root, Bluestein to a chirp-multiplied convolution of length >= 2n-1 -- so they
+/// differ in transform length, in twiddle set, and in the depth of the butterfly tree.
+/// Their outputs agree to FFT roundoff, and neither is the "true" answer for the other to
+/// be checked against.
+///
+/// The anchor is therefore a THIRD arm rather than a diff between these two: the in-crate
+/// test compares `rader_fft` against a naive O(p^2) DFT at p in {67, 71, 101, 103, 1031},
+/// both directions, and holds it to 1e-7 absolute on unit-scale input. A regression that
+/// moved either arm off the direct DFT would show up there; a bare Rader-vs-Bluestein
+/// comparison could not tell which of the two had moved.
 pub static FFT_PRIME_FORCE_BLUESTEIN: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

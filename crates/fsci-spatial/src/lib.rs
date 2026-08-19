@@ -1616,6 +1616,18 @@ pub fn cdist_seuclidean(
 
 /// Same-binary A/B toggle: when `true`, `cdist_seuclidean` uses the per-pair divide path;
 /// when `false` (default) it whitens to `x/√v` once and routes through Euclidean cdist.
+/// CONTRACT: NOT byte-identical -- agrees to ~1e-15 relative. Standardized Euclidean is
+/// Euclidean in the whitened space, so the fast arm scales both point sets by `1/sqrt(v_k)`
+/// ONCE and routes through the tuned Euclidean kernel instead of dividing by `v_k` per
+/// pair. The rounding differs because the scaling rounds FIRST: `(x_i - y_i)^2 / v` and
+/// `(x_i*s - y_i*s)^2` are the same quantity in exact arithmetic and two different f64
+/// values, with `1/sqrt(v_k)` carrying its own rounding into every coordinate.
+///
+/// The gate `v.iter().all(|&vk| vk > 0.0)` is part of the contract, not a performance
+/// heuristic. A zero or negative `v_k` makes `1/sqrt(v_k)` infinite or NaN and would
+/// poison every pair through the whitened path, whereas the per-pair arm produces scipy's
+/// exact per-element NaN behaviour. Non-positive variance therefore keeps the slow arm on
+/// both sides of the toggle.
 pub static SPATIAL_SEUCLIDEAN_PRESCALE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
