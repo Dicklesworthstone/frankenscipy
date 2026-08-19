@@ -5385,6 +5385,11 @@ fn cholesky_lower_blocked_with_kernels_scratch<
         } else {
             cholesky_factor_panel_blocked(&mut lower, n, k, kb, panel_inner)?;
         }
+        CHOL_PANEL_NANOS.fetch_add(
+            u64::try_from(panel_t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let trsm_t0 = std::time::Instant::now();
         if TRSM_KERNEL == TRSM_KERNEL_ROWS2 {
             let (panel, trailing) = lower.split_at_mut(kb * n);
             cholesky_panel_trsm_rows2(panel, trailing, n, k, kb)?;
@@ -5409,6 +5414,10 @@ fn cholesky_lower_blocked_with_kernels_scratch<
                 }
             }
         }
+        CHOL_TRSM_NANOS.fetch_add(
+            u64::try_from(trsm_t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if kb < n {
             let syrk_t0 = std::time::Instant::now();
             let m2 = n - kb;
@@ -20289,6 +20298,23 @@ fn matmul_flat_compute_rows(
 /// which is deliberate: packing is part of what the trailing update costs the factor.
 #[doc(hidden)]
 pub static CHOL_SYRK_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Nanoseconds spent in the PANEL FACTOR of the blocked Cholesky, accumulated.
+///
+/// `frankenscipy-gykw5`. The in-situ row established that threading the trailing SYRK caps at
+/// ~1.07x on the whole factor against a 1.61x need, so the deficit must live in what we run
+/// SERIALLY. These two accumulators split the remaining ~52% into its parts, which is what
+/// decides whether there is an Amdahl ceiling worth attacking and where.
+///
+/// Same admissibility argument as `CHOL_SYRK_NANOS`: the wrapped regions are whole phases
+/// (hundreds of microseconds), called `n/nb` times per factor, so two clock reads apiece are
+/// negligible and are not inside any vectorised loop.
+#[doc(hidden)]
+pub static CHOL_PANEL_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Nanoseconds spent in the PANEL TRSM of the blocked Cholesky, accumulated.
+#[doc(hidden)]
+pub static CHOL_TRSM_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Trailing-SYRK dispatches counted by [`CHOL_SYRK_NANOS`], so the mean per call is derivable.
 #[doc(hidden)]
