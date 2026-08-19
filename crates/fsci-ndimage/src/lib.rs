@@ -1737,6 +1737,7 @@ pub(crate) static SPLINE_FLAGS_RESOLVE_COUNT: std::sync::atomic::AtomicUsize =
 
 impl SplineFlags {
     /// Read both atomics ONCE. Call this OUTSIDE any per-pixel loop.
+    #[cfg(not(feature = "spline-flags-const"))]
     fn resolve() -> Self {
         #[cfg(test)]
         SPLINE_FLAGS_RESOLVE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1747,9 +1748,22 @@ impl SplineFlags {
         }
     }
 
+    /// `frankenscipy-22van` gate (b): the shipped defaults as COMPILE-TIME CONSTANTS, so no
+    /// atomic survives anywhere in the per-pixel path and the compiler is free to specialise
+    /// the loop. Hardcodes exactly the default values (`offsets = true` because the shipped
+    /// `NDIMAGE_SPLINE_OFFSET_DISABLE` is `false`; `compact_disabled = false`).
+    #[cfg(feature = "spline-flags-const")]
+    fn resolve() -> Self {
+        Self {
+            offsets: true,
+            compact_disabled: false,
+        }
+    }
+
     /// The A/B baseline: re-read per call, reproducing the pre-22van behaviour exactly.
     /// Selected by `NDIMAGE_SPLINE_FLAG_HOIST_DISABLE`, so the hoist can be measured
     /// against the shape it replaced inside one binary.
+    #[cfg(not(feature = "spline-flags-const"))]
     #[inline]
     fn resolve_or_reread(hoisted: Self) -> Self {
         if NDIMAGE_SPLINE_FLAG_HOIST_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1757,6 +1771,15 @@ impl SplineFlags {
         } else {
             hoisted
         }
+    }
+
+    /// Gate (b) arm: the A/B knob itself is compiled out. This is the point of the feature —
+    /// in the default build this function performs an atomic load ONCE PER PIXEL, which is
+    /// why a same-binary A/B cannot measure specialisation.
+    #[cfg(feature = "spline-flags-const")]
+    #[inline]
+    fn resolve_or_reread(hoisted: Self) -> Self {
+        hoisted
     }
 }
 
@@ -9830,12 +9853,12 @@ pub fn shift(
             // Resolve ONCE, outside the pixel closure (`frankenscipy-22van`).
             let flags = SplineFlags::resolve();
             // Resolved on THIS path. The other binding lives inside the branch that returns
-    // early, so it is out of scope here, and exactly one of the two runs per call --
-    // which is what `van22_knob_read_is_per_transform` asserts. Resolving inside the
-    // closure instead would read the toggles once PER PIXEL, the hot-path regression
-    // that bead exists to prevent.
-    let flags = SplineFlags::resolve();
-    fill_pixels_parallel_indexed(&mut output, kernel_work, |_flat, out_idx| {
+            // early, so it is out of scope here, and exactly one of the two runs per call --
+            // which is what `van22_knob_read_is_per_transform` asserts. Resolving inside the
+            // closure instead would read the toggles once PER PIXEL, the hot-path regression
+            // that bead exists to prevent.
+            let flags = SplineFlags::resolve();
+            fill_pixels_parallel_indexed(&mut output, kernel_work, |_flat, out_idx| {
                 let coords: Vec<f64> = out_idx
                     .iter()
                     .enumerate()
@@ -13494,8 +13517,14 @@ mod zoom_separable_ab_tests {
             ] {
                 let diagonal = [[1.25, 0.0, 0.5], [0.0, 0.8, -1.0]];
                 let cases: [(&str, Box<dyn Fn() -> Result<NdArray, NdimageError>>); 3] = [
-                    ("zoom", Box::new(|| zoom(&input, &[1.7, 0.8], order, mode, 0.25))),
-                    ("shift", Box::new(|| shift(&input, &[1.3, -0.7], order, mode, 0.25))),
+                    (
+                        "zoom",
+                        Box::new(|| zoom(&input, &[1.7, 0.8], order, mode, 0.25)),
+                    ),
+                    (
+                        "shift",
+                        Box::new(|| shift(&input, &[1.3, -0.7], order, mode, 0.25)),
+                    ),
                     (
                         "affine",
                         Box::new(|| affine_transform(&input, &diagonal, order, mode, 0.25)),
@@ -13535,9 +13564,11 @@ mod zoom_separable_ab_tests {
         // what the separable precompute can represent.
         let sheared = [[1.0, 0.35, 0.5], [0.2, 1.0, -1.0]];
         NDIMAGE_ZOOM_SEPARABLE_DISABLE.store(false, Ordering::Relaxed);
-        let a = affine_transform(&input, &sheared, 3, BoundaryMode::Reflect, 0.25).expect("sheared");
+        let a =
+            affine_transform(&input, &sheared, 3, BoundaryMode::Reflect, 0.25).expect("sheared");
         NDIMAGE_ZOOM_SEPARABLE_DISABLE.store(true, Ordering::Relaxed);
-        let b = affine_transform(&input, &sheared, 3, BoundaryMode::Reflect, 0.25).expect("sheared");
+        let b =
+            affine_transform(&input, &sheared, 3, BoundaryMode::Reflect, 0.25).expect("sheared");
         NDIMAGE_ZOOM_SEPARABLE_DISABLE.store(false, Ordering::Relaxed);
         for (k, (x, y)) in a.data.iter().zip(&b.data).enumerate() {
             assert_eq!(x.to_bits(), y.to_bits(), "sheared affine [{k}]");
@@ -13583,12 +13614,15 @@ mod tests {
         let shifts = [0.37, -0.61];
 
         NDIMAGE_SPLINE_FLAG_HOIST_DISABLE.store(true, Ordering::Relaxed);
-        let per_call = shift(&input, &shifts, 3, BoundaryMode::Reflect, 0.0)
-            .expect("per-call-read arm");
+        let per_call =
+            shift(&input, &shifts, 3, BoundaryMode::Reflect, 0.0).expect("per-call-read arm");
         NDIMAGE_SPLINE_FLAG_HOIST_DISABLE.store(false, Ordering::Relaxed);
         let hoisted = shift(&input, &shifts, 3, BoundaryMode::Reflect, 0.0).expect("hoisted arm");
 
-        assert_eq!(per_call.shape, hoisted.shape, "shape must not depend on the knob");
+        assert_eq!(
+            per_call.shape, hoisted.shape,
+            "shape must not depend on the knob"
+        );
         assert!(
             per_call.data.iter().any(|v| *v != 0.0 && v.is_finite()),
             "degenerate fixture: an all-zero output would compare equal while proving nothing"
@@ -22220,7 +22254,9 @@ mod toggle_ab_nd_filter_scalar {
     /// interaction with the SIMD interior undriven.
     #[test]
     fn nd_filter_scalar_toggle_is_bit_identical() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         const H: usize = 192;
         const W: usize = 192;
@@ -22298,15 +22334,9 @@ mod toggle_ab_nd_filter_scalar {
                 expect += weights.data[kr * K + kc] * input.data[ir * W + ic];
             }
         }
-        let got = correlate_with_origins(
-            &input,
-            &weights,
-            &origins,
-            BoundaryMode::Constant,
-            0.0,
-        )
-        .expect("correlate")
-        .data[r * W + c];
+        let got = correlate_with_origins(&input, &weights, &origins, BoundaryMode::Constant, 0.0)
+            .expect("correlate")
+            .data[r * W + c];
         assert!(
             (got - expect).abs() <= 1e-9 * expect.abs().max(1.0),
             "the interior pixel disagrees with the correlation definition: got \
@@ -22329,16 +22359,16 @@ mod toggle_ab_nd_filter_scalar {
 /// is the other half: the one that says the read is not per pixel.
 #[cfg(test)]
 mod van22_knob_read_is_per_transform {
-    use super::{
-        BoundaryMode, NdArray, SPLINE_FLAGS_RESOLVE_COUNT, shift,
-    };
+    use super::{BoundaryMode, NdArray, SPLINE_FLAGS_RESOLVE_COUNT, shift};
     use std::sync::atomic::Ordering;
 
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn resolve_runs_per_transform_not_per_pixel() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Big enough that per-pixel and per-transform differ by orders of magnitude:
         // 64x64 = 4096 pixels. A count of ~1 and a count of ~4096 cannot be confused.
@@ -22354,7 +22384,11 @@ mod van22_knob_read_is_per_transform {
             .expect("shift failed on a well-formed fixture");
         let count = SPLINE_FLAGS_RESOLVE_COUNT.load(Ordering::Relaxed);
 
-        assert_eq!(out.size(), PIXELS, "the transform did not produce a full image");
+        assert_eq!(
+            out.size(),
+            PIXELS,
+            "the transform did not produce a full image"
+        );
 
         // MUST-HIT: the counter has to move at all. A resolve that is never called —
         // because the code was refactored past it — would give a count of 0 and

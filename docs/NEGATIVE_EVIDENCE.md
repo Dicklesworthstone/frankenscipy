@@ -38477,3 +38477,105 @@ lives. Recorded rather than run, because it needs its own pre-registration.
 n=2048 against live SciPy in the same run: `scipy1/fsci` 2.067x, `scipyN/fsci` 1.521x, nulls
 1.027/1.006. Consistent with the certified n=2048 rows above. Incumbent again on faster cores
 (3227 MHz against our 2764, clock_ratio 1.168), so those remain floors.
+
+## 2026-08-19 — frankenscipy-22van gate (b) — the spline-knob hoist buys NOTHING measurable, and the splu 13% does NOT generalise — REJECT
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-ndimage/src/bin/perf_van22_spline.rs (two shipping binaries, ABBA-interleaved)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms in one window)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=64 actual observed worker threads=64 (the shared rayon pool this
+  transform dispatches to; `fill_pixels_parallel_indexed` is the parallel arm)
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.410)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.398)
+atomic-arm-engine-sha256 = 93cd3d1af09be6aea78dcd580f086d3553f6cc1c40da334ccd88f95963e4cb51
+const-arm-engine-sha256 = e78f75fe4ed686f1f1eb322e87effbd64807c920ab12ef663a7720156b91db6a
+executed-binary ELF SHA-256 = 93cd3d1af09be6aea78dcd580f086d3553f6cc1c40da334ccd88f95963e4cb51
+Same-invocation A/A null: median 1.0328, max 1.1668 (same arm twice inside each ABBA cycle)
+Counted mechanism: `SPLINE_FLAGS_RESOLVE_COUNT` — gate (a), asserted per-transform not
+  per-pixel by `van22_knob_read_is_per_transform` (64x64 = 4096 pixels, observed count a small
+  constant, not 4096)
+Decision: candidate CI — paired bootstrap-median 95% CI over 8 ABBA cycles is
+  [0.9766, 1.0057] with median 0.9964x, judged against a 2x A/A-null margin: null-margin = 2x
+  the measured A/A null of 1.0328, i.e. a threshold of 1.0656. The CI straddles 1.0 and lies
+  entirely below that threshold: IN-FLOOR, REJECT.
+CV is provenance only and was not used for this decision.
+
+### THE PRE-REGISTERED INSTRUMENT WAS RIGHT AND THE SHIPPED ONE COULD NOT HAVE ANSWERED IT
+
+The bead pre-registered that gate (b) must be an A/B of two SHIPPING binaries, not a
+same-binary toggle. That reads like caution. It is a hard requirement, and the reason is
+concrete: `SplineFlags::resolve_or_reread` — the same-binary knob
+`NDIMAGE_SPLINE_FLAG_HOIST_DISABLE` — is consulted inside `sample_interpolated`, i.e. ONCE PER
+PIXEL. In the default build BOTH arms of that toggle therefore carry a per-pixel atomic load,
+neither can specialise, and a same-binary A/B is structurally incapable of measuring the thing
+the bead is about. It would have printed a null, and the null would have meant nothing.
+
+Added a `spline-flags-const` cargo feature that compiles both knobs to constants, removing every
+atomic from the per-pixel path, and a `perf_van22_spline` bin built twice from it. The two
+builds have distinct ELF SHA-256s and produce an IDENTICAL output checksum
+(`3ff125d92d921eb5` at w=256, `464f9af7f143ded7` at w=128), so they compute the same image.
+
+### The result
+
+| | |
+|---|---|
+| atomic arm median | 0.007437117 s |
+| const arm median | 0.007221929 s |
+| paired median ratio (atomic/const) | **0.9964x** |
+| bootstrap-median CI95 | **[0.9766, 1.0057]** |
+| A/A null (same arm twice per cycle) | 1.0328 median, 1.1668 max |
+| 2x-null threshold | 1.0656 |
+
+Fixture: 256x256 f64, order-3 spline, NON-INTEGER shifts (0.37, -0.61) on both axes so the
+cardinal fast path is bypassed and the spline sampler is actually reached — an integer shift
+would have made both arms run identical code and the row vacuous. 8 ABBA cycles, best-of-15
+per sample, 5 transforms per timed block.
+
+**The point estimate is 0.9964 — the const arm is marginally SLOWER, well inside noise.** There
+is no specialisation benefit here.
+
+### Why this is worth recording rather than discarding
+
+The bead said so in advance: "If (a) confirms per-pixel frequency but (b) is null, report the
+null — that is the interesting result, because it would bound the splu finding as specific to
+that kernel rather than general." That is what happened.
+
+And the bound is sharp, not merely a failure to detect. The `perf_toggle_read_in_hot_loop`
+precedent measured **13%** on fsci-sparse's splu merge. A 13% effect would show as a ratio near
+1.13; the CI upper bound here is **1.0057**. An effect of that size is excluded by a very wide
+margin, so this is a positive statement about the world: the barrier cost is a property of the
+splu merge kernel, not a general law about atomic reads in per-item paths.
+
+A plausible mechanism for the difference, NOT established here: `sample_interpolated` does
+substantial per-pixel work (an order-3 separable spline evaluation, ~800 ns/pixel per the
+in-tree comment), so one relaxed load and the specialisation it blocks are a much smaller
+fraction of the pixel than they were of a splu merge step. Testing that would need a size sweep
+against per-pixel cost, which this row does not attempt.
+
+### What stays
+
+The hoist itself STAYS SHIPPED. It is byte-identical (asserted by
+`spline_flag_hoist_is_bit_identical_to_the_per_call_read`), it is not slower, and it is the
+structurally clearer code. This REJECT is of the *expectation of a speedup*, not of the change.
+The `spline-flags-const` feature stays as the instrument, documented as measurement-only.
+
+### Honest limits
+
+- One shape (256x256), one order (3), one transform (`shift`), one boundary mode. The bead
+  ranked `shift` as the strongest candidate, so this is the case most likely to show an effect;
+  it does not follow that no ndimage path can.
+- The window was NOT quiet: loadavg 25-31, host mean busy ~0.40, and the A/A null of 3.3%
+  reflects that. The paired ABBA design is what makes the ratio usable anyway — it cancels
+  drift the null still sees. A quieter re-run would tighten the CI but cannot turn a 0.9964
+  point estimate into a 1.13.
+- An earlier attempt in the same window at best-of-7 gave an A/A null of 5.4% (max 43%) and is
+  discarded, not reported as a null result: that was an unusable window, not evidence.
+
+### Unrelated pre-existing defect noticed
+
+`crates/fsci-ndimage/src/lib.rs:9854` binds `let flags = SplineFlags::resolve();` inside a
+branch where it is immediately dead — `cargo check` warns `unused variable: flags` on a CLEAN
+tree, so it is not from this work. Harmless to output, but it is a redundant resolve and it
+inflates the gate-(a) count by one. Left alone as out of scope; noted so it is not rediscovered.

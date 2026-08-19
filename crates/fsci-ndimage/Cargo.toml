@@ -4,6 +4,22 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[features]
+# frankenscipy-22van gate (b). The bead requires the SPECIALISATION half be an A/B of two
+# SHIPPING binaries, not a same-binary toggle, and the reason is now concrete: the same-binary
+# knob `NDIMAGE_SPLINE_FLAG_HOIST_DISABLE` is itself read inside `sample_interpolated`, i.e.
+# ONCE PER PIXEL. So in the default build NEITHER arm can specialise the pixel loop — both
+# still carry a per-pixel atomic — and a same-binary A/B structurally cannot measure the thing
+# the bead is about.
+#
+# With this feature the flags become compile-time constants and every atomic disappears from
+# the per-pixel path, so the compiler may specialise. Timing this build against the default one,
+# alternated in a single window, is the two-binary comparison the bead asked for.
+#
+# It is a MEASUREMENT feature: it hardcodes the shipped defaults, so it must never be enabled
+# for a build whose behaviour is under test by the toggles it removes.
+spline-flags-const = []
+
 [dependencies]
 fsci-fft = { workspace = true }
 fsci-interpolate = { workspace = true }
