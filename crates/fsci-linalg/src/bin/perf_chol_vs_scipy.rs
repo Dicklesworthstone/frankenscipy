@@ -41,9 +41,9 @@ fn main() {
 #[cfg(unix)]
 mod harness {
     use fsci_linalg::{
-        CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE, CHOL_PANEL_TRSM_PAR_PANELS, CHOL_PANEL_TRSM_STD_SCOPE,
-        CHOL_SYRK_NC_OVERRIDE, DecompOptions, MATMUL_PAR_DISPATCHES, MATMUL_PAR_MACS_OVERRIDE,
-        cholesky,
+        CHOL_NB_OVERRIDE, CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE, CHOL_PANEL_TRSM_PAR_PANELS,
+        CHOL_PANEL_TRSM_STD_SCOPE, CHOL_SYRK_NC_OVERRIDE, DecompOptions, MATMUL_PAR_DISPATCHES,
+        MATMUL_PAR_MACS_OVERRIDE, cholesky,
     };
     use std::io::{BufRead, BufReader, Read, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -729,6 +729,26 @@ for raw_line in sys.stdin.buffer:
         out
     }
 
+    /// Best-of-`min_of` wall seconds with the blocked-Cholesky panel width `NB` overridden.
+    ///
+    /// `frankenscipy-gykw5`, the granularity test. Four parallel-dispatch measurements have now
+    /// shown the loss band is not reachable by moving the 64M gate. The remaining structural
+    /// suspect is the SHAPE of the work: with `nb = 128` the trailing updates decay
+    /// geometrically (63.4M → 42.5M → … → 0.5M at n=832), so none is big enough to thread.
+    /// A WIDER panel makes fewer, larger updates — at n=832, `nb = 256` gives a first update of
+    /// 84.9M MACs, which clears the gate — so this tests the granularity hypothesis with an
+    /// existing knob instead of a new kernel, and therefore without confounding decomposition
+    /// against kernel quality.
+    ///
+    /// NOT byte-identical across NB: panel boundaries regroup the accumulation, which is why
+    /// this arm is gated on BACKWARD ERROR rather than on bits.
+    fn time_fsci_nb(a: &[Vec<f64>], reps: usize, min_of: usize, nb: usize) -> f64 {
+        CHOL_NB_OVERRIDE.store(nb, std::sync::atomic::Ordering::Relaxed);
+        let out = time_fsci(a, reps, min_of);
+        CHOL_NB_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
     /// Best-of-`min_of` wall seconds for `reps` fsci factorisations.
     fn time_fsci(a: &[Vec<f64>], reps: usize, min_of: usize) -> f64 {
         let mut best = f64::INFINITY;
@@ -869,6 +889,11 @@ for raw_line in sys.stdin.buffer:
         let trsm_arm = std::env::var("FSCI_CHOL_TRSM_AB").is_ok_and(|v| v != "0");
         // frankenscipy-ua3gn second experiment: lowered TRSM parallel MACs gate under test.
         // frankenscipy-gykw5: the trailing-SYRK / general matmul parallel gate under test.
+        // frankenscipy-gykw5 granularity arm: panel width under test.
+        let nb_arm: usize = std::env::var("FSCI_CHOL_NB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let mm_arm: u64 = std::env::var("FSCI_CHOL_MATMUL_MACS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -897,7 +922,7 @@ for raw_line in sys.stdin.buffer:
         );
         println!(
             "sizes={sizes:?} replicates={replicates} reps={reps} min_of={min_of} seed={seed:#x} \
-             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy} trsm_ab={trsm_arm} trsm_macs={macs_arm} matmul_macs={mm_arm}"
+             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy} trsm_ab={trsm_arm} trsm_macs={macs_arm} matmul_macs={mm_arm} nb={nb_arm}"
         );
 
         for &n in &sizes {
@@ -1072,6 +1097,33 @@ for raw_line in sys.stdin.buffer:
                 );
             }
 
+            if nb_arm > 0 {
+                // Reachability AND accuracy, before timing. NB legitimately changes the factor
+                // bits (panel boundaries regroup accumulation), so the check here is the
+                // BACKWARD ERROR, not bit-identity: a wider panel that is faster but less
+                // accurate is not a lever, it is a different contract.
+                CHOL_NB_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_PAR_DISPATCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+                let base_f = cholesky(&a, true, DecompOptions::default()).expect("spd factors");
+                let disp_default = MATMUL_PAR_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed);
+                CHOL_NB_OVERRIDE.store(nb_arm, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_PAR_DISPATCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+                let wide_f = cholesky(&a, true, DecompOptions::default()).expect("spd factors");
+                let disp_wide = MATMUL_PAR_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed);
+                CHOL_NB_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+                let be_default = backward_error(&a, &base_f.factor);
+                let be_wide = backward_error(&a, &wide_f.factor);
+                println!(
+                    "n={n} NB_REACH nb={nb_arm} par_dispatch_default={disp_default} \
+                     par_dispatch_wide={disp_wide} backward_err_default={be_default:.3e} \
+                     backward_err_wide={be_wide:.3e}"
+                );
+                assert!(
+                    be_wide <= BACKWARD_ERROR_BUDGET * n as f64 * f64::EPSILON,
+                    "n={n} nb={nb_arm}: wider panel backward error {be_wide:.3e} exceeds budget"
+                );
+            }
+
             // Warm the fsci arm outside every timer, matching the SciPy side's warmup.
             //
             // THREE factorisations, not one. With a single warmup the n=256 cell returned an
@@ -1095,6 +1147,8 @@ for raw_line in sys.stdin.buffer:
             let mut null_macs = Vec::with_capacity(replicates);
             let mut r_mm = Vec::with_capacity(replicates);
             let mut null_mm = Vec::with_capacity(replicates);
+            let mut r_nb = Vec::with_capacity(replicates);
+            let mut null_nb = Vec::with_capacity(replicates);
             // Every load and clock sample taken anywhere inside this cell, so the gates
             // below judge the window the ratio was actually measured in rather than a
             // single reading taken before it.
@@ -1158,6 +1212,15 @@ for raw_line in sys.stdin.buffer:
                     null_mm.push(base_a.max(base_b) / base_a.min(base_b));
                     // > 1 means the LOWERED gate (more parallel dispatch) is faster.
                     r_mm.push(base_a.min(base_b) / low_a.min(low_b));
+                }
+                if nb_arm > 0 {
+                    let base_a = time_fsci_nb(&a, reps, min_of, 0);
+                    let wide_a = time_fsci_nb(&a, reps, min_of, nb_arm);
+                    let wide_b = time_fsci_nb(&a, reps, min_of, nb_arm);
+                    let base_b = time_fsci_nb(&a, reps, min_of, 0);
+                    null_nb.push(base_a.max(base_b) / base_a.min(base_b));
+                    // > 1 means the WIDER panel (fewer, larger updates) is faster.
+                    r_nb.push(base_a.min(base_b) / wide_a.min(wide_b));
                 }
                 cell_loads.extend([load_f0, load_f1, load_s1, load_sn]);
                 cell_mhz_fsci.extend([mhz_f0, mhz_f1]);
@@ -1224,6 +1287,23 @@ for raw_line in sys.stdin.buffer:
                  gates={verdict} loadavg_post={}",
                 read_trimmed("/proc/loadavg"),
             );
+            if nb_arm > 0 {
+                let nmed = median(&mut r_nb.clone());
+                let nnull = median(&mut null_nb.clone());
+                let ok = (nnull - 1.0).abs() <= 0.05;
+                println!(
+                    "n={n} NB_RAW nb={nb_arm} ratios={}",
+                    r_nb.iter()
+                        .map(|v| format!("{v:.9}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                println!(
+                    "n={n} NB_ARM nb={nb_arm} default/wide={nmed:.3}x (>1 = wider panel faster) \
+                     null_nb={nnull:.3} nb_gates={}",
+                    if ok && load_ok { "PASS" } else { "FAIL" }
+                );
+            }
             if mm_arm > 0 {
                 let mmed = median(&mut r_mm.clone());
                 let nmed = median(&mut null_mm.clone());

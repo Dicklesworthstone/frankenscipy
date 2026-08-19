@@ -38916,3 +38916,93 @@ structural difference to test, and it is a design change rather than a knob.
 - Neutral is measured against a ~2.6% null. A true 1-2% gain would be invisible here and is not
   excluded — but a 1-2% gain does not close a 0.62x basin either.
 - Same non-SYRK-specific caveat as the row above: `matmul_thread_count` has 11 call sites.
+
+## 2026-08-19 — frankenscipy-gykw5 — the GRANULARITY hypothesis tested with `CHOL_NB_OVERRIDE`: neutral at best, and it undercuts my own proposed next step
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_chol_vs_scipy.rs (arm FSCI_CHOL_NB)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms one process, ABBA-interleaved)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=64 actual observed worker threads=64
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.298)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.230)
+frankenscipy-engine-sha256 = 19d9b2f0ec2cfa32343ed3c42f8a0961b44ea4ecf6d9340dfc7f87122a50d508
+executed-binary ELF SHA-256 = 19d9b2f0ec2cfa32343ed3c42f8a0961b44ea4ecf6d9340dfc7f87122a50d508
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+Same-invocation A/A null: 1.012 (n=640), 1.022 (n=832)
+Counted mechanism: `MATMUL_PAR_DISPATCHES` observed 0 → 0 at n=640 and 0 → 1 at n=832
+Decision: candidate CI — bootstrap-median 95% CI against a 2x A/A-null margin. n=640
+  [0.8112, 0.8823] against a lower band of 0.9760 → DECIDED SLOWER. n=832 [0.9669, 1.0736]
+  against 0.9560 → IN-FLOOR.
+CV is provenance only and was not used for this decision.
+
+### The hypothesis, and why NB was the right way to test it
+
+The previous row concluded the trailing updates decay geometrically so none is big enough to
+thread, and proposed that a decomposition producing FEWER, LARGER updates would differ. Before
+writing a recursive factor — which would confound decomposition against kernel quality — the
+same mechanism is testable with an existing knob: a wider panel makes fewer, larger trailing
+updates using the SAME kernels.
+
+Computed first, so the arm is not run blind (`m2 · nb · m2` against the 64.0M gate):
+
+| n | nb=128 | nb=192 | nb=256 | nb=320 |
+|---|---|---|---|---|
+| 640 | 33.6 / 18.9 / 8.4 / 2.1 — **0 clear** | 38.5 / 12.6 / 0.8 — 0 clear | 37.7 / 4.2 — **0 clear** | 32.8 — 0 clear |
+| 832 | 63.4 / 42.5 / … — **0 clear** | 78.6 / 38.5 / … — 1 clears | **84.9** / 26.2 / 1.0 — **1 clears** | 83.9 / 11.8 — 1 clears |
+
+At n=640 NO panel width reaches 64M: the whole factorisation is too small for the gate at any
+granularity. That makes n=640 a built-in negative control — widening there cannot open a
+dispatch, so any effect must be the panel width alone.
+
+### Result
+
+| n | dispatches 0 → | default/wide | CI95 | null | 2x-null band | verdict |
+|---|---|---|---|---|---|---|
+| 640 | **0** | **0.8581x** | [0.8112, 0.8823] | 1.012 | 0.9760 | **DECIDED SLOWER** |
+| 832 | **1** | **1.0179x** | [0.9669, 1.0736] | 1.022 | 0.9560 | **IN-FLOOR** |
+
+Backward error is unaffected and slightly better on the wide arm (1.236e-16 vs 1.367e-16 at
+n=640; 1.054e-16 vs 1.153e-16 at n=832), so this is a cost comparison and not an accuracy trade.
+
+**Where widening cannot open the gate it costs 14%. Where it CAN — and does — the net is
+exactly zero.** The threading gain from one 84.9M update is cancelled by the extra serial
+in-panel work a 256-wide panel carries.
+
+### THIS UNDERCUTS THE NEXT STEP I PROPOSED, and that is the finding
+
+The previous row's recommendation was a recursive / cache-oblivious right-looking split, whose
+whole claimed advantage was exactly this: one large root trailing update instead of a decaying
+sequence. That mechanism has now been tested in isolation and is worth **nothing** at n=832 and
+is **harmful** at n=640. So the recursive candidate should be downgraded: its proposed benefit
+is measured neutral, and it would additionally pay a real cost in kernel quality and complexity.
+I am recording that against my own suggestion rather than leaving the suggestion standing.
+
+Five measurements now agree on this bead: panel-TRSM worker reuse (in-floor), panel-TRSM MACs
+gate (regression), trailing-SYRK MACs gate fully open (regression), the same gate surgical
+(in-floor), and panel granularity (in-floor at best). Every knob that changes WHEN or HOW MUCH
+we fan out has been tried.
+
+### What that leaves
+
+Not "parallelise differently" — that family is exhausted at these sizes. The remaining
+possibilities are about the serial work itself, and none is tested:
+
+1. Our per-flop kernel rate in the basin. If our serial SYRK/TRSM is materially slower per flop
+   than OpenBLAS's, no scheduling change can close a 0.62x gap, and the fix is the microkernel.
+   Measurable directly: flops/s of one trailing update at n=832 against a same-size
+   `scipy.linalg.blas.dsyrk` call.
+2. Whether SciPy's advantage is threading at all. `scipy1` is only 0.95x here, so the incumbent
+   is winning by roughly 1.5x from threading a problem we do not thread — but if its SERIAL rate
+   is also higher, the ordering of work to attack changes.
+
+Both are one-cell experiments and neither needs a new kernel to answer.
+
+### Honest limits
+
+- One panel width (256) per cell. 192 and 320 also open one dispatch at n=832 and were not run;
+  they differ from 256 by how much serial in-panel work they add, so they could in principle
+  land differently, but 256 is the middle of that range.
+- Two cells, one fixture family. n=640 is a genuine negative control by construction, which is
+  why it is reported as the stronger of the two results.
