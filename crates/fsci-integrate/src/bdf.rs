@@ -35,6 +35,28 @@ pub static BDF_FORCE_PER_ITER_ALLOC: AtomicBool = AtomicBool::new(false);
 /// two `O(n²)` substitutions with `n` scalar divisions. See [`NewtonFactor`] for the
 /// bit-identity argument. Mirrors [`BDF_FORCE_PER_ITER_ALLOC`]. `#[doc(hidden)]`.
 #[doc(hidden)]
+/// CONTRACT: BIT-IDENTICAL either way. The toggle disables BOTH structural
+/// factorizations of `I − c·J` -- diagonal and banded -- and each is bit-identical to the
+/// dense LU for a different reason, which is worth separating because they are not the
+/// same argument.
+///
+/// DIAGONAL is identical by construction: when `J` is exactly diagonal, `I − c·J` is
+/// diagonal, GEPP performs no elimination at all, and the `n` reciprocal denominators ARE
+/// the factorization rather than an approximation of it.
+///
+/// BANDED is identical only under a precondition -- no row interchange -- and the reason
+/// this is a contract rather than a hope is that the precondition is CHECKED AT RUNTIME,
+/// not assumed. Under partial pivoting a multiplier migrates down its column without
+/// bound and dense GEPP's pivot search can legitimately reach outside the nominal band, so
+/// no band-clipped factorization can reproduce it; LAPACK's own `gbtrf` produces a
+/// different `L` and permutation for exactly this reason. `BandedLu::factor` returns
+/// `None` the moment the in-band maximum leaves the diagonal and the caller takes the
+/// dense path. It DECLINES rather than approximating, so there is no input on which the
+/// fast arm returns a different answer instead of no answer.
+///
+/// `nlu` counts the factorization on every arm, so the reported `SolveIvpResult` counters
+/// are unchanged too -- the toggle is invisible in the result, values and statistics
+/// alike.
 pub static BDF_FORCE_DENSE_NEWTON: AtomicBool = AtomicBool::new(false);
 
 /// Count of Newton factorizations that took the diagonal path. EXECUTION PROOF for

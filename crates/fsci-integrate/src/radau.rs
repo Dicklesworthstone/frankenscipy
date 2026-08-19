@@ -36,12 +36,32 @@ pub static RADAU_FORCE_PER_ITER_ALLOC: AtomicBool = AtomicBool::new(false);
 /// production caches the structural certificate when the Jacobian is refreshed.
 /// `#[doc(hidden)]`.
 #[doc(hidden)]
+/// CONTRACT: BIT-IDENTICAL either way, and note which arm is the fast one -- unlike most
+/// toggles in this audit, `true` here selects the SLOW path. It forces
+/// `diagonal_jacobian_entries(jac)` to re-derive the diagonal structure from the current
+/// Jacobian instead of reading the `jac_diagonal` cached alongside it.
+///
+/// That makes this a cache-staleness probe rather than an optimisation switch: both arms
+/// feed the same diagonal entries into the same scalar solves, so any difference between
+/// them is not a rounding difference but evidence that the cached structure no longer
+/// describes the Jacobian it is filed under. A/B agreement is the assertion; the timing
+/// is incidental.
 pub static RADAU_FORCE_DIAGONAL_RESCAN: AtomicBool = AtomicBool::new(false);
 /// When `true`, restore the original dense-Radau policy that changes the
 /// accepted step size on every controller update and rebuilds both Newton
 /// factors on the next step. The default retains a dense LU pair when the
 /// controller deliberately holds the step size. `#[doc(hidden)]`.
 #[doc(hidden)]
+/// CONTRACT: BIT-IDENTICAL either way. The retained factorization is reused only when
+/// `pair.h.to_bits() == requested_h.to_bits()` -- EXACT bit equality of the step size, not
+/// a relative-closeness test -- and against the same Jacobian, so the LU being reused is
+/// the factorization of the identical matrix the rebuild arm would produce. Reuse is
+/// additionally refused when the step is clipped to `t_bound`, since `h` changes there.
+///
+/// The bit-equality gate is the whole contract. A tolerance-keyed reuse (`|h - h_old| <
+/// eps`) would silently solve a slightly different Newton system, and because Radau's
+/// simplified Newton converges anyway, the error would surface as a drifting solution
+/// rather than a failure -- the hardest kind to attribute.
 pub static RADAU_FORCE_DENSE_LU_REBUILD: AtomicBool = AtomicBool::new(false);
 /// Count of Radau Newton factorizations that took the exact-diagonal stage and
 /// error-solve path. This is execution proof for live-incumbent harnesses: a

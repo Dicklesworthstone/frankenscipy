@@ -49,6 +49,17 @@ struct MathieuFourierCacheKey {
 static MATHIEU_PERIODIC_FOURIER_CACHE: MathieuFourierCache = std::sync::OnceLock::new();
 
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. This is a pure memo, not an approximation: a
+/// miss calls the same `mathieu_fourier(m, q, even)` the disabled arm calls, and a hit
+/// returns a clone of exactly what that call produced. The cache key holds `q.to_bits()`
+/// rather than `q`, so lookup is bit-equality on the input and cannot serve a
+/// neighbouring `q`'s coefficients -- the failure mode a tolerance-keyed cache would
+/// have.
+///
+/// Non-finite `q` bypasses the cache entirely, which keeps NaN out of the key space
+/// (`NaN != NaN` would make every NaN call a permanent miss that still inserted) and
+/// leaves the underlying routine's own NaN handling as the single source of that
+/// behaviour.
 pub static MATHIEU_PERIODIC_CACHE_DISABLE_FOR_BENCH: AtomicBool = AtomicBool::new(false);
 
 /// Evaluate the Legendre polynomial P_n(x) of degree n at point x.
@@ -2877,6 +2888,15 @@ fn lpmv_prefix_column(am: u32, n: u32, x: f64) -> Vec<f64> {
 
 /// Same-binary A/B toggle for `sph_legendre_p_all` (see `LEGENDRE_P_ALL_FUSED_DISABLE`).
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The fused arm does not approximate the per-cell
+/// map, it removes recomputation from it: for a fixed order magnitude `am` the values
+/// `P_j^{am}(cos θ)` are the recurrence PREFIX that the naive map reruns for every degree,
+/// so `lpmv_prefix_column` fills them once and each cell then applies the SAME normalising
+/// factor and the SAME `(−1)^am` negative-order sign expression that `sph_legendre_p`
+/// applies. `O(n²·m)` becomes `O(n·m)` with every arithmetic operation per cell unchanged.
+///
+/// Non-finite `θ` falls back to the map, so the fused arm never has to reproduce the
+/// scalar routine's NaN short-circuit -- it defers to it.
 pub static SPH_LEGENDRE_P_ALL_FUSED_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -2927,6 +2947,18 @@ pub fn sph_legendre_p_all(n: u32, m: u32, theta: f64) -> Vec<Vec<f64>> {
 
 /// Same-binary A/B toggle for `sph_harm_y_all` (see `LEGENDRE_P_ALL_FUSED_DISABLE`).
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way, by the same prefix-reuse argument as
+/// [`SPH_LEGENDRE_P_ALL_FUSED_DISABLE`], with one carve-out that is the interesting part.
+///
+/// The `l == 0` row is written by the MAP even on the fused arm. `sph_harm_y` returns a
+/// closed form for `l == 0`, `1/√(4π)`, and the general path's `√(1/(4π))` differs from it
+/// by up to 1 ULP -- the same quantity, a different order of operations. Fusing that row
+/// would have been a 1-ULP diff on one row of the table, which is precisely the kind of
+/// difference that is too small to fail a tolerance test and too real to call an
+/// identity. Reproducing it exactly costs one row of the naive map.
+///
+/// Non-finite `θ` or `φ` falls back to the map entirely, matching `sph_harm`'s NaN
+/// short-circuit rather than reimplementing it.
 pub static SPH_HARM_Y_ALL_FUSED_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
