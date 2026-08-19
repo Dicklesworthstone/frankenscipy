@@ -36686,3 +36686,40 @@ fixed spectrum on those two fixtures.
 nalgebra arm 0.025 s, Francis arm 0.014 s for the full 7000-case grid. Reported only to
 show the Francis path is not pathologically slower; no ratio should be quoted from a
 window like this one.
+
+## sez4r: routing `eig` to the Francis path is BLOCKED by a scale-equivariance defect — flip attempted and reverted
+
+2026-08-18, same session as the parity measurement above. Host: loadavg 16.03/18.03/13.29,
+CPU idle 82%, ~3400-4200 MHz. Incumbent arm: SciPy 1.17.1, same invocation.
+
+The convergence case is made and unchanged: 230 of 7000 fixtures recovered, 0 regressed,
+recovered spectra matching SciPy at median 2.37e-15. So I flipped
+`EIG_USE_FRANCIS_SCHUR` to `true` to actually ship it, ran the suite, and reverted.
+
+**WHAT THE FLIP BROKE.** `eig_keeps_complex_pairs_complex_at_every_scale_the_incumbent_does`
+fails on the Francis path at scale 2^-60:
+
+    |Im| = 0.000000e0, expected 8.673617e-19
+    full set: [0.0, 0.0, 2.6020852139652106e-18, 2.6020852139652106e-18]
+
+A conjugate pair is returned as REAL. SciPy is exactly scale-equivariant here.
+
+**WHY THE TRADE STILL SAYS DO NOT SHIP, despite 230 recoveries.** A
+`ConvergenceFailure` is loud, catchable and attributable; a complex pair flattened to
+real is none of those. A caller branching on "is this eigenvalue real" is told yes when
+the truth is no, with no signal. Trading 230 loud failures for even one silent wrong
+answer is the wrong direction, so the 230 stay unfixed until this is.
+
+**DIAGNOSIS, and a second bug found next to it.** The suspect is `eig2x2`, which decides
+realness from `disc = tr^2/4 - det`; at 2^-60 that subtraction cancels and a `disc` that
+should be slightly negative lands at exactly zero, so the pair is called real. Separately
+— and this one is certain even though it is NOT the observed failure —
+`standardize_2x2_blocks` compares `zz`, which carries the units of the matrix entries,
+against `4.0 * eps`: an absolute threshold on a dimensioned quantity, the defect class
+already recorded fleet-wide. It biases the other way (real pairs called complex at small
+scale), so it is a second latent scale bug sitting beside the first.
+
+**THE TOGGLE IS THE REASON THIS COST ONE TEST RUN RATHER THAN AN INCIDENT.** The path
+was built behind `EIG_USE_FRANCIS_SCHUR` from the start, so flipping it, observing the
+regression and reverting was three edits and a suite run, with the measured convergence
+result preserved intact for whoever fixes the scale handling.

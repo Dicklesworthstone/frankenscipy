@@ -6424,8 +6424,53 @@ pub static EIG_BALANCE: std::sync::atomic::AtomicBool =
 /// Route `eig` through the in-crate Francis QR (`hessenberg_qr`) instead of
 /// nalgebra's Schur — `frankenscipy-sez4r`.
 ///
-/// Default `false`: `bounded_schur` remains the shipped path until the new
-/// iteration has been compiled and checked against the named fixtures.
+/// Default `false`. I flipped this to `true` on 2026-08-18 and reverted it in the same
+/// session: the convergence case is made, and a SEPARATE defect makes the path unsafe to
+/// ship. See "why this is still off" below.
+///
+/// # The measurement that justifies the flip
+///
+/// Over the 7000 `make_diag_dominant` fixtures (n = 2..8, seed = 0..999) that exposed
+/// the original hang, with `scipy.linalg.eig` as the incumbent arm:
+///
+/// * nalgebra converges on 6770; this path converges on **7000**. 230 recovered, 0
+///   regressed.
+/// * The recovered spectra are CORRECT, not merely present — 25 sampled and compared
+///   eigenvalue-by-eigenvalue against SciPy at median 2.37e-15, max 4.72e-14.
+///
+/// # What the flip does NOT buy, stated because it is easy to assume
+///
+/// It is a convergence win, not a uniform accuracy win. On the six fixtures where both
+/// routines converge to different spectra, SciPy puts this path closer on four and
+/// nalgebra closer on two. Two of those six (n=5 seed=766, n=8 seed=777) are 4e-3 to
+/// 8e-3 from SciPy in BOTH arms — a separate accuracy defect in the eigenvalue path
+/// that this change neither causes nor cures.
+///
+/// # Why this is still off
+///
+/// `eig_keeps_complex_pairs_complex_at_every_scale_the_incumbent_does` fails on this
+/// path at 2^-60: a conjugate pair comes back with `Im = 0` where SciPy gives
+/// 8.67e-19. That is a STRUCTURALLY different answer, not a rounding one — a caller
+/// branching on "is this eigenvalue real" is told yes when the truth is no, silently.
+///
+/// Weighed against the 230 fixtures this path recovers, the trade still says do not
+/// ship: a `ConvergenceFailure` is loud, catchable, and attributable, while a complex
+/// pair flattened to real is none of those. Trading 230 loud failures for even one
+/// silent wrong answer is the wrong direction.
+///
+/// The suspect is scale handling in the 2x2 classification. `eig2x2` decides realness
+/// from `disc = tr^2/4 - det`, and at 2^-60 that subtraction cancels: a `disc` that
+/// should be slightly negative lands at exactly zero and the pair is called real.
+///
+/// A SECOND scale bug sits in the same area and is worth fixing whether or not it is
+/// this failure: `standardize_2x2_blocks` compares `zz`, which carries the units of the
+/// matrix entries, against `4.0 * eps` — an ABSOLUTE threshold on a DIMENSIONED
+/// quantity, the defect class already recorded fleet-wide. It biases the opposite way
+/// (real pairs called complex at small scale), so it is not the observed failure, but it
+/// is the same mistake sitting next to it.
+///
+/// Set to `true` to exercise the path; it remains a toggle rather than a deletion
+/// because the convergence result is real and only this blocks it.
 ///
 /// CONTRACT: NOT BIT-IDENTICAL, and deliberately so. The two arms are DIFFERENT
 /// ALGORITHMS — nalgebra's shift-free implicit double-shift QR versus a Francis
