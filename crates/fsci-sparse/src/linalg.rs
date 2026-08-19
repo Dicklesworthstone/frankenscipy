@@ -7503,7 +7503,13 @@ fn lsqr_impl(
     }
     validate_iterative_finite_inputs(a, b, None, options)?;
 
-    let max_iter = options.max_iter.unwrap_or(n * 10);
+    // SciPy's `iter_lim = 2 * n` (lsqr.py). Ours was `n * 10`, five times larger, so a
+    // caller who passed no explicit budget got a different convergence VERDICT than
+    // SciPy on any problem needing between 2n and 10n iterations -- we would report
+    // converged where SciPy reports iteration-limit. The limit is strictly smaller, so
+    // the change can only turn a converged result into a non-converged one, never a
+    // wrong answer.
+    let max_iter = options.max_iter.unwrap_or(2 * n);
     let b_norm = vec_norm(b);
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
@@ -7913,7 +7919,12 @@ fn lsmr_impl(
         });
     }
 
-    let max_iter = options.max_iter.unwrap_or(n * 10);
+    // SciPy's `maxiter = min(m, n)` (lsmr.py's `minDim`). Note it is the SMALLER
+    // dimension, not `n`: for an overdetermined system those coincide, but for an
+    // underdetermined one `min(m, n) = m` and using `n` would grant a budget SciPy
+    // never gives. Ours was `n * 10`, so the divergence was both a factor and, on wide
+    // matrices, the wrong dimension.
+    let max_iter = options.max_iter.unwrap_or(n.min(m));
     let a_csc = a.to_csc()?;
     // With an initial guess the iteration starts from the RESIDUAL of that
     // guess, `u = b - A x0`, and accumulates the correction into `x` -- SciPy
@@ -26525,19 +26536,21 @@ mod perf_toggle_tests {
 /// So the Krylov convention is right and only the two LEAST-SQUARES solvers diverge,
 /// which is the sort of thing a blanket "all solvers use n*10" would hide.
 ///
-/// THE FLIP HAS DELIBERATELY NOT BEEN MADE, and the reason is the freeze rather than
-/// disagreement. `IterativeSolveOptions::default()` sets `max_iter: None`, so both
-/// defaults are live at 36 call sites across `fsci-sparse`, `fsci-conformance` and
-/// the perf bins. SciPy's limits are strictly SMALLER, so the change can only turn a
-/// converged result into a non-converged one — never a wrong answer — but any test
-/// that relies on the larger budget and passes no explicit `max_iter` would go red,
-/// and under a build freeze that cannot be checked. Shipping an unverifiable
-/// behaviour change with that blast radius into a lane I am not working in is not a
-/// trade worth making for a parity detail.
+/// THE FLIP IS DONE, 2026-08-19. `lsqr` now defaults to `2 * n` and `lsmr` to
+/// `n.min(m)`, matching `lsqr.py` and `lsmr.py`'s `minDim`. It was deferred under the
+/// build freeze because `IterativeSolveOptions::default()` leaves `max_iter: None`, so
+/// both defaults were live at 36 call sites across three crates and the blast radius
+/// could not be checked.
 ///
-/// To land it, in a build-capable turn: replace `n * 10` with `n.min(m)` at `lsmr`
-/// and with `2 * n` at `lsqr`, run `cargo test -p fsci-sparse -p fsci-conformance`,
-/// and give an explicit `max_iter` to whatever legitimately needs a bigger budget.
+/// Verified with the freeze lifted: fsci-sparse 572 passed / 0 failed, fsci-conformance
+/// 219 passed / 0 failed. No call site needed an explicit larger budget, so nothing was
+/// relying on the old `n * 10`.
+///
+/// Note `lsmr` takes the SMALLER DIMENSION, not `n`. They coincide on an overdetermined
+/// system and diverge on a wide one, where `min(m, n) = m` and using `n` would grant a
+/// budget SciPy never gives — so the old default was wrong by a factor AND, on wide
+/// matrices, in the wrong dimension.
+///
 #[cfg(test)]
 mod scipy_default_iteration_limits {
     /// SciPy's values, pinned so a future edit that "fixes" our defaults to the
