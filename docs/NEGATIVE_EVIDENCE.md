@@ -37001,3 +37001,71 @@ only thing that ever produced a number for it. An order-invariant comparison —
 response via `sosfreqz`, or sorted poles and zeros — is what that needs, and it has not
 been run. The flip stays reverted on the evidence of the failing conformance test alone,
 which is sufficient to block but does not size the problem.
+
+## NumericalInverseHermite: our per-draw cost is HIGHER than SciPy's, and differencing over n cannot measure it
+
+**Result class: BEHAVIORAL** — instruction counts, no timing claim. The host was saturated
+throughout: `mpstat` read 1.57 percent idle with 90.15 percent in `nice` (other agents' builds),
+against a reported 76 percent idle. Counted work is what survives that; the clock does not.
+
+**probe**: `crates/fsci-stats/src/bin/perf_hinv.rs` (fsci arm) against
+`scipy.stats.sampling.NumericalInverseHermite(stats.norm(), order=3, u_resolution=1e-10)`
+(incumbent arm, UNU.RAN C), both in the same shell invocation, both consuming the IDENTICAL
+deterministic u stream `(i+0.5)/n` rather than an RNG, so no random-number difference can leak
+into the comparison.
+
+Ran on worker `thinkstation1` — local, NOT rch, so `same_host: thinkstation1` for both arms.
+**loadavg across the measurement**: [60.73 38.49 30.93] before, [55.10 38.25 30.97] mid,
+[58.93 39.63 31.50] after. **counter**: `perf stat -e instructions`.
+
+**The accuracy gate, run BEFORE any cost was compared.** A coarser table is cheaper to build
+and to query, so cost means nothing until the tables are shown to be equivalent:
+
+| u_resolution | fsci intervals / u-error | scipy intervals / u-error |
+|---|---|---|
+| 1e-8 | 322 / 9.607924e-9 | 341 / 8.986752e-9 |
+| 1e-10 | 980 / 9.980961e-11 | 1022 / 9.514548e-11 |
+| 1e-12 | 3106 / 9.986456e-13 | 3000 / 9.139842e-13 |
+
+Both meet every target; node counts agree within 6 percent and achieved u-errors within 10
+percent. The tables are equivalent, so the cost question is fair.
+
+**Observed**, at 1e6 draws per repetition, differenced over REPETITIONS:
+
+| reps | fsci | scipy |
+|---|---|---|
+| 10 | 1,770,648,796 | 17,744,160,687 |
+| 110 | 19,408,034,271 | 29,095,956,714 |
+| 210 | 37,042,408,329 | 44,456,305,057 |
+
+* **per draw: fsci 176.37 and 176.34 across the two independent slopes — 0.02 percent apart.
+  scipy 113.52 and 153.60 — 35.3 percent apart.** Taking the means, the ratio scipy/fsci is
+  0.76: **we retire about a third MORE instructions per draw than the incumbent.**
+* fixed: fsci 7.06e6, scipy 1.64e10 — the Python import again, as in the `goodness_of_fit` row.
+
+**The deficit is understated, not overstated.** The scipy arm additionally does a `.mean()`
+pass over each output array that the Rust arm does not (Rust accumulates inside the draw loop).
+That extra O(n) pass inflates scipy's per-draw figure, so the true incumbent cost is lower
+still and our deficit is larger than measured. The asymmetry runs against us, which is why the
+negative conclusion is safe to state.
+
+**scipy's non-linearity is left as a caveat, not smoothed away.** Its two slopes differ by 35
+percent and rise with repetition count, so no single per-draw figure for it is trustworthy; the
+honest reading is a range of roughly 114 to 154. Ours is linear to 0.02 percent.
+
+**METHOD FAILURE worth recording.** The first attempt differenced over `n` (100k, 600k, 1.1M
+draws) and produced scipy counts that DECREASED with n — 16.83e9, 15.86e9, 15.56e9 — which is
+impossible for a monotone workload and would have yielded a negative per-draw cost had it been
+divided without being looked at. Cause: scipy's total is dominated by a ~1.6e10 import whose
+run-to-run variation is ~1e9, roughly two orders above the ~5e7 marginal work of even 1.1M
+draws. The signal sat far below the noise floor. Differencing over IN-PROCESS REPETITIONS
+instead puts ~2e8 evaluations into the difference and clears it. **Any counted comparison
+against a Python arm must size the differenced work against the import's variance, not against
+the import's magnitude.**
+
+**Where this leaves the capability.** HINV is worth having for its setup cost and for giving an
+O(1) quantile at all, but the per-draw compute is not a win and should not be presented as one.
+The likely cause is architectural rather than a defect: scipy's `ppf` is one vectorised call
+over the whole array, ours is a scalar loop with a per-element binary search over ~980 nodes. A
+batched `ppf_many` that hoists the search would be the thing to try, and until it is measured
+there is no claim here.
