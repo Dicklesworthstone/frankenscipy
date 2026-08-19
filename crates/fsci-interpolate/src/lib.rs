@@ -5364,6 +5364,14 @@ where
 /// Runtime switch to force serial tensor-product grid evaluation (`eval_grid`) for
 /// same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The parallel arm chunks ROWS and each row's
+/// value comes from `row_fn` applied to that row alone, so the work is a map over
+/// independent outputs rather than a split reduction. Chunks are written back in index
+/// order, so even the assembly order is fixed.
+///
+/// The property to re-check if this is ever rewritten: the moment anything is accumulated
+/// ACROSS rows -- a running total, a shared best-so-far, a normalisation pass -- this
+/// stops being an identity and becomes a summation-order tolerance.
 pub static EVAL_GRID_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -5421,6 +5429,15 @@ const PAR_QUERY_MIN_WORK: u64 = 1 << 23;
 /// path for the piecewise-cubic `eval_many`s, for same-binary A/B benchmarks.
 /// Defaults off — sorted finite batches take the O(N+M) interval cursor.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The cursor is a SEARCH optimisation, not an
+/// arithmetic one: for a sorted batch it walks the breakpoints once in O(N+M) instead of
+/// binary-searching per query, and then feeds the SAME interval index into the SAME cubic
+/// evaluation. Locating an interval faster cannot change which interval is found, so the
+/// returned values are bit-for-bit equal.
+///
+/// It declines rather than approximates when its precondition fails -- the fast path is
+/// skipped for non-finite queries and for batches too small to amortise it -- so there is
+/// no input on which it produces a different answer instead of no answer.
 pub static INTERP_CUBIC_CURSOR_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -7947,6 +7964,14 @@ pub fn spalde(
 /// Runtime switch to force the serial `bisplev` grid loop for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The fan-out is over GRID POINTS, each of which
+/// is an independent `(kx+1)*(ky+1)` product against the same coefficients -- no point's
+/// value enters any other's, so there is no reduction for a scheduling change to
+/// reassociate, and the parallel arm writes each result to its own slot in index order.
+///
+/// The gate below is a performance choice with no bearing on this contract: it decides
+/// WHETHER to fan out, not what the answer is. Both sides of the gate compute the same
+/// bits.
 pub static BISPLEV_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
