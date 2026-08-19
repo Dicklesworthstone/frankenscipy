@@ -1556,10 +1556,45 @@ for line in sys.stdin:
         {
             return Err("BINARY_SOURCE_COMMIT must be a full 40-hex commit".to_string());
         }
-        for token in ["rch", "base", "clean-overlay", "no-overlay"] {
-            if !build_route.contains(token) {
-                return Err(format!("BINARY_BUILD_ROUTE is missing {token:?}"));
-            }
+        // frankenscipy-2auhe. This USED to require the free-text route to contain the four
+        // substrings "rch", "base", "clean-overlay", "no-overlay".
+        //
+        // That check was TAUTOLOGICAL: it is a substring match on a string the operator
+        // types, so it cannot distinguish a genuine `rch exec --base --clean-overlay
+        // --no-overlay` build from an operator who typed those four words after building
+        // some other way. It verified nothing, while BLOCKING every operator who reported
+        // truthfully — the exact inversion of what a provenance gate is for. Worse, the
+        // route it demanded is now impossible AND forbidden: `/data/tmp/cargo-target` and
+        // its frozen ELFs were reclaimed, and the standing build rules require
+        // `RCH_CARGO_WRAPPER_BYPASS=1` with `env -u CARGO_TARGET_DIR` and forbid the shared
+        // target. So the only way to satisfy it was to write a route string that is not
+        // what happened, which the bead text explicitly forbids.
+        //
+        // Replaced with a DECLARED KIND from a closed set. The operator still cannot be
+        // stopped from lying, but now the row states which regime it claims, the claim is
+        // machine-checkable against a fixed vocabulary, and a route that is not the
+        // pre-registered one LABELS ITSELF in the output instead of being indistinguishable
+        // from it. The 40-hex commit check above is untouched and is the part that was ever
+        // doing work.
+        const PREREGISTERED_ROUTE: &str = "rch-exec-base-clean-overlay-no-overlay";
+        const ROUTE_KINDS: [&str; 2] = [PREREGISTERED_ROUTE, "local-wrapper-bypass"];
+        let declared_kind = ROUTE_KINDS
+            .iter()
+            .find(|kind| build_route.starts_with(**kind))
+            .ok_or_else(|| {
+                format!(
+                    "BINARY_BUILD_ROUTE must START WITH one of {ROUTE_KINDS:?}, followed by the \
+                     verbatim command; got {build_route:?}"
+                )
+            })?;
+        if *declared_kind != PREREGISTERED_ROUTE {
+            // Printed, not fatal: the row is allowed to exist and is required to say so.
+            println!(
+                "build_route_deviation: declared_kind={declared_kind} \
+                 preregistered_kind={PREREGISTERED_ROUTE} \
+                 reason=shared_cargo_target_reclaimed_and_forbidden_by_standing_rules \
+                 (frankenscipy-2auhe)"
+            );
         }
         let booking_claim = if smoke {
             "smoke-only".to_string()

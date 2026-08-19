@@ -37923,3 +37923,78 @@ survived; the collapse did not happen.
   than the `0` sentinel that earlier notes said independently forbids a KEEP.
 - Single fixture, single size regime. This is one job, not a claim about `truncweibull_min`
   generally.
+
+## 2026-08-19 — frankenscipy-2auhe — the convert-claim family's real blocker is a HOST PIN, not the build route
+
+`2auhe` recorded that five conversion beads were un-actionable because their contracts demand
+an rch build route the standing rules forbid. That is true and I fixed it. It is also not the
+binding constraint, and this row is mostly about the constraint underneath it.
+
+### What I fixed: a tautological gate (BINARY_BUILD_ROUTE)
+
+`perf_minimize_many_scipy` and `perf_dblquad_many_scipy` hard-required the free-text
+`BINARY_BUILD_ROUTE` to contain the substrings `"rch"`, `"base"`, `"clean-overlay"`,
+`"no-overlay"`.
+
+That check verified NOTHING. It is a substring match on a string the operator types, so it
+cannot distinguish a genuine `rch exec --base --clean-overlay --no-overlay` build from an
+operator who typed those four words after building some other way. Its only real effect was to
+block operators who reported truthfully, while passing anyone willing to write a false route —
+the exact inversion of a provenance gate, and the "tautological test" pattern the standing
+orders name. It had also become impossible to satisfy honestly: `/data/tmp/cargo-target` and
+its frozen ELFs were reclaimed, and the current rules mandate `RCH_CARGO_WRAPPER_BYPASS=1`
+with `env -u CARGO_TARGET_DIR`.
+
+Replaced with a DECLARED KIND from a closed set — `rch-exec-base-clean-overlay-no-overlay` or
+`local-wrapper-bypass` — followed by the verbatim command. A non-pre-registered route now
+prints `build_route_deviation:` and labels itself in the row. Both arms observed:
+
+| arm | route string | result |
+|---|---|---|
+| MUST-HIT | `rch exec --base X --clean-overlay --no-overlay` (would have PASSED the old check) | **REJECTED** |
+| MUST-MISS | `local-wrapper-bypass: RCH_CARGO_WRAPPER_BYPASS=1 …` | accepted, prints `build_route_deviation` |
+
+This is resolution **(a)** from 2auhe, taken deliberately and flagged to the bead owner for
+review.
+
+### What actually blocks the family: `hostname != "threadripperje"`
+
+With the route fixed, `perf_minimize_many_scipy` got exactly one line further and stopped:
+
+    ERROR: evidence run is restricted to threadripperje
+
+**Eight of the nine convert-claim harnesses hard-pin evidence runs to hostname
+`threadripperje`.** This host is `thinkstation1`. They are not the same machine —
+`threadripperje` is recorded in `docs/LEDGER_RESURRECTION.md:509` as 64 physical cores / 128
+logical threads; `thinkstation1` is 32 physical / 64 logical.
+
+| harness | evidence host pin |
+|---|---|
+| `perf_minimize_many_scipy` | **PINNED** |
+| `perf_dblquad_many_scipy` | **PINNED** |
+| `perf_tplquad_many_scipy` | **PINNED** |
+| `perf_quad_many_scipy` | **PINNED** |
+| `perf_curve_fit_many_scipy` | **PINNED** |
+| `perf_newton_many_scipy` | **PINNED** |
+| `perf_normality_many_scipy` | **PINNED** |
+| `perf_root_many_scipy` | **PINNED** |
+| `perf_truncweibull_scipy` | **free** |
+| `perf_secant_many_scipy` | does not exist |
+| `perf_fixed_point_many_scipy` | does not exist |
+
+**That single free row is why bxnn7 is the one conversion that completed today.** It was not
+the easier bead; it was the only one whose harness would run on the machine we are on.
+
+### Why I did NOT remove the pin
+
+Unlike the build-route substring check, the host pin is not tautological — `host_identity()`
+reads the real hostname, and pinning every row of a pre-registered series to one machine is a
+legitimate way to buy cross-row comparability on a fleet whose cores differ by up to 3x in
+clock. Deleting it to make my run pass would be gate self-weakening on a gate that is actually
+doing work. So this stops here and is reported.
+
+**It is a decision, not a task**, and it is the same decision shape as 2auhe's own (a)/(b)/(c):
+either `threadripperje` is reachable and these runs should happen there, or the pin should be
+relaxed to "record the host and refuse to pool rows across hosts", or the beads should be
+marked blocked instead of sitting at P1 READY where each agent re-discovers this. Two of the
+nine also have no harness at all, which no amount of host access fixes.
