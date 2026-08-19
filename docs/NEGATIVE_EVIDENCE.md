@@ -38762,3 +38762,82 @@ So "thread the TRSM harder" is answered and is not the lever.
   than any one of them.
 - Every cell is `shift`-free dense Cholesky on one fixture family at one boundary. No claim is
   made about other SPD structure.
+
+## 2026-08-19 — frankenscipy-gykw5 — the trailing SYRK is 100% SERIAL across the loss band, and threading it is DECIDED SLOWER
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_chol_vs_scipy.rs (arm FSCI_CHOL_MATMUL_MACS)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms one process, ABBA-interleaved)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=64 actual observed worker threads=64 (shared rayon pool)
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.190)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.203)
+frankenscipy-engine-sha256 = eabcf12583751009597c01672286cb085e6da55ffb657bed9eb3ffb5fe1716fe
+executed-binary ELF SHA-256 = eabcf12583751009597c01672286cb085e6da55ffb657bed9eb3ffb5fe1716fe
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+Same-invocation A/A null: 1.025 (n=640), 1.030 (n=832) — default arm twice per ABBA cycle
+Counted mechanism: `MATMUL_PAR_DISPATCHES` — calls where the gate returned > 1, observed
+  0 → 4 at n=640 and 0 → 6 at n=832
+Decision: candidate CI — bootstrap-median 95% CI against a 2x A/A-null margin. n=640
+  [0.7566, 0.8401] against a lower band of 0.9500; n=832 [0.8734, 0.9189] against 0.9400. BOTH
+  CIs lie entirely below their bands: DECIDED SLOWER in both cells.
+CV is provenance only and was not used for this decision.
+iowait=0, loadavg 11.7-13.6, mhz_fsci 2777/2848 vs mhz_scipy 2965/3138
+
+### The structural half CONFIRMS the hypothesis, and more strongly than predicted
+
+I predicted that across the n≈576-1280 loss band "a MINORITY of panels clear the 64M gate, so
+most of the trailing update runs serial while SciPy's is threaded throughout". The counter says
+it is not a minority — it is **none**:
+
+| n | `MATMUL_PAR_DISPATCHES`, default gate | lowered gate | differing bits |
+|---|---|---|---|
+| 640 | **0** | 4 | 0 |
+| 832 | **0** | 6 | 0 |
+
+`matmul_thread_count` returns 1 for EVERY call in a Cholesky factorisation at these sizes. The
+trailing SYRK — the dominant O(n³) term — is 100% serial across the entire certified loss band,
+while the incumbent's LAPACK is threaded throughout. That is a satisfying explanation for a
+deficit that appears only against `scipyN` and vanishes against `scipy1`.
+
+### The remedial half REFUTES it: threading the SYRK is worse
+
+| n | default/lowered | CI95 | A/A null | 2x-null lower band | verdict |
+|---|---|---|---|---|---|
+| 640 | **0.7951x** | [0.7566, 0.8401] | 1.025 | 0.9500 | **DECIDED SLOWER** |
+| 832 | **0.8944x** | [0.8734, 0.9189] | 1.030 | 0.9400 | **DECIDED SLOWER** |
+
+Opening the gate costs 11-26%. So the gate is not mistuned either. This is the SECOND gate
+refuted today on this question — `frankenscipy-ua3gn` already showed the panel-TRSM MACs gate is
+a decided regression when lowered (0.8365x at n=512).
+
+### What that combination actually means, and it is the useful part
+
+The deficit is NOT "we forget to parallelise". We deliberately do not, at these sizes, and the
+two independent knobs that would change that both make things worse when opened. So:
+
+**Our parallel decomposition does not pay at n≈576-1280, and SciPy's does.** Both gates are
+correctly tuned FOR OUR CURRENT KERNELS — the fan-out we can express costs more than it saves
+there. SciPy gets useful threaded speedup in exactly the band where our fan-out is
+counterproductive. That is an efficiency gap in the parallel decomposition itself, not a
+tuning error, and it will not be closed by moving a threshold.
+
+Three levers are now measured and dead on this question: panel-TRSM worker reuse (in-floor),
+panel-TRSM MACs gate (regression), trailing-SYRK MACs gate (regression). Anyone picking this up
+should treat "thread it more" as answered and look at WHAT is threaded, not WHETHER — a
+decomposition whose parallel form has less overhead per unit work (blocked/recursive
+right-looking with larger granules, or a different panel/trailing split) is the class of change
+this needs.
+
+### Honest limits
+
+- One override value (gate = 1, fully open). A partial lowering could in principle land
+  between; it is hard to credit, given fully-open is a decided regression in both cells and
+  the direction is the same at n=512 for the TRSM gate.
+- `MATMUL_PAR_MACS_OVERRIDE` is not SYRK-specific: `matmul_thread_count` has 11 call sites, so
+  the lowered arm widens fan-out for several dense paths, not only the trailing update. That
+  makes it a locator, not a tuning knob, and it means the measured slowdown is an upper bound
+  on the harm attributable to the SYRK path alone.
+- Two cells, one fixture family. The direction is consistent with the four other gate cells
+  measured today, none of which favoured more fan-out.

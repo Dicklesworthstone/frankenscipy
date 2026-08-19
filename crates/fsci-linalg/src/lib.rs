@@ -6471,8 +6471,7 @@ fn schur_magnitude_scale(t: &DMatrix<f64>, rows: usize) -> f64 {
 /// easy to get subtly wrong and the matrix is already covered by that function's
 /// own tests. It costs an O(n^2) product per vector, which is not the dominant
 /// term next to the O(n^3) decomposition.
-pub static EIG_BALANCE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+pub static EIG_BALANCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Route `eig` through the in-crate Francis QR (`hessenberg_qr`) instead of
 /// nalgebra's Schur — `frankenscipy-sez4r`.
@@ -6573,9 +6572,7 @@ pub static EIG_USE_FRANCIS_SCHUR: std::sync::atomic::AtomicBool =
 pub static EIG_FRANCIS_FALLBACK: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
-fn bounded_schur(
-    m: DMatrix<f64>,
-) -> Result<nalgebra::linalg::Schur<f64, Dyn>, LinalgError> {
+fn bounded_schur(m: DMatrix<f64>) -> Result<nalgebra::linalg::Schur<f64, Dyn>, LinalgError> {
     let n = m.nrows();
     let max_niter = 30 * n.max(10);
     nalgebra::linalg::Schur::try_new(m, f64::EPSILON, max_niter).ok_or_else(|| {
@@ -6586,7 +6583,6 @@ fn bounded_schur(
         }
     })
 }
-
 
 /// Produce the `(Q, T)` pair `eig` consumes, from whichever iteration is selected.
 ///
@@ -6628,7 +6624,9 @@ fn eig_schur_pair(
     // what blocked routing `eig` through Francis wholesale.
     match bounded_schur(matrix.clone()) {
         Ok(schur) => Ok(schur.unpack()),
-        Err(LinalgError::ConvergenceFailure { .. }) if EIG_FRANCIS_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) => {
+        Err(LinalgError::ConvergenceFailure { .. })
+            if EIG_FRANCIS_FALLBACK.load(std::sync::atomic::Ordering::Relaxed) =>
+        {
             let n = a.len();
             let per_eigenvalue = (30 * n.max(10)).div_ceil(n.max(1));
             let (_eigs, t_rows, z_rows) =
@@ -8208,7 +8206,8 @@ pub fn schur(a: &[Vec<f64>], options: DecompOptions) -> Result<SchurResult, Lina
     }
 
     let matrix = dmatrix_from_rows(a)?;
-    let schur_decomp = bounded_schur(matrix)?;    let (q_mat, t_mat) = schur_decomp.unpack();
+    let schur_decomp = bounded_schur(matrix)?;
+    let (q_mat, t_mat) = schur_decomp.unpack();
 
     emit_trace(LinalgTrace {
         operation: "schur",
@@ -8343,7 +8342,8 @@ pub fn qz(a: &[Vec<f64>], b: &[Vec<f64>], options: DecompOptions) -> Result<QzRe
 
     // Real Schur of A·B⁻¹ = Q·T·Qᵀ gives the orthogonal Q and a real
     // quasi-upper-triangular T.
-    let schur_decomp = bounded_schur(&a_mat * &b_inv)?;    let (q_mat, _t_mat) = schur_decomp.unpack();
+    let schur_decomp = bounded_schur(&a_mat * &b_inv)?;
+    let (q_mat, _t_mat) = schur_decomp.unpack();
 
     // Choose an orthogonal Z that upper-triangularizes Qᵀ·B. Writing
     // C = Qᵀ·B, an RQ factorization C = R·Zᵀ yields BB = Qᵀ·B·Z = R
@@ -9486,7 +9486,8 @@ fn logm_general(
     n: usize,
     options: DecompOptions,
 ) -> Result<Vec<Vec<f64>>, LinalgError> {
-    let schur = bounded_schur(matrix.clone())?;    let (q, t) = schur.unpack();
+    let schur = bounded_schur(matrix.clone())?;
+    let (q, t) = schur.unpack();
 
     let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
     let result = if has_complex_block {
@@ -9587,7 +9588,8 @@ pub fn sqrtm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
         // complex Schur–Parlett evaluator — the real-diagonal scalar Parlett below
         // is wrong across those blocks. An all-real spectrum keeps the real path
         // (and its negative-eigenvalue NaN behavior).
-        let schur = bounded_schur(matrix.clone())?;        let (q, t) = schur.unpack();
+        let schur = bounded_schur(matrix.clone())?;
+        let (q, t) = schur.unpack();
         let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
         let result = if has_complex_block {
             schur_parlett_complex(&q, &t, n, |z| z.sqrt())
@@ -9774,7 +9776,8 @@ pub fn signm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
     // spectrum the real Schur form has 2×2 blocks whose individual diagonal
     // entries can differ in sign from Re λ, so funm(_, sign) on the real diagonal
     // is wrong; route those through the complex Schur–Parlett evaluator.
-    let schur = bounded_schur(m.clone())?;    let (q, t) = schur.unpack();
+    let schur = bounded_schur(m.clone())?;
+    let (q, t) = schur.unpack();
     let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
     if has_complex_block {
         let result = schur_parlett_complex(&q, &t, n, |z| {
@@ -10093,7 +10096,8 @@ pub fn funm(
 
     // General: use Schur decomposition A = Q T Q^T
     // Then f(A) = Q f(T) Q^T via Parlett's recurrence
-    let schur = bounded_schur(matrix.clone())?;    let (q, t) = schur.unpack();
+    let schur = bounded_schur(matrix.clone())?;
+    let (q, t) = schur.unpack();
 
     let mut ft = DMatrix::<f64>::zeros(n, n);
     // Diagonal: f(T[i,i])
@@ -10162,7 +10166,8 @@ pub fn fractional_matrix_power(
         return funm(a, |x| x.powf(p), options);
     }
 
-    let schur = bounded_schur(matrix.clone())?;    let (q, t) = schur.unpack();
+    let schur = bounded_schur(matrix.clone())?;
+    let (q, t) = schur.unpack();
     let has_complex_block = (0..n.saturating_sub(1)).any(|i| t[(i + 1, i)].abs() > 1e-300);
     if has_complex_block {
         let result = schur_parlett_complex(&q, &t, n, |z| (z.ln() * Complex::new(p, 0.0)).exp());
@@ -11572,7 +11577,11 @@ fn eigh_stage_record(stage: usize, started: Option<std::time::Instant>) {
 #[inline]
 fn public_native_eigh_min_dim() -> usize {
     let o = PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
-    if o == 0 { PUBLIC_NATIVE_EIGH_MIN_DIM } else { o }
+    if o == 0 {
+        PUBLIC_NATIVE_EIGH_MIN_DIM
+    } else {
+        o
+    }
 }
 const EIG_BANDED_NATIVE_EIGENVECTOR_MIN_DIM: usize = 128;
 const PUBLIC_BIDIAG_SVD_MIN_COLS: usize = 64;
@@ -16539,8 +16548,10 @@ pub fn solve_sylvester(
     let q_mat = dmatrix_from_rows(q)?;
 
     // Schur decompositions: A = U T_A U^T, B = V T_B V^T
-    let schur_a = bounded_schur(a_mat.clone())?;    let (u, ta) = schur_a.unpack();
-    let schur_b = bounded_schur(b_mat.clone())?;    let (v, tb) = schur_b.unpack();
+    let schur_a = bounded_schur(a_mat.clone())?;
+    let (u, ta) = schur_a.unpack();
+    let schur_b = bounded_schur(b_mat.clone())?;
+    let (v, tb) = schur_b.unpack();
 
     // Transform Q: F = U^T Q V
     let f = u.transpose() * &q_mat * &v;
@@ -16736,7 +16747,8 @@ pub fn solve_discrete_lyapunov(
     let a_mat = dmatrix_from_rows(a)?;
     let q_mat = dmatrix_from_rows(q)?;
 
-    let (u, t) = bounded_schur(a_mat.clone())?.unpack();    let c = -(u.transpose() * &q_mat * &u); // C = -U^T Q U
+    let (u, t) = bounded_schur(a_mat.clone())?.unpack();
+    let c = -(u.transpose() * &q_mat * &u); // C = -U^T Q U
 
     // When T is strictly upper triangular (A has only real eigenvalues — the
     // common case) each 1×1-block system (T[j,j]·T − I) is upper triangular and
@@ -20174,13 +20186,47 @@ fn matmul_flat_compute_rows(
 /// Number of worker threads for a flat-workspace GEMM of the given dims. Returns 1
 /// (sequential) for matmuls too small to amortise thread spawn; otherwise scales with
 /// cores, capped so each thread owns at least 64 output rows.
+/// A/B override for the 64M-MAC parallel gate in [`matmul_thread_count`] (0 ⇒ default).
+///
+/// `frankenscipy-gykw5`. Bracketing the Cholesky curve found a CERTIFIED LOSS BAND against
+/// 64-thread SciPy from n≈576 to n≈1280, bottoming at 0.621x at n=832, while against
+/// single-threaded SciPy we stay near parity throughout. That shape says the deficit is
+/// parallel efficiency, not arithmetic — and this gate is the best remaining suspect: with
+/// `nb = 128` the trailing SYRK goes parallel only while `m2 ≥ ~724`, so across the whole loss
+/// band a MINORITY of panels are threaded while SciPy's LAPACK is threaded throughout.
+///
+/// NOT SYRK-SPECIFIC, and that is the honest caveat: `matmul_thread_count` has 11 call sites,
+/// so lowering this knob widens fan-out for several dense paths at once, not just Cholesky's
+/// trailing update. It is an A/B instrument for locating the deficit, not a shippable tuning.
+///
+/// BYTE-IDENTICAL either way: the gate only decides how many disjoint row ranges the work is
+/// split into, and every kernel it feeds is chunking-independent.
+#[doc(hidden)]
+pub static MATMUL_PAR_MACS_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Parallel-dispatch execution proof: how many times [`matmul_thread_count`] returned > 1.
+///
+/// The reachability half of `frankenscipy-gykw5`. Without it, an A/B on the gate at a size
+/// where the gate never opens is one code path timed twice — the trap that made the first two
+/// cells of the `ua3gn` TRSM experiment vacuous. A structural count survives instrumentation
+/// even though a cost measurement would not.
+#[doc(hidden)]
+pub static MATMUL_PAR_DISPATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn matmul_thread_count(m: usize, ka: usize, n: usize) -> usize {
     let macs = (m as u64)
         .saturating_mul(ka as u64)
         .saturating_mul(n as u64);
-    if macs < 64 * 1024 * 1024 {
+    let gate = {
+        let o = MATMUL_PAR_MACS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if o == 0 { 64 * 1024 * 1024 } else { o }
+    };
+    if macs < gate {
         return 1;
     }
+    MATMUL_PAR_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let cores = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
@@ -23390,7 +23436,13 @@ mod tests {
         // Include exact zeros in the vector: both arms skip `v_col == 0.0`, and dropping that
         // skip is NOT a no-op for signed zeros, so the fixture must exercise it.
         let vector: Vec<f64> = (0..active)
-            .map(|j| if j % 37 == 0 { 0.0 } else { ((j % 13) as f64 - 6.0) / 7.0 })
+            .map(|j| {
+                if j % 37 == 0 {
+                    0.0
+                } else {
+                    ((j % 13) as f64 - 6.0) / 7.0
+                }
+            })
             .collect();
 
         let mut serial = vec![0.0f64; active];
@@ -23399,7 +23451,12 @@ mod tests {
         for nthreads in [2usize, 4, 8] {
             let mut parallel = vec![0.0f64; active];
             symmetric_lower_matvec_double_read_gather_parallel(
-                &data, n, start, &vector, &mut parallel, nthreads,
+                &data,
+                n,
+                start,
+                &vector,
+                &mut parallel,
+                nthreads,
             );
             for (i, (a, b)) in serial.iter().zip(parallel.iter()).enumerate() {
                 assert_eq!(
@@ -23446,7 +23503,11 @@ mod tests {
                     let r = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000)
                         as f64
                         / 1000.0;
-                    a[i][j] = if i == j { (n as f64) * 2.0 + r } else { r - 0.5 };
+                    a[i][j] = if i == j {
+                        (n as f64) * 2.0 + r
+                    } else {
+                        r - 0.5
+                    };
                 }
             }
             a
@@ -31687,7 +31748,10 @@ mod tests {
             for j in 0..2 {
                 let dot: f64 = (0..2).map(|r| vectors[(r, i)] * vectors[(r, j)]).sum();
                 let want = if i == j { 1.0 } else { 0.0 };
-                assert!((dot - want).abs() < 1e-12, "v{i}.v{j} = {dot}, expected {want}");
+                assert!(
+                    (dot - want).abs() < 1e-12,
+                    "v{i}.v{j} = {dot}, expected {want}"
+                );
             }
         }
     }
@@ -31733,7 +31797,11 @@ mod tests {
             .zip(&by_index.eigenvalues)
             .enumerate()
         {
-            assert_eq!(v.to_bits(), x.to_bits(), "eigenvalue {i} differs by value vs index");
+            assert_eq!(
+                v.to_bits(),
+                x.to_bits(),
+                "eigenvalue {i} differs by value vs index"
+            );
         }
         for r in 0..n {
             for c in 0..(hi - lo + 1) {
@@ -31750,7 +31818,9 @@ mod tests {
         for c in 0..(hi - lo + 1) {
             let mut worst = 0.0_f64;
             for row in 0..n {
-                let av: f64 = (0..n).map(|k| a[row][k] * by_value.eigenvectors[k][c]).sum();
+                let av: f64 = (0..n)
+                    .map(|k| a[row][k] * by_value.eigenvectors[k][c])
+                    .sum();
                 worst =
                     worst.max((av - by_value.eigenvalues[c] * by_value.eigenvectors[row][c]).abs());
             }
@@ -32032,9 +32102,8 @@ mod tests {
             4.023_443_980_403_098,
         ];
 
-        let (vals, vecs) =
-            eigh_tridiagonal_subset(&d, &e, (1, 3), false, DecompOptions::default())
-                .expect("subset");
+        let (vals, vecs) = eigh_tridiagonal_subset(&d, &e, (1, 3), false, DecompOptions::default())
+            .expect("subset");
         assert_eq!(vals.len(), 3, "inclusive range (1,3) selects three values");
         for (i, (g, w)) in vals.iter().zip(&want).enumerate() {
             assert!((g - w).abs() < 1e-12, "eigenvalue[{i}] {g} vs scipy {w}");
@@ -32089,9 +32158,8 @@ mod tests {
         }
 
         // eigvals_only skips the eigenvector work entirely.
-        let (only, none) =
-            eigh_tridiagonal_subset(&d, &e, (1, 3), true, DecompOptions::default())
-                .expect("subset eigvals only");
+        let (only, none) = eigh_tridiagonal_subset(&d, &e, (1, 3), true, DecompOptions::default())
+            .expect("subset eigvals only");
         assert!(none.is_none());
         assert_eq!(only.len(), 3);
 
@@ -32138,9 +32206,7 @@ mod tests {
             .max(1.0);
         let min_gap = TRIDIAGONAL_INVERSE_MIN_GAP_REL * scale;
         assert!(
-            eigenvalues
-                .windows(2)
-                .any(|w| w[1] - w[0] <= min_gap),
+            eigenvalues.windows(2).any(|w| w[1] - w[0] <= min_gap),
             "fixture must contain a cluster or it tests nothing"
         );
 
@@ -32502,7 +32568,11 @@ mod tests {
         zero();
         PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(1, Relaxed);
         eigh(&a, DecompOptions::default()).expect("native, timing off");
-        assert_eq!(read(), [0, 0, 0], "counters must stay zero while timing is off");
+        assert_eq!(
+            read(),
+            [0, 0, 0],
+            "counters must stay zero while timing is off"
+        );
 
         // MUST-HIT: enabled, every stage records a nonzero duration.
         zero();
@@ -32512,7 +32582,10 @@ mod tests {
         PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, Relaxed);
         let stages = read();
         for (i, ns) in stages.iter().enumerate() {
-            assert!(*ns > 0, "stage {i} recorded {ns}ns; expected a nonzero duration");
+            assert!(
+                *ns > 0,
+                "stage {i} recorded {ns}ns; expected a nonzero duration"
+            );
         }
 
         // They must ACCUMULATE, not overwrite -- a caller sums over a batch.
@@ -32572,12 +32645,7 @@ mod tests {
         // Both are correct: same spectrum to eigensolver tolerance.
         assert_eq!(base.eigenvalues.len(), n);
         assert_eq!(forced.eigenvalues.len(), n);
-        for (i, (b, f)) in base
-            .eigenvalues
-            .iter()
-            .zip(&forced.eigenvalues)
-            .enumerate()
-        {
+        for (i, (b, f)) in base.eigenvalues.iter().zip(&forced.eigenvalues).enumerate() {
             assert!(
                 (b - f).abs() < 1e-9,
                 "eigenvalue[{i}] nalgebra {b} vs native {f}"
@@ -35885,7 +35953,6 @@ mod proptest_tests {
     use super::*;
     use proptest::prelude::*;
 
-
     /// Perf toggles whose doc block states NO accuracy contract, in this file.
     ///
     /// A toggle's doc is where a reader learns what its two arms are supposed to
@@ -35940,7 +36007,11 @@ mod proptest_tests {
                 continue;
             };
             let name = rest.split(':').next().unwrap_or("").trim();
-            if name.is_empty() || !name.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()) {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+            {
                 continue;
             }
             total += 1;
@@ -36769,8 +36840,12 @@ mod proptest_tests {
             // witness makes it rarer, not safe -- and the comment above says both arms
             // SHARE the Schur reduction, so using a different one here would also make
             // the comparison measure something it does not claim to.
-            let (u, ta) = bounded_schur(a_mat.clone()).expect("Schur A converges").unpack();
-            let (v, tb) = bounded_schur(b_mat.clone()).expect("Schur B converges").unpack();
+            let (u, ta) = bounded_schur(a_mat.clone())
+                .expect("Schur A converges")
+                .unpack();
+            let (v, tb) = bounded_schur(b_mat.clone())
+                .expect("Schur B converges")
+                .unpack();
             let f = u.transpose() * &q_mat * &v;
             let mn = m * n;
             let mut system = DMatrix::<f64>::zeros(mn, mn);
@@ -38091,11 +38166,19 @@ mod proptest_tests {
 
         // ...and a genuine tridiagonal problem is untouched by the new guard.
         // scipy.linalg.eigh_tridiagonal([1,2,3],[1,1]) eigenvalues:
-        let (w, _) = eigh_tridiagonal(&[1.0, 2.0, 3.0], &[1.0, 1.0], true, DecompOptions::default())
-            .expect("3x3 tridiagonal");
+        let (w, _) = eigh_tridiagonal(
+            &[1.0, 2.0, 3.0],
+            &[1.0, 1.0],
+            true,
+            DecompOptions::default(),
+        )
+        .expect("3x3 tridiagonal");
         let want = [0.267_949_192_431_122_7, 2.0, 3.732_050_807_568_877];
         for (i, (g, e)) in w.iter().zip(&want).enumerate() {
-            assert!((g - e).abs() < 1e-10, "3x3 eigenvalue[{i}]: {g} vs scipy {e}");
+            assert!(
+                (g - e).abs() < 1e-10,
+                "3x3 eigenvalue[{i}]: {g} vs scipy {e}"
+            );
         }
     }
 
@@ -41148,9 +41231,9 @@ mod proptest_tests {
 #[cfg(test)]
 mod toggle_ab_norm_family {
     use super::{
-        DecompOptions, FROBENIUS_NORM_FORCE_SERIAL, ISSYMMETRIC_FORCE_SERIAL, NormKind,
-        NORM_FRO_FORCE_LEGACY, NORM_INF_FORCE_LEGACY, NORM_ONE_FORCE_LEGACY,
-        NORM_ONE_FORCE_SERIAL, frobenius_norm, ishermitian, norm,
+        DecompOptions, FROBENIUS_NORM_FORCE_SERIAL, ISSYMMETRIC_FORCE_SERIAL,
+        NORM_FRO_FORCE_LEGACY, NORM_INF_FORCE_LEGACY, NORM_ONE_FORCE_LEGACY, NORM_ONE_FORCE_SERIAL,
+        NormKind, frobenius_norm, ishermitian, norm,
     };
     use std::sync::atomic::Ordering;
 
@@ -41194,7 +41277,9 @@ mod toggle_ab_norm_family {
             .map(|i| {
                 (0..DIM)
                     .map(|j| {
-                        let k = (i as u64).wrapping_mul(2_654_435_761).wrapping_add(j as u64);
+                        let k = (i as u64)
+                            .wrapping_mul(2_654_435_761)
+                            .wrapping_add(j as u64);
                         ((k % 1_000_003) as f64 + 1.0) / 1_000_004.0
                     })
                     .collect()
@@ -41369,7 +41454,9 @@ mod toggle_ab_norm_family {
                 (0..N)
                     .map(|j| {
                         let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
-                        let k = (lo as u64).wrapping_mul(2_654_435_761).wrapping_add(hi as u64);
+                        let k = (lo as u64)
+                            .wrapping_mul(2_654_435_761)
+                            .wrapping_add(hi as u64);
                         ((k % 100_003) as f64) / 1000.0
                     })
                     .collect()
@@ -41455,13 +41542,19 @@ mod toggle_ab_linalg_remainder {
     }
 
     fn value(i: u64, j: u64, modulus: u64) -> f64 {
-        let k = i.wrapping_mul(2_654_435_761).wrapping_add(j.wrapping_mul(40_503));
+        let k = i
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add(j.wrapping_mul(40_503));
         ((k % modulus) as f64 + 1.0) / (modulus as f64 + 1.0)
     }
 
     fn rows_fixture(m: usize, n: usize) -> Vec<Vec<f64>> {
         (0..m)
-            .map(|i| (0..n).map(|j| value(i as u64, j as u64, 1_000_003)).collect())
+            .map(|i| {
+                (0..n)
+                    .map(|j| value(i as u64, j as u64, 1_000_003))
+                    .collect()
+            })
             .collect()
     }
 
@@ -41528,9 +41621,8 @@ mod toggle_ab_linalg_remainder {
         const GM_ROWS: usize = 8192;
         const GM_COLS: usize = 16;
         const _: () = assert!(GM_COLS * GM_COLS * GM_ROWS >= (1 << 20) && GM_COLS >= 2);
-        let gm = DMatrix::<f64>::from_fn(GM_ROWS, GM_COLS, |i, j| {
-            value(i as u64, j as u64, 100_003)
-        });
+        let gm =
+            DMatrix::<f64>::from_fn(GM_ROWS, GM_COLS, |i, j| value(i as u64, j as u64, 100_003));
         LINALG_GRAM_FORCE_SERIAL.store(true, Ordering::Relaxed);
         let gram_serial = symmetric_gram_matrix_from_columns(&gm);
         LINALG_GRAM_FORCE_SERIAL.store(false, Ordering::Relaxed);
@@ -41635,7 +41727,10 @@ mod toggle_ab_linalg_remainder {
         // order in both arms is legitimately identical, and failing on that would
         // be asserting a coincidence. The `m / (1<<15) >= 2` const assertion above
         // is what actually guarantees the parallel arm exists.
-        eprintln!("5f06d linalg remainder: cwt_bits_differ={cwt_drifted} workers={}", cores().min(CWT_M / (1 << 15)));
+        eprintln!(
+            "5f06d linalg remainder: cwt_bits_differ={cwt_drifted} workers={}",
+            cores().min(CWT_M / (1 << 15))
+        );
     }
 }
 
@@ -41660,8 +41755,15 @@ mod no_native_blas_smuggling {
     /// Package-name fragments that indicate a native linear-algebra backend.
     /// `blis` and `atlas` are here for completeness rather than suspicion.
     const NATIVE_BACKENDS: &[&str] = &[
-        "blas", "lapack", "mkl", "openblas", "accelerate-src", "netlib", "blis",
-        "atlas-src", "intel-mkl",
+        "blas",
+        "lapack",
+        "mkl",
+        "openblas",
+        "accelerate-src",
+        "netlib",
+        "blis",
+        "atlas-src",
+        "intel-mkl",
     ];
 
     fn offending_packages(lock: &str) -> Vec<String> {
@@ -41695,7 +41797,11 @@ mod no_native_blas_smuggling {
         );
         // The scan must actually be reading a real lockfile, not an empty string.
         assert!(
-            LOCKFILE.lines().filter(|l| l.starts_with("name = ")).count() > 50,
+            LOCKFILE
+                .lines()
+                .filter(|l| l.starts_with("name = "))
+                .count()
+                > 50,
             "the lockfile looks empty or unreadable; this gate would pass \
              vacuously"
         );
@@ -41745,7 +41851,9 @@ mod toggle_ab_eigh_rank2_update {
 
     #[test]
     fn rank2_update_rewrite_is_bit_identical() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // MUST-HIT / MUST-MISS on the detector: this test's whole content is a
         // bit comparison, so a comparison that cannot see a difference would pass
@@ -41766,7 +41874,9 @@ mod toggle_ab_eigh_rank2_update {
                 (0..N)
                     .map(|j| {
                         let (lo, hi) = if i <= j { (i, j) } else { (j, i) };
-                        let k = (lo as u64).wrapping_mul(2_654_435_761).wrapping_add(hi as u64);
+                        let k = (lo as u64)
+                            .wrapping_mul(2_654_435_761)
+                            .wrapping_add(hi as u64);
                         let v = ((k % 100_003) as f64) / 100_003.0;
                         if i == j { v + N as f64 } else { v }
                     })
@@ -41818,9 +41928,7 @@ mod toggle_ab_eigh_rank2_update {
             .eigenvectors
             .iter()
             .zip(&sliced.eigenvectors)
-            .position(|(r1, r2)| {
-                r1.iter().zip(r2).any(|(x, y)| x.to_bits() != y.to_bits())
-            });
+            .position(|(r1, r2)| r1.iter().zip(r2).any(|(x, y)| x.to_bits() != y.to_bits()));
         assert!(
             vec_diff.is_none(),
             "eigenvectors differ at row {vec_diff:?} though the eigenvalues agree; \
@@ -41837,7 +41945,7 @@ mod toggle_ab_eigh_rank2_update {
 /// the old arm returns `ConvergenceFailure` and there is nothing to compare against.
 #[cfg(test)]
 mod toggle_ab_eig_francis_schur {
-    use super::{DecompOptions, EIG_USE_FRANCIS_SCHUR, LinalgError, eig, EIG_FRANCIS_FALLBACK};
+    use super::{DecompOptions, EIG_FRANCIS_FALLBACK, EIG_USE_FRANCIS_SCHUR, LinalgError, eig};
     use std::sync::atomic::Ordering;
 
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -41848,7 +41956,11 @@ mod toggle_ab_eig_francis_schur {
             for j in 0..n {
                 let r = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000) as f64
                     / 1000.0;
-                a[i][j] = if i == j { (n as f64) * 2.0 + r } else { r - 0.5 };
+                a[i][j] = if i == j {
+                    (n as f64) * 2.0 + r
+                } else {
+                    r - 0.5
+                };
             }
         }
         a
@@ -41865,7 +41977,9 @@ mod toggle_ab_eig_francis_schur {
     /// convenience.
     #[test]
     fn francis_arm_agrees_with_nalgebra_where_both_converge() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         for (n, seed) in [(5usize, 0u64), (6, 0), (8, 42), (8, 999), (4, 7)] {
             let a = make_diag_dominant(n, seed);
@@ -41889,7 +42003,11 @@ mod toggle_ab_eig_francis_schur {
             let mut b_re = new.eigenvalues_re.clone();
             a_re.sort_by(f64::total_cmp);
             b_re.sort_by(f64::total_cmp);
-            assert_eq!(a_re.len(), b_re.len(), "({n},{seed}) eigenvalue count differs");
+            assert_eq!(
+                a_re.len(),
+                b_re.len(),
+                "({n},{seed}) eigenvalue count differs"
+            );
 
             let scale = a_re.iter().fold(1.0f64, |m, v| m.max(v.abs()));
             for (i, (x, y)) in a_re.iter().zip(&b_re).enumerate() {
@@ -41919,7 +42037,9 @@ mod toggle_ab_eig_francis_schur {
     /// all, since it only exercises inputs both arms handle.
     #[test]
     fn the_toggle_changes_behaviour_on_the_non_converging_fixtures() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // The FALLBACK is disabled for the whole test. It is on by default now, and its
         // entire job is to make these fixtures converge -- so with it live the "old" arm
@@ -42037,7 +42157,9 @@ mod toggle_ab_eig_balance {
 
     #[test]
     fn balanced_eigenpairs_satisfy_the_defining_relation() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (a, m) = badly_scaled();
 
         EIG_BALANCE.store(true, Ordering::Relaxed);
@@ -42075,7 +42197,9 @@ mod toggle_ab_eig_balance {
     /// inputs that never needed it.
     #[test]
     fn balancing_does_not_disturb_an_already_balanced_matrix() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (_a, m) = badly_scaled();
 
         EIG_BALANCE.store(false, Ordering::Relaxed);
@@ -42139,7 +42263,9 @@ mod toggle_ab_eig_balance {
     /// norms and residuals would pass on exactly that.
     #[test]
     fn the_lapack_phase_convention_survives_balancing() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let a = badly_scaled_with_complex();
 
         for balanced in [false, true] {

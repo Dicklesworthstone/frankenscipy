@@ -42,7 +42,8 @@ fn main() {
 mod harness {
     use fsci_linalg::{
         CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE, CHOL_PANEL_TRSM_PAR_PANELS, CHOL_PANEL_TRSM_STD_SCOPE,
-        CHOL_SYRK_NC_OVERRIDE, DecompOptions, cholesky,
+        CHOL_SYRK_NC_OVERRIDE, DecompOptions, MATMUL_PAR_DISPATCHES, MATMUL_PAR_MACS_OVERRIDE,
+        cholesky,
     };
     use std::io::{BufRead, BufReader, Read, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -714,6 +715,20 @@ for raw_line in sys.stdin.buffer:
         out
     }
 
+    /// Best-of-`min_of` wall seconds with the 64M-MAC parallel gate overridden.
+    ///
+    /// `frankenscipy-gykw5`. The certified loss band n≈576-1280 against 64-thread SciPy, with
+    /// near-parity against single-threaded SciPy, points at parallel efficiency rather than
+    /// arithmetic. With `nb = 128` the trailing SYRK only threads while `m2 >= ~724`, so across
+    /// that band most panels update SERIALLY while SciPy's LAPACK threads throughout. Lowering
+    /// the gate is the direct test of that.
+    fn time_fsci_matmul_macs(a: &[Vec<f64>], reps: usize, min_of: usize, macs: u64) -> f64 {
+        MATMUL_PAR_MACS_OVERRIDE.store(macs, std::sync::atomic::Ordering::Relaxed);
+        let out = time_fsci(a, reps, min_of);
+        MATMUL_PAR_MACS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
     /// Best-of-`min_of` wall seconds for `reps` fsci factorisations.
     fn time_fsci(a: &[Vec<f64>], reps: usize, min_of: usize) -> f64 {
         let mut best = f64::INFINITY;
@@ -853,6 +868,11 @@ for raw_line in sys.stdin.buffer:
         // frankenscipy-ua3gn: time the two panel-TRSM scope arms against each other.
         let trsm_arm = std::env::var("FSCI_CHOL_TRSM_AB").is_ok_and(|v| v != "0");
         // frankenscipy-ua3gn second experiment: lowered TRSM parallel MACs gate under test.
+        // frankenscipy-gykw5: the trailing-SYRK / general matmul parallel gate under test.
+        let mm_arm: u64 = std::env::var("FSCI_CHOL_MATMUL_MACS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let macs_arm: u64 = std::env::var("FSCI_CHOL_TRSM_MACS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -877,7 +897,7 @@ for raw_line in sys.stdin.buffer:
         );
         println!(
             "sizes={sizes:?} replicates={replicates} reps={reps} min_of={min_of} seed={seed:#x} \
-             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy} trsm_ab={trsm_arm} trsm_macs={macs_arm}"
+             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy} trsm_ab={trsm_arm} trsm_macs={macs_arm} matmul_macs={mm_arm}"
         );
 
         for &n in &sizes {
@@ -1020,6 +1040,38 @@ for raw_line in sys.stdin.buffer:
                 );
             }
 
+            if mm_arm > 0 {
+                // REACHABILITY, before any timing. `MATMUL_PAR_DISPATCHES` counts calls where
+                // the gate returned > 1. If it does not move between the two settings the arm
+                // is inert and the timing would be one path twice — the trap that made two
+                // cells of the ua3gn TRSM experiment vacuous.
+                MATMUL_PAR_MACS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_PAR_DISPATCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+                let base_f = cholesky(&a, true, DecompOptions::default()).expect("spd factors");
+                let disp_default = MATMUL_PAR_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed);
+                MATMUL_PAR_MACS_OVERRIDE.store(mm_arm, std::sync::atomic::Ordering::Relaxed);
+                MATMUL_PAR_DISPATCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+                let low_f = cholesky(&a, true, DecompOptions::default()).expect("spd factors");
+                let disp_lowered = MATMUL_PAR_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed);
+                MATMUL_PAR_MACS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+                let differing = base_f
+                    .factor
+                    .iter()
+                    .flatten()
+                    .zip(low_f.factor.iter().flatten())
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count();
+                println!(
+                    "n={n} MATMUL_REACH par_dispatch_default={disp_default} \
+                     par_dispatch_lowered={disp_lowered} differing_bits={differing}"
+                );
+                assert_eq!(
+                    differing, 0,
+                    "n={n}: lowering the matmul parallel gate changed {differing} factor \
+                     entries; it is supposed to change fan-out, not arithmetic"
+                );
+            }
+
             // Warm the fsci arm outside every timer, matching the SciPy side's warmup.
             //
             // THREE factorisations, not one. With a single warmup the n=256 cell returned an
@@ -1041,6 +1093,8 @@ for raw_line in sys.stdin.buffer:
             let mut null_trsm = Vec::with_capacity(replicates);
             let mut r_macs = Vec::with_capacity(replicates);
             let mut null_macs = Vec::with_capacity(replicates);
+            let mut r_mm = Vec::with_capacity(replicates);
+            let mut null_mm = Vec::with_capacity(replicates);
             // Every load and clock sample taken anywhere inside this cell, so the gates
             // below judge the window the ratio was actually measured in rather than a
             // single reading taken before it.
@@ -1095,6 +1149,15 @@ for raw_line in sys.stdin.buffer:
                     null_macs.push(base_a.max(base_b) / base_a.min(base_b));
                     // > 1 means the LOWERED gate (more fan-out) is faster.
                     r_macs.push(base_a.min(base_b) / low_a.min(low_b));
+                }
+                if mm_arm > 0 {
+                    let base_a = time_fsci_matmul_macs(&a, reps, min_of, 0);
+                    let low_a = time_fsci_matmul_macs(&a, reps, min_of, mm_arm);
+                    let low_b = time_fsci_matmul_macs(&a, reps, min_of, mm_arm);
+                    let base_b = time_fsci_matmul_macs(&a, reps, min_of, 0);
+                    null_mm.push(base_a.max(base_b) / base_a.min(base_b));
+                    // > 1 means the LOWERED gate (more parallel dispatch) is faster.
+                    r_mm.push(base_a.min(base_b) / low_a.min(low_b));
                 }
                 cell_loads.extend([load_f0, load_f1, load_s1, load_sn]);
                 cell_mhz_fsci.extend([mhz_f0, mhz_f1]);
@@ -1161,6 +1224,23 @@ for raw_line in sys.stdin.buffer:
                  gates={verdict} loadavg_post={}",
                 read_trimmed("/proc/loadavg"),
             );
+            if mm_arm > 0 {
+                let mmed = median(&mut r_mm.clone());
+                let nmed = median(&mut null_mm.clone());
+                let ok = (nmed - 1.0).abs() <= 0.05;
+                println!(
+                    "n={n} MATMUL_RAW gate={mm_arm} ratios={}",
+                    r_mm.iter()
+                        .map(|v| format!("{v:.9}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                println!(
+                    "n={n} MATMUL_ARM gate={mm_arm} default/lowered={mmed:.3}x (>1 = lowered \
+                     gate faster) null_matmul={nmed:.3} matmul_gates={}",
+                    if ok && load_ok { "PASS" } else { "FAIL" }
+                );
+            }
             if macs_arm > 0 {
                 let mm = median(&mut r_macs.clone());
                 let nm = median(&mut null_macs.clone());
