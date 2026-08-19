@@ -39006,3 +39006,86 @@ Both are one-cell experiments and neither needs a new kernel to answer.
   land differently, but 256 is the middle of that range.
 - Two cells, one fixture family. n=640 is a genuine negative control by construction, which is
   why it is reported as the stronger of the two results.
+
+## 2026-08-19 — frankenscipy-gykw5 — FEWER, FATTER threads is also neutral. The tuning family is exhausted (six levers), and here is what the gap actually decomposes into
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_chol_vs_scipy.rs (arm FSCI_CHOL_THREAD_CAP)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms one process, ABBA-interleaved)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=64 actual observed worker threads=64 (capped arm: 8)
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.273)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.239)
+frankenscipy-engine-sha256 = cf3c2bb523fc39fe6cc3ec8ba3cc5215d530ebfd16f979a5f6502675951109fa
+executed-binary ELF SHA-256 = cf3c2bb523fc39fe6cc3ec8ba3cc5215d530ebfd16f979a5f6502675951109fa
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+Same-invocation A/A null: 1.042 (cap=8), 1.040 (cap=4)
+Counted mechanism: `MATMUL_PAR_DISPATCHES` (gate opened) plus the thread cap itself
+Decision: candidate CI — bootstrap-median 95% CI [0.9540, 1.0978] at cap=8 against a 2x
+  A/A-null band of [0.9160, 1.0840]; the CI sits inside the band → IN-FLOOR.
+CV is provenance only and was not used for this decision.
+
+### The one direction I had not tried
+
+Five levers all made the fan-out WIDER and all were neutral or worse. The per-thread work says
+the opposite might be needed. `matmul_thread_count` returns `cores.min(m / 64)`, i.e. it
+guarantees only 64 rows per worker:
+
+| n | first trailing update | threads chosen | **MACs per thread** |
+|---|---|---|---|
+| 640 | 33.6M | 8 | **4.2M** |
+| 832 | 63.4M | 11 | **5.8M** |
+| **2048** | 236M | 30 | **15.7M** |
+
+n=2048 is where we WIN, and it is also where each worker gets ~3x the work it gets in the
+basin. So: cap the thread count, raising MACs per worker toward the winning profile, without
+threading any additional work. Added `MATMUL_PAR_MAX_THREADS_OVERRIDE` for it.
+
+### Result: no
+
+| n | gate | cap | default/capped | CI95 | null | 2x-null band | verdict |
+|---|---|---|---|---|---|---|---|
+| 832 | 32M | 4 | 0.917x | — | 1.040 | [0.920, 1.080] | marginally slower |
+| 832 | 32M | **8** | **1.0129x** | [0.9540, 1.0978] | 1.042 | [0.916, 1.084] | **IN-FLOOR** |
+
+Fatter granules are worth nothing. That is the SIXTH lever on this bead, and the directions are
+now symmetric: more threads, fewer threads, wider panels, lower gate, surgical gate, persistent
+pool — every one neutral or worse.
+
+### The gap decomposed, from certified data already in this ledger
+
+This is the part worth keeping. At n=832, all `gates=PASS`:
+
+    scipy1 / fsci  = 0.949 – 0.955   (three independent runs)
+    scipyN / fsci  = 0.621 – 0.671
+
+So against SINGLE-THREADED SciPy we are ~5% slow — our serial kernel rate is essentially
+competitive. Dividing the two, SciPy's own threading speedup at n=832 is
+`scipy1/scipyN ≈ 0.951/0.663 ≈ 1.43x`, while ours is 1.00x because nothing threads.
+
+**The 0.62x deficit is therefore ~5 points of serial kernel rate and ~40 points of threading we
+do not get.** Not a kernel problem. And six independent attempts to obtain that threading
+through the knobs we have produce nothing.
+
+### What this closes, and what it opens
+
+CLOSED: parallel-dispatch tuning on this path. No combination of gate, panel width, thread
+count or scope turns the basin into a win. Nobody should spend another window on a knob.
+
+OPEN, and none of it is a knob: SciPy gets 1.43x from threading a problem where our
+row-partitioned fan-out yields ~1.0x. The interesting question is no longer "how much do we
+thread" but "why does row-partitioning not pay here when OpenBLAS's partitioning does" —
+plausibly because it partitions a packed GEMM across a different axis with per-thread panels
+that stay in L2, where our split hands each worker a stripe of the same shared trailing matrix.
+Testing that means measuring OUR trailing-update kernel against `scipy.linalg.blas.dsyrk` at
+matched shape and thread count, which is one cell and needs no new kernel — and it would say
+whether the ceiling is the partition or the microkernel.
+
+### Honest limits
+
+- Two cap values (4, 8) at one size. cap=16 and cap=2 not run; 8 is the one nearest the
+  n=2048 per-thread profile and it is squarely in-floor, so the interpolation is not promising.
+- cap=4's 0.917x sits essentially ON its band edge (0.920) and had no bootstrap CI computed;
+  it is reported as "marginally slower", not as a decided regression.
+- One fixture family, one size for this arm.

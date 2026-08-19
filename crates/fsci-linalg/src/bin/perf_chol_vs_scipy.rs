@@ -43,7 +43,7 @@ mod harness {
     use fsci_linalg::{
         CHOL_NB_OVERRIDE, CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE, CHOL_PANEL_TRSM_PAR_PANELS,
         CHOL_PANEL_TRSM_STD_SCOPE, CHOL_SYRK_NC_OVERRIDE, DecompOptions, MATMUL_PAR_DISPATCHES,
-        MATMUL_PAR_MACS_OVERRIDE, cholesky,
+        MATMUL_PAR_MACS_OVERRIDE, MATMUL_PAR_MAX_THREADS_OVERRIDE, cholesky,
     };
     use std::io::{BufRead, BufReader, Read, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -749,6 +749,21 @@ for raw_line in sys.stdin.buffer:
         out
     }
 
+    /// Best-of-`min_of` wall seconds with the parallel gate LOWERED and the thread count CAPPED.
+    ///
+    /// `frankenscipy-gykw5`. Every previous lever made the fan-out wider; this makes each
+    /// granule fatter. Lowering the gate alone was neutral at 32M (11 workers, 5.8M MACs each
+    /// at n=832); capping the workers raises per-worker work toward the ~15.7M the winning
+    /// n=2048 cell enjoys, without threading any additional work.
+    fn time_fsci_capped(a: &[Vec<f64>], reps: usize, min_of: usize, macs: u64, cap: usize) -> f64 {
+        MATMUL_PAR_MACS_OVERRIDE.store(macs, std::sync::atomic::Ordering::Relaxed);
+        MATMUL_PAR_MAX_THREADS_OVERRIDE.store(cap, std::sync::atomic::Ordering::Relaxed);
+        let out = time_fsci(a, reps, min_of);
+        MATMUL_PAR_MAX_THREADS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        MATMUL_PAR_MACS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
     /// Best-of-`min_of` wall seconds for `reps` fsci factorisations.
     fn time_fsci(a: &[Vec<f64>], reps: usize, min_of: usize) -> f64 {
         let mut best = f64::INFINITY;
@@ -890,6 +905,12 @@ for raw_line in sys.stdin.buffer:
         // frankenscipy-ua3gn second experiment: lowered TRSM parallel MACs gate under test.
         // frankenscipy-gykw5: the trailing-SYRK / general matmul parallel gate under test.
         // frankenscipy-gykw5 granularity arm: panel width under test.
+        // frankenscipy-gykw5: fatter-granule arm. Needs BOTH a lowered gate (so anything is
+        // threaded at all in the basin) and a thread cap (so each worker gets real work).
+        let cap_arm: usize = std::env::var("FSCI_CHOL_THREAD_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let nb_arm: usize = std::env::var("FSCI_CHOL_NB")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -922,7 +943,7 @@ for raw_line in sys.stdin.buffer:
         );
         println!(
             "sizes={sizes:?} replicates={replicates} reps={reps} min_of={min_of} seed={seed:#x} \
-             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy} trsm_ab={trsm_arm} trsm_macs={macs_arm} matmul_macs={mm_arm} nb={nb_arm}"
+             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy} trsm_ab={trsm_arm} trsm_macs={macs_arm} matmul_macs={mm_arm} nb={nb_arm} thread_cap={cap_arm}"
         );
 
         for &n in &sizes {
@@ -1149,6 +1170,8 @@ for raw_line in sys.stdin.buffer:
             let mut null_mm = Vec::with_capacity(replicates);
             let mut r_nb = Vec::with_capacity(replicates);
             let mut null_nb = Vec::with_capacity(replicates);
+            let mut r_cap = Vec::with_capacity(replicates);
+            let mut null_cap = Vec::with_capacity(replicates);
             // Every load and clock sample taken anywhere inside this cell, so the gates
             // below judge the window the ratio was actually measured in rather than a
             // single reading taken before it.
@@ -1222,6 +1245,15 @@ for raw_line in sys.stdin.buffer:
                     // > 1 means the WIDER panel (fewer, larger updates) is faster.
                     r_nb.push(base_a.min(base_b) / wide_a.min(wide_b));
                 }
+                if cap_arm > 0 && mm_arm > 0 {
+                    let base_a = time_fsci_capped(&a, reps, min_of, 0, 0);
+                    let cap_a = time_fsci_capped(&a, reps, min_of, mm_arm, cap_arm);
+                    let cap_b = time_fsci_capped(&a, reps, min_of, mm_arm, cap_arm);
+                    let base_b = time_fsci_capped(&a, reps, min_of, 0, 0);
+                    null_cap.push(base_a.max(base_b) / base_a.min(base_b));
+                    // > 1 means the lowered-gate + capped-threads arm is faster than default.
+                    r_cap.push(base_a.min(base_b) / cap_a.min(cap_b));
+                }
                 cell_loads.extend([load_f0, load_f1, load_s1, load_sn]);
                 cell_mhz_fsci.extend([mhz_f0, mhz_f1]);
                 cell_mhz_scipy.extend([mhz_s1, mhz_sn]);
@@ -1287,6 +1319,24 @@ for raw_line in sys.stdin.buffer:
                  gates={verdict} loadavg_post={}",
                 read_trimmed("/proc/loadavg"),
             );
+            if cap_arm > 0 && mm_arm > 0 {
+                let cmed = median(&mut r_cap.clone());
+                let cnull = median(&mut null_cap.clone());
+                let ok = (cnull - 1.0).abs() <= 0.05;
+                println!(
+                    "n={n} CAP_RAW gate={mm_arm} cap={cap_arm} ratios={}",
+                    r_cap
+                        .iter()
+                        .map(|v| format!("{v:.9}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                println!(
+                    "n={n} CAP_ARM gate={mm_arm} cap={cap_arm} default/capped={cmed:.3}x \
+                     (>1 = fatter granules faster) null_cap={cnull:.3} cap_gates={}",
+                    if ok && load_ok { "PASS" } else { "FAIL" }
+                );
+            }
             if nb_arm > 0 {
                 let nmed = median(&mut r_nb.clone());
                 let nnull = median(&mut null_nb.clone());
