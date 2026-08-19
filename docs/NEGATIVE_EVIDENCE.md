@@ -36894,3 +36894,42 @@ whatever `butter` needs.
 fails with the toggle OFF too — "the section still reports two zeros, left 1 right 2". It
 is in my own earlier unbuilt fsci-signal work and is being compiled for the first time.
 Recorded here so it is not mistaken for fallout from the eig change; it needs its own fix.
+
+## `sos2zpk` deleted every root at the origin — fixed, verified against SciPy in the same invocation
+
+2026-08-18. Host: fsci arm loadavg [27.11 29.18 29.74] 3143 MHz; scipy arm loadavg
+[27.11 29.18 29.74] 2880 MHz. SciPy 1.17.1. This is a CORRECTNESS fix with an
+exact-value incumbent comparison; no timing is claimed, and the busy host does not bear
+on it.
+
+`sos2zpk` trimmed trailing zero coefficients before root-finding and never restored the
+roots that trimming removes. A trailing zero IS a root at the origin:
+`b0 + b1 z^-1 + 0 z^-2` has zeros `{0, -b1/b0}`, not `{-b1/b0}`.
+
+**INCUMBENT, run in the same invocation:**
+
+| section | SciPy zeros | SciPy poles |
+|---|---|---|
+| `[1, 0.5, 0, 1, 0.5, 0.1]` | `[-0.5+0j, 0+0j]` (2) | 2 |
+| `[1, 0, 0, 1, 0.5, 0.1]` | `[0+0j, 0+0j]` (2) | 2 |
+| `[1, 0.5, 0.2, 1, 0.5, 0]` | 2 | `[-0.5+0j, 0+0j]` (2) |
+
+Every section reports as many zeros as poles. Ours returned ONE zero for the first case.
+
+**TWO PLACES IT WAS LOST, and the second is the worse one.** The obvious one is after
+root-finding: `k` trimmed coefficients means `k` roots at the origin to append. The
+second is that a numerator trimming all the way down to a CONSTANT skips root-finding
+entirely under a `len() > 1` guard — so `[1, 0, 0]`, whose zeros are BOTH at the origin,
+lost both and reported none. The restore is therefore outside that guard, not inside it.
+
+**FIXED ON BOTH SIDES.** A trimmed denominator coefficient is a POLE at the origin by the
+same argument. Fixing only the zeros would leave the two lists mismatched — a section
+reporting 2 zeros and 1 pole — which is its own defect, and the third row above is the
+case that would have exposed it.
+
+fsci-signal: 684 passed, 0 failed.
+
+**Provenance:** this failure surfaced only because shipping the Francis `eig` default
+forced me to compile fsci-signal's dependent tests for the first time. It is NOT caused
+by that change — it reproduces with `EIG_USE_FRANCIS_SCHUR` off — and it had been sitting
+in unbuilt work.

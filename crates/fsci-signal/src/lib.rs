@@ -10342,17 +10342,42 @@ pub fn sos2zpk(sos: &[SosSection]) -> ZpkCoeffs {
         let b_trim = trim_trailing_zeros(&b_norm);
         let a_trim = trim_trailing_zeros(&a_norm);
 
+        // Every trailing coefficient removed is a ROOT AT THE ORIGIN, and trimming
+        // without restoring it deletes that root. `b0 + b1*z^-1 + 0*z^-2` has zeros
+        // `{0, -b1/b0}`, not just `{-b1/b0}`, and SciPy agrees: `sos2zpk` on
+        // `[1, 0.5, 0, ...]` returns `[-0.5+0j, 0+0j]`, and on `[1, 0, 0, ...]`
+        // returns `[0+0j, 0+0j]` — two zeros in both cases.
+        //
+        // The count matters beyond tidiness: a section must report as many zeros as
+        // poles, and every downstream consumer that zips the two lists reads a section
+        // short by one as a different filter.
+        let b_dropped = b_norm.len() - b_trim.len();
         if b_trim.len() > 1
             && let Ok((zr, zi)) = poly_roots(&b_trim)
         {
             all_zeros_re.extend(zr);
             all_zeros_im.extend(zi);
         }
+        // Outside the `len() > 1` guard on purpose: a numerator that trims all the way
+        // down to a constant skips root-finding entirely, and its origin roots would
+        // otherwise be the ones most completely lost.
+        for _ in 0..b_dropped {
+            all_zeros_re.push(0.0);
+            all_zeros_im.push(0.0);
+        }
+        // Same for the denominator: a trimmed trailing coefficient is a POLE at the
+        // origin. Fixing only the zeros would leave the two lists mismatched, which is
+        // its own defect.
+        let a_dropped = a_norm.len() - a_trim.len();
         if a_trim.len() > 1
             && let Ok((pr, pi)) = poly_roots(&a_trim)
         {
             all_poles_re.extend(pr);
             all_poles_im.extend(pi);
+        }
+        for _ in 0..a_dropped {
+            all_poles_re.push(0.0);
+            all_poles_im.push(0.0);
         }
     }
 
