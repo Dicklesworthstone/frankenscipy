@@ -37222,3 +37222,55 @@ it is now clean of any accuracy caveat.
 a dimensioned quantity. Every one produced a plausible number pointing at a real-looking
 defect. The pattern worth carrying: when a comparison reports an error many orders larger
 than the arithmetic could produce, suspect the comparison before the code.
+
+## TIMED: the Francis arm costs 2.5-3.4x on `eig`. sez4r's 230 recoveries are not free.
+
+2026-08-19. **Result class: TIMED.** Clean window verified by me, not assumed: runq 8,
+CPU idle 83-84%, iowait 0%, over two consecutive vmstat samples before starting.
+
+**Host / provenance.** same_host: thinkstation1. 32 physical cores, 64 logical, 215G RAM,
+NUMA nodes 1, affinity 0-63 (no cpuset), CPU frequency governor `powersave`, runtime ISA
+avx2, RUSTFLAGS unset. Engine artifacts: fsci `perf_eig_vs_scipy` executed-ELF-sha256
+`c193dcfcc2a5649c2a4837a3cec5f5821db90823ab3f76b2856a6de0f2ebe0b4`; incumbent
+scipy 1.17.1 / numpy 2.4.3. Requested threads: default (no explicit pool); observed
+workers: 1 (single-threaded `eig` path). Per-arm: fsci loadavg [14.41 10.24 7.25]
+3309 MHz iowait 0%; scipy loadavg [14.62 10.35 7.30] 3143 MHz iowait 0%. 9 replicates,
+one untimed warm-up per arm, medians with a 4000-sample bootstrap CI.
+
+### The A/B that matters for shipping sez4r
+
+| n | nalgebra (ms) | francis (ms) | **A/A null** | **francis / nalgebra** |
+|---|---|---|---|---|
+| 32 | 0.1740 | 0.3862 | [0.744, 0.814] | **[2.090, 2.270]** |
+| 64 | 0.8487 | 2.3082 | [0.990, 1.306] | **[2.634, 3.372]** |
+| 128 | 7.1707 | 18.6958 | [0.883, 0.983] | **[2.565, 2.798]** |
+| 256 | 63.5377 | 170.5471 | [0.932, 1.003] | **[2.512, 2.785]** |
+
+The A/A arm is the SAME configuration run twice under different labels, so its interval is
+the measured noise floor. Every francis/nalgebra interval clears it by more than 2x and
+none of them touch 1.0. **The Francis arm is 2.5-3.4x slower, certified.**
+
+This is the missing half of the sez4r trade. The flip buys 230 of 7000 fixtures that
+previously errored, with recovered spectra at median 2.37e-15 against SciPy — and it costs
+roughly 2.5-3x on every `eig` call, not only the hard ones. "More robust and free" would
+have been an easy decision; "more robust at 3x" is a real one, and it was not measured
+until now.
+
+### Against the incumbent
+
+| n | fsci nalgebra (ms) | scipy (ms) | scipy / fsci | scipy CV |
+|---|---|---|---|---|
+| 32 | 0.1740 | 0.1552 | [0.83, 0.98] | 0.106 |
+| 64 | 0.8487 | 0.6773 | [0.78, 0.83] | 0.013 |
+| 128 | 7.1707 | 5.8669 | [0.80, 0.88] | 0.024 |
+| 256 | 63.5377 | 339.7294 | [4.65, 7.69] | **0.222** |
+
+At n = 32-128 SciPy is faster: we are about 1.2-1.3x behind on our own default arm. That
+is the honest standing position for general `eig`.
+
+**THE n=256 ROW IS NOT CERTIFIED AND SHOULD NOT BE QUOTED.** Its interval looks like a
+large win and its CV is 0.222, against 0.013-0.024 at every smaller size, with SciPy
+jumping 5.87 ms to 339 ms — 58x the cost for 8x the work. A jump that shape is specific to
+that matrix or to something in LAPACK's iteration on it, not a scaling result, and one
+unstable arm is not evidence of a 4.65-7.69x advantage. Reported because suppressing an
+inconvenient-to-explain row would be worse; excluded from any claim.
