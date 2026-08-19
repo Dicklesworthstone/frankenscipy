@@ -33589,7 +33589,16 @@ pub fn tiecorrect(rankvals: &[f64]) -> f64 {
     let mut i = 0;
     while i < n {
         let mut j = i + 1;
-        while j < n && (sorted[j] - sorted[i]).abs() < 1e-10 {
+        // EXACT equality, matching scipy's `arr[1:] != arr[:-1]`. This scan used to
+        // group with `(sorted[j] - sorted[i]).abs() < 1e-10`. That was argued inert on
+        // the grounds that distinct average ranks differ by at least 0.5 -- true for
+        // `rankdata` output, but `tiecorrect` is PUBLIC and takes any `&[f64]`, and
+        // scipy's own docstring calls it on a hand-written `[1, 2.5, 2.5, 4]`. On
+        // `[1.0, 1.0 + 5e-11, 2.0, 3.0]` scipy 1.17.1 returns 1.0 (the pair is
+        // distinct); the tolerance merged it and returned 0.9. MUST-MISS control:
+        // `[1.0, 1.5, 2.0, 3.0]` gives 1.0 and `[1.0, 1.0, 2.0, 3.0]` gives 0.9 in both
+        // arms, so the predicate was not blanket-matching. frankenscipy-clttw.
+        while j < n && sorted[j] == sorted[i] {
             j += 1;
         }
         let t = (j - i) as i64;
@@ -61435,6 +61444,71 @@ mod tests {
             (tau - 0.172_789_115_646_258_48).abs() < 1e-9,
             "weightedtau {} != scipy 0.17278911564625848 (tolerance grouping gives 0.13191)",
             tau
+        );
+    }
+
+    /// `frankenscipy-clttw`, the site the inventory called INERT and only half was.
+    ///
+    /// The argument for inertness was that `tiecorrect` takes ranks, and distinct
+    /// average-rank groups differ by at least 0.5, so a 1e-10 window cannot bite. That
+    /// holds for `rankdata` output. It does not hold for the FUNCTION, which is `pub`,
+    /// takes any `&[f64]`, and which scipy's own docstring demonstrates on a
+    /// hand-written `[1, 2.5, 2.5, 4]`. A contract that only binds well-behaved callers
+    /// is not a contract.
+    ///
+    /// Goldens are scipy 1.17.1's own output, both arms observed:
+    ///
+    ///     tiecorrect([1.0, 1.0 + 5e-11, 2.0, 3.0]) = 1.0    MUST-HIT:  distinct
+    ///     tiecorrect([1.0, 1.0,         2.0, 3.0]) = 0.9    what the tolerance gave
+    ///     tiecorrect([1.0, 1.5,         2.0, 3.0]) = 1.0    MUST-MISS: well separated
+    ///
+    /// The gap is 5e-11 against the old 1e-10 window, so under the old predicate the
+    /// first assertion fails at 0.9 against 1.0 — a 10% error on a public function.
+    #[test]
+    fn tiecorrect_groups_by_exact_equality_not_tolerance() {
+        let d10 = 5e-11;
+        let near: [f64; 4] = [1.0, 1.0 + d10, 2.0, 3.0];
+
+        // The fixture is only meaningful if the two values are genuinely distinct
+        // bit patterns; if 5e-11 were absorbed by rounding at this magnitude the
+        // assertion below would be vacuous.
+        assert_ne!(
+            near[0].to_bits(),
+            near[1].to_bits(),
+            "fixture is vacuous: 1.0 and 1.0 + 5e-11 are the same f64"
+        );
+
+        // MUST-HIT: the old 1e-10 window merged this pair and returned 0.9.
+        assert_eq!(
+            tiecorrect(&near),
+            1.0,
+            "a 5e-11 gap is not a tie; scipy gives 1.0"
+        );
+
+        // MUST-MISS controls: the predicate must still SEE a real tie, and must still
+        // return 1.0 on well-separated values. Without these, `return 1.0` would pass.
+        assert_eq!(
+            tiecorrect(&[1.0, 1.0, 2.0, 3.0]),
+            0.9,
+            "an exact tie must still correct; scipy gives 0.9"
+        );
+        assert_eq!(
+            tiecorrect(&[1.0, 1.5, 2.0, 3.0]),
+            1.0,
+            "well-separated values have no ties; scipy gives 1.0"
+        );
+
+        // scipy's own docstring example, on the input it actually documents.
+        assert_eq!(tiecorrect(&[1.0, 2.5, 2.5, 4.0]), 0.9);
+
+        // The contract-conforming path the inertness argument was about must be
+        // unchanged: `rankdata` output still corrects identically.
+        let ranks = rankdata(&[1.0, 3.0, 2.0, 4.0, 5.0, 7.0, 2.0, 8.0, 4.0], None)
+            .expect("average ranks of finite data");
+        assert!(
+            (tiecorrect(&ranks) - 0.983_333_333_333_333_3).abs() < 1e-15,
+            "scipy tiecorrect(rankdata([1,3,2,4,5,7,2,8,4])) = 0.9833333333333333, got {}",
+            tiecorrect(&ranks)
         );
     }
 
