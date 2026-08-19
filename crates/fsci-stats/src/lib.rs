@@ -60861,6 +60861,314 @@ mod tdr_matches_scipy {
     }
 }
 
+/// Hermite-interpolated inverse CDF: pay a setup cost once, then invert in O(1).
+///
+/// Corresponds to `scipy.stats.sampling.NumericalInverseHermite(dist, order=3,
+/// u_resolution=...)` (UNU.RAN's HINV).
+///
+/// The inverse CDF is approximated by a cubic Hermite spline in `u`. Both the
+/// values and the derivatives are available exactly — `x_i = F⁻¹(u_i)` from the
+/// base quantile, and `dF⁻¹/du = 1/f(x)` from the density — so each interval is
+/// pinned at both ends in value AND slope, which is what makes a cubic enough.
+///
+/// # The accuracy contract is on `u`, not on `x`
+///
+/// `u_resolution` bounds `|F(F̃⁻¹(u)) − u|`, the U-ERROR, exactly as SciPy
+/// specifies. That is the right quantity: it is scale-free, it is what matters
+/// for a sampler (the draw's distribution is wrong by exactly this much), and it
+/// stays meaningful in the tails where the x-error of any interpolant blows up
+/// while the probability content does not.
+///
+/// Nodes are inserted adaptively: an interval whose MIDPOINT u-error exceeds the
+/// target is bisected, and the process repeats. [`Self::u_error`] reports the
+/// achieved maximum over those midpoints — the same estimate SciPy exposes, and
+/// an estimate rather than a bound, since it samples the error rather than
+/// maximising it.
+///
+/// # The tails are exact, not extrapolated
+///
+/// Interpolation covers `[u_lo, u_hi]`, chosen so the quantile is finite there.
+/// Outside it, [`Self::ppf`] calls the base quantile DIRECTLY. Extrapolating a
+/// cubic into a tail whose true quantile diverges is how this kind of table
+/// silently returns nonsense; the fast path covers the bulk and the exact path
+/// covers the rest.
+#[derive(Debug, Clone)]
+pub struct NumericalInverseHermite<D: ContinuousDistribution> {
+    dist: D,
+    /// Node positions in `u`, ascending.
+    u: Vec<f64>,
+    /// `F⁻¹` at each node.
+    x: Vec<f64>,
+    /// `dF⁻¹/du = 1/f(x)` at each node.
+    dx: Vec<f64>,
+    /// Achieved maximum midpoint u-error.
+    max_u_error: f64,
+}
+
+impl<D: ContinuousDistribution> NumericalInverseHermite<D> {
+    /// Most nodes to insert before giving up on the tolerance.
+    pub const MAX_NODES: usize = 1 << 16;
+
+    /// Build the interpolant, refining until the midpoint u-error is within
+    /// `u_resolution`.
+    ///
+    /// # Errors
+    ///
+    /// A non-finite or non-positive `u_resolution`, or a distribution whose
+    /// quantile is not finite anywhere in the interpolated range.
+    pub fn new(dist: D, u_resolution: f64) -> Result<Self, StatsError> {
+        if !(u_resolution > 0.0) || !u_resolution.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "u_resolution must be positive and finite, got {u_resolution}"
+            )));
+        }
+        // Interpolate over the range where the quantile is finite. The bound is
+        // deliberately well inside (0, 1): the exact path handles the rest.
+        let (u_lo, u_hi) = (1e-10, 1.0 - 1e-10);
+        let mut u: Vec<f64> = (0..=32)
+            .map(|i| u_lo + (u_hi - u_lo) * f64::from(i) / 32.0)
+            .collect();
+
+        let node = |uu: f64| -> Option<(f64, f64)> {
+            let xx = dist.ppf(uu);
+            if !xx.is_finite() {
+                return None;
+            }
+            let f = dist.pdf(xx);
+            // dF⁻¹/du = 1/f. A zero density means the quantile is flat here and
+            // the derivative is unbounded; that node cannot anchor a cubic.
+            if !(f > 0.0) || !f.is_finite() {
+                return None;
+            }
+            Some((xx, 1.0 / f))
+        };
+
+        let mut x = Vec::with_capacity(u.len());
+        let mut dx = Vec::with_capacity(u.len());
+        for &uu in &u {
+            let (xx, d) = node(uu).ok_or_else(|| {
+                StatsError::InvalidArgument(format!(
+                    "the quantile or density is not usable at u = {uu}; this \
+                     distribution cannot be Hermite-interpolated over [{u_lo}, {u_hi}]"
+                ))
+            })?;
+            x.push(xx);
+            dx.push(d);
+        }
+
+        // Adaptive refinement: bisect any interval whose midpoint u-error misses.
+        let mut max_err;
+        loop {
+            let mut worst = 0.0_f64;
+            let mut split: Vec<usize> = Vec::new();
+            for i in 0..u.len() - 1 {
+                let um = 0.5 * (u[i] + u[i + 1]);
+                let xm = Self::hermite(u[i], u[i + 1], x[i], x[i + 1], dx[i], dx[i + 1], um);
+                let err = (dist.cdf(xm) - um).abs();
+                if err > worst {
+                    worst = err;
+                }
+                if err > u_resolution {
+                    split.push(i);
+                }
+            }
+            max_err = worst;
+            if split.is_empty() || u.len() + split.len() > Self::MAX_NODES {
+                break;
+            }
+            // Insert from the back so earlier indices stay valid.
+            for &i in split.iter().rev() {
+                let um = 0.5 * (u[i] + u[i + 1]);
+                if let Some((xm, dm)) = node(um) {
+                    u.insert(i + 1, um);
+                    x.insert(i + 1, xm);
+                    dx.insert(i + 1, dm);
+                }
+            }
+        }
+
+        Ok(Self {
+            dist,
+            u,
+            x,
+            dx,
+            max_u_error: max_err,
+        })
+    }
+
+    /// Cubic Hermite on `[a, b]` with values and derivatives at both ends.
+    fn hermite(a: f64, b: f64, ya: f64, yb: f64, da: f64, db: f64, q: f64) -> f64 {
+        let h = b - a;
+        if h <= 0.0 {
+            return ya;
+        }
+        let t = (q - a) / h;
+        let t2 = t * t;
+        let t3 = t2 * t;
+        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+        let h10 = t3 - 2.0 * t2 + t;
+        let h01 = -2.0 * t3 + 3.0 * t2;
+        let h11 = t3 - t2;
+        h00 * ya + h * h10 * da + h01 * yb + h * h11 * db
+    }
+
+    /// Achieved maximum midpoint u-error. An ESTIMATE, not a bound: it samples
+    /// the error at interval midpoints rather than maximising over the interval,
+    /// which is also what SciPy reports.
+    #[must_use]
+    pub fn u_error(&self) -> f64 {
+        self.max_u_error
+    }
+
+    /// Number of interpolation intervals.
+    #[must_use]
+    pub fn intervals(&self) -> usize {
+        self.u.len() - 1
+    }
+
+    /// Interpolated quantile, or the exact one outside the interpolated range.
+    #[must_use]
+    pub fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let n = self.u.len();
+        if q < self.u[0] || q > self.u[n - 1] {
+            // Exact path. See the type doc: extrapolating here is how these
+            // tables go silently wrong.
+            return self.dist.ppf(q);
+        }
+        let i = self
+            .u
+            .partition_point(|&uu| uu <= q)
+            .saturating_sub(1)
+            .min(n - 2);
+        Self::hermite(
+            self.u[i],
+            self.u[i + 1],
+            self.x[i],
+            self.x[i + 1],
+            self.dx[i],
+            self.dx[i + 1],
+            q,
+        )
+    }
+
+    /// One draw by inversion.
+    pub fn sample_one(&self, rng: &mut impl Rng) -> f64 {
+        self.ppf(rng.random::<f64>())
+    }
+
+    /// `n` draws.
+    #[must_use]
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<f64> {
+        (0..n).map(|_| self.sample_one(rng)).collect()
+    }
+}
+
+#[cfg(test)]
+mod hinv_matches_scipy {
+    use super::{ContinuousDistribution, Normal, NumericalInverseHermite, StatsError};
+    use rand::{SeedableRng, rngs::StdRng};
+
+    /// The contract is on the U-ERROR, so that is what the test measures -- and
+    /// on a grid INDEPENDENT of the interval midpoints the construction used to
+    /// judge itself. Checking at the same points the builder checked would only
+    /// confirm it stopped when it said it did.
+    #[test]
+    fn the_u_error_contract_holds_off_the_construction_grid() {
+        for tol in [1e-8, 1e-10, 1e-12] {
+            let h = NumericalInverseHermite::new(Normal::standard(), tol).expect("built");
+            let base = Normal::standard();
+            let mut worst = 0.0_f64;
+            // 19_997 points, deliberately not a power of two and offset, so they
+            // do not land on the dyadic midpoints refinement produces.
+            for k in 1..=19_997_u32 {
+                let u = f64::from(k) / 19_998.0;
+                let err = (base.cdf(h.ppf(u)) - u).abs();
+                if err > worst {
+                    worst = err;
+                }
+            }
+            assert!(
+                worst <= tol * 10.0,
+                "tol {tol:e}: worst off-grid u-error {worst:e} exceeds 10x the target \
+                 (self-reported {:e}, {} intervals)",
+                h.u_error(),
+                h.intervals()
+            );
+            // The self-report must be honest about its own grid too.
+            assert!(
+                h.u_error() <= tol,
+                "self-reported u-error {:e} is above the requested {tol:e}",
+                h.u_error()
+            );
+        }
+    }
+
+    /// A tighter tolerance must buy more nodes -- otherwise refinement is not
+    /// responding to the target at all and the contract is met by luck.
+    #[test]
+    fn refinement_responds_to_the_tolerance() {
+        let loose = NumericalInverseHermite::new(Normal::standard(), 1e-6).expect("built");
+        let tight = NumericalInverseHermite::new(Normal::standard(), 1e-12).expect("built");
+        assert!(
+            tight.intervals() > loose.intervals(),
+            "1e-12 used {} intervals, 1e-6 used {} -- refinement is not tolerance-driven",
+            tight.intervals(),
+            loose.intervals()
+        );
+        assert!(tight.u_error() < loose.u_error());
+    }
+
+    /// Structural properties that hold whatever the node placement.
+    #[test]
+    fn monotone_and_exact_outside_the_interpolated_range() {
+        let h = NumericalInverseHermite::new(Normal::standard(), 1e-10).expect("built");
+        let mut prev = f64::NEG_INFINITY;
+        for k in 1..=5_000_u32 {
+            let v = h.ppf(f64::from(k) / 5_001.0);
+            assert!(v > prev, "quantile is not increasing at u = {}", f64::from(k) / 5_001.0);
+            prev = v;
+        }
+        // Beyond the interpolated range the exact quantile is used, so it agrees
+        // with the base distribution bit for bit.
+        let base = Normal::standard();
+        for u in [1e-300, 1e-30, 1e-12] {
+            assert_eq!(h.ppf(u).to_bits(), base.ppf(u).to_bits(), "tail must be exact");
+        }
+        assert!(h.ppf(-0.1).is_nan());
+        assert!(h.ppf(1.1).is_nan());
+    }
+
+    #[test]
+    fn it_samples_the_distribution() {
+        let h = NumericalInverseHermite::new(Normal::standard(), 1e-10).expect("built");
+        let mut rng = StdRng::seed_from_u64(4242);
+        let n = 200_000;
+        let s = h.sample(n, &mut rng);
+        let mean = s.iter().sum::<f64>() / n as f64;
+        let var = s.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+        assert!(mean.abs() < 5.0 * (1.0 / n as f64).sqrt(), "mean {mean}");
+        assert!((var - 1.0).abs() < 5.0 * (2.0 / n as f64).sqrt(), "var {var}");
+    }
+
+    #[test]
+    fn validation() {
+        assert!(
+            matches!(
+                NumericalInverseHermite::new(Normal::standard(), 0.0),
+                Err(StatsError::InvalidArgument(_))
+            ),
+            "zero tolerance"
+        );
+        assert!(NumericalInverseHermite::new(Normal::standard(), -1.0).is_err());
+        assert!(NumericalInverseHermite::new(Normal::standard(), f64::NAN).is_err());
+        // MUST-MISS control for the guards above.
+        assert!(NumericalInverseHermite::new(Normal::standard(), 1e-9).is_ok());
+    }
+}
+
 #[cfg(test)]
 // Legacy test-only lint backlog (reference-value literals, range assertions,
 // helper signatures) scoped here so `clippy --all-targets` passes the perf gate
