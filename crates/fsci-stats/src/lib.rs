@@ -60230,19 +60230,40 @@ mod ratio_uniforms_matches_scipy {
         assert!((mean - 0.5).abs() < 5.0 * (1.0 / 12.0 / n as f64).sqrt(), "mean {mean}");
     }
 
-    /// The location shift `c` moves the whole distribution and nothing else.
+    /// `c` is a CENTRING parameter for the transform, not a translation of the
+    /// distribution. It must be set near the density's own centre, and then the
+    /// same `±√(2/e)` bounds apply to the centred variable.
+    ///
+    /// My first version of this test had it backwards: it used a density centred
+    /// at 0 with `c = 3` and expected the sample to centre at 3. It came back at
+    /// 0.741. The density is unmoved by `c`; what actually happened is that
+    /// `v = u(x − c)` then ranges around `−3u`, so the `±0.8578` rectangle was far
+    /// too small and TRUNCATED the distribution — an accidental demonstration of
+    /// the exact silent failure documented on the type. The code was right and the
+    /// test was wrong.
     #[test]
-    fn the_shift_translates_the_sample() {
-        let shifted =
-            RatioUniforms::new(|x: f64| (-x * x / 2.0).exp(), 1.0, -V_NORMAL, V_NORMAL, 3.0)
-                .expect("valid bounds");
+    fn the_centring_parameter_tracks_the_density_centre() {
+        let shifted = RatioUniforms::new(
+            |x: f64| (-(x - 3.0) * (x - 3.0) / 2.0).exp(),
+            1.0,
+            -V_NORMAL,
+            V_NORMAL,
+            3.0,
+        )
+        .expect("valid bounds");
         let mut rng = StdRng::seed_from_u64(11);
         let n = 100_000;
         let s = shifted.sample(n, &mut rng).expect("acceptance");
         let mean = s.iter().sum::<f64>() / n as f64;
-        // `c` shifts the ARGUMENT of the pdf, so with the pdf still centred at 0
-        // the sample centres at c.
-        assert!((mean - 3.0).abs() < 5.0 * (1.0 / n as f64).sqrt(), "mean {mean}");
+        let var = s.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+        assert!(
+            (mean - 3.0).abs() < 5.0 * (1.0 / n as f64).sqrt(),
+            "mean {mean}, expected 3"
+        );
+        assert!(
+            (var - 1.0).abs() < 5.0 * (2.0 / n as f64).sqrt(),
+            "var {var}, expected 1"
+        );
     }
 
     /// MUST-HIT for the retry budget. A density that is zero across the whole
@@ -60808,13 +60829,19 @@ mod tdr_matches_scipy {
     /// reported rather than quietly producing the wrong samples.
     #[test]
     fn a_non_log_concave_density_is_detected_rather_than_mis_sampled() {
-        // A bimodal mixture: ln f is not concave between the modes.
-        let f = |x: f64| (-(x - 3.0) * (x - 3.0) / 0.02).exp() + (-(x + 3.0) * (x + 3.0) / 0.02).exp();
-        let df = |x: f64| {
-            -100.0 * (x - 3.0) * (-(x - 3.0) * (x - 3.0) / 0.02).exp()
-                - 100.0 * (x + 3.0) * (-(x + 3.0) * (x + 3.0) / 0.02).exp()
-        };
-        let built = TransformedDensityRejection::new(f, df, &[-3.2, -3.0, 3.0, 3.2]);
+        // Cauchy: f = 1/(1+x²), so ln f = −ln(1+x²) is CONVEX in the tails. The
+        // hat is piecewise exponential and the density is polynomial, so far
+        // enough out the hat necessarily falls below f and the check must fire.
+        //
+        // My first fixture here was a bimodal mixture, on the reasoning that ln f
+        // is not concave between the modes. It passed silently, and the reason is
+        // worth keeping: with construction points AT the two modes the tangents
+        // there are horizontal at peak height, so the hat sits above the whole
+        // valley and never dips below f. Non-log-concavity does not by itself
+        // guarantee a detectable violation — the tails do.
+        let f = |x: f64| 1.0 / (1.0 + x * x);
+        let df = |x: f64| -2.0 * x / ((1.0 + x * x) * (1.0 + x * x));
+        let built = TransformedDensityRejection::new(f, df, &[-3.0, -1.0, 1.0, 3.0]);
         // Either the construction rejects it, or sampling detects f > hat. Both are
         // acceptable outcomes; silently sampling is not.
         if let Ok(t) = built {
