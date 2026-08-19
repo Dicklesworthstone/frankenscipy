@@ -6116,35 +6116,25 @@ pub fn lgmres(
             });
         }
 
-        // Augment Krylov space with outer vectors
-        // Project r onto space spanned by outer_v and update x
-        for (z, az) in &outer_v {
-            // `az_sq` is a sum of squares: either exactly zero, in which case
-            // this outer vector spans nothing and the projection is a no-op, or
-            // positive, in which case it divides safely. Clamping it up to
-            // `f64::EPSILON` instead — as this did — is an absolute floor on a
-            // quantity that scales as ‖A‖²: for a problem scaled down by 1e-15
-            // the true ‖Az‖² is ~1e-30, the clamp replaces it with 2.2e-16, and
-            // `alpha` comes out fourteen orders of magnitude too large, so the
-            // projection actively destroys an otherwise converging iterate
-            // (frankenscipy-4u7vp).
-            let az_sq = dot_product(az, az);
-            if az_sq > 0.0 {
-                let alpha = dot_product(&r, az) / az_sq;
-                for i in 0..n {
-                    x[i] += alpha * z[i];
-                    r[i] -= alpha * az[i];
-                }
-            }
-        }
-
-        // Inner GMRES iterations
+        // The augmentation is NOT applied here. It used to be: `r` was projected onto
+        // each stored `(z, Az)` pair and `x` updated, and then an unaugmented GMRES ran
+        // on what was left. That minimises over `span(outer_v)` and over the Krylov
+        // space SEPARATELY, which equals the joint minimisation only if the two are
+        // A-orthogonal. On a 40x40 diagonally dominant system the joint solve reached
+        // residual 3.01e-14 where the split reached 8.89e-01. The vectors are now passed
+        // into the inner iteration and enter the Arnoldi basis, which is what
+        // `scipy.sparse.linalg.lgmres` does and what this function's docstring claims.
+        //
+        // (The old pre-projection also summed sequentially rather than projecting onto
+        // the span, since the `Az` were never orthogonalised against each other. That
+        // was measured at a 1.0006x cost -- negligible, and not why this changed.)
         let (z, converged, iters) = lgmres_inner(
             a,
             &r,
             inner_m,
             options.tol * b_norm,
             (max_iter - total_iter).min(inner_m),
+            &outer_v,
         )?;
         total_iter += iters;
 
@@ -6164,13 +6154,21 @@ pub fn lgmres(
             });
         }
 
-        // Store outer vector for next restart
+        // Store the correction for the next cycle, NORMALISED as scipy does
+        // (`outer_v.append((dx/nx, ax/nx))`). Normalising matters now that these enter
+        // the Arnoldi basis: an unnormalised direction whose magnitude drifts across
+        // cycles makes the basis progressively worse conditioned.
         if outer_k > 0 {
-            let az = csr_matvec(a, &z);
-            if outer_v.len() >= outer_k {
-                outer_v.remove(0); // Remove oldest
+            let nz = vec_norm(&z);
+            if nz > 0.0 && nz.is_finite() {
+                let az = csr_matvec(a, &z);
+                let zn: Vec<f64> = z.iter().map(|v| v / nz).collect();
+                let azn: Vec<f64> = az.iter().map(|v| v / nz).collect();
+                if outer_v.len() >= outer_k {
+                    outer_v.remove(0); // Remove oldest
+                }
+                outer_v.push((zn, azn));
             }
-            outer_v.push((z, az));
         }
     }
 
@@ -6210,15 +6208,40 @@ impl Default for LgmresOptions {
 
 /// Inner LGMRES iteration (simplified GMRES for error approximation).
 /// Returns (error_approximation, converged, iterations).
+/// One inner cycle of LGMRES: GMRES over `span(outer_v) + K_m(A, r0)`.
+///
+/// # The augmentation belongs INSIDE this iteration
+///
+/// The augmentation vectors are directions in the Arnoldi process, not a correction
+/// applied before it. Minimising over `span(outer_v)` first and over the Krylov space
+/// afterwards equals the joint minimisation only when the two are A-orthogonal, which
+/// they are not: measured on a 40x40 diagonally dominant system, the joint solve reached
+/// residual 3.01e-14 where the split reached 8.89e-01. That gap is the whole reason this
+/// function takes `outer_v` at all.
+///
+/// # Flexible GMRES, so the solution is built from Z and not from V
+///
+/// With augmentation the relation is `A Z = V H` with `Z != V`: `V` stays the
+/// orthonormal basis of the IMAGE space, while `Z` holds the directions that produced
+/// it. The correction is therefore `z = Z y`, not `V y`. When `outer_v` is empty every
+/// direction is the previous basis vector, `Z == V`, and this reduces exactly to the
+/// plain GMRES it replaces -- which is the regression the tests pin.
+///
+/// The stored `A z` products are reused rather than recomputed, saving one matvec per
+/// augmentation vector per cycle; the caller already has them.
 fn lgmres_inner(
     a: &CsrMatrix,
     r0: &[f64],
     max_iter: usize,
     tol: f64,
     iter_limit: usize,
+    outer_v: &[(Vec<f64>, Vec<f64>)],
 ) -> SparseResult<(Vec<f64>, bool, usize)> {
     let n = r0.len();
-    let m = max_iter.min(iter_limit).min(n);
+    // scipy's `m = m + len(outer_v)`: the augmentation directions are extra work, not a
+    // substitute for Krylov work. Capped at `n`, past which no further orthonormal image
+    // vector exists.
+    let m = (max_iter.min(iter_limit) + outer_v.len()).min(n);
 
     if m == 0 {
         return Ok((vec![0.0; n], false, 0));
@@ -6252,13 +6275,37 @@ fn lgmres_inner(
     let mut cs = vec![0.0; m];
     let mut sn = vec![0.0; m];
 
+    // Direction vectors. `zs[j]` is the direction whose image produced `v[j+1]`; with no
+    // augmentation it is simply `v[j]`.
+    let mut zs: Vec<Vec<f64>> = Vec::with_capacity(m);
+
     let mut k = 0;
-    // Reused Arnoldi vector A·v[k] (normalized copy is pushed into v, so wj is
+    // Reused Arnoldi vector A·z (normalized copy is pushed into v, so wj is
     // free to reuse next step). frankenscipy-2hclc (byte-identical).
     let mut wj = vec![0.0; r0.len()];
     while k < m {
-        // w = A * v[k]
-        csr_matvec_into(a, &v[k], &mut wj);
+        // Direction for this step, following scipy's `_fgmres` with
+        // `prepend_outer_v`: the augmentation vectors first, then the initial residual
+        // direction, then the most recent basis vector.
+        let (z_dir, reused_av) = if k < outer_v.len() {
+            (outer_v[k].0.clone(), Some(&outer_v[k].1))
+        } else if k == outer_v.len() {
+            // scipy's `z = rpsolve(v0)`: the initial residual direction, taken once.
+            (v[0].clone(), None)
+        } else {
+            // scipy's `z = rpsolve(vs[-1])`: the NEWEST basis vector. `v[k - len]` would
+            // be the wrong one -- the two coincide only when there is no augmentation,
+            // because `v` gains one entry per completed step regardless of which
+            // direction produced it.
+            (v.last().expect("v always holds at least v0").clone(), None)
+        };
+
+        // w = A * z, reusing the stored product where the caller already has it.
+        match reused_av {
+            Some(av) => wj.copy_from_slice(av),
+            None => csr_matvec_into(a, &z_dir, &mut wj),
+        }
+        zs.push(z_dir);
         // Captured before orthogonalization: this is what the breakdown test
         // below is measured against (frankenscipy-4u7vp).
         let w_norm_before = vec_norm(&wj);
@@ -6319,7 +6366,9 @@ fn lgmres_inner(
     // inlined copy, and the copy is how the absolute pivot floor survived here
     // after being noticed elsewhere (frankenscipy-4u7vp).
     let mut z = vec![0.0; n];
-    update_solution(&mut z, &v, &h, &g, k);
+    // `zs`, not `v`: with augmentation the two differ, and combining the orthonormal
+    // basis instead of the directions would solve a different problem entirely.
+    update_solution(&mut z, &zs, &h, &g, k);
 
     let converged = k > 0 && g[k].abs() < tol;
     Ok((z, converged, k))
@@ -22002,6 +22051,153 @@ mod tests {
     }
 
     // ── LGMRES iterative solver tests ───────────────────────────────
+
+        /// A non-symmetric convection-diffusion operator, the shape LGMRES is meant for.
+    fn convection_diffusion_csr(n: usize, beta: f64, diag: f64) -> CsrMatrix {
+        let mut rows: Vec<usize> = Vec::new();
+        let mut cols: Vec<usize> = Vec::new();
+        let mut data: Vec<f64> = Vec::new();
+        for i in 0..n {
+            if i > 0 {
+                rows.push(i);
+                cols.push(i - 1);
+                data.push(-1.0 - beta);
+            }
+            rows.push(i);
+            cols.push(i);
+            data.push(diag);
+            if i + 1 < n {
+                rows.push(i);
+                cols.push(i + 1);
+                data.push(-1.0 + beta);
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("convection-diffusion COO")
+            .to_csr()
+            .expect("convection-diffusion CSR")
+    }
+
+    /// Augmentation must not change WHERE the solve lands, only how it gets there.
+    ///
+    /// Both settings solve the same system to the same tolerance, so the solutions must
+    /// agree far more tightly than the tolerance itself. The must-miss is that the two
+    /// settings do NOT take the same number of iterations -- if they did, the
+    /// augmentation would not be reaching the Arnoldi basis at all and the agreement
+    /// above would be trivial.
+    #[test]
+    fn lgmres_augmentation_changes_the_path_but_not_the_solution() {
+        let a = convection_diffusion_csr(60, 0.6, 4.0);
+        let b = vec![1.0; 60];
+
+        let plain = lgmres(
+            &a,
+            &b,
+            None,
+            LgmresOptions {
+                tol: 1e-10,
+                max_iter: Some(5000),
+                inner_m: 5,
+                outer_k: 0,
+            },
+        )
+        .expect("lgmres works");
+        let augmented = lgmres(
+            &a,
+            &b,
+            None,
+            LgmresOptions {
+                tol: 1e-10,
+                max_iter: Some(5000),
+                inner_m: 5,
+                outer_k: 3,
+            },
+        )
+        .expect("lgmres works");
+
+        assert!(plain.converged, "unaugmented solve did not converge");
+        assert!(augmented.converged, "augmented solve did not converge");
+        assert_close_slice(&plain.solution, &augmented.solution, 1e-6);
+
+        // Both are genuine solutions of the system, not merely of each other.
+        let ax = csr_matvec(&a, &augmented.solution);
+        assert_close_slice(&ax, &b, 1e-8);
+
+        // MUST-MISS: the augmentation is actually active.
+        assert_ne!(
+            plain.iterations, augmented.iterations,
+            "both settings used {} iterations; the augmentation vectors are not \
+             entering the Arnoldi basis",
+            plain.iterations
+        );
+    }
+
+    /// The augmentation ADDS to the inner budget, so an augmented cycle costs more
+    /// Arnoldi steps than an unaugmented one. This pins the cost, not a benefit.
+    ///
+    /// Measured, and worth stating plainly: on every operator tested the augmented
+    /// configuration consumed MORE total inner steps than `outer_k = 0`. LGMRES earns
+    /// its keep on problems where restarted GMRES stagnates; where it does not stagnate,
+    /// the extra directions are simply extra work. That is a property of the method
+    /// rather than of this port, and SciPy behaves the same way.
+    #[test]
+    fn lgmres_augmentation_costs_extra_inner_steps() {
+        let a = convection_diffusion_csr(60, 0.6, 4.0);
+        let b = vec![1.0; 60];
+        let opts = |outer_k| LgmresOptions {
+            tol: 1e-10,
+            max_iter: Some(5000),
+            inner_m: 5,
+            outer_k,
+        };
+
+        let plain = lgmres(&a, &b, None, opts(0)).expect("lgmres works");
+        let augmented = lgmres(&a, &b, None, opts(3)).expect("lgmres works");
+        assert!(plain.converged && augmented.converged);
+        assert!(
+            augmented.iterations > plain.iterations,
+            "augmented used {} inner steps against {} unaugmented; the augmentation is \
+             being taken out of the Krylov budget instead of added to it",
+            augmented.iterations,
+            plain.iterations
+        );
+    }
+
+    /// `outer_k = 0` must be exactly the unaugmented path: with no stored vectors the
+    /// direction at every step is the previous basis vector, so the flexible Arnoldi
+    /// degenerates to ordinary GMRES. Checked against `gmres` on the same system.
+    #[test]
+    fn lgmres_without_augmentation_agrees_with_gmres() {
+        let a = convection_diffusion_csr(40, 0.6, 4.0);
+        let b = vec![1.0; 40];
+
+        let l = lgmres(
+            &a,
+            &b,
+            None,
+            LgmresOptions {
+                tol: 1e-10,
+                max_iter: Some(5000),
+                inner_m: 30,
+                outer_k: 0,
+            },
+        )
+        .expect("lgmres works");
+        let g = gmres(
+            &a,
+            &b,
+            None,
+            IterativeSolveOptions {
+                tol: 1e-10,
+                max_iter: Some(5000),
+                ..IterativeSolveOptions::default()
+            },
+        )
+        .expect("gmres works");
+
+        assert!(l.converged && g.converged, "both should converge");
+        assert_close_slice(&l.solution, &g.solution, 1e-7);
+    }
 
     #[test]
     fn lgmres_diagonally_dominant_converges() {

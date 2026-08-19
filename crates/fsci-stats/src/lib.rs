@@ -4961,6 +4961,18 @@ pub static WEIBULL_FIT_LN_REUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Same-binary A/B toggle for the Weibull/WeibullMax density shape factors.
+///
+/// CONTRACT: NOT byte-identical; agrees to a few ulp, ~1e-15 relative. The fast arm
+/// computes `bc = base^c` once and forms `base^(c−1)` as `bc / base`, replacing a second
+/// `powf` with a divide. Those are the same value mathematically and different values in
+/// floating point: `powf` is correctly rounded to within its own error bound, and
+/// `bc / base` carries the rounding of `bc` through an additional division, so the two
+/// disagree in the last place or two.
+///
+/// Sibling `WEIBULL_FIT_LN_REUSE_DISABLE` states the same shape of contract for the fit
+/// loop, and adds the part that matters there — the fixed point is unchanged. No such
+/// claim is made here because this toggle feeds `pdf`/`logpdf` directly, where the
+/// returned value IS the result and there is no iteration to absorb the difference.
 pub static WEIBULL_DENSITY_REUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -16577,6 +16589,23 @@ impl TruncNormal {
         assert!(a < b, "a must be less than b");
         Self { a, b }
     }
+
+    /// `Φ(b) − Φ(a)`, the renormalising mass — computed on whichever tail keeps
+    /// the subtraction small.
+    ///
+    /// Written literally, that difference is exactly ZERO for `a = 30, b = 40`,
+    /// because both operands round to 1.0. Every method here divides by it, so the
+    /// whole distribution collapsed: `pdf` was identically 0 across its entire
+    /// support where `scipy.stats.truncnorm.pdf(30.5, 30, 40)` is 8.107714e-06.
+    /// The survival-side form `S(a) − S(b)` gives 4.906713927147908e-198 for the
+    /// same interval. It is not only an extreme-case problem — on `[5, 10]` the
+    /// two forms already disagree in the 10th significant digit.
+    ///
+    /// [`interval_probability`] makes that choice; this is a thin alias so the
+    /// seven call sites below cannot drift apart again. frankenscipy-45de1.
+    fn mass(&self) -> f64 {
+        interval_probability(&Normal::standard(), self.a, self.b)
+    }
 }
 
 impl ContinuousDistribution for TruncNormal {
@@ -16591,7 +16620,7 @@ impl ContinuousDistribution for TruncNormal {
             return 0.0;
         }
         let phi_x = (-x * x / 2.0).exp() / (2.0 * PI).sqrt();
-        let norm = standard_normal_cdf(self.b) - standard_normal_cdf(self.a);
+        let norm = self.mass();
         if norm > 0.0 { phi_x / norm } else { 0.0 }
     }
 
@@ -16602,19 +16631,95 @@ impl ContinuousDistribution for TruncNormal {
         if x >= self.b {
             return 1.0;
         }
-        let phi_a = standard_normal_cdf(self.a);
-        let norm = standard_normal_cdf(self.b) - phi_a;
+        // BOTH the numerator and the denominator are interval masses, and both
+        // cancel for the same reason, so both go through the tail choice.
+        let norm = self.mass();
         if norm > 0.0 {
-            (standard_normal_cdf(x) - phi_a) / norm
+            (interval_probability(&Normal::standard(), self.a, x) / norm).clamp(0.0, 1.0)
         } else {
             0.0
         }
     }
 
+    fn sf(&self, x: f64) -> f64 {
+        if x <= self.a {
+            return 1.0;
+        }
+        if x >= self.b {
+            return 0.0;
+        }
+        // Its own interval mass, NOT 1 − cdf. Previously there was no `sf` here at
+        // all, so the trait default subtracted — and the upper part of the interval
+        // is exactly where that has already lost its digits.
+        // scipy.stats.truncnorm.sf(32, 30, 40) = 1.08655699900926376e-34.
+        let norm = self.mass();
+        if norm > 0.0 {
+            (interval_probability(&Normal::standard(), x, self.b) / norm).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// The quantile, kept inside the support.
+    ///
+    /// The trait default returns `-inf` at `q = 0` and `+inf` at `q = 1`, which is right
+    /// for a distribution on the whole line and wrong for a truncated one: the support
+    /// IS `[a, b]`, so those are the two quantiles that are known exactly.
+    /// `scipy.stats.truncnorm.ppf(0, 30, 40)` is 30 and `ppf(1, 30, 40)` is 40.
+    ///
+    /// The interior is left to the default bisection, which is sound here because `cdf`
+    /// now goes through the tail-choosing interval mass. Its result is clamped for the
+    /// same reason `Truncated::quantile` clamps: on `[30, 40]` the bracketing anchors
+    /// are built from `mean` and `std`, both of which are computed from quantities that
+    /// underflow, so the search can step outside a support it should never leave.
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return self.a;
+        }
+        if q == 1.0 {
+            return self.b;
+        }
+        let x = ppf_bisection(|x| self.cdf(x), q, self.mean(), self.std());
+        x.clamp(self.a, self.b)
+    }
+
+    /// Inverse survival function, with the same endpoints reflected.
+    ///
+    /// `isf(0)` is the upper bound and `isf(1)` the lower — the mirror of `ppf`. Left to
+    /// the trait default these are `+inf` and `-inf`, and fixing only `ppf` would leave
+    /// the two functions disagreeing about where the distribution lives.
+    ///
+    /// The interior keeps the trait's own tail discipline rather than reinventing it:
+    /// `1 - q` is used only while it is representable, and below that the accurate `sf`
+    /// is inverted directly. Routing everything through `ppf(1 - q)` would reintroduce
+    /// precisely the underflow the default was written to avoid — for `q` under about
+    /// 1.1e-16, `1 - q` rounds to 1.0 and the answer collapses to the upper bound.
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        if q == 0.0 {
+            return self.b;
+        }
+        if q == 1.0 {
+            return self.a;
+        }
+        let p = 1.0 - q;
+        let x = if p < 1.0 {
+            ppf_bisection(|x| self.cdf(x), p, self.mean(), self.std())
+        } else {
+            isf_bisection(|x| self.sf(x), q, self.mean(), self.std())
+        };
+        x.clamp(self.a, self.b)
+    }
+
     fn mean(&self) -> f64 {
         let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
-        let norm = standard_normal_cdf(self.b) - standard_normal_cdf(self.a);
+        let norm = self.mass();
         if norm > 0.0 {
             (phi_a - phi_b) / norm
         } else {
@@ -16625,7 +16730,7 @@ impl ContinuousDistribution for TruncNormal {
     fn var(&self) -> f64 {
         let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
-        let norm = standard_normal_cdf(self.b) - standard_normal_cdf(self.a);
+        let norm = self.mass();
         if norm <= 0.0 {
             return 0.0;
         }
@@ -16639,7 +16744,7 @@ impl ContinuousDistribution for TruncNormal {
         // where Δ = Φ(b) − Φ(a). (Standard normal truncation.)
         let phi_a = (-self.a * self.a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-self.b * self.b / 2.0).exp() / (2.0 * PI).sqrt();
-        let delta = standard_normal_cdf(self.b) - standard_normal_cdf(self.a);
+        let delta = self.mass();
         if delta <= 0.0 {
             return f64::NAN;
         }
@@ -16654,7 +16759,7 @@ impl ContinuousDistribution for TruncNormal {
         let (a, b) = (self.a, self.b);
         let phi_a = (-a * a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-b * b / 2.0).exp() / (2.0 * PI).sqrt();
-        let z = standard_normal_cdf(b) - standard_normal_cdf(a);
+        let z = self.mass();
         if z <= 0.0 {
             return f64::NAN;
         }
@@ -16673,7 +16778,7 @@ impl ContinuousDistribution for TruncNormal {
         let (a, b) = (self.a, self.b);
         let phi_a = (-a * a / 2.0).exp() / (2.0 * PI).sqrt();
         let phi_b = (-b * b / 2.0).exp() / (2.0 * PI).sqrt();
-        let z = standard_normal_cdf(b) - standard_normal_cdf(a);
+        let z = self.mass();
         if z <= 0.0 {
             return f64::NAN;
         }
@@ -33038,6 +33143,16 @@ enum RankTieMethod {
 
 /// Same-binary A/B toggle for the radix-argsort fast path in the rank engine.
 /// When true, `rankdata_ties`/`rankdata_ordinal` fall back to the comparison sort.
+///
+/// CONTRACT: BYTE-IDENTICAL ranks either way, on every input including NaN and −0.0.
+/// This is stronger than "both sort correctly" and the reason is worth stating, because
+/// the obvious worry — an unstable comparison sort against a stable radix one — would
+/// break ORDINAL ranks, which are assigned by sorted position rather than by value. It
+/// does not: the radix path sorts the `total_cmp` key transform, so it reproduces
+/// `total_cmp` order exactly (−0.0 before +0.0, NaN ordered rather than incomparable),
+/// and LSD radix is stable with indices seeded `0..n`, so equal keys — which are equal
+/// BITS — come out in ascending index order. That is precisely the
+/// `total_cmp.then(index)` comparator the fallback uses.
 pub static RANKDATA_RADIX_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -50077,6 +50192,13 @@ pub struct ProbplotResult {
 /// Toggle forcing the probability-plot theoretical-quantile maps (`probplot`,
 /// `probplot_quantiles`) onto the serial path, for A/B measurement. Default
 /// `false` = the per-point `ndtri`/`ppf` evals fan across cores.
+///
+/// CONTRACT: BYTE-IDENTICAL either way, on every input. The parallel arm is a pure MAP —
+/// each output depends only on its own input, and `par_continuous_map` preserves index
+/// order — so no value is ever combined with another and there is no summation order to
+/// change. That is what makes this exact, and it is the property to check if the body is
+/// ever rewritten: the moment a reduction appears between the points, the contract
+/// becomes a tolerance rather than an identity.
 pub static PROBPLOT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -55936,6 +56058,17 @@ pub fn durbin_watson(residuals: &[f64]) -> f64 {
 /// Returns autocorrelation at lags 0, 1, ..., max_lag.
 /// Same-binary A/B toggle for the FFT (Wiener–Khinchin) autocorrelation path.
 /// When true, `acf` always takes the direct O(n·lags) dot path.
+///
+/// CONTRACT: NOT byte-identical, and not claimed to be. The two arms compute the same
+/// mathematical quantity by different routes — a forward/inverse transform pair against
+/// an explicit dot product — so they differ at the level the FFT's own error bound
+/// allows, which grows like `eps·log n` rather than staying fixed. Expect agreement to
+/// roughly 1e-12 relative on the lags that carry signal.
+///
+/// The absolute difference is NOT a useful bound here and should not be used as one:
+/// autocorrelation at high lag decays toward zero, so a difference that is negligible
+/// against lag 0 can be a large RELATIVE error on a lag whose true value is near zero.
+/// Any A/B on this toggle should compare relative to each lag's own magnitude.
 pub static ACF_FFT_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -57935,6 +58068,2024 @@ impl<D: ContinuousDistribution> ContinuousDistribution for Truncated<D> {
 #[must_use]
 pub fn truncate<D: ContinuousDistribution>(dist: D, lb: f64, ub: f64) -> Truncated<D> {
     Truncated::new(dist, lb, ub)
+}
+
+/// `E[g(X)]` by tanh-sinh quadrature in the PROBABILITY variable.
+///
+/// `X = F⁻¹(U)` for uniform `U`, so `E[g(X)] = ∫₀¹ g(F⁻¹(t)) dt`. Integrating in
+/// `t` rather than in `x` makes the domain `(0, 1)` whatever the base support is,
+/// and the base quantile diverging at the ends is the integrable endpoint
+/// singularity the double-exponential rule exists for.
+fn transform_mean<D: ContinuousDistribution>(dist: &D, g: impl Fn(f64) -> f64) -> f64 {
+    tanh_sinh_integrate(|t| g(dist.ppf(t)), 0.0, 1.0)
+}
+
+/// `Var[g(X)]` as `E[(g(X) − μ)²]`, NOT `E[g²] − μ²` — the central form cannot
+/// have a large mean cancel the variance away.
+fn transform_var<D: ContinuousDistribution>(dist: &D, g: impl Fn(f64) -> f64, mean: f64) -> f64 {
+    if !mean.is_finite() {
+        return f64::NAN;
+    }
+    tanh_sinh_integrate(
+        |t| {
+            let d = g(dist.ppf(t)) - mean;
+            d * d
+        },
+        0.0,
+        1.0,
+    )
+}
+
+/// `Y = eˣ` for `X ~ dist`. Matches `scipy.stats.exp(X)`.
+///
+/// Support `(0, ∞)`. A strictly increasing map, so the cdf and sf pass straight
+/// through with no reordering: `F_Y(y) = F_X(ln y)`, `S_Y(y) = S_X(ln y)`. The
+/// survival therefore inherits whatever accuracy the base has in ITS right tail
+/// rather than being reconstructed as `1 − cdf` — the point of the sf overrides
+/// across this crate.
+///
+/// `exp(Normal(μ, σ))` is the lognormal, which is the cheapest way to check this
+/// against something already trusted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExpOf<D: ContinuousDistribution> {
+    dist: D,
+}
+
+impl<D: ContinuousDistribution> ExpOf<D> {
+    #[must_use]
+    pub fn new(dist: D) -> Self {
+        Self { dist }
+    }
+
+    /// The underlying distribution `X`.
+    #[must_use]
+    pub fn base(&self) -> &D {
+        &self.dist
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for ExpOf<D> {
+    fn pdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return 0.0;
+        }
+        self.dist.pdf(y.ln()) / y
+    }
+
+    fn logpdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        // `- ln y` rather than `/ y`, so a density that underflows in linear space
+        // still reports a finite log.
+        self.dist.logpdf(y.ln()) - y.ln()
+    }
+
+    fn cdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return 0.0;
+        }
+        self.dist.cdf(y.ln())
+    }
+
+    fn sf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return 1.0;
+        }
+        self.dist.sf(y.ln())
+    }
+
+    fn logcdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        self.dist.logcdf(y.ln())
+    }
+
+    fn logsf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y <= 0.0 {
+            return 0.0;
+        }
+        self.dist.logsf(y.ln())
+    }
+
+    fn ppf(&self, p: f64) -> f64 {
+        self.dist.ppf(p).exp()
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        // Through the base's OWN isf, so a small q is never turned into `1 - q`.
+        self.dist.isf(q).exp()
+    }
+
+    fn mean(&self) -> f64 {
+        transform_mean(&self.dist, f64::exp)
+    }
+
+    fn var(&self) -> f64 {
+        transform_var(&self.dist, f64::exp, self.mean())
+    }
+}
+
+/// `Y = ln X` for a non-negative `X ~ dist`. Matches `scipy.stats.log(X)`.
+///
+/// Strictly increasing, so like [`ExpOf`] the cdf and sf pass straight through:
+/// `F_Y(y) = F_X(eʸ)`, `S_Y(y) = S_X(eʸ)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LogOf<D: ContinuousDistribution> {
+    dist: D,
+}
+
+impl<D: ContinuousDistribution> LogOf<D> {
+    /// Panics if `dist` puts mass below zero, where the logarithm is undefined.
+    ///
+    /// SciPy raises `NotImplementedError` here after inspecting `X.support()`.
+    /// `ContinuousDistribution` exposes no support, so the equivalent test is
+    /// `cdf(0) == 0` — which is the same statement about where the mass is, made
+    /// with the interface that exists rather than one that does not.
+    #[must_use]
+    pub fn new(dist: D) -> Self {
+        assert!(
+            dist.cdf(0.0) == 0.0,
+            "the logarithm of a random variable needs a non-negative support, but \
+             cdf(0) = {} puts mass below zero",
+            dist.cdf(0.0)
+        );
+        Self { dist }
+    }
+
+    /// The underlying distribution `X`.
+    #[must_use]
+    pub fn base(&self) -> &D {
+        &self.dist
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for LogOf<D> {
+    fn pdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.pdf(y.exp()) * y.exp()
+    }
+
+    fn logpdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.logpdf(y.exp()) + y
+    }
+
+    fn cdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.cdf(y.exp())
+    }
+
+    fn sf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.sf(y.exp())
+    }
+
+    fn logcdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.logcdf(y.exp())
+    }
+
+    fn logsf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        self.dist.logsf(y.exp())
+    }
+
+    fn ppf(&self, p: f64) -> f64 {
+        self.dist.ppf(p).ln()
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        self.dist.isf(q).ln()
+    }
+
+    fn mean(&self) -> f64 {
+        transform_mean(&self.dist, f64::ln)
+    }
+
+    fn var(&self) -> f64 {
+        transform_var(&self.dist, f64::ln, self.mean())
+    }
+}
+
+/// `Y = |X|` for `X ~ dist`, the folded distribution. Matches `scipy.stats.abs(X)`.
+///
+/// NOT monotone, so unlike [`ExpOf`] and [`LogOf`] both halves of the base
+/// contribute at every point:
+///
+/// ```text
+///   f_Y(y) = f(y) + f(−y)
+///   F_Y(y) = P(−y ≤ X ≤ y)
+///   S_Y(y) = S(y) + F(−y)
+/// ```
+///
+/// The two tail terms of `S_Y` are the base's own `sf` and `cdf`, ADDED. No
+/// subtraction appears in the survival at all, so `|X|` keeps its right tail for
+/// exactly as long as the base keeps both of its own — better conditioned than
+/// the cdf, which is a difference by nature.
+///
+/// `F_Y` goes through [`interval_probability`], so it subtracts on whichever side
+/// is small. That handles a fold placed far out in one tail; it cannot help when
+/// `y` itself is tiny, because `P(−ε < X < ε)` is a narrow interval around a
+/// finite density and no branch avoids that cancellation — see the note on
+/// [`interval_probability`]. `logcdf` via [`log_interval_probability`] is the
+/// route that survives further.
+///
+/// Note there is no `ppf` override: the fold has no closed-form quantile, so the
+/// trait's bisection is used, which is why `mean`/`var` are defined below in
+/// terms of the BASE quantile rather than this type's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AbsOf<D: ContinuousDistribution> {
+    dist: D,
+}
+
+impl<D: ContinuousDistribution> AbsOf<D> {
+    #[must_use]
+    pub fn new(dist: D) -> Self {
+        Self { dist }
+    }
+
+    /// The underlying distribution `X`.
+    #[must_use]
+    pub fn base(&self) -> &D {
+        &self.dist
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for AbsOf<D> {
+    fn pdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return 0.0;
+        }
+        // Outside the base support its pdf is already 0, so no support test is
+        // needed here -- SciPy needs one only because it masks arrays.
+        self.dist.pdf(y) + self.dist.pdf(-y)
+    }
+
+    fn logpdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        // log-sum-exp of the two folded halves, so the fold stays finite where
+        // both densities have underflowed.
+        let a = self.dist.logpdf(y);
+        let b = self.dist.logpdf(-y);
+        if a == f64::NEG_INFINITY && b == f64::NEG_INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        let hi = a.max(b);
+        hi + ((a - hi).exp() + (b - hi).exp()).ln()
+    }
+
+    fn cdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return 0.0;
+        }
+        interval_probability(&self.dist, -y, y).clamp(0.0, 1.0)
+    }
+
+    fn sf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return 1.0;
+        }
+        // Two tails ADDED, never `1 - cdf`.
+        (self.dist.sf(y) + self.dist.cdf(-y)).clamp(0.0, 1.0)
+    }
+
+    fn logcdf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return f64::NEG_INFINITY;
+        }
+        log_interval_probability(&self.dist, -y, y)
+    }
+
+    fn logsf(&self, y: f64) -> f64 {
+        if y.is_nan() {
+            return f64::NAN;
+        }
+        if y < 0.0 {
+            return 0.0;
+        }
+        let a = self.dist.logsf(y);
+        let b = self.dist.logcdf(-y);
+        if a == f64::NEG_INFINITY && b == f64::NEG_INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        let hi = a.max(b);
+        hi + ((a - hi).exp() + (b - hi).exp()).ln()
+    }
+
+    fn mean(&self) -> f64 {
+        // E|X| = ∫₀¹ |F⁻¹(t)| dt through the BASE quantile -- this type's own ppf
+        // is a bisection, and using it here would nest a root-find inside every
+        // quadrature node for no gain in accuracy.
+        transform_mean(&self.dist, f64::abs)
+    }
+
+    fn var(&self) -> f64 {
+        transform_var(&self.dist, f64::abs, self.mean())
+    }
+}
+
+/// `eˣ` as a distribution. Matches `scipy.stats.exp(X)`.
+#[must_use]
+pub fn exp_of<D: ContinuousDistribution>(dist: D) -> ExpOf<D> {
+    ExpOf::new(dist)
+}
+
+/// `ln X` as a distribution. Matches `scipy.stats.log(X)`. Panics unless the
+/// support is non-negative.
+#[must_use]
+pub fn log_of<D: ContinuousDistribution>(dist: D) -> LogOf<D> {
+    LogOf::new(dist)
+}
+
+/// `|X|` as a distribution. Matches `scipy.stats.abs(X)`.
+#[must_use]
+pub fn abs_of<D: ContinuousDistribution>(dist: D) -> AbsOf<D> {
+    AbsOf::new(dist)
+}
+
+/// Which statistic [`goodness_of_fit`] compares against its Monte Carlo null.
+///
+/// Matches the `statistic=` argument of `scipy.stats.goodness_of_fit`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GofStatistic {
+    /// Anderson-Darling. `scipy` spelling `"ad"`; weights the tails heavily.
+    AndersonDarling,
+    /// Kolmogorov-Smirnov. `scipy` spelling `"ks"`; the largest ecdf gap.
+    KolmogorovSmirnov,
+    /// Cramer-von Mises. `scipy` spelling `"cvm"`; integrated squared gap.
+    CramerVonMises,
+    /// Filliben's probability-plot correlation. `scipy` spelling `"filliben"`.
+    Filliben,
+}
+
+impl GofStatistic {
+    /// Which tail of the null is evidence AGAINST the fit.
+    ///
+    /// Three of the four are distances, so LARGE is bad. Filliben is a
+    /// CORRELATION, so small is bad — SciPy carries this as the attribute
+    /// `_filliben.alternative = 'less'`, and getting it backwards produces a
+    /// p-value that is confidently wrong rather than obviously wrong.
+    #[must_use]
+    pub fn alternative(self) -> &'static str {
+        match self {
+            Self::Filliben => "less",
+            _ => "greater",
+        }
+    }
+}
+
+/// One goodness-of-fit statistic for a FITTED distribution and a sample.
+///
+/// Each formula is SciPy's (`scipy/stats/_fit.py`), transcribed with its
+/// numerically important choices kept:
+///
+/// * Anderson-Darling sums `logcdf(x_i) + logsf(x_{n+1-i})`, NOT `ln(cdf)` and
+///   `ln(sf)`. That is the whole reason the statistic is usable in the tails, and
+///   it is why this crate's ~50 `logcdf`/`logsf` overrides pay off here: a
+///   distribution that only had `ln(cdf(x))` would return `-inf` for any sample
+///   point far enough out and take the statistic to NaN.
+/// * Cramer-von Mises keeps the `1/(12n)` offset rather than folding it in.
+/// * Filliben uses the EXACT uniform order-statistic medians — the median of
+///   `Beta(k, n+1-k)` — where the original paper used the approximation
+///   `(k - 0.3175)/(n + 0.365)`. SciPy made the same substitution and says so.
+#[must_use]
+pub fn gof_statistic<D: ContinuousDistribution>(
+    dist: &D,
+    data: &[f64],
+    which: GofStatistic,
+) -> f64 {
+    let n = data.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    let nf = n as f64;
+    let mut x = data.to_vec();
+    x.sort_unstable_by(f64::total_cmp);
+
+    match which {
+        GofStatistic::AndersonDarling => {
+            let mut s = 0.0;
+            for i in 0..n {
+                let w = (2 * (i + 1) - 1) as f64 / nf;
+                s += w * (dist.logcdf(x[i]) + dist.logsf(x[n - 1 - i]));
+            }
+            -nf - s
+        }
+        GofStatistic::KolmogorovSmirnov => {
+            let mut d_plus = f64::NEG_INFINITY;
+            let mut d_minus = f64::NEG_INFINITY;
+            for (i, &xi) in x.iter().enumerate() {
+                let f = dist.cdf(xi);
+                d_plus = d_plus.max((i + 1) as f64 / nf - f);
+                d_minus = d_minus.max(f - i as f64 / nf);
+            }
+            d_plus.max(d_minus)
+        }
+        GofStatistic::CramerVonMises => {
+            let mut acc = 0.0;
+            for (i, &xi) in x.iter().enumerate() {
+                let u = (2 * (i + 1) - 1) as f64 / (2.0 * nf);
+                let d = u - dist.cdf(xi);
+                acc += d * d;
+            }
+            1.0 / (12.0 * nf) + acc
+        }
+        GofStatistic::Filliben => {
+            // Order-statistic medians of the uniform, mapped through the fitted
+            // quantile: the y-axis of a probability plot.
+            let m: Vec<f64> = (1..=n)
+                .map(|k| {
+                    let median = BetaDist::new(k as f64, (n + 1 - k) as f64).median();
+                    dist.ppf(median)
+                })
+                .collect();
+            pearson_correlation_of(&x, &m)
+        }
+    }
+}
+
+/// Pearson r of two equal-length slices, as Filliben's statistic needs it.
+///
+/// Centred sums rather than the `E[XY] - E[X]E[Y]` shortcut: the shortcut
+/// differences two large numbers to get a small one, and a probability plot's
+/// whole point is that its correlation sits very close to 1.
+fn pearson_correlation_of(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len();
+    if n != b.len() || n == 0 {
+        return f64::NAN;
+    }
+    let nf = n as f64;
+    let ma = a.iter().sum::<f64>() / nf;
+    let mb = b.iter().sum::<f64>() / nf;
+    let mut num = 0.0;
+    let mut sa = 0.0;
+    let mut sb = 0.0;
+    for (&ai, &bi) in a.iter().zip(b.iter()) {
+        let (da, db) = (ai - ma, bi - mb);
+        num += da * db;
+        sa += da * da;
+        sb += db * db;
+    }
+    let den = (sa * sb).sqrt();
+    if den == 0.0 { f64::NAN } else { num / den }
+}
+
+/// Outcome of [`goodness_of_fit`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct GofOutcome<D> {
+    /// The null-hypothesis distribution, fitted to `data`.
+    pub fitted: D,
+    /// The statistic observed on `data` under `fitted`.
+    pub statistic: f64,
+    /// Monte Carlo p-value.
+    pub pvalue: f64,
+    /// The simulated null distribution, one entry per Monte Carlo sample.
+    pub null_distribution: Vec<f64>,
+    /// How many Monte Carlo samples FAILED to refit — see the note on
+    /// [`goodness_of_fit`] about the direction of the bias they introduce.
+    pub failed_fits: usize,
+}
+
+/// Monte Carlo goodness-of-fit test against a distribution FAMILY.
+///
+/// Matches `scipy.stats.goodness_of_fit(dist, data, statistic=...)` for the case
+/// where all parameters are unknown, which is the case the test exists for: once
+/// parameters are estimated from the same data, the classical null distributions
+/// of these statistics no longer apply, and simulating the null is the fix.
+///
+/// The procedure, following SciPy:
+///
+/// 1. fit `D` to `data`, giving the null-hypothesis distribution
+/// 2. observe the statistic on `data` under that fit
+/// 3. draw `n_mc_samples` samples of the same size from it, REFITTING `D` to each
+///    one before computing its statistic — refitting is what makes the null
+///    account for parameter estimation, and skipping it is the classic way to get
+///    an anticonservative p-value
+/// 4. p = (#{null at least as extreme} + 1) / (n_mc_samples + 1)
+///
+/// # Requires a fittable family
+///
+/// Returns `Err(FitError::NotImplemented)` when `D` does not override `try_fit`,
+/// which is the trait default. `try_fit` rather than `fit` deliberately: `fit`
+/// panics, and a generic driver that panics on an unfittable family is not usable
+/// as a library.
+///
+/// # Resamples that fail to refit
+///
+/// A Monte Carlo sample can be degenerate enough that `try_fit` fails on it. Such
+/// a sample contributes NaN to the null distribution, and since every NaN
+/// comparison is false it is never counted as extreme — which biases the p-value
+/// DOWNWARD, toward rejecting the fit. `failed_fits` reports how many, so the
+/// caller can see the bias rather than inherit it silently. It is not silently
+/// dropped from the denominator either, because renormalising would be a
+/// different test.
+///
+/// # Difference from SciPy, stated
+///
+/// SciPy's `monte_carlo_test` compares with a tolerance, `null >= observed - γ`
+/// where `γ = |eps · observed|`; this crate's `monte_carlo_test` compares
+/// exactly. The two differ only when a resample reproduces the observed statistic
+/// to within a rounding step, which for continuous statistics is rare — but it is
+/// a real difference and it makes this p-value very slightly the larger of the
+/// two. Filed rather than patched here, since changing the shared
+/// `monte_carlo_test` would move every other caller's numbers.
+pub fn goodness_of_fit<D>(
+    data: &[f64],
+    which: GofStatistic,
+    n_mc_samples: usize,
+    seed: u64,
+) -> Result<GofOutcome<D>, FitError>
+where
+    D: ContinuousDistribution + Copy + Sync,
+{
+    let fitted = D::try_fit(data)?;
+    let n = data.len();
+
+    let rvs = move |s: u64| -> Vec<f64> {
+        let mut rng = StdRng::seed_from_u64(s);
+        fitted.rvs(n, &mut rng)
+    };
+    // Each resample is REFITTED before its statistic is taken; see step 3 above.
+    let statistic_fn = move |sample: &[f64]| -> f64 {
+        match D::try_fit(sample) {
+            Ok(refit) => gof_statistic(&refit, sample, which),
+            Err(_) => f64::NAN,
+        }
+    };
+
+    let mc = monte_carlo_test(
+        data,
+        rvs,
+        statistic_fn,
+        n_mc_samples,
+        seed,
+        which.alternative(),
+    );
+    let failed_fits = mc.null_distribution.iter().filter(|v| v.is_nan()).count();
+
+    Ok(GofOutcome {
+        fitted,
+        statistic: mc.statistic,
+        pvalue: mc.pvalue,
+        null_distribution: mc.null_distribution,
+        failed_fits,
+    })
+}
+
+/// A distribution defined by a histogram: piecewise-constant pdf, piecewise-linear cdf.
+///
+/// Matches `scipy.stats.rv_histogram((counts, edges), density=...)`.
+///
+/// # The `density` flag is not cosmetic
+///
+/// It decides what the counts MEAN, and the two readings disagree whenever the
+/// bins are not equal-width:
+///
+/// * `density = true` — each count is a HEIGHT, so bin `i` carries probability
+///   proportional to `count_i · width_i`. This is what `numpy.histogram(...,
+///   density=True)` produces.
+/// * `density = false` — each count is a FREQUENCY, so bin `i` carries
+///   probability proportional to `count_i` alone, and the pdf is that divided by
+///   the width. This is what raw `numpy.histogram` counts are.
+///
+/// For `counts = [2, 5, 3]` on edges `[0, 1, 3, 4]` the two give `pdf(2.0)` of
+/// 0.3333… and 0.25, and means of 2.1 and 2.15. SciPy's `density=None` emits a
+/// `RuntimeWarning` and assumes `true` when the widths vary; this takes the flag
+/// explicitly instead, because a warning is not a decision and the caller is the
+/// only one who knows which their counts are.
+///
+/// # Numerics
+///
+/// Everything is exact — no quadrature and no iteration:
+///
+/// * `sf` accumulates from the TOP edge down rather than as `1 − cdf`, so the
+///   right tail keeps its precision (the same discipline as the rest of this
+///   crate's `sf` overrides).
+/// * `var` uses `Σ pᵢ[(mᵢ − μ)² + wᵢ²/12]` — the parallel-axis form, exact for a
+///   piecewise-uniform density — rather than `E[X²] − μ²`, which differences two
+///   comparable numbers to get a small one whenever the support sits away from
+///   the origin.
+/// * `ppf`/`isf` binary-search the cumulative edges and interpolate within the
+///   located bin, so they invert `cdf`/`sf` exactly rather than approximately.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramDistribution {
+    /// Bin edges, ascending, length `bins + 1`.
+    edges: Vec<f64>,
+    /// Probability density per bin, length `bins`; `Σ densityᵢ · widthᵢ = 1`.
+    density: Vec<f64>,
+    /// `cum[i] = P(X < edges[i])`, length `bins + 1`, `cum[0] = 0`.
+    cum: Vec<f64>,
+    /// `upper[i] = P(X > edges[i])`, length `bins + 1`, `upper[bins] = 0`.
+    /// Carried so `sf` never has to be `1 − cdf`.
+    upper: Vec<f64>,
+}
+
+impl HistogramDistribution {
+    /// Build from bin `counts` and `bins + 1` ascending `edges`.
+    ///
+    /// # Errors
+    ///
+    /// Fewer than one bin, a length mismatch, a non-finite or negative count, a
+    /// non-finite or non-ascending edge, or a total mass of zero.
+    pub fn new(counts: &[f64], edges: &[f64], density: bool) -> Result<Self, StatsError> {
+        let bins = counts.len();
+        if bins == 0 || edges.len() != bins + 1 {
+            return Err(StatsError::InvalidArgument(format!(
+                "expected {} edges for {bins} counts, got {}",
+                bins + 1,
+                edges.len()
+            )));
+        }
+        if counts.iter().any(|c| !c.is_finite() || *c < 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "counts must be finite and non-negative".to_string(),
+            ));
+        }
+        if edges.iter().any(|e| !e.is_finite()) {
+            return Err(StatsError::InvalidArgument(
+                "bin edges must be finite".to_string(),
+            ));
+        }
+        if edges.windows(2).any(|w| w[1] <= w[0]) {
+            return Err(StatsError::InvalidArgument(
+                "bin edges must be strictly ascending".to_string(),
+            ));
+        }
+
+        // Unnormalised probability per bin. This is the whole content of the
+        // `density` flag: a height must be multiplied by its width to become a
+        // mass, a frequency is already one.
+        let mass: Vec<f64> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| if density { c * (edges[i + 1] - edges[i]) } else { c })
+            .collect();
+        let total: f64 = mass.iter().sum();
+        if !(total > 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "the histogram carries no probability mass".to_string(),
+            ));
+        }
+
+        let dens: Vec<f64> = mass
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| m / total / (edges[i + 1] - edges[i]))
+            .collect();
+
+        // Cumulative from the bottom and from the top, each accumulated in its
+        // own direction so neither is a subtraction of the other.
+        let mut cum = vec![0.0; bins + 1];
+        for i in 0..bins {
+            cum[i + 1] = cum[i] + mass[i] / total;
+        }
+        let mut upper = vec![0.0; bins + 1];
+        for i in (0..bins).rev() {
+            upper[i] = upper[i + 1] + mass[i] / total;
+        }
+
+        Ok(Self {
+            edges: edges.to_vec(),
+            density: dens,
+            cum,
+            upper,
+        })
+    }
+
+    /// Lower and upper edges of the support.
+    #[must_use]
+    pub fn support(&self) -> (f64, f64) {
+        (self.edges[0], self.edges[self.edges.len() - 1])
+    }
+
+    /// Index of the bin containing `x`, for `x` strictly inside the support.
+    fn bin_of(&self, x: f64) -> usize {
+        // partition_point gives the count of edges <= x; the bin index is one
+        // less, clamped so x exactly at the top edge lands in the last bin.
+        let idx = self.edges.partition_point(|&e| e <= x);
+        idx.saturating_sub(1).min(self.density.len() - 1)
+    }
+}
+
+impl ContinuousDistribution for HistogramDistribution {
+    fn pdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if x < lo || x > hi {
+            return 0.0;
+        }
+        self.density[self.bin_of(x)]
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if x <= lo {
+            return 0.0;
+        }
+        if x >= hi {
+            return 1.0;
+        }
+        let i = self.bin_of(x);
+        (self.cum[i] + self.density[i] * (x - self.edges[i])).clamp(0.0, 1.0)
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        if x.is_nan() {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if x <= lo {
+            return 1.0;
+        }
+        if x >= hi {
+            return 0.0;
+        }
+        // Accumulated from the TOP edge down, not as 1 − cdf.
+        let i = self.bin_of(x);
+        (self.upper[i + 1] + self.density[i] * (self.edges[i + 1] - x)).clamp(0.0, 1.0)
+    }
+
+    fn ppf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if q == 0.0 {
+            return lo;
+        }
+        if q == 1.0 {
+            return hi;
+        }
+        // Last edge whose cumulative is <= q; that edge starts the bin holding q.
+        let i = self
+            .cum
+            .partition_point(|&c| c <= q)
+            .saturating_sub(1)
+            .min(self.density.len() - 1);
+        let d = self.density[i];
+        if d == 0.0 {
+            // An empty bin has no interior to interpolate into.
+            return self.edges[i + 1];
+        }
+        (self.edges[i] + (q - self.cum[i]) / d).clamp(lo, hi)
+    }
+
+    fn isf(&self, q: f64) -> f64 {
+        if !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let (lo, hi) = self.support();
+        if q == 0.0 {
+            return hi;
+        }
+        if q == 1.0 {
+            return lo;
+        }
+        // Mirror of `ppf` on the survival scale: `upper` descends, so find the
+        // first edge whose upper tail has dropped to `q` or below. Working here
+        // rather than calling ppf(1 − q) keeps a small q exact.
+        let i = self
+            .upper
+            .partition_point(|&u| u > q)
+            .saturating_sub(1)
+            .min(self.density.len() - 1);
+        let d = self.density[i];
+        if d == 0.0 {
+            return self.edges[i];
+        }
+        (self.edges[i + 1] - (q - self.upper[i + 1]) / d).clamp(lo, hi)
+    }
+
+    fn mean(&self) -> f64 {
+        // Σ pᵢ · midpointᵢ, exact for a piecewise-uniform density.
+        let mut m = 0.0;
+        for i in 0..self.density.len() {
+            let (a, b) = (self.edges[i], self.edges[i + 1]);
+            m += self.density[i] * (b - a) * 0.5 * (a + b);
+        }
+        m
+    }
+
+    fn var(&self) -> f64 {
+        let mu = self.mean();
+        // Parallel axis: each bin contributes its own uniform variance w²/12 plus
+        // the offset of its centre. No E[X²] − μ² anywhere.
+        let mut v = 0.0;
+        for i in 0..self.density.len() {
+            let (a, b) = (self.edges[i], self.edges[i + 1]);
+            let w = b - a;
+            let p = self.density[i] * w;
+            let d = 0.5 * (a + b) - mu;
+            v += p * (d * d + w * w / 12.0);
+        }
+        v
+    }
+
+    fn entropy(&self) -> f64 {
+        // −Σ ∫ f ln f = −Σ pᵢ ln densityᵢ. Empty bins contribute 0 (0·ln 0 → 0).
+        let mut h = 0.0;
+        for i in 0..self.density.len() {
+            let d = self.density[i];
+            if d > 0.0 {
+                h -= d * (self.edges[i + 1] - self.edges[i]) * d.ln();
+            }
+        }
+        h
+    }
+}
+
+/// A weighted mixture of distributions of the same kind.
+///
+/// Matches `scipy.stats.Mixture(components, weights=...)`. Every method is a
+/// weighted sum over the components, which is what makes the type worth having:
+/// each one is exact, with no quadrature and no iteration.
+///
+/// ```text
+///   pdf(x) = Σ wᵢ · fᵢ(x)      cdf(x) = Σ wᵢ · Fᵢ(x)      sf(x) = Σ wᵢ · Sᵢ(x)
+/// ```
+///
+/// # Why `sf` is its own sum
+///
+/// Summing the component SURVIVALS rather than forming `1 − cdf` is the whole
+/// difference between a usable tail and none. On `0.4·N(−2, 1) + 0.6·N(2, 1.5)`
+/// at `x = 20`, the survival is 1.0658892672465918e-33 while `1 − cdf` is exactly
+/// **0.0** — the cdf has saturated and there is nothing left in it to subtract
+/// from. `logcdf`/`logsf` use the log-sum-exp of the components' own log forms,
+/// so they stay finite past where the linear sums underflow.
+///
+/// # Homogeneous components, and why
+///
+/// `Vec<D>` means every component is the SAME type: `Mixture<Normal>` cannot hold
+/// a Gamma. SciPy allows heterogeneous components because its components are
+/// Python objects. The Rust equivalent would be `Vec<Box<dyn
+/// ContinuousDistribution>>`, which is not available here — `rvs` takes
+/// `&mut impl Rng`, a generic parameter, so the trait is not object-safe. That is
+/// a property of the trait, not a decision made here.
+///
+/// # Weights
+///
+/// SciPy requires the weights to sum to 1 and raises otherwise. These are
+/// normalised instead, which cannot change the resulting distribution: a mixture
+/// is defined by the weight RATIOS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Mixture<D: ContinuousDistribution> {
+    components: Vec<D>,
+    /// Normalised so `Σ weights = 1`.
+    weights: Vec<f64>,
+}
+
+impl<D: ContinuousDistribution> Mixture<D> {
+    /// Build a mixture from components and their (unnormalised) weights.
+    ///
+    /// # Errors
+    ///
+    /// No components, a length mismatch, a non-finite or negative weight, or a
+    /// total weight of zero.
+    pub fn new(components: Vec<D>, weights: &[f64]) -> Result<Self, StatsError> {
+        if components.is_empty() {
+            return Err(StatsError::InvalidArgument(
+                "a mixture needs at least one component".to_string(),
+            ));
+        }
+        if weights.len() != components.len() {
+            return Err(StatsError::InvalidArgument(format!(
+                "expected {} weights for {} components, got {}",
+                components.len(),
+                components.len(),
+                weights.len()
+            )));
+        }
+        if weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "weights must be finite and non-negative".to_string(),
+            ));
+        }
+        let total: f64 = weights.iter().sum();
+        if !(total > 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "the weights carry no mass".to_string(),
+            ));
+        }
+        Ok(Self {
+            components,
+            weights: weights.iter().map(|w| w / total).collect(),
+        })
+    }
+
+    /// The component distributions.
+    #[must_use]
+    pub fn components(&self) -> &[D] {
+        &self.components
+    }
+
+    /// The normalised weights.
+    #[must_use]
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
+
+    /// `Σ wᵢ · f(componentᵢ)`.
+    fn blend(&self, f: impl Fn(&D) -> f64) -> f64 {
+        self.components
+            .iter()
+            .zip(self.weights.iter())
+            .map(|(c, &w)| w * f(c))
+            .sum()
+    }
+
+    /// `ln Σ wᵢ · exp(g(componentᵢ))`, evaluated as a log-sum-exp so it stays
+    /// finite where every component's linear value has underflowed.
+    fn log_blend(&self, g: impl Fn(&D) -> f64) -> f64 {
+        let terms: Vec<f64> = self
+            .components
+            .iter()
+            .zip(self.weights.iter())
+            .map(|(c, &w)| if w > 0.0 { w.ln() + g(c) } else { f64::NEG_INFINITY })
+            .collect();
+        let hi = terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        if hi == f64::NEG_INFINITY {
+            return f64::NEG_INFINITY;
+        }
+        hi + terms.iter().map(|t| (t - hi).exp()).sum::<f64>().ln()
+    }
+}
+
+impl<D: ContinuousDistribution> ContinuousDistribution for Mixture<D> {
+    fn pdf(&self, x: f64) -> f64 {
+        self.blend(|c| c.pdf(x))
+    }
+
+    fn logpdf(&self, x: f64) -> f64 {
+        self.log_blend(|c| c.logpdf(x))
+    }
+
+    fn cdf(&self, x: f64) -> f64 {
+        self.blend(|c| c.cdf(x)).clamp(0.0, 1.0)
+    }
+
+    fn sf(&self, x: f64) -> f64 {
+        // The component SURVIVALS, summed. Never 1 − cdf; see the type doc.
+        self.blend(|c| c.sf(x)).clamp(0.0, 1.0)
+    }
+
+    fn logcdf(&self, x: f64) -> f64 {
+        self.log_blend(|c| c.logcdf(x))
+    }
+
+    fn logsf(&self, x: f64) -> f64 {
+        self.log_blend(|c| c.logsf(x))
+    }
+
+    fn mean(&self) -> f64 {
+        self.blend(|c| c.mean())
+    }
+
+    fn var(&self) -> f64 {
+        // Parallel axis: Σ wᵢ[σᵢ² + (μᵢ − μ)²]. NOT E[X²] − μ², which differences
+        // two comparable numbers whenever the components sit away from 0.
+        let mu = self.mean();
+        self.blend(|c| {
+            let d = c.mean() - mu;
+            c.var() + d * d
+        })
+    }
+
+    fn skewness(&self) -> f64 {
+        // Third central moment of a mixture, shifting each component onto the
+        // mixture mean: μ₃ = Σ wᵢ[μ₃ᵢ + 3dᵢσᵢ² + dᵢ³], dᵢ = μᵢ − μ.
+        let mu = self.mean();
+        let var = self.var();
+        if !(var > 0.0) {
+            return f64::NAN;
+        }
+        let m3 = self.blend(|c| {
+            let (d, s) = (c.mean() - mu, c.std());
+            c.skewness() * s * s * s + 3.0 * d * s * s + d * d * d
+        });
+        m3 / var.powf(1.5)
+    }
+
+    fn kurtosis(&self) -> f64 {
+        // μ₄ = Σ wᵢ[μ₄ᵢ + 4dᵢμ₃ᵢ + 6dᵢ²σᵢ² + dᵢ⁴].
+        //
+        // The +3 and −3 are conversions, not fudge: this crate's `kurtosis` is
+        // EXCESS (Normal returns 0.0), so each component's raw fourth moment is
+        // (excessᵢ + 3)σᵢ⁴ and the mixture's is converted back on the way out.
+        // SciPy's `Mixture.kurtosis()` is NON-excess, so its published value for
+        // the same mixture is 3 larger than this one.
+        let mu = self.mean();
+        let var = self.var();
+        if !(var > 0.0) {
+            return f64::NAN;
+        }
+        let m4 = self.blend(|c| {
+            let (d, s) = (c.mean() - mu, c.std());
+            let s2 = s * s;
+            let m3i = c.skewness() * s * s2;
+            (c.kurtosis() + 3.0) * s2 * s2 + 4.0 * d * m3i + 6.0 * d * d * s2 + d * d * d * d
+        });
+        m4 / (var * var) - 3.0
+    }
+}
+
+#[cfg(test)]
+mod mixture_matches_scipy {
+    use super::{ContinuousDistribution, Mixture, Normal};
+
+    fn fixture() -> Mixture<Normal> {
+        // scipy: Mixture([Normal(mu=-2, sigma=1), Normal(mu=2, sigma=1.5)],
+        //                weights=[0.4, 0.6])
+        Mixture::new(
+            vec![Normal::new(-2.0, 1.0), Normal::new(2.0, 1.5)],
+            &[0.4, 0.6],
+        )
+        .expect("valid mixture")
+    }
+
+    #[test]
+    fn pdf_cdf_sf_and_moments_match_scipy() {
+        let m = fixture();
+        for (x, p, c, s) in [
+            (
+                -3.0,
+                9.740_520_140_617_380e-2,
+                6.371_953_777_250_093e-2,
+                9.362_804_622_274_992e-1,
+            ),
+            (
+                0.0,
+                8.720_041_647_567_267e-2,
+                4.456_266_790_562_491e-1,
+                5.543_733_209_437_510e-1,
+            ),
+            (
+                2.5,
+                1.509_596_845_736_400e-1,
+                7.783_338_368_216_919e-1,
+                2.216_661_631_783_081e-1,
+            ),
+            (
+                7.0,
+                6.169_115_985_164_424e-4,
+                9.997_425_638_000_820e-1,
+                2.574_361_999_181_024e-4,
+            ),
+        ] {
+            for (got, want, what) in
+                [(m.pdf(x), p, "pdf"), (m.cdf(x), c, "cdf"), (m.sf(x), s, "sf")]
+            {
+                assert!(
+                    ((got - want) / want).abs() < 1e-13,
+                    "{what}({x}) = {got:e}, scipy = {want:e}"
+                );
+            }
+        }
+        assert!((m.mean() - 0.4).abs() < 1e-14, "mean = {}", m.mean());
+        assert!((m.var() - 5.59).abs() < 1e-13, "var = {}", m.var());
+        assert!(
+            (m.skewness() - 3.994_994_729_573_627e-2).abs() < 1e-13,
+            "skewness = {}",
+            m.skewness()
+        );
+        // scipy reports 1.986543181825455 NON-excess; this crate's convention is
+        // excess, so the same mixture is 3 lower. Getting this backwards would
+        // leave every other assertion here passing.
+        assert!(
+            (m.kurtosis() - (1.986_543_181_825_455 - 3.0)).abs() < 1e-13,
+            "kurtosis = {} (excess); scipy's non-excess value is 1.986543181825455",
+            m.kurtosis()
+        );
+    }
+
+    /// THE POINT OF SUMMING SURVIVALS. At x = 20 the cdf has saturated, so
+    /// `1 − cdf` is exactly zero while the true survival is 1.07e-33.
+    #[test]
+    fn the_tail_survives_a_saturated_cdf() {
+        let m = fixture();
+        assert_eq!(
+            1.0 - m.cdf(20.0),
+            0.0,
+            "premise: the mixture cdf saturates here"
+        );
+        let want = 1.065_889_267_246_592e-33;
+        let got = m.sf(20.0);
+        assert!(
+            ((got - want) / want).abs() < 1e-11,
+            "sf(20) = {got:e}, scipy = {want:e}"
+        );
+        assert!(m.logsf(20.0).is_finite());
+        // Further out still, where even the linear sum of survivals underflows,
+        // the log form must stay finite.
+        assert!(m.logsf(60.0).is_finite(), "logsf(60) = {}", m.logsf(60.0));
+    }
+
+    #[test]
+    fn structural_identities_and_validation() {
+        let m = fixture();
+        // A one-component mixture is that component.
+        let single = Mixture::new(vec![Normal::new(0.5, 2.0)], &[1.0]).expect("valid");
+        let base = Normal::new(0.5, 2.0);
+        for x in [-1.0, 0.5, 3.0] {
+            assert!((single.pdf(x) - base.pdf(x)).abs() < 1e-15);
+            assert!((single.cdf(x) - base.cdf(x)).abs() < 1e-15);
+            assert!((single.sf(x) - base.sf(x)).abs() < 1e-15);
+        }
+        // Weights are normalised, so ratios are what matter.
+        let scaled = Mixture::new(
+            vec![Normal::new(-2.0, 1.0), Normal::new(2.0, 1.5)],
+            &[40.0, 60.0],
+        )
+        .expect("valid");
+        assert_eq!(scaled.weights(), m.weights());
+        assert!((scaled.pdf(0.3) - m.pdf(0.3)).abs() < 1e-15);
+        assert_eq!(m.components().len(), 2);
+        // cdf + sf = 1, each summed independently.
+        for x in [-4.0, 0.0, 5.0] {
+            assert!((m.cdf(x) + m.sf(x) - 1.0).abs() < 1e-14);
+            assert!((m.logpdf(x) - m.pdf(x).ln()).abs() < 1e-12);
+        }
+
+        assert!(Mixture::<Normal>::new(vec![], &[]).is_err(), "no components");
+        assert!(
+            Mixture::new(vec![Normal::standard()], &[0.5, 0.5]).is_err(),
+            "length mismatch"
+        );
+        assert!(
+            Mixture::new(vec![Normal::standard(), Normal::standard()], &[1.0, -1.0]).is_err(),
+            "negative weight"
+        );
+        assert!(
+            Mixture::new(vec![Normal::standard(), Normal::standard()], &[0.0, 0.0]).is_err(),
+            "no weight mass"
+        );
+        // MUST-MISS control: a zero weight is fine as long as some weight remains.
+        assert!(
+            Mixture::new(vec![Normal::standard(), Normal::new(3.0, 1.0)], &[0.0, 1.0]).is_ok(),
+            "one zero weight is legal"
+        );
+    }
+}
+
+/// O(1) sampling from a finite discrete distribution, by Walker's alias method.
+///
+/// Matches `scipy.stats.sampling.DiscreteAliasUrn(pv, domain=...)`, which reaches
+/// the same algorithm through UNU.RAN. Setup is O(k); every draw afterwards costs
+/// one table lookup and one comparison, independent of `k` — the point of the
+/// method, against the O(k) scan or O(log k) binary search of a cumulative table.
+///
+/// The probability vector need not be normalised; only the ratios matter. With
+/// `domain = None` the support is `0 ..= k-1`, matching SciPy's default; a domain
+/// start shifts it, so `domain = (5, 6)` over two weights yields 5 and 6.
+///
+/// # Construction
+///
+/// Vose's variant: scale the probabilities by `k` so the mean bucket is exactly
+/// 1, then repeatedly pair an under-full bucket with an over-full one, filling
+/// the first from the second. Each pairing finalises one bucket, so the loop runs
+/// at most `k` times and needs no re-scan.
+///
+/// # Two uniforms per draw, deliberately
+///
+/// The common single-uniform trick reuses `u·k`'s fractional part as the coin
+/// flip. That saves a draw but makes the coin a deterministic function of the
+/// bucket index, and the low bits it relies on are the least well-behaved part of
+/// a float uniform. Two independent uniforms cost one extra call and keep the
+/// draw exactly the intended distribution, which is the whole reason to prefer an
+/// alias table over an approximation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscreteAliasUrn {
+    /// Per-bucket probability of keeping the bucket rather than its alias.
+    prob: Vec<f64>,
+    /// Per-bucket fallback.
+    alias: Vec<usize>,
+    /// Normalised probabilities, kept so [`Self::pmf`] can report exactly what
+    /// the table was built from.
+    probabilities: Vec<f64>,
+    /// First value of the support.
+    offset: i64,
+}
+
+impl DiscreteAliasUrn {
+    /// Build the alias table from an unnormalised probability vector.
+    ///
+    /// # Errors
+    ///
+    /// An empty vector, a non-finite or negative weight, or a total of zero.
+    pub fn new(pv: &[f64], domain_start: i64) -> Result<Self, StatsError> {
+        let k = pv.len();
+        if k == 0 {
+            return Err(StatsError::InvalidArgument(
+                "the probability vector must be non-empty".to_string(),
+            ));
+        }
+        if pv.iter().any(|p| !p.is_finite() || *p < 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "probabilities must be finite and non-negative".to_string(),
+            ));
+        }
+        let total: f64 = pv.iter().sum();
+        if !(total > 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "the probability vector carries no mass".to_string(),
+            ));
+        }
+        let probabilities: Vec<f64> = pv.iter().map(|p| p / total).collect();
+
+        // Scaled so the average bucket is exactly 1.
+        let mut scaled: Vec<f64> = probabilities.iter().map(|p| p * k as f64).collect();
+        let mut small: Vec<usize> = Vec::new();
+        let mut large: Vec<usize> = Vec::new();
+        for (i, &s) in scaled.iter().enumerate() {
+            if s < 1.0 { small.push(i) } else { large.push(i) }
+        }
+
+        let mut prob = vec![1.0_f64; k];
+        let mut alias: Vec<usize> = (0..k).collect();
+        // PEEK before popping. `(small.pop(), large.pop())` in the pattern would
+        // pop BOTH stacks and then fail the match when one is empty, silently
+        // dropping the element it took from the other. The bucket would survive
+        // (prob is pre-filled with 1.0 and alias with self, which is the correct
+        // treatment for a full bucket), so the bug would not show in any result —
+        // which is exactly why it is worth not writing.
+        while let (Some(&l), Some(&g)) = (small.last(), large.last()) {
+            small.pop();
+            large.pop();
+            prob[l] = scaled[l];
+            alias[l] = g;
+            // The large bucket gives away exactly the deficit of the small one.
+            scaled[g] = (scaled[g] + scaled[l]) - 1.0;
+            if scaled[g] < 1.0 { small.push(g) } else { large.push(g) }
+        }
+        // Whatever remains is full to within rounding; pin it so no draw can fall
+        // through to a stale alias.
+        for i in small.into_iter().chain(large) {
+            prob[i] = 1.0;
+            alias[i] = i;
+        }
+
+        Ok(Self {
+            prob,
+            alias,
+            probabilities,
+            offset: domain_start,
+        })
+    }
+
+    /// The normalised probability of each support point, in order.
+    #[must_use]
+    pub fn pmf(&self) -> &[f64] {
+        &self.probabilities
+    }
+
+    /// Inclusive `(first, last)` values of the support.
+    #[must_use]
+    pub fn support(&self) -> (i64, i64) {
+        (self.offset, self.offset + self.probabilities.len() as i64 - 1)
+    }
+
+    /// One draw.
+    pub fn sample_one(&self, rng: &mut impl Rng) -> i64 {
+        let k = self.prob.len();
+        let bucket = ((rng.random::<f64>() * k as f64) as usize).min(k - 1);
+        let coin: f64 = rng.random();
+        let idx = if coin < self.prob[bucket] {
+            bucket
+        } else {
+            self.alias[bucket]
+        };
+        self.offset + idx as i64
+    }
+
+    /// `n` draws.
+    #[must_use]
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<i64> {
+        (0..n).map(|_| self.sample_one(rng)).collect()
+    }
+
+    /// The probability the table actually assigns to support index `i`.
+    ///
+    /// `(prob[i] + Σ_{j : alias[j] = i} (1 − prob[j])) / k` — the chance of
+    /// landing in bucket `i` and keeping it, plus the chance of landing in any
+    /// bucket that aliases to it and losing the coin. This is what makes the
+    /// table testable ALGEBRAICALLY rather than by sampling: it must reproduce
+    /// `pmf()` exactly, with no Monte Carlo tolerance anywhere.
+    #[must_use]
+    pub fn table_probability(&self, i: usize) -> f64 {
+        let k = self.prob.len();
+        if i >= k {
+            return 0.0;
+        }
+        let mut p = self.prob[i];
+        for j in 0..k {
+            if j != i && self.alias[j] == i {
+                p += 1.0 - self.prob[j];
+            }
+        }
+        p / k as f64
+    }
+}
+
+#[cfg(test)]
+mod discrete_alias_urn_matches_scipy {
+    use super::DiscreteAliasUrn;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    /// THE test: the table must reproduce the requested distribution EXACTLY, as
+    /// algebra, with no sampling and no tolerance for Monte Carlo error.
+    ///
+    /// A sampling test can only bound the error at ~1/√n, which is far too loose
+    /// to catch a table that is subtly wrong — a swapped alias or a mis-split
+    /// bucket moves a probability by a few percent and hides inside the noise of
+    /// any affordable sample size.
+    #[test]
+    fn the_alias_table_reproduces_the_distribution_exactly() {
+        for pv in [
+            vec![0.1, 0.4, 0.3, 0.2],
+            vec![1.0],
+            vec![0.5, 0.5],
+            vec![1.0, 0.0, 3.0], // a zero-probability point must stay unreachable
+            vec![7.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            vec![1e-9, 1.0, 1e-9],
+        ] {
+            let urn = DiscreteAliasUrn::new(&pv, 0).expect("valid pv");
+            let total: f64 = pv.iter().sum();
+            for (i, &raw) in pv.iter().enumerate() {
+                let want = raw / total;
+                let got = urn.table_probability(i);
+                assert!(
+                    (got - want).abs() < 1e-15,
+                    "pv {pv:?}: table gives {got} for index {i}, requested {want}"
+                );
+            }
+            // And the table is a distribution in its own right.
+            let sum: f64 = (0..pv.len()).map(|i| urn.table_probability(i)).sum();
+            assert!((sum - 1.0).abs() < 1e-14, "pv {pv:?}: table sums to {sum}");
+        }
+    }
+
+    /// Sampling only has to show the table is actually being USED as built --
+    /// the exactness is established above. Tolerance is set from the binomial
+    /// standard error at this n, not chosen to make the test pass.
+    #[test]
+    fn draws_follow_the_table_and_respect_the_domain() {
+        let pv = [0.1, 0.4, 0.3, 0.2];
+        let urn = DiscreteAliasUrn::new(&pv, 0).expect("valid");
+        let mut rng = StdRng::seed_from_u64(20260818);
+        let n = 200_000;
+        let draws = urn.sample(n, &mut rng);
+        let mut counts = [0usize; 4];
+        for d in &draws {
+            assert!((0..4).contains(d), "draw {d} outside the support");
+            counts[*d as usize] += 1;
+        }
+        for (i, &want) in pv.iter().enumerate() {
+            let got = counts[i] as f64 / n as f64;
+            // 5 standard errors: sqrt(p(1-p)/n) is at most ~0.0011 here.
+            let se = (want * (1.0 - want) / n as f64).sqrt();
+            assert!(
+                (got - want).abs() < 5.0 * se,
+                "index {i}: empirical {got}, requested {want} (5 se = {})",
+                5.0 * se
+            );
+        }
+
+        // A zero-probability point must NEVER be drawn -- a must-miss control
+        // that a table sampling uniformly would fail immediately.
+        let sparse = DiscreteAliasUrn::new(&[1.0, 0.0, 1.0], 0).expect("valid");
+        let mut rng2 = StdRng::seed_from_u64(4);
+        assert!(
+            sparse.sample(50_000, &mut rng2).iter().all(|&d| d != 1),
+            "a zero-weight point was drawn"
+        );
+
+        // domain start shifts the support, as scipy's `domain=(5, 6)` does.
+        let shifted = DiscreteAliasUrn::new(&[1.0, 3.0], 5).expect("valid");
+        assert_eq!(shifted.support(), (5, 6));
+        let mut rng3 = StdRng::seed_from_u64(11);
+        assert!(
+            shifted.sample(1000, &mut rng3).iter().all(|&d| d == 5 || d == 6),
+            "a draw escaped the shifted domain"
+        );
+    }
+
+    #[test]
+    fn validation() {
+        assert!(DiscreteAliasUrn::new(&[], 0).is_err(), "empty");
+        assert!(DiscreteAliasUrn::new(&[1.0, -1.0], 0).is_err(), "negative");
+        assert!(DiscreteAliasUrn::new(&[1.0, f64::NAN], 0).is_err(), "non-finite");
+        assert!(DiscreteAliasUrn::new(&[0.0, 0.0], 0).is_err(), "no mass");
+        // MUST-MISS control for the guards above.
+        assert!(DiscreteAliasUrn::new(&[0.0, 1.0], 0).is_ok(), "one zero is fine");
+        // Unnormalised input is normalised, not rejected.
+        let a = DiscreteAliasUrn::new(&[2.0, 6.0], 0).expect("valid");
+        let b = DiscreteAliasUrn::new(&[0.25, 0.75], 0).expect("valid");
+        assert_eq!(a.pmf(), b.pmf());
+    }
+}
+
+/// Discrete sampling and quantiles by indexed search over a guide table.
+///
+/// Matches `scipy.stats.sampling.DiscreteGuideTable(pv, domain=..., guide_factor=...)`.
+///
+/// A cumulative table gives `ppf(u) = min{ i : cdf[i] ≥ u }`, which is O(log k) by
+/// binary search. The guide table makes it O(1) amortised: `m = guide_factor · k`
+/// evenly spaced entries record where to START the search for a `u` in each
+/// `[j/m, (j+1)/m)` slice, so the forward scan from there is short and bounded on
+/// average by `1/guide_factor`.
+///
+/// # How this differs from [`DiscreteAliasUrn`], and why both exist
+///
+/// The alias method draws in O(1) but has NO quantile — its table is a set of
+/// paired buckets, not an ordering, so there is nothing to invert. The guide table
+/// costs a short scan per draw and in exchange gives `ppf`, which is what you need
+/// for common random numbers, for coupling two samplers on one uniform stream, and
+/// for quasi-Monte-Carlo input. Neither dominates; they are different tools.
+///
+/// # The `≥` in `min{ i : cdf[i] ≥ u }` is not a detail
+///
+/// It is inclusive, matching SciPy: for `pv = [0.1, 0.4, 0.3, 0.2]`, `ppf(0.1)` is
+/// 0 and not 1, and `ppf(0.5)` is 1 and not 2. Flipping it to `>` shifts the whole
+/// quantile function by one index at every internal boundary — a bug invisible to
+/// any sampling test, since the boundaries are a measure-zero set of uniforms.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiscreteGuideTable {
+    /// Cumulative probabilities, ascending, with the last pinned to exactly 1.0.
+    cdf: Vec<f64>,
+    /// `guide[j]` is the smallest `i` with `cdf[i] ≥ j/m`.
+    guide: Vec<usize>,
+    /// Normalised probabilities.
+    probabilities: Vec<f64>,
+    /// First value of the support.
+    offset: i64,
+}
+
+impl DiscreteGuideTable {
+    /// Build from an unnormalised probability vector.
+    ///
+    /// `guide_factor` is the guide entries per support point; SciPy's default is
+    /// 1. Larger trades memory for a shorter scan.
+    ///
+    /// # Errors
+    ///
+    /// An empty vector, a non-finite or negative weight, a total of zero, or a
+    /// non-positive, non-finite `guide_factor`.
+    pub fn new(pv: &[f64], domain_start: i64, guide_factor: f64) -> Result<Self, StatsError> {
+        let k = pv.len();
+        if k == 0 {
+            return Err(StatsError::InvalidArgument(
+                "the probability vector must be non-empty".to_string(),
+            ));
+        }
+        if pv.iter().any(|p| !p.is_finite() || *p < 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "probabilities must be finite and non-negative".to_string(),
+            ));
+        }
+        if !(guide_factor > 0.0) || !guide_factor.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "guide_factor must be positive and finite, got {guide_factor}"
+            )));
+        }
+        let total: f64 = pv.iter().sum();
+        if !(total > 0.0) {
+            return Err(StatsError::InvalidArgument(
+                "the probability vector carries no mass".to_string(),
+            ));
+        }
+        let probabilities: Vec<f64> = pv.iter().map(|p| p / total).collect();
+
+        let mut cdf = Vec::with_capacity(k);
+        let mut acc = 0.0;
+        for &p in &probabilities {
+            acc += p;
+            cdf.push(acc);
+        }
+        // Pin the top. Accumulated rounding can leave the last entry a few ulps
+        // below 1.0, and then a `u` in that gap would scan off the end.
+        cdf[k - 1] = 1.0;
+
+        let m = ((guide_factor * k as f64).ceil() as usize).max(1);
+        let mut guide = vec![0_usize; m];
+        let mut i = 0_usize;
+        for (j, g) in guide.iter_mut().enumerate() {
+            // CONSERVATIVE target. At lookup `j = floor(u·m)` guarantees `u ≥ j/m`
+            // in REAL arithmetic, but `j as f64 / m as f64` can round UP by up to
+            // half an ulp — leaving a sliver of `u` that maps to `j` while sitting
+            // below the value the guide was built against. Starting the scan too
+            // early is always safe (it only moves forward); starting too late
+            // returns a wrong index. So nudge the target down.
+            let t = j as f64 / m as f64;
+            let target = t - t * f64::EPSILON;
+            while i < k - 1 && cdf[i] < target {
+                i += 1;
+            }
+            *g = i;
+        }
+
+        Ok(Self {
+            cdf,
+            guide,
+            probabilities,
+            offset: domain_start,
+        })
+    }
+
+    /// The normalised probability of each support point, in order.
+    #[must_use]
+    pub fn pmf(&self) -> &[f64] {
+        &self.probabilities
+    }
+
+    /// Inclusive `(first, last)` values of the support.
+    #[must_use]
+    pub fn support(&self) -> (i64, i64) {
+        (self.offset, self.offset + self.probabilities.len() as i64 - 1)
+    }
+
+    /// `min{ i : cdf[i] ≥ u }`, shifted onto the support. `u ≤ 0` gives the first
+    /// point, `u ≥ 1` the last; a NaN `u` gives the first, since every comparison
+    /// against it is false.
+    #[must_use]
+    pub fn ppf(&self, u: f64) -> i64 {
+        let k = self.cdf.len();
+        if !(u > 0.0) {
+            return self.offset;
+        }
+        if u >= 1.0 {
+            return self.offset + k as i64 - 1;
+        }
+        let m = self.guide.len();
+        let j = ((u * m as f64) as usize).min(m - 1);
+        let mut i = self.guide[j];
+        // `u >= j/m` and `guide[j]` is the first index reaching `j/m`, so the
+        // answer is at or after it — the scan only ever moves forward.
+        while i < k - 1 && self.cdf[i] < u {
+            i += 1;
+        }
+        self.offset + i as i64
+    }
+
+    /// One draw.
+    pub fn sample_one(&self, rng: &mut impl Rng) -> i64 {
+        self.ppf(rng.random::<f64>())
+    }
+
+    /// `n` draws.
+    #[must_use]
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Vec<i64> {
+        (0..n).map(|_| self.sample_one(rng)).collect()
+    }
+}
+
+#[cfg(test)]
+mod discrete_guide_table_matches_scipy {
+    use super::{DiscreteAliasUrn, DiscreteGuideTable};
+    use rand::{SeedableRng, rngs::StdRng};
+
+    const PV: [f64; 4] = [0.1, 0.4, 0.3, 0.2];
+
+    /// The guide table is an optimisation of a search, so the test is whether it
+    /// finds what an exhaustive search finds — checked EXACTLY over a dense grid
+    /// rather than sampled.
+    #[test]
+    fn ppf_agrees_with_exhaustive_search_everywhere() {
+        for gf in [0.25, 1.0, 4.0] {
+            let t = DiscreteGuideTable::new(&PV, 0, gf).expect("valid");
+            // The reference cdf must be built the SAME way the implementation
+            // builds its own -- normalised by the total and with the top pinned to
+            // 1.0. Accumulating the raw weights instead would leave the two
+            // differing by an ulp at the last entry, and this test would fail on
+            // that rather than on anything about the guide table.
+            let total: f64 = PV.iter().sum();
+            let mut cdf: Vec<f64> = PV
+                .iter()
+                .scan(0.0, |a, p| {
+                    *a += p / total;
+                    Some(*a)
+                })
+                .collect();
+            cdf[PV.len() - 1] = 1.0;
+            for step in 1..=20_000_u32 {
+                let u = f64::from(step) / 20_000.0;
+                let want = cdf
+                    .iter()
+                    .position(|&c| c >= u)
+                    .unwrap_or(PV.len() - 1) as i64;
+                let got = t.ppf(u);
+                assert!(
+                    got == want,
+                    "guide_factor {gf}: ppf({u}) = {got}, exhaustive search = {want}"
+                );
+            }
+        }
+    }
+
+    /// scipy's published values, and the boundary convention they pin.
+    ///
+    /// `min{i : cdf[i] >= u}` is INCLUSIVE. At u = 0.1 and u = 0.5 -- exactly on
+    /// cdf entries -- an exclusive `>` would return 1 and 2 instead of 0 and 1.
+    /// No sampling test could see that: the boundaries are a measure-zero set.
+    #[test]
+    fn the_boundary_convention_matches_scipy() {
+        let t = DiscreteGuideTable::new(&PV, 0, 1.0).expect("valid");
+        for (u, want) in [
+            (0.05, 0),
+            (0.1, 0),
+            (0.5, 1),
+            (0.8, 2),
+            (0.95, 3),
+        ] {
+            assert_eq!(t.ppf(u), want, "scipy ppf({u}) is {want}");
+        }
+        // Each support point owns the half-open interval (cdf[i-1], cdf[i]], and
+        // its width IS its probability. Probing both sides of every internal
+        // boundary is what makes the whole quantile function pinned, not just the
+        // five points above.
+        let mut acc = 0.0;
+        for (i, &p) in PV.iter().enumerate() {
+            let lo = acc;
+            acc += p;
+            assert_eq!(t.ppf(acc), i as i64, "the upper edge belongs to {i}");
+            assert_eq!(
+                t.ppf(lo + (acc - lo) * 0.5),
+                i as i64,
+                "the interior belongs to {i}"
+            );
+            if i + 1 < PV.len() {
+                assert_eq!(
+                    t.ppf(acc + 1e-12),
+                    i as i64 + 1,
+                    "just past the edge belongs to {}",
+                    i + 1
+                );
+            }
+        }
+        // Out of range and NaN.
+        assert_eq!(t.ppf(0.0), 0);
+        assert_eq!(t.ppf(-1.0), 0);
+        assert_eq!(t.ppf(1.0), 3);
+        assert_eq!(t.ppf(2.0), 3);
+        assert_eq!(t.ppf(f64::NAN), 0);
+    }
+
+    /// CROSS-CHECK against the alias urn: two unrelated algorithms, built from the
+    /// same weights, must agree on the distribution. The guide table's implied
+    /// probability for `i` is the width of its half-open interval; the urn's comes
+    /// from its bucket-and-alias table. Neither is derived from the other.
+    #[test]
+    fn the_two_discrete_samplers_agree_on_the_distribution() {
+        for pv in [
+            vec![0.1, 0.4, 0.3, 0.2],
+            vec![1.0],
+            vec![7.0, 1.0, 1.0, 1.0],
+            vec![1.0, 0.0, 3.0],
+        ] {
+            let urn = DiscreteAliasUrn::new(&pv, 0).expect("valid");
+            let tab = DiscreteGuideTable::new(&pv, 0, 1.0).expect("valid");
+            assert_eq!(urn.pmf(), tab.pmf(), "normalisation differs for {pv:?}");
+            for i in 0..pv.len() {
+                let from_urn = urn.table_probability(i);
+                let from_tab = tab.pmf()[i];
+                assert!(
+                    (from_urn - from_tab).abs() < 1e-15,
+                    "{pv:?}: alias table gives {from_urn} for {i}, guide table {from_tab}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn draws_and_domain_and_validation() {
+        let t = DiscreteGuideTable::new(&PV, 0, 1.0).expect("valid");
+        let mut rng = StdRng::seed_from_u64(20260818);
+        let n = 200_000;
+        let mut counts = [0usize; 4];
+        for d in t.sample(n, &mut rng) {
+            assert!((0..4).contains(&d), "draw {d} outside the support");
+            counts[d as usize] += 1;
+        }
+        for (i, &want) in PV.iter().enumerate() {
+            let got = counts[i] as f64 / n as f64;
+            let se = (want * (1.0 - want) / n as f64).sqrt();
+            assert!(
+                (got - want).abs() < 5.0 * se,
+                "index {i}: empirical {got}, requested {want}"
+            );
+        }
+
+        // domain start, as scipy's `domain=(5, 6)`; scipy's ppf(0.5) there is 6.
+        let shifted = DiscreteGuideTable::new(&[1.0, 3.0], 5, 1.0).expect("valid");
+        assert_eq!(shifted.support(), (5, 6));
+        assert_eq!(shifted.ppf(0.5), 6);
+        assert_eq!(shifted.ppf(0.25), 5);
+
+        // A zero-weight point is never returned: its interval has zero width.
+        let sparse = DiscreteGuideTable::new(&[1.0, 0.0, 1.0], 0, 1.0).expect("valid");
+        for step in 1..=5000_u32 {
+            assert_ne!(
+                sparse.ppf(f64::from(step) / 5000.0),
+                1,
+                "a zero-weight point was returned"
+            );
+        }
+
+        assert!(DiscreteGuideTable::new(&[], 0, 1.0).is_err(), "empty");
+        assert!(DiscreteGuideTable::new(&[1.0, -1.0], 0, 1.0).is_err(), "negative");
+        assert!(DiscreteGuideTable::new(&[0.0, 0.0], 0, 1.0).is_err(), "no mass");
+        assert!(DiscreteGuideTable::new(&PV, 0, 0.0).is_err(), "guide_factor 0");
+        assert!(DiscreteGuideTable::new(&PV, 0, -1.0).is_err(), "guide_factor < 0");
+        // MUST-MISS control for the guide_factor guard.
+        assert!(DiscreteGuideTable::new(&PV, 0, 0.5).is_ok(), "0.5 is legal");
+    }
+}
+
+/// Sampling from an arbitrary (possibly unnormalised) density by the
+/// ratio-of-uniforms method.
+///
+/// Matches `scipy.stats.sampling.RatioUniforms(pdf, umax=, vmin=, vmax=, c=)`.
+///
+/// Draw `u ~ U(0, umax)` and `v ~ U(vmin, vmax)`; accept `x = v/u + c` when
+/// `u² ≤ f(x)`. The accepted points are distributed exactly as `f`, whatever its
+/// normalising constant, because the region
+///
+/// ```text
+///   A = { (u, v) : 0 < u ≤ √f(v/u + c) }
+/// ```
+///
+/// has area `½∫f` and the map `(u, v) ↦ v/u + c` pushes the uniform distribution
+/// on `A` onto `f`. The rectangle `[0, umax] × [vmin, vmax]` must CONTAIN `A`;
+/// the caller supplies it, exactly as SciPy does, because computing it needs
+/// suprema of `√f` and `x√f` that only the caller knows.
+///
+/// Efficiency is `area(A) / area(rectangle)`, so a loose rectangle costs draws
+/// but never correctness — a rectangle that is too SMALL is the error that
+/// silently returns the wrong distribution, since the missing corner of `A` is
+/// simply never sampled and nothing in the loop can notice.
+///
+/// # Bounded, not "expected to terminate"
+///
+/// A pdf that is zero everywhere the rectangle reaches never accepts, and the
+/// natural loop then spins forever. SciPy guards this by raising after 50000
+/// fruitless tries; this returns `Err` after the same budget PER DRAW, which is
+/// stricter than SciPy's per-batch count and easier to reason about. An
+/// unbounded retry loop is the shape that produced this project's worst defect
+/// (`eig` hanging on `max_niter = 0`), and it is not worth repeating for a
+/// sampler.
+#[derive(Debug, Clone)]
+pub struct RatioUniforms<F> {
+    pdf: F,
+    umax: f64,
+    vmin: f64,
+    vmax: f64,
+    c: f64,
+}
+
+impl<F: Fn(f64) -> f64> RatioUniforms<F> {
+    /// Retries allowed for a single draw before giving up.
+    pub const MAX_TRIES: usize = 50_000;
+
+    /// Build a sampler for `pdf` over the bounding rectangle
+    /// `[0, umax] × [vmin, vmax]`, with location shift `c` (SciPy's default 0).
+    ///
+    /// # Errors
+    ///
+    /// `umax` not positive, `vmin` not below `vmax`, or any bound non-finite.
+    pub fn new(pdf: F, umax: f64, vmin: f64, vmax: f64, c: f64) -> Result<Self, StatsError> {
+        if !(umax > 0.0) || !umax.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "umax must be positive and finite, got {umax}"
+            )));
+        }
+        if !(vmin < vmax) || !vmin.is_finite() || !vmax.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "need finite vmin < vmax, got vmin={vmin} vmax={vmax}"
+            )));
+        }
+        if !c.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "c must be finite, got {c}"
+            )));
+        }
+        Ok(Self {
+            pdf,
+            umax,
+            vmin,
+            vmax,
+            c,
+        })
+    }
+
+    /// One draw, or `Err` if [`Self::MAX_TRIES`] rejections pass without an
+    /// acceptance.
+    ///
+    /// # Errors
+    ///
+    /// The retry budget being exhausted, which in practice means the rectangle
+    /// encloses almost no probability mass.
+    pub fn try_sample_one(&self, rng: &mut impl Rng) -> Result<f64, StatsError> {
+        for _ in 0..Self::MAX_TRIES {
+            let u = self.umax * rng.random::<f64>();
+            if u <= 0.0 {
+                // u = 0 would divide by zero; it has probability zero but a
+                // uniform on [0, 1) can return exactly 0.0.
+                continue;
+            }
+            let v = self.vmin + (self.vmax - self.vmin) * rng.random::<f64>();
+            let x = v / u + self.c;
+            if u * u <= (self.pdf)(x) {
+                return Ok(x);
+            }
+        }
+        Err(StatsError::InvalidArgument(format!(
+            "ratio-of-uniforms rejected {} candidates without an acceptance; the \
+             bounding rectangle probably encloses no mass of the density",
+            Self::MAX_TRIES
+        )))
+    }
+
+    /// `n` draws.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_sample_one`].
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Result<Vec<f64>, StatsError> {
+        (0..n).map(|_| self.try_sample_one(rng)).collect()
+    }
+}
+
+#[cfg(test)]
+mod ratio_uniforms_matches_scipy {
+    use super::{RatioUniforms, StatsError};
+    use rand::{SeedableRng, rngs::StdRng};
+
+    /// `√(2/e)`, the supremum of `|x|·√f` for `f(x) = exp(−x²/2)`: the tight `v`
+    /// bound for a standard normal. `√f` peaks at 1, so `umax = 1`.
+    const V_NORMAL: f64 = 0.857_763_884_960_706_8;
+
+    /// The method's whole claim is that accepted points follow `f` regardless of
+    /// its normalisation, so the test uses an UNNORMALISED density -- `exp(−x²/2)`
+    /// without the `1/√(2π)` -- and requires standard-normal moments out of it.
+    /// Normalising the fixture would test something weaker than the claim.
+    #[test]
+    fn an_unnormalised_gaussian_yields_standard_normal_moments() {
+        let r = RatioUniforms::new(|x: f64| (-x * x / 2.0).exp(), 1.0, -V_NORMAL, V_NORMAL, 0.0)
+            .expect("valid bounds");
+        let mut rng = StdRng::seed_from_u64(20260819);
+        let n = 200_000;
+        let s = r.sample(n, &mut rng).expect("acceptance within budget");
+        assert_eq!(s.len(), n);
+
+        let mean = s.iter().sum::<f64>() / n as f64;
+        let var = s.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+        // Tolerances are 5 standard errors computed from n, not chosen to pass:
+        // se(mean) = 1/√n, se(var) = √(2/n) for a normal.
+        let se_mean = (1.0 / n as f64).sqrt();
+        let se_var = (2.0 / n as f64).sqrt();
+        assert!(
+            mean.abs() < 5.0 * se_mean,
+            "mean {mean}, tolerance {}",
+            5.0 * se_mean
+        );
+        assert!(
+            (var - 1.0).abs() < 5.0 * se_var,
+            "var {var}, tolerance {}",
+            5.0 * se_var
+        );
+        // Symmetry is a second, independent handle on the same sample: a shifted
+        // or one-sided acceptance region would move this while leaving the
+        // variance alone.
+        let above = s.iter().filter(|x| **x > 0.0).count() as f64 / n as f64;
+        assert!((above - 0.5).abs() < 5.0 * (0.25 / n as f64).sqrt(), "P(X>0) = {above}");
+    }
+
+    /// A bounded support, where the rectangle is exact and every accepted point
+    /// must lie inside `[0, 1]` -- a hard constraint, not a statistical one.
+    #[test]
+    fn a_uniform_density_stays_inside_its_support() {
+        let r = RatioUniforms::new(
+            |x: f64| if (0.0..=1.0).contains(&x) { 1.0 } else { 0.0 },
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+        )
+        .expect("valid bounds");
+        let mut rng = StdRng::seed_from_u64(7);
+        let n = 100_000;
+        let s = r.sample(n, &mut rng).expect("acceptance within budget");
+        assert!(
+            s.iter().all(|x| (0.0..=1.0).contains(x)),
+            "a draw escaped the support"
+        );
+        let mean = s.iter().sum::<f64>() / n as f64;
+        assert!((mean - 0.5).abs() < 5.0 * (1.0 / 12.0 / n as f64).sqrt(), "mean {mean}");
+    }
+
+    /// The location shift `c` moves the whole distribution and nothing else.
+    #[test]
+    fn the_shift_translates_the_sample() {
+        let shifted =
+            RatioUniforms::new(|x: f64| (-x * x / 2.0).exp(), 1.0, -V_NORMAL, V_NORMAL, 3.0)
+                .expect("valid bounds");
+        let mut rng = StdRng::seed_from_u64(11);
+        let n = 100_000;
+        let s = shifted.sample(n, &mut rng).expect("acceptance");
+        let mean = s.iter().sum::<f64>() / n as f64;
+        // `c` shifts the ARGUMENT of the pdf, so with the pdf still centred at 0
+        // the sample centres at c.
+        assert!((mean - 3.0).abs() < 5.0 * (1.0 / n as f64).sqrt(), "mean {mean}");
+    }
+
+    /// MUST-HIT for the retry budget. A density that is zero across the whole
+    /// rectangle can never be accepted, and the natural loop spins forever. This
+    /// has to come back as an error, promptly.
+    #[test]
+    fn an_impossible_density_errors_instead_of_hanging() {
+        let r = RatioUniforms::new(|_x: f64| 0.0, 1.0, -1.0, 1.0, 0.0).expect("valid bounds");
+        let mut rng = StdRng::seed_from_u64(1);
+        let err = r.try_sample_one(&mut rng);
+        assert!(
+            matches!(err, Err(StatsError::InvalidArgument(_))),
+            "a never-accepting density must return Err, not loop"
+        );
+        // MUST-MISS control: the same shape with a density that CAN be accepted
+        // succeeds, so the error above is about the density and not the budget.
+        let ok = RatioUniforms::new(|_x: f64| 1.0, 1.0, -1.0, 1.0, 0.0).expect("valid bounds");
+        assert!(ok.try_sample_one(&mut rng).is_ok());
+    }
+
+    #[test]
+    fn validation() {
+        let f = |x: f64| (-x * x / 2.0).exp();
+        assert!(RatioUniforms::new(f, 0.0, -1.0, 1.0, 0.0).is_err(), "umax 0");
+        assert!(RatioUniforms::new(f, -1.0, -1.0, 1.0, 0.0).is_err(), "umax < 0");
+        assert!(RatioUniforms::new(f, 1.0, 1.0, 1.0, 0.0).is_err(), "vmin == vmax");
+        assert!(RatioUniforms::new(f, 1.0, 2.0, 1.0, 0.0).is_err(), "vmin > vmax");
+        assert!(
+            RatioUniforms::new(f, f64::INFINITY, -1.0, 1.0, 0.0).is_err(),
+            "non-finite umax"
+        );
+        assert!(
+            RatioUniforms::new(f, 1.0, -1.0, 1.0, f64::NAN).is_err(),
+            "non-finite c"
+        );
+        // MUST-MISS control for the guards above.
+        assert!(RatioUniforms::new(f, 1.0, -1.0, 1.0, 0.0).is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -62356,6 +64507,92 @@ mod tests {
     // rather than assumed. Deep-tail quantiles (q = 1e-10 and q = 1-1e-6) are
     // included deliberately -- that is where a bracket-width-terminated inverse
     // fails while every central quantile still looks fine.
+
+    /// Perturb a golden by enough to break any tolerance these suites declare.
+    ///
+    /// Pure and env-free so it can be tested directly; [`negative_control`] decides
+    /// WHEN to apply it. The additive term is not decoration: a golden of exactly 0.0
+    /// is unperturbable by multiplication, and a control that silently fails to perturb
+    /// is worse than no control, because it reports a passing "failing arm".
+    #[cfg(test)]
+    fn perturb_for_control(golden: f64) -> f64 {
+        golden * (1.0 + 1e-6) + 1e-300
+    }
+
+    /// Return `golden`, or a deliberately wrong value when a control is armed for
+    /// `label` via the `FSCI_NEGATIVE_CONTROL` environment variable.
+    ///
+    /// # Why this exists
+    ///
+    /// The standing two-arm rule requires observing the FAILING arm, and the usual way
+    /// to get one is to edit a golden constant, run, and restore. That is what put a red
+    /// golden on `main` (frankenscipy-hld7v): an auto-commit swept the perturbed value
+    /// mid-window and shipped it under the message "correct gamma ppf(1e-10) scipy
+    /// golden digit", which asserts the opposite of what the diff did. The hazard is
+    /// structural rather than a slip -- the verification standard REQUIRES transiting
+    /// through a state where the tree is deliberately wrong, so any sweep-the-tree
+    /// auto-commit will eventually capture one, and the diff looks like a plausible
+    /// constant tweak.
+    ///
+    /// This removes the window instead of shortening it. The perturbation lives in the
+    /// environment, never in the file, so there is nothing to sweep, nothing to restore,
+    /// and no moment at which a commit of this path would be wrong. Arm it with
+    /// `FSCI_NEGATIVE_CONTROL=<label>` (or `ALL`), run, observe the failure, unset.
+    ///
+    /// It announces itself on stderr because a silent perturbation would let a run that
+    /// believes it is checking the real golden report success against a fake one.
+    #[cfg(test)]
+    fn negative_control(label: &str, golden: f64) -> f64 {
+        match std::env::var("FSCI_NEGATIVE_CONTROL") {
+            Ok(armed) if armed == label || armed == "ALL" => {
+                let perturbed = perturb_for_control(golden);
+                eprintln!(
+                    "NEGATIVE CONTROL ARMED [{label}]: golden {golden:e} -> {perturbed:e}; \
+                     this run is EXPECTED to fail and proves nothing if it passes"
+                );
+                perturbed
+            }
+            _ => golden,
+        }
+    }
+
+    /// The control mechanism itself needs both arms, or it is one more thing asserting
+    /// its own correctness.
+    #[test]
+    fn the_negative_control_perturbs_enough_to_break_the_tolerances_it_guards() {
+        // MUST-HIT: the perturbation exceeds every tolerance these suites declare. The
+        // loosest in the gamma/beta golden test is 1e-9.
+        for golden in [0.000_503_653_813_032_831_1_f64, 1.0, 28.0, -3.5, 1e-300] {
+            let p = perturb_for_control(golden);
+            let denom = golden.abs().max(f64::MIN_POSITIVE);
+            let rel = (p - golden).abs() / denom;
+            assert!(
+                rel > 1e-9,
+                "perturbing {golden:e} gave {p:e}, a relative change of {rel:e} which \
+                 would NOT break a 1e-9 tolerance -- the failing arm would pass"
+            );
+        }
+        // The zero case is why the additive term is there; multiplication alone leaves
+        // it untouched and the control would silently do nothing.
+        assert_ne!(
+            perturb_for_control(0.0),
+            0.0,
+            "a zero golden was left unperturbed"
+        );
+
+        // MUST-MISS: with nothing armed the golden is returned BIT-identically, so an
+        // ordinary run is unaffected. Reading the env here rather than setting it keeps
+        // this free of the process-global races that setting it would introduce.
+        let g = 0.000_503_653_813_032_831_1_f64;
+        if std::env::var("FSCI_NEGATIVE_CONTROL").is_err() {
+            assert_eq!(
+                negative_control("gamma_ppf_1e-10", g).to_bits(),
+                g.to_bits(),
+                "an unarmed control altered the golden"
+            );
+        }
+    }
+
     #[test]
     fn gamma_beta_pdf_cdf_ppf_match_exact_scipy_values() {
         // Relative comparison: these span ~1e-4 to ~28, so a single absolute
@@ -62395,6 +64632,12 @@ mod tests {
             (0.975, 10.114_998_160_055_01),
             (0.999_999, 27.638_164_072_373_63),
         ] {
+            // Routed through `negative_control` so the failing arm can be produced
+            // WITHOUT editing this constant. `ppf(1e-10)` is the exact golden an
+            // auto-commit swept mid-control and pushed red to main (frankenscipy-hld7v);
+            // it is wired first because it is the one that has already been damaged
+            // once. Arm with `FSCI_NEGATIVE_CONTROL=gamma_ppf`.
+            let want = negative_control("gamma_ppf", want);
             close(g.ppf(q), want, 1e-9, &format!("gamma ppf({q})"));
         }
 
@@ -98161,13 +100404,68 @@ mod truncate_matches_scipy {
             );
         }
 
-        // And the incumbent-in-tree really does fail here. If this ever starts
-        // passing, TruncNormal was fixed and this assertion is the place to look.
-        assert_eq!(
-            TruncNormal::new(30.0, 40.0).pdf(32.0),
-            0.0,
-            "TruncNormal is expected to return 0 here; that is frankenscipy's own \
-             instance of the cancellation this type avoids"
+        // This used to assert `TruncNormal::new(30, 40).pdf(32) == 0.0` -- the
+        // in-tree instance of the same cancellation, filed as frankenscipy-45de1.
+        // That bead is now FIXED, so the two implementations must AGREE instead.
+        // Keeping the check rather than deleting it: it is now a cross-validation
+        // between a generic construction and a closed-form one, which is a stronger
+        // statement than either makes against scipy alone.
+        let concrete = TruncNormal::new(30.0, 40.0);
+        for x in [30.5, 32.0, 35.0] {
+            let (g, c) = (t.pdf(x), concrete.pdf(x));
+            assert!(
+                ((g - c) / c).abs() < 1e-12,
+                "generic pdf({x}) = {g:e} but TruncNormal gives {c:e}"
+            );
+        }
+    }
+
+    /// A truncated distribution's extreme quantiles are its BOUNDS, and they are the two
+    /// values known exactly. The trait default answers `-inf` and `+inf`, which is right
+    /// on the whole line and wrong here; `scipy.stats.truncnorm.ppf(0, 30, 40)` is 30 and
+    /// `ppf(1, 30, 40)` is 40.
+    ///
+    /// This is the remaining half of frankenscipy-45de1: `pdf`, `cdf` and `sf` were fixed
+    /// when the bead was filed, but the bead also asked for `ppf`, and the concrete type
+    /// overrode neither it nor `isf`.
+    #[test]
+    fn truncnormal_extreme_quantiles_are_the_support_bounds() {
+        let d = TruncNormal::new(30.0, 40.0);
+        assert_eq!(d.ppf(0.0), 30.0, "ppf(0) must be the lower bound");
+        assert_eq!(d.ppf(1.0), 40.0, "ppf(1) must be the upper bound");
+        assert_eq!(d.isf(0.0), 40.0, "isf(0) must be the upper bound");
+        assert_eq!(d.isf(1.0), 30.0, "isf(1) must be the lower bound");
+
+        // Interior quantiles stay inside the support and track scipy. This
+        // distribution is crushed against its lower edge -- scipy's median is
+        // 30.023070467827313 -- so a quantile that escaped upward would be far outside.
+        let median = d.ppf(0.5);
+        assert!(
+            (median - 30.023_070_467_827_313).abs() < 1e-6,
+            "ppf(0.5) = {median}, scipy gives 30.023070467827313"
+        );
+        for q in [1e-12, 0.25, 0.5, 0.75] {
+            let x = d.ppf(q);
+            assert!(
+                (30.0..=40.0).contains(&x),
+                "ppf({q}) = {x} escaped the support [30, 40]"
+            );
+        }
+
+        // MUST-MISS: on a benign support the same calls are not merely clamped to the
+        // bounds -- the interior is a real inversion, not the endpoint logic firing.
+        let benign = TruncNormal::new(-1.0, 2.0);
+        assert_eq!(benign.ppf(0.0), -1.0);
+        assert_eq!(benign.ppf(1.0), 2.0);
+        let mid = benign.ppf(0.5);
+        assert!(
+            (mid - 0.171_163_918_017_824_82).abs() < 1e-9,
+            "ppf(0.5) on [-1, 2] = {mid}, scipy gives 0.17116391801782482"
+        );
+        assert!(
+            mid > -1.0 && mid < 2.0,
+            "the interior quantile landed on a bound, so the test cannot tell the \
+             inversion from the clamp"
         );
     }
 
@@ -98441,5 +100739,868 @@ mod truncate_matches_scipy {
             t.mean()
         );
         assert!(t.var().is_nan());
+    }
+}
+
+#[cfg(test)]
+mod transforms_match_scipy {
+    use super::{
+        AbsOf, ContinuousDistribution, HalfNormal, LogOf, Lognormal, Normal, Uniform, abs_of,
+        exp_of, log_of,
+    };
+
+    /// `exp(X)`, `abs(X)`, `log(X)` against `scipy.stats.exp/abs/log`.
+    #[test]
+    fn pdf_cdf_sf_match_scipy() {
+        // exp(Normal()) -- x, pdf, cdf, ccdf
+        for (x, want_pdf, want_cdf, want_sf) in [
+            (
+                0.5,
+                6.274_960_771_159_244e-1,
+                2.441_085_957_855_827e-1,
+                7.558_914_042_144_173e-1,
+            ),
+            (1.0, 3.989_422_804_014_327e-1, 5.0e-1, 5.0e-1),
+            (
+                3.0,
+                7.272_825_613_999_470e-2,
+                8.640_313_923_585_756e-1,
+                1.359_686_076_414_244e-1,
+            ),
+        ] {
+            let y = exp_of(Normal::standard());
+            for (got, want, what) in [
+                (y.pdf(x), want_pdf, "pdf"),
+                (y.cdf(x), want_cdf, "cdf"),
+                (y.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(rel < 1e-12, "exp(Normal).{what}({x}) = {got}, scipy = {want}");
+            }
+        }
+
+        // abs(Normal()) -- the symmetric fold.
+        for (x, want_pdf, want_cdf, want_sf) in [
+            (
+                0.25,
+                7.733_362_336_056_985e-1,
+                1.974_126_513_658_474e-1,
+                8.025_873_486_341_526e-1,
+            ),
+            (
+                1.0,
+                4.839_414_490_382_867e-1,
+                6.826_894_921_370_859e-1,
+                3.173_105_078_629_141e-1,
+            ),
+            (
+                2.5,
+                3.505_660_098_713_708e-2,
+                9.875_806_693_484_477e-1,
+                1.241_933_065_155_226e-2,
+            ),
+        ] {
+            let y = abs_of(Normal::standard());
+            for (got, want, what) in [
+                (y.pdf(x), want_pdf, "pdf"),
+                (y.cdf(x), want_cdf, "cdf"),
+                (y.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(rel < 1e-12, "abs(Normal).{what}({x}) = {got}, scipy = {want}");
+            }
+        }
+
+        // abs of an ASYMMETRIC base -- the case where both folded halves carry
+        // different mass, so a fold that only doubled one side would pass the
+        // symmetric rows above and fail here.
+        for (x, want_pdf, want_cdf, want_sf) in [
+            (
+                0.25,
+                5.239_990_657_025_129e-1,
+                1.321_534_888_960_238e-1,
+                8.678_465_111_039_761e-1,
+            ),
+            (
+                1.0,
+                4.293_216_640_823_135e-1,
+                4.957_641_100_843_811e-1,
+                5.042_358_899_156_191e-1,
+            ),
+            (
+                3.0,
+                6.950_393_176_934_426e-2,
+                9.593_597_738_088_753e-1,
+                4.064_022_619_112_470e-2,
+            ),
+        ] {
+            let y = abs_of(Normal::new(0.7, 1.3));
+            for (got, want, what) in [
+                (y.pdf(x), want_pdf, "pdf"),
+                (y.cdf(x), want_cdf, "cdf"),
+                (y.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-12,
+                    "abs(Normal(0.7, 1.3)).{what}({x}) = {got}, scipy = {want}"
+                );
+            }
+        }
+
+        // log(Uniform(1, 4)) -- scipy.stats.Uniform(a=1, b=4) is loc=1, scale=3.
+        for (x, want_pdf, want_cdf, want_sf) in [
+            (
+                0.3,
+                4.499_529_358_586_677e-1,
+                1.166_196_025_253_344e-1,
+                8.833_803_974_746_656e-1,
+            ),
+            (
+                1.0,
+                9.060_939_428_196_817e-1,
+                5.727_606_094_863_483e-1,
+                4.272_393_905_136_516e-1,
+            ),
+            (
+                1.3,
+                1.223_098_889_206_415e0,
+                8.897_655_558_730_815e-1,
+                1.102_344_441_269_185e-1,
+            ),
+        ] {
+            let y = log_of(Uniform::new(1.0, 3.0));
+            for (got, want, what) in [
+                (y.pdf(x), want_pdf, "pdf"),
+                (y.cdf(x), want_cdf, "cdf"),
+                (y.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-12,
+                    "log(Uniform(1,4)).{what}({x}) = {got}, scipy = {want}"
+                );
+            }
+        }
+    }
+
+    /// CROSS-CHECK AGAINST SEPARATELY-WRITTEN CODE IN THIS TREE, which is worth
+    /// more than another golden: `Lognormal` and `HalfNormal` are concrete
+    /// implementations of exactly these two transforms, written independently of
+    /// the generic machinery. A wrong Jacobian, a dropped `1/y`, or a fold that
+    /// doubles instead of adding shows up here immediately and without SciPy.
+    #[test]
+    fn the_transforms_agree_with_the_concrete_distributions_they_reproduce() {
+        // exp(N(0,1)) is lognorm(s = 1, scale = 1).
+        let generic = exp_of(Normal::standard());
+        let concrete = Lognormal::new(1.0, 1.0);
+        for x in [0.05, 0.5, 1.0, 2.0, 7.5] {
+            for (g, c, what) in [
+                (generic.pdf(x), concrete.pdf(x), "pdf"),
+                (generic.cdf(x), concrete.cdf(x), "cdf"),
+                (generic.sf(x), concrete.sf(x), "sf"),
+            ] {
+                assert!(
+                    ((g - c) / c).abs() < 1e-12,
+                    "exp(Normal).{what}({x}) = {g} but Lognormal gives {c}"
+                );
+            }
+        }
+
+        // |N(0,1)| is the half-normal.
+        let folded = abs_of(Normal::standard());
+        let half = HalfNormal;
+        for x in [0.0, 0.3, 1.0, 2.0, 4.0] {
+            for (g, c, what) in [
+                (folded.pdf(x), half.pdf(x), "pdf"),
+                (folded.cdf(x), half.cdf(x), "cdf"),
+            ] {
+                assert!(
+                    (g - c).abs() < 1e-12,
+                    "abs(Normal).{what}({x}) = {g} but HalfNormal gives {c}"
+                );
+            }
+        }
+        // sf compared relatively, since it is the small one out in the tail --
+        // an absolute check there would pass on anything.
+        for x in [1.0, 3.0, 6.0] {
+            let (g, c) = (folded.sf(x), half.sf(x));
+            assert!(
+                ((g - c) / c).abs() < 1e-11,
+                "abs(Normal).sf({x}) = {g:e} but HalfNormal gives {c:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn moments_match_scipy() {
+        // Tolerance 1e-6 relative, and the reason is specific rather than
+        // defensive: these are quadratures of a BASE QUANTILE, so they inherit
+        // `Normal::ppf`'s ~3e-9 rational approximation, and exp(ppf(t)) in
+        // particular grows fast near t = 1 where the rule has fewest nodes. Still
+        // far tighter than a wrong Jacobian, which moves these by percent.
+        for (label, got_mean, got_var, want_mean, want_var) in [
+            (
+                "exp(Normal)",
+                exp_of(Normal::standard()).mean(),
+                exp_of(Normal::standard()).var(),
+                1.648_721_270_700_128e0,
+                4.670_774_270_471_607e0,
+            ),
+            (
+                "abs(Normal)",
+                abs_of(Normal::standard()).mean(),
+                abs_of(Normal::standard()).var(),
+                7.978_845_608_028_653e-1,
+                3.633_802_276_324_187e-1,
+            ),
+            (
+                "abs(Normal(0.7, 1.3))",
+                abs_of(Normal::new(0.7, 1.3)).mean(),
+                abs_of(Normal::new(0.7, 1.3)).var(),
+                1.184_089_942_312_417e0,
+                7.779_310_085_145_781e-1,
+            ),
+            (
+                "log(Uniform(1, 4))",
+                log_of(Uniform::new(1.0, 3.0)).mean(),
+                log_of(Uniform::new(1.0, 3.0)).var(),
+                8.483_924_814_931_875e-1,
+                1.458_613_085_898_641e-1,
+            ),
+        ] {
+            let rm = ((got_mean - want_mean) / want_mean).abs();
+            assert!(
+                rm < 1e-6,
+                "{label}.mean() = {got_mean}, scipy = {want_mean} (rel {rm:e})"
+            );
+            let rv = ((got_var - want_var) / want_var).abs();
+            assert!(
+                rv < 1e-6,
+                "{label}.var() = {got_var}, scipy = {want_var} (rel {rv:e})"
+            );
+        }
+    }
+
+    /// Identities that need no golden and hold for any base.
+    #[test]
+    fn structural_identities() {
+        let base = Normal::new(-0.4, 1.7);
+
+        // log(exp(X)) is X again. Composing the two inverse transforms is the
+        // sharpest check on the pair of Jacobians: they must cancel exactly.
+        let round_trip = log_of(exp_of(base));
+        for x in [-2.0, 0.0, 1.5] {
+            assert!(
+                (round_trip.cdf(x) - base.cdf(x)).abs() < 1e-13,
+                "log(exp(X)).cdf({x}) drifted from the base"
+            );
+            assert!(
+                ((round_trip.pdf(x) - base.pdf(x)) / base.pdf(x)).abs() < 1e-12,
+                "log(exp(X)).pdf({x}) drifted from the base"
+            );
+        }
+
+        // Monotone transforms move the quantile, not the probability.
+        let e = exp_of(base);
+        for p in [0.01, 0.5, 0.99] {
+            assert!(
+                (e.cdf(e.ppf(p)) - p).abs() < 1e-10,
+                "exp(X) ppf/cdf round trip at p={p}"
+            );
+            assert!(
+                (e.sf(e.isf(p)) - p).abs() < 1e-10,
+                "exp(X) isf/sf round trip at p={p}"
+            );
+        }
+
+        // The fold: cdf + sf = 1 with both sides computed independently, and the
+        // total mass of the two halves equals the base's whole mass.
+        let f = abs_of(base);
+        for y in [0.0, 0.5, 2.0, 6.0] {
+            assert!(
+                (f.cdf(y) + f.sf(y) - 1.0).abs() < 1e-12,
+                "abs(X) cdf+sf at {y}"
+            );
+        }
+        // |X| never takes a negative value.
+        assert_eq!(f.pdf(-0.5), 0.0);
+        assert_eq!(f.cdf(-0.5), 0.0);
+        assert_eq!(f.sf(-0.5), 1.0);
+
+        // logs agree with the logs of the values where those are representable.
+        for y in [0.3, 1.0, 3.0] {
+            assert!((f.logpdf(y) - f.pdf(y).ln()).abs() < 1e-10, "abs logpdf");
+            assert!((f.logsf(y) - f.sf(y).ln()).abs() < 1e-10, "abs logsf");
+            assert!((e.logpdf(y) - e.pdf(y).ln()).abs() < 1e-10, "exp logpdf");
+            assert!((e.logcdf(y) - e.cdf(y).ln()).abs() < 1e-10, "exp logcdf");
+        }
+
+        // exp(X) has support (0, inf).
+        assert_eq!(e.pdf(0.0), 0.0);
+        assert_eq!(e.cdf(0.0), 0.0);
+        assert_eq!(e.sf(0.0), 1.0);
+        assert_eq!(e.cdf(-1.0), 0.0);
+        assert!(e.pdf(f64::NAN).is_nan());
+        assert!(f.cdf(f64::NAN).is_nan());
+    }
+
+    /// `log` needs a non-negative support, and says so at construction rather
+    /// than returning NaN later. SciPy raises `NotImplementedError` from
+    /// `X.support()`; `ContinuousDistribution` has no support, so the equivalent
+    /// statement about where the mass is uses `cdf(0)`.
+    #[test]
+    #[should_panic(expected = "non-negative support")]
+    fn log_of_a_two_sided_distribution_panics() {
+        let _ = LogOf::new(Normal::standard());
+    }
+
+    #[test]
+    fn log_accepts_a_distribution_supported_on_the_positive_half_line() {
+        // Uniform(1, 4) starts above zero, so this must NOT panic.
+        let y = log_of(Uniform::new(1.0, 3.0));
+        assert!(y.pdf(0.5) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod goodness_of_fit_matches_scipy {
+    use super::{
+        ContinuousDistribution, GofStatistic, Normal, SeedableRng, gof_statistic,
+        goodness_of_fit,
+    };
+
+    /// A sample that really is normal, and one that visibly is not. Both arms are
+    /// needed: a statistic that returned a constant would pass either alone.
+    const NORMALISH: [f64; 20] = [
+        0.32, -1.15, 0.78, 2.01, -0.44, 1.33, -0.07, 0.95, -1.72, 0.51, 1.88, -0.63, 0.22,
+        -0.11, 1.04, 0.67, -1.29, 0.41, 1.55, -0.86,
+    ];
+    const SKEWED: [f64; 15] = [
+        0.05, 0.11, 0.19, 0.27, 0.38, 0.52, 0.71, 0.95, 1.28, 1.74, 2.4, 3.35, 4.8, 7.1, 11.2,
+    ];
+
+    /// The FIT first, on its own, so a mismatch below is attributable.
+    /// `scipy.stats.norm.fit` is the MLE with ddof = 0.
+    #[test]
+    fn the_normal_fit_matches_scipy_norm_fit() {
+        let f = Normal::try_fit(&NORMALISH).expect("normal fit");
+        assert!(
+            (f.loc - 0.269_999_999_999_999_96).abs() < 1e-15,
+            "loc = {}, scipy = 0.26999999999999996",
+            f.loc
+        );
+        assert!(
+            (f.scale - 1.029_572_726_911_508_7).abs() < 1e-15,
+            "scale = {}, scipy = 1.0295727269115087",
+            f.scale
+        );
+    }
+
+    /// The four statistics against `scipy.stats._fit`, evaluated at the SAME
+    /// fitted parameters so this tests the formulas and nothing else.
+    #[test]
+    fn the_four_statistics_match_scipy() {
+        // Fitted parameters supplied literally rather than via try_fit, so a fit
+        // regression cannot masquerade as a statistic regression.
+        let d = Normal::new(0.269_999_999_999_999_96, 1.029_572_726_911_508_7);
+        for (which, want, tol, why) in [
+            (
+                GofStatistic::AndersonDarling,
+                1.475_404_376_344_506_8e-1,
+                1e-12,
+                "logcdf/logsf are accurate for Normal",
+            ),
+            (
+                GofStatistic::KolmogorovSmirnov,
+                8.063_344_572_644_426e-2,
+                1e-12,
+                "cdf only",
+            ),
+            (
+                GofStatistic::CramerVonMises,
+                1.957_814_319_998_112e-2,
+                1e-12,
+                "cdf only",
+            ),
+            (
+                // Looser DELIBERATELY: Filliben is the only one that inverts the
+                // distribution, and `Normal::ppf` is a rational approximation good
+                // to ~3e-9, so nothing built on it can be tighter. Tightening this
+                // would be asserting against the approximation, not the formula.
+                GofStatistic::Filliben,
+                9.950_384_208_640_177e-1,
+                1e-8,
+                "goes through Normal::ppf",
+            ),
+        ] {
+            let got = gof_statistic(&d, &NORMALISH, which);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel < tol,
+                "{which:?} = {got:e}, scipy = {want:e} (rel {rel:e}; tol {tol:e} because {why})"
+            );
+        }
+
+        // Same four on the skewed fixture, whose fitted normal is a bad fit --
+        // so every distance is LARGER and the correlation is SMALLER. A statistic
+        // insensitive to the data would pass the block above and fail here.
+        let db = Normal::new(2.336_666_666_666_666_4, 3.061_408_535_661_685);
+        for (which, want, tol) in [
+            (GofStatistic::AndersonDarling, 1.523_851_273_486_347e0, 1e-12),
+            (GofStatistic::KolmogorovSmirnov, 2.439_308_121_399_081e-1, 1e-12),
+            (GofStatistic::CramerVonMises, 2.706_468_784_149_458e-1, 1e-12),
+            (GofStatistic::Filliben, 8.533_739_288_191_515e-1, 1e-8),
+        ] {
+            let got = gof_statistic(&db, &SKEWED, which);
+            let rel = ((got - want) / want).abs();
+            assert!(rel < tol, "skewed {which:?} = {got:e}, scipy = {want:e}");
+        }
+    }
+
+    /// The direction of Filliben's alternative, which is the one thing here that
+    /// can be confidently wrong rather than obviously wrong.
+    ///
+    /// Filliben is a CORRELATION: a good fit pushes it UP toward 1, where the other
+    /// three are distances pushed DOWN toward 0. So a bad fit must lower it, and
+    /// its p-value must come from the LOWER tail. If `alternative()` returned
+    /// "greater" for it, the statistic assertions above would all still pass and
+    /// the p-values would simply be reported the wrong way round.
+    #[test]
+    fn filliben_is_a_correlation_so_its_evidence_is_in_the_lower_tail() {
+        assert_eq!(GofStatistic::Filliben.alternative(), "less");
+        assert_eq!(GofStatistic::AndersonDarling.alternative(), "greater");
+        assert_eq!(GofStatistic::KolmogorovSmirnov.alternative(), "greater");
+        assert_eq!(GofStatistic::CramerVonMises.alternative(), "greater");
+
+        let good = Normal::new(0.269_999_999_999_999_96, 1.029_572_726_911_508_7);
+        let bad = Normal::new(2.336_666_666_666_666_4, 3.061_408_535_661_685);
+        let r_good = gof_statistic(&good, &NORMALISH, GofStatistic::Filliben);
+        let r_bad = gof_statistic(&bad, &SKEWED, GofStatistic::Filliben);
+        assert!(
+            r_bad < r_good,
+            "a bad fit must LOWER the probability-plot correlation: {r_bad} vs {r_good}"
+        );
+        // The other three move the opposite way on the same pair.
+        for which in [
+            GofStatistic::AndersonDarling,
+            GofStatistic::KolmogorovSmirnov,
+            GofStatistic::CramerVonMises,
+        ] {
+            assert!(
+                gof_statistic(&bad, &SKEWED, which) > gof_statistic(&good, &NORMALISH, which),
+                "{which:?} is a distance, so a bad fit must RAISE it"
+            );
+        }
+    }
+
+    /// The Monte Carlo p-value. Its exact value depends on the RNG, so this
+    /// asserts what is reproducible: a genuinely normal sample is not rejected,
+    /// and a visibly skewed one is — for all four statistics. That two-arm shape
+    /// is the point; a driver that always returned 1.0, or always 1/(n+1), would
+    /// pass one arm and fail the other.
+    ///
+    /// SciPy on the same fixtures (its own RNG, n_mc_samples = 999): normal
+    /// p = 0.98/0.969/0.978/0.991, skewed p = 0.001/0.014/0.001/0.002.
+    #[test]
+    fn the_monte_carlo_pvalue_separates_a_good_fit_from_a_bad_one() {
+        for which in [
+            GofStatistic::AndersonDarling,
+            GofStatistic::KolmogorovSmirnov,
+            GofStatistic::CramerVonMises,
+            GofStatistic::Filliben,
+        ] {
+            let good: super::GofOutcome<Normal> =
+                goodness_of_fit(&NORMALISH, which, 999, 20260818).expect("fit");
+            let bad: super::GofOutcome<Normal> =
+                goodness_of_fit(&SKEWED, which, 999, 20260818).expect("fit");
+
+            assert!(
+                (0.0..=1.0).contains(&good.pvalue) && (0.0..=1.0).contains(&bad.pvalue),
+                "{which:?}: p-values must be probabilities, got {} and {}",
+                good.pvalue,
+                bad.pvalue
+            );
+            assert_eq!(good.null_distribution.len(), 999);
+            assert_eq!(
+                good.failed_fits, 0,
+                "{which:?}: no resample of a normal fixture should fail to refit"
+            );
+            assert!(
+                good.pvalue > 0.20,
+                "{which:?}: a genuinely normal sample was rejected at p = {}",
+                good.pvalue
+            );
+            assert!(
+                bad.pvalue < 0.05,
+                "{which:?}: a visibly skewed sample was NOT rejected, p = {}",
+                bad.pvalue
+            );
+            // The smallest attainable p is 1/(n+1); anything below means the
+            // count or the denominator is wrong.
+            assert!(
+                bad.pvalue >= 1.0 / 1000.0,
+                "{which:?}: p = {} is below the 1/(n_mc+1) floor",
+                bad.pvalue
+            );
+        }
+    }
+
+    /// The null distribution must be REFIT per resample, not scored against the
+    /// original fit. Skipping the refit is the classic way to get an
+    /// anticonservative test, and it shows up as a null distribution that sits
+    /// systematically ABOVE the correctly-refit one for a distance statistic.
+    #[test]
+    fn the_null_is_built_by_refitting_each_resample() {
+        let res: super::GofOutcome<Normal> =
+            goodness_of_fit(&NORMALISH, GofStatistic::AndersonDarling, 499, 7).expect("fit");
+        let fitted = Normal::try_fit(&NORMALISH).expect("fit");
+        assert_eq!(res.fitted, fitted, "the reported fit is the null-hypothesis fit");
+
+        // Score the same statistic WITHOUT refitting, on samples from the null.
+        // The no-refit statistic is stochastically larger, because refitting
+        // absorbs some of each sample's deviation.
+        let mut no_refit = Vec::new();
+        let mut rng = super::StdRng::seed_from_u64(99);
+        for _ in 0..499 {
+            let sample = fitted.rvs(NORMALISH.len(), &mut rng);
+            no_refit.push(gof_statistic(&fitted, &sample, GofStatistic::AndersonDarling));
+        }
+        let mean_of = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let refit_mean = mean_of(&res.null_distribution);
+        let plain_mean = mean_of(&no_refit);
+        assert!(
+            plain_mean > refit_mean * 1.2,
+            "the refit null should sit well below the no-refit one \
+             (refit {refit_mean:.4}, no-refit {plain_mean:.4}); if they match, \
+             the resamples are probably not being refit"
+        );
+    }
+
+    /// A family with no `try_fit` returns an error instead of panicking, which is
+    /// the whole reason the driver uses `try_fit` rather than `fit`.
+    ///
+    /// `ExpOf<Normal>` is the example precisely because it is one of mine and has
+    /// no fit: the transform types do not implement MLE for the composed family,
+    /// so they exercise the trait default. My first draft used `HalfNormal`, which
+    /// turned out to override `try_fit` — the assertion would have been vacuous in
+    /// the opposite direction, passing only if the driver were broken.
+    #[test]
+    fn an_unfittable_family_is_an_error_not_a_panic() {
+        let res = goodness_of_fit::<super::ExpOf<Normal>>(
+            &NORMALISH,
+            GofStatistic::KolmogorovSmirnov,
+            9,
+            1,
+        );
+        assert!(
+            matches!(res, Err(super::FitError::NotImplemented { .. })),
+            "a family with no try_fit override must be Err(NotImplemented), not a panic"
+        );
+        // MUST-MISS control: a family that DOES implement it succeeds on the same
+        // call, so the error above is about the family and not about the driver.
+        let ok: Result<super::GofOutcome<super::HalfNormal>, _> = goodness_of_fit(
+            &[0.4, 0.9, 1.3, 0.2, 2.1, 0.7, 1.6],
+            GofStatistic::KolmogorovSmirnov,
+            9,
+            1,
+        );
+        assert!(ok.is_ok(), "HalfNormal does override try_fit, so this must succeed");
+    }
+
+    #[test]
+    fn degenerate_inputs() {
+        assert!(gof_statistic(&Normal::standard(), &[], GofStatistic::AndersonDarling).is_nan());
+        let empty: Result<super::GofOutcome<Normal>, _> =
+            goodness_of_fit(&[], GofStatistic::AndersonDarling, 99, 1);
+        assert!(empty.is_err(), "an empty sample cannot be fitted");
+    }
+}
+
+#[cfg(test)]
+mod truncnormal_renormaliser_is_not_a_cancelling_difference {
+    use super::{ContinuousDistribution, Normal, TruncNormal, standard_normal_cdf};
+
+    /// frankenscipy-45de1: every method of `TruncNormal` divided by `Φ(b) − Φ(a)`,
+    /// which is exactly ZERO on `[30, 40]`. The distribution was identically zero
+    /// across its own support.
+    #[test]
+    fn the_collapsed_interval_now_matches_scipy() {
+        // The premise, on the real arithmetic: the literal difference is STILL 0,
+        // so the fix is doing the work rather than the base cdf having improved.
+        assert_eq!(
+            standard_normal_cdf(40.0) - standard_normal_cdf(30.0),
+            0.0,
+            "premise: the textbook renormaliser is exactly zero here"
+        );
+
+        let d = TruncNormal::new(30.0, 40.0);
+        // x, scipy.stats.truncnorm pdf, sf
+        for (x, want_pdf, want_sf) in [
+            (30.5, 8.107_714_218_413_067e-6, 2.655_418_539_828_012e-7),
+            (32.0, 3.559_136_079_029_236e-26, 1.111_147_029_246_309e-27),
+            (35.0, 8.030_621_584_304_054e-70, 2.292_594_846_926_951e-71),
+        ] {
+            for (got, want, what) in [(d.pdf(x), want_pdf, "pdf"), (d.sf(x), want_sf, "sf")] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-9,
+                    "TruncNormal(30, 40).{what}({x}) = {got:e}, scipy = {want:e}"
+                );
+            }
+        }
+        // The moments divide by the same mass, so they were broken too.
+        let (m, v) = (d.mean(), d.var());
+        assert!(
+            ((m - 3.003_325_966_743_637e1) / 3.003_325_966_743_637e1).abs() < 1e-9,
+            "mean = {m}, scipy = 30.033259667436372"
+        );
+        assert!(
+            ((v - 1.103_771_430_859_046e-3) / 1.103_771_430_859_046e-3).abs() < 1e-7,
+            "var = {v}, scipy = 0.0011037714308590463"
+        );
+    }
+
+    /// REGRESSION GUARD, and the more important half: benign intervals must be
+    /// UNCHANGED. A fix that repaired the extreme case while perturbing ordinary
+    /// use would be a worse defect than the one it closed.
+    #[test]
+    fn ordinary_intervals_are_unchanged_and_still_match_scipy() {
+        for (a, b, x, want_pdf, want_cdf, want_sf) in [
+            (
+                -1.0,
+                2.0,
+                -0.25,
+                4.723_560_479_546_409e-1,
+                2.964_085_228_515_105e-1,
+                7.035_914_771_484_896e-1,
+            ),
+            (
+                5.0,
+                10.0,
+                6.25,
+                4.583_968_647_168_819e-3,
+                9.992_840_564_551_017e-1,
+                7.159_435_448_983_936e-4,
+            ),
+        ] {
+            let d = TruncNormal::new(a, b);
+            for (got, want, what) in [
+                (d.pdf(x), want_pdf, "pdf"),
+                (d.cdf(x), want_cdf, "cdf"),
+                (d.sf(x), want_sf, "sf"),
+            ] {
+                let rel = ((got - want) / want).abs();
+                assert!(
+                    rel < 1e-11,
+                    "TruncNormal({a}, {b}).{what}({x}) = {got:e}, scipy = {want:e}"
+                );
+            }
+            // cdf and sf are now computed independently; they must still close.
+            assert!((d.cdf(x) + d.sf(x) - 1.0).abs() < 1e-12);
+            // Support edges.
+            assert_eq!(d.cdf(a), 0.0);
+            assert_eq!(d.cdf(b), 1.0);
+            assert_eq!(d.sf(a), 1.0);
+            assert_eq!(d.sf(b), 0.0);
+            assert_eq!(d.pdf(a - 1.0), 0.0);
+        }
+
+        // `[5, 10]` is where the two forms first visibly part -- the survival side
+        // is the correct one and the naive one is already wrong at the 10th digit.
+        // Pinning the direction, so a future "simplification" back to the plain
+        // subtraction is caught here rather than out in the tail.
+        let naive = standard_normal_cdf(10.0) - standard_normal_cdf(5.0);
+        let kept = Normal::standard().sf(5.0) - Normal::standard().sf(10.0);
+        assert_ne!(
+            naive.to_bits(),
+            kept.to_bits(),
+            "the two renormalisers should still differ on [5, 10]"
+        );
+        assert!(
+            ((kept - 2.866_515_718_791_933e-7) / 2.866_515_718_791_933e-7).abs() < 1e-13,
+            "the survival-side mass is the one scipy agrees with, got {kept:e}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod histogram_distribution_matches_scipy {
+    use super::{ContinuousDistribution, HistogramDistribution};
+
+    const COUNTS: [f64; 3] = [2.0, 5.0, 3.0];
+    /// NON-uniform widths 1, 2, 1 — the only shape where `density` changes the answer.
+    const WIDE: [f64; 4] = [0.0, 1.0, 3.0, 4.0];
+    /// Uniform widths, where both readings of the counts agree.
+    const EVEN: [f64; 4] = [0.0, 1.0, 2.0, 3.0];
+
+    /// `scipy.stats.rv_histogram((counts, edges), density=True)`.
+    #[test]
+    fn density_true_matches_scipy() {
+        let h = HistogramDistribution::new(&COUNTS, &WIDE, true).expect("valid histogram");
+        // x, pdf, cdf, sf
+        for (x, p, c, s) in [
+            (
+                0.5,
+                0.133_333_333_333_333_33,
+                0.066_666_666_666_666_666,
+                0.933_333_333_333_333_35,
+            ),
+            (
+                2.0,
+                0.333_333_333_333_333_31,
+                0.466_666_666_666_666_67,
+                0.533_333_333_333_333_33,
+            ),
+            (
+                3.5,
+                0.200_000_000_000_000_01,
+                0.899_999_999_999_999_91,
+                0.100_000_000_000_000_09,
+            ),
+        ] {
+            for (got, want, what) in [(h.pdf(x), p, "pdf"), (h.cdf(x), c, "cdf"), (h.sf(x), s, "sf")]
+            {
+                assert!(
+                    ((got - want) / want).abs() < 1e-14,
+                    "{what}({x}) = {got}, scipy = {want}"
+                );
+            }
+            // cdf and sf are accumulated in OPPOSITE directions, so this is a
+            // real constraint rather than an identity of the implementation.
+            assert!((h.cdf(x) + h.sf(x) - 1.0).abs() < 1e-15, "cdf+sf at {x}");
+        }
+        for (q, want_ppf, want_isf) in [
+            (0.05, 0.375, 3.75),
+            (0.5, 2.100_000_000_000_000_1, 2.1),
+            (0.95, 3.75, 0.375_000_000_000_000_33),
+        ] {
+            assert!(
+                (h.ppf(q) - want_ppf).abs() < 1e-13,
+                "ppf({q}) = {}, scipy = {want_ppf}",
+                h.ppf(q)
+            );
+            assert!(
+                (h.isf(q) - want_isf).abs() < 1e-13,
+                "isf({q}) = {}, scipy = {want_isf}",
+                h.isf(q)
+            );
+        }
+        assert!((h.mean() - 2.1).abs() < 1e-14, "mean = {}", h.mean());
+        assert!(
+            (h.var() - 0.989_999_999_999_999_3).abs() < 1e-13,
+            "var = {}",
+            h.var()
+        );
+        assert!(
+            (h.entropy() - 1.322_949_511_004_528_6).abs() < 1e-13,
+            "entropy = {}",
+            h.entropy()
+        );
+    }
+
+    /// The `density` flag is the point of this test: the SAME counts and edges
+    /// give different answers, and scipy only guesses (with a warning) which was
+    /// meant. If the flag were ignored, one of these two blocks would fail.
+    #[test]
+    fn density_false_reads_the_counts_as_frequencies() {
+        let f = HistogramDistribution::new(&COUNTS, &WIDE, false).expect("valid histogram");
+        assert!((f.pdf(0.5) - 0.2).abs() < 1e-15, "pdf(0.5) = {}", f.pdf(0.5));
+        assert!((f.pdf(2.0) - 0.25).abs() < 1e-15, "pdf(2.0) = {}", f.pdf(2.0));
+        assert!(
+            (f.cdf(2.0) - 0.449_999_999_999_999_96).abs() < 1e-15,
+            "cdf(2.0) = {}",
+            f.cdf(2.0)
+        );
+        assert!((f.mean() - 2.15).abs() < 1e-14, "mean = {}", f.mean());
+        assert!(
+            (f.var() - 1.310_833_333_333_332_2).abs() < 1e-13,
+            "var = {}",
+            f.var()
+        );
+
+        // MUST-MISS control: with UNIFORM widths the flag makes no difference, so
+        // a test that only ever used even bins could not detect it being ignored.
+        let a = HistogramDistribution::new(&COUNTS, &EVEN, true).expect("valid");
+        let b = HistogramDistribution::new(&COUNTS, &EVEN, false).expect("valid");
+        for x in [0.5, 1.5, 2.5] {
+            assert_eq!(
+                a.pdf(x).to_bits(),
+                b.pdf(x).to_bits(),
+                "uniform bins must be insensitive to `density` at {x}"
+            );
+        }
+        // And that even-bin case against scipy.
+        assert!((b.pdf(1.5) - 0.5).abs() < 1e-15);
+        assert!((b.cdf(1.5) - 0.449_999_999_999_999_96).abs() < 1e-15);
+        assert!((b.sf(1.5) - 0.55).abs() < 1e-15);
+        assert!((b.mean() - 1.6).abs() < 1e-14);
+        assert!((b.var() - 0.573_333_333_333_332_8).abs() < 1e-13);
+        assert!((b.ppf(0.5) - 1.6).abs() < 1e-13);
+        assert!((b.entropy() - 1.029_653_014_064_573_7).abs() < 1e-13);
+    }
+
+    #[test]
+    fn empty_bins_support_edges_and_round_trips() {
+        // A zero-count bin has no interior to interpolate into.
+        let z = HistogramDistribution::new(&[2.0, 0.0, 3.0], &EVEN, false).expect("valid");
+        assert_eq!(z.pdf(1.5), 0.0);
+        assert!((z.cdf(1.5) - 0.4).abs() < 1e-15);
+        assert!((z.ppf(0.4) - 2.0).abs() < 1e-15, "ppf(0.4) = {}", z.ppf(0.4));
+
+        let h = HistogramDistribution::new(&COUNTS, &WIDE, true).expect("valid");
+        assert_eq!(h.support(), (0.0, 4.0));
+        // Outside and at the support edges.
+        assert_eq!(h.pdf(-1.0), 0.0);
+        assert_eq!(h.pdf(5.0), 0.0);
+        assert_eq!(h.cdf(0.0), 0.0);
+        assert_eq!(h.cdf(4.0), 1.0);
+        assert_eq!(h.sf(0.0), 1.0);
+        assert_eq!(h.sf(4.0), 0.0);
+        assert_eq!(h.ppf(0.0), 0.0);
+        assert_eq!(h.ppf(1.0), 4.0);
+        assert_eq!(h.isf(0.0), 4.0);
+        assert_eq!(h.isf(1.0), 0.0);
+        assert!(h.pdf(f64::NAN).is_nan());
+        assert!(h.cdf(f64::NAN).is_nan());
+        assert!(h.ppf(-0.1).is_nan());
+        assert!(h.isf(1.1).is_nan());
+
+        // ppf inverts cdf, and isf inverts sf, exactly enough to round trip.
+        for q in [0.01, 0.3, 0.5, 0.77, 0.99] {
+            assert!((h.cdf(h.ppf(q)) - q).abs() < 1e-13, "ppf/cdf round trip at {q}");
+            assert!((h.sf(h.isf(q)) - q).abs() < 1e-13, "isf/sf round trip at {q}");
+        }
+    }
+
+    #[test]
+    fn malformed_input_is_rejected() {
+        assert!(HistogramDistribution::new(&[], &[0.0], true).is_err(), "no bins");
+        assert!(
+            HistogramDistribution::new(&COUNTS, &[0.0, 1.0, 2.0], true).is_err(),
+            "needs one more edge than counts"
+        );
+        assert!(
+            HistogramDistribution::new(&[1.0, -1.0, 1.0], &EVEN, true).is_err(),
+            "negative count"
+        );
+        assert!(
+            HistogramDistribution::new(&[1.0, f64::NAN, 1.0], &EVEN, true).is_err(),
+            "non-finite count"
+        );
+        assert!(
+            HistogramDistribution::new(&COUNTS, &[0.0, 2.0, 1.0, 3.0], true).is_err(),
+            "edges must ascend"
+        );
+        assert!(
+            HistogramDistribution::new(&COUNTS, &[0.0, 1.0, 1.0, 3.0], true).is_err(),
+            "zero-width bin"
+        );
+        assert!(
+            HistogramDistribution::new(&[0.0, 0.0, 0.0], &EVEN, true).is_err(),
+            "no mass at all"
+        );
+        // MUST-MISS control: the well-formed input these are contrasted with.
+        assert!(HistogramDistribution::new(&COUNTS, &EVEN, true).is_ok());
     }
 }

@@ -1300,6 +1300,125 @@ where
     nonlin_solve(func, x0, &mut j, options)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// root(method=...) dispatch for the nonlin family
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The multivariate root methods `scipy.optimize.root` reaches by name.
+///
+/// Our existing `RootMethod` in `types.rs` covers the SCALAR bracketing and Newton
+/// methods only. These are the vector-valued ones, and they are a separate axis rather
+/// than more variants of the same enum: they take a vector residual, they are driven by
+/// [`nonlin_solve`], and none of them brackets anything.
+///
+/// `hybr` and `lm` are absent deliberately -- they are MINPACK ports rather than members
+/// of this family, and pretending they belong here by name while dispatching elsewhere
+/// would misrepresent what the caller gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NonlinMethod {
+    /// Broyden's good method on the low-rank representation. SciPy's `broyden1`.
+    #[default]
+    Broyden1,
+    /// Broyden's bad method. SciPy's `broyden2`.
+    Broyden2,
+    /// Anderson mixing. SciPy's `anderson`.
+    Anderson,
+    /// Scalar Jacobian. SciPy's `linearmixing`.
+    LinearMixing,
+    /// Diagonal Broyden. SciPy's `diagbroyden`.
+    DiagBroyden,
+    /// Adaptive diagonal steps. SciPy's `excitingmixing`.
+    ExcitingMixing,
+    /// Matrix-free Newton-Krylov. SciPy's `krylov`.
+    Krylov,
+}
+
+impl NonlinMethod {
+    /// Parse SciPy's spelling, case-insensitively.
+    ///
+    /// Accepts the names `scipy.optimize.root` accepts for this family and nothing
+    /// else. Returning `None` for `hybr` and `lm` is deliberate: they are real SciPy
+    /// methods that this dispatch does not provide, and silently substituting a
+    /// different method would be worse than refusing the name.
+    #[must_use]
+    pub fn from_scipy_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "broyden1" => Some(Self::Broyden1),
+            "broyden2" => Some(Self::Broyden2),
+            "anderson" => Some(Self::Anderson),
+            "linearmixing" => Some(Self::LinearMixing),
+            "diagbroyden" => Some(Self::DiagBroyden),
+            "excitingmixing" => Some(Self::ExcitingMixing),
+            "krylov" => Some(Self::Krylov),
+            _ => None,
+        }
+    }
+
+    /// SciPy's spelling of this method.
+    #[must_use]
+    pub fn scipy_name(self) -> &'static str {
+        match self {
+            Self::Broyden1 => "broyden1",
+            Self::Broyden2 => "broyden2",
+            Self::Anderson => "anderson",
+            Self::LinearMixing => "linearmixing",
+            Self::DiagBroyden => "diagbroyden",
+            Self::ExcitingMixing => "excitingmixing",
+            Self::Krylov => "krylov",
+        }
+    }
+}
+
+/// Solve `F(x) = 0` by name -- the `scipy.optimize.root` entry point for this family.
+///
+/// Every method shares [`nonlin_solve`], so they differ only in the Jacobian
+/// approximation handed to it. That is the point of having built the driver: adding a
+/// method here costs one match arm rather than another Newton loop.
+///
+/// The `Krylov` arm has to construct its Jacobian around a BORROW of `func`, because a
+/// `KrylovJacobian` owns its residual function while the others do not. That is why this
+/// takes `func` by reference and the arm passes `&func` rather than moving it.
+pub fn root_nonlin<F>(
+    func: F,
+    x0: &[f64],
+    method: NonlinMethod,
+    options: NonlinOptions,
+) -> NonlinResult
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    match method {
+        NonlinMethod::Broyden1 => {
+            let mut j = BroydenJacobian::first();
+            nonlin_solve(&func, x0, &mut j, options)
+        }
+        NonlinMethod::Broyden2 => {
+            let mut j = BroydenJacobian::second();
+            nonlin_solve(&func, x0, &mut j, options)
+        }
+        NonlinMethod::Anderson => {
+            let mut j = AndersonJacobian::new(None, None, None);
+            nonlin_solve(&func, x0, &mut j, options)
+        }
+        NonlinMethod::LinearMixing => {
+            let mut j = LinearMixingJacobian::new(None);
+            nonlin_solve(&func, x0, &mut j, options)
+        }
+        NonlinMethod::DiagBroyden => {
+            let mut j = DiagBroydenJacobian::new(None);
+            nonlin_solve(&func, x0, &mut j, options)
+        }
+        NonlinMethod::ExcitingMixing => {
+            let mut j = ExcitingMixingJacobian::new(None, None);
+            nonlin_solve(&func, x0, &mut j, options)
+        }
+        NonlinMethod::Krylov => {
+            let mut j = KrylovJacobian::with_defaults(&func);
+            nonlin_solve(&func, x0, &mut j, options)
+        }
+    }
+}
+
 #[cfg(test)]
 mod nonlin_tests {
     use super::{
@@ -1916,6 +2035,245 @@ mod nonlin_tests {
                  reduction"
             );
         }
+    }
+
+    // ── nonlin_solve driver and dispatch ────────────────────────────────────
+
+    use super::{
+        LineSearch, NonlinMethod, NonlinOptions, NonlinResult, nonlin_solve, root_nonlin,
+    };
+
+    /// A well-behaved nonlinear system with a known root, used to check that the
+    /// DRIVER converges rather than that any particular Jacobian is clever.
+    /// `x_i^2 = i + 1` with a weak coupling term, root near `sqrt(i + 1)`.
+    fn solvable(x: &[f64]) -> Vec<f64> {
+        let n = x.len();
+        (0..n)
+            .map(|i| x[i] * x[i] - (i as f64 + 1.0) + 0.05 * x[(i + 1) % n])
+            .collect()
+    }
+
+    /// Every dispatchable method must actually solve a solvable system. This is the
+    /// test that would catch a Jacobian wired into the driver backwards -- each one
+    /// converges on its own or the arm is broken, regardless of how the others do.
+    #[test]
+    fn every_dispatched_method_solves_a_solvable_system() {
+        let x0 = vec![1.0, 1.0, 1.0, 1.0];
+        let opts = NonlinOptions {
+            f_tol: 1e-8,
+            maxiter: Some(400),
+            ..NonlinOptions::default()
+        };
+        for method in [
+            NonlinMethod::Broyden1,
+            NonlinMethod::Broyden2,
+            NonlinMethod::Anderson,
+            NonlinMethod::LinearMixing,
+            NonlinMethod::DiagBroyden,
+            NonlinMethod::ExcitingMixing,
+            NonlinMethod::Krylov,
+        ] {
+            let r: NonlinResult = root_nonlin(solvable, &x0, method, opts);
+            let resid = r.fun.iter().fold(0.0_f64, |a, b| a.max(b.abs()));
+            assert!(
+                resid < 1e-6,
+                "{} did not solve the system: residual {resid}, success={}, iters={}",
+                method.scipy_name(),
+                r.success,
+                r.iterations
+            );
+            assert!(
+                r.function_calls > 0,
+                "{} reported zero function calls",
+                method.scipy_name()
+            );
+        }
+    }
+
+    /// A starting point that already satisfies the tolerance must cost ZERO iterations,
+    /// and one that does not must cost at least one. The condition is checked before the
+    /// step, and `dx` starts at infinity so the step-size clauses cannot pass vacuously
+    /// on the first pass -- a mistake that would make every solve terminate immediately.
+    #[test]
+    fn an_already_converged_start_costs_no_iterations() {
+        let opts = NonlinOptions {
+            f_tol: 1e-8,
+            ..NonlinOptions::default()
+        };
+        let zero = |_: &[f64]| vec![0.0, 0.0];
+        let mut j = LinearMixingJacobian::new(Some(0.5));
+        let r = nonlin_solve(zero, &[1.0, 2.0], &mut j, opts);
+        assert_eq!(r.iterations, 0, "a converged start still iterated");
+        assert!(r.success, "a converged start was not reported as success");
+
+        // MUST-MISS: a genuine problem does iterate, so the check above is about the
+        // starting point and not about the driver refusing to run at all.
+        let mut j2 = DiagBroydenJacobian::new(Some(0.5));
+        let r2 = nonlin_solve(solvable, &[1.0, 1.0, 1.0, 1.0], &mut j2, opts);
+        assert!(r2.iterations > 0, "the driver never iterated on a real problem");
+    }
+
+    /// The iteration cap is honoured and reported as a failure rather than as a
+    /// success with a bad answer -- the distinction a caller acts on.
+    #[test]
+    fn hitting_the_iteration_cap_reports_failure() {
+        let opts = NonlinOptions {
+            f_tol: 1e-14,
+            maxiter: Some(2),
+            ..NonlinOptions::default()
+        };
+        let mut j = LinearMixingJacobian::new(Some(0.01));
+        let r = nonlin_solve(solvable, &[5.0, 5.0, 5.0, 5.0], &mut j, opts);
+        assert!(!r.success, "hitting the cap was reported as success");
+        assert_eq!(r.iterations, 2, "the cap was not honoured");
+        assert!(
+            r.message.contains("maximum number of iterations"),
+            "unhelpful message: {}",
+            r.message
+        );
+    }
+
+    /// The Armijo search must cost extra residual evaluations relative to taking the
+    /// full step, and must not change the answer on a problem both settings solve. If
+    /// the counts matched, the line search would not be running at all.
+    #[test]
+    fn the_line_search_costs_evaluations_and_is_actually_running() {
+        let x0 = vec![3.0, 3.0, 3.0, 3.0];
+        let base = NonlinOptions {
+            f_tol: 1e-9,
+            maxiter: Some(200),
+            ..NonlinOptions::default()
+        };
+
+        let mut j1 = BroydenJacobian::first();
+        let with = nonlin_solve(
+            solvable,
+            &x0,
+            &mut j1,
+            NonlinOptions {
+                line_search: LineSearch::Armijo,
+                ..base
+            },
+        );
+        let mut j2 = BroydenJacobian::first();
+        let without = nonlin_solve(
+            solvable,
+            &x0,
+            &mut j2,
+            NonlinOptions {
+                line_search: LineSearch::None,
+                ..base
+            },
+        );
+
+        assert!(with.success && without.success, "both settings should solve this");
+        assert!(
+            with.function_calls != without.function_calls,
+            "the two line-search settings consumed identical evaluations ({}); the \
+             search is not running",
+            with.function_calls
+        );
+        // Same root, whichever path got there.
+        let d = max_diff(&with.x, &without.x);
+        assert!(d < 1e-5, "the two settings converged to different points ({d})");
+    }
+
+    /// Name parsing accepts exactly SciPy's spellings for this family and refuses the
+    /// ones it does not implement, rather than silently substituting a method.
+    #[test]
+    fn scipy_names_round_trip_and_unsupported_ones_are_refused() {
+        for m in [
+            NonlinMethod::Broyden1,
+            NonlinMethod::Broyden2,
+            NonlinMethod::Anderson,
+            NonlinMethod::LinearMixing,
+            NonlinMethod::DiagBroyden,
+            NonlinMethod::ExcitingMixing,
+            NonlinMethod::Krylov,
+        ] {
+            assert_eq!(
+                NonlinMethod::from_scipy_name(m.scipy_name()),
+                Some(m),
+                "{} does not round-trip",
+                m.scipy_name()
+            );
+            assert_eq!(
+                NonlinMethod::from_scipy_name(&m.scipy_name().to_uppercase()),
+                Some(m),
+                "{} is not matched case-insensitively",
+                m.scipy_name()
+            );
+        }
+        // MUST-MISS: real SciPy methods this dispatch does NOT provide are refused
+        // rather than mapped to something else.
+        for absent in ["hybr", "lm", "df-sane", "", "broyden3"] {
+            assert_eq!(
+                NonlinMethod::from_scipy_name(absent),
+                None,
+                "{absent} was accepted but is not provided here"
+            );
+        }
+    }
+
+    /// The augmentation must ADD to the inner iteration budget rather than consume it.
+    ///
+    /// This is the defect the large-n sweep measured: with `inner_maxiter = 20` and a
+    /// full `outer_k = 10` augmentation, spending the budget on the augmentation leaves
+    /// 10 Krylov directions where SciPy builds 30, and the shortfall grows exactly as
+    /// the augmentation fills. Counted rather than timed, so it is deterministic and a
+    /// contended host cannot obscure it.
+    #[test]
+    fn augmentation_adds_to_the_inner_budget_rather_than_consuming_it() {
+        let n = 24;
+        // A linear residual, so the operator is constant and the only thing that varies
+        // between the two measurements below is the size of the augmentation.
+        let amul = |x: &[f64]| -> Vec<f64> {
+            (0..n)
+                .map(|i| 4.0 * x[i] - x[(i + 1) % n] - 0.5 * x[(i + n - 1) % n])
+                .collect()
+        };
+        let inner_maxiter = 6;
+        let x0 = vec![0.0; n];
+        let f0 = amul(&x0);
+        let rhs = pseudo(1717, n);
+
+        // No augmentation yet: at most `inner_maxiter` products.
+        let mut j = KrylovJacobian::new(amul, None, inner_maxiter, 4);
+        j.setup(&x0, &f0);
+        let before = j.function_evaluations();
+        // A tolerance of zero prevents an early exit from truncating the count, so the
+        // budget is what bounds it.
+        j.solve(&rhs, 0.0, InnerMethod::Lgmres);
+        let plain = j.function_evaluations() - before;
+        assert!(
+            plain <= inner_maxiter,
+            "a solve with no augmentation used {plain} products, over the budget of \
+             {inner_maxiter}"
+        );
+
+        // Build the augmentation up, then measure a solve with it in hand.
+        for _ in 0..4 {
+            j.solve(&rhs, 0.0, InnerMethod::Lgmres);
+        }
+        let k = j.augmentation_rank();
+        assert!(k > 0, "no augmentation accumulated, so the comparison is empty");
+        let mid = j.function_evaluations();
+        j.solve(&rhs, 0.0, InnerMethod::Lgmres);
+        let augmented = j.function_evaluations() - mid;
+
+        // MUST-HIT: the augmented solve does strictly MORE work, not the same amount
+        // redistributed.
+        assert!(
+            augmented > plain,
+            "an augmented solve used {augmented} products against {plain} unaugmented; \
+             the augmentation is being taken out of the Krylov budget instead of added \
+             to it -- the defect measured at large n"
+        );
+        assert!(
+            augmented <= inner_maxiter + k,
+            "an augmented solve used {augmented} products, over the budget of \
+             {inner_maxiter} + {k}"
+        );
     }
 
     // ── Mixing and Anderson Jacobians ───────────────────────────────────────
@@ -3151,14 +3509,33 @@ where
         dx
     }
 
-    /// Generalised conjugate residual, optionally seeded with augmentation directions.
+    /// Generalised conjugate residual over the augmented subspace.
     ///
-    /// GCR rather than an Arnoldi GMRES because augmentation drops straight in: a
-    /// direction is a direction, whether it came from the current Krylov sequence or
-    /// from a previous Newton step, so the augmented subspace needs no special basis
-    /// bookkeeping. Over the same subspace GCR minimises the same residual GMRES does.
+    /// The augmented subspace is `span(outer_v) + K_m(A, r0)`, and TWO details of how
+    /// SciPy builds it were measured to matter; both were wrong here before and the
+    /// ledger has the cost curve.
     ///
-    /// The paired update is what keeps it honest: whenever `A z` is orthogonalised
+    /// # The augmentation ADDS to the iteration budget
+    ///
+    /// `_fgmres` opens with `m = m + len(outer_v)`. The augmentation directions are
+    /// extra work, not a substitute for Krylov work. Spending the budget on them
+    /// instead -- which is what a plain `for j in 0..inner_maxiter` does -- leaves
+    /// `inner_maxiter - k` Krylov directions, so with the defaults `inner_maxiter = 20`
+    /// and `outer_k = 10` the subspace collapses from 30 directions to 10 once the
+    /// augmentation fills. The shortfall grows precisely as the augmentation fills,
+    /// which is why the measured deficit grew with problem size rather than sitting at
+    /// a constant factor.
+    ///
+    /// # The Krylov directions come from the BASIS, not from the running residual
+    ///
+    /// After the augmentation vectors, SciPy takes `z = v0` once and then `z = vs[-1]`
+    /// -- the most recent orthonormal basis vector of the image space. Seeding from the
+    /// current residual instead is ORTHODIR: it spans the same space in exact
+    /// arithmetic, but it reseeds from a vector that has already been reduced by the
+    /// augmentation corrections, so the Krylov part explores a smaller space than
+    /// `K_m(A, r0)` and loses orthogonality faster.
+    ///
+    /// The paired update is what keeps the rest honest: whenever `A z` is orthogonalised
     /// against an earlier image, the SAME coefficient is applied to `z`, so the stored
     /// pair always satisfies `q_j = A z_j` exactly and the residual bookkeeping stays
     /// consistent with the operator.
@@ -3175,15 +3552,31 @@ where
         let mut zs: Vec<Vec<f64>> = Vec::new();
         let mut qs: Vec<Vec<f64>> = Vec::new();
 
-        for j in 0..self.inner_maxiter {
-            // Seed with an augmentation direction while any remain, then fall back to
-            // the current residual -- the ordinary Krylov choice.
+        // The original residual direction, kept because the Krylov part must be seeded
+        // from it rather than from the residual as it stands after the augmentation
+        // corrections have been applied.
+        let v0 = r.clone();
+        // `m = m + len(outer_v)`: the augmentation is additional work, not a substitute
+        // for Krylov work.
+        let budget = self.inner_maxiter + augment.len();
+
+        for j in 0..budget {
             let mut z = if j < augment.len() {
                 augment[j].clone()
+            } else if j == augment.len() {
+                v0.clone()
             } else {
-                r.clone()
+                // The last orthonormal image-space vector -- SciPy's `vs[-1]`. Falling
+                // back to `v0` only if nothing has been stored, which cannot happen
+                // once j exceeds the augmentation count but keeps the index total.
+                qs.last().cloned().unwrap_or_else(|| v0.clone())
             };
             let mut w = self.matvec(&z);
+            // Magnitude BEFORE orthogonalisation: the breakdown test below is relative
+            // to it, because what matters is how much of `w` survived, not its absolute
+            // size. An absolute floor would fire on every direction of a small-scale
+            // problem and on none of a large-scale one.
+            let w_norm0 = norm(&w);
 
             // Modified Gram-Schmidt against the previous images, applying every
             // coefficient to `z` as well so the pair stays exact.
@@ -3198,10 +3591,18 @@ where
                     }
                 }
             }
+            // SciPy's `if not (hcur[-1] > eps * w_norm)` -- a direction that is
+            // almost entirely explained by the existing basis contributes nothing, and
+            // normalising what is left would amplify rounding noise into the solution.
+            // This fires in practice: repeated solves of the same system produce
+            // identical augmentation directions, so every one after the first is
+            // already in the space.
             let nw = norm(&w);
-            if nw == 0.0 || !nw.is_finite() {
-                // The direction added nothing; with an augmentation seed that just means
-                // it was already in the space, so continue rather than give up.
+            if !(nw > f64::EPSILON * w_norm0) || !nw.is_finite() {
+                // An augmentation direction that lies in the space already contributes
+                // nothing; skip it and keep going, since the Krylov directions after it
+                // are still worth building. A Krylov direction that collapses means the
+                // space is exhausted, which is a genuine stop.
                 if j < augment.len() {
                     continue;
                 }

@@ -36454,3 +36454,174 @@ this up needs a quiet window: re-run `drive3.sh`, and reject the result unless p
 loadavg is stable across the whole run rather than merely low at the start. Note that the
 Newton-Krylov COUNTED metric (nfev) would survive a contended window unharmed — counts
 are deterministic — so if only the counts are wanted, contention is not a reason to wait.
+
+## Large-n follow-up, load-independent metrics only — Broyden parity HOLDS, Newton-Krylov step quality DEGRADES
+
+2026-08-18, re-run after the contended attempt above was discarded. Host was NOT quiet
+(loadavg 54.9–106.4 across the run, CPU idle 42–63%, iowait 1–15%, MHz 3872–4057), so
+this run deliberately collected ONLY metrics that a contended host cannot corrupt:
+deterministic evaluation counts and exact residual values. No wall-clock ratio was taken
+and none is reported. Same binaries, sha-verified byte-identical to the banked rows.
+Determinism confirmed by two independent passes returning identical counts.
+
+### Broyden: exact parity extends to n = 32768
+
+| n | fsci final residual | scipy final residual | rel diff |
+|---|---|---|---|
+| 8192 | 5.327782e0 | 5.327782e+00 | 0.00e+00 |
+| 16384 | 7.271271e0 | 7.271271e+00 | 0.00e+00 |
+| 32768 | 1.058844e1 | 1.058844e+01 | 0.00e+00 |
+
+Parity now holds to every printed digit across n = 64 … 32768, a 512x range.
+
+### Newton-Krylov: OUR DEFICIT GROWS WITH n AND BECOMES A CONVERGENCE FAILURE
+
+| n | fsci LGMRES nfev / Newton | scipy nfev / Newton | our evaluation cost | outcome |
+|---|---|---|---|---|
+| 6400 | 358 / 17 | 277 / 8 | 1.29x | both converge |
+| 9216 | 526 / 25 | 356 / 10 | 1.48x | both converge |
+| 16384 | 841 / 40 | 479 / 13 | 1.76x | **we hit the 40-step cap at 1.297e-7; scipy converged** |
+
+**THIS SHARPENS A FINDING PREVIOUSLY RECORDED AS A CURIOSITY INTO A REAL DEFECT.** The
+earlier sweep (n ≤ 4096) showed evaluation-count PARITY with our Newton step count merely
+higher, and the note said "worth chasing; not chased here". That reading was too kind:
+extended to larger n the evaluation cost diverges — 1.29x, 1.48x, 1.76x — and at n=16384
+we fail to converge inside a budget scipy clears in 13 Newton steps. The small-n parity
+was the tail of a trend, not a plateau.
+
+Suspected cause, unchanged and now worth acting on: our GCR seeds the augmentation
+directions FIRST and then falls back to the residual, whereas LGMRES proper augments the
+Krylov basis rather than pre-empting it. Pre-empting spends the early iterations on
+stale directions, which costs more the larger the space is.
+
+**THE AUGMENTATION ITSELF IS STILL DOING ITS JOB** — this is a deficit against SciPy, not
+against no augmentation. At n=16384 both of our arms hit the identical 841-evaluation cap,
+and at that equal budget LGMRES reaches 1.297e-7 where plain GMRES reaches 1.300e0: seven
+orders of magnitude, same cost. The mechanism is right; the basis construction is not.
+
+## `fsci-sparse::lgmres` is not LGMRES — the augmentation never enters the minimisation
+
+2026-08-18, source read plus a numpy quantification; no rebuild involved, so the disk
+throttle does not bear on it. Host quiet at the time: loadavg 4.85/11.94/24.82, CPU
+MHz 3800-4200 range.
+
+`crates/fsci-sparse/src/linalg.rs::lgmres` carries the docstring "Matches
+`scipy.sparse.linalg.lgmres(A, b)`". It does not. What it does, per outer cycle, is:
+
+ 1. project the residual onto each stored `(z, Az)` pair SEQUENTIALLY, updating `x`;
+ 2. run an **unaugmented** inner GMRES on the deflated residual;
+ 3. store the correction for the next cycle.
+
+Real LGMRES (`scipy`'s `_fgmres`, shared with `gcrotmk`) puts the augmentation vectors
+INTO THE ARNOLDI BASIS, so the least-squares step minimises over
+`span(outer_v) + K_m(A, r0)` **jointly**. Minimising over one subspace and then the other
+is equal to the joint minimisation only when the two are A-orthogonal, which they are not.
+
+**QUANTIFIED, AND IT REORDERED WHAT IS WORTH FIXING.** On a 40x40 diagonally dominant
+system with `outer_k = 3` and a 4-dimensional Krylov space:
+
+| what | residual |
+|---|---|
+| joint minimisation over `span(outer_v) + K_m` | 3.01e-14 |
+| span-then-Krylov, i.e. what this code does | 8.89e-01 |
+
+That is the whole defect. By contrast the *sequential* projection in step 1 — which is
+not an orthogonal projection onto the span, since the `Az` vectors are never
+orthogonalised against each other — costs a ratio of **1.0006** against a true span
+projection, even at `max|cos| = 0.43` between the stored directions. Iterating the
+sequential sweep 50 times reproduces the span projection exactly, confirming a single
+sweep is the only shortfall and that it is negligible.
+
+**I WAS ABOUT TO FIX THE HARMLESS ONE.** Orthogonalising the `Az` vectors is the small,
+obvious, self-contained change, and it buys 0.06%. Measuring first is what stopped it
+from being committed as though it mattered. The structural fix — passing `outer_v` into
+the inner iteration so the Arnoldi basis is genuinely augmented — is the only change that
+addresses the 13-order gap, and it is not small.
+
+Related: the same defect CLASS was just found and fixed in `fsci-opt`'s `KrylovJacobian`
+(augmentation consuming rather than adding to the inner budget, commit 7878c782c). The
+two are different bugs with the same root cause: treating augmentation as something done
+around the Krylov solve rather than inside it.
+
+## CORRECTION to the row above — the "13 orders of magnitude" figure was instance-specific and wrong
+
+Same day, before the fix was committed. The row above quantified the LGMRES split-vs-joint
+defect as joint 3.01e-14 against split 8.89e-01. **That figure does not generalise and
+should not be quoted.** It came from a single contrived instance in which the 4-dimensional
+Krylov space happened to nearly solve the 40x40 system by itself, so the joint space
+reached machine precision while the split path did not. It measured that instance, not the
+defect.
+
+Re-measured properly, with the transcription of the patched routine driven over many
+instances:
+
+| setting | old/new residual ratio |
+|---|---|
+| RANDOM augmentation vectors, 12 instances, n=60 | min 0.907, **median 1.059**, max 1.384 |
+| REALISTIC augmentation (corrections carried across 6 cycles of the same system) | **14.8x** (1.80e-10 against 2.66e-09) |
+
+Two honest conclusions, neither matching the withdrawn figure:
+
+ * With random augmentation directions the gain is about 6% at the median, and in 1 of 12
+   instances the augmented version was slightly WORSE (ratio 0.907). Random directions are
+   not informative, and putting them in the basis costs budget that Krylov directions
+   would have used.
+ * With the augmentation LGMRES actually stores -- corrections from previous cycles of the
+   same system -- the fix is worth about 15x on the final residual after six cycles. That
+   is the number to quote, and it is three orders of magnitude smaller than what the
+   previous row claimed.
+
+The defect is real and the fix is worth making. The magnitude I first attached to it was
+not measured, it was read off one lucky instance, and I am recording the correction rather
+than quietly replacing the number.
+
+**SEPARATELY CONFIRMED, AND THIS IS WHAT VALIDATES THE TRANSCRIPTION:** the patched
+routine's Givens solve is optimal over the space its own directions span -- residual ratio
+against an explicit least-squares solve over `span(A Z)` was 1.000000000 on three
+independent instances. That is the property that would break if the `Z`-versus-`V`
+distinction, the Givens bookkeeping, or the back-substitution were wrong.
+
+## SECOND CORRECTION — the "15x" LGMRES figure was also wrong, and the augmentation does NOT pay on any operator I tested
+
+2026-08-18, same day, before any rebuild. Host loadavg 9.43/9.07/14.06, CPU MHz ~4000.
+This is the second time I have attached an over-favourable number to this fix and had to
+withdraw it, which is itself the finding worth recording.
+
+The correction above replaced "13 orders of magnitude" with "about 15x on the final
+residual after six cycles". **That 15x is also wrong.** It compared the two paths at equal
+CYCLES, and an augmented cycle consumes `inner_m + outer_k` Arnoldi steps against
+`inner_m` for an unaugmented one. Equal cycles is unequal work, and the comparison
+flattered the augmented side by exactly the extra work it was doing.
+
+Re-measured at EQUAL TOTAL ARNOLDI STEPS, augmentation loses everywhere I tested:
+
+| comparison | result |
+|---|---|
+| 8 random dense systems, n=60, 40-step budget | median residual ratio **0.190** — augmented leaves ~5x MORE residual |
+| iterations to converge, 10 random dense systems | augmented used strictly MORE steps in **10 of 10** |
+| convection-diffusion, n=100, beta=0.95 | 273 steps augmented against 147 unaugmented |
+| convection-diffusion, n=100, beta=0.99 | 273 against 142 |
+
+**A SCARE THAT WAS MY OWN MEASUREMENT ERROR, NOT A DEFECT.** An intermediate run showed
+the augmented path stuck at residual 4.47e-01 where unaugmented reached 2.9e-07, which
+looked like a bug in the port. It was not: I had capped the budget at 120 Arnoldi steps
+and that solve needs 273. Checked against the incumbent directly, the port converges and
+matches scipy on the same operators — scipy `lgmres(inner_m=5, outer_k=3)` reaches
+9.56e-11 where this port reaches 7.19e-11.
+
+**WHAT SURVIVES, AND IT IS ENOUGH TO JUSTIFY THE CHANGE:**
+
+ * The restructure is a CONFORMANCE fix. The function claimed to match
+   `scipy.sparse.linalg.lgmres` and did not — it minimised over the augmentation span and
+   the Krylov space separately instead of jointly. It now does what the incumbent does.
+   Matching the peer is the goal; beating it was never the claim.
+ * The solve is optimal over the space its own directions span: ratio 1.000000000 against
+   an explicit least-squares solve, three independent instances.
+ * It converges and agrees with scipy's residuals on three operators.
+
+**WHAT DOES NOT SURVIVE:** any claim that this fix makes lgmres faster or stronger. On
+every operator tested the augmentation costs more total work than `outer_k = 0`, and
+SciPy shows the same behaviour, so this is a property of the METHOD rather than of the
+port. LGMRES earns its keep where restarted GMRES stagnates; none of my test operators
+stagnate, and I have not yet built one that does. Anyone wanting a benefit row here needs
+a genuinely stagnating operator first.

@@ -42,8 +42,8 @@ pub use nonlin::{
     AndersonJacobian, BroydenJacobian, BroydenVariant, DiagBroydenJacobian,
     ExcitingMixingJacobian, InnerMethod, InverseJacobian, Jacobian, KrylovJacobian,
     LineSearch, LinearMixingJacobian, LowRankMatrix, NonlinJacobian, NonlinOptions,
-    NonlinResult, ReductionMethod, anderson as anderson_nonlin, broyden1_lowrank,
-    broyden2_lowrank, diag_broyden, exciting_mixing, linear_mixing, nonlin_solve,
+    NonlinMethod, NonlinResult, ReductionMethod, anderson as anderson_nonlin, broyden1_lowrank,
+    broyden2_lowrank, root_nonlin, diag_broyden, exciting_mixing, linear_mixing, nonlin_solve,
 };
 pub use root::{
     MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult,
