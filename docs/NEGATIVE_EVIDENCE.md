@@ -37417,6 +37417,35 @@ A NaN bug in that gate was caught by clippy before it shipped: it was first writ
 `!(ratio > MAX)`, which is TRUE for NaN, so a cell with no clock samples would have
 certified itself. It now tests `is_finite() && ratio <= MAX`.
 
+### The first version of that gate was itself a freeze, and this is the correction
+
+The gate as first written took the PEAK loadavg during a cell against a ceiling of 16. Run
+against the promoting sweep it refused ALL FOUR sizes — including the ones it was written to
+admit. The cause is that the harness generates most of that peak ITSELF: the `scipyN` arm
+runs 64 tasks, and a single sweep drove loadavg from 19.9 to 37.1 with no external
+contention involved. That is the same rule-shape error the campaign's own build-budget notes
+record three times: a threshold set at or below your operating point is a freeze, not a gate.
+
+The variable was wrong, not the number. Our own arms load the box in BOTH halves of every
+cell by construction, so they are part of the measurement rather than a bias in it; the
+confound worth catching is EXTERNAL contention. The gate now reads AMBIENT load, sampled
+once before a size's first replicate, at a ceiling of 30 — the campaign's own documented
+deferral threshold. `load_peak` is still printed, labelled `[ours, not gated]`.
+
+Validated against the historical windows in both directions, which is what makes 30 a
+measured choice rather than a comfortable one:
+
+| window | ambient at start | corrected gate | reading |
+|---|---|---|---|
+| quiet | 20.60 | **admit** | 1.407x / 1.339x |
+| loaded | 59.95 | **refuse** | 0.910x / 0.808x |
+
+HONEST LIMIT: the ADMIT arm has not been observed live. Ambient did not drop below 30 again
+in this session — it sat at 38-41 — so every run since the correction has been refused, and
+the admit direction rests on the recorded ambient of the earlier window rather than on a
+fresh run. One consistency signal worth noting from a refused run at ambient 40.61: n=512
+read 1.408x against the quiet window's 1.407x, but it is refused and not counted.
+
 ### The re-run that would promote the provisional rows
 
 Rebuild (already committed) and run, with `uptime` checked immediately before and the

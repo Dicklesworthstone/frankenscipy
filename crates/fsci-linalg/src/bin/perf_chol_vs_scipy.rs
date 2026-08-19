@@ -85,9 +85,24 @@ mod harness {
     /// changing which arm the scheduler favours. So the null cannot be the only gate, and a
     /// loadavg printed but not enforced is a number nobody checks.
     ///
-    /// The default is deliberately below this 64-CPU host's idle band. Override with
-    /// `FSCI_CHOL_MAX_LOAD` if you are measuring somewhere else, and say so in the row.
-    const DEFAULT_MAX_LOADAVG: f64 = 16.0;
+    /// WHICH LOAD, AND WHY IT IS NOT THE PEAK. The first version gated on the PEAK loadavg
+    /// during the cell at a ceiling of 16, and refused every cell it was ever run on —
+    /// including the quiet-window ones it was written to admit. The reason is that the
+    /// harness generates most of that peak itself: the `scipyN` arm alone runs 64 tasks, so
+    /// a run drives loadavg from 19.9 to 37 without any external contention at all. A
+    /// ceiling below your own operating point is a freeze, not a gate.
+    ///
+    /// The confound worth catching is EXTERNAL contention. Our own arms load the box in
+    /// BOTH halves of every cell by construction, so they are part of the measurement, not a
+    /// bias in it. So the gate reads AMBIENT load — sampled once before a size's first
+    /// replicate — and the peak during the cell is recorded as provenance and explicitly not
+    /// gated.
+    ///
+    /// The 30 is the campaign's own documented deferral threshold, and it reproduces the
+    /// historical evidence in both directions: the window that produced the 1.407x reading
+    /// had ambient 20.60 (admitted), and the window where the same code read 0.910x had
+    /// ambient 59.95 (refused). Override with `FSCI_CHOL_MAX_LOAD` and say so in the row.
+    const DEFAULT_MAX_LOADAVG: f64 = 30.0;
 
     /// Largest tolerated ratio between the two arms' mean clock over a cell.
     ///
@@ -850,6 +865,7 @@ for raw_line in sys.stdin.buffer:
             // Every load and clock sample taken anywhere inside this cell, so the gates
             // below judge the window the ratio was actually measured in rather than a
             // single reading taken before it.
+            let ambient = loadavg_1min();
             let mut cell_loads: Vec<f64> = Vec::new();
             let mut cell_mhz_fsci: Vec<f64> = Vec::new();
             let mut cell_mhz_scipy: Vec<f64> = Vec::new();
@@ -900,8 +916,12 @@ for raw_line in sys.stdin.buffer:
             let nulls_ok = (nf - 1.0).abs() <= 0.05 && (ns - 1.0).abs() <= 0.05;
 
             // ── THE TWO GATES THE A/A NULL CANNOT PROVIDE ──────────────────────────
+            // `ambient` is the load BEFORE this size ran anything; `load_peak` is the
+            // highest reading during it and is dominated by our own arms, so it is reported
+            // and NOT gated. See DEFAULT_MAX_LOADAVG for why that distinction is the whole
+            // difference between a gate and a freeze.
             let load_peak = cell_loads.iter().copied().fold(0.0f64, f64::max);
-            let load_ok = load_peak <= max_load;
+            let load_ok = ambient <= max_load;
             let mhz_f = mean(&cell_mhz_fsci);
             let mhz_s = mean(&cell_mhz_scipy);
             let clock_ratio = if mhz_f > 0.0 && mhz_s > 0.0 {
@@ -922,7 +942,8 @@ for raw_line in sys.stdin.buffer:
             };
             println!(
                 "n={n} RESULT scipy1/fsci={m1:.3}x scipyN/fsci={mn:.3}x \
-                 null_fsci={nf:.3} null_scipy1={ns:.3} load_peak={load_peak:.2}/{max_load:.2} \
+                 null_fsci={nf:.3} null_scipy1={ns:.3} ambient={ambient:.2}/{max_load:.2} \
+                 load_peak={load_peak:.2}[ours, not gated] \
                  mhz_fsci={mhz_f:.0} mhz_scipy={mhz_s:.0} clock_ratio={clock_ratio:.3} \
                  gates={verdict} loadavg_post={}",
                 read_trimmed("/proc/loadavg"),
@@ -935,7 +956,7 @@ for raw_line in sys.stdin.buffer:
             }
             if !load_ok {
                 println!(
-                    "n={n} ROW INVALID: loadavg peaked at {load_peak:.2} against a ceiling of \
+                    "n={n} ROW INVALID: ambient loadavg was {ambient:.2} against a ceiling of \
                      {max_load:.2}. This gate exists because a passing A/A null certified a \
                      cell that was wrong by 1.5x under steady load; the null cannot see it."
                 );
