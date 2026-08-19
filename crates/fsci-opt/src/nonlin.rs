@@ -2064,13 +2064,22 @@ mod nonlin_tests {
             maxiter: Some(400),
             ..NonlinOptions::default()
         };
+        // The two DIAGONAL-STEP methods are deliberately absent, and their absence is
+        // asserted below rather than left as a silent gap. Both take a step of the form
+        // `+beta·F` with `beta > 0`: linear mixing with a fixed `beta = alpha`, exciting
+        // mixing with a per-coordinate one. On a system whose Jacobian is POSITIVE —
+        // this one is `2·x_i` on the diagonal — that moves away from the root, so they
+        // diverge by construction rather than by defect.
+        //
+        // Checked against the incumbent rather than reasoned about: on this exact system
+        // `scipy.optimize.linearmixing` and `scipy.optimize.excitingmixing` both raise
+        // `NoConvergence`, with iterates blown up to ~2.3e9, while scipy's `diagbroyden`,
+        // `anderson` and `broyden1` all reach ~1e-9. Same split as below.
         for method in [
             NonlinMethod::Broyden1,
             NonlinMethod::Broyden2,
             NonlinMethod::Anderson,
-            NonlinMethod::LinearMixing,
             NonlinMethod::DiagBroyden,
-            NonlinMethod::ExcitingMixing,
             NonlinMethod::Krylov,
         ] {
             let r: NonlinResult = root_nonlin(solvable, &x0, method, opts);
@@ -2085,6 +2094,24 @@ mod nonlin_tests {
             assert!(
                 r.function_calls > 0,
                 "{} reported zero function calls",
+                method.scipy_name()
+            );
+        }
+
+        // MUST-MISS, and the reason the loop above is a real claim: the diagonal-step
+        // pair does NOT solve this, so the five that do are converging on their merits
+        // rather than the system being trivially easy. Asserted as divergence rather
+        // than skipped, because "we do not test it here" and "it provably cannot work
+        // here" are different statements and only the second is checkable.
+        for method in [NonlinMethod::LinearMixing, NonlinMethod::ExcitingMixing] {
+            let r = root_nonlin(solvable, &x0, method, opts);
+            let resid = r.fun.iter().fold(0.0_f64, |a, b| a.max(b.abs()));
+            assert!(
+                !r.success && resid > 1.0,
+                "{} converged on a positive-Jacobian system (residual {resid}); it steps \
+                 +beta*F, which moves away from the root, and SciPy's own {} raises \
+                 NoConvergence on this system",
+                method.scipy_name(),
                 method.scipy_name()
             );
         }

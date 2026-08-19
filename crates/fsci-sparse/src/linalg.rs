@@ -16,6 +16,14 @@ use rayon::prelude::*;
 
 use crate::construct::eye;
 use crate::formats::{CscMatrix, CsrMatrix, Shape2D, SparseError, SparseResult};
+// `CooMatrix` is used only by test fixtures in this file, so it is imported under
+// `cfg(test)` rather than added to the line above — an unconditional import would be
+// unused in the library build. Seven `#[cfg(test)] mod` blocks reach for it as
+// `super::CooMatrix`, which resolves only if this module has the name; without it
+// `cargo test -p fsci-sparse --lib` fails to compile with seven E0432s while the LIBRARY
+// still builds clean, so a `cargo build` or `cargo check` does not see the breakage.
+#[cfg(test)]
+use crate::formats::CooMatrix;
 use crate::ops::FormatConvertible;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26566,8 +26574,7 @@ mod scipy_default_iteration_limits {
 #[cfg(test)]
 mod lsmr_damp_tests {
     use super::{
-        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsmr, lsmr_damped,
-    };
+        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsmr, lsmr_damped, FormatConvertible};
 
     /// A rank-deficient 3x2: both columns identical, so `AᵀA` is singular and the
     /// UNDAMPED problem has no unique minimizer. This is the case `damp` exists for.
@@ -26699,8 +26706,7 @@ mod lsmr_damp_tests {
 #[cfg(test)]
 mod lsqr_damp_tests {
     use super::{
-        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsqr, lsqr_damped,
-    };
+        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsqr, lsqr_damped, FormatConvertible};
 
     /// Rank-deficient 3x2: both columns identical, so `A^T A` is singular and the
     /// UNDAMPED problem has no unique minimizer. That is the case damp exists for.
@@ -26842,8 +26848,7 @@ mod lsqr_damp_tests {
 mod lsmr_x0_tests {
     use super::{
         CooMatrix, CsrMatrix, IterativeSolveOptions, SparseError, Shape2D, lsmr,
-        lsmr_regularized,
-    };
+        lsmr_regularized, FormatConvertible};
 
     /// Well-conditioned 3x2 with a unique least-squares solution, so a warm start
     /// has a definite answer to converge to.
@@ -26973,8 +26978,7 @@ mod lsmr_x0_tests {
 mod lsqr_x0_tests {
     use super::{
         CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsmr_regularized,
-        lsqr, lsqr_regularized,
-    };
+        lsqr, lsqr_regularized, FormatConvertible};
 
     fn overdetermined() -> (CsrMatrix, Vec<f64>) {
         let a = CooMatrix::from_triplets(
@@ -27327,8 +27331,7 @@ pub fn tfqmr(
 mod tfqmr_tests {
     use super::{
         CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, bicgstab, gmres,
-        tfqmr,
-    };
+        tfqmr, FormatConvertible};
 
     /// NONSYMMETRIC and diagonally dominant. Nonsymmetric because TFQMR exists for
     /// exactly that case and a symmetric fixture would let a subtly wrong recurrence
@@ -27571,7 +27574,7 @@ pub fn spbandwidth(a: &CsrMatrix) -> (usize, usize) {
 /// Sparsity-structure predicates -- `is_sptriangular` and `spbandwidth`.
 #[cfg(test)]
 mod structure_predicate_tests {
-    use super::{CooMatrix, CsrMatrix, Shape2D, csr_bandwidth, is_sptriangular, spbandwidth};
+    use super::{CooMatrix, CsrMatrix, Shape2D, csr_bandwidth, is_sptriangular, spbandwidth, FormatConvertible};
 
     fn build(n: usize, entries: &[(usize, usize)]) -> CsrMatrix {
         let vals: Vec<f64> = entries.iter().map(|_| 1.0).collect();
@@ -27859,8 +27862,7 @@ pub fn expm_multiply(
 #[cfg(test)]
 mod expm_multiply_tests {
     use super::{
-        CooMatrix, CsrMatrix, ExpmOptions, Shape2D, SparseError, expm, expm_multiply,
-    };
+        CooMatrix, CsrMatrix, ExpmOptions, Shape2D, SparseError, expm, expm_multiply, FormatConvertible};
 
     fn diag(values: &[f64]) -> CsrMatrix {
         let n = values.len();
