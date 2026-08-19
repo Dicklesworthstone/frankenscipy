@@ -39355,3 +39355,93 @@ closed as one; if it is far below, the partition is worth building after all.
   iteration and see whether 1.326x falls toward 1.0.
 - Ambient was 0.29–0.40 host-mean-busy; the cell passed its own gates but this was not a quiet
   window.
+
+## 2026-08-19 — frankenscipy-gykw5 — the missing threading gain QUANTIFIED: 13–21 points expected, 0 delivered, and it is NOT bandwidth
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_syrk_partition_vs_blas.rs (per-update) and
+  perf_chol_vs_scipy.rs FSCI_CHOL_NO_SCIPY (whole factor) — both in this session, same binary tree
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=1 (serial arms) actual observed worker threads=1
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.115)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.257)
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+frankenscipy-engine-sha256 = built from crates/fsci-linalg at this commit
+Same-invocation A/A null: 1.027 (whole factor), 1.013–1.063 per replicate
+Counted mechanism: per-panel trailing-update shapes are known exactly from `nb=128` and n=832
+Decision: this row is an ACCOUNTING of measured times, not a new ratio; the ratio it explains
+  (in-factor threading = 1.000x, null 1.046) is the certified cell in the row above.
+CV is provenance only and was not used for this decision.
+
+### The accounting
+
+Each of the six trailing updates of an n=832 factor, timed in isolation with the real kernel,
+serial (per-update, after dividing by `reps`):
+
+| m2 | 704 | 576 | 448 | 320 | 192 | 64 | **total** |
+|---|---|---|---|---|---|---|---|
+| ms | 1.526 | 1.027 | 0.615 | 0.316 | 0.116 | 0.014 | **3.614** |
+
+Whole serial factor at n=832: **5.340 ms** (null 1.027).
+
+    trailing SYRK = 3.614 / 5.340 = 67.7% of the factor
+    the two updates the 32M gate opens (m2 = 704, 576) = 2.553 ms = 47.8% of the factor
+
+So the gate-opened work is nearly half the factorisation. If it threads at the 1.326x measured
+in isolation, the whole factor should speed up **1.133x**; at the 1.57x implied once the bench's
+own clone overhead is removed (below), **1.210x**.
+
+**Measured in-factor: 1.000x, null 1.046.** Between 13 and 21 points are unaccounted for, far
+outside the noise floor. This is the first quantitative statement of the gap; every earlier row
+could only say "neutral".
+
+### It is NOT memory bandwidth — the previous row's leading hypothesis is weakened
+
+The row above proposed the in-factor update is memory-bound. The arithmetic does not support it.
+One m2=704 update moves the trailing block once (704² × 8 B read + write ≈ 7.9 MB) plus the
+packed panel (≈ 0.7 MB), so ≈ 8.6 MB in 1.526 ms serial → **≈ 5.6 GB/s**. Threaded at 0.006 s
+for the same bytes it is lower still. A Threadripper PRO 5975WX sustains tens of GB/s; nothing
+here is near a bandwidth roof.
+
+At 63.4M MACs in 1.526 ms the serial kernel runs ≈ 83 GFLOP/s, which is a credible AVX2+FMA
+single-core rate — so the SERIAL kernel is healthy and the problem is entirely in what happens
+when it is threaded in situ. "Memory-bound" is downgraded from leading hypothesis to
+not-supported; I published it last row and the numbers do not back it.
+
+### A flaw in my own bench, disclosed
+
+`perf_syrk_partition_vs_blas` clones the 3.96 MB trailing block INSIDE the timed loop, because
+the update is destructive. That serial memcpy is charged to both arms, so it DILUTES the
+threading ratio toward 1.0: the reported 1.326x understates true kernel scaling, which backs out
+to ≈1.57x once a ~0.5 ms clone is subtracted from both arms. The direction is conservative for
+the conclusion here — the gap it leaves unexplained gets larger, not smaller — but the 1.326x
+should not be quoted as the kernel's scaling. Fixing it properly means a non-destructive kernel
+entry point or a pre-allocated pool of victim buffers.
+
+### Where the 13–21 points can still be hiding
+
+Only two candidates survive the arithmetic, and neither is tested:
+
+1. **Per-call parallel set-up in situ.** The factor calls the threaded SYRK six times, once per
+   panel; the isolated bench calls it in a tight loop. If `rayon::scope` set-up plus the
+   first-touch of freshly packed `l21t` costs on the order of the update itself at these sizes,
+   the gain is eaten at the call boundary. Testable by timing the SYRK call site inside the
+   k-loop directly, which is what I proposed a row ago and still have not done.
+2. **Cold vs warm panels.** The bench reuses one `l21`/`l21t` pair; the factor packs a fresh one
+   per step. Testable by cycling the bench through K independent panel sets so no iteration
+   reuses the last one's cache.
+
+Both are one probe each and neither needs a new kernel. Doing (2) first is cheaper and would
+also settle whether the 1.326x/1.57x figure means anything at all.
+
+### Honest limits
+
+- One size (n=832), one nb (128). The per-update times are from the isolated bench and inherit
+  its clone-in-timer flaw, so the 67.7% share is an over-estimate of SYRK's true share by
+  roughly the clone fraction; the qualitative conclusion (SYRK is most of the factor, and the
+  gate-opened part is about half) survives a correction of that size but the exact percentages
+  should not be quoted downstream.
+- The whole-factor time and the per-update times come from two different binaries in the same
+  tree, not one invocation.
