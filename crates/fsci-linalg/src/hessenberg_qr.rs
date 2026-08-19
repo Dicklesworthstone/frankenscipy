@@ -436,8 +436,29 @@ pub(crate) fn real_schur_francis(
         let mut l = ihi;
         while l > 0 {
             let sub = h.get(l, l - 1).abs();
-            let scale = h.get(l - 1, l - 1).abs() + h.get(l, l).abs();
-            let tol = if scale == 0.0 { eps } else { eps * scale };
+            let mut scale = h.get(l - 1, l - 1).abs() + h.get(l, l).abs();
+            // A block can have a ZERO DIAGONAL and still be perfectly well scaled: the
+            // rotation [[0, -s], [s, 0]] has eigenvalues +-is and both diagonal entries
+            // exactly 0. Falling back to a bare `eps` there is an absolute epsilon on a
+            // dimensioned quantity — the defect class already recorded fleet-wide — and
+            // it splits that block for every s below 2.2e-16, turning a conjugate pair
+            // into two real eigenvalues. It is the exact failure frankenscipy-kwi99
+            // fixed on the nalgebra path, reintroduced here.
+            //
+            // `dlahqr` augments the local scale with the NEIGHBOURING subdiagonals
+            // before giving up, which keeps the test relative to the part of the matrix
+            // that actually has magnitude. If everything nearby is zero too, the
+            // tolerance is zero and only an exactly-zero subdiagonal deflates, which is
+            // the correct answer rather than a fallback.
+            if scale == 0.0 {
+                if l >= 2 {
+                    scale += h.get(l - 1, l - 2).abs();
+                }
+                if l + 1 <= ihi {
+                    scale += h.get(l + 1, l).abs();
+                }
+            }
+            let tol = eps * scale;
             if sub <= tol {
                 h.set(l, l - 1, 0.0);
                 ilo = l;

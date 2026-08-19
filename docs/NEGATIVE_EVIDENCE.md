@@ -36821,3 +36821,39 @@ inside `standardize_2x2_blocks` or the deflation test feeding it. Flip reverted 
 **THE DISCRIMINANT FIX IS KEPT AND IS VERIFIED SAFE ON THE DEFAULT PATH:** 576 passed, 0
 failed with `EIG_USE_FRANCIS_SCHUR = false`. It touches code both routes share, so
 "correct but unmeasured" would not have been good enough to keep it.
+
+## sez4r SHIPPED: `eig` now routes through the Francis QR by default, third flip attempt green
+
+2026-08-18. Host: loadavg 19.0-58.8 (busy, 11 remote rch builds fleet-wide), CPU idle
+84-87%. The claim here is a TEST OUTCOME and a COUNT, not a ratio, so the load does not
+bear on it; no timing is certified in this row.
+
+`EIG_USE_FRANCIS_SCHUR` now defaults to `true`. Full suite: **576 passed, 0 failed**.
+
+Two earlier flips today were reverted. Recording all three because the two failures found
+more than the success did — each exposed a defect that would otherwise have shipped the
+moment someone else flipped the flag.
+
+| # | what broke | what it actually was |
+|---|---|---|
+| 1 | `eig_keeps_complex_pairs_complex_at_every_scale...` | A DEFLATION TOLERANCE THAT WAS ABSOLUTE. The scan fell back to a bare `eps` when the local scale was zero. A block CAN have a zero diagonal and still be well scaled: `[[0,-s],[s,0]]` has eigenvalues `±is` and both diagonal entries exactly 0, so every such block with `s < 2.2e-16` was split and a conjugate pair became two reals. `dlahqr` augments the local scale with the NEIGHBOURING subdiagonals; that is the fix. |
+| 2 | same test, second attempt | A CANCELLING DISCRIMINANT in three places — `trace^2 - 4*det` against LAPACK's `(a-d)^2 + 4bc`. Fixed, kept, and verified safe on the default path before the flip; it was NOT the cause of the failure, which is why attempt 2 still failed. |
+| 3 | `eigvals_is_bit_identical_to_full_eig` | `eigvals` called `bounded_schur` DIRECTLY, bypassing the toggle. With the flag on, `eig` ran Francis and `eigvals` ran nalgebra while a comment asserted they were bit-identical. A shared invariant stated in prose and enforced nowhere. |
+
+Also updated: `eig_bounds_the_schur_iteration_instead_of_hanging` demanded
+`ConvergenceFailure` on the 230 cases. That encoded "we cannot solve these" as the
+contract, so the fixed code failed it FOR BEING FIXED. Rewritten to assert TERMINATION
+plus, when a spectrum does come back, that it has the right length, is finite, and
+contains an eigenvalue above 1.0 — which a diagonally-dominant matrix must. Strictly
+stronger on the converging path, identical on the failing one.
+
+**WHAT SHIPPING BUYS, measured against SciPy in the same invocation** (unchanged from the
+parity row above, restated because it is now the DEFAULT behaviour): nalgebra converged
+on 6770 of 7000, this path on 7000 — 230 recovered, 0 regressed — with 25 sampled
+recovered spectra matching `scipy.linalg.eig` at median 2.37e-15, max 4.72e-14.
+
+**WHAT IT DOES NOT BUY.** A convergence win, not a uniform accuracy win. On the six
+fixtures where both routines converge to different spectra SciPy puts Francis closer on
+four and nalgebra on two, and two of those (n=5 seed=766, n=8 seed=777) sit 4e-3 to 8e-3
+from SciPy in BOTH arms — a separate accuracy defect, still open, that this neither
+causes nor cures.

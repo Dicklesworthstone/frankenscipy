@@ -6424,9 +6424,9 @@ pub static EIG_BALANCE: std::sync::atomic::AtomicBool =
 /// Route `eig` through the in-crate Francis QR (`hessenberg_qr`) instead of
 /// nalgebra's Schur — `frankenscipy-sez4r`.
 ///
-/// Default `false`. I flipped this to `true` on 2026-08-18 and reverted it in the same
-/// session: the convergence case is made, and a SEPARATE defect makes the path unsafe to
-/// ship. See "why this is still off" below.
+/// Default `true` since 2026-08-18. Two earlier flip attempts were reverted the same
+/// day; this one is green because the three things they exposed are fixed rather than
+/// worked around. The history is kept in the ledger, not hidden.
 ///
 /// # The measurement that justifies the flip
 ///
@@ -6446,53 +6446,34 @@ pub static EIG_BALANCE: std::sync::atomic::AtomicBool =
 /// 8e-3 from SciPy in BOTH arms — a separate accuracy defect in the eigenvalue path
 /// that this change neither causes nor cures.
 ///
-/// # Why this is still off
+/// # What the three failed flips found
 ///
-/// `eig_keeps_complex_pairs_complex_at_every_scale_the_incumbent_does` fails on this
-/// path at 2^-60: a conjugate pair comes back with `Im = 0` where SciPy gives
-/// 8.67e-19. That is a STRUCTURALLY different answer, not a rounding one — a caller
-/// branching on "is this eigenvalue real" is told yes when the truth is no, silently.
+/// 1. A DEFLATION TOLERANCE THAT WAS ABSOLUTE. The scan fell back to a bare `eps` when
+///    the local scale was zero — and a block can have a zero diagonal while being
+///    perfectly well scaled: `[[0, -s], [s, 0]]` has eigenvalues `+-is` and both
+///    diagonal entries exactly 0. Every such block with `s < 2.2e-16` was split, turning
+///    a conjugate pair into two reals. `dlahqr` augments the local scale with the
+///    NEIGHBOURING subdiagonals instead, which is what this now does.
+/// 2. A CANCELLING DISCRIMINANT, in three places. `trace^2 - 4*det` subtracts two large
+///    nearly-equal quantities; `(a-d)^2 + 4bc` does not. Both are LAPACK's.
+/// 3. `eigvals` CALLED `bounded_schur` DIRECTLY, bypassing this toggle, so with it on
+///    the two entry points ran different iterations while a comment asserted they were
+///    bit-identical. It routes through `eig_schur_pair` now.
 ///
-/// Weighed against the 230 fixtures this path recovers, the trade still says do not
-/// ship: a `ConvergenceFailure` is loud, catchable, and attributable, while a complex
-/// pair flattened to real is none of those. Trading 230 loud failures for even one
-/// silent wrong answer is the wrong direction.
+/// # What this buys, measured against SciPy
 ///
-/// The suspect is scale handling in the 2x2 classification. `eig2x2` decides realness
-/// from `disc = tr^2/4 - det`, and at 2^-60 that subtraction cancels: a `disc` that
-/// should be slightly negative lands at exactly zero and the pair is called real.
+/// Over the 7000 `make_diag_dominant` fixtures that exposed the original hang:
+/// nalgebra converges on 6770, this path on **7000** — 230 recovered, 0 regressed — and
+/// 25 sampled recovered spectra match `scipy.linalg.eig` at median 2.37e-15.
 ///
-/// A SECOND scale bug sits in the same area and is worth fixing whether or not it is
-/// this failure: `standardize_2x2_blocks` compares `zz`, which carries the units of the
-/// matrix entries, against `4.0 * eps` — an ABSOLUTE threshold on a DIMENSIONED
-/// quantity, the defect class already recorded fleet-wide. It biases the opposite way
-/// (real pairs called complex at small scale), so it is not the observed failure, but it
-/// is the same mistake sitting next to it.
+/// It is a CONVERGENCE win, not a uniform accuracy win: on six fixtures where both
+/// routines converge to different spectra, SciPy puts this path closer on four and
+/// nalgebra on two. Two of those (n=5 seed=766, n=8 seed=777) are 4e-3 to 8e-3 from
+/// SciPy in BOTH arms — a separate accuracy defect this change neither causes nor cures.
 ///
-/// Set to `true` to exercise the path; it remains a toggle rather than a deletion
-/// because the convergence result is real and only this blocks it.
-///
-/// CONTRACT: NOT BIT-IDENTICAL, and deliberately so. The two arms are DIFFERENT
-/// ALGORITHMS — nalgebra's shift-free implicit double-shift QR versus a Francis
-/// double-shift with LAPACK's exceptional shifts — so they take different numbers
-/// of sweeps with different shifts and their roundings cannot agree bit for bit.
-/// Expect agreement to about 1e-12 relative on inputs where BOTH converge, and
-/// expect the EIGENVALUE ORDER to differ, since deflation order is a property of
-/// the iteration.
-///
-/// THIS CORRECTS MY OWN PLAN. The note recorded on sez4r for this step asked for a
-/// "bit-identity gate on the cases that already converge". That was overstated: no
-/// gate of that kind can pass between two distinct iterations, and had it been
-/// written as specified it would have failed for the right reason and been
-/// misread as a defect in the new path. The gate is a tolerance gate on the SORTED
-/// spectrum plus the trace identity, which is what actually distinguishes "same
-/// answer, different arithmetic path" from "different answer".
-///
-/// On inputs where nalgebra does NOT converge there is nothing to compare: the old
-/// arm returns `ConvergenceFailure` and the new one is expected to return a
-/// spectrum. That asymmetry is the entire point of the change.
+/// Set to `false` for the old routine; it stays a toggle rather than a deletion.
 pub static EIG_USE_FRANCIS_SCHUR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 fn bounded_schur(
     m: DMatrix<f64>,
@@ -6892,7 +6873,12 @@ pub fn eigvals(
     // The eigenvalues come from the same nalgebra Schur form `T` with the same block
     // logic, so they are bit-identical to `eig(a)`'s — ~2x faster when the
     // eigenvectors are unneeded (mirrors `scipy.linalg.eigvals` vs `eig`).
-    let schur = bounded_schur(matrix.clone())?;    let (_q_mat, t_mat) = schur.unpack();
+    // `eig_schur_pair`, NOT `bounded_schur` directly. Calling the raw constructor here
+    // bypassed `EIG_USE_FRANCIS_SCHUR`, so with the toggle on `eig` ran the Francis
+    // iteration and `eigvals` ran nalgebra's — and the bit-identity this comment claims
+    // silently stopped holding. A shared invariant asserted in prose and enforced
+    // nowhere is exactly the kind that breaks when a second path appears.
+    let (_q_mat, t_mat) = eig_schur_pair(a, &matrix)?;
 
     let mut eigenvalues_re = Vec::with_capacity(rows);
     let mut eigenvalues_im = Vec::with_capacity(rows);
@@ -23071,14 +23057,45 @@ mod tests {
             a
         }
 
-        // MUST-HIT: known non-converging cases now return an error rather than hanging.
+        // MUST-HIT: the cases nalgebra cannot converge on TERMINATE — the property this
+        // test exists for. What terminating means now depends on which iteration runs,
+        // and both outcomes are acceptable; a HANG is the only failure.
+        //
+        // This arm used to demand `ConvergenceFailure` specifically. That was right when
+        // `bounded_schur` was the only path, and it silently encoded "we cannot solve
+        // these" as the contract. The Francis arm solves them, so demanding the error
+        // would now fail the fixed code for being fixed. The guard is therefore
+        // rewritten to assert TERMINATION plus, when a spectrum does come back, that it
+        // is a real spectrum rather than a shrug — which is strictly stronger than the
+        // original on the converging path and identical on the failing one.
         for (n, seed) in [(5usize, 201u64), (5, 213), (5, 234), (6, 319), (6, 335)] {
             let a = make_diag_dominant(n, seed);
             match eig(&a, DecompOptions::default()) {
                 Err(LinalgError::ConvergenceFailure { .. }) => {}
-                other => panic!(
-                    "({n},{seed}) should not converge; expected ConvergenceFailure, got {other:?}"
-                ),
+                Ok(r) => {
+                    assert_eq!(
+                        r.eigenvalues_re.len(),
+                        n,
+                        "({n},{seed}) converged but returned {} eigenvalues for an \
+                         {n}x{n} matrix",
+                        r.eigenvalues_re.len()
+                    );
+                    assert!(
+                        r.eigenvalues_re.iter().all(|v| v.is_finite())
+                            && r.eigenvalues_im.iter().all(|v| v.is_finite()),
+                        "({n},{seed}) converged to a non-finite spectrum, which is a \
+                         hang dressed as a success"
+                    );
+                    // A diagonally-dominant matrix with diagonal ~2n has no eigenvalue
+                    // anywhere near zero; a spectrum of zeros would satisfy every check
+                    // above and mean nothing.
+                    assert!(
+                        r.eigenvalues_re.iter().any(|v| v.abs() > 1.0),
+                        "({n},{seed}) returned a spectrum with no eigenvalue above 1.0, \
+                         which a diagonally-dominant matrix cannot have"
+                    );
+                }
+                other => panic!("({n},{seed}) failed for the wrong reason: {other:?}"),
             }
         }
 
