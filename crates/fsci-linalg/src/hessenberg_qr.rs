@@ -519,7 +519,15 @@ pub(crate) fn real_schur_francis(
                     let last = (k + 3).min(ihi + 1);
 
                     // Left application over the affected columns.
-                    for j in k.saturating_sub(1)..=ihi {
+                    //
+                    // The window runs to `n_full - 1`, NOT to `ihi`. LAPACK's `dlahqr`
+                    // narrows it to the active block only when eigenvalues alone are
+                    // wanted (`WANTT` false); for the full Schur form it sets
+                    // `I1 = 1, I2 = N` and transforms the whole matrix. We return `T`
+                    // and `Z`, so the columns to the RIGHT of the active block are part
+                    // of the answer -- leaving them untransformed keeps the spectrum
+                    // right, and every `Z T Z^T` reconstruction slightly wrong.
+                    for j in k.saturating_sub(1)..n_full {
                         let mut dot = 0.0;
                         for (vi, &ri) in v.iter().zip(rows.iter()) {
                             dot += vi * h.get(ri, j);
@@ -529,8 +537,12 @@ pub(crate) fn real_schur_francis(
                             h.add(ri, j, -f * vi);
                         }
                     }
-                    // Right application over the affected rows.
-                    for i in ilo..=last.min(ihi) {
+                    // Right application over the affected rows, starting at row 0 for
+                    // the same reason: rows ABOVE the active block still hold nonzero
+                    // entries in columns `k..k+2` (the matrix is upper Hessenberg, so
+                    // everything above the diagonal is live), and the similarity is only
+                    // a similarity if they are carried along too.
+                    for i in 0..=last.min(n_full - 1) {
                         let mut dot = 0.0;
                         for (vj, &cj) in v.iter().zip(rows.iter()) {
                             dot += h.get(i, cj) * vj;
@@ -552,6 +564,21 @@ pub(crate) fn real_schur_francis(
                         let f = two_over * dot;
                         for (vj, &cj) in v.iter().zip(rows.iter()) {
                             z.add(i, cj, -f * vj);
+                        }
+                    }
+
+                    // Zero the bulge entries the reflector just pushed into column
+                    // `k - 1`, EXPLICITLY, as `dlahqr` does. In exact arithmetic the
+                    // left application already annihilates them; in floating point it
+                    // leaves residue below the subdiagonal, and that residue is not
+                    // harmless — the deflation test reads those entries, so a Hessenberg
+                    // matrix that is only approximately Hessenberg deflates at the wrong
+                    // place and the run converges to a different spectrum. Chasing the
+                    // bulge means removing it, not leaving it small.
+                    if k > ilo {
+                        h.set(k + 1, k - 1, 0.0);
+                        if k + 2 <= ihi {
+                            h.set(k + 2, k - 1, 0.0);
                         }
                     }
                 }
