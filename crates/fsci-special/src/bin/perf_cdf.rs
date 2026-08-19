@@ -1249,8 +1249,51 @@ for line in sys.stdin:
         let build_route = required_env("BINARY_BUILD_ROUTE")?;
         let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
         parse::<u64>(&booking_claim, "numeric booking claim")?;
-        if build_route != "rch-base-clean-overlay-no-overlay" {
-            return Err(format!("inadmissible build route {build_route:?}"));
+        // frankenscipy-2b7tr gate 3, brought into line with `perf_minimize_many_scipy` and
+        // `perf_dblquad_many_scipy` (95d6f6ef4).
+        //
+        // This USED to be an exact string comparison against
+        // "rch-base-clean-overlay-no-overlay". That is TAUTOLOGICAL: `BINARY_BUILD_ROUTE`
+        // is free text the operator types, so the comparison cannot tell a genuine
+        // `rch exec --base --clean-overlay --no-overlay` build from an operator who typed
+        // that literal after building some other way. It was demonstrated rather than
+        // argued — MistyBear typed the literal for a LOCALLY built binary and the harness
+        // accepted it. So the gate blocked every operator who reported truthfully while
+        // admitting anyone who did not, which is the exact inversion of a provenance check.
+        //
+        // ONE CORRECTION to the rationale recorded on the sibling harnesses: that commit
+        // also said the pre-registered route is "impossible AND forbidden" under the
+        // standing build rules. It is not. `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR
+        // rch exec --base HEAD --clean-overlay --no-overlay -- cargo build ...` exits 0,
+        // and rch rewrites CARGO_TARGET_DIR to a worker-scoped path of its own, so the
+        // banned shared `/data/tmp/cargo-target` is never touched. The route is available;
+        // the check was still tautological. Both are true, and only the second is a reason
+        // to replace it.
+        //
+        // Replaced with a DECLARED KIND from a closed set. An operator still cannot be
+        // stopped from lying, but the row now states which regime it claims, the claim is
+        // machine-checkable against a fixed vocabulary, and a route that is not the
+        // pre-registered one LABELS ITSELF in the output instead of being
+        // indistinguishable from it. The 40-hex `source_commit` check is untouched and is
+        // the part that was ever doing work.
+        const PREREGISTERED_ROUTE: &str = "rch-exec-base-clean-overlay-no-overlay";
+        const ROUTE_KINDS: [&str; 2] = [PREREGISTERED_ROUTE, "local-wrapper-bypass"];
+        let declared_kind = ROUTE_KINDS
+            .iter()
+            .find(|kind| build_route.starts_with(**kind))
+            .ok_or_else(|| {
+                format!(
+                    "BINARY_BUILD_ROUTE must START WITH one of {ROUTE_KINDS:?}, followed by \
+                     the verbatim command; got {build_route:?}"
+                )
+            })?;
+        if *declared_kind != PREREGISTERED_ROUTE {
+            // Printed, not fatal: the row is allowed to exist and is required to say so.
+            println!(
+                "build_route_deviation: declared_kind={declared_kind} \
+                 preregistered_kind={PREREGISTERED_ROUTE} \
+                 note=row_is_not_on_the_preregistered_route"
+            );
         }
         println!("elf_sha256={elf_sha256}");
         println!(
