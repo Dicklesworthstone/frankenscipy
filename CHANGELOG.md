@@ -217,9 +217,19 @@ sections further below.
     ~370× faster **than the Simpson quadrature it replaced**, and structurally
     exact. The ~370× is a self-speedup against our own previous implementation;
     it is **not** a speed claim against `scipy.stats.truncweibull_min`, which
-    evaluates the same identity in its own `_munp`. Do not read this number as a
-    reason to prefer FrankenSciPy over SciPy for this call
+    evaluates the same identity in its own `_munp`
     ([frankenscipy-b47bcc6e](https://github.com/Dicklesworthstone/frankenscipy/commit/b47bcc6e)).
+    The incumbent number that WAS missing has since been measured
+    (frankenscipy-bxnn7): on a three-row mean/variance summary, against the
+    strongest of SciPy 1.17.1's three screened public arms, **SciPy /
+    FrankenSciPy = 46.6× (CI95 [46.1, 51.6])** — same invocation, both arms
+    pinned to one CPU and observed single-threaded, six-output parity to
+    3.8e-15, A/A nulls 1.001 and 0.995. **Read that 46.6× with its own caveat:**
+    the harness also measured SciPy's public `.stats()` path against SciPy's own
+    private `_munp` and found the public wrapper costs **3.26× (CI95 [3.16,
+    3.33])**, so roughly a third of the gap is Python call overhead in the
+    incumbent's public API rather than arithmetic. Against SciPy's private
+    routine the remaining advantage is about 14×.
   - `HalfCauchy.mean/var` now returns `+INFINITY` to match SciPy
     ([frankenscipy-59anq](https://github.com/Dicklesworthstone/frankenscipy/commit/aa1724bc)).
   - `Burr3`, `RecipInvGauss`, `Kappa3`, `ExponPow`, `PowerLognorm`,

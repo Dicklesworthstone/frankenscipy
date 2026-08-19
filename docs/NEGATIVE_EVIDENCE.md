@@ -37855,3 +37855,71 @@ and getting it wrong changes results silently.
 Wilkinson shift is globally convergent for symmetric input (Golub & Van Loan) — and 40,000
 cases agree, but the family space is not the input space. The probe is committed and
 parameterised (`seeds`, `nmax`) so reopening means rerunning it wider, not rebuilding it.
+
+## 2026-08-19 — frankenscipy-bxnn7 — TruncWeibullMin mean/var vs live SciPy — DECIDED FRANKENSCIPY WIN
+
+The first of the nine "convert claim" beads to actually produce its number. The public
+CHANGELOG ~370× was never a claim against SciPy — it says so in terms, and correctly — so
+nothing had to be retracted. What was missing was the incumbent ratio, and this is it.
+
+**Incumbent ratio: SciPy / FrankenSciPy = 46.572418461x**
+bootstrap_median_ci95=[46.142489380, 51.599694531], cv=12.466% (provenance only).
+
+Outcome `DECIDED FRANKENSCIPY WIN` on the corrected four-clause null gate: effect CI excludes
+one, beats 2× the null half-width, beats the 2× endpoint, and the two null medians agree
+within 2%. effect_deviation 45.14 against a required 0.119.
+
+| | |
+|---|---|
+| fixture | `truncweibull_min` three-row mean/var summary, params 1.5:0.5:5.0, 2.5:0.1:3.0, 3.0:1.0:10.0 |
+| rounds × reps | 15 × 2000 |
+| FrankenSciPy p50 / p95 | 1.907 µs / 3.093 µs per job |
+| SciPy p50 / p95 | 88.867 µs / 174.147 µs per job |
+| A/A null, ours | median 1.0014, ci95 [0.9870, 1.0342] |
+| A/A null, SciPy | median 0.9950, ci95 [0.9436, 1.0498] |
+| parity | max_abs_difference 3.775e-15 on all six outputs, checked BEFORE arm selection |
+| threads | requested 1 / **observed 1** on both arms; max OS tasks 1 |
+| ELF sha256 | `348586e637b71e45cf746d0fc533f96eb619db557e7c0945a04380218db38a25` |
+| SciPy engine sha256 | `8bdf1788046aa1bbaad92184494cccfcc9122cc1fd792e27783e82200ac2da44` |
+| incumbent | scipy 1.17.1 / numpy 2.4.3, `genuine=True`, `fsci_loaded=False` |
+| host | thinkstation1, 32 physical / 64 logical, 1 NUMA, 216 GiB, affinity **cpu 5 only** |
+| ISA | avx2 + fma, no avx512f; governor `powersave`, amd-pstate-epp, 1.43–4.56 GHz |
+| linkage | `ldd`: no BLAS, LAPACK or MKL |
+| booking | `trj_booking_claim_message_id=31764`, verified `persisted=true` |
+
+**THE STRONGEST INCUMBENT ARM WAS SCREENED, NOT ASSUMED.** All three public SciPy routes were
+run and parity-checked first: vectorized 84.579 µs/job, scalar 328.292, frozen 351.598. The
+**fastest** was selected. Picking `scalar` would have inflated the ratio roughly four-fold.
+
+### The caveat that belongs next to the number
+
+The harness also timed SciPy's public `.stats()` path against SciPy's own private `_munp`,
+which computes the same identity:
+
+    public / private = 3.263847485x, ci95 [3.158881988, 3.330128712]
+
+So **about a third of our 46.6× is Python wrapper overhead in the incumbent's public API, not
+arithmetic.** Against SciPy's private routine the remaining advantage is roughly 14×. The
+private path is correctly ruled ineligible as an incumbent — it is not public API and no user
+calls it — but quoting 46.6× without this decomposition would overstate what our closed-form
+incomplete-gamma identity actually buys. Both numbers are in the CHANGELOG entry.
+
+### Pre-registered predictions, adjudicated
+
+`collapse_boundary=37.0x` was pre-registered: the prediction was that the 370× self-speedup
+would COLLAPSE below 37× once measured against a real incumbent. Measured 46.57×, so
+`collapse_confirmed=false, collapse_falsified=true, direction_confirmed=true`. The direction
+survived; the collapse did not happen.
+
+### Honest limits
+
+- `host_wide_quiescence` is **NOT_CERTIFIED** at both pre and post: host_mean_busy 0.239/0.240
+  with 18 and 20 CPUs above the 20% limit. That gate is unsatisfiable on this shared box and
+  the harness treats it as reporting, not blocking — the row is decided on the same-invocation
+  A/A nulls, which passed. Recorded rather than hidden.
+- `acquire_build_slot` returns "Build slots are disabled. Enable WORKTREES_ENABLED", so the
+  fleet-wide serialisation the standing orders require was unavailable. The booking claim
+  above is the fallback: an addressed agent-mail message, confirmed durably persisted, rather
+  than the `0` sentinel that earlier notes said independently forbids a KEEP.
+- Single fixture, single size regime. This is one job, not a claim about `truncweibull_min`
+  generally.
