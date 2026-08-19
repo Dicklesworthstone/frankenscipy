@@ -39089,3 +39089,91 @@ whether the ceiling is the partition or the microkernel.
 - cap=4's 0.917x sits essentially ON its band edge (0.920) and had no bootstrap CI computed;
   it is reported as "marginally slower", not as a decided regression.
 - One fixture family, one size for this arm.
+
+## 2026-08-19 — frankenscipy-gykw5 — ANSWERED: it is a PARTITION ceiling, not a bandwidth wall. OpenBLAS threads the exact basin shape for 1.5x.
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_syrk_partition_vs_blas.rs
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both thread counts one invocation, ABBA)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=1 and 64; actual observed worker threads: 1 task at
+  OPENBLAS_NUM_THREADS=1, 127 tasks at 64 — observed, printed by the arm itself
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.161)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.214)
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+frankenscipy-engine-sha256 = n/a for the decided claim — see WITHDRAWN below
+Same-invocation A/A null: blas 1-thread 1.0861, blas N-thread 1.0811 (m=704);
+  1.0277 / 1.0668 (m=1920)
+Decision: the effect (1.508x, 1.557x) is far outside a 2x A/A-null margin (~1.17), so both
+  cells are decided. iowait 0, loadavg 10.3–13.7.
+CV is provenance only and was not used for this decision.
+
+### The question this settles
+
+Six parallel-dispatch levers on this bead were neutral or worse, and the gap decomposes to ~5
+points of serial kernel rate plus ~40 points of threading SciPy gets and we do not. That left
+exactly one fork: when OpenBLAS threads a trailing update of the BASIN's shape, does it get a
+speedup? If not, the basin is a bandwidth wall and no partitioning can close it. If yes, the
+ceiling is ours.
+
+Shape is not invented: `C(704×704) -= A(704×128)·A(704×128)ᵀ`, 63.4M MACs — the first trailing
+update of a Cholesky at n=832 with the shipped nb=128, the one that misses the 64M gate by 1%.
+
+### Answer: OpenBLAS threads it, and threads it as well as it threads the shape where we WIN
+
+| shape | MACs | dsyrk 1 thread | dsyrk 64 threads | **dsyrk threading speedup** | nulls |
+|---|---|---|---|---|---|
+| m=704, k=128 (**basin**, n=832) | 63.4M | 0.006069 s | 0.004023 s | **1.508x** | 1.086 / 1.081 |
+| m=1920, k=128 (n=2048, we win) | 471.9M | 0.056189 s | 0.036082 s | **1.557x** | 1.028 / 1.067 |
+
+**The basin shape is not special to OpenBLAS.** It gets essentially the same threading benefit
+there (1.508x) as at the shape where our factorisation already beats SciPy (1.557x). Meanwhile
+our fan-out at that shape yields nothing: the gate blocks it entirely by default, and every
+forced-dispatch configuration measured on this bead came back neutral or worse.
+
+**So the ceiling is our PARTITION, not memory bandwidth.** That closes the fork, and it is the
+first result on this bead that points at work rather than closing a door.
+
+### A SMOKE RUN SAID THE OPPOSITE AND WAS WRONG — recorded because it nearly stood
+
+The first pass, at `min_of=2`, reported `blas=1.002x` — i.e. "dsyrk gets no speedup either",
+which would have meant a bandwidth wall and an argument to close this bead. With `min_of=9` and
+`reps=5` the same shape reports 1.508x with a 1.08 null. The 1.002x was pure sampling noise on a
+2-sample minimum. A cheap smoke reading in the direction that ENDS an investigation deserves the
+same rigour as one that continues it, and this one did not get it until it was re-run.
+
+### WITHDRAWN from this harness: the "ours" arm
+
+The binary also times our public `matmul` at the same shape, and that number is NOT comparable
+and is no longer printed as a ratio. Three independent reasons, any one fatal:
+
+- `matmul` gates on `matmul_ws_thread_count`, NOT the `matmul_thread_count` that this binary's
+  counter and thread cap hook. Observed `dispatches=0` even uncapped, so the cap did nothing.
+- `matmul` is a general GEMM computing the FULL m×m product; `dsyrk` computes only the triangle.
+- Cholesky's trailing update does not call `matmul` at all — it uses its own packed triangular
+  kernels.
+
+The smoke printed `serial_rate_ratio=10.1x` from this arm. That number is meaningless and is
+explicitly not a finding; the serial rate that matters was already measured on the real path at
+`scipy1/fsci ≈ 0.95x`. The binary now prints a `WITHDRAWN` line explaining this so the figure
+cannot be mined out of the artifact later.
+
+### What to do with it
+
+The fix is a packed, L2-resident partition of the trailing update rather than a row-stripe
+split. Our current split hands each worker a stripe of the SAME shared trailing matrix, so every
+worker streams the same memory and the fan-out buys nothing; OpenBLAS packs A-panels and
+B-blocks so each core works out of its own cache. That is a real piece of kernel work with a
+known shape, and it now has a measured target: **1.5x is available at the basin shape**, and
+capturing even most of it would move n=832 from 0.62x to roughly 0.95x against `scipyN`.
+
+### Honest limits
+
+- Two shapes, one k (128). The basin spans n≈576–1280, whose first trailing updates run
+  m≈512–960; only m=704 was measured inside it.
+- dsyrk computes the triangle and our trailing update also only needs the triangle, so the
+  shapes correspond — but OpenBLAS's dsyrk is a different algorithm from our SYRK kernel, and
+  this row claims only that THE SHAPE IS THREADABLE, not that our kernel can hit dsyrk's rate.
+- Nulls of 1.03–1.09 are looser than this ledger's better cells; the effect is 5–20x the null,
+  so the verdict is not close, but a quieter window would tighten it.
