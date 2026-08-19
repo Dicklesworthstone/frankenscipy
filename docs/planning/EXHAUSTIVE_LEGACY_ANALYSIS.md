@@ -20,10 +20,10 @@ Legacy corpus:
 
 Project contracts:
 - `/data/projects/frankenscipy/docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md`
-- `/data/projects/frankenscipy/EXISTING_SCIPY_STRUCTURE.md`
+- `/data/projects/frankenscipy/docs/planning/EXISTING_SCIPY_STRUCTURE.md`
 - `/data/projects/frankenscipy/docs/planning/PLAN_TO_PORT_SCIPY_TO_RUST.md`
 - `/data/projects/frankenscipy/docs/planning/PROPOSED_ARCHITECTURE.md`
-- `/data/projects/frankenscipy/FEATURE_PARITY.md`
+- `/data/projects/frankenscipy/docs/planning/FEATURE_PARITY.md`
 
 Specification status:
 - `docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md` includes sections `14-20` (crate contracts, conformance matrix, threat matrix, CI gates, and RaptorQ envelope); remaining work is empirical validation of those sections against live artifacts.

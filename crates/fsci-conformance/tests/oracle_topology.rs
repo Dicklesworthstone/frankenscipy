@@ -141,7 +141,7 @@ fn rch_env_enforces_strict_scipy_oracle_mode() -> TestResult {
 fn m3_packet_surface_covers_all_canonical_packets() -> TestResult {
     let artifacts_dir = conformance_root().join("fixtures/artifacts");
     let workspace_root = workspace_root()?;
-    let feature_parity = fs::read_to_string(workspace_root.join("FEATURE_PARITY.md"))?;
+    let feature_parity = fs::read_to_string(workspace_root.join("docs/planning/FEATURE_PARITY.md"))?;
     let tolerance_policy =
         fs::read_to_string(workspace_root.join("artifacts/TOLERANCE_POLICY.md"))?;
 

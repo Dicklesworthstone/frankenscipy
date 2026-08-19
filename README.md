@@ -112,7 +112,7 @@ FrankenSciPy is a Cargo workspace of **19 crates** spanning ~140,000 lines of Ru
 | [`fsci-arrayapi`](crates/fsci-arrayapi/) | ~3,500 | Contract-first Array API backend (`backend.rs`, `broadcast`, `creation`, `indexing`, `audit`) with integration seams for linalg / opt / sparse |
 | [`fsci-conformance`](crates/fsci-conformance/) | ~31,400 (lib + 7 bins) + **767 test files** | Three-lane differential harness (self-check, SciPy-oracle, dispatch); RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 15 Python oracle scripts; seven binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`) |
 
-For per-symbol parity assessment see [`FEATURE_PARITY.md`](FEATURE_PARITY.md).
+For per-symbol parity assessment see [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md).
 
 ---
 
@@ -1738,7 +1738,7 @@ cargo run -p fsci-conformance --bin conformance_dashboard -- \
 
 ## Crate Reference
 
-Detailed feature lists for each crate live in [`FEATURE_PARITY.md`](FEATURE_PARITY.md) and the per-crate `src/lib.rs` doc comments. The table below summarizes status against the V1 scope contract.
+Detailed feature lists for each crate live in [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md) and the per-crate `src/lib.rs` doc comments. The table below summarizes status against the V1 scope contract.
 
 | Crate | Status | SciPy coverage | Notes |
 |---|---|---|---|
@@ -1930,7 +1930,7 @@ The `fsci-conformance` writer for `parity_report.{json,raptorq.json,decode_proof
 FrankenSciPy is pre-1.0. The following are intentional and tracked:
 
 - **No tagged releases yet.** The workspace version is `0.1.0`; there are no semver guarantees between commits.
-- **Selected V1 surface, not 100% SciPy parity.** Overall coverage of `scipy.*` public symbols is ~52%; see [`FEATURE_PARITY.md`](FEATURE_PARITY.md) for module-level breakdowns. The gap is concentrated in `scipy.special` long-tail functions, advanced sparse direct solvers, and a handful of `scipy.optimize` constraint forms.
+- **Selected V1 surface, not 100% SciPy parity.** Overall coverage of `scipy.*` public symbols is ~52%; see [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md) for module-level breakdowns. The gap is concentrated in `scipy.special` long-tail functions, advanced sparse direct solvers, and a handful of `scipy.optimize` constraint forms.
 - **No GPU or distributed backends.** All kernels are single-process CPU.
 - **No FFI to BLAS / LAPACK.** All linear algebra is implemented in safe Rust; we lose hand-tuned-vendor-kernel performance for the largest matrices in exchange for memory safety and embeddability. Profile-first optimization closes this gap routine by routine.
 - **Heavy-tail distribution moments return `NaN`.** For families like `Alpha`, `Cauchy` (mean), `HalfCauchy` (mean/var), and some `Pareto` parameter regimes, the relevant moment integral diverges. We return `NaN` and document it rather than silently returning truncated finite numbers.
@@ -1985,11 +1985,11 @@ A. GitHub issues are open. Bug reports, especially numerical-regression reports 
 | [`CHANGELOG.md`](CHANGELOG.md) | Landed capabilities, by domain, with linked commits |
 | [`AGENTS.md`](AGENTS.md) | Guidelines and conventions for AI agents working in the repo |
 | [`docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md`](docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md) | Prime directive, product thesis, V1 scope, compatibility/security model |
-| [`FEATURE_PARITY.md`](FEATURE_PARITY.md) | Per-module SciPy parity assessment |
+| [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md) | Per-module SciPy parity assessment |
 | [`docs/planning/PROPOSED_ARCHITECTURE.md`](docs/planning/PROPOSED_ARCHITECTURE.md) | Crate map, runtime plan, mode model, performance contract |
 | [`docs/planning/PLAN_TO_PORT_SCIPY_TO_RUST.md`](docs/planning/PLAN_TO_PORT_SCIPY_TO_RUST.md) | Porting strategy and prioritization |
-| [`EXISTING_SCIPY_STRUCTURE.md`](EXISTING_SCIPY_STRUCTURE.md) | Reference catalog of the SciPy public surface |
-| [`EXHAUSTIVE_LEGACY_ANALYSIS.md`](EXHAUSTIVE_LEGACY_ANALYSIS.md) | Deep audit of the legacy SciPy code paths the conformance harness targets |
+| [`docs/planning/EXISTING_SCIPY_STRUCTURE.md`](docs/planning/EXISTING_SCIPY_STRUCTURE.md) | Reference catalog of the SciPy public surface |
+| [`docs/planning/EXHAUSTIVE_LEGACY_ANALYSIS.md`](docs/planning/EXHAUSTIVE_LEGACY_ANALYSIS.md) | Deep audit of the legacy SciPy code paths the conformance harness targets |
 | [`docs/ARTIFACT_TOPOLOGY.md`](docs/) | Locked artifact directory schema |
 | [`docs/ORACLE_WORKFLOW.md`](docs/) | Full Python oracle capture → regen → provenance → CI lane workflow |
 | [`docs/schemas/`](docs/) | Governance-gated JSON schemas (`behavior_ledger`, `contract_table`, `threat_matrix`) |
