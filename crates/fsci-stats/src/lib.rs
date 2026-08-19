@@ -42137,9 +42137,43 @@ fn kde_simd_exp_nonpos(
     Simd::from_array(out)
 }
 
+/// Same-binary A/B toggle for the sorted-dataset tail window. When true, every query
+/// sums the whole dataset instead of the points within the kernel radius.
+///
+/// CONTRACT: NOT byte-identical, and this one is a TRUNCATION rather than a rounding
+/// difference — the fast arm does not merely reorder the sum, it omits terms. The window
+/// is `KERNEL_RADIUS_IN_BANDWIDTHS = 8.0`, so every omitted datum contributes at most
+/// `exp(−8²/2)` = 1.27e-14 relative to a kernel centred on the query point. The total
+/// omitted mass is bounded by that times the number of excluded points, so the error is
+/// data-dependent in a way a rounding contract is not: a query in a sparse region, where
+/// the retained points contribute little, can see a larger RELATIVE error than the
+/// per-point figure suggests, even though the absolute error stays tiny.
+///
+/// The radius is the parameter that matters and it is not conservative by much: at 6
+/// bandwidths the per-point bound is 1.52e-08, six orders worse. Anything that widens
+/// the gate or narrows the radius changes this contract and should re-derive it.
+///
+/// The fast arm also declines several inputs outright — fewer than 4096 query points,
+/// fewer than 512 data points, a non-finite bandwidth, or any non-finite query — and on
+/// those the two arms are byte-identical because only one of them exists.
 pub static GAUSSIAN_KDE_TAIL_WINDOW_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Same-binary A/B toggle for the vectorised kernel exponential. When true, the KDE
+/// evaluates `exp` through the standard library instead of the SIMD path.
+///
+/// CONTRACT: NOT byte-identical. The fast arm is Cephes' rational approximation to
+/// `exp`, evaluated by Horner in SIMD lanes — an APPROXIMATION, not a vectorised call to
+/// the same function, which is the distinction the toggle's name does not make.
+///
+/// MEASURED, by transcribing this exact polynomial and its exact coefficients and
+/// comparing against libm over the range the KDE actually uses (arguments from 0 down to
+/// −80, since the exponent is `−½((x−xᵢ)/h)²` and the caller has already clamped to
+/// non-positive): worst-case relative error 3.07e-16, which is 1.38 ulp of the result,
+/// at x ≈ −73.8. So the two arms agree to within about one and a half ulp per kernel
+/// evaluation, and a KDE value summing `n` kernels inherits that per term rather than
+/// amplifying it — the sum is of non-negative quantities, so there is no cancellation to
+/// magnify the difference.
 pub static GAUSSIAN_KDE_SIMD_EXP_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -49980,6 +50014,17 @@ fn normplot_ppcc(transformed: &[f64], osm: &[f64]) -> f64 {
 /// Toggle forcing the PPCC / normality-plot shape sweeps (`ppcc_plot`,
 /// `boxcox_normplot`, `yeojohnson_normplot`) onto the serial path, for A/B
 /// measurement. Default `false` = the shapes fan across cores.
+///
+/// CONTRACT: BYTE-IDENTICAL either way. The fan is over the `n_shapes` grid points,
+/// which are INDEPENDENT — each shape's correlation is computed from the full dataset on
+/// its own. There are reductions inside a grid point (the sort, the `pearsonr` sums), but
+/// they are the same reductions in the same order in both arms; only which thread runs
+/// them changes. Nothing is combined ACROSS shapes, so no summation order that affects a
+/// result is altered.
+///
+/// That distinction is the whole contract: parallelism over independent outputs is exact,
+/// parallelism that splits a reduction is not. If a future revision fans over the DATA
+/// within a shape rather than over the shapes, this becomes a tolerance.
 pub static NORMPLOT_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -59965,6 +60010,84 @@ impl<F: Fn(f64) -> f64> RatioUniforms<F> {
     pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Result<Vec<f64>, StatsError> {
         (0..n).map(|_| self.try_sample_one(rng)).collect()
     }
+
+    /// Simple Ratio-of-Uniforms: derive the bounding rectangle from the mode and
+    /// the area, instead of making the caller supply it.
+    ///
+    /// Matches `scipy.stats.sampling.SimpleRatioUniforms(dist, mode=, pdf_area=,
+    /// cdf_at_mode=)`. This removes the failure mode documented on
+    /// [`RatioUniforms`] itself: a hand-chosen rectangle that is too small
+    /// silently yields the wrong distribution, and here it cannot be too small
+    /// because it is derived from a proof.
+    ///
+    /// # The bound, derived rather than quoted
+    ///
+    /// SciPy documents only a reference (UNU.RAN §5.3.16, Leydold 2001), so the
+    /// rectangle here is derived from unimodality alone:
+    ///
+    /// * `√f(x) ≤ √f(m)`, so `umax = √f(m)`.
+    /// * Past the mode `f` is non-increasing, so `A ≥ ∫ₘˣ f ≥ (x−m)·f(x)`, giving
+    ///   `f(x) ≤ A/(x−m)`. Together with `f(x) ≤ f(m)` the two bounds cross at
+    ///   `x−m = A/f(m)`, where both give `|x−m|·√f(x) ≤ A/√f(m)`. That is the `v`
+    ///   bound, and it needs only that `f` is unimodal — not log-concavity.
+    ///
+    /// # Two independent confirmations that this is UNU.RAN's rectangle
+    ///
+    /// The rectangle has area `2A` while the acceptance region has area `A/2`, so
+    /// the rejection constant is **4** — exactly the constant UNU.RAN documents
+    /// for SROU. Supplying `F(m)` splits the `v` interval by the one-sided areas
+    /// (`A·F(m)` below, `A·(1−F(m))` above, each by the same argument restricted
+    /// to one side), giving total area `A` and a rejection constant of **2** —
+    /// exactly the halving SciPy's docstring describes. Two constants agreeing
+    /// with the reference implementation is what makes this a derivation rather
+    /// than a guess.
+    ///
+    /// `pdf_area` may be an UPPER BOUND on the area rather than the area itself;
+    /// the rectangle only grows, so correctness survives and only the rejection
+    /// rate suffers. SciPy says the same.
+    ///
+    /// # Errors
+    ///
+    /// Non-finite `mode`, non-positive or non-finite `pdf_area`, a `pdf` that is
+    /// not positive and finite at the mode, or a `cdf_at_mode` outside `[0, 1]`.
+    pub fn simple(
+        pdf: F,
+        mode: f64,
+        pdf_area: f64,
+        cdf_at_mode: Option<f64>,
+    ) -> Result<Self, StatsError> {
+        if !mode.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "mode must be finite, got {mode}"
+            )));
+        }
+        if !(pdf_area > 0.0) || !pdf_area.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "pdf_area must be positive and finite, got {pdf_area}"
+            )));
+        }
+        if let Some(fm) = cdf_at_mode {
+            if !(0.0..=1.0).contains(&fm) {
+                return Err(StatsError::InvalidArgument(format!(
+                    "cdf_at_mode must lie in [0, 1], got {fm}"
+                )));
+            }
+        }
+        let f_mode = pdf(mode);
+        if !(f_mode > 0.0) || !f_mode.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "the pdf must be positive and finite at the mode, got {f_mode}"
+            )));
+        }
+        let umax = f_mode.sqrt();
+        // One-sided areas when the cdf at the mode is known, else the whole area
+        // on each side.
+        let (area_below, area_above) = match cdf_at_mode {
+            Some(c) => (pdf_area * c, pdf_area * (1.0 - c)),
+            None => (pdf_area, pdf_area),
+        };
+        Self::new(pdf, umax, -area_below / umax, area_above / umax, mode)
+    }
 }
 
 #[cfg(test)]
@@ -60066,6 +60189,114 @@ mod ratio_uniforms_matches_scipy {
         // succeeds, so the error above is about the density and not the budget.
         let ok = RatioUniforms::new(|_x: f64| 1.0, 1.0, -1.0, 1.0, 0.0).expect("valid bounds");
         assert!(ok.try_sample_one(&mut rng).is_ok());
+    }
+
+    /// SROU's derived rectangle must CONTAIN the acceptance region. This is the
+    /// property the whole construction rests on, and the one whose failure is
+    /// silent: a rectangle missing a corner of the region simply never samples it
+    /// and returns a subtly wrong distribution.
+    ///
+    /// Checked directly against the definition on a dense grid, for a normal and
+    /// for a skewed (Gamma-like) density whose mode is not at zero and whose tails
+    /// are asymmetric.
+    #[test]
+    fn the_derived_rectangle_encloses_the_acceptance_region() {
+        // (pdf, mode, area, label)
+        let normal = (
+            Box::new(|x: f64| (-x * x / 2.0).exp()) as Box<dyn Fn(f64) -> f64>,
+            0.0,
+            std::f64::consts::TAU.sqrt(),
+            "unnormalised normal",
+        );
+        // Gamma(3, 1) unnormalised: x^2 e^-x on x > 0. Mode 2, area = Gamma(3) = 2.
+        let gamma = (
+            Box::new(|x: f64| if x > 0.0 { x * x * (-x).exp() } else { 0.0 })
+                as Box<dyn Fn(f64) -> f64>,
+            2.0,
+            2.0,
+            "unnormalised gamma(3,1)",
+        );
+        for (pdf, mode, area, label) in [normal, gamma] {
+            let r = RatioUniforms::simple(&pdf, mode, area, None).expect("valid");
+            // Walk a wide grid and require every point of the region to be inside.
+            for step in 0..40_000_i32 {
+                let x = mode + f64::from(step - 20_000) * 0.002;
+                let fx = pdf(x);
+                if fx <= 0.0 {
+                    continue;
+                }
+                let u = fx.sqrt();
+                let v = (x - mode) * u;
+                assert!(
+                    u <= r.umax * (1.0 + 1e-12),
+                    "{label}: u = {u} exceeds umax = {} at x = {x}",
+                    r.umax
+                );
+                assert!(
+                    v >= r.vmin * (1.0 + 1e-12) && v <= r.vmax * (1.0 + 1e-12),
+                    "{label}: v = {v} outside [{}, {}] at x = {x}",
+                    r.vmin,
+                    r.vmax
+                );
+            }
+            // The documented rejection constants, which is how the derivation was
+            // confirmed against UNU.RAN in the first place: rectangle area is 2A
+            // without the cdf at the mode, and A with it.
+            let rect = r.umax * (r.vmax - r.vmin);
+            assert!(
+                ((rect - 2.0 * area) / area).abs() < 1e-12,
+                "{label}: rectangle area {rect}, expected 2A = {}",
+                2.0 * area
+            );
+            let halved = RatioUniforms::simple(&pdf, mode, area, Some(0.5)).expect("valid");
+            let rect2 = halved.umax * (halved.vmax - halved.vmin);
+            assert!(
+                ((rect2 - area) / area).abs() < 1e-12,
+                "{label}: with cdf_at_mode the area should halve to {area}, got {rect2}"
+            );
+        }
+    }
+
+    /// And it actually samples the right distribution, not merely a valid region.
+    #[test]
+    fn srou_samples_the_distribution() {
+        let r = RatioUniforms::simple(
+            |x: f64| (-x * x / 2.0).exp(),
+            0.0,
+            std::f64::consts::TAU.sqrt(),
+            None,
+        )
+        .expect("valid");
+        let mut rng = StdRng::seed_from_u64(31337);
+        let n = 200_000;
+        let s = r.sample(n, &mut rng).expect("acceptance");
+        let mean = s.iter().sum::<f64>() / n as f64;
+        let var = s.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+        assert!(mean.abs() < 5.0 * (1.0 / n as f64).sqrt(), "mean {mean}");
+        assert!(
+            (var - 1.0).abs() < 5.0 * (2.0 / n as f64).sqrt(),
+            "var {var}"
+        );
+    }
+
+    #[test]
+    fn srou_validation() {
+        let f = |x: f64| (-x * x / 2.0).exp();
+        assert!(RatioUniforms::simple(f, f64::NAN, 1.0, None).is_err(), "mode NaN");
+        assert!(RatioUniforms::simple(f, 0.0, 0.0, None).is_err(), "area 0");
+        assert!(RatioUniforms::simple(f, 0.0, -1.0, None).is_err(), "area < 0");
+        assert!(
+            RatioUniforms::simple(f, 0.0, 1.0, Some(1.5)).is_err(),
+            "cdf_at_mode out of range"
+        );
+        // A pdf that is zero at the claimed mode cannot define a rectangle.
+        assert!(
+            RatioUniforms::simple(|_x: f64| 0.0, 0.0, 1.0, None).is_err(),
+            "pdf zero at the mode"
+        );
+        // MUST-MISS controls for each guard above.
+        assert!(RatioUniforms::simple(f, 0.0, 1.0, None).is_ok());
+        assert!(RatioUniforms::simple(f, 0.0, 1.0, Some(1.0)).is_ok(), "1.0 is in range");
     }
 
     #[test]
