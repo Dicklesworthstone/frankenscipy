@@ -20230,8 +20230,34 @@ fn matmul_thread_count(m: usize, ka: usize, n: usize) -> usize {
     let cores = std::thread::available_parallelism()
         .map(std::num::NonZero::get)
         .unwrap_or(1);
+    let cap = MATMUL_PAR_MAX_THREADS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    let cores = if cap == 0 { cores } else { cores.min(cap) };
     cores.min(m / 64).max(1)
 }
+
+/// A/B cap on the thread count [`matmul_thread_count`] may return (0 ⇒ uncapped).
+///
+/// `frankenscipy-gykw5`, and it tests the OPPOSITE direction from every other lever on that
+/// bead. Five measurements have shown that fanning out MORE is neutral or harmful in the
+/// n≈576-1280 loss band. The per-thread work says why that might be, and points the other way:
+///
+/// | n | first trailing update | threads chosen | MACs per thread |
+/// |---|---|---|---|
+/// | 640 | 33.6M | 8 | **4.2M** |
+/// | 832 | 63.4M | 11 | **5.8M** |
+/// | 2048 | 236M | 30 | **15.7M** |
+///
+/// n=2048 is where we WIN, and it is also where each worker gets ~3x more work than in the
+/// basin. `cores.min(m / 64)` guarantees only 64 rows per worker, which at these shapes leaves
+/// each one too little to amortise its own dispatch. Capping the count raises MACs per thread
+/// without touching how much total work is threaded — the one knob on this bead that makes
+/// each granule FATTER rather than more numerous.
+///
+/// BYTE-IDENTICAL either way: the count only decides how many disjoint row ranges the update is
+/// split into, and the kernel is chunking-independent.
+#[doc(hidden)]
+pub static MATMUL_PAR_MAX_THREADS_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// A/B override for the public `matmul` flat-workspace parallel gate (0 ⇒ default 8M
 /// macs). Same-binary A/B only; byte-identical either way.
@@ -29584,6 +29610,12 @@ mod tests {
 
     #[test]
     fn randomized_eigh_matches_full_eigh_on_low_rank() {
+        // Takes the toggle lock despite writing no toggle. It calls `randomized_eigh`
+        // TWICE and asserts the results are equal, so a concurrent test flipping an
+        // eigh toggle between those two calls makes the halves take different arms and
+        // the assertion fails for a reason that has nothing to do with this test. A
+        // reader of shared mutable state needs the lock as much as a writer does.
+        let _g = eigh_toggle_lock();
         let mut s: u64 = 0x0f1e_2d3c_4b5a_6978;
         let mut rng = || {
             s = s
@@ -32517,14 +32549,24 @@ mod tests {
         }
     }
 
-    /// Shared by every test in this module that writes a process-global perf
-    /// toggle. These statics are visible to all test threads at once, so two
-    /// toggle-writing tests running concurrently can both invent drift and mask
-    /// it. This is currently the only in-crate toggle writer (the others live
-    /// in benches, which are separate processes), so the lock is defensive --
-    /// it exists so the SECOND one shares it rather than discovering the race.
-    static EIGH_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn eigh_toggle_lock() -> std::sync::MutexGuard<'static, ()> {
+    /// Shared by every test ANYWHERE IN THE CRATE that writes, or depends on, a
+    /// process-global eigh perf toggle. These statics are visible to all test
+    /// threads at once, so two toggle-writing tests running concurrently can both
+    /// invent drift and mask it.
+    ///
+    /// This comment used to say the lock was "defensive -- it exists so the SECOND
+    /// one shares it rather than discovering the race". The second one arrived and
+    /// did NOT share: `mod toggle_ab_eigh_rank2_update` declared its own private
+    /// `static LOCK` and dutifully took it. Two disjoint mutexes over the same
+    /// globals is not mutual exclusion -- each module looked individually correct
+    /// while together they protected nothing, which is worse than no lock at all
+    /// because it reads as handled. That is frankenscipy-0xy3l: bit-identity and
+    /// determinism tests failing 2 of 3 runs under load on a clean tree.
+    ///
+    /// So it is `pub(crate)` now. A second lock for this state is a bug; if a new
+    /// module needs one, it needs THIS one.
+    pub(crate) static EIGH_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) fn eigh_toggle_lock() -> std::sync::MutexGuard<'static, ()> {
         EIGH_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -41847,13 +41889,15 @@ mod toggle_ab_eigh_rank2_update {
     };
     use std::sync::atomic::Ordering;
 
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // NO PRIVATE MUTEX HERE. This module used to declare its own `static LOCK` and
+    // take it faithfully, which excluded nothing: `mod tests` guards the same
+    // process-global eigh toggles with a DIFFERENT mutex, so the two could run at
+    // once and interleave writes between this test's two `eigh` calls. That is
+    // frankenscipy-0xy3l. One lock, crate-wide.
 
     #[test]
     fn rank2_update_rewrite_is_bit_identical() {
-        let _g = LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::tests::eigh_toggle_lock();
 
         // MUST-HIT / MUST-MISS on the detector: this test's whole content is a
         // bit comparison, so a comparison that cannot see a difference would pass
