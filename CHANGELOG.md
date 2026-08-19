@@ -14,6 +14,94 @@ License: MIT with OpenAI/Anthropic Rider
 
 ## [Unreleased] -- HEAD on main (workspace version 0.1.0)
 
+No git tags and no GitHub Releases exist. Continuous development on `main`.
+The crate inventory below is the 2026-05-16 snapshot (19 crates). The
+current-window waves after it cover **2026-05-17 through HEAD 2026-08-19**:
+**5,455 non-merge commits**, bringing `main` to **8,790** non-merge / **8,798**
+total commits.
+
+### 2026-08-19 — Repo-janitor docs-reorg
+
+Root planning and parity documents moved into [`docs/planning/`](docs/planning/).
+Live janitor commits:
+
+- [`fb631afa09`](https://github.com/Dicklesworthstone/frankenscipy/commit/fb631afa09f898bb8260b5318cabc2037de59008)
+  untrack skill-loop scratch; move `COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md`,
+  `PLAN_TO_PORT_SCIPY_TO_RUST.md`, `PROPOSED_ARCHITECTURE.md`, and
+  `SPEC_CROSSWALK_FRANKENSQLITE_TO_FRANKENSCIPY.md` into `docs/planning/`.
+- [`c754f9e1a9`](https://github.com/Dicklesworthstone/frankenscipy/commit/c754f9e1a901549f72ff69ac765f465299267e23)
+  drop agent-identity leaks and root scratch artifacts.
+- [`115467ec9c`](https://github.com/Dicklesworthstone/frankenscipy/commit/115467ec9c286219e9aebf5d3eb19daa2e86903e)
+  move remaining root planning/parity docs:
+  `FEATURE_PARITY.md`, `EXHAUSTIVE_LEGACY_ANALYSIS.md`,
+  `EXISTING_SCIPY_STRUCTURE.md`, `MASTER_EXECUTION_TODO.md`,
+  `PARITY-COVERAGE.md`, `PHASE2C_EXTRACTION_PACKET.md`, and
+  `UPGRADE_LOG.md` → `docs/planning/`.
+
+Canonical paths: [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md),
+[`docs/planning/EXHAUSTIVE_LEGACY_ANALYSIS.md`](docs/planning/EXHAUSTIVE_LEGACY_ANALYSIS.md),
+[`docs/planning/EXISTING_SCIPY_STRUCTURE.md`](docs/planning/EXISTING_SCIPY_STRUCTURE.md).
+
+### May 17 – August 19, 2026: vs-SciPy performance campaign, remaining surface, measurement integrity
+
+The previous changelog cut (2026-05-16) closed V1 surface buildout. The
+uncovered window is **not** another 3,000-function port: 2,012 of 5,455
+commits are `perf`, plus 682 `fix`, 670 `docs`, 503 `test`, 479 `feat`.
+June is the peak (2,597 commits). Themes:
+
+- **Vs-incumbent kernels.** Measured wins against live SciPy, not
+  self-speedups: integer-exponent batched `minkowski_distance` (4–12×),
+  parallel Kaiser/Hann family windows (17–20×), parallel Bessel dispatch
+  (~11–25×, byte-identical), `kendall_distance` merge-sort inversions
+  (42–168×, `O(n²)→O(n log n)`), `clarkson_woodruff_transform` implicit
+  CountSketch (345× vs explicit), `solve_toeplitz_many` (9–18×),
+  `wofz` Weideman rational (2–4× loss → parity–1.2× win),
+  `gammaincinv` iterate-break (`chdtri` 4.35× loss → 1.3–3.2× win),
+  `hilbert_many` (1.7–5.7×), `itairy_many`/`pbdv_many` gapfill (7.4–28×).
+- **Cholesky / eig / sparse factor campaign.** Blocked-Cholesky panel/TRSM
+  accounting (`gykw5`), Francis QR as an eig fallback that recovers 230
+  non-convergent cases then un-shipped as the default because it broke
+  `butter` ([`8a82fee7f`](https://github.com/Dicklesworthstone/frankenscipy/commit/8a82fee7f)),
+  supernodal/splu two-pointer merge, sparse `spsolve` banded routes
+  restored after an accidental rustfmt deletion.
+- **Remaining SciPy surface.** Late-window `feat` work: `root_nonlin` and
+  the Broyden/Anderson/Krylov Jacobian family, `goodness_of_fit`,
+  `NumericalInverseHermite` (UNU.RAN HINV), `RatioUniforms` /
+  `TransformedDensityRejection` / `DiscreteAliasUrn`, `truncate` /
+  `order_statistic`, Mathieu coefficients, `line_search`, MatrixNormal,
+  stats distances/losses (`xlogy`, Bray-Curtis, Huber, KL).
+- **Correctness that the harness actually caught.** `simpson` silently
+  swapped in trapezoid on a fine grid
+  ([`c419c4cbea`](https://github.com/Dicklesworthstone/frankenscipy/commit/c419c4cbea));
+  `TruncNormal` pdf cancellation on `[30,40]` (`45de1`); `sos2zpk`
+  deleted roots at the origin; `lsqr`/`lsmr` default iteration limits
+  now match SciPy (`zwi1v`); `tiecorrect` grouped ties by a `1e-10`
+  tolerance on a public API (`clttw`).
+- **Certified keep / reject.** `zdom3` KEEP: a 124.7× sparse loss became
+  an 84.2× win vs live SciPy
+  ([`206c4c1f5`](https://github.com/Dicklesworthstone/frankenscipy/commit/206c4c1f5));
+  `TruncWeibullMin` 46.6× vs live SciPy (`bxnn7`); Cholesky 1.204× at
+  `n=2048` (`8l8r1.151`). Several threading/SYRK levers were measured
+  and rejected (partition ceiling, surgical matmul gate, persistent-pool
+  TRSM).
+- **Measurement integrity.** Tautological `BINARY_BUILD_ROUTE` checks
+  replaced; host-pinned conversion beads unblocked from the wrong
+  diagnosis; load-ceiling on the Cholesky harness so a passing A/A null
+  could no longer certify a 1.5×-wrong cell.
+
+**Representative commits**
+
+- [`825b6b1c96`](https://github.com/Dicklesworthstone/frankenscipy/commit/825b6b1c96) `clarkson_woodruff_transform` implicit CountSketch
+- [`7ba1b38695`](https://github.com/Dicklesworthstone/frankenscipy/commit/7ba1b38695) integer-exponent batched Minkowski
+- [`8634e76ace`](https://github.com/Dicklesworthstone/frankenscipy/commit/8634e76ace) parallel Bessel dispatch
+- [`a53138be60`](https://github.com/Dicklesworthstone/frankenscipy/commit/a53138be60) `kendall_distance` inversions
+- [`f89428c3cc`](https://github.com/Dicklesworthstone/frankenscipy/commit/f89428c3cc) Faddeeva `wofz` Weideman rational
+- [`4c52efdb2`](https://github.com/Dicklesworthstone/frankenscipy/commit/4c52efdb2) Francis QR real Schur (sez4r)
+- [`13dc3852a`](https://github.com/Dicklesworthstone/frankenscipy/commit/13dc3852a) `goodness_of_fit`
+- [`47757cb6f`](https://github.com/Dicklesworthstone/frankenscipy/commit/47757cb6f) NumericalInverseHermite
+- [`206c4c1f5`](https://github.com/Dicklesworthstone/frankenscipy/commit/206c4c1f5) `zdom3` KEEP 84× vs live SciPy
+- [`c419c4cbea`](https://github.com/Dicklesworthstone/frankenscipy/commit/c419c4cbea) simpson/trapezoid silent swap
+
 ### Workspace crates (19 crates, ~140,000 lines of Rust source plus ~370,000 additional lines of tests, harnesses, and conformance fixtures)
 
 | Crate | First commit | Lines | Purpose |
