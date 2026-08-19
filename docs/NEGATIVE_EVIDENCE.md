@@ -38115,3 +38115,67 @@ or the harness accepts `powersave` with the per-arm MHz already recorded and say
 row. Everything upstream of gate 4 now works — the target builds, `ldd` shows no
 BLAS/LAPACK/MKL, and the SIMD candidate (`ndtri_isafloor_simd_candidate`) is already
 reconstructed in the library, so the reconstruction this bead asks for is already done.
+
+## 2026-08-19 — frankenscipy-hld7v — ROOT CAUSE: `AGENT_NAME` is hard-coded to `BlackThrush` in `~/.zshrc`
+
+The bead's secondary finding — "the holder is blocked, a non-holder is not" — was flagged as
+"worth checking as part of the same fix". It is the whole mechanism, and it is one line:
+
+    /home/ubuntu/.zshrc:53:  export AGENT_NAME=BlackThrush
+
+The guard's own comparison is CORRECT. `pre-push/50-agent-mail.py:593` computes
+`self_agent = AGENT_NAME.lower()` and `:603` skips a reservation when
+`holder.lower() == self_agent`. Nothing is wrong with that code. The defect is the value it is
+handed.
+
+### Why this inverts the guard
+
+Every Bash invocation is a fresh shell that sources `~/.zshrc`, so `AGENT_NAME` resets to
+`BlackThrush` on every command. An agent registered under its own name only carries that name
+into git if it exports it **in the same command as the git call**. Therefore:
+
+- An agent (say `MistyBear`) that forgets the export identifies to the guard as `BlackThrush`.
+  Its own reservations are held by `MistyBear`, which is NOT the self-agent, so **it is blocked
+  by its own lease**.
+- Anything that does commit as `BlackThrush` has every `BlackThrush`-held reservation skipped.
+
+That is exactly the asymmetry the bead describes: the legitimate owner is inconvenienced, and
+it trains agents to release leases early — which is the behaviour that leaves paths unguarded
+while a negative control is in flight.
+
+### Both arms observed, same file, same staged diff, minutes apart
+
+Reservation on `docs/NEGATIVE_EVIDENCE.md` held by `MistyBear`, active for both arms.
+
+| arm | `AGENT_NAME` at commit time | result |
+|---|---|---|
+| MUST-HIT | `BlackThrush` (the `~/.zshrc` default — i.e. any agent that forgets to export) | **BLOCKED**: "conflicts with reservation … held by MistyBear" |
+| MUST-MISS | `MistyBear` (the actual holder) | **ALLOWED** |
+
+The only variable between the two runs is the environment variable. This was first hit
+accidentally earlier today: a `git push` with no export was refused on my own reservation,
+which is what pointed at the cause.
+
+### What it does and does not explain
+
+EXPLAINS: the inverted guard, and why agents release leases early — the practice that leaves a
+window open for a sweep. It also explains why `21c11204f` and `586505148` are both authored
+`BlackThrush` and why RubyBeacon "could not identify the auto-committer": there may be no
+separate auto-committer process at all. A commit by any agent that did not export its own name
+is indistinguishable from one by BlackThrush, in both the git identity and the guard's view.
+
+DOES NOT EXPLAIN, and I am not claiming it: how a path reserved by `TopazOsprey` was swept.
+A `BlackThrush` identity should still have been blocked by a `TopazOsprey` lease. Either that
+reservation had lapsed at commit time, or one of the two silent bypasses on
+`50-agent-mail.py:640-645` was set in that environment. Both bypasses `sys.exit(0)` with no
+output, so nothing in the commit record distinguishes "guard ran and approved" from "guard was
+skipped" — which remains the bead's sharpest open point and is unaffected by this finding.
+
+### The fix is not mine to make
+
+`AGENTS.md` forbids agents modifying hooks, and `~/.zshrc` is user configuration. The change is
+one line — unset the hard-coded default, or have the guard treat a `BlackThrush` value as
+"unidentified" and refuse rather than self-skip, the same way it already refuses on an empty
+`AGENT_NAME` at `:637`. A guard that silently self-approves for the one identity every
+unconfigured shell carries is strictly worse than one that blocks, because it fails open for
+precisely the commits nobody is watching.
