@@ -37636,12 +37636,62 @@ case needs load to appear, which the flat-CV neighbours argue is an amplifier ra
 cause. The decisive test is to pin `RAYON_NUM_THREADS` and re-measure n=896-1024: if the
 variance collapses, obtained parallelism is confirmed as the variable.
 
+### RETRACTED WITHIN THE HOUR: the size-specificity does not replicate
+
+Everything above this heading about n=1024 being SPECIAL is **withdrawn**. I published it and
+then ran the replication I should have run first.
+
+Three consecutive repeats of the identical fsci-only measurement (12 replicates, reps=2,
+min_of=9), same binary, same fixtures:
+
+| repeat | host load | n=512 CV | n=1024 CV | n=2048 CV |
+|---|---|---|---|---|
+| baseline | 27.8 | 1.11% | **17.64%** | 2.29% |
+| a | 13.6 | **16.71%** | 6.89% | 2.27% |
+| 1 | 16.2 | 3.62% | 9.15% | **21.99%** |
+| 2 | ~60 | 18.53% | **28.45%** | 19.50% |
+| 3 | 99.6 | 18.03% | **29.79%** | 20.13% |
+
+**The high-CV size moves.** It was n=1024, then n=512, then n=2048, and by the last two
+repeats every size was elevated — those two ran while host load climbed to 99.6. The variance
+tracks LOAD, not size. There is no n=1024 anomaly to explain, and therefore nothing for the
+straddle mechanism to be the mechanism OF.
+
+What this cost: a table of six sizes whose CV peaked at 896-1024 looked like clean support for
+a parallel-panel straddle. It was one draw from a distribution whose mode wanders. Six points
+in one run is not a replication, and I presented it as one.
+
+### The scoreboard, since four hypotheses were tested and all four are dead
+
+| hypothesis | verdict | what killed it |
+|---|---|---|
+| SciPy arm evicts our cache between halves | **REFUTED** | fsci-only null is WORSE (1.233) than with SciPy |
+| Systematic first-half warmup penalty | **REFUTED** | `f_a > f_b` and `f_b > f_a` both occur |
+| Obtained rayon parallelism varies at the straddle | **REFUTED** | `RAYON_NUM_THREADS=1` makes CV WORSE (14.61%), not better |
+| Power-of-two row-stride cache aliasing | **REFUTED** | n=1023 / 1024 / 1025 all 6.7-8.1%, no step at 1024 |
+| n=1024 is a special size at all | **REFUTED** | high-CV size wanders across repeats |
+
+### What actually survives
+
+1. `FSCI_CHOL_NO_SCIPY` is a genuinely useful instrument and stays: it separates "our arm" from
+   "our arm plus the incumbent's footprint" in one flag, and it is what refuted hypothesis 1.
+2. Our Cholesky timing variance is LARGE and LOAD-SENSITIVE at every size below n=2048 — CV
+   from 1% to 30% and max/min up to 2.8 on the same binary and fixture. That is the real,
+   replicated finding, and it is the same load-dependence this ledger already documents for
+   the vs-SciPy ratios, now measured on a single arm with no incumbent in the process.
+3. The gate refusing n=1024 cells was never diagnosing a size. It was refusing windows, which
+   is exactly its job, and the certified rows at 256/512/2048 are unaffected.
+
+`frankenscipy-1ps0o` should be reframed accordingly: its premise "at that size and no other"
+is not supported by replication.
+
 ### Why this matters beyond one refused cell
 
-It is not a measurement artefact to be worked around — it is a real property of the shipped
-factorisation. At the straddle sizes our Cholesky can take nearly twice as long from one run
-to the next, and a user gets whichever mode they get. The harness refusing to certify n=1024
-was correct, and what it was refusing to certify was a genuinely unstable number.
+(Written before the retraction above, and kept because the general point survives even though
+its "straddle sizes" framing does not.) The instability is a real property of the shipped
+factorisation, not a harness artefact: our Cholesky can take nearly twice as long from one run
+to the next and a user gets whichever mode they get. What is NOT established is that any
+particular size owns that behaviour.
 
 ### The re-run that would promote the provisional rows
 
