@@ -6585,7 +6585,21 @@ pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgEr
             let a22 = t_mat[(i + 1, i + 1)];
             let trace = a11 + a22;
             let det_block = a11 * a22 - a12 * a21;
-            let disc = trace * trace - 4.0 * det_block;
+            // `4*(p^2 + bc)`, NOT `trace^2 - 4*det`. Equal in exact arithmetic --
+            // `(a+d)^2 - 4(ad - bc) = (a-d)^2 + 4bc` -- and not in floating point: the
+            // second form subtracts two individually large, nearly equal quantities, so
+            // the difference loses its leading digits. A discriminant that should be
+            // slightly negative then lands on exactly zero, `im` comes out 0, and a
+            // CONJUGATE PAIR IS REPORTED AS REAL. That is a structurally different
+            // answer, not a rounding one: a caller branching on "is this eigenvalue
+            // real" is told yes when the truth is no.
+            //
+            // It bites at small scale, where the cancelling terms are closest in
+            // magnitude: at 2^-60 SciPy returns |Im| = 8.67e-19 and this returned 0.
+            // The first form is LAPACK's (`dlanv2` builds its discriminant the same
+            // way) and cancels only in the genuinely near-degenerate case.
+            let half_diff = (a11 - a22) / 2.0;
+            let disc = 4.0 * (half_diff * half_diff + a12 * a21);
             let re = trace / 2.0;
             let im = (-disc).max(0.0).sqrt() / 2.0;
             eigenvalues_re.push(re);
@@ -6894,7 +6908,21 @@ pub fn eigvals(
             let a22 = t_mat[(i + 1, i + 1)];
             let trace = a11 + a22;
             let det_block = a11 * a22 - a12 * a21;
-            let disc = trace * trace - 4.0 * det_block;
+            // `4*(p^2 + bc)`, NOT `trace^2 - 4*det`. Equal in exact arithmetic --
+            // `(a+d)^2 - 4(ad - bc) = (a-d)^2 + 4bc` -- and not in floating point: the
+            // second form subtracts two individually large, nearly equal quantities, so
+            // the difference loses its leading digits. A discriminant that should be
+            // slightly negative then lands on exactly zero, `im` comes out 0, and a
+            // CONJUGATE PAIR IS REPORTED AS REAL. That is a structurally different
+            // answer, not a rounding one: a caller branching on "is this eigenvalue
+            // real" is told yes when the truth is no.
+            //
+            // It bites at small scale, where the cancelling terms are closest in
+            // magnitude: at 2^-60 SciPy returns |Im| = 8.67e-19 and this returned 0.
+            // The first form is LAPACK's (`dlanv2` builds its discriminant the same
+            // way) and cancels only in the genuinely near-degenerate case.
+            let half_diff = (a11 - a22) / 2.0;
+            let disc = 4.0 * (half_diff * half_diff + a12 * a21);
             let re = trace / 2.0;
             let im = (-disc).max(0.0).sqrt() / 2.0;
             eigenvalues_re.push(re);

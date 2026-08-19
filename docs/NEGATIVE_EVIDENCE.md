@@ -36781,3 +36781,43 @@ alone in `_fit_funs`, and every other distribution falls through to `dist.fit`, 
 MLE. Both tests are valid, since each simulates its null with the same estimator it used on
 the data; but the statistics are not comparable between them, and ours is the self-consistent
 one. Filed separately.
+
+## CORRECTIONS to the sez4r flip row above, and a second flip attempt that also failed
+
+2026-08-18, same session. Host: loadavg 17.7-39.2, CPU idle 84%, runq 11. Two things in
+the row above are wrong and are corrected here rather than edited in place.
+
+**CORRECTION 1 — the flip broke THREE tests, not one.** I committed that row before the
+full suite finished and reported only the failure I had diagnosed. The complete set:
+
+ * `eig_keeps_complex_pairs_complex_at_every_scale_the_incumbent_does` — the real defect.
+ * `eig_bounds_the_schur_iteration_instead_of_hanging` — sez4r's OWN regression test,
+   which asserts the bounded path reports `ConvergenceFailure`. Francis converging on
+   everything makes that assertion false. A test encoding the old behaviour, not a defect.
+ * `eigvals_is_bit_identical_to_full_eig` — `eigvals` and `eig` diverged, meaning only
+   one of them routes through the toggle. A real wiring gap in the flip.
+
+**CORRECTION 2 — my "second scale bug" was not a bug.** I wrote that
+`standardize_2x2_blocks` comparing `zz` against `4.0 * eps` is an absolute threshold on a
+dimensioned quantity. LAPACK's `dlanv2` compares its `Z` against `MULTPL*EPS` in exactly
+the same way, so that line MATCHES the peer. Changing it would have been improving on the
+incumbent rather than matching it, which is the opposite of the standing rule. Withdrawn.
+
+### The second flip attempt, and what it did establish
+
+I fixed the discriminant in two places — `hessenberg_qr::eig2x2` and BOTH copies of
+`eig`'s downstream 2x2 classifier — replacing `trace^2 - 4*det` with `(a-d)^2 + 4bc`.
+These are equal in exact arithmetic and not in floating point: the first subtracts two
+individually large, nearly equal quantities, so a discriminant that should be slightly
+negative can land on exactly zero and report a conjugate pair as REAL. That is LAPACK's
+formulation and it removes a genuine cancellation.
+
+**It did not fix the failure.** With the flip on, `|Im|` is still 0 at 2^-60 against
+SciPy's 8.67e-19, and the reported spectrum `[0, 0, 2.6e-18, 2.6e-18]` shows the pair
+arriving as two 1x1 blocks — so the 2x2 is being split UPSTREAM of the classifier and the
+discriminant is never the deciding step. The remaining suspect is the split decision
+inside `standardize_2x2_blocks` or the deflation test feeding it. Flip reverted again.
+
+**THE DISCRIMINANT FIX IS KEPT AND IS VERIFIED SAFE ON THE DEFAULT PATH:** 576 passed, 0
+failed with `EIG_USE_FRANCIS_SCHUR = false`. It touches code both routes share, so
+"correct but unmeasured" would not have been good enough to keep it.

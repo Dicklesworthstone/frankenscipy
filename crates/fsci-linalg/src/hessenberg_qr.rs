@@ -198,7 +198,17 @@ fn to_hessenberg(h: &mut Mat, z: &mut Mat) {
 fn eig2x2(a: f64, b: f64, c: f64, d: f64) -> (Eigenvalue, Eigenvalue) {
     let tr = a + d;
     let det = a * d - b * c;
-    let disc = 0.25 * tr * tr - det;
+    // `p^2 + bc`, NOT `tr^2/4 - det`. The two are equal in exact arithmetic --
+    // `(a+d)^2/4 - (ad - bc) = ((a-d)/2)^2 + bc` -- and not in floating point: the
+    // second form subtracts two quantities that are individually large and nearly
+    // equal, so the difference loses its leading digits and a discriminant that should
+    // be slightly negative can land on exactly zero. That reports a conjugate pair as
+    // REAL, which is a structurally different answer rather than a rounding one, and it
+    // is what broke `eig_keeps_complex_pairs_complex_at_every_scale_the_incumbent_does`
+    // at 2^-60. The first form is LAPACK's (`dlanv2` builds its discriminant the same
+    // way) and has no such cancellation.
+    let p = 0.5 * (a - d);
+    let disc = p * p + b * c;
     if disc >= 0.0 {
         let r = disc.sqrt();
         // Both roots via the numerically stable form: compute the larger by
