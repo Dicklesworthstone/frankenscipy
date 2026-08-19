@@ -38666,3 +38666,99 @@ our Cholesky curve and a better target than anything in this bead.
   in direction and magnitude, which is corroboration and not a second decided cell.
 - The n≈768 loss is one size on one fixture family (`A = MMᵀ + nI`). Whether the minimum is a
   property of our blocking or of SciPy's is not established here.
+
+## 2026-08-19 — frankenscipy-gykw5 — it is NOT a notch at n=768: a BROAD BASIN, n≈576–1280, bottoming at 0.621x
+
+Result class: CAMPAIGN-WIN
+Incumbent ratio: SciPy / FrankenSciPy = 0.621x
+Legacy incumbent arm: SciPy 1.17.1 `scipy.linalg.cholesky(lower=True, check_finite=False)`,
+  timed side-by-side with our arm in the same-invocation (both arms in one process, ABBA
+  interleaved with their A/A nulls; side-by-side same-invocation raw samples are in the
+  committed artifact).
+harness=crates/fsci-linalg/src/bin/perf_chol_vs_scipy.rs
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms one process)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=64 actual observed worker threads=64 (scipyN observed 64 tasks;
+  scipy1 observed 2; ours the shared rayon pool)
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.178)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.155)
+frankenscipy-engine-sha256 = 944716a15fef52114604db473ca53152857b25f519e4a6616d214cf523640fc4
+executed-binary ELF SHA-256 = 944716a15fef52114604db473ca53152857b25f519e4a6616d214cf523640fc4
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+Same-invocation A/A null: 1.020 (ours) and 1.029 (SciPy) at the worst cell, n=832
+Decision: candidate CI — each cell decided on its own A/A nulls against a 2x A/A-null margin;
+  n=832 reads 0.621x with nulls of 1.020/1.029, i.e. a 38% deficit against a ~4-6% noise floor,
+  far outside the margin. Six cells are decided losses.
+CV is provenance only and was not used for this decision.
+iowait=0. Per-cell loadavg and MHz in the table below.
+
+### I FILED THIS BEAD AN HOUR AGO AND ITS HEADLINE WAS THE SHALLOWEST POINT OF THE PROBLEM
+
+`gykw5` says "n≈768 is a certified LOSS (0.954x) between wins at 512 and 2048 — a local minimum".
+Bracketing it, per that bead's own probe 1, shows the opposite of a local minimum. Every
+`gates=PASS` cell, one harness, one fixture family (`A = MMᵀ + nI`):
+
+| n | scipy1/fsci | **scipyN/fsci** | null_f | null_s | clock | gates |
+|---|---|---|---|---|---|---|
+| 512 | 1.370 | **1.283** | 1.013 | 1.023 | 1.118 | PASS — win |
+| 576 | 0.907 | **0.858** | 1.044 | 1.032 | 1.020 | PASS — **loss** |
+| 640 | 0.953 | **0.805** | 1.013 | 1.015 | 1.096 | PASS — **loss** |
+| 704 | 0.957 | **0.730** | 1.036 | 1.016 | 1.056 | PASS — **loss** |
+| 768 | 1.149 | **0.954** | 1.040 | 1.023 | 1.177 | PASS — **loss** |
+| 832 | 0.955 | **0.621** | 1.020 | 1.029 | 1.165 | PASS — **loss, worst** |
+| 896 | 1.038 | 0.668 | 1.058 | 1.019 | 1.097 | refused (own null) |
+| 960 | 0.981 | 0.622 | 1.095 | 1.067 | 1.060 | refused (own null) |
+| 1088 | 1.078 | 0.667 | 1.080 | 1.046 | 1.019 | refused (own null) |
+| 1280 | 1.589 | **0.875** | 1.035 | 1.016 | 1.059 | PASS — **loss** |
+| 2048 | 1.733–2.067 | **1.204–1.521** | 1.019–1.027 | 1.006–1.014 | 1.168 | PASS — win |
+
+**SIX certified losses, not one, spanning n≈576 to n≈1280, bottoming at 0.621x at n=832.**
+n=768's 0.954x — the number I put in the bead title — is the SHALLOWEST cell in the band. I
+picked it because it was the only one I had measured, and a single point cannot show a shape.
+The three refused cells (896, 960, 1088) sit at 0.62–0.67 and are consistent with the basin,
+but they are refused and are not counted.
+
+### The shape says what kind of problem it is
+
+Against SINGLE-THREADED SciPy we are at 0.907–1.589 across the whole band — near parity, and
+winning at the ends. Against 64-THREAD SciPy we are at 0.621–0.954 throughout. The deficit is
+therefore not in the kernel arithmetic; it is in **parallel efficiency against SciPy's threaded
+LAPACK across a broad mid-size band**. Per-core we are competitive; per-machine we are not,
+until the problem gets big enough (n=2048) for our fan-out to pay.
+
+The incumbent also ran on FASTER cores in every loss cell (clock_ratio 1.02–1.18, e.g. 2634 MHz
+against our 2260 at n=832), so the measured deficits are if anything understated.
+
+### What is already ruled out, and must not be retried
+
+Both measured today under `frankenscipy-ua3gn`, in this ledger:
+
+- **Panel-TRSM worker reuse** (persistent rayon pool vs spawn-per-panel): IN-FLOOR where it
+  runs — 1.020x against a 1.026 null at n=2048 — and it does not run at all at n≤512.
+- **Lowering the TRSM parallel MACs gate**: DECIDED REGRESSION. 0.8365x at n=512, CI95
+  [0.7564, 0.8682] against a 2x-null band of 0.9740. More fan-out is worse.
+
+So "thread the TRSM harder" is answered and is not the lever.
+
+### Where I would look next, none of it run
+
+1. The trailing SYRK gate, not the TRSM one. `matmul_thread_count` returns 1 below 64M MACs;
+   with nb=128 that means the trailing update goes parallel only while `m2 ≥ ~724`. Across
+   n≈576–1280 a *minority* of panels clear it, so most of the trailing update runs serial while
+   SciPy's is threaded throughout. That matches the band's location and its recovery by n=2048
+   better than anything in the TRSM path.
+2. `CHOL_NB_OVERRIDE`: the NB staircase switches at n≥1000, so most of this basin sits at the
+   top of the NB=128 band.
+3. Whether the basin is a property of `A = MMᵀ + nI` or of any SPD matrix — one fixture family
+   is one fixture family.
+
+### Honest limits
+
+- Three cells in the band (896, 960, 1088) refused their own A/A nulls and are reported as
+  refused. Their point estimates support the basin; they do not certify it.
+- The ends are certified from different runs and windows (n=512 twice, n=2048 four times); the
+  basin cells are one run each, though six independent cells agreeing in direction is stronger
+  than any one of them.
+- Every cell is `shift`-free dense Cholesky on one fixture family at one boundary. No claim is
+  made about other SPD structure.
