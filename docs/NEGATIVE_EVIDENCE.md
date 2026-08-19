@@ -36646,7 +36646,7 @@ reported for completeness and are NOT certified.
 
 | arm | converged of 7000 |
 |---|---|
-| nalgebra (, the shipped path) | 6770 |
+| nalgebra (`bounded_schur`, the shipped path) | 6770 |
 | Francis double-shift QR with LAPACK exceptional shifts | **7000** |
 
 **recovered_by_francis = 230. regressed_under_francis = 0.** That is exactly the 230 the
