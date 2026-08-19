@@ -152,7 +152,7 @@ Execution scope requested: complete all previously identified next steps in one 
 ## 5. Documentation and Tracking Updates
 
 - [x] Update `FEATURE_PARITY.md` for P2C-002 and oracle/dashboard state transitions.
-- [x] Update `PROPOSED_ARCHITECTURE.md` to include new conformance/dashboard/oracle flows.
+- [x] Update `docs/planning/PROPOSED_ARCHITECTURE.md` to include new conformance/dashboard/oracle flows.
 - [x] Update `README.md` usage notes for:
   - [x] linalg packet runner
   - [x] oracle capture workflow

@@ -19,14 +19,14 @@ Legacy corpus:
 - Upstream oracle: `scipy/scipy`
 
 Project contracts:
-- `/data/projects/frankenscipy/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md`
+- `/data/projects/frankenscipy/docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md`
 - `/data/projects/frankenscipy/EXISTING_SCIPY_STRUCTURE.md`
-- `/data/projects/frankenscipy/PLAN_TO_PORT_SCIPY_TO_RUST.md`
-- `/data/projects/frankenscipy/PROPOSED_ARCHITECTURE.md`
+- `/data/projects/frankenscipy/docs/planning/PLAN_TO_PORT_SCIPY_TO_RUST.md`
+- `/data/projects/frankenscipy/docs/planning/PROPOSED_ARCHITECTURE.md`
 - `/data/projects/frankenscipy/FEATURE_PARITY.md`
 
 Specification status:
-- `COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md` includes sections `14-20` (crate contracts, conformance matrix, threat matrix, CI gates, and RaptorQ envelope); remaining work is empirical validation of those sections against live artifacts.
+- `docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md` includes sections `14-20` (crate contracts, conformance matrix, threat matrix, CI gates, and RaptorQ envelope); remaining work is empirical validation of those sections against live artifacts.
 
 ## 2. Quantitative Legacy Inventory (Measured)
 
@@ -176,7 +176,7 @@ Definition of done for Phase-2:
 ## 11. Residual Gaps and Risks
 
 - sections 14-20 now exist; top release risk is numeric-budget miscalibration before first benchmark cycle.
-- `PROPOSED_ARCHITECTURE.md` crate map formatting contains literal `\n`; normalize before automation.
+- `docs/planning/PROPOSED_ARCHITECTURE.md` crate map formatting contains literal `\n`; normalize before automation.
 - numerical correctness regressions can be subtle; broad differential corpus is mandatory before heavy optimization.
 
 ## 12. Deep-Pass Hotspot Inventory (Measured)
@@ -547,7 +547,7 @@ Aligned with `docs/TEST_CONVENTIONS.md` structured logging and `fsci-runtime` te
 
 ### 22.2 Hotspot hypotheses (explicit and testable)
 
-All hotspot validation follows the project optimization loop and gate requirements: baseline p50/p95/p99 + memory, one optimization lever at a time, parity proof, and delta artifact (`AGENTS.md:304`, `AGENTS.md:310`, `COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:204`).
+All hotspot validation follows the project optimization loop and gate requirements: baseline p50/p95/p99 + memory, one optimization lever at a time, parity proof, and delta artifact (`AGENTS.md:304`, `AGENTS.md:310`, `docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:204`).
 
 1. Sparse matching/flow kernels: runtime should scale with edge density, and dense fallback risk should be visible as memory spikes; benchmark sweeps must vary `|E|/|V|` and emit `timing_ms` + `memory_peak`.
 2. `least_squares` crossover: `'exact'` should dominate only for small dense Jacobians; large/sparse regimes should favor `'lsmr'`; benchmark by Jacobian density and dimension.
@@ -568,7 +568,7 @@ Artifacts must be emitted in the locked topology (`docs/ARTIFACT_TOPOLOGY.md:23`
 |---|---|---|
 | solver simplification that weakens tolerance/stability behavior | violates documented doctrine that numerical stability outranks speed | reject unless conformance + invariant evidence proves no tolerance drift (`docs/TEST_CONVENTIONS.md:510`, `AGENTS.md:318`) |
 | skipping baseline/profile/re-baseline loop | hides regression tails and memory blowups | enforce mandatory loop artifacts for every optimization (`AGENTS.md:308`, `AGENTS.md:314`) |
-| perf-only change that alters observable semantics | fails Acceptance Gate C requirement of no semantic regression | require Gate C evidence before closure (`COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:204`) |
+| perf-only change that alters observable semantics | fails Acceptance Gate C requirement of no semantic regression | require Gate C evidence before closure (`docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:204`) |
 | removing or weakening CASP stiffness handling for speed | can cause effective hangs on stiff systems | require threat-matrix mitigation evidence for switch/certification behavior (`docs/threat_matrix.json:102`, `docs/threat_matrix.json:108`) |
 | changing FFT fallback/dispatch semantics without explicit policy | may alter user-visible backend behavior and numerical route | prove parity on strict mode and document any hardened-only divergence with tests (`docs/DOC_PASS_04_EXECUTION_PATH_TRACING.md:1672`) |
 | missing parity/benchmark artifact sidecars | breaks auditable recovery and topology lock | emit `.raptorq.json` and `.decode_proof.json` for long-lived artifacts and enforce an automated existence check in packet closure gates (`docs/ARTIFACT_TOPOLOGY.md:62`, `docs/ARTIFACT_TOPOLOGY.md:67`) |
@@ -598,7 +598,7 @@ Artifacts must be emitted in the locked topology (`docs/ARTIFACT_TOPOLOGY.md:23`
 1. No optimization-only change is admissible without behavior-isomorphism proof:
    baseline -> profile -> one lever -> conformance+invariants -> re-baseline (`AGENTS.md:308-314`).
 2. Gate coupling is mandatory for all packet closures:
-   Gate A (parity), Gate B (security/adversarial), Gate C (performance without semantic drift), Gate D (RaptorQ durability) (`COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:200-208`).
+   Gate A (parity), Gate B (security/adversarial), Gate C (performance without semantic drift), Gate D (RaptorQ durability) (`docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:200-208`).
 3. Structured logging is part of correctness evidence:
    major test/e2e paths must emit replay fields listed in section 21.4 (including `trace_id`, `mode`, `artifact_refs`, `timing_ms`, `memory_peak`).
 4. Artifact topology is locked:
@@ -631,7 +631,7 @@ Each downstream pass must explicitly reuse:
 
 | ID | Issue found | Resolution applied | Evidence |
 |---|---|---|---|
-| RT-01 | spec-gap statement claimed missing sections `14-20` although those sections exist | section 1 updated to reflect current spec status and focus on empirical validation, not missing structure | `COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:232`, `EXHAUSTIVE_LEGACY_ANALYSIS.md:28` |
+| RT-01 | spec-gap statement claimed missing sections `14-20` although those sections exist | section 1 updated to reflect current spec status and focus on empirical validation, not missing structure | `docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:232`, `EXHAUSTIVE_LEGACY_ANALYSIS.md:28` |
 | RT-02 | canonical legacy root path differed between docs (`/data/projects/...` vs `/dp/...`) | `EXISTING_SCIPY_STRUCTURE.md` root normalized to `/data/projects/frankenscipy/legacy_scipy_code/scipy` | `EXISTING_SCIPY_STRUCTURE.md:5`, `EXHAUSTIVE_LEGACY_ANALYSIS.md:18` |
 | RT-03 | pass/bead linkage was easy to misread across pass-11/pass-12 handoff statements | pass label for `bd-3jh.23.13` is now explicit as DOC-PASS-12 wherever referenced in handoff narrative | `EXHAUSTIVE_LEGACY_ANALYSIS.md:599`, `EXISTING_SCIPY_STRUCTURE.md:390` |
 

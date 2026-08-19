@@ -278,7 +278,7 @@ For every hypothesis, record `p50/p95/p99` + `memory_peak` and emit artifacts un
 
 - numerical stability outranks speed; performance-only wins are invalid if they alter tolerance/conditioning behavior (`docs/TEST_CONVENTIONS.md:510`).
 - optimization workflow is mandatory: baseline -> profile -> one lever -> parity proof -> re-baseline (`AGENTS.md:308`).
-- acceptance Gate C requires performance budgets with no semantic regressions (`COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:204`).
+- acceptance Gate C requires performance budgets with no semantic regressions (`docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md:204`).
 - stiff-system handling is not optional; optimization cannot bypass CASP switching/certification expectations (`docs/threat_matrix.json:102`, `docs/threat_matrix.json:108`).
 - long-lived performance/conformance artifacts must retain durability sidecars (`docs/ARTIFACT_TOPOLOGY.md:62`, `docs/ARTIFACT_TOPOLOGY.md:67`).
 

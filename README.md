@@ -955,7 +955,7 @@ FrankenSciPy is part of a deliberate family of "Franken*" projects that share th
 | **[asupersync](https://github.com/Dicklesworthstone/asupersync)** | Async runtime | The exclusive async runtime FrankenSciPy depends on |
 | **[ftui](https://github.com/Dicklesworthstone/ftui)** | Terminal UI rendering | Drives the `conformance_dashboard` binary |
 | **[FrankenTerm](https://github.com/Dicklesworthstone/frankenterm)** | Terminal emulator (a WezTerm fork) | Sibling project; same doctrine |
-| **[FrankenSQLite](https://github.com/Dicklesworthstone/frankensqlite)** | SQLite re-implementation | Sibling project; shares the `SPEC_CROSSWALK_FRANKENSQLITE_TO_FRANKENSCIPY.md` doctrine alignment |
+| **[FrankenSQLite](https://github.com/Dicklesworthstone/frankensqlite)** | SQLite re-implementation | Sibling project; shares the `docs/planning/SPEC_CROSSWALK_FRANKENSQLITE_TO_FRANKENSCIPY.md` doctrine alignment |
 | **[FrankenLibc / FrankenFS](https://github.com/Dicklesworthstone/)** | libc + filesystem | Where the strict-vs-hardened compatibility-security model first crystallized |
 | **[beads_rust (`br`)](https://github.com/Dicklesworthstone/beads_rust)** | Issue tracker | The dependency-aware ticket database used to drive work |
 
@@ -1984,16 +1984,16 @@ A. GitHub issues are open. Bug reports, especially numerical-regression reports 
 | [`README.md`](README.md) | You are here |
 | [`CHANGELOG.md`](CHANGELOG.md) | Landed capabilities, by domain, with linked commits |
 | [`AGENTS.md`](AGENTS.md) | Guidelines and conventions for AI agents working in the repo |
-| [`COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md`](COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md) | Prime directive, product thesis, V1 scope, compatibility/security model |
+| [`docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md`](docs/planning/COMPREHENSIVE_SPEC_FOR_FRANKENSCIPY_V1.md) | Prime directive, product thesis, V1 scope, compatibility/security model |
 | [`FEATURE_PARITY.md`](FEATURE_PARITY.md) | Per-module SciPy parity assessment |
-| [`PROPOSED_ARCHITECTURE.md`](PROPOSED_ARCHITECTURE.md) | Crate map, runtime plan, mode model, performance contract |
-| [`PLAN_TO_PORT_SCIPY_TO_RUST.md`](PLAN_TO_PORT_SCIPY_TO_RUST.md) | Porting strategy and prioritization |
+| [`docs/planning/PROPOSED_ARCHITECTURE.md`](docs/planning/PROPOSED_ARCHITECTURE.md) | Crate map, runtime plan, mode model, performance contract |
+| [`docs/planning/PLAN_TO_PORT_SCIPY_TO_RUST.md`](docs/planning/PLAN_TO_PORT_SCIPY_TO_RUST.md) | Porting strategy and prioritization |
 | [`EXISTING_SCIPY_STRUCTURE.md`](EXISTING_SCIPY_STRUCTURE.md) | Reference catalog of the SciPy public surface |
 | [`EXHAUSTIVE_LEGACY_ANALYSIS.md`](EXHAUSTIVE_LEGACY_ANALYSIS.md) | Deep audit of the legacy SciPy code paths the conformance harness targets |
 | [`docs/ARTIFACT_TOPOLOGY.md`](docs/) | Locked artifact directory schema |
 | [`docs/ORACLE_WORKFLOW.md`](docs/) | Full Python oracle capture → regen → provenance → CI lane workflow |
 | [`docs/schemas/`](docs/) | Governance-gated JSON schemas (`behavior_ledger`, `contract_table`, `threat_matrix`) |
-| [`SPEC_CROSSWALK_FRANKENSQLITE_TO_FRANKENSCIPY.md`](SPEC_CROSSWALK_FRANKENSQLITE_TO_FRANKENSCIPY.md) | Cross-project doctrine alignment with the FrankenSQLite project |
+| [`docs/planning/SPEC_CROSSWALK_FRANKENSQLITE_TO_FRANKENSCIPY.md`](docs/planning/SPEC_CROSSWALK_FRANKENSQLITE_TO_FRANKENSCIPY.md) | Cross-project doctrine alignment with the FrankenSQLite project |
 
 ---
 
