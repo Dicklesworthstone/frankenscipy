@@ -37998,3 +37998,37 @@ either `threadripperje` is reachable and these runs should happen there, or the 
 relaxed to "record the host and refuse to pool rows across hosts", or the beads should be
 marked blocked instead of sitting at P1 READY where each agent re-discovers this. Two of the
 nine also have no harness at all, which no amount of host access fixes.
+
+---
+
+## sez4r's own closing criterion, RUN rather than asserted: all nine named fixtures behave as the bead required
+
+2026-08-19. **Result class: BEHAVIORAL.** same_host: fixmydocuments, loadavg
+[1.33 1.64 1.23], 4740.934 MHz, iowait 0%. Probe: `probe_sez4r_named_fixtures` (MARKER
+`sez4r-named-fixtures-v1`), built and run through
+`RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec`.
+
+**Observed value: 5/5 converge with the fallback, 5/5 still fail without it, 4/4
+bit-identical.** Counts and bit comparisons only; no duration measured or implied.
+
+sez4r's last open comment named nine fixtures and said they settle whether the shipped
+change does what it claims. It had never been run against them. Now it has:
+
+| arm | fixtures | observed |
+|---|---|---|
+| must converge | (5,201) (5,213) (5,234) (6,319) (6,335) | **5/5 converge** with the fallback |
+| — its must-hit control | same five | **5/5 still FAIL** with the fallback disabled |
+| must be unchanged | (5,0) (6,0) (8,999) (8,42) | **4/4 bit-identical** |
+
+**Why the middle row is not redundant.** Checking only that the five now converge would
+pass for a stale fixture set — if a fixture had drifted into converging on its own, that arm
+would be testing nothing while printing green. Re-running each with `EIG_FRANCIS_FALLBACK`
+disabled and requiring it to STILL fail is what proves these are the failing cases the bead
+meant. And the bit-identity arm is compared against the same binary with the fallback off,
+not against a remembered value, so it directly tests the structural claim the delivery row
+rests on: the fallback may change behaviour only on inputs that previously returned
+`ConvergenceFailure`.
+
+Independently, the code state matches: `grep '\.schur()'` finds zero live call sites — the
+only two matches are inside a comment recording their replacement — and `bounded_schur` uses
+`Schur::try_new(m, f64::EPSILON, 30 * n.max(10))`, the bound sez4r specified.
