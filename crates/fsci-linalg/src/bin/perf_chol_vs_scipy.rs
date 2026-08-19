@@ -40,7 +40,10 @@ fn main() {
 
 #[cfg(unix)]
 mod harness {
-    use fsci_linalg::{CHOL_SYRK_NC_OVERRIDE, DecompOptions, cholesky};
+    use fsci_linalg::{
+        CHOL_PANEL_TRSM_PAR_PANELS, CHOL_PANEL_TRSM_STD_SCOPE, CHOL_SYRK_NC_OVERRIDE,
+        DecompOptions, cholesky,
+    };
     use std::io::{BufRead, BufReader, Read, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::time::Instant;
@@ -675,6 +678,24 @@ for raw_line in sys.stdin.buffer:
         out
     }
 
+    /// Best-of-`min_of` wall seconds with the panel-TRSM scope arm selected.
+    ///
+    /// `std_scope = false` (the shipped default) dispatches each panel's TRSM onto rayon's
+    /// PERSISTENT pool, exactly as the trailing SYRK already does. `true` restores the old
+    /// `std::thread::scope` arm, which spawns fresh OS threads per panel and joins them before
+    /// the next — the cost `frankenscipy-ua3gn` measured as making fan-out net-negative below
+    /// ~15M MACs per panel.
+    ///
+    /// Both arms hand disjoint `&mut` row ranges to the same kernel and neither scope imposes
+    /// an order, so the factor is BYTE-IDENTICAL either way — asserted before any timing. That
+    /// is what makes this a cost comparison rather than a comparison of two computations.
+    fn time_fsci_trsm(a: &[Vec<f64>], reps: usize, min_of: usize, std_scope: bool) -> f64 {
+        CHOL_PANEL_TRSM_STD_SCOPE.store(std_scope, std::sync::atomic::Ordering::Relaxed);
+        let out = time_fsci(a, reps, min_of);
+        CHOL_PANEL_TRSM_STD_SCOPE.store(false, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
     /// Best-of-`min_of` wall seconds for `reps` fsci factorisations.
     fn time_fsci(a: &[Vec<f64>], reps: usize, min_of: usize) -> f64 {
         let mut best = f64::INFINITY;
@@ -811,6 +832,8 @@ for raw_line in sys.stdin.buffer:
 
         // The NC-blocking arm under test. 0 disables the arm entirely (the harness then
         // measures only fsci against SciPy, exactly as before).
+        // frankenscipy-ua3gn: time the two panel-TRSM scope arms against each other.
+        let trsm_arm = std::env::var("FSCI_CHOL_TRSM_AB").is_ok_and(|v| v != "0");
         let nc_arm: usize = std::env::var("FSCI_CHOL_NC")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -831,7 +854,7 @@ for raw_line in sys.stdin.buffer:
         );
         println!(
             "sizes={sizes:?} replicates={replicates} reps={reps} min_of={min_of} seed={seed:#x} \
-             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy}"
+             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy} trsm_ab={trsm_arm}"
         );
 
         for &n in &sizes {
@@ -917,6 +940,29 @@ for raw_line in sys.stdin.buffer:
                  buying speed with accuracy"
             );
 
+            if trsm_arm {
+                // The two scope arms must produce the SAME FACTOR BITS, or the timing below
+                // compares two computations rather than two dispatch strategies.
+                CHOL_PANEL_TRSM_STD_SCOPE.store(false, std::sync::atomic::Ordering::Relaxed);
+                let pool_f = cholesky(&a, true, DecompOptions::default()).expect("spd factors");
+                CHOL_PANEL_TRSM_STD_SCOPE.store(true, std::sync::atomic::Ordering::Relaxed);
+                let std_f = cholesky(&a, true, DecompOptions::default()).expect("spd factors");
+                CHOL_PANEL_TRSM_STD_SCOPE.store(false, std::sync::atomic::Ordering::Relaxed);
+                let differing = pool_f
+                    .factor
+                    .iter()
+                    .flatten()
+                    .zip(std_f.factor.iter().flatten())
+                    .filter(|(x, y)| x.to_bits() != y.to_bits())
+                    .count();
+                println!("n={n} trsm_scope_byte_identity differing_bits={differing}");
+                assert_eq!(
+                    differing, 0,
+                    "n={n}: the two panel-TRSM scope arms disagree in {differing} entries; they \
+                     are supposed to differ in dispatch, not arithmetic"
+                );
+            }
+
             // Warm the fsci arm outside every timer, matching the SciPy side's warmup.
             //
             // THREE factorisations, not one. With a single warmup the n=256 cell returned an
@@ -934,6 +980,8 @@ for raw_line in sys.stdin.buffer:
             // SciPy ratios in the same cell are what say whether the lever matters.
             let mut r_nc = Vec::with_capacity(replicates);
             let mut null_nc = Vec::with_capacity(replicates);
+            let mut r_trsm = Vec::with_capacity(replicates);
+            let mut null_trsm = Vec::with_capacity(replicates);
             // Every load and clock sample taken anywhere inside this cell, so the gates
             // below judge the window the ratio was actually measured in rather than a
             // single reading taken before it.
@@ -967,6 +1015,17 @@ for raw_line in sys.stdin.buffer:
                     null_nc.push(d_a.max(d_b) / d_a.min(d_b));
                     // > 1 means NC-blocking is FASTER than the shipped traversal.
                     r_nc.push(d_t / nc_t);
+                }
+                if trsm_arm {
+                    // ABBA inside the replicate so a drift across the cell cancels rather
+                    // than loading one arm.
+                    let pool_a = time_fsci_trsm(&a, reps, min_of, false);
+                    let std_a = time_fsci_trsm(&a, reps, min_of, true);
+                    let std_b = time_fsci_trsm(&a, reps, min_of, true);
+                    let pool_b = time_fsci_trsm(&a, reps, min_of, false);
+                    null_trsm.push(pool_a.max(pool_b) / pool_a.min(pool_b));
+                    // > 1 means the PERSISTENT rayon pool (the shipped default) is faster.
+                    r_trsm.push(std_a.min(std_b) / pool_a.min(pool_b));
                 }
                 cell_loads.extend([load_f0, load_f1, load_s1, load_sn]);
                 cell_mhz_fsci.extend([mhz_f0, mhz_f1]);
@@ -1033,6 +1092,30 @@ for raw_line in sys.stdin.buffer:
                  gates={verdict} loadavg_post={}",
                 read_trimmed("/proc/loadavg"),
             );
+            if trsm_arm {
+                let mt = median(&mut r_trsm.clone());
+                let nt = median(&mut null_trsm.clone());
+                let ok = (nt - 1.0).abs() <= 0.05;
+                // Raw per-replicate ratios and the OBSERVED rayon worker count, so a
+                // bootstrap-median CI can be computed from the printed vector rather than
+                // asserted, and so the row can state observed workers instead of requested.
+                println!(
+                    "n={n} TRSM_RAW observed_workers={} requested_workers={} ratios={}",
+                    rayon::current_num_threads(),
+                    std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+                    r_trsm
+                        .iter()
+                        .map(|v| format!("{v:.9}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                println!(
+                    "n={n} TRSM_ARM std_scope/rayon_pool={mt:.3}x (>1 = persistent pool faster) \
+                     null_trsm={nt:.3} par_panels={} trsm_gates={}",
+                    CHOL_PANEL_TRSM_PAR_PANELS.load(std::sync::atomic::Ordering::Relaxed),
+                    if ok && load_ok { "PASS" } else { "FAIL" }
+                );
+            }
             if nc_arm > 0 {
                 let mnc = median(&mut r_nc.clone());
                 let nnc = median(&mut null_nc.clone());

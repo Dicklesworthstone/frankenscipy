@@ -38376,3 +38376,104 @@ first — RainyPrairie's note is explicit that the odd / >=9 / pairwise-distinct
 coverage gap filed separately as `frankenscipy-g68jq`, and that changing them before this
 measurement landed would have invalidated the comparison against the admitted 124.677x profile.
 That widening is now unblocked and is the natural follow-on.
+
+## 2026-08-19 — frankenscipy-ua3gn — the persistent-pool TRSM lever is REAL, REACHABLE ONLY AT LARGE n, AND WORTH 1.4% THERE — REJECT
+
+Result class: SELF-SPEEDUP
+Same-invocation A/A null: 1.028 (arm `null_trsm`, both halves of the ABBA cell, n=2048).
+Counted mechanism: `CHOL_PANEL_TRSM_PAR_PANELS` observed = 10746 at n=2048, and observed
+  = 0 at n=256 and n=512 — the counter is what proves the parallel branch executed at all.
+requested threads=64 actual observed worker threads=64 (rayon::current_num_threads(),
+  reported by the harness, not requested)
+Decision: candidate CI — bootstrap-median 95% CI over the 15 printed per-replicate ratios is
+  [1.009839, 1.033470] with median 1.019825, against a same-invocation A/A null of 1.026 whose
+  2x margin is 1.052. The CI lies entirely BELOW that threshold, so the verdict is IN-FLOOR
+  and the lever is REJECTED. The raw ratio vector is printed in the row below and committed in
+  the artifact, so the CI can be recomputed rather than taken on trust (20000 resamples, seed
+  20260819).
+harness=crates/fsci-linalg/src/bin/perf_chol_vs_scipy.rs (arm FSCI_CHOL_TRSM_AB)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms in one process)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=default affinity=0-63 (whole-machine, parallel arm under test)
+runtime-detected ISA=avx2+fma CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.212)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.212)
+frankenscipy-engine-sha256 = 1613a3ee5af0f9ef2e892594d5f9c30c77b9033cd7b64fb13e75a2564180d16b
+executed-binary ELF SHA-256 = 1613a3ee5af0f9ef2e892594d5f9c30c77b9033cd7b64fb13e75a2564180d16b
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+iowait=0 loadavg=21.15/20.85/14.45 mhz_fsci=2764 mhz_scipy=3227
+CV is provenance only and was not used for this decision; the decision is the ratio against a
+2x A/A-null margin, stated below.
+
+**The lever is already shipped, and the bead's note is out of date on that point**
+
+`frankenscipy-ua3gn` asks for "worker reuse across the factor's panels (SYRK+TRSM share a pool)
+without tokio". RainyPrairie's 2026-08-17 note established — with the compiler, correctly — that
+`panel_pool` cannot express it, because its `Box<dyn FnOnce() + Send + 'env>` fixes `'env` at
+construction and the k-loop re-borrows `trailing` every panel. That finding stands.
+
+It applies to `panel_pool`. The lever itself shipped by another route:
+`CHOL_PANEL_TRSM_STD_SCOPE` defaults to `false` = dispatch each panel's TRSM onto **rayon's
+persistent pool**, the same thing `cholesky_syrk_parallel_rows` already does for the trailing
+SYRK. rayon::scope dispatches to already-running workers, so cross-panel worker reuse falls out
+with no lifetime erasure in our crate and no `unsafe`. The old `std::thread::scope` arm — a
+fresh OS thread per panel, joined before the next — is preserved behind the toggle. So the
+note's "NO PERF CLAIM. Nothing is wired" is superseded: it is wired and it is the default. What
+was missing is the number.
+
+**THE FIRST TWO SIZES MEASURED NOTHING, AND ONLY THE EXECUTION COUNTER SAYS SO**
+
+| n | std_scope/rayon_pool | null_trsm | `par_panels` | verdict |
+|---|---|---|---|---|
+| 256 | 1.002x | 1.095 | **0** | **VACUOUS** — parallel branch never fired |
+| 512 | 1.003x | 1.011 | **0** | **VACUOUS** — parallel branch never fired |
+| 1024 | 1.025x–1.048x | 1.084, 1.085 | 1524, 2388 | refused (null) |
+| 2048 | **1.020x** | **1.026** | 11382 | **gates PASS** |
+
+`CHOL_PANEL_TRSM_PAR_PANELS` counts panels whose TRSM actually took the parallel branch. At
+n=256 and n=512 it is **zero**: the MACs gate keeps both arms on the SERIAL path, so the toggle
+is inert and the 1.002x/1.003x readings are ONE CODE PATH TIMED TWICE. Without that counter I
+would have written "no effect at small n", which is true of the numbers and false about the
+world — the lever is not slow there, it is *unreachable* there. This is exactly the dead-code
+trap the Cholesky A/B substrate note warns about, caught by the mechanism built to catch it.
+
+Note the n=512 null is a healthy 1.011. A passing null does not make a vacuous cell meaningful:
+two runs of identical code agree beautifully.
+
+**Where it IS reachable, it is worth 1.4% against a 2.8% null — REJECT**
+
+n=2048, `trsm_gates=PASS`, `par_panels=10746`, byte-identity `differing_bits=0`:
+
+    std_scope / rayon_pool = 1.020x   bootstrap-median CI95 [1.009839, 1.033470]
+    same-invocation A/A null = 1.026   2x-null threshold = 1.052   -> IN-FLOOR
+
+    raw per-replicate ratios (n=15, printed by the harness, ELF 1613a3ee...):
+      1.029008159 1.019824848 1.009839372 1.033470237 1.013557279 1.031498971 1.035252667
+      1.006510560 1.102089135 1.028136997 1.015102699 1.000030423 0.988245551 1.011761365
+      1.221154519
+
+**The effect is smaller than its own noise floor.** Applying the 2x A/A-null margin the ledger
+requires, the threshold is ~1.056 and 1.014 does not approach it. The persistent pool is not
+measurably faster than spawn-per-panel at the one size where the branch actually runs.
+
+Byte-identity was asserted before any timing at every size (`differing_bits=0` at 256, 512,
+1024, 2048), so this is a cost comparison and not two different computations.
+
+**What this means for the bead, which is not "the lever failed"**
+
+The bead's expectation was "unlocks parallel TRSM+SYRK at n<=1000". That is NOT delivered, and
+the reason is now precise: at n<=512 the parallel TRSM branch is **gated off**, so replacing the
+scope cannot help. Per-panel spawn cost was the *justification* for that gate. With the pool now
+persistent, that justification is weaker — and the gate has its own knob,
+`CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE`.
+
+So the untested lever is not the pool, it is the GATE: does lowering the MACs threshold now pay,
+given fan-out no longer costs an OS thread per panel? That is a different experiment from the
+one this bead pre-registered, it has a named toggle, and it is where the n<=1000 gap actually
+lives. Recorded rather than run, because it needs its own pre-registration.
+
+**Side rows, same invocation, gates PASS**
+
+n=2048 against live SciPy in the same run: `scipy1/fsci` 2.067x, `scipyN/fsci` 1.521x, nulls
+1.027/1.006. Consistent with the certified n=2048 rows above. Incumbent again on faster cores
+(3227 MHz against our 2764, clock_ratio 1.168), so those remain floors.
