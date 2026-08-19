@@ -795,6 +795,20 @@ for raw_line in sys.stdin.buffer:
         let reps = env_usize("FSCI_CHOL_REPS", 3);
         let min_of = env_usize("FSCI_CHOL_MIN_OF", 3);
         let seed = 0x5eed_c0de_u64;
+        // frankenscipy-1ps0o: run the fsci arm ALONE, with no SciPy child in the invocation.
+        //
+        // This is the discriminator for the n=1024 A/A-null anomaly. Our own arm's null
+        // misses 1.0 by 8-13% at n=1024 and at no other size, five times, including in a
+        // quiet window where n=256 and n=512 certified at 1.049 and 1.008. Two stories fit:
+        // the second half of each cell runs AFTER both SciPy arms and is paying for cache
+        // they evicted (the n=1024 working set is ~8 MB + 8 MB, small enough to be resident
+        // and therefore losable, where n=2048 misses either way); or the asymmetry is
+        // internal to our factorisation at that size.
+        //
+        // Removing the SciPy children separates them: if the null returns to ~1.0 the cause
+        // is the other arms, if it persists it is ours. Nothing else about the cell changes.
+        let no_scipy = std::env::var("FSCI_CHOL_NO_SCIPY").is_ok_and(|v| v != "0");
+
         // The NC-blocking arm under test. 0 disables the arm entirely (the harness then
         // measures only fsci against SciPy, exactly as before).
         let nc_arm: usize = std::env::var("FSCI_CHOL_NC")
@@ -817,12 +831,44 @@ for raw_line in sys.stdin.buffer:
         );
         println!(
             "sizes={sizes:?} replicates={replicates} reps={reps} min_of={min_of} seed={seed:#x} \
-             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm}"
+             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm} no_scipy={no_scipy}"
         );
 
         for &n in &sizes {
             let a = spd_fixture(n, seed);
             let bytes = to_row_major_bytes(&a);
+
+            if no_scipy {
+                // Same cell shape as the full path -- same warmup, same ABBA halves, same
+                // best-of -- with the SciPy arms simply absent. Anything else changed here
+                // would make the comparison to the full run meaningless.
+                std::hint::black_box(time_fsci(&a, 3, 1));
+                let ambient = loadavg_1min();
+                let mut nulls = Vec::with_capacity(replicates);
+                for rep in 0..replicates {
+                    let (mhz0, load0) = (cpu_mhz_mean(), loadavg_1min());
+                    let f_a = time_fsci(&a, reps, min_of);
+                    let f_b = time_fsci(&a, reps, min_of);
+                    let (mhz1, load1) = (cpu_mhz_mean(), loadavg_1min());
+                    let null = f_a.max(f_b) / f_a.min(f_b);
+                    nulls.push(null);
+                    println!(
+                        "n={n} rep={rep} FSCI_ONLY f_a={f_a:.6e}s f_b={f_b:.6e}s null={null:.3} \
+                         mhz {mhz0:.0}->{mhz1:.0} load {load0:.2}->{load1:.2}"
+                    );
+                }
+                let med = median(&mut nulls.clone());
+                println!(
+                    "n={n} FSCI_ONLY null_fsci={med:.3} ambient={ambient:.2}/{max_load:.2} \
+                     verdict={}",
+                    if (med - 1.0).abs() <= 0.05 {
+                        "NULL_CLEAN (the SciPy arms were the cause)"
+                    } else {
+                        "NULL_STILL_DIRTY (internal to our path)"
+                    }
+                );
+                continue;
+            }
 
             let (mut scipy1, ready1) = Scipy::start("scipy1", n, &bytes, true);
             let (mut scipyn, readyn) = Scipy::start("scipyN", n, &bytes, false);

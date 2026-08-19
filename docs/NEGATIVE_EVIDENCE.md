@@ -37569,6 +37569,80 @@ only because its headline 1.042x would otherwise look like the best number here.
 The lever stays SHIPPED OFF. A 2.7% effect that needs a quiet host to resolve is not worth a
 default change on the strength of one cell.
 
+### 2026-08-19 — the n=1024 null anomaly diagnosed, and MY OWN HYPOTHESIS REFUTED
+
+`frankenscipy-1ps0o` recorded that `perf_chol_vs_scipy` cannot certify n=1024 because our own
+A/A null misses 1.0 there and at no other size. It proposed a cache-eviction mechanism: the
+second half of each cell runs after the 64-task SciPy arm, and at n=1024 the ~8 MB working set
+is small enough to be resident and therefore losable, where n=2048 misses either way.
+
+**That hypothesis is REFUTED.** A `FSCI_CHOL_NO_SCIPY` mode was added which runs the identical
+cell — same warmup, same ABBA halves, same best-of — with no SciPy child in the process at all.
+If eviction were the cause the null would come back clean. It did not:
+
+| n | null_fsci, NO SciPy in the process | ambient |
+|---|---|---|
+| 512 | 1.014 | 52.26 |
+| **1024** | **1.233** | 52.26 |
+| 2048 | 1.036 | 58.18 |
+
+n=1024 is WORSE without SciPy than with it (1.078-1.178 in the full runs), while its
+neighbours stay clean in the same loaded window. The cause is internal to our path.
+
+### It is VARIANCE, not bias — and the direction alternates
+
+Per-replicate inspection kills the warmup story too: `f_a > f_b` in some replicates and
+`f_b > f_a` in others, so there is no systematic first-half penalty. What there is, is spread.
+Same binary, no SciPy, 24 samples per size:
+
+| n | median (s) | **CV%** | max/min |
+|---|---|---|---|
+| 512 | 3.4383e-03 | **1.11** | 1.046 |
+| **1024** | 3.5581e-02 | **17.64** | **2.906** |
+| 2048 | 1.0528e-01 | **2.29** | 1.110 |
+
+A max/min of 2.9 is not noise, it is BIMODALITY: whole runs land in a slow mode. The same
+n=1024 cell measured 1.94e-2 s equivalent in one run and 3.56e-2 s in another — a 1.8x
+difference in the median, between runs of the same binary on the same fixture.
+
+### Mechanism: n=1024 straddles the parallel-SYRK gate. Supported, not established.
+
+`matmul_thread_count(m2, nb, m2)` returns 1 below 64M macs. With the default `nb = 128` that
+means the trailing SYRK goes parallel only while `m2 >= ~724`. So:
+
+  - n=512 — `m2` never reaches 724, so EVERY panel is serial. Stable: CV 1.11%.
+  - n=2048 — most panels are parallel and average out. CV 2.29%.
+  - n≈1024 — a MINORITY of panels are parallel, and those few dominate the run time, so
+    whatever parallelism they actually obtain from a shared rayon pool swings the total.
+
+Prediction tested in a quiet window (ambient 19.9), CV against the number of parallel panels:
+
+| n | CV% | max/min | parallel panels |
+|---|---|---|---|
+| 640 | 5.13 | 1.193 | 0/5 |
+| 768 | 4.04 | 1.157 | 0/6 |
+| **896** | **8.04** | 1.349 | **1/7** |
+| **1024** | **7.50** | 1.368 | **2/8** |
+| 1280 | 4.58 | 1.153 | 4/10 |
+| 1536 | 4.30 | 1.172 | 6/12 |
+
+CV peaks exactly at the sizes with the smallest NON-ZERO number of parallel panels and falls
+away on both sides. That is the shape the mechanism predicts.
+
+HONEST LIMIT: in this quiet window the peak is 8.0% against 4-5% at the flanks — the right
+shape but a modest margin, and nothing like the 17.6% seen at moderate load. So the straddle
+is SUPPORTED by the size-ordering and NOT established as the whole story; the severe bimodal
+case needs load to appear, which the flat-CV neighbours argue is an amplifier rather than the
+cause. The decisive test is to pin `RAYON_NUM_THREADS` and re-measure n=896-1024: if the
+variance collapses, obtained parallelism is confirmed as the variable.
+
+### Why this matters beyond one refused cell
+
+It is not a measurement artefact to be worked around — it is a real property of the shipped
+factorisation. At the straddle sizes our Cholesky can take nearly twice as long from one run
+to the next, and a user gets whichever mode they get. The harness refusing to certify n=1024
+was correct, and what it was refusing to certify was a genuinely unstable number.
+
 ### The re-run that would promote the provisional rows
 
 Rebuild (already committed) and run, with `uptime` checked immediately before and the
