@@ -40,7 +40,7 @@ fn main() {
 
 #[cfg(unix)]
 mod harness {
-    use fsci_linalg::{DecompOptions, cholesky};
+    use fsci_linalg::{CHOL_SYRK_NC_OVERRIDE, DecompOptions, cholesky};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::time::Instant;
@@ -660,6 +660,21 @@ for raw_line in sys.stdin.buffer:
         out
     }
 
+    /// Best-of-`min_of` wall seconds for `reps` fsci factorisations at a given NC setting.
+    ///
+    /// `nc = 0` is the shipped single-pass SYRK traversal; `nc > 0` selects the NC-blocked
+    /// one. The toggle is set ONCE around the whole timed region, not per iteration, so the
+    /// atomic store is never part of what is being timed. The two arms are bit-identical by
+    /// construction and by `chol_syrk_nc_blocking_is_bit_identical`, so any difference here
+    /// is cost and nothing else — which is the only reason a same-binary A/B on it is
+    /// meaningful rather than a comparison of two different computations.
+    fn time_fsci_nc(a: &[Vec<f64>], reps: usize, min_of: usize, nc: usize) -> f64 {
+        CHOL_SYRK_NC_OVERRIDE.store(nc, std::sync::atomic::Ordering::Relaxed);
+        let out = time_fsci(a, reps, min_of);
+        CHOL_SYRK_NC_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        out
+    }
+
     /// Best-of-`min_of` wall seconds for `reps` fsci factorisations.
     fn time_fsci(a: &[Vec<f64>], reps: usize, min_of: usize) -> f64 {
         let mut best = f64::INFINITY;
@@ -780,6 +795,12 @@ for raw_line in sys.stdin.buffer:
         let reps = env_usize("FSCI_CHOL_REPS", 3);
         let min_of = env_usize("FSCI_CHOL_MIN_OF", 3);
         let seed = 0x5eed_c0de_u64;
+        // The NC-blocking arm under test. 0 disables the arm entirely (the harness then
+        // measures only fsci against SciPy, exactly as before).
+        let nc_arm: usize = std::env::var("FSCI_CHOL_NC")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         let max_load: f64 = std::env::var("FSCI_CHOL_MAX_LOAD")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -796,7 +817,7 @@ for raw_line in sys.stdin.buffer:
         );
         println!(
             "sizes={sizes:?} replicates={replicates} reps={reps} min_of={min_of} seed={seed:#x} \
-             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO}"
+             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO} nc_arm={nc_arm}"
         );
 
         for &n in &sizes {
@@ -862,6 +883,11 @@ for raw_line in sys.stdin.buffer:
             let mut r_scipyn = Vec::with_capacity(replicates);
             let mut null_fsci = Vec::with_capacity(replicates);
             let mut null_s1 = Vec::with_capacity(replicates);
+            // NC-blocking arm: ratio against our own default traversal, plus its own A/A
+            // null. This is a SELF-speedup and is labelled as one — it is the lever, and the
+            // SciPy ratios in the same cell are what say whether the lever matters.
+            let mut r_nc = Vec::with_capacity(replicates);
+            let mut null_nc = Vec::with_capacity(replicates);
             // Every load and clock sample taken anywhere inside this cell, so the gates
             // below judge the window the ratio was actually measured in rather than a
             // single reading taken before it.
@@ -883,6 +909,19 @@ for raw_line in sys.stdin.buffer:
                 let (s1_b, _) = scipy1.time(reps, min_of);
                 let f_b = time_fsci(&a, reps, min_of);
                 let (mhz_f1, load_f1) = (cpu_mhz_mean(), loadavg_1min());
+                // NC arm, ABBA against the default arm inside the same replicate so the two
+                // traversals are compared in the same window rather than across cells.
+                if nc_arm > 0 {
+                    let nc_a = time_fsci_nc(&a, reps, min_of, nc_arm);
+                    let d_a = time_fsci_nc(&a, reps, min_of, 0);
+                    let d_b = time_fsci_nc(&a, reps, min_of, 0);
+                    let nc_b = time_fsci_nc(&a, reps, min_of, nc_arm);
+                    let nc_t = nc_a.min(nc_b);
+                    let d_t = d_a.min(d_b);
+                    null_nc.push(d_a.max(d_b) / d_a.min(d_b));
+                    // > 1 means NC-blocking is FASTER than the shipped traversal.
+                    r_nc.push(d_t / nc_t);
+                }
                 cell_loads.extend([load_f0, load_f1, load_s1, load_sn]);
                 cell_mhz_fsci.extend([mhz_f0, mhz_f1]);
                 cell_mhz_scipy.extend([mhz_s1, mhz_sn]);
@@ -948,6 +987,16 @@ for raw_line in sys.stdin.buffer:
                  gates={verdict} loadavg_post={}",
                 read_trimmed("/proc/loadavg"),
             );
+            if nc_arm > 0 {
+                let mnc = median(&mut r_nc.clone());
+                let nnc = median(&mut null_nc.clone());
+                let nc_ok = (nnc - 1.0).abs() <= 0.05;
+                println!(
+                    "n={n} NC_ARM nc={nc_arm} default/nc={mnc:.3}x (>1 = NC faster) \
+                     null_nc={nnc:.3} nc_gates={}",
+                    if nc_ok && load_ok { "PASS" } else { "FAIL" }
+                );
+            }
             if !nulls_ok {
                 println!(
                     "n={n} ROW INVALID: an A/A null missed 1.0 by more than 5%, so this \

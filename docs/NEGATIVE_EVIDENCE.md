@@ -37478,6 +37478,50 @@ had only ever been seen refusing. It refused n=256 and n=512 at ambient 32.73 an
 n=2048 at 28.46 in the SAME invocation — a must-hit and a must-miss four seconds apart, on
 the same binary, distinguished only by the variable the gate reads.
 
+### CERTIFIED 2026-08-19 (second window): n=256 and n=512, and the n=1024 prediction HOLDS
+
+Ambient reached 19-22 for the first time since the gate was corrected. Same shipped ELF
+`9746dee0254b0c01c564c72446298baa4f738a22d406161bb954371a3073897a`.
+
+| n | fsci (s) | scipy1 (s) | scipyN (s) | **scipy1/fsci** | **scipyN/fsci** | null_fsci | null_scipy1 | ambient | clock | gates |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 256 | 6.639e-4 | 8.503e-4 | 1.130e-3 | **1.047x** | **1.672x** | 1.049 | 1.011 | 22.27/30 | 1.000 | **PASS** |
+| 512 | 3.475e-3 | 4.927e-3 | 4.499e-3 | **1.379x** | **1.295x** | 1.008 | 1.027 | 22.27/30 | 1.086 | **PASS** |
+| 1024 | — | — | — | 1.784x | 1.393x | **1.078** | 1.014 | 21.21/30 | 1.067 | **FAIL** |
+
+iowait 0 throughout. n=256 per-arm MHz: fsci 2476-3128, scipy1 2850, scipyN 2654. n=512:
+fsci 2520-2944, scipy1 2283, scipyN 2588.
+
+**THE n=1024 PREDICTION WAS FALSIFIABLE AND IT HELD.** The earlier row predicted n=1024 would
+stay INVALID and named the falsifier. It has now missed its own A/A null FIVE times
+independently — at `min_of` 5, 9 and 15, and now twice more — and at NO OTHER SIZE. Critically
+this run was in a QUIET window (ambient 21.21, the same window where 256 and 512 both
+certified with nulls of 1.049 and 1.008), which is what rules out contention: a
+contention-driven null would have come in at 1.0 here alongside its neighbours. Whatever it
+is, it is a property of our n=1024 path, not of the host.
+
+Certified vs-incumbent position for `cholesky`, all gated, all one-invocation, no BLAS
+linked on our side:
+
+| n | vs single-threaded SciPy | vs strongest SciPy (64 tasks) |
+|---|---|---|
+| 256 | 1.047x | **1.672x** |
+| 512 | 1.379x | **1.295x** |
+| 2048 | 1.782x | **1.204x** |
+
+### The NC-blocking lever now has an in-invocation arm, and NO number yet
+
+`FSCI_CHOL_NC` adds a fourth interleaved arm timing `CHOL_SYRK_NC_OVERRIDE` on against off,
+ABBA inside each replicate, with its own A/A null — so the lever is measured beside the SciPy
+ratios rather than in a separate run. Because the two traversals are bit-identical (asserted
+on raw factor bits), a difference in this arm is cost and nothing else.
+
+First attempt was REFUSED and is recorded as such: the fleet resumed benchmarking mid-run and
+ambient went 19 → 50-56, `load_peak` 73.6. The readings were `default/nc` = 1.062x at n=1024
+and 1.023x at n=2048 with NC=256, and their own nulls failed at 1.173 and 1.095. Not evidence,
+not quoted, and listed only so the next attempt knows the arm works end to end and roughly
+where to look.
+
 ### The re-run that would promote the provisional rows
 
 Rebuild (already committed) and run, with `uptime` checked immediately before and the
