@@ -75,6 +75,30 @@ mod harness {
     /// on a host whose BLAS we do not control.
     const MAX_BACKWARD_ERROR_VS_SCIPY: f64 = 4.0;
 
+    /// Highest 1-minute loadavg at which a cell may be certified.
+    ///
+    /// OBSERVED DEFECT, not a precaution. On 2026-08-19 the same code, fixtures and protocol
+    /// gave `scipyN/fsci` = 1.339x at loadavg 20-27 and 0.808x at loadavg 60-106 for n=512 —
+    /// the cell INVERTED — and **both A/A nulls passed in the loaded window** (1.012, 1.012).
+    /// An A/A null bounds drift BETWEEN the halves of a cell; it is structurally blind to a
+    /// load that is high but steady, because that depresses both halves equally while
+    /// changing which arm the scheduler favours. So the null cannot be the only gate, and a
+    /// loadavg printed but not enforced is a number nobody checks.
+    ///
+    /// The default is deliberately below this 64-CPU host's idle band. Override with
+    /// `FSCI_CHOL_MAX_LOAD` if you are measuring somewhere else, and say so in the row.
+    const DEFAULT_MAX_LOADAVG: f64 = 16.0;
+
+    /// Largest tolerated ratio between the two arms' mean clock over a cell.
+    ///
+    /// Cores on this host run at DIFFERENT frequencies at the same instant (1429-4289 MHz
+    /// observed). A ratio whose arms sat at materially different clocks is a frequency ratio
+    /// wearing a costume, so the harness measures each arm's own cpuset clock and refuses the
+    /// cell when they diverge. 1.25 is wide enough to pass the ordinary jitter seen in the
+    /// quiet-window runs (fsci 2504-3469 against scipy1 2928-3166) and narrow enough to catch
+    /// an arm parked on a different CCD.
+    const MAX_CROSS_ARM_CLOCK_RATIO: f64 = 1.25;
+
     /// Threads the SciPy arm materialises per thread requested — MEASURED on this fleet and
     /// recorded in `perf_eigh_vs_scipy.rs` (scipy1 requests 1, observes 2; scipyN requests
     /// 10, observes 20). Encoded as a constant with its provenance rather than guessed.
@@ -711,6 +735,13 @@ for raw_line in sys.stdin.buffer:
             .unwrap_or(default)
     }
 
+    fn mean(v: &[f64]) -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.iter().sum::<f64>() / v.len() as f64
+    }
+
     fn median(v: &mut [f64]) -> f64 {
         v.sort_by(f64::total_cmp);
         let n = v.len();
@@ -734,6 +765,10 @@ for raw_line in sys.stdin.buffer:
         let reps = env_usize("FSCI_CHOL_REPS", 3);
         let min_of = env_usize("FSCI_CHOL_MIN_OF", 3);
         let seed = 0x5eed_c0de_u64;
+        let max_load: f64 = std::env::var("FSCI_CHOL_MAX_LOAD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_MAX_LOADAVG);
 
         println!("# perf_chol_vs_scipy — fsci_linalg::cholesky vs scipy.linalg.cholesky, LIVE");
         println!("elf_sha256={}", elf_sha256());
@@ -745,7 +780,8 @@ for raw_line in sys.stdin.buffer:
             cpu_mhz_mean(),
         );
         println!(
-            "sizes={sizes:?} replicates={replicates} reps={reps} min_of={min_of} seed={seed:#x}"
+            "sizes={sizes:?} replicates={replicates} reps={reps} min_of={min_of} seed={seed:#x} \
+             max_loadavg={max_load} max_clock_ratio={MAX_CROSS_ARM_CLOCK_RATIO}"
         );
 
         for &n in &sizes {
@@ -811,6 +847,12 @@ for raw_line in sys.stdin.buffer:
             let mut r_scipyn = Vec::with_capacity(replicates);
             let mut null_fsci = Vec::with_capacity(replicates);
             let mut null_s1 = Vec::with_capacity(replicates);
+            // Every load and clock sample taken anywhere inside this cell, so the gates
+            // below judge the window the ratio was actually measured in rather than a
+            // single reading taken before it.
+            let mut cell_loads: Vec<f64> = Vec::new();
+            let mut cell_mhz_fsci: Vec<f64> = Vec::new();
+            let mut cell_mhz_scipy: Vec<f64> = Vec::new();
 
             for rep in 0..replicates {
                 // ABBA within the replicate: the second half reverses the order so a
@@ -825,6 +867,9 @@ for raw_line in sys.stdin.buffer:
                 let (s1_b, _) = scipy1.time(reps, min_of);
                 let f_b = time_fsci(&a, reps, min_of);
                 let (mhz_f1, load_f1) = (cpu_mhz_mean(), loadavg_1min());
+                cell_loads.extend([load_f0, load_f1, load_s1, load_sn]);
+                cell_mhz_fsci.extend([mhz_f0, mhz_f1]);
+                cell_mhz_scipy.extend([mhz_s1, mhz_sn]);
 
                 let fsci = f_a.min(f_b);
                 let s1 = s1_a.min(s1_b);
@@ -853,16 +898,53 @@ for raw_line in sys.stdin.buffer:
             let nf = median(&mut null_fsci.clone());
             let ns = median(&mut null_s1.clone());
             let nulls_ok = (nf - 1.0).abs() <= 0.05 && (ns - 1.0).abs() <= 0.05;
+
+            // ── THE TWO GATES THE A/A NULL CANNOT PROVIDE ──────────────────────────
+            let load_peak = cell_loads.iter().copied().fold(0.0f64, f64::max);
+            let load_ok = load_peak <= max_load;
+            let mhz_f = mean(&cell_mhz_fsci);
+            let mhz_s = mean(&cell_mhz_scipy);
+            let clock_ratio = if mhz_f > 0.0 && mhz_s > 0.0 {
+                (mhz_f / mhz_s).max(mhz_s / mhz_f)
+            } else {
+                f64::NAN
+            };
+            // `is_finite()` FIRST, so a NaN ratio (no clock samples) FAILS the gate. The
+            // first version wrote this as `!(ratio > MAX)`, which is true for NaN and would
+            // have let a cell with no frequency evidence certify itself — the exact shape of
+            // blindness that a gate is supposed to prevent.
+            let clock_ok = clock_ratio.is_finite() && clock_ratio <= MAX_CROSS_ARM_CLOCK_RATIO;
+
+            let verdict = if nulls_ok && load_ok && clock_ok {
+                "PASS"
+            } else {
+                "FAIL"
+            };
             println!(
                 "n={n} RESULT scipy1/fsci={m1:.3}x scipyN/fsci={mn:.3}x \
-                 null_fsci={nf:.3} null_scipy1={ns:.3} nulls={} loadavg_post={}",
-                if nulls_ok { "PASS" } else { "FAIL" },
+                 null_fsci={nf:.3} null_scipy1={ns:.3} load_peak={load_peak:.2}/{max_load:.2} \
+                 mhz_fsci={mhz_f:.0} mhz_scipy={mhz_s:.0} clock_ratio={clock_ratio:.3} \
+                 gates={verdict} loadavg_post={}",
                 read_trimmed("/proc/loadavg"),
             );
             if !nulls_ok {
                 println!(
                     "n={n} ROW INVALID: an A/A null missed 1.0 by more than 5%, so this \
                      cell measured the window, not the code."
+                );
+            }
+            if !load_ok {
+                println!(
+                    "n={n} ROW INVALID: loadavg peaked at {load_peak:.2} against a ceiling of \
+                     {max_load:.2}. This gate exists because a passing A/A null certified a \
+                     cell that was wrong by 1.5x under steady load; the null cannot see it."
+                );
+            }
+            if !clock_ok {
+                println!(
+                    "n={n} ROW INVALID: the arms ran at {mhz_f:.0} MHz and {mhz_s:.0} MHz \
+                     (ratio {clock_ratio:.3} > {MAX_CROSS_ARM_CLOCK_RATIO}); this would be a \
+                     frequency ratio, not a code ratio."
                 );
             }
 

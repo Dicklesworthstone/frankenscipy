@@ -37392,6 +37392,31 @@ sufficient.** Every row needs its absolute loadavg recorded and a stated ceiling
 null. Rows in this repo that carry a null but no load figure cannot be compared with rows
 that carry both.
 
+### The finding was turned into a gate, with both probe arms observed
+
+Printing a loadavg nobody enforces is how the above happened, so the harness now REFUSES a
+cell whose loadavg peaked above a ceiling (`FSCI_CHOL_MAX_LOAD`, default 16) and one whose
+two arms sat at clocks differing by more than 1.25x. Demonstrated the same day, at loadavg
+76.4, on the same fixture, in two runs differing only in the ceiling:
+
+| ceiling | load_peak | nulls | scipy1/fsci | gates |
+|---|---|---|---|---|
+| 16 (default) | 76.39 | 1.013 / 1.013 **both pass** | 0.717x | **FAIL — row refused** |
+| 999 | 77.32 | 1.013 / 1.026 **both pass** | 0.710x | PASS — row allowed |
+
+MUST-HIT and MUST-MISS in one sitting: the gate responds to the load value rather than
+blanket-failing, and the run it refuses is one where BOTH A/A NULLS PASS while the ratio
+reads 0.717x against 1.016x for the same size in the quiet window. That is the blindness
+argued above, now observed inside the instrument that has to survive it.
+
+HONEST LIMIT ON THE CLOCK GATE: only its MUST-MISS arm has been observed (1.003 and 1.008,
+both passing). No run has yet produced arms far enough apart in frequency to trip it, so it
+is unproven in the direction that matters and is recorded as such rather than counted.
+
+A NaN bug in that gate was caught by clippy before it shipped: it was first written
+`!(ratio > MAX)`, which is TRUE for NaN, so a cell with no clock samples would have
+certified itself. It now tests `is_finite() && ratio <= MAX`.
+
 ### The re-run that would promote the provisional rows
 
 Rebuild (already committed) and run, with `uptime` checked immediately before and the
