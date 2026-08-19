@@ -39503,3 +39503,90 @@ undone. It should be done before anything else on this bead.
   L2 and a CCD's L3 slice but not the full 128 MB L3; a stronger test would exceed L3 entirely.
 - The SETS=1 cell's N-thread null is 1.2557, so its 1.310x is not itself trustworthy; the
   conclusion rests on SETS=16, whose nulls are 1.036.
+
+## 2026-08-19 — frankenscipy-gykw5 — the accounting CLOSES: there are no missing points, and SYRK threading can never close this basin
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_chol_syrk_insitu.rs
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms one process, ABBA within each cycle)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=1 and 64; actual observed worker threads 1 and the shared rayon
+  pool; `dispatches=10` and `calls=30` identical in both arms, so the arms differ ONLY in
+  worker count
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.311)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.283)
+frankenscipy-engine-sha256 = built from crates/fsci-linalg at this commit
+scipy-engine-sha256 = n/a — this row is an internal decomposition, not an incumbent comparison
+Same-invocation A/A null: the four cycles' spread on the factor arm is the null here (1.003–1.067)
+Counted mechanism: `CHOL_SYRK_NANOS` / `CHOL_SYRK_CALLS`, wrapping the trailing-update dispatch
+  inside the k-loop
+Decision: the in-situ SYRK speedup (1.117–1.159x over three stable runs) PREDICTS the measured
+  whole-factor speedup (1.003–1.067x) to within the run-to-run spread. The accounting closes.
+CV is provenance only and was not used for this decision.
+
+**The measurement three previous rows kept naming**
+
+| run | syrk speedup | factor speedup | syrk share | predicted factor | non-syrk (1 thr) | non-syrk (64 thr) |
+|---|---|---|---|---|---|---|
+| 1 | 1.157x | 1.067x | 46.4% | 1.067x | 3.496 ms | 3.499 ms |
+| 2 | 1.159x | 1.003x | 47.6% | 1.070x | 3.263 ms | 3.651 ms |
+| 3 | 1.117x | 1.014x | 46.1% | 1.051x | 3.515 ms | 3.739 ms |
+| 4 (first, outlier) | 1.070x | 0.914x | 48.7% | 1.033x | 3.125 ms | 3.895 ms |
+
+**THE 13–21 MISSING POINTS DO NOT EXIST. I created them with a bad premise.**
+
+The accounting row assumed the isolated 1.281–1.361x transferred into the factor. **It does not:
+in situ the same updates thread at 1.117–1.159x.** Feed the in-situ figure into the same
+arithmetic and it reconciles exactly:
+
+    syrk share ~48%, syrk speedup 1.157x  ->  predicted factor 1.070x
+    measured factor                       ->  1.003 – 1.067x
+
+No gap. The "13–21 points unaccounted" was an artefact of using a microbench number where an
+in-situ number was required, and it is hereby withdrawn along with the mystery it created.
+
+What survives from the earlier rows is the smaller true statement: the call context costs about
+0.15x of speedup (1.30x isolated → 1.16x in situ), which is real but is not a missing 20 points.
+
+**I published that mystery, chased it across three rows, and it was my own measurement error.**
+The lesson is the one the cold-panel row already stated and I did not apply hard enough: a
+standalone kernel number is an upper bound, not a substitute, and the arithmetic that uses it
+inherits its error.
+
+**The consequence for the bead, which is decisive**
+
+Threading the trailing SYRK is worth **~1.07x on the whole factor**, and that is the CEILING —
+it assumes the SYRK portion threads perfectly, which it does not.
+
+Closing the n=832 basin requires **~1.61x** (0.621x → 1.0x against `scipyN`).
+
+**So SYRK threading cannot close this basin even in principle.** It is worth 7 points against a
+61-point deficit. That also explains, finally, why six independent tuning levers all read
+"neutral": the true effect is ~5–7% sitting on top of A/A nulls of 3–5%, i.e. right at the edge
+of detectability. Every one of those rows was measuring a real but tiny effect and correctly
+failing to resolve it.
+
+**Where the deficit must actually live**
+
+We are at 0.95x against single-threaded SciPy and 0.62x against 64-thread SciPy, so SciPy gains
+~1.5x from threading. Our entire trailing-update parallelism can contribute at most 1.07x.
+Therefore SciPy's `dpotrf` must be extracting parallelism from parts of the factorisation we run
+serially — the panel factor and the panel TRSM — or using a decomposition whose parallel
+fraction is far larger than ours. Amdahl's law on our current structure: with 48% of the factor
+in the SYRK and everything else serial, our maximum possible speedup from threading ONLY the
+SYRK is 1/(0.52) = **1.92x** even at infinite SYRK scaling, and we achieve 1.07x of it.
+
+The next question is therefore not about the SYRK at all: it is what fraction of `dpotrf` SciPy
+threads, and whether our panel factor and TRSM can be parallelised. That is a structural
+question about the algorithm, and it is the first time this bead has had one.
+
+**Honest limits**
+
+- One size (n=832), one gate (32M), one fixture family. `dispatches=10` and `calls=30` are
+  identical across arms, so the comparison is clean, but 10 dispatches over 5 reps means only 2
+  threaded updates per factor.
+- Run 4 (the first) is an outlier on both syrk (1.070x) and factor (0.914x); it is reported, not
+  dropped, and the conclusions rest on runs 1–3.
+- The instrumented region includes the panel packing, which is deliberate but means "syrk share"
+  is really "trailing-update-including-pack share".

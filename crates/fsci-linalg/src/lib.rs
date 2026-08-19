@@ -5410,6 +5410,7 @@ fn cholesky_lower_blocked_with_kernels_scratch<
             }
         }
         if kb < n {
+            let syrk_t0 = std::time::Instant::now();
             let m2 = n - kb;
             let nb = kb - k;
             let (l21_own, l21t_own);
@@ -5462,6 +5463,11 @@ fn cholesky_lower_blocked_with_kernels_scratch<
                     trailing, n, l21_ref, l21t_ref, nb, kb, nthreads,
                 );
             }
+            CHOL_SYRK_NANOS.fetch_add(
+                u64::try_from(syrk_t0.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            CHOL_SYRK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         k = kb;
     }
@@ -20266,6 +20272,28 @@ fn matmul_flat_compute_rows(
 /// Number of worker threads for a flat-workspace GEMM of the given dims. Returns 1
 /// (sequential) for matmuls too small to amortise thread spawn; otherwise scales with
 /// cores, capped so each thread owns at least 64 output rows.
+/// Nanoseconds spent inside the trailing-SYRK dispatch of the blocked Cholesky, accumulated.
+///
+/// `frankenscipy-gykw5`. Six rows on that bead have compared WHOLE-FACTOR times and could only
+/// say the threading gain is missing; the accounting row narrowed it to 13-21 points. This
+/// measures the SYRK portion DIRECTLY in situ, which is the step every one of those rows named
+/// as the way to find where the gain goes.
+///
+/// It is admissible as a COST measurement, unlike the `cfg(test)` counters this repo has
+/// (correctly) ruled out for that use: the instrumented region is a whole trailing update
+/// (~1.5 ms at n=832) and there are only `n/nb` of them per factor, so two clock reads per call
+/// are a part in ~10^5. A per-element counter would be an optimisation barrier; this is not
+/// inside any loop the compiler would vectorise.
+///
+/// Reset it before a factor, read it after. Also counts the packing that precedes the dispatch,
+/// which is deliberate: packing is part of what the trailing update costs the factor.
+#[doc(hidden)]
+pub static CHOL_SYRK_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Trailing-SYRK dispatches counted by [`CHOL_SYRK_NANOS`], so the mean per call is derivable.
+#[doc(hidden)]
+pub static CHOL_SYRK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A/B override for the 64M-MAC parallel gate in [`matmul_thread_count`] (0 ⇒ default).
 ///
 /// `frankenscipy-gykw5`. Bracketing the Cholesky curve found a CERTIFIED LOSS BAND against
