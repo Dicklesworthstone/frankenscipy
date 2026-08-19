@@ -37762,3 +37762,96 @@ failed with its own message: "if it now converges the fixture set is stale and t
 no longer testing the toggle". It was right — with the fallback live the baseline arm is no
 longer bare nalgebra, so the test now disables the fallback for its duration and restores
 it, rather than being weakened.
+
+---
+
+## frankenscipy-x3kr0 — `symmetric_eigen` and `SVD::new` are unbounded but NOT non-convergent: 40,000 cases, 0 hangs. REPORTABLE NEGATIVE, sites left alone.
+
+2026-08-19. **Result class: BEHAVIORAL.** same_host: fixmydocuments, loadavg
+[0.11 0.34 0.44], 3854.410 MHz, iowait 0.18%, 16 logical CPUs. Probe:
+`probe_unbounded_symmetric_svd` (MARKER `unbounded-sym-svd-v1`), invoked as `-- 1000 48`,
+built and run through `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec`.
+
+**Observed value: 0 non-convergent cases out of 40,000, and 0 bit-mismatches out of
+40,000.** Counts and convergence outcomes only — no duration is measured, claimed, or
+implied anywhere in this row.
+
+**The worker line is read from inside the measuring process, and that is not pedantry
+here.** `rch` dispatches per invocation, and it moved: the build log for an earlier run
+named ovh-a, while this run reports fixmydocuments. Attributing this row to the host named
+in a build log would have been wrong. `rch exec` refuses non-compilation commands, so the
+run cannot be bracketed by a shell that echoes `uptime` from outside — the probe therefore
+reads `/proc/sys/kernel/hostname`, `/proc/loadavg`, `/proc/cpuinfo` and `/proc/stat` itself
+and prints them beside its own output.
+
+**Load is recorded and then explicitly discounted, by design rather than as an excuse.**
+The local host was at 1/5/15 load 84.00 / 51.10 / 46.18 while this ran. That would void a
+timing row. It does not touch this one, because the detector is a COUNT, not a timeout.
+
+### The design decision that makes this row readable at all
+
+The obvious probe is to run the unbounded constructor under a wall-clock timeout. On this
+host that probe is worthless — a case that trips a 5-second timeout under run queue 84 is
+indistinguishable from a case that never converges, and the run queue was 84. So the probe
+instead calls `try_new(m, eps, K)` and reads `None` as "needs more than K iterations".
+That is a property of the matrix and the algorithm, identical on an idle and a saturated
+host, and it cannot hang: every call is bounded by construction. Two bounds separate two
+findings — `K_LAPACK = 30·max(n,10)` (sez4r's constant) and `K_HUGE = 100·K_LAPACK`.
+
+### Observed
+
+| arm | cases | needed > 30·n iters | needed > 3000·n iters | bit-mismatch vs unbounded |
+|---|---|---|---|---|
+| `symmetric_eigen` | 28,000 | **0** | **0** | **0** |
+| `SVD::new` | 12,000 | **0** | **0** | **0** |
+
+Fixture families: symmetrised `make_diag_dominant` (sez4r's own generator, the one that
+produced 230 non-convergent cases for the UNSYMMETRIC path), graded/ill-conditioned
+spectra spanning 10⁰…10⁻¹⁶, clustered spectra separated by 1e-15, and exactly-degenerate
+spectra; n ∈ {2,3,5,8,13,21,48} × 1000 seeds. SVD: 4×4, 8×3, 3×8, 16×16, 32×7, 7×32,
+each with and without a duplicated column forcing an exact zero singular value.
+
+### Both control arms were observed, and the zero means nothing without them
+
+    CONTROL sym_fires_at_1=true svd_fires_at_1=true
+            sym_converges_at_100k=true svd_converges_at_100k=true
+
+Must-hit: squeezed to `max_niter = 1`, both constructors return `None` — the detector
+fires. Must-miss: at `max_niter = 100_000` the same inputs return `Some` — it is not
+simply always-`None`. Without both, "0 non-convergent in 40,000" is indistinguishable from
+a blind probe, and the run would be VOID rather than negative. The harness exits 2 and
+prints "CONTROL FAILED -- the sweep below is VOID, not negative" if either arm misbehaves.
+
+### A bug this probe found IN ITSELF, which is the part worth keeping
+
+The first run reported **805 of 2400 SVD cases differing** from the unbounded call. That
+looked like a finding. It was mine: `SVD::new` routes through `new_unordered`, which passes
+`default_epsilon() * 5.0` — **not** `default_epsilon()`. `SymmetricEigen::new` and
+`Schur::new` pass it unscaled. My bounded call used a bare `f64::EPSILON`, i.e. a 5× tighter
+deflation threshold, so it made different deflation decisions and landed about one ulp away
+(worst observed relative gap 7.215e-16, and never a reordering — 0 of 805 were the same
+multiset).
+
+What identified it was the CONTRAST between arms, not inspection: the symmetric arm, where
+the eps happened to match, showed 0 of 5600 while the SVD arm showed 805 of 2400. Two arms
+disagreeing about the same claim is what made the harness the suspect.
+
+**This generalises past the probe, and it is the actionable half of this bead.** sez4r's
+bounding recipe — `try_new(m, f64::EPSILON, 30 * n.max(10))` — is correct for `Schur` and
+`symmetric_eigen` and **WRONG for SVD**. Anyone who bounds an SVD site with it will shift
+results by an ulp while believing the change is behaviour-preserving, and an ulp is exactly
+small enough to survive a tolerance test and pass review as "just adding a bound".
+
+### Verdict
+
+Per the bead's own step 3: no must-hit exists across 40,000 constructed cases, so this is a
+reportable negative and the 12 sites are LEFT ALONE. An unbounded loop that provably
+terminates on every input we can construct is a latent risk, not a defect, and bounding it
+would be unjustified churn — with a real cost, since the correct eps differs per constructor
+and getting it wrong changes results silently.
+
+**What would reopen this:** any observed hang in `eigh`, `pinv`, a gram-matrix path or the
+`svd` family. The theory says it should not happen — symmetric tridiagonal QL/QR with a
+Wilkinson shift is globally convergent for symmetric input (Golub & Van Loan) — and 40,000
+cases agree, but the family space is not the input space. The probe is committed and
+parameterised (`seeds`, `nmax`) so reopening means rerunning it wider, not rebuilding it.
