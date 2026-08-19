@@ -37466,12 +37466,34 @@ ambient 32.73, so this is one certified cell, not three.
 `dpotrf`, with no BLAS linked on our side.** The incumbent again ran on faster cores
 (scipyN 3841-3972 MHz against our 3053-3440), so 1.204x remains a floor.
 
-THE CERTIFIED NUMBER IS LOWER THAN THE PROVISIONAL ONE, AND THAT IS THE POINT. The
-provisional reading was 2.041x / 1.407x at ambient 20.60; the certified reading is
-1.782x / 1.204x at ambient 28.46. Same code, same fixture, same protocol — the ratio decays
-monotonically with ambient load across three independent windows now (20.6 → 28.5 → 60+),
-which is the load-dependence argued above, measured a third time and in the direction the
-argument predicts. Quote the certified row, not the provisional one.
+THE CERTIFIED NUMBER IS LOWER THAN THE PROVISIONAL ONE. The provisional reading was
+2.041x / 1.407x at ambient 20.60; the certified reading is 1.782x / 1.204x at ambient 28.46.
+Quote the certified row, not the provisional one.
+
+**CORRECTION, 2026-08-19, later the same day.** This row originally went on to claim the
+ratio "decays monotonically with ambient load", citing 20.6 → 28.5 → 60+. That claim is
+WITHDRAWN. It leaned on a 60+ point that the gate had REFUSED — using a refused reading as
+one of three supporting points is precisely the error the gate exists to prevent, and I made
+it while writing up the gate. Certified n=2048 `scipyN/fsci` readings, ordered by ambient:
+
+| ambient | scipyN/fsci | status |
+|---|---|---|
+| 19.48 | 1.113x | PASS |
+| 28.33 | 1.158x | PASS |
+| 28.46 | 1.204x | PASS |
+| 55.76 | 1.504x | REFUSED, not evidence |
+
+Among CERTIFIED rows the trend at n=2048 runs the OTHER WAY: quieter host, SMALLER lead for
+us. That is mechanically sensible — `scipyN` asks for 64 tasks, so a quiet box is where the
+incumbent's parallel arm gets what it wants, and our lead is narrowest exactly there. It is
+also the conservative direction, and it means the honest n=2048 figure to quote against the
+strongest SciPy arm is the QUIETEST certified one, **1.113x**, not 1.204x.
+
+n=512 goes the opposite way (1.339x at ambient 20.6, 1.295x at 22.3, 0.808x at 60-106), so
+there is no single load-to-ratio law across sizes and I should not have asserted one from
+three points at one size. What survives is the original, narrower finding, which is
+unaffected: load changes the answer by more than the effect being measured, and a passing
+A/A null does not detect it.
 
 The gate's ADMIT arm is now observed live, which closes the honest limit recorded above: it
 had only ever been seen refusing. It refused n=256 and n=512 at ambient 32.73 and admitted
@@ -37521,6 +37543,31 @@ ambient went 19 → 50-56, `load_peak` 73.6. The readings were `default/nc` = 1.
 and 1.023x at n=2048 with NC=256, and their own nulls failed at 1.173 and 1.095. Not evidence,
 not quoted, and listed only so the next attempt knows the arm works end to end and roughly
 where to look.
+
+### The NC-blocking lever: MEASURED, gated, and only marginally above its own null
+
+One certified datum, from the in-invocation arm at n=2048, shipped ELF
+`54e97f7e7e55addac51a00039b0dbeae38fd157c54f43bcab9b00ba0d803aa8b`:
+
+| NC | default/nc | null_nc | ambient | nc_gates |
+|---|---|---|---|---|
+| 256 | **1.027x** | 1.016 | 28.33/30 | **PASS** |
+| 64 | 1.042x | **1.334** | 19.48 | FAIL |
+| 512 | 0.987x | 1.084 | 61.74 | FAIL |
+
+The SciPy arms in the NC=256 cell certified alongside it: `scipy1/fsci` 1.705x,
+`scipyN/fsci` 1.158x, nulls 1.011/1.014, clock ratio 1.193.
+
+**Read this as weak.** 1.027x sits only 1.7x above its own 1.016 A/A null. It is a gated,
+positive, bit-identical result and it is nowhere near the "local release-probe gains at
+n=2048" that the 2026-07-09 rejection recorded — which is the useful part, because that
+rejection asked for exactly this same-binary runtime A/B before the lever could be believed,
+and the same-binary answer is "real but small". The NC=64 and NC=512 attempts are refused,
+not results; NC=64's own null at 1.334 says its window was unusable, which is worth noting
+only because its headline 1.042x would otherwise look like the best number here.
+
+The lever stays SHIPPED OFF. A 2.7% effect that needs a quiet host to resolve is not worth a
+default change on the strength of one cell.
 
 ### The re-run that would promote the provisional rows
 
