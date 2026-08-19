@@ -66,20 +66,31 @@ fn main() {
     // which is a general GEMM on a different gate and is not what the factor calls. This calls
     // the SAME kernel the factor uses, at the SAME shape, so the self-scaling ratio is real.
     // Fixture built ONCE, outside every timer. `trailing` is destructively updated, so each
-    // timed iteration works on a fresh clone — the clone is inside the timer for both arms
-    // equally and is far smaller than the update itself.
-    let (trailing0, l21, l21t) = bench_trailing_syrk_prepare(m, k, 0xC0DE);
+    // timed iteration works on a fresh clone.
+    //
+    // SETS controls the COLD/WARM question. With SETS=1 every timed iteration reuses the SAME
+    // `l21`/`l21t` (721 KB at m=704), so after the first they stay resident and the update is
+    // compute-bound — which is NOT what the factor does. The factor packs a FRESH panel every
+    // k-step. With SETS>1 the loop rotates through independent panel sets, so a panel is only
+    // revisited every SETS iterations and is evicted in between. If the 1.326x is a warm-cache
+    // artefact, it should fall toward 1.0 as SETS rises.
+    let sets = env_usize("SYRK_SETS", 1).max(1);
+    let fixtures: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> = (0..sets)
+        .map(|i| bench_trailing_syrk_prepare(m, k, 0xC0DE ^ (i as u64).wrapping_mul(0x9E37)))
+        .collect();
 
     let time_ours = |nthreads: usize| -> (f64, f64) {
-        let mut warm = trailing0.clone();
-        let fold = bench_trailing_syrk_run(&mut warm, &l21, &l21t, m, k, nthreads);
+        let (t0f, l0, l0t) = &fixtures[0];
+        let mut warm = t0f.clone();
+        let fold = bench_trailing_syrk_run(&mut warm, l0, l0t, m, k, nthreads);
         black_box(fold);
         let mut best = f64::INFINITY;
         for _ in 0..min_of {
             let t0 = Instant::now();
-            for _ in 0..reps {
-                let mut t = trailing0.clone();
-                black_box(bench_trailing_syrk_run(&mut t, &l21, &l21t, m, k, nthreads));
+            for r in 0..reps {
+                let (tf, l21, l21t) = &fixtures[r % sets];
+                let mut t = tf.clone();
+                black_box(bench_trailing_syrk_run(&mut t, l21, l21t, m, k, nthreads));
             }
             let dt = t0.elapsed().as_secs_f64();
             if dt < best {
@@ -149,7 +160,7 @@ print(f"seconds={best:.9f} threads_env={os.environ.get('OPENBLAS_NUM_THREADS','u
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     println!(
         "shape m={m} k={k} macs={:.1}M reps={reps} min_of={min_of} host_threads={threads} \
-         loadavg={}",
+         sets={sets} loadavg={}",
         (m * k * m) as f64 / 1e6,
         load.trim()
     );

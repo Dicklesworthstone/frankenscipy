@@ -39445,3 +39445,61 @@ also settle whether the 1.326x/1.57x figure means anything at all.
   should not be quoted downstream.
 - The whole-factor time and the per-update times come from two different binaries in the same
   tree, not one invocation.
+
+## 2026-08-19 — frankenscipy-gykw5 — the COLD-PANEL hypothesis is refuted too: isolated scaling survives cache eviction
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_syrk_partition_vs_blas.rs (arm SYRK_SETS)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both thread counts one invocation, ABBA)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=1 and 64; actual observed worker threads 1 and the shared rayon pool
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.211)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.266)
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+frankenscipy-engine-sha256 = built from crates/fsci-linalg at this commit
+Same-invocation A/A null: 1.0356 / 1.0359 at SETS=16 (the trustworthy cell)
+Counted mechanism: `SYRK_SETS` — number of independent packed-panel fixtures rotated through, so
+  a panel is revisited only every SETS iterations
+Decision: candidate CI — judged against a 2x A/A-null margin; the speedup is 1.28–1.36x across a
+  16-fold change in cache pressure, i.e. FLAT, so the hypothesis predicting a fall is refuted.
+CV is provenance only and was not used for this decision.
+
+### The hypothesis, which was mine
+
+Two rows ago I explained the isolated-vs-in-factor gap by cache state: the bench reuses ONE
+`l21`/`l21t` pair (721 KB at m=704) so panels stay resident, whereas the factor packs a fresh
+panel every k-step. Prediction: rotate the bench through K independent panel sets and the speedup
+should fall toward the in-factor 1.000x.
+
+### It does not fall
+
+| SETS | panel working set | ours threading speedup | null_ours_1 / null_ours_n |
+|---|---|---|---|
+| 1 (all warm) | 0.7 MB | 1.310x | 1.0005 / **1.2557** |
+| 5 | 3.6 MB | 1.361x | 1.0562 / 1.1551 |
+| **16 (coldest)** | **11.5 MB** | **1.281x** | **1.0356 / 1.0359** |
+
+Flat within noise across a 16-fold increase in panel working set, and the coldest cell has the
+tightest nulls (1.036), so it is the one to believe. **Cache residency of the packed panel is not
+what separates 1.3x isolated from 1.000x in situ.** Hypothesis refuted — the second of mine to
+fall on this bead, after "memory-bound".
+
+### What is left
+
+Of the two candidates named in the previous row, cold-vs-warm is now dead. That leaves the CALL
+CONTEXT: the factor invokes the threaded SYRK six times, once per panel, interleaved with the
+panel factor and TRSM, while the bench invokes it in a tight loop. Per-call `rayon::scope`
+set-up, or the pool going cold between widely-spaced calls, would show up in the factor and not
+in the bench.
+
+That is now the ONLY surviving explanation of the 13–21 point gap, and it is directly testable by
+timing the SYRK call site inside the k-loop — the named next step for three rows now, still
+undone. It should be done before anything else on this bead.
+
+### Honest limits
+
+- One shape (m=704, k=128), one size. SETS=16 gives an 11.5 MB panel working set, past per-core
+  L2 and a CCD's L3 slice but not the full 128 MB L3; a stronger test would exceed L3 entirely.
+- The SETS=1 cell's N-thread null is 1.2557, so its 1.310x is not itself trustworthy; the
+  conclusion rests on SETS=16, whose nulls are 1.036.
