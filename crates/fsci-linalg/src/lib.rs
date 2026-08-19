@@ -6565,7 +6565,8 @@ pub fn eig(a: &[Vec<f64>], options: DecompOptions) -> Result<EigResult, LinalgEr
             let a21 = t_mat[(i + 1, i)];
             let a22 = t_mat[(i + 1, i + 1)];
             let trace = a11 + a22;
-            let det_block = a11 * a22 - a12 * a21;
+            // `det_block` is no longer part of the discriminant; the cancellation-free
+            // form below uses the entries directly. Kept out rather than left unused.
             // `4*(p^2 + bc)`, NOT `trace^2 - 4*det`. Equal in exact arithmetic --
             // `(a+d)^2 - 4(ad - bc) = (a-d)^2 + 4bc` -- and not in floating point: the
             // second form subtracts two individually large, nearly equal quantities, so
@@ -6893,7 +6894,8 @@ pub fn eigvals(
             let a21 = t_mat[(i + 1, i)];
             let a22 = t_mat[(i + 1, i + 1)];
             let trace = a11 + a22;
-            let det_block = a11 * a22 - a12 * a21;
+            // See the sibling classifier: the discriminant no longer goes through the
+            // determinant, so forming it here would only produce an unused binding.
             // `4*(p^2 + bc)`, NOT `trace^2 - 4*det`. Equal in exact arithmetic --
             // `(a+d)^2 - 4(ad - bc) = (a-d)^2 + 4bc` -- and not in floating point: the
             // second form subtracts two individually large, nearly equal quantities, so

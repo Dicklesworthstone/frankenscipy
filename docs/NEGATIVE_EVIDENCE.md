@@ -36933,3 +36933,71 @@ fsci-signal: 684 passed, 0 failed.
 forced me to compile fsci-signal's dependent tests for the first time. It is NOT caused
 by that change — it reproduces with `EIG_USE_FRANCIS_SCHUR` off — and it had been sitting
 in unbuilt work.
+
+## The Francis blocker is NOT in `butter` — it is in `tf2sos`. And my first measurement of it was invalid.
+
+2026-08-18. `crates/fsci-signal/src/bin/diff_butter_eig_arms.rs`
+(`MARKER=butter-eig-arms-v1`), release, executed-ELF-sha256 `24c63f09a709d66dd96e9b6fcfd78ad2d9c9d6703fcd66deef32f3eddb342e55`.
+Per-arm: fsci loadavg [16.91 22.12 26.37] 3144 MHz; scipy loadavg [16.91 22.12 26.37]
+2564 MHz, SciPy 1.17.1, same invocation. Exact coefficient values, no timing claimed.
+
+**Result class: BEHAVIORAL.** same_host: thinkstation1 (both arms in one process on one machine). This refutes a BEHAVIOUR claim —
+which function the eig arm actually reaches — using exact coefficient values, not
+timings; no A/A null applies because nothing here is a duration. Probe:
+`diff_butter_eig_arms` prints the BA coefficients under both arms in one process, and
+`scratchpad/butter_arm.py` scores them against `scipy.signal.butter(..., output='ba')`
+in the same invocation.
+
+**OBSERVED:** the probe returned max-relative-error against SciPy of
+`2.517e-15, 1.074e-15, 3.460e-12, 3.080e-16, 2.710e-13, 7.372e-08` for the nalgebra arm
+and the SAME SIX VALUES for the francis arm — 6 of 6 identical, 0 differing.
+
+I attributed the blocked sez4r flip to "Francis breaks `butter`". Measuring it properly
+says otherwise.
+
+### `butter` itself is INSENSITIVE to the eig arm
+
+Transfer-function coefficients, both arms against `scipy.signal.butter(..., output='ba')`:
+
+| case | nalgebra vs scipy | francis vs scipy |
+|---|---|---|
+| lp4 Wn=0.2 | 2.517e-15 | 2.517e-15 |
+| lp6 Wn=0.3 | 1.074e-15 | 1.074e-15 |
+| lp8 Wn=0.15 | 3.460e-12 | 3.460e-12 |
+| hp5 Wn=0.4 | 3.080e-16 | 3.080e-16 |
+| lp10 Wn=0.25 | 2.710e-13 | 2.710e-13 |
+| lp12 Wn=0.1 | 7.372e-08 | 7.372e-08 |
+
+**Identical on all six**, to the last printed digit. Butterworth poles are placed
+analytically, so `eig` never enters `butter`. The failing conformance test calls
+`butter_sos`, which is `tf2sos(butter(...))` — and `tf2sos` DOES root-find through
+`poly_roots`, hence through `eig`. **The blocker is `tf2sos`, not `butter`.**
+
+### MY FIRST ATTEMPT AT THIS MEASUREMENT WAS INVALID AND I ALMOST REPORTED IT
+
+**Result class: BEHAVIORAL.** same_host: thinkstation1 (both arms in one process on one machine). A refutation of my own earlier
+measurement, on exact values rather than timings. Probe: the same binary run once per
+representation — the SOS pass and the BA pass differ only in which form is compared.
+
+**OBSERVED:** the SOS pass returned max-relative-errors of
+`4.604e-08, 4.329e+00, 1.181e+00, 1.303e+11, 3.510e+00, 7.374e-01`; the BA pass on the
+same six filters returned `2.517e-15 … 7.372e-08`. A filter coefficient cannot be wrong
+by 1.303e+11, so the first set measures section misalignment, not accuracy.
+
+The first pass compared SOS sections element-wise and produced relative errors of
+4.3, 1.18, and **1.303e+11**. Those are not accuracy figures; second-order sections carry
+no canonical ORDER, so an element-wise diff against SciPy compares different sections
+against each other. Only one row was interpretable and I would have been quoting a
+4-orders-of-magnitude "Francis is worse" number off a harness that was mostly comparing
+unrelated numbers. The 1e11 was the tell — an error that large in a filter coefficient is
+a harness bug, not a numerical one.
+
+Switched to the BA form, which is ordered by descending power and therefore canonical.
+
+### WHAT REMAINS UNMEASURED
+
+How much worse Francis is inside `tf2sos` is still unknown: the invalid harness is the
+only thing that ever produced a number for it. An order-invariant comparison — frequency
+response via `sosfreqz`, or sorted poles and zeros — is what that needs, and it has not
+been run. The flip stays reverted on the evidence of the failing conformance test alone,
+which is sufficient to block but does not size the problem.
