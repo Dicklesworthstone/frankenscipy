@@ -2,6 +2,15 @@
 
 All notable changes to FrankenSciPy are documented in this file.
 
+Scope window: project inception through HEAD on 2026-08-19.
+
+## Version Timeline
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| Unreleased | commits on `main` | through 2026-08-19 | vs-SciPy campaign + 2026-08-19 janitor docs-reorg |
+| workspace `0.1.0` | unreleased HEAD | 2026-08-19 | No git tags and no GitHub Releases exist |
+
 FrankenSciPy is a clean-room Rust reimplementation of SciPy with a
 Condition-Aware Solver Portfolio (CASP) at its core. The project has no
 formal releases yet; this changelog tracks landed capabilities organized
@@ -23,6 +32,16 @@ total commits.
 ### 2026-08-19 — Repo-janitor docs-reorg
 
 Root planning and parity documents moved into [`docs/planning/`](docs/planning/).
+
+### Delivered capability
+
+- Planning/parity markdown no longer occupies the repo root; canonical paths are under `docs/planning/`.
+- vs-SciPy campaign continues on `main` with no tags or GitHub Releases.
+
+### Closed workstreams
+
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/frankenscipy/blob/main/.beads/issues.jsonl).
+
 Live janitor commits:
 
 - [`fb631afa09`](https://github.com/Dicklesworthstone/frankenscipy/commit/fb631afa09f898bb8260b5318cabc2037de59008)
