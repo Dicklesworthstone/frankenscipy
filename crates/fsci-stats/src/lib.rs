@@ -10665,6 +10665,22 @@ pub struct BetaNegativeBinomial {
 /// Same-binary A/B toggle for [`BetaNegativeBinomial::cdf_many`]. When `true`,
 /// the batch API maps the legacy scalar `cdf(k)` per query; when `false`, it
 /// builds one prefix table up to `max(k)` and indexes it.
+///
+/// CONTRACT: BYTE-IDENTICAL either way, and the reason is that the scalar `cdf` is not
+/// the generic `DiscreteDistribution::cdf`. That default sums `pmf(0..=k)` with each
+/// `pmf` computed independently from `ln_gamma`, and against THAT a prefix table would
+/// differ — a recurrence accumulating rounding versus terms computed fresh. But
+/// `BetaNegativeBinomial` overrides `cdf` with exactly the recurrence the table uses:
+/// same `pmf(0)` seed, same ratio `(n+i)(b+i)/((i+1)(a+n+b+i))`, same running total, same
+/// final `min(1.0)`. The table is that loop with its partial sums retained, so element
+/// `i` is bit-for-bit what `cdf(ks[i])` returns.
+///
+/// The fast arm also declines `max(k) > 1_000_000` and falls back to the scalar map,
+/// where identity is trivial because only one path exists.
+///
+/// Worth stating explicitly because the surrounding code makes the opposite look true:
+/// checking this against the generic default rather than the override would have
+/// produced a confident and wrong "not identical".
 pub static BETANBINOM_CDF_MANY_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -42529,6 +42545,27 @@ pub static GAUSSIAN_KDE_ND_SIMD_EXP_DISABLE: std::sync::atomic::AtomicBool =
 /// tile. The default retains the one-query-at-a-time evaluation loop because the tile did
 /// not clear its doubled-null confidence-interval gate. `#[doc(hidden)]` — the same-binary
 /// benchmark knob.
+///
+/// CONTRACT: NOT byte-identical, for TWO independent reasons — either alone would break
+/// identity, and a contract naming only one would be half right.
+///
+/// 1. DIFFERENT SUMMATION ORDER. The tile accumulates each query's kernel sum into SIMD
+///    lanes and finishes with `reduce_sum()`, so the dataset is summed as lane-wise
+///    partials combined pairwise. The untiled path sums it sequentially. Same terms,
+///    different association.
+/// 2. DIFFERENT EXPONENTIAL. The tiled kernel calls `kde_simd_exp_nonpos` — Cephes'
+///    rational approximation, worst case 1.38 ulp against libm over the range used here
+///    (see `GAUSSIAN_KDE_SIMD_EXP_DISABLE`) — where the scalar path calls `exp`. This
+///    part is separately gated by `GAUSSIAN_KDE_ND_SIMD_EXP_DISABLE`, so the two toggles
+///    INTERACT: disabling the SIMD exp removes reason 2 and leaves reason 1 standing, and
+///    an A/B that flips only one of them is not measuring what its name says.
+///
+/// Neither error amplifies: the summands are non-negative, so there is no cancellation
+/// for the reordering to magnify, and the per-term exp difference enters linearly.
+///
+/// Note the default here is DISABLED, and the comment above records why — the tile did
+/// not clear its doubled-null confidence-interval gate. That is a performance verdict,
+/// not an accuracy one, and it is independent of this contract.
 #[doc(hidden)]
 pub static GAUSSIAN_KDE_ND_QUERY_TILE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
@@ -60316,6 +60353,443 @@ mod ratio_uniforms_matches_scipy {
         );
         // MUST-MISS control for the guards above.
         assert!(RatioUniforms::new(f, 1.0, -1.0, 1.0, 0.0).is_ok());
+    }
+}
+
+
+/// Transformed Density Rejection for LOG-CONCAVE densities.
+///
+/// Corresponds to `scipy.stats.sampling.TransformedDensityRejection(dist, c=0,
+/// construction_points=...)`. Needs `pdf` and its derivative `dpdf`, neither of
+/// which need be normalised.
+///
+/// # How it works
+///
+/// With `h = ln f` concave, every tangent to `h` lies ABOVE it and every secant
+/// lies BELOW it. Exponentiating gives a piecewise-exponential HAT that dominates
+/// `f` and a piecewise-exponential SQUEEZE that `f` dominates. Sampling from the
+/// hat is exact inversion; a draw is accepted on the squeeze without touching
+/// `f`, and only the gap between squeeze and hat costs a pdf evaluation.
+///
+/// The tangents at the construction points intersect pairwise, and those
+/// intersections are the interval boundaries — the hat on each interval is the
+/// tangent that is lowest there.
+///
+/// # Scope, stated rather than implied
+///
+/// This is the `c = 0` (log-concave) case with FIXED construction points. SciPy
+/// defaults to `c = -0.5` and `use_dars=True`, deriving extra points adaptively
+/// until the squeeze/hat ratio target is met. Neither is implemented here. The
+/// consequence is efficiency, not correctness: more construction points close the
+/// gap, and the hat dominates `f` regardless of how they are chosen.
+///
+/// The density MUST be log-concave. That is not checkable in general, so it is a
+/// precondition rather than a validated argument — but a violation is not silent
+/// the way a bad ratio-of-uniforms rectangle is, because `f(x) > hat(x)` is
+/// detected at sample time and reported.
+#[derive(Debug, Clone)]
+pub struct TransformedDensityRejection<F, D> {
+    pdf: F,
+    dpdf: D,
+    /// Construction points, ascending.
+    points: Vec<f64>,
+    /// `ln f` at each construction point.
+    log_f: Vec<f64>,
+    /// `(ln f)' = f'/f` at each construction point.
+    slope: Vec<f64>,
+    /// Interval boundaries; `bound[i]` separates tangent `i` from tangent `i+1`.
+    /// Length `points.len() - 1`.
+    bound: Vec<f64>,
+    /// Cumulative hat area up to the end of each interval, normalised to 1.
+    cum_area: Vec<f64>,
+    /// Total hat area, kept so the acceptance rate is inspectable.
+    hat_area: f64,
+}
+
+impl<F: Fn(f64) -> f64, D: Fn(f64) -> f64> TransformedDensityRejection<F, D> {
+    /// Retries allowed for a single draw.
+    pub const MAX_TRIES: usize = 50_000;
+
+    /// Build hat and squeeze from `construction_points`, which must be strictly
+    /// ascending and land where `pdf` is positive and finite.
+    ///
+    /// # Errors
+    ///
+    /// Fewer than two points, points not ascending, a non-positive or non-finite
+    /// pdf at a point, a non-finite derivative, or a hat of infinite area — which
+    /// happens when the outermost slopes do not point inward and the tails are
+    /// therefore not integrable.
+    pub fn new(pdf: F, dpdf: D, construction_points: &[f64]) -> Result<Self, StatsError> {
+        let n = construction_points.len();
+        if n < 2 {
+            return Err(StatsError::InvalidArgument(
+                "need at least two construction points".to_string(),
+            ));
+        }
+        if construction_points.windows(2).any(|w| !(w[0] < w[1])) {
+            return Err(StatsError::InvalidArgument(
+                "construction points must be strictly ascending".to_string(),
+            ));
+        }
+        let mut log_f = Vec::with_capacity(n);
+        let mut slope = Vec::with_capacity(n);
+        for &x in construction_points {
+            let f = pdf(x);
+            if !(f > 0.0) || !f.is_finite() {
+                return Err(StatsError::InvalidArgument(format!(
+                    "the pdf must be positive and finite at every construction point; \
+                     at {x} it is {f}"
+                )));
+            }
+            let d = dpdf(x);
+            if !d.is_finite() {
+                return Err(StatsError::InvalidArgument(format!(
+                    "the pdf derivative must be finite at every construction point; \
+                     at {x} it is {d}"
+                )));
+            }
+            log_f.push(f.ln());
+            slope.push(d / f);
+        }
+        // The outermost tangents carry the unbounded tails, so they must point
+        // inward or the hat has infinite area.
+        if !(slope[0] > 0.0) || !(slope[n - 1] < 0.0) {
+            return Err(StatsError::InvalidArgument(format!(
+                "the hat is not integrable: the tangent slope of ln f must be positive \
+                 at the first construction point (got {}) and negative at the last \
+                 (got {})",
+                slope[0],
+                slope[n - 1]
+            )));
+        }
+
+        // Tangent i and i+1 intersect where their lines meet. Equal slopes mean
+        // ln f is linear across the pair, so the two tangents COINCIDE and any
+        // separator is correct; the midpoint is the stable choice.
+        let mut bound = Vec::with_capacity(n - 1);
+        for i in 0..n - 1 {
+            let (x0, x1) = (construction_points[i], construction_points[i + 1]);
+            let ds = slope[i] - slope[i + 1];
+            let z = if ds.abs() <= f64::EPSILON * slope[i].abs().max(1.0) {
+                0.5 * (x0 + x1)
+            } else {
+                (log_f[i + 1] - log_f[i] - slope[i + 1] * x1 + slope[i] * x0) / ds
+            };
+            // Concavity puts the crossing between the two points; clamping guards
+            // against a rounding excursion turning an interval inside out.
+            bound.push(z.clamp(x0, x1));
+        }
+
+        // Hat area per interval, in a form that cannot overflow: factor out the
+        // larger exponent before differencing.
+        let mut areas = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = if i == 0 { f64::NEG_INFINITY } else { bound[i - 1] };
+            let b = if i == n - 1 { f64::INFINITY } else { bound[i] };
+            areas.push(Self::interval_area(construction_points[i], log_f[i], slope[i], a, b));
+        }
+        let hat_area: f64 = areas.iter().sum();
+        if !(hat_area > 0.0) || !hat_area.is_finite() {
+            return Err(StatsError::InvalidArgument(format!(
+                "the hat area is not finite and positive, got {hat_area}"
+            )));
+        }
+        let mut cum_area = Vec::with_capacity(n);
+        let mut acc = 0.0;
+        for a in &areas {
+            acc += a / hat_area;
+            cum_area.push(acc);
+        }
+        // Pin the top so a uniform of exactly 1.0 cannot fall past the last
+        // interval.
+        cum_area[n - 1] = 1.0;
+
+        Ok(Self {
+            pdf,
+            dpdf,
+            points: construction_points.to_vec(),
+            log_f,
+            slope,
+            bound,
+            cum_area,
+            hat_area,
+        })
+    }
+
+    /// `∫ₐᵇ exp(log_f + s·(x − x₀)) dx`, with either endpoint possibly infinite.
+    fn interval_area(x0: f64, log_f: f64, s: f64, a: f64, b: f64) -> f64 {
+        if s == 0.0 {
+            return if a.is_finite() && b.is_finite() {
+                log_f.exp() * (b - a)
+            } else {
+                f64::INFINITY
+            };
+        }
+        let ea = if a.is_finite() { s * (a - x0) } else { f64::NEG_INFINITY };
+        let eb = if b.is_finite() { s * (b - x0) } else { f64::NEG_INFINITY };
+        // `s·(±inf − x0)` is −inf exactly when the tail points inward, which is
+        // enforced in `new`; the other case is rejected there.
+        let m = ea.max(eb);
+        if !m.is_finite() {
+            return f64::INFINITY;
+        }
+        (log_f + m).exp() * ((eb - m).exp() - (ea - m).exp()) / s
+    }
+
+    /// Total hat area. The acceptance rate is `∫f / hat_area`, so this is how the
+    /// quality of a construction-point choice is judged.
+    #[must_use]
+    pub fn hat_area(&self) -> f64 {
+        self.hat_area
+    }
+
+    /// Which tangent governs `x`.
+    fn interval_of(&self, x: f64) -> usize {
+        self.bound.partition_point(|&z| z <= x)
+    }
+
+    /// The hat at `x`: `exp` of the lowest tangent there.
+    #[must_use]
+    pub fn hat(&self, x: f64) -> f64 {
+        let i = self.interval_of(x);
+        (self.log_f[i] + self.slope[i] * (x - self.points[i])).exp()
+    }
+
+    /// The squeeze at `x`: `exp` of the secant of `ln f` across the bracketing
+    /// construction points, and zero outside them, where there is no secant.
+    #[must_use]
+    pub fn squeeze(&self, x: f64) -> f64 {
+        let n = self.points.len();
+        if x < self.points[0] || x > self.points[n - 1] {
+            return 0.0;
+        }
+        let j = self.points.partition_point(|&p| p <= x).min(n - 1);
+        let i = j - 1;
+        let (x0, x1) = (self.points[i], self.points[j]);
+        let t = if x1 > x0 { (x - x0) / (x1 - x0) } else { 0.0 };
+        (self.log_f[i] + t * (self.log_f[j] - self.log_f[i])).exp()
+    }
+
+    /// One draw.
+    ///
+    /// # Errors
+    ///
+    /// The retry budget being exhausted, or `pdf` exceeding the hat — which means
+    /// the density is not log-concave and the construction is invalid. That is
+    /// reported rather than silently producing the wrong distribution.
+    pub fn try_sample_one(&self, rng: &mut impl Rng) -> Result<f64, StatsError> {
+        let n = self.points.len();
+        for _ in 0..Self::MAX_TRIES {
+            // Pick an interval by its share of the hat area, then invert within it.
+            let u = rng.random::<f64>();
+            let i = self.cum_area.partition_point(|&c| c < u).min(n - 1);
+            let a = if i == 0 { f64::NEG_INFINITY } else { self.bound[i - 1] };
+            let b = if i == n - 1 { f64::INFINITY } else { self.bound[i] };
+            let (x0, s) = (self.points[i], self.slope[i]);
+            let w = rng.random::<f64>();
+            let x = if s == 0.0 {
+                a + w * (b - a)
+            } else {
+                let ea = if a.is_finite() { s * (a - x0) } else { f64::NEG_INFINITY };
+                let eb = if b.is_finite() { s * (b - x0) } else { f64::NEG_INFINITY };
+                let m = ea.max(eb);
+                let lo = (ea - m).exp();
+                let hi = (eb - m).exp();
+                let inner = lo + w * (hi - lo);
+                if !(inner > 0.0) {
+                    continue;
+                }
+                x0 + (m + inner.ln()) / s
+            };
+            if !x.is_finite() {
+                continue;
+            }
+            let hat = self.hat(x);
+            let v = rng.random::<f64>() * hat;
+            if v <= self.squeeze(x) {
+                return Ok(x);
+            }
+            let fx = (self.pdf)(x);
+            if fx > hat * (1.0 + 1e-9) {
+                return Err(StatsError::InvalidArgument(format!(
+                    "the pdf exceeds the hat at {x} ({fx} > {hat}); the density is not \
+                     log-concave, so this construction is invalid"
+                )));
+            }
+            if v <= fx {
+                return Ok(x);
+            }
+        }
+        Err(StatsError::InvalidArgument(format!(
+            "transformed density rejection failed to accept in {} tries",
+            Self::MAX_TRIES
+        )))
+    }
+
+    /// `n` draws.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::try_sample_one`].
+    pub fn sample(&self, n: usize, rng: &mut impl Rng) -> Result<Vec<f64>, StatsError> {
+        (0..n).map(|_| self.try_sample_one(rng)).collect()
+    }
+}
+
+#[cfg(test)]
+mod tdr_matches_scipy {
+    use super::{StatsError, TransformedDensityRejection};
+    use rand::{SeedableRng, rngs::StdRng};
+
+    fn normal() -> TransformedDensityRejection<impl Fn(f64) -> f64, impl Fn(f64) -> f64> {
+        // Unnormalised, because the method does not need normalisation and using a
+        // normalised density would test something weaker.
+        TransformedDensityRejection::new(
+            |x: f64| (-x * x / 2.0).exp(),
+            |x: f64| -x * (-x * x / 2.0).exp(),
+            &[-3.0, -1.5, -0.5, 0.5, 1.5, 3.0],
+        )
+        .expect("valid construction")
+    }
+
+    /// THE structural property, and the reason the method is correct at all:
+    ///
+    /// ```text
+    ///   squeeze(x)  <=  f(x)  <=  hat(x)     for every x
+    /// ```
+    ///
+    /// Checked exactly on a dense grid rather than sampled. If the hat ever dips
+    /// below `f` the sampler returns the wrong distribution; if the squeeze ever
+    /// rises above it, draws are accepted that should have been rejected. Neither
+    /// shows up reliably in a moment test.
+    #[test]
+    fn the_hat_dominates_and_the_squeeze_is_dominated() {
+        let t = normal();
+        for step in -60_000..=60_000_i32 {
+            let x = f64::from(step) * 0.0001;
+            let f = (-x * x / 2.0).exp();
+            let hat = t.hat(x);
+            let sq = t.squeeze(x);
+            assert!(
+                f <= hat * (1.0 + 1e-12),
+                "hat dipped below the density at x = {x}: f = {f}, hat = {hat}"
+            );
+            assert!(
+                sq <= f * (1.0 + 1e-12),
+                "squeeze rose above the density at x = {x}: squeeze = {sq}, f = {f}"
+            );
+        }
+        // The squeeze is zero outside the construction points, where no secant
+        // exists -- and non-zero inside, or it would be doing no work at all.
+        assert_eq!(t.squeeze(-4.0), 0.0);
+        assert_eq!(t.squeeze(4.0), 0.0);
+        assert!(t.squeeze(0.0) > 0.0);
+    }
+
+    /// The hat area is a computed quantity, so it gets checked against the thing
+    /// it must exceed: the true integral of the density.
+    #[test]
+    fn the_hat_area_exceeds_the_density_integral_and_not_by_much() {
+        let t = normal();
+        let exact = std::f64::consts::TAU.sqrt(); // integral of exp(-x^2/2)
+        assert!(
+            t.hat_area() > exact,
+            "hat area {} must exceed the density integral {exact}",
+            t.hat_area()
+        );
+        // Six well-placed points on a gaussian should be comfortably tight; a
+        // ratio far above this would mean the interval boundaries are wrong.
+        assert!(
+            t.hat_area() < 1.15 * exact,
+            "hat area {} is more than 15% above the integral {exact}, which suggests \
+             the tangent intersections are misplaced",
+            t.hat_area()
+        );
+    }
+
+    #[test]
+    fn it_samples_the_distribution() {
+        let t = normal();
+        let mut rng = StdRng::seed_from_u64(90210);
+        let n = 200_000;
+        let s = t.sample(n, &mut rng).expect("acceptance");
+        let mean = s.iter().sum::<f64>() / n as f64;
+        let var = s.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+        assert!(mean.abs() < 5.0 * (1.0 / n as f64).sqrt(), "mean {mean}");
+        assert!((var - 1.0).abs() < 5.0 * (2.0 / n as f64).sqrt(), "var {var}");
+        // A log-concave density with a shifted, asymmetric shape too: Gamma(3,1),
+        // x^2 e^-x on x > 0, whose ln f = 2 ln x - x is concave.
+        let g = TransformedDensityRejection::new(
+            |x: f64| if x > 0.0 { x * x * (-x).exp() } else { 0.0 },
+            |x: f64| if x > 0.0 { (2.0 * x - x * x) * (-x).exp() } else { 0.0 },
+            &[0.4, 1.0, 2.0, 3.5, 6.0, 10.0],
+        )
+        .expect("valid construction");
+        let mut rng2 = StdRng::seed_from_u64(5150);
+        let sg = g.sample(100_000, &mut rng2).expect("acceptance");
+        assert!(sg.iter().all(|x| *x > 0.0), "a draw left the support");
+        let mg = sg.iter().sum::<f64>() / sg.len() as f64;
+        // Gamma(3,1) has mean 3, variance 3.
+        assert!(
+            (mg - 3.0).abs() < 5.0 * (3.0 / sg.len() as f64).sqrt(),
+            "gamma mean {mg}"
+        );
+    }
+
+    #[test]
+    fn validation() {
+        let f = |x: f64| (-x * x / 2.0).exp();
+        let df = |x: f64| -x * (-x * x / 2.0).exp();
+        assert!(
+            TransformedDensityRejection::new(f, df, &[0.0]).is_err(),
+            "one point"
+        );
+        assert!(
+            TransformedDensityRejection::new(f, df, &[1.0, 0.0]).is_err(),
+            "not ascending"
+        );
+        // Both construction points on the same side of the mode leave a tail whose
+        // tangent points outward, so the hat has infinite area.
+        assert!(
+            TransformedDensityRejection::new(f, df, &[1.0, 2.0]).is_err(),
+            "tails not integrable"
+        );
+        // A pdf that is zero at a construction point has no log.
+        assert!(
+            TransformedDensityRejection::new(|_x: f64| 0.0, |_x: f64| 0.0, &[-1.0, 1.0]).is_err(),
+            "pdf zero at a point"
+        );
+        // MUST-MISS control: the valid construction the failures are contrasted with.
+        assert!(TransformedDensityRejection::new(f, df, &[-1.0, 1.0]).is_ok());
+    }
+
+    /// A density that is NOT log-concave breaks the hat, and that must be
+    /// reported rather than quietly producing the wrong samples.
+    #[test]
+    fn a_non_log_concave_density_is_detected_rather_than_mis_sampled() {
+        // A bimodal mixture: ln f is not concave between the modes.
+        let f = |x: f64| (-(x - 3.0) * (x - 3.0) / 0.02).exp() + (-(x + 3.0) * (x + 3.0) / 0.02).exp();
+        let df = |x: f64| {
+            -100.0 * (x - 3.0) * (-(x - 3.0) * (x - 3.0) / 0.02).exp()
+                - 100.0 * (x + 3.0) * (-(x + 3.0) * (x + 3.0) / 0.02).exp()
+        };
+        let built = TransformedDensityRejection::new(f, df, &[-3.2, -3.0, 3.0, 3.2]);
+        // Either the construction rejects it, or sampling detects f > hat. Both are
+        // acceptable outcomes; silently sampling is not.
+        if let Ok(t) = built {
+            let mut rng = StdRng::seed_from_u64(2);
+            let mut saw_error = false;
+            for _ in 0..2000 {
+                if matches!(t.try_sample_one(&mut rng), Err(StatsError::InvalidArgument(_))) {
+                    saw_error = true;
+                    break;
+                }
+            }
+            assert!(
+                saw_error,
+                "a non-log-concave density was sampled without complaint"
+            );
+        }
     }
 }
 
