@@ -55495,6 +55495,30 @@ pub fn binned_statistic_dd(
     (stats, edges)
 }
 
+/// Same-binary A/B toggle for the 3-D `binned_statistic_dd` accumulator. When `true`,
+/// the per-bin pass is single-threaded regardless of size.
+///
+/// CONTRACT: DEPENDS ON THE STATISTIC, which is why a single verdict would be wrong.
+/// Each thread builds private per-bin accumulators over a contiguous chunk and the
+/// partials are merged once, so what changes is the association of each bin's
+/// accumulation — and whether that matters is decided per aggregate:
+///
+/// * `count` — BYTE-IDENTICAL. Summing `1.0` repeatedly produces exact integers while
+///   the total stays under 2^53, and exact-integer addition is order-independent.
+/// * `min` / `max` — BYTE-IDENTICAL, including the SIGN OF ZERO, which is the part that
+///   is not obvious. `<` and `>` treat −0.0 and +0.0 as equal, so a bin holding both
+///   keeps whichever it saw first; chunks are contiguous and merged in order, so
+///   "first" is the same sample in both arms. NaNs never enter the comparison — they
+///   set a per-bin flag instead — so they cannot reorder anything either.
+/// * `sum`, and `mean` which divides it — NOT byte-identical. Per-thread partial sums
+///   combined pairwise is a different association from one sequential pass. Agreement is
+///   ~1e-15 relative, the ordinary summation-order term; the 1-D sibling
+///   `parallel_bin_histogram` records the same figure for the same reason.
+/// * `median` and `std` never reach this path at all — they take the materialize route,
+///   so the toggle cannot affect them.
+///
+/// The parallel arm is additionally gated on `n >= 131_072 && total_bins <= 65_536`;
+/// below that `nthreads` is 1 and the two arms are the same code.
 pub static BINNED_STATISTIC_DD_3D_PARALLEL_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -60399,9 +60423,8 @@ mod ratio_uniforms_matches_scipy {
 /// the way a bad ratio-of-uniforms rectangle is, because `f(x) > hat(x)` is
 /// detected at sample time and reported.
 #[derive(Debug, Clone)]
-pub struct TransformedDensityRejection<F, D> {
+pub struct TransformedDensityRejection<F> {
     pdf: F,
-    dpdf: D,
     /// Construction points, ascending.
     points: Vec<f64>,
     /// `ln f` at each construction point.
@@ -60417,7 +60440,7 @@ pub struct TransformedDensityRejection<F, D> {
     hat_area: f64,
 }
 
-impl<F: Fn(f64) -> f64, D: Fn(f64) -> f64> TransformedDensityRejection<F, D> {
+impl<F: Fn(f64) -> f64> TransformedDensityRejection<F> {
     /// Retries allowed for a single draw.
     pub const MAX_TRIES: usize = 50_000;
 
@@ -60430,7 +60453,11 @@ impl<F: Fn(f64) -> f64, D: Fn(f64) -> f64> TransformedDensityRejection<F, D> {
     /// pdf at a point, a non-finite derivative, or a hat of infinite area — which
     /// happens when the outermost slopes do not point inward and the tails are
     /// therefore not integrable.
-    pub fn new(pdf: F, dpdf: D, construction_points: &[f64]) -> Result<Self, StatsError> {
+    pub fn new<D: Fn(f64) -> f64>(
+        pdf: F,
+        dpdf: D,
+        construction_points: &[f64],
+    ) -> Result<Self, StatsError> {
         let n = construction_points.len();
         if n < 2 {
             return Err(StatsError::InvalidArgument(
@@ -60515,9 +60542,12 @@ impl<F: Fn(f64) -> f64, D: Fn(f64) -> f64> TransformedDensityRejection<F, D> {
         // interval.
         cum_area[n - 1] = 1.0;
 
+        // `dpdf` is deliberately NOT stored: it is consumed here for the tangent
+        // slopes and nothing afterwards needs it. Keeping it against a
+        // hypothetical adaptive-point pass would be dead weight, and the compiler
+        // said so.
         Ok(Self {
             pdf,
-            dpdf,
             points: construction_points.to_vec(),
             log_f,
             slope,
@@ -60652,7 +60682,7 @@ mod tdr_matches_scipy {
     use super::{StatsError, TransformedDensityRejection};
     use rand::{SeedableRng, rngs::StdRng};
 
-    fn normal() -> TransformedDensityRejection<impl Fn(f64) -> f64, impl Fn(f64) -> f64> {
+    fn normal() -> TransformedDensityRejection<impl Fn(f64) -> f64> {
         // Unnormalised, because the method does not need normalisation and using a
         // normalised density would test something weaker.
         TransformedDensityRejection::new(
@@ -101461,7 +101491,7 @@ mod truncate_matches_scipy {
 #[cfg(test)]
 mod transforms_match_scipy {
     use super::{
-        AbsOf, ContinuousDistribution, HalfNormal, LogOf, Lognormal, Normal, Uniform, abs_of,
+        ContinuousDistribution, HalfNormal, LogOf, Lognormal, Normal, Uniform, abs_of,
         exp_of, log_of,
     };
 
