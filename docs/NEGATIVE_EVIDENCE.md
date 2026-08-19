@@ -37288,9 +37288,19 @@ over a stdin protocol, interleaved ABBA with our arm inside each replicate. `sci
 every BLAS thread variable to 1; `scipyN` takes default parallelism capped at the cpuset.
 
 Host thinkstation1, AMD Ryzen Threadripper PRO 5975WX, 64 CPUs, affinity 0-63, governor
-`powersave`, runtime ISA avx2. fsci executed-ELF-sha256
+`powersave`, runtime ISA avx2.
+
+**PROVENANCE CAVEAT, STATED UP FRONT.** The rows below were produced by executed-ELF-sha256
 `bfac23bc70312527486cab8a3e7748f5d01d7d8d7994a705097aedb116d22e3a`, self-reported from
-`/proc/self/exe` inside the process. `ldd` on that binary lists only `libc`, `libgcc_s`,
+`/proc/self/exe`. The file as committed builds to
+`62d270e28ffe7e03ceef5b22ec19c3b4f3c6905e0152ef357863f9691c07ed9e`, because three clippy
+findings were fixed after measuring: two lint-only edits (a redundant `.into_iter()`, an
+`allow` attribute) and one rewrite of the inner product inside `backward_error`, which runs
+ONCE per size BEFORE any timer and is not on the timed path. The timed code is therefore the
+same code — but it is not the same binary, so **these rows are PROVISIONAL** and are marked
+so rather than attributed to a binary that did not produce them. The re-run that would
+promote them is specified at the end of this section; it could not be done in this session
+because the host went from loadavg 20 to 106 immediately afterwards. `ldd` on that binary lists only `libc`, `libgcc_s`,
 `linux-vdso` and `ld-linux` — no BLAS, LAPACK or MKL on our side. Incumbent scipy 1.17.1 /
 numpy 2.4.6, `scipy.linalg._decomp_cholesky` sha256
 `ffa9c56b6df853d633a6969f1a65017e93c1caef9ff31fe0183b8c2771fb60dd`, BLAS `scipy-openblas`,
@@ -37298,7 +37308,7 @@ numpy 2.4.6, `scipy.linalg._decomp_cholesky` sha256
 `0x5eedc0de`, sha256 printed per size; SciPy asserts exact symmetry on receipt.
 Observed threads: scipy1 peak 2 tasks, scipyN peak 64 tasks — observed, not requested.
 
-### Certified rows (A/A nulls within 5% of 1.0)
+### Provisional rows (A/A nulls within 5% of 1.0), quiet window, loadavg 20.6-26.6
 
 | n | fsci (s) | scipy1 (s) | scipyN (s) | **scipy1/fsci** | **scipyN/fsci** | null_fsci | null_scipy1 |
 |---|---|---|---|---|---|---|---|
@@ -37356,12 +37366,53 @@ factor against the mathematics in absolute terms, where the old one only checked
 with SciPy. The elementwise number is still printed, labelled `[diagnostic, not gated]`, so
 the row shows the figure that misled the first version next to the one that did not.
 
+### THE SAME CODE MEASURED A WIN AND A LOSS, AND THE ONLY VARIABLE WAS HOST LOAD
+
+This is the most transferable thing in this section, so it is not buried. The post-clippy
+binary was re-run on the SAME fixtures, SAME sizes, SAME protocol, minutes later, while the
+host climbed from loadavg 20 to 106 (vmstat: 98% busy, 0% idle):
+
+| n | quiet window (loadavg 20-27) | loaded window (loadavg 60-106) | verdict |
+|---|---|---|---|
+| 256 | 1.016x / 1.639x, nulls 1.008/1.008 | 1.028x / 1.634x, nulls 1.031/1.047 | agrees |
+| 512 | **1.407x / 1.339x**, nulls 1.034/1.028 | **0.910x / 0.808x**, nulls 1.012/1.012 | **FLIPS** |
+| 2048 | 2.041x / 1.407x, nulls 1.030/1.012 | 1.712x / 1.294x, null_fsci 1.106 | INVALID under load |
+
+The n=512 cell inverts from a 1.41x win to a 0.91x loss — and **both A/A nulls PASS in the
+loaded window** (1.012 and 1.012). That is the important part. The null is designed to catch
+a window that moved under the arms, and here it certified a cell whose answer was wrong by a
+factor of 1.5. An A/A null bounds drift BETWEEN the two halves of a cell; it cannot see a
+load level that is high but steady, because a steady load depresses both halves equally
+while changing which arm the scheduler favours. n=256, the smallest and least
+parallelism-hungry size, is the one that agrees across both windows, which fits: our arm
+uses more cores as n grows, so it is the arm that loses most when there are no spare cores.
+
+Practical consequence for this campaign: **a passing A/A null is necessary and not
+sufficient.** Every row needs its absolute loadavg recorded and a stated ceiling, not just a
+null. Rows in this repo that carry a null but no load figure cannot be compared with rows
+that carry both.
+
+### The re-run that would promote the provisional rows
+
+Rebuild (already committed) and run, with `uptime` checked immediately before and the
+1-minute average under ~15:
+
+    FSCI_CHOL_SIZES=256,512,1024,2048 FSCI_CHOL_REPLICATES=9 FSCI_CHOL_REPS=2 \
+      FSCI_CHOL_MIN_OF=9 ./target/release/perf_chol_vs_scipy
+
+Promote a row only if its ELF sha matches the shipped binary, both nulls are within 5%, and
+loadavg_pre and loadavg_post are both under the ceiling. n=1024 is expected to stay INVALID
+for the reason given above, which is a prediction this re-run can falsify.
+
 ### What this does and does not settle for 8l8r1.151
 
-It settles the baseline: `cholesky` is AHEAD of the incumbent at 256, 512 and 2048, so the
-panel-order SYRK lever is not closing a deficit — it would be widening a lead. It does not
-measure the SYRK traversal itself, which still has no runtime A/B switch. Anyone taking
-that lever now has a live incumbent number to beat instead of an fsci-against-fsci one.
+It settles the INSTRUMENT, not the number. There is now a live same-invocation incumbent
+harness for `cholesky` with parity gating, A/A nulls and per-arm clock and load — which did
+not exist before, and without which the SYRK lever had nothing but fsci-against-fsci to aim
+at. The provisional reading is that we are AHEAD at 256, 512 and 2048 in a quiet window, so
+the lever would be widening a lead rather than closing a deficit; that reading is not banked
+until the re-run above. It does not measure the SYRK traversal itself, which still has no
+runtime A/B switch — that remains 8l8r1.151's open work.
 
 ## sez4r DELIVERED: Francis as a convergence-failure FALLBACK. All 230 recovered, no cost, `butter` untouched.
 
