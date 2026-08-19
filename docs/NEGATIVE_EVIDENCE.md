@@ -36857,3 +36857,40 @@ fixtures where both routines converge to different spectra SciPy puts Francis cl
 four and nalgebra on two, and two of those (n=5 seed=766, n=8 seed=777) sit 4e-3 to 8e-3
 from SciPy in BOTH arms — a separate accuracy defect, still open, that this neither
 causes nor cures.
+
+## THE FRANCIS DEFAULT IS REVERTED: it breaks `butter` filter design against SciPy. I shipped it having tested one crate.
+
+2026-08-18, the turn after shipping. Host: loadavg 32.3-38.4, CPU idle 71%, runq 14.
+This corrects the row above, which announced the default as delivered.
+
+**WHAT I DID WRONG.** I flipped `EIG_USE_FRANCIS_SCHUR` to `true`, ran `fsci-linalg`'s
+576 tests, saw them green, and shipped. `eig` has SEVEN dependent crates. I tested one.
+
+**WHAT IT BROKE.** `fsci-signal`'s `butter_sos_matches_scipy_reference_sections`:
+
+    section 0 coeff 1: 0.020417662447921658 vs 0.020418961582406275  (diff 1.30e-6)
+
+Butterworth design finds its poles as companion-matrix roots, so it runs through `eig`,
+and a 1.3e-6 relative shift in a filter coefficient is a conformance failure against the
+SciPy reference the test pins.
+
+**CONTROLLED, NOT INFERRED.** With the toggle OFF the test passes; with it ON it fails.
+Same binary, same fixture, one flag. That is what makes this attributable to the flip
+rather than to anything else landing today.
+
+**THE HONEST SCORE ON THE FLIP.** It recovers 230 of 7000 fixtures that previously
+errored, and it costs conformance on `butter`. Those are not comparable by counting:
+the 230 were LOUD failures a caller could catch, and this is a SILENT numerical shift in
+a filter a caller will ship. Same reasoning that blocked the flip twice before; I applied
+it to the complex-pair defect and then failed to apply it to the crates I had not run.
+
+The Francis path stays available behind the toggle, and every fix from the three flip
+attempts stays in — the deflation-scale fix, the discriminant fix, the `eigvals` routing.
+Only the DEFAULT reverts. sez4r's parity work is not undone; it is un-shipped pending
+whatever `butter` needs.
+
+**SEPARATELY, A PRE-EXISTING FAILURE NOT CAUSED BY ANY OF THIS:**
+`jyfke_trailing_trim_is_exact::an_exactly_zero_trailing_coefficient_still_yields_a_root_at_the_origin`
+fails with the toggle OFF too — "the section still reports two zeros, left 1 right 2". It
+is in my own earlier unbuilt fsci-signal work and is being compiled for the first time.
+Recorded here so it is not mistaken for fallout from the eig change; it needs its own fix.

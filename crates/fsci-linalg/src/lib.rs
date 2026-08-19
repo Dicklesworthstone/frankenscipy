@@ -6473,7 +6473,7 @@ pub static EIG_BALANCE: std::sync::atomic::AtomicBool =
 ///
 /// Set to `false` for the old routine; it stays a toggle rather than a deletion.
 pub static EIG_USE_FRANCIS_SCHUR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+    std::sync::atomic::AtomicBool::new(false);
 
 fn bounded_schur(
     m: DMatrix<f64>,
