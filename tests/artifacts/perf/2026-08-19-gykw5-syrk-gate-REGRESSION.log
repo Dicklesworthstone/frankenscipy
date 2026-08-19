@@ -40,3 +40,46 @@ n=832 RESULT scipy1/fsci=0.951x scipyN/fsci=0.671x null_fsci=1.035 null_scipy1=1
 n=832 MATMUL_RAW gate=1 ratios=0.890870153,0.873420450,0.942489330,0.871110892,0.894375171,0.899428382,0.909820291,0.918888636,0.946099507,0.893158157,0.778769633
 n=832 MATMUL_ARM gate=1 default/lowered=0.894x (>1 = lowered gate faster) null_matmul=1.030 matmul_gates=PASS
 n=832 scipy1_peak_tasks=2 scipyN_peak_tasks=64
+# perf_chol_vs_scipy — fsci_linalg::cholesky vs scipy.linalg.cholesky, LIVE
+elf_sha256=eabcf12583751009597c01672286cb085e6da55ffb657bed9eb3ffb5fe1716fe
+host=thinkstation1 nproc=64 loadavg_pre=10.41 13.25 15.94 12/5019 1090159 mhz_pre=2698
+sizes=[640, 832] replicates=11 reps=3 min_of=9 seed=0x5eedc0de max_loadavg=30 max_clock_ratio=1.25 nc_arm=0 no_scipy=false trsm_ab=false trsm_macs=0 matmul_macs=33554432
+n=640 READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas chol_module=scipy.linalg._decomp_cholesky chol_sha256=ffa9c56b6df853d633a6969f1a65017e93c1caef9ff31fe0183b8c2771fb60dd fixture_sha256=d63d4d9e92ef6f8d0f32801bb256f0fe8dd608e90a49a99ae4e9f171a3289673 n=640 affinity=64 peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=640 READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas chol_module=scipy.linalg._decomp_cholesky chol_sha256=ffa9c56b6df853d633a6969f1a65017e93c1caef9ff31fe0183b8c2771fb60dd fixture_sha256=d63d4d9e92ef6f8d0f32801bb256f0fe8dd608e90a49a99ae4e9f171a3289673 n=640 affinity=64 peak_tasks=64 thread_names=[('python3.13', 55)] fsci_loaded=False genuine=True
+n=640 parity backward_err ours=1.367e-16 scipy=1.583e-16 budget=2.274e-12 (16·n·eps) factor_rel_fro=7.821e-17 worst_elementwise_rel=3.109e-12@(550,545) [diagnostic, not gated]
+n=640 MATMUL_REACH par_dispatch_default=0 par_dispatch_lowered=1 differing_bits=0
+n=640 rep=0 fsci=8.189931e-3s scipy1=7.969242e-3s scipyN=6.999754e-3s r1=0.973x rN=0.855x | fsci[mhz 2764->3288 load 10.41->10.41] scipy1[mhz 2466 load 10.41 tasks 2] scipyN[mhz 3346 load 10.41 tasks 64]
+n=640 rep=1 fsci=8.275713e-3s scipy1=7.842512e-3s scipyN=6.942826e-3s r1=0.948x rN=0.839x | fsci[mhz 2439->2851 load 10.41->10.41] scipy1[mhz 2352 load 10.41 tasks 2] scipyN[mhz 2988 load 10.41 tasks 64]
+n=640 rep=2 fsci=8.423274e-3s scipy1=7.830459e-3s scipyN=6.525714e-3s r1=0.930x rN=0.775x | fsci[mhz 2762->2461 load 10.41->10.41] scipy1[mhz 2979 load 10.41 tasks 2] scipyN[mhz 3542 load 10.41 tasks 64]
+n=640 rep=3 fsci=8.320749e-3s scipy1=7.957419e-3s scipyN=6.553167e-3s r1=0.956x rN=0.788x | fsci[mhz 2374->2777 load 10.41->10.41] scipy1[mhz 2412 load 10.41 tasks 2] scipyN[mhz 3175 load 10.41 tasks 64]
+n=640 rep=4 fsci=8.773648e-3s scipy1=8.345114e-3s scipyN=6.612289e-3s r1=0.951x rN=0.754x | fsci[mhz 2281->2229 load 10.46->10.46] scipy1[mhz 2179 load 10.46 tasks 2] scipyN[mhz 2613 load 10.46 tasks 64]
+n=640 rep=5 fsci=8.236980e-3s scipy1=8.035217e-3s scipyN=6.771511e-3s r1=0.976x rN=0.822x | fsci[mhz 2383->2808 load 10.46->10.46] scipy1[mhz 2550 load 10.46 tasks 2] scipyN[mhz 3241 load 10.46 tasks 64]
+n=640 rep=6 fsci=8.500540e-3s scipy1=8.044214e-3s scipyN=6.273005e-3s r1=0.946x rN=0.738x | fsci[mhz 3089->2544 load 10.46->10.46] scipy1[mhz 2863 load 10.46 tasks 2] scipyN[mhz 3177 load 10.46 tasks 64]
+n=640 rep=7 fsci=8.746726e-3s scipy1=8.155996e-3s scipyN=6.814512e-3s r1=0.932x rN=0.779x | fsci[mhz 2666->2694 load 10.46->10.46] scipy1[mhz 2601 load 10.46 tasks 2] scipyN[mhz 3030 load 10.46 tasks 64]
+n=640 rep=8 fsci=8.540715e-3s scipy1=8.272267e-3s scipyN=7.012007e-3s r1=0.969x rN=0.821x | fsci[mhz 2450->2624 load 10.46->10.46] scipy1[mhz 2538 load 10.46 tasks 2] scipyN[mhz 3159 load 10.46 tasks 64]
+n=640 rep=9 fsci=8.588797e-3s scipy1=7.955546e-3s scipyN=6.800536e-3s r1=0.926x rN=0.792x | fsci[mhz 2991->2911 load 10.46->10.46] scipy1[mhz 3383 load 10.46 tasks 2] scipyN[mhz 3677 load 10.46 tasks 64]
+n=640 rep=10 fsci=8.189860e-3s scipy1=7.849636e-3s scipyN=6.908190e-3s r1=0.958x rN=0.844x | fsci[mhz 3370->2721 load 11.38->11.38] scipy1[mhz 3069 load 11.38 tasks 2] scipyN[mhz 3226 load 11.38 tasks 64]
+n=640 RESULT scipy1/fsci=0.951x scipyN/fsci=0.792x null_fsci=1.017 null_scipy1=1.006 ambient=10.41/30.00 load_peak=11.38[ours, not gated] mhz_fsci=2704 mhz_scipy=2935 clock_ratio=1.086 gates=PASS loadavg_post=11.38 13.35 15.94 11/5134 1119713
+n=640 MATMUL_RAW gate=33554432 ratios=0.882109888,1.037687116,0.961137800,1.017488573,0.954792944,0.902092509,0.887826322,0.975754136,0.927805232,0.939475744,0.973138349
+n=640 MATMUL_ARM gate=33554432 default/lowered=0.955x (>1 = lowered gate faster) null_matmul=1.026 matmul_gates=PASS
+n=640 scipy1_peak_tasks=2 scipyN_peak_tasks=64
+n=832 READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas chol_module=scipy.linalg._decomp_cholesky chol_sha256=ffa9c56b6df853d633a6969f1a65017e93c1caef9ff31fe0183b8c2771fb60dd fixture_sha256=26ae73bdc2b02be754978ee3d563a6f72b939ec597b1b00298003cb8ccb24829 n=832 affinity=64 peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=832 READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas chol_module=scipy.linalg._decomp_cholesky chol_sha256=ffa9c56b6df853d633a6969f1a65017e93c1caef9ff31fe0183b8c2771fb60dd fixture_sha256=26ae73bdc2b02be754978ee3d563a6f72b939ec597b1b00298003cb8ccb24829 n=832 affinity=64 peak_tasks=64 thread_names=[('python3.13', 64)] fsci_loaded=False genuine=True
+n=832 parity backward_err ours=1.153e-16 scipy=1.231e-16 budget=2.956e-12 (16·n·eps) factor_rel_fro=6.890e-17 worst_elementwise_rel=1.021e-10@(600,463) [diagnostic, not gated]
+n=832 MATMUL_REACH par_dispatch_default=0 par_dispatch_lowered=2 differing_bits=0
+n=832 rep=0 fsci=1.724744e-2s scipy1=1.615723e-2s scipyN=1.082175e-2s r1=0.937x rN=0.627x | fsci[mhz 3016->2750 load 11.38->11.38] scipy1[mhz 2498 load 11.38 tasks 2] scipyN[mhz 3292 load 11.38 tasks 64]
+n=832 rep=1 fsci=1.726532e-2s scipy1=1.606422e-2s scipyN=1.072122e-2s r1=0.930x rN=0.621x | fsci[mhz 2941->2857 load 11.38->11.38] scipy1[mhz 2808 load 11.38 tasks 2] scipyN[mhz 3738 load 11.38 tasks 64]
+n=832 rep=2 fsci=1.688314e-2s scipy1=1.616219e-2s scipyN=1.075004e-2s r1=0.957x rN=0.637x | fsci[mhz 2744->3005 load 11.75->11.75] scipy1[mhz 2856 load 11.75 tasks 2] scipyN[mhz 3297 load 11.75 tasks 64]
+n=832 rep=3 fsci=1.754490e-2s scipy1=1.666688e-2s scipyN=1.093704e-2s r1=0.950x rN=0.623x | fsci[mhz 3469->2701 load 11.75->11.75] scipy1[mhz 2739 load 11.75 tasks 2] scipyN[mhz 3448 load 11.75 tasks 64]
+n=832 rep=4 fsci=1.737780e-2s scipy1=1.804150e-2s scipyN=1.143622e-2s r1=1.038x rN=0.658x | fsci[mhz 2469->3312 load 11.75->11.75] scipy1[mhz 3224 load 11.75 tasks 2] scipyN[mhz 3686 load 11.75 tasks 64]
+n=832 rep=5 fsci=1.836169e-2s scipy1=1.739008e-2s scipyN=1.096592e-2s r1=0.947x rN=0.597x | fsci[mhz 3854->2519 load 13.54->13.54] scipy1[mhz 2810 load 13.54 tasks 2] scipyN[mhz 3207 load 13.54 tasks 64]
+n=832 rep=6 fsci=1.820839e-2s scipy1=1.782861e-2s scipyN=1.095346e-2s r1=0.979x rN=0.602x | fsci[mhz 2532->3280 load 13.54->13.54] scipy1[mhz 2493 load 13.54 tasks 2] scipyN[mhz 3208 load 13.54 tasks 64]
+n=832 rep=7 fsci=1.681060e-2s scipy1=1.588387e-2s scipyN=1.073291e-2s r1=0.945x rN=0.638x | fsci[mhz 2899->2741 load 13.54->13.54] scipy1[mhz 3364 load 13.54 tasks 2] scipyN[mhz 3050 load 13.54 tasks 64]
+n=832 rep=8 fsci=1.786633e-2s scipy1=1.590687e-2s scipyN=1.063245e-2s r1=0.890x rN=0.595x | fsci[mhz 2429->2216 load 12.93->12.93] scipy1[mhz 2240 load 12.93 tasks 2] scipyN[mhz 3077 load 12.93 tasks 64]
+n=832 rep=9 fsci=1.637472e-2s scipy1=1.568227e-2s scipyN=1.083634e-2s r1=0.958x rN=0.662x | fsci[mhz 3190->2440 load 12.93->12.93] scipy1[mhz 2316 load 12.93 tasks 2] scipyN[mhz 3214 load 12.93 tasks 64]
+n=832 rep=10 fsci=1.725239e-2s scipy1=1.636883e-2s scipyN=1.141650e-2s r1=0.949x rN=0.662x | fsci[mhz 2547->3055 load 12.93->12.93] scipy1[mhz 2622 load 12.93 tasks 2] scipyN[mhz 3388 load 12.93 tasks 64]
+n=832 RESULT scipy1/fsci=0.949x scipyN/fsci=0.627x null_fsci=1.038 null_scipy1=1.057 ambient=11.38/30.00 load_peak=13.54[ours, not gated] mhz_fsci=2862 mhz_scipy=3026 clock_ratio=1.057 gates=FAIL loadavg_post=12.93 13.61 15.99 8/5147 1162738
+n=832 MATMUL_RAW gate=33554432 ratios=1.051719440,0.969675138,0.949654163,0.947558058,0.841273774,1.002116689,1.037308901,1.007392245,0.881042363,0.975354380,1.077369538
+n=832 MATMUL_ARM gate=33554432 default/lowered=0.975x (>1 = lowered gate faster) null_matmul=1.027 matmul_gates=PASS
+n=832 ROW INVALID: an A/A null missed 1.0 by more than 5%, so this cell measured the window, not the code.
+n=832 scipy1_peak_tasks=2 scipyN_peak_tasks=64

@@ -38841,3 +38841,78 @@ this needs.
   on the harm attributable to the SYRK path alone.
 - Two cells, one fixture family. The direction is consistent with the four other gate cells
   measured today, none of which favoured more fan-out.
+
+## 2026-08-19 — frankenscipy-gykw5 — closing my own "one override value" limit: a SURGICAL gate is neutral, not a win
+
+The row above measured the matmul parallel gate at `1` — fully open — and recorded as an honest
+limit that "a partial lowering could in principle land between; it is hard to credit". That
+limit is now closed by measurement rather than by assertion, and the earlier row's DIRECTION was
+partly an artefact of the extreme setting.
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_chol_vs_scipy.rs (arm FSCI_CHOL_MATMUL_MACS)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms one process, ABBA-interleaved)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=64 actual observed worker threads=64
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.104)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.135)
+frankenscipy-engine-sha256 = eabcf12583751009597c01672286cb085e6da55ffb657bed9eb3ffb5fe1716fe
+executed-binary ELF SHA-256 = eabcf12583751009597c01672286cb085e6da55ffb657bed9eb3ffb5fe1716fe
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+Same-invocation A/A null: 1.026 (n=640), 1.027 (n=832)
+Counted mechanism: `MATMUL_PAR_DISPATCHES` observed 0 → 1 at n=640 and 0 → 2 at n=832
+Decision: candidate CI — judged against a 2x A/A-null margin; both cells land INSIDE the band,
+  so both are IN-FLOOR (neutral), neither a win nor a decided regression.
+CV is provenance only and was not used for this decision.
+
+### Why 64M blocks everything: the arithmetic, computed not guessed
+
+Trailing-update MAC counts per panel (`m2 · nb · m2`, nb = 128), against the 64.0M gate:
+
+| n | successive trailing updates |
+|---|---|
+| 640 | 33.6M, 18.9M, 8.4M, 2.1M |
+| 832 | **63.4M**, 42.5M, 25.7M, 13.1M, 4.7M, 0.5M |
+| 1088 | 118.0M, 88.6M, 63.4M, 42.5M, … |
+
+At n=832 the LARGEST trailing update is 63.4M — it misses the 64M gate by 1%. At n=640 the
+largest is 33.6M, barely half. So across the basin nothing threads, which is what
+`MATMUL_PAR_DISPATCHES = 0` reported. By n=1088 two updates clear it, and the basin starts
+lifting shortly after.
+
+### Surgical vs fully-open, and the earlier row's direction was partly the setting
+
+| n | gate | dispatches opened | default/lowered | null | 2x-null band | verdict |
+|---|---|---|---|---|---|---|
+| 640 | 1 (all) | 4 | 0.795x | 1.025 | 0.9500 | DECIDED SLOWER |
+| 640 | **32M** | **1** | **0.955x** | 1.026 | 0.9480 | **IN-FLOOR** |
+| 832 | 1 (all) | 6 | 0.894x | 1.030 | 0.9400 | DECIDED SLOWER |
+| 832 | **32M** | **2** | **0.975x** | 1.027 | 0.9460 | **IN-FLOOR** |
+
+So most of the harm at `gate = 1` came from dispatching the TINY updates (down to 0.5M MACs),
+exactly as the limit note suspected. Opening only the largest one or two is not harmful — and it
+is not helpful either. Both surgical cells sit inside their own noise floor.
+
+### What this settles
+
+Threading the biggest trailing updates in the basin is worth **nothing measurable**, and
+threading all of them is worth **-11% to -26%**. There is no setting of this threshold that
+turns the basin into a win, which is a stronger statement than the previous row could make.
+Combined with the two TRSM levers, four measurements now agree: the deficit is not reachable
+through parallel-dispatch tuning.
+
+That leaves the decomposition itself, and it also sharpens what a replacement has to do. The
+current fixed-panel scheme produces trailing updates that DECAY geometrically (63.4 → 42.5 →
+25.7 → 13.1 → 4.7 → 0.5 at n=832), so all but the first are too small to thread profitably. A
+recursive/cache-oblivious right-looking split would instead produce ONE trailing update of
+roughly (n/2)³ at the root — 72M MACs at n=832, above the gate — and recurse. That is the
+structural difference to test, and it is a design change rather than a knob.
+
+### Honest limits
+
+- Two cells, one gate value each on the surgical arm (32M). 48M would open exactly the 63.4M
+  update at n=832 and nothing at n=640; not run.
+- Neutral is measured against a ~2.6% null. A true 1-2% gain would be invisible here and is not
+  excluded — but a 1-2% gain does not close a 0.62x basin either.
+- Same non-SYRK-specific caveat as the row above: `matmul_thread_count` has 11 call sites.
