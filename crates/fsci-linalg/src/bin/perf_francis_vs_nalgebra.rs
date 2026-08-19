@@ -105,15 +105,41 @@ fn main() {
                 (Some(_), None) => regressed.push((n, seed)),
                 (Some(x), Some(y)) => {
                     // Both converged: they must agree, or one of them is wrong.
-                    let worst = x
-                        .iter()
-                        .zip(y.iter())
-                        .map(|(p, q)| {
+                    //
+                    // NEAREST-NEIGHBOUR MATCHING, not index-by-index on the sorted
+                    // lists. Sorting pairs eigenvalue k of one arm with eigenvalue k of
+                    // the other, which is only meaningful when the sort key separates
+                    // them. On these fixtures it does not: `make_diag_dominant` produces
+                    // spectra whose real parts are ALL IDENTICAL to ~1e-14 (10.5 five
+                    // times, 16.5 eight times) with a single small conjugate pair, so
+                    // the sort orders them by pure rounding noise and the pair lands at
+                    // a different index in each arm. A real eigenvalue then gets
+                    // compared against a complex one and the difference reported is the
+                    // IMAGINARY PART's magnitude — 4e-3 relative — with nothing actually
+                    // wrong. Matching each eigenvalue to its closest counterpart removes
+                    // that entirely: the same two fixtures go to 3.0e-15 and 2.7e-15.
+                    let mut used = vec![false; y.len()];
+                    let mut worst = 0.0_f64;
+                    for p in x.iter() {
+                        let mut best = f64::INFINITY;
+                        let mut best_j = usize::MAX;
+                        for (j, q) in y.iter().enumerate() {
+                            if used[j] {
+                                continue;
+                            }
                             let d = ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2)).sqrt();
+                            if d < best {
+                                best = d;
+                                best_j = j;
+                            }
+                        }
+                        if best_j != usize::MAX {
+                            used[best_j] = true;
                             let s = (p.0 * p.0 + p.1 * p.1).sqrt().max(1.0);
-                            d / s
-                        })
-                        .fold(0.0_f64, f64::max);
+                            worst = worst.max(best / s);
+                        }
+                    }
+                    let _ = &worst;
                     if worst > 1e-8 {
                         disagreed.push((n, seed, worst));
                     }

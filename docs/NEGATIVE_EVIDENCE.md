@@ -37168,3 +37168,57 @@ path: a 2x2 block whose realness test must decide on a spectrum where every real
 coincides, so the discriminant is the only signal and it is tiny. **This must not be
 closed by widening a tolerance** — the fixture family (all real parts equal, one small
 conjugate pair) is the cheapest regression test available for that classifier.
+
+## WITHDRAWN: the "two fixtures 4e-3 from SciPy" defect does not exist. It was my sort-pairing.
+
+2026-08-19. **Result class: BEHAVIORAL.** same_host: thinkstation1 (both arms and the
+incumbent in one invocation). Probe: `perf_francis_vs_nalgebra`, executed-ELF-sha256
+`e9565c6e5cacbdc1ed3e4b2158c82c5cbe2b3b9fe44c1f2863f0f968166e845e`, plus `scipy.linalg.eig` and an optimal-assignment
+comparison. loadavg [15.24 28.92 31.45], 3433 MHz, CPU idle 83%, iowait 0%.
+
+This withdraws TWO earlier rows: the claim that two fixtures sit 4e-3 to 8e-3 from SciPy
+in both Schur routines, and the follow-up claim that one arm was "losing a conjugate
+pair". Neither is true. The bead I filed for it (frankenscipy-unevl) is closed as not a
+defect.
+
+**OBSERVED — both arms recover the pair exactly.**
+
+    n=5 seed=766   scipy |Im| = 0.041231056256   nalgebra 0.041231056256   francis 0.041231056256
+    n=8 seed=777   scipy |Im| = 0.104537074763   nalgebra 0.104537074763   francis 0.104537074763
+
+Twelve decimals, both arms. Nothing is lost by either routine.
+
+**THE ERROR WAS PAIRING BY SORT INDEX.** I compared eigenvalue *k* of one arm against
+eigenvalue *k* of the other after sorting. These spectra have ALL REAL PARTS IDENTICAL to
+~1e-14 — 10.5 five times, 16.5 eight times — plus one small conjugate pair. The sort
+therefore orders them by pure rounding noise, the pair lands at a different index in each
+arm, a real eigenvalue gets compared against a complex one, and the reported difference is
+the imaginary part's magnitude: 0.0412 against |λ| 10.5 is 3.9e-3 — precisely the number
+I filed as a bug.
+
+Under optimal matching, the same data:
+
+| fixture | nalgebra vs scipy | francis vs scipy |
+|---|---|---|
+| n=5 seed=766 | 3.042e-15 | 1.380e-14 |
+| n=8 seed=777 | 2.670e-15 | 1.914e-14 |
+
+**THE CONDITIONING CHECK STANDS AND WAS STILL WORTH DOING.** Gaps 1.066e-14 and 8.882e-16,
+eigenvalue condition numbers 17.7 and 9.9, predicting ~1e-15. It correctly ruled out
+ill-conditioning. It just was not the whole answer, because the remaining explanation was
+in the harness rather than in either arm — and having eliminated the physics is what
+forced me to look at the comparison.
+
+**FIXED SO IT CANNOT RECUR, and it corrects a third row.** The binary now matches each
+eigenvalue to its nearest counterpart instead of pairing by index. Re-running the full
+7000-fixture grid: **disagreed_where_both_converged = 0**, down from 6. So the sez4r
+parity row's "six contested cases, SciPy puts Francis closer on four and nalgebra on two"
+is also withdrawn — there were never six disagreements, and no adjudication was needed.
+The convergence result that row rests on is untouched: **230 recovered, 0 regressed**, and
+it is now clean of any accuracy caveat.
+
+**FOURTH BAD METRIC IN THIS INVESTIGATION.** The others: dividing by a decaying stopband
+(1e284), comparing unordered SOS sections element-wise (1e11), and an absolute epsilon on
+a dimensioned quantity. Every one produced a plausible number pointing at a real-looking
+defect. The pattern worth carrying: when a comparison reports an error many orders larger
+than the arithmetic could produce, suspect the comparison before the code.
