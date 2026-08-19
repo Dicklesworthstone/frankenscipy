@@ -37274,3 +37274,139 @@ jumping 5.87 ms to 339 ms — 58x the cost for 8x the work. A jump that shape is
 that matrix or to something in LAPACK's iteration on it, not a scaling result, and one
 unstable arm is not evidence of a 4.65-7.69x advantage. Reported because suppressing an
 inconvenient-to-explain row would be worse; excluded from any claim.
+
+## 2026-08-19 — `cholesky` against live SciPy: the first vs-incumbent Cholesky row this repo has had
+
+`frankenscipy-8l8r1.151` asks for a large-n panel-order SYRK A/B. Every Cholesky A/B in
+this repo before today was fsci-against-fsci — a self-speedup, which is maintenance and not
+a win — so there was no measured incumbent ratio for `cholesky` at all, and therefore no
+target the SYRK lever could be said to close. This row is that missing baseline, produced
+by a new harness `crates/fsci-linalg/src/bin/perf_chol_vs_scipy.rs`.
+
+Both arms run in ONE invocation: SciPy is a persistent child holding the fixture, driven
+over a stdin protocol, interleaved ABBA with our arm inside each replicate. `scipy1` pins
+every BLAS thread variable to 1; `scipyN` takes default parallelism capped at the cpuset.
+
+Host thinkstation1, AMD Ryzen Threadripper PRO 5975WX, 64 CPUs, affinity 0-63, governor
+`powersave`, runtime ISA avx2. fsci executed-ELF-sha256
+`bfac23bc70312527486cab8a3e7748f5d01d7d8d7994a705097aedb116d22e3a`, self-reported from
+`/proc/self/exe` inside the process. `ldd` on that binary lists only `libc`, `libgcc_s`,
+`linux-vdso` and `ld-linux` — no BLAS, LAPACK or MKL on our side. Incumbent scipy 1.17.1 /
+numpy 2.4.6, `scipy.linalg._decomp_cholesky` sha256
+`ffa9c56b6df853d633a6969f1a65017e93c1caef9ff31fe0183b8c2771fb60dd`, BLAS `scipy-openblas`,
+`genuine=True` (version pinned and no fsci module loaded). Fixture `A = MMᵀ + nI`, seed
+`0x5eedc0de`, sha256 printed per size; SciPy asserts exact symmetry on receipt.
+Observed threads: scipy1 peak 2 tasks, scipyN peak 64 tasks — observed, not requested.
+
+### Certified rows (A/A nulls within 5% of 1.0)
+
+| n | fsci (s) | scipy1 (s) | scipyN (s) | **scipy1/fsci** | **scipyN/fsci** | null_fsci | null_scipy1 |
+|---|---|---|---|---|---|---|---|
+| 256 | 1.05e-3 | 1.07e-3 | 1.75e-3 | **1.016x** | **1.639x** | 1.008 | 1.008 |
+| 512 | 5.09e-3 | 7.06e-3 | 6.62e-3 | **1.407x** | **1.339x** | 1.034 | 1.028 |
+| 2048 | 1.20e-1 | 2.53e-1 | 1.73e-1 | **2.041x** | **1.407x** | 1.030 | 1.012 |
+
+We are faster than both SciPy arms at every certified size, in pure safe Rust against
+OpenBLAS `dpotrf`. n=2048: loadavg 20.1-26.6 across the cell, iowait 0.
+
+**THE FREQUENCY EVIDENCE MAKES THE 2048 WIN CONSERVATIVE, NOT GENEROUS.** Per-arm MHz at
+n=2048: scipyN 3837-4043, scipy1 2928-3166, fsci 2504-3469. The incumbent's strongest arm
+ran on cores clocked roughly 15-40% HIGHER than ours for the whole cell. On this host cores
+differ by up to 3x at the same instant, and the usual failure is a ratio flattered by a
+clock difference; here the difference runs against us, so 1.407x is a floor.
+
+### NOT CERTIFIED: n=1024
+
+| n | scipy1/fsci | scipyN/fsci | null_fsci | verdict |
+|---|---|---|---|---|
+| 1024 | 1.763-1.873x | 1.346-1.509x | 1.081-1.112 | **INVALID** |
+
+Our own A/A null misses 1.0 by 8-11% at this size and NOWHERE ELSE — 1.008 at 256, 1.034 at
+512, 1.030 at 2048. Three runs at `min_of` = 5, 9 and 15 all failed it at the same
+magnitude, so it is not contention: more repetitions would have driven a contention-driven
+null toward 1.0 and did not. It is a systematic asymmetry between the two halves of our own
+arm within the ABBA cell, specific to n=1024. The ratios look like wins and are not quoted.
+No mechanism is established here; a cache-residency story (8 MB fixture against a 32 MB
+per-CCD L3 slice, evicted by the SciPy arms between halves) fits the size-specificity but
+was not tested, and is recorded as a hypothesis rather than a finding.
+
+### A gate that was measuring the wrong thing, and was replaced rather than loosened
+
+The harness first gated parity on `max |L_ours − L_theirs| / |L|` against 1e-11. It FAILED
+at n=1024 (1.219e-11 at entry (822,577)) and would have failed harder at n=2048 (1.756e-10
+at (1210,236)). Loosening the constant until it passed would have been gate self-weakening.
+
+The gate was wrong in kind: a Cholesky factor spans many orders of magnitude and the
+relative difference of a near-zero entry is enormous while its contribution is nil, so
+pass/fail depended on the smallest entry in the matrix. Replaced with the NORMWISE backward
+error `‖A − LLᵀ‖_F / ‖A‖_F`, bound `O(n)·ε` (Higham, *Accuracy and Stability*, Thm 10.3),
+gated at `16·n·ε` AND at 4x the incumbent's own backward error.
+
+| n | ours | scipy | budget 16·n·ε | old elementwise diagnostic |
+|---|---|---|---|---|
+| 256 | 1.662e-16 | 1.906e-16 | 9.095e-13 | 1.709e-12 |
+| 512 | 1.472e-16 | 1.627e-16 | 1.819e-12 | 2.456e-12 |
+| 1024 | 2.052e-16 | 2.174e-16 | 3.638e-12 | 1.219e-11 |
+| 2048 | 2.163e-16 | 2.103e-16 | 7.276e-12 | 1.756e-10 |
+
+Both arms sit at machine precision at every size while the discarded diagnostic wanders
+over four orders of magnitude — which is the evidence that the old gate was reading noise
+on tiny entries, not correctness. The replacement is STRICTLY STRONGER: it bounds our
+factor against the mathematics in absolute terms, where the old one only checked agreement
+with SciPy. The elementwise number is still printed, labelled `[diagnostic, not gated]`, so
+the row shows the figure that misled the first version next to the one that did not.
+
+### What this does and does not settle for 8l8r1.151
+
+It settles the baseline: `cholesky` is AHEAD of the incumbent at 256, 512 and 2048, so the
+panel-order SYRK lever is not closing a deficit — it would be widening a lead. It does not
+measure the SYRK traversal itself, which still has no runtime A/B switch. Anyone taking
+that lever now has a live incumbent number to beat instead of an fsci-against-fsci one.
+
+## sez4r DELIVERED: Francis as a convergence-failure FALLBACK. All 230 recovered, no cost, `butter` untouched.
+
+2026-08-19. **Result class: BEHAVIORAL.** same_host: thinkstation1, loadavg
+[21.25 19.61 13.86], 3293 MHz, iowait 0%. Probe: `perf_francis_vs_nalgebra` over the full
+7000-fixture grid, plus the fsci-linalg and fsci-signal suites.
+
+Two measurements from this session, together, said the wholesale flip was the wrong shape:
+
+ * The Francis arm recovers 230 of 7000 fixtures nalgebra cannot converge on, at median
+   2.37e-15 against `scipy.linalg.eig`.
+ * It also costs materially more per call. That figure is NOT restated here: it is
+   certified in the TIMED row above, with its A/A null and bootstrap intervals, and a
+   behavioural row is the wrong place to re-assert a speed number.
+
+Paying that cost on the 6770 that already converge, to rescue 230, is a bad trade — and
+the wholesale flip also perturbed `tf2sos`, which is what blocked it on `butter_sos`. So Francis now runs as a
+FALLBACK: nalgebra first, Francis only when nalgebra returns `ConvergenceFailure`.
+
+**OBSERVED, default configuration** (counts and convergence outcomes only; see the
+TIMED row above for anything about duration):
+
+| metric | before | after |
+|---|---|---|
+| default arm converged | 6770 / 7000 | **7000 / 7000** |
+| still needing the Francis arm | 230 | **0** |
+| disagreements where both converge | 0 | **0** |
+
+**WHY THIS IS SAFE TO DEFAULT ON, and it is a structural argument rather than a test
+result:** the fallback changes behaviour EXCLUSIVELY on inputs that previously returned
+`ConvergenceFailure`. Every input that succeeded before takes the identical nalgebra path
+and returns identical bits. No passing test can move — which is why
+`butter_sos_matches_scipy_reference_sections` is unaffected, and it is. fsci-linalg 576
+passed / 0 failed; fsci-signal 684 passed / 0 failed.
+
+The open coefficients-versus-behaviour question is now MOOT for shipping: nothing needs to
+decide it, because nothing that currently passes changes. It stays interesting only if
+someone later wants the Francis arm everywhere.
+
+**THREE GATES CAUGHT REAL OMISSIONS ON THE WAY, none of them cosmetic.** The toggle
+ratchet refused a new switch with no accuracy contract — correctly, mine had none. Fixing
+that revealed I had inserted the new declaration BETWEEN `EIG_USE_FRANCIS_SCHUR`'s doc
+comment and its item, silently orphaning it, which is why the predicate had stopped seeing
+that one as contracted either. And `the_toggle_changes_behaviour_on_the_non_converging_fixtures`
+failed with its own message: "if it now converges the fixture set is stale and this test is
+no longer testing the toggle". It was right — with the fallback live the baseline arm is no
+longer bare nalgebra, so the test now disables the fallback for its duration and restores
+it, rather than being weakened.
