@@ -402,6 +402,18 @@ pub fn triu_array<T: SparseArray + ?Sized>(array: &T, k: isize) -> SparseResult<
 /// Runtime switch to force the serial `spmv_csr` loop for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The fan-out is across contiguous RANGES OF
+/// OUTPUT ROWS, and every row still runs the identical `row_dot` -- the same nonzeros
+/// accumulated in the same order into the same single accumulator. Threads take disjoint
+/// `split_at_mut` slices of the result at fixed row offsets, so the value of a row and the
+/// index it lands at are both independent of the thread count.
+///
+/// The load balancing is where this could have gone wrong and did not. CSR row lengths are
+/// badly skewed, so the boundaries are chosen at equal cumulative-nnz targets rather than
+/// equal row counts. That moves the CUT POINTS between threads; it does not move any
+/// nonzero into a different row's sum. Had the balancing instead split a long row across
+/// two workers, the row's dot would have become a two-part reduction and this would be a
+/// tolerance rather than an identity.
 pub static SPMV_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -613,6 +625,21 @@ pub fn add_coo(lhs: &CooMatrix, rhs: &CooMatrix) -> SparseResult<CooMatrix> {
 /// ordinary production calls do not pay an atomic load.
 #[cfg(any(test, feature = "sparse-incumbent-bench"))]
 #[doc(hidden)]
+/// CONTRACT: BIT-IDENTICAL either way, and the code goes to a specific length to keep it
+/// that way. The linear-merge arm runs only when BOTH operands have strictly increasing
+/// coordinates, so each output coordinate receives at most one contribution per side and
+/// there is no accumulation order for the two arms to disagree about.
+///
+/// The subtle part is signed zero. The BTreeMap arm seeds each entry with
+/// `or_insert(0.0) +=`, and `0.0 + (-0.0)` is `+0.0` -- so a stored `-0.0` is normalised on
+/// that path. The merge arm therefore writes `0.0 + lhs.data()[i]` rather than the value
+/// directly, reproducing that normalisation deliberately instead of being "more correct"
+/// than the arm it has to match. Both then drop exact zeros through the same `value != 0.0`
+/// test, which treats `-0.0` and `+0.0` alike, and both emit in lexicographic coordinate
+/// order.
+///
+/// Note this toggle is `cfg(any(test, feature = "sparse-incumbent-bench"))` -- it does not
+/// exist in a shipping build, so the A/B costs nothing at runtime.
 pub static COO_SUB_FORCE_BTREE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

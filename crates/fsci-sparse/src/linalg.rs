@@ -4997,6 +4997,23 @@ fn validate_iterative_finite_inputs(
 
 /// Forces CG back onto the per-iteration scoped-thread route (A/B control).
 #[doc(hidden)]
+/// CONTRACT: NOT byte-identical -- the two arms agree to 1e-9 on the solution and produce
+/// the SAME ITERATION COUNT. This is the one toggle in this crate where forcing the serial
+/// arm genuinely changes the arithmetic, so it is worth being precise about why.
+///
+/// The persistent-worker arm is a different routine, not a threaded wrapper around the
+/// same loop. Its inner products are split across workers and combined per chunk, whereas
+/// the per-iteration-scope arm keeps `p_ap`, `p_sq` and `ap_sq` in single accumulators
+/// fused into one pass. Splitting a dot product IS reassociating it, so the iterates
+/// differ in the last bits and the difference compounds over iterations.
+///
+/// What pins it down is the second half of the claim.
+/// `cg_persistent_workers_match_serial_cg_across_worker_counts` holds the two to 1e-9 for
+/// EVERY worker count from 2 to 8 and additionally asserts an identical iteration count --
+/// a structural check that a pure tolerance would miss. A reassociation that merely
+/// perturbs the last bits leaves the convergence trajectory intact; one that has actually
+/// broken the recurrence changes how many steps it takes to get there, and would fail on
+/// the count long before it failed on the norm.
 pub static CG_FORCE_ITERATION_SCOPES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -25159,6 +25176,15 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
 /// Runtime switch to force the serial dense reference build for same-binary A/B
 /// benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
+/// CONTRACT: BYTE-IDENTICAL either way. The fan-out is across ROWS of the Laplacian, each
+/// built by the same `build_row` closure from the graph's own adjacency -- one row's
+/// entries depend on nothing another row computes. Threads fill disjoint chunks at fixed
+/// row offsets, so both the values and their positions are independent of the thread
+/// count.
+///
+/// A map over independent outputs, not a split reduction: the degree that appears on a
+/// row's diagonal is summed WITHIN that row's construction and never across rows, which is
+/// what keeps this an identity rather than a summation-order tolerance.
 pub static LAPLACIAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

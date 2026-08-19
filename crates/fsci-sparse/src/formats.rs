@@ -1276,6 +1276,21 @@ pub struct CooMatrix {
 }
 
 #[doc(hidden)]
+/// CONTRACT: BIT-IDENTICAL either way, and it rests entirely on both sorts being STABLE.
+/// Coalescing duplicates SUMS them, so the order in which equal coordinates are visited is
+/// the summation order and any instability would reassociate that sum. The fast arm uses
+/// an LSD radix sort that is stable by construction; the arm it replaces is a counting
+/// sort by row, likewise stable. Duplicates therefore accumulate in original insertion
+/// order on both, which is also what SciPy's `coo.sum_duplicates()` produces via
+/// `np.lexsort`.
+///
+/// This is asserted rather than argued: `coo_sum_duplicates_radix_matches_legacy_bits`
+/// compares the two arms bit-for-bit over a 2048-wide matrix with 131072 nonzeros, which
+/// is dense enough in duplicates for an unstable sort to show.
+///
+/// The gates below are performance, not correctness -- the radix arm returns `None` on
+/// small or very sparse inputs and the caller falls through -- so the identity holds
+/// wherever the toggle actually changes which arm runs.
 pub static COO_SUM_DUPLICATES_RADIX_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
