@@ -38579,3 +38579,90 @@ The `spline-flags-const` feature stays as the instrument, documented as measurem
 branch where it is immediately dead — `cargo check` warns `unused variable: flags` on a CLEAN
 tree, so it is not from this work. Harmless to output, but it is a redundant resolve and it
 inflates the gate-(a) count by one. Left alone as out of scope; noted so it is not rediscovered.
+
+## 2026-08-19 — frankenscipy-ua3gn, second experiment — lowering the TRSM MACs gate makes it SLOWER; my own hypothesis REFUTED
+
+Result class: SELF-SPEEDUP
+harness=crates/fsci-linalg/src/bin/perf_chol_vs_scipy.rs (arm FSCI_CHOL_TRSM_MACS)
+same_host=thinkstation1 (LOCAL, RCH_WORKER=none, both arms in one process, ABBA-interleaved)
+host identity=thinkstation1 physical_cores=32 logical threads=64 RAM=231692279808 bytes
+numa_nodes=1 requested threads=64 actual observed worker threads=64 (shared rayon pool)
+runtime-detected ISA=avx2+fma affinity=0-63 CPU frequency governor=powersave
+host-wide-quiescence-pre = not-certified(host-mean-busy=0.139)
+host-wide-quiescence-post = not-certified(host-mean-busy=0.235)
+frankenscipy-engine-sha256 = 944716a15fef52114604db473ca53152857b25f519e4a6616d214cf523640fc4
+executed-binary ELF SHA-256 = 944716a15fef52114604db473ca53152857b25f519e4a6616d214cf523640fc4
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+Same-invocation A/A null: 1.013 (n=512), 1.043 (n=768) — default arm twice per ABBA cycle
+Counted mechanism: `CHOL_PANEL_TRSM_PAR_PANELS` — panels opened by the lowered gate,
+  observed 0 → 2 at n=512 and 0 → 4 at n=768, and 0 → 0 at n=256
+Decision: candidate CI — bootstrap-median 95% CI judged against a 2x A/A-null margin
+  (null-margin = 2x the measured A/A null). n=512: [0.7564, 0.8682] against a lower band of
+  0.9740 — the whole CI is BELOW it, DECIDED SLOWER. n=768: [0.8031, 0.9256] against 0.9140,
+  which the CI crosses, so that cell is in-floor and only the n=512 cell is decided.
+CV is provenance only and was not used for this decision.
+iowait=0 loadavg 13.87→23.49, mhz_fsci 2773 / mhz_scipy 3101 (n=512)
+
+### The hypothesis, and it was mine
+
+The first ua3gn experiment found the persistent-pool scope change IN-FLOOR where it runs and,
+more usefully, that at n≤512 it does not run at all — `CHOL_PANEL_TRSM_PAR_PANELS` reads ZERO
+because the MACs gate keeps both arms serial. I argued: per-panel OS-thread spawn was the
+JUSTIFICATION for that gate; the pool is now persistent, so the justification is weaker and the
+gate may be mistuned. I said that was the untested lever and where the n≤1000 gap lives.
+
+It is tested now and it is wrong, in the opposite direction.
+
+### Reachability first — and n=256 is vacuous even with the gate wide open
+
+| n | par_panels, default gate | par_panels, gate=1 | differing bits |
+|---|---|---|---|
+| 256 | 0 | **0** | 0 |
+| 512 | 0 | **2** | 0 |
+| 768 | 0 | **4** | 0 |
+
+At n=256 the counter does not move even with the gate set to its minimum, so something other
+than the MACs threshold keeps that size serial and no MACs experiment can say anything there.
+That cell is reported as vacuous rather than as a null. n=512 and n=768 do open, by 2 and 4
+panels, so those are the cells with something to measure. Byte-identity asserted before timing
+at every size.
+
+### The result: more fan-out is worse, decisively at n=512
+
+| n | default/lowered | CI95 | A/A null | 2x-null lower band | verdict |
+|---|---|---|---|---|---|
+| 512 | **0.8365x** | [0.7564, 0.8682] | 1.013 | 0.9740 | **DECIDED SLOWER** |
+| 768 | 0.8467x | [0.8031, 0.9256] | 1.043 | 0.9140 | in-floor |
+
+A ratio below 1 means the LOWERED gate is slower. At n=512 the entire CI sits below the null
+band: opening two extra panels to fan-out costs about 16-20%. So the shipped gate is not a
+stale artefact of the old spawn cost — it is doing real work at exactly the sizes I predicted
+it would be over-conservative at, and lowering it is a regression.
+
+That closes the question the first experiment left open. The n≤1000 threading gap is NOT a
+mistuned gate.
+
+### A side row that is worth more than the lever
+
+Both cells certified their live-SciPy arms in the same invocation, and n=768 is the worst
+certified ratio this harness has produced:
+
+| n | scipy1/fsci | scipyN/fsci | nulls | gates |
+|---|---|---|---|---|
+| 512 | 1.370x | 1.283x | 1.013 / 1.023 | PASS |
+| 768 | 1.149x | **0.954x** | 1.040 / 1.023 | PASS |
+
+**At n=768 we LOSE to 64-thread SciPy, 0.954x.** That is a certified loss, in a quiet window,
+with nulls of 1.040 and 1.023, and the incumbent again on faster cores (3162 MHz against our
+2687, clock_ratio 1.177) — so if anything it is generous to us. It sits between two certified
+wins (1.283x at n=512, 1.204-1.521x at n=2048), which makes n≈768 a genuine local minimum in
+our Cholesky curve and a better target than anything in this bead.
+
+### Honest limits
+
+- One override value (gate = 1, i.e. fully open). A partial lowering might behave differently,
+  though it is hard to see how, given fully-open is already a decided regression at n=512.
+- n=768's cell is in-floor by its own null, so only the n=512 verdict is decided; the two agree
+  in direction and magnitude, which is corroboration and not a second decided cell.
+- The n≈768 loss is one size on one fixture family (`A = MMᵀ + nI`). Whether the minimum is a
+  property of our blocking or of SciPy's is not established here.
