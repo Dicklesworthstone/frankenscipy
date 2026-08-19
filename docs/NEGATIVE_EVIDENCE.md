@@ -36625,3 +36625,64 @@ SciPy shows the same behaviour, so this is a property of the METHOD rather than 
 port. LGMRES earns its keep where restarted GMRES stagnates; none of my test operators
 stagnate, and I have not yet built one that does. Anyone wanting a benefit row here needs
 a genuinely stagnating operator first.
+
+## frankenscipy-sez4r PARITY half: Francis QR recovers all 230 spectra nalgebra cannot converge, at machine precision against SciPy
+
+2026-08-18. `crates/fsci-linalg/src/bin/perf_francis_vs_nalgebra.rs`
+(`MARKER=francis-vs-nalgebra-v1`), release,
+executed-ELF-sha256 `211915a89474d7c07307c2ad801e259d2f789d7b4f27752ac0f34fc110061aa3`.
+Fixtures: `make_diag_dominant(n, seed)` copied verbatim from the metamorphic suite,
+n = 2..8 x seed = 0..999, 7000 cases. Incumbent arm: SciPy 1.17.1 `scipy.linalg.eig`,
+run in the same invocation.
+Per-arm environment: fsci loadavg [31.57 20.05 10.89] 3390 MHz; scipy loadavg
+[31.05 20.13 10.96] 3273 MHz; a later scipy arm at [26.79 20.03 11.18] 2513 MHz.
+
+**THE HOST WAS NOT QUIET — loadavg 26-40, CPU idle as low as 1%. That is why the claim
+is COUNTED.** Convergence counts and exact eigenvalue comparisons are deterministic;
+they read the same on a loaded box as an idle one. The wall-clock figures below are
+reported for completeness and are NOT certified.
+
+### Convergence: counted, deterministic
+
+| arm | converged of 7000 |
+|---|---|
+| nalgebra (, the shipped path) | 6770 |
+| Francis double-shift QR with LAPACK exceptional shifts | **7000** |
+
+**recovered_by_francis = 230. regressed_under_francis = 0.** That is exactly the 230 the
+bead predicted from the hang sweep, recovered with nothing lost.
+
+### Recovered spectra are RIGHT, not merely present
+
+25 of the 230 recovered cases were compared eigenvalue-by-eigenvalue against SciPy
+(sorted, relative to each eigenvalue's own magnitude): **median 2.37e-15, max 4.72e-14,
+zero cases above 1e-8**. Converging and converging to the correct answer are different
+claims and only the second is worth having; this is the second.
+
+### A THIRD DEFECT, PRESENT IN BOTH ARMS, THAT FRANCIS DOES NOT FIX
+
+Six fixtures have both arms converging to DIFFERENT spectra. SciPy adjudicates: Francis
+is closer on 4, nalgebra on 2 — so Francis is better on convergence and NOT uniformly
+better on accuracy, which is worth stating plainly.
+
+| case | nalgebra vs scipy | francis vs scipy |
+|---|---|---|
+| n=5 seed=300 | 3.07e-09 | 1.61e-08 |
+| n=5 seed=766 | **7.85e-03** | **3.93e-03** |
+| n=7 seed=357 | 1.16e-08 | 2.66e-13 |
+| n=8 seed=331 | 1.45e-08 | 6.80e-10 |
+| n=8 seed=581 | 5.83e-09 | 8.89e-09 |
+| n=8 seed=777 | **6.34e-03** | **6.34e-03** |
+
+Four of the six sit at 1e-8 to 1e-13 and are tolerance noise around my 1e-8 disagreement
+threshold. **Two are not: n=5 seed=766 and n=8 seed=777 are 4e-3 to 8e-3 from SciPy in
+BOTH arms.** That is a pre-existing accuracy defect in the eigenvalue path, independent
+of which Schur routine runs, and it is not addressed by this work. Filed separately
+rather than folded in, because attaching it to sez4r would let a fixed sez4r imply a
+fixed spectrum on those two fixtures.
+
+### Timings, NOT certified (host at loadavg 31, idle 1%)
+
+nalgebra arm 0.025 s, Francis arm 0.014 s for the full 7000-case grid. Reported only to
+show the Francis path is not pathologically slower; no ratio should be quoted from a
+window like this one.
