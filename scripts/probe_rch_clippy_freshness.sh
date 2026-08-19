@@ -23,10 +23,18 @@
 # Counted, not timed: a line number matches or it does not, identically under any load. No
 # build slot needed, which matters while acquire_build_slot is disabled (frankenscipy-fr78g).
 #
-# Usage: scripts/probe_rch_clippy_freshness.sh [iterations]   (default 5)
+# SCALE: pass a second argument to bulk the probe file up to a comparable size before
+# testing. ozg54's edit was 65 lines inserted into fsci-interpolate's lib.rs, which is 15,476
+# lines / 558 KB; the bare probe is 59 lines / 3 KB, a 180x difference. A chunked-transfer or
+# fingerprint bug could easily be size-dependent, so a clean result on a 3 KB file does not
+# generalise. With bulk lines the lint also sits DEEP in the file, as the original's line
+# 2185 and 7065 did, rather than near the top where a partial transfer would still cover it.
+#
+# Usage: scripts/probe_rch_clippy_freshness.sh [iterations] [bulk_lines]   (default 5, 0)
 set -u
 
 ITERATIONS="${1:-5}"
+BULK="${2:-0}"
 SRC="crates/fsci-sparse/src/bin/probe_rch_source_freshness.rs"
 BACKUP="$(mktemp)"
 
@@ -52,6 +60,11 @@ for i in $(seq 1 "$ITERATIONS"); do
     pad=$(( i * 7 ))
 
     cp "$BACKUP" "$SRC"
+    if [ "$BULK" -gt 0 ]; then
+        # Bulk FIRST, so the lint lands deep in a large file rather than in its first
+        # kilobyte. Generated per iteration and never committed.
+        seq 1 "$BULK" | sed 's|.*|// ozg54 bulk padding line to reach fsci-interpolate scale|' >> "$SRC"
+    fi
     {
         for _ in $(seq 1 "$pad"); do echo "// ozg54 clippy padding line"; done
         echo ""
@@ -89,7 +102,7 @@ for i in $(seq 1 "$ITERATIONS"); do
 done
 
 echo
-echo "VERDICT iterations=${ITERATIONS} fresh=${fresh} stale=${stale} no_diagnostic=${failures}"
+echo "VERDICT iterations=${ITERATIONS} bulk_lines=${BULK} file_bytes=$(wc -c < "$SRC") fresh=${fresh} stale=${stale} no_diagnostic=${failures}"
 if [ "$fresh" -eq 0 ]; then
     echo "CONTROL FAILED: no iteration was observed FRESH; this run is VOID, not a negative" >&2
     exit 2
