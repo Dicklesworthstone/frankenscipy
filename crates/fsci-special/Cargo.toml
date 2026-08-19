@@ -7,6 +7,7 @@ autobins = false
 [features]
 ndtri-isafloor-bench = ["dep:sha2"]
 
+
 [dependencies]
 fsci-integrate = { workspace = true }
 fsci-linalg = { workspace = true }
@@ -20,3 +21,18 @@ sha2 = "0.10.9"
 [[bench]]
 name = "special_bench"
 harness = false
+
+# `autobins = false` (2ad35641e, "exclude ignored scratch bin targets") turned off bin
+# auto-discovery for this crate. That was right in intent — `src/bin/` holds 120 `.rs` files
+# and 119 of them are untracked scratch — but it also excluded the ONE that is tracked and
+# intended, so `perf_cdf` became unbuildable: `cargo build --bin perf_cdf` answers "no bin
+# target named `perf_cdf`". It is the harness `frankenscipy-2b7tr` depends on, added in
+# 750a02308 and disabled three days later by a one-line change aimed at something else.
+#
+# Registering it explicitly restores exactly that one target and leaves the 119 scratch files
+# excluded, which is what the original commit wanted. `required-features` keeps it out of a
+# default build, so a plain `cargo build` still does not compile it.
+[[bin]]
+name = "perf_cdf"
+path = "src/bin/perf_cdf.rs"
+required-features = ["ndtri-isafloor-bench"]
