@@ -139,7 +139,28 @@ CONTRACT_KEYWORDS = (
 
 
 def contract_stated(doc: str) -> bool:
-    d = doc.lower()
+    # NORMALISE BEFORE MATCHING. rustfmt wraps doc comments at the column, and it
+    # is happy to break a hyphenated word across lines: NDIMAGE_BSPLINE_COMPACT_
+    # DISABLE reads "...nonzero. Byte-\n/// identical either way." That states the
+    # contract as plainly as any row in this audit, and the raw-substring
+    # predicate missed it, because "byte-identical" is not a substring of
+    # "byte-\n/// identical". It was reported as UNCONTRACTED and would have been
+    # "fixed" by writing a second contract next to the first.
+    #
+    # So: drop comment markers, rejoin a word broken across a line at its hyphen,
+    # and collapse the remaining whitespace to single spaces. Every keyword is
+    # then matched against flowing prose rather than against whatever column
+    # rustfmt happened to wrap at.
+    #
+    # Markers are stripped ANYWHERE, not just at line start: `contract_scan` hands
+    # this function a block already joined with `" ".join(doc)`, so by the time it
+    # arrives the wrap reads "byte- /// identical" on ONE line and a
+    # start-of-line-anchored strip leaves the interior marker in place. My first
+    # attempt at this fix anchored to `^` and changed nothing at all -- the count
+    # stayed at 3, which is the only reason I looked at the caller.
+    d = re.sub(r"///|//!|//", " ", doc)
+    d = re.sub(r"-\s+", "-", d)
+    d = re.sub(r"\s+", " ", d).lower()
     if any(k in d for k in CONTRACT_KEYWORDS):
         return True
     # The in-crate ratchet ALSO accepts a bare numeric tolerance -- a token like
@@ -162,6 +183,22 @@ def contract_stated(doc: str) -> bool:
 # Must-hit / must-miss on the contract predicate, before it is trusted anywhere.
 assert contract_stated("/// CONTRACT: BYTE-IDENTICAL either way."), "predicate misses a real contract"
 assert not contract_stated("/// A/B switch: force the serial path."), "predicate matches a bare description"
+# The wrap case that exposed the bug, both arms. Must-hit: a contract broken
+# across a line by rustfmt still counts.
+assert contract_stated(
+    "/// taps that can be nonzero. Byte-\n/// identical either way. Benchmark knob."
+), "predicate misses a contract that rustfmt wrapped at the hyphen"
+# The SAME case in the form `contract_scan` actually produces -- lines joined with
+# a space, marker intact in the middle. This is the arm that was failing; the
+# newline form above passed even while the real census reported the toggle bare.
+assert contract_stated(
+    "/// taps that can be nonzero. Byte- /// identical either way. Benchmark knob."
+), "predicate misses a wrapped contract once contract_scan has joined the lines"
+# Must-miss: rejoining hyphens must not manufacture a keyword out of prose that
+# never stated one -- otherwise the fix would just paper the count over.
+assert not contract_stated(
+    "/// forces the serial arm. Useful for byte-\n/// level debugging of the plan."
+), "hyphen rejoining invented a contract"
 
 
 def contract_scan(src: str, names: set[str]) -> tuple[list[str], list[str]]:
@@ -303,6 +340,11 @@ def census(crate: str) -> int:
             f"  no accuracy contract (drqu7) {len(bare)}"
             f"  [{len(contracted)} contracted]"
         )
+        # NAME them, don't just count them. A bare count tells you the work is
+        # not done without telling you where it is, which meant every pass of
+        # the drqu7 rollout re-derived the same list with a throwaway grep.
+        for n in bare:
+            print(f"      NO CONTRACT: {n}")
     if counters:
         undriven_counters = sorted(
             c for c in counters if c not in test_code and c not in bin_code
