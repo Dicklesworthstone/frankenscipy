@@ -1792,7 +1792,7 @@ frankenscipy/
 │   ├── fsci-spatial/            # KDTree + distances + hulls + assignment
 │   ├── fsci-special/            # Gamma + Bessel + Carlson + orthopoly + …
 │   └── fsci-stats/              # Distributions + tests + regression + QMC
-├── docs/                        # ARTIFACT_TOPOLOGY.md, ORACLE_WORKFLOW.md, schemas/
+├── docs/                        # ARTIFACT_TOPOLOGY.md, ORACLE_WORKFLOW.md, schemas/, planning/
 ├── legacy_scipy_code/scipy/     # SciPy oracle source-of-truth (cloned)
 ├── reference/                   # Reference materials
 ├── fuzz/                        # Fuzz targets (excluded from main workspace)
