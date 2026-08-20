@@ -7852,9 +7852,7 @@ impl Multinomial {
             return f64::NEG_INFINITY;
         }
         let sum: f64 = x.iter().sum();
-        if sum != self.n as f64
-            || x.iter().any(|&xi| xi < 0.0 || xi.floor() != xi)
-        {
+        if sum != self.n as f64 || x.iter().any(|&xi| xi < 0.0 || xi.floor() != xi) {
             return f64::NEG_INFINITY;
         }
         let mut lp = ln_gamma(self.n as f64 + 1.0);
@@ -30785,6 +30783,45 @@ fn mwu_use_exact(n1: usize, n2: usize, no_ties: bool) -> bool {
     no_ties && n1.min(n2) <= 8 && n1 * n2 <= 20_000
 }
 
+/// When `true`, [`mannwhitneyu`] and [`mannwhitneyu_alternative`] recompute `Σ(t³ − t)` the
+/// ORIGINAL way — clone the RANKS, sort them a SECOND time, and re-walk the groups with a
+/// `< 1e-12` tolerance — instead of taking the value the ranking pass already produced.
+/// Default `false`.
+///
+/// Exists so `frankenscipy-921i0`'s A/B has both arms in ONE shipping binary; it is not a
+/// tuning knob. The arms are byte-identical, and the reason is worth stating because it is
+/// NOT the same argument as `kruskal`'s: here the deleted loop grouped by a TOLERANCE rather
+/// than by `==`, so equivalence needs the tolerance to be inert. It is — distinct
+/// average-rank groups differ by at least 0.5, which no `1e-12` window can bridge at any n,
+/// since the ranks are half-integers rather than a floating-point accumulation. Ranks are
+/// monotone in the values, so the groups and their ascending order are exactly the ranking
+/// pass's. `mannwhitneyu_tie_bit_identical_across_the_resort_toggle` executes that argument.
+#[doc(hidden)]
+pub static MWU_FORCE_TIE_RESORT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The pre-`frankenscipy-921i0` tie correction for Mann-Whitney: clone the ranks, sort, walk
+/// groups within `1e-12`. Reachable only via [`MWU_FORCE_TIE_RESORT`], so the A/B arm is the
+/// real deleted code rather than a paraphrase of it — tolerance included.
+fn mwu_tie_sum_by_resort(ranks: &[f64]) -> f64 {
+    let mut sorted_ranks = ranks.to_vec();
+    sorted_ranks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut tie_correction = 0.0_f64;
+    let mut i = 0;
+    while i < sorted_ranks.len() {
+        let mut j = i + 1;
+        while j < sorted_ranks.len() && (sorted_ranks[j] - sorted_ranks[i]).abs() < 1e-12 {
+            j += 1;
+        }
+        let t = (j - i) as f64;
+        if t > 1.0 {
+            tie_correction += t * t * t - t;
+        }
+        i = j;
+    }
+    tie_correction
+}
+
 pub fn mannwhitneyu(x: &[f64], y: &[f64]) -> TtestResult {
     if x.len() < 2 || y.len() < 2 || x.iter().any(|v| v.is_nan()) || y.iter().any(|v| v.is_nan()) {
         return TtestResult {
@@ -30814,7 +30851,15 @@ pub fn mannwhitneyu(x: &[f64], y: &[f64]) -> TtestResult {
     // within 1e-12, a tolerance that cannot bite because distinct average-rank groups
     // differ by at least 0.5; ranks are monotone in values, so the groups and their
     // ascending order are exactly those of the ranking pass.
-    let (ranks, tie_correction) = rankdata_ties_with_tie_sum(&values, RankTieMethod::Average);
+    let (ranks, tie_correction_from_pass) =
+        rankdata_ties_with_tie_sum(&values, RankTieMethod::Average);
+    // ORIG arm of the `frankenscipy-921i0` A/B: clone the ranks + second sort + regroup.
+    // Off by default; the toggle is read ONCE here, never inside a loop.
+    let tie_correction = if MWU_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed) {
+        mwu_tie_sum_by_resort(&ranks)
+    } else {
+        tie_correction_from_pass
+    };
 
     // U statistic: sum of ranks of x - n1*(n1+1)/2
     let rank_sum_x: f64 = ranks
@@ -31015,7 +31060,15 @@ pub fn mannwhitneyu_alternative(x: &[f64], y: &[f64], alternative: &str) -> Ttes
     // within 1e-12, a tolerance that cannot bite because distinct average-rank groups
     // differ by at least 0.5; ranks are monotone in values, so the groups and their
     // ascending order are exactly those of the ranking pass.
-    let (ranks, tie_correction) = rankdata_ties_with_tie_sum(&values, RankTieMethod::Average);
+    let (ranks, tie_correction_from_pass) =
+        rankdata_ties_with_tie_sum(&values, RankTieMethod::Average);
+    // ORIG arm of the `frankenscipy-921i0` A/B: clone the ranks + second sort + regroup.
+    // Off by default; the toggle is read ONCE here, never inside a loop.
+    let tie_correction = if MWU_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed) {
+        mwu_tie_sum_by_resort(&ranks)
+    } else {
+        tie_correction_from_pass
+    };
 
     let rank_sum_x: f64 = ranks
         .iter()
@@ -31634,7 +31687,8 @@ pub fn kruskal(groups: &[&[f64]]) -> TtestResult {
     // via `_rankdata(..., return_ties=True)` (`frankenscipy-921i0`). BYTE-IDENTICAL:
     // the old loop grouped `sorted_values[j] == sorted_values[i]`, the same `==` over
     // the same values in the same ascending order, summing the same `t` values.
-    let (ranks, tie_sum_from_pass) = rankdata_ties_with_tie_sum(&all_values, RankTieMethod::Average);
+    let (ranks, tie_sum_from_pass) =
+        rankdata_ties_with_tie_sum(&all_values, RankTieMethod::Average);
     // The ORIG arm of the `frankenscipy-921i0` A/B: clone + second sort + regroup. Off by
     // default; the toggle is read ONCE here, at the call boundary, never inside a loop.
     let tie_sum = if KRUSKAL_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed) {
@@ -37291,7 +37345,9 @@ pub fn trim_mean(data: &[f64], proportiontocut: f64) -> Result<f64, StatsError> 
     let lowercut = (prop * n as f64).trunc();
     let uppercut = n as f64 - lowercut;
     if lowercut > uppercut {
-        return Err(StatsError::InvalidArgument("Proportion too big.".to_string()));
+        return Err(StatsError::InvalidArgument(
+            "Proportion too big.".to_string(),
+        ));
     }
 
     let mut sorted = data.to_vec();
@@ -37626,7 +37682,9 @@ pub fn trimboth(data: &[f64], proportiontocut: f64) -> Result<Vec<f64>, StatsErr
     let lowercut = (prop * n as f64).trunc();
     let uppercut = n as f64 - lowercut;
     if lowercut >= uppercut {
-        return Err(StatsError::InvalidArgument("Proportion too big.".to_string()));
+        return Err(StatsError::InvalidArgument(
+            "Proportion too big.".to_string(),
+        ));
     }
 
     let mut sorted = data.to_vec();
@@ -57933,11 +57991,19 @@ impl<D: ContinuousDistribution> Truncated<D> {
         } else {
             dist.cdf(lb)
         };
-        let s_ub = if ub == f64::INFINITY { 0.0 } else { dist.sf(ub) };
+        let s_ub = if ub == f64::INFINITY {
+            0.0
+        } else {
+            dist.sf(ub)
+        };
         // Which half the interval sits in. This only picks a BRANCH, so reading
         // F(ub) straight off the base cdf is fine here even though the mass above
         // deliberately avoids differencing two such values.
-        let f_ub = if ub == f64::INFINITY { 1.0 } else { dist.cdf(ub) };
+        let f_ub = if ub == f64::INFINITY {
+            1.0
+        } else {
+            dist.cdf(ub)
+        };
         Self {
             dist,
             lb,
@@ -58940,7 +59006,13 @@ impl HistogramDistribution {
         let mass: Vec<f64> = counts
             .iter()
             .enumerate()
-            .map(|(i, &c)| if density { c * (edges[i + 1] - edges[i]) } else { c })
+            .map(|(i, &c)| {
+                if density {
+                    c * (edges[i + 1] - edges[i])
+                } else {
+                    c
+                }
+            })
             .collect();
         let total: f64 = mass.iter().sum();
         if !(total > 0.0) {
@@ -59227,7 +59299,13 @@ impl<D: ContinuousDistribution> Mixture<D> {
             .components
             .iter()
             .zip(self.weights.iter())
-            .map(|(c, &w)| if w > 0.0 { w.ln() + g(c) } else { f64::NEG_INFINITY })
+            .map(|(c, &w)| {
+                if w > 0.0 {
+                    w.ln() + g(c)
+                } else {
+                    f64::NEG_INFINITY
+                }
+            })
             .collect();
         let hi = terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         if hi == f64::NEG_INFINITY {
@@ -59358,9 +59436,11 @@ mod mixture_matches_scipy {
                 2.574_361_999_181_024e-4,
             ),
         ] {
-            for (got, want, what) in
-                [(m.pdf(x), p, "pdf"), (m.cdf(x), c, "cdf"), (m.sf(x), s, "sf")]
-            {
+            for (got, want, what) in [
+                (m.pdf(x), p, "pdf"),
+                (m.cdf(x), c, "cdf"),
+                (m.sf(x), s, "sf"),
+            ] {
                 assert!(
                     ((got - want) / want).abs() < 1e-13,
                     "{what}({x}) = {got:e}, scipy = {want:e}"
@@ -59432,7 +59512,10 @@ mod mixture_matches_scipy {
             assert!((m.logpdf(x) - m.pdf(x).ln()).abs() < 1e-12);
         }
 
-        assert!(Mixture::<Normal>::new(vec![], &[]).is_err(), "no components");
+        assert!(
+            Mixture::<Normal>::new(vec![], &[]).is_err(),
+            "no components"
+        );
         assert!(
             Mixture::new(vec![Normal::standard()], &[0.5, 0.5]).is_err(),
             "length mismatch"
@@ -59523,7 +59606,11 @@ impl DiscreteAliasUrn {
         let mut small: Vec<usize> = Vec::new();
         let mut large: Vec<usize> = Vec::new();
         for (i, &s) in scaled.iter().enumerate() {
-            if s < 1.0 { small.push(i) } else { large.push(i) }
+            if s < 1.0 {
+                small.push(i)
+            } else {
+                large.push(i)
+            }
         }
 
         let mut prob = vec![1.0_f64; k];
@@ -59541,7 +59628,11 @@ impl DiscreteAliasUrn {
             alias[l] = g;
             // The large bucket gives away exactly the deficit of the small one.
             scaled[g] = (scaled[g] + scaled[l]) - 1.0;
-            if scaled[g] < 1.0 { small.push(g) } else { large.push(g) }
+            if scaled[g] < 1.0 {
+                small.push(g)
+            } else {
+                large.push(g)
+            }
         }
         // Whatever remains is full to within rounding; pin it so no draw can fall
         // through to a stale alias.
@@ -59567,7 +59658,10 @@ impl DiscreteAliasUrn {
     /// Inclusive `(first, last)` values of the support.
     #[must_use]
     pub fn support(&self) -> (i64, i64) {
-        (self.offset, self.offset + self.probabilities.len() as i64 - 1)
+        (
+            self.offset,
+            self.offset + self.probabilities.len() as i64 - 1,
+        )
     }
 
     /// One draw.
@@ -59690,7 +59784,10 @@ mod discrete_alias_urn_matches_scipy {
         assert_eq!(shifted.support(), (5, 6));
         let mut rng3 = StdRng::seed_from_u64(11);
         assert!(
-            shifted.sample(1000, &mut rng3).iter().all(|&d| d == 5 || d == 6),
+            shifted
+                .sample(1000, &mut rng3)
+                .iter()
+                .all(|&d| d == 5 || d == 6),
             "a draw escaped the shifted domain"
         );
     }
@@ -59699,10 +59796,16 @@ mod discrete_alias_urn_matches_scipy {
     fn validation() {
         assert!(DiscreteAliasUrn::new(&[], 0).is_err(), "empty");
         assert!(DiscreteAliasUrn::new(&[1.0, -1.0], 0).is_err(), "negative");
-        assert!(DiscreteAliasUrn::new(&[1.0, f64::NAN], 0).is_err(), "non-finite");
+        assert!(
+            DiscreteAliasUrn::new(&[1.0, f64::NAN], 0).is_err(),
+            "non-finite"
+        );
         assert!(DiscreteAliasUrn::new(&[0.0, 0.0], 0).is_err(), "no mass");
         // MUST-MISS control for the guards above.
-        assert!(DiscreteAliasUrn::new(&[0.0, 1.0], 0).is_ok(), "one zero is fine");
+        assert!(
+            DiscreteAliasUrn::new(&[0.0, 1.0], 0).is_ok(),
+            "one zero is fine"
+        );
         // Unnormalised input is normalised, not rejected.
         let a = DiscreteAliasUrn::new(&[2.0, 6.0], 0).expect("valid");
         let b = DiscreteAliasUrn::new(&[0.25, 0.75], 0).expect("valid");
@@ -59826,7 +59929,10 @@ impl DiscreteGuideTable {
     /// Inclusive `(first, last)` values of the support.
     #[must_use]
     pub fn support(&self) -> (i64, i64) {
-        (self.offset, self.offset + self.probabilities.len() as i64 - 1)
+        (
+            self.offset,
+            self.offset + self.probabilities.len() as i64 - 1,
+        )
     }
 
     /// `min{ i : cdf[i] ≥ u }`, shifted onto the support. `u ≤ 0` gives the first
@@ -59894,10 +60000,7 @@ mod discrete_guide_table_matches_scipy {
             cdf[PV.len() - 1] = 1.0;
             for step in 1..=20_000_u32 {
                 let u = f64::from(step) / 20_000.0;
-                let want = cdf
-                    .iter()
-                    .position(|&c| c >= u)
-                    .unwrap_or(PV.len() - 1) as i64;
+                let want = cdf.iter().position(|&c| c >= u).unwrap_or(PV.len() - 1) as i64;
                 let got = t.ppf(u);
                 assert!(
                     got == want,
@@ -59915,13 +60018,7 @@ mod discrete_guide_table_matches_scipy {
     #[test]
     fn the_boundary_convention_matches_scipy() {
         let t = DiscreteGuideTable::new(&PV, 0, 1.0).expect("valid");
-        for (u, want) in [
-            (0.05, 0),
-            (0.1, 0),
-            (0.5, 1),
-            (0.8, 2),
-            (0.95, 3),
-        ] {
+        for (u, want) in [(0.05, 0), (0.1, 0), (0.5, 1), (0.8, 2), (0.95, 3)] {
             assert_eq!(t.ppf(u), want, "scipy ppf({u}) is {want}");
         }
         // Each support point owns the half-open interval (cdf[i-1], cdf[i]], and
@@ -60017,10 +60114,22 @@ mod discrete_guide_table_matches_scipy {
         }
 
         assert!(DiscreteGuideTable::new(&[], 0, 1.0).is_err(), "empty");
-        assert!(DiscreteGuideTable::new(&[1.0, -1.0], 0, 1.0).is_err(), "negative");
-        assert!(DiscreteGuideTable::new(&[0.0, 0.0], 0, 1.0).is_err(), "no mass");
-        assert!(DiscreteGuideTable::new(&PV, 0, 0.0).is_err(), "guide_factor 0");
-        assert!(DiscreteGuideTable::new(&PV, 0, -1.0).is_err(), "guide_factor < 0");
+        assert!(
+            DiscreteGuideTable::new(&[1.0, -1.0], 0, 1.0).is_err(),
+            "negative"
+        );
+        assert!(
+            DiscreteGuideTable::new(&[0.0, 0.0], 0, 1.0).is_err(),
+            "no mass"
+        );
+        assert!(
+            DiscreteGuideTable::new(&PV, 0, 0.0).is_err(),
+            "guide_factor 0"
+        );
+        assert!(
+            DiscreteGuideTable::new(&PV, 0, -1.0).is_err(),
+            "guide_factor < 0"
+        );
         // MUST-MISS control for the guide_factor guard.
         assert!(DiscreteGuideTable::new(&PV, 0, 0.5).is_ok(), "0.5 is legal");
     }
@@ -60260,7 +60369,10 @@ mod ratio_uniforms_matches_scipy {
         // or one-sided acceptance region would move this while leaving the
         // variance alone.
         let above = s.iter().filter(|x| **x > 0.0).count() as f64 / n as f64;
-        assert!((above - 0.5).abs() < 5.0 * (0.25 / n as f64).sqrt(), "P(X>0) = {above}");
+        assert!(
+            (above - 0.5).abs() < 5.0 * (0.25 / n as f64).sqrt(),
+            "P(X>0) = {above}"
+        );
     }
 
     /// A bounded support, where the rectangle is exact and every accepted point
@@ -60283,7 +60395,10 @@ mod ratio_uniforms_matches_scipy {
             "a draw escaped the support"
         );
         let mean = s.iter().sum::<f64>() / n as f64;
-        assert!((mean - 0.5).abs() < 5.0 * (1.0 / 12.0 / n as f64).sqrt(), "mean {mean}");
+        assert!(
+            (mean - 0.5).abs() < 5.0 * (1.0 / 12.0 / n as f64).sqrt(),
+            "mean {mean}"
+        );
     }
 
     /// `c` is a CENTRING parameter for the transform, not a translation of the
@@ -60431,9 +60546,15 @@ mod ratio_uniforms_matches_scipy {
     #[test]
     fn srou_validation() {
         let f = |x: f64| (-x * x / 2.0).exp();
-        assert!(RatioUniforms::simple(f, f64::NAN, 1.0, None).is_err(), "mode NaN");
+        assert!(
+            RatioUniforms::simple(f, f64::NAN, 1.0, None).is_err(),
+            "mode NaN"
+        );
         assert!(RatioUniforms::simple(f, 0.0, 0.0, None).is_err(), "area 0");
-        assert!(RatioUniforms::simple(f, 0.0, -1.0, None).is_err(), "area < 0");
+        assert!(
+            RatioUniforms::simple(f, 0.0, -1.0, None).is_err(),
+            "area < 0"
+        );
         assert!(
             RatioUniforms::simple(f, 0.0, 1.0, Some(1.5)).is_err(),
             "cdf_at_mode out of range"
@@ -60445,16 +60566,31 @@ mod ratio_uniforms_matches_scipy {
         );
         // MUST-MISS controls for each guard above.
         assert!(RatioUniforms::simple(f, 0.0, 1.0, None).is_ok());
-        assert!(RatioUniforms::simple(f, 0.0, 1.0, Some(1.0)).is_ok(), "1.0 is in range");
+        assert!(
+            RatioUniforms::simple(f, 0.0, 1.0, Some(1.0)).is_ok(),
+            "1.0 is in range"
+        );
     }
 
     #[test]
     fn validation() {
         let f = |x: f64| (-x * x / 2.0).exp();
-        assert!(RatioUniforms::new(f, 0.0, -1.0, 1.0, 0.0).is_err(), "umax 0");
-        assert!(RatioUniforms::new(f, -1.0, -1.0, 1.0, 0.0).is_err(), "umax < 0");
-        assert!(RatioUniforms::new(f, 1.0, 1.0, 1.0, 0.0).is_err(), "vmin == vmax");
-        assert!(RatioUniforms::new(f, 1.0, 2.0, 1.0, 0.0).is_err(), "vmin > vmax");
+        assert!(
+            RatioUniforms::new(f, 0.0, -1.0, 1.0, 0.0).is_err(),
+            "umax 0"
+        );
+        assert!(
+            RatioUniforms::new(f, -1.0, -1.0, 1.0, 0.0).is_err(),
+            "umax < 0"
+        );
+        assert!(
+            RatioUniforms::new(f, 1.0, 1.0, 1.0, 0.0).is_err(),
+            "vmin == vmax"
+        );
+        assert!(
+            RatioUniforms::new(f, 1.0, 2.0, 1.0, 0.0).is_err(),
+            "vmin > vmax"
+        );
         assert!(
             RatioUniforms::new(f, f64::INFINITY, -1.0, 1.0, 0.0).is_err(),
             "non-finite umax"
@@ -60467,7 +60603,6 @@ mod ratio_uniforms_matches_scipy {
         assert!(RatioUniforms::new(f, 1.0, -1.0, 1.0, 0.0).is_ok());
     }
 }
-
 
 /// Transformed Density Rejection for LOG-CONCAVE densities.
 ///
@@ -60599,9 +60734,19 @@ impl<F: Fn(f64) -> f64> TransformedDensityRejection<F> {
         // larger exponent before differencing.
         let mut areas = Vec::with_capacity(n);
         for i in 0..n {
-            let a = if i == 0 { f64::NEG_INFINITY } else { bound[i - 1] };
+            let a = if i == 0 {
+                f64::NEG_INFINITY
+            } else {
+                bound[i - 1]
+            };
             let b = if i == n - 1 { f64::INFINITY } else { bound[i] };
-            areas.push(Self::interval_area(construction_points[i], log_f[i], slope[i], a, b));
+            areas.push(Self::interval_area(
+                construction_points[i],
+                log_f[i],
+                slope[i],
+                a,
+                b,
+            ));
         }
         let hat_area: f64 = areas.iter().sum();
         if !(hat_area > 0.0) || !hat_area.is_finite() {
@@ -60643,8 +60788,16 @@ impl<F: Fn(f64) -> f64> TransformedDensityRejection<F> {
                 f64::INFINITY
             };
         }
-        let ea = if a.is_finite() { s * (a - x0) } else { f64::NEG_INFINITY };
-        let eb = if b.is_finite() { s * (b - x0) } else { f64::NEG_INFINITY };
+        let ea = if a.is_finite() {
+            s * (a - x0)
+        } else {
+            f64::NEG_INFINITY
+        };
+        let eb = if b.is_finite() {
+            s * (b - x0)
+        } else {
+            f64::NEG_INFINITY
+        };
         // `s·(±inf − x0)` is −inf exactly when the tail points inward, which is
         // enforced in `new`; the other case is rejected there.
         let m = ea.max(eb);
@@ -60701,15 +60854,31 @@ impl<F: Fn(f64) -> f64> TransformedDensityRejection<F> {
             // Pick an interval by its share of the hat area, then invert within it.
             let u = rng.random::<f64>();
             let i = self.cum_area.partition_point(|&c| c < u).min(n - 1);
-            let a = if i == 0 { f64::NEG_INFINITY } else { self.bound[i - 1] };
-            let b = if i == n - 1 { f64::INFINITY } else { self.bound[i] };
+            let a = if i == 0 {
+                f64::NEG_INFINITY
+            } else {
+                self.bound[i - 1]
+            };
+            let b = if i == n - 1 {
+                f64::INFINITY
+            } else {
+                self.bound[i]
+            };
             let (x0, s) = (self.points[i], self.slope[i]);
             let w = rng.random::<f64>();
             let x = if s == 0.0 {
                 a + w * (b - a)
             } else {
-                let ea = if a.is_finite() { s * (a - x0) } else { f64::NEG_INFINITY };
-                let eb = if b.is_finite() { s * (b - x0) } else { f64::NEG_INFINITY };
+                let ea = if a.is_finite() {
+                    s * (a - x0)
+                } else {
+                    f64::NEG_INFINITY
+                };
+                let eb = if b.is_finite() {
+                    s * (b - x0)
+                } else {
+                    f64::NEG_INFINITY
+                };
                 let m = ea.max(eb);
                 let lo = (ea - m).exp();
                 let hi = (eb - m).exp();
@@ -60834,12 +61003,21 @@ mod tdr_matches_scipy {
         let mean = s.iter().sum::<f64>() / n as f64;
         let var = s.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
         assert!(mean.abs() < 5.0 * (1.0 / n as f64).sqrt(), "mean {mean}");
-        assert!((var - 1.0).abs() < 5.0 * (2.0 / n as f64).sqrt(), "var {var}");
+        assert!(
+            (var - 1.0).abs() < 5.0 * (2.0 / n as f64).sqrt(),
+            "var {var}"
+        );
         // A log-concave density with a shifted, asymmetric shape too: Gamma(3,1),
         // x^2 e^-x on x > 0, whose ln f = 2 ln x - x is concave.
         let g = TransformedDensityRejection::new(
             |x: f64| if x > 0.0 { x * x * (-x).exp() } else { 0.0 },
-            |x: f64| if x > 0.0 { (2.0 * x - x * x) * (-x).exp() } else { 0.0 },
+            |x: f64| {
+                if x > 0.0 {
+                    (2.0 * x - x * x) * (-x).exp()
+                } else {
+                    0.0
+                }
+            },
             &[0.4, 1.0, 2.0, 3.5, 6.0, 10.0],
         )
         .expect("valid construction");
@@ -60904,7 +61082,10 @@ mod tdr_matches_scipy {
             let mut rng = StdRng::seed_from_u64(2);
             let mut saw_error = false;
             for _ in 0..2000 {
-                if matches!(t.try_sample_one(&mut rng), Err(StatsError::InvalidArgument(_))) {
+                if matches!(
+                    t.try_sample_one(&mut rng),
+                    Err(StatsError::InvalidArgument(_))
+                ) {
                     saw_error = true;
                     break;
                 }
@@ -61184,14 +61365,22 @@ mod hinv_matches_scipy {
         let mut prev = f64::NEG_INFINITY;
         for k in 1..=5_000_u32 {
             let v = h.ppf(f64::from(k) / 5_001.0);
-            assert!(v > prev, "quantile is not increasing at u = {}", f64::from(k) / 5_001.0);
+            assert!(
+                v > prev,
+                "quantile is not increasing at u = {}",
+                f64::from(k) / 5_001.0
+            );
             prev = v;
         }
         // Beyond the interpolated range the exact quantile is used, so it agrees
         // with the base distribution bit for bit.
         let base = Normal::standard();
         for u in [1e-300, 1e-30, 1e-12] {
-            assert_eq!(h.ppf(u).to_bits(), base.ppf(u).to_bits(), "tail must be exact");
+            assert_eq!(
+                h.ppf(u).to_bits(),
+                base.ppf(u).to_bits(),
+                "tail must be exact"
+            );
         }
         assert!(h.ppf(-0.1).is_nan());
         assert!(h.ppf(1.1).is_nan());
@@ -61206,7 +61395,10 @@ mod hinv_matches_scipy {
         let mean = s.iter().sum::<f64>() / n as f64;
         let var = s.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
         assert!(mean.abs() < 5.0 * (1.0 / n as f64).sqrt(), "mean {mean}");
-        assert!((var - 1.0).abs() < 5.0 * (2.0 / n as f64).sqrt(), "var {var}");
+        assert!(
+            (var - 1.0).abs() < 5.0 * (2.0 / n as f64).sqrt(),
+            "var {var}"
+        );
     }
 
     #[test]
@@ -61412,9 +61604,17 @@ mod tests {
         // ppf at q = 0 is ONE BELOW the support, scipy's discrete convention:
         // inf{x : cdf(x) >= 0} falls below every support point. scipy 1.17.1 gives
         // 0.0 for xk=[1,2,3], 4.0 for [5,6,7], -3.0 for [-2,0,4]. We returned xk[0].
-        assert_eq!(rd.ppf(0.0), 0.0, "ppf(0) is one below the lower support bound");
+        assert_eq!(
+            rd.ppf(0.0),
+            0.0,
+            "ppf(0) is one below the lower support bound"
+        );
         let shifted = RvDiscrete::new(vec![5.0, 6.0, 7.0], vec![0.2, 0.3, 0.5]);
-        assert_eq!(shifted.ppf(0.0), 4.0, "the rule tracks the support, not zero");
+        assert_eq!(
+            shifted.ppf(0.0),
+            4.0,
+            "the rule tracks the support, not zero"
+        );
         let negative = RvDiscrete::new(vec![-2.0, 0.0, 4.0], vec![0.2, 0.3, 0.5]);
         assert_eq!(negative.ppf(0.0), -3.0, "and holds for a negative support");
         // Unchanged, so the special case cannot have swallowed the general path.
@@ -61432,7 +61632,11 @@ mod tests {
         assert!(sr.ppf(-0.5).is_nan(), "p < 0 has no quantile");
         assert!(sr.ppf(1.5).is_nan(), "p > 1 has no quantile");
         assert_eq!(sr.ppf(0.0), 0.0, "unchanged at the lower boundary");
-        assert_eq!(sr.ppf(1.0), f64::INFINITY, "unchanged at the upper boundary");
+        assert_eq!(
+            sr.ppf(1.0),
+            f64::INFINITY,
+            "unchanged at the upper boundary"
+        );
         // The interior is untouched by this change. Asserted as a property rather than a
         // golden: scipy gives 1.6446888587137876 here, but that value comes from its own
         // adaptive integrator and pinning it would test the quadrature, not this guard.
@@ -61459,7 +61663,14 @@ mod tests {
     fn rank_ties_group_by_exact_equality_not_tolerance() {
         let d12 = 5e-13;
         let s0 = [1.0, 2.0, 4.0, 7.0, 3.0, 6.0];
-        let s1 = [1.0 + d12, 2.0 + d12, 4.0 + d12, 7.0 + d12, 3.0 + d12, 6.0 + d12];
+        let s1 = [
+            1.0 + d12,
+            2.0 + d12,
+            4.0 + d12,
+            7.0 + d12,
+            3.0 + d12,
+            6.0 + d12,
+        ];
         let s2 = [3.0, 5.0, 1.0, 2.0, 8.0, 9.0];
         let fr = friedmanchisquare(&[&s0[..], &s1[..], &s2[..]]);
         assert!(
@@ -78598,7 +78809,11 @@ mod tests {
     fn trim_mean_empty() {
         // Empty data is still an in-band NaN, NOT a rejection: only the
         // proportion is validated (frankenscipy-tb5es).
-        assert!(trim_mean(&[], 0.1).expect("empty data is NaN, not an error").is_nan());
+        assert!(
+            trim_mean(&[], 0.1)
+                .expect("empty data is NaN, not an error")
+                .is_nan()
+        );
     }
 
     #[test]
@@ -78618,7 +78833,11 @@ mod tests {
 
     #[test]
     fn trimboth_empty() {
-        assert!(trimboth(&[], 0.1).expect("empty data is empty, not an error").is_empty());
+        assert!(
+            trimboth(&[], 0.1)
+                .expect("empty data is empty, not an error")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -78690,18 +78909,25 @@ mod tests {
                     );
                 }
                 (Err(_), None) => {}
-                (got, want) => panic!("trim_mean(n={n}, {prop}): got {got:?}, scipy wanted {want:?}"),
+                (got, want) => {
+                    panic!("trim_mean(n={n}, {prop}): got {got:?}, scipy wanted {want:?}")
+                }
             }
 
             match (trimboth(&data, prop), want_both) {
                 (Ok(got), Some(want)) => {
                     assert_eq!(got.len(), want.len(), "trimboth(n={n}, {prop}) length");
                     for (i, (g, w)) in got.iter().zip(want).enumerate() {
-                        assert!((g - w).abs() < 1e-12, "trimboth(n={n}, {prop})[{i}] = {g}, scipy {w}");
+                        assert!(
+                            (g - w).abs() < 1e-12,
+                            "trimboth(n={n}, {prop})[{i}] = {g}, scipy {w}"
+                        );
                     }
                 }
                 (Err(_), None) => {}
-                (got, want) => panic!("trimboth(n={n}, {prop}): got {got:?}, scipy wanted {want:?}"),
+                (got, want) => {
+                    panic!("trimboth(n={n}, {prop}): got {got:?}, scipy wanted {want:?}")
+                }
             }
         }
 
@@ -78709,17 +78935,21 @@ mod tests {
         // prop = 0.6 at n = 11, which is exactly scipy's answer for the
         // LEGITIMATE 0.45 -- a plausible number, not a NaN.
         let odd: Vec<f64> = (1..=11).map(|i| i as f64).collect();
-        assert!(trim_mean(&odd, 0.6).is_err(), "0.6 at n=11 must now be refused");
         assert!(
-            (trim_mean(&odd, 0.45).expect("0.45 is in range") - 6.0).abs() < 1e-12
+            trim_mean(&odd, 0.6).is_err(),
+            "0.6 at n=11 must now be refused"
         );
+        assert!((trim_mean(&odd, 0.45).expect("0.45 is in range") - 6.0).abs() < 1e-12);
 
         // A negative proportion still trims nothing rather than erroring: scipy
         // errors there, but incidentally from numpy's partition, so it is not
         // mirrored.
         let untrimmed = trim_mean(&odd, 0.0).expect("0.0 is in range");
         let negative = trim_mean(&odd, -0.1).expect("negative clamps to no trim");
-        assert!((negative - untrimmed).abs() < 1e-12, "{negative} vs {untrimmed}");
+        assert!(
+            (negative - untrimmed).abs() < 1e-12,
+            "{negative} vs {untrimmed}"
+        );
     }
 
     #[test]
@@ -94330,8 +94560,14 @@ mod tests {
         // scipy.stats.trim_mean uses floor(n*prop) cut from each end; tmean keeps
         // values within (inclusive) limits. Golden from scipy.stats 1.17.1.
         let a = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
-        assert!((trim_mean(&a, 0.1).expect("proportion is in range") - 5.5).abs() < 1e-12, "trim_mean 0.1");
-        assert!((trim_mean(&a, 0.25).expect("proportion is in range") - 5.5).abs() < 1e-12, "trim_mean 0.25");
+        assert!(
+            (trim_mean(&a, 0.1).expect("proportion is in range") - 5.5).abs() < 1e-12,
+            "trim_mean 0.1"
+        );
+        assert!(
+            (trim_mean(&a, 0.25).expect("proportion is in range") - 5.5).abs() < 1e-12,
+            "trim_mean 0.25"
+        );
         assert!(
             (tmean(&a, (2.0, 8.0), (true, true)) - 5.0).abs() < 1e-12,
             "tmean (2,8)"
@@ -99988,7 +100224,11 @@ mod tests {
                 continue;
             };
             let name = rest.split(':').next().unwrap_or("").trim();
-            if name.is_empty() || !name.chars().all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit()) {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+            {
                 continue;
             }
             total += 1;
@@ -100721,7 +100961,8 @@ mod tests {
             .map(|g| {
                 (0..GLEN as u64)
                     .map(|i| {
-                        ((i.wrapping_mul(2_654_435_761).wrapping_add(g as u64 * 104_729)
+                        ((i.wrapping_mul(2_654_435_761)
+                            .wrapping_add(g as u64 * 104_729)
                             % 50_021) as f64)
                             / 100.0
                     })
@@ -100754,7 +100995,11 @@ mod tests {
         let sm_serial = spearmanr_matrix(&group_data).expect("spearmanr_matrix fixture rejected");
         SPEARMANR_MATRIX_FORCE_SERIAL.store(false, Ordering::Relaxed);
         let sm_par = spearmanr_matrix(&group_data).expect("spearmanr_matrix fixture rejected");
-        assert_eq!(sm_serial.len(), GCOUNT, "spearmanr_matrix returned no matrix");
+        assert_eq!(
+            sm_serial.len(),
+            GCOUNT,
+            "spearmanr_matrix returned no matrix"
+        );
         assert!(
             sm_serial.iter().flatten().all(|v| v.is_finite()),
             "spearmanr_matrix fixture produced non-finite entries"
@@ -100857,6 +101102,135 @@ mod tests {
                 && !BIWEIGHT_FORCE_SERIAL.load(Ordering::Relaxed)
                 && !BINNED_STAT_MAP_FORCE_SERIAL.load(Ordering::Relaxed)
                 && !CONTINGENCY_SORT_FORCE_SERIAL.load(Ordering::Relaxed),
+            "a toggle was left flipped, which would leak into every later test \
+             sharing TOGGLE_LOCK"
+        );
+    }
+
+    /// `frankenscipy-921i0` GATE, byte-identity half for MANN-WHITNEY.
+    ///
+    /// Kept separate from the `kruskal` test because the equivalence argument is DIFFERENT
+    /// and could fail independently. `kruskal`'s deleted loop grouped by `==`, so it is the
+    /// same predicate as the ranking pass. Mann-Whitney's grouped SORTED RANKS by
+    /// `(a − b).abs() < 1e-12`, so byte-identity holds only if that tolerance is inert.
+    ///
+    /// It is inert because average ranks are half-integers: two distinct rank values differ
+    /// by at least 0.5, and `1e-12` cannot bridge 0.5 at any n. The fixtures below are chosen
+    /// to attack that claim rather than to confirm it:
+    ///
+    ///   * MUST-HIT   — heavy ties from a small alphabet, so many groups exist and the
+    ///     tolerance loop runs over real groups rather than singletons. Asserted via a
+    ///     non-zero tie correction recomputed independently.
+    ///   * MUST-MISS  — strictly distinct values, so every group is a singleton and the
+    ///     correction is `0.0`; on its own this would pass against any implementation.
+    ///   * ADJACENT   — values `1.0` apart in a LARGE sample, so the ranks themselves are
+    ///     large (up to ~4000). If the tolerance were relative rather than absolute, or if
+    ///     ranks were accumulated by summation instead of computed as `(i+1+j)/2`, adjacent
+    ///     rank groups would start to merge here first.
+    #[test]
+    fn mannwhitneyu_tie_bit_identical_across_the_resort_toggle() {
+        let _g = toggle_guard();
+
+        let run = |x: &[f64], y: &[f64], resort: bool| {
+            MWU_FORCE_TIE_RESORT.store(resort, std::sync::atomic::Ordering::Relaxed);
+            let a = mannwhitneyu(x, y);
+            let b = mannwhitneyu_alternative(x, y, "greater");
+            MWU_FORCE_TIE_RESORT.store(false, std::sync::atomic::Ordering::Relaxed);
+            (a, b)
+        };
+
+        // Independent recomputation of Σ(t³−t) over the COMBINED sample, by exact equality
+        // on the VALUES — deliberately not the code under test, and deliberately not the
+        // tolerance form either.
+        let tie_sum_of = |x: &[f64], y: &[f64]| -> f64 {
+            let mut all: Vec<f64> = x.to_vec();
+            all.extend_from_slice(y);
+            all.sort_unstable_by(f64::total_cmp);
+            let mut sum = 0.0;
+            let mut i = 0;
+            while i < all.len() {
+                let mut j = i + 1;
+                while j < all.len() && all[j] == all[i] {
+                    j += 1;
+                }
+                let t = (j - i) as f64;
+                if t > 1.0 {
+                    sum += t * t * t - t;
+                }
+                i = j;
+            }
+            sum
+        };
+
+        let cases: [(&str, Vec<f64>, Vec<f64>); 3] = [
+            (
+                "MUST-HIT heavy ties",
+                (0..400).map(|i| ((i * 7) % 9) as f64).collect(),
+                (0..400).map(|i| ((i * 11) % 9) as f64).collect(),
+            ),
+            (
+                "MUST-MISS all distinct",
+                (0..400).map(|i| i as f64).collect(),
+                (0..400).map(|i| 1000.0 + i as f64).collect(),
+            ),
+            (
+                "ADJACENT large ranks",
+                (0..2000).map(|i| (i / 2) as f64).collect(),
+                (0..2000).map(|i| (i / 2) as f64 + 0.5).collect(),
+            ),
+        ];
+
+        for (label, x, y) in &cases {
+            let ts = tie_sum_of(x, y);
+            match *label {
+                "MUST-MISS all distinct" => assert_eq!(
+                    ts, 0.0,
+                    "{label}: fixture has ties (tie_sum {ts}), so it is not the must-miss \
+                     control it claims to be"
+                ),
+                _ => assert!(
+                    ts > 0.0,
+                    "{label}: fixture produced no ties (tie_sum {ts}), so the resort arm \
+                     walks only singletons and the two arms would agree trivially"
+                ),
+            }
+
+            let (a_orig, b_orig) = run(x, y, true);
+            let (a_new, b_new) = run(x, y, false);
+
+            assert_eq!(
+                a_orig.statistic.to_bits(),
+                a_new.statistic.to_bits(),
+                "{label}: mannwhitneyu U differs across MWU_FORCE_TIE_RESORT: \
+                 resort {} vs ranking-pass {}",
+                a_orig.statistic,
+                a_new.statistic
+            );
+            assert_eq!(
+                a_orig.pvalue.to_bits(),
+                a_new.pvalue.to_bits(),
+                "{label}: mannwhitneyu p differs across MWU_FORCE_TIE_RESORT: \
+                 resort {} vs ranking-pass {}",
+                a_orig.pvalue,
+                a_new.pvalue
+            );
+            assert_eq!(
+                b_orig.statistic.to_bits(),
+                b_new.statistic.to_bits(),
+                "{label}: mannwhitneyu_alternative U differs across the toggle"
+            );
+            assert_eq!(
+                b_orig.pvalue.to_bits(),
+                b_new.pvalue.to_bits(),
+                "{label}: mannwhitneyu_alternative p differs across the toggle: \
+                 resort {} vs ranking-pass {}",
+                b_orig.pvalue,
+                b_new.pvalue
+            );
+        }
+
+        assert!(
+            !MWU_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed),
             "a toggle was left flipped, which would leak into every later test \
              sharing TOGGLE_LOCK"
         );
@@ -100973,7 +101347,6 @@ mod tests {
              sharing TOGGLE_LOCK"
         );
     }
-
 }
 
 /// frankenscipy-clttw — the tie predicate must be EXACT EQUALITY, not a tolerance.
@@ -100998,9 +101371,7 @@ mod tests {
 /// why a tolerance looks harmless and is not.
 #[cfg(test)]
 mod clttw_tie_predicate_is_exact {
-    use super::{
-        RANKDATA_RADIX_DISABLE, RankTieMethod, rankdata_ties_with_tie_sum, wilcoxon,
-    };
+    use super::{RANKDATA_RADIX_DISABLE, RankTieMethod, rankdata_ties_with_tie_sum, wilcoxon};
     use std::sync::atomic::Ordering;
 
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -101012,7 +101383,9 @@ mod clttw_tie_predicate_is_exact {
 
     #[test]
     fn a_five_e_minus_thirteen_gap_is_not_a_tie() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Annotated: `to_bits` below is called before inference has pinned the
         // element type from the later `rankdata_ties_with_tie_sum` call.
@@ -101029,8 +101402,7 @@ mod clttw_tie_predicate_is_exact {
              distinguish an exact predicate from a tolerant one"
         );
 
-        let (_r, distinct_sum) =
-            rankdata_ties_with_tie_sum(&distinct, RankTieMethod::Average);
+        let (_r, distinct_sum) = rankdata_ties_with_tie_sum(&distinct, RankTieMethod::Average);
         let (_r, tied_sum) = rankdata_ties_with_tie_sum(&tied, RankTieMethod::Average);
 
         assert_eq!(
@@ -101051,7 +101423,9 @@ mod clttw_tie_predicate_is_exact {
     /// comparison path.
     #[test]
     fn the_radix_and_comparison_paths_group_ties_identically() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Large enough to cross the radix threshold, with the near-tie repeated
         // throughout so the grouping scan meets it many times rather than once.
@@ -101063,7 +101437,7 @@ mod clttw_tie_predicate_is_exact {
                     0 => base,
                     1 => base + 5e-13, // near-tie: must NOT group
                     2 => base + 1.0,
-                    _ => base + 1.0,   // exact tie: MUST group
+                    _ => base + 1.0, // exact tie: MUST group
                 }
             })
             .collect();
@@ -101119,7 +101493,9 @@ mod clttw_tie_predicate_is_exact {
     /// have passed on a fixture where they differ for the wrong reason.
     #[test]
     fn the_predicate_reaches_the_wilcoxon_pvalue() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Differences 1.0, 1.0+5e-13, 2.0 .. 14.0 — fifteen, all positive, no zeros
         // for wilcoxon to drop.
@@ -101141,7 +101517,10 @@ mod clttw_tie_predicate_is_exact {
         let (_, ts_near) = rankdata_ties_with_tie_sum(&x, RankTieMethod::Average);
         let (_, ts_exact) = rankdata_ties_with_tie_sum(&x_tied, RankTieMethod::Average);
         assert_eq!(ts_near, 0.0, "MUST-MISS: a 5e-13 gap is not a tie group");
-        assert_eq!(ts_exact, 6.0, "MUST-HIT: the exact pair is a tie group of 2");
+        assert_eq!(
+            ts_exact, 6.0,
+            "MUST-HIT: the exact pair is a tie group of 2"
+        );
 
         // scipy.stats.wilcoxon(x, y) — the near-tie arm has no ties, so it takes the
         // exact signed-rank distribution; the tied arm takes the approximation.
@@ -101182,11 +101561,41 @@ mod wofb_noncentral_survival_is_direct {
     fn noncentral_survival_is_direct_not_one_minus_cdf() {
         // x, df, nc, scipy.stats.ncx2.sf, what 1 - cdf gave.
         let ncx2 = [
-            (10.0, 3.0, 2.0, 1.014_350_364_860_013_6e-1, "1.014350e-01 ok"),
-            (5.0, 7.0, 20.0, 9.992_803_076_754_801_5e-1, "9.992803e-01 ok"),
-            (80.0, 3.0, 2.0, 1.626_871_961_685_991_5e-13, "1.627587e-13, 4th digit"),
-            (150.0, 3.0, 2.0, 1.044_927_027_553_426_6e-26, "0.0 COLLAPSED"),
-            (300.0, 10.0, 50.0, 3.224_568_183_927_314_4e-23, "0.0 COLLAPSED"),
+            (
+                10.0,
+                3.0,
+                2.0,
+                1.014_350_364_860_013_6e-1,
+                "1.014350e-01 ok",
+            ),
+            (
+                5.0,
+                7.0,
+                20.0,
+                9.992_803_076_754_801_5e-1,
+                "9.992803e-01 ok",
+            ),
+            (
+                80.0,
+                3.0,
+                2.0,
+                1.626_871_961_685_991_5e-13,
+                "1.627587e-13, 4th digit",
+            ),
+            (
+                150.0,
+                3.0,
+                2.0,
+                1.044_927_027_553_426_6e-26,
+                "0.0 COLLAPSED",
+            ),
+            (
+                300.0,
+                10.0,
+                50.0,
+                3.224_568_183_927_314_4e-23,
+                "0.0 COLLAPSED",
+            ),
         ];
         for (x, df, nc, want, note) in ncx2 {
             let got = NoncentralChiSquared::new(df, nc).sf(x);
@@ -101200,11 +101609,46 @@ mod wofb_noncentral_survival_is_direct {
 
         // f, dfn, dfd, nc, scipy.stats.ncf.sf, what 1 - cdf gave.
         let ncf = [
-            (20.0, 3.0, 5.0, 2.0, 9.362_115_386_065_090e-3, "9.362115e-03 ok"),
-            (100.0, 10.0, 10.0, 40.0, 1.168_395_145_190_737e-5, "1.168395e-05 ok"),
-            (1e6, 3.0, 5.0, 2.0, 2.330_338_627_458_045e-14, "2.331468e-14, 3 digits"),
-            (1e12, 3.0, 5.0, 2.0, 2.330_354_877_710_844e-29, "0.0 COLLAPSED"),
-            (1e4, 5.0, 200.0, 3.0, 4.498_173_170_614_720e-230, "0.0 COLLAPSED"),
+            (
+                20.0,
+                3.0,
+                5.0,
+                2.0,
+                9.362_115_386_065_090e-3,
+                "9.362115e-03 ok",
+            ),
+            (
+                100.0,
+                10.0,
+                10.0,
+                40.0,
+                1.168_395_145_190_737e-5,
+                "1.168395e-05 ok",
+            ),
+            (
+                1e6,
+                3.0,
+                5.0,
+                2.0,
+                2.330_338_627_458_045e-14,
+                "2.331468e-14, 3 digits",
+            ),
+            (
+                1e12,
+                3.0,
+                5.0,
+                2.0,
+                2.330_354_877_710_844e-29,
+                "0.0 COLLAPSED",
+            ),
+            (
+                1e4,
+                5.0,
+                200.0,
+                3.0,
+                4.498_173_170_614_720e-230,
+                "0.0 COLLAPSED",
+            ),
         ];
         for (x, dfn, dfd, nc, want, note) in ncf {
             let got = NoncentralF::new(dfn, dfd, nc).sf(x);
@@ -101475,11 +101919,41 @@ mod order_statistic_matches_scipy {
     fn ppf_and_isf_match_scipy() {
         // r, n, q, scipy icdf, scipy iccdf
         let cases = [
-            (1, 5, 0.05, -2.318_679_209_826_409e0, -1.238_431_617_706_278e-1),
-            (1, 5, 0.5, -1.128_997_535_296_102e0, -1.128_997_535_296_102e0),
-            (1, 5, 0.95, -1.238_431_617_706_281e-1, -2.318_679_209_826_408e0),
-            (3, 5, 0.05, -8.806_435_950_364_639e-1, 8.806_435_950_364_639e-1),
-            (3, 5, 0.95, 8.806_435_950_364_635e-1, -8.806_435_950_364_635e-1),
+            (
+                1,
+                5,
+                0.05,
+                -2.318_679_209_826_409e0,
+                -1.238_431_617_706_278e-1,
+            ),
+            (
+                1,
+                5,
+                0.5,
+                -1.128_997_535_296_102e0,
+                -1.128_997_535_296_102e0,
+            ),
+            (
+                1,
+                5,
+                0.95,
+                -1.238_431_617_706_281e-1,
+                -2.318_679_209_826_408e0,
+            ),
+            (
+                3,
+                5,
+                0.05,
+                -8.806_435_950_364_639e-1,
+                8.806_435_950_364_639e-1,
+            ),
+            (
+                3,
+                5,
+                0.95,
+                8.806_435_950_364_635e-1,
+                -8.806_435_950_364_635e-1,
+            ),
         ];
         for (r, n, q, want_ppf, want_isf) in cases {
             let y = order_statistic(Normal::standard(), r, n);
@@ -101815,10 +102289,20 @@ mod truncate_matches_scipy {
         // good to ~3e-9 absolute, so nothing built on it can be tighter. Still
         // orders below any formula error.
         let cases = [
-            (-1.0, 2.0, 2.296_371_790_913_290e-1, 5.197_625_392_115_339e-1),
+            (
+                -1.0,
+                2.0,
+                2.296_371_790_913_290e-1,
+                5.197_625_392_115_339e-1,
+            ),
             (0.0, 3.0, 7.911_568_260_634_169e-1, 3.474_078_012_358_018e-1),
             (5.0, 10.0, 5.186_503_967_125_851e0, 3.269_643_461_706_051e-2),
-            (30.0, 40.0, 3.003_325_966_743_637e1, 1.103_771_430_859_046e-3),
+            (
+                30.0,
+                40.0,
+                3.003_325_966_743_637e1,
+                1.103_771_430_859_046e-3,
+            ),
         ];
         for (lb, ub, want_mean, want_var) in cases {
             let t = truncate(Normal::standard(), lb, ub);
@@ -102060,8 +102544,8 @@ mod truncate_matches_scipy {
 #[cfg(test)]
 mod transforms_match_scipy {
     use super::{
-        ContinuousDistribution, HalfNormal, LogOf, Lognormal, Normal, Uniform, abs_of,
-        exp_of, log_of,
+        ContinuousDistribution, HalfNormal, LogOf, Lognormal, Normal, Uniform, abs_of, exp_of,
+        log_of,
     };
 
     /// `exp(X)`, `abs(X)`, `log(X)` against `scipy.stats.exp/abs/log`.
@@ -102090,7 +102574,10 @@ mod transforms_match_scipy {
                 (y.sf(x), want_sf, "sf"),
             ] {
                 let rel = ((got - want) / want).abs();
-                assert!(rel < 1e-12, "exp(Normal).{what}({x}) = {got}, scipy = {want}");
+                assert!(
+                    rel < 1e-12,
+                    "exp(Normal).{what}({x}) = {got}, scipy = {want}"
+                );
             }
         }
 
@@ -102122,7 +102609,10 @@ mod transforms_match_scipy {
                 (y.sf(x), want_sf, "sf"),
             ] {
                 let rel = ((got - want) / want).abs();
-                assert!(rel < 1e-12, "abs(Normal).{what}({x}) = {got}, scipy = {want}");
+                assert!(
+                    rel < 1e-12,
+                    "abs(Normal).{what}({x}) = {got}, scipy = {want}"
+                );
             }
         }
 
@@ -102381,15 +102871,14 @@ mod transforms_match_scipy {
 #[cfg(test)]
 mod goodness_of_fit_matches_scipy {
     use super::{
-        ContinuousDistribution, GofStatistic, Normal, SeedableRng, gof_statistic,
-        goodness_of_fit,
+        ContinuousDistribution, GofStatistic, Normal, SeedableRng, gof_statistic, goodness_of_fit,
     };
 
     /// A sample that really is normal, and one that visibly is not. Both arms are
     /// needed: a statistic that returned a constant would pass either alone.
     const NORMALISH: [f64; 20] = [
-        0.32, -1.15, 0.78, 2.01, -0.44, 1.33, -0.07, 0.95, -1.72, 0.51, 1.88, -0.63, 0.22,
-        -0.11, 1.04, 0.67, -1.29, 0.41, 1.55, -0.86,
+        0.32, -1.15, 0.78, 2.01, -0.44, 1.33, -0.07, 0.95, -1.72, 0.51, 1.88, -0.63, 0.22, -0.11,
+        1.04, 0.67, -1.29, 0.41, 1.55, -0.86,
     ];
     const SKEWED: [f64; 15] = [
         0.05, 0.11, 0.19, 0.27, 0.38, 0.52, 0.71, 0.95, 1.28, 1.74, 2.4, 3.35, 4.8, 7.1, 11.2,
@@ -102462,9 +102951,21 @@ mod goodness_of_fit_matches_scipy {
         // insensitive to the data would pass the block above and fail here.
         let db = Normal::new(2.336_666_666_666_666_4, 3.061_408_535_661_685);
         for (which, want, tol) in [
-            (GofStatistic::AndersonDarling, 1.523_851_273_486_347e0, 1e-12),
-            (GofStatistic::KolmogorovSmirnov, 2.439_308_121_399_081e-1, 1e-12),
-            (GofStatistic::CramerVonMises, 2.706_468_784_149_458e-1, 1e-12),
+            (
+                GofStatistic::AndersonDarling,
+                1.523_851_273_486_347e0,
+                1e-12,
+            ),
+            (
+                GofStatistic::KolmogorovSmirnov,
+                2.439_308_121_399_081e-1,
+                1e-12,
+            ),
+            (
+                GofStatistic::CramerVonMises,
+                2.706_468_784_149_458e-1,
+                1e-12,
+            ),
             (GofStatistic::Filliben, 8.533_739_288_191_515e-1, 1e-8),
         ] {
             let got = gof_statistic(&db, &SKEWED, which);
@@ -102570,7 +103071,10 @@ mod goodness_of_fit_matches_scipy {
         let res: super::GofOutcome<Normal> =
             goodness_of_fit(&NORMALISH, GofStatistic::AndersonDarling, 499, 7).expect("fit");
         let fitted = Normal::try_fit(&NORMALISH).expect("fit");
-        assert_eq!(res.fitted, fitted, "the reported fit is the null-hypothesis fit");
+        assert_eq!(
+            res.fitted, fitted,
+            "the reported fit is the null-hypothesis fit"
+        );
 
         // Score the same statistic WITHOUT refitting, on samples from the null.
         // The no-refit statistic is stochastically larger, because refitting
@@ -102579,7 +103083,11 @@ mod goodness_of_fit_matches_scipy {
         let mut rng = super::StdRng::seed_from_u64(99);
         for _ in 0..499 {
             let sample = fitted.rvs(NORMALISH.len(), &mut rng);
-            no_refit.push(gof_statistic(&fitted, &sample, GofStatistic::AndersonDarling));
+            no_refit.push(gof_statistic(
+                &fitted,
+                &sample,
+                GofStatistic::AndersonDarling,
+            ));
         }
         let mean_of = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
         let refit_mean = mean_of(&res.null_distribution);
@@ -102620,7 +103128,10 @@ mod goodness_of_fit_matches_scipy {
             9,
             1,
         );
-        assert!(ok.is_ok(), "HalfNormal does override try_fit, so this must succeed");
+        assert!(
+            ok.is_ok(),
+            "HalfNormal does override try_fit, so this must succeed"
+        );
     }
 
     #[test]
@@ -102774,8 +103285,11 @@ mod histogram_distribution_matches_scipy {
                 0.100_000_000_000_000_09,
             ),
         ] {
-            for (got, want, what) in [(h.pdf(x), p, "pdf"), (h.cdf(x), c, "cdf"), (h.sf(x), s, "sf")]
-            {
+            for (got, want, what) in [
+                (h.pdf(x), p, "pdf"),
+                (h.cdf(x), c, "cdf"),
+                (h.sf(x), s, "sf"),
+            ] {
                 assert!(
                     ((got - want) / want).abs() < 1e-14,
                     "{what}({x}) = {got}, scipy = {want}"
@@ -102820,8 +103334,16 @@ mod histogram_distribution_matches_scipy {
     #[test]
     fn density_false_reads_the_counts_as_frequencies() {
         let f = HistogramDistribution::new(&COUNTS, &WIDE, false).expect("valid histogram");
-        assert!((f.pdf(0.5) - 0.2).abs() < 1e-15, "pdf(0.5) = {}", f.pdf(0.5));
-        assert!((f.pdf(2.0) - 0.25).abs() < 1e-15, "pdf(2.0) = {}", f.pdf(2.0));
+        assert!(
+            (f.pdf(0.5) - 0.2).abs() < 1e-15,
+            "pdf(0.5) = {}",
+            f.pdf(0.5)
+        );
+        assert!(
+            (f.pdf(2.0) - 0.25).abs() < 1e-15,
+            "pdf(2.0) = {}",
+            f.pdf(2.0)
+        );
         assert!(
             (f.cdf(2.0) - 0.449_999_999_999_999_96).abs() < 1e-15,
             "cdf(2.0) = {}",
@@ -102861,7 +103383,11 @@ mod histogram_distribution_matches_scipy {
         let z = HistogramDistribution::new(&[2.0, 0.0, 3.0], &EVEN, false).expect("valid");
         assert_eq!(z.pdf(1.5), 0.0);
         assert!((z.cdf(1.5) - 0.4).abs() < 1e-15);
-        assert!((z.ppf(0.4) - 2.0).abs() < 1e-15, "ppf(0.4) = {}", z.ppf(0.4));
+        assert!(
+            (z.ppf(0.4) - 2.0).abs() < 1e-15,
+            "ppf(0.4) = {}",
+            z.ppf(0.4)
+        );
 
         let h = HistogramDistribution::new(&COUNTS, &WIDE, true).expect("valid");
         assert_eq!(h.support(), (0.0, 4.0));
@@ -102883,14 +103409,23 @@ mod histogram_distribution_matches_scipy {
 
         // ppf inverts cdf, and isf inverts sf, exactly enough to round trip.
         for q in [0.01, 0.3, 0.5, 0.77, 0.99] {
-            assert!((h.cdf(h.ppf(q)) - q).abs() < 1e-13, "ppf/cdf round trip at {q}");
-            assert!((h.sf(h.isf(q)) - q).abs() < 1e-13, "isf/sf round trip at {q}");
+            assert!(
+                (h.cdf(h.ppf(q)) - q).abs() < 1e-13,
+                "ppf/cdf round trip at {q}"
+            );
+            assert!(
+                (h.sf(h.isf(q)) - q).abs() < 1e-13,
+                "isf/sf round trip at {q}"
+            );
         }
     }
 
     #[test]
     fn malformed_input_is_rejected() {
-        assert!(HistogramDistribution::new(&[], &[0.0], true).is_err(), "no bins");
+        assert!(
+            HistogramDistribution::new(&[], &[0.0], true).is_err(),
+            "no bins"
+        );
         assert!(
             HistogramDistribution::new(&COUNTS, &[0.0, 1.0, 2.0], true).is_err(),
             "needs one more edge than counts"
