@@ -247,7 +247,11 @@ impl LowRankMatrix {
             .map(|i| {
                 (0..n)
                     .map(|j| {
-                        let e = if transpose { dense[j * n + i] } else { dense[i * n + j] };
+                        let e = if transpose {
+                            dense[j * n + i]
+                        } else {
+                            dense[i * n + j]
+                        };
                         e * v[j]
                     })
                     .sum()
@@ -879,12 +883,16 @@ impl Jacobian for BroydenJacobian {
     }
 }
 
-/// Low-rank Jacobian representations and the Broyden updates built on them.
-///
-/// The load-bearing property throughout is the SECANT CONDITION: after absorbing a
-/// step, `Gm df = dx` holds to rounding rather than approximately, because `Gm`
-/// approximates the INVERSE Jacobian and both Broyden updates are constructed to
-/// enforce exactly that. Testing against it states what the code must be.
+// Low-rank Jacobian representations and the Broyden updates built on them.
+//
+// The load-bearing property throughout is the SECANT CONDITION: after absorbing a
+// step, `Gm df = dx` holds to rounding rather than approximately, because `Gm`
+// approximates the INVERSE Jacobian and both Broyden updates are constructed to
+// enforce exactly that. Testing against it states what the code must be.
+//
+// This is a SECTION banner for the preceding block, not documentation of the
+// `NonlinJacobian` trait below -- as a `///` block it silently attached itself to that
+// trait across an intervening banner (clippy::empty_line_after_doc_comments).
 // ─────────────────────────────────────────────────────────────────────────────
 // nonlin_solve — the driver that turns a Jacobian approximation into a solver
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1164,15 +1172,14 @@ where
         let step = jacobian.newton_direction(&fx, tol);
         dx = step.iter().map(|v| -v).collect();
 
-        let fx_norm_new;
-        match options.line_search {
+        let fx_norm_new = match options.line_search {
             LineSearch::None => {
                 for (xi, di) in x.iter_mut().zip(&dx) {
                     *xi += di;
                 }
                 fx = func(&x);
                 calls += 1;
-                fx_norm_new = max_norm(&fx);
+                max_norm(&fx)
             }
             LineSearch::Armijo => {
                 // phi(s) = ||F(x + s dx)||^2, so phi'(0) = -2||F||^2 in exact
@@ -1187,8 +1194,7 @@ where
                 // are definitively released before either is read below.
                 let found = {
                     let mut phi = |s: f64| -> f64 {
-                        let xt: Vec<f64> =
-                            base_x.iter().zip(&dx).map(|(a, b)| a + s * b).collect();
+                        let xt: Vec<f64> = base_x.iter().zip(&dx).map(|(a, b)| a + s * b).collect();
                         let v = func(&xt);
                         inner_calls += 1;
                         let p: f64 = v.iter().map(|q| q * q).sum();
@@ -1210,9 +1216,9 @@ where
                         calls += 1;
                     }
                 }
-                fx_norm_new = max_norm(&fx);
+                max_norm(&fx)
             }
-        }
+        };
 
         jacobian.absorb(&x, &fx);
 
@@ -1422,8 +1428,8 @@ where
 #[cfg(test)]
 mod nonlin_tests {
     use super::{
-        BroydenJacobian, BroydenVariant, InverseJacobian, Jacobian, LowRankMatrix,
-        ReductionMethod, economic_qr, lu_solve_in_place, one_sided_jacobi,
+        BroydenJacobian, BroydenVariant, InverseJacobian, Jacobian, LowRankMatrix, ReductionMethod,
+        economic_qr, lu_solve_in_place, one_sided_jacobi,
     };
 
     const N: usize = 5;
@@ -1434,7 +1440,9 @@ mod nonlin_tests {
         let mut s = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
         (0..n)
             .map(|_| {
-                s = s.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
                 ((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
             })
             .collect()
@@ -1454,7 +1462,10 @@ mod nonlin_tests {
     }
 
     fn max_diff(a: &[f64], b: &[f64]) -> f64 {
-        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f64::max)
     }
 
     /// MUST-HIT: the Sherman-Morrison-Woodbury solve agrees with a dense solve of the
@@ -1589,8 +1600,7 @@ mod nonlin_tests {
         for variant in [BroydenVariant::First, BroydenVariant::Second] {
             let mut x = vec![1.0, 1.2, 0.9, 0.4, 1.1];
             let mut f = residual(&x);
-            let mut j =
-                BroydenJacobian::new(variant, None, ReductionMethod::Restart, None);
+            let mut j = BroydenJacobian::new(variant, None, ReductionMethod::Restart, None);
             j.setup(&x, &f);
 
             for step in 0..6 {
@@ -1643,7 +1653,11 @@ mod nonlin_tests {
 
         restart.restart_reduce(3);
         simple.simple_reduce(3);
-        assert_eq!(restart.rank(), 0, "restart kept vectors; it drops all of them");
+        assert_eq!(
+            restart.rank(),
+            0,
+            "restart kept vectors; it drops all of them"
+        );
         assert_eq!(simple.rank(), 3, "simple did not reduce to its cap");
 
         // WHICH three it kept is the actual claim, and a count cannot check it. Build
@@ -1686,8 +1700,12 @@ mod nonlin_tests {
     fn inverse_jacobian_swaps_the_two_directions() {
         let x = vec![1.0, 1.2, 0.9, 0.4, 1.1];
         let f = residual(&x);
-        let mut inner =
-            BroydenJacobian::new(BroydenVariant::First, Some(0.5), ReductionMethod::Restart, None);
+        let mut inner = BroydenJacobian::new(
+            BroydenVariant::First,
+            Some(0.5),
+            ReductionMethod::Restart,
+            None,
+        );
         inner.setup(&x, &f);
         let next: Vec<f64> = x.iter().map(|a| a + 0.05).collect();
         inner.update(&next, &residual(&next));
@@ -1794,7 +1812,11 @@ mod nonlin_tests {
 
         let mut by_svd = skewed_terms();
         by_svd.svd_reduce(4, Some(2));
-        assert_eq!(by_svd.rank(), 2, "svd_reduce did not retain exactly 2 components");
+        assert_eq!(
+            by_svd.rank(),
+            2,
+            "svd_reduce did not retain exactly 2 components"
+        );
         let svd_err = operator_error(&by_svd, &reference);
         assert!(
             svd_err < 1e-5,
@@ -1901,7 +1923,10 @@ mod nonlin_tests {
             for j in 0..m {
                 let ip: f64 = v[i].iter().zip(&v[j]).map(|(x, y)| x * y).sum();
                 let want = if i == j { 1.0 } else { 0.0 };
-                assert!((ip - want).abs() < 1e-10, "V is not orthogonal at ({i}, {j})");
+                assert!(
+                    (ip - want).abs() < 1e-10,
+                    "V is not orthogonal at ({i}, {j})"
+                );
             }
         }
         // The rotated matrix is A V: column j is sum_k A[:,k] V[k][j], and V[k][j] is
@@ -1931,7 +1956,10 @@ mod nonlin_tests {
         let svals: Vec<f64> = a.iter().map(|c| norm_of(c)).collect();
         // Sorted descending, without which the truncation is meaningless.
         for w in svals.windows(2) {
-            assert!(w[0] >= w[1], "singular values are not sorted descending: {svals:?}");
+            assert!(
+                w[0] >= w[1],
+                "singular values are not sorted descending: {svals:?}"
+            );
         }
         // Sum of squares = squared Frobenius norm of the input.
         let frob2: f64 = original.iter().flat_map(|c| c.iter()).map(|x| x * x).sum();
@@ -1944,7 +1972,11 @@ mod nonlin_tests {
         let mut gram = vec![0.0; m * m];
         for i in 0..m {
             for j in 0..m {
-                gram[i * m + j] = original[i].iter().zip(&original[j]).map(|(x, y)| x * y).sum();
+                gram[i * m + j] = original[i]
+                    .iter()
+                    .zip(&original[j])
+                    .map(|(x, y)| x * y)
+                    .sum();
             }
         }
         let det = det_via_lu(&mut gram, m);
@@ -2039,9 +2071,7 @@ mod nonlin_tests {
 
     // ── nonlin_solve driver and dispatch ────────────────────────────────────
 
-    use super::{
-        LineSearch, NonlinMethod, NonlinOptions, NonlinResult, nonlin_solve, root_nonlin,
-    };
+    use super::{LineSearch, NonlinMethod, NonlinOptions, NonlinResult, nonlin_solve, root_nonlin};
 
     /// A well-behaved nonlinear system with a known root, used to check that the
     /// DRIVER converges rather than that any particular Jacobian is clever.
@@ -2137,7 +2167,10 @@ mod nonlin_tests {
         // starting point and not about the driver refusing to run at all.
         let mut j2 = DiagBroydenJacobian::new(Some(0.5));
         let r2 = nonlin_solve(solvable, &[1.0, 1.0, 1.0, 1.0], &mut j2, opts);
-        assert!(r2.iterations > 0, "the driver never iterated on a real problem");
+        assert!(
+            r2.iterations > 0,
+            "the driver never iterated on a real problem"
+        );
     }
 
     /// The iteration cap is honoured and reported as a failure rather than as a
@@ -2193,7 +2226,10 @@ mod nonlin_tests {
             },
         );
 
-        assert!(with.success && without.success, "both settings should solve this");
+        assert!(
+            with.success && without.success,
+            "both settings should solve this"
+        );
         assert!(
             with.function_calls != without.function_calls,
             "the two line-search settings consumed identical evaluations ({}); the \
@@ -2202,7 +2238,10 @@ mod nonlin_tests {
         );
         // Same root, whichever path got there.
         let d = max_diff(&with.x, &without.x);
-        assert!(d < 1e-5, "the two settings converged to different points ({d})");
+        assert!(
+            d < 1e-5,
+            "the two settings converged to different points ({d})"
+        );
     }
 
     /// Name parsing accepts exactly SciPy's spellings for this family and refuses the
@@ -2283,7 +2322,10 @@ mod nonlin_tests {
             j.solve(&rhs, 0.0, InnerMethod::Lgmres);
         }
         let k = j.augmentation_rank();
-        assert!(k > 0, "no augmentation accumulated, so the comparison is empty");
+        assert!(
+            k > 0,
+            "no augmentation accumulated, so the comparison is empty"
+        );
         let mid = j.function_evaluations();
         j.solve(&rhs, 0.0, InnerMethod::Lgmres);
         let augmented = j.function_evaluations() - mid;
@@ -2324,7 +2366,9 @@ mod nonlin_tests {
 
     fn transposed(cols: &[Vec<f64>]) -> Vec<Vec<f64>> {
         let n = cols.len();
-        (0..n).map(|j| (0..n).map(|i| cols[i][j]).collect()).collect()
+        (0..n)
+            .map(|j| (0..n).map(|i| cols[i][j]).collect())
+            .collect()
     }
 
     fn max_diff_cols(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
@@ -2606,12 +2650,15 @@ mod nonlin_tests {
         let mut em = ExcitingMixingJacobian::new(Some(0.4), None);
         let mut an = AndersonJacobian::new(Some(0.4), None, None);
         let mut br = BroydenJacobian::first();
-        let strategies: [&mut dyn Jacobian; 5] =
-            [&mut lm, &mut db, &mut em, &mut an, &mut br];
+        let strategies: [&mut dyn Jacobian; 5] = [&mut lm, &mut db, &mut em, &mut an, &mut br];
 
         for (i, s) in strategies.into_iter().enumerate() {
             s.setup(&x0, &f0);
-            assert_eq!(s.dimension(), n, "strategy {i} reported the wrong dimension");
+            assert_eq!(
+                s.dimension(),
+                n,
+                "strategy {i} reported the wrong dimension"
+            );
             s.update(&x1, &f1);
             let probe = pseudo(909, n);
             let step = s.solve_ref(&probe);
@@ -2707,7 +2754,9 @@ mod nonlin_tests {
 
         // Recover h from the component with the largest v_i^2, where the recovery is
         // best conditioned -- this is a difference of nearly equal numbers.
-        let idx = (0..4).max_by(|&a, &b| v[a].abs().partial_cmp(&v[b].abs()).unwrap()).unwrap();
+        let idx = (0..4)
+            .max_by(|&a, &b| v[a].abs().partial_cmp(&v[b].abs()).unwrap())
+            .unwrap();
         let recovered = (got[idx] - 2.0 * x[idx] * v[idx]) / (v[idx] * v[idx]);
         assert!(
             (recovered - want_h).abs() < 1e-8 * want_h,
@@ -2755,9 +2804,7 @@ mod nonlin_tests {
         let n = 12;
         let amul = |x: &[f64]| -> Vec<f64> {
             (0..n)
-                .map(|i| {
-                    4.0 * x[i] - x[(i + 1) % n] - 0.5 * x[(i + n - 1) % n]
-                })
+                .map(|i| 4.0 * x[i] - x[(i + 1) % n] - 0.5 * x[(i + n - 1) % n])
                 .collect()
         };
         let x0 = vec![0.0; n];
@@ -2850,10 +2897,12 @@ mod nonlin_tests {
             2,
             "a zero direction consumed an evaluation"
         );
-        assert!(z.iter().all(|v| *v == 0.0), "a zero direction gave a nonzero product");
+        assert!(
+            z.iter().all(|v| *v == 0.0),
+            "a zero direction gave a nonzero product"
+        );
     }
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Simple mixing Jacobians — scipy.optimize LinearMixing / DiagBroyden / ExcitingMixing
@@ -3509,10 +3558,7 @@ where
         let xp: Vec<f64> = self.x0.iter().zip(v).map(|(a, b)| a + sc * b).collect();
         let fp = (self.func)(&xp);
         self.nfev += 1;
-        fp.iter()
-            .zip(&self.f0)
-            .map(|(a, b)| (a - b) / sc)
-            .collect()
+        fp.iter().zip(&self.f0).map(|(a, b)| (a - b) / sc).collect()
     }
 
     /// Solve `J dx = rhs` with the inner Krylov method, to relative tolerance `rtol`.
@@ -3625,7 +3671,13 @@ where
             // identical augmentation directions, so every one after the first is
             // already in the space.
             let nw = norm(&w);
-            if !(nw > f64::EPSILON * w_norm0) || !nw.is_finite() {
+            // The negation is DELIBERATE and must not become `nw <= ...`: for `nw` NaN the
+            // negated form is TRUE (skip the direction) while `<=` is FALSE (normalise by
+            // NaN and poison the basis). `partial_cmp`, which the lint suggests, would have
+            // to spell out the same three-way branch to preserve that.
+            #[allow(clippy::neg_cmp_op_on_partial_ord)]
+            let degenerate = !(nw > f64::EPSILON * w_norm0) || !nw.is_finite();
+            if degenerate {
                 // An augmentation direction that lies in the space already contributes
                 // nothing; skip it and keep going, since the Krylov directions after it
                 // are still worth building. A Krylov direction that collapses means the
