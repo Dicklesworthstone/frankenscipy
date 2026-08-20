@@ -31551,6 +31551,46 @@ pub fn ttest_onesamp(data: &[f64], popmean: f64) -> TtestResult {
     ttest_1samp(data, popmean)
 }
 
+/// When `true`, [`kruskal`] recomputes `Σ(t³ − t)` the ORIGINAL way — clone the combined
+/// observations, sort them a SECOND time, and re-walk the tie groups — instead of taking the
+/// value the ranking pass already produced. Default `false`.
+///
+/// This exists so `frankenscipy-921i0`'s preregistered A/B has BOTH arms inside ONE shipping
+/// binary (per the paired-interleaved rule); it is not a tuning knob. The two arms are
+/// byte-identical — the deleted loop grouped `sorted[j] == sorted[i]`, the same `==` over the
+/// same values in the same ascending order, so the same `t` values are summed in the same
+/// order — and `kruskal_tie_bit_identical_across_the_resort_toggle` asserts that on a fixture
+/// WITH ties and one WITHOUT.
+///
+/// NOTE for anyone reading the A/B: the tie-sum ACCUMULATION in the ranking pass runs in BOTH
+/// arms (it is inside `rankdata_ties_with_tie_sum`, which both arms call), so the measured
+/// ORIG/NEW ratio is a LOWER BOUND on the true pre-lever/post-lever ratio.
+#[doc(hidden)]
+pub static KRUSKAL_FORCE_TIE_RESORT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The pre-`frankenscipy-921i0` tie-correction sum: clone, sort, walk `==` groups.
+/// Reachable only via [`KRUSKAL_FORCE_TIE_RESORT`]; kept so the A/B arm is the real code
+/// that was deleted rather than a paraphrase of it.
+fn kruskal_tie_sum_by_resort(all_values: &[f64]) -> f64 {
+    let mut sorted_values = all_values.to_vec();
+    sorted_values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mut tie_sum = 0.0_f64;
+    let mut i = 0;
+    while i < sorted_values.len() {
+        let mut j = i + 1;
+        while j < sorted_values.len() && sorted_values[j] == sorted_values[i] {
+            j += 1;
+        }
+        let t = (j - i) as f64;
+        if t > 1.0 {
+            tie_sum += t * t * t - t;
+        }
+        i = j;
+    }
+    tie_sum
+}
+
 pub fn kruskal(groups: &[&[f64]]) -> TtestResult {
     if groups.len() < 2
         || groups.iter().any(|g| g.is_empty())
@@ -31594,7 +31634,14 @@ pub fn kruskal(groups: &[&[f64]]) -> TtestResult {
     // via `_rankdata(..., return_ties=True)` (`frankenscipy-921i0`). BYTE-IDENTICAL:
     // the old loop grouped `sorted_values[j] == sorted_values[i]`, the same `==` over
     // the same values in the same ascending order, summing the same `t` values.
-    let (ranks, tie_sum) = rankdata_ties_with_tie_sum(&all_values, RankTieMethod::Average);
+    let (ranks, tie_sum_from_pass) = rankdata_ties_with_tie_sum(&all_values, RankTieMethod::Average);
+    // The ORIG arm of the `frankenscipy-921i0` A/B: clone + second sort + regroup. Off by
+    // default; the toggle is read ONCE here, at the call boundary, never inside a loop.
+    let tie_sum = if KRUSKAL_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed) {
+        kruskal_tie_sum_by_resort(&all_values)
+    } else {
+        tie_sum_from_pass
+    };
 
     // Compute H statistic: H = (12/(N(N+1))) * Σ(R_i²/n_i) - 3(N+1)
     let mut offset = 0;
@@ -100814,6 +100861,119 @@ mod tests {
              sharing TOGGLE_LOCK"
         );
     }
+
+    /// `frankenscipy-921i0` GATE, byte-identity half. The lever removed a clone + second
+    /// sort from `kruskal`; `KRUSKAL_FORCE_TIE_RESORT` restores it so both arms live in one
+    /// binary. This asserts the two arms agree BIT FOR BIT on the statistic and the p-value.
+    ///
+    /// TWO ARMS, both observed, per the two-arm probe rule (frankenscipy-yq1k8):
+    ///
+    ///   * MUST-HIT  — a fixture WITH ties, where the correction divisor `C < 1` and the
+    ///     resort therefore has something to find. Asserted by comparing against the
+    ///     UNCORRECTED statistic recomputed here, so a fixture that silently lost its ties
+    ///     cannot pass.
+    ///   * MUST-MISS — a fixture with NO ties, where `Σ(t³−t) = 0` and the correction is
+    ///     vacuous. On its own this arm would pass against ANY implementation of the tie
+    ///     sum, including one that returned a constant, which is exactly why it is not the
+    ///     only fixture here.
+    #[test]
+    fn kruskal_tie_bit_identical_across_the_resort_toggle() {
+        let _g = toggle_guard();
+
+        // WITH ties: values drawn from a small alphabet, so tie groups are large and
+        // straddle group boundaries.
+        let tied_a: Vec<f64> = (0..60).map(|i| ((i * 7) % 5) as f64).collect();
+        let tied_b: Vec<f64> = (0..60).map(|i| ((i * 11) % 5) as f64).collect();
+        let tied_c: Vec<f64> = (0..60).map(|i| ((i * 13) % 5) as f64 + 1.0).collect();
+
+        // NO ties: strictly increasing, disjoint across groups.
+        let free_a: Vec<f64> = (0..60).map(|i| i as f64 * 0.5).collect();
+        let free_b: Vec<f64> = (0..60).map(|i| 100.0 + i as f64 * 0.5).collect();
+        let free_c: Vec<f64> = (0..60).map(|i| 200.0 + i as f64 * 0.5).collect();
+
+        let tied: Vec<&[f64]> = vec![&tied_a, &tied_b, &tied_c];
+        let free: Vec<&[f64]> = vec![&free_a, &free_b, &free_c];
+
+        let run = |g: &[&[f64]], resort: bool| {
+            KRUSKAL_FORCE_TIE_RESORT.store(resort, std::sync::atomic::Ordering::Relaxed);
+            let r = kruskal(g);
+            KRUSKAL_FORCE_TIE_RESORT.store(false, std::sync::atomic::Ordering::Relaxed);
+            r
+        };
+
+        // H before any tie correction, recomputed here so the controls below do not
+        // depend on the code under test for their own reference point.
+        let uncorrected = |groups: &[&[f64]]| -> f64 {
+            let all: Vec<f64> = groups.iter().flat_map(|g| g.iter().copied()).collect();
+            let nf = all.len() as f64;
+            let ranks = rankdata_average(&all);
+            let mut offset = 0usize;
+            let mut h_sum = 0.0;
+            for g in groups {
+                let rank_sum: f64 = ranks[offset..offset + g.len()].iter().sum();
+                h_sum += rank_sum * rank_sum / g.len() as f64;
+                offset += g.len();
+            }
+            12.0 / (nf * (nf + 1.0)) * h_sum - 3.0 * (nf + 1.0)
+        };
+
+        let tied_orig = run(&tied, true);
+        let tied_new = run(&tied, false);
+        let free_orig = run(&free, true);
+        let free_new = run(&free, false);
+
+        // MUST-HIT control: the tied fixture has to actually exercise the correction.
+        let tied_uncorrected = uncorrected(&tied);
+        assert_ne!(
+            tied_new.statistic.to_bits(),
+            tied_uncorrected.to_bits(),
+            "the tied fixture produced no tie correction (H == H_uncorrected == \
+             {tied_uncorrected}), so both arms would agree without the resort ever \
+             computing anything"
+        );
+
+        assert_eq!(
+            tied_orig.statistic.to_bits(),
+            tied_new.statistic.to_bits(),
+            "kruskal H differs across KRUSKAL_FORCE_TIE_RESORT on the TIED fixture: \
+             resort {} vs ranking-pass {}",
+            tied_orig.statistic,
+            tied_new.statistic
+        );
+        assert_eq!(
+            tied_orig.pvalue.to_bits(),
+            tied_new.pvalue.to_bits(),
+            "kruskal p differs across KRUSKAL_FORCE_TIE_RESORT on the TIED fixture: \
+             resort {} vs ranking-pass {}",
+            tied_orig.pvalue,
+            tied_new.pvalue
+        );
+
+        // MUST-MISS arm: no ties, correction vacuous, arms must still agree.
+        assert_eq!(
+            free_orig.statistic.to_bits(),
+            free_new.statistic.to_bits(),
+            "kruskal H differs across the toggle on the UNTIED fixture"
+        );
+        assert_eq!(
+            free_orig.pvalue.to_bits(),
+            free_new.pvalue.to_bits(),
+            "kruskal p differs across the toggle on the UNTIED fixture"
+        );
+        assert_eq!(
+            free_new.statistic.to_bits(),
+            uncorrected(&free).to_bits(),
+            "the UNTIED fixture applied a non-trivial tie correction, so it is not the \
+             must-miss control it claims to be"
+        );
+
+        assert!(
+            !KRUSKAL_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed),
+            "a toggle was left flipped, which would leak into every later test \
+             sharing TOGGLE_LOCK"
+        );
+    }
+
 }
 
 /// frankenscipy-clttw — the tie predicate must be EXACT EQUALITY, not a tolerance.
