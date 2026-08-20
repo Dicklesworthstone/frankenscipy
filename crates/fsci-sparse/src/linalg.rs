@@ -11509,6 +11509,87 @@ mod tests {
     // validate_csgraph call that the dense implementation had dropped entirely
     // — the third of the three regressions 4lfu1 tracked.
     #[test]
+    /// frankenscipy-5f06d: the last A/B switch in this crate that nothing drove.
+    ///
+    /// `LAPLACIAN_FORCE_SERIAL` gates the row-parallel dense-Laplacian build, and its gate is
+    /// `cores <= 1 || LAPLACIAN_FORCE_SERIAL || n < 512`. Nothing exercised it, so a reversed
+    /// condition or a bad chunk split would have been invisible -- the parallel arm is skipped
+    /// entirely below n=512, and every other laplacian test in this file is far smaller.
+    ///
+    /// Reaching it needs two things at once: a graph with n >= 512, and
+    /// `LAPLACIAN_FORCE_DENSE_REFERENCE` on, since the serial toggle lives inside the dense
+    /// reference path rather than on the default route. Both are asserted rather than assumed,
+    /// because a fixture that quietly missed either would make this pass while testing nothing.
+    #[test]
+    fn laplacian_force_serial_toggle_is_bit_identical_to_the_parallel_build() {
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // 23^2 = 529 nodes, comfortably past the n >= 512 gate. A 2-D grid rather than a ring
+        // so rows have differing degrees and the normalized scaling actually varies per row.
+        let k = 23usize;
+        let n = k * k;
+        assert!(
+            n >= 512,
+            "fixture below the parallel gate ({n} < 512); the parallel arm would never run \
+             and this test would pass vacuously"
+        );
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        let idx = |r: usize, c: usize| r * k + c;
+        for r in 0..k {
+            for c in 0..k {
+                for (dr, dc) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+                    let (nr, nc) = (r as i64 + dr, c as i64 + dc);
+                    if nr >= 0 && nr < k as i64 && nc >= 0 && nc < k as i64 {
+                        rows.push(idx(r, c));
+                        cols.push(idx(nr as usize, nc as usize));
+                        data.push(1.0);
+                    }
+                }
+            }
+        }
+        let graph = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+
+        for normed in [false, true] {
+            let run = |serial: bool| -> (Vec<f64>, Vec<usize>, Vec<usize>) {
+                LAPLACIAN_FORCE_DENSE_REFERENCE.store(true, std::sync::atomic::Ordering::Relaxed);
+                LAPLACIAN_FORCE_SERIAL.store(serial, std::sync::atomic::Ordering::Relaxed);
+                let l = laplacian(&graph, normed).expect("laplacian");
+                LAPLACIAN_FORCE_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
+                LAPLACIAN_FORCE_DENSE_REFERENCE
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                (l.data().to_vec(), l.indices().to_vec(), l.indptr().to_vec())
+            };
+
+            let (serial_data, serial_indices, serial_indptr) = run(true);
+            let (par_data, par_indices, par_indptr) = run(false);
+
+            // MUST-HIT on the detector: an empty or all-zero result would make the bit
+            // comparison below vacuous, so establish the fixture produced real output first.
+            assert!(
+                serial_data.iter().any(|v| *v != 0.0),
+                "laplacian produced no nonzero entries; the comparison would be vacuous"
+            );
+
+            assert_eq!(serial_indptr, par_indptr, "indptr differs (normed={normed})");
+            assert_eq!(serial_indices, par_indices, "indices differ (normed={normed})");
+            for (i, (a, b)) in serial_data.iter().zip(&par_data).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "LAPLACIAN_FORCE_SERIAL is documented BIT-IDENTICAL and is not: \
+                     entry {i} differs (normed={normed}, {a} vs {b})"
+                );
+            }
+        }
+    }
+
     fn laplacian_handles_empty_and_isolated_graphs() {
         let empty =
             CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
