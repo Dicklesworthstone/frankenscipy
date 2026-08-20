@@ -289,6 +289,25 @@ def census(crate: str) -> int:
     )
     bin_code = strip_comments("".join(Path(p).read_text() for p in driver_files))
 
+    # A bare name-appearance is too weak: a toggle merely IMPORTED into a test
+    # module (`use super::{FOO, BAR};`) would count as driven while nothing ever
+    # writes it. Strip import lines first, so "appears" means "appears in code".
+    #
+    # Deliberately NOT tightened all the way to `FOO.store(`, which is the obvious
+    # next step and is WRONG: fsci-stats drives nine distance/histogram levers
+    # through a table of `SumLever { flag: &FOO, .. }` records and stores via
+    # `flag.store(..)` on the reference. That is a better pattern than per-toggle
+    # boilerplate, and a `.store(`-only rule reports all nine as undriven. Both
+    # errors were measured on fsci-stats before this rule was chosen: name-only
+    # over-counts by 0 there but can in principle, `.store(`-only under-counts by 9.
+    def uses_stripped(text: str) -> str:
+        return "\n".join(
+            line for line in text.split("\n") if not line.lstrip().startswith("use ")
+        )
+
+    test_code = uses_stripped(test_code)
+    bin_code = uses_stripped(bin_code)
+
     names = sorted(names_all)
     in_test = [n for n in names if n in test_code]
     in_bin = [n for n in names if n not in test_code and n in bin_code]

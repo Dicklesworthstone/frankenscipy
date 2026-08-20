@@ -23581,6 +23581,102 @@ mod tests {
     /// to agree. An asymmetric fixture is therefore the stronger choice: it would expose a
     /// transposed index in either implementation, which a symmetric one would silently hide.
     #[test]
+    /// frankenscipy-5f06d: DRIVES the toggle, which the kernel test above does not.
+    ///
+    /// `parallel_gather_dsymv_is_bit_identical_to_the_double_read_scatter` calls the two
+    /// matvec kernels DIRECTLY. That proves the kernels agree and says nothing about the
+    /// dispatch that chooses between them, so `EIGH_DSYMV_PARALLEL_GATHER` was the last
+    /// undriven A/B switch in this crate: a reversed gate, a mis-ordered `else if`, or a
+    /// wrong `nthreads` argument would leave that test green while the toggle did nothing
+    /// or the wrong thing.
+    ///
+    /// This exercises the real dispatch in
+    /// `apply_symmetric_householder_trailing_rank2_lower_storage` and compares BOTH of its
+    /// outputs -- the matvec result `p` and the rank-2-updated matrix -- bit for bit.
+    ///
+    /// Sized just past the gate rather than generously: `active` must reach
+    /// `EIGH_DSYMV_PARALLEL_MIN_ACTIVE` (512) or the parallel arm is never selected and the
+    /// test passes vacuously, which is asserted below rather than assumed. Driving the
+    /// function directly instead of a full `eigh` keeps this O(n^2); an `eigh` large enough
+    /// to clear the same gate would be O(n^3) in a debug suite that frankenscipy-jn3vu
+    /// already reports as costing about an hour.
+    #[test]
+    fn eigh_dsymv_parallel_gather_toggle_dispatches_bit_identically() {
+        let _g = eigh_toggle_lock();
+
+        let n = 520usize;
+        let start = 0usize;
+        let active = n - start;
+        assert!(
+            active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE,
+            "fixture below the parallel gate ({active} < {EIGH_DSYMV_PARALLEL_MIN_ACTIVE}); \
+             the gathered arm would never be selected and this test would pass vacuously"
+        );
+
+        // Asymmetric filler so a transposed read cannot coincide with the correct one.
+        let entries: Vec<f64> = (0..n * n)
+            .map(|i| {
+                let x = ((i as u64).wrapping_mul(6_364_136_223_846_793_005) >> 11) as f64;
+                x / (u64::MAX >> 11) as f64 - 0.5
+            })
+            .collect();
+        let base = DMatrix::from_row_slice(n, n, &entries);
+
+        // Exact zeros in the reflector: both arms skip `v_col == 0.0`, and a skip that is
+        // equivalent to adding only holds while the matrix entry is finite, so the zeros
+        // belong in the fixture rather than being tidied out of it.
+        let reflector = HouseholderReflector {
+            start,
+            values: (0..active)
+                .map(|i| if i % 37 == 0 { 0.0 } else { (i as f64 * 0.013).sin() })
+                .collect(),
+            tau: 0.7,
+        };
+
+        let run = |gather: bool| -> (Vec<f64>, Vec<f64>) {
+            EIGH_DSYMV_PARALLEL_GATHER.store(gather, Ordering::Relaxed);
+            let mut matrix = base.clone();
+            let mut p = vec![0.0; active];
+            let mut w = vec![0.0; active];
+            apply_symmetric_householder_trailing_rank2_lower_storage(
+                &mut matrix,
+                &reflector,
+                &mut p,
+                &mut w,
+            );
+            (p, matrix.as_slice().to_vec())
+        };
+
+        let (p_serial, matrix_serial) = run(false);
+        let (p_gather, matrix_gather) = run(true);
+        EIGH_DSYMV_PARALLEL_GATHER.store(false, Ordering::Relaxed);
+
+        // MUST-HIT on the detector: a comparison that cannot see a difference would pass
+        // this vacuously, so confirm the fixture actually produced non-trivial output
+        // before trusting the agreement.
+        assert!(
+            p_serial.iter().any(|v| *v != 0.0),
+            "matvec produced an all-zero p; the comparison below would be vacuous"
+        );
+
+        for (index, (a, b)) in p_serial.iter().zip(&p_gather).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "EIGH_DSYMV_PARALLEL_GATHER is documented BIT-IDENTICAL and is not: \
+                 p differs at {index} ({a} vs {b})"
+            );
+        }
+        for (index, (a, b)) in matrix_serial.iter().zip(&matrix_gather).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "EIGH_DSYMV_PARALLEL_GATHER changed the rank-2 update at {index} \
+                 ({a} vs {b})"
+            );
+        }
+    }
+
     fn parallel_gather_dsymv_is_bit_identical_to_the_double_read_scatter() {
         let n = 640usize;
         let start = 7usize;
