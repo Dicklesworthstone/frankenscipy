@@ -233,7 +233,11 @@ mod tests {
         let counter = AtomicUsize::new(0);
         with_panel_pool(4, |pool| {
             let tasks: Vec<Task<'_>> = (0..64)
-                .map(|_| Box::new(|| { counter.fetch_add(1, Ordering::Relaxed); }) as Task<'_>)
+                .map(|_| {
+                    Box::new(|| {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }) as Task<'_>
+                })
                 .collect();
             pool.run_batch(tasks);
         });
@@ -279,7 +283,9 @@ mod tests {
                     .map(|_| {
                         Box::new(|| {
                             let id = format!("{:?}", std::thread::current().id());
-                            seen.lock().unwrap_or_else(PoisonError::into_inner).insert(id);
+                            seen.lock()
+                                .unwrap_or_else(PoisonError::into_inner)
+                                .insert(id);
                         }) as Task<'_>
                     })
                     .collect();
@@ -307,7 +313,11 @@ mod tests {
         let counter = AtomicUsize::new(0);
         with_panel_pool(1, |pool| {
             let tasks: Vec<Task<'_>> = (0..16)
-                .map(|_| Box::new(|| { counter.fetch_add(1, Ordering::Relaxed); }) as Task<'_>)
+                .map(|_| {
+                    Box::new(|| {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }) as Task<'_>
+                })
                 .collect();
             pool.run_batch(tasks);
         });

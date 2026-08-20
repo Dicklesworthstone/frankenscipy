@@ -214,7 +214,11 @@ fn eig2x2(a: f64, b: f64, c: f64, d: f64) -> (Eigenvalue, Eigenvalue) {
         // Both roots via the numerically stable form: compute the larger by
         // magnitude first, then the other from the determinant, so a small root is
         // not formed by subtracting two nearly equal numbers.
-        let big = if tr >= 0.0 { 0.5 * tr + r } else { 0.5 * tr - r };
+        let big = if tr >= 0.0 {
+            0.5 * tr + r
+        } else {
+            0.5 * tr - r
+        };
         let small = if big == 0.0 { 0.0 } else { det / big };
         (
             Eigenvalue { re: big, im: 0.0 },
@@ -684,7 +688,11 @@ mod tests {
             for j in 0..n {
                 let r = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000) as f64
                     / 1000.0;
-                a[i][j] = if i == j { (n as f64) * 2.0 + r } else { r - 0.5 };
+                a[i][j] = if i == j {
+                    (n as f64) * 2.0 + r
+                } else {
+                    r - 0.5
+                };
             }
         }
         a
@@ -762,12 +770,18 @@ mod tests {
         assert!((one[0].re - 3.5).abs() < 1e-12 && one[0].im == 0.0);
 
         // Real pair.
-        let real = eigenvalues_francis(&[vec![2.0, 1.0], vec![1.0, 2.0]], f64::EPSILON, budget())
-            .unwrap();
+        let real =
+            eigenvalues_francis(&[vec![2.0, 1.0], vec![1.0, 2.0]], f64::EPSILON, budget()).unwrap();
         let mut re: Vec<f64> = real.iter().map(|e| e.re).collect();
         re.sort_by(f64::total_cmp);
-        assert!((re[0] - 1.0).abs() < 1e-12 && (re[1] - 3.0).abs() < 1e-12, "{re:?}");
-        assert!(real.iter().all(|e| e.im == 0.0), "real pair got an imaginary part");
+        assert!(
+            (re[0] - 1.0).abs() < 1e-12 && (re[1] - 3.0).abs() < 1e-12,
+            "{re:?}"
+        );
+        assert!(
+            real.iter().all(|e| e.im == 0.0),
+            "real pair got an imaginary part"
+        );
 
         // Conjugate pair: [[0,1],[-1,0]] has eigenvalues +/- i, so this is the
         // must-hit arm for the complex branch of the 2x2 extraction.
