@@ -5359,6 +5359,10 @@ fn cholesky_lower_blocked_with_kernels_scratch<
     let mut k = 0;
     while k < n {
         let kb = (k + nb_block).min(n);
+        // Start of the PANEL FACTOR phase counted by `CHOL_PANEL_NANOS` (frankenscipy-gykw5).
+        // 6b7cdc35e added the `fetch_add` below but not this binding and landed unbuilt, so
+        // `fsci-linalg` — and every crate depending on it — has not compiled since.
+        let panel_t0 = std::time::Instant::now();
         if panel_inner == 0 {
             // Unblocked in-panel factorization: per column, a diagonal dot + one
             // dot per sub-panel row. `simd_dot` of two row slices `L[·][k..j]`
