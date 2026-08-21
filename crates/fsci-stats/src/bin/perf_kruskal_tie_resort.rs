@@ -86,9 +86,16 @@ fn self_elf_sha256() -> (String, String) {
 }
 
 fn med(v: &[f64]) -> f64 {
+    pct(v, 0.5)
+}
+
+/// Nearest-rank percentile. Used instead of the min/max of the null, which is not a statistic
+/// -- it is an outlier detector, and one descheduled sample makes it swallow any effect.
+fn pct(v: &[f64], q: f64) -> f64 {
     let mut s = v.to_vec();
     s.sort_by(f64::total_cmp);
-    s[s.len() / 2]
+    let i = ((q * (s.len() - 1) as f64).round() as usize).min(s.len() - 1);
+    s[i]
 }
 
 /// Three groups over `n` observations, values from a small alphabet so tie groups are real.
@@ -172,12 +179,19 @@ fn main() {
             (tie_sum / (nf * nf * nf - nf), groups)
         };
 
+        // INNER REPETITION. A single `kruskal` call at these sizes is 0.2-140ms, short enough
+        // that one descheduling event dominates the sample. Averaging `inner` consecutive
+        // calls per sample damps that without averaging across the ABBA structure, which is
+        // what carries the drift cancellation. Chosen so each sample is >= ~20ms of work.
+        let inner = (20.0 / (n as f64 * 5e-5)).ceil().max(1.0) as usize;
         let time_one = |resort: bool| -> f64 {
             KRUSKAL_FORCE_TIE_RESORT.store(resort, Ordering::Relaxed);
             let t = Instant::now();
-            let r = black_box(kruskal(black_box(&groups)));
-            let dt = t.elapsed().as_secs_f64() * 1e3;
-            black_box(r);
+            for _ in 0..inner {
+                let r = black_box(kruskal(black_box(&groups)));
+                black_box(r);
+            }
+            let dt = t.elapsed().as_secs_f64() * 1e3 / inner as f64;
             KRUSKAL_FORCE_TIE_RESORT.store(false, Ordering::Relaxed);
             dt
         };
@@ -206,17 +220,23 @@ fn main() {
         let load_after = loadavg();
         let mhz_after = mhz();
 
+        // DECISION AT THE REPLICATE LEVEL. Both `cand` and `null` are 21 paired replicates of
+        // the same shape, so the question is whether their DISTRIBUTIONS separate, not whether
+        // one median clears the other's extremes. Require the candidate's 10th percentile to
+        // clear the null's 90th (or vice versa) -- a gap that one outlier on either side
+        // cannot manufacture and one outlier cannot erase.
         let cand_med = med(&cand);
         let null_med = med(&null);
-        let null_lo = null.iter().copied().fold(f64::MAX, f64::min);
-        let null_hi = null.iter().copied().fold(f64::MIN, f64::max);
-        let decided = cand_med > null_hi || cand_med < null_lo;
+        let (cand_lo, cand_hi) = (pct(&cand, 0.10), pct(&cand, 0.90));
+        let (null_lo, null_hi) = (pct(&null, 0.10), pct(&null, 0.90));
+        let decided = cand_lo > null_hi || cand_hi < null_lo;
         let share = 1.0 - 1.0 / cand_med;
         trend.push((n, share));
 
         println!(
             "n={n} {} resort {:.3}ms pass {:.3}ms | CAND(resort/pass) median {cand_med:.4}x \
-             | share {:.2}% | NULL(A/A) median {null_med:.4} range [{null_lo:.4},{null_hi:.4}] \
+             | share {:.2}% | CAND p10-p90 [{cand_lo:.4},{cand_hi:.4}] \
+             | NULL(A/A) median {null_med:.4} p10-p90 [{null_lo:.4},{null_hi:.4}] inner={inner} \
              | bitmism={bitmism} H={} p={} tie_mass={tie_frac:.3e} tie_groups={tie_groups} \
              ranking_path={}",
             if decided { "DECIDED " } else { "IN-FLOOR" },

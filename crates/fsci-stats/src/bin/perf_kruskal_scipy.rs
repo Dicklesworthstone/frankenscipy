@@ -21,6 +21,13 @@ fn med(v: &[f64]) -> f64 {
     s[s.len() / 2]
 }
 
+/// Consecutive calls averaged into ONE sample, so a single descheduling event cannot dominate.
+/// Both arms use the same rule, computed from the same expression, or the ratio would be
+/// comparing a damped measurement against an undamped one.
+fn inner_reps(n: usize) -> usize {
+    (20.0 / (n as f64 * 5e-5)).ceil().max(1.0) as usize
+}
+
 fn loadavg() -> String {
     std::fs::read_to_string("/proc/loadavg")
         .ok()
@@ -93,6 +100,8 @@ const PY: &str = r#"
 import sys, time, numpy as np
 from scipy.stats import kruskal
 n = int(sys.argv[1]); reps = int(sys.argv[2])
+import math
+inner = max(1, math.ceil(20.0 / (n * 5e-5)))   # same rule as the Rust arm
 modulus = max(n // 4, 2)
 i = np.arange(n, dtype=np.uint64)
 v = ((i * np.uint64(7919)) % np.uint64(modulus)).astype(np.float64)
@@ -101,8 +110,9 @@ kruskal(*groups)                      # warm
 ts = []
 for _ in range(reps):
     t = time.perf_counter()
-    r = kruskal(*groups)
-    ts.append((time.perf_counter() - t) * 1e3)
+    for _ in range(inner):
+        r = kruskal(*groups)
+    ts.append((time.perf_counter() - t) * 1e3 / inner)
 ts.sort()
 print("%.6f %.17g %.17g" % (ts[len(ts)//2], r.statistic, r.pvalue))
 "#;
@@ -138,13 +148,16 @@ fn main() {
         let mhz_a = mhz_mean();
         let py1 = run_python(&python, n, reps);
 
+        let inner = inner_reps(n);
         let _ = black_box(kruskal(&groups));
         let mut fsci_ms = Vec::with_capacity(reps);
         let mut r = kruskal(&groups);
         for _ in 0..reps {
             let t = Instant::now();
-            r = black_box(kruskal(black_box(&groups)));
-            fsci_ms.push(t.elapsed().as_secs_f64() * 1e3);
+            for _ in 0..inner {
+                r = black_box(kruskal(black_box(&groups)));
+            }
+            fsci_ms.push(t.elapsed().as_secs_f64() * 1e3 / inner as f64);
         }
         let fsci_med = med(&fsci_ms);
         let mhz_f = mhz_mean();
@@ -177,7 +190,8 @@ fn main() {
         let agree = h_gap < 1e-12 && p_gap < 1e-9;
 
         println!(
-            "n={n} fsci {fsci_med:.3}ms scipy {scipy_med:.3}ms | RATIO(scipy/fsci) {:.3}x \
+            "n={n} fsci {fsci_med:.3}ms scipy {scipy_med:.3}ms inner={inner} \
+             | RATIO(scipy/fsci) {:.3}x \
              | scipy A/A null {scipy_null:.4} | agree={agree} H fsci={} scipy={} \
              (relgap {h_gap:.3e}) p fsci={} scipy={} (relgap {p_gap:.3e})",
             scipy_med / fsci_med,
