@@ -1,0 +1,78 @@
+### frankenscipy-921i0 CERTIFICATION RUN
+date=2026-08-20T13:04:55-04:00 host=thinkstation1 governor=powersave
+uptime_before:  13:04:55 up 5 days,  4:23,  3 users,  load average: 18.22, 29.97, 40.71
+df_before: /dev/mapper/ubuntu--vg-ubuntu--lv  1.9T  1.7T  137G  93% /
+iowait_before: us=19 sy=3 id=78 wa=0
+build_slot: REFUSED server-side (acquire_build_slot: 'Build slots are disabled') -- frankenscipy-fr78g
+scipy: 1.17.1 2.4.3
+
+== ARM A/B (self, both arms one binary, ABBA + A/A null) ==
+# harness=perf_kruskal_tie_resort bead=frankenscipy-921i0
+# elf_sha256=6713128d73bd58da550288d588fabae0937af5c4308768a74093881977a9b541 elf_path=/data/projects/frankenscipy/target-m921i0/release/perf_kruskal_tie_resort
+# host=thinkstation1 threads_observed=64 reps=21
+n=8000 IN-FLOOR resort 0.265ms pass 0.192ms | CAND(resort/pass) median 1.3771x | share 27.39% | NULL(A/A) median 1.0105 range [0.9529,1.9005] | bitmism=0 H=0.01455784711973019 p=0.9927475036448207 tie_mass=2.344e-7 tie_groups=2000 ranking_path=comparison
+    load before=18.22/29.97/40.71 after=18.22/29.97/40.71 | MHz before min/mean/max 1914/3340/4167 after 1429/3286/4091
+n=20000 IN-FLOOR resort 0.762ms pass 0.491ms | CAND(resort/pass) median 1.4503x | share 31.05% | NULL(A/A) median 1.0312 range [0.2785,15.9844] | bitmism=0 H=0.08808747435250107 p=0.9569121039244297 tie_mass=3.750e-8 tie_groups=5000 ranking_path=radix
+    load before=18.22/29.97/40.71 after=18.22/29.97/40.71 | MHz before min/mean/max 1429/3196/4089 after 1429/2745/4063
+n=200000 IN-FLOOR resort 9.501ms pass 6.491ms | CAND(resort/pass) median 1.4008x | share 28.61% | NULL(A/A) median 1.0029 range [0.6481,4.9979] | bitmism=0 H=0.0007848449752815257 p=0.9996076544999928 tie_mass=3.750e-10 tie_groups=50000 ranking_path=radix
+    load before=18.22/29.97/40.71 after=18.22/29.97/40.71 | MHz before min/mean/max 1429/2540/4091 after 1429/2731/4265
+n=2000000 IN-FLOOR resort 142.294ms pass 109.693ms | CAND(resort/pass) median 1.3268x | share 24.63% | NULL(A/A) median 0.8696 range [0.6323,1.4910] | bitmism=0 H=0.0019838195294216163 p=0.999008582015166 tie_mass=3.750e-12 tie_groups=500000 ranking_path=radix
+    load before=18.22/29.97/40.71 after=18.17/29.38/40.35 | MHz before min/mean/max 1429/2731/4168 after 1429/2816/4010
+# GATE(a) SHARE trend FLAT-OR-FALLING : n=8000:27.39% n=20000:31.05% n=200000:28.61% n=2000000:24.63%
+
+uptime_mid:  13:05:09 up 5 days,  4:23,  3 users,  load average: 18.17, 29.38, 40.35
+
+== LIVE HEAD-TO-HEAD vs scipy.stats.kruskal (same invocation) ==
+# harness=perf_kruskal_scipy bead=frankenscipy-921i0 incumbent=scipy.stats.kruskal
+# elf_sha256=5346b4a876702076682107b364a63c0210cbea530bafb8760b7e9cb986d8f6ab elf_path=/data/projects/frankenscipy/target-m921i0/release/perf_kruskal_scipy
+# threads_observed=64 require_scipy=true
+n=8000 fsci 0.186ms scipy 0.747ms | RATIO(scipy/fsci) 4.009x | scipy A/A null 0.9370 | agree=true H fsci=0.01455784711973019 scipy=0.01455784711973019 (relgap 0.000e0) p fsci=0.9927475036448207 scipy=0.9927475036448207 (relgap 0.000e0)
+    load scipy1=18.17/29.38/40.35 fsci=18.17/29.38/40.35 scipy2=18.17/29.38/40.35 | MHz mean scipy1=2926 fsci=3540
+n=20000 fsci 0.608ms scipy 1.031ms | RATIO(scipy/fsci) 1.697x | scipy A/A null 1.0205 | agree=true H fsci=0.08808747435250107 scipy=0.08808747435250107 (relgap 0.000e0) p fsci=0.9569121039244297 scipy=0.9569121039244297 (relgap 0.000e0)
+    load scipy1=18.17/29.38/40.35 fsci=18.17/29.38/40.35 scipy2=18.17/29.38/40.35 | MHz mean scipy1=3433 fsci=3361
+n=200000 fsci 7.258ms scipy 22.214ms | RATIO(scipy/fsci) 3.060x | scipy A/A null 0.9381 | agree=true H fsci=0.0007848449752815257 scipy=0.0007848449752815257 (relgap 0.000e0) p fsci=0.9996076544999928 scipy=0.9996076544999928 (relgap 0.000e0)
+    load scipy1=18.17/29.38/40.35 fsci=18.16/29.19/40.23 scipy2=18.16/29.19/40.23 | MHz mean scipy1=3429 fsci=2837
+n=2000000 fsci 110.175ms scipy 267.603ms | RATIO(scipy/fsci) 2.429x | scipy A/A null 0.8805 | agree=true H fsci=0.0019838195294216163 scipy=0.0019838195294216163 (relgap 0.000e0) p fsci=0.999008582015166 scipy=0.999008582015166 (relgap 0.000e0)
+    load scipy1=18.16/29.19/40.23 fsci=18.15/29.01/40.11 scipy2=17.97/28.79/39.98 | MHz mean scipy1=3393 fsci=2444
+scipy_arm_exit=0
+
+uptime_after:  13:05:28 up 5 days,  4:24,  3 users,  load average: 17.97, 28.79, 39.98
+iowait_after: us=19 sy=6 id=74 wa=1
+df_after: /dev/mapper/ubuntu--vg-ubuntu--lv  1.9T  1.7T  137G  93% /
+
+### RE-RUN with replicate-level decision rule (inner repetition + p10/p90 separation)
+date=2026-08-20T13:06:47-04:00
+uptime_before:  13:06:47 up 5 days,  4:25,  3 users,  load average: 20.54, 26.96, 38.40
+iowait_before: us=16 sy=4 id=78 wa=1
+# harness=perf_kruskal_tie_resort bead=frankenscipy-921i0
+# elf_sha256=f57d95205452e5e551fed8b8c680569872893e11e5953061cc9339f9260dbea5 elf_path=/data/projects/frankenscipy/target-m921i0/release/perf_kruskal_tie_resort
+# host=thinkstation1 threads_observed=64 reps=21
+n=8000 IN-FLOOR resort 0.275ms pass 0.197ms | CAND(resort/pass) median 1.3455x | share 25.68% | CAND p10-p90 [0.6564,2.3885] | NULL(A/A) median 0.9978 p10-p90 [0.8262,2.5053] inner=50 | bitmism=0 H=0.01455784711973019 p=0.9927475036448207 tie_mass=2.344e-7 tie_groups=2000 ranking_path=comparison
+    load before=20.54/26.96/38.40 after=20.25/26.79/38.29 | MHz before min/mean/max 1429/2920/4118 after 1429/3183/4131
+n=20000 DECIDED  resort 0.711ms pass 0.473ms | CAND(resort/pass) median 1.4588x | share 31.45% | CAND p10-p90 [1.4219,2.1869] | NULL(A/A) median 1.0008 p10-p90 [0.8853,1.2435] inner=20 | bitmism=0 H=0.08808747435250107 p=0.9569121039244297 tie_mass=3.750e-8 tie_groups=5000 ranking_path=radix
+    load before=20.25/26.79/38.29 after=20.25/26.79/38.29 | MHz before min/mean/max 1429/3029/4043 after 1429/2573/4122
+n=200000 DECIDED  resort 8.245ms pass 5.638ms | CAND(resort/pass) median 1.4729x | share 32.11% | CAND p10-p90 [1.4186,1.5044] | NULL(A/A) median 1.0073 p10-p90 [0.9865,1.0434] inner=2 | bitmism=0 H=0.0007848449752815257 p=0.9996076544999928 tie_mass=3.750e-10 tie_groups=50000 ranking_path=radix
+    load before=20.25/26.79/38.29 after=20.25/26.79/38.29 | MHz before min/mean/max 1429/2483/4118 after 1429/2599/4186
+n=2000000 DECIDED  resort 104.864ms pass 74.086ms | CAND(resort/pass) median 1.4254x | share 29.84% | CAND p10-p90 [1.3180,1.4499] | NULL(A/A) median 0.9988 p10-p90 [0.9872,1.0489] inner=1 | bitmism=0 H=0.0019838195294216163 p=0.999008582015166 tie_mass=3.750e-12 tie_groups=500000 ranking_path=radix
+    load before=20.25/26.79/38.29 after=19.97/26.52/38.07 | MHz before min/mean/max 1429/2326/4129 after 1429/2880/4093
+# GATE(a) SHARE trend FLAT-OR-FALLING : n=8000:25.68% n=20000:31.45% n=200000:32.11% n=2000000:29.84%
+uptime_after:  13:07:00 up 5 days,  4:25,  3 users,  load average: 19.97, 26.52, 38.07
+iowait_after: us=15 sy=2 id=82 wa=1
+
+### RE-RUN head-to-head with MATCHED inner repetition in both arms
+date=2026-08-20T13:07:44-04:00
+uptime_before:  13:07:44 up 5 days,  4:26,  3 users,  load average: 18.64, 25.26, 37.10
+# harness=perf_kruskal_scipy bead=frankenscipy-921i0 incumbent=scipy.stats.kruskal
+# elf_sha256=c601011759823ac1b26cf98cb07f980677f662914ee8b90f3dd322047d39ed02 elf_path=/data/projects/frankenscipy/target-m921i0/release/perf_kruskal_scipy
+# threads_observed=64 require_scipy=true
+n=8000 fsci 0.220ms scipy 0.760ms inner=50 | RATIO(scipy/fsci) 3.460x | scipy A/A null 0.9904 | agree=true H fsci=0.01455784711973019 scipy=0.01455784711973019 (relgap 0.000e0) p fsci=0.9927475036448207 scipy=0.9927475036448207 (relgap 0.000e0)
+    load scipy1=18.64/25.26/37.10 fsci=18.64/25.26/37.10 scipy2=18.64/25.26/37.10 | MHz mean scipy1=2887 fsci=2676
+n=20000 fsci 0.623ms scipy 1.169ms inner=20 | RATIO(scipy/fsci) 1.875x | scipy A/A null 0.9428 | agree=true H fsci=0.08808747435250107 scipy=0.08808747435250107 (relgap 0.000e0) p fsci=0.9569121039244297 scipy=0.9569121039244297 (relgap 0.000e0)
+    load scipy1=18.64/25.26/37.10 fsci=18.83/25.19/37.01 scipy2=18.83/25.19/37.01 | MHz mean scipy1=3319 fsci=3217
+n=200000 fsci 6.740ms scipy 24.461ms inner=2 | RATIO(scipy/fsci) 3.629x | scipy A/A null 1.0017 | agree=true H fsci=0.0007848449752815257 scipy=0.0007848449752815257 (relgap 0.000e0) p fsci=0.9996076544999928 scipy=0.9996076544999928 (relgap 0.000e0)
+    load scipy1=18.83/25.19/37.01 fsci=18.83/25.19/37.01 scipy2=18.60/25.03/36.90 | MHz mean scipy1=3502 fsci=3087
+n=2000000 fsci 131.566ms scipy 320.771ms inner=1 | RATIO(scipy/fsci) 2.438x | scipy A/A null 0.9198 | agree=true H fsci=0.0019838195294216163 scipy=0.0019838195294216163 (relgap 0.000e0) p fsci=0.999008582015166 scipy=0.999008582015166 (relgap 0.000e0)
+    load scipy1=18.60/25.03/36.90 fsci=18.63/24.93/36.80 scipy2=18.01/24.59/36.56 | MHz mean scipy1=3315 fsci=3096
+scipy_arm_exit=0
+uptime_after:  13:08:10 up 5 days,  4:26,  3 users,  load average: 18.01, 24.59, 36.56
+iowait_after: us=20 sy=5 id=75 wa=1
