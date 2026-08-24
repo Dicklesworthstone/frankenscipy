@@ -5959,6 +5959,16 @@ fn arnoldi_breakdown_floor(w_norm_before_orthogonalization: f64) -> f64 {
     f64::EPSILON * 100.0 * w_norm_before_orthogonalization
 }
 
+/// Apply one modified-Gram-Schmidt projection without re-indexing the jagged
+/// basis or coefficient inside the element loop.
+#[inline]
+fn subtract_scaled_basis_vector(destination: &mut [f64], scale: f64, basis: &[f64]) {
+    debug_assert_eq!(destination.len(), basis.len());
+    for (value, &basis_value) in destination.iter_mut().zip(basis) {
+        *value -= scale * basis_value;
+    }
+}
+
 fn gmres_inner(
     a: &CsrMatrix,
     b: &[f64],
@@ -6009,10 +6019,10 @@ fn gmres_inner(
 
         // Modified Gram-Schmidt orthogonalization
         for i in 0..=j {
-            h[i][j] = dot_product(&wj, &v[i]);
-            for k in 0..n {
-                wj[k] -= h[i][j] * v[i][k];
-            }
+            let basis = v[i].as_slice();
+            let coefficient = dot_product(&wj, basis);
+            h[i][j] = coefficient;
+            subtract_scaled_basis_vector(&mut wj, coefficient, basis);
         }
 
         h[j + 1][j] = vec_norm(&wj);
@@ -19712,6 +19722,27 @@ mod tests {
         let result = gmres(&a, &b, None, IterativeSolveOptions::default()).expect("gmres works");
         assert!(result.converged);
         assert_close_slice(&result.solution, &b, 1e-10);
+    }
+
+    #[test]
+    fn gmres_mgs_axpy_matches_indexed_reference_bitwise() {
+        let basis = [0.125, -0.375, 0.625, -0.875, 1.125];
+        let coefficient = -0.4375;
+        let mut indexed = [0.75, -0.5, 0.25, -0.125, 1.5];
+        let mut hoisted = indexed;
+
+        for index in 0..indexed.len() {
+            indexed[index] -= coefficient * basis[index];
+        }
+        subtract_scaled_basis_vector(&mut hoisted, coefficient, &basis);
+
+        for (index, (expected, actual)) in indexed.iter().zip(&hoisted).enumerate() {
+            assert_eq!(
+                expected.to_bits(),
+                actual.to_bits(),
+                "MGS component {index} changed bits"
+            );
+        }
     }
 
     /// frankenscipy-4u7vp. Scaling `A` and `b` by the same factor leaves the
