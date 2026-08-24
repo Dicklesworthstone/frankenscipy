@@ -1264,15 +1264,15 @@ mod cubic_live {
         Dirichlet,
         Neumann,
         PeriodicCuboid,
-        // Never constructed, deliberately: `run_convection_splu` REFUSES,
-        // because the lazy-column control this family existed to exercise no
-        // longer has a production read path. The arms below (extents, matrix,
-        // expected components, labels) are kept rather than deleted so the
-        // fixture survives for whoever restores that path — they were
-        // established by measurement and re-deriving them is the expensive
-        // part. Reintroducing the toggle just to silence this is explicitly
-        // forbidden by frankenscipy-gkzq8.
-        #[allow(dead_code)]
+        // The lazy-column A/B control this family once exercised was deleted from
+        // production and is NOT coming back (frankenscipy-gkzq8 forbids reviving a
+        // toggle to satisfy a harness). What that removed is the A/B, not the
+        // fixture: this is the nonsymmetric side-64 factor-plus-16-solves cell
+        // carrying the campaign's worst standing vs-incumbent ratio, and comparing
+        // it against live SciPy never read the deleted toggle at all. So the arm
+        // runs, and `ab_control()` returns false for it — the "control" arm here is
+        // the SAME code as the candidate, which makes it a second A/A null and not
+        // a maintenance claim (frankenscipy-run7d).
         Convection,
     }
 
@@ -1379,12 +1379,27 @@ mod cubic_live {
             matches!(self, Self::Convection)
         }
 
+        /// Whether this family's "control" arm is a DIFFERENT code path from the candidate.
+        ///
+        /// For the three spectral families `set_disabled(true)` routes the control onto the
+        /// generic path, so control/candidate is a maintenance ratio. For `Convection`
+        /// `set_disabled` is a no-op — there is no spectral fast path and the lazy-column
+        /// toggle it once compared against was deleted — so the control arm re-runs the
+        /// candidate's own code. That ratio is a second A/A null, and reporting it as
+        /// maintenance would be a claim about an A/B that does not exist.
+        fn ab_control(self) -> bool {
+            !matches!(self, Self::Convection)
+        }
+
         fn decision_label(self) -> &'static str {
             match self {
                 Self::Dirichlet => "CUBIC_SPLU_DECISION",
                 Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
                 Self::PeriodicCuboid => "PERIODIC_CUBOID_SPLU_DECISION",
-                Self::Convection => "CONVECTION_SPLU_LAZY_COLUMNS_DECISION",
+                // NOT `..._LAZY_COLUMNS_DECISION`: that named an A/B control which no longer
+                // exists, and a label is what a reader greps for. This arm compares against
+                // the live incumbent and claims nothing about a toggle.
+                Self::Convection => "CONVECTION_SPLU_VS_INCUMBENT",
             }
         }
 
@@ -2507,10 +2522,28 @@ mod cubic_live {
         );
     }
 
+    /// Decision word for the labelled verdict line.
+    ///
+    /// Split out of the printing so the "this arm claims no A/B" path is testable without
+    /// capturing stdout: `KEEP`/`REVERT` is a claim about a candidate beating a DIFFERENT
+    /// control, and an arm whose control re-runs the candidate's own code must not print
+    /// either word. Both arms of that distinction are pinned by
+    /// `convection_reports_no_ab_decision_while_the_spectral_families_still_do`.
+    fn decision_word(keep: bool, ab_control: bool) -> &'static str {
+        if !ab_control {
+            "NO_AB_DECISION"
+        } else if keep {
+            "KEEP"
+        } else {
+            "REVERT"
+        }
+    }
+
     fn print_measurement_named(
         measurement: &Measurement,
         decision_label: &str,
         minimum_candidate_seconds: f64,
+        ab_control: bool,
     ) -> bool {
         let live_candidate = if measurement.candidate_live.is_empty() {
             &measurement.candidate
@@ -2620,14 +2653,29 @@ mod cubic_live {
         .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_LIMIT);
         let candidate_p50 = median(measurement.candidate.clone());
         let candidate_duration_pass = candidate_p50 >= minimum_candidate_seconds;
-        let maintenance_pass = control_low >= 1.20 && control_low > twice_null_threshold;
+        let maintenance_pass =
+            ab_control && control_low >= 1.20 && control_low > twice_null_threshold;
         let competitive_pass = live_low > twice_null_threshold;
-        println!(
-            "maintenance_ratio: control/candidate median={:.6} \
-             bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
-             registered_minimum=1.200000 twice_widest_null_threshold={twice_null_threshold:.6}",
-            median(control_ratios)
-        );
+        if ab_control {
+            println!(
+                "maintenance_ratio: control/candidate median={:.6} \
+                 bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
+                 registered_minimum=1.200000 \
+                 twice_widest_null_threshold={twice_null_threshold:.6}",
+                median(control_ratios)
+            );
+        } else {
+            // Same code in both arms, so this is a third A/A null rather than a maintenance
+            // ratio. Printed under a name that says so: calling it `maintenance_ratio` is how
+            // a 1.0 gets read as "the lever bought nothing" instead of "there is no lever".
+            println!(
+                "same_elf_replica_ratio: control/candidate median={:.6} \
+                 bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
+                 twice_widest_null_threshold={twice_null_threshold:.6} \
+                 maintenance_claim=none_this_arm_has_no_ab_control",
+                median(control_ratios)
+            );
+        }
         println!(
             "competitive_ratio: live_scipy/candidate median={:.6} \
              bootstrap_median_ci95=[{live_low:.6},{live_high:.6}] registered_minimum=1.000000",
@@ -2643,20 +2691,23 @@ mod cubic_live {
             minimum_candidate_seconds * 1.0e3,
         );
         let keep = null_medians_pass && candidate_duration_pass && maintenance_pass;
+        // The competitive claim is about the LIVE incumbent and does not depend on there
+        // being an A/B control, so an arm with no control can still pass or fail it — it
+        // just needs the nulls and the sample duration behind it, not a maintenance ratio.
+        let competitive_claim = competitive_pass
+            && null_medians_pass
+            && candidate_duration_pass
+            && (keep || !ab_control);
         println!(
             "{decision_label}={} competitive_claim={}",
-            if keep { "KEEP" } else { "REVERT" },
-            if keep && competitive_pass {
-                "PASS"
-            } else {
-                "FAIL"
-            }
+            decision_word(keep, ab_control),
+            if competitive_claim { "PASS" } else { "FAIL" }
         );
         keep
     }
 
     fn print_measurement(measurement: &Measurement) -> bool {
-        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION", 0.0)
+        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION", 0.0, true)
     }
 
     #[derive(Clone, Copy)]
@@ -3374,8 +3425,12 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep =
-            print_measurement_named(&measurement, "PERIODIC_CUBOID_SPSOLVE_DECISION", 0.005);
+        let _keep = print_measurement_named(
+            &measurement,
+            "PERIODIC_CUBOID_SPSOLVE_DECISION",
+            0.005,
+            true,
+        );
         Ok(())
     }
 
@@ -3392,11 +3447,7 @@ mod cubic_live {
     }
 
     pub fn run_convection_splu(arguments: &[String]) -> Result<(), String> {
-        let _ = arguments;
-        Err(
-            "convection SPLU live measurement is refused: its deleted lazy-column control no longer has a production read path"
-                .to_string(),
-        )
+        run_splu_family(arguments, SpluFamily::Convection)
     }
 
     fn run_splu_family(arguments: &[String], family: SpluFamily) -> Result<(), String> {
@@ -3659,7 +3710,12 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep = print_measurement_named(&measurement, family.decision_label(), 0.005);
+        let _keep = print_measurement_named(
+            &measurement,
+            family.decision_label(),
+            0.005,
+            family.ab_control(),
+        );
         Ok(())
     }
 
@@ -3712,11 +3768,65 @@ mod cubic_live {
             assert_eq!(drifted.second_null_left / drifted.second_null_right, 1.0);
         }
 
+        /// The narrowed successor to `convection_live_refuses_deleted_control`.
+        ///
+        /// That test pinned a BLANKET refusal of the convection arm, added because its
+        /// lazy-column A/B control had been deleted from production. The intent was right —
+        /// do not claim an A/B decision on a control that no longer exists — but the refusal
+        /// also blocked the plain vs-incumbent measurement, which never read that toggle.
+        /// This keeps the intent and drops the over-reach: the arm runs, and it is pinned
+        /// to claim no A/B.
+        ///
+        /// TWO ARMS, because a predicate that answered "no decision" for everything would
+        /// pass a one-armed version of this test: the spectral families must still claim one.
         #[test]
-        fn convection_live_refuses_deleted_control() {
-            let error = super::run_convection_splu(&[])
-                .expect_err("a deleted production control cannot support a live A/B");
-            assert!(error.contains("no longer has a production read path"));
+        fn convection_reports_no_ab_decision_while_the_spectral_families_still_do() {
+            use super::SpluFamily;
+
+            // MUST-MISS: no A/B control, so no KEEP/REVERT word at either truth value.
+            assert!(!SpluFamily::Convection.ab_control());
+            assert_eq!(super::decision_word(true, false), "NO_AB_DECISION");
+            assert_eq!(super::decision_word(false, false), "NO_AB_DECISION");
+
+            // MUST-HIT: the spectral families are unchanged and still decide.
+            for family in [
+                SpluFamily::Dirichlet,
+                SpluFamily::Neumann,
+                SpluFamily::PeriodicCuboid,
+            ] {
+                assert!(family.ab_control(), "{} must keep its A/B", family.name());
+            }
+            assert_eq!(super::decision_word(true, true), "KEEP");
+            assert_eq!(super::decision_word(false, true), "REVERT");
+        }
+
+        /// The other half of the deleted test's intent: the convection arm must not advertise
+        /// a spectral fast path it does not have, and its label must not name the deleted
+        /// control. A stale label is what a later reader greps for and believes.
+        #[test]
+        fn convection_claims_no_spectral_hits_and_no_deleted_control_label() {
+            use super::SpluFamily;
+
+            SpluFamily::Convection.reset_hits();
+            assert_eq!(SpluFamily::Convection.expected_hits(), (0, 0));
+            assert_eq!(SpluFamily::Convection.hits(), (0, 0));
+            // There is no toggle behind this family; flipping the switch must not invent one.
+            SpluFamily::Convection.set_disabled(true);
+            assert_eq!(SpluFamily::Convection.hits(), (0, 0));
+            SpluFamily::Convection.set_disabled(false);
+
+            let label = SpluFamily::Convection.decision_label();
+            assert_eq!(label, "CONVECTION_SPLU_VS_INCUMBENT");
+            assert!(
+                !label.contains("LAZY_COLUMNS"),
+                "the label must not name a control that was deleted: {label}"
+            );
+            // MUST-HIT arm for the same assertion: a family that DOES decide still says so.
+            assert!(
+                SpluFamily::Dirichlet
+                    .decision_label()
+                    .ends_with("_DECISION")
+            );
         }
 
         #[test]
