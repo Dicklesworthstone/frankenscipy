@@ -1,0 +1,80 @@
+### DEFAULT-PATH ATTRIBUTION for the convection cell — reachability proof + where the work is
+
+BlackThrush, 2026-08-24. Ordered as a dispatch-reachability proof before any further kernel
+lever, after my previous target turned out to be default-unreachable
+(tests/artifacts/perf/9nw95-merge-kernel-is-DEFAULT-UNREACHABLE.log).
+
+## COMMAND
+
+  valgrind --tool=callgrind --callgrind-out-file=<out> \
+      <target>/release-perf/perf_spsolve --convection-split 3
+  callgrind_annotate <out>
+
+perf_spsolve ELF 8a8ccadf7dfed7715795bcbb2058109205038b7af7268dd1eae3c3773d2493c0,
+host=thinkstation1, n=4096 nonsymmetric convection-diffusion, DEFAULT configuration
+(`SPLU_SUPERNODAL_ENABLE` false, i.e. the shipping path), factor plus sixteen solves.
+
+## REACHABILITY: PROVEN, and this time it is checked rather than assumed
+
+    apply_sorted_pivot_tail   144,317,656 Ir self (5.71% of program)
+                            + 16,722,332 Ir in its Vec code
+                            = 161,039,988 Ir
+
+It appears in the profile of a DEFAULT-configuration run with non-zero self cost, so it
+executes in the shipping build. That is the check the previous kernel failed:
+`apply_supernode_tails` sits behind `SPLU_SUPERNODAL_ENABLE`, default false, and never ran.
+
+## BUT THE PROFILE RE-AIMS THE TARGET
+
+`sha2::compress256` is 1,024,071,231 Ir (40.5% of the program) and is NOT workload — it is
+`sha256_of_self()` hashing the 18 MB ELF once for provenance. Excluding it leaves 1,504,928,769
+Ir of numeric work:
+
+    NativeSparseLu::solve       869,689,818 Ir    57.8% of numeric work
+    apply_sorted_pivot_tail     161,039,988 Ir    10.7%
+    factorize_csr                68,215,408 Ir     4.5%
+
+    solve / apply_sorted_pivot_tail = 5.4x
+
+The kernel I was sent to optimize is real and reachable, and it is one fifth the size of the
+function next to it.
+
+## AND HALF OF THE SOLVE IS NOT ARITHMETIC
+
+    solve self (linalg.rs)             436,160,886   50.2% of solve
+    slice/index.rs   (bounds checks)   193,259,904   22.2%
+    ptr/non_null.rs  (Vec deref)       140,474,401   16.2%
+    slice/iter/macros.rs                99,794,627   11.5%
+
+433,528,932 Ir — 49.8% of the solve — is slice indexing, `Vec` dereference and iterator
+machinery rather than multiply-subtract. That is the signature of the jagged
+`Vec<Vec<(usize, f64)>>` row layout for `l_rows`/`u_rows`, which `frankenscipy-run7d` named as
+its third item and which nobody has taken.
+
+Two components split differently and should not be conflated:
+
+  * `slice/index.rs` 193M is dominated by the `y[col]` GATHER — one bounds check per factor
+    nonzero per solve. In safe Rust that check is essentially irreducible: `col` comes from the
+    factor and the compiler cannot prove `col < n`. This crate is `#![forbid(unsafe_code)]`, so
+    `get_unchecked` is not available. Do not budget this as recoverable.
+  * `ptr/non_null.rs` 140M plus part of `slice/iter/macros.rs` 100M IS recoverable. Each
+    `self.l_rows[row]` / `self.u_rows[row]` dereferences an inner `Vec` — pointer, length and
+    capacity — once per row per solve. A flat CSR layout (one `Vec<u32>` of columns, one
+    `Vec<f64>` of values, one `Vec<usize>` of row starts) replaces that with a slice built from
+    two offsets, and makes the rows contiguous.
+
+So the honest ceiling for the layout rewrite on this cell is roughly the non-gather half:
+~16% of numeric work, not the 50% the raw "half the solve is overhead" line suggests. That
+matches the ~16%-of-job bound `run7d` already banked from a different measurement, arrived at
+independently.
+
+## WHAT THIS ESTABLISHES AND WHAT IT DOES NOT
+
+ESTABLISHES: `apply_sorted_pivot_tail` runs in the default build; the solve is 5.4x larger; and
+within the solve the addressable share is the Vec-deref/iterator half, not the gather.
+
+DOES NOT ESTABLISH: any wall-clock number, anything against the incumbent, or that the layout
+rewrite will realise its ceiling. Instruction counts are not time — the whole point of the
+layout change is locality, which Ir cannot see.
+
+NOT A LEVER, A SIGHTING. No code changed by this row.

@@ -1,0 +1,25 @@
+### frankenscipy-9nw95 PAIRED A/B: both merge kernels in ONE invocation
+2026-08-24T00:32:50-04:00
+host=thinkstation1 pin=taskset -c 1 rounds=81 governor=powersave
+loadavg_before=18.77 25.63 26.58 16/7914 219141
+candidate arm = HEAD kernel (17,297 Ir/call); control arm = LEGACY kernel (18,194 Ir/call)
+build_route=local-wrapper-bypass; build_slot REFUSED server-side (fr78g)
+elf=8a8ccadf7dfed7715795bcbb2058109205038b7af7268dd1eae3c3773d2493c0
+COUNTED EXPECTATION: legacy/head = 18194+12.010*w*span over 17297+12.000*w*span; at the job's real supernode widths that is ~1.02x, i.e. a 2% maintenance ratio against a registered 1.20x minimum -> REVERT is the expected verdict and is NOT a failure of the lever.
+elf_sha256=8a8ccadf7dfed7715795bcbb2058109205038b7af7268dd1eae3c3773d2493c0
+frankenscipy_engine_sha256=8a8ccadf7dfed7715795bcbb2058109205038b7af7268dd1eae3c3773d2493c0
+binary_provenance: source_commit=775d4a3e6969a90c039987c905b804da421208fc builder_identity=BlackThrush build_route=local-wrapper-bypass
+trj_booking_claim_message_id=BUILD_SLOTS_DISABLED-frankenscipy-fr78g
+linalg_source_sha256=ad75e2f2876d99bad3b11d753ebed2256062f3ece95b2471c517381d952c858e
+harness_source_sha256=c25df38501ae319e6378a75972859cf43a86f6a773d2b06f1b41fb0c8a2b6465
+perf_spsolve_source_marker=perf-spsolve-freshness-a
+thread_provenance: cpu_affinity=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 requested_scipy_threads=1
+balanced_square_provenance: schedule=ABBAABBA host_quiescence_required=false null_gate=per_arm_first_half_over_second_half null_median_limit=0.020
+fixture: grid_side=64 boundary=Dirichlet convection_diffusion=true diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 rhs_count_per_factor=16 rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=1 materialized_components=65536 rounds=81
+whole_job_boundary: INCLUDED=1_public_splu_calls,16_public_splu_solve_calls,65536_materialized_outputs,folded_all_output_bits; EXCLUDED=matrix_rhs_construction,csc_transport,python_startup,scipy_import,warmup,parity,provenance,bootstrap
+shared_matrix_rhs_sha256=d9981ff830cad23af482b55ddcad2078bc544938814a317ca4d04280e7649c05
+live_verified_fixture_sha256=b9d4cf87697388cbc7818c20322adab874b93a6d692e283fd0f1898b658eaf72
+merge_ab_dispatch_observed=false
+CONVECTION_SPLU_LIVE_FATAL the merge-kernel A/B toggle was never consulted: the two arms are the same code and no ratio from them is reportable
+exit=1
+loadavg_after=18.77 25.63 26.58 12/7906 219339

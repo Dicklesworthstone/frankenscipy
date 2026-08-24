@@ -52,6 +52,11 @@ pub enum BoundaryMode {
 }
 
 const DEFAULT_GAUSSIAN_TRUNCATE: f64 = 4.0;
+// A 64-element f64 span is one 512-byte cache tile.  The 3-D separable y pass
+// revisits adjacent source rows, so retaining this span in L1 avoids streaming a
+// complete x row for every output y row.  It is deliberately only used where
+// there are outer slabs; the outermost z pass keeps its full contiguous span.
+const CONVOLVE1D_CACHE_BLOCK: usize = 64;
 
 fn gaussian_kernel_radius(sigma: f64) -> usize {
     (DEFAULT_GAUSSIAN_TRUNCATE * sigma + 0.5) as usize
@@ -2904,36 +2909,77 @@ fn convolve1d_along_axis(
             // For every output line, hoist the boundary lookup out of the contiguous inner
             // span. Each output still accumulates the same k=0..len tap sequence as the
             // scalar N-D convolution, but the inner loop is now a vector-friendly axpy.
-            for a in axis_start as i64..axis_end as i64 {
-                let output_base = (a as usize - axis_start) * inner;
-                for (k, &w) in weights.iter().enumerate() {
-                    let source = a + (klen - 1 - k as i64) - offset + origin;
-                    let output = &mut os[output_base..output_base + inner];
-                    if let Some(source) = boundary_index_1d(source, mid as i64, mode) {
-                        let input_base = source as usize * inner;
-                        for (slot, &value) in output
-                            .iter_mut()
-                            .zip(&is[input_base..input_base + inner])
-                        {
-                            *slot += w * value;
-                        }
-                    } else {
-                        for slot in output {
-                            *slot += w * cval;
+            // On the 3-D middle (y) pass, walk x in cache tiles so consecutive y outputs
+            // reuse their overlapping source-row spans from L1.  The z pass has outer=1
+            // and deliberately retains its complete contiguous plane span.
+            let block = if outer > 1 && inner >= CONVOLVE1D_CACHE_BLOCK {
+                CONVOLVE1D_CACHE_BLOCK
+            } else {
+                inner
+            };
+            for inner_start in (0..inner).step_by(block) {
+                let inner_end = (inner_start + block).min(inner);
+                for a in axis_start as i64..axis_end as i64 {
+                    let output_base = (a as usize - axis_start) * inner + inner_start;
+                    for (k, &w) in weights.iter().enumerate() {
+                        let source = a + (klen - 1 - k as i64) - offset + origin;
+                        let output = &mut os[output_base..output_base + (inner_end - inner_start)];
+                        if let Some(source) = boundary_index_1d(source, mid as i64, mode) {
+                            let input_base = source as usize * inner + inner_start;
+                            for (slot, &value) in output
+                                .iter_mut()
+                                .zip(&is[input_base..input_base + (inner_end - inner_start)])
+                            {
+                                *slot += w * value;
+                            }
+                        } else {
+                            for slot in output {
+                                *slot += w * cval;
+                            }
                         }
                     }
                 }
             }
         } else {
-            for a in axis_start as i64..axis_end as i64 {
+            // The innermost (x) pass is contiguous.  Keep its boundary pixels on the
+            // original boundary mapper, and accumulate each interior x tile one tap at a
+            // time.  That preserves k=0..len arithmetic for every output while turning the
+            // hot span into cache-friendly contiguous axpy streams.
+            let scalar = |a: usize, os: &mut [f64]| {
                 let mut sum = 0.0;
                 for (k, &w) in weights.iter().enumerate() {
-                    let source = a + (klen - 1 - k as i64) - offset + origin;
+                    let source = a as i64 + (klen - 1 - k as i64) - offset + origin;
                     let value = boundary_index_1d(source, mid as i64, mode)
                         .map_or(cval, |source| is[source as usize]);
                     sum += w * value;
                 }
-                os[a as usize - axis_start] = sum;
+                os[a - axis_start] = sum;
+            };
+            let min_shift = -offset + origin;
+            let max_shift = klen - 1 - offset + origin;
+            let interior_lo = (-min_shift).max(0) as usize;
+            let interior_hi = ((mid as i64) - max_shift).clamp(0, mid as i64) as usize;
+            let interior_start = axis_start.max(interior_lo).min(axis_end);
+            let interior_end = axis_end.min(interior_hi).max(interior_start);
+            for a in axis_start..interior_start {
+                scalar(a, os);
+            }
+            for tile_start in (interior_start..interior_end).step_by(CONVOLVE1D_CACHE_BLOCK) {
+                let tile_end = (tile_start + CONVOLVE1D_CACHE_BLOCK).min(interior_end);
+                let output = &mut os[tile_start - axis_start..tile_end - axis_start];
+                for (k, &w) in weights.iter().enumerate() {
+                    let shift = (klen - 1 - k as i64) - offset + origin;
+                    let input_start = (tile_start as i64 + shift) as usize;
+                    for (slot, &value) in output
+                        .iter_mut()
+                        .zip(&is[input_start..input_start + (tile_end - tile_start)])
+                    {
+                        *slot += w * value;
+                    }
+                }
+            }
+            for a in interior_end..axis_end {
+                scalar(a, os);
             }
         }
     };
@@ -2945,7 +2991,11 @@ fn convolve1d_along_axis(
     let nthreads = if par_work < (1 << 20) {
         1
     } else {
-        let parallel_spans = if outer == 1 && inner > 1 { mid } else { outer.max(1) };
+        let parallel_spans = if outer == 1 && inner > 1 {
+            mid
+        } else {
+            outer.max(1)
+        };
         ndimage_filter_thread_count(arr.size(), weights.len()).min(parallel_spans)
     };
     if nthreads <= 1 || outer < 2 {
@@ -3200,6 +3250,151 @@ pub fn gaussian_filter1d_default_axis(
 /// Median filter.
 ///
 /// Matches `scipy.ndimage.median_filter`.
+fn median_filter1d_sliding_histogram(
+    input: &NdArray,
+    size: usize,
+    origin: i64,
+    mode: BoundaryMode,
+    cval: f64,
+) -> NdArray {
+    // Coordinate-compress the exact total order used by `select_total_rank`.  This is a
+    // histogram over values rather than a lossy numeric binning scheme, so NaN payloads and
+    // signed zeros retain the same SciPy-visible ordering as the generic rank path.
+    let mut values = input.data.clone();
+    values.push(cval);
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|left, right| left.total_cmp(right).is_eq());
+
+    let mut tree = vec![0isize; values.len() + 1];
+    let adjust = |tree: &mut [isize], index: usize, delta: isize| {
+        let mut node = index + 1;
+        while node < tree.len() {
+            tree[node] += delta;
+            node += node.isolate_lowest_one();
+        }
+    };
+    let index_of =
+        |value: f64| values.partition_point(|candidate| candidate.total_cmp(&value).is_lt());
+    let select = |tree: &[isize], mut rank: isize| {
+        let mut bit = 1usize;
+        while bit < values.len() {
+            bit <<= 1;
+        }
+        let mut node = 0usize;
+        while bit != 0 {
+            let candidate = node + bit;
+            if candidate < tree.len() && tree[candidate] <= rank {
+                rank -= tree[candidate];
+                node = candidate;
+            }
+            bit >>= 1;
+        }
+        node
+    };
+
+    let len = input.shape[0] as i64;
+    let size_i = size as i64;
+    let lo = size_i / 2 + origin;
+    let value_at = |coord: i64| {
+        boundary_index_1d(coord, len, mode).map_or(cval, |index| input.data[index as usize])
+    };
+    for coord in -lo..size_i - lo {
+        adjust(&mut tree, index_of(value_at(coord)), 1);
+    }
+
+    let mut output = NdArray::zeros(input.shape.clone());
+    let rank = (size / 2) as isize;
+    for position in 0..len {
+        output.data[position as usize] = values[select(&tree, rank)];
+        if position + 1 < len {
+            adjust(&mut tree, index_of(value_at(position - lo)), -1);
+            adjust(&mut tree, index_of(value_at(position - lo + size_i)), 1);
+        }
+    }
+    output
+}
+
+fn median_filter2d_sliding_histogram(
+    input: &NdArray,
+    size: usize,
+    origins: [i64; 2],
+    mode: BoundaryMode,
+    cval: f64,
+) -> NdArray {
+    // Preserve the generic rank path's full `total_cmp` ordering by compressing exact
+    // observed values, rather than placing values into numeric bins.
+    let mut values = input.data.clone();
+    values.push(cval);
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|left, right| left.total_cmp(right).is_eq());
+
+    let mut tree = vec![0isize; values.len() + 1];
+    let adjust = |tree: &mut [isize], index: usize, delta: isize| {
+        let mut node = index + 1;
+        while node < tree.len() {
+            tree[node] += delta;
+            node += node.isolate_lowest_one();
+        }
+    };
+    let index_of =
+        |value: f64| values.partition_point(|candidate| candidate.total_cmp(&value).is_lt());
+    let select = |tree: &[isize], mut rank: isize| {
+        let mut bit = 1usize;
+        while bit < values.len() {
+            bit <<= 1;
+        }
+        let mut node = 0usize;
+        while bit != 0 {
+            let candidate = node + bit;
+            if candidate < tree.len() && tree[candidate] <= rank {
+                rank -= tree[candidate];
+                node = candidate;
+            }
+            bit >>= 1;
+        }
+        node
+    };
+
+    let height = input.shape[0] as i64;
+    let width = input.shape[1] as i64;
+    let size_i = size as i64;
+    let lo_row = size_i / 2 + origins[0];
+    let lo_col = size_i / 2 + origins[1];
+    let value_at = |row: i64, col: i64| match (
+        boundary_index_1d(row, height, mode),
+        boundary_index_1d(col, width, mode),
+    ) {
+        (Some(row), Some(col)) => input.data[(row * width + col) as usize],
+        _ => cval,
+    };
+
+    let mut output = NdArray::zeros(input.shape.clone());
+    let rank = (size * size / 2) as isize;
+    for row in 0..height {
+        tree.fill(0);
+        for source_row in row - lo_row..row - lo_row + size_i {
+            for source_col in -lo_col..size_i - lo_col {
+                adjust(&mut tree, index_of(value_at(source_row, source_col)), 1);
+            }
+        }
+
+        for col in 0..width {
+            output.data[(row * width + col) as usize] = values[select(&tree, rank)];
+            if col + 1 < width {
+                for source_row in row - lo_row..row - lo_row + size_i {
+                    adjust(&mut tree, index_of(value_at(source_row, col - lo_col)), -1);
+                    adjust(
+                        &mut tree,
+                        index_of(value_at(source_row, col - lo_col + size_i)),
+                        1,
+                    );
+                }
+            }
+        }
+    }
+    output
+}
+
 pub fn median_filter(
     input: &NdArray,
     size: usize,
@@ -3250,11 +3445,27 @@ pub fn median_filter_with_origins(
     }
 
     let ndim = input.ndim();
-    let mut output = NdArray::zeros(input.shape.clone());
     let offsets: Vec<i64> = vec![size as i64 / 2; ndim];
     let kernel_shape: Vec<usize> = vec![size; ndim];
     let kernel_total: usize = kernel_shape.iter().product();
     let origins = normalize_filter_origins(ndim, &kernel_shape, origins)?;
+
+    if ndim == 1 {
+        return Ok(median_filter1d_sliding_histogram(
+            input, size, origins[0], mode, cval,
+        ));
+    }
+    if ndim == 2 {
+        return Ok(median_filter2d_sliding_histogram(
+            input,
+            size,
+            [origins[0], origins[1]],
+            mode,
+            cval,
+        ));
+    }
+
+    let mut output = NdArray::zeros(input.shape.clone());
 
     // Generate all offsets in kernel
     let kernel_strides = compute_strides(&kernel_shape);
@@ -3670,7 +3881,7 @@ fn uniform_filter_along_axis(
     // lines along `axis` slides a running sum (drop leaving, add entering element).
     // out[0] is summed left-to-right (byte-identical to the per-window kernel); later
     // positions accumulate incrementally (tolerance-parity). Writes stay inside `os`.
-    let do_slab = |is: &[f64], os: &mut [f64]| {
+    let do_slab = |is: &[f64], os: &mut [f64], sum_vec: &mut Vec<f64>| {
         let val_at = |i: usize, a: i64| -> f64 {
             match boundary_index_1d(a, mid as i64, mode) {
                 Some(m) => is[i + (m as usize) * inner],
@@ -3701,7 +3912,8 @@ fn uniform_filter_along_axis(
         let row = |r: i64| -> Option<usize> {
             boundary_index_1d(r, mid as i64, mode).map(|m| (m as usize) * inner)
         };
-        let mut sum_vec = vec![0.0f64; inner];
+        sum_vec.clear();
+        sum_vec.resize(inner, 0.0);
         for k in 0..size_i {
             match row(k - lo) {
                 Some(b) => {
@@ -3717,7 +3929,7 @@ fn uniform_filter_along_axis(
                 }
             }
         }
-        for (slot, &s) in os[..inner].iter_mut().zip(&sum_vec) {
+        for (slot, &s) in os[..inner].iter_mut().zip(sum_vec.iter()) {
             *slot = s / size_f;
         }
         for a in 1..mid as i64 {
@@ -3776,8 +3988,9 @@ fn uniform_filter_along_axis(
         ndimage_filter_thread_count(arr.size(), size).min(outer.max(1))
     };
     if nthreads <= 1 || outer < 2 {
+        let mut sum_vec = Vec::with_capacity(inner);
         for (is, os) in arr.data.chunks(slab).zip(out.data.chunks_mut(slab)) {
-            do_slab(is, os);
+            do_slab(is, os, &mut sum_vec);
         }
     } else {
         let slabs_per = outer.div_ceil(nthreads);
@@ -3789,8 +4002,9 @@ fn uniform_filter_along_axis(
                 .zip(out.data.chunks_mut(slab * slabs_per))
             {
                 scope.spawn(move || {
+                    let mut sum_vec = Vec::with_capacity(inner);
                     for (is, os) in in_chunk.chunks(slab).zip(out_chunk.chunks_mut(slab)) {
-                        do_slab(is, os);
+                        do_slab(is, os, &mut sum_vec);
                     }
                 });
             }
@@ -6585,6 +6799,62 @@ pub fn binary_dilation_with_origins(
         iterations,
         binary_dilation_once_with_origins,
     )
+}
+
+/// Binary erosion with an arbitrary structuring element.
+///
+/// The structuring element is centered in each dimension and elements equal to
+/// zero are ignored. Out-of-bounds input is treated as background. This is the
+/// default `scipy.ndimage.binary_erosion` behavior for an explicit
+/// `structure` and `border_value=0`.
+pub fn binary_erosion_with_structure(
+    input: &NdArray,
+    structure: &NdArray,
+    iterations: usize,
+) -> Result<NdArray, NdimageError> {
+    let mut current = input.clone();
+    if iterations == 0 {
+        loop {
+            let output = binary_erosion_with_struct(&current, structure)?;
+            if output.data == current.data {
+                return Ok(output);
+            }
+            current = output;
+        }
+    }
+
+    for _ in 0..iterations {
+        current = binary_erosion_with_struct(&current, structure)?;
+    }
+    Ok(current)
+}
+
+/// Binary dilation with an arbitrary structuring element.
+///
+/// The structuring element is centered in each dimension and elements equal to
+/// zero are ignored. Out-of-bounds output locations are discarded. This is the
+/// default `scipy.ndimage.binary_dilation` behavior for an explicit
+/// `structure` and `border_value=0`.
+pub fn binary_dilation_with_structure(
+    input: &NdArray,
+    structure: &NdArray,
+    iterations: usize,
+) -> Result<NdArray, NdimageError> {
+    let mut current = input.clone();
+    if iterations == 0 {
+        loop {
+            let output = binary_dilation_with_structure_once(&current, structure)?;
+            if output.data == current.data {
+                return Ok(output);
+            }
+            current = output;
+        }
+    }
+
+    for _ in 0..iterations {
+        current = binary_dilation_with_structure_once(&current, structure)?;
+    }
+    Ok(current)
 }
 
 /// Binary propagation: repeatedly dilate the input until convergence,
@@ -11593,43 +11863,83 @@ fn binary_erosion_with_struct(
             "input and structure must have same dimensions".to_string(),
         ));
     }
+    if structure.shape.contains(&0) {
+        return Err(NdimageError::InvalidArgument(
+            "structure dimensions must be positive".to_string(),
+        ));
+    }
 
-    let _ndim = input.ndim();
     let mut output = NdArray::zeros(input.shape.clone());
-    let offsets: Vec<i64> = structure.shape.iter().map(|&s| s as i64 / 2).collect();
+    let centers: Vec<i64> = structure
+        .shape
+        .iter()
+        .map(|&dim| (dim / 2) as i64)
+        .collect();
 
-    // Collect structure element positions
+    // Collect active structure offsets once. The optimized arm below retains
+    // the exact source and structure traversal order of the original generic
+    // implementation; it only replaces temporary coordinate vectors with a
+    // row-major odometer and direct flat input indexing.
     let mut struct_positions = Vec::new();
     for flat in 0..structure.size() {
         if structure.data[flat] != 0.0 {
             let idx = structure.unravel(flat);
             let delta: Vec<i64> = idx
                 .iter()
-                .zip(offsets.iter())
-                .map(|(&i, &o)| i as i64 - o)
+                .zip(&centers)
+                .map(|(&coord, &center)| coord as i64 - center)
                 .collect();
             struct_positions.push(delta);
         }
     }
 
+    let full_mode = NDIMAGE_UNRAVEL_ODOMETER_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+    let ndim = input.ndim();
+    let mut idx = vec![0usize; ndim];
     for flat_out in 0..input.size() {
-        let out_idx = input.unravel(flat_out);
         let mut all_set = true;
-
-        for delta in &struct_positions {
-            let in_idx: Vec<i64> = out_idx
-                .iter()
-                .zip(delta.iter())
-                .map(|(&o, &d)| o as i64 + d)
-                .collect();
-            let val = input.get_boundary(&in_idx, BoundaryMode::Constant, 0.0);
-            if val == 0.0 {
-                all_set = false;
-                break;
+        if full_mode {
+            let out_idx = input.unravel(flat_out);
+            for delta in &struct_positions {
+                let in_idx: Vec<i64> = out_idx
+                    .iter()
+                    .zip(delta)
+                    .map(|(&coord, &offset)| coord as i64 + offset)
+                    .collect();
+                if input.get_boundary(&in_idx, BoundaryMode::Constant, 0.0) == 0.0 {
+                    all_set = false;
+                    break;
+                }
+            }
+        } else {
+            for delta in &struct_positions {
+                let mut in_bounds = true;
+                let mut input_flat = 0usize;
+                for axis in 0..ndim {
+                    let coord = idx[axis] as i64 + delta[axis];
+                    if coord < 0 || coord >= input.shape[axis] as i64 {
+                        in_bounds = false;
+                        break;
+                    }
+                    input_flat += coord as usize * input.strides[axis];
+                }
+                if !in_bounds || input.data[input_flat] == 0.0 {
+                    all_set = false;
+                    break;
+                }
             }
         }
-
         output.data[flat_out] = if all_set { 1.0 } else { 0.0 };
+
+        if !full_mode {
+            for axis in (0..ndim).rev() {
+                idx[axis] += 1;
+                if idx[axis] < input.shape[axis] {
+                    break;
+                }
+                idx[axis] = 0;
+            }
+        }
     }
 
     Ok(output)
@@ -14754,9 +15064,10 @@ mod tests {
     #[test]
     fn convolve1d_line_walk_is_byte_identical_to_nd_convolve() {
         // convolve1d_along_axis must equal the N-D convolve on a 1-D-embedded kernel,
-        // bit-for-bit (the gaussian reroute relies on this). The 3-D shape exercises
-        // both the vector-friendly inner spans and the scalar innermost span.
-        let shape = vec![13usize, 11, 17];
+        // bit-for-bit (the gaussian reroute relies on this). The 3-D shape makes the
+        // z pass parallelizable and crosses the 64-element cache blocks in both y/x
+        // passes, while still exercising the scalar innermost boundary path.
+        let shape = vec![7usize, 71, 73];
         let data: Vec<f64> = (0..shape.iter().product())
             .map(|i| ((i * 40503usize) % 911) as f64 / 90.0 - 5.0)
             .collect();
@@ -14822,11 +15133,11 @@ mod tests {
     fn uniform_running_sum_matches_perwindow_reference() {
         // The O(n) running-sum path must match the per-window reference to rounding
         // across sizes, axes, and boundary modes (running sum is tolerance-parity).
-        let (rows, cols) = (37usize, 41usize);
-        let data: Vec<f64> = (0..rows * cols)
+        let shape = vec![11usize, 13, 17];
+        let data: Vec<f64> = (0..shape.iter().product())
             .map(|i| ((i * 2654435761usize) % 1000) as f64 / 1000.0 - 0.5)
             .collect();
-        let arr = NdArray::new(data, vec![rows, cols]).unwrap();
+        let arr = NdArray::new(data, shape).unwrap();
         for mode in [
             BoundaryMode::Nearest,
             BoundaryMode::Reflect,
@@ -14835,7 +15146,7 @@ mod tests {
             BoundaryMode::Mirror,
         ] {
             for size in [2usize, 3, 7, 12, 20] {
-                for axis in [0usize, 1usize] {
+                for axis in 0..arr.ndim() {
                     let got = uniform_filter1d(&arr, size, axis, mode, 0.3).unwrap();
                     let want =
                         uniform_filter1d_perwindow_ref(&arr, size, axis, mode, 0.3, 0).unwrap();
@@ -14850,6 +15161,47 @@ mod tests {
                         "mode={mode:?} size={size} axis={axis}: max|dx|={max_dx:.2e}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn uniform_running_sum_is_bit_identical_to_perwindow_on_dyadic_fixture() {
+        // The general floating-point oracle above is tolerance-parity because a rolling
+        // add/subtract sum need not round like a fresh sum.  This integer / power-of-two
+        // fixture makes every intermediate sum and division exact, so it is a strict
+        // bit-level guard for the public all-axis uniform_filter route and every boundary
+        // mapper, independently of the running-sum implementation.
+        let shape = vec![7usize, 71, 73];
+        let data = (0..shape.iter().product())
+            .map(|i| ((i * 17) % 19) as f64 - 9.0)
+            .collect();
+        let arr = NdArray::new(data, shape).unwrap();
+        for mode in [
+            BoundaryMode::Nearest,
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Wrap,
+            BoundaryMode::Mirror,
+        ] {
+            for size in [2usize, 4, 8] {
+                let got = uniform_filter(&arr, size, mode, -5.0).unwrap();
+                let mut want = arr.clone();
+                for axis in 0..arr.ndim() {
+                    want =
+                        uniform_filter1d_perwindow_ref(&want, size, axis, mode, -5.0, 0).unwrap();
+                }
+                assert_eq!(
+                    got.data
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    want.data
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "mode={mode:?} size={size}"
+                );
             }
         }
     }
@@ -16496,6 +16848,122 @@ mod tests {
         let shifted =
             median_filter_with_origins(&input, 2, &[-1], BoundaryMode::Constant, 0.0).unwrap();
         assert_eq!(shifted.data, vec![2., 3., 4., 5., 5.]);
+    }
+
+    #[test]
+    fn median_filter_1d_sliding_histogram_matches_full_rank_bits() {
+        let input = NdArray::new(
+            vec![
+                -0.0,
+                4.0,
+                f64::from_bits(0x7ff8_0000_0000_0007),
+                -3.0,
+                4.0,
+                0.0,
+                9.0,
+            ],
+            vec![7],
+        )
+        .unwrap();
+        let cval = f64::from_bits(0x7ff8_0000_0000_0011);
+        for mode in [
+            BoundaryMode::Nearest,
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Wrap,
+            BoundaryMode::Mirror,
+        ] {
+            for size in [2usize, 3, 6] {
+                let origin_lo = -(size as i64 / 2);
+                let origin_hi = (size as i64 - 1) / 2;
+                for origin in [origin_lo, 0, origin_hi] {
+                    let got =
+                        median_filter_with_origins(&input, size, &[origin], mode, cval).unwrap();
+                    let want = rank_filter_index_with_origins(
+                        &input,
+                        size,
+                        &[origin],
+                        mode,
+                        cval,
+                        size / 2,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        got.data
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        want.data
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        "mode={mode:?} size={size} origin={origin}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn median_filter_2d_sliding_histogram_matches_full_rank_bits() {
+        let input = NdArray::new(
+            vec![
+                -0.0,
+                4.0,
+                f64::from_bits(0x7ff8_0000_0000_0007),
+                -3.0,
+                7.0,
+                4.0,
+                0.0,
+                9.0,
+                -2.0,
+                6.0,
+                1.0,
+                5.0,
+            ],
+            vec![3, 4],
+        )
+        .unwrap();
+        let cval = f64::from_bits(0x7ff8_0000_0000_0011);
+        for mode in [
+            BoundaryMode::Nearest,
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Wrap,
+            BoundaryMode::Mirror,
+        ] {
+            for size in [2usize, 3] {
+                let origin_lo = -(size as i64 / 2);
+                let origin_hi = (size as i64 - 1) / 2;
+                for row_origin in [origin_lo, 0, origin_hi] {
+                    for col_origin in [origin_lo, 0, origin_hi] {
+                        let origins = [row_origin, col_origin];
+                        let got =
+                            median_filter_with_origins(&input, size, &origins, mode, cval).unwrap();
+                        let want = rank_filter_index_with_origins(
+                            &input,
+                            size,
+                            &origins,
+                            mode,
+                            cval,
+                            size * size / 2,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            got.data
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            want.data
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            "mode={mode:?} size={size} origins={origins:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -21029,6 +21497,60 @@ mod tests {
     }
 
     #[test]
+    fn binary_morphology_arbitrary_structure_matches_scipy_oracle() {
+        // scipy.ndimage.binary_{erosion,dilation} with the explicit asymmetric
+        // 3x5 footprint below and border_value=0. Keep separate erosion and
+        // dilation fixtures so each expected output has nontrivial interior and
+        // boundary cells.
+        #[rustfmt::skip]
+        let structure = NdArray::new(vec![
+            1.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 1.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 0.0, 1.0,
+        ], vec![3, 5]).unwrap();
+
+        let mut erosion_data = vec![1.0; 6 * 7];
+        erosion_data[2 * 7 + 3] = 0.0;
+        erosion_data[4 * 7 + 1] = 0.0;
+        let erosion_input = NdArray::new(erosion_data, vec![6, 7]).unwrap();
+        #[rustfmt::skip]
+        let expected_erosion = vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        assert_eq!(
+            binary_erosion_with_structure(&erosion_input, &structure, 1)
+                .unwrap()
+                .data,
+            expected_erosion
+        );
+
+        let mut dilation_data = vec![0.0; 6 * 7];
+        dilation_data[2 * 7 + 3] = 1.0;
+        dilation_data[4 * 7 + 1] = 1.0;
+        let dilation_input = NdArray::new(dilation_data, vec![6, 7]).unwrap();
+        #[rustfmt::skip]
+        let expected_dilation = vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+            0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+            1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+        ];
+        assert_eq!(
+            binary_dilation_with_structure(&dilation_input, &structure, 1)
+                .unwrap()
+                .data,
+            expected_dilation
+        );
+    }
+
+    #[test]
     fn sobel_matches_scipy_reference_values() {
         // scipy.ndimage.sobel([[1,2,3],[4,5,6],[7,8,9]], axis=0, mode='reflect')
         let input = NdArray::new(
@@ -22258,6 +22780,51 @@ mod tests {
                         a.to_bits(),
                         b.to_bits(),
                         "binary_dilation {shape:?} iters={iters}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_erosion_arbitrary_structure_odometer_matches_full_bitexact() {
+        use std::sync::atomic::Ordering;
+        // The optimized arm must preserve the original generic coordinate
+        // vectors and get_boundary semantics for arbitrary footprints, including
+        // even dimensions and empty footprint positions.
+        let cases: &[(Vec<usize>, Vec<usize>)] = &[
+            (vec![25], vec![4]),
+            (vec![11, 13], vec![3, 4]),
+            (vec![5, 6, 4], vec![3, 2, 3]),
+        ];
+        for (shape, structure_shape) in cases {
+            let total: usize = shape.iter().product();
+            let input = NdArray::new(
+                (0..total)
+                    .map(|flat| ((flat * 7 + 3) % 5 != 0) as u8 as f64)
+                    .collect(),
+                shape.clone(),
+            )
+            .unwrap();
+            let structure_total: usize = structure_shape.iter().product();
+            let structure = NdArray::new(
+                (0..structure_total)
+                    .map(|flat| ((flat * 5 + 1) % 4 != 0) as u8 as f64)
+                    .collect(),
+                structure_shape.clone(),
+            )
+            .unwrap();
+            for iterations in [1usize, 2] {
+                NDIMAGE_UNRAVEL_ODOMETER_DISABLE.store(true, Ordering::Relaxed);
+                let full = binary_erosion_with_structure(&input, &structure, iterations).unwrap();
+                NDIMAGE_UNRAVEL_ODOMETER_DISABLE.store(false, Ordering::Relaxed);
+                let optimized =
+                    binary_erosion_with_structure(&input, &structure, iterations).unwrap();
+                for (full_value, optimized_value) in full.data.iter().zip(&optimized.data) {
+                    assert_eq!(
+                        full_value.to_bits(),
+                        optimized_value.to_bits(),
+                        "shape={shape:?} structure={structure_shape:?} iterations={iterations}"
                     );
                 }
             }

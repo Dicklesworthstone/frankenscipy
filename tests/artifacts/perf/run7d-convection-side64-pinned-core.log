@@ -1,0 +1,150 @@
+### frankenscipy-run7d CONVECTION side-64 RE-MEASUREMENT #2 (pinned core, low load)
+2026-08-23T22:05:33-04:00
+host=thinkstation1 governor=powersave
+pin=taskset -c 1  rounds=21
+uptime_before:  22:05:33 up 3 days,  5:09,  3 users,  load average: 14.59, 16.92, 21.96
+iowait_before: us=27 sy=9 id=64 wa=1
+df_before: /dev/mapper/ubuntu--vg-ubuntu--lv  1.9T  1.4T  443G  77% /
+build_slot: REFUSED server-side (acquire_build_slot: Build slots are disabled) -- frankenscipy-fr78g
+build_route=local-wrapper-bypass
+elf_sha256_precomputed=9ea9dc1b70df4e0184dc2c29e8520d4cb563a31daeb912c81171521a747f8b6e
+source_marker_two_arm_proof: MUST-HIT -a (elf 9ea9dc1b70df4e0184dc2c29e8520d4cb563a31daeb912c81171521a747f8b6e) / MUST-MISS -z (elf b954af0d5e2a6070ea2fb10566d618e3fdb30af919386d9036d2be7d4a834195), both observed
+scipy: 1.17.1 2.4.3
+elf_sha256=9ea9dc1b70df4e0184dc2c29e8520d4cb563a31daeb912c81171521a747f8b6e
+frankenscipy_engine_sha256=9ea9dc1b70df4e0184dc2c29e8520d4cb563a31daeb912c81171521a747f8b6e
+binary_provenance: source_commit=9e474163db0bae5e4c6c75d890813629c85ec323 builder_identity=BlackThrush build_route=local-wrapper-bypass
+trj_booking_claim_message_id=BUILD_SLOTS_DISABLED-frankenscipy-fr78g
+linalg_source_sha256=492c02dc4cb7ff20dd9333d83986b0c734092664d612a861e8197fdc0cdf284f
+harness_source_sha256=67d8087d5d1cee16d9a25a3a2660193d36e3bdf0cabaf7fcbec9530405d39a3e
+perf_spsolve_source_marker=perf-spsolve-freshness-a
+thread_provenance: cpu_affinity=1 requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 requested_scipy_threads=1
+balanced_square_provenance: schedule=ABBAABBA host_quiescence_required=false null_gate=per_arm_first_half_over_second_half null_median_limit=0.020
+fixture: grid_side=64 boundary=Dirichlet convection_diffusion=true diagonal=4.001 west=-1.2 east=-0.8 vertical=-1 rhs_count_per_factor=16 rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=1 materialized_components=65536 rounds=21
+whole_job_boundary: INCLUDED=1_public_splu_calls,16_public_splu_solve_calls,65536_materialized_outputs,folded_all_output_bits; EXCLUDED=matrix_rhs_construction,csc_transport,python_startup,scipy_import,warmup,parity,provenance,bootstrap
+shared_matrix_rhs_sha256=d9981ff830cad23af482b55ddcad2078bc544938814a317ca4d04280e7649c05
+live_verified_fixture_sha256=b9d4cf87697388cbc7818c20322adab874b93a6d692e283fd0f1898b658eaf72
+candidate_control_proof: candidate_factor_hits=0 candidate_solve_hits=0 control_factor_hits=0 control_solve_hits=0 candidate_max_relative_residual=5.770e-14 control_max_relative_residual=5.770e-14 relative_l2=0.000e0 candidate_factor_vector_payload_bytes=5753856 control_factor_vector_payload_bytes=5753856 memory_claim=false
+scipy_oracle_script=/data/projects/frankenscipy/crates/fsci-sparse/python/scipy_sparse_arm.py
+scipy_oracle_script_sha256=19cb41e5e23a86ef646afa9482c3c2156d04b97d15f4eb954546064c920e2ade
+scipy_arm_0: READY scipy=1.17.1 numpy=2.4.3 method=splu solver_mod=scipy.sparse.linalg._dsolve.linsolve scipy_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/__init__.py scipy_engine_file=/home/ubuntu/.local/lib/python3.13/site-packages/scipy/sparse/linalg/_dsolve/linsolve.py scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388 python=/usr/bin/python3.13 actual_observed_worker_threads=1 fsci_loaded=False genuine=True
+scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+candidate_live_proof: genuine_scipy=1.17.1 input_sha_match=true live_reported_max_relative_residual=3.976e-14 live_recomputed_max_relative_residual=3.976e-14 relative_l2=2.868e-15 component_mismatches=0 component_tolerance=1e-10+1e-10*abs(live) scipy_l_plus_u_array_payload_bytes=2680264 memory_claim=false
+measurement_round=1 total_rounds=21
+measurement_round=2 total_rounds=21
+measurement_round=3 total_rounds=21
+measurement_round=4 total_rounds=21
+measurement_round=5 total_rounds=21
+measurement_round=6 total_rounds=21
+measurement_round=7 total_rounds=21
+measurement_round=8 total_rounds=21
+measurement_round=9 total_rounds=21
+measurement_round=10 total_rounds=21
+measurement_round=11 total_rounds=21
+measurement_round=12 total_rounds=21
+measurement_round=13 total_rounds=21
+measurement_round=14 total_rounds=21
+measurement_round=15 total_rounds=21
+measurement_round=16 total_rounds=21
+measurement_round=17 total_rounds=21
+measurement_round=18 total_rounds=21
+measurement_round=19 total_rounds=21
+measurement_round=20 total_rounds=21
+measurement_round=21 total_rounds=21
+observed_workers: candidate=1 control=1 live_scipy=1 matrix_rhs_sha256=d9981ff830cad23af482b55ddcad2078bc544938814a317ca4d04280e7649c05
+candidate_whole_job: p50_ms=19.967408 p95_ms=25.083344 p99_ms=27.617209 cv_percent=13.339
+candidate_live_pair_whole_job: p50_ms=18.998695 p95_ms=22.215816 p99_ms=23.183002 cv_percent=9.487
+same_elf_control_whole_job: p50_ms=20.861601 p95_ms=27.188520 p99_ms=28.287045 cv_percent=16.125
+live_scipy_whole_job: p50_ms=12.074708 p95_ms=13.231795 p99_ms=13.323774 cv_percent=4.505
+raw_samples_seconds: candidate=0.025083344,0.018005145,0.024570230,0.022883344,0.027617209,0.018441643,0.019144246,0.019442822,0.016625886,0.019967408,0.020067429,0.019343885,0.019848859,0.017994494,0.019068612,0.023251067,0.022046264,0.019945632,0.021062633,0.022951518,0.024198414 candidate_live_pair=0.022215816,0.017142358,0.017453627,0.016218594,0.021597879,0.019213032,0.018819074,0.017474562,0.018998695,0.019013398,0.019911682,0.020615163,0.019517610,0.017111623,0.018888225,0.020900630,0.019789090,0.017852489,0.018954902,0.017250176,0.023183002 control=0.026083473,0.017569928,0.021845599,0.024053629,0.028287045,0.020174533,0.018185197,0.018811359,0.018738376,0.020861601,0.026395745,0.018448686,0.018933371,0.018249077,0.019347512,0.021133728,0.027188520,0.019962209,0.021543010,0.026180927,0.026013439 live=0.012670394,0.011944311,0.012101535,0.012065827,0.012764112,0.011841500,0.011828310,0.011864298,0.011745664,0.011692793,0.012453036,0.011949987,0.012074708,0.012224006,0.012941788,0.013231795,0.012429492,0.011984772,0.012983964,0.011226007,0.013323774 candidate_null_left=0.029234378,0.017094446,0.023660009,0.019016168,0.027483650,0.019524348,0.022893312,0.019216433,0.017450922,0.020433804,0.020067429,0.020187877,0.017670909,0.017144451,0.018190787,0.021832204,0.022046264,0.019308968,0.021062633,0.021134955,0.021707456 candidate_null_right=0.022713827,0.018005145,0.024570230,0.027684507,0.027617209,0.017016448,0.017560731,0.019442822,0.016205910,0.019181376,0.025320094,0.018488001,0.021530205,0.019469288,0.020161632,0.023724559,0.024315867,0.020653596,0.020543577,0.022951518,0.026887853 candidate_live_null_left=0.024571378,0.018597955,0.017805741,0.016218594,0.023596703,0.019437454,0.018659793,0.017474562,0.018998695,0.018881523,0.024145018,0.019800523,0.020984740,0.017000779,0.023174526,0.019079624,0.022804398,0.017239706,0.020369492,0.016586988,0.021345224 candidate_live_null_right=0.022215816,0.016471504,0.016222256,0.017315050,0.019058053,0.019213032,0.019012487,0.017578049,0.019256505,0.019064481,0.019367755,0.021971808,0.017674486,0.017133600,0.018202047,0.021880520,0.019789090,0.018573483,0.016968331,0.017250176,0.023891672 control_null_left=0.024990158,0.016659155,0.023233683,0.020627712,0.028945074,0.020174533,0.021478943,0.019476958,0.019254366,0.020561191,0.020861611,0.019004131,0.017791589,0.016567866,0.019968195,0.020515594,0.027188520,0.019962209,0.018234445,0.024651614,0.024310181 control_null_right=0.027258328,0.021345966,0.021845599,0.026927840,0.028287045,0.021488907,0.018185197,0.018742344,0.018738376,0.022551613,0.032224303,0.018448686,0.021155890,0.020389900,0.018248391,0.022100578,0.027445763,0.021201286,0.022457249,0.026190560,0.027305050 live_null_left=0.012670394,0.011944311,0.012436245,0.012897490,0.012961311,0.013462227,0.011828310,0.011703885,0.014793389,0.011618577,0.012487567,0.012349169,0.012024072,0.012224006,0.012941788,0.016124660,0.013722907,0.011984772,0.012562624,0.011226007,0.012170941 live_null_right=0.012385814,0.011874608,0.012094642,0.012065827,0.012687657,0.011841500,0.012053529,0.012166923,0.011735961,0.011692793,0.011820450,0.011945598,0.012415790,0.012106198,0.012081301,0.011640018,0.012286635,0.011894906,0.013235311,0.011306946,0.013932454
+control_over_candidate_ratios=1.039872236,0.975828242,0.889108427,1.051141367,1.024254297,1.093966112,0.949904009,0.967522051,1.127060296,1.044782602,1.315352604,0.953721862,0.953877071,1.014147828,1.014626103,0.908935833,1.233248386,1.000831109,1.022807049,1.140705707,1.075005949
+live_over_candidate_ratios=0.570332155,0.696771754,0.693353546,0.743950216,0.590989157,0.616326459,0.628527747,0.678946831,0.618235305,0.614976502,0.625413547,0.579669756,0.618657075,0.714368598,0.685177589,0.633081133,0.628098186,0.671322170,0.684992408,0.650776357,0.574721679
+candidate_A/A: median=0.949420 ci95=[0.906662,1.025266] raw=1.287074080,0.949420095,0.962954275,0.686888477,0.995163939,1.147380968,1.303665121,0.988356140,1.076824599,1.065293958,0.792549561,1.091944851,0.820749710,0.880589521,0.902247720,0.920236412,0.906661646,0.934896227,1.025266097,0.920852162,0.807333170
+control_A/A: median=0.938835 ci95=[0.890318,1.023263] raw=0.916789834,0.780435769,1.063540693,0.766036637,1.023262557,0.938834744,1.181122404,1.039195418,1.027536511,0.911739242,0.647387511,1.030107509,0.840975677,0.812552587,1.094244145,0.928283164,0.990627205,0.941556517,0.811962543,0.941240432,0.890318112
+candidate_live_pair_A/A: median=0.994113 ci95=[0.981449,1.129099] raw=1.106030854,1.129098776,1.097611920,0.936676102,1.238148645,1.011680692,0.981449349,0.994112714,0.986611797,0.990403200,1.246660648,0.901178569,1.187289911,0.992247893,1.273182344,0.871991362,1.152372241,0.928189182,1.200441658,0.961554654,0.893416917
+live_A/A: median=1.021569 ci95=[0.993653,1.056437] raw=1.022976327,1.005869837,1.028244202,1.068927188,1.021568600,1.136868348,0.981315180,0.961942847,1.260517918,0.993652843,1.056437445,1.033784161,0.968449938,1.009731257,1.071224737,1.385277871,1.116897057,1.007554956,0.949174896,0.992841659,0.873567609
+same_elf_replica_ratio: control/candidate median=1.022807 bootstrap_median_ci95=[0.975828,1.051141] twice_widest_null_threshold=1.258198 maintenance_claim=none_this_arm_has_no_ab_control
+competitive_ratio: live_scipy/candidate median=0.628528 bootstrap_median_ci95=[0.618235,0.678947] registered_minimum=1.000000
+decision_gate: null_medians_within_2pct=false candidate_p50_at_least_registered_minimum=true candidate_p50_ms=19.967408 registered_candidate_minimum_ms=5.000000 maintenance_ci_low_at_least_1_20_and_beyond_2x_null=false competitive_ci_low_beyond_2x_null=false cv_used_for_decision=false
+CONVECTION_SPLU_VS_INCUMBENT=NO_AB_DECISION competitive_claim=FAIL
+exit=0
+uptime_after:  22:05:43 up 3 days,  5:10,  3 users,  load average: 16.33, 17.22, 22.00
+
+### READING OF THIS RUN (BlackThrush, frankenscipy-run7d)
+
+WHAT IT SAYS. Same fixture as the standing ledger row (grid_side=64 nonsymmetric
+convection-diffusion, ONE factorization plus SIXTEEN solves, 65,536 materialized
+components), live scipy 1.17.1 SuperLU in the SAME invocation, 21 rounds,
+ABBAABBA, pinned to a single core with `taskset -c 1`, host at loadavg 16.3-17.5
+throughout:
+
+    competitive_ratio: live_scipy/candidate median = 0.628528
+                       bootstrap_median_ci95 = [0.618235, 0.678947]
+    candidate p50 = 19.967 ms      live SciPy p50 = 12.075 ms
+
+The standing row is 0.097628x (10.24x slower). This is 0.6285x -- about 1.59x
+slower. STILL A LOSS: 0.629 < 1.0, and the harness's own verdict is
+`competitive_claim=FAIL`. Nothing here is a win over SuperLU.
+
+CORROBORATION ACROSS TWO VERY DIFFERENT HOST STATES. The earlier unpinned run at
+loadavg 38 measured 0.591992 [0.563136, 0.600538]; this pinned run at loadavg 17
+measures 0.628528 [0.618235, 0.678947]. Two runs, opposite ends of the host's
+load range, different pinning, land within 6% of each other and both an order of
+magnitude away from 0.0976. The movement is not an artifact of one window.
+
+THE NULL GATE STILL FAILS, and for a DIFFERENT reason than last time -- worth
+stating precisely rather than repeating "the nulls failed".
+
+    candidate_A/A            median 0.949420  ci95 [0.906662, 1.025266]
+    control_A/A              median 0.938835  ci95 [0.890318, 1.023263]
+    candidate_live_pair_A/A  median 0.994113  ci95 [0.981449, 1.129099]
+    live_A/A                 median 1.021569  ci95 [0.993653, 1.056437]
+
+Last time the failure was the candidate_live_pair null at 0.911 on a host at
+loadavg 38 -- i.e. the host. This time the two arms that miss the 2% band are the
+candidate's and the control's OWN self-nulls (first half over second half within
+one arm) at 0.949 and 0.939, while the live SciPy null is 1.022 and the
+candidate/live pairing is 0.994. A host effect would move all four; it moved the
+two that re-factorize.
+
+That is the same effect `--convection-split` quantified directly: the first
+sixteen-solve pass after a fresh factorization is systematically slower than an
+immediately repeated one, worth ~1.6x on a solve pass. Each measurement round
+here re-factorizes, so the early rounds of each arm carry more cold-solve time
+than the late ones and the self-null lands below unity. It is a property of the
+workload being measured, not of the measurement.
+
+SO: the ORDER is unambiguous -- 0.63 against a widest-null threshold of 1.258,
+in the loss direction, corroborated across two host states. The MAGNITUDE still
+carries a caveat, and the honest way to remove it is to interleave the
+factorizations across the arms rather than to keep re-running at lower load;
+lowering the load did not fix it, which is itself the evidence that load was not
+the cause.
+
+BINARY FRESHNESS -- BOTH ARMS OBSERVED, on the marker this session added.
+`perf_spsolve_source_marker=perf-spsolve-freshness-a` is printed in the row above.
+MUST-HIT: the source const is `-a` and the built ELF
+9ea9dc1b70df4e0184dc2c29e8520d4cb563a31daeb912c81171521a747f8b6e reports `-a`.
+MUST-MISS: flipping the const to `-z` and rebuilding produced a DIFFERENT ELF
+b954af0d5e2a6070ea2fb10566d618e3fdb30af919386d9036d2be7d4a834195 reporting `-z`;
+restoring the const reproduced the first ELF sha exactly. A stale binary would
+now contradict its own row instead of passing silently, which is the failure this
+session actually hit (rch returned 5/5 green while running a deleted test,
+frankenscipy-ozg54).
+
+CONFORMANCE. candidate vs live SciPy: component_mismatches=0,
+relative_l2=2.868e-15, live_reported and live_recomputed max relative residual
+3.976e-14, against the harness's 1e-10 / 1e-8 limits.
+
+PROVENANCE. host=thinkstation1, governor=powersave, cpu_affinity=1 (taskset -c 1),
+one observed worker thread in each of the three arms, scipy engine
+a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388, source_commit
+9e474163d. build_slot: REFUSED server-side ("Build slots are disabled",
+frankenscipy-fr78g); build_route=local-wrapper-bypass. The binary was built into
+/data/tmp/cargo-target (the inherited CARGO_TARGET_DIR); later builds use
+`env -u CARGO_TARGET_DIR` per the orchestrator's instruction, and the ELF sha
+above identifies the file that actually ran.
+
+NO A/B IS CLAIMED. This family has no A/B control -- `set_disabled` is a no-op for
+Convection -- so control/candidate is reported as `same_elf_replica_ratio`
+(median 1.022807, a fourth A/A) and the verdict word is NO_AB_DECISION. The
+deleted lazy-column toggle was not revived to produce this row.

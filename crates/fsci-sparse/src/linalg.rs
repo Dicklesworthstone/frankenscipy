@@ -437,10 +437,7 @@ impl SortedFactorRow {
     /// The smallest column and its value — at pivot `k` this is the pivot entry
     /// itself, by invariant 1.
     fn first(&self) -> Option<(usize, f64)> {
-        Some((
-            *self.cols.get(self.start)? as usize,
-            self.vals[self.start],
-        ))
+        Some((*self.cols.get(self.start)? as usize, self.vals[self.start]))
     }
 
     fn get(&self, col: usize) -> Option<f64> {
@@ -720,7 +717,8 @@ fn row_capacity_headroom() -> usize {
 
 fn sorted_row_from_entries(mut entries: Vec<(usize, f64)>) -> SortedFactorRow {
     entries.sort_unstable_by_key(|(col, _)| *col);
-    let mut row = SortedFactorRow::with_capacity(entries.len().saturating_mul(row_capacity_headroom()));
+    let mut row =
+        SortedFactorRow::with_capacity(entries.len().saturating_mul(row_capacity_headroom()));
     for (col, value) in entries {
         match row.last_value_mut() {
             Some((last_col, last_value)) if last_col == col => {
@@ -1301,10 +1299,7 @@ fn apply_sorted_pivot_tail(
                         #[cfg(test)]
                         CANCELLATION_DROPS.with(|cell| {
                             let (drops, at_head) = cell.get();
-                            cell.set((
-                                drops + 1,
-                                at_head + usize::from(index == target.start),
-                            ));
+                            cell.set((drops + 1, at_head + usize::from(index == target.start)));
                         });
                     }
                 }
@@ -1436,10 +1431,7 @@ fn apply_sorted_pivot_tail(
                             #[cfg(test)]
                             CANCELLATION_DROPS.with(|cell| {
                                 let (drops, at_head) = cell.get();
-                                cell.set((
-                                    drops + 1,
-                                    at_head + usize::from(index == target.start),
-                                ));
+                                cell.set((drops + 1, at_head + usize::from(index == target.start)));
                             });
                         }
                     }
@@ -1513,10 +1505,7 @@ fn apply_sorted_pivot_tail(
                         #[cfg(test)]
                         CANCELLATION_DROPS.with(|cell| {
                             let (drops, at_head) = cell.get();
-                            cell.set((
-                                drops + 1,
-                                at_head + usize::from(index == target.start),
-                            ));
+                            cell.set((drops + 1, at_head + usize::from(index == target.start)));
                         });
                     }
                 }
@@ -1641,12 +1630,11 @@ fn scan_matched_prefix(left: &[u32], right: &[u32], bound: usize) -> usize {
         }
         span += BLOCK;
     }
-    span
-        + left[span..]
-            .iter()
-            .zip(&right[span..])
-            .take_while(|(a, b)| a == b)
-            .count()
+    span + left[span..]
+        .iter()
+        .zip(&right[span..])
+        .take_while(|(a, b)| a == b)
+        .count()
 }
 
 /// The indexed form `scan_matched_prefix` replaced, kept as a test-only reference.
@@ -1672,8 +1660,6 @@ fn scan_matched_prefix_indexed(left: &[u32], right: &[u32], bound: usize) -> usi
     }
     span
 }
-
-
 
 #[derive(Debug, Clone, Copy)]
 struct CubicGridDirichletPattern {
@@ -2271,10 +2257,7 @@ fn supernode_block_density(l_pattern: &[Vec<u32>], widths: &[usize]) -> (usize, 
 /// **A ratio above 1.0 is the padding tax, and a design is only worth writing if it is
 /// close to 1.**
 #[allow(dead_code)] // diagnostic: consumed by `supernode_padding_blowup_on_the_measured_cell`
-fn supernode_padding_cost(
-    u_pattern: &[Vec<u32>],
-    widths: &[usize],
-) -> (usize, usize) {
+fn supernode_padding_cost(u_pattern: &[Vec<u32>], widths: &[usize]) -> (usize, usize) {
     let mut sequential = 0usize;
     let mut blocked = 0usize;
     let mut start = 0usize;
@@ -2338,7 +2321,10 @@ fn pad_supernode_tails(
     // Sorted union of every tail's columns. The inputs are each sorted, so a k-way merge
     // would be tidier, but `w` is small (5-ish measured) and correctness here is worth
     // more than the constant factor.
-    let mut union: Vec<u32> = tail_cols.iter().flat_map(|cols| cols.iter().copied()).collect();
+    let mut union: Vec<u32> = tail_cols
+        .iter()
+        .flat_map(|cols| cols.iter().copied())
+        .collect();
     union.sort_unstable();
     union.dedup();
 
@@ -2581,13 +2567,41 @@ fn apply_supernode_tails(
         scratch.vals.resize(needed, 0.0);
     }
 
+    // A/B DISPATCH, read ONCE at the call boundary and never inside a loop
+    // (`perf_toggle_read_in_hot_loop_is_a_barrier`: an atomic load in a per-item path
+    // cost 13% in this same crate). The legacy arm is the pre-9nw95 kernel, kept so the
+    // two can be alternated in one window instead of compared across invocations.
+    if SPLU_MERGE_FORCE_LEGACY_WALK.load(std::sync::atomic::Ordering::Relaxed) {
+        return apply_supernode_tails_legacy(
+            target_cols,
+            target_vals,
+            scratch,
+            multipliers,
+            tail_cols,
+            tail_vals_flat,
+            span,
+            width,
+        );
+    }
+
+    // THE DESTINATION IS BOUND ONCE, NOT PER WRITE. `scratch.cols[put] = ...`
+    // indexes through a `Vec`, so every store reloads the heap pointer and the
+    // length before its bounds check. `needed` entries were just reserved above,
+    // so a fixed-length slice over exactly that prefix is valid for the whole
+    // walk and keeps pointer and length in registers.
+    // COUNTED: the merge kernel's width-independent cost is 18,194 Ir per call
+    // against 12.010 Ir per element-update, i.e. HALF the kernel at the measured
+    // mean supernode width of 5.24 (frankenscipy-9nw95 cost model, e8c7a8377).
+    // This is that half.
+    let (cols_out, vals_out) = (&mut scratch.cols[..needed], &mut scratch.vals[..needed]);
+
     let (mut left, mut right, mut put) = (0usize, 0usize, 0usize);
     while left < target_cols.len() && right < span {
         let left_col = target_cols[left];
         let right_col = tail_cols[right];
         if left_col < right_col {
-            scratch.cols[put] = left_col;
-            scratch.vals[put] = target_vals[left];
+            cols_out[put] = left_col;
+            vals_out[put] = target_vals[left];
             put += 1;
             left += 1;
         } else if left_col > right_col {
@@ -2624,8 +2638,8 @@ fn apply_supernode_tails(
                 }
             }
             if value != 0.0 {
-                scratch.cols[put] = right_col;
-                scratch.vals[put] = value;
+                cols_out[put] = right_col;
+                vals_out[put] = value;
                 put += 1;
             }
             right += 1;
@@ -2643,6 +2657,106 @@ fn apply_supernode_tails(
             for (k, &multiplier) in multipliers.iter().enumerate() {
                 value += -multiplier * tail_vals_flat[index];
                 index += span;
+                if value == 0.0 && k + 1 < width {
+                    return false;
+                }
+            }
+            cols_out[put] = left_col;
+            vals_out[put] = value;
+            put += 1;
+            left += 1;
+            right += 1;
+        }
+    }
+    let remaining = target_cols.len() - left;
+    cols_out[put..put + remaining].copy_from_slice(&target_cols[left..]);
+    vals_out[put..put + remaining].copy_from_slice(&target_vals[left..]);
+    put += remaining;
+    while right < span {
+        let mut value = 0.0f64;
+        let mut exists = false;
+        // Same strided walk as the two merge branches. This drain loop was MISSED
+        // when those were converted, and re-sliced the k-th tail row per pivot to
+        // read one element from it.
+        let mut index = right;
+        for (k, &multiplier) in multipliers.iter().enumerate() {
+            value += -multiplier * tail_vals_flat[index];
+            index += span;
+            if value == 0.0 {
+                if exists && k + 1 < width {
+                    return false;
+                }
+            } else {
+                exists = true;
+            }
+        }
+        cols_out[put] = tail_cols[right];
+        vals_out[put] = value;
+        put += 1;
+        right += 1;
+    }
+    scratch.cols.truncate(put.max(scratch.start));
+    scratch.vals.truncate(put.max(scratch.start));
+    true
+}
+
+/// The PRE-`frankenscipy-9nw95` merge walk, retained as the A/B arm.
+///
+/// Two differences from the shipping kernel, and only two — both about ADDRESSING, neither
+/// about arithmetic:
+///   * each pivot's tail row is rebuilt as a slice, `&tail_vals_flat[k * span..(k + 1) * span]`,
+///     to read the single element `[right]` from it;
+///   * every store goes through `scratch.cols[put]` / `scratch.vals[put]`, i.e. through the
+///     `Vec`, reloading the heap pointer and length before each bounds check.
+///
+/// The values read, the `k` order, the additions and their association, and the
+/// cancellation-refusal branches are IDENTICAL to the shipping arm, so the two are
+/// bit-identical by construction. Reachable only via `SPLU_MERGE_FORCE_LEGACY_WALK`.
+#[allow(clippy::too_many_arguments)]
+fn apply_supernode_tails_legacy(
+    target_cols: &[u32],
+    target_vals: &[f64],
+    scratch: &mut SortedFactorRow,
+    multipliers: &[f64],
+    tail_cols: &[u32],
+    tail_vals_flat: &[f64],
+    span: usize,
+    width: usize,
+) -> bool {
+    let (mut left, mut right, mut put) = (0usize, 0usize, 0usize);
+    while left < target_cols.len() && right < span {
+        let left_col = target_cols[left];
+        let right_col = tail_cols[right];
+        if left_col < right_col {
+            scratch.cols[put] = left_col;
+            scratch.vals[put] = target_vals[left];
+            put += 1;
+            left += 1;
+        } else if left_col > right_col {
+            let mut value = 0.0f64;
+            let mut exists = false;
+            for (k, &multiplier) in multipliers.iter().enumerate() {
+                let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                value += -multiplier * tail[right];
+                if value == 0.0 {
+                    if exists && k + 1 < width {
+                        return false;
+                    }
+                } else {
+                    exists = true;
+                }
+            }
+            if value != 0.0 {
+                scratch.cols[put] = right_col;
+                scratch.vals[put] = value;
+                put += 1;
+            }
+            right += 1;
+        } else {
+            let mut value = target_vals[left];
+            for (k, &multiplier) in multipliers.iter().enumerate() {
+                let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                value += -multiplier * tail[right];
                 if value == 0.0 && k + 1 < width {
                     return false;
                 }
@@ -2807,7 +2921,11 @@ fn supernode_widths_relaxed(
 /// conservative one, which is the safe direction for sizing blocks.
 /// `supernode_widths_agree_between_symbolic_and_numeric` pins that.
 #[allow(dead_code)] // staged capability: consumed by the supernodal driver
-fn supernode_widths_from_symbolic(n: usize, l_pattern: &[Vec<u32>], tolerance: usize) -> Vec<usize> {
+fn supernode_widths_from_symbolic(
+    n: usize,
+    l_pattern: &[Vec<u32>],
+    tolerance: usize,
+) -> Vec<usize> {
     let mut columns: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (row, cols) in l_pattern.iter().enumerate() {
         for &col in cols {
@@ -3142,7 +3260,11 @@ impl NativeSparseLu {
                     // save, so each is counted.
                     let spanned = (entries * std::mem::size_of::<f64>()).div_ceil(64).max(1)
                         + (entries * std::mem::size_of::<u32>()).div_ceil(64).max(1);
-                    cell.set((visits + 1, lines + spanned, single + usize::from(spanned <= 2)));
+                    cell.set((
+                        visits + 1,
+                        lines + spanned,
+                        single + usize::from(spanned <= 2),
+                    ));
                 });
                 let multiplier = value / pivot;
                 if multiplier != 0.0 {
@@ -3174,7 +3296,7 @@ impl NativeSparseLu {
                         back_merge,
                         partial_inplace,
                         one_column,
-            detect_cancellation,
+                        detect_cancellation,
                     );
                 }
                 #[cfg(test)]
@@ -3191,7 +3313,11 @@ impl NativeSparseLu {
                     if grew > 0 && matched != usize::MAX {
                         PREFIX_STABILITY.with(|stability| {
                             let (n, live_total, matched_total) = stability.get();
-                            stability.set((n + 1, live_total + live_before, matched_total + matched));
+                            stability.set((
+                                n + 1,
+                                live_total + live_before,
+                                matched_total + matched,
+                            ));
                         });
                     }
                 });
@@ -3215,8 +3341,7 @@ impl NativeSparseLu {
         // freshly allocated in one sweep, so its layout says nothing about what the
         // elimination left behind. Measured here or not at all.
         #[cfg(test)]
-        LIVE_ROW_ADJACENCY_AFTER_ELIMINATION
-            .with(|cell| cell.set(row_allocation_adjacency(&rows)));
+        LIVE_ROW_ADJACENCY_AFTER_ELIMINATION.with(|cell| cell.set(row_allocation_adjacency(&rows)));
 
         let u_rows = rows
             .into_iter()
@@ -3277,8 +3402,7 @@ impl NativeSparseLu {
         if !shape.is_square() {
             return None;
         }
-        let one_column =
-            SPLU_ONE_COLUMN_INSERT_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        let one_column = SPLU_ONE_COLUMN_INSERT_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
         let detect_cancellation =
             !SPLU_SKIP_CANCELLATION_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
         let n = shape.rows;
@@ -3438,7 +3562,7 @@ impl NativeSparseLu {
                             back_merge,
                             partial_inplace,
                             one_column,
-            detect_cancellation,
+                            detect_cancellation,
                         );
                     }
                     let next = target.first();
@@ -3503,7 +3627,12 @@ impl NativeSparseLu {
                         rows[row].drop_first();
                     }
                 } else if apply_supernode_tails(
-                    &rows[row], &mut blocked, skip, &multipliers, &union, &padded,
+                    &rows[row],
+                    &mut blocked,
+                    skip,
+                    &multipliers,
+                    &union,
+                    &padded,
                 ) {
                     rows[row].cols.clear();
                     rows[row].vals.clear();
@@ -3531,7 +3660,7 @@ impl NativeSparseLu {
                                 back_merge,
                                 partial_inplace,
                                 one_column,
-            detect_cancellation,
+                                detect_cancellation,
                             );
                         }
                     }
@@ -5686,6 +5815,30 @@ fn csr_matvec_into(a: &CsrMatrix, x: &[f64], out: &mut [f64]) {
 /// Shared kernel for `csr_matvec`/`csr_matvec_into`. Each output row is an
 /// independent dot product accumulated in CSR index order, so the threaded path
 /// (disjoint output chunks) is byte-identical to the serial sweep.
+#[inline]
+fn csr_row_dot(data: &[f64], indices: &[usize], x: &[f64], start: usize, end: usize) -> f64 {
+    // The whole-job GMRES fixture is the five-point convection-diffusion
+    // stencil: 900 of its 1,024 rows have exactly five nonzeros, accounting for
+    // 4,500 of 4,992 visits per SpMV. Keep the additions in CSR order, but
+    // expose that fixed width to LLVM so it need not carry a dynamic inner-loop
+    // induction variable through the overwhelmingly common row shape.
+    if end - start == 5 {
+        let mut sum = 0.0;
+        sum += data[start] * x[indices[start]];
+        sum += data[start + 1] * x[indices[start + 1]];
+        sum += data[start + 2] * x[indices[start + 2]];
+        sum += data[start + 3] * x[indices[start + 3]];
+        sum += data[start + 4] * x[indices[start + 4]];
+        return sum;
+    }
+
+    let mut sum = 0.0;
+    for idx in start..end {
+        sum += data[idx] * x[indices[idx]];
+    }
+    sum
+}
+
 fn csr_matvec_into_impl(
     indptr: &[usize],
     indices: &[usize],
@@ -5697,11 +5850,7 @@ fn csr_matvec_into_impl(
     let n = out.len();
     if nthreads <= 1 {
         for (i, slot) in out.iter_mut().enumerate() {
-            let mut sum = 0.0;
-            for idx in indptr[i]..indptr[i + 1] {
-                sum += data[idx] * x[indices[idx]];
-            }
-            *slot = sum;
+            *slot = csr_row_dot(data, indices, x, indptr[i], indptr[i + 1]);
         }
         return;
     }
@@ -5713,11 +5862,7 @@ fn csr_matvec_into_impl(
             scope.spawn(move || {
                 for (r, o) in slot.iter_mut().enumerate() {
                     let i = base + r;
-                    let mut sum = 0.0;
-                    for idx in indptr[i]..indptr[i + 1] {
-                        sum += data[idx] * x[indices[idx]];
-                    }
-                    *o = sum;
+                    *o = csr_row_dot(data, indices, x, indptr[i], indptr[i + 1]);
                 }
             });
         }
@@ -5959,6 +6104,16 @@ fn arnoldi_breakdown_floor(w_norm_before_orthogonalization: f64) -> f64 {
     f64::EPSILON * 100.0 * w_norm_before_orthogonalization
 }
 
+/// Apply one modified-Gram-Schmidt projection without re-indexing the jagged
+/// basis or coefficient inside the element loop.
+#[inline]
+fn subtract_scaled_basis_vector(destination: &mut [f64], scale: f64, basis: &[f64]) {
+    debug_assert_eq!(destination.len(), basis.len());
+    for (value, &basis_value) in destination.iter_mut().zip(basis) {
+        *value -= scale * basis_value;
+    }
+}
+
 fn gmres_inner(
     a: &CsrMatrix,
     b: &[f64],
@@ -5980,9 +6135,13 @@ fn gmres_inner(
         return Ok((true, 0));
     }
 
-    // Arnoldi process with modified Gram-Schmidt
-    let mut v: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
-    v.push(r.iter().map(|&ri| ri / r_norm).collect());
+    // Arnoldi process with modified Gram-Schmidt. The basis is one contiguous
+    // `(m + 1) × n` slab rather than `m + 1` individually allocated rows. Each
+    // completed row is appended in the same order as before, so the recurrence
+    // reads and writes the identical values while the MGS kernel gets a direct
+    // slice for every basis vector.
+    let mut v = Vec::with_capacity((m + 1) * n);
+    v.extend(r.iter().map(|&ri| ri / r_norm));
 
     // Upper Hessenberg matrix H (stored as (m+1) x m)
     let mut h = vec![vec![0.0; m]; m + 1];
@@ -6002,17 +6161,18 @@ fn gmres_inner(
         iters = j + 1;
 
         // w = A * v_j
-        csr_matvec_into(a, &v[j], &mut wj);
+        let current_basis = &v[j * n..(j + 1) * n];
+        csr_matvec_into(a, current_basis, &mut wj);
         // Captured before orthogonalization: this is what the breakdown test
         // below is measured against (frankenscipy-4u7vp).
         let w_norm_before = vec_norm(&wj);
 
         // Modified Gram-Schmidt orthogonalization
         for i in 0..=j {
-            h[i][j] = dot_product(&wj, &v[i]);
-            for k in 0..n {
-                wj[k] -= h[i][j] * v[i][k];
-            }
+            let basis = &v[i * n..(i + 1) * n];
+            let coefficient = dot_product(&wj, basis);
+            h[i][j] = coefficient;
+            subtract_scaled_basis_vector(&mut wj, coefficient, basis);
         }
 
         h[j + 1][j] = vec_norm(&wj);
@@ -6022,13 +6182,13 @@ fn gmres_inner(
             // Apply previous Givens rotations to column j
             apply_givens_to_column(&mut h, &cs, &sn, j);
             // Solve the triangular system and update x
-            update_solution(x, &v, &h, &g, j + 1);
+            update_solution_slab(x, &v, n, &h, &g, j + 1);
             return Ok((true, iters));
         }
 
         // Normalize
         let inv_h = 1.0 / h[j + 1][j];
-        v.push(wj.iter().map(|&wi| wi * inv_h).collect());
+        v.extend(wj.iter().map(|&wi| wi * inv_h));
 
         // Apply previous Givens rotations to column j of H
         apply_givens_to_column(&mut h, &cs, &sn, j);
@@ -6048,21 +6208,25 @@ fn gmres_inner(
 
         let residual = g[j + 1].abs() / b_norm;
         if residual < tol {
-            update_solution(x, &v, &h, &g, j + 1);
+            update_solution_slab(x, &v, n, &h, &g, j + 1);
             return Ok((true, iters));
         }
     }
 
     // Update solution with current approximation
-    update_solution(x, &v, &h, &g, m);
+    update_solution_slab(x, &v, n, &h, &g, m);
     Ok((false, iters))
 }
 
 /// Apply previous Givens rotations to column j of H.
 fn apply_givens_to_column(h: &mut [Vec<f64>], cs: &[f64], sn: &[f64], j: usize) {
     for i in 0..j {
-        let temp = cs[i] * h[i][j] + sn[i] * h[i + 1][j];
-        h[i + 1][j] = -sn[i] * h[i][j] + cs[i] * h[i + 1][j];
+        let upper = h[i][j];
+        let lower = h[i + 1][j];
+        let c = cs[i];
+        let s = sn[i];
+        let temp = c * upper + s * lower;
+        h[i + 1][j] = -s * upper + c * lower;
         h[i][j] = temp;
     }
 }
@@ -6115,6 +6279,42 @@ fn update_solution(x: &mut [f64], v: &[Vec<f64>], h: &[Vec<f64>], g: &[f64], k: 
     for (j, &yj) in y.iter().enumerate() {
         for (i, xi) in x.iter_mut().enumerate() {
             *xi += yj * v[j][i];
+        }
+    }
+}
+
+/// Slab-backed counterpart of [`update_solution`] for GMRES' contiguous
+/// Arnoldi basis. It keeps the same back-substitution and accumulation order;
+/// only the basis-row address calculation differs.
+fn update_solution_slab(
+    x: &mut [f64],
+    basis: &[f64],
+    row_width: usize,
+    h: &[Vec<f64>],
+    g: &[f64],
+    k: usize,
+) {
+    debug_assert_eq!(basis.len() % row_width, 0);
+    let pivot_floor =
+        f64::EPSILON * 100.0 * (0..k).fold(0.0_f64, |largest, i| largest.max(h[i][i].abs()));
+
+    let mut y = vec![0.0; k];
+    for i in (0..k).rev() {
+        y[i] = g[i];
+        for j in (i + 1)..k {
+            y[i] -= h[i][j] * y[j];
+        }
+        if h[i][i].abs() > pivot_floor {
+            y[i] /= h[i][i];
+        } else {
+            y[i] = 0.0;
+        }
+    }
+
+    for (j, &yj) in y.iter().enumerate() {
+        let row = &basis[j * row_width..(j + 1) * row_width];
+        for (xi, &basis_value) in x.iter_mut().zip(row) {
+            *xi += yj * basis_value;
         }
     }
 }
@@ -7657,8 +7857,7 @@ fn lsqr_impl(
         None => (b.to_vec(), beta),
         Some(start) => {
             let ax0 = csr_matvec(a, start);
-            let residual: Vec<f64> =
-                b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
+            let residual: Vec<f64> = b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
             let norm = vec_norm(&residual);
             (residual, norm)
         }
@@ -8061,8 +8260,7 @@ fn lsmr_impl(
         None => (b.to_vec(), b_norm),
         Some(start) => {
             let ax0 = csr_matvec(a, start);
-            let residual: Vec<f64> =
-                b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
+            let residual: Vec<f64> = b.iter().zip(&ax0).map(|(bi, ai)| bi - ai).collect();
             let norm = vec_norm(&residual);
             (residual, norm)
         }
@@ -11626,8 +11824,7 @@ mod tests {
                 LAPLACIAN_FORCE_SERIAL.store(serial, std::sync::atomic::Ordering::Relaxed);
                 let l = laplacian(&graph, normed).expect("laplacian");
                 LAPLACIAN_FORCE_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
-                LAPLACIAN_FORCE_DENSE_REFERENCE
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                LAPLACIAN_FORCE_DENSE_REFERENCE.store(false, std::sync::atomic::Ordering::Relaxed);
                 (l.data().to_vec(), l.indices().to_vec(), l.indptr().to_vec())
             };
 
@@ -11641,8 +11838,14 @@ mod tests {
                 "laplacian produced no nonzero entries; the comparison would be vacuous"
             );
 
-            assert_eq!(serial_indptr, par_indptr, "indptr differs (normed={normed})");
-            assert_eq!(serial_indices, par_indices, "indices differ (normed={normed})");
+            assert_eq!(
+                serial_indptr, par_indptr,
+                "indptr differs (normed={normed})"
+            );
+            assert_eq!(
+                serial_indices, par_indices,
+                "indices differ (normed={normed})"
+            );
             for (i, (a, b)) in serial_data.iter().zip(&par_data).enumerate() {
                 assert_eq!(
                     a.to_bits(),
@@ -13735,13 +13938,15 @@ mod tests {
             // assuming it: `dispatch_observed` returning false would mean the two "arms" are
             // the same code and the identity below is a comparison of a thing with itself.
             SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(true, std::sync::atomic::Ordering::Relaxed);
-            let observed =
-                SPLU_SOLVE_FORCE_MATERIALIZED_RHS.dispatch_observed(|| {
-                    let _ = lu.solve(&b);
-                });
+            let observed = SPLU_SOLVE_FORCE_MATERIALIZED_RHS.dispatch_observed(|| {
+                let _ = lu.solve(&b);
+            });
             let materialized = lu.solve(&b).expect("the ORIG arm succeeds");
             SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(false, std::sync::atomic::Ordering::Relaxed);
-            assert!(observed, "{label}: the solve never consulted the A/B toggle");
+            assert!(
+                observed,
+                "{label}: the solve never consulted the A/B toggle"
+            );
 
             let actual = lu.solve(&b).expect("the shipping solve succeeds");
             for (index, (composed, orig)) in actual.iter().zip(&materialized).enumerate() {
@@ -14079,10 +14284,16 @@ mod tests {
             // ~89% of updates with 94% of those missing by one column, so the arm must
             // fire there. Scattered takes the fast path on every update, so it must NOT.
             if label.starts_with("cubic") {
-                assert!(hits > 0, "the arm never fired on {label}, so bit-identity is vacuous");
+                assert!(
+                    hits > 0,
+                    "the arm never fired on {label}, so bit-identity is vacuous"
+                );
             }
             if label.starts_with("scattered") {
-                assert_eq!(hits, 0, "the fast path already handles every scattered update");
+                assert_eq!(
+                    hits, 0,
+                    "the fast path already handles every scattered update"
+                );
             }
         }
     }
@@ -14107,8 +14318,12 @@ mod tests {
         );
 
         // MUST FIRE: the cubic cell rejects the fast path on ~89% of updates.
-        NativeSparseLu::factorize_csr(&splu_dirichlet_laplacian_3d(8), 1.0, PermutationOrdering::Colamd)
-            .expect("cubic factorization");
+        NativeSparseLu::factorize_csr(
+            &splu_dirichlet_laplacian_3d(8),
+            1.0,
+            PermutationOrdering::Colamd,
+        )
+        .expect("cubic factorization");
         let histogram = FASTPATH_SHORTFALL.with(|cell| cell.get());
         assert!(
             histogram.iter().sum::<u64>() > 0,
@@ -14133,12 +14348,18 @@ mod tests {
                 "side={side} rejected={total}  miss=1: {} ({:.1}%)  miss=2: {} ({:.1}%)  \
                  miss=3-4: {} ({:.1}%)  miss=5-8: {} ({:.1}%)  miss>8: {} ({:.1}%)  \
                  miss=0: {} ({:.1}%)",
-                histogram[0], pct(histogram[0]),
-                histogram[1], pct(histogram[1]),
-                histogram[2], pct(histogram[2]),
-                histogram[3], pct(histogram[3]),
-                histogram[4], pct(histogram[4]),
-                histogram[5], pct(histogram[5]),
+                histogram[0],
+                pct(histogram[0]),
+                histogram[1],
+                pct(histogram[1]),
+                histogram[2],
+                pct(histogram[2]),
+                histogram[3],
+                pct(histogram[3]),
+                histogram[4],
+                pct(histogram[4]),
+                histogram[5],
+                pct(histogram[5]),
             );
         }
     }
@@ -14213,7 +14434,10 @@ mod tests {
         // factorization that generates fill MUST record both merges and runs; a
         // counter that silently stayed zero would otherwise read as "no runs",
         // which is the same shape as the answer being looked for.
-        assert!(shape.runs > 0, "the fixture must exercise the matched-run path");
+        assert!(
+            shape.runs > 0,
+            "the fixture must exercise the matched-run path"
+        );
         assert!(
             shape.merges + shape.inplace > 0,
             "the fixture must exercise the merge at all"
@@ -14540,8 +14764,9 @@ mod tests {
             ("3D Dirichlet Laplacian", splu_dirichlet_laplacian_3d(3)),
         ] {
             let n = matrix.shape().rows;
-            let factored = NativeSparseLu::factorize_csr(&matrix, 0.0, PermutationOrdering::Natural)
-                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            let factored =
+                NativeSparseLu::factorize_csr(&matrix, 0.0, PermutationOrdering::Natural)
+                    .unwrap_or_else(|error| panic!("{label}: {error:?}"));
             assert_eq!(
                 factored.row_perm,
                 (0..n).collect::<Vec<_>>(),
@@ -14591,8 +14816,7 @@ mod tests {
                     "{label}: the symbolic partition must still cover every column"
                 );
                 if cancellation_free {
-                    let from_numeric =
-                        supernode_widths_relaxed(n, &factored.l_rows, tolerance);
+                    let from_numeric = supernode_widths_relaxed(n, &factored.l_rows, tolerance);
                     assert_eq!(
                         from_symbolic, from_numeric,
                         "{label} at tolerance {tolerance}: symbolic and numeric \
@@ -14623,8 +14847,9 @@ mod tests {
             let n = matrix.shape().rows;
             // Natural order and a diagonal-favouring threshold, so the symbolic pass and
             // the numeric one eliminate in the same sequence.
-            let factored = NativeSparseLu::factorize_csr(&matrix, 0.0, PermutationOrdering::Natural)
-                .unwrap_or_else(|error| panic!("{label}: {error:?}"));
+            let factored =
+                NativeSparseLu::factorize_csr(&matrix, 0.0, PermutationOrdering::Natural)
+                    .unwrap_or_else(|error| panic!("{label}: {error:?}"));
             assert_eq!(
                 factored.row_perm,
                 (0..n).collect::<Vec<_>>(),
@@ -14950,6 +15175,121 @@ mod tests {
         }
     }
 
+    /// Drives BOTH arms of `SPLU_MERGE_FORCE_LEGACY_WALK` and pins them bit-identical.
+    ///
+    /// This is the toggle's accuracy contract executed rather than asserted. The two arms
+    /// differ only in ADDRESSING — the legacy one rebuilds each pivot's tail row as a slice to
+    /// read one element, and stores through the `Vec` — so every value, every `k` order, every
+    /// addition and every cancellation-refusal branch must agree to the bit.
+    ///
+    /// THREE PATHS, because the kernel has three and a fixture reaching only one would pin
+    /// almost nothing: the DISJOINT fixture drives the fill branch and the tail drain, the
+    /// OVERLAPPING fixture drives the reuse branch. That distinction is not hypothetical — an
+    /// earlier version of the sibling test was green under a transposed stride precisely
+    /// because the reuse branch was never reached.
+    ///
+    /// `dispatch_observed` is asserted so that a refactor which stops consulting the toggle
+    /// fails here instead of silently comparing one arm with itself.
+    #[test]
+    fn merge_kernel_ab_arms_are_bit_identical() {
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        for (span, width, overlap) in [
+            (1usize, 1usize, false),
+            (3, 4, false),
+            (7, 2, false),
+            (300, 5, false),
+            (64, 12, false),
+            (5, 3, true),
+            (64, 12, true),
+            (300, 5, true),
+        ] {
+            let (target, tail_cols, tail_vals_flat, multipliers) = if overlap {
+                overlapping_cell_shaped_block(span, width)
+            } else {
+                measured_cell_shaped_block(span, width)
+            };
+
+            // PROVE THE DISPATCH before believing any comparison below.
+            SPLU_MERGE_FORCE_LEGACY_WALK.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut probe = SortedFactorRow::default();
+            let observed = SPLU_MERGE_FORCE_LEGACY_WALK.dispatch_observed(|| {
+                let _ = apply_supernode_tails(
+                    &target,
+                    &mut probe,
+                    0,
+                    &multipliers,
+                    &tail_cols,
+                    &tail_vals_flat,
+                );
+            });
+            assert!(
+                observed,
+                "span={span} width={width} overlap={overlap}: the kernel never consulted the \
+                 A/B toggle, so the two arms are the same code"
+            );
+
+            let mut legacy = SortedFactorRow::default();
+            let legacy_ok = apply_supernode_tails(
+                &target,
+                &mut legacy,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+            );
+            SPLU_MERGE_FORCE_LEGACY_WALK.store(false, std::sync::atomic::Ordering::Relaxed);
+
+            let mut head = SortedFactorRow::default();
+            let head_ok = apply_supernode_tails(
+                &target,
+                &mut head,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+            );
+
+            assert_eq!(
+                legacy_ok, head_ok,
+                "span={span} width={width} overlap={overlap}: the arms disagree on whether the \
+                 row must be replayed sequentially"
+            );
+            let legacy_cols = &legacy.cols[legacy.start..];
+            let head_cols = &head.cols[head.start..];
+            let legacy_vals = &legacy.vals[legacy.start..];
+            let head_vals = &head.vals[head.start..];
+            assert_eq!(
+                legacy_cols.len(),
+                head_cols.len(),
+                "span={span} width={width} overlap={overlap}: entry count"
+            );
+            for (i, (l, h)) in legacy_cols.iter().zip(head_cols).enumerate() {
+                assert_eq!(l, h, "span={span} width={width}: column {i}");
+            }
+            for (i, (l, h)) in legacy_vals.iter().zip(head_vals).enumerate() {
+                assert_eq!(
+                    l.to_bits(),
+                    h.to_bits(),
+                    "span={span} width={width} overlap={overlap}: value {i} ({l} vs {h})"
+                );
+            }
+
+            // MUST-MISS arm for the comparison: one ulp on one value has to be visible, or
+            // "every value matched" is a statement about the assertion, not about the kernels.
+            if !head_vals.is_empty() {
+                let probe_index = head_vals.len() / 2;
+                let perturbed = f64::from_bits(head_vals[probe_index].to_bits() ^ 1);
+                assert!(
+                    legacy_vals[probe_index].to_bits() != perturbed.to_bits(),
+                    "span={span} width={width}: a one-ulp perturbation must be visible"
+                );
+            }
+        }
+        SPLU_MERGE_FORCE_LEGACY_WALK.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     #[test]
     #[ignore = "kernel A/B: build with --release and run under callgrind, then read the \
                 per-function Ir for apply_supernode_tails vs dense_scatter_block_update"]
@@ -15040,7 +15380,14 @@ mod tests {
 
         let mut merged = SortedFactorRow::default();
         assert!(
-            apply_supernode_tails(&row, &mut merged, 0, &multipliers, &tail_cols, &tail_vals_flat),
+            apply_supernode_tails(
+                &row,
+                &mut merged,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat
+            ),
             "the merge kernel must apply on this input"
         );
 
@@ -15139,7 +15486,10 @@ mod tests {
             .map(|i| sorted_row_from_entries(vec![(i, 1.0 + i as f64)]))
             .collect();
         let (pairs, adjacent) = row_allocation_adjacency(&rows);
-        assert_eq!(pairs, 3, "every consecutive pair of non-empty rows is counted");
+        assert_eq!(
+            pairs, 3,
+            "every consecutive pair of non-empty rows is counted"
+        );
         assert!(
             adjacent <= pairs,
             "adjacent pairs cannot exceed counted pairs -- got {adjacent}/{pairs}"
@@ -15345,13 +15695,19 @@ mod tests {
             .expect("tridiagonal factorization");
         assert_eq!(lu.n, 256);
         let (visits, lines, single) = ROW_VISIT_SPAN.with(|cell| cell.get());
-        assert!(visits > 0, "the recorder must fire -- zero visits measures nothing");
+        assert!(
+            visits > 0,
+            "the recorder must fire -- zero visits measures nothing"
+        );
         assert_eq!(
             lines,
             visits * 2,
             "a 3-entry row spans exactly one vals line and one cols line per visit"
         );
-        assert_eq!(single, visits, "every tridiagonal visit is a single-line sweep");
+        assert_eq!(
+            single, visits,
+            "every tridiagonal visit is a single-line sweep"
+        );
 
         // MUST REPORT MANY LINES: the measured cell, where rows carry hundreds of
         // entries. If this arm also read ~1 line per visit the counter would be blind.
@@ -15393,7 +15749,11 @@ mod tests {
         let shifted: Vec<u32> = (0..64).map(|c| c + 1).collect();
         assert_eq!(matched_run_length(&identical, &shifted), 0);
         let (calls, span, bound) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
-        assert_eq!((calls, span, bound), (1, 0, 64), "a slice that agrees nowhere");
+        assert_eq!(
+            (calls, span, bound),
+            (1, 0, 64),
+            "a slice that agrees nowhere"
+        );
 
         // A PARTIAL RUN, to pin that the counter tracks the boundary and not just the
         // extremes -- and that it crosses the 8-wide block path correctly.
@@ -15410,7 +15770,11 @@ mod tests {
             matched_run_length(&identical, &identical);
         }
         let (calls, span, _) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
-        assert_eq!((calls, span), (3, 192), "counts must accumulate, not overwrite");
+        assert_eq!(
+            (calls, span),
+            (3, 192),
+            "counts must accumulate, not overwrite"
+        );
     }
 
     #[test]
@@ -15441,7 +15805,10 @@ mod tests {
             .expect("cubic factorization");
         assert_eq!(lu.n, 512);
         let (updates, changed, added) = PATTERN_CHURN.with(|cell| cell.get());
-        assert!(updates > 0 && changed > 0, "a filling factor must change patterns");
+        assert!(
+            updates > 0 && changed > 0,
+            "a filling factor must change patterns"
+        );
         assert!(
             added >= changed,
             "an update that changed a pattern added at least one column: {added} < {changed}"
@@ -15582,7 +15949,10 @@ mod tests {
 
         // ENABLED IS NOT THE SAME AS TOOK EFFECT. Without this the optimizer could fold
         // the second pass away and the A/B would measure nothing while looking healthy.
-        assert!(hits > 0, "the doubling arm must actually execute extra passes, got {hits}");
+        assert!(
+            hits > 0,
+            "the doubling arm must actually execute extra passes, got {hits}"
+        );
 
         // And it must not fire when disabled, or the counter is measuring the wrong thing.
         DOUBLE_COLUMN_COMPARE_HITS.with(|hits| hits.set(0));
@@ -15661,8 +16031,16 @@ mod tests {
         // on both measured fixtures, so retaining structural zeros cannot change anything
         // there -- and if it does, the premise of the whole lever is wrong.
         for (label, matrix, ordering) in [
-            ("cubic side=8", splu_dirichlet_laplacian_3d(8), PermutationOrdering::Colamd),
-            ("scattered side=6", scattered_pentadiagonal_csr(6), PermutationOrdering::Colamd),
+            (
+                "cubic side=8",
+                splu_dirichlet_laplacian_3d(8),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "scattered side=6",
+                scattered_pentadiagonal_csr(6),
+                PermutationOrdering::Colamd,
+            ),
         ] {
             SPLU_SKIP_CANCELLATION_ENABLE.store(false, Ordering::Relaxed);
             let detected = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
@@ -15674,7 +16052,10 @@ mod tests {
                 .unwrap_or_else(|e| panic!("skipping on {label}: {e:?}"));
             SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
 
-            assert_eq!(drops, 0, "{label} was expected to cancel nothing, got {drops} drops");
+            assert_eq!(
+                drops, 0,
+                "{label} was expected to cancel nothing, got {drops} drops"
+            );
             assert_eq!(
                 factor_value_bits(&skipped.u_rows),
                 factor_value_bits(&detected.u_rows),
@@ -15685,7 +16066,11 @@ mod tests {
                 factor_value_bits(&detected.l_rows),
                 "L bits differ on {label}"
             );
-            assert_eq!(skipped.stored_nnz(), detected.stored_nnz(), "pattern on {label}");
+            assert_eq!(
+                skipped.stored_nnz(),
+                detected.stored_nnz(),
+                "pattern on {label}"
+            );
         }
 
         // WHERE IT DOES CANCEL, BIT-IDENTITY IS NOT AVAILABLE AND MUST NOT BE ASSERTED.
@@ -15693,8 +16078,9 @@ mod tests {
         // and the stored pattern legitimately grows. What must survive is the SOLVE.
         let cancelling = exact_cancellation_csr();
         SPLU_SKIP_CANCELLATION_ENABLE.store(false, Ordering::Relaxed);
-        let detected = NativeSparseLu::factorize_csr(&cancelling, 1.0, PermutationOrdering::Natural)
-            .expect("detecting on the cancelling fixture");
+        let detected =
+            NativeSparseLu::factorize_csr(&cancelling, 1.0, PermutationOrdering::Natural)
+                .expect("detecting on the cancelling fixture");
         let (drops, _) = CANCELLATION_DROPS.with(|cell| cell.get());
         SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
         let skipped = NativeSparseLu::factorize_csr(&cancelling, 1.0, PermutationOrdering::Natural)
@@ -15702,7 +16088,10 @@ mod tests {
         // Restore the SHIPPING default, which is now `true`.
         SPLU_SKIP_CANCELLATION_ENABLE.store(true, Ordering::Relaxed);
 
-        assert!(drops > 0, "the cancelling fixture must actually cancel, got {drops}");
+        assert!(
+            drops > 0,
+            "the cancelling fixture must actually cancel, got {drops}"
+        );
         let rhs = vec![1.0, 2.0, 3.0, 4.0];
         let (a, b) = (
             detected.solve(&rhs).expect("detected solve"),
@@ -15739,7 +16128,10 @@ mod tests {
         .expect("cancelling factorization");
         assert_eq!(lu.n, 4);
         let (drops, at_head) = CANCELLATION_DROPS.with(|cell| cell.get());
-        assert!(drops > 0, "an exact cancellation must be counted, got {drops}");
+        assert!(
+            drops > 0,
+            "an exact cancellation must be counted, got {drops}"
+        );
         assert!(
             at_head <= drops,
             "head drops cannot exceed total drops: {at_head} > {drops}"
@@ -15748,8 +16140,12 @@ mod tests {
         // MUST MISS: a tridiagonal factor generates no fill and no cancellation, so the
         // counter must read exactly zero. A counter that reported drops here would be
         // counting something other than cancellation.
-        NativeSparseLu::factorize_csr(&plain_tridiagonal_csr(256), 1.0, PermutationOrdering::Natural)
-            .expect("tridiagonal factorization");
+        NativeSparseLu::factorize_csr(
+            &plain_tridiagonal_csr(256),
+            1.0,
+            PermutationOrdering::Natural,
+        )
+        .expect("tridiagonal factorization");
         assert_eq!(
             CANCELLATION_DROPS.with(|cell| cell.get()),
             (0, 0),
@@ -15837,7 +16233,7 @@ mod tests {
             f64::NEG_INFINITY,
             f64::MIN_POSITIVE,
             -f64::MIN_POSITIVE,
-            5e-324,  // smallest subnormal: nonzero, must NOT read as cancelled
+            5e-324, // smallest subnormal: nonzero, must NOT read as cancelled
             -5e-324,
             1.0,
             -1.0,
@@ -15879,7 +16275,10 @@ mod tests {
         assert!(!cancelled_by_min_magnitude(&clean), "no zero present");
         let mut with_zero = clean.clone();
         with_zero[37] = 0.0;
-        assert!(cancelled_by_min_magnitude(&with_zero), "a zero mid-run must be caught");
+        assert!(
+            cancelled_by_min_magnitude(&with_zero),
+            "a zero mid-run must be caught"
+        );
         let mut with_negative_zero = clean.clone();
         with_negative_zero[5] = -0.0;
         assert!(
@@ -15888,7 +16287,10 @@ mod tests {
         );
         let mut with_nan = clean;
         with_nan[9] = f64::NAN;
-        assert!(!cancelled_by_min_magnitude(&with_nan), "NaN is not a cancellation");
+        assert!(
+            !cancelled_by_min_magnitude(&with_nan),
+            "NaN is not a cancellation"
+        );
     }
 
     #[test]
@@ -15909,8 +16311,9 @@ mod tests {
         // must not perturb the elimination order either.
         let matrix = splu_dirichlet_laplacian_3d(8);
         let swapped = row_swapped_tridiagonal_csr(64);
-        let baseline_cubic = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
-            .expect("baseline cubic");
+        let baseline_cubic =
+            NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("baseline cubic");
         let baseline_swapped =
             NativeSparseLu::factorize_csr(&swapped, 1.0, PermutationOrdering::Natural)
                 .expect("baseline swapped");
@@ -15948,7 +16351,10 @@ mod tests {
         SPLU_ROW_CAPACITY_HEADROOM.store(0, Ordering::Relaxed);
         let clamped = row_capacity_headroom();
         SPLU_ROW_CAPACITY_HEADROOM.store(1, Ordering::Relaxed);
-        assert_eq!(clamped, 1, "headroom 0 must clamp to 1, not allocate nothing");
+        assert_eq!(
+            clamped, 1,
+            "headroom 0 must clamp to 1, not allocate nothing"
+        );
     }
 
     #[test]
@@ -16063,7 +16469,10 @@ mod tests {
         NativeSparseLu::factorize_csr(&thin, 1.0, PermutationOrdering::Natural)
             .expect("tridiagonal factorization");
         let (n, _, _) = PREFIX_STABILITY.with(|cell| cell.get());
-        assert_eq!(n, 0, "a fill-free factor has no pattern-changing update to pair");
+        assert_eq!(
+            n, 0,
+            "a fill-free factor has no pattern-changing update to pair"
+        );
     }
 
     #[test]
@@ -16132,7 +16541,11 @@ mod tests {
             let mean_run = span as f64 / calls.max(1) as f64;
             // Fraction of the COLUMN stream a perfect directory removes, then the share of
             // the whole 12-byte-per-entry row stream that represents.
-            let column_saved = if mean_run > 0.0 { 1.0 - 2.0 / mean_run } else { 0.0 };
+            let column_saved = if mean_run > 0.0 {
+                1.0 - 2.0 / mean_run
+            } else {
+                0.0
+            };
             println!(
                 "side={side}  calls={calls}  matched={span}  compared={bound}  \
                  match_rate={:.1}%  MEAN RUN={mean_run:.1} entries  \
@@ -16178,7 +16591,10 @@ mod tests {
                 "accepted candidates cannot exceed examined on {label}: \
                  {accepted} > {examined}"
             );
-            assert!(accepted > 0, "some candidate must actually update on {label}");
+            assert!(
+                accepted > 0,
+                "some candidate must actually update on {label}"
+            );
         }
     }
 
@@ -16210,8 +16626,7 @@ mod tests {
                 PermutationOrdering::Natural,
             ),
         ] {
-            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
-                .expect("factorization");
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering).expect("factorization");
             assert!(lu.n > 0);
             let (bucket, examined, accepted) = CANDIDATE_ADMISSION.with(|cell| cell.get());
             let pct = |part: usize, whole: usize| 100.0 * part as f64 / whole.max(1) as f64;
@@ -16325,13 +16740,11 @@ mod tests {
         // But the elimination GROWS every row as fill accumulates, and a grown row is
         // reallocated somewhere else entirely. The arena's value is whatever that growth
         // destroys.
-        for (label, matrix, ordering) in [
-            (
-                "THE MEASURED CELL: cubic side=16, Colamd",
-                splu_dirichlet_laplacian_3d(16),
-                PermutationOrdering::Colamd,
-            ),
-        ] {
+        for (label, matrix, ordering) in [(
+            "THE MEASURED CELL: cubic side=16, Colamd",
+            splu_dirichlet_laplacian_3d(16),
+            PermutationOrdering::Colamd,
+        )] {
             let n = matrix.shape().rows;
             let fill_perm = sparse_lu_fill_ordering(&matrix, n, ordering).0;
             let mut rows = match &fill_perm {
@@ -16439,7 +16852,11 @@ mod tests {
         // touches, blocked does 2 -- the full width-2 saving.
         let shared = vec![vec![], vec![], vec![0u32, 1], vec![0, 1]];
         let (seq, blk) = supernode_touch_reduction(&shared, &[2, 1, 1]);
-        assert_eq!((seq, blk), (4, 2), "shared rows must halve the touches at width 2");
+        assert_eq!(
+            (seq, blk),
+            (4, 2),
+            "shared rows must halve the touches at width 2"
+        );
 
         // DISJOINT: each column touches a different row. Sequential does 2 touches,
         // blocked does 2 -- NO saving, despite the identical width. This is the case
@@ -16502,7 +16919,11 @@ mod tests {
         // FULL: columns 0 and 1 both touch rows 2 and 3. Block is 2x2 and holds 4 entries.
         let full = vec![vec![], vec![], vec![0u32, 1], vec![0, 1]];
         let (stored, area) = supernode_block_density(&full, &[2, 1, 1]);
-        assert_eq!((stored, area), (4, 4), "a full block must price at density 1.0");
+        assert_eq!(
+            (stored, area),
+            (4, 4),
+            "a full block must price at density 1.0"
+        );
 
         // HOLLOW: column 0 touches row 2, column 1 touches row 3. The block still spans
         // 2 columns x 2 rows, but holds only 2 entries -- dense storage would do double
@@ -16558,12 +16979,20 @@ mod tests {
                 let widths = supernode_widths_from_symbolic(n, &l_pattern, tolerance);
                 let blocked_cols: usize = widths.iter().filter(|&&w| w >= 2).sum();
                 let (stored, area) = supernode_block_density(&l_pattern, &widths);
-                let density = if area == 0 { 0.0 } else { stored as f64 / area as f64 };
+                let density = if area == 0 {
+                    0.0
+                } else {
+                    stored as f64 / area as f64
+                };
                 println!(
                     "block density {label} t={tolerance}: cols_in_blocks={blocked_cols}/{n} \
                      stored={stored} block_area={area} density={density:.3} \
                      flop_multiplier={:.2}x",
-                    if density > 0.0 { 1.0 / density } else { f64::INFINITY }
+                    if density > 0.0 {
+                        1.0 / density
+                    } else {
+                        f64::INFINITY
+                    }
                 );
             }
         }
@@ -16578,9 +17007,21 @@ mod tests {
 
         // Identical tails: 2 columns, both reaching {5, 6}. Union is {5, 6}, so blocked
         // touches 2 x 2 = 4 and sequential touches 4. No tax.
-        let clean = vec![vec![5u32, 6], vec![5, 6], vec![], vec![], vec![], vec![], vec![]];
+        let clean = vec![
+            vec![5u32, 6],
+            vec![5, 6],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        ];
         let (seq, blk) = supernode_padding_cost(&clean, &[2, 5]);
-        assert_eq!((seq, blk), (4, 4), "identical tails must cost nothing to pad");
+        assert_eq!(
+            (seq, blk),
+            (4, 4),
+            "identical tails must cost nothing to pad"
+        );
 
         // Disjoint tails: column 0 reaches {5}, column 1 reaches {6}. Union is {5, 6}, so
         // blocked touches 2 x 2 = 4 where sequential touches 2 -- the tax is 2x, and it
@@ -16695,7 +17136,11 @@ mod tests {
             let pivoted = sequential.row_perm != (0..n).collect::<Vec<_>>();
             println!(
                 "supernodal plan on {label}: n={n} outcome={} sequential_pivoted={pivoted}",
-                if planned.is_some() { "PLANNED" } else { "DECLINED" }
+                if planned.is_some() {
+                    "PLANNED"
+                } else {
+                    "DECLINED"
+                }
             );
             if let Some(blocked) = planned {
                 assert_eq!(
@@ -16745,7 +17190,9 @@ mod tests {
             "the supernodal arm was enabled but declined on this fixture, so this test \
              compared the sequential path with itself and proved nothing"
         );
-        let rhs: Vec<f64> = (0..matrix.shape().rows).map(|i| 1.0 + (i % 5) as f64).collect();
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|i| 1.0 + (i % 5) as f64)
+            .collect();
         let a = splu_solve(&sequential, &rhs).expect("sequential solve");
         let b = splu_solve(&blocked, &rhs).expect("supernodal solve");
         assert_eq!(
@@ -16763,9 +17210,17 @@ mod tests {
         // BIT -- row_perm, fill_perm, L and U -- or the blocking has changed the answer.
         let mut exercised = 0usize;
         for (label, matrix, tolerance) in [
-            ("2D Laplacian, exact blocks", laplacian_2d_for_mmd(6), 0usize),
+            (
+                "2D Laplacian, exact blocks",
+                laplacian_2d_for_mmd(6),
+                0usize,
+            ),
             ("2D Laplacian, relaxed t=8", laplacian_2d_for_mmd(6), 8),
-            ("3D Dirichlet, relaxed t=8", splu_dirichlet_laplacian_3d(3), 8),
+            (
+                "3D Dirichlet, relaxed t=8",
+                splu_dirichlet_laplacian_3d(3),
+                8,
+            ),
         ] {
             let sequential =
                 NativeSparseLu::factorize_csr(&matrix, 0.0, PermutationOrdering::Natural)
@@ -16784,7 +17239,10 @@ mod tests {
             exercised += 1;
 
             assert_eq!(blocked.row_perm, sequential.row_perm, "row_perm on {label}");
-            assert_eq!(blocked.fill_perm, sequential.fill_perm, "fill_perm on {label}");
+            assert_eq!(
+                blocked.fill_perm, sequential.fill_perm,
+                "fill_perm on {label}"
+            );
             assert_eq!(
                 factor_value_bits(&blocked.l_rows),
                 factor_value_bits(&sequential.l_rows),
@@ -16862,7 +17320,14 @@ mod tests {
         let blocked_input = sorted_row_from_entries(vec![(2, 8.0), (5, 6.0), (11, 4.0)]);
         let mut blocked = SortedFactorRow::default();
         assert!(
-            apply_supernode_tails(&blocked_input, &mut blocked, 0, &multipliers, &union, &padded),
+            apply_supernode_tails(
+                &blocked_input,
+                &mut blocked,
+                0,
+                &multipliers,
+                &union,
+                &padded
+            ),
             "no intermediate value cancels here, so the blocked path must apply"
         );
 
@@ -16937,8 +17402,7 @@ mod tests {
 
         let seq_bits: Vec<(usize, u64)> =
             sequential.pairs().map(|(c, v)| (c, v.to_bits())).collect();
-        let blk_bits: Vec<(usize, u64)> =
-            blocked.pairs().map(|(c, v)| (c, v.to_bits())).collect();
+        let blk_bits: Vec<(usize, u64)> = blocked.pairs().map(|(c, v)| (c, v.to_bits())).collect();
         assert_eq!(
             blk_bits, seq_bits,
             "blocked supernode update must equal the sequential elimination BIT for BIT"
@@ -17164,7 +17628,10 @@ mod tests {
         }
         // Without fill there is no merge at all, and the partial path is only reached
         // from the merge, so a pass over fill-free cases would be vacuous.
-        assert!(filled, "no case generated fill, so no case entered the merge");
+        assert!(
+            filled,
+            "no case generated fill, so no case entered the merge"
+        );
         assert!(pivoted, "no case pivoted");
     }
 
@@ -17308,14 +17775,19 @@ mod tests {
             ),
         ] {
             SPLU_BACK_MERGE_ENABLE.store(false, Ordering::Relaxed);
-            let scratch_arm = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
-                .unwrap_or_else(|error| panic!("scratch-merge factorization on {label}: {error:?}"));
+            let scratch_arm =
+                NativeSparseLu::factorize_csr(&matrix, 1.0, ordering).unwrap_or_else(|error| {
+                    panic!("scratch-merge factorization on {label}: {error:?}")
+                });
             SPLU_BACK_MERGE_ENABLE.store(true, Ordering::Relaxed);
             let back_arm = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
                 .unwrap_or_else(|error| panic!("back-merge factorization on {label}: {error:?}"));
             SPLU_BACK_MERGE_ENABLE.store(false, Ordering::Relaxed);
 
-            assert_eq!(back_arm.row_perm, scratch_arm.row_perm, "row_perm on {label}");
+            assert_eq!(
+                back_arm.row_perm, scratch_arm.row_perm,
+                "row_perm on {label}"
+            );
             assert_eq!(
                 back_arm.fill_perm, scratch_arm.fill_perm,
                 "fill_perm on {label}"
@@ -17344,7 +17816,10 @@ mod tests {
             }
         }
         // Without fill there is no merge at all and the comparison is vacuous.
-        assert!(filled, "no case generated fill, so no case entered the merge");
+        assert!(
+            filled,
+            "no case generated fill, so no case entered the merge"
+        );
         assert!(pivoted, "no case pivoted");
     }
 
@@ -17420,7 +17895,16 @@ mod tests {
             // behaviour is under test. The extra column contributes `-0.0`, which
             // compares equal to zero and is therefore not inserted.
             apply_sorted_pivot_tail(
-                &mut row, &mut scratch, 0, 1.0, &cols, &vals, true, false, true, true,
+                &mut row,
+                &mut scratch,
+                0,
+                1.0,
+                &cols,
+                &vals,
+                true,
+                false,
+                true,
+                true,
             );
         }
         assert_eq!(
@@ -19712,6 +20196,111 @@ mod tests {
         let result = gmres(&a, &b, None, IterativeSolveOptions::default()).expect("gmres works");
         assert!(result.converged);
         assert_close_slice(&result.solution, &b, 1e-10);
+    }
+
+    #[test]
+    fn gmres_mgs_axpy_matches_indexed_reference_bitwise() {
+        let basis = [0.125, -0.375, 0.625, -0.875, 1.125];
+        let coefficient = -0.4375;
+        let mut indexed = [0.75, -0.5, 0.25, -0.125, 1.5];
+        let mut hoisted = indexed;
+
+        for index in 0..indexed.len() {
+            indexed[index] -= coefficient * basis[index];
+        }
+        subtract_scaled_basis_vector(&mut hoisted, coefficient, &basis);
+
+        for (index, (expected, actual)) in indexed.iter().zip(&hoisted).enumerate() {
+            assert_eq!(
+                expected.to_bits(),
+                actual.to_bits(),
+                "MGS component {index} changed bits"
+            );
+        }
+    }
+
+    #[test]
+    fn gmres_slab_basis_update_matches_jagged_reference_bitwise() {
+        let basis = vec![
+            vec![0.25, -0.5, 0.75, -1.0],
+            vec![-0.125, 0.375, -0.625, 0.875],
+            vec![1.25, -1.5, 1.75, -2.0],
+        ];
+        let slab: Vec<f64> = basis.iter().flatten().copied().collect();
+        let h = vec![
+            vec![2.0, -0.5, 0.25],
+            vec![0.0, 1.5, -0.75],
+            vec![0.0, 0.0, 3.0],
+        ];
+        let g = vec![0.5, -1.25, 2.0];
+        let mut jagged_solution = vec![0.125, -0.25, 0.375, -0.5];
+        let mut slab_solution = jagged_solution.clone();
+
+        update_solution(&mut jagged_solution, &basis, &h, &g, 3);
+        update_solution_slab(&mut slab_solution, &slab, 4, &h, &g, 3);
+
+        for (index, (expected, actual)) in jagged_solution.iter().zip(&slab_solution).enumerate() {
+            assert_eq!(
+                expected.to_bits(),
+                actual.to_bits(),
+                "slab basis update changed solution component {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn csr_matvec_five_entry_rows_match_generic_csr_order_bitwise() {
+        let indptr = [0, 5, 8];
+        let indices = [0, 2, 1, 3, 0, 3, 1, 2];
+        let data = [1.25, -0.5, 0.75, -1.0, 0.125, 2.0, -0.25, 0.5];
+        let x = [0.5, -1.5, 2.0, 0.25];
+        let mut actual = [0.0; 2];
+
+        csr_matvec_into_impl(&indptr, &indices, &data, &x, &mut actual, 1);
+
+        for row in 0..actual.len() {
+            let mut expected = 0.0;
+            for index in indptr[row]..indptr[row + 1] {
+                expected += data[index] * x[indices[index]];
+            }
+            assert_eq!(
+                actual[row].to_bits(),
+                expected.to_bits(),
+                "CSR row {row} changed the ordered dot-product bits"
+            );
+        }
+    }
+
+    #[test]
+    fn givens_column_update_matches_reloaded_reference_bitwise() {
+        let mut reference = vec![
+            vec![0.25, -0.5, 0.75, -1.0],
+            vec![-0.125, 0.375, -0.625, 0.875],
+            vec![1.25, -1.5, 1.75, -2.0],
+            vec![0.5, -0.75, 1.0, -1.25],
+        ];
+        let mut hoisted = reference.clone();
+        let cs = [0.8, -0.6, 0.35];
+        let sn = [0.6, 0.8, -0.936_749_699_759_759_7];
+        let column = 3;
+
+        for i in 0..column {
+            let temp = cs[i] * reference[i][column] + sn[i] * reference[i + 1][column];
+            reference[i + 1][column] =
+                -sn[i] * reference[i][column] + cs[i] * reference[i + 1][column];
+            reference[i][column] = temp;
+        }
+        apply_givens_to_column(&mut hoisted, &cs, &sn, column);
+
+        for (row, (expected, actual)) in reference.iter().zip(&hoisted).enumerate() {
+            for (entry, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                assert_eq!(
+                    expected.to_bits(),
+                    actual.to_bits(),
+                    "Givens entry ({row}, {entry}) changed bits"
+                );
+            }
+        }
     }
 
     /// frankenscipy-4u7vp. Scaling `A` and `b` by the same factor leaves the
@@ -22590,7 +23179,7 @@ mod tests {
 
     // ── LGMRES iterative solver tests ───────────────────────────────
 
-        /// A non-symmetric convection-diffusion operator, the shape LGMRES is meant for.
+    /// A non-symmetric convection-diffusion operator, the shape LGMRES is meant for.
     fn convection_diffusion_csr(n: usize, beta: f64, diag: f64) -> CsrMatrix {
         let mut rows: Vec<usize> = Vec::new();
         let mut cols: Vec<usize> = Vec::new();
@@ -26431,6 +27020,24 @@ pub static SPLU_BACK_MERGE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
 ///
 /// INERT under natural ordering — with `fill_perm == None` there is nothing to materialize, so
 /// both arms are the same loop and any ratio taken on such a fixture is measuring noise.
+/// When `true`, `apply_supernode_tails` runs the PRE-`frankenscipy-9nw95` merge walk:
+/// the `k`-th tail row rebuilt as a slice per pivot to read one element, and the
+/// destination indexed through the `Vec` on every store.
+///
+/// ACCURACY CONTRACT: **bit-identical**, by construction rather than by tolerance. Both arms
+/// read the same elements in the same `k` order, perform the same additions in the same
+/// association, and take the same cancellation-refusal branches; only the ADDRESSING of the
+/// reads and the destination differs. `merge_kernel_ab_arms_are_bit_identical` executes that
+/// claim with `to_bits()` on fixtures that reach the fill branch, the reuse branch and the
+/// tail drain.
+///
+/// Exists so the comparison is PAIRED inside one binary and one window. It is not a tuning
+/// knob. Counted, the two arms differ by 18,194 vs 17,297 Ir per call and 12.010 vs 12.000 Ir
+/// per element-update — an effect far below what this cell's A/A nulls can resolve across two
+/// separate invocations, which is exactly why an in-binary toggle is the only honest
+/// instrument for it.
+#[doc(hidden)]
+pub static SPLU_MERGE_FORCE_LEGACY_WALK: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_SOLVE_FORCE_MATERIALIZED_RHS: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
@@ -27145,7 +27752,9 @@ mod scipy_default_iteration_limits {
 #[cfg(test)]
 mod lsmr_damp_tests {
     use super::{
-        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsmr, lsmr_damped, FormatConvertible};
+        CooMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, SparseError, lsmr,
+        lsmr_damped,
+    };
 
     /// A rank-deficient 3x2: both columns identical, so `AᵀA` is singular and the
     /// UNDAMPED problem has no unique minimizer. This is the case `damp` exists for.
@@ -27196,7 +27805,10 @@ mod lsmr_damp_tests {
                 "component {i} differs at damp=0: {x} vs {y}"
             );
         }
-        assert_eq!(plain.iterations, damped.iterations, "iteration counts differ");
+        assert_eq!(
+            plain.iterations, damped.iterations,
+            "iteration counts differ"
+        );
         assert_eq!(
             plain.residual_norm.to_bits(),
             damped.residual_norm.to_bits(),
@@ -27269,7 +27881,10 @@ mod lsmr_damp_tests {
         }
         // MUST-MISS: an ordinary damp is NOT rejected, or the guard would be
         // satisfying the test above by refusing everything.
-        assert!(lsmr_damped(&a, &b, 0.25, opts()).is_ok(), "0.25 was rejected");
+        assert!(
+            lsmr_damped(&a, &b, 0.25, opts()).is_ok(),
+            "0.25 was rejected"
+        );
     }
 }
 
@@ -27277,7 +27892,9 @@ mod lsmr_damp_tests {
 #[cfg(test)]
 mod lsqr_damp_tests {
     use super::{
-        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsqr, lsqr_damped, FormatConvertible};
+        CooMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, SparseError, lsqr,
+        lsqr_damped,
+    };
 
     /// Rank-deficient 3x2: both columns identical, so `A^T A` is singular and the
     /// UNDAMPED problem has no unique minimizer. That is the case damp exists for.
@@ -27321,7 +27938,10 @@ mod lsqr_damp_tests {
                 "component {i} differs at damp=0: {x} vs {y}"
             );
         }
-        assert_eq!(plain.iterations, damped.iterations, "iteration counts differ");
+        assert_eq!(
+            plain.iterations, damped.iterations,
+            "iteration counts differ"
+        );
         assert_eq!(
             plain.residual_norm.to_bits(),
             damped.residual_norm.to_bits(),
@@ -27410,7 +28030,10 @@ mod lsqr_damp_tests {
                 "damp = {bad} was accepted"
             );
         }
-        assert!(lsqr_damped(&a, &b, 0.25, opts()).is_ok(), "0.25 was rejected");
+        assert!(
+            lsqr_damped(&a, &b, 0.25, opts()).is_ok(),
+            "0.25 was rejected"
+        );
     }
 }
 
@@ -27418,8 +28041,9 @@ mod lsqr_damp_tests {
 #[cfg(test)]
 mod lsmr_x0_tests {
     use super::{
-        CooMatrix, CsrMatrix, IterativeSolveOptions, SparseError, Shape2D, lsmr,
-        lsmr_regularized, FormatConvertible};
+        CooMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, SparseError, lsmr,
+        lsmr_regularized,
+    };
 
     /// Well-conditioned 3x2 with a unique least-squares solution, so a warm start
     /// has a definite answer to converge to.
@@ -27548,8 +28172,9 @@ mod lsmr_x0_tests {
 #[cfg(test)]
 mod lsqr_x0_tests {
     use super::{
-        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, lsmr_regularized,
-        lsqr, lsqr_regularized, FormatConvertible};
+        CooMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, SparseError,
+        lsmr_regularized, lsqr, lsqr_regularized,
+    };
 
     fn overdetermined() -> (CsrMatrix, Vec<f64>) {
         let a = CooMatrix::from_triplets(
@@ -27583,7 +28208,10 @@ mod lsqr_x0_tests {
             assert_eq!(x.to_bits(), y.to_bits(), "component {i}: {x} vs {y}");
         }
         assert_eq!(plain.iterations, general.iterations);
-        assert_eq!(plain.residual_norm.to_bits(), general.residual_norm.to_bits());
+        assert_eq!(
+            plain.residual_norm.to_bits(),
+            general.residual_norm.to_bits()
+        );
     }
 
     /// MUST-HIT: a warm start reaches the same unique minimizer, from a guess that is
@@ -27653,8 +28281,7 @@ mod lsqr_x0_tests {
         );
 
         // MUST-MISS: it is NOT the shrink-toward-origin answer.
-        let toward_origin =
-            lsqr_regularized(&a, &b, damp, None, opts()).expect("damped cold");
+        let toward_origin = lsqr_regularized(&a, &b, damp, None, opts()).expect("damped cold");
         let apart: f64 = toward_origin
             .solution
             .iter()
@@ -27901,8 +28528,9 @@ pub fn tfqmr(
 #[cfg(test)]
 mod tfqmr_tests {
     use super::{
-        CooMatrix, CsrMatrix, IterativeSolveOptions, Shape2D, SparseError, bicgstab, gmres,
-        tfqmr, FormatConvertible};
+        CooMatrix, CsrMatrix, FormatConvertible, IterativeSolveOptions, Shape2D, SparseError,
+        bicgstab, gmres, tfqmr,
+    };
 
     /// NONSYMMETRIC and diagonally dominant. Nonsymmetric because TFQMR exists for
     /// exactly that case and a symmetric fixture would let a subtly wrong recurrence
@@ -28145,7 +28773,10 @@ pub fn spbandwidth(a: &CsrMatrix) -> (usize, usize) {
 /// Sparsity-structure predicates -- `is_sptriangular` and `spbandwidth`.
 #[cfg(test)]
 mod structure_predicate_tests {
-    use super::{CooMatrix, CsrMatrix, Shape2D, csr_bandwidth, is_sptriangular, spbandwidth, FormatConvertible};
+    use super::{
+        CooMatrix, CsrMatrix, FormatConvertible, Shape2D, csr_bandwidth, is_sptriangular,
+        spbandwidth,
+    };
 
     fn build(n: usize, entries: &[(usize, usize)]) -> CsrMatrix {
         let vals: Vec<f64> = entries.iter().map(|_| 1.0).collect();
@@ -28321,12 +28952,7 @@ mod structure_predicate_tests {
 ///
 /// `tol` is the relative tolerance for the series termination, defaulting to `2^-53`
 /// (SciPy's `u_d`) when a non-positive value is passed.
-pub fn expm_multiply(
-    a: &CsrMatrix,
-    b: &[f64],
-    t: f64,
-    tol: f64,
-) -> SparseResult<Vec<f64>> {
+pub fn expm_multiply(a: &CsrMatrix, b: &[f64], t: f64, tol: f64) -> SparseResult<Vec<f64>> {
     let shape = a.shape();
     if !shape.is_square() {
         return Err(SparseError::InvalidShape {
@@ -28348,7 +28974,11 @@ pub fn expm_multiply(
         return Ok(Vec::new());
     }
 
-    let tol = if tol > 0.0 { tol } else { f64::EPSILON / 2.0 /* 2^-53, SciPy's u_d; EPSILON is 2^-52 */ };
+    let tol = if tol > 0.0 {
+        tol
+    } else {
+        f64::EPSILON / 2.0 /* 2^-53, SciPy's u_d; EPSILON is 2^-52 */
+    };
 
     // mu = tr(A)/n, and A' = A - mu*I. Only the diagonal is touched, so the shift
     // costs one pass over the stored entries rather than a matrix copy.
@@ -28433,7 +29063,9 @@ pub fn expm_multiply(
 #[cfg(test)]
 mod expm_multiply_tests {
     use super::{
-        CooMatrix, CsrMatrix, ExpmOptions, Shape2D, SparseError, expm, expm_multiply, FormatConvertible};
+        CooMatrix, CsrMatrix, ExpmOptions, FormatConvertible, Shape2D, SparseError, expm,
+        expm_multiply,
+    };
 
     fn diag(values: &[f64]) -> CsrMatrix {
         let n = values.len();
@@ -28552,16 +29184,10 @@ mod expm_multiply_tests {
             ),
             "a non-finite t was accepted"
         );
-        let rect = CooMatrix::from_triplets(
-            Shape2D::new(2, 3),
-            vec![1.0],
-            vec![0],
-            vec![0],
-            true,
-        )
-        .expect("coo")
-        .to_csr()
-        .expect("csr");
+        let rect = CooMatrix::from_triplets(Shape2D::new(2, 3), vec![1.0], vec![0], vec![0], true)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
         assert!(
             matches!(
                 expm_multiply(&rect, &[1.0, 2.0], 1.0, 0.0),

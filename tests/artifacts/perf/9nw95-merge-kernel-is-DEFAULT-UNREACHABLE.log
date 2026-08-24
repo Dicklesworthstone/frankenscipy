@@ -1,0 +1,97 @@
+### frankenscipy-9nw95 — THE MERGE KERNEL I OPTIMIZED IS UNREACHABLE IN THE DEFAULT BUILD
+
+BlackThrush, 2026-08-24. This corrects my own reporting on this bead tonight.
+
+## HOW IT SURFACED
+
+The paired A/B instrument landed in 775d4a3e6 prints `merge_ab_dispatch_observed=` before any
+timing and REFUSES the run if the library never consults the toggle. On its first invocation:
+
+    merge_ab_dispatch_observed=false
+    CONVECTION_SPLU_LIVE_FATAL the merge-kernel A/B toggle was never consulted: the two arms
+    are the same code and no ratio from them is reportable
+
+The two-arm probe control fired on its first use and refused to produce a number. Without it I
+would have reported a paired ratio built from two arms that were the same code.
+
+## THE FACT
+
+    `apply_supernode_tails` has exactly ONE non-test caller:
+        NativeSparseLu::factorize_csr_supernodal   (linalg.rs:3395)
+
+    which is reached only here (linalg.rs:4740):
+        let native = if SPLU_SUPERNODAL_ENABLE.load(Ordering::Relaxed) {
+            NativeSparseLu::factorize_csr_supernodal(...)
+        } else {
+            ... factorize_csr(...)
+        };
+
+    and:
+        pub static SPLU_SUPERNODAL_ENABLE: PerfToggle = PerfToggle::new(false);   // DEFAULT OFF
+
+So the merge kernel is dead code in the shipping configuration. The default factorization runs
+`factorize_csr`, whose hot kernel is `apply_sorted_pivot_tail` — a different function with a
+different signature (one pivot's tail, not a flat width x span buffer), already carrying its own
+optimization history.
+
+This is consistent with this bead's own closure, which says the supernodal line was kept
+"in-tree behind default-off toggles (SPLU_SUPERNODAL_ENABLE), deliberately not deleted". I read
+that sentence and did not connect it to the kernel I was working on.
+
+## WHAT THAT DOES TO MY RESULTS ON THIS BEAD
+
+STILL TRUE, as statements about that kernel — both counted under callgrind, both bit-identical,
+both with driver tests:
+
+  * b923646ab   inner loop   15.000 -> 12.010 Ir per element-update
+  * 6c147ffd6   outer walk   18,194 -> 17,297 Ir per call
+
+NOT TRUE, and I said it: that these could move the shipping cell. I wrote "the merge inner loop
+is part of the factor, the factor is roughly two thirds of a factor-plus-16-solves job, so a
+19.9% cut is worth plausibly a few percent". The premise is wrong. The merge kernel is 0% of the
+default job, and the correct predicted end-to-end effect was EXACTLY ZERO, not "a few percent".
+
+That retroactively explains both end-to-end rows, and I am withdrawing the reading I gave the
+first one:
+
+  * 0.663058 -> 0.713729, CIs disjoint, nulls clean. I called this "consistent with the count"
+    and attributed ~1.7% to the lever. THAT ATTRIBUTION IS WITHDRAWN. The lever cannot have
+    contributed anything. The move was run-to-run variation, which is exactly what the
+    across-run caveat I attached to it warned about — the caveat was right and my attribution
+    ignored my own caveat.
+  * 0.713729 -> 0.700061, control null biased, statistics disagreeing in sign. Correctly
+    classified as a NON-CLAIM at the time; now explained rather than merely flagged.
+
+## WHAT IS STILL WORTH SOMETHING
+
+  * The instrument. The paired toggle, the bit-identity driver across all three code paths, and
+    the dispatch refusal are correct and are what caught this. That refusal is now a permanent
+    guard on the convection arm.
+  * The counted method. The bar this bead set for a successor — Ir per element-update — remains
+    the right currency, and the cost decomposition (per call = constant + slope x elements) is
+    reusable on any kernel.
+  * A REJECT that is now sharper: the supernodal path's merge kernel is 1.05x cheaper than it
+    was, so the dense-scatter design this bead rejected is now measured against a FASTER
+    baseline. That widens the gap that made it a REJECT rather than narrowing it.
+
+## WHAT SHOULD HAPPEN NEXT, and what should NOT
+
+SHOULD NOT: further optimization of `apply_supernode_tails` on the theory that it helps the
+product. It cannot, while `SPLU_SUPERNODAL_ENABLE` is false.
+
+SHOULD: any future splu factor lever targets `apply_sorted_pivot_tail` and the `factorize_csr`
+path, and any harness A/B for it must carry the same dispatch proof this one does — because the
+lesson here is that a kernel can look hot in a microbenchmark and be unreachable in production,
+and only a dispatch check distinguishes those.
+
+NOT REVERTED: the two counted levers stay. They are bit-identical, tested, and strictly less
+work on code that is still in the tree and still reachable when the toggle is enabled. Reverting
+would be churn with no benefit. What changes is the CLAIM attached to them, which is this file.
+
+## PROVENANCE
+
+host=thinkstation1, source_commit 775d4a3e6, perf_spsolve ELF
+8a8ccadf7dfed7715795bcbb2058109205038b7af7268dd1eae3c3773d2493c0, source marker
+`perf-spsolve-freshness-a`, `merge_ab_dispatch_observed=false` printed by the run itself.
+build_slot REFUSED server-side (frankenscipy-fr78g); build_route=local-wrapper-bypass; private
+target dir (frankenscipy-y9bzw).
