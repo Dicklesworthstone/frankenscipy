@@ -25,9 +25,13 @@ fn make_diag_dominant(n: usize, seed: u64) -> Vec<Vec<f64>> {
     let mut a = vec![vec![0.0; n]; n];
     for i in 0..n {
         for j in 0..n {
-            let r = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000) as f64
-                / 1000.0;
-            a[i][j] = if i == j { (n as f64) * 2.0 + r } else { r - 0.5 };
+            let r =
+                ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000) as f64 / 1000.0;
+            a[i][j] = if i == j {
+                (n as f64) * 2.0 + r
+            } else {
+                r - 0.5
+            };
         }
     }
     a

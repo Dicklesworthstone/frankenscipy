@@ -49,20 +49,22 @@ fn main() {
             if let Ok(sos) = butter_sos(*order, &[*wn], *btype)
                 && let Ok(fr) = sosfreqz(&sos, Some(64))
             {
-                let mags: Vec<String> =
-                    fr.h_mag.iter().map(|m| format!("{m:.17e}")).collect();
+                let mags: Vec<String> = fr.h_mag.iter().map(|m| format!("{m:.17e}")).collect();
                 println!("MAG arm={arm} case={label} {}", mags.join(","));
             }
 
             match butter(*order, &[*wn], *btype) {
                 Ok(ba) => {
-                    let flat: Vec<String> = ba
-                        .b
-                        .iter()
-                        .chain(ba.a.iter())
-                        .map(|v| format!("{v:.17e}"))
-                        .collect();
-                    println!("BA arm={arm} case={label} nb={} {}", ba.b.len(), flat.join(","));
+                    let flat: Vec<String> =
+                        ba.b.iter()
+                            .chain(ba.a.iter())
+                            .map(|v| format!("{v:.17e}"))
+                            .collect();
+                    println!(
+                        "BA arm={arm} case={label} nb={} {}",
+                        ba.b.len(),
+                        flat.join(",")
+                    );
                 }
                 Err(e) => println!("SOS arm={arm} case={label} ERROR {e:?}"),
             }

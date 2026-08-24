@@ -737,7 +737,8 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     let q0 = betainc_scalar(b, a0, y1, RuntimeMode::Strict).unwrap_or(f64::NAN);
     // u(a) = y^a (1−y)^b · Γ(a+b)/(Γ(a+1)Γ(b)), the recurrence increment shared
     // with `ncfdtr`; (1−y)^b taken as b·ln(y1) so it stays exact for y → 1.
-    let u0 = (a0 * y.ln() + b * y1.ln()
+    let u0 = (a0 * y.ln()
+        + b * y1.ln()
         + gammaln_scalar(a0 + b, RuntimeMode::Strict).unwrap_or(f64::NAN)
         - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
         - gammaln_scalar(b, RuntimeMode::Strict).unwrap_or(f64::NAN))
@@ -4140,13 +4141,62 @@ mod tests {
     fn ncfdtrc_matches_scipy_survival_where_one_minus_cdf_erodes_then_collapses() {
         // dfn, dfd, nc, f, scipy.stats.ncf.sf, and what 1 - ncfdtr gives instead.
         let cases = [
-            (3.0, 5.0, 2.0, 20.0, 9.362_115_386_065_090e-3, "9.362115e-03 ok"),
-            (2.0, 20.0, 1.0, 60.0, 3.851_245_644_126_540e-8, "3.851246e-08 ok"),
-            (10.0, 10.0, 40.0, 100.0, 1.168_395_145_190_737e-5, "1.168395e-05 ok"),
-            (5.0, 10.0, 3.0, 500.0, 8.759_364_975_614_790e-11, "8.759360e-11, 7 digits"),
-            (3.0, 5.0, 2.0, 1e6, 2.330_338_627_458_045e-14, "2.331468e-14, 3 digits"),
-            (3.0, 5.0, 2.0, 1e12, 2.330_354_877_710_844e-29, "0.0 COLLAPSED"),
-            (5.0, 200.0, 3.0, 1e4, 4.498_173_170_614_720e-230, "0.0 COLLAPSED"),
+            (
+                3.0,
+                5.0,
+                2.0,
+                20.0,
+                9.362_115_386_065_090e-3,
+                "9.362115e-03 ok",
+            ),
+            (
+                2.0,
+                20.0,
+                1.0,
+                60.0,
+                3.851_245_644_126_540e-8,
+                "3.851246e-08 ok",
+            ),
+            (
+                10.0,
+                10.0,
+                40.0,
+                100.0,
+                1.168_395_145_190_737e-5,
+                "1.168395e-05 ok",
+            ),
+            (
+                5.0,
+                10.0,
+                3.0,
+                500.0,
+                8.759_364_975_614_790e-11,
+                "8.759360e-11, 7 digits",
+            ),
+            (
+                3.0,
+                5.0,
+                2.0,
+                1e6,
+                2.330_338_627_458_045e-14,
+                "2.331468e-14, 3 digits",
+            ),
+            (
+                3.0,
+                5.0,
+                2.0,
+                1e12,
+                2.330_354_877_710_844e-29,
+                "0.0 COLLAPSED",
+            ),
+            (
+                5.0,
+                200.0,
+                3.0,
+                1e4,
+                4.498_173_170_614_720e-230,
+                "0.0 COLLAPSED",
+            ),
         ];
         for (dfn, dfd, nc, f, want, note) in cases {
             let got = ncfdtrc(dfn, dfd, nc, f);

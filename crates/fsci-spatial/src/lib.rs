@@ -13913,7 +13913,9 @@ mod toggle_ab_mahalanobis_assembly {
     /// making the comparison stronger.
     #[test]
     fn mahalanobis_assembly_toggle_is_byte_identical() {
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         const NA: usize = 2048;
         const NB: usize = 2048;
@@ -13938,7 +13940,9 @@ mod toggle_ab_mahalanobis_assembly {
         );
 
         let pt = |i: u64, j: u64| {
-            let k = i.wrapping_mul(2_654_435_761).wrapping_add(j.wrapping_mul(40_503));
+            let k = i
+                .wrapping_mul(2_654_435_761)
+                .wrapping_add(j.wrapping_mul(40_503));
             ((k % 100_003) as f64) / 1000.0
         };
         let xa: Vec<Vec<f64>> = (0..NA)
@@ -13963,10 +13967,7 @@ mod toggle_ab_mahalanobis_assembly {
         // A result that is all zeros -- or all NaN -- compares equal in both arms
         // while exercising nothing, so the fixture is checked for signal first.
         assert!(
-            serial
-                .iter()
-                .flatten()
-                .any(|v| v.is_finite() && *v > 0.0),
+            serial.iter().flatten().any(|v| v.is_finite() && *v > 0.0),
             "mahalanobis fixture is degenerate: no positive finite distance"
         );
 
