@@ -15206,8 +15206,7 @@ impl LSQBivariateSpline {
 
         Ok(Self {
             inner: SmoothBivariateSpline::from_fitted(
-                kx, ky, bbox, tx, ty, coeffs, nx_coeffs, ny_coeffs, 0.0, x, y, z,
-                &weights,
+                kx, ky, bbox, tx, ty, coeffs, nx_coeffs, ny_coeffs, 0.0, x, y, z, &weights,
             ),
         })
     }
@@ -15274,9 +15273,10 @@ impl LSQBivariateSpline {
 
 /// Min and max of a slice, used for the default bounding box.
 fn bounds_of(v: &[f64]) -> (f64, f64) {
-    v.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
-        (lo.min(x), hi.max(x))
-    })
+    v.iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+            (lo.min(x), hi.max(x))
+        })
 }
 
 /// Interior knots must be finite, strictly increasing, and strictly inside the
@@ -15287,12 +15287,7 @@ fn bounds_of(v: &[f64]) -> (f64, f64) {
 /// the basis singular. FITPACK rejects it, and so does this -- a fit that came back
 /// with NaN coefficients from a singular basis would be far harder to diagnose than
 /// a message naming the offending knot.
-fn check_interior_knots(
-    knots: &[f64],
-    lo: f64,
-    hi: f64,
-    label: &str,
-) -> Result<(), InterpError> {
+fn check_interior_knots(knots: &[f64], lo: f64, hi: f64, label: &str) -> Result<(), InterpError> {
     for (i, &k) in knots.iter().enumerate() {
         if !k.is_finite() {
             return Err(InterpError::InvalidArgument {
@@ -15373,8 +15368,7 @@ mod lsq_bivariate_spline_tests {
     #[test]
     fn a_bilinear_surface_is_reproduced_exactly() {
         let (x, y, z) = bilinear_samples();
-        let spline = LSQBivariateSpline::new(&x, &y, &z, &[2.0], &[2.0], opts(1, 1))
-            .expect("fit");
+        let spline = LSQBivariateSpline::new(&x, &y, &z, &[2.0], &[2.0], opts(1, 1)).expect("fit");
 
         for (i, (&xi, &yi)) in x.iter().zip(&y).enumerate() {
             let got = spline.eval(xi, yi);

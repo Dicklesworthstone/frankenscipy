@@ -70,9 +70,13 @@ fn diag_dominant_sym(n: usize, seed: u64) -> DMatrix<f64> {
     let mut a = DMatrix::zeros(n, n);
     for i in 0..n {
         for j in 0..=i {
-            let r = ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000) as f64
-                / 1000.0;
-            let v = if i == j { (n as f64) * 2.0 + r } else { r - 0.5 };
+            let r =
+                ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000) as f64 / 1000.0;
+            let v = if i == j {
+                (n as f64) * 2.0 + r
+            } else {
+                r - 0.5
+            };
             a[(i, j)] = v;
             a[(j, i)] = v;
         }
@@ -266,7 +270,11 @@ fn probe_svd(tally: &mut Tally, label: &str, m: DMatrix<f64>) {
         //     only the ORDER differs -- a tie-breaking difference, not a numerical one.
         //   * the worst RELATIVE gap position-by-position: sizes a real disagreement.
         //   * the count of positions differing at all.
-        let mut a: Vec<u64> = bounded.singular_values.iter().map(|v| v.to_bits()).collect();
+        let mut a: Vec<u64> = bounded
+            .singular_values
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
         let mut b: Vec<u64> = unbounded
             .singular_values
             .iter()
@@ -341,25 +349,12 @@ fn main() {
     // void rather than negative.
     let control_m = ill_conditioned(16, 7);
     let sym_fires = SymmetricEigen::try_new(control_m.clone(), f64::EPSILON, 1).is_none();
-    let svd_fires = SVD::try_new(
-        rect(16, 16, 7, false),
-        true,
-        true,
-        SVD_NEW_EPSILON,
-        1,
-    )
-    .is_none();
+    let svd_fires = SVD::try_new(rect(16, 16, 7, false), true, true, SVD_NEW_EPSILON, 1).is_none();
     // And the must-MISS half of the same control: at a generous bound the SAME inputs must
     // come back `Some`, or the detector is simply always-None and equally blind.
     let sym_misses = SymmetricEigen::try_new(control_m, f64::EPSILON, 100_000).is_some();
-    let svd_misses = SVD::try_new(
-        rect(16, 16, 7, false),
-        true,
-        true,
-        SVD_NEW_EPSILON,
-        100_000,
-    )
-    .is_some();
+    let svd_misses =
+        SVD::try_new(rect(16, 16, 7, false), true, true, SVD_NEW_EPSILON, 100_000).is_some();
     println!(
         "CONTROL sym_fires_at_1={sym_fires} svd_fires_at_1={svd_fires} \
 sym_converges_at_100k={sym_misses} svd_converges_at_100k={svd_misses}"
@@ -448,11 +443,21 @@ fn emit_environment() {
     let (idle, iowait, total) = if fields.len() > 5 {
         let nums: Vec<u64> = fields[1..].iter().filter_map(|f| f.parse().ok()).collect();
         let total: u64 = nums.iter().sum();
-        (nums.get(3).copied().unwrap_or(0), nums.get(4).copied().unwrap_or(0), total)
+        (
+            nums.get(3).copied().unwrap_or(0),
+            nums.get(4).copied().unwrap_or(0),
+            total,
+        )
     } else {
         (0, 0, 0)
     };
-    let pct = |v: u64| if total == 0 { 0.0 } else { 100.0 * v as f64 / total as f64 };
+    let pct = |v: u64| {
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * v as f64 / total as f64
+        }
+    };
     println!(
         "ENV host={host} loadavg=[{loadavg}] cpu_mhz={mhz} \
 idle_pct_since_boot={:.1} iowait_pct_since_boot={:.2} logical_cpus={}",

@@ -39,11 +39,11 @@ pub use minimize::{
 // `anderson_nonlin`. Rename it freely; the point of this edit is only that a
 // crate which does not build is strictly worse than either naming.
 pub use nonlin::{
-    AndersonJacobian, BroydenJacobian, BroydenVariant, DiagBroydenJacobian,
-    ExcitingMixingJacobian, InnerMethod, InverseJacobian, Jacobian, KrylovJacobian,
-    LineSearch, LinearMixingJacobian, LowRankMatrix, NonlinJacobian, NonlinOptions,
-    NonlinMethod, NonlinResult, ReductionMethod, anderson as anderson_nonlin, broyden1_lowrank,
-    broyden2_lowrank, root_nonlin, diag_broyden, exciting_mixing, linear_mixing, nonlin_solve,
+    AndersonJacobian, BroydenJacobian, BroydenVariant, DiagBroydenJacobian, ExcitingMixingJacobian,
+    InnerMethod, InverseJacobian, Jacobian, KrylovJacobian, LineSearch, LinearMixingJacobian,
+    LowRankMatrix, NonlinJacobian, NonlinMethod, NonlinOptions, NonlinResult, ReductionMethod,
+    anderson as anderson_nonlin, broyden1_lowrank, broyden2_lowrank, diag_broyden, exciting_mixing,
+    linear_mixing, nonlin_solve, root_nonlin,
 };
 pub use root::{
     MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult,
@@ -8880,8 +8880,7 @@ impl BfgsHessian {
             HessianApproxType::Hess => {
                 for i in 0..n {
                     for j in 0..n {
-                        self.matrix[i * n + j] +=
-                            -mw[i] * mw[j] / wmw + z[i] * z[j] / wz;
+                        self.matrix[i * n + j] += -mw[i] * mw[j] / wmw + z[i] * z[j] / wz;
                     }
                 }
             }
@@ -8987,7 +8986,6 @@ impl Sr1Hessian {
     }
 }
 
-
 /// The interface both quasi-Newton strategies present
 /// -- `scipy.optimize.HessianUpdateStrategy`.
 ///
@@ -9057,20 +9055,16 @@ impl HessianUpdateStrategy for Sr1Hessian {
 /// happens to produce.
 #[cfg(test)]
 mod hessian_update_strategy_tests {
-    use super::{
-        BfgsExceptionStrategy, BfgsHessian, HessianApproxType, Sr1Hessian,
-    };
+    use super::{BfgsExceptionStrategy, BfgsHessian, HessianApproxType, Sr1Hessian};
 
     /// A fixed SPD matrix. Steps are drawn against it so that `y = A s` is a genuine
     /// curvature pair and the strategies have something true to converge to.
-    const A: [[f64; 3]; 3] = [
-        [4.0, 1.0, 0.5],
-        [1.0, 3.0, -0.25],
-        [0.5, -0.25, 2.0],
-    ];
+    const A: [[f64; 3]; 3] = [[4.0, 1.0, 0.5], [1.0, 3.0, -0.25], [0.5, -0.25, 2.0]];
 
     fn a_times(s: &[f64]) -> Vec<f64> {
-        (0..3).map(|i| (0..3).map(|j| A[i][j] * s[j]).sum()).collect()
+        (0..3)
+            .map(|i| (0..3).map(|j| A[i][j] * s[j]).sum())
+            .collect()
     }
 
     fn dot(a: &[f64], b: &[f64]) -> f64 {
@@ -9220,7 +9214,10 @@ mod hessian_update_strategy_tests {
         // Negative curvature: s . y < 0. SR1 absorbs it.
         let s_neg = vec![0.0, 1.0, 0.0];
         let y_neg = vec![0.1, -2.0, 0.3];
-        assert!(dot(&s_neg, &y_neg) < 0.0, "the test pair is not negative curvature");
+        assert!(
+            dot(&s_neg, &y_neg) < 0.0,
+            "the test pair is not negative curvature"
+        );
         b.update(&s_neg, &y_neg);
         let bs_neg = b.dot(&s_neg);
         for i in 0..3 {
@@ -9256,7 +9253,10 @@ mod hessian_update_strategy_tests {
         assert!(dot(&s_bad, &y_bad) < 0.0);
         b.update(&s_bad, &y_bad);
         let after: Vec<u64> = b.get_matrix().iter().map(|v| v.to_bits()).collect();
-        assert_eq!(before, after, "a curvature-violating step was absorbed anyway");
+        assert_eq!(
+            before, after,
+            "a curvature-violating step was absorbed anyway"
+        );
 
         // MUST-MISS the guard: a good step still gets through.
         let (s_ok, y_ok) = steps().remove(2);
@@ -9293,7 +9293,10 @@ mod hessian_update_strategy_tests {
         );
         // Damping exists to KEEP positive definiteness; the point is lost if it does
         // not. Positive `mc` and positive `wMw` make the damped curvature positive.
-        assert!(wz_new > 0.0, "damping left the matrix without positive curvature");
+        assert!(
+            wz_new > 0.0,
+            "damping left the matrix without positive curvature"
+        );
     }
 
     /// Zero steps and zero gradient changes carry no curvature information and are
@@ -9308,20 +9311,29 @@ mod hessian_update_strategy_tests {
         b.update(&[0.0, 0.0, 0.0], &[1.0, 2.0, 3.0]);
         assert_eq!(
             base,
-            b.get_matrix().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.get_matrix()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
             "a zero step changed the approximation"
         );
         b.update(&[1.0, 2.0, 3.0], &[0.0, 0.0, 0.0]);
         assert_eq!(
             base,
-            b.get_matrix().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.get_matrix()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
             "a zero gradient change changed the approximation"
         );
         // Mismatched lengths are ignored rather than panicking or reading past the end.
         b.update(&[1.0, 2.0], &[1.0, 2.0]);
         assert_eq!(
             base,
-            b.get_matrix().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.get_matrix()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
             "a wrong-length step changed the approximation"
         );
 
@@ -9330,7 +9342,10 @@ mod hessian_update_strategy_tests {
         b.update(&s, &y);
         assert_ne!(
             base,
-            b.get_matrix().iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            b.get_matrix()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
             "a valid step was ignored too"
         );
     }

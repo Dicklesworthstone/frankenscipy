@@ -442,10 +442,7 @@ for raw_line in sys.stdin.buffer:
     /// nothing.
     pub fn null_margin(effect: &Paired, nulls: &[&Paired]) -> f64 {
         let deviation = |p: &Paired| (p.ratio_lo - 1.0).abs().max((p.ratio_hi - 1.0).abs());
-        let null_dev = nulls
-            .iter()
-            .map(|p| deviation(p))
-            .fold(0.0_f64, f64::max);
+        let null_dev = nulls.iter().map(|p| deviation(p)).fold(0.0_f64, f64::max);
         let effect_dev = (effect.ratio_p50 - 1.0).abs();
         if null_dev > 0.0 {
             effect_dev / null_dev
@@ -577,7 +574,8 @@ for raw_line in sys.stdin.buffer:
         let mut current: Option<usize> = None;
         for line in text.lines() {
             if let Some(v) = line.strip_prefix("processor") {
-                current = v.trim_start_matches(|c: char| c == ':' || c.is_whitespace())
+                current = v
+                    .trim_start_matches(|c: char| c == ':' || c.is_whitespace())
                     .trim()
                     .parse()
                     .ok();
@@ -602,13 +600,13 @@ for raw_line in sys.stdin.buffer:
 
     /// `(cpu, core_id, siblings, MHz)` for each CPU, so a row can show whether
     /// two arms landed on one physical core or on its SMT sibling.
-    pub fn cpu_topology(cpus: &std::collections::BTreeSet<usize>) -> Vec<(usize, usize, String, f64)> {
+    pub fn cpu_topology(
+        cpus: &std::collections::BTreeSet<usize>,
+    ) -> Vec<(usize, usize, String, f64)> {
         cpus.iter()
             .map(|&c| {
-                let core = sysfs_usize(format!(
-                    "/sys/devices/system/cpu/cpu{c}/topology/core_id"
-                ))
-                .unwrap_or(usize::MAX);
+                let core = sysfs_usize(format!("/sys/devices/system/cpu/cpu{c}/topology/core_id"))
+                    .unwrap_or(usize::MAX);
                 let sibs = std::fs::read_to_string(format!(
                     "/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list"
                 ))
@@ -680,12 +678,7 @@ for raw_line in sys.stdin.buffer:
     /// Time the SIMD candidate or its same-ELF scalar dsymv control. The public
     /// native-routing override is set by the surrounding cell and intentionally
     /// remains in place for both arms.
-    fn time_fsci_dsymv(
-        a: &[Vec<f64>],
-        min_of: usize,
-        min_dim: usize,
-        force_scalar: bool,
-    ) -> f64 {
+    fn time_fsci_dsymv(a: &[Vec<f64>], min_of: usize, min_dim: usize, force_scalar: bool) -> f64 {
         PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(min_dim, std::sync::atomic::Ordering::Relaxed);
         EIGH_DSYMV_FORCE_SCALAR.store(force_scalar, std::sync::atomic::Ordering::Relaxed);
         let t = time_fsci(a, 1, min_of);
@@ -1061,7 +1054,11 @@ for raw_line in sys.stdin.buffer:
             }
             let median_of = |mut v: Vec<f64>| -> f64 {
                 v.sort_by(f64::total_cmp);
-                if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
+                if v.is_empty() {
+                    f64::NAN
+                } else {
+                    v[v.len() / 2]
+                }
             };
             let half = alone.len() / 2;
             let alone_pre = median_of(alone[..half].to_vec());
@@ -1085,8 +1082,11 @@ for raw_line in sys.stdin.buffer:
                 .iter()
                 .map(|(c, core, sibs, mhz)| format!("cpu{c}(core{core},sibs{sibs},{mhz:.0}MHz)"))
                 .collect();
-            let mhz_vals: Vec<f64> =
-                topo.iter().map(|(_, _, _, m)| *m).filter(|m| m.is_finite()).collect();
+            let mhz_vals: Vec<f64> = topo
+                .iter()
+                .map(|(_, _, _, m)| *m)
+                .filter(|m| m.is_finite())
+                .collect();
             // An empty set must print "unavailable", not the fold's sentinel.
             // The first version printed f64::MAX here, which is how this bug was
             // found (frankenscipy-ll0kk).

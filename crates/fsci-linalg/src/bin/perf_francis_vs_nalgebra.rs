@@ -30,7 +30,11 @@ fn make_diag_dominant(n: usize, seed: u64) -> Vec<Vec<f64>> {
         for j in 0..n {
             let r =
                 ((seed.wrapping_mul(i as u64 + 1).wrapping_add(j as u64)) % 1000) as f64 / 1000.0;
-            a[i][j] = if i == j { (n as f64) * 2.0 + r } else { r - 0.5 };
+            a[i][j] = if i == j {
+                (n as f64) * 2.0 + r
+            } else {
+                r - 0.5
+            };
         }
     }
     a
@@ -175,8 +179,10 @@ fn main() {
         let fr = spectrum(&make_diag_dominant(*n, *seed));
         for (label, s) in [("NALGEBRA", &na), ("FRANCIS", &fr)] {
             if let Some(v) = s {
-                let flat: Vec<String> =
-                    v.iter().map(|(re, im)| format!("{re:.17e}:{im:.17e}")).collect();
+                let flat: Vec<String> = v
+                    .iter()
+                    .map(|(re, im)| format!("{re:.17e}:{im:.17e}"))
+                    .collect();
                 println!("CONTESTED {label} n={n} seed={seed} {}", flat.join(","));
             }
         }
@@ -188,7 +194,10 @@ fn main() {
     EIG_USE_FRANCIS_SCHUR.store(true, Ordering::Relaxed);
     for (n, seed) in recovered.iter().take(25) {
         if let Some(s) = spectrum(&make_diag_dominant(*n, *seed)) {
-            let flat: Vec<String> = s.iter().map(|(re, im)| format!("{re:.17e}:{im:.17e}")).collect();
+            let flat: Vec<String> = s
+                .iter()
+                .map(|(re, im)| format!("{re:.17e}:{im:.17e}"))
+                .collect();
             println!("SPECTRUM n={n} seed={seed} {}", flat.join(","));
         }
     }

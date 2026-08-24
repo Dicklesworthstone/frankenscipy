@@ -12102,9 +12102,8 @@ fn symmetric_lower_matvec_one_pass_simd(
                 Simd::<f64, LANES>::from_slice(&vector[row_offset..row_offset + LANES]);
 
             if v_col != 0.0 {
-                let prior = Simd::<f64, LANES>::from_slice(
-                    &product[row_offset..row_offset + LANES],
-                );
+                let prior =
+                    Simd::<f64, LANES>::from_slice(&product[row_offset..row_offset + LANES]);
                 (prior + values * Simd::splat(v_col))
                     .copy_to_slice(&mut product[row_offset..row_offset + LANES]);
             }
@@ -23708,7 +23707,13 @@ mod tests {
         let reflector = HouseholderReflector {
             start,
             values: (0..active)
-                .map(|i| if i % 37 == 0 { 0.0 } else { (i as f64 * 0.013).sin() })
+                .map(|i| {
+                    if i % 37 == 0 {
+                        0.0
+                    } else {
+                        (i as f64 * 0.013).sin()
+                    }
+                })
                 .collect(),
             tau: 0.7,
         };

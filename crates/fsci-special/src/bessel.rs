@@ -5832,8 +5832,16 @@ mod tests {
         // And a non-integer positive order is untouched.
         //   scipy.special.lmbda(0.5, 2.0) -> ([0.45464871341284085], [-0.4353977749799916])
         let (vl, dl) = lmbda(0.5, 2.0);
-        assert!((vl[0] - 0.454_648_713_412_840_85).abs() < 1e-12, "vl {}", vl[0]);
-        assert!((dl[0] - -0.435_397_774_979_991_6).abs() < 1e-12, "dl {}", dl[0]);
+        assert!(
+            (vl[0] - 0.454_648_713_412_840_85).abs() < 1e-12,
+            "vl {}",
+            vl[0]
+        );
+        assert!(
+            (dl[0] - -0.435_397_774_979_991_6).abs() < 1e-12,
+            "dl {}",
+            dl[0]
+        );
     }
 
     #[test]

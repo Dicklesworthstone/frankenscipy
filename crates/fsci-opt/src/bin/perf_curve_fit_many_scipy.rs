@@ -709,9 +709,7 @@ for line in sys.stdin:
         let mut rmse = Vec::with_capacity(BATCH);
         let mut parameter_error = Vec::with_capacity(BATCH);
         let mut improved = 0usize;
-        for ((parameters, observations), truth) in
-            fitted.iter().zip(&data.y).zip(&data.truth)
-        {
+        for ((parameters, observations), truth) in fitted.iter().zip(&data.y).zip(&data.truth) {
             let mut fit_rss = 0.0;
             let mut initial_rss = 0.0;
             for ((x, initial), observed) in data

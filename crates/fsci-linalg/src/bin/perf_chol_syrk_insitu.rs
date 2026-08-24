@@ -139,8 +139,16 @@ fn main() {
 
     let ms = |x: f64| x * 1000.0 / reps as f64;
     let nms = |x: u64| x as f64 / 1e6 / reps as f64;
-    println!("cap=1   factor={:.4}ms syrk={:.4}ms calls={c1} dispatches={d1}", ms(w1), nms(s1));
-    println!("cap={threads}  factor={:.4}ms syrk={:.4}ms calls={cn} dispatches={dn}", ms(wn), nms(sn));
+    println!(
+        "cap=1   factor={:.4}ms syrk={:.4}ms calls={c1} dispatches={d1}",
+        ms(w1),
+        nms(s1)
+    );
+    println!(
+        "cap={threads}  factor={:.4}ms syrk={:.4}ms calls={cn} dispatches={dn}",
+        ms(wn),
+        nms(sn)
+    );
     println!(
         "syrk_share_cap1={:.1}%  syrk_share_capN={:.1}%",
         nms(s1) / ms(w1) * 100.0,

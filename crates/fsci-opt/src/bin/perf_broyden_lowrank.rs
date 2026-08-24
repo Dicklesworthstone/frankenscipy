@@ -30,12 +30,7 @@ fn start_point(n: usize) -> Vec<f64> {
 fn time_lowrank(n: usize) -> (f64, f64) {
     let x0 = start_point(n);
     let f0 = residual(&x0);
-    let mut jac = BroydenJacobian::new(
-        BroydenVariant::First,
-        None,
-        ReductionMethod::Restart,
-        None,
-    );
+    let mut jac = BroydenJacobian::new(BroydenVariant::First, None, ReductionMethod::Restart, None);
     jac.setup(&x0, &f0);
     let mut x = x0;
     let mut f = f0;

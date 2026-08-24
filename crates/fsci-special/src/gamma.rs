@@ -3639,14 +3639,21 @@ mod tests {
         // branches are unchanged.
         //   gamma(-1.0) = nan, gamma(-1.5) = 2.363271801207355,
         //   gamma(1.0) = 1.0, gamma(2.5) = 1.329340388179137
-        assert!(gamma_scalar(-1.0, RuntimeMode::Strict).expect("pole").is_nan());
+        assert!(
+            gamma_scalar(-1.0, RuntimeMode::Strict)
+                .expect("pole")
+                .is_nan()
+        );
         for (x, want) in [
             (-1.5_f64, 2.363_271_801_207_355_f64),
             (1.0, 1.0),
             (2.5, 1.329_340_388_179_137),
         ] {
             let got = gamma_scalar(x, RuntimeMode::Strict).expect("finite");
-            assert!((got - want).abs() < 1e-12, "gamma({x}) = {got}, scipy {want}");
+            assert!(
+                (got - want).abs() < 1e-12,
+                "gamma({x}) = {got}, scipy {want}"
+            );
         }
     }
 
@@ -4912,11 +4919,17 @@ mod tests {
             0.0,
             "the subtraction is expected to collapse here; that is why chndtrc exists"
         );
-        assert!(chndtrc(150.0, 3.0, 2.0) > 0.0, "the kernel must not collapse");
+        assert!(
+            chndtrc(150.0, 3.0, 2.0) > 0.0,
+            "the kernel must not collapse"
+        );
 
         // Complementarity in the range where subtraction IS accurate, and the boundaries.
         let mid = chndtrc(10.0, 3.0, 2.0) + chndtr(10.0, 3.0, 2.0);
-        assert!((mid - 1.0).abs() < 1e-12, "cdf + sf should be 1 mid-range, got {mid}");
+        assert!(
+            (mid - 1.0).abs() < 1e-12,
+            "cdf + sf should be 1 mid-range, got {mid}"
+        );
         assert_eq!(chndtrc(0.0, 3.0, 2.0), 1.0, "sf below the support is 1");
         assert!(chndtrc(f64::NAN, 3.0, 2.0).is_nan(), "NaN propagates");
         // nc = 0 degenerates to the central complement.

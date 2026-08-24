@@ -8062,7 +8062,8 @@ mod accuracy_contract_ratchet {
         .iter()
         .any(|k| d.contains(k))
             || d.split_whitespace().any(|w| {
-                let w = w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
+                let w =
+                    w.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.' && c != '-');
                 w.contains("e-") && w.chars().next().is_some_and(|c| c.is_ascii_digit())
             })
     }

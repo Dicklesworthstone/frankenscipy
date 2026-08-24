@@ -11477,6 +11477,9 @@ mod max_rstat_matches_scipy {
         // Empty is not an error, it is an empty answer -- matching maxdists.
         assert_eq!(max_rstat(&[], &[], 0).expect("empty"), Vec::<f64>::new());
         // MUST-MISS control for the field guard: 3 is the last valid one.
-        assert!(max_rstat(&Z, &R, 3).is_ok(), "field 3 must still be accepted");
+        assert!(
+            max_rstat(&Z, &R, 3).is_ok(),
+            "field 3 must still be accepted"
+        );
     }
 }

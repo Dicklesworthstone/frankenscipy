@@ -50,10 +50,9 @@ mod bench {
     use fsci_sparse::{
         CooMatrix, CscMatrix, FormatConvertible, LuOptions, SPLU_BACK_MERGE_ENABLE,
         SPLU_BACK_MERGE_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
-        SPLU_PARTIAL_INPLACE_ENABLE, SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_SUPERNODAL_ENABLE,
-        SPLU_SUPERNODAL_FACTOR_HITS,
-        SPLU_ROW_HEAD_CACHE_DISABLE, SPLU_ROW_HEAD_CACHE_FACTOR_HITS, Shape2D, splu,
-        splu_factor_payload_bytes, splu_solve,
+        SPLU_PARTIAL_INPLACE_ENABLE, SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
+        SPLU_ROW_HEAD_CACHE_FACTOR_HITS, SPLU_SUPERNODAL_ENABLE, SPLU_SUPERNODAL_FACTOR_HITS,
+        Shape2D, splu, splu_factor_payload_bytes, splu_solve,
     };
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
@@ -234,7 +233,9 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
             "on" => true,
             "off" => false,
             other => {
-                return Err(format!("supernodal arm must be `on` or `off`, got {other:?}"));
+                return Err(format!(
+                    "supernodal arm must be `on` or `off`, got {other:?}"
+                ));
             }
         };
         let partial_inplace_enabled = match args.get(8).map(String::as_str).unwrap_or("on") {
@@ -638,7 +639,9 @@ for raw_line in sys.stdin.buffer:
                 .parse()
                 .map_err(|_| format!("replicate ratio must be a number, got {value:?}"))?;
             if !parsed.is_finite() || parsed <= 0.0 {
-                return Err(format!("replicate ratio must be finite and positive, got {parsed}"));
+                return Err(format!(
+                    "replicate ratio must be finite and positive, got {parsed}"
+                ));
             }
             ratios.push(parsed);
         }
@@ -1270,7 +1273,10 @@ for raw_line in sys.stdin.buffer:
             let tight = [0.5300, 0.5310, 0.5305, 0.5295, 0.5302];
             let (n, med, lo, high, min, max) = replicate_summary(&tight);
             assert_eq!(n, 5);
-            assert!((med - 0.5302).abs() < 1e-9, "median of the tight set, got {med}");
+            assert!(
+                (med - 0.5302).abs() < 1e-9,
+                "median of the tight set, got {med}"
+            );
             assert!(
                 high - lo < 0.005,
                 "agreeing replicates must give a narrow interval, got [{lo},{high}]"
@@ -1308,14 +1314,29 @@ for raw_line in sys.stdin.buffer:
             // Two replicates cannot separate a spread from an outlier, and printing a
             // confident-looking interval over them would recreate the over-confidence
             // this mode exists to remove.
-            assert!(run_aggregate(&args(&["0.52", "0.55"])).is_err(), "two replicates");
+            assert!(
+                run_aggregate(&args(&["0.52", "0.55"])).is_err(),
+                "two replicates"
+            );
             assert!(run_aggregate(&args(&[])).is_err(), "no replicates");
             // Non-numeric and non-physical inputs are refused rather than silently
             // coerced, since a ratio of zero or NaN would poison the median.
-            assert!(run_aggregate(&args(&["0.52", "banana", "0.55"])).is_err(), "non-numeric");
-            assert!(run_aggregate(&args(&["0.52", "0", "0.55"])).is_err(), "zero ratio");
-            assert!(run_aggregate(&args(&["0.52", "-0.1", "0.55"])).is_err(), "negative ratio");
-            assert!(run_aggregate(&args(&["0.52", "NaN", "0.55"])).is_err(), "NaN ratio");
+            assert!(
+                run_aggregate(&args(&["0.52", "banana", "0.55"])).is_err(),
+                "non-numeric"
+            );
+            assert!(
+                run_aggregate(&args(&["0.52", "0", "0.55"])).is_err(),
+                "zero ratio"
+            );
+            assert!(
+                run_aggregate(&args(&["0.52", "-0.1", "0.55"])).is_err(),
+                "negative ratio"
+            );
+            assert!(
+                run_aggregate(&args(&["0.52", "NaN", "0.55"])).is_err(),
+                "NaN ratio"
+            );
             // And the must-hit arm: three valid replicates are accepted.
             assert!(run_aggregate(&args(&["0.5230", "0.5380", "0.5775"])).is_ok());
         }
@@ -1432,7 +1453,10 @@ for raw_line in sys.stdin.buffer:
             // NOT, because a divide-by-zero that quietly returns 0.0 would print
             // the fastest number in the table for a cell that measured nothing.
             let rate = ns_per_unit(2_500.0, 1_000);
-            assert!((rate - 2.5).abs() < 1e-12, "1000 units of 2500 ns is 2.5 ns each");
+            assert!(
+                (rate - 2.5).abs() < 1e-12,
+                "1000 units of 2500 ns is 2.5 ns each"
+            );
             assert!(
                 ns_per_unit(2_500.0, 0).is_nan(),
                 "no units must read as undefined, never as zero"

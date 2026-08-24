@@ -34790,7 +34790,11 @@ mod jyfke_trailing_trim_is_exact {
         let sos: Vec<SosSection> = vec![[1.0, b1, b2, 1.0, 0.5, 0.1]];
         let z = sos2zpk(&sos);
 
-        assert_eq!(z.zeros_re.len(), 2, "a 3-coefficient numerator has two zeros");
+        assert_eq!(
+            z.zeros_re.len(),
+            2,
+            "a 3-coefficient numerator has two zeros"
+        );
         // Product of the zeros, as complex numbers.
         let (r0, i0) = (z.zeros_re[0], z.zeros_im[0]);
         let (r1, i1) = (z.zeros_re[1], z.zeros_im[1]);
