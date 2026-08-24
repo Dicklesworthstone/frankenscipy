@@ -14909,6 +14909,47 @@ mod tests {
     }
 
     #[test]
+    fn uniform_running_sum_is_bit_identical_to_perwindow_on_dyadic_fixture() {
+        // The general floating-point oracle above is tolerance-parity because a rolling
+        // add/subtract sum need not round like a fresh sum.  This integer / power-of-two
+        // fixture makes every intermediate sum and division exact, so it is a strict
+        // bit-level guard for the public all-axis uniform_filter route and every boundary
+        // mapper, independently of the running-sum implementation.
+        let shape = vec![7usize, 71, 73];
+        let data = (0..shape.iter().product())
+            .map(|i| ((i * 17) % 19) as f64 - 9.0)
+            .collect();
+        let arr = NdArray::new(data, shape).unwrap();
+        for mode in [
+            BoundaryMode::Nearest,
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Wrap,
+            BoundaryMode::Mirror,
+        ] {
+            for size in [2usize, 4, 8] {
+                let got = uniform_filter(&arr, size, mode, -5.0).unwrap();
+                let mut want = arr.clone();
+                for axis in 0..arr.ndim() {
+                    want =
+                        uniform_filter1d_perwindow_ref(&want, size, axis, mode, -5.0, 0).unwrap();
+                }
+                assert_eq!(
+                    got.data
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    want.data
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>(),
+                    "mode={mode:?} size={size}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn uniform_filter_origins_match_scipy_constant() {
         let input = NdArray::new(vec![1., 2., 3., 4., 5.], vec![5]).unwrap();
 
