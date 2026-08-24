@@ -141,12 +141,13 @@ fn gaussian_filter1d_axis(
     if input.size() == 0 {
         return Err(NdimageError::EmptyInput);
     }
-    // The 1-D-embedded kernel convolution is the slab line walk; on the outermost axis
-    // (too few slabs) fall back to the N-D `convolve` which parallelizes per pixel. Both
-    // are byte-identical (convolve1d_along_axis reproduces convolve's flip/offset/order).
+    // The 1-D-embedded kernel convolution is the slab line walk.  It parallelizes either
+    // across outer slabs or, for the outermost axis, across the contiguous inner span.
+    // Both routes are byte-identical to N-D `convolve` (same flip/offset/tap order).
     let outer: usize = input.shape[..axis].iter().product();
+    let inner: usize = input.shape[axis + 1..].iter().product();
     let nthreads = ndimage_filter_thread_count(input.size(), kernel_1d.len());
-    if outer >= nthreads {
+    if outer >= nthreads || (outer == 1 && inner >= nthreads) {
         return Ok(convolve1d_along_axis(
             input, &kernel_1d, axis, 0, mode, cval,
         ));
@@ -2898,20 +2899,40 @@ fn convolve1d_along_axis(
     let klen = weights.len() as i64;
     let offset = (klen - 1) / 2;
     let mut out = NdArray::zeros(arr.shape.clone());
-    let do_slab = |is: &[f64], os: &mut [f64]| {
-        let val_at = |i: usize, a: i64| -> f64 {
-            match boundary_index_1d(a, mid as i64, mode) {
-                Some(m) => is[i + (m as usize) * inner],
-                None => cval,
+    let do_slab = |is: &[f64], os: &mut [f64], axis_start: usize, axis_end: usize| {
+        if inner > 1 {
+            // For every output line, hoist the boundary lookup out of the contiguous inner
+            // span. Each output still accumulates the same k=0..len tap sequence as the
+            // scalar N-D convolution, but the inner loop is now a vector-friendly axpy.
+            for a in axis_start as i64..axis_end as i64 {
+                let output_base = (a as usize - axis_start) * inner;
+                for (k, &w) in weights.iter().enumerate() {
+                    let source = a + (klen - 1 - k as i64) - offset + origin;
+                    let output = &mut os[output_base..output_base + inner];
+                    if let Some(source) = boundary_index_1d(source, mid as i64, mode) {
+                        let input_base = source as usize * inner;
+                        for (slot, &value) in
+                            output.iter_mut().zip(&is[input_base..input_base + inner])
+                        {
+                            *slot += w * value;
+                        }
+                    } else {
+                        for slot in output {
+                            *slot += w * cval;
+                        }
+                    }
+                }
             }
-        };
-        for i in 0..inner {
-            for a in 0..mid as i64 {
+        } else {
+            for a in axis_start as i64..axis_end as i64 {
                 let mut sum = 0.0;
                 for (k, &w) in weights.iter().enumerate() {
-                    sum += w * val_at(i, a + (klen - 1 - k as i64) - offset + origin);
+                    let source = a + (klen - 1 - k as i64) - offset + origin;
+                    let value = boundary_index_1d(source, mid as i64, mode)
+                        .map_or(cval, |source| is[source as usize]);
+                    sum += w * value;
                 }
-                os[i + (a as usize) * inner] = sum;
+                os[a as usize - axis_start] = sum;
             }
         }
     };
@@ -2923,11 +2944,28 @@ fn convolve1d_along_axis(
     let nthreads = if par_work < (1 << 20) {
         1
     } else {
-        ndimage_filter_thread_count(arr.size(), weights.len()).min(outer.max(1))
+        let parallel_spans = if outer == 1 && inner > 1 {
+            mid
+        } else {
+            outer.max(1)
+        };
+        ndimage_filter_thread_count(arr.size(), weights.len()).min(parallel_spans)
     };
     if nthreads <= 1 || outer < 2 {
-        for (is, os) in arr.data.chunks(slab).zip(out.data.chunks_mut(slab)) {
-            do_slab(is, os);
+        if nthreads <= 1 || inner == 1 {
+            for (is, os) in arr.data.chunks(slab).zip(out.data.chunks_mut(slab)) {
+                do_slab(is, os, 0, mid);
+            }
+        } else {
+            let chunk = mid.div_ceil(nthreads);
+            let do_slab = &do_slab;
+            std::thread::scope(|scope| {
+                for (chunk_idx, out_chunk) in out.data.chunks_mut(chunk * inner).enumerate() {
+                    let start = chunk_idx * chunk;
+                    let end = start + out_chunk.len() / inner;
+                    scope.spawn(move || do_slab(&arr.data, out_chunk, start, end));
+                }
+            });
         }
     } else {
         let slabs_per = outer.div_ceil(nthreads);
@@ -2940,7 +2978,7 @@ fn convolve1d_along_axis(
             {
                 scope.spawn(move || {
                     for (is, os) in in_chunk.chunks(slab).zip(out_chunk.chunks_mut(slab)) {
-                        do_slab(is, os);
+                        do_slab(is, os, 0, mid);
                     }
                 });
             }
@@ -14719,12 +14757,13 @@ mod tests {
     #[test]
     fn convolve1d_line_walk_is_byte_identical_to_nd_convolve() {
         // convolve1d_along_axis must equal the N-D convolve on a 1-D-embedded kernel,
-        // bit-for-bit (the gaussian reroute relies on this).
-        let (rows, cols) = (41usize, 37usize);
-        let data: Vec<f64> = (0..rows * cols)
+        // bit-for-bit (the gaussian reroute relies on this). The 3-D shape exercises
+        // both the vector-friendly inner spans and the scalar innermost span.
+        let shape = vec![13usize, 11, 17];
+        let data: Vec<f64> = (0..shape.iter().product())
             .map(|i| ((i * 40503usize) % 911) as f64 / 90.0 - 5.0)
             .collect();
-        let arr = NdArray::new(data, vec![rows, cols]).unwrap();
+        let arr = NdArray::new(data, shape).unwrap();
         for mode in [
             BoundaryMode::Nearest,
             BoundaryMode::Reflect,
@@ -14734,8 +14773,8 @@ mod tests {
         ] {
             for klen in [2usize, 3, 6, 9] {
                 let w: Vec<f64> = (0..klen).map(|k| (k as f64 * 0.9 + 0.3).sin()).collect();
-                for axis in [0usize, 1usize] {
-                    let mut kshape = vec![1usize; 2];
+                for axis in 0..arr.ndim() {
+                    let mut kshape = vec![1usize; arr.ndim()];
                     kshape[axis] = klen;
                     let kernel = NdArray::new(w.clone(), kshape).unwrap();
                     let nd = convolve(&arr, &kernel, mode, 0.4).unwrap();
