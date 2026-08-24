@@ -1211,13 +1211,13 @@ mod cubic_live {
         SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS,
     };
     use fsci_sparse::{
-        CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
-        SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS,
-        SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
-        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPLU_MERGE_FORCE_LEGACY_WALK,
-        SPLU_SOLVE_FORCE_MATERIALIZED_RHS, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
-        SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, SparseLuFactorization, splu,
-        splu_factor_payload_bytes, splu_solve, spsolve,
+        CscMatrix, CsrMatrix, FormatConvertible, LuOptions, PermutationOrdering,
+        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE, SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS,
+        SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS, SPLU_CUBIC_SPECTRAL_DISABLE,
+        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_SOLVE_HITS,
+        SPLU_MERGE_FORCE_LEGACY_WALK, SPLU_SOLVE_FORCE_MATERIALIZED_RHS,
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions,
+        SparseLuFactorization, splu, splu_factor_payload_bytes, splu_solve, spsolve,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -3514,6 +3514,117 @@ mod cubic_live {
             .unwrap_or_else(|| "unavailable".to_string())
     }
 
+    /// Fill and whole-job cost per FILL-REDUCING ORDERING, on the run7d cell.
+    ///
+    /// WHY THIS AND NOT A NEW ORDERING ALGORITHM. The ledger carries an explicit REJECT on
+    /// attacking the ordering ("do not attack the fill-reducing ordering -- it is already at
+    /// SuperLU parity", frankenscipy-llywn) and a measured row showing that adopting COLAMD
+    /// ALONE would be a PESSIMIZATION for us: it hands SuperLU 1.65x MORE element-updates
+    /// (21.8M against 13.2M) and is still faster only because its blocked kernel then has
+    /// supernodes to exploit, at 2.21 instructions per update against 13.45 under RCM. Our
+    /// merge kernel cannot exploit them, so more fill-reduction is not automatically less work
+    /// for us.
+    ///
+    /// That row's retry predicate is the reason this exists: "measure instructions per update
+    /// for a candidate ordering FIRST -- ordering is now known to move that number by 6x".
+    /// `minimum_degree_ordering` is ALREADY IMPLEMENTED and wired to `MmdAta`/`MmdAtPlusA`, so
+    /// the candidate needs measuring, not writing.
+    ///
+    /// Reports, per ordering: the retained factor payload (fill), and the whole-job
+    /// factor-plus-sixteen-solves median. No incumbent arm and no A/A null -- this decides
+    /// which ordering is worth taking to the live harness, it does not claim a ratio.
+    pub fn run_ordering_sweep(arguments: &[String]) -> Result<(), String> {
+        let rounds = arguments
+            .first()
+            .map(|value| parse::<usize>(value, "rounds"))
+            .transpose()?
+            .unwrap_or(7);
+        if rounds < 3 {
+            return Err("the ordering sweep needs at least 3 rounds".to_string());
+        }
+        println!("# probe=ordering_fill_sweep bead=frankenscipy-run7d claim=SELF_ATTRIBUTION_ONLY");
+        println!("elf_sha256={}", sha256_of_self()?);
+        println!("loadavg_before={}", loadavg());
+
+        let fixtures = splu_fixtures(SpluFamily::Convection)?;
+        let fixture = fixtures
+            .first()
+            .ok_or_else(|| "the convection family has no fixture".to_string())?;
+        let n = fixture.matrix.shape().rows;
+
+        for ordering in [
+            PermutationOrdering::Colamd,
+            PermutationOrdering::ReverseCuthillMcKee,
+            PermutationOrdering::MmdAtPlusA,
+            PermutationOrdering::MmdAta,
+            PermutationOrdering::Natural,
+        ] {
+            let options = LuOptions {
+                ordering,
+                ..LuOptions::default()
+            };
+            let mut factor_ms = Vec::with_capacity(rounds);
+            let mut solve_ms = Vec::with_capacity(rounds);
+            let mut payload = 0usize;
+            let mut checksum = 0u64;
+            let mut failed = None;
+            for round in 0..=rounds {
+                let started = Instant::now();
+                let factor = match splu(black_box(&fixture.csc), options) {
+                    Ok(factor) => factor,
+                    Err(error) => {
+                        failed = Some(format!("{error}"));
+                        break;
+                    }
+                };
+                let factored = started.elapsed().as_secs_f64() * 1.0e3;
+                payload = splu_factor_payload_bytes(&factor);
+                let started = Instant::now();
+                for right_hand_side in &fixture.right_hand_sides {
+                    match splu_solve(&factor, black_box(right_hand_side)) {
+                        Ok(solution) => {
+                            for value in solution {
+                                checksum = checksum.rotate_left(1) ^ value.to_bits();
+                            }
+                        }
+                        Err(error) => {
+                            failed = Some(format!("{error}"));
+                            break;
+                        }
+                    }
+                }
+                let solved = started.elapsed().as_secs_f64() * 1.0e3;
+                if failed.is_some() {
+                    break;
+                }
+                if round == 0 {
+                    continue;
+                }
+                factor_ms.push(factored);
+                solve_ms.push(solved);
+            }
+            black_box(checksum);
+            if let Some(error) = failed {
+                println!("ordering={ordering:?} REFUSED: {error}");
+                continue;
+            }
+            // Entries back out of the packed payload: 12 bytes per entry (u32 column +
+            // f64 value) plus one usize offset per row on each triangle, plus row_perm.
+            let overhead = 2 * 8 * (n + 1) + 8 * n;
+            let entries = payload.saturating_sub(overhead) / 12;
+            let factor_median = median(factor_ms.clone());
+            let solve_median = median(solve_ms.clone());
+            println!(
+                "ordering={ordering:?} lu_entries={entries} payload_bytes={payload} \
+                 factor_p50_ms={factor_median:.6} sixteen_solves_p50_ms={solve_median:.6} \
+                 job_p50_ms={:.6}",
+                factor_median + solve_median
+            );
+        }
+        println!("loadavg_after={}", loadavg());
+        Ok(())
+    }
+
     /// GATE (a) for `frankenscipy-run7d`: what fraction of this cell is the SOLVE?
     ///
     /// The cell is one factorization plus SIXTEEN solves, so "optimize the solve path" is worth
@@ -4189,6 +4300,21 @@ fn main() {
     if raw_arguments.get(1).map(String::as_str) == Some("--source-marker") {
         println!("perf_spsolve_source_marker={PERF_SPSOLVE_SOURCE_MARKER}");
         return;
+    }
+    if raw_arguments.get(1).map(String::as_str) == Some("--ordering-sweep") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_ordering_sweep(&raw_arguments[2..]) {
+                eprintln!("ORDERING_SWEEP_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--ordering-sweep requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
     }
     if raw_arguments.get(1).map(String::as_str) == Some("--convection-split") {
         #[cfg(feature = "sparse-incumbent-bench")]
