@@ -16,7 +16,10 @@ use fsci_stats::{ContinuousDistribution, Normal, NumericalInverseHermite};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1_000_000);
+    let n: usize = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1_000_000);
     let ures: f64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1e-10);
     let reps: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(1);
 
