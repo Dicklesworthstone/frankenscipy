@@ -1,0 +1,66 @@
+### frankenscipy-9nw95 — MERGE KERNEL COST MODEL, and where the next lever is
+
+BlackThrush, 2026-08-23. Counted, not timed: callgrind per-function Ir, one process, no host
+dependence and no A/A null applicable. Kernel binary contains the landed 12.010 Ir/elem inner
+loop (commit b923646ab). host=thinkstation1, span=300, repeats=2000.
+
+## OBSERVED — apply_supernode_tails at six widths
+
+  width   merge Ir        Ir per element-update   residual after 12.010*elements, per call
+      1     43,580,028                   72.633                                   18,187.0
+      2     50,800,112                   42.333                                   18,194.1
+      3     58,006,112                   32.226                                   18,194.1
+      4     65,212,112                   27.172                                   18,194.1
+      5     72,418,112                   24.139                                   18,194.1
+     12    122,860,112                   17.064                                   18,194.1
+     24    209,332,112                   14.537                                   18,194.1
+
+## THE MODEL, and it fits exactly
+
+    per call  =  18,194 Ir  +  12.010 Ir x (width x span)
+
+The residual is 18,194.1 at EVERY width from 2 upward — identical to the decimal — so this is
+not a fitted trend, it is an exact decomposition. The 18,187 at width 1 differs only because
+that row's k-loop has no second iteration.
+
+That width-independent term is the OUTER merge walk: the
+`while left < target_cols.len() && right < span` loop that compares the two sorted column
+arrays, copies entries into `scratch`, and drains the remainders. It runs once per call over
+~`span` columns regardless of width, so per column it is **60.6 Ir**.
+
+## WHY THAT IS THE NEXT LEVER, sized
+
+  width   element work   outer work   outer share
+      1          3,603       18,194        83.5%
+      2          7,206       18,194        71.6%
+      5         18,015       18,194        50.2%
+   5.24         18,880       18,194        49.1%   <- the MEASURED mean supernode width
+     12         43,236       18,194        29.6%
+     24         86,472       18,194        17.4%
+
+At the supernode width this factorization actually produces (5.24, measured on this cell by
+this bead), the outer merge walk is HALF the kernel. The inner loop I just cut by 19.9% is the
+other half — so that landed lever is worth about **10% of the kernel**, not 19.9%, which is
+consistent with the ~1.7% end-to-end attribution measured separately. This is the honest
+deflation of that result, and it belongs next to it.
+
+60.6 Ir per column is large for what the outer loop does: compare two u32 columns, copy one
+f64, advance two or three counters. The suspicion — NOT counted, and it must be counted before
+it is acted on — is the same defect class the inner-loop lever just fixed: five separate
+bounds-checked index expressions per column (`target_cols[left]`, `target_vals[left]`,
+`tail_cols[right]`, `scratch.cols[put]`, `scratch.vals[put]`) plus the two-condition `while`.
+
+## WHAT WOULD HAVE TO BE TRUE
+
+If the outer loop is bounds-check bound, restructuring it over slice iterators — or splitting
+the drain phases out of the merge phase — should move the 18,194 constant. Halving it would be
+~25% off the whole kernel at width 5, LARGER than the inner-loop win already landed. If the
+constant does not move, this is a REJECT and the merge kernel is done: 12.010 Ir per element
+plus an irreducible ~60 Ir per column.
+
+NOT ESTABLISHED: any claim that the outer loop is bounds-check bound. That is a hypothesis with
+a counted test attached, and it is the next thing to run.
+
+BLOCKED: `crates/fsci-sparse/src/linalg.rs` is held exclusively by FrostyThrush, with
+uncommitted GMRES work in the tree, so the experiment was not runnable in this window.
+Committing that path would sweep their unfinished work into my commit.
