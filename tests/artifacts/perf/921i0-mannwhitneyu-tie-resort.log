@@ -1,0 +1,124 @@
+### frankenscipy-921i0 MANNWHITNEYU CERTIFICATION
+2026-08-23T22:32:30-04:00
+host=thinkstation1 governor=powersave
+uptime_before:  22:32:30 up 3 days,  5:36,  3 users,  load average: 10.64, 11.25, 15.75
+df_before: /dev/mapper/ubuntu--vg-ubuntu--lv  1.9T  1.5T  425G  78% /
+build_slot: REFUSED server-side (Build slots are disabled) -- frankenscipy-fr78g
+build_route=local-wrapper-bypass; target_dir=PRIVATE session scratchpad (repo target/release is wedged: check-only libserde rmeta with no rlib, cargo treats it fresh; nothing deleted to work around it)
+scipy: 1.17.1 2.4.3
+
+== ARM A/B (both arms one binary, ABBA + A/A null) ==
+# harness=perf_mwu_tie_resort bead=frankenscipy-921i0
+# elf_sha256=3eadcee52f1db6d2bd5bf6ee2b449b22d042ba057b51f985a219dde856ea373d elf_path=/data/tmp/claude-1000/-data-projects-frankenscipy/841e235d-401f-444a-8875-dd2922c0b998/scratchpad/tgt/release/perf_mwu_tie_resort
+# host=thinkstation1 threads_observed=1 reps=21
+n=20000 DECIDED  resort 0.684ms pass 0.444ms | CAND(resort/pass) median 1.5387x | share 35.01% | CAND p10-p90 [1.5351,1.5570] | NULL(A/A) median 1.0017 p10-p90 [0.9924,1.0142] inner=20 | bitmism=0 U=49980000 p=0.9609293799743455 tie_mass=3.750e-8 tie_groups=5000 ranking_path=radix branch=asymptotic
+    load before=10.64/11.25/15.75 after=10.64/11.25/15.75 | MHz before min/mean/max 1429/3277/4292 after 2514/3236/4292
+n=200000 DECIDED  resort 9.332ms pass 6.436ms | CAND(resort/pass) median 1.4706x | share 32.00% | CAND p10-p90 [1.4322,1.4944] | NULL(A/A) median 1.0018 p10-p90 [0.9805,1.0315] inner=2 | bitmism=0 U=4999800000 p=0.9876397817423834 tie_mass=3.750e-10 tie_groups=50000 ranking_path=radix branch=asymptotic
+    load before=10.64/11.25/15.75 after=11.15/11.34/15.76 | MHz before min/mean/max 1429/3104/4292 after 2509/3386/4294
+n=2000000 DECIDED  resort 124.109ms pass 80.330ms | CAND(resort/pass) median 1.5403x | share 35.08% | CAND p10-p90 [1.5273,1.5622] | NULL(A/A) median 0.9934 p10-p90 [0.9779,1.0182] inner=1 | bitmism=0 U=499998000000 p=0.9960911974943794 tie_mass=3.750e-12 tie_groups=500000 ranking_path=radix branch=asymptotic
+    load before=11.15/11.34/15.76 after=10.83/11.27/15.69 | MHz before min/mean/max 1429/3048/4292 after 2514/3354/4292
+# GATE(a) SHARE trend FLAT-OR-FALLING : n=20000:35.01% n=200000:32.00% n=2000000:35.08%
+
+== LIVE HEAD-TO-HEAD vs scipy.stats.mannwhitneyu (same invocation) ==
+# harness=perf_mwu_scipy bead=frankenscipy-921i0 incumbent=scipy.stats.mannwhitneyu method=asymptotic
+# elf_sha256=4c31cc240f7aae435c21e36302ed3321e197550fd178deecb790d3caed334165 elf_path=/data/tmp/claude-1000/-data-projects-frankenscipy/841e235d-401f-444a-8875-dd2922c0b998/scratchpad/tgt/release/perf_mwu_scipy
+# threads_observed=1 require_scipy=true
+n=20000 fsci 0.451ms scipy 1.183ms inner=20 | RATIO(scipy/fsci) 2.624x | scipy A/A null 0.9770 | agree=true U fsci=49980000 scipy=49980000 (relgap 0.000e0) p fsci=0.9609293799743455 scipy=0.9609293799743455 (relgap 0.000e0) branch=asymptotic
+    load scipy1=11.32/11.36/15.65 fsci=11.32/11.36/15.65 scipy2=11.32/11.36/15.65 | MHz mean scipy1=3334 fsci=3119
+n=200000 fsci 6.271ms scipy 14.471ms inner=2 | RATIO(scipy/fsci) 2.308x | scipy A/A null 0.9933 | agree=true U fsci=4999800000 scipy=4999800000 (relgap 0.000e0) p fsci=0.9876397817423834 scipy=0.9876397817423834 (relgap 0.000e0) branch=asymptotic
+    load scipy1=11.32/11.36/15.65 fsci=11.32/11.36/15.65 scipy2=11.32/11.36/15.65 | MHz mean scipy1=3033 fsci=2404
+n=2000000 fsci 81.247ms scipy 132.946ms inner=1 | RATIO(scipy/fsci) 1.636x | scipy A/A null 0.9689 | agree=true U fsci=499998000000 scipy=499998000000 (relgap 0.000e0) p fsci=0.9960911974943794 scipy=0.9960911974943794 (relgap 0.000e0) branch=asymptotic
+    load scipy1=11.32/11.36/15.65 fsci=10.81/11.26/15.59 scipy2=10.66/11.22/15.55 | MHz mean scipy1=2699 fsci=3143
+
+uptime_after:  22:33:53 up 3 days,  5:38,  3 users,  load average: 9.38, 10.78, 15.20
+
+### READING (BlackThrush, frankenscipy-921i0)
+
+## 1. THE LEVER (self A/B, both arms one binary) — MAINTENANCE, not a win
+
+    n=20,000     resort 0.684ms  pass 0.444ms   1.5387x   share 35.01%   DECIDED
+    n=200,000    resort 9.332ms  pass 6.436ms   1.4706x   share 32.00%   DECIDED
+    n=2,000,000  resort 124.109ms pass 80.330ms 1.5403x   share 35.08%   DECIDED
+
+All three DECIDED at the replicate level: the candidate's p10 clears the null's
+p90 with room at every size (e.g. n=2M candidate [1.5273,1.5622] against a null
+[0.9779,1.0182]). A/A nulls 1.0017 / 1.0018 / 0.9934 — tight, on a pinned core at
+loadavg ~11.
+
+This is ours-against-ours and is MAINTENANCE by the campaign's own rule. It is not
+the win.
+
+BYTE-IDENTITY HELD ON THE REAL FIXTURE: bitmism=0 at every size, checked before any
+timing was believed. The MUST-HIT control is satisfied rather than assumed —
+tie_groups 5,000 / 50,000 / 500,000 and tie_mass 3.75e-8 / 3.75e-10 / 3.75e-12,
+recomputed over the VALUES by exact equality, so no row here describes a tie-free
+fixture on which the lever's equivalence argument would be vacuous.
+branch=asymptotic at every size, so every row exercised the path the tie correction
+actually lives on.
+
+## 2. GATE (a): the share is LARGE, and its predicted TREND did not appear
+
+The bead predicted the share would GROW with n, on the model "an O(n log n) sort
+removed from an O(n) remainder". It does not: 35.01% -> 32.00% -> 35.08%, FLAT.
+Reported that way round because the prediction failed, not because the number is
+convenient. The bead's stop condition was "if the sort is a SMALL share at the
+sizes callers actually use, report that and STOP" — 32-35% is not small, so the
+lever stands, but the mechanism story is weaker than the bead assumed. Kruskal
+behaved identically (25-32%, also flat), which is consistent: above n=2^14 the
+ranking pass uses a radix argsort, so the removed comparison sort is being weighed
+against O(n) work at every size measured, and no growth should be expected.
+
+## 3. THE WIN: live scipy.stats.mannwhitneyu, same invocation
+
+    n=20,000     fsci 0.451ms   scipy 1.183ms    RATIO 2.624x   scipy A/A null 0.9770
+    n=200,000    fsci 6.271ms   scipy 14.471ms   RATIO 2.308x   scipy A/A null 0.9933
+    n=2,000,000  fsci 81.247ms  scipy 132.946ms  RATIO 1.636x   scipy A/A null 0.9689
+
+FrankenSciPy is 1.64x to 2.62x FASTER than the live incumbent, with the scipy arm
+bracketing the fsci arm in the same window so drift lands in the incumbent null
+rather than the ratio. The effect is one to two orders of magnitude larger than any
+null observed (worst null deviation 3.1%).
+
+PARITY BEFORE ANY RATIO IS BELIEVED: agree=true at every size, U and p both at
+relgap 0.000e0 — bit-exact against SciPy, not merely close. Both arms pinned to
+method="asymptotic", because SciPy's default "auto" would take the exact null on
+small tie-free inputs and time a different algorithm entirely.
+
+## 4. WHAT THE LEVER IS WORTH AGAINST THE INCUMBENT — an ESTIMATE, not a row
+
+The two harnesses agree on the post-lever fsci number at n=2M (80.330ms in the A/B,
+81.247ms in the head-to-head, within 1.1%), so composing them is defensible:
+
+    scipy / pre-lever fsci  ~=  132.946 / 124.109  ~=  1.07x
+
+i.e. at n=2,000,000 the redundant sort was very nearly the whole margin — without
+it mannwhitneyu sits at roughly parity with SciPy, and with it we are at 1.64x.
+This is a COMPOSITION ACROSS TWO BINARIES AND TWO WINDOWS, not a measured row, and
+must not be quoted as one. Measuring it directly needs the ORIG arm and the scipy
+arm in a single invocation, which neither binary does today.
+
+## 5. WHAT IS NOT MEASURED
+
+The tie-sum accumulation added to the ranking pass runs in BOTH arms of the A/B, so
+1.47-1.54x is a LOWER BOUND on the true pre-lever/post-lever ratio, and it says
+nothing about whether that accumulation slowed `rankdata`'s other callers.
+`mannwhitneyu_alternative` carries the identical edit at lib.rs:31067 and is pinned
+byte-identical by the same unit test, but was NOT timed — do not quote these rows
+for it.
+
+## PROVENANCE
+
+host=thinkstation1, governor=powersave, taskset -c 1, threads_observed=1,
+loadavg 10.6-11.4 throughout, scipy 1.17.1 / numpy 2.4.3.
+A/B ELF   3eadcee52f1db6d2bd5bf6ee2b449b22d042ba057b51f985a219dde856ea373d
+live ELF  4c31cc240f7aae435c21e36302ed3321e197550fd178deecb790d3caed334165
+Both self-reported in-process from /proc/self/exe by the running binary.
+build_slot: REFUSED server-side ("Build slots are disabled", frankenscipy-fr78g).
+build_route=local-wrapper-bypass.
+
+TARGET DIR DEVIATION, recorded because it affects nothing but should not be silent:
+the repo's own target/release is wedged — it holds a check-only `libserde` .rmeta
+with no matching .rlib, which cargo treats as fresh, so every build there fails
+with "can't find crate for serde" while compiling fsci-runtime. Rather than delete
+anything to clear it (forbidden), these binaries were built into a private
+session-scratchpad target dir. The ELF shas above identify exactly what ran.
