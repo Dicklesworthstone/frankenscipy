@@ -4,6 +4,7 @@ pub mod audit;
 pub mod bracket;
 pub mod chandrupatla;
 pub mod curvefit;
+pub mod lbfgs_inv_hess;
 pub mod linesearch;
 pub mod minimize;
 pub mod nonlin;
@@ -15,6 +16,8 @@ pub use bracket::{
     BracketOptions, BracketResult, MinimumBracketOptions, MinimumBracketResult,
     MinimumBracketStatus, bracket_minimum, bracket_root,
 };
+pub use lbfgs_inv_hess::LbfgsInvHessProduct;
+
 pub use chandrupatla::{
     FindMinimumOptions, FindMinimumResult, FindMinimumStatus, FindRootOptions, FindRootResult,
     FindRootStatus, find_minimum, find_root,
