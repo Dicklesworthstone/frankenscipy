@@ -3250,6 +3250,73 @@ pub fn gaussian_filter1d_default_axis(
 /// Median filter.
 ///
 /// Matches `scipy.ndimage.median_filter`.
+fn median_filter1d_sliding_histogram(
+    input: &NdArray,
+    size: usize,
+    origin: i64,
+    mode: BoundaryMode,
+    cval: f64,
+) -> NdArray {
+    // Coordinate-compress the exact total order used by `select_total_rank`.  This is a
+    // histogram over values rather than a lossy numeric binning scheme, so NaN payloads and
+    // signed zeros retain the same SciPy-visible ordering as the generic rank path.
+    let mut values = input.data.clone();
+    values.push(cval);
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|left, right| left.total_cmp(right).is_eq());
+
+    let mut tree = vec![0isize; values.len() + 1];
+    let adjust = |tree: &mut [isize], index: usize, delta: isize| {
+        let mut node = index + 1;
+        while node < tree.len() {
+            tree[node] += delta;
+            node += node & node.wrapping_neg();
+        }
+    };
+    let index_of = |value: f64| {
+        values
+            .binary_search_by(|candidate| candidate.total_cmp(&value))
+            .expect("histogram palette contains input and boundary values")
+    };
+    let select = |tree: &[isize], mut rank: isize| {
+        let mut bit = 1usize;
+        while bit < values.len() {
+            bit <<= 1;
+        }
+        let mut node = 0usize;
+        while bit != 0 {
+            let candidate = node + bit;
+            if candidate < tree.len() && tree[candidate] <= rank {
+                rank -= tree[candidate];
+                node = candidate;
+            }
+            bit >>= 1;
+        }
+        node
+    };
+
+    let len = input.shape[0] as i64;
+    let size_i = size as i64;
+    let lo = size_i / 2 + origin;
+    let value_at = |coord: i64| {
+        boundary_index_1d(coord, len, mode).map_or(cval, |index| input.data[index as usize])
+    };
+    for coord in -lo..size_i - lo {
+        adjust(&mut tree, index_of(value_at(coord)), 1);
+    }
+
+    let mut output = NdArray::zeros(input.shape.clone());
+    let rank = (size / 2) as isize;
+    for position in 0..len {
+        output.data[position as usize] = values[select(&tree, rank)];
+        if position + 1 < len {
+            adjust(&mut tree, index_of(value_at(position - lo)), -1);
+            adjust(&mut tree, index_of(value_at(position - lo + size_i)), 1);
+        }
+    }
+    output
+}
+
 pub fn median_filter(
     input: &NdArray,
     size: usize,
@@ -3300,11 +3367,18 @@ pub fn median_filter_with_origins(
     }
 
     let ndim = input.ndim();
-    let mut output = NdArray::zeros(input.shape.clone());
     let offsets: Vec<i64> = vec![size as i64 / 2; ndim];
     let kernel_shape: Vec<usize> = vec![size; ndim];
     let kernel_total: usize = kernel_shape.iter().product();
     let origins = normalize_filter_origins(ndim, &kernel_shape, origins)?;
+
+    if ndim == 1 {
+        return Ok(median_filter1d_sliding_histogram(
+            input, size, origins[0], mode, cval,
+        ));
+    }
+
+    let mut output = NdArray::zeros(input.shape.clone());
 
     // Generate all offsets in kernel
     let kernel_strides = compute_strides(&kernel_shape);
@@ -16591,6 +16665,60 @@ mod tests {
         let shifted =
             median_filter_with_origins(&input, 2, &[-1], BoundaryMode::Constant, 0.0).unwrap();
         assert_eq!(shifted.data, vec![2., 3., 4., 5., 5.]);
+    }
+
+    #[test]
+    fn median_filter_1d_sliding_histogram_matches_full_rank_bits() {
+        let input = NdArray::new(
+            vec![
+                -0.0,
+                4.0,
+                f64::from_bits(0x7ff8_0000_0000_0007),
+                -3.0,
+                4.0,
+                0.0,
+                9.0,
+            ],
+            vec![7],
+        )
+        .unwrap();
+        let cval = f64::from_bits(0x7ff8_0000_0000_0011);
+        for mode in [
+            BoundaryMode::Nearest,
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Wrap,
+            BoundaryMode::Mirror,
+        ] {
+            for size in [2usize, 3, 6] {
+                let origin_lo = -(size as i64 / 2);
+                let origin_hi = (size as i64 - 1) / 2;
+                for origin in [origin_lo, 0, origin_hi] {
+                    let got =
+                        median_filter_with_origins(&input, size, &[origin], mode, cval).unwrap();
+                    let want = rank_filter_index_with_origins(
+                        &input,
+                        size,
+                        &[origin],
+                        mode,
+                        cval,
+                        size / 2,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        got.data
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        want.data
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        "mode={mode:?} size={size} origin={origin}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
