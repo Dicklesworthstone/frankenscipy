@@ -397,6 +397,19 @@ pub trait ContinuousDistribution {
         })
     }
 
+    /// Fit the family for [`goodness_of_fit`].
+    ///
+    /// Most families use their ordinary [`Self::try_fit`] estimator. SciPy's
+    /// normal goodness-of-fit fast path is the deliberate exception: when both
+    /// parameters are free it estimates scale with the sample standard deviation
+    /// (`ddof = 1`) instead of `norm.fit`'s MLE scale (`ddof = 0`).
+    fn try_fit_for_goodness_of_fit(data: &[f64]) -> Result<Self, FitError>
+    where
+        Self: Sized,
+    {
+        Self::try_fit(data)
+    }
+
     /// Audit-emitting counterpart to `try_fit` (br-egba-3). Delegates
     /// to `try_fit`, and on any `FitError` records an
     /// `AuditAction::FailClosed` event on the provided ledger. Useful
@@ -1168,6 +1181,14 @@ impl ContinuousDistribution for Normal {
             ));
         }
         Ok(Self::fit(data))
+    }
+
+    fn try_fit_for_goodness_of_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "Normal")?;
+        let n = data.len() as f64;
+        let loc = sample_mean(data);
+        let scale = (data.iter().map(|&x| (x - loc).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+        Ok(Self { loc, scale })
     }
 
     fn entropy(&self) -> f64 {
@@ -58075,8 +58096,8 @@ impl<D: ContinuousDistribution> Truncated<D> {
 /// alone is exactly zero for a standard normal on `[30, 40]`, where the survival
 /// side still returns 4.906713927147908e-198.
 ///
-/// The guard is `!(lo < hi)` rather than `lo >= hi` so a NaN bound short-circuits
-/// to zero instead of slipping through a false comparison — the same NaN-aware
+/// The guard rejects `lo >= hi` and either NaN bound, so a NaN short-circuits to
+/// zero instead of slipping through a false comparison — the same NaN-aware
 /// shape as `tanh_sinh_integrate` (frankenscipy-023vy).
 ///
 /// # What it cannot fix
@@ -58088,7 +58109,7 @@ impl<D: ContinuousDistribution> Truncated<D> {
 /// rather than of the branch choice. The failure is graceful: relative accuracy
 /// degrades as the interval narrows, it does not jump to zero.
 fn interval_probability<D: ContinuousDistribution>(dist: &D, lo: f64, hi: f64) -> f64 {
-    if !(lo < hi) {
+    if lo >= hi || lo.is_nan() || hi.is_nan() {
         return 0.0;
     }
     if lo == f64::NEG_INFINITY {
@@ -58117,7 +58138,7 @@ fn interval_probability<D: ContinuousDistribution>(dist: &D, lo: f64, hi: f64) -
 /// the `exp` argument is never positive. On `[40, 50]` for a standard normal
 /// BOTH linear branches are exactly 0.0 while this returns −804.608.
 fn log_interval_probability<D: ContinuousDistribution>(dist: &D, lo: f64, hi: f64) -> f64 {
-    if !(lo < hi) {
+    if lo >= hi || lo.is_nan() || hi.is_nan() {
         return f64::NEG_INFINITY;
     }
     if lo == f64::NEG_INFINITY {
@@ -58139,6 +58160,27 @@ fn log_interval_probability<D: ContinuousDistribution>(dist: &D, lo: f64, hi: f6
         return big;
     }
     big + (-(small - big).exp()).ln_1p()
+}
+
+#[cfg(test)]
+mod interval_probability_nan_bounds {
+    use super::{Normal, interval_probability, log_interval_probability};
+
+    /// A plain `lo >= hi` rewrite admits NaN because every ordered comparison
+    /// against NaN is false. Both mass paths must instead retain the documented
+    /// empty-interval result.
+    #[test]
+    fn nan_bounds_are_empty_intervals_not_unordered_inputs_to_the_distribution() {
+        let normal = Normal::standard();
+        for (lo, hi) in [(f64::NAN, 1.0), (-1.0, f64::NAN)] {
+            assert_eq!(interval_probability(&normal, lo, hi), 0.0);
+            assert_eq!(log_interval_probability(&normal, lo, hi), f64::NEG_INFINITY);
+        }
+
+        // MUST-MISS: a finite ascending interval remains a real interval.
+        assert!(interval_probability(&normal, -1.0, 1.0) > 0.0);
+        assert!(log_interval_probability(&normal, -1.0, 1.0).is_finite());
+    }
 }
 
 impl<D: ContinuousDistribution> ContinuousDistribution for Truncated<D> {
@@ -58853,10 +58895,11 @@ pub struct GofOutcome<D> {
 ///
 /// # Requires a fittable family
 ///
-/// Returns `Err(FitError::NotImplemented)` when `D` does not override `try_fit`,
-/// which is the trait default. `try_fit` rather than `fit` deliberately: `fit`
-/// panics, and a generic driver that panics on an unfittable family is not usable
-/// as a library.
+/// Returns `Err(FitError::NotImplemented)` when `D` does not override
+/// `try_fit_for_goodness_of_fit`, which delegates to the trait-default
+/// `try_fit`. The fallible method rather than `fit` deliberately: `fit` panics,
+/// and a generic driver that panics on an unfittable family is not usable as a
+/// library.
 ///
 /// # Resamples that fail to refit
 ///
@@ -58886,7 +58929,7 @@ pub fn goodness_of_fit<D>(
 where
     D: ContinuousDistribution + Copy + Sync,
 {
-    let fitted = D::try_fit(data)?;
+    let fitted = D::try_fit_for_goodness_of_fit(data)?;
     let n = data.len();
 
     let rvs = move |s: u64| -> Vec<f64> {
@@ -58895,7 +58938,7 @@ where
     };
     // Each resample is REFITTED before its statistic is taken; see step 3 above.
     let statistic_fn = move |sample: &[f64]| -> f64 {
-        match D::try_fit(sample) {
+        match D::try_fit_for_goodness_of_fit(sample) {
             Ok(refit) => gof_statistic(&refit, sample, which),
             Err(_) => f64::NAN,
         }
@@ -59015,7 +59058,7 @@ impl HistogramDistribution {
             })
             .collect();
         let total: f64 = mass.iter().sum();
-        if !(total > 0.0) {
+        if total <= 0.0 || total.is_nan() {
             return Err(StatsError::InvalidArgument(
                 "the histogram carries no probability mass".to_string(),
             ));
@@ -59260,7 +59303,7 @@ impl<D: ContinuousDistribution> Mixture<D> {
             ));
         }
         let total: f64 = weights.iter().sum();
-        if !(total > 0.0) {
+        if total <= 0.0 || total.is_nan() {
             return Err(StatsError::InvalidArgument(
                 "the weights carry no mass".to_string(),
             ));
@@ -59360,7 +59403,7 @@ impl<D: ContinuousDistribution> ContinuousDistribution for Mixture<D> {
         // mixture mean: μ₃ = Σ wᵢ[μ₃ᵢ + 3dᵢσᵢ² + dᵢ³], dᵢ = μᵢ − μ.
         let mu = self.mean();
         let var = self.var();
-        if !(var > 0.0) {
+        if var <= 0.0 || var.is_nan() {
             return f64::NAN;
         }
         let m3 = self.blend(|c| {
@@ -59380,7 +59423,7 @@ impl<D: ContinuousDistribution> ContinuousDistribution for Mixture<D> {
         // the same mixture is 3 larger than this one.
         let mu = self.mean();
         let var = self.var();
-        if !(var > 0.0) {
+        if var <= 0.0 || var.is_nan() {
             return f64::NAN;
         }
         let m4 = self.blend(|c| {
@@ -59413,7 +59456,7 @@ mod mixture_matches_scipy {
         for (x, p, c, s) in [
             (
                 -3.0,
-                9.740_520_140_617_380e-2,
+                9.740_520_140_617_38e-2,
                 6.371_953_777_250_093e-2,
                 9.362_804_622_274_992e-1,
             ),
@@ -59421,18 +59464,18 @@ mod mixture_matches_scipy {
                 0.0,
                 8.720_041_647_567_267e-2,
                 4.456_266_790_562_491e-1,
-                5.543_733_209_437_510e-1,
+                5.543_733_209_437_51e-1,
             ),
             (
                 2.5,
-                1.509_596_845_736_400e-1,
+                1.509_596_845_736_4e-1,
                 7.783_338_368_216_919e-1,
                 2.216_661_631_783_081e-1,
             ),
             (
                 7.0,
                 6.169_115_985_164_424e-4,
-                9.997_425_638_000_820e-1,
+                9.997_425_638_000_82e-1,
                 2.574_361_999_181_024e-4,
             ),
         ] {
@@ -59594,7 +59637,7 @@ impl DiscreteAliasUrn {
             ));
         }
         let total: f64 = pv.iter().sum();
-        if !(total > 0.0) {
+        if total <= 0.0 || total.is_nan() {
             return Err(StatsError::InvalidArgument(
                 "the probability vector carries no mass".to_string(),
             ));
@@ -59871,13 +59914,13 @@ impl DiscreteGuideTable {
                 "probabilities must be finite and non-negative".to_string(),
             ));
         }
-        if !(guide_factor > 0.0) || !guide_factor.is_finite() {
+        if guide_factor <= 0.0 || !guide_factor.is_finite() {
             return Err(StatsError::InvalidArgument(format!(
                 "guide_factor must be positive and finite, got {guide_factor}"
             )));
         }
         let total: f64 = pv.iter().sum();
-        if !(total > 0.0) {
+        if total <= 0.0 || total.is_nan() {
             return Err(StatsError::InvalidArgument(
                 "the probability vector carries no mass".to_string(),
             ));
@@ -59941,7 +59984,7 @@ impl DiscreteGuideTable {
     #[must_use]
     pub fn ppf(&self, u: f64) -> i64 {
         let k = self.cdf.len();
-        if !(u > 0.0) {
+        if u <= 0.0 || u.is_nan() {
             return self.offset;
         }
         if u >= 1.0 {
@@ -60187,12 +60230,12 @@ impl<F: Fn(f64) -> f64> RatioUniforms<F> {
     ///
     /// `umax` not positive, `vmin` not below `vmax`, or any bound non-finite.
     pub fn new(pdf: F, umax: f64, vmin: f64, vmax: f64, c: f64) -> Result<Self, StatsError> {
-        if !(umax > 0.0) || !umax.is_finite() {
+        if umax <= 0.0 || !umax.is_finite() {
             return Err(StatsError::InvalidArgument(format!(
                 "umax must be positive and finite, got {umax}"
             )));
         }
-        if !(vmin < vmax) || !vmin.is_finite() || !vmax.is_finite() {
+        if vmin >= vmax || !vmin.is_finite() || !vmax.is_finite() {
             return Err(StatsError::InvalidArgument(format!(
                 "need finite vmin < vmax, got vmin={vmin} vmax={vmax}"
             )));
@@ -60298,20 +60341,20 @@ impl<F: Fn(f64) -> f64> RatioUniforms<F> {
                 "mode must be finite, got {mode}"
             )));
         }
-        if !(pdf_area > 0.0) || !pdf_area.is_finite() {
+        if pdf_area <= 0.0 || !pdf_area.is_finite() {
             return Err(StatsError::InvalidArgument(format!(
                 "pdf_area must be positive and finite, got {pdf_area}"
             )));
         }
-        if let Some(fm) = cdf_at_mode {
-            if !(0.0..=1.0).contains(&fm) {
-                return Err(StatsError::InvalidArgument(format!(
-                    "cdf_at_mode must lie in [0, 1], got {fm}"
-                )));
-            }
+        if let Some(fm) = cdf_at_mode
+            && !(0.0..=1.0).contains(&fm)
+        {
+            return Err(StatsError::InvalidArgument(format!(
+                "cdf_at_mode must lie in [0, 1], got {fm}"
+            )));
         }
         let f_mode = pdf(mode);
-        if !(f_mode > 0.0) || !f_mode.is_finite() {
+        if f_mode <= 0.0 || !f_mode.is_finite() {
             return Err(StatsError::InvalidArgument(format!(
                 "the pdf must be positive and finite at the mode, got {f_mode}"
             )));
@@ -60676,7 +60719,10 @@ impl<F: Fn(f64) -> f64> TransformedDensityRejection<F> {
                 "need at least two construction points".to_string(),
             ));
         }
-        if construction_points.windows(2).any(|w| !(w[0] < w[1])) {
+        if construction_points
+            .windows(2)
+            .any(|w| w[0] >= w[1] || w[0].is_nan() || w[1].is_nan())
+        {
             return Err(StatsError::InvalidArgument(
                 "construction points must be strictly ascending".to_string(),
             ));
@@ -60685,7 +60731,7 @@ impl<F: Fn(f64) -> f64> TransformedDensityRejection<F> {
         let mut slope = Vec::with_capacity(n);
         for &x in construction_points {
             let f = pdf(x);
-            if !(f > 0.0) || !f.is_finite() {
+            if f <= 0.0 || !f.is_finite() {
                 return Err(StatsError::InvalidArgument(format!(
                     "the pdf must be positive and finite at every construction point; \
                      at {x} it is {f}"
@@ -60703,7 +60749,7 @@ impl<F: Fn(f64) -> f64> TransformedDensityRejection<F> {
         }
         // The outermost tangents carry the unbounded tails, so they must point
         // inward or the hat has infinite area.
-        if !(slope[0] > 0.0) || !(slope[n - 1] < 0.0) {
+        if slope[0] <= 0.0 || slope[0].is_nan() || slope[n - 1] >= 0.0 || slope[n - 1].is_nan() {
             return Err(StatsError::InvalidArgument(format!(
                 "the hat is not integrable: the tangent slope of ln f must be positive \
                  at the first construction point (got {}) and negative at the last \
@@ -60749,7 +60795,7 @@ impl<F: Fn(f64) -> f64> TransformedDensityRejection<F> {
             ));
         }
         let hat_area: f64 = areas.iter().sum();
-        if !(hat_area > 0.0) || !hat_area.is_finite() {
+        if hat_area <= 0.0 || !hat_area.is_finite() {
             return Err(StatsError::InvalidArgument(format!(
                 "the hat area is not finite and positive, got {hat_area}"
             )));
@@ -60883,7 +60929,7 @@ impl<F: Fn(f64) -> f64> TransformedDensityRejection<F> {
                 let lo = (ea - m).exp();
                 let hi = (eb - m).exp();
                 let inner = lo + w * (hi - lo);
-                if !(inner > 0.0) {
+                if inner <= 0.0 || inner.is_nan() {
                     continue;
                 }
                 x0 + (m + inner.ln()) / s
@@ -61154,7 +61200,7 @@ impl<D: ContinuousDistribution> NumericalInverseHermite<D> {
     /// A non-finite or non-positive `u_resolution`, or a distribution whose
     /// quantile is not finite anywhere in the interpolated range.
     pub fn new(dist: D, u_resolution: f64) -> Result<Self, StatsError> {
-        if !(u_resolution > 0.0) || !u_resolution.is_finite() {
+        if u_resolution <= 0.0 || !u_resolution.is_finite() {
             return Err(StatsError::InvalidArgument(format!(
                 "u_resolution must be positive and finite, got {u_resolution}"
             )));
@@ -61174,7 +61220,7 @@ impl<D: ContinuousDistribution> NumericalInverseHermite<D> {
             let f = dist.pdf(xx);
             // dF⁻¹/du = 1/f. A zero density means the quantile is flat here and
             // the derivative is unbounded; that node cannot anchor a cubic.
-            if !(f > 0.0) || !f.is_finite() {
+            if f <= 0.0 || !f.is_finite() {
                 return None;
             }
             Some((xx, 1.0 / f))
@@ -101568,13 +101614,7 @@ mod wofb_noncentral_survival_is_direct {
                 1.014_350_364_860_013_6e-1,
                 "1.014350e-01 ok",
             ),
-            (
-                5.0,
-                7.0,
-                20.0,
-                9.992_803_076_754_801_5e-1,
-                "9.992803e-01 ok",
-            ),
+            (5.0, 7.0, 20.0, 9.992_803_076_754_802e-1, "9.992803e-01 ok"),
             (
                 80.0,
                 3.0,
@@ -101614,7 +101654,7 @@ mod wofb_noncentral_survival_is_direct {
                 3.0,
                 5.0,
                 2.0,
-                9.362_115_386_065_090e-3,
+                9.362_115_386_065_09e-3,
                 "9.362115e-03 ok",
             ),
             (
@@ -101646,7 +101686,7 @@ mod wofb_noncentral_survival_is_direct {
                 5.0,
                 200.0,
                 3.0,
-                4.498_173_170_614_720e-230,
+                4.498_173_170_614_72e-230,
                 "0.0 COLLAPSED",
             ),
         ];
@@ -101674,7 +101714,7 @@ mod wofb_noncentral_survival_is_direct {
             (
                 "ncf(5, 200, 3) at 1e4",
                 1.0 - NoncentralF::new(5.0, 200.0, 3.0).cdf(1e4),
-                4.498_173_170_614_720e-230,
+                4.498_173_170_614_72e-230,
             ),
         ] {
             let rel = ((naive - truth) / truth).abs();
@@ -101781,8 +101821,8 @@ mod order_statistic_matches_scipy {
                 7,
                 -1.0,
                 6.797_301_110_926_495e-1,
-                3.076_774_137_564_610e-1,
-                6.923_225_862_435_390e-1,
+                3.076_774_137_564_61e-1,
+                6.923_225_862_435_39e-1,
             ),
             (2, 7, 0.0, 2.618_058_715_134_402e-1, 9.375e-1, 6.25e-2),
             (
@@ -101877,8 +101917,8 @@ mod order_statistic_matches_scipy {
     fn mean_and_var_match_scipy() {
         // r, n, scipy mean, scipy variance
         let cases = [
-            (1, 5, -1.162_964_473_640_520e0, 4.475_340_690_206_621e-1),
-            (5, 5, 1.162_964_473_640_520e0, 4.475_340_690_206_621e-1),
+            (1, 5, -1.162_964_473_640_52, 4.475_340_690_206_621e-1),
+            (5, 5, 1.162_964_473_640_52, 4.475_340_690_206_621e-1),
             (2, 7, -7.573_742_706_388_729e-1, 2.567_328_861_621_016e-1),
         ];
         for (r, n, want_mean, want_var) in cases {
@@ -102100,8 +102140,8 @@ mod truncate_matches_scipy {
                 3.0,
                 0.75,
                 6.039_052_854_217_726e-1,
-                5.482_253_920_013_680e-1,
-                4.517_746_079_986_320e-1,
+                5.482_253_920_013_68e-1,
+                4.517_746_079_986_32e-1,
             ),
             (
                 0.0,
@@ -102289,12 +102329,7 @@ mod truncate_matches_scipy {
         // good to ~3e-9 absolute, so nothing built on it can be tighter. Still
         // orders below any formula error.
         let cases = [
-            (
-                -1.0,
-                2.0,
-                2.296_371_790_913_290e-1,
-                5.197_625_392_115_339e-1,
-            ),
+            (-1.0, 2.0, 2.296_371_790_913_29e-1, 5.197_625_392_115_339e-1),
             (0.0, 3.0, 7.911_568_260_634_169e-1, 3.474_078_012_358_018e-1),
             (5.0, 10.0, 5.186_503_967_125_851e0, 3.269_643_461_706_051e-2),
             (
@@ -102339,7 +102374,7 @@ mod truncate_matches_scipy {
                 2.0,
                 0.5,
                 1.711_639_180_178_248e-1,
-                1.711_639_180_178_250e-1,
+                1.711_639_180_178_25e-1,
             ),
             (
                 -1.0,
@@ -102562,7 +102597,7 @@ mod transforms_match_scipy {
             (1.0, 3.989_422_804_014_327e-1, 5.0e-1, 5.0e-1),
             (
                 3.0,
-                7.272_825_613_999_470e-2,
+                7.272_825_613_999_47e-2,
                 8.640_313_923_585_756e-1,
                 1.359_686_076_414_244e-1,
             ),
@@ -102636,7 +102671,7 @@ mod transforms_match_scipy {
                 3.0,
                 6.950_393_176_934_426e-2,
                 9.593_597_738_088_753e-1,
-                4.064_022_619_112_470e-2,
+                4.064_022_619_112_47e-2,
             ),
         ] {
             let y = abs_of(Normal::new(0.7, 1.3));
@@ -102901,6 +102936,42 @@ mod goodness_of_fit_matches_scipy {
         );
     }
 
+    /// SciPy deliberately uses a different normal estimator for
+    /// `goodness_of_fit` than for `norm.fit`: the former has `ddof = 1` when
+    /// both parameters are free. Keep that exception inside the GoF path so
+    /// ordinary Normal fitting remains maximum-likelihood (`ddof = 0`).
+    #[test]
+    fn normal_goodness_of_fit_uses_scipys_sample_scale_not_norm_fits_mle() {
+        let mle = Normal::try_fit(&NORMALISH).expect("normal MLE fit");
+        let result: super::GofOutcome<Normal> =
+            goodness_of_fit(&NORMALISH, GofStatistic::AndersonDarling, 9, 20260818)
+                .expect("normal goodness-of-fit");
+
+        assert!(
+            (mle.scale - 1.029_572_726_911_508_7).abs() < 1e-15,
+            "Normal::try_fit must remain scipy.stats.norm.fit's MLE"
+        );
+        assert!(
+            (result.fitted.loc - 0.269_999_999_999_999_96).abs() < 1e-15,
+            "gof loc = {}, scipy = 0.26999999999999996",
+            result.fitted.loc
+        );
+        assert!(
+            (result.fitted.scale - 1.056_319_329_708_488).abs() < 1e-15,
+            "gof scale = {}, scipy goodness_of_fit = 1.056319329708488",
+            result.fitted.scale
+        );
+        assert!(
+            (result.statistic - 1.305_856_415_585_253_7e-1).abs() < 1e-12,
+            "AD = {}, scipy goodness_of_fit = 0.13058564155852537",
+            result.statistic
+        );
+        assert!(
+            result.fitted.scale > mle.scale,
+            "the sample-scale GoF fit must differ from Normal::try_fit's MLE"
+        );
+    }
+
     /// The four statistics against `scipy.stats._fit`, evaluated at the SAME
     /// fitted parameters so this tests the formulas and nothing else.
     #[test]
@@ -103070,11 +103141,12 @@ mod goodness_of_fit_matches_scipy {
     fn the_null_is_built_by_refitting_each_resample() {
         let res: super::GofOutcome<Normal> =
             goodness_of_fit(&NORMALISH, GofStatistic::AndersonDarling, 499, 7).expect("fit");
-        let fitted = Normal::try_fit(&NORMALISH).expect("fit");
-        assert_eq!(
-            res.fitted, fitted,
-            "the reported fit is the null-hypothesis fit"
+        let mle = Normal::try_fit(&NORMALISH).expect("fit");
+        assert!(
+            res.fitted.scale > mle.scale,
+            "the normal GoF null must use SciPy's ddof=1 fit, not norm.fit's MLE"
         );
+        let fitted = res.fitted;
 
         // Score the same statistic WITHOUT refitting, on samples from the null.
         // The no-refit statistic is stochastically larger, because refitting
@@ -103122,15 +103194,14 @@ mod goodness_of_fit_matches_scipy {
         );
         // MUST-MISS control: a family that DOES implement it succeeds on the same
         // call, so the error above is about the family and not about the driver.
-        let ok: Result<super::GofOutcome<super::HalfNormal>, _> = goodness_of_fit(
-            &[0.4, 0.9, 1.3, 0.2, 2.1, 0.7, 1.6],
-            GofStatistic::KolmogorovSmirnov,
-            9,
-            1,
-        );
-        assert!(
-            ok.is_ok(),
-            "HalfNormal does override try_fit, so this must succeed"
+        let half_normal_data = [0.4, 0.9, 1.3, 0.2, 2.1, 0.7, 1.6];
+        let ok: Result<super::GofOutcome<super::HalfNormal>, _> =
+            goodness_of_fit(&half_normal_data, GofStatistic::KolmogorovSmirnov, 9, 1);
+        let ok = ok.expect("HalfNormal does override try_fit, so this must succeed");
+        assert_eq!(
+            ok.fitted,
+            super::HalfNormal::try_fit(&half_normal_data).expect("HalfNormal MLE fit"),
+            "only Normal has SciPy's goodness-of-fit-specific estimator"
         );
     }
 
@@ -103269,21 +103340,16 @@ mod histogram_distribution_matches_scipy {
             (
                 0.5,
                 0.133_333_333_333_333_33,
-                0.066_666_666_666_666_666,
-                0.933_333_333_333_333_35,
+                0.066_666_666_666_666_67,
+                0.933_333_333_333_333_3,
             ),
             (
                 2.0,
-                0.333_333_333_333_333_31,
-                0.466_666_666_666_666_67,
-                0.533_333_333_333_333_33,
+                0.333_333_333_333_333_3,
+                0.466_666_666_666_666_7,
+                0.533_333_333_333_333_3,
             ),
-            (
-                3.5,
-                0.200_000_000_000_000_01,
-                0.899_999_999_999_999_91,
-                0.100_000_000_000_000_09,
-            ),
+            (3.5, 0.2, 0.899_999_999_999_999_9, 0.100_000_000_000_000_09),
         ] {
             for (got, want, what) in [
                 (h.pdf(x), p, "pdf"),
@@ -103301,7 +103367,7 @@ mod histogram_distribution_matches_scipy {
         }
         for (q, want_ppf, want_isf) in [
             (0.05, 0.375, 3.75),
-            (0.5, 2.100_000_000_000_000_1, 2.1),
+            (0.5, 2.1, 2.1),
             (0.95, 3.75, 0.375_000_000_000_000_33),
         ] {
             assert!(
