@@ -3554,10 +3554,34 @@ mod cubic_live {
                     let _ = splu_solve(&factor, &fixture.right_hand_sides[0]);
                 });
             }
-            let orig_1 = arm(true, &mut sixteen_solves)?;
-            let head_1 = arm(false, &mut sixteen_solves)?;
-            let head_2 = arm(false, &mut sixteen_solves)?;
-            let orig_2 = arm(true, &mut sixteen_solves)?;
+            // POSITION-BALANCED, not merely ABBA. ABBA cancels a monotone DRIFT, and the
+            // effect here is not drift: the first sixteen-solve pass after a fresh
+            // factorization is systematically slower than an immediately repeated one
+            // (measured: an A/A null of 1.185, 20 of 21 replicates above unity, on a probe
+            // that always ran the ORIG arm in the cold outer slot). With a fixed schedule
+            // that bias lands entirely on whichever arm owns slot 1, and it is LARGER than
+            // the lever — the first version of this probe reported the candidate at 1.126
+            // against a null of 1.185, i.e. the schedule, not the code.
+            //
+            // So the quartet flips with the round: ABBA on even rounds, BAAB on odd. Each
+            // arm then owns the cold slot in half the replicates and the position effect
+            // cancels in the aggregate ratio instead of being attributed to the candidate.
+            // The A/A null is still same-arm-over-same-arm and still SEES the effect, which
+            // is what makes the candidate's separation from it meaningful.
+            let orig_first = round % 2 == 0;
+            let (orig_1, head_1, head_2, orig_2) = if orig_first {
+                let a1 = arm(true, &mut sixteen_solves)?;
+                let b1 = arm(false, &mut sixteen_solves)?;
+                let b2 = arm(false, &mut sixteen_solves)?;
+                let a2 = arm(true, &mut sixteen_solves)?;
+                (a1, b1, b2, a2)
+            } else {
+                let b1 = arm(false, &mut sixteen_solves)?;
+                let a1 = arm(true, &mut sixteen_solves)?;
+                let a2 = arm(true, &mut sixteen_solves)?;
+                let b2 = arm(false, &mut sixteen_solves)?;
+                (a1, b1, b2, a2)
+            };
             black_box(checksum);
 
             if round == 0 {
@@ -3565,10 +3589,17 @@ mod cubic_live {
             }
             factor_ms.push(factored);
             let head = (head_1 + head_2) / 2.0;
+            let orig = (orig_1 + orig_2) / 2.0;
             solve_ms.push(head);
-            orig_solve_ms.push((orig_1 + orig_2) / 2.0);
-            ab.push(((orig_1 + orig_2) / 2.0) / head);
-            nulls.push(orig_1 / orig_2);
+            orig_solve_ms.push(orig);
+            ab.push(orig / head);
+            // The null is taken from whichever arm occupied the two OUTER slots this round,
+            // so it carries the same cold/warm exposure the ratio has to clear.
+            nulls.push(if orig_first {
+                orig_1 / orig_2
+            } else {
+                head_1 / head_2
+            });
         }
 
         let factor_median = median(factor_ms.clone());

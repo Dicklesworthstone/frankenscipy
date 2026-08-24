@@ -1,0 +1,65 @@
+### frankenscipy-run7d — SOLVE-PATH ATTRIBUTION AND A/B (BlackThrush, 2026-08-23)
+host=thinkstation1 governor=powersave scipy=1.17.1/numpy=2.4.3
+build_slot: REFUSED server-side ("Build slots are disabled") -- frankenscipy-fr78g
+build_route=local-wrapper-bypass
+fixture: grid_side=64 nonsymmetric convection-diffusion, n=4096, 16 RHS per factor
+
+## GATE (a) — the split, on the fixture the ratio is quoted on
+elf 50ee709442b661b3c4495d8b4ccbadebe69a44f89b8732f9a31c672353f8d13d, loadavg 34.54/35.57/36.16
+  factor_p50 = 13.003 ms   sixteen_solves_p50 = 6.887 ms   solve_share = 0.3462
+Repeated across four later builds/windows the share sits in 0.331-0.490; the three
+runs with a settled host give 0.3313, 0.3346, 0.3586. So the solve is ~33-35% of
+this cell, NOT the ~31% banked at n=1,728. My own prediction was that the share
+would FALL with n. It did not. Recorded that way round because the prediction was
+wrong.
+
+## LOSS (reverted): `y` built by `push` instead of `vec![0.0; n]`
+  push-built   sixteen_solves_p50 = 10.053992 ms   (factor 10.459251 ms)
+  zeroed       sixteen_solves_p50 =  5.769022 ms   (factor 10.316419 ms)
+The factorization is untouched by either arm and moved 1.4% between the windows,
+so it is the control: the host was flat and the substitution was 42.6% slower.
+Cause: `y[col]` against a Vec whose `len` grows each iteration is a bounds check
+against a MOVING bound, which LLVM cannot hoist; a fixed-length buffer's can be.
+One n-element memset traded for a per-nonzero check. REVERTED in 90c30c285.
+
+## IN-FLOOR (no claim): composing the rhs index maps
+`b[fill_perm[row_perm[row]]]` instead of materializing the permuted rhs. Removes
+one n-element allocation and one n-element write per solve, bit-identical.
+
+Paired ABBA, both arms in ONE binary via SPLU_SOLVE_FORCE_MATERIALIZED_RHS,
+dispatch_observed=true, 21 replicates:
+
+  elf 2a4e8b0d5e6d5487dc172174aa215ee8a26612793688fc96fc19468d80030b0b (fixed schedule)
+    AB(materialized/composed) median 1.125842 p10-p90 [1.016295,1.276655]
+    solve A/A                 median 1.185360 p10-p90 [1.008266,1.514333]   IN-FLOOR
+
+  elf 255506556d6b1a74964be2211810f5b43e94a600955f059a9c654198381213da (position-balanced)
+    AB(materialized/composed) median 0.983687 p10-p90 [0.724727,1.381388]
+    solve A/A                 median 1.584377 p10-p90 [1.112313,1.894612]   IN-FLOOR
+
+The first schedule always put the ORIG arm in the cold outer slot and reported the
+candidate at 1.126 -- against a null of 1.185. That was the SCHEDULE, not the code.
+Balancing the quartet (ABBA on even rounds, BAAB on odd) moved the candidate to
+0.98 and left the null at 1.58.
+
+VERDICT: no effect measurable. The lever is smaller than the probe's floor and the
+floor is not noise -- it is a real, repeatable cold/warm effect worth ~1.6x on a
+sixteen-solve pass depending on whether the factor was just built.
+
+## WHAT THAT IMPLIES FOR THE NEXT LEVER, and it is the useful part
+At n=4,096 the dominant variable in this solve is MEMORY STATE, not arithmetic or
+allocation: an identical sixteen-solve pass runs ~1.6x faster when the factor's
+rows are already resident. Removing an n-element write cannot move a job whose
+spread is dominated by whether 5.75 MB of factor is in cache.
+
+So the remaining solve-side item on this bead -- converting `l_rows`/`u_rows` from
+jagged `Vec<Vec<(usize, f64)>>` to flat u32/f64 parallel arrays -- should be
+attacked as a BYTES-TOUCHED change, not as an indexing change: it halves the index
+stream (u32 against a 16-byte pair with a usize) and makes the rows contiguous,
+which is the variable this probe says actually moves. Size it against the ~33-35%
+the solve is worth, and expect the same 1.6x floor to require a paired,
+position-balanced probe to see through.
+
+NOT ESTABLISHED: any whole-job ratio for either change. The vs-incumbent cell was
+re-measured separately (tests/artifacts/perf/run7d-convection-side64-remeasure.log)
+and nothing in this file claims to move it.
