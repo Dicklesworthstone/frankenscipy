@@ -2604,9 +2604,17 @@ fn apply_supernode_tails(
             // re-fills it from nothing.
             let mut value = 0.0f64;
             let mut exists = false;
+            // STRIDED, NOT RE-SLICED. This loop reads exactly ONE element per pivot,
+            // `tail_vals_flat[k * span + right]`, so building the whole `k`-th row as a
+            // slice first was `w` range computations and `w` range checks to reach `w`
+            // elements. Column `right` of the flat buffer is the arithmetic progression
+            // `right, right + span, right + 2*span, ...`, which a slice iterator plus
+            // `step_by` walks with no per-element bounds check at all.
+            // Same values, same `k` order, same additions ⇒ bit-identical.
+            let mut index = right;
             for (k, &multiplier) in multipliers.iter().enumerate() {
-                let tail = &tail_vals_flat[k * span..(k + 1) * span];
-                value += -multiplier * tail[right];
+                value += -multiplier * tail_vals_flat[index];
+                index += span;
                 if value == 0.0 {
                     if exists && k + 1 < width {
                         return false;
@@ -2629,9 +2637,12 @@ fn apply_supernode_tails(
             // entry and the next pivot re-fills it from nothing. A zero on the LAST pivot
             // is fine -- the final check below drops it, exactly as sequential would.
             let mut value = target_vals[left];
+            // Same strided walk as the fill branch above, and for the same reason: one
+            // element per pivot, so re-slicing the row to reach it was pure overhead.
+            let mut index = right;
             for (k, &multiplier) in multipliers.iter().enumerate() {
-                let tail = &tail_vals_flat[k * span..(k + 1) * span];
-                value += -multiplier * tail[right];
+                value += -multiplier * tail_vals_flat[index];
+                index += span;
                 if value == 0.0 && k + 1 < width {
                     return false;
                 }
@@ -14761,6 +14772,182 @@ mod tests {
             .collect();
         let multipliers: Vec<f64> = (0..width).map(|k| 0.3 + 0.11 * k as f64).collect();
         (target, tail_cols, tail_vals_flat, multipliers)
+    }
+
+    /// Like `measured_cell_shaped_block`, but the target SHARES columns with the tail so the
+    /// merge kernel's Equal branch runs.
+    ///
+    /// The disjoint fixture (target on even columns, tail on odd) exercises only the fill
+    /// branch. Every column here is in both, so every element goes through the reuse path
+    /// where the accumulator is seeded from the target's own value.
+    fn overlapping_cell_shaped_block(
+        span: usize,
+        width: usize,
+    ) -> (SortedFactorRow, Vec<u32>, Vec<f64>, Vec<f64>) {
+        let entries: Vec<(usize, f64)> = (0..span)
+            .map(|i| (2 * i, 1.0 + (i % 17) as f64 * 0.25))
+            .collect();
+        let target = sorted_row_from_entries(entries);
+        // SAME columns as the target, so `left_col == right_col` every time.
+        let tail_cols: Vec<u32> = (0..span).map(|i| (2 * i) as u32).collect();
+        let tail_vals_flat: Vec<f64> = (0..width * span)
+            .map(|i| ((i % 23) as f64) * 0.125 - 1.0)
+            .collect();
+        let multipliers: Vec<f64> = (0..width).map(|k| 0.3 + 0.11 * k as f64).collect();
+        (target, tail_cols, tail_vals_flat, multipliers)
+    }
+
+    /// The merge kernel's inner loop now walks column `right` of the flat tail buffer by
+    /// INDEX ARITHMETIC (`index = right; index += span`) instead of re-slicing the `k`-th
+    /// row as `&tail_vals_flat[k * span..(k + 1) * span]` and indexing that. The claim is
+    /// that this reaches the same element in the same order, so the merged row is
+    /// bit-identical — not close, identical.
+    ///
+    /// This executes the claim against a REFERENCE THAT USES THE OLD SLICE FORM. That is the
+    /// point: comparing the new walk against `k * span + right` would be comparing the new
+    /// code with a restatement of itself, and a stride/offset transposition — the realistic
+    /// way to get this wrong — would pass. The reference below is the code that was there
+    /// before, so a transposition produces different VALUES and fails.
+    #[test]
+    fn merge_kernel_index_walk_is_bit_identical_to_the_old_slice_form() {
+        // Widths above 1 are what exercise the stride at all; width 1 is included only to
+        // show the degenerate case still agrees.
+        for (span, width, overlap) in [
+            (1usize, 1usize, false),
+            (3, 4, false),
+            (7, 2, false),
+            (300, 5, false),
+            (64, 12, false),
+            // OVERLAPPING fixtures. `measured_cell_shaped_block` puts the target on even
+            // columns and the tail on odd ones, so they never coincide and the kernel's
+            // Equal branch -- the REUSE path, where the running value starts from the
+            // target's own entry -- is NEVER TAKEN. A negative control proved that: with
+            // only the disjoint fixtures, transposing the stride in that branch to
+            // `span + 1` left this test GREEN. These cases fix the hole.
+            (5, 3, true),
+            (64, 12, true),
+            (300, 5, true),
+        ] {
+            let (target, tail_cols, tail_vals_flat, multipliers) = if overlap {
+                overlapping_cell_shaped_block(span, width)
+            } else {
+                measured_cell_shaped_block(span, width)
+            };
+            assert_eq!(tail_vals_flat.len(), width * span);
+            if overlap {
+                // MUST-HIT: assert the reuse branch is actually reachable on this fixture,
+                // or the coverage this case exists for is imaginary.
+                let base = target.start;
+                let shared = target.cols[base..]
+                    .iter()
+                    .filter(|c| tail_cols.contains(c))
+                    .count();
+                assert!(
+                    shared > 0,
+                    "span={span} width={width}: an overlapping fixture must share columns"
+                );
+            }
+
+            let mut scratch = SortedFactorRow::default();
+            let applied = apply_supernode_tails(
+                &target,
+                &mut scratch,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+            );
+            assert!(
+                applied,
+                "span={span} width={width}: the fixture must not trip the cancellation \
+                 refusal, or this row proves nothing about the arithmetic"
+            );
+
+            // REFERENCE: the merge exactly as it was written before this change, with the
+            // per-pivot row rebuilt as a slice. Same branches, same order, same additions.
+            let base = target.start;
+            let target_cols = &target.cols[base..];
+            let target_vals = &target.vals[base..];
+            let mut expected_cols: Vec<u32> = Vec::new();
+            let mut expected_vals: Vec<f64> = Vec::new();
+            let (mut left, mut right) = (0usize, 0usize);
+            while left < target_cols.len() && right < span {
+                let (lc, rc) = (target_cols[left], tail_cols[right]);
+                if lc < rc {
+                    expected_cols.push(lc);
+                    expected_vals.push(target_vals[left]);
+                    left += 1;
+                } else if lc > rc {
+                    let mut value = 0.0f64;
+                    for k in 0..width {
+                        let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                        value += -multipliers[k] * tail[right];
+                    }
+                    if value != 0.0 {
+                        expected_cols.push(rc);
+                        expected_vals.push(value);
+                    }
+                    right += 1;
+                } else {
+                    let mut value = target_vals[left];
+                    for k in 0..width {
+                        let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                        value += -multipliers[k] * tail[right];
+                    }
+                    expected_cols.push(lc);
+                    expected_vals.push(value);
+                    left += 1;
+                    right += 1;
+                }
+            }
+            while left < target_cols.len() {
+                expected_cols.push(target_cols[left]);
+                expected_vals.push(target_vals[left]);
+                left += 1;
+            }
+            while right < span {
+                let mut value = 0.0f64;
+                for k in 0..width {
+                    let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                    value += -multipliers[k] * tail[right];
+                }
+                if value != 0.0 {
+                    expected_cols.push(tail_cols[right]);
+                    expected_vals.push(value);
+                }
+                right += 1;
+            }
+
+            let got_cols = &scratch.cols[scratch.start..];
+            let got_vals = &scratch.vals[scratch.start..];
+            assert_eq!(
+                got_cols.len(),
+                expected_cols.len(),
+                "span={span} width={width}: entry count"
+            );
+            for (i, (&got, &want)) in got_cols.iter().zip(&expected_cols).enumerate() {
+                assert_eq!(got, want, "span={span} width={width}: column {i}");
+            }
+            for (i, (&got, &want)) in got_vals.iter().zip(&expected_vals).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "span={span} width={width}: value {i} ({got} vs {want})"
+                );
+            }
+
+            // MUST-MISS arm for the comparison itself: a one-ulp change in ONE value has to
+            // be visible, or "everything matched" is a statement about the assertion rather
+            // than about the kernel.
+            if !expected_vals.is_empty() {
+                let probe = expected_vals.len() / 2;
+                let perturbed = f64::from_bits(expected_vals[probe].to_bits() ^ 1);
+                assert!(
+                    got_vals[probe].to_bits() != perturbed.to_bits(),
+                    "span={span} width={width}: a one-ulp perturbation must be visible"
+                );
+            }
+        }
     }
 
     #[test]
