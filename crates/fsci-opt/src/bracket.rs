@@ -289,6 +289,272 @@ where
     })
 }
 
+/// Why a [`bracket_minimum`] search stopped.
+///
+/// A minimum search has a third outcome a root search does not: it can run into a user-supplied
+/// bound while still descending. SciPy reports that as status `-1` and documents that, assuming
+/// unimodality, the endpoint AT the limit is then the minimizer — which is useful information,
+/// not a failure, and is why it is named rather than folded into `success == false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MinimumBracketStatus {
+    /// A valid three-point bracket was found.
+    Converged,
+    /// The moving end reached `xmin`/`xmax` while still descending.
+    LimitReached,
+    /// `maxiter` was exhausted with the search still descending.
+    MaxIterations,
+    /// The objective returned a non-finite value, or the search stepped to one.
+    NonFinite,
+}
+
+/// Outcome of a minimum-bracket search.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MinimumBracketResult {
+    /// The three abscissae, ordered ascending.
+    pub bracket: (f64, f64, f64),
+    /// `f` at each, in the same order.
+    pub f_bracket: (f64, f64, f64),
+    /// Iterations performed. Zero when the initial trio already brackets.
+    pub nit: usize,
+    /// Function evaluations performed, including the three initial ones.
+    pub nfev: usize,
+    /// Why the search stopped.
+    pub status: MinimumBracketStatus,
+    /// Whether a valid bracket was found.
+    pub success: bool,
+}
+
+/// Options for [`bracket_minimum`], defaulting to SciPy's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MinimumBracketOptions {
+    /// Left endpoint of the initial trio. `None` means `xm0 - min((xm0 - xmin)/16, 0.5)`.
+    pub xl0: Option<f64>,
+    /// Right endpoint of the initial trio. `None` means `xm0 + min((xmax - xm0)/16, 0.5)`.
+    pub xr0: Option<f64>,
+    /// Lower limit the search may approach but never cross.
+    pub xmin: Option<f64>,
+    /// Upper limit the search may approach but never cross.
+    pub xmax: Option<f64>,
+    /// Geometric factor. `None` means 2.0.
+    pub factor: Option<f64>,
+    /// Maximum iterations.
+    pub maxiter: usize,
+}
+
+impl Default for MinimumBracketOptions {
+    fn default() -> Self {
+        Self {
+            xl0: None,
+            xr0: None,
+            xmin: None,
+            xmax: None,
+            factor: None,
+            maxiter: 1000,
+        }
+    }
+}
+
+/// Does `fm` sit strictly below at least one neighbour and no higher than the other?
+///
+/// SciPy's exact condition, `(fl >= fm & fr > fm) | (fl > fm & fr >= fm)`. The asymmetry
+/// matters: a flat trio (`fl == fm == fr`) is NOT a bracket, because it gives a descent method
+/// nothing to descend, and accepting it would report success on a plateau.
+fn brackets_minimum(fl: f64, fm: f64, fr: f64) -> bool {
+    (fl >= fm && fr > fm) || (fl > fm && fr >= fm)
+}
+
+/// Search outward from an initial trio until `f` has a minimum bracketed between three points.
+///
+/// Returns `xl < xm < xr` with `f(xm)` no greater than both neighbours and strictly below at
+/// least one — the input `minimize_scalar`-style descent methods need and that nothing else in
+/// this crate produced.
+///
+/// The search first decides which way is downhill by comparing the two initial endpoints, then
+/// walks that way with geometrically growing steps measured from a FIXED anchor (SciPy's
+/// `work.xr0`), not from the moving end. A side with a limit contracts toward it instead, so a
+/// bounded search converges on the bound in finitely many steps rather than creeping.
+///
+/// # Errors
+///
+/// Returns [`OptError::InvalidArgument`] unless `xmin <= xl0 < xm0 < xr0 <= xmax` with all of
+/// `xl0`, `xm0`, `xr0` finite, or if `factor <= 1`.
+pub fn bracket_minimum<F>(
+    f: F,
+    xm0: f64,
+    options: MinimumBracketOptions,
+) -> Result<MinimumBracketResult, OptError>
+where
+    F: Fn(f64) -> f64,
+{
+    let xmin = options.xmin.unwrap_or(f64::NEG_INFINITY);
+    let xmax = options.xmax.unwrap_or(f64::INFINITY);
+    let factor = options.factor.unwrap_or(2.0);
+    // SciPy's defaults, which back off from a limit rather than a fixed 0.5 so that the initial
+    // trio cannot start outside `(xmin, xmax)`. With no limit the `min` picks 0.5.
+    let xl0 = options
+        .xl0
+        .unwrap_or_else(|| xm0 - ((xm0 - xmin) / 16.0).min(0.5));
+    let xr0 = options
+        .xr0
+        .unwrap_or_else(|| xm0 + ((xmax - xm0) / 16.0).min(0.5));
+
+    if !factor.is_finite() || factor <= 1.0 {
+        return Err(OptError::InvalidArgument {
+            detail: format!("bracket_minimum requires a finite factor > 1, got {factor}"),
+        });
+    }
+    if !xl0.is_finite() || !xm0.is_finite() || !xr0.is_finite() {
+        return Err(OptError::InvalidArgument {
+            detail: "bracket_minimum requires finite xl0, xm0 and xr0".to_string(),
+        });
+    }
+    if !(xmin <= xl0 && xl0 < xm0 && xm0 < xr0 && xr0 <= xmax) {
+        return Err(OptError::InvalidArgument {
+            detail: format!(
+                "bracket_minimum requires xmin <= xl0 < xm0 < xr0 <= xmax, \
+                 got xmin={xmin}, xl0={xl0}, xm0={xm0}, xr0={xr0}, xmax={xmax}"
+            ),
+        });
+    }
+
+    // The initial trio, sampled left to right as SciPy's vectorized call does.
+    let (fl0, fm0, fr0) = (f(xl0), f(xm0), f(xr0));
+    let mut nfev = 3usize;
+
+    // Walk toward whichever endpoint is lower, swapping the roles of the two ends rather than
+    // carrying a direction flag through the arithmetic.
+    let descend_left = fl0 < fr0;
+    let (mut xl, mut fl, mut xr, mut fr) = if descend_left {
+        (xr0, fr0, xl0, fl0)
+    } else {
+        (xl0, fl0, xr0, fr0)
+    };
+    let (mut xm, mut fm) = (xm0, fm0);
+
+    // The anchor stays put: each step is measured from the ORIGINAL moving endpoint, so the
+    // steps grow as `factor^k` rather than compounding off the point just visited.
+    let anchor = xr;
+    let limit = if descend_left { xmin } else { xmax };
+    let unlimited = limit.is_infinite();
+    let mut step = if unlimited {
+        anchor - xm0
+    } else {
+        limit - anchor
+    };
+    // A limited search DIVIDES by the factor, closing the remaining gap to the bound.
+    let effective_factor = if unlimited { factor } else { 1.0 / factor };
+
+    let finish = |xl: f64,
+                  fl: f64,
+                  xm: f64,
+                  fm: f64,
+                  xr: f64,
+                  fr: f64,
+                  nit: usize,
+                  nfev: usize,
+                  status: MinimumBracketStatus| {
+        // Report ascending regardless of which way the search walked.
+        let (bracket, f_bracket) = if xl <= xr {
+            ((xl, xm, xr), (fl, fm, fr))
+        } else {
+            ((xr, xm, xl), (fr, fm, fl))
+        };
+        MinimumBracketResult {
+            bracket,
+            f_bracket,
+            nit,
+            nfev,
+            status,
+            success: status == MinimumBracketStatus::Converged,
+        }
+    };
+
+    if brackets_minimum(fl, fm, fr) {
+        return Ok(finish(
+            xl,
+            fl,
+            xm,
+            fm,
+            xr,
+            fr,
+            0,
+            nfev,
+            MinimumBracketStatus::Converged,
+        ));
+    }
+
+    for nit in 1..=options.maxiter {
+        step *= effective_factor;
+        let mut x = if unlimited {
+            anchor + step
+        } else {
+            limit - step
+        };
+        // Once the gap to the bound underflows, stepping again would revisit the same point
+        // forever; take the bound itself so the search terminates on it.
+        if !unlimited && x == xr {
+            x = limit;
+        }
+        let fx = f(x);
+        nfev += 1;
+
+        (xl, xm, xr) = (xm, xr, x);
+        (fl, fm, fr) = (fm, fr, fx);
+
+        if brackets_minimum(fl, fm, fr) {
+            return Ok(finish(
+                xl,
+                fl,
+                xm,
+                fm,
+                xr,
+                fr,
+                nit,
+                nfev,
+                MinimumBracketStatus::Converged,
+            ));
+        }
+        if xr == limit {
+            return Ok(finish(
+                xl,
+                fl,
+                xm,
+                fm,
+                xr,
+                fr,
+                nit,
+                nfev,
+                MinimumBracketStatus::LimitReached,
+            ));
+        }
+        if !xr.is_finite() || !fr.is_finite() {
+            return Ok(finish(
+                xl,
+                fl,
+                xm,
+                fm,
+                xr,
+                fr,
+                nit,
+                nfev,
+                MinimumBracketStatus::NonFinite,
+            ));
+        }
+    }
+
+    Ok(finish(
+        xl,
+        fl,
+        xm,
+        fm,
+        xr,
+        fr,
+        options.maxiter,
+        nfev,
+        MinimumBracketStatus::MaxIterations,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +741,221 @@ mod tests {
         .expect("exhausting maxiter is not an error");
         assert!(!result.success);
         assert_eq!(result.nit, 12);
+    }
+
+    #[test]
+    fn bracket_minimum_matches_live_scipy_walking_right() {
+        // Live `elementwise.bracket_minimum(lambda x: (x - 10.0)**2, 1.0)` on scipy 1.17.1
+        // returns bracket (5.5, 9.5, 17.5), nit=5, nfev=8, sampling
+        // 0.5, 1.0, 1.5, 2.5, 3.5, 5.5, 9.5, 17.5. The steps are 1, 2, 4, 8, 16 from the FIXED
+        // anchor 1.5 — not compounded off the previous point, which would give 2.5, 4.5, 8.5.
+        let visited = std::cell::RefCell::new(Vec::new());
+        let result = bracket_minimum(
+            traced(|x| (x - 10.0) * (x - 10.0), &visited),
+            1.0,
+            MinimumBracketOptions::default(),
+        )
+        .expect("minimum bracket search succeeds");
+
+        assert!(result.success);
+        assert_eq!(result.status, MinimumBracketStatus::Converged);
+        assert_eq!(result.bracket, (5.5, 9.5, 17.5));
+        assert_eq!(result.nit, 5);
+        assert_eq!(result.nfev, 8);
+        assert_eq!(
+            &visited.borrow()[..],
+            &[0.5, 1.0, 1.5, 2.5, 3.5, 5.5, 9.5, 17.5]
+        );
+    }
+
+    #[test]
+    fn bracket_minimum_matches_live_scipy_walking_left() {
+        // Live scipy: bracket_minimum(lambda x: (x + 8.0)**2, 0.0) -> (-16.5, -8.5, -4.5),
+        // nit=5, nfev=8, sampling -0.5, 0.0, 0.5, -1.5, -2.5, -4.5, -8.5, -16.5. The initial
+        // comparison sends the search left, and the result is still reported ascending.
+        let visited = std::cell::RefCell::new(Vec::new());
+        let result = bracket_minimum(
+            traced(|x| (x + 8.0) * (x + 8.0), &visited),
+            0.0,
+            MinimumBracketOptions::default(),
+        )
+        .expect("minimum bracket search succeeds");
+
+        assert_eq!(result.bracket, (-16.5, -8.5, -4.5));
+        assert_eq!(result.nit, 5);
+        assert_eq!(result.nfev, 8);
+        assert_eq!(
+            &visited.borrow()[..],
+            &[-0.5, 0.0, 0.5, -1.5, -2.5, -4.5, -8.5, -16.5]
+        );
+    }
+
+    #[test]
+    fn bracket_minimum_matches_live_scipy_against_a_lower_limit() {
+        // THE LIMITED BRANCH and the limit-aware default endpoint together. Live scipy with
+        // xmin=0 returns (0.0585937500, 0.1171875, 0.234375), nit=4, nfev=7, sampling
+        // 0.9375, 1.0, 1.5, 0.46875, 0.234375, 0.1171875, 0.05859375. Note the first sample is
+        // 0.9375 = 1 - 1/16, not 0.5: the default left endpoint backs off from the LIMIT.
+        let visited = std::cell::RefCell::new(Vec::new());
+        let result = bracket_minimum(
+            traced(|x| (x - 0.1) * (x - 0.1), &visited),
+            1.0,
+            MinimumBracketOptions {
+                xmin: Some(0.0),
+                ..MinimumBracketOptions::default()
+            },
+        )
+        .expect("minimum bracket search succeeds");
+
+        assert_eq!(result.bracket, (0.058_593_75, 0.117_187_5, 0.234_375));
+        assert_eq!(result.nit, 4);
+        assert_eq!(result.nfev, 7);
+        assert_eq!(
+            &visited.borrow()[..],
+            &[
+                0.9375,
+                1.0,
+                1.5,
+                0.46875,
+                0.234_375,
+                0.117_187_5,
+                0.058_593_75
+            ],
+            "a limited search must contract toward its bound from the limit-aware default"
+        );
+    }
+
+    #[test]
+    fn bracket_minimum_reports_the_trio_it_started_with_when_that_already_brackets() {
+        let result = bracket_minimum(|x| x * x, 0.0, MinimumBracketOptions::default())
+            .expect("minimum bracket search succeeds");
+        assert_eq!(result.bracket, (-0.5, 0.0, 0.5));
+        assert_eq!(result.nit, 0);
+        assert_eq!(result.nfev, 3);
+        assert!(result.success);
+    }
+
+    #[test]
+    fn bracket_minimum_stops_at_a_bound_it_cannot_cross() {
+        // A function still descending when it runs into xmin. This is NOT converged — there is
+        // no bracket — but it is also not a failure to report as one: the bound itself is the
+        // minimizer under unimodality, which is why it has its own status.
+        //
+        // Reaching the bound takes 1075 iterations, because halving the remaining gap only
+        // lands ON zero once it underflows. That is not an accident of our arithmetic: live
+        // scipy reports status -2 (max iterations) at the default maxiter=1000 and status -1
+        // only at maxiter >= 1075, returning bracket (0.0, 5e-324, 1e-323). Both are pinned
+        // here, because the DEFAULT-budget outcome is the one callers will actually meet.
+        let descending = |x: f64| x;
+        let limited = MinimumBracketOptions {
+            xmin: Some(0.0),
+            ..MinimumBracketOptions::default()
+        };
+
+        let at_default_budget =
+            bracket_minimum(descending, 1.0, limited).expect("minimum bracket search succeeds");
+        assert!(!at_default_budget.success);
+        assert_eq!(
+            at_default_budget.status,
+            MinimumBracketStatus::MaxIterations,
+            "the default 1000 iterations do not suffice to underflow onto the bound"
+        );
+        assert_eq!(at_default_budget.nit, 1000);
+
+        let reaching_the_bound = bracket_minimum(
+            descending,
+            1.0,
+            MinimumBracketOptions {
+                maxiter: 1200,
+                ..limited
+            },
+        )
+        .expect("minimum bracket search succeeds");
+        assert_eq!(
+            reaching_the_bound.status,
+            MinimumBracketStatus::LimitReached
+        );
+        assert_eq!(reaching_the_bound.nit, 1075);
+        assert_eq!(
+            reaching_the_bound.bracket,
+            (0.0, 5e-324, 1e-323),
+            "the search must land exactly ON the bound, not merely near it"
+        );
+    }
+
+    #[test]
+    fn bracket_minimum_refuses_a_flat_trio_as_a_bracket() {
+        // MUST-MISS on the predicate itself: a plateau satisfies `fm <= fl && fm <= fr` but
+        // gives a descent method nothing to descend, and scipy's condition excludes it. A
+        // constant function therefore never brackets and must exhaust its budget.
+        assert!(!brackets_minimum(1.0, 1.0, 1.0));
+        assert!(brackets_minimum(1.0, 1.0, 2.0));
+        assert!(brackets_minimum(2.0, 1.0, 1.0));
+        assert!(!brackets_minimum(0.0, 1.0, 2.0));
+
+        let result = bracket_minimum(
+            |_| 1.0,
+            0.0,
+            MinimumBracketOptions {
+                maxiter: 8,
+                ..MinimumBracketOptions::default()
+            },
+        )
+        .expect("a flat objective is not an error");
+        assert!(!result.success);
+        assert_eq!(result.status, MinimumBracketStatus::MaxIterations);
+    }
+
+    #[test]
+    fn bracket_minimum_feeds_a_scalar_minimizer() {
+        use crate::minimize::{MinimizeScalarOptions, minimize_scalar};
+
+        let objective = |x: f64| (x - 3.25) * (x - 3.25) + 1.0;
+        let result =
+            bracket_minimum(objective, 0.0, MinimumBracketOptions::default()).expect("bracket");
+        assert!(result.success);
+        let (lo, _, hi) = result.bracket;
+        let found = minimize_scalar(objective, (lo, hi), MinimizeScalarOptions::default())
+            .expect("the scalar minimizer converges inside the discovered bracket");
+        assert!((found.x - 3.25).abs() < 1e-6, "got {}", found.x);
+    }
+
+    #[test]
+    fn bracket_minimum_rejects_inputs_it_cannot_search() {
+        // The trio must be strictly ordered and inside the bounds.
+        assert!(
+            bracket_minimum(
+                |x| x * x,
+                0.0,
+                MinimumBracketOptions {
+                    xl0: Some(0.5),
+                    ..MinimumBracketOptions::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            bracket_minimum(
+                |x| x * x,
+                0.0,
+                MinimumBracketOptions {
+                    xmin: Some(1.0),
+                    ..MinimumBracketOptions::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            bracket_minimum(
+                |x| x * x,
+                0.0,
+                MinimumBracketOptions {
+                    factor: Some(1.0),
+                    ..MinimumBracketOptions::default()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

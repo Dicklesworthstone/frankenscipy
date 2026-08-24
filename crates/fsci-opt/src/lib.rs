@@ -10,7 +10,10 @@ pub mod root;
 pub mod types;
 
 pub use audit::{SyncSharedAuditLedger, record_fail_closed, sync_audit_ledger};
-pub use bracket::{BracketOptions, BracketResult, bracket_root};
+pub use bracket::{
+    BracketOptions, BracketResult, MinimumBracketOptions, MinimumBracketResult,
+    MinimumBracketStatus, bracket_minimum, bracket_root,
+};
 pub use curvefit::{
     CurveFitOptions, CurveFitResult, LeastSquaresOptions, LeastSquaresResult, LeastsqResult,
     curve_fit, curve_fit_bounded, curve_fit_bounded_many, curve_fit_many, least_squares,

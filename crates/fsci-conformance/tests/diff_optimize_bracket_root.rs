@@ -24,6 +24,14 @@
 //!
 //! Every other case must agree bit-for-bit — these are exact binary schedules, not tolerances,
 //! so the comparison is `==` on `f64` bits and there is no epsilon to tune.
+//!
+//! FLOATS CROSS THE PROCESS BOUNDARY AS IEEE-754 BIT PATTERNS, never as decimal text.
+//! `serde_json` without its `float_roundtrip` feature is not correctly rounded on every input:
+//! `serde_json::from_str::<f64>("0.0017144775390624983")` yields `0x3f5c170a3d70a3d0`, one ULP
+//! above the `0x3f5c170a3d70a3cf` that Python's `float()` and Rust's own literal parser both
+//! produce. That is large enough to invent a disagreement between two arms that computed
+//! identical bits — it did exactly that in this test's sibling — and equally large enough to
+//! ERASE a real one. Integers do not have that problem, so bits are what travel.
 
 use std::fs;
 use std::io::Write;
@@ -96,9 +104,9 @@ struct OracleQuery {
 struct PointArm {
     case_id: String,
     /// Every abscissa scipy evaluated, in order. `None` when scipy raised.
-    sampled: Option<Vec<f64>>,
-    bracket: Option<Vec<f64>>,
-    f_bracket: Option<Vec<f64>>,
+    sampled_bits: Option<Vec<u64>>,
+    bracket_bits: Option<Vec<u64>>,
+    f_bracket_bits: Option<Vec<u64>>,
     nit: Option<u64>,
     nfev: Option<u64>,
     success: Option<bool>,
@@ -259,9 +267,16 @@ fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
     let script = r#"
 import json
 import math
+import struct
 import sys
 import numpy as np
 from scipy.optimize import elementwise
+
+def bits(values):
+    # IEEE-754 bit patterns, because decimal text is NOT a lossless channel for f64 here:
+    # serde_json without float_roundtrip rounds some 17-digit decimals to the wrong
+    # neighbour, which would surface as a 1-ULP "disagreement" neither arm actually has.
+    return [struct.unpack("<Q", struct.pack("<d", float(v)))[0] for v in values]
 
 def objective(tag, c):
     if tag == "linear":
@@ -302,9 +317,9 @@ for case in q["points"]:
             raise ValueError("case produced a non-finite value; lower its maxiter")
         points.append({
             "case_id": cid,
-            "sampled": [float(v) for v in sampled],
-            "bracket": [float(v) for v in r.bracket],
-            "f_bracket": [float(v) for v in r.f_bracket],
+            "sampled_bits": bits(sampled),
+            "bracket_bits": bits(r.bracket),
+            "f_bracket_bits": bits(r.f_bracket),
             "nit": int(r.nit),
             "nfev": int(r.nfev),
             "success": bool(r.success),
@@ -314,7 +329,8 @@ for case in q["points"]:
         # Recorded, never silently skipped: a case that errors on the oracle side must be
         # visible in the Rust arm's accounting, not quietly dropped from the comparison.
         points.append({
-            "case_id": cid, "sampled": None, "bracket": None, "f_bracket": None,
+            "case_id": cid, "sampled_bits": None, "bracket_bits": None,
+            "f_bracket_bits": None,
             "nit": None, "nfev": None, "success": None,
             "error": f"{type(exc).__name__}: {exc}",
         })
@@ -371,6 +387,11 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse bracket_root oracle JSON"))
 }
 
+/// Render transported bit patterns back to floats.
+fn as_floats(bits: &[u64]) -> Vec<f64> {
+    bits.iter().copied().map(f64::from_bits).collect()
+}
+
 /// Is `pair` genuinely a bracket — opposite signs, or a zero at an endpoint?
 fn is_real_bracket(fl: f64, fr: f64) -> bool {
     fl == 0.0 || fr == 0.0 || fl.signum() != fr.signum()
@@ -378,12 +399,12 @@ fn is_real_bracket(fl: f64, fr: f64) -> bool {
 
 /// How our schedule relates to the incumbent's. Returns `Err` with a description when the
 /// relationship is anything other than the two permitted ones.
-fn classify_schedule(ours: &[f64], theirs: &[f64]) -> Result<&'static str, String> {
+fn classify_schedule(ours: &[f64], theirs: &[u64]) -> Result<&'static str, String> {
     // Compared by BITS, not by `==`: `-0.0 == 0.0` is true in Rust, so `==` would accept a
     // schedule that had lost a sign — and a signed zero is a genuinely different abscissa to
     // hand an objective. `schedule_comparator_rejects_...` pins that case.
-    fn same(a: &[f64], b: &[f64]) -> bool {
-        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+    fn same(a: &[f64], b: &[u64]) -> bool {
+        a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == *y)
     }
     if same(ours, theirs) {
         return Ok("matched");
@@ -399,7 +420,7 @@ fn classify_schedule(ours: &[f64], theirs: &[f64]) -> Result<&'static str, Strin
         ours.len(),
         ours,
         theirs.len(),
-        theirs
+        as_floats(theirs)
     ))
 }
 
@@ -434,9 +455,9 @@ fn diff_optimize_bracket_root() {
             arm.error
         );
         let (Some(sampled), Some(bracket), Some(f_bracket), Some(nit), Some(nfev), Some(success)) = (
-            arm.sampled.as_ref(),
-            arm.bracket.as_ref(),
-            arm.f_bracket.as_ref(),
+            arm.sampled_bits.as_ref(),
+            arm.bracket_bits.as_ref(),
+            arm.f_bracket_bits.as_ref(),
             arm.nit,
             arm.nfev,
             arm.success,
@@ -491,6 +512,8 @@ fn diff_optimize_bracket_root() {
             case.case_id
         );
 
+        let f_bracket = as_floats(f_bracket);
+        let bracket = as_floats(bracket);
         let incumbent_bracket_is_real = !success || is_real_bracket(f_bracket[0], f_bracket[1]);
         let verdict = if incumbent_bracket_is_real {
             // The ordinary case: the endpoints must agree exactly. Ours are ordered ascending,
@@ -596,27 +619,41 @@ fn diff_optimize_bracket_root() {
 /// clean pass over schedules that do not match at all. These are the shapes it MUST reject.
 #[test]
 fn schedule_comparator_rejects_the_differences_it_exists_to_catch() {
+    let w = |xs: &[f64]| -> Vec<u64> { xs.iter().map(|x| x.to_bits()).collect() };
+
     // MUST-HIT: the two permitted relationships.
     assert_eq!(
-        classify_schedule(&[1.0, 2.0, 0.0], &[1.0, 2.0, 0.0]),
+        classify_schedule(&[1.0, 2.0, 0.0], &w(&[1.0, 2.0, 0.0])),
         Ok("matched")
     );
     assert_eq!(
-        classify_schedule(&[1.0, 2.0, 0.0], &[1.0, 2.0, 0.0, 3.0]),
+        classify_schedule(&[1.0, 2.0, 0.0], &w(&[1.0, 2.0, 0.0, 3.0])),
         Ok("trailing_lockstep_eval")
     );
 
     // MUST-MISS: a point missing from the MIDDLE is a different search, not a saved
     // evaluation, even though it is also "one shorter".
-    assert!(classify_schedule(&[1.0, 2.0, 3.0], &[1.0, 2.0, 0.0, 3.0]).is_err());
+    assert!(classify_schedule(&[1.0, 2.0, 3.0], &w(&[1.0, 2.0, 0.0, 3.0])).is_err());
     // MUST-MISS: two trailing points is a whole skipped iteration.
-    assert!(classify_schedule(&[1.0, 2.0], &[1.0, 2.0, 0.0, 3.0]).is_err());
+    assert!(classify_schedule(&[1.0, 2.0], &w(&[1.0, 2.0, 0.0, 3.0])).is_err());
     // MUST-MISS: a single differing value, same length.
-    assert!(classify_schedule(&[1.0, 2.0, 0.5], &[1.0, 2.0, 0.0]).is_err());
+    assert!(classify_schedule(&[1.0, 2.0, 0.5], &w(&[1.0, 2.0, 0.0])).is_err());
     // MUST-MISS: ours LONGER than the incumbent's is never permitted.
-    assert!(classify_schedule(&[1.0, 2.0, 0.0, 3.0], &[1.0, 2.0, 0.0]).is_err());
+    assert!(classify_schedule(&[1.0, 2.0, 0.0, 3.0], &w(&[1.0, 2.0, 0.0])).is_err());
     // MUST-MISS: a sign difference the eye skips over.
-    assert!(classify_schedule(&[1.0, 2.0, -0.0], &[1.0, 2.0, 0.0]).is_err());
+    assert!(classify_schedule(&[1.0, 2.0, -0.0], &w(&[1.0, 2.0, 0.0])).is_err());
+    // MUST-MISS: one ULP, which is the resolution this comparison claims to have. Built by
+    // incrementing the bit pattern rather than written as a decimal literal — a hand-typed
+    // "0.10000000000000001" rounds back to 0.1 and would have made this control vacuous.
+    let one_ulp_up = 0.1f64.to_bits() + 1;
+    assert_ne!(one_ulp_up, 0.1f64.to_bits());
+    assert!(
+        classify_schedule(
+            &[1.0, 2.0, 0.1],
+            &[1.0f64.to_bits(), 2.0f64.to_bits(), one_ulp_up]
+        )
+        .is_err()
+    );
 }
 
 /// MUST-HIT / MUST-MISS control for the bracket predicate, which decides whether the
