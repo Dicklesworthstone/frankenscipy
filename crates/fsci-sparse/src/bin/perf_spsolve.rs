@@ -1215,8 +1215,8 @@ mod cubic_live {
         SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS,
         SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
         SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
-        SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, splu, splu_factor_payload_bytes, splu_solve,
-        spsolve,
+        SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, SparseLuFactorization, splu,
+        splu_factor_payload_bytes, splu_solve, spsolve,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -3450,6 +3450,119 @@ mod cubic_live {
         run_splu_family(arguments, SpluFamily::Convection)
     }
 
+    fn loadavg() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| {
+                let fields = text.split_whitespace().take(3).collect::<Vec<_>>();
+                (fields.len() == 3).then(|| fields.join("/"))
+            })
+            .unwrap_or_else(|| "unavailable".to_string())
+    }
+
+    /// GATE (a) for `frankenscipy-run7d`: what fraction of this cell is the SOLVE?
+    ///
+    /// The cell is one factorization plus SIXTEEN solves, so "optimize the solve path" is worth
+    /// doing only in proportion to what those solves actually cost HERE. The profile banked in
+    /// `docs/NEGATIVE_EVIDENCE.md` put the solve at ~31% with about twofold headroom — but it
+    /// was taken on a DIFFERENT fixture (n=1,728), and a share does not transfer across sizes:
+    /// factorization grows superlinearly in fill while the solve is linear in factor nonzeros,
+    /// so the share should FALL as n grows. This measures it on the fixture the ratio is
+    /// actually quoted on (n=4,096), because a lever sized off the wrong fixture is how a 4%
+    /// change gets budgeted as a 16% one.
+    ///
+    /// The solve arm is timed TWICE per round from the SAME factor, and the ratio of those two
+    /// passes is reported as an A/A null. Without it a share is just a number: the second pass
+    /// bounds how much of the spread is the host rather than the code.
+    ///
+    /// This claims NOTHING against the incumbent — it is a self-attribution probe whose only
+    /// output is a proportion, and it must not be quoted as a ratio.
+    pub fn run_convection_split(arguments: &[String]) -> Result<(), String> {
+        let rounds = arguments
+            .first()
+            .map(|value| parse::<usize>(value, "rounds"))
+            .transpose()?
+            .unwrap_or(MINIMUM_ROUNDS);
+        if rounds < 3 {
+            return Err("the split probe needs at least 3 rounds".to_string());
+        }
+
+        println!("# probe=convection_factor_solve_split bead=frankenscipy-run7d");
+        println!("elf_sha256={}", sha256_of_self()?);
+        println!(
+            "# host={} observed_os_threads={} rounds={rounds} claim=SELF_ATTRIBUTION_ONLY",
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(|_| "unknown".to_string()),
+            observed_os_threads()?,
+        );
+        println!("loadavg_before={}", loadavg());
+
+        let fixtures = splu_fixtures(SpluFamily::Convection)?;
+        let fixture = fixtures
+            .first()
+            .ok_or_else(|| "the convection family has no fixture".to_string())?;
+        let n = fixture.matrix.shape().rows;
+
+        let mut factor_ms = Vec::with_capacity(rounds);
+        let mut solve_ms = Vec::with_capacity(rounds);
+        let mut nulls = Vec::with_capacity(rounds);
+        let mut factor_payload = 0usize;
+
+        // Round 0 is discarded, so the allocator and the page cache are warm in both phases
+        // before anything is recorded.
+        for round in 0..=rounds {
+            let started = Instant::now();
+            let factor = splu(black_box(&fixture.csc), LuOptions::default())
+                .map_err(|error| format!("split probe splu: {error}"))?;
+            let factored = started.elapsed().as_secs_f64() * 1.0e3;
+            factor_payload = splu_factor_payload_bytes(&factor);
+
+            let mut checksum = 0u64;
+            let mut sixteen_solves = |factor: &SparseLuFactorization| -> Result<f64, String> {
+                let started = Instant::now();
+                for right_hand_side in &fixture.right_hand_sides {
+                    let solution = splu_solve(factor, black_box(right_hand_side))
+                        .map_err(|error| format!("split probe splu_solve: {error}"))?;
+                    for value in solution {
+                        checksum = checksum.rotate_left(1) ^ value.to_bits();
+                    }
+                }
+                Ok(started.elapsed().as_secs_f64() * 1.0e3)
+            };
+            let first = sixteen_solves(&factor)?;
+            let second = sixteen_solves(&factor)?;
+            black_box(checksum);
+
+            if round == 0 {
+                continue;
+            }
+            factor_ms.push(factored);
+            solve_ms.push(first);
+            nulls.push(first / second);
+        }
+
+        let factor_median = median(factor_ms.clone());
+        let solve_median = median(solve_ms.clone());
+        let job = factor_median + solve_median;
+        println!(
+            "split: n={n} rhs_count={SPLU_RHS_COUNT} factor_p50_ms={factor_median:.6} \
+             sixteen_solves_p50_ms={solve_median:.6} factor_plus_solves_p50_ms={job:.6} \
+             solve_share={:.4} per_solve_p50_ms={:.6} factor_payload_bytes={factor_payload}",
+            solve_median / job,
+            solve_median / SPLU_RHS_COUNT as f64,
+        );
+        println!(
+            "solve_A/A: median={:.6} raw={}",
+            median(nulls.clone()),
+            csv(&nulls)
+        );
+        println!("factor_raw_ms={}", csv(&factor_ms));
+        println!("solve_raw_ms={}", csv(&solve_ms));
+        println!("loadavg_after={}", loadavg());
+        Ok(())
+    }
+
     fn run_splu_family(arguments: &[String], family: SpluFamily) -> Result<(), String> {
         let rounds = arguments
             .first()
@@ -3857,6 +3970,21 @@ fn main() {
     if raw_arguments.get(1).map(String::as_str) == Some("--source-marker") {
         println!("perf_spsolve_source_marker={PERF_SPSOLVE_SOURCE_MARKER}");
         return;
+    }
+    if raw_arguments.get(1).map(String::as_str) == Some("--convection-split") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_convection_split(&raw_arguments[2..]) {
+                eprintln!("CONVECTION_SPLIT_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--convection-split requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
     }
     if raw_arguments.get(1).map(String::as_str) == Some("--convection-splu-live") {
         #[cfg(feature = "sparse-incumbent-bench")]
