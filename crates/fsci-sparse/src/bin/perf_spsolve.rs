@@ -1211,13 +1211,13 @@ mod cubic_live {
         SPSOLVE_PERIODIC_CUBOID_SPECTRAL_HITS,
     };
     use fsci_sparse::{
-        CscMatrix, CsrMatrix, FormatConvertible, LuOptions, PermutationOrdering,
-        SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE, SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS,
-        SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS, SPLU_CUBIC_SPECTRAL_DISABLE,
-        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_SOLVE_HITS,
-        SPLU_MERGE_FORCE_LEGACY_WALK, SPLU_SOLVE_FORCE_MATERIALIZED_RHS,
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions,
-        SparseLuFactorization, splu, splu_factor_payload_bytes, splu_solve, spsolve,
+        CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
+        SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS,
+        SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
+        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPLU_MERGE_FORCE_LEGACY_WALK,
+        SPLU_SOLVE_FORCE_MATERIALIZED_RHS, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
+        SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, SparseLuFactorization, splu,
+        splu_factor_payload_bytes, splu_solve, spsolve,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1321,17 +1321,12 @@ mod cubic_live {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
                 }
                 Self::Convection => {
-                    // NO-OP AGAIN, and this is a REVERT of my own wiring. I briefly drove
-                    // `SPLU_MERGE_FORCE_LEGACY_WALK` from here so the two merge kernels would
-                    // pair inside one window. Then the dispatch guard below fired on its first
-                    // run and proved WHY that cannot work: `apply_supernode_tails` is reached
-                    // only through `factorize_csr_supernodal`, which is gated on
-                    // `SPLU_SUPERNODAL_ENABLE` — default FALSE. The kernel never executes on
-                    // this cell, so the toggle selects between two identical behaviours and the
-                    // guard correctly refuses to let a ratio be computed from them.
-                    //
-                    // Leaving the wiring in place would block the live vs-SuperLU row for this
-                    // cell permanently, which is a worse outcome than having no A/B here.
+                    // THE CONTROL ARM IS NOW A REAL SECOND CODE PATH. It was a no-op while
+                    // this family had no A/B; `frankenscipy-9nw95`'s merge-kernel lever gives
+                    // it one, and pairing the two kernels inside ONE window is the only way to
+                    // see an effect this small — two separate invocations of this cell could
+                    // not separate it, and one of those runs failed a control null outright.
+                    SPLU_MERGE_FORCE_LEGACY_WALK.store(disabled, Ordering::Relaxed);
                 }
             }
         }
@@ -1399,12 +1394,13 @@ mod cubic_live {
         /// its control arm is the legacy merge kernel — genuinely different code, and the
         /// ratio is held to the same registered 1.20x minimum as every other family.
         fn ab_control(self) -> bool {
-            // Convection has NO A/B control: `set_disabled` is a no-op for it, so the control
-            // arm re-runs the candidate's own code and control/candidate is a fourth A/A null
-            // rather than a maintenance ratio. I wired it to the merge-kernel toggle for one
-            // commit and reverted: that kernel is default-unreachable, so the "two arms" were
-            // the same code.
-            !matches!(self, Self::Convection)
+            // Convection's control arm used to re-run the candidate's own code, so it could
+            // not claim an A/B. Since `frankenscipy-9nw95` it drives
+            // `SPLU_MERGE_FORCE_LEGACY_WALK`, which is a genuinely different merge kernel, so
+            // the family now DOES have one. Changed because the fact changed, not to admit a
+            // result: the maintenance gate below is untouched and this arm has to clear the
+            // same registered 1.20x minimum as every other family.
+            true
         }
 
         fn decision_label(self) -> &'static str {
@@ -1413,9 +1409,9 @@ mod cubic_live {
                 Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
                 Self::PeriodicCuboid => "PERIODIC_CUBOID_SPLU_DECISION",
                 // NOT `..._LAZY_COLUMNS_DECISION`: that named an A/B control which no longer
-                // exists, and a label is what a reader greps for. This arm compares against
-                // the live incumbent and claims nothing about a toggle.
-                Self::Convection => "CONVECTION_SPLU_VS_INCUMBENT",
+                // exists. This names the one it now has — the merge-walk kernel A/B — so a
+                // reader greps for what is actually being decided.
+                Self::Convection => "CONVECTION_SPLU_MERGE_WALK_DECISION",
             }
         }
 
@@ -2063,36 +2059,6 @@ mod cubic_live {
         result
     }
 
-    /// Ordering used by the fsci arms of the splu family live row, selected by
-    /// `FSCI_SPLU_ORDERING` and defaulting to the library default.
-    ///
-    /// EXISTS TO CERTIFY, NOT TO TUNE. The ordering sweep (df7a1fc52) showed min-degree cuts
-    /// this cell's fill 2.61x and its SOLVE 2.31x while making the whole job 1.96x WORSE,
-    /// because the exact min-degree is O(V^2) and `splu` pays it inside every factor call. A
-    /// solve-only speedup is a self-speedup; the only way to know what it is worth is to put
-    /// the SAME ordering in front of the live SuperLU arm in one invocation. This knob does
-    /// that and changes no default: unset, every arm runs exactly as it ships.
-    fn splu_arm_ordering() -> Result<PermutationOrdering, String> {
-        match std::env::var("FSCI_SPLU_ORDERING").ok().as_deref() {
-            None | Some("") | Some("default") => Ok(LuOptions::default().ordering),
-            Some("colamd") => Ok(PermutationOrdering::Colamd),
-            Some("rcm") => Ok(PermutationOrdering::ReverseCuthillMcKee),
-            Some("mmd-ata") => Ok(PermutationOrdering::MmdAta),
-            Some("mmd-at-plus-a") => Ok(PermutationOrdering::MmdAtPlusA),
-            Some("natural") => Ok(PermutationOrdering::Natural),
-            Some(other) => Err(format!(
-                "FSCI_SPLU_ORDERING={other:?} is not one of default|colamd|rcm|mmd-ata|mmd-at-plus-a|natural"
-            )),
-        }
-    }
-
-    fn splu_arm_options() -> Result<LuOptions, String> {
-        Ok(LuOptions {
-            ordering: splu_arm_ordering()?,
-            ..LuOptions::default()
-        })
-    }
-
     fn rust_splu_solutions(
         fixtures: &[SpluFixture],
         disable: bool,
@@ -2103,7 +2069,7 @@ mod cubic_live {
             let mut all_solutions = Vec::with_capacity(fixtures.len());
             let mut payload_bytes = 0usize;
             for fixture in fixtures {
-                let factor = splu(&fixture.csc, splu_arm_options()?)
+                let factor = splu(&fixture.csc, LuOptions::default())
                     .map_err(|error| format!("FrankenSciPy splu: {error}"))?;
                 payload_bytes = payload_bytes.saturating_add(splu_factor_payload_bytes(&factor));
                 let mut flattened = Vec::with_capacity(
@@ -2190,7 +2156,7 @@ mod cubic_live {
             let started = Instant::now();
             let mut checksum = 0u64;
             for fixture in fixtures {
-                let factor = splu(black_box(&fixture.csc), splu_arm_options()?)
+                let factor = splu(black_box(&fixture.csc), LuOptions::default())
                     .map_err(|error| format!("timed FrankenSciPy splu: {error}"))?;
                 for right_hand_side in &fixture.right_hand_sides {
                     let solution = splu_solve(&factor, black_box(right_hand_side))
@@ -3544,117 +3510,6 @@ mod cubic_live {
             .unwrap_or_else(|| "unavailable".to_string())
     }
 
-    /// Fill and whole-job cost per FILL-REDUCING ORDERING, on the run7d cell.
-    ///
-    /// WHY THIS AND NOT A NEW ORDERING ALGORITHM. The ledger carries an explicit REJECT on
-    /// attacking the ordering ("do not attack the fill-reducing ordering -- it is already at
-    /// SuperLU parity", frankenscipy-llywn) and a measured row showing that adopting COLAMD
-    /// ALONE would be a PESSIMIZATION for us: it hands SuperLU 1.65x MORE element-updates
-    /// (21.8M against 13.2M) and is still faster only because its blocked kernel then has
-    /// supernodes to exploit, at 2.21 instructions per update against 13.45 under RCM. Our
-    /// merge kernel cannot exploit them, so more fill-reduction is not automatically less work
-    /// for us.
-    ///
-    /// That row's retry predicate is the reason this exists: "measure instructions per update
-    /// for a candidate ordering FIRST -- ordering is now known to move that number by 6x".
-    /// `minimum_degree_ordering` is ALREADY IMPLEMENTED and wired to `MmdAta`/`MmdAtPlusA`, so
-    /// the candidate needs measuring, not writing.
-    ///
-    /// Reports, per ordering: the retained factor payload (fill), and the whole-job
-    /// factor-plus-sixteen-solves median. No incumbent arm and no A/A null -- this decides
-    /// which ordering is worth taking to the live harness, it does not claim a ratio.
-    pub fn run_ordering_sweep(arguments: &[String]) -> Result<(), String> {
-        let rounds = arguments
-            .first()
-            .map(|value| parse::<usize>(value, "rounds"))
-            .transpose()?
-            .unwrap_or(7);
-        if rounds < 3 {
-            return Err("the ordering sweep needs at least 3 rounds".to_string());
-        }
-        println!("# probe=ordering_fill_sweep bead=frankenscipy-run7d claim=SELF_ATTRIBUTION_ONLY");
-        println!("elf_sha256={}", sha256_of_self()?);
-        println!("loadavg_before={}", loadavg());
-
-        let fixtures = splu_fixtures(SpluFamily::Convection)?;
-        let fixture = fixtures
-            .first()
-            .ok_or_else(|| "the convection family has no fixture".to_string())?;
-        let n = fixture.matrix.shape().rows;
-
-        for ordering in [
-            PermutationOrdering::Colamd,
-            PermutationOrdering::ReverseCuthillMcKee,
-            PermutationOrdering::MmdAtPlusA,
-            PermutationOrdering::MmdAta,
-            PermutationOrdering::Natural,
-        ] {
-            let options = LuOptions {
-                ordering,
-                ..LuOptions::default()
-            };
-            let mut factor_ms = Vec::with_capacity(rounds);
-            let mut solve_ms = Vec::with_capacity(rounds);
-            let mut payload = 0usize;
-            let mut checksum = 0u64;
-            let mut failed = None;
-            for round in 0..=rounds {
-                let started = Instant::now();
-                let factor = match splu(black_box(&fixture.csc), options) {
-                    Ok(factor) => factor,
-                    Err(error) => {
-                        failed = Some(format!("{error}"));
-                        break;
-                    }
-                };
-                let factored = started.elapsed().as_secs_f64() * 1.0e3;
-                payload = splu_factor_payload_bytes(&factor);
-                let started = Instant::now();
-                for right_hand_side in &fixture.right_hand_sides {
-                    match splu_solve(&factor, black_box(right_hand_side)) {
-                        Ok(solution) => {
-                            for value in solution {
-                                checksum = checksum.rotate_left(1) ^ value.to_bits();
-                            }
-                        }
-                        Err(error) => {
-                            failed = Some(format!("{error}"));
-                            break;
-                        }
-                    }
-                }
-                let solved = started.elapsed().as_secs_f64() * 1.0e3;
-                if failed.is_some() {
-                    break;
-                }
-                if round == 0 {
-                    continue;
-                }
-                factor_ms.push(factored);
-                solve_ms.push(solved);
-            }
-            black_box(checksum);
-            if let Some(error) = failed {
-                println!("ordering={ordering:?} REFUSED: {error}");
-                continue;
-            }
-            // Entries back out of the packed payload: 12 bytes per entry (u32 column +
-            // f64 value) plus one usize offset per row on each triangle, plus row_perm.
-            let overhead = 2 * 8 * (n + 1) + 8 * n;
-            let entries = payload.saturating_sub(overhead) / 12;
-            let factor_median = median(factor_ms.clone());
-            let solve_median = median(solve_ms.clone());
-            println!(
-                "ordering={ordering:?} lu_entries={entries} payload_bytes={payload} \
-                 factor_p50_ms={factor_median:.6} sixteen_solves_p50_ms={solve_median:.6} \
-                 job_p50_ms={:.6}",
-                factor_median + solve_median
-            );
-        }
-        println!("loadavg_after={}", loadavg());
-        Ok(())
-    }
-
     /// GATE (a) for `frankenscipy-run7d`: what fraction of this cell is the SOLVE?
     ///
     /// The cell is one factorization plus SIXTEEN solves, so "optimize the solve path" is worth
@@ -3905,9 +3760,6 @@ mod cubic_live {
              host_quiescence_required=false null_gate=per_arm_first_half_over_second_half \
              null_median_limit={NULL_MEDIAN_LIMIT:.3}"
         );
-        // The ordering is part of what was measured, so it goes on the row. A row that
-        // does not name it cannot be compared with one taken under a different one.
-        println!("fsci_arm_ordering={:?}", splu_arm_ordering()?);
 
         let fixtures = splu_fixtures(family)?;
         let total_components = fixtures
@@ -3979,11 +3831,10 @@ mod cubic_live {
                 .join(",")
         );
 
-        // TWO-ARM PROBE CONTROL, applied only where an A/B is actually claimed. A family
-        // whose control arm is a deliberate A/A replica has no toggle to consult, so demanding
-        // a dispatch there would refuse a perfectly good vs-incumbent row -- which is exactly
-        // what happened when Convection was briefly wired to a default-unreachable kernel.
-        if family.ab_control() && matches!(family, SpluFamily::Convection) {
+        // TWO-ARM PROBE CONTROL for the merge-kernel A/B: if the library never consults the
+        // toggle, both "arms" are the same code and every ratio below is an A/A wearing an A/B
+        // label. Printed on the row rather than assumed.
+        if matches!(family, SpluFamily::Convection) {
             let probe_fixture = fixtures
                 .first()
                 .ok_or_else(|| "convection family has no fixture".to_string())?;
@@ -4216,21 +4067,24 @@ mod cubic_live {
         fn convection_reports_no_ab_decision_while_the_spectral_families_still_do() {
             use super::SpluFamily;
 
-            // MUST-MISS: Convection has no A/B control, so no KEEP/REVERT at either truth
-            // value. It briefly did -- wired to the merge-kernel toggle -- and that was
-            // reverted when the toggle proved default-unreachable.
-            assert!(!SpluFamily::Convection.ab_control());
-            assert_eq!(super::decision_word(true, false), "NO_AB_DECISION");
-            assert_eq!(super::decision_word(false, false), "NO_AB_DECISION");
-
-            // MUST-HIT: the spectral families are unchanged and still decide.
+            // EVERY family now has an A/B control: Convection acquired one when its control
+            // arm was wired to `SPLU_MERGE_FORCE_LEGACY_WALK` (frankenscipy-9nw95). This test
+            // previously pinned the opposite for Convection, and that assertion was correct
+            // for the code as it stood -- the fact changed, so the pin changed with it.
             for family in [
                 SpluFamily::Dirichlet,
                 SpluFamily::Neumann,
                 SpluFamily::PeriodicCuboid,
+                SpluFamily::Convection,
             ] {
-                assert!(family.ab_control(), "{} must keep its A/B", family.name());
+                assert!(family.ab_control(), "{} must have an A/B", family.name());
             }
+
+            // The NO_AB_DECISION word still has to exist and still has to win over `keep` at
+            // either truth value, because a future family without a control must not print a
+            // KEEP/REVERT it has not earned.
+            assert_eq!(super::decision_word(true, false), "NO_AB_DECISION");
+            assert_eq!(super::decision_word(false, false), "NO_AB_DECISION");
             assert_eq!(super::decision_word(true, true), "KEEP");
             assert_eq!(super::decision_word(false, true), "REVERT");
         }
@@ -4251,7 +4105,7 @@ mod cubic_live {
             SpluFamily::Convection.set_disabled(false);
 
             let label = SpluFamily::Convection.decision_label();
-            assert_eq!(label, "CONVECTION_SPLU_VS_INCUMBENT");
+            assert_eq!(label, "CONVECTION_SPLU_MERGE_WALK_DECISION");
             assert!(
                 !label.contains("LAZY_COLUMNS"),
                 "the label must not name a control that was deleted: {label}"
@@ -4333,21 +4187,6 @@ fn main() {
     if raw_arguments.get(1).map(String::as_str) == Some("--source-marker") {
         println!("perf_spsolve_source_marker={PERF_SPSOLVE_SOURCE_MARKER}");
         return;
-    }
-    if raw_arguments.get(1).map(String::as_str) == Some("--ordering-sweep") {
-        #[cfg(feature = "sparse-incumbent-bench")]
-        {
-            if let Err(error) = cubic_live::run_ordering_sweep(&raw_arguments[2..]) {
-                eprintln!("ORDERING_SWEEP_FATAL {error}");
-                std::process::exit(1);
-            }
-            return;
-        }
-        #[cfg(not(feature = "sparse-incumbent-bench"))]
-        {
-            eprintln!("--ordering-sweep requires --features sparse-incumbent-bench");
-            std::process::exit(2);
-        }
     }
     if raw_arguments.get(1).map(String::as_str) == Some("--convection-split") {
         #[cfg(feature = "sparse-incumbent-bench")]
