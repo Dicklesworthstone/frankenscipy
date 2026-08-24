@@ -197,6 +197,20 @@ fn generate_query() -> OracleQuery {
         sos: sos_b,
         n_sections: 1,
     });
+    // `frankenscipy-jyfke`: the tiny but nonzero trailing numerator
+    // coefficient is a genuine near-origin zero. A tolerance-based trailing
+    // trim discarded it; SciPy keeps it. This fixture is deliberately
+    // contrived because ordinary O(1) biquad coefficients do not expose the
+    // divergence.
+    points.push(Case {
+        case_id: "sos_tiny_nonzero_trailing".into(),
+        op: "sos".into(),
+        n: 0,
+        shift: 0,
+        seed: 0,
+        sos: vec![1.0, 1.0e-6, 9.0e-16, 1.0, 0.5, 0.1],
+        n_sections: 1,
+    });
     OracleQuery { points }
 }
 
