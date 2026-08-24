@@ -143,13 +143,59 @@ enum SparseLuInternal {
 struct NativeSparseLu {
     n: usize,
     row_perm: Vec<usize>,
+    // Keep the factor test oracle in its natural row form, but do not retain it
+    // in a release factor.  The solve only needs an ordered stream of columns
+    // and values; a flat structure avoids one allocation and one pointer chase
+    // per triangular row while preserving the exact accumulation order.
+    #[cfg(test)]
     l_rows: Vec<Vec<(usize, f64)>>,
+    #[cfg(test)]
     u_rows: Vec<Vec<(usize, f64)>>,
+    lower: PackedTriangularRows,
+    upper: PackedTriangularRows,
     // Symmetric fill-reducing permutation applied before factorization: the matrix
     // actually factored is B = P·A·Pᵀ (B[i][j] = A[fill_perm[i]][fill_perm[j]]).
     // `None` ⇒ natural ordering. Solve maps b → P·b, back-substitutes, then x = Pᵀ·z.
     fill_perm: Option<Vec<usize>>,
     ordering_used: PermutationOrdering,
+}
+
+/// Immutable, row-blocked triangular-factor storage for the hot solve path.
+///
+/// A row's entries occupy `offsets[row]..offsets[row + 1]` in two parallel
+/// arrays.  `columns` stays `u32` because native sparse LU already rejects
+/// dimensions that cannot be represented by its factor-row index type.
+#[derive(Debug, Clone)]
+struct PackedTriangularRows {
+    offsets: Vec<usize>,
+    columns: Vec<u32>,
+    values: Vec<f64>,
+}
+
+impl PackedTriangularRows {
+    fn from_rows(rows: &[Vec<(usize, f64)>]) -> Self {
+        let entry_count = rows.iter().map(Vec::len).sum();
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        let mut columns = Vec::with_capacity(entry_count);
+        let mut values = Vec::with_capacity(entry_count);
+        offsets.push(0);
+
+        for entries in rows {
+            for &(column, value) in entries {
+                // `NativeSparseLu::factorize_csr` rejects n >= 2^32 before a
+                // factor row can be formed, so every stored column fits exactly.
+                columns.push(column as u32);
+                values.push(value);
+            }
+            offsets.push(columns.len());
+        }
+
+        Self {
+            offsets,
+            columns,
+            values,
+        }
+    }
 }
 
 /// A direct sine-transform plan for a strictly diagonally dominant 3-D
@@ -2985,6 +3031,31 @@ fn columns_share_a_supernode(current: &[usize], next_col: &[usize], next: usize)
 }
 
 impl NativeSparseLu {
+    fn from_factor_rows(
+        n: usize,
+        row_perm: Vec<usize>,
+        l_rows: Vec<Vec<(usize, f64)>>,
+        u_rows: Vec<Vec<(usize, f64)>>,
+        fill_perm: Option<Vec<usize>>,
+        ordering_used: PermutationOrdering,
+    ) -> Self {
+        let lower = PackedTriangularRows::from_rows(&l_rows);
+        let upper = PackedTriangularRows::from_rows(&u_rows);
+
+        Self {
+            n,
+            row_perm,
+            #[cfg(test)]
+            l_rows,
+            #[cfg(test)]
+            u_rows,
+            lower,
+            upper,
+            fill_perm,
+            ordering_used,
+        }
+    }
+
     /// The shipping elimination, over column-sorted factor rows.
     ///
     /// Identical in structure to `factorize_csr_with_hasher` below — same
@@ -3354,14 +3425,14 @@ impl NativeSparseLu {
             })
             .collect();
 
-        Ok(Self {
+        Ok(Self::from_factor_rows(
             n,
             row_perm,
             l_rows,
             u_rows,
             fill_perm,
             ordering_used,
-        })
+        ))
     }
 
     /// The supernodal elimination: plan the blocks symbolically, then eliminate a whole
@@ -3685,14 +3756,14 @@ impl NativeSparseLu {
                     .collect()
             })
             .collect();
-        Some(Self {
+        Some(Self::from_factor_rows(
             n,
             row_perm,
             l_rows,
             u_rows,
             fill_perm,
             ordering_used,
-        })
+        ))
     }
 
     /// The previous hash-backed elimination, retained as the REFERENCE the sorted
@@ -3822,14 +3893,14 @@ impl NativeSparseLu {
             })
             .collect();
 
-        Ok(Self {
+        Ok(Self::from_factor_rows(
             n,
             row_perm,
             l_rows,
             u_rows,
             fill_perm,
             ordering_used,
-        })
+        ))
     }
 
     fn solve(&self, b: &[f64]) -> SparseResult<Vec<f64>> {
@@ -3838,6 +3909,14 @@ impl NativeSparseLu {
                 message: format!("rhs length {} must match matrix size {}", b.len(), self.n),
             });
         }
+
+        SPLU_PACKED_TRIANGULAR_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lower_offsets = &self.lower.offsets;
+        let lower_columns = &self.lower.columns;
+        let lower_values = &self.lower.values;
+        let upper_offsets = &self.upper.offsets;
+        let upper_columns = &self.upper.columns;
+        let upper_values = &self.upper.values;
 
         // Solve A·x = b as (P·A·Pᵀ)·(P·x) = P·b, then map back: x[fill_perm[i]] = z[i].
         //
@@ -3883,8 +3962,8 @@ impl NativeSparseLu {
                 let permuted = fill.iter().map(|&old| b[old]).collect::<Vec<f64>>();
                 for row in 0..self.n {
                     let mut value = permuted[self.row_perm[row]];
-                    for &(col, multiplier) in &self.l_rows[row] {
-                        value -= multiplier * y[col];
+                    for entry_index in lower_offsets[row]..lower_offsets[row + 1] {
+                        value -= lower_values[entry_index] * y[lower_columns[entry_index] as usize];
                     }
                     y[row] = value;
                 }
@@ -3892,8 +3971,8 @@ impl NativeSparseLu {
             Some(fill) => {
                 for row in 0..self.n {
                     let mut value = b[fill[self.row_perm[row]]];
-                    for &(col, multiplier) in &self.l_rows[row] {
-                        value -= multiplier * y[col];
+                    for entry_index in lower_offsets[row]..lower_offsets[row + 1] {
+                        value -= lower_values[entry_index] * y[lower_columns[entry_index] as usize];
                     }
                     y[row] = value;
                 }
@@ -3904,18 +3983,18 @@ impl NativeSparseLu {
                 // Any A/B row taken on a natural-ordering fixture is measuring nothing.
                 for row in 0..self.n {
                     let mut value = b[self.row_perm[row]];
-                    for &(col, multiplier) in &self.l_rows[row] {
-                        value -= multiplier * y[col];
+                    for entry_index in lower_offsets[row]..lower_offsets[row + 1] {
+                        value -= lower_values[entry_index] * y[lower_columns[entry_index] as usize];
                     }
                     y[row] = value;
                 }
             }
         }
 
-        // THE DIAGONAL IS THE FIRST ENTRY, so stop searching for it. `u_rows[row]`
-        // is built by filtering an already-sorted row to `col >= row`, so it is
-        // ascending and the diagonal, if the row has one, is at index 0; an index-0
-        // column past `row` means the row has no diagonal and the matrix is
+        // THE DIAGONAL IS THE FIRST PACKED ENTRY, so stop searching for it. U is
+        // emitted from an already-sorted row filtered to `col >= row`, so it is
+        // ascending and the diagonal, if the row has one, starts its packed range.
+        // A first column past `row` means the row has no diagonal and the matrix is
         // singular. The old loop carried an `Option` and tested `col == row` and
         // `col > row` on every entry to rediscover that on each pass — the same
         // invariant the elimination already relies on for its pivot lookup, sitting
@@ -3929,10 +4008,12 @@ impl NativeSparseLu {
         // standing deficit in the ledger is one factorization against SIXTEEN
         // solves (frankenscipy-run7d).
         for row in (0..self.n).rev() {
-            let entries = &self.u_rows[row];
-            let (diagonal_col, pivot) = match entries.first() {
-                Some(&(col, entry)) => (col, entry),
-                None => (usize::MAX, 0.0),
+            let start = upper_offsets[row];
+            let end = upper_offsets[row + 1];
+            let (diagonal_col, pivot) = if start < end {
+                (upper_columns[start] as usize, upper_values[start])
+            } else {
+                (usize::MAX, 0.0)
             };
             if diagonal_col != row || is_sparse_zero_pivot(pivot) {
                 return Err(SparseError::SingularMatrix {
@@ -3940,8 +4021,8 @@ impl NativeSparseLu {
                 });
             }
             let mut value = y[row];
-            for &(col, entry) in &entries[1..] {
-                value -= entry * y[col];
+            for entry_index in start + 1..end {
+                value -= upper_values[entry_index] * y[upper_columns[entry_index] as usize];
             }
             y[row] = value / pivot;
         }
@@ -3960,8 +4041,7 @@ impl NativeSparseLu {
 
     #[cfg(test)]
     fn stored_nnz(&self) -> usize {
-        self.l_rows.iter().map(Vec::len).sum::<usize>()
-            + self.u_rows.iter().map(Vec::len).sum::<usize>()
+        self.lower.values.len() + self.upper.values.len()
     }
 }
 
@@ -13882,6 +13962,8 @@ mod tests {
 
         let mut saw_nonidentity_fill = false;
         let mut saw_nonidentity_row_perm = false;
+        let packed_solves_before =
+            SPLU_PACKED_TRIANGULAR_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed);
 
         for (label, matrix) in [
             ("laplacian_2d(12)", &laplacian),
@@ -13988,6 +14070,12 @@ mod tests {
             saw_nonidentity_row_perm,
             "no fixture produced a non-identity row permutation, so the composition is untested"
         );
+        assert_eq!(
+            SPLU_PACKED_TRIANGULAR_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            packed_solves_before + 6,
+            "each of the two fixtures must run the counted packed solve in the dispatch probe, \
+             materialized control, and shipping arm"
+        );
     }
 
     #[test]
@@ -14007,6 +14095,13 @@ mod tests {
             "the fixture must generate fill, or the invariant is untested on fill"
         );
         for (row, entries) in lu.u_rows.iter().enumerate() {
+            let start = lu.upper.offsets[row];
+            let end = lu.upper.offsets[row + 1];
+            assert_eq!(
+                end - start,
+                entries.len(),
+                "row {row} must retain every U entry in its packed range"
+            );
             let (first_col, _) = entries[0];
             assert_eq!(
                 first_col, row,
@@ -14017,6 +14112,18 @@ mod tests {
                 entries.windows(2).all(|pair| pair[0].0 < pair[1].0),
                 "row {row} must stay strictly ascending"
             );
+            for (entry_offset, &(column, value)) in entries.iter().enumerate() {
+                let packed_index = start + entry_offset;
+                assert_eq!(
+                    lu.upper.columns[packed_index], column as u32,
+                    "row {row} column {entry_offset} changed while packing"
+                );
+                assert_eq!(
+                    lu.upper.values[packed_index].to_bits(),
+                    value.to_bits(),
+                    "row {row} value {entry_offset} changed while packing"
+                );
+            }
         }
 
         // NEGATIVE ARM. A structurally singular matrix — column 1 is empty, so no
@@ -27040,6 +27147,10 @@ pub static SPLU_BACK_MERGE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
 pub static SPLU_MERGE_FORCE_LEGACY_WALK: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_SOLVE_FORCE_MATERIALIZED_RHS: PerfToggle = PerfToggle::new(false);
+/// Native LU solves that traversed the packed triangular-factor representation.
+#[doc(hidden)]
+pub static SPLU_PACKED_TRIANGULAR_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_ROW_HEAD_CACHE_DISABLE: PerfToggle = PerfToggle::new(false);
 /// Factorizations that took the head-cache arm. A harness that cannot show this
