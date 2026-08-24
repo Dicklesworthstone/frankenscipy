@@ -3992,8 +3992,12 @@ impl NativeSparseLu {
                 let permuted = fill.iter().map(|&old| b[old]).collect::<Vec<f64>>();
                 for row in 0..self.n {
                     let mut value = permuted[self.row_perm[row]];
-                    for entry_index in lower_offsets[row]..lower_offsets[row + 1] {
-                        value -= lower_values[entry_index] * y[lower_columns[entry_index] as usize];
+                    let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
+                    for (&column, &multiplier) in lower_columns[start..end]
+                        .iter()
+                        .zip(&lower_values[start..end])
+                    {
+                        value -= multiplier * y[column as usize];
                     }
                     y[row] = value;
                 }
@@ -4001,8 +4005,12 @@ impl NativeSparseLu {
             Some(fill) => {
                 for row in 0..self.n {
                     let mut value = b[fill[self.row_perm[row]]];
-                    for entry_index in lower_offsets[row]..lower_offsets[row + 1] {
-                        value -= lower_values[entry_index] * y[lower_columns[entry_index] as usize];
+                    let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
+                    for (&column, &multiplier) in lower_columns[start..end]
+                        .iter()
+                        .zip(&lower_values[start..end])
+                    {
+                        value -= multiplier * y[column as usize];
                     }
                     y[row] = value;
                 }
@@ -4013,8 +4021,12 @@ impl NativeSparseLu {
                 // Any A/B row taken on a natural-ordering fixture is measuring nothing.
                 for row in 0..self.n {
                     let mut value = b[self.row_perm[row]];
-                    for entry_index in lower_offsets[row]..lower_offsets[row + 1] {
-                        value -= lower_values[entry_index] * y[lower_columns[entry_index] as usize];
+                    let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
+                    for (&column, &multiplier) in lower_columns[start..end]
+                        .iter()
+                        .zip(&lower_values[start..end])
+                    {
+                        value -= multiplier * y[column as usize];
                     }
                     y[row] = value;
                 }
@@ -4051,8 +4063,11 @@ impl NativeSparseLu {
                 });
             }
             let mut value = y[row];
-            for entry_index in start + 1..end {
-                value -= upper_values[entry_index] * y[upper_columns[entry_index] as usize];
+            for (&column, &entry) in upper_columns[start + 1..end]
+                .iter()
+                .zip(&upper_values[start + 1..end])
+            {
+                value -= entry * y[column as usize];
             }
             y[row] = value / pivot;
         }
