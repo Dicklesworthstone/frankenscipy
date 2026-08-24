@@ -3270,7 +3270,7 @@ fn median_filter1d_sliding_histogram(
         let mut node = index + 1;
         while node < tree.len() {
             tree[node] += delta;
-            node += node & node.wrapping_neg();
+            node += node.isolate_lowest_one();
         }
     };
     let index_of =
@@ -3309,6 +3309,87 @@ fn median_filter1d_sliding_histogram(
         if position + 1 < len {
             adjust(&mut tree, index_of(value_at(position - lo)), -1);
             adjust(&mut tree, index_of(value_at(position - lo + size_i)), 1);
+        }
+    }
+    output
+}
+
+fn median_filter2d_sliding_histogram(
+    input: &NdArray,
+    size: usize,
+    origins: [i64; 2],
+    mode: BoundaryMode,
+    cval: f64,
+) -> NdArray {
+    // Preserve the generic rank path's full `total_cmp` ordering by compressing exact
+    // observed values, rather than placing values into numeric bins.
+    let mut values = input.data.clone();
+    values.push(cval);
+    values.sort_by(f64::total_cmp);
+    values.dedup_by(|left, right| left.total_cmp(right).is_eq());
+
+    let mut tree = vec![0isize; values.len() + 1];
+    let adjust = |tree: &mut [isize], index: usize, delta: isize| {
+        let mut node = index + 1;
+        while node < tree.len() {
+            tree[node] += delta;
+            node += node.isolate_lowest_one();
+        }
+    };
+    let index_of =
+        |value: f64| values.partition_point(|candidate| candidate.total_cmp(&value).is_lt());
+    let select = |tree: &[isize], mut rank: isize| {
+        let mut bit = 1usize;
+        while bit < values.len() {
+            bit <<= 1;
+        }
+        let mut node = 0usize;
+        while bit != 0 {
+            let candidate = node + bit;
+            if candidate < tree.len() && tree[candidate] <= rank {
+                rank -= tree[candidate];
+                node = candidate;
+            }
+            bit >>= 1;
+        }
+        node
+    };
+
+    let height = input.shape[0] as i64;
+    let width = input.shape[1] as i64;
+    let size_i = size as i64;
+    let lo_row = size_i / 2 + origins[0];
+    let lo_col = size_i / 2 + origins[1];
+    let value_at = |row: i64, col: i64| match (
+        boundary_index_1d(row, height, mode),
+        boundary_index_1d(col, width, mode),
+    ) {
+        (Some(row), Some(col)) => input.data[(row * width + col) as usize],
+        _ => cval,
+    };
+
+    let mut output = NdArray::zeros(input.shape.clone());
+    let rank = (size * size / 2) as isize;
+    for row in 0..height {
+        tree.fill(0);
+        for source_row in row - lo_row..row - lo_row + size_i {
+            for source_col in -lo_col..size_i - lo_col {
+                adjust(&mut tree, index_of(value_at(source_row, source_col)), 1);
+            }
+        }
+
+        for col in 0..width {
+            output.data[(row * width + col) as usize] = values[select(&tree, rank)];
+            if col + 1 < width {
+                for source_row in row - lo_row..row - lo_row + size_i {
+                    adjust(&mut tree, index_of(value_at(source_row, col - lo_col)), -1);
+                    adjust(
+                        &mut tree,
+                        index_of(value_at(source_row, col - lo_col + size_i)),
+                        1,
+                    );
+                }
+            }
         }
     }
     output
@@ -3372,6 +3453,15 @@ pub fn median_filter_with_origins(
     if ndim == 1 {
         return Ok(median_filter1d_sliding_histogram(
             input, size, origins[0], mode, cval,
+        ));
+    }
+    if ndim == 2 {
+        return Ok(median_filter2d_sliding_histogram(
+            input,
+            size,
+            [origins[0], origins[1]],
+            mode,
+            cval,
         ));
     }
 
@@ -16809,6 +16899,68 @@ mod tests {
                             .collect::<Vec<_>>(),
                         "mode={mode:?} size={size} origin={origin}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn median_filter_2d_sliding_histogram_matches_full_rank_bits() {
+        let input = NdArray::new(
+            vec![
+                -0.0,
+                4.0,
+                f64::from_bits(0x7ff8_0000_0000_0007),
+                -3.0,
+                7.0,
+                4.0,
+                0.0,
+                9.0,
+                -2.0,
+                6.0,
+                1.0,
+                5.0,
+            ],
+            vec![3, 4],
+        )
+        .unwrap();
+        let cval = f64::from_bits(0x7ff8_0000_0000_0011);
+        for mode in [
+            BoundaryMode::Nearest,
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Wrap,
+            BoundaryMode::Mirror,
+        ] {
+            for size in [2usize, 3] {
+                let origin_lo = -(size as i64 / 2);
+                let origin_hi = (size as i64 - 1) / 2;
+                for row_origin in [origin_lo, 0, origin_hi] {
+                    for col_origin in [origin_lo, 0, origin_hi] {
+                        let origins = [row_origin, col_origin];
+                        let got =
+                            median_filter_with_origins(&input, size, &origins, mode, cval).unwrap();
+                        let want = rank_filter_index_with_origins(
+                            &input,
+                            size,
+                            &origins,
+                            mode,
+                            cval,
+                            size * size / 2,
+                        )
+                        .unwrap();
+                        assert_eq!(
+                            got.data
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            want.data
+                                .iter()
+                                .map(|value| value.to_bits())
+                                .collect::<Vec<_>>(),
+                            "mode={mode:?} size={size} origins={origins:?}"
+                        );
+                    }
                 }
             }
         }
