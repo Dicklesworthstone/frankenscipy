@@ -12120,6 +12120,41 @@ fn symmetric_lower_matvec_one_pass_simd(
             row_offset += LANES;
         }
 
+        // The active suffix shrinks by one for every Householder step.  Once
+        // the eight-lane body is exhausted, four through seven positions are
+        // frequently left for the scalar loop.  These lanes still update
+        // distinct `product` entries, and reducing `p_col` in slice order
+        // keeps its accumulation sequence unchanged.
+        const TAIL_LANES: usize = 4;
+        if row_offset + TAIL_LANES <= active {
+            let values = Simd::<f64, TAIL_LANES>::from_slice(
+                &data[col_base + start + row_offset
+                    ..col_base + start + row_offset + TAIL_LANES],
+            );
+            let vector_lanes = Simd::<f64, TAIL_LANES>::from_slice(
+                &vector[row_offset..row_offset + TAIL_LANES],
+            );
+
+            if v_col != 0.0 {
+                let prior = Simd::<f64, TAIL_LANES>::from_slice(
+                    &product[row_offset..row_offset + TAIL_LANES],
+                );
+                (prior + values * Simd::splat(v_col))
+                    .copy_to_slice(&mut product[row_offset..row_offset + TAIL_LANES]);
+            }
+
+            for (&term, &v_row) in (values * vector_lanes)
+                .to_array()
+                .iter()
+                .zip(&vector[row_offset..row_offset + TAIL_LANES])
+            {
+                if v_row != 0.0 {
+                    p_col += term;
+                }
+            }
+            row_offset += TAIL_LANES;
+        }
+
         while row_offset < active {
             let value = data[col_base + start + row_offset];
             if v_col != 0.0 {
@@ -32782,6 +32817,43 @@ mod tests {
                 double_read[index].to_bits(),
                 one_pass[index].to_bits(),
                 "symmetric product changed at index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn symmetric_lower_matvec_simd_four_lane_tail_matches_scalar_bits() {
+        // `active = 77 = 9 * 8 + 5`: after the eight-lane body, this must
+        // execute the new four-lane tail and leave one scalar entry.  A pure
+        // multiple of eight would leave the tail untested.
+        let n = 84usize;
+        let start = 7usize;
+        let active = n - start;
+        assert_eq!(active % 8, 5, "fixture must enter the four-lane tail");
+
+        let mut matrix = DMatrix::<f64>::zeros(n, n);
+        for col in start..n {
+            for row in col..n {
+                matrix[(row, col)] =
+                    ((row * 37 + col * 19 + 23) % 113) as f64 / 107.0 - 0.5;
+            }
+        }
+        let mut vector: Vec<f64> = (0..active)
+            .map(|index| ((index * 17 + 29) % 97) as f64 / 89.0 - 0.45)
+            .collect();
+        vector[5] = 0.0;
+        vector[61] = -0.0;
+
+        let mut scalar = vec![f64::NAN; active];
+        let mut simd = vec![f64::NAN; active];
+        symmetric_lower_matvec_one_pass(matrix.as_slice(), n, start, &vector, &mut scalar);
+        symmetric_lower_matvec_one_pass_simd(matrix.as_slice(), n, start, &vector, &mut simd);
+
+        for (index, (expected, actual)) in scalar.iter().zip(&simd).enumerate() {
+            assert_eq!(
+                expected.to_bits(),
+                actual.to_bits(),
+                "four-lane tail changed product[{index}]"
             );
         }
     }
