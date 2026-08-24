@@ -397,6 +397,19 @@ pub trait ContinuousDistribution {
         })
     }
 
+    /// Fit the family for [`goodness_of_fit`].
+    ///
+    /// Most families use their ordinary [`Self::try_fit`] estimator. SciPy's
+    /// normal goodness-of-fit fast path is the deliberate exception: when both
+    /// parameters are free it estimates scale with the sample standard deviation
+    /// (`ddof = 1`) instead of `norm.fit`'s MLE scale (`ddof = 0`).
+    fn try_fit_for_goodness_of_fit(data: &[f64]) -> Result<Self, FitError>
+    where
+        Self: Sized,
+    {
+        Self::try_fit(data)
+    }
+
     /// Audit-emitting counterpart to `try_fit` (br-egba-3). Delegates
     /// to `try_fit`, and on any `FitError` records an
     /// `AuditAction::FailClosed` event on the provided ledger. Useful
@@ -1168,6 +1181,14 @@ impl ContinuousDistribution for Normal {
             ));
         }
         Ok(Self::fit(data))
+    }
+
+    fn try_fit_for_goodness_of_fit(data: &[f64]) -> Result<Self, FitError> {
+        validate_finite_fit_data(data, 2, "Normal")?;
+        let n = data.len() as f64;
+        let loc = sample_mean(data);
+        let scale = (data.iter().map(|&x| (x - loc).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+        Ok(Self { loc, scale })
     }
 
     fn entropy(&self) -> f64 {
@@ -58853,10 +58874,11 @@ pub struct GofOutcome<D> {
 ///
 /// # Requires a fittable family
 ///
-/// Returns `Err(FitError::NotImplemented)` when `D` does not override `try_fit`,
-/// which is the trait default. `try_fit` rather than `fit` deliberately: `fit`
-/// panics, and a generic driver that panics on an unfittable family is not usable
-/// as a library.
+/// Returns `Err(FitError::NotImplemented)` when `D` does not override
+/// `try_fit_for_goodness_of_fit`, which delegates to the trait-default
+/// `try_fit`. The fallible method rather than `fit` deliberately: `fit` panics,
+/// and a generic driver that panics on an unfittable family is not usable as a
+/// library.
 ///
 /// # Resamples that fail to refit
 ///
@@ -58886,7 +58908,7 @@ pub fn goodness_of_fit<D>(
 where
     D: ContinuousDistribution + Copy + Sync,
 {
-    let fitted = D::try_fit(data)?;
+    let fitted = D::try_fit_for_goodness_of_fit(data)?;
     let n = data.len();
 
     let rvs = move |s: u64| -> Vec<f64> {
@@ -58895,7 +58917,7 @@ where
     };
     // Each resample is REFITTED before its statistic is taken; see step 3 above.
     let statistic_fn = move |sample: &[f64]| -> f64 {
-        match D::try_fit(sample) {
+        match D::try_fit_for_goodness_of_fit(sample) {
             Ok(refit) => gof_statistic(&refit, sample, which),
             Err(_) => f64::NAN,
         }
@@ -102901,6 +102923,42 @@ mod goodness_of_fit_matches_scipy {
         );
     }
 
+    /// SciPy deliberately uses a different normal estimator for
+    /// `goodness_of_fit` than for `norm.fit`: the former has `ddof = 1` when
+    /// both parameters are free. Keep that exception inside the GoF path so
+    /// ordinary Normal fitting remains maximum-likelihood (`ddof = 0`).
+    #[test]
+    fn normal_goodness_of_fit_uses_scipys_sample_scale_not_norm_fits_mle() {
+        let mle = Normal::try_fit(&NORMALISH).expect("normal MLE fit");
+        let result: super::GofOutcome<Normal> =
+            goodness_of_fit(&NORMALISH, GofStatistic::AndersonDarling, 9, 20260818)
+                .expect("normal goodness-of-fit");
+
+        assert!(
+            (mle.scale - 1.029_572_726_911_508_7).abs() < 1e-15,
+            "Normal::try_fit must remain scipy.stats.norm.fit's MLE"
+        );
+        assert!(
+            (result.fitted.loc - 0.269_999_999_999_999_96).abs() < 1e-15,
+            "gof loc = {}, scipy = 0.26999999999999996",
+            result.fitted.loc
+        );
+        assert!(
+            (result.fitted.scale - 1.056_319_329_708_488).abs() < 1e-15,
+            "gof scale = {}, scipy goodness_of_fit = 1.056319329708488",
+            result.fitted.scale
+        );
+        assert!(
+            (result.statistic - 1.305_856_415_585_253_7e-1).abs() < 1e-12,
+            "AD = {}, scipy goodness_of_fit = 0.13058564155852537",
+            result.statistic
+        );
+        assert!(
+            result.fitted.scale > mle.scale,
+            "the sample-scale GoF fit must differ from Normal::try_fit's MLE"
+        );
+    }
+
     /// The four statistics against `scipy.stats._fit`, evaluated at the SAME
     /// fitted parameters so this tests the formulas and nothing else.
     #[test]
@@ -103070,11 +103128,12 @@ mod goodness_of_fit_matches_scipy {
     fn the_null_is_built_by_refitting_each_resample() {
         let res: super::GofOutcome<Normal> =
             goodness_of_fit(&NORMALISH, GofStatistic::AndersonDarling, 499, 7).expect("fit");
-        let fitted = Normal::try_fit(&NORMALISH).expect("fit");
-        assert_eq!(
-            res.fitted, fitted,
-            "the reported fit is the null-hypothesis fit"
+        let mle = Normal::try_fit(&NORMALISH).expect("fit");
+        assert!(
+            res.fitted.scale > mle.scale,
+            "the normal GoF null must use SciPy's ddof=1 fit, not norm.fit's MLE"
         );
+        let fitted = res.fitted;
 
         // Score the same statistic WITHOUT refitting, on samples from the null.
         // The no-refit statistic is stochastically larger, because refitting
@@ -103122,15 +103181,14 @@ mod goodness_of_fit_matches_scipy {
         );
         // MUST-MISS control: a family that DOES implement it succeeds on the same
         // call, so the error above is about the family and not about the driver.
-        let ok: Result<super::GofOutcome<super::HalfNormal>, _> = goodness_of_fit(
-            &[0.4, 0.9, 1.3, 0.2, 2.1, 0.7, 1.6],
-            GofStatistic::KolmogorovSmirnov,
-            9,
-            1,
-        );
-        assert!(
-            ok.is_ok(),
-            "HalfNormal does override try_fit, so this must succeed"
+        let half_normal_data = [0.4, 0.9, 1.3, 0.2, 2.1, 0.7, 1.6];
+        let ok: Result<super::GofOutcome<super::HalfNormal>, _> =
+            goodness_of_fit(&half_normal_data, GofStatistic::KolmogorovSmirnov, 9, 1);
+        let ok = ok.expect("HalfNormal does override try_fit, so this must succeed");
+        assert_eq!(
+            ok.fitted,
+            super::HalfNormal::try_fit(&half_normal_data).expect("HalfNormal MLE fit"),
+            "only Normal has SciPy's goodness-of-fit-specific estimator"
         );
     }
 
