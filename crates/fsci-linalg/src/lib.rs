@@ -42216,6 +42216,177 @@ mod toggle_ab_eigh_rank2_update {
     }
 }
 
+/// frankenscipy-bgrq1 — the two `pinv` toggles below change arithmetic, so unlike
+/// the layout-only `pinv` toggles their contract is a conditioning-scaled bound.
+///
+/// The tall toggle compares the custom triangular solve with nalgebra's
+/// Cholesky solve; the wide toggle compares its normal-equation Cholesky arm
+/// with the public SVD fallback. The normal equations square the conditioning,
+/// therefore a fixed tolerance would either be needlessly loose at κ=1 or
+/// reject a sound result at κ=10⁴. Keep both shapes and the three-condition
+/// sweep here so an edit to either route cannot silently turn an argued
+/// contract back into one.
+#[cfg(test)]
+mod toggle_ab_pinv_cholesky {
+    use super::{
+        DISABLE_TALL_PINV_TRSM, DISABLE_WIDE_PINV_CHOLESKY, DMatrix, PinvOptions, pinv,
+        pinv_full_rank_tall_cholesky_with_min_cols, pinv_full_rank_wide_cholesky_with_min_rows,
+    };
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    struct RestoreToggles {
+        tall_trsm: bool,
+        wide_cholesky: bool,
+    }
+
+    impl RestoreToggles {
+        fn capture() -> Self {
+            Self {
+                tall_trsm: DISABLE_TALL_PINV_TRSM.load(Ordering::Relaxed),
+                wide_cholesky: DISABLE_WIDE_PINV_CHOLESKY.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl Drop for RestoreToggles {
+        fn drop(&mut self) {
+            DISABLE_TALL_PINV_TRSM.store(self.tall_trsm, Ordering::Relaxed);
+            DISABLE_WIDE_PINV_CHOLESKY.store(self.wide_cholesky, Ordering::Relaxed);
+        }
+    }
+
+    fn diagonal_scales(n: usize, kappa: f64) -> Vec<f64> {
+        (0..n)
+            .map(|index| kappa.powf(-(index as f64) / ((n - 1) as f64)))
+            .collect()
+    }
+
+    fn tall_fixture(kappa: f64) -> Vec<Vec<f64>> {
+        const ROWS: usize = 129;
+        const COLS: usize = 128;
+        let scales = diagonal_scales(COLS, kappa);
+        let mut a = vec![vec![0.0; COLS]; ROWS];
+        for (index, &scale) in scales.iter().enumerate() {
+            a[index][index] = scale;
+            if index + 1 < ROWS {
+                a[index + 1][index] = 0.25 * scale;
+            }
+        }
+        a
+    }
+
+    fn wide_fixture(kappa: f64) -> Vec<Vec<f64>> {
+        const ROWS: usize = 128;
+        const COLS: usize = 129;
+        let scales = diagonal_scales(ROWS, kappa);
+        let mut a = vec![vec![0.0; COLS]; ROWS];
+        for (index, &scale) in scales.iter().enumerate() {
+            a[index][index] = scale;
+            if index + 1 < ROWS {
+                a[index][index + 1] = 0.25 * scale;
+            }
+        }
+        a
+    }
+
+    fn max_relative_entry_error(left: &[Vec<f64>], right: &[Vec<f64>]) -> f64 {
+        let scale = left
+            .iter()
+            .chain(right)
+            .flat_map(|row| row.iter())
+            .fold(0.0_f64, |max, &value| max.max(value.abs()))
+            .max(1.0);
+        left.iter()
+            .zip(right)
+            .flat_map(|(left_row, right_row)| left_row.iter().zip(right_row))
+            .fold(0.0_f64, |max, (&left, &right)| {
+                max.max((left - right).abs() / scale)
+            })
+    }
+
+    #[test]
+    fn normal_equation_pinv_toggle_arms_follow_a_kappa_squared_bound() {
+        let _lock = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = RestoreToggles::capture();
+
+        for kappa in [1.0_f64, 1.0e2, 1.0e4] {
+            let tall = tall_fixture(kappa);
+            let tall_matrix = DMatrix::from_row_slice(
+                tall.len(),
+                tall[0].len(),
+                &tall.iter().flatten().copied().collect::<Vec<_>>(),
+            );
+            let tall_rtol = (tall.len().max(tall[0].len()) as f64) * f64::EPSILON;
+
+            DISABLE_TALL_PINV_TRSM.store(false, Ordering::Relaxed);
+            assert!(
+                pinv_full_rank_tall_cholesky_with_min_cols(&tall_matrix, 0.0, tall_rtol, 128)
+                    .is_some(),
+                "tall Cholesky arm did not admit κ={kappa:.0e}; the public A/B below would be blind"
+            );
+            let tall_fast = pinv(&tall, PinvOptions::default()).expect("tall fast pinv");
+            DISABLE_TALL_PINV_TRSM.store(true, Ordering::Relaxed);
+            let tall_legacy = pinv(&tall, PinvOptions::default()).expect("tall legacy pinv");
+            let wide = wide_fixture(kappa);
+            let wide_matrix = DMatrix::from_row_slice(
+                wide.len(),
+                wide[0].len(),
+                &wide.iter().flatten().copied().collect::<Vec<_>>(),
+            );
+            let wide_rtol = (wide.len().max(wide[0].len()) as f64) * f64::EPSILON;
+
+            DISABLE_WIDE_PINV_CHOLESKY.store(false, Ordering::Relaxed);
+            assert!(
+                pinv_full_rank_wide_cholesky_with_min_rows(
+                    &wide,
+                    &wide_matrix,
+                    0.0,
+                    wide_rtol,
+                    128
+                )
+                .is_some(),
+                "wide Cholesky arm did not admit κ={kappa:.0e}; the public A/B below would be blind"
+            );
+            let wide_fast = pinv(&wide, PinvOptions::default()).expect("wide fast pinv");
+            DISABLE_WIDE_PINV_CHOLESKY.store(true, Ordering::Relaxed);
+            assert!(
+                pinv_full_rank_wide_cholesky_with_min_rows(
+                    &wide,
+                    &wide_matrix,
+                    0.0,
+                    wide_rtol,
+                    128
+                )
+                .is_none(),
+                "wide toggle did not force its SVD fallback for κ={kappa:.0e}"
+            );
+            let wide_svd = pinv(&wide, PinvOptions::default()).expect("wide SVD pinv");
+
+            let bound = 512.0 * f64::EPSILON * kappa * kappa;
+            let tall_error =
+                max_relative_entry_error(&tall_fast.pseudo_inverse, &tall_legacy.pseudo_inverse);
+            let wide_error =
+                max_relative_entry_error(&wide_fast.pseudo_inverse, &wide_svd.pseudo_inverse);
+            println!(
+                "kappa={kappa:.0e} tall_relative_error={tall_error:.3e} wide_relative_error={wide_error:.3e} bound={bound:.3e}"
+            );
+            assert!(
+                tall_error <= bound,
+                "tall Cholesky-arm relative gap {tall_error:.3e} exceeded κ² bound {bound:.3e} at κ={kappa:.0e}"
+            );
+            assert!(
+                wide_error <= bound,
+                "wide Cholesky/SVD relative gap {wide_error:.3e} exceeded κ² bound {bound:.3e} at κ={kappa:.0e}"
+            );
+        }
+    }
+}
+
 /// frankenscipy-sez4r — driver for `EIG_USE_FRANCIS_SCHUR`.
 ///
 /// Both arms are compared on inputs where the OLD one already converges, which is
