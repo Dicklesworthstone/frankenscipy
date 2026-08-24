@@ -5702,6 +5702,30 @@ fn csr_matvec_into(a: &CsrMatrix, x: &[f64], out: &mut [f64]) {
 /// Shared kernel for `csr_matvec`/`csr_matvec_into`. Each output row is an
 /// independent dot product accumulated in CSR index order, so the threaded path
 /// (disjoint output chunks) is byte-identical to the serial sweep.
+#[inline]
+fn csr_row_dot(data: &[f64], indices: &[usize], x: &[f64], start: usize, end: usize) -> f64 {
+    // The whole-job GMRES fixture is the five-point convection-diffusion
+    // stencil: 900 of its 1,024 rows have exactly five nonzeros, accounting for
+    // 4,500 of 4,992 visits per SpMV. Keep the additions in CSR order, but
+    // expose that fixed width to LLVM so it need not carry a dynamic inner-loop
+    // induction variable through the overwhelmingly common row shape.
+    if end - start == 5 {
+        let mut sum = 0.0;
+        sum += data[start] * x[indices[start]];
+        sum += data[start + 1] * x[indices[start + 1]];
+        sum += data[start + 2] * x[indices[start + 2]];
+        sum += data[start + 3] * x[indices[start + 3]];
+        sum += data[start + 4] * x[indices[start + 4]];
+        return sum;
+    }
+
+    let mut sum = 0.0;
+    for idx in start..end {
+        sum += data[idx] * x[indices[idx]];
+    }
+    sum
+}
+
 fn csr_matvec_into_impl(
     indptr: &[usize],
     indices: &[usize],
@@ -5713,11 +5737,7 @@ fn csr_matvec_into_impl(
     let n = out.len();
     if nthreads <= 1 {
         for (i, slot) in out.iter_mut().enumerate() {
-            let mut sum = 0.0;
-            for idx in indptr[i]..indptr[i + 1] {
-                sum += data[idx] * x[indices[idx]];
-            }
-            *slot = sum;
+            *slot = csr_row_dot(data, indices, x, indptr[i], indptr[i + 1]);
         }
         return;
     }
@@ -5729,11 +5749,7 @@ fn csr_matvec_into_impl(
             scope.spawn(move || {
                 for (r, o) in slot.iter_mut().enumerate() {
                     let i = base + r;
-                    let mut sum = 0.0;
-                    for idx in indptr[i]..indptr[i + 1] {
-                        sum += data[idx] * x[indices[idx]];
-                    }
-                    *o = sum;
+                    *o = csr_row_dot(data, indices, x, indptr[i], indptr[i + 1]);
                 }
             });
         }
@@ -19996,6 +20012,29 @@ mod tests {
                 expected.to_bits(),
                 actual.to_bits(),
                 "slab basis update changed solution component {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn csr_matvec_five_entry_rows_match_generic_csr_order_bitwise() {
+        let indptr = [0, 5, 8];
+        let indices = [0, 2, 1, 3, 0, 3, 1, 2];
+        let data = [1.25, -0.5, 0.75, -1.0, 0.125, 2.0, -0.25, 0.5];
+        let x = [0.5, -1.5, 2.0, 0.25];
+        let mut actual = [0.0; 2];
+
+        csr_matvec_into_impl(&indptr, &indices, &data, &x, &mut actual, 1);
+
+        for row in 0..actual.len() {
+            let mut expected = 0.0;
+            for index in indptr[row]..indptr[row + 1] {
+                expected += data[index] * x[indices[index]];
+            }
+            assert_eq!(
+                actual[row].to_bits(),
+                expected.to_bits(),
+                "CSR row {row} changed the ordered dot-product bits"
             );
         }
     }
