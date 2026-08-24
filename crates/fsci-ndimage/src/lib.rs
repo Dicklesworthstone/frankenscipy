@@ -6711,6 +6711,62 @@ pub fn binary_dilation_with_origins(
     )
 }
 
+/// Binary erosion with an arbitrary structuring element.
+///
+/// The structuring element is centered in each dimension and elements equal to
+/// zero are ignored. Out-of-bounds input is treated as background. This is the
+/// default `scipy.ndimage.binary_erosion` behavior for an explicit
+/// `structure` and `border_value=0`.
+pub fn binary_erosion_with_structure(
+    input: &NdArray,
+    structure: &NdArray,
+    iterations: usize,
+) -> Result<NdArray, NdimageError> {
+    let mut current = input.clone();
+    if iterations == 0 {
+        loop {
+            let output = binary_erosion_with_struct(&current, structure)?;
+            if output.data == current.data {
+                return Ok(output);
+            }
+            current = output;
+        }
+    }
+
+    for _ in 0..iterations {
+        current = binary_erosion_with_struct(&current, structure)?;
+    }
+    Ok(current)
+}
+
+/// Binary dilation with an arbitrary structuring element.
+///
+/// The structuring element is centered in each dimension and elements equal to
+/// zero are ignored. Out-of-bounds output locations are discarded. This is the
+/// default `scipy.ndimage.binary_dilation` behavior for an explicit
+/// `structure` and `border_value=0`.
+pub fn binary_dilation_with_structure(
+    input: &NdArray,
+    structure: &NdArray,
+    iterations: usize,
+) -> Result<NdArray, NdimageError> {
+    let mut current = input.clone();
+    if iterations == 0 {
+        loop {
+            let output = binary_dilation_with_structure_once(&current, structure)?;
+            if output.data == current.data {
+                return Ok(output);
+            }
+            current = output;
+        }
+    }
+
+    for _ in 0..iterations {
+        current = binary_dilation_with_structure_once(&current, structure)?;
+    }
+    Ok(current)
+}
+
 /// Binary propagation: repeatedly dilate the input until convergence,
 /// optionally constrained by a mask.
 ///
@@ -11717,43 +11773,83 @@ fn binary_erosion_with_struct(
             "input and structure must have same dimensions".to_string(),
         ));
     }
+    if structure.shape.contains(&0) {
+        return Err(NdimageError::InvalidArgument(
+            "structure dimensions must be positive".to_string(),
+        ));
+    }
 
-    let _ndim = input.ndim();
     let mut output = NdArray::zeros(input.shape.clone());
-    let offsets: Vec<i64> = structure.shape.iter().map(|&s| s as i64 / 2).collect();
+    let centers: Vec<i64> = structure
+        .shape
+        .iter()
+        .map(|&dim| (dim / 2) as i64)
+        .collect();
 
-    // Collect structure element positions
+    // Collect active structure offsets once. The optimized arm below retains
+    // the exact source and structure traversal order of the original generic
+    // implementation; it only replaces temporary coordinate vectors with a
+    // row-major odometer and direct flat input indexing.
     let mut struct_positions = Vec::new();
     for flat in 0..structure.size() {
         if structure.data[flat] != 0.0 {
             let idx = structure.unravel(flat);
             let delta: Vec<i64> = idx
                 .iter()
-                .zip(offsets.iter())
-                .map(|(&i, &o)| i as i64 - o)
+                .zip(&centers)
+                .map(|(&coord, &center)| coord as i64 - center)
                 .collect();
             struct_positions.push(delta);
         }
     }
 
+    let full_mode = NDIMAGE_UNRAVEL_ODOMETER_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+    let ndim = input.ndim();
+    let mut idx = vec![0usize; ndim];
     for flat_out in 0..input.size() {
-        let out_idx = input.unravel(flat_out);
         let mut all_set = true;
-
-        for delta in &struct_positions {
-            let in_idx: Vec<i64> = out_idx
-                .iter()
-                .zip(delta.iter())
-                .map(|(&o, &d)| o as i64 + d)
-                .collect();
-            let val = input.get_boundary(&in_idx, BoundaryMode::Constant, 0.0);
-            if val == 0.0 {
-                all_set = false;
-                break;
+        if full_mode {
+            let out_idx = input.unravel(flat_out);
+            for delta in &struct_positions {
+                let in_idx: Vec<i64> = out_idx
+                    .iter()
+                    .zip(delta)
+                    .map(|(&coord, &offset)| coord as i64 + offset)
+                    .collect();
+                if input.get_boundary(&in_idx, BoundaryMode::Constant, 0.0) == 0.0 {
+                    all_set = false;
+                    break;
+                }
+            }
+        } else {
+            for delta in &struct_positions {
+                let mut in_bounds = true;
+                let mut input_flat = 0usize;
+                for axis in 0..ndim {
+                    let coord = idx[axis] as i64 + delta[axis];
+                    if coord < 0 || coord >= input.shape[axis] as i64 {
+                        in_bounds = false;
+                        break;
+                    }
+                    input_flat += coord as usize * input.strides[axis];
+                }
+                if !in_bounds || input.data[input_flat] == 0.0 {
+                    all_set = false;
+                    break;
+                }
             }
         }
-
         output.data[flat_out] = if all_set { 1.0 } else { 0.0 };
+
+        if !full_mode {
+            for axis in (0..ndim).rev() {
+                idx[axis] += 1;
+                if idx[axis] < input.shape[axis] {
+                    break;
+                }
+                idx[axis] = 0;
+            }
+        }
     }
 
     Ok(output)
@@ -21249,6 +21345,60 @@ mod tests {
     }
 
     #[test]
+    fn binary_morphology_arbitrary_structure_matches_scipy_oracle() {
+        // scipy.ndimage.binary_{erosion,dilation} with the explicit asymmetric
+        // 3x5 footprint below and border_value=0. Keep separate erosion and
+        // dilation fixtures so each expected output has nontrivial interior and
+        // boundary cells.
+        #[rustfmt::skip]
+        let structure = NdArray::new(vec![
+            1.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 1.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 0.0, 1.0,
+        ], vec![3, 5]).unwrap();
+
+        let mut erosion_data = vec![1.0; 6 * 7];
+        erosion_data[2 * 7 + 3] = 0.0;
+        erosion_data[4 * 7 + 1] = 0.0;
+        let erosion_input = NdArray::new(erosion_data, vec![6, 7]).unwrap();
+        #[rustfmt::skip]
+        let expected_erosion = vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        assert_eq!(
+            binary_erosion_with_structure(&erosion_input, &structure, 1)
+                .unwrap()
+                .data,
+            expected_erosion
+        );
+
+        let mut dilation_data = vec![0.0; 6 * 7];
+        dilation_data[2 * 7 + 3] = 1.0;
+        dilation_data[4 * 7 + 1] = 1.0;
+        let dilation_input = NdArray::new(dilation_data, vec![6, 7]).unwrap();
+        #[rustfmt::skip]
+        let expected_dilation = vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0,
+            0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+            1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+        ];
+        assert_eq!(
+            binary_dilation_with_structure(&dilation_input, &structure, 1)
+                .unwrap()
+                .data,
+            expected_dilation
+        );
+    }
+
+    #[test]
     fn sobel_matches_scipy_reference_values() {
         // scipy.ndimage.sobel([[1,2,3],[4,5,6],[7,8,9]], axis=0, mode='reflect')
         let input = NdArray::new(
@@ -22478,6 +22628,51 @@ mod tests {
                         a.to_bits(),
                         b.to_bits(),
                         "binary_dilation {shape:?} iters={iters}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_erosion_arbitrary_structure_odometer_matches_full_bitexact() {
+        use std::sync::atomic::Ordering;
+        // The optimized arm must preserve the original generic coordinate
+        // vectors and get_boundary semantics for arbitrary footprints, including
+        // even dimensions and empty footprint positions.
+        let cases: &[(Vec<usize>, Vec<usize>)] = &[
+            (vec![25], vec![4]),
+            (vec![11, 13], vec![3, 4]),
+            (vec![5, 6, 4], vec![3, 2, 3]),
+        ];
+        for (shape, structure_shape) in cases {
+            let total: usize = shape.iter().product();
+            let input = NdArray::new(
+                (0..total)
+                    .map(|flat| ((flat * 7 + 3) % 5 != 0) as u8 as f64)
+                    .collect(),
+                shape.clone(),
+            )
+            .unwrap();
+            let structure_total: usize = structure_shape.iter().product();
+            let structure = NdArray::new(
+                (0..structure_total)
+                    .map(|flat| ((flat * 5 + 1) % 4 != 0) as u8 as f64)
+                    .collect(),
+                structure_shape.clone(),
+            )
+            .unwrap();
+            for iterations in [1usize, 2] {
+                NDIMAGE_UNRAVEL_ODOMETER_DISABLE.store(true, Ordering::Relaxed);
+                let full = binary_erosion_with_structure(&input, &structure, iterations).unwrap();
+                NDIMAGE_UNRAVEL_ODOMETER_DISABLE.store(false, Ordering::Relaxed);
+                let optimized =
+                    binary_erosion_with_structure(&input, &structure, iterations).unwrap();
+                for (full_value, optimized_value) in full.data.iter().zip(&optimized.data) {
+                    assert_eq!(
+                        full_value.to_bits(),
+                        optimized_value.to_bits(),
+                        "shape={shape:?} structure={structure_shape:?} iterations={iterations}"
                     );
                 }
             }
