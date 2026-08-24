@@ -3673,7 +3673,7 @@ fn uniform_filter_along_axis(
     // lines along `axis` slides a running sum (drop leaving, add entering element).
     // out[0] is summed left-to-right (byte-identical to the per-window kernel); later
     // positions accumulate incrementally (tolerance-parity). Writes stay inside `os`.
-    let do_slab = |is: &[f64], os: &mut [f64]| {
+    let do_slab = |is: &[f64], os: &mut [f64], sum_vec: &mut Vec<f64>| {
         let val_at = |i: usize, a: i64| -> f64 {
             match boundary_index_1d(a, mid as i64, mode) {
                 Some(m) => is[i + (m as usize) * inner],
@@ -3704,7 +3704,8 @@ fn uniform_filter_along_axis(
         let row = |r: i64| -> Option<usize> {
             boundary_index_1d(r, mid as i64, mode).map(|m| (m as usize) * inner)
         };
-        let mut sum_vec = vec![0.0f64; inner];
+        sum_vec.clear();
+        sum_vec.resize(inner, 0.0);
         for k in 0..size_i {
             match row(k - lo) {
                 Some(b) => {
@@ -3720,7 +3721,7 @@ fn uniform_filter_along_axis(
                 }
             }
         }
-        for (slot, &s) in os[..inner].iter_mut().zip(&sum_vec) {
+        for (slot, &s) in os[..inner].iter_mut().zip(sum_vec.iter()) {
             *slot = s / size_f;
         }
         for a in 1..mid as i64 {
@@ -3779,8 +3780,9 @@ fn uniform_filter_along_axis(
         ndimage_filter_thread_count(arr.size(), size).min(outer.max(1))
     };
     if nthreads <= 1 || outer < 2 {
+        let mut sum_vec = Vec::with_capacity(inner);
         for (is, os) in arr.data.chunks(slab).zip(out.data.chunks_mut(slab)) {
-            do_slab(is, os);
+            do_slab(is, os, &mut sum_vec);
         }
     } else {
         let slabs_per = outer.div_ceil(nthreads);
@@ -3792,8 +3794,9 @@ fn uniform_filter_along_axis(
                 .zip(out.data.chunks_mut(slab * slabs_per))
             {
                 scope.spawn(move || {
+                    let mut sum_vec = Vec::with_capacity(inner);
                     for (is, os) in in_chunk.chunks(slab).zip(out_chunk.chunks_mut(slab)) {
-                        do_slab(is, os);
+                        do_slab(is, os, &mut sum_vec);
                     }
                 });
             }
@@ -14825,11 +14828,11 @@ mod tests {
     fn uniform_running_sum_matches_perwindow_reference() {
         // The O(n) running-sum path must match the per-window reference to rounding
         // across sizes, axes, and boundary modes (running sum is tolerance-parity).
-        let (rows, cols) = (37usize, 41usize);
-        let data: Vec<f64> = (0..rows * cols)
+        let shape = vec![11usize, 13, 17];
+        let data: Vec<f64> = (0..shape.iter().product())
             .map(|i| ((i * 2654435761usize) % 1000) as f64 / 1000.0 - 0.5)
             .collect();
-        let arr = NdArray::new(data, vec![rows, cols]).unwrap();
+        let arr = NdArray::new(data, shape).unwrap();
         for mode in [
             BoundaryMode::Nearest,
             BoundaryMode::Reflect,
@@ -14838,7 +14841,7 @@ mod tests {
             BoundaryMode::Mirror,
         ] {
             for size in [2usize, 3, 7, 12, 20] {
-                for axis in [0usize, 1usize] {
+                for axis in 0..arr.ndim() {
                     let got = uniform_filter1d(&arr, size, axis, mode, 0.3).unwrap();
                     let want =
                         uniform_filter1d_perwindow_ref(&arr, size, axis, mode, 0.3, 0).unwrap();
