@@ -3680,6 +3680,21 @@ mod cubic_live {
             "harness_source_sha256={:x}",
             Sha256::digest(HARNESS_SOURCE_BYTES)
         );
+        // SOURCE MARKER ON THE ROW ITSELF, not only behind `--source-marker`.
+        //
+        // A source sha proves which bytes the compiler read; it does not help a reader who is
+        // holding a printed row and asking "was this binary built from the source I think it
+        // was". The marker is a value I can FLIP in one edit, so the freshness check has two
+        // observable arms: build with `-a` and the row says `-a`, change the const and the row
+        // must say the new value. This is the check that catches the failure actually seen in
+        // this session — `rch exec -- cargo test` returned exit 0 and 5/5 green while running
+        // a test that had already been deleted from the working tree (frankenscipy-ozg54),
+        // because the remote arm built the COMMITTED tree. A stale binary now contradicts its
+        // own row instead of passing silently.
+        println!(
+            "perf_spsolve_source_marker={}",
+            super::PERF_SPSOLVE_SOURCE_MARKER
+        );
 
         if observed_os_threads()? != 1 {
             return Err("FrankenSciPy harness started with more than one OS thread".to_string());
