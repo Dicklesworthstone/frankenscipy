@@ -1,0 +1,152 @@
+### frankenscipy-ll0kk EIGH vs LIVE scipy after the dsymv SIMD work
+2026-08-24T04:00:06-04:00
+host=thinkstation1 governor=powersave
+loadavg_before=14.67 20.60 30.56 12/8838 2337885
+elf=efca72a95e49a6f78f59ee3a33209344179a59ace8d6215a5624ee0be55816f0
+code: 9d0f72fc6 + 566c208a6 (SIMD native eigh dsymv tail), never measured vs live scipy
+NOTE: prior ll0kk rows were on hz2/hetzner2 (n=512 1.8224x, n=768 2.2295x, n=1024 1.8144x); this host is thinkstation1 so those are NOT a paired baseline.
+elf_sha256=efca72a95e49a6f78f59ee3a33209344179a59ace8d6215a5624ee0be55816f0
+elf_path=/data/tmp/claude-1000/-data-projects-frankenscipy/841e235d-401f-444a-8875-dd2922c0b998/scratchpad/tgt/release-perf/perf_eigh_vs_scipy
+host=thinkstation1 governor=powersave avx2=true avx512f=false fma=true affinity=1 nproc=64 loadavg_pre=14.67 20.60 30.56 16/8839 2337891 rounds=9 min_of=2 seed=0x2468ace013579bdf
+n=512 impl=nalgebra READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=1 cpus_allowed=[1] peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=512 impl=nalgebra READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=1 cpus_allowed=[1] peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=512 agreement: worst_rel_diff=1.070e-14 at index 504 scale=1.311734e1 scipy1_vs_scipyN_differing_bits=0
+--- n=512 impl=nalgebra ---
+NULL fsci/fsci   a=  103.844ms b=  104.215ms ratio_p50=0.9964x ci95=[0.9639,1.0541] cv=2.62% rounds=9
+NULL sp1/sp1     a=   36.976ms b=   36.835ms ratio_p50=1.0144x ci95=[1.0030,1.1889] cv=5.40% rounds=9
+NULL nalg/nalg   a=   77.564ms b=   76.383ms ratio_p50=1.0004x ci95=[0.9236,1.0795] cv=4.35% rounds=9
+IMPL nalg/native a=   77.118ms b=  105.492ms ratio_p50=0.7374x ci95=[0.6752,0.7445] cv=3.20% rounds=9
+fsci/scipy1      a=  107.986ms b=   37.114ms ratio_p50=2.9106x ci95=[2.0873,3.1173] cv=12.03% rounds=9
+fsci/scipyN      a=  107.986ms b=   38.481ms ratio_p50=2.8178x ci95=[2.0107,3.0577] cv=11.59% rounds=9
+n=512 impl=nalgebra observed_threads: fsci_peak_tasks=2 scipy1_peak_tasks=2 scipyN_peak_tasks=2
+n=512 impl=nalgebra margins (need >=2.00x): fsci/scipy1=10.12x fsci/scipyN=33.60x IMPL=3.30x DSYMV=NaNx
+n=512 impl=nalgebra IMPL_CERTIFIED=true (margin 3.30x, ci95=[0.6752,0.7445])
+n=512 impl=nalgebra CONTENTION fsci_alone=98.499ms fsci_resident=103.844ms ratio=1.0543x (tolerable <=1.05x) alone_pre=72.267ms alone_post=101.394ms drift=1.4030x
+n=512 impl=nalgebra PLACEMENT fsci_cpus=[cpu1(core1,sibs1,33,4167MHz)] mhz=[4167..4167] spread=1.00x smt_present=true note=arms_unpinned_both_allowed_full_cpuset
+n=512 impl=nalgebra scipyN_REPORTABLE=true (ratio=2.8178x floor=0.10x) oversubscribed=true (peak_tasks=2 cpuset=1)
+loadavg_post=20.10 21.50 30.69 18/8861 2367290
+n=512 impl=nalgebra VERDICT vs scipy1 (1 BLAS thread) = 2.911x SLOWER | vs scipyN (default BLAS) = 2.818x | nulls=FAIL (row void)
+n=512 impl=native READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=1 cpus_allowed=[1] peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=512 impl=native READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=36cd696ba647ea69f93aaaeda228b8bfe517d2dbd06b2181354da74b05fb44d8 n=512 affinity=1 cpus_allowed=[1] peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=512 agreement: worst_rel_diff=7.611e-14 at index 2 scale=1.311734e1 scipy1_vs_scipyN_differing_bits=0
+--- n=512 impl=native ---
+NULL fsci/fsci   a=  104.064ms b=  105.516ms ratio_p50=0.9919x ci95=[0.9695,1.0192] cv=1.58% rounds=9
+NULL sp1/sp1     a=   37.263ms b=   36.553ms ratio_p50=0.9989x ci95=[0.9176,1.0488] cv=3.45% rounds=9
+NULL nalg/nalg   a=   74.923ms b=   76.182ms ratio_p50=0.9877x ci95=[0.9684,1.0105] cv=1.38% rounds=9
+IMPL nalg/native a=   75.687ms b=  106.474ms ratio_p50=0.7156x ci95=[0.6936,0.7625] cv=2.80% rounds=9
+NULL simd/simd   a=  104.661ms b=  105.774ms ratio_p50=0.9951x ci95=[0.9703,1.1264] cv=5.07% rounds=9
+DSYMV scalar/simd a=  112.238ms b=  105.532ms ratio_p50=1.0676x ci95=[1.0378,1.0836] cv=1.26% rounds=9
+fsci/scipy1      a=  104.165ms b=   36.799ms ratio_p50=2.8306x ci95=[2.5322,2.9424] cv=3.82% rounds=9
+fsci/scipyN      a=  104.165ms b=   36.982ms ratio_p50=2.8252x ci95=[2.2456,2.9703] cv=7.21% rounds=9
+n=512 impl=native observed_threads: fsci_peak_tasks=2 scipy1_peak_tasks=2 scipyN_peak_tasks=2
+n=512 impl=native margins (need >=2.00x): fsci/scipy1=22.22x fsci/scipyN=59.88x IMPL=9.01x DSYMV=0.54x
+n=512 impl=native IMPL_CERTIFIED=true (margin 9.01x, ci95=[0.6936,0.7625])
+n=512 impl=native DSYMV_CERTIFIED=false (margin 0.54x, ci95=[1.0378,1.0836])
+n=512 impl=native CONTENTION fsci_alone=100.351ms fsci_resident=104.064ms ratio=1.0370x (tolerable <=1.05x) alone_pre=100.250ms alone_post=100.549ms drift=1.0030x
+n=512 impl=native PLACEMENT fsci_cpus=[cpu1(core1,sibs1,33,4155MHz)] mhz=[4155..4155] spread=1.00x smt_present=true note=arms_unpinned_both_allowed_full_cpuset
+n=512 impl=native scipyN_REPORTABLE=true (ratio=2.8252x floor=0.10x) oversubscribed=true (peak_tasks=2 cpuset=1)
+loadavg_post=18.83 21.04 30.25 16/8795 2387707
+n=512 impl=native VERDICT vs scipy1 (1 BLAS thread) = 2.831x SLOWER | vs scipyN (default BLAS) = 2.825x | nulls=PASS
+n=1024 impl=nalgebra READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=6224bf09e5ddc5e73d9aba8cd15a21f3b381a646e0a63c15ad7cde47c8bfdd0a n=1024 affinity=1 cpus_allowed=[1] peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=1024 impl=nalgebra READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=6224bf09e5ddc5e73d9aba8cd15a21f3b381a646e0a63c15ad7cde47c8bfdd0a n=1024 affinity=1 cpus_allowed=[1] peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=1024 agreement: worst_rel_diff=1.794e-14 at index 6 scale=1.842135e1 scipy1_vs_scipyN_differing_bits=0
+--- n=1024 impl=nalgebra ---
+NULL fsci/fsci   a=  753.573ms b=  762.094ms ratio_p50=0.9899x ci95=[0.9553,1.0092] cv=1.80% rounds=9
+NULL sp1/sp1     a=  231.645ms b=  234.087ms ratio_p50=0.9935x ci95=[0.9582,1.0131] cv=1.81% rounds=9
+NULL nalg/nalg   a=  506.494ms b=  503.104ms ratio_p50=1.0085x ci95=[0.9795,1.0502] cv=2.06% rounds=9
+IMPL nalg/native a=  505.552ms b=  765.581ms ratio_p50=0.6557x ci95=[0.6357,0.6757] cv=1.76% rounds=9
+fsci/scipy1      a=  760.242ms b=  232.689ms ratio_p50=3.2929x ci95=[2.2310,3.3552] cv=10.55% rounds=9
+fsci/scipyN      a=  760.242ms b=  232.593ms ratio_p50=3.2656x ci95=[2.2737,3.4837] cv=10.46% rounds=9
+n=1024 impl=nalgebra observed_threads: fsci_peak_tasks=2 scipy1_peak_tasks=2 scipyN_peak_tasks=2
+n=1024 impl=nalgebra margins (need >=2.00x): fsci/scipy1=51.25x fsci/scipyN=50.64x IMPL=6.86x DSYMV=NaNx
+n=1024 impl=nalgebra IMPL_CERTIFIED=true (margin 6.86x, ci95=[0.6357,0.6757])
+n=1024 impl=nalgebra CONTENTION fsci_alone=719.282ms fsci_resident=753.573ms ratio=1.0477x (tolerable <=1.05x) alone_pre=470.216ms alone_post=732.404ms drift=1.5576x
+n=1024 impl=nalgebra PLACEMENT fsci_cpus=[cpu1(core1,sibs1,33,4288MHz)] mhz=[4288..4288] spread=1.00x smt_present=true note=arms_unpinned_both_allowed_full_cpuset
+n=1024 impl=nalgebra scipyN_REPORTABLE=true (ratio=3.2656x floor=0.10x) oversubscribed=true (peak_tasks=2 cpuset=1)
+loadavg_post=13.47 18.51 28.22 9/8727 2534712
+n=1024 impl=nalgebra VERDICT vs scipy1 (1 BLAS thread) = 3.293x SLOWER | vs scipyN (default BLAS) = 3.266x | nulls=PASS
+n=1024 impl=native READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=6224bf09e5ddc5e73d9aba8cd15a21f3b381a646e0a63c15ad7cde47c8bfdd0a n=1024 affinity=1 cpus_allowed=[1] peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=1024 impl=native READY scipy=1.17.1 numpy=2.4.6 blas=scipy-openblas decomp_module=scipy.linalg._decomp decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361 fixture_sha256=6224bf09e5ddc5e73d9aba8cd15a21f3b381a646e0a63c15ad7cde47c8bfdd0a n=1024 affinity=1 cpus_allowed=[1] peak_tasks=2 thread_names=[('python3.13', 2)] fsci_loaded=False genuine=True
+n=1024 agreement: worst_rel_diff=5.766e-14 at index 1019 scale=1.842135e1 scipy1_vs_scipyN_differing_bits=0
+--- n=1024 impl=native ---
+NULL fsci/fsci   a=  759.189ms b=  761.528ms ratio_p50=0.9969x ci95=[0.9744,1.0112] cv=1.02% rounds=9
+NULL sp1/sp1     a=  230.211ms b=  233.046ms ratio_p50=0.9954x ci95=[0.9475,1.0063] cv=1.89% rounds=9
+NULL nalg/nalg   a=  606.650ms b=  612.237ms ratio_p50=0.9853x ci95=[0.9316,1.0234] cv=2.40% rounds=9
+IMPL nalg/native a=  615.575ms b=  766.583ms ratio_p50=0.7914x ci95=[0.6467,0.8833] cv=7.79% rounds=9
+NULL simd/simd   a=  764.438ms b=  768.328ms ratio_p50=0.9957x ci95=[0.7979,1.0261] cv=6.56% rounds=9
+DSYMV scalar/simd a=  820.175ms b=  759.235ms ratio_p50=1.0747x ci95=[0.6328,1.1015] cv=13.65% rounds=9
+fsci/scipy1      a=  764.066ms b=  231.086ms ratio_p50=3.3166x ci95=[3.2043,3.3382] cv=1.25% rounds=9
+fsci/scipyN      a=  764.066ms b=  231.724ms ratio_p50=3.2973x ci95=[3.2544,3.3439] cv=0.85% rounds=9
+n=1024 impl=native observed_threads: fsci_peak_tasks=2 scipy1_peak_tasks=2 scipyN_peak_tasks=2
+n=1024 impl=native margins (need >=2.00x): fsci/scipy1=44.15x fsci/scipyN=89.60x IMPL=3.05x DSYMV=0.37x
+n=1024 impl=native IMPL_CERTIFIED=true (margin 3.05x, ci95=[0.6467,0.8833])
+n=1024 impl=native DSYMV_CERTIFIED=false (margin 0.37x, ci95=[0.6328,1.1015])
+n=1024 impl=native CONTENTION fsci_alone=739.013ms fsci_resident=759.189ms ratio=1.0273x (tolerable <=1.05x) alone_pre=717.303ms alone_post=750.494ms drift=1.0463x
+n=1024 impl=native PLACEMENT fsci_cpus=[cpu1(core1,sibs1,33,4288MHz)] mhz=[4288..4288] spread=1.00x smt_present=true note=arms_unpinned_both_allowed_full_cpuset
+n=1024 impl=native scipyN_REPORTABLE=true (ratio=3.2973x floor=0.10x) oversubscribed=true (peak_tasks=2 cpuset=1)
+loadavg_post=28.53 19.42 26.38 14/8843 2764732
+n=1024 impl=native VERDICT vs scipy1 (1 BLAS thread) = 3.317x SLOWER | vs scipyN (default BLAS) = 3.297x | nulls=PASS
+loadavg_after=28.53 19.42 26.38 11/8850 2764742
+
+### READING (BlackThrush, 2026-08-24) — the FIRST live row for the dsymv SIMD work
+
+`9d0f72fc6` and `566c208a6` landed the SIMD native eigh dsymv tail and were never measured
+against the live incumbent. This is that measurement, on this host, with the harness's own
+DSYMV A/B and four A/A nulls.
+
+## THE DSYMV LEVER — established at n=512, NOT at n=1024
+
+  DSYMV scalar/simd (higher = SIMD faster), impl=native, nulls PASS:
+
+    n=512    1.0676  ci95 [1.0378, 1.0836]  cv  1.26%   CI EXCLUDES unity -> ~6.8% faster
+    n=1024   1.0747  ci95 [0.6328, 1.1015]  cv 13.65%   CI SPANS unity    -> not established
+
+Same central estimate at both sizes, which is reassuring, but only n=512 separates. At n=1024
+the cv is 13.65% and the interval runs from 0.63 to 1.10, so that size says nothing.
+
+BOTH SIZES REPORT `DSYMV_CERTIFIED=false` (margins 0.54x and 0.37x against a required 2.00x).
+That is the harness's bar — the effect must be at least twice the null width — and a ~7% lever
+cannot clear it however real it is. So: a genuine ~6.8% improvement at n=512 by its own CI, and
+NOT a certified win by this harness's standard. Both statements belong on the row; quoting
+either alone would misrepresent it.
+
+## WHERE EIGH ACTUALLY STANDS, on this host
+
+    n=512    2.8306x SLOWER than scipy1  ci95 [2.5322, 2.9424]
+    n=1024   3.3166x SLOWER than scipy1  ci95 [3.2043, 3.3382]
+
+That is far worse than the 1.8224x / 1.8144x this bead banked on hz2/hetzner2. The prior rows
+were taken on a DIFFERENT WORKER and this one is thinkstation1, so these are not a paired
+comparison and neither refutes the other — but it is a sharp reminder that this bead's ratios
+are worker-dependent, which its own ledger already warned about. A ~7% kernel lever is not the
+shape of a fix for a 2.8-3.3x deficit.
+
+## AN INCIDENTAL FINDING ABOUT THE ROUTING THRESHOLD
+
+    IMPL nalg/native   n=512   0.7156  ci95 [0.6936, 0.7625]   IMPL_CERTIFIED=true
+                       n=1024  0.6557  ci95 [0.6357, 0.6757]   IMPL_CERTIFIED=true
+
+Native is FASTER than nalgebra at BOTH sizes here, decisively and with certified margins. On
+hz2 the n=512 ordering was the other way and then flipped between two runs of the same ELF,
+which is why the crossover claim was withdrawn. On this host there is no ambiguity at these two
+sizes, and `PUBLIC_NATIVE_EIGH_MIN_DIM = 512` routes to the faster path. Recorded as a data
+point, NOT as a reason to move the constant: one host does not settle what two runs on another
+host could not.
+
+## HYGIENE
+
+`n=512 impl=nalgebra` printed `nulls=FAIL (row void)` and is excluded from every figure above.
+The harness voided it itself; I am not quoting it.
+
+Agreement checked before timing at every cell: worst_rel_diff 1.070e-14 to 7.611e-14,
+`scipy1_vs_scipyN_differing_bits=0`.
+
+## PROVENANCE
+
+host=thinkstation1, governor=powersave, taskset -c 1, rounds=9 min_of=2,
+perf_eigh_vs_scipy ELF efca72a95e49a6f78f59ee3a33209344179a59ace8d6215a5624ee0be55816f0,
+scipy 1.17.1 / numpy 2.4.6, blas=scipy-openblas,
+decomp_sha256=3c3d1688a87b606757306eb5ed81c8e45e0b6d286792031d4ffaa8b56a773361,
+fixture_sha256=6224bf09e5ddc5e73d9aba8cd15a21f3b381a646e0a63c15ad7cde47c8bfdd0a,
+loadavg 15.37 before / 28.53 after. build_slot REFUSED server-side (frankenscipy-fr78g);
+build_route=local-wrapper-bypass; private target dir (frankenscipy-y9bzw). No rch worker.
