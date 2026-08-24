@@ -11378,12 +11378,45 @@ fn binary_dilation_with_structure_once(
     }
 
     let mut output = NdArray::zeros(input.shape.clone());
+    let foreground = input.data.iter().filter(|&&value| value != 0.0).count();
+    // The existing scatter is excellent for sparse masks: it visits only foreground
+    // sources and writes each reachable destination once (idempotently). For dense
+    // masks it instead repeats nearly the whole footprint for every source. Evaluate
+    // each output independently in that case: most pixels find a foreground neighbor
+    // at the first few active footprint positions, and disjoint output writes can run
+    // in parallel. The output test is exactly the inverse of the scatter relation:
+    // scatter writes `source + offset`, so an output probes `output - offset`.
+    let dense_input = foreground.saturating_mul(4) >= input.size().saturating_mul(3);
+    let full_mode = NDIMAGE_UNRAVEL_ODOMETER_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
+    if !full_mode && dense_input && offsets.len() > 1 {
+        let shape = &input.shape;
+        let strides = &input.strides;
+        fill_pixels_parallel_indexed(&mut output, offsets.len(), |_flat, out_idx| {
+            for offset in &offsets {
+                let mut in_bounds = true;
+                let mut input_flat = 0usize;
+                for axis in 0..out_idx.len() {
+                    let coord = out_idx[axis] as i64 - offset[axis];
+                    if coord < 0 || coord >= shape[axis] as i64 {
+                        in_bounds = false;
+                        break;
+                    }
+                    input_flat += coord as usize * strides[axis];
+                }
+                if in_bounds && input.data[input_flat] != 0.0 {
+                    return 1.0;
+                }
+            }
+            0.0
+        });
+        return Ok(output);
+    }
+
     // Row-major odometer for the source multi-index (was `input.unravel(flat)`, a `Vec` heap-alloc
     // per FOREGROUND element) plus a direct output flat-index (was a fresh `out_idx` `Vec` per
     // (element, offset)). Dilation writes 1.0 idempotently, so cell-write order is irrelevant.
     // BYTE-IDENTICAL: `idx` = `unravel(flat)`; `out_flat = Σ (idx+offset)·strides` = exactly what
     // `output.set(&out_idx, 1.0)` computes, so the same cells become 1.0.
-    let full_mode = NDIMAGE_UNRAVEL_ODOMETER_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
     let ndim = input.ndim();
     let mut idx = vec![0usize; ndim];
     for flat in 0..input.size() {
@@ -21548,6 +21581,43 @@ mod tests {
                 .data,
             expected_dilation
         );
+
+        // A dense fixture takes the output-centric path. Values were obtained
+        // from scipy.ndimage.binary_dilation with the same asymmetric footprint.
+        #[rustfmt::skip]
+        let dense_input = NdArray::new(vec![
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 0.0,
+            1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0,
+        ], vec![8, 9]).unwrap();
+        #[rustfmt::skip]
+        let dense_structure = NdArray::new(vec![
+            1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 1.0,
+        ], vec![3, 5]).unwrap();
+        #[rustfmt::skip]
+        let expected_dense_dilation = vec![
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+            0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0,
+            0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        ];
+        assert_eq!(
+            binary_dilation_with_structure(&dense_input, &dense_structure, 1)
+                .unwrap()
+                .data,
+            expected_dense_dilation
+        );
     }
 
     #[test]
@@ -22780,6 +22850,53 @@ mod tests {
                         a.to_bits(),
                         b.to_bits(),
                         "binary_dilation {shape:?} iters={iters}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn binary_dilation_dense_arbitrary_structure_matches_scatter_bits() {
+        use std::sync::atomic::Ordering;
+        // Dense masks take the output-centric short-circuit path, while the
+        // full-mode arm retains the original foreground-scatter implementation.
+        // Cover odd/even footprints and dimensions because the footprint center
+        // is part of the scatter/output coordinate inversion.
+        let cases: &[(Vec<usize>, Vec<usize>)] = &[
+            (vec![37], vec![4]),
+            (vec![11, 13], vec![3, 4]),
+            (vec![5, 6, 4], vec![3, 2, 3]),
+        ];
+        for (shape, structure_shape) in cases {
+            let total: usize = shape.iter().product();
+            let input = NdArray::new(
+                (0..total)
+                    .map(|flat| ((flat * 11 + 5) % 7 != 0) as u8 as f64)
+                    .collect(),
+                shape.clone(),
+            )
+            .unwrap();
+            let structure_total: usize = structure_shape.iter().product();
+            let structure = NdArray::new(
+                (0..structure_total)
+                    .map(|flat| ((flat * 3 + 1) % 5 != 0) as u8 as f64)
+                    .collect(),
+                structure_shape.clone(),
+            )
+            .unwrap();
+            for iterations in [1usize, 2] {
+                NDIMAGE_UNRAVEL_ODOMETER_DISABLE.store(true, Ordering::Relaxed);
+                let scatter =
+                    binary_dilation_with_structure(&input, &structure, iterations).unwrap();
+                NDIMAGE_UNRAVEL_ODOMETER_DISABLE.store(false, Ordering::Relaxed);
+                let output_centric =
+                    binary_dilation_with_structure(&input, &structure, iterations).unwrap();
+                for (scatter_value, output_value) in scatter.data.iter().zip(&output_centric.data) {
+                    assert_eq!(
+                        scatter_value.to_bits(),
+                        output_value.to_bits(),
+                        "shape={shape:?} structure={structure_shape:?} iterations={iterations}"
                     );
                 }
             }
