@@ -349,6 +349,268 @@ where
     ))
 }
 
+/// Why a [`find_minimum`] search stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindMinimumStatus {
+    /// A minimum was bracketed to within the tolerances.
+    Converged,
+    /// The three points do not bracket a minimum — the middle one is not the lowest.
+    BracketError,
+    /// `maxiter` was exhausted.
+    MaxIterations,
+    /// A non-finite abscissa or function value was encountered.
+    NonFinite,
+}
+
+/// Outcome of a [`find_minimum`] search.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FindMinimumResult {
+    /// The best estimate of the minimizer — the middle point of the final trio.
+    ///
+    /// NaN for [`FindMinimumStatus::BracketError`] and [`FindMinimumStatus::NonFinite`]. NOT
+    /// NaN for [`FindMinimumStatus::MaxIterations`], where the iterate is still usable.
+    pub x: f64,
+    /// `f` at [`Self::x`], NaN under the same two conditions.
+    pub f_x: f64,
+    /// The final trio `(xl, xm, xr)`, with the outer two ordered so `xl <= xr`.
+    pub bracket: (f64, f64, f64),
+    /// `f` at each point of [`Self::bracket`], in the same order.
+    pub f_bracket: (f64, f64, f64),
+    /// Iterations performed.
+    pub nit: usize,
+    /// Function evaluations performed, including the three initial ones.
+    pub nfev: usize,
+    /// Why the search stopped.
+    pub status: FindMinimumStatus,
+    /// Whether a minimum was bracketed.
+    pub success: bool,
+}
+
+/// Options for [`find_minimum`], defaulting to SciPy's.
+///
+/// Note that the defaults are NOT the same as [`FindRootOptions`]': `xrtol` here defaults to
+/// `sqrt(f64::EPSILON)`, roughly `1.49e-8`, because a minimum can only be located to about
+/// half the working precision — the function is flat there, so the abscissa is far less
+/// determined than the value.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct FindMinimumOptions {
+    /// Absolute tolerance on the bracket width. `None` means `f64::MIN_POSITIVE`.
+    pub xatol: Option<f64>,
+    /// Relative tolerance on the bracket width. `None` means `sqrt(f64::EPSILON)`.
+    pub xrtol: Option<f64>,
+    /// Absolute tolerance on the function value. `None` means `f64::MIN_POSITIVE`.
+    pub fatol: Option<f64>,
+    /// Relative tolerance on the function value. `None` means `f64::MIN_POSITIVE`.
+    pub frtol: Option<f64>,
+    /// Maximum iterations. `None` means 100.
+    pub maxiter: Option<usize>,
+}
+
+/// The three-point state the minimizer carries between iterations.
+#[derive(Debug, Clone, Copy)]
+struct Trio {
+    x1: f64,
+    f1: f64,
+    x2: f64,
+    f2: f64,
+    x3: f64,
+    f3: f64,
+}
+
+/// Find a local minimum of `f` bracketed by three points, by Chandrupatla's minimization
+/// method.
+///
+/// The trio may be given in any order; it is sorted on entry. Each iteration fits a parabola
+/// through the three points and takes its vertex when that is trustworthy — Chandrupatla's
+/// condition (7), `|q1 - q0| < |x2 - x1| / 2`, comparing this iteration's vertex against the
+/// PREVIOUS one rather than against the current points — and otherwise falls back to golden
+/// sectioning of the larger interval.
+///
+/// Returns `success: false` with a [`FindMinimumStatus`] for outcomes that are answers about
+/// the problem, reserving `Err` for arguments the search cannot start from.
+///
+/// # Errors
+///
+/// Returns [`OptError::InvalidArgument`] if any of the three abscissae is not finite, or if a
+/// supplied tolerance is negative or not finite.
+pub fn find_minimum<F>(
+    f: F,
+    init: (f64, f64, f64),
+    options: FindMinimumOptions,
+) -> Result<FindMinimumResult, OptError>
+where
+    F: Fn(f64) -> f64,
+{
+    let (xa, xb, xc) = init;
+    if !xa.is_finite() || !xb.is_finite() || !xc.is_finite() {
+        return Err(OptError::InvalidArgument {
+            detail: format!("find_minimum requires a finite trio, got ({xa}, {xb}, {xc})"),
+        });
+    }
+
+    let xatol = options.xatol.unwrap_or(f64::MIN_POSITIVE);
+    let xrtol = options.xrtol.unwrap_or_else(|| f64::EPSILON.sqrt());
+    let fatol = options.fatol.unwrap_or(f64::MIN_POSITIVE);
+    let frtol = options.frtol.unwrap_or(f64::MIN_POSITIVE);
+    for (name, value) in [
+        ("xatol", xatol),
+        ("xrtol", xrtol),
+        ("fatol", fatol),
+        ("frtol", frtol),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(OptError::InvalidArgument {
+                detail: format!("find_minimum requires a finite, non-negative {name}, got {value}"),
+            });
+        }
+    }
+    let maxiter = options.maxiter.unwrap_or(100);
+
+    // Computed rather than written as a literal, so it is bit-identical to the incumbent's
+    // `0.5 + 0.5*5**0.5` however that rounds.
+    let phi = 0.5 + 0.5 * 5.0_f64.sqrt();
+
+    // Sampled in the order given, THEN sorted by abscissa — so the schedule's first three
+    // points follow the caller's argument order even when the trio arrives unsorted.
+    let mut points = [(xa, f(xa)), (xb, f(xb)), (xc, f(xc))];
+    let mut nfev = 3usize;
+    points.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("abscissae are finite"));
+    let mut trio = Trio {
+        x1: points[0].0,
+        f1: points[0].1,
+        x2: points[1].0,
+        f2: points[1].1,
+        x3: points[2].0,
+        f3: points[2].1,
+    };
+    // "At the start, q0 is set at x3" — condition (7) compares against the PREVIOUS vertex, so
+    // it needs a value before any vertex has been computed.
+    let mut q0 = trio.x3;
+    let mut xtol = 0.0;
+
+    // Mutates `t` the way SciPy's `check_termination` mutates `work`: it erases the middle
+    // point on failure, reorders so `(x2, x3)` is the larger interval, and publishes `xtol`.
+    let check = |t: &mut Trio, xtol: &mut f64| -> Option<FindMinimumStatus> {
+        if t.f2 > t.f1 || t.f2 > t.f3 {
+            t.x2 = f64::NAN;
+            t.f2 = f64::NAN;
+            return Some(FindMinimumStatus::BracketError);
+        }
+        // SciPy tests finiteness by summing all six values — one NaN or infinity anywhere
+        // poisons the sum. Reproduced as a sum rather than six separate checks so that the
+        // same overflow-to-infinity edge cases classify identically.
+        if !(t.x1 + t.x2 + t.x3 + t.f1 + t.f2 + t.f3).is_finite() {
+            t.x2 = f64::NAN;
+            t.f2 = f64::NAN;
+            return Some(FindMinimumStatus::NonFinite);
+        }
+        // "Points 1 and 3 are interchanged if necessary to make (x2, x3) the larger interval."
+        if (t.x3 - t.x2).abs() < (t.x2 - t.x1).abs() {
+            std::mem::swap(&mut t.x1, &mut t.x3);
+            std::mem::swap(&mut t.f1, &mut t.f3);
+        }
+        *xtol = t.x2.abs() * xrtol + xatol;
+        // Equation (9), with equality allowed so that `xtol = 0` can still terminate.
+        let width_converged = (t.x3 - t.x2).abs() <= 2.0 * *xtol;
+        // Equation (11). The doubled `ftol` is not in the paper's text but is in its BASIC
+        // listing, and the incumbent follows the listing.
+        let ftol = t.f2.abs() * frtol + fatol;
+        let curvature_converged = (t.f1 - 2.0 * t.f2 + t.f3) <= 2.0 * ftol;
+        if width_converged || curvature_converged {
+            Some(FindMinimumStatus::Converged)
+        } else {
+            None
+        }
+    };
+
+    let finish = |t: &Trio, status: FindMinimumStatus, nit, nfev| {
+        // Report the OUTER two ascending; the middle point stays the middle point.
+        let (bracket, f_bracket) = if t.x1 >= t.x3 {
+            ((t.x3, t.x2, t.x1), (t.f3, t.f2, t.f1))
+        } else {
+            ((t.x1, t.x2, t.x3), (t.f1, t.f2, t.f3))
+        };
+        FindMinimumResult {
+            // `x2` has already been set to NaN by `check` for the two failing conditions, so
+            // no second decision is needed here.
+            x: t.x2,
+            f_x: t.f2,
+            bracket,
+            f_bracket,
+            nit,
+            nfev,
+            status,
+            success: matches!(status, FindMinimumStatus::Converged),
+        }
+    };
+
+    if let Some(status) = check(&mut trio, &mut xtol) {
+        return Ok(finish(&trio, status, 0, nfev));
+    }
+
+    for nit in 1..=maxiter {
+        // Section 2 (5)/(6): the vertex of the parabola through the three points.
+        let x21 = trio.x2 - trio.x1;
+        let x32 = trio.x3 - trio.x2;
+        let a = x21 * (trio.f3 - trio.f2);
+        let b = x32 * (trio.f1 - trio.f2);
+        let c = a / (a + b);
+        let q1 = 0.5 * (c * (trio.x1 - trio.x3) + trio.x2 + trio.x3);
+
+        let x = if (q1 - q0).abs() < 0.5 * x21.abs() {
+            // Condition (7) holds, so the vertex is trusted — unless it lands within `xtol` of
+            // the middle point, where accepting it would stop the bracket shrinking. In that
+            // case step `xtol` INTO the larger interval instead.
+            if (q1 - trio.x2).abs() <= xtol {
+                trio.x2 + numpy_sign(x32) * xtol
+            } else {
+                q1
+            }
+        } else {
+            // Golden sectioning of the larger interval.
+            trio.x2 + (2.0 - phi) * x32
+        };
+        // `q0` follows the vertex even on an iteration that golden-sectioned: condition (7) is
+        // about whether successive VERTEX estimates are settling, not about the step taken.
+        q0 = q1;
+
+        let fx = f(x);
+        nfev += 1;
+
+        // Fold the new point into the trio, keeping the middle point the lowest.
+        if numpy_sign(x - trio.x2) == numpy_sign(x32) {
+            if fx > trio.f2 {
+                trio.x3 = x;
+                trio.f3 = fx;
+            } else {
+                trio.x1 = trio.x2;
+                trio.f1 = trio.f2;
+                trio.x2 = x;
+                trio.f2 = fx;
+            }
+        } else if fx > trio.f2 {
+            trio.x1 = x;
+            trio.f1 = fx;
+        } else {
+            trio.x3 = trio.x2;
+            trio.f3 = trio.f2;
+            trio.x2 = x;
+            trio.f2 = fx;
+        }
+
+        if let Some(status) = check(&mut trio, &mut xtol) {
+            return Ok(finish(&trio, status, nit, nfev));
+        }
+    }
+
+    Ok(finish(
+        &trio,
+        FindMinimumStatus::MaxIterations,
+        maxiter,
+        nfev,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +815,144 @@ mod tests {
                 (-1.0, 1.0),
                 FindRootOptions {
                     frtol: Some(f64::NAN),
+                    ..opts
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn find_minimum_matches_live_scipy_on_a_parabola() {
+        // Live `elementwise.find_minimum(lambda x: (x - 2)**2, (0.0, 1.0, 5.0))` on scipy
+        // 1.17.1 returns x = 2.0, f_x = 0.0, nit = 4, nfev = 7, and its FIRST step is the
+        // golden section 2.52786404500042 — not the parabola vertex, which is exactly 2.0 and
+        // would have solved it in one. Condition (7) rejects that vertex because it is
+        // compared against the PREVIOUS vertex estimate `q0` (initialised to x3 = 5), and
+        // |2 - 5| is not less than |x2 - x1| / 2. Getting `q0` wrong would land on 2.0 here
+        // and look like a better implementation while being a different algorithm.
+        let visited = std::cell::RefCell::new(Vec::new());
+        let result = find_minimum(
+            traced(|x| (x - 2.0) * (x - 2.0), &visited),
+            (0.0, 1.0, 5.0),
+            FindMinimumOptions::default(),
+        )
+        .expect("minimum search succeeds");
+
+        assert!(result.success);
+        assert_eq!(result.status, FindMinimumStatus::Converged);
+        assert_eq!(result.x, 2.0);
+        assert_eq!(result.f_x, 0.0);
+        assert_eq!(result.nit, 4);
+        assert_eq!(result.nfev, 7);
+
+        let seen = visited.borrow();
+        assert_eq!(seen.len(), 7);
+        assert_eq!(&seen[..3], &[0.0, 1.0, 5.0]);
+        assert_eq!(
+            seen[3], 2.527_864_045_000_420_4,
+            "the first step golden-sections; the vertex is not yet trusted"
+        );
+        // And the step AFTER it takes the vertex, now that condition (7) is satisfied — which
+        // is where the method stops looking like plain golden-section search.
+        assert_eq!(seen[4], 2.0);
+    }
+
+    #[test]
+    fn find_minimum_sorts_a_trio_given_in_any_order() {
+        // Live scipy on (5.0, 1.0, 0.0) reaches the same answer in the same 4 iterations.
+        let visited = std::cell::RefCell::new(Vec::new());
+        let result = find_minimum(
+            traced(|x| (x - 2.0) * (x - 2.0), &visited),
+            (5.0, 1.0, 0.0),
+            FindMinimumOptions::default(),
+        )
+        .expect("minimum search succeeds");
+
+        assert!(result.success);
+        assert_eq!(result.x, 2.0);
+        assert_eq!(result.nit, 4);
+        assert_eq!(result.nfev, 7);
+        assert_eq!(
+            &visited.borrow()[..3],
+            &[5.0, 1.0, 0.0],
+            "the initial three are sampled in the order GIVEN, and sorted afterwards"
+        );
+        let (xl, _, xr) = result.bracket;
+        assert!(xl <= xr, "the outer two are reported ascending");
+    }
+
+    #[test]
+    fn find_minimum_rejects_a_trio_whose_middle_is_not_the_lowest() {
+        // Live scipy: x=nan, nit=0, nfev=3, status=-1. A monotone function has no interior
+        // minimum, and inventing one would be worse than saying so.
+        let result = find_minimum(|x| x, (0.0, 1.0, 5.0), FindMinimumOptions::default())
+            .expect("a trio that does not bracket is an answer, not an error");
+        assert!(!result.success);
+        assert_eq!(result.status, FindMinimumStatus::BracketError);
+        assert!(result.x.is_nan());
+        assert!(result.f_x.is_nan());
+        assert_eq!(result.nit, 0);
+        assert_eq!(result.nfev, 3);
+        // The outer points it was given are still reported.
+        assert_eq!(result.bracket.0, 0.0);
+        assert_eq!(result.bracket.2, 5.0);
+    }
+
+    #[test]
+    fn find_minimum_keeps_its_iterate_when_the_budget_runs_out() {
+        // Live scipy with maxiter=2: x=2.0, nit=2, nfev=5, status=-2, success=False. As with
+        // find_root, a spent budget does not erase the iterate — only a bad bracket or a
+        // non-finite value does.
+        let result = find_minimum(
+            |x| (x - 2.0) * (x - 2.0),
+            (0.0, 1.0, 5.0),
+            FindMinimumOptions {
+                maxiter: Some(2),
+                ..FindMinimumOptions::default()
+            },
+        )
+        .expect("minimum search succeeds");
+        assert!(!result.success);
+        assert_eq!(result.status, FindMinimumStatus::MaxIterations);
+        assert_eq!(result.nit, 2);
+        assert_eq!(result.nfev, 5);
+        assert_eq!(result.x, 2.0, "the best estimate survives a spent budget");
+        assert!(result.f_x.is_finite());
+    }
+
+    #[test]
+    fn find_minimum_locates_an_asymmetric_minimum() {
+        // A quartic whose minimum is nowhere near the middle of the initial trio.
+        let result = find_minimum(
+            |x| (x - 0.75) * (x - 0.75) * (x - 0.75) * (x - 0.75) + 0.5,
+            (-3.0, 0.0, 10.0),
+            FindMinimumOptions::default(),
+        )
+        .expect("minimum search succeeds");
+        assert!(result.success, "status {:?}", result.status);
+        // A quartic is flat at its minimum, so the abscissa is only determined to about the
+        // square root of the working precision — which is why xrtol defaults as it does.
+        assert!((result.x - 0.75).abs() < 1e-3, "got {}", result.x);
+        let (xl, xm, xr) = result.bracket;
+        assert!(
+            xl <= xm && xm <= xr,
+            "bracket out of order: {:?}",
+            result.bracket
+        );
+    }
+
+    #[test]
+    fn find_minimum_rejects_inputs_it_cannot_start_from() {
+        let opts = FindMinimumOptions::default();
+        assert!(find_minimum(|x| x * x, (f64::NAN, 0.0, 1.0), opts).is_err());
+        assert!(find_minimum(|x| x * x, (-1.0, 0.0, f64::INFINITY), opts).is_err());
+        assert!(
+            find_minimum(
+                |x| x * x,
+                (-1.0, 0.0, 1.0),
+                FindMinimumOptions {
+                    xrtol: Some(-1.0),
                     ..opts
                 }
             )
