@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
-use fsci_fft::{Complex64, FftOptions, fft, rfft};
+use fsci_fft::{Complex64, FftOptions, WorkerPolicy, fft, rfft};
 
 const SIZES: &[usize] = &[
     1 << 16,
@@ -164,6 +164,10 @@ fn checksum(values: &[Complex64]) -> u64 {
     })
 }
 
+fn extend_digest(digest: u64, next: u64) -> u64 {
+    digest.rotate_left(7) ^ next
+}
+
 fn repeats_for(n: usize) -> usize {
     match n {
         0..=262_144 => 6,
@@ -176,6 +180,18 @@ fn median(mut values: Vec<f64>) -> f64 {
     assert!(!values.is_empty(), "median needs observations");
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
+}
+
+fn options_from_environment() -> FftOptions {
+    let options = FftOptions::default();
+    let Ok(value) = std::env::var("FSCI_FFT_WORKERS") else {
+        return options;
+    };
+    let workers: usize = value
+        .parse()
+        .expect("FSCI_FFT_WORKERS must be a positive integer");
+    assert!(workers > 0, "FSCI_FFT_WORKERS must be positive");
+    options.with_workers(WorkerPolicy::Exact(workers))
 }
 
 fn executable_sha256() -> String {
@@ -223,7 +239,7 @@ fn time_fsci(
                 .all(|&(real, imag)| real.is_finite() && imag.is_finite()),
             "{mode} emitted a non-finite value"
         );
-        digest = digest.rotate_left(7) ^ checksum(&values);
+        digest = extend_digest(digest, checksum(&values));
         black_box(values);
     }
     (start.elapsed().as_secs_f64() * 1e3 / repeats as f64, digest)
@@ -231,10 +247,11 @@ fn time_fsci(
 
 fn main() {
     let mut scipy = ScipyServer::start();
-    let options = FftOptions::default();
+    let options = options_from_environment();
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     println!(
-        "METADATA harness=fft-whole-job-aa-bbaa rounds={ROUNDS} rust_threads={threads} elf_sha256={} {}",
+        "METADATA harness=fft-whole-job-aa-bbaa rounds={ROUNDS} rust_threads={threads} configured_workers={:?} elf_sha256={} {}",
+        options.workers,
         executable_sha256(),
         scipy.version_line
     );
@@ -262,8 +279,10 @@ fn main() {
                 fsci_second.push(second_fsci_ms);
                 scipy_first.push(first_scipy_ms);
                 scipy_second.push(second_scipy_ms);
-                fsci_digest ^= first_fsci_digest ^ second_fsci_digest;
-                scipy_digest ^= first_scipy_digest ^ second_scipy_digest;
+                fsci_digest = extend_digest(fsci_digest, first_fsci_digest);
+                fsci_digest = extend_digest(fsci_digest, second_fsci_digest);
+                scipy_digest = extend_digest(scipy_digest, first_scipy_digest);
+                scipy_digest = extend_digest(scipy_digest, second_scipy_digest);
             }
 
             let fsci_first_median = median(fsci_first);
@@ -284,7 +303,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{checksum, complex_input, median, real_input, repeats_for};
+    use super::{checksum, complex_input, extend_digest, median, real_input, repeats_for};
 
     #[test]
     fn deterministic_inputs_and_digest_are_stable() {
@@ -293,6 +312,11 @@ mod tests {
         assert_eq!(real, real_input(16));
         assert_eq!(complex, complex_input(16));
         assert_eq!(checksum(&complex), checksum(&complex_input(16)));
+        assert_ne!(
+            extend_digest(1, 1),
+            0,
+            "digest extension must not XOR-cancel"
+        );
     }
 
     #[test]
