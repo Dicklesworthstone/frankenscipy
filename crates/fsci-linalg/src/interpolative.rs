@@ -241,6 +241,177 @@ pub fn id_to_svd(b: &[Vec<f64>], idx: &[usize], proj: &[Vec<f64>]) -> Result<IdS
     })
 }
 
+/// SciPy's default number of power iterations for the spectral-norm estimators.
+pub const DEFAULT_SPECTRAL_NORM_ITERATIONS: usize = 20;
+
+/// A deterministic starting vector with no component that is exactly zero.
+///
+/// SciPy draws this at random. A power iteration converges to the same answer from ANY start
+/// that is not orthogonal to the leading right singular vector, so a fixed start gives a
+/// reproducible estimate instead of one that varies run to run — strictly better for a library,
+/// and it costs nothing, because the failure mode both choices share (a start orthogonal to the
+/// leading singular vector) is measure-zero either way.
+///
+/// `sin(i + 1)` is used because it is never exactly zero for an integer argument and carries no
+/// structure that could align with a test matrix built from a regular formula.
+fn power_iteration_start(n: usize) -> Vec<f64> {
+    (0..n).map(|i| ((i + 1) as f64).sin()).collect()
+}
+
+fn scaled_in_place(v: &mut [f64], factor: f64) {
+    for entry in v {
+        *entry *= factor;
+    }
+}
+
+fn euclidean_norm(v: &[f64]) -> f64 {
+    v.iter().map(|x| x * x).sum::<f64>().sqrt()
+}
+
+/// Estimate the largest singular value of an operator given its forward and adjoint actions.
+///
+/// This is the power method applied to `AᵀA`: each sweep maps `x → Aᵀ(A x)`, whose norm tends
+/// to `σ₁²` as `x` aligns with the leading right singular vector. Hence the square root.
+///
+/// The estimate is always a LOWER bound on `σ₁` (a Rayleigh-quotient-style estimate cannot
+/// exceed the largest eigenvalue), and it approaches it like `(σ₂/σ₁)^(2·its)` — so accuracy is
+/// governed by the spectral GAP, not by the iteration count alone. That is why the differential
+/// test tolerances are derived from each case's gap rather than fixed.
+fn power_method_norm<Forward, Adjoint>(
+    forward: Forward,
+    adjoint: Adjoint,
+    n: usize,
+    its: usize,
+) -> f64
+where
+    Forward: Fn(&[f64]) -> Vec<f64>,
+    Adjoint: Fn(&[f64]) -> Vec<f64>,
+{
+    if n == 0 {
+        return 0.0;
+    }
+    let mut x = power_iteration_start(n);
+    let start_norm = euclidean_norm(&x);
+    if start_norm == 0.0 {
+        return 0.0;
+    }
+    scaled_in_place(&mut x, 1.0 / start_norm);
+
+    let mut estimate = 0.0;
+    for _ in 0..its {
+        let y = forward(&x);
+        let mut next = adjoint(&y);
+        let magnitude = euclidean_norm(&next);
+        if magnitude == 0.0 {
+            // The operator annihilates the current iterate; for a zero operator that is the
+            // right answer, and for any other it means we started in the null space, which the
+            // deterministic start makes reproducible rather than sporadic.
+            return 0.0;
+        }
+        // `x` is a unit vector here, so ‖AᵀA x‖ estimates σ₁².
+        estimate = magnitude.sqrt();
+        scaled_in_place(&mut next, 1.0 / magnitude);
+        x = next;
+    }
+    estimate
+}
+
+fn matvec(a: &[Vec<f64>], x: &[f64]) -> Vec<f64> {
+    a.iter()
+        .map(|row| row.iter().zip(x).map(|(v, xi)| v * xi).sum())
+        .collect()
+}
+
+fn transpose_matvec(a: &[Vec<f64>], n: usize, y: &[f64]) -> Vec<f64> {
+    let mut out = vec![0.0; n];
+    for (row, &scale) in a.iter().zip(y) {
+        if scale == 0.0 {
+            continue;
+        }
+        for (entry, &value) in out.iter_mut().zip(row.iter()) {
+            *entry += scale * value;
+        }
+    }
+    out
+}
+
+/// Estimate the spectral norm (largest singular value) of `a` by power iteration.
+///
+/// Pass [`DEFAULT_SPECTRAL_NORM_ITERATIONS`] for SciPy's default of 20 sweeps.
+///
+/// The result is a lower bound on the true norm and converges to it at a rate set by the
+/// spectral gap: on a matrix whose second singular value is well below the first this is exact
+/// to machine precision, while on one with a near-degenerate leading pair it is correspondingly
+/// looser. That is a property of the method, shared with the incumbent, not a limitation of
+/// this implementation.
+///
+/// # Errors
+///
+/// Returns [`LinalgError::RaggedMatrix`] if the rows differ in length, or
+/// [`LinalgError::NonFiniteInput`] if any entry is not finite — a NaN would propagate through
+/// the iteration and turn the estimate into NaN with no indication of where it came from.
+pub fn estimate_spectral_norm(a: &[Vec<f64>], its: usize) -> Result<f64, LinalgError> {
+    let (_, n) = matrix_shape(a)?;
+    if a.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(LinalgError::NonFiniteInput);
+    }
+    Ok(power_method_norm(
+        |x| matvec(a, x),
+        |y| transpose_matvec(a, n, y),
+        n,
+        its,
+    ))
+}
+
+/// Estimate the spectral norm of the DIFFERENCE `a - b`, without forming it.
+///
+/// The difference is applied one matrix-vector product at a time, which is what makes this
+/// worth having as its own function rather than as `estimate_spectral_norm(&(a - b))`: for the
+/// large operators these estimators exist for, materialising the difference is the expensive
+/// part.
+///
+/// # Errors
+///
+/// As [`estimate_spectral_norm`], plus [`LinalgError::InvalidArgument`] if the two matrices do
+/// not have the same shape.
+pub fn estimate_spectral_norm_diff(
+    a: &[Vec<f64>],
+    b: &[Vec<f64>],
+    its: usize,
+) -> Result<f64, LinalgError> {
+    let (a_rows, a_cols) = matrix_shape(a)?;
+    let (b_rows, b_cols) = matrix_shape(b)?;
+    if a_rows != b_rows || a_cols != b_cols {
+        return Err(LinalgError::InvalidArgument {
+            detail: format!(
+                "interpolative: estimate_spectral_norm_diff needs matching shapes, \
+                 got {a_rows}×{a_cols} and {b_rows}×{b_cols}"
+            ),
+        });
+    }
+    if a.iter()
+        .flatten()
+        .chain(b.iter().flatten())
+        .any(|v| !v.is_finite())
+    {
+        return Err(LinalgError::NonFiniteInput);
+    }
+    let forward = |x: &[f64]| {
+        let ax = matvec(a, x);
+        let bx = matvec(b, x);
+        ax.iter().zip(&bx).map(|(p, q)| p - q).collect::<Vec<f64>>()
+    };
+    let adjoint = |y: &[f64]| {
+        let aty = transpose_matvec(a, a_cols, y);
+        let bty = transpose_matvec(b, b_cols, y);
+        aty.iter()
+            .zip(&bty)
+            .map(|(p, q)| p - q)
+            .collect::<Vec<f64>>()
+    };
+    Ok(power_method_norm(forward, adjoint, a_cols, its))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +526,135 @@ mod tests {
         // A rank-2 matrix has two positive singular values, in descending order.
         assert!(result.s[0] >= result.s[1]);
         assert!(result.s[1] > 1e-12, "got {:?}", result.s);
+    }
+
+    /// The true spectral norm, from the SVD, for the estimator tests to be judged against.
+    fn true_spectral_norm(a: &[Vec<f64>]) -> f64 {
+        svd(a, DecompOptions::default()).expect("svd").s[0]
+    }
+
+    fn decay_matrix(m: usize, n: usize) -> Vec<Vec<f64>> {
+        (0..m)
+            .map(|i| {
+                (0..n)
+                    .map(|j| 1.0 / (1.0 + i as f64 + 2.0 * j as f64))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn spectral_norm_is_exact_when_the_leading_singular_value_is_well_separated() {
+        // Live scipy: estimate_spectral_norm on this 8×6 matrix returns 1.44259141439456, and
+        // the true norm is the same to every digit — the gap σ₂/σ₁ is 0.183, so twenty sweeps
+        // leave an error of order 0.183^40, far below rounding.
+        let a = decay_matrix(8, 6);
+        let estimate =
+            estimate_spectral_norm(&a, DEFAULT_SPECTRAL_NORM_ITERATIONS).expect("finite matrix");
+        let truth = true_spectral_norm(&a);
+        assert!(
+            (estimate - truth).abs() / truth < 1e-12,
+            "estimate {estimate}, true {truth}"
+        );
+    }
+
+    #[test]
+    fn spectral_norm_never_exceeds_the_true_norm() {
+        // A sharp invariant of the method, not a tolerance: the power iteration produces a
+        // Rayleigh-quotient-style estimate, which cannot exceed the largest singular value.
+        // A wrong normalisation would show up here even when the value looks plausible.
+        for (m, n) in [(8, 6), (12, 10), (5, 5), (3, 9)] {
+            let a = decay_matrix(m, n);
+            let estimate = estimate_spectral_norm(&a, DEFAULT_SPECTRAL_NORM_ITERATIONS)
+                .expect("finite matrix");
+            let truth = true_spectral_norm(&a);
+            assert!(
+                estimate <= truth * (1.0 + 1e-12),
+                "{m}×{n}: estimate {estimate} exceeds the true norm {truth}"
+            );
+        }
+    }
+
+    #[test]
+    fn spectral_norm_of_a_rank_one_matrix_is_its_only_singular_value() {
+        // σ₂ is exactly zero here, so the answer is analytic: ‖u vᵀ‖₂ = ‖u‖·‖v‖.
+        let u = [1.0, 2.0, 3.0, 4.0];
+        let v = [2.0, -1.0, 0.5];
+        let a: Vec<Vec<f64>> = u
+            .iter()
+            .map(|ui| v.iter().map(|vj| ui * vj).collect())
+            .collect();
+        let expected = euclidean_norm(&u) * euclidean_norm(&v);
+
+        // TWO sweeps, not one. A single sweep estimates σ₁·√|⟨x₀, v₁⟩|, because the estimate is
+        // read off BEFORE the iterate has been normalised into alignment; the first sweep is
+        // what aligns it. Measured: one sweep here is 26% low. From the second it is exact,
+        // since a rank-one operator aligns the iterate perfectly in one step.
+        let one_sweep = estimate_spectral_norm(&a, 1).expect("finite matrix");
+        assert!(
+            (one_sweep - expected).abs() / expected > 1e-3,
+            "one sweep should NOT already be exact; got {one_sweep} against {expected}"
+        );
+        for its in [2, 3, 20] {
+            let estimate = estimate_spectral_norm(&a, its).expect("finite matrix");
+            assert!(
+                (estimate - expected).abs() / expected < 1e-12,
+                "{its} sweeps: estimate {estimate}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn spectral_norm_diff_matches_the_norm_of_the_explicit_difference() {
+        // The whole point of the `_diff` form is not forming `a - b`. It must nonetheless agree
+        // with what forming it would give.
+        let a = decay_matrix(9, 7);
+        let b: Vec<Vec<f64>> = decay_matrix(9, 7)
+            .iter()
+            .map(|row| row.iter().map(|v| v * 0.25).collect())
+            .collect();
+        let explicit: Vec<Vec<f64>> = a
+            .iter()
+            .zip(&b)
+            .map(|(ra, rb)| ra.iter().zip(rb).map(|(p, q)| p - q).collect())
+            .collect();
+
+        let via_diff = estimate_spectral_norm_diff(&a, &b, DEFAULT_SPECTRAL_NORM_ITERATIONS)
+            .expect("matching shapes");
+        let via_explicit = estimate_spectral_norm(&explicit, DEFAULT_SPECTRAL_NORM_ITERATIONS)
+            .expect("finite matrix");
+        assert!(
+            (via_diff - via_explicit).abs() / via_explicit < 1e-12,
+            "diff {via_diff}, explicit {via_explicit}"
+        );
+    }
+
+    #[test]
+    fn spectral_norm_diff_of_a_matrix_with_itself_is_zero() {
+        // The zero operator annihilates every iterate; the estimator must report 0, not NaN
+        // from normalising by a zero magnitude.
+        let a = decay_matrix(6, 5);
+        let estimate = estimate_spectral_norm_diff(&a, &a, DEFAULT_SPECTRAL_NORM_ITERATIONS)
+            .expect("matching shapes");
+        assert_eq!(estimate, 0.0);
+    }
+
+    #[test]
+    fn spectral_norm_estimators_reject_input_they_cannot_use() {
+        let a = decay_matrix(4, 3);
+        let b = decay_matrix(3, 4);
+        assert!(
+            estimate_spectral_norm_diff(&a, &b, 5).is_err(),
+            "shapes must match"
+        );
+        let nan = vec![vec![1.0, f64::NAN], vec![2.0, 3.0]];
+        assert!(
+            estimate_spectral_norm(&nan, 5).is_err(),
+            "a NaN would propagate into the estimate with no trace of its origin"
+        );
+        assert!(estimate_spectral_norm_diff(&nan, &nan, 5).is_err());
+        // Zero iterations is not an error; it simply produces no estimate.
+        assert_eq!(estimate_spectral_norm(&a, 0).expect("valid"), 0.0);
     }
 
     #[test]
