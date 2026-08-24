@@ -5666,13 +5666,12 @@ mod tests {
 
     use super::{
         Complex64, FftError, FftOptions, TransformKind, WorkerPolicy, dct, dct_axis2d, dct_i,
-        dct_iii, dct_iv, idct_i,
-        dctn, dst, dst_ii, dst_iii, dstn, estimate_fft_flops, fft, fft_axis2d,
+        dct_iii, dct_iv, dctn, dst, dst_ii, dst_iii, dstn, estimate_fft_flops, fft, fft_axis2d,
         fft_iter_par_threads, fft_radix4_par_threads, fft_with_audit, fft2, fft2_with_audit, fftn,
-        fwht, get_workers, hfft, hfft2, hfftn, idct, idct_axis2d, idctn, idstn, ifft, ifft2, ifftn,
-        ihfft, ihfft2, ihfftn, install_worker_cap, irfft, irfft_with_audit, irfft2, irfftn,
-        is_fast_len, next_fast_len, prev_fast_len, rfft, rfft_axis2d, rfft_with_audit, rfft2,
-        rfftn, set_workers, sync_audit_ledger, take_transform_traces, worker_policy_cap,
+        fwht, get_workers, hfft, hfft2, hfftn, idct, idct_axis2d, idct_i, idctn, idstn, ifft,
+        ifft2, ifftn, ihfft, ihfft2, ihfftn, install_worker_cap, irfft, irfft_with_audit, irfft2,
+        irfftn, is_fast_len, next_fast_len, prev_fast_len, rfft, rfft_axis2d, rfft_with_audit,
+        rfft2, rfftn, set_workers, sync_audit_ledger, take_transform_traces, worker_policy_cap,
     };
     use super::{
         cooley_tukey_radix2_inplace, cooley_tukey_radix4_inplace_with_twiddles,
@@ -6254,9 +6253,21 @@ mod tests {
         // that rejected N = 1 transform-wide would be worse than the bug.
         // All four measured on scipy 1.17.1 with x = [5.0].
         let defined_at_one: [(&str, Vec<f64>, f64); 4] = [
-            ("dst type 1", dst(&one, 1, &FftOptions::default()).expect("dst_i"), 10.0),
-            ("dct type 2", dct(&one, &FftOptions::default()).expect("dct_ii"), 10.0),
-            ("dct type 3", dct_iii(&one, &FftOptions::default()).expect("dct_iii"), 5.0),
+            (
+                "dst type 1",
+                dst(&one, 1, &FftOptions::default()).expect("dst_i"),
+                10.0,
+            ),
+            (
+                "dct type 2",
+                dct(&one, &FftOptions::default()).expect("dct_ii"),
+                10.0,
+            ),
+            (
+                "dct type 3",
+                dct_iii(&one, &FftOptions::default()).expect("dct_iii"),
+                5.0,
+            ),
             (
                 "dct type 4",
                 dct_iv(&one, &FftOptions::default()).expect("dct_iv"),
