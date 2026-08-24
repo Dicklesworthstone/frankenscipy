@@ -52,6 +52,11 @@ pub enum BoundaryMode {
 }
 
 const DEFAULT_GAUSSIAN_TRUNCATE: f64 = 4.0;
+// A 64-element f64 span is one 512-byte cache tile.  The 3-D separable y pass
+// revisits adjacent source rows, so retaining this span in L1 avoids streaming a
+// complete x row for every output y row.  It is deliberately only used where
+// there are outer slabs; the outermost z pass keeps its full contiguous span.
+const CONVOLVE1D_CACHE_BLOCK: usize = 64;
 
 fn gaussian_kernel_radius(sigma: f64) -> usize {
     (DEFAULT_GAUSSIAN_TRUNCATE * sigma + 0.5) as usize
@@ -2904,35 +2909,77 @@ fn convolve1d_along_axis(
             // For every output line, hoist the boundary lookup out of the contiguous inner
             // span. Each output still accumulates the same k=0..len tap sequence as the
             // scalar N-D convolution, but the inner loop is now a vector-friendly axpy.
-            for a in axis_start as i64..axis_end as i64 {
-                let output_base = (a as usize - axis_start) * inner;
-                for (k, &w) in weights.iter().enumerate() {
-                    let source = a + (klen - 1 - k as i64) - offset + origin;
-                    let output = &mut os[output_base..output_base + inner];
-                    if let Some(source) = boundary_index_1d(source, mid as i64, mode) {
-                        let input_base = source as usize * inner;
-                        for (slot, &value) in
-                            output.iter_mut().zip(&is[input_base..input_base + inner])
-                        {
-                            *slot += w * value;
-                        }
-                    } else {
-                        for slot in output {
-                            *slot += w * cval;
+            // On the 3-D middle (y) pass, walk x in cache tiles so consecutive y outputs
+            // reuse their overlapping source-row spans from L1.  The z pass has outer=1
+            // and deliberately retains its complete contiguous plane span.
+            let block = if outer > 1 && inner >= CONVOLVE1D_CACHE_BLOCK {
+                CONVOLVE1D_CACHE_BLOCK
+            } else {
+                inner
+            };
+            for inner_start in (0..inner).step_by(block) {
+                let inner_end = (inner_start + block).min(inner);
+                for a in axis_start as i64..axis_end as i64 {
+                    let output_base = (a as usize - axis_start) * inner + inner_start;
+                    for (k, &w) in weights.iter().enumerate() {
+                        let source = a + (klen - 1 - k as i64) - offset + origin;
+                        let output = &mut os[output_base..output_base + (inner_end - inner_start)];
+                        if let Some(source) = boundary_index_1d(source, mid as i64, mode) {
+                            let input_base = source as usize * inner + inner_start;
+                            for (slot, &value) in output
+                                .iter_mut()
+                                .zip(&is[input_base..input_base + (inner_end - inner_start)])
+                            {
+                                *slot += w * value;
+                            }
+                        } else {
+                            for slot in output {
+                                *slot += w * cval;
+                            }
                         }
                     }
                 }
             }
         } else {
-            for a in axis_start as i64..axis_end as i64 {
+            // The innermost (x) pass is contiguous.  Keep its boundary pixels on the
+            // original boundary mapper, and accumulate each interior x tile one tap at a
+            // time.  That preserves k=0..len arithmetic for every output while turning the
+            // hot span into cache-friendly contiguous axpy streams.
+            let scalar = |a: usize, os: &mut [f64]| {
                 let mut sum = 0.0;
                 for (k, &w) in weights.iter().enumerate() {
-                    let source = a + (klen - 1 - k as i64) - offset + origin;
+                    let source = a as i64 + (klen - 1 - k as i64) - offset + origin;
                     let value = boundary_index_1d(source, mid as i64, mode)
                         .map_or(cval, |source| is[source as usize]);
                     sum += w * value;
                 }
-                os[a as usize - axis_start] = sum;
+                os[a - axis_start] = sum;
+            };
+            let min_shift = -offset + origin;
+            let max_shift = klen - 1 - offset + origin;
+            let interior_lo = (-min_shift).max(0) as usize;
+            let interior_hi = ((mid as i64) - max_shift).clamp(0, mid as i64) as usize;
+            let interior_start = axis_start.max(interior_lo).min(axis_end);
+            let interior_end = axis_end.min(interior_hi).max(interior_start);
+            for a in axis_start..interior_start {
+                scalar(a, os);
+            }
+            for tile_start in (interior_start..interior_end).step_by(CONVOLVE1D_CACHE_BLOCK) {
+                let tile_end = (tile_start + CONVOLVE1D_CACHE_BLOCK).min(interior_end);
+                let output = &mut os[tile_start - axis_start..tile_end - axis_start];
+                for (k, &w) in weights.iter().enumerate() {
+                    let shift = (klen - 1 - k as i64) - offset + origin;
+                    let input_start = (tile_start as i64 + shift) as usize;
+                    for (slot, &value) in output
+                        .iter_mut()
+                        .zip(&is[input_start..input_start + (tile_end - tile_start)])
+                    {
+                        *slot += w * value;
+                    }
+                }
+            }
+            for a in interior_end..axis_end {
+                scalar(a, os);
             }
         }
     };
@@ -14760,9 +14807,10 @@ mod tests {
     #[test]
     fn convolve1d_line_walk_is_byte_identical_to_nd_convolve() {
         // convolve1d_along_axis must equal the N-D convolve on a 1-D-embedded kernel,
-        // bit-for-bit (the gaussian reroute relies on this). The 3-D shape exercises
-        // both the vector-friendly inner spans and the scalar innermost span.
-        let shape = vec![13usize, 11, 17];
+        // bit-for-bit (the gaussian reroute relies on this). The 3-D shape makes the
+        // z pass parallelizable and crosses the 64-element cache blocks in both y/x
+        // passes, while still exercising the scalar innermost boundary path.
+        let shape = vec![7usize, 71, 73];
         let data: Vec<f64> = (0..shape.iter().product())
             .map(|i| ((i * 40503usize) % 911) as f64 / 90.0 - 5.0)
             .collect();
