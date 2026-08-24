@@ -2567,6 +2567,23 @@ fn apply_supernode_tails(
         scratch.vals.resize(needed, 0.0);
     }
 
+    // A/B DISPATCH, read ONCE at the call boundary and never inside a loop
+    // (`perf_toggle_read_in_hot_loop_is_a_barrier`: an atomic load in a per-item path
+    // cost 13% in this same crate). The legacy arm is the pre-9nw95 kernel, kept so the
+    // two can be alternated in one window instead of compared across invocations.
+    if SPLU_MERGE_FORCE_LEGACY_WALK.load(std::sync::atomic::Ordering::Relaxed) {
+        return apply_supernode_tails_legacy(
+            target_cols,
+            target_vals,
+            scratch,
+            multipliers,
+            tail_cols,
+            tail_vals_flat,
+            span,
+            width,
+        );
+    }
+
     // THE DESTINATION IS BOUND ONCE, NOT PER WRITE. `scratch.cols[put] = ...`
     // indexes through a `Vec`, so every store reloads the heap pointer and the
     // length before its bounds check. `needed` entries were just reserved above,
@@ -2675,6 +2692,102 @@ fn apply_supernode_tails(
         }
         cols_out[put] = tail_cols[right];
         vals_out[put] = value;
+        put += 1;
+        right += 1;
+    }
+    scratch.cols.truncate(put.max(scratch.start));
+    scratch.vals.truncate(put.max(scratch.start));
+    true
+}
+
+/// The PRE-`frankenscipy-9nw95` merge walk, retained as the A/B arm.
+///
+/// Two differences from the shipping kernel, and only two — both about ADDRESSING, neither
+/// about arithmetic:
+///   * each pivot's tail row is rebuilt as a slice, `&tail_vals_flat[k * span..(k + 1) * span]`,
+///     to read the single element `[right]` from it;
+///   * every store goes through `scratch.cols[put]` / `scratch.vals[put]`, i.e. through the
+///     `Vec`, reloading the heap pointer and length before each bounds check.
+///
+/// The values read, the `k` order, the additions and their association, and the
+/// cancellation-refusal branches are IDENTICAL to the shipping arm, so the two are
+/// bit-identical by construction. Reachable only via `SPLU_MERGE_FORCE_LEGACY_WALK`.
+#[allow(clippy::too_many_arguments)]
+fn apply_supernode_tails_legacy(
+    target_cols: &[u32],
+    target_vals: &[f64],
+    scratch: &mut SortedFactorRow,
+    multipliers: &[f64],
+    tail_cols: &[u32],
+    tail_vals_flat: &[f64],
+    span: usize,
+    width: usize,
+) -> bool {
+    let (mut left, mut right, mut put) = (0usize, 0usize, 0usize);
+    while left < target_cols.len() && right < span {
+        let left_col = target_cols[left];
+        let right_col = tail_cols[right];
+        if left_col < right_col {
+            scratch.cols[put] = left_col;
+            scratch.vals[put] = target_vals[left];
+            put += 1;
+            left += 1;
+        } else if left_col > right_col {
+            let mut value = 0.0f64;
+            let mut exists = false;
+            for (k, &multiplier) in multipliers.iter().enumerate() {
+                let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                value += -multiplier * tail[right];
+                if value == 0.0 {
+                    if exists && k + 1 < width {
+                        return false;
+                    }
+                } else {
+                    exists = true;
+                }
+            }
+            if value != 0.0 {
+                scratch.cols[put] = right_col;
+                scratch.vals[put] = value;
+                put += 1;
+            }
+            right += 1;
+        } else {
+            let mut value = target_vals[left];
+            for (k, &multiplier) in multipliers.iter().enumerate() {
+                let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                value += -multiplier * tail[right];
+                if value == 0.0 && k + 1 < width {
+                    return false;
+                }
+            }
+            scratch.cols[put] = left_col;
+            scratch.vals[put] = value;
+            put += 1;
+            left += 1;
+            right += 1;
+        }
+    }
+    let remaining = target_cols.len() - left;
+    scratch.cols[put..put + remaining].copy_from_slice(&target_cols[left..]);
+    scratch.vals[put..put + remaining].copy_from_slice(&target_vals[left..]);
+    put += remaining;
+    while right < span {
+        let mut value = 0.0f64;
+        let mut exists = false;
+        for (k, &multiplier) in multipliers.iter().enumerate() {
+            let tail = &tail_vals_flat[k * span..(k + 1) * span];
+            value += -multiplier * tail[right];
+            if value == 0.0 {
+                if exists && k + 1 < width {
+                    return false;
+                }
+            } else {
+                exists = true;
+            }
+        }
+        scratch.cols[put] = tail_cols[right];
+        scratch.vals[put] = value;
         put += 1;
         right += 1;
     }
@@ -15058,6 +15171,122 @@ mod tests {
         }
     }
 
+    /// Drives BOTH arms of `SPLU_MERGE_FORCE_LEGACY_WALK` and pins them bit-identical.
+    ///
+    /// This is the toggle's accuracy contract executed rather than asserted. The two arms
+    /// differ only in ADDRESSING — the legacy one rebuilds each pivot's tail row as a slice to
+    /// read one element, and stores through the `Vec` — so every value, every `k` order, every
+    /// addition and every cancellation-refusal branch must agree to the bit.
+    ///
+    /// THREE PATHS, because the kernel has three and a fixture reaching only one would pin
+    /// almost nothing: the DISJOINT fixture drives the fill branch and the tail drain, the
+    /// OVERLAPPING fixture drives the reuse branch. That distinction is not hypothetical — an
+    /// earlier version of the sibling test was green under a transposed stride precisely
+    /// because the reuse branch was never reached.
+    ///
+    /// `dispatch_observed` is asserted so that a refactor which stops consulting the toggle
+    /// fails here instead of silently comparing one arm with itself.
+    #[test]
+    fn merge_kernel_ab_arms_are_bit_identical() {
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        for (span, width, overlap) in [
+            (1usize, 1usize, false),
+            (3, 4, false),
+            (7, 2, false),
+            (300, 5, false),
+            (64, 12, false),
+            (5, 3, true),
+            (64, 12, true),
+            (300, 5, true),
+        ] {
+            let (target, tail_cols, tail_vals_flat, multipliers) = if overlap {
+                overlapping_cell_shaped_block(span, width)
+            } else {
+                measured_cell_shaped_block(span, width)
+            };
+
+            // PROVE THE DISPATCH before believing any comparison below.
+            SPLU_MERGE_FORCE_LEGACY_WALK.store(true, std::sync::atomic::Ordering::Relaxed);
+            let mut probe = SortedFactorRow::default();
+            let observed = SPLU_MERGE_FORCE_LEGACY_WALK.dispatch_observed(|| {
+                let _ = apply_supernode_tails(
+                    &target,
+                    &mut probe,
+                    0,
+                    &multipliers,
+                    &tail_cols,
+                    &tail_vals_flat,
+                );
+            });
+            assert!(
+                observed,
+                "span={span} width={width} overlap={overlap}: the kernel never consulted the \
+                 A/B toggle, so the two arms are the same code"
+            );
+
+            let mut legacy = SortedFactorRow::default();
+            let legacy_ok = apply_supernode_tails(
+                &target,
+                &mut legacy,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+            );
+            SPLU_MERGE_FORCE_LEGACY_WALK.store(false, std::sync::atomic::Ordering::Relaxed);
+
+            let mut head = SortedFactorRow::default();
+            let head_ok = apply_supernode_tails(
+                &target,
+                &mut head,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+            );
+
+            assert_eq!(
+                legacy_ok, head_ok,
+                "span={span} width={width} overlap={overlap}: the arms disagree on whether the \
+                 row must be replayed sequentially"
+            );
+            let legacy_cols = &legacy.cols[legacy.start..];
+            let head_cols = &head.cols[head.start..];
+            let legacy_vals = &legacy.vals[legacy.start..];
+            let head_vals = &head.vals[head.start..];
+            assert_eq!(
+                legacy_cols.len(),
+                head_cols.len(),
+                "span={span} width={width} overlap={overlap}: entry count"
+            );
+            for (i, (l, h)) in legacy_cols.iter().zip(head_cols).enumerate() {
+                assert_eq!(l, h, "span={span} width={width}: column {i}");
+            }
+            for (i, (l, h)) in legacy_vals.iter().zip(head_vals).enumerate() {
+                assert_eq!(
+                    l.to_bits(),
+                    h.to_bits(),
+                    "span={span} width={width} overlap={overlap}: value {i} ({l} vs {h})"
+                );
+            }
+
+            // MUST-MISS arm for the comparison: one ulp on one value has to be visible, or
+            // "every value matched" is a statement about the assertion, not about the kernels.
+            if !head_vals.is_empty() {
+                let probe_index = head_vals.len() / 2;
+                let perturbed = f64::from_bits(head_vals[probe_index].to_bits() ^ 1);
+                assert!(
+                    legacy_vals[probe_index].to_bits() != perturbed.to_bits(),
+                    "span={span} width={width}: a one-ulp perturbation must be visible"
+                );
+            }
+        }
+        SPLU_MERGE_FORCE_LEGACY_WALK.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[test]
     #[ignore = "kernel A/B: build with --release and run under callgrind, then read the \
                 per-function Ir for apply_supernode_tails vs dense_scatter_block_update"]
@@ -26756,6 +26985,24 @@ pub static SPLU_BACK_MERGE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
 ///
 /// INERT under natural ordering — with `fill_perm == None` there is nothing to materialize, so
 /// both arms are the same loop and any ratio taken on such a fixture is measuring noise.
+/// When `true`, `apply_supernode_tails` runs the PRE-`frankenscipy-9nw95` merge walk:
+/// the `k`-th tail row rebuilt as a slice per pivot to read one element, and the
+/// destination indexed through the `Vec` on every store.
+///
+/// ACCURACY CONTRACT: **bit-identical**, by construction rather than by tolerance. Both arms
+/// read the same elements in the same `k` order, perform the same additions in the same
+/// association, and take the same cancellation-refusal branches; only the ADDRESSING of the
+/// reads and the destination differs. `merge_kernel_ab_arms_are_bit_identical` executes that
+/// claim with `to_bits()` on fixtures that reach the fill branch, the reuse branch and the
+/// tail drain.
+///
+/// Exists so the comparison is PAIRED inside one binary and one window. It is not a tuning
+/// knob. Counted, the two arms differ by 18,194 vs 17,297 Ir per call and 12.010 vs 12.000 Ir
+/// per element-update — an effect far below what this cell's A/A nulls can resolve across two
+/// separate invocations, which is exactly why an in-binary toggle is the only honest
+/// instrument for it.
+#[doc(hidden)]
+pub static SPLU_MERGE_FORCE_LEGACY_WALK: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_SOLVE_FORCE_MATERIALIZED_RHS: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]

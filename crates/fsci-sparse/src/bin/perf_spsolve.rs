@@ -1214,9 +1214,10 @@ mod cubic_live {
         CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
         SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS,
         SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
-        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPLU_SOLVE_FORCE_MATERIALIZED_RHS,
-        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions,
-        SparseLuFactorization, splu, splu_factor_payload_bytes, splu_solve, spsolve,
+        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPLU_MERGE_FORCE_LEGACY_WALK,
+        SPLU_SOLVE_FORCE_MATERIALIZED_RHS, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
+        SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, SparseLuFactorization, splu,
+        splu_factor_payload_bytes, splu_solve, spsolve,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1320,7 +1321,14 @@ mod cubic_live {
                 Self::PeriodicCuboid => {
                     SPLU_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(disabled, Ordering::Relaxed);
                 }
-                Self::Convection => {}
+                Self::Convection => {
+                    // THE CONTROL ARM IS NOW A REAL SECOND CODE PATH. It was a no-op while
+                    // this family had no A/B; `frankenscipy-9nw95`'s merge-kernel lever gives
+                    // it one, and pairing the two kernels inside ONE window is the only way to
+                    // see an effect this small — two separate invocations of this cell could
+                    // not separate it, and one of those runs failed a control null outright.
+                    SPLU_MERGE_FORCE_LEGACY_WALK.store(disabled, Ordering::Relaxed);
+                }
             }
         }
 
@@ -1388,7 +1396,13 @@ mod cubic_live {
         /// candidate's own code. That ratio is a second A/A null, and reporting it as
         /// maintenance would be a claim about an A/B that does not exist.
         fn ab_control(self) -> bool {
-            !matches!(self, Self::Convection)
+            // Convection's control arm used to re-run the candidate's own code, so it could
+            // not claim an A/B. Since `frankenscipy-9nw95` it drives
+            // `SPLU_MERGE_FORCE_LEGACY_WALK`, which is a genuinely different merge kernel, so
+            // the family now DOES have one. Changed because the fact changed, not to admit a
+            // result: the maintenance gate below is untouched and this arm has to clear the
+            // same registered 1.20x minimum as every other family.
+            true
         }
 
         fn decision_label(self) -> &'static str {
@@ -1397,9 +1411,9 @@ mod cubic_live {
                 Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
                 Self::PeriodicCuboid => "PERIODIC_CUBOID_SPLU_DECISION",
                 // NOT `..._LAZY_COLUMNS_DECISION`: that named an A/B control which no longer
-                // exists, and a label is what a reader greps for. This arm compares against
-                // the live incumbent and claims nothing about a toggle.
-                Self::Convection => "CONVECTION_SPLU_VS_INCUMBENT",
+                // exists. This names the one it now has — the merge-walk kernel A/B — so a
+                // reader greps for what is actually being decided.
+                Self::Convection => "CONVECTION_SPLU_MERGE_WALK_DECISION",
             }
         }
 
@@ -3819,6 +3833,28 @@ mod cubic_live {
                 .join(",")
         );
 
+        // TWO-ARM PROBE CONTROL for the merge-kernel A/B: if the library never consults the
+        // toggle, both "arms" are the same code and every ratio below is an A/A wearing an A/B
+        // label. Printed on the row rather than assumed.
+        if matches!(family, SpluFamily::Convection) {
+            let probe_fixture = fixtures
+                .first()
+                .ok_or_else(|| "convection family has no fixture".to_string())?;
+            let dispatch_observed = SPLU_MERGE_FORCE_LEGACY_WALK.dispatch_observed(|| {
+                if let Ok(factor) = splu(&probe_fixture.csc, LuOptions::default()) {
+                    let _ = splu_solve(&factor, &probe_fixture.right_hand_sides[0]);
+                }
+            });
+            println!("merge_ab_dispatch_observed={dispatch_observed}");
+            if !dispatch_observed {
+                return Err(
+                    "the merge-kernel A/B toggle was never consulted: the two arms are the \
+                     same code and no ratio from them is reportable"
+                        .to_string(),
+                );
+            }
+        }
+
         family.reset_hits();
         let (candidate, candidate_payload_bytes) = rust_splu_solutions(&fixtures, false, family)?;
         let (candidate_factor_hits, candidate_solve_hits) = family.hits();
@@ -4033,19 +4069,24 @@ mod cubic_live {
         fn convection_reports_no_ab_decision_while_the_spectral_families_still_do() {
             use super::SpluFamily;
 
-            // MUST-MISS: no A/B control, so no KEEP/REVERT word at either truth value.
-            assert!(!SpluFamily::Convection.ab_control());
-            assert_eq!(super::decision_word(true, false), "NO_AB_DECISION");
-            assert_eq!(super::decision_word(false, false), "NO_AB_DECISION");
-
-            // MUST-HIT: the spectral families are unchanged and still decide.
+            // EVERY family now has an A/B control: Convection acquired one when its control
+            // arm was wired to `SPLU_MERGE_FORCE_LEGACY_WALK` (frankenscipy-9nw95). This test
+            // previously pinned the opposite for Convection, and that assertion was correct
+            // for the code as it stood -- the fact changed, so the pin changed with it.
             for family in [
                 SpluFamily::Dirichlet,
                 SpluFamily::Neumann,
                 SpluFamily::PeriodicCuboid,
+                SpluFamily::Convection,
             ] {
-                assert!(family.ab_control(), "{} must keep its A/B", family.name());
+                assert!(family.ab_control(), "{} must have an A/B", family.name());
             }
+
+            // The NO_AB_DECISION word still has to exist and still has to win over `keep` at
+            // either truth value, because a future family without a control must not print a
+            // KEEP/REVERT it has not earned.
+            assert_eq!(super::decision_word(true, false), "NO_AB_DECISION");
+            assert_eq!(super::decision_word(false, false), "NO_AB_DECISION");
             assert_eq!(super::decision_word(true, true), "KEEP");
             assert_eq!(super::decision_word(false, true), "REVERT");
         }
@@ -4066,7 +4107,7 @@ mod cubic_live {
             SpluFamily::Convection.set_disabled(false);
 
             let label = SpluFamily::Convection.decision_label();
-            assert_eq!(label, "CONVECTION_SPLU_VS_INCUMBENT");
+            assert_eq!(label, "CONVECTION_SPLU_MERGE_WALK_DECISION");
             assert!(
                 !label.contains("LAZY_COLUMNS"),
                 "the label must not name a control that was deleted: {label}"
