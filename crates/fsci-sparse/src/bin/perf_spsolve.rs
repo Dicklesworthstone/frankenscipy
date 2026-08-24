@@ -2522,6 +2522,17 @@ mod cubic_live {
         );
     }
 
+    /// Does this null's bootstrap CI contain unity — i.e. is it consistent with NO arm-order
+    /// bias at all?
+    ///
+    /// Split out of the printing so both arms are testable: a predicate that answered `true`
+    /// for everything would make the diagnostic worthless in exactly the direction that
+    /// flatters a failing run, so `null_ci_unity_predicate_separates_biased_from_imprecise`
+    /// pins a CI that spans unity AND one that does not.
+    fn null_ci_spans_unity(low: f64, high: f64) -> bool {
+        low <= 1.0 && 1.0 <= high
+    }
+
     /// Decision word for the labelled verdict line.
     ///
     /// Split out of the printing so the "this arm claims no A/B" path is testable without
@@ -2651,6 +2662,32 @@ mod cubic_live {
         ]
         .into_iter()
         .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_LIMIT);
+        // IS A FAILING NULL BIASED, OR MERELY IMPRECISE? The gate below tests each null's
+        // MEDIAN against a 2% band, which is the right thing to gate on and is not changed
+        // here. But a median 5% off unity means two completely different things depending on
+        // that null's own precision, and the printed line did not distinguish them:
+        //
+        //   biased    - the null's CI EXCLUDES 1.0. Arm order is really doing something and
+        //               the ratio above it is contaminated.
+        //   imprecise - the null's CI INCLUDES 1.0. The null is consistent with no bias at
+        //               all; there is nothing to fix in the schedule, and the remedy is more
+        //               replicates, because the median simply is not pinned down yet.
+        //
+        // This distinction cost real work: on the 2026-08-23 pinned run of this cell the
+        // candidate and control nulls read 0.949 and 0.939 and were reported as a cold/warm
+        // ORDERING effect. Their CIs were [0.907,1.025] and [0.890,1.023] — both spanning
+        // unity, as did all four nulls — so no bias had been shown at all, and a schedule fix
+        // aimed at one would have been aimed at nothing.
+        //
+        // DIAGNOSTIC ONLY. This flag is printed, never consulted: `keep`, `maintenance_pass`,
+        // `competitive_pass` and the verdict word are computed exactly as before. Widening a
+        // gate to admit a result is not on the table (/data/projects/AGENTS.md); telling the
+        // reader which KIND of failure they are looking at is.
+        let all_null_cis_span_unity = null_ci_spans_unity(candidate_null_low, candidate_null_high)
+            && null_ci_spans_unity(control_null_low, control_null_high)
+            && null_ci_spans_unity(candidate_live_null_low, candidate_live_null_high)
+            && null_ci_spans_unity(live_null_low, live_null_high);
+
         let candidate_p50 = median(measurement.candidate.clone());
         let candidate_duration_pass = candidate_p50 >= minimum_candidate_seconds;
         let maintenance_pass =
@@ -2683,6 +2720,7 @@ mod cubic_live {
         );
         println!(
             "decision_gate: null_medians_within_2pct={null_medians_pass} \
+             all_null_ci95_span_unity={all_null_cis_span_unity} \
              candidate_p50_at_least_registered_minimum={candidate_duration_pass} \
              candidate_p50_ms={:.6} registered_candidate_minimum_ms={:.6} \
              maintenance_ci_low_at_least_1_20_and_beyond_2x_null={maintenance_pass} \
@@ -4039,6 +4077,47 @@ mod cubic_live {
                     .decision_label()
                     .ends_with("_DECISION")
             );
+        }
+
+        /// The diagnostic added for `frankenscipy-run7d` must separate the two ways a null
+        /// median can sit outside the 2% band, because they call for opposite responses:
+        /// a CI excluding unity means the schedule really is biased and the ratio above it is
+        /// contaminated; a CI including unity means the null is merely imprecise and the
+        /// remedy is more replicates.
+        ///
+        /// BOTH ARMS, using the real numbers that motivated it. The pinned 2026-08-23 run of
+        /// the convection cell had all four nulls spanning unity while three of them failed
+        /// the 2% median gate — that is the MUST-HIT case, and reading those failures as an
+        /// ordering effect (which is what happened) is the mistake this pins against. The
+        /// MUST-MISS case is a genuinely biased null.
+        #[test]
+        fn null_ci_unity_predicate_separates_biased_from_imprecise() {
+            // MUST-HIT: every null from that run, medians far off unity, CIs spanning it.
+            for (median, low, high) in [
+                (0.949420, 0.906662, 1.025266), // candidate_A/A   — failed the 2% gate
+                (0.938835, 0.890318, 1.023263), // control_A/A     — failed the 2% gate
+                (1.021569, 0.993653, 1.056437), // live_A/A        — failed the 2% gate
+                (0.994113, 0.981449, 1.129099), // candidate_live_pair — passed it
+            ] {
+                assert!(
+                    super::null_ci_spans_unity(low, high),
+                    "median {median} with ci [{low},{high}] is consistent with no bias"
+                );
+            }
+            // ... and three of those four really did fail the median gate, so the diagnostic
+            // is reporting something the gate line did not already say.
+            assert!(!(0.949420f64 - 1.0).abs().le(&0.02));
+            assert!(!(0.938835f64 - 1.0).abs().le(&0.02));
+            assert!(!(1.021569f64 - 1.0).abs().le(&0.02));
+
+            // MUST-MISS: a null whose CI clears unity entirely is BIASED, and the predicate
+            // has to say so. Without this arm a predicate returning `true` unconditionally
+            // would pass — and would silently excuse every contaminated run.
+            assert!(!super::null_ci_spans_unity(1.041, 1.078));
+            assert!(!super::null_ci_spans_unity(0.902, 0.981));
+            // Touching unity from either side still counts as spanning it.
+            assert!(super::null_ci_spans_unity(1.0, 1.2));
+            assert!(super::null_ci_spans_unity(0.8, 1.0));
         }
 
         #[test]
