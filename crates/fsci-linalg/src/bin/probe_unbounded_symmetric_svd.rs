@@ -45,6 +45,9 @@
 use nalgebra::{DMatrix, SVD, SymmetricEigen};
 
 const MARKER: &str = "unbounded-sym-svd-v1";
+/// `SVD::new` passes nalgebra's default epsilon multiplied by five through
+/// `new_unordered`; bounded comparisons must use the identical threshold.
+const SVD_NEW_EPSILON: f64 = f64::EPSILON * 5.0;
 
 /// Deterministic PRNG so every reported `(family, n, seed)` is reproducible without
 /// carrying a fixture file around.
@@ -235,11 +238,10 @@ fn probe_svd(tally: &mut Tally, label: &str, m: DMatrix<f64>) {
     // `try_new(m, f64::EPSILON, 30 * n.max(10))` is correct for Schur and symmetric_eigen
     // and WRONG for SVD. Anyone bounding an SVD site with it silently shifts results by an
     // ulp while believing the change is behaviour-preserving.
-    let svd_eps = f64::EPSILON * 5.0;
-    let bounded = SVD::try_new(m.clone(), true, true, svd_eps, k_lapack);
+    let bounded = SVD::try_new(m.clone(), true, true, SVD_NEW_EPSILON, k_lapack);
     if bounded.is_none() {
         tally.over_lapack.push(label.to_string());
-        if SVD::try_new(m.clone(), true, true, svd_eps, k_huge).is_none() {
+        if SVD::try_new(m.clone(), true, true, SVD_NEW_EPSILON, k_huge).is_none() {
             tally.over_huge.push(label.to_string());
         }
         return;
@@ -343,7 +345,7 @@ fn main() {
         rect(16, 16, 7, false),
         true,
         true,
-        f64::EPSILON * 5.0,
+        SVD_NEW_EPSILON,
         1,
     )
     .is_none();
@@ -354,7 +356,7 @@ fn main() {
         rect(16, 16, 7, false),
         true,
         true,
-        f64::EPSILON * 5.0,
+        SVD_NEW_EPSILON,
         100_000,
     )
     .is_some();
@@ -465,4 +467,40 @@ idle_pct_since_boot={:.1} iowait_pct_since_boot={:.2} logical_cpus={}",
 fn svd_case(tally: &mut Tally, rows: usize, cols: usize, seed: u64, deficient: bool) {
     let label = format!("rect {rows}x{cols} seed={seed} deficient={deficient}");
     probe_svd(tally, &label, rect(rows, cols, seed, deficient));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_bounded_svd_matches_new(matrix: DMatrix<f64>) {
+        let max_niter = 30 * matrix.nrows().max(matrix.ncols()).max(10);
+        let bounded = SVD::try_new(matrix.clone(), true, true, SVD_NEW_EPSILON, max_niter)
+            .expect("fixture must converge within the LAPACK-order bound");
+        let unbounded = SVD::new(matrix, true, true);
+
+        let bounded_bits: Vec<u64> = bounded
+            .singular_values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        let unbounded_bits: Vec<u64> = unbounded
+            .singular_values
+            .iter()
+            .map(|value| value.to_bits())
+            .collect();
+        assert_eq!(bounded_bits, unbounded_bits);
+    }
+
+    #[test]
+    fn bounded_svd_uses_the_same_epsilon_as_svd_new() {
+        for matrix in [
+            rect(4, 4, 7, false),
+            rect(8, 3, 11, false),
+            rect(3, 8, 13, false),
+            rect(16, 16, 17, true),
+        ] {
+            assert_bounded_svd_matches_new(matrix);
+        }
+    }
 }
