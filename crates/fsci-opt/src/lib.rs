@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod bracket;
 pub mod curvefit;
 pub mod linesearch;
 pub mod minimize;
@@ -9,6 +10,7 @@ pub mod root;
 pub mod types;
 
 pub use audit::{SyncSharedAuditLedger, record_fail_closed, sync_audit_ledger};
+pub use bracket::{BracketOptions, BracketResult, bracket_root};
 pub use curvefit::{
     CurveFitOptions, CurveFitResult, LeastSquaresOptions, LeastSquaresResult, LeastsqResult,
     curve_fit, curve_fit_bounded, curve_fit_bounded_many, curve_fit_many, least_squares,
