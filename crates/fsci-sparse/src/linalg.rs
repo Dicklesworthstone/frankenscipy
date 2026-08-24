@@ -176,6 +176,25 @@ struct PackedTriangularRows {
 }
 
 impl PackedTriangularRows {
+    /// Bytes this packed factor half actually retains.
+    ///
+    /// Named on the row as `candidate_factor_vector_payload_bytes`, so it has to track the
+    /// layout rather than a remembered one: `u32` columns and `f64` values in parallel arrays,
+    /// plus one `usize` offset per row and the trailing terminator. The pre-packing formula
+    /// charged `size_of::<(usize, f64)>()` per entry, which is 16 bytes against this layout's
+    /// 12 — it would still compile and quietly overstate every measured factor by a third.
+    fn payload_bytes(&self) -> usize {
+        self.columns
+            .len()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(self.values.len().saturating_mul(std::mem::size_of::<f64>()))
+            .saturating_add(
+                self.offsets
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+    }
+
     fn from_rows(rows: &[Vec<(usize, f64)>]) -> Self {
         let entry_count = rows.iter().map(Vec::len).sum();
         let mut offsets = Vec::with_capacity(rows.len() + 1);
@@ -27302,9 +27321,14 @@ pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize
             .saturating_mul(n)
             .saturating_mul(std::mem::size_of::<f64>()),
         SparseLuInternal::Native(lu) => {
-            let entries = lu.l_rows.iter().map(Vec::len).sum::<usize>()
-                + lu.u_rows.iter().map(Vec::len).sum::<usize>();
-            entries.saturating_mul(std::mem::size_of::<(usize, f64)>())
+            // PACKED LAYOUT, and the SIZE TERM MOVED WITH IT. The triangular factors are
+            // `PackedTriangularRows` — parallel `u32` columns and `f64` values plus one
+            // `usize` row offset per row — not the old `Vec<Vec<(usize, f64)>>`. Charging the
+            // entries at `size_of::<(usize, f64)>()` would keep compiling and silently
+            // OVERSTATE the retained payload by a third, in a number the splu harness prints
+            // as `candidate_factor_vector_payload_bytes` on every measured row.
+            lu.lower.payload_bytes()
+                + lu.upper.payload_bytes()
                 + lu.row_perm
                     .len()
                     .saturating_mul(std::mem::size_of::<usize>())
