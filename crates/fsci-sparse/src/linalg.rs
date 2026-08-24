@@ -6006,9 +6006,13 @@ fn gmres_inner(
         return Ok((true, 0));
     }
 
-    // Arnoldi process with modified Gram-Schmidt
-    let mut v: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
-    v.push(r.iter().map(|&ri| ri / r_norm).collect());
+    // Arnoldi process with modified Gram-Schmidt. The basis is one contiguous
+    // `(m + 1) × n` slab rather than `m + 1` individually allocated rows. Each
+    // completed row is appended in the same order as before, so the recurrence
+    // reads and writes the identical values while the MGS kernel gets a direct
+    // slice for every basis vector.
+    let mut v = Vec::with_capacity((m + 1) * n);
+    v.extend(r.iter().map(|&ri| ri / r_norm));
 
     // Upper Hessenberg matrix H (stored as (m+1) x m)
     let mut h = vec![vec![0.0; m]; m + 1];
@@ -6028,14 +6032,15 @@ fn gmres_inner(
         iters = j + 1;
 
         // w = A * v_j
-        csr_matvec_into(a, &v[j], &mut wj);
+        let current_basis = &v[j * n..(j + 1) * n];
+        csr_matvec_into(a, current_basis, &mut wj);
         // Captured before orthogonalization: this is what the breakdown test
         // below is measured against (frankenscipy-4u7vp).
         let w_norm_before = vec_norm(&wj);
 
         // Modified Gram-Schmidt orthogonalization
         for i in 0..=j {
-            let basis = v[i].as_slice();
+            let basis = &v[i * n..(i + 1) * n];
             let coefficient = dot_product(&wj, basis);
             h[i][j] = coefficient;
             subtract_scaled_basis_vector(&mut wj, coefficient, basis);
@@ -6048,13 +6053,13 @@ fn gmres_inner(
             // Apply previous Givens rotations to column j
             apply_givens_to_column(&mut h, &cs, &sn, j);
             // Solve the triangular system and update x
-            update_solution(x, &v, &h, &g, j + 1);
+            update_solution_slab(x, &v, n, &h, &g, j + 1);
             return Ok((true, iters));
         }
 
         // Normalize
         let inv_h = 1.0 / h[j + 1][j];
-        v.push(wj.iter().map(|&wi| wi * inv_h).collect());
+        v.extend(wj.iter().map(|&wi| wi * inv_h));
 
         // Apply previous Givens rotations to column j of H
         apply_givens_to_column(&mut h, &cs, &sn, j);
@@ -6074,13 +6079,13 @@ fn gmres_inner(
 
         let residual = g[j + 1].abs() / b_norm;
         if residual < tol {
-            update_solution(x, &v, &h, &g, j + 1);
+            update_solution_slab(x, &v, n, &h, &g, j + 1);
             return Ok((true, iters));
         }
     }
 
     // Update solution with current approximation
-    update_solution(x, &v, &h, &g, m);
+    update_solution_slab(x, &v, n, &h, &g, m);
     Ok((false, iters))
 }
 
@@ -6141,6 +6146,42 @@ fn update_solution(x: &mut [f64], v: &[Vec<f64>], h: &[Vec<f64>], g: &[f64], k: 
     for (j, &yj) in y.iter().enumerate() {
         for (i, xi) in x.iter_mut().enumerate() {
             *xi += yj * v[j][i];
+        }
+    }
+}
+
+/// Slab-backed counterpart of [`update_solution`] for GMRES' contiguous
+/// Arnoldi basis. It keeps the same back-substitution and accumulation order;
+/// only the basis-row address calculation differs.
+fn update_solution_slab(
+    x: &mut [f64],
+    basis: &[f64],
+    row_width: usize,
+    h: &[Vec<f64>],
+    g: &[f64],
+    k: usize,
+) {
+    debug_assert_eq!(basis.len() % row_width, 0);
+    let pivot_floor =
+        f64::EPSILON * 100.0 * (0..k).fold(0.0_f64, |largest, i| largest.max(h[i][i].abs()));
+
+    let mut y = vec![0.0; k];
+    for i in (0..k).rev() {
+        y[i] = g[i];
+        for j in (i + 1)..k {
+            y[i] -= h[i][j] * y[j];
+        }
+        if h[i][i].abs() > pivot_floor {
+            y[i] /= h[i][i];
+        } else {
+            y[i] = 0.0;
+        }
+    }
+
+    for (j, &yj) in y.iter().enumerate() {
+        let row = &basis[j * row_width..(j + 1) * row_width];
+        for (xi, &basis_value) in x.iter_mut().zip(row) {
+            *xi += yj * basis_value;
         }
     }
 }
@@ -19926,6 +19967,35 @@ mod tests {
                 expected.to_bits(),
                 actual.to_bits(),
                 "MGS component {index} changed bits"
+            );
+        }
+    }
+
+    #[test]
+    fn gmres_slab_basis_update_matches_jagged_reference_bitwise() {
+        let basis = vec![
+            vec![0.25, -0.5, 0.75, -1.0],
+            vec![-0.125, 0.375, -0.625, 0.875],
+            vec![1.25, -1.5, 1.75, -2.0],
+        ];
+        let slab: Vec<f64> = basis.iter().flatten().copied().collect();
+        let h = vec![
+            vec![2.0, -0.5, 0.25],
+            vec![0.0, 1.5, -0.75],
+            vec![0.0, 0.0, 3.0],
+        ];
+        let g = vec![0.5, -1.25, 2.0];
+        let mut jagged_solution = vec![0.125, -0.25, 0.375, -0.5];
+        let mut slab_solution = jagged_solution.clone();
+
+        update_solution(&mut jagged_solution, &basis, &h, &g, 3);
+        update_solution_slab(&mut slab_solution, &slab, 4, &h, &g, 3);
+
+        for (index, (expected, actual)) in jagged_solution.iter().zip(&slab_solution).enumerate() {
+            assert_eq!(
+                expected.to_bits(),
+                actual.to_bits(),
+                "slab basis update changed solution component {index}"
             );
         }
     }
