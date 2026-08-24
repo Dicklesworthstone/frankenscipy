@@ -1214,9 +1214,9 @@ mod cubic_live {
         CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
         SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS,
         SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
-        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
-        SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, splu, splu_factor_payload_bytes, splu_solve,
-        spsolve,
+        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPLU_SOLVE_FORCE_MATERIALIZED_RHS,
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions,
+        SparseLuFactorization, splu, splu_factor_payload_bytes, splu_solve, spsolve,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -1264,15 +1264,15 @@ mod cubic_live {
         Dirichlet,
         Neumann,
         PeriodicCuboid,
-        // Never constructed, deliberately: `run_convection_splu` REFUSES,
-        // because the lazy-column control this family existed to exercise no
-        // longer has a production read path. The arms below (extents, matrix,
-        // expected components, labels) are kept rather than deleted so the
-        // fixture survives for whoever restores that path — they were
-        // established by measurement and re-deriving them is the expensive
-        // part. Reintroducing the toggle just to silence this is explicitly
-        // forbidden by frankenscipy-gkzq8.
-        #[allow(dead_code)]
+        // The lazy-column A/B control this family once exercised was deleted from
+        // production and is NOT coming back (frankenscipy-gkzq8 forbids reviving a
+        // toggle to satisfy a harness). What that removed is the A/B, not the
+        // fixture: this is the nonsymmetric side-64 factor-plus-16-solves cell
+        // carrying the campaign's worst standing vs-incumbent ratio, and comparing
+        // it against live SciPy never read the deleted toggle at all. So the arm
+        // runs, and `ab_control()` returns false for it — the "control" arm here is
+        // the SAME code as the candidate, which makes it a second A/A null and not
+        // a maintenance claim (frankenscipy-run7d).
         Convection,
     }
 
@@ -1379,12 +1379,27 @@ mod cubic_live {
             matches!(self, Self::Convection)
         }
 
+        /// Whether this family's "control" arm is a DIFFERENT code path from the candidate.
+        ///
+        /// For the three spectral families `set_disabled(true)` routes the control onto the
+        /// generic path, so control/candidate is a maintenance ratio. For `Convection`
+        /// `set_disabled` is a no-op — there is no spectral fast path and the lazy-column
+        /// toggle it once compared against was deleted — so the control arm re-runs the
+        /// candidate's own code. That ratio is a second A/A null, and reporting it as
+        /// maintenance would be a claim about an A/B that does not exist.
+        fn ab_control(self) -> bool {
+            !matches!(self, Self::Convection)
+        }
+
         fn decision_label(self) -> &'static str {
             match self {
                 Self::Dirichlet => "CUBIC_SPLU_DECISION",
                 Self::Neumann => "NEUMANN_CUBIC_SPLU_DECISION",
                 Self::PeriodicCuboid => "PERIODIC_CUBOID_SPLU_DECISION",
-                Self::Convection => "CONVECTION_SPLU_LAZY_COLUMNS_DECISION",
+                // NOT `..._LAZY_COLUMNS_DECISION`: that named an A/B control which no longer
+                // exists, and a label is what a reader greps for. This arm compares against
+                // the live incumbent and claims nothing about a toggle.
+                Self::Convection => "CONVECTION_SPLU_VS_INCUMBENT",
             }
         }
 
@@ -2507,10 +2522,39 @@ mod cubic_live {
         );
     }
 
+    /// Does this null's bootstrap CI contain unity — i.e. is it consistent with NO arm-order
+    /// bias at all?
+    ///
+    /// Split out of the printing so both arms are testable: a predicate that answered `true`
+    /// for everything would make the diagnostic worthless in exactly the direction that
+    /// flatters a failing run, so `null_ci_unity_predicate_separates_biased_from_imprecise`
+    /// pins a CI that spans unity AND one that does not.
+    fn null_ci_spans_unity(low: f64, high: f64) -> bool {
+        low <= 1.0 && 1.0 <= high
+    }
+
+    /// Decision word for the labelled verdict line.
+    ///
+    /// Split out of the printing so the "this arm claims no A/B" path is testable without
+    /// capturing stdout: `KEEP`/`REVERT` is a claim about a candidate beating a DIFFERENT
+    /// control, and an arm whose control re-runs the candidate's own code must not print
+    /// either word. Both arms of that distinction are pinned by
+    /// `convection_reports_no_ab_decision_while_the_spectral_families_still_do`.
+    fn decision_word(keep: bool, ab_control: bool) -> &'static str {
+        if !ab_control {
+            "NO_AB_DECISION"
+        } else if keep {
+            "KEEP"
+        } else {
+            "REVERT"
+        }
+    }
+
     fn print_measurement_named(
         measurement: &Measurement,
         decision_label: &str,
         minimum_candidate_seconds: f64,
+        ab_control: bool,
     ) -> bool {
         let live_candidate = if measurement.candidate_live.is_empty() {
             &measurement.candidate
@@ -2618,16 +2662,57 @@ mod cubic_live {
         ]
         .into_iter()
         .all(|value| (value - 1.0).abs() <= NULL_MEDIAN_LIMIT);
+        // IS A FAILING NULL BIASED, OR MERELY IMPRECISE? The gate below tests each null's
+        // MEDIAN against a 2% band, which is the right thing to gate on and is not changed
+        // here. But a median 5% off unity means two completely different things depending on
+        // that null's own precision, and the printed line did not distinguish them:
+        //
+        //   biased    - the null's CI EXCLUDES 1.0. Arm order is really doing something and
+        //               the ratio above it is contaminated.
+        //   imprecise - the null's CI INCLUDES 1.0. The null is consistent with no bias at
+        //               all; there is nothing to fix in the schedule, and the remedy is more
+        //               replicates, because the median simply is not pinned down yet.
+        //
+        // This distinction cost real work: on the 2026-08-23 pinned run of this cell the
+        // candidate and control nulls read 0.949 and 0.939 and were reported as a cold/warm
+        // ORDERING effect. Their CIs were [0.907,1.025] and [0.890,1.023] — both spanning
+        // unity, as did all four nulls — so no bias had been shown at all, and a schedule fix
+        // aimed at one would have been aimed at nothing.
+        //
+        // DIAGNOSTIC ONLY. This flag is printed, never consulted: `keep`, `maintenance_pass`,
+        // `competitive_pass` and the verdict word are computed exactly as before. Widening a
+        // gate to admit a result is not on the table (/data/projects/AGENTS.md); telling the
+        // reader which KIND of failure they are looking at is.
+        let all_null_cis_span_unity = null_ci_spans_unity(candidate_null_low, candidate_null_high)
+            && null_ci_spans_unity(control_null_low, control_null_high)
+            && null_ci_spans_unity(candidate_live_null_low, candidate_live_null_high)
+            && null_ci_spans_unity(live_null_low, live_null_high);
+
         let candidate_p50 = median(measurement.candidate.clone());
         let candidate_duration_pass = candidate_p50 >= minimum_candidate_seconds;
-        let maintenance_pass = control_low >= 1.20 && control_low > twice_null_threshold;
+        let maintenance_pass =
+            ab_control && control_low >= 1.20 && control_low > twice_null_threshold;
         let competitive_pass = live_low > twice_null_threshold;
-        println!(
-            "maintenance_ratio: control/candidate median={:.6} \
-             bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
-             registered_minimum=1.200000 twice_widest_null_threshold={twice_null_threshold:.6}",
-            median(control_ratios)
-        );
+        if ab_control {
+            println!(
+                "maintenance_ratio: control/candidate median={:.6} \
+                 bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
+                 registered_minimum=1.200000 \
+                 twice_widest_null_threshold={twice_null_threshold:.6}",
+                median(control_ratios)
+            );
+        } else {
+            // Same code in both arms, so this is a third A/A null rather than a maintenance
+            // ratio. Printed under a name that says so: calling it `maintenance_ratio` is how
+            // a 1.0 gets read as "the lever bought nothing" instead of "there is no lever".
+            println!(
+                "same_elf_replica_ratio: control/candidate median={:.6} \
+                 bootstrap_median_ci95=[{control_low:.6},{control_high:.6}] \
+                 twice_widest_null_threshold={twice_null_threshold:.6} \
+                 maintenance_claim=none_this_arm_has_no_ab_control",
+                median(control_ratios)
+            );
+        }
         println!(
             "competitive_ratio: live_scipy/candidate median={:.6} \
              bootstrap_median_ci95=[{live_low:.6},{live_high:.6}] registered_minimum=1.000000",
@@ -2635,6 +2720,7 @@ mod cubic_live {
         );
         println!(
             "decision_gate: null_medians_within_2pct={null_medians_pass} \
+             all_null_ci95_span_unity={all_null_cis_span_unity} \
              candidate_p50_at_least_registered_minimum={candidate_duration_pass} \
              candidate_p50_ms={:.6} registered_candidate_minimum_ms={:.6} \
              maintenance_ci_low_at_least_1_20_and_beyond_2x_null={maintenance_pass} \
@@ -2643,20 +2729,23 @@ mod cubic_live {
             minimum_candidate_seconds * 1.0e3,
         );
         let keep = null_medians_pass && candidate_duration_pass && maintenance_pass;
+        // The competitive claim is about the LIVE incumbent and does not depend on there
+        // being an A/B control, so an arm with no control can still pass or fail it — it
+        // just needs the nulls and the sample duration behind it, not a maintenance ratio.
+        let competitive_claim = competitive_pass
+            && null_medians_pass
+            && candidate_duration_pass
+            && (keep || !ab_control);
         println!(
             "{decision_label}={} competitive_claim={}",
-            if keep { "KEEP" } else { "REVERT" },
-            if keep && competitive_pass {
-                "PASS"
-            } else {
-                "FAIL"
-            }
+            decision_word(keep, ab_control),
+            if competitive_claim { "PASS" } else { "FAIL" }
         );
         keep
     }
 
     fn print_measurement(measurement: &Measurement) -> bool {
-        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION", 0.0)
+        print_measurement_named(measurement, "CUBIC_SPSOLVE_DECISION", 0.0, true)
     }
 
     #[derive(Clone, Copy)]
@@ -3374,8 +3463,12 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep =
-            print_measurement_named(&measurement, "PERIODIC_CUBOID_SPSOLVE_DECISION", 0.005);
+        let _keep = print_measurement_named(
+            &measurement,
+            "PERIODIC_CUBOID_SPSOLVE_DECISION",
+            0.005,
+            true,
+        );
         Ok(())
     }
 
@@ -3392,11 +3485,204 @@ mod cubic_live {
     }
 
     pub fn run_convection_splu(arguments: &[String]) -> Result<(), String> {
-        let _ = arguments;
-        Err(
-            "convection SPLU live measurement is refused: its deleted lazy-column control no longer has a production read path"
-                .to_string(),
-        )
+        run_splu_family(arguments, SpluFamily::Convection)
+    }
+
+    fn loadavg() -> String {
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|text| {
+                let fields = text.split_whitespace().take(3).collect::<Vec<_>>();
+                (fields.len() == 3).then(|| fields.join("/"))
+            })
+            .unwrap_or_else(|| "unavailable".to_string())
+    }
+
+    /// GATE (a) for `frankenscipy-run7d`: what fraction of this cell is the SOLVE?
+    ///
+    /// The cell is one factorization plus SIXTEEN solves, so "optimize the solve path" is worth
+    /// doing only in proportion to what those solves actually cost HERE. The profile banked in
+    /// `docs/NEGATIVE_EVIDENCE.md` put the solve at ~31% with about twofold headroom — but it
+    /// was taken on a DIFFERENT fixture (n=1,728), and a share does not transfer across sizes:
+    /// factorization grows superlinearly in fill while the solve is linear in factor nonzeros,
+    /// so the share should FALL as n grows. This measures it on the fixture the ratio is
+    /// actually quoted on (n=4,096), because a lever sized off the wrong fixture is how a 4%
+    /// change gets budgeted as a 16% one.
+    ///
+    /// The solve arm is timed TWICE per round from the SAME factor, and the ratio of those two
+    /// passes is reported as an A/A null. Without it a share is just a number: the second pass
+    /// bounds how much of the spread is the host rather than the code.
+    ///
+    /// This claims NOTHING against the incumbent — it is a self-attribution probe whose only
+    /// output is a proportion, and it must not be quoted as a ratio.
+    pub fn run_convection_split(arguments: &[String]) -> Result<(), String> {
+        let rounds = arguments
+            .first()
+            .map(|value| parse::<usize>(value, "rounds"))
+            .transpose()?
+            .unwrap_or(MINIMUM_ROUNDS);
+        if rounds < 3 {
+            return Err("the split probe needs at least 3 rounds".to_string());
+        }
+
+        println!("# probe=convection_factor_solve_split bead=frankenscipy-run7d");
+        println!("elf_sha256={}", sha256_of_self()?);
+        println!(
+            "# host={} observed_os_threads={} rounds={rounds} claim=SELF_ATTRIBUTION_ONLY",
+            std::fs::read_to_string("/proc/sys/kernel/hostname")
+                .map(|value| value.trim().to_string())
+                .unwrap_or_else(|_| "unknown".to_string()),
+            observed_os_threads()?,
+        );
+        println!("loadavg_before={}", loadavg());
+
+        let fixtures = splu_fixtures(SpluFamily::Convection)?;
+        let fixture = fixtures
+            .first()
+            .ok_or_else(|| "the convection family has no fixture".to_string())?;
+        let n = fixture.matrix.shape().rows;
+
+        let mut factor_ms = Vec::with_capacity(rounds);
+        let mut solve_ms = Vec::with_capacity(rounds);
+        let mut nulls = Vec::with_capacity(rounds);
+        let mut orig_solve_ms = Vec::with_capacity(rounds);
+        let mut ab = Vec::with_capacity(rounds);
+        let mut factor_payload = 0usize;
+        let mut dispatch_observed = false;
+
+        // Round 0 is discarded, so the allocator and the page cache are warm in both phases
+        // before anything is recorded.
+        for round in 0..=rounds {
+            let started = Instant::now();
+            let factor = splu(black_box(&fixture.csc), LuOptions::default())
+                .map_err(|error| format!("split probe splu: {error}"))?;
+            let factored = started.elapsed().as_secs_f64() * 1.0e3;
+            factor_payload = splu_factor_payload_bytes(&factor);
+
+            let mut checksum = 0u64;
+            let mut sixteen_solves = |factor: &SparseLuFactorization| -> Result<f64, String> {
+                let started = Instant::now();
+                for right_hand_side in &fixture.right_hand_sides {
+                    let solution = splu_solve(factor, black_box(right_hand_side))
+                        .map_err(|error| format!("split probe splu_solve: {error}"))?;
+                    for value in solution {
+                        checksum = checksum.rotate_left(1) ^ value.to_bits();
+                    }
+                }
+                Ok(started.elapsed().as_secs_f64() * 1.0e3)
+            };
+            // ABBA over the composed-index lever, inside ONE window. A cross-window
+            // before/after on this change is not readable: between two such windows the
+            // UNTOUCHED factorization moved 21% on this host, which is larger than the
+            // lever. A1 and A2 bracket B1 and B2, so a monotone drift over the quartet
+            // cancels in the A/B ratio and surfaces in the A/A null.
+            let arm = |materialize: bool,
+                       solves: &mut dyn FnMut(&SparseLuFactorization) -> Result<f64, String>|
+             -> Result<f64, String> {
+                SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(materialize, Ordering::Relaxed);
+                let elapsed = solves(&factor);
+                SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(false, Ordering::Relaxed);
+                elapsed
+            };
+            if round == 0 {
+                // TWO-ARM PROBE CONTROL. Before any timing is believed, prove the library
+                // actually CONSULTS the toggle: if it does not, both "arms" are the same code
+                // and every ratio below is an A/A comparison wearing an A/B label.
+                dispatch_observed = SPLU_SOLVE_FORCE_MATERIALIZED_RHS.dispatch_observed(|| {
+                    let _ = splu_solve(&factor, &fixture.right_hand_sides[0]);
+                });
+            }
+            // POSITION-BALANCED, not merely ABBA. ABBA cancels a monotone DRIFT, and the
+            // effect here is not drift: the first sixteen-solve pass after a fresh
+            // factorization is systematically slower than an immediately repeated one
+            // (measured: an A/A null of 1.185, 20 of 21 replicates above unity, on a probe
+            // that always ran the ORIG arm in the cold outer slot). With a fixed schedule
+            // that bias lands entirely on whichever arm owns slot 1, and it is LARGER than
+            // the lever — the first version of this probe reported the candidate at 1.126
+            // against a null of 1.185, i.e. the schedule, not the code.
+            //
+            // So the quartet flips with the round: ABBA on even rounds, BAAB on odd. Each
+            // arm then owns the cold slot in half the replicates and the position effect
+            // cancels in the aggregate ratio instead of being attributed to the candidate.
+            // The A/A null is still same-arm-over-same-arm and still SEES the effect, which
+            // is what makes the candidate's separation from it meaningful.
+            let orig_first = round % 2 == 0;
+            let (orig_1, head_1, head_2, orig_2) = if orig_first {
+                let a1 = arm(true, &mut sixteen_solves)?;
+                let b1 = arm(false, &mut sixteen_solves)?;
+                let b2 = arm(false, &mut sixteen_solves)?;
+                let a2 = arm(true, &mut sixteen_solves)?;
+                (a1, b1, b2, a2)
+            } else {
+                let b1 = arm(false, &mut sixteen_solves)?;
+                let a1 = arm(true, &mut sixteen_solves)?;
+                let a2 = arm(true, &mut sixteen_solves)?;
+                let b2 = arm(false, &mut sixteen_solves)?;
+                (a1, b1, b2, a2)
+            };
+            black_box(checksum);
+
+            if round == 0 {
+                continue;
+            }
+            factor_ms.push(factored);
+            let head = (head_1 + head_2) / 2.0;
+            let orig = (orig_1 + orig_2) / 2.0;
+            solve_ms.push(head);
+            orig_solve_ms.push(orig);
+            ab.push(orig / head);
+            // The null is taken from whichever arm occupied the two OUTER slots this round,
+            // so it carries the same cold/warm exposure the ratio has to clear.
+            nulls.push(if orig_first {
+                orig_1 / orig_2
+            } else {
+                head_1 / head_2
+            });
+        }
+
+        let factor_median = median(factor_ms.clone());
+        let solve_median = median(solve_ms.clone());
+        let job = factor_median + solve_median;
+        println!(
+            "split: n={n} rhs_count={SPLU_RHS_COUNT} factor_p50_ms={factor_median:.6} \
+             sixteen_solves_p50_ms={solve_median:.6} factor_plus_solves_p50_ms={job:.6} \
+             solve_share={:.4} per_solve_p50_ms={:.6} factor_payload_bytes={factor_payload}",
+            solve_median / job,
+            solve_median / SPLU_RHS_COUNT as f64,
+        );
+        // A/B DECIDED only when the candidate ratios and the A/A nulls SEPARATE at the
+        // replicate level: the candidate's p10 must clear the null's p90 or vice versa. A
+        // median that merely sits outside a null's extremes is one outlier away from either
+        // verdict.
+        let ab_median = median(ab.clone());
+        let null_median = median(nulls.clone());
+        let (ab_low, ab_high) = (percentile(ab.clone(), 0.10), percentile(ab.clone(), 0.90));
+        let (null_low, null_high) = (
+            percentile(nulls.clone(), 0.10),
+            percentile(nulls.clone(), 0.90),
+        );
+        let decided = ab_low > null_high || ab_high < null_low;
+        println!(
+            "AB(materialized/composed): median={ab_median:.6} p10_p90=[{ab_low:.6},{ab_high:.6}] \
+             orig_sixteen_solves_p50_ms={:.6} verdict={} dispatch_observed={dispatch_observed}",
+            median(orig_solve_ms.clone()),
+            if !dispatch_observed {
+                "VOID_NO_DISPATCH"
+            } else if decided {
+                "DECIDED"
+            } else {
+                "IN-FLOOR"
+            },
+        );
+        println!(
+            "solve_A/A: median={null_median:.6} p10_p90=[{null_low:.6},{null_high:.6}] raw={}",
+            csv(&nulls)
+        );
+        println!("factor_raw_ms={}", csv(&factor_ms));
+        println!("composed_solve_raw_ms={}", csv(&solve_ms));
+        println!("materialized_solve_raw_ms={}", csv(&orig_solve_ms));
+        println!("loadavg_after={}", loadavg());
+        Ok(())
     }
 
     fn run_splu_family(arguments: &[String], family: SpluFamily) -> Result<(), String> {
@@ -3431,6 +3717,21 @@ mod cubic_live {
         println!(
             "harness_source_sha256={:x}",
             Sha256::digest(HARNESS_SOURCE_BYTES)
+        );
+        // SOURCE MARKER ON THE ROW ITSELF, not only behind `--source-marker`.
+        //
+        // A source sha proves which bytes the compiler read; it does not help a reader who is
+        // holding a printed row and asking "was this binary built from the source I think it
+        // was". The marker is a value I can FLIP in one edit, so the freshness check has two
+        // observable arms: build with `-a` and the row says `-a`, change the const and the row
+        // must say the new value. This is the check that catches the failure actually seen in
+        // this session — `rch exec -- cargo test` returned exit 0 and 5/5 green while running
+        // a test that had already been deleted from the working tree (frankenscipy-ozg54),
+        // because the remote arm built the COMMITTED tree. A stale binary now contradicts its
+        // own row instead of passing silently.
+        println!(
+            "perf_spsolve_source_marker={}",
+            super::PERF_SPSOLVE_SOURCE_MARKER
         );
 
         if observed_os_threads()? != 1 {
@@ -3659,7 +3960,12 @@ mod cubic_live {
             "observed_workers: candidate=1 control=1 live_scipy=1 \
              matrix_rhs_sha256={shared_input_sha256}"
         );
-        let _keep = print_measurement_named(&measurement, family.decision_label(), 0.005);
+        let _keep = print_measurement_named(
+            &measurement,
+            family.decision_label(),
+            0.005,
+            family.ab_control(),
+        );
         Ok(())
     }
 
@@ -3712,11 +4018,106 @@ mod cubic_live {
             assert_eq!(drifted.second_null_left / drifted.second_null_right, 1.0);
         }
 
+        /// The narrowed successor to `convection_live_refuses_deleted_control`.
+        ///
+        /// That test pinned a BLANKET refusal of the convection arm, added because its
+        /// lazy-column A/B control had been deleted from production. The intent was right —
+        /// do not claim an A/B decision on a control that no longer exists — but the refusal
+        /// also blocked the plain vs-incumbent measurement, which never read that toggle.
+        /// This keeps the intent and drops the over-reach: the arm runs, and it is pinned
+        /// to claim no A/B.
+        ///
+        /// TWO ARMS, because a predicate that answered "no decision" for everything would
+        /// pass a one-armed version of this test: the spectral families must still claim one.
         #[test]
-        fn convection_live_refuses_deleted_control() {
-            let error = super::run_convection_splu(&[])
-                .expect_err("a deleted production control cannot support a live A/B");
-            assert!(error.contains("no longer has a production read path"));
+        fn convection_reports_no_ab_decision_while_the_spectral_families_still_do() {
+            use super::SpluFamily;
+
+            // MUST-MISS: no A/B control, so no KEEP/REVERT word at either truth value.
+            assert!(!SpluFamily::Convection.ab_control());
+            assert_eq!(super::decision_word(true, false), "NO_AB_DECISION");
+            assert_eq!(super::decision_word(false, false), "NO_AB_DECISION");
+
+            // MUST-HIT: the spectral families are unchanged and still decide.
+            for family in [
+                SpluFamily::Dirichlet,
+                SpluFamily::Neumann,
+                SpluFamily::PeriodicCuboid,
+            ] {
+                assert!(family.ab_control(), "{} must keep its A/B", family.name());
+            }
+            assert_eq!(super::decision_word(true, true), "KEEP");
+            assert_eq!(super::decision_word(false, true), "REVERT");
+        }
+
+        /// The other half of the deleted test's intent: the convection arm must not advertise
+        /// a spectral fast path it does not have, and its label must not name the deleted
+        /// control. A stale label is what a later reader greps for and believes.
+        #[test]
+        fn convection_claims_no_spectral_hits_and_no_deleted_control_label() {
+            use super::SpluFamily;
+
+            SpluFamily::Convection.reset_hits();
+            assert_eq!(SpluFamily::Convection.expected_hits(), (0, 0));
+            assert_eq!(SpluFamily::Convection.hits(), (0, 0));
+            // There is no toggle behind this family; flipping the switch must not invent one.
+            SpluFamily::Convection.set_disabled(true);
+            assert_eq!(SpluFamily::Convection.hits(), (0, 0));
+            SpluFamily::Convection.set_disabled(false);
+
+            let label = SpluFamily::Convection.decision_label();
+            assert_eq!(label, "CONVECTION_SPLU_VS_INCUMBENT");
+            assert!(
+                !label.contains("LAZY_COLUMNS"),
+                "the label must not name a control that was deleted: {label}"
+            );
+            // MUST-HIT arm for the same assertion: a family that DOES decide still says so.
+            assert!(
+                SpluFamily::Dirichlet
+                    .decision_label()
+                    .ends_with("_DECISION")
+            );
+        }
+
+        /// The diagnostic added for `frankenscipy-run7d` must separate the two ways a null
+        /// median can sit outside the 2% band, because they call for opposite responses:
+        /// a CI excluding unity means the schedule really is biased and the ratio above it is
+        /// contaminated; a CI including unity means the null is merely imprecise and the
+        /// remedy is more replicates.
+        ///
+        /// BOTH ARMS, using the real numbers that motivated it. The pinned 2026-08-23 run of
+        /// the convection cell had all four nulls spanning unity while three of them failed
+        /// the 2% median gate — that is the MUST-HIT case, and reading those failures as an
+        /// ordering effect (which is what happened) is the mistake this pins against. The
+        /// MUST-MISS case is a genuinely biased null.
+        #[test]
+        fn null_ci_unity_predicate_separates_biased_from_imprecise() {
+            // MUST-HIT: every null from that run, medians far off unity, CIs spanning it.
+            for (median, low, high) in [
+                (0.949420, 0.906662, 1.025266), // candidate_A/A   — failed the 2% gate
+                (0.938835, 0.890318, 1.023263), // control_A/A     — failed the 2% gate
+                (1.021569, 0.993653, 1.056437), // live_A/A        — failed the 2% gate
+                (0.994113, 0.981449, 1.129099), // candidate_live_pair — passed it
+            ] {
+                assert!(
+                    super::null_ci_spans_unity(low, high),
+                    "median {median} with ci [{low},{high}] is consistent with no bias"
+                );
+            }
+            // ... and three of those four really did fail the median gate, so the diagnostic
+            // is reporting something the gate line did not already say.
+            assert!(!(0.949420f64 - 1.0).abs().le(&0.02));
+            assert!(!(0.938835f64 - 1.0).abs().le(&0.02));
+            assert!(!(1.021569f64 - 1.0).abs().le(&0.02));
+
+            // MUST-MISS: a null whose CI clears unity entirely is BIASED, and the predicate
+            // has to say so. Without this arm a predicate returning `true` unconditionally
+            // would pass — and would silently excuse every contaminated run.
+            assert!(!super::null_ci_spans_unity(1.041, 1.078));
+            assert!(!super::null_ci_spans_unity(0.902, 0.981));
+            // Touching unity from either side still counts as spanning it.
+            assert!(super::null_ci_spans_unity(1.0, 1.2));
+            assert!(super::null_ci_spans_unity(0.8, 1.0));
         }
 
         #[test]
@@ -3747,6 +4148,21 @@ fn main() {
     if raw_arguments.get(1).map(String::as_str) == Some("--source-marker") {
         println!("perf_spsolve_source_marker={PERF_SPSOLVE_SOURCE_MARKER}");
         return;
+    }
+    if raw_arguments.get(1).map(String::as_str) == Some("--convection-split") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            if let Err(error) = cubic_live::run_convection_split(&raw_arguments[2..]) {
+                eprintln!("CONVECTION_SPLIT_FATAL {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--convection-split requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
     }
     if raw_arguments.get(1).map(String::as_str) == Some("--convection-splu-live") {
         #[cfg(feature = "sparse-incumbent-bench")]

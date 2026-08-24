@@ -2604,9 +2604,17 @@ fn apply_supernode_tails(
             // re-fills it from nothing.
             let mut value = 0.0f64;
             let mut exists = false;
+            // STRIDED, NOT RE-SLICED. This loop reads exactly ONE element per pivot,
+            // `tail_vals_flat[k * span + right]`, so building the whole `k`-th row as a
+            // slice first was `w` range computations and `w` range checks to reach `w`
+            // elements. Column `right` of the flat buffer is the arithmetic progression
+            // `right, right + span, right + 2*span, ...`, which a slice iterator plus
+            // `step_by` walks with no per-element bounds check at all.
+            // Same values, same `k` order, same additions ⇒ bit-identical.
+            let mut index = right;
             for (k, &multiplier) in multipliers.iter().enumerate() {
-                let tail = &tail_vals_flat[k * span..(k + 1) * span];
-                value += -multiplier * tail[right];
+                value += -multiplier * tail_vals_flat[index];
+                index += span;
                 if value == 0.0 {
                     if exists && k + 1 < width {
                         return false;
@@ -2629,9 +2637,12 @@ fn apply_supernode_tails(
             // entry and the next pivot re-fills it from nothing. A zero on the LAST pivot
             // is fine -- the final check below drops it, exactly as sequential would.
             let mut value = target_vals[left];
+            // Same strided walk as the fill branch above, and for the same reason: one
+            // element per pivot, so re-slicing the row to reach it was pure overhead.
+            let mut index = right;
             for (k, &multiplier) in multipliers.iter().enumerate() {
-                let tail = &tail_vals_flat[k * span..(k + 1) * span];
-                value += -multiplier * tail[right];
+                value += -multiplier * tail_vals_flat[index];
+                index += span;
                 if value == 0.0 && k + 1 < width {
                     return false;
                 }
@@ -3699,24 +3710,77 @@ impl NativeSparseLu {
             });
         }
 
-        // Solve A·x = b as (P·A·Pᵀ)·(P·x) = P·b. Permute the rhs into the factored
-        // space, back-substitute, then map the solution back: x[fill_perm[i]] = z[i].
-        let permuted_storage;
-        let rhs: &[f64] = match &self.fill_perm {
-            Some(p) => {
-                permuted_storage = p.iter().map(|&old| b[old]).collect::<Vec<f64>>();
-                &permuted_storage
-            }
-            None => b,
-        };
-
+        // Solve A·x = b as (P·A·Pᵀ)·(P·x) = P·b, then map back: x[fill_perm[i]] = z[i].
+        //
+        // THE PERMUTED RHS IS NEVER MATERIALIZED. It used to be built as a whole
+        // n-vector, `permuted_storage[i] = b[fill_perm[i]]`, purely so the forward
+        // substitution could read `rhs[row_perm[row]]`. Those are two index maps
+        // applied one after the other to the SAME element, so they compose:
+        // `b[fill_perm[row_perm[row]]]`. Each element is read exactly once either
+        // way, so this loads the identical f64 in the identical order — the result
+        // is bit-identical by construction, not by tolerance — while removing one
+        // n-element allocation and one n-element write from EVERY solve. On the
+        // shape this exists for that is sixteen of each per job
+        // (frankenscipy-run7d), and the solve is 34.6% of that job measured at
+        // n=4,096 (`perf_spsolve --convection-split`).
+        //
+        // `y` STAYS a zeroed n-vector, and the zeroing IS dead work — row `i` is
+        // written before any later row reads it, so nothing ever reads a zero. It
+        // was built by `push` for one measured window and that cost 46%: MEASURED
+        // 2026-08-23 at n=4,096, sixteen solves went 6.887 ms → 10.054 ms while the
+        // untouched factorization in the SAME window went 13.003 ms → 10.459 ms,
+        // i.e. the host was faster and only the substitution was slower. The reason
+        // is the inner read, not the push: `y[col]` against a Vec whose `len` grows
+        // every iteration is a bounds check against a moving bound, which LLVM
+        // cannot hoist out of the loop, whereas indexing a fixed-length buffer can
+        // be. Trading one n-element memset for a per-NONZERO check is a bad trade at
+        // any fill level. Do not re-take this without a paired measurement.
+        //
+        // The arms below are the same four lines repeated on purpose. Resolving
+        // `fill_perm` INSIDE the row loop would put a loop-invariant discriminant
+        // test in a per-element path, and this codebase has already paid 13% for
+        // exactly that shape once (`perf_toggle_read_in_hot_loop_is_a_barrier`, the
+        // splu merge kernel). The branch is taken once, outside — and so is the
+        // A/B toggle, read here at the call boundary rather than per row.
+        let materialize =
+            SPLU_SOLVE_FORCE_MATERIALIZED_RHS.load(std::sync::atomic::Ordering::Relaxed);
         let mut y = vec![0.0; self.n];
-        for row in 0..self.n {
-            let mut value = rhs[self.row_perm[row]];
-            for &(col, multiplier) in &self.l_rows[row] {
-                value -= multiplier * y[col];
+        match self.fill_perm.as_deref() {
+            Some(fill) if materialize => {
+                // ORIG arm of the `frankenscipy-run7d` A/B: build the whole permuted
+                // rhs first, then index it through `row_perm`. Kept so both arms live
+                // in ONE shipping binary and the comparison is paired rather than
+                // cross-window; it is not a tuning knob and defaults off.
+                let permuted = fill.iter().map(|&old| b[old]).collect::<Vec<f64>>();
+                for row in 0..self.n {
+                    let mut value = permuted[self.row_perm[row]];
+                    for &(col, multiplier) in &self.l_rows[row] {
+                        value -= multiplier * y[col];
+                    }
+                    y[row] = value;
+                }
             }
-            y[row] = value;
+            Some(fill) => {
+                for row in 0..self.n {
+                    let mut value = b[fill[self.row_perm[row]]];
+                    for &(col, multiplier) in &self.l_rows[row] {
+                        value -= multiplier * y[col];
+                    }
+                    y[row] = value;
+                }
+            }
+            None => {
+                // With no fill permutation there is nothing to materialize and nothing
+                // to compose, so both arms are this loop and the toggle is INERT here.
+                // Any A/B row taken on a natural-ordering fixture is measuring nothing.
+                for row in 0..self.n {
+                    let mut value = b[self.row_perm[row]];
+                    for &(col, multiplier) in &self.l_rows[row] {
+                        value -= multiplier * y[col];
+                    }
+                    y[row] = value;
+                }
+            }
         }
 
         // THE DIAGONAL IS THE FIRST ENTRY, so stop searching for it. `u_rows[row]`
@@ -13581,6 +13645,147 @@ mod tests {
     }
 
     #[test]
+    fn composed_solve_indices_are_bit_identical_to_materializing_the_permuted_rhs() {
+        // The forward substitution stopped building `permuted_storage[i] = b[fill_perm[i]]`
+        // and now reads `b[fill_perm[row_perm[row]]]` directly. The claim is that composing
+        // the two index maps loads the identical element, so the answer is bit-identical —
+        // not close, identical. This executes that claim against a reference that DOES
+        // materialize the permuted rhs, rather than restating it in a comment.
+        // This test WRITES a process-global A/B toggle, so it takes the shared lock: without
+        // it a concurrently-running test could read this test's arm, and vice versa
+        // (frankenscipy-0zn0v / defect_global_toggle_test_race).
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Two maps compose here — the fill permutation and the row (pivot) permutation — and
+        // one fixture does not exercise both. The 2-D Laplacian generates fill but never needs
+        // a pivot swap, so its `row_perm` is the identity; the tiny nonsymmetric matrix below
+        // has a first pivot of 1e-14 against a 1.0 beneath it, which forces the swap. Each
+        // fixture declares which map it covers, and the coverage is ASSERTED at the end rather
+        // than assumed, so a future reordering that quietly makes both identities fails here
+        // instead of passing vacuously.
+        let laplacian = laplacian_2d_for_mmd(12);
+        let pivoting = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0e-14, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            vec![0, 0, 1, 1, 1, 2, 2],
+            vec![0, 1, 0, 1, 2, 1, 2],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+
+        let mut saw_nonidentity_fill = false;
+        let mut saw_nonidentity_row_perm = false;
+
+        for (label, matrix) in [
+            ("laplacian_2d(12)", &laplacian),
+            ("pivoting_3x3", &pivoting),
+        ] {
+            let lu = NativeSparseLu::factorize_csr(matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            let n = matrix.shape().rows;
+            let fill = lu.fill_perm.clone();
+            saw_nonidentity_fill |= fill
+                .as_deref()
+                .is_some_and(|p| p.iter().enumerate().any(|(new_i, &old_i)| new_i != old_i));
+            saw_nonidentity_row_perm |= lu.row_perm.iter().enumerate().any(|(i, &p)| i != p);
+
+            let b = (0..n)
+                .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+                .collect::<Vec<f64>>();
+
+            // Reference: materialize P·b first, exactly as the code did before the change.
+            let permuted: Vec<f64> = match fill.as_deref() {
+                Some(p) => p.iter().map(|&old| b[old]).collect(),
+                None => b.clone(),
+            };
+            let mut reference = vec![0.0; n];
+            for row in 0..n {
+                let mut value = permuted[lu.row_perm[row]];
+                for &(col, multiplier) in &lu.l_rows[row] {
+                    value -= multiplier * reference[col];
+                }
+                reference[row] = value;
+            }
+            for row in (0..n).rev() {
+                let entries = &lu.u_rows[row];
+                let (diagonal_col, pivot) = entries[0];
+                assert_eq!(diagonal_col, row, "{label}: reference needs diagonal-first");
+                let mut value = reference[row];
+                for &(col, entry) in &entries[1..] {
+                    value -= entry * reference[col];
+                }
+                reference[row] = value / pivot;
+            }
+            let expected = match fill.as_deref() {
+                Some(p) => {
+                    let mut unpermuted = vec![0.0; n];
+                    for (new_i, &old_i) in p.iter().enumerate() {
+                        unpermuted[old_i] = reference[new_i];
+                    }
+                    unpermuted
+                }
+                None => reference,
+            };
+
+            // Drive BOTH arms of the toggle, and prove the dispatch was observed rather than
+            // assuming it: `dispatch_observed` returning false would mean the two "arms" are
+            // the same code and the identity below is a comparison of a thing with itself.
+            SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(true, std::sync::atomic::Ordering::Relaxed);
+            let observed =
+                SPLU_SOLVE_FORCE_MATERIALIZED_RHS.dispatch_observed(|| {
+                    let _ = lu.solve(&b);
+                });
+            let materialized = lu.solve(&b).expect("the ORIG arm succeeds");
+            SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(observed, "{label}: the solve never consulted the A/B toggle");
+
+            let actual = lu.solve(&b).expect("the shipping solve succeeds");
+            for (index, (composed, orig)) in actual.iter().zip(&materialized).enumerate() {
+                assert_eq!(
+                    composed.to_bits(),
+                    orig.to_bits(),
+                    "{label}: arm {index} differs across SPLU_SOLVE_FORCE_MATERIALIZED_RHS"
+                );
+            }
+            assert_eq!(actual.len(), expected.len(), "{label}");
+            for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{label}: component {index} differs: composed {got} vs materialized {want}"
+                );
+            }
+
+            // MUST-MISS arm for the comparison itself: `to_bits` has to be able to SEE a
+            // difference, or "every component matched" is a statement about the assertion
+            // rather than about the code. One ulp on one component must break it.
+            let mut perturbed = expected.clone();
+            let probe = n / 2;
+            perturbed[probe] = f64::from_bits(perturbed[probe].to_bits() ^ 1);
+            assert!(
+                actual
+                    .iter()
+                    .zip(&perturbed)
+                    .any(|(got, want)| got.to_bits() != want.to_bits()),
+                "{label}: a one-ulp perturbation must be visible to this comparison"
+            );
+        }
+
+        assert!(
+            saw_nonidentity_fill,
+            "no fixture produced a non-identity fill permutation, so the composition is untested"
+        );
+        assert!(
+            saw_nonidentity_row_perm,
+            "no fixture produced a non-identity row permutation, so the composition is untested"
+        );
+    }
+
+    #[test]
     fn emitted_u_rows_carry_the_diagonal_first_or_the_matrix_is_singular() {
         // The back substitution stopped searching for the diagonal and now reads
         // `u_rows[row][0]`. That is only sound because U rows are emitted from an
@@ -14567,6 +14772,182 @@ mod tests {
             .collect();
         let multipliers: Vec<f64> = (0..width).map(|k| 0.3 + 0.11 * k as f64).collect();
         (target, tail_cols, tail_vals_flat, multipliers)
+    }
+
+    /// Like `measured_cell_shaped_block`, but the target SHARES columns with the tail so the
+    /// merge kernel's Equal branch runs.
+    ///
+    /// The disjoint fixture (target on even columns, tail on odd) exercises only the fill
+    /// branch. Every column here is in both, so every element goes through the reuse path
+    /// where the accumulator is seeded from the target's own value.
+    fn overlapping_cell_shaped_block(
+        span: usize,
+        width: usize,
+    ) -> (SortedFactorRow, Vec<u32>, Vec<f64>, Vec<f64>) {
+        let entries: Vec<(usize, f64)> = (0..span)
+            .map(|i| (2 * i, 1.0 + (i % 17) as f64 * 0.25))
+            .collect();
+        let target = sorted_row_from_entries(entries);
+        // SAME columns as the target, so `left_col == right_col` every time.
+        let tail_cols: Vec<u32> = (0..span).map(|i| (2 * i) as u32).collect();
+        let tail_vals_flat: Vec<f64> = (0..width * span)
+            .map(|i| ((i % 23) as f64) * 0.125 - 1.0)
+            .collect();
+        let multipliers: Vec<f64> = (0..width).map(|k| 0.3 + 0.11 * k as f64).collect();
+        (target, tail_cols, tail_vals_flat, multipliers)
+    }
+
+    /// The merge kernel's inner loop now walks column `right` of the flat tail buffer by
+    /// INDEX ARITHMETIC (`index = right; index += span`) instead of re-slicing the `k`-th
+    /// row as `&tail_vals_flat[k * span..(k + 1) * span]` and indexing that. The claim is
+    /// that this reaches the same element in the same order, so the merged row is
+    /// bit-identical — not close, identical.
+    ///
+    /// This executes the claim against a REFERENCE THAT USES THE OLD SLICE FORM. That is the
+    /// point: comparing the new walk against `k * span + right` would be comparing the new
+    /// code with a restatement of itself, and a stride/offset transposition — the realistic
+    /// way to get this wrong — would pass. The reference below is the code that was there
+    /// before, so a transposition produces different VALUES and fails.
+    #[test]
+    fn merge_kernel_index_walk_is_bit_identical_to_the_old_slice_form() {
+        // Widths above 1 are what exercise the stride at all; width 1 is included only to
+        // show the degenerate case still agrees.
+        for (span, width, overlap) in [
+            (1usize, 1usize, false),
+            (3, 4, false),
+            (7, 2, false),
+            (300, 5, false),
+            (64, 12, false),
+            // OVERLAPPING fixtures. `measured_cell_shaped_block` puts the target on even
+            // columns and the tail on odd ones, so they never coincide and the kernel's
+            // Equal branch -- the REUSE path, where the running value starts from the
+            // target's own entry -- is NEVER TAKEN. A negative control proved that: with
+            // only the disjoint fixtures, transposing the stride in that branch to
+            // `span + 1` left this test GREEN. These cases fix the hole.
+            (5, 3, true),
+            (64, 12, true),
+            (300, 5, true),
+        ] {
+            let (target, tail_cols, tail_vals_flat, multipliers) = if overlap {
+                overlapping_cell_shaped_block(span, width)
+            } else {
+                measured_cell_shaped_block(span, width)
+            };
+            assert_eq!(tail_vals_flat.len(), width * span);
+            if overlap {
+                // MUST-HIT: assert the reuse branch is actually reachable on this fixture,
+                // or the coverage this case exists for is imaginary.
+                let base = target.start;
+                let shared = target.cols[base..]
+                    .iter()
+                    .filter(|c| tail_cols.contains(c))
+                    .count();
+                assert!(
+                    shared > 0,
+                    "span={span} width={width}: an overlapping fixture must share columns"
+                );
+            }
+
+            let mut scratch = SortedFactorRow::default();
+            let applied = apply_supernode_tails(
+                &target,
+                &mut scratch,
+                0,
+                &multipliers,
+                &tail_cols,
+                &tail_vals_flat,
+            );
+            assert!(
+                applied,
+                "span={span} width={width}: the fixture must not trip the cancellation \
+                 refusal, or this row proves nothing about the arithmetic"
+            );
+
+            // REFERENCE: the merge exactly as it was written before this change, with the
+            // per-pivot row rebuilt as a slice. Same branches, same order, same additions.
+            let base = target.start;
+            let target_cols = &target.cols[base..];
+            let target_vals = &target.vals[base..];
+            let mut expected_cols: Vec<u32> = Vec::new();
+            let mut expected_vals: Vec<f64> = Vec::new();
+            let (mut left, mut right) = (0usize, 0usize);
+            while left < target_cols.len() && right < span {
+                let (lc, rc) = (target_cols[left], tail_cols[right]);
+                if lc < rc {
+                    expected_cols.push(lc);
+                    expected_vals.push(target_vals[left]);
+                    left += 1;
+                } else if lc > rc {
+                    let mut value = 0.0f64;
+                    for k in 0..width {
+                        let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                        value += -multipliers[k] * tail[right];
+                    }
+                    if value != 0.0 {
+                        expected_cols.push(rc);
+                        expected_vals.push(value);
+                    }
+                    right += 1;
+                } else {
+                    let mut value = target_vals[left];
+                    for k in 0..width {
+                        let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                        value += -multipliers[k] * tail[right];
+                    }
+                    expected_cols.push(lc);
+                    expected_vals.push(value);
+                    left += 1;
+                    right += 1;
+                }
+            }
+            while left < target_cols.len() {
+                expected_cols.push(target_cols[left]);
+                expected_vals.push(target_vals[left]);
+                left += 1;
+            }
+            while right < span {
+                let mut value = 0.0f64;
+                for k in 0..width {
+                    let tail = &tail_vals_flat[k * span..(k + 1) * span];
+                    value += -multipliers[k] * tail[right];
+                }
+                if value != 0.0 {
+                    expected_cols.push(tail_cols[right]);
+                    expected_vals.push(value);
+                }
+                right += 1;
+            }
+
+            let got_cols = &scratch.cols[scratch.start..];
+            let got_vals = &scratch.vals[scratch.start..];
+            assert_eq!(
+                got_cols.len(),
+                expected_cols.len(),
+                "span={span} width={width}: entry count"
+            );
+            for (i, (&got, &want)) in got_cols.iter().zip(&expected_cols).enumerate() {
+                assert_eq!(got, want, "span={span} width={width}: column {i}");
+            }
+            for (i, (&got, &want)) in got_vals.iter().zip(&expected_vals).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "span={span} width={width}: value {i} ({got} vs {want})"
+                );
+            }
+
+            // MUST-MISS arm for the comparison itself: a one-ulp change in ONE value has to
+            // be visible, or "everything matched" is a statement about the assertion rather
+            // than about the kernel.
+            if !expected_vals.is_empty() {
+                let probe = expected_vals.len() / 2;
+                let perturbed = f64::from_bits(expected_vals[probe].to_bits() ^ 1);
+                assert!(
+                    got_vals[probe].to_bits() != perturbed.to_bits(),
+                    "span={span} width={width}: a one-ulp perturbation must be visible"
+                );
+            }
+        }
     }
 
     #[test]
@@ -26032,6 +26413,26 @@ pub static SPLU_BACK_MERGE_ENABLE: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_BACK_MERGE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// When `true`, `NativeSparseLu::solve` materializes the permuted right-hand side as a whole
+/// n-vector before the forward substitution, the way it did before `frankenscipy-run7d`,
+/// instead of composing the two index maps into `b[fill_perm[row_perm[row]]]`.
+///
+/// ACCURACY CONTRACT: **bit-identical**, and by construction rather than by tolerance. Both
+/// arms read each rhs element exactly once, in the same order, and feed the identical f64 into
+/// an identical substitution; only the buffer between the load and the use differs.
+/// `composed_solve_indices_are_bit_identical_to_materializing_the_permuted_rhs` executes that
+/// claim with `to_bits()` on two fixtures — one carrying a non-identity fill permutation, one
+/// forcing a non-identity pivot permutation — and asserts a one-ulp perturbation is visible to
+/// the comparison.
+///
+/// Exists so the A/B is PAIRED inside one binary and one window. It is not a tuning knob: an
+/// earlier cross-window reading of this same change could not be separated from host drift,
+/// because the untouched factorization moved 21% between the two windows.
+///
+/// INERT under natural ordering — with `fill_perm == None` there is nothing to materialize, so
+/// both arms are the same loop and any ratio taken on such a fixture is measuring noise.
+#[doc(hidden)]
+pub static SPLU_SOLVE_FORCE_MATERIALIZED_RHS: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_ROW_HEAD_CACHE_DISABLE: PerfToggle = PerfToggle::new(false);
 /// Factorizations that took the head-cache arm. A harness that cannot show this
