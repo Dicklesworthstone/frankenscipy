@@ -4,6 +4,7 @@
 // Cosine-sine decomposition building blocks (LAPACK dorcsd/dorbdb/dbbcsd port,
 // in progress — see bead frankenscipy-5tmu1).
 pub mod cossin;
+pub mod interpolative;
 
 // Francis double-shift QR with LAPACK's exceptional shifts; the PARITY half of
 // frankenscipy-sez4r, where bounded_schur was only the robustness half.
