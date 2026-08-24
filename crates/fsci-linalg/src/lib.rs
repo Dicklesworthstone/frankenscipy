@@ -23776,6 +23776,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn parallel_gather_dsymv_is_bit_identical_to_the_double_read_scatter() {
         let n = 640usize;
         let start = 7usize;
