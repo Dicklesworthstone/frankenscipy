@@ -1214,9 +1214,9 @@ mod cubic_live {
         CscMatrix, CsrMatrix, FormatConvertible, LuOptions, SPLU_CUBIC_NEUMANN_SPECTRAL_DISABLE,
         SPLU_CUBIC_NEUMANN_SPECTRAL_FACTOR_HITS, SPLU_CUBIC_NEUMANN_SPECTRAL_SOLVE_HITS,
         SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
-        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
-        SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions, SparseLuFactorization, splu,
-        splu_factor_payload_bytes, splu_solve, spsolve,
+        SPLU_CUBIC_SPECTRAL_SOLVE_HITS, SPLU_SOLVE_FORCE_MATERIALIZED_RHS,
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_HITS, SolveOptions,
+        SparseLuFactorization, splu, splu_factor_payload_bytes, splu_solve, spsolve,
     };
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet};
@@ -3507,7 +3507,10 @@ mod cubic_live {
         let mut factor_ms = Vec::with_capacity(rounds);
         let mut solve_ms = Vec::with_capacity(rounds);
         let mut nulls = Vec::with_capacity(rounds);
+        let mut orig_solve_ms = Vec::with_capacity(rounds);
+        let mut ab = Vec::with_capacity(rounds);
         let mut factor_payload = 0usize;
+        let mut dispatch_observed = false;
 
         // Round 0 is discarded, so the allocator and the page cache are warm in both phases
         // before anything is recorded.
@@ -3530,16 +3533,42 @@ mod cubic_live {
                 }
                 Ok(started.elapsed().as_secs_f64() * 1.0e3)
             };
-            let first = sixteen_solves(&factor)?;
-            let second = sixteen_solves(&factor)?;
+            // ABBA over the composed-index lever, inside ONE window. A cross-window
+            // before/after on this change is not readable: between two such windows the
+            // UNTOUCHED factorization moved 21% on this host, which is larger than the
+            // lever. A1 and A2 bracket B1 and B2, so a monotone drift over the quartet
+            // cancels in the A/B ratio and surfaces in the A/A null.
+            let arm = |materialize: bool,
+                       solves: &mut dyn FnMut(&SparseLuFactorization) -> Result<f64, String>|
+             -> Result<f64, String> {
+                SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(materialize, Ordering::Relaxed);
+                let elapsed = solves(&factor);
+                SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(false, Ordering::Relaxed);
+                elapsed
+            };
+            if round == 0 {
+                // TWO-ARM PROBE CONTROL. Before any timing is believed, prove the library
+                // actually CONSULTS the toggle: if it does not, both "arms" are the same code
+                // and every ratio below is an A/A comparison wearing an A/B label.
+                dispatch_observed = SPLU_SOLVE_FORCE_MATERIALIZED_RHS.dispatch_observed(|| {
+                    let _ = splu_solve(&factor, &fixture.right_hand_sides[0]);
+                });
+            }
+            let orig_1 = arm(true, &mut sixteen_solves)?;
+            let head_1 = arm(false, &mut sixteen_solves)?;
+            let head_2 = arm(false, &mut sixteen_solves)?;
+            let orig_2 = arm(true, &mut sixteen_solves)?;
             black_box(checksum);
 
             if round == 0 {
                 continue;
             }
             factor_ms.push(factored);
-            solve_ms.push(first);
-            nulls.push(first / second);
+            let head = (head_1 + head_2) / 2.0;
+            solve_ms.push(head);
+            orig_solve_ms.push((orig_1 + orig_2) / 2.0);
+            ab.push(((orig_1 + orig_2) / 2.0) / head);
+            nulls.push(orig_1 / orig_2);
         }
 
         let factor_median = median(factor_ms.clone());
@@ -3552,13 +3581,37 @@ mod cubic_live {
             solve_median / job,
             solve_median / SPLU_RHS_COUNT as f64,
         );
+        // A/B DECIDED only when the candidate ratios and the A/A nulls SEPARATE at the
+        // replicate level: the candidate's p10 must clear the null's p90 or vice versa. A
+        // median that merely sits outside a null's extremes is one outlier away from either
+        // verdict.
+        let ab_median = median(ab.clone());
+        let null_median = median(nulls.clone());
+        let (ab_low, ab_high) = (percentile(ab.clone(), 0.10), percentile(ab.clone(), 0.90));
+        let (null_low, null_high) = (
+            percentile(nulls.clone(), 0.10),
+            percentile(nulls.clone(), 0.90),
+        );
+        let decided = ab_low > null_high || ab_high < null_low;
         println!(
-            "solve_A/A: median={:.6} raw={}",
-            median(nulls.clone()),
+            "AB(materialized/composed): median={ab_median:.6} p10_p90=[{ab_low:.6},{ab_high:.6}] \
+             orig_sixteen_solves_p50_ms={:.6} verdict={} dispatch_observed={dispatch_observed}",
+            median(orig_solve_ms.clone()),
+            if !dispatch_observed {
+                "VOID_NO_DISPATCH"
+            } else if decided {
+                "DECIDED"
+            } else {
+                "IN-FLOOR"
+            },
+        );
+        println!(
+            "solve_A/A: median={null_median:.6} p10_p90=[{null_low:.6},{null_high:.6}] raw={}",
             csv(&nulls)
         );
         println!("factor_raw_ms={}", csv(&factor_ms));
-        println!("solve_raw_ms={}", csv(&solve_ms));
+        println!("composed_solve_raw_ms={}", csv(&solve_ms));
+        println!("materialized_solve_raw_ms={}", csv(&orig_solve_ms));
         println!("loadavg_after={}", loadavg());
         Ok(())
     }

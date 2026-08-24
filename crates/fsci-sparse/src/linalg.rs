@@ -3713,33 +3713,61 @@ impl NativeSparseLu {
         // (frankenscipy-run7d), and the solve is 34.6% of that job measured at
         // n=4,096 (`perf_spsolve --convection-split`).
         //
-        // `y` is likewise built by pushing rather than by zeroing an n-vector and
-        // overwriting it: row `i` is written before any later row reads it and no
-        // row reads its own slot, so every element is written before it is read and
-        // the zeroing was dead. `push` keeps that order exactly.
-        // The two arms below are the same four lines twice on purpose. Resolving
+        // `y` STAYS a zeroed n-vector, and the zeroing IS dead work — row `i` is
+        // written before any later row reads it, so nothing ever reads a zero. It
+        // was built by `push` for one measured window and that cost 46%: MEASURED
+        // 2026-08-23 at n=4,096, sixteen solves went 6.887 ms → 10.054 ms while the
+        // untouched factorization in the SAME window went 13.003 ms → 10.459 ms,
+        // i.e. the host was faster and only the substitution was slower. The reason
+        // is the inner read, not the push: `y[col]` against a Vec whose `len` grows
+        // every iteration is a bounds check against a moving bound, which LLVM
+        // cannot hoist out of the loop, whereas indexing a fixed-length buffer can
+        // be. Trading one n-element memset for a per-NONZERO check is a bad trade at
+        // any fill level. Do not re-take this without a paired measurement.
+        //
+        // The arms below are the same four lines repeated on purpose. Resolving
         // `fill_perm` INSIDE the row loop would put a loop-invariant discriminant
         // test in a per-element path, and this codebase has already paid 13% for
         // exactly that shape once (`perf_toggle_read_in_hot_loop_is_a_barrier`, the
-        // splu merge kernel). The branch is taken once, outside.
-        let mut y: Vec<f64> = Vec::with_capacity(self.n);
+        // splu merge kernel). The branch is taken once, outside — and so is the
+        // A/B toggle, read here at the call boundary rather than per row.
+        let materialize =
+            SPLU_SOLVE_FORCE_MATERIALIZED_RHS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut y = vec![0.0; self.n];
         match self.fill_perm.as_deref() {
+            Some(fill) if materialize => {
+                // ORIG arm of the `frankenscipy-run7d` A/B: build the whole permuted
+                // rhs first, then index it through `row_perm`. Kept so both arms live
+                // in ONE shipping binary and the comparison is paired rather than
+                // cross-window; it is not a tuning knob and defaults off.
+                let permuted = fill.iter().map(|&old| b[old]).collect::<Vec<f64>>();
+                for row in 0..self.n {
+                    let mut value = permuted[self.row_perm[row]];
+                    for &(col, multiplier) in &self.l_rows[row] {
+                        value -= multiplier * y[col];
+                    }
+                    y[row] = value;
+                }
+            }
             Some(fill) => {
                 for row in 0..self.n {
                     let mut value = b[fill[self.row_perm[row]]];
                     for &(col, multiplier) in &self.l_rows[row] {
                         value -= multiplier * y[col];
                     }
-                    y.push(value);
+                    y[row] = value;
                 }
             }
             None => {
+                // With no fill permutation there is nothing to materialize and nothing
+                // to compose, so both arms are this loop and the toggle is INERT here.
+                // Any A/B row taken on a natural-ordering fixture is measuring nothing.
                 for row in 0..self.n {
                     let mut value = b[self.row_perm[row]];
                     for &(col, multiplier) in &self.l_rows[row] {
                         value -= multiplier * y[col];
                     }
-                    y.push(value);
+                    y[row] = value;
                 }
             }
         }
@@ -13612,6 +13640,13 @@ mod tests {
         // the two index maps loads the identical element, so the answer is bit-identical —
         // not close, identical. This executes that claim against a reference that DOES
         // materialize the permuted rhs, rather than restating it in a comment.
+        // This test WRITES a process-global A/B toggle, so it takes the shared lock: without
+        // it a concurrently-running test could read this test's arm, and vice versa
+        // (frankenscipy-0zn0v / defect_global_toggle_test_race).
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
         // Two maps compose here — the fill permutation and the row (pivot) permutation — and
         // one fixture does not exercise both. The 2-D Laplacian generates fill but never needs
         // a pivot swap, so its `row_perm` is the identity; the tiny nonsymmetric matrix below
@@ -13685,7 +13720,26 @@ mod tests {
                 None => reference,
             };
 
+            // Drive BOTH arms of the toggle, and prove the dispatch was observed rather than
+            // assuming it: `dispatch_observed` returning false would mean the two "arms" are
+            // the same code and the identity below is a comparison of a thing with itself.
+            SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(true, std::sync::atomic::Ordering::Relaxed);
+            let observed =
+                SPLU_SOLVE_FORCE_MATERIALIZED_RHS.dispatch_observed(|| {
+                    let _ = lu.solve(&b);
+                });
+            let materialized = lu.solve(&b).expect("the ORIG arm succeeds");
+            SPLU_SOLVE_FORCE_MATERIALIZED_RHS.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert!(observed, "{label}: the solve never consulted the A/B toggle");
+
             let actual = lu.solve(&b).expect("the shipping solve succeeds");
+            for (index, (composed, orig)) in actual.iter().zip(&materialized).enumerate() {
+                assert_eq!(
+                    composed.to_bits(),
+                    orig.to_bits(),
+                    "{label}: arm {index} differs across SPLU_SOLVE_FORCE_MATERIALIZED_RHS"
+                );
+            }
             assert_eq!(actual.len(), expected.len(), "{label}");
             for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
                 assert_eq!(
@@ -26172,6 +26226,26 @@ pub static SPLU_BACK_MERGE_ENABLE: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_BACK_MERGE_FACTOR_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// When `true`, `NativeSparseLu::solve` materializes the permuted right-hand side as a whole
+/// n-vector before the forward substitution, the way it did before `frankenscipy-run7d`,
+/// instead of composing the two index maps into `b[fill_perm[row_perm[row]]]`.
+///
+/// ACCURACY CONTRACT: **bit-identical**, and by construction rather than by tolerance. Both
+/// arms read each rhs element exactly once, in the same order, and feed the identical f64 into
+/// an identical substitution; only the buffer between the load and the use differs.
+/// `composed_solve_indices_are_bit_identical_to_materializing_the_permuted_rhs` executes that
+/// claim with `to_bits()` on two fixtures — one carrying a non-identity fill permutation, one
+/// forcing a non-identity pivot permutation — and asserts a one-ulp perturbation is visible to
+/// the comparison.
+///
+/// Exists so the A/B is PAIRED inside one binary and one window. It is not a tuning knob: an
+/// earlier cross-window reading of this same change could not be separated from host drift,
+/// because the untouched factorization moved 21% between the two windows.
+///
+/// INERT under natural ordering — with `fill_perm == None` there is nothing to materialize, so
+/// both arms are the same loop and any ratio taken on such a fixture is measuring noise.
+#[doc(hidden)]
+pub static SPLU_SOLVE_FORCE_MATERIALIZED_RHS: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_ROW_HEAD_CACHE_DISABLE: PerfToggle = PerfToggle::new(false);
 /// Factorizations that took the head-cache arm. A harness that cannot show this
