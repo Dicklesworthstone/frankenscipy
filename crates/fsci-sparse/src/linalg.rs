@@ -6221,8 +6221,10 @@ fn gmres_inner(
 /// Apply previous Givens rotations to column j of H.
 fn apply_givens_to_column(h: &mut [Vec<f64>], cs: &[f64], sn: &[f64], j: usize) {
     for i in 0..j {
-        let temp = cs[i] * h[i][j] + sn[i] * h[i + 1][j];
-        h[i + 1][j] = -sn[i] * h[i][j] + cs[i] * h[i + 1][j];
+        let upper = h[i][j];
+        let lower = h[i + 1][j];
+        let temp = cs[i] * upper + sn[i] * lower;
+        h[i + 1][j] = -sn[i] * upper + cs[i] * lower;
         h[i][j] = temp;
     }
 }
@@ -20265,6 +20267,38 @@ mod tests {
                 expected.to_bits(),
                 "CSR row {row} changed the ordered dot-product bits"
             );
+        }
+    }
+
+    #[test]
+    fn givens_column_update_matches_reloaded_reference_bitwise() {
+        let mut reference = vec![
+            vec![0.25, -0.5, 0.75, -1.0],
+            vec![-0.125, 0.375, -0.625, 0.875],
+            vec![1.25, -1.5, 1.75, -2.0],
+            vec![0.5, -0.75, 1.0, -1.25],
+        ];
+        let mut hoisted = reference.clone();
+        let cs = [0.8, -0.6, 0.35];
+        let sn = [0.6, 0.8, -0.936_749_699_759_759_7];
+        let column = 3;
+
+        for i in 0..column {
+            let temp = cs[i] * reference[i][column] + sn[i] * reference[i + 1][column];
+            reference[i + 1][column] =
+                -sn[i] * reference[i][column] + cs[i] * reference[i + 1][column];
+            reference[i][column] = temp;
+        }
+        apply_givens_to_column(&mut hoisted, &cs, &sn, column);
+
+        for (row, (expected, actual)) in reference.iter().zip(&hoisted).enumerate() {
+            for (entry, (expected, actual)) in expected.iter().zip(actual).enumerate() {
+                assert_eq!(
+                    expected.to_bits(),
+                    actual.to_bits(),
+                    "Givens entry ({row}, {entry}) changed bits"
+                );
+            }
         }
     }
 
