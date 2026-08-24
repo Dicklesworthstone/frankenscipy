@@ -218,6 +218,46 @@ impl PackedTriangularRows {
             values,
         }
     }
+
+    /// Consume the final sorted elimination rows directly into the packed U factor.
+    ///
+    /// The shipping factorizer used to first allocate `Vec<Vec<(usize, f64)>>` for
+    /// U, then immediately copy every pair into this layout.  The final factor rows
+    /// already have the required column order, so this keeps the same filter and
+    /// accumulation order while removing that temporary pair-vector layer.
+    fn from_sorted_upper_rows(rows: Vec<SortedFactorRow>) -> Self {
+        let entry_count = rows
+            .iter()
+            .enumerate()
+            .map(|(row, entries)| {
+                entries
+                    .pairs()
+                    .filter(|(column, value)| *column >= row && *value != 0.0)
+                    .count()
+            })
+            .sum();
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        let mut columns = Vec::with_capacity(entry_count);
+        let mut values = Vec::with_capacity(entry_count);
+        offsets.push(0);
+
+        for (row, entries) in rows.into_iter().enumerate() {
+            for (column, value) in entries
+                .pairs()
+                .filter(|(column, value)| *column >= row && *value != 0.0)
+            {
+                columns.push(column as u32);
+                values.push(value);
+            }
+            offsets.push(columns.len());
+        }
+
+        Self {
+            offsets,
+            columns,
+            values,
+        }
+    }
 }
 
 /// A direct sine-transform plan for a strictly diagonally dominant 3-D
@@ -3053,6 +3093,7 @@ fn columns_share_a_supernode(current: &[usize], next_col: &[usize], next: usize)
 }
 
 impl NativeSparseLu {
+    #[cfg(test)]
     fn from_factor_rows(
         n: usize,
         row_perm: Vec<usize>,
@@ -3078,6 +3119,36 @@ impl NativeSparseLu {
             l_rows,
             #[cfg(test)]
             u_rows,
+            lower,
+            upper,
+            fill_perm,
+            inverse_fill_perm,
+            ordering_used,
+        }
+    }
+
+    #[cfg(not(test))]
+    fn from_factor_rows(
+        n: usize,
+        row_perm: Vec<usize>,
+        l_rows: Vec<Vec<(usize, f64)>>,
+        u_rows: Vec<SortedFactorRow>,
+        fill_perm: Option<Vec<usize>>,
+        ordering_used: PermutationOrdering,
+    ) -> Self {
+        let lower = PackedTriangularRows::from_rows(&l_rows);
+        let upper = PackedTriangularRows::from_sorted_upper_rows(u_rows);
+        let inverse_fill_perm = fill_perm.as_ref().map(|fill| {
+            let mut inverse = vec![0; n];
+            for (new_i, &old_i) in fill.iter().enumerate() {
+                inverse[old_i] = new_i;
+            }
+            inverse
+        });
+
+        Self {
+            n,
+            row_perm,
             lower,
             upper,
             fill_perm,
@@ -3444,6 +3515,7 @@ impl NativeSparseLu {
         #[cfg(test)]
         LIVE_ROW_ADJACENCY_AFTER_ELIMINATION.with(|cell| cell.set(row_allocation_adjacency(&rows)));
 
+        #[cfg(test)]
         let u_rows = rows
             .into_iter()
             .enumerate()
@@ -3454,6 +3526,8 @@ impl NativeSparseLu {
                     .collect()
             })
             .collect();
+        #[cfg(not(test))]
+        let u_rows = rows;
 
         Ok(Self::from_factor_rows(
             n,
@@ -3776,6 +3850,7 @@ impl NativeSparseLu {
             start_col = block_end;
         }
 
+        #[cfg(test)]
         let u_rows = rows
             .into_iter()
             .enumerate()
@@ -3786,6 +3861,8 @@ impl NativeSparseLu {
                     .collect()
             })
             .collect();
+        #[cfg(not(test))]
+        let u_rows = rows;
         Some(Self::from_factor_rows(
             n,
             row_perm,
@@ -14260,6 +14337,58 @@ mod tests {
         assert!(
             matches!(refused, Err(SparseError::SingularMatrix { .. })),
             "a column with no pivot must be refused, got {refused:?}"
+        );
+    }
+
+    #[test]
+    fn packed_upper_emission_from_sorted_rows_matches_pair_rows_bitwise() {
+        // The release path consumes `SortedFactorRow` directly.  Exercise a retired
+        // prefix as well as entries below the diagonal, then compare its exact
+        // packed bytes with the former pair-row staging representation.
+        let mut second = sorted_row_from_entries(vec![(0, -7.0), (1, 4.0), (2, 0.5)]);
+        second.drop_first();
+        let mut third = sorted_row_from_entries(vec![(0, 9.0), (1, -2.0), (2, 3.0)]);
+        third.drop_first();
+        third.drop_first();
+        let rows = vec![
+            sorted_row_from_entries(vec![(0, 2.0), (1, -3.0)]),
+            second,
+            third,
+        ];
+        let pair_rows: Vec<Vec<(usize, f64)>> = rows
+            .iter()
+            .enumerate()
+            .map(|(row, entries)| {
+                entries
+                    .pairs()
+                    .filter(|(column, value)| *column >= row && *value != 0.0)
+                    .collect()
+            })
+            .collect();
+        let expected = PackedTriangularRows::from_rows(&pair_rows);
+        let actual = PackedTriangularRows::from_sorted_upper_rows(rows);
+
+        assert_eq!(actual.offsets, expected.offsets);
+        assert_eq!(actual.columns, expected.columns);
+        assert_eq!(actual.values.len(), expected.values.len());
+        for (index, (actual_value, expected_value)) in
+            actual.values.iter().zip(&expected.values).enumerate()
+        {
+            assert_eq!(
+                actual_value.to_bits(),
+                expected_value.to_bits(),
+                "packed value {index} changed while bypassing the pair-row staging layer"
+            );
+        }
+
+        // MUST-MISS: the bitwise lane detects a one-ulp corruption instead of
+        // merely confirming matching lengths and column positions.
+        let mut corrupted = actual.clone();
+        corrupted.values[2] = f64::from_bits(corrupted.values[2].to_bits() + 1);
+        assert_ne!(
+            corrupted.values[2].to_bits(),
+            expected.values[2].to_bits(),
+            "the bitwise lane must reject a changed packed value"
         );
     }
 
