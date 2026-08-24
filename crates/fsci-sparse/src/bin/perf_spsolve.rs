@@ -2063,6 +2063,36 @@ mod cubic_live {
         result
     }
 
+    /// Ordering used by the fsci arms of the splu family live row, selected by
+    /// `FSCI_SPLU_ORDERING` and defaulting to the library default.
+    ///
+    /// EXISTS TO CERTIFY, NOT TO TUNE. The ordering sweep (df7a1fc52) showed min-degree cuts
+    /// this cell's fill 2.61x and its SOLVE 2.31x while making the whole job 1.96x WORSE,
+    /// because the exact min-degree is O(V^2) and `splu` pays it inside every factor call. A
+    /// solve-only speedup is a self-speedup; the only way to know what it is worth is to put
+    /// the SAME ordering in front of the live SuperLU arm in one invocation. This knob does
+    /// that and changes no default: unset, every arm runs exactly as it ships.
+    fn splu_arm_ordering() -> Result<PermutationOrdering, String> {
+        match std::env::var("FSCI_SPLU_ORDERING").ok().as_deref() {
+            None | Some("") | Some("default") => Ok(LuOptions::default().ordering),
+            Some("colamd") => Ok(PermutationOrdering::Colamd),
+            Some("rcm") => Ok(PermutationOrdering::ReverseCuthillMcKee),
+            Some("mmd-ata") => Ok(PermutationOrdering::MmdAta),
+            Some("mmd-at-plus-a") => Ok(PermutationOrdering::MmdAtPlusA),
+            Some("natural") => Ok(PermutationOrdering::Natural),
+            Some(other) => Err(format!(
+                "FSCI_SPLU_ORDERING={other:?} is not one of default|colamd|rcm|mmd-ata|mmd-at-plus-a|natural"
+            )),
+        }
+    }
+
+    fn splu_arm_options() -> Result<LuOptions, String> {
+        Ok(LuOptions {
+            ordering: splu_arm_ordering()?,
+            ..LuOptions::default()
+        })
+    }
+
     fn rust_splu_solutions(
         fixtures: &[SpluFixture],
         disable: bool,
@@ -2073,7 +2103,7 @@ mod cubic_live {
             let mut all_solutions = Vec::with_capacity(fixtures.len());
             let mut payload_bytes = 0usize;
             for fixture in fixtures {
-                let factor = splu(&fixture.csc, LuOptions::default())
+                let factor = splu(&fixture.csc, splu_arm_options()?)
                     .map_err(|error| format!("FrankenSciPy splu: {error}"))?;
                 payload_bytes = payload_bytes.saturating_add(splu_factor_payload_bytes(&factor));
                 let mut flattened = Vec::with_capacity(
@@ -2160,7 +2190,7 @@ mod cubic_live {
             let started = Instant::now();
             let mut checksum = 0u64;
             for fixture in fixtures {
-                let factor = splu(black_box(&fixture.csc), LuOptions::default())
+                let factor = splu(black_box(&fixture.csc), splu_arm_options()?)
                     .map_err(|error| format!("timed FrankenSciPy splu: {error}"))?;
                 for right_hand_side in &fixture.right_hand_sides {
                     let solution = splu_solve(&factor, black_box(right_hand_side))
@@ -3875,6 +3905,9 @@ mod cubic_live {
              host_quiescence_required=false null_gate=per_arm_first_half_over_second_half \
              null_median_limit={NULL_MEDIAN_LIMIT:.3}"
         );
+        // The ordering is part of what was measured, so it goes on the row. A row that
+        // does not name it cannot be compared with one taken under a different one.
+        println!("fsci_arm_ordering={:?}", splu_arm_ordering()?);
 
         let fixtures = splu_fixtures(family)?;
         let total_components = fixtures
