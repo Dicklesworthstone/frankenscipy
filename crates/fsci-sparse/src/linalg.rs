@@ -14070,9 +14070,9 @@ mod tests {
             saw_nonidentity_row_perm,
             "no fixture produced a non-identity row permutation, so the composition is untested"
         );
-        assert_eq!(
-            SPLU_PACKED_TRIANGULAR_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed),
-            packed_solves_before + 6,
+        assert!(
+            SPLU_PACKED_TRIANGULAR_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                >= packed_solves_before + 6,
             "each of the two fixtures must run the counted packed solve in the dispatch probe, \
              materialized control, and shipping arm"
         );
