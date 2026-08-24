@@ -2,6 +2,7 @@
 
 pub mod audit;
 pub mod bracket;
+pub mod chandrupatla;
 pub mod curvefit;
 pub mod linesearch;
 pub mod minimize;
@@ -14,6 +15,7 @@ pub use bracket::{
     BracketOptions, BracketResult, MinimumBracketOptions, MinimumBracketResult,
     MinimumBracketStatus, bracket_minimum, bracket_root,
 };
+pub use chandrupatla::{FindRootOptions, FindRootResult, FindRootStatus, find_root};
 pub use curvefit::{
     CurveFitOptions, CurveFitResult, LeastSquaresOptions, LeastSquaresResult, LeastsqResult,
     curve_fit, curve_fit_bounded, curve_fit_bounded_many, curve_fit_many, least_squares,
