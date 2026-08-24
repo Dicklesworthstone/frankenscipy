@@ -12155,6 +12155,39 @@ fn symmetric_lower_matvec_one_pass_simd(
             row_offset += TAIL_LANES;
         }
 
+        // The four-lane remainder leaves at most three positions.  Preserve
+        // the same ascending reduction order for a two-lane tail before the
+        // one-element scalar cleanup.
+        const SHORT_TAIL_LANES: usize = 2;
+        if row_offset + SHORT_TAIL_LANES <= active {
+            let values = Simd::<f64, SHORT_TAIL_LANES>::from_slice(
+                &data[col_base + start + row_offset
+                    ..col_base + start + row_offset + SHORT_TAIL_LANES],
+            );
+            let vector_lanes = Simd::<f64, SHORT_TAIL_LANES>::from_slice(
+                &vector[row_offset..row_offset + SHORT_TAIL_LANES],
+            );
+
+            if v_col != 0.0 {
+                let prior = Simd::<f64, SHORT_TAIL_LANES>::from_slice(
+                    &product[row_offset..row_offset + SHORT_TAIL_LANES],
+                );
+                (prior + values * Simd::splat(v_col))
+                    .copy_to_slice(&mut product[row_offset..row_offset + SHORT_TAIL_LANES]);
+            }
+
+            for (&term, &v_row) in (values * vector_lanes)
+                .to_array()
+                .iter()
+                .zip(&vector[row_offset..row_offset + SHORT_TAIL_LANES])
+            {
+                if v_row != 0.0 {
+                    p_col += term;
+                }
+            }
+            row_offset += SHORT_TAIL_LANES;
+        }
+
         while row_offset < active {
             let value = data[col_base + start + row_offset];
             if v_col != 0.0 {
@@ -32854,6 +32887,42 @@ mod tests {
                 expected.to_bits(),
                 actual.to_bits(),
                 "four-lane tail changed product[{index}]"
+            );
+        }
+    }
+
+    #[test]
+    fn symmetric_lower_matvec_simd_two_lane_tail_matches_scalar_bits() {
+        // `active = 75 = 9 * 8 + 3`: the four-lane tail is skipped, the new
+        // two-lane tail runs, and one scalar cleanup element remains.
+        let n = 82usize;
+        let start = 7usize;
+        let active = n - start;
+        assert_eq!(active % 8, 3, "fixture must enter the two-lane tail");
+
+        let mut matrix = DMatrix::<f64>::zeros(n, n);
+        for col in start..n {
+            for row in col..n {
+                matrix[(row, col)] =
+                    ((row * 43 + col * 23 + 31) % 127) as f64 / 109.0 - 0.5;
+            }
+        }
+        let mut vector: Vec<f64> = (0..active)
+            .map(|index| ((index * 13 + 37) % 101) as f64 / 97.0 - 0.45)
+            .collect();
+        vector[9] = 0.0;
+        vector[58] = -0.0;
+
+        let mut scalar = vec![f64::NAN; active];
+        let mut simd = vec![f64::NAN; active];
+        symmetric_lower_matvec_one_pass(matrix.as_slice(), n, start, &vector, &mut scalar);
+        symmetric_lower_matvec_one_pass_simd(matrix.as_slice(), n, start, &vector, &mut simd);
+
+        for (index, (expected, actual)) in scalar.iter().zip(&simd).enumerate() {
+            assert_eq!(
+                expected.to_bits(),
+                actual.to_bits(),
+                "two-lane tail changed product[{index}]"
             );
         }
     }
