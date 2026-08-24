@@ -157,6 +157,10 @@ struct NativeSparseLu {
     // actually factored is B = P·A·Pᵀ (B[i][j] = A[fill_perm[i]][fill_perm[j]]).
     // `None` ⇒ natural ordering. Solve maps b → P·b, back-substitutes, then x = Pᵀ·z.
     fill_perm: Option<Vec<usize>>,
+    // Compose the fill and pivot permutations once when the factor is built.  The
+    // hot forward sweep then reads `b[rhs_gather[row]]` rather than indexing both
+    // maps for every solve row.
+    rhs_gather: Option<Vec<usize>>,
     // Inverse of `fill_perm`: `inverse_fill_perm[old_i] = new_i`. This makes the
     // final Pᵀ map write the solution in order rather than scatter into it.
     inverse_fill_perm: Option<Vec<usize>>,
@@ -3111,6 +3115,9 @@ impl NativeSparseLu {
             }
             inverse
         });
+        let rhs_gather = fill_perm
+            .as_ref()
+            .map(|fill| row_perm.iter().map(|&row| fill[row]).collect());
 
         Self {
             n,
@@ -3122,6 +3129,7 @@ impl NativeSparseLu {
             lower,
             upper,
             fill_perm,
+            rhs_gather,
             inverse_fill_perm,
             ordering_used,
         }
@@ -3145,6 +3153,9 @@ impl NativeSparseLu {
             }
             inverse
         });
+        let rhs_gather = fill_perm
+            .as_ref()
+            .map(|fill| row_perm.iter().map(|&row| fill[row]).collect());
 
         Self {
             n,
@@ -3152,6 +3163,7 @@ impl NativeSparseLu {
             lower,
             upper,
             fill_perm,
+            rhs_gather,
             inverse_fill_perm,
             ordering_used,
         }
@@ -4079,9 +4091,16 @@ impl NativeSparseLu {
                     y[row] = value;
                 }
             }
-            Some(fill) => {
+            Some(_) => {
+                let rhs_gather =
+                    self.rhs_gather
+                        .as_deref()
+                        .ok_or_else(|| SparseError::InvalidArgument {
+                            message: "native sparse LU missing precomputed rhs gather map"
+                                .to_string(),
+                        })?;
                 for row in 0..self.n {
-                    let mut value = b[fill[self.row_perm[row]]];
+                    let mut value = b[rhs_gather[row]];
                     let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
                     for (&column, &multiplier) in lower_columns[start..end]
                         .iter()
@@ -14100,6 +14119,17 @@ mod tests {
                 .as_deref()
                 .is_some_and(|p| p.iter().enumerate().any(|(new_i, &old_i)| new_i != old_i));
             saw_nonidentity_row_perm |= lu.row_perm.iter().enumerate().any(|(i, &p)| i != p);
+
+            let expected_rhs_gather = fill.as_deref().map(|permutation| {
+                lu.row_perm
+                    .iter()
+                    .map(|&row| permutation[row])
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                lu.rhs_gather, expected_rhs_gather,
+                "{label}: the cached rhs gather must compose fill then pivot exactly"
+            );
 
             let b = (0..n)
                 .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
