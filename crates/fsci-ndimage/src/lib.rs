@@ -3273,11 +3273,8 @@ fn median_filter1d_sliding_histogram(
             node += node & node.wrapping_neg();
         }
     };
-    let index_of = |value: f64| {
-        values
-            .binary_search_by(|candidate| candidate.total_cmp(&value))
-            .expect("histogram palette contains input and boundary values")
-    };
+    let index_of =
+        |value: f64| values.partition_point(|candidate| candidate.total_cmp(&value).is_lt());
     let select = |tree: &[isize], mut rank: isize| {
         let mut bit = 1usize;
         while bit < values.len() {
