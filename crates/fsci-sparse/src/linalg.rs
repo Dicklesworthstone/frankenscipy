@@ -157,6 +157,9 @@ struct NativeSparseLu {
     // actually factored is B = P·A·Pᵀ (B[i][j] = A[fill_perm[i]][fill_perm[j]]).
     // `None` ⇒ natural ordering. Solve maps b → P·b, back-substitutes, then x = Pᵀ·z.
     fill_perm: Option<Vec<usize>>,
+    // Inverse of `fill_perm`: `inverse_fill_perm[old_i] = new_i`. This makes the
+    // final Pᵀ map write the solution in order rather than scatter into it.
+    inverse_fill_perm: Option<Vec<usize>>,
     ordering_used: PermutationOrdering,
 }
 
@@ -3041,6 +3044,13 @@ impl NativeSparseLu {
     ) -> Self {
         let lower = PackedTriangularRows::from_rows(&l_rows);
         let upper = PackedTriangularRows::from_rows(&u_rows);
+        let inverse_fill_perm = fill_perm.as_ref().map(|fill| {
+            let mut inverse = vec![0; n];
+            for (new_i, &old_i) in fill.iter().enumerate() {
+                inverse[old_i] = new_i;
+            }
+            inverse
+        });
 
         Self {
             n,
@@ -3052,6 +3062,7 @@ impl NativeSparseLu {
             lower,
             upper,
             fill_perm,
+            inverse_fill_perm,
             ordering_used,
         }
     }
@@ -4027,11 +4038,12 @@ impl NativeSparseLu {
             y[row] = value / pivot;
         }
 
-        match &self.fill_perm {
-            Some(p) => {
+        match self.inverse_fill_perm.as_deref() {
+            Some(inverse) => {
+                SPLU_GATHER_UNPERMUTE_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut x = vec![0.0; self.n];
-                for (new_i, &old_i) in p.iter().enumerate() {
-                    x[old_i] = y[new_i];
+                for old_i in 0..self.n {
+                    x[old_i] = y[inverse[old_i]];
                 }
                 Ok(x)
             }
@@ -14076,6 +14088,77 @@ mod tests {
             "each of the two fixtures must run the counted packed solve in the dispatch probe, \
              materialized control, and shipping arm"
         );
+    }
+
+    #[test]
+    fn inverse_fill_permutation_gathers_the_scattered_solution_bit_for_bit() {
+        let matrix = laplacian_2d_for_mmd(12);
+        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
+            .expect("fill-generating factorization");
+        let fill = lu
+            .fill_perm
+            .as_deref()
+            .expect("reordered Laplacian must retain its fill permutation");
+        let inverse = lu
+            .inverse_fill_perm
+            .as_deref()
+            .expect("a fill permutation must retain its inverse");
+        assert!(
+            fill.iter()
+                .enumerate()
+                .any(|(new_i, &old_i)| new_i != old_i),
+            "the fixture must take a non-identity un-permutation path"
+        );
+        for old_i in 0..lu.n {
+            assert_eq!(
+                fill[inverse[old_i]], old_i,
+                "inverse permutation must map original index {old_i} back to its factor row"
+            );
+        }
+
+        let b = (0..lu.n)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect::<Vec<f64>>();
+        let mut factor_order_solution = vec![0.0; lu.n];
+        for row in 0..lu.n {
+            let mut value = b[fill[lu.row_perm[row]]];
+            for &(column, multiplier) in &lu.l_rows[row] {
+                value -= multiplier * factor_order_solution[column];
+            }
+            factor_order_solution[row] = value;
+        }
+        for row in (0..lu.n).rev() {
+            let entries = &lu.u_rows[row];
+            let (diagonal_column, pivot) = entries[0];
+            assert_eq!(diagonal_column, row, "reference needs diagonal-first U");
+            let mut value = factor_order_solution[row];
+            for &(column, entry) in &entries[1..] {
+                value -= entry * factor_order_solution[column];
+            }
+            factor_order_solution[row] = value / pivot;
+        }
+        let mut scattered_reference = vec![0.0; lu.n];
+        for (new_i, &old_i) in fill.iter().enumerate() {
+            scattered_reference[old_i] = factor_order_solution[new_i];
+        }
+
+        let gathered_before =
+            SPLU_GATHER_UNPERMUTE_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let actual = lu.solve(&b).expect("packed solve");
+        assert!(
+            SPLU_GATHER_UNPERMUTE_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+                >= gathered_before + 1,
+            "the solve must take the counted cached-inverse un-permutation path"
+        );
+        for (old_i, (actual_value, reference_value)) in
+            actual.iter().zip(&scattered_reference).enumerate()
+        {
+            assert_eq!(
+                actual_value.to_bits(),
+                reference_value.to_bits(),
+                "component {old_i} differs between gathered and scattered un-permutation"
+            );
+        }
     }
 
     #[test]
@@ -27150,6 +27233,10 @@ pub static SPLU_SOLVE_FORCE_MATERIALIZED_RHS: PerfToggle = PerfToggle::new(false
 /// Native LU solves that traversed the packed triangular-factor representation.
 #[doc(hidden)]
 pub static SPLU_PACKED_TRIANGULAR_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Native LU solves that use the cached inverse permutation for sequential output writes.
+#[doc(hidden)]
+pub static SPLU_GATHER_UNPERMUTE_SOLVE_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[doc(hidden)]
 pub static SPLU_ROW_HEAD_CACHE_DISABLE: PerfToggle = PerfToggle::new(false);
