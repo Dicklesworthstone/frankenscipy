@@ -12064,6 +12064,78 @@ fn symmetric_lower_matvec_one_pass(
     }
 }
 
+/// Portable-SIMD form of [`symmetric_lower_matvec_one_pass`].
+///
+/// Each vector lane updates a distinct `product[row_offset]`, so loading eight
+/// values at once changes neither the multiplication nor the order in which an
+/// individual output receives its columns. `p_col` is still reduced lane by lane
+/// in ascending `row_offset` order; using `reduce_sum` there would reassociate
+/// the sum and break the bit-exact contract.
+#[allow(dead_code, clippy::needless_range_loop)]
+fn symmetric_lower_matvec_one_pass_simd(
+    data: &[f64],
+    n: usize,
+    start: usize,
+    vector: &[f64],
+    product: &mut [f64],
+) {
+    const LANES: usize = 8;
+
+    let active = vector.len();
+    product[..active].fill(0.0);
+    for col_offset in 0..active {
+        let col = start + col_offset;
+        let col_base = col * n;
+        let v_col = vector[col_offset];
+        let mut p_col = product[col_offset];
+
+        if v_col != 0.0 {
+            p_col += data[col_base + start + col_offset] * v_col;
+        }
+
+        let mut row_offset = col_offset + 1;
+        while row_offset + LANES <= active {
+            let values = Simd::<f64, LANES>::from_slice(
+                &data[col_base + start + row_offset..col_base + start + row_offset + LANES],
+            );
+            let vector_lanes =
+                Simd::<f64, LANES>::from_slice(&vector[row_offset..row_offset + LANES]);
+
+            if v_col != 0.0 {
+                let prior = Simd::<f64, LANES>::from_slice(
+                    &product[row_offset..row_offset + LANES],
+                );
+                (prior + values * Simd::splat(v_col))
+                    .copy_to_slice(&mut product[row_offset..row_offset + LANES]);
+            }
+
+            for (&term, &v_row) in (values * vector_lanes)
+                .to_array()
+                .iter()
+                .zip(&vector[row_offset..row_offset + LANES])
+            {
+                if v_row != 0.0 {
+                    p_col += term;
+                }
+            }
+            row_offset += LANES;
+        }
+
+        while row_offset < active {
+            let value = data[col_base + start + row_offset];
+            if v_col != 0.0 {
+                product[row_offset] += value * v_col;
+            }
+            let v_row = vector[row_offset];
+            if v_row != 0.0 {
+                p_col += value * v_row;
+            }
+            row_offset += 1;
+        }
+        product[col_offset] = p_col;
+    }
+}
+
 #[allow(dead_code, clippy::needless_range_loop)]
 fn apply_symmetric_householder_trailing_rank2_lower_storage(
     matrix: &mut DMatrix<f64>,
@@ -12115,6 +12187,8 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
         );
     } else if EIGH_DSYMV_FORCE_DOUBLE_READ.load(std::sync::atomic::Ordering::Relaxed) {
         symmetric_lower_matvec_double_read(data, n, start, &reflector.values, p);
+    } else if !EIGH_DSYMV_FORCE_SCALAR.load(std::sync::atomic::Ordering::Relaxed) {
+        symmetric_lower_matvec_one_pass_simd(data, n, start, &reflector.values, p);
     } else {
         symmetric_lower_matvec_one_pass(data, n, start, &reflector.values, p);
     }
@@ -13617,6 +13691,13 @@ const EIGH_DSYMV_PARALLEL_MIN_ROWS_PER_THREAD: usize = 128;
 /// order, not by tolerance — see that function's doc.
 #[doc(hidden)]
 pub static EIGH_DSYMV_PARALLEL_GATHER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Same-ELF A/B control for the portable-SIMD one-pass dsymv used by dense
+/// `eigh` tridiagonalisation. Defaults off so the production path uses SIMD;
+/// setting it restores the scalar loop with the same operand order.
+#[doc(hidden)]
+pub static EIGH_DSYMV_FORCE_SCALAR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Benchmark-only same-ELF control for the pre-2026-07-31 symmetric matvec.
@@ -23580,7 +23661,6 @@ mod tests {
     /// `data[col*n+row]` on or below — so the fixture does NOT need to be symmetric for them
     /// to agree. An asymmetric fixture is therefore the stronger choice: it would expose a
     /// transposed index in either implementation, which a symmetric one would silently hide.
-    #[test]
     /// frankenscipy-5f06d: DRIVES the toggle, which the kernel test above does not.
     ///
     /// `parallel_gather_dsymv_is_bit_identical_to_the_double_read_scatter` calls the two
@@ -23633,8 +23713,9 @@ mod tests {
             tau: 0.7,
         };
 
-        let run = |gather: bool| -> (Vec<f64>, Vec<f64>) {
+        let run = |gather: bool, scalar: bool| -> (Vec<f64>, Vec<f64>) {
             EIGH_DSYMV_PARALLEL_GATHER.store(gather, Ordering::Relaxed);
+            EIGH_DSYMV_FORCE_SCALAR.store(scalar, Ordering::Relaxed);
             let mut matrix = base.clone();
             let mut p = vec![0.0; active];
             let mut w = vec![0.0; active];
@@ -23647,19 +23728,37 @@ mod tests {
             (p, matrix.as_slice().to_vec())
         };
 
-        let (p_serial, matrix_serial) = run(false);
-        let (p_gather, matrix_gather) = run(true);
+        let (p_scalar, matrix_scalar) = run(false, true);
+        let (p_simd, matrix_simd) = run(false, false);
+        let (p_gather, matrix_gather) = run(true, false);
         EIGH_DSYMV_PARALLEL_GATHER.store(false, Ordering::Relaxed);
+        EIGH_DSYMV_FORCE_SCALAR.store(false, Ordering::Relaxed);
 
         // MUST-HIT on the detector: a comparison that cannot see a difference would pass
         // this vacuously, so confirm the fixture actually produced non-trivial output
         // before trusting the agreement.
         assert!(
-            p_serial.iter().any(|v| *v != 0.0),
+            p_scalar.iter().any(|v| *v != 0.0),
             "matvec produced an all-zero p; the comparison below would be vacuous"
         );
 
-        for (index, (a, b)) in p_serial.iter().zip(&p_gather).enumerate() {
+        for (index, (a, b)) in p_scalar.iter().zip(&p_simd).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "EIGH_DSYMV_FORCE_SCALAR is documented BIT-IDENTICAL and is not: \
+                 p differs at {index} ({a} vs {b})"
+            );
+        }
+        for (index, (a, b)) in matrix_scalar.iter().zip(&matrix_simd).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "EIGH_DSYMV_FORCE_SCALAR changed the rank-2 update at {index} \
+                 ({a} vs {b})"
+            );
+        }
+        for (index, (a, b)) in p_scalar.iter().zip(&p_gather).enumerate() {
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
@@ -23667,7 +23766,7 @@ mod tests {
                  p differs at {index} ({a} vs {b})"
             );
         }
-        for (index, (a, b)) in matrix_serial.iter().zip(&matrix_gather).enumerate() {
+        for (index, (a, b)) in matrix_scalar.iter().zip(&matrix_gather).enumerate() {
             assert_eq!(
                 a.to_bits(),
                 b.to_bits(),
@@ -23677,6 +23776,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn parallel_gather_dsymv_is_bit_identical_to_the_double_read_scatter() {
         let n = 640usize;
         let start = 7usize;
@@ -42213,6 +42313,177 @@ mod toggle_ab_eigh_rank2_update {
              the reduction feeds the back-transform, so vectors are the more \
              sensitive check of the two"
         );
+    }
+}
+
+/// frankenscipy-bgrq1 — the two `pinv` toggles below change arithmetic, so unlike
+/// the layout-only `pinv` toggles their contract is a conditioning-scaled bound.
+///
+/// The tall toggle compares the custom triangular solve with nalgebra's
+/// Cholesky solve; the wide toggle compares its normal-equation Cholesky arm
+/// with the public SVD fallback. The normal equations square the conditioning,
+/// therefore a fixed tolerance would either be needlessly loose at κ=1 or
+/// reject a sound result at κ=10⁴. Keep both shapes and the three-condition
+/// sweep here so an edit to either route cannot silently turn an argued
+/// contract back into one.
+#[cfg(test)]
+mod toggle_ab_pinv_cholesky {
+    use super::{
+        DISABLE_TALL_PINV_TRSM, DISABLE_WIDE_PINV_CHOLESKY, DMatrix, PinvOptions, pinv,
+        pinv_full_rank_tall_cholesky_with_min_cols, pinv_full_rank_wide_cholesky_with_min_rows,
+    };
+    use std::sync::Mutex;
+    use std::sync::atomic::Ordering;
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    struct RestoreToggles {
+        tall_trsm: bool,
+        wide_cholesky: bool,
+    }
+
+    impl RestoreToggles {
+        fn capture() -> Self {
+            Self {
+                tall_trsm: DISABLE_TALL_PINV_TRSM.load(Ordering::Relaxed),
+                wide_cholesky: DISABLE_WIDE_PINV_CHOLESKY.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl Drop for RestoreToggles {
+        fn drop(&mut self) {
+            DISABLE_TALL_PINV_TRSM.store(self.tall_trsm, Ordering::Relaxed);
+            DISABLE_WIDE_PINV_CHOLESKY.store(self.wide_cholesky, Ordering::Relaxed);
+        }
+    }
+
+    fn diagonal_scales(n: usize, kappa: f64) -> Vec<f64> {
+        (0..n)
+            .map(|index| kappa.powf(-(index as f64) / ((n - 1) as f64)))
+            .collect()
+    }
+
+    fn tall_fixture(kappa: f64) -> Vec<Vec<f64>> {
+        const ROWS: usize = 129;
+        const COLS: usize = 128;
+        let scales = diagonal_scales(COLS, kappa);
+        let mut a = vec![vec![0.0; COLS]; ROWS];
+        for (index, &scale) in scales.iter().enumerate() {
+            a[index][index] = scale;
+            if index + 1 < ROWS {
+                a[index + 1][index] = 0.25 * scale;
+            }
+        }
+        a
+    }
+
+    fn wide_fixture(kappa: f64) -> Vec<Vec<f64>> {
+        const ROWS: usize = 128;
+        const COLS: usize = 129;
+        let scales = diagonal_scales(ROWS, kappa);
+        let mut a = vec![vec![0.0; COLS]; ROWS];
+        for (index, &scale) in scales.iter().enumerate() {
+            a[index][index] = scale;
+            if index + 1 < ROWS {
+                a[index][index + 1] = 0.25 * scale;
+            }
+        }
+        a
+    }
+
+    fn max_relative_entry_error(left: &[Vec<f64>], right: &[Vec<f64>]) -> f64 {
+        let scale = left
+            .iter()
+            .chain(right)
+            .flat_map(|row| row.iter())
+            .fold(0.0_f64, |max, &value| max.max(value.abs()))
+            .max(1.0);
+        left.iter()
+            .zip(right)
+            .flat_map(|(left_row, right_row)| left_row.iter().zip(right_row))
+            .fold(0.0_f64, |max, (&left, &right)| {
+                max.max((left - right).abs() / scale)
+            })
+    }
+
+    #[test]
+    fn normal_equation_pinv_toggle_arms_follow_a_kappa_squared_bound() {
+        let _lock = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = RestoreToggles::capture();
+
+        for kappa in [1.0_f64, 1.0e2, 1.0e4] {
+            let tall = tall_fixture(kappa);
+            let tall_matrix = DMatrix::from_row_slice(
+                tall.len(),
+                tall[0].len(),
+                &tall.iter().flatten().copied().collect::<Vec<_>>(),
+            );
+            let tall_rtol = (tall.len().max(tall[0].len()) as f64) * f64::EPSILON;
+
+            DISABLE_TALL_PINV_TRSM.store(false, Ordering::Relaxed);
+            assert!(
+                pinv_full_rank_tall_cholesky_with_min_cols(&tall_matrix, 0.0, tall_rtol, 128)
+                    .is_some(),
+                "tall Cholesky arm did not admit κ={kappa:.0e}; the public A/B below would be blind"
+            );
+            let tall_fast = pinv(&tall, PinvOptions::default()).expect("tall fast pinv");
+            DISABLE_TALL_PINV_TRSM.store(true, Ordering::Relaxed);
+            let tall_legacy = pinv(&tall, PinvOptions::default()).expect("tall legacy pinv");
+            let wide = wide_fixture(kappa);
+            let wide_matrix = DMatrix::from_row_slice(
+                wide.len(),
+                wide[0].len(),
+                &wide.iter().flatten().copied().collect::<Vec<_>>(),
+            );
+            let wide_rtol = (wide.len().max(wide[0].len()) as f64) * f64::EPSILON;
+
+            DISABLE_WIDE_PINV_CHOLESKY.store(false, Ordering::Relaxed);
+            assert!(
+                pinv_full_rank_wide_cholesky_with_min_rows(
+                    &wide,
+                    &wide_matrix,
+                    0.0,
+                    wide_rtol,
+                    128
+                )
+                .is_some(),
+                "wide Cholesky arm did not admit κ={kappa:.0e}; the public A/B below would be blind"
+            );
+            let wide_fast = pinv(&wide, PinvOptions::default()).expect("wide fast pinv");
+            DISABLE_WIDE_PINV_CHOLESKY.store(true, Ordering::Relaxed);
+            assert!(
+                pinv_full_rank_wide_cholesky_with_min_rows(
+                    &wide,
+                    &wide_matrix,
+                    0.0,
+                    wide_rtol,
+                    128
+                )
+                .is_none(),
+                "wide toggle did not force its SVD fallback for κ={kappa:.0e}"
+            );
+            let wide_svd = pinv(&wide, PinvOptions::default()).expect("wide SVD pinv");
+
+            let bound = 512.0 * f64::EPSILON * kappa * kappa;
+            let tall_error =
+                max_relative_entry_error(&tall_fast.pseudo_inverse, &tall_legacy.pseudo_inverse);
+            let wide_error =
+                max_relative_entry_error(&wide_fast.pseudo_inverse, &wide_svd.pseudo_inverse);
+            println!(
+                "kappa={kappa:.0e} tall_relative_error={tall_error:.3e} wide_relative_error={wide_error:.3e} bound={bound:.3e}"
+            );
+            assert!(
+                tall_error <= bound,
+                "tall Cholesky-arm relative gap {tall_error:.3e} exceeded κ² bound {bound:.3e} at κ={kappa:.0e}"
+            );
+            assert!(
+                wide_error <= bound,
+                "wide Cholesky/SVD relative gap {wide_error:.3e} exceeded κ² bound {bound:.3e} at κ={kappa:.0e}"
+            );
+        }
     }
 }
 

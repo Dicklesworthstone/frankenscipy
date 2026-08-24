@@ -28,7 +28,9 @@
 
 #[cfg(feature = "eigh-incumbent-bench")]
 mod bench {
-    use fsci_linalg::{DecompOptions, PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE, eigh};
+    use fsci_linalg::{
+        DecompOptions, EIGH_DSYMV_FORCE_SCALAR, PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE, eigh,
+    };
     use sha2::{Digest, Sha256};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
@@ -675,6 +677,23 @@ for raw_line in sys.stdin.buffer:
         t
     }
 
+    /// Time the SIMD candidate or its same-ELF scalar dsymv control. The public
+    /// native-routing override is set by the surrounding cell and intentionally
+    /// remains in place for both arms.
+    fn time_fsci_dsymv(
+        a: &[Vec<f64>],
+        min_of: usize,
+        min_dim: usize,
+        force_scalar: bool,
+    ) -> f64 {
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(min_dim, std::sync::atomic::Ordering::Relaxed);
+        EIGH_DSYMV_FORCE_SCALAR.store(force_scalar, std::sync::atomic::Ordering::Relaxed);
+        let t = time_fsci(a, 1, min_of);
+        EIGH_DSYMV_FORCE_SCALAR.store(false, std::sync::atomic::Ordering::Relaxed);
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        t
+    }
+
     fn time_fsci(a: &[Vec<f64>], reps: usize, min_of: usize) -> f64 {
         let mut best = f64::INFINITY;
         for _ in 0..min_of {
@@ -872,6 +891,11 @@ for raw_line in sys.stdin.buffer:
             // Paired nalgebra-vs-native, and its OWN A/A null (nalgebra twice).
             let (mut ia, mut ib, mut ir) = (vec![], vec![], vec![]);
             let (mut ina, mut inb, mut inr) = (vec![], vec![], vec![]);
+            // The portable-SIMD dsymv exists only inside the native reduction.
+            // Its same-ELF scalar control is measured only in native cells, with
+            // an A/A null that brackets that exact comparison.
+            let (mut da, mut db, mut dr) = (vec![], vec![], vec![]);
+            let (mut dna, mut dnb, mut dnr) = (vec![], vec![], vec![]);
             let mut scipy1_peak = 0usize;
             let mut scipyn_peak = 0usize;
             for round in 0..rounds {
@@ -936,6 +960,28 @@ for raw_line in sys.stdin.buffer:
                 ia.push(nalg_t);
                 ib.push(nat_t);
                 ir.push(nalg_t / nat_t);
+
+                if impl_label == "native" {
+                    let z1 = time_fsci_dsymv(&a, min_of, min_dim_override, false);
+                    let z2 = time_fsci_dsymv(&a, min_of, min_dim_override, false);
+                    dna.push(z1);
+                    dnb.push(z2);
+                    dnr.push(z1 / z2);
+
+                    let (scalar_t, simd_t) = if round % 2 == 0 {
+                        (
+                            time_fsci_dsymv(&a, min_of, min_dim_override, true),
+                            time_fsci_dsymv(&a, min_of, min_dim_override, false),
+                        )
+                    } else {
+                        let simd_t = time_fsci_dsymv(&a, min_of, min_dim_override, false);
+                        let scalar_t = time_fsci_dsymv(&a, min_of, min_dim_override, true);
+                        (scalar_t, simd_t)
+                    };
+                    da.push(scalar_t);
+                    db.push(simd_t);
+                    dr.push(scalar_t / simd_t);
+                }
             }
             let fsci_peak_tasks = poller.finish();
             scipy1_peak = scipy1_peak.max(scipy1.stop());
@@ -953,11 +999,17 @@ for raw_line in sys.stdin.buffer:
             let vs_default = summarize(cna, cnb, cnr);
             let impl_null = summarize(ina, inb, inr);
             let impl_ab = summarize(ia, ib, ir);
+            let dsymv_null = (impl_label == "native").then(|| summarize(dna, dnb, dnr));
+            let dsymv_ab = (impl_label == "native").then(|| summarize(da, db, dr));
             println!("--- n={n} impl={impl_label} ---");
             report("NULL fsci/fsci", &fsci_null);
             report("NULL sp1/sp1", &scipy_null);
             report("NULL nalg/nalg", &impl_null);
             report("IMPL nalg/native", &impl_ab);
+            if let (Some(dsymv_null), Some(dsymv_ab)) = (&dsymv_null, &dsymv_ab) {
+                report("NULL simd/simd", dsymv_null);
+                report("DSYMV scalar/simd", dsymv_ab);
+            }
             report("fsci/scipy1", &vs_pinned);
             report("fsci/scipyN", &vs_default);
             println!(
@@ -983,9 +1035,14 @@ for raw_line in sys.stdin.buffer:
             let m_scipy1 = null_margin(&vs_pinned, &[&fsci_null, &scipy_null]);
             let m_scipyn = null_margin(&vs_default, &[&fsci_null]);
             let m_impl = null_margin(&impl_ab, &[&impl_null]);
+            let m_dsymv = dsymv_null
+                .as_ref()
+                .zip(dsymv_ab.as_ref())
+                .map_or(f64::NAN, |(null, effect)| null_margin(effect, &[null]));
             println!(
                 "n={n} impl={impl_label} margins (need >={MIN_NULL_MARGIN:.2}x): \
-                 fsci/scipy1={m_scipy1:.2}x fsci/scipyN={m_scipyn:.2}x IMPL={m_impl:.2}x"
+                 fsci/scipy1={m_scipy1:.2}x fsci/scipyN={m_scipyn:.2}x IMPL={m_impl:.2}x \
+                 DSYMV={m_dsymv:.2}x"
             );
             println!(
                 "n={n} impl={impl_label} IMPL_CERTIFIED={} (margin {m_impl:.2}x, ci95=[{:.4},{:.4}])",
@@ -993,6 +1050,15 @@ for raw_line in sys.stdin.buffer:
                 impl_ab.ratio_lo,
                 impl_ab.ratio_hi
             );
+            if let Some(dsymv_ab) = &dsymv_ab {
+                println!(
+                    "n={n} impl={impl_label} DSYMV_CERTIFIED={} (margin {m_dsymv:.2}x, ci95=[{:.4},{:.4}])",
+                    m_dsymv >= MIN_NULL_MARGIN
+                        && !(dsymv_ab.ratio_lo <= 1.0 && dsymv_ab.ratio_hi >= 1.0),
+                    dsymv_ab.ratio_lo,
+                    dsymv_ab.ratio_hi
+                );
+            }
             let median_of = |mut v: Vec<f64>| -> f64 {
                 v.sort_by(f64::total_cmp);
                 if v.is_empty() { f64::NAN } else { v[v.len() / 2] }
