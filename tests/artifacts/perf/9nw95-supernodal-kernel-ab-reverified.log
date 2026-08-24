@@ -1,0 +1,87 @@
+### frankenscipy-9nw95 SUPERNODAL DENSE-PANEL BAR — RE-VERIFIED ON TODAY'S TREE (BlackThrush, 2026-08-23)
+
+WHY THIS RUN EXISTS. I was asked to implement supernodal splu factorization with dense
+panel updates, on the stated premise that supernodes/dense-panel kernels "have NO retry
+predicate (never tried)". Both halves of that premise are false, and this file is the
+check rather than the assertion:
+
+  * They WERE tried. `frankenscipy-9nw95` is CLOSED with a measured mechanism, and the
+    dense-scatter kernel is already in-tree — `dense_scatter_block_update`, staged behind
+    `SPLU_SUPERNODAL_ENABLE`, deliberately not deleted.
+  * There IS a retry predicate, stated in the closure: "BAR FOR ANY SUCCESSOR: must beat
+    15.00 Ir per element-update, checkable with SUPERNODE_AB_WIDTH plus the committed
+    workload harness."
+
+So I ran that instrument instead of writing a fourth driver.
+
+## COMMAND
+
+  cargo test --release -p fsci-sparse --lib --no-run          (private target dir; the repo's
+                                                               target/release is wedged, see
+                                                               frankenscipy-y9bzw)
+  SUPERNODE_AB_WIDTH=<w> valgrind --tool=callgrind \
+    --callgrind-out-file=<out> <test-bin> dense_versus_merge --ignored --nocapture
+  callgrind_annotate <out>
+
+test binary sha256 = 41a0facfe4322d7ff708d47847f97170c41d1b128529822ff8b40fe6c06eec83
+host=thinkstation1. Workload: span=300, repeats=2000, so element-updates = 2000*w*300.
+Both kernels run over IDENTICAL data in ONE process, so callgrind's per-function
+attribution is the comparison — no toggling, no separate binaries, no window.
+
+## OBSERVED
+
+  width   dense_scatter Ir   merge Ir        dense/merge   dense Ir/elem   merge Ir/elem
+      2         71,574,054     53,730,102         1.3321          59.645          44.775
+      5         98,656,054     80,730,102         1.2220          32.885          26.910
+     12        161,908,054    143,730,102         1.1265          22.487          19.963
+     24        270,340,054    251,730,102         1.0739          18.774          17.481
+
+## WHAT IT SHOWS — slope and intercept separated
+
+  width step   dense-minus-merge      dense slope/elem   merge slope/elem
+      2->5           17,925,952                 15.046             15.000
+     5->12           18,177,952                 15.060             15.000
+    12->24           18,609,952                 15.060             15.000
+
+The MARGINAL cost of the dense scatter is 15.06 Ir per element-update against the merge's
+15.00 — reproducing the banked pair EXACTLY, on a binary built today. The gap between the
+two kernels is a CONSTANT ~17.8-18.6M Ir, not a slope difference.
+
+That is the whole verdict, and it is an ordering of two costs rather than a tuning failure:
+identical slope plus a positive intercept means the ratio approaches 1.004 from ABOVE as
+width grows and never crosses 1. THERE IS NO CROSSOVER WIDTH. Widening supernodes dilutes
+the constant (1.3321x at w=2 down to 1.0739x at w=24) and can never pay it off.
+
+## WHY "ADD SIMD TO THE DENSE PANEL" DOES NOT CLEAR THE BAR
+
+The bar is on MARGINAL cost, which is where vectorisation would have to help. The
+accumulate loop cannot vectorise, for two independent reasons that are structural rather
+than effort-limited:
+
+  1. It is an indexed SCATTER: `accumulator[col as usize]` with `col` read from
+     `tail_cols`. Without AVX-512 gather/scatter there is no vector form, and this repo
+     deliberately excludes avx512 from `.cargo/config.toml` so binaries stay portable
+     across the whole rch fleet (no sampled worker reports AVX-512).
+  2. Every element carries a data-dependent early return —
+     `if updated == 0.0 && previous != 0.0 { return false }` — which the BIT-IDENTITY
+     contract requires, because an existing entry driven to zero while pivots remain must
+     be replayed sequentially. A loop-carried exit blocks vectorisation outright, and
+     removing it would break the contract the whole line of work is built on.
+
+Making that loop vectorisable needs the factor stored in dense blocks so the tail is
+contiguous — the rewrite the bead already priced, which "invalidates the SortedFactorRow
+representation several landed levers are built on". And the reason it still would not pay
+is recorded in the closure: the merge kernel is ALREADY dense inside its runs (96.8% of
+elements), so blocking re-densifies something that was never sparse.
+
+## VERDICT
+
+The retry predicate is NOT met. The successor bar (beat 15.00 Ir/element-update) is missed
+by the existing dense kernel at 15.06, and the one proposed mechanism for closing it
+(SIMD) is blocked by the storage representation and by the bit-identity contract. No
+fourth supernodal driver was written.
+
+NOT ESTABLISHED HERE: anything about wall-clock, about the incumbent, or about whether a
+full dense-block STORAGE rewrite (as opposed to the staged scatter kernel) would change
+the slope. That rewrite remains priced but unbuilt, and its own pre-costing already says
+the structure it would exploit is not the thing that is slow.
