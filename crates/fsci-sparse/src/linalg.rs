@@ -3699,24 +3699,49 @@ impl NativeSparseLu {
             });
         }
 
-        // Solve A·x = b as (P·A·Pᵀ)·(P·x) = P·b. Permute the rhs into the factored
-        // space, back-substitute, then map the solution back: x[fill_perm[i]] = z[i].
-        let permuted_storage;
-        let rhs: &[f64] = match &self.fill_perm {
-            Some(p) => {
-                permuted_storage = p.iter().map(|&old| b[old]).collect::<Vec<f64>>();
-                &permuted_storage
+        // Solve A·x = b as (P·A·Pᵀ)·(P·x) = P·b, then map back: x[fill_perm[i]] = z[i].
+        //
+        // THE PERMUTED RHS IS NEVER MATERIALIZED. It used to be built as a whole
+        // n-vector, `permuted_storage[i] = b[fill_perm[i]]`, purely so the forward
+        // substitution could read `rhs[row_perm[row]]`. Those are two index maps
+        // applied one after the other to the SAME element, so they compose:
+        // `b[fill_perm[row_perm[row]]]`. Each element is read exactly once either
+        // way, so this loads the identical f64 in the identical order — the result
+        // is bit-identical by construction, not by tolerance — while removing one
+        // n-element allocation and one n-element write from EVERY solve. On the
+        // shape this exists for that is sixteen of each per job
+        // (frankenscipy-run7d), and the solve is 34.6% of that job measured at
+        // n=4,096 (`perf_spsolve --convection-split`).
+        //
+        // `y` is likewise built by pushing rather than by zeroing an n-vector and
+        // overwriting it: row `i` is written before any later row reads it and no
+        // row reads its own slot, so every element is written before it is read and
+        // the zeroing was dead. `push` keeps that order exactly.
+        // The two arms below are the same four lines twice on purpose. Resolving
+        // `fill_perm` INSIDE the row loop would put a loop-invariant discriminant
+        // test in a per-element path, and this codebase has already paid 13% for
+        // exactly that shape once (`perf_toggle_read_in_hot_loop_is_a_barrier`, the
+        // splu merge kernel). The branch is taken once, outside.
+        let mut y: Vec<f64> = Vec::with_capacity(self.n);
+        match self.fill_perm.as_deref() {
+            Some(fill) => {
+                for row in 0..self.n {
+                    let mut value = b[fill[self.row_perm[row]]];
+                    for &(col, multiplier) in &self.l_rows[row] {
+                        value -= multiplier * y[col];
+                    }
+                    y.push(value);
+                }
             }
-            None => b,
-        };
-
-        let mut y = vec![0.0; self.n];
-        for row in 0..self.n {
-            let mut value = rhs[self.row_perm[row]];
-            for &(col, multiplier) in &self.l_rows[row] {
-                value -= multiplier * y[col];
+            None => {
+                for row in 0..self.n {
+                    let mut value = b[self.row_perm[row]];
+                    for &(col, multiplier) in &self.l_rows[row] {
+                        value -= multiplier * y[col];
+                    }
+                    y.push(value);
+                }
             }
-            y[row] = value;
         }
 
         // THE DIAGONAL IS THE FIRST ENTRY, so stop searching for it. `u_rows[row]`
@@ -13578,6 +13603,121 @@ mod tests {
             })
             .collect();
         assert_eq!(distinct.len(), 4_096);
+    }
+
+    #[test]
+    fn composed_solve_indices_are_bit_identical_to_materializing_the_permuted_rhs() {
+        // The forward substitution stopped building `permuted_storage[i] = b[fill_perm[i]]`
+        // and now reads `b[fill_perm[row_perm[row]]]` directly. The claim is that composing
+        // the two index maps loads the identical element, so the answer is bit-identical —
+        // not close, identical. This executes that claim against a reference that DOES
+        // materialize the permuted rhs, rather than restating it in a comment.
+        // Two maps compose here — the fill permutation and the row (pivot) permutation — and
+        // one fixture does not exercise both. The 2-D Laplacian generates fill but never needs
+        // a pivot swap, so its `row_perm` is the identity; the tiny nonsymmetric matrix below
+        // has a first pivot of 1e-14 against a 1.0 beneath it, which forces the swap. Each
+        // fixture declares which map it covers, and the coverage is ASSERTED at the end rather
+        // than assumed, so a future reordering that quietly makes both identities fails here
+        // instead of passing vacuously.
+        let laplacian = laplacian_2d_for_mmd(12);
+        let pivoting = CooMatrix::from_triplets(
+            Shape2D::new(3, 3),
+            vec![1.0e-14, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+            vec![0, 0, 1, 1, 1, 2, 2],
+            vec![0, 1, 0, 1, 2, 1, 2],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+
+        let mut saw_nonidentity_fill = false;
+        let mut saw_nonidentity_row_perm = false;
+
+        for (label, matrix) in [
+            ("laplacian_2d(12)", &laplacian),
+            ("pivoting_3x3", &pivoting),
+        ] {
+            let lu = NativeSparseLu::factorize_csr(matrix, 1.0, PermutationOrdering::Colamd)
+                .expect("factorization");
+            let n = matrix.shape().rows;
+            let fill = lu.fill_perm.clone();
+            saw_nonidentity_fill |= fill
+                .as_deref()
+                .is_some_and(|p| p.iter().enumerate().any(|(new_i, &old_i)| new_i != old_i));
+            saw_nonidentity_row_perm |= lu.row_perm.iter().enumerate().any(|(i, &p)| i != p);
+
+            let b = (0..n)
+                .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+                .collect::<Vec<f64>>();
+
+            // Reference: materialize P·b first, exactly as the code did before the change.
+            let permuted: Vec<f64> = match fill.as_deref() {
+                Some(p) => p.iter().map(|&old| b[old]).collect(),
+                None => b.clone(),
+            };
+            let mut reference = vec![0.0; n];
+            for row in 0..n {
+                let mut value = permuted[lu.row_perm[row]];
+                for &(col, multiplier) in &lu.l_rows[row] {
+                    value -= multiplier * reference[col];
+                }
+                reference[row] = value;
+            }
+            for row in (0..n).rev() {
+                let entries = &lu.u_rows[row];
+                let (diagonal_col, pivot) = entries[0];
+                assert_eq!(diagonal_col, row, "{label}: reference needs diagonal-first");
+                let mut value = reference[row];
+                for &(col, entry) in &entries[1..] {
+                    value -= entry * reference[col];
+                }
+                reference[row] = value / pivot;
+            }
+            let expected = match fill.as_deref() {
+                Some(p) => {
+                    let mut unpermuted = vec![0.0; n];
+                    for (new_i, &old_i) in p.iter().enumerate() {
+                        unpermuted[old_i] = reference[new_i];
+                    }
+                    unpermuted
+                }
+                None => reference,
+            };
+
+            let actual = lu.solve(&b).expect("the shipping solve succeeds");
+            assert_eq!(actual.len(), expected.len(), "{label}");
+            for (index, (got, want)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{label}: component {index} differs: composed {got} vs materialized {want}"
+                );
+            }
+
+            // MUST-MISS arm for the comparison itself: `to_bits` has to be able to SEE a
+            // difference, or "every component matched" is a statement about the assertion
+            // rather than about the code. One ulp on one component must break it.
+            let mut perturbed = expected.clone();
+            let probe = n / 2;
+            perturbed[probe] = f64::from_bits(perturbed[probe].to_bits() ^ 1);
+            assert!(
+                actual
+                    .iter()
+                    .zip(&perturbed)
+                    .any(|(got, want)| got.to_bits() != want.to_bits()),
+                "{label}: a one-ulp perturbation must be visible to this comparison"
+            );
+        }
+
+        assert!(
+            saw_nonidentity_fill,
+            "no fixture produced a non-identity fill permutation, so the composition is untested"
+        );
+        assert!(
+            saw_nonidentity_row_perm,
+            "no fixture produced a non-identity row permutation, so the composition is untested"
+        );
     }
 
     #[test]
