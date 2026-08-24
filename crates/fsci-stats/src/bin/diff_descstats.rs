@@ -17,7 +17,11 @@ fn main() {
         s("sem", ds, sem(d));
         s("iqr", ds, iqr(d));
         s("mad1", ds, median_abs_deviation(d, 1.0));
-        s("trim_mean0.1", ds, trim_mean(d, 0.1).expect("0.1 is in range"));
+        s(
+            "trim_mean0.1",
+            ds,
+            trim_mean(d, 0.1).expect("0.1 is in range"),
+        );
         s("kstat1", ds, kstat(d, 1));
         s("kstat2", ds, kstat(d, 2));
         s("kstat3", ds, kstat(d, 3));

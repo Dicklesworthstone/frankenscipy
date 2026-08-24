@@ -6,7 +6,7 @@
 //! is believed.
 //!
 //! Usage: perf_goodness_of_fit <n_mc> <seed>
-use fsci_stats::{GofStatistic, GofOutcome, Normal, goodness_of_fit};
+use fsci_stats::{GofOutcome, GofStatistic, Normal, goodness_of_fit};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -29,6 +29,11 @@ fn main() {
         goodness_of_fit(&data, GofStatistic::AndersonDarling, n_mc, seed).expect("fit");
     let dt = t0.elapsed();
 
-    println!("arm=fsci n_mc={n_mc} statistic={:.12e} pvalue={:.6} failed_fits={} secs={:.6}",
-             res.statistic, res.pvalue, res.failed_fits, dt.as_secs_f64());
+    println!(
+        "arm=fsci n_mc={n_mc} statistic={:.12e} pvalue={:.6} failed_fits={} secs={:.6}",
+        res.statistic,
+        res.pvalue,
+        res.failed_fits,
+        dt.as_secs_f64()
+    );
 }
