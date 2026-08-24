@@ -6223,8 +6223,10 @@ fn apply_givens_to_column(h: &mut [Vec<f64>], cs: &[f64], sn: &[f64], j: usize) 
     for i in 0..j {
         let upper = h[i][j];
         let lower = h[i + 1][j];
-        let temp = cs[i] * upper + sn[i] * lower;
-        h[i + 1][j] = -sn[i] * upper + cs[i] * lower;
+        let c = cs[i];
+        let s = sn[i];
+        let temp = c * upper + s * lower;
+        h[i + 1][j] = -s * upper + c * lower;
         h[i][j] = temp;
     }
 }
