@@ -1963,7 +1963,7 @@ fn factorize_csr_banded(
         for &column in sorted.live_cols() {
             let column = column as usize;
             if column >= n {
-                return None;
+                return banded_decline(1);
             }
             if column < lo[row] {
                 lo[row] = column;
@@ -1980,24 +1980,35 @@ fn factorize_csr_banded(
             }
         }
     }
-    // A row's span can only grow leftward as earlier rows push into it; make `lo` monotone in the
-    // sense the elimination needs, so row i never reaches left of a row it will update from.
-    for row in 1..n {
-        let reach = lo[row];
-        if reach < row {
-            let widened = hi[row];
-            if widened > hi[reach] {
-                hi[reach] = widened;
-            }
-        }
+    // `hi` IS THE TRANSPOSE OF `lo`, not a separate estimate.
+    //
+    // For a symmetrically-structured factor the filled band is the envelope: row `i` reaches right
+    // exactly as far as the last row whose own left reach touches `i`. Computing that directly
+    // makes the span total EXACT, which matters because the width guard below compares it against
+    // the matrix's nnz -- an over-estimate declines cells the path could have taken.
+    //
+    // The first version of this widened `hi[lo[row]]` by `hi[row]` in a single pass, which is a
+    // sufficient closure but not a tight one: on the cubic cell it produced a span total of
+    // 1,747,744 against a true fill of 1,188,312, 47% over, and that pushed the band/nnz ratio to
+    // 64.4 and declined a cell the path handles correctly.
+    let mut reach = vec![0usize; n];
+    for row in 0..n {
+        reach[lo[row]] = reach[lo[row]].max(row);
+    }
+    let mut furthest = 0usize;
+    for column in 0..n {
+        furthest = furthest.max(reach[column]);
+        hi[column] = hi[column].max(furthest.max(column));
     }
 
     // Refuse anything that is not worth the dense span: total band entries against the matrix's
     // own nnz. A band far larger than the sparse fill would do arithmetic the sparse path skips.
     let band: u64 = (0..n).map(|i| (hi[i] - lo[i] + 1) as u64).sum();
     let nnz = a.indices().len() as u64;
+    SPLU_BANDED_LAST_BAND.store(band as usize, std::sync::atomic::Ordering::Relaxed);
+    SPLU_BANDED_LAST_NNZ.store(nnz as usize, std::sync::atomic::Ordering::Relaxed);
     if band > nnz.saturating_mul(BANDED_MAX_BAND_PER_NNZ) {
-        return None;
+        return banded_decline(2);
     }
 
     let mut offset = Vec::with_capacity(n + 1);
@@ -2023,7 +2034,7 @@ fn factorize_csr_banded(
             let pivot_hi = hi[pivot];
             let diagonal = values[offset[pivot] + (pivot - pivot_lo)];
             if !(diagonal.abs() > 0.0) {
-                return None;
+                return banded_decline(3);
             }
             let position = offset[row] + (pivot - row_lo);
             let multiplier = values[position] / diagonal;
@@ -2032,7 +2043,7 @@ fn factorize_csr_banded(
             }
             // PARTIAL PIVOTING WOULD BREAK THE SPANS. Decline instead of reordering.
             if diagonal.abs() * diag_pivot_thresh < values[position].abs() {
-                return None;
+                return banded_decline(4);
             }
             values[position] = multiplier;
             let last = pivot_hi.min(row_hi);
@@ -2047,7 +2058,7 @@ fn factorize_csr_banded(
             let (source, target) = if src < dst {
                 (&head[src..src + width], &mut tail[..width])
             } else {
-                return None;
+                return banded_decline(5);
             };
             for (slot, &factor) in target.iter_mut().zip(source.iter()) {
                 *slot -= multiplier * factor;
@@ -2074,7 +2085,7 @@ fn factorize_csr_banded(
             }
         }
         if cols.first().copied() != Some(row as u32) {
-            return None;
+            return banded_decline(6);
         }
         u_rows.push((cols, vals));
     }
@@ -2115,6 +2126,36 @@ fn factorize_csr_banded(
 /// A dense span wider than this multiple of the matrix's own nnz is refused: past it the band
 /// carries enough structural zeros that the sparse path's skipping wins.
 const BANDED_MAX_BAND_PER_NNZ: u64 = 64;
+
+/// Why the banded path last declined. A decline is a legitimate outcome, but an UNDIAGNOSABLE one
+/// turns "the structure did not hold" into "something went wrong somewhere", which is how a
+/// recogniser quietly stops recognising anything. Indices: 0 not square / too large, 1 column out
+/// of range, 2 band too wide, 3 zero pivot, 4 pivot needs an interchange, 5 span overlap,
+/// 6 missing diagonal in U.
+#[doc(hidden)]
+pub static SPLU_BANDED_DECLINE_REASON: [std::sync::atomic::AtomicUsize; 7] = [
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+    std::sync::atomic::AtomicUsize::new(0),
+];
+
+/// The span total and matrix nnz the width guard last compared, so an over-conservative span
+/// estimate is distinguishable from a genuinely wide band.
+#[doc(hidden)]
+pub static SPLU_BANDED_LAST_BAND: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[doc(hidden)]
+pub static SPLU_BANDED_LAST_NNZ: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn banded_decline(reason: usize) -> Option<NativeSparseLu> {
+    SPLU_BANDED_DECLINE_REASON[reason].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    None
+}
 
 fn sparse_lu_fill_ordering(
     a: &CsrMatrix,
@@ -18298,7 +18339,11 @@ mod tests {
             ("convection(32)", convection_diffusion_2d(32)),
             ("convection(64)", convection_diffusion_2d(64)),
             ("cubic(10)", splu_dirichlet_laplacian_3d(10)),
+            ("cubic(16)", splu_dirichlet_laplacian_3d(16)),
         ] {
+            for counter in SPLU_BANDED_DECLINE_REASON.iter() {
+                counter.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             let n = matrix.shape().rows;
             let rhs: Vec<f64> = (0..n)
                 .map(|i| 1.0 + 0.125 * ((17 * i + 23) % 29) as f64)
@@ -18314,7 +18359,21 @@ mod tests {
             let Some(banded) =
                 factorize_csr_banded(&matrix, 1.0, PermutationOrdering::ReverseCuthillMcKee)
             else {
-                println!("BANDED {label} n={n} DECLINED");
+                let reasons: Vec<usize> = SPLU_BANDED_DECLINE_REASON
+                    .iter()
+                    .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    .collect();
+                println!(
+                    "BANDED {label} n={n} DECLINED reasons={reasons:?} computed_band={} nnz={} \
+                 ratio={:.1} true_fill={}",
+                    SPLU_BANDED_LAST_BAND.load(std::sync::atomic::Ordering::Relaxed),
+                    SPLU_BANDED_LAST_NNZ.load(std::sync::atomic::Ordering::Relaxed),
+                    SPLU_BANDED_LAST_BAND.load(std::sync::atomic::Ordering::Relaxed) as f64
+                        / SPLU_BANDED_LAST_NNZ
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            .max(1) as f64,
+                    general.stored_nnz()
+                );
                 continue;
             };
             accepted += 1;
