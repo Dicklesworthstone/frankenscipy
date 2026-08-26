@@ -68,6 +68,52 @@
 //! `tiled4x4_fma` reaches the low miss count too (14.722) and pays 0.7696 density for it. `i-k-j`
 //! is the only variant that gets BOTH.
 //!
+//! THIRD PASS (frankenscipy-n6mqn): WHAT THE SUPERNODAL CLOSURE ACTUALLY MEASURED. On 2026-08-16
+//! the supernodal line was closed with "the dense scatter has IDENTICAL marginal cost to the merge
+//! (15.06 vs 15.00 Ir/element), so it never wins". That kernel,
+//! `fsci_sparse::linalg::dense_scatter_block_update`, writes through `accumulator[slot]` and walks
+//! its tail columns with the same indirection -- it is dense in STORAGE, not in ACCESS, and an
+//! indexed store does not vectorise. `indexed_scatter` here reproduces that access pattern at
+//! IDENTICAL FLOPs; `packed_panel` pays a pack/unpack to make the inner sweep contiguous. k=5:
+//!
+//!     variant             instructions       fp_ops  Ir/element    L1d_miss  miss/kFLOP
+//!     naive_kij            509,943,461  722,621,075        1.41  48,051,202      66.496
+//!     naive_ikj            511,562,545  722,621,075        1.42  11,326,469      15.674
+//!     indexed_scatter    5,985,311,099  722,621,075       16.57  17,224,161      23.836
+//!     packed_panel       3,550,809,603  722,621,075        9.83  15,250,864      21.105
+//!
+//! `indexed_scatter` at 16.57 against the real kernel's measured 15.06 is close enough to say the
+//! model has the right shape. **The indirection is essentially all of that cost**: the same
+//! arithmetic contiguous is 1.42.
+//!
+//! BUT THE PRIZE IS NOT THE PROFIT, and this is the number that keeps the closure standing.
+//! Pure contiguous suggests 16.57 -> 1.42, an 11.7-fold prize. Once the pack and unpack are paid
+//! for, `packed_panel` lands at 9.83 -- **1.69-fold better than the indexed scatter, not 11.7**.
+//! Getting the data contiguous costs about 85% of what being contiguous is worth, at w=5.
+//!
+//! MISSES DO NOT SEPARATE THESE TWO, and saying they did was wrong. Three repeats:
+//!
+//!     variant           Ir/element (3 reps)      miss/kFLOP (3 reps)
+//!     naive_kij         1.41  1.41  1.41         67.333  67.323  67.512
+//!     naive_ikj         1.42  1.42  1.41         16.033  15.902  15.868
+//!     indexed_scatter  16.57 16.58 16.56         22.533  23.542  23.378
+//!     packed_panel      9.83  9.83  9.83         22.632  21.518  22.384
+//!
+//! `Ir/element` is stable to +-0.02 across repeats -- instruction counts really are
+//! load-independent. **`miss/kFLOP` is not**: it moves a few percent run to run, and
+//! `indexed_scatter` and `packed_panel` OVERLAP (22.5-23.5 against 21.5-22.6). Any claim that
+//! packing improves the miss count is unresolved at this precision and is not made here.
+//!
+//! What IS cleanly separated by misses is the loop ORDER: 15.9-16.0 for `i-k-j` against
+//! 67.3-67.5 for `k-i-j`, non-overlapping by a factor of four. So the traffic win belongs to the
+//! ORDER (which `factorize_csr_supernodal` already has) and the instruction win belongs to PACKING
+//! (which it does not). They are separate levers and only one of them is unclaimed.
+//!
+//! **This does not overturn the 2026-08-16 closure and must not be read as doing so.** It
+//! identifies one configuration that closure did not test -- it compared two INDIRECT kernels to
+//! each other -- and prices it at 1.69-fold on instructions. Whether that moves the cell's wall
+//! time depends on what share of the elimination this kernel is, which is not measured here.
+//!
 //! TWO RESULTS THAT INVERT THE PREMISE llywn.3 WAS WORKING FROM:
 //!
 //!   1. **Hand register-tiling is WORSE, not better.** The 4x4 and 8x4 kernels -- the textbook
@@ -98,8 +144,8 @@
 //! Add `-e L1-dcache-load-misses` for the traffic question, which is the one that separates the
 //! loop orders at small k.
 //!
-//! Variants: setup, naive_ijk, naive_kij, naive_kij_fma, naive_ikj, naive_ikj_fma, tiled4x4,
-//! tiled4x4_fma, tiled8x4_fma, matmul_public.
+//! Variants: setup, naive_ijk, naive_kij, naive_kij_fma, naive_ikj, naive_ikj_fma,
+//! indexed_scatter, packed_panel, tiled4x4, tiled4x4_fma, tiled8x4_fma, matmul_public.
 //! Shape sets: `panel` (k=32/64, default), `supernode` (k=5, llywn's actual regime).
 //!
 //! CORRECTNESS IS CHECKED, because a fast-but-wrong kernel would post a density number just fine.
@@ -152,6 +198,107 @@ fn fill(len: usize, seed: f64) -> Vec<f64> {
     (0..len)
         .map(|i| ((i as f64) * 0.0131 + seed).sin() + 0.5)
         .collect()
+}
+
+/// `C -= A * B` through an INDEXED scatter: the shape the supernodal line was actually closed on
+/// (frankenscipy-n6mqn).
+///
+/// `dense_scatter_block_update` in `fsci-sparse` writes through `accumulator[slot]` with
+/// `slot = col as usize`, and its inner loop walks the tail columns with the same indirection.
+/// "Dense" there means dense in STORAGE -- an n-length accumulator -- not dense in ACCESS. An
+/// indexed store cannot be vectorised into packed AVX2, and the 2026-08-16 closure measured that
+/// kernel at 15.06 instructions per element against the merge's 15.00, concluding no crossover
+/// width exists.
+///
+/// This reproduces that access pattern at IDENTICAL FLOPs to `naive_ikj`, so the two can be
+/// compared directly. `slots` spreads the n live columns across a wider accumulator, the way a
+/// real target row's columns are scattered across the matrix's column space, so the cache
+/// behaviour is representative rather than artificially compact.
+///
+/// THIS IS NOT A CLAIM THAT THE CLOSURE WAS WRONG. It is the measurement of how much of that
+/// kernel's cost is the indirection, which is the upper bound on what packing a contiguous panel
+/// could buy -- before paying for the pack/unpack that a contiguous panel needs and this does not.
+#[allow(clippy::too_many_arguments)]
+fn indexed_scatter(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f64],
+    b: &[f64],
+    c: &mut [f64],
+    slots: &[usize],
+    acc: &mut [f64],
+) {
+    for i in 0..m {
+        // Scatter the target row into the accumulator, apply every multiplier through the
+        // indirection, then gather back -- exactly the shape of the refuted kernel.
+        for (j, &slot) in slots.iter().enumerate() {
+            acc[slot] = c[i * n + j];
+        }
+        let arow = &a[i * k..i * k + k];
+        for (p, &av) in arow.iter().enumerate() {
+            let brow = &b[p * n..p * n + n];
+            for (j, &slot) in slots.iter().enumerate() {
+                acc[slot] -= av * brow[j];
+            }
+        }
+        for (j, &slot) in slots.iter().enumerate() {
+            c[i * n + j] = acc[slot];
+        }
+    }
+}
+
+/// The PROPOSAL, measured with the cost that makes it honest: PACK the scattered row into a
+/// contiguous buffer, sweep it with no indirection, then UNPACK (frankenscipy-n6mqn).
+///
+/// `indexed_scatter` bounds the PRIZE -- how much of the refuted kernel's cost is the indirection.
+/// It does not bound the PROFIT, because a contiguous panel has to pay for getting the data
+/// contiguous and the indexed kernel does not. This variant pays it.
+///
+/// The two differ by exactly the trade in question, since both perform the same outer scatter and
+/// gather between `c` and the scattered accumulator:
+///
+///     indexed_scatter : k INDEXED sweeps
+///     packed_panel    : 1 indexed pack + k CONTIGUOUS sweeps + 1 indexed unpack
+///
+/// So packing adds two indirect passes and converts `k` of them to vectorisable ones. It should
+/// pay whenever `k > 2` and lose below that -- and at the cubic cell's supernode width of 5 it is
+/// on the paying side, which is exactly the claim that needs a number rather than an argument.
+#[allow(clippy::too_many_arguments)]
+fn packed_panel(
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &[f64],
+    b: &[f64],
+    c: &mut [f64],
+    slots: &[usize],
+    acc: &mut [f64],
+    buf: &mut [f64],
+) {
+    for i in 0..m {
+        for (j, &slot) in slots.iter().enumerate() {
+            acc[slot] = c[i * n + j];
+        }
+        // PACK: scattered -> contiguous. One indirect pass.
+        for (j, &slot) in slots.iter().enumerate() {
+            buf[j] = acc[slot];
+        }
+        let arow = &a[i * k..i * k + k];
+        for (p, &av) in arow.iter().enumerate() {
+            let brow = &b[p * n..p * n + n];
+            for (bv, &brv) in buf.iter_mut().zip(brow.iter()) {
+                *bv -= av * brv;
+            }
+        }
+        // UNPACK: contiguous -> scattered. One indirect pass.
+        for (j, &slot) in slots.iter().enumerate() {
+            acc[slot] = buf[j];
+        }
+        for (j, &slot) in slots.iter().enumerate() {
+            c[i * n + j] = acc[slot];
+        }
+    }
 }
 
 /// `C -= A * B`, i-k-j order: THE SUPERNODAL SHAPE.
@@ -316,6 +463,19 @@ fn tiled_8x4_fma(m: usize, n: usize, k: usize, a: &[f64], b: &[f64], c: &mut [f6
 fn run(variant: &str, m: usize, n: usize, k: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
     match variant {
         "naive_ijk" => naive_ijk(m, n, k, a, b, c),
+        "packed_panel" => {
+            let slots: Vec<usize> = (0..n).map(|j| j * 4).collect();
+            let mut acc = vec![0.0f64; n * 4];
+            let mut buf = vec![0.0f64; n];
+            packed_panel(m, n, k, a, b, c, &slots, &mut acc, &mut buf);
+        }
+        "indexed_scatter" => {
+            // Spread the n live columns over a 4x wider accumulator, so the indirection lands
+            // across a realistic column span rather than a compact one.
+            let slots: Vec<usize> = (0..n).map(|j| j * 4).collect();
+            let mut acc = vec![0.0f64; n * 4];
+            indexed_scatter(m, n, k, a, b, c, &slots, &mut acc);
+        }
         "naive_ikj" => naive_ikj(m, n, k, a, b, c),
         "naive_ikj_fma" => naive_ikj_fma(m, n, k, a, b, c),
         "naive_kij" => naive_kij(m, n, k, a, b, c),
@@ -389,7 +549,12 @@ fn main() {
             run(&variant, m, n, k, &a, &b, &mut got);
             let exact = matches!(
                 variant.as_str(),
-                "naive_ijk" | "naive_kij" | "naive_ikj" | "tiled4x4"
+                "naive_ijk"
+                    | "naive_kij"
+                    | "naive_ikj"
+                    | "indexed_scatter"
+                    | "packed_panel"
+                    | "tiled4x4"
             );
             let worst = want
                 .iter()

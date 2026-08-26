@@ -41039,3 +41039,70 @@ trailing update built on `naive_ikj` against per-pivot on the cubic cell, to sep
 panel-assembly cost (gather/scatter, symbolic, supernode identification) from kernel cost.
 llywn.2's blocked path measured 4.17-fold worse than per-pivot, but it used neither this loop
 order nor this data layout, so that figure does not bound the overhead of a correctly shaped one.
+
+## 2026-08-26 - BlackThrush (cc) - the supernodal closure compared two INDIRECT kernels to each other: packing the panel contiguous costs 9.83 Ir/element against the indexed scatter's 16.57, a configuration the closure never tested — but pack/unpack eats 85% of the prize, so the closure still stands
+
+**Result class: BEHAVIORAL.** Bead `frankenscipy-n6mqn`, informs `llywn.3` and `9nw95`.
+**This row does NOT reopen `frankenscipy-9nw95` and must not be read as doing so.**
+
+**probe**: `crates/fsci-linalg/src/bin/probe_panel_density.rs`, variants `indexed_scatter` and
+`packed_panel`, one variant per process.
+**same_host=thinkstation1**, 64 cpu. **harness**: `probe_panel_density`, executed ELF sha256
+`de496c7d0143b71b8f5cf9e422a895b6bfb7adccca70bbc858b38d9bc2ad4651`.
+**Ratios are spelled `N-fold`, not `Nx`: they are ratios of INSTRUCTION COUNTS, never of time.**
+**Nothing in this row is a timing claim.**
+
+**observed:** at the cubic cell's supernode width k=5, over three repeats --
+
+    variant           Ir/element (3 reps)      miss/kFLOP (3 reps)
+    naive_kij         1.41  1.41  1.41         67.333  67.323  67.512
+    naive_ikj         1.42  1.42  1.41         16.033  15.902  15.868
+    indexed_scatter  16.57 16.58 16.56         22.533  23.542  23.378
+    packed_panel      9.83  9.83  9.83         22.632  21.518  22.384
+
+### What the 2026-08-16 closure measured
+
+The supernodal line was closed on "THERE IS NO CROSSOVER WIDTH: the dense scatter has IDENTICAL
+marginal cost to the merge (15.06 vs 15.00 Ir/element), so it never wins". That is sound about the
+kernel it measured. **But `dense_scatter_block_update` (`fsci-sparse/src/linalg.rs:1884`) writes
+through `accumulator[slot]` and walks its tail columns with the same indirection.** It is dense in
+STORAGE -- an n-length accumulator -- not dense in ACCESS, and an indexed store does not vectorise
+into packed AVX2.
+
+So the closure compared **two indirect kernels to each other**. Both pay the indirection; neither
+was ever contiguous. `indexed_scatter` reproduces that access pattern at identical FLOPs and lands
+at **16.57 Ir/element against the real kernel's measured 15.06** -- close enough to say the model
+has the right shape. The same arithmetic done contiguously is **1.42**.
+
+### And the number that keeps the closure standing
+
+Pure contiguous suggests a prize of 16.57 -> 1.42, 11.7-fold. **That is not available.** A
+contiguous panel must be packed and unpacked, and the indexed kernel need not. `packed_panel` pays
+exactly that -- one indirect pack, k contiguous sweeps, one indirect unpack, against the indexed
+form's k indirect sweeps -- and lands at **9.83 Ir/element: 1.69-fold better than the indexed
+scatter, not 11.7-fold.** Getting the data contiguous costs about 85% of what being contiguous is
+worth at w=5.
+
+**This is a configuration the closure did not test**, and 1.69-fold on this kernel is not nothing.
+It is also not a refutation, and I am not recording it as one: whether it moves the cell's wall
+time depends on what share of the elimination this kernel is, which is NOT measured here.
+
+### A correction to my own first reading of these numbers
+
+I initially wrote that packing also improved the miss count 1.13-fold. **Three repeats say that is
+unresolved.** `Ir/element` is stable to +-0.02 across repeats -- instruction counts really are
+load-independent -- but `miss/kFLOP` moves a few percent run to run, and `indexed_scatter` and
+`packed_panel` OVERLAP (22.5-23.5 against 21.5-22.6). No miss claim is made between those two.
+
+What misses DO separate cleanly is the loop ORDER: 15.9-16.0 for `i-k-j` against 67.3-67.5 for
+`k-i-j`, non-overlapping by a factor of four. **The traffic win belongs to the ORDER and the
+instruction win belongs to PACKING. They are separate levers**, and `factorize_csr_supernodal`
+already has the first one and not the second.
+
+**Cache-miss counts are NOT as load-independent as instruction counts**, which is worth carrying
+forward: a single-shot miss figure on this box is worth a repeat before it is worth a conclusion.
+
+**Concrete retry predicate:** measure what fraction of the cubic cell's elimination instructions
+sit in the block-update kernel. 1.69-fold on a kernel that is 20% of the work is 1.14-fold on the
+cell and not worth the packing machinery; on 70% it is 1.40-fold and is. That fraction decides
+whether this configuration is worth building, and it is countable on a loaded host.
