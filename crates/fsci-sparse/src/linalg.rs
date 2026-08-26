@@ -17404,6 +17404,7 @@ mod tests {
         for side in [8usize, 12, 16] {
             let matrix = laplacian_3d_cubic(side);
             MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
+            let _ = take_merge_shape();
             let factor = NativeSparseLu::factorize_csr(
                 &matrix,
                 LuOptions::default().diag_pivot_thresh,
@@ -17411,6 +17412,20 @@ mod tests {
             )
             .expect("cubic factorization");
             let (calls, span, bound) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
+            // HOW MUCH NEW STRUCTURE DOES A MERGE ACTUALLY CARRY?
+            //
+            // `apply_sorted_pivot_tail` is 45.38% of this cell and the dominant cost in the
+            // whole factorization. When the target's and the tail's columns do not coincide
+            // exactly it builds a fresh output row and copies it back, and the existing
+            // `merge_shape_explains_the_density_sign_flip` diagnostic measured only 10.6% of
+            // cubic updates taking the in-place path -- so ~89% pay that rewrite.
+            //
+            // The rewrite is justified only if a merge genuinely restructures the row.
+            // `tail_only` counts columns present in the pivot tail but NOT in the target,
+            // i.e. the fill this merge introduces, which is the only thing that can force a
+            // reshape. If that is ~1 per merge, we are rebuilding a ~160-column row to
+            // insert a single entry.
+            let shape = take_merge_shape();
             std::hint::black_box(&factor);
             assert!(
                 calls > 0,
@@ -17424,6 +17439,73 @@ mod tests {
                 bound as f64 / calls as f64,
                 span as f64 / bound.max(1) as f64
             );
+            let rewrites = shape.merges;
+            let total = shape.merges + shape.inplace;
+            println!(
+                "MERGE_SHAPE side={side} n={n} merges={} inplace={} inplace_share={:.4} \
+                 tail_only={} target_only={} tail_only_per_merge={:.3} \
+                 target_only_per_merge={:.3}",
+                shape.merges,
+                shape.inplace,
+                shape.inplace as f64 / total.max(1) as f64,
+                shape.tail_only,
+                shape.target_only,
+                shape.tail_only as f64 / rewrites.max(1) as f64,
+                shape.target_only as f64 / rewrites.max(1) as f64,
+            );
+        }
+
+        // MUST-HIT ARM FOR `target_only`, and it is the load-bearing check here.
+        //
+        // The cubic cell reports `target_only = 0` EXACTLY at every size, which reads as a
+        // structural invariant -- the target's live columns are always contained in the
+        // pivot tail's -- and that invariant is what would justify replacing the general
+        // merge with an insertion. A counter that never fires looks precisely the same, so
+        // the reading is worth nothing until this arm shows the counter CAN fire.
+        //
+        // A scattered pentadiagonal factor has target rows carrying columns the tail does
+        // not, so it must report a nonzero count on the same code path and the same
+        // counter.
+        for (label, matrix, ordering) in [
+            (
+                "scattered/colamd",
+                scattered_pentadiagonal_csr(10),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "cubic/natural",
+                laplacian_3d_cubic(8),
+                PermutationOrdering::Natural,
+            ),
+            (
+                "cubic/colamd",
+                laplacian_3d_cubic(8),
+                PermutationOrdering::Colamd,
+            ),
+        ] {
+            let _ = take_merge_shape();
+            let f = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .expect("control factorization");
+            std::hint::black_box(&f);
+            let c = take_merge_shape();
+            println!(
+                "MERGE_SHAPE_CONTROL {label} merges={} inplace={} target_only={} tail_only={}",
+                c.merges, c.inplace, c.target_only, c.tail_only
+            );
+            if label == "cubic/natural" {
+                // MUST-HIT. Under the shipping RCM ordering this cell reports
+                // `target_only = 0` at every size, which reads as an invariant -- the
+                // target's live columns are always contained in the pivot tail's -- and
+                // that invariant is what would justify replacing the general merge with an
+                // insertion. A counter that never fires looks exactly the same. The same
+                // fixture under NATURAL ordering must report a nonzero count on the same
+                // code path and the same counter, or the zeros mean nothing.
+                assert!(
+                    c.target_only > 0,
+                    "the target_only counter never fires even on cubic/natural, so the \
+                     RCM zeros are a dead counter rather than an invariant"
+                );
+            }
         }
     }
 
