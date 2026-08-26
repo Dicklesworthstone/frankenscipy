@@ -1392,16 +1392,21 @@ fn apply_sorted_pivot_tail(
             // element would reintroduce the barrier that cost 13% one turn earlier.
             let mut cancelled = false;
             {
+                // Same slice-then-zip as the partial-prefix loop below, for the same reason:
+                // `tail_vals[index]` cannot be proven in range against `width` and pays a
+                // bounds check per element otherwise. This arm is the smaller of the two
+                // (6.25% of updates take it at the loss cell) but it is the identical shape.
                 let updated = &mut target.vals[base..base + width];
+                let tail = &tail_vals[..width];
                 if detect_cancellation {
-                    for index in 0..width {
-                        let value = updated[index] + negated * tail_vals[index];
-                        updated[index] = value;
+                    for (value_slot, &tail_value) in updated.iter_mut().zip(tail.iter()) {
+                        let value = *value_slot + negated * tail_value;
+                        *value_slot = value;
                         cancelled |= value == 0.0;
                     }
                 } else {
-                    for index in 0..width {
-                        updated[index] += negated * tail_vals[index];
+                    for (value_slot, &tail_value) in updated.iter_mut().zip(tail.iter()) {
+                        *value_slot += negated * tail_value;
                     }
                 }
             }
@@ -1492,16 +1497,31 @@ fn apply_sorted_pivot_tail(
             // Same reasoning as the fast path above, including the hoisted branch.
             let mut cancelled = false;
             {
+                // SLICE BOTH SIDES, THEN NEVER INDEX -- the same rule `scan_matched_prefix`
+                // already documents, which had not been applied here.
+                //
+                // `updated` is `matched` long, but nothing tells the optimizer that
+                // `tail_vals` is at least that long, so `tail_vals[index]` carried its own
+                // bounds check on every iteration of the hottest loop in the factorization.
+                // Line-level callgrind on the loss cell put this single statement at
+                // 235,423,606 Ir -- 30.57% of `apply_sorted_pivot_tail` and the largest line
+                // in the whole profile -- which is 2.66 instructions per element for a
+                // multiply-add that lowers to `vmulpd`/`vsubpd` four at a time.
+                //
+                // Narrowing `tail_vals` to `matched` up front pays for the check ONCE and
+                // hands `zip` two runs the compiler already knows are the same length.
+                // Bit-identical: same operands, same order, same rounding.
                 let updated = &mut target.vals[base..base + matched];
+                let tail = &tail_vals[..matched];
                 if detect_cancellation {
-                    for index in 0..matched {
-                        let value = updated[index] + negated * tail_vals[index];
-                        updated[index] = value;
+                    for (value_slot, &tail_value) in updated.iter_mut().zip(tail.iter()) {
+                        let value = *value_slot + negated * tail_value;
+                        *value_slot = value;
                         cancelled |= value == 0.0;
                     }
                 } else {
-                    for index in 0..matched {
-                        updated[index] += negated * tail_vals[index];
+                    for (value_slot, &tail_value) in updated.iter_mut().zip(tail.iter()) {
+                        *value_slot += negated * tail_value;
                     }
                 }
             }
@@ -17426,6 +17446,7 @@ mod tests {
             // reshape. If that is ~1 per merge, we are rebuilding a ~160-column row to
             // insert a single entry.
             let shape = take_merge_shape();
+            let shortfall = FASTPATH_SHORTFALL.with(|cell| cell.replace([0; 6]));
             std::hint::black_box(&factor);
             assert!(
                 calls > 0,
@@ -17452,6 +17473,25 @@ mod tests {
                 shape.target_only,
                 shape.tail_only as f64 / rewrites.max(1) as f64,
                 shape.target_only as f64 / rewrites.max(1) as f64,
+            );
+            // HOW FAR SHORT DOES THE ALL-OR-NOTHING FAST PATH FALL?
+            //
+            // `miss = tail_cols.len() - matched` is how many trailing columns stop the
+            // full in-place path from firing. Buckets are [miss=1, 2, 3-4, 5-8, >8,
+            // miss=0]. If the mass sits at miss=1 then the partial prefix path is already
+            // handling essentially the whole row in place and only ~1 column is rewritten,
+            // which would mean the rebuild cost this profile shows is NOT the row copy and
+            // the lever is somewhere else entirely.
+            let total_short: u64 = shortfall.iter().sum();
+            println!(
+                "FASTPATH_SHORTFALL side={side} n={n} miss1={} miss2={} miss3_4={}                  miss5_8={} miss_gt8={} miss0={} total={total_short}                  share_miss1={:.4}",
+                shortfall[0],
+                shortfall[1],
+                shortfall[2],
+                shortfall[3],
+                shortfall[4],
+                shortfall[5],
+                shortfall[0] as f64 / total_short.max(1) as f64,
             );
         }
 
