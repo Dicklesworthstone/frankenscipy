@@ -41288,3 +41288,83 @@ much" but "at what cost". Price a symbolic pass that computes only the supernode
 rather than the full fill pattern -- `symbolic_fill_pattern` at 5.03-fold the sequential
 factorization is the single largest item in the supernodal profile, and no packing lever can pay
 for itself until that is smaller than what it saves.
+
+## 2026-08-26 - BlackThrush (cc) - llywn's packing lever is DEAD on the current symbolic pass: `symbolic_fill_pattern` is O(n^2.265) against a factorization that is O(n^1.653), so it gets relatively worse with size — 1.37-fold of the whole factorization at n=512, 4.86-fold at n=4096
+
+**Result class: BEHAVIORAL.** Bead `frankenscipy-4m90a`, informs `llywn.3`.
+**probe**: `crates/fsci-sparse/src/bin/perf_spsolve.rs --profile-cubic-splu-rust` under
+`valgrind --tool=callgrind --cache-sim=no --branch-sim=no`, both arms, sides 8/10/12/14/16,
+`FSCI_SPLU_ORDERING=rcm` held fixed across the whole sweep so the fill itself does not move.
+**same_host=thinkstation1**, 64 cpu. **harness**: `perf_spsolve` with
+`--features sparse-incumbent-bench`, executed ELF sha256
+`76bcb77bb9e878a0f6807e2f4518a576d84abad9b5d9b187d3da93aee0793ce0`.
+**Ratios are spelled `N-fold`, not `Nx`: they are ratios of INSTRUCTION COUNTS, never of time.**
+**Callgrind counts are deterministic and load-independent. No timing claim is made.**
+
+**observed:** per-function instruction counts across five cubic sides --
+
+    n      symbolic_fill_pattern   apply_sorted_pivot_tail   matched_run_length   sequential TOTAL
+    512           50,431,626             10,605,688            2,857,276            36,746,240
+    1000         225,652,346             36,421,878           11,374,722           104,913,330
+    1728         778,493,914            100,209,462           34,356,302           257,216,794
+    2744       2,234,526,334            231,887,742           91,646,754           561,793,801
+    4096       5,593,938,348            502,157,096          218,376,750         1,150,102,838
+
+    fitted exponents        symbolic_fill_pattern   O(n^2.265)
+                            matched_run_length      O(n^2.079)
+                            apply_sorted_pivot_tail O(n^1.850)
+                            sequential TOTAL        O(n^1.653)
+
+### The finding
+
+`bfk5l` established that a supernodal plan absorbs the per-update pattern compare and put llywn's
+packing ceiling at 1.308-1.384-fold. It also showed `symbolic_fill_pattern` costing 5.03-fold the
+entire sequential factorization, and left the question of whether that is a constant to tune or an
+algorithm to replace.
+
+**It is the algorithm.** The symbolic pass is O(n^2.265) while the factorization it would enable is
+O(n^1.653) -- it grows as O(n^0.612) RELATIVE to its own justification:
+
+    n=512    symbolic costs 1.37-fold the whole sequential factorization
+    n=1000                  2.15-fold
+    n=1728                  3.03-fold
+    n=2744                  3.98-fold
+    n=4096                  4.86-fold
+
+**A pass that must be cheaper than the 67.91% it saves is instead 4.86-fold the entire thing, and
+the multiple rises with every size.** That is roughly 7.1-fold too expensive at the measured cell,
+and the gap widens. No constant-factor tuning reaches it, because the exponent is wrong.
+
+### The honesty condition this bead set for itself, and how it was met
+
+The bead required not concluding "superlinear" from Ir against n alone, since the FILL is also
+growing superlinearly -- an O(fill) pass would show a superlinear Ir curve while being perfectly
+efficient. That is why the sequential arm was swept as the control rather than the symbolic curve
+being read on its own: **the comparison is exponent against exponent on the same fixture family
+and the same ordering**, and 2.265 against 1.653 is a statement about relative growth that no
+common fill factor explains. Five sides, not two.
+
+### A second thing the sweep says, unprompted
+
+`matched_run_length` is O(n^2.079) while `apply_sorted_pivot_tail` is O(n^1.850). **The per-update
+pattern compare grows faster than the value merge it serves**, so its 19.26% share at n=4096 is
+itself rising with size. That strengthens the case for eliminating it -- and makes it more
+important, not less, that the thing eliminating it is not O(n^2.265).
+
+### Where this leaves llywn
+
+The packing lever now has a ceiling (1.308-1.384-fold, `bfk5l`), a kernel (`n6mqn`), a denominator
+(`hpx50`), and a blocker: the only symbolic pass in the tree that can plan its blocks costs more
+than the lever can ever return, asymptotically. **This is a NEGATIVE result and it is the useful
+kind** -- it converts "build a packed supernodal kernel" from a plausible-sounding direction into a
+change with a stated precondition that is currently false.
+
+**Concrete retry predicate, and it is now a specification rather than a direction:** a symbolic
+pass for this lever must (a) compute only supernode UNION patterns, not the full fill pattern, and
+(b) cost at most ~0.68-fold of the factorization -- which at n=4096 means **at least 7.1-fold
+cheaper than `symbolic_fill_pattern`**, with an exponent at or below the factorization's own
+O(n^1.653) so the margin does not evaporate at larger n. The standard elimination-tree / row-
+subtree traversal is the shape that meets (b); whether it can be made to satisfy (a) on this
+factor representation is the next counted question. **Until something meets both, the packing
+lever should not be built**, and `llywn.3` should carry that as a precondition rather than as an
+open lever.
