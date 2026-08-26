@@ -9346,8 +9346,44 @@ fn splu_periodic_cuboid_pattern(a: &CsrMatrix) -> Option<PeriodicCuboidPattern> 
     }
     let x_extent = gaps[2];
     let plane = gaps[4];
-    if x_extent < 9
-        || x_extent.is_multiple_of(2)
+    // MINIMUM EXTENT 3, AND NOTHING ELSE (frankenscipy-g68jq).
+    //
+    // This used to additionally require every extent to be >= 9, ODD, and PAIRWISE DISTINCT,
+    // which turned away a CUBIC periodic grid -- the commonest 3-D periodic stencil there is --
+    // and sent it to the general sparse LU. Counted on one binary, `spsolve` on a refused cubic
+    // 11x11x11 (n=1331) costs 355,902,029 Ir against 20,968,910 Ir for a recognized 9x11x13
+    // (n=1287): 17.0x more work for a 3.4% larger problem.
+    //
+    // The dropped guards were disambiguation aids for the gap-set inversion, not safety. For
+    // extents x,y,z >= 3 the six distances {1, x-1, x, plane-x, plane, n-plane} are provably
+    // DISTINCT and already in ascending order, so `gaps[2]` is x and `gaps[4]` is the plane for
+    // every such grid, cubic ones included:
+    //   * 1 < x-1 needs x >= 3; x < plane-x needs y >= 3; plane < n-plane needs z >= 3.
+    //   * the cross pairs cannot collide: x-1 = plane-x would need y = 2 - 1/x, plane-x = 1
+    //     would need y = 1 + 1/x, and n-plane in {x-1, x} would need plane(z-1) <= x while
+    //     plane >= 3x -- none of which has an integer solution for x,y,z >= 3.
+    // Any collision that did occur would shrink the set below six and be refused by the
+    // `gaps.len() != 6` test above, so the inversion cannot silently misread a grid.
+    //
+    // Extent 2 is excluded for free and needs no guard: the left and right neighbours coincide,
+    // so the row holds fewer than seven distinct columns and `nnz != 7n` rejects it. Extent 1 is
+    // rejected the same way.
+    //
+    // The checks that remain are the ones that actually validate the inference, and they are
+    // unchanged. Below them, the per-row pass walks EVERY row, requires a bijection onto the
+    // exact 7-point periodic neighbourhood built from the inferred extents, and requires the
+    // per-axis weights to match bit-identically across all rows; then `solve_spectral`
+    // self-validates finiteness, a negligible imaginary part, and the true relative residual,
+    // returning None into the general path on any failure. A mis-inference therefore costs time,
+    // never correctness.
+    //
+    // EVEN EXTENTS ARE NONSINGULAR, which is the one thing parity could plausibly have been
+    // protecting. The eigenvalue at mode (a,b,c) is
+    // `shift + 2*sum_d w_d*(cos theta_d - 1)`; every `w_d < 0` and every `cos theta_d - 1 <= 0`,
+    // so each term is >= 0 and the eigenvalue is >= shift > 0 for EVERY extent, Nyquist mode
+    // included. Both facts are already required above: `shift > 0` and all three weights < 0.
+    const MINIMUM_PERIODIC_EXTENT: usize = 3;
+    if x_extent < MINIMUM_PERIODIC_EXTENT
         || gaps[1] != x_extent.checked_sub(1)?
         || gaps[3] != plane.checked_sub(x_extent)?
         || !plane.is_multiple_of(x_extent)
@@ -9358,14 +9394,7 @@ fn splu_periodic_cuboid_pattern(a: &CsrMatrix) -> Option<PeriodicCuboidPattern> 
     }
     let y_extent = plane / x_extent;
     let z_extent = n / plane;
-    if y_extent < 9
-        || z_extent < 9
-        || y_extent.is_multiple_of(2)
-        || z_extent.is_multiple_of(2)
-        || x_extent == y_extent
-        || x_extent == z_extent
-        || y_extent == z_extent
-    {
+    if y_extent < MINIMUM_PERIODIC_EXTENT || z_extent < MINIMUM_PERIODIC_EXTENT {
         return None;
     }
 
@@ -12235,8 +12264,148 @@ mod tests {
             .expect("3-D laplacian CSR")
     }
 
+    /// The periodic-cuboid recognizer's reach, pinned on BOTH arms (frankenscipy-g68jq).
+    ///
+    /// Was: extents had to be >= 9, ODD and PAIRWISE DISTINCT, so a CUBIC periodic grid -- the
+    /// commonest 3-D periodic stencil there is -- fell through to the general sparse LU. Counted
+    /// on one binary, `spsolve` on a refused cubic 11x11x11 (n=1331) cost 355,902,029 Ir against
+    /// 20,968,910 Ir for a recognized 9x11x13 (n=1287).
+    ///
+    /// A widening test needs the refusing arm more than the accepting one: "we now recognize more
+    /// things" is trivially satisfied by a recognizer that accepts everything, and that failure
+    /// mode is invisible because the spectral route self-validates and silently falls back.
+    #[test]
+    fn periodic_cuboid_recognizer_reach_is_pinned_on_both_arms() {
+        // MUST-HIT, and the extents must be read back CORRECTLY -- recognition alone would pass
+        // for an inversion that inferred the wrong grid and then got rescued by the fallback.
+        for (x, y, z, why) in [
+            (
+                9usize,
+                11usize,
+                13usize,
+                "the fixture the periodic route is measured on",
+            ),
+            (
+                13,
+                15,
+                17,
+                "the fixture zdom3 pre-registered its profile against",
+            ),
+            (11, 11, 11, "cubic -- the case this widening exists for"),
+            (9, 9, 13, "two extents equal"),
+            (10, 12, 14, "all extents even"),
+            (4, 5, 6, "small mixed parity"),
+            (
+                3,
+                3,
+                3,
+                "the smallest grid the gap inversion is provable for",
+            ),
+        ] {
+            let matrix = shifted_periodic_cuboid_with_extents(x, y, z);
+            let pattern = super::splu_periodic_cuboid_pattern(&matrix)
+                .unwrap_or_else(|| panic!("{x}x{y}x{z} ({why}) must be recognized"));
+            assert_eq!(
+                (pattern.x_extent, pattern.y_extent, pattern.z_extent),
+                (x, y, z),
+                "{x}x{y}x{z} ({why}): the gap inversion read back the wrong extents"
+            );
+
+            // And the route is actually TAKEN, with an answer that meets the residual bound.
+            // Only above n = 256, because below it `spsolve` dispatches to the DENSE path before
+            // any recognizer is consulted -- asserting the backend there would be asserting
+            // against the dispatcher's size gate, not against this widening.
+            let rhs: Vec<f64> = (0..matrix.shape().rows)
+                .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+                .collect();
+            let solved = spsolve(&matrix, &rhs, SolveOptions::default())
+                .unwrap_or_else(|_| panic!("{x}x{y}x{z}: solve"));
+            if matrix.shape().rows >= 256 {
+                assert_eq!(
+                    solved.backend_used,
+                    SparseBackend::PeriodicCuboidSpectralLu,
+                    "{x}x{y}x{z} ({why}) is recognized but did not reach the spectral backend"
+                );
+            }
+            assert!(
+                relative_residual(&matrix, &rhs, &solved.solution)
+                    <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+                "{x}x{y}x{z}: solution fails the residual bound"
+            );
+        }
+
+        // MUST-MISS. Every one of these has to stay refused, or the widening has traded a slow
+        // path for a wrong one.
+        let recognized = shifted_periodic_cuboid_with_extents(9, 11, 13);
+
+        // (a) a stencil that is not the 7-point periodic operator: one perturbed weight.
+        let mut corrupted_data = recognized.data().to_vec();
+        corrupted_data[3] += 0.5;
+        let corrupted = CsrMatrix::from_components(
+            recognized.shape(),
+            corrupted_data,
+            recognized.indices().to_vec(),
+            recognized.indptr().to_vec(),
+            false,
+        )
+        .expect("corrupted periodic CSR");
+        assert!(
+            super::splu_periodic_cuboid_pattern(&corrupted).is_none(),
+            "a perturbed weight must be refused, or recognition proves nothing"
+        );
+
+        // (b) extents of 2 and 1, which the minimum-extent argument leans on `nnz != 7n` to
+        // reject rather than guarding directly. If that reasoning is ever wrong, this catches it.
+        for (x, y, z) in [(2usize, 5usize, 7usize), (1, 5, 7), (5, 2, 7), (5, 7, 2)] {
+            let degenerate = shifted_periodic_cuboid_with_extents(x, y, z);
+            assert!(
+                super::splu_periodic_cuboid_pattern(&degenerate).is_none(),
+                "{x}x{y}x{z}: an extent below three must be refused"
+            );
+        }
+
+        // (c) a NON-periodic matrix with the same nonzero count per row: seven bands with no
+        // wrap-around. It has the right nnz and is structurally plausible, which is exactly the
+        // shape a loosened inversion would be most likely to misread.
+        let n = 1287usize;
+        let mut rows = Vec::new();
+        let mut columns = Vec::new();
+        let mut data = Vec::new();
+        for row in 0..n {
+            for offset in [0i64, 1, -1, 9, -9, 99, -99] {
+                let column = (row as i64 + offset).rem_euclid(n as i64) as usize;
+                rows.push(row);
+                columns.push(column);
+                data.push(if offset == 0 { 8.0 } else { -1.0 });
+            }
+        }
+        let banded = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, false)
+            .expect("banded COO")
+            .to_csr()
+            .expect("banded CSR");
+        if banded.nnz() == 7 * n {
+            let solved = spsolve(&banded, &vec![1.0; n], SolveOptions::default());
+            if let Ok(solved) = solved {
+                assert!(
+                    relative_residual(&banded, &vec![1.0; n], &solved.solution)
+                        <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+                    "a seven-band matrix must be solved correctly whichever route it takes"
+                );
+            }
+        }
+    }
+
     fn shifted_periodic_cuboid_for_splu() -> CsrMatrix {
-        let (x_extent, y_extent, z_extent) = (9usize, 11usize, 13usize);
+        shifted_periodic_cuboid_with_extents(9, 11, 13)
+    }
+
+    /// Same shifted anisotropic periodic operator, any extents. Extracted so the recognizer's
+    /// reach can be probed on shapes it currently refuses without duplicating the stencil.
+    fn shifted_periodic_cuboid_with_extents(
+        x_extent: usize,
+        y_extent: usize,
+        z_extent: usize,
+    ) -> CsrMatrix {
         let plane = x_extent * y_extent;
         let n = plane * z_extent;
         let (shift, x_weight, y_weight, z_weight) = (0.001, -0.75, -1.0, -1.25);

@@ -15468,3 +15468,39 @@ mod lsq_bivariate_spline_tests {
         );
     }
 }
+
+/// A source-derived marker for remote compilation freshness checks.
+///
+/// The test binary embeds the exact bytes of this file at compile time, so its
+/// SHA-256 must match the caller's checked-out source. This detects a worker that
+/// runs a plausible but stale source snapshot without ever placing a deliberately
+/// wrong value in the shared tree.
+#[cfg(test)]
+mod rch_source_freshness_tests {
+    use sha2::{Digest, Sha256};
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn compiled_source_marker_matches_exact_lib_bytes() {
+        const SOURCE: &[u8] = include_bytes!("lib.rs");
+        let source_sha256 = sha256_hex(SOURCE);
+
+        // Must-hit: a one-byte source mutation changes the marker. A constant
+        // marker or a detector that ignores its input would fail here.
+        let mut altered = SOURCE.to_vec();
+        altered[0] ^= 1;
+        assert_ne!(
+            sha256_hex(&altered),
+            source_sha256,
+            "the source freshness marker did not detect a one-byte mutation"
+        );
+
+        println!(
+            "FSCI_RCH_SOURCE_SHA256 path=crates/fsci-interpolate/src/lib.rs bytes={} sha256={source_sha256}",
+            SOURCE.len()
+        );
+    }
+}

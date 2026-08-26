@@ -843,6 +843,29 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
     );
 }
 
+/// Ordering for the fsci-only convection profile.
+///
+/// It used to be hardcoded to `LuOptions::default()` while the live arm read
+/// `FSCI_SPLU_ORDERING`, so the cheap profile and the row it is supposed to pre-cost were
+/// silently measuring different configurations. Reading the same variable is the whole fix.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn convection_profile_options() -> LuOptions {
+    let ordering = match std::env::var("FSCI_SPLU_ORDERING").ok().as_deref() {
+        None | Some("") | Some("default") => LuOptions::default().ordering,
+        Some("colamd") => PermutationOrdering::Colamd,
+        Some("rcm") => PermutationOrdering::ReverseCuthillMcKee,
+        Some("mmd-ata") => PermutationOrdering::MmdAta,
+        Some("mmd-at-plus-a") => PermutationOrdering::MmdAtPlusA,
+        Some("amd") => PermutationOrdering::Amd,
+        Some("natural") => PermutationOrdering::Natural,
+        Some(other) => panic!("FSCI_SPLU_ORDERING={other:?} is not a known ordering"),
+    };
+    LuOptions {
+        ordering,
+        ..LuOptions::default()
+    }
+}
+
 #[cfg(feature = "sparse-incumbent-bench")]
 /// Ordering for the fsci-only convection profile.
 ///
@@ -1840,8 +1863,41 @@ mod cubic_live {
             .collect()
     }
 
+    /// Extents for the periodic-cuboid live row, selected by `FSCI_PERIODIC_CUBOID_EXTENTS`.
+    ///
+    /// EXISTS TO MEASURE A WIDENING, NOT TO TUNE. The default is the pre-registered 9x11x13 and
+    /// is what every arm runs when the variable is unset. Until frankenscipy-g68jq the recognizer
+    /// refused any grid that was not >= 9, odd and pairwise distinct, so the only fixture this
+    /// harness could build was one it already recognized -- which is precisely the fixture that
+    /// CANNOT show what widening the recognizer is worth. This knob lets a cubic grid be put in
+    /// front of the same live SciPy arm, in one invocation, on the same ELF.
+    fn periodic_cuboid_extents() -> Result<(usize, usize, usize), String> {
+        let raw = match std::env::var("FSCI_PERIODIC_CUBOID_EXTENTS") {
+            Ok(value) if !value.is_empty() && value != "default" => value,
+            _ => return Ok((9, 11, 13)),
+        };
+        let parts: Vec<&str> = raw.split(['x', ',']).collect();
+        if parts.len() != 3 {
+            return Err(format!(
+                "FSCI_PERIODIC_CUBOID_EXTENTS={raw:?} must be three extents, e.g. 11x11x11"
+            ));
+        }
+        let mut extents = [0usize; 3];
+        for (slot, part) in parts.iter().enumerate() {
+            extents[slot] = parse::<usize>(part, "cuboid extent")?;
+            if extents[slot] < 3 {
+                return Err(format!(
+                    "FSCI_PERIODIC_CUBOID_EXTENTS={raw:?}: every extent must be at least three"
+                ));
+            }
+        }
+        Ok((extents[0], extents[1], extents[2]))
+    }
+
     fn periodic_cuboid_spsolve_fixtures() -> Result<Vec<SpluFixture>, String> {
-        let matrix = laplacian_3d_periodic_cuboid(9, 11, 13, 1.0e-3, -0.75, -1.0, -1.25);
+        let (x_extent, y_extent, z_extent) = periodic_cuboid_extents()?;
+        let matrix =
+            laplacian_3d_periodic_cuboid(x_extent, y_extent, z_extent, 1.0e-3, -0.75, -1.0, -1.25);
         let n = matrix.shape().rows;
         let csc = matrix
             .to_csc()
@@ -3357,13 +3413,31 @@ mod cubic_live {
                     .saturating_mul(fixture.right_hand_sides.len())
             })
             .sum::<usize>();
-        if total_components != EXPECTED_PERIODIC_CUBOID_SPSOLVE_COMPONENTS
+        // The guard against a silently-shrunken fixture now tracks the SELECTED extents instead
+        // of a single baked-in count, so it still refuses a fixture that lost rows or RHSs while
+        // allowing the extents to be chosen. At the default 9x11x13 it is the same 41,184 the
+        // constant names, and that equality is asserted rather than assumed.
+        let (guard_x, guard_y, guard_z) = periodic_cuboid_extents()?;
+        let expected_components = guard_x
+            .saturating_mul(guard_y)
+            .saturating_mul(guard_z)
+            .saturating_mul(PERIODIC_CUBOID_SPSOLVE_RHS_COUNT);
+        if (guard_x, guard_y, guard_z) == (9, 11, 13)
+            && expected_components != EXPECTED_PERIODIC_CUBOID_SPSOLVE_COMPONENTS
+        {
+            return Err(format!(
+                "default periodic fixture must still be \
+                 {EXPECTED_PERIODIC_CUBOID_SPSOLVE_COMPONENTS} components, computed \
+                 {expected_components}"
+            ));
+        }
+        if total_components != expected_components
             || fixtures.len() != 1
             || fixtures[0].right_hand_sides.len() != PERIODIC_CUBOID_SPSOLVE_RHS_COUNT
         {
             return Err(format!(
                 "periodic cuboid spsolve components {total_components} != \
-                 {EXPECTED_PERIODIC_CUBOID_SPSOLVE_COMPONENTS}"
+                 {expected_components}"
             ));
         }
         let live_input_digests = fixtures
@@ -3375,16 +3449,19 @@ mod cubic_live {
             combined_hasher.update(digest.as_bytes());
         }
         let shared_input_sha256 = format!("{:x}", combined_hasher.finalize());
+        let (row_x, row_y, row_z) = periodic_cuboid_extents()?;
         println!(
-            "fixture: cuboid_extents=9x11x13 boundary=periodic shift=0.001 \
+            "fixture: cuboid_extents={row_x}x{row_y}x{row_z} boundary=periodic shift=0.001 \
              diagonal=6.001 x=-0.75 y=-1 z=-1.25 \
              rhs_count={PERIODIC_CUBOID_SPSOLVE_RHS_COUNT} \
              rhs=1+0.125*((17*i+23*rhs_index)_mod_29) matrices=1 \
              materialized_components={total_components} rounds={rounds}"
         );
+        println!("fsci_arm_cuboid_extents={row_x}x{row_y}x{row_z}");
         println!(
             "whole_job_boundary: INCLUDED=32_independent_public_spsolve_calls,\
-             fresh_solver_state_per_call,41184_materialized_outputs,folded_all_output_bits; \
+             fresh_solver_state_per_call,{total_components}_materialized_outputs,\
+             folded_all_output_bits; \
              EXCLUDED=matrix_rhs_construction,csc_transport,python_startup,scipy_import,\
              warmup,parity,provenance,bootstrap"
         );

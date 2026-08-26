@@ -39590,3 +39590,230 @@ question about the algorithm, and it is the first time this bead has had one.
   dropped, and the conclusions rest on runs 1–3.
 - The instrumented region includes the panel packing, which is deliberate but means "syrk share"
   is really "trailing-update-including-pack share".
+
+## 2026-08-25 - BlackThrush (cc) - THE CAMPAIGN'S WORST CELL MOVES: run7d reads 0.899034 under AMD against 0.585647 under the shipping ordering, both arms fully admissible in one window
+
+- **Result class: COMPETITIVE, measured against live SciPy inside the same invocation.**
+  Still a LOSS -- 0.899 < 1.0, so SuperLU remains about 1.11x faster on this cell --
+  and `competitive_claim=FAIL` on both arms, correctly. What moved is the size of the
+  loss.
+
+### THE PAIR, same binary, same window, all eight null gates passing
+
+    arm                     competitive_ratio      ci95                  candidate p50
+    shipping (Colamd->RCM)  0.585647               [0.582009, 0.589866]  18.541 ms
+    AMD                     0.899034               [0.896075, 0.901283]  11.963 ms
+
+  Ratio of ratios **1.535x**; the whole job itself 18.541 -> 11.963 ms, **1.550x**.
+  The two CIs are disjoint by a wide margin.
+
+  `decision_gate` on BOTH arms: `null_medians_within_2pct=true`,
+  `all_null_ci95_span_unity=true`. The eight nulls:
+
+    arm       candidate_A/A        control_A/A          pair_A/A             live_A/A
+    shipping  0.996551             1.001540             1.004027             1.000949
+              [0.984019,1.011250]  [0.981949,1.012094]  [0.993601,1.014121]  [0.998196,1.010048]
+    AMD       1.001031             1.002208             1.001568             1.003804
+              [0.997380,1.004893]  [0.997152,1.006230]  [0.999188,1.004707]  [0.997081,1.009226]
+
+- **THREE REPLICATES OF EACH ARM, position balanced.** The pair above is the third.
+  Order was default-then-AMD, AMD-then-default, default-then-AMD:
+
+    AMD        0.885025, 0.899726, 0.899034     candidate p50 12.083, 12.030, 11.963 ms
+    shipping   0.516291, 0.591347, 0.585647     candidate p50 19.562, 17.825, 18.541 ms
+
+  AMD ran second, first, second and gave 0.885/0.900/0.899 -- no position effect at any
+  size. AMD's spread is 1.7%; the shipping arm's is 14%. **The worst AMD draw still beats
+  the best shipping draw by 1.50x.**
+
+- **AN INSTRUMENT FINDING, recorded because it cuts against the arm I am advocating.**
+  The first two AMD rows failed `all_null_ci95_span_unity` while every shipping row
+  passed it. No AMD null median was further than 0.9% from unity; the shipping arm's
+  medians were no closer. What differs is variance: the AMD arm's whole-job cv is
+  3.6-7.4% against the shipping arm's 8.5-16.6%, so its bootstrap CI is narrow enough to
+  resolve a sub-1% drift that the noisier arm cannot see. **The gate is therefore harder
+  on the faster, steadier arm**, and a reader who took "AMD failed its nulls twice" at
+  face value would have drawn the opposite conclusion from the right observation. The
+  pair quoted above is the one where both arms cleared it outright.
+
+- **PROVENANCE.** `elf_sha256 = frankenscipy_engine_sha256 =`
+  `8b5340cb8a81fe5206197735e132502cfb19ee3be710c40e4bb3b98bb385f5f6` (ONE binary; both
+  arms are the same ELF, selected by `FSCI_SPLU_ORDERING`).
+  `source_commit=4c1b3c7ac22eadf01598d61ce6dd487edca0ddc5`,
+  `builder_identity=BlackThrush`, `build_route=local-wrapper-bypass`,
+  `linalg_source_sha256=91357b488657e4f9ec014485b10fe9c819c1587f5ed8527c5b59a48a3e8b0d5d`,
+  `harness_source_sha256=5b78fd81ebeed3b399fda53a057cacdb9700a6609907b33f238651549e944a8c`,
+  `perf_spsolve_source_marker=perf-spsolve-freshness-a`.
+  HARNESS `crates/fsci-sparse/src/bin/perf_spsolve.rs --convection-splu-live 81`.
+  `host=thinkstation1`, `pin=taskset -c 1`, `cpu_affinity=1`,
+  `requested/actual frankenscipy threads = 1`, `requested scipy threads = 1`,
+  `observed_workers: candidate=1 control=1 live_scipy=1`, `runtime_isa=avx2+fma`,
+  rounds=81, `loadavg` 14-24 across the six runs.
+  `build_slot` REFUSED server-side (frankenscipy-fr78g).
+  Artifacts: `tests/artifacts/perf/run7d-amd-ordering-live-pair-{default,amd}-arm.log`.
+
+- **THE INCUMBENT IS GENUINE AND THE ANSWERS AGREE.** `scipy=1.17.1 numpy=2.4.3`,
+  `method=splu`, `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `fsci_loaded=False genuine=True`, `input_sha_match=true`. AMD arm:
+  `component_mismatches=0`, `relative_l2=3.405e-15`,
+  `candidate_max_relative_residual=4.973e-14`, live `3.976e-14`. An ordering may change
+  fill and floating-point association; it did not change the answer.
+
+- **WHAT IS NOT CLAIMED, and this matters for anyone reading the standing worst number.**
+  This is NOT "0.684193 -> 0.899034". The certified 0.684193 row was taken in a different
+  window on a host where live SciPy read 11.438 ms; today it reads 10.90-11.01 ms while
+  our shipping arm reads 17.8-19.6 ms against that row's 16.817 ms. Today's shipping
+  numbers bracket the old one within the arm's own 14% spread, so **no regression is being
+  alleged and no cross-window improvement is being claimed.** The claim is the
+  same-window, same-ELF, same-invocation pair: **0.585647 -> 0.899034**.
+
+- **WHY IT WORKS, from the counted side.** The ordering call alone on this fixture:
+  RCM 0.123 ms / 357,568 factor nonzeros; exact min-degree 25.825 ms / 137,078; AMD
+  2.181 ms / 138,696. The earlier min-degree A/B lost the job 1.96x purely on the
+  ordering's own O(V^2) cost -- it materializes the clique -- while the fill it buys is
+  worth 1.51x on the numeric factor and 2.31x on the solve. AMD reaches min-degree's fill
+  to within 1.2% at 11.8x lower ordering cost, which is what converts that trade.
+
+- **NO DEFAULT CHANGED.** `LuOptions::default().ordering` is still `Colamd`, still mapping
+  to RCM. `Amd` is reachable through this crate's options and through
+  `FSCI_SPLU_ORDERING=amd`; it is deliberately not a SciPy `permc_spec` spelling.
+
+- **Concrete retry predicate:** the deciding next measurement is whether `Amd` should
+  become the default. It is worth 1.5x on this cell and the flip is one line, but it
+  changes fill, cost and floating-point association for EVERY `splu`/`spsolve` caller, so
+  it needs the full conformance corpus green under the flip plus a spread of fixtures --
+  including ones where AMD is expected NOT to help (banded, tridiagonal, already-optimal
+  natural orderings) -- before it can be taken. Do not flip it on this cell alone. Second,
+  AMD's remaining 2.181 ms is still 18% of the AMD job; supervariable detection and mass
+  elimination are the two standard ingredients deliberately left out, and callgrind should
+  be re-run before assuming they are where the remainder is -- the last two profiles both
+  refuted the guess that preceded them.
+
+## 2026-08-25 - BlackThrush (cc) - CORRECTION to the row above: making AMD the default is NOT "one line", it silently disables four specialized fast paths
+
+- **Result class: BEHAVIORAL / refutation of my own retry predicate.** No timing was taken and
+  **no speed claim of any kind is made or restated here** -- the numbers this corrects live in
+  the row above and are not repeated. What this records is which code paths a default flip
+  turns off.
+- **probe: `cargo test -p fsci-sparse --lib --release`**, the whole crate suite, with the
+  three `Default` impls edited and then reverted, `same_host=thinkstation1`, run locally on
+  worker `thinkstation1` (no rch worker: the fleet had no admissible worker this session, so
+  `build_route=local-wrapper-bypass`). `physical_cores=32`,
+  `logical_threads=64`, `numa_count=1`, `runtime_isa=avx2+fma`, `build_route=local-wrapper-bypass`.
+  Pass/fail counts do not depend on any of that; the host is named because the gate requires a
+  probe to say where it ran.
+
+- **WHAT I WROTE.** That the flip "is one line", while noting it changes fill, cost and
+  floating-point association for every `splu`/`spsolve` caller. The caveat stands. **"One
+  line" is wrong**, and it took one build to find out.
+
+- **THE PROBE, both arms observed.** Set `ordering: PermutationOrdering::Amd` at the three
+  `Default` impls (`LuOptions`, `SolveOptions`, `IluOptions`) and run
+  `cargo test -p fsci-sparse --lib --release`. **11 failures against 583 passing at HEAD.**
+  Reverted; the tree is back to 583 passed / 0 failed and the default is unchanged.
+
+- **THREE of the eleven are the contract tests doing their job** —
+  `lu_options_default_matches_contract`, `ilu_options_default_matches_contract`,
+  `solve_options_default_matches_contract` pin the documented default and would simply be
+  updated alongside a deliberate flip.
+
+- **THE OTHER EIGHT ARE THE FINDING.** `spsolve_cubic_spectral_route_is_restored_and_agrees_with_the_general_path`,
+  `splu_cubic_spectral_toggle_changes_dispatch_and_preserves_solution`,
+  `splu_periodic_cuboid_toggle_dispatches_and_rejects_a_changed_stencil`,
+  `spsolve_periodic_cuboid_toggle_is_read_and_preserves_the_solution`,
+  `spsolve_symmetric_banded_non_m_matrix_route_is_accurate`,
+  `spsolve_wide_bandwidth_spd_stencil_takes_the_cg_fast_path`,
+  `cubic_and_scattered_factorizations_report_different_backends` and
+  `perf_toggle_dispatch_observation_separates_a_live_ab_from_a_dead_one` all fail because the
+  cubic-spectral, periodic-cuboid, symmetric-banded and CG recognizers are each gated on
+  `options.ordering == PermutationOrdering::Colamd`. Changing the default therefore **turns
+  those four specialized routes off**, on exactly the stencil cells they exist to win.
+
+- **WHY THIS IS THE DANGEROUS SHAPE.** A one-line default change that reads as pure upside
+  would have taken a gain on one nonsymmetric cell while silently removing the specialized
+  routes on the structured ones — and the eight tests that caught it are DISPATCH assertions,
+  not numerical ones, so a conformance corpus checking only VALUES would have gone green
+  over it.
+
+- **Concrete retry predicate, replacing the one in the row above:** a default flip needs the
+  four recognizer gates widened to accept any fill-reducing ordering (or to be predicated on
+  something other than the ordering enum) BEFORE the default moves, plus its own live rows on
+  the cubic and periodic-cuboid cells to show the recognizers still fire. Until then `Amd`
+  stays opt-in, which is how it is committed.
+
+## 2026-08-26 - BlackThrush (cc) - COUNTED: widening the periodic-cuboid recognizer cuts a cubic grid's spsolve 355,902,029 -> 21,658,722 Ir, and the stale 124.677x figure does NOT describe HEAD
+
+- **Result class: SELF-SPEEDUP, decided by a counted mechanism and by nothing else.** No wall
+  claim is made in this row: the host has been running a build swarm at loadavg 20-190 all
+  session and the periodic harness's own quiescence gate
+  (`host_mean_busy <= 0.200`) refused outright, twice, which is the gate working. Instruction
+  counts do not depend on load. **CV is not computed and would be provenance only.**
+
+- **THE GAP.** `splu_periodic_cuboid_pattern` refused unless all three extents were `>= 9`,
+  ODD and PAIRWISE DISTINCT. A CUBIC periodic grid -- the commonest 3-D periodic stencil there
+  is -- was therefore turned away from the Fourier route and fell through to the general sparse
+  LU. Filed as `frankenscipy-g68jq`.
+
+- **probe: `crates/fsci-sparse/src/bin/perf_spsolve.rs --profile-periodic-cuboid-spsolve-rust`**
+  under `valgrind --tool=callgrind`, one repetition, shifted anisotropic periodic cuboid
+  (shift 1e-3, weights -0.75/-1/-1.25). `same_host=thinkstation1`, run locally on worker
+  `thinkstation1` (no rch worker admitted this session: the fleet reported
+  `os_gate_excluded=1 required_os=none` for every candidate, so
+  `build_route=local-wrapper-bypass`). `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`. `build_slot` REFUSED server-side (frankenscipy-fr78g).
+
+- **Two named engine artifact SHA-256s.**
+  BEFORE `frankenscipy_engine_sha256=406480314135b2fa80d2381d078b21af1f3a14926e93b28d23f602b066bfa527`;
+  AFTER `frankenscipy_engine_sha256=1c0e88d943ae07d6f282c25055a2e020027ba50480c56964fdd10a8465318496`.
+
+- **THE COUNTED MECHANISM.**
+
+    | grid | n | route | total Ir | Ir per unknown |
+    |---|---|---|---|---|
+    | 9x11x13 | 1287 | recognized (unchanged by this work) | 20,968,910 | 16,293.6 |
+    | 11x11x11 | 1331 | **refused** -> general sparse LU | **355,902,029** | 267,394.5 |
+    | 11x11x11 | 1331 | **recognized** after widening | **21,658,722** | 16,272.5 |
+
+  **16.43x fewer instructions on the cubic grid.** The cross-check that this is the same route
+  rather than merely a cheaper one: after widening the cubic grid costs **16,272.5 Ir per
+  unknown against the already-recognized grid's 16,293.6 -- 0.13% apart.** A widening that had
+  mis-inferred the grid and been rescued by the residual fallback would not land on the
+  recognized grid's cost curve; it would land on the general path's.
+
+- **CONFORMANCE.** Cubic max relative residual after widening `1.93e-12`.
+
+- **AND THE HEADLINE NUMBER THIS BEAD INHERITED IS STALE, which is the part worth reading.**
+  `zdom3` admitted this problem class at **124.676979x SLOWER than live SciPy** on 2026-08-01,
+  and both that bead and `g68jq` still describe it that way. That profile was taken when
+  `factorize_csr` spent 58.53%/38.92% of its time in `BTreeMap` insert and ordered-tree
+  internals. **That factorizer has since been rewritten** (hash-map rows to sorted parallel
+  arrays, then packed rows). On this session's provisional harness draws the same-ELF general-LU
+  control reads **599.150 ms p50 against live SciPy's 687.389 ms** on the cubic grid -- i.e. the
+  path the 124.677x describes is now, if anything, slightly FASTER than SciPy on this class.
+  **No ratio from that row should be quoted as describing HEAD.** It is not withdrawn -- it was
+  true when taken -- but it is two orders of magnitude away from current behaviour and it is the
+  number that made this class look like the campaign's worst loss.
+
+- **PROVISIONAL AND NOT ADMISSIBLE, recorded so the next agent does not re-derive it.** One
+  21-round draw of `--periodic-cuboid-spsolve-live` on the cubic grid read
+  `competitive_ratio: live_scipy/candidate median=94.747861 ci95 [87.390409, 103.057693]`,
+  candidate p50 7.027 ms, same-ELF control p50 599.150 ms, live SciPy p50 687.389 ms, with
+  `all_null_ci95_span_unity=true`, `maintenance_ci_low_at_least_1_20_and_beyond_2x_null=true`
+  and `competitive_ci_low_beyond_2x_null=true` -- but `null_medians_within_2pct=false`. **One
+  null median moved more than 2%, so the row is INADMISSIBLE and none of those figures may be
+  quoted as a result.** They are written down only because the counted row above is what this
+  entry actually claims, and a reader should be able to tell the two apart.
+
+- **`candidate_hits=32 control_hits=0`** on every draw: all 32 independent public `spsolve`
+  calls took the spectral route and the control took none, so the arms are not measuring the
+  same code.
+
+- **Concrete retry predicate:** take the live row on a host whose `host_mean_busy` can hold
+  under 0.20 for the length of a 21-round run -- this box could not this session, and the
+  harness refused rather than producing a dirty number. Take BOTH arms:
+  `FSCI_PERIODIC_CUBOID_EXTENTS=11x11x11` (the widened cubic case) and the default `9x11x13`,
+  which is `zdom3`'s own outstanding measurement and is unaffected by this widening. Then
+  re-measure the 124.677x row itself, or mark it stale where it is quoted, because it is
+  currently the load-bearing number in two beads and it no longer describes the code.
