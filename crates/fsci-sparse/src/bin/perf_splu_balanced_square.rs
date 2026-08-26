@@ -1034,11 +1034,19 @@ for raw_line in sys.stdin.buffer:
         // `FSCI_SPLU_BANDED=1` routes the FrankenSciPy arm through the row-contiguous banded
         // factorization. It declines rather than guesses, so the hit count is printed below and a
         // silent fall-through cannot read as a measured result.
-        let banded_requested = matches!(
-            std::env::var("FSCI_SPLU_BANDED").ok().as_deref(),
-            Some("1") | Some("true")
-        );
-        SPLU_BANDED_ENABLE.store(banded_requested, Ordering::Relaxed);
+        // ONLY OVERRIDE WHEN ASKED. An unconditional `store` would pin the arm to this harness's
+        // own default and silently measure something other than the shipping configuration --
+        // which is exactly what happened once the library default flipped to ON: the row read
+        // `banded_factor_hits=0` while the shipping path takes the banded route.
+        let banded_override = match std::env::var("FSCI_SPLU_BANDED").ok().as_deref() {
+            Some("1") | Some("true") => Some(true),
+            Some("0") | Some("false") => Some(false),
+            _ => None,
+        };
+        if let Some(value) = banded_override {
+            SPLU_BANDED_ENABLE.store(value, Ordering::Relaxed);
+        }
+        let banded_requested = SPLU_BANDED_ENABLE.load(Ordering::Relaxed);
         let banded_hits_before = SPLU_BANDED_FACTOR_HITS.load(Ordering::Relaxed);
         let supernodal_hits_before = SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed);
         SPLU_SUPERNODAL_ENABLE.reset_load_count();
