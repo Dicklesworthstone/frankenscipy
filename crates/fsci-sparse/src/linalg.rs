@@ -1936,10 +1936,20 @@ fn is_sparse_zero_pivot(value: f64) -> bool {
 /// hold: a non-full band would make the dense span do arithmetic on structural zeros the sparse
 /// path skips, and a pivot that needs a row interchange breaks the profile the spans were sized
 /// from. Falling through to `factorize_csr` is then the design, not a failure.
+/// Takes the caller's ALREADY-COMPUTED ordering and permuted rows.
+///
+/// It used to recompute both. That made a DECLINE cost a full second setup -- the fill ordering,
+/// the permutation and the symmetry scan -- on top of the general path that then ran anyway, and
+/// on a small cell where the factorization itself is cheap that setup dominates: measured 1.2900x
+/// with the path disabled against 0.6420x with it enabled and DECLINING, same binary, `banded_
+/// factor_hits=0` on both. A recogniser whose refusal is expensive is a tax on every input it does
+/// not recognise.
 fn factorize_csr_banded(
     a: &CsrMatrix,
     diag_pivot_thresh: f64,
-    ordering: PermutationOrdering,
+    fill_perm: &Option<Vec<usize>>,
+    ordering_used: PermutationOrdering,
+    rows: &[SortedFactorRow],
 ) -> Option<NativeSparseLu> {
     let shape = a.shape();
     if !shape.is_square() {
@@ -1949,11 +1959,6 @@ fn factorize_csr_banded(
     if n == 0 || u32::try_from(n).is_err() {
         return None;
     }
-    let (fill_perm, ordering_used) = sparse_lu_fill_ordering(a, n, ordering);
-    let rows: Vec<SortedFactorRow> = match &fill_perm {
-        Some(p) => permuted_sorted_rows(a, p),
-        None => csr_sorted_rows(a),
-    };
 
     // Symmetric profile of the permuted pattern: the span each row will occupy once the band
     // fills. `lo[i]` is the leftmost column reachable from row i, `hi[i]` the rightmost.
@@ -2001,46 +2006,51 @@ fn factorize_csr_banded(
         hi[column] = hi[column].max(furthest.max(column));
     }
 
-    // PATTERN SYMMETRY IS THE ACTUAL PRECONDITION, so it is what gets checked.
+    // GUARD ORDER IS COST ORDER. The cheapest discriminator runs first, because DECLINING is the
+    // common case on inputs this path is not for and a costly refusal taxes every one of them.
+    // With the symmetry scan first, a declining run on the scattered cell measured 0.9372x against
+    // 1.2900x for the same binary with the path disabled -- the refusal itself was the regression.
     //
-    // The dense span is only sound when the envelope IS the fill. That `band_density == 1` is a
-    // classical result for a PATTERN-SYMMETRIC factor -- elimination fills the whole profile --
-    // and it is exactly what fails otherwise. A survey of pattern-unsymmetric shapes measured
-    // band_density 0.0019 on a down-arrow and 0.2729 on a skew band: spans hundreds of times
-    // emptier than the fill, where the dense sweep would do arithmetic the sparse path skips.
-    //
-    // The band/nnz ceiling below happened to decline both of those, but it is a PROXY that
-    // correlates rather than the property itself, and a proxy that has only been checked on the
-    // shapes someone thought to try is how a recogniser accepts the case nobody tested. Checking
-    // symmetry directly costs O(nnz) with a hash set per row and declines for the right reason.
-    {
-        let (indptr, indices) = (a.indptr(), a.indices());
-        let mut present: Vec<Vec<u32>> = vec![Vec::new(); n];
-        for row in 0..n {
-            for &column in &indices[indptr[row]..indptr[row + 1]] {
-                present[row].push(column as u32);
-            }
-            present[row].sort_unstable();
-        }
-        for row in 0..n {
-            for &column in &present[row] {
-                let column = column as usize;
-                if column != row && present[column].binary_search(&(row as u32)).is_err() {
-                    return banded_decline(7);
-                }
-            }
-        }
-    }
-
-    // Secondary ceiling, kept as a backstop rather than the decision: total band entries against
-    // the matrix's own nnz. A band far larger than the sparse fill would do arithmetic the sparse
-    // path skips.
+    // The span totals below are already computed from `lo`/`hi` above at O(nnz) with no
+    // allocation, so the fill gates are effectively free and reject most non-candidates outright.
     let band: u64 = (0..n).map(|i| (hi[i] - lo[i] + 1) as u64).sum();
     let nnz = a.indices().len() as u64;
     SPLU_BANDED_LAST_BAND.store(band as usize, std::sync::atomic::Ordering::Relaxed);
     SPLU_BANDED_LAST_NNZ.store(nnz as usize, std::sync::atomic::Ordering::Relaxed);
     if band > nnz.saturating_mul(BANDED_MAX_BAND_PER_NNZ) {
         return banded_decline(2);
+    }
+    // A factor that barely fills has nothing for the dense span to amortise: shipping without this
+    // gate turned the scattered cell from 1.3017x FASTER into 0.9122x SLOWER. Swept over 2-D
+    // stencils that actually fill, general/banded instructions run 1.089x at fill/nnz 2.76 and
+    // 1.535x at 17.68, against 0.70x at 1.00 -- monotone, so the gate sits at 3.
+    if band < nnz.saturating_mul(BANDED_MIN_BAND_PER_NNZ) {
+        return banded_decline(8);
+    }
+
+    // PATTERN SYMMETRY IS THE ACTUAL PRECONDITION for the span being the fill, and it is checked
+    // LAST because it is the most expensive of the three. The dense span is sound only when the
+    // envelope IS the fill, which is classical for a pattern-symmetric factor and fails otherwise
+    // -- measured band_density 0.0019 on a down-arrow and 0.2729 on a skew band.
+    //
+    // Allocation-free: CSR rows are sorted, so the mirror entry is a binary search into the other
+    // row's slice. The first version built a `Vec<Vec<u32>>` over every row and sorted each, which
+    // is n allocations to answer a question the existing layout already supports.
+    {
+        let (indptr, indices) = (a.indptr(), a.indices());
+        for row in 0..n {
+            for &column in &indices[indptr[row]..indptr[row + 1]] {
+                if column == row {
+                    continue;
+                }
+                if indices[indptr[column]..indptr[column + 1]]
+                    .binary_search(&row)
+                    .is_err()
+                {
+                    return banded_decline(7);
+                }
+            }
+        }
     }
 
     let mut offset = Vec::with_capacity(n + 1);
@@ -2150,7 +2160,7 @@ fn factorize_csr_banded(
         row_perm,
         l_rows,
         u_rows,
-        fill_perm,
+        fill_perm.clone(),
         ordering_used,
     ))
 }
@@ -2159,13 +2169,18 @@ fn factorize_csr_banded(
 /// carries enough structural zeros that the sparse path's skipping wins.
 const BANDED_MAX_BAND_PER_NNZ: u64 = 64;
 
+/// A factor that barely fills has nothing for the dense span to amortise; see the sweep at the
+/// call site. Below this multiple of the matrix's own nnz the general merge wins.
+const BANDED_MIN_BAND_PER_NNZ: u64 = 3;
+
 /// Why the banded path last declined. A decline is a legitimate outcome, but an UNDIAGNOSABLE one
 /// turns "the structure did not hold" into "something went wrong somewhere", which is how a
 /// recogniser quietly stops recognising anything. Indices: 0 not square / too large, 1 column out
 /// of range, 2 band too wide, 3 zero pivot, 4 pivot needs an interchange, 5 span overlap,
-/// 6 missing diagonal in U, 7 pattern-unsymmetric.
+/// 6 missing diagonal in U, 7 pattern-unsymmetric, 8 too little fill to amortise the span.
 #[doc(hidden)]
-pub static SPLU_BANDED_DECLINE_REASON: [std::sync::atomic::AtomicUsize; 8] = [
+pub static SPLU_BANDED_DECLINE_REASON: [std::sync::atomic::AtomicUsize; 9] = [
+    std::sync::atomic::AtomicUsize::new(0),
     std::sync::atomic::AtomicUsize::new(0),
     std::sync::atomic::AtomicUsize::new(0),
     std::sync::atomic::AtomicUsize::new(0),
@@ -3618,6 +3633,19 @@ impl NativeSparseLu {
             Some(p) => permuted_sorted_rows(a, p),
             None => csr_sorted_rows(a),
         };
+
+        // THE BANDED ATTEMPT LIVES HERE so a decline costs nothing beyond its own guards: the
+        // ordering, the permutation and the rows above are computed ONCE and shared with it.
+        // Declining is the common case on inputs this path is not for, and it has to stay cheap --
+        // when the attempt recomputed its own setup, a DECLINING run measured 0.6420x against
+        // 1.2900x for the same binary with the path disabled, `banded_factor_hits=0` on both.
+        if SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(banded) =
+                factorize_csr_banded(a, diag_pivot_thresh, &fill_perm, ordering_used, &rows)
+        {
+            SPLU_BANDED_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(banded);
+        }
         // THE CHEAP FORM OF THE ARENA (frankenscipy-u7biq). Rows are 93.9% adjacent as
         // built and 8.4% adjacent after eliminating, so the allocator's placement is not
         // the problem — growth past capacity is. Reserving each row's predicted final size
@@ -5373,20 +5401,7 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
             // The tolerance is 8 because that is where the structure was measured: exact
             // supernodes on the loss fixture average width 1.10 (useless), relaxed ones
             // at t=8 average 5.35.
-            // The banded path is tried FIRST and declines loudly rather than guessing: it
-            // returns `None` whenever a pivot would need an interchange or the band is too wide
-            // to be worth a dense span, and the hit counter makes a silent decline visible.
-            let banded = if SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed) {
-                factorize_csr_banded(&csr, options.diag_pivot_thresh, options.ordering)
-            } else {
-                None
-            };
-            if banded.is_some() {
-                SPLU_BANDED_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            let native = if let Some(banded) = banded {
-                banded
-            } else if SPLU_SUPERNODAL_ENABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            let native = if SPLU_SUPERNODAL_ENABLE.load(std::sync::atomic::Ordering::Relaxed) {
                 match NativeSparseLu::factorize_csr_supernodal(
                     &csr,
                     options.diag_pivot_thresh,
@@ -16222,6 +16237,15 @@ mod tests {
 
     #[test]
     fn one_column_insert_is_bit_identical_and_takes_effect() {
+        // MEASURES THE GENERAL ELIMINATION, so the banded path must not intercept it. Since
+        // `SPLU_BANDED_ENABLE` became the default, `factorize_csr` returns early on the shapes
+        // these fixtures use and the general counters this test reads stay at zero -- a failure
+        // that says nothing about what is being asserted. Same scoping the harness applies to its
+        // own A/B guards.
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore_banded = RestoreBandedToggle(banded_was);
+
         use std::sync::atomic::Ordering;
         let _guard = PERF_TOGGLE_TEST_LOCK
             .lock()
@@ -16311,6 +16335,15 @@ mod tests {
 
     #[test]
     fn fastpath_shortfall_is_recorded_only_when_the_fast_path_declines() {
+        // MEASURES THE GENERAL ELIMINATION, so the banded path must not intercept it. Since
+        // `SPLU_BANDED_ENABLE` became the default, `factorize_csr` returns early on the shapes
+        // these fixtures use and the general counters this test reads stay at zero -- a failure
+        // that says nothing about what is being asserted. Same scoping the harness applies to its
+        // own A/B guards.
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore_banded = RestoreBandedToggle(banded_was);
+
         // MUST NOT FIRE: scattered takes the in-place fast path on 100% of updates
         // (measured: merges=0), so nothing ever reaches the partial path and the histogram
         // must be entirely empty. A counter that populated here would be recording updates
@@ -17694,6 +17727,15 @@ mod tests {
 
     #[test]
     fn row_visit_span_separates_a_one_line_sweep_from_a_many_line_one() {
+        // MEASURES THE GENERAL ELIMINATION, so the banded path must not intercept it. Since
+        // `SPLU_BANDED_ENABLE` became the default, `factorize_csr` returns early on the shapes
+        // these fixtures use and the general counters this test reads stay at zero -- a failure
+        // that says nothing about what is being asserted. Same scoping the harness applies to its
+        // own A/B guards.
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore_banded = RestoreBandedToggle(banded_was);
+
         // TWO ARMS, because this counter's job is to BOUND a rewrite and both failure
         // modes are silent. A counter stuck reporting many lines per visit would kill the
         // arena on no evidence; one stuck reporting a single line would greenlight it.
@@ -18389,8 +18431,7 @@ mod tests {
             .expect("general factorization");
             let x_general = general.solve(&rhs).expect("general solve");
 
-            let Some(banded) =
-                factorize_csr_banded(&matrix, 1.0, PermutationOrdering::ReverseCuthillMcKee)
+            let Some(banded) = banded_for_test(&matrix, PermutationOrdering::ReverseCuthillMcKee)
             else {
                 let reasons: Vec<usize> = SPLU_BANDED_DECLINE_REASON
                     .iter()
@@ -18480,9 +18521,8 @@ mod tests {
         let mut checksum = 0.0f64;
         for _ in 0..5 {
             let nnz = if banded {
-                let factor =
-                    factorize_csr_banded(&matrix, 1.0, PermutationOrdering::ReverseCuthillMcKee)
-                        .expect("banded declined — the A/B would compare nothing");
+                let factor = banded_for_test(&matrix, PermutationOrdering::ReverseCuthillMcKee)
+                    .expect("banded declined — the A/B would compare nothing");
                 factor.stored_nnz()
             } else {
                 let factor = NativeSparseLu::factorize_csr(
@@ -18568,8 +18608,7 @@ mod tests {
             )
             .expect("general factorization");
             let fill = general.stored_nnz();
-            let accepted =
-                factorize_csr_banded(&matrix, 1.0, PermutationOrdering::ReverseCuthillMcKee);
+            let accepted = banded_for_test(&matrix, PermutationOrdering::ReverseCuthillMcKee);
             let band = SPLU_BANDED_LAST_BAND.load(std::sync::atomic::Ordering::Relaxed);
             let reasons: Vec<usize> = SPLU_BANDED_DECLINE_REASON
                 .iter()
@@ -18767,8 +18806,146 @@ mod tests {
         }
     }
 
+    /// WHERE DOES THE BANDED PATH START PAYING? The gate has to come from a sweep, not two points.
+    ///
+    /// Shipping it by default REGRESSED the scattered cell -- 1.30x FASTER became 0.92x SLOWER,
+    /// a 1.43x regression -- because that factor averages 5 entries per row. The banded path
+    /// amortises per-row setup over the row span, and there is nothing to amortise at span 5 while
+    /// the general merge on a 2-3 entry row is already trivial.
+    ///
+    /// convection averages 87 and cubic 290, both of which win. Picking a threshold between 5 and
+    /// 87 from those three points would be fitting to the cells that happen to exist. This sweeps
+    /// a synthetic symmetric band across the range and counts instructions for both paths, so the
+    /// crossover is located rather than guessed.
+    #[test]
+    #[ignore = "sweep: run explicitly with FSCI_XOVER_HALFWIDTH set, count instructions"]
+    fn banded_crossover_sweep() {
+        // A DENSE-FROM-THE-START BAND IS THE WRONG PROXY, and using one cost a sweep.
+        //
+        // The first version of this swept a synthetic matrix already full inside its band. That
+        // gives the GENERAL path no fill to discover, so its merge runs at best case and banded
+        // lost at every width up to span 65 -- while the real cells, which start at 5 nonzeros a
+        // row and fill to span 87 and 290, both win. The variable that matters is not the band
+        // width, it is how much FILL the elimination has to create inside it.
+        //
+        // So the sweep is over real 2-D stencils of varying side, which fill exactly the way the
+        // cells we measure do.
+        fn convection_grid(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("grid CSR")
+        }
+
+        #[allow(dead_code)]
+        fn symmetric_band(n: usize, half: usize) -> CsrMatrix {
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..n {
+                let lo = row.saturating_sub(half);
+                let hi = (row + half).min(n - 1);
+                for column in lo..=hi {
+                    indices.push(column);
+                    data.push(if column == row {
+                        4.0 * half as f64 + 1.0
+                    } else {
+                        -1.0
+                    });
+                }
+                indptr.push(data.len());
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("band CSR")
+        }
+        let half: usize = std::env::var("FSCI_XOVER_HALFWIDTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let banded_arm = std::env::var("FSCI_BANDED_ARM").ok().as_deref() == Some("banded");
+        // `half` now selects the grid SIDE, so the span comes from real fill.
+        let matrix = convection_grid(half);
+        let n = matrix.shape().rows;
+        let mut checksum = 0usize;
+        for _ in 0..5 {
+            checksum += if banded_arm {
+                banded_for_test(&matrix, PermutationOrdering::ReverseCuthillMcKee)
+                    .expect("banded declined in the sweep")
+                    .stored_nnz()
+            } else {
+                NativeSparseLu::factorize_csr(
+                    &matrix,
+                    1.0,
+                    PermutationOrdering::ReverseCuthillMcKee,
+                )
+                .expect("general")
+                .stored_nnz()
+            };
+        }
+        println!(
+            "XOVER half={half} n={n} arm={} avg_row_span={:.1} checksum={checksum}",
+            if banded_arm { "banded" } else { "general" },
+            checksum as f64 / 5.0 / n as f64
+        );
+    }
+
+    /// Test-only adapter: the shipping caller hands `factorize_csr_banded` its already-computed
+    /// ordering and rows, so tests that want the path in isolation have to build them too.
+    fn banded_for_test(
+        matrix: &CsrMatrix,
+        ordering: PermutationOrdering,
+    ) -> Option<NativeSparseLu> {
+        let n = matrix.shape().rows;
+        let (fill_perm, ordering_used) = sparse_lu_fill_ordering(matrix, n, ordering);
+        let rows: Vec<SortedFactorRow> = match &fill_perm {
+            Some(p) => permuted_sorted_rows(matrix, p),
+            None => csr_sorted_rows(matrix),
+        };
+        factorize_csr_banded(matrix, 1.0, &fill_perm, ordering_used, &rows)
+    }
+
+    /// Restores `SPLU_BANDED_ENABLE` on unwind as well as on return, so a failing assertion cannot
+    /// leave the toggle flipped for whatever test runs next.
+    struct RestoreBandedToggle(bool);
+    impl Drop for RestoreBandedToggle {
+        fn drop(&mut self) {
+            SPLU_BANDED_ENABLE.store(self.0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     #[test]
     fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
+        // MEASURES THE GENERAL ELIMINATION, so the banded path must not intercept it. Since
+        // `SPLU_BANDED_ENABLE` became the default, `factorize_csr` returns early on the shapes
+        // these fixtures use and the general counters this test reads stay at zero -- a failure
+        // that says nothing about what is being asserted. Same scoping the harness applies to its
+        // own A/B guards.
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore_banded = RestoreBandedToggle(banded_was);
+
         // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
         // stuck reporting "no change" would declare the run directory cheap to maintain
         // and greenlight the rewrite on false evidence.
@@ -18814,6 +18991,14 @@ mod tests {
         let _guard = PERF_TOGGLE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // THIS TEST IS ABOUT THE GENERAL MERGE, so the banded path must not intercept it.
+        // `factorize_csr` now returns early when the banded path accepts, and these fixtures are
+        // exactly the shape it accepts -- without this the column-compare toggles never take
+        // effect and the test fails for a reason that has nothing to do with what it asserts.
+        // Held under the same `PERF_TOGGLE_TEST_LOCK` as every other toggle-writing test.
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore_banded = RestoreBandedToggle(banded_was);
 
         // SHIPS OFF. This arm corrupts values by design, so the default is not a
         // preference -- it is the only safe setting.
@@ -18903,6 +19088,14 @@ mod tests {
         let _guard = PERF_TOGGLE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // THIS TEST IS ABOUT THE GENERAL MERGE, so the banded path must not intercept it.
+        // `factorize_csr` now returns early when the banded path accepts, and these fixtures are
+        // exactly the shape it accepts -- without this the column-compare toggles never take
+        // effect and the test fails for a reason that has nothing to do with what it asserts.
+        // Held under the same `PERF_TOGGLE_TEST_LOCK` as every other toggle-writing test.
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore_banded = RestoreBandedToggle(banded_was);
 
         assert!(
             !DOUBLE_COLUMN_COMPARE.with(std::cell::Cell::get),
@@ -19436,6 +19629,15 @@ mod tests {
 
     #[test]
     fn prefix_stability_pairs_a_run_with_the_row_it_updated() {
+        // MEASURES THE GENERAL ELIMINATION, so the banded path must not intercept it. Since
+        // `SPLU_BANDED_ENABLE` became the default, `factorize_csr` returns early on the shapes
+        // these fixtures use and the general counters this test reads stay at zero -- a failure
+        // that says nothing about what is being asserted. Same scoping the harness applies to its
+        // own A/B guards.
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore_banded = RestoreBandedToggle(banded_was);
+
         // The invariant this counter rests on is that `matched_run_length` returns a
         // common PREFIX, so a recorded run can never exceed the row it was measured
         // against. If it could, "the tail beyond the run" would be negative and the

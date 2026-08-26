@@ -1301,10 +1301,14 @@ for raw_line in sys.stdin.buffer:
             "the elimination never read SPLU_ROW_HEAD_CACHE_DISABLE and the banded path never \
              ran, so both arms of this A/B are the same code and the ratio is not reportable"
         );
+        // Only an EXPLICIT request may not decline. Once the library default became ON,
+        // `banded_requested` is true for every run and a decline is the correct, expected outcome
+        // on a cell the path is not for -- scattered declines because its factor barely fills.
+        // Asserting on the default turned a working recogniser into a crash.
         assert!(
-            !banded_requested || banded_hits > 0,
-            "the banded arm was requested and never accepted a factorization, so this row \
-             measures the general path under a banded label"
+            banded_override != Some(true) || banded_hits > 0,
+            "FSCI_SPLU_BANDED=1 was set and the banded arm never accepted a factorization, so \
+             this row would measure the general path under a banded label"
         );
         assert!(
             banded_hits > 0 || head_cache_enabled == (head_cache_hits > 0),
