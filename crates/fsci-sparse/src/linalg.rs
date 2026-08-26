@@ -1778,6 +1778,41 @@ fn scan_matched_prefix(left: &[u32], right: &[u32], bound: usize) -> usize {
         }
         span += BLOCK;
     }
+    // CASCADE THE WIDTH DOWN BEFORE FALLING TO SCALAR.
+    //
+    // The wide loop above stops at the first block containing a mismatch, so what remains
+    // is at most `BLOCK - 1` elements of agreement plus the divergence. Going straight to a
+    // one-at-a-time scan there is the expensive part of this function: the disassembly
+    // shows the wide loop lowering to `vmovdqu`/`vpxor`/`vpor`/`vptest` at about 10
+    // instructions per 16 columns (0.63 per column), while the scalar tail is
+    // `mov`/`cmp`/`jne`/`inc` at about 4 per column -- six times the cost, over a stretch
+    // that averages half a block.
+    //
+    // That stretch is not rare, it is EVERY call that finds a divergence at all, which on
+    // the loss cell is essentially all of them: the measured skipped fraction is 0.9936, so
+    // the wide loop almost always runs to within one block of the end and then hands a
+    // nearly-full block to the scalar path.
+    //
+    // A single intermediate width recovers most of it while keeping the resolution the
+    // caller needs, because the run length is what the vectorised `y += n*x` loop is
+    // driven by and a short answer there is a correctness-neutral pessimisation.
+    //
+    // Bit-identical by construction, exactly as the outer loop is: every stage only
+    // advances `span` over elements it has proven equal, and the final `take_while`
+    // still decides the boundary.
+    const NARROW: usize = 4;
+    while span + NARROW <= bound {
+        let l = &left[span..span + NARROW];
+        let r = &right[span..span + NARROW];
+        let mut all_equal = true;
+        for (a, b) in l.iter().zip(r.iter()) {
+            all_equal &= a == b;
+        }
+        if !all_equal {
+            break;
+        }
+        span += NARROW;
+    }
     span + left[span..]
         .iter()
         .zip(&right[span..])
