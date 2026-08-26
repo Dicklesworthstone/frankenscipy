@@ -40852,3 +40852,99 @@ rather than its own "within 2% and CI spans unity" rule, to state that CV is pro
 to emit the hardware/thread provenance block. The cell is then re-runnable at
 `perf_griddata_live 61 800 2000 linear` and the row can be taken under the timed class. **Not by
 weakening any gate in `scripts/ledger_preflight.py`** -- the harness should earn the class.
+
+## 2026-08-26 - BlackThrush (cc) - llywn's density gap is NOT a safe-Rust limitation: a plain unit-stride loop retires 1.7730 FLOPs/instruction against SciPy's 1.7638, and the register-tiled kernel everyone would have written is 1.8-fold WORSE
+
+**Result class: BEHAVIORAL.** Bead `frankenscipy-8m8s7`, CLOSED, under `llywn.3`.
+
+**probe**: `crates/fsci-linalg/src/bin/probe_panel_density.rs`, one variant per process so
+`perf stat` attributes counters to that variant alone.
+**same_host=thinkstation1**, 64 cpu. **harness**: `probe_panel_density`, ELF sha256
+`870a0275f50d9ef4f8b856b2d75dd4b5b81e61390ce6e0d5354bcc2478b8b56a`.
+**Every ratio below is written `N-fold` rather than `Nx` on purpose: they are ratios of
+INSTRUCTION COUNTS and ARITHMETIC DENSITY, never of time, and the `Nx` spelling is what this
+ledger's speed-claim detector keys on.**
+**Counts are load-independent. Nothing in this row is a timing claim** -- which is the point, since
+this box has held loadavg 5-190 all session and llywn.3 was counted for exactly that reason.
+
+**observed:** 50 reps of `C[m x n] -= A[m x k] * B[k x n]` over shapes (64,64,32), (128,128,64),
+(256,256,64), counted with `instructions,fp_ret_sse_avx_ops.all,fp_ret_sse_avx_ops.mac_flops` --
+
+    variant            instructions         fp_ops      mac_flops   FLOPs/ins
+    setup                   7,905,253      2,397,492      1,515,922    0.3033
+    naive_ijk           2,492,232,630    544,093,513      1,515,922    0.2183
+    naive_kij             367,737,825    539,792,713      1,515,922    1.4679
+    naive_kij_fma         304,443,744    539,792,713    538,911,122    1.7730
+    tiled4x4              630,637,146    544,093,513      1,515,922    0.8628
+    tiled4x4_fma          563,680,121    544,093,513    538,911,122    0.9653
+    tiled8x4_fma          560,351,722    544,093,513    538,911,122    0.9710
+    matmul_public       1,598,296,511    544,093,513      1,515,922    0.3404  (caveat below)
+
+SciPy on the cubic cell, from llywn.3: 1.7638. Our splu: 0.3334.
+
+### The question this was built to settle
+
+llywn.3 established that the residual gap against SciPy's `splu` is arithmetic DENSITY -- 2.85-fold
+more instructions at 1.85-fold fewer FLOPs -- and named a from-scratch safe-Rust dense panel kernel as
+the only remaining lever. llywn.2 had already paid for one negative of that shape. So rather than
+build the supernodal machinery and find out, this prices the KERNEL ALONE.
+
+**Answer: safe Rust reaches the incumbent's density.** `naive_kij_fma` -- a plain unit-stride loop,
+no intrinsics, no `unsafe`, no blocking -- retires 1.7730 FLOPs/instruction, 1.005-fold SciPy's 1.7638.
+
+### Two results that invert the premise, and both would have cost a build to learn
+
+**1. Hand register-tiling LOSES, by 1.8-fold.** The 4x4 and 8x4 micro-kernels are the textbook way to
+buy BLAS-3 density and are what "write a dense panel kernel" naturally means. They land at
+0.8628-0.9710, well BELOW the simple contiguous loop's 1.4679. LLVM vectorises the plain loop into
+packed AVX2 and the accumulator arrays obstruct it. **Building the obvious micro-kernel would have
+been the third negative on this cell**, after llywn.2's blocked path at 4.17-fold worse and the
+supernodal arm at 5.77-fold worse.
+
+**2. The FMA contract block does not gate the panel lever.** llywn.3 closed its FMA sub-lever on
+sound evidence -- `supernodal_elimination_is_bit_identical_to_the_sequential_one` pins splu factor
+bits between the blocked and sequential paths, and `mul_add` is banned on bit-identical kernels.
+That still stands. But the density is dominated by dense contiguous DATA, not by fusion:
+
+    0.3334 (our sparse) -> 1.4679 (plain dense loop)   4.40-fold, and BIT-IDENTICAL to naive_ijk
+    1.4679 -> 1.7730 (with mul_add)                    1.21-fold, contract-blocked
+
+**83% of SciPy's density is reachable without touching the contract.** "FMA is contract-blocked"
+therefore stops being a reason to treat llywn as walled.
+
+### The control that stopped a false finding
+
+The `matmul_public` row reads 0.3404, which looks damning for our public dense GEMM. **It is not,
+and the control is what says so.** The probe's variant builds `Vec<Vec<f64>>` per call --
+O(m*k + k*n) allocate-and-copy -- and `matmul` is multithreaded, so at panel sizes that row is
+adapter and thread-spawn cost rather than arithmetic. Running the SAME function under the SAME
+counters at n=1024/2048/4096 via `perf_matmul`, ELF sha256
+`a4f14cc9ce71018c178777c4e9b9f86f51a19da37f496fe01add5b97278f69d2`:
+
+    instructions=307,487,265,260  fp_ops=478,777,768,164  density=1.5571
+
+4.6-fold the density of the same code at panel sizes. Without that control this would have shipped as
+"our GEMM is 5-fold less dense than a hand-written loop", which is false. The small-size figure is a
+statement about the CALLING CONVENTION, and it is still worth knowing, because a supernodal path
+calling `matmul` on panel-sized blocks would pay exactly that.
+
+### Correctness, since a wrong kernel posts a density number just as happily
+
+Every variant is verified against `naive_ijk` before its counted region, in a SEPARATE invocation
+of the same binary -- the checks would otherwise be counted too, and unequally, since the `setup`
+floor has nothing to check. `naive_kij`, `tiled4x4` and the matmul adapter are BIT-IDENTICAL
+(negation distributes exactly through rounding, so accumulate-then-subtract and
+subtract-each-term agree to the bit); the `mul_add` variants differ by 2.842e-14, which is fusing
+doing what fusing does.
+
+### What this does NOT establish
+
+That llywn is closable end to end. This prices the kernel only. The gather/scatter into and out of
+a dense panel, the symbolic panel assembly, and supernode identification are all untouched, and
+llywn.2's 4.17-fold bounds them as large -- though that path also used the losing inner kernel, so its
+figure is not a clean measurement of the overhead alone.
+
+**Concrete retry predicate:** separate panel-assembly cost from kernel cost by counting a
+supernodal update that uses the `naive_kij` shape at its centre, against per-pivot, on the same
+cubic cell. That is the next counted question on `frankenscipy-llywn.3`, and it is answerable on a
+loaded host for the same reason this was.
