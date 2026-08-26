@@ -21608,10 +21608,15 @@ mod tests {
             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0,
-            0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 1.0,
-            0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+            0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+            1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
             1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0,
         ];
+        // Golden CORRECTED 2026-08-26. The previous values differed from SciPy at flat indices
+        // 52, 53, 54 and 55 even though this test is named `..._matches_scipy_oracle` and its
+        // comment claimed they came from `scipy.ndimage.binary_dilation`. Verified by running
+        // SciPy 1.17.1 on this exact input and footprint: `diff_disttransform_splinefilter`'s
+        // `dilate_asym` group agrees with SciPy on all 72 cells at 0.000e0.
         assert_eq!(
             binary_dilation_with_structure(&dense_input, &dense_structure, 1)
                 .unwrap()
@@ -23133,6 +23138,264 @@ mod van22_knob_read_is_per_transform {
              {ceiling} = 4 per worker on {workers} workers). Anything near {PIXELS} \
              means the read is back inside the pixel loop — results stay \
              byte-identical, so no other test would notice"
+        );
+    }
+
+    /// SciPy parity for three ndimage entry points with no differential coverage
+    /// (frankenscipy-ivxx6), all three already timed by existing perf bins:
+    /// `distance_transform_bf`, `distance_transform_cdt`, `spline_filter1d`.
+    ///
+    /// FIXTURE. The binary image has TWO DISCONNECTED blobs plus an isolated pixel: distance
+    /// transforms are easy to get right on one filled rectangle and wrong on disconnected
+    /// components. Anisotropic `sampling` is exercised because that is where a metric most often
+    /// diverges.
+    ///
+    /// RESULTS against SciPy 1.17.1:
+    ///   * both distance transforms agree EXACTLY (0.000e0) on every metric, sampling included;
+    ///   * `spline_filter1d` agrees under `Reflect`, and DIVERGES under `Nearest`.
+    ///
+    /// The `Nearest` divergence is characterised rather than guessed. SciPy's `spline_filter1d`
+    /// returns BITWISE-IDENTICAL output for `mode='nearest'` and `mode='reflect'` at every order
+    /// 2..=5 -- verified directly -- while its `mirror` genuinely differs. So SciPy's prefilter
+    /// does not distinguish nearest from reflect and this crate's does. Pinned below so the
+    /// difference cannot change silently in either direction.
+    #[test]
+    fn distance_transforms_and_spline_filter1d_against_scipy_1_17_1() {
+        use super::{
+            BoundaryMode, DistanceMetric, NdArray, distance_transform_bf, distance_transform_cdt,
+            spline_filter1d,
+        };
+
+        #[rustfmt::skip]
+        let img = NdArray::new(vec![
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0,
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ], vec![6, 7]).unwrap();
+        let ramp = NdArray::new(
+            (0..12)
+                .map(|i| {
+                    let x = i as f64;
+                    (0.7 * x).sin() * 3.0 + 0.25 * x
+                })
+                .collect(),
+            vec![12],
+        )
+        .unwrap();
+
+        fn close(name: &str, got: &[f64], want: &[f64], tol: f64) {
+            assert_eq!(got.len(), want.len(), "{name}: length");
+            for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{name}[{i}]: got {a:.17e}, SciPy 1.17.1 gives {b:.17e}"
+                );
+            }
+        }
+
+        // SciPy 1.17.1 goldens, generated from its output rather than transcribed.
+        close(
+            "bf/euclidean",
+            &distance_transform_bf(&img, DistanceMetric::Euclidean, None)
+                .unwrap()
+                .data,
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            1e-12,
+        );
+        close(
+            "bf/taxicab",
+            &distance_transform_bf(&img, DistanceMetric::Taxicab, None)
+                .unwrap()
+                .data,
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            1e-12,
+        );
+        close(
+            "bf/chessboard",
+            &distance_transform_bf(&img, DistanceMetric::Chessboard, None)
+                .unwrap()
+                .data,
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            1e-12,
+        );
+        close(
+            "bf/euclidean+sampling",
+            &distance_transform_bf(&img, DistanceMetric::Euclidean, Some(&[2.0, 0.5]))
+                .unwrap()
+                .data,
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5,
+                1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 0.5, 0.0,
+                0.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            1e-12,
+        );
+        close(
+            "cdt/taxicab",
+            &distance_transform_cdt(&img, DistanceMetric::Taxicab)
+                .unwrap()
+                .data,
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            1e-12,
+        );
+        close(
+            "cdt/chessboard",
+            &distance_transform_cdt(&img, DistanceMetric::Chessboard)
+                .unwrap()
+                .data,
+            &[
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+                1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            1e-12,
+        );
+
+        // spline_filter1d under Reflect: agrees. The tolerance widens with order because the
+        // recursive prefilter's conditioning does; measured 8.9e-16 at order 2 and 2.2e-09 at 5.
+        for (order, want, tol) in [
+            (
+                2usize,
+                vec![
+                    -0.33732065835168795,
+                    2.3612446084618157,
+                    3.6310775012853775,
+                    3.5030839035489643,
+                    2.067443876993812,
+                    0.1319684382298843,
+                    -1.278051970923994,
+                    -1.3814751506120255,
+                    -0.011959828387834855,
+                    2.302834812003317,
+                    4.598484567992325,
+                    5.873936149293668,
+                ],
+                1e-12f64,
+            ),
+            (
+                3,
+                vec![
+                    -0.49598595033791937,
+                    2.4799297516895367,
+                    3.672185313858213,
+                    3.5694241326698966,
+                    2.0878867551419336,
+                    0.10881554956866465,
+                    -1.3372470518297486,
+                    -1.4481912456942507,
+                    -0.05413499263123683,
+                    2.3019317345174097,
+                    4.649058263279894,
+                    5.927593989301222,
+                ],
+                1e-12,
+            ),
+            (
+                4,
+                vec![
+                    -0.6753597553465049,
+                    2.636014948374493,
+                    3.686934104352836,
+                    3.651046802552062,
+                    2.1019116304821175,
+                    0.08813499669776499,
+                    -1.3980768786238207,
+                    -1.515815482710598,
+                    -0.09580243048127467,
+                    2.298843775495807,
+                    4.7033188087266655,
+                    5.980115729996259,
+                ],
+                1e-9,
+            ),
+            (
+                5,
+                vec![
+                    -0.8667207290291886,
+                    2.8170212551571936,
+                    3.678733006548496,
+                    3.749366078721156,
+                    2.1061744118370744,
+                    0.07259666481631524,
+                    -1.4615414636437996,
+                    -1.583164577886227,
+                    -0.1369501404201785,
+                    2.2941066365783613,
+                    4.759767571344318,
+                    6.031877534052665,
+                ],
+                1e-7,
+            ),
+        ] {
+            let got = spline_filter1d(&ramp, order, 0, BoundaryMode::Reflect).unwrap();
+            close(
+                &format!("spline_filter1d/reflect/order{order}"),
+                &got.data,
+                &want,
+                tol,
+            );
+        }
+
+        // MUST-MISS ARM 1: modes this crate does not implement are REFUSED, not silently
+        // approximated. SciPy accepts all eight; we accept two, and say so.
+        for mode in [
+            BoundaryMode::Mirror,
+            BoundaryMode::Wrap,
+            BoundaryMode::Constant,
+        ] {
+            assert!(
+                spline_filter1d(&ramp, 3, 0, mode).is_err(),
+                "spline_filter1d must refuse {mode:?} rather than approximate it"
+            );
+        }
+
+        // MUST-MISS ARM 2: our `Nearest` is NOT SciPy's. SciPy returns bitwise-identical output
+        // for nearest and reflect; ours differs. If that is ever reconciled this assertion fails
+        // -- rewrite it to assert the new parity rather than delete it.
+        let ours_nearest = spline_filter1d(&ramp, 3, 0, BoundaryMode::Nearest).unwrap();
+        let scipy_nearest = [
+            -0.49598595033791937,
+            2.4799297516895367,
+            3.672185313858213,
+            3.5694241326698966,
+            2.0878867551419336,
+            0.10881554956866465,
+            -1.3372470518297486,
+            -1.4481912456942507,
+            -0.05413499263123683,
+            2.3019317345174097,
+            4.649058263279894,
+            5.927593989301222,
+        ];
+        let worst = ours_nearest
+            .data
+            .iter()
+            .zip(scipy_nearest.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst > 1e-3,
+            "spline_filter1d/nearest now matches SciPy to {worst:.3e}; if the prefilter's \
+             boundary handling was reconciled, rewrite this to assert parity rather than delete it"
         );
     }
 }
