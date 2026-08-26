@@ -157,6 +157,10 @@ struct NativeSparseLu {
     // actually factored is B = P·A·Pᵀ (B[i][j] = A[fill_perm[i]][fill_perm[j]]).
     // `None` ⇒ natural ordering. Solve maps b → P·b, back-substitutes, then x = Pᵀ·z.
     fill_perm: Option<Vec<usize>>,
+    // Compose the fill and pivot permutations once when the factor is built.  The
+    // hot forward sweep then reads `b[rhs_gather[row]]` rather than indexing both
+    // maps for every solve row.
+    rhs_gather: Option<Vec<usize>>,
     // Inverse of `fill_perm`: `inverse_fill_perm[old_i] = new_i`. This makes the
     // final Pᵀ map write the solution in order rather than scatter into it.
     inverse_fill_perm: Option<Vec<usize>>,
@@ -176,6 +180,25 @@ struct PackedTriangularRows {
 }
 
 impl PackedTriangularRows {
+    /// Bytes this packed factor half actually retains.
+    ///
+    /// Named on the row as `candidate_factor_vector_payload_bytes`, so it has to track the
+    /// layout rather than a remembered one: `u32` columns and `f64` values in parallel arrays,
+    /// plus one `usize` offset per row and the trailing terminator. The pre-packing formula
+    /// charged `size_of::<(usize, f64)>()` per entry, which is 16 bytes against this layout's
+    /// 12 — it would still compile and quietly overstate every measured factor by a third.
+    fn payload_bytes(&self) -> usize {
+        self.columns
+            .len()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(self.values.len().saturating_mul(std::mem::size_of::<f64>()))
+            .saturating_add(
+                self.offsets
+                    .len()
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )
+    }
+
     fn from_rows(rows: &[Vec<(usize, f64)>]) -> Self {
         let entry_count = rows.iter().map(Vec::len).sum();
         let mut offsets = Vec::with_capacity(rows.len() + 1);
@@ -187,6 +210,46 @@ impl PackedTriangularRows {
             for &(column, value) in entries {
                 // `NativeSparseLu::factorize_csr` rejects n >= 2^32 before a
                 // factor row can be formed, so every stored column fits exactly.
+                columns.push(column as u32);
+                values.push(value);
+            }
+            offsets.push(columns.len());
+        }
+
+        Self {
+            offsets,
+            columns,
+            values,
+        }
+    }
+
+    /// Consume the final sorted elimination rows directly into the packed U factor.
+    ///
+    /// The shipping factorizer used to first allocate `Vec<Vec<(usize, f64)>>` for
+    /// U, then immediately copy every pair into this layout.  The final factor rows
+    /// already have the required column order, so this keeps the same filter and
+    /// accumulation order while removing that temporary pair-vector layer.
+    fn from_sorted_upper_rows(rows: Vec<SortedFactorRow>) -> Self {
+        let entry_count = rows
+            .iter()
+            .enumerate()
+            .map(|(row, entries)| {
+                entries
+                    .pairs()
+                    .filter(|(column, value)| *column >= row && *value != 0.0)
+                    .count()
+            })
+            .sum();
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        let mut columns = Vec::with_capacity(entry_count);
+        let mut values = Vec::with_capacity(entry_count);
+        offsets.push(0);
+
+        for (row, entries) in rows.into_iter().enumerate() {
+            for (column, value) in entries
+                .pairs()
+                .filter(|(column, value)| *column >= row && *value != 0.0)
+            {
                 columns.push(column as u32);
                 values.push(value);
             }
@@ -3034,6 +3097,7 @@ fn columns_share_a_supernode(current: &[usize], next_col: &[usize], next: usize)
 }
 
 impl NativeSparseLu {
+    #[cfg(test)]
     fn from_factor_rows(
         n: usize,
         row_perm: Vec<usize>,
@@ -3051,6 +3115,9 @@ impl NativeSparseLu {
             }
             inverse
         });
+        let rhs_gather = fill_perm
+            .as_ref()
+            .map(|fill| row_perm.iter().map(|&row| fill[row]).collect());
 
         Self {
             n,
@@ -3062,6 +3129,41 @@ impl NativeSparseLu {
             lower,
             upper,
             fill_perm,
+            rhs_gather,
+            inverse_fill_perm,
+            ordering_used,
+        }
+    }
+
+    #[cfg(not(test))]
+    fn from_factor_rows(
+        n: usize,
+        row_perm: Vec<usize>,
+        l_rows: Vec<Vec<(usize, f64)>>,
+        u_rows: Vec<SortedFactorRow>,
+        fill_perm: Option<Vec<usize>>,
+        ordering_used: PermutationOrdering,
+    ) -> Self {
+        let lower = PackedTriangularRows::from_rows(&l_rows);
+        let upper = PackedTriangularRows::from_sorted_upper_rows(u_rows);
+        let inverse_fill_perm = fill_perm.as_ref().map(|fill| {
+            let mut inverse = vec![0; n];
+            for (new_i, &old_i) in fill.iter().enumerate() {
+                inverse[old_i] = new_i;
+            }
+            inverse
+        });
+        let rhs_gather = fill_perm
+            .as_ref()
+            .map(|fill| row_perm.iter().map(|&row| fill[row]).collect());
+
+        Self {
+            n,
+            row_perm,
+            lower,
+            upper,
+            fill_perm,
+            rhs_gather,
             inverse_fill_perm,
             ordering_used,
         }
@@ -3425,6 +3527,7 @@ impl NativeSparseLu {
         #[cfg(test)]
         LIVE_ROW_ADJACENCY_AFTER_ELIMINATION.with(|cell| cell.set(row_allocation_adjacency(&rows)));
 
+        #[cfg(test)]
         let u_rows = rows
             .into_iter()
             .enumerate()
@@ -3435,6 +3538,8 @@ impl NativeSparseLu {
                     .collect()
             })
             .collect();
+        #[cfg(not(test))]
+        let u_rows = rows;
 
         Ok(Self::from_factor_rows(
             n,
@@ -3757,6 +3862,7 @@ impl NativeSparseLu {
             start_col = block_end;
         }
 
+        #[cfg(test)]
         let u_rows = rows
             .into_iter()
             .enumerate()
@@ -3767,6 +3873,8 @@ impl NativeSparseLu {
                     .collect()
             })
             .collect();
+        #[cfg(not(test))]
+        let u_rows = rows;
         Some(Self::from_factor_rows(
             n,
             row_perm,
@@ -3973,17 +4081,32 @@ impl NativeSparseLu {
                 let permuted = fill.iter().map(|&old| b[old]).collect::<Vec<f64>>();
                 for row in 0..self.n {
                     let mut value = permuted[self.row_perm[row]];
-                    for entry_index in lower_offsets[row]..lower_offsets[row + 1] {
-                        value -= lower_values[entry_index] * y[lower_columns[entry_index] as usize];
+                    let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
+                    for (&column, &multiplier) in lower_columns[start..end]
+                        .iter()
+                        .zip(&lower_values[start..end])
+                    {
+                        value -= multiplier * y[column as usize];
                     }
                     y[row] = value;
                 }
             }
-            Some(fill) => {
+            Some(_) => {
+                let rhs_gather =
+                    self.rhs_gather
+                        .as_deref()
+                        .ok_or_else(|| SparseError::InvalidArgument {
+                            message: "native sparse LU missing precomputed rhs gather map"
+                                .to_string(),
+                        })?;
                 for row in 0..self.n {
-                    let mut value = b[fill[self.row_perm[row]]];
-                    for entry_index in lower_offsets[row]..lower_offsets[row + 1] {
-                        value -= lower_values[entry_index] * y[lower_columns[entry_index] as usize];
+                    let mut value = b[rhs_gather[row]];
+                    let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
+                    for (&column, &multiplier) in lower_columns[start..end]
+                        .iter()
+                        .zip(&lower_values[start..end])
+                    {
+                        value -= multiplier * y[column as usize];
                     }
                     y[row] = value;
                 }
@@ -3994,8 +4117,12 @@ impl NativeSparseLu {
                 // Any A/B row taken on a natural-ordering fixture is measuring nothing.
                 for row in 0..self.n {
                     let mut value = b[self.row_perm[row]];
-                    for entry_index in lower_offsets[row]..lower_offsets[row + 1] {
-                        value -= lower_values[entry_index] * y[lower_columns[entry_index] as usize];
+                    let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
+                    for (&column, &multiplier) in lower_columns[start..end]
+                        .iter()
+                        .zip(&lower_values[start..end])
+                    {
+                        value -= multiplier * y[column as usize];
                     }
                     y[row] = value;
                 }
@@ -4032,8 +4159,11 @@ impl NativeSparseLu {
                 });
             }
             let mut value = y[row];
-            for entry_index in start + 1..end {
-                value -= upper_values[entry_index] * y[upper_columns[entry_index] as usize];
+            for (&column, &entry) in upper_columns[start + 1..end]
+                .iter()
+                .zip(&upper_values[start + 1..end])
+            {
+                value -= entry * y[column as usize];
             }
             y[row] = value / pivot;
         }
@@ -13990,6 +14120,17 @@ mod tests {
                 .is_some_and(|p| p.iter().enumerate().any(|(new_i, &old_i)| new_i != old_i));
             saw_nonidentity_row_perm |= lu.row_perm.iter().enumerate().any(|(i, &p)| i != p);
 
+            let expected_rhs_gather = fill.as_deref().map(|permutation| {
+                lu.row_perm
+                    .iter()
+                    .map(|&row| permutation[row])
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                lu.rhs_gather, expected_rhs_gather,
+                "{label}: the cached rhs gather must compose fill then pivot exactly"
+            );
+
             let b = (0..n)
                 .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
                 .collect::<Vec<f64>>();
@@ -14226,6 +14367,58 @@ mod tests {
         assert!(
             matches!(refused, Err(SparseError::SingularMatrix { .. })),
             "a column with no pivot must be refused, got {refused:?}"
+        );
+    }
+
+    #[test]
+    fn packed_upper_emission_from_sorted_rows_matches_pair_rows_bitwise() {
+        // The release path consumes `SortedFactorRow` directly.  Exercise a retired
+        // prefix as well as entries below the diagonal, then compare its exact
+        // packed bytes with the former pair-row staging representation.
+        let mut second = sorted_row_from_entries(vec![(0, -7.0), (1, 4.0), (2, 0.5)]);
+        second.drop_first();
+        let mut third = sorted_row_from_entries(vec![(0, 9.0), (1, -2.0), (2, 3.0)]);
+        third.drop_first();
+        third.drop_first();
+        let rows = vec![
+            sorted_row_from_entries(vec![(0, 2.0), (1, -3.0)]),
+            second,
+            third,
+        ];
+        let pair_rows: Vec<Vec<(usize, f64)>> = rows
+            .iter()
+            .enumerate()
+            .map(|(row, entries)| {
+                entries
+                    .pairs()
+                    .filter(|(column, value)| *column >= row && *value != 0.0)
+                    .collect()
+            })
+            .collect();
+        let expected = PackedTriangularRows::from_rows(&pair_rows);
+        let actual = PackedTriangularRows::from_sorted_upper_rows(rows);
+
+        assert_eq!(actual.offsets, expected.offsets);
+        assert_eq!(actual.columns, expected.columns);
+        assert_eq!(actual.values.len(), expected.values.len());
+        for (index, (actual_value, expected_value)) in
+            actual.values.iter().zip(&expected.values).enumerate()
+        {
+            assert_eq!(
+                actual_value.to_bits(),
+                expected_value.to_bits(),
+                "packed value {index} changed while bypassing the pair-row staging layer"
+            );
+        }
+
+        // MUST-MISS: the bitwise lane detects a one-ulp corruption instead of
+        // merely confirming matching lengths and column positions.
+        let mut corrupted = actual.clone();
+        corrupted.values[2] = f64::from_bits(corrupted.values[2].to_bits() + 1);
+        assert_ne!(
+            corrupted.values[2].to_bits(),
+            expected.values[2].to_bits(),
+            "the bitwise lane must reject a changed packed value"
         );
     }
 
@@ -27302,9 +27495,14 @@ pub fn splu_factor_payload_bytes(factorization: &SparseLuFactorization) -> usize
             .saturating_mul(n)
             .saturating_mul(std::mem::size_of::<f64>()),
         SparseLuInternal::Native(lu) => {
-            let entries = lu.l_rows.iter().map(Vec::len).sum::<usize>()
-                + lu.u_rows.iter().map(Vec::len).sum::<usize>();
-            entries.saturating_mul(std::mem::size_of::<(usize, f64)>())
+            // PACKED LAYOUT, and the SIZE TERM MOVED WITH IT. The triangular factors are
+            // `PackedTriangularRows` — parallel `u32` columns and `f64` values plus one
+            // `usize` row offset per row — not the old `Vec<Vec<(usize, f64)>>`. Charging the
+            // entries at `size_of::<(usize, f64)>()` would keep compiling and silently
+            // OVERSTATE the retained payload by a third, in a number the splu harness prints
+            // as `candidate_factor_vector_payload_bytes` on every measured row.
+            lu.lower.payload_bytes()
+                + lu.upper.payload_bytes()
                 + lu.row_perm
                     .len()
                     .saturating_mul(std::mem::size_of::<usize>())
