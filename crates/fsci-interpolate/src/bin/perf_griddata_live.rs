@@ -221,18 +221,42 @@ fn main() {
         "fsci and live SciPy disagree; no timing is admissible"
     );
 
-    // Interleaved A-B-B-A, two samples per arm per round for the A/A nulls.
+    // Interleaved quartet, two samples per arm per round for the A/A nulls.
+    //
+    // THE QUARTET IS FLIPPED EVERY ROUND, and it has to be. A fixed `f1 s1 s2 f2` puts fsci's two
+    // null samples in the OUTER slots and SciPy's in the two ADJACENT middle slots, so `s1` always
+    // pays the cold-cache cost of following an fsci run and `s2` never does. That is a POSITION
+    // effect, not drift, and ABBA does not cancel it: measured over 61 rounds the SciPy null sat
+    // at 1.073 with a bootstrap CI of [1.049, 1.100] that excludes 1.0 outright, while the fsci
+    // null in the outer slots was clean at 0.984. Alternating `f s s f` with `s f f s` gives each
+    // arm half its null samples from each configuration, so neither arm owns the cold slot.
+    //
+    // Each arm also gets an UNTIMED warmup call at the top of every round, which attacks the same
+    // asymmetry at its source rather than only cancelling it in aggregate.
     let (mut fs, mut sc) = (Vec::new(), Vec::new());
     let (mut fnull, mut snull) = (Vec::new(), Vec::new());
-    for _ in 0..rounds {
+    let mut timed_fsci = || {
         let t = Instant::now();
         std::hint::black_box(griddata(&pts, &vals, &xi, method).unwrap());
-        let f1 = t.elapsed().as_secs_f64();
-        let s1 = arm.timed(&method_name);
-        let s2 = arm.timed(&method_name);
-        let t = Instant::now();
-        std::hint::black_box(griddata(&pts, &vals, &xi, method).unwrap());
-        let f2 = t.elapsed().as_secs_f64();
+        t.elapsed().as_secs_f64()
+    };
+    for round in 0..rounds {
+        timed_fsci();
+        arm.timed(&method_name);
+
+        let (f1, f2, s1, s2) = if round % 2 == 0 {
+            let f1 = timed_fsci();
+            let s1 = arm.timed(&method_name);
+            let s2 = arm.timed(&method_name);
+            let f2 = timed_fsci();
+            (f1, f2, s1, s2)
+        } else {
+            let s1 = arm.timed(&method_name);
+            let f1 = timed_fsci();
+            let f2 = timed_fsci();
+            let s2 = arm.timed(&method_name);
+            (f1, f2, s1, s2)
+        };
 
         fs.push(f1.min(f2));
         sc.push(s1.min(s2));

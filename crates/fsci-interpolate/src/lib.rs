@@ -4180,11 +4180,6 @@ impl Delaunay2D {
             max_y = max_y.max(y);
         }
         let (dx, dy) = ((max_x - min_x).max(1e-10), (max_y - min_y).max(1e-10));
-        let margin = 10.0;
-        let mut all_points = points.to_vec();
-        all_points.push((min_x - margin * dx, min_y - margin * dy));
-        all_points.push((max_x + margin * dx, min_y - margin * dy));
-        all_points.push(((min_x + max_x) / 2.0, max_y + margin * dy));
         // Bowyer-Watson incremental triangulation. Both paths precompute each
         // triangle's circumcircle once (see `circumcircle`) so the incircle test
         // is a cheap `dist²(p, center) < r²` compare. Below
@@ -4195,11 +4190,66 @@ impl Delaunay2D {
         // every triangle whose circumcircle could contain it). Both yield a
         // valid Delaunay triangulation (verified by the
         // `delaunay_empty_circumcircle_property` test).
-        let triangles = if n >= DELAUNAY_GRID_THRESHOLD {
-            delaunay_triangulate_circle_grid(&all_points, n, min_x, min_y, dx, dy)
-        } else {
-            delaunay_triangulate_linear(&all_points, n)
-        };
+        //
+        // SUPER-TRIANGLE MARGIN, ESCALATED UNTIL THE RESULT IS PROVABLY COMPLETE.
+        //
+        // Bowyer-Watson deletes the triangles still touching the super-triangle's vertices at the
+        // end. If the super-triangle sits too close, a genuine near-boundary triangle gets
+        // attached to a super-vertex and is deleted with it, leaving a HOLE inside the convex
+        // hull. `LinearNDInterpolator::eval` then returns NaN for a query in that hole, which is
+        // indistinguishable from "outside the hull" -- 4 of 2000 queries at N=800 came back NaN
+        // here and finite from live SciPy 1.17.1, every one 1.7e-4 to 9.4e-4 INSIDE the hull
+        // (frankenscipy-tkpwa). The `-1e-10` barycentric tolerance in `find_simplex` is five
+        // orders of magnitude too small to explain that, so widening it was never the fix.
+        //
+        // The margin used to be a fixed 10.0, and a fixed value CANNOT be right: the deficit was
+        // measured to grow with the point count, so any constant only moves the failure to a
+        // larger input.
+        //
+        //     margin   N=400   N=800   N=2000
+        //         10       1       4        8      <- triangles missing
+        //         30       1       2        6
+        //        100       0       0        4
+        //        300       0       0        1
+        //       1000       0       0        0
+        //
+        // So escalate, and CHECK the result rather than trusting the constant. Euler's identity
+        // fixes the count exactly for points in general position: a Delaunay triangulation of N
+        // points with `h` of them on the convex hull has `2N - 2 - h` triangles. The first margin
+        // whose output reaches that count is accepted. Starting at 1000 rather than 10 because the
+        // sweep shows small margins essentially always leave holes, so starting low would pay for
+        // a discarded triangulation on every call. Escalation is capped and the last attempt is
+        // returned regardless, so a pathological input degrades to the old behaviour rather than
+        // failing outright.
+        //
+        // `fsci_spatial::Delaunay` had the SAME defect from the same constant and is fixed the
+        // same way; the two implementations are independent and neither can be dropped for the
+        // other, so the reasoning is written out in both.
+        let hull_vertices = fsci_spatial::ConvexHull::new(points)
+            .ok()
+            .map(|h| h.vertices.len());
+        let mut triangles = Vec::new();
+        for &margin in &[1000.0_f64, 1.0e5, 1.0e7] {
+            let mut all_points = points.to_vec();
+            all_points.push((min_x - margin * dx, min_y - margin * dy));
+            all_points.push((max_x + margin * dx, min_y - margin * dy));
+            all_points.push(((min_x + max_x) / 2.0, max_y + margin * dy));
+            triangles = if n >= DELAUNAY_GRID_THRESHOLD {
+                delaunay_triangulate_circle_grid(&all_points, n, min_x, min_y, dx, dy)
+            } else {
+                delaunay_triangulate_linear(&all_points, n)
+            };
+            // Degenerate inputs (all-collinear, duplicate-heavy) have no `2N - 2 - h` to reach;
+            // when the hull is unavailable or the count cannot apply, take the first result.
+            match hull_vertices {
+                Some(h) if 2 * n >= 2 + h => {
+                    if triangles.len() >= 2 * n - 2 - h {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
         let simplices = triangles
             .into_iter()
             .map(|triangle| orient_triangle_ccw(points, triangle))

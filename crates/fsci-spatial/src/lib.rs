@@ -4155,17 +4155,59 @@ impl Delaunay {
 
         let dx = (max_x - min_x).max(1e-10);
         let dy = (max_y - min_y).max(1e-10);
-        let margin = 10.0;
-        let mut all_points = points.to_vec();
-        all_points.push((min_x - margin * dx, min_y - margin * dy));
-        all_points.push((max_x + margin * dx, min_y - margin * dy));
-        all_points.push(((min_x + max_x) / 2.0, max_y + margin * dy));
 
-        let simplices = if n >= DELAUNAY_CIRCLE_GRID_THRESHOLD {
-            delaunay_triangulate_circle_grid(&all_points, n, min_x, min_y, dx, dy)
-        } else {
-            delaunay_triangulate_linear(&all_points, n)
-        };
+        // SUPER-TRIANGLE MARGIN, ESCALATED UNTIL THE RESULT IS PROVABLY COMPLETE.
+        //
+        // Bowyer-Watson starts from a super-triangle and deletes the triangles still touching its
+        // vertices at the end. If the super-triangle is too close, a genuine near-boundary
+        // triangle gets attached to a super-vertex and is deleted with it, leaving a HOLE inside
+        // the convex hull. `LinearNDInterpolator` then returns NaN for points in that hole, which
+        // is indistinguishable from "outside the hull" (frankenscipy-tkpwa).
+        //
+        // The margin used to be a fixed 10.0, and a fixed value CANNOT be right: the deficit was
+        // measured to grow with the point count.
+        //
+        //     margin   N=400   N=800   N=2000
+        //         10       1       4        8      <- triangles missing
+        //         30       1       2        6
+        //        100       0       0        4
+        //        300       0       0        1
+        //       1000       0       0        0
+        //
+        // So this escalates instead, and checks the result rather than trusting the constant.
+        // Euler's identity gives the exact triangle count for a complete triangulation of points
+        // in general position: `2N - 2 - h`, with `h` the number of convex-hull vertices. The
+        // first margin whose output satisfies it is accepted. Escalation is capped, and the last
+        // attempt is returned either way so a pathological input degrades to the old behaviour
+        // rather than failing outright.
+        //
+        // Starting at 1000 rather than 10 because the sweep above shows small margins essentially
+        // always leave holes; starting low would just pay for a discarded attempt every call.
+        let hull_vertices = ConvexHull::new(points).ok().map(|h| h.vertices.len());
+        let mut simplices = Vec::new();
+        for &margin in &[1000.0_f64, 1.0e5, 1.0e7] {
+            let mut all_points = points.to_vec();
+            all_points.push((min_x - margin * dx, min_y - margin * dy));
+            all_points.push((max_x + margin * dx, min_y - margin * dy));
+            all_points.push(((min_x + max_x) / 2.0, max_y + margin * dy));
+
+            simplices = if n >= DELAUNAY_CIRCLE_GRID_THRESHOLD {
+                delaunay_triangulate_circle_grid(&all_points, n, min_x, min_y, dx, dy)
+            } else {
+                delaunay_triangulate_linear(&all_points, n)
+            };
+
+            // Degenerate inputs (all-collinear, duplicate-heavy) have no `2N - 2 - h` to meet;
+            // when the hull is unavailable or the count cannot apply, accept the first result.
+            match hull_vertices {
+                Some(h) if n >= 3 && 2 * n >= 2 + h => {
+                    if simplices.len() >= 2 * n - 2 - h {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
         if simplices.is_empty() {
             return Err(qhull_error(
                 "QH6154 Qhull precision error: initial simplex is flat",
@@ -14272,31 +14314,39 @@ mod toggle_ab_mahalanobis_assembly {
         );
     }
 
-    /// `Delaunay::new` is INCOMPLETE: it produces fewer triangles than a Delaunay triangulation
-    /// has, leaving holes inside the convex hull (frankenscipy-tkpwa).
+    /// `Delaunay::new` produces a COMPLETE triangulation: exactly `2N - 2 - h` triangles, covering
+    /// the whole convex hull (frankenscipy-tkpwa, fixed).
     ///
     /// THE INVARIANT IS ARITHMETIC, not a golden value. A Delaunay triangulation of N points in
     /// general position with `h` of them on the convex hull has EXACTLY `2N - 2 - h` triangles.
-    /// Measured on deterministic uniform-random fixtures:
     ///
-    /// | N | h | expected | actual | deficit | uncovered hull area |
+    /// THIS TEST PREVIOUSLY PINNED THE DEFECT and was rewritten when the fix landed, as its own
+    /// closing message instructed. Before the fix the triangulation was missing triangles, leaving
+    /// holes INSIDE the hull:
+    ///
+    /// | N | h | expected | actual BEFORE | deficit | uncovered hull area BEFORE |
     /// |---|---|---|---|---|---|
     /// | 400 | 20 | 778 | 777 | 1 | 7.738e-05 |
     /// | 800 | 19 | 1579 | 1575 | 4 | 7.431e-04 |
     /// | 2000 | 23 | 3975 | 3967 | 8 | 1.152e-03 |
     ///
-    /// The consequence is silent: `LinearNDInterpolator::eval` returns NaN when no triangle
-    /// contains the query, which is right for a point outside the hull and is exactly how a point
-    /// in one of these holes gets reported. Against live SciPy 1.17.1 on the same fixture, 4 of
-    /// 2000 queries (N=800) come back NaN from this crate and finite from SciPy, every one of
+    /// The consequence was silent: `LinearNDInterpolator::eval` returns NaN when no triangle
+    /// contains the query, which is right for a point outside the hull and was exactly how a point
+    /// in one of these holes got reported. Against live SciPy 1.17.1 on the same fixture, 4 of
+    /// 2000 queries (N=800) came back NaN from this crate and finite from SciPy, every one of
     /// them 1.7e-4 to 9.4e-4 INSIDE the hull -- far too deep for the `-1e-10` barycentric
-    /// tolerance in `find_simplex` to be the cause, so widening that tolerance is NOT the fix.
+    /// tolerance in `find_simplex` to have been the cause, so widening that tolerance was never
+    /// the fix.
     ///
-    /// This test PINS THE DEFECT so it cannot change unnoticed in either direction. When the
-    /// triangulation is fixed it will fail; rewrite it then to assert `deficit == 0`, do not
-    /// delete it.
+    /// The cause was a FIXED super-triangle margin of 10.0 in `Delaunay::new`, and a fixed value
+    /// cannot be right: the required margin was measured to grow with N (100 suffices at N=800,
+    /// while N=2000 still lost 4 triangles and needed 1000). The margin now escalates and the
+    /// result is checked against `2N - 2 - h`, so the constant is verified rather than trusted.
+    ///
+    /// N=2000 is included here deliberately: it is the size that survived every intermediate
+    /// margin, so a regression that reintroduced a too-small constant would pass at 400 and 800.
     #[test]
-    fn delaunay_triangulation_is_currently_incomplete() {
+    fn delaunay_triangulation_is_complete() {
         use super::{ConvexHull, Delaunay};
 
         fn lcg(state: &mut u64) -> f64 {
@@ -14308,24 +14358,25 @@ mod toggle_ab_mahalanobis_assembly {
 
         // Same generator and seed as the griddata fixture the defect was found on, so this test
         // and that probe describe the same point sets.
-        let mut worst_deficit = 0i64;
-        for n in [400usize, 800] {
+        for n in [400usize, 800, 2000] {
             let mut s = 0x9e37_79b9_7f4a_7c15u64;
             let pts: Vec<(f64, f64)> = (0..n).map(|_| (lcg(&mut s), lcg(&mut s))).collect();
             let tri = Delaunay::new(&pts).expect("delaunay");
             let hull = ConvexHull::new(&pts).expect("hull");
             let expected = 2 * n - 2 - hull.vertices.len();
-            let deficit = expected as i64 - tri.simplices.len() as i64;
-            assert!(
-                deficit >= 0,
-                "N={n}: MORE triangles than a Delaunay triangulation can have ({} > {expected}); \
-                 that is a different defect from the one this test pins",
-                tri.simplices.len()
+            assert_eq!(
+                tri.simplices.len(),
+                expected,
+                "N={n}: a Delaunay triangulation of these points has exactly {expected} triangles \
+                 (2N-2-h, h={}); a shortfall means holes inside the hull, and queries landing in \
+                 one of them silently return NaN",
+                hull.vertices.len()
             );
-            worst_deficit = worst_deficit.max(deficit);
 
             // The area check is independent of the triangle count: sum the triangle areas and
-            // compare against the hull area. A covering triangulation matches exactly.
+            // compare against the hull area. A covering triangulation matches exactly. Both are
+            // asserted because either alone can be met by a wrong triangulation -- a count by
+            // triangles that overlap, an area by two errors that cancel.
             let area = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
                 ((b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1)).abs() * 0.5
             };
@@ -14341,22 +14392,33 @@ mod toggle_ab_mahalanobis_assembly {
             }
             let uncovered = hull_area - tri_area;
             assert!(
-                uncovered >= -1e-12,
-                "N={n}: triangulated area EXCEEDS the hull ({uncovered:.3e}); that would mean \
-                 overlapping triangles, a different defect from the one this test pins"
+                uncovered.abs() <= 1e-12,
+                "N={n}: triangulated area {tri_area:.15} differs from hull area \
+                 {hull_area:.15} by {uncovered:.3e}; positive means the triangulation leaves a \
+                 hole, negative means triangles overlap"
             );
-            assert!(
-                (deficit > 0) == (uncovered > 1e-9),
-                "N={n}: triangle deficit ({deficit}) and uncovered area ({uncovered:.3e}) \
-                 disagree; the two independent measures of the same defect must agree"
+
+            // And the user-visible symptom directly: every triangle's own centroid is strictly
+            // inside that triangle, so `find_simplex` must locate one for each. This catches a
+            // triangulation and a point-location routine that disagree with each other, which the
+            // two area/count measures above cannot see.
+            let mut centroid_not_found = 0usize;
+            for &(i, j, k) in &tri.simplices {
+                let c = (
+                    (pts[i].0 + pts[j].0 + pts[k].0) / 3.0,
+                    (pts[i].1 + pts[j].1 + pts[k].1) / 3.0,
+                );
+                if tri.find_simplex(c).is_none() {
+                    centroid_not_found += 1;
+                }
+            }
+            assert_eq!(
+                centroid_not_found,
+                0,
+                "N={n}: {centroid_not_found} of {} triangle centroids were not located by \
+                 find_simplex, so point location disagrees with the triangulation it searches",
+                tri.simplices.len()
             );
         }
-
-        assert!(
-            worst_deficit > 0,
-            "Delaunay::new now produces a COMPLETE triangulation. That is the fix this test was \
-             waiting for (frankenscipy-tkpwa): rewrite it to assert deficit == 0 and uncovered \
-             area == 0 for every N, rather than deleting it"
-        );
     }
 }
