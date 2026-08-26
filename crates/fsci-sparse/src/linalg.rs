@@ -17930,6 +17930,115 @@ mod tests {
         upper.iter().map(Vec::len).sum::<usize>() + lower.iter().map(Vec::len).sum::<usize>()
     }
 
+    /// IS THE RCM FACTOR A COMPLETELY DENSE BAND?
+    ///
+    /// If it is, this crate stores a dense band in a general sparse format -- paying a `u32`
+    /// column index per entry, a run-length comparison that is 15.79% of the factorization's
+    /// instructions, and a sorted merge -- for structure that needs none of them.
+    ///
+    /// The test is exact arithmetic, not a threshold. For a symmetrically-structured factor whose
+    /// profile is `E` (entries strictly left of the diagonal, summed over rows), a COMPLETELY FULL
+    /// band holds `2E + n` entries: `E` below, `E` above, `n` on the diagonal. Any entry inside
+    /// the profile that does NOT fill in makes the actual count smaller.
+    ///
+    /// THE CONTROL IS THE POINT. Two structured grids agreeing could be a property of grids
+    /// rather than of RCM, so an irregular fixture is measured alongside them. If the band is full
+    /// there too, it is RCM; if not, the lever only applies to banded problems and that bound has
+    /// to be stated.
+    #[test]
+    #[ignore = "factors several n=1000-4096 cells; run explicitly"]
+    fn rcm_factor_is_a_full_band() {
+        fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("convection CSR")
+        }
+
+        fn profile_under(a: &CsrMatrix, perm: &[usize]) -> u64 {
+            let n = perm.len();
+            let mut inverse = vec![0usize; n];
+            for (position, &original) in perm.iter().enumerate() {
+                inverse[original] = position;
+            }
+            let (indptr, indices) = (a.indptr(), a.indices());
+            let mut total = 0u64;
+            for position in 0..n {
+                let original = perm[position];
+                let mut leftmost = position;
+                for &column in &indices[indptr[original]..indptr[original + 1]] {
+                    let permuted = inverse[column];
+                    if permuted < leftmost {
+                        leftmost = permuted;
+                    }
+                }
+                total += (position - leftmost) as u64;
+            }
+            total
+        }
+
+        for (label, matrix, regular) in [
+            ("convection(64) [run7d]", convection_diffusion_2d(64), true),
+            (
+                "cubic(16)      [llywn]",
+                splu_dirichlet_laplacian_3d(16),
+                true,
+            ),
+            (
+                "scattered(10)  [control]",
+                scattered_pentadiagonal_csr(10),
+                false,
+            ),
+        ] {
+            let n = matrix.shape().rows;
+            let perm = reverse_cuthill_mckee(&matrix);
+            let profile = profile_under(&matrix, &perm);
+            let full_band = 2 * profile + n as u64;
+            let actual = NativeSparseLu::factorize_csr(
+                &matrix,
+                1.0,
+                PermutationOrdering::ReverseCuthillMcKee,
+            )
+            .expect("factorization")
+            .stored_nnz() as u64;
+            let density = actual as f64 / full_band as f64;
+            println!(
+                "RCM_BAND {label} n={n} profile={profile} full_band=2*profile+n={full_band} \
+                 actual_fill={actual} band_density={density:.6} regular_grid={regular}"
+            );
+            if regular {
+                assert_eq!(
+                    actual, full_band,
+                    "{label}: the RCM factor was expected to be a COMPLETELY full band"
+                );
+            }
+        }
+    }
+
     #[test]
     fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
         // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
