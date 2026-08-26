@@ -11482,4 +11482,299 @@ mod max_rstat_matches_scipy {
             "field 3 must still be accepted"
         );
     }
+
+    /// SciPy parity for `scipy.cluster.hierarchy` entry points with no differential coverage
+    /// (frankenscipy-ivxx6): `cut_tree`, `leaders`, `maxdists`, `maxinconsts`, `is_isomorphic`,
+    /// `from_mlab_linkage`.
+    ///
+    /// `linkage` IS ASSERTED FIRST AS A CONTROL. Every function here consumes Z, so if Z already
+    /// disagreed with SciPy the downstream assertions would fail while blaming the wrong
+    /// function. It agrees exactly (0.000e0), which is what licenses reading the rest.
+    ///
+    /// CLUSTER LABELS ARE PERMUTATION-ARBITRARY, so `cut_tree` is checked twice -- raw labels and
+    /// a canonical renumbering by first appearance. Two implementations can produce the same
+    /// PARTITION under different numbering, and only the canonical form separates a real
+    /// disagreement from a naming one. Here both forms agree, so the numbering matches too.
+    ///
+    /// `leaders` is the one that differs, and it differs only in ORDER. fsci returns
+    /// L=[11,17,20] M=[3,2,1]; SciPy returns L=[17,20,11] M=[2,1,3]. As (leader, cluster) PAIRS
+    /// these are the same set -- {(11,3), (17,2), (20,1)} -- so the mapping is identical and
+    /// only the row order differs: fsci sorts by leader, SciPy emits traversal order. The
+    /// contract asserted below is the pair set, which is what the function means; the ordering
+    /// difference is pinned separately so it cannot change unnoticed.
+    #[test]
+    fn hierarchy_utils_against_scipy_1_17_1() {
+        use super::{
+            LinkageMethod, cut_tree, from_mlab_linkage, inconsistent, is_isomorphic, leaders,
+            linkage, maxdists, maxinconsts,
+        };
+
+        fn close(name: &str, got: &[f64], want: &[f64], tol: f64) {
+            assert_eq!(got.len(), want.len(), "{name}: length");
+            for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (a - b).abs() <= tol,
+                    "{name}[{i}]: got {a:.17e}, SciPy gives {b:.17e}"
+                );
+            }
+        }
+
+        let data: Vec<Vec<f64>> = vec![
+            vec![0.0, 0.0],
+            vec![0.3, 0.2],
+            vec![0.1, 0.4],
+            vec![3.0, 3.1],
+            vec![3.4, 2.8],
+            vec![3.1, 3.5],
+            vec![6.2, 0.4],
+            vec![6.0, 0.1],
+            vec![6.5, 0.6],
+            vec![1.7, 5.9],
+            vec![2.0, 6.2],
+            vec![9.4, 9.1],
+        ];
+        let z = linkage(&data, LinkageMethod::Average).expect("linkage");
+
+        // CONTROL first.
+        let flat: Vec<f64> = z.iter().flat_map(|r| r.iter().copied()).collect();
+        close(
+            "linkage(average)",
+            &flat,
+            &[
+                1.0,
+                2.0,
+                0.282842712474619,
+                2.0,
+                6.0,
+                8.0,
+                0.3605551275463988,
+                2.0,
+                0.0,
+                12.0,
+                0.38643284505408254,
+                3.0,
+                3.0,
+                5.0,
+                0.41231056256176596,
+                2.0,
+                9.0,
+                10.0,
+                0.42426406871192845,
+                2.0,
+                7.0,
+                13.0,
+                0.5338309543664733,
+                3.0,
+                4.0,
+                15.0,
+                0.6307886552931956,
+                3.0,
+                16.0,
+                18.0,
+                3.208470536080415,
+                5.0,
+                14.0,
+                19.0,
+                4.978551300056699,
+                8.0,
+                17.0,
+                20.0,
+                5.640647522682954,
+                11.0,
+                11.0,
+                21.0,
+                9.873351063069142,
+                12.0,
+            ],
+            1e-12,
+        );
+
+        close(
+            "maxdists",
+            &maxdists(&z),
+            &[
+                0.282842712474619,
+                0.3605551275463988,
+                0.38643284505408254,
+                0.41231056256176596,
+                0.42426406871192845,
+                0.5338309543664733,
+                0.6307886552931956,
+                3.208470536080415,
+                4.978551300056699,
+                5.640647522682954,
+                9.873351063069142,
+            ],
+            1e-12,
+        );
+
+        let r = inconsistent(&z, 2);
+        let rflat: Vec<f64> = r.iter().flat_map(|q| q.iter().copied()).collect();
+        close(
+            "inconsistent(depth=2)",
+            &rflat,
+            &[
+                0.282842712474619,
+                0.0,
+                1.0,
+                0.0,
+                0.3605551275463988,
+                0.0,
+                1.0,
+                0.0,
+                0.33463777876435075,
+                0.0732492852109524,
+                2.0,
+                0.7071067811865456,
+                0.41231056256176596,
+                0.0,
+                1.0,
+                0.0,
+                0.42426406871192845,
+                0.0,
+                1.0,
+                0.0,
+                0.4471930409564361,
+                0.12252451216018048,
+                2.0,
+                0.7071067811865477,
+                0.5215496089274808,
+                0.15448734091109714,
+                2.0,
+                0.7071067811865479,
+                1.421174420028513,
+                1.551284518086963,
+                3.0,
+                1.1521394658511692,
+                2.857818227063732,
+                2.3160539193978096,
+                3.0,
+                0.9156665374804283,
+                3.717676592368709,
+                2.7770933792318515,
+                3.0,
+                0.6924401407222907,
+                7.756999292876048,
+                2.992973376159383,
+                2.0,
+                0.7071067811865471,
+            ],
+            1e-12,
+        );
+        close(
+            "maxinconsts(depth=2)",
+            &maxinconsts(&z, &r).unwrap(),
+            &[
+                0.0,
+                0.0,
+                0.7071067811865456,
+                0.0,
+                0.0,
+                0.7071067811865477,
+                0.7071067811865479,
+                1.1521394658511692,
+                1.1521394658511692,
+                1.1521394658511692,
+                1.1521394658511692,
+            ],
+            1e-12,
+        );
+
+        for (k, raw, canon) in [
+            (
+                2usize,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ),
+            (
+                3,
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 2.0],
+                vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 2.0],
+            ),
+            (
+                4,
+                vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 3.0],
+                vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 1.0, 1.0, 3.0],
+            ),
+            (
+                6,
+                vec![0.0, 0.0, 0.0, 1.0, 2.0, 1.0, 3.0, 3.0, 3.0, 4.0, 4.0, 5.0],
+                vec![0.0, 0.0, 0.0, 1.0, 2.0, 1.0, 3.0, 3.0, 3.0, 4.0, 4.0, 5.0],
+            ),
+        ] {
+            let labels = cut_tree(&z, Some(k), None).unwrap();
+            let as_f: Vec<f64> = labels.iter().map(|&l| l as f64).collect();
+            close(&format!("cut_tree(k={k})/raw"), &as_f, &raw, 0.0);
+            // Canonical renumbering by first appearance: same PARTITION under any naming.
+            let mut map = std::collections::HashMap::new();
+            let mut next = 0usize;
+            let canon_got: Vec<f64> = labels
+                .iter()
+                .map(|&l| {
+                    let id = *map.entry(l).or_insert_with(|| {
+                        let v = next;
+                        next += 1;
+                        v
+                    });
+                    id as f64
+                })
+                .collect();
+            close(
+                &format!("cut_tree(k={k})/canonical"),
+                &canon_got,
+                &canon,
+                0.0,
+            );
+        }
+
+        // `leaders`: the PAIR SET is the contract, not the row order.
+        let labels = cut_tree(&z, Some(3), None).unwrap();
+        let t: Vec<usize> = labels.iter().map(|&l| l + 1).collect();
+        let (l, m) = leaders(&z, &t).unwrap();
+        let mut ours: Vec<(usize, usize)> = l.iter().copied().zip(m.iter().copied()).collect();
+        let scipy_l = [17, 20, 11];
+        let scipy_m = [2, 1, 3];
+        let mut theirs: Vec<(usize, usize)> = scipy_l
+            .iter()
+            .copied()
+            .zip(scipy_m.iter().copied())
+            .collect();
+        ours.sort_unstable();
+        theirs.sort_unstable();
+        assert_eq!(
+            ours, theirs,
+            "leaders: the (leader, cluster) mapping must match SciPy"
+        );
+
+        // And the ORDER difference, pinned. If this ever starts matching SciPy's traversal order,
+        // rewrite the assertion rather than delete it.
+        let raw_ours: Vec<usize> = l.to_vec();
+        assert_ne!(
+            raw_ours,
+            scipy_l.to_vec(),
+            "leaders now emits SciPy's row order; update this pin to assert the new agreement"
+        );
+
+        // is_isomorphic, BOTH answers -- a predicate probed only where true proves nothing.
+        let a = [0usize, 0, 1, 1, 2, 2];
+        assert!(
+            is_isomorphic(&a, &[5usize, 5, 9, 9, 1, 1]),
+            "relabelled partitions are isomorphic"
+        );
+        assert!(
+            !is_isomorphic(&a, &[0usize, 1, 1, 1, 2, 2]),
+            "different partitions are not"
+        );
+        assert!(is_isomorphic(&a, &a), "a partition is isomorphic to itself");
+
+        let mlab: Vec<[f64; 3]> = vec![[1.0, 2.0, 0.5], [3.0, 4.0, 0.8], [5.0, 6.0, 1.4]];
+        let converted = from_mlab_linkage(&mlab);
+        let cflat: Vec<f64> = converted.iter().flat_map(|r| r.iter().copied()).collect();
+        close(
+            "from_mlab_linkage",
+            &cflat,
+            &[0.0, 1.0, 0.5, 2.0, 2.0, 3.0, 0.8, 2.0, 4.0, 5.0, 1.4, 4.0],
+            1e-12,
+        );
+    }
 }
