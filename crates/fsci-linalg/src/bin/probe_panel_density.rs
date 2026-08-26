@@ -19,8 +19,7 @@
 //!
 //! Either answer closes a question that is currently open on speculation.
 //!
-//! THE ANSWER, MEASURED 2026-08-26 on `thinkstation1`, 50 reps over the three shapes below,
-//! ELF sha256 `870a0275f50d9ef4f8b856b2d75dd4b5b81e61390ce6e0d5354bcc2478b8b56a`:
+//! THE ANSWER, MEASURED 2026-08-26 on `thinkstation1`, 50 reps over the `panel` shapes:
 //!
 //!     variant            instructions         fp_ops      mac_flops   FLOPs/ins
 //!     setup                   7,905,253      2,397,492      1,515,922    0.3033
@@ -35,6 +34,39 @@
 //! **YES: safe Rust reaches SciPy's density.** `naive_kij_fma` retires 1.7730 FLOPs/instruction
 //! against SciPy's 1.7638 on the cubic cell -- and it is a plain unit-stride loop, no intrinsics,
 //! no `unsafe`, no blocking.
+//!
+//! SECOND PASS (frankenscipy-fzk5t), AND IT CORRECTS THE READING ABOVE. Those numbers are all at
+//! k=32..64. llywn's supernodes are **5.35 columns wide**, so k is about 5, and density is not the
+//! only thing that changes. Counting `L1-dcache-load-misses` as well, 50 reps.
+//!
+//! The executed-binary SHA-256 for these tables is pinned in the ledger row rather than here, on
+//! purpose: a sha written into this comment is invalidated by the next edit to this comment, so a
+//! source-pinned hash reads as provenance while being self-referentially stale. The ledger row is
+//! the artifact that has to name the binary that produced the numbers.
+//!
+//!     shapes=supernode (k=5)     instructions       fp_ops  FLOPs/ins     L1d_miss  miss/kFLOP
+//!     naive_kij                   512,403,220  722,621,075     1.4103   48,846,806      67.597
+//!     naive_kij_fma               423,376,788  722,621,075     1.7068   48,795,176      67.525
+//!     naive_ikj                   513,507,942  722,621,075     1.4072   12,332,786      17.067
+//!     naive_ikj_fma               426,075,526  722,621,075     1.6960   11,584,267      16.031
+//!     tiled4x4_fma              1,032,654,036  794,710,675     0.7696   11,699,391      14.722
+//!
+//!     shapes=panel (k=32/64)     instructions       fp_ops  FLOPs/ins     L1d_miss  miss/kFLOP
+//!     naive_kij                   367,831,569  539,792,713     1.4675   35,327,407      65.446
+//!     naive_ikj                   361,338,338  539,792,713     1.4939   32,563,724      60.326
+//!     naive_ikj_fma               295,945,346  539,792,713     1.8240   32,851,297      60.859
+//!
+//! **AT THE REAL SUPERNODE WIDTH, LOOP ORDER IS WORTH 4.22-FOLD IN D1 READ MISSES AT IDENTICAL
+//! DENSITY** (67.597 -> 16.031 misses per kFLOP; density 1.41 either way, 1.70 either way with
+//! `mul_add`). At k=64 the same choice is worth about 8%. Choosing `k-i-j` on the k=64 evidence
+//! and carrying it to k=5 would have kept the density and thrown away the entire traffic win --
+//! and llywn's own decomposition puts 78.65% of the elimination's D1 read misses in exactly that
+//! streaming. The supernodal argument predicts the row is touched once per supernode instead of
+//! once per column, so misses should fall by about `1 - 1/w`; at w=5 that predicts 5-fold and
+//! 4.22-fold is measured, the shortfall being the A and B streams, which do not reduce.
+//!
+//! `tiled4x4_fma` reaches the low miss count too (14.722) and pays 0.7696 density for it. `i-k-j`
+//! is the only variant that gets BOTH.
 //!
 //! TWO RESULTS THAT INVERT THE PREMISE llywn.3 WAS WORKING FROM:
 //!
@@ -61,10 +93,14 @@
 //! arithmetic, so its counts are the floor to subtract rather than a number to assume:
 //!
 //!     perf stat -e instructions,fp_ret_sse_avx_ops.all,fp_ret_sse_avx_ops.mac_flops \
-//!       probe_panel_density <variant> [reps]
+//!       probe_panel_density <variant> [reps] [panel|supernode]
 //!
-//! Variants: setup, naive_ijk, naive_kij, naive_kij_fma, tiled4x4, tiled4x4_fma, tiled8x4_fma,
-//! matmul_public.
+//! Add `-e L1-dcache-load-misses` for the traffic question, which is the one that separates the
+//! loop orders at small k.
+//!
+//! Variants: setup, naive_ijk, naive_kij, naive_kij_fma, naive_ikj, naive_ikj_fma, tiled4x4,
+//! tiled4x4_fma, tiled8x4_fma, matmul_public.
+//! Shape sets: `panel` (k=32/64, default), `supernode` (k=5, llywn's actual regime).
 //!
 //! CORRECTNESS IS CHECKED, because a fast-but-wrong kernel would post a density number just fine.
 //! Every variant is verified against `naive_ijk` before its counted region runs, and the check is
@@ -72,17 +108,87 @@
 //! tolerance, since fusing is precisely what makes them differ.
 use std::hint::black_box;
 
-/// Panel shapes representative of a supernodal trailing update `C[m x n] -= A[m x k] * B[k x n]`.
-/// `k` is the supernode width and stays small; `m` and `n` are the trailing rows and columns.
-/// All dimensions are multiples of 8 so the tiled kernels need no edge handling -- edge cases are
+/// Panel shapes for a trailing update `C[m x n] -= A[m x k] * B[k x n]`.
+/// `m` and `n` are the trailing rows and columns; `k` is the supernode width.
+/// All `m` and `n` are multiples of 8 so the tiled kernels need no edge handling -- edge cases are
 /// a correctness concern for a shipping kernel but would only add instructions that are not part
 /// of the density question being asked here.
-const SHAPES: &[(usize, usize, usize)] = &[(64, 64, 32), (128, 128, 64), (256, 256, 64)];
+///
+/// TWO SHAPE SETS, AND THE SECOND IS THE ONE THAT MATTERS FOR llywn (frankenscipy-fzk5t).
+///
+/// The `panel` set uses k=32..64. That is a reasonable dense-GEMM regime and it is what the first
+/// pass of this probe measured -- but IT IS NOT THE REGIME llywn RUNS IN, and reading the k=64
+/// result as if it were was a real error in that pass.
+///
+/// The cubic cell's relaxed supernodes measure **5.35 columns wide** (ledger 2026-08-26, mean
+/// 5.35, blocks 97.2% full). So llywn's panel update has k about 5, and at k=5 the LOOP ORDER
+/// stops being a detail:
+///
+///   * `k-i-j` streams the whole target block C once per pivot column -- k passes over m*n. That
+///     is exactly the traffic llywn's decomposition blames, where 78.65% of the elimination's D1
+///     read misses sit in merge streaming because a target row is touched once per PIVOT COLUMN.
+///   * `i-k-j` holds ONE target row and applies all k pivot updates to it before moving on, so the
+///     row is touched once per SUPERNODE. That is the whole point of supernodal blocking.
+///
+/// At k=64 cache absorbs the difference and `k-i-j` looks fine. At k=5 it should not. The
+/// `supernode` set exists to make that visible rather than assumed, which is why both sets ship
+/// and the crossover is measured rather than argued.
+const SHAPES_PANEL: &[(usize, usize, usize)] = &[(64, 64, 32), (128, 128, 64), (256, 256, 64)];
+const SHAPES_SUPERNODE: &[(usize, usize, usize)] =
+    &[(1024, 128, 5), (2048, 128, 5), (4096, 256, 5)];
+
+fn shapes_for(set: &str) -> &'static [(usize, usize, usize)] {
+    match set {
+        "panel" => SHAPES_PANEL,
+        "supernode" => SHAPES_SUPERNODE,
+        other => {
+            eprintln!("unknown shape set {other}; expected `panel` or `supernode`");
+            std::process::exit(2);
+        }
+    }
+}
 
 fn fill(len: usize, seed: f64) -> Vec<f64> {
     (0..len)
         .map(|i| ((i as f64) * 0.0131 + seed).sin() + 0.5)
         .collect()
+}
+
+/// `C -= A * B`, i-k-j order: THE SUPERNODAL SHAPE.
+///
+/// One target row `crow` is held while all `k` pivot updates are applied to it, so the row is
+/// touched once per SUPERNODE rather than once per pivot column. `crow` is `n * 8` bytes -- 1 KiB
+/// at n=128 -- so it stays resident in L1 across the whole `k` loop, which is the traffic
+/// reduction supernodal blocking is supposed to buy and which `k-i-j` cannot get at small `k`.
+///
+/// Bit-identical to `naive_ijk` and to `naive_kij`: for a fixed `(i, j)` all three subtract the
+/// same terms in the same `p` order, and negation distributes exactly through rounding.
+fn naive_ikj(m: usize, n: usize, k: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+    for i in 0..m {
+        let arow = &a[i * k..i * k + k];
+        let crow = &mut c[i * n..i * n + n];
+        for (p, &av) in arow.iter().enumerate() {
+            let brow = &b[p * n..p * n + n];
+            for (cv, &bv) in crow.iter_mut().zip(brow.iter()) {
+                *cv -= av * bv;
+            }
+        }
+    }
+}
+
+/// `i-k-j` with the multiply-subtract fused. See `naive_kij_fma` for why the fusion has to be
+/// written out: Rust builds with `fp-contract=off` and will not do it on our behalf.
+fn naive_ikj_fma(m: usize, n: usize, k: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+    for i in 0..m {
+        let arow = &a[i * k..i * k + k];
+        let crow = &mut c[i * n..i * n + n];
+        for (p, &av) in arow.iter().enumerate() {
+            let brow = &b[p * n..p * n + n];
+            for (cv, &bv) in crow.iter_mut().zip(brow.iter()) {
+                *cv = (-av).mul_add(bv, *cv);
+            }
+        }
+    }
 }
 
 /// `C -= A * B`, i-j-k order: the textbook triple loop, and the one that strides B badly.
@@ -210,6 +316,8 @@ fn tiled_8x4_fma(m: usize, n: usize, k: usize, a: &[f64], b: &[f64], c: &mut [f6
 fn run(variant: &str, m: usize, n: usize, k: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
     match variant {
         "naive_ijk" => naive_ijk(m, n, k, a, b, c),
+        "naive_ikj" => naive_ikj(m, n, k, a, b, c),
+        "naive_ikj_fma" => naive_ikj_fma(m, n, k, a, b, c),
         "naive_kij" => naive_kij(m, n, k, a, b, c),
         "naive_kij_fma" => naive_kij_fma(m, n, k, a, b, c),
         "tiled4x4" => tiled_4x4(m, n, k, a, b, c, false),
@@ -256,6 +364,10 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(20);
+    let shape_set = std::env::args()
+        .nth(3)
+        .unwrap_or_else(|| "panel".to_string());
+    let shapes = shapes_for(&shape_set);
 
     // ---- correctness, BEFORE the counted region -------------------------------------------
     // A kernel that computes the wrong thing would post a density number just as happily.
@@ -268,14 +380,17 @@ fn main() {
     // the same code.
     let counted = std::env::var("FSCI_PANEL_COUNTED").is_ok_and(|v| v == "1");
     if variant != "setup" && !counted {
-        for &(m, n, k) in SHAPES {
+        for &(m, n, k) in shapes {
             let a = fill(m * k, 0.3);
             let b = fill(k * n, 1.1);
             let mut want = vec![0.0; m * n];
             naive_ijk(m, n, k, &a, &b, &mut want);
             let mut got = vec![0.0; m * n];
             run(&variant, m, n, k, &a, &b, &mut got);
-            let exact = variant == "naive_ijk" || variant == "naive_kij" || variant == "tiled4x4";
+            let exact = matches!(
+                variant.as_str(),
+                "naive_ijk" | "naive_kij" | "naive_ikj" | "tiled4x4"
+            );
             let worst = want
                 .iter()
                 .zip(got.iter())
@@ -306,7 +421,7 @@ fn main() {
 
     // ---- the counted region ----------------------------------------------------------------
     let mut flops = 0.0f64;
-    for &(m, n, k) in SHAPES {
+    for &(m, n, k) in shapes {
         let a = black_box(fill(m * k, 0.3));
         let b = black_box(fill(k * n, 1.1));
         let mut c = vec![0.0; m * n];
@@ -319,5 +434,5 @@ fn main() {
             flops += reps as f64 * (2.0 * (m * n * k) as f64 + (m * n) as f64);
         }
     }
-    println!("variant={variant} reps={reps} analytic_flops={flops:.0}");
+    println!("variant={variant} shapes={shape_set} reps={reps} analytic_flops={flops:.0}");
 }

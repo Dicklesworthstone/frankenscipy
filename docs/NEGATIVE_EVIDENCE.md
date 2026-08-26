@@ -40948,3 +40948,94 @@ figure is not a clean measurement of the overhead alone.
 supernodal update that uses the `naive_kij` shape at its centre, against per-pivot, on the same
 cubic cell. That is the next counted question on `frankenscipy-llywn.3`, and it is answerable on a
 loaded host for the same reason this was.
+
+## 2026-08-26 - BlackThrush (cc) - I measured the wrong k and nearly shipped the wrong kernel shape: at llywn's REAL supernode width of 5, loop order is worth 4.26-fold in D1 read misses at identical arithmetic density
+
+**Result class: BEHAVIORAL.** Bead `frankenscipy-fzk5t`, informs `llywn.3`. Corrects my own row
+from earlier today (`frankenscipy-8m8s7`).
+
+**probe**: `crates/fsci-linalg/src/bin/probe_panel_density.rs`, one variant per process so
+`perf stat` attributes counters to that variant alone.
+**same_host=thinkstation1**, 64 cpu. **harness**: `probe_panel_density`, executed ELF sha256
+`ce0a40379789ee3f371d6a3f17776fb2879a6f44e26193e2d96e5469820edfc2`.
+**Every ratio below is written `N-fold` rather than `Nx` on purpose: they are ratios of
+INSTRUCTION COUNTS, CACHE MISSES and ARITHMETIC DENSITY, never of time.**
+**Counts are load-independent. Nothing in this row is a timing claim.**
+
+**observed:** at k=5, `i-k-j` costs 16.031 L1 D-cache read misses per kFLOP against `k-i-j`'s
+67.525 -- a 4.26-fold reduction -- at arithmetic density 1.6960 against 1.7068, i.e.
+indistinguishable. At k=32/64 the same choice moves misses only 65.446 -> 60.326. The
+bit-identical no-FMA forms read 17.067 against 67.597 misses per kFLOP at density 1.4072
+against 1.4103. Reproduced on the final binary at 15.928 against 67.780.
+
+### What I got wrong this morning
+
+`8m8s7` measured dense-panel kernels at k=32 and k=64, found a plain contiguous `k-i-j` loop
+reached SciPy's density, and recorded that as the shape llywn's panel kernel should take. **The
+cubic cell's relaxed supernodes are 5.35 columns wide** -- already measured and already in this
+ledger -- so llywn's panel update has k about 5, and k=64 is not its regime. Density is not the
+only thing that moves.
+
+**observed:** 50 reps, `C[m x n] -= A[m x k] * B[k x n]`, counting
+`instructions,fp_ret_sse_avx_ops.all,L1-dcache-load-misses` --
+
+    shapes=supernode (k=5)     instructions       fp_ops  FLOPs/ins     L1d_miss  miss/kFLOP
+    setup                         6,241,945    1,725,054     0.2764       56,306      32.640
+    naive_kij                   512,403,220  722,621,075     1.4103   48,846,806      67.597
+    naive_kij_fma               423,376,788  722,621,075     1.7068   48,795,176      67.525
+    naive_ikj                   513,507,942  722,621,075     1.4072   12,332,786      17.067
+    naive_ikj_fma               426,075,526  722,621,075     1.6960   11,584,267      16.031
+    tiled4x4_fma              1,032,654,036  794,710,675     0.7696   11,699,391      14.722
+
+    shapes=panel (k=32/64)     instructions       fp_ops  FLOPs/ins     L1d_miss  miss/kFLOP
+    naive_kij                   367,831,569  539,792,713     1.4675   35,327,407      65.446
+    naive_ikj                   361,338,338  539,792,713     1.4939   32,563,724      60.326
+    naive_ikj_fma               295,945,346  539,792,713     1.8240   32,851,297      60.859
+
+### The finding
+
+**At k=5, `i-k-j` costs 15.9-16.0 D1 read misses per kFLOP against `k-i-j`'s 67.5-67.6 -- a
+4.26-fold reduction -- at INDISTINGUISHABLE density** (1.4072 vs 1.4103 plain, 1.6960 vs 1.7068
+fused). At k=64 the same choice is worth about 8%.
+
+`k-i-j` streams the whole target block once per PIVOT COLUMN; `i-k-j` holds one target row and
+applies all k updates to it, so the row is touched once per SUPERNODE. That is precisely the
+traffic llywn's own decomposition blames, which put **78.65% of the elimination's D1 read misses
+in merge streaming** for exactly this reason. The supernodal argument predicts misses fall by
+about `1 - 1/w`; at w=5 that predicts 5-fold and 4.26-fold is measured, the shortfall being the A
+and B streams, which do not reduce.
+
+**Choosing on the k=64 evidence and carrying it to k=5 would have kept the density and thrown the
+entire traffic win away** -- and it would have looked fully justified, because the k=64 table is
+correct about what it measured. This is the second time today that a measurement agreeing with
+itself was not measuring the regime in question.
+
+`tiled4x4_fma` reaches the low miss count too (14.722) and pays 0.7696 density for it. **`i-k-j`
+is the only variant that gets both.**
+
+### What this hands llywn.3
+
+The redirected lever is now specified exactly rather than by direction: an `i-k-j` sweep over
+dense contiguous rows, NOT a register-tiled micro-kernel, and NOT `k-i-j`. The bit-identical
+no-FMA form (`naive_ikj`, 1.4072 density, 17.067 misses/kFLOP) already takes the whole traffic
+win without touching the `mul_add` contract that closed llywn.3's FMA sub-lever.
+
+### Reproduction and correctness
+
+The k=5 table was reproduced on the final binary after the last source edit -- `naive_kij_fma`
+67.780 and `naive_ikj_fma` 15.928 misses/kFLOP, 4.26-fold, against 67.525/16.031 on the earlier
+build. The executed sha above is that final binary. **No SHA-256 is pinned in the probe's source
+comment**, deliberately: a hash written into a comment is invalidated by the next edit to that
+comment, so it reads as provenance while being stale.
+
+`naive_ikj` is BIT-IDENTICAL to `naive_ijk` and `naive_kij` (verified at every shape, worst abs
+diff 0.000e0) -- for fixed `(i, j)` all three subtract the same terms in the same order, and
+negation distributes exactly through rounding. The `mul_add` variants differ by 1.776e-15.
+Correctness runs in a SEPARATE invocation of the same binary, since the checks would otherwise be
+counted and would contaminate the `setup` floor unequally.
+
+**Concrete retry predicate:** unchanged from `8m8s7` and now better aimed -- count a supernodal
+trailing update built on `naive_ikj` against per-pivot on the cubic cell, to separate
+panel-assembly cost (gather/scatter, symbolic, supernode identification) from kernel cost.
+llywn.2's blocked path measured 4.17-fold worse than per-pivot, but it used neither this loop
+order nor this data layout, so that figure does not bound the overhead of a correctly shaped one.
