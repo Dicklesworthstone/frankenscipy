@@ -4048,8 +4048,17 @@ impl NativeSparseLu {
         // its blocks before it starts; a right-looking elimination cannot discover them
         // as it goes, because row k+1 is not final when pivot k is chosen.
         let initial: Vec<Vec<u32>> = rows.iter().map(|row| row.live_cols().to_vec()).collect();
-        let (_u_pattern, l_pattern) = symbolic_fill_pattern(n, &initial);
-        let widths = supernode_widths_from_symbolic(n, &l_pattern, tolerance);
+        // THE PLAN COMES FROM THE TREE, NOT THE PATTERN. `symbolic_fill_pattern` measures
+        // O(n^2.19) and 15.35x a factorization; it was the whole of this path's 6.24x deficit on
+        // RCM and the reason it never finished on AMD. The elimination tree is 0.039x and the
+        // column counts are O(|L|), and the pattern was only ever used for `widths`.
+        let perm_for_tree: Vec<usize> = match &fill_perm {
+            Some(p) => p.clone(),
+            None => (0..n).collect(),
+        };
+        let parent = elimination_tree_of_permuted(a, &perm_for_tree);
+        let (counts, _l_total) = l_column_counts_from_etree(a, &perm_for_tree, &parent);
+        let widths = supernode_widths_from_etree(n, &parent, &counts, tolerance);
         if widths.iter().all(|&w| w <= 1) {
             return None;
         }
@@ -10777,6 +10786,50 @@ fn postorder_forest(parent: &[usize]) -> Vec<usize> {
 /// rather than to the pattern it avoids materialising.
 ///
 /// Returns `(column_counts, total)` where `total` is the L nonzero count including the diagonal.
+/// Supernode widths from the elimination tree and column counts, with no fill pattern.
+///
+/// THE SWAP THAT UNBLOCKS THE SUPERNODAL PATH. `supernode_widths_from_symbolic` needs
+/// `symbolic_fill_pattern`, measured at O(n^2.19) and 15.35x a factorization -- which is the
+/// entire reason `factorize_csr_supernodal` runs 6.24x slower than the general path on RCM and
+/// does not finish at all on AMD. The pattern was only ever used to compute these widths.
+///
+/// Columns `j` and `j+1` are in the same FUNDAMENTAL supernode when `parent[j] == j + 1` and
+/// `count[j] == count[j + 1] + 1`: the parent relation makes them adjacent in the tree, and the
+/// count relation says `j`'s column pattern is `j+1`'s plus its own diagonal, i.e. they share
+/// their below-diagonal structure.
+///
+/// `tolerance` relaxes the count equality the way SuperLU relaxes pattern equality -- merging
+/// columns that ALMOST match and padding with explicit zeros, trading a little wasted arithmetic
+/// for wider blocks. It is an APPROXIMATION of the pattern-based rule, not a reproduction of it:
+/// equal counts do not prove equal patterns. That is sound here because a supernode partition is
+/// a BLOCKING decision, and a wrong merge costs arithmetic on zeros rather than a wrong answer --
+/// but it is why the numeric path must not assume the blocks are exact.
+fn supernode_widths_from_etree(
+    n: usize,
+    parent: &[usize],
+    counts: &[u32],
+    tolerance: usize,
+) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut widths = Vec::new();
+    let mut run = 1usize;
+    for j in 0..n - 1 {
+        let adjacent = parent[j] == j + 1;
+        let expected = i64::from(counts[j + 1]) + 1;
+        let slack = (i64::from(counts[j]) - expected).unsigned_abs() as usize;
+        if adjacent && slack <= tolerance {
+            run += 1;
+        } else {
+            widths.push(run);
+            run = 1;
+        }
+    }
+    widths.push(run);
+    widths
+}
+
 #[allow(dead_code)] // supernodal precondition; no numeric path consumes it yet
 fn l_column_counts_from_etree(a: &CsrMatrix, perm: &[usize], parent: &[usize]) -> (Vec<u32>, u64) {
     let n = perm.len();
