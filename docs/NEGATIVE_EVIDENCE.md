@@ -40302,3 +40302,79 @@ question about the algorithm, and it is the first time this bead has had one.
   AMD and exact minimum degree all measured, RCM wins) and the four alternative arms are closed.
   **The honest campaign statement for llywn is "needs a BLAS-3-class panel kernel in safe Rust",
   with 1.46x as the prize and 2.85x/5.29x as the shape of it.**
+
+## 2026-08-26 - BlackThrush (cc) - the structural fast paths no longer key off which enum variant is the default: flipping the default now leaves ZERO dispatch failures, only assertions that pin the default itself
+
+- **Result class: BEHAVIORAL.** No timing was taken and **no speed figure is claimed or restated
+  here** -- the two ratios this reasoning rests on are in the 2026-08-25 and 2026-08-26 rows above
+  and are referenced, not repeated. What this records is which code paths dispatch under which
+  requested ordering. Filed onward as `frankenscipy-run7d.1`.
+
+- **probe: `cargo test -p fsci-sparse --lib --release`**, re-runnable, with the three `Default`
+  impls edited to `Amd` and then reverted; plus the new
+  `structural_fast_paths_follow_unnamed_orderings_not_the_default_variant`. `same_host=thinkstation1`,
+  run locally on worker `thinkstation1` (no rch worker admitted this session: every candidate
+  reported `os_gate_excluded=1 required_os=none`, so `build_route=local-wrapper-bypass`).
+  `physical_cores=32`, `logical_threads=64`, `numa_count=1`, `runtime_isa=avx2+fma`.
+
+- **THE DEFECT.** Five structural fast paths -- cubic-spectral factor and solve, periodic-cuboid
+  spectral solve, SPD banded Cholesky, wide-bandwidth CG -- each tested
+  `options.ordering == PermutationOrdering::Colamd` directly. That equality stood in for "the
+  caller did not name an ordering, so we may ignore orderings altogether": every such route
+  returns `ordering_used = Natural`, and one call site binds the test to a local literally named
+  `spectral_defaults`. **Using the DEFAULT VALUE as the proxy for "unspecified" makes the set of
+  live recognisers depend on which enum variant happens to be the default.**
+
+- **OBSERVED VALUES, before and after.** Same probe both times.
+
+    | | flipping the default to `Amd` |
+    |---|---|
+    | before (2026-08-25 row) | **11 failures**, of which 8 were DISPATCH assertions |
+    | after (this change) | **8 failures**, of which **0 are dispatch assertions** |
+
+  The four previously-failing banded and CG dispatch tests now pass under `Amd`. Every remaining
+  failure pins the default value itself: three `*_options_default_matches_contract` tests, and
+  four control arms asserting `ordering_used == ReverseCuthillMcKee` -- one of which reports
+  exactly `left: Amd, right: ReverseCuthillMcKee`. The probe was reverted; **no default changed.**
+
+- **THE REPLACEMENT, and what it deliberately does NOT do.**
+  `ordering_permits_structural_substitution` is true for `Colamd` and `Amd` only. Both are
+  requests for GOOD FILL rather than for a named elimination sequence, and a route that skips the
+  general LU entirely serves that purpose better than any ordering could. `Natural`,
+  `ReverseCuthillMcKee`, `MmdAta` and `MmdAtPlusA` name a specific algorithm the caller asked for
+  by name and are excluded: replacing an explicitly requested elimination order with a spectral
+  solve is a different decision, and this predicate does not make it. Pinned by
+  `structural_fast_paths_follow_unnamed_orderings_not_the_default_variant` on BOTH arms -- a
+  predicate returning true for everything would pass the "still fires" half while doing exactly
+  that substitution -- and every arm checks the residual too, because a fast path that dispatches
+  and returns the wrong answer is worse than one that never fires.
+
+- **AND THE DEFAULT IS STILL NOT FLIPPED, on evidence rather than caution.** There are exactly two
+  general-LU cells measured and they disagree: AMD is the better arm on run7d's convection cell
+  and the worse arm on llywn's cubic cell -- the latter while holding strictly LESS fill, which is
+  what refutes fill as the predictor. Both figures live in the dated rows above and are not
+  repeated here. Two disagreeing cells do not justify a library-wide default. `run7d.1` carries the sweep that
+  would settle it, including the must-miss shapes (banded, tridiagonal) without which a sweep
+  reports that AMD always wins.
+
+- **TWO TEST-REGISTRATION DEFECTS, both the same shape, and one was mine.** A `#[test]` separated
+  from its function compiles fine and the compiler reports it only as "function is never used":
+  * `laplacian_handles_empty_and_isolated_graphs` had lost its attribute and had been dead code,
+    warned about on every build of this crate. Restored, not deleted: it passes.
+  * I introduced the identical fault in this change by inserting a test between the previous
+    test's `#[test]` and its `fn`. That registered mine TWICE and silently dropped
+    `periodic_cuboid_recognizer_reach_is_pinned_on_both_arms` from the suite. Caught only because
+    `cargo test -- --list` printed one definition as two entries. Both restored.
+  **The suite total is the tell and it is worth checking after any test insertion:** 584 -> 586.
+
+- **A TEST-ISOLATION DEFECT, recorded not fixed.** The new test passed alone and failed in the
+  full suite, reproducing at `--test-threads=1`, i.e. leftover toggle state from an earlier test
+  rather than a race. It now resets both cubic-spectral toggles rather than only the one it reads.
+  Other tests in this family likely share the fault; the suite passes at `--test-threads=1` and
+  concurrently, so nothing is currently masked, but the ordering dependence is real.
+
+- **Concrete retry predicate:** `frankenscipy-run7d.1` -- sweep RCM against AMD counting
+  INSTRUCTIONS (fill is refuted; `perf stat -e instructions` is load-independent and native-speed)
+  across shapes that genuinely reach the general LU, must-miss shapes included, then look for a
+  predicate over pre-factorization quantities. If none separates the classes, the honest answer is
+  that AMD stays opt-in and run7d's gain is not reachable by default -- which is also a result.
