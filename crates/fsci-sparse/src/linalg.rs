@@ -19156,6 +19156,50 @@ mod tests {
         }
     }
 
+    /// HOW EXPENSIVE IS THE ELIMINATION TREE compared to the full symbolic pass it could replace?
+    ///
+    /// The only remaining lever on run7d's cell is a fill-reducing ordering plus a scatter-tolerant
+    /// kernel -- the supernodal path -- and `frankenscipy-4m90a` priced that behind
+    /// `symbolic_fill_pattern` at O(n^2.265) against a factorization at O(n^1.653). That pass
+    /// computes the whole fill PATTERN. A supernodal plan needs far less: the elimination tree and
+    /// per-column fill COUNTS, both of which are O(nnz*alpha).
+    ///
+    /// `elimination_tree_of_permuted` already exists here, built for the postordering experiment.
+    /// If it is as cheap as theory says, the blocked precondition is half-built and the block is
+    /// smaller than 4m90a's number implies. If it is not, the block stands as recorded.
+    ///
+    /// Select the arm with `FSCI_SYMBOLIC_ARM=etree|pattern` and count instructions.
+    #[test]
+    #[ignore = "A/B arm: FSCI_SYMBOLIC_ARM=etree|pattern under perf stat"]
+    fn ab_etree_versus_full_symbolic() {
+        let side: usize = std::env::var("FSCI_SYMBOLIC_SIDE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let matrix = splu_dirichlet_laplacian_3d(side);
+        let n = matrix.shape().rows;
+        let perm = reverse_cuthill_mckee(&matrix);
+        let etree_arm = std::env::var("FSCI_SYMBOLIC_ARM").ok().as_deref() == Some("etree");
+        let mut checksum = 0usize;
+        for _ in 0..5 {
+            if etree_arm {
+                let parent = elimination_tree_of_permuted(&matrix, &perm);
+                checksum += parent.iter().filter(|&&p| p != n).count();
+            } else {
+                let rows = permuted_sorted_rows(&matrix, &perm);
+                let initial: Vec<Vec<u32>> =
+                    rows.iter().map(|row| row.live_cols().to_vec()).collect();
+                let (upper, lower) = symbolic_fill_pattern(n, &initial);
+                checksum += upper.iter().map(Vec::len).sum::<usize>()
+                    + lower.iter().map(Vec::len).sum::<usize>();
+            }
+        }
+        println!(
+            "AB_SYMBOLIC arm={} side={side} n={n} checksum={checksum}",
+            if etree_arm { "etree" } else { "pattern" }
+        );
+    }
+
     #[test]
     fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
         // MEASURES THE GENERAL ELIMINATION, so the banded path must not intercept it. Since
