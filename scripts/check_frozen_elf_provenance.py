@@ -29,6 +29,7 @@ Exit 0 if every citation either resolves locally or carries exactly one host; 1 
 
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
 import re
@@ -56,43 +57,69 @@ WORKERS = [
 DOC_CONTEXT_LINES = 40
 
 
-def sources():
-    """Yield (origin, text) where `text` is the record a citation should be attributed by.
+def citation_context(text: str, match: re.Match[str]) -> str:
+    """Return the line window that can attribute one frozen-ELF citation."""
+    lines = text.splitlines()
+    line_index = text[: match.start()].count("\n")
+    lo = max(0, line_index - DOC_CONTEXT_LINES)
+    hi = min(len(lines), line_index + DOC_CONTEXT_LINES + 1)
+    return "\n".join(lines[lo:hi])
 
-    Bead records are naturally scoped -- one JSON object per issue -- so the whole record is
-    the right unit. A long markdown ledger is not: scoping to the file would attribute a
-    citation to every host mentioned anywhere in it, so each citation there gets its own
-    windowed excerpt instead.
+
+def contexts_from_text(origin: str, text: str):
+    """Yield one (origin, path, context) tuple for every citation in one record field."""
+    for match in FROZEN.finditer(text):
+        yield origin, match.group(), citation_context(text, match)
+
+
+def parse_issue_record(line: str) -> dict[str, object] | None:
+    """Parse one durable Beads record without abandoning the whole audit on bad data."""
+    try:
+        return json.JSONDecoder().decode(line)
+    except json.JSONDecodeError as error:
+        print(f"Skipping malformed Beads record: {error}", file=sys.stderr)
+        return None
+
+
+def sources():
+    """Yield citation-local (origin, path, context) tuples.
+
+    A whole Bead JSON object is not a provenance record: its description, notes, and every
+    historical comment can name unrelated workers. Attribute a path only from its own field's
+    local window. Markdown ledgers follow the same rule, one window per matching line.
     """
     beads = ROOT / ".beads" / "issues.jsonl"
     if beads.is_file():
         for line in beads.read_text(errors="replace").splitlines():
-            try:
-                obj = json.loads(line)
-            except Exception:
+            obj = parse_issue_record(line)
+            if obj is None:
                 continue
-            yield obj.get("id", "<bead>"), json.dumps(obj)
+            bead_id = str(obj.get("id", "<bead>"))
+            for field in ("description", "notes", "close_reason"):
+                text = obj.get(field)
+                if isinstance(text, str):
+                    yield from contexts_from_text(f"{bead_id}:{field}", text)
+            for comment in obj.get("comments", []):
+                if not isinstance(comment, dict):
+                    continue
+                text = comment.get("text")
+                if isinstance(text, str):
+                    comment_id = comment.get("id", "<comment>")
+                    yield from contexts_from_text(f"{bead_id}:comment-{comment_id}", text)
     for doc in sorted((ROOT / "docs").glob("*.md")):
         lines = doc.read_text(errors="replace").splitlines()
         for index, line in enumerate(lines):
-            if not FROZEN.search(line):
-                continue
-            lo = max(0, index - DOC_CONTEXT_LINES)
-            hi = min(len(lines), index + DOC_CONTEXT_LINES + 1)
-            yield f"{doc.name}:{index + 1}", "\n".join(lines[lo:hi])
+            for match in FROZEN.finditer(line):
+                lo = max(0, index - DOC_CONTEXT_LINES)
+                hi = min(len(lines), index + DOC_CONTEXT_LINES + 1)
+                yield f"{doc.name}:{index + 1}", match.group(), "\n".join(lines[lo:hi])
 
 
 def main() -> int:
-    seen: set[tuple[str, str]] = set()
     rows = []
-    for origin, blob in sources():
-        for path in sorted(set(FROZEN.findall(blob))):
-            key = (origin, path)
-            if key in seen:
-                continue
-            seen.add(key)
-            hosts = sorted({w for w in WORKERS if w in blob})
-            rows.append((origin, path, pathlib.Path(path).exists(), hosts))
+    for origin, path, context in sources():
+        hosts = sorted({worker for worker in WORKERS if worker in context})
+        rows.append((origin, path, pathlib.Path(path).exists(), hosts))
 
     if not rows:
         print("no frozen-ELF citations found")
@@ -105,7 +132,7 @@ def main() -> int:
         label = ",".join(hosts) if hosts else "-- NONE --"
         if len(hosts) > 1:
             label += "  (AMBIGUOUS)"
-        print(f"{origin:<24} {name:<48} {str(exists):<7} {label}")
+        print(f"{origin:<24} {name:<48} {exists!s:<7} {label}")
         if not exists and len(hosts) != 1:
             unresolved_unattributed.append((origin, name, hosts))
 
@@ -127,5 +154,41 @@ def main() -> int:
     return 0
 
 
+def cmd_self_test() -> int:
+    artifact = "/data/tmp/cargo-target/frozen/perf_fixture-01234567"
+    distant_host_record = "\n".join(
+        [f"artifact={artifact} built on hz1"]
+        + [f"unrelated line {number}" for number in range(DOC_CONTEXT_LINES + 1)]
+        + ["old unrelated run used ovh-a"]
+    )
+    match = FROZEN.search(distant_host_record)
+    if match is None:
+        print("self-test FAILED: fixture has no frozen-ELF path", file=sys.stderr)
+        return 1
+    local_hosts = sorted({worker for worker in WORKERS if worker in citation_context(distant_host_record, match)})
+    whole_record_hosts = sorted({worker for worker in WORKERS if worker in distant_host_record})
+    if local_hosts != ["hz1"] or whole_record_hosts != ["hz1", "ovh-a"]:
+        print("self-test FAILED: distant host contaminated citation context", file=sys.stderr)
+        return 1
+
+    ambiguous_record = f"artifact={artifact} built by hz1, later executed on ovh-a"
+    ambiguous_match = FROZEN.search(ambiguous_record)
+    if ambiguous_match is None:
+        print("self-test FAILED: ambiguous fixture has no frozen-ELF path", file=sys.stderr)
+        return 1
+    ambiguous_hosts = sorted(
+        {worker for worker in WORKERS if worker in citation_context(ambiguous_record, ambiguous_match)}
+    )
+    if ambiguous_hosts != ["hz1", "ovh-a"]:
+        print("self-test FAILED: nearby multiple hosts were not ambiguous", file=sys.stderr)
+        return 1
+
+    print("frozen-ELF provenance self-test: PASS (2 attribution-boundary checks)")
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true", help="run deterministic attribution-boundary checks")
+    args = parser.parse_args()
+    raise SystemExit(cmd_self_test() if args.self_test else main())
