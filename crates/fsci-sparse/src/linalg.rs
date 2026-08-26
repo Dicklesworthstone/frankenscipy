@@ -1724,7 +1724,36 @@ fn matched_run_length(left: &[u32], right: &[u32]) -> usize {
 /// Split out of `matched_run_length` so it can be invoked twice by the measurement arm.
 /// The shipping path calls it exactly once and it inlines as before.
 fn scan_matched_prefix(left: &[u32], right: &[u32], bound: usize) -> usize {
-    const BLOCK: usize = 8;
+    // BLOCK IS SIZED FOR WHERE THE DIVERGENCE ACTUALLY IS, WHICH IS THE END.
+    //
+    // The block width trades per-block loop overhead against early-exit granularity: a
+    // narrow block abandons the scan sooner when the two column lists diverge early. That
+    // is the right trade only if they DO diverge early, and on the cell where we lose they
+    // do not. `prefix_skip_payoff_on_the_loss_peak` measures the skipped fraction at
+    // 0.9726 / 0.9884 / 0.9936 for side 8 / 12 / 16 -- at the loss peak the scan reads
+    // ~160 columns and finds ~159.5 of them equal, so it runs to completion almost every
+    // time and the fine early exit is paying for an escape it never takes.
+    //
+    // Widening it is therefore close to free on the exit side and halves the per-block
+    // overhead. Measured under callgrind on that cell (`perf_spsolve
+    // --profile-cubic-splu-rust 1 16 1`, `FSCI_SPLU_ORDERING=rcm`, n=4096):
+    //
+    //     BLOCK   whole-factorization Ir   matched_run_length Ir
+    //         8        1,150,100,616            218,376,750
+    //        16        1,122,264,465            190,540,538   <- best
+    //        32        1,146,602,641            214,878,686
+    //        64        1,241,358,346                       -
+    //
+    // 16 takes 27,836,151 Ir off the factorization (2.42%) and 12.75% off the comparison
+    // itself. It is an interior optimum, not a bigger-is-better knob: 32 gives most of it
+    // back and 64 is worse than shipping, because once the block exceeds the run length the
+    // remainder loop does the work instead and the vector compare is wasted.
+    //
+    // BIT-IDENTICAL BY CONSTRUCTION, not by tolerance: the returned span is the common
+    // prefix length regardless of block width -- the trailing `take_while` finishes whatever
+    // the blocked loop did not consume -- so this cannot change a factor value.
+    // `scan_matched_prefix_indexed` is the kept reference the equality tests hold it to.
+    const BLOCK: usize = 16;
     // SLICE ONCE, THEN NEVER INDEX. The previous form wrote `left[span + offset]` inside
     // the inner loop, so every element carried its own bounds check against a length the
     // optimizer could not relate to `bound`. Measured on the two-arm totals A/B, one
