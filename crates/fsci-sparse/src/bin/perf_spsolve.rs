@@ -25,7 +25,8 @@ use fsci_sparse::spsolve_triangular;
 // FSCI_DISABLE_STRUCTURAL_FASTPATHS is set. Gated to match that single use site.
 #[cfg(feature = "sparse-incumbent-bench")]
 use fsci_sparse::linalg::{
-    SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_SUPERNODAL_ENABLE, SPLU_SUPERNODAL_FACTOR_HITS,
+    SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_RESERVE_FROM_SYMBOLIC_ENABLE,
+    SPLU_RESERVE_FROM_SYMBOLIC_FACTOR_HITS, SPLU_SUPERNODAL_ENABLE, SPLU_SUPERNODAL_FACTOR_HITS,
     SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
 };
 use nalgebra::{DMatrix, DVector};
@@ -968,6 +969,32 @@ fn apply_supernodal_env() {
     }
 }
 
+/// `FSCI_SPLU_RESERVE_SYMBOLIC=1` reserves each row's predicted final capacity before the
+/// elimination starts.
+///
+/// WHY A PROFILE NEEDS TO REACH THIS. The loss cell is LATENCY-bound, not instruction-bound:
+/// removing 4.21% of its instructions moved cycles by +0.36% and IPC by the same -4.5%, so the
+/// remaining question is where its ~190M L1 D-cache load misses come from. One candidate is row
+/// SCATTERING -- `frankenscipy-u7biq` measured rows 93.9% adjacent as built and 8.4% adjacent
+/// after eliminating, because rows that outgrow their allocation get moved.
+///
+/// `reserve_rows_from_symbolic_pattern` is the exact fix for that and already exists, but it is
+/// gated behind `symbolic_fill_pattern`, which `frankenscipy-4m90a` measured at O(n^2.265) against
+/// a factorization at O(n^1.653) -- far too expensive to ship. That does NOT make it useless as a
+/// measurement: turning it on prices the CEILING of perfect reservation on the miss count, and
+/// that ceiling decides whether a cheap capacity heuristic is worth building at all.
+///
+/// So this switch exists to answer a question, not to ship a configuration. Off by default.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn apply_reserve_symbolic_env() {
+    if matches!(
+        std::env::var("FSCI_SPLU_RESERVE_SYMBOLIC").ok().as_deref(),
+        Some("1") | Some("true")
+    ) {
+        SPLU_RESERVE_FROM_SYMBOLIC_ENABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Did the supernodal arm actually run, or did it plan-and-decline? Printed by the profiles that
 /// can reach it, so the switch cannot read as inert when it merely fell through.
 #[cfg(feature = "sparse-incumbent-bench")]
@@ -977,7 +1004,12 @@ fn supernodal_arm_status() -> String {
         Some("1") | Some("true")
     );
     let hits = SPLU_SUPERNODAL_FACTOR_HITS.load(std::sync::atomic::Ordering::Relaxed);
-    format!("supernodal_requested={requested} supernodal_factor_hits={hits}")
+    let reserve_hits =
+        SPLU_RESERVE_FROM_SYMBOLIC_FACTOR_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "supernodal_requested={requested} supernodal_factor_hits={hits} \
+         reserve_symbolic_factor_hits={reserve_hits}"
+    )
 }
 
 /// Ordering for the fsci-only splu profiles (convection and cubic).
@@ -989,6 +1021,7 @@ fn supernodal_arm_status() -> String {
 fn splu_profile_options() -> LuOptions {
     apply_structural_fastpath_env();
     apply_supernodal_env();
+    apply_reserve_symbolic_env();
     let ordering = match std::env::var("FSCI_SPLU_ORDERING").ok().as_deref() {
         None | Some("") | Some("default") => LuOptions::default().ordering,
         Some("colamd") => PermutationOrdering::Colamd,
