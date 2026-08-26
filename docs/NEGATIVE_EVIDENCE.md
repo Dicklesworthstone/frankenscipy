@@ -39688,6 +39688,7 @@ question about the algorithm, and it is the first time this bead has had one.
   elimination are the two standard ingredients deliberately left out, and callgrind should
   be re-run before assuming they are where the remainder is -- the last two profiles both
   refuted the guess that preceded them.
+<<<<<<< HEAD
 
 ## 2026-08-25 - BlackThrush (cc) - CORRECTION to the row above: making AMD the default is NOT "one line", it silently disables four specialized fast paths
 
