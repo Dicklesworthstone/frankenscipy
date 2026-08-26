@@ -34857,4 +34857,196 @@ mod jyfke_trailing_trim_is_exact {
             "real zeros gained an imaginary part"
         );
     }
+
+    /// SciPy parity for four `scipy.signal` entry points with no differential coverage
+    /// (frankenscipy-ivxx6): `convolve2d`, `check_COLA`, `check_NOLA`, `cont2discrete`.
+    ///
+    /// FIXTURE CHOICES, since a naive version of this test proves very little:
+    ///   * the kernel is NON-SYMMETRIC and the image non-square. A symmetric kernel hides
+    ///     transposition and reflection errors, which is the commonest way a 2-D convolution
+    ///     diverges -- convolution reflects the kernel where correlation does not.
+    ///   * every `mode` and every `boundary` is swept: once the interior agrees, the edge
+    ///     treatment is the only place left for the two to differ.
+    ///   * `check_COLA`/`check_NOLA` are probed at hops that produce BOTH answers. A predicate
+    ///     tested only where it returns true is indistinguishable from one that always does.
+    ///
+    /// Measured against SciPy 1.17.1: all 18 groups agree, worst 5.551e-16.
+    #[test]
+    fn convolve2d_cola_nola_cont2discrete_against_scipy_1_17_1() {
+        use super::{
+            Boundary2d, ConvolveMode, check_COLA, check_NOLA, cont2discrete, convolve2d,
+            convolve2d_with_boundary,
+        };
+
+        fn close(name: &str, got: &[f64], want: &[f64]) {
+            assert_eq!(got.len(), want.len(), "{name}: length");
+            for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-12,
+                    "{name}[{i}]: got {a:.17e}, SciPy 1.17.1 gives {b:.17e}"
+                );
+            }
+        }
+
+        #[rustfmt::skip]
+        let a: Vec<f64> = vec![
+            1.0, 2.0, 3.0, 4.0, 5.0,
+            6.0, 7.0, 8.0, 9.0, 1.0,
+            2.0, 4.0, 6.0, 8.0, 3.0,
+            5.0, 7.0, 9.0, 2.0, 4.0,
+        ];
+        let a_shape = (4usize, 5usize);
+        let v: Vec<f64> = vec![1.0, -2.0, 3.0, 0.5, -1.5, 2.5];
+        let v_shape = (3usize, 2usize);
+
+        close(
+            "convolve2d/full",
+            &convolve2d(&a, a_shape, &v, v_shape, ConvolveMode::Full).unwrap(),
+            &[
+                1.0, 0.0, -1.0, -2.0, -3.0, -10.0, 9.0, 1.5, 4.0, 6.5, 0.0, 0.5, 18.5, 23.5, 26.0,
+                28.5, -3.0, 7.0, 2.0, 14.5, 20.5, 17.5, 34.0, -4.0, 12.0, 22.5, 31.5, 13.5, 28.5,
+                9.5, -7.5, 2.0, 4.0, 19.5, -1.0, 10.0,
+            ],
+        );
+        close(
+            "convolve2d/same",
+            &convolve2d(&a, a_shape, &v, v_shape, ConvolveMode::Same).unwrap(),
+            &[
+                9.0, 1.5, 4.0, 6.5, 0.0, 18.5, 23.5, 26.0, 28.5, -3.0, 2.0, 14.5, 20.5, 17.5, 34.0,
+                12.0, 22.5, 31.5, 13.5, 28.5,
+            ],
+        );
+        close(
+            "convolve2d/valid",
+            &convolve2d(&a, a_shape, &v, v_shape, ConvolveMode::Valid).unwrap(),
+            &[23.5, 26.0, 28.5, -3.0, 14.5, 20.5, 17.5, 34.0],
+        );
+
+        for (bname, boundary, want) in [
+            (
+                "fill",
+                Boundary2d::Fill,
+                vec![
+                    9.0, 1.5, 4.0, 6.5, 0.0, 18.5, 23.5, 26.0, 28.5, -3.0, 2.0, 14.5, 20.5, 17.5,
+                    34.0, 12.0, 22.5, 31.5, 13.5, 28.5,
+                ],
+            ),
+            (
+                "wrap",
+                Boundary2d::Wrap,
+                vec![
+                    12.0, 3.5, 8.0, 26.0, -1.0, 25.5, 23.5, 26.0, 28.5, -3.0, -2.0, 14.5, 20.5,
+                    17.5, 34.0, 12.5, 22.5, 30.5, 11.5, 25.5,
+                ],
+            ),
+            (
+                "symm",
+                Boundary2d::Symm,
+                vec![
+                    -1.5, 1.0, 4.5, 8.0, 2.5, 20.0, 23.5, 26.0, 28.5, -3.0, 8.0, 14.5, 20.5, 17.5,
+                    34.0, 14.5, 19.5, 26.5, -2.5, 28.5,
+                ],
+            ),
+        ] {
+            let got = convolve2d_with_boundary(
+                &a,
+                a_shape,
+                &v,
+                v_shape,
+                ConvolveMode::Same,
+                boundary,
+                0.0,
+            )
+            .unwrap();
+            close(&format!("convolve2d/same/{bname}"), &got, &want);
+        }
+
+        // COLA/NOLA, both answers present. The Hann window satisfies COLA at 50% overlap and
+        // not at the awkward hops, which is what makes this a two-armed check.
+        let n = 16usize;
+        let hann: Vec<f64> = (0..n)
+            .map(|i| (std::f64::consts::PI * i as f64 / n as f64).sin().powi(2))
+            .collect();
+        let boxcar: Vec<f64> = vec![1.0; n];
+        let want_cola = [0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+        let want_nola = [0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let mut k = 0usize;
+        for w in [&hann, &boxcar] {
+            for noverlap in [0usize, 4, 8, 12, 13] {
+                let c = match check_COLA(w, n, noverlap) {
+                    Ok(true) => 1.0,
+                    Ok(false) => 0.0,
+                    Err(_) => -1.0,
+                };
+                let nl = match check_NOLA(w, n, noverlap) {
+                    Ok(true) => 1.0,
+                    Ok(false) => 0.0,
+                    Err(_) => -1.0,
+                };
+                assert_eq!(c, want_cola[k], "check_COLA case {k} (noverlap={noverlap})");
+                assert_eq!(
+                    nl, want_nola[k],
+                    "check_NOLA case {k} (noverlap={noverlap})"
+                );
+                k += 1;
+            }
+        }
+        assert!(
+            want_cola.iter().any(|&x| x == 1.0) && want_cola.iter().any(|&x| x == 0.0),
+            "the COLA fixture must contain BOTH answers or it pins nothing"
+        );
+
+        // cont2discrete across every discretisation method, including gbt with an explicit alpha.
+        let num = vec![1.0];
+        let den = vec![1.0, 0.7, 1.0];
+        for (method, wn, wd) in [
+            (
+                "zoh",
+                vec![0.0, 0.004881296079795039, 0.004768684632352249],
+                vec![1.0, -1.9227438391938008, 0.9323938199059479],
+            ),
+            (
+                "bilinear",
+                vec![
+                    0.002409638554216831,
+                    0.004819277108433884,
+                    0.002409638554216831,
+                ],
+                vec![1.0, -1.92289156626506, 0.9325301204819275],
+            ),
+            (
+                "euler",
+                vec![0.0, 2.220446049250313e-16, 0.009999999999999787],
+                vec![1.0, -1.9300000000000002, 0.9400000000000002],
+            ),
+            (
+                "backward_diff",
+                vec![
+                    0.0092592592592593,
+                    -2.220446049250313e-16,
+                    1.1102230246251565e-16,
+                ],
+                vec![1.0, -1.9166666666666665, 0.9259259259259258],
+            ),
+        ] {
+            let (nd, dd) = cont2discrete(&num, &den, 0.1, method, None).unwrap();
+            close(&format!("cont2discrete/{method}/num"), &nd, &wn);
+            close(&format!("cont2discrete/{method}/den"), &dd, &wd);
+        }
+        let (nd, dd) = cont2discrete(&num, &den, 0.1, "gbt", Some(0.3)).unwrap();
+        close(
+            "cont2discrete/gbt(0.3)/num",
+            &nd,
+            &[
+                0.0008807123984734266,
+                0.004109991192876139,
+                0.004794989725021792,
+            ],
+        );
+        close(
+            "cont2discrete/gbt(0.3)/den",
+            &dd,
+            &[1.0, -1.925628730795577, 0.9354144241119485],
+        );
+    }
 }
