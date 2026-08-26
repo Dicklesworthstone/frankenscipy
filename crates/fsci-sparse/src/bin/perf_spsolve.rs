@@ -911,22 +911,19 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
     );
 }
 
-/// Ordering for the fsci-only splu profiles (convection and cubic).
+/// Apply `FSCI_DISABLE_STRUCTURAL_FASTPATHS`, forcing the general sparse LU.
 ///
-/// It used to be hardcoded to `LuOptions::default()` while the live arm read
-/// `FSCI_SPLU_ORDERING`, so the cheap profile and the row it is supposed to pre-cost were
-/// silently measuring different configurations. Reading the same variable is the whole fix.
+/// SEPARATE FROM `splu_profile_options` BECAUSE NOT EVERY PROFILE BUILDS `LuOptions`. The periodic
+/// cuboid profile calls `spsolve` with `SolveOptions::default()` and never touches the ordering
+/// builder, so while this logic lived inside that builder the variable was INERT there: both arms
+/// of a supposed route A/B ran identical code and reported instruction counts within 0.03% of
+/// each other. That is a dead A/B, and it reads as "the route makes no difference" rather than as
+/// a broken switch. Every profile that can reach a structural fast path must call this, and every
+/// such profile prints the backend it actually used so the failure is visible on the row.
+///
+/// Off by default, so every arm runs exactly as it ships unless the variable is set.
 #[cfg(feature = "sparse-incumbent-bench")]
-fn splu_profile_options() -> LuOptions {
-    // FSCI_DISABLE_STRUCTURAL_FASTPATHS forces the general sparse LU.
-    //
-    // Needed to measure an ORDERING at all on a fixture the recognisers claim. Since the fast
-    // paths accept `Amd` as well as `Colamd`, a Dirichlet cubic Laplacian takes the spectral
-    // route under `amd` and the general LU under `rcm`, so the two arms would be different
-    // ALGORITHMS. `perf_splu` already exposes exactly this switch as a CLI argument and asserts
-    // the toggle took effect; this is the same control for the fsci-only profiles.
-    //
-    // Off by default, so every arm runs as it ships unless the variable is set.
+fn apply_structural_fastpath_env() {
     if matches!(
         std::env::var("FSCI_DISABLE_STRUCTURAL_FASTPATHS")
             .ok()
@@ -938,6 +935,16 @@ fn splu_profile_options() -> LuOptions {
         SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(true, AtomicOrdering::Relaxed);
         SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(true, AtomicOrdering::Relaxed);
     }
+}
+
+/// Ordering for the fsci-only splu profiles (convection and cubic).
+///
+/// It used to be hardcoded to `LuOptions::default()` while the live arm read
+/// `FSCI_SPLU_ORDERING`, so the cheap profile and the row it is supposed to pre-cost were
+/// silently measuring different configurations. Reading the same variable is the whole fix.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn splu_profile_options() -> LuOptions {
+    apply_structural_fastpath_env();
     let ordering = match std::env::var("FSCI_SPLU_ORDERING").ok().as_deref() {
         None | Some("") | Some("default") => LuOptions::default().ordering,
         Some("colamd") => PermutationOrdering::Colamd,
@@ -1262,8 +1269,10 @@ fn profile_periodic_cuboid_spsolve_rust(
     let matrix_csc = matrix.to_csc().expect("shifted-periodic cuboid CSC");
     let rhs = cubic_splu_rhs(n, 1);
 
+    apply_structural_fastpath_env();
     let warm =
         spsolve(&matrix, &rhs, SolveOptions::default()).expect("periodic cuboid spsolve warmup");
+    println!("periodic_profile_backend_used={:?}", warm.backend_used);
     let maximum_residual = splu_max_relative_residual(
         &matrix,
         std::slice::from_ref(&rhs),
