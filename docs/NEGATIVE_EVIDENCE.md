@@ -40127,3 +40127,91 @@ question about the algorithm, and it is the first time this bead has had one.
   one counted profile of an arm that already exists, needs no quiet host, and would either
   produce a fixable defect or price the rewrite honestly. Do NOT re-try ordering: RCM, AMD and
   exact minimum degree are all now measured on this cell and RCM wins.
+
+## 2026-08-26 - BlackThrush (cc) - llywn.2 ANSWERED: the supernodal arm's deficit is STRUCTURAL, not a defect -- one real defect found and fixed is worth 5.6%, and the numeric kernel alone is still 4.17x the whole per-pivot path
+
+- **Result class: SELF-SPEEDUP (small) plus a REJECT, both decided by a counted mechanism and by
+  nothing else.** No wall claim is made from these runs: they are under callgrind, whose ~50x
+  instrumentation applies to the fsci arm while the SciPy arm runs in a separate un-instrumented
+  subprocess, so the `Incumbent ratio` those two logs print is meaningless and is **not quoted
+  here or anywhere**. **CV is not computed and would be provenance only.**
+
+- **THE QUESTION, from `frankenscipy-llywn.2`.** The timed row earlier today found the supernodal
+  blocked-update arm 5.77x SLOWER than our own per-pivot elimination on llywn's cubic cell. The
+  bead asked one thing: is that a fixable defect, or the real cost of the blocking strategy as
+  written? It matters because "close llywn's remaining 1.46x with supernodal/BLAS-3 blocking" is
+  the obvious next proposal, and anyone making it finds a supernodal arm already in the tree.
+
+- **probe: `perf_splu 16 9 1 off cubic on off on {on,off}`** under
+  `valgrind --tool=callgrind`, laplacian_3d_cubic side=16, n=4096, nnz=27136. The two arms are
+  proven to be different code by their own counters: `supernodal_factor_hits=38` with
+  `supernodal_toggle_reads=38` on the supernodal arm and `=0` on the per-pivot arm.
+
+- **THE ATTRIBUTION, and it named something nobody had looked at.**
+
+    | | Ir | share |
+    |---|---|---|
+    | per-pivot arm, TOTAL | 20,950,718,926 | -- |
+    | supernodal arm, TOTAL | 219,076,136,559 | 10.5x the per-pivot arm |
+    | ... `symbolic_fill_pattern` | 114,326,082,408 | **52.19%** |
+    | ... `factorize_csr_supernodal` | 87,352,568,058 | 39.87% |
+
+  **`symbolic_fill_pattern` does not appear in the per-pivot profile at all** -- it is exclusive
+  to the supernodal path -- and on its own it costs **5.46x the entire per-pivot factorization it
+  is supposed to be a cheap precursor to.**
+
+- **A REAL DEFECT, found and fixed.** That function merged each row's remaining pattern with the
+  pivot tail into a reusable `merged` scratch buffer and then did `pattern[row] = merged.clone()`
+  -- a malloc, a memcpy of the whole merged pattern, and a free of the row's old buffer, PER
+  ELIMINATION UPDATE, on a buffer that was about to be cleared and reused anyway.
+  `std::mem::swap` does the same work with none of the three:
+
+    | | before | after | |
+    |---|---|---|---|
+    | `symbolic_fill_pattern` | 114,326,082,408 | 106,284,828,612 | **7.0% less** |
+    | supernodal arm total | 219,076,136,559 | 206,808,062,258 | **5.6% less** |
+    | `__memcpy_avx_unaligned_erms` | 3,981,384,379 | 1,890,435,438 | **2.11x less** |
+
+  **Byte-identical output**, which is the check a buffer-management change actually needs:
+  `fsci_lu_payload_bytes=14358064` and `worst_rel_solution_diff=3.908e-15` are the same values
+  before and after. Landed as f6694042e.
+
+- **AND IT DOES NOT RESCUE THE ARM. The answer to llywn.2 is STRUCTURAL.** Set the symbolic pass
+  to zero and the supernodal numeric kernel alone is **87,352,568,058 Ir against the per-pivot
+  arm's entire 20,950,718,926 -- still 4.17x worse.** So the 5.77x is not one bad line; both
+  halves are worse than the path they would replace.
+
+- **WHAT I PREDICTED AND WHAT HAPPENED.** I filed llywn.2 offering two outcomes -- defect, in
+  which case llywn's 1.46x is live again, or structural, in which case the row prices the
+  rewrite. I found a defect, it was real, and it was worth 5.6% against a 5.77x gap. **The
+  defect branch was the one I expected to matter and it did not.** Recording that, because "we
+  found a bug in the slow path" is exactly the shape of result that gets mistaken for progress
+  on the headline number.
+
+- **SO THE PRICE IS NOW HONEST.** Closing llywn's remaining 1.46x by blocking means writing a
+  panel kernel from scratch that beats the per-pivot path's 47.74 ns per LU nonzero; the existing
+  blocked path is 4-6x on the wrong side of that, so it is not a starting point. This is
+  reportable as "needs a BLAS-3-class kernel we do not have, in safe Rust", not as a tuning task.
+
+- **PROVENANCE.** Two named engine artifact SHA-256s, both `target/release/perf_splu`:
+  BEFORE `frankenscipy_engine_sha256=3b6e779049b8284745dd643db0a13da22e4658ddc1229f5f27b0ddeb19d8e501`,
+  AFTER `frankenscipy_engine_sha256=29d3230618b6ab51208da300d44c7c4d740f3c29871a80f7270becf755df520e`.
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`.
+  `same_host=thinkstation1`, run locally on worker `thinkstation1` (no rch worker admitted this
+  session: every candidate reported `os_gate_excluded=1 required_os=none`, so
+  `build_route=local-wrapper-bypass`). `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692255232`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity/cpuset=64`,
+  `CPU frequency governor=powersave`. `build_slot` REFUSED server-side (frankenscipy-fr78g).
+  Instruction counts do not depend on host load, which is why this row exists at all -- the box
+  has held loadavg 20-190 for most of this session.
+
+- **Concrete retry predicate:** do NOT profile the supernodal arm again for tuning; two of its
+  three cost centres are now attributed and the third (`from_factor_rows`, 0.56%) cannot matter.
+  The remaining question on llywn is whether `symbolic_fill_pattern` is even the right ALGORITHM
+  -- it is a right-looking pass that re-merges every row's full pattern at every pivot, where the
+  standard approach (elimination tree plus column counts, or Gilbert-Peierls reach) is
+  near-linear in fill. At 106 G Ir for a 1.196M-entry pattern it is running about 2,300 Ir per
+  fill entry. That is a self-contained rewrite of one function with a byte-identical output
+  contract already pinned by the payload/parity check used above, and it needs no quiet host.
+  But note it only buys back the 52% share: it cannot close the 4.17x in the numeric kernel.
