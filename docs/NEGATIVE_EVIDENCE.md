@@ -41106,3 +41106,91 @@ forward: a single-shot miss figure on this box is worth a repeat before it is wo
 sit in the block-update kernel. 1.69-fold on a kernel that is 20% of the work is 1.14-fold on the
 cell and not worth the packing machinery; on 70% it is 1.40-fold and is. That fraction decides
 whether this configuration is worth building, and it is countable on a loaded host.
+
+## 2026-08-26 - BlackThrush (cc) - llywn's packing lever finally has a DENOMINATOR: the merge is 48-68% of the cubic cell's factorization, so the cell-level ceiling is 1.20-1.38-fold against a 1.46-fold residual
+
+**Result class: BEHAVIORAL.** Bead `frankenscipy-hpx50`, informs `llywn.3`.
+**probe**: `crates/fsci-sparse/src/bin/perf_spsolve.rs --profile-cubic-splu-rust`, under
+`valgrind --tool=callgrind --cache-sim=no --branch-sim=no`, annotated with `callgrind_annotate`.
+**same_host=thinkstation1**, 64 cpu. **harness**: `perf_spsolve` built with
+`--features sparse-incumbent-bench`, executed ELF sha256
+`9ce6a0bfd97545711bd97b32bb4c0755832d1f51991f1181bef57fa5e3de06c1`.
+**Ratios are spelled `N-fold`, not `Nx`: they are ratios of INSTRUCTION COUNTS, never of time.**
+**Callgrind instruction counts are deterministic and load-independent. No timing claim is made.**
+
+**observed:** `laplacian_3d_cubic side=16`, n=4096, nnz=27136, `FSCI_SPLU_ORDERING=rcm`,
+`input_sha256=acc1c86b49d19e02d404ff0b303dcbdb642db28410d73c99234b3ccc7a705b9e`. Per-function
+instruction shares, at 1 repetition (1,150,099,054 Ir) and 3 repetitions (2,267,963,976 Ir):
+
+    function                        1 rep      3 reps
+    apply_sorted_pivot_tail        43.66%      44.28%
+    matched_run_length             18.99%      19.26%
+    NativeSparseLu::factorize_csr  11.23%      11.39%
+    from_factor_rows                5.59%       5.67%
+    __memcpy_avx_unaligned_erms     3.31%          --
+    merge_sorted_remainder          3.01%       3.05%
+    select_sorted_pivot_row         2.73%       2.77%
+    sha2::compress256 (fixture)     2.36%          --
+    NativeSparseLu::solve           1.91%       1.93%
+
+### Why this row exists
+
+`n6mqn` priced packing the panel contiguous at 1.53-to-1.69-fold ON THE KERNEL. **That is a
+numerator with no denominator.** 1.69-fold on 20% of the work is 1.14-fold on the cell and not
+worth the machinery; on 70% it is 1.40-fold and is. I had been reasoning about a lever without
+knowing what fraction of the cell it touches, and so had everyone before me.
+
+### The denominator
+
+`apply_sorted_pivot_tail` applies ONE pivot's tail to ONE target row -- precisely the operation a
+packed k-wide contiguous sweep replaces. With `merge_sorted_remainder` it is **48.27% of the
+factorization**. `matched_run_length` is the run-length compare over column patterns, another
+**19.26%**.
+
+Amdahl, against llywn's 1.46-fold residual:
+
+    replaceable set                          kernel 1.53   kernel 1.69
+    A  value-merge only (48.27%)             1.201-fold    1.245-fold
+    B  value-merge + run-length (67.91%)     1.308-fold    1.384-fold
+
+    A closes 48-58% of the residual; B closes 71-86%.
+
+**This is the first positive quantified ceiling llywn has had.** Every prior structural successor
+was refuted on a counted bound; this one has a number and the number is large enough to matter.
+
+### The two unknowns that set the spread, stated rather than resolved
+
+1. **Does packing absorb the pattern work?** Row A assumes `matched_run_length` survives -- a
+   packed panel still has to know which columns are in it. Row B assumes the supernodal symbolic
+   pass computes the union pattern ONCE per supernode and the per-update compare disappears. The
+   code to decide this already exists (`supernode_widths_from_symbolic`), so this is answerable,
+   not speculative.
+2. **Which kernel baseline?** 1.53-fold is `packed_panel`'s 9.83 Ir/element against the merge's
+   15.00 from the 2026-08-16 closure -- but those are DIFFERENT MEASUREMENT SETUPS, callgrind on
+   real code against `perf stat` on a model. The model's `indexed_scatter` reads 16.57 against
+   that closure's 15.06 for the kernel it mimics, about 10% apart, which is the size of the unit
+   mismatch to expect. 1.69-fold is the same-probe comparison and is internally consistent but
+   compares against the indexed scatter rather than the merge.
+
+### The control, because "1 repetition is conservative" is a claim and not an observation
+
+One-time costs sit at their MAXIMUM share in a 1-rep profile, so the merge share should be
+understated there. Measured rather than assumed: at 3 repetitions `apply_sorted_pivot_tail` rises
+43.66% -> 44.28%, `matched_run_length` 18.99% -> 19.26%, and `sha2::compress256` (fixture hashing)
+plus `memcpy` drop out of the threshold entirely, which is what a one-time cost does. The
+direction is as predicted and the converged shares are the ones used above.
+
+Note the harness runs `repetitions + 1` factorizations: per-function counts go up exactly
+2.0000-fold from 1 rep to 3 reps, which is 4 factorizations against 2, not 3 against 1. Shares are
+unaffected; anyone reading absolute Ir off this row should know it.
+
+### Method note
+
+Attribution is callgrind's own dynamic instrumentation. No `cfg(test)` counters were added to the
+hot path: counters in a hot loop are optimisation BARRIERS and have already inflated one effect
+34-fold in this project, costing three withdrawn rows.
+
+**Concrete retry predicate:** decide unknown (1) by counting a supernodal pass that computes the
+union pattern once per supernode from `supernode_widths_from_symbolic` and reports whether
+`matched_run_length` disappears from the profile. That moves the ceiling from the 1.20-1.38-fold
+range to a single number, and only then is building the packed kernel a decision rather than a bet.
