@@ -40568,3 +40568,122 @@ question about the algorithm, and it is the first time this bead has had one.
   running both symbolic factorizations, which on this cell would itself cost a meaningful fraction
   of one factorization. If it is not, the correct campaign statement is that ordering selection
   stays a caller decision and `FSCI_SPLU_ORDERING` is the whole of the shipped surface.
+
+## 2026-08-26 — frankenscipy-g68jq — cubic periodic spsolve — DECISION=KEEP, and the counted 40.32x prediction is CONFIRMED at 97.588315x wall
+
+Result class: CAMPAIGN-WIN
+Incumbent ratio: SciPy / FrankenSciPy = 97.588315x
+
+    PERIODIC_CUBOID_SPSOLVE_DECISION=KEEP   competitive_claim=PASS
+
+The cubic periodic cell has been waiting on a quiescent window since 2026-08-25; its harness
+enforces `host_mean_busy <= 0.200` and refused roughly thirty attempts across five sessions while
+this box ran a build swarm at loadavg 90-190. This window held: quiescence admitted at both
+phases, post `host_mean_busy_fraction=0.111`, `busiest_unrelated=48:0.889`, `admitted=true`.
+
+| arm | p50 | p95 | p99 | CV |
+|---|---|---|---|---|
+| candidate (spectral, post-widening) | **6.213 ms** | 8.656 ms | 11.496 ms | 18.79% |
+| same-ELF control (general LU = pre-widening) | 500.712 ms | 646.361 ms | 900.526 ms | 17.62% |
+| live SciPy 1.17.1 `spsolve` | 608.540 ms | 660.869 ms | 664.835 ms | 3.39% |
+
+**Competitive ratio: live SciPy / candidate = 97.588315x**, bootstrap median CI95
+[96.040015, 98.549771], registered minimum 1.0.
+Maintenance ratio: control / candidate = **80.6x** — what widening the recogniser bought on this
+cell, fsci against fsci, labelled as the self-speedup it is.
+
+A/A NULLS, all four in the same invocation, `null_medians_within_2pct=true` and
+`all_null_ci95_span_unity=true`:
+
+    candidate           0.999357  [0.991887, 1.003157]
+    control             1.000569  [0.968850, 1.018247]
+    candidate_live_pair 0.999357  [0.991887, 1.003157]
+    live                0.997831  [0.989727, 1.008963]
+
+`maintenance_ci_low_at_least_1_20_and_beyond_2x_null=true`, `competitive_ci_low_beyond_2x_null`
+likewise, `cv_used_for_decision=false` — the decision is taken from the bootstrap-median CIs alone
+and CV above is provenance only.
+
+- **THE ARMS ARE DIFFERENT CODE, PROVEN, not assumed.** `candidate_hits=32 control_hits=0`: all
+  thirty-two independent public `spsolve` calls took the spectral route and the control took none.
+  This is the cell where a dead toggle previously made two arms look identical to within 0.03%, so
+  the counter is the thing that makes the row admissible rather than the ratio.
+
+- **A PREDICTION MADE YESTERDAY AND CONFIRMED TODAY.** The counted row for this cell measured
+  **40.32x fewer instructions** and predicted that the wall ratio would EXCEED it, on the grounds
+  that our dense, cache-friendly spectral route retires more instructions per cycle than SciPy's
+  sparse LU. **Wall is 97.588315x against 40.32x counted — larger by 2.42x, in the predicted
+  direction.** The same holds on the control arm: pre-widening reads **1.215x** of live SciPy in
+  wall against **0.98x** counted, same sign flip, same cause. This is the first time on this crate
+  that a counted bound and its wall row have both been taken on the same cell and the same ELF, and
+  the IPC gap is the whole of the difference between them.
+
+- **AND IT FINISHES OFF THE 124.677x, IN WALL THIS TIME.** `g68jq` and `zdom3` still carry that
+  figure in their bead text. The same-ELF control here IS the pre-widening behaviour for a cubic
+  grid, and it is **1.215x FASTER than live SciPy**, not 124x slower. The widening therefore took
+  this cell from a small win to a large one; it did not close a 124x loss. That is the third and
+  final correction of this figure and it is now measured, not inferred.
+
+- **CONFORMANCE.** `component_mismatches=0`, `component_tolerance=1e-10+1e-10*abs(live)`,
+  `relative_l2=1.379e-13`, candidate `max_relative_residual=2.048e-12`, control `3.118e-12`, live
+  reported and recomputed `1.693e-12`, `input_sha_match=true`, `genuine_scipy=1.17.1`.
+
+Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.spsolve` (`method=spsolve_many`,
+`solver_mod=scipy.sparse.linalg._dsolve.linsolve`), timed side-by-side with the candidate and the
+same-ELF control in the same invocation -- all three arms inside one process, interleaved with
+their A/A nulls; the side-by-side same-invocation raw sample vectors are in the artifact committed
+with this row.
+physical_cores=32 numa_nodes=1 affinity=1
+host-wide-quiescence-pre = clear (host-mean-busy=0.181, limit 0.200, admitted=true)
+host-wide-quiescence-post = clear (host-mean-busy=0.111, limit 0.200, admitted=true)
+frankenscipy-engine-sha256 = 0ea5acbb6cbb8024ce30ba9689aafceaf36f4d9626dea1f92d53e914e94472e8
+scipy-engine-sha256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+harness=crates/fsci-sparse/src/bin/perf_spsolve.rs (mode --periodic-cuboid-spsolve-live)
+same_host=thinkstation1 (LOCAL run, not an rch worker; RCH_WORKER=none, all arms on this host)
+host identity=thinkstation1 physical cores=32 logical threads=64 RAM=231692279808 bytes
+NUMA count=1 requested threads=1 actual observed worker threads=1 (all arms)
+runtime-detected ISA=avx2+fma (avx512f=false) affinity/cpuset=cpu 1 only (SMT siblings 1,33)
+CPU frequency governor=powersave
+host-wide pre-measurement quiescence=0.181 mean busy (pinned 0.051, sibling 0.070) admitted=true
+host-wide post-measurement quiescence=0.111 mean busy (pinned 0.020, sibling 0.020) admitted=true
+iowait=0 loadavg=9.22/32.05/60.70
+
+Engine artifact SHA-256, two distinct named artifacts:
+  executed-binary ELF SHA-256 = 0ea5acbb6cbb8024ce30ba9689aafceaf36f4d9626dea1f92d53e914e94472e8
+    (self-reported in-process; artifact name: target/release/perf_spsolve)
+  SciPy engine SHA-256 = a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388
+    (artifact name: scipy/sparse/linalg/_dsolve/linsolve.py, scipy 1.17.1 / numpy 2.4.3)
+
+A/A NULL AND MARGIN. All four A/A nulls ran in the same invocation and their medians agree within
+2% (`null_medians_within_2pct=true`). The decision applies a **2x A/A-null margin**: the harness
+computed `twice_widest_null_threshold=1.064302` and required both ratios' CI lows to clear it --
+maintenance CI low and competitive CI low (96.040015) both exceed it by a wide margin, and the
+gate flags read `maintenance_ci_low_at_least_1_20_and_beyond_2x_null=true` and
+`competitive_ci_low_beyond_2x_null=true`.
+
+CV IS PROVENANCE ONLY and was not used for the decision: `cv_used_for_decision=false`.
+
+- **PROVENANCE.** `elf_sha256 = frankenscipy_engine_sha256 =`
+  `0ea5acbb6cbb8024ce30ba9689aafceaf36f4d9626dea1f92d53e914e94472e8` — **the same ELF the counted
+  row cites**, so the two rows describe one binary.
+  `source_commit=6f49526ce2617dd2a463d02ac8862585851b88cd`, `builder_identity=BlackThrush`,
+  `build_route=local-wrapper-bypass`.
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.3, `fsci_loaded=False`, `genuine=True`).
+  HARNESS `crates/fsci-sparse/src/bin/perf_spsolve.rs --periodic-cuboid-spsolve-live 21`,
+  `FSCI_PERIODIC_CUBOID_EXTENTS=11x11x11`, fixture shifted anisotropic 7-point periodic cuboid
+  11x11x11, n=1331, nnz=9317, 32 independent solves per round, 21 rounds.
+  `same_host=thinkstation1`, run locally on worker `thinkstation1` (no rch worker admitted this
+  session: every candidate reported `os_gate_excluded=1 required_os=none`).
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `cpu_affinity=1`, `smt_siblings=1,33`, `requested_frankenscipy_threads=1`,
+  `actual_observed_frankenscipy_threads=1`, `requested_scipy_threads=1`,
+  `runtime_isa=avx2+fma`, `CPU frequency governor=powersave`, loadavg 9.2-12.0.
+  `build_slot` REFUSED server-side (frankenscipy-fr78g).
+  Artifact: `tests/artifacts/perf/g68jq-periodic-cubic-11x11x11-live-admissible.log`.
+
+- **Concrete retry predicate:** `g68jq` is now measured and can close. The reusable finding is the
+  one about METHOD: on this crate a counted instruction ratio UNDERSTATES the wall ratio by
+  roughly the IPC gap, measured here at 2.42x on the candidate arm and in the same direction on the
+  control. So a counted bound is a safe LOWER bound on a win and an unsafe one on a loss, and rows
+  that quote instructions where a wall row was refused should say which of those they are.
