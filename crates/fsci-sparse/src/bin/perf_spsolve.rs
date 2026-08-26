@@ -25,7 +25,7 @@ use fsci_sparse::spsolve_triangular;
 // FSCI_DISABLE_STRUCTURAL_FASTPATHS is set. Gated to match that single use site.
 #[cfg(feature = "sparse-incumbent-bench")]
 use fsci_sparse::linalg::{
-    SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_RESERVE_FROM_SYMBOLIC_ENABLE,
+    SPLU_BANDED_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_RESERVE_FROM_SYMBOLIC_ENABLE,
     SPLU_RESERVE_FROM_SYMBOLIC_FACTOR_HITS, SPLU_SUPERNODAL_ENABLE, SPLU_SUPERNODAL_FACTOR_HITS,
     SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
 };
@@ -1006,9 +1006,10 @@ fn supernodal_arm_status() -> String {
     let hits = SPLU_SUPERNODAL_FACTOR_HITS.load(std::sync::atomic::Ordering::Relaxed);
     let reserve_hits =
         SPLU_RESERVE_FROM_SYMBOLIC_FACTOR_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    let banded_hits = SPLU_BANDED_FACTOR_HITS.load(std::sync::atomic::Ordering::Relaxed);
     format!(
         "supernodal_requested={requested} supernodal_factor_hits={hits} \
-         reserve_symbolic_factor_hits={reserve_hits}"
+         reserve_symbolic_factor_hits={reserve_hits} banded_factor_hits={banded_hits}"
     )
 }
 
@@ -2318,6 +2319,13 @@ mod cubic_live {
     }
 
     fn splu_arm_options() -> Result<LuOptions, String> {
+        // The env drivers have to be applied HERE too. They were wired only into
+        // `splu_profile_options`, so `FSCI_SPLU_SUPERNODAL` did nothing on any probe that goes
+        // through this function -- including the convection split, which is exactly where a
+        // supernodal comparison would be run. A second dead toggle on the same probe, found the
+        // same way: the hit counter read zero while the arm claimed to be enabled.
+        super::apply_supernodal_env();
+        super::apply_reserve_symbolic_env();
         Ok(LuOptions {
             ordering: splu_arm_ordering()?,
             ..LuOptions::default()
@@ -3938,6 +3946,10 @@ mod cubic_live {
         // Name the ordering on the row. A probe that silently used the default is exactly what
         // this line exists to make impossible to repeat.
         println!("split_ordering={:?}", splu_arm_options()?.ordering);
+        // Which arms actually RAN. Without this the split probe could report a supernodal or
+        // banded comparison in which neither path ever accepted a factorization -- the same
+        // dead-toggle failure this probe already had once, when it ignored FSCI_SPLU_ORDERING and
+        // reported one configuration under three labels.
         println!("elf_sha256={}", sha256_of_self()?);
         println!(
             "# host={} observed_os_threads={} rounds={rounds} claim=SELF_ATTRIBUTION_ONLY",
@@ -4068,6 +4080,20 @@ mod cubic_live {
         let factor_median = median(factor_ms.clone());
         let solve_median = median(solve_ms.clone());
         let job = factor_median + solve_median;
+        // WHICH ARMS ACTUALLY RAN, read AFTER the timed loop. The first version of this line
+        // printed the counters at the TOP of the probe and read zeros for every arm -- counters
+        // not yet incremented look exactly like a path that never ran, which is precisely the
+        // failure the line exists to prevent. This probe has already shipped one dead toggle
+        // (it ignored FSCI_SPLU_ORDERING and reported one configuration under three labels), so
+        // the arms it claims to compare are named from the counters rather than from the request.
+        println!(
+            "split_arms: supernodal_hits={} banded_hits={} reserve_hits={}",
+            fsci_sparse::linalg::SPLU_SUPERNODAL_FACTOR_HITS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            fsci_sparse::linalg::SPLU_BANDED_FACTOR_HITS.load(std::sync::atomic::Ordering::Relaxed),
+            fsci_sparse::linalg::SPLU_RESERVE_FROM_SYMBOLIC_FACTOR_HITS
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
         println!(
             "split: n={n} rhs_count={SPLU_RHS_COUNT} factor_p50_ms={factor_median:.6} \
              sixteen_solves_p50_ms={solve_median:.6} factor_plus_solves_p50_ms={job:.6} \
