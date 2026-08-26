@@ -15503,4 +15503,85 @@ mod rch_source_freshness_tests {
             SOURCE.len()
         );
     }
+    /// `RbfInterpolator` implements SciPy's NON-DEFAULT `degree=-1` variant, not its default.
+    ///
+    /// This type builds a plain N x N kernel matrix (`phi` is `vec![0.0; n * n]`) with no
+    /// polynomial augmentation. SciPy's `RBFInterpolator` augments the system with a polynomial
+    /// of degree >= 0 for `linear` and >= 1 for `thin_plate_spline`, and those defaults are not
+    /// cosmetic: both kernels are only CONDITIONALLY positive definite, and the tail is what
+    /// makes the system well posed.
+    ///
+    /// The values below came from SciPy 1.17.1 on identical data and are pinned so the gap cannot
+    /// close or widen silently. Data lying exactly on y = 2x + 1, evaluated OUTSIDE the hull --
+    /// a question no kernel-convention difference affects, since SciPy's `linear` is -r where
+    /// this is +r and with no tail that sign only flips the weights:
+    ///
+    /// | query | this type | SciPy `degree=-1` | SciPy DEFAULT |
+    /// |---|---|---|---|
+    /// | f(1.5) | 10.161878 | 10.161878 | 4.0 |
+    /// | f(2) | 10.584389 | 10.584389 | 5.0 |
+    /// | f(3) | -36.696158 | -36.696158 | 7.0 |
+    ///
+    /// So we agree with SciPy to the printed digits on the variant nobody selects, and differ
+    /// qualitatively on the one they get by default. This test exists to make closing that gap a
+    /// deliberate, visible change rather than a silent one.
+    #[test]
+    fn rbf_matches_scipy_degree_minus_one_and_not_scipy_default() {
+        use super::{RbfInterpolator, RbfKernel};
+        let points: Vec<Vec<f64>> = (0..9).map(|i| vec![i as f64 / 8.0]).collect();
+        let values: Vec<f64> = points.iter().map(|p| 2.0 * p[0] + 1.0).collect();
+
+        // MUST-HIT: interpolation is exact AT the nodes for both conditionally-positive-definite
+        // kernels. If this ever fails, the assertions below are measuring a broken solve rather
+        // than a missing polynomial tail.
+        for (name, kernel) in [
+            ("thin_plate_spline", RbfKernel::ThinPlateSpline),
+            ("linear", RbfKernel::Linear),
+        ] {
+            let rbf = RbfInterpolator::new(&points, &values, kernel, 1.0).expect("rbf");
+            let node_error = points
+                .iter()
+                .zip(&values)
+                .map(|(p, &v)| (rbf.eval(p) - v).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                node_error < 1e-12,
+                "{name}: RBF must reproduce its own data, saw {node_error:.3e}"
+            );
+        }
+
+        // THE GAP, pinned against SciPy 1.17.1 on both sides.
+        let tps =
+            RbfInterpolator::new(&points, &values, RbfKernel::ThinPlateSpline, 1.0).expect("tps");
+        for (query, scipy_degree_minus_one, scipy_default) in [
+            (1.5_f64, 10.161878_f64, 4.0_f64),
+            (2.0, 10.584389, 5.0),
+            (3.0, -36.696158, 7.0),
+        ] {
+            let ours = tps.eval(&[query]);
+            assert!(
+                (ours - scipy_degree_minus_one).abs() < 1e-5,
+                "thin_plate_spline f({query}): we give {ours:.6}, SciPy degree=-1 gives \
+                 {scipy_degree_minus_one:.6}; we are supposed to match the no-tail variant"
+            );
+            assert!(
+                (ours - scipy_default).abs() > 1.0,
+                "thin_plate_spline f({query}): we now agree with SciPy's DEFAULT \
+                 ({scipy_default:.6}) -- if a polynomial tail has been added, this test has done \
+                 its job and should be rewritten to assert the new parity, not deleted"
+            );
+        }
+
+        // `linear` behaves the same way: we match degree=-1 (5, 7, 11), while SciPy's degree-0
+        // default returns the constant 3 everywhere outside the hull.
+        let lin = RbfInterpolator::new(&points, &values, RbfKernel::Linear, 1.0).expect("linear");
+        for (query, scipy_degree_minus_one) in [(1.5_f64, 5.0_f64), (2.0, 7.0), (3.0, 11.0)] {
+            let ours = lin.eval(&[query]);
+            assert!(
+                (ours - scipy_degree_minus_one).abs() < 1e-9,
+                "linear f({query}): we give {ours:.6}, SciPy degree=-1 gives \
+                 {scipy_degree_minus_one:.6}"
+            );
+        }
+    }
 }

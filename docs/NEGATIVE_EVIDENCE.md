@@ -40687,3 +40687,71 @@ CV IS PROVENANCE ONLY and was not used for the decision: `cv_used_for_decision=f
   roughly the IPC gap, measured here at 2.42x on the candidate arm and in the same direction on the
   control. So a counted bound is a safe LOWER bound on a win and an unsafe one on a loss, and rows
   that quote instructions where a wall row was refused should say which of those they are.
+
+## 2026-08-26 - BlackThrush (cc) - PARITY GAP: `RbfInterpolator` is SciPy's `degree=-1` variant under SciPy's default name, and it makes any RBF perf row invalid
+
+- **Result class: BEHAVIORAL.** No timing was taken and **no speed figure is claimed anywhere in
+  this row.** What it records is which mathematical object this type computes.
+
+- **probe: `cargo test -p fsci-interpolate --lib rbf_matches_scipy_degree_minus_one_and_not_scipy_default --release`**,
+  landed and passing, plus a three-line SciPy 1.17.1 script on identical data.
+  `same_host=thinkstation1`, run locally on worker `thinkstation1` (no rch worker admitted this
+  session: every candidate reported `os_gate_excluded=1 required_os=none`, so
+  `build_route=local-wrapper-bypass`). `physical_cores=32`, `logical_threads=64`, `numa_count=1`,
+  `runtime_isa=avx2+fma`. **Observed values are in the table below**; pass/fail counts do not
+  depend on host state and the host is named because the gate asks.
+
+- **THE OBSERVATION.** `RbfInterpolator::new` builds a plain N x N kernel matrix -- `phi` is
+  `vec![0.0; n * n]` -- with no polynomial augmentation. `scipy.interpolate.RBFInterpolator`
+  augments with a polynomial of degree >= 0 for `linear` and >= 1 for `thin_plate_spline`. Those
+  defaults are load-bearing: both kernels are only CONDITIONALLY positive definite and the tail is
+  what makes the system well posed.
+
+  Nine nodes on [0,1] lying EXACTLY on y = 2*x + 1, evaluated outside the hull. The question is
+  immune to every kernel-convention difference between the libraries -- SciPy's `linear` is `-r`
+  where ours is `+r`, and with no tail that sign only flips the weights:
+
+    | `thin_plate_spline` | f(1.5) | f(2) | f(3) |
+    |---|---|---|---|
+    | fsci | 10.161878 | 10.584389 | -36.696158 |
+    | SciPy `degree=-1` | **10.161878** | **10.584389** | **-36.696158** |
+    | SciPy DEFAULT | 4.000000 | 5.000000 | 7.000000 |
+
+    | `linear` | f(1.5) | f(2) | f(3) |
+    |---|---|---|---|
+    | fsci | 5.000000 | 7.000000 | 11.000000 |
+    | SciPy `degree=-1` | **5.000000** | **7.000000** | **11.000000** |
+    | SciPy DEFAULT | 3.000000 | 3.000000 | 3.000000 |
+
+  **We do not merely differ from SciPy. We agree DIGIT-FOR-DIGIT with the variant nobody selects
+  and differ qualitatively from the one every caller gets by default.** On a dataset that is
+  exactly linear, SciPy's default thin-plate spline reproduces the trend exactly; ours returns
+  -36.7 at x = 3.
+
+- **NODE EXACTNESS HOLDS, which is what makes the above a tail finding rather than a broken
+  solve.** Maximum error at the interpolation nodes is 4.441e-16 for `thin_plate_spline` and
+  0.000e0 for `linear`. The landed test asserts this FIRST for exactly that reason.
+
+- **WHY IT SURVIVED THIS LONG.**
+  `grep -ci rbf crates/fsci-conformance/python_oracle/scipy_interpolate_oracle.py` returns **0**.
+  There is no RBF entry in the interpolate conformance oracle, so nothing has ever compared these
+  two implementations on any input.
+
+- **AND IT BLOCKS ANY RBF COMPARISON AGAINST SciPy UNTIL IT IS FIXED, which is why it belongs in
+  this file.** The two systems are not the same size: ours is N x N, SciPy's default is
+  (N+m) x (N+m) for m polynomial terms. **The two arms would therefore be solving DIFFERENT
+  PROBLEMS**, which is the same admissibility fault this ledger already refuses elsewhere -- a
+  cubic cell whose two arms used different backends was refused on exactly that ground earlier
+  today. `crates/fsci-interpolate/src/bin/perf_rbf_eval.rs` exercises these kernels and names
+  `linear` and `thin_plate_spline` as its "controls". **No vs-SciPy row has ever been taken on
+  RBF, and none is admissible until the semantics match or the size difference is accounted for in
+  the comparison.** I found this while scouting RBF as a measurement target and stopped there
+  rather than record a comparison between two different problems.
+
+- **Concrete retry predicate:** filed as `frankenscipy-icozs`. Closing it means building the
+  augmented saddle-point system `[[Phi, P], [P^T, 0]] [w; c] = [y; 0]` and exposing `degree` with
+  SciPy's per-kernel defaults. **That CHANGES results for existing callers of `linear` and
+  `thin_plate_spline`**, so it is a behaviour change and wants its own row rather than being
+  folded into a perf commit. The landed test is written to fail loudly when the tail arrives, with
+  a message telling the next agent to rewrite it to assert the NEW parity rather than delete it.
+  The other half -- an RBF entry in the interpolate oracle -- is not written.
