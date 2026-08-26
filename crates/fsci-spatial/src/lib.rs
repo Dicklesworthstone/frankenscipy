@@ -14271,4 +14271,92 @@ mod toggle_ab_mahalanobis_assembly {
             "SphericalVoronoi vertex off the sphere by {worst:.3e}"
         );
     }
+
+    /// `Delaunay::new` is INCOMPLETE: it produces fewer triangles than a Delaunay triangulation
+    /// has, leaving holes inside the convex hull (frankenscipy-tkpwa).
+    ///
+    /// THE INVARIANT IS ARITHMETIC, not a golden value. A Delaunay triangulation of N points in
+    /// general position with `h` of them on the convex hull has EXACTLY `2N - 2 - h` triangles.
+    /// Measured on deterministic uniform-random fixtures:
+    ///
+    /// | N | h | expected | actual | deficit | uncovered hull area |
+    /// |---|---|---|---|---|---|
+    /// | 400 | 20 | 778 | 777 | 1 | 7.738e-05 |
+    /// | 800 | 19 | 1579 | 1575 | 4 | 7.431e-04 |
+    /// | 2000 | 23 | 3975 | 3967 | 8 | 1.152e-03 |
+    ///
+    /// The consequence is silent: `LinearNDInterpolator::eval` returns NaN when no triangle
+    /// contains the query, which is right for a point outside the hull and is exactly how a point
+    /// in one of these holes gets reported. Against live SciPy 1.17.1 on the same fixture, 4 of
+    /// 2000 queries (N=800) come back NaN from this crate and finite from SciPy, every one of
+    /// them 1.7e-4 to 9.4e-4 INSIDE the hull -- far too deep for the `-1e-10` barycentric
+    /// tolerance in `find_simplex` to be the cause, so widening that tolerance is NOT the fix.
+    ///
+    /// This test PINS THE DEFECT so it cannot change unnoticed in either direction. When the
+    /// triangulation is fixed it will fail; rewrite it then to assert `deficit == 0`, do not
+    /// delete it.
+    #[test]
+    fn delaunay_triangulation_is_currently_incomplete() {
+        use super::{ConvexHull, Delaunay};
+
+        fn lcg(state: &mut u64) -> f64 {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (*state >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        // Same generator and seed as the griddata fixture the defect was found on, so this test
+        // and that probe describe the same point sets.
+        let mut worst_deficit = 0i64;
+        for n in [400usize, 800] {
+            let mut s = 0x9e37_79b9_7f4a_7c15u64;
+            let pts: Vec<(f64, f64)> = (0..n).map(|_| (lcg(&mut s), lcg(&mut s))).collect();
+            let tri = Delaunay::new(&pts).expect("delaunay");
+            let hull = ConvexHull::new(&pts).expect("hull");
+            let expected = 2 * n - 2 - hull.vertices.len();
+            let deficit = expected as i64 - tri.simplices.len() as i64;
+            assert!(
+                deficit >= 0,
+                "N={n}: MORE triangles than a Delaunay triangulation can have ({} > {expected}); \
+                 that is a different defect from the one this test pins",
+                tri.simplices.len()
+            );
+            worst_deficit = worst_deficit.max(deficit);
+
+            // The area check is independent of the triangle count: sum the triangle areas and
+            // compare against the hull area. A covering triangulation matches exactly.
+            let area = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| {
+                ((b.0 - a.0) * (c.1 - a.1) - (c.0 - a.0) * (b.1 - a.1)).abs() * 0.5
+            };
+            let tri_area: f64 = tri
+                .simplices
+                .iter()
+                .map(|&(i, j, k)| area(pts[i], pts[j], pts[k]))
+                .sum();
+            let hv: Vec<(f64, f64)> = hull.vertices.iter().map(|&i| pts[i]).collect();
+            let mut hull_area = 0.0;
+            for i in 1..hv.len() - 1 {
+                hull_area += area(hv[0], hv[i], hv[i + 1]);
+            }
+            let uncovered = hull_area - tri_area;
+            assert!(
+                uncovered >= -1e-12,
+                "N={n}: triangulated area EXCEEDS the hull ({uncovered:.3e}); that would mean \
+                 overlapping triangles, a different defect from the one this test pins"
+            );
+            assert!(
+                (deficit > 0) == (uncovered > 1e-9),
+                "N={n}: triangle deficit ({deficit}) and uncovered area ({uncovered:.3e}) \
+                 disagree; the two independent measures of the same defect must agree"
+            );
+        }
+
+        assert!(
+            worst_deficit > 0,
+            "Delaunay::new now produces a COMPLETE triangulation. That is the fix this test was \
+             waiting for (frankenscipy-tkpwa): rewrite it to assert deficit == 0 and uncovered \
+             area == 0 for every N, rather than deleting it"
+        );
+    }
 }
