@@ -48,13 +48,46 @@
 
 mod bench {
     use fsci_sparse::{
-        CooMatrix, CscMatrix, FormatConvertible, LuOptions, SPLU_BACK_MERGE_ENABLE,
-        SPLU_BACK_MERGE_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
-        SPLU_PARTIAL_INPLACE_ENABLE, SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
+        CooMatrix, CscMatrix, FormatConvertible, LuOptions, PermutationOrdering,
+        SPLU_BACK_MERGE_ENABLE, SPLU_BACK_MERGE_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE,
+        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_PARTIAL_INPLACE_ENABLE,
+        SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
         SPLU_ROW_HEAD_CACHE_FACTOR_HITS, SPLU_SUPERNODAL_ENABLE, SPLU_SUPERNODAL_FACTOR_HITS,
         Shape2D, splu, splu_factor_payload_bytes, splu_solve,
     };
     use sha2::{Digest, Sha256};
+
+    /// Ordering for the fsci arm of the balanced-square factor cell, selected by
+    /// `FSCI_SPLU_ORDERING` and defaulting to the library default.
+    ///
+    /// EXISTS TO TEST A STATED MECHANISM, NOT TO TUNE. frankenscipy-llywn records this cell's
+    /// mechanism as settled -- "the fill-reducing ordering is NOT the problem" -- on the grounds
+    /// that our fill is at SuperLU parity. That is true of the SHIPPING ordering: `Colamd` maps
+    /// to RCM here and gives 1,188,312 factor nonzeros against SuperLU's 1,231,312, 0.965x. AMD,
+    /// which did not exist when that was written, gives 648,372 -- 1.83x less. This harness
+    /// hardcoded `LuOptions::default()` at every call site and so could not measure any ordering
+    /// but the one whose exhaustion it was being cited to prove. Unset, every arm runs exactly as
+    /// it ships.
+    fn balanced_arm_options() -> LuOptions {
+        let ordering = match std::env::var("FSCI_SPLU_ORDERING").ok().as_deref() {
+            None | Some("") | Some("default") => LuOptions::default().ordering,
+            Some("colamd") => PermutationOrdering::Colamd,
+            Some("rcm") => PermutationOrdering::ReverseCuthillMcKee,
+            Some("mmd-ata") => PermutationOrdering::MmdAta,
+            Some("mmd-at-plus-a") => PermutationOrdering::MmdAtPlusA,
+            Some("amd") => PermutationOrdering::Amd,
+            Some("natural") => PermutationOrdering::Natural,
+            Some(other) => panic!(
+                "FSCI_SPLU_ORDERING={other:?} is not one of \
+                 default|colamd|rcm|mmd-ata|mmd-at-plus-a|amd|natural"
+            ),
+        };
+        LuOptions {
+            ordering,
+            ..LuOptions::default()
+        }
+    }
+
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -999,7 +1032,7 @@ for raw_line in sys.stdin.buffer:
 
         // ── PARITY BEFORE TIMING ─────────────────────────────────────────────
         // A fast arm that factored a different matrix is not a result.
-        let ours = splu(&matrix, LuOptions::default()).expect("fsci splu");
+        let ours = splu(&matrix, balanced_arm_options()).expect("fsci splu");
         let x_ours = splu_solve(&ours, &rhs).expect("fsci splu_solve");
         let x_theirs = scipy.solution();
         assert_eq!(x_ours.len(), x_theirs.len(), "solution length");
@@ -1011,6 +1044,7 @@ for raw_line in sys.stdin.buffer:
             .fold(0.0_f64, f64::max)
             / scale.max(1.0);
         println!("parity: worst_rel_solution_diff={worst:.3e} scale={scale:.6e}");
+        println!("fsci_arm_ordering={:?}", ours.ordering_used);
         assert!(
             worst <= MAX_SOLUTION_REL_DIFF,
             "fsci and live SciPy disagree on the solution ({worst:.3e}) — no timing is admissible"
@@ -1019,7 +1053,7 @@ for raw_line in sys.stdin.buffer:
         // ── BALANCED SQUARE ──────────────────────────────────────────────────
         for _ in 0..warmup {
             let _ = black_box(scipy.factor());
-            let _ = black_box(splu(&matrix, LuOptions::default()).expect("fsci splu"));
+            let _ = black_box(splu(&matrix, balanced_arm_options()).expect("fsci splu"));
         }
 
         let pre_busy = host_mean_busy();
@@ -1042,7 +1076,7 @@ for raw_line in sys.stdin.buffer:
                     a_slots.push(ns as f64);
                 } else {
                     let started = Instant::now();
-                    let factorization = splu(&matrix, LuOptions::default()).expect("fsci splu");
+                    let factorization = splu(&matrix, balanced_arm_options()).expect("fsci splu");
                     let elapsed = started.elapsed().as_nanos() as f64;
                     black_box(&factorization);
                     b_slots.push(elapsed);

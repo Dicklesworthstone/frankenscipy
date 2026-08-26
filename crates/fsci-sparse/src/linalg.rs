@@ -14709,6 +14709,118 @@ mod tests {
         println!("RUN7D_ORDER_SPLIT_END");
     }
 
+    /// Does the fill-reducing ordering matter on the splu CUBIC cell (frankenscipy-llywn)?
+    ///
+    /// llywn states its mechanism as settled: "Our fill is at SuperLU parity or better ... Same
+    /// COLAMD ordering, same fill. So the fill-reducing ordering is NOT the problem -- per-entry
+    /// elimination THROUGHPUT is." That was written when the only orderings available were RCM
+    /// (which `Colamd` maps to) and the O(V^2) exact minimum degree. AMD did not exist yet.
+    ///
+    /// On the run7d convection cell AMD cut fill 2.58x against RCM, so the premise is worth
+    /// re-testing rather than inheriting. Fill is a STRUCTURAL count and does not depend on host
+    /// load; the ordering call is a pure function with no cfg(test) instrumentation in it.
+    ///
+    /// The fixture is `laplacian_3d_cubic` side=16, n=4096, nnz=27136 -- llywn's own cell, whose
+    /// SuperLU comparison point is 1,231,312 LU nonzeros.
+    #[test]
+    #[ignore]
+    fn llywn_cubic_ordering_fill_probe() {
+        fn laplacian_3d_cubic(side: usize) -> CsrMatrix {
+            let n = side * side * side;
+            let idx = |z: usize, y: usize, x: usize| (z * side + y) * side + x;
+            let mut rows = Vec::new();
+            let mut columns = Vec::new();
+            let mut data = Vec::new();
+            for z in 0..side {
+                for y in 0..side {
+                    for x in 0..side {
+                        let row = idx(z, y, x);
+                        rows.push(row);
+                        columns.push(row);
+                        data.push(6.0);
+                        for (dz, dy, dx) in [
+                            (-1i64, 0i64, 0i64),
+                            (1, 0, 0),
+                            (0, -1, 0),
+                            (0, 1, 0),
+                            (0, 0, -1),
+                            (0, 0, 1),
+                        ] {
+                            let (nz, ny, nx) = (z as i64 + dz, y as i64 + dy, x as i64 + dx);
+                            if nz >= 0
+                                && nz < side as i64
+                                && ny >= 0
+                                && ny < side as i64
+                                && nx >= 0
+                                && nx < side as i64
+                            {
+                                rows.push(row);
+                                columns.push(idx(nz as usize, ny as usize, nx as usize));
+                                data.push(-1.0);
+                            }
+                        }
+                    }
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, false)
+                .expect("cubic COO")
+                .to_csr()
+                .expect("cubic CSR")
+        }
+
+        const SUPERLU_LU_NONZEROS: usize = 1_231_312;
+        let side = 16usize;
+        let a = laplacian_3d_cubic(side);
+        let n = a.shape().rows;
+        let csc = a.to_csc().expect("cubic CSC");
+        println!(
+            "LLYWN_ORDER_FILL_BEGIN side={side} n={n} nnz={} superlu_lu_nnz={SUPERLU_LU_NONZEROS}",
+            a.nnz()
+        );
+
+        for (name, ordering, reps) in [
+            ("rcm", PermutationOrdering::ReverseCuthillMcKee, 20usize),
+            ("amd", PermutationOrdering::Amd, 20),
+            ("mmd", PermutationOrdering::MmdAtPlusA, 3),
+        ] {
+            let start = std::time::Instant::now();
+            let mut permutation = Vec::new();
+            for _ in 0..reps {
+                permutation = match ordering {
+                    PermutationOrdering::ReverseCuthillMcKee => {
+                        super::reverse_cuthill_mckee(std::hint::black_box(&a))
+                    }
+                    PermutationOrdering::Amd => {
+                        super::approximate_minimum_degree_ordering(std::hint::black_box(&a))
+                    }
+                    _ => super::minimum_degree_ordering(std::hint::black_box(&a)),
+                };
+                std::hint::black_box(&permutation);
+            }
+            let ordering_ms = start.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            assert_eq!(permutation.len(), n, "{name}: short permutation");
+
+            let factorization = super::splu(
+                &csc,
+                LuOptions {
+                    ordering,
+                    ..LuOptions::default()
+                },
+            )
+            .expect("cubic factorization");
+            let fill = match &factorization.lu_internal {
+                SparseLuInternal::Native(lu) => lu.lower.columns.len() + lu.upper.columns.len(),
+                _ => panic!("{name}: expected the native sparse LU path"),
+            };
+            println!(
+                "ordering={name} ordering_only_ms={ordering_ms:.6} factor_nnz={fill} \
+                 fill_vs_superlu={:.4}",
+                fill as f64 / SUPERLU_LU_NONZEROS as f64
+            );
+        }
+        println!("LLYWN_ORDER_FILL_END");
+    }
+
     /// Is the AMD ordering's cost ALGORITHMIC or CONSTANT-FACTOR?
     ///
     /// 6.27 ms at n=4096 is ~1.5 us per elimination, far above what a near-linear sweep
