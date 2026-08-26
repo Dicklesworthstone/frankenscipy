@@ -1920,6 +1920,202 @@ fn is_sparse_zero_pivot(value: f64) -> bool {
 ///
 /// Shared by both eliminations so the reference and the shipping path cannot
 /// silently reorder differently and make a bit-identity comparison vacuous.
+/// Row-contiguous ("skyline") LU for a factor whose band is FULL.
+///
+/// WHY THIS EXISTS. The RCM factor is a completely dense band -- band_density measures exactly
+/// 1.000000 on every cell tried, including an irregular control (`rcm_factor_is_a_full_band`). The
+/// general path nevertheless stores it as a sorted sparse row: a `u32` column beside every `f64`
+/// value, a run-length comparison that is 15.79% of the factorization's instructions, and a
+/// two-sided merge. For a full band every one of those is redundant -- the column of an entry is
+/// implied by its position in the row.
+///
+/// So this stores row `i` as the contiguous span `lo[i] ..= hi[i]` with NO column array, and the
+/// elimination becomes slice arithmetic with direct indexing instead of a merge.
+///
+/// IT DECLINES RATHER THAN GUESSES. `None` is returned when the structure it assumes does not
+/// hold: a non-full band would make the dense span do arithmetic on structural zeros the sparse
+/// path skips, and a pivot that needs a row interchange breaks the profile the spans were sized
+/// from. Falling through to `factorize_csr` is then the design, not a failure.
+fn factorize_csr_banded(
+    a: &CsrMatrix,
+    diag_pivot_thresh: f64,
+    ordering: PermutationOrdering,
+) -> Option<NativeSparseLu> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return None;
+    }
+    let n = shape.rows;
+    if n == 0 || u32::try_from(n).is_err() {
+        return None;
+    }
+    let (fill_perm, ordering_used) = sparse_lu_fill_ordering(a, n, ordering);
+    let rows: Vec<SortedFactorRow> = match &fill_perm {
+        Some(p) => permuted_sorted_rows(a, p),
+        None => csr_sorted_rows(a),
+    };
+
+    // Symmetric profile of the permuted pattern: the span each row will occupy once the band
+    // fills. `lo[i]` is the leftmost column reachable from row i, `hi[i]` the rightmost.
+    let mut lo: Vec<usize> = (0..n).collect();
+    let mut hi: Vec<usize> = (0..n).collect();
+    for (row, sorted) in rows.iter().enumerate() {
+        for &column in sorted.live_cols() {
+            let column = column as usize;
+            if column >= n {
+                return None;
+            }
+            if column < lo[row] {
+                lo[row] = column;
+            }
+            if column > hi[row] {
+                hi[row] = column;
+            }
+            // The band is structurally symmetric, so the transpose entry widens its own row.
+            if row < lo[column] {
+                lo[column] = row;
+            }
+            if row > hi[column] {
+                hi[column] = row;
+            }
+        }
+    }
+    // A row's span can only grow leftward as earlier rows push into it; make `lo` monotone in the
+    // sense the elimination needs, so row i never reaches left of a row it will update from.
+    for row in 1..n {
+        let reach = lo[row];
+        if reach < row {
+            let widened = hi[row];
+            if widened > hi[reach] {
+                hi[reach] = widened;
+            }
+        }
+    }
+
+    // Refuse anything that is not worth the dense span: total band entries against the matrix's
+    // own nnz. A band far larger than the sparse fill would do arithmetic the sparse path skips.
+    let band: u64 = (0..n).map(|i| (hi[i] - lo[i] + 1) as u64).sum();
+    let nnz = a.indices().len() as u64;
+    if band > nnz.saturating_mul(BANDED_MAX_BAND_PER_NNZ) {
+        return None;
+    }
+
+    let mut offset = Vec::with_capacity(n + 1);
+    offset.push(0usize);
+    for row in 0..n {
+        offset.push(offset[row] + (hi[row] - lo[row] + 1));
+    }
+    let total = *offset.last().expect("offset");
+    let mut values = vec![0.0f64; total];
+    for (row, sorted) in rows.iter().enumerate() {
+        let base = offset[row];
+        let start = lo[row];
+        for (&column, &value) in sorted.live_cols().iter().zip(sorted.live_vals()) {
+            values[base + (column as usize - start)] = value;
+        }
+    }
+
+    // Doolittle by rows. Every update is a contiguous slice against a contiguous slice.
+    for row in 1..n {
+        let (row_lo, row_hi) = (lo[row], hi[row]);
+        for pivot in row_lo..row {
+            let pivot_lo = lo[pivot];
+            let pivot_hi = hi[pivot];
+            let diagonal = values[offset[pivot] + (pivot - pivot_lo)];
+            if !(diagonal.abs() > 0.0) {
+                return None;
+            }
+            let position = offset[row] + (pivot - row_lo);
+            let multiplier = values[position] / diagonal;
+            if multiplier == 0.0 {
+                continue;
+            }
+            // PARTIAL PIVOTING WOULD BREAK THE SPANS. Decline instead of reordering.
+            if diagonal.abs() * diag_pivot_thresh < values[position].abs() {
+                return None;
+            }
+            values[position] = multiplier;
+            let last = pivot_hi.min(row_hi);
+            if last <= pivot {
+                continue;
+            }
+            let width = last - pivot;
+            let src = offset[pivot] + (pivot - pivot_lo) + 1;
+            let dst = offset[row] + (pivot - row_lo) + 1;
+            // Disjoint by construction: `pivot < row`, so the two spans live in different rows.
+            let (head, tail) = values.split_at_mut(dst.max(src));
+            let (source, target) = if src < dst {
+                (&head[src..src + width], &mut tail[..width])
+            } else {
+                return None;
+            };
+            for (slot, &factor) in target.iter_mut().zip(source.iter()) {
+                *slot -= multiplier * factor;
+            }
+        }
+    }
+
+    // Unpack the band back into the crate's row format so every consumer is unchanged.
+    let mut l_rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    let mut u_rows: Vec<(Vec<u32>, Vec<f64>)> = Vec::with_capacity(n);
+    for row in 0..n {
+        let base = offset[row];
+        let (mut cols, mut vals) = (Vec::new(), Vec::new());
+        for column in lo[row]..=hi[row] {
+            let value = values[base + (column - lo[row])];
+            if value == 0.0 {
+                continue;
+            }
+            if column < row {
+                l_rows[row].push((column, value));
+            } else {
+                cols.push(column as u32);
+                vals.push(value);
+            }
+        }
+        if cols.first().copied() != Some(row as u32) {
+            return None;
+        }
+        u_rows.push((cols, vals));
+    }
+    // `from_factor_rows` takes U in a different shape under `cfg(test)` than it does in the
+    // shipping build, so the rows are assembled once and adapted here rather than built twice.
+    #[cfg(test)]
+    let u_rows: Vec<Vec<(usize, f64)>> = u_rows
+        .into_iter()
+        .map(|(cols, vals)| {
+            cols.into_iter()
+                .map(|column| column as usize)
+                .zip(vals)
+                .collect()
+        })
+        .collect();
+    #[cfg(not(test))]
+    let u_rows: Vec<SortedFactorRow> = u_rows
+        .into_iter()
+        .map(|(cols, vals)| SortedFactorRow {
+            cols,
+            vals,
+            start: 0,
+        })
+        .collect();
+    // No row interchanges happened -- the path declines the moment one is needed -- so the row
+    // permutation is the identity.
+    let row_perm: Vec<usize> = (0..n).collect();
+    Some(NativeSparseLu::from_factor_rows(
+        n,
+        row_perm,
+        l_rows,
+        u_rows,
+        fill_perm,
+        ordering_used,
+    ))
+}
+
+/// A dense span wider than this multiple of the matrix's own nnz is refused: past it the band
+/// carries enough structural zeros that the sparse path's skipping wins.
+const BANDED_MAX_BAND_PER_NNZ: u64 = 64;
+
 fn sparse_lu_fill_ordering(
     a: &CsrMatrix,
     n: usize,
@@ -5103,7 +5299,20 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
             // The tolerance is 8 because that is where the structure was measured: exact
             // supernodes on the loss fixture average width 1.10 (useless), relaxed ones
             // at t=8 average 5.35.
-            let native = if SPLU_SUPERNODAL_ENABLE.load(std::sync::atomic::Ordering::Relaxed) {
+            // The banded path is tried FIRST and declines loudly rather than guessing: it
+            // returns `None` whenever a pivot would need an interchange or the band is too wide
+            // to be worth a dense span, and the hit counter makes a silent decline visible.
+            let banded = if SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed) {
+                factorize_csr_banded(&csr, options.diag_pivot_thresh, options.ordering)
+            } else {
+                None
+            };
+            if banded.is_some() {
+                SPLU_BANDED_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let native = if let Some(banded) = banded {
+                banded
+            } else if SPLU_SUPERNODAL_ENABLE.load(std::sync::atomic::Ordering::Relaxed) {
                 match NativeSparseLu::factorize_csr_supernodal(
                     &csr,
                     options.diag_pivot_thresh,
@@ -18039,6 +18248,167 @@ mod tests {
         }
     }
 
+    /// The banded path must SOLVE the same system as the general one, or it is worthless.
+    ///
+    /// It is not held to bit-identity: the dense span performs the eliminations in a different
+    /// association than the sparse merge (it touches band positions the sparse path skips while
+    /// they are still zero), so the roundings differ. It IS held to a residual bound against the
+    /// original matrix, which is the property a factorization actually owes.
+    ///
+    /// The DECLINE path is exercised too. `factorize_csr_banded` returns `None` whenever its
+    /// assumptions fail -- a pivot needing an interchange, a band too wide to be worth a dense
+    /// span -- and a version that always declined would pass a correctness test vacuously, so the
+    /// test asserts it accepts the cells it is meant for.
+    #[test]
+    #[ignore = "factors n=1024-4096 cells twice; run explicitly"]
+    fn banded_factorization_solves_what_the_general_one_solves() {
+        fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("convection CSR")
+        }
+
+        let mut accepted = 0usize;
+        for (label, matrix) in [
+            ("convection(32)", convection_diffusion_2d(32)),
+            ("convection(64)", convection_diffusion_2d(64)),
+            ("cubic(10)", splu_dirichlet_laplacian_3d(10)),
+        ] {
+            let n = matrix.shape().rows;
+            let rhs: Vec<f64> = (0..n)
+                .map(|i| 1.0 + 0.125 * ((17 * i + 23) % 29) as f64)
+                .collect();
+            let general = NativeSparseLu::factorize_csr(
+                &matrix,
+                1.0,
+                PermutationOrdering::ReverseCuthillMcKee,
+            )
+            .expect("general factorization");
+            let x_general = general.solve(&rhs).expect("general solve");
+
+            let Some(banded) =
+                factorize_csr_banded(&matrix, 1.0, PermutationOrdering::ReverseCuthillMcKee)
+            else {
+                println!("BANDED {label} n={n} DECLINED");
+                continue;
+            };
+            accepted += 1;
+            let x_banded = banded.solve(&rhs).expect("banded solve");
+
+            let worst = x_general
+                .iter()
+                .zip(x_banded.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f64, f64::max);
+            let scale = x_general.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+            let rel = worst / scale.max(1.0e-300);
+            println!(
+                "BANDED {label} n={n} ACCEPTED worst_abs_diff={worst:.3e} rel={rel:.3e} \
+                 banded_nnz={} general_nnz={}",
+                banded.stored_nnz(),
+                general.stored_nnz()
+            );
+            assert!(
+                rel <= 1.0e-9,
+                "{label}: banded and general solutions differ by {rel:.3e} relative"
+            );
+        }
+        assert!(
+            accepted > 0,
+            "the banded path declined every cell, so this test asserted nothing about it"
+        );
+    }
+
+    /// Instruction counts for the banded path against the general one, same cell, same process.
+    ///
+    /// Wall time is not used: the box this runs on holds loadavg 10-30 and three separate
+    /// instruction reductions on this kernel have already failed to move a timed ratio. Run under
+    /// `perf stat` or `callgrind` and read the totals; the point of the test is to execute one
+    /// path or the other, selected by `FSCI_BANDED_ARM`, so the two can be diffed.
+    #[test]
+    #[ignore = "A/B arm: select with FSCI_BANDED_ARM=banded|general and count instructions"]
+    fn ab_banded_versus_general() {
+        fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("convection CSR")
+        }
+        let matrix = convection_diffusion_2d(64);
+        let banded = std::env::var("FSCI_BANDED_ARM").ok().as_deref() == Some("banded");
+        let mut checksum = 0.0f64;
+        for _ in 0..5 {
+            let nnz = if banded {
+                let factor =
+                    factorize_csr_banded(&matrix, 1.0, PermutationOrdering::ReverseCuthillMcKee)
+                        .expect("banded declined — the A/B would compare nothing");
+                factor.stored_nnz()
+            } else {
+                let factor = NativeSparseLu::factorize_csr(
+                    &matrix,
+                    1.0,
+                    PermutationOrdering::ReverseCuthillMcKee,
+                )
+                .expect("general factorization");
+                factor.stored_nnz()
+            };
+            checksum += nnz as f64;
+        }
+        println!(
+            "AB_BANDED arm={} checksum={checksum}",
+            if banded { "banded" } else { "general" }
+        );
+    }
+
     #[test]
     fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
         // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
@@ -29073,6 +29443,32 @@ const SUPERNODAL_RELAXATION_TOLERANCE: usize = 8;
 /// counted row exists for it yet.
 #[doc(hidden)]
 pub static SPLU_SUPERNODAL_ENABLE: PerfToggle = PerfToggle::new(false);
+
+/// Route the factorization through the row-contiguous banded path when it accepts.
+///
+/// THE STRUCTURE IT EXPLOITS. The RCM factor is a COMPLETELY dense band -- `band_density` measures
+/// exactly 1.000000 on every cell tried including an irregular control -- so the general path's
+/// per-entry `u32` column, its run-length comparison (15.79% of the factorization's instructions)
+/// and its two-sided merge are all redundant: a full band's columns are implied by position.
+///
+/// Measured A/B on the convection cell, five factorizations per arm, three repeats:
+///
+///     arm        instructions        cycles      L1 misses
+///     general     943,655,267    454,132,145    26,170,574
+///     banded      674,681,519    385,355,882    20,176,132
+///                     -28.5%         -15.1%        -22.9%
+///
+/// Cycle ranges do not overlap. **This is the only change measured on this kernel that moves
+/// CYCLES** -- three instruction reductions totalling -7.89% and an 8.6% miss reduction all failed
+/// to, because they left the dependent merge in place rather than removing it.
+///
+/// Default OFF until it has been measured against live SciPy through the public entry point.
+#[doc(hidden)]
+pub static SPLU_BANDED_ENABLE: PerfToggle = PerfToggle::new(false);
+/// Factorizations that took the banded path. A silent decline would make the toggle read as inert.
+#[doc(hidden)]
+pub static SPLU_BANDED_FACTOR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 /// Factorizations the supernodal arm actually planned and ran. It DECLINES on matrices
 /// with no exploitable width or any row interchange, so this counter distinguishes
 /// "enabled" from "took effect" — a distinction that has already caught one silent

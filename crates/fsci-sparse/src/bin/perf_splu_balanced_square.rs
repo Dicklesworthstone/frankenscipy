@@ -49,9 +49,9 @@
 mod bench {
     use fsci_sparse::{
         CooMatrix, CscMatrix, FormatConvertible, LuOptions, PermutationOrdering,
-        SPLU_BACK_MERGE_ENABLE, SPLU_BACK_MERGE_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE,
-        SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_PARTIAL_INPLACE_ENABLE,
-        SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
+        SPLU_BACK_MERGE_ENABLE, SPLU_BACK_MERGE_FACTOR_HITS, SPLU_BANDED_ENABLE,
+        SPLU_BANDED_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
+        SPLU_PARTIAL_INPLACE_ENABLE, SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
         SPLU_ROW_HEAD_CACHE_FACTOR_HITS, SPLU_SUPERNODAL_ENABLE, SPLU_SUPERNODAL_FACTOR_HITS,
         Shape2D, splu, splu_factor_payload_bytes, splu_solve,
     };
@@ -1031,6 +1031,15 @@ for raw_line in sys.stdin.buffer:
         let partial_inplace_hits_before = SPLU_PARTIAL_INPLACE_FACTOR_HITS.load(Ordering::Relaxed);
         SPLU_PARTIAL_INPLACE_ENABLE.reset_load_count();
         SPLU_SUPERNODAL_ENABLE.store(supernodal_enabled, Ordering::Relaxed);
+        // `FSCI_SPLU_BANDED=1` routes the FrankenSciPy arm through the row-contiguous banded
+        // factorization. It declines rather than guesses, so the hit count is printed below and a
+        // silent fall-through cannot read as a measured result.
+        let banded_requested = matches!(
+            std::env::var("FSCI_SPLU_BANDED").ok().as_deref(),
+            Some("1") | Some("true")
+        );
+        SPLU_BANDED_ENABLE.store(banded_requested, Ordering::Relaxed);
+        let banded_hits_before = SPLU_BANDED_FACTOR_HITS.load(Ordering::Relaxed);
         let supernodal_hits_before = SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed);
         SPLU_SUPERNODAL_ENABLE.reset_load_count();
         println!(
@@ -1272,13 +1281,25 @@ for raw_line in sys.stdin.buffer:
              row_head_cache_toggle_reads={}",
             SPLU_ROW_HEAD_CACHE_DISABLE.load_count(),
         );
+        // THE GUARD IS SCOPED, NOT WEAKENED. Its premise is that the general elimination ran; it
+        // exists to catch an A/B whose two arms are the same code. The banded path bypasses that
+        // elimination entirely -- which is the whole point of it -- so the row-head-cache toggle
+        // is legitimately unread there, and `banded_factor_hits` is the positive evidence that a
+        // DIFFERENT path ran rather than the same one twice. Where the banded path did not take
+        // the factorization the original assertion applies unchanged.
+        let banded_hits = SPLU_BANDED_FACTOR_HITS.load(Ordering::Relaxed) - banded_hits_before;
         assert!(
-            SPLU_ROW_HEAD_CACHE_DISABLE.load_count() > 0,
-            "the elimination never read SPLU_ROW_HEAD_CACHE_DISABLE, so both arms of \
-             this A/B are the same code and the ratio is not reportable"
+            SPLU_ROW_HEAD_CACHE_DISABLE.load_count() > 0 || banded_hits > 0,
+            "the elimination never read SPLU_ROW_HEAD_CACHE_DISABLE and the banded path never \
+             ran, so both arms of this A/B are the same code and the ratio is not reportable"
         );
         assert!(
-            head_cache_enabled == (head_cache_hits > 0),
+            !banded_requested || banded_hits > 0,
+            "the banded arm was requested and never accepted a factorization, so this row \
+             measures the general path under a banded label"
+        );
+        assert!(
+            banded_hits > 0 || head_cache_enabled == (head_cache_hits > 0),
             "the head-cache arm did not take effect: enabled={head_cache_enabled} but \
              {head_cache_hits} factorizations took the head path"
         );
@@ -1292,12 +1313,12 @@ for raw_line in sys.stdin.buffer:
             SPLU_BACK_MERGE_ENABLE.load_count(),
         );
         assert!(
-            SPLU_BACK_MERGE_ENABLE.load_count() > 0,
+            SPLU_BACK_MERGE_ENABLE.load_count() > 0 || banded_hits > 0,
             "the elimination never read SPLU_BACK_MERGE_ENABLE, so both arms of this \
              A/B are the same code and the ratio is not reportable"
         );
         assert!(
-            back_merge_enabled == (back_merge_hits > 0),
+            banded_hits > 0 || back_merge_enabled == (back_merge_hits > 0),
             "the back-merge arm did not take effect: enabled={back_merge_enabled} but \
              {back_merge_hits} factorizations took it"
         );
@@ -1311,12 +1332,12 @@ for raw_line in sys.stdin.buffer:
             SPLU_PARTIAL_INPLACE_ENABLE.load_count(),
         );
         assert!(
-            SPLU_PARTIAL_INPLACE_ENABLE.load_count() > 0,
+            SPLU_PARTIAL_INPLACE_ENABLE.load_count() > 0 || banded_hits > 0,
             "the elimination never read SPLU_PARTIAL_INPLACE_ENABLE, so both arms of \
              this A/B are the same code and the ratio is not reportable"
         );
         assert!(
-            partial_inplace_enabled == (partial_inplace_hits > 0),
+            banded_hits > 0 || partial_inplace_enabled == (partial_inplace_hits > 0),
             "the partial-inplace arm did not take effect: \
              enabled={partial_inplace_enabled} but {partial_inplace_hits} took it"
         );
@@ -1327,6 +1348,10 @@ for raw_line in sys.stdin.buffer:
         // and must be read as such, not as a supernodal result.
         let supernodal_hits =
             SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed) - supernodal_hits_before;
+        println!(
+            "execution_proof: banded_requested={banded_requested} banded_factor_hits={}",
+            SPLU_BANDED_FACTOR_HITS.load(Ordering::Relaxed) - banded_hits_before
+        );
         println!(
             "execution_proof: supernodal_enabled={supernodal_enabled} \
              supernodal_factor_hits={supernodal_hits} \
