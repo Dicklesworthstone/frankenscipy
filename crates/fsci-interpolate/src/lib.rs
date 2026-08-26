@@ -15584,4 +15584,161 @@ mod rch_source_freshness_tests {
             );
         }
     }
+
+    /// SciPy parity for the two ND interpolators a LIVE SciPy harness already exercises
+    /// (frankenscipy-ivxx6).
+    ///
+    /// `perf_griddata_scipy.rs` times `LinearNDInterpolator` and `CloughTocher2DInterpolator`
+    /// against a live SciPy arm, and neither had ANY differential coverage. That is the
+    /// configuration in which a competitive ratio can be recorded between two things nobody has
+    /// shown compute the same value -- the situation that stopped the RBF row.
+    ///
+    /// FIXTURE DESIGN. The sites are in general position (irrational-ish coordinates, no four
+    /// cocircular), so the Delaunay triangulation is UNIQUE and agreement is required rather than
+    /// lucky; on a degenerate fixture both libraries could pick different legal triangulations and
+    /// differ without either being wrong. The linear arm is a control: every valid triangulation
+    /// reproduces a linear function, so it tests the barycentric arithmetic and not the mesh.
+    /// Exterior queries must be NaN -- the must-miss arm, since an interpolator that silently
+    /// extrapolates would pass every interior check.
+    ///
+    /// RESULT, measured against SciPy 1.17.1:
+    ///   * `LinearNDInterpolator` AGREES to 2.220e-16. Pinned below.
+    ///   * `CloughTocher2DInterpolator` DIVERGES, and the cause is algorithmic rather than a bug.
+    ///     SciPy estimates vertex gradients with a GLOBAL iterative curvature-minimising solve
+    ///     (documented `tol`/`maxiter`); this crate estimates them LOCALLY per vertex. Both are
+    ///     legitimate Clough-Tocher constructions and they are different functions. On linear
+    ///     data THIS crate is exact while SciPy carries its convergence tolerance -- see the
+    ///     assertions below, which pin that direction explicitly so nobody "fixes" it backwards.
+    #[test]
+    fn nd_interpolators_against_scipy_1_17_1() {
+        use super::{CloughTocher2DInterpolator, LinearNDInterpolator};
+
+        let sites: Vec<Vec<f64>> = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.0],
+            vec![1.0, 1.0],
+            vec![0.0, 1.0],
+            vec![0.31830988618379069, 0.15915494309189535],
+            vec![0.69314718055994531, 0.43429448190325176],
+            vec![0.57721566490153286, 0.86602540378443865],
+            vec![0.13533528323661270, 0.60653065971263342],
+            vec![0.86602540378443865, 0.20787957635076193],
+            vec![0.41421356237309515, 0.73205080756887729],
+            vec![0.22360679774997896, 0.33166247903553998],
+            vec![0.78539816339744828, 0.61803398874989479],
+        ];
+        let queries: Vec<Vec<f64>> = vec![
+            vec![0.25, 0.25],
+            vec![0.5, 0.5],
+            vec![0.75, 0.25],
+            vec![0.4, 0.8],
+            vec![0.6, 0.15],
+            vec![0.15, 0.85],
+            vec![-0.25, 0.5],
+            vec![1.4, 0.5],
+            vec![0.5, -0.3],
+        ];
+        let linear = |p: &[f64]| 2.0 * p[0] - 3.0 * p[1] + 1.0;
+        let nonlinear = |p: &[f64]| (3.0 * p[0]).sin() * (2.0 * p[1]).cos() + 0.5 * p[0];
+
+        // SciPy 1.17.1
+        let scipy_linearnd_linear: Vec<f64> = vec![
+            0.75,
+            0.5,
+            1.75,
+            -0.6000000000000002,
+            1.7499999999999996,
+            -1.25,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ];
+        let scipy_linearnd_nonlinear: Vec<f64> = vec![
+            0.7027381516961764,
+            0.657453112847633,
+            0.9111643418591131,
+            0.22398295470806284,
+            0.8796896732430468,
+            0.12974716698758793,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ];
+        let scipy_clough_nonlinear: Vec<f64> = vec![
+            0.7345917469360356,
+            0.7487565926370296,
+            1.0115592520596974,
+            0.19530234037679986,
+            1.1052830901401725,
+            0.08294242349752515,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ];
+
+        // ---- LinearNDInterpolator: full parity, pinned ----------------------------------------
+        for (label, f, want) in [
+            (
+                "linear",
+                &linear as &dyn Fn(&[f64]) -> f64,
+                &scipy_linearnd_linear,
+            ),
+            ("nonlinear", &nonlinear, &scipy_linearnd_nonlinear),
+        ] {
+            let values: Vec<f64> = sites.iter().map(|p| f(p)).collect();
+            let it = LinearNDInterpolator::new(&sites, &values).expect("linearnd");
+            for (i, q) in queries.iter().enumerate() {
+                let got = it.eval(q).unwrap_or(f64::NAN);
+                let w = want[i];
+                if w.is_nan() {
+                    assert!(
+                        got.is_nan(),
+                        "linearnd/{label} q{i}: SciPy gives NaN outside the hull, we gave {got}"
+                    );
+                } else {
+                    assert!(
+                        (got - w).abs() <= 1e-12,
+                        "linearnd/{label} q{i}: got {got:.17e}, SciPy 1.17.1 gives {w:.17e}"
+                    );
+                }
+            }
+        }
+
+        // ---- CloughTocher2D: exact on linear data, and NOT SciPy's interpolant ----------------
+        let lin_values: Vec<f64> = sites.iter().map(|p| linear(p)).collect();
+        let ct = CloughTocher2DInterpolator::new(&sites, &lin_values).expect("clough");
+        for (i, q) in queries.iter().enumerate().take(6) {
+            let got = ct.eval(q).unwrap_or(f64::NAN);
+            assert!(
+                (got - linear(q)).abs() <= 1e-12,
+                "clough/linear q{i}: a Clough-Tocher patch must reproduce linear data exactly; \
+                 got {got:.17e} against {:.17e}",
+                linear(q)
+            );
+        }
+        for (i, q) in queries.iter().enumerate().skip(6) {
+            assert!(
+                ct.eval(q).unwrap_or(f64::NAN).is_nan(),
+                "clough q{i}: must be NaN outside the convex hull"
+            );
+        }
+
+        // The divergence itself, pinned so it cannot close silently. If a future change adopts
+        // SciPy's global iterative gradient estimator this assertion FAILS -- rewrite it to
+        // assert the new parity rather than delete it.
+        let nl_values: Vec<f64> = sites.iter().map(|p| nonlinear(p)).collect();
+        let ct_nl = CloughTocher2DInterpolator::new(&sites, &nl_values).expect("clough nl");
+        let worst = queries
+            .iter()
+            .take(6)
+            .enumerate()
+            .map(|(i, q)| (ct_nl.eval(q).unwrap_or(f64::NAN) - scipy_clough_nonlinear[i]).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst > 1e-3,
+            "clough/nonlinear now agrees with SciPy to {worst:.3e}. If the gradient estimator \
+             was changed to SciPy's global iterative one, this test has done its job and should \
+             be rewritten to assert parity, not deleted"
+        );
+    }
 }
