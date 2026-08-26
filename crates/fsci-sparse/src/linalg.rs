@@ -18599,6 +18599,174 @@ mod tests {
         }
     }
 
+    /// WHAT IS A BETTER RCM START NODE WORTH? Measured before anything is built on it.
+    ///
+    /// run7d's cell is now at 0.973x SciPy's cost PER LU NONZERO -- the kernel is at parity -- and
+    /// its entire remaining 1.58x deficit is that RCM hands us 1.62x more fill than SciPy's COLAMD
+    /// (357,568 against 220,624). The banded kernel requires a banded ordering, so the lever has
+    /// to reduce the ENVELOPE while staying banded.
+    ///
+    /// `reverse_cuthill_mckee` starts from the minimum-degree unvisited node. The textbook
+    /// improvement is a PSEUDO-PERIPHERAL start (George-Liu): repeatedly BFS from the current
+    /// candidate and jump to a minimum-degree node in the last level, which finds a near-diameter
+    /// endpoint and usually narrows the band substantially.
+    ///
+    /// The public `reverse_cuthill_mckee` is pinned to SciPy's output by
+    /// `reverse_cuthill_mckee_matches_scipy_reference_values`, so it cannot change. This measures
+    /// whether an INTERNAL variant would be worth having at all.
+    #[test]
+    #[ignore = "measurement: run explicitly"]
+    fn pseudo_peripheral_start_envelope_gain() {
+        fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("convection CSR")
+        }
+
+        // BFS levels from `start`; returns (last level's nodes, eccentricity).
+        fn bfs_levels(a: &CsrMatrix, start: usize, n: usize) -> (Vec<usize>, usize) {
+            let (indptr, indices) = (a.indptr(), a.indices());
+            let mut seen = vec![false; n];
+            let mut frontier = vec![start];
+            seen[start] = true;
+            let mut depth = 0usize;
+            loop {
+                let mut next = Vec::new();
+                for &u in &frontier {
+                    for &v in &indices[indptr[u]..indptr[u + 1]] {
+                        if !seen[v] {
+                            seen[v] = true;
+                            next.push(v);
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    return (frontier, depth);
+                }
+                frontier = next;
+                depth += 1;
+            }
+        }
+
+        // George-Liu: jump to a least-degree node of the last level until the eccentricity stops
+        // growing.
+        fn pseudo_peripheral(a: &CsrMatrix, n: usize) -> usize {
+            let (indptr, _) = (a.indptr(), a.indices());
+            let degree = |i: usize| indptr[i + 1] - indptr[i];
+            let mut current = (0..n).min_by_key(|&i| degree(i)).unwrap_or(0);
+            let (mut last, mut ecc) = bfs_levels(a, current, n);
+            for _ in 0..10 {
+                let candidate = *last.iter().min_by_key(|&&i| degree(i)).unwrap_or(&current);
+                let (next_last, next_ecc) = bfs_levels(a, candidate, n);
+                if next_ecc <= ecc {
+                    break;
+                }
+                current = candidate;
+                last = next_last;
+                ecc = next_ecc;
+            }
+            current
+        }
+
+        // RCM from an explicit start node.
+        fn rcm_from(a: &CsrMatrix, n: usize, start: usize) -> Vec<usize> {
+            let (indptr, indices) = (a.indptr(), a.indices());
+            let degree = |i: usize| indptr[i + 1] - indptr[i];
+            let mut visited = vec![false; n];
+            let mut order = Vec::with_capacity(n);
+            let mut roots: Vec<usize> = vec![start];
+            roots.extend((0..n).filter(|&i| i != start));
+            for root in roots {
+                if visited[root] {
+                    continue;
+                }
+                visited[root] = true;
+                let mut queue = std::collections::VecDeque::from(vec![root]);
+                while let Some(u) = queue.pop_front() {
+                    order.push(u);
+                    let mut neighbours: Vec<usize> = indices[indptr[u]..indptr[u + 1]]
+                        .iter()
+                        .copied()
+                        .filter(|&v| !visited[v])
+                        .collect();
+                    neighbours.sort_by_key(|&v| degree(v));
+                    for v in neighbours {
+                        if !visited[v] {
+                            visited[v] = true;
+                            queue.push_back(v);
+                        }
+                    }
+                }
+            }
+            order.reverse();
+            order
+        }
+
+        fn profile_of(a: &CsrMatrix, perm: &[usize], n: usize) -> u64 {
+            let mut inverse = vec![0usize; n];
+            for (position, &original) in perm.iter().enumerate() {
+                inverse[original] = position;
+            }
+            let (indptr, indices) = (a.indptr(), a.indices());
+            let mut total = 0u64;
+            for position in 0..n {
+                let original = perm[position];
+                let mut leftmost = position;
+                for &column in &indices[indptr[original]..indptr[original + 1]] {
+                    leftmost = leftmost.min(inverse[column]);
+                }
+                total += (position - leftmost) as u64;
+            }
+            total
+        }
+
+        for (label, matrix) in [
+            ("convection(64) [run7d]", convection_diffusion_2d(64)),
+            ("cubic(16)      [llywn]", splu_dirichlet_laplacian_3d(16)),
+        ] {
+            let n = matrix.shape().rows;
+            let shipping = reverse_cuthill_mckee(&matrix);
+            let start = pseudo_peripheral(&matrix, n);
+            let improved = rcm_from(&matrix, n, start);
+            let (p_ship, p_imp) = (
+                profile_of(&matrix, &shipping, n),
+                profile_of(&matrix, &improved, n),
+            );
+            println!(
+                "PP_START {label} n={n} start_node={start} shipping_profile={p_ship} \
+                 pseudo_peripheral_profile={p_imp} fill_ship={} fill_pp={} gain={:.4}x",
+                2 * p_ship + n as u64,
+                2 * p_imp + n as u64,
+                (2 * p_ship + n as u64) as f64 / (2 * p_imp + n as u64) as f64
+            );
+        }
+    }
+
     #[test]
     fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
         // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
