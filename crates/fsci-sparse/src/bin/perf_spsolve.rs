@@ -25,8 +25,8 @@ use fsci_sparse::spsolve_triangular;
 // FSCI_DISABLE_STRUCTURAL_FASTPATHS is set. Gated to match that single use site.
 #[cfg(feature = "sparse-incumbent-bench")]
 use fsci_sparse::linalg::{
-    SPLU_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
-    SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
+    SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_SUPERNODAL_ENABLE, SPLU_SUPERNODAL_FACTOR_HITS,
+    SPSOLVE_CUBIC_SPECTRAL_DISABLE, SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
 };
 use nalgebra::{DMatrix, DVector};
 #[cfg(feature = "sparse-incumbent-bench")]
@@ -904,10 +904,11 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
         }
     }
     println!(
-        "CUBIC_SPLU_PROFILE side={side} n={n} nnz={} rhs_count={rhs_count} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={}",
+        "CUBIC_SPLU_PROFILE side={side} n={n} nnz={} rhs_count={rhs_count} repetitions={repetitions} elapsed_seconds={:.9} checksum={checksum:.17e} input_sha256={} {}",
         matrix.nnz(),
         started.elapsed().as_secs_f64(),
         cubic_splu_fixture_sha256(&matrix, &right_hand_sides),
+        supernodal_arm_status(),
     );
 }
 
@@ -937,6 +938,48 @@ fn apply_structural_fastpath_env() {
     }
 }
 
+/// `FSCI_SPLU_SUPERNODAL=1` routes the splu profiles through the supernodal arm
+/// (frankenscipy-bfk5l).
+///
+/// WHY A PROFILE NEEDS TO REACH THIS. `SPLU_SUPERNODAL_ENABLE` was driven only by in-crate tests,
+/// so the census counted it as exercised while no PROFILE could select it -- and the question it
+/// answers is a profiling question. hpx50 left llywn's packing ceiling as a range, 1.20-fold to
+/// 1.38-fold, and the entire spread is whether a supernodal symbolic pass absorbs
+/// `matched_run_length` (19.26% of the cubic cell's factorization, run PER UPDATE) or whether that
+/// compare survives per update. Profiling this path and reading that function's share off it
+/// decides between the two.
+///
+/// THE ARM'S KNOWN SLOWNESS IS NOT THE POINT. It measured 5.77-fold worse overall on this cell.
+/// The question here is STRUCTURAL -- which functions the path executes -- and a path can be
+/// slower in total while still showing that the per-update pattern compare is unnecessary. Do not
+/// read a total-cost number off a profile taken through this switch.
+///
+/// Off by default, so every arm runs exactly as it ships unless the variable is set. The profile
+/// prints whether the arm actually planned or declined, because `factorize_csr_supernodal` returns
+/// `None` and falls through whenever the plan cannot be trusted -- and a silent fall-through would
+/// make this switch look inert exactly the way `FSCI_DISABLE_STRUCTURAL_FASTPATHS` once did.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn apply_supernodal_env() {
+    if matches!(
+        std::env::var("FSCI_SPLU_SUPERNODAL").ok().as_deref(),
+        Some("1") | Some("true")
+    ) {
+        SPLU_SUPERNODAL_ENABLE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Did the supernodal arm actually run, or did it plan-and-decline? Printed by the profiles that
+/// can reach it, so the switch cannot read as inert when it merely fell through.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn supernodal_arm_status() -> String {
+    let requested = matches!(
+        std::env::var("FSCI_SPLU_SUPERNODAL").ok().as_deref(),
+        Some("1") | Some("true")
+    );
+    let hits = SPLU_SUPERNODAL_FACTOR_HITS.load(std::sync::atomic::Ordering::Relaxed);
+    format!("supernodal_requested={requested} supernodal_factor_hits={hits}")
+}
+
 /// Ordering for the fsci-only splu profiles (convection and cubic).
 ///
 /// It used to be hardcoded to `LuOptions::default()` while the live arm read
@@ -945,6 +988,7 @@ fn apply_structural_fastpath_env() {
 #[cfg(feature = "sparse-incumbent-bench")]
 fn splu_profile_options() -> LuOptions {
     apply_structural_fastpath_env();
+    apply_supernodal_env();
     let ordering = match std::env::var("FSCI_SPLU_ORDERING").ok().as_deref() {
         None | Some("") | Some("default") => LuOptions::default().ordering,
         Some("colamd") => PermutationOrdering::Colamd,

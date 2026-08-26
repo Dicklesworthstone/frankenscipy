@@ -41194,3 +41194,97 @@ hot path: counters in a hot loop are optimisation BARRIERS and have already infl
 union pattern once per supernode from `supernode_widths_from_symbolic` and reports whether
 `matched_run_length` disappears from the profile. That moves the ceiling from the 1.20-1.38-fold
 range to a single number, and only then is building the packed kernel a decision rather than a bet.
+
+## 2026-08-26 - BlackThrush (cc) - hpx50's range COLLAPSES to row B: a supernodal plan does absorb the per-update pattern compare (19.26% -> 0.03%), so the ceiling is 1.308-1.384-fold — and the same profile shows the existing arm spends 9.63-fold MORE instructions to get there
+
+**Result class: BEHAVIORAL.** Bead `frankenscipy-bfk5l`, informs `llywn.3`. Collapses `hpx50`.
+**probe**: `crates/fsci-sparse/src/bin/perf_spsolve.rs --profile-cubic-splu-rust` under
+`valgrind --tool=callgrind --cache-sim=no --branch-sim=no`, with the new `FSCI_SPLU_SUPERNODAL=1`
+driver.
+**same_host=thinkstation1**, 64 cpu. **harness**: `perf_spsolve` with
+`--features sparse-incumbent-bench`, executed ELF sha256
+`76bcb77bb9e878a0f6807e2f4518a576d84abad9b5d9b187d3da93aee0793ce0`.
+**Ratios are spelled `N-fold`, not `Nx`: they are ratios of INSTRUCTION COUNTS, never of time.**
+**Callgrind counts are deterministic and load-independent. No timing claim is made.**
+
+**observed:** same cell, same fixture
+(`input_sha256=acc1c86b49d19e02d404ff0b303dcbdb642db28410d73c99234b3ccc7a705b9e`), same ordering,
+same binary, 3 repetitions each. Per-function share, sequential arm against supernodal arm --
+
+    function                        sequential   supernodal
+    symbolic_fill_pattern                   --       51.25%
+    factorize_csr_supernodal                --       42.12%
+    apply_sorted_pivot_tail             44.28%        0.06%
+    matched_run_length                  19.26%        0.03%
+    merge_sorted_remainder               3.05%        0.00%
+    factorize_csr                       11.39%           --
+    from_factor_rows                     5.67%        0.59%
+    TOTAL Ir                     2,267,963,976   21,831,080,680
+
+### The question, answered
+
+`hpx50` left llywn's packing ceiling as a range because one structural fact was unknown: does a
+supernodal symbolic pass absorb `matched_run_length`, the per-update run-length compare that is
+19.26% of the cell's factorization?
+
+**It does. 19.26% -> 0.03%.** `apply_sorted_pivot_tail` goes 44.28% -> 0.06% and
+`merge_sorted_remainder` 3.05% -> 0.00% alongside it. The per-update merge machinery is not
+reduced, it is essentially gone.
+
+So `hpx50`'s row A is eliminated and the ceiling is row B:
+
+    replaceable 67.91%  ->  kernel 1.53-fold gives 1.308-fold on the cell (closes 71%)
+                            kernel 1.69-fold gives 1.384-fold on the cell (closes 86%)
+
+against llywn's 1.46-fold residual.
+
+### And the same profile says the existing arm is not the way to collect it
+
+**The supernodal path executes 9.63-fold MORE instructions in total** -- 21,831,080,680 against
+2,267,963,976 on identical work. It eliminated the merge and bought something far more expensive:
+
+  * `symbolic_fill_pattern` alone is **5.03-fold the entire sequential factorization**;
+  * `factorize_csr_supernodal` alone is **4.13-fold the entire sequential factorization**.
+
+**That 4.13-fold independently reproduces llywn.2's 4.17-fold**, which was measured separately and
+with the symbolic phase zeroed. Two different measurements, two different sessions, agreeing to
+1%. That is the strongest confirmation on this cell that the existing blocked path is not a
+starting point -- and it now has a localisation llywn.2 did not have: **the symbolic pass is the
+larger half, and llywn.2 was zeroing exactly the half that costs most.**
+
+### What this means for llywn, stated carefully
+
+The 1.308-1.384-fold ceiling is what a GOOD supernodal implementation could reach on this cell. It
+is NOT what this one reaches; this one is 9.63-fold in the wrong direction. The result makes the
+lever's payoff a single number instead of a range, and simultaneously says the existing code
+cannot be tuned into it -- the two halves of its cost are both larger than the entire thing they
+replace.
+
+### Controls
+
+**The new switch was verified in both directions before any profile was taken**:
+`supernodal_requested=false supernodal_factor_hits=0` with it off, `supernodal_requested=true
+supernodal_factor_hits=4` with it on. A switch that silently fell through would have produced a
+"supernodal" profile identical to the sequential one and the answer would have been the opposite
+of the truth. `factorize_csr_supernodal` returns `None` and falls back whenever its plan cannot be
+trusted, so this is a live hazard on this specific toggle rather than a formality.
+
+**Both arms produce byte-identical results**: `checksum=1.59345163910255661e1` from each, on the
+same fixture at the same repetition count. The comparison is between two paths computing the same
+factorization, not between two different problems.
+
+`matched_run_length` at 0.03% was read at a 99.99% annotation threshold, not inferred from its
+absence at 92% -- absence from a truncated listing is not evidence of absence.
+
+### Method note
+
+The `FSCI_SPLU_SUPERNODAL` driver was added because `SPLU_SUPERNODAL_ENABLE` was reachable only
+from in-crate tests, so the census counted it exercised while no PROFILE could select it -- and the
+question it answers is a profiling question. `scripts/toggle_driver_census.py fsci-sparse` remains
+at 0 EXERCISED NOWHERE.
+
+**Concrete retry predicate:** the ceiling is now a number, so the open question is no longer "how
+much" but "at what cost". Price a symbolic pass that computes only the supernode union patterns
+rather than the full fill pattern -- `symbolic_fill_pattern` at 5.03-fold the sequential
+factorization is the single largest item in the supernodal profile, and no packing lever can pay
+for itself until that is smaller than what it saves.
