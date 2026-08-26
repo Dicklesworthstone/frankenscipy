@@ -843,6 +843,7 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
     );
 }
 
+<<<<<<< HEAD
 /// Ordering for the fsci-only convection profile.
 ///
 /// It used to be hardcoded to `LuOptions::default()` while the live arm read
@@ -867,6 +868,8 @@ fn convection_profile_options() -> LuOptions {
 }
 
 #[cfg(feature = "sparse-incumbent-bench")]
+=======
+>>>>>>> fe722fe71 (perf(sparse): widen the periodic-cuboid recognizer to cubic and even extents (frankenscipy-g68jq))
 /// Ordering for the fsci-only convection profile.
 ///
 /// It used to be hardcoded to `LuOptions::default()` while the live arm read
@@ -890,6 +893,7 @@ fn convection_profile_options() -> LuOptions {
     }
 }
 
+#[cfg(feature = "sparse-incumbent-bench")]
 fn profile_convection_splu_rust(
     repetitions: usize,
     side: usize,

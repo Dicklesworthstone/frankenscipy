@@ -39818,3 +39818,85 @@ question about the algorithm, and it is the first time this bead has had one.
   which is `zdom3`'s own outstanding measurement and is unaffected by this widening. Then
   re-measure the 124.677x row itself, or mark it stale where it is quoted, because it is
   currently the load-bearing number in two beads and it no longer describes the code.
+
+## 2026-08-26 - BlackThrush (cc) - g68jq's widening MEASURED against the live incumbent at last, by counting: 41.14x fewer instructions on the cubic periodic cell, and BEFORE the widening that cell was at PARITY, not at a 124x loss
+
+- **Result class: SELF-SPEEDUP plus a COMPETITIVE BOUND, both decided by a counted mechanism and
+  by nothing else.** No wall claim: this cell's live harness enforces
+  `host_mean_busy <= 0.200` and has refused every attempt across four sessions; the box sat at
+  loadavg 93-106 for this turn. Instruction counts do not depend on load. **CV is not computed and
+  would be provenance only.**
+
+- **probes, both re-runnable, and startup is SUBTRACTED rather than assumed away.** Each arm is
+  measured at 5 and at 25 repetitions and differenced, so process startup, imports and matrix
+  construction cancel: on the Dirichlet cubic cell those terms were 4.5x the work itself, so
+  assuming them negligible has already been shown to invert a result here.
+  * fsci: `perf_spsolve --profile-periodic-cuboid-spsolve-rust <reps> 11 11 11`
+  * SciPy: `python3 crates/fsci-sparse/python/scipy_periodic_cuboid_flops.py <reps> 11 11 11`
+    (committed, so the incumbent arm is re-runnable)
+
+- **THE COUNTED MECHANISM.** Per `spsolve` on the shifted anisotropic 7-point PERIODIC cuboid,
+  11x11x11, n=1331, nnz=9317:
+
+    | arm | instructions per spsolve |
+    |---|---|
+    | fsci spectral (post-widening) | **4,322,330** |
+    | fsci general LU (pre-widening behaviour) | 177,841,271 |
+    | live SciPy 1.17.1 `spsolve` | 174,281,460 |
+
+    the widening bought          **41.14x** fewer instructions on this cell
+    fsci spectral vs live SciPy  **40.32x** fewer instructions
+    fsci general LU vs live SciPy  **0.98x** -- parity, marginally behind
+
+- **AND THAT LAST ROW IS THE ONE WORTH READING.** `frankenscipy-g68jq` and `frankenscipy-zdom3`
+  both still carry a 124.677x figure for this problem class in their bead text. **Measured here
+  with the fast path disabled -- which is exactly the pre-widening behaviour for a cubic grid --
+  the general LU sits at 0.98x of live SciPy, i.e. at parity.** I reported the staleness of that
+  figure once already from a provisional draw and got the explanation wrong; this is the first
+  time the pre-widening arm has been measured directly on this cell rather than inferred. The
+  widening therefore turned a PARITY cell into a 40x win, which is a different and smaller claim
+  than "closed a 124x loss", and it is the accurate one.
+
+- **AN INSTRUCTION RATIO IS NOT A WALL RATIO, and the two disagree here in the direction worth
+  flagging.** One inadmissible 21-round live draw of this cell (recorded 2026-08-26, explicitly
+  labelled unquotable) read `live_scipy/candidate = 94.75`, against 40.32x on instructions.
+  Larger in wall than in instructions is consistent with the IPC gap already measured on this
+  crate -- our dense, cache-friendly spectral route retires more instructions per cycle than
+  SciPy's sparse LU -- but **nothing here licenses quoting either number as the other.** The
+  admissible statement from this row is the instruction ratio.
+
+- **A DEAD TOGGLE IN MY OWN INSTRUMENTATION, found by disbelieving a clean result.** The first
+  attempt at this measurement reported the two fsci arms within **0.03%** of each other, which
+  reads as "the route makes no difference". It was not: `FSCI_DISABLE_STRUCTURAL_FASTPATHS` lived
+  inside `splu_profile_options`, and the periodic profile calls `spsolve` with
+  `SolveOptions::default()` and never touches that builder, so the variable was INERT and both
+  arms ran identical code. Extracted to `apply_structural_fastpath_env`, called from the periodic
+  profile, and **the profile now prints `periodic_profile_backend_used`** so the failure is
+  visible on the row rather than requiring suspicion. Observed on both arms after the fix: unset
+  gives `PeriodicCuboidSpectralLu`, set gives `NativeSparseLu`. Nothing from the dead-toggle run
+  is quoted anywhere.
+
+- **CONFORMANCE.** fsci `max_relative_residual = 1.93e-12`, SciPy `4.95e-12`, on the same fixture.
+  The certified live run of this cell additionally reported `component_mismatches=0` and
+  `relative_l2=3.405e-15`.
+
+- **PROVENANCE.** `frankenscipy_engine_sha256 = executed-binary ELF SHA-256 =`
+  `0ea5acbb6cbb8024ce30ba9689aafceaf36f4d9626dea1f92d53e914e94472e8`
+  (artifact `target/release/perf_spsolve`; ONE binary, both fsci arms, selected by env).
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.3, reported by the oracle script itself alongside its `nnz`).
+  `same_host=thinkstation1`, run locally on worker `thinkstation1` (no rch worker admitted this
+  session: every candidate reported `os_gate_excluded=1 required_os=none`, so
+  `build_route=local-wrapper-bypass`). CPU `AMD Ryzen Threadripper PRO 5975WX`,
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `CPU frequency governor=powersave`, loadavg 93-106 throughout. `build_slot` REFUSED server-side
+  (frankenscipy-fr78g).
+
+- **Concrete retry predicate:** this cell now has a defensible number without a quiet host, so the
+  outstanding live row is a nice-to-have rather than a blocker -- take it if a window ever opens,
+  and expect the wall ratio to EXCEED the instruction ratio for the IPC reason above. Separately,
+  and more usefully: **both `g68jq` and `zdom3` should have the 124.677x figure in their bead text
+  annotated with a pointer to the row that superseded it.** I have now twice reasoned from that
+  number and twice had to correct the reasoning; the third agent to read those beads will do the
+  same.
