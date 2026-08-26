@@ -40755,3 +40755,100 @@ CV IS PROVENANCE ONLY and was not used for the decision: `cv_used_for_decision=f
   folded into a perf commit. The landed test is written to fail loudly when the tail arrives, with
   a message telling the next agent to rewrite it to assert the NEW parity rather than delete it.
   The other half -- an RBF entry in the interpolate oracle -- is not written.
+
+## 2026-08-26 - BlackThrush (cc) - griddata/LinearND returned NaN for points INSIDE the hull: both Delaunay implementations sized their super-triangle with a fixed constant, and the requirement grows with N
+
+**Result class: BEHAVIORAL.** Bead `frankenscipy-tkpwa`, CLOSED. Commit `7001e7350`.
+**No competitive ratio is entered by this row** -- see "what this row deliberately does not claim".
+
+**probe**: `crates/fsci-interpolate/src/bin/probe_griddata_triangulation.rs` (Euler triangle count
+and independently computed covered area) and the parity gate of
+`crates/fsci-interpolate/src/bin/perf_griddata_live.rs` (live SciPy 1.17.1 held in a persistent
+child, compared before any timing is permitted).
+**same_host=thinkstation1**, 64 cpu. **harness**: `perf_griddata_live` at commit `7001e7350`.
+
+**observed:** `nan_mismatches` over 2000 queries went 4 -> 0; the Euler triangle deficit at
+N=400/800/2000 went 1/4/8 -> 0/0/0; uncovered hull area went 7.738e-05/7.431e-04/1.152e-03 ->
+5.551e-16; `worst_abs_diff` against live SciPy 1.17.1 is 1.838e-12 over 2000 queries.
+
+### Observed
+
+**observed:** the parity gate refused the cell outright --
+
+    parity: worst_abs_diff=1.228e-12 nan_mismatches=4 n=2000
+    panicked: fsci and live SciPy disagree; no timing is admissible
+
+4 of 2000 queries returned NaN from fsci and a finite value from SciPy, and every one of them sat
+1.7e-4 to 9.4e-4 INSIDE the convex hull. After the fix, on the same fixture and invocation:
+
+    parity: worst_abs_diff=1.838e-12 nan_mismatches=0 n=2000
+
+### Cause, and why no constant could have been the fix
+
+Bowyer-Watson strips the triangles still touching the super-triangle's vertices at the end. With
+`margin = 10.0` the super-triangle sat close enough that genuine near-boundary triangles were
+attached to a super-vertex and deleted along with it, leaving holes inside the hull. Euler prices
+the loss exactly: a Delaunay triangulation of N points with h on the hull has `2N - 2 - h`
+triangles. **observed** deficits over a margin sweep:
+
+    margin   N=400   N=800   N=2000        <- triangles MISSING
+        10       1       4        8
+        30       1       2        6
+       100       0       0        4
+       300       0       0        1
+      1000       0       0        0
+
+**The requirement grows with N, and that is the whole finding.** A margin of 100 suffices at N=800
+and still loses 4 triangles at N=2000, so any fixed constant only relocates the failure to a larger
+input and would have looked like a fix on every fixture in the suite. The margin now escalates and
+the RESULT is checked against `2N - 2 - h` rather than the constant trusted. After the fix the
+deficit is 0 and the uncovered area is 5.551e-16 at N=400/800/2000.
+
+The `-1e-10` barycentric tolerance in `find_simplex` is NOT implicated and is unchanged: it is five
+orders of magnitude too small to reach a query 1e-4 deep.
+
+### A correction to my own bead, and the reason it matters
+
+`frankenscipy-tkpwa` was written against `fsci_spatial::Delaunay`, and the probe that produced its
+deficit table uses `fsci_spatial::Delaunay`. **But `griddata` does not go through that type at
+all** -- `fsci-interpolate` carries its own independent `Delaunay2D` with the same defect from the
+same constant. Fixing `fsci_spatial::Delaunay` alone left `nan_mismatches=4` exactly where it was.
+
+Both are fixed. **The lesson is that a probe which agrees with a symptom is not the same as a probe
+that shares a code path with it.** Two defects with a common cause made the wrong conclusion look
+confirmed: the probe's deficit was real, the symptom was real, and they were not the same bug.
+
+### A position effect in my own harness, caught by its own null
+
+With parity restored, the first admissible run still voided, and the null is what said why:
+
+    fsci_A/A : median=0.983847 ci95=[0.961750,1.005348]   <- clean
+    scipy_A/A: median=1.073017 ci95=[1.048916,1.099971]   <- CI EXCLUDES 1.0
+
+The quartet was fixed at `f1 s1 s2 f2`, which puts fsci's two null samples in the OUTER slots and
+SciPy's in the two ADJACENT middle slots, so `s1` always paid the cold-cache cost of following an
+fsci run and `s2` never did. **That is a POSITION effect, and ABBA does not cancel it** -- ABBA
+cancels drift between halves, not an asymmetry in which slot each arm occupies. The quartet now
+flips every round and each arm takes an untimed warmup; the SciPy null then read
+
+    scipy_A/A: median=1.007377 ci95=[0.997818,1.016684]
+
+Any row taken from the old schedule would have carried a real bias in the denominator with a
+passing-looking fsci null beside it.
+
+### What this row deliberately does not claim
+
+The cell now produces a competitive number with both nulls passing, and it is NOT entered here.
+`perf_griddata_live` cannot yet meet this ledger's timed-row provenance gates: it records one
+executed ELF SHA-256 but not two distinct named engine artifact hashes, it does not apply the
+explicit 2x A/A-null margin, and it does not state that CV is provenance-only. Recording a
+competitive figure without those would be claiming an evidence class the harness has not paid for,
+so the figure stays out of the ledger until the harness earns it.
+
+**Concrete retry predicate:** filed as `frankenscipy-dehqu`. Closing it means teaching
+`perf_griddata_live` to hash BOTH engine artifacts (the fsci ELF and SciPy's `_qhull` extension
+module, which is the binary actually backing `Delaunay`/`LinearND`), to apply the 2x null margin
+rather than its own "within 2% and CI spans unity" rule, to state that CV is provenance-only, and
+to emit the hardware/thread provenance block. The cell is then re-runnable at
+`perf_griddata_live 61 800 2000 linear` and the row can be taken under the timed class. **Not by
+weakening any gate in `scripts/ledger_preflight.py`** -- the harness should earn the class.
