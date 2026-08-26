@@ -1,0 +1,24 @@
+elf_sha256=3b6e779049b8284745dd643db0a13da22e4658ddc1229f5f27b0ddeb19d8e501
+frankenscipy_engine_sha256=3b6e779049b8284745dd643db0a13da22e4658ddc1229f5f27b0ddeb19d8e501
+elf_path=/data/tmp/cargo-target/release/perf_splu
+provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64 ram_bytes=231692255232 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1 loadavg=10.76 30.77 75.75 7/7276 2101899
+supernodal_arm=DISABLED (per-pivot elimination)
+partial_inplace_arm=ENABLED (coincident prefix updated in place)
+back_merge_arm=DISABLED (shared scratch plus copy-back)
+row_head_cache_arm=ENABLED (shipping dense head projection)
+fixture=laplacian_3d_cubic side=16 rounds=41 warmup=4 arm=general-sparse-LU (cubic spectral fast path DISABLED)
+fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f n=4096 nnz=27136
+scipy_identity: READY scipy=1.17.1 numpy=2.4.3 engine_module=scipy.sparse.linalg._dsolve.linsolve scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388 fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f n=4096 nnz=27136 lu_nnz=1231312 observed_os_tasks=1 affinity=1 fsci_loaded=False genuine=True
+parity: worst_rel_solution_diff=1.579e-14 scale=4.363922e1
+fsci_arm_ordering=Amd
+execution_proof: fsci_backend=NativeSparseLu fsci_ordering=Amd fsci_lu_payload_bytes=7878784 scipy_lu_nnz=1231312 cubic_spectral_factor_hits=0 cubic_spectral_toggle_reads=0 arm_expected_spectral=false
+execution_proof: row_head_cache_enabled=true row_head_cache_factor_hits=169 row_head_cache_toggle_reads=169
+execution_proof: back_merge_enabled=false back_merge_factor_hits=0 back_merge_toggle_reads=169
+execution_proof: partial_inplace_enabled=true partial_inplace_factor_hits=169 partial_inplace_toggle_reads=169
+execution_proof: supernodal_enabled=false supernodal_factor_hits=0 supernodal_toggle_reads=169
+pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.104) post_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.293)
+NULL scipy/scipy=0.9996 NULL fsci/fsci=0.9932 bound=+/-0.02 null_edge=0.0068 decided_if_ci_lo>1.0136_or_ci_hi<0.9864
+quiescence=clear method=balanced-square criterion=both_A/A_nulls_within_0.020
+absolute: scipy_median_ns=41500503 ci95=[41001802,41991403] fsci_median_ns=106479558 ci95=[105519604,108844816] scipy_median_us=41500.503 fsci_median_us=106479.557
+per_unit: scipy_ns_per_lu_nonzero=33.7043 fsci_ns_per_lu_nonzero=86.4765 scipy_ns_per_row=10131.96 fsci_ns_per_row=25995.99 lu_nnz=1231312 n=4096
+Incumbent ratio: SciPy / FrankenSciPy = 0.3895x  ci95=[0.3867,0.3934]  rounds=41  verdict=ADMISSIBLE: FrankenSciPy SLOWER

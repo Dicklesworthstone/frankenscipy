@@ -40040,3 +40040,90 @@ question about the algorithm, and it is the first time this bead has had one.
   ~4.5x, the mechanism is closed and the ordering question on this cell is finished for good. Do
   NOT spend a quiet window on a live AMD row for this cell first: the counted result above says
   it would measure a regression.
+
+## 2026-08-26 - BlackThrush (cc) - llywn's cubic cell RE-MEASURED at HEAD: 0.6871x over four replicates, and ALL FIVE implemented levers are already in their best configuration
+
+- **Result class: TIMED, REPLICATE-LEVEL, plus four A/B REJECTs.** Live SciPy 1.17.1 in the same
+  invocation as the candidate, balanced-square schedule, both A/A nulls inside the harness's
+  +/-0.020 bound on every one of the twelve invocations below. **CV is not used for any decision
+  here; every figure is a median with an interval over REPLICATES or a same-window A/B.**
+
+- **THE STANDING FIGURE, re-measured.** `frankenscipy-llywn` is the campaign's worst standing
+  replicated loss. Its last figure was `0.6237` CI95 [0.6215, 0.6287] over twelve replicates
+  (2026-08-17). At HEAD, four independent invocations, position-balanced:
+
+        replicate_aggregate: n=4 median=0.6871x ci95_across_replicates=[0.6840,0.6961]
+        observed_range=[0.6840,0.6961] spread=1.8% deficit_vs_incumbent=1.46x
+
+  Individual draws 0.6870 / 0.6872 / 0.6961 / 0.6840, every one `ADMISSIBLE`. **The cell is
+  BETTER than its standing figure** -- 1.46x deficit against 1.60x -- and the replicate spread is
+  1.8% against the 13-15% this bead has historically seen, so this is the tightest set it has
+  produced. I am NOT claiming the improvement is a code change: nothing I did touches this path,
+  and a quieter window is a sufficient explanation. **What is claimed is the new figure, not a
+  delta.**
+
+- **ABSOLUTES AND THE MECHANISM, in one line.** `scipy_ns_per_lu_nonzero=32.6489` against
+  `fsci_ns_per_lu_nonzero=47.7404`, on IDENTICAL fill (`scipy_lu_nnz=1231312`; our payload
+  14,358,064 bytes = 1.196M entries). SciPy median 40.201 ms, fsci 58.783 ms.
+  **The entire deficit is per-entry throughput at equal fill** -- exactly what llywn has said
+  since it was filed, now stated in nanoseconds per LU nonzero.
+
+- **ALL FOUR ALTERNATIVE ARMS ARE WORSE, each one an implemented lever, each fired and proven to
+  fire by its own hit counter.** Same ELF, same fixture, same window:
+
+    | arm | ratio | ci95 (rounds) | ns/lu_nnz | vs shipping |
+    |---|---|---|---|---|
+    | **shipping** (RCM, row-head-cache ON, back-merge OFF, partial-inplace ON, supernodal OFF) | **0.6871** | replicate [0.6840, 0.6961] | 47.74 | -- |
+    | AMD ordering | 0.3917 | replicate [0.3895, 0.3922], n=4 | -- | **1.75x worse** |
+    | supernodal blocking ON | 0.1190 | [0.1179, 0.1205] | 282.99 | **5.77x worse** |
+    | back-merge ON | 0.1693 | [0.1684, 0.1697] | 195.71 | **4.06x worse** |
+    | row-head-cache OFF | 0.5879 | [0.5864, 0.5926] | 56.31 | **1.17x worse** |
+
+  `supernodal_factor_hits=169`, `back_merge_factor_hits=169`, `row_head_cache_factor_hits=169`
+  with matching `toggle_reads=169` on their arms and `=0` on the others, so no row here is a dead
+  A/B measuring the same code twice.
+
+- **THE ROW-HEAD-CACHE ARM IS A NEGATIVE CONTROL AND IT BEHAVED.** It is the only one of the four
+  that is ON in the shipping configuration, so turning it OFF must make things WORSE if the
+  harness resolves arm changes at all -- and it does, by 1.17x, well outside the +/-2% null. A
+  suite where all four arms came back "worse" without this control would be indistinguishable
+  from a harness that reports the shipping number whatever you ask it for.
+
+- **SO THE IMPLEMENTED SURFACE ON THIS CELL IS EXHAUSTED.** Five levers exist; the shipping
+  configuration is the best setting of every one of them. The remaining 1.46x is not reachable by
+  any toggle in the tree.
+
+- **AMD IS NOW REFUTED IN WALL TIME TOO**, which was the open item from my counted row earlier
+  today. Counted said 2.47x more instructions at side=16; the wall says **1.75x worse ratio** and
+  `fsci_lu_payload_bytes=7,878,784` against the shipping arm's `14,358,064` -- i.e. AMD really
+  does hold **1.82x less fill** (matching the 1.83x measured structurally) and is still slower.
+  Less fill, more time, in the same window, with nulls passing on both arms.
+
+- **PROVENANCE.** `elf_sha256 = frankenscipy_engine_sha256 =`
+  `3b6e779049b8284745dd643db0a13da22e4658ddc1229f5f27b0ddeb19d8e501` (ONE binary; every arm above
+  is this ELF, selected by argument or by `FSCI_SPLU_ORDERING`).
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.3, `genuine=True`),
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`,
+  laplacian_3d_cubic side=16, n=4096, nnz=27136, rounds=41, warmup=4.
+  HARNESS `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` (bin `perf_splu`).
+  `same_host=thinkstation1`, run locally on worker `thinkstation1` (no rch worker admitted this
+  session: every candidate reported `os_gate_excluded=1 required_os=none`, so
+  `build_route=local-wrapper-bypass`). `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692255232`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `runtime_isa=avx2+fma`, `affinity/cpuset=1`,
+  `CPU frequency governor=powersave`, loadavg 6.4-13.1 across the twelve invocations.
+  `pre_measurement_quiescence=0.055 post=0.097`. `build_slot` REFUSED server-side
+  (frankenscipy-fr78g). Parity `worst_rel_solution_diff=3.908e-15` (shipping) and `1.579e-14`
+  (AMD) -- an ordering may change association, not the answer.
+
+- **Concrete retry predicate.** Nothing left to toggle: the next move on this cell is
+  IMPLEMENTATION, and the target is named by the absolutes rather than guessed. SuperLU reaches
+  32.65 ns per LU nonzero on this fill with supernodal panels handed to OpenBLAS; we reach 47.74
+  with per-pivot elimination. **Our supernodal arm is not a smaller version of that -- it is
+  5.77x SLOWER than our own per-pivot path**, so "enable supernodal" is not the lever and any
+  future attempt is a rewrite of that kernel, not a toggle. Before spending on it, measure why
+  the existing blocked-update path costs 283 ns/nnz where the per-pivot path costs 47.74; that is
+  one counted profile of an arm that already exists, needs no quiet host, and would either
+  produce a fixable defect or price the rewrite honestly. Do NOT re-try ordering: RCM, AMD and
+  exact minimum degree are all now measured on this cell and RCM wins.

@@ -1,0 +1,24 @@
+elf_sha256=3b6e779049b8284745dd643db0a13da22e4658ddc1229f5f27b0ddeb19d8e501
+frankenscipy_engine_sha256=3b6e779049b8284745dd643db0a13da22e4658ddc1229f5f27b0ddeb19d8e501
+elf_path=/data/tmp/cargo-target/release/perf_splu
+provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64 ram_bytes=231692255232 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1 loadavg=5.98 18.95 61.98 3/7301 2241516
+supernodal_arm=ENABLED (symbolic plan, blocked update)
+partial_inplace_arm=ENABLED (coincident prefix updated in place)
+back_merge_arm=DISABLED (shared scratch plus copy-back)
+row_head_cache_arm=ENABLED (shipping dense head projection)
+fixture=laplacian_3d_cubic side=16 rounds=41 warmup=4 arm=general-sparse-LU (cubic spectral fast path DISABLED)
+fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f n=4096 nnz=27136
+scipy_identity: READY scipy=1.17.1 numpy=2.4.3 engine_module=scipy.sparse.linalg._dsolve.linsolve scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388 fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f n=4096 nnz=27136 lu_nnz=1231312 observed_os_tasks=1 affinity=1 fsci_loaded=False genuine=True
+parity: worst_rel_solution_diff=3.908e-15 scale=4.363922e1
+fsci_arm_ordering=ReverseCuthillMcKee
+execution_proof: fsci_backend=NativeSparseLu fsci_ordering=ReverseCuthillMcKee fsci_lu_payload_bytes=14358064 scipy_lu_nnz=1231312 cubic_spectral_factor_hits=0 cubic_spectral_toggle_reads=169 arm_expected_spectral=false
+execution_proof: row_head_cache_enabled=true row_head_cache_factor_hits=169 row_head_cache_toggle_reads=169
+execution_proof: back_merge_enabled=false back_merge_factor_hits=0 back_merge_toggle_reads=169
+execution_proof: partial_inplace_enabled=true partial_inplace_factor_hits=169 partial_inplace_toggle_reads=169
+execution_proof: supernodal_enabled=true supernodal_factor_hits=169 supernodal_toggle_reads=169
+pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.071) post_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.221)
+NULL scipy/scipy=1.0040 NULL fsci/fsci=0.9981 bound=+/-0.02 null_edge=0.0040 decided_if_ci_lo>1.0080_or_ci_hi<0.9920
+quiescence=clear method=balanced-square criterion=both_A/A_nulls_within_0.020
+absolute: scipy_median_ns=42321629 ci95=[41186848,43337920] fsci_median_ns=348444614 ci95=[344988982,364898528] scipy_median_us=42321.629 fsci_median_us=348444.613
+per_unit: scipy_ns_per_lu_nonzero=34.3712 fsci_ns_per_lu_nonzero=282.9865 scipy_ns_per_row=10332.43 fsci_ns_per_row=85069.49 lu_nnz=1231312 n=4096
+Incumbent ratio: SciPy / FrankenSciPy = 0.1190x  ci95=[0.1179,0.1205]  rounds=41  verdict=ADMISSIBLE: FrankenSciPy SLOWER
