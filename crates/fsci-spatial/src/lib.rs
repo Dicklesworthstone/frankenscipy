@@ -14006,4 +14006,269 @@ mod toggle_ab_mahalanobis_assembly {
             par[last][NB - 1]
         );
     }
+
+    /// SciPy parity for `scipy.spatial` entry points with no differential coverage
+    /// (frankenscipy-ivxx6): `minkowski_distance`, `minkowski_distance_p`, `tsearch`,
+    /// `SphericalVoronoi`.
+    ///
+    /// TWO OF THESE HAVE IMPLEMENTATION-DEPENDENT OUTPUT and are deliberately NOT compared
+    /// elementwise, because doing so would manufacture a divergence out of a legal difference:
+    ///   * `tsearch` returns a SIMPLEX INDEX, and two libraries may build different but equally
+    ///     valid Delaunay triangulations of the same points. What is canonical is whether a query
+    ///     lies inside the hull, so that is what is pinned against SciPy; separately the returned
+    ///     simplex is checked to actually CONTAIN its query, which is a property rather than a
+    ///     convention and needs no oracle.
+    ///   * `SphericalVoronoi` vertex and region ORDER is not canonical. Pinned instead on
+    ///     order-independent invariants: vertex count, lexicographically sorted vertices, sorted
+    ///     region sizes, and that every vertex lies on the sphere.
+    ///
+    /// `minkowski_distance*` has no such freedom and is compared elementwise, including p < 1
+    /// (where it is not a metric, so an implementation assuming the triangle inequality can
+    /// quietly special-case it) and p = infinity.
+    ///
+    /// Measured against SciPy 1.17.1: 17 groups, worst 1.110e-16.
+    #[test]
+    fn minkowski_tsearch_sphericalvoronoi_against_scipy_1_17_1() {
+        use super::{
+            Delaunay, SphericalVoronoi, minkowski_distance, minkowski_distance_p, tsearch,
+        };
+
+        fn close(name: &str, got: &[f64], want: &[f64]) {
+            assert_eq!(got.len(), want.len(), "{name}: length");
+            for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-12,
+                    "{name}[{i}]: got {a:.17e}, SciPy 1.17.1 gives {b:.17e}"
+                );
+            }
+        }
+
+        let xa: Vec<Vec<f64>> = vec![
+            vec![0.0, 0.0, 0.0],
+            vec![1.0, 2.0, -1.0],
+            vec![-3.0, 0.5, 2.0],
+            vec![4.0, -4.0, 1.5],
+        ];
+        let xb: Vec<Vec<f64>> = vec![
+            vec![1.0, -1.0, 2.0],
+            vec![0.0, 0.0, 0.0],
+            vec![2.5, 1.5, -2.0],
+            vec![-1.0, 3.0, 0.0],
+        ];
+
+        for (p, want_d, want_dp) in [
+            (
+                0.5,
+                vec![
+                    11.65685424949238,
+                    11.65685424949238,
+                    28.571247279470295,
+                    37.29012583965875,
+                ],
+                vec![
+                    3.414213562373095,
+                    3.414213562373095,
+                    5.345207879911715,
+                    6.106564159955969,
+                ],
+            ),
+            (1.0, vec![4.0, 4.0, 10.5, 13.5], vec![4.0, 4.0, 10.5, 13.5]),
+            (
+                1.5,
+                vec![
+                    2.8567382778502783,
+                    2.8567382778502783,
+                    7.827290881260925,
+                    9.982059680283934,
+                ],
+                vec![
+                    4.82842712474619,
+                    4.82842712474619,
+                    21.89864333951443,
+                    31.537716372038467,
+                ],
+            ),
+            (
+                2.0,
+                vec![
+                    2.449489742783178,
+                    2.449489742783178,
+                    6.87386354243376,
+                    8.73212459828649,
+                ],
+                vec![6.0, 6.0, 47.25, 76.25],
+            ),
+            (
+                3.0,
+                vec![
+                    2.154434690031884,
+                    2.154434690031884,
+                    6.139110878621298,
+                    7.782554699694896,
+                ],
+                vec![10.0, 10.0, 231.375, 471.375],
+            ),
+        ] {
+            close(
+                &format!("minkowski_distance(p={p})"),
+                &minkowski_distance(&xa, &xb, p).unwrap(),
+                &want_d,
+            );
+            close(
+                &format!("minkowski_distance_p(p={p})"),
+                &minkowski_distance_p(&xa, &xb, p).unwrap(),
+                &want_dp,
+            );
+        }
+        close(
+            "minkowski_distance(p=inf)",
+            &minkowski_distance(&xa, &xb, f64::INFINITY).unwrap(),
+            &[2.0, 2.0, 5.5, 7.0],
+        );
+
+        // ---- tsearch: inside/outside is the canonical part ------------------------------------
+        let pts: Vec<(f64, f64)> = vec![
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (1.0, 1.0),
+            (0.0, 1.0),
+            (0.35, 0.45),
+            (0.7, 0.25),
+            (0.25, 0.75),
+        ];
+        let tri = Delaunay::new(&pts).expect("delaunay");
+        let queries: Vec<(f64, f64)> = vec![
+            (0.5, 0.5),
+            (0.2, 0.2),
+            (0.85, 0.6),
+            (0.1, 0.9),
+            (0.5, 0.05),
+            (-0.5, 0.5),
+            (1.5, 0.5),
+            (0.5, -0.4),
+        ];
+        let found = tsearch(&tri, &queries);
+        let inside: Vec<f64> = found.iter().map(|&s| f64::from(s >= 0)).collect();
+        close(
+            "tsearch/inside",
+            &inside,
+            &[1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
+        );
+        assert!(
+            inside.iter().any(|&v| v == 1.0) && inside.iter().any(|&v| v == 0.0),
+            "the tsearch fixture must contain queries BOTH inside and outside the hull"
+        );
+
+        // PROPERTY, not a convention: the reported simplex must contain its query point.
+        for (q, &s) in queries.iter().zip(found.iter()) {
+            if s < 0 {
+                continue;
+            }
+            let (i0, i1, i2) = tri.simplices[s as usize];
+            let ((ax, ay), (bx, by), (cx, cy)) = (pts[i0], pts[i1], pts[i2]);
+            let det = (bx - ax) * (cy - ay) - (cx - ax) * (by - ay);
+            let l1 = ((bx - q.0) * (cy - q.1) - (cx - q.0) * (by - q.1)) / det;
+            let l2 = ((cx - q.0) * (ay - q.1) - (ax - q.0) * (cy - q.1)) / det;
+            let l3 = 1.0 - l1 - l2;
+            assert!(
+                l1 >= -1e-9 && l2 >= -1e-9 && l3 >= -1e-9,
+                "tsearch returned simplex {s} for {q:?}, which does not contain it"
+            );
+        }
+
+        // ---- SphericalVoronoi: order-independent invariants -----------------------------------
+        let sphere: Vec<[f64; 3]> = vec![
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [
+                0.577_350_269_189_625_84,
+                0.577_350_269_189_625_84,
+                0.577_350_269_189_625_84,
+            ],
+            [
+                -0.577_350_269_189_625_84,
+                -0.577_350_269_189_625_84,
+                0.577_350_269_189_625_84,
+            ],
+        ];
+        let sv = SphericalVoronoi::new(&sphere, [0.0, 0.0, 0.0], 1.0).expect("spherical voronoi");
+        close(
+            "SphericalVoronoi/n_vertices",
+            &[sv.vertices.len() as f64],
+            &[12.0],
+        );
+
+        let mut sorted = sv.vertices.clone();
+        sorted.sort_by(|a, b| {
+            a[0].total_cmp(&b[0])
+                .then(a[1].total_cmp(&b[1]))
+                .then(a[2].total_cmp(&b[2]))
+        });
+        let flat: Vec<f64> = sorted.iter().flat_map(|v| v.iter().copied()).collect();
+        close(
+            "SphericalVoronoi/vertices(sorted)",
+            &flat,
+            &[
+                -0.6947465906068657,
+                -0.6947465906068657,
+                -0.18615678789738566,
+                -0.6947465906068657,
+                0.18615678789738566,
+                0.6947465906068657,
+                -0.5773502691896258,
+                -0.5773502691896258,
+                -0.5773502691896258,
+                -0.5773502691896258,
+                0.5773502691896258,
+                -0.5773502691896258,
+                -0.5773502691896258,
+                0.5773502691896258,
+                0.5773502691896258,
+                -0.18615678789738566,
+                0.6947465906068657,
+                0.6947465906068657,
+                0.18615678789738566,
+                -0.6947465906068657,
+                0.6947465906068657,
+                0.5773502691896258,
+                -0.5773502691896258,
+                -0.5773502691896258,
+                0.5773502691896258,
+                -0.5773502691896258,
+                0.5773502691896258,
+                0.5773502691896258,
+                0.5773502691896258,
+                -0.5773502691896258,
+                0.6947465906068657,
+                -0.18615678789738566,
+                0.6947465906068657,
+                0.6947465906068657,
+                0.6947465906068657,
+                -0.18615678789738566,
+            ],
+        );
+
+        let mut sizes: Vec<f64> = sv.regions.iter().map(|r| r.len() as f64).collect();
+        sizes.sort_by(f64::total_cmp);
+        close(
+            "SphericalVoronoi/region_sizes(sorted)",
+            &sizes,
+            &[3.0, 3.0, 4.0, 5.0, 5.0, 5.0, 5.0, 6.0],
+        );
+
+        // PROPERTY: every Voronoi vertex lies on the sphere.
+        let worst = sv
+            .vertices
+            .iter()
+            .map(|v| ((v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() - 1.0).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            worst <= 1e-12,
+            "SphericalVoronoi vertex off the sphere by {worst:.3e}"
+        );
+    }
 }
