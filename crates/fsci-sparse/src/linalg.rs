@@ -2001,8 +2001,40 @@ fn factorize_csr_banded(
         hi[column] = hi[column].max(furthest.max(column));
     }
 
-    // Refuse anything that is not worth the dense span: total band entries against the matrix's
-    // own nnz. A band far larger than the sparse fill would do arithmetic the sparse path skips.
+    // PATTERN SYMMETRY IS THE ACTUAL PRECONDITION, so it is what gets checked.
+    //
+    // The dense span is only sound when the envelope IS the fill. That `band_density == 1` is a
+    // classical result for a PATTERN-SYMMETRIC factor -- elimination fills the whole profile --
+    // and it is exactly what fails otherwise. A survey of pattern-unsymmetric shapes measured
+    // band_density 0.0019 on a down-arrow and 0.2729 on a skew band: spans hundreds of times
+    // emptier than the fill, where the dense sweep would do arithmetic the sparse path skips.
+    //
+    // The band/nnz ceiling below happened to decline both of those, but it is a PROXY that
+    // correlates rather than the property itself, and a proxy that has only been checked on the
+    // shapes someone thought to try is how a recogniser accepts the case nobody tested. Checking
+    // symmetry directly costs O(nnz) with a hash set per row and declines for the right reason.
+    {
+        let (indptr, indices) = (a.indptr(), a.indices());
+        let mut present: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for row in 0..n {
+            for &column in &indices[indptr[row]..indptr[row + 1]] {
+                present[row].push(column as u32);
+            }
+            present[row].sort_unstable();
+        }
+        for row in 0..n {
+            for &column in &present[row] {
+                let column = column as usize;
+                if column != row && present[column].binary_search(&(row as u32)).is_err() {
+                    return banded_decline(7);
+                }
+            }
+        }
+    }
+
+    // Secondary ceiling, kept as a backstop rather than the decision: total band entries against
+    // the matrix's own nnz. A band far larger than the sparse fill would do arithmetic the sparse
+    // path skips.
     let band: u64 = (0..n).map(|i| (hi[i] - lo[i] + 1) as u64).sum();
     let nnz = a.indices().len() as u64;
     SPLU_BANDED_LAST_BAND.store(band as usize, std::sync::atomic::Ordering::Relaxed);
@@ -2131,9 +2163,10 @@ const BANDED_MAX_BAND_PER_NNZ: u64 = 64;
 /// turns "the structure did not hold" into "something went wrong somewhere", which is how a
 /// recogniser quietly stops recognising anything. Indices: 0 not square / too large, 1 column out
 /// of range, 2 band too wide, 3 zero pivot, 4 pivot needs an interchange, 5 span overlap,
-/// 6 missing diagonal in U.
+/// 6 missing diagonal in U, 7 pattern-unsymmetric.
 #[doc(hidden)]
-pub static SPLU_BANDED_DECLINE_REASON: [std::sync::atomic::AtomicUsize; 7] = [
+pub static SPLU_BANDED_DECLINE_REASON: [std::sync::atomic::AtomicUsize; 8] = [
+    std::sync::atomic::AtomicUsize::new(0),
     std::sync::atomic::AtomicUsize::new(0),
     std::sync::atomic::AtomicUsize::new(0),
     std::sync::atomic::AtomicUsize::new(0),
@@ -18468,6 +18501,104 @@ mod tests {
         );
     }
 
+    /// WHERE DOES THE BANDED PATH STOP BEING SAFE? The survey that has to precede shipping it.
+    ///
+    /// The path assumes the envelope IS the fill -- `band_density == 1` -- which is a classical
+    /// result for a PATTERN-SYMMETRIC factor with no cancellation: elimination fills the whole
+    /// profile. Every cell measured so far is pattern-symmetric (a 5- or 7-point stencil carries
+    /// both `i-1` and `i+1`), so the density-1.000000 readings prove nothing about the case the
+    /// path could get wrong.
+    ///
+    /// A PATTERN-UNSYMMETRIC matrix is that case: its envelope can be far wider than its fill, and
+    /// the dense span would then do arithmetic the sparse path skips. This measures band_density
+    /// on such matrices and reports what the width guard does with them.
+    #[test]
+    #[ignore = "survey: run explicitly"]
+    fn banded_accept_decline_survey() {
+        // Lower-triangular-ish: every row reaches far LEFT but nothing reaches right. The
+        // envelope is huge; the fill is not.
+        fn arrow_down(n: usize) -> CsrMatrix {
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..n {
+                if row > 0 {
+                    indices.push(0);
+                    data.push(-1.0);
+                }
+                indices.push(row);
+                data.push(4.0 + row as f64);
+                indptr.push(data.len());
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("arrow CSR")
+        }
+        // Strongly unsymmetric banded: entries only to the LEFT of the diagonal at a long
+        // distance, plus a short right reach.
+        fn skew_band(n: usize, far_left: usize) -> CsrMatrix {
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..n {
+                if row >= far_left {
+                    indices.push(row - far_left);
+                    data.push(-1.0);
+                }
+                indices.push(row);
+                data.push(8.0);
+                if row + 1 < n {
+                    indices.push(row + 1);
+                    data.push(-1.0);
+                }
+                indptr.push(data.len());
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("skew CSR")
+        }
+
+        for (label, matrix) in [
+            ("arrow_down(2048)", arrow_down(2048)),
+            ("skew_band(2048,600)", skew_band(2048, 600)),
+            ("scattered(10)", scattered_pentadiagonal_csr(10)),
+        ] {
+            let n = matrix.shape().rows;
+            for counter in SPLU_BANDED_DECLINE_REASON.iter() {
+                counter.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            let general = NativeSparseLu::factorize_csr(
+                &matrix,
+                1.0,
+                PermutationOrdering::ReverseCuthillMcKee,
+            )
+            .expect("general factorization");
+            let fill = general.stored_nnz();
+            let accepted =
+                factorize_csr_banded(&matrix, 1.0, PermutationOrdering::ReverseCuthillMcKee);
+            let band = SPLU_BANDED_LAST_BAND.load(std::sync::atomic::Ordering::Relaxed);
+            let reasons: Vec<usize> = SPLU_BANDED_DECLINE_REASON
+                .iter()
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                .collect();
+            let density = if band > 0 {
+                fill as f64 / band as f64
+            } else {
+                f64::NAN
+            };
+            println!(
+                "SURVEY {label:<22} n={n} fill={fill} computed_band={band} \
+                 band_density={density:.4} accepted={} reasons={reasons:?}",
+                accepted.is_some()
+            );
+            // The property that matters: if the path ACCEPTS, the dense span must not be doing
+            // materially more arithmetic than the sparse path would. A low density with an accept
+            // is the failure mode this survey exists to find.
+            if accepted.is_some() && band > 0 {
+                assert!(
+                    density >= 0.5,
+                    "{label}: banded ACCEPTED a span only {density:.4} full -- it would do \
+                     roughly {:.1}x the arithmetic the sparse path does",
+                    1.0 / density
+                );
+            }
+        }
+    }
+
     #[test]
     fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
         // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
@@ -29521,9 +29652,18 @@ pub static SPLU_SUPERNODAL_ENABLE: PerfToggle = PerfToggle::new(false);
 /// CYCLES** -- three instruction reductions totalling -7.89% and an 8.6% miss reduction all failed
 /// to, because they left the dependent merge in place rather than removing it.
 ///
-/// Default OFF until it has been measured against live SciPy through the public entry point.
+/// DEFAULT ON. Measured against live SciPy 1.17.1 through the public entry point on both cells
+/// this repo tracks a loss for, balanced square, 41 rounds, both A/A nulls inside +/-0.020:
+///
+///     cell                   general    banded     effect
+///     cubic (llywn)          0.7126x   1.2536x    1.733x, LOSS -> WIN
+///     convection (run7d)     0.4629x   0.6339x    1.369x, still a loss
+///
+/// It declines on its actual precondition rather than a proxy: the dense span is sound only when
+/// the envelope IS the fill, which holds for a PATTERN-SYMMETRIC factor and fails otherwise --
+/// measured band_density 0.0019 on a down-arrow and 0.2729 on a skew band, both declined.
 #[doc(hidden)]
-pub static SPLU_BANDED_ENABLE: PerfToggle = PerfToggle::new(false);
+pub static SPLU_BANDED_ENABLE: PerfToggle = PerfToggle::new(true);
 /// Factorizations that took the banded path. A silent decline would make the toggle read as inert.
 #[doc(hidden)]
 pub static SPLU_BANDED_FACTOR_HITS: std::sync::atomic::AtomicUsize =
