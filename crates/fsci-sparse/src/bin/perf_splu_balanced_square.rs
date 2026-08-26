@@ -382,6 +382,16 @@ for raw_line in sys.stdin.buffer:
         f = spla.splu(A)
         elapsed = time.perf_counter_ns() - started
         print(f"FACTOR {elapsed} {int(f.L.nnz + f.U.nnz)}", flush=True)
+    elif fields[0] == "SOLVETIME":
+        # Times k solves on the ALREADY-FACTORED `lu` built during warmup, so the factorization
+        # is outside the timer on both arms. This is the only timed path in this harness that
+        # measures the triangular solves rather than the factorization.
+        k = int(fields[1])
+        started = time.perf_counter_ns()
+        for _ in range(k):
+            y = lu.solve(rhs)
+        elapsed = time.perf_counter_ns() - started
+        print(f"SOLVETIME {elapsed} {int(y[0].view('<u8')):016x}", flush=True)
     elif fields[0] == "SOLVE":
         sol = spla.splu(A).solve(rhs)
         bits = np.asarray(sol, dtype="<f8").view("<u8")
@@ -482,6 +492,18 @@ for raw_line in sys.stdin.buffer:
                 fields[1].parse().expect("SciPy elapsed ns"),
                 fields[2].parse().expect("SciPy LU nnz"),
             )
+        }
+
+        /// Nanoseconds for `count` solves on the warm factor. The factorization is NOT in the
+        /// timed region on either arm.
+        fn solve_time(&mut self, count: usize) -> u64 {
+            let response = self.request(&format!("SOLVETIME {count}"));
+            let fields: Vec<&str> = response.split_whitespace().collect();
+            assert!(
+                fields.len() == 3 && fields[0] == "SOLVETIME",
+                "malformed SOLVETIME response: {response}"
+            );
+            fields[1].parse().expect("SciPy solve elapsed ns")
         }
 
         fn solution(&mut self) -> Vec<f64> {
@@ -643,6 +665,24 @@ for raw_line in sys.stdin.buffer:
             .expect("convection CSR")
             .to_csc()
             .expect("convection CSC")
+    }
+
+    /// Which half of the job the square times.
+    ///
+    /// `FSCI_SPLU_STAGE=solve` times the triangular solves on an already-built factor; anything
+    /// else times the factorization, which is what this harness has always done. An env var
+    /// rather than a positional argument so every existing invocation keeps its meaning.
+    ///
+    /// WHY THE SOLVE NEEDED ITS OWN STAGE: run7d is a whole-job bead -- factor plus sixteen
+    /// solves -- and its factorization measures 0.4629x against live SciPy. Nothing in this repo
+    /// had ever timed its SOLVE against a live incumbent; the `SOLVE` command here existed only
+    /// to compare solution bits for parity, and the split probe that does time our solves has no
+    /// SciPy arm at all. So the solve half of the worst measured loss was unmeasured.
+    fn solve_stage_requested() -> bool {
+        matches!(
+            std::env::var("FSCI_SPLU_STAGE").ok().as_deref(),
+            Some("solve")
+        )
     }
 
     fn build_fixture(fixture: &str, side: usize) -> CscMatrix {
@@ -1040,6 +1080,10 @@ for raw_line in sys.stdin.buffer:
             }
         );
 
+        // Solves per timed slot. Sixteen because run7d's job is a factor plus sixteen solves,
+        // so a slot here is one job's worth of solve work.
+        const SOLVES_PER_SLOT: usize = 16;
+        let solve_stage = solve_stage_requested();
         let spectral_hits_before = SPLU_CUBIC_SPECTRAL_FACTOR_HITS.load(Ordering::Relaxed);
         let matrix = build_fixture(
             match fixture {
@@ -1106,9 +1150,17 @@ for raw_line in sys.stdin.buffer:
         );
 
         // ── BALANCED SQUARE ──────────────────────────────────────────────────
+        // In solve mode the factor is built once, outside every timer, mirroring the SciPy arm's
+        // warm `lu`. `ours` above is exactly that factor and it already passed the parity gate.
+        let warm_factor = &ours;
         for _ in 0..warmup {
-            let _ = black_box(scipy.factor());
-            let _ = black_box(splu(&matrix, balanced_arm_options()).expect("fsci splu"));
+            if solve_stage {
+                let _ = black_box(splu_solve(&warm_factor, &rhs).expect("fsci splu_solve"));
+                let _ = black_box(scipy.solve_time(SOLVES_PER_SLOT));
+            } else {
+                let _ = black_box(scipy.factor());
+                let _ = black_box(splu(&matrix, balanced_arm_options()).expect("fsci splu"));
+            }
         }
 
         let pre_busy = host_mean_busy();
@@ -1126,9 +1178,22 @@ for raw_line in sys.stdin.buffer:
             let mut b_slots = Vec::with_capacity(4);
             for slot in SQUARE {
                 if slot == b'A' {
-                    let (ns, lu_nnz) = scipy.factor();
-                    scipy_lu_nnz = lu_nnz;
-                    a_slots.push(ns as f64);
+                    if solve_stage {
+                        a_slots.push(scipy.solve_time(SOLVES_PER_SLOT) as f64);
+                    } else {
+                        let (ns, lu_nnz) = scipy.factor();
+                        scipy_lu_nnz = lu_nnz;
+                        a_slots.push(ns as f64);
+                    }
+                } else if solve_stage {
+                    // The factor is built ONCE outside every timer, exactly as the SciPy arm
+                    // keeps its warm `lu`, so this times the triangular solves alone.
+                    let started = Instant::now();
+                    for _ in 0..SOLVES_PER_SLOT {
+                        let solution = splu_solve(&warm_factor, &rhs).expect("fsci splu_solve");
+                        black_box(&solution);
+                    }
+                    b_slots.push(started.elapsed().as_nanos() as f64);
                 } else {
                     let started = Instant::now();
                     let factorization = splu(&matrix, balanced_arm_options()).expect("fsci splu");
