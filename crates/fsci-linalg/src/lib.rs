@@ -12128,12 +12128,10 @@ fn symmetric_lower_matvec_one_pass_simd(
         const TAIL_LANES: usize = 4;
         if row_offset + TAIL_LANES <= active {
             let values = Simd::<f64, TAIL_LANES>::from_slice(
-                &data[col_base + start + row_offset
-                    ..col_base + start + row_offset + TAIL_LANES],
+                &data[col_base + start + row_offset..col_base + start + row_offset + TAIL_LANES],
             );
-            let vector_lanes = Simd::<f64, TAIL_LANES>::from_slice(
-                &vector[row_offset..row_offset + TAIL_LANES],
-            );
+            let vector_lanes =
+                Simd::<f64, TAIL_LANES>::from_slice(&vector[row_offset..row_offset + TAIL_LANES]);
 
             if v_col != 0.0 {
                 let prior = Simd::<f64, TAIL_LANES>::from_slice(
@@ -32867,8 +32865,7 @@ mod tests {
         let mut matrix = DMatrix::<f64>::zeros(n, n);
         for col in start..n {
             for row in col..n {
-                matrix[(row, col)] =
-                    ((row * 37 + col * 19 + 23) % 113) as f64 / 107.0 - 0.5;
+                matrix[(row, col)] = ((row * 37 + col * 19 + 23) % 113) as f64 / 107.0 - 0.5;
             }
         }
         let mut vector: Vec<f64> = (0..active)
@@ -32903,8 +32900,7 @@ mod tests {
         let mut matrix = DMatrix::<f64>::zeros(n, n);
         for col in start..n {
             for row in col..n {
-                matrix[(row, col)] =
-                    ((row * 43 + col * 23 + 31) % 127) as f64 / 109.0 - 0.5;
+                matrix[(row, col)] = ((row * 43 + col * 23 + 31) % 127) as f64 / 109.0 - 0.5;
             }
         }
         let mut vector: Vec<f64> = (0..active)
@@ -43162,5 +43158,179 @@ mod chol_syrk_nc_blocking {
                 "nc={nc} did not round up to a full 8-column panel"
             );
         }
+    }
+
+    /// SciPy parity for four entry points that had NO differential coverage (frankenscipy-ivxx6).
+    ///
+    /// `orthogonal_procrustes`, `pinvh`, `diagsvd` and `cdf2rdf` all exist in `scipy.linalg` under
+    /// these names and each was confirmed to return ZERO referencing files from
+    /// `grep -rli <name> crates/fsci-conformance/{tests,python_oracle,src} crates/*/src/bin/diff_*.rs`
+    /// across the FULL corpus -- both locations, since differential tests are split between the
+    /// conformance crate and each crate's own `src/bin`.
+    ///
+    /// The goldens below were GENERATED from SciPy 1.17.1's output rather than transcribed, and
+    /// the measured agreement when they were taken was <= 2.0e-15 on every cell.
+    ///
+    /// This is a `#[test]`, not one of the `diff_*` bins, deliberately: CI runs
+    /// `cargo test --workspace`, so a `#[test]` is enforced, while the `diff_*` bins in
+    /// `crates/*/src/bin/` are manual probes that nothing runs. A probe nothing runs would not
+    /// have caught a regression here. The companion probe and its comparator are committed too,
+    /// for re-deriving these values against a future SciPy.
+    #[test]
+    fn procrustes_pinvh_diagsvd_cdf2rdf_match_scipy() {
+        use super::{cdf2rdf, diagsvd, orthogonal_procrustes, pinvh};
+        fn assert_close(name: &str, got: &[Vec<f64>], want: &[Vec<f64>]) {
+            assert_eq!(got.len(), want.len(), "{name}: row count");
+            for (r, (g, w)) in got.iter().zip(want).enumerate() {
+                assert_eq!(g.len(), w.len(), "{name}: row {r} width");
+                for (c, (&a, &b)) in g.iter().zip(w).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 1e-12,
+                        "{name}[{r}][{c}]: got {a:.17e}, SciPy 1.17.1 gives {b:.17e}"
+                    );
+                }
+            }
+        }
+
+        // SciPy 1.17.1, 3x3
+        let procrustes_r_golden: Vec<Vec<f64>> = vec![
+            vec![0.7353787385912179, 0.5785533913852307, -0.35283719212214154],
+            vec![-0.3448372670838743, 0.7677029037540217, 0.5401106468102328],
+            vec![0.5833569833799147, -0.2755144730940484, 0.7640591633228376],
+        ];
+        // SciPy 1.17.1
+        const PROCRUSTES_SCALE: f64 = 308.03806085745475;
+        // SciPy 1.17.1, 3x3
+        let pinvh_sym_golden: Vec<Vec<f64>> = vec![
+            vec![0.3687500000000005, -0.1500000000000004, 0.16250000000000034],
+            vec![
+                -0.1500000000000004,
+                0.4000000000000005,
+                -0.10000000000000021,
+            ],
+            vec![
+                0.16250000000000037,
+                -0.10000000000000026,
+                0.2750000000000003,
+            ],
+        ];
+        // SciPy 1.17.1, 3x3
+        let pinvh_rank2_golden: Vec<Vec<f64>> = vec![
+            vec![
+                0.5185185185185197,
+                -0.48148148148148184,
+                0.03703703703703653,
+            ],
+            vec![
+                -0.48148148148148184,
+                0.5185185185185182,
+                0.03703703703703755,
+            ],
+            vec![
+                0.03703703703703653,
+                0.03703703703703755,
+                0.07407407407407408,
+            ],
+        ];
+        // SciPy 1.17.1, 5x3
+        let diagsvd_5x3_golden: Vec<Vec<f64>> = vec![
+            vec![3.0, 0.0, 0.0],
+            vec![0.0, 2.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0],
+        ];
+        // SciPy 1.17.1, 3x5
+        let diagsvd_3x5_golden: Vec<Vec<f64>> = vec![
+            vec![3.0, 0.0, 0.0, 0.0, 0.0],
+            vec![0.0, 2.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0, 0.0],
+        ];
+        // SciPy 1.17.1, 3x3
+        let cdf2rdf_w_golden: Vec<Vec<f64>> = vec![
+            vec![0.0, 1.0, 0.0],
+            vec![-1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 2.0],
+        ];
+        // SciPy 1.17.1, 3x3
+        let cdf2rdf_v_golden: Vec<Vec<f64>> = vec![
+            vec![0.7071067811865475, 0.0, 0.0],
+            vec![0.0, 0.7071067811865475, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+
+        let a = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, 5.0, 6.0],
+            vec![7.0, 8.0, 10.0],
+            vec![-1.0, 0.5, 2.0],
+        ];
+        let b = vec![
+            vec![2.0, 1.0, 3.5],
+            vec![5.0, 4.5, 6.5],
+            vec![8.0, 7.5, 9.0],
+            vec![0.0, -0.5, 1.5],
+        ];
+        let (r, scale) = orthogonal_procrustes(&a, &b).expect("procrustes");
+        assert_close("orthogonal_procrustes", &r, &procrustes_r_golden);
+        assert!(
+            (scale - PROCRUSTES_SCALE).abs() <= 1e-9,
+            "procrustes scale: got {scale:.17e}, SciPy gives {PROCRUSTES_SCALE:.17e}"
+        );
+
+        let sym = vec![
+            vec![4.0, 1.0, -2.0],
+            vec![1.0, 3.0, 0.5],
+            vec![-2.0, 0.5, 5.0],
+        ];
+        assert_close(
+            "pinvh(sym)",
+            &pinvh(&sym, None, None).expect("pinvh"),
+            &pinvh_sym_golden,
+        );
+
+        // Rank 2 of 3: the pseudo-inverse of a SINGULAR matrix is where conventions diverge, so
+        // this arm matters more than the well-conditioned one above.
+        let rank_deficient = vec![
+            vec![2.0, 1.0, 3.0],
+            vec![1.0, 2.0, 3.0],
+            vec![3.0, 3.0, 6.0],
+        ];
+        assert_close(
+            "pinvh(rank-deficient)",
+            &pinvh(&rank_deficient, None, None).expect("pinvh rank2"),
+            &pinvh_rank2_golden,
+        );
+
+        // Both orientations, since diagsvd's entire job is the zero padding.
+        assert_close(
+            "diagsvd(5,3)",
+            &diagsvd(&[3.0, 2.0, 1.0], 5, 3).expect("diagsvd 5x3"),
+            &diagsvd_5x3_golden,
+        );
+        assert_close(
+            "diagsvd(3,5)",
+            &diagsvd(&[3.0, 2.0, 1.0], 3, 5).expect("diagsvd 3x5"),
+            &diagsvd_3x5_golden,
+        );
+
+        // One conjugate pair plus one real eigenvalue: the case cdf2rdf exists for.
+        let w = vec![(0.0, 1.0), (0.0, -1.0), (2.0, 0.0)];
+        let v = vec![
+            vec![
+                (0.0, -0.707_106_781_186_547_46),
+                (0.0, 0.707_106_781_186_547_46),
+                (0.0, 0.0),
+            ],
+            vec![
+                (0.707_106_781_186_547_46, 0.0),
+                (0.707_106_781_186_547_46, 0.0),
+                (0.0, 0.0),
+            ],
+            vec![(0.0, 0.0), (0.0, 0.0), (1.0, 0.0)],
+        ];
+        let (wr, vr) = cdf2rdf(&w, &v).expect("cdf2rdf");
+        assert_close("cdf2rdf(w)", &wr, &cdf2rdf_w_golden);
+        assert_close("cdf2rdf(v)", &vr, &cdf2rdf_v_golden);
     }
 }
