@@ -1940,6 +1940,19 @@ fn sparse_lu_fill_ordering(
             }
         }
         PermutationOrdering::Amd => {
+            // NOT `amd_postordered_ordering`. Postordering the elimination tree is the standard
+            // companion to AMD (CHOLMOD, UMFPACK, KLU all do it) and it works exactly as designed
+            // here -- fill unchanged to the byte, D1 read misses down 8.6% -- and the cell gets
+            // SLOWER. Measured A/B on two distinct binaries, three runs each, run7d's cell:
+            //
+            //     arm              cycles (median)   D1 misses (median)   job ms
+            //     plain AMD          1,749,670,621        109,600,120     13.080
+            //     AMD + postorder    1,826,179,836        100,206,346     13.285
+            //                              +4.4%              -8.6%       +1.6%
+            //
+            // Non-overlapping ranges on all three. The machinery is kept and exercised by
+            // `amd_postorder_is_fill_neutral`, because it is a precondition for any supernodal
+            // work, but it does not ship on this path.
             let p = approximate_minimum_degree_ordering(a);
             if p.len() == n {
                 (Some(p), PermutationOrdering::Amd)
@@ -10354,6 +10367,120 @@ fn minimum_degree_ordering_hashset(a: &CsrMatrix) -> Vec<usize> {
 /// factorization, so the ordering can only change fill, cost and floating-point
 /// association — never whether the answer is right. The selection is deterministic
 /// (min degree, ties broken by lowest index), so the permutation is reproducible.
+/// Elimination tree of the symmetric pattern of `P·A·Pᵀ`, by Liu's path-compression algorithm.
+///
+/// `parent[k] == n` means `k` is a root. Runs in O(nnz·α(n)) -- it needs only the ADJACENCY, never
+/// the fill pattern, which is what makes it affordable where `symbolic_fill_pattern` is not
+/// (`frankenscipy-4m90a` measured that at O(n^2.265) against a factorization at O(n^1.653)).
+#[allow(dead_code)] // measured NEGATIVE on the AMD path; kept as a precondition for supernodal work
+fn elimination_tree_of_permuted(a: &CsrMatrix, perm: &[usize]) -> Vec<usize> {
+    let n = perm.len();
+    let mut inverse = vec![0usize; n];
+    for (position, &original) in perm.iter().enumerate() {
+        inverse[original] = position;
+    }
+    // Adjacency of the permuted pattern, lower part only: for position k, the positions i < k
+    // adjacent to it. The symmetric pattern is A+Aᵀ, so both orientations are collected.
+    let indptr = a.indptr();
+    let indices = a.indices();
+    let mut lower: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for position in 0..n {
+        let original = perm[position];
+        for &column in &indices[indptr[original]..indptr[original + 1]] {
+            let other = inverse[column];
+            if other < position {
+                lower[position].push(other);
+            } else if other > position {
+                // the transpose entry, so the pattern is symmetric
+                lower[other].push(position);
+            }
+        }
+    }
+    let mut parent = vec![n; n];
+    let mut ancestor = vec![n; n];
+    for k in 0..n {
+        for &start in &lower[k] {
+            let mut i = start;
+            // Walk to the current root, compressing the path as we go.
+            while ancestor[i] != n && ancestor[i] != k {
+                let next = ancestor[i];
+                ancestor[i] = k;
+                i = next;
+            }
+            if ancestor[i] == n {
+                ancestor[i] = k;
+                parent[i] = k;
+            }
+        }
+    }
+    parent
+}
+
+/// Postorder of the forest described by `parent`, children visited in increasing order.
+///
+/// Iterative so a deep tree cannot blow the stack -- an n=4096 banded matrix produces a chain
+/// thousands deep, which a recursive DFS would not survive.
+#[allow(dead_code)] // measured NEGATIVE on the AMD path; kept as a precondition for supernodal work
+fn postorder_forest(parent: &[usize]) -> Vec<usize> {
+    let n = parent.len();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut roots = Vec::new();
+    for node in 0..n {
+        if parent[node] == n {
+            roots.push(node);
+        } else {
+            children[parent[node]].push(node);
+        }
+    }
+    let mut order = Vec::with_capacity(n);
+    // (node, next child index) — emit the node once its children are done.
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for &root in &roots {
+        stack.push((root, 0));
+        while let Some((node, index)) = stack.pop() {
+            if index < children[node].len() {
+                stack.push((node, index + 1));
+                stack.push((children[node][index], 0));
+            } else {
+                order.push(node);
+            }
+        }
+    }
+    debug_assert_eq!(
+        order.len(),
+        n,
+        "postorder must emit every node exactly once"
+    );
+    order
+}
+
+/// AMD's order followed by an elimination-tree postordering.
+///
+/// WHY. AMD chooses WHICH pivots to eliminate and in doing so destroys locality: on run7d's cell
+/// it produces 2.49x less fill than RCM and yet costs 1.55x more CYCLES PER LU NONZERO and takes
+/// 1.39x more D1 misses per nonzero, so 60% of the fill win is eaten back. That cell is
+/// latency-bound -- an earlier A/B removed 4.21% of its instructions and moved cycles by +0.36% --
+/// so scattering is paid for directly.
+///
+/// Postordering the elimination tree is the standard companion step (CHOLMOD, UMFPACK and KLU all
+/// do it) and it is FILL-NEUTRAL BY CONSTRUCTION: reordering siblings of an elimination tree
+/// permutes the factor's rows and columns without changing which entries fill in. So this can only
+/// move locality, never work.
+#[allow(dead_code)] // measured NEGATIVE on the AMD path; kept as a precondition for supernodal work
+fn amd_postordered_ordering(a: &CsrMatrix) -> Vec<usize> {
+    let base = approximate_minimum_degree_ordering(a);
+    let n = base.len();
+    if n == 0 {
+        return base;
+    }
+    let parent = elimination_tree_of_permuted(a, &base);
+    let post = postorder_forest(&parent);
+    if post.len() != n {
+        return base;
+    }
+    post.into_iter().map(|position| base[position]).collect()
+}
+
 fn approximate_minimum_degree_ordering(a: &CsrMatrix) -> Vec<usize> {
     let n = a.shape().rows;
     if n == 0 {
@@ -17701,6 +17828,96 @@ mod tests {
                 best_env.0 == best_fill.0
             );
         }
+    }
+
+    /// POSTORDERING MUST BE FILL-NEUTRAL. If it is not, the implementation is wrong.
+    ///
+    /// Reordering the siblings of an elimination tree permutes the factor without changing which
+    /// entries fill in, so AMD and AMD-then-postorder must produce the SAME nonzero count. That is
+    /// the whole reason the step is safe to take: it can only move locality, never work. A
+    /// postorder that changes the fill count has either built the wrong tree or emitted an order
+    /// that is not a topological one.
+    ///
+    /// Also asserts the postorder is a permutation at all, since a DFS that drops or repeats a
+    /// node would still "work" and would silently corrupt the ordering.
+    #[test]
+    fn amd_postorder_is_fill_neutral() {
+        fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("convection CSR")
+        }
+
+        for (label, matrix) in [
+            ("convection(32)", convection_diffusion_2d(32)),
+            ("cubic(10)", splu_dirichlet_laplacian_3d(10)),
+        ] {
+            let n = matrix.shape().rows;
+            let plain = approximate_minimum_degree_ordering(&matrix);
+            let posted = amd_postordered_ordering(&matrix);
+
+            // Both must be permutations of 0..n.
+            for (name, order) in [("amd", &plain), ("amd+postorder", &posted)] {
+                let mut seen = vec![false; n];
+                assert_eq!(order.len(), n, "{label}/{name}: wrong length");
+                for &value in order {
+                    assert!(value < n, "{label}/{name}: index {value} out of range");
+                    assert!(!seen[value], "{label}/{name}: index {value} repeated");
+                    seen[value] = true;
+                }
+            }
+            // The postorder must actually CHANGE the order, or the test proves nothing about it.
+            assert_ne!(
+                plain, posted,
+                "{label}: postordering left the AMD order untouched, so this test is vacuous"
+            );
+
+            let fill_plain = fill_under(&matrix, &plain);
+            let fill_posted = fill_under(&matrix, &posted);
+            println!(
+                "AMD_POSTORDER {label} n={n} fill_amd={fill_plain} fill_amd_postordered={fill_posted}"
+            );
+            assert_eq!(
+                fill_plain, fill_posted,
+                "{label}: postordering changed the fill from {fill_plain} to {fill_posted}; \
+                 sibling reordering of an elimination tree cannot do that, so the tree or the \
+                 traversal is wrong"
+            );
+        }
+    }
+
+    /// Nonzeros in the factor when `order` is imposed as the fill-reducing permutation.
+    fn fill_under(matrix: &CsrMatrix, order: &[usize]) -> usize {
+        let n = matrix.shape().rows;
+        let rows = permuted_sorted_rows(matrix, order);
+        let initial: Vec<Vec<u32>> = rows.iter().map(|row| row.live_cols().to_vec()).collect();
+        let (upper, lower) = symbolic_fill_pattern(n, &initial);
+        upper.iter().map(Vec::len).sum::<usize>() + lower.iter().map(Vec::len).sum::<usize>()
     }
 
     #[test]
