@@ -111,6 +111,13 @@ mod bench {
     enum Fixture {
         Cubic,
         Scattered,
+        /// run7d's cell. Added so the worst measured vs-SciPy loss in this repo can be
+        /// measured at all: its sanctioned harness (`perf_spsolve --convection-splu-live`)
+        /// hard-requires `TRJ_BOOKING_CLAIM_MESSAGE_ID` from the agent-mail build-slot
+        /// service, which is disabled server-side (`frankenscipy-fr78g`). This harness exists
+        /// precisely because those gates were unsatisfiable -- see the header -- so porting
+        /// the cell here is the sanctioned route, not a way around a gate.
+        Convection,
     }
 
     impl Fixture {
@@ -118,6 +125,7 @@ mod bench {
             match self {
                 Self::Cubic => "laplacian_3d_cubic",
                 Self::Scattered => "scattered_pentadiagonal",
+                Self::Convection => "convection_diffusion_2d",
             }
         }
     }
@@ -230,9 +238,10 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
         let fixture = match args.get(5).map(String::as_str).unwrap_or("cubic") {
             "cubic" => Fixture::Cubic,
             "scattered" => Fixture::Scattered,
+            "convection" => Fixture::Convection,
             other => {
                 return Err(format!(
-                    "fixture must be `cubic` or `scattered`, got {other:?}"
+                    "fixture must be `cubic`, `scattered` or `convection`, got {other:?}"
                 ));
             }
         };
@@ -592,10 +601,55 @@ for raw_line in sys.stdin.buffer:
             .expect("scattered CSC")
     }
 
+    /// The same 5-point convection-diffusion stencil `perf_spsolve` builds for run7d:
+    /// asymmetric off-diagonals (WEST -1.2, EAST -0.8) so the pattern is genuinely
+    /// nonsymmetric, diagonal 4.001. Copied rather than shared because the two binaries do
+    /// not share a module; the constants are kept identical on purpose so this measures the
+    /// same cell the bead is about.
+    fn convection_diffusion_2d(side: usize) -> CscMatrix {
+        let n = side * side;
+        let (mut rows, mut cols, mut data) = (Vec::new(), Vec::new(), Vec::new());
+        for row in 0..side {
+            for column in 0..side {
+                let index = row * side + column;
+                if row > 0 {
+                    rows.push(index);
+                    cols.push(index - side);
+                    data.push(-1.0);
+                }
+                if column > 0 {
+                    rows.push(index);
+                    cols.push(index - 1);
+                    data.push(-1.2);
+                }
+                rows.push(index);
+                cols.push(index);
+                data.push(4.001);
+                if column + 1 < side {
+                    rows.push(index);
+                    cols.push(index + 1);
+                    data.push(-0.8);
+                }
+                if row + 1 < side {
+                    rows.push(index);
+                    cols.push(index + side);
+                    data.push(-1.0);
+                }
+            }
+        }
+        CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .expect("convection triplets")
+            .to_csr()
+            .expect("convection CSR")
+            .to_csc()
+            .expect("convection CSC")
+    }
+
     fn build_fixture(fixture: &str, side: usize) -> CscMatrix {
         match fixture {
             "cubic" => laplacian_3d_cubic(side),
             "scattered" => scattered_pentadiagonal(side),
+            "convection" => convection_diffusion_2d(side),
             other => panic!("unknown fixture {other:?}"),
         }
     }
@@ -991,6 +1045,7 @@ for raw_line in sys.stdin.buffer:
             match fixture {
                 Fixture::Cubic => "cubic",
                 Fixture::Scattered => "scattered",
+                Fixture::Convection => "convection",
             },
             side,
         );
