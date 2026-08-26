@@ -10153,6 +10153,21 @@ fn minimum_degree_ordering_hashset(a: &CsrMatrix) -> Vec<usize> {
 /// element lists are disjoint, which is the ordinary case; that is why AMD's fill is
 /// within a few percent of exact minimum degree in practice while its cost is near-linear.
 ///
+/// SELECTION IS BY DEGREE BUCKET LIST, and that is a measured choice rather than a stylistic
+/// one. The first version of this function reused the lazy `BinaryHeap<Reverse<(degree,
+/// index)>>` that `minimum_degree_ordering` uses. A degree update happens for every member of
+/// every `Lp`, so that heap takes a push per update and never discards the superseded entry
+/// until it surfaces; callgrind attributed **460,957,042 Ir, 34.34% of the whole ordering**,
+/// to `BinaryHeap::pop` alone, against 8% for the allocator. Bucket lists make insert, remove
+/// and update O(1): `head[d]` heads a doubly linked list of the variables whose approximate
+/// degree is `d`, and `min_degree` only ever walks forward until a smaller degree is inserted.
+///
+/// One consequence is deliberate and worth naming: ties are broken by bucket insertion order,
+/// not by lowest index the way the exact orderings break them. The result is still fully
+/// deterministic and reproducible -- the same matrix yields the same permutation -- but it is
+/// not the same permutation the heap version produced, and the tie-break carries no meaning
+/// for fill.
+///
 /// WHAT THIS IS NOT. Supervariable (indistinguishable-node) detection and mass
 /// elimination are deliberately NOT implemented here. They cut AMD's cost further and
 /// usually improve its fill a little; leaving them out keeps this reviewable and cannot
@@ -10164,9 +10179,6 @@ fn minimum_degree_ordering_hashset(a: &CsrMatrix) -> Vec<usize> {
 /// association — never whether the answer is right. The selection is deterministic
 /// (min degree, ties broken by lowest index), so the permutation is reproducible.
 fn approximate_minimum_degree_ordering(a: &CsrMatrix) -> Vec<usize> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
     let n = a.shape().rows;
     if n == 0 {
         return Vec::new();
@@ -10175,19 +10187,56 @@ fn approximate_minimum_degree_ordering(a: &CsrMatrix) -> Vec<usize> {
     // Adjacency of A + Aᵀ with self loops dropped, ascending and unique. Explicit zeros
     // are skipped for the same reason the exact code skips them: they carry no pivotal
     // dependency and counting them would inflate every degree.
-    let mut var_adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    //
+    // ONE FLAT ARENA, not `Vec<Vec<u32>>`. A variable's adjacency only ever SHRINKS -- the
+    // pruning pass removes entries and nothing ever adds one, because new coupling is carried
+    // by elements instead. So the lists can be laid out end to end once and compacted in
+    // place forever after. Growing 4096 individual vectors instead put ~18% of the ordering in
+    // the allocator, most of it in this build.
+    let mut counts = vec![0u32; n];
     for i in 0..n {
         for idx in a.indptr()[i]..a.indptr()[i + 1] {
             let j = a.indices()[idx];
             if j != i && a.data()[idx] != 0.0 {
-                var_adj[i].push(j as u32);
-                var_adj[j].push(i as u32);
+                counts[i] += 1;
+                counts[j] += 1;
             }
         }
     }
-    for list in var_adj.iter_mut() {
-        list.sort_unstable();
-        list.dedup();
+    let mut adj_start = vec![0u32; n + 1];
+    for i in 0..n {
+        adj_start[i + 1] = adj_start[i] + counts[i];
+    }
+    let total = adj_start[n] as usize;
+    let mut adj = vec![0u32; total];
+    let mut cursor: Vec<u32> = adj_start[..n].to_vec();
+    for i in 0..n {
+        for idx in a.indptr()[i]..a.indptr()[i + 1] {
+            let j = a.indices()[idx];
+            if j != i && a.data()[idx] != 0.0 {
+                adj[cursor[i] as usize] = j as u32;
+                cursor[i] += 1;
+                adj[cursor[j] as usize] = i as u32;
+                cursor[j] += 1;
+            }
+        }
+    }
+    // Sort and dedupe each row in place; `adj_len` then tracks the live prefix of each row and
+    // the space past it is dead but never reclaimed, which is exactly what lets pruning be a
+    // compaction rather than an allocation.
+    let mut adj_len = vec![0u32; n];
+    for i in 0..n {
+        let (start, end) = (adj_start[i] as usize, adj_start[i + 1] as usize);
+        let row = &mut adj[start..end];
+        row.sort_unstable();
+        let mut write = 0usize;
+        for read in 0..row.len() {
+            if write == 0 || row[read] != row[write - 1] {
+                row[write] = row[read];
+                write += 1;
+            }
+        }
+        adj_len[i] = write as u32;
     }
 
     // Quotient-graph state. An element is named by the variable whose elimination created
@@ -10196,7 +10245,7 @@ fn approximate_minimum_degree_ordering(a: &CsrMatrix) -> Vec<usize> {
     let mut elem_vars: Vec<Vec<u32>> = vec![Vec::new(); n];
     let mut var_alive = vec![true; n];
     let mut elem_alive = vec![false; n];
-    let mut degree: Vec<usize> = var_adj.iter().map(Vec::len).collect();
+    let mut degree: Vec<usize> = adj_len.iter().map(|&len| len as usize).collect();
 
     // Stamped scratch: `w` carries |Le| minus the number of Le members seen in Lp, and
     // `mark` carries Lp membership. Both are stamped rather than cleared so no pass over
@@ -10206,40 +10255,68 @@ fn approximate_minimum_degree_ordering(a: &CsrMatrix) -> Vec<usize> {
     let mut mark = vec![0usize; n];
     let mut mark_flag = 0usize;
 
-    // Lazy min-heap keyed on (degree, index): stale entries are discarded on pop, which
-    // is the same discipline the exact orderings use. Ties break on the lowest index, so
-    // the selection matches a deterministic linear scan.
-    let mut heap: BinaryHeap<Reverse<(usize, usize)>> =
-        (0..n).map(|v| Reverse((degree[v], v))).collect();
+    // Degree bucket lists: `head[d]` heads a doubly linked list of the live variables whose
+    // approximate degree is `d`. Insert, remove and update are O(1), which is the whole point
+    // -- see the note above on what the heap this replaced actually cost.
+    const NIL: usize = usize::MAX;
+    let mut head = vec![NIL; n + 1];
+    let mut next = vec![NIL; n];
+    let mut prev = vec![NIL; n];
+    for v in (0..n).rev() {
+        let d = degree[v];
+        next[v] = head[d];
+        if head[d] != NIL {
+            prev[head[d]] = v;
+        }
+        head[d] = v;
+    }
+    let mut min_degree = 0usize;
     let mut order = Vec::with_capacity(n);
     let mut lp: Vec<u32> = Vec::new();
 
     while order.len() < n {
-        let p = loop {
-            let Reverse((d, v)) = heap.pop().expect("heap nonempty while variables remain");
-            if var_alive[v] && d == degree[v] {
-                break v;
-            }
-        };
+        // `min_degree` only walks forward here; it is pulled back only by an insertion at a
+        // smaller degree, so the total distance walked over the whole sweep is bounded.
+        while min_degree <= n && head[min_degree] == NIL {
+            min_degree += 1;
+        }
+        let p = head[min_degree];
+        debug_assert!(p != NIL, "a live variable must remain while order is short");
+        // Unlink p from its bucket.
+        head[min_degree] = next[p];
+        if next[p] != NIL {
+            prev[next[p]] = NIL;
+        }
+        next[p] = NIL;
+        prev[p] = NIL;
 
         // Lp = (Ap ∪ ⋃_{e ∈ Ep} Le) \ {p}, live variables only.
         mark_flag += 1;
         lp.clear();
         mark[p] = mark_flag;
-        for entry in 0..var_adj[p].len() {
-            let v = var_adj[p][entry] as usize;
+        // Every list here is bound as a SLICE before its loop rather than indexed as
+        // `var_elems[p][slot]`. Two-level indexing inside these loops was 18.9% of the whole
+        // ordering in `core::slice::index` -- a bounds check per level per entry, on a crate
+        // that forbids unsafe so the check cannot simply be removed. Binding the row once
+        // leaves one check for the row and none for its entries.
+        let (p_start, p_end) = (
+            adj_start[p] as usize,
+            adj_start[p] as usize + adj_len[p] as usize,
+        );
+        for &packed in &adj[p_start..p_end] {
+            let v = packed as usize;
             if var_alive[v] && mark[v] != mark_flag {
                 mark[v] = mark_flag;
                 lp.push(v as u32);
             }
         }
-        for slot in 0..var_elems[p].len() {
-            let e = var_elems[p][slot] as usize;
+        for &element in &var_elems[p] {
+            let e = element as usize;
             if !elem_alive[e] {
                 continue;
             }
-            for entry in 0..elem_vars[e].len() {
-                let v = elem_vars[e][entry] as usize;
+            for &packed in &elem_vars[e] {
+                let v = packed as usize;
                 if var_alive[v] && mark[v] != mark_flag {
                     mark[v] = mark_flag;
                     lp.push(v as u32);
@@ -10253,11 +10330,11 @@ fn approximate_minimum_degree_ordering(a: &CsrMatrix) -> Vec<usize> {
             let e = var_elems[p][slot] as usize;
             if elem_alive[e] {
                 elem_alive[e] = false;
-                elem_vars[e] = Vec::new();
+                elem_vars[e].clear();
             }
         }
-        var_elems[p] = Vec::new();
-        var_adj[p] = Vec::new();
+        var_elems[p].clear();
+        adj_len[p] = 0;
         var_alive[p] = false;
         order.push(p);
         let eliminated = order.len();
@@ -10273,10 +10350,10 @@ fn approximate_minimum_degree_ordering(a: &CsrMatrix) -> Vec<usize> {
         // afterwards `w[e] − w_flag` is exactly |Le \ Lp|. The stamp advances by n+1 so a
         // value left over from an earlier elimination can never be mistaken for a seeded one.
         w_flag += n + 1;
-        for index in 0..lp.len() {
-            let j = lp[index] as usize;
-            for slot in 0..var_elems[j].len() {
-                let e = var_elems[j][slot] as usize;
+        for &member in &lp {
+            let j = member as usize;
+            for &element in &var_elems[j] {
+                let e = element as usize;
                 if e == p || !elem_alive[e] {
                     continue;
                 }
@@ -10287,53 +10364,80 @@ fn approximate_minimum_degree_ordering(a: &CsrMatrix) -> Vec<usize> {
             }
         }
 
-        // Aggressive absorption: |Le \ Lp| == 0 means Le ⊆ Lp, so `p` already represents
-        // everything `e` did and `e` is pure overhead from here on.
-        for index in 0..lp.len() {
-            let j = lp[index] as usize;
-            for slot in 0..var_elems[j].len() {
-                let e = var_elems[j][slot] as usize;
-                if e != p && elem_alive[e] && w[e] == w_flag {
-                    elem_alive[e] = false;
-                    elem_vars[e] = Vec::new();
-                }
-            }
-        }
-
-        // Prune, then re-point at `p`. Dropping edges INTO Lp is what stops the clique
-        // from ever being written down.
-        for index in 0..lp.len() {
-            let j = lp[index] as usize;
-            let mut adjacency = std::mem::take(&mut var_adj[j]);
-            adjacency.retain(|&v| {
-                let v = v as usize;
-                var_alive[v] && mark[v] != mark_flag
-            });
-            var_adj[j] = adjacency;
-
-            let mut elements = std::mem::take(&mut var_elems[j]);
-            elements.retain(|&e| elem_alive[e as usize]);
-            elements.push(p as u32);
-            var_elems[j] = elements;
-        }
-
-        // Approximate external degree, all three AMD bounds.
+        // ONE pass over Lp now does absorption, pruning and the degree bound. They were three
+        // separate passes, and since each one walked `var_elems[j]` again that cost two extra
+        // traversals of every element list per elimination; callgrind put 82% of the ordering
+        // in this function's own code, so the redundant walks are the thing to remove.
+        //
+        //   * absorption -- |Le \ Lp| == 0 means Le ⊆ Lp, so `p` already represents everything
+        //     `e` did. Marking `e` dead BEFORE this `j`'s retain is what lets the same pass
+        //     drop it; a later `j` that also holds `e` sees it already dead and drops it too.
+        //   * pruning -- dropping edges INTO Lp is what stops the clique from ever being
+        //     written down.
+        //   * the degree bound reads the list AFTER the retain, so it never counts an absorbed
+        //     element. An element absorbed by a later `j` contributes `|Le \ Lp| = 0` to an
+        //     earlier `j`'s bound, so fusing cannot change any degree that gets computed.
+        //
+        // Absorbed element lists are cleared rather than dropped: `Vec::clear` keeps the
+        // allocation, and the allocator was the other 14% of the profile.
         let external = lp.len() - 1;
         for index in 0..lp.len() {
             let j = lp[index] as usize;
-            let mut approximate = var_adj[j].len() + external;
-            for slot in 0..var_elems[j].len() {
-                let e = var_elems[j][slot] as usize;
-                if e != p {
-                    approximate += w[e].saturating_sub(w_flag);
+
+            // In place: the earlier form moved each list out with `mem::take` and wrote it
+            // back, which showed up as `core::mem` plus allocator traffic for no gain. These
+            // are all distinct vectors, so `var_elems[j]` can be held mutably while
+            // `elem_alive` and `elem_vars` are touched.
+            let elements = &mut var_elems[j];
+            for &element in elements.iter() {
+                let e = element as usize;
+                if e != p && elem_alive[e] && w[e] == w_flag {
+                    elem_alive[e] = false;
+                    elem_vars[e].clear();
                 }
             }
-            let bounded = approximate
-                .min(degree[j] + external)
-                .min(n - eliminated);
+            elements.retain(|&e| elem_alive[e as usize]);
+            let mut approximate = external;
+            for &element in elements.iter() {
+                approximate += w[element as usize].saturating_sub(w_flag);
+            }
+            elements.push(p as u32);
+
+            let start = adj_start[j] as usize;
+            let end = start + adj_len[j] as usize;
+            let mut write = start;
+            for read in start..end {
+                let v = adj[read] as usize;
+                if var_alive[v] && mark[v] != mark_flag {
+                    adj[write] = adj[read];
+                    write += 1;
+                }
+            }
+            adj_len[j] = (write - start) as u32;
+            approximate += write - start;
+
+            let bounded = approximate.min(degree[j] + external).min(n - eliminated);
             if bounded != degree[j] {
+                // Unlink from the old bucket, link into the new one, both O(1).
+                let old = degree[j];
+                if prev[j] != NIL {
+                    next[prev[j]] = next[j];
+                } else if head[old] == j {
+                    head[old] = next[j];
+                }
+                if next[j] != NIL {
+                    prev[next[j]] = prev[j];
+                }
                 degree[j] = bounded;
-                heap.push(Reverse((bounded, j)));
+                prev[j] = NIL;
+                next[j] = head[bounded];
+                if head[bounded] != NIL {
+                    prev[head[bounded]] = j;
+                }
+                head[bounded] = j;
+                if bounded < min_degree {
+                    min_degree = bounded;
+                }
             }
         }
     }
@@ -14139,6 +14243,162 @@ mod tests {
         println!("MMD_ORDER_PERF_END");
     }
 
+    /// AMD must be a permutation on every shape, and must actually reduce fill where
+    /// reducing fill is possible.
+    ///
+    /// BOTH ARMS, because a fill assertion with only a positive case is satisfied by any
+    /// ordering that happens to help on one matrix: the arrowhead is the MUST-HIT arm, where
+    /// eliminating the hub last is worth a large factor, and the tridiagonal is the MUST-MISS
+    /// arm, where no ordering can beat the natural one and a "fill went down" claim would be
+    /// evidence the measurement is wrong rather than that AMD is good.
+    #[test]
+    fn amd_orders_every_shape_and_cuts_fill_only_where_fill_exists() {
+        fn from_pairs(n: usize, pairs: &[(usize, usize)]) -> CsrMatrix {
+            let mut rows = vec![Vec::new(); n];
+            for &(i, j) in pairs {
+                rows[i].push(j);
+                rows[j].push(i);
+            }
+            let mut data = Vec::new();
+            let mut indices = Vec::new();
+            let mut indptr = vec![0usize];
+            for (i, row) in rows.iter_mut().enumerate() {
+                row.push(i);
+                row.sort_unstable();
+                row.dedup();
+                for &j in row.iter() {
+                    indices.push(j);
+                    data.push(if i == j { n as f64 + 4.0 } else { -1.0 });
+                }
+                indptr.push(data.len());
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("symmetric test CSR")
+        }
+
+        fn factor_nnz(a: &CsrMatrix, ordering: PermutationOrdering) -> usize {
+            let csc = a.to_csc().expect("csc");
+            let factorization = super::splu(
+                &csc,
+                LuOptions {
+                    ordering,
+                    ..LuOptions::default()
+                },
+            )
+            .expect("factorization");
+            match &factorization.lu_internal {
+                SparseLuInternal::Native(lu) => lu.lower.columns.len() + lu.upper.columns.len(),
+                _ => panic!("expected the native sparse LU path"),
+            }
+        }
+
+        // A permutation on every shape, degenerate ones included.
+        // The fill arms run at n = 512 deliberately: `splu` routes below n = 256 to a DENSE
+        // factorization, where every ordering yields the same n² and a fill comparison would be
+        // vacuously equal rather than informative.
+        const FILL_N: usize = 512;
+        let hub = 0usize;
+        let arrowhead_pairs: Vec<(usize, usize)> = (1..FILL_N).map(|spoke| (hub, spoke)).collect();
+        let tridiagonal_pairs: Vec<(usize, usize)> = (0..FILL_N - 1).map(|i| (i, i + 1)).collect();
+        let disconnected_pairs: Vec<(usize, usize)> = vec![(0, 1), (2, 3), (10, 11), (40, 41)];
+        let shapes: Vec<(&str, CsrMatrix)> = vec![
+            ("arrowhead", from_pairs(FILL_N, &arrowhead_pairs)),
+            ("tridiagonal", from_pairs(FILL_N, &tridiagonal_pairs)),
+            ("disconnected", from_pairs(FILL_N, &disconnected_pairs)),
+            ("isolated_only", from_pairs(8, &[])),
+            ("single", from_pairs(1, &[])),
+        ];
+        for (label, a) in shapes.iter() {
+            let n = a.shape().rows;
+            let permutation = super::approximate_minimum_degree_ordering(a);
+            assert_eq!(permutation.len(), n, "{label}: wrong length");
+            let mut seen = vec![false; n];
+            for &index in &permutation {
+                assert!(index < n, "{label}: index {index} out of range");
+                assert!(!seen[index], "{label}: index {index} repeated");
+                seen[index] = true;
+            }
+            // Deterministic: the same matrix must yield the same permutation.
+            assert_eq!(
+                permutation,
+                super::approximate_minimum_degree_ordering(a),
+                "{label}: ordering is not reproducible"
+            );
+        }
+        assert_eq!(
+            super::approximate_minimum_degree_ordering(&from_pairs(0, &[])).len(),
+            0,
+            "the empty matrix must yield the empty ordering"
+        );
+
+        // MUST-HIT arm: the arrowhead is the textbook case where eliminating the hub first
+        // fills the whole matrix and eliminating it last costs nothing.
+        let arrowhead = &shapes[0].1;
+        let natural_fill = factor_nnz(arrowhead, PermutationOrdering::Natural);
+        let amd_fill = factor_nnz(arrowhead, PermutationOrdering::Amd);
+        assert!(
+            amd_fill * 4 < natural_fill,
+            "arrowhead: AMD fill {amd_fill} should be far below natural {natural_fill}"
+        );
+
+        // MUST-MISS arm: a tridiagonal matrix has no fill to remove under any ordering, so
+        // AMD must not come in BELOW the natural ordering. If it did, the count is measuring
+        // something other than the factor.
+        let tridiagonal = &shapes[1].1;
+        let natural_band = factor_nnz(tridiagonal, PermutationOrdering::Natural);
+        let amd_band = factor_nnz(tridiagonal, PermutationOrdering::Amd);
+        assert!(
+            amd_band >= natural_band,
+            "tridiagonal: AMD fill {amd_band} below the natural minimum {natural_band}"
+        );
+
+        // An ordering may only change fill and association, never the answer.
+        for (label, a) in shapes.iter() {
+            let n = a.shape().rows;
+            if n == 0 {
+                continue;
+            }
+            let csc = a.to_csc().expect("csc");
+            let factorization = super::splu(
+                &csc,
+                LuOptions {
+                    ordering: PermutationOrdering::Amd,
+                    ..LuOptions::default()
+                },
+            )
+            .expect("factorization");
+            // Only the native path runs a fill-reducing ordering at all; below n = 256 `splu`
+            // goes dense and honestly reports `Natural`, so requiring `Amd` there would be
+            // asserting against the dispatcher rather than against this ordering.
+            if n >= 256 {
+                assert_eq!(
+                    factorization.ordering_used,
+                    PermutationOrdering::Amd,
+                    "{label}: ordering silently downgraded"
+                );
+            }
+            let b = (0..n)
+                .map(|i| 1.0 + 0.125 * ((17 * i + 23) % 29) as f64)
+                .collect::<Vec<f64>>();
+            let x = super::splu_solve(&factorization, &b).expect("solve");
+            let mut residual: f64 = 0.0;
+            let mut scale: f64 = 0.0;
+            for row in 0..n {
+                let mut ax = 0.0;
+                for idx in a.indptr()[row]..a.indptr()[row + 1] {
+                    ax += a.data()[idx] * x[a.indices()[idx]];
+                }
+                residual = residual.max((ax - b[row]).abs());
+                scale = scale.max(b[row].abs());
+            }
+            assert!(
+                residual / scale < 1e-10,
+                "{label}: relative residual {:.3e} is not a solve",
+                residual / scale
+            );
+        }
+    }
+
     /// run7d ORDERING SPLIT + FILL PROBE (frankenscipy-run7d).
     ///
     /// The min-degree live A/B moved the side-64 convection factor 14.502 -> 35.364 ms and
@@ -14242,7 +14502,10 @@ mod tests {
                 },
             )
             .expect("convection factorization");
-            assert_eq!(factorization.ordering_used, ordering, "{name}: ordering silently downgraded");
+            assert_eq!(
+                factorization.ordering_used, ordering,
+                "{name}: ordering silently downgraded"
+            );
             let fill = match &factorization.lu_internal {
                 SparseLuInternal::Native(lu) => lu.lower.columns.len() + lu.upper.columns.len(),
                 _ => panic!("{name}: expected the native sparse LU path"),
@@ -14275,6 +14538,84 @@ mod tests {
             );
         }
         println!("RUN7D_ORDER_SPLIT_END");
+    }
+
+    /// Is the AMD ordering's cost ALGORITHMIC or CONSTANT-FACTOR?
+    ///
+    /// 6.27 ms at n=4096 is ~1.5 us per elimination, far above what a near-linear sweep
+    /// should cost, and the two explanations need opposite fixes. This measures the growth
+    /// exponent against n on the same fixture family, plus the STRUCTURAL touch count
+    /// (members of Lp and entries of their element lists), which is the quantity the
+    /// algorithm's complexity is stated in and which no build can distort.
+    #[test]
+    #[ignore]
+    fn amd_ordering_growth_probe() {
+        fn grid(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let mut data = Vec::new();
+            let mut indices = Vec::new();
+            let mut indptr = vec![0usize];
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("grid CSR")
+        }
+
+        println!("AMD_GROWTH_BEGIN");
+        let mut previous: Option<(f64, f64)> = None;
+        for side in [16usize, 32, 64, 128] {
+            let a = grid(side);
+            let n = a.shape().rows;
+            let reps = if side >= 128 { 3 } else { 15 };
+            let start = std::time::Instant::now();
+            let mut permutation = Vec::new();
+            for _ in 0..reps {
+                permutation = super::approximate_minimum_degree_ordering(std::hint::black_box(&a));
+                std::hint::black_box(&permutation);
+            }
+            let amd_ms = start.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            assert_eq!(permutation.len(), n);
+
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(super::reverse_cuthill_mckee(std::hint::black_box(&a)));
+            }
+            let rcm_ms = start.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+            let exponent = match previous {
+                Some((prev_n, prev_ms)) => (amd_ms / prev_ms).ln() / (n as f64 / prev_n).ln(),
+                None => f64::NAN,
+            };
+            previous = Some((n as f64, amd_ms));
+            println!(
+                "side={side} n={n} amd_ms={amd_ms:.6} rcm_ms={rcm_ms:.6} \
+                 amd_over_rcm={:.1} growth_exponent_vs_previous={exponent:.3}",
+                amd_ms / rcm_ms
+            );
+        }
+        println!("AMD_GROWTH_END");
     }
 
     #[test]

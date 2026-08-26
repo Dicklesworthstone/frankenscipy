@@ -844,6 +844,29 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
 }
 
 #[cfg(feature = "sparse-incumbent-bench")]
+/// Ordering for the fsci-only convection profile.
+///
+/// It used to be hardcoded to `LuOptions::default()` while the live arm read
+/// `FSCI_SPLU_ORDERING`, so the cheap profile and the row it is supposed to pre-cost were
+/// silently measuring different configurations. Reading the same variable is the whole fix.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn convection_profile_options() -> LuOptions {
+    let ordering = match std::env::var("FSCI_SPLU_ORDERING").ok().as_deref() {
+        None | Some("") | Some("default") => LuOptions::default().ordering,
+        Some("colamd") => PermutationOrdering::Colamd,
+        Some("rcm") => PermutationOrdering::ReverseCuthillMcKee,
+        Some("mmd-ata") => PermutationOrdering::MmdAta,
+        Some("mmd-at-plus-a") => PermutationOrdering::MmdAtPlusA,
+        Some("amd") => PermutationOrdering::Amd,
+        Some("natural") => PermutationOrdering::Natural,
+        Some(other) => panic!("FSCI_SPLU_ORDERING={other:?} is not a known ordering"),
+    };
+    LuOptions {
+        ordering,
+        ..LuOptions::default()
+    }
+}
+
 fn profile_convection_splu_rust(
     repetitions: usize,
     side: usize,
@@ -858,7 +881,7 @@ fn profile_convection_splu_rust(
         .collect::<Vec<_>>();
 
     let warm_factor =
-        splu(&matrix, LuOptions::default()).expect("convection–diffusion splu warmup");
+        splu(&matrix, convection_profile_options()).expect("convection–diffusion splu warmup");
     let warm_solutions = right_hand_sides
         .iter()
         .map(|rhs| splu_solve(&warm_factor, rhs).expect("convection–diffusion splu warmup solve"))
@@ -873,7 +896,7 @@ fn profile_convection_splu_rust(
 
     let started = Instant::now();
     for _ in 0..repetitions {
-        let factor = splu(black_box(&matrix), LuOptions::default())
+        let factor = splu(black_box(&matrix), convection_profile_options())
             .expect("convection–diffusion splu profile");
         for rhs in &right_hand_sides {
             let solution = splu_solve(black_box(&factor), black_box(rhs))
@@ -2079,9 +2102,10 @@ mod cubic_live {
             Some("rcm") => Ok(PermutationOrdering::ReverseCuthillMcKee),
             Some("mmd-ata") => Ok(PermutationOrdering::MmdAta),
             Some("mmd-at-plus-a") => Ok(PermutationOrdering::MmdAtPlusA),
+            Some("amd") => Ok(PermutationOrdering::Amd),
             Some("natural") => Ok(PermutationOrdering::Natural),
             Some(other) => Err(format!(
-                "FSCI_SPLU_ORDERING={other:?} is not one of default|colamd|rcm|mmd-ata|mmd-at-plus-a|natural"
+                "FSCI_SPLU_ORDERING={other:?} is not one of default|colamd|rcm|mmd-ata|mmd-at-plus-a|amd|natural"
             )),
         }
     }
