@@ -811,6 +811,67 @@ fn cubic_splu_fixture_sha256(matrix: &CscMatrix, right_hand_sides: &[Vec<f64>]) 
     format!("{:x}", hasher.finalize())
 }
 
+/// One fsci-only factorization, one fixture, one ordering -- the sweep behind frankenscipy-run7d.1.
+///
+/// WHY IT EXISTS. AMD is the better arm on run7d's convection cell and the worse arm on llywn's
+/// cubic cell, and the losing cell holds strictly LESS fill, so fill is refuted as the predictor.
+/// Deciding whether AMD can ever be the default needs INSTRUCTIONS across a spread of shapes, and
+/// `perf stat -e instructions` is load-independent and runs at native speed -- the only kind of
+/// measurement this host has reliably supported.
+///
+/// IT PRINTS THE BACKEND THAT ACTUALLY RAN, which is not decoration. Since the structural fast
+/// paths now accept `Amd` as well as `Colamd`, a fixture like the Dirichlet cubic Laplacian takes
+/// the SPECTRAL route under `amd` and the general LU under `rcm`. Comparing those two would be
+/// comparing different algorithms and would read as a spectacular AMD win. The driver must check
+/// that both arms report `NativeSparseLu` before comparing them.
+#[cfg(feature = "sparse-incumbent-bench")]
+fn profile_ordering_sweep(fixture: &str, size: usize, repetitions: usize) {
+    let matrix = match fixture {
+        "convection" => convection_diffusion_2d(size),
+        "cubic" => laplacian_3d_cubic(size),
+        "lap2d" => laplacian_2d(size),
+        "arrowhead" => arrowhead(size),
+        // rows x 1 column IS a tridiagonal matrix: the MUST-MISS shape, where no ordering can
+        // beat the natural one and an "AMD wins" reading would mean the sweep is broken.
+        "tridiag" => laplacian_2d_rectangular(size, 1),
+        "pentadiag" => scattered_pentadiagonal(size, 0x5eed_1234),
+        other => panic!("unknown sweep fixture {other:?}"),
+    };
+    let n = matrix.shape().rows;
+    let csc = matrix.to_csc().expect("sweep CSC");
+    let rhs: Vec<f64> = (0..n)
+        .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+        .collect();
+
+    // Warm once outside the timed/counted region so allocator growth is not attributed.
+    let warm = splu(&csc, splu_profile_options()).expect("sweep warmup");
+    let solution = splu_solve(&warm, &rhs).expect("sweep warm solve");
+    let residual = splu_max_relative_residual(
+        &matrix,
+        std::slice::from_ref(&rhs),
+        std::slice::from_ref(&solution),
+    );
+    let fill = fsci_sparse::linalg::splu_factor_payload_bytes(&warm);
+
+    let started = Instant::now();
+    let mut checksum = 0.0;
+    for _ in 0..repetitions {
+        let factor = splu(black_box(&csc), splu_profile_options()).expect("sweep factor");
+        checksum += black_box(fsci_sparse::linalg::splu_factor_payload_bytes(&factor)) as f64;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+
+    println!(
+        "ORDERING_SWEEP fixture={fixture} size={size} n={n} nnz={} \
+         ordering_used={:?} backend_used={:?} factor_payload_bytes={fill} \
+         max_relative_residual={residual:.6e} repetitions={repetitions} \
+         elapsed_seconds={elapsed:.9} checksum={checksum:.6e}",
+        matrix.nnz(),
+        warm.ordering_used,
+        warm.backend_used,
+    );
+}
+
 #[cfg(feature = "sparse-incumbent-bench")]
 fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
     let n = side * side * side;
@@ -4596,6 +4657,28 @@ fn main() {
         #[cfg(not(feature = "sparse-incumbent-bench"))]
         {
             eprintln!("--profile-cuboid-rust requires --features sparse-incumbent-bench");
+            std::process::exit(2);
+        }
+    }
+    if mode.as_deref() == Some("--profile-ordering-sweep") {
+        #[cfg(feature = "sparse-incumbent-bench")]
+        {
+            let fixture = arguments.next().expect("sweep fixture name");
+            let size = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive fixture size"))
+                .unwrap_or(64);
+            let repetitions = arguments
+                .next()
+                .map(|value| value.parse::<usize>().expect("positive repetition count"))
+                .unwrap_or(1);
+            assert!(size > 1 && repetitions > 0);
+            profile_ordering_sweep(&fixture, size, repetitions);
+            return;
+        }
+        #[cfg(not(feature = "sparse-incumbent-bench"))]
+        {
+            eprintln!("--profile-ordering-sweep requires --features sparse-incumbent-bench");
             std::process::exit(2);
         }
     }
