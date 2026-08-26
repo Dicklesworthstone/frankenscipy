@@ -17272,6 +17272,97 @@ mod tests {
         );
     }
 
+    /// DOES THE PREFIX SKIP EARN ITS KEEP ON THE CELL WHERE WE ACTUALLY LOSE?
+    ///
+    /// `matched_run_length` exists so the merge can leave an already-correct prefix of the
+    /// target row untouched instead of rewriting it. It is 18.99% of the cubic cell's
+    /// factorization at n=4096 and it is the FASTEST-GROWING term in the profile
+    /// (O(n^2.079) against the value merge's O(n^1.850)), so at the loss peak it is paying
+    /// for itself only if the prefixes it finds are actually long.
+    ///
+    /// The measured loss against live SciPy 1.17.1 is a U-shape -- 1.0797x at n=512,
+    /// 0.7005x at n=1728, 0.7025x at n=4096, 0.8946x at n=13824, 1.0651x at n=21952 -- so
+    /// THIS is the size to ask the question at, not the smallest or the largest.
+    ///
+    /// `span / bound` is the fraction of the compared region the scan got to skip. It is a
+    /// STRUCTURAL ratio, not a cost, which matters because `MATCHED_RUN_PROFILE` is a
+    /// `cfg(test)` counter in a hot loop and therefore an optimisation barrier: counts
+    /// survive that, timings do not. Nothing here is a timing claim.
+    ///
+    /// Ignored because it factorizes a 4096-row matrix. Run with
+    /// `cargo test --release -p fsci-sparse --lib prefix_skip -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "factorizes the n=4096 loss cell; run explicitly"]
+    fn prefix_skip_payoff_on_the_loss_peak() {
+        // Same 7-point Dirichlet stencil as `llywn_cubic_ordering_fill_probe` builds, copied
+        // rather than shared because that one is nested inside its own test.
+        fn laplacian_3d_cubic(side: usize) -> CsrMatrix {
+            let n = side * side * side;
+            let idx = |z: usize, y: usize, x: usize| (z * side + y) * side + x;
+            let (mut rows, mut columns, mut data) = (Vec::new(), Vec::new(), Vec::new());
+            for z in 0..side {
+                for y in 0..side {
+                    for x in 0..side {
+                        let row = idx(z, y, x);
+                        rows.push(row);
+                        columns.push(row);
+                        data.push(6.0);
+                        for (dz, dy, dx) in [
+                            (-1i64, 0i64, 0i64),
+                            (1, 0, 0),
+                            (0, -1, 0),
+                            (0, 1, 0),
+                            (0, 0, -1),
+                            (0, 0, 1),
+                        ] {
+                            let (nz, ny, nx) = (z as i64 + dz, y as i64 + dy, x as i64 + dx);
+                            if nz >= 0
+                                && nz < side as i64
+                                && ny >= 0
+                                && ny < side as i64
+                                && nx >= 0
+                                && nx < side as i64
+                            {
+                                rows.push(row);
+                                columns.push(idx(nz as usize, ny as usize, nx as usize));
+                                data.push(-1.0);
+                            }
+                        }
+                    }
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, columns, false)
+                .expect("cubic COO")
+                .to_csr()
+                .expect("cubic CSR")
+        }
+
+        for side in [8usize, 12, 16] {
+            let matrix = laplacian_3d_cubic(side);
+            MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
+            let factor = NativeSparseLu::factorize_csr(
+                &matrix,
+                LuOptions::default().diag_pivot_thresh,
+                PermutationOrdering::ReverseCuthillMcKee,
+            )
+            .expect("cubic factorization");
+            let (calls, span, bound) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
+            std::hint::black_box(&factor);
+            assert!(
+                calls > 0,
+                "side={side}: the merge never consulted the prefix scan"
+            );
+            let n = side * side * side;
+            println!(
+                "PREFIX_SKIP side={side} n={n} calls={calls} span={span} bound={bound} \
+                 span_per_call={:.2} bound_per_call={:.2} skipped_fraction={:.4}",
+                span as f64 / calls as f64,
+                bound as f64 / calls as f64,
+                span as f64 / bound.max(1) as f64
+            );
+        }
+    }
+
     #[test]
     fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
         // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
