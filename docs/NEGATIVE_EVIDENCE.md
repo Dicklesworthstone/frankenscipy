@@ -41368,3 +41368,78 @@ subtree traversal is the shape that meets (b); whether it can be made to satisfy
 factor representation is the next counted question. **Until something meets both, the packing
 lever should not be built**, and `llywn.3` should carry that as a precondition rather than as an
 open lever.
+
+## 2026-08-26 - BlackThrush (cc) - REJECT of my own premise: llywn's deficit is SIZE-DEPENDENT and shrinks: 1.44x at n=4096, 1.25x at n=8000, 1.12x at n=13824, all live against SciPy 1.17.1 with both A/A nulls passing — so every lever priced today was sized against the worst point of a curve
+
+**Result class: REJECT** of the implicit premise that llywn's residual is a fixed constant.
+Bead `frankenscipy-6940p`, informs `llywn.3`.
+
+**Legacy incumbent arm: SciPy 1.17.1**, in the SAME invocation as the candidate, interleaved
+side-by-side as a balanced square `A B B A A B B A`, both arms same-invocation.
+**Incumbent ratio: SciPy / FrankenSciPy = 0.6968x** at the cell llywn is defined on.
+
+**probe**: `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` (bin `perf_splu`).
+**harness**: `perf_splu`, balanced-square, 41 rounds, 4 warmup, 3 independent replicates per size.
+**same_host=thinkstation1**. host_identity=thinkstation1 physical_cores=32 logical_threads=64
+ram_bytes=231692255232 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=64
+requested_threads=1.
+**host-wide-quiescence-pre = not-certified(host-mean-busy=0.058)**,
+**host-wide-quiescence-post = not-certified(host-mean-busy=0.174)** -- recorded, not claimed. The
+host-wide certification was NOT run; what makes these rows admissible on a shared box is the
+balanced square plus the same-invocation A/A nulls, which detect the contention an uncertified
+host may have caused. The harness's own `quiescence=clear` refers to that method, not to the host
+being idle, and the two are recorded separately here so neither stands in for the other.
+**executed-binary sha256=`0c009d586ee5d4bb4792409ebe1b848573cba62b79ecb850720bef20622ebd6a`**, self-reported from inside the process.
+**Two named engine artifact SHA-256s**: frankenscipy_engine_sha256 =
+`0c009d586ee5d4bb4792409ebe1b848573cba62b79ecb850720bef20622ebd6a` (self-reported executed ELF);
+scipy_engine_sha256 = `a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+(`scipy.sparse.linalg._dsolve.linsolve`), `fsci_loaded=False genuine=True`.
+**quiescence=clear** on every invocation. Bootstrap-median CI over replicates; per-round CI is
+reported by the harness but is NOT quoted as reproducibility, per its own warning. CVs are reported for provenance only and decide nothing. The harness applies a 2x null-margin: it decides only outside a band of twice the null edge
+(`decided_if_ci_lo>1.0134_or_ci_hi<0.9866` on the first run), and every row below was inside its
+own admissibility band with both nulls within +/-0.020.
+
+**observed:**
+
+    side      n    median   replicate ci95      spread   deficit   nulls (worst of 3)
+      16   4096   0.6968   [0.6919, 0.7088]      2.4%    1.44x     scipy 1.0050 / fsci 1.0126
+      20   8000   0.7992   [0.7985, 0.8585]      7.5%    1.25x     scipy 1.0106 / fsci 1.0023
+      24  13824   0.8946   [0.8867, 0.9321]      5.1%    1.12x     scipy 0.9826 / fsci 0.9951
+
+Nine invocations, every one `ADMISSIBLE: FrankenSciPy SLOWER`, every one with both A/A nulls
+inside +/-0.02 and quiescence clear. Parity checked before timing on each:
+`worst_rel_solution_diff` 3.908e-15 at side 16 and 7.105e-15 at side 24. `lu_nnz` identical on
+both arms (8,420,004 at side 24), so this is not a fill comparison in disguise.
+
+### The finding, and it is a correction to my own six rows from today
+
+**The deficit falls monotonically as n grows**, and the side-16 and side-24 replicate ranges do not
+overlap. Every lever priced today -- density (`8m8s7`), loop order (`fzk5t`), packing (`n6mqn`),
+its denominator (`hpx50`), its ceiling (`bfk5l`), its blocker (`4m90a`) -- was computed against the
+n=4096 cell, where the deficit is at its worst.
+
+**At n=13824 the deficit is 1.12x, so the packing lever's own 1.308-1.384-fold ceiling would
+OVERSHOOT the entire gap.** The lever was sized against the worst point of a curve and then reasoned
+about as though it had been sized against the curve. That is a scope error, not an arithmetic one:
+the kernel numbers are correct FOR THEIR SIZE.
+
+### What the shape implies, stated as a hypothesis rather than a result
+
+A gap that CLOSES as n grows is characteristic of a fixed or slowly-growing overhead being
+amortised. A per-element kernel deficit would hold its ratio or widen. Everything measured today
+was a per-element kernel property, so the thing actually costing us at the losing cell is probably
+not what six beads examined. **This is a hypothesis with an obvious test and it is not being
+recorded as a finding.**
+
+### Also worth stating plainly
+
+At side 24 we are at 0.8946x with a replicate range reaching 0.9321x. llywn is conventionally
+described in this ledger as a 1.46-fold or 1.60-fold loss. **That description is true only of its
+smallest measured cell**, and any future row quoting llywn's deficit should quote the size with it.
+
+**Concrete retry predicate:** repeat `hpx50`'s callgrind attribution at side 24 and compare SHARES
+against side 16 -- specifically `factorize_csr`, `from_factor_rows` and the ordering pass against
+`apply_sorted_pivot_tail`. If the one-time terms shrink as a share while the elimination holds, the
+small-n penalty is amortisable overhead and that is a cheaper, better-aimed lever than anything now
+on `llywn.3`. Counted, so no quiet host is required.
