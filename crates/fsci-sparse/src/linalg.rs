@@ -1511,6 +1511,28 @@ fn apply_sorted_pivot_tail(
                 // Narrowing `tail_vals` to `matched` up front pays for the check ONCE and
                 // hands `zip` two runs the compiler already knows are the same length.
                 // Bit-identical: same operands, same order, same rounding.
+                //
+                // AND IT BUYS NO TIME, WHICH IS THE MORE USEFUL RESULT. A/B on two
+                // verified-distinct binaries, three `perf stat` runs each on the loss cell:
+                //
+                //     arm     instructions      cycles      IPC
+                //     before  3,392,459,064  1,685,204,012  2.013
+                //     after   3,249,647,050  1,691,238,385  1.922
+                //     delta          -4.21%         +0.36%  -4.5%
+                //
+                // Cycle ranges overlap completely (1,673.9-1,701.5M against
+                // 1,678.7-1,705.2M). Instructions fell 4.21% and IPC fell by the same
+                // amount, so the cycles were never spent issuing these instructions --
+                // the bounds checks were filling idle slots behind the dependent load
+                // chain through the sparse column indices.
+                //
+                // THE CONSEQUENCE FOR ANYONE OPTIMISING THIS KERNEL: instruction counts do
+                // not convert to time here. `perf stat` reads IPC ~1.92 with
+                // stalled-cycles-backend at 0.0% and ~190M L1 D-cache load misses over
+                // 3.25G instructions. Justify further work on the miss count or the
+                // dependency chain, not on Ir -- three separate Ir reductions landed today
+                // (-7.89% cumulative) and none of them moved the vs-SciPy ratio outside its
+                // replicate spread.
                 let updated = &mut target.vals[base..base + matched];
                 let tail = &tail_vals[..matched];
                 if detect_cancellation {
