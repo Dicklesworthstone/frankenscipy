@@ -39900,3 +39900,143 @@ question about the algorithm, and it is the first time this bead has had one.
   annotated with a pointer to the row that superseded it.** I have now twice reasoned from that
   number and twice had to correct the reasoning; the third agent to read those beads will do the
   same.
+
+## 2026-08-26 - BlackThrush (cc) - CORRECTION to my own row above: that periodic-cuboid class was closed and reversed on 2026-08-19 and I failed to read the row that did it
+
+- **Result class: BEHAVIORAL / correction of a claim I made in this ledger yesterday.** No
+  timing was taken and **no speed figure is claimed, quoted or restated anywhere in this row** --
+  every number this corrects lives in the rows referenced by line number below and is
+  deliberately not repeated, because a correction that re-quotes ratios is just another
+  unverified timing claim.
+- **probe: `grep -n frankenscipy-zdom3 docs/NEGATIVE_EVIDENCE.md`**, re-runnable, on
+  `same_host=thinkstation1`, run locally on worker `thinkstation1` (no rch worker admitted this
+  session; every candidate reported `os_gate_excluded=1 required_os=none`).
+  **Observed values:** the newest matching row is at line **38241**, dated 2026-08-19, and not
+  the 2026-08-01 profile I cited. Reading that row, its result-class field is `CAMPAIGN-WIN`; its
+  decision field is `PERIODIC_CUBOID_SPSOLVE_DECISION=KEEP competitive_claim=PASS`; its null
+  field is `null_medians_within_2pct=true`; its gate fields
+  `maintenance_ci_low_at_least_1_20_and_beyond_2x_null` and
+  `competitive_ci_low_beyond_2x_null` are both `true`; `cv_used_for_decision=false`; and it
+  carries two named engine SHA-256s.
+
+- **WHAT I WROTE.** In the 2026-08-26 COUNTED row above I presented as a finding that the bead's
+  headline figure no longer describes HEAD, that "both zdom3 and g68jq still describe it that
+  way", and I attributed the change to `factorize_csr` having been "rewritten twice" since the
+  2026-08-01 profile.
+
+- **WHAT IS ACTUALLY THE CASE.** `frankenscipy-zdom3` was closed a week earlier by the row at
+  line 38241, with `DECISION=KEEP` and every gate that row's pre-registration named. **The
+  transition I reported as undiscovered was already recorded, in this file, in a stronger and
+  fully gated form than my row gave it.**
+
+- **AND MY EXPLANATION WAS WRONG TOO.** That row credits the reversal to wiring the periodic
+  Fourier recognizer and plan into `spsolve` -- a ROUTE change, so the work is no longer a sparse
+  factorization at all. I attributed it to factorizer rewrites, which I did not verify and which
+  are not what that row credits.
+
+- **WHAT SURVIVES FROM MY ROW, unchanged.** Its counted result was measured rather than
+  inherited, and none of it depends on the mistaken framing: the 2026-08-19 win was taken on a
+  9x11x13 grid -- odd, `>= 9`, pairwise distinct -- and says nothing about cubic or even-extent
+  grids, which the recognizer refused until `frankenscipy-g68jq` landed (fe722fe71). That gap was
+  real and the widening closes it.
+
+- **THE PROCESS FAILURE, because it is the reusable part.** I searched this file for the bead's
+  headline figure and read the beads' own comments, then treated "the beads still say it" as
+  evidence the class was still a loss. Bead text is a claim about the past; the ledger row is the
+  record. **`g68jq`'s stated blocker -- "do not land before zdom3 measures" -- had been satisfied
+  for a week**, which the same row would have told me, and which makes my sequencing anxiety in
+  that commit unnecessary rather than merely cautious.
+
+- **Concrete retry predicate:** before citing any bead's headline figure, run the grep above with
+  that bead id and read the NEWEST row naming it, not the oldest. Both `zdom3` and `g68jq` still
+  carry the superseded figure in their bead text with no pointer to the row that replaced it;
+  adding that pointer is worth more than either of these two ledger entries.
+
+## 2026-08-26 - BlackThrush (cc) - REFUTED, and it CONFIRMS llywn from the opposite direction: AMD cuts the cubic cell's fill 1.83x and costs 2.47x MORE instructions
+
+- **Result class: REJECT, decided by a counted mechanism and by nothing else.** No wall claim.
+  The host held loadavg 20-190 for this whole session and the splu live harness could not be
+  run; instruction counts do not depend on load. **CV is not computed and would be provenance
+  only.** Filed and closed as `frankenscipy-llywn.1`, a leaf under `frankenscipy-llywn`.
+
+- **THE HYPOTHESIS, and why it was worth testing.** `frankenscipy-llywn` is the campaign's worst
+  standing REPLICATED loss -- splu cubic side=16, competitive ratio **0.6237** CI95
+  [0.6215, 0.6287] over twelve admissible replicates, zero void. Its bead states the mechanism
+  as settled: *"Our fill is at SuperLU parity or better ... Same COLAMD ordering, same fill. So
+  the fill-reducing ordering is NOT the problem -- per-entry elimination THROUGHPUT is."* That
+  was written when the only orderings here were RCM (which `Colamd` maps to) and the O(V^2)
+  exact minimum degree. AMD landed 2026-08-25 and had never been tried on this cell.
+
+- **AND THE FILL PREMISE REALLY DOES FALL.** probe: `llywn_cubic_ordering_fill_probe`,
+  laplacian_3d_cubic side=16, n=4096, nnz=27136. Fill is structural and the ordering call is a
+  pure function, so neither depends on load:
+
+    | ordering | ordering call alone | factor nnz | vs SuperLU 1,231,312 |
+    |---|---|---|---|
+    | RCM (ships) | 7.634 ms | 1,188,312 | 0.9651 |
+    | AMD | 11.707 ms | **648,372** | **0.5266** |
+    | exact min-degree | 1343.367 ms | 597,514 | 0.4853 |
+
+  So llywn's "at SuperLU parity" is confirmed for the SHIPPING ordering, and **AMD gets 1.83x
+  less fill than what ships and 1.90x less than SuperLU.** On fill alone the bead's premise is
+  wrong at HEAD.
+
+- **AND THE LEVER IS STILL REFUTED, which is the finding.** probe:
+  `perf_spsolve --profile-cubic-splu-rust` under `valgrind --tool=callgrind`, one repetition,
+  ONE binary, arms selected by `FSCI_SPLU_ORDERING`. Both arms take the general sparse LU: `rcm`
+  and `amd` are each != `Colamd`, so neither reaches the cubic-spectral recognizer, which is the
+  route llywn's own harness disables.
+
+    | side | n | RCM total Ir | AMD total Ir | AMD vs RCM |
+    |---|---|---|---|---|
+    | 12 | 1728 | 257,211,025 | 481,039,198 | **1.87x MORE** |
+    | 16 | 4096 | 1,150,097,078 | 2,838,299,619 | **2.47x MORE** |
+
+  Same sign at both sizes, growing with n. **1.83x less fill bought 2.47x more work.**
+
+- **THE COUNTED MECHANISM, and it is the interesting part.** Instructions per factor nonzero:
+
+        RCM   1,150,097,078 / 1,188,312 =   967.8
+        AMD   2,838,299,619 /   648,372 = 4,377.6      4.52x WORSE per entry
+
+  The elimination's cost on this cell is not fill-volume bound. RCM produces a BANDED factor and
+  the row-merge kernel this cell has been tuned on for months is efficient on it; AMD produces a
+  scattered factor with the same total entries costing 4.5x more each, which more than cancels
+  having 1.83x fewer of them. **llywn's stated mechanism -- "per-entry elimination THROUGHPUT",
+  not fill -- is therefore CONFIRMED, from a direction that was set up to refute it.**
+
+- **Parity held on both arms**: cubic checksum 7.96725819551278303e0 under RCM against
+  7.96725819551273240e0 under AMD, differing only in the last digits as two elimination orders
+  must.
+
+- **WHAT I GOT WRONG, stated plainly.** I filed `llywn.1` predicting the opposite, on the
+  reasoning that elimination flops go as the sum of squared row counts so a 1.83x fill cut
+  "should be worth MORE than 1.83x on the factor, not less". That reasoning treats fill as the
+  only structural variable and is wrong: the ordering also sets how many times each row is
+  TOUCHED and how contiguous those touches are, and on this kernel that term dominates. The bead
+  did say the deciding measurement was counted-first for exactly this reason, and it was, before
+  anything was spent on a quiet window.
+
+- **PROVENANCE.** `frankenscipy_engine_sha256 = executed-binary ELF SHA-256 =`
+  `849a86b5b983bd4b5b6ec78ea208f2ff2904cb2c88deb766163d8d14643960e7`
+  (artifact `target/release/perf_spsolve`; ONE binary, both arms) and the fill probe ran under
+  `849a86b5...`'s sibling test binary from the same tree. `same_host=thinkstation1`, run locally
+  on worker `thinkstation1` (no rch worker admitted this session: every candidate reported
+  `os_gate_excluded=1 required_os=none`, so `build_route=local-wrapper-bypass`).
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `affinity/cpuset=64`, `CPU frequency governor=powersave`. `build_slot` REFUSED server-side
+  (frankenscipy-fr78g).
+
+- **WHAT THIS DOES NOT SAY.** It does not say AMD is a bad ordering -- on the run7d convection
+  cell the same code is worth 1.535x against live SciPy, certified. It says the CUBIC cell's
+  elimination is structure-bound rather than fill-bound, and that the two cells therefore want
+  opposite orderings. Any future "make AMD the default" proposal has to answer this row.
+
+- **Concrete retry predicate:** the number that would explain the 4.52x directly is the UPDATE
+  COUNT -- how many times the elimination touches each factor row under each ordering -- which
+  llywn already tracks as its own figure of merit ("1.74 Ir/update, updates already 98.8% of
+  minimum"). Count updates under RCM and under AMD on this cell; if AMD's update count is up by
+  ~4.5x, the mechanism is closed and the ordering question on this cell is finished for good. Do
+  NOT spend a quiet window on a live AMD row for this cell first: the counted result above says
+  it would measure a regression.
