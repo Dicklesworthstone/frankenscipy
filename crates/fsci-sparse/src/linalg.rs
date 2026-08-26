@@ -4457,7 +4457,7 @@ fn spsolve_spd_m_matrix_candidate(
     let shape = a.shape();
     let n = shape.rows;
     if options.backend != SparseBackend::Auto
-        || options.ordering != PermutationOrdering::Colamd
+        || !ordering_permits_structural_substitution(options.ordering)
         || n < min_n
         || a.nnz() > n.saturating_mul(max_nnz_per_row)
     {
@@ -4561,7 +4561,7 @@ fn spsolve_symmetric_banded_candidate(
     // Cholesky is ~half the flops of the general banded LU it replaces regardless of
     // in-band density. Bandwidth (≤128) bounds the O(n·bw²) cost.
     if options.backend != SparseBackend::Auto
-        || options.ordering != PermutationOrdering::Colamd
+        || !ordering_permits_structural_substitution(options.ordering)
         || n < SPSOLVE_SPD_BANDED_CHOLESKY_MIN_N
         || half_bandwidth == 0
         || half_bandwidth > SPSOLVE_SPD_BANDED_MAX_HALF_BANDWIDTH
@@ -4773,7 +4773,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
     if over_dense_guard || genuinely_sparse {
         if options.mode == RuntimeMode::Strict
             && options.backend == SparseBackend::Auto
-            && options.ordering == PermutationOrdering::Colamd
+            && ordering_permits_structural_substitution(options.ordering)
             && !SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
             && let Some(pattern) = splu_periodic_cuboid_pattern(a)
             && let Some(solution) = spsolve_periodic_cuboid_direct(a, b, pattern)
@@ -4814,7 +4814,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
         // (frankenscipy-vacuous-perf-toggles-qcuyy).
         if options.mode == RuntimeMode::Strict
             && options.backend == SparseBackend::Auto
-            && options.ordering == PermutationOrdering::Colamd
+            && ordering_permits_structural_substitution(options.ordering)
             && !SPSOLVE_CUBIC_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
             && let Some(pattern) = splu_cubic_grid_dirichlet_pattern(a, bandwidth)
             && let Some(plan) = CubicSpectralLu::new(a, pattern)
@@ -4938,7 +4938,7 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
     {
         let csr = a.to_csr()?;
         let spectral_defaults = options.mode == RuntimeMode::Strict
-            && options.ordering == PermutationOrdering::Colamd
+            && ordering_permits_structural_substitution(options.ordering)
             && options.diag_pivot_thresh.to_bits() == 1.0_f64.to_bits();
         let cubic_spectral = if spectral_defaults
             && !SPLU_CUBIC_SPECTRAL_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
@@ -9335,6 +9335,37 @@ impl CubicSpectralLu {
     }
 }
 
+/// Does the requested ordering leave the library free to substitute a structure-specific route?
+///
+/// WHAT THIS REPLACES, and why it was a defect rather than a style problem. Five structural fast
+/// paths -- the cubic-spectral factor and solve, the periodic-cuboid spectral solve, the SPD
+/// banded Cholesky, and the wide-bandwidth CG route -- each tested `options.ordering ==
+/// PermutationOrdering::Colamd` directly. That equality was standing in for "the caller did not
+/// name an ordering, so we may ignore orderings altogether": every one of those routes returns
+/// `ordering_used = Natural`, and one of the call sites even binds the test to a local called
+/// `spectral_defaults`.
+///
+/// Using the DEFAULT VALUE as the proxy for "unspecified" means the set of recognisers silently
+/// depends on which enum variant happens to be the default. Measured consequence: changing
+/// `LuOptions::default().ordering` to `Amd` turned all five routes OFF and failed eight tests --
+/// and every one of those eight is a DISPATCH assertion, so a conformance corpus checking only
+/// VALUES would have gone green over a default change that removed four fast paths
+/// (frankenscipy-run7d, ledger 2026-08-25).
+///
+/// `Colamd` and `Amd` are both requests for *good fill*, not for a named elimination sequence:
+/// the whole point of either is to make the general LU cheaper, and a route that skips the
+/// general LU entirely serves that purpose better than any ordering could. `Natural`,
+/// `ReverseCuthillMcKee`, `MmdAta` and `MmdAtPlusA` name a specific algorithm the caller asked
+/// for by name, so they are deliberately NOT included -- substituting a spectral solve for an
+/// explicitly requested elimination order is a different decision, and this function does not
+/// make it.
+fn ordering_permits_structural_substitution(ordering: PermutationOrdering) -> bool {
+    matches!(
+        ordering,
+        PermutationOrdering::Colamd | PermutationOrdering::Amd
+    )
+}
+
 fn splu_periodic_cuboid_pattern(a: &CsrMatrix) -> Option<PeriodicCuboidPattern> {
     let shape = a.shape();
     if !shape.is_square() || a.nnz() != shape.rows.checked_mul(7)? {
@@ -12274,6 +12305,79 @@ mod tests {
             .expect("3-D laplacian CSR")
     }
 
+    /// The structural fast paths must depend on whether an ordering was NAMED, not on which enum
+    /// variant happens to be the default (frankenscipy-run7d).
+    ///
+    /// BOTH ARMS, and the must-miss arm is the one that matters: a predicate returning `true` for
+    /// everything would pass the "still fires" half while quietly letting an explicitly requested
+    /// elimination order be replaced by a spectral solve.
+    ///   * MUST-HIT: `Colamd` and `Amd` both reach the cubic-spectral route.
+    ///   * MUST-MISS: `Natural`, `ReverseCuthillMcKee`, `MmdAta` and `MmdAtPlusA` name a specific
+    ///     algorithm, so the route must stand aside and the general path must answer.
+    /// Every arm checks the ANSWER as well as the route: a fast path that dispatches and returns
+    /// the wrong solution is worse than one that never fires.
+    #[test]
+    fn structural_fast_paths_follow_unnamed_orderings_not_the_default_variant() {
+        use std::sync::atomic::Ordering;
+
+        // These routes are gated on process-global toggles that other tests write, so this takes
+        // the same lock they do; without it a concurrent test can disable the route and this one
+        // reports a dispatch failure that is really a race.
+        let _lock = SPLU_CUBIC_SPECTRAL_TEST_LOCK
+            .lock()
+            .expect("cubic test lock");
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(false, Ordering::Relaxed);
+
+        let matrix = splu_dirichlet_laplacian_3d(8);
+        let rhs: Vec<f64> = (0..matrix.shape().rows)
+            .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+            .collect();
+
+        for (ordering, may_substitute) in [
+            (PermutationOrdering::Colamd, true),
+            (PermutationOrdering::Amd, true),
+            (PermutationOrdering::Natural, false),
+            (PermutationOrdering::ReverseCuthillMcKee, false),
+            (PermutationOrdering::MmdAta, false),
+            (PermutationOrdering::MmdAtPlusA, false),
+        ] {
+            assert_eq!(
+                super::ordering_permits_structural_substitution(ordering),
+                may_substitute,
+                "{ordering:?}: substitution predicate"
+            );
+
+            let solved = spsolve(
+                &matrix,
+                &rhs,
+                SolveOptions {
+                    ordering,
+                    ..SolveOptions::default()
+                },
+            )
+            .expect("cubic solve");
+            if may_substitute {
+                assert_eq!(
+                    solved.backend_used,
+                    SparseBackend::CubicSpectralLu,
+                    "{ordering:?} leaves the ordering to us, so the spectral route must fire"
+                );
+            } else {
+                assert_ne!(
+                    solved.backend_used,
+                    SparseBackend::CubicSpectralLu,
+                    "{ordering:?} names an elimination order and must not be replaced"
+                );
+            }
+            assert!(
+                relative_residual(&matrix, &rhs, &solved.solution)
+                    <= SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL,
+                "{ordering:?}: whichever route answered must answer correctly"
+            );
+        }
+    }
+
     /// The periodic-cuboid recognizer's reach, pinned on BOTH arms (frankenscipy-g68jq).
     ///
     /// Was: extents had to be >= 9, ODD and PAIRWISE DISTINCT, so a CUBIC periodic grid -- the
@@ -12596,6 +12700,10 @@ mod tests {
         }
     }
 
+    // Lost its `#[test]` at some point and has been dead code ever since -- the compiler said so
+    // on every build ("function is never used"), which is what a silently unregistered test looks
+    // like. Restored rather than deleted: it passes.
+    #[test]
     fn laplacian_handles_empty_and_isolated_graphs() {
         let empty =
             CsrMatrix::from_components(Shape2D::new(0, 0), Vec::new(), Vec::new(), vec![0], false)
