@@ -18935,6 +18935,227 @@ mod tests {
         }
     }
 
+    /// WHAT IS A PROFILE-REDUCING ORDERING WORTH? Measured before anything is built on it.
+    ///
+    /// The banded kernel is 1.13-1.74x BETTER per LU nonzero than SuperLU; the whole remaining
+    /// loss on run7d's cell is that our fill grows O(n^1.473) against SciPy's O(n^1.266). Fill for
+    /// an envelope method IS the profile, so anything that shrinks the profile shrinks the loss
+    /// while keeping the band the kernel needs.
+    ///
+    /// RCM minimises BANDWIDTH. Sloan minimises PROFILE, which is the quantity that actually bills
+    /// us, and is the standard answer when the profile is what matters. This measures the gap
+    /// between them before any of it is wired in -- the pseudo-peripheral attempt was worth
+    /// exactly 1.0000x and was cheaper to reject this way than to build.
+    #[test]
+    #[ignore = "measurement: run explicitly"]
+    fn sloan_profile_gain_over_rcm() {
+        fn convection_grid(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("grid CSR")
+        }
+
+        fn bfs_dist(a: &CsrMatrix, from: usize, n: usize) -> Vec<i64> {
+            let (indptr, indices) = (a.indptr(), a.indices());
+            let mut dist = vec![-1i64; n];
+            let mut queue = std::collections::VecDeque::from(vec![from]);
+            dist[from] = 0;
+            while let Some(u) = queue.pop_front() {
+                for &v in &indices[indptr[u]..indptr[u + 1]] {
+                    if dist[v] < 0 {
+                        dist[v] = dist[u] + 1;
+                        queue.push_back(v);
+                    }
+                }
+            }
+            dist
+        }
+
+        /// Sloan: priority `W1 * distance_to_end - W2 * (degree + 1)`, eligible nodes promoted
+        /// through inactive -> preactive -> active -> postactive. The classic weights are 1 and 2.
+        fn sloan(a: &CsrMatrix, n: usize, start: usize, end: usize) -> Vec<usize> {
+            const W1: i64 = 1;
+            const W2: i64 = 2;
+            let (indptr, indices) = (a.indptr(), a.indices());
+            let degree = |i: usize| (indptr[i + 1] - indptr[i]) as i64;
+            let dist_end = bfs_dist(a, end, n);
+            let mut status = vec![0u8; n]; // 0 inactive, 1 preactive, 2 active, 3 postactive
+            let mut priority: Vec<i64> = (0..n)
+                .map(|i| W1 * dist_end[i].max(0) - W2 * (degree(i) + 1))
+                .collect();
+            let mut order = Vec::with_capacity(n);
+            let mut eligible: Vec<usize> = vec![start];
+            status[start] = 1;
+            while order.len() < n {
+                if eligible.is_empty() {
+                    if let Some(next) = (0..n).find(|&i| status[i] != 3) {
+                        eligible.push(next);
+                        status[next] = 1;
+                    } else {
+                        break;
+                    }
+                }
+                let pick = eligible
+                    .iter()
+                    .enumerate()
+                    .max_by_key(|(_, node)| priority[**node])
+                    .map(|(index, _)| index)
+                    .expect("eligible");
+                let node = eligible.swap_remove(pick);
+                if status[node] == 1 {
+                    for &v in &indices[indptr[node]..indptr[node + 1]] {
+                        priority[v] += W2;
+                        if status[v] == 0 {
+                            status[v] = 1;
+                            eligible.push(v);
+                        }
+                    }
+                }
+                status[node] = 3;
+                order.push(node);
+                for &v in &indices[indptr[node]..indptr[node + 1]] {
+                    if status[v] == 1 {
+                        status[v] = 2;
+                        priority[v] += W2;
+                        for &w in &indices[indptr[v]..indptr[v + 1]] {
+                            if status[w] != 3 {
+                                priority[w] += W2;
+                                if status[w] == 0 {
+                                    status[w] = 1;
+                                    eligible.push(w);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            order
+        }
+
+        fn profile_of(a: &CsrMatrix, perm: &[usize], n: usize) -> u64 {
+            let mut inverse = vec![0usize; n];
+            for (position, &original) in perm.iter().enumerate() {
+                inverse[original] = position;
+            }
+            let (indptr, indices) = (a.indptr(), a.indices());
+            let mut total = 0u64;
+            for position in 0..n {
+                let original = perm[position];
+                let mut leftmost = position;
+                for &column in &indices[indptr[original]..indptr[original + 1]] {
+                    leftmost = leftmost.min(inverse[column]);
+                }
+                total += (position - leftmost) as u64;
+            }
+            total
+        }
+
+        // MUST-HIT CONTROL FIRST. Identical profiles to the digit on three grids could equally
+        // mean this Sloan degenerates to RCM -- a broken implementation and a genuine tie look the
+        // same. An irregular graph is where Sloan's priority is supposed to differ from a pure
+        // level sweep, so if the two agree THERE, the measurement is measuring nothing.
+        {
+            // Ragged: a path with random long chords, so level sets are not the natural order.
+            let n = 2000usize;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            let mut state = 0x2545_f491_4f6c_dd1du64;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state
+            };
+            let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+            for i in 0..n - 1 {
+                edges[i].push(i + 1);
+                edges[i + 1].push(i);
+            }
+            for _ in 0..n / 4 {
+                let a = (next() as usize) % n;
+                let b = (next() as usize) % n;
+                if a != b && !edges[a].contains(&b) {
+                    edges[a].push(b);
+                    edges[b].push(a);
+                }
+            }
+            for row in 0..n {
+                let mut row_cols = edges[row].clone();
+                row_cols.push(row);
+                row_cols.sort_unstable();
+                row_cols.dedup();
+                for c in row_cols {
+                    indices.push(c);
+                    data.push(if c == row { 40.0 } else { -1.0 });
+                }
+                indptr.push(data.len());
+            }
+            let ragged =
+                CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                    .expect("ragged CSR");
+            let rcm = reverse_cuthill_mckee(&ragged);
+            let d0 = bfs_dist(&ragged, 0, n);
+            let end = (0..n).max_by_key(|&i| d0[i]).unwrap_or(0);
+            let sl = sloan(&ragged, n, 0, end);
+            let (p_rcm, p_sl) = (profile_of(&ragged, &rcm, n), profile_of(&ragged, &sl, n));
+            println!(
+                "SLOAN_CONTROL ragged n={n} rcm_profile={p_rcm} sloan_profile={p_sl} \
+                 differ={}",
+                p_rcm != p_sl
+            );
+            assert_ne!(
+                p_rcm, p_sl,
+                "Sloan and RCM produce the same profile even on an irregular graph, so this \
+                 implementation is not doing anything RCM does not and the grid ties below \
+                 measure nothing"
+            );
+        }
+
+        for side in [32usize, 64, 96] {
+            let matrix = convection_grid(side);
+            let n = matrix.shape().rows;
+            let rcm = reverse_cuthill_mckee(&matrix);
+            let p_rcm = profile_of(&matrix, &rcm, n);
+            // Endpoints: a corner and the far corner, which BFS finds as the deepest node.
+            let d0 = bfs_dist(&matrix, 0, n);
+            let end = (0..n).max_by_key(|&i| d0[i]).unwrap_or(0);
+            let sl = sloan(&matrix, n, 0, end);
+            assert_eq!(sl.len(), n, "sloan must emit every node");
+            let p_sl = profile_of(&matrix, &sl, n);
+            println!(
+                "SLOAN side={side} n={n} rcm_profile={p_rcm} sloan_profile={p_sl} \
+                 rcm_fill={} sloan_fill={} gain={:.4}x",
+                2 * p_rcm + n as u64,
+                2 * p_sl + n as u64,
+                (2 * p_rcm + n as u64) as f64 / (2 * p_sl + n as u64) as f64
+            );
+        }
+    }
+
     #[test]
     fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
         // MEASURES THE GENERAL ELIMINATION, so the banded path must not intercept it. Since
