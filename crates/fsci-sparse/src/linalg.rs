@@ -10764,6 +10764,55 @@ fn postorder_forest(parent: &[usize]) -> Vec<usize> {
 /// do it) and it is FILL-NEUTRAL BY CONSTRUCTION: reordering siblings of an elimination tree
 /// permutes the factor's rows and columns without changing which entries fill in. So this can only
 /// move locality, never work.
+/// Per-column nonzero counts of the L factor, from the elimination tree.
+///
+/// THE OTHER HALF OF THE SUPERNODAL PRECONDITION. A supernodal plan needs the tree and these
+/// counts; it does not need the fill PATTERN. `symbolic_fill_pattern` builds the pattern and
+/// measures 15.35x a factorization, which is what closed the direction on `frankenscipy-4m90a`.
+/// The tree measures 0.039x. This closes the gap between them.
+///
+/// The row pattern of L row `i` is the union of the elimination-tree paths from each `A(i,k)`,
+/// `k < i`, upward until a node already reached for this row. Marking by row makes each node cost
+/// O(1) per row that reaches it, so the total is O(|L|) -- proportional to the fill it counts
+/// rather than to the pattern it avoids materialising.
+///
+/// Returns `(column_counts, total)` where `total` is the L nonzero count including the diagonal.
+#[allow(dead_code)] // supernodal precondition; no numeric path consumes it yet
+fn l_column_counts_from_etree(a: &CsrMatrix, perm: &[usize], parent: &[usize]) -> (Vec<u32>, u64) {
+    let n = perm.len();
+    let mut inverse = vec![0usize; n];
+    for (position, &original) in perm.iter().enumerate() {
+        inverse[original] = position;
+    }
+    let (indptr, indices) = (a.indptr(), a.indices());
+    let mut counts = vec![0u32; n];
+    let mut mark = vec![usize::MAX; n];
+    let mut total = 0u64;
+    for row in 0..n {
+        let original = perm[row];
+        mark[row] = row;
+        counts[row] += 1; // the diagonal
+        total += 1;
+        for &column in &indices[indptr[original]..indptr[original + 1]] {
+            let mut node = inverse[column];
+            if node >= row {
+                continue;
+            }
+            while mark[node] != row {
+                mark[node] = row;
+                counts[node] += 1;
+                total += 1;
+                let up = parent[node];
+                if up >= n {
+                    break;
+                }
+                node = up;
+            }
+        }
+    }
+    (counts, total)
+}
+
 #[allow(dead_code)] // measured NEGATIVE on the AMD path; kept as a precondition for supernodal work
 fn amd_postordered_ordering(a: &CsrMatrix) -> Vec<usize> {
     let base = approximate_minimum_degree_ordering(a);
@@ -19198,6 +19247,149 @@ mod tests {
             "AB_SYMBOLIC arm={} side={side} n={n} checksum={checksum}",
             if etree_arm { "etree" } else { "pattern" }
         );
+    }
+
+    /// The etree column counts must agree with the fill the factorization ACTUALLY produces.
+    ///
+    /// These counts are the supernodal plan's sizing input; a count that is merely plausible would
+    /// size every block wrong. They are checked against `symbolic_fill_pattern`, which is the
+    /// expensive object they exist to replace -- so the reference is the thing being replaced,
+    /// not a restatement of the same algorithm.
+    ///
+    /// Checked under BOTH orderings that matter, because the whole point of having them is to plan
+    /// a supernodal factorization on a FILL-REDUCING ordering, where the band assumption fails.
+    #[test]
+    #[ignore = "verification: run explicitly"]
+    fn etree_column_counts_match_the_real_fill() {
+        fn convection_grid(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("grid CSR")
+        }
+
+        for (label, matrix) in [
+            ("convection(32)", convection_grid(32)),
+            ("convection(64)", convection_grid(64)),
+            ("cubic(10)", splu_dirichlet_laplacian_3d(10)),
+        ] {
+            let n = matrix.shape().rows;
+            for ordering in [
+                PermutationOrdering::ReverseCuthillMcKee,
+                PermutationOrdering::Amd,
+            ] {
+                let (perm, _used) = sparse_lu_fill_ordering(&matrix, n, ordering);
+                let perm = perm.unwrap_or_else(|| (0..n).collect());
+                let parent = elimination_tree_of_permuted(&matrix, &perm);
+                let (counts, total) = l_column_counts_from_etree(&matrix, &perm, &parent);
+
+                // Reference: the pattern pass this is meant to replace.
+                let rows = permuted_sorted_rows(&matrix, &perm);
+                let initial: Vec<Vec<u32>> =
+                    rows.iter().map(|row| row.live_cols().to_vec()).collect();
+                let (_u_pattern, l_pattern) = symbolic_fill_pattern(n, &initial);
+                // `l_pattern[r]` holds the columns of L in row r, strictly below the diagonal.
+                let mut reference = vec![0u32; n];
+                let mut reference_total = 0u64;
+                for (row, cols) in l_pattern.iter().enumerate() {
+                    for &column in cols {
+                        if (column as usize) < row {
+                            reference[column as usize] += 1;
+                            reference_total += 1;
+                        }
+                    }
+                    reference[row] += 1; // diagonal
+                    reference_total += 1;
+                }
+                let mismatched = counts
+                    .iter()
+                    .zip(reference.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                println!(
+                    "COLCOUNT {label} ord={ordering:?} n={n} etree_total={total} \
+                     pattern_total={reference_total} mismatched_columns={mismatched}"
+                );
+                assert_eq!(
+                    total, reference_total,
+                    "{label}/{ordering:?}: etree counts total {total} against the pattern's \
+                     {reference_total}"
+                );
+                assert_eq!(
+                    mismatched, 0,
+                    "{label}/{ordering:?}: {mismatched} columns disagree with the pattern"
+                );
+
+                // FUNDAMENTAL SUPERNODES straight off the tree and the counts, which is the whole
+                // point of having them cheaply: columns `j` and `j+1` share a supernode when
+                // `parent[j] == j+1` and `count[j] == count[j+1] + 1`. No pattern needed.
+                //
+                // This is the number that decides whether a blocked kernel can work on a
+                // FILL-REDUCING ordering. AMD gives far less fill than RCM; if it also gives
+                // usable supernodes, the combination this campaign has been unable to reach is
+                // worth building. If its supernodes are width 1, it is not.
+                let mut widths = Vec::new();
+                let mut run = 1usize;
+                for j in 0..n.saturating_sub(1) {
+                    if parent[j] == j + 1 && counts[j] == counts[j + 1] + 1 {
+                        run += 1;
+                    } else {
+                        widths.push(run);
+                        run = 1;
+                    }
+                }
+                widths.push(run);
+                let mean = widths.iter().sum::<usize>() as f64 / widths.len() as f64;
+                let widest = widths.iter().copied().max().unwrap_or(0);
+                let in_wide: usize = widths.iter().filter(|&&w| w >= 4).sum();
+                // FILL-WEIGHTED SHARE, which is the number that matters. A blocked kernel
+                // accelerates WORK, not columns, and fill concentrates at the top of the
+                // elimination tree where the supernodes are widest -- so the share of COLUMNS in
+                // wide supernodes understates the prize, possibly badly.
+                let mut fill_in_wide = 0u64;
+                let mut column = 0usize;
+                for &w in &widths {
+                    if w >= 4 {
+                        for c in column..column + w {
+                            fill_in_wide += counts[c] as u64;
+                        }
+                    }
+                    column += w;
+                }
+                println!(
+                    "SUPERNODE {label} ord={ordering:?} n={n} fill={total} supernodes={} \
+                     mean_width={mean:.2} max_width={widest} cols_in_width>=4={in_wide} \
+                     col_share={:.3} FILL_share={:.3}",
+                    widths.len(),
+                    in_wide as f64 / n as f64,
+                    fill_in_wide as f64 / total as f64
+                );
+            }
+        }
     }
 
     #[test]
