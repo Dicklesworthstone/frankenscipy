@@ -43,6 +43,13 @@ pub enum PermutationOrdering {
     MmdAta,
     MmdAtPlusA,
     ReverseCuthillMcKee,
+    /// Approximate minimum degree (Amestoy-Davis-Duff) on the pattern of A + Aᵀ.
+    ///
+    /// Targets the same fill as `MmdAtPlusA` without its O(V²) clique construction.
+    /// Not a SciPy `permc_spec` value -- SciPy exposes COLAMD, NATURAL and the two MMD
+    /// variants only -- so it is reachable through this crate's own options and never
+    /// through a SciPy-compatible spelling.
+    Amd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1822,6 +1829,14 @@ fn sparse_lu_fill_ordering(
             let p = minimum_degree_ordering(a);
             if p.len() == n {
                 (Some(p), ordering)
+            } else {
+                (None, PermutationOrdering::Natural)
+            }
+        }
+        PermutationOrdering::Amd => {
+            let p = approximate_minimum_degree_ordering(a);
+            if p.len() == n {
+                (Some(p), PermutationOrdering::Amd)
             } else {
                 (None, PermutationOrdering::Natural)
             }
@@ -10107,6 +10122,225 @@ fn minimum_degree_ordering_hashset(a: &CsrMatrix) -> Vec<usize> {
     order
 }
 
+/// Approximate Minimum Degree (Amestoy–Davis–Duff) on the pattern of A + Aᵀ.
+///
+/// WHY THIS EXISTS, in one measured sentence: on the run7d cell (nonsymmetric
+/// convection–diffusion, side 64, n=4096) the exact minimum-degree ordering cuts fill
+/// 2.61x and the solve 2.31x, but `minimum_degree_ordering` itself costs **25.825 ms**
+/// against RCM's **0.123 ms**, which is 73% of the min-degree factor and 1.8x the whole
+/// RCM factor — so min-degree loses the job 1.96x on its own overhead while the numeric
+/// factor it buys is 1.51x FASTER. The fill is worth having; the O(V²) price is not.
+///
+/// WHERE THE O(V²) LIVES, and what replaces it. `minimum_degree_ordering` materializes
+/// the clique: eliminating a node of degree k inserts k(k−1)/2 edges into sorted vectors
+/// or hash sets, and does it again for every node. This keeps the **quotient graph**
+/// instead — an eliminated variable becomes an *element* holding its neighbour list once,
+/// and its neighbours store a pointer to that element rather than edges to each other.
+/// No clique is ever built. Three standard ingredients keep it near-linear:
+///
+///   * **element absorption** — when `p` is eliminated, every element it touched is
+///     folded into `Lp` and freed, and any element whose variable list is contained in
+///     `Lp` is freed too (aggressive absorption). Storage cannot grow without bound.
+///   * **approximate external degree** — the exact degree of a variable is a set-union
+///     over its elements, which is what costs. AMD instead uses the bound
+///     `d_j = min(n−k, d_j + |Lp\{j}|, |Aj| + |Lp\{j}| + Σ_{e∈Ej, e≠p} |Le \ Lp|)`,
+///     and every `|Le \ Lp|` for the whole sweep is obtained in ONE pass over the
+///     element lists of `Lp` with a stamped counter, never a set operation.
+///   * **pruning** — a variable in `Lp` drops every explicit edge to another member of
+///     `Lp`, because `p` now represents all of them.
+///
+/// The bound is an upper bound on the true external degree and is exact whenever the
+/// element lists are disjoint, which is the ordinary case; that is why AMD's fill is
+/// within a few percent of exact minimum degree in practice while its cost is near-linear.
+///
+/// WHAT THIS IS NOT. Supervariable (indistinguishable-node) detection and mass
+/// elimination are deliberately NOT implemented here. They cut AMD's cost further and
+/// usually improve its fill a little; leaving them out keeps this reviewable and cannot
+/// affect correctness, only quality. If the measured fill lands near
+/// `minimum_degree_ordering`'s, they are not needed for this cell.
+///
+/// CORRECTNESS is independent of quality: any permutation of `0..n` yields an exact
+/// factorization, so the ordering can only change fill, cost and floating-point
+/// association — never whether the answer is right. The selection is deterministic
+/// (min degree, ties broken by lowest index), so the permutation is reproducible.
+fn approximate_minimum_degree_ordering(a: &CsrMatrix) -> Vec<usize> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let n = a.shape().rows;
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Adjacency of A + Aᵀ with self loops dropped, ascending and unique. Explicit zeros
+    // are skipped for the same reason the exact code skips them: they carry no pivotal
+    // dependency and counting them would inflate every degree.
+    let mut var_adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for idx in a.indptr()[i]..a.indptr()[i + 1] {
+            let j = a.indices()[idx];
+            if j != i && a.data()[idx] != 0.0 {
+                var_adj[i].push(j as u32);
+                var_adj[j].push(i as u32);
+            }
+        }
+    }
+    for list in var_adj.iter_mut() {
+        list.sort_unstable();
+        list.dedup();
+    }
+
+    // Quotient-graph state. An element is named by the variable whose elimination created
+    // it, so `elem_vars` and `var_elems` can both be indexed by `0..n`.
+    let mut var_elems: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut elem_vars: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut var_alive = vec![true; n];
+    let mut elem_alive = vec![false; n];
+    let mut degree: Vec<usize> = var_adj.iter().map(Vec::len).collect();
+
+    // Stamped scratch: `w` carries |Le| minus the number of Le members seen in Lp, and
+    // `mark` carries Lp membership. Both are stamped rather than cleared so no pass over
+    // `n` is paid per elimination — clearing them would reintroduce a quadratic term.
+    let mut w = vec![0usize; n];
+    let mut w_flag = 0usize;
+    let mut mark = vec![0usize; n];
+    let mut mark_flag = 0usize;
+
+    // Lazy min-heap keyed on (degree, index): stale entries are discarded on pop, which
+    // is the same discipline the exact orderings use. Ties break on the lowest index, so
+    // the selection matches a deterministic linear scan.
+    let mut heap: BinaryHeap<Reverse<(usize, usize)>> =
+        (0..n).map(|v| Reverse((degree[v], v))).collect();
+    let mut order = Vec::with_capacity(n);
+    let mut lp: Vec<u32> = Vec::new();
+
+    while order.len() < n {
+        let p = loop {
+            let Reverse((d, v)) = heap.pop().expect("heap nonempty while variables remain");
+            if var_alive[v] && d == degree[v] {
+                break v;
+            }
+        };
+
+        // Lp = (Ap ∪ ⋃_{e ∈ Ep} Le) \ {p}, live variables only.
+        mark_flag += 1;
+        lp.clear();
+        mark[p] = mark_flag;
+        for entry in 0..var_adj[p].len() {
+            let v = var_adj[p][entry] as usize;
+            if var_alive[v] && mark[v] != mark_flag {
+                mark[v] = mark_flag;
+                lp.push(v as u32);
+            }
+        }
+        for slot in 0..var_elems[p].len() {
+            let e = var_elems[p][slot] as usize;
+            if !elem_alive[e] {
+                continue;
+            }
+            for entry in 0..elem_vars[e].len() {
+                let v = elem_vars[e][entry] as usize;
+                if var_alive[v] && mark[v] != mark_flag {
+                    mark[v] = mark_flag;
+                    lp.push(v as u32);
+                }
+            }
+        }
+
+        // Every element `p` touched is now represented by `p` itself: absorb and free it.
+        // Each of its variables is in Lp by construction, so nothing loses its reference.
+        for slot in 0..var_elems[p].len() {
+            let e = var_elems[p][slot] as usize;
+            if elem_alive[e] {
+                elem_alive[e] = false;
+                elem_vars[e] = Vec::new();
+            }
+        }
+        var_elems[p] = Vec::new();
+        var_adj[p] = Vec::new();
+        var_alive[p] = false;
+        order.push(p);
+        let eliminated = order.len();
+
+        if lp.is_empty() {
+            continue;
+        }
+        elem_vars[p] = lp.clone();
+        elem_alive[p] = true;
+
+        // ONE pass yields |Le \ Lp| for every element adjacent to Lp. `w[e]` is seeded to
+        // |Le| + w_flag on first sight and decremented once per member of Le found in Lp;
+        // afterwards `w[e] − w_flag` is exactly |Le \ Lp|. The stamp advances by n+1 so a
+        // value left over from an earlier elimination can never be mistaken for a seeded one.
+        w_flag += n + 1;
+        for index in 0..lp.len() {
+            let j = lp[index] as usize;
+            for slot in 0..var_elems[j].len() {
+                let e = var_elems[j][slot] as usize;
+                if e == p || !elem_alive[e] {
+                    continue;
+                }
+                if w[e] < w_flag {
+                    w[e] = elem_vars[e].len() + w_flag;
+                }
+                w[e] -= 1;
+            }
+        }
+
+        // Aggressive absorption: |Le \ Lp| == 0 means Le ⊆ Lp, so `p` already represents
+        // everything `e` did and `e` is pure overhead from here on.
+        for index in 0..lp.len() {
+            let j = lp[index] as usize;
+            for slot in 0..var_elems[j].len() {
+                let e = var_elems[j][slot] as usize;
+                if e != p && elem_alive[e] && w[e] == w_flag {
+                    elem_alive[e] = false;
+                    elem_vars[e] = Vec::new();
+                }
+            }
+        }
+
+        // Prune, then re-point at `p`. Dropping edges INTO Lp is what stops the clique
+        // from ever being written down.
+        for index in 0..lp.len() {
+            let j = lp[index] as usize;
+            let mut adjacency = std::mem::take(&mut var_adj[j]);
+            adjacency.retain(|&v| {
+                let v = v as usize;
+                var_alive[v] && mark[v] != mark_flag
+            });
+            var_adj[j] = adjacency;
+
+            let mut elements = std::mem::take(&mut var_elems[j]);
+            elements.retain(|&e| elem_alive[e as usize]);
+            elements.push(p as u32);
+            var_elems[j] = elements;
+        }
+
+        // Approximate external degree, all three AMD bounds.
+        let external = lp.len() - 1;
+        for index in 0..lp.len() {
+            let j = lp[index] as usize;
+            let mut approximate = var_adj[j].len() + external;
+            for slot in 0..var_elems[j].len() {
+                let e = var_elems[j][slot] as usize;
+                if e != p {
+                    approximate += w[e].saturating_sub(w_flag);
+                }
+            }
+            let bounded = approximate
+                .min(degree[j] + external)
+                .min(n - eliminated);
+            if bounded != degree[j] {
+                degree[j] = bounded;
+                heap.push(Reverse((bounded, j)));
+            }
+        }
+    }
+
+    order
+}
+
 pub fn reverse_cuthill_mckee(graph: &CsrMatrix) -> Vec<usize> {
     let n = graph.shape().rows;
     if n == 0 {
@@ -13903,6 +14137,144 @@ mod tests {
             );
         }
         println!("MMD_ORDER_PERF_END");
+    }
+
+    /// run7d ORDERING SPLIT + FILL PROBE (frankenscipy-run7d).
+    ///
+    /// The min-degree live A/B moved the side-64 convection factor 14.502 -> 35.364 ms and
+    /// the whole job 0.684193x -> 0.344404x, but it measured only the SUM of min-degree's
+    /// own ordering cost and the numeric factor cost it buys. This separates them, on that
+    /// exact fixture, for RCM (what ships), exact min-degree, and AMD.
+    ///
+    /// Ordering cost and fill are both build-independent in the way that matters: the
+    /// ordering functions carry no `cfg(test)` instrumentation, and fill is a STRUCTURAL
+    /// count, not a cost. The numeric factor time is NOT read from this probe -- a
+    /// `cfg(test)` `NativeSparseLu` additionally retains `l_rows`/`u_rows`, which is an
+    /// optimisation barrier in exactly the path that would be timed.
+    #[test]
+    #[ignore]
+    fn run7d_ordering_cost_split_probe() {
+        fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+            const DIAGONAL: f64 = 4.001;
+            const WEST: f64 = -1.2;
+            const EAST: f64 = -0.8;
+            const VERTICAL: f64 = -1.0;
+            let n = side * side;
+            let expected_nnz = 5 * n - 4 * side;
+            let mut data = Vec::with_capacity(expected_nnz);
+            let mut indices = Vec::with_capacity(expected_nnz);
+            let mut indptr = Vec::with_capacity(n + 1);
+            indptr.push(0);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(VERTICAL);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(WEST);
+                    }
+                    indices.push(index);
+                    data.push(DIAGONAL);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(EAST);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(VERTICAL);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            assert_eq!(data.len(), expected_nnz);
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("canonical nonsymmetric convection-diffusion CSR")
+        }
+
+        let side = 64usize;
+        let a = convection_diffusion_2d(side);
+        let n = a.shape().rows;
+        let csc = a.to_csc().expect("convection CSC");
+        println!("RUN7D_ORDER_SPLIT_BEGIN side={side} n={n} nnz={}", a.nnz());
+
+        let arms: [(&str, PermutationOrdering, usize); 3] = [
+            ("rcm", PermutationOrdering::ReverseCuthillMcKee, 25),
+            ("mmd", PermutationOrdering::MmdAtPlusA, 5),
+            ("amd", PermutationOrdering::Amd, 25),
+        ];
+
+        for (name, ordering, reps) in arms {
+            // Ordering call alone, exactly as `sparse_lu_fill_ordering` invokes it.
+            let mut permutation = Vec::new();
+            let start = std::time::Instant::now();
+            for _ in 0..reps {
+                permutation = match ordering {
+                    PermutationOrdering::ReverseCuthillMcKee => {
+                        super::reverse_cuthill_mckee(std::hint::black_box(&a))
+                    }
+                    PermutationOrdering::MmdAtPlusA => {
+                        super::minimum_degree_ordering(std::hint::black_box(&a))
+                    }
+                    _ => super::approximate_minimum_degree_ordering(std::hint::black_box(&a)),
+                };
+                std::hint::black_box(&permutation);
+            }
+            let ordering_ms = start.elapsed().as_secs_f64() * 1e3 / reps as f64;
+
+            // A permutation, not merely a list: every index exactly once.
+            assert_eq!(permutation.len(), n, "{name}: short permutation");
+            let mut seen = vec![false; n];
+            for &index in &permutation {
+                assert!(index < n, "{name}: index {index} out of range");
+                assert!(!seen[index], "{name}: index {index} repeated");
+                seen[index] = true;
+            }
+
+            // Fill is a structural count and survives the instrumented build.
+            let factorization = super::splu(
+                &csc,
+                LuOptions {
+                    ordering,
+                    ..LuOptions::default()
+                },
+            )
+            .expect("convection factorization");
+            assert_eq!(factorization.ordering_used, ordering, "{name}: ordering silently downgraded");
+            let fill = match &factorization.lu_internal {
+                SparseLuInternal::Native(lu) => lu.lower.columns.len() + lu.upper.columns.len(),
+                _ => panic!("{name}: expected the native sparse LU path"),
+            };
+
+            // The factor still solves: an ordering may only change fill and association.
+            let b = (0..n)
+                .map(|index| 1.0 + 0.125 * ((17 * index + 23) % 29) as f64)
+                .collect::<Vec<f64>>();
+            let x = super::splu_solve(&factorization, &b).expect("solve");
+            let mut residual: f64 = 0.0;
+            let mut scale: f64 = 0.0;
+            for row in 0..n {
+                let mut ax = 0.0;
+                for idx in a.indptr()[row]..a.indptr()[row + 1] {
+                    ax += a.data()[idx] * x[a.indices()[idx]];
+                }
+                residual = residual.max((ax - b[row]).abs());
+                scale = scale.max(b[row].abs());
+            }
+            let relative_residual = residual / scale;
+            assert!(
+                relative_residual < 1e-10,
+                "{name}: relative residual {relative_residual:.3e} is not a solve"
+            );
+
+            println!(
+                "ordering={name} reps={reps} ordering_only_ms={ordering_ms:.6} \
+                 factor_nnz={fill} relative_residual={relative_residual:.3e}"
+            );
+        }
+        println!("RUN7D_ORDER_SPLIT_END");
     }
 
     #[test]
