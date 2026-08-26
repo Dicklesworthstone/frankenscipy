@@ -3935,6 +3935,9 @@ mod cubic_live {
         }
 
         println!("# probe=convection_factor_solve_split bead=frankenscipy-run7d");
+        // Name the ordering on the row. A probe that silently used the default is exactly what
+        // this line exists to make impossible to repeat.
+        println!("split_ordering={:?}", splu_arm_options()?.ordering);
         println!("elf_sha256={}", sha256_of_self()?);
         println!(
             "# host={} observed_os_threads={} rounds={rounds} claim=SELF_ATTRIBUTION_ONLY",
@@ -3963,7 +3966,20 @@ mod cubic_live {
         // before anything is recorded.
         for round in 0..=rounds {
             let started = Instant::now();
-            let factor = splu(black_box(&fixture.csc), LuOptions::default())
+            // READ THE SAME VARIABLE THE REST OF THIS FILE READS.
+            //
+            // This was `LuOptions::default()`, so `FSCI_SPLU_ORDERING` did nothing here and the
+            // probe reported one configuration no matter what it was asked for. Running it at
+            // colamd, rcm and amd returned `factor_payload_bytes=4389136` for all three -- the
+            // same fill to the byte, which is what a dead toggle looks like and what caught it.
+            //
+            // This file already carries the identical fix on `splu_profile_options`, whose
+            // comment records that the profile "was hardcoded to `LuOptions::default()` while the
+            // live arm read `FSCI_SPLU_ORDERING`, so the cheap profile and the row it is supposed
+            // to pre-cost were silently measuring different configurations". The same bug was
+            // still here, on the probe that owns `frankenscipy-run7d` -- the bead whose whole
+            // question is which ORDERING to use.
+            let factor = splu(black_box(&fixture.csc), splu_arm_options()?)
                 .map_err(|error| format!("split probe splu: {error}"))?;
             let factored = started.elapsed().as_secs_f64() * 1.0e3;
             factor_payload = splu_factor_payload_bytes(&factor);
