@@ -40378,3 +40378,110 @@ question about the algorithm, and it is the first time this bead has had one.
   across shapes that genuinely reach the general LU, must-miss shapes included, then look for a
   predicate over pre-factorization quantities. If none separates the classes, the honest answer is
   that AMD stays opt-in and run7d's gain is not reachable by default -- which is also a result.
+
+## 2026-08-26 - BlackThrush (cc) - run7d RE-CERTIFIED at HEAD after the gate decoupling: 0.588962 shipping against 0.891249 under AMD, both arms fully admissible; and run7d.1 is ANSWERED -- the gain is SOLVE-SIDE
+
+- **Result class: TIMED (the pair) plus BOUND (the counted sweep).** Live SciPy 1.17.1 in the same
+  invocation as the candidate, one ELF for both arms, ordering selected by `FSCI_SPLU_ORDERING`.
+  **CV is not used for any decision here.**
+
+- **THE PAIR, same window, same binary, all eight null gates passing.**
+
+    | arm | competitive_ratio | ci95 | candidate p50 | live SciPy p50 |
+    |---|---|---|---|---|
+    | shipping (`Colamd`->RCM) | **0.588962** | [0.585620, 0.595939] | 19.299 ms | 11.227 ms |
+    | AMD | **0.891249** | [0.886057, 0.897354] | 12.521 ms | 11.264 ms |
+
+  Ratio of ratios **1.513x**; the job itself 19.299 -> 12.521 ms. `decision_gate` on BOTH arms:
+  `null_medians_within_2pct=true`, `all_null_ci95_span_unity=true`. AMD's four nulls:
+  candidate 1.003235 [0.993427, 1.008634], control 1.002823 [0.990329, 1.013116],
+  pair 0.997046 [0.989742, 1.003739], live 0.997245 [0.993251, 1.006127].
+  **STILL A LOSS on both arms** -- 0.891 < 1.0 -- and `competitive_claim=FAIL` on both, correctly.
+
+- **WHY THIS RE-MEASUREMENT WAS NEEDED, rather than citing the 2026-08-25 row.** That row was
+  taken before `5e8b81ff5` changed which orderings the structural fast paths accept. A dispatch
+  change is exactly the kind of thing that can move a number without anyone noticing, so the cell
+  was re-run rather than assumed. It reproduces: 0.585647 -> 0.588962 shipping and 0.899034 ->
+  0.891249 under AMD, on a different day and a different binary. **The two live SciPy arms read
+  11.227 and 11.264 ms, 0.3% apart, which is the host control saying the window held across both
+  runs.**
+
+- **CONFORMANCE.** `component_mismatches=0`, `relative_l2=3.405e-15`,
+  live reported and recomputed `max_relative_residual=3.976e-14`, `input_sha_match=true`,
+  `genuine_scipy=1.17.1`.
+
+- **AND NOW run7d.1, ANSWERED BY COUNTING.** probe: `perf_spsolve --profile-ordering-sweep` and
+  `--profile-convection-splu-rust` under `perf stat -e instructions`, load-independent and
+  native-speed. Every sweep cell reports the backend that actually ran, because since the
+  decoupling a cubic Dirichlet Laplacian takes the SPECTRAL route under `amd` and the general LU
+  under `rcm`; comparing those is comparing algorithms, and both cubic cells were refused on that
+  ground rather than being reported as a spectacular AMD win.
+
+    | fixture | size | payload AMD/RCM | instructions AMD/RCM |
+    |---|---|---|---|
+    | convection | 64 | 0.402 | 0.943 |
+    | convection | 96 | 0.318 | 0.807 |
+    | lap2d | 64 | 0.402 | 0.943 |
+    | arrowhead | 4096 | **1.000** | **2.113** |
+    | tridiag | 4096 | **1.000** | **1.338** |
+    | pentadiag | 4096 | **1.000** | **1.375** |
+
+  **The must-miss shapes behaved.** Arrowhead, tridiagonal and scattered pentadiagonal have a
+  payload ratio of exactly 1.000 -- there is no fill for AMD to remove -- and there AMD is pure
+  ordering overhead. A sweep sampling only shapes where AMD was expected to win would have
+  reported that AMD always wins.
+
+- **THE FACTOR-ONLY NUMBERS DO NOT EXPLAIN THE LIVE ROW, AND CHASING THAT IS THE FINDING.** AMD's
+  factor on the convection cell is 0.943 -- six percent -- against a certified 1.513x on the same
+  cell. Sweeping the solve count resolves it:
+
+    | solves per factor | RCM instructions | AMD instructions | AMD/RCM |
+    |---|---|---|---|
+    | 1 | 628,544,229 | 587,675,384 | 0.935 |
+    | 4 | 672,745,475 | 608,729,566 | 0.905 |
+    | 16 | 851,555,205 | 692,162,658 | 0.813 |
+    | 64 | 1,572,813,783 | 1,034,819,191 | **0.658** |
+
+  Marginal cost per solve: **RCM 4,996,135 against AMD 2,365,840 -- AMD's SOLVE is 2.11x
+  cheaper**, independently reproducing the 2.31x an earlier fill sweep reported by a different
+  route. Per factorization: RCM 204,518,608 against AMD 193,525,954, **5.4% cheaper**.
+
+- **SO THE ENTIRE GAIN IS SOLVE-SIDE, and that reconciles every data point on file.** AMD buys
+  less fill; less fill makes every solve cheaper; the factor is close to a wash on this cell.
+  run7d is one factorization plus SIXTEEN solves and AMD wins it. llywn measures the FACTOR ONLY,
+  by construction of its harness, and AMD loses it. The factor-only sweep cells sit near parity
+  where AMD cuts fill and lose outright where it cannot. **One mechanism, three previously
+  disagreeing results.**
+
+- **THE ANSWER TO run7d.1, stated so it can be acted on or refused.** AMD is **not** a global
+  default and **not** a per-matrix decision. It is a per-WORKLOAD decision whose deciding variable
+  is solves-per-factorization -- which maps onto an API distinction that already exists, since
+  `splu` hands back a reusable factor while `spsolve` is one-shot. **I am not acting on it here**:
+  the cubic cell shows AMD's factor can be much MORE expensive rather than merely neutral, so the
+  crossover is cell-dependent, and a routing rule needs the solve sweep repeated on a cell where
+  AMD's factor loses before any default moves.
+
+- **PROVENANCE.** Live pair: `elf_sha256 = frankenscipy_engine_sha256 =`
+  `1bf3579c7869929f7d32ddc05022a50607283ef83c978d8e4867c0349b2d49b6`,
+  `source_commit=489efa95693227e7ca579218ac05f2b123662300`. Counted sweep:
+  `frankenscipy_engine_sha256=5612ede515309730ed91ec215b9f32d0b7bc582faa3a320de3c4c8b2338760b1`.
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.3). HARNESS `crates/fsci-sparse/src/bin/perf_spsolve.rs`
+  (`--convection-splu-live 81`, `--profile-ordering-sweep`, `--profile-convection-splu-rust`).
+  Fixture grid_side=64 convection-diffusion, rhs_count_per_factor=16, rounds=81.
+  `same_host=thinkstation1`, run locally on worker `thinkstation1` (no rch worker admitted this
+  session: every candidate reported `os_gate_excluded=1 required_os=none`, so
+  `build_route=local-wrapper-bypass`). `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231692279808`, `numa_count=1`, `requested threads = 1`,
+  `actual observed worker threads = 1`, `observed_workers: candidate=1 control=1 live_scipy=1`,
+  `runtime_isa=avx2+fma`, `affinity/cpuset=1`, `CPU frequency governor=powersave`,
+  loadavg 17.7-19.0 across the two live runs. `build_slot` REFUSED server-side
+  (frankenscipy-fr78g). Artifacts:
+  `tests/artifacts/perf/run7d-head-489efa956-{shipping,amd}-arm.log`.
+
+- **Concrete retry predicate:** repeat the solves-per-factor sweep on a cell where AMD's FACTOR
+  loses, not just where it is neutral -- the cubic cell with the spectral route disabled is the
+  obvious one, since that is the configuration llywn measures. That yields the crossover solve
+  count, and a routing rule needs a crossover, not a direction. Do NOT flip
+  `LuOptions::default().ordering` before that: the factor-only sweep above already shows three
+  shapes where AMD is 1.34-2.11x pure overhead.
