@@ -40215,3 +40215,90 @@ question about the algorithm, and it is the first time this bead has had one.
   fill entry. That is a self-contained rewrite of one function with a byte-identical output
   contract already pinned by the payload/parity check used above, and it needs no quiet host.
   But note it only buys back the 52% share: it cannot close the 4.17x in the numeric kernel.
+
+## 2026-08-26 - BlackThrush (cc) - llywn's residual 1.46x is PRICED and it is a BLAS-3 density gap: we execute 2.85x MORE instructions doing 1.85x FEWER FLOPs, because SciPy's arithmetic is 5.29x denser
+
+- **Result class: BOUND, decided by a counted mechanism on BOTH sides and by nothing else.** No
+  wall claim is made or restated in this row. Instruction and FLOP counts do not depend on host
+  load, which is the only reason this row exists: the box has held loadavg 5-190 all session and
+  the periodic harness's quiescence gate refused again during this turn. **CV is not computed
+  and would be provenance only.** Filed as `frankenscipy-llywn.3`.
+
+- **BOTH ARMS FACTOR THE SAME MATRIX AND PRODUCE THE SAME FILL.** laplacian_3d_cubic side=16,
+  n=4096, nnz=27136; `lu_nnz=1,231,312` reported by SciPy and matched by our factor payload of
+  14,358,064 bytes = 1.196M entries. **This is not a fill comparison in disguise** -- the fill is
+  equal and was checked, not assumed.
+
+- **probes, both re-runnable, both counting rather than timing:**
+  `perf stat -e instructions,fp_ret_sse_avx_ops.all,fp_ret_sse_avx_ops.mac_flops
+   FSCI_SPLU_ORDERING=rcm perf_spsolve --profile-cubic-splu-rust 5 16 1` and
+  `perf stat -e ... python3 crates/fsci-sparse/python/scipy_cubic_flops.py {0,5} 16`.
+  **The SciPy arm is DIFFERENCED against a 0-repetition run of the same script**, so interpreter
+  startup, imports and matrix construction are subtracted rather than assumed negligible -- they
+  are 5,544,252,793 instructions, 4.5x the factorization itself, so assuming them away would
+  have inverted this result.
+
+- **THE COUNTED MECHANISM.** Per five factorizations:
+
+    | | fsci | SciPy 1.17.1 | |
+    |---|---|---|---|
+    | instructions | 3,521,052,535 | 1,233,750,241 | **fsci 2.85x MORE** |
+    | FLOPs | 1,173,976,243 | 2,176,149,862 | **fsci 1.85x FEWER** |
+    | MAC FLOPs | **0** | 1,393,819,960 | 64% of SciPy's FLOPs are FMA |
+    | FLOPs / instruction | **0.3334** | **1.7638** | **SciPy 5.29x DENSER** |
+    | instructions per LU nonzero | 571.9 | 200.4 | |
+
+- **WHAT THIS SETTLES, and it reframes llywn's own headline reassurance.** The incumbent is not
+  running a better sparse elimination. **It is running a different trade**: SuperLU's supernodal
+  blocking does 1.85x MORE arithmetic -- operating on zeros inside dense panels -- and buys 5.29x
+  higher density for it, netting 2.85x fewer instructions. llywn records "1.74 Ir/update, updates
+  already 98.8% of minimum" as evidence the kernel is nearly optimal. It is: **it is at the floor
+  of a SCALAR SPARSE algorithm, and the incumbent is not playing that game.** Being at that floor
+  is exactly why no toggle helped.
+
+- **AND IT EXPLAINS EVERY NEGATIVE RESULT ON THIS CELL.** Five levers were measured earlier today
+  and the shipping configuration was the best setting of all five. The supernodal arm -- the one
+  that attempts precisely this trade -- was the WORST of them at 5.77x, because it pays the extra
+  flops without a dense-panel kernel to earn the density back. `llywn.2` then found its deficit
+  structural rather than defective. All three results are the same fact seen from three sides.
+
+- **IT ALSO RECONCILES TWO NUMBERS THAT LOOK INCONSISTENT.** 2.85x more instructions against a
+  measured 1.46x wall deficit implies our IPC is ~1.95x better. That is what a scalar,
+  branch-predictable, dependency-light loop does. **We execute far more, far simpler instructions,
+  very efficiently** -- so instruction count alone would have overstated the deficit twofold, and
+  wall time alone would have hidden where it comes from.
+
+- **A POLICY CONSTRAINT SHOWS UP IN THE DATA.** Our build emits **zero MAC FLOPs**.
+  `.cargo/config.toml` sets `+fma` for register width but Rust keeps `fp-contract=off`, and that
+  file's own note relies on exactly that for its bit-identity claim. So 64% of the incumbent's
+  FLOPs come from an instruction class we do not emit at all, by policy. **Ceiling if that
+  changed, computed rather than hoped: the FP work is 1.17 G FLOPs inside 3.52 G instructions, so
+  fusing every multiply-subtract pair saves at most ~0.59 G instructions, about 17%.** Real, and
+  not the gap. It also needs the contract checked first -- this cell's parity gate is a residual
+  bound (`worst_rel_solution_diff=3.908e-15`), NOT bit-identity, but the standing project rule is
+  that `mul_add` is banned on bit-identical kernels and permitted only where the tolerance
+  contract allows.
+
+- **PROVENANCE.** `frankenscipy_engine_sha256 = executed-binary ELF SHA-256 =`
+  `af1e2ac6d7e8c34cad156452ed167b02f35877f961edfee65806378d0962edd8`
+  (artifact `target/release/perf_spsolve`).
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (scipy 1.17.1, numpy 2.4.3, reported by the script itself alongside its `lu_nnz`).
+  `same_host=thinkstation1`, run locally on worker `thinkstation1` (no rch worker admitted this
+  session: every candidate reported `os_gate_excluded=1 required_os=none`, so
+  `build_route=local-wrapper-bypass`). CPU `AMD Ryzen Threadripper PRO 5975WX`,
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692255232`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`, `runtime_isa=avx2+fma`
+  (avx512f=false), `CPU frequency governor=powersave`. `build_slot` REFUSED server-side
+  (frankenscipy-fr78g). The oracle script is committed at
+  `crates/fsci-sparse/python/scipy_cubic_flops.py` so the SciPy side is re-runnable.
+
+- **Concrete retry predicate.** Two sub-levers remain on this cell and both are now priced rather
+  than proposed. **(1) FMA**, ceiling ~17% of instructions, gated on confirming no test pins splu
+  factor bits -- cheap to check, cheap to try, and it does NOT close the gap. **(2) Dense
+  panels**, which IS the gap and is a from-scratch safe-Rust kernel: `llywn.2` measured the
+  existing blocked path at 4.17x worse than per-pivot with its symbolic phase set to zero, so it
+  is not a starting point. Anything else on this cell should be refused: ordering is closed (RCM,
+  AMD and exact minimum degree all measured, RCM wins) and the four alternative arms are closed.
+  **The honest campaign statement for llywn is "needs a BLAS-3-class panel kernel in safe Rust",
+  with 1.46x as the prize and 2.85x/5.29x as the shape of it.**
