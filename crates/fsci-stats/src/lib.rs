@@ -103519,4 +103519,269 @@ mod histogram_distribution_matches_scipy {
         // MUST-MISS control: the well-formed input these are contrasted with.
         assert!(HistogramDistribution::new(&COUNTS, &EVEN, true).is_ok());
     }
+
+    /// SciPy parity for `scipy.stats` entry points with no differential coverage
+    /// (frankenscipy-ivxx6): `binned_statistic_2d`, `wasserstein_distance_nd`, `bws_test`,
+    /// `logrank`.
+    ///
+    /// Randomised entry points from the same backlog -- `monte_carlo_test`, `sobol_indices`,
+    /// `dunnett` -- are deliberately NOT covered here: comparing two draws is not comparing two
+    /// answers.
+    ///
+    /// FIXTURE CHOICES.
+    ///   * the 4x4 grid leaves 6 of 16 bins EMPTY on purpose. The empty bin is exactly where the
+    ///     two libraries could disagree (NaN against 0), and a dense fixture never reaches it.
+    ///     Both produce NaN in `mean` and 0 in `count`, and the assertions below require NaN to
+    ///     match NaN rather than treating it as a numeric difference.
+    ///   * `bws_test` and `logrank` are run under EVERY alternative. A two-sided-only probe
+    ///     cannot see a tail taken on the wrong side.
+    ///   * `wasserstein_distance_nd` is probed weighted and unweighted; the weighted arm is where
+    ///     a normalisation convention would show.
+    ///
+    /// Measured against SciPy 1.17.1: 13 groups, worst 1.110e-16.
+    #[test]
+    fn binstat2d_wasserstein_bws_logrank_against_scipy_1_17_1() {
+        use super::{binned_statistic_2d, bws_test, logrank, wasserstein_distance_nd};
+
+        fn close(name: &str, got: &[f64], want: &[f64]) {
+            assert_eq!(got.len(), want.len(), "{name}: length");
+            for (i, (&a, &b)) in got.iter().zip(want).enumerate() {
+                if b.is_nan() {
+                    assert!(a.is_nan(), "{name}[{i}]: SciPy gives NaN, we gave {a:.17e}");
+                } else {
+                    assert!(
+                        !a.is_nan() && (a - b).abs() <= 1e-12,
+                        "{name}[{i}]: got {a:.17e}, SciPy 1.17.1 gives {b:.17e}"
+                    );
+                }
+            }
+        }
+
+        let x = [
+            0.1, 0.4, 0.6, 0.9, 0.2, 0.75, 0.35, 0.95, 0.05, 0.55, 0.8, 0.45,
+        ];
+        let y = [
+            0.2, 0.1, 0.7, 0.3, 0.85, 0.55, 0.4, 0.95, 0.6, 0.15, 0.9, 0.5,
+        ];
+        let vals = [
+            1.0, 2.5, -1.0, 4.0, 0.5, 3.5, -2.0, 6.0, 1.5, 2.0, -0.5, 3.0,
+        ];
+
+        let mut saw_nan = false;
+        for (stat, want) in [
+            (
+                "mean",
+                vec![
+                    1.0,
+                    f64::NAN,
+                    1.5,
+                    0.5,
+                    2.5,
+                    0.5,
+                    f64::NAN,
+                    f64::NAN,
+                    2.0,
+                    f64::NAN,
+                    -1.0,
+                    f64::NAN,
+                    4.0,
+                    f64::NAN,
+                    3.5,
+                    2.75,
+                ],
+            ),
+            (
+                "sum",
+                vec![
+                    1.0, 0.0, 1.5, 0.5, 2.5, 1.0, 0.0, 0.0, 2.0, 0.0, -1.0, 0.0, 4.0, 0.0, 3.5, 5.5,
+                ],
+            ),
+            (
+                "count",
+                vec![
+                    1.0, 0.0, 1.0, 1.0, 1.0, 2.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 2.0,
+                ],
+            ),
+            (
+                "median",
+                vec![
+                    1.0,
+                    f64::NAN,
+                    1.5,
+                    0.5,
+                    2.5,
+                    0.5,
+                    f64::NAN,
+                    f64::NAN,
+                    2.0,
+                    f64::NAN,
+                    -1.0,
+                    f64::NAN,
+                    4.0,
+                    f64::NAN,
+                    3.5,
+                    2.75,
+                ],
+            ),
+            (
+                "min",
+                vec![
+                    1.0,
+                    f64::NAN,
+                    1.5,
+                    0.5,
+                    2.5,
+                    -2.0,
+                    f64::NAN,
+                    f64::NAN,
+                    2.0,
+                    f64::NAN,
+                    -1.0,
+                    f64::NAN,
+                    4.0,
+                    f64::NAN,
+                    3.5,
+                    -0.5,
+                ],
+            ),
+            (
+                "max",
+                vec![
+                    1.0,
+                    f64::NAN,
+                    1.5,
+                    0.5,
+                    2.5,
+                    3.0,
+                    f64::NAN,
+                    f64::NAN,
+                    2.0,
+                    f64::NAN,
+                    -1.0,
+                    f64::NAN,
+                    4.0,
+                    f64::NAN,
+                    3.5,
+                    6.0,
+                ],
+            ),
+            (
+                "std",
+                vec![
+                    0.0,
+                    f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
+                    2.5,
+                    f64::NAN,
+                    f64::NAN,
+                    0.0,
+                    f64::NAN,
+                    0.0,
+                    f64::NAN,
+                    0.0,
+                    f64::NAN,
+                    0.0,
+                    3.25,
+                ],
+            ),
+        ] {
+            let (s, xe, ye) = binned_statistic_2d(&x, &y, &vals, 4, stat);
+            let flat: Vec<f64> = s.iter().flat_map(|r| r.iter().copied()).collect();
+            close(&format!("binned_statistic_2d/{stat}"), &flat, &want);
+            if stat == "mean" {
+                saw_nan = flat.iter().filter(|v| v.is_nan()).count() > 0;
+                close(
+                    "binned_statistic_2d/x_edge",
+                    &xe,
+                    &[0.05, 0.27499999999999997, 0.49999999999999994, 0.725, 0.95],
+                );
+                close(
+                    "binned_statistic_2d/y_edge",
+                    &ye,
+                    &[0.1, 0.3125, 0.525, 0.7374999999999999, 0.95],
+                );
+            }
+        }
+        assert!(
+            saw_nan,
+            "the fixture must leave some bins EMPTY, or the NaN branch above is never taken and \
+             this test is weaker than it looks"
+        );
+
+        let u = vec![
+            vec![0.0, 0.0],
+            vec![1.0, 0.5],
+            vec![0.5, 1.5],
+            vec![2.0, 1.0],
+        ];
+        let v = vec![vec![0.5, 0.25], vec![1.5, 1.0], vec![2.5, 0.5]];
+        close(
+            "wasserstein_distance_nd/plain",
+            &[wasserstein_distance_nd(&u, &v, None, None)],
+            &[0.8265497557079721],
+        );
+        close(
+            "wasserstein_distance_nd/weighted",
+            &[wasserstein_distance_nd(
+                &u,
+                &v,
+                Some(&[1.0, 2.0, 0.5, 1.5]),
+                Some(&[2.0, 1.0, 3.0]),
+            )],
+            &[0.8574148834350394],
+        );
+
+        // Every alternative for both tests.
+        let a = [1.2, 2.4, 0.7, 3.1, 1.9, 2.8, 0.4];
+        let b = [2.9, 3.6, 1.8, 4.2, 3.3, 2.2];
+        let want_bws = [
+            2.008292062246144,
+            0.09265734265734266,
+            -2.008292062246144,
+            0.04079254079254079,
+            -2.008292062246144,
+            0.9597902097902098,
+        ];
+        let mut got_bws = Vec::new();
+        for alt in ["two-sided", "less", "greater"] {
+            match bws_test(&a, &b, alt, None) {
+                Ok(r) => {
+                    got_bws.push(r.statistic);
+                    got_bws.push(r.pvalue);
+                }
+                Err(_) => {
+                    got_bws.push(f64::NAN);
+                    got_bws.push(f64::NAN);
+                }
+            }
+        }
+        close("bws_test", &got_bws, &want_bws);
+
+        let s1 = [6.0, 7.0, 10.0, 15.0, 19.0, 25.0, 30.0];
+        let s2 = [4.0, 8.0, 11.0, 13.0, 16.0, 21.0];
+        let want_lr = [
+            -0.9157730585267136,
+            0.3597859369493178,
+            -0.9157730585267136,
+            0.1798929684746589,
+            -0.9157730585267136,
+            0.8201070315253411,
+        ];
+        let mut got_lr = Vec::new();
+        for alt in ["two-sided", "less", "greater"] {
+            let r = logrank(&s1, &s2, alt);
+            got_lr.push(r.statistic);
+            got_lr.push(r.pvalue);
+        }
+        close("logrank", &got_lr, &want_lr);
+
+        // The one-sided p-values must actually DIFFER from each other, or "every alternative was
+        // swept" would be true and meaningless.
+        assert!(
+            (got_lr[3] - got_lr[5]).abs() > 1e-6,
+            "logrank: less and greater must give different p-values on this fixture"
+        );
+    }
 }
