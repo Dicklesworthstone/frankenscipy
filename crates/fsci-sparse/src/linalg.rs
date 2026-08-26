@@ -17571,6 +17571,138 @@ mod tests {
         }
     }
 
+    /// CAN AN O(nnz) ENVELOPE PICK THE ORDERING, WITHOUT A SYMBOLIC PASS?
+    ///
+    /// `frankenscipy-run7d` is the worst measured vs-SciPy loss in this repo, 0.588962x, and its
+    /// own split probe now shows why: on its cell AMD produces 2.49x less fill than RCM and 2.52x
+    /// faster solves, because solve time tracks fill almost exactly. AMD is not shippable as a
+    /// GLOBAL default -- `run7d.1` measured a crossover of 172 solves on the cubic cell -- so the
+    /// ordering has to be chosen PER MATRIX.
+    ///
+    /// Choosing it needs a fill prediction, and the only fill predictor in this crate is
+    /// `symbolic_fill_pattern`, which `frankenscipy-4m90a` measured at O(n^2.265) against a
+    /// factorization at O(n^1.653). That is far too expensive to run speculatively for two
+    /// candidate orderings.
+    ///
+    /// THE CANDIDATE THIS TESTS is the envelope (profile) of the permuted pattern: for each row
+    /// `i`, how far left of the diagonal its first nonzero sits. It is O(nnz) from the permutation
+    /// alone, needs no symbolic pass, and for banded orderings it BOUNDS the fill. The question is
+    /// only whether it RANKS the candidate orderings the same way the actual fill does.
+    ///
+    /// If it ranks them correctly on both the convection cell (where AMD wins) and the cubic cell
+    /// (where it does not), a per-matrix chooser is cheap and real. If it does not, this
+    /// discriminator is dead and the run7d lever stays blocked behind a fill predictor nobody has.
+    #[test]
+    #[ignore = "factors two n=4096 cells under four orderings; run explicitly"]
+    fn envelope_ranks_orderings_the_way_fill_does() {
+        fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+            let n = side * side;
+            let (mut data, mut indices, mut indptr) = (Vec::new(), Vec::new(), vec![0usize]);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(-1.0);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(-1.2);
+                    }
+                    indices.push(index);
+                    data.push(4.001);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(-0.8);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(-1.0);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("convection CSR")
+        }
+
+        // Envelope of the permuted pattern. `perm[i]` is the original row placed at position `i`,
+        // so the permuted column of original column `c` is `inverse[c]`.
+        fn envelope(a: &CsrMatrix, perm: Option<&Vec<usize>>, n: usize) -> u64 {
+            let identity: Vec<usize> = (0..n).collect();
+            let perm = perm.unwrap_or(&identity);
+            let mut inverse = vec![0usize; n];
+            for (position, &original) in perm.iter().enumerate() {
+                inverse[original] = position;
+            }
+            let indptr = a.indptr();
+            let indices = a.indices();
+            let mut total = 0u64;
+            for position in 0..n {
+                let original = perm[position];
+                let mut leftmost = position;
+                for &column in &indices[indptr[original]..indptr[original + 1]] {
+                    let permuted = inverse[column];
+                    if permuted < leftmost {
+                        leftmost = permuted;
+                    }
+                }
+                total += (position - leftmost) as u64;
+            }
+            total
+        }
+
+        for (label, matrix) in [
+            ("convection(64) [run7d cell]", convection_diffusion_2d(64)),
+            (
+                "cubic(16)      [llywn cell]",
+                splu_dirichlet_laplacian_3d(16),
+            ),
+        ] {
+            let n = matrix.shape().rows;
+            let mut rows = Vec::new();
+            for ordering in [
+                PermutationOrdering::Colamd,
+                PermutationOrdering::ReverseCuthillMcKee,
+                PermutationOrdering::Amd,
+                PermutationOrdering::MmdAtPlusA,
+            ] {
+                let (perm, used) = sparse_lu_fill_ordering(&matrix, n, ordering);
+                let env = envelope(&matrix, perm.as_ref(), n);
+                let factor =
+                    NativeSparseLu::factorize_csr(&matrix, 1.0, ordering).expect("factorization");
+                let fill = factor.stored_nnz();
+                rows.push((format!("{ordering:?}->{used:?}"), env, fill));
+            }
+            println!("ENVELOPE_VS_FILL {label} n={n}");
+            for (name, env, fill) in &rows {
+                println!("    {name:<34} envelope={env:>12} actual_fill_nnz={fill:>10}");
+            }
+            // Does the envelope rank the same as the fill? Compare every pair.
+            let mut agree = 0usize;
+            let mut total = 0usize;
+            for i in 0..rows.len() {
+                for j in (i + 1)..rows.len() {
+                    total += 1;
+                    let env_order = rows[i].1.cmp(&rows[j].1);
+                    let fill_order = rows[i].2.cmp(&rows[j].2);
+                    if env_order == fill_order {
+                        agree += 1;
+                    }
+                }
+            }
+            let best_env = rows.iter().min_by_key(|r| r.1).expect("rows");
+            let best_fill = rows.iter().min_by_key(|r| r.2).expect("rows");
+            println!(
+                "    pairwise_rank_agreement={agree}/{total} envelope_pick={} fill_pick={} \
+                 SAME_PICK={}",
+                best_env.0,
+                best_fill.0,
+                best_env.0 == best_fill.0
+            );
+        }
+    }
+
     #[test]
     fn pattern_churn_separates_a_fill_free_factor_from_a_filling_one() {
         // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
