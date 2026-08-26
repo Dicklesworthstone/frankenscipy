@@ -2606,7 +2606,17 @@ fn symbolic_fill_pattern(n: usize, initial: &[Vec<u32>]) -> (Vec<Vec<u32>>, Vec<
             }
             merged.extend_from_slice(&live[left..]);
             merged.extend_from_slice(&tail[right..]);
-            pattern[row] = merged.clone();
+            // SWAP, not clone. `merged` is already a reusable scratch buffer that is cleared at
+            // the top of this loop, so cloning it allocated a fresh Vec, copied the whole merged
+            // pattern, and dropped the row's old buffer -- one malloc, one memcpy and one free
+            // PER ELIMINATION UPDATE. Swapping hands the merged buffer to the row and takes the
+            // row's old allocation back as the next iteration's scratch, which `merged.clear()`
+            // then reuses. Same contents, same order, no allocator traffic.
+            //
+            // Measured: `symbolic_fill_pattern` was 114,326,082,408 Ir, 52.19% of the whole
+            // supernodal arm and 5.46x the entire per-pivot factorization it is supposed to be
+            // a cheap precursor to (frankenscipy-llywn.2).
+            std::mem::swap(&mut pattern[row], &mut merged);
             cursor[row] = 0;
             if let Some(&next_col) = pattern[row].first() {
                 next_in_bucket[row] = bucket_head[next_col as usize];
