@@ -17570,14 +17570,24 @@ mod tests {
                 .expect("cubic CSR")
         }
 
-        for side in [8usize, 12, 16] {
+        // Both orderings, because the run structure is the thing being measured and the
+        // shipping default (RCM, via Colamd) is a BANDWIDTH ordering while AMD is a
+        // fill-reducing one. AMD costs 2.09x-3.34x more per LU nonzero than RCM despite less
+        // fill on both measured cells, and nothing so far explains that; if the coincident runs
+        // this merge is built around collapse under AMD, that is the explanation.
+        for (side, ordering) in [
+            (8usize, PermutationOrdering::ReverseCuthillMcKee),
+            (12, PermutationOrdering::ReverseCuthillMcKee),
+            (16, PermutationOrdering::ReverseCuthillMcKee),
+            (16, PermutationOrdering::Amd),
+        ] {
             let matrix = laplacian_3d_cubic(side);
             MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
             let _ = take_merge_shape();
             let factor = NativeSparseLu::factorize_csr(
                 &matrix,
                 LuOptions::default().diag_pivot_thresh,
-                PermutationOrdering::ReverseCuthillMcKee,
+                ordering,
             )
             .expect("cubic factorization");
             let (calls, span, bound) = MATCHED_RUN_PROFILE.with(|cell| cell.get());
@@ -17603,7 +17613,7 @@ mod tests {
             );
             let n = side * side * side;
             println!(
-                "PREFIX_SKIP side={side} n={n} calls={calls} span={span} bound={bound} \
+                "PREFIX_SKIP side={side} ord={ordering:?} n={n} calls={calls} span={span} bound={bound} \
                  span_per_call={:.2} bound_per_call={:.2} skipped_fraction={:.4}",
                 span as f64 / calls as f64,
                 bound as f64 / calls as f64,
@@ -17612,7 +17622,7 @@ mod tests {
             let rewrites = shape.merges;
             let total = shape.merges + shape.inplace;
             println!(
-                "MERGE_SHAPE side={side} n={n} merges={} inplace={} inplace_share={:.4} \
+                "MERGE_SHAPE side={side} ord={ordering:?} n={n} merges={} inplace={} inplace_share={:.4} \
                  tail_only={} target_only={} tail_only_per_merge={:.3} \
                  target_only_per_merge={:.3}",
                 shape.merges,
