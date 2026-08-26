@@ -40485,3 +40485,86 @@ question about the algorithm, and it is the first time this bead has had one.
   count, and a routing rule needs a crossover, not a direction. Do NOT flip
   `LuOptions::default().ordering` before that: the factor-only sweep above already shows three
   shapes where AMD is 1.34-2.11x pure overhead.
+
+## 2026-08-26 - BlackThrush (cc) - run7d.1 CLOSED: the crossover is 172 solves on the cubic cell and 0 on the convection cell, which refutes all three simple ordering rules
+
+- **Result class: BOUND, decided by a counted mechanism and by nothing else.** No wall claim: the
+  host sat at loadavg 106 for this turn and no live row was takeable. Instruction counts do not
+  depend on load. **CV is not computed and would be provenance only.**
+
+- **THE QUESTION.** `run7d.1` asked whether AMD can ever be the default. The prior row established
+  that AMD's gain on the convection cell is SOLVE-side (its factor is 5.4% cheaper, its solve
+  2.11x cheaper) and named the deciding measurement: repeat the solve sweep on a cell where AMD's
+  FACTOR **loses**, to get a crossover rather than a direction.
+
+- **probe: `perf_spsolve --profile-cubic-splu-rust 1 16 <rhs>`** under `perf stat -e
+  instructions`, with `FSCI_DISABLE_STRUCTURAL_FASTPATHS=1` so the cubic Dirichlet Laplacian
+  reaches the general LU under BOTH orderings -- the configuration llywn measures. **The toggle is
+  observed on both arms before any count is quoted:** unset, `backend_used=CubicSpectralLu`; set,
+  `backend_used=NativeSparseLu`. Without that check the two arms would be different algorithms and
+  AMD would appear to win by two orders of magnitude.
+
+    | solves per factor | RCM instructions | AMD instructions | AMD/RCM |
+    |---|---|---|---|
+    | 1 | 1,206,434,132 | 2,868,417,818 | 2.378 |
+    | 8 | 1,361,002,684 | 2,955,269,471 | 2.171 |
+    | 32 | 1,895,885,870 | 3,255,655,163 | 1.717 |
+    | 128 | 4,031,359,663 | 4,456,637,653 | 1.105 |
+    | 512 | 12,573,481,165 | 9,260,330,210 | **0.736** |
+
+- **THE MODEL IS VALIDATED, NOT ASSUMED.** Fitting factor + k·solve on the endpoints and predicting
+  the three interior points: RCM errs by 0.08%, 0.01%, 0.00% and AMD by 0.02%, 0.02%, 0.01%. So
+  the split below is a measurement, not an extrapolation.
+
+        factor cost   RCM 1,184,189,422    AMD 2,855,909,183    AMD 2.41x MORE expensive
+        per solve     RCM    22,244,710    AMD    12,508,635    AMD 1.78x cheaper
+        **CROSSOVER   172 solves per factorization**
+
+- **AND THE TWO CELLS DISAGREE BY THE FULL RANGE OF THE ANSWER.**
+
+    | cell | AMD factor | AMD solve | crossover |
+    |---|---|---|---|
+    | convection 2-D (run7d) | 0.946, i.e. cheaper | 2.11x cheaper | **0 solves** -- AMD wins outright |
+    | cubic 3-D (llywn) | **2.41x more expensive** | 1.78x cheaper | **172 solves** |
+
+- **THIS REFUTES ALL THREE SIMPLE RULES, each on its own evidence.**
+  * **Global default** -- refuted by the factor-only sweep in the prior row: arrowhead, tridiagonal
+    and scattered pentadiagonal have a fill ratio of exactly 1.000, nothing for AMD to remove, and
+    AMD costs 1.34-2.11x there as pure ordering overhead.
+  * **Per-matrix rule** -- refuted here: AMD reduces fill on BOTH the convection and cubic cells,
+    and the outcomes are opposite. Fill was already refuted as the predictor by llywn; this shows
+    "AMD reduces fill" does not even predict its own sign.
+  * **Per-workload rule** -- refuted here: the crossover is not a constant. It is 0 on one cell and
+    172 on the other, so "route `splu` to AMD because it hands back a reusable factor" is wrong on
+    cubic-like cells for any caller doing fewer than 172 solves, which is nearly all of them.
+
+- **WHAT SURVIVES.** Only a joint (matrix, workload) decision, and it needs an estimate of the
+  FACTOR-COST RATIO between the two orderings before factoring. Fill does not supply that -- llywn
+  is the standing counterexample, and this row adds a second: the cubic cell's AMD arm holds
+  strictly less fill and costs 2.41x more to build. **No cheap predictor for that ratio is known,
+  and this bead does not claim one exists.**
+
+- **WHAT IT MEANS FOR run7d ITSELF, which is the practical point.** run7d's cell has a crossover of
+  0 and its workload is one factorization plus sixteen solves, so AMD is simply right there -- and
+  that is exactly why the certified 1.513x is real, why it is exposed as `FSCI_SPLU_ORDERING=amd`,
+  and why it is NOT shippable as a default. **The shipping ratio for run7d stays 0.588962.**
+
+- **PROVENANCE.** `frankenscipy_engine_sha256 = executed-binary ELF SHA-256 =`
+  `6be2b60b736cfc7384bd953f704008ef62ab4ea30947ed21d4b45765e0639b7b`
+  (artifact `target/release/perf_spsolve`; ONE binary, both arms, ordering by
+  `FSCI_SPLU_ORDERING`). Fixture `laplacian_3d_cubic` side=16, n=4096, nnz=27136.
+  `same_host=thinkstation1`, run locally on worker `thinkstation1` (no rch worker admitted this
+  session: every candidate reported `os_gate_excluded=1 required_os=none`, so
+  `build_route=local-wrapper-bypass`). CPU `AMD Ryzen Threadripper PRO 5975WX`,
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231692279808`, `numa_count=1`,
+  `requested threads = 1`, `actual observed worker threads = 1`, `runtime_isa=avx2+fma`,
+  `CPU frequency governor=powersave`, loadavg ~106 throughout -- irrelevant to counts and recorded
+  because the gate asks. `build_slot` REFUSED server-side (frankenscipy-fr78g).
+
+- **Concrete retry predicate:** do NOT propose an ordering default, an ordering heuristic keyed on
+  fill, or an ordering rule keyed on solve count -- all three are now refuted with counts on file.
+  The only open form is a pre-factorization estimate of the FACTOR-COST ratio between orderings,
+  and the first honest step there is to find out whether such an estimate is cheaper than just
+  running both symbolic factorizations, which on this cell would itself cost a meaningful fraction
+  of one factorization. If it is not, the correct campaign statement is that ordering selection
+  stays a caller decision and `FSCI_SPLU_ORDERING` is the whole of the shipped surface.

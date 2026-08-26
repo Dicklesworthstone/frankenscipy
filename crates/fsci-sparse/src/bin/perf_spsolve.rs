@@ -21,6 +21,13 @@ use fsci_sparse::{
 // (frankenscipy-nwx8m). Gate the import to match its only use site.
 #[cfg(feature = "sparse-incumbent-bench")]
 use fsci_sparse::spsolve_triangular;
+// Structural fast-path toggles, read only by `splu_profile_options` when
+// FSCI_DISABLE_STRUCTURAL_FASTPATHS is set. Gated to match that single use site.
+#[cfg(feature = "sparse-incumbent-bench")]
+use fsci_sparse::linalg::{
+    SPLU_CUBIC_SPECTRAL_DISABLE, SPSOLVE_CUBIC_SPECTRAL_DISABLE,
+    SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE,
+};
 use nalgebra::{DMatrix, DVector};
 #[cfg(feature = "sparse-incumbent-bench")]
 use sha2::{Digest, Sha256};
@@ -911,6 +918,26 @@ fn profile_cubic_splu_rust(repetitions: usize, side: usize, rhs_count: usize) {
 /// silently measuring different configurations. Reading the same variable is the whole fix.
 #[cfg(feature = "sparse-incumbent-bench")]
 fn splu_profile_options() -> LuOptions {
+    // FSCI_DISABLE_STRUCTURAL_FASTPATHS forces the general sparse LU.
+    //
+    // Needed to measure an ORDERING at all on a fixture the recognisers claim. Since the fast
+    // paths accept `Amd` as well as `Colamd`, a Dirichlet cubic Laplacian takes the spectral
+    // route under `amd` and the general LU under `rcm`, so the two arms would be different
+    // ALGORITHMS. `perf_splu` already exposes exactly this switch as a CLI argument and asserts
+    // the toggle took effect; this is the same control for the fsci-only profiles.
+    //
+    // Off by default, so every arm runs as it ships unless the variable is set.
+    if matches!(
+        std::env::var("FSCI_DISABLE_STRUCTURAL_FASTPATHS")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true")
+    ) {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(true, AtomicOrdering::Relaxed);
+        SPSOLVE_CUBIC_SPECTRAL_DISABLE.store(true, AtomicOrdering::Relaxed);
+        SPSOLVE_PERIODIC_CUBOID_SPECTRAL_DISABLE.store(true, AtomicOrdering::Relaxed);
+    }
     let ordering = match std::env::var("FSCI_SPLU_ORDERING").ok().as_deref() {
         None | Some("") | Some("default") => LuOptions::default().ordering,
         Some("colamd") => PermutationOrdering::Colamd,
