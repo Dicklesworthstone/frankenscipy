@@ -19393,6 +19393,34 @@ mod tests {
                 2 * p_sl + n as u64,
                 (2 * p_rcm + n as u64) as f64 / (2 * p_sl + n as u64) as f64
             );
+
+            // HOW MUCH OF THE BAND IS STRUCTURAL ZERO?
+            //
+            // `2 * profile + n` is the DENSE ENVELOPE -- what the banded kernel allocates
+            // and multiplies. It is not the fill. The elimination tree gives the exact
+            // symbolic fill for the same permutation, so the ratio is the share of the
+            // banded kernel's arithmetic spent on entries that are structurally zero and
+            // stay zero.
+            //
+            // This is the one remaining term in the Pareto bound. The banded arm does 4.15x
+            // the FLOPs of the fill-reducing arm; a lever must lengthen vectors or cut
+            // flops, and if a large part of that 4.15x is multiplying known zeros then the
+            // flop side has slack. If the band is genuinely near-full it does not, and the
+            // envelope method is simply the wrong shape for this matrix at this size.
+            for (label, perm) in [("rcm", &rcm), ("sloan", &sl)] {
+                let parent = elimination_tree_of_permuted(&matrix, perm);
+                let (_, true_fill) = l_column_counts_from_etree(&matrix, perm, &parent);
+                // `true_fill` counts L off-diagonals; the envelope figure above counts both
+                // triangles plus the diagonal, so compare like with like.
+                let envelope = 2 * (if label == "rcm" { p_rcm } else { p_sl }) + n as u64;
+                let symbolic = 2 * true_fill + n as u64;
+                println!(
+                    "BAND_WASTE side={side} n={n} ord={label} envelope={envelope} \
+                     symbolic_fill={symbolic} dense_share={:.4} wasted_flops={:.4}",
+                    symbolic as f64 / envelope as f64,
+                    1.0 - symbolic as f64 / envelope as f64,
+                );
+            }
         }
     }
 
