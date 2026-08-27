@@ -17954,6 +17954,18 @@ mod tests {
     #[test]
     #[ignore = "factorizes the n=4096 loss cell; run explicitly"]
     fn prefix_skip_payoff_on_the_loss_peak() {
+        // SCOPE THE BANDED PATH OFF, or this diagnostic silently measures NOTHING.
+        //
+        // This test is `#[ignore]`d, so it had not run since `SPLU_BANDED_ENABLE` began
+        // shipping ON. Under the shipping default the banded kernel accepts cubic/RCM
+        // outright and the merge is never called -- the first assertion below fired with
+        // `calls = 0`. The counters would otherwise have printed a tidy set of zeros and
+        // read as "the prefix scan skips everything", which is the opposite of the truth.
+        // The subject here is the GENERAL merge, so the general path is what must run.
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore_banded = RestoreBandedToggle(banded_was);
+
         // Same 7-point Dirichlet stencil as `llywn_cubic_ordering_fill_probe` builds, copied
         // rather than shared because that one is nested inside its own test.
         fn laplacian_3d_cubic(side: usize) -> CsrMatrix {
@@ -17997,18 +18009,79 @@ mod tests {
                 .expect("cubic CSR")
         }
 
+        // THE ACTUAL LOSS PEAK, and the reason this fixture is here at all.
+        //
+        // Every shape number this test has ever printed came from the CUBIC cell, and every
+        // merge lever built on those numbers was tuned against a SYMMETRIC 7-point stencil.
+        // The worst measured ratio in the suite is not cubic: it is convection-diffusion at
+        // n=4096, 0.6813x. That matrix is NONSYMMETRIC by construction -- `WEST` and `EAST`
+        // differ -- so its elimination has no reason to produce the coincident runs the
+        // in-place path depends on. Reading cubic's shape and calling it the loss cell's is
+        // the same substitution that cost a session on `Delaunay` vs `Delaunay2D`.
+        //
+        // Byte-for-byte the fixture `perf_spsolve` measures, so the counts here describe the
+        // cell the ratio was taken on rather than a lookalike.
+        fn convection_diffusion_2d(side: usize) -> CsrMatrix {
+            const DIAGONAL: f64 = 4.001;
+            const WEST: f64 = -1.2;
+            const EAST: f64 = -0.8;
+            const VERTICAL: f64 = -1.0;
+
+            let n = side * side;
+            let expected_nnz = 5 * n - 4 * side;
+            let mut data = Vec::with_capacity(expected_nnz);
+            let mut indices = Vec::with_capacity(expected_nnz);
+            let mut indptr = Vec::with_capacity(n + 1);
+            indptr.push(0);
+            for row in 0..side {
+                for column in 0..side {
+                    let index = row * side + column;
+                    if row > 0 {
+                        indices.push(index - side);
+                        data.push(VERTICAL);
+                    }
+                    if column > 0 {
+                        indices.push(index - 1);
+                        data.push(WEST);
+                    }
+                    indices.push(index);
+                    data.push(DIAGONAL);
+                    if column + 1 < side {
+                        indices.push(index + 1);
+                        data.push(EAST);
+                    }
+                    if row + 1 < side {
+                        indices.push(index + side);
+                        data.push(VERTICAL);
+                    }
+                    indptr.push(data.len());
+                }
+            }
+            assert_eq!(data.len(), expected_nnz);
+            CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+                .expect("canonical nonsymmetric convection-diffusion CSR")
+        }
+
         // Both orderings, because the run structure is the thing being measured and the
         // shipping default (RCM, via Colamd) is a BANDWIDTH ordering while AMD is a
         // fill-reducing one. AMD costs 2.09x-3.34x more per LU nonzero than RCM despite less
         // fill on both measured cells, and nothing so far explains that; if the coincident runs
         // this merge is built around collapse under AMD, that is the explanation.
-        for (side, ordering) in [
-            (8usize, PermutationOrdering::ReverseCuthillMcKee),
-            (12, PermutationOrdering::ReverseCuthillMcKee),
-            (16, PermutationOrdering::ReverseCuthillMcKee),
-            (16, PermutationOrdering::Amd),
+        for (fixture, side, ordering) in [
+            ("cubic", 8usize, PermutationOrdering::ReverseCuthillMcKee),
+            ("cubic", 12, PermutationOrdering::ReverseCuthillMcKee),
+            ("cubic", 16, PermutationOrdering::ReverseCuthillMcKee),
+            ("cubic", 16, PermutationOrdering::Amd),
+            // The convection cell at the size the ratio was measured on, under BOTH the
+            // shipping ordering and the fill-reducing one.
+            ("convection", 64, PermutationOrdering::ReverseCuthillMcKee),
+            ("convection", 64, PermutationOrdering::Amd),
         ] {
-            let matrix = laplacian_3d_cubic(side);
+            let matrix = if fixture == "convection" {
+                convection_diffusion_2d(side)
+            } else {
+                laplacian_3d_cubic(side)
+            };
             MATCHED_RUN_PROFILE.with(|cell| cell.set((0, 0, 0)));
             let _ = take_merge_shape();
             let factor = NativeSparseLu::factorize_csr(
@@ -18036,11 +18109,11 @@ mod tests {
             std::hint::black_box(&factor);
             assert!(
                 calls > 0,
-                "side={side}: the merge never consulted the prefix scan"
+                "{fixture} side={side}: the merge never consulted the prefix scan"
             );
-            let n = side * side * side;
+            let n = matrix.shape().rows;
             println!(
-                "PREFIX_SKIP side={side} ord={ordering:?} n={n} calls={calls} span={span} bound={bound} \
+                "PREFIX_SKIP fix={fixture} side={side} ord={ordering:?} n={n} calls={calls} span={span} bound={bound} \
                  span_per_call={:.2} bound_per_call={:.2} skipped_fraction={:.4}",
                 span as f64 / calls as f64,
                 bound as f64 / calls as f64,
@@ -18049,7 +18122,7 @@ mod tests {
             let rewrites = shape.merges;
             let total = shape.merges + shape.inplace;
             println!(
-                "MERGE_SHAPE side={side} ord={ordering:?} n={n} merges={} inplace={} inplace_share={:.4} \
+                "MERGE_SHAPE fix={fixture} side={side} ord={ordering:?} n={n} merges={} inplace={} inplace_share={:.4} \
                  tail_only={} target_only={} tail_only_per_merge={:.3} \
                  target_only_per_merge={:.3}",
                 shape.merges,
@@ -18070,7 +18143,7 @@ mod tests {
             // the lever is somewhere else entirely.
             let total_short: u64 = shortfall.iter().sum();
             println!(
-                "FASTPATH_SHORTFALL side={side} n={n} miss1={} miss2={} miss3_4={}                  miss5_8={} miss_gt8={} miss0={} total={total_short}                  share_miss1={:.4}",
+                "FASTPATH_SHORTFALL fix={fixture} side={side} n={n} miss1={} miss2={} miss3_4={}                  miss5_8={} miss_gt8={} miss0={} total={total_short}                  share_miss1={:.4}",
                 shortfall[0],
                 shortfall[1],
                 shortfall[2],
