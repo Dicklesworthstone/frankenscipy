@@ -279,6 +279,30 @@ for raw_line in sys.stdin.buffer:
     /// Not a whole-box mean: cores differ by up to 3x at the same instant here, and the
     /// only frequency that explains an arm's time is the frequency of the cores it was
     /// allowed to use.
+    /// CPUs this process may run on, from `/proc/self/status`'s `Cpus_allowed_list`.
+    ///
+    /// The list is the kernel's own rendering of the affinity mask, e.g. `4` or `0-3,8`.
+    /// Returning `None` means it could not be read, and the caller then falls back to the
+    /// whole-box mean rather than silently reporting a mean over one arbitrary CPU.
+    fn allowed_cpus() -> Option<Vec<usize>> {
+        let text = std::fs::read_to_string("/proc/self/status").ok()?;
+        let list = text
+            .lines()
+            .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?
+            .trim();
+        let mut cpus = Vec::new();
+        for part in list.split(',') {
+            let part = part.trim();
+            if let Some((lo, hi)) = part.split_once('-') {
+                let (lo, hi): (usize, usize) = (lo.trim().parse().ok()?, hi.trim().parse().ok()?);
+                cpus.extend(lo..=hi);
+            } else if !part.is_empty() {
+                cpus.push(part.parse().ok()?);
+            }
+        }
+        (!cpus.is_empty()).then_some(cpus)
+    }
+
     fn cpu_mhz_mean() -> f64 {
         let text = read_trimmed("/proc/cpuinfo");
         let vals: Vec<f64> = text
@@ -290,7 +314,37 @@ for raw_line in sys.stdin.buffer:
         if vals.is_empty() {
             return f64::NAN;
         }
-        vals.iter().sum::<f64>() / vals.len() as f64
+        // FILTER BY AFFINITY, which is what the comment above has always claimed this does
+        // and what the SciPy arm has always actually done (`os.sched_getaffinity(0)`).
+        //
+        // WITHOUT IT THIS GATE VOIDS VALID ROWS. Averaging all 64 CPUs on this box puts 63
+        // idle powersave cores into our arm's figure and drags it to ~2,240 MHz, while the
+        // SciPy arm — correctly filtered — reports the ~4,288 MHz of the one core both arms
+        // actually ran on. The result was a phantom `clock_ratio` of 1.77-1.91x and
+        // `ROW INVALID` on every cell.
+        //
+        // The clocks are in fact equal, measured independently and outside this harness:
+        // `perf stat -e cycles,task-clock` gives **4.281 GHz** for our arm and **4.271 GHz**
+        // for the eigh arm on the same pinned CPU, against the SciPy arm's self-reported
+        // 4,287-4,289 MHz. Ratio ~1.00, not 1.77.
+        //
+        // Disclosing the direction, because it is the one that deserves the most scrutiny:
+        // the rows this admits are WINS (scipy1/fsci 1.376x at n=512, 1.564x at n=1024), so
+        // fixing this gate makes our numbers look better. That is exactly why the
+        // justification is an independent hardware counter rather than a re-reading of the
+        // harness's own instrument.
+        let allowed = allowed_cpus();
+        let selected: Vec<f64> = match &allowed {
+            Some(cpus) => cpus
+                .iter()
+                .filter_map(|&cpu| vals.get(cpu).copied())
+                .collect(),
+            None => vals.clone(),
+        };
+        if selected.is_empty() {
+            return vals.iter().sum::<f64>() / vals.len() as f64;
+        }
+        selected.iter().sum::<f64>() / selected.len() as f64
     }
 
     /// SHA-256 of this running executable, read from `/proc/self/exe`.
