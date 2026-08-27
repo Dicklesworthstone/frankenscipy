@@ -811,8 +811,15 @@ for raw_line in sys.stdin.buffer:
         );
         fsci_linalg::EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE
             .store(split_accum, std::sync::atomic::Ordering::Relaxed);
+        // `FSCI_EIGH_COLBLOCK=0` returns to one column at a time.
+        let colblock = !matches!(
+            std::env::var("FSCI_EIGH_COLBLOCK").ok().as_deref(),
+            Some("0") | Some("false")
+        );
+        fsci_linalg::EIGH_BACKTRANSFORM_COLBLOCK_ENABLE
+            .store(colblock, std::sync::atomic::Ordering::Relaxed);
         println!(
-            "backtransform_panel_width_override={panel_width} (0 = shipping default 8) blocked={blocked} sliced={sliced} split_accum={split_accum}"
+            "backtransform_panel_width_override={panel_width} (0 = shipping default 8) blocked={blocked} sliced={sliced} split_accum={split_accum} colblock={colblock}"
         );
 
         println!(
@@ -1199,7 +1206,7 @@ for raw_line in sys.stdin.buffer:
                 println!(
                     "n={n} impl={impl_label} STAGES reduce={:.3}ms solve={:.3}ms back={:.3}ms \
                      total={:.3}ms shares={:.4}/{:.4}/{:.4} panel_width={} panels={} \
-                     sliced_hits={} instrumented=true",
+                     sliced_hits={} colblock_hits={} instrumented=true",
                     stage[0] as f64 / 1.0e6,
                     stage[1] as f64 / 1.0e6,
                     stage[2] as f64 / 1.0e6,
@@ -1212,6 +1219,8 @@ for raw_line in sys.stdin.buffer:
                     fsci_linalg::EIGH_BACKTRANSFORM_LAST_PANELS
                         .load(std::sync::atomic::Ordering::Relaxed),
                     fsci_linalg::EIGH_BACKTRANSFORM_SLICED_HITS
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    fsci_linalg::EIGH_BACKTRANSFORM_COLBLOCK_HITS
                         .load(std::sync::atomic::Ordering::Relaxed),
                 );
                 // MUST-HIT. All-zero counters mean the native path never ran -- at n below

@@ -11802,6 +11802,17 @@ pub static EIGH_BACKTRANSFORM_SLICED_HITS: std::sync::atomic::AtomicUsize =
 /// replays included — so that they still agree. Kept as a measured bound until then.
 pub static EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Interleave FOUR columns in the back-transform so four dot-product chains run at once.
+///
+/// The bit-identical way to break the dependency chain that
+/// [`EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE`] measures by reassociating. Each dot still sums
+/// its own products in its own order; only the interleaving of independent columns changes.
+pub static EIGH_BACKTRANSFORM_COLBLOCK_ENABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Reflector applications that took the four-column arm — "enabled" is not "took effect".
+pub static EIGH_BACKTRANSFORM_COLBLOCK_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_PAR_ROWS: usize = 128;
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_ROWS_PER_WORKER: usize = 32;
 const THIN_BIDIAG_RIGHT_REPLAY_MAX_WORKERS: usize = 8;
@@ -11953,7 +11964,64 @@ fn apply_householder_left(
     let data = matrix.as_mut_slice();
     let values = reflector.values.as_slice();
     let active = values.len();
-    for col in col_start..cols {
+
+    // FOUR COLUMNS IN FLIGHT, AND THE POINT IS THAT THIS COSTS NO REASSOCIATION.
+    //
+    // This kernel is LATENCY-bound, not bandwidth-bound: each dot product is a serial chain
+    // of dependent FMAs whose length is the active row count, ~n/2, and at ~4 cycles apiece
+    // that chain alone accounts for ~258 ms against a measured ~190 ms. Cutting traffic 8x
+    // (the compact-WY panel loop interchange) moved nothing, which is what proved it.
+    //
+    // The obvious fix — splitting one dot across four accumulators — REASSOCIATES, and four
+    // bit-equality contracts in this crate forbid that: the serial arm would stop agreeing
+    // with the parallel one, so results would depend on how many CPUs are visible.
+    //
+    // Different COLUMNS are independent. Interleaving four of them runs four concurrent
+    // chains while each individual dot still sums its own products in its own original
+    // order, so every value is bit-for-bit what the one-column-at-a-time loop produced.
+    // The columns are disjoint spans of `data` and no dot reads a column another update
+    // writes, so computing four dots and then applying four updates is the same arithmetic
+    // in the same order on every element.
+    let mut col = col_start;
+    let colblock = EIGH_BACKTRANSFORM_COLBLOCK_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+    if sliced && colblock && !split_accum && active > 0 {
+        EIGH_BACKTRANSFORM_COLBLOCK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        while col + 4 <= cols {
+            let bases = [
+                col * rows + start,
+                (col + 1) * rows + start,
+                (col + 2) * rows + start,
+                (col + 3) * rows + start,
+            ];
+            let (mut d0, mut d1, mut d2, mut d3) = (0.0, 0.0, 0.0, 0.0);
+            {
+                let view: &[f64] = data;
+                let s0 = &view[bases[0]..bases[0] + active];
+                let s1 = &view[bases[1]..bases[1] + active];
+                let s2 = &view[bases[2]..bases[2] + active];
+                let s3 = &view[bases[3]..bases[3] + active];
+                for index in 0..active {
+                    let value = values[index];
+                    d0 += value * s0[index];
+                    d1 += value * s1[index];
+                    d2 += value * s2[index];
+                    d3 += value * s3[index];
+                }
+            }
+            for (base, dot) in bases.into_iter().zip([d0, d1, d2, d3]) {
+                let scale = reflector.tau * dot;
+                if scale != 0.0 {
+                    let segment = &mut data[base..base + active];
+                    for (slot, &value) in segment.iter_mut().zip(values) {
+                        *slot -= scale * value;
+                    }
+                }
+            }
+            col += 4;
+        }
+    }
+
+    for col in col..cols {
         // BIND THE COLUMN SEGMENT ONCE, THEN NEVER INDEX. `data[col_base + start + offset]`
         // with the index computed per iteration hides from LLVM both that the walk is
         // contiguous and that `data` and `values` cannot alias, which is enough to stop it
