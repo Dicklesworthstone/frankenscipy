@@ -13462,6 +13462,32 @@ pub static NDIMAGE_SPLINE_FILTER1D_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// * `order` - Spline order (0-5)
 /// * `axis` - Axis along which to filter
 /// * `mode` - Boundary handling mode (only Reflect and Nearest are supported)
+/// Does this boundary mode use the reflect-class spline PREFILTER, as SciPy defines it?
+///
+/// SciPy's spline prefilter does NOT give each `mode` its own boundary treatment. Measured
+/// directly on SciPy 1.17.1, `spline_filter1d` over a 12-sample ramp collapses all eight
+/// mode spellings into exactly THREE bitwise-distinct outputs at every order 2..=5:
+///
+/// ```text
+/// group 0: nearest, reflect, grid-mirror          <- this predicate
+/// group 1: mirror, wrap, constant, grid-constant
+/// group 2: grid-wrap
+/// ```
+///
+/// So `nearest` and `reflect` are not merely close in the prefilter, they are the SAME
+/// computation, and `mirror` — the mode whose name most suggests `reflect` — is in a
+/// different group entirely. This crate previously sent `Nearest` down the general
+/// interpolation-system path, which produced a genuinely different boundary treatment and
+/// diverged from SciPy by 5.8e-1 at order 2 rising to 1.76 at order 5
+/// (`frankenscipy-047br`).
+///
+/// Grouping is a property of SciPy's prefilter, not an approximation chosen here: the
+/// pinning test carries SciPy's own values for both modes and asserts our two agree with
+/// each other AND with SciPy.
+fn spline_prefilter_is_reflect_class(mode: BoundaryMode) -> bool {
+    matches!(mode, BoundaryMode::Reflect | BoundaryMode::Nearest)
+}
+
 pub fn spline_filter1d(
     input: &NdArray,
     order: usize,
@@ -13502,7 +13528,8 @@ pub fn spline_filter1d(
     // per-line walk below): the strided stride>1 case sweeps the IIR in place over the contiguous
     // inner dim (cache-friendly instead of a per-column strided gather) and both cases fan the
     // independent outer blocks / rows across cores. Other kernels keep the serial per-line walk.
-    let use_reflect = mode == BoundaryMode::Reflect && (2..=5).contains(&order) && axis_len > order;
+    let use_reflect =
+        spline_prefilter_is_reflect_class(mode) && (2..=5).contains(&order) && axis_len > order;
     if use_reflect
         && !NDIMAGE_SPLINE_FILTER1D_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
     {
@@ -13566,12 +13593,14 @@ pub fn spline_filter1d(
             // solving a full interpolation system via `make_interp_spline` (O(n) banded build
             // per line — ~17x slower for a single long line). Nearest mode and axes too short
             // for the order's stencil keep the general path.
-            let coeffs =
-                if mode == BoundaryMode::Reflect && (2..=5).contains(&order) && axis_len > order {
-                    bspline_reflect_coefficients(&line, order)
-                } else {
-                    spline_coefficients_for_line(&line, order)?
-                };
+            let coeffs = if spline_prefilter_is_reflect_class(mode)
+                && (2..=5).contains(&order)
+                && axis_len > order
+            {
+                bspline_reflect_coefficients(&line, order)
+            } else {
+                spline_coefficients_for_line(&line, order)?
+            };
 
             for (i, &c) in coeffs.iter().enumerate() {
                 let flat = outer_idx * axis_len * stride + i * stride + inner_idx;
@@ -23595,10 +23624,35 @@ mod van22_knob_read_is_per_transform {
             );
         }
 
-        // MUST-MISS ARM 2: our `Nearest` is NOT SciPy's. SciPy returns bitwise-identical output
-        // for nearest and reflect; ours differs. If that is ever reconciled this assertion fails
-        // -- rewrite it to assert the new parity rather than delete it.
+        // RECONCILED (frankenscipy-047br). This was a MUST-MISS arm asserting that our
+        // `Nearest` differed from SciPy's, with an instruction to rewrite it as a parity
+        // assertion rather than delete it if the boundary handling was ever reconciled. It
+        // has been, so this is that rewrite.
+        //
+        // The reconciliation is not a tolerance loosened until it passed. SciPy's spline
+        // prefilter collapses its eight mode spellings into THREE bitwise-distinct outputs,
+        // with `nearest`, `reflect` and `grid-mirror` in one group — so routing `Nearest`
+        // through the same reflect-class kernel is what SciPy itself computes, not an
+        // approximation of it. See `spline_prefilter_is_reflect_class`.
+        //
+        // TWO ARMS, because agreeing with SciPy and agreeing with our own `Reflect` are
+        // different claims and only both together pin the grouping: the second would pass
+        // even if BOTH our modes drifted away from SciPy in step.
         let ours_nearest = spline_filter1d(&ramp, 3, 0, BoundaryMode::Nearest).unwrap();
+        let ours_reflect_order3 = spline_filter1d(&ramp, 3, 0, BoundaryMode::Reflect).unwrap();
+        for (index, (nearest, reflect)) in ours_nearest
+            .data
+            .iter()
+            .zip(ours_reflect_order3.data.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                nearest.to_bits(),
+                reflect.to_bits(),
+                "spline_filter1d nearest and reflect must be the SAME computation, as they \
+                 are in SciPy; element {index} differs ({nearest} vs {reflect})"
+            );
+        }
         let scipy_nearest = [
             -0.49598595033791937,
             2.4799297516895367,
@@ -23619,10 +23673,15 @@ mod van22_knob_read_is_per_transform {
             .zip(scipy_nearest.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
+        // The tolerance is the ORDER-3 reflect tolerance already used above (1e-9), not a
+        // number chosen to make this pass: `Nearest` now runs the identical kernel, so it
+        // inherits exactly that kernel's agreement with SciPy. Before the fix this read
+        // 5.8e-1 at order 2 and 1.76 at order 5.
         assert!(
-            worst > 1e-3,
-            "spline_filter1d/nearest now matches SciPy to {worst:.3e}; if the prefilter's \
-             boundary handling was reconciled, rewrite this to assert parity rather than delete it"
+            worst <= 1e-9,
+            "spline_filter1d/nearest diverges from SciPy by {worst:.3e}; SciPy returns \
+             bitwise-identical output for nearest and reflect, so this must agree to the \
+             same 1e-9 the reflect arm holds to"
         );
     }
 }
