@@ -214,6 +214,54 @@ fn main() {
         fsci_cluster::VQ_SOA_SCAN.load(std::sync::atomic::Ordering::Relaxed)
     );
 
+    // `FSCI_CLUSTER_MST_FUSED=0` restores the two-pass Prim's inner loop. Only-override-
+    // when-asked: storing the parsed value unconditionally would overwrite a newly flipped
+    // library default with `false` whenever the variable is unset.
+    match std::env::var("FSCI_CLUSTER_MST_FUSED").ok().as_deref() {
+        Some("1") | Some("true") => {
+            fsci_cluster::MST_FUSED_SCAN.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some("0") | Some("false") => {
+            fsci_cluster::MST_FUSED_SCAN.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    println!(
+        "mst_fused_scan={}",
+        fsci_cluster::MST_FUSED_SCAN.load(std::sync::atomic::Ordering::Relaxed)
+    );
+
+    // `FSCI_CLUSTER_DM_BLOCKED=0` restores the one-pair-at-a-time `sq_dist` triangle fill;
+    // `FSCI_CLUSTER_DM_FORCE_BLOCK=1` restores the pre-fix single-thread block fill that
+    // evaluated every pair twice. Both only-override-when-asked.
+    match std::env::var("FSCI_CLUSTER_DM_BLOCKED").ok().as_deref() {
+        Some("1") | Some("true") => {
+            fsci_cluster::LINKAGE_DM_BLOCKED_FOLD.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some("0") | Some("false") => {
+            fsci_cluster::LINKAGE_DM_BLOCKED_FOLD
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    match std::env::var("FSCI_CLUSTER_DM_FORCE_BLOCK").ok().as_deref() {
+        Some("1") | Some("true") => {
+            fsci_cluster::LINKAGE_DM_FORCE_BLOCK_FILL
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some("0") | Some("false") => {
+            fsci_cluster::LINKAGE_DM_FORCE_BLOCK_FILL
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    println!(
+        "dm_blocked_fold={} dm_force_block_fill={} available_parallelism={}",
+        fsci_cluster::LINKAGE_DM_BLOCKED_FOLD.load(std::sync::atomic::Ordering::Relaxed),
+        fsci_cluster::LINKAGE_DM_FORCE_BLOCK_FILL.load(std::sync::atomic::Ordering::Relaxed),
+        std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+    );
+
     let coord = |i: usize, d: usize| -> f64 {
         let key = (i * 2_654_435_761usize).wrapping_add(d * 40_503) % 100_003;
         key as f64 / 100_003.0 - 0.5
@@ -251,12 +299,21 @@ fn main() {
         // bar every other harness in this campaign holds to, which makes a ratio an ordering
         // signal rather than a measurement. Repeat each sample until it spans at least
         // `MIN_SAMPLE_MS`; both arms use the SAME repetition count, so neither is advantaged.
+        // Calibrate off the FASTEST of several calls, not one. A single call carries cold
+        // caches and any scheduler hiccup that lands on it, so it over-estimates the cost
+        // and under-estimates `reps`. That was visible once `linkage` got faster: a 4.8 ms
+        // op measured 11.9-20.5 ms on its first call, which set `reps` to 1-2 and left
+        // samples at ~10 ms against a 20 ms target, pushing the A/A nulls to 1.10-1.16.
+        // The repetition count is shared by both arms either way, so this sharpens the
+        // nulls rather than moving the ratio.
         const MIN_SAMPLE_MS: f64 = 20.0;
-        let single = {
+        const CALIBRATION_CALLS: usize = 3;
+        let mut single = f64::INFINITY;
+        for _ in 0..CALIBRATION_CALLS {
             let started = Instant::now();
             black_box(ours());
-            started.elapsed().as_secs_f64() * 1.0e3
-        };
+            single = single.min(started.elapsed().as_secs_f64() * 1.0e3);
+        }
         let reps = ((MIN_SAMPLE_MS / single.max(1.0e-6)).ceil() as usize).clamp(1, 4096);
         println!("op={op} calibration single={single:.4}ms reps={reps}");
 
@@ -282,6 +339,26 @@ fn main() {
         }
 
         let (fsci_ms, scipy_ms) = (median(fsci), median(sp));
+        if op == "linkage" {
+            // Stage split of OUR arm, over one freshly-zeroed call, so the two stages are
+            // attributed against the same invocation the ratio above was measured on.
+            for slot in &fsci_cluster::LINKAGE_STAGE_NANOS {
+                slot.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            black_box(ours());
+            let build =
+                fsci_cluster::LINKAGE_STAGE_NANOS[0].load(std::sync::atomic::Ordering::Relaxed);
+            let agglomerate =
+                fsci_cluster::LINKAGE_STAGE_NANOS[1].load(std::sync::atomic::Ordering::Relaxed);
+            let total = (build + agglomerate).max(1);
+            println!(
+                "op=linkage stages dm_build={:.3}ms ({:.1}%) agglomerate={:.3}ms ({:.1}%)",
+                build as f64 / 1.0e6,
+                100.0 * build as f64 / total as f64,
+                agglomerate as f64 / 1.0e6,
+                100.0 * agglomerate as f64 / total as f64,
+            );
+        }
         let check = scipy.check(&ours());
         println!(
             "case=n{n}d{dim} op={op} fsci={fsci_ms:.3}ms scipy={scipy_ms:.3}ms \

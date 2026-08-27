@@ -617,9 +617,11 @@ fn cooley_tukey_radix4_inplace_with_twiddles_par(data: &mut [Complex64], twiddle
 /// **MEASURED AND REJECTED — SHIPS OFF.** Eight replicates alternated ABBA in one window at
 /// n=2^22, arm proven live by `FFT_BLOCKED_BITREV_HITS` reading 531 against 0:
 ///
-///     blocked ON   prologue median 44.60 ms   range [42.75, 50.65]
-///     blocked OFF  prologue median 47.80 ms   range [45.42, 61.04]
-///     1.0719x — RANGES OVERLAP, so undecided, and worth 2.2% on the cell at best
+/// ```text
+/// blocked ON   prologue median 44.60 ms   range [42.75, 50.65]
+/// blocked OFF  prologue median 47.80 ms   range [45.42, 61.04]
+/// 1.0719x — RANGES OVERLAP, so undecided, and worth 2.2% on the cell at best
+/// ```
 ///
 /// The bound said **5.1x** was available on this pass. Tiling reaches at most 1.07x and does
 /// not separate. **Why, and this is the useful part:** the tiling fixes only the READ side.
@@ -689,12 +691,12 @@ fn apply_bit_reverse_permutation_blocked(data: &mut [Complex64]) {
         let mut col_block = 0;
         while col_block < cols {
             let col_end = (col_block + tile).min(cols);
-            for r in row_block..row_end {
-                let low_bits = rev_h[r] as usize;
+            for (r, &reversed_high) in (row_block..row_end).zip(&rev_h[row_block..row_end]) {
+                let low_bits = reversed_high as usize;
                 let base = r << low;
-                for c in col_block..col_end {
+                for (c, &reversed_low) in (col_block..col_end).zip(&rev_low[col_block..col_end]) {
                     let source = base | c;
-                    let target = ((rev_low[c] as usize) << h) | low_bits;
+                    let target = ((reversed_low as usize) << h) | low_bits;
                     // Each unordered pair is reached twice and swapped once, exactly as the
                     // incremental walk does.
                     if source < target {

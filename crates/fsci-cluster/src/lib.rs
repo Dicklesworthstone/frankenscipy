@@ -4488,14 +4488,94 @@ pub fn linkage(data: &[Vec<f64>], method: LinkageMethod) -> Result<Vec<[f64; 4]>
     // resulting linkage matrix matches scipy element-for-element.
     // Build the full n×n distance matrix once and route every method through the shared
     // O(n²) dm-based path (single→MST, reducible→NN-chain, centroid/median→Müller heap).
+    let build_start = std::time::Instant::now();
     let dm = linkage_distance_matrix(&flat, n, d);
-    Ok(linkage_from_dm(n, dm, method))
+    let build_nanos = build_start.elapsed().as_nanos();
+    let agglomerate_start = std::time::Instant::now();
+    let z = linkage_from_dm(n, dm, method);
+    record_linkage_stage(0, build_nanos);
+    record_linkage_stage(1, agglomerate_start.elapsed().as_nanos());
+    Ok(z)
+}
+
+/// Cumulative nanoseconds in `linkage`'s two stages: `[0]` the dense distance-matrix
+/// build, `[1]` the agglomeration over it. Two `Instant::now` pairs per CALL (not per
+/// element), so the timing cannot perturb either stage's inner loops.
+pub static LINKAGE_STAGE_NANOS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn record_linkage_stage(stage: usize, nanos: u128) {
+    LINKAGE_STAGE_NANOS[stage].fetch_add(
+        u64::try_from(nanos).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 /// Minimum build work (`n² · dimension`) above which the dense distance-matrix
 /// build is parallelized. Below it the serial upper-triangle loop wins (thread
 /// spawn dominates); measured crossover well under n=800/d=4.
 const LINKAGE_DM_PAR_WORK_GATE: u128 = 2_000_000;
+
+/// Forces the redundant-work block fill even when only one thread is available, to
+/// recover the pre-fix behaviour as an A/B reference arm. Never set in shipping use.
+pub static LINKAGE_DM_FORCE_BLOCK_FILL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Selects the four-pair-at-a-time triangle fill (`true`, shipping) over the
+/// one-pair-at-a-time `sq_dist` fill (`false`). Bit-identical — see
+/// `fill_triangle_blocked`.
+pub static LINKAGE_DM_BLOCKED_FOLD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Upper-triangle distance fill that evaluates FOUR column pairs at once against the
+/// same row `i`, then mirrors. Bit-identical to the `sq_dist` fill it replaces.
+///
+/// `sq_dist` is `Σ(a−b)²` accumulated as a left fold, which is a serial dependency
+/// chain rustc cannot vectorise: at `d = 8` that is eight dependent adds per pair, and
+/// the fill evaluates `n²/2` pairs. Different COLUMNS are independent, so four
+/// accumulators run four chains concurrently and the row-`i` coordinate is loaded once
+/// and reused four times.
+///
+/// Each accumulator still sums its own pair's terms over `k` ASCENDING, exactly the
+/// order `sq_dist`'s fold uses, so no float is reassociated and every entry keeps its
+/// bits — which the tie-break-sensitive agglomeration downstream depends on.
+fn fill_triangle_blocked(flat: &[f64], n: usize, d: usize, dm: &mut [f64]) {
+    for i in 0..n {
+        let ri = &flat[i * d..i * d + d];
+        let mut j = i + 1;
+        while j + 4 <= n {
+            let (r0, r1, r2, r3) = (
+                &flat[j * d..j * d + d],
+                &flat[(j + 1) * d..(j + 1) * d + d],
+                &flat[(j + 2) * d..(j + 2) * d + d],
+                &flat[(j + 3) * d..(j + 3) * d + d],
+            );
+            let (mut a0, mut a1, mut a2, mut a3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            for k in 0..d {
+                let c = ri[k];
+                let (t0, t1, t2, t3) = (c - r0[k], c - r1[k], c - r2[k], c - r3[k]);
+                a0 += t0 * t0;
+                a1 += t1 * t1;
+                a2 += t2 * t2;
+                a3 += t3 * t3;
+            }
+            for (off, acc) in [a0, a1, a2, a3].into_iter().enumerate() {
+                let dist = acc.sqrt();
+                dm[i * n + j + off] = dist;
+                dm[(j + off) * n + i] = dist;
+            }
+            j += 4;
+        }
+        while j < n {
+            let dist = sq_dist(ri, &flat[j * d..j * d + d]).sqrt();
+            dm[i * n + j] = dist;
+            dm[j * n + i] = dist;
+            j += 1;
+        }
+    }
+}
 
 /// Build the dense symmetric `n×n` distance matrix used by `linkage`, from
 /// row-major `flat` (`d` coords per row). Serial below the work gate; above it
@@ -4504,24 +4584,41 @@ const LINKAGE_DM_PAR_WORK_GATE: u128 = 2_000_000;
 /// `sq_dist` is symmetric (`Σ(a−b)² == Σ(b−a)²` term-for-term), every entry is
 /// bit-identical to the serial upper-triangle-plus-mirror fill, so the downstream
 /// tie-break-sensitive agglomeration is unaffected. The diagonal stays `0.0`.
+///
+/// The block fill trades REDUNDANT WORK for disjoint writes: it evaluates all `n²`
+/// pairs where the triangle fill evaluates `n²/2`, which only pays off when there are
+/// threads to absorb it. So the work gate is not sufficient on its own — the thread
+/// count has to be checked too. Under a single-CPU affinity mask (`taskset -c 4`, how
+/// this op is benchmarked against single-threaded SciPy) `available_parallelism()` is
+/// 1, and a work-gate-only test sent a 1500-point build down the block path to do
+/// 2.25M distance evaluations on ONE thread where the triangle does 1.12M. That is
+/// double work for zero parallelism, and it was 85% of `linkage`'s runtime.
 fn linkage_distance_matrix(flat: &[f64], n: usize, d: usize) -> Vec<f64> {
     let row = |idx: usize| -> &[f64] { &flat[idx * d..idx * d + d] };
     let mut dm = vec![0.0_f64; n * n];
-    if (n as u128) * (n as u128) * (d.max(1) as u128) < LINKAGE_DM_PAR_WORK_GATE {
-        for i in 0..n {
-            for j in i + 1..n {
-                let dist = sq_dist(row(i), row(j)).sqrt();
-                dm[i * n + j] = dist;
-                dm[j * n + i] = dist;
-            }
-        }
-        return dm;
-    }
     let nthreads = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
         .min(16)
         .min(n)
         .max(1);
+    let worth_parallelizing =
+        nthreads > 1 && (n as u128) * (n as u128) * (d.max(1) as u128) >= LINKAGE_DM_PAR_WORK_GATE;
+    let parallel = worth_parallelizing
+        || LINKAGE_DM_FORCE_BLOCK_FILL.load(std::sync::atomic::Ordering::Relaxed);
+    if !parallel {
+        if LINKAGE_DM_BLOCKED_FOLD.load(std::sync::atomic::Ordering::Relaxed) {
+            fill_triangle_blocked(flat, n, d, &mut dm);
+        } else {
+            for i in 0..n {
+                for j in i + 1..n {
+                    let dist = sq_dist(row(i), row(j)).sqrt();
+                    dm[i * n + j] = dist;
+                    dm[j * n + i] = dist;
+                }
+            }
+        }
+        return dm;
+    }
     let chunk = n.div_ceil(nthreads);
     let row = &row;
     std::thread::scope(|scope| {
@@ -4563,14 +4660,22 @@ fn linkage_from_dm(n: usize, dm: Vec<f64>, method: LinkageMethod) -> Vec<[f64; 4
 /// is O(n²) (vs the generic O(n³) nearest-pair scan), then the edges are stably sorted by
 /// distance and relabeled with scipy's LinkageUnionFind (new cluster id n, n+1, …) so the
 /// output matches scipy element-for-element.
-fn single_linkage_mst(n: usize, dm: &[f64]) -> Vec<[f64; 4]> {
-    // Prim's MST from vertex 0, recording edges in add-order.
-    let mut in_tree = vec![false; n];
-    let mut min_d = vec![f64::INFINITY; n];
-    let mut nearest = vec![0usize; n];
-    let mut edges: Vec<(f64, usize, usize)> = Vec::with_capacity(n - 1);
-    in_tree[0] = true;
-    min_d[1..n].copy_from_slice(&dm[1..n]);
+/// Selects the fused single-pass Prim's inner loop (`true`, shipping) over the
+/// two-pass form (`false`). Both produce bit-identical MST edges — see
+/// `prim_edges_fused` for why the argmin cannot move.
+pub static MST_FUSED_SCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Original two-pass Prim's inner loop: one pass to pick the closest outside vertex,
+/// a second to relax `min_d` against the row just added. Retained as the A/B reference
+/// arm for `MST_FUSED_SCAN`; `prim_edges_fused` does the same work in one pass.
+fn prim_edges_two_pass(
+    n: usize,
+    dm: &[f64],
+    in_tree: &mut [bool],
+    min_d: &mut [f64],
+    nearest: &mut [usize],
+    edges: &mut Vec<(f64, usize, usize)>,
+) {
     for _ in 1..n {
         let mut best = usize::MAX;
         let mut bd = f64::INFINITY;
@@ -4591,6 +4696,75 @@ fn single_linkage_mst(n: usize, dm: &[f64]) -> Vec<[f64; 4]> {
                 }
             }
         }
+    }
+}
+
+/// Fused Prim's inner loop: relax `min_d` against the newly added row AND pick the next
+/// closest outside vertex in the SAME pass, halving the traversals of `min_d`/`in_tree`
+/// from `2n` to `n` per step.
+///
+/// Bit-identical to `prim_edges_two_pass`, not merely equal within tolerance. The
+/// two-pass form picks `argmin_j min_d[j]` over vertices outside the tree using the
+/// values left by the *previous* step's relaxation; the fused form relaxes `min_d[j]`
+/// and then compares the same slot, still ascending in `j` and still with a strict `<`
+/// so the first minimum wins. Both therefore reduce over identical values in identical
+/// order — no float is reassociated and no tie resolves differently. The seed argmin
+/// that the two-pass form computes in its first find-pass is computed here over the
+/// same row-0 values before the loop.
+fn prim_edges_fused(
+    n: usize,
+    dm: &[f64],
+    in_tree: &mut [bool],
+    min_d: &mut [f64],
+    nearest: &mut [usize],
+    edges: &mut Vec<(f64, usize, usize)>,
+) {
+    // Seed: the vertex the two-pass form would select in its first find-pass.
+    let mut best = usize::MAX;
+    let mut bd = f64::INFINITY;
+    for j in 0..n {
+        if !in_tree[j] && min_d[j] < bd {
+            bd = min_d[j];
+            best = j;
+        }
+    }
+    for _ in 1..n {
+        in_tree[best] = true;
+        edges.push((bd, nearest[best], best));
+        // Relax against row `best` and track the next argmin in the same traversal.
+        let row = &dm[best * n..best * n + n];
+        let mut next_best = usize::MAX;
+        let mut next_bd = f64::INFINITY;
+        for j in 0..n {
+            if !in_tree[j] {
+                let dj = row[j];
+                if dj < min_d[j] {
+                    min_d[j] = dj;
+                    nearest[j] = best;
+                }
+                if min_d[j] < next_bd {
+                    next_bd = min_d[j];
+                    next_best = j;
+                }
+            }
+        }
+        best = next_best;
+        bd = next_bd;
+    }
+}
+
+fn single_linkage_mst(n: usize, dm: &[f64]) -> Vec<[f64; 4]> {
+    // Prim's MST from vertex 0, recording edges in add-order.
+    let mut in_tree = vec![false; n];
+    let mut min_d = vec![f64::INFINITY; n];
+    let mut nearest = vec![0usize; n];
+    let mut edges: Vec<(f64, usize, usize)> = Vec::with_capacity(n - 1);
+    in_tree[0] = true;
+    min_d[1..n].copy_from_slice(&dm[1..n]);
+    if MST_FUSED_SCAN.load(std::sync::atomic::Ordering::Relaxed) {
+        prim_edges_fused(n, dm, &mut in_tree, &mut min_d, &mut nearest, &mut edges);
+    } else {
+        prim_edges_two_pass(n, dm, &mut in_tree, &mut min_d, &mut nearest, &mut edges);
     }
     // Stable sort by distance (matches scipy's argsort(kind='stable') on the MST edges).
     edges.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -7624,6 +7798,174 @@ pub fn kmedoids(
 #[cfg(test)]
 mod tests {
 
+    /// Serialises every test that writes a `pub static` A/B toggle.
+    ///
+    /// `cargo test` runs tests concurrently inside ONE process and these toggles are
+    /// process-global, so without this lock a test that pins its reference arm to `false`
+    /// can have a concurrent test flip it back mid-run. Both arms then execute the same
+    /// code and the bit-identity assertion compares a thing to itself — it passes, and a
+    /// masked pass is indistinguishable from a real one. That is why this is a single
+    /// lock over all of them rather than one lock per toggle: two different toggles can
+    /// select paths within the same call.
+    ///
+    /// Poisoning is deliberately ignored: one failing toggle test should report its own
+    /// assertion, not cascade every other toggle test into an unrelated panic.
+    static TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The four-at-a-time triangle fill must produce a distance matrix with EXACTLY the
+    /// bits the one-at-a-time `sq_dist` fill produces.
+    ///
+    /// Compared at the matrix rather than through `linkage`, because a single wrong entry
+    /// in the lower triangle can leave the dendrogram unchanged and hide the defect —
+    /// only entries the agglomeration happens to select would show. `to_bits` rather than
+    /// `==` so a lost sign on a zero cannot pass.
+    ///
+    /// Sweeps `d` across and either side of the four-wide block, and `n` so that the
+    /// per-row remainder `n - i - 1` takes every value mod 4 — a fill whose tail handling
+    /// is off by one is invisible at a single well-aligned size.
+    #[test]
+    fn linkage_dm_blocked_fold_matches_sq_dist_bits() {
+        use std::sync::atomic::Ordering;
+        let _serialized = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let was = super::LINKAGE_DM_BLOCKED_FOLD.load(Ordering::Relaxed);
+        let coord = |i: usize, d: usize| -> f64 {
+            let key = (i * 2_654_435_761usize).wrapping_add(d * 40_503) % 100_003;
+            key as f64 / 100_003.0 - 0.5
+        };
+        for d in [1usize, 2, 3, 4, 5, 7, 8, 13] {
+            for n in [2usize, 3, 4, 5, 6, 7, 9, 33, 64] {
+                let flat: Vec<f64> = (0..n)
+                    .flat_map(|i| (0..d).map(move |k| coord(i, k)))
+                    .collect();
+
+                super::LINKAGE_DM_BLOCKED_FOLD.store(false, Ordering::Relaxed);
+                let reference = super::linkage_distance_matrix(&flat, n, d);
+                super::LINKAGE_DM_BLOCKED_FOLD.store(true, Ordering::Relaxed);
+                let candidate = super::linkage_distance_matrix(&flat, n, d);
+
+                assert_eq!(reference.len(), candidate.len(), "d={d} n={n}: length");
+                for (idx, (want, got)) in reference.iter().zip(candidate.iter()).enumerate() {
+                    assert_eq!(
+                        want.to_bits(),
+                        got.to_bits(),
+                        "d={d} n={n}: dm[{}][{}] differs ({want} vs {got})",
+                        idx / n,
+                        idx % n
+                    );
+                }
+            }
+        }
+        super::LINKAGE_DM_BLOCKED_FOLD.store(was, Ordering::Relaxed);
+    }
+
+    /// The single-thread triangle route and the redundant-work block fill must agree
+    /// bit-for-bit, since the thread-count check now decides between them.
+    ///
+    /// This is the assertion the doc comment on `linkage_distance_matrix` asserts in
+    /// prose — that `sq_dist` symmetry makes the two fills identical — made checkable.
+    #[test]
+    fn linkage_dm_thread_route_is_bit_identical_to_block_fill() {
+        use std::sync::atomic::Ordering;
+        let _serialized = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let was = super::LINKAGE_DM_FORCE_BLOCK_FILL.load(Ordering::Relaxed);
+        let coord = |i: usize, d: usize| -> f64 {
+            let key = (i * 40_503usize).wrapping_add(d * 2_654_435_761) % 99_991;
+            key as f64 / 99_991.0 - 0.5
+        };
+        for d in [1usize, 3, 8] {
+            for n in [2usize, 5, 33, 70] {
+                let flat: Vec<f64> = (0..n)
+                    .flat_map(|i| (0..d).map(move |k| coord(i, k)))
+                    .collect();
+
+                super::LINKAGE_DM_FORCE_BLOCK_FILL.store(false, Ordering::Relaxed);
+                let triangle = super::linkage_distance_matrix(&flat, n, d);
+                super::LINKAGE_DM_FORCE_BLOCK_FILL.store(true, Ordering::Relaxed);
+                let block = super::linkage_distance_matrix(&flat, n, d);
+
+                for (idx, (want, got)) in triangle.iter().zip(block.iter()).enumerate() {
+                    assert_eq!(
+                        want.to_bits(),
+                        got.to_bits(),
+                        "d={d} n={n}: dm[{}][{}] differs ({want} vs {got})",
+                        idx / n,
+                        idx % n
+                    );
+                }
+            }
+        }
+        super::LINKAGE_DM_FORCE_BLOCK_FILL.store(was, Ordering::Relaxed);
+    }
+
+    /// The fused single-pass Prim's loop must produce EXACTLY the linkage matrix the
+    /// two-pass loop produces — same merge pairs, same distance bits, same sizes.
+    ///
+    /// Bit equality is the right assertion because fusing changes only how many times
+    /// `min_d` is traversed, never the values reduced or their order. A tolerance would
+    /// accept a fused loop that picked a different vertex among equal-distance ties,
+    /// which reorders the whole dendrogram below that merge while every distance still
+    /// looks correct — the specific failure this rewrite can have.
+    ///
+    /// Includes a fixture with MANY EXACT TIES (points on a coarse integer lattice, so
+    /// large numbers of pairs are exactly equidistant) alongside generic points, because
+    /// tie-break drift is invisible on data where every distance is distinct.
+    #[test]
+    fn mst_fused_scan_matches_two_pass_bits() {
+        use std::sync::atomic::Ordering;
+        let _serialized = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let was = super::MST_FUSED_SCAN.load(Ordering::Relaxed);
+        let coord = |i: usize, d: usize| -> f64 {
+            let key = (i * 2_654_435_761usize).wrapping_add(d * 40_503) % 100_003;
+            key as f64 / 100_003.0 - 0.5
+        };
+        for dim in [1usize, 2, 3, 8] {
+            for n in [2usize, 3, 5, 17, 64, 129] {
+                for lattice in [false, true] {
+                    let points: Vec<Vec<f64>> = (0..n)
+                        .map(|i| {
+                            (0..dim)
+                                .map(|d| {
+                                    if lattice {
+                                        // Coarse lattice ⇒ many pairs exactly equidistant.
+                                        f64::from(((i / (d + 1)) % 3) as u32)
+                                    } else {
+                                        coord(i, d)
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect();
+
+                    super::MST_FUSED_SCAN.store(false, Ordering::Relaxed);
+                    let reference =
+                        super::linkage(&points, super::LinkageMethod::Single).expect("two-pass");
+                    super::MST_FUSED_SCAN.store(true, Ordering::Relaxed);
+                    let candidate =
+                        super::linkage(&points, super::LinkageMethod::Single).expect("fused");
+
+                    assert_eq!(
+                        reference.len(),
+                        candidate.len(),
+                        "dim={dim} n={n} lattice={lattice}: merge count differs"
+                    );
+                    for (step, (want, got)) in reference.iter().zip(candidate.iter()).enumerate() {
+                        for slot in 0..4 {
+                            assert_eq!(
+                                want[slot].to_bits(),
+                                got[slot].to_bits(),
+                                "dim={dim} n={n} lattice={lattice}: Z[{step}][{slot}] \
+                                 differs ({} vs {})",
+                                want[slot],
+                                got[slot]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        super::MST_FUSED_SCAN.store(was, Ordering::Relaxed);
+    }
+
     /// The dimension-major accumulator kernel must return EXACTLY what the `sq_dist` scan
     /// returns — same winning centroid AND same distance bits.
     ///
@@ -7637,6 +7979,7 @@ mod tests {
     #[test]
     fn vq_soa_kernel_matches_sq_dist_bits() {
         use std::sync::atomic::Ordering;
+        let _serialized = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let was = VQ_SOA_SCAN.load(Ordering::Relaxed);
         let coord = |i: usize, d: usize| -> f64 {
             let key = (i * 2_654_435_761usize).wrapping_add(d * 40_503) % 100_003;
@@ -7687,6 +8030,7 @@ mod tests {
         // Gate: n < 2 || n*d < 65_536. n=8192, d=8 -> 65_536, so the threaded
         // path runs.
         use std::sync::atomic::Ordering;
+        let _serialized = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (n, d) = (8192usize, 8usize);
         let data: Vec<Vec<f64>> = (0..n)
             .map(|i| {
@@ -7719,6 +8063,7 @@ mod tests {
         // linkage with 4097 merges clears it without paying for a real O(n²)
         // linkage build.
         use std::sync::atomic::Ordering;
+        let _serialized = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let m = 4097usize;
         let n = m + 1;
         let mut z: Vec<[f64; 4]> = Vec::with_capacity(m);
@@ -7760,6 +8105,7 @@ mod tests {
         // Gate: n*m*d < 1<<20 goes serial. A 256x256 kernel with 128 components
         // clears it.
         use std::sync::atomic::Ordering;
+        let _serialized = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let n = 256usize;
         let kernel: Vec<Vec<f64>> = (0..n)
             .map(|i| {
@@ -7803,6 +8149,7 @@ mod tests {
         // every call, so any input exercises both arms. The fused arm claims to
         // accumulate the same dist(i,j) terms in the same order; this pins that.
         use std::sync::atomic::Ordering;
+        let _serialized = TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (n, d) = (300usize, 4usize);
         let data: Vec<Vec<f64>> = (0..n)
             .map(|i| {
