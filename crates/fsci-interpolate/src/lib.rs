@@ -15675,39 +15675,36 @@ mod rch_source_freshness_tests {
             );
         }
 
-        // THE GAP, pinned against SciPy 1.17.1 on both sides.
-        let tps =
-            RbfInterpolator::new(&points, &values, RbfKernel::ThinPlateSpline, 1.0).expect("tps");
-        for (query, scipy_degree_minus_one, scipy_default) in [
-            (1.5_f64, 10.161878_f64, 4.0_f64),
-            (2.0, 10.584389, 5.0),
-            (3.0, -36.696158, 7.0),
-        ] {
-            let ours = tps.eval(&[query]);
+        let tps = RbfInterpolator::new(&points, &values, RbfKernel::ThinPlateSpline, 1.0)
+            .expect("default tps");
+        let linear = RbfInterpolator::new(&points, &values, RbfKernel::Linear, 1.0)
+            .expect("default linear");
+        for (query, tps_expected) in [(1.5_f64, 4.0_f64), (2.0, 5.0), (3.0, 7.0)] {
             assert!(
-                (ours - scipy_degree_minus_one).abs() < 1e-5,
-                "thin_plate_spline f({query}): we give {ours:.6}, SciPy degree=-1 gives \
-                 {scipy_degree_minus_one:.6}; we are supposed to match the no-tail variant"
+                (tps.eval(&[query]) - tps_expected).abs() < 1e-10,
+                "thin-plate default f({query}) differs from SciPy: {}",
+                tps.eval(&[query])
             );
             assert!(
-                (ours - scipy_default).abs() > 1.0,
-                "thin_plate_spline f({query}): we now agree with SciPy's DEFAULT \
-                 ({scipy_default:.6}) -- if a polynomial tail has been added, this test has done \
-                 its job and should be rewritten to assert the new parity, not deleted"
+                (linear.eval(&[query]) - 3.0).abs() < 1e-10,
+                "linear default f({query}) differs from SciPy: {}",
+                linear.eval(&[query])
             );
         }
 
-        // `linear` behaves the same way: we match degree=-1 (5, 7, 11), while SciPy's degree-0
-        // default returns the constant 3 everywhere outside the hull.
-        let lin = RbfInterpolator::new(&points, &values, RbfKernel::Linear, 1.0).expect("linear");
-        for (query, scipy_degree_minus_one) in [(1.5_f64, 5.0_f64), (2.0, 7.0), (3.0, 11.0)] {
-            let ours = lin.eval(&[query]);
-            assert!(
-                (ours - scipy_degree_minus_one).abs() < 1e-9,
-                "linear f({query}): we give {ours:.6}, SciPy degree=-1 gives \
-                 {scipy_degree_minus_one:.6}"
-            );
+        // MUST-HIT negative case: selecting degree=-1 must retain the old no-tail variant.
+        let no_tail = RbfInterpolator::with_degree(
+            &points,
+            &values,
+            RbfKernel::ThinPlateSpline,
+            1.0,
+            -1,
+        )
+        .expect("degree=-1");
+        for (query, expected) in [(1.5_f64, 10.161878_f64), (2.0, 10.584389), (3.0, -36.696158)] {
+            assert!((no_tail.eval(&[query]) - expected).abs() < 1e-5);
         }
+        assert!(RbfInterpolator::with_degree(&points, &values, RbfKernel::Linear, 1.0, 2).is_err());
     }
 
     /// SciPy parity for the two ND interpolators a LIVE SciPy harness already exercises
