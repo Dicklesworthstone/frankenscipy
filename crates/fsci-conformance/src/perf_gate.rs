@@ -389,17 +389,51 @@ mod tests {
         );
     }
 
+    /// Smallest median arm time this self-test accepts as measurable, in seconds.
+    ///
+    /// Below roughly a microsecond the clock cannot express a ratio at all: both arms land
+    /// on the same one or two tick counts, every ratio collapses to exactly 1.000000, and
+    /// the CI bounds come out as small exact fractions (2/3, 3/2) — the signature of
+    /// quantisation rather than of noise. A gate fed that input is CORRECT to refuse, so a
+    /// self-test built on it can only ever fail, however sound the gate is.
+    const MEASURABLE_FLOOR_SECONDS: f64 = 1.0e-6;
+
     #[test]
     fn a_null_does_not_decide_and_a_real_effect_does() {
         // A/A: both arms identical work. A/B: arm B does a quarter of it.
+        //
+        // `black_box` SITS INSIDE THE LOOP, and that is the whole reason this test works.
+        // The previous fixture accumulated `acc += i * K` over `0..n` with `black_box` only
+        // on the FINAL value. That sum has a closed form — `K · n(n−1)/2` — and LLVM's
+        // scalar evolution duly replaced the loop with it, so `work(200_000)` and
+        // `work(50_000)` both returned in 20-30 ns and every ratio quantised to 1.000000.
+        // This test was RED on main deterministically because of it.
+        //
+        // The consequence worth recording: RAISING `n` WOULD NOT HAVE FIXED IT. A folded
+        // loop costs the same at every `n`, so the obvious reading of the symptom — "the
+        // fixture is too small" — leads to a change that leaves the test exactly as red.
+        // Forcing `acc` through `black_box` each iteration makes the recurrence opaque to
+        // scalar evolution, so cost becomes genuinely linear in `n` and the planted 4x
+        // effect is expressible by the clock.
         let work = |n: usize| {
             let mut acc = 0u64;
             for i in 0..n {
-                acc = acc.wrapping_add((i as u64).wrapping_mul(2_654_435_761));
+                acc =
+                    std::hint::black_box(acc).wrapping_add((i as u64).wrapping_mul(2_654_435_761));
             }
             std::hint::black_box(acc);
         };
         let null = paired(15, 3, || work(200_000), || work(200_000));
+
+        // The fixture must be RESOLVABLE before any verdict about the gate means anything.
+        // Without this, a future edit that reintroduces a foldable loop turns this test back
+        // into a mysterious "the gate refused to decide" rather than naming its own broken
+        // input, which is precisely how the original defect stayed unexplained.
+        assert!(
+            null.p50_a > MEASURABLE_FLOOR_SECONDS && null.p50_b > MEASURABLE_FLOOR_SECONDS,
+            "the synthetic fixture is below timer resolution, so this test cannot say \
+             anything about the gate it is meant to check: {null}"
+        );
         let cand = paired(15, 3, || work(200_000), || work(50_000));
 
         let null_verdict = decide(&null, &null);
