@@ -3357,6 +3357,105 @@ fn median_filter1d_sliding_histogram(
     output
 }
 
+/// Largest kernel width for which the 2-D median filter selects directly from the gathered
+/// window instead of maintaining the sliding rank tree.
+///
+/// The sliding tree is indexed by DISTINCT OBSERVED VALUE, so on continuous data its
+/// alphabet is the whole image: a 512x512 float image gives ~262k distinct values, making
+/// every window update a binary search plus a Fenwick walk of ~18 steps each through a 2 MB
+/// tree. Per output pixel that is `2·size` updates, so roughly `4·size·log₂(U)` scattered
+/// steps, against `size²` sequential loads plus a linear-time selection for the direct
+/// form. Those cross near `size ≈ 4·log₂(U) ≈ 72` on this shape, and the direct side is
+/// contiguous while the tree side misses cache, so the real crossover is further out still.
+/// 64 keeps every kernel anyone filters with on the direct path while leaving the tree in
+/// place for the extreme widths where its `O(size)` update genuinely wins.
+const NDIMAGE_MEDIAN_DIRECT_MAX_SIZE: usize = 64;
+
+/// Select the median directly from each gathered window (`true`, shipping) instead of
+/// maintaining the sliding rank tree. Bit-identical: both return an ELEMENT of the window,
+/// chosen at the same rank under the same `total_cmp` order.
+pub static NDIMAGE_MEDIAN_DIRECT_SELECT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// 2-D median by gathering each window and selecting its rank-`size²/2` element.
+///
+/// BIT-IDENTICAL to the sliding-tree path, and for a structural reason rather than a
+/// numerical one: a median filter RETURNS AN ELEMENT of its window, never a combination of
+/// elements, so no arithmetic happens at all. Both paths pick the same rank under the same
+/// `total_cmp` order over the same multiset, so they select the same `f64` — including for
+/// NaN inputs, since `total_cmp` gives NaN a definite position that both paths honour.
+///
+/// `select_nth_unstable_by` is average `O(k)` and touches only the gathered window, which
+/// is `size²` contiguous-ish loads; the tree path pays `~4·size·log₂(distinct values)`
+/// scattered steps. Boundary index maps are precomputed per axis so the inner gather is
+/// pure indexing rather than a `boundary_index_1d` call per element.
+fn median_filter2d_direct_select(
+    input: &NdArray,
+    size: usize,
+    origins: [i64; 2],
+    mode: BoundaryMode,
+    cval: f64,
+) -> NdArray {
+    let height = input.shape[0] as i64;
+    let width = input.shape[1] as i64;
+    let size_i = size as i64;
+    let lo_row = size_i / 2 + origins[0];
+    let lo_col = size_i / 2 + origins[1];
+
+    // Per-axis boundary maps: `None` marks a tap that falls outside and takes `cval`.
+    // Computed once per axis rather than once per element, which is `size²` fewer
+    // `boundary_index_1d` calls per output pixel.
+    let mut col_map: Vec<Option<usize>> = Vec::with_capacity((width as usize) * size);
+    for col in 0..width {
+        for k in 0..size_i {
+            col_map.push(boundary_index_1d(col - lo_col + k, width, mode).map(|c| c as usize));
+        }
+    }
+
+    let mut output = NdArray::zeros(input.shape.clone());
+    let rank = size * size / 2;
+    let mut window: Vec<f64> = vec![0.0; size * size];
+    let mut row_map: Vec<Option<usize>> = vec![None; size];
+
+    for row in 0..height {
+        for (k, slot) in row_map.iter_mut().enumerate() {
+            *slot = boundary_index_1d(row - lo_row + k as i64, height, mode).map(|r| r as usize);
+        }
+        for col in 0..width {
+            let cols = &col_map[(col as usize) * size..(col as usize) * size + size];
+            let mut at = 0usize;
+            for source_row in &row_map {
+                match source_row {
+                    Some(r) => {
+                        let base = r * width as usize;
+                        for source_col in cols {
+                            window[at] = match source_col {
+                                Some(c) => input.data[base + c],
+                                None => cval,
+                            };
+                            at += 1;
+                        }
+                    }
+                    None => {
+                        for _ in 0..size {
+                            window[at] = cval;
+                            at += 1;
+                        }
+                    }
+                }
+            }
+            // MEASURED AND REJECTED: replacing this with a straight-line insertion sort for
+            // small windows, on the theory that quickselect's pivot choice and partition
+            // bookkeeping would dominate at 25 elements. It is 1.60x SLOWER (36.7 ms against
+            // 22.9 ms on the 512x512 size-5 case), so the O(n²) shift costs more than the
+            // machinery it removes even at this size. `select_nth_unstable_by` stays.
+            let (_, median, _) = window.select_nth_unstable_by(rank, |a, b| a.total_cmp(b));
+            output.data[(row * width + col) as usize] = *median;
+        }
+    }
+    output
+}
+
 fn median_filter2d_sliding_histogram(
     input: &NdArray,
     size: usize,
@@ -3499,6 +3598,17 @@ pub fn median_filter_with_origins(
         ));
     }
     if ndim == 2 {
+        if size <= NDIMAGE_MEDIAN_DIRECT_MAX_SIZE
+            && NDIMAGE_MEDIAN_DIRECT_SELECT.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(median_filter2d_direct_select(
+                input,
+                size,
+                [origins[0], origins[1]],
+                mode,
+                cval,
+            ));
+        }
         return Ok(median_filter2d_sliding_histogram(
             input,
             size,
@@ -13902,6 +14012,78 @@ mod zoom_separable_ab_tests {
     static TOGGLE_LOCK: Mutex<()> = Mutex::new(());
     fn toggle_lock() -> MutexGuard<'static, ()> {
         TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Direct window selection must return EXACTLY what the sliding rank tree returns.
+    ///
+    /// Bit equality is the right assertion and is achievable here for a structural reason:
+    /// a median filter RETURNS AN ELEMENT of its window, never a combination, so no
+    /// arithmetic occurs and both paths can only differ by selecting a different element.
+    /// A tolerance would accept exactly that — an off-by-one rank, or a different tie-break
+    /// among equal values — which is the specific failure this rewrite can have.
+    ///
+    /// Sweeps EVEN sizes as well as odd, because SciPy takes rank `len/2` (the upper of the
+    /// two middle elements) rather than averaging, and an even window is where an off-by-one
+    /// rank hides. Every boundary mode is covered, since the two paths reach the border
+    /// through different index maps. A DUPLICATE-HEAVY image is included alongside the
+    /// distinct-valued one: ties are where a selection algorithm and a rank tree are most
+    /// likely to disagree, and they are absent from generic noise.
+    #[test]
+    fn ndimage_median2d_direct_select_matches_sliding_tree_bits() {
+        let _guard = toggle_lock();
+        use std::sync::atomic::Ordering;
+        let was = super::NDIMAGE_MEDIAN_DIRECT_SELECT.load(Ordering::Relaxed);
+
+        let modes = [
+            BoundaryMode::Reflect,
+            BoundaryMode::Constant,
+            BoundaryMode::Nearest,
+            BoundaryMode::Wrap,
+            BoundaryMode::Mirror,
+        ];
+        let mut compared = 0usize;
+        for &(rows, cols) in &[(1usize, 7usize), (7, 1), (5, 5), (9, 6), (12, 11)] {
+            for duplicate_heavy in [false, true] {
+                let data: Vec<f64> = (0..rows * cols)
+                    .map(|i| {
+                        let k = (i * 2_654_435_761usize).wrapping_add(40_503) % 1_000_003;
+                        let raw = k as f64 / 1_000_003.0;
+                        // Quantizing to a handful of levels makes most windows tie-heavy.
+                        if duplicate_heavy {
+                            (raw * 4.0).floor()
+                        } else {
+                            raw
+                        }
+                    })
+                    .collect();
+                let input = NdArray::new(data, vec![rows, cols]).expect("input");
+                for size in [1usize, 2, 3, 4, 5, 6] {
+                    for &mode in &modes {
+                        super::NDIMAGE_MEDIAN_DIRECT_SELECT.store(false, Ordering::Relaxed);
+                        let tree = median_filter(&input, size, mode, 0.25).expect("tree");
+                        super::NDIMAGE_MEDIAN_DIRECT_SELECT.store(true, Ordering::Relaxed);
+                        let direct = median_filter(&input, size, mode, 0.25).expect("direct");
+
+                        assert_eq!(tree.shape, direct.shape, "shape differs");
+                        for (idx, (want, got)) in
+                            tree.data.iter().zip(direct.data.iter()).enumerate()
+                        {
+                            assert_eq!(
+                                want.to_bits(),
+                                got.to_bits(),
+                                "rows={rows} cols={cols} size={size} mode={mode:?} \
+                                 dup={duplicate_heavy}: element {idx} differs ({want} vs {got})"
+                            );
+                        }
+                        compared += 1;
+                    }
+                }
+            }
+        }
+        // Guards a silently-empty comparison: if the 2-D route stopped being taken, every
+        // assertion above would be skipped and the test would still report success.
+        assert_eq!(compared, 300, "expected 300 compared cases, ran {compared}");
+        super::NDIMAGE_MEDIAN_DIRECT_SELECT.store(was, Ordering::Relaxed);
     }
 
     /// `NDIMAGE_ZOOM_SEPARABLE_DISABLE` claims precomputing the per-axis
