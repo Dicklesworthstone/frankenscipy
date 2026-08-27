@@ -803,8 +803,16 @@ for raw_line in sys.stdin.buffer:
         );
         fsci_linalg::EIGH_BACKTRANSFORM_SLICED_ENABLE
             .store(sliced, std::sync::atomic::Ordering::Relaxed);
+        // `FSCI_EIGH_SPLIT_ACCUM=1` sizes what the serial dot-product dependency chain
+        // costs. NOT bit-identical (it reassociates), so it ships off and is a bound.
+        let split_accum = matches!(
+            std::env::var("FSCI_EIGH_SPLIT_ACCUM").ok().as_deref(),
+            Some("1") | Some("true")
+        );
+        fsci_linalg::EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE
+            .store(split_accum, std::sync::atomic::Ordering::Relaxed);
         println!(
-            "backtransform_panel_width_override={panel_width} (0 = shipping default 8) blocked={blocked} sliced={sliced}"
+            "backtransform_panel_width_override={panel_width} (0 = shipping default 8) blocked={blocked} sliced={sliced} split_accum={split_accum}"
         );
 
         println!(

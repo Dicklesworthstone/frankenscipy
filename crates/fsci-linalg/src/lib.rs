@@ -11773,6 +11773,17 @@ pub static EIGH_BACKTRANSFORM_SLICED_ENABLE: std::sync::atomic::AtomicBool =
 /// Reflector applications that took the sliced arm — "enabled" is not "took effect".
 pub static EIGH_BACKTRANSFORM_SLICED_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Accumulate the back-transform's dot product into FOUR independent accumulators.
+///
+/// MEASUREMENT ARM, SHIPS OFF, and it is NOT bit-identical: it reassociates the sum. It
+/// exists because the back-transform turns out to be LATENCY-bound rather than
+/// bandwidth-bound — the dot product is a serial chain of dependent FMAs whose length is the
+/// active row count, and at ~4 cycles each that chain alone accounts for ~258 ms against a
+/// measured ~190 ms. That is why cutting traffic 8x via the panel loop interchange moved
+/// nothing at all.
+pub static EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_PAR_ROWS: usize = 128;
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_ROWS_PER_WORKER: usize = 32;
 const THIN_BIDIAG_RIGHT_REPLAY_MAX_WORKERS: usize = 8;
@@ -11916,6 +11927,8 @@ fn apply_householder_left(
     // per-element path is an optimisation barrier, and this repo has already paid 13% for
     // exactly that shape in the splu merge kernel.
     let sliced = EIGH_BACKTRANSFORM_SLICED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+    let split_accum =
+        EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
     if sliced {
         EIGH_BACKTRANSFORM_SLICED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -11942,8 +11955,39 @@ fn apply_householder_left(
         if sliced {
             let segment = &mut data[col_base + start..col_base + start + active];
             let mut dot = 0.0;
-            for (&slot, &value) in segment.iter().zip(values) {
-                dot += value * slot;
+            if split_accum {
+                // FOUR INDEPENDENT ACCUMULATORS, to measure what the dependency chain costs.
+                //
+                // The dot product is a serial chain of dependent FMAs: at ~4 cycles each and
+                // an average length of n/2, the chain alone accounts for ~258 ms against a
+                // measured back-transform of ~190 ms, which is why an 8x traffic reduction
+                // (the panel loop interchange) moved nothing. Four accumulators let four
+                // chains run concurrently.
+                //
+                // NOT BIT-IDENTICAL — this REASSOCIATES the sum, so it ships OFF and exists
+                // to size the headroom. Reassociation here does not weaken the tolerance
+                // contract (pairwise-style summation has a strictly better error bound than
+                // sequential), but it does change the last bits, and every other arm in this
+                // function is bit-identical by construction.
+                let (mut a0, mut a1, mut a2, mut a3) = (0.0, 0.0, 0.0, 0.0);
+                let chunks = active / 4 * 4;
+                let mut offset = 0;
+                while offset < chunks {
+                    a0 += values[offset] * segment[offset];
+                    a1 += values[offset + 1] * segment[offset + 1];
+                    a2 += values[offset + 2] * segment[offset + 2];
+                    a3 += values[offset + 3] * segment[offset + 3];
+                    offset += 4;
+                }
+                dot = (a0 + a1) + (a2 + a3);
+                while offset < active {
+                    dot += values[offset] * segment[offset];
+                    offset += 1;
+                }
+            } else {
+                for (&slot, &value) in segment.iter().zip(values) {
+                    dot += value * slot;
+                }
             }
             let scale = reflector.tau * dot;
             if scale != 0.0 {
