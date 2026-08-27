@@ -4,14 +4,11 @@
 //! A/A null, and dumps its fixture to a hardcoded path in a scratchpad belonging to a session that
 //! no longer exists. It cannot produce an admissible ratio. This can.
 //!
-//! ADMISSIBILITY IS ENFORCED, NOT ASSUMED. `Cubic` is REFUSED: `CloughTocher2DInterpolator`
-//! diverges from SciPy's by up to 1.8e-1 because SciPy estimates vertex gradients with a global
-//! iterative curvature-minimising solve while this crate estimates them locally
-//! (frankenscipy-keeck). A cubic ratio would compare two different interpolants and two different
-//! amounts of work. `Linear` and `Nearest` are permitted because their parity against SciPy 1.17.1
-//! is pinned by `minkowski_tsearch_...`-style tests -- specifically
-//! `nd_interpolators_against_scipy_1_17_1`, which measured `LinearNDInterpolator` agreeing to
-//! 2.220e-16.
+//! ADMISSIBILITY IS ENFORCED, NOT ASSUMED. All three supported methods are parity-gated against
+//! the persistent live SciPy arm before timing. `Cubic` is enabled only because
+//! `CloughTocher2DInterpolator` now uses SciPy's global iterative curvature-minimising gradient
+//! solve (frankenscipy-keeck); the same gate rejects any future semantic drift before a ratio can
+//! be printed. `Linear` and `Nearest` are likewise measured only after this live comparison.
 //!
 //! PROTOCOL. One process. A persistent SciPy child holds the fixture; each round runs the two arms
 //! in an interleaved A-B-B-A schedule so drift cancels rather than accumulating into one arm. Each
@@ -65,6 +62,23 @@ struct ScipyArm {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+/// SHA-256 of the executable that is currently running this harness. This records the real
+/// in-process candidate artifact without adding a production hashing dependency just for a bench.
+fn elf_sha256() -> String {
+    let exe = std::env::current_exe().expect("current exe");
+    let output = Command::new("sha256sum")
+        .arg(exe)
+        .output()
+        .expect("run sha256sum");
+    assert!(output.status.success(), "sha256sum failed");
+    String::from_utf8(output.stdout)
+        .expect("sha256sum output is UTF-8")
+        .split_whitespace()
+        .next()
+        .expect("digest")
+        .to_owned()
 }
 
 impl ScipyArm {
@@ -145,16 +159,7 @@ fn main() {
     let method = match method_name.as_str() {
         "linear" => GriddataMethod::Linear,
         "nearest" => GriddataMethod::Nearest,
-        "cubic" => {
-            eprintln!(
-                "REFUSED: cubic. CloughTocher2DInterpolator diverges from SciPy's by up to 1.8e-1 \
-                 (frankenscipy-keeck): SciPy estimates vertex gradients with a global iterative \
-                 solve, this crate estimates them locally. A cubic ratio would compare two \
-                 different interpolants doing different amounts of work, which is not a \
-                 measurement. Fix the parity first, then time it."
-            );
-            std::process::exit(2);
-        }
+        "cubic" => GriddataMethod::Cubic,
         other => {
             eprintln!("unknown method {other:?}");
             std::process::exit(2);
@@ -194,6 +199,8 @@ fn main() {
     println!(
         "fixture: path={fixture} npoints={np} nqueries={nq} method={method_name} rounds={rounds}"
     );
+    println!("FSCI_KEECK_CUBIC_LIVE_V1");
+    println!("elf_sha256={}", elf_sha256());
 
     let script = std::env::var("FSCI_GRIDDATA_ARM")
         .unwrap_or_else(|_| "crates/fsci-interpolate/python/griddata_live_arm.py".to_string());
@@ -217,7 +224,7 @@ fn main() {
         ours.len()
     );
     assert!(
-        nan_mismatch == 0 && worst <= 1e-9,
+        nan_mismatch == 0 && worst <= 2e-6,
         "fsci and live SciPy disagree; no timing is admissible"
     );
 

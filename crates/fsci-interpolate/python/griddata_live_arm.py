@@ -15,10 +15,12 @@ incumbent answered rather than which one was installed.
 import struct
 import sys
 import time
+import hashlib
 
 import numpy as np
 import scipy
 from scipy.interpolate import griddata
+from scipy.interpolate import _interpnd
 
 
 def load(path):
@@ -36,12 +38,15 @@ def load(path):
 
 def main():
     pts, vals, xi = load(sys.argv[1])
+    with open(_interpnd.__file__, "rb") as fh:
+        engine_sha256 = hashlib.sha256(fh.read()).hexdigest()
     print(f"READY scipy={scipy.__version__} numpy={np.__version__} "
-          f"engine_file={griddata.__module__} npoints={len(pts)} nqueries={len(xi)} "
+          f"engine_file={_interpnd.__file__} engine_sha256={engine_sha256} "
+          f"npoints={len(pts)} nqueries={len(xi)} "
           f"fsci_loaded={'fsci' in sys.modules}", flush=True)
 
     # Warm every method once so the timed calls do not pay import/JIT-style first-call costs.
-    for m in ("linear", "nearest"):
+    for m in ("linear", "nearest", "cubic"):
         griddata(pts, vals, xi, method=m)
 
     for line in sys.stdin:

@@ -4722,8 +4722,9 @@ impl Default for CloughTocher2DOptions {
 /// `scipy.interpolate.CloughTocher2DInterpolator(points, values, ...)`: input
 /// points are triangulated, values are interpolated exactly at data sites, and
 /// query points outside the convex hull return `fill_value`. The Rust kernel
-/// estimates per-vertex gradients from neighboring triangles and evaluates a
-/// cubic, gradient-corrected triangular patch that preserves affine functions.
+/// estimates per-vertex gradients with SciPy's global iterative
+/// curvature-minimising solve and evaluates a cubic, gradient-corrected
+/// triangular patch that preserves affine functions.
 #[derive(Debug, Clone)]
 pub struct CloughTocher2DInterpolator {
     delaunay: Delaunay2D,
@@ -4765,7 +4766,8 @@ impl CloughTocher2DInterpolator {
                 detail: "CloughTocher2DInterpolator requires non-collinear points".to_string(),
             });
         }
-        let gradients = estimate_clough_tocher_gradients(&delaunay, values);
+        let gradients =
+            estimate_clough_tocher_gradients(&delaunay, values, options.maxiter, options.tol);
         let patches: Vec<[f64; 19]> = (0..delaunay.simplices.len())
             .map(|i| clough_tocher_patch(&delaunay, i, values, &gradients))
             .collect();
@@ -4910,7 +4912,19 @@ fn prepare_clough_tocher_points(
     Ok((scaled, (min_x, min_y), (scale_x, scale_y)))
 }
 
-fn estimate_clough_tocher_gradients(delaunay: &Delaunay2D, values: &[f64]) -> Vec<(f64, f64)> {
+/// Match SciPy's global approximate-curvature-minimisation gradient estimate.
+///
+/// Each Gauss-Seidel step minimizes the edge-curvature contribution at one
+/// vertex against the latest gradients at its Delaunay neighbours.  The 2x2
+/// update is deliberately scalar: it is the full algorithm SciPy uses here,
+/// requires no BLAS/LAPACK dependency, and makes `tol` and `maxiter` observable
+/// controls rather than inert compatibility fields.
+fn estimate_clough_tocher_gradients(
+    delaunay: &Delaunay2D,
+    values: &[f64],
+    maxiter: usize,
+    tol: f64,
+) -> Vec<(f64, f64)> {
     let mut neighbors = vec![Vec::<usize>::new(); values.len()];
     for &(a, b, c) in &delaunay.simplices {
         push_unique_neighbor(&mut neighbors[a], b);
@@ -4921,13 +4935,58 @@ fn estimate_clough_tocher_gradients(delaunay: &Delaunay2D, values: &[f64]) -> Ve
         push_unique_neighbor(&mut neighbors[c], b);
     }
 
-    (0..values.len())
-        .map(|index| {
-            estimate_vertex_gradient(index, delaunay, values, &neighbors[index])
-                .or_else(|| fallback_triangle_gradient(index, delaunay, values))
-                .unwrap_or((0.0, 0.0))
-        })
-        .collect()
+    let mut gradients = vec![(0.0, 0.0); values.len()];
+    for _ in 0..maxiter {
+        let mut max_relative_change = 0.0_f64;
+        for index in 0..values.len() {
+            let origin = delaunay.points[index];
+            let mut qxx = 0.0;
+            let mut qxy = 0.0;
+            let mut qyy = 0.0;
+            let mut sx = 0.0;
+            let mut sy = 0.0;
+
+            for &neighbor in &neighbors[index] {
+                let point = delaunay.points[neighbor];
+                let ex = point.0 - origin.0;
+                let ey = point.1 - origin.1;
+                let length_sq = ex * ex + ey * ey;
+                let length_cubed = length_sq * length_sq.sqrt();
+                let neighbor_projection = -ex * gradients[neighbor].0 - ey * gradients[neighbor].1;
+                let edge_term =
+                    6.0 * (values[index] - values[neighbor]) - 2.0 * neighbor_projection;
+
+                qxx += 4.0 * ex * ex / length_cubed;
+                qxy += 4.0 * ex * ey / length_cubed;
+                qyy += 4.0 * ey * ey / length_cubed;
+                sx += edge_term * ex / length_cubed;
+                sy += edge_term * ey / length_cubed;
+            }
+
+            let determinant = qxx * qyy - qxy * qxy;
+            if determinant.abs() <= 1e-24 {
+                gradients[index] =
+                    estimate_vertex_gradient(index, delaunay, values, &neighbors[index])
+                        .or_else(|| fallback_triangle_gradient(index, delaunay, values))
+                        .unwrap_or((0.0, 0.0));
+                continue;
+            }
+
+            let rx = (qyy * sx - qxy * sy) / determinant;
+            let ry = (-qxy * sx + qxx * sy) / determinant;
+            let next = (-rx, -ry);
+            let change = (gradients[index].0 + rx)
+                .abs()
+                .max((gradients[index].1 + ry).abs())
+                / 1.0_f64.max(rx.abs().max(ry.abs()));
+            max_relative_change = max_relative_change.max(change);
+            gradients[index] = next;
+        }
+        if max_relative_change < tol {
+            break;
+        }
+    }
+    gradients
 }
 
 fn push_unique_neighbor(neighbors: &mut Vec<usize>, candidate: usize) {
@@ -15722,15 +15781,15 @@ mod rch_source_freshness_tests {
     ///
     /// RESULT, measured against SciPy 1.17.1:
     ///   * `LinearNDInterpolator` AGREES to 2.220e-16. Pinned below.
-    ///   * `CloughTocher2DInterpolator` DIVERGES, and the cause is algorithmic rather than a bug.
-    ///     SciPy estimates vertex gradients with a GLOBAL iterative curvature-minimising solve
-    ///     (documented `tol`/`maxiter`); this crate estimates them LOCALLY per vertex. Both are
-    ///     legitimate Clough-Tocher constructions and they are different functions. On linear
-    ///     data THIS crate is exact while SciPy carries its convergence tolerance -- see the
-    ///     assertions below, which pin that direction explicitly so nobody "fixes" it backwards.
+    ///   * `CloughTocher2DInterpolator` uses SciPy's global iterative curvature-minimising
+    ///     gradient solve. The nonlinear rows below are the negative case for a tempting but
+    ///     wrong local least-squares gradient fit: it differs from SciPy by orders of magnitude
+    ///     more than this test permits.
     #[test]
     fn nd_interpolators_against_scipy_1_17_1() {
         use super::{CloughTocher2DInterpolator, LinearNDInterpolator};
+
+        println!("FSCI_KEECK_GLOBAL_GRADIENT_V1");
 
         let sites: Vec<Vec<f64>> = vec![
             vec![0.0, 0.0],
@@ -15794,6 +15853,17 @@ mod rch_source_freshness_tests {
             f64::NAN,
             f64::NAN,
         ];
+        let scipy_clough_linear: Vec<f64> = vec![
+            0.7499999941446031,
+            0.5000000043516966,
+            1.749999994553052,
+            -0.6000000066278471,
+            1.7499999994212223,
+            -1.2500000153299917,
+            f64::NAN,
+            f64::NAN,
+            f64::NAN,
+        ];
 
         // ---- LinearNDInterpolator: full parity, pinned ----------------------------------------
         for (label, f, want) in [
@@ -15823,16 +15893,16 @@ mod rch_source_freshness_tests {
             }
         }
 
-        // ---- CloughTocher2D: exact on linear data, and NOT SciPy's interpolant ----------------
+        // ---- CloughTocher2D: global-gradient SciPy parity --------------------------------------
         let lin_values: Vec<f64> = sites.iter().map(|p| linear(p)).collect();
         let ct = CloughTocher2DInterpolator::new(&sites, &lin_values).expect("clough");
         for (i, q) in queries.iter().enumerate().take(6) {
             let got = ct.eval(q).unwrap_or(f64::NAN);
             assert!(
-                (got - linear(q)).abs() <= 1e-12,
-                "clough/linear q{i}: a Clough-Tocher patch must reproduce linear data exactly; \
-                 got {got:.17e} against {:.17e}",
-                linear(q)
+                (got - scipy_clough_linear[i]).abs() <= 2e-6,
+                "clough/linear q{i}: global gradient result {got:.17e}, SciPy 1.17.1 gives \
+                 {:.17e}",
+                scipy_clough_linear[i]
             );
         }
         for (i, q) in queries.iter().enumerate().skip(6) {
@@ -15842,22 +15912,19 @@ mod rch_source_freshness_tests {
             );
         }
 
-        // The divergence itself, pinned so it cannot close silently. If a future change adopts
-        // SciPy's global iterative gradient estimator this assertion FAILS -- rewrite it to
-        // assert the new parity rather than delete it.
+        // MUST-HIT negative case: a local per-vertex least-squares gradient fit returns values
+        // more than 1e-3 away on this general-position nonlinear fixture. These SciPy values
+        // therefore reject that superficially plausible but semantically different shortcut.
         let nl_values: Vec<f64> = sites.iter().map(|p| nonlinear(p)).collect();
         let ct_nl = CloughTocher2DInterpolator::new(&sites, &nl_values).expect("clough nl");
-        let worst = queries
-            .iter()
-            .take(6)
-            .enumerate()
-            .map(|(i, q)| (ct_nl.eval(q).unwrap_or(f64::NAN) - scipy_clough_nonlinear[i]).abs())
-            .fold(0.0_f64, f64::max);
-        assert!(
-            worst > 1e-3,
-            "clough/nonlinear now agrees with SciPy to {worst:.3e}. If the gradient estimator \
-             was changed to SciPy's global iterative one, this test has done its job and should \
-             be rewritten to assert parity, not deleted"
-        );
+        for (i, q) in queries.iter().enumerate().take(6) {
+            let got = ct_nl.eval(q).expect("clough nonlinear eval");
+            let want = scipy_clough_nonlinear[i];
+            assert!(
+                (got - want).abs() <= 2e-6,
+                "clough/nonlinear q{i}: global gradient result {got:.17e}, SciPy 1.17.1 gives \
+                 {want:.17e}; local-gradient shortcut must not pass this parity check"
+            );
+        }
     }
 }
