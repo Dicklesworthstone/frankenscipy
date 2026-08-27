@@ -3960,11 +3960,53 @@ mod cubic_live {
         );
         println!("loadavg_before={}", loadavg());
 
-        let fixtures = splu_fixtures(SpluFamily::Convection)?;
-        let fixture = fixtures
-            .first()
-            .ok_or_else(|| "the convection family has no fixture".to_string())?;
+        // THE PROBE WAS PINNED TO THE WRONG CELL. `CONVECTION_EXTENTS` is a single
+        // `[64, 64, 1]`, so `fixtures.first()` is always n=4,096 -- the size this bead
+        // started on. The worst measured loss has since moved to n=16,384 (0.4432x against
+        // 0.7951x at n=4,096), and the two are in DIFFERENT regimes: at n=4,096 the banded
+        // kernel is 1.33x FASTER than SuperLU per stored nonzero, and by n=16,384 that
+        // advantage is gone because 34.3 MB of factor no longer fits in cache. A split
+        // taken at the old size cannot see that.
+        //
+        // The second argument overrides the side. It builds the fixture directly rather
+        // than widening `CONVECTION_EXTENTS`, because that table feeds the pre-registered
+        // live rows and editing it would silently move every one of them.
+        let side = arguments
+            .get(1)
+            .map(|value| parse::<usize>(value, "side"))
+            .transpose()?
+            .unwrap_or(64);
+        let built;
+        let fixtures;
+        let fixture = if side == 64 {
+            fixtures = splu_fixtures(SpluFamily::Convection)?;
+            fixtures
+                .first()
+                .ok_or_else(|| "the convection family has no fixture".to_string())?
+        } else {
+            let matrix = convection_diffusion_2d(side);
+            let rows = matrix.shape().rows;
+            let csc = matrix
+                .to_csc()
+                .map_err(|error| format!("construct convection CSC: {error}"))?;
+            // Byte-for-byte the RHS set `splu_fixtures` builds, so a split at another side
+            // differs from the pinned one in the matrix and in nothing else.
+            let right_hand_sides = (0..SPLU_RHS_COUNT)
+                .map(|rhs_index| {
+                    (0..rows)
+                        .map(|index| 1.0 + 0.125 * ((17 * index + 23 * rhs_index) % 29) as f64)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            built = SpluFixture {
+                matrix,
+                csc,
+                right_hand_sides,
+            };
+            &built
+        };
         let n = fixture.matrix.shape().rows;
+        println!("split_side={side} split_n={n}");
 
         let mut factor_ms = Vec::with_capacity(rounds);
         let mut solve_ms = Vec::with_capacity(rounds);
