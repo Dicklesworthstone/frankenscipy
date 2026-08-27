@@ -8004,6 +8004,8 @@ pub fn eigh_tridiagonal_subset(
     let shift_unit = 32.0 * f64::EPSILON * scale;
     let k = hi - lo + 1;
     let mut columns: Vec<Vec<f64>> = Vec::with_capacity(k);
+    // ONE scratch for the whole subset, same hoist as the full solve.
+    let mut scratch = InverseIterationScratch::new(n);
     for col in lo..=hi {
         let mut dst = vec![0.0_f64; n];
         // The ORIGINAL index `col` is passed through, which is what makes the
@@ -8016,6 +8018,7 @@ pub fn eigh_tridiagonal_subset(
             min_pivot,
             shift_unit,
             &mut dst,
+            &mut scratch,
         ) {
             // Inverse iteration failed for this eigenvalue; the full QR path is
             // the correct answer, exactly as in the unrestricted routine.
@@ -11829,6 +11832,24 @@ pub static EIGH_BACKTRANSFORM_COLBLOCK_HITS: std::sync::atomic::AtomicUsize =
 pub static EIGH_REDUCE_SUBSTAGE_TIMING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Accumulated nanoseconds: `[0]` gather, `[1]` rank-2 update.
+/// Split the tridiagonal SOLVE into eigenvalues and eigenvectors.
+///
+/// The solve is the one stage of `eigh` nothing had examined — 21.4% of the cell, 43.1 ms at
+/// n=768. Its exponent is already ~2.07 (measured across n=384..1024 against 3.04 and 2.98
+/// for the other two stages), so it is NOT an algorithmic gap: inverse iteration is
+/// O(n^2) for the vectors, the same class as LAPACK's MRRR. What is left is the CONSTANT,
+/// and 43.1 ms for n^2 = 0.59M units is 73 ns per unit, which is far too slow for a
+/// tridiagonal solve. So the question is which half carries it.
+///
+/// `[0]` eigenvalues (`eigh_tridiagonal`), `[1]` eigenvectors (inverse iteration).
+pub static EIGH_SOLVE_SUBSTAGE_TIMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Accumulated nanoseconds: `[0]` eigenvalues, `[1]` eigenvectors.
+pub static EIGH_SOLVE_SUBSTAGE_NANOS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
 pub static EIGH_REDUCE_SUBSTAGE_NANOS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -14143,6 +14164,44 @@ const EIGH_INVITER_PAR_MIN_DIM: usize = 192;
 /// deterministic start vector + shift, allocating its own scratch — so calling it from
 /// parallel column-chunks is byte-identical to the serial sweep. Returns false on a
 /// singular solve / normalization failure (⇒ the caller falls back to QR).
+/// Per-column scratch for [`compute_inverse_iteration_column`], allocated ONCE by the caller.
+///
+/// WHY IT IS A PARAMETER AND NOT FOUR LOCALS. Attribution put 70.4% of the tridiagonal solve
+/// in the eigenvector half — 28.6 ms at n=768, i.e. 37.2 µs per eigenvector, or ~149,000
+/// cycles for what is four O(n) tridiagonal solves. It allocated and zeroed FOUR length-n
+/// `Vec`s per column: 24 KiB per eigenvector, **18.9 MB of malloc and memset** across the 768
+/// columns of one solve, against ~20n of actual arithmetic per column.
+///
+/// Reuse is bit-identical. `rhs` is fully overwritten by the pattern loop before any read, and
+/// `solution`, `upper_factors` and `reduced_rhs` are fully written by
+/// `solve_shifted_tridiagonal_system` before it reads them, so no value survives from one
+/// column into the next and every column performs the identical arithmetic it did before.
+/// Hoist the inverse-iteration scratch out of the per-column loop.
+///
+/// A/B arm for the allocation hoist. Off restores a fresh four-`Vec` allocation per column,
+/// which is what the code did before — so both shapes live in ONE binary and can be
+/// alternated in a single window instead of compared across two builds.
+pub static EIGH_INVERSE_SCRATCH_HOIST: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+struct InverseIterationScratch {
+    rhs: Vec<f64>,
+    solution: Vec<f64>,
+    upper_factors: Vec<f64>,
+    reduced_rhs: Vec<f64>,
+}
+
+impl InverseIterationScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            rhs: vec![0.0_f64; n],
+            solution: vec![0.0_f64; n],
+            upper_factors: vec![0.0_f64; n],
+            reduced_rhs: vec![0.0_f64; n],
+        }
+    }
+}
+
 fn compute_inverse_iteration_column(
     diagonal: &[f64],
     offdiagonal: &[f64],
@@ -14151,17 +14210,20 @@ fn compute_inverse_iteration_column(
     min_pivot: f64,
     shift_unit: f64,
     dst: &mut [f64],
+    scratch: &mut InverseIterationScratch,
 ) -> bool {
     let n = diagonal.len();
-    let mut rhs = vec![0.0_f64; n];
-    let mut solution = vec![0.0_f64; n];
-    let mut upper_factors = vec![0.0_f64; n];
-    let mut reduced_rhs = vec![0.0_f64; n];
+    let InverseIterationScratch {
+        rhs,
+        solution,
+        upper_factors,
+        reduced_rhs,
+    } = scratch;
     for (row, value) in rhs.iter_mut().enumerate() {
         let pattern = ((row + 1) * (col + 3) + 5) % 17;
         *value = 0.5 + pattern as f64 / 19.0;
     }
-    if !normalize_tridiagonal_inverse_vector(&mut rhs) {
+    if !normalize_tridiagonal_inverse_vector(rhs) {
         return false;
     }
     let signed_shift = if col.is_multiple_of(2) {
@@ -14176,17 +14238,17 @@ fn compute_inverse_iteration_column(
             offdiagonal,
             shifted_lambda,
             min_pivot,
-            &rhs,
+            rhs.as_slice(),
             ShiftedTridiagonalWorkspace {
-                solution: &mut solution,
-                upper_factors: &mut upper_factors,
-                reduced_rhs: &mut reduced_rhs,
+                solution,
+                upper_factors,
+                reduced_rhs,
             },
         ) {
             return false;
         }
-        std::mem::swap(&mut rhs, &mut solution);
-        if !normalize_tridiagonal_inverse_vector(&mut rhs) {
+        std::mem::swap(rhs, solution);
+        if !normalize_tridiagonal_inverse_vector(rhs) {
             return false;
         }
     }
@@ -14275,7 +14337,16 @@ fn tridiagonal_inverse_iteration_eigenvectors(
                     let base_col = t * chunk;
                     scope.spawn(move || {
                         let cols_here = colblk.len() / n;
+                        // ONE scratch per THREAD, reused across that thread's columns. Each
+                        // thread owns its own, so the columns stay independent and the arm
+                        // remains byte-identical to the serial one.
+                        let hoist =
+                            EIGH_INVERSE_SCRATCH_HOIST.load(std::sync::atomic::Ordering::Relaxed);
+                        let mut scratch = InverseIterationScratch::new(n);
                         for local in 0..cols_here {
+                            if !hoist {
+                                scratch = InverseIterationScratch::new(n);
+                            }
                             let col = base_col + local;
                             let dst = &mut colblk[local * n..local * n + n];
                             if !compute_inverse_iteration_column(
@@ -14286,6 +14357,7 @@ fn tridiagonal_inverse_iteration_eigenvectors(
                                 min_pivot,
                                 shift_unit,
                                 dst,
+                                &mut scratch,
                             ) {
                                 return false;
                             }
@@ -14301,7 +14373,13 @@ fn tridiagonal_inverse_iteration_eigenvectors(
         // contiguous destination column.  Write it there directly instead of
         // allocating a temporary `Vec` and copying n values per eigenvector.
         let storage = eigenvectors.as_mut_slice();
+        // ONE scratch for all n columns, not four fresh `Vec`s per column.
+        let hoist = EIGH_INVERSE_SCRATCH_HOIST.load(std::sync::atomic::Ordering::Relaxed);
+        let mut scratch = InverseIterationScratch::new(n);
         for (col, &lambda) in eigenvalues.iter().enumerate() {
+            if !hoist {
+                scratch = InverseIterationScratch::new(n);
+            }
             let dst = &mut storage[col * n..(col + 1) * n];
             if !compute_inverse_iteration_column(
                 diagonal,
@@ -14311,6 +14389,7 @@ fn tridiagonal_inverse_iteration_eigenvectors(
                 min_pivot,
                 shift_unit,
                 dst,
+                &mut scratch,
             ) {
                 return None;
             }
@@ -14368,10 +14447,25 @@ fn symmetric_tridiagonal_inverse_iteration_eigen(
     diagonal: &[f64],
     offdiagonal: &[f64],
 ) -> Option<SymmetricJacobiEigen> {
+    let timing = EIGH_SOLVE_SUBSTAGE_TIMING.load(std::sync::atomic::Ordering::Relaxed);
+    let t_values = timing.then(std::time::Instant::now);
     let (eigenvalues, _) =
         eigh_tridiagonal(diagonal, offdiagonal, true, DecompOptions::default()).ok()?;
+    if let Some(at) = t_values {
+        EIGH_SOLVE_SUBSTAGE_NANOS[0].fetch_add(
+            u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let t_vectors = timing.then(std::time::Instant::now);
     let eigenvectors =
         tridiagonal_inverse_iteration_eigenvectors(diagonal, offdiagonal, &eigenvalues)?;
+    if let Some(at) = t_vectors {
+        EIGH_SOLVE_SUBSTAGE_NANOS[1].fetch_add(
+            u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     Some(SymmetricJacobiEigen {
         eigenvalues,
         eigenvectors,
