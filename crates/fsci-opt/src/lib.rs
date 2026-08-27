@@ -1,7 +1,6 @@
 // Index walks over parallel slices by a single counter; an iterator rewrite would
 // obscure the arithmetic without changing behaviour.
 #![allow(clippy::needless_range_loop)]
-
 #![forbid(unsafe_code)]
 
 pub mod audit;
@@ -4134,9 +4133,90 @@ fn nnls_chol_solve(lflat: &[f64], n: usize, p: usize, rhs: &[f64], s: &mut [f64]
     }
 }
 
+/// Column-block width for the blocked Gram accumulation. A `B x B` `f64` tile is
+/// `B²·8` bytes and must stay resident in L1 across the whole row sweep; 64 gives 32 KB,
+/// which fits alongside the two streamed `A` rows on every core this runs on.
+const NNLS_GRAM_BLOCK: usize = 64;
+
+/// Use the blocked Gram accumulation instead of the per-row rank-1 sweep.
+///
+/// **MEASURED AND REJECTED — SHIPS OFF.** Bit-identical either way (see
+/// `nnls_gram_blocked`), so this is purely a cost knob, and it costs. Both arms in one
+/// binary, alternated, `n = m = 256`:
+///
+/// ```text
+/// blocked ON   fsci 3.084 / 3.078 ms   scipy/fsci 0.451x / 0.453x
+/// blocked OFF  fsci 2.925 / 2.940 ms   scipy/fsci 0.478x / 0.473x
+/// 1.05x SLOWER, ranges disjoint
+/// ```
+///
+/// The premise was that the rank-1 sweep touches the whole 512 KB upper triangle once per
+/// observation and so streams ~64 MB over 256 rows. The premise is arithmetically right and
+/// operationally irrelevant: at `n = 256` the Gram is 512 KB and FITS IN L2, so those
+/// re-reads are L2 hits, not memory traffic, and there was no bandwidth problem to solve.
+/// Blocking then only adds loop nesting and the per-row triangle test, and shortens the
+/// vectorized inner run from up to `n` down to the 64-wide block.
+///
+/// Kept, defaulted off, so the next attempt starts from a measured dead end. It would
+/// become the right shape again at an `n` where the Gram genuinely leaves cache — around
+/// `n >= 512` (2 MB) — which is not the size this op is used at here.
+pub static NNLS_GRAM_BLOCKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Accumulate `AᵀA` (upper triangle) and `Aᵀb` with the GRAM TILE held in cache instead of
+/// the row.
+///
+/// WHY. The rank-1 sweep visits the entire upper triangle of the Gram once per observation:
+/// at `n = 256` that is 256 KB touched per row and 64 MB streamed over `m = 256` rows, for
+/// a Gram that is only 512 KB and an `A` that is only 512 KB. The arithmetic is `O(m·n²)`
+/// either way; the traffic is not. SciPy gets this matrix from one OpenBLAS `dgemm`, which
+/// is exactly the dependency this project does not take, so the answer has to be blocking.
+///
+/// Holding a `B x B` tile of the Gram in L1 and streaming `A`'s two column panels through
+/// it inverts the residency: each tile pair reads `m·2B` elements of `A` and writes its
+/// tile once, so total traffic falls from `O(m·n²)` to `O(m·n²/B)` — about 2.6 MB here
+/// against 64 MB.
+///
+/// BIT-IDENTICAL to the rank-1 sweep. Every `gram[j1][j2]` still accumulates its `m`
+/// products in ASCENDING `i`, because the row loop stays innermost within a tile; only the
+/// ORDER IN WHICH INDEPENDENT ENTRIES are visited changes, and separate entries never
+/// interact. `Aᵀb` is accumulated in its own single pass over the rows, again in ascending
+/// `i`, so it is unchanged too.
+fn nnls_gram_blocked(a_flat: &[f64], b: &[f64], g: &mut [f64], ab: &mut [f64], n: usize) {
+    for (ai, &bi) in a_flat.chunks_exact(n).zip(b.iter()) {
+        for (abj, &v) in ab.iter_mut().zip(ai.iter()) {
+            *abj += v * bi;
+        }
+    }
+    let mut j1_block = 0usize;
+    while j1_block < n {
+        let j1_end = (j1_block + NNLS_GRAM_BLOCK).min(n);
+        let mut j2_block = j1_block;
+        while j2_block < n {
+            let j2_end = (j2_block + NNLS_GRAM_BLOCK).min(n);
+            for ai in a_flat.chunks_exact(n) {
+                for j1 in j1_block..j1_end {
+                    let v1 = ai[j1];
+                    // Upper triangle only: on the diagonal tile the row starts at `j1`.
+                    let lo = j2_block.max(j1);
+                    if lo >= j2_end {
+                        continue;
+                    }
+                    let grow = &mut g[j1 * n + lo..j1 * n + j2_end];
+                    for (gg, &v2) in grow.iter_mut().zip(ai[lo..j2_end].iter()) {
+                        *gg += v1 * v2;
+                    }
+                }
+            }
+            j2_block += NNLS_GRAM_BLOCK;
+        }
+        j1_block += NNLS_GRAM_BLOCK;
+    }
+}
+
 /// Accumulate one observation's rank-1 contribution into the UPPER triangle of a partial Gram
-/// matrix `g` (row-major n×n) and `Aᵀb` accumulator `ab`. Shared by the serial and parallel-
-/// reduction Gram precompute in `nnls`.
+/// matrix `g` (row-major n×n) and `Aᵀb` accumulator `ab`. Used by the parallel-reduction Gram
+/// precompute in `nnls`, and as the A/B reference arm for `nnls_gram_blocked`.
 #[inline]
 fn nnls_gram_accumulate(g: &mut [f64], ab: &mut [f64], ai: &[f64], bi: f64, n: usize) {
     for (j1, &v1) in ai.iter().enumerate() {
@@ -4227,8 +4307,12 @@ pub fn nnls(a: &[Vec<f64>], b: &[f64]) -> Result<(Vec<f64>, f64), OptError> {
             .min(16)
     };
     if nthreads <= 1 {
-        for (ai, &bi) in a_flat.chunks(n).zip(b.iter()) {
-            nnls_gram_accumulate(&mut gram, &mut atb, ai, bi, n);
+        if NNLS_GRAM_BLOCKED.load(std::sync::atomic::Ordering::Relaxed) {
+            nnls_gram_blocked(&a_flat, b, &mut gram, &mut atb, n);
+        } else {
+            for (ai, &bi) in a_flat.chunks(n).zip(b.iter()) {
+                nnls_gram_accumulate(&mut gram, &mut atb, ai, bi, n);
+            }
         }
     } else {
         let chunk = m.div_ceil(nthreads);
@@ -6902,6 +6986,69 @@ mod tests {
                 "shape {rows}x{cols}: fast cost {fast_cost}, reference cost {ref_cost}"
             );
         }
+    }
+
+    /// The blocked Gram accumulation must produce EXACTLY the solution the rank-1 sweep
+    /// produces.
+    ///
+    /// Bit equality is the right assertion: blocking changes only the ORDER IN WHICH
+    /// INDEPENDENT Gram entries are visited, never the order of the `m` products summed
+    /// into any one entry, and separate entries never interact. Any difference means a tile
+    /// boundary dropped or double-counted a term. A tolerance would hide exactly that,
+    /// because NNLS is stable enough that a slightly wrong Gram still yields a
+    /// plausible-looking solution.
+    ///
+    /// `n` deliberately straddles `NNLS_GRAM_BLOCK` (64) — below it there is a single tile
+    /// and the test proves nothing about tiling, so sizes just above and well above are
+    /// what matter, including ones that leave a RAGGED final tile in both index directions.
+    /// The diagonal tile is the delicate one, since it is the only place the upper-triangle
+    /// bound `j2 >= j1` cuts inside a block rather than between blocks.
+    #[test]
+    fn nnls_gram_blocked_matches_rank1_sweep_bits() {
+        use std::sync::atomic::Ordering;
+        let was = crate::NNLS_GRAM_BLOCKED.load(Ordering::Relaxed);
+        let value = |i: usize, salt: usize| -> f64 {
+            let k = (i * 2_654_435_761usize).wrapping_add(salt * 40_503) % 100_003;
+            k as f64 / 100_003.0
+        };
+        let mut compared = 0usize;
+        for &(m, n) in &[
+            (12usize, 5usize),
+            (40, 64),
+            (40, 65),
+            (90, 100),
+            (70, 128),
+            (70, 129),
+        ] {
+            let a: Vec<Vec<f64>> = (0..m)
+                .map(|i| (0..n).map(|j| value(i * n + j, 7)).collect())
+                .collect();
+            let b: Vec<f64> = (0..m).map(|i| value(i, 29)).collect();
+
+            crate::NNLS_GRAM_BLOCKED.store(false, Ordering::Relaxed);
+            let (x_ref, r_ref) = nnls(&a, &b).expect("rank-1 sweep");
+            crate::NNLS_GRAM_BLOCKED.store(true, Ordering::Relaxed);
+            let (x_new, r_new) = nnls(&a, &b).expect("blocked");
+
+            assert_eq!(x_ref.len(), x_new.len(), "m={m} n={n}: length");
+            for (idx, (want, got)) in x_ref.iter().zip(x_new.iter()).enumerate() {
+                assert_eq!(
+                    want.to_bits(),
+                    got.to_bits(),
+                    "m={m} n={n}: x[{idx}] differs ({want} vs {got})"
+                );
+            }
+            assert_eq!(
+                r_ref.to_bits(),
+                r_new.to_bits(),
+                "m={m} n={n}: residual norm differs ({r_ref} vs {r_new})"
+            );
+            compared += 1;
+        }
+        // Guards a silently-empty comparison: an early return in `nnls` would skip every
+        // assertion above while the test still reported success.
+        assert_eq!(compared, 6, "expected 6 compared cases, ran {compared}");
+        crate::NNLS_GRAM_BLOCKED.store(was, Ordering::Relaxed);
     }
 
     #[test]
