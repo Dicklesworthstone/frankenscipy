@@ -11,7 +11,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_interpolate::{interp1d_linear, lagrange, polyfit, polyval, splev, splrep};
+use fsci_interpolate::{
+    NearestNDInterpolator, interp1d_linear, lagrange, polyfit, polyval, splev, splrep,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-016";
@@ -724,4 +726,36 @@ fn diff_spline() {
     emit_log(&log);
     assert_all_cases_compared("spline", log.case_count, cases.len());
     assert!(all_pass, "spline diff failed: max_diff={max_diff}");
+}
+
+/// Differential coverage for scipy.interpolate.NearestNDInterpolator.
+///
+/// The expected values are the SciPy nearest-site result for this fixture. Queries include an
+/// exterior point because nearest interpolation extrapolates, unlike linear interpolation. The
+/// first-value negative control ensures a stub that ignores query geometry cannot pass.
+#[test]
+fn diff_nearest_nd_interpolator() {
+    let points = vec![
+        vec![0.0, 0.0],
+        vec![10.0, 0.0],
+        vec![0.0, 10.0],
+        vec![10.0, 10.0],
+    ];
+    let values = vec![1.0, 2.0, 3.0, 4.0];
+    let queries = vec![
+        vec![0.1, 0.2],
+        vec![9.8, 0.3],
+        vec![0.2, 9.7],
+        vec![9.9, 9.9],
+        vec![25.0, -4.0],
+    ];
+    // scipy.interpolate.NearestNDInterpolator(points, values)(queries)
+    let scipy_expected = [1.0, 2.0, 3.0, 4.0, 2.0];
+    let interpolator = NearestNDInterpolator::new(&points, &values).expect("valid fixture");
+    let observed = interpolator.eval_many(&queries).expect("queries succeed");
+    assert_eq!(observed, scipy_expected);
+
+    // A naive implementation that always returns values[0] fails this negative control.
+    let naive = vec![values[0]; queries.len()];
+    assert_ne!(naive, scipy_expected);
 }
