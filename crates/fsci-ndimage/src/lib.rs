@@ -876,39 +876,6 @@ fn spline_coefficients_for_line(line: &[f64], order: usize) -> Result<Vec<f64>, 
     Ok(spline.coeffs().to_vec())
 }
 
-fn cubic_constant_wrap_coefficients(line: &[f64]) -> Vec<f64> {
-    let n = line.len();
-    if n <= 1 {
-        return line.to_vec();
-    }
-    let mut diag: Vec<f64> = vec![2.0 / 3.0; n];
-    let mut rhs: Vec<f64> = line.to_vec();
-    let mut lower: Vec<f64> = vec![0.0; n];
-    let mut upper: Vec<f64> = vec![0.0; n];
-    if n >= 2 {
-        upper[0] = 1.0 / 3.0;
-        lower[n - 1] = 1.0 / 3.0;
-    }
-    for i in 1..n.saturating_sub(1) {
-        lower[i] = 1.0 / 6.0;
-        diag[i] = 2.0 / 3.0;
-        upper[i] = 1.0 / 6.0;
-    }
-    for i in 1..n {
-        if diag[i - 1].abs() < 1e-18 {
-            continue;
-        }
-        let w = lower[i] / diag[i - 1];
-        diag[i] -= w * upper[i - 1];
-        rhs[i] -= w * rhs[i - 1];
-    }
-    rhs[n - 1] /= diag[n - 1];
-    for i in (0..n - 1).rev() {
-        rhs[i] = (rhs[i] - upper[i] * rhs[i + 1]) / diag[i];
-    }
-    rhs
-}
-
 /// Cardinal B-spline `beta^order(x)` for `order` in 1..=5.
 ///
 /// Evaluated by the order-raising recurrence
@@ -1344,9 +1311,10 @@ fn prefilter_spline_coefficients(
     let bspline_reflect = matches!(order, 2..=5);
     let exact_reflect =
         bspline_reflect && mode == BoundaryMode::Reflect && input.shape.iter().all(|&s| s > order);
-    let exact_mirror =
-        bspline_reflect && mode == BoundaryMode::Mirror && input.shape.iter().all(|&s| s > order);
-    if mode == BoundaryMode::Mirror && !exact_mirror {
+    let exact_mirror = bspline_reflect
+        && spline_prefilter_is_mirror_class(mode)
+        && input.shape.iter().all(|&s| s > order);
+    if spline_prefilter_is_mirror_class(mode) && !exact_mirror {
         // The exact mirror prefilter needs every axis longer than `order`; a
         // too-short axis would fall through to the clamped de Boor solver,
         // which does not carry mirror symmetry. Fail closed (tracked separately)
@@ -1465,16 +1433,16 @@ fn prefilter_spline_coefficients(
                                         line.push(chunk[base + i * stride]);
                                     }
                                     let coeffs = match (order, mode) {
-                                        (3, BoundaryMode::Constant | BoundaryMode::Wrap) => {
-                                            cubic_constant_wrap_coefficients(&line)
-                                        }
                                         (_, BoundaryMode::Nearest) if bspline_reflect => {
                                             bspline_reflect_coefficients(&line, order)
                                         }
                                         (_, BoundaryMode::Reflect) if exact_reflect => {
                                             bspline_reflect_coefficients(&line, order)
                                         }
-                                        (_, BoundaryMode::Mirror) if exact_mirror => {
+                                        (_, current_mode)
+                                            if spline_prefilter_is_mirror_class(current_mode)
+                                                && exact_mirror =>
+                                        {
                                             bspline_mirror_coefficients(&line, order)
                                         }
                                         _ => spline_coefficients_for_line(&line, order)?,
@@ -1508,16 +1476,15 @@ fn prefilter_spline_coefficients(
                 line.push(current.data[base + i * stride]);
             }
             let coeffs = match (order, mode) {
-                (3, BoundaryMode::Constant | BoundaryMode::Wrap) => {
-                    cubic_constant_wrap_coefficients(&line)
-                }
                 (_, BoundaryMode::Nearest) if bspline_reflect => {
                     bspline_reflect_coefficients(&line, order)
                 }
                 (_, BoundaryMode::Reflect) if exact_reflect => {
                     bspline_reflect_coefficients(&line, order)
                 }
-                (_, BoundaryMode::Mirror) if exact_mirror => {
+                (_, current_mode)
+                    if spline_prefilter_is_mirror_class(current_mode) && exact_mirror =>
+                {
                     bspline_mirror_coefficients(&line, order)
                 }
                 _ => spline_coefficients_for_line(&line, order)?,
@@ -13423,7 +13390,7 @@ where
 /// # Arguments
 /// * `input` - Input array
 /// * `order` - Spline order (0-5)
-/// * `mode` - Boundary handling mode (only Reflect and Nearest are supported)
+/// * `mode` - Boundary handling mode (Reflect, Nearest, Mirror, Wrap, or Constant)
 pub fn spline_filter(
     input: &NdArray,
     order: usize,
@@ -13434,9 +13401,16 @@ pub fn spline_filter(
             "spline order must be in 0..=5, got {order}"
         )));
     }
-    if !matches!(mode, BoundaryMode::Reflect | BoundaryMode::Nearest) {
+    if !matches!(
+        mode,
+        BoundaryMode::Reflect
+            | BoundaryMode::Nearest
+            | BoundaryMode::Mirror
+            | BoundaryMode::Wrap
+            | BoundaryMode::Constant
+    ) {
         return Err(NdimageError::InvalidArgument(
-            "spline_filter only supports Reflect and Nearest modes".to_string(),
+            "spline_filter supports Reflect, Nearest, Mirror, Wrap, and Constant modes".to_string(),
         ));
     }
 
@@ -13461,7 +13435,7 @@ pub static NDIMAGE_SPLINE_FILTER1D_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// * `input` - Input array
 /// * `order` - Spline order (0-5)
 /// * `axis` - Axis along which to filter
-/// * `mode` - Boundary handling mode (only Reflect and Nearest are supported)
+/// * `mode` - Boundary handling mode (Reflect, Nearest, Mirror, Wrap, or Constant)
 /// Does this boundary mode use the reflect-class spline PREFILTER, as SciPy defines it?
 ///
 /// SciPy's spline prefilter does NOT give each `mode` its own boundary treatment. Measured
@@ -13488,6 +13462,17 @@ fn spline_prefilter_is_reflect_class(mode: BoundaryMode) -> bool {
     matches!(mode, BoundaryMode::Reflect | BoundaryMode::Nearest)
 }
 
+/// Does this mode use SciPy's whole-sample-symmetric spline prefilter class?
+///
+/// `mirror`, `wrap`, and `constant` share the prefilter, but keep their own
+/// interpolation-coordinate semantics after the coefficients are computed.
+fn spline_prefilter_is_mirror_class(mode: BoundaryMode) -> bool {
+    matches!(
+        mode,
+        BoundaryMode::Mirror | BoundaryMode::Wrap | BoundaryMode::Constant
+    )
+}
+
 pub fn spline_filter1d(
     input: &NdArray,
     order: usize,
@@ -13506,9 +13491,17 @@ pub fn spline_filter1d(
             input.ndim()
         )));
     }
-    if !matches!(mode, BoundaryMode::Reflect | BoundaryMode::Nearest) {
+    if !matches!(
+        mode,
+        BoundaryMode::Reflect
+            | BoundaryMode::Nearest
+            | BoundaryMode::Mirror
+            | BoundaryMode::Wrap
+            | BoundaryMode::Constant
+    ) {
         return Err(NdimageError::InvalidArgument(
-            "spline_filter1d only supports Reflect and Nearest modes".to_string(),
+            "spline_filter1d supports Reflect, Nearest, Mirror, Wrap, and Constant modes"
+                .to_string(),
         ));
     }
 
@@ -13530,6 +13523,13 @@ pub fn spline_filter1d(
     // independent outer blocks / rows across cores. Other kernels keep the serial per-line walk.
     let use_reflect =
         spline_prefilter_is_reflect_class(mode) && (2..=5).contains(&order) && axis_len > order;
+    let use_mirror =
+        spline_prefilter_is_mirror_class(mode) && (2..=5).contains(&order) && axis_len > order;
+    if spline_prefilter_is_mirror_class(mode) && (2..=5).contains(&order) && !use_mirror {
+        return Err(NdimageError::InvalidArgument(
+            "mirror-class spline filtering requires axis length > spline order".to_string(),
+        ));
+    }
     if use_reflect
         && !NDIMAGE_SPLINE_FILTER1D_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
     {
@@ -13598,6 +13598,8 @@ pub fn spline_filter1d(
                 && axis_len > order
             {
                 bspline_reflect_coefficients(&line, order)
+            } else if use_mirror {
+                bspline_mirror_coefficients(&line, order)
             } else {
                 spline_coefficients_for_line(&line, order)?
             };
@@ -23611,18 +23613,56 @@ mod van22_knob_read_is_per_transform {
             );
         }
 
-        // MUST-MISS ARM 1: modes this crate does not implement are REFUSED, not silently
-        // approximated. SciPy accepts all eight; we accept two, and say so.
-        for mode in [
-            BoundaryMode::Mirror,
-            BoundaryMode::Wrap,
-            BoundaryMode::Constant,
-        ] {
-            assert!(
-                spline_filter1d(&ramp, 3, 0, mode).is_err(),
-                "spline_filter1d must refuse {mode:?} rather than approximate it"
+        // SciPy's mirror class is a DIFFERENT prefilter from Reflect. The hardcoded
+        // SciPy values and the required separation below are the negative case: a
+        // naive implementation that simply routes every newly accepted mode through
+        // the Reflect kernel passes an acceptance-only test but fails this one.
+        let scipy_mirror_class = [
+            -1.3550591935007921,
+            2.710118387001584,
+            3.6105040157728943,
+            3.5859606896991232,
+            2.0834218251103462,
+            0.11013871266578582,
+            -1.3380747741866461,
+            -1.4462035193637817,
+            -0.06125817559621497,
+            2.328436740046853,
+            4.550161424127101,
+            6.296676340382951,
+        ];
+        let mirror = spline_filter1d(&ramp, 3, 0, BoundaryMode::Mirror).unwrap();
+        close(
+            "spline_filter1d/mirror/order3",
+            &mirror.data,
+            &scipy_mirror_class,
+            1e-12,
+        );
+        for mode in [BoundaryMode::Wrap, BoundaryMode::Constant] {
+            let got = spline_filter1d(&ramp, 3, 0, mode).unwrap();
+            close(
+                &format!("spline_filter1d/{mode:?}/order3"),
+                &got.data,
+                &scipy_mirror_class,
+                1e-12,
+            );
+            assert_eq!(
+                got.data.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                mirror.data.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                "SciPy puts {mode:?} in the mirror prefilter class"
             );
         }
+        let reflect_order3 = spline_filter1d(&ramp, 3, 0, BoundaryMode::Reflect).unwrap();
+        let class_separation = mirror
+            .data
+            .iter()
+            .zip(reflect_order3.data.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            class_separation > 0.8,
+            "fixture must distinguish SciPy mirror-class from reflect-class; got {class_separation:.3e}"
+        );
 
         // RECONCILED (frankenscipy-047br). This was a MUST-MISS arm asserting that our
         // `Nearest` differed from SciPy's, with an instruction to rewrite it as a parity

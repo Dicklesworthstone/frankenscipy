@@ -59,7 +59,8 @@ def main():
 
     for order in (2, 3, 4, 5):
         for bname, mode in (("reflect", "reflect"), ("nearest", "nearest"),
-                            ("wrap", "wrap"), ("mirror", "mirror")):
+                            ("wrap", "wrap"), ("mirror", "mirror"),
+                            ("constant", "constant")):
             dump(f"spf1d_o{order}_{bname}",
                  spline_filter1d(RAMP, order=order, axis=0, mode=mode))
 

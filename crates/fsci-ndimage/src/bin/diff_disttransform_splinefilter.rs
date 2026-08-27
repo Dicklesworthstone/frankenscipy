@@ -113,6 +113,7 @@ fn main() {
             ("nearest", BoundaryMode::Nearest),
             ("wrap", BoundaryMode::Wrap),
             ("mirror", BoundaryMode::Mirror),
+            ("constant", BoundaryMode::Constant),
         ] {
             if let Ok(out) = spline_filter1d(&r, order, 0, mode) {
                 dump(&format!("spf1d_o{order}_{bname}"), &out.data);
