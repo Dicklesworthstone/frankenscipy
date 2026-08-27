@@ -16,6 +16,7 @@ import struct
 import sys
 import time
 import hashlib
+import os
 
 import numpy as np
 import scipy
@@ -41,7 +42,8 @@ def main():
     with open(_interpnd.__file__, "rb") as fh:
         engine_sha256 = hashlib.sha256(fh.read()).hexdigest()
     print(f"READY scipy={scipy.__version__} numpy={np.__version__} "
-          f"engine_file={_interpnd.__file__} engine_sha256={engine_sha256} "
+          f"engine_file={_interpnd.__file__} scipy_engine_sha256={engine_sha256} "
+          f"actual_observed_scipy_threads={len(os.listdir('/proc/self/task'))} "
           f"npoints={len(pts)} nqueries={len(xi)} "
           f"fsci_loaded={'fsci' in sys.modules}", flush=True)
 

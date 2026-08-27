@@ -17,9 +17,10 @@
 //!
 //! Usage: `perf_griddata_live [rounds] [npoints] [nqueries] [method]`
 use fsci_interpolate::{GriddataMethod, griddata};
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 fn lcg(state: &mut u64) -> f64 {
     *state = state
@@ -56,6 +57,168 @@ fn bootstrap_ci(samples: &[f64], iters: usize) -> (f64, f64) {
     }
     medians.sort_by(f64::total_cmp);
     (medians[iters / 40], medians[iters - 1 - iters / 40])
+}
+
+fn coefficient_of_variation(samples: &[f64]) -> f64 {
+    if samples.is_empty() {
+        return f64::NAN;
+    }
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    if mean == 0.0 {
+        return f64::NAN;
+    }
+    let variance = samples
+        .iter()
+        .map(|sample| (sample - mean).powi(2))
+        .sum::<f64>()
+        / samples.len() as f64;
+    variance.sqrt() / mean.abs()
+}
+
+fn proc_stat_totals() -> Option<(u64, u64)> {
+    let line = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .next()?
+        .to_owned();
+    let mut fields = line.split_whitespace();
+    if fields.next()? != "cpu" {
+        return None;
+    }
+    let values: Vec<u64> = fields.filter_map(|field| field.parse().ok()).collect();
+    let total = values.iter().sum();
+    let idle = values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0);
+    Some((total, idle))
+}
+
+/// This is an observation, not an admission gate: the A/A controls decide whether a busy host
+/// contaminated this particular window.
+fn host_mean_busy() -> Option<f64> {
+    let (total_before, idle_before) = proc_stat_totals()?;
+    std::thread::sleep(Duration::from_millis(100));
+    let (total_after, idle_after) = proc_stat_totals()?;
+    let total_delta = total_after.checked_sub(total_before)?;
+    if total_delta == 0 {
+        return None;
+    }
+    let idle_delta = idle_after.checked_sub(idle_before)?;
+    Some(1.0 - idle_delta as f64 / total_delta as f64)
+}
+
+fn physical_cores() -> usize {
+    let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") else {
+        return std::thread::available_parallelism().map_or(0, usize::from);
+    };
+    let mut cores = BTreeSet::new();
+    for processor in cpuinfo.split("\n\n") {
+        let physical = processor
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("physical id")
+                    .and_then(|field| field.split_once(':'))
+            })
+            .and_then(|(_, value)| value.trim().parse::<u32>().ok());
+        let core = processor
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("core id")
+                    .and_then(|field| field.split_once(':'))
+            })
+            .and_then(|(_, value)| value.trim().parse::<u32>().ok());
+        if let (Some(physical), Some(core)) = (physical, core) {
+            cores.insert((physical, core));
+        }
+    }
+    if cores.is_empty() {
+        std::thread::available_parallelism().map_or(0, usize::from)
+    } else {
+        cores.len()
+    }
+}
+
+fn sysfs_count(prefix: &str, path: &str) -> usize {
+    std::fs::read_dir(path)
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| {
+                    entry.file_name().to_str().is_some_and(|name| {
+                        name.strip_prefix(prefix).is_some_and(|suffix| {
+                            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                    })
+                })
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+fn mem_total_bytes() -> u64 {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|meminfo| {
+            meminfo.lines().find_map(|line| {
+                line.strip_prefix("MemTotal:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+                    .map(|kib| kib * 1024)
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn status_value(name: &str) -> Option<String> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|value| value.trim_start_matches(':').split_whitespace().next())
+                .map(str::to_owned)
+        })
+}
+
+fn task_count() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .map(|entries| entries.flatten().count())
+        .unwrap_or(0)
+}
+
+fn runtime_isa() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            "avx2+fma"
+        } else if std::is_x86_feature_detected!("sse4.2") {
+            "sse4.2"
+        } else {
+            "x86_64-baseline"
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "aarch64-neon"
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        "unknown"
+    }
+}
+
+fn decision(nulls_ok: bool, lo: f64, hi: f64, null_edge: f64) -> &'static str {
+    let margin = 2.0 * null_edge;
+    if !nulls_ok {
+        "VOID(null gate failed)"
+    } else if lo > 1.0 + margin {
+        "fsci FASTER"
+    } else if hi < 1.0 - margin {
+        "fsci SLOWER"
+    } else {
+        "INDISTINGUISHABLE(null margin)"
+    }
 }
 
 struct ScipyArm {
@@ -200,7 +363,27 @@ fn main() {
         "fixture: path={fixture} npoints={np} nqueries={nq} method={method_name} rounds={rounds}"
     );
     println!("FSCI_KEECK_CUBIC_LIVE_V1");
-    println!("elf_sha256={}", elf_sha256());
+    let candidate_engine_sha = elf_sha256();
+    println!("elf_sha256={candidate_engine_sha}");
+    println!("frankenscipy_engine_sha256={candidate_engine_sha}");
+    println!(
+        "host_identity={} physical_cores={} logical_threads={} ram_bytes={} numa_count={} \
+         requested_threads=1 actual_observed_worker_threads={} runtime_isa={} affinity={} \
+         scaling_governor={}",
+        std::fs::read_to_string("/etc/hostname")
+            .map(|hostname| hostname.trim().to_owned())
+            .unwrap_or_else(|_| "unknown".to_string()),
+        physical_cores(),
+        sysfs_count("cpu", "/sys/devices/system/cpu"),
+        mem_total_bytes(),
+        sysfs_count("node", "/sys/devices/system/node"),
+        task_count(),
+        runtime_isa(),
+        status_value("Cpus_allowed_list").unwrap_or_else(|| "unknown".to_string()),
+        std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+            .map(|governor| governor.trim().to_owned())
+            .unwrap_or_else(|_| "unknown".to_string()),
+    );
 
     let script = std::env::var("FSCI_GRIDDATA_ARM")
         .unwrap_or_else(|_| "crates/fsci-interpolate/python/griddata_live_arm.py".to_string());
@@ -226,6 +409,12 @@ fn main() {
     assert!(
         nan_mismatch == 0 && worst <= 2e-6,
         "fsci and live SciPy disagree; no timing is admissible"
+    );
+
+    let pre_busy = host_mean_busy();
+    println!(
+        "host-wide quiescence pre=NOT_CERTIFIED (host_mean_busy={:.6})",
+        pre_busy.unwrap_or(f64::NAN)
     );
 
     // Interleaved quartet, two samples per arm per round for the A/A nulls.
@@ -270,6 +459,11 @@ fn main() {
         fnull.push(f1 / f2);
         snull.push(s1 / s2);
     }
+    let post_busy = host_mean_busy();
+    println!(
+        "host-wide quiescence post=NOT_CERTIFIED (host_mean_busy={:.6})",
+        post_busy.unwrap_or(f64::NAN)
+    );
 
     let fm = median(fs.clone());
     let sm = median(sc.clone());
@@ -296,17 +490,47 @@ fn main() {
         && shi >= 1.0;
     println!("null_gate: medians_within_2pct_and_ci_span_unity={nulls_ok}");
     println!("competitive_ratio: scipy/fsci median={rm:.6} ci95=[{lo:.6},{hi:.6}]");
+    let null_edge = [
+        (fnm - 1.0).abs(),
+        (snm - 1.0).abs(),
+        (flo - 1.0).abs(),
+        (fhi - 1.0).abs(),
+        (slo - 1.0).abs(),
+        (shi - 1.0).abs(),
+    ]
+    .into_iter()
+    .fold(0.0_f64, f64::max);
+    println!(
+        "decision_gate: 2x A/A-null margin={:.6} (null_edge={null_edge:.6})",
+        2.0 * null_edge
+    );
+    println!(
+        "ratio_cv={:.6}; CV is provenance only; decisions use bootstrap median CI plus the null margin",
+        coefficient_of_variation(&ratios)
+    );
     println!(
         "GRIDDATA_LIVE verdict={}",
-        if !nulls_ok {
-            "VOID(null gate failed)"
-        } else if lo > 1.0 {
-            "fsci FASTER"
-        } else if hi < 1.0 {
-            "fsci SLOWER"
-        } else {
-            "INDISTINGUISHABLE"
-        }
+        decision(nulls_ok, lo, hi, null_edge)
     );
     arm.quit();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decision;
+
+    #[test]
+    fn null_margin_rejects_a_naively_positive_ratio() {
+        // A naive `lo > 1.0` decision would call this faster. The 1% null edge
+        // demands a 2% separation before a timing claim is admissible.
+        assert_eq!(
+            decision(true, 1.011, 1.030, 0.010),
+            "INDISTINGUISHABLE(null margin)"
+        );
+    }
+
+    #[test]
+    fn null_margin_allows_a_separated_loss() {
+        assert_eq!(decision(true, 0.80, 0.95, 0.010), "fsci SLOWER");
+    }
 }
