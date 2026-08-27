@@ -793,6 +793,26 @@ for raw_line in sys.stdin.buffer:
         );
         fsci_linalg::EIGH_BACKTRANSFORM_BLOCKED_ENABLE
             .store(blocked, std::sync::atomic::Ordering::Relaxed);
+        // `FSCI_EIGH_DSYMV=double_read|scalar|simd` selects the symmetric-matvec arm. The
+        // gather is 74.6% of the reduction, and `double_read` reads the matrix TWICE but has
+        // no `p_col` reduction chain — so it separates "bound by traffic" from "bound by the
+        // serial lane reduction" using arms that already exist.
+        {
+            use fsci_linalg::{EIGH_DSYMV_FORCE_DOUBLE_READ, EIGH_DSYMV_FORCE_SCALAR};
+            let arm = std::env::var("FSCI_EIGH_DSYMV").unwrap_or_default();
+            EIGH_DSYMV_FORCE_DOUBLE_READ
+                .store(arm == "double_read", std::sync::atomic::Ordering::Relaxed);
+            EIGH_DSYMV_FORCE_SCALAR.store(arm == "scalar", std::sync::atomic::Ordering::Relaxed);
+            println!(
+                "dsymv_arm={}",
+                if arm.is_empty() {
+                    "simd(default)"
+                } else {
+                    &arm
+                }
+            );
+        }
+
         // `FSCI_EIGH_SLICED_BACKTRANSFORM=0` restores the per-element indexed form of the
         // unblocked back-transform. Both arms in ONE binary, alternated in one window.
         let sliced = !matches!(
@@ -1188,7 +1208,14 @@ for raw_line in sys.stdin.buffer:
             // are structural enough to survive that; the absolute nanoseconds here are not a
             // timing claim and must not be quoted as one.
             {
-                use fsci_linalg::{EIGH_NATIVE_STAGE_NANOS, EIGH_NATIVE_STAGE_TIMING};
+                use fsci_linalg::{
+                    EIGH_NATIVE_STAGE_NANOS, EIGH_NATIVE_STAGE_TIMING, EIGH_REDUCE_SUBSTAGE_NANOS,
+                    EIGH_REDUCE_SUBSTAGE_TIMING,
+                };
+                for slot in &EIGH_REDUCE_SUBSTAGE_NANOS {
+                    slot.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                EIGH_REDUCE_SUBSTAGE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
                 PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE
                     .store(min_dim_override, std::sync::atomic::Ordering::Relaxed);
                 for slot in &EIGH_NATIVE_STAGE_NANOS {
@@ -1197,6 +1224,21 @@ for raw_line in sys.stdin.buffer:
                 EIGH_NATIVE_STAGE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
                 black_box(eigh(black_box(&a), DecompOptions::default()).expect("staged fsci eigh"));
                 EIGH_NATIVE_STAGE_TIMING.store(false, std::sync::atomic::Ordering::Relaxed);
+                EIGH_REDUCE_SUBSTAGE_TIMING.store(false, std::sync::atomic::Ordering::Relaxed);
+                let sub: Vec<u64> = EIGH_REDUCE_SUBSTAGE_NANOS
+                    .iter()
+                    .map(|slot| slot.load(std::sync::atomic::Ordering::Relaxed))
+                    .collect();
+                let sub_total = sub.iter().sum::<u64>();
+                println!(
+                    "n={n} impl={impl_label} REDUCE_SUBSTAGES gather_ms={:.3} rank2_ms={:.3} \
+                     total_ms={:.3} gather_share={:.4} instrumented={}",
+                    sub[0] as f64 / 1.0e6,
+                    sub[1] as f64 / 1.0e6,
+                    sub_total as f64 / 1.0e6,
+                    sub[0] as f64 / sub_total.max(1) as f64,
+                    sub_total > 0,
+                );
                 PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
                 let stage: Vec<u64> = EIGH_NATIVE_STAGE_NANOS
                     .iter()

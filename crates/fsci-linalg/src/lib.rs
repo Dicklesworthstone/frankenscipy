@@ -11813,6 +11813,41 @@ pub static EIGH_BACKTRANSFORM_COLBLOCK_ENABLE: std::sync::atomic::AtomicBool =
 /// Reflector applications that took the four-column arm — "enabled" is not "took effect".
 pub static EIGH_BACKTRANSFORM_COLBLOCK_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Split the tridiagonal REDUCTION into its two halves: the symmetric matvec (gather) and
+/// the rank-2 trailing update.
+///
+/// WHY NOW. The back-transform win flipped this cell's shape — reduce went from 24.9% to
+/// **47.1%** of `eigh` at n=768, making it the largest stage of the suite's worst cell. The
+/// blocked-dsytrd rejection on record (0.5-0.81x) was measured when the reduction was a
+/// quarter of the cost, so it is being re-opened at its new weight rather than inherited.
+/// Nothing has ever attributed WITHIN the reduction.
+///
+/// `[0]` gather (`p = A·v`), `[1]` rank-2 update (`A -= v·wᵀ + w·vᵀ`). Reported as shares;
+/// `Instant::now()` per reflector is instrumentation and the absolute nanoseconds are not a
+/// timing claim.
+pub static EIGH_REDUCE_SUBSTAGE_TIMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Accumulated nanoseconds: `[0]` gather, `[1]` rank-2 update.
+pub static EIGH_REDUCE_SUBSTAGE_NANOS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[inline]
+fn eigh_reduce_substage_start() -> Option<std::time::Instant> {
+    EIGH_REDUCE_SUBSTAGE_TIMING
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(std::time::Instant::now)
+}
+
+#[inline]
+fn eigh_reduce_substage_record(stage: usize, started: Option<std::time::Instant>) {
+    if let Some(at) = started {
+        let nanos = u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        EIGH_REDUCE_SUBSTAGE_NANOS[stage].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_PAR_ROWS: usize = 128;
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_ROWS_PER_WORKER: usize = 32;
 const THIN_BIDIAG_RIGHT_REPLAY_MAX_WORKERS: usize = 8;
@@ -12481,6 +12516,7 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
     // These reads are per COLUMN, not per element, so they are not the per-item barrier
     // shape that cost 13% in fsci-sparse's merge; hoisting them further would mean
     // threading state through `symmetric_tridiagonalize_native` for no measurable gain.
+    let t_gather = eigh_reduce_substage_start();
     let parallel_gather = EIGH_DSYMV_PARALLEL_GATHER.load(std::sync::atomic::Ordering::Relaxed)
         && active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE;
     if parallel_gather {
@@ -12505,6 +12541,8 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
         symmetric_lower_matvec_one_pass(data, n, start, &reflector.values, p);
     }
 
+    eigh_reduce_substage_record(0, t_gather);
+
     let mut v_dot_p = 0.0;
     for row_offset in 0..active {
         p[row_offset] *= reflector.tau;
@@ -12515,6 +12553,7 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
         w[row_offset] = p[row_offset] - correction * reflector.values[row_offset];
     }
 
+    let t_update = eigh_reduce_substage_start();
     let data = matrix.as_mut_slice();
     let force_scalar = EIGH_RANK2_UPDATE_FORCE_SCALAR.load(std::sync::atomic::Ordering::Relaxed);
     for col_offset in 0..active {
@@ -12548,6 +12587,7 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
             }
         }
     }
+    eigh_reduce_substage_record(1, t_update);
 }
 
 #[allow(dead_code)]
