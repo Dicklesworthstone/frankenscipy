@@ -18,6 +18,22 @@
 //! AGREEMENT IS CHECKED by shipping our result back to the Python child and comparing
 //! elementwise against SciPy's own output, so a speed number can never be reported over a
 //! numerical difference.
+//!
+//! PROFILING THIS BINARY REQUIRES `perf stat --no-inherit`. It spawns a live SciPy child,
+//! and `perf stat` follows children by default, so a plain `perf stat` on this harness
+//! counts BOTH arms and attributes the total to us. The error is large and it does not look
+//! like an error — measured here on `gammaln`, the same run reads:
+//!
+//! ```text
+//! perf stat              10,343,020,541 instructions   IPC 2.67
+//! perf stat --no-inherit  6,043,533,900 instructions   IPC 2.97
+//! ```
+//!
+//! 1.71x too many instructions, and an IPC that is wrong in the direction that makes our
+//! arm look WORSE at scheduling than it is. The giveaway is `fp_ret_sse_avx_ops.mac_flops`:
+//! this crate is built with `fp-contract=off` and emits no FMA at all, so any non-zero
+//! MAC-FLOP count on this binary is the SciPy child being counted. The same applies to
+//! every `perf_*_vs_scipy` harness in this workspace — they all spawn a child.
 
 use std::hint::black_box;
 use std::io::{BufRead, BufReader, Write};
