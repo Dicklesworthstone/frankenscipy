@@ -494,7 +494,14 @@ fn radix4_stage_run(
 /// and parallel radix-4 sweeps. Returns the starting `l`.
 #[inline]
 fn radix4_prologue(data: &mut [Complex64], log_n: usize) -> usize {
-    apply_bit_reverse_permutation_incremental(data);
+    if log_n >= BLOCKED_BITREV_MIN_LOG_N
+        && FFT_BLOCKED_BITREV_ENABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        FFT_BLOCKED_BITREV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        apply_bit_reverse_permutation_blocked(data);
+    } else {
+        apply_bit_reverse_permutation_incremental(data);
+    }
     if log_n % 2 == 1 {
         let mut base = 0;
         let n = data.len();
@@ -599,6 +606,106 @@ fn cooley_tukey_radix4_inplace_with_twiddles_par(data: &mut [Complex64], twiddle
         l *= 4;
     }
     fft_stage_record(1, t_stages);
+}
+
+/// Route the bit-reversal through the two-level blocked permutation.
+///
+/// A/B arm for the pass that stage timing puts at **31.5%** of the n=2^22 transform, running
+/// at 2.9 GB/s against the 14.4 GB/s our own butterflies achieve on the same core. Ships ON
+/// only if it measures faster; both arms live in one binary so they can be alternated.
+///
+/// **MEASURED AND REJECTED — SHIPS OFF.** Eight replicates alternated ABBA in one window at
+/// n=2^22, arm proven live by `FFT_BLOCKED_BITREV_HITS` reading 531 against 0:
+///
+///     blocked ON   prologue median 44.60 ms   range [42.75, 50.65]
+///     blocked OFF  prologue median 47.80 ms   range [45.42, 61.04]
+///     1.0719x — RANGES OVERLAP, so undecided, and worth 2.2% on the cell at best
+///
+/// The bound said **5.1x** was available on this pass. Tiling reaches at most 1.07x and does
+/// not separate. **Why, and this is the useful part:** the tiling fixes only the READ side.
+/// Bit-reversal's scatter is intrinsic to the DESTINATION index — confining `r` to a tile
+/// confines `rev_h(r)` to `TILE` scattered low-bit values and `rev_low(c)` to `TILE` scattered
+/// high-bit values, so each tile's `TILE * TILE` stores still land on ~`TILE` far-apart
+/// regions. Better than fully random, nowhere near sequential.
+///
+/// So the headroom is NOT reachable by reordering the permutation. It is reachable only by
+/// not performing one — a Stockham autosort formulation, which carries the permutation inside
+/// the butterflies and is what pocketfft does. Kept, defaulted off, so the next attempt starts
+/// from a measured dead end rather than repeating it.
+pub static FFT_BLOCKED_BITREV_ENABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Permutations that took the blocked arm — "enabled" is not "took effect".
+pub static FFT_BLOCKED_BITREV_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Below this many bits the whole buffer is cache-resident and blocking only adds tables.
+const BLOCKED_BITREV_MIN_LOG_N: usize = 16;
+/// Tile edge in elements; `TILE * TILE * 16` bytes is the per-tile working set (16 KiB).
+const BLOCKED_BITREV_TILE: usize = 32;
+
+#[inline]
+fn reverse_low_bits(value: usize, bits: usize) -> usize {
+    if bits == 0 {
+        return 0;
+    }
+    value.reverse_bits() >> (usize::BITS as usize - bits)
+}
+
+/// Bit-reversal via the two-level index split, tiled.
+///
+/// `i = (r << low) | c` with `r` the high `h` bits and `c` the low `low = m - h` bits, and
+/// reversing all `m` bits gives `rev(i) = rev_low(c) << h | rev_h(r)`. So the permutation is a
+/// TRANSPOSE with both indices bit-reversed, and it can be walked in tiles instead of as one
+/// scan whose destination jumps anywhere in the buffer.
+///
+/// What the tiling buys: within a tile the reads at `i` are `TILE` contiguous runs, and the
+/// writes at `j` are confined to `TILE` distinct `rev_h`-bases reused across the tile's
+/// `TILE * TILE` stores, instead of every store landing on an unrelated page.
+///
+/// BIT-IDENTICAL BY CONSTRUCTION, and not merely by argument: a permutation moves values and
+/// performs no arithmetic, so any correct index scheme produces the identical array. That is
+/// what `blocked_bitrev_matches_incremental_for_every_size` checks exhaustively.
+fn apply_bit_reverse_permutation_blocked(data: &mut [Complex64]) {
+    let n = data.len();
+    debug_assert!(n.is_power_of_two());
+    let m = n.trailing_zeros() as usize;
+    let h = m / 2;
+    let low = m - h;
+    let rows = 1usize << h;
+    let cols = 1usize << low;
+
+    // Two small tables, 2^h + 2^low entries total — 4,096 at n=2^22.
+    let rev_h: Vec<u32> = (0..rows)
+        .map(|r| u32::try_from(reverse_low_bits(r, h)).expect("h < 32"))
+        .collect();
+    let rev_low: Vec<u32> = (0..cols)
+        .map(|c| u32::try_from(reverse_low_bits(c, low)).expect("low < 32"))
+        .collect();
+
+    let tile = BLOCKED_BITREV_TILE;
+    let mut row_block = 0;
+    while row_block < rows {
+        let row_end = (row_block + tile).min(rows);
+        let mut col_block = 0;
+        while col_block < cols {
+            let col_end = (col_block + tile).min(cols);
+            for r in row_block..row_end {
+                let low_bits = rev_h[r] as usize;
+                let base = r << low;
+                for c in col_block..col_end {
+                    let source = base | c;
+                    let target = ((rev_low[c] as usize) << h) | low_bits;
+                    // Each unordered pair is reached twice and swapped once, exactly as the
+                    // incremental walk does.
+                    if source < target {
+                        data.swap(source, target);
+                    }
+                }
+            }
+            col_block += tile;
+        }
+        row_block += tile;
+    }
 }
 
 fn apply_bit_reverse_permutation_incremental(data: &mut [Complex64]) {
@@ -5697,6 +5804,66 @@ fn ihfftn_impl(
         value.1 *= -scale;
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod bitrev_tests {
+    use super::{
+        BLOCKED_BITREV_MIN_LOG_N, Complex64, apply_bit_reverse_permutation_blocked,
+        apply_bit_reverse_permutation_incremental,
+    };
+
+    /// The blocked permutation must produce EXACTLY the array the incremental one produces,
+    /// for every size the blocked arm can be reached at.
+    ///
+    /// Exhaustive rather than sampled, and that is the point: a permutation moves values and
+    /// performs no arithmetic, so equality here is total equality of the two schemes, not
+    /// evidence about one input. Bit-compared, because a tolerance would pass an
+    /// implementation that scattered values to the wrong places within rounding of each
+    /// other — which is precisely the failure a hand-derived index split can have.
+    #[test]
+    fn blocked_bitrev_matches_incremental_for_every_size() {
+        // Includes sizes BELOW the shipping gate so the identity is checked at both odd and
+        // even `m`, where the `h = m / 2` split is asymmetric.
+        for log_n in 1..=20usize {
+            let n = 1usize << log_n;
+            let original: Vec<Complex64> = (0..n)
+                .map(|i| (i as f64 * 0.5 - 1.0, 1.0 - i as f64 * 0.25))
+                .collect();
+            let mut reference = original.clone();
+            apply_bit_reverse_permutation_incremental(&mut reference);
+            let mut blocked = original.clone();
+            apply_bit_reverse_permutation_blocked(&mut blocked);
+            for (index, (want, got)) in reference.iter().zip(blocked.iter()).enumerate() {
+                assert_eq!(
+                    (want.0.to_bits(), want.1.to_bits()),
+                    (got.0.to_bits(), got.1.to_bits()),
+                    "log_n={log_n} index={index}: blocked bit-reversal placed a different value"
+                );
+            }
+        }
+    }
+
+    /// MUST-MISS control: the two schemes agreeing everywhere is only meaningful if the
+    /// permutation is not the identity, i.e. if it actually moves things.
+    #[test]
+    fn bit_reversal_actually_permutes() {
+        let log_n = BLOCKED_BITREV_MIN_LOG_N;
+        let n = 1usize << log_n;
+        let original: Vec<Complex64> = (0..n).map(|i| (i as f64, 0.0)).collect();
+        let mut permuted = original.clone();
+        apply_bit_reverse_permutation_blocked(&mut permuted);
+        let moved = original
+            .iter()
+            .zip(permuted.iter())
+            .filter(|(a, b)| a.0.to_bits() != b.0.to_bits())
+            .count();
+        assert!(
+            moved > n / 2,
+            "only {moved} of {n} elements moved; a near-identity permutation would make the \
+             equivalence test above vacuous"
+        );
+    }
 }
 
 #[cfg(test)]

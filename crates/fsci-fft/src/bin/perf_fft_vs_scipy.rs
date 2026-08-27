@@ -244,6 +244,16 @@ fn time_fsci(
         Some("0") | Some("false")
     );
 
+    // `FSCI_FFT_BLOCKED_BITREV=0` restores the incremental scalar bit-reversal.
+    {
+        use fsci_fft::transforms::FFT_BLOCKED_BITREV_ENABLE;
+        let blocked = !matches!(
+            std::env::var("FSCI_FFT_BLOCKED_BITREV").ok().as_deref(),
+            Some("0") | Some("false")
+        );
+        FFT_BLOCKED_BITREV_ENABLE.store(blocked, std::sync::atomic::Ordering::Relaxed);
+    }
+
     // STAGE ATTRIBUTION, run once outside the timed loop and reported as shares. See
     // `FFT_STAGE_TIMING`: the question is what the bit-reversal prologue costs, since
     // pocketfft has no such pass.
@@ -269,12 +279,14 @@ fn time_fsci(
         // mean the instrumented path was not the path taken and the shares describe nothing.
         println!(
             "STAGES mode={mode} n={} prologue_ms={:.3} butterflies_ms={:.3} total_ms={:.3} \
-             prologue_share={:.4} instrumented={}",
+             prologue_share={:.4} blocked_hits={} instrumented={}",
             real.len().max(complex.len()),
             stage[0] as f64 / 1.0e6,
             stage[1] as f64 / 1.0e6,
             total as f64 / 1.0e6,
             stage[0] as f64 / total.max(1) as f64,
+            fsci_fft::transforms::FFT_BLOCKED_BITREV_HITS
+                .load(std::sync::atomic::Ordering::Relaxed),
             total > 0,
         );
     }
