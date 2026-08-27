@@ -53,7 +53,8 @@ mod bench {
         SPLU_BANDED_FACTOR_HITS, SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
         SPLU_PARTIAL_INPLACE_ENABLE, SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
         SPLU_ROW_HEAD_CACHE_FACTOR_HITS, SPLU_SUPERNODAL_ENABLE, SPLU_SUPERNODAL_FACTOR_HITS,
-        Shape2D, splu, splu_factor_payload_bytes, splu_solve,
+        SPLU_SWAP_WRITEBACK_ENABLE, SPLU_SWAP_WRITEBACK_HITS, Shape2D, splu,
+        splu_factor_payload_bytes, splu_solve,
     };
     use sha2::{Digest, Sha256};
 
@@ -1046,8 +1047,22 @@ for raw_line in sys.stdin.buffer:
         if let Some(value) = banded_override {
             SPLU_BANDED_ENABLE.store(value, Ordering::Relaxed);
         }
+        // `FSCI_SPLU_SWAP_WRITEBACK=0` restores the copy-back writeback, so both arms of
+        // that change live in ONE binary and can be alternated inside a single window
+        // instead of compared across two builds in two windows. Same only-override-when-
+        // asked rule as the banded arm directly above, and for the same reason.
+        let swap_writeback_override =
+            match std::env::var("FSCI_SPLU_SWAP_WRITEBACK").ok().as_deref() {
+                Some("1") | Some("true") => Some(true),
+                Some("0") | Some("false") => Some(false),
+                _ => None,
+            };
+        if let Some(value) = swap_writeback_override {
+            SPLU_SWAP_WRITEBACK_ENABLE.store(value, Ordering::Relaxed);
+        }
         let banded_requested = SPLU_BANDED_ENABLE.load(Ordering::Relaxed);
         let banded_hits_before = SPLU_BANDED_FACTOR_HITS.load(Ordering::Relaxed);
+        let swap_writeback_hits_before = SPLU_SWAP_WRITEBACK_HITS.load(Ordering::Relaxed);
         let supernodal_hits_before = SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed);
         SPLU_SUPERNODAL_ENABLE.reset_load_count();
         println!(
@@ -1363,6 +1378,14 @@ for raw_line in sys.stdin.buffer:
         println!(
             "execution_proof: banded_requested={banded_requested} banded_factor_hits={}",
             SPLU_BANDED_FACTOR_HITS.load(Ordering::Relaxed) - banded_hits_before
+        );
+        // "enabled" is not "took effect". The swap writeback only fires on the FULL merge
+        // path, so on a fixture the banded kernel accepts, or one the one-column arm covers,
+        // this reads zero and an A/B between the two settings is a null over identical code.
+        println!(
+            "execution_proof: swap_writeback_enabled={} swap_writeback_hits={}",
+            SPLU_SWAP_WRITEBACK_ENABLE.load(Ordering::Relaxed),
+            SPLU_SWAP_WRITEBACK_HITS.load(Ordering::Relaxed) - swap_writeback_hits_before
         );
         println!(
             "execution_proof: supernodal_enabled={supernodal_enabled} \

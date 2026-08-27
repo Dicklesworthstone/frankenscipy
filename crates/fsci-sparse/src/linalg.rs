@@ -1339,6 +1339,7 @@ fn apply_sorted_pivot_tail(
     partial_inplace: bool,
     one_column: bool,
     detect_cancellation: bool,
+    swap_writeback: bool,
 ) {
     // SIZE THE OUTPUT ONCE AND WRITE BY INDEX, never `push`.
     //
@@ -1705,10 +1706,27 @@ fn apply_sorted_pivot_tail(
         scratch,
     );
 
-    target.cols.clear();
-    target.vals.clear();
-    target.cols.extend_from_slice(&scratch.cols[..written]);
-    target.vals.extend_from_slice(&scratch.vals[..written]);
+    // THE WRITEBACK. `scratch` already holds the finished row; the only question is
+    // whether those bytes get COPIED into the caller's buffer or whether the two buffers
+    // trade places. The swap is O(1) and leaves `scratch` holding the row's old
+    // allocation, which the next merge resizes and reuses exactly as it reused its own.
+    //
+    // Bit-identical: `truncate` shortens the length and touches no element, so the
+    // surviving prefix is the same `written` values in the same order that
+    // `extend_from_slice` would have copied. `f64` and `u32` have no drop glue, so the
+    // truncate is a length store.
+    if swap_writeback {
+        SPLU_SWAP_WRITEBACK_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::mem::swap(&mut target.cols, &mut scratch.cols);
+        std::mem::swap(&mut target.vals, &mut scratch.vals);
+        target.cols.truncate(written);
+        target.vals.truncate(written);
+    } else {
+        target.cols.clear();
+        target.vals.clear();
+        target.cols.extend_from_slice(&scratch.cols[..written]);
+        target.vals.extend_from_slice(&scratch.vals[..written]);
+    }
     target.start = 0;
 }
 
@@ -3747,6 +3765,10 @@ impl NativeSparseLu {
         // so it blocks specialisation of the merge around it. Every other toggle here is
         // read once and passed as a `bool` for exactly this reason.
         let one_column = SPLU_ONE_COLUMN_INSERT_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Read ONCE per factorization and passed as a `bool`, for the reason spelled out
+        // directly above: an atomic load inside the per-update path is an optimisation
+        // barrier and cost 13% here once already.
+        let swap_writeback = SPLU_SWAP_WRITEBACK_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
         let detect_cancellation =
             !SPLU_SKIP_CANCELLATION_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
         if partial_inplace {
@@ -3923,6 +3945,7 @@ impl NativeSparseLu {
                         partial_inplace,
                         one_column,
                         detect_cancellation,
+                        swap_writeback,
                     );
                 }
                 #[cfg(test)]
@@ -4109,6 +4132,8 @@ impl NativeSparseLu {
         }
         let partial_inplace =
             SPLU_PARTIAL_INPLACE_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Read ONCE per factorization and passed as a `bool`, like every other arm here.
+        let swap_writeback = SPLU_SWAP_WRITEBACK_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
         if partial_inplace {
             SPLU_PARTIAL_INPLACE_FACTOR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -4201,6 +4226,7 @@ impl NativeSparseLu {
                             partial_inplace,
                             one_column,
                             detect_cancellation,
+                            swap_writeback,
                         );
                     }
                     let next = target.first();
@@ -4299,6 +4325,7 @@ impl NativeSparseLu {
                                 partial_inplace,
                                 one_column,
                                 detect_cancellation,
+                                swap_writeback,
                             );
                         }
                     }
@@ -16608,10 +16635,24 @@ mod tests {
         // writing a new one: these cases were chosen to hit each branch of the scratch
         // merge, so reusing them proves the back-merge has the same branches rather
         // than merely agreeing on whatever inputs a fresh test happened to pick.
-        for (back_merge, partial_inplace) in [(false, false), (true, false), (false, true)] {
-            let arm = match (back_merge, partial_inplace) {
-                (true, _) => "back-merge",
-                (_, true) => "partial-inplace",
+        // The swap writeback is carried through the SAME cases for the same reason the
+        // back-merge is: it is a different way of handing the finished row back, so every
+        // branch of the scratch merge must come out identical on it. These cases were
+        // chosen to hit each branch, so reusing them proves the swap preserves all of
+        // them -- including the cancellation branch, where `written` is shorter than the
+        // buffer and the truncate is what keeps the two arms equal.
+        for (back_merge, partial_inplace, swap_writeback) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (false, true, true),
+        ] {
+            let arm = match (back_merge, partial_inplace, swap_writeback) {
+                (true, ..) => "back-merge",
+                (_, true, false) => "partial-inplace",
+                (_, true, true) => "partial-inplace+swap",
+                (_, _, true) => "scratch+swap",
                 _ => "scratch",
             };
             let mut row = sorted_row_from_entries(vec![(1, 4.0), (3, 2.0), (5, -1.0)]);
@@ -16632,6 +16673,7 @@ mod tests {
                 partial_inplace,
                 true,
                 true,
+                swap_writeback,
             );
             assert_eq!(
                 row.pairs().collect::<Vec<_>>(),
@@ -16654,6 +16696,7 @@ mod tests {
                 partial_inplace,
                 true,
                 true,
+                swap_writeback,
             );
             assert_eq!(
                 retired.pairs().collect::<Vec<_>>(),
@@ -16680,6 +16723,7 @@ mod tests {
                 partial_inplace,
                 true,
                 true,
+                swap_writeback,
             );
             assert!(
                 run_row.pairs().next().is_none(),
@@ -16700,6 +16744,7 @@ mod tests {
                 partial_inplace,
                 true,
                 true,
+                swap_writeback,
             );
             assert_eq!(
                 partial.pairs().collect::<Vec<_>>(),
@@ -16726,6 +16771,7 @@ mod tests {
                 partial_inplace,
                 true,
                 true,
+                swap_writeback,
             );
             assert_eq!(
                 prefixed.pairs().collect::<Vec<_>>(),
@@ -18121,6 +18167,25 @@ mod tests {
             );
             let rewrites = shape.merges;
             let total = shape.merges + shape.inplace;
+            // HOW LONG IS THE RUN THE VECTORISED KERNEL ACTUALLY GETS?
+            //
+            // The merge already detects coincident columns and hands them to a countable
+            // `y += n*x` loop, which is the exact shape the banded kernel runs at
+            // 8.59 Gflop/s. So the question is never "is it vectorised" but "over how many
+            // elements". A packed AVX2 body needs 4 doubles before it beats the scalar
+            // remainder, and the loop's own setup has to be amortised on top of that. If
+            // the mean run is ~1 the kernel is paying vector setup to do scalar work, and
+            // no further widening of it can help -- the lever would have to be structural,
+            // upstream, in what the ordering makes coincide.
+            println!(
+                "RUN_KERNEL fix={fixture} side={side} ord={ordering:?} n={n} runs={} run_elements={} \
+                 mean_run={:.3} run_share_of_merged={:.4}",
+                shape.runs,
+                shape.run_elements,
+                shape.run_elements as f64 / shape.runs.max(1) as f64,
+                shape.run_elements as f64
+                    / (shape.run_elements + shape.target_only + shape.tail_only).max(1) as f64,
+            );
             println!(
                 "MERGE_SHAPE fix={fixture} side={side} ord={ordering:?} n={n} merges={} inplace={} inplace_share={:.4} \
                  tail_only={} target_only={} tail_only_per_merge={:.3} \
@@ -20166,44 +20231,69 @@ mod tests {
         println!("arm=reserve-on ok={} reserve_hits={hits}", lu.is_ok());
     }
 
+    /// Scopes the banded path off and names the ordering, for the four A/B totals arms.
+    ///
+    /// ALL FOUR WERE MEASURING NOTHING. They ran `PermutationOrdering::Colamd` on a
+    /// Dirichlet Laplacian, which since `SPLU_BANDED_ENABLE` began shipping ON is
+    /// intercepted by the banded kernel -- so `factorize_csr` returned before the merge was
+    /// ever called and both arms of every diff executed the same code. A totals diff over
+    /// two identical runs is a clean-looking zero, which is exactly what a working null
+    /// looks like. Same rot that had silently disabled `prefix_skip_payoff_on_the_loss_peak`.
+    ///
+    /// AMD, not Colamd, because the question these arms exist to answer is where the
+    /// GENERAL kernel's density goes, and AMD is the low-density arm: measured
+    /// `skipped_fraction` 0.2715 against RCM's 0.9936, mean run 13.990 against 1.000.
+    fn ab_totals_general_factor() -> usize {
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore = RestoreBandedToggle(banded_was);
+        let matrix = splu_dirichlet_laplacian_3d(10);
+        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Amd)
+            .expect("factorization");
+        lu.n
+    }
+
     #[test]
     #[ignore = "A/B totals arm: run under callgrind, comparison run ONCE (shipping)"]
     fn ab_totals_compare_single() {
-        let matrix = splu_dirichlet_laplacian_3d(10);
-        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
-            .expect("factorization");
-        println!("arm=compare-single n={}", lu.n);
+        let n = ab_totals_general_factor();
+        println!("arm=compare-single n={n}");
     }
 
     #[test]
     #[ignore = "A/B totals arm: run under callgrind, comparison run TWICE (same result)"]
     fn ab_totals_compare_doubled() {
         DOUBLE_COLUMN_COMPARE.with(|arm| arm.set(true));
-        let matrix = splu_dirichlet_laplacian_3d(10);
-        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
-            .expect("factorization");
+        let n = ab_totals_general_factor();
         let hits = DOUBLE_COLUMN_COMPARE_HITS.with(std::cell::Cell::get);
         DOUBLE_COLUMN_COMPARE.with(|arm| arm.set(false));
-        println!("arm=compare-doubled n={} extra_passes={hits}", lu.n);
+        // MUST-HIT. `extra_passes = 0` means the doubled arm never doubled anything and the
+        // diff against `compare-single` is a null over identical code, not a measurement.
+        assert!(
+            hits > 0,
+            "the doubled-comparison arm ran zero extra passes, so this diff measures nothing"
+        );
+        println!("arm=compare-doubled n={n} extra_passes={hits}");
     }
 
     #[test]
     #[ignore = "A/B totals arm: run under callgrind, comparison ENABLED (shipping behaviour)"]
     fn ab_totals_column_compare_enabled() {
-        let matrix = splu_dirichlet_laplacian_3d(10);
-        let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
-            .expect("factorization");
-        println!("arm=compare-enabled n={}", lu.n);
+        let n = ab_totals_general_factor();
+        println!("arm=compare-enabled n={n}");
     }
 
     #[test]
     #[ignore = "A/B totals arm: run under callgrind, comparison SKIPPED (incorrect, bound only)"]
     fn ab_totals_column_compare_skipped() {
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _restore = RestoreBandedToggle(banded_was);
         SKIP_COLUMN_COMPARE.with(|arm| arm.set(true));
         let result = NativeSparseLu::factorize_csr(
             &splu_dirichlet_laplacian_3d(10),
             1.0,
-            PermutationOrdering::Colamd,
+            PermutationOrdering::Amd,
         );
         SKIP_COLUMN_COMPARE.with(|arm| arm.set(false));
         // The factor is wrong on purpose; only the instruction and miss totals matter.
@@ -21064,6 +21154,7 @@ mod tests {
             false,
             true,
             true,
+            true,
         );
         apply_sorted_pivot_tail(
             &mut sequential,
@@ -21074,6 +21165,7 @@ mod tests {
             &vals_b,
             false,
             false,
+            true,
             true,
             true,
         );
@@ -21155,6 +21247,7 @@ mod tests {
                 vals,
                 false,
                 false,
+                true,
                 true,
                 true,
             );
@@ -21468,6 +21561,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         );
         assert_eq!(
             none.pairs().collect::<Vec<_>>(),
@@ -21489,6 +21583,7 @@ mod tests {
             true,
             true,
             true,
+            true,
         );
         assert_eq!(
             partial.pairs().collect::<Vec<_>>(),
@@ -21506,6 +21601,7 @@ mod tests {
             &[2, 4, 7],
             &[4.0, 1.0, 1.0],
             false,
+            true,
             true,
             true,
             true,
@@ -21678,6 +21774,7 @@ mod tests {
                 &vals,
                 true,
                 false,
+                true,
                 true,
                 true,
             );
@@ -30714,6 +30811,51 @@ pub static SPLU_ONE_COLUMN_INSERT_ENABLE: PerfToggle = PerfToggle::new(true);
 /// Updates that actually took the one-column arm — "enabled" is not "took effect".
 #[doc(hidden)]
 pub static SPLU_ONE_COLUMN_INSERT_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Hand the merged row back by SWAPPING the scratch buffer in, instead of copying it.
+///
+/// WHY THIS ARM EXISTS. The full merge path ends `target.cols.clear()` followed by
+/// `extend_from_slice(&scratch.cols[..written])` on both arrays — a complete copy of the
+/// row, every merge, carrying **zero floating-point work**. `merge_sorted_remainder` has
+/// already written the final row into `scratch`, so the copy exists only to put those bytes
+/// in the buffer the caller happens to hold. Swapping the two `Vec`s puts them there in
+/// O(1), and `scratch` inherits the old buffer, which it reuses on the next call exactly as
+/// it reused its own.
+///
+/// WHY IT SHOULD MATTER MOST ON AMD, which is where the density is lost. The one-column arm
+/// already avoids this copy, but only when the merge misses by exactly one column: measured
+/// on convection at n=4,096 that is **96.46% of merges under RCM and 0.16% under AMD**,
+/// where instead **77% miss by more than eight**. So under the fill-reducing ordering
+/// essentially every merge pays the full rebuild, and that ordering is the one running at
+/// 1.92 Gflop/s against the banded kernel's 8.59.
+///
+/// Bit-identical by construction: same values, same order, same length — the only thing
+/// that changes is which heap allocation holds them.
+///
+/// **REJECTED ON MEASUREMENT — SHIPS OFF.** Sixteen replicates alternated ABBA inside one
+/// window on the AMD arm (the only arm that reaches this code: the banded kernel intercepts
+/// the shipping path and this counter reads **0** there), `perf_splu 64 25 4 off convection`,
+/// live SciPy in the same invocation:
+///
+///     swap ON   median 0.5247   range [0.4922, 0.5397]
+///     swap OFF  median 0.5361   range [0.5053, 0.5435]
+///     median ON/OFF = 0.9788
+///
+/// The ranges overlap, so this is not a decided regression — but there is no win, and the
+/// point estimate is the wrong way. **Why the copy was not the cost:** removing it also
+/// destroys `scratch`'s stable capacity. `scratch` is reused across every merge and grows
+/// once to the largest row it ever sees; after a swap it inherits whatever buffer the target
+/// happened to hold, and `merge_sorted_remainder` reallocates it. The copy that was removed
+/// was a bounded `memcpy` into a `Vec` that already had capacity, so the trade is a memcpy
+/// for allocator traffic. Same lesson as
+/// `perf_push_built_buffer_moving_bounds_check`: the obviously-dead data movement was
+/// cheaper than what replaced it.
+#[doc(hidden)]
+pub static SPLU_SWAP_WRITEBACK_ENABLE: PerfToggle = PerfToggle::new(false);
+/// Merges that actually took the swap writeback — "enabled" is not "took effect".
+#[doc(hidden)]
+pub static SPLU_SWAP_WRITEBACK_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// Skip exact-cancellation detection and retain structurally-zero entries.
 ///
