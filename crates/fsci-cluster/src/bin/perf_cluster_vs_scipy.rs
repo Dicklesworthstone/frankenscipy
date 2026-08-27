@@ -273,7 +273,22 @@ fn main() {
         .map(|i| (0..dim).map(|d| coord(i * 37 + 11, d)).collect())
         .collect();
 
+    // `FSCI_CLUSTER_OPS=vq` restricts the run to one op. Needed to attribute a hardware
+    // counter to a single op: with both ops in the run, a `perf stat` total mixes them and
+    // a change in either moves the number.
+    let selected = std::env::var("FSCI_CLUSTER_OPS").unwrap_or_else(|_| "vq,linkage".to_owned());
+    // `FSCI_CLUSTER_FIXED_REPS=N` pins the repetition count instead of calibrating it, so two
+    // runs being compared on instructions retired do the SAME amount of work. Calibration
+    // picks reps from measured time, so a faster arm would otherwise run FEWER reps and
+    // retire fewer instructions for that reason alone.
+    let fixed_reps: Option<usize> = std::env::var("FSCI_CLUSTER_FIXED_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+
     for op in ["vq", "linkage"] {
+        if !selected.split(',').any(|name| name.trim() == op) {
+            continue;
+        }
         let mut scipy = Scipy::start(op, &points, &centroids);
         println!("{}", scipy.ready);
 
@@ -314,7 +329,9 @@ fn main() {
             black_box(ours());
             single = single.min(started.elapsed().as_secs_f64() * 1.0e3);
         }
-        let reps = ((MIN_SAMPLE_MS / single.max(1.0e-6)).ceil() as usize).clamp(1, 4096);
+        let reps = fixed_reps
+            .unwrap_or_else(|| ((MIN_SAMPLE_MS / single.max(1.0e-6)).ceil() as usize))
+            .clamp(1, 4096);
         println!("op={op} calibration single={single:.4}ms reps={reps}");
 
         let time_ours = || -> f64 {

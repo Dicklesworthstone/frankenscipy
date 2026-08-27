@@ -6511,6 +6511,15 @@ const NEAREST_FULL_SCAN_MAX_K: usize = 64;
 /// BIT-IDENTICAL: `accumulators[c]` sums `(p[j] - c[j])²` over `j` ascending, which is exactly
 /// the order `sq_dist`'s left fold uses. Only the interleaving of INDEPENDENT centroids
 /// changes. Pinned by `vq_soa_kernel_matches_sq_dist_bits`.
+///
+/// CONFIRMED ON A LOAD-INDEPENDENT COUNTER, because wall time here is not trustworthy on a
+/// busy box: this op reads 0.143 ms quiet and 0.265 ms at loadavg 50 with the A/A null tight
+/// (1.010) in BOTH cases, since the null bounds drift between halves and is blind to steady
+/// load. Under `perf stat` at pinned repetitions the SoA arm retires 3.4426e9 instructions
+/// against the `sq_dist` arm's 4.4789e9 — 1.3010x and 1.3009x fewer across two independent
+/// pairs — while `fp_ret_sse_avx_ops.all` is EXACTLY equal at 1_262_607_418, which is the
+/// check that both arms really do the same arithmetic and the saving is in the scan, not in
+/// skipped work.
 fn accumulate_sq_dists_soa(point: &[f64], soa: &[f64], k: usize, d: usize, out: &mut [f64]) {
     debug_assert!(soa.len() >= k * d);
     debug_assert!(out.len() >= k);
