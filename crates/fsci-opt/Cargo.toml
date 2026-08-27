@@ -6,6 +6,9 @@ edition = "2024"
 [features]
 opt-incumbent-bench = ["dep:sha2"]
 
+[lints]
+workspace = true
+
 [dependencies]
 fsci-runtime.workspace = true
 rand.workspace = true

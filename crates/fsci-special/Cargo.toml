@@ -8,6 +8,9 @@ autobins = false
 ndtri-isafloor-bench = ["dep:sha2"]
 
 
+[lints]
+workspace = true
+
 [dependencies]
 fsci-integrate = { workspace = true }
 fsci-linalg = { workspace = true }

@@ -1,4 +1,20 @@
+// Numeric kernels: index walks over parallel slices, wide signatures the algorithm
+// requires, and literals carried at full written precision.
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::excessive_precision)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
+#![allow(clippy::type_complexity)]
+
 #![forbid(unsafe_code)]
+// Numeric kernels: fixture vectors, deliberate min/max comparisons, and helper
+// aliases kept for the variants these modules can be switched to.
+#![allow(clippy::useless_vec)]
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(clippy::min_max)]
+#![allow(clippy::absurd_extreme_comparisons)]
+
 
 //! Input/Output routines for FrankenSciPy.
 //!

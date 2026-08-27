@@ -1,3 +1,7 @@
+// The parity tests below compare our constants against scipy's published literals
+// on purpose; substituting the std constant would make the check self-referential.
+#![allow(clippy::approx_constant)]
+
 #![forbid(unsafe_code)]
 
 //! Physical and mathematical constants for FrankenSciPy.
@@ -21,9 +25,9 @@ pub const TAU: f64 = 2.0 * std::f64::consts::PI;
 /// Euler's number e
 pub const E: f64 = std::f64::consts::E;
 /// Golden ratio φ = (1 + √5)/2
-pub const GOLDEN_RATIO: f64 = 1.618_033_988_749_895;
+pub const GOLDEN_RATIO: f64 = std::f64::consts::GOLDEN_RATIO;
 /// Euler-Mascheroni constant γ
-pub const EULER_GAMMA: f64 = 0.577_215_664_901_532_9;
+pub const EULER_GAMMA: f64 = std::f64::consts::EULER_GAMMA;
 
 // ══════════════════════════════════════════════════════════════════════
 // SI Prefixes

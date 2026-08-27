@@ -1,3 +1,7 @@
+// Index walks over parallel slices by a single counter; an iterator rewrite would
+// obscure the arithmetic without changing behaviour.
+#![allow(clippy::needless_range_loop)]
+
 #![forbid(unsafe_code)]
 
 pub mod audit;
@@ -3410,7 +3414,7 @@ pub fn bracket<F>(f: F, xa: f64, xb: f64) -> (f64, f64, f64, f64, f64, f64)
 where
     F: Fn(f64) -> f64,
 {
-    let golden = 1.618_033_988_749_895;
+    let golden = std::f64::consts::GOLDEN_RATIO;
     let limit = 100.0;
 
     let mut xa = xa;
