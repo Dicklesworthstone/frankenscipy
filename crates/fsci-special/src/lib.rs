@@ -336,13 +336,13 @@ pub use error::{
     ERROR_DISPATCH_PLAN, erf, erf_scalar, erfc, erfc_scalar, erfcinv, erfinv, erfinv_scalar,
 };
 pub use gamma::{
-    GAMMA_DISPATCH_PLAN, GAMMALN_ASYMPTOTIC_MIN_OVERRIDE, GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT, binom,
-    chdtr, chdtrc, chdtri, chdtriv, chdtriv_many, chndtr, chndtridf, chndtrinc, chndtrix, comb,
-    digamma, factorial, factorial2, factorialk, gamma, gamma_with_audit, gammainc, gammainc_scalar,
-    gammaincc, gammaincc_scalar, gammaln, gammaln_scalar, gammasgn, gammasgn_scalar, gdtr, gdtrc,
-    gdtria, gdtrib, gdtrix, gdtrix_many, log_gammainc_scalar, log_gammaincc_scalar, loggamma,
-    loggamma_scalar, multigammaln, pdtr, pdtrc, pdtri, pdtrik, perm, polygamma, psi, rgamma, zeta,
-    zetac, zetac_scalar,
+    GAMMA_DISPATCH_PLAN, GAMMALN_ASYMPTOTIC_MIN_OVERRIDE, GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT,
+    ZETA_DIRECT_EARLY_EXIT, binom, chdtr, chdtrc, chdtri, chdtriv, chdtriv_many, chndtr, chndtridf,
+    chndtrinc, chndtrix, comb, digamma, factorial, factorial2, factorialk, gamma, gamma_with_audit,
+    gammainc, gammainc_scalar, gammaincc, gammaincc_scalar, gammaln, gammaln_scalar, gammasgn,
+    gammasgn_scalar, gdtr, gdtrc, gdtria, gdtrib, gdtrix, gdtrix_many, log_gammainc_scalar,
+    log_gammaincc_scalar, loggamma, loggamma_scalar, multigammaln, pdtr, pdtrc, pdtri, pdtrik,
+    perm, polygamma, psi, rgamma, zeta, zetac, zetac_scalar,
 };
 pub use hyper::{
     HYPER_DISPATCH_PLAN, HyperCaspDecision, HyperCaspProblem, HypergeometricBranch,
@@ -2736,6 +2736,62 @@ mod tests {
         assert!(hurwitz_zeta(2.0, 0.0).is_infinite());
         assert!(hurwitz_zeta(2.0, -1.0).is_infinite());
         assert!(hurwitz_zeta(2.5, -0.5).is_nan());
+    }
+
+    /// The early-exited direct prefix must return EXACTLY the bits the full eight-term
+    /// prefix returns, at every `s`.
+    ///
+    /// Bit equality is the right assertion and is achievable by construction: the exit
+    /// fires only when `sum + term == sum`, and terms decrease monotonically in `n`, so it
+    /// skips additions that were already identities. A tolerance would accept an exit that
+    /// fired one term EARLY — dropping a contribution that did matter — which is the
+    /// specific failure this can have and is invisible at any sane tolerance because the
+    /// dropped term is by definition tiny.
+    ///
+    /// Sweeps `s` across the whole regime boundary, densely where the exit begins to fire
+    /// (the interesting zone is roughly `s > 15`, since a term is negligible once
+    /// `s·ln n > 36`), and includes small `s` where it must NEVER fire and the two arms run
+    /// identical code.
+    #[test]
+    fn zeta_direct_early_exit_is_bit_identical_to_the_full_prefix() {
+        use std::sync::atomic::Ordering;
+        // `ZETA_DIRECT_EARLY_EXIT` is process-global and `cargo test` runs this crate's
+        // tests concurrently, so a second toggle-writing test would race this one. A race
+        // here can only MASK a difference (both arms would run the same code and the
+        // bit-equality would compare a thing to itself), never invent one — which is the
+        // quieter and worse direction. One lock, taken by any test that writes it.
+        static ZETA_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ZETA_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was = ZETA_DIRECT_EARLY_EXIT.load(Ordering::Relaxed);
+
+        let mut points: Vec<f64> = Vec::new();
+        for i in 0..=2000 {
+            points.push(1.0 + 1.0e-6 + (60.0 - 1.0) * (i as f64 / 2000.0));
+        }
+        for anchor in [
+            1.000_001, 1.05, 1.5, 2.0, 3.0, 7.0, 12.0, 14.0, 15.0, 16.0, 20.0, 25.0, 30.0, 40.0,
+            60.0, 100.0, 200.0,
+        ] {
+            points.push(anchor);
+        }
+
+        let mut compared = 0usize;
+        for &s in &points {
+            ZETA_DIRECT_EARLY_EXIT.store(false, Ordering::Relaxed);
+            let full = zeta_scalar(s);
+            ZETA_DIRECT_EARLY_EXIT.store(true, Ordering::Relaxed);
+            let exited = zeta_scalar(s);
+            assert_eq!(
+                full.to_bits(),
+                exited.to_bits(),
+                "zeta({s}) differs: full prefix {full:e} vs early-exited {exited:e}"
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, points.len(), "comparison loop was skipped");
+        ZETA_DIRECT_EARLY_EXIT.store(was, Ordering::Relaxed);
     }
 
     #[test]

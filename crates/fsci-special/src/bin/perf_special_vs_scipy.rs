@@ -223,6 +223,67 @@ fn main() {
             .store(x.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
+    // `FSCI_SPECIAL_ZETA_EARLY=0` restores the unconditional eight-term direct prefix, so
+    // the early exit can be A/B'd inside ONE binary. Without this the two "arms" are the
+    // same arm and the comparison is inert — which is exactly how it first read.
+    match std::env::var("FSCI_SPECIAL_ZETA_EARLY").ok().as_deref() {
+        Some("1") | Some("true") => {
+            fsci_special::ZETA_DIRECT_EARLY_EXIT.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some("0") | Some("false") => {
+            fsci_special::ZETA_DIRECT_EARLY_EXIT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
+
+    // `FSCI_SPECIAL_ZETA_BITS=1` runs the zeta early-exit bit-identity check and exits.
+    // This lives in a BIN rather than only in `#[cfg(test)]` because the test profile of
+    // this crate does not currently build: the workspace `Cargo.toml` asks for
+    // `rand = "0.10.1"` while `Cargo.lock` still pins 0.8.7/0.9.5, so cargo re-resolves to
+    // rand 0.10.2 and fails on a `getrandom` it cannot find offline. The `#[test]` version
+    // is kept and is the durable check; this is what can actually be run today.
+    if matches!(
+        std::env::var("FSCI_SPECIAL_ZETA_BITS").ok().as_deref(),
+        Some("1")
+    ) {
+        let mut points: Vec<f64> = (0..=4000)
+            .map(|i| 1.0 + 1.0e-6 + 59.0 * (i as f64 / 4000.0))
+            .collect();
+        points.extend([
+            1.000_001, 1.05, 1.5, 2.0, 7.0, 12.0, 15.0, 16.0, 20.0, 30.0, 60.0, 200.0,
+        ]);
+        let eval = |on: bool| -> Vec<f64> {
+            fsci_special::ZETA_DIRECT_EARLY_EXIT.store(on, std::sync::atomic::Ordering::Relaxed);
+            let t = SpecialTensor::RealVec(points.clone());
+            match zeta(&t, RuntimeMode::Hardened).expect("fsci zeta") {
+                SpecialTensor::RealVec(v) => v,
+                other => panic!("zeta returned {other:?}"),
+            }
+        };
+        let full = eval(false);
+        let exited = eval(true);
+        fsci_special::ZETA_DIRECT_EARLY_EXIT.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut differing = 0usize;
+        for (i, (a, b)) in full.iter().zip(exited.iter()).enumerate() {
+            if a.to_bits() != b.to_bits() {
+                if differing < 5 {
+                    println!("  s={} full={a:e} exited={b:e}", points[i]);
+                }
+                differing += 1;
+            }
+        }
+        println!(
+            "zeta_bits: points={} differing={differing} VERDICT={}",
+            points.len(),
+            if differing == 0 {
+                "BIT-IDENTICAL"
+            } else {
+                "DIVERGES"
+            }
+        );
+        std::process::exit(i32::from(differing != 0));
+    }
+
     println!("elf_sha256={}", elf_sha256());
     println!("n={n} gammaln_crossover={}", {
         let bits = fsci_special::GAMMALN_ASYMPTOTIC_MIN_OVERRIDE

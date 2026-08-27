@@ -2962,10 +2962,39 @@ fn fill_zeta_affine_blocks(
     }
 }
 
+/// Stop the direct prefix once a term stops changing the running sum (`true`, shipping).
+/// BIT-IDENTICAL — see `zeta_positive`.
+pub static ZETA_DIRECT_EARLY_EXIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
 fn zeta_positive(s: f64) -> f64 {
     let mut sum = 1.0;
-    for &ln_n in &ZETA_POSITIVE_DIRECT_LN {
-        sum += (-s * ln_n).exp();
+    if ZETA_DIRECT_EARLY_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
+        // The prefix is `Σ n^-s` for n = 2..=9, evaluated as eight `exp` calls. For large
+        // `s` most of them are already below the running sum's resolution: at s = 30,
+        // 4^-30 = 8.7e-19 against sum ≈ 1 whose ULP is 2.2e-16, so `sum + term` IS `sum`.
+        //
+        // BIT-IDENTICAL, and provably rather than empirically. `ln_n` is strictly
+        // increasing and `s > 1`, so `exp(-s·ln_n)` is strictly DECREASING in n. Once an
+        // addition is a no-op, every later term is smaller still and would be a no-op
+        // against the same unchanged `sum`. Breaking therefore skips only additions that
+        // were already identities — the accumulated value is the same float, not merely a
+        // close one, which is why this needs no tolerance and is pinned by a bits test.
+        //
+        // Costs one compare per surviving term and saves an `exp` per skipped one. It saves
+        // NOTHING for small `s` (at s = 1.5 no term is negligible and all eight run), so
+        // this is worth a lot at large `s` and exactly zero at small — not a trade.
+        for &ln_n in &ZETA_POSITIVE_DIRECT_LN {
+            let next = sum + (-s * ln_n).exp();
+            if next == sum {
+                break;
+            }
+            sum = next;
+        }
+    } else {
+        for &ln_n in &ZETA_POSITIVE_DIRECT_LN {
+            sum += (-s * ln_n).exp();
+        }
     }
 
     let tail_neg_s = (-s * ZETA_POSITIVE_TAIL_LN).exp();
