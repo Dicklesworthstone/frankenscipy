@@ -212,8 +212,27 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok());
 
+    // `FSCI_SPECIAL_GAMMALN_CROSSOVER=100` restores the pre-2026-08-27 Lanczos/asymptotic
+    // crossover, so the change can be A/B'd inside ONE binary rather than against a
+    // differently-built one.
+    if let Some(x) = std::env::var("FSCI_SPECIAL_GAMMALN_CROSSOVER")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        fsci_special::GAMMALN_ASYMPTOTIC_MIN_OVERRIDE
+            .store(x.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
     println!("elf_sha256={}", elf_sha256());
-    println!("n={n}");
+    println!("n={n} gammaln_crossover={}", {
+        let bits = fsci_special::GAMMALN_ASYMPTOTIC_MIN_OVERRIDE
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if bits == 0 {
+            fsci_special::GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT
+        } else {
+            f64::from_bits(bits)
+        }
+    });
 
     let unit = |i: usize| -> f64 {
         let k = (i * 2_654_435_761usize).wrapping_add(40_503) % 1_000_003;

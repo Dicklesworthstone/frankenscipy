@@ -48,3 +48,9 @@ required-features = ["ndtri-isafloor-bench"]
 [[bin]]
 name = "perf_special_vs_scipy"
 path = "src/bin/perf_special_vs_scipy.rs"
+
+# Accuracy probe for gammaln's Lanczos->asymptotic crossover. Registered explicitly for the
+# same reason as the harness above: `autobins = false` hides src/bin from cargo.
+[[bin]]
+name = "diff_gammaln_crossover"
+path = "src/bin/diff_gammaln_crossover.rs"

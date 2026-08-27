@@ -336,12 +336,13 @@ pub use error::{
     ERROR_DISPATCH_PLAN, erf, erf_scalar, erfc, erfc_scalar, erfcinv, erfinv, erfinv_scalar,
 };
 pub use gamma::{
-    GAMMA_DISPATCH_PLAN, binom, chdtr, chdtrc, chdtri, chdtriv, chdtriv_many, chndtr, chndtridf,
-    chndtrinc, chndtrix, comb, digamma, factorial, factorial2, factorialk, gamma, gamma_with_audit,
-    gammainc, gammainc_scalar, gammaincc, gammaincc_scalar, gammaln, gammaln_scalar, gammasgn,
-    gammasgn_scalar, gdtr, gdtrc, gdtria, gdtrib, gdtrix, gdtrix_many, log_gammainc_scalar,
-    log_gammaincc_scalar, loggamma, loggamma_scalar, multigammaln, pdtr, pdtrc, pdtri, pdtrik,
-    perm, polygamma, psi, rgamma, zeta, zetac, zetac_scalar,
+    GAMMA_DISPATCH_PLAN, GAMMALN_ASYMPTOTIC_MIN_OVERRIDE, GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT, binom,
+    chdtr, chdtrc, chdtri, chdtriv, chdtriv_many, chndtr, chndtridf, chndtrinc, chndtrix, comb,
+    digamma, factorial, factorial2, factorialk, gamma, gamma_with_audit, gammainc, gammainc_scalar,
+    gammaincc, gammaincc_scalar, gammaln, gammaln_scalar, gammasgn, gammasgn_scalar, gdtr, gdtrc,
+    gdtria, gdtrib, gdtrix, gdtrix_many, log_gammainc_scalar, log_gammaincc_scalar, loggamma,
+    loggamma_scalar, multigammaln, pdtr, pdtrc, pdtri, pdtrik, perm, polygamma, psi, rgamma, zeta,
+    zetac, zetac_scalar,
 };
 pub use hyper::{
     HYPER_DISPATCH_PLAN, HyperCaspDecision, HyperCaspProblem, HypergeometricBranch,

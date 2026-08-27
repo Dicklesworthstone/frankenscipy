@@ -1018,7 +1018,7 @@ pub fn gammaln_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     }
 
     let output = if x >= 0.5 {
-        if x < 100.0 {
+        if x < gammaln_asymptotic_min_x() {
             lngamma_lanczos(x)
         } else {
             lngamma_positive(x)
@@ -1928,6 +1928,59 @@ fn lngamma_positive(x: f64) -> f64 {
         stirling_lngamma(shifted) - correction
     } else {
         stirling_lngamma(x)
+    }
+}
+
+/// Default `x` at or above which `gammaln` leaves the Lanczos kernel for the asymptotic
+/// (Stirling) one.
+///
+/// WAS 100, LOWERED TO 20 ON ACCURACY, measured against live SciPy 1.17.1 over a
+/// logarithmic grid of 1278 points on [8, 120] with extra points packed against every
+/// candidate boundary (`src/bin/diff_gammaln_crossover.rs`). Worst error over the range
+/// each candidate actually changes, in ULPs of the reference:
+///
+/// ```text
+/// crossover   worst_ulp   Lanczos over the same range   verdict
+///        13       18.41                          3.18   REJECTED
+///        15        3.80                          3.18   REJECTED
+///        16        2.29                          3.18   justified (edge)
+///        20        0.82                          3.18   justified, ~3.9x margin
+///        40        0.00                          3.18   identical to Lanczos
+/// ```
+///
+/// So the asymptotic kernel is not merely adequate above 20, it is 3.9x MORE accurate than
+/// the Lanczos kernel it replaces there, and the two agree exactly above 40. 20 is chosen
+/// over the measured boundary of 16 to keep margin rather than sit on it.
+///
+/// JUDGED IN ULPs, NOT ABSOLUTE ERROR, and the distinction reverses the answer at the low
+/// end: at crossover 13 the asymptotic kernel has the SMALLER worst absolute error
+/// (8.17e-14 against 1.71e-13) and is nonetheless 5.8x worse, because its error lands at
+/// lnΓ ≈ 20 where 8e-14 is 18 ULP, while the Lanczos kernel's lands at lnΓ ≈ 201 where a
+/// larger absolute error is only 3 ULP. Absolute error alone would have endorsed 13.
+///
+/// This is cheaper as well — one `ln` against two, and no eight-term division chain — but
+/// that is a CONSEQUENCE, not the reason, and how much it is worth depends entirely on how
+/// much of a caller's input lies in [20, 100). For inputs below 20 it is worth nothing.
+pub const GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT: f64 = 20.0;
+
+/// Override for [`GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT`], as raw `f64` bits; 0 means "use the
+/// default". Exists so the two kernels can be compared against SciPy on IDENTICAL inputs
+/// rather than argued about from truncation-error algebra.
+///
+/// This is an ACCURACY question before it is a cost question. The asymptotic kernel is
+/// cheaper — one `ln` against the Lanczos kernel's two, and no division chain — so lowering
+/// the crossover is worth something, but only if it is at least as accurate there. Lowering
+/// it because a benchmark's fixture happens to sit in the affected range would be tuning the
+/// input distribution rather than the function.
+pub static GAMMALN_ASYMPTOTIC_MIN_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn gammaln_asymptotic_min_x() -> f64 {
+    let bits = GAMMALN_ASYMPTOTIC_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if bits == 0 {
+        GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT
+    } else {
+        f64::from_bits(bits)
     }
 }
 
