@@ -12450,14 +12450,14 @@ fn apply_left_reflectors_column_chunks(
     // the compact-WY form is losing to the plain application at every width tried, not
     // merely mistuned. Left gated behind the worker count exactly as it was; the toggle and
     // the panel counters stay so the arm can be re-measured rather than re-derived.
-    if rows == 0 || cols == 0 || usable_workers <= 1 || cols < THIN_BIDIAG_LEFT_REPLAY_MIN_PAR_COLS
-    {
-        for reflector in reflectors.iter().rev() {
-            apply_householder_left(matrix, reflector, 0);
-        }
-        return;
-    }
-
+    // BUILT BEFORE THE SERIAL GUARD, so one core gets blocking too.
+    //
+    // Compact-WY is a serial cache transform — it exists to cut the number of times the
+    // eigenvector matrix is traversed — so gating it on `usable_workers > 1` made it
+    // unreachable on exactly the configuration this is measured in. It was left gated while
+    // the blocked kernel streamed the chunk once per reflector and therefore lost; with the
+    // loop interchange it traverses once per PANEL, and the gate is what stops that being
+    // worth anything on one core.
     let compact_panels = if EIGH_BACKTRANSFORM_BLOCKED_ENABLE
         .load(std::sync::atomic::Ordering::Relaxed)
         && rows >= SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_MIN_DIM
@@ -12467,6 +12467,18 @@ fn apply_left_reflectors_column_chunks(
     } else {
         None
     };
+
+    if rows == 0 || cols == 0 || usable_workers <= 1 || cols < THIN_BIDIAG_LEFT_REPLAY_MIN_PAR_COLS
+    {
+        if let Some(panels) = compact_panels.as_deref() {
+            apply_compact_wy_left_panels_to_column_chunk(matrix.as_mut_slice(), rows, cols, panels);
+        } else {
+            for reflector in reflectors.iter().rev() {
+                apply_householder_left(matrix, reflector, 0);
+            }
+        }
+        return;
+    }
 
     let cols_per_worker = cols.div_ceil(usable_workers);
     let chunk_len = rows * cols_per_worker;
@@ -12560,16 +12572,31 @@ fn apply_compact_wy_left_panel_to_column_chunk(
     y.fill(0.0);
     z.fill(0.0);
 
-    for k_idx in 0..k_count {
-        let v_base = k_idx * row_count;
-        let y_base = k_idx * cols;
-        for col in 0..cols {
-            let col_base = col * rows + active_start;
+    // COLUMN OUTSIDE, REFLECTOR INSIDE — this is the whole point of blocking.
+    //
+    // With `k_idx` outermost this loop streamed the entire chunk ONCE PER REFLECTOR, which
+    // is exactly what the unblocked path does. Blocking then bought no traffic reduction at
+    // all and still paid for the T-multiply and the second pass, so it was strictly worse:
+    // measured 1.130x SLOWER than applying the reflectors one at a time, ranges disjoint.
+    //
+    // Interchanged, the column's active segment is loaded once and reused for all `k_count`
+    // reflectors, so the chunk is traversed once instead of `k_count` times. That is the
+    // k-fold traffic cut compact-WY exists to deliver, and it is what a rank-1 update at
+    // 0.25 flops/byte needs — the kernel is memory-bound, so traffic is the only currency.
+    //
+    // Bit-identical: each dot product sums the same products in the same order; only the
+    // order in which DIFFERENT dot products are computed changes, and they are independent.
+    for col in 0..cols {
+        let col_base = col * rows + active_start;
+        let column = &chunk[col_base..col_base + row_count];
+        for k_idx in 0..k_count {
+            let v_base = k_idx * row_count;
+            let reflector = &panel.v_by_k_row[v_base..v_base + row_count];
             let mut dot = 0.0;
-            for row_rel in 0..row_count {
-                dot += panel.v_by_k_row[v_base + row_rel] * chunk[col_base + row_rel];
+            for (&v_row, &c_row) in reflector.iter().zip(column) {
+                dot += v_row * c_row;
             }
-            y[y_base + col] = dot;
+            y[k_idx * cols + col] = dot;
         }
     }
 
@@ -12587,17 +12614,26 @@ fn apply_compact_wy_left_panel_to_column_chunk(
         }
     }
 
-    for k_idx in 0..k_count {
-        let v_base = k_idx * row_count;
-        let z_base = k_idx * cols;
-        for col in 0..cols {
-            let scale = z[z_base + col];
+    // Same interchange, same reason: the update pass also streamed the chunk once per
+    // reflector. Held column-outside, each active segment is written once and every
+    // reflector's contribution is applied to it while it is resident.
+    //
+    // Bit-identical: for any fixed element the subtractions still happen for `k_idx`
+    // ascending, so the sequence of operations on that element is unchanged. The
+    // `scale == 0.0` skip is preserved exactly — dropping it would change `-0.0` results
+    // and could turn an `inf * 0.0` into a NaN the previous code never produced.
+    for col in 0..cols {
+        let col_base = col * rows + active_start;
+        let column = &mut chunk[col_base..col_base + row_count];
+        for k_idx in 0..k_count {
+            let scale = z[k_idx * cols + col];
             if scale == 0.0 {
                 continue;
             }
-            let col_base = col * rows + active_start;
-            for row_rel in 0..row_count {
-                chunk[col_base + row_rel] -= panel.v_by_k_row[v_base + row_rel] * scale;
+            let v_base = k_idx * row_count;
+            let reflector = &panel.v_by_k_row[v_base..v_base + row_count];
+            for (slot, &v_row) in column.iter_mut().zip(reflector) {
+                *slot -= v_row * scale;
             }
         }
     }
