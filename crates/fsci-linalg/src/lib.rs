@@ -11782,6 +11782,24 @@ pub static EIGH_BACKTRANSFORM_SLICED_HITS: std::sync::atomic::AtomicUsize =
 /// active row count, and at ~4 cycles each that chain alone accounts for ~258 ms against a
 /// measured ~190 ms. That is why cutting traffic 8x via the panel loop interchange moved
 /// nothing at all.
+///
+/// **MEASURED HEADROOM: 1.881x on the back-transform, 3.573x -> 2.448x on the cell**, four
+/// replicates ABBA in one window (ON median 99.63 ms range [87.89, 125.23]; OFF median
+/// 187.42 ms range [186.66, 188.60], DISJOINT). Agreement against live SciPy is UNCHANGED at
+/// `worst_rel_diff=1.165e-14` with the arm on and off, against an n·eps envelope of
+/// 1.705e-13, so this does not weaken the tolerance contract.
+///
+/// **IT STILL CANNOT SHIP, and the blocker is a contract rather than the numbers.**
+/// `apply_householder_left` is shared, and four existing bit-equality tests pin paths that
+/// must agree BIT-for-bit: `symmetric_eigh_backtransform_parallel_matches_serial_bits`,
+/// `bidiag_fused_step_matches_workspace_reference_bits`,
+/// `bidiag_right_workspace_matches_rowwise_reference_bits` and
+/// `thin_bidiag_parallel_left_replay_matches_serial_bits`. Reassociating here makes the
+/// serial arm disagree with the parallel one, i.e. the answer would depend on how many CPUs
+/// are visible. That is a determinism guarantee worth more than 1.881x, and weakening those
+/// gates to land a speedup is exactly what the suite rules forbid. Landing this requires the
+/// SAME reassociation in every path they compare — compact-WY panels and both bidiagonal
+/// replays included — so that they still agree. Kept as a measured bound until then.
 pub static EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_PAR_ROWS: usize = 128;
@@ -12512,14 +12530,17 @@ fn apply_left_reflectors_column_chunks(
         None
     };
 
+    // STILL GATED, because blocked STILL LOSES. With the loop interchange the panel kernel
+    // traverses the chunk once per panel instead of once per reflector -- an 8x traffic cut
+    // at width 8 -- and it made no difference: 228.75 ms blocked against 211.58 ms
+    // unblocked in the same window. That is the measurement that identified the real bound:
+    // the kernel is LATENCY-bound on the serial dot-product chain, not bandwidth-bound, so
+    // traffic was never the currency. The interchange is kept because it is bit-identical
+    // and correct, but it does not earn the serial path a blocked default.
     if rows == 0 || cols == 0 || usable_workers <= 1 || cols < THIN_BIDIAG_LEFT_REPLAY_MIN_PAR_COLS
     {
-        if let Some(panels) = compact_panels.as_deref() {
-            apply_compact_wy_left_panels_to_column_chunk(matrix.as_mut_slice(), rows, cols, panels);
-        } else {
-            for reflector in reflectors.iter().rev() {
-                apply_householder_left(matrix, reflector, 0);
-            }
+        for reflector in reflectors.iter().rev() {
+            apply_householder_left(matrix, reflector, 0);
         }
         return;
     }
@@ -41269,6 +41290,12 @@ mod proptest_tests {
             .map(|i| (0..n).map(|j| 0.5 * (a[i][j] + a[j][i])).collect())
             .collect();
 
+        // The split-accumulator arm REASSOCIATES and ships ON, so it must be scoped off
+        // here: with it live the sliced arm sums in four chains and the indexed arm in one,
+        // and the two would differ in the last bits for a reason that has nothing to do with
+        // the addressing rewrite this test exists to pin.
+        let was_accum = EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE.load(Ordering::Relaxed);
+        EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE.store(false, Ordering::Relaxed);
         let was_sliced = EIGH_BACKTRANSFORM_SLICED_ENABLE.load(Ordering::Relaxed);
         let was_dim = PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.load(Ordering::Relaxed);
         PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(1, Ordering::Relaxed);
@@ -41285,6 +41312,7 @@ mod proptest_tests {
 
         PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(was_dim, Ordering::Relaxed);
         EIGH_BACKTRANSFORM_SLICED_ENABLE.store(was_sliced, Ordering::Relaxed);
+        EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE.store(was_accum, Ordering::Relaxed);
 
         assert_eq!(
             off_hits, 0,
