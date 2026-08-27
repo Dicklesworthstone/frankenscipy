@@ -30939,9 +30939,25 @@ pub static SPLU_ROW_CAPACITY_HEADROOM: std::sync::atomic::AtomicUsize =
 /// construction** and removes the need for the refusal/fallback machinery the supernodal
 /// path required.
 ///
-/// DEFAULT OFF until timed. The symbolic pass is O(fill) work that the shipping path does
-/// not currently do, and it may cost more than the locality is worth. Two preconditions
-/// being cleared is not a measured win.
+/// NOW TIMED, AND REJECTED — 2.48x SLOWER. The caution above was right: the symbolic pass
+/// is O(fill) work the shipping path does not do, and it costs far more than the locality is
+/// worth. Measured on the worst cell (convection n=16,384, AMD — the only ordering that
+/// reaches the general path at all), four replicates alternated ABBA in one window,
+/// `perf_spsolve --convection-split 5 128`, arm proven live by `reserve_hits=6` against `0`:
+///
+///     factor, reserve ON    median 217.82 ms   range [150.67, 265.17]
+///     factor, reserve OFF   median  87.87 ms   range [ 79.55,  98.29]
+///
+/// **Ranges completely disjoint** — the slowest OFF replicate is faster than the fastest ON
+/// one. The cause is already recorded elsewhere in this campaign: the pattern-based symbolic
+/// pass costs **15.35x a factorization**, so reserving from it cannot amortise no matter how
+/// good the resulting layout is.
+///
+/// The sixteen solves overlap between arms (12.51 against 9.54 median, ranges crossing),
+/// which is the CONTROL: both arms produce `factor_payload_bytes=9,284,128` and the solve
+/// reads only the packed arrays, so a solve difference here would have meant noise rather
+/// than an effect. An earlier pair of runs did show the solve "1.61x faster" under reserve —
+/// taken during a load spike, and that identity is what exposed it.
 #[doc(hidden)]
 pub static SPLU_RESERVE_FROM_SYMBOLIC_ENABLE: PerfToggle = PerfToggle::new(false);
 /// Factorizations that ran the symbolic reserve pass.
