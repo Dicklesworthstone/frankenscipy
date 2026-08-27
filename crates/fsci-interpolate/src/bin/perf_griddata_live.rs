@@ -235,7 +235,7 @@ fn main() {
     // asymmetry at its source rather than only cancelling it in aggregate.
     let (mut fs, mut sc) = (Vec::new(), Vec::new());
     let (mut fnull, mut snull) = (Vec::new(), Vec::new());
-    let mut timed_fsci = || {
+    let timed_fsci = || {
         let t = Instant::now();
         std::hint::black_box(griddata(&pts, &vals, &xi, method).unwrap());
         t.elapsed().as_secs_f64()

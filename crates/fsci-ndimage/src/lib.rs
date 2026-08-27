@@ -2014,10 +2014,7 @@ fn compute_axis_support(
     // Constant/Wrap order∈{1,2,4,5} ~8-18× slower than scipy (the cardinal fast paths only
     // covered Nearest/Reflect/Mirror and Constant-order-3); this routes the rest here.
     bspline_local_support(coeff_len, spline_coord, effective_order, support);
-    if support.is_empty() {
-        return false;
-    }
-    true
+    !support.is_empty()
 }
 
 // Eight parameters because the geometry (input, coeffs, coords, offsets, order, mode,
@@ -10202,7 +10199,7 @@ pub fn shift(
             });
         } else {
             // Resolve ONCE, outside the pixel closure (`frankenscipy-22van`).
-            let flags = SplineFlags::resolve();
+            let _flags = SplineFlags::resolve();
             // Resolved on THIS path. The other binding lives inside the branch that returns
             // early, so it is out of scope here, and exactly one of the two runs per call --
             // which is what `van22_knob_read_is_per_transform` asserts. Resolving inside the

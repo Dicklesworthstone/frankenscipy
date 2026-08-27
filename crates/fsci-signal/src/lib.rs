@@ -35116,7 +35116,7 @@ mod jyfke_trailing_trim_is_exact {
             }
         }
         assert!(
-            want_cola.iter().any(|&x| x == 1.0) && want_cola.iter().any(|&x| x == 0.0),
+            want_cola.contains(&1.0) && want_cola.contains(&0.0),
             "the COLA fixture must contain BOTH answers or it pins nothing"
         );
 

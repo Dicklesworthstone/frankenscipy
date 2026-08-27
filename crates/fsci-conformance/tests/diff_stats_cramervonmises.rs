@@ -235,7 +235,7 @@ fn diff_stats_cramervonmises() {
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let result = cramervonmises(&case.data, &cdf_norm);
+        let result = cramervonmises(&case.data, cdf_norm);
 
         if let Some(scipy_stat) = scipy_arm.statistic
             && result.statistic.is_finite()

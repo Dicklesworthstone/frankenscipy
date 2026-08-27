@@ -458,7 +458,7 @@ pub(crate) fn real_schur_francis(
                 if l >= 2 {
                     scale += h.get(l - 1, l - 2).abs();
                 }
-                if l + 1 <= ihi {
+                if l < ihi {
                     scale += h.get(l + 1, l).abs();
                 }
             }
@@ -517,7 +517,7 @@ pub(crate) fn real_schur_francis(
         // that choice is abandoned for an exceptional shift displaced from the
         // local cluster, because a shift that sits inside a tight cluster barely
         // advances the iteration and gets recomputed identically next sweep.
-        let (s_tr, s_det) = if its > 0 && its % KEXSH == 0 {
+        let (s_tr, s_det) = if its > 0 && its.is_multiple_of(KEXSH) {
             // Anchor on the local subdiagonal magnitude. At its==20 LAPACK
             // re-anchors at the block's other end; alternating the anchor avoids
             // reproducing the same displaced shift twice in a row.

@@ -225,7 +225,7 @@ fn diff_signal_sosfilt() {
         let Some(scipy_v) = scipy_arm.values.as_ref() else {
             continue;
         };
-        let sos: Vec<SosSection> = case.sos.iter().copied().collect();
+        let sos: Vec<SosSection> = case.sos.to_vec();
         let Ok(fsci_v) = sosfilt(&sos, &case.x) else {
             continue;
         };

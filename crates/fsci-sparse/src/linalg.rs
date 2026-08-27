@@ -1867,7 +1867,7 @@ fn scan_matched_prefix(left: &[u32], right: &[u32], bound: usize) -> usize {
     let left = &left[..bound];
     let right = &right[..bound];
     let mut span = 0usize;
-    for (left_block, right_block) in left.chunks_exact(BLOCK).zip(right.chunks_exact(BLOCK)) {
+    for (left_block, right_block) in left.as_chunks::<BLOCK>().0.iter().zip(right.chunks_exact(BLOCK)) {
         let mut all_equal = true;
         for (a, b) in left_block.iter().zip(right_block.iter()) {
             all_equal &= a == b;
@@ -4136,7 +4136,7 @@ impl NativeSparseLu {
         // PLAN FIRST. The whole point of the symbolic pass is that the numeric pass knows
         // its blocks before it starts; a right-looking elimination cannot discover them
         // as it goes, because row k+1 is not final when pivot k is chosen.
-        let initial: Vec<Vec<u32>> = rows.iter().map(|row| row.live_cols().to_vec()).collect();
+        let _initial: Vec<Vec<u32>> = rows.iter().map(|row| row.live_cols().to_vec()).collect();
         // THE PLAN COMES FROM THE TREE, NOT THE PATTERN. `symbolic_fill_pattern` measures
         // O(n^2.19) and 15.35x a factorization; it was the whole of this path's 6.24x deficit on
         // RCM and the reason it never finished on AMD. The elimination tree is 0.039x and the
@@ -7212,7 +7212,7 @@ pub fn lgmres(
     while total_iter < max_iter {
         // r = b - A*x
         let ax = csr_matvec(a, &x);
-        let mut r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
+        let r: Vec<f64> = b.iter().zip(ax.iter()).map(|(bi, axi)| bi - axi).collect();
         let r_norm = vec_norm(&r);
 
         if r_norm / b_norm < options.tol {

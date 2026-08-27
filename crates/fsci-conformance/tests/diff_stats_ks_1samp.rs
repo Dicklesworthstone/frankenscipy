@@ -234,7 +234,7 @@ fn diff_stats_ks_1samp() {
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let result = ks_1samp(&case.data, &cdf_norm);
+        let result = ks_1samp(&case.data, cdf_norm);
 
         if let Some(scipy_stat) = scipy_arm.statistic
             && result.statistic.is_finite()

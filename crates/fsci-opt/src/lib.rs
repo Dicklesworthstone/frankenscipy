@@ -9478,7 +9478,7 @@ mod hessian_update_strategy_tests {
         let b = vec![1.0, -2.0, 3.0, 0.5, -1.5];
 
         // CONTROL: bounds too wide to bind -> ordinary least squares.
-        let x = lsq_linear(&a, &b, &vec![-1.0e6; 3], &vec![1.0e6; 3]).unwrap();
+        let x = lsq_linear(&a, &b, &[-1.0e6; 3], &[1.0e6; 3]).unwrap();
         close(
             "lsq_linear/slack",
             &x,

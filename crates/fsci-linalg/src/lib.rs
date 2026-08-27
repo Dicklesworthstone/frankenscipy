@@ -5199,7 +5199,7 @@ pub fn bench_trailing_syrk_prepare(
         ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
     };
     let n = m2;
-    let mut trailing: Vec<f64> = (0..m2 * n).map(|_| next()).collect();
+    let trailing: Vec<f64> = (0..m2 * n).map(|_| next()).collect();
     let l21: Vec<f64> = (0..m2 * nb).map(|_| next()).collect();
     // Pack the transpose the same way the factor does: micro-panels of 8 rows.
     let npanels = m2.div_ceil(8);
