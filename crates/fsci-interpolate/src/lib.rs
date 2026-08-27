@@ -5394,9 +5394,7 @@ fn rbf_default_degree(kernel: RbfKernel) -> i32 {
     match kernel {
         RbfKernel::Linear => 0,
         RbfKernel::ThinPlateSpline => 1,
-        RbfKernel::Multiquadric
-        | RbfKernel::InverseMultiquadric
-        | RbfKernel::Gaussian => -1,
+        RbfKernel::Multiquadric | RbfKernel::InverseMultiquadric | RbfKernel::Gaussian => -1,
     }
 }
 
@@ -15677,8 +15675,8 @@ mod rch_source_freshness_tests {
 
         let tps = RbfInterpolator::new(&points, &values, RbfKernel::ThinPlateSpline, 1.0)
             .expect("default tps");
-        let linear = RbfInterpolator::new(&points, &values, RbfKernel::Linear, 1.0)
-            .expect("default linear");
+        let linear =
+            RbfInterpolator::new(&points, &values, RbfKernel::Linear, 1.0).expect("default linear");
         for (query, tps_expected) in [(1.5_f64, 4.0_f64), (2.0, 5.0), (3.0, 7.0)] {
             assert!(
                 (tps.eval(&[query]) - tps_expected).abs() < 1e-10,
@@ -15693,15 +15691,14 @@ mod rch_source_freshness_tests {
         }
 
         // MUST-HIT negative case: selecting degree=-1 must retain the old no-tail variant.
-        let no_tail = RbfInterpolator::with_degree(
-            &points,
-            &values,
-            RbfKernel::ThinPlateSpline,
-            1.0,
-            -1,
-        )
-        .expect("degree=-1");
-        for (query, expected) in [(1.5_f64, 10.161878_f64), (2.0, 10.584389), (3.0, -36.696158)] {
+        let no_tail =
+            RbfInterpolator::with_degree(&points, &values, RbfKernel::ThinPlateSpline, 1.0, -1)
+                .expect("degree=-1");
+        for (query, expected) in [
+            (1.5_f64, 10.161878_f64),
+            (2.0, 10.584389),
+            (3.0, -36.696158),
+        ] {
             assert!((no_tail.eval(&[query]) - expected).abs() < 1e-5);
         }
         assert!(RbfInterpolator::with_degree(&points, &values, RbfKernel::Linear, 1.0, 2).is_err());
