@@ -825,6 +825,22 @@ pub fn pdist(x: &[Vec<f64>], metric: DistanceMetric) -> Result<Vec<f64>, Spatial
             let norms: Vec<f64> = points.iter().map(|v| sqsum4(v).sqrt()).collect();
             pdist_fill_cosine4(&points, &norms, n, total, nthreads)
         }
+        // Every width below 16 EXCEPT 4, which keeps its own hand-tuned kernel (that one
+        // also carries a measured serial/parallel crossover this general path has not been
+        // swept for).
+        DistanceMetric::Euclidean
+            if dim != 4
+                && dim > 0
+                && dim < PDIST_SOA_MAX_DIM
+                && PDIST_SOA_EUCLIDEAN.load(std::sync::atomic::Ordering::Relaxed) =>
+        {
+            let mut flat = Vec::with_capacity(n * dim);
+            for row in x {
+                flat.extend_from_slice(row);
+            }
+            let soa = pdist_soa_columns(x, n, dim);
+            pdist_fill_euclidean_soa(&soa, &flat, n, dim, total, nthreads)
+        }
         DistanceMetric::Cosine => {
             let norms: Vec<f64> = x.iter().map(|v| simd_sqsum(v).sqrt()).collect();
             pdist_fill(n, total, nthreads, |i, j| {
@@ -896,6 +912,125 @@ pub fn pdist(x: &[Vec<f64>], metric: DistanceMetric) -> Result<Vec<f64>, Spatial
 /// all-pairs loop load `L` consecutive `j`-points per coordinate with one aligned SIMD
 /// gather, so each output element of a SIMD chunk is a *different* pair — the dependent
 /// per-pair `sqrt`/`div` then pipeline across lanes instead of stalling one at a time.
+/// Largest `dim` for which `sqeuclidean`'s reduction is plainly ascending in `d`, so an
+/// across-pairs kernel accumulating ascending is BIT-identical to it.
+///
+/// `sqeuclidean` runs two 8-wide accumulators and finishes with an ORDERED horizontal
+/// reduce. Below 16 dimensions only `acc0` is ever written, so the reduce is
+/// `0.0 + d₀² + … + d₇²` and any scalar tail continues that same ascending chain. At
+/// `dim == 16` the second accumulator becomes live and `(acc0 + acc1)` pairs lane `k` with
+/// lane `k + 8` BEFORE the reduce — a genuinely different summation order that an ascending
+/// accumulation cannot reproduce. So this bound is a property of the reference reduction,
+/// not a convenience: widening it would silently change results rather than speed them up.
+const PDIST_SOA_MAX_DIM: usize = 16;
+
+/// Route `pdist`'s Euclidean fill through the general across-pairs SoA kernel.
+///
+/// Bit-identical to the `metric_distance` scan it replaces, so this is a cost knob only.
+pub static PDIST_SOA_EUCLIDEAN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Transpose points into flat column-major coordinates: `soa[d * n + i]` is coordinate `d`
+/// of point `i`, so a SIMD load pulls the SAME coordinate from `L` CONSECUTIVE points.
+fn pdist_soa_columns(x: &[Vec<f64>], n: usize, dim: usize) -> Vec<f64> {
+    let mut soa = vec![0.0_f64; n * dim];
+    for (i, row) in x.iter().enumerate() {
+        for d in 0..dim {
+            soa[d * n + i] = row[d];
+        }
+    }
+    soa
+}
+
+/// SIMD-ACROSS-PAIRS Euclidean fill for rows `r0..r1`, for any `dim < PDIST_SOA_MAX_DIM`.
+///
+/// WHY. The generic path calls `euclidean` once per pair, and `sqeuclidean` inside it is
+/// SIMD WITHIN one vector: it produces `dim` squared differences in lanes and then collapses
+/// them with an ORDERED horizontal reduce, which is a chain of dependent adds, followed by a
+/// dependent scalar `sqrt`. At `dim = 8` that is ~8 serial adds plus a `sqrt` for ONE pair,
+/// and `pdist` at n=2000 has 2M pairs. The lanes are being spent on the one axis that has to
+/// be summed away again.
+///
+/// Different PAIRS are independent, so lane `k` here holds pair `(i, start + j + k)` and the
+/// `d` loop walks dimensions on the OUTSIDE. Nothing is ever reduced horizontally: the `d`
+/// accumulation is `L` independent chains, and one `sqrt` covers `L` pairs. This is the same
+/// shape the `dim == 4` kernel already uses; it was simply never written for other widths.
+///
+/// BIT-IDENTICAL, see `PDIST_SOA_MAX_DIM`: each lane accumulates `0.0 + d₀² + … ` ascending,
+/// exactly the chain `sqeuclidean` produces below 16 dimensions, and `Simd::sqrt` is the same
+/// correctly-rounded IEEE operation as `f64::sqrt`. The scalar tail defers to `euclidean`
+/// itself rather than reimplementing it.
+fn fill_euclidean_soa_rows(
+    soa: &[f64],
+    flat: &[f64],
+    n: usize,
+    dim: usize,
+    r0: usize,
+    r1: usize,
+    seg: &mut [f64],
+) {
+    use std::simd::{Simd, StdFloat};
+    const L: usize = 8;
+    let mut pos = 0usize;
+    for i in r0..r1 {
+        let row = n - 1 - i;
+        let start = i + 1;
+        let mut j = 0usize;
+        while j + L <= row {
+            let s = start + j;
+            let mut acc = Simd::<f64, L>::splat(0.0);
+            for d in 0..dim {
+                let column = &soa[d * n..d * n + n];
+                let a = Simd::<f64, L>::splat(column[i]);
+                let b = Simd::<f64, L>::from_slice(&column[s..s + L]);
+                let diff = a - b;
+                acc += diff * diff;
+            }
+            acc.sqrt().copy_to_slice(&mut seg[pos + j..pos + j + L]);
+            j += L;
+        }
+        while j < row {
+            let s = start + j;
+            seg[pos + j] = euclidean(&flat[i * dim..i * dim + dim], &flat[s * dim..s * dim + dim]);
+            j += 1;
+        }
+        pos += row;
+    }
+}
+
+/// Threaded driver for `fill_euclidean_soa_rows`, splitting the condensed output into
+/// disjoint row-aligned segments exactly as the `dim == 4` path does.
+fn pdist_fill_euclidean_soa(
+    soa: &[f64],
+    flat: &[f64],
+    n: usize,
+    dim: usize,
+    total: usize,
+    nthreads: usize,
+) -> Vec<f64> {
+    let mut result = vec![0.0_f64; total];
+    if nthreads <= 1 {
+        fill_euclidean_soa_rows(soa, flat, n, dim, 0, n, &mut result);
+        return result;
+    }
+    let bounds = pdist_row_bounds(n, nthreads);
+    let offset = |r: usize| -> usize { r * (n - 1) - r * (r.saturating_sub(1)) / 2 };
+    std::thread::scope(|scope| {
+        let mut rest: &mut [f64] = &mut result;
+        let mut prev = 0usize;
+        for w in 0..bounds.len() - 1 {
+            let r0 = bounds[w];
+            let r1 = bounds[w + 1];
+            let take = offset(r1) - prev;
+            prev = offset(r1);
+            let (seg, tail) = rest.split_at_mut(take);
+            rest = tail;
+            scope.spawn(move || fill_euclidean_soa_rows(soa, flat, n, dim, r0, r1, seg));
+        }
+    });
+    result
+}
+
 fn dim4_soa(x: &[[f64; 4]]) -> [Vec<f64>; 4] {
     let n = x.len();
     let mut c = [
@@ -13835,6 +13970,107 @@ mod bool_popcount_ab_tests {
     static TOGGLE_LOCK: Mutex<()> = Mutex::new(());
     fn toggle_lock() -> MutexGuard<'static, ()> {
         TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The across-pairs Euclidean kernel must return EXACTLY the bits the per-pair
+    /// `metric_distance` scan returns, for every width it claims.
+    ///
+    /// Bit equality is the right assertion and it is NOT free here: the reference
+    /// `sqeuclidean` is itself SIMD, finishing with an ORDERED horizontal reduce, and the
+    /// new kernel reproduces that chain only because below 16 dimensions just one
+    /// accumulator is live. A tolerance would hide exactly the case this gate exists for.
+    ///
+    /// Sweeps `dim` right up to the boundary (15) and `n` so that the per-row remainder
+    /// `n - 1 - i` takes every value mod the 8-wide lane count — the scalar tail is where an
+    /// off-by-one in a chunked fill hides, and at some rows the tail is the whole row.
+    #[test]
+    fn pdist_soa_euclidean_matches_metric_distance_bits() {
+        let _guard = toggle_lock();
+        let coord = |i: usize, d: usize| -> f64 {
+            let key = (i * 2_654_435_761usize).wrapping_add(d * 40_503) % 100_003;
+            key as f64 / 100_003.0 - 0.5
+        };
+        for dim in [1usize, 2, 3, 5, 6, 7, 8, 9, 12, 15] {
+            for n in [2usize, 3, 8, 9, 10, 16, 17, 23, 40] {
+                let points: Vec<Vec<f64>> = (0..n)
+                    .map(|i| (0..dim).map(|d| coord(i, d)).collect())
+                    .collect();
+
+                PDIST_SOA_EUCLIDEAN.store(false, Ordering::Relaxed);
+                let reference = pdist(&points, DistanceMetric::Euclidean).expect("scalar scan");
+                PDIST_SOA_EUCLIDEAN.store(true, Ordering::Relaxed);
+                let candidate = pdist(&points, DistanceMetric::Euclidean).expect("soa kernel");
+
+                assert_eq!(reference.len(), candidate.len(), "dim={dim} n={n}: length");
+                for (idx, (want, got)) in reference.iter().zip(candidate.iter()).enumerate() {
+                    assert_eq!(
+                        want.to_bits(),
+                        got.to_bits(),
+                        "dim={dim} n={n}: condensed[{idx}] differs ({want} vs {got})"
+                    );
+                }
+            }
+        }
+        PDIST_SOA_EUCLIDEAN.store(true, Ordering::Relaxed);
+    }
+
+    /// The `dim < 16` bound must be the REASON the kernel is exact, not a coincidence.
+    ///
+    /// At `dim == 16` the reference's second accumulator goes live and `(acc0 + acc1)` pairs
+    /// lane `k` with lane `k + 8` before the ordered reduce, so ascending accumulation is a
+    /// different summation order. This asserts the two orders genuinely disagree on real
+    /// data — without it, `PDIST_SOA_MAX_DIM` could be widened by someone who tested only
+    /// well-conditioned inputs, and the gate above would be an unexamined constant.
+    #[test]
+    fn pdist_soa_dim_bound_marks_a_real_change_in_summation_order() {
+        let dim = PDIST_SOA_MAX_DIM; // 16
+        // CONSTRUCTED, not sampled. Random same-scale coordinates round identically under
+        // both orders, so they would show the bound to be arbitrary even when it is real.
+        // Here seven tiny terms sit in lanes 0..8 and the only large term in lane 8, which
+        // is exactly the lane pairing `(acc0 + acc1)` performs:
+        //   ascending  0 + 8·2⁻⁵⁴ = 2⁻⁵¹, then + 1.0  ->  1.0 + 2⁻⁵¹   (2 ULP above one)
+        //   reference  lane 0 becomes 2⁻⁵⁴ + 1.0 -> 1.0 (below half-ULP, absorbed), and
+        //              every later tiny addend is then absorbed too  ->  1.0
+        // Each partial sum above is exactly representable, so the disagreement is a
+        // property of the ORDER and not of the particular values.
+        let mut a = vec![0.0_f64; dim];
+        for slot in a.iter_mut().take(8) {
+            // Square is 2⁻⁵⁴, a QUARTER ULP of 1.0, so `1.0 + t` absorbs it. The square has
+            // to land below the half-ULP 2⁻⁵³ for the pairing to be observable at all.
+            *slot = 2.0f64.powi(-27);
+        }
+        a[8] = 1.0;
+        let b = vec![0.0_f64; dim];
+
+        let reference = sqeuclidean(&a, &b);
+        let ascending = a
+            .iter()
+            .zip(b.iter())
+            .fold(0.0_f64, |acc, (&p, &q)| acc + (p - q) * (p - q));
+
+        assert_ne!(
+            reference.to_bits(),
+            ascending.to_bits(),
+            "at dim={dim} the two-accumulator reduce and an ascending fold agreed, so \
+             PDIST_SOA_MAX_DIM no longer marks a real boundary and this test cannot \
+             justify the gate ({reference:e} vs {ascending:e})"
+        );
+
+        // And one width below the bound the two orders MUST agree, or the gate is drawn in
+        // the wrong place. Without this arm the test above would pass just as happily if
+        // ascending accumulation were wrong everywhere.
+        let below = PDIST_SOA_MAX_DIM - 1;
+        let reference_below = sqeuclidean(&a[..below], &b[..below]);
+        let ascending_below = a[..below]
+            .iter()
+            .zip(b[..below].iter())
+            .fold(0.0_f64, |acc, (&p, &q)| acc + (p - q) * (p - q));
+        assert_eq!(
+            reference_below.to_bits(),
+            ascending_below.to_bits(),
+            "at dim={below}, below the bound, the orders disagreed \
+             ({reference_below:e} vs {ascending_below:e})"
+        );
     }
 
     /// `SPATIAL_BOOL_POPCOUNT_DISABLE` claims the bit-packed popcount path is

@@ -201,6 +201,32 @@ fn main() {
 
     println!("elf_sha256={}", elf_sha256());
 
+    // `FSCI_SPATIAL_PDIST_SOA=0` restores the per-pair `metric_distance` scan.
+    // Only-override-when-asked: storing the parsed value unconditionally would overwrite a
+    // newly flipped library default with `false` whenever the variable is unset.
+    match std::env::var("FSCI_SPATIAL_PDIST_SOA").ok().as_deref() {
+        Some("1") | Some("true") => {
+            fsci_spatial::PDIST_SOA_EUCLIDEAN.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some("0") | Some("false") => {
+            fsci_spatial::PDIST_SOA_EUCLIDEAN.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    // `FSCI_SPATIAL_OPS=pdist` restricts the run to one op, so a `perf stat` total can be
+    // attributed to it; `FSCI_SPATIAL_FIXED_REPS=N` pins repetitions so two arms being
+    // compared on instructions retired do the SAME work (calibration derives reps from
+    // measured time, so a faster arm would otherwise retire fewer for that reason alone).
+    let selected = std::env::var("FSCI_SPATIAL_OPS").unwrap_or_else(|_| "pdist,kdtree".to_owned());
+    let fixed_reps: Option<usize> = std::env::var("FSCI_SPATIAL_FIXED_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    println!(
+        "pdist_soa_euclidean={} available_parallelism={}",
+        fsci_spatial::PDIST_SOA_EUCLIDEAN.load(std::sync::atomic::Ordering::Relaxed),
+        std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get),
+    );
+
     // Deterministic and well spread, so the tree is balanced and no metric degenerates.
     let coord = |i: usize, d: usize| -> f64 {
         let k = (i * 2_654_435_761usize).wrapping_add(d * 40_503) % 100_003;
@@ -214,6 +240,9 @@ fn main() {
         .collect();
 
     for op in ["pdist", "kdtree"] {
+        if !selected.split(',').any(|name| name.trim() == op) {
+            continue;
+        }
         let mut scipy = Scipy::start(op, &points, &queries);
         println!("{}", scipy.ready);
 
@@ -234,22 +263,43 @@ fn main() {
         black_box(ours());
         let _ = scipy.time(1, 1);
 
+        // `FSCI_SPATIAL_FIXED_REPS` repeats the call inside one sample. Default stays 1 so
+        // existing rows keep their meaning; the knob exists so a `perf stat` comparison can
+        // pin both arms to identical work.
+        let reps = fixed_reps.unwrap_or(1).max(1);
         let time_ours = || -> f64 {
             let started = Instant::now();
-            let value = ours();
-            let elapsed = started.elapsed().as_secs_f64() * 1.0e3;
-            black_box(value);
-            elapsed
+            for _ in 0..reps {
+                black_box(ours());
+            }
+            started.elapsed().as_secs_f64() * 1.0e3 / reps as f64
         };
 
         // A-B-B-A per round so each arm carries its own A/A null across the same window.
         let (mut fsci, mut sp, mut null_f, mut null_s) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        for _ in 0..rounds {
-            let a1 = time_ours();
-            let s1 = scipy.time(1, 1);
-            let s2 = scipy.time(1, 1);
-            let a2 = time_ours();
+        // FLIP THE QUARTET EACH ROUND, because A-B-B-A alone balances DRIFT but not
+        // POSITION. In `A B B A` our two samples are the outermost and are separated by both
+        // SciPy samples, while SciPy's two are adjacent — so its A/A null measures a much
+        // shorter interval than ours and is optimistic by construction. That asymmetry made
+        // our null read 1.09-1.12 against SciPy's 1.003-1.012 in every row of this harness,
+        // which looks like our arm being unstable when it is the schedule. Alternating to
+        // `B A A B` on odd rounds gives each arm the inner and outer slots equally often, so
+        // the two nulls become comparable and the medians mean the same thing.
+        for round in 0..rounds {
+            let (a1, s1, s2, a2) = if round % 2 == 0 {
+                let a1 = time_ours();
+                let s1 = scipy.time(reps, 1);
+                let s2 = scipy.time(reps, 1);
+                let a2 = time_ours();
+                (a1, s1, s2, a2)
+            } else {
+                let s1 = scipy.time(reps, 1);
+                let a1 = time_ours();
+                let a2 = time_ours();
+                let s2 = scipy.time(reps, 1);
+                (a1, s1, s2, a2)
+            };
             fsci.push(a1.min(a2));
             sp.push(s1.min(s2));
             null_f.push(a1.max(a2) / a1.min(a2));
