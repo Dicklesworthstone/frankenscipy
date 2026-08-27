@@ -11697,6 +11697,64 @@ const THIN_BIDIAG_LEFT_REPLAY_MIN_COLS_PER_WORKER: usize = 32;
 const THIN_BIDIAG_LEFT_REPLAY_MAX_WORKERS: usize = 8;
 const SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_MIN_DIM: usize = 512;
 const SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_PANEL_WIDTH: usize = 8;
+
+/// Override for the compact-WY back-transform panel width; `0` keeps
+/// [`SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_PANEL_WIDTH`].
+///
+/// WHY THIS IS THE PLACE TO PUSH (frankenscipy-ll0kk). Stage timing on the worst cell in
+/// the suite — `eigh` at n=768, **3.628x slower than 1-thread SciPy** — puts
+/// **61.5%** of the time in the BACK-TRANSFORM, against 24.9% in the tridiagonal reduction
+/// and 13.7% in the tridiagonal solve. The bead's two eliminated candidates were both
+/// aimed at the reduction, which is a quarter of the cost; nobody had looked at the stage
+/// that is nearly two thirds of it.
+///
+/// The back-transform applies `Q = P₀P₁…P_{n-3}` to the eigenvector matrix, which is the
+/// most GEMM-shaped work in the whole algorithm. It is already blocked into compact-WY
+/// panels, but at width **8** — a rank-8 update, where LAPACK's `dormtr` uses 32–64.
+/// `probe_panel_density` measured this crate's own dense kernels reaching 1.4679
+/// FLOPs/instruction on a plain unit-stride loop at k=32/64 against 0.2183 at a bad
+/// stride, so the width is the knob that decides whether this stage runs at rate.
+///
+/// Read ONCE per back-transform at the call boundary, never inside a panel loop.
+/// **Changing the width changes the GROUPING of floating-point operations**, so results
+/// move in the last bits — this is the same trade the existing width-8 blocking already
+/// made against unblocked application, not a new one, and compact-WY is backward stable.
+pub static EIGH_BACKTRANSFORM_PANEL_WIDTH_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn eigh_backtransform_panel_width() -> usize {
+    let override_value =
+        EIGH_BACKTRANSFORM_PANEL_WIDTH_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if override_value == 0 {
+        SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_PANEL_WIDTH
+    } else {
+        override_value
+    }
+}
+
+/// Width actually used by the last compact-WY back-transform, and how many panels it built.
+///
+/// PROOF THAT THE KNOB IS CONNECTED. Sweeping
+/// [`EIGH_BACKTRANSFORM_PANEL_WIDTH_OVERRIDE`] over 8/16/32/64 moved the back-transform by
+/// less than the run-to-run spread. That reading is worth nothing on its own: a width that
+/// does not matter and a width that is never applied produce the identical flat sweep. The
+/// panel COUNT is what separates them — it must fall roughly as `reflectors / width` — so
+/// it is recorded here and printed beside the timing.
+pub static EIGH_BACKTRANSFORM_LAST_WIDTH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Panels the last compact-WY back-transform built; see [`EIGH_BACKTRANSFORM_LAST_WIDTH`].
+pub static EIGH_BACKTRANSFORM_LAST_PANELS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Apply the back-transform through compact-WY panels rather than one reflector at a time.
+///
+/// The A/B arm for the blocking itself, so blocked and unblocked live in ONE binary and can
+/// be alternated inside a single window. Comparing them across two builds is what made the
+/// first reading of this lever unusable: the unblocked figure came from a quiet window and
+/// the blocked one from a window at loadavg 63.
+pub static EIGH_BACKTRANSFORM_BLOCKED_ENABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_PAR_ROWS: usize = 128;
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_ROWS_PER_WORKER: usize = 32;
 const THIN_BIDIAG_RIGHT_REPLAY_MAX_WORKERS: usize = 8;
@@ -12314,6 +12372,25 @@ fn apply_left_reflectors_column_chunks(
     let usable_workers = worker_count
         .min(THIN_BIDIAG_LEFT_REPLAY_MAX_WORKERS)
         .min(cols / THIN_BIDIAG_LEFT_REPLAY_MIN_COLS_PER_WORKER);
+    // THE SERIAL PATH APPLIES REFLECTORS ONE AT A TIME, AND THAT IS THE FASTER ARM.
+    //
+    // Compact-WY blocking is reachable only when `usable_workers > 1`, so pinned to one CPU
+    // — which is how this is measured, and how the 1-thread SciPy arm is compared — the
+    // blocked path never runs. That coupling looks accidental: blocking is a serial
+    // cache transform and has nothing to do with worker count. It was decoupled and
+    // MEASURED, and the coupling turns out to be load-bearing.
+    //
+    // n=768, four replicates alternated ABBA in one window, arm proven by
+    // `EIGH_BACKTRANSFORM_LAST_PANELS` reading 96 against 0:
+    //
+    //     blocked (panels=96)   back-transform median 212.33 ms   range [212.25, 265.26]
+    //     unblocked (panels=0)                 median 187.97 ms   range [187.21, 190.27]
+    //     blocked is 1.130x SLOWER, ranges DISJOINT
+    //
+    // Widening the panel made it worse still (8 -> 32 -> 64 gave 216 -> 224 -> 235 ms), so
+    // the compact-WY form is losing to the plain application at every width tried, not
+    // merely mistuned. Left gated behind the worker count exactly as it was; the toggle and
+    // the panel counters stay so the arm can be re-measured rather than re-derived.
     if rows == 0 || cols == 0 || usable_workers <= 1 || cols < THIN_BIDIAG_LEFT_REPLAY_MIN_PAR_COLS
     {
         for reflector in reflectors.iter().rev() {
@@ -12322,14 +12399,12 @@ fn apply_left_reflectors_column_chunks(
         return;
     }
 
-    let compact_panels = if rows >= SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_MIN_DIM
+    let compact_panels = if EIGH_BACKTRANSFORM_BLOCKED_ENABLE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && rows >= SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_MIN_DIM
         && cols >= SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_MIN_DIM
     {
-        compact_wy_left_backtransform_panels(
-            rows,
-            reflectors,
-            SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_PANEL_WIDTH,
-        )
+        compact_wy_left_backtransform_panels(rows, reflectors, eigh_backtransform_panel_width())
     } else {
         None
     };
@@ -12373,6 +12448,8 @@ fn compact_wy_left_backtransform_panels(
         panels.push(panel);
         start = end;
     }
+    EIGH_BACKTRANSFORM_LAST_WIDTH.store(panel_width, std::sync::atomic::Ordering::Relaxed);
+    EIGH_BACKTRANSFORM_LAST_PANELS.store(panels.len(), std::sync::atomic::Ordering::Relaxed);
     Some(panels)
 }
 

@@ -771,6 +771,32 @@ for raw_line in sys.stdin.buffer:
             .unwrap_or(0x2468_ace0_1357_9bdf);
         assert!(!sizes.is_empty(), "no sizes parsed");
 
+        // `FSCI_EIGH_PANEL_WIDTH=<n>` sweeps the compact-WY back-transform panel width, so
+        // both arms live in ONE binary and can be alternated inside a single window rather
+        // than compared across two builds. Set BEFORE any timing: read here, once, at
+        // startup. Unset keeps the shipping width, and the value is echoed on the banner so
+        // a row cannot silently report a width it did not run.
+        let panel_width: usize = std::env::var("FSCI_EIGH_PANEL_WIDTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        fsci_linalg::EIGH_BACKTRANSFORM_PANEL_WIDTH_OVERRIDE
+            .store(panel_width, std::sync::atomic::Ordering::Relaxed);
+        // `FSCI_EIGH_BLOCKED_BACKTRANSFORM=0` applies the reflectors one at a time, which
+        // is what the serial path did before the panels were decoupled from the worker
+        // count. Both arms in ONE binary so they can be alternated in one window.
+        let blocked = !matches!(
+            std::env::var("FSCI_EIGH_BLOCKED_BACKTRANSFORM")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("false")
+        );
+        fsci_linalg::EIGH_BACKTRANSFORM_BLOCKED_ENABLE
+            .store(blocked, std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "backtransform_panel_width_override={panel_width} (0 = shipping default 8) blocked={blocked}"
+        );
+
         println!(
             "host={} governor={} avx2={} avx512f={} fma={} affinity={} nproc={} loadavg_pre={} rounds={rounds} min_of={min_of} seed={seed:#x}",
             read_trimmed("/proc/sys/kernel/hostname"),
@@ -1123,6 +1149,63 @@ for raw_line in sys.stdin.buffer:
                 );
             }
             print_loadavg_post();
+
+            // WHERE THE CONSTANT FACTOR SITS (frankenscipy-ll0kk). `EIGH_NATIVE_STAGE_NANOS`
+            // has existed for exactly this question and no harness has ever read it, so the
+            // bead's two eliminated candidates -- blocked dsytrd measured SLOWER (0.5-0.81x)
+            // and the refuted clustering gate -- were reached by elimination rather than by
+            // looking. Three stages: 0 reduce (Householder tridiagonalization), 1 solve
+            // (tridiagonal eigenproblem), 2 back-transform.
+            //
+            // Timed OUTSIDE the A/B loop and reported as a SHARE, never as a ratio against
+            // SciPy: `Instant::now()` around each stage is instrumentation, and this crate
+            // has already had one effect inflated 34-fold by counters in a hot path. Shares
+            // are structural enough to survive that; the absolute nanoseconds here are not a
+            // timing claim and must not be quoted as one.
+            {
+                use fsci_linalg::{EIGH_NATIVE_STAGE_NANOS, EIGH_NATIVE_STAGE_TIMING};
+                PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE
+                    .store(min_dim_override, std::sync::atomic::Ordering::Relaxed);
+                for slot in &EIGH_NATIVE_STAGE_NANOS {
+                    slot.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                EIGH_NATIVE_STAGE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+                black_box(eigh(black_box(&a), DecompOptions::default()).expect("staged fsci eigh"));
+                EIGH_NATIVE_STAGE_TIMING.store(false, std::sync::atomic::Ordering::Relaxed);
+                PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+                let stage: Vec<u64> = EIGH_NATIVE_STAGE_NANOS
+                    .iter()
+                    .map(|slot| slot.load(std::sync::atomic::Ordering::Relaxed))
+                    .collect();
+                let total = stage.iter().sum::<u64>().max(1);
+                println!(
+                    "n={n} impl={impl_label} STAGES reduce={:.3}ms solve={:.3}ms back={:.3}ms \
+                     total={:.3}ms shares={:.4}/{:.4}/{:.4} panel_width={} panels={} \
+                     instrumented=true",
+                    stage[0] as f64 / 1.0e6,
+                    stage[1] as f64 / 1.0e6,
+                    stage[2] as f64 / 1.0e6,
+                    total as f64 / 1.0e6,
+                    stage[0] as f64 / total as f64,
+                    stage[1] as f64 / total as f64,
+                    stage[2] as f64 / total as f64,
+                    fsci_linalg::EIGH_BACKTRANSFORM_LAST_WIDTH
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    fsci_linalg::EIGH_BACKTRANSFORM_LAST_PANELS
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                );
+                // MUST-HIT. All-zero counters mean the native path never ran -- at n below
+                // `PUBLIC_NATIVE_EIGH_MIN_DIM` the public entry routes to nalgebra, which
+                // carries no stage instrumentation -- and three zeros divided by a clamped
+                // total print as a tidy 0/0/0 rather than as the nothing they are.
+                if stage.iter().all(|&value| value == 0) {
+                    println!(
+                        "n={n} impl={impl_label} STAGES VOID: no native stage was recorded, so \
+                         this split describes nothing (the public entry did not take the \
+                         native path at this size)"
+                    );
+                }
+            }
 
             let nulls_ok =
                 null_ok(&fsci_null) && null_ok(&scipy_null) && m_scipy1 >= MIN_NULL_MARGIN;
