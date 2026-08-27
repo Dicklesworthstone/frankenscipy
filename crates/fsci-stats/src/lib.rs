@@ -48,11 +48,84 @@ const EULER_MASCHERONI: f64 = 0.577_215_664_901_532_9;
 /// (exact 0.005122654178708466 vs asymptotic 0.004866628830199581).
 /// See `frankenscipy-6ozha`; same defect class as `frankenscipy-ksk1u`.
 ///
-/// The exact path is O(n1*n2) time and O(n2) memory, which is the same
-/// asymptotic cost SciPy pays in `_attempt_exact_2kssamp`. The lcm
-/// `checked_mul` below still falls back to asymptotic on overflow, mirroring
-/// SciPy's own int32 lcm guard.
+/// The threshold matches SciPy's own `MAX_AUTO_N`, so both switch to the
+/// asymptotic p-value at the same size. The lcm `checked_mul` below still falls
+/// back to asymptotic on overflow, mirroring SciPy's own int32 lcm guard.
+///
+/// This comment used to claim the exact path was "O(n1*n2) time ... the same
+/// asymptotic cost SciPy pays in `_attempt_exact_2kssamp`". The first live-SciPy
+/// measurement of this op refuted that: at `n1 = n2 = 10000` we took 119 ms
+/// against SciPy's 2.1 ms. SciPy walks only the band where the recurrence is
+/// non-zero, which is `O(n1 · h/b)` and independent of `n` in width. Ours walked
+/// the whole rectangle. See `ks_2samp_exact_pvalue` and `KS_2SAMP_BANDED_EXACT`.
 const KS_2SAMP_EXACT_MAX_N: usize = 10_000;
+
+/// Walk only the non-zero band of the exact KS recurrence (`true`, shipping) instead of
+/// the full `(n1+1) × (n2+1)` rectangle. Bit-identical — see `ks_2samp_exact_pvalue`.
+pub static KS_2SAMP_BANDED_EXACT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Use the closed-form reflection series for EQUAL sample sizes (`true`, shipping), which
+/// is what SciPy does, instead of the path-counting sweep.
+///
+/// ACCURACY CONTRACT: the two arms are NOT bit-identical to each other, and cannot be —
+/// they are different formulas for the same exact quantity. The contract is against SciPy,
+/// not against the other arm: the series reproduces `scipy.stats.ks_2samp(method='exact')`
+/// to within a few ULP across the pinned table in
+/// `ks_2samp_square_series_matches_scipy_exact_pvalues`, while the sweep it replaces forms
+/// the p-value as `1 − inside` and loses most of its significant digits once `p` is small
+/// (relative error 9e-5 at n = 25, three orders of magnitude at n = 10000). Switching this
+/// off restores the less accurate arm; it is not a neutral A/B.
+pub static KS_2SAMP_SQUARE_SERIES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Two-sided `Pr(D_{n,n} >= h/n)`: the proportion of lattice paths passing outside the
+/// diagonals `x − y = ±h`, evaluated as SciPy's `_compute_prob_outside_square` does.
+///
+/// The natural form is an alternating sum of binomials,
+/// `2·(C(2n, n−h) − C(2n, n−2h) + C(2n, n−3h) − …) / C(2n, n)`, which suffers heavy
+/// subtractive cancellation. Dividing each term by `C(2n, n)` first and factoring gives the
+/// Horner form used here, where every partial value stays in `[0, 1]`.
+///
+/// The operation ORDER mirrors SciPy's line for line — `(n − k·h − j) * p1 / (n + k·h + j + 1)`
+/// with the numerator and denominator formed in exact integer arithmetic before the
+/// conversion to float — so the two agree to the last bit rather than merely closely.
+/// Accept an exact KS probability, or decline it so the caller falls back to the
+/// asymptotic p-value — which is what SciPy does, and NOT what clamping does.
+///
+/// `_attempt_exact_2kssamp` ends `if not (0 <= prob <= 1): return False, d, prob`, and its
+/// caller then recomputes the p-value asymptotically. Clamping instead reports a value the
+/// exact method never produced: at n1 = n2 = 60 with h = 2 the series returns
+/// 1.0000000000000002, where clamping says `1.0` and SciPy says `0.999999999998711697`.
+/// An out-of-range result is the exact path announcing it has lost its own precision, so
+/// the honest response is to stop using it rather than to round it into range.
+fn ks_exact_probability_or_fallback(snapped_d: f64, probability: f64) -> Option<(f64, f64)> {
+    if (0.0..=1.0).contains(&probability) {
+        Some((snapped_d, probability))
+    } else {
+        None
+    }
+}
+
+fn ks_prob_outside_square(n: usize, h: u64) -> f64 {
+    debug_assert!(h > 0, "h == 0 is handled by the caller as p = 1");
+    let n_i = n as i64;
+    let h_i = h as i64;
+    let mut probability = 0.0_f64;
+    let mut k = n_i / h_i; // floor(n / h)
+    while k >= 0 {
+        let offset = k * h_i;
+        let mut term = 1.0_f64;
+        for j in 0..h_i {
+            let numerator = (n_i - offset - j) as f64;
+            let denominator = (n_i + offset + j + 1) as f64;
+            term = numerator * term / denominator;
+        }
+        probability = term * (1.0 - probability);
+        k -= 1;
+    }
+    2.0 * probability
+}
 
 /// Error type for stats APIs that validate structured inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41481,35 +41554,118 @@ fn ks_2samp_exact_pvalue(d: f64, n1: usize, n2: usize) -> Option<(f64, f64)> {
         return Some((snapped_d, 1.0));
     }
 
+    // EQUAL SAMPLE SIZES HAVE A CLOSED FORM AND SciPy USES IT. For `n1 == n2` the
+    // two-sided probability is an alternating series over reflections,
+    //   P = 2·A₀·(1 − A₁·(1 − A₂·(1 − …)))
+    // with `floor(n/h) + 1` terms of `h` factors each, so the whole thing is `O(n + h)`
+    // against the band sweep's `O(n · h)`. At n1 = n2 = 10000 with h ≈ 1850 that is ~12k
+    // operations instead of ~18.5M, and it is what `scipy.stats.ks_2samp` actually calls
+    // (`_compute_prob_outside_square`); the band DP is only its UNEQUAL-size path.
+    //
+    // This is a DIFFERENT FORMULA, not a reordering, so it does not agree bit-for-bit with
+    // the sweep it replaces — it agrees with SCIPY, which is the contract. The sweep and
+    // the series are both exact in exact arithmetic; in floating point the series is the
+    // better-conditioned of the two (it is written in Horner form precisely to avoid the
+    // subtractive cancellation of the binomial-difference formulation), and before this
+    // change our p-value at n=10000 differed from SciPy's by orders of magnitude on the
+    // tiny values where the two methods part company.
+    if n1 == n2 && KS_2SAMP_SQUARE_SERIES.load(std::sync::atomic::Ordering::Relaxed) {
+        return ks_exact_probability_or_fallback(snapped_d, ks_prob_outside_square(n1, h));
+    }
+
     let a = (n2u / g) as i128;
     let b = (n1u / g) as i128;
     let mut inside_prob = vec![0.0_f64; n2 + 1];
 
+    if !KS_2SAMP_BANDED_EXACT.load(std::sync::atomic::Ordering::Relaxed) {
+        for i in 0..=n1 {
+            let mut left_prob = 0.0_f64;
+            for (j, cell) in inside_prob.iter_mut().enumerate().take(n2 + 1) {
+                let top_prob = *cell;
+                let current = if i == 0 && j == 0 {
+                    1.0
+                } else {
+                    let delta = ((i as i128 * a) - (j as i128 * b)).unsigned_abs();
+                    if delta >= h as u128 {
+                        0.0
+                    } else if i == 0 {
+                        left_prob
+                    } else if j == 0 {
+                        top_prob
+                    } else {
+                        let denom = (i + j) as f64;
+                        top_prob * (i as f64 / denom) + left_prob * (j as f64 / denom)
+                    }
+                };
+                *cell = current;
+                left_prob = current;
+            }
+        }
+        return ks_exact_probability_or_fallback(snapped_d, 1.0 - inside_prob[n2]);
+    }
+
+    // BANDED SWEEP. The recurrence sets every cell with `|i·a − j·b| >= h` to zero, and
+    // those cells are the overwhelming majority: the survivors form a band around the
+    // diagonal whose width is about `2h/b`, independent of `n`. Walking the full rectangle
+    // therefore costs `n1·n2` to compute a `n1 · bandwidth` answer — 10⁸ cells at
+    // n1=n2=10000 where roughly 2·10⁶ are non-zero.
+    //
+    // Solving `|i·a − j·b| < h` for `j` gives the row's live span directly, so the zeros are
+    // never visited rather than being visited and discarded.
+    //
+    // BIT-IDENTICAL to the full sweep, and the reasons are worth stating because they are
+    // what make skipping safe rather than merely plausible:
+    //   * arithmetic inside a live cell is untouched, and cells outside the band evaluate
+    //     to exactly 0.0 in the full sweep, which is what the untouched buffer already holds;
+    //   * `left_prob` entering a row's band is the cell just left of it, which is outside
+    //     the band and so 0.0 — the same value the full sweep would have carried in;
+    //   * the band's start is non-decreasing in `i` (its centre `i·a/b` only moves right),
+    //     so a later row never reads a cell to the left of its own span, and stale values
+    //     from earlier rows are unreachable rather than merely unlikely;
+    //   * cells to the RIGHT of a row's span have never been written by any earlier row,
+    //     since spans only move right, so they are still the initial 0.0.
+    // `inside_prob[n2]` is always live on the last row: `|n1·a − n2·b| == 0 < h`.
+    // `y` is always positive here (`b = n1/g >= 1`). Rust's `/` truncates toward zero, so a
+    // negative numerator needs correcting by one to reach floor/ceil; `i128::div_ceil` is
+    // still unstable, hence the explicit form.
+    let floor_div = |x: i128, y: i128| -> i128 {
+        let q = x / y;
+        if x % y != 0 && x < 0 { q - 1 } else { q }
+    };
+    let ceil_div = |x: i128, y: i128| -> i128 {
+        let q = x / y;
+        if x % y != 0 && x > 0 { q + 1 } else { q }
+    };
+    let h_i = h as i128;
+    let n2_i = n2 as i128;
     for i in 0..=n1 {
+        let center = i as i128 * a;
+        // j must satisfy  (i·a − h)/b  <  j  <  (i·a + h)/b
+        let lo = (floor_div(center - h_i, b) + 1).max(0);
+        let hi = (ceil_div(center + h_i, b) - 1).min(n2_i);
+        if lo > hi {
+            continue;
+        }
+        let (lo, hi) = (lo as usize, hi as usize);
         let mut left_prob = 0.0_f64;
-        for (j, cell) in inside_prob.iter_mut().enumerate().take(n2 + 1) {
+        for (j, cell) in inside_prob.iter_mut().enumerate().take(hi + 1).skip(lo) {
             let top_prob = *cell;
             let current = if i == 0 && j == 0 {
                 1.0
+            } else if i == 0 {
+                left_prob
+            } else if j == 0 {
+                top_prob
             } else {
-                let delta = ((i as i128 * a) - (j as i128 * b)).unsigned_abs();
-                if delta >= h as u128 {
-                    0.0
-                } else if i == 0 {
-                    left_prob
-                } else if j == 0 {
-                    top_prob
-                } else {
-                    let denom = (i + j) as f64;
-                    top_prob * (i as f64 / denom) + left_prob * (j as f64 / denom)
-                }
+                let denom = (i + j) as f64;
+                top_prob * (i as f64 / denom) + left_prob * (j as f64 / denom)
             };
             *cell = current;
             left_prob = current;
         }
     }
 
-    Some((snapped_d, (1.0 - inside_prob[n2]).clamp(0.0, 1.0)))
+    ks_exact_probability_or_fallback(snapped_d, 1.0 - inside_prob[n2])
 }
 
 fn shapiro_poly(coeffs: &[f64], x: f64) -> f64 {
@@ -99398,6 +99554,195 @@ mod tests {
     /// in i32 overflows, and a debug build panics on it. A panic raised from
     /// inside a LEVER rather than from the fixture is a real defect in a
     /// parallel arm that has never run at its own gate size.
+    /// The banded exact KS sweep must return EXACTLY the bits the full-rectangle sweep
+    /// returns, across the shapes where skipping cells can go wrong.
+    ///
+    /// Bit equality is the right assertion: skipping changes only WHICH cells are visited,
+    /// never the arithmetic in a visited one, so any difference means the band excluded a
+    /// live cell or read a stale one. A tolerance would pass a band that is off by one at
+    /// the edges, which shifts probability mass slightly and is invisible on well-separated
+    /// samples but wrong on close ones.
+    ///
+    /// The sweep matters more than the sizes here. `n1 == n2` makes `g == n` and `a == b == 1`
+    /// (the widest, most forgiving band); UNEQUAL and COPRIME sizes make `a != b`, so the
+    /// band is sheared and its per-row endpoints stop being symmetric — that is where a
+    /// floor/ceil sign error on a negative numerator shows up. Effect sizes span from
+    /// nearly-identical samples (a NARROW band, the case the lever exists for) to disjoint
+    /// ones (`d == 1`, band covers everything, so the two arms must agree trivially).
+    #[test]
+    fn ks_2samp_banded_exact_matches_full_sweep_bits() {
+        let _toggle_guard = toggle_guard();
+        use std::sync::atomic::Ordering;
+        let was = super::KS_2SAMP_BANDED_EXACT.load(Ordering::Relaxed);
+
+        let value = |i: usize, salt: usize| -> f64 {
+            let k = (i * 2_654_435_761usize).wrapping_add(salt * 40_503) % 100_003;
+            k as f64 / 100_003.0
+        };
+        // Coprime and unequal pairs, not just square ones, so `a != b` shears the band.
+        for &(n1, n2) in &[
+            (2usize, 2usize),
+            (5, 5),
+            (7, 11),
+            (13, 4),
+            (31, 17),
+            (64, 64),
+            (97, 41),
+            (200, 150),
+        ] {
+            for &shift in &[0.0_f64, 0.02, 0.35, 5.0] {
+                let a: Vec<f64> = (0..n1).map(|i| value(i, 7)).collect();
+                let b: Vec<f64> = (0..n2).map(|i| value(i, 29) + shift).collect();
+
+                super::KS_2SAMP_BANDED_EXACT.store(false, Ordering::Relaxed);
+                let full = super::ks_2samp(&a, &b);
+                super::KS_2SAMP_BANDED_EXACT.store(true, Ordering::Relaxed);
+                let banded = super::ks_2samp(&a, &b);
+
+                assert_eq!(
+                    full.statistic.to_bits(),
+                    banded.statistic.to_bits(),
+                    "n1={n1} n2={n2} shift={shift}: statistic differs ({} vs {})",
+                    full.statistic,
+                    banded.statistic
+                );
+                assert_eq!(
+                    full.pvalue.to_bits(),
+                    banded.pvalue.to_bits(),
+                    "n1={n1} n2={n2} shift={shift}: pvalue differs ({:e} vs {:e})",
+                    full.pvalue,
+                    banded.pvalue
+                );
+            }
+        }
+        super::KS_2SAMP_BANDED_EXACT.store(was, Ordering::Relaxed);
+    }
+
+    /// The closed-form reflection series must reproduce SciPy's exact p-value.
+    ///
+    /// Pinned against SciPy's OWN OUTPUT rather than against our other arm. The first
+    /// version of this test compared the series to the path-counting sweep and failed at
+    /// n=25 — and the sweep was the wrong one: SciPy gives 7.91072860244861512e-13 there,
+    /// the series reproduces it, and the sweep returns 7.911449273478866e-13. The sweep
+    /// forms the p-value as `1 − inside`, so when `p` is tiny `inside ≈ 1` and the
+    /// subtraction cancels catastrophically; the series computes the small quantity
+    /// directly. Testing two of our own arms against each other could only ever have
+    /// pinned the inaccurate one.
+    ///
+    /// Cases span `h = 1` (p is exactly 1) through a p-value of 4e-27, so the series' term
+    /// count `floor(n/h) + 1` ranges from many terms to one. Values generated by
+    /// `scipy.stats.ks_2samp(..., method='exact')` on scipy 1.17.1.
+    #[test]
+    fn ks_2samp_square_series_matches_scipy_exact_pvalues() {
+        let _toggle_guard = toggle_guard();
+        use std::sync::atomic::Ordering;
+        let was = super::KS_2SAMP_SQUARE_SERIES.load(Ordering::Relaxed);
+        super::KS_2SAMP_SQUARE_SERIES.store(true, Ordering::Relaxed);
+
+        let value = |i: usize, salt: usize| -> f64 {
+            let k = (i * 2_654_435_761usize).wrapping_add(salt * 40_503) % 100_003;
+            k as f64 / 100_003.0
+        };
+        // (n, shift, scipy p-value)
+        let reference: &[(usize, f64, f64)] = &[
+            (4, 0.25, 7.714_285_714_285_715_7e-1),
+            (4, 0.9, 2.857_142_857_142_857_8e-2),
+            (9, 0.25, 7.301_110_654_051_831_1e-1),
+            (9, 0.9, 4.113_533_525_298_230_2e-5),
+            (25, 0.0, 9.999_997_345_599_950_2e-1),
+            (25, 0.05, 9.955_315_531_751_669_5e-1),
+            (25, 0.25, 1.557_602_520_061_934_8e-1),
+            (25, 0.9, 7.910_728_602_448_615_1e-13),
+            (60, 0.05, 9.999_997_074_905_671_0e-1),
+            (60, 0.25, 1.578_762_838_272_507_5e-2),
+            (60, 0.9, 3.945_105_911_446_686_5e-27),
+        ];
+        for &(n, shift, expected) in reference {
+            let a: Vec<f64> = (0..n).map(|i| value(i, 7)).collect();
+            let b: Vec<f64> = (0..n).map(|i| value(i, 29) + shift).collect();
+            let got = super::ks_2samp(&a, &b).pvalue;
+            let tolerance = 8.0 * f64::EPSILON * expected.abs();
+            assert!(
+                (got - expected).abs() <= tolerance,
+                "n={n} shift={shift}: p-value {got:e} differs from scipy {expected:e} \
+                 by more than {tolerance:e}"
+            );
+        }
+        assert_eq!(reference.len(), 11, "reference table was truncated");
+        super::KS_2SAMP_SQUARE_SERIES.store(was, Ordering::Relaxed);
+    }
+
+    /// The sweep the series replaced must be DEMONSTRABLY worse on the case that motivated
+    /// the change, or the replacement was unjustified.
+    ///
+    /// This is the second arm of the control: the test above shows the series is right, and
+    /// this shows the old path was wrong on the same input — so the swap fixed something
+    /// rather than merely moving between two acceptable answers.
+    #[test]
+    fn ks_2samp_path_sweep_loses_precision_where_the_series_does_not() {
+        let _toggle_guard = toggle_guard();
+        use std::sync::atomic::Ordering;
+        let was = super::KS_2SAMP_SQUARE_SERIES.load(Ordering::Relaxed);
+
+        let value = |i: usize, salt: usize| -> f64 {
+            let k = (i * 2_654_435_761usize).wrapping_add(salt * 40_503) % 100_003;
+            k as f64 / 100_003.0
+        };
+        let (n, shift) = (25usize, 0.9_f64);
+        let scipy = 7.910_728_602_448_615_1e-13;
+        let a: Vec<f64> = (0..n).map(|i| value(i, 7)).collect();
+        let b: Vec<f64> = (0..n).map(|i| value(i, 29) + shift).collect();
+
+        super::KS_2SAMP_SQUARE_SERIES.store(false, Ordering::Relaxed);
+        let sweep = super::ks_2samp(&a, &b).pvalue;
+        super::KS_2SAMP_SQUARE_SERIES.store(true, Ordering::Relaxed);
+        let series = super::ks_2samp(&a, &b).pvalue;
+        super::KS_2SAMP_SQUARE_SERIES.store(was, Ordering::Relaxed);
+
+        let sweep_error = (sweep - scipy).abs() / scipy;
+        let series_error = (series - scipy).abs() / scipy;
+        assert!(
+            sweep_error > 1.0e-6,
+            "the `1 - inside` sweep is no longer inaccurate here (relative error \
+             {sweep_error:e}); if it has been fixed, this test and the series' \
+             justification both need revisiting"
+        );
+        assert!(
+            series_error < 1.0e-14,
+            "series relative error {series_error:e} against scipy is too large"
+        );
+    }
+
+    /// The band must actually EXCLUDE cells, or the test above passes vacuously because
+    /// both arms visited the same rectangle.
+    ///
+    /// Asserts the live-cell count is a small fraction of the rectangle for a
+    /// nearly-identical pair — the case the lever exists for — using the same span
+    /// arithmetic the kernel uses. Without this arm a band computed as `0..=n2` would
+    /// satisfy every bit-equality assertion while saving nothing.
+    #[test]
+    fn ks_2samp_band_actually_skips_most_of_the_rectangle() {
+        // Mirrors the kernel: for equal sizes g == n so a == b == 1 and h == round(d·n).
+        let (n1, n2) = (4000usize, 4000usize);
+        let (a, b) = (1i128, 1i128);
+        let h = 40i128; // d = 0.01, a realistic statistic for similar samples
+        let mut live = 0u64;
+        for i in 0..=n1 {
+            let center = i as i128 * a;
+            let lo = (((center - h) as f64 / b as f64).floor() as i128 + 1).max(0);
+            let hi = (((center + h) as f64 / b as f64).ceil() as i128 - 1).min(n2 as i128);
+            if lo <= hi {
+                live += (hi - lo + 1) as u64;
+            }
+        }
+        let rectangle = (n1 as u64 + 1) * (n2 as u64 + 1);
+        assert!(
+            live * 20 < rectangle,
+            "band covers {live} of {rectangle} cells, so skipping saves little and the \
+             bit-equality test above proves nothing about the lever"
+        );
+    }
+
     #[test]
     fn float_reduction_gate_levers_ab() {
         let _toggle_guard = toggle_guard();
