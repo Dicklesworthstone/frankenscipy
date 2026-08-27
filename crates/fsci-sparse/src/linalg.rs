@@ -2110,6 +2110,7 @@ fn factorize_csr_banded(
         }
     }
 
+    let t_eliminate = splu_banded_stage_start();
     let mut offset = Vec::with_capacity(n + 1);
     offset.push(0usize);
     for row in 0..n {
@@ -2165,12 +2166,37 @@ fn factorize_csr_banded(
         }
     }
 
+    splu_banded_stage_record(0, t_eliminate);
+    let t_unpack = splu_banded_stage_start();
+
     // Unpack the band back into the crate's row format so every consumer is unchanged.
+    //
+    // RESERVE, DO NOT GROW. The band width of every row is known exactly here — it is
+    // `hi[row] - lo[row] + 1`, the same quantity `offset` was built from — yet these vectors
+    // started empty and were grown by `push`. At n=16,384 the factor holds ~2.84M entries
+    // spread over ~32,768 vectors, so that is ~2.84M pushes against capacities that double
+    // from zero: roughly eight reallocations per vector, each copying everything written so
+    // far. Reserving is a capacity hint only; it touches no value, no index and no length, so
+    // the rows produced are bit-identical.
     let mut l_rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
     let mut u_rows: Vec<(Vec<u32>, Vec<f64>)> = Vec::with_capacity(n);
+    let reserve = SPLU_BANDED_UNPACK_RESERVE.load(std::sync::atomic::Ordering::Relaxed);
+    if reserve {
+        for row in 0..n {
+            // Row `row` contributes at most `row - lo[row]` entries to L and
+            // `hi[row] - row + 1` to U, and never more.
+            l_rows[row].reserve_exact(row.saturating_sub(lo[row]));
+        }
+        SPLU_BANDED_UNPACK_RESERVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     for row in 0..n {
         let base = offset[row];
-        let (mut cols, mut vals) = (Vec::new(), Vec::new());
+        let span = hi[row] + 1 - row;
+        let (mut cols, mut vals) = if reserve {
+            (Vec::with_capacity(span), Vec::with_capacity(span))
+        } else {
+            (Vec::new(), Vec::new())
+        };
         for column in lo[row]..=hi[row] {
             let value = values[base + (column - lo[row])];
             if value == 0.0 {
@@ -2188,6 +2214,7 @@ fn factorize_csr_banded(
         }
         u_rows.push((cols, vals));
     }
+    splu_banded_stage_record(1, t_unpack);
     // `from_factor_rows` takes U in a different shape under `cfg(test)` than it does in the
     // shipping build, so the rows are assembled once and adapted here rather than built twice.
     #[cfg(test)]
@@ -30897,6 +30924,45 @@ pub static SPLU_SUPERNODAL_ENABLE: PerfToggle = PerfToggle::new(false);
 /// measured band_density 0.0019 on a down-arrow and 0.2729 on a skew band, both declined.
 #[doc(hidden)]
 pub static SPLU_BANDED_ENABLE: PerfToggle = PerfToggle::new(true);
+
+/// Reserve exact capacity for the banded unpack's per-row vectors instead of growing them.
+///
+/// The unpack is the stage that turns the dense band back into the crate's row format. Every
+/// row's width is known exactly (`hi - lo + 1`), yet the vectors started empty. Reserving is a
+/// capacity hint — no value, index or length changes — so the factor is bit-identical.
+#[doc(hidden)]
+pub static SPLU_BANDED_UNPACK_RESERVE: PerfToggle = PerfToggle::new(true);
+/// Factorizations that took the reserving unpack — "enabled" is not "took effect".
+#[doc(hidden)]
+pub static SPLU_BANDED_UNPACK_RESERVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Split the banded factorization into elimination and unpack, so the loss decomposition can
+/// say which of them the "per stored nonzero" figure is actually measuring.
+#[doc(hidden)]
+pub static SPLU_BANDED_STAGE_TIMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Accumulated nanoseconds: `[0]` fill + elimination, `[1]` unpack.
+#[doc(hidden)]
+pub static SPLU_BANDED_STAGE_NANOS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[inline]
+fn splu_banded_stage_start() -> Option<std::time::Instant> {
+    SPLU_BANDED_STAGE_TIMING
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(std::time::Instant::now)
+}
+
+#[inline]
+fn splu_banded_stage_record(stage: usize, started: Option<std::time::Instant>) {
+    if let Some(at) = started {
+        let nanos = u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        SPLU_BANDED_STAGE_NANOS[stage].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 /// Factorizations that took the banded path. A silent decline would make the toggle read as inert.
 #[doc(hidden)]
 pub static SPLU_BANDED_FACTOR_HITS: std::sync::atomic::AtomicUsize =

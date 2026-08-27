@@ -50,9 +50,10 @@ mod bench {
     use fsci_sparse::{
         CooMatrix, CscMatrix, FormatConvertible, LuOptions, PermutationOrdering,
         SPLU_BACK_MERGE_ENABLE, SPLU_BACK_MERGE_FACTOR_HITS, SPLU_BANDED_ENABLE,
-        SPLU_BANDED_FACTOR_HITS, SPLU_CONTIGUOUS_SOLVE_ENABLE, SPLU_CONTIGUOUS_SOLVE_HITS,
-        SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS, SPLU_PARTIAL_INPLACE_ENABLE,
-        SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
+        SPLU_BANDED_FACTOR_HITS, SPLU_BANDED_STAGE_NANOS, SPLU_BANDED_STAGE_TIMING,
+        SPLU_BANDED_UNPACK_RESERVE, SPLU_BANDED_UNPACK_RESERVE_HITS, SPLU_CONTIGUOUS_SOLVE_ENABLE,
+        SPLU_CONTIGUOUS_SOLVE_HITS, SPLU_CUBIC_SPECTRAL_DISABLE, SPLU_CUBIC_SPECTRAL_FACTOR_HITS,
+        SPLU_PARTIAL_INPLACE_ENABLE, SPLU_PARTIAL_INPLACE_FACTOR_HITS, SPLU_ROW_HEAD_CACHE_DISABLE,
         SPLU_ROW_HEAD_CACHE_FACTOR_HITS, SPLU_SUPERNODAL_ENABLE, SPLU_SUPERNODAL_FACTOR_HITS,
         SPLU_SWAP_WRITEBACK_ENABLE, SPLU_SWAP_WRITEBACK_HITS, Shape2D, splu,
         splu_factor_payload_bytes, splu_solve,
@@ -1075,6 +1076,22 @@ for raw_line in sys.stdin.buffer:
         let contiguous_solve_hits_before = SPLU_CONTIGUOUS_SOLVE_HITS.load(Ordering::Relaxed);
         let banded_requested = SPLU_BANDED_ENABLE.load(Ordering::Relaxed);
         let banded_hits_before = SPLU_BANDED_FACTOR_HITS.load(Ordering::Relaxed);
+        // `FSCI_SPLU_UNPACK_RESERVE=0` restores the growing per-row vectors in the banded
+        // unpack. Only-override-when-asked, so an unset variable keeps the shipping default.
+        match std::env::var("FSCI_SPLU_UNPACK_RESERVE").ok().as_deref() {
+            Some("1") | Some("true") => SPLU_BANDED_UNPACK_RESERVE.store(true, Ordering::Relaxed),
+            Some("0") | Some("false") => {
+                SPLU_BANDED_UNPACK_RESERVE.store(false, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        if std::env::var("FSCI_SPLU_BANDED_STAGES").is_ok_and(|v| v != "0") {
+            for slot in &SPLU_BANDED_STAGE_NANOS {
+                slot.store(0, Ordering::Relaxed);
+            }
+            SPLU_BANDED_STAGE_TIMING.store(true, Ordering::Relaxed);
+        }
+        let unpack_reserve_hits_before = SPLU_BANDED_UNPACK_RESERVE_HITS.load(Ordering::Relaxed);
         let swap_writeback_hits_before = SPLU_SWAP_WRITEBACK_HITS.load(Ordering::Relaxed);
         let supernodal_hits_before = SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed);
         SPLU_SUPERNODAL_ENABLE.reset_load_count();
@@ -1388,6 +1405,24 @@ for raw_line in sys.stdin.buffer:
         // and must be read as such, not as a supernodal result.
         let supernodal_hits =
             SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed) - supernodal_hits_before;
+        {
+            let stage: Vec<u64> = SPLU_BANDED_STAGE_NANOS
+                .iter()
+                .map(|slot| slot.load(Ordering::Relaxed))
+                .collect();
+            let total = stage.iter().sum::<u64>();
+            println!(
+                "execution_proof: banded_eliminate_ms={:.3} banded_unpack_ms={:.3} \
+                 unpack_share={:.4} unpack_reserve={} unpack_reserve_hits={} instrumented={}",
+                stage[0] as f64 / 1.0e6,
+                stage[1] as f64 / 1.0e6,
+                stage[1] as f64 / total.max(1) as f64,
+                SPLU_BANDED_UNPACK_RESERVE.load(Ordering::Relaxed),
+                SPLU_BANDED_UNPACK_RESERVE_HITS.load(Ordering::Relaxed)
+                    - unpack_reserve_hits_before,
+                total > 0,
+            );
+        }
         println!(
             "execution_proof: banded_requested={banded_requested} banded_factor_hits={}",
             SPLU_BANDED_FACTOR_HITS.load(Ordering::Relaxed) - banded_hits_before
