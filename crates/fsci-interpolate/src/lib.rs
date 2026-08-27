@@ -5390,6 +5390,30 @@ impl RbfInterpolator {
     }
 }
 
+fn rbf_default_degree(kernel: RbfKernel) -> i32 {
+    match kernel {
+        RbfKernel::Linear => 0,
+        RbfKernel::ThinPlateSpline => 1,
+        RbfKernel::Multiquadric
+        | RbfKernel::InverseMultiquadric
+        | RbfKernel::Gaussian => -1,
+    }
+}
+
+fn rbf_polynomial_terms(point: &[f64], degree: i32) -> Vec<f64> {
+    match degree {
+        -1 => Vec::new(),
+        0 => vec![1.0],
+        1 => {
+            let mut terms = Vec::with_capacity(point.len() + 1);
+            terms.push(1.0);
+            terms.extend_from_slice(point);
+            terms
+        }
+        _ => unreachable!("RbfInterpolator degree was validated at construction"),
+    }
+}
+
 /// Map `f` over `queries`, splitting the work across threads when
 /// `queries.len() * work_per_query` is large enough to amortise thread spawn. `f` is
 /// a pure per-query function, so the parallel result is bit-identical to the
