@@ -8818,7 +8818,16 @@ pub fn lfilter_with_state(
     let na = a.len();
     let nfilt = nb.max(na);
 
-    if nfilt <= 3 {
+    // WIDENED 3 -> 5. The unrolled transposed-direct-form-II arms keep the whole delay
+    // line in registers; the general path below carries it in a `Vec` and loops over taps.
+    // The gate stopped at 3, so a 4th-order Butterworth — `nfilt = 5`, the single most
+    // common IIR in practice and what `scipy.signal.butter(4, ...)` produces — missed it
+    // entirely and took the general path.
+    //
+    // Bit-identical: the unrolled arms perform the SAME transposed-direct-form-II
+    // recurrence in the SAME order on the same normalised coefficients, which is what
+    // `lfilter_low_order_matches_general_path_bits` checks against the general path.
+    if nfilt <= LFILTER_LOW_ORDER_MAX_NFILT.load(std::sync::atomic::Ordering::Relaxed) {
         return lfilter_low_order_with_state(b, a, a0, x, zi, nfilt);
     }
 
@@ -9077,6 +9086,12 @@ fn lfilter_df2t_scan_parallel(
     (y, zf)
 }
 
+/// Largest `nfilt` routed to the unrolled low-order `lfilter` arms.
+///
+/// A/B knob for the gate widening, so both shapes live in one binary. `3` is the old value.
+pub static LFILTER_LOW_ORDER_MAX_NFILT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(5);
+
 fn lfilter_low_order_with_state(
     b: &[f64],
     a: &[f64],
@@ -9088,6 +9103,8 @@ fn lfilter_low_order_with_state(
     let expected_zi = nfilt - 1;
     let mut d0 = 0.0;
     let mut d1 = 0.0;
+    let mut d2 = 0.0;
+    let mut d3 = 0.0;
     if let Some(initial) = zi {
         if initial.len() != expected_zi {
             validate_real_values_finite(x, "lfilter input samples must be finite")?;
@@ -9109,13 +9126,23 @@ fn lfilter_low_order_with_state(
         if expected_zi > 1 {
             d1 = initial[1];
         }
+        if expected_zi > 2 {
+            d2 = initial[2];
+        }
+        if expected_zi > 3 {
+            d3 = initial[3];
+        }
     }
 
     let b0 = b[0] / a0;
     let b1 = if b.len() > 1 { b[1] / a0 } else { 0.0 };
     let b2 = if b.len() > 2 { b[2] / a0 } else { 0.0 };
+    let b3 = if b.len() > 3 { b[3] / a0 } else { 0.0 };
+    let b4 = if b.len() > 4 { b[4] / a0 } else { 0.0 };
     let a1 = if a.len() > 1 { a[1] / a0 } else { 0.0 };
     let a2 = if a.len() > 2 { a[2] / a0 } else { 0.0 };
+    let a3 = if a.len() > 3 { a[3] / a0 } else { 0.0 };
+    let a4 = if a.len() > 4 { a[4] / a0 } else { 0.0 };
 
     let mut y = Vec::with_capacity(x.len());
     match nfilt {
@@ -9157,7 +9184,38 @@ fn lfilter_low_order_with_state(
             }
             Ok((y, vec![d0, d1]))
         }
-        _ => unreachable!("low-order lfilter only handles nfilt <= 3"),
+        4 => {
+            for &xi in x {
+                if !xi.is_finite() {
+                    return Err(SignalError::NonFiniteInput {
+                        detail: "lfilter input samples must be finite".to_string(),
+                    });
+                }
+                let yi = b0 * xi + d0;
+                y.push(yi);
+                d0 = b1 * xi - a1 * yi + d1;
+                d1 = b2 * xi - a2 * yi + d2;
+                d2 = b3 * xi - a3 * yi;
+            }
+            Ok((y, vec![d0, d1, d2]))
+        }
+        5 => {
+            for &xi in x {
+                if !xi.is_finite() {
+                    return Err(SignalError::NonFiniteInput {
+                        detail: "lfilter input samples must be finite".to_string(),
+                    });
+                }
+                let yi = b0 * xi + d0;
+                y.push(yi);
+                d0 = b1 * xi - a1 * yi + d1;
+                d1 = b2 * xi - a2 * yi + d2;
+                d2 = b3 * xi - a3 * yi + d3;
+                d3 = b4 * xi - a4 * yi;
+            }
+            Ok((y, vec![d0, d1, d2, d3]))
+        }
+        _ => unreachable!("low-order lfilter only handles nfilt <= 5"),
     }
 }
 
@@ -20955,6 +21013,72 @@ pub fn daub(p: usize) -> Result<Vec<f64>, SignalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The widened low-order `lfilter` arms must return EXACTLY what the general path returns.
+    ///
+    /// The unrolled arms keep the delay line in registers while the general path carries it in
+    /// a `Vec` and loops over taps. They perform the same transposed-direct-form-II recurrence
+    /// in the same order on the same normalised coefficients, so bit equality is the right
+    /// assertion — a tolerance would pass an arm that dropped or reordered a tap, which is
+    /// exactly what hand-unrolling gets wrong.
+    ///
+    /// Covers `nfilt` 4 and 5 — exactly the sizes this change newly routes — with and
+    /// without `zi`, asserting the final delay state as well as the output.
+    ///
+    /// NOT 1-3: those were ALWAYS routed to the unrolled arms, so the general path has never
+    /// run at those sizes and does not support them. Forcing it there panics with
+    /// `index out of bounds` rather than producing a reference, which is how this test first
+    /// failed. A comparison against an implementation that cannot run the case is not a
+    /// weaker check, it is no check at all.
+    #[test]
+    fn lfilter_low_order_matches_general_path_bits() {
+        use std::sync::atomic::Ordering;
+        let n = 512usize;
+        let x: Vec<f64> = (0..n)
+            .map(|i| {
+                let t = i as f64 / n as f64;
+                (7.0 * t).sin() + 0.25 * (61.0 * t).cos()
+            })
+            .collect();
+
+        let was = LFILTER_LOW_ORDER_MAX_NFILT.load(Ordering::Relaxed);
+        for nfilt in 4..=5usize {
+            let b: Vec<f64> = (0..nfilt).map(|k| 0.5 - 0.1 * k as f64).collect();
+            let mut a: Vec<f64> = (0..nfilt).map(|k| 0.05 * (k + 1) as f64).collect();
+            a[0] = 1.7;
+            for zi in [None, Some(vec![0.25; nfilt - 1])] {
+                let zi_ref = zi.as_deref();
+
+                LFILTER_LOW_ORDER_MAX_NFILT.store(0, Ordering::Relaxed);
+                let general = lfilter_with_state(&b, &a, &x, zi_ref).expect("general path");
+                LFILTER_LOW_ORDER_MAX_NFILT.store(5, Ordering::Relaxed);
+                let unrolled = lfilter_with_state(&b, &a, &x, zi_ref).expect("unrolled path");
+
+                assert_eq!(
+                    general.0.len(),
+                    unrolled.0.len(),
+                    "nfilt={nfilt}: output lengths differ"
+                );
+                for (index, (want, got)) in general.0.iter().zip(unrolled.0.iter()).enumerate() {
+                    assert_eq!(
+                        want.to_bits(),
+                        got.to_bits(),
+                        "nfilt={nfilt} zi={}: y[{index}] differs ({want:e} vs {got:e})",
+                        zi_ref.is_some()
+                    );
+                }
+                for (index, (want, got)) in general.1.iter().zip(unrolled.1.iter()).enumerate() {
+                    assert_eq!(
+                        want.to_bits(),
+                        got.to_bits(),
+                        "nfilt={nfilt} zi={}: zf[{index}] differs",
+                        zi_ref.is_some()
+                    );
+                }
+            }
+        }
+        LFILTER_LOW_ORDER_MAX_NFILT.store(was, Ordering::Relaxed);
+    }
 
     #[test]
     fn short_time_fft_scaling_and_axes() {
