@@ -1867,7 +1867,12 @@ fn scan_matched_prefix(left: &[u32], right: &[u32], bound: usize) -> usize {
     let left = &left[..bound];
     let right = &right[..bound];
     let mut span = 0usize;
-    for (left_block, right_block) in left.as_chunks::<BLOCK>().0.iter().zip(right.chunks_exact(BLOCK)) {
+    for (left_block, right_block) in left
+        .as_chunks::<BLOCK>()
+        .0
+        .iter()
+        .zip(right.chunks_exact(BLOCK))
+    {
         let mut all_equal = true;
         for (a, b) in left_block.iter().zip(right_block.iter()) {
             all_equal &= a == b;
@@ -3711,12 +3716,17 @@ impl NativeSparseLu {
                 message: format!("native sparse LU supports n < 2^32, got {n}"),
             });
         }
+        let stage_clock = std::time::Instant::now();
         let (fill_perm, ordering_used) = sparse_lu_fill_ordering(a, n, ordering);
+        let ordering_nanos = stage_clock.elapsed().as_nanos();
 
+        let setup_clock = std::time::Instant::now();
         let mut rows: Vec<SortedFactorRow> = match &fill_perm {
             Some(p) => permuted_sorted_rows(a, p),
             None => csr_sorted_rows(a),
         };
+        let setup_nanos = setup_clock.elapsed().as_nanos();
+        let eliminate_clock = std::time::Instant::now();
 
         // THE BANDED ATTEMPT LIVES HERE so a decline costs nothing beyond its own guards: the
         // ordering, the permutation and the rows above are computed ONCE and shared with it.
@@ -4072,14 +4082,20 @@ impl NativeSparseLu {
         #[cfg(not(test))]
         let u_rows = rows;
 
-        Ok(Self::from_factor_rows(
-            n,
-            row_perm,
-            l_rows,
-            u_rows,
-            fill_perm,
-            ordering_used,
-        ))
+        record_splu_stage(SPLU_STAGE_ORDERING, ordering_nanos);
+        record_splu_stage(SPLU_STAGE_SETUP, setup_nanos);
+        record_splu_stage(
+            SPLU_STAGE_ELIMINATE,
+            eliminate_clock
+                .elapsed()
+                .as_nanos()
+                .saturating_sub(setup_nanos + ordering_nanos),
+        );
+        let assemble_clock = std::time::Instant::now();
+        let assembled =
+            Self::from_factor_rows(n, row_perm, l_rows, u_rows, fill_perm, ordering_used);
+        record_splu_stage(SPLU_STAGE_ASSEMBLE, assemble_clock.elapsed().as_nanos());
+        Ok(assembled)
     }
 
     /// The supernodal elimination: plan the blocks symbolically, then eliminate a whole
@@ -16451,8 +16467,11 @@ mod tests {
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave with
+        // another test's factorization. Constructing it after the store would leave a
+        // window in which the very race this guards against can still happen.
+        let _restore_banded = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore_banded = RestoreBandedToggle(banded_was);
 
         use std::sync::atomic::Ordering;
         let _guard = PERF_TOGGLE_TEST_LOCK
@@ -16549,8 +16568,11 @@ mod tests {
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave with
+        // another test's factorization. Constructing it after the store would leave a
+        // window in which the very race this guards against can still happen.
+        let _restore_banded = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore_banded = RestoreBandedToggle(banded_was);
 
         // MUST NOT FIRE: scattered takes the in-place fast path on 100% of updates
         // (measured: merges=0), so nothing ever reaches the partial path and the histogram
@@ -17960,8 +17982,11 @@ mod tests {
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave with
+        // another test's factorization. Constructing it after the store would leave a
+        // window in which the very race this guards against can still happen.
+        let _restore_banded = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore_banded = RestoreBandedToggle(banded_was);
 
         // TWO ARMS, because this counter's job is to BOUND a rewrite and both failure
         // modes are silent. A counter stuck reporting many lines per visit would kill the
@@ -18088,8 +18113,9 @@ mod tests {
         // read as "the prefix scan skips everything", which is the opposite of the truth.
         // The subject here is the GENERAL merge, so the general path is what must run.
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave.
+        let _restore_banded = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore_banded = RestoreBandedToggle(banded_was);
 
         // Same 7-point Dirichlet stencil as `llywn_cubic_ordering_fill_probe` builds, copied
         // rather than shared because that one is nested inside its own test.
@@ -19350,7 +19376,38 @@ mod tests {
         SPLU_CONTIGUOUS_SOLVE_ENABLE.store(was, Ordering::Relaxed);
     }
 
-    struct RestoreBandedToggle(bool);
+    /// Serialises every test that steers `splu`'s BACKEND SELECTION through
+    /// `SPLU_BANDED_ENABLE`.
+    ///
+    /// `cargo test` runs a crate's tests in one process on many threads, and this toggle
+    /// decides which factorization path runs. A test that turns banded OFF so the general
+    /// path executes, then asserts a general-path arm FIRED, is asserting something another
+    /// thread can take away from it: re-enabling banded sends the factorization down the
+    /// banded path, the arm never fires, and the must-hit assertion trips with a message
+    /// about vacuous bit-identity that describes the symptom rather than the cause.
+    ///
+    /// That is what `one_column_insert_is_bit_identical_and_takes_effect` was doing. It
+    /// passed alone (632 filtered out, 1 passed) and passed under `--test-threads=1` (588
+    /// passed) while failing under the default runner — the same signature as
+    /// `frankenscipy-0rbip` in fsci-linalg, one crate over.
+    ///
+    /// Poisoning is ignored deliberately: one failing toggle test must report its own
+    /// assertion rather than cascade into unrelated poisoned panics that bury it.
+    static BANDED_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds `BANDED_TOGGLE_LOCK` for the caller's scope AND restores `SPLU_BANDED_ENABLE`
+    /// on drop, including on unwind. The restore behaviour is unchanged; the lock is new.
+    struct RestoreBandedToggle(bool, std::sync::MutexGuard<'static, ()>);
+    impl RestoreBandedToggle {
+        fn new(previous: bool) -> Self {
+            Self(
+                previous,
+                BANDED_TOGGLE_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        }
+    }
     impl Drop for RestoreBandedToggle {
         fn drop(&mut self) {
             SPLU_BANDED_ENABLE.store(self.0, std::sync::atomic::Ordering::Relaxed);
@@ -19801,8 +19858,11 @@ mod tests {
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave with
+        // another test's factorization. Constructing it after the store would leave a
+        // window in which the very race this guards against can still happen.
+        let _restore_banded = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore_banded = RestoreBandedToggle(banded_was);
 
         // TWO ARMS, and here the must-MISS arm is the load-bearing one: a churn counter
         // stuck reporting "no change" would declare the run directory cheap to maintain
@@ -19855,8 +19915,9 @@ mod tests {
         // effect and the test fails for a reason that has nothing to do with what it asserts.
         // Held under the same `PERF_TOGGLE_TEST_LOCK` as every other toggle-writing test.
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave.
+        let _restore_banded = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore_banded = RestoreBandedToggle(banded_was);
 
         // SHIPS OFF. This arm corrupts values by design, so the default is not a
         // preference -- it is the only safe setting.
@@ -19952,8 +20013,9 @@ mod tests {
         // effect and the test fails for a reason that has nothing to do with what it asserts.
         // Held under the same `PERF_TOGGLE_TEST_LOCK` as every other toggle-writing test.
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave.
+        let _restore_banded = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore_banded = RestoreBandedToggle(banded_was);
 
         assert!(
             !DOUBLE_COLUMN_COMPARE.with(std::cell::Cell::get),
@@ -20455,8 +20517,9 @@ mod tests {
     /// `skipped_fraction` 0.2715 against RCM's 0.9936, mean run 13.990 against 1.000.
     fn ab_totals_general_factor() -> usize {
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave.
+        let _restore = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore = RestoreBandedToggle(banded_was);
         let matrix = splu_dirichlet_laplacian_3d(10);
         let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Amd)
             .expect("factorization");
@@ -20497,8 +20560,9 @@ mod tests {
     #[ignore = "A/B totals arm: run under callgrind, comparison SKIPPED (incorrect, bound only)"]
     fn ab_totals_column_compare_skipped() {
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave.
+        let _restore = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore = RestoreBandedToggle(banded_was);
         SKIP_COLUMN_COMPARE.with(|arm| arm.set(true));
         let result = NativeSparseLu::factorize_csr(
             &splu_dirichlet_laplacian_3d(10),
@@ -20518,8 +20582,11 @@ mod tests {
         // that says nothing about what is being asserted. Same scoping the harness applies to its
         // own A/B guards.
         let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        // Guard FIRST — it takes the lock, so the store below cannot interleave with
+        // another test's factorization. Constructing it after the store would leave a
+        // window in which the very race this guards against can still happen.
+        let _restore_banded = RestoreBandedToggle::new(banded_was);
         SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        let _restore_banded = RestoreBandedToggle(banded_was);
 
         // The invariant this counter rests on is that `matched_run_length` returns a
         // common PREFIX, so a recorded run can never exceed the row it was measured
@@ -30944,6 +31011,42 @@ pub static SPLU_BANDED_STAGE_TIMING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Accumulated nanoseconds: `[0]` fill + elimination, `[1]` unpack.
 #[doc(hidden)]
+/// Index into [`SPLU_STAGE_NANOS`]: computing the fill-reducing permutation.
+pub const SPLU_STAGE_ORDERING: usize = 0;
+/// Index into [`SPLU_STAGE_NANOS`]: building the permuted sorted row set.
+pub const SPLU_STAGE_SETUP: usize = 1;
+/// Index into [`SPLU_STAGE_NANOS`]: the elimination itself.
+pub const SPLU_STAGE_ELIMINATE: usize = 2;
+/// Index into [`SPLU_STAGE_NANOS`]: assembling the factor (`from_factor_rows`).
+pub const SPLU_STAGE_ASSEMBLE: usize = 3;
+
+/// Cumulative nanoseconds per `factorize_csr` stage, for deciding what the vs-SciPy
+/// deficit's n-DEPENDENCE is made of (`frankenscipy-6940p`).
+///
+/// The deficit shrinks monotonically with n — 1.44x at n=4096 down to 1.12x at n=13824 —
+/// and a gap that CLOSES as n grows is characteristic of a fixed or slowly-growing overhead
+/// being amortised, not of a per-element kernel deficit, which would hold its ratio or
+/// widen. Deciding between those needs SHARES at two sizes, so the split is: three stages
+/// whose cost is driven by `n` and `nnz` (ordering, setup, assemble) against one driven by
+/// FILL (eliminate).
+///
+/// Four `Instant::now` pairs per FACTORIZATION, none inside any per-element loop, so this
+/// cannot act as an optimisation barrier on the kernel it is measuring — the failure mode
+/// that inflated an earlier measurement 34-fold in this tree.
+pub static SPLU_STAGE_NANOS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn record_splu_stage(stage: usize, nanos: u128) {
+    SPLU_STAGE_NANOS[stage].fetch_add(
+        u64::try_from(nanos).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
 pub static SPLU_BANDED_STAGE_NANOS: [std::sync::atomic::AtomicU64; 2] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),

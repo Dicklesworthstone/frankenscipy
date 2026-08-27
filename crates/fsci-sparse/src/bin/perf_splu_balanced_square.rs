@@ -1427,6 +1427,34 @@ for raw_line in sys.stdin.buffer:
             "execution_proof: banded_requested={banded_requested} banded_factor_hits={}",
             SPLU_BANDED_FACTOR_HITS.load(Ordering::Relaxed) - banded_hits_before
         );
+        // STAGE SHARES for frankenscipy-6940p. The vs-SciPy deficit shrinks monotonically
+        // with n, and a gap that CLOSES as n grows points at amortising overhead rather
+        // than a per-element kernel deficit. Shares — not totals — decide which: ordering,
+        // setup and assemble are driven by n and nnz; eliminate is driven by FILL. If the
+        // first three lose share as n grows while eliminate gains it, the small-n penalty
+        // is one-time cost and the lever family is different from every kernel lever
+        // priced so far.
+        {
+            let stage: Vec<u64> = fsci_sparse::linalg::SPLU_STAGE_NANOS
+                .iter()
+                .map(|slot| slot.load(Ordering::Relaxed))
+                .collect();
+            let total = stage.iter().sum::<u64>().max(1);
+            let pct = |i: usize| 100.0 * stage[i] as f64 / total as f64;
+            println!(
+                "splu_stages: ordering_ms={:.3} ({:.2}%) setup_ms={:.3} ({:.2}%) \
+                 eliminate_ms={:.3} ({:.2}%) assemble_ms={:.3} ({:.2}%) one_time_share={:.4}",
+                stage[0] as f64 / 1.0e6,
+                pct(0),
+                stage[1] as f64 / 1.0e6,
+                pct(1),
+                stage[2] as f64 / 1.0e6,
+                pct(2),
+                stage[3] as f64 / 1.0e6,
+                pct(3),
+                (stage[0] + stage[1] + stage[3]) as f64 / total as f64,
+            );
+        }
         // "enabled" is not "took effect". The swap writeback only fires on the FULL merge
         // path, so on a fixture the banded kernel accepts, or one the one-column arm covers,
         // this reads zero and an A/B between the two settings is a null over identical code.
