@@ -66,9 +66,11 @@ const DEFAULT_GAUSSIAN_TRUNCATE: f64 = 4.0;
 ///
 /// 3d-256 gaussian, three replicates each, alternated in one window:
 ///
-///     block=256   median 520.13 ms   range [509.4, 528.4]
-///     block= 64   median 559.03 ms   range [552.1, 563.4]
-///     1.0747x, RANGES DISJOINT
+/// ```text
+/// block=256   median 520.13 ms   range [509.4, 528.4]
+/// block= 64   median 559.03 ms   range [552.1, 563.4]
+/// 1.0747x, RANGES DISJOINT
+/// ```
 ///
 /// Bit-identical, and the harness confirms it: `max_rel` against live SciPy reads
 /// 1.51511616350838218e-10 at 64, 256, 1024 and 4096 — the same digits. For any output the
