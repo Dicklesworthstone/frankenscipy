@@ -533,12 +533,50 @@ fn cooley_tukey_radix4_inplace_with_twiddles(data: &mut [Complex64], twiddles: &
 /// `radix4_stage_run` math, same per-group order; only which core owns a group
 /// changes. Used ONLY by the top-level single pow2 transform (never nested under
 /// the already-parallel non-pow2 leaf phase). SciPy's 1-D FFT is single-threaded.
+/// Split the power-of-two sweep into PROLOGUE (bit-reversal) and BUTTERFLY stages.
+///
+/// WHY. FFT at n=2^22 is the next-worst measured cell, 1.45x against SciPy's pocketfft, and
+/// nothing here had ever been attributed. The prologue is
+/// `apply_bit_reverse_permutation_incremental`, a scalar `data.swap(i, j)` loop over every
+/// element where `j` is the bit reversal of `i` — a full RANDOM-scatter pass over a 67 MB
+/// buffer. pocketfft does not have this pass at all: a Stockham autosort formulation carries
+/// the permutation inside the butterflies. So the first question is what that pass costs,
+/// and whether it is a large enough share to be worth restructuring around.
+///
+/// Timed OUTSIDE any A/B and reported as a SHARE. `Instant::now()` around a stage is
+/// instrumentation; shares survive that, absolute nanoseconds are not a timing claim.
+pub static FFT_STAGE_TIMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Accumulated nanoseconds: `[0]` prologue/bit-reversal, `[1]` butterfly stages.
+pub static FFT_STAGE_NANOS: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[inline]
+fn fft_stage_start() -> Option<std::time::Instant> {
+    FFT_STAGE_TIMING
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .then(std::time::Instant::now)
+}
+
+#[inline]
+fn fft_stage_record(stage: usize, started: Option<std::time::Instant>) {
+    if let Some(at) = started {
+        let nanos = u64::try_from(at.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        FFT_STAGE_NANOS[stage].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn cooley_tukey_radix4_inplace_with_twiddles_par(data: &mut [Complex64], twiddles: &[Complex64]) {
     let n = data.len();
     debug_assert!(n.is_power_of_two());
     debug_assert!(twiddles.len() >= n);
     let log_n = n.trailing_zeros() as usize;
+    let t_prologue = fft_stage_start();
     let mut l = radix4_prologue(data, log_n);
+    fft_stage_record(0, t_prologue);
+    let t_stages = fft_stage_start();
     let quarter = n / 4;
     while l < n {
         let stride2 = n / (2 * l);
@@ -560,6 +598,7 @@ fn cooley_tukey_radix4_inplace_with_twiddles_par(data: &mut [Complex64], twiddle
         }
         l *= 4;
     }
+    fft_stage_record(1, t_stages);
 }
 
 fn apply_bit_reverse_permutation_incremental(data: &mut [Complex64]) {

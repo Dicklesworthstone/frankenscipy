@@ -244,6 +244,41 @@ fn time_fsci(
         Some("0") | Some("false")
     );
 
+    // STAGE ATTRIBUTION, run once outside the timed loop and reported as shares. See
+    // `FFT_STAGE_TIMING`: the question is what the bit-reversal prologue costs, since
+    // pocketfft has no such pass.
+    if std::env::var("FSCI_FFT_STAGES").is_ok_and(|v| v != "0") {
+        use fsci_fft::transforms::{FFT_STAGE_NANOS, FFT_STAGE_TIMING};
+        for slot in &FFT_STAGE_NANOS {
+            slot.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        FFT_STAGE_TIMING.store(true, std::sync::atomic::Ordering::Relaxed);
+        let probe = if mode == "rfft" {
+            rfft(black_box(real), black_box(options)).expect("staged rfft")
+        } else {
+            fft(black_box(complex), black_box(options)).expect("staged fft")
+        };
+        black_box(&probe);
+        FFT_STAGE_TIMING.store(false, std::sync::atomic::Ordering::Relaxed);
+        let stage: Vec<u64> = FFT_STAGE_NANOS
+            .iter()
+            .map(|slot| slot.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        let total = stage.iter().sum::<u64>();
+        // MUST-HIT: a power-of-two transform always runs this sweep, so all-zero counters
+        // mean the instrumented path was not the path taken and the shares describe nothing.
+        println!(
+            "STAGES mode={mode} n={} prologue_ms={:.3} butterflies_ms={:.3} total_ms={:.3} \
+             prologue_share={:.4} instrumented={}",
+            real.len().max(complex.len()),
+            stage[0] as f64 / 1.0e6,
+            stage[1] as f64 / 1.0e6,
+            total as f64 / 1.0e6,
+            stage[0] as f64 / total.max(1) as f64,
+            total > 0,
+        );
+    }
+
     let start = Instant::now();
     let mut digest = 0_u64;
     let mut retained = Vec::new();
