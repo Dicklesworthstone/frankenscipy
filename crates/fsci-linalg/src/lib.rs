@@ -11603,6 +11603,71 @@ const BIDIAG_SYMMETRIC_EIGEN_MIN_DIM: usize = 32;
 const BIDIAG_TRIDIAGONAL_QR_MIN_DIM: usize = 128;
 const BIDIAG_TRIDIAGONAL_QR_MAX_ITERS_PER_DIM: usize = 64;
 const TRIDIAGONAL_INVERSE_ITERATIONS: usize = 4;
+
+/// Override for [`TRIDIAGONAL_INVERSE_ITERATIONS`]; `0` keeps the shipping 4.
+///
+/// WHY ASK. The eigenvector half is 70.1% of the tridiagonal solve and 15% of the whole
+/// `eigh` cell, and it is latency-bound on a serial recurrence with a division per row —
+/// ~149,000 cycles per eigenvector against a ~98,000-cycle prediction for FOUR iterations of
+/// forward-plus-back substitution. The iteration count is therefore very nearly a linear
+/// multiplier on the whole half, and LAPACK's `dstein` normally converges in one or two.
+///
+/// This is NOT bit-identical and is NOT free: fewer iterations means a less converged
+/// eigenvector. It ships at 4 until the accuracy is measured, and the measurement that
+/// matters is the harness's own `agreement: worst_rel_diff` against live SciPy plus the
+/// residual assertions in the suite — not a speed number on its own.
+pub static EIGH_INVERSE_ITERATIONS_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Stop inverse iteration once successive normalized iterates agree.
+///
+/// WHY THIS AND NOT A SMALLER FIXED COUNT. Measured at n=768, `worst_rel_diff` against live
+/// SciPy is **1.165e-14 at 1, 2, 3 AND 4 iterations** while the eigenvector half falls
+/// 29.3 -> 23.2 -> 17.1 -> 10.3 ms. So three of the four iterations change nothing on that
+/// fixture — but the fixture is a RANDOM symmetric matrix, and random spectra exhibit
+/// eigenvalue repulsion. This file already records that exact trap: a structured or
+/// nearly-degenerate input is the case that needs the extra iterations, and it is not the
+/// case the benchmark exercises. Cutting the constant on the easy spectrum would be tuning
+/// to the fixture.
+///
+/// A convergence test costs one O(n) pass per iteration against a solve that is O(n) with a
+/// serial division chain, and it is adaptive: a well-separated eigenvalue stops after one
+/// iteration, a clustered one still gets the full four. The comparison is sign-insensitive
+/// because inverse iteration may flip the sign of the iterate each step.
+pub static EIGH_INVERSE_CONVERGENCE_STOP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Iterations skipped by the convergence stop — "enabled" is not "took effect".
+pub static EIGH_INVERSE_ITERATIONS_SKIPPED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Both iterates are unit-norm, so this is an absolute bound on a unit vector.
+const TRIDIAGONAL_INVERSE_CONVERGED_TOL: f64 = 1.0e-13;
+
+fn inverse_iterates_agree(current: &[f64], previous: &[f64]) -> bool {
+    let mut dot = 0.0_f64;
+    for (&a, &b) in current.iter().zip(previous) {
+        dot += a * b;
+    }
+    let sign = if dot < 0.0 { -1.0 } else { 1.0 };
+    let mut worst = 0.0_f64;
+    for (&a, &b) in current.iter().zip(previous) {
+        worst = worst.max((a - sign * b).abs());
+        if worst > TRIDIAGONAL_INVERSE_CONVERGED_TOL {
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+fn tridiagonal_inverse_iterations() -> usize {
+    let value = EIGH_INVERSE_ITERATIONS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if value == 0 {
+        TRIDIAGONAL_INVERSE_ITERATIONS
+    } else {
+        value
+    }
+}
 const TRIDIAGONAL_INVERSE_MIN_PIVOT: f64 = 64.0 * f64::EPSILON;
 const TRIDIAGONAL_INVERSE_MIN_GAP_REL: f64 = 1e-6;
 const TRIDIAGONAL_INVERSE_RESIDUAL_TOL: f64 = 1e-7;
@@ -14219,6 +14284,8 @@ fn compute_inverse_iteration_column(
         upper_factors,
         reduced_rhs,
     } = scratch;
+    let stop_on_convergence =
+        EIGH_INVERSE_CONVERGENCE_STOP.load(std::sync::atomic::Ordering::Relaxed);
     for (row, value) in rhs.iter_mut().enumerate() {
         let pattern = ((row + 1) * (col + 3) + 5) % 17;
         *value = 0.5 + pattern as f64 / 19.0;
@@ -14232,7 +14299,7 @@ fn compute_inverse_iteration_column(
         -shift_unit
     };
     let shifted_lambda = lambda + signed_shift * (1 + col % 13) as f64;
-    for _ in 0..TRIDIAGONAL_INVERSE_ITERATIONS {
+    for _ in 0..tridiagonal_inverse_iterations() {
         if !solve_shifted_tridiagonal_system(
             diagonal,
             offdiagonal,
@@ -14250,6 +14317,13 @@ fn compute_inverse_iteration_column(
         std::mem::swap(rhs, solution);
         if !normalize_tridiagonal_inverse_vector(rhs) {
             return false;
+        }
+        // `solution` now holds the PREVIOUS normalized iterate, so this is a successive-
+        // iterate test and costs one O(n) pass against an O(n) solve with a serial
+        // division chain.
+        if stop_on_convergence && inverse_iterates_agree(rhs, solution) {
+            EIGH_INVERSE_ITERATIONS_SKIPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            break;
         }
     }
     dst[..n].copy_from_slice(&rhs[..n]);

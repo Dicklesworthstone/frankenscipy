@@ -793,6 +793,41 @@ for raw_line in sys.stdin.buffer:
         );
         fsci_linalg::EIGH_BACKTRANSFORM_BLOCKED_ENABLE
             .store(blocked, std::sync::atomic::Ordering::Relaxed);
+        // `FSCI_EIGH_CONVERGENCE_STOP=1` stops inverse iteration once successive iterates agree.
+        {
+            // ONLY OVERRIDE WHEN ASKED. An unconditional store pins the arm to this
+            // harness's own default and silently measures something other than the shipping
+            // configuration — which is exactly what happened here: with the library default
+            // flipped ON, an unset variable still forced it OFF and the row reported
+            // `converged_early=0`. The counter is what caught it.
+            use fsci_linalg::EIGH_INVERSE_CONVERGENCE_STOP;
+            match std::env::var("FSCI_EIGH_CONVERGENCE_STOP").ok().as_deref() {
+                Some("1") | Some("true") => {
+                    EIGH_INVERSE_CONVERGENCE_STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Some("0") | Some("false") => {
+                    EIGH_INVERSE_CONVERGENCE_STOP
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            println!(
+                "inverse_convergence_stop={}",
+                EIGH_INVERSE_CONVERGENCE_STOP.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+
+        // `FSCI_EIGH_INV_ITERS=<n>` overrides the inverse-iteration count (0 = shipping 4).
+        {
+            use fsci_linalg::EIGH_INVERSE_ITERATIONS_OVERRIDE;
+            let iters: usize = std::env::var("FSCI_EIGH_INV_ITERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            EIGH_INVERSE_ITERATIONS_OVERRIDE.store(iters, std::sync::atomic::Ordering::Relaxed);
+            println!("inverse_iterations_override={iters} (0 = shipping 4)");
+        }
+
         // `FSCI_EIGH_SCRATCH_HOIST=0` restores the per-column allocation in inverse iteration.
         {
             use fsci_linalg::EIGH_INVERSE_SCRATCH_HOIST;
@@ -1249,11 +1284,13 @@ for raw_line in sys.stdin.buffer:
                 let sol_total = sol.iter().sum::<u64>();
                 println!(
                     "n={n} impl={impl_label} SOLVE_SUBSTAGES values_ms={:.3} vectors_ms={:.3} \
-                     total_ms={:.3} values_share={:.4} instrumented={}",
+                     total_ms={:.3} values_share={:.4} converged_early={} instrumented={}",
                     sol[0] as f64 / 1.0e6,
                     sol[1] as f64 / 1.0e6,
                     sol_total as f64 / 1.0e6,
                     sol[0] as f64 / sol_total.max(1) as f64,
+                    fsci_linalg::EIGH_INVERSE_ITERATIONS_SKIPPED
+                        .load(std::sync::atomic::Ordering::Relaxed),
                     sol_total > 0,
                 );
                 let sub: Vec<u64> = EIGH_REDUCE_SUBSTAGE_NANOS
