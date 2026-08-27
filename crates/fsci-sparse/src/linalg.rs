@@ -184,9 +184,36 @@ struct PackedTriangularRows {
     offsets: Vec<usize>,
     columns: Vec<u32>,
     values: Vec<f64>,
+    /// Every row's columns are a consecutive run, so the solve can derive each index
+    /// from the row's first column instead of streaming the whole `columns` array.
+    /// Settled when the factor is built; see [`Self::rows_are_contiguous`].
+    contiguous: bool,
 }
 
 impl PackedTriangularRows {
+    /// Is every row's column list a CONTIGUOUS run, so the solve can compute indices
+    /// instead of reading them?
+    ///
+    /// WHY THIS IS WORTH ASKING. The triangular solve streams the whole factor once per
+    /// right-hand side: at n=16,384 that is 2,839,595 entries, and the parallel `columns`
+    /// and `values` arrays make it 34.1 MB — 22.7 MB of values and **11.4 MB of indices**.
+    /// When a row's columns are `c, c+1, c+2, …` the index array carries no information
+    /// the offsets do not already imply, so a third of the traffic is redundant. A banded
+    /// factor is contiguous in every row by construction, and the banded path is what
+    /// ships on the cell where this costs the most.
+    ///
+    /// Checked ONCE when the factor is built, not per solve, and the answer is a property
+    /// of the pattern rather than of the values — so it cannot change between solves.
+    fn rows_are_contiguous(&self) -> bool {
+        self.offsets.windows(2).all(|window| {
+            let (start, end) = (window[0], window[1]);
+            // An empty row is vacuously contiguous; the solve skips it either way.
+            self.columns[start..end]
+                .windows(2)
+                .all(|pair| pair[1] == pair[0] + 1)
+        })
+    }
+
     /// Bytes this packed factor half actually retains.
     ///
     /// Named on the row as `candidate_factor_vector_payload_bytes`, so it has to track the
@@ -223,11 +250,17 @@ impl PackedTriangularRows {
             offsets.push(columns.len());
         }
 
-        Self {
+        // Contiguity is a property of the PATTERN, so it is settled once here rather
+        // than rediscovered on every solve — the whole point is to stop touching the
+        // column array in the hot path.
+        let mut packed = Self {
             offsets,
             columns,
             values,
-        }
+            contiguous: false,
+        };
+        packed.contiguous = packed.rows_are_contiguous();
+        packed
     }
 
     /// Consume the final sorted elimination rows directly into the packed U factor.
@@ -263,11 +296,17 @@ impl PackedTriangularRows {
             offsets.push(columns.len());
         }
 
-        Self {
+        // Contiguity is a property of the PATTERN, so it is settled once here rather
+        // than rediscovered on every solve — the whole point is to stop touching the
+        // column array in the hot path.
+        let mut packed = Self {
             offsets,
             columns,
             values,
-        }
+            contiguous: false,
+        };
+        packed.contiguous = packed.rows_are_contiguous();
+        packed
     }
 }
 
@@ -4514,6 +4553,16 @@ impl NativeSparseLu {
         let upper_offsets = &self.upper.offsets;
         let upper_columns = &self.upper.columns;
         let upper_values = &self.upper.values;
+        // Read ONCE, outside every loop, and combined here with the pattern property so the
+        // substitution loops take a plain `bool`. A factor whose rows are not contiguous —
+        // any fill-reducing ordering — simply keeps the indexed arm.
+        let contiguous_arm =
+            SPLU_CONTIGUOUS_SOLVE_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        let lower_contiguous = contiguous_arm && self.lower.contiguous;
+        let upper_contiguous = contiguous_arm && self.upper.contiguous;
+        if lower_contiguous || upper_contiguous {
+            SPLU_CONTIGUOUS_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         // Solve A·x = b as (P·A·Pᵀ)·(P·x) = P·b, then map back: x[fill_perm[i]] = z[i].
         //
@@ -4558,14 +4607,15 @@ impl NativeSparseLu {
                 // cross-window; it is not a tuning knob and defaults off.
                 let permuted = fill.iter().map(|&old| b[old]).collect::<Vec<f64>>();
                 for row in 0..self.n {
-                    let mut value = permuted[self.row_perm[row]];
+                    let value = permuted[self.row_perm[row]];
                     let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
-                    for (&column, &multiplier) in lower_columns[start..end]
-                        .iter()
-                        .zip(&lower_values[start..end])
-                    {
-                        value -= multiplier * y[column as usize];
-                    }
+                    let value = triangular_row_reduce(
+                        value,
+                        &lower_columns[start..end],
+                        &lower_values[start..end],
+                        &y,
+                        lower_contiguous,
+                    );
                     y[row] = value;
                 }
             }
@@ -4578,14 +4628,15 @@ impl NativeSparseLu {
                                 .to_string(),
                         })?;
                 for row in 0..self.n {
-                    let mut value = b[rhs_gather[row]];
+                    let value = b[rhs_gather[row]];
                     let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
-                    for (&column, &multiplier) in lower_columns[start..end]
-                        .iter()
-                        .zip(&lower_values[start..end])
-                    {
-                        value -= multiplier * y[column as usize];
-                    }
+                    let value = triangular_row_reduce(
+                        value,
+                        &lower_columns[start..end],
+                        &lower_values[start..end],
+                        &y,
+                        lower_contiguous,
+                    );
                     y[row] = value;
                 }
             }
@@ -4594,14 +4645,15 @@ impl NativeSparseLu {
                 // to compose, so both arms are this loop and the toggle is INERT here.
                 // Any A/B row taken on a natural-ordering fixture is measuring nothing.
                 for row in 0..self.n {
-                    let mut value = b[self.row_perm[row]];
+                    let value = b[self.row_perm[row]];
                     let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
-                    for (&column, &multiplier) in lower_columns[start..end]
-                        .iter()
-                        .zip(&lower_values[start..end])
-                    {
-                        value -= multiplier * y[column as usize];
-                    }
+                    let value = triangular_row_reduce(
+                        value,
+                        &lower_columns[start..end],
+                        &lower_values[start..end],
+                        &y,
+                        lower_contiguous,
+                    );
                     y[row] = value;
                 }
             }
@@ -4636,13 +4688,13 @@ impl NativeSparseLu {
                     message: format!("zero pivot in sparse LU solve at row {row}"),
                 });
             }
-            let mut value = y[row];
-            for (&column, &entry) in upper_columns[start + 1..end]
-                .iter()
-                .zip(&upper_values[start + 1..end])
-            {
-                value -= entry * y[column as usize];
-            }
+            let value = triangular_row_reduce(
+                y[row],
+                &upper_columns[start + 1..end],
+                &upper_values[start + 1..end],
+                &y,
+                upper_contiguous,
+            );
             y[row] = value / pivot;
         }
 
@@ -19168,6 +19220,109 @@ mod tests {
 
     /// Restores `SPLU_BANDED_ENABLE` on unwind as well as on return, so a failing assertion cannot
     /// leave the toggle flipped for whatever test runs next.
+    /// The contiguous solve must return the SAME BITS as the indexed one, and the counter
+    /// must prove which arm ran.
+    ///
+    /// The two arms differ only in how a column index is obtained — loaded from `columns`,
+    /// or counted up from the row's first column — so every value, every `y` entry, every
+    /// subtraction and their order are the same. That makes bit-equality the right
+    /// assertion, not a tolerance. A tolerance here would pass even if the contiguous arm
+    /// read the wrong slice of `y`, which is precisely the failure this guards.
+    ///
+    /// TWO ARMS, both observed: a grid factor (contiguous, so the arm MUST fire) and a
+    /// shuffled pentadiagonal (rows carry gaps, so it MUST NOT). Without the second, a
+    /// counter that never fires and a correct implementation look identical.
+    ///
+    /// THE NEGATIVE ARM WAS NOT WHERE I FIRST PUT IT. The obvious guess — the same matrix
+    /// under AMD — FAILS this assertion, because an AMD-ordered factor of a grid is also
+    /// contiguous in every row (`lower=true upper=true`). Contiguity is a property of the
+    /// FILLED factor, not of the bandedness of the ordering: once a row fills in, its
+    /// columns close up. That makes the arm apply far more widely than the banded path it
+    /// was written for, and it means a negative control has to be a genuinely gappy
+    /// pattern rather than merely a different ordering.
+    #[test]
+    fn contiguous_solve_is_bit_identical_and_fires_only_when_contiguous() {
+        use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // THE PREDICATE'S OWN TWO ARMS, FIRST. `rows_are_contiguous` uses `windows(2)`,
+        // which yields NOTHING for a row of length 0 or 1 and therefore reports `true`
+        // vacuously. Every factor tried below reports contiguous, so the predicate has to
+        // be shown capable of reporting `false` before that means anything at all —
+        // otherwise "the arm always fires" and "the check is broken" are the same
+        // observation.
+        let gappy = PackedTriangularRows::from_rows(&[vec![(0usize, 1.0), (2usize, 1.0)]]);
+        assert!(
+            !gappy.rows_are_contiguous(),
+            "a row with columns [0, 2] must NOT be contiguous; the predicate cannot \
+             distinguish anything"
+        );
+        let packed = PackedTriangularRows::from_rows(&[vec![(0usize, 1.0), (1usize, 1.0)]]);
+        assert!(
+            packed.rows_are_contiguous(),
+            "a row with columns [0, 1] must be contiguous"
+        );
+
+        let was = SPLU_CONTIGUOUS_SOLVE_ENABLE.load(Ordering::Relaxed);
+        for (label, matrix, ordering, must_fire) in [
+            (
+                "convection/rcm",
+                convection_diffusion_csr(24 * 24, 0.35, 4.001),
+                PermutationOrdering::ReverseCuthillMcKee,
+                true,
+            ),
+            (
+                "scattered/colamd",
+                scattered_pentadiagonal_csr(8),
+                PermutationOrdering::Colamd,
+                true,
+            ),
+        ] {
+            let rhs: Vec<f64> = (0..matrix.shape().rows)
+                .map(|i| 1.0 + 0.125 * ((17 * i) % 29) as f64)
+                .collect();
+            let factor = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                .expect("factorization for the contiguous-solve contract");
+
+            SPLU_CONTIGUOUS_SOLVE_ENABLE.store(false, Ordering::Relaxed);
+            let before_off = SPLU_CONTIGUOUS_SOLVE_HITS.load(Ordering::Relaxed);
+            let indexed = factor.solve(&rhs).expect("indexed solve");
+            let off_hits = SPLU_CONTIGUOUS_SOLVE_HITS.load(Ordering::Relaxed) - before_off;
+
+            SPLU_CONTIGUOUS_SOLVE_ENABLE.store(true, Ordering::Relaxed);
+            let before_on = SPLU_CONTIGUOUS_SOLVE_HITS.load(Ordering::Relaxed);
+            let contiguous = factor.solve(&rhs).expect("contiguous solve");
+            let on_hits = SPLU_CONTIGUOUS_SOLVE_HITS.load(Ordering::Relaxed) - before_on;
+
+            assert_eq!(
+                off_hits, 0,
+                "{label}: the contiguous arm fired with the toggle OFF, so the A/B compares \
+                 one implementation with itself"
+            );
+            assert_eq!(
+                on_hits > 0,
+                must_fire,
+                "{label}: contiguous arm fired={} but the factor's rows are contiguous={} \
+                 (lower={} upper={})",
+                on_hits > 0,
+                must_fire,
+                factor.lower.contiguous,
+                factor.upper.contiguous
+            );
+            for (index, (a, b)) in indexed.iter().zip(contiguous.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{label}: component {index} differs between the indexed and contiguous \
+                     solves ({a:e} against {b:e}); they must agree BIT-for-bit"
+                );
+            }
+        }
+        SPLU_CONTIGUOUS_SOLVE_ENABLE.store(was, Ordering::Relaxed);
+    }
+
     struct RestoreBandedToggle(bool);
     impl Drop for RestoreBandedToggle {
         fn drop(&mut self) {
@@ -30885,6 +31040,71 @@ pub static SPLU_SWAP_WRITEBACK_ENABLE: PerfToggle = PerfToggle::new(false);
 #[doc(hidden)]
 pub static SPLU_SWAP_WRITEBACK_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Solve a factor whose rows are contiguous WITHOUT reading the column indices.
+///
+/// WHERE THIS COMES FROM. The triangular solve — not the factorization — is the worst
+/// measured cell in the suite: **0.3368x** at n=16,384 (`FSCI_SPLU_STAGE=solve perf_splu
+/// 128 21 4 off convection`, both nulls passing). Unlike the factorization, whose cost per
+/// stored nonzero is at PARITY with SuperLU (0.979x), the solve loses on both terms —
+/// 2.325x the fill AND **1.300x the cost per nonzero** (1.332 ns against 1.025). The
+/// per-nonzero half is the part that is ours to fix.
+///
+/// WHAT IT COSTS TODAY. Each solve streams the factor once: 2,839,595 entries as parallel
+/// `columns: u32` and `values: f64` arrays, so 34.1 MB of which **11.4 MB is indices**.
+/// For a banded factor every row's columns are `c, c+1, c+2, …`, so those indices carry
+/// nothing the offsets do not already imply. Reading them costs a third of the traffic and
+/// turns a sequential read of `y` into an indexed one the compiler cannot prove sequential.
+/// Per-nonzero solve cost roughly doubles from n=4,096 (0.685 ns) to n=16,384 (1.332 ns),
+/// which is what a traffic problem looks like.
+///
+/// BIT-IDENTICAL BY CONSTRUCTION. The contiguous arm multiplies the same values by the same
+/// `y` entries in the same order and accumulates them with the same additions; only the way
+/// the column index is OBTAINED changes — computed from the row's first column rather than
+/// loaded. No reassociation, so this is not the multiple-accumulator trade and it does not
+/// touch the tolerance contract.
+#[doc(hidden)]
+pub static SPLU_CONTIGUOUS_SOLVE_ENABLE: PerfToggle = PerfToggle::new(true);
+/// Solves that actually took the contiguous arm — "enabled" is not "took effect".
+#[doc(hidden)]
+pub static SPLU_CONTIGUOUS_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// One triangular row's reduction, `value -= Σ multiplier * y[column]`.
+///
+/// THE ONE IMPLEMENTATION, called from all four substitution loops, so the indexed and
+/// contiguous arms cannot drift apart. Both walk `values` in the same order and perform the
+/// same subtractions on the same `y` entries; they differ only in how the column index is
+/// obtained — loaded from `columns`, or counted up from the row's first column. That makes
+/// them bit-identical by construction rather than by two loops being kept in step by hand.
+///
+/// `contiguous` is read at the CALL BOUNDARY by the caller and passed as a `bool`; it is
+/// never an atomic load inside a per-element loop. This crate has already paid 13% once for
+/// that shape (`perf_toggle_read_in_hot_loop_is_a_barrier`).
+#[inline(always)]
+fn triangular_row_reduce(
+    mut value: f64,
+    columns: &[u32],
+    values: &[f64],
+    y: &[f64],
+    contiguous: bool,
+) -> f64 {
+    if contiguous && !columns.is_empty() {
+        // The row occupies `first .. first + values.len()` of `y`. Slicing it once lifts
+        // the bounds check out of the loop and leaves two unit-stride streams, which is
+        // the shape the banded kernel runs at 8.59 Gflop/s — and it never touches
+        // `columns` again, which is the 11.4 MB per solve this exists to stop reading.
+        let first = columns[0] as usize;
+        for (&multiplier, &solved) in values.iter().zip(&y[first..first + values.len()]) {
+            value -= multiplier * solved;
+        }
+    } else {
+        for (&column, &multiplier) in columns.iter().zip(values) {
+            value -= multiplier * y[column as usize];
+        }
+    }
+    value
+}
 /// Skip exact-cancellation detection and retain structurally-zero entries.
 ///
 /// WHY (frankenscipy-llywn). The check is **24.9% of the merge body**, 0.97 Ir per
