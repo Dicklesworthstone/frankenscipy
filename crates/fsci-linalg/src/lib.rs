@@ -15,8 +15,6 @@
 #![allow(clippy::min_max)]
 #![allow(clippy::absurd_extreme_comparisons)]
 
-
-
 // Cosine-sine decomposition building blocks (LAPACK dorcsd/dorbdb/dbbcsd port,
 // in progress — see bead frankenscipy-5tmu1).
 pub mod cossin;
@@ -25534,8 +25532,66 @@ mod tests {
     /// The MACs override forces the fan-out at unit-test sizes, and the panel counter is the
     /// must-hit arm: without it a gate change could send BOTH arms down the serial path and
     /// the comparison would pass while exercising nothing.
+    /// Serialises every test that writes — or merely runs code that reads — the
+    /// process-global `CHOL_PANEL_TRSM_*` dispatch toggles.
+    ///
+    /// `cargo test` runs a crate's tests in ONE process on many threads, and these toggles
+    /// select which arm the panel TRSM takes. Without this lock, one test's write lands in
+    /// the middle of another's comparison, and the failure mode is worse in the direction
+    /// that does not fail: a concurrent write can make BOTH arms take the same path, and a
+    /// bit-identity assertion that compares a thing to itself PASSES. The observed symptom
+    /// was the harmless direction — spurious RED under the concurrent runner, green alone
+    /// and green under `--test-threads=1` — but the same race silently masks real drift.
+    ///
+    /// Poisoning is ignored on purpose: one failing toggle test must report its own
+    /// assertion, not cascade into unrelated poisoned panics that bury it.
+    static CHOL_PANEL_TRSM_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds `CHOL_PANEL_TRSM_TOGGLE_LOCK` and restores every toggle it guards on drop,
+    /// INCLUDING on unwind.
+    ///
+    /// The tests previously reset `PAR_MACS_OVERRIDE` on their last line, which does not run
+    /// when an assertion fires. A failing test then left the override set for whatever ran
+    /// next, turning one real failure into a cascade with an unrelated-looking cause.
+    /// Restoring from `Drop` makes the reset unconditional, and snapshotting rather than
+    /// assuming defaults keeps it correct if an outer harness has set these deliberately.
+    struct CholPanelTrsmToggles {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        macs_override: u64,
+        std_scope: bool,
+        force_serial: bool,
+        par_panels: usize,
+    }
+
+    impl CholPanelTrsmToggles {
+        fn acquire() -> Self {
+            use std::sync::atomic::Ordering::Relaxed;
+            let guard = CHOL_PANEL_TRSM_TOGGLE_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self {
+                _guard: guard,
+                macs_override: CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE.load(Relaxed),
+                std_scope: CHOL_PANEL_TRSM_STD_SCOPE.load(Relaxed),
+                force_serial: CHOL_PANEL_TRSM_FORCE_SERIAL.load(Relaxed),
+                par_panels: CHOL_PANEL_TRSM_PAR_PANELS.load(Relaxed),
+            }
+        }
+    }
+
+    impl Drop for CholPanelTrsmToggles {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering::Relaxed;
+            CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE.store(self.macs_override, Relaxed);
+            CHOL_PANEL_TRSM_STD_SCOPE.store(self.std_scope, Relaxed);
+            CHOL_PANEL_TRSM_FORCE_SERIAL.store(self.force_serial, Relaxed);
+            CHOL_PANEL_TRSM_PAR_PANELS.store(self.par_panels, Relaxed);
+        }
+    }
+
     #[test]
     fn cholesky_panel_trsm_rayon_dispatch_is_bit_identical_to_thread_scope() {
+        let _toggles = CholPanelTrsmToggles::acquire();
         CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
         for &n in &[420usize, 600] {
             let mut a = vec![vec![0.0; n]; n];
@@ -25586,7 +25642,6 @@ mod tests {
                 );
             }
         }
-        CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
@@ -25594,9 +25649,16 @@ mod tests {
         // 4-row-aligned chunking preserves every row-block grouping, so the fanned
         // TRSM must agree bit-for-bit with the forced-serial path. The MACs-gate
         // override forces the fan-out at unit-test sizes (production gate needs
-        // n > ~1100); n=130 exercises the too-few-rows serial fallback. Both the
-        // static flips are safe under concurrent tests — every setting produces
-        // identical bits by construction.
+        // n > ~1100); n=130 exercises the too-few-rows serial fallback.
+        //
+        // This used to claim "both the static flips are safe under concurrent tests — every
+        // setting produces identical bits by construction". The premise is true and the
+        // conclusion does not follow: identical bits per setting is exactly what makes a
+        // stolen setting INVISIBLE here, so a concurrent write cannot be caught by this
+        // test's own assertion. It can still send both arms down one path and reduce the
+        // comparison to a thing against itself. The toggles are shared mutable state and
+        // need the lock regardless of whether their settings agree.
+        let _toggles = CholPanelTrsmToggles::acquire();
         CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE.store(1, std::sync::atomic::Ordering::Relaxed);
         for &n in &[130usize, 420, 600] {
             let mut a = vec![vec![0.0; n]; n];
@@ -25641,7 +25703,6 @@ mod tests {
                 );
             }
         }
-        CHOL_PANEL_TRSM_PAR_MACS_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[test]
@@ -25650,6 +25711,14 @@ mod tests {
         // single-rounding + cross-block/within-block reassociation); the contract is
         // the blocked path's 1e-10 factor-uniqueness tolerance. Sizes cover full 4×8
         // tiles, ragged column tails (nb % 8), tail rows (m2 % 4), and multi-panel runs.
+        //
+        // Takes the toggle lock even though it selects its kernels by GENERIC parameter and
+        // writes no toggle: the factorization it calls still reads the `CHOL_PANEL_TRSM_*`
+        // dispatch statics, so a concurrent write moves it between the serial and fanned
+        // paths mid-test. Its assertions happen to be insensitive to that, but "happens to
+        // be insensitive" is a property of today's contract, not a guarantee, and holding
+        // the lock costs one serialised test.
+        let _toggles = CholPanelTrsmToggles::acquire();
         let mut any_bits_differ = false;
         for &n in &[130usize, 131, 270, 271, 300] {
             let mut a = vec![vec![0.0; n]; n];
