@@ -5178,9 +5178,11 @@ pub static RBF_BUILD_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 pub struct RbfInterpolator {
     points: Vec<Vec<f64>>,
     weights: Vec<f64>,
+    polynomial_weights: Vec<f64>,
     kernel: RbfKernel,
     epsilon: f64,
     dim: usize,
+    degree: i32,
 }
 
 const MAX_RBF_POINTS: usize = 4096;
@@ -5198,6 +5200,21 @@ impl RbfInterpolator {
         values: &[f64],
         kernel: RbfKernel,
         epsilon: f64,
+    ) -> Result<Self, InterpError> {
+        Self::with_degree(points, values, kernel, epsilon, rbf_default_degree(kernel))
+    }
+
+    /// Create an RBF interpolator with an explicit polynomial-tail degree.
+    ///
+    /// `-1` disables the tail, `0` adds a constant, and `1` adds a constant
+    /// plus one linear term per input dimension. The default constructor uses
+    /// SciPy's kernel-specific defaults for the kernels this type supports.
+    pub fn with_degree(
+        points: &[Vec<f64>],
+        values: &[f64],
+        kernel: RbfKernel,
+        epsilon: f64,
+        degree: i32,
     ) -> Result<Self, InterpError> {
         let n = points.len();
         if n == 0 {
@@ -5248,6 +5265,19 @@ impl RbfInterpolator {
                 detail: "RbfInterpolator values must be finite".to_string(),
             });
         }
+        if !(-1..=1).contains(&degree) {
+            return Err(InterpError::InvalidArgument {
+                detail: format!(
+                    "RbfInterpolator supports polynomial degrees -1, 0, and 1; got {degree}"
+                ),
+            });
+        }
+
+        let polynomial_terms: Vec<Vec<f64>> = points
+            .iter()
+            .map(|point| rbf_polynomial_terms(point, degree))
+            .collect();
+        let tail_width = polynomial_terms.first().map_or(0, Vec::len);
 
         // Build the RBF matrix Φ[i,j] = φ(||points[i] - points[j]||) in FLAT row-major
         // storage so the dense solve runs over contiguous rows (cache-resident +
@@ -5299,19 +5329,34 @@ impl RbfInterpolator {
         // blocked LU (n≥1000 fast path) instead of the local serial Gaussian elimination
         // — the dense O(n³) solve dominates RBF construction. Not bit-identical to the
         // naive GE (different pivoting/blocking, ~1e-12), but within the RBF tolerance.
-        let a_rows: Vec<Vec<f64>> = phi.chunks(n).map(<[f64]>::to_vec).collect();
-        let weights = fsci_linalg::solve(&a_rows, values, fsci_linalg::SolveOptions::default())
+        let mut system = vec![vec![0.0; n + tail_width]; n + tail_width];
+        for (i, row) in phi.chunks(n).enumerate() {
+            system[i][..n].copy_from_slice(row);
+            system[i][n..].copy_from_slice(&polynomial_terms[i]);
+        }
+        for (term, column) in (0..tail_width).enumerate() {
+            for (i, terms) in polynomial_terms.iter().enumerate() {
+                system[n + term][i] = terms[column];
+            }
+        }
+        let mut rhs = values.to_vec();
+        rhs.resize(n + tail_width, 0.0);
+        let solution = fsci_linalg::solve(&system, &rhs, fsci_linalg::SolveOptions::default())
             .map_err(|e| InterpError::InvalidArgument {
                 detail: format!("RbfInterpolator dense solve failed: {e:?}"),
             })?
             .x;
+        let weights = solution[..n].to_vec();
+        let polynomial_weights = solution[n..].to_vec();
 
         Ok(Self {
             points: points.to_vec(),
             weights,
+            polynomial_weights,
             kernel,
             epsilon,
             dim,
+            degree,
         })
     }
 
@@ -5326,6 +5371,12 @@ impl RbfInterpolator {
             result += self.weights[i] * rbf_eval_sq(self.kernel, r2, self.epsilon);
         }
         result
+            + self
+                .polynomial_weights
+                .iter()
+                .zip(rbf_polynomial_terms(query, self.degree))
+                .map(|(&coefficient, term)| coefficient * term)
+                .sum::<f64>()
     }
 
     /// Evaluate at multiple query points.
