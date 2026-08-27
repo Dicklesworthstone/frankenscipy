@@ -11915,8 +11915,45 @@ pub static EIGH_BACKTRANSFORM_SPLIT_ACCUM_ENABLE: std::sync::atomic::AtomicBool 
 /// its own products in its own order; only the interleaving of independent columns changes.
 pub static EIGH_BACKTRANSFORM_COLBLOCK_ENABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
+
+/// Four-columns-in-flight in the PARALLEL per-chunk back-transform kernel (`true`,
+/// shipping). Bit-identical — see `apply_left_reflectors_to_column_chunk`.
+///
+/// The sibling `EIGH_BACKTRANSFORM_COLBLOCK_ENABLE` governs `apply_householder_left`, which
+/// only runs when the back-transform gets ONE worker. On any multi-core host the chunked
+/// arm runs instead and had no equivalent, so that toggle's hit counter reads 0 there and
+/// the recorded 2.341x never reached the shipping path.
+pub static EIGH_BACKTRANSFORM_CHUNK_COLBLOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Groups of four columns that actually took the chunked four-column arm — "enabled" is not
+/// "took effect", which is the distinction that exposed the gap this closes.
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result, so output is bit-identical
+/// whether or not anyone reads it.
+pub static EIGH_BACKTRANSFORM_CHUNK_COLBLOCK_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 /// Reflector applications that took the four-column arm — "enabled" is not "took effect".
 pub static EIGH_BACKTRANSFORM_COLBLOCK_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Four-reflectors-in-flight in the COMPACT-WY per-chunk back-transform kernel (`true`,
+/// shipping). Bit-identical — see `apply_compact_wy_left_panel_to_column_chunk`.
+///
+/// This is the kernel `eigh` actually reaches at n >= 512, which is every size
+/// frankenscipy-ll0kk measures. Its two siblings both address the same serial dot chain in
+/// kernels that do NOT run there: `EIGH_BACKTRANSFORM_COLBLOCK_ENABLE` needs one worker and
+/// `EIGH_BACKTRANSFORM_CHUNK_COLBLOCK` needs blocking disabled or n < 512. Each was
+/// measured a large win on its own kernel and moved whole-`eigh` not at all, for that
+/// reason alone.
+pub static EIGH_BACKTRANSFORM_PANEL_KBLOCK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Groups of four reflectors that actually took the compact-WY four-reflector arm.
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result, so output is bit-identical
+/// whether or not anyone reads it.
+pub static EIGH_BACKTRANSFORM_PANEL_KBLOCK_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Split the tridiagonal REDUCTION into its two halves: the symmetric matvec (gather) and
@@ -12882,10 +12919,52 @@ fn apply_compact_wy_left_panel_to_column_chunk(
     //
     // Bit-identical: each dot product sums the same products in the same order; only the
     // order in which DIFFERENT dot products are computed changes, and they are independent.
+    // FOUR REFLECTORS IN FLIGHT. `dot` accumulates `row_count` products into ONE variable,
+    // so it is a serial chain of dependent additions ~4 cycles deep that no unrolling can
+    // break — the adds wait on each other, and the interchange above did nothing about it
+    // because it addressed TRAFFIC. Traffic was the wrong currency: the measurement that
+    // rejected blocking on the serial path already named the bound as latency on this
+    // chain.
+    //
+    // `k_idx` is the independent dimension. Four reflectors are four unrelated dots over
+    // the SAME column, so running them together gives the machine four concurrent chains
+    // and loads each `column[r]` once for four uses instead of once each.
+    //
+    // BIT-IDENTICAL, and that is why it is `k_idx` blocking rather than splitting one dot
+    // across accumulators: every `d_i` still sums over `r` ASCENDING, exactly the order the
+    // scalar loop uses. Splitting a single dot into partial sums would be faster still and
+    // is NOT available — it reassociates.
     for col in 0..cols {
         let col_base = col * rows + active_start;
         let column = &chunk[col_base..col_base + row_count];
-        for k_idx in 0..k_count {
+        let mut k_idx = 0usize;
+        if EIGH_BACKTRANSFORM_PANEL_KBLOCK.load(std::sync::atomic::Ordering::Relaxed) {
+            while k_idx + 4 <= k_count {
+                let b0 = k_idx * row_count;
+                let (r0, r1, r2, r3) = (
+                    &panel.v_by_k_row[b0..b0 + row_count],
+                    &panel.v_by_k_row[b0 + row_count..b0 + 2 * row_count],
+                    &panel.v_by_k_row[b0 + 2 * row_count..b0 + 3 * row_count],
+                    &panel.v_by_k_row[b0 + 3 * row_count..b0 + 4 * row_count],
+                );
+                let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+                for r in 0..row_count {
+                    let c_row = column[r];
+                    d0 += r0[r] * c_row;
+                    d1 += r1[r] * c_row;
+                    d2 += r2[r] * c_row;
+                    d3 += r3[r] * c_row;
+                }
+                y[k_idx * cols + col] = d0;
+                y[(k_idx + 1) * cols + col] = d1;
+                y[(k_idx + 2) * cols + col] = d2;
+                y[(k_idx + 3) * cols + col] = d3;
+                EIGH_BACKTRANSFORM_PANEL_KBLOCK_HITS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                k_idx += 4;
+            }
+        }
+        for k_idx in k_idx..k_count {
             let v_base = k_idx * row_count;
             let reflector = &panel.v_by_k_row[v_base..v_base + row_count];
             let mut dot = 0.0;
@@ -12945,7 +13024,72 @@ fn apply_left_reflectors_to_column_chunk(
         if reflector.tau == 0.0 || reflector.values.is_empty() {
             continue;
         }
-        for col in 0..cols {
+        // FOUR COLUMNS IN FLIGHT. The per-column dot below is unrolled four ways but every
+        // one of those `+=` lands in the SAME accumulator, so it is a serial dependency
+        // chain of `values.len()` additions that unrolling does not break — the adds still
+        // wait on each other. Different COLUMNS are independent, so running four of them
+        // together gives the machine four concurrent chains and reuses each loaded
+        // `values[k]` four times.
+        //
+        // BIT-IDENTICAL, which is the whole reason this shape is used instead of four
+        // partial sums within one column: each column still accumulates its own dot over
+        // `k` ASCENDING, exactly the order the scalar path uses, so no float is
+        // reassociated. Splitting one column's sum across accumulators would be faster
+        // still and is NOT available — it changes the result.
+        //
+        // This technique was already measured at 2.341x on `apply_householder_left`, the
+        // SERIAL arm, and `EIGH_BACKTRANSFORM_COLBLOCK_HITS` reads 0 on any multi-core run
+        // because that arm is reachable only at `usable_workers <= 1`. Ported here it is
+        // worth 2.703x on this kernel, ABBA-interleaved in one process with the quartet
+        // flipped per round, ranges DISJOINT:
+        //
+        //     four columns in flight  median 25.364 ms  range [24.974, 25.985]
+        //     one accumulator         median 68.548 ms  range [66.703, 71.527]
+        //
+        // WHAT THIS IS NOT: a win on `eigh` at the sizes the gap is measured at. This
+        // kernel is the ELSE branch of `apply_left_reflectors_column_chunks`. At
+        // `rows >= SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_MIN_DIM` (512) with
+        // `EIGH_BACKTRANSFORM_BLOCKED_ENABLE` at its default `true` — which is n=512, 768
+        // and 1024, every size in frankenscipy-ll0kk — the spawned threads call
+        // `apply_compact_wy_left_panels_to_column_chunk` instead and never reach this code.
+        // Eight interleaved whole-`eigh` runs confirmed it: the paired ratio medians were
+        // 1.394 disabled against 1.415 enabled, overlapping, no movement. So this arm pays
+        // only below the compact-WY gate or with blocking off. The same lever applied to
+        // the kernel that DOES ship is `EIGH_BACKTRANSFORM_PANEL_KBLOCK`.
+        let values = &reflector.values;
+        let len = values.len();
+        let start = reflector.start;
+        let mut col = 0usize;
+        if EIGH_BACKTRANSFORM_CHUNK_COLBLOCK.load(std::sync::atomic::Ordering::Relaxed) {
+            while col + 4 <= cols {
+                let (b0, b1, b2, b3) = (
+                    col * rows + start,
+                    (col + 1) * rows + start,
+                    (col + 2) * rows + start,
+                    (col + 3) * rows + start,
+                );
+                let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+                for k in 0..len {
+                    let v = values[k];
+                    d0 += v * chunk[b0 + k];
+                    d1 += v * chunk[b1 + k];
+                    d2 += v * chunk[b2 + k];
+                    d3 += v * chunk[b3 + k];
+                }
+                for (base, dot) in [(b0, d0), (b1, d1), (b2, d2), (b3, d3)] {
+                    let scale = reflector.tau * dot;
+                    if scale != 0.0 {
+                        for k in 0..len {
+                            chunk[base + k] -= scale * values[k];
+                        }
+                    }
+                }
+                EIGH_BACKTRANSFORM_CHUNK_COLBLOCK_HITS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                col += 4;
+            }
+        }
+        for col in col..cols {
             let col_base = col * rows;
             let base = col_base + reflector.start;
             let values = &reflector.values;
@@ -34164,6 +34308,335 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Drives `EIGH_BACKTRANSFORM_CHUNK_COLBLOCK` in BOTH settings through the real
+    /// entry point, and pins the arm's contract: bit-identity, not near-equality.
+    ///
+    /// The fixture is sized above the gate that decides which kernel runs. Getting this
+    /// wrong is the failure this project keeps paying for: below
+    /// `THIN_BIDIAG_LEFT_REPLAY_MIN_PAR_COLS`, or with fewer than two usable workers,
+    /// `apply_left_reflectors_column_chunks` takes the SERIAL `apply_householder_left`
+    /// instead and both toggle settings execute the same code — the assertion then passes
+    /// while comparing nothing. The `HITS` counters below are what make that visible:
+    /// the enabled arm must be non-zero and the disabled arm must be exactly zero, so a
+    /// fixture that silently missed the kernel fails loudly instead of reading green.
+    #[test]
+    fn eigh_chunk_colblock_is_bit_identical_and_actually_runs() {
+        let _guard = eigh_toggle_lock();
+        use std::sync::atomic::Ordering::Relaxed;
+
+        const N: usize = 160;
+        const WORKERS: usize = 4;
+        const _: () = assert!(N >= THIN_BIDIAG_LEFT_REPLAY_MIN_PAR_COLS);
+        const _: () = assert!(N / THIN_BIDIAG_LEFT_REPLAY_MIN_COLS_PER_WORKER >= 2);
+
+        let build = || {
+            let mut m = DMatrix::<f64>::zeros(N, N);
+            for row in 0..N {
+                for col in 0..N {
+                    m[(row, col)] =
+                        ((row * 31 + col * 17 + row * col + 5) % 97) as f64 / 89.0 - 0.5;
+                }
+            }
+            m
+        };
+        let mut reflectors = Vec::with_capacity(N - 2);
+        for start in 1..N - 1 {
+            let column: Vec<f64> = (start..N)
+                .map(|i| ((i * 13 + start * 29 + 3) % 61) as f64 / 59.0 - 0.5)
+                .collect();
+            reflectors.push(make_householder_reflector(start, column));
+        }
+
+        // The blocked arm keeps the compact-WY setting fixed, because that toggle also
+        // decides which chunk kernel the spawned threads call. Flipping one lever at a
+        // time is the only way the result belongs to the lever under test.
+        let blocked_before = EIGH_BACKTRANSFORM_BLOCKED_ENABLE.load(Relaxed);
+        EIGH_BACKTRANSFORM_BLOCKED_ENABLE.store(false, Relaxed);
+
+        let mut arms = Vec::with_capacity(2);
+        for enabled in [true, false] {
+            EIGH_BACKTRANSFORM_CHUNK_COLBLOCK.store(enabled, Relaxed);
+            let before = EIGH_BACKTRANSFORM_CHUNK_COLBLOCK_HITS.load(Relaxed);
+            let mut m = build();
+            apply_left_reflectors_column_chunks(&mut m, &reflectors, WORKERS);
+            let hits = EIGH_BACKTRANSFORM_CHUNK_COLBLOCK_HITS.load(Relaxed) - before;
+            arms.push((enabled, m, hits));
+        }
+
+        EIGH_BACKTRANSFORM_BLOCKED_ENABLE.store(blocked_before, Relaxed);
+        EIGH_BACKTRANSFORM_CHUNK_COLBLOCK.store(true, Relaxed);
+
+        assert!(
+            arms[0].2 > 0,
+            "four-column arm never ran: the fixture missed the parallel kernel, so the \
+             bit-identity assertion below would be vacuous"
+        );
+        assert_eq!(
+            arms[1].2, 0,
+            "disabled arm still took the four-column block; the toggle is not the lever"
+        );
+
+        let (blocked, scalar) = (&arms[0].1, &arms[1].1);
+        let mut differing = 0usize;
+        for row in 0..N {
+            for col in 0..N {
+                if blocked[(row, col)].to_bits() != scalar[(row, col)].to_bits() {
+                    differing += 1;
+                }
+            }
+        }
+        assert_eq!(
+            differing, 0,
+            "four-column dot reassociated a sum; the arm is not bit-identical"
+        );
+
+        // DETECTOR ARM. Every claim here is bit-identity, so "nothing differed" is the
+        // passing outcome and is indistinguishable from a comparison too blunt to see a
+        // difference. Perturb one entry by a single ULP and require the same `to_bits`
+        // comparison to catch it. `==` would not: it accepts a lost sign on zero.
+        let mut perturbed = scalar.clone();
+        perturbed[(N / 3, N / 5)] = f64::from_bits(perturbed[(N / 3, N / 5)].to_bits() ^ 1);
+        let seen = (0..N)
+            .flat_map(|row| (0..N).map(move |col| (row, col)))
+            .filter(|&(row, col)| blocked[(row, col)].to_bits() != perturbed[(row, col)].to_bits())
+            .count();
+        assert_eq!(
+            seen, 1,
+            "the bit comparison cannot see a one-ULP difference"
+        );
+    }
+
+    /// Drives `EIGH_BACKTRANSFORM_PANEL_KBLOCK` in BOTH settings on the kernel `eigh`
+    /// actually reaches at n >= 512, and pins bit-identity.
+    ///
+    /// `k_count` must exceed 4 or the four-reflector block never forms and the comparison
+    /// is vacuous; the `HITS` assertions below are what make that visible rather than
+    /// green. A panel width of 8 is the shipping value and gives one full block plus a
+    /// remainder, so both the blocked path and its scalar tail are covered.
+    #[test]
+    fn eigh_panel_kblock_is_bit_identical_and_actually_runs() {
+        let _guard = eigh_toggle_lock();
+        use std::sync::atomic::Ordering::Relaxed;
+
+        const ROWS: usize = 192;
+        const COLS: usize = 40;
+        const PANEL_WIDTH: usize = SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_PANEL_WIDTH;
+        const _: () = assert!(PANEL_WIDTH > 4, "no four-reflector block would form");
+
+        let mut s: u64 = 0x0bad_c0de_face_1234;
+        let mut rng = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
+        };
+        let mut reflectors = Vec::with_capacity(ROWS - 2);
+        for start in 1..ROWS - 1 {
+            let column: Vec<f64> = (start..ROWS).map(|_| rng()).collect();
+            reflectors.push(make_householder_reflector(start, column));
+        }
+        let panels = compact_wy_left_backtransform_panels(ROWS, &reflectors, PANEL_WIDTH)
+            .expect("compact-WY backtransform panels");
+        let base: Vec<f64> = (0..ROWS * COLS).map(|_| rng()).collect();
+
+        let mut arms = Vec::with_capacity(2);
+        for enabled in [true, false] {
+            EIGH_BACKTRANSFORM_PANEL_KBLOCK.store(enabled, Relaxed);
+            let before = EIGH_BACKTRANSFORM_PANEL_KBLOCK_HITS.load(Relaxed);
+            let mut chunk = base.clone();
+            apply_compact_wy_left_panels_to_column_chunk(&mut chunk, ROWS, COLS, &panels);
+            let hits = EIGH_BACKTRANSFORM_PANEL_KBLOCK_HITS.load(Relaxed) - before;
+            arms.push((chunk, hits));
+        }
+        EIGH_BACKTRANSFORM_PANEL_KBLOCK.store(true, Relaxed);
+
+        assert!(
+            arms[0].1 > 0,
+            "four-reflector arm never ran: the bit-identity check below would be vacuous"
+        );
+        assert_eq!(
+            arms[1].1, 0,
+            "disabled arm still blocked; the toggle is not the lever"
+        );
+
+        let (blocked, scalar) = (&arms[0].0, &arms[1].0);
+        let differing = blocked
+            .iter()
+            .zip(scalar)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "four-reflector dots reassociated a sum; the arm is not bit-identical"
+        );
+
+        // DETECTOR ARM: with every claim being bit-identity, "nothing differed" is also
+        // what a comparison too blunt to see anything prints. `to_bits`, not `==`, because
+        // `-0.0 == 0.0` accepts a lost sign.
+        let mut perturbed = scalar.clone();
+        perturbed[ROWS * COLS / 3] = f64::from_bits(perturbed[ROWS * COLS / 3].to_bits() ^ 1);
+        let seen = blocked
+            .iter()
+            .zip(&perturbed)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            seen, 1,
+            "the bit comparison cannot see a one-ULP difference"
+        );
+    }
+
+    /// Times the two `EIGH_BACKTRANSFORM_PANEL_KBLOCK` arms on the kernel alone, ABBA with
+    /// the quartet flipped per round, inside ONE process. Self-comparison: it chooses
+    /// between two of our own arms and can never be a win against SciPy.
+    #[test]
+    #[ignore = "perf/proof probe: run with --release for one-accumulator vs four-reflector panel dots"]
+    fn eigh_panel_kblock_arm_perf_probe() {
+        let _guard = eigh_toggle_lock();
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // Shaped like the shipping split: n=1024 over 8 workers is 128 columns per chunk.
+        const ROWS: usize = 1024;
+        const COLS: usize = 128;
+
+        let mut s: u64 = 0x5eed_1234_abcd_ef01;
+        let mut rng = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
+        };
+        let mut reflectors = Vec::with_capacity(ROWS - 2);
+        for start in 1..ROWS - 1 {
+            let column: Vec<f64> = (start..ROWS).map(|_| rng()).collect();
+            reflectors.push(make_householder_reflector(start, column));
+        }
+        let panels = compact_wy_left_backtransform_panels(
+            ROWS,
+            &reflectors,
+            SYMMETRIC_EIGH_COMPACT_BACKTRANSFORM_PANEL_WIDTH,
+        )
+        .expect("compact-WY backtransform panels");
+        let base: Vec<f64> = (0..ROWS * COLS).map(|_| rng()).collect();
+
+        let restore = EIGH_BACKTRANSFORM_PANEL_KBLOCK.load(Relaxed);
+        let (mut on, mut off) = (Vec::new(), Vec::new());
+        for (round, order) in [[true, false, false, true], [false, true, true, false]]
+            .into_iter()
+            .enumerate()
+        {
+            for enabled in order {
+                EIGH_BACKTRANSFORM_PANEL_KBLOCK.store(enabled, Relaxed);
+                let mut chunk = base.clone();
+                let started_at = std::time::Instant::now();
+                apply_compact_wy_left_panels_to_column_chunk(
+                    std::hint::black_box(&mut chunk),
+                    ROWS,
+                    COLS,
+                    &panels,
+                );
+                let ms = started_at.elapsed().as_secs_f64() * 1_000.0;
+                std::hint::black_box(&chunk);
+                if enabled { &mut on } else { &mut off }.push(ms);
+                println!("round={round} panel_kblock={enabled} kernel_ms={ms:.3}");
+            }
+        }
+        EIGH_BACKTRANSFORM_PANEL_KBLOCK.store(restore, Relaxed);
+
+        on.sort_by(f64::total_cmp);
+        off.sort_by(f64::total_cmp);
+        let median = |v: &[f64]| (v[v.len() / 2 - 1] + v[v.len() / 2]) / 2.0;
+        println!(
+            "panel_kblock ON median={:.3}ms range=[{:.3}, {:.3}] | OFF median={:.3}ms \
+             range=[{:.3}, {:.3}] | on/off={:.4}x",
+            median(&on),
+            on[0],
+            on[on.len() - 1],
+            median(&off),
+            off[0],
+            off[off.len() - 1],
+            median(&on) / median(&off),
+        );
+    }
+
+    /// Times the two `EIGH_BACKTRANSFORM_CHUNK_COLBLOCK` arms against each other on the
+    /// kernel alone, alternating them inside ONE process.
+    ///
+    /// This is a SELF-COMPARISON and therefore proves nothing about SciPy — it cannot be
+    /// a win, only a choice of which of our own arms to ship. It exists because the
+    /// whole-`eigh` A/B could not resolve the question: over eight interleaved runs the
+    /// host load swung from 16 to 65 while the A/A nulls kept passing, and the
+    /// back-transform stage time tracked the load rather than the arm (62.8 ms at load
+    /// 16.4 against 95.5 ms at load 19.7, both with the arm ENABLED). Stripping SciPy and
+    /// the other two stages out leaves a comparison short enough to sit inside one load
+    /// epoch.
+    #[test]
+    #[ignore = "perf/proof probe: run with --release for one-accumulator vs four-column chunk dots"]
+    fn eigh_chunk_colblock_arm_perf_probe() {
+        let _guard = eigh_toggle_lock();
+        use std::sync::atomic::Ordering::Relaxed;
+
+        // Shaped like the shipping split: n=1024 over 8 workers is 128 columns per chunk.
+        const ROWS: usize = 1024;
+        const COLS: usize = 128;
+
+        let mut s: u64 = 0x1357_9bdf_2468_ace0;
+        let mut rng = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 11) as f64) / (1u64 << 53) as f64 - 0.5
+        };
+        let mut reflectors = Vec::with_capacity(ROWS - 2);
+        for start in 1..ROWS - 1 {
+            let column: Vec<f64> = (start..ROWS).map(|_| rng()).collect();
+            reflectors.push(make_householder_reflector(start, column));
+        }
+        let base: Vec<f64> = (0..ROWS * COLS).map(|_| rng()).collect();
+
+        let restore = EIGH_BACKTRANSFORM_CHUNK_COLBLOCK.load(Relaxed);
+        let mut on = Vec::new();
+        let mut off = Vec::new();
+        // ABBA with the quartet flipped each round: position cannot be attributed to an
+        // arm. A plain alternation cancels drift but not a cold or hot slot.
+        for (round, order) in [[true, false, false, true], [false, true, true, false]]
+            .into_iter()
+            .enumerate()
+        {
+            for enabled in order {
+                EIGH_BACKTRANSFORM_CHUNK_COLBLOCK.store(enabled, Relaxed);
+                let mut chunk = base.clone();
+                let started_at = std::time::Instant::now();
+                apply_left_reflectors_to_column_chunk(
+                    std::hint::black_box(&mut chunk),
+                    ROWS,
+                    COLS,
+                    &reflectors,
+                );
+                let ms = started_at.elapsed().as_secs_f64() * 1_000.0;
+                std::hint::black_box(&chunk);
+                if enabled { &mut on } else { &mut off }.push(ms);
+                println!("round={round} chunk_colblock={enabled} kernel_ms={ms:.3}");
+            }
+        }
+        EIGH_BACKTRANSFORM_CHUNK_COLBLOCK.store(restore, Relaxed);
+
+        on.sort_by(f64::total_cmp);
+        off.sort_by(f64::total_cmp);
+        let median = |v: &[f64]| (v[v.len() / 2 - 1] + v[v.len() / 2]) / 2.0;
+        println!(
+            "chunk_colblock ON median={:.3}ms range=[{:.3}, {:.3}] | OFF median={:.3}ms \
+             range=[{:.3}, {:.3}] | on/off={:.4}x",
+            median(&on),
+            on[0],
+            on[on.len() - 1],
+            median(&off),
+            off[0],
+            off[off.len() - 1],
+            median(&on) / median(&off),
+        );
     }
 
     #[test]

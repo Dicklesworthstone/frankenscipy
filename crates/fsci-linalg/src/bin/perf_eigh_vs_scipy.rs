@@ -793,6 +793,27 @@ for raw_line in sys.stdin.buffer:
         );
         fsci_linalg::EIGH_BACKTRANSFORM_BLOCKED_ENABLE
             .store(blocked, std::sync::atomic::Ordering::Relaxed);
+        // `FSCI_EIGH_CHUNK_COLBLOCK=0` restores the one-accumulator per-column dot in the
+        // PARALLEL back-transform kernel. That kernel — not the serial one that carries
+        // `EIGH_BACKTRANSFORM_COLBLOCK` — is what runs on any multi-core host, so this is
+        // the arm the shipping configuration actually takes. Both arms in ONE binary.
+        let chunk_colblock = !matches!(
+            std::env::var("FSCI_EIGH_CHUNK_COLBLOCK").ok().as_deref(),
+            Some("0") | Some("false")
+        );
+        fsci_linalg::EIGH_BACKTRANSFORM_CHUNK_COLBLOCK
+            .store(chunk_colblock, std::sync::atomic::Ordering::Relaxed);
+        println!("chunk_colblock={chunk_colblock}");
+        // `FSCI_EIGH_PANEL_KBLOCK=0` restores the one-accumulator per-reflector dot in the
+        // COMPACT-WY chunk kernel — the one `eigh` reaches at n >= 512, i.e. every size
+        // this harness measures. Both arms in ONE binary.
+        let panel_kblock = !matches!(
+            std::env::var("FSCI_EIGH_PANEL_KBLOCK").ok().as_deref(),
+            Some("0") | Some("false")
+        );
+        fsci_linalg::EIGH_BACKTRANSFORM_PANEL_KBLOCK
+            .store(panel_kblock, std::sync::atomic::Ordering::Relaxed);
+        println!("panel_kblock={panel_kblock}");
         // `FSCI_EIGH_INTERLEAVE=1` drives four inverse-iteration columns in lockstep.
         {
             use fsci_linalg::EIGH_INVERSE_COLUMN_INTERLEAVE;
@@ -1339,7 +1360,8 @@ for raw_line in sys.stdin.buffer:
                 println!(
                     "n={n} impl={impl_label} STAGES reduce={:.3}ms solve={:.3}ms back={:.3}ms \
                      total={:.3}ms shares={:.4}/{:.4}/{:.4} panel_width={} panels={} \
-                     sliced_hits={} colblock_hits={} instrumented=true",
+                     sliced_hits={} colblock_hits={} chunk_colblock_hits={} \
+                     panel_kblock_hits={} instrumented=true",
                     stage[0] as f64 / 1.0e6,
                     stage[1] as f64 / 1.0e6,
                     stage[2] as f64 / 1.0e6,
@@ -1354,6 +1376,10 @@ for raw_line in sys.stdin.buffer:
                     fsci_linalg::EIGH_BACKTRANSFORM_SLICED_HITS
                         .load(std::sync::atomic::Ordering::Relaxed),
                     fsci_linalg::EIGH_BACKTRANSFORM_COLBLOCK_HITS
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    fsci_linalg::EIGH_BACKTRANSFORM_CHUNK_COLBLOCK_HITS
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    fsci_linalg::EIGH_BACKTRANSFORM_PANEL_KBLOCK_HITS
                         .load(std::sync::atomic::Ordering::Relaxed),
                 );
                 // MUST-HIT. All-zero counters mean the native path never ran -- at n below
