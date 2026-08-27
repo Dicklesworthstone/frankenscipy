@@ -793,6 +793,26 @@ for raw_line in sys.stdin.buffer:
         );
         fsci_linalg::EIGH_BACKTRANSFORM_BLOCKED_ENABLE
             .store(blocked, std::sync::atomic::Ordering::Relaxed);
+        // `FSCI_EIGH_INTERLEAVE=1` drives four inverse-iteration columns in lockstep.
+        {
+            use fsci_linalg::EIGH_INVERSE_COLUMN_INTERLEAVE;
+            match std::env::var("FSCI_EIGH_INTERLEAVE").ok().as_deref() {
+                Some("1") | Some("true") => {
+                    EIGH_INVERSE_COLUMN_INTERLEAVE
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Some("0") | Some("false") => {
+                    EIGH_INVERSE_COLUMN_INTERLEAVE
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            println!(
+                "inverse_column_interleave={}",
+                EIGH_INVERSE_COLUMN_INTERLEAVE.load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+
         // `FSCI_EIGH_CONVERGENCE_STOP=1` stops inverse iteration once successive iterates agree.
         {
             // ONLY OVERRIDE WHEN ASKED. An unconditional store pins the arm to this
@@ -1284,12 +1304,15 @@ for raw_line in sys.stdin.buffer:
                 let sol_total = sol.iter().sum::<u64>();
                 println!(
                     "n={n} impl={impl_label} SOLVE_SUBSTAGES values_ms={:.3} vectors_ms={:.3} \
-                     total_ms={:.3} values_share={:.4} converged_early={} instrumented={}",
+                     total_ms={:.3} values_share={:.4} converged_early={} interleave_hits={} \
+                     instrumented={}",
                     sol[0] as f64 / 1.0e6,
                     sol[1] as f64 / 1.0e6,
                     sol_total as f64 / 1.0e6,
                     sol[0] as f64 / sol_total.max(1) as f64,
                     fsci_linalg::EIGH_INVERSE_ITERATIONS_SKIPPED
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    fsci_linalg::EIGH_INVERSE_INTERLEAVE_HITS
                         .load(std::sync::atomic::Ordering::Relaxed),
                     sol_total > 0,
                 );
