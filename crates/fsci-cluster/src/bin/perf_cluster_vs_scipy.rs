@@ -199,6 +199,21 @@ fn main() {
 
     println!("elf_sha256={}", elf_sha256());
 
+    // `FSCI_CLUSTER_VQ_SOA=0` restores the `sq_dist` scan. Only-override-when-asked.
+    match std::env::var("FSCI_CLUSTER_VQ_SOA").ok().as_deref() {
+        Some("1") | Some("true") => {
+            fsci_cluster::VQ_SOA_SCAN.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some("0") | Some("false") => {
+            fsci_cluster::VQ_SOA_SCAN.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    println!(
+        "vq_soa_scan={}",
+        fsci_cluster::VQ_SOA_SCAN.load(std::sync::atomic::Ordering::Relaxed)
+    );
+
     let coord = |i: usize, d: usize| -> f64 {
         let key = (i * 2_654_435_761usize).wrapping_add(d * 40_503) % 100_003;
         key as f64 / 100_003.0 - 0.5

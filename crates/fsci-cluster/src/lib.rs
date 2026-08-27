@@ -3740,7 +3740,27 @@ pub fn vq(
     // Each point's nearest-centroid lookup is independent; assign them in
     // parallel into ordered slots (single pass — threads are spawned once).
     // Byte-identical: same per-point lowest-index argmin, results in data order.
-    let assign = |point: &[f64]| -> (usize, f64) {
+    // Built ONCE per `vq` call, not per point: k*d is 256 here against 48,000 pair
+    // evaluations, so the transpose is noise and the layout it buys is not.
+    let soa_scan =
+        VQ_SOA_SCAN.load(std::sync::atomic::Ordering::Relaxed) && k <= NEAREST_FULL_SCAN_MAX_K;
+    let soa = soa_scan.then(|| centroids_to_soa(&centroids_flat, k, d));
+    let assign = |point: &[f64], scratch: &mut Vec<f64>| -> (usize, f64) {
+        if let Some(soa) = soa.as_deref() {
+            scratch.resize(k, 0.0);
+            accumulate_sq_dists_soa(point, soa, k, d, scratch);
+            // Ascending `c` with a strict `<` keeps the smallest-index minimiser, the exact
+            // tie-break the `sq_dist` scan uses.
+            let mut best_c = 0usize;
+            let mut min_sq = scratch[0];
+            for c in 1..k {
+                if scratch[c] < min_sq {
+                    min_sq = scratch[c];
+                    best_c = c;
+                }
+            }
+            return (best_c, min_sq.sqrt());
+        }
         let (best_c, min_sq) = nearest_centroid(point, &centroids_flat, k, d);
         (best_c, min_sq.sqrt())
     };
@@ -3753,7 +3773,8 @@ pub fn vq(
             .min(n)
     };
     let pairs: Vec<(usize, f64)> = if nthreads <= 1 {
-        data.iter().map(|p| assign(p)).collect()
+        let mut scratch = Vec::new();
+        data.iter().map(|p| assign(p, &mut scratch)).collect()
     } else {
         let mut out = vec![(0usize, 0.0f64); n];
         let chunk = n.div_ceil(nthreads);
@@ -3762,8 +3783,10 @@ pub fn vq(
             for (t, slot) in out.chunks_mut(chunk).enumerate() {
                 let base = t * chunk;
                 scope.spawn(move || {
+                    // One accumulator buffer per THREAD, so the points stay independent.
+                    let mut scratch = Vec::new();
                     for (i, o) in slot.iter_mut().enumerate() {
-                        *o = assign(&data[base + i]);
+                        *o = assign(&data[base + i], &mut scratch);
                     }
                 });
             }
@@ -6299,6 +6322,52 @@ fn assign_points(
 /// distances to pay for the branchy scan, so the abandonment path is kept.
 const NEAREST_FULL_SCAN_MAX_K: usize = 64;
 
+/// Accumulate squared distances to ALL centroids at once, from a dimension-major layout.
+///
+/// WHY. `sq_dist` is `iter().zip().map().sum()` — a serial float fold that rustc cannot
+/// vectorise, because reordering the sum would change the result. At d=8 that is eight
+/// DEPENDENT adds per (point, centroid) pair, and `vq` at n=1500 k=32 runs 48,000 of those
+/// pairs: ~384,000 dependent adds whose latency is the whole cost. The arithmetic per pair is
+/// trivial; the chain is not.
+///
+/// Different CENTROIDS are independent, so walking dimensions on the outside and centroids on
+/// the inside turns those chains into `k` concurrent ones, and with the centroids stored
+/// dimension-major (`soa[j * k + c]`) the inner loop is contiguous and vectorises.
+///
+/// BIT-IDENTICAL: `accumulators[c]` sums `(p[j] - c[j])²` over `j` ascending, which is exactly
+/// the order `sq_dist`'s left fold uses. Only the interleaving of INDEPENDENT centroids
+/// changes. Pinned by `vq_soa_kernel_matches_sq_dist_bits`.
+fn accumulate_sq_dists_soa(point: &[f64], soa: &[f64], k: usize, d: usize, out: &mut [f64]) {
+    debug_assert!(soa.len() >= k * d);
+    debug_assert!(out.len() >= k);
+    let accumulators = &mut out[..k];
+    accumulators.fill(0.0);
+    for j in 0..d {
+        let coordinate = point[j];
+        let row = &soa[j * k..j * k + k];
+        for (accumulator, &centroid) in accumulators.iter_mut().zip(row) {
+            let difference = coordinate - centroid;
+            *accumulator += difference * difference;
+        }
+    }
+}
+
+/// Transpose row-major centroids (`c * d + j`) into dimension-major (`j * k + c`).
+fn centroids_to_soa(centroids_flat: &[f64], k: usize, d: usize) -> Vec<f64> {
+    let mut soa = vec![0.0; k * d];
+    for c in 0..k {
+        for j in 0..d {
+            soa[j * k + c] = centroids_flat[c * d + j];
+        }
+    }
+    soa
+}
+
+/// Route `vq`'s nearest-centroid scan through the dimension-major accumulator kernel.
+///
+/// Bit-identical to the `sq_dist` scan it replaces, so this is a cost knob only.
+pub static VQ_SOA_SCAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 fn nearest_centroid(point: &[f64], centroids_flat: &[f64], k: usize, d: usize) -> (usize, f64) {
     if k == 4 && d == 4 {
         return nearest_centroid_k4_d4(point, centroids_flat);
@@ -7554,6 +7623,57 @@ pub fn kmedoids(
 
 #[cfg(test)]
 mod tests {
+
+    /// The dimension-major accumulator kernel must return EXACTLY what the `sq_dist` scan
+    /// returns — same winning centroid AND same distance bits.
+    ///
+    /// `accumulators[c]` sums `(p[j]-c[j])²` over `j` ascending, which is the order
+    /// `sq_dist`'s left fold uses, so bit equality is the right assertion. A tolerance would
+    /// pass a kernel that transposed the wrong axis and still produced plausible distances,
+    /// which is the specific failure a SoA rewrite can have.
+    ///
+    /// Sweeps `d` including values that are not a multiple of the SIMD width, and `k` on
+    /// both sides of 8, so a lane-tail bug cannot hide.
+    #[test]
+    fn vq_soa_kernel_matches_sq_dist_bits() {
+        use std::sync::atomic::Ordering;
+        let was = VQ_SOA_SCAN.load(Ordering::Relaxed);
+        let coord = |i: usize, d: usize| -> f64 {
+            let key = (i * 2_654_435_761usize).wrapping_add(d * 40_503) % 100_003;
+            key as f64 / 100_003.0 - 0.5
+        };
+        for dim in [1usize, 3, 4, 7, 8, 13] {
+            for k in [1usize, 5, 8, 17, 32] {
+                let n = 40usize;
+                let data: Vec<Vec<f64>> = (0..n)
+                    .map(|i| (0..dim).map(|d| coord(i, d)).collect())
+                    .collect();
+                // Some centroids coincide exactly with data rows, so the zero-distance case
+                // and its tie-break are exercised rather than assumed.
+                let centroids: Vec<Vec<f64>> = (0..k)
+                    .map(|c| (0..dim).map(|d| coord(c * 3, d)).collect())
+                    .collect();
+
+                VQ_SOA_SCAN.store(false, Ordering::Relaxed);
+                let reference = vq(&data, &centroids).expect("sq_dist scan");
+                VQ_SOA_SCAN.store(true, Ordering::Relaxed);
+                let candidate = vq(&data, &centroids).expect("soa scan");
+
+                assert_eq!(
+                    reference.0, candidate.0,
+                    "dim={dim} k={k}: chosen centroids differ"
+                );
+                for (index, (want, got)) in reference.1.iter().zip(candidate.1.iter()).enumerate() {
+                    assert_eq!(
+                        want.to_bits(),
+                        got.to_bits(),
+                        "dim={dim} k={k}: distance[{index}] differs ({want:e} vs {got:e})"
+                    );
+                }
+            }
+        }
+        VQ_SOA_SCAN.store(was, Ordering::Relaxed);
+    }
     use super::*;
 
     // ── frankenscipy-ecrbb: bit-identity gates for the four levers restored from
