@@ -11755,6 +11755,24 @@ pub static EIGH_BACKTRANSFORM_LAST_PANELS: std::sync::atomic::AtomicUsize =
 /// the blocked one from a window at loadavg 63.
 pub static EIGH_BACKTRANSFORM_BLOCKED_ENABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
+
+/// Bind each column segment as a contiguous slice in the unblocked back-transform instead
+/// of recomputing `data[col_base + start + offset]` per element.
+///
+/// The unblocked application is the SHIPPING arm of the back-transform (compact-WY blocking
+/// measured 1.130x slower and is unreachable on one core anyway), and stage timing puts the
+/// back-transform at **61.4%** of `eigh` at n=768 — the suite's worst cell at 3.627x. Its
+/// two inner loops indexed through a per-iteration offset, which hides contiguity and
+/// non-aliasing from LLVM and stops it vectorizing a plain dot product and AXPY. This crate
+/// already recorded that finding in `apply_symmetric_householder_trailing_rank2` and applied
+/// it only to the REDUCTION, which is 24.9%.
+///
+/// Bit-identical: same operands, same order, same additions — only the addressing changes.
+pub static EIGH_BACKTRANSFORM_SLICED_ENABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Reflector applications that took the sliced arm — "enabled" is not "took effect".
+pub static EIGH_BACKTRANSFORM_SLICED_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_PAR_ROWS: usize = 128;
 const THIN_BIDIAG_RIGHT_REPLAY_MIN_ROWS_PER_WORKER: usize = 32;
 const THIN_BIDIAG_RIGHT_REPLAY_MAX_WORKERS: usize = 8;
@@ -11894,17 +11912,58 @@ fn apply_householder_left(
     let rows = matrix.nrows();
     let cols = matrix.ncols();
     let start = reflector.start;
+    // Read ONCE at the call boundary, never inside the column loop: an atomic load in a
+    // per-element path is an optimisation barrier, and this repo has already paid 13% for
+    // exactly that shape in the splu merge kernel.
+    let sliced = EIGH_BACKTRANSFORM_SLICED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+    if sliced {
+        EIGH_BACKTRANSFORM_SLICED_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let data = matrix.as_mut_slice();
+    let values = reflector.values.as_slice();
+    let active = values.len();
     for col in col_start..cols {
+        // BIND THE COLUMN SEGMENT ONCE, THEN NEVER INDEX. `data[col_base + start + offset]`
+        // with the index computed per iteration hides from LLVM both that the walk is
+        // contiguous and that `data` and `values` cannot alias, which is enough to stop it
+        // vectorizing what is otherwise a textbook dot product followed by an AXPY.
+        //
+        // This crate already carries that finding in
+        // `apply_symmetric_householder_trailing_rank2`, where the same rewrite is spelled
+        // out in a comment — but it was only ever applied to the REDUCTION. This function is
+        // the BACK-TRANSFORM, which stage timing puts at 61.4% of `eigh` at n=768 against
+        // the reduction's 24.9%, so the known fix had been applied to the smaller stage and
+        // not the larger one.
+        //
+        // Bit-identical: same operands, same order, same additions. Only the addressing
+        // changes, so `dot` accumulates in the identical sequence and the update subtracts
+        // the identical products.
         let col_base = col * rows;
-        let mut dot = 0.0;
-        for (offset, value) in reflector.values.iter().enumerate() {
-            dot += value * data[col_base + start + offset];
-        }
-        let scale = reflector.tau * dot;
-        if scale != 0.0 {
-            for (offset, value) in reflector.values.iter().enumerate() {
-                data[col_base + start + offset] -= scale * value;
+        if sliced {
+            let segment = &mut data[col_base + start..col_base + start + active];
+            let mut dot = 0.0;
+            for (&slot, &value) in segment.iter().zip(values) {
+                dot += value * slot;
+            }
+            let scale = reflector.tau * dot;
+            if scale != 0.0 {
+                for (slot, &value) in segment.iter_mut().zip(values) {
+                    *slot -= scale * value;
+                }
+            }
+        } else {
+            // THE PRE-REWRITE ARM, kept so the two can be alternated in ONE binary instead
+            // of compared across two builds in two windows. Identical arithmetic in an
+            // identical order; the index is simply recomputed per element.
+            let mut dot = 0.0;
+            for (offset, value) in values.iter().enumerate() {
+                dot += value * data[col_base + start + offset];
+            }
+            let scale = reflector.tau * dot;
+            if scale != 0.0 {
+                for (offset, value) in values.iter().enumerate() {
+                    data[col_base + start + offset] -= scale * value;
+                }
             }
         }
     }
@@ -41093,6 +41152,95 @@ mod proptest_tests {
                 (got - want).abs() < 1e-10,
                 "s[{i}] got {got}, expected {want}"
             );
+        }
+    }
+
+    /// The sliced back-transform must return the SAME BITS as the indexed one.
+    ///
+    /// The two arms bind the same operands in the same order and perform the same additions
+    /// and subtractions; only the way the element address is FORMED changes. Bit-equality is
+    /// therefore the right assertion, not a tolerance — a tolerance would pass even if the
+    /// sliced arm walked the wrong segment of the column, which is exactly what a
+    /// slice-binding rewrite can get wrong.
+    ///
+    /// TWO ARMS, both observed: the hit counter must advance with the toggle on and must not
+    /// with it off. Without that, an arm that silently never runs and a correct one look
+    /// identical — and this file has already produced one flat sweep of a knob that was
+    /// never connected.
+    #[test]
+    fn sliced_backtransform_is_bit_identical_to_the_indexed_one() {
+        use std::sync::atomic::Ordering;
+
+        // Big enough that `eigh` takes the native path the back-transform belongs to.
+        let n = 96usize;
+        let a: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        let (i, j) = (i as f64, j as f64);
+                        // Symmetric, well-scaled, no exact degeneracies.
+                        1.0 / (1.0 + (i - j).abs()) + 0.25 * ((i * 7.0 + j * 3.0) % 11.0)
+                            - 0.125 * ((i * 3.0 + j * 7.0) % 5.0)
+                    })
+                    .collect()
+            })
+            .collect();
+        let symmetric: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..n).map(|j| 0.5 * (a[i][j] + a[j][i])).collect())
+            .collect();
+
+        let was_sliced = EIGH_BACKTRANSFORM_SLICED_ENABLE.load(Ordering::Relaxed);
+        let was_dim = PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.load(Ordering::Relaxed);
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(1, Ordering::Relaxed);
+
+        EIGH_BACKTRANSFORM_SLICED_ENABLE.store(false, Ordering::Relaxed);
+        let before_off = EIGH_BACKTRANSFORM_SLICED_HITS.load(Ordering::Relaxed);
+        let indexed = eigh(&symmetric, DecompOptions::default()).expect("indexed eigh");
+        let off_hits = EIGH_BACKTRANSFORM_SLICED_HITS.load(Ordering::Relaxed) - before_off;
+
+        EIGH_BACKTRANSFORM_SLICED_ENABLE.store(true, Ordering::Relaxed);
+        let before_on = EIGH_BACKTRANSFORM_SLICED_HITS.load(Ordering::Relaxed);
+        let sliced = eigh(&symmetric, DecompOptions::default()).expect("sliced eigh");
+        let on_hits = EIGH_BACKTRANSFORM_SLICED_HITS.load(Ordering::Relaxed) - before_on;
+
+        PUBLIC_NATIVE_EIGH_MIN_DIM_OVERRIDE.store(was_dim, Ordering::Relaxed);
+        EIGH_BACKTRANSFORM_SLICED_ENABLE.store(was_sliced, Ordering::Relaxed);
+
+        assert_eq!(
+            off_hits, 0,
+            "the sliced arm ran with its toggle OFF, so this compares one implementation \
+             with itself"
+        );
+        assert!(
+            on_hits > 0,
+            "the sliced arm never ran with its toggle ON, so bit-equality here is vacuous"
+        );
+        for (index, (x, y)) in indexed
+            .eigenvalues
+            .iter()
+            .zip(sliced.eigenvalues.iter())
+            .enumerate()
+        {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "eigenvalue {index} differs between the indexed and sliced back-transforms"
+            );
+        }
+        for (row, (xs, ys)) in indexed
+            .eigenvectors
+            .iter()
+            .zip(sliced.eigenvectors.iter())
+            .enumerate()
+        {
+            for (col, (x, y)) in xs.iter().zip(ys.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "eigenvector[{row}][{col}] differs between the indexed and sliced \
+                     back-transforms ({x:e} against {y:e})"
+                );
+            }
         }
     }
 

@@ -793,8 +793,18 @@ for raw_line in sys.stdin.buffer:
         );
         fsci_linalg::EIGH_BACKTRANSFORM_BLOCKED_ENABLE
             .store(blocked, std::sync::atomic::Ordering::Relaxed);
+        // `FSCI_EIGH_SLICED_BACKTRANSFORM=0` restores the per-element indexed form of the
+        // unblocked back-transform. Both arms in ONE binary, alternated in one window.
+        let sliced = !matches!(
+            std::env::var("FSCI_EIGH_SLICED_BACKTRANSFORM")
+                .ok()
+                .as_deref(),
+            Some("0") | Some("false")
+        );
+        fsci_linalg::EIGH_BACKTRANSFORM_SLICED_ENABLE
+            .store(sliced, std::sync::atomic::Ordering::Relaxed);
         println!(
-            "backtransform_panel_width_override={panel_width} (0 = shipping default 8) blocked={blocked}"
+            "backtransform_panel_width_override={panel_width} (0 = shipping default 8) blocked={blocked} sliced={sliced}"
         );
 
         println!(
@@ -1181,7 +1191,7 @@ for raw_line in sys.stdin.buffer:
                 println!(
                     "n={n} impl={impl_label} STAGES reduce={:.3}ms solve={:.3}ms back={:.3}ms \
                      total={:.3}ms shares={:.4}/{:.4}/{:.4} panel_width={} panels={} \
-                     instrumented=true",
+                     sliced_hits={} instrumented=true",
                     stage[0] as f64 / 1.0e6,
                     stage[1] as f64 / 1.0e6,
                     stage[2] as f64 / 1.0e6,
@@ -1192,6 +1202,8 @@ for raw_line in sys.stdin.buffer:
                     fsci_linalg::EIGH_BACKTRANSFORM_LAST_WIDTH
                         .load(std::sync::atomic::Ordering::Relaxed),
                     fsci_linalg::EIGH_BACKTRANSFORM_LAST_PANELS
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    fsci_linalg::EIGH_BACKTRANSFORM_SLICED_HITS
                         .load(std::sync::atomic::Ordering::Relaxed),
                 );
                 // MUST-HIT. All-zero counters mean the native path never ran -- at n below
