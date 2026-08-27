@@ -203,6 +203,16 @@ fn elf_sha256() -> String {
 }
 
 fn main() {
+    // `FSCI_NDIMAGE_BLOCK=<n>` sweeps the separable-filter tile (0 = shipping 64).
+    {
+        let block: usize = std::env::var("FSCI_NDIMAGE_BLOCK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        fsci_ndimage::CONVOLVE1D_CACHE_BLOCK_OVERRIDE
+            .store(block, std::sync::atomic::Ordering::Relaxed);
+        println!("convolve1d_cache_block_override={block} (0 = shipping 64)");
+    }
     let cases: &[(&str, &[usize])] = &[("2d-4096", &[4096, 4096]), ("3d-256", &[256, 256, 256])];
     let reps = 1;
     let min_of = 2;

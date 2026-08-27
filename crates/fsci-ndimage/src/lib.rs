@@ -56,7 +56,52 @@ const DEFAULT_GAUSSIAN_TRUNCATE: f64 = 4.0;
 // revisits adjacent source rows, so retaining this span in L1 avoids streaming a
 // complete x row for every output y row.  It is deliberately only used where
 // there are outer slabs; the outermost z pass keeps its full contiguous span.
-const CONVOLVE1D_CACHE_BLOCK: usize = 64;
+/// Tile for the separable-filter hot span, in elements.
+///
+/// **RAISED 64 -> 256 ON MEASUREMENT.** Per tile the filter runs one contiguous AXPY per
+/// KERNEL TAP so the output tile stays resident across the taps — the right shape, but at 64
+/// elements each tap loop did only 64 FMAs for one loop setup and the tap loop was re-entered
+/// every 64 outputs. A tile is L1-resident at either size, so the small block bought nothing
+/// it could not have where the per-tap loop amortises.
+///
+/// 3d-256 gaussian, three replicates each, alternated in one window:
+///
+///     block=256   median 520.13 ms   range [509.4, 528.4]
+///     block= 64   median 559.03 ms   range [552.1, 563.4]
+///     1.0747x, RANGES DISJOINT
+///
+/// Bit-identical, and the harness confirms it: `max_rel` against live SciPy reads
+/// 1.51511616350838218e-10 at 64, 256, 1024 and 4096 — the same digits. For any output the
+/// taps are summed over `k = 0..klen` in the same order wherever tile boundaries fall; tiling
+/// groups INDEPENDENT outputs and never reorders one output's accumulation.
+///
+/// The sweep saturates by 256: 1024 and 4096 measured 518.9 and 517.6 ms, inside 256's spread.
+const CONVOLVE1D_CACHE_BLOCK: usize = 256;
+
+/// Override for [`CONVOLVE1D_CACHE_BLOCK`]; `0` keeps the shipping 64.
+///
+/// WHY. The separable filter tiles the hot span and, per tile, runs one contiguous AXPY per
+/// KERNEL TAP so the output tile stays resident across the taps. That is the right shape, but
+/// the tile is 64 elements — 512 bytes — so each tap loop does 64 FMAs for one loop setup and
+/// the 9-tap outer loop is re-entered every 64 outputs. A tile is L1-resident at 64 elements
+/// and still L1-resident at several thousand, so the small block buys nothing it could not
+/// have at a size where the per-tap loop actually amortises.
+///
+/// Bit-identical: for any output element the taps are summed over `k = 0..klen` in the same
+/// order regardless of where tile boundaries fall. Tiling changes grouping of INDEPENDENT
+/// outputs, never the accumulation of one.
+pub static CONVOLVE1D_CACHE_BLOCK_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn convolve1d_cache_block() -> usize {
+    let value = CONVOLVE1D_CACHE_BLOCK_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if value == 0 {
+        CONVOLVE1D_CACHE_BLOCK
+    } else {
+        value
+    }
+}
 
 fn gaussian_kernel_radius(sigma: f64) -> usize {
     (DEFAULT_GAUSSIAN_TRUNCATE * sigma + 0.5) as usize
@@ -2912,8 +2957,8 @@ fn convolve1d_along_axis(
             // On the 3-D middle (y) pass, walk x in cache tiles so consecutive y outputs
             // reuse their overlapping source-row spans from L1.  The z pass has outer=1
             // and deliberately retains its complete contiguous plane span.
-            let block = if outer > 1 && inner >= CONVOLVE1D_CACHE_BLOCK {
-                CONVOLVE1D_CACHE_BLOCK
+            let block = if outer > 1 && inner >= convolve1d_cache_block() {
+                convolve1d_cache_block()
             } else {
                 inner
             };
@@ -2964,8 +3009,9 @@ fn convolve1d_along_axis(
             for a in axis_start..interior_start {
                 scalar(a, os);
             }
-            for tile_start in (interior_start..interior_end).step_by(CONVOLVE1D_CACHE_BLOCK) {
-                let tile_end = (tile_start + CONVOLVE1D_CACHE_BLOCK).min(interior_end);
+            let tile = convolve1d_cache_block();
+            for tile_start in (interior_start..interior_end).step_by(tile) {
+                let tile_end = (tile_start + tile).min(interior_end);
                 let output = &mut os[tile_start - axis_start..tile_end - axis_start];
                 for (k, &w) in weights.iter().enumerate() {
                     let shift = (klen - 1 - k as i64) - offset + origin;
