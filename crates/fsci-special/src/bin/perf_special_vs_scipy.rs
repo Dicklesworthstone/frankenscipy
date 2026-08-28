@@ -241,6 +241,16 @@ fn main() {
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
 
+    // `FSCI_SPECIAL_ZETA_RATIONAL=0` restores our eight-`exp` Euler-Maclaurin prefix in
+    // place of SciPy's rational approximations, so the two can be A/B'd -- for ACCURACY as
+    // much as cost -- inside ONE binary against the same live SciPy arm.
+    let zeta_rational = !matches!(
+        std::env::var("FSCI_SPECIAL_ZETA_RATIONAL").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::ZETA_CEPHES_RATIONAL.store(zeta_rational, std::sync::atomic::Ordering::Relaxed);
+    println!("zeta_cephes_rational={zeta_rational}");
+
     // `FSCI_SPECIAL_ZETA_EARLY=0` restores the unconditional eight-term direct prefix, so
     // the early exit can be A/B'd inside ONE binary. Without this the two "arms" are the
     // same arm and the comparison is inert — which is exactly how it first read.

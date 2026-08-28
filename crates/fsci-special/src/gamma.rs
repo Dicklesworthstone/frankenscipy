@@ -2131,6 +2131,23 @@ pub static GAMMA_FAMILY_PREALLOC_FILL: std::sync::atomic::AtomicBool =
 pub static GAMMA_FAMILY_PREALLOC_FILL_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Use SciPy's own `zetac` rational approximations for ζ(x), x > 1 (`true`, shipping),
+/// instead of our eight-`exp` Euler-Maclaurin prefix.
+///
+/// NOT bit-identical and not intended to be: it is a different approximation, and it is the
+/// one the incumbent uses, so it moves our values toward SciPy. Accuracy against the live
+/// SciPy arm is the contract and is checked in the same invocation by
+/// `perf_special_vs_scipy`; the two forms are also pinned against each other by
+/// `zeta_cephes_rational_matches_the_euler_maclaurin_series`.
+pub static ZETA_CEPHES_RATIONAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Evaluations that took the rational arm — "enabled" is not "took effect".
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result.
+pub static ZETA_CEPHES_RATIONAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Batches that took the hoisted-threshold arm — "enabled" is not "took effect".
 ///
 /// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
@@ -3144,7 +3161,194 @@ fn fill_zeta_affine_blocks(
 pub static ZETA_DIRECT_EARLY_EXIT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
+// ── Cephes `zetac` rational approximations, x > 1 ────────────────────────────────────
+//
+// WHY THESE EXIST. Our Euler-Maclaurin form evaluates `Σ n^-s` for n = 2..=9 as EIGHT
+// `exp` calls plus one for the tail. SciPy never does that: profiled on the same fixture,
+// `exp` is 68.7% of our 567.1 instructions per element (~390), while SciPy spends ~154 in
+// transcendentals TOTAL and 34.9% in a polynomial. Its `zetac_positive` uses a table for
+// integer arguments, a rational approximation in `1/x` for 1 <= x <= 10 (ONE `pow`), and a
+// rational-plus-`exp` form for 10 < x <= 50. Eight `exp` calls against one `pow` is the
+// whole 1.95x instruction gap on this cell.
+//
+// Coefficients are transcribed from scipy's `xsf/cephes/zetac.h`, which is the code the
+// incumbent actually runs, so adopting them moves our values TOWARD SciPy rather than away
+// — this is a parity change and a cost change in the same direction. A mistranscribed digit
+// would show up immediately as a large `max_rel` against the live SciPy arm, and
+// `zeta_cephes_rational_matches_the_euler_maclaurin_series` pins the two forms against each
+// other independently of that.
+
+/// `zetac(i) = ζ(i) - 1` for integer `i` in `0..=30`. Entry 1 is unused (ζ(1) is a pole).
+#[allow(clippy::excessive_precision)]
+const ZETAC_INTEGER: [f64; 31] = [
+    -1.500_000_000_000_000_000_00E0,
+    0.0,
+    6.449_340_668_482_264_364_72E-1,
+    2.020_569_031_595_942_854_00E-1,
+    8.232_323_371_113_819_151_60E-2,
+    3.692_775_514_336_992_633_14E-2,
+    1.734_306_198_444_913_971_45E-2,
+    8.349_277_381_922_826_839_80E-3,
+    4.077_356_197_944_339_378_69E-3,
+    2.008_392_826_082_214_417_85E-3,
+    9.945_751_278_180_853_371_46E-4,
+    4.941_886_041_194_645_587_02E-4,
+    2.460_865_533_080_482_986_38E-4,
+    1.227_133_475_784_891_467_52E-4,
+    6.124_813_505_870_482_925_85E-5,
+    3.058_823_630_702_049_355_17E-5,
+    1.528_225_940_865_187_173_26E-5,
+    7.637_197_637_899_762_273_60E-6,
+    3.817_293_264_999_839_856_46E-6,
+    1.908_212_716_553_938_925_66E-6,
+    9.539_620_338_727_961_131_52E-7,
+    4.769_329_867_878_064_631_17E-7,
+    2.384_505_027_277_329_900_04E-7,
+    1.192_199_259_653_110_730_68E-7,
+    5.960_818_905_125_947_961_24E-8,
+    2.980_350_351_465_228_018_61E-8,
+    1.490_155_482_836_504_123_47E-8,
+    7.450_711_789_835_429_491_98E-9,
+    3.725_334_024_788_457_054_82E-9,
+    1.862_659_723_513_049_006_40E-9,
+    9.313_274_324_196_681_828_72E-10,
+];
+
+/// `2^x (1 - 1/x) (ζ(x) - 1) = P(1/x)/Q(1/x)` for `1 <= x <= 10`.
+#[allow(clippy::excessive_precision)]
+const ZETAC_P: [f64; 9] = [
+    5.857_465_145_697_253_195_40E11,
+    2.575_341_277_561_025_728_88E11,
+    4.877_811_595_679_482_564_38E10,
+    5.153_995_380_238_857_706_96E9,
+    3.416_460_735_147_540_942_81E8,
+    1.608_370_068_806_564_927_31E7,
+    5.927_854_673_421_095_229_98E5,
+    1.511_291_699_649_388_231_17E4,
+    2.018_224_444_859_979_558_65E2,
+];
+
+/// Denominator for [`ZETAC_P`]; monic, so the leading `1.0` is implicit.
+#[allow(clippy::excessive_precision)]
+const ZETAC_Q: [f64; 8] = [
+    3.904_976_763_733_711_575_16E11,
+    5.228_582_353_682_721_617_97E10,
+    5.644_515_172_712_805_433_51E9,
+    3.390_067_460_153_504_188_34E8,
+    1.794_103_715_001_264_537_02E7,
+    5.666_668_251_313_847_970_29E5,
+    1.603_829_768_109_441_315_06E4,
+    1.964_362_372_233_873_141_44E2,
+];
+
+/// `log(ζ(x) - 1 - 2^-x) = A(x)/B(x)` for `10 <= x <= 50`.
+#[allow(clippy::excessive_precision)]
+const ZETAC_A: [f64; 11] = [
+    8.707_285_674_845_901_925_39E6,
+    1.765_068_656_703_464_627_57E8,
+    2.608_895_067_074_832_648_96E10,
+    5.298_063_740_098_947_916_47E11,
+    2.268_881_561_192_382_414_87E13,
+    3.318_844_029_327_050_835_99E14,
+    5.137_789_979_758_682_301_92E15,
+    -1.981_236_881_339_071_714_55E15,
+    -9.927_638_100_399_835_723_56E16,
+    7.829_053_761_808_705_864_44E16,
+    9.267_862_757_689_277_171_87E16,
+];
+
+/// Denominator for [`ZETAC_A`]; monic, so the leading `1.0` is implicit.
+#[allow(clippy::excessive_precision)]
+const ZETAC_B: [f64; 10] = [
+    -7.926_254_105_637_410_628_61E6,
+    -1.605_299_699_329_202_296_76E8,
+    -2.376_692_609_755_432_217_88E10,
+    -4.803_195_843_504_551_698_57E11,
+    -2.078_209_617_541_733_201_70E13,
+    -2.960_754_045_072_722_236_80E14,
+    -4.862_991_036_946_091_366_86E15,
+    5.345_895_096_757_899_301_99E15,
+    5.714_641_110_922_976_312_92E16,
+    -1.799_155_976_586_765_568_28E16,
+];
+
+/// Cephes `polevl`: evaluate `coef[0]·xⁿ + … + coef[n]` by Horner, highest order first.
+#[inline]
+fn polevl(x: f64, coef: &[f64]) -> f64 {
+    let mut ans = coef[0];
+    for &c in &coef[1..] {
+        ans = ans * x + c;
+    }
+    ans
+}
+
+/// Cephes `p1evl`: as [`polevl`] but for a MONIC polynomial, so the leading `1.0` is not
+/// stored. `p1evl(x, c)` is `polevl(x, [1.0, c…])` and is a different function from
+/// `polevl` on the same slice — conflating the two silently shifts the degree by one.
+#[inline]
+fn p1evl(x: f64, coef: &[f64]) -> f64 {
+    let mut ans = x + coef[0];
+    for &c in &coef[1..] {
+        ans = ans * x + c;
+    }
+    ans
+}
+
+/// `ζ(x) - 1` for `x > 1`, by SciPy's own method.
+///
+/// Returns `ζ(x) - 1` rather than `ζ(x)` for the same reason Cephes does: for large `x` the
+/// difference from 1 is what carries the information, and forming `1 + tiny` at the end
+/// loses nothing that computing `ζ` directly would have kept.
+fn zetac_positive_rational(x: f64) -> f64 {
+    // Beyond this the first term `2^-x` has itself underflowed relative to 1.
+    if x >= 127.0 {
+        return 0.0;
+    }
+
+    // Integer arguments are tabulated: no transcendental at all.
+    let w = x.floor();
+    if w == x {
+        let i = x as usize;
+        if i < ZETAC_INTEGER.len() {
+            return ZETAC_INTEGER[i];
+        }
+    }
+
+    if x <= 10.0 {
+        let b = 2.0_f64.powf(x) * (x - 1.0);
+        let w = 1.0 / x;
+        return (x * polevl(w, &ZETAC_P)) / (b * p1evl(w, &ZETAC_Q));
+    }
+
+    if x <= 50.0 {
+        let b = 2.0_f64.powf(-x);
+        let w = polevl(x, &ZETAC_A) / p1evl(x, &ZETAC_B);
+        return w.exp() + b;
+    }
+
+    // Basic sum of inverse powers over ODD integers, then folded to all integers by
+    // `(s + 2^-x) / (1 - 2^-x)`. Only reachable for 50 < x < 127, where it converges in a
+    // couple of terms.
+    let mut s = 0.0_f64;
+    let mut a = 1.0_f64;
+    let mut b;
+    loop {
+        a += 2.0;
+        b = a.powf(-x);
+        s += b;
+        if b / s <= f64::EPSILON / 2.0 {
+            break;
+        }
+    }
+    let b = 2.0_f64.powf(-x);
+    (s + b) / (1.0 - b)
+}
+
 fn zeta_positive(s: f64) -> f64 {
+    if ZETA_CEPHES_RATIONAL.load(std::sync::atomic::Ordering::Relaxed) {
+        ZETA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return 1.0 + zetac_positive_rational(s);
+    }
     let mut sum = 1.0;
     if ZETA_DIRECT_EARLY_EXIT.load(std::sync::atomic::Ordering::Relaxed) {
         // The prefix is `Σ n^-s` for n = 2..=9, evaluated as eight `exp` calls. For large
