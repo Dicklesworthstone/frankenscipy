@@ -822,7 +822,13 @@ fn main() {
             };
             let (mut on_ms, mut off_ms, mut null_on, mut null_off) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-            for round in 0..rounds {
+            // Deliberately MORE rounds than the SciPy comparison gets. That one is bounded
+            // by the cost of driving a Python child through a pipe; this one is two Rust
+            // closures, so precision is cheap here and it is needed: the first run of this
+            // sweep returned 1.122x against A/A nulls of 1.194 and 1.126, an effect smaller
+            // than its own control, which is not a measurement of anything.
+            let arm_rounds = rounds * 5;
+            for round in 0..arm_rounds {
                 let (t1, f1, f2, t2) = if round % 2 == 0 {
                     let t1 = time_arm(true);
                     let f1 = time_arm(false);
@@ -861,11 +867,28 @@ fn main() {
                 "armab op={op} lever={name} control on_hits={on_hits} off_hits={off_hits} \
                  (must be >0 and 0)"
             );
+            // Aggregate at the REPLICATE level: one ratio per round, then the median of
+            // those, so the pairing that the interleave bought is not thrown away by
+            // dividing two independently-computed medians. The range is printed because a
+            // median that sits inside the spread of its own A/A nulls is not a result.
+            let mut per_round: Vec<f64> = on_ms
+                .iter()
+                .zip(off_ms.iter())
+                .map(|(on, off)| off / on)
+                .collect();
+            per_round.sort_by(f64::total_cmp);
             let (on_med, off_med) = (median(on_ms), median(off_ms));
-            println!("armab op={op} lever={name} on={on_med:.3}ms off={off_med:.3}ms");
             println!(
-                "armab op={op} lever={name} off/on={:.3}x null_on={:.3} null_off={:.3}",
+                "armab op={op} lever={name} on={on_med:.3}ms off={off_med:.3}ms \
+                 rounds={arm_rounds}"
+            );
+            println!(
+                "armab op={op} lever={name} off/on={:.3}x paired_median={:.3}x \
+                 paired_min={:.3}x paired_max={:.3}x null_on={:.3} null_off={:.3}",
                 off_med / on_med,
+                median(per_round.clone()),
+                per_round[0],
+                per_round[per_round.len() - 1],
                 median(null_on),
                 median(null_off),
             );
