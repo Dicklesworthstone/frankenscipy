@@ -285,8 +285,20 @@ where
     // 46% elsewhere in this workspace. The zeroing pass really is dead work and keeping it
     // is still faster.
     //
+    // 26% ATTRIBUTED IS NOT 26% REMOVABLE. Only 13.6 instructions per element of that
+    // block actually went away (226.8 against 240.4, 159.7 against 173.3, 183.1 against
+    // 196.9 in the three bands); the rest is the store and the loop any version must
+    // perform. A profile says where instructions ARE, not how many can be removed —
+    // quoting the attribution as the prize would have overstated this by threefold.
+    //
+    // MUST-MISS CONTROL: `erf` does not route through this mapper and reads 69.3
+    // instructions per element with the arm on AND off, `prealloc_hits=0` both times. An
+    // op that must not move, and does not.
+    //
     // BIT-IDENTICAL: same `f`, same indices, same order, and the first error in index
-    // order is still the one returned. Only the destination changes.
+    // order is still the one returned. Only the destination changes. Asserted by
+    // `gamma_family_prealloc_fill_arms_agree_bit_for_bit` on both the serial and the
+    // threaded arm, with a one-ULP detector proving the comparison can see a difference.
     //
     // The parallel arm additionally drops a whole copy of the output: it used to build one
     // `Vec` per thread and concatenate them, and now each thread fills its own disjoint
