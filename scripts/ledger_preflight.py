@@ -153,6 +153,14 @@ INCUMBENT_RATIO_RE = re.compile(
     r"\d+(?:\.\d+)?x(?:`)?\b",
     re.IGNORECASE,
 )
+# Sparse LU has a measured path switch and a documented ratio crossover.  A
+# canonical SciPy/FSCI ratio without the matrix dimensions therefore cannot be
+# compared to another row on this surface: the same implementation can win at
+# one size and lose at another.  Limit this rule to rows that make the canonical
+# ratio claim, rather than treating every mention of sparse LU as a timed row.
+SPARSE_LU_SURFACE_RE = re.compile(r"\b(?:perf_splu|sparse[- ]lu|splu)\b", re.IGNORECASE)
+SPARSE_LU_N_RE = re.compile(r"\bn\s*=\s*\d+\b", re.IGNORECASE)
+SPARSE_LU_NNZ_RE = re.compile(r"\bnnz\s*=\s*\d+\b", re.IGNORECASE)
 HOST_IDENTITY_RE = re.compile(
     r"\bhost(?:_identity|\s+identity)?\s*(?:=|:)\s*`?[a-z0-9][a-z0-9_.-]*"
     r"|\bhost\s+`[a-z0-9][a-z0-9_.-]*`",
@@ -443,6 +451,17 @@ def row_errors(head: str, body: str) -> list[str]:
     is_invalid_cotenancy = bool(INVALID_COTENANCY_RE.search(blob))
     is_behavioral = bool(BEHAVIORAL_CLASS_RE.search(blob))
     is_timed = is_keep or (is_reject and has_null and not is_invalid_cotenancy)
+    if INCUMBENT_RATIO_RE.search(blob) and SPARSE_LU_SURFACE_RE.search(blob):
+        missing_shape = []
+        if not SPARSE_LU_N_RE.search(blob):
+            missing_shape.append("n=<matrix dimension>")
+        if not SPARSE_LU_NNZ_RE.search(blob):
+            missing_shape.append("nnz=<input nonzeros>")
+        if missing_shape:
+            errors.append(
+                "sparse-LU incumbent ratio lacks size provenance: "
+                + ", ".join(missing_shape)
+            )
     if is_behavioral:
         if is_keep or WIN_HEAD_RE.search(head):
             errors.append("BEHAVIORAL row may not be titled KEEP or WIN")
@@ -1026,6 +1045,33 @@ def cmd_self_test() -> int:
                 f"Result class: CAMPAIGN-WIN. executed ELF sha256={sha}. "
                 "Legacy incumbent arm: SciPy 1.17.1, side-by-side in the same invocation. "
                 "Incumbent ratio: SciPy / FrankenSciPy = 1.23x. "
+                f"{timed_contract}"
+            ),
+            False,
+        ),
+        # Sparse-LU comparisons can invert across matrix size.  The canonical
+        # ratio is therefore not enough evidence unless the row also records
+        # both the matrix dimension and input nonzero count.  These paired
+        # fixtures reject the under-specified row while admitting the same
+        # otherwise-complete timing record once its shape is present.
+        (
+            "sparse_lu_ratio_without_shape",
+            "2026-08-27 REJECT: sparse LU candidate loses",
+            (
+                "A/A null CI [0.99, 1.01]. Candidate CI [0.80, 0.90]. "
+                "bootstrap-median CI verdict DECIDED. "
+                "Incumbent ratio: SciPy / FrankenSciPy = 0.85x. "
+                f"{timed_contract}"
+            ),
+            True,
+        ),
+        (
+            "sparse_lu_ratio_with_shape",
+            "2026-08-27 REJECT: sparse LU candidate loses",
+            (
+                "fixture n=8000 nnz=53600. A/A null CI [0.99, 1.01]. "
+                "Candidate CI [0.80, 0.90]. bootstrap-median CI verdict DECIDED. "
+                "Incumbent ratio: SciPy / FrankenSciPy = 0.85x. "
                 f"{timed_contract}"
             ),
             False,
