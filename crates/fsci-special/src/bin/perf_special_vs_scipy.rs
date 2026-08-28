@@ -330,6 +330,16 @@ fn main() {
     fsci_special::GAMMA_CEPHES_RATIONAL.store(gamma_rational, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_cephes_rational={gamma_rational}");
 
+    // `FSCI_SPECIAL_K01_CEPHES=0` restores the general order-v `kv_scalar` path for
+    // `k0`/`k1`, so the Chebyshev kernels can be A/B'd -- for ACCURACY as much as cost --
+    // inside ONE binary against the same live SciPy arm.
+    let k01_cephes = !matches!(
+        std::env::var("FSCI_SPECIAL_K01_CEPHES").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::BESSEL_K01_CEPHES.store(k01_cephes, std::sync::atomic::Ordering::Relaxed);
+    println!("bessel_k01_cephes={k01_cephes}");
+
     // `FSCI_SPECIAL_Y01_LARGE=0` restores the harmonic series and general order-v
     // asymptotic for `y0`/`y1` above x = 5, so the Cephes large-argument form can be A/B'd
     // -- for ACCURACY as much as cost -- inside ONE binary against the same live SciPy arm.

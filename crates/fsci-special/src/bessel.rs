@@ -470,24 +470,6 @@ const I1_CHEB_B: [f64; 25] = [
     7.78576235018280120474E-1,
 ];
 
-/// Cephes `chbevl`: evaluate a Chebyshev series by the Clenshaw recurrence.
-///
-/// The series is in the SHIFTED argument the caller supplies (`x/2 - 2` or `32/x - 2`), and
-/// the leading coefficient is halved by the `0.5 * (b0 - b2)` at the end — which is why this
-/// is not interchangeable with an ordinary Horner evaluation of the same table.
-#[inline]
-fn chbevl(x: f64, coeffs: &[f64]) -> f64 {
-    let mut b0 = coeffs[0];
-    let mut b1 = 0.0_f64;
-    let mut b2 = 0.0_f64;
-    for &c in &coeffs[1..] {
-        b2 = b1;
-        b1 = b0;
-        b0 = x * b1 - b2 + c;
-    }
-    0.5 * (b0 - b2)
-}
-
 /// Largest `x` for which `exp(x)` is finite; beyond it Cephes splits the exponential in two
 /// halves because `I0(x)` stays finite to about 713.99 while `exp(x)` alone overflows.
 const CEPHES_MAXLOG: f64 = 7.09782712893383996732E2;
@@ -497,9 +479,9 @@ fn i0_cephes(x: f64) -> f64 {
     let x = x.abs();
     if x <= 8.0 {
         let y = (x / 2.0) - 2.0;
-        return x.exp() * chbevl(y, &I0_CHEB_A);
+        return x.exp() * cephes_chbevl(y, &I0_CHEB_A);
     }
-    let cheb = chbevl(32.0 / x - 2.0, &I0_CHEB_B) / x.sqrt();
+    let cheb = cephes_chbevl(32.0 / x - 2.0, &I0_CHEB_B) / x.sqrt();
     if x > CEPHES_MAXLOG {
         let e = (x / 2.0).exp();
         return e * cheb * e;
@@ -512,9 +494,9 @@ fn i1_cephes(x: f64) -> f64 {
     let z = x.abs();
     let out = if z <= 8.0 {
         let y = (z / 2.0) - 2.0;
-        chbevl(y, &I1_CHEB_A) * z * z.exp()
+        cephes_chbevl(y, &I1_CHEB_A) * z * z.exp()
     } else {
-        let cheb = chbevl(32.0 / z - 2.0, &I1_CHEB_B) / z.sqrt();
+        let cheb = cephes_chbevl(32.0 / z - 2.0, &I1_CHEB_B) / z.sqrt();
         if z > CEPHES_MAXLOG {
             let e = (z / 2.0).exp();
             e * cheb * e
@@ -545,6 +527,69 @@ pub fn i1_scalar(x: f64) -> f64 {
     iv_scalar(1.0, x)
 }
 
+/// Use SciPy's own Chebyshev kernels for `K0`/`K1` (`true`, shipping) instead of routing
+/// them through the general order-v `kv_scalar`.
+///
+/// NOT bit-identical and not intended to be: it is a different approximation, and it is the
+/// one the incumbent uses, so it moves our values toward SciPy. Accuracy against the live
+/// SciPy arm is the contract, checked in the same invocation by `perf_special_vs_scipy`;
+/// the two forms are cross-checked against each other by `k0_k1_cephes_matches_the_kv_path`.
+pub static BESSEL_K01_CEPHES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Evaluations that took the Chebyshev arm — "enabled" is not "took effect".
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result.
+pub static BESSEL_K01_CEPHES_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// ── Cephes K0/K1 Chebyshev kernels ───────────────────────────────────────────────────
+//
+// WHY. `k0`/`k1` delegate to `kv_scalar(0.0, x)` / `kv_scalar(1.0, x)`, the GENERAL order-v
+// routine — the same defect that made `i0`/`i1` 12x. It computes the SCALED `K_v·e^z`
+// through a general-order path and then multiplies by `exp(-z)`. Measured against live
+// SciPy on the identical fixture, instructions per element:
+//
+//     k1   fsci 808.1   scipy 330.0   2.45x
+//     k0   fsci 484.8   scipy 331.7   1.46x
+//
+// AND THE KERNEL WAS ALREADY HERE, which is the actual finding. `K0_A`/`K0_B`/`K1_A`/`K1_B`
+// and `cephes_chbevl` have been in this file all along, used by `k0e_cephes` — the exp-SCALED
+// form. So `k0` was not missing a fast path; it was reaching order 0 through the general-order
+// dispatch and then multiplying `k0e_cephes(x)` by `exp(-x)`, having just multiplied the
+// x <= 2 branch by `exp(x)`. That branch paid TWO exponentials and a rounding round-trip to
+// get back where it started. Cephes computes K0 below 2 with no exponential at all.
+//
+// I STARTED BY TRANSCRIBING THE COEFFICIENTS FROM `xsf/cephes/{k0,k1}.h` AND THREW THEM AWAY:
+// they were byte-for-byte duplicates of tables three hundred lines up. The same check caught
+// the same mistake on `y0` — GREP FOR AN EXISTING SIBLING BEFORE FETCHING ANYTHING. The only
+// genuinely new tables in this file are `I0_CHEB_*`/`I1_CHEB_*`, which had no predecessor.
+//
+// Cross-checked against the `kv` path it replaces by `k0_k1_cephes_matches_the_kv_path`.
+
+/// `K0(x)` for `x > 0`, UNSCALED, reusing the Chebyshev tables already in this file.
+///
+/// NO NEW COEFFICIENTS. `K0_A`/`K0_B` and `cephes_chbevl` were already here, used by
+/// `k0e_cephes` — the exp-SCALED form. The defect was never a missing kernel: it was that
+/// `kv_scalar` reached order 0 through the general-order dispatch and then multiplied
+/// `k0e_cephes(x)` by `exp(-x)`, while `k0e_cephes` had just multiplied the x <= 2 branch by
+/// `exp(x)`. That branch therefore paid TWO exponentials and a rounding round-trip to
+/// arrive back where it started. Cephes computes `K0` below 2 with no exponential at all.
+fn k0_cephes(x: f64) -> f64 {
+    if x <= 2.0 {
+        return cephes_chbevl(x * x - 2.0, &K0_A) - (0.5 * x).ln() * i0_scalar(x);
+    }
+    (-x).exp() * cephes_chbevl(8.0 / x - 2.0, &K0_B) / x.sqrt()
+}
+
+/// `K1(x)` for `x > 0`, UNSCALED. Same story as [`k0_cephes`].
+fn k1_cephes(x: f64) -> f64 {
+    if x <= 2.0 {
+        return (0.5 * x).ln() * i1_scalar(x) + cephes_chbevl(x * x - 2.0, &K1_A) / x;
+    }
+    (-x).exp() * cephes_chbevl(8.0 / x - 2.0, &K1_B) / x.sqrt()
+}
+
 /// Modified Bessel function of the second kind for real order v: K_v(z).
 ///
 /// K_v(z) = π/2 (I_{-v}(z) - I_v(z)) / sin(vπ) for non-integer v.
@@ -557,14 +602,54 @@ pub fn kv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 ///
 /// Convenience wrapper for kv(0, z). Matches `scipy.special.k0(z)`.
 pub fn k0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_input("k0", z, mode, 1 << 12, |x| kv_scalar(0.0, x, mode))
+    map_real_input("k0", z, mode, 1 << 12, |x| k0_order_scalar(x, mode))
+}
+
+/// `K0(x)` with the domain handling `kv_scalar` performs, but the order-0 kernel.
+///
+/// The zero and negative-x behaviour is taken from `kv_scalar` verbatim rather than from
+/// Cephes, because it is this crate's contract — `Hardened` mode returns a domain error
+/// where Cephes returns NaN — and a faster kernel is not a licence to change it.
+fn k0_order_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+    if !BESSEL_K01_CEPHES.load(std::sync::atomic::Ordering::Relaxed) {
+        return kv_scalar(0.0, x, mode);
+    }
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x <= 0.0 {
+        if x == 0.0 {
+            return Ok(f64::INFINITY);
+        }
+        return domain_error_by_mode("kv", mode, format!("v=0,z={x}"), "kv requires z > 0");
+    }
+    BESSEL_K01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(k0_cephes(x))
+}
+
+/// `K1(x)` with the domain handling `kv_scalar` performs, but the order-1 kernel.
+fn k1_order_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+    if !BESSEL_K01_CEPHES.load(std::sync::atomic::Ordering::Relaxed) {
+        return kv_scalar(1.0, x, mode);
+    }
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x <= 0.0 {
+        if x == 0.0 {
+            return Ok(f64::INFINITY);
+        }
+        return domain_error_by_mode("kv", mode, format!("v=1,z={x}"), "kv requires z > 0");
+    }
+    BESSEL_K01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(k1_cephes(x))
 }
 
 /// Modified Bessel function of the second kind of order 1: K_1(z).
 ///
 /// Convenience wrapper for kv(1, z). Matches `scipy.special.k1(z)`.
 pub fn k1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_input("k1", z, mode, 1 << 12, |x| kv_scalar(1.0, x, mode))
+    map_real_input("k1", z, mode, 1 << 12, |x| k1_order_scalar(x, mode))
 }
 
 /// Modified Bessel function of the second kind for integer order n: K_n(z).
@@ -6061,6 +6146,85 @@ mod tests {
         BESSEL_TOGGLE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Cross-checks the direct `K0`/`K1` kernels against the general-order `kv` path they
+    /// replace, and drives `BESSEL_K01_CEPHES` in both settings.
+    ///
+    /// The two paths evaluate the SAME Chebyshev tables — that is the point of this change,
+    /// which added no coefficients — but by different routes: the direct form computes `K`
+    /// below x = 2 with no exponential, while `kv_scalar` obtained the exp-SCALED value and
+    /// multiplied by `exp(-x)`, so that branch made a round trip through `exp(x)·exp(-x)`.
+    /// They must therefore agree to a couple of ULP, and any larger gap means the routing is
+    /// wrong rather than the tables.
+    #[test]
+    fn k0_k1_cephes_matches_the_kv_path() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = bessel_toggle_lock();
+        let was = BESSEL_K01_CEPHES.load(Relaxed);
+
+        // Straddle the x = 2 split: below it the log/I0 form, above it the exp/sqrt form.
+        let mut points: Vec<f64> = Vec::new();
+        for i in 1..=1200 {
+            points.push(0.01 + (20.0 - 0.01) * (i as f64 / 1200.0));
+        }
+        points.extend([0.01, 0.5, 1.0, 1.999, 2.0, 2.001, 5.0, 12.0, 19.999]);
+
+        let (mut small, mut large) = (0usize, 0usize);
+        let (mut worst0, mut worst1) = (0.0_f64, 0.0_f64);
+        let (mut at0, mut at1) = (f64::NAN, f64::NAN);
+        let mut hits_seen = 0usize;
+        for &x in &points {
+            if x <= 2.0 {
+                small += 1;
+            } else {
+                large += 1;
+            }
+            BESSEL_K01_CEPHES.store(true, Relaxed);
+            let before = BESSEL_K01_CEPHES_HITS.load(Relaxed);
+            let d0 = k0_order_scalar(x, RuntimeMode::Strict).expect("k0");
+            let d1 = k1_order_scalar(x, RuntimeMode::Strict).expect("k1");
+            if BESSEL_K01_CEPHES_HITS.load(Relaxed) > before {
+                hits_seen += 1;
+            }
+            BESSEL_K01_CEPHES.store(false, Relaxed);
+            let g0 = k0_order_scalar(x, RuntimeMode::Strict).expect("k0 via kv");
+            let g1 = k1_order_scalar(x, RuntimeMode::Strict).expect("k1 via kv");
+            assert!(
+                d0.is_finite() && d1.is_finite() && g0.is_finite() && g1.is_finite(),
+                "non-finite at x={x}"
+            );
+            let u0 = (d0 - g0).abs() / g0.abs() / f64::EPSILON;
+            let u1 = (d1 - g1).abs() / g1.abs() / f64::EPSILON;
+            if u0 > worst0 {
+                worst0 = u0;
+                at0 = x;
+            }
+            if u1 > worst1 {
+                worst1 = u1;
+                at1 = x;
+            }
+        }
+        BESSEL_K01_CEPHES.store(was, Relaxed);
+
+        // MUST-HIT: both branches reached, and the direct arm actually fired every time.
+        assert!(
+            small > 0 && large > 0,
+            "grid missed a branch: x<=2 {small}, x>2 {large}"
+        );
+        assert!(
+            hits_seen >= points.len(),
+            "direct arm did not run for every point"
+        );
+        println!(
+            "k0 worst {worst0:.1} ULP at x={at0}; k1 worst {worst1:.1} ULP at x={at1}; \
+             {} points (small={small} large={large})",
+            points.len()
+        );
+        assert!(
+            worst0 < 64.0 && worst1 < 64.0,
+            "direct and kv paths disagree: k0 {worst0} ULP at {at0}, k1 {worst1} ULP at {at1}"
+        );
     }
 
     /// Pins `y0`/`y1` against SciPy reference values tightly enough to catch a parity
