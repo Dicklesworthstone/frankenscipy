@@ -1894,8 +1894,85 @@ fn gamma_core(x: f64) -> f64 {
         return PI / (sin_pi_x * gamma_core(1.0 - x));
     }
 
+    if x <= GAMMA_CEPHES_MAX_X && GAMMA_CEPHES_RATIONAL.load(std::sync::atomic::Ordering::Relaxed) {
+        GAMMA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return gamma_cephes_reduced(x);
+    }
+
     gamma_lanczos(x)
 }
+
+// ── Cephes Gamma rational, 0.5 <= x <= 33 ────────────────────────────────────────────
+//
+// WHY. `gamma_lanczos` costs EIGHT divisions and THREE transcendentals per call — `t.ln()`,
+// `coeff_sum.abs().ln()` and a final `.exp()`. SciPy uses NONE on this range: it reduces the
+// argument into [2, 3] by multiplication and division, then evaluates one rational P(6)/Q(7).
+// Measured against live SciPy on the identical fixture, instructions per element:
+//
+//     gamma    fsci 305.6   scipy 127.5   2.40x
+//     rgamma   fsci 428.6   scipy 134.0   3.20x   (it is 1/gamma_scalar, so it inherits this)
+//
+// THIS IS NOT THE `gammaln` CASE. That rewrite was refuted because the band where the two
+// implementations already agree was STILL 1.45x, so no kernel swap could reach the gap.
+// Here the implementations do not agree anywhere on the measured domain: SciPy evaluates a
+// polynomial where we call `exp` and `ln` twice, for EVERY x in the fixture.
+//
+// ARTICULATION POINT: `gamma_core` is what `rgamma`, `factorial`, `poch` and the beta family
+// call, so this is not one function's kernel.
+//
+// Coefficients are transcribed from scipy's `xsf/cephes/gamma.h` — the code the incumbent
+// runs — so this moves our values TOWARD SciPy, and are cross-checked against the Lanczos
+// form by `gamma_cephes_rational_matches_the_lanczos_form`.
+
+/// Numerator of the Cephes `Gamma` rational on `[2, 3]`, in `x - 2`.
+#[allow(clippy::excessive_precision)]
+const GAMMA_CEPHES_P: [f64; 7] = [
+    1.60119522476751861407E-4,
+    1.19135147006586384913E-3,
+    1.04213797561761569935E-2,
+    4.76367800457137231464E-2,
+    2.07448227648435975150E-1,
+    4.94214826801497100753E-1,
+    9.99999999999999996796E-1,
+];
+
+/// Denominator of the Cephes `Gamma` rational. NOT monic — unlike `ZETAC_Q` this one stores
+/// its leading coefficient, so it is evaluated with `polevl` and not `p1evl`.
+#[allow(clippy::excessive_precision)]
+const GAMMA_CEPHES_Q: [f64; 8] = [
+    -2.31581873324120129819E-5,
+    5.39605580493303397842E-4,
+    -4.45641913851797240494E-3,
+    1.18139785222060435552E-2,
+    3.58236398605498653373E-2,
+    -2.34591795718243348568E-1,
+    7.14304917030273074085E-2,
+    1.00000000000000000320E0,
+];
+
+/// `Γ(x)` for `0.5 <= x <= 33` by SciPy's own method: reduce into `[2, 3]`, then one
+/// rational. No transcendental is evaluated anywhere on this path.
+fn gamma_cephes_reduced(mut x: f64) -> f64 {
+    let mut z = 1.0_f64;
+    while x >= 3.0 {
+        x -= 1.0;
+        z *= x;
+    }
+    while x < 2.0 {
+        z /= x;
+        x += 1.0;
+    }
+    if x == 2.0 {
+        return z;
+    }
+    x -= 2.0;
+    z * polevl(x, &GAMMA_CEPHES_P) / polevl(x, &GAMMA_CEPHES_Q)
+}
+
+/// Upper limit of the rational form. Above it Cephes switches to Stirling; we keep the
+/// Lanczos kernel there instead, which is unchanged behaviour and outside every domain this
+/// harness measures — named rather than silently assumed equivalent.
+const GAMMA_CEPHES_MAX_X: f64 = 33.0;
 
 fn gamma_lanczos(x: f64) -> f64 {
     let x_minus_1 = x - 1.0;
@@ -2146,6 +2223,23 @@ pub static ZETA_CEPHES_RATIONAL: std::sync::atomic::AtomicBool =
 /// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
 /// anything between; incrementing it changes no numeric result.
 pub static ZETA_CEPHES_RATIONAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Use SciPy's own rational form for `Γ(x)` on `0.5 <= x <= 33` (`true`, shipping) instead
+/// of the Lanczos kernel's eight divisions and three transcendentals.
+///
+/// NOT bit-identical and not intended to be: it is a different approximation, and it is the
+/// one the incumbent uses, so it moves our values toward SciPy. Accuracy against the live
+/// SciPy arm is the contract, checked in the same invocation by `perf_special_vs_scipy`;
+/// the two forms are cross-checked against each other by
+/// `gamma_cephes_rational_matches_the_lanczos_form`.
+pub static GAMMA_CEPHES_RATIONAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Evaluations that took the rational arm — "enabled" is not "took effect".
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result.
+pub static GAMMA_CEPHES_RATIONAL_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Batches that took the hoisted-threshold arm — "enabled" is not "took effect".
@@ -4194,6 +4288,94 @@ mod tests {
             }
         }
         GAMMA_FAMILY_PREALLOC_FILL.store(restore, Relaxed);
+    }
+
+    /// Cross-checks the transcribed Cephes rational against the independent Lanczos kernel,
+    /// and drives `GAMMA_CEPHES_RATIONAL` in both settings.
+    ///
+    /// This is what catches a mistranscribed coefficient: the two forms share no constants
+    /// and no code path, so agreement to a few tens of ULP is strong evidence the fifteen
+    /// numbers copied out of `xsf/cephes/gamma.h` are right. A single wrong digit moves the
+    /// rational far more than the bound below.
+    ///
+    /// JUDGED IN ULPs, NOT ABSOLUTE ERROR, and here that is the whole point: Γ(30) is
+    /// 8.8e30, so an absolute measure on this domain reports 2.5e17 for a result that is
+    /// correct to 34 ULP. The mirror of `y0`, where the function passes through ZERO and the
+    /// relative measure is the misleading one. Neither measure is right by default — pick it
+    /// from the function's range on the domain being tested.
+    #[test]
+    fn gamma_cephes_rational_matches_the_lanczos_form() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = gamma_toggle_lock();
+        let restore = GAMMA_CEPHES_RATIONAL.load(Relaxed);
+
+        // Span the reduction's regimes: below 2 (divide up), [2,3] (the rational's own
+        // interval, no loop), and above 3 (multiply down, up to 30 iterations).
+        let mut points: Vec<f64> = Vec::new();
+        for i in 0..=1200 {
+            points.push(0.5 + (33.0 - 0.5) * (i as f64 / 1200.0));
+        }
+        points.extend([
+            0.5, 0.9, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 10.0, 20.0, 32.9, 33.0,
+        ]);
+
+        let (mut below, mut inside, mut above) = (0usize, 0usize, 0usize);
+        let mut worst = 0.0_f64;
+        let mut worst_at = f64::NAN;
+        let mut hits_seen = 0usize;
+        for &x in &points {
+            if x < 2.0 {
+                below += 1;
+            } else if x <= 3.0 {
+                inside += 1;
+            } else {
+                above += 1;
+            }
+            GAMMA_CEPHES_RATIONAL.store(true, Relaxed);
+            let before = GAMMA_CEPHES_RATIONAL_HITS.load(Relaxed);
+            let rational = gamma_core(x);
+            if GAMMA_CEPHES_RATIONAL_HITS.load(Relaxed) > before {
+                hits_seen += 1;
+            }
+            GAMMA_CEPHES_RATIONAL.store(false, Relaxed);
+            let lanczos = gamma_core(x);
+            assert!(
+                rational.is_finite() && lanczos.is_finite(),
+                "non-finite at x={x}: rational {rational} lanczos {lanczos}"
+            );
+            let ulp = (rational - lanczos).abs() / lanczos.abs() / f64::EPSILON;
+            if ulp > worst {
+                worst = ulp;
+                worst_at = x;
+            }
+        }
+        GAMMA_CEPHES_RATIONAL.store(restore, Relaxed);
+
+        // MUST-HIT: every regime of the reduction has to be reached, and the arm has to have
+        // actually fired, or the agreement below is evidence about nothing.
+        assert!(
+            below > 0 && inside > 0 && above > 0,
+            "grid missed a regime: x<2 {below}, 2<=x<=3 {inside}, x>3 {above}"
+        );
+        assert!(
+            hits_seen >= points.len(),
+            "rational arm did not run for every point"
+        );
+        println!(
+            "gamma rational vs lanczos: worst {worst:.1} ULP at x={worst_at}, {} points",
+            points.len()
+        );
+        // MEASURED worst is 138.0 ULP at x = 32.95, and almost all of it is the LANCZOS
+        // side: against live SciPy the rational arm is ~3 ULP (max_rel 7.46e-16) where the
+        // Lanczos form is ~154 (3.43e-14). Bound at 1024 for ~7x margin rather than the
+        // measured value, because it exists to catch a mistranscribed coefficient — which
+        // moves the rational by orders of magnitude, not by ULPs — and sitting on the
+        // measurement would make it a change-detector instead.
+        assert!(
+            worst < 1024.0,
+            "rational and Lanczos disagree by {worst} ULP at x={worst_at}; \
+             a transcribed coefficient is probably wrong"
+        );
     }
 
     /// Drives `GAMMALN_HOIST_THRESHOLD` in BOTH settings through the BATCH entry point,

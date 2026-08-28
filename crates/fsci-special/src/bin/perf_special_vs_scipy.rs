@@ -320,6 +320,16 @@ fn main() {
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
 
+    // `FSCI_SPECIAL_GAMMA_RATIONAL=0` restores the Lanczos kernel for `Γ(x)` on
+    // 0.5 <= x <= 33, so the Cephes rational can be A/B'd -- for ACCURACY as much as cost --
+    // inside ONE binary against the same live SciPy arm. `rgamma` inherits it.
+    let gamma_rational = !matches!(
+        std::env::var("FSCI_SPECIAL_GAMMA_RATIONAL").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::GAMMA_CEPHES_RATIONAL.store(gamma_rational, std::sync::atomic::Ordering::Relaxed);
+    println!("gamma_cephes_rational={gamma_rational}");
+
     // `FSCI_SPECIAL_Y01_LARGE=0` restores the harmonic series and general order-v
     // asymptotic for `y0`/`y1` above x = 5, so the Cephes large-argument form can be A/B'd
     // -- for ACCURACY as much as cost -- inside ONE binary against the same live SciPy arm.
