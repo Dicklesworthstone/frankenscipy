@@ -395,6 +395,15 @@ fn main() {
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
 
+    // `FSCI_SPECIAL_IV_TERMRATIO=0` restores the log-carried `I_v` series, so the term-ratio
+    // recurrence can be A/B'd -- for ACCURACY as much as cost -- inside ONE binary.
+    let iv_ratio = !matches!(
+        std::env::var("FSCI_SPECIAL_IV_TERMRATIO").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::IV_SERIES_TERM_RATIO.store(iv_ratio, std::sync::atomic::Ordering::Relaxed);
+    println!("iv_series_term_ratio={iv_ratio}");
+
     // `FSCI_SPECIAL_BETA_DIRECT=0` restores `exp(betaln(a,b))` for `beta`, so the
     // direct-Gamma product can be A/B'd inside ONE binary.
     let beta_direct = !matches!(

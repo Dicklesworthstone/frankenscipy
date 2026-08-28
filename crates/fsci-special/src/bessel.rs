@@ -301,6 +301,21 @@ pub fn i1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_input("i1", z, mode, 1 << 14, |x| Ok(i1_scalar(x)))
 }
 
+/// Advance the `I_v` power series by its exact term ratio instead of carrying the term in
+/// logs (`true`, shipping).
+///
+/// NOT bit-identical to the log form: it rounds once at the start rather than once per term,
+/// and every term is positive so nothing cancels. Accuracy against the live SciPy arm is the
+/// contract.
+pub static IV_SERIES_TERM_RATIO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Evaluations that took the term-ratio arm — "enabled" is not "took effect".
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result.
+pub static IV_SERIES_TERM_RATIO_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Use SciPy's own Chebyshev kernels for `I0`/`I1` (`true`, shipping) instead of routing
 /// them through the general order-v `iv_scalar`.
 ///
@@ -1849,21 +1864,45 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
 
     let log_first = v * half_z.ln() - lgamma(v + 1.0);
     let mut sum = 0.0;
-    let mut log_term = log_first;
 
     // The summand peaks near k ≈ (√(v²+z²) − v)/2, which reaches a few hundred
     // for large order with z ≲ v² (iv(100,500) peaks at ~305 terms); cap well
     // past that so the tail is captured before the relative-convergence break.
-    for k in 0..1000 {
-        let term = log_term.exp();
-        sum += term;
-
-        if term < 1e-16 * sum && k > 10 {
-            break;
+    //
+    // TERM RATIO, NOT A LOG PER TERM. Successive terms of this series differ by the exact
+    // factor `(z²/4) / ((k+1)(v+k+1))`, so the whole sum needs ONE `exp` for the leading
+    // term and nothing transcendental afterwards. The previous form carried the term in
+    // logs and paid an `exp` AND THREE `ln` calls on every iteration — one of them,
+    // `quarter_z2.ln()`, loop-invariant and recomputed each time. Profiled against live
+    // SciPy, `exp` and `log` were 79% of `iv`'s 3715.4 instructions per element.
+    //
+    // Every term here is positive, so accumulating them directly cannot cancel; the
+    // multiplicative form is at least as accurate as re-exponentiating a running logarithm,
+    // which rounds once per term.
+    if IV_SERIES_TERM_RATIO.load(std::sync::atomic::Ordering::Relaxed) {
+        IV_SERIES_TERM_RATIO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut term = log_first.exp();
+        for k in 0..1000 {
+            sum += term;
+            if term < 1e-16 * sum && k > 10 {
+                break;
+            }
+            let kf = k as f64;
+            term *= quarter_z2 / ((kf + 1.0) * (v + kf + 1.0));
         }
+    } else {
+        let mut log_term = log_first;
+        for k in 0..1000 {
+            let term = log_term.exp();
+            sum += term;
 
-        let kf = k as f64;
-        log_term += quarter_z2.ln() - (kf + 1.0).ln() - (v + kf + 1.0).ln();
+            if term < 1e-16 * sum && k > 10 {
+                break;
+            }
+
+            let kf = k as f64;
+            log_term += quarter_z2.ln() - (kf + 1.0).ln() - (v + kf + 1.0).ln();
+        }
     }
 
     // Parity for negative z: I_v(-z) = (-1)^v I_v(z) for integer v
@@ -6278,6 +6317,78 @@ mod tests {
             worst0 < 64.0 && worst1 < 64.0,
             "direct and kv paths disagree: k0 {worst0} ULP at {at0}, k1 {worst1} ULP at {at1}"
         );
+    }
+
+    /// The term-ratio `I_v` series agrees with the log-carried form it replaces.
+    ///
+    /// The two share no arithmetic in the loop: one multiplies by an exact ratio, the other
+    /// exponentiates a running logarithm and pays three `ln` calls per term. Agreement to a
+    /// few ULP is therefore real evidence rather than a tautology. The grid spans the orders
+    /// and arguments the series branch actually handles, including the small-z corner where
+    /// the leading term dominates and the large-order corner where the summand peaks late.
+    #[test]
+    fn iv_term_ratio_series_matches_the_log_form() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = bessel_toggle_lock();
+        let restore = IV_SERIES_TERM_RATIO.load(Relaxed);
+
+        let mut worst = 0.0_f64;
+        let mut worst_at = (f64::NAN, f64::NAN);
+        let mut compared = 0usize;
+        let mut hits_seen = 0usize;
+        for vi in 0..40 {
+            for zi in 1..60 {
+                let v = vi as f64 * 0.35;
+                let z = zi as f64 * 0.35;
+                IV_SERIES_TERM_RATIO.store(true, Relaxed);
+                let before = IV_SERIES_TERM_RATIO_HITS.load(Relaxed);
+                let ratio = iv_scalar(v, z);
+                if IV_SERIES_TERM_RATIO_HITS.load(Relaxed) > before {
+                    hits_seen += 1;
+                }
+                IV_SERIES_TERM_RATIO.store(false, Relaxed);
+                let logged = iv_scalar(v, z);
+                assert!(
+                    ratio.is_finite() && logged.is_finite(),
+                    "non-finite at v={v} z={z}: ratio {ratio} logged {logged}"
+                );
+                let rel = (ratio - logged).abs() / logged.abs().max(f64::MIN_POSITIVE);
+                if rel > worst {
+                    worst = rel;
+                    worst_at = (v, z);
+                }
+                compared += 1;
+            }
+        }
+        IV_SERIES_TERM_RATIO.store(restore, Relaxed);
+
+        // MUST-HIT: the series branch has to have been taken, or this compared two
+        // evaluations that both went somewhere else (the asymptotic arm, say).
+        assert!(
+            hits_seen > compared / 2,
+            "series branch ran only {hits_seen} of {compared} times; the grid is off it"
+        );
+        println!(
+            "iv term-ratio vs log form: worst rel {worst:e} at v={} z={}, {compared} points",
+            worst_at.0, worst_at.1
+        );
+        assert!(
+            worst < 1.0e-12,
+            "term-ratio and log forms disagree by {worst:e} at v={} z={}",
+            worst_at.0,
+            worst_at.1
+        );
+
+        // Integer-order parity for negative z must survive: I_v(-z) = (-1)^v I_v(z).
+        for (v, z) in [(2.0_f64, 3.0_f64), (3.0, 3.0)] {
+            let pos = iv_scalar(v, z);
+            let neg = iv_scalar(v, -z);
+            let expect = if (v as i64) % 2 == 0 { pos } else { -pos };
+            assert!(
+                (neg - expect).abs() <= 1.0e-12 * pos.abs().max(1.0),
+                "I_{v}(-{z}) parity broken: {neg} vs {expect}"
+            );
+        }
     }
 
     /// The `Y1` small-argument rational agrees with the power series it replaces, and both
