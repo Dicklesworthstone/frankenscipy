@@ -3227,6 +3227,30 @@ fn exp_from_log(log_value: f64, ln_min: f64, ln_max: f64) -> f64 {
     }
 }
 
+/// Preallocate the output once and let workers write disjoint slices, instead of giving each
+/// worker its own `Vec` and concatenating (`true`, shipping).
+///
+/// BIT-IDENTICAL, values and first error alike — see the block in `map_real_input`. This is
+/// an allocation-and-copy lever, not a numeric one.
+pub static BESSEL_FUSED_PAR_WRITE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// BATCHES that took the fused write — "enabled" is not "took effect". Counted per batch.
+pub static BESSEL_FUSED_PAR_WRITE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Runtime override for `map_real_input`'s fan-out threshold; `0` means "use the caller's".
+///
+/// Whether fanning out pays was shown to be a property of the OP rather than of the host
+/// alone (gamma prefers serial, rgamma and digamma prefer threaded), so it has to be measured
+/// per op rather than assumed. `map_real_input` caps workers at `n / 256`, where gamma's
+/// mapper caps at `n / 32768` — a 128-fold difference between two mappers in one crate, which
+/// is worth knowing the consequence of.
+pub static BESSEL_PAR_MIN_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// BATCHES that ran SERIAL through `map_real_input`. Pairs with the override as its control.
+pub static BESSEL_SERIAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn map_real_input<F>(
     function: &'static str,
     input: &SpecialTensor,
@@ -3248,6 +3272,16 @@ where
             // is returned in element order, so the result (value and first error) is
             // bit-identical to the sequential `values.iter().map(kernel).collect()`.
             let n = values.len();
+            // `real_par_min` is overridable so the serial and threaded schedules can be timed
+            // against each other in one process on the machine that will run them. Read ONCE
+            // per batch here, never per element.
+            let real_par_min = {
+                let value = BESSEL_PAR_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+                if value == 0 { real_par_min } else { value }
+            };
+            if n < real_par_min {
+                BESSEL_SERIAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let nthreads = if n < real_par_min {
                 1
             } else {
@@ -3267,6 +3301,49 @@ where
             }
             let chunk = n.div_ceil(nthreads);
             let kernel = &kernel;
+
+            // FUSED PARALLEL WRITE. The path below this block gives every worker its OWN
+            // `Vec<f64>` to collect into and then concatenates them, which costs one
+            // allocation per thread plus a full extra copy of the whole output — at n=200000
+            // and 16 threads that is 16 allocations and 1.6 MB memcpy'd a second time, none
+            // of which the incumbent's single pass pays. `map_real_infallible` in gamma.rs
+            // already does the other thing: preallocate once and let the workers write
+            // disjoint slices.
+            //
+            // BIT-IDENTICAL, including the error: each element is computed by the same kernel
+            // and written to the same index, and the first `Err` is still the one earliest in
+            // element order, because a worker stops at its own first failure and the chunk
+            // results are scanned in chunk order.
+            if BESSEL_FUSED_PAR_WRITE.load(std::sync::atomic::Ordering::Relaxed) {
+                BESSEL_FUSED_PAR_WRITE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut out = vec![0.0_f64; n];
+                let first_errors: Vec<Option<SpecialError>> = std::thread::scope(|scope| {
+                    out.chunks_mut(chunk)
+                        .zip(values.chunks(chunk))
+                        .map(|(out_chunk, in_chunk)| {
+                            scope.spawn(move || {
+                                for (slot, &x) in out_chunk.iter_mut().zip(in_chunk) {
+                                    match kernel(x) {
+                                        Ok(value) => *slot = value,
+                                        Err(error) => return Some(error),
+                                    }
+                                }
+                                None
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .map(|h| h.join().expect("bessel array worker panicked"))
+                        .collect()
+                });
+                for error in first_errors {
+                    if let Some(error) = error {
+                        return Err(error);
+                    }
+                }
+                return Ok(SpecialTensor::RealVec(out));
+            }
+
             let chunk_results: Vec<Result<Vec<f64>, SpecialError>> = std::thread::scope(|scope| {
                 values
                     .chunks(chunk)

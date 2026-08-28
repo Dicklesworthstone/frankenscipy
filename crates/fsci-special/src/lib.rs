@@ -37,8 +37,9 @@ pub use audit::{
     SyncSharedAuditLedger, record_bounded_recovery, record_fail_closed, sync_audit_ledger,
 };
 pub use bessel::{
-    BESSEL_DISPATCH_PLAN, BESSEL_I01_CEPHES, BESSEL_I01_CEPHES_HITS, BESSEL_K01_CEPHES,
-    BESSEL_K01_CEPHES_HITS, BESSEL_Y01_CEPHES_LARGE, BESSEL_Y01_CEPHES_LARGE_HITS,
+    BESSEL_DISPATCH_PLAN, BESSEL_FUSED_PAR_WRITE, BESSEL_FUSED_PAR_WRITE_HITS, BESSEL_I01_CEPHES,
+    BESSEL_I01_CEPHES_HITS, BESSEL_K01_CEPHES, BESSEL_K01_CEPHES_HITS, BESSEL_PAR_MIN_OVERRIDE,
+    BESSEL_SERIAL_HITS, BESSEL_Y01_CEPHES_LARGE, BESSEL_Y01_CEPHES_LARGE_HITS,
     IV_SERIES_TERM_RATIO, IV_SERIES_TERM_RATIO_HITS, h1vp, h2vp, hankel1, hankel1e, hankel2,
     hankel2e, i0, i0_scalar, i0e, i0e_scalar, i1, i1_scalar, i1e, i1e_scalar, iv, ive, ive_scalar,
     ivp, j0, j1, jn, jn_zeros, jnjnp_zeros, jnp_zeros, jnyn_zeros, jv, jve, jvp, k0, k0_scalar,

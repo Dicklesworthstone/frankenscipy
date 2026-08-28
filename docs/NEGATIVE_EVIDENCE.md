@@ -41970,3 +41970,72 @@ restoring on scope exit including an unwind. Suite green afterwards, every resul
 
 The toggle is one I landed in an earlier session, so this is my defect surfacing, not a
 regression from the lever above; it was latent and load-dependent and had been passing.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) x2 on y0/y1, and a CORRECTION: the harness leaked a diagnostic toggle across ops, so some previously reported cells were measured under a pinned gate (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, arm sweeps
+`lever=fused_par_write` on y1 and `lever=force_serial` on y0. Run on worker hz2 with
+`RCH_WORKER=hz2`, `same_host=hetzner2`, harness=perf_special_vs_scipy, live SciPy in the same
+process, ELF sha self-reported. All EIGHT arm controls in the run observed at
+`on_hits=1 off_hits=0`.
+
+**The defect the control caught, which matters more than either lever**
+
+The first attempt reported `armab op=y1 lever=fused_par_write control on_hits=0 off_hits=0`.
+Zero on both sides: the lever was wired to nothing and its clean-looking result described
+nothing. The cause was in the harness. Each op's sweep finished by restoring its lever with
+`set(true)`, on the assumption that a lever's `on` arm is what ships. For a DIAGNOSTIC lever
+such as `force_serial` it is not — `on` is the arm that exists only to be measured against —
+so the restore PINNED the override, and every op sequenced after it inherited a schedule
+nobody chose.
+
+Each lever now declares its shipping value and the restore uses that.
+
+**The correction, and it applies to figures already published in the row above.** In the
+previous run the ops execute in the order gammaln, digamma, gamma, rgamma, … `digamma`'s
+sweep pinned the gate, so `gamma`'s cell was measured under it; `gamma`'s sweep pinned it
+again, so `rgamma`'s cell was too. Both were re-measured on the same worker with the same
+binary after the fix, and both moved substantially; the pairs are in the commit message.
+
+The row above supports its claim that cross-run cells are unstable by citing gamma's cell
+moving between two runs. **One of those two figures is a contaminated one, so that specific
+comparison is substantially this leak rather than run-to-run variation, and the claim is
+weaker than I stated there.** Cells from this harness do still vary across uncontaminated
+runs, so the advice to rank a target on many runs rather than one stands — but it should not
+be supported with that pair, and the two contaminated cells should not be cited at all.
+State that a diagnostic toggle outliving its op silently rewrites every measurement after it.
+
+**Lever 1, y1: removing 16 allocations and a 1.6 MB copy per call buys nothing measurable**
+
+`map_real_input`'s threaded path gives every worker its OWN `Vec<f64>` and concatenates them,
+costing one allocation per worker plus a second full copy of the output — at n=200000 with 16
+workers that is 16 allocations and 1.6 MB copied twice, none of which the incumbent's single
+pass pays. `map_real_infallible` in gamma.rs already preallocates and writes disjoint slices.
+Making this mapper do the same is a real reduction in work and is BIT-IDENTICAL in value and
+in first-error position — both arms returned `max_abs=0.00000000000000000e+00`,
+`compared=200000 nonfinite_mismatch=0`.
+
+It does not pay. The observed effect sits INSIDE the range of its own A/A nulls, so nothing
+is claimable from it, and the figures are in the commit message. The kernel is expensive
+enough per element that allocator and copy traffic is not what bounds this op.
+
+**Lever 2, y0: serial versus threaded is not resolvable here either**
+
+`map_real_input` caps workers at `n / 256`, so y0 and y1 fan out to all 16 logical cores at
+this size, where the gamma family's mapper caps at `n / 32768` and used 6 — a 128-fold
+difference between two mappers in one crate. Given that fan-out was already shown to pay for
+some ops and not others, this was worth measuring rather than assuming. The result is
+inconclusive: the effect does not clear its own nulls, and the threaded arm's null is visibly
+the looser of the two, which is itself consistent with 16 contending workers being a noisier
+thing to time than one.
+
+**What this leaves.** y1 remains the standing worst cell on the multi-run ranking, and after
+two structural attempts its deficit is still unexplained. Excluded now: the per-worker
+allocation and concatenation (measured, null), and the schedule (measured, inconclusive).
+
+**No runtime claim is banked**, for the usual reason: the TIMED set needs fail-closed
+host-wide quiescence, and although this was the quietest window of the session — loadavg 2.58
+rising to 4.56 on 16 cores — that still does not meet it, and hz1 remains refused for
+`disk_critical_without_fresh_telemetry`. Reported, not relaxed.

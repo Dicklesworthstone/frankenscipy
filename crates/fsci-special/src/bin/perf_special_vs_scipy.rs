@@ -903,7 +903,7 @@ fn main() {
         // control: the SAME arm timed twice within a round. A lever ratio is only readable
         // if it stands clear of the nulls.
         if let Some(sweep) = arm_sweep(op) {
-            let (name, set) = sweep;
+            let (name, set, shipping_on) = sweep;
             let time_arm = |on: bool| -> f64 {
                 set(on);
                 let started = Instant::now();
@@ -1001,7 +1001,15 @@ fn main() {
             );
             emit!("armab op={op} lever={name} arm=on  {check_on}");
             emit!("armab op={op} lever={name} arm=off {check_off}");
-            set(true);
+            // RESTORE THE SHIPPING VALUE, which is not always `on`.
+            //
+            // This used to be `set(true)`, on the assumption that a lever's `on` arm is what
+            // ships. For a DIAGNOSTIC lever such as `force_serial` it is not, and the
+            // assumption leaked: after y0's sweep the override stayed pinned and every later
+            // Bessel op ran serial, which is exactly what the y1 hit counter caught by
+            // reporting on_hits=0. State that outlives its op silently rewrites every
+            // measurement after it.
+            set(shipping_on);
         }
     }
 
@@ -1017,17 +1025,53 @@ fn main() {
 /// Returning `None` for an op with no lever is what keeps the sweep from printing a
 /// meaningless self-comparison — an `armab` line for an op whose two "arms" are the same
 /// code would read exactly like a measured null and mean nothing.
-fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool))> {
+fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool), bool)> {
     match op {
-        "gammaln" => Some(("cephes_lgam", |on| {
-            fsci_special::GAMMALN_CEPHES_LGAM.store(on, std::sync::atomic::Ordering::Relaxed);
-        })),
-        "erfcinv" => Some(("ndtri_not_acklam", |on| {
-            fsci_special::ERFCINV_NDTRI.store(on, std::sync::atomic::Ordering::Relaxed);
-        })),
-        "erfinv" => Some(("infallible_batch", |on| {
-            fsci_special::ERFINV_INFALLIBLE_BATCH.store(on, std::sync::atomic::Ordering::Relaxed);
-        })),
+        "gammaln" => Some((
+            "cephes_lgam",
+            |on| {
+                fsci_special::GAMMALN_CEPHES_LGAM.store(on, std::sync::atomic::Ordering::Relaxed);
+            },
+            true,
+        )),
+        "erfcinv" => Some((
+            "ndtri_not_acklam",
+            |on| {
+                fsci_special::ERFCINV_NDTRI.store(on, std::sync::atomic::Ordering::Relaxed);
+            },
+            true,
+        )),
+        "erfinv" => Some((
+            "infallible_batch",
+            |on| {
+                fsci_special::ERFINV_INFALLIBLE_BATCH
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+            },
+            true,
+        )),
+        // TWO DIFFERENT QUESTIONS, one on each sibling, so a single run answers both and
+        // neither can be reported selectively. y1 asks whether the threaded path's
+        // per-worker Vec plus concatenation is worth removing; y0 asks whether threading
+        // pays here at all. They share `map_real_input`, so each answer informs the other.
+        "y1" => Some((
+            "fused_par_write",
+            |on| {
+                fsci_special::BESSEL_FUSED_PAR_WRITE
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+            },
+            true,
+        )),
+        // shipping = FALSE: `on` here is the diagnostic serial arm, not what ships.
+        "y0" => Some((
+            "force_serial",
+            |on| {
+                fsci_special::BESSEL_PAR_MIN_OVERRIDE.store(
+                    if on { usize::MAX } else { 0 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            },
+            false,
+        )),
         // `on` = stay SERIAL for this batch, `off` = the shipped threshold (fan out at
         // 131072). All four of gamma/rgamma/digamma/gammaln share the gate, so one lever
         // drives each of them.
@@ -1038,12 +1082,18 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool))> {
         // "our gamma kernel is slow" from "our thread policy is wrong at this size on this
         // host" — and those two have entirely different fixes. (`gammaln`'s sweep slot is
         // taken by `cephes_lgam`; one lever per op.)
-        "gamma" | "rgamma" | "digamma" => Some(("force_serial", |on| {
-            fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(
-                if on { usize::MAX } else { 0 },
-                std::sync::atomic::Ordering::Relaxed,
-            );
-        })),
+        // shipping = FALSE: `on` is the diagnostic serial arm. Restoring `true` here is
+        // what pinned the gate for every op that ran after gamma.
+        "gamma" | "rgamma" | "digamma" => Some((
+            "force_serial",
+            |on| {
+                fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(
+                    if on { usize::MAX } else { 0 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            },
+            false,
+        )),
         _ => None,
     }
 }
@@ -1064,6 +1114,12 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
         "erfinv" => Some(|| {
             fsci_special::ERFINV_INFALLIBLE_BATCH_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),
+        "y1" => Some(|| {
+            fsci_special::BESSEL_FUSED_PAR_WRITE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+        }),
+        "y0" => {
+            Some(|| fsci_special::BESSEL_SERIAL_HITS.load(std::sync::atomic::Ordering::Relaxed))
+        }
         "gamma" | "rgamma" | "digamma" => Some(|| {
             fsci_special::GAMMA_FAMILY_SERIAL_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),
