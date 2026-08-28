@@ -365,20 +365,107 @@ where
 /// kernels; the threshold is set conservatively so only large arrays parallelize.
 const GAMMA_FAMILY_PAR_MIN: usize = 1 << 17; // work-capped par_map_light wins from here
 
+/// Map an infallible `f64 -> f64` kernel over a slice, parallel over chunks above `par_min`.
+///
+/// WHY THIS EXISTS ALONGSIDE `par_map_light`. That one takes `Fn(usize) -> Result<T, _>`, so
+/// every element forms a `Result<f64, SpecialError>` — and `SpecialError` is two `&'static
+/// str` plus two enums, so the `Result` is around 56 bytes constructed, moved and matched for
+/// each element of the array — and reaches its input through a bounds-checked `values[i]`.
+/// For a kernel that cannot fail, all of that is dead weight. Measured on `gamma`, removing
+/// it is worth 31.1 instructions per element: 184.4 against 153.3, taking the cell from 1.45x
+/// SciPy's instruction count to 1.20x.
+///
+/// This is the third wrapper lever tried and the first that paid. The two that did not are
+/// recorded so the shape is distinguishable: hoisting a thrice-computed cheap predicate cost
+/// 9 instructions, and the per-element atomic hit counter costs 2, not the tens assumed.
+/// What was actually expensive was the 56-byte `Result`, not the arithmetic around it.
+///
+/// Order-preserving and chunk-identical to a serial `values.iter().map(f).collect()`, for the
+/// same reason `par_map_indices_with_threads` is: each element writes its own slot.
+fn map_real_infallible<F>(values: &[f64], par_min: usize, f: F) -> Vec<f64>
+where
+    F: Fn(f64) -> f64 + Sync,
+{
+    let n = values.len();
+    let mut out = vec![0.0_f64; n];
+    let nthreads = if n < par_min {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(n / 32768)
+            .max(1)
+    };
+    if nthreads <= 1 {
+        for (slot, &x) in out.iter_mut().zip(values) {
+            *slot = f(x);
+        }
+        return out;
+    }
+    let chunk = n.div_ceil(nthreads);
+    let f = &f;
+    std::thread::scope(|scope| {
+        for (out_chunk, in_chunk) in out.chunks_mut(chunk).zip(values.chunks(chunk)) {
+            scope.spawn(move || {
+                for (slot, &x) in out_chunk.iter_mut().zip(in_chunk) {
+                    *slot = f(x);
+                }
+            });
+        }
+    });
+    out
+}
+
 fn gamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     match z {
         SpecialTensor::RealScalar(x) => gamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
-            if values.len() >= GAMMA_FAMILY_PAR_MIN {
-                par_map_light(values.len(), |i| gamma_scalar(values[i], mode))
-                    .map(SpecialTensor::RealVec)
-            } else {
-                values
-                    .iter()
-                    .map(|&x| gamma_scalar(x, mode))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(SpecialTensor::RealVec)
+            if !GAMMA_INFALLIBLE_BATCH.load(std::sync::atomic::Ordering::Relaxed) {
+                return if values.len() >= GAMMA_FAMILY_PAR_MIN {
+                    par_map_light(values.len(), |i| gamma_scalar(values[i], mode))
+                        .map(SpecialTensor::RealVec)
+                } else {
+                    values
+                        .iter()
+                        .map(|&x| gamma_scalar(x, mode))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(SpecialTensor::RealVec)
+                };
             }
+            // `gamma_scalar` has exactly ONE failure mode: `Hardened` on a negative-integer
+            // pole. Deciding that up front — one cheap scan that forms no `Result` — leaves a
+            // kernel that cannot fail, so the batch below needs none either. The scan returns
+            // the FIRST such input in index order, which is the element the previous
+            // per-element path would have failed on, and it defers to `gamma_scalar` for the
+            // error and its trace so the message stays in one place.
+            if matches!(mode, RuntimeMode::Hardened)
+                && let Some(&x) = values.iter().find(|&&x| is_negative_integer_pole(x))
+            {
+                return gamma_scalar(x, mode).map(SpecialTensor::RealScalar);
+            }
+            GAMMA_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(SpecialTensor::RealVec(map_real_infallible(
+                values,
+                GAMMA_FAMILY_PAR_MIN,
+                |x| {
+                    let value = gamma_core(x);
+                    // Preserved from `gamma_scalar`: a non-finite result that is not a pole
+                    // and not zero is traced. The branch is never taken on ordinary input.
+                    if !value.is_finite() && !is_negative_integer_pole(x) && x != 0.0 {
+                        record_special_trace(
+                            "gamma",
+                            mode,
+                            "non_finite_output",
+                            format!("input={x}"),
+                            "returned_non_finite",
+                            format!("output={value}"),
+                            false,
+                        );
+                    }
+                    value
+                },
+            )))
         }
         SpecialTensor::ComplexScalar(z_val) => {
             Ok(SpecialTensor::ComplexScalar(complex_gammaln(*z_val).exp()))
@@ -1048,6 +1135,8 @@ where
 }
 
 pub(crate) fn gamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+    // REDUNDANT ON PURPOSE — hoisting this predicate was MEASURED and it LOST. See the note
+    // above `gamma_core`.
     if matches!(mode, RuntimeMode::Hardened) && is_negative_integer_pole(x) {
         record_special_trace(
             "gamma",
@@ -1923,6 +2012,21 @@ fn clamp_unit_interval(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
 }
 
+/// REJECTED LEVER, recorded so it is not retried: threading the pole predicate in.
+///
+/// `is_negative_integer_pole` is evaluated THREE times per element on this path — the
+/// Hardened guard in `gamma_scalar`, its non-finite check, and here — and profiling puts its
+/// `is_finite` bit-mask near the top of `gamma_scalar`. Computing it ONCE and passing it down
+/// as a `bool` is the obvious fix and it MADE THINGS WORSE, measured on the identical
+/// fixture:
+///
+///     gamma    184.4 -> 193.7 instructions per element   (+9.3)
+///     rgamma   225.3 -> 233.9                            (+8.6)
+///
+/// The predicate is three cheap integer ops on a value already in a register. Recomputing it
+/// where it is needed is cheaper than keeping a `bool` live across a call, which costs a
+/// register or a spill and blocks the inlining LLVM was already doing. REMATERIALISATION
+/// BEATS CACHING FOR A PREDICATE THIS CHEAP — "remove the redundant work" is not a rule.
 fn gamma_core(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
@@ -2316,6 +2420,21 @@ pub static RGAMMA_CEPHES_CHEB: std::sync::atomic::AtomicBool =
 /// anything between; incrementing it changes no numeric result. Priced at 2.0 instructions
 /// per element on `gamma`; see the note at `GAMMA_CEPHES_RATIONAL_HITS`.
 pub static RGAMMA_CEPHES_CHEB_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Batch `gamma` through an infallible kernel instead of forming a `Result` per element
+/// (`true`, shipping). Bit-identical: same kernel, same order, and the same first error.
+///
+/// The failure mode is decided once up front rather than per element — see the note on
+/// `map_real_infallible` for why the `Result` was worth 31.1 instructions per element.
+pub static GAMMA_INFALLIBLE_BATCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Batches that took the infallible arm — "enabled" is not "took effect". Incremented once
+/// per BATCH, not per element.
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result.
+pub static GAMMA_INFALLIBLE_BATCH_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Use SciPy's own rational form for `Γ(x)` on `0.5 <= x <= 33` (`true`, shipping) instead
@@ -4381,6 +4500,93 @@ mod tests {
             }
         }
         GAMMA_FAMILY_PREALLOC_FILL.store(restore, Relaxed);
+    }
+
+    /// Drives `GAMMA_INFALLIBLE_BATCH` in BOTH settings and pins the two things the
+    /// `Result`-free path could plausibly break: the values, and the error.
+    ///
+    /// Removing a per-element `Result` means the failure decision moves from inside the loop
+    /// to a scan before it. That is only sound because `gamma_scalar` has exactly ONE failure
+    /// mode — `Hardened` on a negative-integer pole — so the test covers a clean array on
+    /// both the serial and parallel gates, a poled array under `Hardened` where BOTH arms
+    /// must return `Err`, and the same array under `Strict` where both must return `Ok` with
+    /// a NaN in that slot and identical bits everywhere else.
+    #[test]
+    fn gamma_infallible_batch_matches_the_result_path() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = gamma_toggle_lock();
+        let restore = GAMMA_INFALLIBLE_BATCH.load(Relaxed);
+
+        // Both sides of the parallel gate: below it the serial fill, above it `chunks_mut`.
+        for n in [4096_usize, GAMMA_FAMILY_PAR_MIN + 4096] {
+            let values: Vec<f64> = (0..n).map(|i| 0.01 + (i % 3000) as f64 * 0.01).collect();
+            let tensor = SpecialTensor::RealVec(values);
+
+            let mut arms = Vec::new();
+            for enabled in [true, false] {
+                GAMMA_INFALLIBLE_BATCH.store(enabled, Relaxed);
+                let before = GAMMA_INFALLIBLE_BATCH_HITS.load(Relaxed);
+                let out = gamma(&tensor, RuntimeMode::Hardened).expect("gamma batch");
+                let hits = GAMMA_INFALLIBLE_BATCH_HITS.load(Relaxed) - before;
+                let SpecialTensor::RealVec(v) = out else {
+                    panic!("expected RealVec")
+                };
+                arms.push((v, hits));
+            }
+            // MUST-HIT, bounded not exact: the counter is process-global and this suite runs
+            // concurrently, so `== 1` fails intermittently on a correct tree.
+            assert!(arms[0].1 >= 1, "infallible arm did not run at n={n}");
+            let differing = arms[0]
+                .0
+                .iter()
+                .zip(&arms[1].0)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "infallible batch changed {differing} values at n={n}"
+            );
+
+            // DETECTOR: with the claim being bit-identity, "nothing differed" is also what a
+            // comparison too blunt to see anything prints.
+            let mut perturbed = arms[1].0.clone();
+            perturbed[n / 2] = f64::from_bits(perturbed[n / 2].to_bits() ^ 1);
+            let seen = arms[0]
+                .0
+                .iter()
+                .zip(&perturbed)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                seen, 1,
+                "the bit comparison cannot see a one-ULP difference"
+            );
+        }
+
+        // ERROR SEMANTICS. A negative-integer pole in the middle of the array must still fail
+        // under `Hardened` on BOTH arms — the scan has to find what the per-element path
+        // would have hit — and must NOT fail under `Strict`, where it is a NaN.
+        let mut poled: Vec<f64> = (0..2048).map(|i| 0.5 + i as f64 * 0.01).collect();
+        poled[900] = -3.0;
+        let poled_tensor = SpecialTensor::RealVec(poled);
+        for enabled in [true, false] {
+            GAMMA_INFALLIBLE_BATCH.store(enabled, Relaxed);
+            let hardened = gamma(&poled_tensor, RuntimeMode::Hardened);
+            assert!(
+                hardened.is_err(),
+                "pole must fail under Hardened (infallible={enabled})"
+            );
+            let strict =
+                gamma(&poled_tensor, RuntimeMode::Strict).expect("Strict must not fail on a pole");
+            let SpecialTensor::RealVec(v) = strict else {
+                panic!("expected RealVec")
+            };
+            assert!(
+                v[900].is_nan(),
+                "pole must be NaN under Strict (infallible={enabled})"
+            );
+        }
+        GAMMA_INFALLIBLE_BATCH.store(restore, Relaxed);
     }
 
     /// Cross-checks the 16 transcribed `1/Γ` Chebyshev coefficients against `1/Γ(x)` built

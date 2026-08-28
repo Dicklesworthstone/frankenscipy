@@ -320,6 +320,18 @@ fn main() {
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
 
+    // `FSCI_SPECIAL_GAMMA_INFALLIBLE=0` restores the `Result`-per-element batch path for
+    // `gamma`, so the infallible batch can be A/B'd inside ONE binary.
+    let gamma_infallible = !matches!(
+        std::env::var("FSCI_SPECIAL_GAMMA_INFALLIBLE")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::GAMMA_INFALLIBLE_BATCH
+        .store(gamma_infallible, std::sync::atomic::Ordering::Relaxed);
+    println!("gamma_infallible_batch={gamma_infallible}");
+
     // `FSCI_SPECIAL_RGAMMA_CHEB=0` restores `1.0 / gamma_scalar(x)` for |x| <= 4, so the
     // Chebyshev series can be A/B'd -- for ACCURACY as much as cost -- in ONE binary.
     let rgamma_cheb = !matches!(
