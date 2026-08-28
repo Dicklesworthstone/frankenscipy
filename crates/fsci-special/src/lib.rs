@@ -2762,11 +2762,17 @@ mod tests {
         // here can only MASK a difference (both arms would run the same code and the
         // bit-equality would compare a thing to itself), never invent one — which is the
         // quieter and worse direction. One lock, taken by any test that writes it.
-        static ZETA_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = ZETA_TOGGLE_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = zeta_toggle_lock();
         let was = ZETA_DIRECT_EARLY_EXIT.load(Ordering::Relaxed);
+
+        // PIN THE SIBLING ARM. `zeta_positive` now returns from the Cephes rational
+        // approximation before the direct prefix is reached, so with the shipping default
+        // BOTH settings below would evaluate identical code and this test would pass while
+        // comparing a thing to itself -- a tautology, not a check. The early-exit lever
+        // lives on the series path, so the series path is what this test must select.
+        let rational_was = ZETA_CEPHES_RATIONAL.load(Ordering::Relaxed);
+        ZETA_CEPHES_RATIONAL.store(false, Ordering::Relaxed);
+        let hits_before = ZETA_CEPHES_RATIONAL_HITS.load(Ordering::Relaxed);
 
         let mut points: Vec<f64> = Vec::new();
         for i in 0..=2000 {
@@ -2793,7 +2799,112 @@ mod tests {
             compared += 1;
         }
         assert_eq!(compared, points.len(), "comparison loop was skipped");
+        // MUST-MISS: prove the series path really was the one exercised. If the rational
+        // arm ran, every comparison above was between two identical evaluations.
+        assert_eq!(
+            ZETA_CEPHES_RATIONAL_HITS.load(Ordering::Relaxed),
+            hits_before,
+            "the rational arm ran, so the early-exit comparison was vacuous"
+        );
+        ZETA_CEPHES_RATIONAL.store(rational_was, Ordering::Relaxed);
         ZETA_DIRECT_EARLY_EXIT.store(was, Ordering::Relaxed);
+    }
+
+    /// The ONE lock for every test that writes a zeta perf toggle. `ZETA_DIRECT_EARLY_EXIT`
+    /// and `ZETA_CEPHES_RATIONAL` are process-global and `cargo test` runs concurrently, so
+    /// two tests flipping them at once produce a MASKED pass -- both arms running the same
+    /// code and the equality comparing a thing to itself -- which is the quiet direction. A
+    /// second lock for this state would be a bug, not extra safety.
+    fn zeta_toggle_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ZETA_TOGGLE_LOCK: Mutex<()> = Mutex::new(());
+        ZETA_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Cross-checks SciPy's rational approximation against our independent
+    /// Euler-Maclaurin series over the whole positive domain.
+    ///
+    /// This is what catches a mistranscribed coefficient. The two forms share no constants
+    /// and no code path, so agreement to a few ULP is strong evidence that the ~70 numbers
+    /// copied out of `xsf/cephes/zetac.h` are the right ones; a single wrong digit in any of
+    /// them moves the rational arm far more than the tolerance below.
+    #[test]
+    fn zeta_cephes_rational_matches_the_euler_maclaurin_series() {
+        use std::sync::atomic::Ordering;
+        let _guard = zeta_toggle_lock();
+        let rational_was = ZETA_CEPHES_RATIONAL.load(Ordering::Relaxed);
+
+        // Span every branch of the rational form: the integer table, the 1..10 rational,
+        // the 10..50 rational-plus-exp, and the >50 sum. Non-integer points sit between
+        // table entries so the table and the polynomials are both exercised.
+        let mut points: Vec<f64> = Vec::new();
+        for i in 0..=1200 {
+            points.push(1.000_001 + (60.0 - 1.0) * (i as f64 / 1200.0));
+        }
+        points.extend([
+            1.000_001, 1.5, 2.0, 2.5, 3.0, 7.5, 9.999, 10.0, 10.001, 25.5, 49.9, 50.0, 50.1, 60.0,
+            80.0, 120.0, 126.9,
+        ]);
+
+        let mut worst_ulp = 0.0_f64;
+        let mut worst_at = f64::NAN;
+        let mut compared = 0usize;
+        let mut table = 0usize;
+        let mut low = 0usize;
+        let mut high = 0usize;
+        let mut sum_branch = 0usize;
+        for &s in &points {
+            ZETA_CEPHES_RATIONAL.store(true, Ordering::Relaxed);
+            let rational = zeta_scalar(s);
+            ZETA_CEPHES_RATIONAL.store(false, Ordering::Relaxed);
+            let series = zeta_scalar(s);
+            assert!(
+                rational.is_finite() && series.is_finite(),
+                "zeta({s}) not finite: rational {rational} series {series}"
+            );
+            // In ULPs of the series value, so a point where zeta is ~1 is not flattered by
+            // an absolute bound.
+            let ulp = (rational - series).abs()
+                / f64::max(series.abs(), f64::MIN_POSITIVE)
+                / f64::EPSILON;
+            if ulp > worst_ulp {
+                worst_ulp = ulp;
+                worst_at = s;
+            }
+            compared += 1;
+            if s.floor() == s && s < 31.0 {
+                table += 1;
+            } else if s <= 10.0 {
+                low += 1;
+            } else if s <= 50.0 {
+                high += 1;
+            } else {
+                sum_branch += 1;
+            }
+        }
+        ZETA_CEPHES_RATIONAL.store(rational_was, Ordering::Relaxed);
+
+        // MUST-HIT: every branch of the rational form has to be reached, or the agreement
+        // below is evidence only about the branches that ran.
+        assert!(
+            table > 0 && low > 0 && high > 0 && sum_branch > 0,
+            "grid missed a branch: table={table} low={low} high={high} sum={sum_branch}"
+        );
+        assert_eq!(compared, points.len(), "comparison loop was skipped");
+        // MEASURED worst is 70.5 ULP at s = 2.3275 over this grid, and almost all of that
+        // is the SERIES, not the rational form: against live SciPy the rational arm is
+        // ~1 ULP (max_rel 2.74e-16) where the series is ~73 ULP (1.62e-14). The bound is
+        // 256 for ~3.6x margin rather than the measured value, because it exists to catch a
+        // mistranscribed coefficient — which moves a branch by orders of magnitude, not by
+        // ULPs — and sitting on the measurement would make it a change-detector instead.
+        assert!(
+            worst_ulp < 256.0,
+            "rational and series disagree by {worst_ulp} ULP at s={worst_at};              a transcribed coefficient is probably wrong"
+        );
+        println!(
+            "zeta rational vs series: worst {worst_ulp:.1} ULP at s={worst_at},              {compared} points (table={table} low={low} high={high} sum={sum_branch})"
+        );
     }
 
     #[test]
