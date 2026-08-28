@@ -1019,6 +1019,9 @@ fn main() {
     // that way; the pair brackets the measurement, so a load spike that arrived mid-run is
     // visible in the row rather than hidden inside a median.
     gamma_gate_size_sweep();
+    // y1 is the worst cell and its deficit survives every structural explanation tried so
+    // far; x = 5 is where its kernel changes shape, so that is where to look next.
+    band_sweep("y1", (0.01, 30.0), 5.0, 9);
 
     emit!("provenance_after {}", host_provenance());
 }
@@ -1037,6 +1040,108 @@ fn main() {
 ///
 /// Both schedules are bit-identical: `map_real_infallible` gives each index its own output
 /// slot and applies the same kernel either way.
+/// Split an op's domain at a KERNEL BRANCH BOUNDARY and compare each side against the
+/// incumbent separately.
+///
+/// WHY. Every cell in this harness averages an op over its whole fixture, so a kernel with two
+/// branches reports one number that belongs to neither of them. `y1` splits at x = 5: below it
+/// Cephes evaluates a rational AND calls `j1` AND takes a logarithm; above it evaluates a
+/// different rational with a sin/cos phase. Those are not the same amount of work, they are
+/// not present in the same proportion, and a single ratio cannot say which one is behind.
+///
+/// This is a DIAGNOSTIC, not a headline: a fixture confined to one branch benchmarks that
+/// branch and says nothing about the op as a whole. Both bands are always reported together,
+/// with the proportion each occupies in the real fixture, so neither can be quoted alone as
+/// "y1's ratio".
+fn band_sweep(op: &str, full: (f64, f64), split: f64, rounds: usize) {
+    let n: usize = 200_000;
+    let unit = |i: usize| -> f64 {
+        let k = (i * 2_654_435_761usize).wrapping_add(40_503) % 1_000_003;
+        k as f64 / 1_000_003.0
+    };
+    let share = (split - full.0) / (full.1 - full.0);
+    emit!(
+        "bandsweep op={op} split_at={split} lower_share_of_full_fixture={share:.3} \
+         note=diagnostic-per-branch-not-a-headline-ratio"
+    );
+
+    for (lo, hi, label) in [(full.0, split, "lower"), (split, full.1, "upper")] {
+        let x: Vec<f64> = (0..n).map(|i| lo + unit(i) * (hi - lo)).collect();
+        let mut scipy = Scipy::start(op, &x);
+        let tensor = SpecialTensor::RealVec(x);
+        let ours = || -> Vec<f64> {
+            let out = call_ours(op, &tensor);
+            real_vec(out.unwrap_or_else(|e| panic!("fsci {op} failed: {e}")), op)
+        };
+        black_box(ours());
+        let _ = scipy.time(1, 1);
+
+        // Same reps for both arms, sized off the faster of a few calls, as in the main loop.
+        let mut single = f64::INFINITY;
+        for _ in 0..3 {
+            let started = Instant::now();
+            black_box(ours());
+            single = single.min(started.elapsed().as_secs_f64() * 1.0e3);
+        }
+        let reps = (20.0_f64 / single.max(1.0e-6)).ceil() as usize;
+        let reps = reps.clamp(1, 4096);
+
+        let time_ours = || -> f64 {
+            let started = Instant::now();
+            for _ in 0..reps {
+                black_box(ours());
+            }
+            started.elapsed().as_secs_f64() * 1.0e3 / reps as f64
+        };
+
+        let (mut fs, mut sp, mut nf, mut ns) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for round in 0..rounds {
+            let (a1, s1, s2, a2) = if round % 2 == 0 {
+                let a1 = time_ours();
+                let s1 = scipy.time(reps, 1);
+                let s2 = scipy.time(reps, 1);
+                let a2 = time_ours();
+                (a1, s1, s2, a2)
+            } else {
+                let s1 = scipy.time(reps, 1);
+                let a1 = time_ours();
+                let a2 = time_ours();
+                let s2 = scipy.time(reps, 1);
+                (a1, s1, s2, a2)
+            };
+            fs.push(a1.min(a2));
+            sp.push(s1.min(s2));
+            nf.push(a1.max(a2) / a1.min(a2));
+            ns.push(s1.max(s2) / s1.min(s2));
+        }
+        // Aggregate at the replicate level, and withhold a ratio that does not clear the
+        // looser of the two nulls rather than printing one that decides nothing.
+        let mut per_round: Vec<f64> = sp.iter().zip(fs.iter()).map(|(s, f)| s / f).collect();
+        per_round.sort_by(f64::total_cmp);
+        let ratio = median(per_round.clone());
+        let worst_null = median(nf.clone()).max(median(ns.clone()));
+        let resolved = ratio > worst_null || ratio < 1.0 / worst_null;
+        let check = scipy.check(&ours());
+        if resolved {
+            emit!(
+                "bandsweep op={op} band={label} domain=[{lo}, {hi}] scipy/fsci={ratio:.3}x \
+                 min={:.3}x max={:.3}x null_fsci={:.3} null_scipy={:.3} {check}",
+                per_round[0],
+                per_round[per_round.len() - 1],
+                median(nf),
+                median(ns),
+            );
+        } else {
+            emit!(
+                "bandsweep op={op} band={label} domain=[{lo}, {hi}] scipy/fsci=WITHHELD-UNRESOLVED \
+                 null_fsci={:.3} null_scipy={:.3} {check}",
+                median(nf),
+                median(ns),
+            );
+        }
+    }
+}
+
 fn gamma_gate_size_sweep() {
     use std::sync::atomic::Ordering::Relaxed;
 

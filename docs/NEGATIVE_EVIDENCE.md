@@ -42170,3 +42170,61 @@ as the control rather than merely a third data series.
 hz2 ran this between loadavg 2.33 and 7.27 on 16 cores and hz1 is still refused for
 `disk_critical_without_fresh_telemetry`. Every ratio is in the commit message. Reported, not
 relaxed.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) of "one bad branch" as y1's deficit: BOTH branches are behind the incumbent, the smaller one worse — and an anomaly I nearly published did not replicate (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, `bandsweep op=y1`, two
+independent runs. Run on worker hz2 with `RCH_WORKER=hz2`, `same_host=hetzner2`,
+harness=perf_special_vs_scipy, live SciPy in the same process, ELF sha self-reported.
+
+Observed: `max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00
+compared=200000 nonfinite_mismatch=0` on BOTH bands in BOTH runs, so every comparison below
+is between implementations that agree exactly. The lower band occupies 0.166 of the real
+fixture. The upper band resolved in run 1 and returned `WITHHELD-UNRESOLVED` in run 2.
+
+**Why a band sweep at all**
+
+Every cell in this harness averages an op over its whole fixture, so a kernel with two
+branches reports one number belonging to neither. `y1` splits at x = 5: below it Cephes
+evaluates a rational AND calls `j1` AND takes a logarithm; above it evaluates a different
+rational with a sin/cos phase. Those are not the same work and are not present in equal
+proportion. y1's deficit had already survived every structural explanation tried — extra
+refinement, the parallel gate, per-worker allocation and concatenation, and the schedule in
+both directions — so the next question was not "what else is bolted on" but "which half of
+the kernel is it".
+
+**The answer is: not one half.** Both bands sit behind the incumbent, in both runs where they
+resolved. There is no single branch to fix and no fixture-composition effect to exploit. The
+lower band — the one carrying the `j1` call and the logarithm — was the worse of the two in
+both runs and is the more promising place to look next, while being only a sixth of the
+fixture, so even removing its deficit entirely would leave most of the cell's gap standing.
+
+**An anomaly that did not survive replication, recorded because I nearly published it**
+
+In the first run the FULL-fixture ratio was worse than either band measured separately, which
+a weighted average of the two bands does not predict. That has an attractive explanation —
+the per-element branch on x is unpredictable when the two cases are interleaved and perfectly
+predicted inside a single band — and I had begun building a sorted-versus-shuffled arm to test
+it.
+
+It did not replicate. In the second run the full-fixture figure was better than the lower
+band, not worse than both. So the anomaly was window drift, the explanation was a story fitted
+to one run, and the experiment being built for it would have been chasing noise. Recorded
+here because the useful artifact is the near miss: a difference between two numbers taken in
+DIFFERENT measurement windows is not a finding, however good the mechanism sounds, and the
+cheapest test of one is to take it again before explaining it.
+
+**A process failure in the same turn, with the same shape.** The edit adding that
+sorted-versus-shuffled arm did not apply — its guard assertion fired because the target text
+had been reformatted — but the build and run that followed were not conditional on it, so a
+run went to completion, printed a full set of band results, and looked exactly like the new
+experiment. It was a replication of the old one. That it happened to be a USEFUL replication
+is luck, not process. Chain a measurement behind its edit, or check the edit landed before
+believing the output describes what you think it does.
+
+**No runtime claim is banked.** The TIMED evidence set requires fail-closed host-wide
+quiescence; hz2 ran these between loadavg 2.14 and 7.24 on 16 cores and hz1 remains refused
+for `disk_critical_without_fresh_telemetry`. All ratios are in the commit message. Reported,
+not relaxed.
