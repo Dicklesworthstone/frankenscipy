@@ -41523,3 +41523,58 @@ re-derived.
 the `is_finite(output)` trace check, and the `Result` per element. That is where the ~35
 instructions per element over SciPy in the asymptotic band live. Cephes' own `lgam` performs
 no per-element pole test at all for `x > -34`.
+
+---
+
+## 2026-08-28 REJECT: hoisting gamma's thrice-computed pole predicate cost 9 instructions per element (BlackThrush)
+
+Result class: REJECT. Counted mechanism, no timed claim is made or banked here.
+
+executed-binary sha256 arm proven by instruction count, harness=crates/fsci-special/src/bin/perf_special_vs_scipy.rs,
+same_host=local, affinity `taskset -c 4`, requested_threads=1.
+
+**The target was the one the profile named.** `gamma`'s residual against SciPy is per-element
+wrapper, not kernel: its kernel measures 108.8 instructions per element against SciPy's
+102.4, while the wrapper is ~72 against ~25. Annotating `gamma_scalar` put the
+`movabs $0x7fefffffffffffff` / `and` pair — the `is_finite` bit-mask inside
+`is_negative_integer_pole` — at the top of the function. That predicate runs THREE times per
+element: the Hardened guard in `gamma_scalar`, its non-finite check afterwards, and again
+inside `gamma_core`. The input cannot change between them.
+
+**Computing it once and threading it down lost.** Measured on the identical fixture, both
+arms built the same way: instructions per element 184.4 vs 193.7 on gamma and 225.3 vs 233.9
+on rgamma, i.e. the hoisted arm retires MORE instructions in both cases.
+
+    gamma    184.4 -> 193.7   +9.3   WORSE
+    rgamma   225.3 -> 233.9   +8.6   WORSE
+
+Removing two redundant computations cost nine instructions.
+
+**Why, and this is the reusable part.** The predicate is three cheap integer operations on a
+value already in a register. Recomputing it where it is needed is cheaper than keeping a
+`bool` live across a call — that costs a register or a spill, and the extra parameter blocks
+the inlining LLVM was already doing across `gamma_scalar` into `gamma_core`. Rematerialisation
+beats caching when the cached value is cheaper than the pressure of holding it. "Remove the
+redundant work" is a heuristic, not a rule, and at this granularity it points the wrong way
+about as often as the right way.
+
+**Reverted, and the revert verified rather than assumed:** gamma reads 184.4 and rgamma 225.2
+afterwards, matching the pre-experiment 184.4 and 225.3 to within 0.1.
+
+**What is still true, so this is not read as closing the file on the wrapper.** The remaining
+~47-instruction gap against SciPy's per-element overhead is real and is NOT this predicate.
+It is the `Result<f64, SpecialError>` constructed per element — the error type is two
+`&'static str` plus two enums, so the `Result` is around 56 bytes moved for every element of
+a 200000-element array — together with the batch mapper. `gamma_scalar` can only return `Err`
+when mode is `Hardened` AND the input is a negative-integer pole, so the whole `Result` is
+dead weight on the `Strict` path and nearly always dead on the `Hardened` one. Restructuring
+that spans 245 call sites and is not attempted here.
+
+**Instructions were again the right currency.** +9.3 on 184.4 is 5%, which this host's wall
+clock cannot resolve — loadavg moved between 6 and 49 during the session. The counts
+reproduced to 0.1 across builds and across that load range.
+
+**A note on where this row lives.** The source-level version of this note is a comment-only
+block above `gamma_core`; it could not be committed because a peer holds an exclusive
+reservation on that file, which was not overridden. This ledger row is the durable record
+either way.
