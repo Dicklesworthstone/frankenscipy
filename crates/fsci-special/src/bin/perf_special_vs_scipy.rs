@@ -1040,6 +1040,49 @@ fn main() {
 fn gamma_gate_size_sweep() {
     use std::sync::atomic::Ordering::Relaxed;
 
+    // Three ops, and the third is a CONTROL rather than a target.
+    //
+    // A sweep that answered "SERIAL" for every op would be indistinguishable from a sweep
+    // whose threaded arm is broken — forcing a threshold of 1 could, for instance, be
+    // producing chunks so small that fanning out is doomed by construction. `digamma`
+    // preferred the THREADED schedule in both runs that measured it, so it is included
+    // precisely to see the instrument say THREADED. If it does not, the other two rows are
+    // evidence about the harness, not about the gate.
+    for (op, lo, hi, set_serial) in [
+        (
+            "gamma",
+            0.01_f64,
+            30.0_f64,
+            (|serial: bool| {
+                fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(
+                    if serial { usize::MAX } else { 1 },
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }) as fn(bool),
+        ),
+        ("digamma", 0.01, 60.0, |serial: bool| {
+            fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(
+                if serial { usize::MAX } else { 1 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }),
+        ("y1", 0.01, 30.0, |serial: bool| {
+            fsci_special::BESSEL_PAR_MIN_OVERRIDE.store(
+                if serial { usize::MAX } else { 1 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }),
+    ] {
+        gate_size_sweep_one(op, lo, hi, set_serial);
+    }
+    fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(0, Relaxed);
+    fsci_special::BESSEL_PAR_MIN_OVERRIDE.store(0, Relaxed);
+}
+
+/// One op's schedule-crossover sweep. See `gamma_gate_size_sweep` for why this exists.
+fn gate_size_sweep_one(op: &str, lo: f64, hi: f64, set_serial: fn(bool)) {
+    use std::sync::atomic::Ordering::Relaxed;
+
     // Sizes bracket the shipped threshold (1 << 17) on both sides, so the sweep can show it
     // being wrong in one direction and right in the other rather than only confirming a
     // prior. Below the threshold BOTH arms are serial, which is a built-in null: any
@@ -1047,7 +1090,8 @@ fn gamma_gate_size_sweep() {
     const SIZES: &[usize] = &[1 << 16, 1 << 17, 1 << 18, 1 << 19, 1 << 20, 1 << 21];
     const ROUNDS: usize = 9;
 
-    emit!("gatesweep op=gamma note=internal-A/B-not-an-incumbent-comparison");
+    emit!("gatesweep op={op} note=internal-A/B-not-an-incumbent-comparison");
+    let mut rows: Vec<(usize, f64)> = Vec::new();
     for &n in SIZES {
         // Same generator and same domain as the `gamma` case above, so the branch mix inside
         // `gamma_core` is the one the headline cell exercises rather than a different fixture
@@ -1056,21 +1100,16 @@ fn gamma_gate_size_sweep() {
             let k = (i * 2_654_435_761usize).wrapping_add(40_503) % 1_000_003;
             k as f64 / 1_000_003.0
         };
-        let x: Vec<f64> = (0..n).map(|i| 0.01 + unit(i) * (30.0 - 0.01)).collect();
+        let x: Vec<f64> = (0..n).map(|i| lo + unit(i) * (hi - lo)).collect();
         let tensor = SpecialTensor::RealVec(x);
         let run = || {
-            let out = gamma(&tensor, RuntimeMode::Hardened).expect("fsci gamma");
-            real_vec(out, "gamma")
+            let out = call_ours(op, &tensor);
+            real_vec(out.unwrap_or_else(|e| panic!("fsci {op} failed: {e}")), op)
         };
 
-        let set_serial = |serial: bool| {
-            fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE
-                .store(if serial { usize::MAX } else { 1 }, Relaxed);
-        };
-        // `1`, not `0`: `0` means "use the shipped constant", which at the small sizes here
-        // would silently make the threaded arm serial too and turn the whole row into a null
-        // that looks like a result. Forcing the threshold to 1 makes the threaded arm
-        // actually thread at every size.
+        // The setter uses `1`, not `0`, for the threaded arm: `0` means "use the shipped
+        // constant", which at the small sizes here would silently make the threaded arm
+        // serial too and turn the whole row into a null that looks like a result.
         set_serial(false);
         black_box(run());
 
@@ -1118,10 +1157,11 @@ fn gamma_gate_size_sweep() {
                 "UNRESOLVED"
             }
         };
+        let serial_ms = median(ser);
+        rows.push((n, serial_ms));
         emit!(
-            "gatesweep op=gamma n={n} serial={:.3}ms threaded={:.3}ms par/ser={:.3}x \
+            "gatesweep op={op} n={n} serial={serial_ms:.3}ms threaded={:.3}ms par/ser={:.3}x \
              min={:.3}x max={:.3}x null_serial={:.3} null_threaded={:.3} prefers={verdict}",
-            median(ser),
             median(par),
             median(per_round.clone()),
             per_round[0],
@@ -1130,7 +1170,33 @@ fn gamma_gate_size_sweep() {
             median(null_p),
         );
     }
+
+    // SELF-FLAG ROWS THAT WERE DISTURBED MID-MEASUREMENT.
+    //
+    // The serial arm is a plain O(n) loop, so its cost PER ELEMENT must be constant across
+    // sizes. It is the one quantity in this sweep whose correct value is known a priori, and
+    // a row that departs from it was interfered with while it ran — by another tenant on the
+    // box, or by this harness's own neighbours — no matter how tidy its own A/A null looked.
+    //
+    // This matters because such a row does not fail loudly: it reports UNRESOLVED, which
+    // reads like a genuine "no effect here" and quietly weakens a real conclusion. Two gamma
+    // rows in this very run did exactly that. Flagged rather than dropped, because deciding
+    // for the reader which measurements to discard is not the harness's job.
+    let mut costs: Vec<f64> = rows.iter().map(|&(n, ms)| ms / n as f64).collect();
+    costs.sort_by(f64::total_cmp);
+    let typical = costs[costs.len() / 2];
+    for (n, ms) in rows {
+        let rel = (ms / n as f64) / typical;
+        let flag = if !(0.67..=1.5).contains(&rel) {
+            "DISTURBED-discard-this-row"
+        } else {
+            "ok"
+        };
+        emit!("gatesweep op={op} n={n} serial_cost_rel={rel:.2} row={flag}");
+    }
+    set_serial(false);
     fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(0, Relaxed);
+    fsci_special::BESSEL_PAR_MIN_OVERRIDE.store(0, Relaxed);
 }
 
 /// The in-process A/B lever for an op, if it has one: a display name and a setter.

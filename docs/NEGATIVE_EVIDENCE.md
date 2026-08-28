@@ -42105,3 +42105,68 @@ ignore it.
 quiescence and hz2 was at loadavg 3.22 rising to 8.15 on 16 cores across these runs, which
 does not meet it; hz1 remains refused for `disk_critical_without_fresh_telemetry`. Reported,
 not relaxed.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) of the schedule as y1's deficit: y1 never prefers the serial arm at any size, and a must-differ control proves the instrument can say so (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, `gatesweep` over six sizes
+for three ops. Run on worker hz2 with `RCH_WORKER=hz2`, `same_host=hetzner2`,
+harness=perf_special_vs_scipy, live SciPy in the same process, ELF sha self-reported.
+
+Observed, as verdict and flag counts over six sizes per op: `prefers=SERIAL` on 0 of 6 y1
+sizes and `prefers=THREADED` on 2 of 6; `prefers=THREADED` on 5 of 6 digamma sizes and
+`prefers=SERIAL` on 0 of 6; `prefers=SERIAL` on 3 of 6 gamma sizes and `prefers=THREADED` on
+0 of 6. The disturbance flag `row=DISTURBED-discard-this-row` was raised on 2 gamma sizes and
+1 y1 size, and on 0 digamma sizes. Every arm of every op agreed with the incumbent to its own
+baseline, `compared=200000 nonfinite_mismatch=0`.
+
+**The hypothesis, and it was mine**
+
+`y1` is the worst cell on the current ranking. Two of its structural explanations were already
+excluded — per-worker allocation and concatenation, measured null — and the schedule was the
+one left open, because a single-size test of it last time returned an effect that did not
+clear its own control. gamma had just shown that a single size cannot resolve a threshold
+question that a size sweep resolves cleanly, so the sweep was the right instrument to point at
+y1 next.
+
+**The control, which is the part that makes the rest admissible**
+
+A sweep that answered SERIAL for every op would be indistinguishable from a sweep whose
+threaded arm is broken by construction. `digamma` was therefore included as a MUST-DIFFER
+control: it preferred the threaded schedule in both earlier runs, so the instrument was
+required to say THREADED for it. It did, at five of six sizes, and by the largest margins in
+the sweep. The instrument discriminates; a SERIAL verdict elsewhere is about the code.
+
+**Result: the schedule is not y1's problem.** Across six sizes y1 never once preferred the
+serial arm. Where the comparison resolved it preferred THREADED, and everywhere else it
+returned UNRESOLVED and its ratio was withheld rather than published. So y1 keeps the
+schedule it has, no change is made to it, and the schedule joins allocation traffic on the
+list of things that do NOT explain its deficit. That deficit is still unexplained.
+
+`gamma`'s verdict from the previous row replicated on every row of this run that resolved,
+which is the second independent sweep supporting the threshold already shipped for it.
+
+**A new self-check fell out, and it is the transferable part**
+
+Two `gamma` rows in this run reported UNRESOLVED. They were not quiet — they were disturbed.
+The serial arm is a plain O(n) loop, so its cost PER ELEMENT must be constant across sizes;
+that is the one quantity in the sweep whose correct value is known in advance. Both rows
+departed from it by more than a factor of two while their own A/A nulls still looked tidy,
+because a disturbance that lands on both arms of a round cancels out of the null and does not
+cancel out of the comparison.
+
+This is worth stating plainly: **an UNRESOLVED verdict reads like "no effect here" and can
+instead mean "this row was interfered with", and the A/A null does not distinguish them.**
+The harness now derives cost-per-element for every size, compares each against the median,
+and prints `row=DISTURBED-discard-this-row` where it departs. Flagged, not dropped — deciding
+which measurements a reader may keep is not the harness's job. One `y1` row is flagged the
+same way, and the conclusion above rests on its clean rows only.
+
+`digamma`, the control, came back clean on all six rows, which is a second reason to trust it
+as the control rather than merely a third data series.
+
+**No runtime claim is banked.** The TIMED evidence set needs fail-closed host-wide quiescence;
+hz2 ran this between loadavg 2.33 and 7.27 on 16 cores and hz1 is still refused for
+`disk_critical_without_fresh_telemetry`. Every ratio is in the commit message. Reported, not
+relaxed.
