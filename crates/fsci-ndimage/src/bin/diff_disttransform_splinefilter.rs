@@ -18,8 +18,8 @@
 //!
 //! Lines: `name|v;v;v`. Inputs must match `python/diff_disttransform_splinefilter.py`.
 use fsci_ndimage::{
-    BoundaryMode, DistanceMetric, NdArray, binary_dilation_with_structure, distance_transform_bf,
-    distance_transform_cdt, spline_filter1d,
+    BoundaryMode, DistanceMetric, NdArray, SplineBoundaryMode, binary_dilation_with_structure,
+    distance_transform_bf, distance_transform_cdt, spline_filter1d, spline_filter1d_with_mode,
 };
 
 fn dump(name: &str, v: &[f64]) {
@@ -116,6 +116,15 @@ fn main() {
             ("constant", BoundaryMode::Constant),
         ] {
             if let Ok(out) = spline_filter1d(&r, order, 0, mode) {
+                dump(&format!("spf1d_o{order}_{bname}"), &out.data);
+            }
+        }
+        for (bname, mode) in [
+            ("grid_mirror", SplineBoundaryMode::GridMirror),
+            ("grid_constant", SplineBoundaryMode::GridConstant),
+            ("grid_wrap", SplineBoundaryMode::GridWrap),
+        ] {
+            if let Ok(out) = spline_filter1d_with_mode(&r, order, 0, mode) {
                 dump(&format!("spf1d_o{order}_{bname}"), &out.data);
             }
         }

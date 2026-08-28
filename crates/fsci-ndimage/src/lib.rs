@@ -13426,6 +13426,88 @@ pub fn spline_filter(
 pub static NDIMAGE_SPLINE_FILTER1D_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// SciPy's spline-prefilter boundary spellings, including the three `grid-*`
+/// modes that do not have a one-to-one equivalent in [`BoundaryMode`].
+///
+/// `GridMirror` and `GridConstant` deliberately reuse SciPy's reflect- and
+/// mirror-class prefilters respectively. `GridWrap` is distinct: it solves the
+/// periodic cardinal-B-spline system, so mapping it to `Wrap` would silently
+/// return the wrong coefficients at both boundaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplineBoundaryMode {
+    /// One of FrankenSciPy's existing filtering boundary modes.
+    Boundary(BoundaryMode),
+    /// SciPy `mode="grid-mirror"`.
+    GridMirror,
+    /// SciPy `mode="grid-constant"`.
+    GridConstant,
+    /// SciPy `mode="grid-wrap"`.
+    GridWrap,
+}
+
+/// Solve the periodic cardinal B-spline interpolation system used by SciPy's
+/// `grid-wrap` spline prefilter.
+///
+/// The system is banded and circulant, but dimensions here are one axis of a
+/// capability-oriented filter call. A pivoted dense solve is intentionally
+/// preferred over borrowing one of the non-periodic IIR recurrences: it keeps
+/// the periodic boundary condition explicit and fails closed on a singular
+/// system rather than approximating `grid-wrap` as ordinary `wrap`.
+fn bspline_grid_wrap_coefficients(line: &[f64], order: usize) -> Result<Vec<f64>, NdimageError> {
+    let n = line.len();
+    if n <= order {
+        return Err(NdimageError::InvalidArgument(
+            "grid-wrap spline filtering requires axis length > spline order".to_string(),
+        ));
+    }
+
+    let mut system = vec![vec![0.0_f64; n + 1]; n];
+    for (sample, row) in system.iter_mut().enumerate() {
+        for coefficient in 0..n {
+            // n > order, so the compact cardinal support can cross a periodic
+            // boundary at most once in either direction.
+            for image in -1..=1 {
+                let offset = sample as f64 - (coefficient as f64 + image as f64 * n as f64);
+                row[coefficient] += cardinal_bspline(order, offset);
+            }
+        }
+        row[n] = line[sample];
+    }
+
+    for pivot in 0..n {
+        let best = (pivot..n)
+            .max_by(|&left, &right| {
+                system[left][pivot]
+                    .abs()
+                    .total_cmp(&system[right][pivot].abs())
+            })
+            .expect("non-empty pivot range");
+        if system[best][pivot].abs() <= f64::EPSILON {
+            return Err(NdimageError::InvalidArgument(
+                "grid-wrap spline prefilter system is singular".to_string(),
+            ));
+        }
+        system.swap(pivot, best);
+        let diagonal = system[pivot][pivot];
+        for column in pivot..=n {
+            system[pivot][column] /= diagonal;
+        }
+        for row in 0..n {
+            if row == pivot {
+                continue;
+            }
+            let scale = system[row][pivot];
+            if scale == 0.0 {
+                continue;
+            }
+            for column in pivot..=n {
+                system[row][column] -= scale * system[pivot][column];
+            }
+        }
+    }
+    Ok(system.into_iter().map(|row| row[n]).collect())
+}
+
 /// Compute spline filter coefficients along a single axis.
 ///
 /// Matches `scipy.ndimage.spline_filter1d`. Computes spline coefficients
@@ -13612,6 +13694,70 @@ pub fn spline_filter1d(
     }
 
     Ok(result)
+}
+
+/// Compute `spline_filter1d` coefficients with the complete SciPy prefilter
+/// boundary-mode vocabulary.
+///
+/// This is separate from [`BoundaryMode`] because the `grid-*` spellings are
+/// spline-prefilter semantics, not aliases for every ndimage operation.
+pub fn spline_filter1d_with_mode(
+    input: &NdArray,
+    order: usize,
+    axis: usize,
+    mode: SplineBoundaryMode,
+) -> Result<NdArray, NdimageError> {
+    match mode {
+        SplineBoundaryMode::Boundary(mode) => spline_filter1d(input, order, axis, mode),
+        SplineBoundaryMode::GridMirror => {
+            spline_filter1d(input, order, axis, BoundaryMode::Reflect)
+        }
+        SplineBoundaryMode::GridConstant => {
+            spline_filter1d(input, order, axis, BoundaryMode::Mirror)
+        }
+        SplineBoundaryMode::GridWrap => {
+            if order > 5 {
+                return Err(NdimageError::InvalidArgument(format!(
+                    "spline order must be in 0..=5, got {order}"
+                )));
+            }
+            if axis >= input.ndim() {
+                return Err(NdimageError::InvalidArgument(format!(
+                    "axis {axis} out of bounds for input with {} dimensions",
+                    input.ndim()
+                )));
+            }
+            if order <= 1 {
+                return Ok(input.clone());
+            }
+
+            let axis_len = input.shape[axis];
+            if axis_len <= order {
+                return Err(NdimageError::InvalidArgument(
+                    "grid-wrap spline filtering requires axis length > spline order".to_string(),
+                ));
+            }
+            let stride: usize = input.shape[axis + 1..].iter().product();
+            let outer: usize = input.shape[..axis].iter().product();
+            let mut result = input.clone();
+            for outer_idx in 0..outer {
+                for inner_idx in 0..stride {
+                    let mut line = Vec::with_capacity(axis_len);
+                    for index in 0..axis_len {
+                        line.push(
+                            input.data[outer_idx * axis_len * stride + index * stride + inner_idx],
+                        );
+                    }
+                    let coefficients = bspline_grid_wrap_coefficients(&line, order)?;
+                    for (index, coefficient) in coefficients.into_iter().enumerate() {
+                        result.data[outer_idx * axis_len * stride + index * stride + inner_idx] =
+                            coefficient;
+                    }
+                }
+            }
+            Ok(result)
+        }
+    }
 }
 
 /// Compute spline filter coefficients along one signed axis with SciPy-style normalization.
@@ -23420,8 +23566,8 @@ mod van22_knob_read_is_per_transform {
     #[test]
     fn distance_transforms_and_spline_filter1d_against_scipy_1_17_1() {
         use super::{
-            BoundaryMode, DistanceMetric, NdArray, distance_transform_bf, distance_transform_cdt,
-            spline_filter1d,
+            BoundaryMode, DistanceMetric, NdArray, SplineBoundaryMode, distance_transform_bf,
+            distance_transform_cdt, spline_filter1d, spline_filter1d_with_mode,
         };
 
         #[rustfmt::skip]
@@ -23662,6 +23808,70 @@ mod van22_knob_read_is_per_transform {
         assert!(
             class_separation > 0.8,
             "fixture must distinguish SciPy mirror-class from reflect-class; got {class_separation:.3e}"
+        );
+
+        // `grid-mirror` and `grid-constant` are SciPy spelling aliases for the
+        // reflect and mirror prefilter classes, respectively. `grid-wrap` is
+        // NOT: it solves a periodic system. These three assertions reject the
+        // tempting but wrong implementation that treats every `grid-*` mode as
+        // ordinary `Wrap`.
+        let grid_mirror =
+            spline_filter1d_with_mode(&ramp, 3, 0, SplineBoundaryMode::GridMirror).unwrap();
+        assert_eq!(
+            grid_mirror
+                .data
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            reflect_order3
+                .data
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            "SciPy grid-mirror must use the reflect prefilter class"
+        );
+        let grid_constant =
+            spline_filter1d_with_mode(&ramp, 3, 0, SplineBoundaryMode::GridConstant).unwrap();
+        assert_eq!(
+            grid_constant
+                .data
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>(),
+            mirror.data.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "SciPy grid-constant must use the mirror prefilter class"
+        );
+        let scipy_grid_wrap = [
+            -2.8471809154237673,
+            3.1099347073079859,
+            3.5033604564702627,
+            3.614718606603249,
+            2.075533716796474,
+            0.11293322901715125,
+            -1.341364731278235,
+            -1.435838207348791,
+            -0.09942946656458981,
+            2.470756591905362,
+            4.01905330766144,
+            8.278788954387085,
+        ];
+        let grid_wrap =
+            spline_filter1d_with_mode(&ramp, 3, 0, SplineBoundaryMode::GridWrap).unwrap();
+        close(
+            "spline_filter1d/grid-wrap/order3",
+            &grid_wrap.data,
+            &scipy_grid_wrap,
+            1e-12,
+        );
+        let grid_wrap_separation = grid_wrap
+            .data
+            .iter()
+            .zip(mirror.data.iter())
+            .map(|(periodic, ordinary_wrap)| (periodic - ordinary_wrap).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            grid_wrap_separation > 1.4,
+            "fixture must distinguish grid-wrap from ordinary wrap; got {grid_wrap_separation:.3e}"
         );
 
         // RECONCILED (frankenscipy-047br). This was a MUST-MISS arm asserting that our
