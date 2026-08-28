@@ -871,6 +871,9 @@ fn main() {
             // those, so the pairing that the interleave bought is not thrown away by
             // dividing two independently-computed medians. The range is printed because a
             // median that sits inside the spread of its own A/A nulls is not a result.
+            //
+            // `per_round` is built BEFORE the medians because `median` takes its vector by
+            // value; the other order does not compile, and a merge put it back once.
             let mut per_round: Vec<f64> = on_ms
                 .iter()
                 .zip(off_ms.iter())
