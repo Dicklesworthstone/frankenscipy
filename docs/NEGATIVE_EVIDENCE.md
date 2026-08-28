@@ -41578,3 +41578,93 @@ reproduced to 0.1 across builds and across that load range.
 block above `gamma_core`; it could not be committed because a peer holds an exclusive
 reservation on that file, which was not overridden. This ledger row is the durable record
 either way.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL): every remote A/B run through an `FSCI_SPECIAL_*` knob compared a binary against ITSELF, because `.rch.env` forwards neither (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`.
+run on worker hz2 with `RCH_WORKER=hz2`, `same_host=hetzner2` as the binary itself
+reported it, harness=perf_special_vs_scipy, live
+`scipy=1.17.1 numpy=2.4.3` in the same process.
+
+**The defect, and it silently invalidated the method it was serving**
+
+Builds are remote. The prescribed way to compare two arms was therefore to select the arm
+with an environment variable and issue two `rch exec` invocations. That does not work, and
+it does not fail loudly:
+
+    .rch.env:  RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,FSCI_REQUIRE_SCIPY_ORACLE
+
+The allowlist is exhaustive. **No `FSCI_SPECIAL_*` variable reaches the worker at all** — not
+the arm toggles, not `FSCI_SPECIAL_OPS`, not `FSCI_SPECIAL_XMIN`/`XMAX`, not
+`FSCI_SPECIAL_ROUNDS`, not `FSCI_SPECIAL_PROBE`. Every such run executes the harness's
+compiled-in defaults, so two invocations that differ only in an `FSCI_SPECIAL_*` setting are
+the same program twice.
+
+**Two-arm evidence, both arms observed.** One invocation set the toggle on and one set it
+off. The binary reported, from inside itself, on both:
+
+    arm=1   gammaln_cephes_lgam=true   elf_sha256=48b6458542cbd29f0b83712497f2b90ba31b8003509509a474d39b6aceffa877
+    arm=0   gammaln_cephes_lgam=true   elf_sha256=48b6458542cbd29f0b83712497f2b90ba31b8003509509a474d39b6aceffa877
+
+Identical toggle state, identical executable, and identical agreement figures
+(`max_abs=2.22044604925031308e-15` on both) — one program, run twice.
+
+**What makes this worth a row rather than a footnote: the self-comparison did not look
+degenerate.** The two runs of that identical binary did not report the same numbers as each
+other, so the output had every appearance of an A/B with a real effect in it, and nothing in
+the run announced that the two arms were one arm. The figures are in the commit message as
+diagnostics; this row banks no timing and none is needed, because the defect is settled by
+the toggle state and the executable digest above.
+
+**The `op=` echo is NOT a control for this.** It was previously read as one. It is not:
+`gammaln` is in the harness's default case list, so it is echoed whether or not
+`FSCI_SPECIAL_OPS` arrived. A must-hit control has to be a value that can only appear if the
+input took effect.
+
+**The fix, in the harness rather than in the fleet config**
+
+The arms are now switched **in-process**, interleaved round by round with the same
+position-balancing the SciPy comparison uses, with a two-sided control on the hit counter
+(`on_hits` must be non-zero and `off_hits` must be zero — both observed, `on_hits=1
+off_hits=0`). Nothing depends on an environment variable surviving the `rch` boundary.
+
+The same binary now also self-reports host provenance from the worker, before and after the
+timed region, because a row assembled from the local machine names the wrong host:
+
+    provenance_before host=hetzner2 cpu_model=AMD_EPYC-Genoa_Processor physical_cores=16
+      logical_threads=16 ram_kb=32078328 numa_nodes=1 governor=unknown
+      loadavg=[8.12 9.79 9.52 9/1939 1122686]
+    provenance_after  ... loadavg=[14.44 11.14 9.97 4/1945 1154536]
+
+**The behavioural result: Cephes `lgam` agrees with the incumbent far more closely**
+
+With the arms genuinely switched, both were checked elementwise against live SciPy's own
+output over 200000 points on `[0.01, 60]`, `compared=200000 nonfinite_mismatch=0`:
+
+    arm=on   (Cephes one-log lgam)   max_abs=2.22044604925031308e-15
+    arm=off  (Lanczos band)          max_abs=2.84217094304040074e-14
+
+A 12.8-fold reduction in worst-case absolute disagreement with the oracle. Reproduced
+identically on four separate invocations and on two distinct executables, which is what
+`BEHAVIORAL` rests on rather than a clock.
+
+**Quote `max_abs`, not `max_rel`, for this function.** The same runs report
+`max_rel=4.45e-11` for the Lanczos arm, which overstates the case: `gammaln` has zeros at
+x=1 and x=2, both inside the fixture, and relative error is unbounded next to a zero. The
+absolute figure is the honest one.
+
+**No speed verdict is banked here, and that is the point**
+
+The premise being tested was that `gammaln`'s deficit is its two logarithms, so Cephes'
+one-log rational should pay. This row does not decide that, and deliberately banks nothing
+about it: the worker could not be quiesced for any of the four attempts — the bracketing
+readings above show loadavg rising from 8.12 to 14.44 on a 16-core host during a single run
+— and in every attempt the observed effect fell inside that attempt's own A/A null. The
+attempts are recorded in the commit message as diagnostics explicitly not offered as a
+result.
+
+The reusable part is the ordering, not the outcome: as the A/A nulls tightened across the
+four attempts the apparent effect moved monotonically toward unity. An effect that shrinks
+as its own control improves is the control, not the code.

@@ -334,6 +334,83 @@ fn elf_sha256() -> String {
         .to_owned()
 }
 
+/// Host provenance, printed by the binary that is actually being timed.
+///
+/// WHY IT IS SELF-REPORTED. Builds are remote, so the machine that runs the benchmark is
+/// not the machine the agent is typing on, and a row that names the local box names the
+/// wrong host. Every field here is read on the worker, in the timed process, by the same
+/// executable whose SHA-256 is printed next to it — so "which host, which binary" is one
+/// answer rather than two claims that have to be trusted to match.
+///
+/// A ledger row is required to carry this, and until now it was assembled by hand from the
+/// wrong machine. Fields that cannot be read return `unknown` rather than a plausible
+/// default: a fabricated governor is worse than an absent one.
+fn host_provenance() -> String {
+    let read = |path: &str| std::fs::read_to_string(path).ok();
+    let first_line =
+        |path: &str| read(path).map(|s| s.lines().next().unwrap_or("").trim().to_owned());
+
+    let hostname = first_line("/proc/sys/kernel/hostname").unwrap_or_else(|| "unknown".into());
+    let logical = std::thread::available_parallelism()
+        .map(|n| n.get().to_string())
+        .unwrap_or_else(|_| "unknown".into());
+
+    let cpuinfo = read("/proc/cpuinfo").unwrap_or_default();
+    let model = cpuinfo
+        .lines()
+        .find(|l| l.starts_with("model name"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().replace(' ', "_"))
+        .unwrap_or_else(|| "unknown".into());
+    // Physical cores = distinct (physical id, core id) pairs. Counting `processor` lines
+    // instead would report SMT siblings as cores and silently double the number.
+    let mut cores: Vec<(&str, &str)> = Vec::new();
+    let (mut pkg, mut core) = ("", "");
+    for line in cpuinfo.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            match k.trim() {
+                "physical id" => pkg = v.trim(),
+                "core id" => {
+                    core = v.trim();
+                    if !cores.contains(&(pkg, core)) {
+                        cores.push((pkg, core));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let physical = if cores.is_empty() {
+        "unknown".to_owned()
+    } else {
+        cores.len().to_string()
+    };
+
+    let ram_kb = read("/proc/meminfo")
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal"))
+                .and_then(|l| l.split_whitespace().nth(1).map(str::to_owned))
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let numa = std::fs::read_dir("/sys/devices/system/node")
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("node"))
+                .count()
+                .to_string()
+        })
+        .unwrap_or_else(|_| "unknown".into());
+    let governor = first_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        .unwrap_or_else(|| "unknown".into());
+    let loadavg = first_line("/proc/loadavg").unwrap_or_else(|| "unknown".into());
+
+    format!(
+        "host={hostname} cpu_model={model} physical_cores={physical} logical_threads={logical} \
+         ram_kb={ram_kb} numa_nodes={numa} governor={governor} loadavg=[{loadavg}]"
+    )
+}
+
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
@@ -568,6 +645,7 @@ fn main() {
     }
 
     println!("elf_sha256={}", elf_sha256());
+    println!("provenance_before {}", host_provenance());
     println!("n={n} gammaln_crossover={}", {
         let bits = fsci_special::GAMMALN_ASYMPTOTIC_MIN_OVERRIDE
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -900,6 +978,12 @@ fn main() {
             set(true);
         }
     }
+
+    // Printed AFTER the timed work as well as before it. A single reading taken at startup
+    // says the host was quiet when the process began and nothing about whether it stayed
+    // that way; the pair brackets the measurement, so a load spike that arrived mid-run is
+    // visible in the row rather than hidden inside a median.
+    println!("provenance_after {}", host_provenance());
 }
 
 /// The in-process A/B lever for an op, if it has one: a display name and a setter.
