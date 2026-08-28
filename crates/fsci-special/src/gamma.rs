@@ -324,13 +324,33 @@ fn gammaln_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
     match z {
         SpecialTensor::RealScalar(x) => gammaln_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
+            // The crossover is read ONCE for the whole batch rather than once per element.
+            // See `gammaln_scalar_with_threshold`; the value is identical, so this is
+            // bit-identical, and it takes an atomic load out of the hot loop.
+            let hoist = GAMMALN_HOIST_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
+            if !hoist {
+                return if values.len() >= GAMMA_FAMILY_PAR_MIN {
+                    par_map_light(values.len(), |i| gammaln_scalar(values[i], mode))
+                        .map(SpecialTensor::RealVec)
+                } else {
+                    values
+                        .iter()
+                        .map(|&x| gammaln_scalar(x, mode))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(SpecialTensor::RealVec)
+                };
+            }
+            GAMMALN_HOIST_THRESHOLD_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let min_x = gammaln_asymptotic_min_x();
             if values.len() >= GAMMA_FAMILY_PAR_MIN {
-                par_map_light(values.len(), |i| gammaln_scalar(values[i], mode))
-                    .map(SpecialTensor::RealVec)
+                par_map_light(values.len(), |i| {
+                    gammaln_scalar_with_threshold(values[i], mode, min_x)
+                })
+                .map(SpecialTensor::RealVec)
             } else {
                 values
                     .iter()
-                    .map(|&x| gammaln_scalar(x, mode))
+                    .map(|&x| gammaln_scalar_with_threshold(x, mode, min_x))
                     .collect::<Result<Vec<_>, _>>()
                     .map(SpecialTensor::RealVec)
             }
@@ -985,6 +1005,29 @@ pub(crate) fn gamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialErro
 }
 
 pub fn gammaln_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+    gammaln_scalar_with_threshold(x, mode, gammaln_asymptotic_min_x())
+}
+
+/// `gammaln_scalar` with the Lanczos/asymptotic crossover passed IN rather than read from
+/// the process-global override on every call.
+///
+/// WHY THIS SPLIT EXISTS. `gammaln_asymptotic_min_x()` is an atomic load, and the batch
+/// entry point calls `gammaln_scalar` once per element, so the load sat INSIDE the hot
+/// loop. A relaxed load is one instruction but it is also an optimisation barrier: the
+/// compiler may not hoist it, fold the comparison against a constant, or vectorise across
+/// it, because another thread is permitted to change the value between two elements. This
+/// crate has already paid for that exact shape once — a toggle read inside a per-item loop
+/// cost 13% — and the fix is the same: read it ONCE at the call boundary and pass a value.
+///
+/// BIT-IDENTICAL by construction: the threshold is the same `f64` either way and nothing
+/// else in the body changes. The only observable difference is that a batch now uses one
+/// consistent threshold for every element instead of re-reading a value that a test knob
+/// could in principle change mid-batch — which is strictly more correct, not less.
+fn gammaln_scalar_with_threshold(
+    x: f64,
+    mode: RuntimeMode,
+    asymptotic_min_x: f64,
+) -> Result<f64, SpecialError> {
     if x.is_nan() {
         return Ok(f64::NAN);
     }
@@ -1018,7 +1061,7 @@ pub fn gammaln_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     }
 
     let output = if x >= 0.5 {
-        if x < gammaln_asymptotic_min_x() {
+        if x < asymptotic_min_x {
             lngamma_lanczos(x)
         } else {
             lngamma_positive(x)
@@ -1191,6 +1234,18 @@ fn lngamma_lanczos(x: f64) -> f64 {
 
     let t = x + 6.5;
     // ln(Γ(x)) = ln(sqrt(2π)) + (x-0.5)ln(t) - t + ln(coeff_sum)
+    // `0.5 * (2.0 * PI).ln()` LOOKS like a libm call per element — `f64::ln` is not a
+    // `const fn`, so nothing in the language guarantees it is folded. MEASURED, and it is:
+    // replacing it with the literal `HALF_LN_2PI` (0x3fed67f1c864beb4) changed the
+    // instruction count by NOTHING, in every band, both kernels —
+    //
+    //     band          literal   runtime ln
+    //     [0.5, 19.9]     248.3        248.3   ins/elem
+    //     [20.1, 60]      181.3        181.2
+    //     [0.01, 60]      204.7        204.7
+    //
+    // — so LLVM constant-folds it and the "obvious" win is worth zero. Left as the
+    // expression, which reads better than a magic constant. Do not re-derive this.
     0.5 * (2.0 * PI).ln() + (x - 0.5) * t.ln() - t + coeff_sum.ln()
 }
 
@@ -1963,6 +2018,34 @@ fn lngamma_positive(x: f64) -> f64 {
 /// much of a caller's input lies in [20, 100). For inputs below 20 it is worth nothing.
 pub const GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT: f64 = 20.0;
 
+/// Read the Lanczos/asymptotic crossover ONCE per batch instead of once per element
+/// (`true`, shipping). Bit-identical: the threshold is the same `f64` either way.
+///
+/// Measured because the banked plan for this cell was wrong. The recorded diagnosis was
+/// that `gammaln` is 2.07x slower because the Lanczos kernel does 8 divisions and 2 logs,
+/// and that the fix is to adopt Cephes' `lgam`. Instruction counts per element, by band,
+/// against live SciPy on the identical fixture, say otherwise:
+///
+/// ```text
+/// band            fsci    scipy   ratio
+/// [0.5, 19.9]    243.3    154.1   1.58x   Lanczos
+/// [20.1, 60]     175.3    121.1   1.45x   asymptotic — SAME algorithm as Cephes
+/// [0.01, 60]     199.0    132.3   1.50x   shipping mix
+/// ```
+///
+/// The asymptotic band is one log and one divide in BOTH implementations and is still
+/// 1.45x, so most of the gap is per-element overhead that no kernel swap can reach.
+/// Replacing the Lanczos kernel with a free one would move the mix only 199.0 -> 177.2.
+pub static GAMMALN_HOIST_THRESHOLD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Batches that took the hoisted-threshold arm — "enabled" is not "took effect".
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result, so output is bit-identical
+/// whether or not anyone reads it.
+pub static GAMMALN_HOIST_THRESHOLD_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Override for [`GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT`], as raw `f64` bits; 0 means "use the
 /// default". Exists so the two kernels can be compared against SciPy on IDENTICAL inputs
 /// rather than argued about from truncation-error algebra.
@@ -1986,6 +2069,7 @@ fn gammaln_asymptotic_min_x() -> f64 {
 
 /// Stirling series for lnΓ(x), valid for large x.
 fn stirling_lngamma(x: f64) -> f64 {
+    // Folded by LLVM; see the note in `lngamma_lanczos`. Measured, not assumed.
     let half_ln_2pi = 0.5 * (2.0 * PI).ln();
     let inv = 1.0 / x;
     let inv2 = inv * inv;
@@ -3691,6 +3775,63 @@ fn complex_parameter_gammaincc_cf(a: Complex64, z: Complex64) -> Result<Complex6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ONE lock for every test that writes a gamma-family perf toggle.
+    ///
+    /// These are process-global `static`s and `cargo test` runs tests concurrently, so two
+    /// tests flipping toggles at once produce both false drift and, worse, a masked pass —
+    /// this workspace has already had bit-identity tests fail 2 runs in 3 on a clean tree
+    /// for exactly that reason. A SECOND lock for this state would be a bug, not extra
+    /// safety: two locks protect nothing while reading as handled. If a new gamma toggle
+    /// needs a lock, it needs THIS one.
+    static GAMMA_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn gamma_toggle_lock() -> std::sync::MutexGuard<'static, ()> {
+        GAMMA_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Drives `GAMMALN_HOIST_THRESHOLD` in BOTH settings through the BATCH entry point,
+    /// which is the only place the hoist exists, and pins bit-identity plus the hit
+    /// counter. The fixture is sized above `GAMMA_FAMILY_PAR_MIN` so the parallel arm —
+    /// the one that actually ships for a large array — is the one under test.
+    #[test]
+    fn gammaln_hoist_threshold_arms_agree_bit_for_bit() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = gamma_toggle_lock();
+
+        let n = GAMMA_FAMILY_PAR_MIN + 4096;
+        let values: Vec<f64> = (0..n).map(|i| 0.01 + (i % 6000) as f64 * 0.01).collect();
+        let tensor = SpecialTensor::RealVec(values);
+
+        let restore = GAMMALN_HOIST_THRESHOLD.load(Relaxed);
+        let mut arms = Vec::with_capacity(2);
+        for enabled in [true, false] {
+            GAMMALN_HOIST_THRESHOLD.store(enabled, Relaxed);
+            let before = GAMMALN_HOIST_THRESHOLD_HITS.load(Relaxed);
+            let out = gammaln(&tensor, RuntimeMode::Strict).expect("gammaln batch");
+            let hits = GAMMALN_HOIST_THRESHOLD_HITS.load(Relaxed) - before;
+            let SpecialTensor::RealVec(v) = out else {
+                panic!("expected RealVec")
+            };
+            arms.push((v, hits));
+        }
+        GAMMALN_HOIST_THRESHOLD.store(restore, Relaxed);
+
+        assert_eq!(
+            arms[0].1, 1,
+            "hoisted arm did not run; the check is vacuous"
+        );
+        assert_eq!(arms[1].1, 0, "disabled arm still hoisted");
+        let differing = arms[0]
+            .0
+            .iter()
+            .zip(&arms[1].0)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "hoisting the threshold changed {differing} values"
+        );
+    }
 
     #[test]
     fn gamma_scalar_returns_a_signed_infinity_at_zero() {

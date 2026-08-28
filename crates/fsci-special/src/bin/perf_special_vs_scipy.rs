@@ -223,6 +223,15 @@ fn main() {
             .store(x.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
+    // `FSCI_SPECIAL_GAMMALN_HOIST=0` restores the per-element read of the Lanczos/asymptotic
+    // crossover, so the batch-level hoist can be A/B'd inside ONE binary.
+    let hoist = !matches!(
+        std::env::var("FSCI_SPECIAL_GAMMALN_HOIST").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::GAMMALN_HOIST_THRESHOLD.store(hoist, std::sync::atomic::Ordering::Relaxed);
+    println!("gammaln_hoist_threshold={hoist}");
+
     // `FSCI_SPECIAL_ZETA_EARLY=0` restores the unconditional eight-term direct prefix, so
     // the early exit can be A/B'd inside ONE binary. Without this the two "arms" are the
     // same arm and the comparison is inert — which is exactly how it first read.
@@ -310,16 +319,26 @@ fn main() {
         //   gammaln/digamma: 0.01 .. 60      (reflection, series and asymptotic all live)
         //   erf:            -6   .. 6        (series core, continued fraction, saturated tail)
         //   zeta:            1.5 .. 30       (above the pole, into where the sum truncates fast)
-        let x: Vec<f64> = (0..n)
-            .map(|i| {
-                let u = unit(i);
-                match op {
-                    "gammaln" | "digamma" => 0.01 + u * 59.99,
-                    "erf" => -6.0 + u * 12.0,
-                    _ => 1.5 + u * 28.5,
-                }
-            })
-            .collect();
+        //
+        // `FSCI_SPECIAL_XMIN`/`FSCI_SPECIAL_XMAX` narrow the domain to ONE band, which is
+        // how the per-branch instruction counts are taken. The default spans everything;
+        // a band is a diagnostic, never the headline, because a fixture confined to one
+        // branch is exactly what the paragraph above warns against.
+        let (lo, hi) = match op {
+            "gammaln" | "digamma" => (0.01_f64, 60.0_f64),
+            "erf" => (-6.0, 6.0),
+            _ => (1.5, 30.0),
+        };
+        let lo = std::env::var("FSCI_SPECIAL_XMIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(lo);
+        let hi = std::env::var("FSCI_SPECIAL_XMAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(hi);
+        println!("n={n} op={op} domain=[{lo}, {hi}]");
+        let x: Vec<f64> = (0..n).map(|i| lo + unit(i) * (hi - lo)).collect();
 
         let mut scipy = Scipy::start(op, &x);
         println!("{}", scipy.ready);
@@ -341,6 +360,33 @@ fn main() {
         };
 
         black_box(ours());
+
+        // `FSCI_SPECIAL_PROBE=<k>` runs EXACTLY k calls of our arm and exits before SciPy
+        // is ever timed. It exists so `perf stat --no-inherit -e instructions` divided by
+        // `k * n` is an instructions-per-element figure with NOTHING else in it.
+        //
+        // Reading that number off the full A/B run does not work and the failure is quiet:
+        // the harness executes a fixed but unstated number of timing ROUNDS, so a
+        // per-element figure computed from the whole run is inflated by that multiplier and
+        // looks like ~1750 instructions for a kernel that is one log and one divide. The
+        // BAND-TO-BAND RATIO survives that error, which is exactly why it is easy to keep
+        // and quote a number that is wrong by an unknown constant factor.
+        if let Ok(k) = std::env::var("FSCI_SPECIAL_PROBE") {
+            let k: usize = k.parse().expect("FSCI_SPECIAL_PROBE must be an integer");
+            let started = Instant::now();
+            for _ in 0..k {
+                black_box(ours());
+            }
+            let ms = started.elapsed().as_secs_f64() * 1.0e3;
+            println!(
+                "PROBE op={op} calls={k} n={n} elements={} ms={ms:.3} hoist_hits={}",
+                k * n,
+                fsci_special::GAMMALN_HOIST_THRESHOLD_HITS
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            );
+            continue;
+        }
+
         let _ = scipy.time(1, 1);
 
         // Calibrate off the FASTEST of several calls: one call carries cold caches and any
