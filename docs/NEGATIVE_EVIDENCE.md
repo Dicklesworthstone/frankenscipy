@@ -41443,3 +41443,83 @@ against side 16 -- specifically `factorize_csr`, `from_factor_rows` and the orde
 `apply_sorted_pivot_tail`. If the one-time terms shrink as a share while the elimination holds, the
 small-n penalty is amortisable overhead and that is a cheaper, better-aimed lever than anything now
 on `llywn.3`. Counted, so no quiet host is required.
+
+---
+
+## 2026-08-27 REJECT: gammaln's gap is NOT the Lanczos kernel, so the banked Cephes `lgam` rewrite would not have paid (BlackThrush)
+
+Result class: REJECT. Counted mechanism, not a timing claim: the refutation is an
+instruction census, and the two candidate levers are priced in instructions per element.
+
+**The banked plan.** `gammaln` was recorded as the suite's worst cell at 2.07x slower, with
+the cause named as our 9-term Lanczos doing 8 divisions and 2 logs per element against
+Cephes' single log, and the fix named as adopting Cephes `lgam` wholesale — a deliberate
+numerical change to a core function with dependents (betaln, poch, the beta family) —
+projected at 1.5-1.7x on instructions.
+
+**What the counts say.** Per element, `perf stat --no-inherit`, arm isolated by the slope
+between `FSCI_SPECIAL_PROBE=40` and `=200` so fixed harness overhead cancels exactly, both
+arms on the identical fixture (the Python probe reproduces the Rust harness's Knuth hash,
+so the two see the same values and not merely the same band), `taskset -c 4`, executed-binary
+sha256=6f08d6286fc1149df4d1406a587c7d515463ac37228fd5e739b7192e9b2fd662:
+
+    band                     fsci ins/elem   IPC    scipy ins/elem   IPC    ratio
+    [0.5, 19.9]  Lanczos             243.3  3.01             154.1  3.28    1.58x
+    [20.1, 60]   asymptotic          175.3  3.27             121.1  3.13    1.45x
+    [0.01, 0.49] reflection          386.5  2.64                 -     -        -
+    [0.01, 60]   shipping mix        199.0  2.96             132.3  3.20    1.50x
+
+The asymptotic band is one log and one divide in BOTH implementations and is still 1.45x
+behind, so most of the gap sits where the algorithms already agree and no kernel swap can
+reach it. Two thirds of the shipping fixture lives in that band, because the crossover was
+lowered to 20 in frankenscipy-tubnb; only about a third ever reaches the Lanczos kernel.
+Making that kernel entirely free would move the mix from 199.0 to 177.2 instructions per
+element, which does not reach SciPy's 132.3, let alone the projected 1.5-1.7x.
+
+**The control that settles it.** `erf`, measured the same way through the SAME per-element
+machinery (a `Result<f64, SpecialError>` per element, collected), costs 69.3 instructions
+per element in total and BEATS SciPy at 0.48x against its 144.6. So the wrapper is roughly
+20-30 instructions, not the ~130 that a first reading of the gammaln numbers suggests, and
+gammaln's remainder is genuinely its own prologue and kernel. Without that arm the natural
+conclusion — "the batch wrapper is the problem" — is wrong and would have aimed the next
+pass at nothing.
+
+**Correctness is unchanged**, checked against live SciPy 1.17.1 in the same invocation by
+shipping our result back to the Python child: compared=200000, nonfinite_mismatch=0,
+agreement max_abs=2.84e-14.
+
+**NO TIMED ROW IS BANKED HERE, deliberately.** The end-to-end cell was re-measured and reads
+better than the recorded 2.07x, but that came from a single run without a bootstrap-median
+CI, on a host whose loadavg ranged 14 to 195, so it does not meet this ledger's timed bar and
+is not recorded as a number. The claim above is a counted one and stands on the instruction
+census alone. Anyone wanting the cell should re-measure it to the timed standard; the point
+of this row is that the KERNEL is the wrong target, which counting settles without a clock.
+
+**KEPT, in 7134bc86e.** Reading the Lanczos/asymptotic crossover once per batch instead of
+once per element — it is an atomic load and the batch entry called `gammaln_scalar` per
+element, so it sat in the hot loop. Bit-identical, arm proven by `hoist_hits`; instructions
+per element 243.3 vs 240.3, 176.3 vs 173.2 and 199.5 vs 196.7 across the three bands, about
+1.4%, reproducing to 0.1 across separate builds. That is exactly the cost of a
+load-compare-select: my hypothesis was that the load was a large optimisation barrier and
+its own size refutes that.
+
+**Priced in instructions for a reason.** In the same runs the CYCLE column moved the WRONG
+WAY in one band, 78.3 against 80.0, while instructions were flat. Host loadavg ranged from
+14 to 195 during this session, so a 1.4% effect is invisible to wall clock here and exactly
+resolvable by counting.
+
+**REJECTED AND REVERTED: the `ln(2π)/2` literal.** `f64::ln` is not a `const fn`, so
+`0.5 * (2.0 * PI).ln()` looks like a libm call per element in both kernels. Measured with a
+toggle selecting the two forms, instructions per element are identical at 248.3 vs 248.3,
+181.3 vs 181.2 and 204.7 vs 204.7 — LLVM already constant-folds it and no work was removed.
+Reverted rather than shipped, because reading the selector flag added a per-call atomic that
+cost about 8 instructions per element in the Lanczos band, 240.3 vs 248.3, so the instrument
+was dearer than the thing it measured. A note at the call site records this so it is not
+re-derived.
+
+**What the next pass should target: not the kernel.** The per-element prologue —
+`is_negative_integer_pole` (`is_finite`, `< 0`, `fract() == 0`), the `x == 0` / `x == 1` /
+`x == 2` exactness branches (the last two are a required parity fix, frankenscipy-dwd3d),
+the `is_finite(output)` trace check, and the `Result` per element. That is where the ~35
+instructions per element over SciPy in the asymptotic band live. Cephes' own `lgam` performs
+no per-element pole test at all for `x > -34`.
