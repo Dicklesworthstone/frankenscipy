@@ -232,6 +232,15 @@ fn main() {
     fsci_special::GAMMALN_HOIST_THRESHOLD.store(hoist, std::sync::atomic::Ordering::Relaxed);
     println!("gammaln_hoist_threshold={hoist}");
 
+    // `FSCI_SPECIAL_PREALLOC=0` restores `collect::<Result<Vec<_>, _>>()` in the shared
+    // gamma-family array mapper, so the preallocated fill can be A/B'd inside ONE binary.
+    let prealloc = !matches!(
+        std::env::var("FSCI_SPECIAL_PREALLOC").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
+    println!("gamma_family_prealloc_fill={prealloc}");
+
     // `FSCI_SPECIAL_ZETA_EARLY=0` restores the unconditional eight-term direct prefix, so
     // the early exit can be A/B'd inside ONE binary. Without this the two "arms" are the
     // same arm and the comparison is inert — which is exactly how it first read.
@@ -379,9 +388,12 @@ fn main() {
             }
             let ms = started.elapsed().as_secs_f64() * 1.0e3;
             println!(
-                "PROBE op={op} calls={k} n={n} elements={} ms={ms:.3} hoist_hits={}",
+                "PROBE op={op} calls={k} n={n} elements={} ms={ms:.3} hoist_hits={} \
+                 prealloc_hits={}",
                 k * n,
                 fsci_special::GAMMALN_HOIST_THRESHOLD_HITS
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                fsci_special::GAMMA_FAMILY_PREALLOC_FILL_HITS
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
             continue;

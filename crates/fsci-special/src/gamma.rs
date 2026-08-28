@@ -201,7 +201,7 @@ pub fn loggamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 /// Complex64); infallible complex kernels wrap their result in `Ok`.
 fn par_map_indices<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
 where
-    T: Send,
+    T: Send + Default + Copy,
     H: Fn(usize) -> Result<T, SpecialError> + Sync,
 {
     let nthreads = if n < 256 {
@@ -227,7 +227,7 @@ where
 /// output stays byte-identical to the serial map.
 fn par_map_light<T, H>(n: usize, f: H) -> Result<Vec<T>, SpecialError>
 where
-    T: Send,
+    T: Send + Default + Copy,
     H: Fn(usize) -> Result<T, SpecialError> + Sync,
 {
     let nthreads = if n < 256 {
@@ -242,38 +242,102 @@ where
     par_map_indices_with_threads(n, nthreads, f)
 }
 
+/// Write `f(base + k)` into `out[k]`, stopping at the first error in index order.
+///
+/// Iterating `out` by `iter_mut` rather than by index is deliberate: there is no bound to
+/// check, so the write is a plain store.
+fn fill_indices<T, H>(out: &mut [T], base: usize, f: &H) -> Result<(), SpecialError>
+where
+    H: Fn(usize) -> Result<T, SpecialError>,
+{
+    for (offset, slot) in out.iter_mut().enumerate() {
+        *slot = f(base + offset)?;
+    }
+    Ok(())
+}
+
 fn par_map_indices_with_threads<T, H>(
     n: usize,
     nthreads: usize,
     f: H,
 ) -> Result<Vec<T>, SpecialError>
 where
-    T: Send,
+    T: Send + Default + Copy,
     H: Fn(usize) -> Result<T, SpecialError> + Sync,
 {
-    if nthreads <= 1 {
-        return (0..n).map(&f).collect();
+    // COLLECTING A `Result` PER ELEMENT COSTS MORE THAN THE LOG IT WRAPS.
+    //
+    // `(0..n).map(f).collect::<Result<Vec<T>, _>>()` routes every element through
+    // `GenericShunt`, the adapter that lets a fallible iterator collect into a `Vec`. It
+    // cannot use the size hint to preallocate — the iterator may stop early — so each
+    // element pays a capacity check and a discriminant test, and the compiler cannot turn
+    // the body into a straight store. Profiled on `gammaln` at n=200000, x in [20.1, 60],
+    // instructions attributed by symbol:
+    //
+    //     gammaln_scalar_with_threshold   50.5%   (the kernel itself)
+    //     ...GenericShunt...::from_iter   26.1%   <- this
+    //     __ieee754_log_fma + log@plt     22.0%
+    //
+    // 26% of the op, in the collect. Allocating the output up front and writing each slot
+    // through `iter_mut` removes the adapter entirely; the buffer is `vec![T::default();
+    // n]`, NOT `with_capacity` + `push`, because a push-built buffer keeps a growing `len`
+    // that turns every later write into a bounds check LLVM cannot hoist — that swap cost
+    // 46% elsewhere in this workspace. The zeroing pass really is dead work and keeping it
+    // is still faster.
+    //
+    // BIT-IDENTICAL: same `f`, same indices, same order, and the first error in index
+    // order is still the one returned. Only the destination changes.
+    //
+    // The parallel arm additionally drops a whole copy of the output: it used to build one
+    // `Vec` per thread and concatenate them, and now each thread fills its own disjoint
+    // `chunks_mut` slice of the final buffer.
+    if !GAMMA_FAMILY_PREALLOC_FILL.load(std::sync::atomic::Ordering::Relaxed) {
+        if nthreads <= 1 {
+            return (0..n).map(&f).collect();
+        }
+        let chunk = n.div_ceil(nthreads);
+        let f = &f;
+        let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
+            (0..nthreads)
+                .filter_map(|t| {
+                    let i0 = t * chunk;
+                    if i0 >= n {
+                        return None;
+                    }
+                    let i1 = (i0 + chunk).min(n);
+                    Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("gamma array worker panicked"))
+                .collect()
+        });
+        let mut out = Vec::with_capacity(n);
+        for cr in chunk_results {
+            out.extend(cr?);
+        }
+        return Ok(out);
+    }
+
+    GAMMA_FAMILY_PREALLOC_FILL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut out = vec![T::default(); n];
+    if nthreads <= 1 || n == 0 {
+        fill_indices(&mut out, 0, &f)?;
+        return Ok(out);
     }
     let chunk = n.div_ceil(nthreads);
     let f = &f;
-    let chunk_results: Vec<Result<Vec<T>, SpecialError>> = std::thread::scope(|scope| {
-        (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || (i0..i1).map(f).collect::<Result<Vec<T>, _>>()))
-            })
+    let results: Vec<Result<(), SpecialError>> = std::thread::scope(|scope| {
+        out.chunks_mut(chunk)
+            .enumerate()
+            .map(|(t, slice)| scope.spawn(move || fill_indices(slice, t * chunk, f)))
             .collect::<Vec<_>>()
             .into_iter()
             .map(|h| h.join().expect("gamma array worker panicked"))
             .collect()
     });
-    let mut out = Vec::with_capacity(n);
-    for cr in chunk_results {
-        out.extend(cr?);
+    for result in results {
+        result?;
     }
     Ok(out)
 }
@@ -2038,6 +2102,23 @@ pub const GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT: f64 = 20.0;
 /// Replacing the Lanczos kernel with a free one would move the mix only 199.0 -> 177.2.
 pub static GAMMALN_HOIST_THRESHOLD: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
+/// Fill a preallocated output buffer by index instead of collecting a `Result` per element
+/// (`true`, shipping). Bit-identical: same `f`, same indices, same order, same first error.
+///
+/// This is the shared mapper for the whole crate's array paths — 245 call sites across
+/// gamma, bessel, beta, elliptic, airy, error and hyper — so it is an articulation point
+/// rather than one kernel's tuning. Profiled on `gammaln`, the `collect::<Result<Vec<_>,
+/// _>>()` adapter was 26.1% of the op, more than the `log` it wraps.
+pub static GAMMA_FAMILY_PREALLOC_FILL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Array evaluations that took the preallocated-fill arm — "enabled" is not "took effect".
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result, so output is bit-identical
+/// whether or not anyone reads it.
+pub static GAMMA_FAMILY_PREALLOC_FILL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Batches that took the hoisted-threshold arm — "enabled" is not "took effect".
 ///
 /// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
@@ -3787,6 +3868,105 @@ mod tests {
     static GAMMA_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn gamma_toggle_lock() -> std::sync::MutexGuard<'static, ()> {
         GAMMA_TOGGLE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Drives `GAMMA_FAMILY_PREALLOC_FILL` in BOTH settings through the shared mapper
+    /// itself, on BOTH the serial and the threaded arm, and pins bit-identity plus error
+    /// propagation.
+    ///
+    /// Testing `par_map_indices_with_threads` directly rather than through `gammaln` is
+    /// deliberate: `nthreads` is chosen from `available_parallelism()`, so a test that went
+    /// through the public entry would exercise whichever arm the test host happened to
+    /// pick, and would silently stop covering the threaded path on a one-core runner.
+    #[test]
+    fn gamma_family_prealloc_fill_arms_agree_bit_for_bit() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = gamma_toggle_lock();
+
+        const N: usize = 9_997; // not a multiple of any thread count used below
+        let kernel = |i: usize| -> Result<f64, SpecialError> {
+            // Deliberately irrational per index so a mis-indexed slot cannot coincide.
+            Ok((i as f64 + 0.5).sqrt().sin() * 1.0e3 + i as f64)
+        };
+
+        let restore = GAMMA_FAMILY_PREALLOC_FILL.load(Relaxed);
+        let mut arms: Vec<(Vec<f64>, usize)> = Vec::new();
+        for enabled in [true, false] {
+            GAMMA_FAMILY_PREALLOC_FILL.store(enabled, Relaxed);
+            for threads in [1usize, 4] {
+                let before = GAMMA_FAMILY_PREALLOC_FILL_HITS.load(Relaxed);
+                let out = par_map_indices_with_threads(N, threads, kernel)
+                    .expect("infallible kernel must not error");
+                let hits = GAMMA_FAMILY_PREALLOC_FILL_HITS.load(Relaxed) - before;
+                assert_eq!(out.len(), N);
+                arms.push((out, hits));
+            }
+        }
+
+        // MUST-HIT / MUST-MISS: without these a build where the toggle did nothing would
+        // pass every equality below while comparing an arm against itself.
+        assert_eq!(arms[0].1, 1, "prealloc serial arm did not run");
+        assert_eq!(arms[1].1, 1, "prealloc threaded arm did not run");
+        assert_eq!(arms[2].1, 0, "disabled serial arm still preallocated");
+        assert_eq!(arms[3].1, 0, "disabled threaded arm still preallocated");
+
+        // All four must agree BIT for bit: prealloc vs collect, serial vs threaded.
+        for (label, other) in [
+            ("prealloc threaded", &arms[1].0),
+            ("collect serial", &arms[2].0),
+            ("collect threaded", &arms[3].0),
+        ] {
+            let differing = arms[0]
+                .0
+                .iter()
+                .zip(other)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                differing, 0,
+                "{label} differs from prealloc serial in {differing}"
+            );
+        }
+
+        // DETECTOR: every claim here is bit-identity, so "nothing differed" is also what a
+        // comparison too blunt to see anything prints. `to_bits`, not `==`.
+        let mut perturbed = arms[3].0.clone();
+        perturbed[N / 2] = f64::from_bits(perturbed[N / 2].to_bits() ^ 1);
+        let seen = arms[0]
+            .0
+            .iter()
+            .zip(&perturbed)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            seen, 1,
+            "the bit comparison cannot see a one-ULP difference"
+        );
+
+        // ERROR PROPAGATION is part of the contract this mapper had before: the FIRST
+        // failing index in index order is the error returned, on every arm. A prealloc
+        // buffer makes it easy to accidentally report a later chunk's error instead.
+        for enabled in [true, false] {
+            GAMMA_FAMILY_PREALLOC_FILL.store(enabled, Relaxed);
+            for threads in [1usize, 4] {
+                let failing = |i: usize| -> Result<f64, SpecialError> {
+                    if i == 17 || i == 8_000 {
+                        Err(SpecialError {
+                            function: "test",
+                            kind: SpecialErrorKind::DomainError,
+                            mode: RuntimeMode::Strict,
+                            detail: "seeded",
+                        })
+                    } else {
+                        Ok(i as f64)
+                    }
+                };
+                let err = par_map_indices_with_threads(N, threads, failing)
+                    .expect_err("seeded failure must propagate");
+                assert_eq!(err.function, "test", "prealloc={enabled} threads={threads}");
+            }
+        }
+        GAMMA_FAMILY_PREALLOC_FILL.store(restore, Relaxed);
     }
 
     /// Drives `GAMMALN_HOIST_THRESHOLD` in BOTH settings through the BATCH entry point,
