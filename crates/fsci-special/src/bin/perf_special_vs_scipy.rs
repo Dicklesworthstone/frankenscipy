@@ -320,6 +320,15 @@ fn main() {
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
 
+    // `FSCI_SPECIAL_RGAMMA_CHEB=0` restores `1.0 / gamma_scalar(x)` for |x| <= 4, so the
+    // Chebyshev series can be A/B'd -- for ACCURACY as much as cost -- in ONE binary.
+    let rgamma_cheb = !matches!(
+        std::env::var("FSCI_SPECIAL_RGAMMA_CHEB").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::RGAMMA_CEPHES_CHEB.store(rgamma_cheb, std::sync::atomic::Ordering::Relaxed);
+    println!("rgamma_cephes_cheb={rgamma_cheb}");
+
     // `FSCI_SPECIAL_GAMMA_RATIONAL=0` restores the Lanczos kernel for `Γ(x)` on
     // 0.5 <= x <= 33, so the Cephes rational can be A/B'd -- for ACCURACY as much as cost --
     // inside ONE binary against the same live SciPy arm. `rgamma` inherits it.

@@ -3755,7 +3755,7 @@ fn cephes_p1evl(x: f64, coef: &[f64]) -> f64 {
     coef.iter().fold(1.0, |acc, &c| acc * x + c)
 }
 
-fn cephes_chbevl(x: f64, coef: &[f64]) -> f64 {
+pub(crate) fn cephes_chbevl(x: f64, coef: &[f64]) -> f64 {
     let mut iter = coef.iter();
     let mut b0 = *iter.next().expect("non-empty Chebyshev coefficient table");
     let mut b1 = 0.0;

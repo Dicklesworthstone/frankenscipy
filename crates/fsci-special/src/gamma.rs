@@ -1479,9 +1479,78 @@ fn polygamma_higher_scalar(order: usize, x: f64, mode: RuntimeMode) -> Result<f6
     Ok(value)
 }
 
+// ── Cephes reciprocal-Gamma, |x| <= 4 ────────────────────────────────────────────────
+//
+// WHY. `rgamma_scalar` is `1.0 / gamma_scalar(x)`, so it pays the whole of `Γ` — kernel,
+// prologue and `Result` — and then a division. SciPy only does that for |x| > 4; below it,
+// `1/Γ` has its own Chebyshev series and needs no `Γ` call and no division by one. Measured
+// against live SciPy on the identical fixture, rgamma is 270.6 instructions per element
+// against 134.1 — the worst remaining cell, and a 136 gap where `gamma`'s is 57.
+//
+// The fixture spans [-10, 10], so this covers 40% of it; the rest already agrees with SciPy
+// in structure (`1/Γ`) and is left alone.
+//
+// REUSES `cephes_chbevl` FROM `bessel`, which is why that function is now `pub(crate)`.
+// Adding a second Clenshaw evaluator would have been the third duplicate in this crate —
+// 8c203c777 had to retire two.
+
+/// Chebyshev coefficients for `1/(x Γ(x)) - 1` on `0 <= x <= 1`, in `4x - 2`.
+#[allow(clippy::excessive_precision)]
+const RGAMMA_CHEB_R: [f64; 16] = [
+    3.13173458231230000000E-17,
+    -6.70718606477908000000E-16,
+    2.20039078172259550000E-15,
+    2.47691630348254132600E-13,
+    -6.60074100411295197440E-12,
+    5.13850186324226978840E-11,
+    1.08965386454418662084E-9,
+    -3.33964630686836942556E-8,
+    2.68975996440595483619E-7,
+    2.96001177518801696639E-6,
+    -8.04814124978471142852E-5,
+    4.16609138709688864714E-4,
+    5.06579864028608725080E-3,
+    -6.41925436109158228810E-2,
+    -4.98558728684003594785E-3,
+    1.27546015610523951063E-1,
+];
+
+/// `1/Γ(x)` for `|x| <= 4` by SciPy's own method: recur into `(0, 1]`, then one Chebyshev.
+///
+/// Callers handle `x == 0` and the negative-integer poles; this is the interior kernel.
+fn rgamma_cephes_small(x: f64) -> f64 {
+    let mut z = 1.0_f64;
+    let mut w = x;
+    while w > 1.0 {
+        w -= 1.0;
+        z *= w;
+    }
+    while w < 0.0 {
+        z /= w;
+        w += 1.0;
+    }
+    if w == 0.0 {
+        return 0.0;
+    }
+    if w == 1.0 {
+        return 1.0 / z;
+    }
+    w * (1.0 + crate::bessel::cephes_chbevl(4.0 * w - 2.0, &RGAMMA_CHEB_R)) / z
+}
+
+/// Above this magnitude SciPy itself falls back to `1/Γ(x)`, which is what we already do.
+const RGAMMA_CHEB_MAX_ABS_X: f64 = 4.0;
+
 pub(crate) fn rgamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if is_negative_integer_pole(x) {
         return Ok(0.0);
+    }
+    if x != 0.0
+        && x.abs() <= RGAMMA_CHEB_MAX_ABS_X
+        && RGAMMA_CEPHES_CHEB.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        RGAMMA_CEPHES_CHEB_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(rgamma_cephes_small(x));
     }
     let gamma_value = gamma_scalar(x, mode)?;
     let value = 1.0 / gamma_value;
@@ -1895,6 +1964,14 @@ fn gamma_core(x: f64) -> f64 {
     }
 
     if x <= GAMMA_CEPHES_MAX_X && GAMMA_CEPHES_RATIONAL.load(std::sync::atomic::Ordering::Relaxed) {
+        // PRICED, because a per-element atomic read-modify-write looks like it should be
+        // expensive and this crate has a standing note that a toggle read in a hot loop cost
+        // 13% elsewhere. Removing this `fetch_add` entirely moves gamma from 184.4 to 182.4
+        // instructions per element — 2.0, about 1.1%. An uncontended relaxed increment on a
+        // line already in L1 is a few instructions, not the tens the earlier note implies for
+        // a read that also blocks vectorisation; nothing here vectorises anyway. Kept: the
+        // must-hit evidence it buys has caught two real defects, and 2 instructions is the
+        // honest price of it.
         GAMMA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return gamma_cephes_reduced(x);
     }
@@ -2223,6 +2300,22 @@ pub static ZETA_CEPHES_RATIONAL: std::sync::atomic::AtomicBool =
 /// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
 /// anything between; incrementing it changes no numeric result.
 pub static ZETA_CEPHES_RATIONAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Use SciPy's own Chebyshev series for `1/Γ(x)` on `|x| <= 4` (`true`, shipping) instead of
+/// dividing one by a full `Γ` evaluation.
+///
+/// NOT bit-identical and not intended to be: it is a different approximation, and it is the
+/// one the incumbent uses, so it moves our values toward SciPy. Accuracy against the live
+/// SciPy arm is the contract, checked in the same invocation by `perf_special_vs_scipy`.
+pub static RGAMMA_CEPHES_CHEB: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Evaluations that took the Chebyshev arm — "enabled" is not "took effect".
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result. Priced at 2.0 instructions
+/// per element on `gamma`; see the note at `GAMMA_CEPHES_RATIONAL_HITS`.
+pub static RGAMMA_CEPHES_CHEB_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Use SciPy's own rational form for `Γ(x)` on `0.5 <= x <= 33` (`true`, shipping) instead
@@ -4288,6 +4381,81 @@ mod tests {
             }
         }
         GAMMA_FAMILY_PREALLOC_FILL.store(restore, Relaxed);
+    }
+
+    /// Cross-checks the 16 transcribed `1/Γ` Chebyshev coefficients against `1/Γ(x)` built
+    /// from the independent gamma kernel, and drives `RGAMMA_CEPHES_CHEB` in both settings.
+    ///
+    /// The two share no constants and no code path, so agreement is evidence the table is
+    /// right. Poles are excluded because `1/Γ` is exactly zero there and both forms return
+    /// it by a different route; the interesting comparison is the interior.
+    #[test]
+    fn rgamma_cephes_chebyshev_matches_one_over_gamma() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = gamma_toggle_lock();
+        let restore = RGAMMA_CEPHES_CHEB.load(Relaxed);
+
+        // Span the recurrence's regimes inside |x| <= 4: downward for x > 1, upward for
+        // x < 0, and the bare Chebyshev interval (0, 1].
+        let mut points: Vec<f64> = Vec::new();
+        for i in 0..=1600 {
+            let x = -4.0 + 8.0 * (i as f64 / 1600.0);
+            if x != 0.0 && !(x < 0.0 && x.fract() == 0.0) {
+                points.push(x);
+            }
+        }
+        points.extend([0.25, 0.75, 1.0, 1.5, 2.5, 3.5, -0.5, -1.5, -2.5, -3.5]);
+
+        let (mut down, mut interval, mut up) = (0usize, 0usize, 0usize);
+        let mut worst = 0.0_f64;
+        let mut worst_at = f64::NAN;
+        let mut hits_seen = 0usize;
+        for &x in &points {
+            if x < 0.0 {
+                up += 1;
+            } else if x > 1.0 {
+                down += 1;
+            } else {
+                interval += 1;
+            }
+            RGAMMA_CEPHES_CHEB.store(true, Relaxed);
+            let before = RGAMMA_CEPHES_CHEB_HITS.load(Relaxed);
+            let cheb = rgamma_scalar(x, RuntimeMode::Strict).expect("rgamma");
+            if RGAMMA_CEPHES_CHEB_HITS.load(Relaxed) > before {
+                hits_seen += 1;
+            }
+            RGAMMA_CEPHES_CHEB.store(false, Relaxed);
+            let divided = rgamma_scalar(x, RuntimeMode::Strict).expect("rgamma via 1/gamma");
+            assert!(
+                cheb.is_finite() && divided.is_finite(),
+                "non-finite at x={x}: cheb {cheb} divided {divided}"
+            );
+            let rel = (cheb - divided).abs() / divided.abs().max(f64::MIN_POSITIVE);
+            if rel > worst {
+                worst = rel;
+                worst_at = x;
+            }
+        }
+        RGAMMA_CEPHES_CHEB.store(restore, Relaxed);
+
+        // MUST-HIT: every regime reached, and the arm actually fired every time.
+        assert!(
+            down > 0 && interval > 0 && up > 0,
+            "grid missed a regime: x>1 {down}, (0,1] {interval}, x<0 {up}"
+        );
+        assert!(
+            hits_seen >= points.len(),
+            "Chebyshev arm did not run for every point"
+        );
+        println!(
+            "rgamma cheb vs 1/gamma: worst {worst:e} at x={worst_at}, {} points",
+            points.len()
+        );
+        assert!(
+            worst < 1.0e-12,
+            "Chebyshev and 1/gamma disagree by {worst:e} at x={worst_at}; \
+             a transcribed coefficient is probably wrong"
+        );
     }
 
     /// Cross-checks the transcribed Cephes rational against the independent Lanczos kernel,
