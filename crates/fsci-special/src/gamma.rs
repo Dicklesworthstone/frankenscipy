@@ -521,6 +521,29 @@ fn gammaln_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
                         .map(SpecialTensor::RealVec)
                 };
             }
+            // REJECTED LEVER, recorded so it is not retried: the infallible batch.
+            //
+            // Removing the per-element `Result` is worth 29 instructions per element on
+            // `gamma` and on `digamma` (5f2e3a66b, 9349fec6c). On `gammaln` it LOSES,
+            // measured on the identical fixture at loadavg under 7:
+            //
+            // ```text
+            // baseline, Result per element              183.1 ins/elem
+            // infallible batch via unwrap               208.1   (+25.0)
+            // infallible batch via an extracted value fn 200.1   (+17.0)
+            // ```
+            //
+            // The first form repeats the trap that cost `rgamma` 24 instructions: wrapping a
+            // value in `Ok` only to unwrap it still builds the ~56-byte `Result`. The second
+            // avoids that and STILL loses — splitting the body into a value function plus a
+            // fallible wrapper costs more at the call boundary than the `Result` it removes,
+            // and it makes the wrapper test the pole twice, which pushed the `Result` arm
+            // itself from 183.1 to 205.1.
+            //
+            // `gammaln` differs from `gamma` and `digamma` in that its scalar body is large
+            // and already does its own pole and zero tests, so there is no cheap infallible
+            // core to call the way `gamma_core` and `digamma_core` are. Left on the `Result`
+            // path deliberately.
             GAMMALN_HOIST_THRESHOLD_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let min_x = gammaln_asymptotic_min_x();
             if values.len() >= GAMMA_FAMILY_PAR_MIN {
@@ -2103,8 +2126,10 @@ fn clamp_unit_interval(value: f64) -> f64 {
 /// as a `bool` is the obvious fix and it MADE THINGS WORSE, measured on the identical
 /// fixture:
 ///
-///     gamma    184.4 -> 193.7 instructions per element   (+9.3)
-///     rgamma   225.3 -> 233.9                            (+8.6)
+/// ```text
+/// gamma    184.4 -> 193.7 instructions per element   (+9.3)
+/// rgamma   225.3 -> 233.9                            (+8.6)
+/// ```
 ///
 /// The predicate is three cheap integer ops on a value already in a register. Recomputing it
 /// where it is needed is cheaper than keeping a `bool` live across a call, which costs a
