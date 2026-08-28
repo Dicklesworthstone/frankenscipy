@@ -365,6 +365,64 @@ where
 /// kernels; the threshold is set conservatively so only large arrays parallelize.
 const GAMMA_FAMILY_PAR_MIN: usize = 1 << 17; // work-capped par_map_light wins from here
 
+/// Runtime override for [`GAMMA_FAMILY_PAR_MIN`]; `0` means "use the constant".
+///
+/// The threshold above was tuned once and then trusted. It decides whether a whole-array
+/// gamma-family call fans out across threads, and the answer is not a property of the array
+/// size alone — it depends on how many cores are actually FREE. This exists so the two
+/// choices can be timed against each other in one process on the machine that will run them,
+/// rather than inferred from a constant chosen on a different machine.
+///
+/// BIT-IDENTICAL either way: `map_real_infallible` and `par_map_light` give each index its own
+/// output slot and apply the same scalar kernel, so the serial and threaded paths agree
+/// element for element. Only the schedule changes.
+pub static GAMMA_FAMILY_PAR_MIN_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// BATCHES that took the SERIAL path. Pairs with [`GAMMA_FAMILY_PAR_MIN_OVERRIDE`] as the
+/// two-sided control: forcing serial must move it, leaving the default must not.
+///
+/// Counted once per batch, not per element, so it is not a call count. A diagnostic counter;
+/// incrementing it changes no numeric result.
+pub static GAMMA_FAMILY_SERIAL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The effective parallel-fan-out threshold for this batch.
+///
+/// Read ONCE per batch at the dispatch boundary and passed down as a `usize`, never consulted
+/// per element — a relaxed load inside a per-item loop is an optimisation barrier this crate
+/// has already paid 13% for.
+fn gamma_family_par_min() -> usize {
+    let override_value = GAMMA_FAMILY_PAR_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+    if override_value == 0 {
+        GAMMA_FAMILY_PAR_MIN
+    } else {
+        override_value
+    }
+}
+
+/// Record which schedule a batch of `n` elements took, and return whether it is parallel.
+fn gamma_family_is_parallel(n: usize) -> bool {
+    let parallel = n >= gamma_family_par_min();
+    if !parallel {
+        GAMMA_FAMILY_SERIAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    parallel
+}
+
+/// The threshold to hand to `map_real_infallible`, recording the schedule on the way.
+///
+/// `map_real_infallible` applies the `n < par_min` test itself, so this cannot return a bool;
+/// it returns the threshold and counts, keeping the control on the same footing as
+/// `gamma_family_is_parallel`.
+fn gamma_family_par_min_for(n: usize) -> usize {
+    let threshold = gamma_family_par_min();
+    if n < threshold {
+        GAMMA_FAMILY_SERIAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    threshold
+}
+
 /// Map an infallible `f64 -> f64` kernel over a slice, parallel over chunks above `par_min`.
 ///
 /// WHY THIS EXISTS ALONGSIDE `par_map_light`. That one takes `Fn(usize) -> Result<T, _>`, so
@@ -442,7 +500,7 @@ fn gamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) 
         SpecialTensor::RealScalar(x) => gamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
             if !GAMMA_INFALLIBLE_BATCH.load(std::sync::atomic::Ordering::Relaxed) {
-                return if values.len() >= GAMMA_FAMILY_PAR_MIN {
+                return if gamma_family_is_parallel(values.len()) {
                     par_map_light(values.len(), |i| gamma_scalar(values[i], mode))
                         .map(SpecialTensor::RealVec)
                 } else {
@@ -465,7 +523,7 @@ fn gamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) 
             GAMMA_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(SpecialTensor::RealVec(map_real_infallible(
                 values,
-                GAMMA_FAMILY_PAR_MIN,
+                gamma_family_par_min_for(values.len()),
                 |x| {
                     let value = gamma_core(x);
                     // Preserved from `gamma_scalar`: a non-finite result that is not a pole
@@ -510,7 +568,7 @@ fn gammaln_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
             // bit-identical, and it takes an atomic load out of the hot loop.
             let hoist = GAMMALN_HOIST_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
             if !hoist {
-                return if values.len() >= GAMMA_FAMILY_PAR_MIN {
+                return if gamma_family_is_parallel(values.len()) {
                     par_map_light(values.len(), |i| gammaln_scalar(values[i], mode))
                         .map(SpecialTensor::RealVec)
                 } else {
@@ -554,7 +612,7 @@ fn gammaln_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
             if cephes {
                 GAMMALN_CEPHES_LGAM_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            if values.len() >= GAMMA_FAMILY_PAR_MIN {
+            if gamma_family_is_parallel(values.len()) {
                 par_map_light(values.len(), |i| {
                     gammaln_scalar_with_threshold(values[i], mode, min_x, cephes)
                 })
@@ -593,7 +651,7 @@ fn loggamma_dispatch(
         SpecialTensor::RealVec(values) => {
             // loggamma(real) == gammaln (cheap ~30ns); gate with the family min so the
             // n/256-class over-subscription that pessimizes small arrays is avoided.
-            if values.len() >= GAMMA_FAMILY_PAR_MIN {
+            if gamma_family_is_parallel(values.len()) {
                 par_map_light(values.len(), |i| loggamma_scalar(values[i], mode))
                     .map(SpecialTensor::RealVec)
             } else {
@@ -633,7 +691,7 @@ fn digamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
         SpecialTensor::RealScalar(x) => digamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
             if !GAMMA_INFALLIBLE_BATCH.load(std::sync::atomic::Ordering::Relaxed) {
-                return if values.len() >= GAMMA_FAMILY_PAR_MIN {
+                return if gamma_family_is_parallel(values.len()) {
                     par_map_light(values.len(), |i| digamma_scalar(values[i], mode))
                         .map(SpecialTensor::RealVec)
                 } else {
@@ -652,7 +710,7 @@ fn digamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
             GAMMA_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(SpecialTensor::RealVec(map_real_infallible(
                 values,
-                GAMMA_FAMILY_PAR_MIN,
+                gamma_family_par_min_for(values.len()),
                 |x| {
                     let value = digamma_core(x);
                     if !value.is_finite() {
@@ -936,7 +994,7 @@ fn polygamma_dispatch(
                 2 => tetragamma_scalar(x, mode),
                 _ => polygamma_higher_scalar(n, x, mode),
             };
-            if values.len() >= GAMMA_FAMILY_PAR_MIN {
+            if gamma_family_is_parallel(values.len()) {
                 par_map_indices(values.len(), |i| eval(values[i])).map(SpecialTensor::RealVec)
             } else {
                 values
@@ -970,7 +1028,7 @@ pub fn rgamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
             // work-capped light path (the loose par_map_indices cap over-subscribes
             // it at moderate n), same as the gamma/gammaln/digamma family.
             if !GAMMA_INFALLIBLE_BATCH.load(std::sync::atomic::Ordering::Relaxed) {
-                return if values.len() >= GAMMA_FAMILY_PAR_MIN {
+                return if gamma_family_is_parallel(values.len()) {
                     par_map_light(values.len(), |i| rgamma_scalar(values[i], mode))
                         .map(SpecialTensor::RealVec)
                 } else {
@@ -989,7 +1047,7 @@ pub fn rgamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
             GAMMA_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(SpecialTensor::RealVec(map_real_infallible(
                 values,
-                GAMMA_FAMILY_PAR_MIN,
+                gamma_family_par_min_for(values.len()),
                 |x| rgamma_value(x, mode),
             )))
         }

@@ -1011,6 +1011,15 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool))> {
         "erfcinv" => Some(("ndtri_not_acklam", |on| {
             fsci_special::ERFCINV_NDTRI.store(on, std::sync::atomic::Ordering::Relaxed);
         })),
+        // `on` = stay SERIAL for this batch, `off` = the shipped threshold (fan out at
+        // 131072). The whole gamma family shares the gate, so `gamma` is the probe for all
+        // four of gamma/rgamma/digamma/gammaln.
+        "gamma" => Some(("force_serial", |on| {
+            fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(
+                if on { usize::MAX } else { 0 },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        })),
         _ => None,
     }
 }
@@ -1028,6 +1037,9 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
         "erfcinv" => {
             Some(|| fsci_special::ERFCINV_NDTRI_HITS.load(std::sync::atomic::Ordering::Relaxed))
         }
+        "gamma" => Some(|| {
+            fsci_special::GAMMA_FAMILY_SERIAL_HITS.load(std::sync::atomic::Ordering::Relaxed)
+        }),
         _ => None,
     }
 }
