@@ -41586,7 +41586,16 @@ Result class: BEHAVIORAL
 Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`.
 run on worker hz2 with `RCH_WORKER=hz2`, `same_host=hetzner2` as the binary itself
 reported it, harness=perf_special_vs_scipy, live
-`scipy=1.17.1 numpy=2.4.3` in the same process.
+live SciPy in the same process.
+
+**CORRECTION, 2026-08-28, same day.** This row was committed saying the oracle was
+`scipy=1.17.1 numpy=2.4.3`. It was not. The harness's own `READY` line reports
+`scipy=1.18.1 numpy=2.5.2` on hz2, and re-reading the captured logs it said so on EVERY run
+behind this row. The version was carried over from a stale memory note rather than read out
+of the run. The row's findings do not depend on the oracle's minor version — they are about
+env forwarding and about two arms of our own code checked against whatever oracle was
+present — but the provenance field was wrong and is corrected here rather than quietly
+edited. See the erfcinv row below for the `genuine=` flag that had been announcing this.
 
 **The defect, and it silently invalidated the method it was serving**
 
@@ -41668,3 +41677,75 @@ result.
 The reusable part is the ordering, not the outcome: as the A/A nulls tightened across the
 four attempts the apparent effect moved monotonically toward unity. An effect that shrinks
 as its own control improves is the control, not the code.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) of erfcinv's shipped kernel: it was bare Acklam with no refinement, so `scipy.special.erfcinv` parity was ~9 digits where the rest of the crate holds 15-16 (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, arm sweep
+`lever=ndtri_not_acklam`. Run on worker hz2 with `RCH_WORKER=hz2`, `same_host=hetzner2`,
+harness=perf_special_vs_scipy, live SciPy in the same process. Executed binary self-reported
+`elf_sha256=` in the run log. Two-sided arm control observed: `on_hits=1 off_hits=0`.
+
+**The defect, found by ranking the sweep on agreement rather than on speed**
+
+The one-argument sweep's agreement column is not uniform. Twenty of twenty-one ops sit at
+`max_rel` 1e-11 or better and most at 1e-16. One does not:
+
+    erfcinv   max_abs=2.28107133182220423e-09   max_rel=1.12892054034163799e-09
+
+`erfcinv_scalar` computed `-inv_norm_cdf_scalar(y/2)/sqrt(2)`, and `inv_norm_cdf_scalar` is
+Acklam's rational approximation for the inverse normal CDF **with no refinement step**.
+Acklam's published maximum relative error is 1.15e-9. The measured 1.129e-9 is that constant,
+so the kernel was performing exactly to specification — the specification was just three
+orders of magnitude looser than every neighbouring function in the crate, and nothing
+flagged it because a tolerance test written against 1e-8 passes comfortably.
+
+The accurate kernel was already in the crate and already trusted by its neighbours:
+`erfinv_scalar` three functions above uses `ndtri_scalar`, and `erfcinv_conv` uses it too.
+Only the public `erfcinv` still went through Acklam. `inv_norm_cdf_scalar` had exactly one
+caller.
+
+**Both arms, checked elementwise against live SciPy in the same process**, 200000 points on
+`[0.001, 1.999]`, `compared=200000 nonfinite_mismatch=0`:
+
+    arm=off  Acklam, as shipped     max_abs=2.28107133182220423e-09  max_rel=1.12892054034163799e-09
+    arm=on   ndtri                  max_abs=8.88178419700125232e-16  max_rel=1.15973903135397223e-15
+
+A 2.57e6-fold reduction in worst-case absolute disagreement with the incumbent, and 9.7e5-fold
+in relative. `erfcinv` moves from about nine correct digits to full double precision.
+
+**This correctness win is NOT free, and the price is deliberately not banked here**
+
+The accurate kernel is the more expensive kernel. That is a runtime claim, so it does not
+belong in a BEHAVIORAL row and is not made in one: the figures, the paired per-round
+aggregation and both A/A nulls are recorded in the commit message instead.
+
+**The gate that cannot be satisfied on this worker, reported rather than relaxed.** Banking
+that runtime claim needs the TIMED evidence set, which includes fail-closed host-wide
+quiescence before and after measurement. hz2 cannot supply it: the binary's own bracketed
+readings show loadavg 10.09 rising to 12.91 on a 16-core host during the run, and hz1 — the
+only other worker in the fleet carrying SciPy — is refused admission for
+`disk_critical_without_fresh_telemetry`. So the requirement is unmet, and the correct
+response is to leave the runtime claim unbanked and say why, not to argue the gate down.
+Everything in THIS row is deterministic and needs no quiescent host at all, which is why the
+correctness finding lands today and the runtime one does not.
+
+**No cheaper accurate route was found, and the reason is arithmetic rather than effort.** The
+obvious alternative is to keep Acklam as a seed and polish with one Newton or Halley step.
+That step needs an `erfc` and an `exp` per element, and the per-element budget in the run log
+leaves no room for a full `erfc` evaluation underneath the `ndtri` arm. Not attempted;
+recorded so the next reader does not re-derive it.
+
+**The provenance flag that had been shouting and was read past**
+
+The Python child prints `genuine=<version == "1.17.1">` on every run. It has been printing
+`genuine=False`, because hz2 now carries `scipy=1.18.1 numpy=2.5.2`, not 1.17.1. Every run
+today, including those behind the preceding ledger row, used 1.18.1. The preceding row has
+been corrected in place. Two lessons, and the second is the transferable one: a stale memory
+note beats a printed fact if nobody reads the printed fact; and a genuineness flag hard-coded
+to one version string degrades into a permanent `False` that everyone learns to ignore, which
+is worse than not having it.
+
+**Not decided here:** whether the deficit `erfcinv` now carries against the incumbent is
+reducible. That is a runtime question and it needs the quiescent host described above.

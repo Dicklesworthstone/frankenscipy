@@ -40,6 +40,20 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
+/// Emit a result line on BOTH stdout and stderr.
+///
+/// `rch` relays the remote job's stderr, and a run whose numbers went only to stdout can come
+/// back with the numbers missing — the measurement then has to be repeated for no reason
+/// other than where it was written. Duplicating only the RESULT lines keeps that cheap:
+/// per-round chatter stays on stdout alone.
+macro_rules! emit {
+    ($($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        println!("{line}");
+        eprintln!("{line}");
+    }};
+}
+
 use fsci_runtime::RuntimeMode;
 use fsci_special::{
     SpecialTensor, beta, betaln, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit, exprel, gamma,
@@ -644,8 +658,8 @@ fn main() {
         std::process::exit(i32::from(differing != 0));
     }
 
-    println!("elf_sha256={}", elf_sha256());
-    println!("provenance_before {}", host_provenance());
+    emit!("elf_sha256={}", elf_sha256());
+    emit!("provenance_before {}", host_provenance());
     println!("n={n} gammaln_crossover={}", {
         let bits = fsci_special::GAMMALN_ASYMPTOTIC_MIN_OVERRIDE
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -736,7 +750,7 @@ fn main() {
             let fsci = f1.min(f2);
             let sci = s1.min(s2);
             let check = scipy.check(&ours());
-            println!(
+            emit!(
                 "case=n{n} op={op} fsci={fsci:.3}ms scipy={sci:.3}ms scipy/fsci={:.3}x \
                  null_fsci={:.3} null_scipy={:.3} {check}",
                 sci / fsci,
@@ -865,7 +879,7 @@ fn main() {
 
         let (fsci_ms, scipy_ms) = (median(fsci), median(sp));
         let check = scipy.check(&ours());
-        println!(
+        emit!(
             "case=n{n} op={op} fsci={fsci_ms:.3}ms scipy={scipy_ms:.3}ms \
              scipy/fsci={:.3}x null_fsci={:.3} null_scipy={:.3} {check}",
             scipy_ms / fsci_ms,
@@ -930,9 +944,7 @@ fn main() {
             // The hit counter is sampled around each arm as a two-sided control: the `on`
             // arm MUST increment it and the `off` arm MUST NOT. "Enabled" is not "took
             // effect", and a lever wired to nothing prints a perfectly clean 1.000x.
-            let hits = || {
-                fsci_special::GAMMALN_CEPHES_LGAM_HITS.load(std::sync::atomic::Ordering::Relaxed)
-            };
+            let hits = arm_hits(op).expect("a lever with a sweep must expose a hit counter");
             set(true);
             let h0 = hits();
             let check_on = scipy.check(&ours());
@@ -941,7 +953,7 @@ fn main() {
             let h1 = hits();
             let check_off = scipy.check(&ours());
             let off_hits = hits() - h1;
-            println!(
+            emit!(
                 "armab op={op} lever={name} control on_hits={on_hits} off_hits={off_hits} \
                  (must be >0 and 0)"
             );
@@ -959,11 +971,11 @@ fn main() {
                 .collect();
             per_round.sort_by(f64::total_cmp);
             let (on_med, off_med) = (median(on_ms), median(off_ms));
-            println!(
+            emit!(
                 "armab op={op} lever={name} on={on_med:.3}ms off={off_med:.3}ms \
                  rounds={arm_rounds}"
             );
-            println!(
+            emit!(
                 "armab op={op} lever={name} off/on={:.3}x paired_median={:.3}x \
                  paired_min={:.3}x paired_max={:.3}x null_on={:.3} null_off={:.3}",
                 off_med / on_med,
@@ -973,8 +985,8 @@ fn main() {
                 median(null_on),
                 median(null_off),
             );
-            println!("armab op={op} lever={name} arm=on  {check_on}");
-            println!("armab op={op} lever={name} arm=off {check_off}");
+            emit!("armab op={op} lever={name} arm=on  {check_on}");
+            emit!("armab op={op} lever={name} arm=off {check_off}");
             set(true);
         }
     }
@@ -983,7 +995,7 @@ fn main() {
     // says the host was quiet when the process began and nothing about whether it stayed
     // that way; the pair brackets the measurement, so a load spike that arrived mid-run is
     // visible in the row rather than hidden inside a median.
-    println!("provenance_after {}", host_provenance());
+    emit!("provenance_after {}", host_provenance());
 }
 
 /// The in-process A/B lever for an op, if it has one: a display name and a setter.
@@ -996,6 +1008,26 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool))> {
         "gammaln" => Some(("cephes_lgam", |on| {
             fsci_special::GAMMALN_CEPHES_LGAM.store(on, std::sync::atomic::Ordering::Relaxed);
         })),
+        "erfcinv" => Some(("ndtri_not_acklam", |on| {
+            fsci_special::ERFCINV_NDTRI.store(on, std::sync::atomic::Ordering::Relaxed);
+        })),
+        _ => None,
+    }
+}
+
+/// The hit counter for an op's lever, so the sweep can prove the arm actually fired.
+///
+/// A lever wired to nothing prints a perfectly clean 1.000x and a perfectly clean accuracy
+/// comparison; only a counter that moves on one arm and not the other separates "the switch
+/// did nothing" from "the switch did nothing measurable".
+fn arm_hits(op: &str) -> Option<fn() -> usize> {
+    match op {
+        "gammaln" => Some(|| {
+            fsci_special::GAMMALN_CEPHES_LGAM_HITS.load(std::sync::atomic::Ordering::Relaxed)
+        }),
+        "erfcinv" => {
+            Some(|| fsci_special::ERFCINV_NDTRI_HITS.load(std::sync::atomic::Ordering::Relaxed))
+        }
         _ => None,
     }
 }

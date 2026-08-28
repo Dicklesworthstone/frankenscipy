@@ -336,7 +336,8 @@ pub use elliptic::{
     elliprc, elliprd, elliprf, elliprg, elliprj, exp1, expi, expn_scalar, lambertw,
 };
 pub use error::{
-    ERROR_DISPATCH_PLAN, erf, erf_scalar, erfc, erfc_scalar, erfcinv, erfinv, erfinv_scalar,
+    ERFCINV_NDTRI, ERFCINV_NDTRI_HITS, ERROR_DISPATCH_PLAN, erf, erf_scalar, erfc, erfc_scalar,
+    erfcinv, erfinv, erfinv_scalar,
 };
 pub use gamma::{
     GAMMA_CEPHES_RATIONAL, GAMMA_CEPHES_RATIONAL_HITS, GAMMA_CEPHES_REFLECTION_FREE,

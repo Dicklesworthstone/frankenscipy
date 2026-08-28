@@ -216,15 +216,39 @@ pub fn erfinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 }
 
 pub fn erfcinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    // The arm is read ONCE for the whole batch and passed down as a `bool`, never read per
+    // element: a relaxed load inside a per-item loop is an optimisation barrier this crate
+    // has already paid 13% for, and a per-element `fetch_add` costs 2 instructions more.
+    let ndtri_arm = ERFCINV_NDTRI.load(std::sync::atomic::Ordering::Relaxed);
+    if ndtri_arm {
+        ERFCINV_NDTRI_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     map_unary_input_rp(
         "erfcinv",
         y,
         mode,
-        |v| erfcinv_scalar(v, mode),
+        |v| erfcinv_scalar_with_arm(v, mode, ndtri_arm),
         |value| erfcinv_complex_scalar(value, mode),
         1 << 20, // cheap ~12ns; default-256 gate lost 36.9x@4096, still loses at 262k (BlackThrush A/B)
     )
 }
+
+/// Use the crate's own `ndtri` for `erfcinv` (`true`, shipping) instead of Acklam's rational.
+///
+/// ACCURACY CONTRACT, and it is the entire reason this switch exists. Acklam's approximation
+/// carries a published maximum relative error of 1.15e-9 and is used here with NO refinement
+/// step, so `erfcinv` returned about nine correct digits while every neighbouring function in
+/// this crate returns fifteen or sixteen. Measured against live SciPy over 200000 points on
+/// `[0.001, 1.999]`, the Acklam arm reads `max_abs=2.28e-09`; the whole rest of the
+/// one-argument sweep sits at 1e-11 or better. This arm is not a speed lever and no speed
+/// claim is attached to it.
+pub static ERFCINV_NDTRI: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// BATCHES that took the `ndtri` arm — "enabled" is not "took effect".
+///
+/// Counted once per batch, not once per element, so it is not a call count. A diagnostic
+/// counter with no arms to preserve anything between; incrementing it changes no result.
+pub static ERFCINV_NDTRI_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Evaluate `f(0..n)` into a `Vec<T>`, parallel over index chunks for large `n`.
 /// Error-function kernels (erf series / erfc continued fraction / erfinv–erfcinv Newton
@@ -802,6 +826,20 @@ fn erfinv_complex_initial_guess(y: Complex64) -> Complex64 {
 }
 
 fn erfcinv_scalar(y: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+    erfcinv_scalar_with_arm(
+        y,
+        mode,
+        ERFCINV_NDTRI.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// `erfcinv_scalar` with the kernel choice passed IN rather than read from the process-global
+/// switch on every element. See `erfcinv` for why the read is hoisted.
+fn erfcinv_scalar_with_arm(
+    y: f64,
+    mode: RuntimeMode,
+    ndtri_arm: bool,
+) -> Result<f64, SpecialError> {
     if y.is_nan() {
         return Ok(f64::NAN);
     }
@@ -849,7 +887,15 @@ fn erfcinv_scalar(y: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
         return Ok(0.0);
     }
 
-    Ok(-inv_norm_cdf_scalar(0.5 * y) / 2.0_f64.sqrt())
+    // erfcinv(y) = -Phi^-1(y/2)/sqrt(2). Both arms compute that identity; they differ only in
+    // which inverse-normal kernel evaluates it. `ndtri_scalar` is the crate's Cephes-derived
+    // one, already trusted by `erfinv_scalar` three functions up and by `erfcinv_conv`, and it
+    // handles the deep tail by delegating there rather than by losing digits.
+    if ndtri_arm {
+        Ok(-crate::convenience::ndtri_scalar(0.5 * y) * std::f64::consts::FRAC_1_SQRT_2)
+    } else {
+        Ok(-inv_norm_cdf_scalar(0.5 * y) / 2.0_f64.sqrt())
+    }
 }
 
 fn erfcinv_complex_scalar(y: Complex64, mode: RuntimeMode) -> Result<Complex64, SpecialError> {
