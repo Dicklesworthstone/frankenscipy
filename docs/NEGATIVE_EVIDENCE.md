@@ -42039,3 +42039,69 @@ allocation and concatenation (measured, null), and the schedule (measured, incon
 host-wide quiescence, and although this was the quietest window of the session — loadavg 2.58
 rising to 4.56 on 16 cores — that still does not meet it, and hz1 remains refused for
 `disk_critical_without_fresh_telemetry`. Reported, not relaxed.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) of one fan-out constant serving four kernels: gamma's gate was wrong at every size it could be resolved at, and the family does not agree on the answer (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, `gatesweep op=gamma` plus
+arm sweep `lever=force_serial`. Run on worker hz2 with `RCH_WORKER=hz2`,
+`same_host=hetzner2`, harness=perf_special_vs_scipy, live SciPy in the same process, ELF sha
+self-reported. Arm control observed at `on_hits=1 off_hits=0` before the change.
+
+**Two things were excluded before any code was written, and both cost nothing**
+
+`gamma` is the worst cell in the crate on a multi-run ranking and it is BIT-IDENTICAL to the
+incumbent (`max_abs=0.00000000000000000e+00`, `compared=200000 nonfinite_mismatch=0`), so the
+kernel is not the difference. Before building anything: the AVX2/FMA build flag was checked
+and is already applied — `.cargo/config.toml` carries `target-feature=+avx2,+fma` with its
+own evidence — and `ndtri`-style extra refinement does not exist in this path. Neither
+needed a compile to rule out.
+
+**What was actually wrong: one constant serving four kernels**
+
+`GAMMA_FAMILY_PAR_MIN` decided fan-out for gamma, rgamma, digamma and gammaln alike. A
+per-size sweep of the two schedules against each other — nine position-balanced rounds per
+size, both schedules bit-identical because `map_real_infallible` gives every index its own
+output slot — found the SERIAL schedule quicker at every size it could resolve, from 65536 to
+1048576. There is no crossover in the tested range; fanning out never won. The figures are in
+the commit message.
+
+The largest size tested, 2097152, is reported as UNRESOLVED and its ratio is withheld: it did
+not clear the looser of its two A/A nulls, and a number printed beside the word "prefers"
+would be read as a decision it cannot support.
+
+**The family does not agree, which is why this is not a family-wide change.** `digamma`
+preferred the THREADED schedule in both runs that measured it. `rgamma` gave opposite answers
+on two runs and is unresolved. Only `gamma` is settled, and only `gamma` is changed: it now
+carries `GAMMA_PAR_MIN`, set just ABOVE the measured range rather than to "never", so the
+untested regime keeps the behaviour it already had instead of acquiring a new unmeasured
+claim in the other direction.
+
+**This row is NOT titled KEEP, deliberately.** The change is an improvement and the
+incumbent ratio moved substantially in our favour, but banking that as a KEEP requires the
+full TIMED evidence set — host-wide fail-closed quiescence, a bootstrap-median CI carrying
+the required two-fold margin over the A/A nulls, two named engine digests — and hz2 cannot
+supply the quiescence. The preflight
+refused the KEEP title for exactly that reason and was not argued down. What is banked here
+is only what is deterministic; the ratio lives in the commit message.
+
+**Result.** With the new threshold
+`gamma` runs serial at the fixture size and its agreement with the incumbent is unchanged at
+`max_abs=0.00000000000000000e+00` — the schedule was never a numerical question. The
+incumbent ratio moved substantially in our favour; it is a timing claim and lives in the
+commit message.
+
+**An unplanned A/A null fell out of it, and it is worth recording.** After the change, the
+`force_serial` arm sweep at the fixture size drives two arms that are now the SAME schedule,
+which the hit counter reports honestly as `on_hits=1 off_hits=1`. That degenerate sweep
+returned a paired median within a fraction of a per cent of unity against its own nulls —
+i.e. when the harness compares identical code it says so. The control's printed hint was
+reworded, because "must be >0 and 0" stopped being true the moment the shipped default moved
+to match the `on` arm, and a control whose stated invariant is wrong trains readers to
+ignore it.
+
+**No runtime claim is banked here.** The TIMED evidence set requires fail-closed host-wide
+quiescence and hz2 was at loadavg 3.22 rising to 8.15 on 16 cores across these runs, which
+does not meet it; hz1 remains refused for `disk_critical_without_fresh_telemetry`. Reported,
+not relaxed.

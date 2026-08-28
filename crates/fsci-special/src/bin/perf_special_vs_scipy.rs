@@ -955,7 +955,8 @@ fn main() {
             let off_hits = hits() - h1;
             emit!(
                 "armab op={op} lever={name} control on_hits={on_hits} off_hits={off_hits} \
-                 (must be >0 and 0)"
+                 (on_hits must be >0; off_hits 0 UNLESS the shipped default already equals \
+                 the on arm at this size, in which case the sweep is an A/A null)"
             );
             // Aggregate at the REPLICATE level: one ratio per round, then the median of
             // those, so the pairing that the interleave bought is not thrown away by
@@ -1017,7 +1018,119 @@ fn main() {
     // says the host was quiet when the process began and nothing about whether it stayed
     // that way; the pair brackets the measurement, so a load spike that arrived mid-run is
     // visible in the row rather than hidden inside a median.
+    gamma_gate_size_sweep();
+
     emit!("provenance_after {}", host_provenance());
+}
+
+/// Where does fanning out start to pay for `gamma`? Measured, per size, in this process.
+///
+/// WHY THIS EXISTS. `gamma` has preferred the SERIAL schedule in every run so far and across
+/// three different host load levels, so its fan-out threshold is wrong at the harness's
+/// fixture size. Knowing that is not enough to fix it: the gate is a SIZE threshold, and
+/// moving it needs the size at which the two schedules cross, not a single point plus a
+/// guess. One point would only justify "not at 200000", which is not a threshold.
+///
+/// This is an INTERNAL comparison — our two schedules against each other — so it is
+/// maintenance, not a win, and it is reported as such. What makes it actionable is that the
+/// live-incumbent ratio at the fixture size is measured separately by the arm sweep above.
+///
+/// Both schedules are bit-identical: `map_real_infallible` gives each index its own output
+/// slot and applies the same kernel either way.
+fn gamma_gate_size_sweep() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    // Sizes bracket the shipped threshold (1 << 17) on both sides, so the sweep can show it
+    // being wrong in one direction and right in the other rather than only confirming a
+    // prior. Below the threshold BOTH arms are serial, which is a built-in null: any
+    // difference reported there is measurement noise and calibrates the rest of the column.
+    const SIZES: &[usize] = &[1 << 16, 1 << 17, 1 << 18, 1 << 19, 1 << 20, 1 << 21];
+    const ROUNDS: usize = 9;
+
+    emit!("gatesweep op=gamma note=internal-A/B-not-an-incumbent-comparison");
+    for &n in SIZES {
+        // Same generator and same domain as the `gamma` case above, so the branch mix inside
+        // `gamma_core` is the one the headline cell exercises rather than a different fixture
+        // that happens to be easier or harder.
+        let unit = |i: usize| -> f64 {
+            let k = (i * 2_654_435_761usize).wrapping_add(40_503) % 1_000_003;
+            k as f64 / 1_000_003.0
+        };
+        let x: Vec<f64> = (0..n).map(|i| 0.01 + unit(i) * (30.0 - 0.01)).collect();
+        let tensor = SpecialTensor::RealVec(x);
+        let run = || {
+            let out = gamma(&tensor, RuntimeMode::Hardened).expect("fsci gamma");
+            real_vec(out, "gamma")
+        };
+
+        let set_serial = |serial: bool| {
+            fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE
+                .store(if serial { usize::MAX } else { 1 }, Relaxed);
+        };
+        // `1`, not `0`: `0` means "use the shipped constant", which at the small sizes here
+        // would silently make the threaded arm serial too and turn the whole row into a null
+        // that looks like a result. Forcing the threshold to 1 makes the threaded arm
+        // actually thread at every size.
+        set_serial(false);
+        black_box(run());
+
+        let time = |serial: bool| -> f64 {
+            set_serial(serial);
+            let started = Instant::now();
+            black_box(run());
+            started.elapsed().as_secs_f64() * 1.0e3
+        };
+
+        let (mut ser, mut par, mut null_s, mut null_p) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for round in 0..ROUNDS {
+            let (s1, p1, p2, s2) = if round % 2 == 0 {
+                let s1 = time(true);
+                let p1 = time(false);
+                let p2 = time(false);
+                let s2 = time(true);
+                (s1, p1, p2, s2)
+            } else {
+                let p1 = time(false);
+                let s1 = time(true);
+                let s2 = time(true);
+                let p2 = time(false);
+                (s1, p1, p2, s2)
+            };
+            ser.push(s1.min(s2));
+            par.push(p1.min(p2));
+            null_s.push(s1.max(s2) / s1.min(s2));
+            null_p.push(p1.max(p2) / p1.min(p2));
+        }
+        let mut per_round: Vec<f64> = ser.iter().zip(par.iter()).map(|(s, p)| p / s).collect();
+        per_round.sort_by(f64::total_cmp);
+        let verdict = {
+            let ratio = median(per_round.clone());
+            let worst_null = median(null_s.clone()).max(median(null_p.clone()));
+            // Withhold rather than publish an unresolvable ratio: if the effect does not
+            // clear the looser of the two A/A nulls in BOTH directions it decides nothing,
+            // and a number printed next to the word "prefers" will be read as a decision.
+            if ratio > worst_null {
+                "SERIAL"
+            } else if ratio < 1.0 / worst_null {
+                "THREADED"
+            } else {
+                "UNRESOLVED"
+            }
+        };
+        emit!(
+            "gatesweep op=gamma n={n} serial={:.3}ms threaded={:.3}ms par/ser={:.3}x \
+             min={:.3}x max={:.3}x null_serial={:.3} null_threaded={:.3} prefers={verdict}",
+            median(ser),
+            median(par),
+            median(per_round.clone()),
+            per_round[0],
+            per_round[per_round.len() - 1],
+            median(null_s),
+            median(null_p),
+        );
+    }
+    fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(0, Relaxed);
 }
 
 /// The in-process A/B lever for an op, if it has one: a display name and a setter.
