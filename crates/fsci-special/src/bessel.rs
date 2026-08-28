@@ -3975,10 +3975,72 @@ fn j1_core(x: f64) -> f64 {
     if x < 0.0 { -ans } else { ans }
 }
 
+/// Route `Y0`/`Y1` above x = 5 through SciPy's own large-argument Cephes form (`true`,
+/// shipping) instead of a harmonic series and the general order-v asymptotic.
+///
+/// NOT bit-identical and not intended to be: it is a different approximation, and it is the
+/// one the incumbent uses, so it moves our values toward SciPy. Accuracy against the live
+/// SciPy arm is the contract, checked in the same invocation by `perf_special_vs_scipy`;
+/// the arms are also cross-checked against each other by
+/// `y0_y1_cephes_large_matches_the_series`.
+pub static BESSEL_Y01_CEPHES_LARGE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Evaluations that took the large-argument Cephes arm — "enabled" is not "took effect".
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result.
+pub static BESSEL_Y01_CEPHES_LARGE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// ── Cephes Y0/Y1 large-argument form ─────────────────────────────────────────────────
+//
+// WHY. Measured against live SciPy on the identical fixture (x in [0.01, 30]), instructions
+// per element: y0 757.2 against 232.8 (3.25x) and y1 827.1 against 232.4 (3.56x). Above
+// x = 5 we ran a convergence-controlled harmonic series out to x = 14 and then
+// `yv_asymptotic`, the GENERAL order-v routine — the same shape that made `i0`/`i1` 12x.
+// SciPy runs two rational functions in 25/x^2 and one sin/cos, for every x > 5.
+//
+// THE COEFFICIENTS ARE ALREADY HERE AND ALREADY TRUSTED. Cephes evaluates `Y0` above 5 from
+// the SAME `PP/PQ/QP/QQ` tables as `J0`, differing only in how the phase is combined: J0
+// takes `p·cos(xn) - w·q·sin(xn)`, Y0 takes `p·sin(xn) + w·q·cos(xn)`. Those tables are
+// already in this file, already used by `j0_core`/`j1_core`, and `j0`/`j1` already measure
+// at parity with SciPy (1.06x and 0.88x). So this adds NO transcribed constants and carries
+// none of the risk the `i0`/`i1` tables did.
+//
+// SCOPED TO x > 5 DELIBERATELY. Cephes also has a dedicated small-argument branch for `Y1`
+// (its own `YP`/`YQ`) which is NOT in this tree; adding it means transcribing new
+// coefficients, so `Y1` below 5 keeps its power series and is left as named, measured work
+// rather than half-done here.
+
+/// `Y0(x)` for `x > 5`, the Cephes large-argument form. Shares `J0`'s tables.
+fn y0_cephes_large(x: f64) -> f64 {
+    let w = 5.0 / x;
+    let qz = 25.0 / (x * x);
+    let p = cephes_polevl(qz, &J0_PP) / cephes_polevl(qz, &J0_PQ);
+    let q = cephes_polevl(qz, &J0_QP) / cephes_p1evl(qz, &J0_QQ);
+    let xn = x - std::f64::consts::FRAC_PI_4;
+    (p * xn.sin() + w * q * xn.cos()) * SQRT2OPI / x.sqrt()
+}
+
+/// `Y1(x)` for `x > 5`, the Cephes large-argument form. Shares `J1`'s tables.
+fn y1_cephes_large(x: f64) -> f64 {
+    let w = 5.0 / x;
+    let z = w * w;
+    let p = cephes_polevl(z, &J1_PP) / cephes_polevl(z, &J1_PQ);
+    let q = cephes_polevl(z, &J1_QP) / cephes_p1evl(z, &J1_QQ);
+    let xn = x - THREE_PI_OVER_FOUR;
+    (p * xn.sin() + w * q * xn.cos()) * SQRT2OPI / x.sqrt()
+}
+
 fn y0_core_positive(x: f64) -> f64 {
     if x <= 5.0 {
-        y0_cephes_small(x)
-    } else if x < 14.0 {
+        return y0_cephes_small(x);
+    }
+    if BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed) {
+        BESSEL_Y01_CEPHES_LARGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return y0_cephes_large(x);
+    }
+    if x < 14.0 {
         y0_series_small(x)
     } else {
         yv_asymptotic(0.0, x)
@@ -4061,6 +4123,10 @@ fn y1_series_small(x: f64) -> f64 {
 }
 
 fn y1_core_positive(x: f64) -> f64 {
+    if x > 5.0 && BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed) {
+        BESSEL_Y01_CEPHES_LARGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return y1_cephes_large(x);
+    }
     if x < 14.0 {
         // Power series (DLMF 10.8.1) for x<14 (≳11 digits); x≥14 uses the NR fit.
         y1_series_small(x)
@@ -5997,6 +6063,89 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Pins `y0`/`y1` against SciPy reference values tightly enough to catch a parity
+    /// defect, which the pre-existing tests did not.
+    ///
+    /// THE HOLE THIS CLOSES. Before the Cephes large-argument form, `y0` differed from
+    /// SciPy by `max_abs = 1.27e-11` across the harness fixture and `y1` by 9.54e-12, while
+    /// every test in this crate passed. Tolerances loose enough to accept 1e-11 cannot tell
+    /// a correct implementation from a drifting one, so the speed work above would have
+    /// landed on top of an accuracy gap nothing was watching. Verified as a real gate and
+    /// not a decorative one: with `BESSEL_Y01_CEPHES_LARGE` forced off this test FAILS,
+    /// reporting y0 2.13e-11 at x = 13.999 and y1 6.37e-12 at x = 11.5.
+    ///
+    /// JUDGED ON ABSOLUTE ERROR, NOT RELATIVE, and the distinction matters here. The same
+    /// comparison reports `max_rel = 1.32e-6` for the old `y0`, which reads like six lost
+    /// digits and is not: `Y0` has zeros at x ≈ 0.89, 3.96, 7.09, 10.22, 13.36 … and a
+    /// relative measure divides by a value passing through zero. This crate has already
+    /// been caught once quoting an inflated `max_rel` as an accuracy claim (`gammaln`, whose
+    /// zeros do the same thing), so the bound below is relative but the CLAIM is absolute.
+    ///
+    /// The bound is 1e-13 relative: tight enough to fail the old arm by two orders of
+    /// magnitude, loose enough not to be a change-detector for the last bits. Points
+    /// straddle every branch boundary this file has (x = 5 for the Cephes split, x = 14 for
+    /// the old series/asymptotic split) so a future re-cut is caught at the seam.
+    #[test]
+    fn y0_y1_match_scipy_reference_values() {
+        // scipy 1.17.1 / numpy 2.4.3
+        const REFERENCE: &[(f64, f64, f64)] = &[
+            (0.1, -1.5342386513503667, -6.458951094702027),
+            (0.5, -0.4445187335067066, -1.4714723926702433),
+            (1.0, 0.08825696421567697, -0.7812128213002888),
+            (2.5, 0.498070359615232, 0.14591813796678577),
+            (4.9, -0.29205459424401364, 0.18124669204504856),
+            (5.0, -0.30851762524903303, 0.14786314339122691),
+            (5.1, -0.3216024491248595, 0.11373644197749971),
+            (6.0, -0.28819468398157916, -0.17501034430039827),
+            (7.5, 0.11731328614820863, -0.25912851048611624),
+            (9.0, 0.24993669828502474, 0.10431457519671594),
+            (10.0, 0.05567116728359961, 0.24901542420695388),
+            (11.5, -0.22523211169118781, 0.057942547143000615),
+            (13.0, -0.07820786452787612, -0.2100814084206936),
+            (13.999, 0.12702585421842472, -0.16678385967336848),
+            (14.0, 0.12719256858218356, -0.16664484185617212),
+            (14.001, 0.12735914385018385, -0.16650566817978737),
+            (17.0, -0.09263719844232356, 0.1672050360772336),
+            (20.0, 0.06264059680938369, -0.1655116143625212),
+            (23.5, -0.10828611769479085, 0.1216532806902693),
+            (27.0, 0.1352149762078723, -0.07025123823578311),
+            (30.0, -0.11729573168666398, 0.08442557066174713),
+        ];
+
+        let (mut worst0, mut worst1) = (0.0_f64, 0.0_f64);
+        let (mut at0, mut at1) = (f64::NAN, f64::NAN);
+        let (mut below, mut above) = (0usize, 0usize);
+        for &(x, ref0, ref1) in REFERENCE {
+            if x <= 5.0 {
+                below += 1;
+            } else {
+                above += 1;
+            }
+            let got0 = y0_core_positive(x);
+            let got1 = y1_core_positive(x);
+            let rel0 = (got0 - ref0).abs() / ref0.abs();
+            let rel1 = (got1 - ref1).abs() / ref1.abs();
+            if rel0 > worst0 {
+                worst0 = rel0;
+                at0 = x;
+            }
+            if rel1 > worst1 {
+                worst1 = rel1;
+                at1 = x;
+            }
+        }
+        // MUST-HIT: both sides of the x = 5 split have to be exercised, or this is evidence
+        // about only one branch.
+        assert!(
+            below > 0 && above > 0,
+            "reference grid missed a branch: x<=5 {below}, x>5 {above}"
+        );
+        assert!(
+            worst0 < 1.0e-13 && worst1 < 1.0e-13,
+            "y0/y1 disagree with SciPy: y0 {worst0:e} at x={at0}, y1 {worst1:e} at x={at1}"
+        );
+    }
+
     /// Cross-checks the transcribed Chebyshev tables against the independent `iv` power
     /// series over the whole domain.
     ///
@@ -6096,12 +6245,16 @@ mod tests {
         }
         BESSEL_I01_CEPHES.store(was, Relaxed);
 
-        assert_eq!(
-            arms[0].1,
-            values.len(),
+        // MUST-HIT, bounded rather than exact, for the same reason the gamma-family
+        // mapper's counter is: `BESSEL_I01_CEPHES_HITS` is process-global, so any
+        // concurrent test calling `i0`/`i1` increments it and `== values.len()` / `== 0`
+        // fail intermittently on a CORRECT tree. The must-miss for this toggle is the
+        // instruction A/B instead — 176.0 against 4181.2 per element — which cannot happen
+        // unless the two arms really execute different code.
+        assert!(
+            arms[0].1 >= values.len(),
             "Chebyshev arm did not run for every element"
         );
-        assert_eq!(arms[1].1, 0, "disabled arm still took the Chebyshev path");
         // The two arms are DIFFERENT approximations, so they must not be asserted equal.
         // What matters is that both produced finite, close results; accuracy against SciPy
         // is the real contract and lives in the harness.

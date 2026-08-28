@@ -320,6 +320,16 @@ fn main() {
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
 
+    // `FSCI_SPECIAL_Y01_LARGE=0` restores the harmonic series and general order-v
+    // asymptotic for `y0`/`y1` above x = 5, so the Cephes large-argument form can be A/B'd
+    // -- for ACCURACY as much as cost -- inside ONE binary against the same live SciPy arm.
+    let y01_large = !matches!(
+        std::env::var("FSCI_SPECIAL_Y01_LARGE").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::BESSEL_Y01_CEPHES_LARGE.store(y01_large, std::sync::atomic::Ordering::Relaxed);
+    println!("bessel_y01_cephes_large={y01_large}");
+
     // `FSCI_SPECIAL_I01_CEPHES=0` restores the general order-v `iv_scalar` path for
     // `i0`/`i1`, so the Chebyshev kernels can be A/B'd -- for ACCURACY as much as cost --
     // inside ONE binary against the same live SciPy arm.

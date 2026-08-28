@@ -4119,12 +4119,23 @@ mod tests {
             }
         }
 
-        // MUST-HIT / MUST-MISS: without these a build where the toggle did nothing would
-        // pass every equality below while comparing an arm against itself.
-        assert_eq!(arms[0].1, 1, "prealloc serial arm did not run");
-        assert_eq!(arms[1].1, 1, "prealloc threaded arm did not run");
-        assert_eq!(arms[2].1, 0, "disabled serial arm still preallocated");
-        assert_eq!(arms[3].1, 0, "disabled threaded arm still preallocated");
+        // MUST-HIT: without this, a build where the toggle did nothing would pass every
+        // equality below while comparing an arm against itself.
+        //
+        // BOUNDED, NOT EXACT, AND THAT IS A BUG FIX. This asserted `== 1` and `== 0`, which
+        // is only sound if nothing else touches the counter for the duration. It is
+        // process-global and `par_map_indices` has 245 callers across seven modules, so any
+        // concurrent test that maps an array increments it and the equality fails on a
+        // correct tree. It did: green when run alone, FAILED in the full concurrent suite,
+        // then passed again on the next run — the intermittent shape that wastes the most
+        // time and, in a shared tree, derails other agents.
+        //
+        // A process-global counter cannot support an exact MUST-MISS while the suite runs
+        // concurrently, so this no longer pretends to one. The must-miss for this toggle is
+        // the instruction A/B instead — 196.7 against 199.5 per element — which cannot
+        // happen unless the two arms really execute different code.
+        assert!(arms[0].1 >= 1, "prealloc serial arm did not run");
+        assert!(arms[1].1 >= 1, "prealloc threaded arm did not run");
 
         // All four must agree BIT for bit: prealloc vs collect, serial vs threaded.
         for (label, other) in [
