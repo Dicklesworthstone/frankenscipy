@@ -218,3 +218,6 @@ rust_out
 # Accidental shell-redirect leftovers at repo root (`:> =`, `:> null_hi`).
 /=
 /null_hi
+
+# br doctor per-run artifacts
+.doctor/
