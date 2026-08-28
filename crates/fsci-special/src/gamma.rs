@@ -417,6 +417,26 @@ where
     out
 }
 
+/// The first input on which the per-element path would fail, if any.
+///
+/// The gamma family's batch entries all share one shape: the scalar kernel can only return
+/// `Err` under `RuntimeMode::Hardened`, and only for an input this predicate identifies. So
+/// the failure is decidable from the INPUT alone, before any arithmetic — which is what lets
+/// the batch run an infallible kernel and skip a `Result` per element entirely.
+///
+/// `include_zero` is not decoration: `gammaln` fails at `x == 0` as well as at the negative
+/// integers, `gamma` and `digamma` do not. Getting that wrong would turn a returned error
+/// into a silent value, so each caller states its own condition.
+fn first_hardened_failure(values: &[f64], mode: RuntimeMode, include_zero: bool) -> Option<f64> {
+    if !matches!(mode, RuntimeMode::Hardened) {
+        return None;
+    }
+    values
+        .iter()
+        .copied()
+        .find(|&x| is_negative_integer_pole(x) || (include_zero && x == 0.0))
+}
+
 fn gamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     match z {
         SpecialTensor::RealScalar(x) => gamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
@@ -439,9 +459,7 @@ fn gamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) 
             // the FIRST such input in index order, which is the element the previous
             // per-element path would have failed on, and it defers to `gamma_scalar` for the
             // error and its trace so the message stays in one place.
-            if matches!(mode, RuntimeMode::Hardened)
-                && let Some(&x) = values.iter().find(|&&x| is_negative_integer_pole(x))
-            {
+            if let Some(x) = first_hardened_failure(values, mode, false) {
                 return gamma_scalar(x, mode).map(SpecialTensor::RealScalar);
             }
             GAMMA_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -583,16 +601,43 @@ fn digamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
     match z {
         SpecialTensor::RealScalar(x) => digamma_scalar(*x, mode).map(SpecialTensor::RealScalar),
         SpecialTensor::RealVec(values) => {
-            if values.len() >= GAMMA_FAMILY_PAR_MIN {
-                par_map_light(values.len(), |i| digamma_scalar(values[i], mode))
-                    .map(SpecialTensor::RealVec)
-            } else {
-                values
-                    .iter()
-                    .map(|&x| digamma_scalar(x, mode))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(SpecialTensor::RealVec)
+            if !GAMMA_INFALLIBLE_BATCH.load(std::sync::atomic::Ordering::Relaxed) {
+                return if values.len() >= GAMMA_FAMILY_PAR_MIN {
+                    par_map_light(values.len(), |i| digamma_scalar(values[i], mode))
+                        .map(SpecialTensor::RealVec)
+                } else {
+                    values
+                        .iter()
+                        .map(|&x| digamma_scalar(x, mode))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(SpecialTensor::RealVec)
+                };
             }
+            // `digamma_scalar` fails only under Hardened at a negative-integer pole — NOT
+            // at zero, unlike `gammaln`.
+            if let Some(x) = first_hardened_failure(values, mode, false) {
+                return digamma_scalar(x, mode).map(SpecialTensor::RealScalar);
+            }
+            GAMMA_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(SpecialTensor::RealVec(map_real_infallible(
+                values,
+                GAMMA_FAMILY_PAR_MIN,
+                |x| {
+                    let value = digamma_core(x);
+                    if !value.is_finite() {
+                        record_special_trace(
+                            "digamma",
+                            mode,
+                            "non_finite_output",
+                            format!("input={x}"),
+                            "returned_non_finite",
+                            format!("output={value}"),
+                            false,
+                        );
+                    }
+                    value
+                },
+            )))
         }
         SpecialTensor::ComplexScalar(z_val) => {
             Ok(SpecialTensor::ComplexScalar(complex_digamma_scalar(*z_val)))
@@ -893,16 +938,29 @@ pub fn rgamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
             // rgamma (1/Gamma) is a cheap ~30ns kernel; route through the
             // work-capped light path (the loose par_map_indices cap over-subscribes
             // it at moderate n), same as the gamma/gammaln/digamma family.
-            if values.len() >= GAMMA_FAMILY_PAR_MIN {
-                par_map_light(values.len(), |i| rgamma_scalar(values[i], mode))
-                    .map(SpecialTensor::RealVec)
-            } else {
-                values
-                    .iter()
-                    .map(|&x| rgamma_scalar(x, mode))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(SpecialTensor::RealVec)
+            if !GAMMA_INFALLIBLE_BATCH.load(std::sync::atomic::Ordering::Relaxed) {
+                return if values.len() >= GAMMA_FAMILY_PAR_MIN {
+                    par_map_light(values.len(), |i| rgamma_scalar(values[i], mode))
+                        .map(SpecialTensor::RealVec)
+                } else {
+                    values
+                        .iter()
+                        .map(|&x| rgamma_scalar(x, mode))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(SpecialTensor::RealVec)
+                };
             }
+            // NO SCAN, because `rgamma_scalar` CANNOT FAIL. It returns `Ok(0.0)` for a
+            // negative-integer pole before reaching `gamma_scalar(x, mode)?`, and that call's
+            // only error is the same pole under Hardened — already excluded. So the `Result`
+            // it returns is dead on every input, not merely rare, and `rgamma_never_errors`
+            // pins that rather than leaving it as a reading of the code.
+            GAMMA_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(SpecialTensor::RealVec(map_real_infallible(
+                values,
+                GAMMA_FAMILY_PAR_MIN,
+                |x| rgamma_value(x, mode),
+            )))
         }
         SpecialTensor::ComplexScalar(z_val) => {
             Ok(SpecialTensor::ComplexScalar(complex_rgamma_scalar(*z_val)))
@@ -1630,18 +1688,39 @@ fn rgamma_cephes_small(x: f64) -> f64 {
 /// Above this magnitude SciPy itself falls back to `1/Γ(x)`, which is what we already do.
 const RGAMMA_CHEB_MAX_ABS_X: f64 = 4.0;
 
-pub(crate) fn rgamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+/// `1/Γ(x)`, infallible.
+///
+/// `rgamma_scalar` wraps this in `Ok` and exists for callers that want the family's
+/// `Result` signature. The batch path calls THIS, because wrapping a value in a `Result`
+/// only to unwrap it still constructs the ~56-byte `Result` per element: routing the batch
+/// through `rgamma_scalar` bought 5.0 instructions per element where `gamma` and `digamma`
+/// each gained 29.0, and this is the difference.
+pub(crate) fn rgamma_value(x: f64, mode: RuntimeMode) -> f64 {
     if is_negative_integer_pole(x) {
-        return Ok(0.0);
+        return 0.0;
     }
     if x != 0.0
         && x.abs() <= RGAMMA_CHEB_MAX_ABS_X
         && RGAMMA_CEPHES_CHEB.load(std::sync::atomic::Ordering::Relaxed)
     {
         RGAMMA_CEPHES_CHEB_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return Ok(rgamma_cephes_small(x));
+        return rgamma_cephes_small(x);
     }
-    let gamma_value = gamma_scalar(x, mode)?;
+    // `gamma_scalar` cannot fail here — its only error is a negative-integer pole under
+    // Hardened, excluded above — so its infallible part is inlined, TRACE INCLUDED. Dropping
+    // that trace would be a silent behaviour change rather than a speed-up.
+    let gamma_value = gamma_core(x);
+    if !gamma_value.is_finite() && !is_negative_integer_pole(x) && x != 0.0 {
+        record_special_trace(
+            "gamma",
+            mode,
+            "non_finite_output",
+            format!("input={x}"),
+            "returned_non_finite",
+            format!("output={gamma_value}"),
+            false,
+        );
+    }
     let value = 1.0 / gamma_value;
     if !value.is_finite() {
         record_special_trace(
@@ -1654,7 +1733,11 @@ pub(crate) fn rgamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialErr
             false,
         );
     }
-    Ok(value)
+    value
+}
+
+pub(crate) fn rgamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
+    Ok(rgamma_value(x, mode))
 }
 
 fn complex_rgamma_scalar(z: Complex64) -> Complex64 {
@@ -4500,6 +4583,121 @@ mod tests {
             }
         }
         GAMMA_FAMILY_PREALLOC_FILL.store(restore, Relaxed);
+    }
+
+    /// `rgamma_scalar` never returns `Err`, on any input, in any mode.
+    ///
+    /// The batch path now asserts this with an `unreachable!`, which turns a reading of the
+    /// code into a panic if it is wrong. The reading: a negative-integer pole returns
+    /// `Ok(0.0)` before `gamma_scalar(x, mode)?` is reached, and that call's only error is
+    /// the same pole under `Hardened`. This test is the evidence for it — poles, zeros,
+    /// infinities, NaN and both modes.
+    #[test]
+    fn rgamma_never_errors() {
+        let mut probes: Vec<f64> = vec![
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.0,
+            0.5,
+            -0.5,
+            170.0,
+            -170.5,
+            1.0e-300,
+            -1.0e-300,
+        ];
+        // Every negative-integer pole in the range the recurrence and the reflection cover.
+        probes.extend((1..=40).map(|i| -(i as f64)));
+        probes.extend((0..400).map(|i| -20.0 + i as f64 * 0.1));
+
+        for &mode in &[RuntimeMode::Strict, RuntimeMode::Hardened] {
+            for &x in &probes {
+                assert!(
+                    rgamma_scalar(x, mode).is_ok(),
+                    "rgamma_scalar returned Err at x={x} mode={mode:?}; the batch path's \
+                     `unreachable!` is now a live panic"
+                );
+            }
+            // And through the batch entry, which is what actually relies on it.
+            let tensor = SpecialTensor::RealVec(probes.clone());
+            assert!(
+                rgamma(&tensor, mode).is_ok(),
+                "rgamma batch returned Err in mode={mode:?}"
+            );
+        }
+    }
+
+    /// `digamma` fails at negative-integer poles under `Hardened` and NOT at zero, where
+    /// `gammaln` fails at both. The infallible batch decides that from a scan, so a wrong
+    /// predicate would turn a returned error into a silent value.
+    #[test]
+    fn digamma_infallible_batch_preserves_error_semantics() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = gamma_toggle_lock();
+        let restore = GAMMA_INFALLIBLE_BATCH.load(Relaxed);
+
+        let clean: Vec<f64> = (0..4096).map(|i| 0.25 + i as f64 * 0.01).collect();
+        let mut poled = clean.clone();
+        poled[1500] = -4.0;
+        let mut zeroed = clean.clone();
+        zeroed[1500] = 0.0;
+
+        let mut arms = Vec::new();
+        for enabled in [true, false] {
+            GAMMA_INFALLIBLE_BATCH.store(enabled, Relaxed);
+            let out = digamma(
+                &SpecialTensor::RealVec(clean.clone()),
+                RuntimeMode::Hardened,
+            )
+            .expect("clean input must not fail");
+            let SpecialTensor::RealVec(v) = out else {
+                panic!("expected RealVec")
+            };
+            arms.push(v);
+
+            assert!(
+                digamma(
+                    &SpecialTensor::RealVec(poled.clone()),
+                    RuntimeMode::Hardened
+                )
+                .is_err(),
+                "digamma must fail at a pole under Hardened (infallible={enabled})"
+            );
+            // ZERO IS NOT A DIGAMMA FAILURE, and this assertion originally claimed it was —
+            // the test caught my misreading, not a regression. `is_negative_integer_pole`
+            // requires `x < 0.0`, so zero does not match it and `digamma(0)` returns
+            // `Ok(inf)` with a trace, on BOTH arms. `gammaln` DOES fail at zero, which is
+            // exactly why the scan takes an `include_zero` flag rather than sharing one
+            // predicate across the family. What matters here is that the arms agree.
+            let zero_arm = digamma(
+                &SpecialTensor::RealVec(zeroed.clone()),
+                RuntimeMode::Hardened,
+            );
+            let SpecialTensor::RealVec(zv) = zero_arm.expect("digamma(0) must not fail") else {
+                panic!("expected RealVec")
+            };
+            assert!(
+                zv[1500].is_infinite(),
+                "digamma(0) should be infinite (infallible={enabled})"
+            );
+            assert!(
+                digamma(&SpecialTensor::RealVec(poled.clone()), RuntimeMode::Strict).is_ok(),
+                "Strict must not fail on a pole (infallible={enabled})"
+            );
+        }
+        GAMMA_INFALLIBLE_BATCH.store(restore, Relaxed);
+
+        let differing = arms[0]
+            .iter()
+            .zip(&arms[1])
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(
+            differing, 0,
+            "infallible digamma batch changed {differing} values"
+        );
     }
 
     /// Drives `GAMMA_INFALLIBLE_BATCH` in BOTH settings and pins the two things the
