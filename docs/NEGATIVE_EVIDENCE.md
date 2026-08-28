@@ -41818,3 +41818,66 @@ component that is about the host rather than the code, and ops that never fan ou
 carry it. That would make the sweep's RANKING partly an artifact. It is a hypothesis: testing
 it needs the quiescent host that is unavailable, and it is recorded so it is not mistaken for
 a measured claim.
+
+## 2026-08-28 REJECT of MY OWN hypothesis from the row above (Result class: BEHAVIORAL): fan-out is NOT uniformly penalised on a contended host — two of the three gamma-family ops are quicker WITH it, and the direction is per-op (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, arm sweep
+`lever=force_serial` applied to three ops. Run on worker hz2 with `RCH_WORKER=hz2`,
+`same_host=hetzner2`, harness=perf_special_vs_scipy, live SciPy in the same process, ELF sha
+self-reported. Two-sided arm control observed on every op: `on_hits=1 off_hits=0`.
+
+**What was claimed, and by whom**
+
+The row immediately above ends with a hypothesis I wrote: that a contended host penalises
+whichever implementation fans out, so every banked cell putting a threaded frankenscipy arm
+against a serial SciPy ufunc would carry a component about the host rather than the code, and
+part of the sweep's RANKING would be an artifact. It was labelled a hypothesis. It is now
+tested, and it is **wrong**.
+
+**How it was tested, and why three ops rather than one**
+
+`gamma`, `rgamma` and `digamma` share one fan-out gate and have three different kernels. If
+the schedule were what mattered, the direction would be the same for all three. If the kernel
+were what mattered, the direction could differ. That is the whole experiment, and it is only
+available because the ops share a gate.
+
+Each op ran the same in-process interleaved arm sweep, 25 position-balanced rounds,
+`arm=on` forcing serial and `arm=off` taking the shipped threshold. **All arms of all three
+ops agreed with live SciPy identically to their own baseline** — gamma and rgamma at
+`max_abs=0.00000000000000000e+00`, digamma at `2.84217094304040074e-14` on both arms,
+`compared=200000 nonfinite_mismatch=0` throughout. The schedule changes nothing numerically,
+which is the part this row banks.
+
+**The directions disagree, and two of three go the opposite way**
+
+The paired per-round aggregate is in the commit message with both A/A nulls per op. Stated
+without figures here: `gamma` prefers the serial arm; `rgamma` and `digamma` both prefer the
+threaded arm, and for `digamma` that preference is the largest single arm effect measured in
+this harness so far and sits far outside its control. So the schedule is not what decides it.
+A uniform host-penalty story predicts one direction and got two.
+
+**What replaced the hypothesis**
+
+Whether fanning out pays is a property of the OP, not of the host alone — the per-element
+kernel cost sets how much work each thread gets for a fixed spawn price, and the three
+kernels differ. `gamma`'s advantage for the serial arm did replicate across two runs on two
+different load levels, but it shrank as the host got quieter, so even the one op that prefers
+serial is not load-independent.
+
+**Consequence for the ledger: the ranking artifact claim is withdrawn.** It should not be
+cited. What survives is narrower and still useful: a single gate shared by four ops with
+different kernels cannot be right for all four, and the instrument to settle each of them
+per-op now exists.
+
+**Also observed, and it bears on every clock-derived row in this campaign.** The same three cells
+moved substantially between two runs of the same binary on the same worker hours apart, while
+the paired in-window arm sweeps stayed far steadier. Cross-run cell figures on hz2 are worth
+much less than same-window paired ones, which is an argument for the paired sweep and against
+quoting a cell as though it were a stable property.
+
+**No runtime claim is banked here**, for the same reason as the two rows above: the TIMED
+evidence set needs fail-closed host-wide quiescence, hz2 ran this at loadavg 10.64 rising to
+14.96 on 16 cores, and hz1 is refused admission for
+`disk_critical_without_fresh_telemetry`. Reported, not relaxed.
