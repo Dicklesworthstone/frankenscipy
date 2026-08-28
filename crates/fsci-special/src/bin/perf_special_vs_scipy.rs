@@ -42,8 +42,9 @@ use std::time::Instant;
 
 use fsci_runtime::RuntimeMode;
 use fsci_special::{
-    SpecialTensor, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit, exprel, gamma, gammaln, i0,
-    i1, j0, j1, k0, k1, rgamma, spence, y0, y1, zeta,
+    SpecialTensor, beta, betaln, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit, exprel, gamma,
+    gammainc, gammaincc, gammaln, hyp0f1, i0, i1, iv, ive, j0, j1, jn, jv, jve, k0, k1, kn, kv,
+    kve, rgamma, spence, y0, y1, yn, yv, yve, zeta,
 };
 
 const PYTHON: &str = r#"
@@ -54,13 +55,15 @@ from scipy import special as sp
 
 op = os.environ['FSCI_SPECIAL_OP']
 n = int(os.environ['FSCI_SPECIAL_N'])
+nargs = int(os.environ.get('FSCI_SPECIAL_NARGS', '1'))
 
-raw = sys.stdin.buffer.read(n * 8)
-if len(raw) != n * 8: raise RuntimeError('short fixture')
-x = np.frombuffer(raw, dtype='<f8').copy()
+raw = sys.stdin.buffer.read(n * 8 * nargs)
+if len(raw) != n * 8 * nargs: raise RuntimeError('short fixture')
+flat = np.frombuffer(raw, dtype='<f8').copy()
+args = [flat[i * n:(i + 1) * n] for i in range(nargs)]
 
 fn = getattr(sp, op)   # resolved by name: adding a case needs no change here
-def run(): return np.ascontiguousarray(fn(x), dtype='<f8')
+def run(): return np.ascontiguousarray(fn(*args), dtype='<f8')
 
 ref = run()
 print(f'READY scipy={scipy.__version__} numpy={np.__version__} op={op} n={n} '
@@ -104,19 +107,34 @@ struct Scipy {
 
 impl Scipy {
     fn start(op: &str, x: &[f64]) -> Self {
+        Self::start_n(op, &[x])
+    }
+
+    /// Start the child for an op of any arity. Arguments are sent as one flat little-endian
+    /// stream, argument-major, and the child slices them back apart — so adding a
+    /// two-argument case needs no protocol change beyond `FSCI_SPECIAL_NARGS`.
+    fn start_n(op: &str, args: &[&[f64]]) -> Self {
+        let n = args[0].len();
+        assert!(
+            args.iter().all(|a| a.len() == n),
+            "all argument arrays must have the same length"
+        );
         let mut child = Command::new("python3")
             .args(["-u", "-c", PYTHON])
             .env("FSCI_SPECIAL_OP", op)
-            .env("FSCI_SPECIAL_N", x.len().to_string())
+            .env("FSCI_SPECIAL_N", n.to_string())
+            .env("FSCI_SPECIAL_NARGS", args.len().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn live scipy.special child");
         let mut stdin = child.stdin.take().expect("python stdin");
-        let mut bytes = Vec::with_capacity(x.len() * 8);
-        for value in x {
-            bytes.extend_from_slice(&value.to_le_bytes());
+        let mut bytes = Vec::with_capacity(n * 8 * args.len());
+        for arg in args {
+            for value in *arg {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
         }
         stdin.write_all(&bytes).expect("send fixture");
         stdin.flush().expect("flush fixture");
@@ -209,6 +227,63 @@ const CASES: &[(&str, f64, f64)] = &[
     ("expit", -20.0, 20.0),
     ("exprel", -10.0, 10.0),
 ];
+
+/// Two-argument cases: the `scipy.special` name and a domain for each argument.
+///
+/// The one-argument survey was widened from 4 ops to 21 in 7f0e93d26 and immediately found
+/// `i0`/`i1` at 12x, the worst cells in the crate. TWO-argument ufuncs were never measured
+/// at all — 70 of SciPy's 232 are binary, 20 of them have a matching two-tensor entry point
+/// here — so this is the same unmeasured surface one arity up.
+///
+/// `hankel1`/`hankel2` and their scaled forms are excluded: they return complex, and this
+/// harness compares real arrays. Orders for `jn`/`kn`/`yn` are integer-valued because that
+/// is what those entry points mean by their first argument.
+const CASES2: &[(&str, f64, f64, f64, f64)] = &[
+    ("beta", 0.5, 8.0, 0.5, 8.0),
+    ("betaln", 0.5, 40.0, 0.5, 40.0),
+    ("gammainc", 0.5, 12.0, 0.1, 25.0),
+    ("gammaincc", 0.5, 12.0, 0.1, 25.0),
+    ("hyp0f1", 0.5, 10.0, -10.0, 10.0),
+    ("jv", 0.0, 10.0, 0.5, 30.0),
+    ("yv", 0.0, 10.0, 0.5, 30.0),
+    ("iv", 0.0, 5.0, 0.1, 12.0),
+    ("kv", 0.0, 5.0, 0.1, 12.0),
+    ("jve", 0.0, 10.0, 0.5, 30.0),
+    ("yve", 0.0, 10.0, 0.5, 30.0),
+    ("ive", 0.0, 5.0, 0.1, 12.0),
+    ("kve", 0.0, 5.0, 0.1, 12.0),
+];
+
+/// Integer-order siblings, kept apart because their first argument is quantised.
+const CASES2_INTEGER_ORDER: &[(&str, f64, f64, f64, f64)] = &[
+    ("jn", 0.0, 10.0, 0.5, 20.0),
+    ("yn", 0.0, 10.0, 0.5, 20.0),
+    ("kn", 0.0, 10.0, 0.1, 12.0),
+];
+
+/// Dispatch to our two-argument entry point for `op`.
+fn call_ours2(op: &str, a: &SpecialTensor, b: &SpecialTensor) -> fsci_special::SpecialResult {
+    let mode = RuntimeMode::Hardened;
+    match op {
+        "beta" => beta(a, b, mode),
+        "betaln" => betaln(a, b, mode),
+        "gammainc" => gammainc(a, b, mode),
+        "gammaincc" => gammaincc(a, b, mode),
+        "hyp0f1" => hyp0f1(a, b, mode),
+        "jv" => jv(a, b, mode),
+        "yv" => yv(a, b, mode),
+        "iv" => iv(a, b, mode),
+        "kv" => kv(a, b, mode),
+        "jve" => jve(a, b, mode),
+        "yve" => yve(a, b, mode),
+        "ive" => ive(a, b, mode),
+        "kve" => kve(a, b, mode),
+        "jn" => jn(a, b, mode),
+        "yn" => yn(a, b, mode),
+        "kn" => kn(a, b, mode),
+        other => panic!("no fsci two-argument entry point wired for {other}"),
+    }
+}
 
 /// Dispatch to our entry point for `op`. Kept next to [`CASES`] so a new case is two lines
 /// in one file rather than an edit in four places.
@@ -319,6 +394,15 @@ fn main() {
     );
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
+
+    // `FSCI_SPECIAL_BETA_DIRECT=0` restores `exp(betaln(a,b))` for `beta`, so the
+    // direct-Gamma product can be A/B'd inside ONE binary.
+    let beta_direct = !matches!(
+        std::env::var("FSCI_SPECIAL_BETA_DIRECT").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::BETA_CEPHES_DIRECT.store(beta_direct, std::sync::atomic::Ordering::Relaxed);
+    println!("beta_cephes_direct={beta_direct}");
 
     // `FSCI_SPECIAL_GAMMA_REFLECTFREE=0` restores the reflection formula (and its `sin`) for
     // negative arguments, so the recurrence route can be A/B'd -- for ACCURACY as much as
@@ -480,6 +564,91 @@ fn main() {
         let k = (i * 2_654_435_761usize).wrapping_add(40_503) % 1_000_003;
         k as f64 / 1_000_003.0
     };
+
+    // ── two-argument sweep ───────────────────────────────────────────────────────────
+    //
+    // Same protocol, same agreement check, same probe mode; only the arity differs. Run
+    // with `FSCI_SPECIAL_OPS=<name>` like the one-argument cases.
+    for (cases, integer_order) in [(CASES2, false), (CASES2_INTEGER_ORDER, true)] {
+        for &(op, alo, ahi, blo, bhi) in cases {
+            if !selected.split(',').any(|name| name.trim() == op) {
+                continue;
+            }
+            let a: Vec<f64> = (0..n)
+                .map(|i| {
+                    let v = alo + unit(i) * (ahi - alo);
+                    if integer_order { v.floor() } else { v }
+                })
+                .collect();
+            // A second, decorrelated stream for the other argument — reusing `unit(i)` for
+            // both would put every sample on the diagonal and exercise one line of a
+            // two-dimensional domain.
+            let b: Vec<f64> = (0..n)
+                .map(|i| blo + unit(i * 7 + 13) * (bhi - blo))
+                .collect();
+            println!("n={n} op={op} domain_a=[{alo}, {ahi}] domain_b=[{blo}, {bhi}]");
+
+            let mut scipy = Scipy::start_n(op, &[&a, &b]);
+            println!("{}", scipy.ready);
+
+            let ta = SpecialTensor::RealVec(a.clone());
+            let tb = SpecialTensor::RealVec(b.clone());
+            let ours = || -> Vec<f64> {
+                let out = call_ours2(op, &ta, &tb);
+                real_vec(out.unwrap_or_else(|e| panic!("fsci {op} failed: {e}")), op)
+            };
+            black_box(ours());
+
+            if let Ok(k) = std::env::var("FSCI_SPECIAL_PROBE") {
+                let k: usize = k.parse().expect("FSCI_SPECIAL_PROBE must be an integer");
+                let started = Instant::now();
+                for _ in 0..k {
+                    black_box(ours());
+                }
+                let ms = started.elapsed().as_secs_f64() * 1.0e3;
+                println!(
+                    "PROBE op={op} calls={k} n={n} elements={} ms={ms:.3}",
+                    k * n
+                );
+                continue;
+            }
+
+            let _ = scipy.time(1, 1);
+            const MIN_SAMPLE_MS2: f64 = 20.0;
+            let mut single = f64::INFINITY;
+            for _ in 0..3 {
+                let started = Instant::now();
+                black_box(ours());
+                single = single.min(started.elapsed().as_secs_f64() * 1.0e3);
+            }
+            let reps = fixed_reps
+                .unwrap_or_else(|| (MIN_SAMPLE_MS2 / single.max(1.0e-6)).ceil() as usize)
+                .clamp(1, 4096);
+            println!("op={op} calibration single={single:.4}ms reps={reps}");
+
+            let time_ours = || -> f64 {
+                let started = Instant::now();
+                for _ in 0..reps {
+                    black_box(ours());
+                }
+                started.elapsed().as_secs_f64() * 1.0e3 / reps as f64
+            };
+            let f1 = time_ours();
+            let s1 = scipy.time(reps, 1);
+            let s2 = scipy.time(reps, 1);
+            let f2 = time_ours();
+            let fsci = f1.min(f2);
+            let sci = s1.min(s2);
+            let check = scipy.check(&ours());
+            println!(
+                "case=n{n} op={op} fsci={fsci:.3}ms scipy={sci:.3}ms scipy/fsci={:.3}x \
+                 null_fsci={:.3} null_scipy={:.3} {check}",
+                sci / fsci,
+                f1.max(f2) / f1.min(f2),
+                s1.max(s2) / s1.min(s2),
+            );
+        }
+    }
 
     for &(op, default_lo, default_hi) in CASES {
         if !selected.split(',').any(|name| name.trim() == op) {

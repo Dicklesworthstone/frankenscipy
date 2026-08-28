@@ -2110,7 +2110,7 @@ fn clamp_unit_interval(value: f64) -> f64 {
 /// where it is needed is cheaper than keeping a `bool` live across a call, which costs a
 /// register or a spill and blocks the inlining LLVM was already doing. REMATERIALISATION
 /// BEATS CACHING FOR A PREDICATE THIS CHEAP — "remove the redundant work" is not a rule.
-fn gamma_core(x: f64) -> f64 {
+pub(crate) fn gamma_core(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }

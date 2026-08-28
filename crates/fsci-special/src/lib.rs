@@ -47,13 +47,14 @@ pub use bessel::{
     y1_zeros, y1p_zeros, yn, yn_zeros, ynp_zeros, yv, yve, yvp,
 };
 pub use beta::{
-    BETA_DISPATCH_PLAN, bdtr, bdtrc, bdtri, bdtrik, bdtrin, beta, betainc, betainc_scalar,
-    betaincc, betaincc_scalar, betainccinv, betainccinv_scalar, betaln, betaln_scalar, btdtr,
-    btdtrc, btdtri, btdtria, btdtrib, fdtr, fdtrc, fdtri, fdtridfd, log_betainc_scalar, nbdtr,
-    nbdtrc, nbdtri, nbdtrik, nbdtrik_many, nbdtrin, ncfdtr, ncfdtrc, ncfdtri, ncfdtri_many,
-    ncfdtridfd, ncfdtridfd_many, ncfdtridfn, ncfdtridfn_many, ncfdtrinc, ncfdtrinc_many, nctdtr,
-    nctdtr_many, nctdtridf, nctdtridf_many, nctdtrinc, nctdtrinc_many, nctdtrit, nctdtrit_many,
-    stdtr, stdtrc, stdtridf, stdtrit, stdtrit_many,
+    BETA_CEPHES_DIRECT, BETA_CEPHES_DIRECT_HITS, BETA_DISPATCH_PLAN, bdtr, bdtrc, bdtri, bdtrik,
+    bdtrin, beta, betainc, betainc_scalar, betaincc, betaincc_scalar, betainccinv,
+    betainccinv_scalar, betaln, betaln_scalar, btdtr, btdtrc, btdtri, btdtria, btdtrib, fdtr,
+    fdtrc, fdtri, fdtridfd, log_betainc_scalar, nbdtr, nbdtrc, nbdtri, nbdtrik, nbdtrik_many,
+    nbdtrin, ncfdtr, ncfdtrc, ncfdtri, ncfdtri_many, ncfdtridfd, ncfdtridfd_many, ncfdtridfn,
+    ncfdtridfn_many, ncfdtrinc, ncfdtrinc_many, nctdtr, nctdtr_many, nctdtridf, nctdtridf_many,
+    nctdtrinc, nctdtrinc_many, nctdtrit, nctdtrit_many, stdtr, stdtrc, stdtridf, stdtrit,
+    stdtrit_many,
 };
 pub use convenience::{
     CONVENIENCE_DISPATCH_PLAN,
