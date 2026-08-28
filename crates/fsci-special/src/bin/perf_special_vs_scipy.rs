@@ -1025,6 +1025,9 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool))> {
         "erfcinv" => Some(("ndtri_not_acklam", |on| {
             fsci_special::ERFCINV_NDTRI.store(on, std::sync::atomic::Ordering::Relaxed);
         })),
+        "erfinv" => Some(("infallible_batch", |on| {
+            fsci_special::ERFINV_INFALLIBLE_BATCH.store(on, std::sync::atomic::Ordering::Relaxed);
+        })),
         // `on` = stay SERIAL for this batch, `off` = the shipped threshold (fan out at
         // 131072). All four of gamma/rgamma/digamma/gammaln share the gate, so one lever
         // drives each of them.
@@ -1058,6 +1061,9 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
         "erfcinv" => {
             Some(|| fsci_special::ERFCINV_NDTRI_HITS.load(std::sync::atomic::Ordering::Relaxed))
         }
+        "erfinv" => Some(|| {
+            fsci_special::ERFINV_INFALLIBLE_BATCH_HITS.load(std::sync::atomic::Ordering::Relaxed)
+        }),
         "gamma" | "rgamma" | "digamma" => Some(|| {
             fsci_special::GAMMA_FAMILY_SERIAL_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),

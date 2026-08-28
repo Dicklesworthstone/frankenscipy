@@ -205,6 +205,27 @@ fn erfc_real_vec_simd(values: &[f64]) -> Vec<f64> {
 }
 
 pub fn erfinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    // Infallible batch. `erfinv_scalar` can only return `Err` on an out-of-domain input, so
+    // an array with none cannot fail, and building a `Result<f64, SpecialError>` — two
+    // `&'static str` plus two enums, around 56 bytes — for every element of it is pure
+    // overhead. gamma and digamma each gained about 29 instructions per element from exactly
+    // this change; `gammaln` LOST 17 to it, so the outcome is not assumed here, it is
+    // measured against the `Result` path in the same process.
+    //
+    // The `any` scan is what keeps semantics identical rather than merely similar. An
+    // out-of-domain element must still produce its trace and, in Hardened mode, its error, so
+    // if one is present this declines the fast path entirely and the per-element route runs
+    // unchanged. That costs one cheap pass on the arrays that DO take the fast path, and it
+    // is the honest price of the lever rather than something to hide.
+    if let SpecialTensor::RealVec(values) = y
+        && ERFINV_INFALLIBLE_BATCH.load(std::sync::atomic::Ordering::Relaxed)
+        && !values.iter().any(|&v| v.abs() > 1.0)
+    {
+        ERFINV_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(SpecialTensor::RealVec(
+            values.iter().map(|&v| erfinv_value(v)).collect(),
+        ));
+    }
     map_unary_input_rp(
         "erfinv",
         y,
@@ -214,6 +235,20 @@ pub fn erfinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
         1 << 20, // cheap ndtri-Newton (~23ns); default-256 gate lost 18.8x@4096 (BlackThrush A/B)
     )
 }
+
+/// Take the infallible batch path in [`erfinv`] for in-domain real arrays (`true`, shipping).
+///
+/// BIT-IDENTICAL by construction: both arms call the same `erfinv_value` on the same inputs.
+/// Only the presence of a per-element `Result` differs, and an out-of-domain array declines
+/// the fast path outright, so traces and errors are unchanged in either arm.
+pub static ERFINV_INFALLIBLE_BATCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// BATCHES that took the infallible path — "enabled" is not "took effect".
+///
+/// Counted once per batch, not per element, so it is not a call count. A diagnostic counter;
+/// incrementing it changes no numeric result.
+pub static ERFINV_INFALLIBLE_BATCH_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub fn erfcinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     // The arm is read ONCE for the whole batch and passed down as a `bool`, never read per
@@ -707,15 +742,9 @@ fn erfc_complex_asymptotic(z: Complex64) -> Complex64 {
 }
 
 pub fn erfinv_scalar(y: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    if y.is_nan() {
-        return Ok(f64::NAN);
-    }
-    if y == 1.0 {
-        return Ok(f64::INFINITY);
-    }
-    if y == -1.0 {
-        return Ok(f64::NEG_INFINITY);
-    }
+    // The NaN and endpoint cases live in `erfinv_value` and are not repeated here. `NaN.abs()
+    // > 1.0` is false, so NaN falls through this domain test to `erfinv_value` exactly as it
+    // did when the test was written out in this function.
     if y.abs() > 1.0 {
         return match mode {
             RuntimeMode::Strict => {
@@ -749,16 +778,40 @@ pub fn erfinv_scalar(y: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
             }
         };
     }
+    Ok(erfinv_value(y))
+}
+
+/// `erfinv` for an input already known to be IN DOMAIN, with no `Result` in sight.
+///
+/// PRECONDITION, and it is enforced by the caller rather than checked here: `|y| <= 1` or
+/// `y` is NaN. `erfinv_scalar` tests the domain before delegating, and the batch entry point
+/// scans for a violation up front and declines the infallible path if it finds one. This
+/// function therefore performs NO domain test and records NO trace — those belong to the
+/// caller that established the precondition.
+///
+/// Splitting it out this way is what lets the batch avoid building a
+/// `Result<f64, SpecialError>` for every element of an array that cannot produce an error.
+/// The algorithm is unchanged and lives in exactly one place.
+fn erfinv_value(y: f64) -> f64 {
+    if y.is_nan() {
+        return f64::NAN;
+    }
+    if y == 1.0 {
+        return f64::INFINITY;
+    }
+    if y == -1.0 {
+        return f64::NEG_INFINITY;
+    }
     if y == 0.0 {
-        return Ok(y);
+        return y;
     }
 
     let p = 0.5 * (y + 1.0);
     if p == 0.0 || p == 1.0 {
-        return Ok(y.signum() * crate::convenience::erfcinv_conv(1.0 - y.abs()));
+        return y.signum() * crate::convenience::erfcinv_conv(1.0 - y.abs());
     }
 
-    Ok(crate::convenience::ndtri_scalar(p) * std::f64::consts::FRAC_1_SQRT_2)
+    crate::convenience::ndtri_scalar(p) * std::f64::consts::FRAC_1_SQRT_2
 }
 
 fn erfinv_complex_scalar(y: Complex64, mode: RuntimeMode) -> Result<Complex64, SpecialError> {

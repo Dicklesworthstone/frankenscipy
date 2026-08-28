@@ -6477,6 +6477,38 @@ mod tests {
     /// the old series/asymptotic split) so a future re-cut is caught at the seam.
     #[test]
     fn y0_y1_match_scipy_reference_values() {
+        // TAKES THE TOGGLE LOCK, and it must: this test READS a toggled kernel.
+        //
+        // `y0_core_positive` and `y1_core_positive` branch on `BESSEL_Y01_CEPHES_LARGE`, and
+        // `y1_cephes_small_matches_the_series` temporarily stores `false` into it. Both
+        // tests ran without excluding each other, so under a concurrent `cargo test` this
+        // one could evaluate the OLD series path against references pinned to the Cephes
+        // path and fail at ~4e-13 — observed on hz2, 1178 passed / 1 failed, from a source
+        // change in an unrelated file.
+        //
+        // The lock already existed and every WRITER took it. That is not enough: a mutex
+        // only excludes participants that take it, and a reader of shared mutable state is a
+        // participant. The doc comment above even records that this test FAILS with the
+        // toggle off, which is exactly the failure a racing writer induces.
+        //
+        // The arm is also pinned explicitly rather than inherited, so the test states which
+        // path it is gating instead of depending on ambient process state, and restored
+        // afterwards so it leaves nothing behind for the next test.
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = bessel_toggle_lock();
+        let was = BESSEL_Y01_CEPHES_LARGE.load(Relaxed);
+        BESSEL_Y01_CEPHES_LARGE.store(true, Relaxed);
+        // `_restore` and not `_`: a bare underscore drops the guard IMMEDIATELY, which would
+        // restore the toggle before the test body ran and defeat the pin. It restores on the
+        // assertion's unwind too.
+        let _restore = RestoreY01Large(was);
+        struct RestoreY01Large(bool);
+        impl Drop for RestoreY01Large {
+            fn drop(&mut self) {
+                BESSEL_Y01_CEPHES_LARGE.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
         // scipy 1.17.1 / numpy 2.4.3
         const REFERENCE: &[(f64, f64, f64)] = &[
             (0.1, -1.5342386513503667, -6.458951094702027),

@@ -41881,3 +41881,92 @@ quoting a cell as though it were a stable property.
 evidence set needs fail-closed host-wide quiescence, hz2 ran this at loadavg 10.64 rising to
 14.96 on 16 cores, and hz1 is refused admission for
 `disk_critical_without_fresh_telemetry`. Reported, not relaxed.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) of the premise that erfinv's deficit is its wrapper: removing the per-element `Result` helps and the cell is STILL a loss, so the wrapper was never the explanation (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, arm sweep
+`lever=infallible_batch`. Run on worker hz2 with `RCH_WORKER=hz2`, `same_host=hetzner2`,
+harness=perf_special_vs_scipy, live SciPy in the same process, ELF sha self-reported.
+Two-sided arm control observed: `on_hits=1 off_hits=0`.
+
+**How the target was chosen, because that is part of the evidence**
+
+Not from the most recent sweep. Cells from this harness on hz2 are not stable across runs —
+the row above records three of them moving by 30 to 50 per cent between two runs of the same
+binary — so picking the worst cell from one run risks selecting a favourable pairing rather
+than a real deficit. Instead all eleven full sweeps captured today were aggregated and ranked
+by MEDIAN cell with the observed range printed beside it.
+
+`erfinv` was not the lowest median. It was chosen because it is the tightest: eleven runs,
+and its best run is still clearly a loss. A deficit that never once disappears across eleven
+independent runs cannot be an artifact of a lucky pair. `erfinv` is also below its parallel
+gate at this size, so unlike the gamma family it carries none of the scheduling confound
+that the two rows above spent their time on.
+
+**The premise, and it was checked before any code was written**
+
+`ndtri_scalar` — which is all `erfinv` does after a halving — is straight Cephes with NO
+refinement step, the same algorithm SciPy runs. So "we do extra polish the incumbent does
+not" was refuted by reading, not by building. What remained was the wrapper: `erfinv` built a
+`Result<f64, SpecialError>` per element, roughly 56 bytes of it, for arrays that in the
+overwhelming majority of cases cannot fail. gamma and digamma each gained from removing
+exactly that; `gammaln` LOST to it. So the outcome was genuinely open.
+
+`ledger_preflight --propose` was run first on both this lever and on the SIMD alternative.
+It surfaced a 2026-07-04 `ndtri` central-region SIMD reject which it classes VOID-NONULL —
+re-running would have been admissible — but that row's stated reason is that the log/sqrt
+TAILS dominate, so vectorising the central branch does not touch the expensive part. Not
+re-tread.
+
+**What was observed**
+
+Both arms were checked elementwise against live SciPy and returned the SAME figures —
+`max_abs=2.26485497023531934e-14`, `max_rel=7.40907513953783678e-12`,
+`compared=200000 nonfinite_mismatch=0` — which is what "bit-identical" means here: the two
+arms call the same `erfinv_value` on the same inputs and differ only in whether a `Result` is
+constructed around it. An out-of-domain array declines the fast path outright, so traces and
+errors are unchanged in either arm.
+
+The paired per-round aggregate and both A/A nulls are in the commit message. This was the
+best-conditioned window of the session by a wide margin, and for once the effect's observed
+range does not touch the range of its own control.
+
+**The part that matters more than the win: it does NOT close the gap**
+
+The lever helps and `erfinv` remains a loss against the incumbent. Removing the per-element
+`Result` recovered a small fraction of the deficit, not the bulk of it, so the wrapper was
+never the explanation — and this row exists mainly to say so before someone reads a green
+commit and assumes `erfinv` is now fixed. **The remaining majority of the deficit is
+unexplained.** What is now excluded: extra refinement (there is none), the parallel gate
+(below it at this size), and the per-element `Result` (measured, small). What is not yet
+excluded is the tail branch, where each element pays two logarithms and a square root that
+SciPy's identical algorithm also pays — which is precisely why the gap there is a puzzle
+rather than an obvious lever.
+
+**No runtime claim is banked here.** The TIMED evidence set requires fail-closed host-wide
+quiescence. This was the quietest window of the day and it was still loadavg 6.17 rising to
+9.81 on 16 cores, which does not meet it; hz1 remains refused for
+`disk_critical_without_fresh_telemetry`. Reported, not relaxed.
+
+**A RED SUITE THIS TURN UNCOVERED, in a file this change never touched**
+
+`bessel::tests::y0_y1_match_scipy_reference_values` failed on hz2 — 1178 passed, 1 failed —
+reporting y0 4.08e-13 at x=9. It is fully deterministic: hard-coded references, direct kernel
+calls, no threads of its own. It cannot flake on its own inputs, so the state had to be
+shared.
+
+`y0_core_positive` branches on the process-global `BESSEL_Y01_CEPHES_LARGE`, and a sibling
+test stores `false` into that toggle for the duration of its own body. A `bessel_toggle_lock`
+already existed and every WRITER took it. That is not sufficient, and the gap is the reusable
+lesson: **a mutex only excludes participants that take it, and a READER of shared mutable
+state is a participant.** Under a concurrent `cargo test` this test could evaluate the old
+series path against references pinned to the Cephes path. Its own doc comment records that it
+FAILS with that toggle off, which is precisely what a racing writer induces.
+
+Fixed by having the reader take the same lock and pin the arm it is documented to gate,
+restoring on scope exit including an unwind. Suite green afterwards, every result line read.
+
+The toggle is one I landed in an earlier session, so this is my defect surfacing, not a
+regression from the lever above; it was latent and load-dependent and had been passing.
