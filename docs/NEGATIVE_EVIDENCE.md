@@ -41749,3 +41749,72 @@ is worse than not having it.
 
 **Not decided here:** whether the deficit `erfcinv` now carries against the incumbent is
 reducible. That is a runtime question and it needs the quiescent host described above.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) of the premise that gamma's deficit is its kernel: a third of it is our OWN threads, and the fan-out gate is a bare constant that cannot know how many cores are free (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, arm sweep
+`lever=force_serial`. Run on worker hz2 with `RCH_WORKER=hz2`, `same_host=hetzner2`,
+harness=perf_special_vs_scipy, live SciPy in the same process, ELF sha self-reported in the
+run log. Two-sided arm control observed: `on_hits=1 off_hits=0`.
+
+**The premise that was wrong**
+
+`gamma` is the worst cell in the one-argument sweep and it is BIT-IDENTICAL to the incumbent
+(`max_abs=0.00000000000000000e+00` over 200000 points, `compared=200000
+nonfinite_mismatch=0`). The natural reading — and mine — was that a bit-identical Cephes
+rational must simply have a costlier kernel than SciPy's.
+
+The arithmetic refuses that reading. `GAMMA_FAMILY_PAR_MIN` is `1 << 17` = 131072 and the
+fixture is 200000, so the batch **already fans out across threads**; `map_real_infallible`
+picks `min(available_parallelism, n / 32768)` = 6 of them. Six threads losing to one
+single-threaded ufunc would require our per-element kernel to be roughly nine times SciPy's,
+which is not a credible property of the same algorithm. So the fan-out itself was the
+suspect, not the kernel.
+
+**What was actually observed, and it is deterministic**
+
+Both schedules were run as interleaved arms in one process and both were checked elementwise
+against live SciPy: `arm=on` (forced serial) and `arm=off` (the shipped threshold) each
+returned `max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00`,
+`compared=200000 nonfinite_mismatch=0`. The two schedules are **bit-identical to each other
+and to the incumbent** — `map_real_infallible` and `par_map_light` give every index its own
+output slot and apply the same scalar kernel, so only the schedule differs. That is the part
+this row banks, and it needs no clock.
+
+**The structural defect: the gate is a constant, and the question is not about n**
+
+`GAMMA_FAMILY_PAR_MIN` decides fan-out from array length alone. Whether fanning out helps
+depends on how many cores are FREE, which a compile-time constant cannot know. hz2's own
+bracketed readings during this run were loadavg 20.08 rising to 22.03 on a 16-core host —
+oversubscribed — and under that condition the shipped threshold makes the gamma family spawn
+six threads into a machine that has none to give. The gate was presumably tuned on a quiet
+machine, where it may well be right.
+
+Landed here: `GAMMA_FAMILY_PAR_MIN_OVERRIDE` plus a `GAMMA_FAMILY_SERIAL_HITS` counter, so
+the two schedules can be timed against each other **in one process on the machine that will
+actually run them** instead of inferred from a constant chosen on a different machine. The
+whole gamma family — gamma, rgamma, digamma, gammaln — shares the gate, so one probe covers
+four ops.
+
+**THE SHIPPED DEFAULT IS DELIBERATELY UNCHANGED.** The evidence covers exactly one load
+regime. Re-tuning a shipped constant from single-regime evidence is the same mistake that
+produced the current value, in the opposite direction, and doing it would be unjustified.
+
+**The gate that cannot be satisfied on this worker, reported rather than relaxed**
+
+Which schedule is quicker is a runtime claim and is therefore not banked in this row. Banking
+it needs the TIMED evidence set including fail-closed host-wide quiescence, and a host at
+loadavg 22 on 16 cores cannot supply it; hz1, the only other SciPy-carrying worker in the
+fleet, is refused admission for `disk_critical_without_fresh_telemetry`. The figures, the
+paired per-round aggregation and both A/A nulls are recorded in the commit message instead.
+
+**The fleet-wide implication, stated as a hypothesis rather than a result**
+
+If a contended host penalises whichever implementation fans out, then every banked cell in
+this campaign comparing a threaded frankenscipy arm against a serial SciPy ufunc carries a
+component that is about the host rather than the code, and ops that never fan out do not
+carry it. That would make the sweep's RANKING partly an artifact. It is a hypothesis: testing
+it needs the quiescent host that is unavailable, and it is recorded so it is not mistaken for
+a measured claim.
