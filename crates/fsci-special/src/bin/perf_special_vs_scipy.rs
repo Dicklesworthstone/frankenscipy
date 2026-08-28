@@ -985,6 +985,20 @@ fn main() {
                 median(null_on),
                 median(null_off),
             );
+            // Each arm against the INCUMBENT, not just against each other. `off/on` says
+            // which of our two schedules is quicker and says nothing about whether either
+            // beats SciPy — and it is the second question the cell is actually judged on.
+            //
+            // CROSS-WINDOW, deliberately labelled: `scipy_ms` is the median from the paired
+            // SciPy comparison above, taken in a different window from the arm sweep. It is
+            // the same figure the `case=` line already reports, so these two ratios are
+            // directly comparable to that line and NOT to the paired `off/on` beside them.
+            emit!(
+                "armab op={op} lever={name} crosswindow scipy/on={:.3}x scipy/off={:.3}x \
+                 (case line reports scipy/off)",
+                scipy_ms / on_med,
+                scipy_ms / off_med,
+            );
             emit!("armab op={op} lever={name} arm=on  {check_on}");
             emit!("armab op={op} lever={name} arm=off {check_off}");
             set(true);
@@ -1012,9 +1026,16 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool))> {
             fsci_special::ERFCINV_NDTRI.store(on, std::sync::atomic::Ordering::Relaxed);
         })),
         // `on` = stay SERIAL for this batch, `off` = the shipped threshold (fan out at
-        // 131072). The whole gamma family shares the gate, so `gamma` is the probe for all
-        // four of gamma/rgamma/digamma/gammaln.
-        "gamma" => Some(("force_serial", |on| {
+        // 131072). All four of gamma/rgamma/digamma/gammaln share the gate, so one lever
+        // drives each of them.
+        //
+        // Applied to THREE ops rather than one on purpose. A single op showing that its own
+        // fan-out is what puts it behind the incumbent is a fact about that op; the same
+        // result across ops that share the SCHEDULE but not the kernel is what separates
+        // "our gamma kernel is slow" from "our thread policy is wrong at this size on this
+        // host" — and those two have entirely different fixes. (`gammaln`'s sweep slot is
+        // taken by `cephes_lgam`; one lever per op.)
+        "gamma" | "rgamma" | "digamma" => Some(("force_serial", |on| {
             fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(
                 if on { usize::MAX } else { 0 },
                 std::sync::atomic::Ordering::Relaxed,
@@ -1037,7 +1058,7 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
         "erfcinv" => {
             Some(|| fsci_special::ERFCINV_NDTRI_HITS.load(std::sync::atomic::Ordering::Relaxed))
         }
-        "gamma" => Some(|| {
+        "gamma" | "rgamma" | "digamma" => Some(|| {
             fsci_special::GAMMA_FAMILY_SERIAL_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),
         _ => None,
