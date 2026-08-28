@@ -4097,6 +4097,55 @@ pub static BESSEL_Y01_CEPHES_LARGE_HITS: std::sync::atomic::AtomicUsize =
 // coefficients, so `Y1` below 5 keeps its power series and is left as named, measured work
 // rather than half-done here.
 
+// ── Cephes Y1 small-argument branch, 0 < x <= 5 ──────────────────────────────────────
+//
+// WHY. `y1` was the last cell in this family still on a power series below x = 5, and it is
+// the only one of `y0`/`y1` that is not bit-identical to SciPy: max_abs 1.42e-14. `y0` has
+// had Cephes' small-argument rational all along and reads exactly 0. Localising the
+// difference: above 5 both functions already take the same large-argument form, so the
+// residual is entirely the x <= 5 branch.
+//
+// WHAT THE INCUMBENT ACTUALLY RUNS, checked rather than assumed. Profiling SciPy's `y1`
+// shows `xsf::cyl_bessel_y1` and `xsf::cephes::j1` — NOT `xsf::cephes::y1`. The structure
+// `Y1(x) = x·P(x²)/Q(x²) + (2/π)(J1(x)·ln x − 1/x)` is the Cephes one and it calls `j1`,
+// which is what the profile shows, so the tables below are the right ones. That check
+// mattered: `xsf/cephes/j0.h`'s `y0` carries an extra `x >= 10` phase form that SciPy's
+// `cyl_bessel_y0` does NOT use, and adopting it would have BROKEN y0's bit-identity. The
+// source on GitHub main is not automatically the code the installed incumbent runs.
+
+/// Numerator of Cephes' `Y1` small-argument rational, in `x^2`. Degree 5, six terms.
+#[allow(clippy::excessive_precision)]
+const Y1_SMALL_YP: [f64; 6] = [
+    1.26320474790178026440E9,
+    -6.47355876379160291031E11,
+    1.14509511541823727583E14,
+    -8.12770255501325109621E15,
+    2.02439475713594898196E17,
+    -7.78877196265950026825E17,
+];
+
+/// Denominator of Cephes' `Y1` small-argument rational. MONIC — the leading 1.0 is not
+/// stored, so this is evaluated with `cephes_p1evl` and NOT `cephes_polevl`.
+#[allow(clippy::excessive_precision)]
+const Y1_SMALL_YQ: [f64; 8] = [
+    5.94301592346128195359E2,
+    2.35564092943068577943E5,
+    7.34811944459721705660E7,
+    1.87601316108706159478E10,
+    3.88231277496238566008E12,
+    6.20557727146953693363E14,
+    6.87141087355300489866E16,
+    3.97270608116560655612E18,
+];
+
+/// `Y1(x)` for `0 < x <= 5`, the Cephes small-argument form. Uses `J1`, hence the shared
+/// `j1_core`.
+fn y1_cephes_small(x: f64) -> f64 {
+    let z = x * x;
+    let w = x * (cephes_polevl(z, &Y1_SMALL_YP) / cephes_p1evl(z, &Y1_SMALL_YQ));
+    w + FRAC_2_PI * (j1_core(x) * x.ln() - 1.0 / x)
+}
+
 /// `Y0(x)` for `x > 5`, the Cephes large-argument form. Shares `J0`'s tables.
 fn y0_cephes_large(x: f64) -> f64 {
     let w = 5.0 / x;
@@ -4208,9 +4257,13 @@ fn y1_series_small(x: f64) -> f64 {
 }
 
 fn y1_core_positive(x: f64) -> f64 {
-    if x > 5.0 && BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed) {
+    if BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed) {
         BESSEL_Y01_CEPHES_LARGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return y1_cephes_large(x);
+        return if x > 5.0 {
+            y1_cephes_large(x)
+        } else {
+            y1_cephes_small(x)
+        };
     }
     if x < 14.0 {
         // Power series (DLMF 10.8.1) for x<14 (≳11 digits); x≥14 uses the NR fit.
@@ -6224,6 +6277,68 @@ mod tests {
         assert!(
             worst0 < 64.0 && worst1 < 64.0,
             "direct and kv paths disagree: k0 {worst0} ULP at {at0}, k1 {worst1} ULP at {at1}"
+        );
+    }
+
+    /// The `Y1` small-argument rational agrees with the power series it replaces, and both
+    /// branches of `y1_core_positive` are reached.
+    ///
+    /// The 14 transcribed coefficients are cross-checked against an implementation that
+    /// shares none of them. The bound is loose for the same reason as the `y0` reflection
+    /// check: the SERIES is the less accurate side here — against live SciPy the rational is
+    /// exactly 0 where the series was 1.42e-14 — so this catches a mistranscription, and the
+    /// live-incumbent arm adjudicates accuracy.
+    #[test]
+    fn y1_cephes_small_matches_the_series() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = bessel_toggle_lock();
+        let was = BESSEL_Y01_CEPHES_LARGE.load(Relaxed);
+
+        let mut points: Vec<f64> = Vec::new();
+        for i in 1..=2000 {
+            points.push(0.002 + (10.0 - 0.002) * (i as f64 / 2000.0));
+        }
+        points.extend([1.0e-6, 0.01, 0.5, 1.0, 2.0, 4.999, 5.0, 5.001, 9.9]);
+
+        let (mut small, mut large) = (0usize, 0usize);
+        let mut worst = 0.0_f64;
+        let mut worst_at = f64::NAN;
+        for &x in &points {
+            if x <= 5.0 {
+                small += 1;
+            } else {
+                large += 1;
+            }
+            BESSEL_Y01_CEPHES_LARGE.store(true, Relaxed);
+            let cephes = y1_core_positive(x);
+            BESSEL_Y01_CEPHES_LARGE.store(false, Relaxed);
+            let series = y1_core_positive(x);
+            assert!(
+                cephes.is_finite() && series.is_finite(),
+                "non-finite at x={x}: cephes {cephes} series {series}"
+            );
+            let rel = (cephes - series).abs() / series.abs().max(f64::MIN_POSITIVE);
+            if rel > worst {
+                worst = rel;
+                worst_at = x;
+            }
+        }
+        BESSEL_Y01_CEPHES_LARGE.store(was, Relaxed);
+
+        // MUST-HIT: both branches, or this is evidence about only one of them.
+        assert!(
+            small > 0 && large > 0,
+            "grid missed a branch: x<=5 {small}, x>5 {large}"
+        );
+        println!(
+            "y1 cephes vs series: worst rel {worst:e} at x={worst_at}, {} points \
+             (small={small} large={large})",
+            points.len()
+        );
+        assert!(
+            worst < 1.0e-6,
+            "Y1 rational and series disagree by {worst:e} at x={worst_at}; \
+             a transcribed coefficient is probably wrong"
         );
     }
 
