@@ -546,15 +546,23 @@ fn gammaln_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
             // path deliberately.
             GAMMALN_HOIST_THRESHOLD_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let min_x = gammaln_asymptotic_min_x();
+            // Hoisted for the same reason as `min_x`, and the counter with it: a relaxed
+            // load per element is an optimisation barrier, and a `fetch_add` per element is
+            // a contended write this crate has already priced at 2 instructions per element.
+            // Once per batch it is neither.
+            let cephes = GAMMALN_CEPHES_LGAM.load(std::sync::atomic::Ordering::Relaxed);
+            if cephes {
+                GAMMALN_CEPHES_LGAM_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if values.len() >= GAMMA_FAMILY_PAR_MIN {
                 par_map_light(values.len(), |i| {
-                    gammaln_scalar_with_threshold(values[i], mode, min_x)
+                    gammaln_scalar_with_threshold(values[i], mode, min_x, cephes)
                 })
                 .map(SpecialTensor::RealVec)
             } else {
                 values
                     .iter()
-                    .map(|&x| gammaln_scalar_with_threshold(x, mode, min_x))
+                    .map(|&x| gammaln_scalar_with_threshold(x, mode, min_x, cephes))
                     .collect::<Result<Vec<_>, _>>()
                     .map(SpecialTensor::RealVec)
             }
@@ -1251,7 +1259,12 @@ pub(crate) fn gamma_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialErro
 }
 
 pub fn gammaln_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    gammaln_scalar_with_threshold(x, mode, gammaln_asymptotic_min_x())
+    gammaln_scalar_with_threshold(
+        x,
+        mode,
+        gammaln_asymptotic_min_x(),
+        GAMMALN_CEPHES_LGAM.load(std::sync::atomic::Ordering::Relaxed),
+    )
 }
 
 /// `gammaln_scalar` with the Lanczos/asymptotic crossover passed IN rather than read from
@@ -1273,6 +1286,7 @@ fn gammaln_scalar_with_threshold(
     x: f64,
     mode: RuntimeMode,
     asymptotic_min_x: f64,
+    cephes_lgam: bool,
 ) -> Result<f64, SpecialError> {
     if x.is_nan() {
         return Ok(f64::NAN);
@@ -1307,7 +1321,9 @@ fn gammaln_scalar_with_threshold(
     }
 
     let output = if x >= 0.5 {
-        if x < asymptotic_min_x {
+        if cephes_lgam {
+            lgam_cephes_positive(x)
+        } else if x < asymptotic_min_x {
             lngamma_lanczos(x)
         } else {
             lngamma_positive(x)
@@ -1471,6 +1487,102 @@ fn multigammaln_scalar(a: f64, d: f64, mode: RuntimeMode) -> Result<f64, Special
     }
     Ok(result)
 }
+
+// ── Cephes lnGamma, x > 0 ────────────────────────────────────────────────────────────
+//
+// WHY. Profiling `gammaln` against the live SciPy arm put 82.3 of its 183.1 instructions per
+// element inside `log`, against SciPy's 27.7 — three times the logarithm work. Our Lanczos
+// band (0.5 <= x < 20, a third of the fixture) evaluates TWO logs, `t.ln()` and
+// `coeff_sum.ln()`; Cephes reduces the argument into [2,3] by multiplication and division
+// and then needs ONE, `log(z)`, plus a rational.
+//
+// THIS IS NOT THE REWRITE THAT WAS REFUTED IN 24e68d940. That one was rejected because the
+// ASYMPTOTIC band — where our Stirling and Cephes' agree in shape — was still 1.45x, so a
+// kernel swap could not reach the gap. The measurement since then is different and specific:
+// the gap is logarithm count, and it is concentrated in the band where the two do NOT agree.
+//
+// The wrapper is not the lever either: bc8975013 measured the infallible batch LOSING 17
+// instructions per element here.
+
+/// Stirling correction for `lnGamma` on 13 <= x < 1000, in 1/x^2. polevl, degree 4.
+#[allow(clippy::excessive_precision)]
+const LGAM_CHEB_A: [f64; 5] = [
+    8.11614167470508450300E-4,
+    -5.95061904284301438324E-4,
+    7.93650340457716943945E-4,
+    -2.77777777730099687205E-3,
+    8.33333333333331927722E-2,
+];
+
+/// Numerator of Cephes' lnGamma rational on [2,3], in x-2. polevl, degree 5.
+#[allow(clippy::excessive_precision)]
+const LGAM_RAT_B: [f64; 6] = [
+    -1.37825152569120859100E3,
+    -3.88016315134637840924E4,
+    -3.31612992738871184744E5,
+    -1.16237097492762307383E6,
+    -1.72173700820839662146E6,
+    -8.53555664245765465627E5,
+];
+
+/// Denominator of the same rational. MONIC - evaluated with p1evl, NOT polevl.
+#[allow(clippy::excessive_precision)]
+const LGAM_RAT_C: [f64; 6] = [
+    -3.51815701436523470549E2,
+    -1.70642106651881159223E4,
+    -2.20528590553854454839E5,
+    -1.13933444367982507207E6,
+    -2.53252307177582951285E6,
+    -2.01889141433532773231E6,
+];
+
+/// `ln|Gamma(x)|` for `x > 0` by SciPy's own method: one logarithm, not two.
+///
+/// Mirrors `xsf::cephes::detail::lgam_sgn` for positive arguments — the recurrence into
+/// [2,3] with a rational below 13, the Stirling series with `LGAM_CHEB_A` from 13 to 1000,
+/// and the reduced Stirling form above that. Callers handle poles, zero and negative x.
+fn lgam_cephes_positive(x: f64) -> f64 {
+    if x < 13.0 {
+        let mut z = 1.0_f64;
+        let mut p = 0.0_f64;
+        let mut u = x;
+        while u >= 3.0 {
+            p -= 1.0;
+            u = x + p;
+            z *= u;
+        }
+        while u < 2.0 {
+            // `u == 0` is a pole and is excluded before this function is reached.
+            z /= u;
+            p += 1.0;
+            u = x + p;
+        }
+        let z = z.abs();
+        if u == 2.0 {
+            return z.ln();
+        }
+        p -= 2.0;
+        let u = x + p;
+        let rational = u * polevl(u, &LGAM_RAT_B) / p1evl(u, &LGAM_RAT_C);
+        return z.ln() + rational;
+    }
+
+    let q = (x - 0.5) * x.ln() - x + HALF_LN_TWO_PI_CEPHES;
+    if x > 1.0e8 {
+        return q;
+    }
+    let p = 1.0 / (x * x);
+    if x >= 1000.0 {
+        return q
+            + ((7.936_507_936_507_936_507_94E-4 * p - 2.777_777_777_777_777_777_78E-3) * p
+                + 8.333_333_333_333_333_333_33E-2)
+                / x;
+    }
+    q + polevl(p, &LGAM_CHEB_A) / x
+}
+
+/// `log(sqrt(2*pi))`, Cephes' `LS2PI`.
+const HALF_LN_TWO_PI_CEPHES: f64 = 0.918_938_533_204_672_741_78;
 
 fn lngamma_lanczos(x: f64) -> f64 {
     let mut coeff_sum = LANCZOS_COEFFS[0];
@@ -2501,6 +2613,22 @@ fn lngamma_positive(x: f64) -> f64 {
 /// that is a CONSEQUENCE, not the reason, and how much it is worth depends entirely on how
 /// much of a caller's input lies in [20, 100). For inputs below 20 it is worth nothing.
 pub const GAMMALN_ASYMPTOTIC_MIN_X_DEFAULT: f64 = 20.0;
+
+/// Use SciPy's own `lgam` for `ln|Gamma(x)|`, `x > 0` (`true`, shipping), instead of the
+/// Lanczos band and our Stirling.
+///
+/// NOT bit-identical to either and not intended to be: it is the incumbent's algorithm.
+/// Accuracy against the live SciPy arm is the contract.
+pub static GAMMALN_CEPHES_LGAM: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// BATCHES that took the Cephes arm — "enabled" is not "took effect".
+///
+/// Counted once per batch, not once per element, so it cannot be read as a call count.
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result.
+pub static GAMMALN_CEPHES_LGAM_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Read the Lanczos/asymptotic crossover ONCE per batch instead of once per element
 /// (`true`, shipping). Bit-identical: the threshold is the same `f64` either way.

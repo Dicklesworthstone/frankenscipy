@@ -395,6 +395,15 @@ fn main() {
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
 
+    // `FSCI_SPECIAL_GAMMALN_LGAM=0` restores the Lanczos band, so Cephes' one-log `lgam`
+    // can be A/B'd inside ONE invocation on the worker.
+    let gammaln_lgam = !matches!(
+        std::env::var("FSCI_SPECIAL_GAMMALN_LGAM").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::GAMMALN_CEPHES_LGAM.store(gammaln_lgam, std::sync::atomic::Ordering::Relaxed);
+    println!("gammaln_cephes_lgam={gammaln_lgam}");
+
     // `FSCI_SPECIAL_IV_TERMRATIO=0` restores the log-carried `I_v` series, so the term-ratio
     // recurrence can be A/B'd -- for ACCURACY as much as cost -- inside ONE binary.
     let iv_ratio = !matches!(
@@ -785,5 +794,121 @@ fn main() {
             median(null_f),
             median(null_s),
         );
+
+        // ── The two arms of a lever, interleaved INSIDE ONE PROCESS ──────────────────
+        //
+        // WHY THIS EXISTS, AND IT IS NOT A CONVENIENCE. Builds are remote, so the arms used
+        // to be selected by an environment variable and compared across two `rch exec`
+        // invocations. That silently did not work: `.rch.env` sets
+        // `RCH_ENV_ALLOWLIST=CARGO_TARGET_DIR,FSCI_REQUIRE_SCIPY_ORACLE`, so NO
+        // `FSCI_SPECIAL_*` variable reaches the worker at all. Both "arms" ran the same
+        // code and reported 0.459x and 0.393x — a 17% spread between two runs that were
+        // bit-identical, which is the cross-invocation noise floor and is far larger than
+        // any lever worth arguing about.
+        //
+        // So the arms are switched here, in-process, and interleaved round by round with
+        // the same position-balancing as the SciPy comparison above. `arm_null` is the A/A
+        // control: the SAME arm timed twice within a round. A lever ratio is only readable
+        // if it stands clear of the nulls.
+        if let Some(sweep) = arm_sweep(op) {
+            let (name, set) = sweep;
+            let time_arm = |on: bool| -> f64 {
+                set(on);
+                let started = Instant::now();
+                for _ in 0..reps {
+                    black_box(ours());
+                }
+                started.elapsed().as_secs_f64() * 1.0e3 / reps as f64
+            };
+            let (mut on_ms, mut off_ms, mut null_on, mut null_off) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            // Deliberately MORE rounds than the SciPy comparison gets. That one is bounded
+            // by the cost of driving a Python child through a pipe; this one is two Rust
+            // closures, so precision is cheap here and it is needed: the first run of this
+            // sweep returned 1.122x against A/A nulls of 1.194 and 1.126, an effect smaller
+            // than its own control, which is not a measurement of anything.
+            let arm_rounds = rounds * 5;
+            for round in 0..arm_rounds {
+                let (t1, f1, f2, t2) = if round % 2 == 0 {
+                    let t1 = time_arm(true);
+                    let f1 = time_arm(false);
+                    let f2 = time_arm(false);
+                    let t2 = time_arm(true);
+                    (t1, f1, f2, t2)
+                } else {
+                    let f1 = time_arm(false);
+                    let t1 = time_arm(true);
+                    let t2 = time_arm(true);
+                    let f2 = time_arm(false);
+                    (t1, f1, f2, t2)
+                };
+                on_ms.push(t1.min(t2));
+                off_ms.push(f1.min(f2));
+                null_on.push(t1.max(t2) / t1.min(t2));
+                null_off.push(f1.max(f2) / f1.min(f2));
+            }
+            // Accuracy of each arm against the live SciPy values, from the same process.
+            //
+            // The hit counter is sampled around each arm as a two-sided control: the `on`
+            // arm MUST increment it and the `off` arm MUST NOT. "Enabled" is not "took
+            // effect", and a lever wired to nothing prints a perfectly clean 1.000x.
+            let hits = || {
+                fsci_special::GAMMALN_CEPHES_LGAM_HITS.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            set(true);
+            let h0 = hits();
+            let check_on = scipy.check(&ours());
+            let on_hits = hits() - h0;
+            set(false);
+            let h1 = hits();
+            let check_off = scipy.check(&ours());
+            let off_hits = hits() - h1;
+            println!(
+                "armab op={op} lever={name} control on_hits={on_hits} off_hits={off_hits} \
+                 (must be >0 and 0)"
+            );
+            let (on_med, off_med) = (median(on_ms), median(off_ms));
+            // Aggregate at the REPLICATE level: one ratio per round, then the median of
+            // those, so the pairing that the interleave bought is not thrown away by
+            // dividing two independently-computed medians. The range is printed because a
+            // median that sits inside the spread of its own A/A nulls is not a result.
+            let mut per_round: Vec<f64> = on_ms
+                .iter()
+                .zip(off_ms.iter())
+                .map(|(on, off)| off / on)
+                .collect();
+            per_round.sort_by(f64::total_cmp);
+            println!(
+                "armab op={op} lever={name} on={on_med:.3}ms off={off_med:.3}ms \
+                 rounds={arm_rounds}"
+            );
+            println!(
+                "armab op={op} lever={name} off/on={:.3}x paired_median={:.3}x \
+                 paired_min={:.3}x paired_max={:.3}x null_on={:.3} null_off={:.3}",
+                off_med / on_med,
+                median(per_round.clone()),
+                per_round[0],
+                per_round[per_round.len() - 1],
+                median(null_on),
+                median(null_off),
+            );
+            println!("armab op={op} lever={name} arm=on  {check_on}");
+            println!("armab op={op} lever={name} arm=off {check_off}");
+            set(true);
+        }
+    }
+}
+
+/// The in-process A/B lever for an op, if it has one: a display name and a setter.
+///
+/// Returning `None` for an op with no lever is what keeps the sweep from printing a
+/// meaningless self-comparison — an `armab` line for an op whose two "arms" are the same
+/// code would read exactly like a measured null and mean nothing.
+fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool))> {
+    match op {
+        "gammaln" => Some(("cephes_lgam", |on| {
+            fsci_special::GAMMALN_CEPHES_LGAM.store(on, std::sync::atomic::Ordering::Relaxed);
+        })),
+        _ => None,
     }
 }
