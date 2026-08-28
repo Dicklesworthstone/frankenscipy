@@ -41,13 +41,16 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
 use fsci_runtime::RuntimeMode;
-use fsci_special::{SpecialTensor, digamma, erf, gammaln, zeta};
+use fsci_special::{
+    SpecialTensor, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit, exprel, gamma, gammaln, i0,
+    i1, j0, j1, k0, k1, rgamma, spence, y0, y1, zeta,
+};
 
 const PYTHON: &str = r#"
 import hashlib, os, sys, time
 import numpy as np
 import scipy
-from scipy.special import digamma, erf, gammaln, zeta
+from scipy import special as sp
 
 op = os.environ['FSCI_SPECIAL_OP']
 n = int(os.environ['FSCI_SPECIAL_N'])
@@ -56,7 +59,7 @@ raw = sys.stdin.buffer.read(n * 8)
 if len(raw) != n * 8: raise RuntimeError('short fixture')
 x = np.frombuffer(raw, dtype='<f8').copy()
 
-fn = {'gammaln': gammaln, 'digamma': digamma, 'erf': erf, 'zeta': zeta}[op]
+fn = getattr(sp, op)   # resolved by name: adding a case needs no change here
 def run(): return np.ascontiguousarray(fn(x), dtype='<f8')
 
 ref = run()
@@ -166,6 +169,77 @@ impl Drop for Scipy {
     }
 }
 
+/// Every measured case: the `scipy.special` ufunc name (ours must match it exactly, since
+/// the Python child resolves it with `getattr`) and the input domain.
+///
+/// DOMAINS SPAN REGIMES ON PURPOSE. A fixture sitting inside one branch benchmarks that
+/// branch and says nothing about the function — the mistake that made the first `gammaln`
+/// reading unrepresentative. Each range below crosses the switch points of the
+/// implementation it exercises: series against asymptotic, reflection against direct,
+/// small-argument rational against continued fraction.
+///
+/// The list started at four ops. That was the problem: `zeta` turned out to be nearly twice
+/// SciPy's instruction count while three cheaper functions sat next to it looking fine, and
+/// this crate exports 578 public functions. Unmeasured surface is where the large cells have
+/// been every time.
+const CASES: &[(&str, f64, f64)] = &[
+    // Gamma family: reflection, Lanczos and asymptotic kernels all live in these ranges.
+    ("gammaln", 0.01, 60.0),
+    ("digamma", 0.01, 60.0),
+    ("gamma", 0.01, 30.0),
+    ("rgamma", -10.0, 10.0),
+    ("zeta", 1.5, 30.0),
+    // Error function family: series core, continued fraction, and the saturated tail.
+    ("erf", -6.0, 6.0),
+    ("erfc", -6.0, 6.0),
+    ("erfinv", -0.999, 0.999),
+    ("erfcinv", 0.001, 1.999),
+    ("dawsn", -10.0, 10.0),
+    // Bessel: oscillatory small-argument series through to the asymptotic expansion.
+    ("j0", -30.0, 30.0),
+    ("j1", -30.0, 30.0),
+    ("y0", 0.01, 30.0),
+    ("y1", 0.01, 30.0),
+    ("i0", -15.0, 15.0),
+    ("i1", -15.0, 15.0),
+    ("k0", 0.01, 20.0),
+    ("k1", 0.01, 20.0),
+    // Miscellaneous single-argument ufuncs.
+    ("spence", 0.0, 10.0),
+    ("expit", -20.0, 20.0),
+    ("exprel", -10.0, 10.0),
+];
+
+/// Dispatch to our entry point for `op`. Kept next to [`CASES`] so a new case is two lines
+/// in one file rather than an edit in four places.
+fn call_ours(op: &str, tensor: &SpecialTensor) -> fsci_special::SpecialResult {
+    let mode = RuntimeMode::Hardened;
+    match op {
+        "gammaln" => gammaln(tensor, mode),
+        "digamma" => digamma(tensor, mode),
+        "gamma" => gamma(tensor, mode),
+        "rgamma" => rgamma(tensor, mode),
+        "zeta" => zeta(tensor, mode),
+        "erf" => erf(tensor, mode),
+        "erfc" => erfc(tensor, mode),
+        "erfinv" => erfinv(tensor, mode),
+        "erfcinv" => erfcinv(tensor, mode),
+        "dawsn" => dawsn(tensor, mode),
+        "j0" => j0(tensor, mode),
+        "j1" => j1(tensor, mode),
+        "y0" => y0(tensor, mode),
+        "y1" => y1(tensor, mode),
+        "i0" => i0(tensor, mode),
+        "i1" => i1(tensor, mode),
+        "k0" => k0(tensor, mode),
+        "k1" => k1(tensor, mode),
+        "spence" => spence(tensor, mode),
+        "expit" => expit(tensor, mode),
+        "exprel" => exprel(tensor, mode),
+        other => panic!("no fsci entry point wired for {other}"),
+    }
+}
+
 /// SHA-256 of the running executable, so a row names the binary that produced it and a
 /// stale build cannot masquerade as a fresh one. Shelled out rather than hashed in
 /// process: taking a production dependency so a benchmark can print a digest would be
@@ -206,8 +280,13 @@ fn main() {
     };
     let n = env_usize("FSCI_SPECIAL_N", 200_000);
     let rounds = env_usize("FSCI_SPECIAL_ROUNDS", 5);
-    let selected =
-        std::env::var("FSCI_SPECIAL_OPS").unwrap_or_else(|_| "gammaln,digamma,erf,zeta".to_owned());
+    let selected = std::env::var("FSCI_SPECIAL_OPS").unwrap_or_else(|_| {
+        CASES
+            .iter()
+            .map(|&(op, _, _)| op)
+            .collect::<Vec<_>>()
+            .join(",")
+    });
     let fixed_reps: Option<usize> = std::env::var("FSCI_SPECIAL_FIXED_REPS")
         .ok()
         .and_then(|v| v.parse().ok());
@@ -240,6 +319,16 @@ fn main() {
     );
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
+
+    // `FSCI_SPECIAL_I01_CEPHES=0` restores the general order-v `iv_scalar` path for
+    // `i0`/`i1`, so the Chebyshev kernels can be A/B'd -- for ACCURACY as much as cost --
+    // inside ONE binary against the same live SciPy arm.
+    let i01_cephes = !matches!(
+        std::env::var("FSCI_SPECIAL_I01_CEPHES").ok().as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::BESSEL_I01_CEPHES.store(i01_cephes, std::sync::atomic::Ordering::Relaxed);
+    println!("bessel_i01_cephes={i01_cephes}");
 
     // `FSCI_SPECIAL_ZETA_RATIONAL=0` restores our eight-`exp` Euler-Maclaurin prefix in
     // place of SciPy's rational approximations, so the two can be A/B'd -- for ACCURACY as
@@ -328,26 +417,15 @@ fn main() {
         k as f64 / 1_000_003.0
     };
 
-    for op in ["gammaln", "digamma", "erf", "zeta"] {
+    for &(op, default_lo, default_hi) in CASES {
         if !selected.split(',').any(|name| name.trim() == op) {
             continue;
         }
-        // Per-op domains, chosen so the input SPANS the regimes each implementation
-        // switches between rather than sitting inside one of them. A fixture confined to a
-        // single branch benchmarks that branch and says nothing about the function.
-        //   gammaln/digamma: 0.01 .. 60      (reflection, series and asymptotic all live)
-        //   erf:            -6   .. 6        (series core, continued fraction, saturated tail)
-        //   zeta:            1.5 .. 30       (above the pole, into where the sum truncates fast)
-        //
         // `FSCI_SPECIAL_XMIN`/`FSCI_SPECIAL_XMAX` narrow the domain to ONE band, which is
         // how the per-branch instruction counts are taken. The default spans everything;
         // a band is a diagnostic, never the headline, because a fixture confined to one
-        // branch is exactly what the paragraph above warns against.
-        let (lo, hi) = match op {
-            "gammaln" | "digamma" => (0.01_f64, 60.0_f64),
-            "erf" => (-6.0, 6.0),
-            _ => (1.5, 30.0),
-        };
+        // branch benchmarks that branch and says nothing about the function.
+        let (lo, hi) = (default_lo, default_hi);
         let lo = std::env::var("FSCI_SPECIAL_XMIN")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -369,12 +447,7 @@ fn main() {
         let tensor = SpecialTensor::RealVec(x.clone());
 
         let ours = || -> Vec<f64> {
-            let out = match op {
-                "gammaln" => gammaln(&tensor, RuntimeMode::Hardened),
-                "digamma" => digamma(&tensor, RuntimeMode::Hardened),
-                "erf" => erf(&tensor, RuntimeMode::Hardened),
-                _ => zeta(&tensor, RuntimeMode::Hardened),
-            };
+            let out = call_ours(op, &tensor);
             real_vec(out.unwrap_or_else(|e| panic!("fsci {op} failed: {e}")), op)
         };
 

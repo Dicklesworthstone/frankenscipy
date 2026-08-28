@@ -291,25 +291,257 @@ pub fn iv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 ///
 /// Convenience wrapper for iv(0, z). Matches `scipy.special.i0(z)`.
 pub fn i0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_input("i0", z, mode, 1 << 14, |x| Ok(iv_scalar(0.0, x)))
+    map_real_input("i0", z, mode, 1 << 14, |x| Ok(i0_scalar(x)))
 }
 
 /// Modified Bessel function of the first kind of order 1: I_1(z).
 ///
 /// Convenience wrapper for iv(1, z). Matches `scipy.special.i1(z)`.
 pub fn i1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_input("i1", z, mode, 1 << 14, |x| Ok(iv_scalar(1.0, x)))
+    map_real_input("i1", z, mode, 1 << 14, |x| Ok(i1_scalar(x)))
+}
+
+/// Use SciPy's own Chebyshev kernels for `I0`/`I1` (`true`, shipping) instead of routing
+/// them through the general order-v `iv_scalar`.
+///
+/// NOT bit-identical and not intended to be: it is a different approximation, and it is the
+/// one the incumbent uses, so it moves our values toward SciPy. Accuracy against the live
+/// SciPy arm is the contract and is checked in the same invocation by
+/// `perf_special_vs_scipy`; the two forms are also cross-checked against each other by
+/// `i0_i1_cephes_matches_the_iv_series`.
+pub static BESSEL_I01_CEPHES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// Evaluations that took the Chebyshev arm — "enabled" is not "took effect".
+///
+/// Accuracy contract: a diagnostic counter, not an A/B lever. It has no arms to preserve
+/// anything between; incrementing it changes no numeric result.
+pub static BESSEL_I01_CEPHES_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// ── Cephes I0/I1 Chebyshev kernels ───────────────────────────────────────────────────
+//
+// WHY THESE EXIST. `i0`/`i1` delegated to `iv_scalar(0.0, x)` / `iv_scalar(1.0, x)`, the
+// GENERAL order-v routine. For |x| <= 15 that takes the ascending power series, whose
+// summand is formed in logs — an `exp` and a `lgamma` PER TERM — and needs tens of terms
+// once `x^2/4` is large. Measured against live SciPy on the identical fixture, instructions
+// per element:
+//
+//     i0   fsci 4175.4   scipy 339.7   12.29x
+//     i1   fsci 4129.3   scipy 341.8   12.08x
+//
+// the two worst cells in this crate, and invisible until the harness was widened past its
+// original four ops. SciPy runs a single Chebyshev expansion and one `exp`.
+//
+// A general-order routine is the right implementation for general order and the wrong one
+// for order 0 and 1, which are the orders callers actually ask for by name. `iv_scalar`
+// keeps every other order; these two names stop paying for generality they never use.
+//
+// Coefficients are transcribed from scipy's `xsf/cephes/{i0,i1}.h` — the code the incumbent
+// runs — so this moves our values TOWARD SciPy. They are extracted mechanically rather than
+// retyped, and cross-checked against the existing series by
+// `i0_i1_cephes_matches_the_iv_series`.
+
+/// Chebyshev coefficients for `exp(-x) I0(x)` on `0 <= x <= 8`, in `x/2 - 2`.
+#[allow(clippy::excessive_precision)]
+const I0_CHEB_A: [f64; 30] = [
+    -4.41534164647933937950E-18,
+    3.33079451882223809783E-17,
+    -2.43127984654795469359E-16,
+    1.71539128555513303061E-15,
+    -1.16853328779934516808E-14,
+    7.67618549860493561688E-14,
+    -4.85644678311192946090E-13,
+    2.95505266312963983461E-12,
+    -1.72682629144155570723E-11,
+    9.67580903537323691224E-11,
+    -5.18979560163526290666E-10,
+    2.65982372468238665035E-9,
+    -1.30002500998624804212E-8,
+    6.04699502254191894932E-8,
+    -2.67079385394061173391E-7,
+    1.11738753912010371815E-6,
+    -4.41673835845875056359E-6,
+    1.64484480707288970893E-5,
+    -5.75419501008210370398E-5,
+    1.88502885095841655729E-4,
+    -5.76375574538582365885E-4,
+    1.63947561694133579842E-3,
+    -4.32430999505057594430E-3,
+    1.05464603945949983183E-2,
+    -2.37374148058994688156E-2,
+    4.93052842396707084878E-2,
+    -9.49010970480476444210E-2,
+    1.71620901522208775349E-1,
+    -3.04682672343198398683E-1,
+    6.76795274409476084995E-1,
+];
+
+/// Chebyshev coefficients for `exp(-x) sqrt(x) I0(x)` on `8 <= x < inf`, in `32/x - 2`.
+#[allow(clippy::excessive_precision)]
+const I0_CHEB_B: [f64; 25] = [
+    -7.23318048787475395456E-18,
+    -4.83050448594418207126E-18,
+    4.46562142029675999901E-17,
+    3.46122286769746109310E-17,
+    -2.82762398051658348494E-16,
+    -3.42548561967721913462E-16,
+    1.77256013305652638360E-15,
+    3.81168066935262242075E-15,
+    -9.55484669882830764870E-15,
+    -4.15056934728722208663E-14,
+    1.54008621752140982691E-14,
+    3.85277838274214270114E-13,
+    7.18012445138366623367E-13,
+    -1.79417853150680611778E-12,
+    -1.32158118404477131188E-11,
+    -3.14991652796324136454E-11,
+    1.18891471078464383424E-11,
+    4.94060238822496958910E-10,
+    3.39623202570838634515E-9,
+    2.26666899049817806459E-8,
+    2.04891858946906374183E-7,
+    2.89137052083475648297E-6,
+    6.88975834691682398426E-5,
+    3.36911647825569408990E-3,
+    8.04490411014108831608E-1,
+];
+
+/// Chebyshev coefficients for `exp(-x) I1(x) / x` on `0 <= x <= 8`, in `x/2 - 2`.
+#[allow(clippy::excessive_precision)]
+const I1_CHEB_A: [f64; 29] = [
+    2.77791411276104639959E-18,
+    -2.11142121435816608115E-17,
+    1.55363195773620046921E-16,
+    -1.10559694773538630805E-15,
+    7.60068429473540693410E-15,
+    -5.04218550472791168711E-14,
+    3.22379336594557470981E-13,
+    -1.98397439776494371520E-12,
+    1.17361862988909016308E-11,
+    -6.66348972350202774223E-11,
+    3.62559028155211703701E-10,
+    -1.88724975172282928790E-9,
+    9.38153738649577178388E-9,
+    -4.44505912879632808065E-8,
+    2.00329475355213526229E-7,
+    -8.56872026469545474066E-7,
+    3.47025130813767847674E-6,
+    -1.32731636560394358279E-5,
+    4.78156510755005422638E-5,
+    -1.61760815825896745588E-4,
+    5.12285956168575772895E-4,
+    -1.51357245063125314899E-3,
+    4.15642294431288815669E-3,
+    -1.05640848946261981558E-2,
+    2.47264490306265168283E-2,
+    -5.29459812080949914269E-2,
+    1.02643658689847095384E-1,
+    -1.76416518357834055153E-1,
+    2.52587186443633654823E-1,
+];
+
+/// Chebyshev coefficients for `exp(-x) sqrt(x) I1(x)` on `8 <= x < inf`, in `32/x - 2`.
+#[allow(clippy::excessive_precision)]
+const I1_CHEB_B: [f64; 25] = [
+    7.51729631084210481353E-18,
+    4.41434832307170791151E-18,
+    -4.65030536848935832153E-17,
+    -3.20952592199342395980E-17,
+    2.96262899764595013876E-16,
+    3.30820231092092828324E-16,
+    -1.88035477551078244854E-15,
+    -3.81440307243700780478E-15,
+    1.04202769841288027642E-14,
+    4.27244001671195135429E-14,
+    -2.10154184277266431302E-14,
+    -4.08355111109219731823E-13,
+    -7.19855177624590851209E-13,
+    2.03562854414708950722E-12,
+    1.41258074366137813316E-11,
+    3.25260358301548823856E-11,
+    -1.89749581235054123450E-11,
+    -5.58974346219658380687E-10,
+    -3.83538038596423702205E-9,
+    -2.63146884688951950684E-8,
+    -2.51223623787020892529E-7,
+    -3.88256480887769039346E-6,
+    -1.10588938762623716291E-4,
+    -9.76109749136146840777E-3,
+    7.78576235018280120474E-1,
+];
+
+/// Cephes `chbevl`: evaluate a Chebyshev series by the Clenshaw recurrence.
+///
+/// The series is in the SHIFTED argument the caller supplies (`x/2 - 2` or `32/x - 2`), and
+/// the leading coefficient is halved by the `0.5 * (b0 - b2)` at the end — which is why this
+/// is not interchangeable with an ordinary Horner evaluation of the same table.
+#[inline]
+fn chbevl(x: f64, coeffs: &[f64]) -> f64 {
+    let mut b0 = coeffs[0];
+    let mut b1 = 0.0_f64;
+    let mut b2 = 0.0_f64;
+    for &c in &coeffs[1..] {
+        b2 = b1;
+        b1 = b0;
+        b0 = x * b1 - b2 + c;
+    }
+    0.5 * (b0 - b2)
+}
+
+/// Largest `x` for which `exp(x)` is finite; beyond it Cephes splits the exponential in two
+/// halves because `I0(x)` stays finite to about 713.99 while `exp(x)` alone overflows.
+const CEPHES_MAXLOG: f64 = 7.09782712893383996732E2;
+
+/// `I0(x)` by SciPy's own Chebyshev kernels.
+fn i0_cephes(x: f64) -> f64 {
+    let x = x.abs();
+    if x <= 8.0 {
+        let y = (x / 2.0) - 2.0;
+        return x.exp() * chbevl(y, &I0_CHEB_A);
+    }
+    let cheb = chbevl(32.0 / x - 2.0, &I0_CHEB_B) / x.sqrt();
+    if x > CEPHES_MAXLOG {
+        let e = (x / 2.0).exp();
+        return e * cheb * e;
+    }
+    x.exp() * cheb
+}
+
+/// `I1(x)` by SciPy's own Chebyshev kernels. Odd in `x`, so the sign is restored at the end.
+fn i1_cephes(x: f64) -> f64 {
+    let z = x.abs();
+    let out = if z <= 8.0 {
+        let y = (z / 2.0) - 2.0;
+        chbevl(y, &I1_CHEB_A) * z * z.exp()
+    } else {
+        let cheb = chbevl(32.0 / z - 2.0, &I1_CHEB_B) / z.sqrt();
+        if z > CEPHES_MAXLOG {
+            let e = (z / 2.0).exp();
+            e * cheb * e
+        } else {
+            z.exp() * cheb
+        }
+    };
+    if x < 0.0 { -out } else { out }
 }
 
 /// Scalar convenience function for I_0(x).
 #[must_use]
 pub fn i0_scalar(x: f64) -> f64 {
+    if BESSEL_I01_CEPHES.load(std::sync::atomic::Ordering::Relaxed) {
+        BESSEL_I01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return i0_cephes(x);
+    }
     iv_scalar(0.0, x)
 }
 
 /// Scalar convenience function for I_1(x).
 #[must_use]
 pub fn i1_scalar(x: f64) -> f64 {
+    if BESSEL_I01_CEPHES.load(std::sync::atomic::Ordering::Relaxed) {
+        BESSEL_I01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return i1_cephes(x);
+    }
     iv_scalar(1.0, x)
 }
 
@@ -5754,6 +5986,132 @@ fn collect_jnjnp_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ONE lock for tests that write a Bessel perf toggle. Process-global statics under
+    /// a concurrent `cargo test` otherwise produce a MASKED pass — both arms running the
+    /// same code and the comparison checking a thing against itself.
+    fn bessel_toggle_lock() -> std::sync::MutexGuard<'static, ()> {
+        static BESSEL_TOGGLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        BESSEL_TOGGLE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Cross-checks the transcribed Chebyshev tables against the independent `iv` power
+    /// series over the whole domain.
+    ///
+    /// This is what catches a mistranscribed coefficient. 109 numbers were copied out of
+    /// `xsf/cephes/{i0,i1}.h`; the series shares none of them and no code path, so agreement
+    /// to a few tens of ULP is strong evidence the tables are right. A single wrong digit in
+    /// any of the four tables moves its branch by far more than the bound below.
+    #[test]
+    fn i0_i1_cephes_matches_the_iv_series() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = bessel_toggle_lock();
+        let was = BESSEL_I01_CEPHES.load(Relaxed);
+
+        // Span BOTH Chebyshev branches: |x| <= 8 uses the A tables, |x| > 8 the B tables.
+        let mut points: Vec<f64> = Vec::new();
+        for i in 0..=1500 {
+            points.push(-15.0 + 30.0 * (i as f64 / 1500.0));
+        }
+        points.extend([
+            0.0, 1e-8, -1e-8, 0.5, -0.5, 7.999, 8.0, 8.001, -8.001, 12.0, -12.0, 15.0,
+        ]);
+
+        let (mut small, mut large) = (0usize, 0usize);
+        let (mut worst0, mut worst1) = (0.0_f64, 0.0_f64);
+        let (mut at0, mut at1) = (f64::NAN, f64::NAN);
+        let mut compared = 0usize;
+        for &x in &points {
+            if x.abs() <= 8.0 {
+                small += 1;
+            } else {
+                large += 1;
+            }
+            let (c0, c1) = (i0_cephes(x), i1_cephes(x));
+            let (s0, s1) = (iv_scalar(0.0, x), iv_scalar(1.0, x));
+            assert!(
+                c0.is_finite() && c1.is_finite() && s0.is_finite() && s1.is_finite(),
+                "non-finite at x={x}: cephes {c0}/{c1} series {s0}/{s1}"
+            );
+            // I1 is odd and vanishes at 0, so guard the relative measure rather than
+            // dividing by something that is legitimately zero.
+            let ulp0 = (c0 - s0).abs() / f64::max(s0.abs(), f64::MIN_POSITIVE) / f64::EPSILON;
+            let ulp1 = (c1 - s1).abs() / f64::max(s1.abs(), 1.0e-300) / f64::EPSILON;
+            if ulp0 > worst0 {
+                worst0 = ulp0;
+                at0 = x;
+            }
+            if ulp1 > worst1 {
+                worst1 = ulp1;
+                at1 = x;
+            }
+            compared += 1;
+        }
+        BESSEL_I01_CEPHES.store(was, Relaxed);
+
+        // MUST-HIT: both Chebyshev branches have to be reached, or this is evidence only
+        // about the table that happened to run.
+        assert!(
+            small > 0 && large > 0,
+            "grid missed a branch: |x|<=8 {small}, |x|>8 {large}"
+        );
+        assert_eq!(compared, points.len(), "comparison loop was skipped");
+        println!(
+            "i0 worst {worst0:.1} ULP at x={at0}; i1 worst {worst1:.1} ULP at x={at1};              {compared} points (small={small} large={large})"
+        );
+        // MEASURED worst is 27.5 ULP (i0, x=14.4) and 22.4 ULP (i1, x=14.88), and almost
+        // all of that is the SERIES: against live SciPy the Chebyshev arm is ~1.5 ULP
+        // (max_rel 3.37e-16) where the series is ~32 ULP (7.03e-15). The bound is 256 for
+        // ~9x margin rather than the measured value, because it exists to catch a
+        // mistranscribed coefficient — which moves a branch by orders of magnitude, not by
+        // ULPs — and sitting on the measurement would make it a change-detector instead.
+        assert!(
+            worst0 < 256.0 && worst1 < 256.0,
+            "Chebyshev and series disagree: i0 {worst0} ULP at {at0}, i1 {worst1} ULP at              {at1}; a transcribed coefficient is probably wrong"
+        );
+    }
+
+    /// Drives `BESSEL_I01_CEPHES` in BOTH settings through the public batch entry, and pins
+    /// that the arm actually fires — "enabled" is not "took effect".
+    #[test]
+    fn bessel_i01_cephes_toggle_drives_both_arms() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = bessel_toggle_lock();
+        let was = BESSEL_I01_CEPHES.load(Relaxed);
+
+        let values: Vec<f64> = (0..512).map(|i| -12.0 + i as f64 * 0.05).collect();
+        let tensor = SpecialTensor::RealVec(values.clone());
+        let mut arms = Vec::new();
+        for enabled in [true, false] {
+            BESSEL_I01_CEPHES.store(enabled, Relaxed);
+            let before = BESSEL_I01_CEPHES_HITS.load(Relaxed);
+            let out = i0(&tensor, RuntimeMode::Strict).expect("i0 batch");
+            let hits = BESSEL_I01_CEPHES_HITS.load(Relaxed) - before;
+            let SpecialTensor::RealVec(v) = out else {
+                panic!("expected RealVec")
+            };
+            arms.push((v, hits));
+        }
+        BESSEL_I01_CEPHES.store(was, Relaxed);
+
+        assert_eq!(
+            arms[0].1,
+            values.len(),
+            "Chebyshev arm did not run for every element"
+        );
+        assert_eq!(arms[1].1, 0, "disabled arm still took the Chebyshev path");
+        // The two arms are DIFFERENT approximations, so they must not be asserted equal.
+        // What matters is that both produced finite, close results; accuracy against SciPy
+        // is the real contract and lives in the harness.
+        for (a, b) in arms[0].0.iter().zip(&arms[1].0) {
+            assert!(
+                (a - b).abs() <= 1.0e-9 * a.abs().max(1.0),
+                "arms disagree far more than either differs from SciPy: {a} vs {b}"
+            );
+        }
+    }
 
     #[test]
     fn spherical_jn_jv_route_matches_scipy_small_x() {
