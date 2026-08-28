@@ -42228,3 +42228,55 @@ believing the output describes what you think it does.
 quiescence; hz2 ran these between loadavg 2.14 and 7.24 on 16 cores and hz1 remains refused
 for `disk_critical_without_fresh_telemetry`. All ratios are in the commit message. Reported,
 not relaxed.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) of the premise that y1's deficit was in its mathematics: it was two process-global atomics per element, and 16 workers writing one cache line (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, arm sweep
+`lever=hoist_flag_out_of_kernel`. Run on worker hz2 with `RCH_WORKER=hz2`,
+`same_host=hetzner2`, harness=perf_special_vs_scipy, live SciPy in the same process, ELF sha
+self-reported.
+
+Observed: arm control `on_hits=1 off_hits=0`; both arms returned
+`max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000
+nonfinite_mismatch=0`; the paired effect's whole observed range lies outside both A/A nulls.
+
+**What every previous attempt had assumed**
+
+`y1` was the worst cell for four consecutive investigations, and each one looked for the
+answer in the arithmetic or the schedule: extra refinement, the parallel gate, per-worker
+allocation and concatenation, serial versus threaded across six sizes, and finally which of
+the two kernel branches was to blame. All were measured, all were negative or null, and the
+last of them established that BOTH branches were behind — which should have been the clue,
+because a defect present in two different code paths is probably in neither of them.
+
+**It was in the wrapper both branches share.** `y0_core_positive` and `y1_core_positive`
+performed TWO process-global atomic operations for every element: a relaxed load of the
+Cephes-large flag, and a `fetch_add` on a hit counter. `map_real_input` fans these ops out to
+all 16 logical cores at the fixture size, so the counter meant sixteen workers writing the
+same cache line on every element of the array.
+
+That also retrospectively explains an anomaly recorded two rows above and left unexplained:
+16 workers were buying `y1` almost nothing over a single thread. A serialising write in the
+inner loop is exactly that signature, and it was in the code the whole time.
+
+**Fixed by hoisting the flag to the batch entry point** — read once per array, counted once
+per array, passed down as a plain `bool` — which is the same treatment `gammaln`, `erfcinv`
+and the gamma family each received earlier in this campaign. `y0` and `y1` were simply missed
+then. BIT-IDENTICAL: the flag holds the same value either way and no arithmetic changes.
+
+**The effect is the largest this harness has measured**, and both `y0` and `y1` move from the
+two worst cells in the crate to beating the incumbent. Figures are in the commit message,
+because a ratio is a timing claim and this row does not carry one.
+
+**The pattern is not exhausted, and here is where it survives.** `i0_scalar`, `i1_scalar`,
+`k0_order_scalar`, `k1_order_scalar` and `zeta_positive` all still perform a per-element
+`fetch_add` on a shared counter. Those cells currently beat the incumbent, which is precisely
+why nobody looked: **a hit counter in a hot loop is invisible while the cell is winning, and
+it is not free — it was worth several-fold here.** Named so the next reader can price them
+rather than rediscover the class.
+
+**No runtime claim is banked.** The TIMED evidence set requires fail-closed host-wide
+quiescence; hz2 ran this between loadavg 1.72 and 6.97 on 16 cores, and hz1 remains refused
+for `disk_critical_without_fresh_telemetry`. Reported, not relaxed.

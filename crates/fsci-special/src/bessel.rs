@@ -234,12 +234,41 @@ pub fn jn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 }
 
 pub fn y0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    if BESSEL_Y01_HOIST_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+        BESSEL_Y01_HOIST_FLAG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cephes_large = BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed);
+        return map_real_input("y0", z, mode, 1 << 16, move |x| {
+            y0_scalar_with(x, mode, cephes_large)
+        });
+    }
     map_real_input("y0", z, mode, 1 << 16, |x| y0_scalar(x, mode))
 }
 
 pub fn y1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    if BESSEL_Y01_HOIST_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+        BESSEL_Y01_HOIST_FLAG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cephes_large = BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed);
+        if cephes_large {
+            BESSEL_Y01_CEPHES_LARGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return map_real_input("y1", z, mode, 1 << 16, move |x| {
+            y1_scalar_with(x, mode, cephes_large)
+        });
+    }
     map_real_input("y1", z, mode, 1 << 16, |x| y1_scalar(x, mode))
 }
+
+/// Read the `y0`/`y1` Cephes-large flag ONCE per batch instead of once per element
+/// (`true`, shipping).
+///
+/// BIT-IDENTICAL: both arms evaluate the same kernel on the same flag value. What differs is
+/// only how many times a process-global atomic is touched — once per array, or once per
+/// element by every worker at the same address.
+pub static BESSEL_Y01_HOIST_FLAG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// BATCHES that took the hoisted path — "enabled" is not "took effect". Counted per batch.
+pub static BESSEL_Y01_HOIST_FLAG_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 pub fn yn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_binary("yn", n, z, mode, |order, x| yn_scalar(order, x, mode))
@@ -3686,6 +3715,29 @@ fn y0_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     Ok(y0_core_positive(x))
 }
 
+/// `y0_scalar` with the Cephes-large flag supplied by the batch entry point.
+/// Domain and endpoint handling are identical; only the flag's provenance differs.
+fn y0_scalar_with(x: f64, mode: RuntimeMode, cephes_large: bool) -> Result<f64, SpecialError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x == 0.0 {
+        return Ok(f64::NEG_INFINITY);
+    }
+    if x < 0.0 {
+        return domain_error_by_mode(
+            "y0",
+            mode,
+            format!("x={x}"),
+            "y0 real-valued wrapper requires x >= 0",
+        );
+    }
+    if x.is_infinite() {
+        return Ok(0.0);
+    }
+    Ok(y0_core_positive_with(x, cephes_large))
+}
+
 fn y1_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if x.is_nan() {
         return Ok(f64::NAN);
@@ -3705,6 +3757,29 @@ fn y1_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
         return Ok(0.0);
     }
     Ok(y1_core_positive(x))
+}
+
+/// `y1_scalar` with the Cephes-large flag supplied by the batch entry point.
+/// Domain and endpoint handling are identical; only the flag's provenance differs.
+fn y1_scalar_with(x: f64, mode: RuntimeMode, cephes_large: bool) -> Result<f64, SpecialError> {
+    if x.is_nan() {
+        return Ok(f64::NAN);
+    }
+    if x == 0.0 {
+        return Ok(f64::NEG_INFINITY);
+    }
+    if x < 0.0 {
+        return domain_error_by_mode(
+            "y1",
+            mode,
+            format!("x={x}"),
+            "y1 real-valued wrapper requires x >= 0",
+        );
+    }
+    if x.is_infinite() {
+        return Ok(0.0);
+    }
+    Ok(y1_core_positive_with(x, cephes_large))
 }
 
 fn domain_error_by_mode(
@@ -4283,11 +4358,32 @@ fn y1_cephes_large(x: f64) -> f64 {
 }
 
 fn y0_core_positive(x: f64) -> f64 {
+    // Preserves the original counting semantics exactly: the counter moves only when the
+    // flag branch is actually reached, which for y0 is x > 5.
+    let cephes_large = BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed);
+    if x > 5.0 && cephes_large {
+        BESSEL_Y01_CEPHES_LARGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    y0_core_positive_with(x, cephes_large)
+}
+
+/// `y0_core_positive` with the Cephes-large flag passed IN rather than read per element.
+///
+/// WHY. The wrapper above performs TWO process-global atomic operations per element: a
+/// relaxed load, which is an optimisation barrier LLVM may not hoist out of the mapper's
+/// inner loop, and a `fetch_add` on a counter every worker shares. The second is the worse
+/// one under fan-out — a single cache line written by all 16 threads on every element is
+/// exactly the shape that stops a parallel loop scaling — and `map_real_input` fans `y0`/`y1`
+/// out to all 16 logical cores at the fixture size.
+///
+/// This crate has already paid for this pattern three times (`gammaln`, `erfcinv`, the gamma
+/// family). `y0`/`y1` were missed. BIT-IDENTICAL: the flag holds the same value either way
+/// and nothing else in the body changes.
+fn y0_core_positive_with(x: f64, cephes_large: bool) -> f64 {
     if x <= 5.0 {
         return y0_cephes_small(x);
     }
-    if BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed) {
-        BESSEL_Y01_CEPHES_LARGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if cephes_large {
         return y0_cephes_large(x);
     }
     if x < 14.0 {
@@ -4373,8 +4469,27 @@ fn y1_series_small(x: f64) -> f64 {
 }
 
 fn y1_core_positive(x: f64) -> f64 {
-    if BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed) {
+    let cephes_large = BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed);
+    if cephes_large {
         BESSEL_Y01_CEPHES_LARGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    y1_core_positive_with(x, cephes_large)
+}
+
+/// `y1_core_positive` with the Cephes-large flag passed IN rather than read per element.
+///
+/// WHY. The wrapper above performs TWO process-global atomic operations per element: a
+/// relaxed load, which is an optimisation barrier LLVM may not hoist out of the mapper's
+/// inner loop, and a `fetch_add` on a counter every worker shares. The second is the worse
+/// one under fan-out — a single cache line written by all 16 threads on every element is
+/// exactly the shape that stops a parallel loop scaling — and `map_real_input` fans `y0`/`y1`
+/// out to all 16 logical cores at the fixture size.
+///
+/// This crate has already paid for this pattern three times (`gammaln`, `erfcinv`, the gamma
+/// family). `y0`/`y1` were missed. BIT-IDENTICAL: the flag holds the same value either way
+/// and nothing else in the body changes.
+fn y1_core_positive_with(x: f64, cephes_large: bool) -> f64 {
+    if cephes_large {
         return if x > 5.0 {
             y1_cephes_large(x)
         } else {

@@ -1337,11 +1337,12 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool), bool)> {
         // neither can be reported selectively. y1 asks whether the threaded path's
         // per-worker Vec plus concatenation is worth removing; y0 asks whether threading
         // pays here at all. They share `map_real_input`, so each answer informs the other.
+        // Was `fused_par_write`, which measured null and is settled; y1's live question is
+        // now whether the per-element atomics in its core are what stops it scaling.
         "y1" => Some((
-            "fused_par_write",
+            "hoist_flag_out_of_kernel",
             |on| {
-                fsci_special::BESSEL_FUSED_PAR_WRITE
-                    .store(on, std::sync::atomic::Ordering::Relaxed);
+                fsci_special::BESSEL_Y01_HOIST_FLAG.store(on, std::sync::atomic::Ordering::Relaxed);
             },
             true,
         )),
@@ -1399,7 +1400,7 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
             fsci_special::ERFINV_INFALLIBLE_BATCH_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),
         "y1" => Some(|| {
-            fsci_special::BESSEL_FUSED_PAR_WRITE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+            fsci_special::BESSEL_Y01_HOIST_FLAG_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),
         "y0" => {
             Some(|| fsci_special::BESSEL_SERIAL_HITS.load(std::sync::atomic::Ordering::Relaxed))
