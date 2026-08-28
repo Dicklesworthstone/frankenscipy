@@ -1372,6 +1372,17 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool), bool)> {
         // rgamma's live question is now the same per-element-atomics one that was worth
         // several-fold on y0/y1, not the schedule (which came back contradictory twice and
         // is deliberately still open).
+        // One lever, several ops: the defect is a class, and ops sharing a mapper should show
+        // effects that track worker count. i0/i1/k0/k1 fan out through `map_real_input`
+        // (16 workers at this size); rgamma through the gamma family's mapper (6).
+        "i0" | "i1" | "k0" | "k1" => Some((
+            "hoist_element_flags",
+            |on| {
+                fsci_special::SPECIAL_HOIST_ELEMENT_FLAGS
+                    .store(on, std::sync::atomic::Ordering::Relaxed);
+            },
+            true,
+        )),
         "rgamma" => Some((
             "hoist_flag_out_of_kernel",
             |on| {
@@ -1415,6 +1426,10 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
         "y0" => {
             Some(|| fsci_special::BESSEL_SERIAL_HITS.load(std::sync::atomic::Ordering::Relaxed))
         }
+        "i0" | "i1" | "k0" | "k1" => Some(|| {
+            fsci_special::SPECIAL_HOIST_ELEMENT_FLAGS_HITS
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }),
         "rgamma" => {
             Some(|| fsci_special::RGAMMA_HOIST_FLAG_HITS.load(std::sync::atomic::Ordering::Relaxed))
         }

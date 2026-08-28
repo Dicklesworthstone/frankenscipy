@@ -2437,6 +2437,20 @@ pub(crate) fn gamma_core(x: f64) -> f64 {
         // a read that also blocks vectorisation; nothing here vectorises anyway. Kept: the
         // must-hit evidence it buys has caught two real defects, and 2 instructions is the
         // honest price of it.
+        //
+        // CORRECTION, 2026-08-28: that pricing is right and its CONCLUSION is wrong, because
+        // it was taken single-threaded. The word doing the work above is "uncontended". These
+        // batches FAN OUT, and then this line is written by every worker on every element.
+        // Measured as an in-process A/B on the same shape elsewhere in this crate: several-
+        // fold on ops that fan out to 16 workers (y0/y1, i0/i1/k0/k1) and 1.35x on ops that
+        // fan out to 6 (rgamma) — an effect that tracks WORKER COUNT, which is the signature
+        // of cache-line contention and not of instruction cost.
+        //
+        // INSTRUCTION COUNTING CANNOT SEE THIS. It is the metric this campaign prefers for
+        // being load-independent, and that is exactly why it missed a several-fold defect for
+        // months: the instruction count of a contended increment is identical to an
+        // uncontended one. `gamma_core` is still on the per-element path and is a live
+        // candidate; it is named in frankenscipy-sdus1's successor rather than fixed here.
         GAMMA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return gamma_cephes_reduced(x);
     }

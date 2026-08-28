@@ -320,6 +320,11 @@ pub fn iv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 ///
 /// Convenience wrapper for iv(0, z). Matches `scipy.special.i0(z)`.
 pub fn i0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    if let Some(cephes) = hoisted_i01_flag() {
+        return map_real_input("i0", z, mode, 1 << 14, move |x| {
+            Ok(i0_scalar_with(x, cephes))
+        });
+    }
     map_real_input("i0", z, mode, 1 << 14, |x| Ok(i0_scalar(x)))
 }
 
@@ -327,6 +332,11 @@ pub fn i0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 ///
 /// Convenience wrapper for iv(1, z). Matches `scipy.special.i1(z)`.
 pub fn i1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    if let Some(cephes) = hoisted_i01_flag() {
+        return map_real_input("i1", z, mode, 1 << 14, move |x| {
+            Ok(i1_scalar_with(x, cephes))
+        });
+    }
     map_real_input("i1", z, mode, 1 << 14, |x| Ok(i1_scalar(x)))
 }
 
@@ -551,11 +561,66 @@ fn i1_cephes(x: f64) -> f64 {
     if x < 0.0 { -out } else { out }
 }
 
+/// Hoist per-element toggle reads and hit counters to the batch boundary across the special
+/// family (`true`, shipping).
+///
+/// ONE switch for the whole class deliberately. The defect is not any single op's: it is a
+/// per-element `fetch_add` on a process-global counter, which under fan-out means every worker
+/// writing one cache line on every element. It was worth several-fold on `y0`/`y1` and it
+/// tracks worker count, so the ops that share a mapper share a fate and are best measured
+/// against one lever.
+///
+/// BIT-IDENTICAL everywhere it applies: the flags hold the same values either way and no
+/// arithmetic changes.
+pub static SPECIAL_HOIST_ELEMENT_FLAGS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// BATCHES that took a hoisted path — "enabled" is not "took effect". Counted per batch.
+pub static SPECIAL_HOIST_ELEMENT_FLAGS_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Read the I0/I1 Cephes flag ONCE for a batch, counting the batch, or `None` when the hoist
+/// is switched off and the per-element path should run instead.
+fn hoisted_i01_flag() -> Option<bool> {
+    if !SPECIAL_HOIST_ELEMENT_FLAGS.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    SPECIAL_HOIST_ELEMENT_FLAGS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cephes = BESSEL_I01_CEPHES.load(std::sync::atomic::Ordering::Relaxed);
+    if cephes {
+        BESSEL_I01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(cephes)
+}
+
+/// As `hoisted_i01_flag`, for K0/K1.
+fn hoisted_k01_flag() -> Option<bool> {
+    if !SPECIAL_HOIST_ELEMENT_FLAGS.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    SPECIAL_HOIST_ELEMENT_FLAGS_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let cephes = BESSEL_K01_CEPHES.load(std::sync::atomic::Ordering::Relaxed);
+    if cephes {
+        BESSEL_K01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(cephes)
+}
+
 /// Scalar convenience function for I_0(x).
 #[must_use]
 pub fn i0_scalar(x: f64) -> f64 {
-    if BESSEL_I01_CEPHES.load(std::sync::atomic::Ordering::Relaxed) {
+    let cephes = BESSEL_I01_CEPHES.load(std::sync::atomic::Ordering::Relaxed);
+    if cephes {
         BESSEL_I01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    i0_scalar_with(x, cephes)
+}
+
+/// `i0_scalar` with the Cephes-arm flag supplied by the batch entry point, so neither the
+/// flag load nor the hit counter appears in the per-element path. See
+/// `SPECIAL_HOIST_ELEMENT_FLAGS`.
+#[must_use]
+pub fn i0_scalar_with(x: f64, cephes: bool) -> f64 {
+    if cephes {
         return i0_cephes(x);
     }
     iv_scalar(0.0, x)
@@ -564,8 +629,19 @@ pub fn i0_scalar(x: f64) -> f64 {
 /// Scalar convenience function for I_1(x).
 #[must_use]
 pub fn i1_scalar(x: f64) -> f64 {
-    if BESSEL_I01_CEPHES.load(std::sync::atomic::Ordering::Relaxed) {
+    let cephes = BESSEL_I01_CEPHES.load(std::sync::atomic::Ordering::Relaxed);
+    if cephes {
         BESSEL_I01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    i1_scalar_with(x, cephes)
+}
+
+/// `i1_scalar` with the Cephes-arm flag supplied by the batch entry point, so neither the
+/// flag load nor the hit counter appears in the per-element path. See
+/// `SPECIAL_HOIST_ELEMENT_FLAGS`.
+#[must_use]
+pub fn i1_scalar_with(x: f64, cephes: bool) -> f64 {
+    if cephes {
         return i1_cephes(x);
     }
     iv_scalar(1.0, x)
@@ -646,6 +722,11 @@ pub fn kv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 ///
 /// Convenience wrapper for kv(0, z). Matches `scipy.special.k0(z)`.
 pub fn k0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    if let Some(cephes) = hoisted_k01_flag() {
+        return map_real_input("k0", z, mode, 1 << 12, move |x| {
+            k0_order_scalar_with(x, mode, cephes, false)
+        });
+    }
     map_real_input("k0", z, mode, 1 << 12, |x| k0_order_scalar(x, mode))
 }
 
@@ -655,7 +736,24 @@ pub fn k0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 /// Cephes, because it is this crate's contract — `Hardened` mode returns a domain error
 /// where Cephes returns NaN — and a faster kernel is not a licence to change it.
 fn k0_order_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    if !BESSEL_K01_CEPHES.load(std::sync::atomic::Ordering::Relaxed) {
+    k0_order_scalar_with(
+        x,
+        mode,
+        BESSEL_K01_CEPHES.load(std::sync::atomic::Ordering::Relaxed),
+        true,
+    )
+}
+
+/// `k0_order_scalar` with the Cephes-arm flag supplied by the caller. `count` is false on the
+/// batch path, where the hit counter is incremented once for the whole array instead of once
+/// per element. See `SPECIAL_HOIST_ELEMENT_FLAGS`.
+fn k0_order_scalar_with(
+    x: f64,
+    mode: RuntimeMode,
+    cephes: bool,
+    count: bool,
+) -> Result<f64, SpecialError> {
+    if !cephes {
         return kv_scalar(0.0, x, mode);
     }
     if x.is_nan() {
@@ -667,13 +765,32 @@ fn k0_order_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
         }
         return domain_error_by_mode("kv", mode, format!("v=0,z={x}"), "kv requires z > 0");
     }
-    BESSEL_K01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count {
+        BESSEL_K01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(k0_cephes(x))
 }
 
 /// `K1(x)` with the domain handling `kv_scalar` performs, but the order-1 kernel.
 fn k1_order_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
-    if !BESSEL_K01_CEPHES.load(std::sync::atomic::Ordering::Relaxed) {
+    k1_order_scalar_with(
+        x,
+        mode,
+        BESSEL_K01_CEPHES.load(std::sync::atomic::Ordering::Relaxed),
+        true,
+    )
+}
+
+/// `k1_order_scalar` with the Cephes-arm flag supplied by the caller. `count` is false on the
+/// batch path, where the hit counter is incremented once for the whole array instead of once
+/// per element. See `SPECIAL_HOIST_ELEMENT_FLAGS`.
+fn k1_order_scalar_with(
+    x: f64,
+    mode: RuntimeMode,
+    cephes: bool,
+    count: bool,
+) -> Result<f64, SpecialError> {
+    if !cephes {
         return kv_scalar(1.0, x, mode);
     }
     if x.is_nan() {
@@ -685,7 +802,9 @@ fn k1_order_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
         }
         return domain_error_by_mode("kv", mode, format!("v=1,z={x}"), "kv requires z > 0");
     }
-    BESSEL_K01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if count {
+        BESSEL_K01_CEPHES_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     Ok(k1_cephes(x))
 }
 
@@ -693,6 +812,11 @@ fn k1_order_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
 ///
 /// Convenience wrapper for kv(1, z). Matches `scipy.special.k1(z)`.
 pub fn k1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    if let Some(cephes) = hoisted_k01_flag() {
+        return map_real_input("k1", z, mode, 1 << 12, move |x| {
+            k1_order_scalar_with(x, mode, cephes, false)
+        });
+    }
     map_real_input("k1", z, mode, 1 << 12, |x| k1_order_scalar(x, mode))
 }
 
@@ -6865,9 +6989,24 @@ mod tests {
         // fail intermittently on a CORRECT tree. The must-miss for this toggle is the
         // instruction A/B instead — 176.0 against 4181.2 per element — which cannot happen
         // unless the two arms really execute different code.
+        // MUST-HIT, now counted PER BATCH rather than per element. The counter used to be
+        // incremented inside the kernel, and this assertion read `>= values.len()` because of
+        // it. That per-element `fetch_add` was the defect: under fan-out every worker wrote
+        // one cache line on every element, and removing it was worth ~3x on this very op.
+        // The counter moving once per array is the intended new semantics, not a regression.
+        assert!(arms[0].1 >= 1, "Chebyshev arm did not run at all");
+
+        // MUST-DIFFER, and it is STRONGER than the count it partly replaces. The two arms are
+        // different approximations, so if they were secretly executing the same code their
+        // outputs would agree bit-for-bit everywhere. Comparing `to_bits` rather than `==`
+        // because `-0.0 == 0.0` is true and would accept a lost sign.
         assert!(
-            arms[0].1 >= values.len(),
-            "Chebyshev arm did not run for every element"
+            arms[0]
+                .0
+                .iter()
+                .zip(&arms[1].0)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the two arms produced bit-identical output, so the toggle drove nothing"
         );
         // The two arms are DIFFERENT approximations, so they must not be asserted equal.
         // What matters is that both produced finite, close results; accuracy against SciPy

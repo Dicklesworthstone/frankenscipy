@@ -42329,3 +42329,66 @@ contradiction was measured through that bottleneck.
 quiescence; hz2 ran this between loadavg 1.30 and 6.68 on 16 cores, and hz1 remains refused
 for `disk_critical_without_fresh_telemetry`. Ratios are in the commit message. Reported, not
 relaxed.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) of instruction counting as sufficient for this defect class: a per-element counter was PRICED at ~1% and left in place, and it was worth several-fold once the batch fans out (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, arm sweep
+`lever=hoist_element_flags` on i0, i1, k0, k1 and `lever=hoist_flag_out_of_kernel` on rgamma,
+all in one invocation. Run on worker hz2 with `RCH_WORKER=hz2`, `same_host=hetzner2`,
+harness=perf_special_vs_scipy, live SciPy in the same process, ELF sha self-reported.
+
+Observed: arm control `on_hits=1 off_hits=0` on all five ops. Per-arm agreement identical
+between arms on every op — `max_abs=5.82076609134674072e-11` on both arms of i0 and of i1
+(their pre-existing figure, unchanged), `max_abs=0.00000000000000000e+00` on both arms of k0
+and of k1, `compared=200000 nonfinite_mismatch=0` throughout. Five ops audited and fixed;
+`gamma_core` and `iv_scalar` found and NOT fixed.
+
+**The audit**
+
+Every `_HITS.fetch_add` and toggle `.load()` in the crate was enumerated against its enclosing
+function and classified by whether that function takes a scalar (per element) or a tensor
+(per batch). That found more than the informal list in the previous row: `i0_scalar`,
+`i1_scalar`, `k0_order_scalar`, `k1_order_scalar`, `iv_scalar` and — missed entirely before —
+`gamma_core`, which carries TWO loads and TWO increments per element.
+
+**The correction this row exists for**
+
+`gamma_core` carries an in-source note recording that this exact `fetch_add` was measured, at
+2.0 instructions per element or about 1.1%, and deliberately RETAINED as the honest price of
+its must-hit evidence. That measurement is not wrong. Its conclusion is, and the load-bearing word
+in it is "uncontended": it was taken single-threaded. These batches fan out, and then the line
+is written by every worker on every element.
+
+**Instruction counting cannot see this.** It is the metric this campaign prefers precisely
+because it is load-independent, and that is exactly why the defect survived: the instruction
+count of a contended increment is identical to an uncontended one. A defect invisible to the
+preferred instrument is not a small defect — it is one that will keep being priced at zero.
+The note has been corrected in place rather than left to mislead the next reader.
+
+**The effect tracks worker count, which is the mechanism test**
+
+Ops sharing `map_real_input` fan out to 16 workers at this size; rgamma fans out through the
+gamma family's mapper to 6. The four 16-worker ops all landed in one band and the 6-worker op
+well below it, with every observed range clear of its own A/A nulls and the two bands not
+overlapping. Figures are in the commit message. A contended-cache-line explanation predicts
+that ordering; an "atomics are expensive" explanation predicts no dependence on worker count
+and does not fit.
+
+**A must-hit control had to be REPLACED, not relaxed.** `bessel_i01_cephes_toggle_drives_both_arms`
+asserted that the counter advanced at least once PER ELEMENT — it proved the arm ran by
+counting the very increments that were the defect. Changing the assertion to match the new
+per-batch counting would have been weakening it, so the count was replaced by a stronger and
+counter-free control: the two arms are different approximations, so their outputs must DIFFER
+somewhere, compared by `to_bits` because `-0.0 == 0.0` would accept a lost sign. A control
+that cannot survive fixing the code it watches was measuring the implementation, not the
+behaviour.
+
+**Not fixed here, deliberately:** `gamma_core` and `iv_scalar`. Both are live instances; both
+need deeper plumbing than the four ops above, and folding them in on the strength of this
+result rather than their own would be exactly the reasoning this row is correcting.
+
+**No runtime claim is banked.** The TIMED set requires fail-closed host-wide quiescence; hz2
+ran this between loadavg 1.72 and 7.45 on 16 cores, and hz1 remains refused for
+`disk_critical_without_fresh_telemetry`. Reported, not relaxed.
