@@ -2133,6 +2133,19 @@ fn gamma_core(x: f64) -> f64 {
         return f64::NAN;
     }
 
+    // NEGATIVE ARGUMENTS NEED NO REFLECTION, and this is where `rgamma` was losing.
+    // Profiling `rgamma` over [-10, 10] put `__sin_fma` at 11.05% of the op — 20.9
+    // instructions per element — against SciPy, which calls no `sin` at all on this domain.
+    // Cephes reaches [2, 3] from a negative argument by the same upward recurrence it uses
+    // from a small positive one; the reflection formula is only needed below the rational's
+    // range. Taking it here removes the `sin` for every |x| <= 33.
+    if x.abs() <= GAMMA_CEPHES_MAX_X
+        && GAMMA_CEPHES_REFLECTION_FREE.load(std::sync::atomic::Ordering::Relaxed)
+        && GAMMA_CEPHES_RATIONAL.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        GAMMA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return gamma_cephes_reduced(x);
+    }
     if x < 0.5 {
         // Reflection formula: Γ(x) = π / (sin(πx) * Γ(1-x))
         let sin_pi_x = (PI * x).sin();
@@ -2222,7 +2235,21 @@ fn gamma_cephes_reduced(mut x: f64) -> f64 {
         x -= 1.0;
         z *= x;
     }
+    // UPWARD RECURRENCE THROUGH THE NEGATIVE REGION, which is how Cephes reaches [2, 3]
+    // from a negative argument — no reflection and no `sin`. The guards are Cephes' own and
+    // they are load-bearing rather than defensive: without them `z /= x` divides by a value
+    // approaching zero as the recurrence steps across it.
+    while x < 0.0 {
+        if x > -1.0e-9 {
+            return gamma_cephes_near_zero(z, x);
+        }
+        z /= x;
+        x += 1.0;
+    }
     while x < 2.0 {
+        if x < 1.0e-9 {
+            return gamma_cephes_near_zero(z, x);
+        }
         z /= x;
         x += 1.0;
     }
@@ -2232,6 +2259,21 @@ fn gamma_cephes_reduced(mut x: f64) -> f64 {
     x -= 2.0;
     z * polevl(x, &GAMMA_CEPHES_P) / polevl(x, &GAMMA_CEPHES_Q)
 }
+
+/// Cephes' `small` exit from the recurrence: `Γ(x) ~ 1/(x(1 + γx))` as `x -> 0`.
+///
+/// Reached only when the recurrence lands within 1e-9 of zero, where the division that
+/// drives it would otherwise lose the value. `x == 0` here means the input was a
+/// nonpositive integer, which Cephes reports as singular.
+fn gamma_cephes_near_zero(z: f64, x: f64) -> f64 {
+    if x == 0.0 {
+        return f64::NAN;
+    }
+    z / ((1.0 + EULER_MASCHERONI_CEPHES * x) * x)
+}
+
+/// Euler-Mascheroni as Cephes spells it in `gamma.h`'s small-argument exit.
+const EULER_MASCHERONI_CEPHES: f64 = 0.577_215_664_901_532_9;
 
 /// Upper limit of the rational form. Above it Cephes switches to Stirling; we keep the
 /// Lanczos kernel there instead, which is unchanged behaviour and outside every domain this
@@ -2519,6 +2561,14 @@ pub static GAMMA_INFALLIBLE_BATCH: std::sync::atomic::AtomicBool =
 /// anything between; incrementing it changes no numeric result.
 pub static GAMMA_INFALLIBLE_BATCH_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+/// Reach negative arguments through Cephes' upward recurrence instead of the reflection
+/// formula (`true`, shipping), removing a `sin` per element for `|x| <= 33`.
+///
+/// NOT bit-identical: it is a different route to the same value, and it is the route the
+/// incumbent takes. Accuracy against the live SciPy arm is the contract.
+pub static GAMMA_CEPHES_REFLECTION_FREE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 /// Use SciPy's own rational form for `Γ(x)` on `0.5 <= x <= 33` (`true`, shipping) instead
 /// of the Lanczos kernel's eight divisions and three transcendentals.
@@ -4583,6 +4633,101 @@ mod tests {
             }
         }
         GAMMA_FAMILY_PREALLOC_FILL.store(restore, Relaxed);
+    }
+
+    /// The reflection-free route to negative arguments agrees with the reflection formula,
+    /// and its near-zero guards actually fire.
+    ///
+    /// Cephes reaches [2, 3] from a negative argument by upward recurrence rather than
+    /// through `Γ(x) = π / (sin(πx) Γ(1-x))`. The two are the same function by different
+    /// arithmetic, so they must agree closely — but the recurrence divides by `x` as it
+    /// steps across zero, which is why Cephes carries `x > -1e-9` and `x < 1e-9` bail-outs.
+    /// Those guards are the part that is easy to drop and impossible to notice: this test
+    /// drives inputs into them deliberately.
+    #[test]
+    fn gamma_reflection_free_matches_the_reflection_formula() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = gamma_toggle_lock();
+        let restore = GAMMA_CEPHES_REFLECTION_FREE.load(Relaxed);
+
+        // Negative non-integers across the rational's range, avoiding the poles themselves.
+        let mut points: Vec<f64> = Vec::new();
+        for i in 0..=3000 {
+            let x = -32.5 + 32.0 * (i as f64 / 3000.0);
+            if !(x < 0.0 && x.fract() == 0.0) && x != 0.0 {
+                points.push(x);
+            }
+        }
+        points.extend([-0.5, -1.5, -2.5, -10.5, -20.25, -32.4, 0.25, 0.4999, 0.5]);
+
+        let mut worst = 0.0_f64;
+        let mut worst_at = f64::NAN;
+        for &x in &points {
+            GAMMA_CEPHES_REFLECTION_FREE.store(true, Relaxed);
+            let recurrence = gamma_core(x);
+            GAMMA_CEPHES_REFLECTION_FREE.store(false, Relaxed);
+            let reflection = gamma_core(x);
+            assert!(
+                recurrence.is_finite() && reflection.is_finite(),
+                "non-finite at x={x}: recurrence {recurrence} reflection {reflection}"
+            );
+            let rel = (recurrence - reflection).abs() / reflection.abs();
+            if rel > worst {
+                worst = rel;
+                worst_at = x;
+            }
+        }
+
+        // NEAR-ZERO GUARDS: land the recurrence inside 1e-9 of zero from both sides, which
+        // is the only way `gamma_cephes_near_zero` is reached. Without the guards these
+        // divide by a value approaching zero.
+        GAMMA_CEPHES_REFLECTION_FREE.store(true, Relaxed);
+        for &x in &[
+            1.0e-12,
+            -1.0e-12,
+            5.0e-10,
+            -5.0e-10,
+            -1.000_000_000_1,
+            -2.999_999_999_9,
+        ] {
+            let v = gamma_core(x);
+            assert!(
+                v.is_finite() && v != 0.0,
+                "guard path returned {v} at x={x}"
+            );
+            // Γ(x) ~ 1/x near zero, so tiny arguments must be enormous and correctly signed.
+            if x.abs() < 1.0e-9 {
+                assert!(
+                    v.abs() > 1.0e9 && (v > 0.0) == (x > 0.0),
+                    "Γ({x}) should be ~1/x, got {v}"
+                );
+            }
+        }
+        // Poles stay NaN on the new route.
+        for &x in &[-1.0, -2.0, -17.0] {
+            assert!(gamma_core(x).is_nan(), "Γ({x}) must be NaN at a pole");
+        }
+        GAMMA_CEPHES_REFLECTION_FREE.store(restore, Relaxed);
+
+        println!(
+            "gamma recurrence vs reflection: worst rel {worst:e} at x={worst_at}, {} points",
+            points.len()
+        );
+        // MEASURED worst is 1.35e-12 at x = -31.9987, and it is the REFLECTION arm that is
+        // wrong there: `sin(pi x)` approaches zero as x approaches a negative integer, so the
+        // reflection formula cancels catastrophically while the recurrence does not. The
+        // recurrence side is the one that measures BIT-IDENTICAL to live SciPy over the whole
+        // [-10, 10] fixture, max_abs and max_rel both exactly 0.
+        //
+        // So this bound is 1e-10 — 74x the measurement — because this test exists to catch a
+        // gross routing or guard error, not to adjudicate the last ULP between two routes of
+        // known-unequal quality. The authoritative accuracy check is the live-SciPy arm in
+        // `perf_special_vs_scipy`, and tightening this one onto 1.35e-12 would make it a
+        // detector for the reflection formula's noise near the poles.
+        assert!(
+            worst < 1.0e-10,
+            "recurrence and reflection disagree by {worst:e} at x={worst_at}"
+        );
     }
 
     /// `rgamma_scalar` never returns `Err`, on any input, in any mode.

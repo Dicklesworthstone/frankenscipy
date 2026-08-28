@@ -320,6 +320,19 @@ fn main() {
     fsci_special::GAMMA_FAMILY_PREALLOC_FILL.store(prealloc, std::sync::atomic::Ordering::Relaxed);
     println!("gamma_family_prealloc_fill={prealloc}");
 
+    // `FSCI_SPECIAL_GAMMA_REFLECTFREE=0` restores the reflection formula (and its `sin`) for
+    // negative arguments, so the recurrence route can be A/B'd -- for ACCURACY as much as
+    // cost -- inside ONE binary.
+    let reflect_free = !matches!(
+        std::env::var("FSCI_SPECIAL_GAMMA_REFLECTFREE")
+            .ok()
+            .as_deref(),
+        Some("0") | Some("false")
+    );
+    fsci_special::GAMMA_CEPHES_REFLECTION_FREE
+        .store(reflect_free, std::sync::atomic::Ordering::Relaxed);
+    println!("gamma_cephes_reflection_free={reflect_free}");
+
     // `FSCI_SPECIAL_GAMMA_INFALLIBLE=0` restores the `Result`-per-element batch path for
     // `gamma`, so the infallible batch can be A/B'd inside ONE binary.
     let gamma_infallible = !matches!(
