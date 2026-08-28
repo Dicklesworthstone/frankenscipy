@@ -1088,6 +1088,18 @@ pub fn rgamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
             // it returns is dead on every input, not merely rare, and `rgamma_never_errors`
             // pins that rather than leaving it as a reading of the code.
             GAMMA_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if RGAMMA_HOIST_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
+                RGAMMA_HOIST_FLAG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let cheb = RGAMMA_CEPHES_CHEB.load(std::sync::atomic::Ordering::Relaxed);
+                if cheb {
+                    RGAMMA_CEPHES_CHEB_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(SpecialTensor::RealVec(map_real_infallible(
+                    values,
+                    gamma_family_par_min_for(values.len()),
+                    |x| rgamma_value_with(x, mode, cheb),
+                )));
+            }
             Ok(SpecialTensor::RealVec(map_real_infallible(
                 values,
                 gamma_family_par_min_for(values.len()),
@@ -1932,14 +1944,29 @@ const RGAMMA_CHEB_MAX_ABS_X: f64 = 4.0;
 /// through `rgamma_scalar` bought 5.0 instructions per element where `gamma` and `digamma`
 /// each gained 29.0, and this is the difference.
 pub(crate) fn rgamma_value(x: f64, mode: RuntimeMode) -> f64 {
+    let cheb = RGAMMA_CEPHES_CHEB.load(std::sync::atomic::Ordering::Relaxed);
+    if !is_negative_integer_pole(x) && x != 0.0 && x.abs() <= RGAMMA_CHEB_MAX_ABS_X && cheb {
+        RGAMMA_CEPHES_CHEB_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    rgamma_value_with(x, mode, cheb)
+}
+
+/// `rgamma_value` with the Chebyshev-arm flag passed IN rather than read per element.
+///
+/// WHY. The wrapper above does TWO process-global atomic operations per element: a relaxed
+/// load, which is an optimisation barrier LLVM may not hoist out of the mapper's inner loop,
+/// and a `fetch_add` on a counter every worker shares. `map_real_infallible` fans `rgamma`
+/// across cores at the fixture size, so that counter is several workers writing one cache
+/// line on every element.
+///
+/// The same shape was worth several-fold on `y0`/`y1` (frankenscipy-sdus1), and rgamma was
+/// the next-worst cell immediately afterwards. BIT-IDENTICAL: the flag holds the same value
+/// either way and no arithmetic changes.
+pub(crate) fn rgamma_value_with(x: f64, mode: RuntimeMode, cheb: bool) -> f64 {
     if is_negative_integer_pole(x) {
         return 0.0;
     }
-    if x != 0.0
-        && x.abs() <= RGAMMA_CHEB_MAX_ABS_X
-        && RGAMMA_CEPHES_CHEB.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        RGAMMA_CEPHES_CHEB_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if x != 0.0 && x.abs() <= RGAMMA_CHEB_MAX_ABS_X && cheb {
         return rgamma_cephes_small(x);
     }
     // `gamma_scalar` cannot fail here — its only error is a negative-integer pole under
@@ -2791,6 +2818,18 @@ pub static ZETA_CEPHES_RATIONAL_HITS: std::sync::atomic::AtomicUsize =
 /// NOT bit-identical and not intended to be: it is a different approximation, and it is the
 /// one the incumbent uses, so it moves our values toward SciPy. Accuracy against the live
 /// SciPy arm is the contract, checked in the same invocation by `perf_special_vs_scipy`.
+/// Read rgamma's Chebyshev-arm flag ONCE per batch instead of once per element
+/// (`true`, shipping).
+///
+/// BIT-IDENTICAL: both arms evaluate the same kernel on the same flag value. Only the number
+/// of process-global atomic touches differs — once per array, or once per element from every
+/// worker at the same address.
+pub static RGAMMA_HOIST_FLAG: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// BATCHES that took the hoisted path — "enabled" is not "took effect". Counted per batch.
+pub static RGAMMA_HOIST_FLAG_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub static RGAMMA_CEPHES_CHEB: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 /// Evaluations that took the Chebyshev arm — "enabled" is not "took effect".

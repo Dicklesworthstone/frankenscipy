@@ -1369,7 +1369,17 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool), bool)> {
         // taken by `cephes_lgam`; one lever per op.)
         // shipping = FALSE: `on` is the diagnostic serial arm. Restoring `true` here is
         // what pinned the gate for every op that ran after gamma.
-        "gamma" | "rgamma" | "digamma" => Some((
+        // rgamma's live question is now the same per-element-atomics one that was worth
+        // several-fold on y0/y1, not the schedule (which came back contradictory twice and
+        // is deliberately still open).
+        "rgamma" => Some((
+            "hoist_flag_out_of_kernel",
+            |on| {
+                fsci_special::RGAMMA_HOIST_FLAG.store(on, std::sync::atomic::Ordering::Relaxed);
+            },
+            true,
+        )),
+        "gamma" | "digamma" => Some((
             "force_serial",
             |on| {
                 fsci_special::GAMMA_FAMILY_PAR_MIN_OVERRIDE.store(
@@ -1405,7 +1415,10 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
         "y0" => {
             Some(|| fsci_special::BESSEL_SERIAL_HITS.load(std::sync::atomic::Ordering::Relaxed))
         }
-        "gamma" | "rgamma" | "digamma" => Some(|| {
+        "rgamma" => {
+            Some(|| fsci_special::RGAMMA_HOIST_FLAG_HITS.load(std::sync::atomic::Ordering::Relaxed))
+        }
+        "gamma" | "digamma" => Some(|| {
             fsci_special::GAMMA_FAMILY_SERIAL_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),
         _ => None,

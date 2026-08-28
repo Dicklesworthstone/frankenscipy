@@ -42280,3 +42280,52 @@ rather than rediscover the class.
 **No runtime claim is banked.** The TIMED evidence set requires fail-closed host-wide
 quiescence; hz2 ran this between loadavg 1.72 and 6.97 on 16 cores, and hz1 remains refused
 for `disk_critical_without_fresh_telemetry`. Reported, not relaxed.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) of rgamma's arithmetic as its deficit: the same per-element process-global atomics found in y0/y1 were live here too, and the effect scales with WORKER COUNT (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, arm sweep
+`lever=hoist_flag_out_of_kernel` on rgamma. Run on worker hz2 with `RCH_WORKER=hz2`,
+`same_host=hetzner2`, harness=perf_special_vs_scipy, live SciPy in the same process, ELF sha
+self-reported.
+
+Observed: arm control `on_hits=1 off_hits=0`; both arms returned
+`max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000
+nonfinite_mismatch=0`; the paired effect's entire observed range lies above the looser of the
+two A/A nulls.
+
+**Found by prediction rather than by search, which is the point**
+
+The previous row established that `y0`/`y1` were held back not by their mathematics but by two
+process-global atomics executed per element — a relaxed flag load and a `fetch_add` on a
+counter shared by every worker. `rgamma` became the worst cell immediately afterwards, and
+`rgamma_value` had exactly the same shape: a `RGAMMA_CEPHES_CHEB` load and a
+`RGAMMA_CEPHES_CHEB_HITS` increment, both inside the per-element kernel. No search was needed;
+the previous finding named the pattern and this was the next instance of it.
+
+Hoisted to the batch entry point — read once per array, counted once per array, passed down as
+a plain `bool`. BIT-IDENTICAL: the flag holds the same value either way and no arithmetic
+changes.
+
+**The size of the effect follows the WORKER COUNT, which supports the mechanism rather than
+merely being consistent with it.** `y0`/`y1` fan out through `map_real_input`, whose cap puts
+16 workers on the array at this size, and their effect was several-fold. `rgamma` fans out
+through the gamma family's mapper, whose cap puts 6 workers on it, and its effect is far
+smaller while still clearing its nulls by the whole observed range. More writers on one cache
+line, more to recover — which is what a contended-counter explanation predicts and what a
+"the atomic instruction itself is expensive" explanation would not.
+
+**The remaining named instances are unchanged:** `i0_scalar`, `i1_scalar`, `k0_order_scalar`,
+`k1_order_scalar`, `zeta_positive`. All still beat the incumbent, which is why they went
+unexamined; that is not evidence they are paying nothing.
+
+**Not addressed here, and still open:** rgamma's serial-versus-threaded question, which
+returned opposite answers on two earlier runs and was deliberately left alone. It is worth
+re-asking now that the counter no longer serialises its inner loop, because the earlier
+contradiction was measured through that bottleneck.
+
+**No runtime claim is banked.** The TIMED evidence set requires fail-closed host-wide
+quiescence; hz2 ran this between loadavg 1.30 and 6.68 on 16 cores, and hz1 remains refused
+for `disk_critical_without_fresh_telemetry`. Ratios are in the commit message. Reported, not
+relaxed.
