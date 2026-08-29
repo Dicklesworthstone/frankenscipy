@@ -564,11 +564,17 @@ fn gamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) 
                 return gamma_scalar(x, mode).map(SpecialTensor::RealScalar);
             }
             GAMMA_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let core_flags = hoisted_gamma_core_flags();
             Ok(SpecialTensor::RealVec(map_real_infallible(
                 values,
                 gamma_family_par_min_for_of(values.len(), GAMMA_PAR_MIN),
-                |x| {
-                    let value = gamma_core(x);
+                move |x| {
+                    let value = match core_flags {
+                        Some((rational, reflection_free)) => {
+                            gamma_core_with(x, rational, reflection_free, false)
+                        }
+                        None => gamma_core(x),
+                    };
                     // Preserved from `gamma_scalar`: a non-finite result that is not a pole
                     // and not zero is traced. The branch is never taken on ordinary input.
                     if !value.is_finite() && !is_negative_integer_pole(x) && x != 0.0 {
@@ -1094,10 +1100,11 @@ pub fn rgamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
                 if cheb {
                     RGAMMA_CEPHES_CHEB_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                let core_flags = hoisted_gamma_core_flags();
                 return Ok(SpecialTensor::RealVec(map_real_infallible(
                     values,
                     gamma_family_par_min_for(values.len()),
-                    |x| rgamma_value_with(x, mode, cheb),
+                    move |x| rgamma_value_with_core(x, mode, cheb, core_flags),
                 )));
             }
             Ok(SpecialTensor::RealVec(map_real_infallible(
@@ -1963,6 +1970,23 @@ pub(crate) fn rgamma_value(x: f64, mode: RuntimeMode) -> f64 {
 /// the next-worst cell immediately afterwards. BIT-IDENTICAL: the flag holds the same value
 /// either way and no arithmetic changes.
 pub(crate) fn rgamma_value_with(x: f64, mode: RuntimeMode, cheb: bool) -> f64 {
+    rgamma_value_with_core(x, mode, cheb, None)
+}
+
+/// `rgamma_value_with`, additionally taking `gamma_core`'s two flags when the batch has
+/// already read them.
+///
+/// WHY THIS SECOND LAYER EXISTS. Hoisting rgamma's OWN flag was not enough: the fallback path
+/// below calls `gamma_core`, which held four more process-global atomics per element — two
+/// loads and two increments — so an rgamma batch that fans out was still writing a shared
+/// cache line on every element that missed the Chebyshev branch. `core_flags` of `None` keeps
+/// the per-element behaviour for scalar callers.
+pub(crate) fn rgamma_value_with_core(
+    x: f64,
+    mode: RuntimeMode,
+    cheb: bool,
+    core_flags: Option<(bool, bool)>,
+) -> f64 {
     if is_negative_integer_pole(x) {
         return 0.0;
     }
@@ -1972,7 +1996,10 @@ pub(crate) fn rgamma_value_with(x: f64, mode: RuntimeMode, cheb: bool) -> f64 {
     // `gamma_scalar` cannot fail here — its only error is a negative-integer pole under
     // Hardened, excluded above — so its infallible part is inlined, TRACE INCLUDED. Dropping
     // that trace would be a silent behaviour change rather than a speed-up.
-    let gamma_value = gamma_core(x);
+    let gamma_value = match core_flags {
+        Some((rational, reflection_free)) => gamma_core_with(x, rational, reflection_free, false),
+        None => gamma_core(x),
+    };
     if !gamma_value.is_finite() && !is_negative_integer_pole(x) && x != 0.0 {
         record_special_trace(
             "gamma",
@@ -2375,7 +2402,43 @@ fn clamp_unit_interval(value: f64) -> f64 {
 /// where it is needed is cheaper than keeping a `bool` live across a call, which costs a
 /// register or a spill and blocks the inlining LLVM was already doing. REMATERIALISATION
 /// BEATS CACHING FOR A PREDICATE THIS CHEAP — "remove the redundant work" is not a rule.
+
+/// Read gamma_core's two flags ONCE for a batch, counting the batch, or `None` when the hoist
+/// is switched off and the per-element path should run instead.
+fn hoisted_gamma_core_flags() -> Option<(bool, bool)> {
+    if !crate::bessel::SPECIAL_HOIST_ELEMENT_FLAGS.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    crate::bessel::SPECIAL_HOIST_ELEMENT_FLAGS_HITS
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rational = GAMMA_CEPHES_RATIONAL.load(std::sync::atomic::Ordering::Relaxed);
+    let reflection_free = GAMMA_CEPHES_REFLECTION_FREE.load(std::sync::atomic::Ordering::Relaxed);
+    if rational {
+        GAMMA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some((rational, reflection_free))
+}
+
 pub(crate) fn gamma_core(x: f64) -> f64 {
+    gamma_core_with(
+        x,
+        GAMMA_CEPHES_RATIONAL.load(std::sync::atomic::Ordering::Relaxed),
+        GAMMA_CEPHES_REFLECTION_FREE.load(std::sync::atomic::Ordering::Relaxed),
+        true,
+    )
+}
+
+/// `gamma_core` with both flags supplied by the caller and the hit counter optional.
+///
+/// WHY. This function held FOUR process-global atomic operations per element — two flag loads
+/// and two `fetch_add`s — and it is the most-shared kernel in the crate, reached by `gamma`,
+/// `rgamma` and the reflection recursion. Under fan-out every worker wrote the counter's cache
+/// line on every element; the note further down records that this was once priced at ~1% by
+/// instruction count and left in place, and why that pricing could not see the real cost.
+///
+/// `count` is false on batch paths, where the counter is advanced once for the whole array.
+/// BIT-IDENTICAL: the flags hold the same values either way and no arithmetic changes.
+pub(crate) fn gamma_core_with(x: f64, rational: bool, reflection_free: bool, count: bool) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }
@@ -2404,11 +2467,10 @@ pub(crate) fn gamma_core(x: f64) -> f64 {
     // Cephes reaches [2, 3] from a negative argument by the same upward recurrence it uses
     // from a small positive one; the reflection formula is only needed below the rational's
     // range. Taking it here removes the `sin` for every |x| <= 33.
-    if x.abs() <= GAMMA_CEPHES_MAX_X
-        && GAMMA_CEPHES_REFLECTION_FREE.load(std::sync::atomic::Ordering::Relaxed)
-        && GAMMA_CEPHES_RATIONAL.load(std::sync::atomic::Ordering::Relaxed)
-    {
-        GAMMA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if x.abs() <= GAMMA_CEPHES_MAX_X && reflection_free && rational {
+        if count {
+            GAMMA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return gamma_cephes_reduced(x);
     }
     if x < 0.5 {
@@ -2425,10 +2487,10 @@ pub(crate) fn gamma_core(x: f64) -> f64 {
             }
             return f64::NAN;
         }
-        return PI / (sin_pi_x * gamma_core(1.0 - x));
+        return PI / (sin_pi_x * gamma_core_with(1.0 - x, rational, reflection_free, count));
     }
 
-    if x <= GAMMA_CEPHES_MAX_X && GAMMA_CEPHES_RATIONAL.load(std::sync::atomic::Ordering::Relaxed) {
+    if x <= GAMMA_CEPHES_MAX_X && rational {
         // PRICED, because a per-element atomic read-modify-write looks like it should be
         // expensive and this crate has a standing note that a toggle read in a hot loop cost
         // 13% elsewhere. Removing this `fetch_add` entirely moves gamma from 184.4 to 182.4
@@ -2451,7 +2513,9 @@ pub(crate) fn gamma_core(x: f64) -> f64 {
         // months: the instruction count of a contended increment is identical to an
         // uncontended one. `gamma_core` is still on the per-element path and is a live
         // candidate; it is named in frankenscipy-sdus1's successor rather than fixed here.
-        GAMMA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if count {
+            GAMMA_CEPHES_RATIONAL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         return gamma_cephes_reduced(x);
     }
 

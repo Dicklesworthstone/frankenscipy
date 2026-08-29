@@ -42392,3 +42392,54 @@ result rather than their own would be exactly the reasoning this row is correcti
 **No runtime claim is banked.** The TIMED set requires fail-closed host-wide quiescence; hz2
 ran this between loadavg 1.72 and 7.45 on 16 cores, and hz1 remains refused for
 `disk_critical_without_fresh_telemetry`. Reported, not relaxed.
+
+## 2026-08-28 REJECT (Result class: BEHAVIORAL) — the false-sharing class closes on gamma_core, and the worker-count law predicts its own NULL: the same fix does nothing for an op that no longer fans out (BlackThrush)
+
+Result class: BEHAVIORAL
+
+Cited probe: `crates/fsci-special/src/bin/perf_special_vs_scipy.rs`, arm sweep
+`lever=hoist_flag_out_of_kernel` on rgamma, plus the full one-argument cell sweep. Run on
+worker hz2 with `RCH_WORKER=hz2`, `same_host=hetzner2`, harness=perf_special_vs_scipy, live
+SciPy in the same process, ELF sha self-reported.
+
+Observed: arm control `on_hits=1 off_hits=0`; both rgamma arms returned
+`max_abs=0.00000000000000000e+00 max_rel=0.00000000000000000e+00 compared=200000
+nonfinite_mismatch=0`; rgamma's paired range lies entirely above both its A/A nulls; gamma's
+cell was unchanged to within its nulls across the same change.
+
+**The last per-element instance on a batch path**
+
+`gamma_core` held FOUR process-global atomics per element — two flag loads and two
+increments — and is the most-shared kernel in the crate, reached by `gamma`, by `rgamma`'s
+fallback, and by its own reflection recursion. Hoisting `rgamma`'s own flag last time was not
+enough: every element that missed the Chebyshev branch still went through `gamma_core` and
+still wrote the shared line. Both layers are now hoisted, and rgamma's effect roughly doubled
+over the previous row's — consistent with `gamma_core` carrying twice the atomics rgamma's own
+flag did.
+
+**A predicted NULL, which is the stronger half of this row**
+
+The same change did NOTHING for `gamma`. That is not a disappointment, it is the prediction:
+`gamma` was given its own fan-out threshold two rows ago and now runs SERIAL at this size, so
+there is no second worker and no cache line to contend for. A contended-line explanation
+requires the effect to vanish at one worker. It vanished.
+
+The law now has three points measured independently and in the right order: sixteen workers
+gave the largest effects, six gave a much smaller one, one gave nothing. An "atomic
+instructions are simply expensive" explanation predicts the same effect at every worker count
+and is refuted by the third point specifically — the one where a fix that helped elsewhere was
+correctly expected to do nothing here and did nothing.
+
+**Class status.** Fixed on batch paths: gammaln, erfcinv, the gamma family, y0/y1, i0/i1,
+k0/k1, rgamma, gamma_core. Remaining and named: `iv_scalar`, which reaches its kernel through
+the shared two-argument `bessel_dispatch` and needs different plumbing; it is not folded in
+here on this row's evidence.
+
+**Next worst cells, for the record:** `erfcinv` and `erfinv`. Neither fans out at this size —
+their gate sits far above it — so neither is an instance of this class, and their deficits are
+kernel cost. `erfcinv`'s is partly deliberate: it was traded for a large accuracy gain
+earlier in this campaign, knowingly.
+
+**No runtime claim is banked.** The TIMED set requires fail-closed host-wide quiescence; hz2
+ran this between loadavg 1.84 and 6.16 on 16 cores, and hz1 remains refused for
+`disk_critical_without_fresh_telemetry`. Reported, not relaxed.
