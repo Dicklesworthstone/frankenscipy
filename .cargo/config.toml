@@ -21,3 +21,7 @@
 # Evidence + reproducer: tests/artifacts/perf/2026-07-10-fsci-isa-baseline-sse2/
 [build]
 rustflags = ["-Z", "threads=4", "-C", "target-feature=+avx2,+fma"]
+# Keep new Cargo invocations out of the stale shared `target/` tree.  The
+# directory is intentionally separate rather than cleaning the shared tree,
+# which may contain other agents' active artifacts.
+target-dir = "target-isolated"
