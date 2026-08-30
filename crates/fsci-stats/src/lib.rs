@@ -31413,6 +31413,39 @@ fn wilcoxon_permutation_pvalue(ranks: &[f64], t_plus: f64, alternative: &str) ->
 pub static WILCOXON_FORCE_EAGER_NOTIES: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// When `true`, [`wilcoxon`] and [`wilcoxon_alternative`] reconstruct their tie sum with the
+/// historical clone-and-sort path. Default `false` takes the exact tie sum from the ranking pass.
+///
+/// This is an A/B measurement switch for `frankenscipy-921i0`, not a user-facing policy knob.
+/// On the exact-tie fixtures admitted by its regression test, both paths are byte-identical.
+/// Near-tied values deliberately remain on the shipping path because the historical tolerance
+/// grouping does not match SciPy; that conformance repair is covered by `frankenscipy-clttw`.
+#[doc(hidden)]
+pub static WILCOXON_FORCE_TIE_RESORT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Historical Wilcoxon tie correction: clone absolute differences, sort, then group values
+/// within the former `1e-12` tolerance. It exists solely as the control arm for
+/// [`WILCOXON_FORCE_TIE_RESORT`]; shipping code uses exact groups from `rankdata_ties` instead.
+fn wilcoxon_tie_sum_by_resort(abs_diffs: &[f64]) -> f64 {
+    let mut sorted_abs = abs_diffs.to_vec();
+    sorted_abs.sort_unstable_by(f64::total_cmp);
+    let mut tie_sum = 0.0_f64;
+    let mut i = 0usize;
+    while i < sorted_abs.len() {
+        let mut j = i + 1;
+        while j < sorted_abs.len() && (sorted_abs[j] - sorted_abs[i]).abs() < 1e-12 {
+            j += 1;
+        }
+        let t = (j - i) as f64;
+        if t > 1.0 {
+            tie_sum += t * t * t - t;
+        }
+        i = j;
+    }
+    tie_sum
+}
+
 pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     if x.len() != y.len() || x.iter().any(|v| v.is_nan()) || y.iter().any(|v| v.is_nan()) {
         return TtestResult {
@@ -31448,7 +31481,12 @@ pub fn wilcoxon(x: &[f64], y: &[f64]) -> TtestResult {
     // replaces a clone+sort for `no_ties` AND a clone+sort for the tie correction
     // (`frankenscipy-921i0`), and switches the tie predicate from a 1e-12 tolerance to
     // exact equality, matching scipy (`frankenscipy-clttw`).
-    let (ranks, tie_sum) = rankdata_ties_with_tie_sum(&abs_diffs, RankTieMethod::Average);
+    let (ranks, tie_sum_from_pass) = rankdata_ties_with_tie_sum(&abs_diffs, RankTieMethod::Average);
+    let tie_sum = if WILCOXON_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed) {
+        wilcoxon_tie_sum_by_resort(&abs_diffs)
+    } else {
+        tie_sum_from_pass
+    };
 
     // T+ = sum of ranks where difference is positive
     let t_plus: f64 = ranks
@@ -31581,7 +31619,12 @@ pub fn wilcoxon_alternative(x: &[f64], y: &[f64], alternative: &str) -> TtestRes
     // replaces a clone+sort for `no_ties` AND a clone+sort for the tie correction
     // (`frankenscipy-921i0`), and switches the tie predicate from a 1e-12 tolerance to
     // exact equality, matching scipy (`frankenscipy-clttw`).
-    let (ranks, tie_sum) = rankdata_ties_with_tie_sum(&abs_diffs, RankTieMethod::Average);
+    let (ranks, tie_sum_from_pass) = rankdata_ties_with_tie_sum(&abs_diffs, RankTieMethod::Average);
+    let tie_sum = if WILCOXON_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed) {
+        wilcoxon_tie_sum_by_resort(&abs_diffs)
+    } else {
+        tie_sum_from_pass
+    };
 
     let t_plus: f64 = ranks
         .iter()
@@ -101624,6 +101667,65 @@ mod tests {
             !MWU_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed),
             "a toggle was left flipped, which would leak into every later test \
              sharing TOGGLE_LOCK"
+        );
+    }
+
+    /// `frankenscipy-921i0` GATE, byte-identity half for Wilcoxon. The restored control arm
+    /// recreates the deleted clone-and-sort tie correction, while shipping uses the tie sum from
+    /// the ranking pass. Exact ties make the historical tolerance inert, so this compares work
+    /// rather than semantics; near-tie conformance remains covered separately by clttw.
+    #[test]
+    fn wilcoxon_tie_bit_identical_across_the_resort_toggle() {
+        let _g = toggle_guard();
+
+        let run = |x: &[f64], y: &[f64], resort: bool| {
+            WILCOXON_FORCE_TIE_RESORT.store(resort, std::sync::atomic::Ordering::Relaxed);
+            let standard = wilcoxon(x, y);
+            let greater = wilcoxon_alternative(x, y, "greater");
+            WILCOXON_FORCE_TIE_RESORT.store(false, std::sync::atomic::Ordering::Relaxed);
+            (standard, greater)
+        };
+
+        // More than thirteen entries forces the normal-approximation path where the tie
+        // correction is consumed. The repeating exact magnitudes are the MUST-HIT control.
+        let x: Vec<f64> = (0..48)
+            .map(|i| {
+                let magnitude = (i % 7 + 1) as f64;
+                if i % 2 == 0 { magnitude } else { -magnitude }
+            })
+            .collect();
+        let y = vec![0.0; x.len()];
+        let (_, tie_sum) = rankdata_ties_with_tie_sum(
+            &x.iter().map(|v| v.abs()).collect::<Vec<_>>(),
+            RankTieMethod::Average,
+        );
+        assert!(
+            tie_sum > 0.0,
+            "MUST-HIT: the fixture has no exact tie groups, so the resort arm would be vacuous"
+        );
+
+        let (orig_standard, orig_greater) = run(&x, &y, true);
+        let (pass_standard, pass_greater) = run(&x, &y, false);
+        for (label, original, shipping) in [
+            ("wilcoxon", orig_standard, pass_standard),
+            ("wilcoxon_alternative(greater)", orig_greater, pass_greater),
+        ] {
+            assert_eq!(
+                original.statistic.to_bits(),
+                shipping.statistic.to_bits(),
+                "{label}: statistic differs across WILCOXON_FORCE_TIE_RESORT"
+            );
+            assert_eq!(
+                original.pvalue.to_bits(),
+                shipping.pvalue.to_bits(),
+                "{label}: p-value differs across WILCOXON_FORCE_TIE_RESORT: resort {} vs pass {}",
+                original.pvalue,
+                shipping.pvalue
+            );
+        }
+        assert!(
+            !WILCOXON_FORCE_TIE_RESORT.load(std::sync::atomic::Ordering::Relaxed),
+            "a toggle was left flipped, which would leak into every later test sharing TOGGLE_LOCK"
         );
     }
 
