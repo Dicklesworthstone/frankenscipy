@@ -42768,3 +42768,78 @@ the smaller difference, and should be sized from the estimate that fires it leas
   14.5%). Even a free one-time cost leaves the elimination alone at ~48 ms against SciPy's
   ~35 ms, so the ordering-and-assemble family caps out around 1.5x on this stage and cannot on
   its own return the 1.29x the arm switch costs plus a win.
+
+- **REJECT 2026-08-30, frankenscipy-82rz5 — shipping L AoS-to-split-row retype.** Live
+  same-process SciPy 1.17.1 `perf_splu` on thinkstation1 (`taskset -c 6`, ELF
+  `b38a674e0673f8db4b4d40d8ba7d1d8cfbdbff9271f1e5afbeb7c8e3bdc0c63d`, rch build worker
+  `ovh-a`) gave SciPy/FrankenSciPy **0.4589x** CI `[0.4490,0.4690]`, down from the current
+  0.4722x row; A/A SciPy=0.9967 and FSci=0.9881 passed. Reverted the uncommitted retype.
+
+## 2026-08-30 - CopperFalcon (cc) - REJECT / WITHDRAWAL: my own reuse-aware splu ordering gate is a 2.74x REGRESSION on the cubic cell — one global crossover constant cannot serve two matrices, and the gate is removed
+
+- **Bead: `frankenscipy-run7d` / `frankenscipy-mad5u`.** **Result class: REJECT.** This withdraws
+  the routing shipped earlier today in `a47a51ae6`. The code is removed from the tree; the
+  convection rows in that entry stand as measured and are not retracted — what is retracted is
+  the claim that a single `expected_solves` threshold is a safe way to act on them.
+- **I shipped this with a written warning instead of a guard, and the warning was right.** The
+  constant's own doc said "the crossover is cell-dependent ... a caller declaring reuse on a very
+  different pattern may not be served by it", and I shipped anyway on the strength of one cell.
+  Checking the second cell is what a guard would have been for.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` (SuperLU), LIVE and
+  side-by-side in the same-invocation balanced square on identical fixture bytes**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`.
+- **HARNESS: `harness=perf_splu`**, substrate
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`.
+  **WHERE BOTH ARMS RAN: `same_host=thinkstation1`, back to back, `taskset -c 6`.**
+  `frankenscipy_engine_sha256=c5df988bd478b468b62134153ae6f975ea7066309c90353c79128414d22ec5ee`,
+  equivalently
+  `executed-binary sha256=c5df988bd478b468b62134153ae6f975ea7066309c90353c79128414d22ec5ee`,
+  built on **rch worker `vmi1152480`**, run outside the build window.
+  `requested_threads=1`, `actual_observed_worker_threads=1`, `physical_cores=32`,
+  `logical_threads=64`, `ram_bytes=231687815168`, `numa_count=1`,
+  `scaling_governor=powersave`, `runtime_isa=avx2+fma`, `affinity=1 (taskset -c 6)`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.137)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.227)`.
+- **DECISION RULE: bootstrap-median CI only, never cv; CV is provenance only.** Worst A/A null
+  edge across the four rows is 0.0043, so the **2x A/A-null margin** requires a ratio outside
+  [0.9914, 1.0086]; every row below clears it by a wide margin and the two factor CIs are
+  disjoint from each other by more than a factor of three.
+
+- **THE ROWS — `laplacian_3d_cubic` side=16, `n=4096`, `nnz=27136` input nonzeros,
+  `fixture_sha256=66c3a2a848ed1feff6007a9d8a3ef944c7112943ca93251d20e972ae2127f12f`, 21 rounds,
+  `host_identity=thinkstation1`, all `quiescence=clear`:**
+
+  | stage | gate OFF (`declared_solves=1`) | gate FIRES (`declared_solves=16`) |
+  |---|---|---|
+  | factor | **1.4297x** [1.4260, 1.4403], 27.842 ms | **0.3865x** [0.3847, 0.3873], 103.151 ms |
+  | solve, 16 RHS | 0.9009x [0.8931, 0.9083], 13.495 ms | 1.1595x [1.1560, 1.1634], 10.143 ms |
+
+  `Incumbent ratio: SciPy / FrankenSciPy = 0.3865x` on the arm the gate selects, against
+  `Incumbent ratio: SciPy / FrankenSciPy = 1.4297x` on the arm it replaces.
+
+- **THE ARITHMETIC THAT CONDEMNS IT.** Switching costs **+75.309 ms** of factor and saves
+  **3.352 ms** across sixteen solves, i.e. 0.2095 ms per RHS. The cubic crossover is therefore
+  **k = 75.309 / 0.2095 = 359.5 right-hand sides.** The shipped constant was **8**. At the
+  declared k = 16 the gate turns a 41.34 ms job (27.842 + 13.495) into a 113.29 ms one — a
+  **2.74x REGRESSION on a cell that was winning 1.4297x** — and it stays a regression everywhere
+  from k = 8 to k = 359.
+- **WHY ONE CONSTANT CANNOT WORK, stated so the next attempt does not repeat it.** The crossover
+  is the ratio of two matrix-dependent quantities and it moves by **51-fold** between the two
+  cells this repo tracks: k = 7.05 on convection n=16384, k = 359.5 on cubic n=4096. Convection's
+  AMD factor costs 1.29x the envelope's and its solve gains 4.19x; cubic's AMD factor costs
+  **3.705x** and its solve gains only **1.257x**. Both terms move the wrong way at once on a 3-D
+  grid, whose AMD separators are far denser than a 2-D stencil's. **A threshold on `k` alone is
+  therefore not merely mis-tuned — it is the wrong shape of predicate**, and no value of it is
+  safe for both cells: 8 wrecks cubic, and anything above 360 never fires on convection.
+- **The correct predicate, for whoever builds it:** compare the two arms' PREDICTED TOTALS at the
+  declared `k`, from quantities available before either factorization — the envelope band (which
+  `factorize_csr_banded` already computes for free at O(nnz)) against the AMD symbolic fill and
+  its elimination flops `Σ|L_k|·|U_k|` from the elimination tree (`symbolic_fill_pattern`,
+  `l_column_counts_from_etree`, both already in this crate). Solve cost tracks stored entries and
+  factor cost tracks flops; both are symbolic. That is a real gate rather than a constant, and it
+  would have declined cubic on its own numbers.
+- **What survives:** the convection finding is untouched — the envelope arm really is 4.19x worse
+  at solving there, and routing that cell to AMD really is worth 3.947x on the solve stage. The
+  defect is in the ACTING, not in the observation. `run7d` keeps its measured deficit and now has
+  a specified gate to build instead of a constant to tune.

@@ -87,29 +87,10 @@ mod bench {
         };
         LuOptions {
             ordering,
-            expected_solves: declared_solves(),
             ..LuOptions::default()
         }
     }
 
-    /// How many right-hand sides this invocation DECLARES to `splu`, via
-    /// `FSCI_SPLU_EXPECTED_SOLVES` and defaulting to 1.
-    ///
-    /// EXISTS SO THE REUSE LEVER IS DRIVEN THROUGH THE PUBLIC GATE rather than around it.
-    /// The same routing can be produced by setting `FSCI_SPLU_ORDERING=amd`, and that is how
-    /// it was first measured — but that bypasses the predicate under test and would report a
-    /// number for a decision path no caller ever takes. Declaring the count exercises
-    /// `LuOptions::expected_solves`, and `SPLU_REUSE_ORDERING_HITS` in the execution proof is
-    /// what shows the substitution actually fired.
-    ///
-    /// Default 1 keeps every previously recorded invocation of this harness meaning what it
-    /// meant, including the rows taken before the option existed.
-    fn declared_solves() -> usize {
-        std::env::var("FSCI_SPLU_EXPECTED_SOLVES")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1)
-    }
 
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
@@ -1583,16 +1564,6 @@ for raw_line in sys.stdin.buffer:
              supernodal_factor_hits={supernodal_hits} \
              supernodal_toggle_reads={}",
             SPLU_SUPERNODAL_ENABLE.load_count(),
-        );
-        // The reuse lever's two-sided control. `declared_solves` says what this invocation
-        // asked for; `reuse_ordering_hits` says whether the substitution actually fired. A run
-        // that declares 1 MUST report 0 hits, and a run past the crossover MUST report more —
-        // otherwise the row is measuring the same arm twice under two labels.
-        println!(
-            "execution_proof: declared_solves={} reuse_ordering_hits={} fsci_ordering_after={:?}",
-            declared_solves(),
-            fsci_sparse::linalg::SPLU_REUSE_ORDERING_HITS.load(Ordering::Relaxed),
-            ours.ordering_used,
         );
         // Reported, never gated on — see `host_mean_busy`.
         println!(
