@@ -157,7 +157,9 @@ fn main() {
 
     for n in sizes {
         let (x, y) = fixture(n);
-        let inner = (1_000_000usize / n).max(1);
+        // Keep each timing sample long enough that the n=2m live SciPy A/A control
+        // measures the routine rather than scheduler noise.
+        let inner = (10_000_000usize / n).max(1);
         let time_one = |resort: bool| {
             WILCOXON_FORCE_TIE_RESORT.store(resort, Ordering::Relaxed);
             let started = Instant::now();
