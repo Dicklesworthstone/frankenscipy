@@ -508,15 +508,14 @@ impl PackedTriangularRows {
     /// already have the required column order, so this keeps the same filter and
     /// accumulation order while removing that temporary pair-vector layer.
     fn from_sorted_upper_rows(rows: Vec<SortedFactorRow>) -> Self {
+        // `len` is an upper bound, not merely an estimate: the only entries discarded
+        // below are explicit zero values. Reserving that bound avoids a complete first
+        // walk of every live `(column, value)` pair merely to count the values the filter
+        // will keep. The second pass remains the only payload walk and retains exactly the
+        // same predicate, order, and packed output as the former filter-count pass.
         let entry_count = rows
             .iter()
-            .enumerate()
-            .map(|(row, entries)| {
-                entries
-                    .pairs()
-                    .filter(|(column, value)| *column >= row && *value != 0.0)
-                    .count()
-            })
+            .map(SortedFactorRow::len)
             .sum();
         let mut offsets = Vec::with_capacity(rows.len() + 1);
         let mut columns = Vec::with_capacity(entry_count);
@@ -16804,7 +16803,7 @@ mod tests {
         third.drop_first();
         third.drop_first();
         let rows = vec![
-            sorted_row_from_entries(vec![(0, 2.0), (1, -3.0)]),
+            sorted_row_from_entries(vec![(0, 2.0), (1, -3.0), (2, 0.0)]),
             second,
             third,
         ];
@@ -16823,7 +16822,16 @@ mod tests {
 
         assert_eq!(actual.offsets, expected.offsets);
         assert_eq!(actual.columns, expected.columns);
-        assert_eq!(actual.values.len(), expected.values.len());
+        assert_eq!(
+            actual.values.len(),
+            expected.values.len(),
+            "an explicit zero must remain filtered after upper-bound reservation"
+        );
+        assert_eq!(
+            actual.payload_bytes(),
+            expected.payload_bytes(),
+            "reservation slack must not enter the packed factor payload"
+        );
         for (index, (actual_value, expected_value)) in
             actual.values.iter().zip(&expected.values).enumerate()
         {
