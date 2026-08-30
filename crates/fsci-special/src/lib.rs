@@ -63,6 +63,8 @@ pub use convenience::{
     CONVENIENCE_DISPATCH_PLAN,
     ERF_ZEROS_FORCE_SERIAL,
     FRESNEL_ZEROS_FORCE_SERIAL,
+    NDTRI_UNROLL_POLEVL,
+    NDTRI_UNROLL_POLEVL_HITS,
     // Numerical differentiation and AGM
     agm,
     arccosh,

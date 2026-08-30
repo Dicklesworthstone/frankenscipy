@@ -437,6 +437,35 @@ pub fn ndtri(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 
 #[must_use]
 pub fn ndtri_scalar(y: f64) -> f64 {
+    ndtri_scalar_with(
+        y,
+        NDTRI_UNROLL_POLEVL.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Evaluate the Cephes rationals with a compile-time degree (`true`, shipping) instead of a
+/// runtime slice length.
+///
+/// BIT-IDENTICAL: identical coefficients and identical Horner order in both arms. This is a
+/// codegen-shape lever, not a numeric one.
+pub static NDTRI_UNROLL_POLEVL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+/// BATCHES that took the unrolled arm — "enabled" is not "took effect". Counted per batch.
+pub static NDTRI_UNROLL_POLEVL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `ndtri_scalar` with the evaluator choice supplied by the caller, so the flag is read once
+/// per batch rather than once per element.
+#[must_use]
+pub fn ndtri_scalar_with(y: f64, unrolled: bool) -> f64 {
+    if unrolled {
+        ndtri_kernel::<true>(y)
+    } else {
+        ndtri_kernel::<false>(y)
+    }
+}
+
+fn ndtri_kernel<const UNROLL: bool>(y: f64) -> f64 {
     if y.is_nan() {
         return f64::NAN;
     }
@@ -461,8 +490,8 @@ pub fn ndtri_scalar(y: f64) -> f64 {
         let w = p - 0.5;
         let w2 = w * w;
         return (w + w
-            * (w2 * cephes_ndtri_polevl(w2, &CEPHES_NDTRI_P0)
-                / cephes_ndtri_p1evl(w2, &CEPHES_NDTRI_Q0)))
+            * (w2 * ndtri_pe::<_, UNROLL>(w2, &CEPHES_NDTRI_P0)
+                / ndtri_p1e::<_, UNROLL>(w2, &CEPHES_NDTRI_Q0)))
             * CEPHES_NDTRI_SQRT_2PI;
     }
 
@@ -471,11 +500,11 @@ pub fn ndtri_scalar(y: f64) -> f64 {
         let z0 = z - z.ln() / z;
         let inv_z = 1.0 / z;
         let correction = if z < 8.0 {
-            inv_z * cephes_ndtri_polevl(inv_z, &CEPHES_NDTRI_P1)
-                / cephes_ndtri_p1evl(inv_z, &CEPHES_NDTRI_Q1)
+            inv_z * ndtri_pe::<_, UNROLL>(inv_z, &CEPHES_NDTRI_P1)
+                / ndtri_p1e::<_, UNROLL>(inv_z, &CEPHES_NDTRI_Q1)
         } else {
-            inv_z * cephes_ndtri_polevl(inv_z, &CEPHES_NDTRI_P2)
-                / cephes_ndtri_p1evl(inv_z, &CEPHES_NDTRI_Q2)
+            inv_z * ndtri_pe::<_, UNROLL>(inv_z, &CEPHES_NDTRI_P2)
+                / ndtri_p1e::<_, UNROLL>(inv_z, &CEPHES_NDTRI_Q2)
         };
         z0 - correction
     };
@@ -620,6 +649,48 @@ const CEPHES_NDTRI_Q2: [f64; 8] = [
     2.892_478_647_453_806_8e-6,
     6.790_194_080_099_813e-9,
 ];
+
+/// Horner with the degree known at COMPILE time, taking the table as an array rather than a
+/// slice.
+///
+/// WHY BOTH FORMS EXIST. `cephes_ndtri_polevl` below takes `&[f64]`, so every call site's
+/// fixed-size table (`[f64; 5]`, `[f64; 8]`, `[f64; 9]`) is coerced to a slice and its length
+/// becomes a runtime value: a loop with a counter and a bounds-checked iterator. SciPy's
+/// evaluator is a template whose degree is a compile-time constant and unrolls completely.
+/// Whether LLVM already recovers that through inlining is not something to assume — it is what
+/// the A/B measures.
+///
+/// BIT-IDENTICAL: same coefficients, same left-to-right Horner order, same rounding.
+#[inline(always)]
+fn cephes_ndtri_polevl_n<const N: usize>(x: f64, coef: &[f64; N]) -> f64 {
+    coef.iter().copied().fold(0.0, |acc, c| acc * x + c)
+}
+
+/// Monic Horner with the degree known at compile time. See `cephes_ndtri_polevl_n`.
+#[inline(always)]
+fn cephes_ndtri_p1evl_n<const N: usize>(x: f64, coef: &[f64; N]) -> f64 {
+    coef.iter().copied().fold(1.0, |acc, c| acc * x + c)
+}
+
+/// Pick the evaluator by a const flag, so each arm monomorphises with NO runtime branch.
+#[inline(always)]
+fn ndtri_pe<const N: usize, const UNROLL: bool>(x: f64, coef: &[f64; N]) -> f64 {
+    if UNROLL {
+        cephes_ndtri_polevl_n(x, coef)
+    } else {
+        cephes_ndtri_polevl(x, coef)
+    }
+}
+
+/// Monic counterpart of `ndtri_pe`.
+#[inline(always)]
+fn ndtri_p1e<const N: usize, const UNROLL: bool>(x: f64, coef: &[f64; N]) -> f64 {
+    if UNROLL {
+        cephes_ndtri_p1evl_n(x, coef)
+    } else {
+        cephes_ndtri_p1evl(x, coef)
+    }
+}
 
 fn cephes_ndtri_polevl(x: f64, coef: &[f64]) -> f64 {
     coef.iter().copied().fold(0.0, |acc, c| acc * x + c)

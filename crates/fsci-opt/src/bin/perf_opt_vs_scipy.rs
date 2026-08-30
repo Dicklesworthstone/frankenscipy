@@ -226,11 +226,21 @@ fn main() {
         }
         _ => {}
     }
+    match std::env::var("FSCI_OPT_NNLS_DIRECT_QR").ok().as_deref() {
+        Some("1") | Some("true") => {
+            fsci_opt::NNLS_DIRECT_QR.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Some("0") | Some("false") => {
+            fsci_opt::NNLS_DIRECT_QR.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
 
     println!("elf_sha256={}", elf_sha256());
     println!(
-        "n={n} m={m} nnls_gram_blocked={}",
-        fsci_opt::NNLS_GRAM_BLOCKED.load(std::sync::atomic::Ordering::Relaxed)
+        "n={n} m={m} nnls_gram_blocked={} nnls_direct_qr={}",
+        fsci_opt::NNLS_GRAM_BLOCKED.load(std::sync::atomic::Ordering::Relaxed),
+        fsci_opt::NNLS_DIRECT_QR.load(std::sync::atomic::Ordering::Relaxed),
     );
 
     // Deterministic and STRICTLY POSITIVE, which keeps the linprog instance feasible and
@@ -353,5 +363,57 @@ fn main() {
             median(null_f),
             median(null_s),
         );
+
+        if op == "nnls" {
+            // The SciPy comparison above runs with the shipping QR arm. Pair it with the
+            // incumbent normal-equations arm IN THIS PROCESS so a source/ELF/fixture mismatch
+            // cannot turn a historical self-number into a result.
+            let time_arm = |direct_qr: bool| {
+                fsci_opt::NNLS_DIRECT_QR.store(direct_qr, std::sync::atomic::Ordering::Relaxed);
+                time_ours()
+            };
+            let (mut qr, mut gram, mut null_qr, mut null_gram) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            for round in 0..rounds {
+                let (q1, g1, g2, q2) = if round % 2 == 0 {
+                    let q1 = time_arm(true);
+                    let g1 = time_arm(false);
+                    let g2 = time_arm(false);
+                    let q2 = time_arm(true);
+                    (q1, g1, g2, q2)
+                } else {
+                    let g1 = time_arm(false);
+                    let q1 = time_arm(true);
+                    let q2 = time_arm(true);
+                    let g2 = time_arm(false);
+                    (q1, g1, g2, q2)
+                };
+                qr.push(q1.min(q2));
+                gram.push(g1.min(g2));
+                null_qr.push(q1.max(q2) / q1.min(q2));
+                null_gram.push(g1.max(g2) / g1.min(g2));
+            }
+            let q0 = fsci_opt::NNLS_DIRECT_QR_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            fsci_opt::NNLS_DIRECT_QR.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = ours();
+            let q1 = fsci_opt::NNLS_DIRECT_QR_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            fsci_opt::NNLS_DIRECT_QR.store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = ours();
+            let q2 = fsci_opt::NNLS_DIRECT_QR_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(q1, q0 + 1, "direct QR toggle did not hit exactly once");
+            assert_eq!(q2, q1, "normal-equations arm incremented the QR hit counter");
+            fsci_opt::NNLS_DIRECT_QR.store(true, std::sync::atomic::Ordering::Relaxed);
+            let qr_ms = median(qr);
+            let gram_ms = median(gram);
+            println!(
+                "armab=nnls_direct_qr qr={qr_ms:.3}ms gram={gram_ms:.3}ms \
+                 gram/qr={:.3}x null_qr={:.3} null_gram={:.3} hits_on={} hits_off={}",
+                gram_ms / qr_ms,
+                median(null_qr),
+                median(null_gram),
+                q1 - q0,
+                q2 - q1,
+            );
+        }
     }
 }

@@ -4163,6 +4163,212 @@ const NNLS_GRAM_BLOCK: usize = 64;
 pub static NNLS_GRAM_BLOCKED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Use the direct Lawson-Hanson QR active-set solve instead of the normal-equations path.
+///
+/// The shipping arm never forms `AᵀA`: it maintains the passive factorization as columns enter
+/// and uses Givens rotations to downdate it when a trial least-squares solution expels columns.
+/// This avoids both the normal-equations conditioning penalty and the dense Gram precompute.
+pub static NNLS_DIRECT_QR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Counts NNLS calls that entered the direct QR arm. The perf driver checks this around both
+/// arms so an apparently clean A/B cannot be a switch wired to nothing.
+pub static NNLS_DIRECT_QR_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Insert an original column into the passive QR factorization using two-pass modified
+/// Gram-Schmidt. `q` owns orthonormal columns and `r` is an `n`-stride upper triangle.
+fn nnls_qr_add_column(
+    a: &[Vec<f64>],
+    b: &[f64],
+    column: usize,
+    q: &mut Vec<Vec<f64>>,
+    r: &mut [f64],
+    qtb: &mut Vec<f64>,
+    n: usize,
+) -> bool {
+    let p = q.len();
+    let mut v: Vec<f64> = a.iter().map(|row| row[column]).collect();
+
+    // `r` is capacity-sized so a prior Givens downdate leaves retired cells behind. An
+    // insertion into that logical column must start from zero, not accumulate stale rotations.
+    for k in 0..p {
+        r[k * n + p] = 0.0;
+    }
+
+    // Reorthogonalization is material here: NNLS can select nearly dependent columns, and a
+    // one-pass projection can make a correct positive passive solution look negative.
+    for _ in 0..2 {
+        for k in 0..p {
+            let projection: f64 = q[k].iter().zip(v.iter()).map(|(&u, &z)| u * z).sum();
+            r[k * n + p] += projection;
+            for (entry, &basis) in v.iter_mut().zip(q[k].iter()) {
+                *entry -= projection * basis;
+            }
+        }
+    }
+
+    let norm = v.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if !norm.is_finite() || norm <= f64::EPSILON.sqrt() {
+        return false;
+    }
+    for value in &mut v {
+        *value /= norm;
+    }
+    r[p * n + p] = norm;
+    qtb.push(v.iter().zip(b.iter()).map(|(&u, &rhs)| u * rhs).sum());
+    q.push(v);
+    true
+}
+
+/// Remove passive column `removed` from a QR factorization.
+///
+/// Deleting a column from an upper-triangular `R` leaves one subdiagonal. Chase that bulge down
+/// with Givens rotations and apply the inverse rotations to `Q`; the remaining prefix is again a
+/// QR factorization of exactly the surviving original columns. This is the downdate that keeps
+/// Lawson-Hanson's inner feasibility loop incremental instead of refactorizing after every exit.
+fn nnls_qr_remove_column(
+    removed: usize,
+    q: &mut Vec<Vec<f64>>,
+    r: &mut [f64],
+    qtb: &mut Vec<f64>,
+    n: usize,
+) {
+    let p = q.len();
+    debug_assert!(removed < p);
+
+    for row in 0..p {
+        for col in removed..(p - 1) {
+            r[row * n + col] = r[row * n + col + 1];
+        }
+    }
+    for pivot in removed..(p - 1) {
+        let upper = r[pivot * n + pivot];
+        let lower = r[(pivot + 1) * n + pivot];
+        let hypot = upper.hypot(lower);
+        if hypot == 0.0 {
+            continue;
+        }
+        let cosine = upper / hypot;
+        let sine = lower / hypot;
+        for col in pivot..(p - 1) {
+            let top = r[pivot * n + col];
+            let bottom = r[(pivot + 1) * n + col];
+            r[pivot * n + col] = cosine * top + sine * bottom;
+            r[(pivot + 1) * n + col] = -sine * top + cosine * bottom;
+        }
+        let top_rhs = qtb[pivot];
+        let bottom_rhs = qtb[pivot + 1];
+        qtb[pivot] = cosine * top_rhs + sine * bottom_rhs;
+        qtb[pivot + 1] = -sine * top_rhs + cosine * bottom_rhs;
+        for row in 0..q[pivot].len() {
+            let left = q[pivot][row];
+            let right = q[pivot + 1][row];
+            q[pivot][row] = cosine * left + sine * right;
+            q[pivot + 1][row] = -sine * left + cosine * right;
+        }
+    }
+    q.remove(p - 1);
+    qtb.pop();
+}
+
+/// Direct Lawson-Hanson NNLS using an incrementally-maintained passive QR factorization.
+fn nnls_direct_qr(a: &[Vec<f64>], b: &[f64], n: usize) -> Result<(Vec<f64>, f64), OptError> {
+    let mut x = vec![0.0; n];
+    let mut residual = b.to_vec();
+    let mut passive = vec![false; n];
+    let mut passive_indices = Vec::new();
+    let mut q = Vec::new();
+    let mut r = vec![0.0; n * n];
+    let mut qtb = Vec::new();
+    let mut candidate = vec![0.0; n];
+    let tolerance = 1.0e-10;
+
+    for _ in 0..(3 * n) {
+        let mut gradient = vec![0.0; n];
+        for (row, &residual_value) in a.iter().zip(residual.iter()) {
+            for (gradient_value, &aij) in gradient.iter_mut().zip(row.iter()) {
+                *gradient_value += aij * residual_value;
+            }
+        }
+        let mut entering = None;
+        let mut best_gradient = tolerance;
+        for (index, &gradient_value) in gradient.iter().enumerate() {
+            if !passive[index] && gradient_value > best_gradient {
+                best_gradient = gradient_value;
+                entering = Some(index);
+            }
+        }
+        let Some(entering) = entering else {
+            break;
+        };
+
+        if !nnls_qr_add_column(a, b, entering, &mut q, &mut r, &mut qtb, n) {
+            // A dependent column has zero projected norm. It cannot improve the passive solve;
+            // leave it active so the outer gradient test does not select it again.
+            passive[entering] = true;
+            continue;
+        }
+        passive[entering] = true;
+        passive_indices.push(entering);
+
+        loop {
+            candidate.fill(0.0);
+            let p = passive_indices.len();
+            for local in (0..p).rev() {
+                let mut value = qtb[local];
+                for next in (local + 1)..p {
+                    value -= r[local * n + next] * candidate[passive_indices[next]];
+                }
+                candidate[passive_indices[local]] = value / r[local * n + local];
+            }
+
+            let mut alpha = 1.0_f64;
+            let mut has_nonpositive = false;
+            for &index in &passive_indices {
+                let next = candidate[index];
+                if next <= tolerance {
+                    has_nonpositive = true;
+                    let denominator = x[index] - next;
+                    if denominator > 0.0 {
+                        alpha = alpha.min(x[index] / denominator);
+                    }
+                }
+            }
+            if !has_nonpositive {
+                x.copy_from_slice(&candidate);
+                break;
+            }
+
+            for &index in &passive_indices {
+                x[index] += alpha * (candidate[index] - x[index]);
+            }
+            let mut local = 0;
+            while local < passive_indices.len() {
+                let index = passive_indices[local];
+                if x[index] <= tolerance {
+                    x[index] = 0.0;
+                    passive[index] = false;
+                    passive_indices.remove(local);
+                    nnls_qr_remove_column(local, &mut q, &mut r, &mut qtb, n);
+                } else {
+                    local += 1;
+                }
+            }
+            if passive_indices.is_empty() {
+                break;
+            }
+        }
+
+        for (row_index, row) in a.iter().enumerate() {
+            residual[row_index] = b[row_index]
+                - row.iter().zip(x.iter()).map(|(&aij, &xj)| aij * xj).sum::<f64>();
+        }
+    }
+    let residual_norm = residual.iter().map(|value| value * value).sum::<f64>().sqrt();
+    Ok((x, residual_norm))
+}
+
 /// Accumulate `AᵀA` (upper triangle) and `Aᵀb` with the GRAM TILE held in cache instead of
 /// the row.
 ///
@@ -4259,6 +4465,11 @@ pub fn nnls(a: &[Vec<f64>], b: &[f64]) -> Result<(Vec<f64>, f64), OptError> {
         return Err(OptError::NonFiniteInput {
             detail: "b must not contain NaN or Inf".to_string(),
         });
+    }
+
+    if NNLS_DIRECT_QR.load(std::sync::atomic::Ordering::Relaxed) {
+        NNLS_DIRECT_QR_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return nnls_direct_qr(a, b, n);
     }
 
     let mut x = vec![0.0; n];
@@ -7049,6 +7260,89 @@ mod tests {
         // assertion above while the test still reported success.
         assert_eq!(compared, 6, "expected 6 compared cases, ran {compared}");
         crate::NNLS_GRAM_BLOCKED.store(was, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn nnls_direct_qr_matches_normal_equations_and_scipy_pin() {
+        use std::sync::atomic::Ordering;
+
+        let was = crate::NNLS_DIRECT_QR.load(Ordering::Relaxed);
+        let cases = [
+            (
+                vec![
+                    vec![1.0, 0.0, 1.0],
+                    vec![1.0, 1.0, 0.0],
+                    vec![0.0, 1.0, 1.0],
+                    vec![2.0, 1.0, 1.0],
+                ],
+                vec![1.0, 2.0, 1.5, 3.0],
+            ),
+            (
+                vec![
+                    vec![1.0, 0.2, 0.7],
+                    vec![0.1, 1.0, 0.3],
+                    vec![0.4, 0.6, 1.0],
+                    vec![0.9, 0.3, 0.2],
+                    vec![0.2, 0.8, 0.5],
+                ],
+                vec![0.7, 0.4, 1.2, 0.5, 0.9],
+            ),
+        ];
+
+        for (a, b) in cases {
+            crate::NNLS_DIRECT_QR.store(false, Ordering::Relaxed);
+            let (normal_x, normal_residual) = nnls(&a, &b).expect("normal-equations arm");
+            crate::NNLS_DIRECT_QR.store(true, Ordering::Relaxed);
+            let (qr_x, qr_residual) = nnls(&a, &b).expect("direct QR arm");
+            for (index, (&normal, &qr)) in normal_x.iter().zip(qr_x.iter()).enumerate() {
+                assert!(
+                    (normal - qr).abs() <= 1.0e-9,
+                    "coefficient {index}: normal={normal:.17e} qr={qr:.17e}"
+                );
+                assert!(qr >= -1.0e-12, "coefficient {index} is negative: {qr:.17e}");
+            }
+            assert!(
+                (normal_residual - qr_residual).abs() <= 1.0e-9,
+                "residual: normal={normal_residual:.17e} qr={qr_residual:.17e}"
+            );
+        }
+        crate::NNLS_DIRECT_QR.store(was, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn nnls_direct_qr_matches_normal_equations_on_perf_fixture() {
+        use std::sync::atomic::Ordering;
+
+        let n = 256;
+        let unit = |i: usize, salt: usize| -> f64 {
+            let k = (i * 2_654_435_761usize).wrapping_add(salt * 40_503) % 1_000_003;
+            k as f64 / 1_000_003.0
+        };
+        let a: Vec<Vec<f64>> = (0..n * n)
+            .map(|i| 0.05 + unit(i, 7))
+            .collect::<Vec<_>>()
+            .chunks_exact(n)
+            .map(<[f64]>::to_vec)
+            .collect();
+        let b: Vec<f64> = (0..n).map(|i| 0.05 + unit(i, 29)).collect();
+        let was = crate::NNLS_DIRECT_QR.load(Ordering::Relaxed);
+
+        crate::NNLS_DIRECT_QR.store(false, Ordering::Relaxed);
+        let (normal_x, normal_residual) = nnls(&a, &b).expect("normal-equations arm");
+        crate::NNLS_DIRECT_QR.store(true, Ordering::Relaxed);
+        let (qr_x, qr_residual) = nnls(&a, &b).expect("direct QR arm");
+
+        for (index, (&normal, &qr)) in normal_x.iter().zip(qr_x.iter()).enumerate() {
+            assert!(
+                (normal - qr).abs() <= 1.0e-8,
+                "coefficient {index}: normal={normal:.17e} qr={qr:.17e}"
+            );
+        }
+        assert!(
+            (normal_residual - qr_residual).abs() <= 1.0e-8,
+            "residual: normal={normal_residual:.17e} qr={qr_residual:.17e}"
+        );
+        crate::NNLS_DIRECT_QR.store(was, Ordering::Relaxed);
     }
 
     #[test]

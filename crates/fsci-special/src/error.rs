@@ -222,8 +222,16 @@ pub fn erfinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
         && !values.iter().any(|&v| v.abs() > 1.0)
     {
         ERFINV_INFALLIBLE_BATCH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // The evaluator choice is read ONCE for the whole array, never per element.
+        let unrolled =
+            crate::convenience::NDTRI_UNROLL_POLEVL.load(std::sync::atomic::Ordering::Relaxed);
+        crate::convenience::NDTRI_UNROLL_POLEVL_HITS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(SpecialTensor::RealVec(
-            values.iter().map(|&v| erfinv_value(v)).collect(),
+            values
+                .iter()
+                .map(|&v| erfinv_value_with(v, unrolled))
+                .collect(),
         ));
     }
     map_unary_input_rp(
@@ -812,6 +820,27 @@ fn erfinv_value(y: f64) -> f64 {
     }
 
     crate::convenience::ndtri_scalar(p) * std::f64::consts::FRAC_1_SQRT_2
+}
+
+/// `erfinv_value` with the `ndtri` evaluator choice supplied by the batch entry point.
+fn erfinv_value_with(y: f64, unrolled: bool) -> f64 {
+    if y.is_nan() {
+        return f64::NAN;
+    }
+    if y == 1.0 {
+        return f64::INFINITY;
+    }
+    if y == -1.0 {
+        return f64::NEG_INFINITY;
+    }
+    if y == 0.0 {
+        return y;
+    }
+    let p = 0.5 * (y + 1.0);
+    if p == 0.0 || p == 1.0 {
+        return y.signum() * crate::convenience::erfcinv_conv(1.0 - y.abs());
+    }
+    crate::convenience::ndtri_scalar_with(p, unrolled) * std::f64::consts::FRAC_1_SQRT_2
 }
 
 fn erfinv_complex_scalar(y: Complex64, mode: RuntimeMode) -> Result<Complex64, SpecialError> {

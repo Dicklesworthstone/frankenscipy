@@ -1325,7 +1325,17 @@ fn arm_sweep(op: &str) -> Option<(&'static str, fn(bool), bool)> {
             },
             true,
         )),
+        // erfinv's live question is now its polynomial evaluator's shape: the Cephes tables
+        // are fixed-size arrays but `cephes_ndtri_polevl` takes a slice, so the degree is a
+        // runtime length. SciPy's equivalent is a compile-time-degree template.
         "erfinv" => Some((
+            "ndtri_unroll_polevl",
+            |on| {
+                fsci_special::NDTRI_UNROLL_POLEVL.store(on, std::sync::atomic::Ordering::Relaxed);
+            },
+            true,
+        )),
+        "erfinv_old" => Some((
             "infallible_batch",
             |on| {
                 fsci_special::ERFINV_INFALLIBLE_BATCH
@@ -1418,7 +1428,7 @@ fn arm_hits(op: &str) -> Option<fn() -> usize> {
             Some(|| fsci_special::ERFCINV_NDTRI_HITS.load(std::sync::atomic::Ordering::Relaxed))
         }
         "erfinv" => Some(|| {
-            fsci_special::ERFINV_INFALLIBLE_BATCH_HITS.load(std::sync::atomic::Ordering::Relaxed)
+            fsci_special::NDTRI_UNROLL_POLEVL_HITS.load(std::sync::atomic::Ordering::Relaxed)
         }),
         "y1" => Some(|| {
             fsci_special::BESSEL_Y01_HOIST_FLAG_HITS.load(std::sync::atomic::Ordering::Relaxed)
