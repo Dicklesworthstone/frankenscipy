@@ -42894,3 +42894,50 @@ the smaller difference, and should be sized from the estimate that fires it leas
 - **Where this leaves `run7d`:** the deficit stands and its cause is now stated precisely — our
   general kernel does less work per element and executes it less efficiently. That is `llywn`'s density wall, and
   it is the only remaining route. **There is no gate to write.**
+
+## 2026-08-30 - CopperFalcon (cc) - BEHAVIORAL REJECT of a standing premise: the merge's target-only branch carries 40% of AMD's elements at mean span ~10, and the standing refutation of block-advancing it was measured on the arm where that branch is EXACTLY ZERO
+
+- **Bead: `frankenscipy-run7d`.** **Result class: BEHAVIORAL.** No timing claim and no timing
+  decision: this is a structural survey that reopens a closed lever by showing the evidence
+  that closed it was taken on a configuration where the lever cannot act.
+- **`probe: merge_shape_on_the_cubic_fixture`** in `crates/fsci-sparse/src/linalg.rs`,
+  re-runnable with
+  `cargo test --release -p fsci-sparse --lib -- --ignored --nocapture merge_shape_on_the_cubic_fixture`.
+  **Probe host: `same_host=thinkstation1`, no rch worker** (local-wrapper-bypass; `rch` refuses
+  every `cargo test` verb with `missing_runtime`). The probe counts structure and reads no
+  clock, so it is host-independent by construction.
+- **THE PROBE WAS ITSELF BROKEN AND ITS OWN CONTROL CAUGHT IT.** `merge_shape_on_the_cubic_fixture`
+  predates `SPLU_BANDED_ENABLE` shipping ON. Once it did, the banded arm took the fixture, the
+  general merge never ran, and the counters **observed** `merges=0 runs=0` — indistinguishable
+  from "this fixture has no runs", which is the very question the probe exists to answer. Its
+  must-hit assertion (`runs > 0`) failed rather than reporting the zeros, which is the only
+  reason this was visible at all. Fixed here by scoping the banded arm off under the shared
+  perf-toggle lock. **A diagnostic silently rots the moment a default flips.**
+- **THE SURVEY, observed values.** Both cells, both orderings the arm choice ranges over,
+  general merge only:
+
+      cell + ordering        stored_nnz  runs      run_elements  target_only  target_runs  mean_target_span  mean_run  run_share
+      cubic s=16 rcm          1,188,312    8,351          8,351            0            0              0.00      1.00     0.0129
+      cubic s=16 amd            648,372  2,402,436   33,609,242   23,203,012    2,349,012              9.88     13.99     0.5856
+      convection s=64 rcm       357,568    4,155          4,155            0            0              0.00      1.00     0.0235
+      convection s=64 amd       138,696   152,468     1,515,301    1,042,113      149,824              6.96      9.94     0.5702
+
+- **WHAT IT OVERTURNS.** `merge_sorted_remainder` carries this note beside its two non-matched
+  branches: *"These two branches step ONE element, deliberately. Advancing them in blocks with a
+  binary search was tried and measured ... a 0.6% change, because the non-matched branches almost
+  never run with a span above one."* The survey shows that premise holds only for the ENVELOPE
+  ordering, where `target_only` is **exactly 0** and the branch cannot contribute anything. On the
+  AMD ordering — the arm `run7d` is about — `target_only` is **40.4% of all merged elements on
+  cubic** (23,203,012 of 57,396,573) and 39.2% on convection, at a mean stretch of **9.88** and
+  **6.96** elements. "Almost never above one" is false there by an order of magnitude.
+- **The lever this reopens, stated so it can be pre-costed rather than assumed:** the target-only
+  stretch is a pure COPY of `(column, value)` pairs from target to output with no arithmetic, so
+  advancing it as a block is two `copy_from_slice` calls of mean length ~10 in place of ~10
+  iterations of a scalar loop, and it is **bit-identical by construction** — no value is computed,
+  only moved. It applies to roughly 40% of merged elements on the arm that matters and to 0% on
+  the arm where it was previously measured, which is exactly why the earlier number was 0.6%.
+- **Counter integrity.** `target_runs` counts maximal stretches, not calls, and is maintained
+  across all three merge branches so a stretch cannot be double-opened; `MergeShape` is `cfg(test)`
+  so the shipping kernel is unchanged, and the counts are STRUCTURAL, which per this ledger's own
+  rule survives instrumentation where cost does not. The RCM rows are the must-miss control: a
+  counter that incremented regardless would not report 0 there.

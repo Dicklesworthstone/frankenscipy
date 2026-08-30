@@ -1276,12 +1276,23 @@ pub(crate) struct MergeShape {
     pub(crate) run_elements: u64,
     pub(crate) target_only: u64,
     pub(crate) tail_only: u64,
+    /// Contiguous stretches of the target-only branch, so its mean SPAN is readable.
+    ///
+    /// EXISTS BECAUSE THE EXISTING REFUTATION WAS MEASURED WHERE THE BRANCH DOES NOT FIRE
+    /// (frankenscipy-run7d). The merge records that block-advancing the non-matched branches
+    /// was tried and measured at 0.6%, "because the non-matched branches almost never run
+    /// with a span above one". That holds for the envelope ordering, where `target_only` is
+    /// exactly 0 - and not for AMD, where it is ~40% of all merged elements. Counting the
+    /// stretches separates "the branch is rare" from "rare per call but long when it fires",
+    /// which the element count alone cannot distinguish.
+    pub(crate) target_runs: u64,
 }
 
 #[cfg(test)]
 thread_local! {
     static MERGE_SHAPE: std::cell::Cell<MergeShape> = const { std::cell::Cell::new(MergeShape {
         merges: 0, inplace: 0, runs: 0, run_elements: 0, target_only: 0, tail_only: 0,
+        target_runs: 0,
     }) };
 }
 
@@ -1449,6 +1460,9 @@ fn merge_sorted_remainder(
     let mut left = 0usize;
     let mut right = 0usize;
     let mut put = 0usize;
+    // Test-only: a target-only STRETCH is a maximal run of consecutive target-only steps.
+    #[cfg(test)]
+    let mut prev_was_target = false;
 
     while left < target_cols.len() && right < tail_cols.len() {
         let left_col = target_cols[left];
@@ -1459,14 +1473,26 @@ fn merge_sorted_remainder(
         // with a span above one. The elements are in the matched branch.
         if left_col < right_col {
             #[cfg(test)]
-            record_merge_shape(|shape| shape.target_only += 1);
+            {
+                let opens = !prev_was_target;
+                record_merge_shape(|shape| {
+                    shape.target_only += 1;
+                    if opens {
+                        shape.target_runs += 1;
+                    }
+                });
+                prev_was_target = true;
+            }
             out_cols[put] = left_col;
             out_vals[put] = target_vals[left];
             put += 1;
             left += 1;
         } else if left_col > right_col {
             #[cfg(test)]
-            record_merge_shape(|shape| shape.tail_only += 1);
+            {
+                record_merge_shape(|shape| shape.tail_only += 1);
+                prev_was_target = false;
+            }
             let delta = negated * tail_vals[right];
             if delta != 0.0 {
                 out_cols[put] = right_col;
@@ -1481,10 +1507,13 @@ fn merge_sorted_remainder(
             // so it can be widened.
             let span = matched_run_length(&target_cols[left..], &tail_cols[right..]);
             #[cfg(test)]
-            record_merge_shape(|shape| {
-                shape.runs += 1;
-                shape.run_elements += span as u64;
-            });
+            {
+                record_merge_shape(|shape| {
+                    shape.runs += 1;
+                    shape.run_elements += span as u64;
+                });
+                prev_was_target = false;
+            }
             // THE ZERO TEST RIDES ALONG WITH THE ARITHMETIC, so the compare becomes a
             // `vcmpeqpd`/`vorpd` beside the multiply instead of a second pass over the
             // output.
@@ -17242,11 +17271,69 @@ mod tests {
     #[test]
     #[ignore = "diagnostic: factors a real grid, run explicitly with --ignored --nocapture"]
     fn merge_shape_on_the_cubic_fixture() {
+        // THE BANDED ARM MUST BE SCOPED OFF OR THIS MEASURES NOTHING (frankenscipy-run7d).
+        // This diagnostic predates SPLU_BANDED_ENABLE shipping ON. Once it did, the banded
+        // path took this fixture, the general merge never ran, and the counters read
+        // merges=0 runs=0 -- which is the same shape as the answer being looked for. The
+        // must-hit assertion below is what caught it; without that it would have gone on
+        // reporting zeros as a finding. Writes a process-global toggle, so it takes the
+        // shared lock (defect_global_toggle_test_race).
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let banded_was = SPLU_BANDED_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
+        SPLU_BANDED_ENABLE.store(false, std::sync::atomic::Ordering::Relaxed);
+
         let matrix = splu_dirichlet_laplacian_3d(10);
         let _ = take_merge_shape();
         let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, PermutationOrdering::Colamd)
             .expect("cubic factorization");
         let shape = take_merge_shape();
+        // WHERE THE GENERAL KERNEL'S ELEMENTS ACTUALLY GO, per cell and per ordering.
+        // run7d's remaining route is the merge's density, and the density is decided by RUN
+        // LENGTH -- the run kernel is the only vectorisable branch, the other two step one
+        // element at a time. Reported for both cells this repo tracks and both orderings the
+        // arm choice ranges over, at matched n where possible, because a single cell's run
+        // length has already been quoted for the whole crate once.
+        for (label, cell, ordering) in [
+            ("cubic side=16 rcm", splu_dirichlet_laplacian_3d(16), PermutationOrdering::Colamd),
+            ("cubic side=16 amd", splu_dirichlet_laplacian_3d(16), PermutationOrdering::Amd),
+            (
+                "convection side=64 rcm",
+                convection_diffusion_2d_probe(64),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "convection side=64 amd",
+                convection_diffusion_2d_probe(64),
+                PermutationOrdering::Amd,
+            ),
+        ] {
+            let _ = take_merge_shape();
+            let factored = NativeSparseLu::factorize_csr(&cell, 1.0, ordering)
+                .expect("survey factorization");
+            let survey = take_merge_shape();
+            let elements = survey.run_elements + survey.target_only + survey.tail_only;
+            assert!(
+                survey.runs > 0 && elements > 0,
+                "{label}: the general merge never ran, so this row measures nothing"
+            );
+            println!(
+                "merge_survey {label}: stored_nnz={} runs={} run_elements={} \
+                 target_only={} target_runs={} mean_target_span={:.2} tail_only={} \
+                 elements={elements} mean_run={:.2} run_share={:.4}",
+                factored.stored_nnz(),
+                survey.runs,
+                survey.run_elements,
+                survey.target_only,
+                survey.target_runs,
+                survey.target_only as f64 / survey.target_runs.max(1) as f64,
+                survey.tail_only,
+                survey.run_elements as f64 / survey.runs.max(1) as f64,
+                survey.run_elements as f64 / elements.max(1) as f64,
+            );
+        }
+        SPLU_BANDED_ENABLE.store(banded_was, std::sync::atomic::Ordering::Relaxed);
 
         let merged_elements = shape.run_elements + shape.target_only + shape.tail_only;
         let mean_run = shape.run_elements as f64 / shape.runs.max(1) as f64;
