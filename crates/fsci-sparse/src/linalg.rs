@@ -13699,7 +13699,6 @@ mod tests {
     // laplacian_rejects_rectangular_and_nonfinite_graphs is the guard for the
     // validate_csgraph call that the dense implementation had dropped entirely
     // — the third of the three regressions 4lfu1 tracked.
-    #[test]
     /// frankenscipy-5f06d: the last A/B switch in this crate that nothing drove.
     ///
     /// `LAPLACIAN_FORCE_SERIAL` gates the row-parallel dense-Laplacian build, and its gate is
