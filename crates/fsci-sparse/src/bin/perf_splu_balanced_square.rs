@@ -103,8 +103,25 @@ mod bench {
     const SQUARE: [u8; 8] = *b"ABBAABBA";
     /// A per-arm A/A null must land within this of 1.0 or the row is void.
     const NULL_BOUND: f64 = 0.02;
-    const SCIPY_SITE_PACKAGES: &str =
-        "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages";
+    /// Site-packages directories that have held the pinned SciPy incumbent, newest first.
+    ///
+    /// The first entry was the only one this harness knew, it no longer exists, and its
+    /// disappearance was SILENT: `is_dir()` was false, `PYTHONPATH` went unset, the spawn
+    /// fell through to a bare `python3` with no SciPy, and the failure surfaced as
+    /// `send fixture to SciPy: BrokenPipe` — several lines AFTER the provenance block had
+    /// already printed a well-formed host/ELF header. A row that dies that way looks like a
+    /// flaky pipe rather than a missing incumbent, which is the expensive way to lose an
+    /// afternoon. `resolve_scipy_interpreter` below now proves the import before timing.
+    const SCIPY_SITE_PACKAGES: [&str; 2] = [
+        "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages",
+        "/home/ubuntu/.local/lib/python3.13/site-packages",
+    ];
+    /// Interpreters to try, in order, when `SCIPY_PYTHON` is unset.
+    const SCIPY_PYTHON_CANDIDATES: [&str; 3] = [
+        "/usr/bin/python3.13",
+        "/home/ubuntu/.local/bin/python3.13",
+        "python3",
+    ];
     /// Both factorizations solve the same RHS before any timing; they use
     /// different orderings and pivot thresholds, so agreement is to solve
     /// accuracy, not to bits.
@@ -413,18 +430,91 @@ for raw_line in sys.stdin.buffer:
         stopped: bool,
     }
 
+    /// Pick an interpreter that can actually `import scipy`, and say so before any timing.
+    ///
+    /// WHY THIS PROBES INSTEAD OF ASSUMING. The incumbent arm is the whole point of this
+    /// harness, so "no incumbent" must be a loud refusal, not a degraded run. Both halves of
+    /// the old selection had gone stale at once — `/usr/bin/python3.13` was absent and the
+    /// pinned site-packages directory had been removed — and neither is checked by anything
+    /// that runs before the fixture is written to the child's stdin. The import is therefore
+    /// PROVEN here, by running it, rather than inferred from a path existing.
+    ///
+    /// `SCIPY_PYTHON` still wins outright when set: an explicit pin is a deliberate act and
+    /// this must not silently route around it. It is probed too, so a typo fails with the
+    /// interpreter named rather than as a broken pipe.
+    /// Does this interpreter, under this `PYTHONPATH`, actually import SciPy?
+    ///
+    /// Split out of `resolve_scipy_interpreter` so both of its answers can be exercised:
+    /// a probe that only ever ran against a working interpreter would report `true` whether
+    /// it was testing the import or testing nothing at all.
+    fn interpreter_can_import_scipy(python: &str, site: Option<&str>) -> bool {
+        let mut probe = Command::new(python);
+        if let Some(path) = site {
+            probe.env("PYTHONPATH", path);
+        }
+        probe
+            .arg("-c")
+            .arg("import scipy, scipy.sparse.linalg")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn resolve_scipy_interpreter() -> (String, Option<String>) {
+        // `None` first: the candidate may already have SciPy on its own default path, and
+        // prepending a foreign site-packages to a working interpreter is how version skew
+        // gets introduced.
+        let site_options: Vec<Option<String>> = std::iter::once(None)
+            .chain(
+                SCIPY_SITE_PACKAGES
+                    .iter()
+                    .filter(|path| std::path::Path::new(*path).is_dir())
+                    .map(|path| Some((*path).to_string())),
+            )
+            .collect();
+        let candidates: Vec<String> = match std::env::var("SCIPY_PYTHON") {
+            Ok(pinned) if !pinned.is_empty() => vec![pinned],
+            _ => SCIPY_PYTHON_CANDIDATES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
+        };
+
+        let mut tried: Vec<String> = Vec::new();
+        for python in &candidates {
+            for site in &site_options {
+                let ok = interpreter_can_import_scipy(python, site.as_deref());
+                tried.push(format!(
+                    "{python}+{}={}",
+                    site.as_deref().unwrap_or("<default>"),
+                    if ok { "ok" } else { "no" }
+                ));
+                if ok {
+                    println!(
+                        "scipy_interpreter: {python} pythonpath={} (probed {} candidate(s))",
+                        site.as_deref().unwrap_or("<default>"),
+                        tried.len()
+                    );
+                    return (python.clone(), site.clone());
+                }
+            }
+        }
+        panic!(
+            "no interpreter on this host can `import scipy`, so there is no live incumbent \
+             to compare against and every ratio this harness could print would be \
+             meaningless. Set SCIPY_PYTHON to one that can. Probed: {}",
+            tried.join(" ")
+        );
+    }
+
     impl Scipy {
         fn start(n: usize, nnz: usize, payload: &[u8]) -> (Self, String) {
-            let python = std::env::var("SCIPY_PYTHON").unwrap_or_else(|_| {
-                if std::path::Path::new("/usr/bin/python3.13").exists() {
-                    "/usr/bin/python3.13".to_string()
-                } else {
-                    "python3".to_string()
-                }
-            });
+            let (python, site_packages) = resolve_scipy_interpreter();
             let mut command = Command::new(&python);
-            if std::path::Path::new(SCIPY_SITE_PACKAGES).is_dir() {
-                command.env("PYTHONPATH", SCIPY_SITE_PACKAGES);
+            if let Some(path) = site_packages.as_deref() {
+                command.env("PYTHONPATH", path);
             }
             for key in [
                 "OPENBLAS_NUM_THREADS",
@@ -1549,7 +1639,8 @@ for raw_line in sys.stdin.buffer:
     #[cfg(test)]
     mod tests {
         use super::{
-            Fixture, RunConfig, balanced_square_quiescence, is_help_request, ns_per_unit,
+            Fixture, RunConfig, SCIPY_PYTHON_CANDIDATES, SCIPY_SITE_PACKAGES,
+            balanced_square_quiescence, interpreter_can_import_scipy, is_help_request, ns_per_unit,
             parse_run_config, replicate_summary, run_aggregate,
         };
 
@@ -1602,6 +1693,62 @@ for raw_line in sys.stdin.buffer:
             // from it could not be reproduced from the ledger.
             let values = [0.5230, 0.5380, 0.5775, 0.4950, 0.5100];
             assert_eq!(replicate_summary(&values), replicate_summary(&values));
+        }
+
+        /// The interpreter probe answers BOTH ways — the two-arm control.
+        ///
+        /// The must-MISS arm is the one that matters. Before this probe existed the harness
+        /// selected an interpreter by `Path::exists`, which is a predicate that cannot fail
+        /// for the reason we care about: `python3` exists on every host here and imports
+        /// SciPy on almost none of them. A probe that only ever returns `true` reads exactly
+        /// like a working one right up until it routes a whole afternoon of rows into a
+        /// broken pipe, which is how this defect was found.
+        #[test]
+        fn scipy_interpreter_probe_answers_both_ways() {
+            // MUST MISS: an interpreter that is not on the box at all. This arm needs no
+            // SciPy anywhere and so runs identically on a bare CI worker.
+            assert!(
+                !interpreter_can_import_scipy(
+                    "/nonexistent/bin/python-that-is-not-installed",
+                    None
+                ),
+                "probe claimed a nonexistent interpreter can import scipy"
+            );
+            // MUST MISS for the same reason even when handed a plausible PYTHONPATH: it is
+            // the IMPORT that is being proven, never the existence of a directory.
+            assert!(
+                !interpreter_can_import_scipy(
+                    "/nonexistent/bin/python-that-is-not-installed",
+                    Some("/tmp")
+                ),
+                "probe was satisfied by a path rather than by an import"
+            );
+            // MUST HIT, but only where a live incumbent is actually installed. Asserting
+            // unconditionally would make this test a host check rather than a probe check,
+            // and it would fail on workers that legitimately carry no SciPy.
+            let (python, site) = SCIPY_PYTHON_CANDIDATES
+                .iter()
+                .flat_map(|python| {
+                    std::iter::once((*python, None)).chain(
+                        SCIPY_SITE_PACKAGES
+                            .iter()
+                            .map(move |path| (*python, Some(*path))),
+                    )
+                })
+                .find(|(python, site)| interpreter_can_import_scipy(python, *site))
+                .map_or((None, None), |(python, site)| (Some(python), site));
+            if let Some(python) = python {
+                assert!(
+                    interpreter_can_import_scipy(python, site),
+                    "probe is not repeatable on {python}"
+                );
+                println!("must-hit arm observed on {python} site={site:?}");
+            } else {
+                println!(
+                    "must-hit arm SKIPPED: no candidate on this host imports scipy, so only \
+                     the must-miss arm ran here"
+                );
+            }
         }
 
         #[test]

@@ -160,6 +160,12 @@ struct NativeSparseLu {
     u_rows: Vec<Vec<(usize, f64)>>,
     lower: PackedTriangularRows,
     upper: PackedTriangularRows,
+    // A triangular row can read only rows that have already been solved.  Grouping
+    // those independent rows once at factor construction makes a future multi-core
+    // solve a sequence of safe read-only / write-after-barrier phases rather than
+    // requiring aliases into the solution vector.
+    lower_levels: TriangularLevelSchedule,
+    upper_levels: TriangularLevelSchedule,
     // Symmetric fill-reducing permutation applied before factorization: the matrix
     // actually factored is B = P·A·Pᵀ (B[i][j] = A[fill_perm[i]][fill_perm[j]]).
     // `None` ⇒ natural ordering. Solve maps b → P·b, back-substitutes, then x = Pᵀ·z.
@@ -188,6 +194,177 @@ struct PackedTriangularRows {
     /// from the row's first column instead of streaming the whole `columns` array.
     /// Settled when the factor is built; see [`Self::rows_are_contiguous`].
     contiguous: bool,
+}
+
+/// Topological row levels for one packed triangular factor.
+///
+/// `rows[offsets[level]..offsets[level + 1]]` can be evaluated concurrently:
+/// every dependency is in an earlier level.  The rows remain in their factor
+/// order within a level, so the serial fallback has the same visitation order.
+#[derive(Debug, Clone)]
+struct TriangularLevelSchedule {
+    offsets: Vec<usize>,
+    rows: Vec<usize>,
+}
+
+impl TriangularLevelSchedule {
+    fn lower(rows: &PackedTriangularRows) -> Option<Self> {
+        Self::from_dependencies(rows, false)
+    }
+
+    fn upper(rows: &PackedTriangularRows) -> Option<Self> {
+        Self::from_dependencies(rows, true)
+    }
+
+    fn from_dependencies(rows: &PackedTriangularRows, upper: bool) -> Option<Self> {
+        let row_count = rows.offsets.len().checked_sub(1)?;
+        let mut row_levels = vec![0usize; row_count];
+        let mut levels: Vec<Vec<usize>> = Vec::new();
+        let order: Box<dyn Iterator<Item = usize>> = if upper {
+            Box::new((0..row_count).rev())
+        } else {
+            Box::new(0..row_count)
+        };
+
+        for row in order {
+            let start = rows.offsets[row];
+            let end = rows.offsets[row + 1];
+            // U's first entry is its diagonal; L has no stored diagonal.
+            let dependencies = if upper {
+                &rows.columns[start.saturating_add(1)..end]
+            } else {
+                &rows.columns[start..end]
+            };
+            let mut level = 0usize;
+            for &column in dependencies {
+                let column = column as usize;
+                if (upper && column <= row) || (!upper && column >= row) {
+                    return None;
+                }
+                level = level.max(row_levels[column].checked_add(1)?);
+            }
+            if levels.len() <= level {
+                levels.resize_with(level + 1, Vec::new);
+            }
+            levels[level].push(row);
+            row_levels[row] = level;
+        }
+
+        let mut offsets = Vec::with_capacity(levels.len() + 1);
+        let mut scheduled_rows = Vec::with_capacity(row_count);
+        offsets.push(0);
+        for level in levels {
+            scheduled_rows.extend(level);
+            offsets.push(scheduled_rows.len());
+        }
+        Some(Self {
+            offsets,
+            rows: scheduled_rows,
+        })
+    }
+
+    fn has_parallel_rows(&self) -> bool {
+        self.offsets.windows(2).any(|window| window[1] - window[0] > 1)
+    }
+
+    fn levels(&self) -> impl Iterator<Item = &[usize]> {
+        self.offsets
+            .windows(2)
+            .map(|window| &self.rows[window[0]..window[1]])
+    }
+}
+
+#[inline]
+fn level_schedule_is_useful(schedule: &TriangularLevelSchedule) -> bool {
+    schedule.has_parallel_rows()
+        && std::thread::available_parallelism().is_ok_and(|parallelism| parallelism.get() > 1)
+}
+
+fn triangular_forward_substitute<F>(
+    offsets: &[usize],
+    columns: &[u32],
+    values: &[f64],
+    rhs: F,
+    solved: &mut [f64],
+    contiguous: bool,
+    schedule: Option<&TriangularLevelSchedule>,
+) where
+    F: Fn(usize) -> f64 + Sync,
+{
+    let reduce = |row: usize, prior: &[f64]| {
+        let (start, end) = (offsets[row], offsets[row + 1]);
+        triangular_row_reduce(
+            rhs(row),
+            &columns[start..end],
+            &values[start..end],
+            prior,
+            contiguous,
+        )
+    };
+    if let Some(schedule) = schedule {
+        for rows in schedule.levels() {
+            let completed = rows
+                .par_iter()
+                .map(|&row| (row, reduce(row, solved)))
+                .collect::<Vec<_>>();
+            for (row, value) in completed {
+                solved[row] = value;
+            }
+        }
+    } else {
+        for row in 0..solved.len() {
+            let value = reduce(row, solved);
+            solved[row] = value;
+        }
+    }
+}
+
+fn triangular_backward_substitute(
+    offsets: &[usize],
+    columns: &[u32],
+    values: &[f64],
+    solved: &mut [f64],
+    contiguous: bool,
+    schedule: Option<&TriangularLevelSchedule>,
+) -> SparseResult<()> {
+    let reduce = |row: usize, known: &[f64]| -> SparseResult<f64> {
+        let start = offsets[row];
+        let end = offsets[row + 1];
+        let (diagonal_column, pivot) = if start < end {
+            (columns[start] as usize, values[start])
+        } else {
+            (usize::MAX, 0.0)
+        };
+        if diagonal_column != row || is_sparse_zero_pivot(pivot) {
+            return Err(SparseError::SingularMatrix {
+                message: format!("zero pivot in sparse LU solve at row {row}"),
+            });
+        }
+        Ok(triangular_row_reduce(
+            known[row],
+            &columns[start + 1..end],
+            &values[start + 1..end],
+            known,
+            contiguous,
+        ) / pivot)
+    };
+    if let Some(schedule) = schedule {
+        for rows in schedule.levels() {
+            let completed = rows
+                .par_iter()
+                .map(|&row| reduce(row, solved).map(|value| (row, value)))
+                .collect::<SparseResult<Vec<_>>>()?;
+            for (row, value) in completed {
+                solved[row] = value;
+            }
+        }
+    } else {
+        for row in (0..solved.len()).rev() {
+            let value = reduce(row, solved)?;
+            solved[row] = value;
+        }
+    }
+    Ok(())
 }
 
 impl PackedTriangularRows {
@@ -3626,6 +3803,10 @@ impl NativeSparseLu {
     ) -> Self {
         let lower = PackedTriangularRows::from_rows(&l_rows);
         let upper = PackedTriangularRows::from_rows(&u_rows);
+        let lower_levels = TriangularLevelSchedule::lower(&lower)
+            .expect("native LU L rows must depend only on earlier rows");
+        let upper_levels = TriangularLevelSchedule::upper(&upper)
+            .expect("native LU U rows must depend only on later rows after the diagonal");
         let inverse_fill_perm = fill_perm.as_ref().map(|fill| {
             let mut inverse = vec![0; n];
             for (new_i, &old_i) in fill.iter().enumerate() {
@@ -3646,6 +3827,8 @@ impl NativeSparseLu {
             u_rows,
             lower,
             upper,
+            lower_levels,
+            upper_levels,
             fill_perm,
             rhs_gather,
             inverse_fill_perm,
@@ -3664,6 +3847,10 @@ impl NativeSparseLu {
     ) -> Self {
         let lower = PackedTriangularRows::from_rows(&l_rows);
         let upper = PackedTriangularRows::from_sorted_upper_rows(u_rows);
+        let lower_levels = TriangularLevelSchedule::lower(&lower)
+            .expect("native LU L rows must depend only on earlier rows");
+        let upper_levels = TriangularLevelSchedule::upper(&upper)
+            .expect("native LU U rows must depend only on later rows after the diagonal");
         let inverse_fill_perm = fill_perm.as_ref().map(|fill| {
             let mut inverse = vec![0; n];
             for (new_i, &old_i) in fill.iter().enumerate() {
@@ -3680,6 +3867,8 @@ impl NativeSparseLu {
             row_perm,
             lower,
             upper,
+            lower_levels,
+            upper_levels,
             fill_perm,
             rhs_gather,
             inverse_fill_perm,
@@ -4603,6 +4792,13 @@ impl NativeSparseLu {
             SPLU_CONTIGUOUS_SOLVE_ENABLE.load(std::sync::atomic::Ordering::Relaxed);
         let lower_contiguous = contiguous_arm && self.lower.contiguous;
         let upper_contiguous = contiguous_arm && self.upper.contiguous;
+        // On one pinned CPU the existing serial loops avoid scheduling overhead.  Once the
+        // caller grants multiple CPUs, each precomputed level is a safe barrier: all reads
+        // target prior levels and the completed values are published together afterwards.
+        let lower_schedule = level_schedule_is_useful(&self.lower_levels)
+            .then_some(&self.lower_levels);
+        let upper_schedule = level_schedule_is_useful(&self.upper_levels)
+            .then_some(&self.upper_levels);
         if lower_contiguous || upper_contiguous {
             SPLU_CONTIGUOUS_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -4649,18 +4845,15 @@ impl NativeSparseLu {
                 // in ONE shipping binary and the comparison is paired rather than
                 // cross-window; it is not a tuning knob and defaults off.
                 let permuted = fill.iter().map(|&old| b[old]).collect::<Vec<f64>>();
-                for row in 0..self.n {
-                    let value = permuted[self.row_perm[row]];
-                    let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
-                    let value = triangular_row_reduce(
-                        value,
-                        &lower_columns[start..end],
-                        &lower_values[start..end],
-                        &y,
-                        lower_contiguous,
-                    );
-                    y[row] = value;
-                }
+                triangular_forward_substitute(
+                    lower_offsets,
+                    lower_columns,
+                    lower_values,
+                    |row| permuted[self.row_perm[row]],
+                    &mut y,
+                    lower_contiguous,
+                    lower_schedule,
+                );
             }
             Some(_) => {
                 let rhs_gather =
@@ -4670,35 +4863,29 @@ impl NativeSparseLu {
                             message: "native sparse LU missing precomputed rhs gather map"
                                 .to_string(),
                         })?;
-                for row in 0..self.n {
-                    let value = b[rhs_gather[row]];
-                    let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
-                    let value = triangular_row_reduce(
-                        value,
-                        &lower_columns[start..end],
-                        &lower_values[start..end],
-                        &y,
-                        lower_contiguous,
-                    );
-                    y[row] = value;
-                }
+                triangular_forward_substitute(
+                    lower_offsets,
+                    lower_columns,
+                    lower_values,
+                    |row| b[rhs_gather[row]],
+                    &mut y,
+                    lower_contiguous,
+                    lower_schedule,
+                );
             }
             None => {
                 // With no fill permutation there is nothing to materialize and nothing
                 // to compose, so both arms are this loop and the toggle is INERT here.
                 // Any A/B row taken on a natural-ordering fixture is measuring nothing.
-                for row in 0..self.n {
-                    let value = b[self.row_perm[row]];
-                    let (start, end) = (lower_offsets[row], lower_offsets[row + 1]);
-                    let value = triangular_row_reduce(
-                        value,
-                        &lower_columns[start..end],
-                        &lower_values[start..end],
-                        &y,
-                        lower_contiguous,
-                    );
-                    y[row] = value;
-                }
+                triangular_forward_substitute(
+                    lower_offsets,
+                    lower_columns,
+                    lower_values,
+                    |row| b[self.row_perm[row]],
+                    &mut y,
+                    lower_contiguous,
+                    lower_schedule,
+                );
             }
         }
 
@@ -4718,28 +4905,14 @@ impl NativeSparseLu {
         // every solve, which matters on the shapes this is used for: the worst
         // standing deficit in the ledger is one factorization against SIXTEEN
         // solves (frankenscipy-run7d).
-        for row in (0..self.n).rev() {
-            let start = upper_offsets[row];
-            let end = upper_offsets[row + 1];
-            let (diagonal_col, pivot) = if start < end {
-                (upper_columns[start] as usize, upper_values[start])
-            } else {
-                (usize::MAX, 0.0)
-            };
-            if diagonal_col != row || is_sparse_zero_pivot(pivot) {
-                return Err(SparseError::SingularMatrix {
-                    message: format!("zero pivot in sparse LU solve at row {row}"),
-                });
-            }
-            let value = triangular_row_reduce(
-                y[row],
-                &upper_columns[start + 1..end],
-                &upper_values[start + 1..end],
-                &y,
-                upper_contiguous,
-            );
-            y[row] = value / pivot;
-        }
+        triangular_backward_substitute(
+            upper_offsets,
+            upper_columns,
+            upper_values,
+            &mut y,
+            upper_contiguous,
+            upper_schedule,
+        )?;
 
         match self.inverse_fill_perm.as_deref() {
             Some(inverse) => {
@@ -15934,6 +16107,62 @@ mod tests {
             })
             .collect();
         assert_eq!(distinct.len(), 4_096);
+    }
+
+    #[test]
+    fn level_scheduled_triangular_solve_matches_serial_dependency_order_bits() {
+        // Two independent rows appear in each level of both factors.  This is not a
+        // schedule-shaped assertion: execute the level path itself and compare its result
+        // with the hand-evaluated triangular system bit-for-bit.
+        let lu = NativeSparseLu::from_factor_rows(
+            4,
+            vec![0, 1, 2, 3],
+            vec![vec![], vec![], vec![(0, 0.5)], vec![(1, 0.25)]],
+            vec![
+                vec![(0, 2.0), (2, 0.25)],
+                vec![(1, 3.0), (3, 0.5)],
+                vec![(2, 4.0)],
+                vec![(3, 5.0)],
+            ],
+            None,
+            PermutationOrdering::Natural,
+        );
+        assert!(lu.lower_levels.has_parallel_rows());
+        assert!(lu.upper_levels.has_parallel_rows());
+        assert_eq!(
+            lu.lower_levels.levels().collect::<Vec<_>>(),
+            vec![&[0, 1][..], &[2, 3][..]]
+        );
+
+        let rhs = [2.0, 6.0, 10.0, 20.0];
+        let mut scheduled = vec![0.0; 4];
+        triangular_forward_substitute(
+            &lu.lower.offsets,
+            &lu.lower.columns,
+            &lu.lower.values,
+            |row| rhs[row],
+            &mut scheduled,
+            false,
+            Some(&lu.lower_levels),
+        );
+        triangular_backward_substitute(
+            &lu.upper.offsets,
+            &lu.upper.columns,
+            &lu.upper.values,
+            &mut scheduled,
+            false,
+            Some(&lu.upper_levels),
+        )
+        .expect("level schedule has valid diagonals");
+
+        let expected = [0.71875, 1.3833333333333333, 2.25, 3.7];
+        for (index, (actual, reference)) in scheduled.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                reference.to_bits(),
+                "level-scheduled component {index} differs"
+            );
+        }
     }
 
     #[test]
@@ -30956,8 +31185,37 @@ const SUPERNODAL_RELAXATION_TOLERANCE: usize = 8;
 /// pivot order — and `supernodal_elimination_is_bit_identical_to_the_sequential_one`
 /// asserts the whole factorization as raw bits, including relaxed blocks.
 ///
-/// **Defaults OFF: unmeasured.** The driver is correct and reachable, but no timing or
-/// counted row exists for it yet.
+/// **Defaults OFF: MEASURED, and it is a large LOSS** (frankenscipy-9nw95, 2026-08-30).
+/// This comment used to read "unmeasured — no timing or counted row exists for it yet",
+/// which was true when written and is the reason the arm survived this long.
+///
+/// Live SciPy 1.17.1 SuperLU in the same invocation, `perf_splu` balanced square,
+/// `host=thinkstation1`, one pinned CPU, ELF `428fb95f…0469`, every row's A/A nulls inside
+/// the ±0.020 bound:
+///
+///     cell                      shipping (banded)   general arm   general + SUPERNODAL
+///     cubic side=16  n=4096          1.4666x          0.6988x          0.1685x
+///     convection s=128 n=16384       0.6162x                --         0.0128x
+///
+/// On cubic the blocked arm is **4.15x slower than the very general arm it replaces**, and
+/// on convection it is **48x** below the shipping cell. The direction is not marginal and it
+/// gets worse with size, so there is no crossover to look for.
+///
+/// **THE COUNTED BOUND PREDICTED THE OPPOSITE, AND THAT IS THE FINDING.** On the cubic cell
+/// `supernode_touch_reduction` measures **5.08x** fewer target-row touches (against a width
+/// bound of 5.24x) and `supernode_block_density` measures **0.972** — the blocks are full, so
+/// the padding costs only 1.03x in flops. A lever that removes 80% of the touches for 3% more
+/// arithmetic and then runs 4x slower is not mispredicted by a little. What the touch count
+/// cannot see is that `apply_supernode_tails` makes the SUPERNODE WIDTH the inner loop, and
+/// that width is **5.24** — so the blocking trades a long unit-stride merge for a very short
+/// strided one. **Touch reduction is not a cost model.** Do not resurrect this arm on a
+/// counted-touch or block-density argument; only a construction whose INNER loop gets longer
+/// (a frontal matrix, dense in both dimensions) can be argued for here, and it must be priced
+/// on run length, not on touches.
+///
+/// ACCURACY CONTRACT, unchanged and still honoured: **BIT-IDENTICAL, unconditionally.**
+/// The arm stays in the tree, driven and asserted, because it is the negative control for
+/// exactly that class of argument.
 #[doc(hidden)]
 pub static SPLU_SUPERNODAL_ENABLE: PerfToggle = PerfToggle::new(false);
 

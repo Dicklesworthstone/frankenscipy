@@ -42443,3 +42443,112 @@ earlier in this campaign, knowingly.
 **No runtime claim is banked.** The TIMED set requires fail-closed host-wide quiescence; hz2
 ran this between loadavg 1.84 and 6.16 on 16 cores, and hz1 remains refused for
 `disk_critical_without_fresh_telemetry`. Reported, not relaxed.
+
+## 2026-08-30 - CopperFalcon (cc) - LOSS / REJECT: the splu supernodal arm is 4.15x SLOWER than the arm it replaces, and its 5.08x counted touch reduction is what predicted otherwise
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: LOSS. The arm stays OFF; nothing was
+  reverted because nothing shipped — `SPLU_SUPERNODAL_ENABLE` already defaulted `false`.
+  What changes is that its doc comment claimed "unmeasured", and it is now measured.**
+- **The bead's own falsification condition is met from the other side.** It predicted that
+  supernodal blocking would turn the elimination into dense BLAS-3 panels. It does not.
+- Harness `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs` (`perf_splu`), live SciPy
+  1.17.1 SuperLU **in the same invocation on identical fixture bytes**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`, `fsci_loaded=False`, `genuine=True`.
+- **Two named engine artifact SHA-256s.** Ours,
+  `frankenscipy_engine_sha256=428fb95f26b0931f02a13c2e3bfa66c3bceb59cd25b062c6a52176a622270469`,
+  self-reported from inside the process, `elf_path=target/release/perf_splu`, built on
+  **rch worker `vmi1293453`**
+  (`RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo build -j 1 --release -p fsci-sparse --bin perf_splu`)
+  and run OUTSIDE the build window; the incumbent's,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`.
+- **HARDWARE / THREAD PROVENANCE, verbatim from the process** (identical on every row; the
+  `loadavg` and quiescence figures below are the convection 21-round row, the others are
+  quoted with their own rows):
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+      loadavg=18.54 14.39 10.66
+      pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.292)
+      post_measurement_quiescence=NOT_CERTIFIED(host_mean_busy=0.273)
+
+  Restated in the ledger's own field names, same values:
+  `executed-binary sha256=428fb95f26b0931f02a13c2e3bfa66c3bceb59cd25b062c6a52176a622270469`,
+  `requested_threads=1`, `actual_observed_worker_threads=1`, `logical_threads=64`,
+  `physical_cores=32`, `ram_bytes=231687815168`, `numa_count=1`,
+  `scaling_governor=powersave`, `runtime_isa=avx2+fma`, `affinity=1 (taskset -c 4)`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.292)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.273)`.
+  Host-wide quiescence is **NOT_CERTIFIED** on both sides and is reported, not relaxed
+  (`frankenscipy-fr78g`: the build-slot service that would certify it is disabled
+  server-side). The cubic rows carry `host_mean_busy` 0.131 pre / 0.292 post, i.e.
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.131)` and
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.292)`.
+- **DECISION RULE: bootstrap-median CI only, never cv.** Every row below is decided from
+  `ci95` against the harness's own printed rule, e.g. the convection row's
+  `decided_if_ci_lo>1.0102_or_ci_hi<0.9898` and the cubic supernodal row's
+  `decided_if_ci_lo>1.0333_or_ci_hi<0.9667`. **CV is provenance only** and decides nothing
+  here. **The 2x A/A-null margin holds with room to spare on the finding**: the worst null
+  edge on any supernodal row is 0.0167, so a 2x margin demands the ratio sit outside
+  [0.9666, 1.0334], and the measured 0.1685x and 0.0128x miss that band by more than an
+  order of magnitude. `quiescence=clear` on every row (both A/A nulls inside +/-0.020).
+
+- **THE ROWS.** All four are `SciPy / FrankenSciPy`, so >1 is a win for us:
+
+  | cell | arm | ratio | ci95 | null scipy | null fsci |
+  |---|---|---|---|---|---|
+  | cubic side=16, n=4096 | **shipping (banded)** | **1.4666x** | [1.4481, 1.4782] | 0.9998 | 0.9991 |
+  | cubic side=16, n=4096 | general, supernodal OFF | 0.6988x | [0.6941, 0.7049] | 0.9846 | 0.9937 |
+  | cubic side=16, n=4096 | general, **supernodal ON** | **0.1685x** | [0.1634, 0.1707] | 0.9833 | 0.9984 |
+  | convection side=128, n=16384 | shipping (banded), 21 rounds | 0.6162x | [0.6076, 0.6358] | 1.0051 | 1.0021 |
+  | convection side=128, n=16384 | general, **supernodal ON** | **0.0128x** | [0.0127, 0.0135] | 0.9896 | 1.0024 |
+
+  Commands, verbatim (`SCIPY_PYTHON=/home/ubuntu/.local/bin/python3.13` throughout):
+  `FSCI_SPLU_BANDED=0 taskset -c 4 ./target/release/perf_splu 16 9 2 off cubic on off on on|off`,
+  `taskset -c 4 ./target/release/perf_splu 16 9 2 off cubic on off on off`,
+  `taskset -c 4 ./target/release/perf_splu 128 21 4 off convection on off on off`,
+  `FSCI_SPLU_BANDED=0 taskset -c 4 ./target/release/perf_splu 128 9 2 off convection on off on on`.
+- **The arm demonstrably ran**: `supernodal_factor_hits=39` with `supernodal_enabled=true` and
+  `banded_factor_hits=0`, against `supernodal_factor_hits=0` on its control — the two-sided
+  driver control, both arms observed. Parity gated before any timing,
+  `worst_rel_solution_diff=3.908e-15`.
+
+- **WHY THIS IS WORTH BANKING RATHER THAN JUST DELETING: the counted bound pointed the other
+  way, confidently.** On the same cell, `supernode_touch_reduction` measures **5.08x** fewer
+  target-row touches against a width bound of 5.24x, and `supernode_block_density` measures
+  **0.972** — the blocks are nearly solid, so the relaxation pads only **1.03x** in flops.
+  Removing 80% of the touches for 3% more arithmetic and then running **4.15x slower** is not
+  a small mis-prediction. What a touch count cannot see is the **run length**:
+  `apply_supernode_tails` puts the SUPERNODE WIDTH on the inner loop, and that width is
+  **5.24**, so the blocking trades a long unit-stride merge (mean run 9.938) for a very short
+  strided one. **Touch reduction is not a cost model.** This is the same shape as
+  `perf_register_tiling_loses_to_plain_loop`: a blocking scheme that looks better on every
+  counted quantity except the one the hardware bills.
+- **Concrete retry predicate.** Do not re-open supernodal blocking on a touch-count,
+  block-density or padding-cost argument — all three are now measured favourable AND the arm
+  loses anyway, so they license nothing. The only admissible successor is a construction whose
+  INNER loop gets longer than the 9.938 it replaces — a frontal matrix, dense in both
+  dimensions — and it must be pre-costed **on run length**, not on touches.
+- **The deficit gets WORSE with size** (4.15x at n=4096, 48x at n=16384 against the shipping
+  cell), so there is no crossover width to go looking for.
+
+### Correction banked with it: the cited "worst cell" no longer exists
+
+The orders that produced this row cited the splu cubic cell at **0.4170-0.4209x** from the
+2026-08-16 entry above. That number is superseded: with the banded arm shipping, **cubic
+side=16 is now a 1.4666x WIN**, measured here. The worst standing splu cell today is
+**convection n=16384 at 0.6162x** (1.62x slower), not 2.4x slower. Any lever sized against
+0.4170x is sized against a cell that has already moved twice.
+
+### Harness defect found and fixed in the same pass
+
+`perf_splu` selected its SciPy interpreter by `Path::exists` and its `PYTHONPATH` by
+`is_dir`. Both had gone stale — `/usr/bin/python3.13` is absent on `thinkstation1` and the
+pinned `/data/projects/.python-incumbents/...` directory has been removed — so the harness
+fell through to a bare `python3` with no SciPy and died on
+`send fixture to SciPy: BrokenPipe`, **several lines after** printing a well-formed
+provenance/ELF header. Existence is not a predicate for "can import scipy". The selection now
+probes the import itself, prefers the interpreter's own default path over a prepended
+site-packages, and refuses loudly naming every candidate it tried. Covered by
+`scipy_interpreter_probe_answers_both_ways`, whose **must-miss** arm is the load-bearing one.
