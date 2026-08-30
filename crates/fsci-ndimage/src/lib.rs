@@ -7236,8 +7236,91 @@ pub fn binary_fill_holes_with_structure(
 /// Returns (labeled_array, num_features).
 /// Matches `scipy.ndimage.label`.
 pub fn label(input: &NdArray) -> Result<(NdArray, usize), NdimageError> {
+    // The default SciPy structure is the 2-D cross.  This hot path can scan a
+    // row as runs instead of doing a bounds check for every foreground cell and
+    // every backward offset.  Keep `label_with_structure` as the general path:
+    // it covers arbitrary dimensions and explicitly supplied structures.
+    if input.shape.len() == 2 {
+        return label_2d_cross_runs(input);
+    }
     let structure = generate_binary_structure(input.ndim(), 1);
     label_with_structure(input, &structure)
+}
+
+/// Label a 2-D image with SciPy's default 4-connected structure.
+///
+/// Each foreground run is represented by its first flat index in the same
+/// parent array used by the general two-pass implementation.  A current-row
+/// run only needs to union with previous-row runs that overlap it, so dense
+/// images avoid per-cell left/up neighbour tests.  Every cell still points at
+/// its run root, preserving the first-raster-cell roots and therefore SciPy's
+/// component numbering exactly.
+fn label_2d_cross_runs(input: &NdArray) -> Result<(NdArray, usize), NdimageError> {
+    if input.size() == 0 {
+        return Err(NdimageError::EmptyInput);
+    }
+    let (rows, cols) = (input.shape[0], input.shape[1]);
+    let n = input.size();
+    let fg: Vec<u8> = input.data.iter().map(|&value| u8::from(value != 0.0)).collect();
+    let mut parent = vec![0u32; n];
+    let mut previous: Vec<(usize, usize, u32)> = Vec::new();
+    let mut current: Vec<(usize, usize, u32)> = Vec::new();
+
+    for row in 0..rows {
+        current.clear();
+        let base = row * cols;
+        let mut column = 0usize;
+        let mut previous_run = 0usize;
+        while column < cols {
+            while column < cols && fg[base + column] == 0 {
+                column += 1;
+            }
+            let start = column;
+            while column < cols && fg[base + column] != 0 {
+                column += 1;
+            }
+            if start == column {
+                continue;
+            }
+
+            let root = (base + start) as u32;
+            parent[root as usize] = root;
+            for flat in (base + start + 1)..(base + column) {
+                parent[flat] = root;
+            }
+
+            // Previous-row runs are ordered by start.  Skip the ones ending at
+            // or before this run, then union every overlapping run.  Touching
+            // only at a corner is deliberately excluded: the default structure
+            // is 4-connected, not 8-connected.
+            while previous_run < previous.len() && previous[previous_run].1 <= start {
+                previous_run += 1;
+            }
+            let mut overlap = previous_run;
+            while overlap < previous.len() && previous[overlap].0 < column {
+                label_union(&mut parent, root, previous[overlap].2);
+                overlap += 1;
+            }
+            current.push((start, column, root));
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    let mut labels = NdArray::zeros(input.shape.clone());
+    let mut component_labels = vec![0u32; n];
+    let mut component_count = 0u32;
+    for flat in 0..n {
+        if fg[flat] == 0 {
+            continue;
+        }
+        let root = label_find(&mut parent, flat as u32) as usize;
+        if root == flat {
+            component_count += 1;
+            component_labels[flat] = component_count;
+        }
+        labels.data[flat] = component_labels[root] as f64;
+    }
+    Ok((labels, component_count as usize))
 }
 
 fn validate_label_structure(input_ndim: usize, structure: &NdArray) -> Result<(), NdimageError> {
@@ -18221,6 +18304,26 @@ mod tests {
         let (full_labels, full_num) = label_with_structure(&input, &full_structure).unwrap();
         assert_eq!(full_num, 1);
         assert_eq!(full_labels.data, vec![1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn label_default_run_scan_matches_general_cross_union_find() {
+        // The middle run overlaps two separate runs above it, exercising the
+        // run-to-run merge that replaces per-pixel upward-neighbour probes.
+        #[rustfmt::skip]
+        let input = NdArray::new(vec![
+            1.0, 1.0, 0.0, 0.0, 1.0, 1.0,
+            0.0, 1.0, 1.0, 1.0, 1.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            1.0, 0.0, 0.0, 0.0, 1.0, 1.0,
+        ], vec![4, 6]).unwrap();
+        let (run_labels, run_count) = label(&input).expect("run scan label");
+        let cross = generate_binary_structure(2, 1);
+        let (general_labels, general_count) =
+            label_with_structure(&input, &cross).expect("general cross label");
+
+        assert_eq!(run_count, general_count);
+        assert_eq!(run_labels.data, general_labels.data);
     }
 
     #[test]

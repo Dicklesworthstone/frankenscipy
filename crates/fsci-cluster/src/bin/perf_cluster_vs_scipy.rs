@@ -20,19 +20,20 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
-use fsci_cluster::{LinkageMethod, linkage, vq};
+use fsci_cluster::{LinkageMethod, kmeans2, linkage, vq};
 
 const PYTHON: &str = r#"
 import hashlib, os, sys, time
 import numpy as np
 import scipy
 from scipy.cluster.hierarchy import linkage
-from scipy.cluster.vq import vq
+from scipy.cluster.vq import kmeans2, vq
 
 op = os.environ['FSCI_CLUSTER_OP']
 n = int(os.environ['FSCI_CLUSTER_N'])
 dim = int(os.environ['FSCI_CLUSTER_DIM'])
 k = int(os.environ['FSCI_CLUSTER_K'])
+iterations = int(os.environ['FSCI_CLUSTER_ITER'])
 
 raw = sys.stdin.buffer.read(n * dim * 8)
 if len(raw) != n * dim * 8: raise RuntimeError('short fixture')
@@ -44,6 +45,9 @@ cent = np.frombuffer(craw, dtype='<f8').reshape(k, dim).copy()
 def run():
     if op == 'linkage':
         return np.ascontiguousarray(linkage(pts, method='single')[:, 2], dtype='<f8')
+    if op == 'kmeans2':
+        _centroids, labels = kmeans2(pts, cent, iter=iterations, minit='matrix')
+        return np.ascontiguousarray(labels, dtype='<f8')
     _codes, dist = vq(pts, cent)
     return np.ascontiguousarray(dist, dtype='<f8')
 
@@ -86,7 +90,7 @@ struct Scipy {
 }
 
 impl Scipy {
-    fn start(op: &str, points: &[Vec<f64>], centroids: &[Vec<f64>]) -> Self {
+    fn start(op: &str, points: &[Vec<f64>], centroids: &[Vec<f64>], iterations: usize) -> Self {
         let dim = points[0].len();
         let mut child = Command::new("python3")
             .args(["-u", "-c", PYTHON])
@@ -94,6 +98,7 @@ impl Scipy {
             .env("FSCI_CLUSTER_N", points.len().to_string())
             .env("FSCI_CLUSTER_DIM", dim.to_string())
             .env("FSCI_CLUSTER_K", centroids.len().to_string())
+            .env("FSCI_CLUSTER_ITER", iterations.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -196,6 +201,10 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
+    let iterations: usize = std::env::var("FSCI_CLUSTER_ITER")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
 
     println!("elf_sha256={}", elf_sha256());
 
@@ -276,7 +285,8 @@ fn main() {
     // `FSCI_CLUSTER_OPS=vq` restricts the run to one op. Needed to attribute a hardware
     // counter to a single op: with both ops in the run, a `perf stat` total mixes them and
     // a change in either moves the number.
-    let selected = std::env::var("FSCI_CLUSTER_OPS").unwrap_or_else(|_| "vq,linkage".to_owned());
+    let selected =
+        std::env::var("FSCI_CLUSTER_OPS").unwrap_or_else(|_| "vq,linkage,kmeans2".to_owned());
     // `FSCI_CLUSTER_FIXED_REPS=N` pins the repetition count instead of calibrating it, so two
     // runs being compared on instructions retired do the SAME amount of work. Calibration
     // picks reps from measured time, so a faster arm would otherwise run FEWER reps and
@@ -285,16 +295,23 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok());
 
-    for op in ["vq", "linkage"] {
+    for op in ["vq", "linkage", "kmeans2"] {
         if !selected.split(',').any(|name| name.trim() == op) {
             continue;
         }
-        let mut scipy = Scipy::start(op, &points, &centroids);
+        let mut scipy = Scipy::start(op, &points, &centroids, iterations);
         println!("{}", scipy.ready);
 
         let ours = || -> Vec<f64> {
             if op == "vq" {
                 vq(&points, &centroids).expect("fsci vq").1
+            } else if op == "kmeans2" {
+                kmeans2(&points, &centroids, iterations)
+                    .expect("fsci kmeans2")
+                    .1
+                    .into_iter()
+                    .map(|label| label as f64)
+                    .collect()
             } else {
                 linkage(&points, LinkageMethod::Single)
                     .expect("fsci linkage")
@@ -330,7 +347,7 @@ fn main() {
             single = single.min(started.elapsed().as_secs_f64() * 1.0e3);
         }
         let reps = fixed_reps
-            .unwrap_or_else(|| ((MIN_SAMPLE_MS / single.max(1.0e-6)).ceil() as usize))
+            .unwrap_or_else(|| (MIN_SAMPLE_MS / single.max(1.0e-6)).ceil() as usize)
             .clamp(1, 4096);
         println!("op={op} calibration single={single:.4}ms reps={reps}");
 

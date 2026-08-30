@@ -28,14 +28,15 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
 use fsci_ndimage::{
-    BoundaryMode, NdArray, distance_transform_edt, gaussian_filter, median_filter, uniform_filter,
+    BoundaryMode, NdArray, distance_transform_edt, gaussian_filter, label, median_filter,
+    uniform_filter,
 };
 
 const PYTHON: &str = r#"
 import hashlib, os, sys, time
 import numpy as np
 import scipy
-from scipy.ndimage import (distance_transform_edt, gaussian_filter, median_filter,
+from scipy.ndimage import (distance_transform_edt, gaussian_filter, label, median_filter,
                            uniform_filter)
 
 op = os.environ['FSCI_ND_OP']
@@ -53,6 +54,8 @@ elif op == 'uniform':
     def run(): return uniform_filter(img, size=size, mode='reflect')
 elif op == 'median':
     def run(): return median_filter(img, size=size, mode='reflect')
+elif op == 'label':
+    def run(): return label(img)[0]
 else:
     # EDT takes a binary image; threshold so roughly half the pixels are background.
     binary = (img > 0.5).astype(np.float64)
@@ -252,21 +255,24 @@ fn main() {
         .collect();
     let binary: Vec<f64> = image
         .iter()
-        .map(|&v| if v > 0.5 { 1.0 } else { 0.0 })
+        .map(|&v| if v > 0.85 { 1.0 } else { 0.0 })
         .collect();
 
-    for op in ["gaussian", "uniform", "median", "edt"] {
+    for op in ["gaussian", "uniform", "median", "edt", "label"] {
         if !selected.split(',').any(|name| name.trim() == op) {
             continue;
         }
-        let mut scipy = Scipy::start(op, n, sigma, size, &image);
-        println!("{}", scipy.ready);
-
         // Built ONCE, outside the timed region: SciPy's arm is handed an array it already
         // holds, so cloning the image into a fresh NdArray per call would charge us a
         // memcpy the incumbent never pays — the defect that cost 23% of a measured number
         // in the fsci-special harness.
-        let source = if op == "edt" { &binary } else { &image };
+        let source = if op == "edt" || op == "label" {
+            &binary
+        } else {
+            &image
+        };
+        let mut scipy = Scipy::start(op, n, sigma, size, source);
+        println!("{}", scipy.ready);
         let array = NdArray::new(source.clone(), vec![n, n]).expect("build NdArray");
 
         let ours = || -> Vec<f64> {
@@ -274,6 +280,7 @@ fn main() {
                 "gaussian" => gaussian_filter(&array, sigma, BoundaryMode::Reflect, 0.0),
                 "uniform" => uniform_filter(&array, size, BoundaryMode::Reflect, 0.0),
                 "median" => median_filter(&array, size, BoundaryMode::Reflect, 0.0),
+                "label" => label(&array).map(|(labels, _)| labels),
                 _ => distance_transform_edt(&array, None),
             };
             out.unwrap_or_else(|e| panic!("fsci {op} failed: {e}")).data

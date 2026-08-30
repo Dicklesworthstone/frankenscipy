@@ -2847,7 +2847,7 @@ pub fn kmeans(
         // point order so its floating-point reduction — and therefore the convergence
         // check and iteration count — stay bit-identical to the serial version.
         let centroids_flat = flatten_centroids(&centroids, d);
-        let assignments = assign_points(&data_flat, n, &centroids_flat, k, d);
+        let assignments = assign_points_with_distances(&data_flat, n, &centroids_flat, k, d);
         let mut new_inertia = 0.0;
         for (i, &(best_c, min_dist)) in assignments.iter().enumerate() {
             labels[i] = best_c;
@@ -3870,10 +3870,7 @@ pub fn kmeans2(
         // Assign each observation to its nearest current centroid. kmeans2 only
         // needs labels, so bypass vq's Euclidean-distance sqrt/output vector.
         flatten_centroids_into(&code_book, d, &mut centroids_flat);
-        let assignments = assign_points(&data_flat, data.len(), &centroids_flat, nc, d);
-        for (dst, &(best_c, _)) in label.iter_mut().zip(assignments.iter()) {
-            *dst = best_c;
-        }
+        assign_points(&data_flat, data.len(), &centroids_flat, nc, d, &mut label);
         // Recompute centroids as the mean of assigned observations.
         for row in sums.iter_mut() {
             row.iter_mut().for_each(|x| *x = 0.0);
@@ -6424,17 +6421,20 @@ fn flatten_centroids_into(centroids: &[Vec<f64>], d: usize, flat: &mut Vec<f64>)
 ///    full and broken by lowest index (`sd == min_sq && c < best_c`), so the
 ///    result is independent of the seed and bit-identical to the naive argmin.
 #[inline]
-// Assign every point to its nearest centroid, returning the label and squared
-// distance per point. For large n*k*d the points are split across threads; each pair
-// comes from the same pure `nearest_centroid`, so the per-point result is
-// bit-identical and order is preserved (the caller sums inertia sequentially).
+// Assign every point to its nearest centroid.  The small-k route is a
+// GEMM-shaped `X × Cᵀ` kernel: one point row multiplies against every centroid
+// column at once from the dimension-major centroid packing.  The scratch is
+// allocated once per worker, not once per point; its accumulation order within
+// each centroid remains ascending dimension order, matching `sq_dist` exactly.
 fn assign_points(
     data_flat: &[f64],
     n: usize,
     centroids_flat: &[f64],
     k: usize,
     d: usize,
-) -> Vec<(usize, f64)> {
+    labels: &mut [usize],
+) {
+    debug_assert_eq!(labels.len(), n);
     let work = (n as u64)
         .saturating_mul(k as u64)
         .saturating_mul(d.max(1) as u64);
@@ -6457,8 +6457,70 @@ fn assign_points(
             .min(n / 32)
             .max(1)
     };
+    // `kmeans2` is repeatedly called at k=32/d=16.  Packing Cᵀ once per Lloyd
+    // step lets the inner dimension-major kernel expose independent centroid
+    // lanes to SIMD, while preserving each distance's exact reduction order.
+    let gemm_scan = k <= NEAREST_FULL_SCAN_MAX_K && !(k == 4 && d == 4);
+    let centroids_soa = gemm_scan.then(|| centroids_to_soa(centroids_flat, k, d));
     // Contiguous flat layout (n×d): points are read sequentially (cache-friendly + auto-
     // vectorizable) instead of chasing `Vec<Vec<f64>>` heap pointers.
+    if nthreads <= 1 {
+        let mut scratch = vec![0.0; k];
+        for (i, label) in labels.iter_mut().enumerate() {
+            let point = &data_flat[i * d..i * d + d];
+            *label = if let Some(soa) = centroids_soa.as_deref() {
+                nearest_centroid_gemm(point, soa, k, d, &mut scratch).0
+            } else {
+                nearest_centroid(point, centroids_flat, k, d).0
+            };
+        }
+        return;
+    }
+    let chunk = n.div_ceil(nthreads);
+    std::thread::scope(|scope| {
+        for (t, label_chunk) in labels.chunks_mut(chunk).enumerate() {
+                let i0 = t * chunk;
+            let centroids_soa = centroids_soa.as_deref();
+            scope.spawn(move || {
+                let mut scratch = vec![0.0; k];
+                for (offset, label) in label_chunk.iter_mut().enumerate() {
+                    let i = i0 + offset;
+                    let point = &data_flat[i * d..i * d + d];
+                    *label = if let Some(soa) = centroids_soa {
+                        nearest_centroid_gemm(point, soa, k, d, &mut scratch).0
+                    } else {
+                        nearest_centroid(point, centroids_flat, k, d).0
+                    };
+                }
+            });
+        }
+    })
+}
+
+// `kmeans` needs the winning squared distances to preserve its ordered inertia
+// reduction and convergence criterion.  Keep that public-algorithm path
+// separate from `kmeans2`, which needs labels only and therefore avoids this
+// output allocation entirely.
+fn assign_points_with_distances(
+    data_flat: &[f64],
+    n: usize,
+    centroids_flat: &[f64],
+    k: usize,
+    d: usize,
+) -> Vec<(usize, f64)> {
+    let work = (n as u64)
+        .saturating_mul(k as u64)
+        .saturating_mul(d.max(1) as u64);
+    let nthreads = if work < 1 << 21 || n < 64 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(std::num::NonZero::get)
+            .unwrap_or(1)
+            .min(((work >> 20) as usize).max(1))
+            .min(n / 32)
+            .max(1)
+    };
     if nthreads <= 1 {
         return (0..n)
             .map(|i| nearest_centroid(&data_flat[i * d..i * d + d], centroids_flat, k, d))
@@ -6467,24 +6529,28 @@ fn assign_points(
     let chunk = n.div_ceil(nthreads);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..nthreads)
-            .filter_map(|t| {
-                let i0 = t * chunk;
-                if i0 >= n {
-                    return None;
-                }
-                let i1 = (i0 + chunk).min(n);
-                Some(scope.spawn(move || {
-                    (i0..i1)
-                        .map(|i| {
-                            nearest_centroid(&data_flat[i * d..i * d + d], centroids_flat, k, d)
-                        })
-                        .collect::<Vec<(usize, f64)>>()
-                }))
+            .filter_map(|thread| {
+                let start = thread * chunk;
+                (start < n).then(|| {
+                    let end = (start + chunk).min(n);
+                    scope.spawn(move || {
+                        (start..end)
+                            .map(|i| {
+                                nearest_centroid(
+                                    &data_flat[i * d..i * d + d],
+                                    centroids_flat,
+                                    k,
+                                    d,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
             })
             .collect();
         handles
             .into_iter()
-            .flat_map(|h| h.join().expect("kmeans assign worker panicked"))
+            .flat_map(|handle| handle.join().expect("kmeans assign worker panicked"))
             .collect()
     })
 }
@@ -6533,6 +6599,57 @@ fn accumulate_sq_dists_soa(point: &[f64], soa: &[f64], k: usize, d: usize, out: 
             *accumulator += difference * difference;
         }
     }
+}
+
+/// Dimension-major distance kernel plus a SIMD-screened stable argmin.
+///
+/// The matrix product is evaluated as `(point[j] - centroid[j])²` rather than
+/// `||x||² + ||c||² - 2x·c`; the latter changes rounding near a tie and can
+/// change a Lloyd assignment.  Independent centroid accumulators are still a
+/// GEMM-shaped row-by-column kernel, and the explicit SIMD comparison rejects
+/// whole groups that cannot beat the incumbent before the stable scalar tie
+/// break selects the first winning lane.
+#[inline]
+fn nearest_centroid_gemm(
+    point: &[f64],
+    centroids_soa: &[f64],
+    k: usize,
+    d: usize,
+    scratch: &mut [f64],
+) -> (usize, f64) {
+    accumulate_sq_dists_soa(point, centroids_soa, k, d, scratch);
+    let best = argmin_sq_dists_simd(&scratch[..k]);
+    (best, scratch[best])
+}
+
+#[inline]
+fn argmin_sq_dists_simd(values: &[f64]) -> usize {
+    use std::simd::{cmp::SimdPartialOrd, Simd};
+
+    let mut best = 0usize;
+    let mut minimum = values[0];
+    let mut base = 1usize;
+    while base + 4 <= values.len() {
+        let lanes = Simd::<f64, 4>::from_slice(&values[base..base + 4]);
+        if lanes.simd_lt(Simd::splat(minimum)).any() {
+            // Preserve the scalar path's ascending, strict-`<` tie break.
+            for lane in 0..4 {
+                let candidate = values[base + lane];
+                if candidate < minimum {
+                    minimum = candidate;
+                    best = base + lane;
+                }
+            }
+        }
+        base += 4;
+    }
+    for (offset, &candidate) in values[base..].iter().enumerate() {
+        if candidate < minimum {
+            minimum = candidate;
+            best = base + offset;
+        }
+    }
+    best
 }
 
 /// Transpose row-major centroids (`c * d + j`) into dimension-major (`j * k + c`).
@@ -11459,6 +11576,50 @@ mod tests {
         for (got_row, want_row) in got.0.iter().zip(want.0.iter()) {
             for (&g, &w) in got_row.iter().zip(want_row.iter()) {
                 assert_eq!(g.to_bits(), w.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn kmeans2_gemm_assignment_matches_vq_reference_bits() {
+        let data: Vec<Vec<f64>> = (0..96)
+            .map(|i| {
+                (0..16)
+                    .map(|j| ((i * 31 + j * 17) as f64 * 0.019).sin() + (i % 8) as f64)
+                    .collect()
+            })
+            .collect();
+        let init: Vec<Vec<f64>> = (0..8)
+            .map(|cluster| (0..16).map(|j| cluster as f64 + j as f64 * 0.03).collect())
+            .collect();
+
+        let mut expected_centroids = init.clone();
+        let mut expected_labels = vec![0usize; data.len()];
+        for _ in 0..5 {
+            expected_labels = vq(&data, &expected_centroids).expect("vq reference").0;
+            let mut sums = vec![vec![0.0; 16]; 8];
+            let mut counts = vec![0usize; 8];
+            for (point, &cluster) in data.iter().zip(&expected_labels) {
+                counts[cluster] += 1;
+                for (sum, &value) in sums[cluster].iter_mut().zip(point) {
+                    *sum += value;
+                }
+            }
+            for cluster in 0..8 {
+                if counts[cluster] > 0 {
+                    let inv = 1.0 / counts[cluster] as f64;
+                    for (centroid, &sum) in expected_centroids[cluster].iter_mut().zip(&sums[cluster]) {
+                        *centroid = sum * inv;
+                    }
+                }
+            }
+        }
+
+        let actual = kmeans2(&data, &init, 5).expect("gemm kmeans2");
+        assert_eq!(actual.1, expected_labels);
+        for (actual_row, expected_row) in actual.0.iter().zip(&expected_centroids) {
+            for (&actual, &expected) in actual_row.iter().zip(expected_row) {
+                assert_eq!(actual.to_bits(), expected.to_bits());
             }
         }
     }
