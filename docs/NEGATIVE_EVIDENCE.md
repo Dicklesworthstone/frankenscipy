@@ -42552,3 +42552,124 @@ provenance/ELF header. Existence is not a predicate for "can import scipy". The 
 probes the import itself, prefers the interpreter's own default path over a prepended
 site-packages, and refuses loudly naming every candidate it tried. Covered by
 `scipy_interpreter_probe_answers_both_ways`, whose **must-miss** arm is the load-bearing one.
+
+## 2026-08-30 - CopperFalcon (cc) - KEEP: splu's arm gate voted on the factor only, and the arm it picks is 3.947x worse at solving — declaring reuse flips the worst standing cell from 0.4421x to 1.6061x
+
+- **Bead: `frankenscipy-run7d`** (the whole-job convection cell), with the mechanism inherited
+  from `frankenscipy-llywn`. **Result class: CAMPAIGN-WIN.**
+  `Incumbent ratio: SciPy / FrankenSciPy = 1.6061x` on the lever's arm, against
+  `Incumbent ratio: SciPy / FrankenSciPy = 0.4421x` on the arm it replaces.
+- **What was wrong.** `splu` chooses between the envelope (RCM/banded) arm and the general arm
+  on FACTOR cost alone. The envelope arm stores the whole band, so it factors faster and then
+  pays for that band on **every** solve. `splu` exists to hand back a factorization *to be
+  reused*, so for its actual callers the gate was optimising the smaller half of the job.
+- **The lever.** `LuOptions::expected_solves` (default **1**, i.e. today's behaviour exactly,
+  so no existing caller moves and no recorded row is invalidated). Past
+  `SPLU_ENVELOPE_SOLVE_CROSSOVER` the DEFAULT ordering is substituted with AMD. That is the
+  whole mechanism: no arm flag is threaded anywhere, because the envelope arm's existing
+  structural gate declines an AMD-permuted matrix on its own — verified rather than assumed,
+  `banded_requested=true banded_factor_hits=0` with the banded path fully enabled. An
+  explicitly requested ordering is never overridden.
+- **Two named engine artifact SHA-256s.** Ours,
+  `frankenscipy_engine_sha256=742143238f3b86beca3977ff890a1da3e6f2614f66df012cede4dbc5eea06d85`,
+  self-reported from inside the process, `elf_path=target/release/perf_splu`, built on **rch
+  worker `hz4`**
+  (`RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- cargo build -j 1 --release -p fsci-sparse --bin perf_splu`)
+  and run OUTSIDE the build window; the legacy incumbent's,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (SciPy 1.17.1 SuperLU, `numpy=2.4.3`, `fsci_loaded=False`, `genuine=True`), **live in the
+  same invocation on identical fixture bytes**,
+  `fixture_sha256=fdbb4bdd81cb15eef6aef1455144774c7f46931258e9ad3b94ae0fc08cb5f991`.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` (SuperLU), LIVE and
+  side-by-side in the same-invocation balanced square on identical fixture bytes** —
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`, `fsci_loaded=False`, `genuine=True`. Both arms of every row below are timed
+  side-by-side within the same invocation, so the pipe enters neither number.
+- **HARNESS: `harness=perf_splu`, substrate
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`** (balanced square, `ABBAABBA`,
+  per-arm A/A null). Both arms were produced by this one harness and this one binary.
+- **WHERE BOTH ARMS RAN: `same_host=thinkstation1`, both arms, back to back, one pinned CPU
+  (`taskset -c 4`).** The rch worker `hz4` BUILT the ELF and measured nothing; no timed row
+  here was taken on an rch worker.
+- **HARDWARE / THREAD PROVENANCE, verbatim from the process:**
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+      loadavg=9.03 9.40 9.98
+
+  Restated in the ledger's own field names, same values:
+  `executed-binary sha256=742143238f3b86beca3977ff890a1da3e6f2614f66df012cede4dbc5eea06d85`,
+  `requested_threads=1`, `actual_observed_worker_threads=1`, `logical_threads=64`,
+  `physical_cores=32`, `ram_bytes=231687815168`, `numa_count=1`,
+  `scaling_governor=powersave`, `runtime_isa=avx2+fma`, `affinity=1 (taskset -c 4)`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.137)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.227)` on the OFF arm and
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.195)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.109)` on the ON arm. Host-wide
+  quiescence is NOT_CERTIFIED and is reported, not relaxed (`frankenscipy-fr78g`).
+- **DECISION RULE: bootstrap-median CI only, never cv.** `decided_if_ci_lo>1.0211_or_ci_hi<0.9789`
+  (OFF) and `decided_if_ci_lo>1.0171_or_ci_hi<0.9829` (ON); **CV is provenance only**. The
+  **2x A/A-null margin** is cleared with room to spare: worst null edge on either arm is
+  0.0106, so a 2x margin demands the ratio sit outside [0.9788, 1.0212], and the two CIs
+  ([0.4355,0.4492] and [1.5638,1.6198]) are not merely outside it but disjoint from each other.
+
+- **THE ROWS.** `SciPy / FrankenSciPy`, so >1 is a win for us. Convection-diffusion 2-D,
+  `side=128`, `n=16384`, `nnz=81408`, 21 rounds, 4 warmup, `quiescence=clear` on all four:
+
+  | stage | lever OFF (`declared_solves=1`) | lever ON (`declared_solves=16`) |
+  |---|---|---|
+  | solve, 16 RHS | **0.4421x** [0.4355, 0.4492], 52.015 ms | **1.6061x** [1.5638, 1.6198], 13.178 ms |
+  | factor | 0.6334x [0.6297, 0.6390], 59.407 ms | 0.4623x [0.4587, 0.4648], 76.408 ms |
+
+  The solve rows are the claim: **3.947x, and the cell crosses from 2.26x SLOWER than SuperLU
+  to 1.61x FASTER.** The factor rows are quoted because the trade must be stated whole — the
+  substitution costs **1.29x on the factor**, and a row that reported only the solve would be
+  quoting the good half. (The factor pair was taken on the predecessor ELF
+  `888aa2f7989cde0eb7be76ec291160432d5f35e522f45d0b2e82c88c54e00863`, which differs from the
+  shipped one ONLY in the value of `SPLU_ENVELOPE_SOLVE_CROSSOVER`; both measured points, 1
+  and 16, fall on the same side of both candidate values, so the routing exercised is
+  identical. Labelled rather than silently pooled.)
+
+  Commands, verbatim (`SCIPY_PYTHON=/home/ubuntu/.local/bin/python3.13`):
+  `FSCI_SPLU_STAGE=solve FSCI_SPLU_EXPECTED_SOLVES=1|16 taskset -c 4 ./target/release/perf_splu 128 21 4 off convection on off on off`
+  and the same without `FSCI_SPLU_STAGE` for the factor stage.
+- **TWO-SIDED DRIVER CONTROL, both arms observed.** OFF reports
+  `declared_solves=1 reuse_ordering_hits=0 fsci_ordering_after=ReverseCuthillMcKee` with
+  `banded_factor_hits=1`; ON reports
+  `declared_solves=16 reuse_ordering_hits=1 fsci_ordering_after=Amd` with
+  `banded_factor_hits=0`. Factor payload 34,337,296 B against 9,284,128 B — a 3.70x smaller
+  factor is why each solve is cheaper, and it is the same quantity that makes the factor
+  dearer to build. Parity gated before any timing.
+
+### The constant was WRONG on first measurement, and the correction is the transferable part
+
+`SPLU_ENVELOPE_SOLVE_CROSSOVER` shipped at **8**, not the **3** it was first written as. Two
+estimates of the same crossover on the same cell disagreed:
+
+    binary            factor difference   solve difference   crossover
+    428fb95f…0469          5.99 ms          2.330 ms/RHS       k = 2.57
+    888aa2f7…0863         17.00 ms          2.410 ms/RHS       k = 7.05
+
+The solve term is stable to 3%. The entire disagreement lives in the factor difference, which
+moved 2.8-fold between windows — and that term is **a difference of two large and nearly equal
+numbers**, which is exactly the shape that is unstable when the host is not quiet. A threshold
+of 3 would have fired the lever across `3..=7`, where this cell still prefers the arm it has.
+
+**The rule: when two windows disagree about a crossover, take the CONSERVATIVE one.** The lever
+then only fires where both estimates agree it wins. This generalises past this bead — any gate
+whose threshold is a ratio of *differences* rather than of levels inherits the instability of
+the smaller difference, and should be sized from the estimate that fires it least.
+
+### Two harness notes, both of which cost time to establish
+
+- **`--periodic-cuboid-spsolve-live` could not be used**, for two independent reasons: it
+  requires `TRJ_BOOKING_CLAIM_MESSAGE_ID` from the agent-mail build-slot service, which is
+  still disabled server-side — `acquire_build_slot` answers *"Build slots are disabled"*
+  (`frankenscipy-fr78g`) — and it measures the PERIODIC CUBOID fixture, not convection. The
+  balanced-square harness was created for precisely this situation and is the sanctioned
+  substitute; no gate was weakened or bypassed to produce the rows above.
+- The lever is driven **through the public gate**, not around it. The same routing can be
+  produced with `FSCI_SPLU_ORDERING=amd`, and that is how it was first observed, but that
+  bypasses the predicate under test and would report a number for a decision path no caller
+  takes. `FSCI_SPLU_EXPECTED_SOLVES` exercises `LuOptions::expected_solves` itself.

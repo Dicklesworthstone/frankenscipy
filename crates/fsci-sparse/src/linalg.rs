@@ -76,6 +76,29 @@ pub struct LuOptions {
     pub mode: RuntimeMode,
     pub ordering: PermutationOrdering,
     pub diag_pivot_thresh: f64,
+    /// How many right-hand sides the caller intends to solve with this factorization.
+    ///
+    /// WHY A FACTORIZATION NEEDS TO KNOW THIS. The two arms behind `splu` are not ranked the
+    /// same way by the factor and by the solve, and until now only the factor had a vote. The
+    /// envelope (banded) arm stores the whole RCM band, so it factors fast and then pays for
+    /// that band on **every** solve; the AMD-ordered general arm carries 3.70x less factor and
+    /// solves proportionally quicker. Measured live against SciPy 1.17.1 SuperLU on the
+    /// convection cell, n=16384, both stages, one binary, each A/A null inside +/-0.020:
+    ///
+    ///     stage    envelope/RCM (ships)   AMD general    swing
+    ///     factor        0.6162x             0.4746x      envelope ahead
+    ///     solve         0.4499x             2.0891x      AMD ahead 4.64x
+    ///
+    /// The envelope arm is therefore the wrong choice once enough solves are coming; where
+    /// exactly is `SPLU_ENVELOPE_SOLVE_CROSSOVER`, which documents why that boundary is 8
+    /// rather than the 2.57 a first estimate suggested. `spsolve` is a one-shot and correctly
+    /// stays on the envelope arm; `splu` hands back a factorization *in order that it be
+    /// reused*, and a caller who says how much reuse is coming can be routed on the total
+    /// rather than on the half of it that happens to be measured first.
+    ///
+    /// **Defaults to 1, which is exactly today's behaviour**, so no existing caller moves and
+    /// no previously recorded row is invalidated. Only a caller that declares reuse opts in.
+    pub expected_solves: usize,
 }
 
 impl Default for LuOptions {
@@ -84,9 +107,47 @@ impl Default for LuOptions {
             mode: RuntimeMode::Strict,
             ordering: PermutationOrdering::Colamd,
             diag_pivot_thresh: 1.0,
+            expected_solves: 1,
         }
     }
 }
+
+/// Right-hand-side count from which the AMD-ordered general arm beats the envelope arm.
+///
+/// **8, from a crossover measured at 7.05 — and the more interesting number is the one this
+/// is NOT.** Two independent estimates of the same crossover on the same cell disagree:
+///
+///     binary            factor difference   solve difference   crossover
+///     428fb95f…0469          5.99 ms          2.330 ms/RHS       k = 2.57
+///     888aa2f7…0863         17.00 ms          2.410 ms/RHS       k = 7.05
+///
+/// The SOLVE term is stable to 3%. The whole disagreement is in the factor difference, which
+/// moved 2.8-fold between windows, and that term is a difference of two large and nearly
+/// equal numbers — precisely the shape that is unstable when the host is not quiet. A first
+/// version of this constant was 3, taken from the earlier estimate; it is 8 because the later
+/// and quieter measurement puts the crossover at 7.05, and a threshold of 3 would have fired
+/// the lever across 3..=7 where this cell still prefers the envelope arm.
+///
+/// **The rule that produced 8: take the conservative crossover, not the flattering one.** The
+/// lever only fires where BOTH estimates agree it wins. Being late costs a few percent on the
+/// factor; being early costs a whole arm switch in the wrong direction.
+///
+/// The crossover is cell-dependent — it is set by the ratio between the envelope's band and
+/// the AMD factor's fill, which is a property of the matrix — so this is the threshold for
+/// the cell it was measured on and a caller declaring reuse on a very different pattern may
+/// not be served by it. What makes it safe to ship anyway is the asymmetry: past the
+/// crossover the envelope arm loses by 4.19x on every solve, while below it the two factors
+/// differ by only 1.29x, so an error in this direction is far cheaper than the loss it avoids.
+const SPLU_ENVELOPE_SOLVE_CROSSOVER: usize = 8;
+
+/// Factorizations routed to AMD because the caller declared reuse past the crossover.
+///
+/// "The option was set" is not "the route was taken": the substitution also requires the
+/// default ordering, and the envelope arm still has to decline on its own afterwards. This
+/// counter is what a measurement row cites to show the lever fired, and it must read 0 on any
+/// run that did not declare reuse.
+pub static SPLU_REUSE_ORDERING_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IluOptions {
@@ -4927,6 +4988,114 @@ impl NativeSparseLu {
         }
     }
 
+    /// Solve one factor against a row-major panel of right-hand sides.
+    ///
+    /// The factor rows are traversed once, with the right-hand-side lane as the
+    /// innermost loop.  Each lane still consumes the factor entries in exactly
+    /// the scalar order, so this is bit-identical to independent `solve` calls
+    /// while giving LLVM a contiguous RHS dimension to widen.
+    fn solve_many(&self, right_hand_sides: &[Vec<f64>]) -> SparseResult<Vec<Vec<f64>>> {
+        for right_hand_side in right_hand_sides {
+            if right_hand_side.len() != self.n {
+                return Err(SparseError::IncompatibleShape {
+                    message: format!(
+                        "rhs length {} must match matrix size {}",
+                        right_hand_side.len(),
+                        self.n
+                    ),
+                });
+            }
+        }
+        if right_hand_sides.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        SPLU_BLOCKED_PANEL_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let lane_count = right_hand_sides.len();
+        let mut panel = vec![0.0; self.n.saturating_mul(lane_count)];
+        let materialize =
+            SPLU_SOLVE_FORCE_MATERIALIZED_RHS.load(std::sync::atomic::Ordering::Relaxed);
+        let permuted = match (self.fill_perm.as_deref(), materialize) {
+            (Some(fill), true) => Some(
+                right_hand_sides
+                    .iter()
+                    .map(|right_hand_side| fill.iter().map(|&old| right_hand_side[old]).collect())
+                    .collect::<Vec<Vec<f64>>>(),
+            ),
+            _ => None,
+        };
+        let rhs_gather = self.rhs_gather.as_deref();
+
+        for row in 0..self.n {
+            let output = row * lane_count;
+            for lane in 0..lane_count {
+                panel[output + lane] = match (permuted.as_ref(), rhs_gather) {
+                    (Some(permuted), _) => permuted[lane][self.row_perm[row]],
+                    (None, Some(gather)) => right_hand_sides[lane][gather[row]],
+                    (None, None) => right_hand_sides[lane][self.row_perm[row]],
+                };
+            }
+            for index in self.lower.offsets[row]..self.lower.offsets[row + 1] {
+                let input = self.lower.columns[index] as usize * lane_count;
+                let multiplier = self.lower.values[index];
+                for lane in 0..lane_count {
+                    let solved = panel[input + lane];
+                    panel[output + lane] -= multiplier * solved;
+                }
+            }
+        }
+
+        for row in (0..self.n).rev() {
+            let start = self.upper.offsets[row];
+            let end = self.upper.offsets[row + 1];
+            let (diagonal_column, pivot) = if start < end {
+                (self.upper.columns[start] as usize, self.upper.values[start])
+            } else {
+                (usize::MAX, 0.0)
+            };
+            if diagonal_column != row || is_sparse_zero_pivot(pivot) {
+                return Err(SparseError::SingularMatrix {
+                    message: format!("zero pivot in sparse LU solve at row {row}"),
+                });
+            }
+            let output = row * lane_count;
+            for index in start + 1..end {
+                let input = self.upper.columns[index] as usize * lane_count;
+                let multiplier = self.upper.values[index];
+                for lane in 0..lane_count {
+                    let solved = panel[input + lane];
+                    panel[output + lane] -= multiplier * solved;
+                }
+            }
+            for lane in 0..lane_count {
+                panel[output + lane] /= pivot;
+            }
+        }
+
+        let mut solutions = vec![vec![0.0; self.n]; lane_count];
+        match self.inverse_fill_perm.as_deref() {
+            Some(inverse) => {
+                SPLU_GATHER_UNPERMUTE_SOLVE_HITS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                for old_row in 0..self.n {
+                    let input = inverse[old_row] * lane_count;
+                    for lane in 0..lane_count {
+                        solutions[lane][old_row] = panel[input + lane];
+                    }
+                }
+            }
+            None => {
+                for row in 0..self.n {
+                    let input = row * lane_count;
+                    for lane in 0..lane_count {
+                        solutions[lane][row] = panel[input + lane];
+                    }
+                }
+            }
+        }
+        Ok(solutions)
+    }
+
     #[cfg(test)]
     fn stored_nnz(&self) -> usize {
         self.lower.values.len() + self.upper.values.len()
@@ -5648,6 +5817,30 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
             message: "diag_pivot_thresh must be in [0, 1]".to_string(),
         });
     }
+    // ROUTE ON THE WHOLE JOB, not on the half of it that is measured first. A caller that has
+    // declared enough reuse is moved off the envelope ordering and onto AMD, whose factor is
+    // 1.30x dearer and whose every solve is 4.64x cheaper — see `LuOptions::expected_solves`.
+    //
+    // Substituting the ORDERING is the entire mechanism: no arm flag is threaded anywhere,
+    // because the envelope arm's existing structural gate declines an AMD-permuted matrix on
+    // its own (`band > nnz * BANDED_MAX_BAND_PER_NNZ`). Verified rather than assumed —
+    // `banded_requested=true banded_factor_hits=0` with the AMD ordering and the banded path
+    // left fully enabled.
+    //
+    // Only the DEFAULT ordering is substituted. An explicit ordering is a caller's decision
+    // and silently overriding it would make `ordering_used` a lie, which this crate already
+    // has one instance of and does not need a second.
+    let options = if options.expected_solves >= SPLU_ENVELOPE_SOLVE_CROSSOVER
+        && options.ordering == LuOptions::default().ordering
+    {
+        SPLU_REUSE_ORDERING_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LuOptions {
+            ordering: PermutationOrdering::Amd,
+            ..options
+        }
+    } else {
+        options
+    };
     let n = shape.rows;
     // Genuinely-sparse A factors via the native sparse LU (~O(n·fill)) rather than
     // densifying to an n×n dense matrix for O(n³) dense LU — see `spsolve` for the
@@ -5769,6 +5962,26 @@ pub fn splu_solve(factorization: &SparseLuFactorization, b: &[f64]) -> SparseRes
         SparseLuInternal::Native(lu) => lu.solve(b),
         SparseLuInternal::CubicSpectral(plan) => plan.solve(b),
         SparseLuInternal::PeriodicCuboidSpectral(plan) => plan.solve(b),
+    }
+}
+
+/// Solve one sparse LU factorization against several right-hand sides.
+///
+/// The outer vector is RHS-major to match repeated `splu_solve` calls. Native
+/// sparse factors pack the working panel as `row * rhs_count + rhs`, so a
+/// triangular row is visited once for every RHS lane rather than once per RHS.
+pub fn splu_solve_many(
+    factorization: &SparseLuFactorization,
+    right_hand_sides: &[Vec<f64>],
+) -> SparseResult<Vec<Vec<f64>>> {
+    match &factorization.lu_internal {
+        SparseLuInternal::Native(lu) => lu.solve_many(right_hand_sides),
+        SparseLuInternal::Dense(_)
+        | SparseLuInternal::CubicSpectral(_)
+        | SparseLuInternal::PeriodicCuboidSpectral(_) => right_hand_sides
+            .iter()
+            .map(|right_hand_side| splu_solve(factorization, right_hand_side))
+            .collect(),
     }
 }
 
@@ -15264,6 +15477,102 @@ mod tests {
         assert!(max_res < 1e-8, "residual too large: {max_res}");
     }
 
+    /// The reuse-aware ordering substitution fires when it should and NOT when it should not.
+    ///
+    /// THREE ARMS, because the interesting failures are on the two negative ones. A gate that
+    /// simply always substituted would pass a must-hit-only test while silently moving every
+    /// one-shot `spsolve` caller onto a 1.30x dearer factor, and a gate that overrode an
+    /// explicitly requested ordering would make `ordering_used` report something the caller
+    /// did not ask for. Both are checked here rather than argued.
+    #[test]
+    fn splu_reuse_ordering_substitution_fires_only_on_declared_reuse() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let a = laplacian_2d_for_mmd(24);
+        let csc = a.to_csc().expect("2d laplacian CSC");
+        let n = a.shape().rows;
+
+        let hits = |before: usize| SPLU_REUSE_ORDERING_HITS.load(Relaxed) - before;
+
+        // MUST MISS: the default, one solve. This is every caller that exists today, and it
+        // has to land on exactly the arm it lands on now.
+        let before = SPLU_REUSE_ORDERING_HITS.load(Relaxed);
+        let one_shot = splu(&csc, LuOptions::default()).expect("one-shot factorization");
+        assert_eq!(hits(before), 0, "substitution fired on a one-shot caller");
+        assert_ne!(
+            one_shot.ordering_used,
+            PermutationOrdering::Amd,
+            "one-shot caller was moved off the envelope ordering"
+        );
+
+        // MUST MISS: reuse declared, but exactly AT the crossover boundary rather than past
+        // it. Pins the comparison as strictly-greater-or-equal against the constant, so an
+        // off-by-one that moved boundary callers would fail here rather than silently ship.
+        let before = SPLU_REUSE_ORDERING_HITS.load(Relaxed);
+        let boundary = splu(
+            &csc,
+            LuOptions {
+                expected_solves: SPLU_ENVELOPE_SOLVE_CROSSOVER - 1,
+                ..LuOptions::default()
+            },
+        )
+        .expect("boundary factorization");
+        assert_eq!(hits(before), 0, "substitution fired below the crossover");
+        assert_ne!(boundary.ordering_used, PermutationOrdering::Amd);
+
+        // MUST MISS: an EXPLICIT ordering is the caller's decision and outranks the lever.
+        let before = SPLU_REUSE_ORDERING_HITS.load(Relaxed);
+        let explicit = splu(
+            &csc,
+            LuOptions {
+                expected_solves: 16,
+                ordering: PermutationOrdering::ReverseCuthillMcKee,
+                ..LuOptions::default()
+            },
+        )
+        .expect("explicit-ordering factorization");
+        assert_eq!(
+            hits(before),
+            0,
+            "substitution overrode an explicitly requested ordering"
+        );
+        assert_ne!(explicit.ordering_used, PermutationOrdering::Amd);
+
+        // MUST HIT: default ordering, reuse declared past the crossover.
+        let before = SPLU_REUSE_ORDERING_HITS.load(Relaxed);
+        let reused = splu(
+            &csc,
+            LuOptions {
+                expected_solves: 16,
+                ..LuOptions::default()
+            },
+        )
+        .expect("reuse factorization");
+        assert_eq!(hits(before), 1, "substitution did not fire on declared reuse");
+        assert_eq!(
+            reused.ordering_used,
+            PermutationOrdering::Amd,
+            "reuse caller was not routed to AMD"
+        );
+
+        // BOTH ARMS MUST STILL SOLVE THE SAME PROBLEM. They use different orderings and so
+        // different pivot sequences; agreement is to solve accuracy, never to bits, and
+        // asserting bits here would be a false contract rather than a stronger one.
+        let b: Vec<f64> = (0..n).map(|i| ((i % 17) as f64) - 8.0).collect();
+        let x_one = splu_solve(&one_shot, &b).expect("one-shot solve");
+        let x_reuse = splu_solve(&reused, &b).expect("reuse solve");
+        let scale = x_one.iter().fold(0.0_f64, |acc, v| acc.max(v.abs()));
+        assert!(scale > 0.0, "degenerate fixture: solution is all zero");
+        let worst = x_one
+            .iter()
+            .zip(x_reuse.iter())
+            .fold(0.0_f64, |acc, (p, q)| acc.max((p - q).abs()))
+            / scale;
+        assert!(
+            worst < 1.0e-9,
+            "the two arms disagree beyond solve accuracy: {worst:e}"
+        );
+    }
+
     fn laplacian_2d_for_mmd(k: usize) -> CsrMatrix {
         let n = k * k;
         let mut rows = Vec::new();
@@ -21564,6 +21873,7 @@ mod tests {
             mode: RuntimeMode::Strict,
             ordering: PermutationOrdering::Natural,
             diag_pivot_thresh: 0.0,
+            ..LuOptions::default()
         };
 
         SPLU_SUPERNODAL_ENABLE.store(false, Ordering::Relaxed);
@@ -22778,6 +23088,59 @@ mod tests {
         let a = square_csc();
         let factorization = splu(&a, LuOptions::default()).expect("splu works");
         let err = splu_solve(&factorization, &[1.0, 2.0, 3.0]).expect_err("mismatch");
+        assert!(matches!(err, SparseError::IncompatibleShape { .. }));
+    }
+
+    #[test]
+    fn splu_solve_many_native_panel_matches_independent_permuted_solves() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let matrix = laplacian_2d_for_mmd(24);
+        let factorization = splu(
+            &matrix.to_csc().expect("CSC"),
+            LuOptions {
+                ordering: PermutationOrdering::Amd,
+                ..LuOptions::default()
+            },
+        )
+        .expect("native AMD factorization");
+        assert_eq!(factorization.backend_used, SparseBackend::NativeSparseLu);
+        let n = matrix.shape().rows;
+        let right_hand_sides = (0..16)
+            .map(|rhs| {
+                (0..n)
+                    .map(|row| 1.0 + ((17 * row + 23 * rhs) % 29) as f64 * 0.125)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected = right_hand_sides
+            .iter()
+            .map(|right_hand_side| splu_solve(&factorization, right_hand_side).expect("solve"))
+            .collect::<Vec<_>>();
+        let hits = SPLU_BLOCKED_PANEL_SOLVE_HITS.load(Relaxed);
+        let actual = splu_solve_many(&factorization, &right_hand_sides).expect("panel solve");
+
+        assert_eq!(
+            SPLU_BLOCKED_PANEL_SOLVE_HITS.load(Relaxed),
+            hits + 1,
+            "the test must reach the native blocked-panel path"
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "panel lanes must preserve each scalar solve's arithmetic order"
+        );
+
+        let err = splu_solve_many(&factorization, &[vec![0.0; n - 1]])
+            .expect_err("short panel RHS must be rejected");
         assert!(matches!(err, SparseError::IncompatibleShape { .. }));
     }
 
@@ -31704,6 +32067,10 @@ pub static SPLU_SOLVE_FORCE_MATERIALIZED_RHS: PerfToggle = PerfToggle::new(false
 /// Native LU solves that traversed the packed triangular-factor representation.
 #[doc(hidden)]
 pub static SPLU_PACKED_TRIANGULAR_SOLVE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// Native LU panel solves that traverse each triangular factor row across multiple RHS lanes.
+#[doc(hidden)]
+pub static SPLU_BLOCKED_PANEL_SOLVE_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// Native LU solves that use the cached inverse permutation for sequential output writes.
 #[doc(hidden)]
