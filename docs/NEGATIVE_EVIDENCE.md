@@ -42843,3 +42843,54 @@ the smaller difference, and should be sized from the estimate that fires it leas
   at solving there, and routing that cell to AMD really is worth 3.947x on the solve stage. The
   defect is in the ACTING, not in the observation. `run7d` keeps its measured deficit and now has
   a specified gate to build instead of a constant to tune.
+
+## 2026-08-30 - CopperFalcon (cc) - BEHAVIORAL REJECT: the predicted-totals arm gate I specified this morning is refuted by its own inputs — every symbolic term prefers the SAME arm on both cells, so the model cannot express the decision at all
+
+- **Bead: `frankenscipy-run7d`.** **Result class: BEHAVIORAL.** This row makes NO timing claim
+  and takes no timing decision. It refutes a DESIGN on structural grounds only; the measured arm
+  comparison it builds on lives in the withdrawal entry above, which carries its own live-SciPy
+  provenance, A/A nulls and bootstrap-median CIs, and is not restated here.
+- **`probe: arm_choice_model_is_separable_by_one_hardware_ratio`**, an `#[ignore]`d test in
+  `crates/fsci-sparse/src/linalg.rs`, re-runnable with
+  `cargo test --release -p fsci-sparse --lib -- --ignored arm_choice_model_is_separable_by_one_hardware_ratio`.
+  **Probe host: `same_host=thinkstation1`, no rch worker** — it ran local-wrapper-bypass because
+  `rch` refuses every `cargo test` verb with `missing_runtime` on every worker. The probe reads
+  symbolic structure only and never reads a clock, so it is host-independent by construction; the
+  host is named because the rule requires it, not because the result could vary with it.
+- **The design being refuted**, written into the withdrawal entry above before any of it existed:
+  compare the two arms' predicted totals, `R * (flops_amd - flops_env)` against
+  `k * (entries_env - entries_amd)`, leaving only a hardware ratio `R` as a constant while every
+  cell-dependent term stays symbolic.
+- **The probe observed these values and returned separable=false:**
+
+      cell                  env_entries   amd_entries   env_flops     amd_flops
+      cubic side=16           1,188,312       648,372   96,926,892   81,746,494
+      convection side=128     2,828,672       740,908  135,599,424   29,399,840
+
+- **THE REFUTATION.** `flops_amd < flops_env` AND `entries_amd < entries_env` on **both** cells.
+  The AMD arm does strictly less arithmetic and stores strictly less on every cell this repo
+  tracks. Every term in the model therefore prefers the same arm everywhere, so **no value of
+  `R`, and no monotone function of these quantities, can ever decline that arm** — including on
+  the cell where the withdrawal entry above records it losing. The gate is refuted on its inputs
+  rather than on its tuning, and the probe cost about a minute against the day of implementation
+  it would have taken to learn this afterwards.
+- **WHAT THIS ESTABLISHES, which is the transferable part.** The arm difference is not fill and
+  not arithmetic volume: both of those favour the arm that loses. It is per-flop EFFICIENCY. The
+  envelope arm walks a contiguous band with no index merging; the general arm runs a
+  data-branching two-pointer merge whose recorded mean run length is 9.938. **Every structural
+  gate attempted on this bead has measured WORK, and the quantity that decides is RATE.**
+- **Concrete retry predicate.** Do not build an arm gate on fill, flop counts, entry counts,
+  bandwidth, or any monotone combination of them — this row shows they cannot express the
+  decision. An admissible gate must estimate how efficiently each kernel executes its arithmetic, which is
+  structure-dependent (run length for the merge, band density for the envelope) and is not
+  recoverable from the symbolic pattern. The probe stays in the tree with its assertion
+  **inverted** to pin exactly this: it asserts AMD dominance on both terms, so if a future
+  ordering or symbolic change makes either term favour the envelope arm, it FAILS and the design
+  becomes worth revisiting.
+- **Probe integrity, two-arm control.** An all-infinite verdict is indistinguishable from a probe
+  that measured nothing, so the test asserts all four symbolic quantities are strictly non-zero
+  and that the entry advantage is strictly positive before drawing any conclusion from the
+  infinities.
+- **Where this leaves `run7d`:** the deficit stands and its cause is now stated precisely — our
+  general kernel does less work per element and executes it less efficiently. That is `llywn`'s density wall, and
+  it is the only remaining route. **There is no gate to write.**

@@ -15393,6 +15393,184 @@ mod tests {
         assert!(max_res < 1e-8, "residual too large: {max_res}");
     }
 
+    /// Can ONE hardware ratio decide the envelope-vs-AMD arm on BOTH cells? (frankenscipy-run7d)
+    ///
+    /// WHY THIS EXISTS. I shipped a gate keyed on the declared right-hand-side count alone and
+    /// withdrew it the same day: the crossover is 7.05 RHS on convection and 359.5 on cubic, a
+    /// 51-fold spread, so no constant `k` serves both. The replacement I specified compares the
+    /// two arms' PREDICTED TOTALS from symbolic quantities, leaving only a HARDWARE ratio as a
+    /// constant. That is only an improvement if a single such ratio actually separates the two
+    /// cells' known-correct decisions — and sizing it on one cell is precisely the error being
+    /// corrected, so it is sized on both here or not at all.
+    ///
+    /// THE MODEL. Solve cost tracks stored entries (each solve streams the factor once); factor
+    /// cost tracks flops. Choosing the general arm is right when
+    ///   `R * (flops_amd - flops_env)  <  k * (entries_env - entries_amd)`
+    /// with `R = (ns per flop) / (ns per stored entry per solve)`. `R` is a property of the
+    /// machine; every cell-dependent term is symbolic and computed here.
+    ///
+    /// GROUND TRUTH the predicate must reproduce, both measured live against SciPy with passing
+    /// A/A nulls: at k=16 convection MUST choose AMD (solve 0.4421x -> 1.6061x) and cubic MUST
+    /// keep the envelope (whole job 41.34 ms -> 113.29 ms if it switches).
+    #[test]
+    #[ignore]
+    fn arm_choice_model_is_separable_by_one_hardware_ratio() {
+        /// Stored entries and elimination flops of the SYMBOLIC factor under `ordering`.
+        fn symbolic_cost(matrix: &CsrMatrix, ordering: PermutationOrdering) -> (u64, u64) {
+            let n = matrix.shape().rows;
+            let fill_perm = sparse_lu_fill_ordering(matrix, n, ordering).0;
+            let rows = match &fill_perm {
+                Some(p) => permuted_sorted_rows(matrix, p),
+                None => csr_sorted_rows(matrix),
+            };
+            let initial: Vec<Vec<u32>> = rows.iter().map(|r| r.live_cols().to_vec()).collect();
+            let (u_pattern, l_pattern) = symbolic_fill_pattern(n, &initial);
+            let entries: u64 = u_pattern.iter().map(|r| r.len() as u64).sum::<u64>()
+                + l_pattern.iter().map(|r| r.len() as u64).sum::<u64>();
+            // Right-looking flops: at pivot k the update is |L(:,k)| x |U(k,:)|.
+            let mut l_column = vec![0u64; n];
+            for cols in &l_pattern {
+                for &c in cols {
+                    if (c as usize) < n {
+                        l_column[c as usize] += 1;
+                    }
+                }
+            }
+            let flops: u64 = (0..n)
+                .map(|k| l_column[k] * (u_pattern[k].len().saturating_sub(1) as u64))
+                .sum();
+            (entries, flops)
+        }
+
+        /// Envelope (band) entries under the ordering the banded arm actually uses.
+        fn envelope_entries(matrix: &CsrMatrix, ordering: PermutationOrdering) -> u64 {
+            let n = matrix.shape().rows;
+            let fill_perm = sparse_lu_fill_ordering(matrix, n, ordering).0;
+            let rows = match &fill_perm {
+                Some(p) => permuted_sorted_rows(matrix, p),
+                None => csr_sorted_rows(matrix),
+            };
+            let (mut lo, mut hi): (Vec<usize>, Vec<usize>) = ((0..n).collect(), (0..n).collect());
+            for (row, sorted) in rows.iter().enumerate() {
+                for &column in sorted.live_cols() {
+                    let column = column as usize;
+                    lo[row] = lo[row].min(column);
+                    hi[row] = hi[row].max(column);
+                    lo[column] = lo[column].min(row);
+                    hi[column] = hi[column].max(row);
+                }
+            }
+            let mut reach = vec![0usize; n];
+            for row in 0..n {
+                reach[lo[row]] = reach[lo[row]].max(row);
+            }
+            let mut furthest = 0usize;
+            for column in 0..n {
+                furthest = furthest.max(reach[column]);
+                hi[column] = hi[column].max(furthest.max(column));
+            }
+            (0..n).map(|i| (hi[i] - lo[i] + 1) as u64).sum()
+        }
+
+        // The envelope arm ships under the DEFAULT ordering, which maps to RCM here.
+        let envelope_ordering = LuOptions::default().ordering;
+        let cells: [(&str, CsrMatrix, bool); 2] = [
+            ("cubic side=16", splu_dirichlet_laplacian_3d(16), false),
+            ("convection side=128", convection_diffusion_2d_probe(128), true),
+        ];
+
+        let mut rows = Vec::new();
+        for (label, matrix, amd_is_right) in cells {
+            let env_entries = envelope_entries(&matrix, envelope_ordering);
+            let (_env_sym_entries, env_flops) = symbolic_cost(&matrix, envelope_ordering);
+            let (amd_entries, amd_flops) = symbolic_cost(&matrix, PermutationOrdering::Amd);
+            // R below which the predicate picks AMD at k = 16.
+            let k = 16u64;
+            let entry_gain = env_entries as i128 - amd_entries as i128;
+            let flop_penalty = amd_flops as i128 - env_flops as i128;
+            let r_boundary = if flop_penalty > 0 {
+                (k as i128 * entry_gain) as f64 / flop_penalty as f64
+            } else {
+                f64::INFINITY
+            };
+            println!(
+                "{label}: env_entries={env_entries} amd_entries={amd_entries} \
+                 env_flops={env_flops} amd_flops={amd_flops} entry_gain={entry_gain} \
+                 flop_penalty={flop_penalty} R_boundary_at_k16={r_boundary:.6} \
+                 amd_is_right={amd_is_right}"
+            );
+            assert!(
+                env_entries > 0 && amd_entries > 0 && env_flops > 0 && amd_flops > 0,
+                "{label}: symbolic_cost returned a degenerate zero -- the probe is measuring \
+                 nothing and its all-infinite verdict would be vacuous"
+            );
+            assert!(
+                entry_gain > 0,
+                "{label}: AMD does not store fewer entries; the refutation below assumes it does"
+            );
+            rows.push((label, amd_is_right, r_boundary));
+        }
+
+        // THE RESULT, PINNED: no monotone gate on flops-and-entries can work, because BOTH
+        // quantities favour AMD on BOTH cells while AMD is measured 3.705x SLOWER on cubic.
+        // A model whose every term prefers one arm cannot decline that arm anywhere, so the
+        // predicted-totals gate is refuted on its own inputs. This assertion is the finding,
+        // not a placeholder: if a future ordering or symbolic change makes either quantity
+        // favour the envelope arm somewhere, this fails and the design becomes worth revisiting.
+        for (label, _, r_boundary) in &rows {
+            assert!(
+                r_boundary.is_infinite(),
+                "{label}: AMD no longer dominates on both flops and entries (boundary \
+                 {r_boundary}), so a predicted-totals gate may now be constructible -- \
+                 re-open frankenscipy-run7d's arm-choice design"
+            );
+        }
+        // MUST-DIFFER CONTROL on the probe itself: an all-infinite result would look the
+        // same if `symbolic_cost` silently returned zeros, so the entry counts are asserted
+        // non-trivial and AMD's advantage asserted in the direction the numbers claim.
+        for (label, _, _) in &rows {
+            println!("{label}: pinned as AMD-dominant on both symbolic terms");
+        }
+    }
+
+    /// run7d's convection-diffusion fixture, as the perf harness builds it.
+    fn convection_diffusion_2d_probe(side: usize) -> CsrMatrix {
+        const DIAGONAL: f64 = 4.001;
+        const WEST: f64 = -1.2;
+        const EAST: f64 = -0.8;
+        const VERTICAL: f64 = -1.0;
+        let n = side * side;
+        let mut data = Vec::new();
+        let mut indices = Vec::new();
+        let mut indptr = vec![0usize];
+        for row in 0..side {
+            for column in 0..side {
+                let index = row * side + column;
+                if row > 0 {
+                    indices.push(index - side);
+                    data.push(VERTICAL);
+                }
+                if column > 0 {
+                    indices.push(index - 1);
+                    data.push(WEST);
+                }
+                indices.push(index);
+                data.push(DIAGONAL);
+                if column + 1 < side {
+                    indices.push(index + 1);
+                    data.push(EAST);
+                }
+                if row + 1 < side {
+                    indices.push(index + side);
+                    data.push(VERTICAL);
+                }
+                indptr.push(data.len());
+            }
+        }
+        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+            .expect("convection-diffusion CSR")
+    }
+
     fn laplacian_2d_for_mmd(k: usize) -> CsrMatrix {
         let n = k * k;
         let mut rows = Vec::new();
