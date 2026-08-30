@@ -16155,8 +16155,26 @@ mod tests {
         )
         .expect("level schedule has valid diagonals");
 
-        let expected = [0.71875, 1.3833333333333333, 2.25, 3.7];
-        for (index, (actual, reference)) in scheduled.iter().zip(expected).enumerate() {
+        let mut serial = vec![0.0; 4];
+        triangular_forward_substitute(
+            &lu.lower.offsets,
+            &lu.lower.columns,
+            &lu.lower.values,
+            |row| rhs[row],
+            &mut serial,
+            false,
+            None,
+        );
+        triangular_backward_substitute(
+            &lu.upper.offsets,
+            &lu.upper.columns,
+            &lu.upper.values,
+            &mut serial,
+            false,
+            None,
+        )
+        .expect("serial factor has valid diagonals");
+        for (index, (actual, reference)) in scheduled.iter().zip(serial).enumerate() {
             assert_eq!(
                 actual.to_bits(),
                 reference.to_bits(),
