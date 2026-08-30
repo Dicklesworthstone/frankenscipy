@@ -6341,6 +6341,33 @@ mod tests {
     use crate::hungarian_rectangular_reference;
     use fsci_runtime::RuntimeMode;
 
+    static NNLS_MODE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct NnlsModeRestore {
+        gram_blocked: bool,
+        direct_qr: bool,
+    }
+
+    impl NnlsModeRestore {
+        fn capture() -> Self {
+            use std::sync::atomic::Ordering;
+
+            Self {
+                gram_blocked: crate::NNLS_GRAM_BLOCKED.load(Ordering::Relaxed),
+                direct_qr: crate::NNLS_DIRECT_QR.load(Ordering::Relaxed),
+            }
+        }
+    }
+
+    impl Drop for NnlsModeRestore {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+
+            crate::NNLS_GRAM_BLOCKED.store(self.gram_blocked, Ordering::Relaxed);
+            crate::NNLS_DIRECT_QR.store(self.direct_qr, Ordering::Relaxed);
+        }
+    }
+
     use crate::{
         BasinhoppingOptions, Bounds, ConvergenceStatus, DifferentialEvolutionOptions,
         DifferentiateOptions, Integrality, LinearConstraint, MilpOptions, MilpProblem,
@@ -7217,7 +7244,11 @@ mod tests {
     #[test]
     fn nnls_gram_blocked_matches_rank1_sweep_bits() {
         use std::sync::atomic::Ordering;
-        let was = crate::NNLS_GRAM_BLOCKED.load(Ordering::Relaxed);
+        let _mode_lock = NNLS_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = NnlsModeRestore::capture();
+        crate::NNLS_DIRECT_QR.store(false, Ordering::Relaxed);
         let value = |i: usize, salt: usize| -> f64 {
             let k = (i * 2_654_435_761usize).wrapping_add(salt * 40_503) % 100_003;
             k as f64 / 100_003.0
@@ -7259,14 +7290,16 @@ mod tests {
         // Guards a silently-empty comparison: an early return in `nnls` would skip every
         // assertion above while the test still reported success.
         assert_eq!(compared, 6, "expected 6 compared cases, ran {compared}");
-        crate::NNLS_GRAM_BLOCKED.store(was, Ordering::Relaxed);
     }
 
     #[test]
     fn nnls_direct_qr_matches_normal_equations_and_scipy_pin() {
         use std::sync::atomic::Ordering;
 
-        let was = crate::NNLS_DIRECT_QR.load(Ordering::Relaxed);
+        let _mode_lock = NNLS_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = NnlsModeRestore::capture();
         let cases = [
             (
                 vec![
@@ -7306,12 +7339,16 @@ mod tests {
                 "residual: normal={normal_residual:.17e} qr={qr_residual:.17e}"
             );
         }
-        crate::NNLS_DIRECT_QR.store(was, Ordering::Relaxed);
     }
 
     #[test]
     fn nnls_direct_qr_matches_normal_equations_on_perf_fixture() {
         use std::sync::atomic::Ordering;
+
+        let _mode_lock = NNLS_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _restore = NnlsModeRestore::capture();
 
         let n = 256;
         let unit = |i: usize, salt: usize| -> f64 {
@@ -7325,8 +7362,6 @@ mod tests {
             .map(<[f64]>::to_vec)
             .collect();
         let b: Vec<f64> = (0..n).map(|i| 0.05 + unit(i, 29)).collect();
-        let was = crate::NNLS_DIRECT_QR.load(Ordering::Relaxed);
-
         crate::NNLS_DIRECT_QR.store(false, Ordering::Relaxed);
         let (normal_x, normal_residual) = nnls(&a, &b).expect("normal-equations arm");
         crate::NNLS_DIRECT_QR.store(true, Ordering::Relaxed);
@@ -7342,7 +7377,6 @@ mod tests {
             (normal_residual - qr_residual).abs() <= 1.0e-8,
             "residual: normal={normal_residual:.17e} qr={qr_residual:.17e}"
         );
-        crate::NNLS_DIRECT_QR.store(was, Ordering::Relaxed);
     }
 
     #[test]
