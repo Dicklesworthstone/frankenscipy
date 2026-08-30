@@ -42941,3 +42941,61 @@ the smaller difference, and should be sized from the estimate that fires it leas
   so the shipping kernel is unchanged, and the counts are STRUCTURAL, which per this ledger's own
   rule survives instrumentation where cost does not. The RCM rows are the must-miss control: a
   counter that incremented regardless would not report 0 there.
+
+## 2026-08-30 - CopperFalcon (cc) - REJECT (measured NULL, reverted): block-advancing the merge's target-only branch touches 40% of AMD's elements and buys nothing
+
+- **Bead: `frankenscipy-run7d`.** **Result class: REJECT.** Reverted in the same session; the
+  structural survey and the `target_runs` counter that reopened the lever stay, the lever does
+  not. The reopening was correct — the standing 0.6% really was measured where the branch is
+  zero — and the lever still does not pay.
+- **Legacy incumbent arm: SciPy 1.17.1 `scipy.sparse.linalg.splu` (SuperLU), LIVE and
+  side-by-side in the same-invocation balanced square on identical fixture bytes**,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`. **HARNESS `harness=perf_splu`**, substrate
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`. **Both arms ran on
+  `same_host=thinkstation1`**, back to back, `taskset -c 6`, from ONE binary:
+  `frankenscipy_engine_sha256=262bb7ca0f049ca860c3fd6961ebacabd4c91c6cbb1e3b9cc626c7c473d40c50`,
+  equivalently
+  `executed-binary sha256=262bb7ca0f049ca860c3fd6961ebacabd4c91c6cbb1e3b9cc626c7c473d40c50`,
+  built on **rch worker `hz4`**, run outside the build window.
+- `laplacian_3d_cubic` side=16, `n=4096`, `nnz=27136` input nonzeros, 21 rounds,
+  `host_identity=thinkstation1`, `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `physical_cores=32`, `logical_threads=64`, `ram_bytes=231687815168`, `numa_count=1`,
+  `scaling_governor=powersave`, `runtime_isa=avx2+fma`, `affinity=1 (taskset -c 6)`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.137)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.227)`. General arm with AMD
+  ordering, which is the only configuration where the branch fires at all.
+
+- **THE ROWS.** Decided from the bootstrap-median CI only, never cv; **CV is provenance only**:
+
+  | arm | fsci median | ci95 | A/A null scipy | A/A null fsci |
+  |---|---|---|---|---|
+  | block-advance OFF | 117.063 ms | [116.867, 117.962] | 0.9957 | 0.9967 |
+  | block-advance ON | 117.572 ms | [117.148, 118.112] | 1.0028 | 0.9981 |
+
+  `Incumbent ratio: SciPy / FrankenSciPy = 0.3420x` OFF and `0.3436x` ON. **The two fsci CIs
+  OVERLAP.** Worst null edge is 0.0043, so the **2x A/A-null margin** demands a separation
+  beyond 0.86%; the observed difference is **0.43%**, inside it and in the unfavourable
+  direction. **Not an effect in either direction.**
+- **Two-sided driver control, both arms observed**: `target_block_advance=false
+  target_block_advance_hits=0` against `target_block_advance=true
+  target_block_advance_hits=17936971`. The lever demonstrably ran on 17.9M merges and moved
+  nothing.
+- **Bit-identity was proven before timing**, by `merge_target_block_advance_is_bit_identical`
+  comparing both arms' L and U as raw `to_bits` plus their column arrays, under AMD with the
+  banded path scoped off and with the hit counter asserted non-zero on one arm and zero on the
+  other. The contract held; the speed did not follow.
+- **WHY 40% OF ELEMENTS BOUGHT NOTHING, which is the transferable part.** The mean target-only
+  stretch is 9.88 elements — about **79 bytes** per array. At that length a `copy_from_slice`
+  is not meaningfully cheaper than the ten indexed stores it replaces, and the block form adds
+  a `partition_point` binary search per stretch that the element form does not pay. The scalar
+  loop was already writing by index into a pre-sized buffer with no bounds-check growth, so the
+  usual reason a per-element loop loses had already been removed by an earlier lever.
+- **Concrete retry predicate.** Do not re-attempt block-advancing either non-matched branch on
+  an ELEMENT-SHARE argument: 40.4% of elements is now measured and it is worth nothing. The
+  only thing that would change this is a fixture whose mean stretch is far longer — the
+  crossover is where a copy beats an indexed store loop, well above ten elements — and the
+  stretch length is a property of the ordering, so it must be re-measured, not assumed.
+- **What the survey still establishes**, and it is not withdrawn: the standing note beside the
+  branch is wrong about the ENVELOPE ordering being representative, since `target_only` is 0
+  there and 40% under AMD. The premise was faulty; the conclusion happens to survive.
