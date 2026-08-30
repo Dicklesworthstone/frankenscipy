@@ -12703,19 +12703,61 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
 
     eigh_reduce_substage_record(0, t_gather);
 
+    // The scalar A/B arm covers the entire `dsyr2` preparation, not merely the
+    // final lower-triangle store below. Every SIMD lane here is independent;
+    // the dot product still consumes the scaled `p` terms in ascending row
+    // order, so no reduction is reassociated.
+    let force_scalar = EIGH_RANK2_UPDATE_FORCE_SCALAR.load(std::sync::atomic::Ordering::Relaxed);
     let mut v_dot_p = 0.0;
-    for row_offset in 0..active {
-        p[row_offset] *= reflector.tau;
-        v_dot_p += reflector.values[row_offset] * p[row_offset];
+    if force_scalar {
+        for row_offset in 0..active {
+            p[row_offset] *= reflector.tau;
+            v_dot_p += reflector.values[row_offset] * p[row_offset];
+        }
+    } else {
+        const LANES: usize = 8;
+        let mut row_offset = 0;
+        while row_offset + LANES <= active {
+            let scaled = Simd::<f64, LANES>::from_slice(&p[row_offset..row_offset + LANES])
+                * Simd::splat(reflector.tau);
+            scaled.copy_to_slice(&mut p[row_offset..row_offset + LANES]);
+            for (&v_row, &p_row) in reflector.values[row_offset..row_offset + LANES]
+                .iter()
+                .zip(scaled.to_array().iter())
+            {
+                v_dot_p += v_row * p_row;
+            }
+            row_offset += LANES;
+        }
+        for row_offset in row_offset..active {
+            p[row_offset] *= reflector.tau;
+            v_dot_p += reflector.values[row_offset] * p[row_offset];
+        }
     }
     let correction = 0.5 * reflector.tau * v_dot_p;
-    for row_offset in 0..active {
-        w[row_offset] = p[row_offset] - correction * reflector.values[row_offset];
+    if force_scalar {
+        for row_offset in 0..active {
+            w[row_offset] = p[row_offset] - correction * reflector.values[row_offset];
+        }
+    } else {
+        const LANES: usize = 8;
+        let mut row_offset = 0;
+        while row_offset + LANES <= active {
+            let p_lanes = Simd::<f64, LANES>::from_slice(&p[row_offset..row_offset + LANES]);
+            let v_lanes = Simd::<f64, LANES>::from_slice(
+                &reflector.values[row_offset..row_offset + LANES],
+            );
+            (p_lanes - Simd::splat(correction) * v_lanes)
+                .copy_to_slice(&mut w[row_offset..row_offset + LANES]);
+            row_offset += LANES;
+        }
+        for row_offset in row_offset..active {
+            w[row_offset] = p[row_offset] - correction * reflector.values[row_offset];
+        }
     }
 
     let t_update = eigh_reduce_substage_start();
     let data = matrix.as_mut_slice();
-    let force_scalar = EIGH_RANK2_UPDATE_FORCE_SCALAR.load(std::sync::atomic::Ordering::Relaxed);
     for col_offset in 0..active {
         let w_col = w[col_offset];
         let col = start + col_offset;
@@ -43912,7 +43954,7 @@ mod toggle_ab_eigh_rank2_update {
     // frankenscipy-0xy3l. One lock, crate-wide.
 
     #[test]
-    fn rank2_update_rewrite_is_bit_identical() {
+    fn rank2_update_simd_preparation_is_bit_identical() {
         let _g = crate::tests::eigh_toggle_lock();
 
         // MUST-HIT / MUST-MISS on the detector: this test's whole content is a
@@ -43978,9 +44020,9 @@ mod toggle_ab_eigh_rank2_update {
         assert!(
             first_diff.is_none(),
             "EIGH_RANK2_UPDATE_FORCE_SCALAR is documented BIT-IDENTICAL and is not: \
-             eigenvalues first differ at index {first_diff:?}. The rewrite only \
-             rebinds operands as slices, so any difference means it reassociated or \
-             contracted an FMA -- in which case the perf number it chases would be \
+             eigenvalues first differ at index {first_diff:?}. The SIMD preparation must \
+             preserve the scalar lane expression and dot-product order without \
+             reassociation or FMA contraction; otherwise the perf number it chases would be \
              measuring a different computation"
         );
 
