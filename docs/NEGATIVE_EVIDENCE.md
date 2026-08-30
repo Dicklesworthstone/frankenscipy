@@ -42673,3 +42673,98 @@ the smaller difference, and should be sized from the estimate that fires it leas
   produced with `FSCI_SPLU_ORDERING=amd`, and that is how it was first observed, but that
   bypasses the predicate under test and would report a number for a decision path no caller
   takes. `FSCI_SPLU_EXPECTED_SOLVES` exercises `LuOptions::expected_solves` itself.
+
+- **2026-08-30, `frankenscipy-mad5u` LOSS / reverted:** fusing the AMD absorb/prune/degree
+  element-list walks measured `SciPy / FrankenSciPy = 0.4588x` (CI95 `[0.4514, 0.4711]`),
+  below the clean `0.4627x` baseline; both same-invocation A/A nulls passed (`0.9859`,
+  `0.9876`) on live SciPy 1.17.1. The hunk was reverted. Evidence: bead comment 601,
+  ELF `73875fc571a5c2242c42d7f8eb94b1ea9802c9874a29fc3a9943b19139e79160`,
+  thinkstation1, RCH build worker hz4.
+
+## 2026-08-30 - CopperFalcon (cc) - REJECT (measured NULL, reverted): building splu's triangular level schedules lazily is ~1.2% of the factor stage, not the recoverable part of it
+
+- **Bead: `frankenscipy-mad5u`** (recover the 1.29x factor cost the reuse-aware arm gate pays).
+  **Result class: REJECT.** Change reverted to HEAD in the same session; nothing shipped.
+- **The hypothesis, and why it looked good.** `NativeSparseLu` builds two
+  `TriangularLevelSchedule`s at factor construction. They are read only where
+  `available_parallelism() > 1`, so under `requested_threads=1` — the regime every row in this
+  campaign is measured in — they were built for every factorization and never read once. Each
+  is a full pass over every stored entry plus a `Vec<Vec<usize>>` of per-level vectors, on a
+  factor with ~1.16M entries. Making them `OnceLock` and building on first use is bit-identical
+  (a derived index structure, no factor value changes) and strictly better-or-equal: removed
+  outright on one CPU, merely moved to the first solve on several.
+- **WHAT REFUTES IT: the stage counter cannot see an effect this small, and I can show that
+  rather than assert it.** The harness's in-process stage shares, same fixture and arm:
+
+      run                          ordering   setup   eliminate   assemble   one_time_share
+      eager  ELF 74214323, 9 rnd    15.04%    3.70%    65.46%     15.80%       0.3454
+      lazy   ELF 922f6fc5, 21 rnd   14.97%    3.59%    66.91%     14.53%       0.3309
+      lazy   ELF 922f6fc5, 9 rnd    12.82%    3.49%    67.57%     16.12%       0.3243
+
+  Taken as a pair, the first two look like assemble falling 15.80% -> 14.53% and would have
+  been quotable as a ~1.2%-of-factor saving. **The third run is the SAME lazy binary and
+  reports 16.12% — above the eager figure — so the two lazy windows BRACKET the eager one.**
+  The cross-window spread of this counter is at least as large as the effect being attributed
+  to the change, and the schedules are simply not a material part of the assemble stage.
+  Reported as a **NULL**, in neither direction; the vs-incumbent ratios (0.4675x eager,
+  0.4743x lazy, 0.4368x void) are likewise not resolvable and no effect is claimed from them.
+- **MEASURED SAME-INVOCATION A/A NULLS, both arms, both passing.** The two non-void rows
+  carry their own controls inside the invocation that produced them: the lazy 21-round row
+  reports A/A null scipy/scipy = 1.0007 and A/A null fsci/fsci = 0.9971 against the +/-0.020
+  bound (`null_edge=0.0029`), and the eager row reports A/A null scipy/scipy = 0.9878 and A/A
+  null fsci/fsci = 0.9901 (`null_edge=0.0122`). Both rows are `quiescence=clear`. The nulls
+  are what license the conclusion: with controls this tight, an effect of the size claimed for
+  the lazy schedules would have been visible, and it was not.
+- **THE THIRD ROW IS VOID AND SAYS SO**: `null_scipy=0.9469` against a +/-0.020 bound, at
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.426)` /
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.502)`. It is quoted for its STAGE
+  SHARES, which are an in-process decomposition rather than a cross-arm timing, and it is
+  named as void so it cannot be mistaken for a timing row. Its being void is part of the
+  point: the same load that voids a ratio also moves the stage shares.
+- **PROVENANCE.** `harness=perf_splu`, substrate
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`; `same_host=thinkstation1` for
+  every row, `taskset -c 6`. Two named engine artifact SHA-256s:
+  `frankenscipy_engine_sha256=922f6fc5f12bff9465395c6503645facb013dbdf2e4623a45b9e786f7343d679`
+  (lazy, self-reported in-process; equivalently
+  `executed-binary sha256=922f6fc5f12bff9465395c6503645facb013dbdf2e4623a45b9e786f7343d679`;
+  the eager arm is `74214323...6d85`), both built on rch worker `hz4`, and the incumbent's
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`
+  (SciPy 1.17.1 SuperLU, `numpy=2.4.3`), live in the same invocation on
+  `fixture_sha256=fdbb4bdd81cb15eef6aef1455144774c7f46931258e9ad3b94ae0fc08cb5f991`. Verbatim:
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+      loadavg=11.11 8.99 8.71
+
+  In the ledger's own field names: `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `logical_threads=64`, `physical_cores=32`, `ram_bytes=231687815168`, `numa_count=1`,
+  `scaling_governor=powersave`, `runtime_isa=avx2+fma`, `affinity=1 (taskset -c 6)`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.426)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.502)`.
+- **2x A/A-NULL MARGIN, applied and deliberately NOT met — which is the finding.** The worst
+  null edge across the two valid rows is 0.0122, so a 2x margin requires a ratio outside
+  [0.9756, 1.0244] before anything may be claimed. The lazy-versus-eager comparison produces
+  nothing remotely near that: the ratios are 0.4743x and 0.4675x against the SAME incumbent in
+  different windows, and their difference is well inside the band the margin demands be
+  cleared. **Failing the 2x margin is the reason this is a null and not a win.**
+- **DECISION RULE: bootstrap-median CI only, never cv; CV is provenance only.** No timing
+  decision is taken here at all — the row's conclusion is a null, and the one arm whose CI
+  would have decided anything failed its A/A null and is declared void above. The 2x
+  A/A-null margin is not met by any ratio here, which is precisely why nothing is claimed.
+- **Why it is reverted rather than kept as free hygiene.** It is strictly-better-or-equal work
+  removal, so keeping it would not be wrong — but it is unmeasurable on this cell, and it moves
+  a malformed-factor invariant check from factor time to the first solve. Shipping a semantic
+  change, however small, whose entire justification is a theory the counter refutes is how
+  unmeasured complexity accumulates. **A measured null is not a win.**
+- **Where the assemble stage actually goes, for whoever takes this next:** with the schedules
+  removed, ~14.5% of the factor remains in assemble, and it is dominated by
+  `PackedTriangularRows::from_rows` COPYING the jagged `Vec<Vec<(usize, f64)>>` elimination
+  output into packed arrays — twice, once for L and once for U — plus the permutation inverses.
+  `from_rows` already reserves exact capacity, so this is not the push-without-reserve shape
+  that paid 2.217x in the banded unpack; it is a genuine extra full pass over the factor, and
+  removing it means having the elimination write packed storage directly.
+- **The one-time share is 33-35% of the AMD factor** (ordering 15.0% + setup 3.6% + assemble
+  14.5%). Even a free one-time cost leaves the elimination alone at ~48 ms against SciPy's
+  ~35 ms, so the ordering-and-assemble family caps out around 1.5x on this stage and cannot on
+  its own return the 1.29x the arm switch costs plus a win.
