@@ -43253,3 +43253,55 @@ the smaller difference, and should be sized from the estimate that fires it leas
   pattern agreement — measured here reporting 1.000 against a true 0.000. A repair must be
   computed from `parent`/`counts`, and must be validated against all four cells of the 2x2, not
   one.
+
+## 2026-08-31 - CopperFalcon (cc) - BEHAVIORAL REJECT, and it RETRACTS MY OWN MECHANISM from the row above: the supernodal planner's blocks are REAL supernodes, so the defect is in the kernel, not the plan
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: BEHAVIORAL.** No timing claim, no timing
+  decision. **This retracts the "local test, global cost" mechanism I published in the row
+  immediately above.** The measurements in that row stand; the explanation attached to them does
+  not.
+- **`probe: supernodal_gate_decline_cost_share`**, re-runnable with
+  `cargo test --release -p fsci-sparse --lib -- --ignored --nocapture supernodal_gate_decline_cost_share`.
+  **Probe host: `same_host=thinkstation1`, no rch worker** (local-wrapper-bypass; `rch` refuses
+  every `cargo test` verb with `missing_runtime`). Structural counts, no clock.
+- **WHAT I CLAIMED.** That `supernode_widths_from_etree` merges on a LOCAL adjacent-pair test
+  while the padding cost is GLOBAL, so a long run assembled from individually-tolerable steps
+  accrues ruinous padding, and that charging the tolerance against the whole block instead would
+  decline the envelope cells.
+- **HOW I TESTED IT.** I implemented exactly that: accumulate the per-step slack across the run
+  and close the block when the total exceeds `SUPERNODAL_RELAXATION_TOLERANCE`. The acceptance
+  criterion was pre-registered in the row above — reproduce `cols >= 8` near 0.000 and 0.007 on
+  the two Colamd cells and near 0.426 and 0.621 on the two AMD cells.
+- **THE PROBE OBSERVED, with the accumulating rule in place:**
+
+      cell + ordering        cols>=8 etree BEFORE   cols>=8 etree AFTER   required
+      cubic s=16 Colamd              1.000                 0.943            ~0.000
+      convection s=64 Colamd         1.000                 0.997            ~0.007
+      cubic s=16 Amd                 0.302                 0.302             0.426
+      convection s=64 Amd            0.136                 0.136             0.621
+
+  **It fails its own criterion outright**, and the AMD cells did not move at all. Reverted; the
+  tree is identical to HEAD.
+- **WHY THE FAILURE IS INFORMATIVE, which is the point of banking it.** Accumulating the slack
+  barely split the runs — 94.3% of columns stayed inside a wide block on cubic and 99.7% on
+  convection. That can only happen if the per-step slack is essentially **zero**, i.e.
+  `counts[j] == counts[j+1] + 1` holds exactly along the path. **That is the definition of
+  perfectly nested column patterns**, so the planner's blocks on an envelope ordering are not an
+  artefact of a sloppy local test — they are genuine fundamental supernodes. The planner is
+  telling the truth.
+- **SO THE DEFECT IS IN THE NUMERIC KERNEL, NOT THE PLAN.** The blocks are real; applying them is
+  what goes wrong. That relocates the whole question to `apply_supernode_tails` and its behaviour
+  at very large widths, and it also explains why the ENVELOPE arm — which is precisely a dense
+  kernel over that same band — is the fastest thing in the crate on these cells. The structure
+  supports blocking; our blocked kernel does not exploit it.
+- **What this does NOT do.** It does not restore any credit to the supernodal arm on envelope
+  orderings: the 2x2 rows are unchanged and the arm remains the losing choice there. It changes only
+  WHERE the fault lies, and therefore which code a repair must touch.
+- **Concrete retry predicate.** Do not attempt another repair of the supernode PARTITION on
+  envelope orderings — the partition is correct and two different criteria now agree on it. Any
+  further work belongs in `apply_supernode_tails`, and must state what it does differently at
+  block widths in the thousands, since that is the regime the envelope cells actually produce.
+- **A note on method.** The pre-registered four-cell criterion is what made this cheap: the
+  mechanism was wrong, the repair was written and measured against a standard set BEFORE it was
+  built, and the whole exchange cost one probe run. A repair judged by whether it "seemed to
+  help" would have shipped a null change and left the real fault untouched.
