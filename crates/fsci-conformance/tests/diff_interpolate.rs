@@ -12,7 +12,8 @@ use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_interpolate::{
-    NearestNDInterpolator, interp1d_linear, lagrange, polyfit, polyval, splev, splrep,
+    interp1d_linear, lagrange, polyfit, polyval, splev, splrep, NearestNDInterpolator,
+    RbfInterpolator, RbfKernel,
 };
 use serde::{Deserialize, Serialize};
 
@@ -53,6 +54,34 @@ struct SplineCase {
     y: Vec<f64>,
     k: usize,
     x_eval: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RbfCase {
+    case_id: String,
+    points: Vec<Vec<f64>>,
+    values: Vec<f64>,
+    queries: Vec<Vec<f64>>,
+    kernel: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epsilon: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degree: Option<i32>,
+    tolerance: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RbfOracleResult {
+    case_id: String,
+    status: String,
+    result_kind: String,
+    result: RbfOracleValues,
+    error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RbfOracleValues {
+    values: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +267,98 @@ fn spline_cases() -> Vec<SplineCase> {
             x_eval: vec![0.5, 1.5, 2.5, 3.5, 4.5],
         },
     ]
+}
+
+fn rbf_cases() -> Vec<RbfCase> {
+    let points: Vec<Vec<f64>> = (0..9).map(|i| vec![i as f64 / 8.0]).collect();
+    let values: Vec<f64> = points.iter().map(|point| 2.0 * point[0] + 1.0).collect();
+    let queries = vec![vec![1.5], vec![2.0], vec![3.0]];
+    vec![
+        RbfCase {
+            case_id: "linear_default_constant_tail".into(),
+            points: points.clone(),
+            values: values.clone(),
+            queries: queries.clone(),
+            kernel: "linear".into(),
+            epsilon: None,
+            degree: None,
+            tolerance: 1.0e-10,
+        },
+        RbfCase {
+            case_id: "thin_plate_default_linear_tail".into(),
+            points: points.clone(),
+            values: values.clone(),
+            queries: queries.clone(),
+            kernel: "thin_plate_spline".into(),
+            epsilon: None,
+            degree: None,
+            tolerance: 1.0e-10,
+        },
+        RbfCase {
+            case_id: "thin_plate_explicit_degree_minus_one".into(),
+            points,
+            values,
+            queries,
+            kernel: "thin_plate_spline".into(),
+            epsilon: None,
+            degree: Some(-1),
+            tolerance: 1.0e-5,
+        },
+    ]
+}
+
+fn rbf_kernel(name: &str) -> RbfKernel {
+    match name {
+        "linear" => RbfKernel::Linear,
+        "thin_plate_spline" => RbfKernel::ThinPlateSpline,
+        _ => unreachable!("RBF fixture uses a supported kernel"),
+    }
+}
+
+fn run_scipy_rbf_oracle(case: &RbfCase) -> RbfOracleResult {
+    let oracle =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python_oracle/scipy_interpolate_oracle.py");
+    let mut child = Command::new("python3")
+        .arg(oracle)
+        .arg("--rbf-live")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn live SciPy RBF oracle");
+    child
+        .stdin
+        .take()
+        .expect("access RBF oracle stdin")
+        .write_all(
+            format!(
+                "{}\n",
+                serde_json::to_string(case).expect("serialize RBF case")
+            )
+            .as_bytes(),
+        )
+        .expect("write RBF oracle case");
+    let output = child
+        .wait_with_output()
+        .expect("wait for live SciPy RBF oracle");
+    assert!(
+        output.status.success(),
+        "live SciPy RBF oracle failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("RBF oracle emitted UTF-8");
+    let mut lines = stdout.lines();
+    let ready = lines.next().expect("RBF oracle READY line");
+    assert!(
+        ready.contains("genuine=True"),
+        "RBF oracle must use genuine SciPy: {ready}"
+    );
+    let response = lines.next().expect("RBF oracle response");
+    assert!(
+        lines.next().is_none(),
+        "unexpected RBF oracle output: {stdout}"
+    );
+    serde_json::from_str(response).expect("parse live SciPy RBF response")
 }
 
 fn run_scipy_interp1d_oracle(cases: &[Interp1dCase]) -> HashMap<String, Vec<f64>> {
@@ -726,6 +847,56 @@ fn diff_spline() {
     emit_log(&log);
     assert_all_cases_compared("spline", log.case_count, cases.len());
     assert!(all_pass, "spline diff failed: max_diff={max_diff}");
+}
+
+#[test]
+fn diff_rbf_interpolator() {
+    let cases = rbf_cases();
+    let mut compared = 0;
+    for case in &cases {
+        let kernel = rbf_kernel(&case.kernel);
+        let rust = match case.degree {
+            Some(degree) => RbfInterpolator::with_degree(
+                &case.points,
+                &case.values,
+                kernel,
+                case.epsilon.unwrap_or(1.0),
+                degree,
+            ),
+            None => RbfInterpolator::new(
+                &case.points,
+                &case.values,
+                kernel,
+                case.epsilon.unwrap_or(1.0),
+            ),
+        }
+        .expect("valid RBF fixture");
+        let rust_values: Vec<f64> = case.queries.iter().map(|query| rust.eval(query)).collect();
+        let scipy = run_scipy_rbf_oracle(case);
+        assert_eq!(scipy.case_id, case.case_id, "oracle case identity");
+        assert_eq!(scipy.status, "ok", "SciPy RBF result: {:?}", scipy.error);
+        assert_eq!(scipy.result_kind, "vector", "SciPy RBF result kind");
+        assert_eq!(
+            rust_values.len(),
+            scipy.result.values.len(),
+            "{} output length",
+            case.case_id
+        );
+        let max_abs_diff = rust_values
+            .iter()
+            .zip(&scipy.result.values)
+            .map(|(rust, scipy)| (rust - scipy).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_abs_diff <= case.tolerance,
+            "{} differs from live SciPy by {max_abs_diff:.3e}, tolerance {:.3e}; rust={rust_values:?}, scipy={:?}",
+            case.case_id,
+            case.tolerance,
+            scipy.result.values,
+        );
+        compared += 1;
+    }
+    assert_all_cases_compared("rbf_interpolator", compared, cases.len());
 }
 
 /// Differential coverage for scipy.interpolate.NearestNDInterpolator.

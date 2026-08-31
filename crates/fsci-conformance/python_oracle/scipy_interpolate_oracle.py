@@ -152,6 +152,27 @@ def _run_bspline(case: Dict[str, Any], interpolate: Any, np: Any) -> Dict[str, A
         return _err(case_id, _fixture_error(case, str(exc)))
 
 
+def _run_rbf_interpolator(
+    case: Dict[str, Any], interpolate: Any, np: Any
+) -> Dict[str, Any]:
+    case_id = case["case_id"]
+    try:
+        kwargs: Dict[str, Any] = {"kernel": str(case["kernel"])}
+        if "epsilon" in case:
+            kwargs["epsilon"] = float(case["epsilon"])
+        if "degree" in case:
+            kwargs["degree"] = int(case["degree"])
+        interpolator = interpolate.RBFInterpolator(
+            np.array(case["points"], dtype=np.float64),
+            np.array(case["values"], dtype=np.float64),
+            **kwargs,
+        )
+        values = interpolator(np.array(case["queries"], dtype=np.float64))
+        return _ok(case_id, "vector", {"values": _float_list(values)})
+    except (ArithmeticError, OverflowError, TypeError, ValueError) as exc:
+        return _err(case_id, _fixture_error(case, str(exc)))
+
+
 def _run_case(case: Dict[str, Any], interpolate: Any, np: Any) -> Dict[str, Any]:
     operation = case.get("operation")
     if operation == "interp1d":
@@ -162,6 +183,8 @@ def _run_case(case: Dict[str, Any], interpolate: Any, np: Any) -> Dict[str, Any]
         return _run_cubic_spline(case, interpolate, np)
     if operation == "bspline":
         return _run_bspline(case, interpolate, np)
+    if operation == "rbf_interpolator":
+        return _run_rbf_interpolator(case, interpolate, np)
     return {
         "case_id": case.get("case_id", "<missing>"),
         "status": "error",
@@ -310,6 +333,37 @@ def _run_cursor_live(
     return 0
 
 
+def _run_rbf_live(interpolate: Any, np: Any, scipy: Any) -> int:
+    scipy_path = Path(scipy.__file__).resolve()
+    engine_path = Path(interpolate.__file__).resolve()
+    engine_sha256 = hashlib.sha256(engine_path.read_bytes()).hexdigest()
+    fsci_loaded = any(
+        name == "fsci_interpolate" or name.startswith("fsci_") for name in sys.modules
+    )
+    genuine = scipy_path.parent in engine_path.parents and not fsci_loaded
+    print(
+        f"READY scipy={scipy.__version__} numpy={np.__version__} "
+        f"scipy_engine_path={engine_path} scipy_engine_sha256={engine_sha256} "
+        f"fsci_loaded={fsci_loaded} genuine={genuine}",
+        flush=True,
+    )
+    if not genuine:
+        print("FATAL not-genuine-scipy-rbf", flush=True)
+        return 2
+
+    raw_case = sys.stdin.readline()
+    if not raw_case:
+        print("FATAL missing-rbf-case", flush=True)
+        return 2
+    try:
+        case = json.loads(raw_case)
+    except json.JSONDecodeError as exc:
+        print(f"FATAL invalid-rbf-case: {exc}", flush=True)
+        return 2
+    print(json.dumps(_run_rbf_interpolator(case, interpolate, np)), flush=True)
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Capture SciPy interpolate oracle outputs")
     parser.add_argument("--fixture", required=False, help="Input packet fixture JSON path")
@@ -323,6 +377,11 @@ def main() -> int:
         "--cursor-live",
         choices=("pchip", "cubic", "akima", "hermite"),
         help="Run a persistent live-SciPy cubic-cursor protocol on stdin",
+    )
+    parser.add_argument(
+        "--rbf-live",
+        action="store_true",
+        help="Run one live-SciPy RBFInterpolator request from stdin",
     )
     parser.add_argument(
         "--oracle-root",
@@ -340,12 +399,14 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 2
 
-    if args.pchip_live and args.cursor_live:
-        parser.error("--pchip-live and --cursor-live are mutually exclusive")
+    if sum(bool(value) for value in (args.pchip_live, args.cursor_live, args.rbf_live)) > 1:
+        parser.error("live oracle modes are mutually exclusive")
     if args.pchip_live:
         return _run_cursor_live(interpolate, np, scipy, "pchip")
     if args.cursor_live:
         return _run_cursor_live(interpolate, np, scipy, args.cursor_live)
+    if args.rbf_live:
+        return _run_rbf_live(interpolate, np, scipy)
     if not args.fixture or not args.output:
         parser.error("--fixture and --output are required outside live cursor mode")
     fixture_path = Path(args.fixture)
