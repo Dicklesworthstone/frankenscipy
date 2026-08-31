@@ -15579,6 +15579,60 @@ mod tests {
         }
     }
 
+    /// What `max_matchable` would a FRONTAL construction actually predict? (frankenscipy-run7d)
+    ///
+    /// THIS ANSWERS THE ACCEPTANCE CRITERION I SET rather than leaving it for the proposal.
+    /// The merge is measured at 98.19% of its structural ceiling, so the only way to move
+    /// general-kernel density is to raise the ceiling itself — which means grouping columns so
+    /// that a target row is touched once per BLOCK instead of once per column, and the matched
+    /// run becomes the block's width rather than the incidental column agreement between two
+    /// rows. The multiplier that buys is exactly the mean block width, so that width IS the
+    /// predicted `max_matchable` multiplier and it can be computed symbolically, before writing
+    /// a single line of frontal code.
+    ///
+    /// MEASURED UNDER AMD, WHICH IS THE POINT. The supernode widths recorded on this bead
+    /// earlier (mean 5.24) were taken under `Colamd`, which maps to RCM here — the arm where the
+    /// general merge does not even ship. The arm that matters is AMD, and it has never been
+    /// measured. If AMD's blocks are no wider, then a frontal matrix cannot raise the ceiling
+    /// enough and llywn's density target is unreachable by this route as well.
+    #[test]
+    #[ignore = "diagnostic: symbolic analysis of two real grids, run with --ignored --nocapture"]
+    fn frontal_block_width_bounds_the_matchable_ceiling() {
+        for (label, matrix) in [
+            ("cubic side=16", splu_dirichlet_laplacian_3d(16)),
+            ("convection side=64", convection_diffusion_2d_probe(64)),
+        ] {
+            let n = matrix.shape().rows;
+            for ordering in [PermutationOrdering::Colamd, PermutationOrdering::Amd] {
+                let fill_perm = sparse_lu_fill_ordering(&matrix, n, ordering).0;
+                let rows = match &fill_perm {
+                    Some(p) => permuted_sorted_rows(&matrix, p),
+                    None => csr_sorted_rows(&matrix),
+                };
+                let initial: Vec<Vec<u32>> =
+                    rows.iter().map(|r| r.live_cols().to_vec()).collect();
+                let (_u_pattern, l_pattern) = symbolic_fill_pattern(n, &initial);
+
+                for tolerance in [0usize, SUPERNODAL_RELAXATION_TOLERANCE] {
+                    let widths = supernode_widths_from_symbolic(n, &l_pattern, tolerance);
+                    assert!(!widths.is_empty(), "{label}: empty supernode partition");
+                    let blocks = widths.len();
+                    let mean = n as f64 / blocks as f64;
+                    let widest = widths.iter().copied().max().unwrap_or(0);
+                    // Columns sitting in blocks wide enough for a dense kernel to be worth
+                    // entering at all. Below about four the block IS the scalar loop.
+                    let in_wide: usize = widths.iter().filter(|&&w| w >= 8).sum();
+                    println!(
+                        "frontal {label} {ordering:?} t={tolerance}: blocks={blocks} \
+                         mean_width={mean:.2} widest={widest} \
+                         cols_in_blocks_ge8={in_wide}/{n} ({:.3})",
+                        in_wide as f64 / n as f64
+                    );
+                }
+            }
+        }
+    }
+
     /// run7d's convection-diffusion fixture, as the perf harness builds it.
     fn convection_diffusion_2d_probe(side: usize) -> CsrMatrix {
         const DIAGONAL: f64 = 4.001;
