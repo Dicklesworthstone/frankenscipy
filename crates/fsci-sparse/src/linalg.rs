@@ -15840,20 +15840,21 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let banded_was = SPLU_BANDED_ENABLE.load(Relaxed);
         let supernodal_was = SPLU_SUPERNODAL_ENABLE.load(Relaxed);
-        let spectral_was = SPLU_CUBIC_SPECTRAL_DISABLE.load(Relaxed);
         SPLU_BANDED_ENABLE.store(false, Relaxed);
         SPLU_SUPERNODAL_ENABLE.store(true, Relaxed);
-        // AN EXACT CUBIC DIRICHLET GRID IS ROUTED TO `CubicSpectralLu` BEFORE ANY OF THIS.
-        // Without disabling it the factorization returns in microseconds having touched neither
-        // arm, and the test reports zero hits and zero declines — indistinguishable from a
-        // decline. The harness passes `off` for exactly this reason.
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(true, Relaxed);
 
-        // side=16 (n=4096) is where the probe measures coverage=1.000 under the envelope
-        // ordering. At side=8 the envelope partition is all-trivial and the PRE-EXISTING
-        // `all(|&w| w <= 1)` guard refuses first, so the wide-block guard is never reached and
-        // the test would pass while exercising nothing — checked, not assumed.
-        let matrix = splu_dirichlet_laplacian_3d(16);
+        // A 2-D LAPLACIAN, NOT A CUBIC DIRICHLET GRID, AND THE REASON IS A RACE. An exact cubic
+        // grid is routed to `CubicSpectralLu` before either arm is reached, so the test would
+        // have to disable that path — and `SPLU_CUBIC_SPECTRAL_DISABLE` is guarded by a
+        // DIFFERENT mutex than `PERF_TOGGLE_TEST_LOCK`, so a concurrently running test can flip
+        // it back mid-run. That is exactly how this test passed alone and failed in the full
+        // suite. Choosing a fixture the spectral path never claims removes the dependency
+        // instead of trying to order two locks.
+        //
+        // n must also be large enough to clear `splu`'s dense guard, and large enough that the
+        // envelope partition is not all-trivial — at the small sizes the PRE-EXISTING
+        // `all(|&w| w <= 1)` guard refuses first and the wide-block guard is never reached.
+        let matrix = laplacian_2d_for_mmd(32);
 
         // THROUGH THE PUBLIC ENTRY POINT, because that is the only place the supernodal arm is
         // dispatched from. Calling `factorize_csr` directly never attempts it, so a test written
@@ -15883,7 +15884,6 @@ mod tests {
 
         SPLU_SUPERNODAL_ENABLE.store(supernodal_was, Relaxed);
         SPLU_BANDED_ENABLE.store(banded_was, Relaxed);
-        SPLU_CUBIC_SPECTRAL_DISABLE.store(spectral_was, Relaxed);
 
         // MUST DECLINE, and for the stated reason rather than incidentally: the wide-block
         // counter has to be the thing that fired.
@@ -22318,9 +22318,16 @@ mod tests {
         // have caught because they call `factorize_csr_supernodal` directly.
         let matrix = laplacian_2d_for_mmd(16);
         let csc = matrix.to_csc().expect("csc");
+        // AMD, NOT NATURAL (frankenscipy-9nw95). Under a natural or envelope ordering this
+        // fixture is a band, and the planner's count-based supernode rule merges the whole band
+        // into ONE block whose columns do not share a pattern; the wide-block guard now declines
+        // exactly that, so this test's own must-hit control fired and reported that it was
+        // comparing the sequential path with itself. AMD produces genuinely narrow blocks, so
+        // the blocked path still runs and the bit-identity claim this test exists to make is
+        // still made — on a fixture where blocking actually happens.
         let options = LuOptions {
             mode: RuntimeMode::Strict,
-            ordering: PermutationOrdering::Natural,
+            ordering: PermutationOrdering::Amd,
             diag_pivot_thresh: 0.0,
             ..LuOptions::default()
         };
