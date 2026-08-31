@@ -4851,6 +4851,9 @@ impl NativeSparseLu {
         }
 
         SPLU_PACKED_TRIANGULAR_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Read once; when off, no clock is constructed anywhere below.
+        let stage_timing = SPLU_SOLVE_STAGE_TIMING.load(std::sync::atomic::Ordering::Relaxed);
+        let solve_clock = stage_timing.then(std::time::Instant::now);
         let lower_offsets = &self.lower.offsets;
         let lower_columns = &self.lower.columns;
         let lower_values = &self.lower.values;
@@ -4910,6 +4913,7 @@ impl NativeSparseLu {
         let materialize =
             SPLU_SOLVE_FORCE_MATERIALIZED_RHS.load(std::sync::atomic::Ordering::Relaxed);
         let mut y = vec![0.0; self.n];
+        let forward_clock = stage_timing.then(std::time::Instant::now);
         match self.fill_perm.as_deref() {
             Some(fill) if materialize => {
                 // ORIG arm of the `frankenscipy-run7d` A/B: build the whole permuted
@@ -4961,6 +4965,10 @@ impl NativeSparseLu {
             }
         }
 
+        if let Some(started) = forward_clock {
+            record_splu_solve_stage(SPLU_SOLVE_STAGE_FORWARD, started.elapsed().as_nanos());
+        }
+
         // THE DIAGONAL IS THE FIRST PACKED ENTRY, so stop searching for it. U is
         // emitted from an already-sorted row filtered to `col >= row`, so it is
         // ascending and the diagonal, if the row has one, starts its packed range.
@@ -4977,6 +4985,7 @@ impl NativeSparseLu {
         // every solve, which matters on the shapes this is used for: the worst
         // standing deficit in the ledger is one factorization against SIXTEEN
         // solves (frankenscipy-run7d).
+        let backward_clock = stage_timing.then(std::time::Instant::now);
         triangular_backward_substitute(
             upper_offsets,
             upper_columns,
@@ -4985,8 +4994,12 @@ impl NativeSparseLu {
             upper_contiguous,
             upper_schedule,
         )?;
+        if let Some(started) = backward_clock {
+            record_splu_solve_stage(SPLU_SOLVE_STAGE_BACKWARD, started.elapsed().as_nanos());
+        }
 
-        match self.inverse_fill_perm.as_deref() {
+        let unpermute_clock = stage_timing.then(std::time::Instant::now);
+        let solved = match self.inverse_fill_perm.as_deref() {
             Some(inverse) => {
                 SPLU_GATHER_UNPERMUTE_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let mut x = vec![0.0; self.n];
@@ -4996,7 +5009,17 @@ impl NativeSparseLu {
                 Ok(x)
             }
             None => Ok(y),
+        };
+        if let Some(started) = unpermute_clock {
+            record_splu_solve_stage(SPLU_SOLVE_STAGE_UNPERMUTE, started.elapsed().as_nanos());
         }
+        if let Some(started) = solve_clock {
+            SPLU_SOLVE_STAGE_TOTAL_NANOS.fetch_add(
+                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        solved
     }
 
     /// Solve one factor against a row-major panel of right-hand sides.
@@ -15912,6 +15935,46 @@ mod tests {
             envelope_nnz > 0 && amd_nnz > 0,
             "a degenerate factor: envelope {envelope_nnz}, amd {amd_nnz}"
         );
+    }
+
+    /// Does `U` cost twice `L` in the solve because it HOLDS twice as much, or because of how
+    /// it is traversed? (frankenscipy-run7d)
+    ///
+    /// THE DISCRIMINATOR FOR THE SOLVE PHASE SPLIT. With closure at 0.9928 the backward sweep
+    /// is 66.75% of the solve against the forward sweep's 32.64% — almost exactly two to one.
+    /// That is a LEVER only if the two sweeps touch comparable amounts of data: if `U` simply
+    /// stores twice what `L` does, the ratio is work and there is nothing to recover, whereas
+    /// equal entry counts would put the difference in the access pattern (the backward sweep
+    /// walks rows descending) and make it worth attacking. Counts only, no clock.
+    #[test]
+    #[ignore = "diagnostic: factors a real grid, run with --ignored --nocapture"]
+    fn solve_phase_entry_counts_l_versus_u() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let banded_was = SPLU_BANDED_ENABLE.load(Relaxed);
+
+        for (label, matrix) in [
+            ("convection side=128", convection_diffusion_2d_probe(128)),
+            ("cubic side=16", splu_dirichlet_laplacian_3d(16)),
+        ] {
+            let n = matrix.shape().rows;
+            // The SHIPPING arm on these cells is the banded one, so measure the factor the
+            // solve actually walks rather than a general-arm stand-in.
+            SPLU_BANDED_ENABLE.store(true, Relaxed);
+            let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, LuOptions::default().ordering)
+                .expect("factorization");
+            let lower = lu.lower.values.len();
+            let upper = lu.upper.values.len();
+            assert!(lower > 0 && upper > 0, "{label}: degenerate factor");
+            println!(
+                "solve_entries {label}: n={n} lower={lower} upper={upper} \
+                 upper_over_lower={:.3}",
+                upper as f64 / lower as f64
+            );
+        }
+        SPLU_BANDED_ENABLE.store(banded_was, Relaxed);
     }
 
     /// run7d's convection-diffusion fixture, as the perf harness builds it.
@@ -32128,12 +32191,57 @@ pub const SPLU_STAGE_ASSEMBLE: usize = 3;
 /// Four `Instant::now` pairs per FACTORIZATION, none inside any per-element loop, so this
 /// cannot act as an optimisation barrier on the kernel it is measuring — the failure mode
 /// that inflated an earlier measurement 34-fold in this tree.
+/// Index into [`SPLU_SOLVE_STAGE_NANOS`]: forward substitution against `L`.
+pub const SPLU_SOLVE_STAGE_FORWARD: usize = 0;
+/// Index into [`SPLU_SOLVE_STAGE_NANOS`]: backward substitution against `U`.
+pub const SPLU_SOLVE_STAGE_BACKWARD: usize = 1;
+/// Index into [`SPLU_SOLVE_STAGE_NANOS`]: undoing the fill permutation into the output.
+pub const SPLU_SOLVE_STAGE_UNPERMUTE: usize = 2;
+
+/// Split the SOLVE into its three phases, so the worst standing deficit can be attributed.
+///
+/// WHY THIS EXISTS. The FACTOR has had a four-stage split for a while
+/// (`SPLU_STAGE_NANOS`); the solve has had none, and the solve is the worse half of the
+/// campaign's worst cell — convection n=16384 measures 0.4481x against live SuperLU on the
+/// shipping arm, against 0.6162x for the factor. Attributing a loss you cannot decompose is
+/// guesswork, and three levers on this bead have already died to guesses about where time
+/// goes.
+///
+/// **CLOSURE IS REPORTED FIRST AND IS THE POINT.** The three phases are timed inside one
+/// solve and their sum is compared against that same solve measured end to end. A split whose
+/// parts do not add up to the whole is not a decomposition, it is three unrelated numbers, and
+/// it would licence exactly the kind of lever this bead keeps refuting.
+///
+/// **DEFAULT OFF, and the clock is never constructed when it is off.** Three `Instant::now`
+/// pairs per solve is not a per-element barrier, but the shipping path takes none of them.
+pub static SPLU_SOLVE_STAGE_TIMING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Nanoseconds accumulated per solve phase; see `SPLU_SOLVE_STAGE_*` for the indices, and
+/// `SPLU_SOLVE_STAGE_TOTAL_NANOS` for the whole-solve figure the closure check compares against.
+pub static SPLU_SOLVE_STAGE_NANOS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// The same solves timed END TO END, so `sum(phases) / total` is a readable closure ratio.
+pub static SPLU_SOLVE_STAGE_TOTAL_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub static SPLU_STAGE_NANOS: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
 ];
+
+fn record_splu_solve_stage(stage: usize, nanos: u128) {
+    SPLU_SOLVE_STAGE_NANOS[stage].fetch_add(
+        u64::try_from(nanos).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 fn record_splu_stage(stage: usize, nanos: u128) {
     SPLU_STAGE_NANOS[stage].fetch_add(

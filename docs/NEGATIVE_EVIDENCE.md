@@ -43444,3 +43444,70 @@ the smaller difference, and should be sized from the estimate that fires it leas
   counts are built, or those products must be handed to the general path instead of discarded.
   Any such proposal must quote this scattered cell with the arm enabled and show it at or above
   1.1201x, which is what the shipping default achieves today.
+
+## 2026-08-31 - CopperFalcon (cc) - REJECT of the "the solve is slow because of fill" reading: the backward sweep is 66.75% of the worst cell and pays 2.045x the time for 1.012x the data
+
+- **Bead: `frankenscipy-run7d`.** **Result class: REJECT.** What is refused is the standing
+  assumption that the solve deficit is a WORK problem distributed across the sweep. It is
+  concentrated, and it is not work. No lever is shipped here; the decomposition is the result.
+- **PHASE SPLIT WITH CLOSURE, and closure is reported first.** The factor has had a four-stage
+  split for a while; the solve had none, which is why three levers on this bead were aimed by
+  guess. `SPLU_SOLVE_STAGE_NANOS` now times forward / backward / unpermute inside the same
+  solve that is timed end to end, so the parts can be checked against the whole:
+
+      closure = 0.9928   (sum 3084.055 ms against whole 3106.379 ms)
+      forward   (L)   1006.573 ms   32.64%
+      backward  (U)   2058.613 ms   66.75%
+      unpermute         18.869 ms    0.61%
+
+  **99.28% of the solve is accounted for.** The 0.72% remainder is the output allocation and the
+  untimed prologue. A split that did not close would be three unrelated numbers and would
+  licence nothing.
+- **THE DISCRIMINATOR, counted and clock-free** (`probe: solve_phase_entry_counts_l_versus_u`):
+
+      cell                    lower entries   upper entries   upper/lower
+      convection side=128         1,406,144       1,422,528      1.012
+      cubic side=16                 592,108         596,204      1.007
+
+  **`U` holds 1.2% more data than `L` and its sweep costs 2.045x as much time.** The ratio is
+  therefore NOT volume. Both sweeps read the same packed layout with the same kernel; the
+  difference is that the backward substitution visits rows DESCENDING, against the direction
+  hardware prefetch is built for, while the forward sweep ascends.
+- **The timed row this decomposes**, live SciPy 1.17.1 SuperLU side-by-side in the same
+  invocation on identical fixture bytes,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`: convection_diffusion_2d side=128, `n=16384`, `nnz=81408`, SHIPPING arm
+  (`banded_factor_hits=1`), `FSCI_SPLU_STAGE=solve`, 21 rounds, `quiescence=clear`:
+  `Incumbent ratio: SciPy / FrankenSciPy = 0.5117x` ci95 [0.5079, 0.5174], fsci 36.784 ms
+  against SciPy 18.834 ms. **Decision from the bootstrap-median CI only, never cv; CV is
+  provenance only** — the harness printed `decided_if_ci_lo>1.0110_or_ci_hi<0.9890`. A/A nulls
+  0.9976 (scipy) and 1.0055 (fsci); the **2x A/A-null margin** demands separation beyond 1.10%
+  and the deficit is 95%.
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+
+  `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.029)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.007)`, reported not relaxed.
+  `harness=perf_splu`, substrate `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`,
+  `same_host=thinkstation1`, `taskset -c 6`, ONE binary
+  `frankenscipy_engine_sha256=b12d2972487365c8eb13942186310880c1f76f080360e241bdc6dbe86fed8ea3`
+  (`executed-binary sha256=b12d2972487365c8eb13942186310880c1f76f080360e241bdc6dbe86fed8ea3`)
+  built on **rch worker `hz2`**, run outside the build window.
+  Command: `FSCI_SPLU_SOLVE_STAGES=1 FSCI_SPLU_STAGE=solve taskset -c 6 ./target/release/perf_splu 128 21 4 off convection on off on off`.
+- **WHAT THIS RULES OUT.** Any lever aimed at the solve as a whole, at the unpermute (0.61% —
+  it cannot matter), or at reducing solve WORK. Two thirds of the cost sits in one sweep that
+  already reads near-identical data to its twin.
+- **The lever it points at, with its acceptance test, NOT built here.** Make the backward sweep
+  ascend memory — store `U`'s rows in reverse so the descending visit order walks forward
+  through the arrays, or otherwise restore a forward access pattern. It is a layout change, so
+  it must be **bit-identical**: the same values are read in the same order, only their addresses
+  change. Acceptance: re-run this split and show `backward_ms` approaching `forward_ms` at
+  unchanged entry counts, with closure still above 0.99 — anything that moves the share without
+  holding closure is measuring something else.
+- **Concrete retry predicate.** Do not attack the solve without quoting this split. A proposal
+  that does not name which of the three phases it moves, and does not report closure, is aimed
+  by guess — which is how the block-advance and lazy-schedule levers on this bead were aimed
+  before they measured null.

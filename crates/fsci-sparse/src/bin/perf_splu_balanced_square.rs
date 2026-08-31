@@ -1182,6 +1182,16 @@ for raw_line in sys.stdin.buffer:
             }
             SPLU_BANDED_STAGE_TIMING.store(true, Ordering::Relaxed);
         }
+        // `FSCI_SPLU_SOLVE_STAGES=1` splits the SOLVE into forward / backward / unpermute and
+        // reports CLOSURE first. Off by default so no clock is constructed on a normal row.
+        if std::env::var("FSCI_SPLU_SOLVE_STAGES").is_ok_and(|v| v != "0") {
+            for slot in &fsci_sparse::linalg::SPLU_SOLVE_STAGE_NANOS {
+                slot.store(0, Ordering::Relaxed);
+            }
+            fsci_sparse::linalg::SPLU_SOLVE_STAGE_TOTAL_NANOS.store(0, Ordering::Relaxed);
+            fsci_sparse::linalg::SPLU_SOLVE_STAGE_TIMING.store(true, Ordering::Relaxed);
+        }
+
         let unpack_reserve_hits_before = SPLU_BANDED_UNPACK_RESERVE_HITS.load(Ordering::Relaxed);
         let swap_writeback_hits_before = SPLU_SWAP_WRITEBACK_HITS.load(Ordering::Relaxed);
         let supernodal_hits_before = SPLU_SUPERNODAL_FACTOR_HITS.load(Ordering::Relaxed);
@@ -1565,6 +1575,30 @@ for raw_line in sys.stdin.buffer:
              supernodal_toggle_reads={}",
             SPLU_SUPERNODAL_ENABLE.load_count(),
         );
+        if fsci_sparse::linalg::SPLU_SOLVE_STAGE_TIMING.load(Ordering::Relaxed) {
+            let stage: Vec<u64> = fsci_sparse::linalg::SPLU_SOLVE_STAGE_NANOS
+                .iter()
+                .map(|slot| slot.load(Ordering::Relaxed))
+                .collect();
+            let parts: u64 = stage.iter().sum();
+            let total = fsci_sparse::linalg::SPLU_SOLVE_STAGE_TOTAL_NANOS.load(Ordering::Relaxed);
+            // CLOSURE FIRST. Parts that do not sum to the whole are three unrelated numbers,
+            // and quoting a share off them would be worse than quoting nothing.
+            println!(
+                "solve_stages: closure={:.4} (sum {:.3} ms vs whole {:.3} ms) \
+                 forward_ms={:.3} ({:.2}%) backward_ms={:.3} ({:.2}%) \
+                 unpermute_ms={:.3} ({:.2}%)",
+                parts as f64 / total.max(1) as f64,
+                parts as f64 / 1.0e6,
+                total as f64 / 1.0e6,
+                stage[0] as f64 / 1.0e6,
+                100.0 * stage[0] as f64 / parts.max(1) as f64,
+                stage[1] as f64 / 1.0e6,
+                100.0 * stage[1] as f64 / parts.max(1) as f64,
+                stage[2] as f64 / 1.0e6,
+                100.0 * stage[2] as f64 / parts.max(1) as f64,
+            );
+        }
         // Reported, never gated on — see `host_mean_busy`.
         println!(
             "pre_measurement_quiescence=NOT_CERTIFIED(host_mean_busy={pre_busy:.3}) \
