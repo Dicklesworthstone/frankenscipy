@@ -15819,6 +15819,101 @@ mod tests {
         }
     }
 
+    /// The wide-block guard declines a full-matrix "supernode" and leaves real ones alone.
+    ///
+    /// TWO ARMS, and the ACCEPT arm is what stops this being a test that merely disables the
+    /// feature. A guard that refused everything would pass a decline-only test perfectly while
+    /// removing the arm's entire value, so both sides are asserted on the same fixture with
+    /// only the ordering changed.
+    ///
+    /// WHY THE ORDERING IS THE VARIABLE. `supernode_widths_from_etree` merges on COUNTS, not on
+    /// row SETS. Along an envelope ordering the counts fall by exactly one per column while the
+    /// sets slide with the band, so the rule emits one block spanning the matrix — measured at
+    /// `coverage=1.000` on both cells this repo tracks, against 0.112 and 0.030 under AMD. The
+    /// pre-existing `widths.iter().all(|&w| w <= 1)` cannot catch that, because a single
+    /// full-width block is not `w <= 1`.
+    #[test]
+    fn supernodal_wide_block_guard_declines_a_full_matrix_block() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let banded_was = SPLU_BANDED_ENABLE.load(Relaxed);
+        let supernodal_was = SPLU_SUPERNODAL_ENABLE.load(Relaxed);
+        let spectral_was = SPLU_CUBIC_SPECTRAL_DISABLE.load(Relaxed);
+        SPLU_BANDED_ENABLE.store(false, Relaxed);
+        SPLU_SUPERNODAL_ENABLE.store(true, Relaxed);
+        // AN EXACT CUBIC DIRICHLET GRID IS ROUTED TO `CubicSpectralLu` BEFORE ANY OF THIS.
+        // Without disabling it the factorization returns in microseconds having touched neither
+        // arm, and the test reports zero hits and zero declines — indistinguishable from a
+        // decline. The harness passes `off` for exactly this reason.
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(true, Relaxed);
+
+        // side=16 (n=4096) is where the probe measures coverage=1.000 under the envelope
+        // ordering. At side=8 the envelope partition is all-trivial and the PRE-EXISTING
+        // `all(|&w| w <= 1)` guard refuses first, so the wide-block guard is never reached and
+        // the test would pass while exercising nothing — checked, not assumed.
+        let matrix = splu_dirichlet_laplacian_3d(16);
+
+        // THROUGH THE PUBLIC ENTRY POINT, because that is the only place the supernodal arm is
+        // dispatched from. Calling `factorize_csr` directly never attempts it, so a test written
+        // that way reports zero hits AND zero declines and looks like a decline without one ever
+        // having been offered — which is exactly the false pass this comment exists to prevent.
+        let csc = matrix.to_csc().expect("csc");
+        let run = |ordering: PermutationOrdering| -> (usize, usize, usize) {
+            let hits_before = SPLU_SUPERNODAL_FACTOR_HITS.load(Relaxed);
+            let declines_before = SPLU_SUPERNODAL_WIDE_BLOCK_DECLINES.load(Relaxed);
+            let factored = splu(
+                &csc,
+                LuOptions {
+                    ordering,
+                    ..LuOptions::default()
+                },
+            )
+            .expect("factorization must succeed on either arm");
+            (
+                SPLU_SUPERNODAL_FACTOR_HITS.load(Relaxed) - hits_before,
+                SPLU_SUPERNODAL_WIDE_BLOCK_DECLINES.load(Relaxed) - declines_before,
+                usize::from(factored.shape.0 > 0),
+            )
+        };
+
+        let (envelope_hits, envelope_declines, envelope_nnz) = run(PermutationOrdering::Colamd);
+        let (amd_hits, amd_declines, amd_nnz) = run(PermutationOrdering::Amd);
+
+        SPLU_SUPERNODAL_ENABLE.store(supernodal_was, Relaxed);
+        SPLU_BANDED_ENABLE.store(banded_was, Relaxed);
+        SPLU_CUBIC_SPECTRAL_DISABLE.store(spectral_was, Relaxed);
+
+        // MUST DECLINE, and for the stated reason rather than incidentally: the wide-block
+        // counter has to be the thing that fired.
+        assert_eq!(
+            envelope_hits, 0,
+            "the envelope ordering took the supernodal arm despite planning one full-width block"
+        );
+        assert_eq!(
+            envelope_declines, 1,
+            "the envelope ordering was refused, but not by the wide-block guard"
+        );
+
+        // MUST ACCEPT. Without this the guard could refuse everything and still look correct.
+        assert_eq!(
+            amd_hits, 1,
+            "AMD's narrow blocks were refused; the guard is too aggressive and the arm is dead"
+        );
+        assert_eq!(
+            amd_declines, 0,
+            "AMD tripped the wide-block guard, which it must not"
+        );
+
+        // Both arms must still have produced a usable factor; a guard that broke the fallback
+        // would be worse than the regression it removes.
+        assert!(
+            envelope_nnz > 0 && amd_nnz > 0,
+            "a degenerate factor: envelope {envelope_nnz}, amd {amd_nnz}"
+        );
+    }
+
     /// run7d's convection-diffusion fixture, as the perf harness builds it.
     fn convection_diffusion_2d_probe(side: usize) -> CsrMatrix {
         const DIAGONAL: f64 = 4.001;
