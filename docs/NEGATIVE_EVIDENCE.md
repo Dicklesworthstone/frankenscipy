@@ -43129,3 +43129,72 @@ the smaller difference, and should be sized from the estimate that fires it leas
 - **Concrete retry predicate.** The supernodal REJECT is now scoped to orderings whose symbolic
   partition has no wide blocks. Any re-test must (a) name its ordering, and (b) report
   `cols in blocks >= 8` from the probe above, or it is repeating the original error.
+
+## 2026-08-31 - CopperFalcon (cc) - KEEP / SELF-SPEEDUP: the supernodal 2x2 is COMPLETE — the arm wins under AMD on both cells and loses catastrophically under Colamd on both, and one symbolic predicate separates all four
+
+- **Bead: `frankenscipy-9nw95` / `frankenscipy-run7d`.** **Result class: SELF-SPEEDUP.** Every
+  arm carries the live incumbent in the same invocation and every arm remains behind it, so this
+  is maintenance on the general arm and **is not claimed as a campaign win**. **Nothing is
+  shipped**: `SPLU_SUPERNODAL_ENABLE` stays `false`.
+- Completes the correction filed above, which had only the cubic/AMD cell. The missing
+  must-miss arm is now measured and it is emphatic.
+
+- **THE 2x2**, all four rows `quiescence=clear` with both A/A nulls inside +/-0.020, general arm,
+  live SciPy 1.17.1 SuperLU side-by-side in the same invocation on identical fixture bytes,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`, 21 rounds each:
+
+  | cell | ordering | cols in blocks >= 8 | supernodal OFF | supernodal ON | effect |
+  |---|---|---|---|---|---|
+  | cubic side=16 | Colamd | 0.000 | 0.6988x | 0.1685x | **4.15x WORSE** |
+  | convection side=128 | Colamd | 0.007 | 119.969 ms (0.2891x) | **2844.062 ms (0.0127x)** | **23.7x WORSE** |
+  | cubic side=16 | Amd | 0.426 | 112.437 ms (0.3711x) | 90.893 ms (0.4693x) | **1.2370x BETTER** |
+  | convection side=128 | Amd | 0.621 | 79.867 ms (0.4589x) | 72.899 ms (0.4864x) | **1.0956x BETTER** |
+
+  **Decision from the bootstrap-median CI only, never cv; CV is provenance only.** The two AMD
+  pairs have DISJOINT CIs — cubic [111.138,113.082] against [89.298,93.016], convection
+  [77.694,80.665] against [72.023,74.009]. The **2x A/A-null margin** is applied and cleared on
+  both: worst null edge 0.0110 (cubic) and 0.0082 (convection) demand separation beyond 2.2% and
+  1.64%, observed 23.7% and 9.56%.
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+
+  In the ledger's own field names: `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `logical_threads=64`, `physical_cores=32`, `ram_bytes=231687815168`, `numa_count=1`,
+  `scaling_governor=powersave`, `runtime_isa=avx2+fma`, `affinity=1 (taskset -c 6)`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.229)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.131)` on the convection control and
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.177)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.102)` on its treatment; host-wide
+  quiescence is NOT_CERTIFIED throughout and is reported, not relaxed (`frankenscipy-fr78g`).
+
+  `harness=perf_splu`, substrate `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`,
+  `same_host=thinkstation1` for every arm, `taskset -c 6`, ONE binary
+  `frankenscipy_engine_sha256=7bf18ec6b13e99dc265490978b7f8326016d1a3a684165030c8afceeb4215f2e`
+  (`executed-binary sha256=7bf18ec6b13e99dc265490978b7f8326016d1a3a684165030c8afceeb4215f2e`)
+  built on **rch worker `hz2`**, run outside the build window. Two-sided driver control on every
+  pair: `supernodal_factor_hits=0` against `=89`.
+- **THE PREDICATE SEPARATES ALL FOUR.** `cols in blocks >= 8`, read off the symbolic supernode
+  partition at relaxation tolerance 8, is **0.000 and 0.007** where the arm loses and **0.426 and
+  0.621** where it wins — a sixty-fold gap in the predicate against effects spanning 23.7x worse
+  to 1.24x better. It is computed from structure alone, before any numeric work.
+- **WHY THE LOSING SIDE LOSES SO BADLY.** Under Colamd the widest supernode is 7 columns on cubic
+  and 15 on convection, so `pad_supernode_tails` pads blocks that have no shared structure to
+  amortise the padding: every padded row is a multiply-add computing nothing. The convection cell
+  makes that visible at 2844 ms against 120 ms. This is the cost of blocking over structure that
+  is not there, and it is why a global default flip would be a serious regression.
+- **THE GATE THIS JUSTIFIES, AND THE ONE THING STILL UNMEASURED.** A gate admitting the
+  supernodal arm only when the width fraction clears a threshold anywhere in `0.01 .. 0.4`
+  separates all four measured points with enormous margin. **What is NOT yet measured is the cost
+  of DECLINING**: the predicate needs the symbolic fill pattern, and computing it only to decline
+  would tax every factorization that ends up on the scalar path. The banded gate documents
+  exactly this failure (a declining run measured 0.6420x against 1.2900x when its guards were
+  expensive). The supernodal path already builds a symbolic plan when it ACCEPTS, so the
+  marginal cost falls only on declines — that is the number to take before shipping any gate.
+- **Concrete retry predicate.** The supernodal arm is REJECTED for orderings whose partition has
+  no wide blocks and ACCEPTED, on this evidence, for orderings that do. Any further row must name
+  its ordering and report `cols in blocks >= 8` (probe
+  `frontal_block_width_bounds_the_matchable_ceiling`), and any gate proposal must additionally
+  report the measured decline cost.
