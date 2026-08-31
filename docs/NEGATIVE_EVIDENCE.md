@@ -43381,3 +43381,66 @@ the smaller difference, and should be sized from the estimate that fires it leas
   accident of a bad plan; it is refused by a guard that names its reason. Any future change to
   the partition rule must re-run `supernodal_padding_blowup_at_planned_widths` and keep coverage
   well below 0.5 on the AMD cells, or it re-admits the case this removes.
+
+## 2026-08-31 - CopperFalcon (cc) - REJECT: shipping the supernodal arm ON costs 1.803x on a cell where the arm NEVER RUNS — the decline itself is the regression, and it turns a win into a loss
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: REJECT.** The verdict on the standing question
+  "now that the wide-block guard exists, can `SPLU_SUPERNODAL_ENABLE` ship ON?" **It cannot.**
+  The default stays `false`; no code changed.
+- **THIS CORRECTS MY OWN FRAMING.** When the guard landed I wrote that it "removes the reason the
+  arm could not be enabled". That was wrong: it removed ONE reason — the catastrophic ACCEPT on
+  envelope orderings — and there is a second, independent one that is decisive on its own.
+  Worse, the guard makes declines MORE common, so it makes this cost apply MORE often.
+- **THE MEASUREMENT.** `scattered_pentadiagonal` side=16, `n=4096`, `nnz=20474` input nonzeros,
+  `fixture_sha256=45f1b62c8285db07f97c828a724ae867c7b67f5a6ab1581ba7832466a4fa7eb5`, in the
+  SHIPPING configuration (banded enabled, which declines here: `banded_factor_hits=0`), 21
+  rounds, both rows `quiescence=clear`:
+
+  | arm | fsci median | ci95 | incumbent ratio | supernodal hits | null scipy | null fsci |
+  |---|---|---|---|---|---|---|
+  | supernodal OFF (default) | **1.6136 ms** | [1.6118, 1.6148] | **1.1201x** [1.1147, 1.1232] | 0 | 1.0007 | 1.0008 |
+  | supernodal ON (proposed) | **2.9095 ms** | [2.8789, 2.9198] | **0.5118x** [0.5046, 0.5783] | 0 | 1.0018 | 1.0003 |
+
+  `Incumbent ratio: SciPy / FrankenSciPy = 1.1201x` on the shipping default against
+  `Incumbent ratio: SciPy / FrankenSciPy = 0.5118x` on the proposal. **Enabling the toggle turns
+  a cell we WIN into one we LOSE**, by a factor of 1.803 on our own time.
+- **THE ARM NEVER RAN.** `supernodal_factor_hits=0` on BOTH rows, with
+  `supernodal_toggle_reads=89` on both, so the toggle was read and the plan was refused every
+  time. **The entire cost is the refusal**: computing the elimination tree, the column counts and
+  the supernode partition, and then discarding all of it and running the general path from
+  scratch. This is precisely the failure the banded gate records for itself — a declining run
+  measured far behind the same binary with the path disabled — reproduced on a different arm.
+- **Decision from the bootstrap-median CI only, never cv; CV is provenance only.** The harness
+  printed `decided_if_ci_lo>1.0017_or_ci_hi<0.9983` on the OFF row and
+  `decided_if_ci_lo>1.0035_or_ci_hi<0.9965` on the ON row. The **2x A/A-null margin** is applied
+  and cleared by two orders of magnitude: worst null edge is 0.0018, demanding separation beyond
+  0.36%, and the observed separation is 80.3%. The two fsci intervals are disjoint with a wide
+  gap ([1.6118, 1.6148] against [2.8789, 2.9198]).
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+
+  In the ledger's field names: `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.029)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.007)` — the quietest window of the
+  campaign (`loadavg 1.55`), reported and not relaxed. `harness=perf_splu`, substrate
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`, `same_host=thinkstation1` both arms,
+  `taskset -c 6`, ONE binary
+  `frankenscipy_engine_sha256=af781bc8c919af9307c79e55647aa19e750b83c7096f83c725b9be9ad0bf3563`
+  (`executed-binary sha256=af781bc8c919af9307c79e55647aa19e750b83c7096f83c725b9be9ad0bf3563`)
+  built on **rch worker `hz2`**, run outside the build window. **Legacy incumbent arm: SciPy
+  1.17.1 `scipy.sparse.linalg.splu` (SuperLU), LIVE and side-by-side in the same invocation** on
+  identical fixture bytes,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`.
+  Commands: `taskset -c 6 ./target/release/perf_splu 16 21 4 off scattered on off on off|on`.
+- **WHAT SURVIVES.** The AMD wins are not withdrawn: supernodal really is 1.2370x and 1.0956x on
+  the two cells where it ACCEPTS, and the wide-block guard really does remove the envelope
+  catastrophe. What is refused is making it the DEFAULT, because the population of factorizations
+  that merely ask and are told no is large and pays 1.803x for the question.
+- **Concrete retry predicate.** Do not propose enabling `SPLU_SUPERNODAL_ENABLE` by default until
+  the DECLINE path is cheap — the plan must be abandoned before the elimination tree and column
+  counts are built, or those products must be handed to the general path instead of discarded.
+  Any such proposal must quote this scattered cell with the arm enabled and show it at or above
+  1.1201x, which is what the shipping default achieves today.
