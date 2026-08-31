@@ -43305,3 +43305,79 @@ the smaller difference, and should be sized from the estimate that fires it leas
   mechanism was wrong, the repair was written and measured against a standard set BEFORE it was
   built, and the whole exchange cost one probe run. A repair judged by whether it "seemed to
   help" would have shipped a null change and left the real fault untouched.
+
+## 2026-08-31 - CopperFalcon (cc) - KEEP / SELF-SPEEDUP: the supernodal planner accepted ONE block covering the whole matrix; a three-line width guard removes both envelope regressions and leaves both AMD wins untouched
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: SELF-SPEEDUP.** Every arm carries the live
+  incumbent in the same invocation and every arm remains behind it. **Shipping behaviour is
+  unchanged**: `SPLU_SUPERNODAL_ENABLE` still defaults `false`, so this alters nothing any
+  caller sees today — it removes the reason the arm could not be enabled.
+- **THE MECHANISM, correcting my own retraction above.** `supernode_widths_from_etree` merges
+  `j` and `j+1` when `parent[j] == j+1` and `|counts[j] - (counts[j+1]+1)| <= tolerance`. That
+  characterises a fundamental supernode only when the column patterns genuinely NEST. Along an
+  envelope ordering the counts fall by exactly one per column while the row SETS slide with the
+  band, so **the arithmetic test is satisfied by columns whose patterns do not nest**, and the
+  planner emits a single block spanning the matrix. The rule compares COUNTS, not SETS.
+- **Observed by `probe: supernodal_padding_blowup_at_planned_widths`** (structural, no clock),
+  at the widths the SHIPPING planner emits:
+
+      cell + ordering        blocks   widest   coverage   padding blowup
+      cubic s=16 Colamd           1     4096      1.000   N/A (one block spans the matrix)
+      convection s=64 Colamd      1     4096      1.000   N/A (one block spans the matrix)
+      cubic s=16 Amd           2609      459      0.112   1.01
+      convection s=64 Amd      3052      121      0.030   1.00
+
+  Under AMD the blocks are real and padding is essentially free. Under Colamd there is exactly
+  ONE block covering the entire matrix, so the arm treats a sparse band as a single dense
+  supernode. The pre-existing guard, `widths.iter().all(|&w| w <= 1)`, cannot catch that: a
+  4096-wide block is not `w <= 1`. **A degenerate `sequential = 0` is reported as N/A rather
+  than as a ratio, because a single full-width block has no tails reaching beyond it and a
+  blowup figure would be 0/0.**
+- **THE FIX.** Decline when the widest planned block covers half the matrix or more. Computed
+  from `widths`, which the planner already holds, at no cost. Half is the threshold because a
+  block that large is not a supernode within a factorization, it IS the factorization; nothing
+  measured is near the boundary (1.000 against 0.112 and 0.030). `SPLU_SUPERNODAL_WIDE_BLOCK_DECLINES`
+  counts refusals so a run can show the guard fired rather than assert that it would.
+
+- **THE FOUR ROWS, against a criterion pre-registered before the fix was written.** Live SciPy
+  1.17.1 SuperLU side-by-side in the same invocation on identical fixture bytes,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`, general arm, supernodal ENABLED throughout, 21 rounds, all `quiescence=clear`
+  with both A/A nulls inside +/-0.020:
+
+  | cell | ordering | required | hits | fsci median | ci95 | before |
+  |---|---|---|---|---|---|---|
+  | cubic side=16 | Colamd | DECLINE | 0 | 67.450 ms (0.6345x) | [66.431, 71.460] | 0.1685x |
+  | convection side=128 | Colamd | DECLINE | 0 | 122.783 ms (0.2815x) | [122.050, 123.486] | 2844.062 ms (0.0127x) |
+  | cubic side=16 | Amd | ACCEPT | 89 | 86.449 ms (0.4722x) | [85.337, 88.622] | 90.893 ms |
+  | convection side=128 | Amd | ACCEPT | 89 | 72.839 ms (0.4762x) | [71.700, 73.278] | 72.899 ms |
+
+  **All four conditions met.** The two declines return the cells to their scalar baselines
+  (0.6988x and 119.969 ms measured previously), removing regressions of roughly four-fold and
+  twenty-fold; the two accepts are unchanged within their intervals. **Decision from the
+  bootstrap-median CI only, never cv; CV is provenance only.** The harness printed
+  `decided_if_ci_lo>1.0304_or_ci_hi<0.9696` on cubic Colamd,
+  `decided_if_ci_lo>1.0109_or_ci_hi<0.9891` on convection Colamd,
+  `decided_if_ci_lo>1.0080_or_ci_hi<0.9920` on cubic Amd and
+  `decided_if_ci_lo>1.0262_or_ci_hi<0.9738` on convection Amd. The **2x A/A-null margin** is
+  applied: worst null edge across the four is 0.0152, demanding separation beyond 3.04%, and the
+  two declines move their cells by far more while the two accepts move by less than that and are
+  therefore correctly reported as UNCHANGED rather than as improvements.
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+
+  In the ledger's field names: `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.137)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.227)`; NOT_CERTIFIED is reported,
+  not relaxed (`frankenscipy-fr78g`). `harness=perf_splu`, substrate
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`, `same_host=thinkstation1` for every
+  arm, `taskset -c 6`, ONE binary
+  `frankenscipy_engine_sha256=90f299ef590d7765703e96061f32148542140700e29d54974bc0bae1d45f2e31`
+  (`executed-binary sha256=90f299ef590d7765703e96061f32148542140700e29d54974bc0bae1d45f2e31`)
+  built on **rch worker `hz2`**, run outside the build window.
+- **Concrete retry predicate.** The supernodal arm is no longer refused on envelope orderings by
+  accident of a bad plan; it is refused by a guard that names its reason. Any future change to
+  the partition rule must re-run `supernodal_padding_blowup_at_planned_widths` and keep coverage
+  well below 0.5 on the AMD cells, or it re-admits the case this removes.

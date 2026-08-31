@@ -4404,6 +4404,30 @@ impl NativeSparseLu {
         if widths.iter().all(|&w| w <= 1) {
             return None;
         }
+        // DECLINE A BLOCK THAT SWALLOWS THE MATRIX (frankenscipy-9nw95).
+        //
+        // The etree rule merges `j` and `j+1` on COUNTS — `counts[j] == counts[j+1] + 1` within
+        // a tolerance — which characterises a fundamental supernode only when the column
+        // patterns genuinely NEST. Along an envelope ordering the counts fall by exactly one per
+        // column while the row SETS slide with the band, so the arithmetic test is satisfied by
+        // columns whose patterns do not nest at all, and the planner emits ONE block spanning
+        // the whole matrix. Measured on both cells this repo tracks: `blocks=1 widest=4096
+        // coverage=1.000` under `Colamd`, against `blocks=2609 widest=459 coverage=0.112` and
+        // `blocks=3052 widest=121 coverage=0.030` under AMD, where the padding blowup is 1.01
+        // and 1.00 — i.e. the AMD blocks are real and essentially free to pad.
+        //
+        // The guard above cannot catch this: a single 4096-wide block is not `w <= 1`. Treating
+        // a sparse band as one dense supernode is what made this arm far and away the losing
+        // choice on envelope orderings.
+        //
+        // Half the matrix is the threshold because a block that large is not a supernode within
+        // a factorization, it IS the factorization; the measured cases sit at 1.000 against
+        // 0.112 and 0.030, so nothing observed is near the boundary.
+        let widest = widths.iter().copied().max().unwrap_or(0);
+        if widest * 2 >= n {
+            SPLU_SUPERNODAL_WIDE_BLOCK_DECLINES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return None;
+        }
 
         const NO_ROW: usize = usize::MAX;
         let mut bucket_head = vec![NO_ROW; n];
@@ -15717,6 +15741,79 @@ mod tests {
                     in_wide as f64 / n as f64,
                     etree_in_wide as f64 / n as f64,
                     if in_wide as f64 / n as f64 >= 0.10 { "ACCEPT" } else { "DECLINE" },
+                );
+            }
+        }
+    }
+
+    /// How much arithmetic does the supernodal arm PAD at the widths it actually plans?
+    ///
+    /// THE QUESTION LEFT BY THE RETRACTION (frankenscipy-9nw95). The partition is correct — two
+    /// independent criteria agree the envelope blocks are genuine fundamental supernodes — so
+    /// the cost must be in applying them. `apply_supernode_tails` requires all `w` tails in a
+    /// block to share one column pattern, so each is padded onto their union with explicit
+    /// zeros: the block computes `w * |union|` entries where the scalar path computes only the
+    /// tails that exist. `supernode_padding_cost` returns exactly that pair.
+    ///
+    /// MEASURED AT THE ETREE WIDTHS, WHICH IS THE POINT. Earlier padding numbers on this bead
+    /// were taken with `supernode_widths_from_symbolic`. The shipping planner uses
+    /// `supernode_widths_from_etree`, and on an envelope ordering the two disagree wildly — the
+    /// etree rule emits one block spanning nearly the whole matrix. Padding must therefore be
+    /// costed at the widths the arm will really use, or it prices a plan nobody runs.
+    #[test]
+    #[ignore = "diagnostic: symbolic analysis of two real grids, run with --ignored --nocapture"]
+    fn supernodal_padding_blowup_at_planned_widths() {
+        for (label, matrix) in [
+            ("cubic side=16", splu_dirichlet_laplacian_3d(16)),
+            ("convection side=64", convection_diffusion_2d_probe(64)),
+        ] {
+            let n = matrix.shape().rows;
+            for ordering in [PermutationOrdering::Colamd, PermutationOrdering::Amd] {
+                let fill_perm = sparse_lu_fill_ordering(&matrix, n, ordering).0;
+                let rows = match &fill_perm {
+                    Some(p) => permuted_sorted_rows(&matrix, p),
+                    None => csr_sorted_rows(&matrix),
+                };
+                let initial: Vec<Vec<u32>> =
+                    rows.iter().map(|r| r.live_cols().to_vec()).collect();
+                let (u_pattern, _l_pattern) = symbolic_fill_pattern(n, &initial);
+
+                // The widths the SHIPPING planner emits, not the pattern-based ones.
+                let perm_for_tree: Vec<usize> =
+                    fill_perm.clone().unwrap_or_else(|| (0..n).collect());
+                let parent = elimination_tree_of_permuted(&matrix, &perm_for_tree);
+                let (counts, _total) =
+                    l_column_counts_from_etree(&matrix, &perm_for_tree, &parent);
+                let widths = supernode_widths_from_etree(
+                    n,
+                    &parent,
+                    &counts,
+                    SUPERNODAL_RELAXATION_TOLERANCE,
+                );
+                let widest = widths.iter().copied().max().unwrap_or(0);
+                let (sequential, blocked) = supernode_padding_cost(&u_pattern, &widths);
+                // DEGENERACY IS A RESULT, NOT AN ERROR, and it must be labelled rather than
+                // printed as a ratio. `supernode_padding_cost` counts tails reaching BEYOND the
+                // block; when the planner emits a single block spanning the matrix there are no
+                // such tails and `sequential` is 0, so a blowup ratio would be 0/0. That is
+                // exactly the envelope case, and saying so is the finding.
+                let degenerate = sequential == 0;
+                assert!(
+                    !degenerate || widths.len() <= 2,
+                    "{label} {ordering:?}: no tails despite {} blocks -- the probe is measuring \
+                     nothing and this is not the single-block case",
+                    widths.len()
+                );
+                println!(
+                    "padding {label} {ordering:?}: blocks={} widest={widest} coverage={:.3} \
+                     sequential={sequential} blocked={blocked} blowup={}",
+                    widths.len(),
+                    widest as f64 / n as f64,
+                    if degenerate {
+                        "N/A (single block spans the matrix: no tails reach beyond it)".to_string()
+                    } else {
+                        format!("{:.2}", blocked as f64 / sequential as f64)
+                    }
                 );
             }
         }
@@ -31969,6 +32066,15 @@ pub static SPLU_BANDED_FACTOR_HITS: std::sync::atomic::AtomicUsize =
 /// Factorizations the supernodal arm actually planned and ran. It DECLINES on matrices
 /// with no exploitable width or any row interchange, so this counter distinguishes
 /// "enabled" from "took effect" — a distinction that has already caught one silent
+/// Supernodal plans refused because one block covered half the matrix or more.
+///
+/// The etree supernode rule tests COUNTS, not row SETS, so on an envelope ordering it merges a
+/// whole band into one block whose columns do not actually share a pattern. This counts the
+/// refusals, so a run can show the guard fired rather than asserting that it would.
+#[doc(hidden)]
+pub static SPLU_SUPERNODAL_WIDE_BLOCK_DECLINES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// mis-measurement in this harness.
 #[doc(hidden)]
 pub static SPLU_SUPERNODAL_FACTOR_HITS: std::sync::atomic::AtomicUsize =
