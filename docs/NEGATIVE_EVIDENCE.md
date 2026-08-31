@@ -43051,3 +43051,81 @@ the smaller difference, and should be sized from the estimate that fires it leas
   blocking measured a large loss; the constant-`k` arm gate was withdrawn on a cubic regression;
   the predicted-totals gate was refuted on its own inputs; and the merge is now shown to be at
   its structural ceiling. What remains is a different DATA STRUCTURE, not a better kernel.
+
+## 2026-08-31 - CopperFalcon (cc) - KEEP / SELF-SPEEDUP + CORRECTION: my own supernodal REJECT was measured under the ordering that has NO wide blocks; under AMD the same arm is 1.2370x
+
+- **Bead: `frankenscipy-9nw95` / `frankenscipy-run7d`.** **Result class: SELF-SPEEDUP.** Both
+  arms carry the live incumbent in the same invocation, but both remain behind it, so this is
+  maintenance on the general arm and **is not claimed as a campaign win**. Nothing is shipped:
+  `SPLU_SUPERNODAL_ENABLE` stays `false`.
+- **THIS CORRECTS MY OWN ROW FROM EARLIER TODAY.** That row recorded the supernodal arm as a
+  large LOSS and named no ordering. It was run under the DEFAULT `Colamd` ordering. It is
+  correct for that ordering and wrong as a general statement, which is how I wrote it.
+- **WHY THE ORDERING DECIDES IT — measured, not argued.** Symbolic supernode partition
+  (`probe: frontal_block_width_bounds_the_matchable_ceiling`, structural counts, no clock),
+  relaxation tolerance 8:
+
+      cell + ordering        blocks   mean_width   widest   cols in blocks >= 8
+      cubic s=16 Colamd         781       5.24          7          0 / 4096  (0.000)
+      cubic s=16 Amd           2119       1.93        598       1744 / 4096  (0.426)
+      convection s=64 Colamd    804       5.09         15         27 / 4096  (0.007)
+      convection s=64 Amd      1061       3.86       2034       2542 / 4096  (0.621)
+
+  Under `Colamd` the widest supernode is **7 columns and not one column sits in a block of 8 or
+  more** — there is no wide structure for a blocked kernel to exploit, so the arm could only
+  lose. Under AMD the widest front is **598** columns on cubic and **2034** on convection, with
+  **42.6%** and **62.1%** of columns in blocks of 8 or wider. **The mean is the misleading
+  statistic here**: it is dragged to ~2 by a tail of singleton blocks while the WORK
+  concentrates in a few very large fronts, which is the classic multifrontal shape.
+
+- **THE ROWS.** `laplacian_3d_cubic` side=16, `n=4096`, `nnz=27136`, general arm, **AMD
+  ordering**, 21 rounds, `quiescence=clear`, live SciPy 1.17.1 SuperLU side-by-side in the
+  same invocation on identical fixture bytes,
+  `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`:
+
+  | arm | fsci median | ci95 | incumbent ratio | null scipy | null fsci |
+  |---|---|---|---|---|---|
+  | supernodal OFF | 112.437 ms | [111.138, 113.082] | 0.3711x | 0.9977 | 0.9890 |
+  | supernodal ON | **90.893 ms** | [89.298, 93.016] | 0.4693x | 0.9971 | 1.0008 |
+
+  **1.2370x, and the two CIs are DISJOINT** (0.3797 below 0.4603). **Decision is taken from the
+  bootstrap-median CI only, never cv; CV is provenance only.** The harness printed
+  `decided_if_ci_lo>1.0220_or_ci_hi<0.9780` on the OFF arm and
+  `decided_if_ci_lo>1.0058_or_ci_hi<0.9942` on the ON arm. The **2x A/A-null margin** is applied
+  and cleared with room: worst A/A null edge is 0.0110, so a 2x margin demands separation beyond
+  2.2%, and the observed separation is 23.7%.
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+- **HARNESS `harness=perf_splu`**, substrate
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`. **`same_host=thinkstation1` for
+  both arms**, back to back, `taskset -c 6`, one binary
+  `frankenscipy_engine_sha256=7bf18ec6b13e99dc265490978b7f8326016d1a3a684165030c8afceeb4215f2e`,
+  equivalently
+  `executed-binary sha256=7bf18ec6b13e99dc265490978b7f8326016d1a3a684165030c8afceeb4215f2e`,
+  built on **rch worker `hz2`**, run outside the build window. `requested_threads=1`,
+  `actual_observed_worker_threads=1`, `physical_cores=32`, `logical_threads=64`,
+  `ram_bytes=231687815168`, `numa_count=1`, `scaling_governor=powersave`,
+  `runtime_isa=avx2+fma`, `affinity=1 (taskset -c 6)`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.137)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.227)`.
+  Two-sided driver control observed: `supernodal_factor_hits=0` against `=89`.
+  Commands: `FSCI_SPLU_BANDED=0 FSCI_SPLU_ORDERING=amd taskset -c 6 ./target/release/perf_splu 16 21 4 off cubic on off on off|on`.
+
+- **THE SECOND CELL IS UNCONFIRMED AND I AM NOT CLAIMING IT.** The convection control
+  (supernodal OFF, AMD) failed its own A/A null **twice**, at `null_fsci` 0.9792 and 0.9793
+  against the +/-0.020 bound, at `loadavg` 16.65. Both rows are VOID and are excluded. The
+  supernodal-ON arm there did clear (0.4791x, 73.876 ms) but a treatment without a valid control
+  decides nothing. **So the width predicate is confirmed on ONE cell only.**
+- **NOTHING IS SHIPPED, deliberately.** Flipping `SPLU_SUPERNODAL_ENABLE` globally would enable
+  blocking under `Colamd` too, where it is measured to lose badly — the same shape as the
+  `expected_solves` constant I shipped and withdrew this morning. A gate keyed on the measured
+  width distribution (fraction of columns in blocks >= 8: 0.000 and 0.007 under Colamd against
+  0.426 and 0.621 under AMD) is the obvious candidate and it separates cleanly on the symbolic
+  data — but it must be confirmed on the convection cell under a quiet host before anything is
+  gated on it. **One cell is how this morning's regression happened.**
+- **Concrete retry predicate.** The supernodal REJECT is now scoped to orderings whose symbolic
+  partition has no wide blocks. Any re-test must (a) name its ordering, and (b) report
+  `cols in blocks >= 8` from the probe above, or it is repeating the original error.
