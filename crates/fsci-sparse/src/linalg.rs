@@ -1286,13 +1286,25 @@ pub(crate) struct MergeShape {
     /// stretches separates "the branch is rare" from "rare per call but long when it fires",
     /// which the element count alone cannot distinguish.
     pub(crate) target_runs: u64,
+    /// Upper bound on how many elements COULD ever be matched runs, summed per merge as
+    /// `min(|target|, |tail|)`.
+    ///
+    /// EXISTS TO PRE-COST THE DENSITY WALL (frankenscipy-run7d / llywn). Lengthening the
+    /// merge's vectors is the only remaining route on this bead and it is a multi-session
+    /// rewrite, so the question worth answering FIRST is how much room there is at all. Two
+    /// rows can only match on the columns they share, so `min` of the two lengths is the
+    /// ceiling no reordering, blocking or frontal construction can exceed. Comparing the
+    /// achieved `run_elements` against it separates "our runs are short because the kernel
+    /// is naive" from "our runs are short because the STRUCTURE is short", and only the
+    /// first is worth a rewrite.
+    pub(crate) max_matchable: u64,
 }
 
 #[cfg(test)]
 thread_local! {
     static MERGE_SHAPE: std::cell::Cell<MergeShape> = const { std::cell::Cell::new(MergeShape {
         merges: 0, inplace: 0, runs: 0, run_elements: 0, target_only: 0, tail_only: 0,
-        target_runs: 0,
+        target_runs: 0, max_matchable: 0,
     }) };
 }
 
@@ -1456,6 +1468,12 @@ fn merge_sorted_remainder(
         scratch.vals.resize(needed, 0.0);
     }
     let (out_cols, out_vals) = (&mut scratch.cols[..needed], &mut scratch.vals[..needed]);
+    // Structural ceiling for this merge: two rows can match on at most the shorter of them.
+    #[cfg(test)]
+    {
+        let ceiling = target_cols.len().min(tail_cols.len()) as u64;
+        record_merge_shape(|shape| shape.max_matchable += ceiling);
+    }
 
     let mut left = 0usize;
     let mut right = 0usize;
@@ -17320,7 +17338,8 @@ mod tests {
             println!(
                 "merge_survey {label}: stored_nnz={} runs={} run_elements={} \
                  target_only={} target_runs={} mean_target_span={:.2} tail_only={} \
-                 elements={elements} mean_run={:.2} run_share={:.4}",
+                 elements={elements} mean_run={:.2} run_share={:.4} \
+                 max_matchable={} run_vs_ceiling={:.4}",
                 factored.stored_nnz(),
                 survey.runs,
                 survey.run_elements,
@@ -17330,6 +17349,8 @@ mod tests {
                 survey.tail_only,
                 survey.run_elements as f64 / survey.runs.max(1) as f64,
                 survey.run_elements as f64 / elements.max(1) as f64,
+                survey.max_matchable,
+                survey.run_elements as f64 / survey.max_matchable.max(1) as f64,
             );
         }
         SPLU_BANDED_ENABLE.store(banded_was, std::sync::atomic::Ordering::Relaxed);

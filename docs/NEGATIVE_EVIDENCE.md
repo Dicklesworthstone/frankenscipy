@@ -42999,3 +42999,55 @@ the smaller difference, and should be sized from the estimate that fires it leas
 - **What the survey still establishes**, and it is not withdrawn: the standing note beside the
   branch is wrong about the ENVELOPE ordering being representative, since `target_only` is 0
   there and 40% under AMD. The premise was faulty; the conclusion happens to survive.
+
+## 2026-08-30 - CopperFalcon (cc) - BEHAVIORAL REJECT of the density-wall premise: the general merge already captures 98.2% of every element it could POSSIBLY match, so lengthening its runs is not a lever at all
+
+- **Bead: `frankenscipy-run7d` / `frankenscipy-llywn`.** **Result class: BEHAVIORAL.** No timing
+  claim and no timing decision. This pre-costs a multi-session rewrite before anyone starts it.
+- **`probe: merge_shape_on_the_cubic_fixture`** in `crates/fsci-sparse/src/linalg.rs`, re-runnable
+  with
+  `cargo test --release -p fsci-sparse --lib -- --ignored --nocapture merge_shape_on_the_cubic_fixture`.
+  **Probe host: `same_host=thinkstation1`, no rch worker** (local-wrapper-bypass; `rch` refuses
+  every `cargo test` verb with `missing_runtime`). The probe counts structure and reads no clock,
+  so it is host-independent by construction.
+- **THE CEILING, and why it is a real one.** Two sorted rows can match only on the columns they
+  share, so `min(|target|, |tail|)` summed per merge is an upper bound on matched-run elements
+  that **no reordering, blocking, run-directory or frontal construction operating on these rows
+  can exceed**. `max_matchable` accumulates exactly that, once per merge, beside the achieved
+  `run_elements`.
+- **The probe observed:**
+
+      cell + ordering        run_elements   max_matchable   run / ceiling   mean_run   run_share
+      cubic s=16 amd           33,609,242      34,229,877        0.9819        13.99      0.5856
+      convection s=64 amd       1,515,301       1,633,589        0.9276         9.94      0.5702
+      cubic s=16 rcm                8,351          78,295        0.1067         1.00      0.0129
+      convection s=64 rcm           4,155          16,057        0.2588         1.00      0.0235
+
+- **THE REFUTATION.** On the AMD arm — the arm this bead is about — the merge already extracts
+  **98.19%** of every element it could conceivably match on cubic and **92.76%** on convection.
+  The remaining headroom from perfect run extraction is **1.8%** and **7.2%** of matched elements
+  respectively. `llywn` records the requirement on general-kernel density as a factor of roughly three and a half. A lever
+  bounded by 1.8% cannot deliver a factor of that size, and no cleverness inside the merge changes the bound,
+  because the bound is a property of the ROWS and not of the code reading them.
+- **WHAT THIS SETTLES.** "Our runs are short because the kernel is naive" and "our runs are short
+  because the structure is short" predict the same mean run length and are distinguished only by
+  this ratio. It is the second. Mean run is 13.99 on cubic because the rows genuinely share about
+  fourteen consecutive columns — not because the merge fails to notice longer agreement. **Every
+  remaining merge-kernel lever on this bead is therefore bounded by ~2%**, which is below what
+  this harness can resolve (see the doubled-null-margin bound recorded on `mad5u`).
+- **Concrete retry predicate.** Do not spend another lever on run extraction, run directories,
+  blocking, candidate ordering or loop shape inside `merge_sorted_remainder`: the achieved
+  fraction is now measured at 0.98 and the ceiling is structural. The ONLY thing that can move
+  general-kernel density is changing what the rows CONTAIN — a frontal matrix gathers a
+  submatrix dense in both dimensions so that rows share far more columns, which raises
+  `max_matchable` itself rather than chasing the 1.8% left under it. Any such proposal must
+  state its predicted `max_matchable`, or it is proposing to chase 1.8%.
+- **Probe integrity, must-miss control.** The two RCM rows are the control: they report ratios of
+  0.1067 and 0.2588, so the counter demonstrably does NOT return ~1.0 regardless of input, and a
+  ceiling that always equalled the achieved value would be indistinguishable from a broken one.
+  `MergeShape` is `cfg(test)`, so the shipping kernel is unchanged, and these are STRUCTURAL
+  counts, which survive instrumentation where cost does not.
+- **This is the fourth and last structural avenue on `run7d` to close today.** Supernodal
+  blocking measured a large loss; the constant-`k` arm gate was withdrawn on a cubic regression;
+  the predicted-totals gate was refuted on its own inputs; and the merge is now shown to be at
+  its structural ceiling. What remains is a different DATA STRUCTURE, not a better kernel.
