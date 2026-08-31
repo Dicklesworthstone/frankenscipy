@@ -15633,6 +15633,95 @@ mod tests {
         }
     }
 
+    /// What does the supernodal width GATE cost on a factorization that DECLINES?
+    ///
+    /// THIS IS THE NUMBER THAT GATES THE GATE (frankenscipy-9nw95). The 2x2 shows the arm wins
+    /// under AMD and loses badly under Colamd, and that `cols in blocks >= 8` separates all four
+    /// cells. But a gate is only worth writing if asking the question is cheap on the runs that
+    /// answer "no" — the banded gate records a declining run measured at 0.6420x against
+    /// 1.2900x when its guards were expensive, i.e. the REFUSAL was the regression.
+    ///
+    /// WHAT IS AND IS NOT MARGINAL. `sparse_lu_fill_ordering` and the permuted rows are computed
+    /// by `factorize_csr` regardless, so they are NOT a gate cost and are excluded here. The
+    /// marginal cost is exactly `symbolic_fill_pattern` plus `supernode_widths_from_symbolic`,
+    /// which is what this times against the scalar factorization those runs would then perform.
+    ///
+    /// Reported as a SHARE, not a duration, because the absolute numbers are a loaded-host
+    /// artifact while the share is what decides whether the gate is affordable.
+    #[test]
+    #[ignore = "diagnostic: times a symbolic pass against a real factorization, run with --ignored --nocapture"]
+    fn supernodal_gate_decline_cost_share() {
+        for (label, matrix) in [
+            ("cubic side=16", splu_dirichlet_laplacian_3d(16)),
+            ("convection side=64", convection_diffusion_2d_probe(64)),
+        ] {
+            let n = matrix.shape().rows;
+            // Colamd is the DECLINING side — the one that would pay the gate for nothing.
+            for ordering in [PermutationOrdering::Colamd, PermutationOrdering::Amd] {
+                // Shared prefix, excluded from the gate cost because the factorization does it
+                // anyway. Computed once, outside both timers.
+                let fill_perm = sparse_lu_fill_ordering(&matrix, n, ordering).0;
+                let rows = match &fill_perm {
+                    Some(p) => permuted_sorted_rows(&matrix, p),
+                    None => csr_sorted_rows(&matrix),
+                };
+                let initial: Vec<Vec<u32>> =
+                    rows.iter().map(|r| r.live_cols().to_vec()).collect();
+
+                // EXPENSIVE ROUTE: materialise the whole fill pattern, then partition it.
+                let gate_clock = std::time::Instant::now();
+                let (_u, l_pattern) = symbolic_fill_pattern(n, &initial);
+                let widths = supernode_widths_from_symbolic(
+                    n,
+                    &l_pattern,
+                    SUPERNODAL_RELAXATION_TOLERANCE,
+                );
+                let in_wide: usize = widths.iter().filter(|&&w| w >= 8).sum();
+                let gate_nanos = gate_clock.elapsed().as_nanos();
+
+                // CHEAP ROUTE: the elimination tree plus column counts answer the same question
+                // without ever materialising the pattern. Timed separately because declaring the
+                // gate unaffordable on the expensive route, while a cheap one sits in the crate,
+                // would be refuting an implementation rather than the design.
+                let identity: Vec<usize> = (0..n).collect();
+                let perm_for_etree = fill_perm.clone().unwrap_or(identity);
+                let etree_clock = std::time::Instant::now();
+                let parent = elimination_tree_of_permuted(&matrix, &perm_for_etree);
+                let (counts, _total) =
+                    l_column_counts_from_etree(&matrix, &perm_for_etree, &parent);
+                let etree_widths = supernode_widths_from_etree(
+                    n,
+                    &parent,
+                    &counts,
+                    SUPERNODAL_RELAXATION_TOLERANCE,
+                );
+                let etree_in_wide: usize = etree_widths.iter().filter(|&&w| w >= 8).sum();
+                let etree_nanos = etree_clock.elapsed().as_nanos();
+
+                let factor_clock = std::time::Instant::now();
+                let lu = NativeSparseLu::factorize_csr(&matrix, 1.0, ordering)
+                    .expect("scalar factorization");
+                let factor_nanos = factor_clock.elapsed().as_nanos();
+
+                assert!(gate_nanos > 0 && factor_nanos > 0, "{label}: degenerate timing");
+                assert!(lu.stored_nnz() > 0, "{label}: degenerate factor");
+                println!(
+                    "decline_cost {label} {ordering:?}: symbolic_ms={:.3} etree_ms={:.3} \
+                     factor_ms={:.3} symbolic_share={:.4} etree_share={:.4} \
+                     cols_ge8_symbolic={:.3} cols_ge8_etree={:.3} verdict={}",
+                    gate_nanos as f64 / 1.0e6,
+                    etree_nanos as f64 / 1.0e6,
+                    factor_nanos as f64 / 1.0e6,
+                    gate_nanos as f64 / factor_nanos as f64,
+                    etree_nanos as f64 / factor_nanos as f64,
+                    in_wide as f64 / n as f64,
+                    etree_in_wide as f64 / n as f64,
+                    if in_wide as f64 / n as f64 >= 0.10 { "ACCEPT" } else { "DECLINE" },
+                );
+            }
+        }
+    }
+
     /// run7d's convection-diffusion fixture, as the perf harness builds it.
     fn convection_diffusion_2d_probe(side: usize) -> CsrMatrix {
         const DIAGONAL: f64 = 4.001;

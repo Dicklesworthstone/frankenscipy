@@ -43198,3 +43198,58 @@ the smaller difference, and should be sized from the estimate that fires it leas
   its ordering and report `cols in blocks >= 8` (probe
   `frontal_block_width_bounds_the_matchable_ceiling`), and any gate proposal must additionally
   report the measured decline cost.
+
+## 2026-08-31 - CopperFalcon (cc) - BEHAVIORAL REJECT of the supernodal PLANNER's criterion: it merges on a LOCAL test while the cost it incurs is GLOBAL, so on an envelope ordering it plans one 4096-column block that shares no pattern
+
+- **Bead: `frankenscipy-9nw95`.** **Result class: BEHAVIORAL.** No timing claim and no timing
+  decision here; the measured arm comparison lives in the 2x2 row above, which carries its own
+  nulls and CIs. This identifies the MECHANISM behind that row's losing half and specifies the
+  cheap repair.
+- **`probe: supernodal_gate_decline_cost_share`** in `crates/fsci-sparse/src/linalg.rs`,
+  re-runnable with
+  `cargo test --release -p fsci-sparse --lib -- --ignored --nocapture supernodal_gate_decline_cost_share`.
+  **Probe host: `same_host=thinkstation1`, no rch worker** (local-wrapper-bypass; `rch` refuses
+  every `cargo test` verb with `missing_runtime`).
+
+- **The probe observed** (share is against the scalar factorization it would gate):
+
+      cell + ordering        symbolic_share   etree_share   cols>=8 symbolic   cols>=8 etree
+      cubic s=16 Colamd          4.6798          0.0333          0.000            1.000
+      cubic s=16 Amd             1.3728          0.0080          0.426            0.302
+      convection s=64 Colamd     3.0310          0.0622          0.007            1.000
+      convection s=64 Amd        0.7934          0.0315          0.621            0.136
+
+- **TWO FINDINGS, AND THE SECOND IS THE IMPORTANT ONE.**
+  1. A gate computed from `symbolic_fill_pattern` is **unaffordable**: asking the question costs
+     three to four and a half times the factorization it would protect on the declining side.
+     That route is dead for admission purposes, which the shipping code already knew — the
+     planner's own comment already records the pattern route as many times the cost of a factorization.
+  2. The cheap route the planner actually uses **answers a different question**, and on the
+     decisive cells it answers it backwards. `supernode_widths_from_etree` reports **1.000** —
+     every column inside a wide block — exactly where the pattern-based measure reports
+     **0.000** and **0.007**, i.e. on the two cells where blocking is measured to be
+     catastrophic. **This is not a misuse of the helper; it is the criterion the shipping
+     planner runs**, at `factorize_csr_supernodal`.
+- **THE DEFECT, precisely.** The etree rule merges columns `j` and `j+1` when `parent[j] == j+1`
+  and `|counts[j] - (counts[j+1] + 1)| <= tolerance`. Both conditions are LOCAL, on one adjacent
+  pair. The cost they license is GLOBAL: every column admitted to a block is padded to the
+  block's row set, so a run of length `w` built from `w` individually-tolerable steps can accrue
+  up to `w * tolerance` padded entries, each a multiply-add computing nothing. On an envelope
+  ordering the elimination tree is essentially a PATH — `parent[j] == j + 1` almost everywhere —
+  and the counts fall smoothly, so every adjacent test passes and the planner emits one block
+  spanning effectively the whole matrix. The only existing guard is
+  `if widths.iter().all(|&w| w <= 1) { return None; }`, which declines only when EVERY block is
+  trivial and therefore cannot catch a single enormous one.
+- **This is what the 2x2's losing half is made of**, and it is why the loss is so much larger on
+  convection than cubic: the flatter the etree path, the bigger the bogus block.
+- **THE CHEAP REPAIR, specified rather than assumed.** The planner already has `counts` in hand
+  for free. Bound the ACCUMULATED slack across a run, or equivalently cap the run length,
+  instead of testing only adjacent pairs — both are computable from `counts` alone at no extra
+  asymptotic cost, and both would decline the RCM case while leaving the AMD case untouched. The
+  acceptance test is already written: it must reproduce `cols >= 8` near 0.000/0.007 on the two
+  Colamd cells and near 0.426/0.621 on the two AMD cells.
+- **Concrete retry predicate.** Do not gate supernodal admission on `symbolic_fill_pattern` — it
+  costs more than the work it protects. Do not trust `supernode_widths_from_etree` as a proxy for
+  pattern agreement — measured here reporting 1.000 against a true 0.000. A repair must be
+  computed from `parent`/`counts`, and must be validated against all four cells of the 2x2, not
+  one.
