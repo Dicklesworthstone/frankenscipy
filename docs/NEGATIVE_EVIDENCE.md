@@ -43582,3 +43582,63 @@ the smaller difference, and should be sized from the estimate that fires it leas
   change it refutes would have touched `PackedTriangularRows`, `from_sorted_upper_rows`, the
   backward kernel and every consumer of `lu.upper`. Phase-split first, discriminator second,
   lever last is what made the difference.
+
+## 2026-08-31 - CopperFalcon (cc) - REPLICATION under the ledger-293 rule: the per-row reading survives — the backward/forward ratio separates by 7.4x the within-cell spread, and one replicate was VOID and is excluded
+
+- **Bead: `frankenscipy-run7d`.** **Result class: REJECT** (the traversal-direction lever stays
+  refuted). This row exists because the fleet rule changed under a conclusion I had already
+  drawn: an effect must exceed the incumbent's within-run spread or it is not actionable. My
+  refutation rested on ONE run per cell, so it was owed a spread.
+- **WHAT WAS AT RISK.** I refuted my own reversed-`U` layout lever on the observation that
+  backward/forward falls from 2.045 to 1.325 as mean row length rises from 86.82 to 145.56. If
+  that ratio's run-to-run spread were comparable to the gap, I would have killed a lever on
+  noise and the honest move would have been to withdraw the refutation.
+- **FOUR REPLICATES PER CELL** (the original plus three), `FSCI_SPLU_SOLVE_STAGES=1
+  FSCI_SPLU_STAGE=solve`, shipping arm, 21 rounds each, closure held on every one
+  (0.9928-0.9930 convection, 0.9951-0.9952 cubic):
+
+      cell                    backward/forward replicates              range            spread
+      convection n=16384      2.1407  2.0637  2.0452  (+1 VOID)        [2.045, 2.141]   0.096
+      cubic      n=4096       1.3305  1.3345  1.3302  1.3249           [1.3249, 1.3345] 0.010
+
+  **One convection replicate is VOID and is excluded, not averaged in**: `null fsci/fsci=1.0247`
+  against the +/-0.020 bound, i.e. the run's own A/A control failed. It read 2.285, which would
+  have flattered the conclusion — excluding it makes the claim weaker and is therefore the only
+  defensible handling.
+- **THE VERDICT.** The gap between convection's MINIMUM (2.045) and cubic's MAXIMUM (1.3345) is
+  **0.711**, against a largest within-cell spread of **0.096**. The effect is **7.4x** that
+  spread and the two ranges are disjoint with a wide margin. **The per-row reading stands**, and
+  the traversal-direction lever stays refuted.
+- **ON INTERLEAVING, and why this design is stronger rather than exempt.** The ledger-293 rule
+  asks that arms be interleaved so drift cannot masquerade as effect. The two quantities
+  compared here are not alternating arms: forward and backward are timed **inside the same
+  solve**, in the same process, microseconds apart, on the same factor. They cannot drift
+  relative to one another — which is a stricter guarantee than interleaving, not a waiver of it.
+  What interleaving buys is supplied here by the vs-incumbent rows the split decomposes, which
+  are balanced-square ABBAABBA with their own A/A nulls.
+- **Cubic's spread is 0.7%**, which is worth recording on its own: the phase counters aggregate
+  over every solve in the run, so they are far steadier than the single-cell wall-clock ratios
+  this campaign usually works with. Convection's 4.7% is the noisier of the two and is the
+  number any future claim on this split must clear.
+- Provenance unchanged from the rows this replicates: `harness=perf_splu`, substrate
+  `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`, `same_host=thinkstation1`,
+  `taskset -c 6`, ONE binary
+  `frankenscipy_engine_sha256=b12d2972487365c8eb13942186310880c1f76f080360e241bdc6dbe86fed8ea3`
+  (`executed-binary sha256=b12d2972487365c8eb13942186310880c1f76f080360e241bdc6dbe86fed8ea3`)
+  built on **rch worker `hz2`**; cells `convection_diffusion_2d side=128 n=16384 nnz=81408` and
+  `laplacian_3d_cubic side=16 n=4096 nnz=27136`; live SciPy 1.17.1 SuperLU in the same
+  invocation, `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`. **Decision from the bootstrap-median CIs only, never cv; CV is provenance
+  only** — the underlying incumbent rows are DECIDED at [0.5079, 0.5174] and [0.8756, 0.8836].
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+
+  `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.029)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.007)`, reported not relaxed.
+- **Concrete retry predicate.** Any future claim about the solve's phase balance must clear the
+  spread recorded here — 0.096 on convection, 0.010 on cubic — and must report closure. A
+  reciprocal lever, which remains the only candidate with the right per-row shape, must also
+  carry an accuracy contract and a ULP bound, since it is not bit-identical.
