@@ -43583,7 +43583,7 @@ the smaller difference, and should be sized from the estimate that fires it leas
   backward kernel and every consumer of `lu.upper`. Phase-split first, discriminator second,
   lever last is what made the difference.
 
-## 2026-08-31 - CopperFalcon (cc) - REPLICATION under the ledger-293 rule: the per-row reading survives — the backward/forward ratio separates by 7.4x the within-cell spread, and one replicate was VOID and is excluded
+## 2026-08-31 - CopperFalcon (cc) - REJECT upheld on REPLICATION under the ledger-293 rule: the per-row reading survives — the backward/forward ratio separates by 7.4x the within-cell spread, and one replicate was VOID and is excluded
 
 - **Bead: `frankenscipy-run7d`.** **Result class: REJECT** (the traversal-direction lever stays
   refuted). This row exists because the fleet rule changed under a conclusion I had already
@@ -43638,6 +43638,12 @@ the smaller difference, and should be sized from the estimate that fires it leas
   `requested_threads=1`, `actual_observed_worker_threads=1`,
   `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.029)`,
   `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.007)`, reported not relaxed.
+- **THE 2x A/A-NULL MARGIN, applied.** The tightest surviving replicate carries
+  `null_edge=0.0039` and the loosest `0.0093`, so a 2x margin demands the compared quantities
+  sit outside [0.9814, 1.0186] — and the ratios being compared, 2.045 and 1.3345, are not
+  merely outside that band but nowhere near it, separated from each other by 0.711. **CV is
+  provenance only and decides nothing here**; every verdict above is taken from the
+  bootstrap-median CIs and from the replicate ranges, never from a coefficient of variation.
 - **Concrete retry predicate.** Any future claim about the solve's phase balance must clear the
   spread recorded here — 0.096 on convection, 0.010 on cubic — and must report closure. A
   reciprocal lever, which remains the only candidate with the right per-row shape, must also
