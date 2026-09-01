@@ -13,6 +13,7 @@
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
     use fsci_runtime::RuntimeMode;
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use fsci_sparse::linalg::{
         ITERATIVE_BATCH_LAST_WORKERS, IterativeSolveOptions, LGMRES_BATCH_FORCE_SEQUENTIAL,
         LgmresOptions, QMR_BATCH_FORCE_SEQUENTIAL, bicg, bicgstab, cg, cgs, gmres, lgmres,
@@ -29,6 +30,27 @@ mod bench {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-run.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.sparse"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a name resolving on `PATH`.
+    ///
+    /// This harness used to spawn a bare `python3`, which on `thinkstation1` is 3.14 with no
+    /// SciPy at all, so the oracle died on its first write and the run read as a flaky pipe
+    /// rather than as a missing incumbent (frankenscipy-m5s54).
+    fn incumbent() -> &'static ScipyIncumbent {
+        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+        INCUMBENT.get_or_init(|| {
+            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+                .unwrap_or_else(|error| panic!("{error}"));
+            println!("{}", resolved.provenance_line());
+            resolved
+        })
+    }
 
     const DIAGONAL: f64 = 4.001;
     const WEST: f64 = -1.2;
@@ -315,7 +337,8 @@ mod bench {
 
     impl Scipy {
         fn start(script: &Path, method: Method) -> Result<(Self, String), String> {
-            let mut child = Command::new("python3")
+            let mut child = incumbent()
+                .command()
                 .arg("-u")
                 .arg(script)
                 .arg("--live")

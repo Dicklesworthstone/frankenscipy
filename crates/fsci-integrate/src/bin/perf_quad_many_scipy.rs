@@ -7,6 +7,7 @@
 #[cfg(feature = "quad-incumbent-bench")]
 mod bench {
     use fsci_integrate::{QuadOptions, quad_many};
+    use fsci_runtime::scipy_incumbent::{PINNED_NUMPY, PINNED_SCIPY, ScipyIncumbent};
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::hint::black_box;
@@ -32,8 +33,6 @@ mod bench {
     const DURABLE_WIN_BOUNDARY: f64 = 3.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(400);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
-    const SCIPY_SITE_PACKAGES: &str =
-        "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages";
     const SCIPY_ARMS: [&str; 7] = [
         "quad_scalar",
         "quad_thread",
@@ -329,7 +328,7 @@ THREAD_POOL = ThreadPool(WORKER_CAPACITY)
 SCIPY_ENGINE_SHA256 = source_sha256()
 SCIPY_GENUINE = (
     scipy.__version__ == "1.17.1"
-    and "/frankenscipy-scipy-1.17.1/site-packages/" in scipy.__file__
+    and np.__version__ == "2.4.3"
 )
 FSCI_LOADED = any(name == "fsci" or name.startswith("fsci_") for name in sys.modules)
 print(
@@ -474,22 +473,48 @@ for line in sys.stdin:
         stopped: bool,
     }
 
+    /// Environment the live SciPy oracle spawns under.
+    ///
+    /// The resolver probes under exactly this, so a candidate interpreter cannot pass the
+    /// probe under conditions the timed spawn will not get. The single-thread BLAS pinning
+    /// lives in `fsci_runtime::scipy_incumbent::SINGLE_THREAD_ENV` and is applied by
+    /// `ScipyIncumbent::command`, so it is deliberately not repeated here.
+    const SPAWN_ENV: &[(&str, &str)] = &[("PYTHONNOUSERSITE", "1")];
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-timing.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.integrate"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a path existing.
+    ///
+    /// This harness used to name `/usr/bin/python3.13` and a pinned site-packages directory
+    /// outright. Both are gone from this host, and neither absence was checked before the
+    /// fixture reached the child's stdin, so a missing incumbent arrived as `BrokenPipe`
+    /// several lines AFTER a well-formed provenance header had printed
+    /// (frankenscipy-m5s54).
+    fn incumbent() -> Result<&'static ScipyIncumbent, String> {
+        static INCUMBENT: std::sync::OnceLock<Result<ScipyIncumbent, String>> =
+            std::sync::OnceLock::new();
+        INCUMBENT
+            .get_or_init(|| {
+                ScipyIncumbent::resolve_with(SPAWN_ENV, SCIPY_REQUIRED_MODULES)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     impl Scipy {
         fn start() -> Result<(Self, String), String> {
-            let python =
-                std::env::var("SCIPY_PYTHON").unwrap_or_else(|_| "/usr/bin/python3.13".to_string());
-            let mut child = Command::new(&python)
+            let incumbent = incumbent()?;
+            println!("{}", incumbent.provenance_line());
+            let python = incumbent.python.clone();
+            let mut child = incumbent
+                .command()
                 .arg("-u")
                 .arg("-c")
                 .arg(PYTHON_ORACLE)
-                .env("PYTHONPATH", SCIPY_SITE_PACKAGES)
-                .env("PYTHONNOUSERSITE", "1")
-                .env("OPENBLAS_NUM_THREADS", "1")
-                .env("OMP_NUM_THREADS", "1")
-                .env("MKL_NUM_THREADS", "1")
-                .env("BLIS_NUM_THREADS", "1")
-                .env("VECLIB_MAXIMUM_THREADS", "1")
-                .env("NUMEXPR_NUM_THREADS", "1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -1708,10 +1733,10 @@ for line in sys.stdin:
         let identity = ready.split('|').collect::<Vec<_>>();
         if identity.len() != 12
             || identity[0] != "READY"
-            || identity[1] != "1.17.1"
+            || identity[1] != PINNED_SCIPY
+            || identity[2] != PINNED_NUMPY
             || identity[9] != "True"
             || identity[10] != "False"
-            || !identity[11].starts_with(SCIPY_SITE_PACKAGES)
         {
             return Err(format!("live SciPy identity gate failed: {ready}"));
         }

@@ -55,6 +55,29 @@ macro_rules! emit {
 }
 
 use fsci_runtime::RuntimeMode;
+use fsci_runtime::scipy_incumbent::ScipyIncumbent;
+
+/// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+/// installation whose compiled submodules do not load, and that difference would otherwise
+/// only surface mid-run.
+const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.special"];
+
+/// The one live-SciPy incumbent this process compares against, resolved once and PROVEN by
+/// running the import rather than by a name resolving on `PATH`.
+///
+/// This harness used to spawn a bare `python3`. On `thinkstation1` that is 3.14 with no
+/// SciPy at all, so the oracle died on its first write with `BrokenPipe` and the run read as
+/// a flaky pipe rather than as a missing incumbent (frankenscipy-m5s54). Resolving names the
+/// interpreter, and prints the scipy AND numpy versions it proved, before anything is timed.
+fn incumbent() -> &'static ScipyIncumbent {
+    static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+    INCUMBENT.get_or_init(|| {
+        let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+            .unwrap_or_else(|error| panic!("{error}"));
+        println!("{}", resolved.provenance_line());
+        resolved
+    })
+}
 use fsci_special::{
     SpecialTensor, beta, betaln, dawsn, digamma, erf, erfc, erfcinv, erfinv, expit, exprel, gamma,
     gammainc, gammaincc, gammaln, hyp0f1, i0, i1, iv, ive, j0, j1, jn, jv, jve, k0, k1, kn, kv,
@@ -83,7 +106,7 @@ ref = run()
 print(f'READY scipy={scipy.__version__} numpy={np.__version__} op={op} n={n} '
       f'fixture_sha256={hashlib.sha256(raw).hexdigest()} '
       f'tasks={len(os.listdir("/proc/self/task"))} '
-      f'genuine={scipy.__version__ == "1.17.1"} out_len={ref.size}', flush=True)
+      f'genuine={scipy.__version__ == "1.17.1" and np.__version__ == "2.4.3"} out_len={ref.size}', flush=True)
 
 for line in sys.stdin.buffer:
     cmd = line.decode('ascii').strip().split()
@@ -133,7 +156,8 @@ impl Scipy {
             args.iter().all(|a| a.len() == n),
             "all argument arrays must have the same length"
         );
-        let mut child = Command::new("python3")
+        let mut child = incumbent()
+            .command()
             .args(["-u", "-c", PYTHON])
             .env("FSCI_SPECIAL_OP", op)
             .env("FSCI_SPECIAL_N", n.to_string())

@@ -45,6 +45,7 @@ use fsci_sparse::{
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod expm_bench {
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use fsci_sparse::linalg::{ExpmOptions, LAPLACIAN_FORCE_DENSE_REFERENCE, expm, laplacian};
     use fsci_sparse::{
         BsrMatrix, CscMatrix, CsrMatrix, FormatConvertible, LilMatrix, Shape2D, add_csc, hstack,
@@ -60,6 +61,27 @@ mod expm_bench {
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::{Duration, Instant};
+
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-run.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.sparse"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a name resolving on `PATH`.
+    ///
+    /// This harness used to spawn a bare `python3`, which on `thinkstation1` is 3.14 with no
+    /// SciPy at all, so the oracle died on its first write and the run read as a flaky pipe
+    /// rather than as a missing incumbent (frankenscipy-m5s54).
+    fn incumbent() -> &'static ScipyIncumbent {
+        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+        INCUMBENT.get_or_init(|| {
+            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+                .unwrap_or_else(|error| panic!("{error}"));
+            println!("{}", resolved.provenance_line());
+            resolved
+        })
+    }
 
     const REGISTERED_N: usize = 384;
     const REGISTERED_ROUNDS: usize = 21;
@@ -950,7 +972,8 @@ mod expm_bench {
         }
 
         fn start_mode(script: &Path, mode: &str) -> Result<(Self, String), String> {
-            let mut child = Command::new("python3")
+            let mut child = incumbent()
+                .command()
                 .arg("-u")
                 .arg(script)
                 .arg(mode)

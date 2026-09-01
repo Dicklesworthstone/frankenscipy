@@ -30,8 +30,31 @@
 //! conformance test — it is evidence that one can now be written, which is what `ivxx6`
 //! asks for.
 
+use fsci_runtime::scipy_incumbent::ScipyIncumbent;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+/// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+/// installation whose compiled submodules do not load, and that difference would otherwise
+/// only surface mid-run.
+const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.linalg"];
+
+/// The one live-SciPy incumbent this process compares against, resolved once and PROVEN by
+/// running the import rather than by a name resolving on `PATH`.
+///
+/// This harness used to spawn a bare `python3`. On `thinkstation1` that is 3.14 with no
+/// SciPy at all, so the oracle died on its first write with `BrokenPipe` and the run read as
+/// a flaky pipe rather than as a missing incumbent (frankenscipy-m5s54). Resolving names the
+/// interpreter, and prints the scipy AND numpy versions it proved, before anything is timed.
+fn incumbent() -> &'static ScipyIncumbent {
+    static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+    INCUMBENT.get_or_init(|| {
+        let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+            .unwrap_or_else(|error| panic!("{error}"));
+        println!("{}", resolved.provenance_line());
+        resolved
+    })
+}
 
 use fsci_linalg::{
     DecompOptions, cholesky_banded, diagsvd, eigvals_banded, orthogonal_procrustes, pinvh,
@@ -162,7 +185,8 @@ fn main() {
 
     let request = serde_json_line(&ab, &s, m_svd, n_svd, &h, &pa, &pb);
 
-    let mut child = Command::new("python3")
+    let mut child = incumbent()
+        .command()
         .args(["-u", "-c", PYTHON])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -39,14 +39,36 @@ mod bench {
         SolveIvpOptions, SolveIvpResult, SolverKind, ToleranceValue, solve_ivp, solve_ivp_many,
     };
     use fsci_runtime::RuntimeMode;
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeSet, HashSet};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
+
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-run.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.integrate"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a name resolving on `PATH`.
+    ///
+    /// This harness used to spawn a bare `python3`, which on `thinkstation1` is 3.14 with no
+    /// SciPy at all, so the oracle died on its first write and the run read as a flaky pipe
+    /// rather than as a missing incumbent (frankenscipy-m5s54).
+    fn incumbent() -> &'static ScipyIncumbent {
+        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+        INCUMBENT.get_or_init(|| {
+            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+                .unwrap_or_else(|error| panic!("{error}"));
+            println!("{}", resolved.provenance_line());
+            resolved
+        })
+    }
 
     const BDF_T_END: f64 = 1.0;
     const BDF_RTOL: f64 = 1e-8;
@@ -429,7 +451,8 @@ mod bench {
 
     impl Scipy {
         fn start(script: &str) -> Result<(Self, String), String> {
-            let mut child = Command::new("python3")
+            let mut child = incumbent()
+                .command()
                 .arg("-u")
                 .arg(script)
                 .env("OPENBLAS_NUM_THREADS", "1")

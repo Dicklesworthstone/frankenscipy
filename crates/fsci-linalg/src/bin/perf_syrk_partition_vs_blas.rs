@@ -33,10 +33,33 @@ fn main() {
 #[cfg(unix)]
 fn main() {
     use fsci_linalg::{bench_trailing_syrk_prepare, bench_trailing_syrk_run};
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use std::hint::black_box;
-    use std::process::Command;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
+
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-run.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.linalg"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a path existing (frankenscipy-m5s54).
+    ///
+    /// The probe pins every BLAS thread variable to 1 while the timed spawn sweeps them.
+    /// That is the one difference, it is stated rather than hidden, and it cannot change the
+    /// answer: a thread count does not decide whether `import scipy` succeeds. Everything
+    /// that DOES decide it -- interpreter, `PYTHONPATH`, user-site policy -- is replayed by
+    /// `ScipyIncumbent::command`, and the sweep overrides only the thread variables.
+    fn incumbent() -> &'static ScipyIncumbent {
+        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+        INCUMBENT.get_or_init(|| {
+            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+                .unwrap_or_else(|error| panic!("{error}"));
+            println!("{}", resolved.provenance_line());
+            resolved
+        })
+    }
 
     let env_usize = |k: &str, d: usize| {
         std::env::var(k)
@@ -122,18 +145,7 @@ print(f"seconds={best:.9f} threads_env={os.environ.get('OPENBLAS_NUM_THREADS','u
 "#;
 
     let time_blas = |nthreads: usize| -> String {
-        let python = std::env::var("SCIPY_PYTHON").unwrap_or_else(|_| {
-            if std::path::Path::new("/usr/bin/python3.13").exists() {
-                "/usr/bin/python3.13".into()
-            } else {
-                "python3".into()
-            }
-        });
-        let mut c = Command::new(&python);
-        let site = "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages";
-        if std::path::Path::new(site).is_dir() {
-            c.env("PYTHONPATH", site);
-        }
+        let mut c = incumbent().command();
         for key in [
             "OPENBLAS_NUM_THREADS",
             "OMP_NUM_THREADS",

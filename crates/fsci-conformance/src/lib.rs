@@ -107,6 +107,7 @@ use fsci_opt::{
     MinimizeOptions, OptError, OptimizeMethod, RootMethod, RootOptions, basinhopping, brute,
     differential_evolution, dual_annealing, minimize, minimize_with_audit, root_scalar,
 };
+use fsci_runtime::scipy_incumbent::ScipyIncumbent;
 use fsci_runtime::{AuditLedger, RuntimeMode, SolverPortfolio};
 use fsci_special::{
     Complex64, SpecialError as FsciSpecialError, SpecialErrorKind as FsciSpecialErrorKind,
@@ -2665,6 +2666,55 @@ pub struct OracleCaseOutput {
     pub error: Option<String>,
 }
 
+// ── Live-SciPy oracle interpreter ──────────────────────────────────────────
+//
+// Every differential oracle in this crate used to default to a bare `python3`. On
+// `thinkstation1` that is 3.14 with no SciPy at all, so `probe_oracle_availability` reported
+// `Missing { reason: "scipy not available" }` and roughly twenty live-SciPy conformance tests
+// skipped -- or, under `FSCI_REQUIRE_SCIPY_ORACLE=1`, failed closed -- while the pinned
+// incumbent sat one interpreter away at `/home/ubuntu/.local/bin/python3.13`. That is the
+// discovery half of `frankenscipy-m5s54`; the incumbent was never gone.
+
+/// The live-SciPy incumbent, resolved once per process and PROVEN by running the import.
+///
+/// `None` when this host has no interpreter that can import SciPy, which is the honest state
+/// on most rch workers. Callers fall back to a bare `python3` so the oracle reports
+/// `Missing` exactly as it did before rather than panicking inside a `Default` impl.
+fn oracle_incumbent() -> Option<&'static ScipyIncumbent> {
+    static INCUMBENT: OnceLock<Option<ScipyIncumbent>> = OnceLock::new();
+    INCUMBENT
+        .get_or_init(|| match ScipyIncumbent::resolve() {
+            Ok(found) => {
+                eprintln!("{}", found.provenance_line());
+                Some(found)
+            }
+            Err(error) => {
+                eprintln!("scipy_incumbent: unresolved -- {error}");
+                None
+            }
+        })
+        .as_ref()
+}
+
+/// Interpreter an oracle config defaults to: the proven incumbent when there is one.
+fn default_oracle_python() -> PathBuf {
+    oracle_incumbent().map_or_else(
+        || PathBuf::from("python3"),
+        |incumbent| PathBuf::from(&incumbent.python),
+    )
+}
+
+/// Replay the environment the incumbent was PROVEN under onto an oracle spawn.
+///
+/// Without this the `PYTHONPATH` that made the import work during resolution would be absent
+/// from the run that matters, which is the difference between probing a code path and
+/// probing something that merely resembles it.
+fn apply_oracle_env(command: &mut Command) {
+    if let Some(incumbent) = oracle_incumbent() {
+        incumbent.apply_to(command);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PythonOracleConfig {
     pub python_bin: PathBuf,
@@ -2681,7 +2731,7 @@ impl Default for PythonOracleConfig {
         // because the old default pointed there (bpmm).
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         Self {
-            python_bin: PathBuf::from("python3"),
+            python_bin: crate::default_oracle_python(),
             script_path: manifest.join("python_oracle/NO_DEFAULT_ORACLE_SET.py"),
             required: false,
         }
@@ -9724,7 +9774,9 @@ pub fn capture_linalg_oracle(
     }
 
     let python_bin = oracle.python_bin.display().to_string();
-    let output = Command::new(&oracle.python_bin)
+    let mut command = Command::new(&oracle.python_bin);
+    apply_oracle_env(&mut command);
+    let output = command
         .arg(&oracle.script_path)
         .arg(as_os_str("--fixture"))
         .arg(&fixture_path)
@@ -10245,7 +10297,9 @@ fn capture_python_oracle_inner(
     }
 
     let python_bin = oracle.python_path.display().to_string();
-    let output = Command::new(&oracle.python_path)
+    let mut command = Command::new(&oracle.python_path);
+    apply_oracle_env(&mut command);
+    let output = command
         .arg(&oracle.script_path)
         .arg(as_os_str("--fixture"))
         .arg(fixture_path)
@@ -13297,7 +13351,7 @@ impl Default for DifferentialOracleConfig {
         // that skipped the resolve step.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         Self {
-            python_path: PathBuf::from("python3"),
+            python_path: crate::default_oracle_python(),
             script_path: manifest.join("python_oracle/NO_DEFAULT_ORACLE_SET.py"),
             timeout_secs: 30,
             required: false,
@@ -18297,7 +18351,9 @@ fn probe_oracle_availability(config: &DifferentialOracleConfig) -> OracleStatus 
         };
     }
 
-    let result = Command::new(&config.python_path)
+    let mut command = Command::new(&config.python_path);
+    apply_oracle_env(&mut command);
+    let result = command
         .arg("-c")
         .arg("import scipy; print(scipy.__version__)")
         .output();
@@ -19409,7 +19465,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             strict_mode: true,
         };
         let oracle = PythonOracleConfig {
-            python_bin: PathBuf::from("python3"),
+            python_bin: crate::default_oracle_python(),
             script_path,
             required: true,
         };
@@ -20568,7 +20624,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
             strict_mode: true,
         };
         let oracle = PythonOracleConfig {
-            python_bin: PathBuf::from("python3"),
+            python_bin: crate::default_oracle_python(),
             script_path,
             required: true,
         };
@@ -20589,14 +20645,32 @@ Path(args.output).write_text(json.dumps(result, indent=2))
 
     #[test]
     fn scipy_oracle_capture_when_available() {
-        let scipy_check = Command::new("python3")
-            .arg("-c")
-            .arg("import scipy")
-            .status();
-        if !matches!(scipy_check, Ok(status) if status.success()) {
-            eprintln!("SciPy not available in this environment; skipping optional oracle test");
+        // The guard must interrogate the SAME interpreter the oracle config below will use.
+        // It used to probe a bare `python3` while `PythonOracleConfig::default()` also named
+        // `python3`, so the two agreed by accident. Once the default resolved a real
+        // incumbent the guard kept clearing on one interpreter while the packet ran on
+        // another, and the numeric comparison it guards started reporting a failed case for a
+        // reason that had nothing to do with this crate.
+        //
+        // And it is not enough for SOME SciPy to be importable. This test asserts numeric
+        // agreement, so it is only meaningful against the PINNED incumbent -- the sampled rch
+        // workers carry 1.18.1 with two different NumPy builds, and asserting agreement
+        // against whichever one a scheduler picked is the incomparability
+        // `frankenscipy-m5s54` is about. On a host without the pin this skips, loudly.
+        let Some(incumbent) = crate::oracle_incumbent() else {
+            eprintln!("no live SciPy incumbent on this host; skipping optional oracle test");
+            return;
+        };
+        if !incumbent.genuine() {
+            eprintln!(
+                "skipping optional oracle test: {}",
+                incumbent
+                    .disagreement()
+                    .unwrap_or_else(|| "not the pinned incumbent".to_string())
+            );
             return;
         }
+        eprintln!("{}", incumbent.provenance_line());
 
         let unique = format!("fsci-conformance-scipy-{}", super::now_unix_ms());
         let root = PathBuf::from("/tmp").join(unique);
@@ -20731,7 +20805,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
         fs::write(&script_path, script).expect("write mock script");
 
         let oracle = DifferentialOracleConfig {
-            python_path: PathBuf::from("python3"),
+            python_path: crate::default_oracle_python(),
             script_path,
             timeout_secs: 30,
             required: true,
@@ -21816,7 +21890,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
         fs::write(&script_path, script).expect("write mock interpolate oracle");
 
         let oracle = DifferentialOracleConfig {
-            python_path: PathBuf::from("python3"),
+            python_path: crate::default_oracle_python(),
             script_path,
             timeout_secs: 30,
             required: true,
@@ -21903,7 +21977,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
         fs::write(&script_path, script).expect("write mock io oracle");
 
         let oracle = DifferentialOracleConfig {
-            python_path: PathBuf::from("python3"),
+            python_path: crate::default_oracle_python(),
             script_path,
             timeout_secs: 30,
             required: true,

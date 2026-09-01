@@ -7,6 +7,7 @@
 #[cfg(feature = "opt-incumbent-bench")]
 mod bench {
     use fsci_opt::{RootOptions, fixed_point_many, newton_many, secant_many};
+    use fsci_runtime::scipy_incumbent::{PINNED_NUMPY, PINNED_SCIPY, ScipyIncumbent};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::hint::black_box;
@@ -41,8 +42,6 @@ mod bench {
     const DURABLE_WIN_BOUNDARY: f64 = 3.0;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(400);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
-    const SCIPY_SITE_PACKAGES: &str =
-        "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages";
     const SCIPY_ARMS: [&str; 6] = [
         "scalar_loop",
         "array_single",
@@ -526,6 +525,7 @@ fsci_loaded = any(
 )
 genuine = (
     scipy.__version__ == "1.17.1"
+    and np.__version__ == "2.4.3"
     and engine_identity
     and not fsci_loaded
 )
@@ -666,22 +666,49 @@ for raw_line in sys.stdin.buffer:
         stopped: bool,
     }
 
+    /// Environment the live SciPy oracle spawns under.
+    ///
+    /// The resolver probes under exactly this, so a candidate interpreter cannot pass the
+    /// probe under conditions the timed spawn will not get. The single-thread BLAS pinning
+    /// lives in `fsci_runtime::scipy_incumbent::SINGLE_THREAD_ENV` and is applied by
+    /// `ScipyIncumbent::command`, so it is deliberately not repeated here.
+    const SPAWN_ENV: &[(&str, &str)] = &[];
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-timing.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.optimize"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a path existing.
+    ///
+    /// This harness used to name `/usr/bin/python3.13` and a pinned site-packages directory
+    /// outright. Both are gone from this host, and neither absence was checked before the
+    /// fixture reached the child's stdin, so a missing incumbent arrived as `BrokenPipe`
+    /// several lines AFTER a well-formed provenance header had printed
+    /// (frankenscipy-m5s54).
+    fn incumbent() -> Result<&'static ScipyIncumbent, String> {
+        static INCUMBENT: std::sync::OnceLock<Result<ScipyIncumbent, String>> =
+            std::sync::OnceLock::new();
+        INCUMBENT
+            .get_or_init(|| {
+                ScipyIncumbent::resolve_with(SPAWN_ENV, SCIPY_REQUIRED_MODULES)
+                    .map_err(|error| error.to_string())
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     impl Scipy {
         fn start(data: &Dataset, solver: SolverMode) -> Result<(Self, String), String> {
-            let python =
-                std::env::var("SCIPY_PYTHON").unwrap_or_else(|_| "/usr/bin/python3.13".to_string());
-            let mut child = Command::new(&python)
+            let incumbent = incumbent()?;
+            println!("{}", incumbent.provenance_line());
+            let python = incumbent.python.clone();
+            let mut child = incumbent
+                .command()
                 .arg("-u")
                 .arg("-c")
                 .arg(PYTHON_ORACLE)
-                .env("PYTHONPATH", SCIPY_SITE_PACKAGES)
                 .env("FSCI_SOLVER_MODE", solver.label())
-                .env("OPENBLAS_NUM_THREADS", "1")
-                .env("OMP_NUM_THREADS", "1")
-                .env("MKL_NUM_THREADS", "1")
-                .env("BLIS_NUM_THREADS", "1")
-                .env("VECLIB_MAXIMUM_THREADS", "1")
-                .env("NUMEXPR_NUM_THREADS", "1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit())
@@ -2474,7 +2501,8 @@ for raw_line in sys.stdin.buffer:
             }
         };
         if !ready.starts_with("READY ")
-            || identity.get("scipy") != Some(&"1.17.1")
+            || identity.get("scipy") != Some(&PINNED_SCIPY)
+            || identity.get("numpy") != Some(&PINNED_NUMPY)
             || identity.get("genuine") != Some(&"True")
             || identity.get("fsci_loaded") != Some(&"False")
             || identity.get("solver_mode") != Some(&solver.label())

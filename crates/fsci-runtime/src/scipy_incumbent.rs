@@ -312,6 +312,27 @@ impl ScipyIncumbent {
     }
 }
 
+/// Does `python`, under this `PYTHONPATH`, actually import SciPy and every module in
+/// `required_modules`?
+///
+/// Split out of the resolver so BOTH of its answers can be exercised. The must-MISS arm is
+/// the one that matters: the selection this replaced was `Path::exists`, a predicate that
+/// cannot fail for the reason we care about, because `python3` exists on every host here and
+/// imports SciPy on almost none of them. A probe that only ever returns `true` reads exactly
+/// like a working one, right up until it routes an afternoon of rows into a broken pipe.
+#[must_use]
+pub fn interpreter_can_import_scipy(
+    python: &str,
+    pythonpath: Option<&str>,
+    required_modules: &[&str],
+) -> bool {
+    let env: BTreeMap<String, String> = SINGLE_THREAD_ENV
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+    probe(python, pythonpath, &env, required_modules).is_ok()
+}
+
 /// No interpreter on this host could import the incumbent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolveError {
@@ -478,6 +499,54 @@ mod tests {
         // A truncated line from a dying interpreter must not read as a plausible answer.
         parse_probe_line("FSCI_PROBE ok=1 scipy=1.17.1")
             .expect_err("a half-written line is not a report");
+    }
+
+    /// The probe answers BOTH ways -- the two-arm control. One arm proves nothing: blindness
+    /// and blanket-matching both print clean numbers.
+    #[test]
+    fn interpreter_probe_answers_both_ways() {
+        // MUST MISS: an interpreter that is not on the box at all. This arm needs no SciPy
+        // anywhere, so it runs identically on a bare worker.
+        assert!(
+            !interpreter_can_import_scipy("/nonexistent/bin/python-not-installed", None, &[]),
+            "probe claimed a nonexistent interpreter can import scipy"
+        );
+        // MUST MISS for the same reason even when handed a plausible PYTHONPATH: it is the
+        // IMPORT that is proven, never the existence of a directory.
+        assert!(
+            !interpreter_can_import_scipy(
+                "/nonexistent/bin/python-not-installed",
+                Some("/tmp"),
+                &[]
+            ),
+            "probe was satisfied by a path rather than by an import"
+        );
+        // MUST MISS on a real, working interpreter asked for a module that cannot exist.
+        // Without this arm, a probe that ignored `required_modules` entirely would pass.
+        assert!(
+            !interpreter_can_import_scipy(
+                "python3",
+                None,
+                &["scipy.this_submodule_does_not_exist"]
+            ),
+            "probe ignored required_modules"
+        );
+        // MUST HIT, but only where an incumbent is actually installed. Asserting
+        // unconditionally would make this a host check rather than a probe check.
+        match ScipyIncumbent::resolve() {
+            Ok(found) => {
+                assert!(
+                    interpreter_can_import_scipy(&found.python, found.pythonpath.as_deref(), &[]),
+                    "probe is not repeatable on {}",
+                    found.python
+                );
+                println!("must-hit arm observed on {}", found.python);
+            }
+            Err(_) => println!(
+                "must-hit arm SKIPPED: no candidate on this host imports scipy, so only the \
+                 must-miss arms ran here"
+            ),
+        }
     }
 
     /// End-to-end against whatever this host actually has, and it must stay meaningful on a

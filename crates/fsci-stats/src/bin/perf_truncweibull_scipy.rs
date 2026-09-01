@@ -6,14 +6,36 @@
 
 #[cfg(feature = "stats-incumbent-bench")]
 mod bench {
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use fsci_stats::{ContinuousDistribution, TruncWeibullMin};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, HashSet};
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::path::Path;
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::time::{Duration, Instant};
+
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-run.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.stats"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a path or a `PATH` name resolving.
+    ///
+    /// This harness used to spawn a bare `python3`, which on `thinkstation1` is 3.14
+    /// with no SciPy at all, so the oracle died on its first write and the run read as a
+    /// flaky pipe rather than as a missing incumbent (frankenscipy-m5s54).
+    fn incumbent() -> &'static ScipyIncumbent {
+        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+        INCUMBENT.get_or_init(|| {
+            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+                .unwrap_or_else(|error| panic!("{error}"));
+            println!("{}", resolved.provenance_line());
+            resolved
+        })
+    }
 
     const DEFAULT_ROUNDS: usize = 15;
     const DEFAULT_REPETITIONS: usize = 2_000;
@@ -193,7 +215,8 @@ for line in sys.stdin:
 
     impl Scipy {
         fn start() -> Result<(Self, String), String> {
-            let mut child = Command::new("python3")
+            let mut child = incumbent()
+                .command()
                 .arg("-u")
                 .arg("-c")
                 .arg(PYTHON_ORACLE)

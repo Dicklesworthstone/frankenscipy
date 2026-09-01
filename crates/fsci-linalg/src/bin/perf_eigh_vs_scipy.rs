@@ -39,9 +39,6 @@ mod bench {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Instant;
 
-    const SCIPY_SITE_PACKAGES: &str =
-        "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages";
-
     /// Relative eigenvalue agreement our native path contracts for (it is a
     /// tolerance-based solver, so bit-equality with LAPACK is not on offer).
     const MAX_EIGENVALUE_REL_DIFF: f64 = 1.0e-8;
@@ -128,7 +125,7 @@ print(
     f" peak_tasks={PEAK_TASKS}"
     f" thread_names={sorted(collections.Counter(THREAD_NAMES.values()).items())}"
     f" fsci_loaded={fsci_loaded}"
-    f" genuine={scipy.__version__ == '1.17.1' and not fsci_loaded}",
+    f" genuine={scipy.__version__ == '1.17.1' and np.__version__ == '2.4.3' and not fsci_loaded}",
     flush=True,
 )
 
@@ -173,22 +170,34 @@ for raw_line in sys.stdin.buffer:
         label: &'static str,
     }
 
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-run.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.linalg"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a path existing (frankenscipy-m5s54).
+    ///
+    /// The probe pins every BLAS thread variable to 1 while the timed spawn may not. That is
+    /// the one difference, it is stated rather than hidden, and it cannot change the answer:
+    /// a thread count does not decide whether `import scipy` succeeds. Everything that DOES
+    /// decide it -- interpreter, `PYTHONPATH`, user-site policy -- is replayed by
+    /// `ScipyIncumbent::command`, and the timed spawn overrides only the thread variables.
+    fn incumbent() -> &'static ScipyIncumbent {
+        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+        INCUMBENT.get_or_init(|| {
+            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+                .unwrap_or_else(|error| panic!("{error}"));
+            println!("{}", resolved.provenance_line());
+            resolved
+        })
+    }
+
     impl Scipy {
         fn start(label: &'static str, n: usize, bytes: &[u8], pin_threads: bool) -> (Self, String) {
-            let python = std::env::var("SCIPY_PYTHON").unwrap_or_else(|_| {
-                if std::path::Path::new("/usr/bin/python3.13").exists() {
-                    "/usr/bin/python3.13".to_string()
-                } else {
-                    "python3".to_string()
-                }
-            });
-            let mut command = Command::new(&python);
-            // Prefer the campaign's pinned, screened SciPy 1.17.1 when this host has
-            // it; fall back to the system interpreter's scipy (the READY line reports
-            // the version either way, so the arm is never anonymous).
-            if std::path::Path::new(SCIPY_SITE_PACKAGES).is_dir() {
-                command.env("PYTHONPATH", SCIPY_SITE_PACKAGES);
-            }
+            let incumbent = incumbent();
+            let python = incumbent.python.clone();
+            let mut command = incumbent.command();
             command
                 .arg("-u")
                 .arg("-c")
@@ -1415,6 +1424,7 @@ for raw_line in sys.stdin.buffer:
 #[cfg(all(test, feature = "eigh-incumbent-bench"))]
 mod tests {
     use super::bench::{MIN_NULL_MARGIN, Paired, null_margin};
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
 
     fn paired(ratio_p50: f64, lo: f64, hi: f64) -> Paired {
         Paired {

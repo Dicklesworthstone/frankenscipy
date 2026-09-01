@@ -8,6 +8,7 @@
 
 #[cfg(feature = "sparse-incumbent-bench")]
 mod bench {
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use fsci_sparse::{
         CsrMatrix, SPARSE_COUNT_NONZERO_FORCE_SERIAL, Shape2D, sparse_count_nonzero, sparse_nnz,
     };
@@ -21,6 +22,26 @@ mod bench {
     use std::thread;
     use std::time::{Duration, Instant};
 
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-run.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.sparse"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a path or a `PATH` name resolving.
+    ///
+    /// This harness named `/usr/bin/python3.13` outright. That path is gone from this host,
+    /// and its absence was not checked before the oracle was spawned (frankenscipy-m5s54).
+    fn incumbent() -> &'static ScipyIncumbent {
+        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+        INCUMBENT.get_or_init(|| {
+            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+                .unwrap_or_else(|error| panic!("{error}"));
+            println!("{}", resolved.provenance_line());
+            resolved
+        })
+    }
+
     const ROWS: usize = 1_048_576;
     const ENTRIES_PER_ROW: usize = 8;
     const EXPECTED_NNZ: usize = ROWS * ENTRIES_PER_ROW;
@@ -29,7 +50,6 @@ mod bench {
     const NULL_MEDIAN_BIAS_LIMIT: f64 = 0.02;
     const HOST_QUIESCENCE_SAMPLE: Duration = Duration::from_millis(300);
     const HOST_QUIESCENCE_MAX_BUSY: f64 = 0.20;
-    const PYTHON: &str = "/usr/bin/python3.13";
     const HARNESS_SOURCE: &[u8] = include_bytes!("perf_sparse_nnz.rs");
     const PRODUCTION_SOURCE: &[u8] = include_bytes!("../linalg.rs");
 
@@ -163,7 +183,8 @@ for raw in sys.stdin:
     impl Scipy {
         fn start() -> Result<(Self, String, String), String> {
             let oracle_sha256 = sha256_bytes(PYTHON_ORACLE.as_bytes());
-            let mut child = Command::new(PYTHON)
+            let mut child = incumbent()
+                .command()
                 .arg("-u")
                 .arg("-c")
                 .arg(PYTHON_ORACLE)

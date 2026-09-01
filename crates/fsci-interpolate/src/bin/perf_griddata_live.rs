@@ -17,10 +17,33 @@
 //!
 //! Usage: `perf_griddata_live [rounds] [npoints] [nqueries] [method]`
 use fsci_interpolate::{GriddataMethod, griddata};
+use fsci_runtime::scipy_incumbent::ScipyIncumbent;
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+/// installation whose compiled submodules do not load, and that difference would otherwise
+/// only surface mid-run.
+const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.interpolate"];
+
+/// The one live-SciPy incumbent this process compares against, resolved once and PROVEN by
+/// running the import rather than by a name resolving on `PATH`.
+///
+/// This harness used to spawn a bare `python3`. On `thinkstation1` that is 3.14 with no
+/// SciPy at all, so the oracle died on its first write with `BrokenPipe` and the run read as
+/// a flaky pipe rather than as a missing incumbent (frankenscipy-m5s54). Resolving names the
+/// interpreter, and prints the scipy AND numpy versions it proved, before anything is timed.
+fn incumbent() -> &'static ScipyIncumbent {
+    static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+    INCUMBENT.get_or_init(|| {
+        let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+            .unwrap_or_else(|error| panic!("{error}"));
+        println!("{}", resolved.provenance_line());
+        resolved
+    })
+}
 
 fn lcg(state: &mut u64) -> f64 {
     *state = state
@@ -246,7 +269,8 @@ fn elf_sha256() -> String {
 
 impl ScipyArm {
     fn start(script: &str, fixture: &str) -> Self {
-        let mut child = Command::new("python3")
+        let mut child = incumbent()
+            .command()
             .arg(script)
             .arg(fixture)
             .stdin(Stdio::piped())

@@ -11,6 +11,29 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
 use fsci_fft::{Complex64, FftOptions, WorkerPolicy, fft, rfft};
+use fsci_runtime::scipy_incumbent::ScipyIncumbent;
+
+/// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+/// installation whose compiled submodules do not load, and that difference would otherwise
+/// only surface mid-run.
+const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.fft"];
+
+/// The one live-SciPy incumbent this process compares against, resolved once and PROVEN by
+/// running the import rather than by a name resolving on `PATH`.
+///
+/// This harness used to spawn a bare `python3`. On `thinkstation1` that is 3.14 with no
+/// SciPy at all, so the oracle died on its first write with `BrokenPipe` and the run read as
+/// a flaky pipe rather than as a missing incumbent (frankenscipy-m5s54). Resolving names the
+/// interpreter, and prints the scipy AND numpy versions it proved, before anything is timed.
+fn incumbent() -> &'static ScipyIncumbent {
+    static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+    INCUMBENT.get_or_init(|| {
+        let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+            .unwrap_or_else(|error| panic!("{error}"));
+        println!("{}", resolved.provenance_line());
+        resolved
+    })
+}
 
 const SIZES: &[usize] = &[
     1 << 16,
@@ -76,7 +99,8 @@ struct ScipyServer {
 
 impl ScipyServer {
     fn start() -> Self {
-        let mut child = Command::new("python3")
+        let mut child = incumbent()
+            .command()
             .args(["-u", "-c", PYTHON_DRIVER])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

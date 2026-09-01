@@ -91,10 +91,10 @@ mod bench {
         }
     }
 
-
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
@@ -104,25 +104,6 @@ mod bench {
     const SQUARE: [u8; 8] = *b"ABBAABBA";
     /// A per-arm A/A null must land within this of 1.0 or the row is void.
     const NULL_BOUND: f64 = 0.02;
-    /// Site-packages directories that have held the pinned SciPy incumbent, newest first.
-    ///
-    /// The first entry was the only one this harness knew, it no longer exists, and its
-    /// disappearance was SILENT: `is_dir()` was false, `PYTHONPATH` went unset, the spawn
-    /// fell through to a bare `python3` with no SciPy, and the failure surfaced as
-    /// `send fixture to SciPy: BrokenPipe` — several lines AFTER the provenance block had
-    /// already printed a well-formed host/ELF header. A row that dies that way looks like a
-    /// flaky pipe rather than a missing incumbent, which is the expensive way to lose an
-    /// afternoon. `resolve_scipy_interpreter` below now proves the import before timing.
-    const SCIPY_SITE_PACKAGES: [&str; 2] = [
-        "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages",
-        "/home/ubuntu/.local/lib/python3.13/site-packages",
-    ];
-    /// Interpreters to try, in order, when `SCIPY_PYTHON` is unset.
-    const SCIPY_PYTHON_CANDIDATES: [&str; 3] = [
-        "/usr/bin/python3.13",
-        "/home/ubuntu/.local/bin/python3.13",
-        "python3",
-    ];
     /// Both factorizations solve the same RHS before any timing; they use
     /// different orderings and pivot thresholds, so agreement is to solve
     /// accuracy, not to bits.
@@ -403,7 +384,7 @@ print(
     f" observed_os_tasks={len(os.listdir('/proc/self/task'))}"
     f" affinity={len(os.sched_getaffinity(0))}"
     f" fsci_loaded={fsci_loaded}"
-    f" genuine={scipy.__version__ == '1.17.1' and not fsci_loaded}",
+    f" genuine={scipy.__version__ == '1.17.1' and np.__version__ == '2.4.3' and not fsci_loaded}",
     flush=True,
 )
 
@@ -444,102 +425,34 @@ for raw_line in sys.stdin.buffer:
         stopped: bool,
     }
 
-    /// Pick an interpreter that can actually `import scipy`, and say so before any timing.
-    ///
-    /// WHY THIS PROBES INSTEAD OF ASSUMING. The incumbent arm is the whole point of this
-    /// harness, so "no incumbent" must be a loud refusal, not a degraded run. Both halves of
-    /// the old selection had gone stale at once — `/usr/bin/python3.13` was absent and the
-    /// pinned site-packages directory had been removed — and neither is checked by anything
-    /// that runs before the fixture is written to the child's stdin. The import is therefore
-    /// PROVEN here, by running it, rather than inferred from a path existing.
-    ///
-    /// `SCIPY_PYTHON` still wins outright when set: an explicit pin is a deliberate act and
-    /// this must not silently route around it. It is probed too, so a typo fails with the
-    /// interpreter named rather than as a broken pipe.
-    /// Does this interpreter, under this `PYTHONPATH`, actually import SciPy?
-    ///
-    /// Split out of `resolve_scipy_interpreter` so both of its answers can be exercised:
-    /// a probe that only ever ran against a working interpreter would report `true` whether
-    /// it was testing the import or testing nothing at all.
-    fn interpreter_can_import_scipy(python: &str, site: Option<&str>) -> bool {
-        let mut probe = Command::new(python);
-        if let Some(path) = site {
-            probe.env("PYTHONPATH", path);
-        }
-        probe
-            .arg("-c")
-            .arg("import scipy, scipy.sparse.linalg")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
-    }
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-timing.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.sparse.linalg"];
 
-    fn resolve_scipy_interpreter() -> (String, Option<String>) {
-        // `None` first: the candidate may already have SciPy on its own default path, and
-        // prepending a foreign site-packages to a working interpreter is how version skew
-        // gets introduced.
-        let site_options: Vec<Option<String>> = std::iter::once(None)
-            .chain(
-                SCIPY_SITE_PACKAGES
-                    .iter()
-                    .filter(|path| std::path::Path::new(*path).is_dir())
-                    .map(|path| Some((*path).to_string())),
-            )
-            .collect();
-        let candidates: Vec<String> = match std::env::var("SCIPY_PYTHON") {
-            Ok(pinned) if !pinned.is_empty() => vec![pinned],
-            _ => SCIPY_PYTHON_CANDIDATES
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
-        };
-
-        let mut tried: Vec<String> = Vec::new();
-        for python in &candidates {
-            for site in &site_options {
-                let ok = interpreter_can_import_scipy(python, site.as_deref());
-                tried.push(format!(
-                    "{python}+{}={}",
-                    site.as_deref().unwrap_or("<default>"),
-                    if ok { "ok" } else { "no" }
-                ));
-                if ok {
-                    println!(
-                        "scipy_interpreter: {python} pythonpath={} (probed {} candidate(s))",
-                        site.as_deref().unwrap_or("<default>"),
-                        tried.len()
-                    );
-                    return (python.clone(), site.clone());
-                }
-            }
-        }
-        panic!(
-            "no interpreter on this host can `import scipy`, so there is no live incumbent \
-             to compare against and every ratio this harness could print would be \
-             meaningless. Set SCIPY_PYTHON to one that can. Probed: {}",
-            tried.join(" ")
-        );
+    /// The one live-SciPy incumbent this process compares against.
+    ///
+    /// This harness is where the stale-discovery failure was first caught, and it carried the
+    /// only working resolver in the workspace while 26 neighbours still hard-coded paths that
+    /// no longer exist. That resolver now lives in `fsci_runtime::scipy_incumbent` so every
+    /// harness answers the question the same way; this is the same mechanism, not a new one,
+    /// and it additionally reports the NumPy version the row needs to be comparable
+    /// (frankenscipy-m5s54).
+    fn incumbent() -> &'static ScipyIncumbent {
+        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+        INCUMBENT.get_or_init(|| {
+            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+                .unwrap_or_else(|error| panic!("{error}"));
+            println!("{}", resolved.provenance_line());
+            resolved
+        })
     }
 
     impl Scipy {
         fn start(n: usize, nnz: usize, payload: &[u8]) -> (Self, String) {
-            let (python, site_packages) = resolve_scipy_interpreter();
-            let mut command = Command::new(&python);
-            if let Some(path) = site_packages.as_deref() {
-                command.env("PYTHONPATH", path);
-            }
-            for key in [
-                "OPENBLAS_NUM_THREADS",
-                "OMP_NUM_THREADS",
-                "MKL_NUM_THREADS",
-                "BLIS_NUM_THREADS",
-                "VECLIB_MAXIMUM_THREADS",
-                "NUMEXPR_NUM_THREADS",
-            ] {
-                command.env(key, "1");
-            }
+            let incumbent = incumbent();
+            let python = incumbent.python.clone();
+            let mut command = incumbent.command();
             let mut child = command
                 .arg("-u")
                 .arg("-c")
@@ -1687,10 +1600,13 @@ for raw_line in sys.stdin.buffer:
     #[cfg(test)]
     mod tests {
         use super::{
-            Fixture, Ordering, RunConfig, SCIPY_PYTHON_CANDIDATES, SCIPY_SITE_PACKAGES,
-            SPLU_BACK_MERGE_ENABLE, SPLU_PARTIAL_INPLACE_ENABLE, SPLU_ROW_HEAD_CACHE_DISABLE,
-            SPLU_SUPERNODAL_ENABLE, balanced_square_quiescence, interpreter_can_import_scipy,
-            is_help_request, ns_per_unit, parse_run_config, replicate_summary, run_aggregate,
+            Fixture, Ordering, RunConfig, SCIPY_REQUIRED_MODULES, SPLU_BACK_MERGE_ENABLE,
+            SPLU_PARTIAL_INPLACE_ENABLE, SPLU_ROW_HEAD_CACHE_DISABLE, SPLU_SUPERNODAL_ENABLE,
+            balanced_square_quiescence, is_help_request, ns_per_unit, parse_run_config,
+            replicate_summary, run_aggregate,
+        };
+        use fsci_runtime::scipy_incumbent::{
+            PYTHON_CANDIDATES, SITE_PACKAGES_CANDIDATES, interpreter_can_import_scipy,
         };
 
         fn args(values: &[&str]) -> Vec<String> {
@@ -1744,14 +1660,15 @@ for raw_line in sys.stdin.buffer:
             assert_eq!(replicate_summary(&values), replicate_summary(&values));
         }
 
-        /// The interpreter probe answers BOTH ways — the two-arm control.
+        /// The interpreter probe answers BOTH ways -- the two-arm control.
         ///
-        /// The must-MISS arm is the one that matters. Before this probe existed the harness
-        /// selected an interpreter by `Path::exists`, which is a predicate that cannot fail
-        /// for the reason we care about: `python3` exists on every host here and imports
-        /// SciPy on almost none of them. A probe that only ever returns `true` reads exactly
-        /// like a working one right up until it routes a whole afternoon of rows into a
-        /// broken pipe, which is how this defect was found.
+        /// The probe itself now lives in `fsci_runtime::scipy_incumbent`, because this
+        /// harness was the only one in the workspace that had it while 26 neighbours still
+        /// selected an interpreter by `Path::exists`. That predicate cannot fail for the
+        /// reason we care about: `python3` exists on every host here and imports SciPy on
+        /// almost none of them. This test stays HERE as well as there because it is this
+        /// harness's own contract that its incumbent arm is real, and because a shared
+        /// helper is exactly the kind of thing that gets swapped out from under a caller.
         #[test]
         fn scipy_interpreter_probe_answers_both_ways() {
             // MUST MISS: an interpreter that is not on the box at all. This arm needs no
@@ -1759,7 +1676,8 @@ for raw_line in sys.stdin.buffer:
             assert!(
                 !interpreter_can_import_scipy(
                     "/nonexistent/bin/python-that-is-not-installed",
-                    None
+                    None,
+                    SCIPY_REQUIRED_MODULES
                 ),
                 "probe claimed a nonexistent interpreter can import scipy"
             );
@@ -1768,34 +1686,36 @@ for raw_line in sys.stdin.buffer:
             assert!(
                 !interpreter_can_import_scipy(
                     "/nonexistent/bin/python-that-is-not-installed",
-                    Some("/tmp")
+                    Some("/tmp"),
+                    SCIPY_REQUIRED_MODULES
                 ),
                 "probe was satisfied by a path rather than by an import"
             );
             // MUST HIT, but only where a live incumbent is actually installed. Asserting
             // unconditionally would make this test a host check rather than a probe check,
             // and it would fail on workers that legitimately carry no SciPy.
-            let (python, site) = SCIPY_PYTHON_CANDIDATES
+            let found = PYTHON_CANDIDATES
                 .iter()
                 .flat_map(|python| {
                     std::iter::once((*python, None)).chain(
-                        SCIPY_SITE_PACKAGES
+                        SITE_PACKAGES_CANDIDATES
                             .iter()
                             .map(move |path| (*python, Some(*path))),
                     )
                 })
-                .find(|(python, site)| interpreter_can_import_scipy(python, *site))
-                .map_or((None, None), |(python, site)| (Some(python), site));
-            if let Some(python) = python {
+                .find(|(python, site)| {
+                    interpreter_can_import_scipy(python, *site, SCIPY_REQUIRED_MODULES)
+                });
+            if let Some((python, site)) = found {
                 assert!(
-                    interpreter_can_import_scipy(python, site),
+                    interpreter_can_import_scipy(python, site, SCIPY_REQUIRED_MODULES),
                     "probe is not repeatable on {python}"
                 );
                 println!("must-hit arm observed on {python} site={site:?}");
             } else {
                 println!(
                     "must-hit arm SKIPPED: no candidate on this host imports scipy, so only \
-                     the must-miss arm ran here"
+                     the must-miss arms ran here"
                 );
             }
         }
@@ -2023,7 +1943,10 @@ for raw_line in sys.stdin.buffer:
             // back to the same guess that produced the malformed command.
             for (argv, expected) in [
                 (vec!["perf_splu", "24", "x"], "rounds must be an integer"),
-                (vec!["perf_splu", "24", "41", "x"], "warmup must be an integer"),
+                (
+                    vec!["perf_splu", "24", "41", "x"],
+                    "warmup must be an integer",
+                ),
                 (
                     vec!["perf_splu", "24", "41", "4", "maybe"],
                     "spectral arm must be `on` or `off`",
@@ -2037,12 +1960,31 @@ for raw_line in sys.stdin.buffer:
                     "back-merge arm must be `on` or `off`",
                 ),
                 (
-                    vec!["perf_splu", "24", "41", "4", "off", "cubic", "on", "off", "yes"],
+                    vec![
+                        "perf_splu",
+                        "24",
+                        "41",
+                        "4",
+                        "off",
+                        "cubic",
+                        "on",
+                        "off",
+                        "yes",
+                    ],
                     "partial-inplace arm must be `on` or `off`",
                 ),
                 (
                     vec![
-                        "perf_splu", "24", "41", "4", "off", "cubic", "on", "off", "on", "yes",
+                        "perf_splu",
+                        "24",
+                        "41",
+                        "4",
+                        "off",
+                        "cubic",
+                        "on",
+                        "off",
+                        "on",
+                        "yes",
                     ],
                     "supernodal arm must be `on` or `off`",
                 ),
@@ -2062,7 +2004,17 @@ for raw_line in sys.stdin.buffer:
             // argument too many has mistaken the positional order, and every arm after the
             // mistake is then wrong. Refuse the whole command rather than the tail.
             let error = parse_run_config(&args(&[
-                "perf_splu", "24", "41", "4", "off", "cubic", "on", "off", "on", "off", "off",
+                "perf_splu",
+                "24",
+                "41",
+                "4",
+                "off",
+                "cubic",
+                "on",
+                "off",
+                "on",
+                "off",
+                "off",
             ]))
             .expect_err("a tenth selector must be refused, not ignored");
             assert!(
@@ -2073,7 +2025,16 @@ for raw_line in sys.stdin.buffer:
             // MUST-HIT for this test too: the longest LEGAL command still parses, so the
             // arity guard is refusing the tenth selector and not the ninth.
             let full = parse_run_config(&args(&[
-                "perf_splu", "24", "41", "4", "off", "cubic", "on", "off", "on", "off",
+                "perf_splu",
+                "24",
+                "41",
+                "4",
+                "off",
+                "cubic",
+                "on",
+                "off",
+                "on",
+                "off",
             ]))
             .expect("the nine-selector form must still parse");
             assert_eq!(

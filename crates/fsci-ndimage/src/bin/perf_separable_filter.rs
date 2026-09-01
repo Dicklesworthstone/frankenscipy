@@ -6,9 +6,30 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Instant;
 
 use fsci_ndimage::{BoundaryMode, NdArray, gaussian_filter, gaussian_filter1d, uniform_filter};
+use fsci_runtime::scipy_incumbent::ScipyIncumbent;
 
-const SCIPY_SITE_PACKAGES: &str =
-    "/data/projects/.python-incumbents/frankenscipy-scipy-1.17.1/site-packages";
+/// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+/// installation whose compiled submodules do not load, and that difference would otherwise
+/// only surface mid-run.
+const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.ndimage"];
+
+/// The one live-SciPy incumbent this process compares against, resolved once and PROVEN by
+/// running the import rather than by a name resolving on `PATH`.
+///
+/// This harness used to spawn a bare `python3`. On `thinkstation1` that is 3.14 with no
+/// SciPy at all, so the oracle died on its first write with `BrokenPipe` and the run read as
+/// a flaky pipe rather than as a missing incumbent (frankenscipy-m5s54). Resolving names the
+/// interpreter, and prints the scipy AND numpy versions it proved, before anything is timed.
+fn incumbent() -> &'static ScipyIncumbent {
+    static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+    INCUMBENT.get_or_init(|| {
+        let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+            .unwrap_or_else(|error| panic!("{error}"));
+        println!("{}", resolved.provenance_line());
+        resolved
+    })
+}
+
 const PYTHON: &str = r#"
 import hashlib, os, sys, time
 import numpy as np
@@ -27,7 +48,7 @@ def run():
 ref = run()
 try: blas = np.__config__.CONFIG['Build Dependencies']['blas']['name']
 except Exception: blas = 'unknown'
-print(f'READY scipy={scipy.__version__} numpy={np.__version__} blas={blas} fixture_sha256={hashlib.sha256(raw).hexdigest()} tasks={len(os.listdir("/proc/self/task"))} genuine={scipy.__version__ == "1.17.1"}', flush=True)
+print(f'READY scipy={scipy.__version__} numpy={np.__version__} blas={blas} fixture_sha256={hashlib.sha256(raw).hexdigest()} tasks={len(os.listdir("/proc/self/task"))} genuine={scipy.__version__ == "1.17.1" and np.__version__ == "2.4.3"}', flush=True)
 for line in sys.stdin.buffer:
     cmd = line.decode('ascii').strip().split()
     if cmd[0] == 'TIME':
@@ -84,11 +105,11 @@ impl Scipy {
             .map(usize::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let mut child = Command::new("python3")
+        let mut child = incumbent()
+            .command()
             .arg("-u")
             .arg("-c")
             .arg(PYTHON)
-            .env("PYTHONPATH", SCIPY_SITE_PACKAGES)
             .env("FSCI_NDIMAGE_SHAPE", shape)
             .env("FSCI_NDIMAGE_OP", op.name())
             .stdin(Stdio::piped())
