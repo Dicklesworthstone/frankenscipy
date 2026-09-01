@@ -12,7 +12,9 @@
 //! | `evidence`  | [`PolicyEvidenceLedger`], [`DecisionEvidenceEntry`]        |
 //! | `policy`    | [`PolicyController`], loss matrices, risk-state model      |
 //! | `scipy_incumbent` | [`ScipyIncumbent`]: the one live-SciPy oracle resolver |
+//! | `booking_claim` | [`BookingClaim`]: verifies the fleet measurement booking a timed row cites |
 
+pub mod booking_claim;
 pub mod evidence;
 pub mod mode;
 pub mod policy;
@@ -20,6 +22,7 @@ pub mod scipy_incumbent;
 pub mod signals;
 
 // ── Re-exports: preserve the flat public API ────────────────────────
+pub use booking_claim::{BookingClaim, ClaimRejection, FleetBooking};
 pub use evidence::{
     AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, DecisionEvidenceEntry,
     PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
