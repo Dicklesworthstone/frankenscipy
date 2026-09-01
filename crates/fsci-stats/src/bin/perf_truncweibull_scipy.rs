@@ -1039,7 +1039,16 @@ for line in sys.stdin:
         let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
         let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
         let build_route = required_env("BINARY_BUILD_ROUTE")?;
-        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
+        let verified_claim = fsci_runtime::booking_claim::verify_for_harness()
+            .map_err(|rejection| rejection.to_string())?;
+        println!("{}", verified_claim.provenance_line());
+        for conflict in fsci_runtime::booking_claim::fleet_conflicts_now() {
+            println!(
+                "fleet_booking_conflict: project={} agent={} age_seconds={} subject={:?}",
+                conflict.project_slug, conflict.agent, conflict.age_seconds, conflict.subject
+            );
+        }
+        let booking_claim = verified_claim.message_id.to_string();
         println!("elf_sha256={elf_sha256}");
         println!("frankenscipy_engine_sha256={elf_sha256}");
         println!(

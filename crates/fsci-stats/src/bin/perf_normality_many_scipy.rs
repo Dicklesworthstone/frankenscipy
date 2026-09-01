@@ -1682,13 +1682,16 @@ for line in sys.stdin:
     }
 
     fn require_booking_claim() -> Result<String, String> {
-        let value = std::env::var("TRJ_BOOKING_CLAIM_MESSAGE_ID")
-            .map_err(|_| "missing TRJ_BOOKING_CLAIM_MESSAGE_ID".to_string())?;
-        let id: u64 = parse(&value, "TRJ booking claim message id")?;
-        if id == 0 {
-            return Err("TRJ booking claim message id must be non-zero".to_string());
+        let claim = fsci_runtime::booking_claim::verify_for_harness()
+            .map_err(|rejection| rejection.to_string())?;
+        println!("{}", claim.provenance_line());
+        for conflict in fsci_runtime::booking_claim::fleet_conflicts_now() {
+            println!(
+                "fleet_booking_conflict: project={} agent={} age_seconds={} subject={:?}",
+                conflict.project_slug, conflict.agent, conflict.age_seconds, conflict.subject
+            );
         }
-        Ok(value)
+        Ok(claim.message_id.to_string())
     }
 
     fn require_env(name: &str) -> Result<String, String> {
