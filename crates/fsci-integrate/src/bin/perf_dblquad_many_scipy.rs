@@ -1626,12 +1626,16 @@ for line in sys.stdin:
         let booking_claim = if smoke {
             "smoke-only".to_string()
         } else {
-            let value = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
-            let numeric: u64 = parse(&value, "numeric trj booking claim")?;
-            if numeric == 0 {
-                return Err("trj booking claim must be positive".to_string());
+            let claim = fsci_runtime::booking_claim::verify_for_harness()
+                .map_err(|rejection| rejection.to_string())?;
+            println!("{}", claim.provenance_line());
+            for conflict in fsci_runtime::booking_claim::fleet_conflicts_now() {
+                println!(
+                    "fleet_booking_conflict: project={} agent={} age_seconds={} subject={:?}",
+                    conflict.project_slug, conflict.agent, conflict.age_seconds, conflict.subject
+                );
             }
-            value
+            claim.message_id.to_string()
         };
         println!(
             "binary_provenance: source_commit={source_commit} \

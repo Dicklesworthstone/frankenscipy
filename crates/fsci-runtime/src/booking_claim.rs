@@ -287,6 +287,7 @@ pub struct FleetBooking {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimRejection {
     Missing,
+    MissingAgent,
     Malformed {
         value: String,
     },
@@ -328,6 +329,10 @@ pub enum ClaimRejection {
 impl std::fmt::Display for ClaimRejection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::MissingAgent => write!(
+                formatter,
+                "AGENT_NAME is required: a booking is verified against the agent that sent it"
+            ),
             Self::Missing => write!(
                 formatter,
                 "{CLAIM_ENV} is required: send an addressed agent-mail message whose subject \
@@ -412,6 +417,36 @@ pub fn project_slug(project_key: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The project every harness in this workspace books against.
+pub const PROJECT_KEY: &str = "/data/projects/frankenscipy";
+
+/// The one call a timed harness makes: verify this run's booking, or refuse.
+///
+/// The measuring agent comes from `AGENT_NAME` because a booking is only evidence if it names
+/// who made it -- "some booking exists" was the old gate, and it is what let any string pass.
+pub fn verify_for_harness() -> Result<BookingClaim, ClaimRejection> {
+    let agent = std::env::var("AGENT_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or(ClaimRejection::MissingAgent)?;
+    verify_from_env(PROJECT_KEY, agent.trim())
+}
+
+/// Other projects' live bookings right now, for a harness to report into its row.
+///
+/// Reported rather than fatal: refusing here would let one project's stale booking block the
+/// fleet, which is a policy change for other repositories to make, not a check to smuggle in.
+pub fn fleet_conflicts_now() -> Vec<FleetBooking> {
+    let Some(root) = default_archive_root() else {
+        return Vec::new();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+    BookingClaim::fleet_conflicts_in(&root, &project_slug(PROJECT_KEY), now, DEFAULT_MAX_AGE_SECS)
 }
 
 /// Read [`CLAIM_ENV`] and verify it, against the real archive and the current clock.
