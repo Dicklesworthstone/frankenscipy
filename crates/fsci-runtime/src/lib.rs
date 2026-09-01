@@ -11,10 +11,12 @@
 //! | `signals`   | [`DecisionSignals`], [`SignalSequence`] for replay testing |
 //! | `evidence`  | [`PolicyEvidenceLedger`], [`DecisionEvidenceEntry`]        |
 //! | `policy`    | [`PolicyController`], loss matrices, risk-state model      |
+//! | `scipy_incumbent` | [`ScipyIncumbent`]: the one live-SciPy oracle resolver |
 
 pub mod evidence;
 pub mod mode;
 pub mod policy;
+pub mod scipy_incumbent;
 pub mod signals;
 
 // ── Re-exports: preserve the flat public API ────────────────────────
