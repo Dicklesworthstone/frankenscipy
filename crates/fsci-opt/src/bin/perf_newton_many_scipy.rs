@@ -2333,13 +2333,16 @@ for raw_line in sys.stdin.buffer:
     }
 
     fn require_booking_claim() -> Result<String, String> {
-        let claim = require_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
-        if claim.is_empty() || !claim.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(format!(
-                "invalid numeric trj booking claim message ID: {claim}"
-            ));
+        let claim = fsci_runtime::booking_claim::verify_for_harness()
+            .map_err(|rejection| rejection.to_string())?;
+        println!("{}", claim.provenance_line());
+        for conflict in fsci_runtime::booking_claim::fleet_conflicts_now() {
+            println!(
+                "fleet_booking_conflict: project={} agent={} age_seconds={} subject={:?}",
+                conflict.project_slug, conflict.agent, conflict.age_seconds, conflict.subject
+            );
         }
-        Ok(claim)
+        Ok(claim.message_id.to_string())
     }
 
     fn rust_version() -> Result<String, String> {

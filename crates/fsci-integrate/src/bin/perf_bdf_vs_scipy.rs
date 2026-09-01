@@ -2737,18 +2737,22 @@ mod bench {
             Err(error) => println!("cpu_frequency_policy: unavailable({error})"),
         }
         if host == "threadripperje" && fixture.is_batch_job() {
-            let claim_message_id = std::env::var("TRJ_BOOKING_CLAIM_MESSAGE_ID")
-                .ok()
-                .filter(|value| {
-                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-                })
-                .unwrap_or_else(|| {
+            let claim =
+                fsci_runtime::booking_claim::verify_for_harness().unwrap_or_else(|rejection| {
                     eprintln!(
                         "ABORT: a trj batch benchmark requires an exclusive \
-                         Agent Mail booking; set TRJ_BOOKING_CLAIM_MESSAGE_ID"
+                         Agent Mail booking; {rejection}"
                     );
                     std::process::exit(2);
                 });
+            println!("{}", claim.provenance_line());
+            for conflict in fsci_runtime::booking_claim::fleet_conflicts_now() {
+                println!(
+                    "fleet_booking_conflict: project={} agent={} age_seconds={} subject={:?}",
+                    conflict.project_slug, conflict.agent, conflict.age_seconds, conflict.subject
+                );
+            }
+            let claim_message_id = claim.message_id;
             println!("trj_booking_claim_message_id={claim_message_id}");
         }
         println!("cpu_affinity={affinity}");
