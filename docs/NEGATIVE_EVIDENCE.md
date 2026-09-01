@@ -43511,3 +43511,74 @@ the smaller difference, and should be sized from the estimate that fires it leas
   that does not name which of the three phases it moves, and does not report closure, is aimed
   by guess — which is how the block-advance and lazy-schedule levers on this bead were aimed
   before they measured null.
+
+## 2026-08-31 - CopperFalcon (cc) - REJECT of my OWN traversal-direction lever, before building it: the U/L excess FALLS as rows lengthen, so it is per-ROW, not per-entry
+
+- **Bead: `frankenscipy-run7d`.** **Result class: REJECT.** What is refused is the lever I
+  specified one commit earlier — reversing `U`'s storage so the backward sweep ascends memory.
+  It was never built. Nothing shipped, nothing reverted.
+- **THE PREDICTION THAT KILLED IT.** Traversal direction is a per-ENTRY cost: it should scale
+  with entries and leave the backward/forward ratio roughly constant across cells. A per-ROW
+  cost — the divide and pivot validation that only the `U` sweep performs — amortises as rows
+  get longer, so its ratio must FALL on a cell with longer rows. The two cells differ enough to
+  separate them: mean row length 86.82 against 145.56.
+
+      cell                  mean row   forward_ms   backward_ms   backward/forward   closure
+      convection n=16384       86.82     1006.573      2058.613        2.045          0.9928
+      cubic      n=4096       145.56      466.818       618.467        1.325          0.9951
+
+  **The ratio falls from 2.045 to 1.325 as rows lengthen by 1.68x.** That is the per-row
+  signature. A purely per-entry cause predicts no such movement, so traversal direction cannot
+  be the dominant term and the layout change would have bought little.
+- **THREE CHEAPER CAUSES WERE RULED OUT FIRST**, all counted and clock-free
+  (`probe: solve_phase_entry_counts_l_versus_u`):
+  - **Volume**: `upper/lower` entries 1.012 (convection) and 1.007 (cubic). U holds ~1% more
+    data and cost up to 2.045x as much, so the gap is not work.
+  - **The contiguous fast path**: `lower_contiguous=true upper_contiguous=true` on both cells,
+    so index derivation is available to BOTH sweeps and cannot explain an asymmetry.
+  - **Row-length distribution**: lower max 128 / mean 85.82 against upper max 129 / mean 86.82
+    (convection), and 200/144.56 against 201/145.56 (cubic). The shapes are the same to within
+    the single diagonal entry, so the gap is not skew.
+- **WHAT IS LEFT, and its awkward consequence.** The `U` sweep performs, once per row, a pivot
+  validation and a DIVISION by the diagonal; the forward sweep runs against a unit-lower-
+  triangular `L` and does neither. That is a genuine per-row cost with the right shape. **But
+  the obvious lever is NOT bit-identical**: precomputing reciprocals at factor time and
+  multiplying turns `x / d` into `x * (1/d)`, which changes rounding. It cannot be proposed
+  under the bit-identity contract every shipped lever on this bead has used; it needs an
+  accuracy contract and a stated ULP bound, and it should be measured against the solve's
+  existing parity gate rather than asserted.
+- **Provenance for the two timed rows.** Live SciPy 1.17.1 SuperLU side-by-side in the same
+  invocation, `scipy_engine_sha256=a890149562f09a19f0770d91ee5057ecb1068f6bf188abd2d1a79196c15bf388`,
+  `numpy=2.4.3`; shipping arm (`banded_factor_hits=1`), `FSCI_SPLU_STAGE=solve`, 21 rounds,
+  both `quiescence=clear`. convection: `Incumbent ratio: SciPy / FrankenSciPy = 0.5117x`
+  ci95 [0.5079, 0.5174], nulls 0.9976 / 1.0055, `decided_if_ci_lo>1.0110_or_ci_hi<0.9890`.
+  cubic: `Incumbent ratio: SciPy / FrankenSciPy = 0.8783x` ci95 [0.8756, 0.8836], nulls
+  1.0041 / 1.0017, `decided_if_ci_lo>1.0082_or_ci_hi<0.9918`. Both cells are
+  `convection_diffusion_2d side=128 n=16384 nnz=81408` and `laplacian_3d_cubic side=16
+  n=4096 nnz=27136` input nonzeros respectively. **Decision is taken from the
+  bootstrap-median CI only, never cv; CV is provenance only** — the bootstrap-median CIs are
+  [0.5079, 0.5174] and [0.8756, 0.8836], both DECIDED against their printed rules. The **2x A/A-null margin** needs
+  separation beyond 1.10% and 0.82%; both deficits exceed that by a wide margin.
+
+      provenance: host_identity=thinkstation1 physical_cores=32 logical_threads=64
+      ram_bytes=231687815168 numa_count=1 scaling_governor=powersave runtime_isa=avx2+fma
+      requested_frankenscipy_threads=1 actual_observed_frankenscipy_threads=1 affinity=1
+
+  `requested_threads=1`, `actual_observed_worker_threads=1`,
+  `host_wide_quiescence_pre=NOT_CERTIFIED(host_mean_busy=0.029)`,
+  `host_wide_quiescence_post=NOT_CERTIFIED(host_mean_busy=0.007)`, reported not relaxed.
+  `harness=perf_splu`, substrate `crates/fsci-sparse/src/bin/perf_splu_balanced_square.rs`,
+  `same_host=thinkstation1`, `taskset -c 6`, ONE binary
+  `frankenscipy_engine_sha256=b12d2972487365c8eb13942186310880c1f76f080360e241bdc6dbe86fed8ea3`
+  (`executed-binary sha256=b12d2972487365c8eb13942186310880c1f76f080360e241bdc6dbe86fed8ea3`)
+  built on **rch worker `hz2`**, run outside the build window.
+- **Concrete retry predicate.** Do not build a layout or traversal-direction change for the
+  backward sweep: the ratio's movement with row length already refutes it, and no reordering of
+  memory can remove a per-row divide. A reciprocal lever may be proposed only with an accuracy
+  contract, a ULP bound, and a measurement on BOTH cells — its predicted signature is that the
+  backward/forward ratio should collapse toward 1.0 on convection (2.045) much more than on
+  cubic (1.325), and a proposal that does not state that asymmetry has not understood the cost.
+- **A note on order of work.** This cost one probe run and one already-built split. The layout
+  change it refutes would have touched `PackedTriangularRows`, `from_sorted_upper_rows`, the
+  backward kernel and every consumer of `lu.upper`. Phase-split first, discriminator second,
+  lever last is what made the difference.

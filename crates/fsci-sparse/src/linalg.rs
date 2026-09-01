@@ -15968,10 +15968,41 @@ mod tests {
             let lower = lu.lower.values.len();
             let upper = lu.upper.values.len();
             assert!(lower > 0 && upper > 0, "{label}: degenerate factor");
+            // THE CHEAPER EXPLANATION, CHECKED BEFORE ANY LAYOUT CHANGE. `SPLU_CONTIGUOUS_SOLVE`
+            // derives column indices from offsets when a row's columns are consecutive, so a
+            // sweep whose rows are contiguous never reads the column array at all. If that
+            // applies to L and not to U, the 2x is the fast path being available to only one
+            // sweep — a completely different cause from traversal direction, and a far cheaper
+            // one to act on.
             println!(
                 "solve_entries {label}: n={n} lower={lower} upper={upper} \
-                 upper_over_lower={:.3}",
-                upper as f64 / lower as f64
+                 upper_over_lower={:.3} lower_contiguous={} upper_contiguous={}",
+                upper as f64 / lower as f64,
+                lu.lower.contiguous,
+                lu.upper.contiguous
+            );
+            // ROW-LENGTH DISTRIBUTION, the last cheap discriminator before any layout change.
+            // Equal TOTALS with different SHAPES would explain the gap without direction or
+            // the divide: a sweep whose work concentrates in a few very long rows behaves
+            // differently from one spread evenly, at identical entry counts.
+            let row_len = |packed: &PackedTriangularRows| -> (usize, f64, usize) {
+                let lens: Vec<usize> = (0..n)
+                    .map(|r| packed.offsets[r + 1] - packed.offsets[r])
+                    .collect();
+                let total: usize = lens.iter().sum();
+                let empty = lens.iter().filter(|&&l| l == 0).count();
+                (
+                    lens.iter().copied().max().unwrap_or(0),
+                    total as f64 / n as f64,
+                    empty,
+                )
+            };
+            let (l_max, l_mean, l_empty) = row_len(&lu.lower);
+            let (u_max, u_mean, u_empty) = row_len(&lu.upper);
+            println!(
+                "solve_shape {label}: lower_max={l_max} lower_mean={l_mean:.2} \
+                 lower_empty={l_empty} upper_max={u_max} upper_mean={u_mean:.2} \
+                 upper_empty={u_empty}"
             );
         }
         SPLU_BANDED_ENABLE.store(banded_was, Relaxed);
