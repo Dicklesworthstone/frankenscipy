@@ -12659,6 +12659,89 @@ fn symmetric_lower_matvec_one_pass_simd(
     }
 }
 
+/// Split-accumulate parallel symmetric lower matvec (`frankenscipy-yla24`).
+///
+/// # NOT BIT-IDENTICAL, and that is the entire point
+///
+/// Every other dsymv arm in this file is byte-identical to its siblings. This one is NOT,
+/// and it cannot be: each output element of a symmetric matvec is a SUM over the active
+/// range, so any split across threads reassociates those additions. `EIGH_DSYMV_PARALLEL_GATHER`
+/// exists precisely to dodge that (it re-reads instead of reassociating) and pays 2.235x more
+/// instructions for it, which is why it loses 2.46x. This arm takes the other branch: it
+/// accepts a different summation ORDER in exchange for keeping the efficient one-pass kernel.
+///
+/// The terms are the SAME terms. Column `col_offset` owns every stored element in its column,
+/// contributes them to exactly the two outputs the serial one-pass form does, and belongs to
+/// exactly one worker's block — so the multiset of products summed into each output is
+/// identical and only the association differs. The difference is therefore bounded by normal
+/// floating-point reassociation, not by an algorithmic change.
+///
+/// Gated OFF by [`EIGH_DSYMV_SPLIT_ACCUMULATE`]. It must stay off until `eigh`'s dsymv
+/// contract is deliberately relaxed from bit-identical to the tolerance contract `eigh`
+/// already carries for its results — that is a CONTRACT decision (frankenscipy-yla24), and
+/// this arm exists to price it, not to pre-empt it.
+#[allow(dead_code, clippy::needless_range_loop)]
+fn symmetric_lower_matvec_split_accumulate_parallel(
+    data: &[f64],
+    n: usize,
+    start: usize,
+    vector: &[f64],
+    product: &mut [f64],
+    workers: usize,
+) {
+    use rayon::iter::{IndexedParallelIterator as _, ParallelIterator as _};
+    use rayon::slice::ParallelSliceMut as _;
+
+    let active = vector.len();
+    if active == 0 {
+        return;
+    }
+    let workers = workers.max(1);
+    let block = active.div_ceil(workers);
+
+    // ONE allocation per call, not one per worker: the matvec runs once per Householder
+    // column, so a per-worker `Vec` would be n*workers allocations across a factorization.
+    let mut partials = vec![0.0f64; workers * active];
+    partials
+        .par_chunks_mut(active)
+        .enumerate()
+        .for_each(|(worker, part)| {
+            let lo = worker * block;
+            let hi = ((worker + 1) * block).min(active);
+            for col_offset in lo..hi {
+                let col = start + col_offset;
+                let col_base = col * n;
+                let v_col = vector[col_offset];
+                // Private accumulator, started at zero rather than read out of `product`:
+                // this worker owns only its own columns' contributions.
+                let mut p_col = 0.0f64;
+                if v_col != 0.0 {
+                    p_col += data[col_base + start + col_offset] * v_col;
+                }
+                for row_offset in col_offset + 1..active {
+                    let value = data[col_base + start + row_offset];
+                    if v_col != 0.0 {
+                        part[row_offset] += value * v_col;
+                    }
+                    let v_row = vector[row_offset];
+                    if v_row != 0.0 {
+                        p_col += value * v_row;
+                    }
+                }
+                part[col_offset] += p_col;
+            }
+        });
+
+    // Serial fold of the worker partials: O(workers * active) against O(active^2) of work.
+    product[..active].fill(0.0);
+    for worker in 0..workers {
+        let part = &partials[worker * active..(worker + 1) * active];
+        for (slot, &value) in product[..active].iter_mut().zip(part) {
+            *slot += value;
+        }
+    }
+}
+
 #[allow(dead_code, clippy::needless_range_loop)]
 fn apply_symmetric_householder_trailing_rank2_lower_storage(
     matrix: &mut DMatrix<f64>,
@@ -12693,6 +12776,25 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
     // shape that cost 13% in fsci-sparse's merge; hoisting them further would mean
     // threading state through `symmetric_tridiagonalize_native` for no measurable gain.
     let t_gather = eigh_reduce_substage_start();
+    let split_accumulate = EIGH_DSYMV_SPLIT_ACCUMULATE
+        .load(std::sync::atomic::Ordering::Relaxed)
+        && active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE;
+    if split_accumulate {
+        EIGH_DSYMV_SPLIT_ACCUMULATE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(active / EIGH_DSYMV_PARALLEL_MIN_ROWS_PER_THREAD)
+            .max(1);
+        symmetric_lower_matvec_split_accumulate_parallel(
+            data,
+            n,
+            start,
+            &reflector.values,
+            p,
+            workers,
+        );
+        eigh_reduce_substage_record(0, t_gather);
+    } else {
     let parallel_gather = EIGH_DSYMV_PARALLEL_GATHER.load(std::sync::atomic::Ordering::Relaxed)
         && active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE;
     if parallel_gather {
@@ -12718,6 +12820,7 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
     }
 
     eigh_reduce_substage_record(0, t_gather);
+    }
 
     // The scalar A/B arm covers the entire `dsyr2` preparation, not merely the
     // final lower-triangle store below. Every SIMD lane here is independent;
@@ -14618,6 +14721,11 @@ pub static EIGH_RANK2_UPDATE_PARALLEL: std::sync::atomic::AtomicBool =
 
 /// Times the parallel rank-2 arm was actually dispatched, so a row cannot claim an arm it
 /// never reached (`frankenscipy-2o0vp`).
+///
+/// ACCURACY CONTRACT: none to state, and that is the contract. This is a COUNTER, not an
+/// arm — it selects nothing and feeds no arithmetic, so results are bit-identical whether
+/// it is read, written, or removed. It is incremented once per dispatch at the stage
+/// boundary, never inside a per-element loop.
 pub static EIGH_RANK2_UPDATE_PARALLEL_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -14634,6 +14742,25 @@ const EIGH_RANK2_PARALLEL_MIN_COLS_PER_TASK: usize = 32;
 /// per-column `rayon::scope` costs more than the matvec it splits, and the dispatch falls
 /// through to the serial one-pass arm that runs today (`frankenscipy-ll0kk`).
 const EIGH_DSYMV_PARALLEL_MIN_ACTIVE: usize = 512;
+
+/// Route the tridiagonalisation's dsymv to the split-accumulate parallel arm
+/// (`frankenscipy-yla24`). Default OFF and MUST STAY OFF until the contract decision is
+/// made: unlike every other dsymv toggle here this one is NOT bit-identical, because
+/// splitting a sum across workers reassociates it. See
+/// [`symmetric_lower_matvec_split_accumulate_parallel`].
+#[doc(hidden)]
+pub static EIGH_DSYMV_SPLIT_ACCUMULATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Times the split-accumulate arm was dispatched, so a row cannot claim an arm it never
+/// reached (`frankenscipy-yla24`).
+///
+/// ACCURACY CONTRACT: none to state, and that is the contract. This is a COUNTER, not an
+/// arm — it selects nothing and feeds no arithmetic, so results are bit-identical whether
+/// it is read, written, or removed. It is incremented once per dispatch at the stage
+/// boundary, never inside a per-element loop.
+pub static EIGH_DSYMV_SPLIT_ACCUMULATE_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Rows a worker must be given before another is added, so a 512-row block does not fan out
 /// across 64 threads to do eight rows each.
@@ -25031,6 +25158,114 @@ mod tests {
         }
     }
 
+    /// `frankenscipy-yla24`: the split-accumulate dsymv must agree with the shipping arm to
+    /// TOLERANCE, and must be observed to dispatch.
+    ///
+    /// This is the one dsymv arm that is deliberately NOT bit-identical, so the assertion is
+    /// a bound, not `to_bits()`. Both directions are checked: the agreement must be tight
+    /// (reassociation only), and a REAL error must still be caught -- otherwise a bound loose
+    /// enough to pass everything would prove nothing.
+    #[test]
+    fn eigh_dsymv_split_accumulate_agrees_to_reassociation_tolerance() {
+        let _g = eigh_toggle_lock();
+
+        let n = 600usize;
+        let start = 3usize;
+        let active = n - start;
+        assert!(
+            active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE,
+            "fixture below the parallel gate ({active} < {EIGH_DSYMV_PARALLEL_MIN_ACTIVE}); \
+             the split arm would never be selected and this test would pass vacuously"
+        );
+
+        let entries: Vec<f64> = (0..n * n)
+            .map(|i| {
+                let x = ((i as u64).wrapping_mul(6_364_136_223_846_793_005) >> 11) as f64;
+                x / (u64::MAX >> 11) as f64 - 0.5
+            })
+            .collect();
+        let base = DMatrix::from_row_slice(n, n, &entries);
+        let reflector = HouseholderReflector {
+            start,
+            values: (0..active)
+                .map(|i| if i % 41 == 0 { 0.0 } else { (i as f64 * 0.011).sin() })
+                .collect(),
+            tau: 0.55,
+        };
+
+        let run = |split: bool| -> (Vec<f64>, usize) {
+            EIGH_DSYMV_SPLIT_ACCUMULATE.store(split, Ordering::Relaxed);
+            EIGH_DSYMV_SPLIT_ACCUMULATE_HITS.store(0, Ordering::Relaxed);
+            let mut matrix = base.clone();
+            let mut p = vec![0.0; active];
+            let mut w = vec![0.0; active];
+            apply_symmetric_householder_trailing_rank2_lower_storage(
+                &mut matrix,
+                &reflector,
+                &mut p,
+                &mut w,
+            );
+            let hits = EIGH_DSYMV_SPLIT_ACCUMULATE_HITS.load(Ordering::Relaxed);
+            (p, hits)
+        };
+
+        let (p_serial, hits_serial) = run(false);
+        let (p_split, hits_split) = run(true);
+        EIGH_DSYMV_SPLIT_ACCUMULATE.store(false, Ordering::Relaxed);
+        EIGH_DSYMV_SPLIT_ACCUMULATE_HITS.store(0, Ordering::Relaxed);
+
+        assert_eq!(
+            hits_serial, 0,
+            "the serial arm dispatched the split kernel ({hits_serial} hits); the arms are \
+             not distinct and the comparison below is vacuous"
+        );
+        // `>= 1` because the toggle is a process-global static and a concurrent `eigh` test
+        // also increments it (`defect_global_toggle_test_race`).
+        assert!(
+            hits_split >= 1,
+            "the split arm did not dispatch ({hits_split} hits); this would be comparing the \
+             serial arm with itself"
+        );
+
+        let scale = p_serial.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
+        assert!(scale > 0.0, "the matvec produced an all-zero p; comparison vacuous");
+
+        // MUST-MISS the bit test: this arm is expected to differ somewhere, so assert that it
+        // DOES. If it were bit-identical the tolerance claim would be untested.
+        assert!(
+            p_serial
+                .iter()
+                .zip(&p_split)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the split arm was bit-identical; the tolerance bound below is then untested \
+             and the arm's whole reason for existing (reassociation) did not happen"
+        );
+
+        // MUST-HIT the tolerance bound: reassociation of a sum of `active` terms.
+        let worst = p_serial
+            .iter()
+            .zip(&p_split)
+            .fold(0.0f64, |acc, (a, b)| acc.max((a - b).abs()));
+        assert!(
+            worst <= 1e-12 * scale,
+            "split-accumulate dsymv differs by more than reassociation can explain: \
+             worst {worst:e} against scale {scale:e}"
+        );
+
+        // NEGATIVE ARM on the bound itself: a genuinely wrong answer must be REJECTED, or
+        // the bound above is satisfied by anything.
+        let mut corrupted = p_split.clone();
+        corrupted[0] += 1e-3 * scale;
+        let bad = p_serial
+            .iter()
+            .zip(&corrupted)
+            .fold(0.0f64, |acc, (a, b)| acc.max((a - b).abs()));
+        assert!(
+            bad > 1e-12 * scale,
+            "the tolerance bound accepts a 1e-3 relative error; it is not a bound"
+        );
+    }
+
     /// `frankenscipy-2o0vp`: the column-parallel rank-2 trailing update must be
     /// BIT-IDENTICAL to the serial one, and must be OBSERVED to dispatch.
     ///
@@ -34363,6 +34598,14 @@ mod tests {
     #[test]
     fn eigh_inverse_iteration_parallel_is_byte_identical() {
         use std::sync::atomic::Ordering;
+        // TAKE THE TOGGLE LOCK. This test compares two full `eigh` calls BIT-for-BIT, so any
+        // concurrent test that flips a process-global eigh toggle between them can fail it.
+        // That was harmless while every such toggle was itself bit-identical; it stopped
+        // being harmless with `EIGH_DSYMV_SPLIT_ACCUMULATE` (frankenscipy-yla24), which
+        // reassociates a sum by design. Observed: this test failed in a full-suite run that
+        // introduced that toggle and passed on the same tree in isolation
+        // (`defect_global_toggle_test_race`).
+        let _guard = eigh_toggle_lock();
         // The parallel inverse-iteration eigenvector sweep must equal the serial one
         // BIT-for-BIT (each column is a pure deterministic function of its index; no
         // cross-column dependency). n above the native gate (512) and the inviter gate.

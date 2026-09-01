@@ -44,6 +44,8 @@ enum Arm {
     Gather,
     /// `EIGH_RANK2_UPDATE_PARALLEL` — the column-parallel rank-2 trailing update.
     Rank2,
+    /// `EIGH_DSYMV_SPLIT_ACCUMULATE` — the tolerance-contract parallel dsymv.
+    Split,
 }
 
 /// One timed `eigh`, with the arm selected at the call boundary (never inside a loop).
@@ -51,6 +53,7 @@ fn timed(a: &[Vec<f64>], arm: Arm, on: bool) -> (f64, f64) {
     match arm {
         Arm::Gather => fsci_linalg::EIGH_DSYMV_PARALLEL_GATHER.store(on, Ordering::Relaxed),
         Arm::Rank2 => fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL.store(on, Ordering::Relaxed),
+        Arm::Split => fsci_linalg::EIGH_DSYMV_SPLIT_ACCUMULATE.store(on, Ordering::Relaxed),
     }
     let start = Instant::now();
     let result = eigh(a, DecompOptions::default()).expect("eigh");
@@ -58,6 +61,7 @@ fn timed(a: &[Vec<f64>], arm: Arm, on: bool) -> (f64, f64) {
     match arm {
         Arm::Gather => fsci_linalg::EIGH_DSYMV_PARALLEL_GATHER.store(false, Ordering::Relaxed),
         Arm::Rank2 => fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL.store(false, Ordering::Relaxed),
+        Arm::Split => fsci_linalg::EIGH_DSYMV_SPLIT_ACCUMULATE.store(false, Ordering::Relaxed),
     }
     (elapsed, result.eigenvalues.iter().sum())
 }
@@ -96,6 +100,8 @@ fn main() {
         fsci_linalg::EIGH_DSYMV_PARALLEL_GATHER.store(gather, Ordering::Relaxed);
         let rank2 = std::env::var("EIGH_RANK2_UPDATE_PARALLEL").as_deref() == Ok("1");
         fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL.store(rank2, Ordering::Relaxed);
+        let split = std::env::var("EIGH_DSYMV_SPLIT_ACCUMULATE").as_deref() == Ok("1");
+        fsci_linalg::EIGH_DSYMV_SPLIT_ACCUMULATE.store(split, Ordering::Relaxed);
         let a = build(n);
         let result = eigh(&a, DecompOptions::default()).expect("eigh");
         let checksum: f64 = result.eigenvalues.iter().sum();
@@ -180,12 +186,13 @@ fn main() {
     let rounds: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15);
     let arm = match args.get(4).map(String::as_str) {
         Some("rank2") => Arm::Rank2,
+        Some("split") => Arm::Split,
         _ => Arm::Gather,
     };
-    let arm_name = if arm == Arm::Rank2 {
-        "EIGH_RANK2_UPDATE_PARALLEL"
-    } else {
-        "EIGH_DSYMV_PARALLEL_GATHER"
+    let arm_name = match arm {
+        Arm::Rank2 => "EIGH_RANK2_UPDATE_PARALLEL",
+        Arm::Split => "EIGH_DSYMV_SPLIT_ACCUMULATE",
+        Arm::Gather => "EIGH_DSYMV_PARALLEL_GATHER",
     };
     fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL_HITS.store(0, Ordering::Relaxed);
     let a = build(n);
@@ -199,6 +206,7 @@ fn main() {
     let mut null_gather = Vec::new();
     let mut mismatches = 0usize;
     let mut reference: Option<u64> = None;
+    let mut max_rel_gap = 0.0f64;
 
     for round in 0..rounds {
         // Position-balanced quartet: ABBA on even rounds, BAAB on odd.
@@ -214,7 +222,18 @@ fn main() {
             let bits = checksum.to_bits();
             match reference {
                 None => reference = Some(bits),
-                Some(r) if r != bits => mismatches += 1,
+                Some(r) if r != bits => {
+                    mismatches += 1;
+                    // Size the disagreement, not just its existence: for an arm that
+                    // reassociates a sum the question is never "do the bits differ" (they
+                    // will) but "by how much against the contract".
+                    let reference_value = f64::from_bits(r);
+                    let gap = (checksum - reference_value).abs()
+                        / reference_value.abs().max(f64::MIN_POSITIVE);
+                    if gap > max_rel_gap {
+                        max_rel_gap = gap;
+                    }
+                }
                 _ => {}
             }
             if is_gather { g.push(ms) } else { s.push(ms) }
@@ -235,6 +254,12 @@ fn main() {
         .collect();
 
     println!("mode=ab n={n} rounds={rounds} arm={arm_name} warm_checksum={warm:.6}");
+    if arm == Arm::Split {
+        println!(
+            "split_accumulate_hits={} (must be > 0 or the candidate arm never ran)",
+            fsci_linalg::EIGH_DSYMV_SPLIT_ACCUMULATE_HITS.load(Ordering::Relaxed)
+        );
+    }
     if arm == Arm::Rank2 {
         // DISPATCH OBSERVED: without this a toggle that stopped being read would report a
         // clean 1.00x and read as "no effect" rather than "no arm".
@@ -243,7 +268,15 @@ fn main() {
             fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL_HITS.load(Ordering::Relaxed)
         );
     }
-    println!("bit_mismatches={mismatches}  (0 required: the gather arm is documented BIT-IDENTICAL)");
+    println!("max_rel_gap_eigenvalue_sum={max_rel_gap:.3e}");
+    if arm == Arm::Split {
+        println!(
+            "bit_mismatches={mismatches}  (EXPECTED NON-ZERO: this arm reassociates the sum; \
+             see max_rel_gap for the size of it)"
+        );
+    } else {
+        println!("bit_mismatches={mismatches}  (0 required: this arm is documented BIT-IDENTICAL)");
+    }
     println!("arm_off_p50_ms={:.4}", median(serial.clone()));
     println!("arm_on_p50_ms={:.4}", median(gather.clone()));
     println!(
