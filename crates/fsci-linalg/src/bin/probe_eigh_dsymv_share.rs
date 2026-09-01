@@ -37,13 +37,28 @@ fn build(n: usize) -> Vec<Vec<f64>> {
     a
 }
 
-/// One timed `eigh`, with the gather arm selected at the call boundary (never inside a loop).
-fn timed(a: &[Vec<f64>], gather: bool) -> (f64, f64) {
-    fsci_linalg::EIGH_DSYMV_PARALLEL_GATHER.store(gather, Ordering::Relaxed);
+/// Which default-off arm the A/B exercises.
+#[derive(Clone, Copy, PartialEq)]
+enum Arm {
+    /// `EIGH_DSYMV_PARALLEL_GATHER` — the row-parallel gather dsymv.
+    Gather,
+    /// `EIGH_RANK2_UPDATE_PARALLEL` — the column-parallel rank-2 trailing update.
+    Rank2,
+}
+
+/// One timed `eigh`, with the arm selected at the call boundary (never inside a loop).
+fn timed(a: &[Vec<f64>], arm: Arm, on: bool) -> (f64, f64) {
+    match arm {
+        Arm::Gather => fsci_linalg::EIGH_DSYMV_PARALLEL_GATHER.store(on, Ordering::Relaxed),
+        Arm::Rank2 => fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL.store(on, Ordering::Relaxed),
+    }
     let start = Instant::now();
     let result = eigh(a, DecompOptions::default()).expect("eigh");
     let elapsed = start.elapsed().as_secs_f64() * 1e3;
-    fsci_linalg::EIGH_DSYMV_PARALLEL_GATHER.store(false, Ordering::Relaxed);
+    match arm {
+        Arm::Gather => fsci_linalg::EIGH_DSYMV_PARALLEL_GATHER.store(false, Ordering::Relaxed),
+        Arm::Rank2 => fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL.store(false, Ordering::Relaxed),
+    }
     (elapsed, result.eigenvalues.iter().sum())
 }
 
@@ -79,6 +94,8 @@ fn main() {
         fsci_linalg::EIGH_DSYMV_FORCE_DOUBLE_READ.store(force_double, Ordering::Relaxed);
         let gather = std::env::var("EIGH_DSYMV_PARALLEL_GATHER").as_deref() == Ok("1");
         fsci_linalg::EIGH_DSYMV_PARALLEL_GATHER.store(gather, Ordering::Relaxed);
+        let rank2 = std::env::var("EIGH_RANK2_UPDATE_PARALLEL").as_deref() == Ok("1");
+        fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL.store(rank2, Ordering::Relaxed);
         let a = build(n);
         let result = eigh(&a, DecompOptions::default()).expect("eigh");
         let checksum: f64 = result.eigenvalues.iter().sum();
@@ -161,10 +178,20 @@ fn main() {
     }
 
     let rounds: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15);
+    let arm = match args.get(4).map(String::as_str) {
+        Some("rank2") => Arm::Rank2,
+        _ => Arm::Gather,
+    };
+    let arm_name = if arm == Arm::Rank2 {
+        "EIGH_RANK2_UPDATE_PARALLEL"
+    } else {
+        "EIGH_DSYMV_PARALLEL_GATHER"
+    };
+    fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL_HITS.store(0, Ordering::Relaxed);
     let a = build(n);
 
     // Warm the allocator and the factor path so round 1 is not the cold outlier.
-    let (_, warm) = timed(&a, false);
+    let (_, warm) = timed(&a, arm, false);
 
     let mut serial = Vec::new();
     let mut gather = Vec::new();
@@ -183,7 +210,7 @@ fn main() {
         let mut s = Vec::new();
         let mut g = Vec::new();
         for &is_gather in &order {
-            let (ms, checksum) = timed(&a, is_gather);
+            let (ms, checksum) = timed(&a, arm, is_gather);
             let bits = checksum.to_bits();
             match reference {
                 None => reference = Some(bits),
@@ -207,24 +234,32 @@ fn main() {
         .map(|(s, g)| s / g)
         .collect();
 
-    println!("mode=ab n={n} rounds={rounds} warm_checksum={warm:.6}");
+    println!("mode=ab n={n} rounds={rounds} arm={arm_name} warm_checksum={warm:.6}");
+    if arm == Arm::Rank2 {
+        // DISPATCH OBSERVED: without this a toggle that stopped being read would report a
+        // clean 1.00x and read as "no effect" rather than "no arm".
+        println!(
+            "rank2_parallel_hits={} (must be > 0 or the candidate arm never ran)",
+            fsci_linalg::EIGH_RANK2_UPDATE_PARALLEL_HITS.load(Ordering::Relaxed)
+        );
+    }
     println!("bit_mismatches={mismatches}  (0 required: the gather arm is documented BIT-IDENTICAL)");
-    println!("serial_p50_ms={:.4}", median(serial.clone()));
-    println!("gather_p50_ms={:.4}", median(gather.clone()));
+    println!("arm_off_p50_ms={:.4}", median(serial.clone()));
+    println!("arm_on_p50_ms={:.4}", median(gather.clone()));
     println!(
-        "effect serial/gather p50={:.4} p10={:.4} p90={:.4}",
+        "effect off/on p50={:.4} p10={:.4} p90={:.4}",
         median(ratios.clone()),
         pct(ratios.clone(), 0.10),
         pct(ratios.clone(), 0.90)
     );
     println!(
-        "null_serial p50={:.4} p10={:.4} p90={:.4}",
+        "null_off p50={:.4} p10={:.4} p90={:.4}",
         median(null_serial.clone()),
         pct(null_serial.clone(), 0.10),
         pct(null_serial.clone(), 0.90)
     );
     println!(
-        "null_gather p50={:.4} p10={:.4} p90={:.4}",
+        "null_on p50={:.4} p10={:.4} p90={:.4}",
         median(null_gather.clone()),
         pct(null_gather.clone(), 0.10),
         pct(null_gather.clone(), 0.90)

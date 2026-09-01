@@ -12773,6 +12773,54 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
 
     let t_update = eigh_reduce_substage_start();
     let data = matrix.as_mut_slice();
+    // Read the toggle ONCE here, at the stage boundary, never inside the column loop: an
+    // atomic load inside a hot loop is an optimisation barrier worth double digits
+    // (`perf_toggle_read_in_hot_loop_is_a_barrier`).
+    if !force_scalar
+        && EIGH_RANK2_UPDATE_PARALLEL.load(std::sync::atomic::Ordering::Relaxed)
+        && active >= EIGH_RANK2_PARALLEL_MIN_ACTIVE
+    {
+        EIGH_RANK2_UPDATE_PARALLEL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Imported in the narrowest scope that needs it: the crate uses `rayon::scope`
+        // elsewhere and does not carry the prelude at module level.
+        use rayon::slice::ParallelSliceMut as _;
+        use rayon::iter::{IndexedParallelIterator as _, ParallelIterator as _};
+        let values = &reflector.values;
+        // TASK GRANULARITY IS THE WHOLE GAME HERE, and getting it wrong is what a first
+        // attempt measured: one chunk PER COLUMN gives up to `active` tasks for a step
+        // whose serial cost is ~126 us at n=1024, so ~1 ms of task overhead buried a
+        // 2.4-3.2x loss (`frankenscipy-2o0vp`). Blocks of columns instead, oversubscribed
+        // 4x against the worker count so rayon can still steal against the TRIANGULAR
+        // imbalance -- column `col_offset` updates `active - col_offset` elements, so a
+        // one-task-per-worker split would leave the last worker with almost nothing.
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(active / EIGH_RANK2_PARALLEL_MIN_COLS_PER_TASK)
+            .max(1);
+        let cols_per_task = active.div_ceil(workers * 4).max(1);
+        // Blocks are disjoint spans of whole columns, and column `col` owns
+        // `data[col * n .. col * n + n]`, so every trailing element is written exactly
+        // once by exactly one task -- see `EIGH_RANK2_UPDATE_PARALLEL`.
+        data[start * n..(start + active) * n]
+            .par_chunks_mut(n * cols_per_task)
+            .enumerate()
+            .for_each(|(task_index, block)| {
+                let first_col = task_index * cols_per_task;
+                for (local, column) in block.chunks_mut(n).enumerate() {
+                    let col_offset = first_col + local;
+                    let w_col = w[col_offset];
+                    let v_col = values[col_offset];
+                    let seg = &mut column[start + col_offset..start + active];
+                    let vs = &values[col_offset..active];
+                    let ws = &w[col_offset..active];
+                    for ((slot, &v_row), &w_row) in seg.iter_mut().zip(vs).zip(ws) {
+                        *slot -= v_row * w_col + w_row * v_col;
+                    }
+                }
+            });
+        eigh_reduce_substage_record(1, t_update);
+        return;
+    }
     for col_offset in 0..active {
         let w_col = w[col_offset];
         let col = start + col_offset;
@@ -14502,6 +14550,85 @@ pub static EIGH_INVITER_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// was worth 2.2-3.5x bit-identically elsewhere in the fleet.
 pub static EIGH_RANK2_UPDATE_FORCE_SCALAR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Fan the reflector's rank-2 trailing update (`dsyr2`) across columns
+/// (`frankenscipy-2o0vp`). MEASURED AND REJECTED; default OFF, kept so the arm can be
+/// re-measured rather than re-derived.
+///
+/// ## The numbers, so nobody re-runs this to find out
+///
+/// Paired A/B against the serial arm, both arms one ELF, position-balanced quartet, dual
+/// A/A nulls in the same window, 21 rounds, host=thinkstation1, 64 cpus:
+///
+/// ```text
+///     n=512   off/on 0.2499 [0.2270, 0.2639]   nulls 0.9737 / 1.0091   hits 10752
+///     n=1024  off/on 0.3704 [0.3566, 0.3797]   nulls 0.9944 / 1.0153   hits 32256
+///     n=1536  off/on 0.4633 [0.4531, 0.4734]   nulls 0.9841 / 0.9848   hits 53760
+/// ```
+///
+/// So the parallel arm is 2.2-4.0x SLOWER, with the effect nowhere near either null and
+/// the dispatch counter proving the candidate arm actually ran. `bit_mismatches=0`
+/// throughout, so the byte-identity claim below holds and this is purely a speed verdict.
+///
+/// ## Why, and it is NOT what the first two guesses said
+///
+/// Guess 1 was task granularity: one chunk per column gives up to `active` tasks per step.
+/// Coarsening to column BLOCKS oversubscribed 4x made it WORSE (n=1024 went 0.4205 ->
+/// 0.3704), so that was not the cost.
+///
+/// The measurement that settles it is the thread sweep. One `eigh` at n=1024:
+///
+/// ```text
+///     rayon threads   1     2     4     8     16    32      serial arm
+///     wall (s)        0.49  0.46  0.44  0.45  0.42  0.52    0.27
+/// ```
+///
+/// The parallel arm is already 1.8x slower AT ONE THREAD, and going to sixteen recovers
+/// only 1.17x. A kernel that cannot beat its own serial form on one core is not losing to
+/// parallel overhead -- there is no compute headroom to fan out. The update streams the
+/// whole trailing submatrix once per step (~n^3/6 = 1.8e8 read-modify-writes over an
+/// `eigh` at n=1024, ~2.9 GB of traffic in 48.3 ms), so it is bandwidth/cache-throughput
+/// bound on ONE core already. This is the `linalg structure predicate scans` rule again:
+/// fan out HEAVY or STRIDED kernels, never bandwidth-bound ones.
+///
+/// The serial arm also has an advantage the parallel one gives up: it walks `data` as one
+/// flat contiguous span with the three operands slice-bound, which is the exact form a
+/// previous lever introduced to keep LLVM vectorising it. Routing through
+/// `par_chunks_mut` + a closure puts an iterator layer between the compiler and that walk.
+///
+/// ## Why THIS kernel and not the dsymv next to it
+///
+/// The stage timers put the reduction at 74.4% of `eigh`'s WALL clock at n=1024, split
+/// 70.8% dsymv / 24.7% this update, and the whole reduction is serial. The dsymv half
+/// CANNOT be fanned out byte-identically: every output element there is a SUM over the
+/// active range, so splitting the range reassociates the additions and moves bits. This
+/// update has no such constraint -- each trailing element is read, decremented ONCE by
+/// `v_row * w_col + w_row * v_col`, and written back, with no term shared between columns.
+///
+/// ## Why it is BIT-IDENTICAL, by construction rather than by fixture
+///
+/// Column `col` occupies `data[col * n .. col * n + n]`, so distinct columns are DISJOINT
+/// slices and the work partition writes each element exactly once with the same three
+/// operands the serial loop uses. Nothing is accumulated across columns, so there is no
+/// order to preserve: the serial and parallel arms differ only in WHICH THREAD performs an
+/// otherwise identical read-modify-write. The per-column body is the same slice-bound loop
+/// the serial arm runs, so its own vectorisation is unchanged too.
+pub static EIGH_RANK2_UPDATE_PARALLEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Times the parallel rank-2 arm was actually dispatched, so a row cannot claim an arm it
+/// never reached (`frankenscipy-2o0vp`).
+pub static EIGH_RANK2_UPDATE_PARALLEL_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Smallest trailing block worth fanning out. The update is a streaming pair of AXPYs over
+/// `active^2 / 2` elements; below this the parallel region costs more than the arithmetic it
+/// splits, exactly as it does for the dsymv gate below.
+const EIGH_RANK2_PARALLEL_MIN_ACTIVE: usize = 256;
+
+/// Columns a task must be given before another worker is added, so a narrow trailing block
+/// does not fan out into tasks that each update a handful of elements.
+const EIGH_RANK2_PARALLEL_MIN_COLS_PER_TASK: usize = 32;
 
 /// Smallest trailing block for which the parallel gather is even considered. Below this the
 /// per-column `rayon::scope` costs more than the matvec it splits, and the dispatch falls
@@ -24902,6 +25029,126 @@ mod tests {
                  ({a} vs {b})"
             );
         }
+    }
+
+    /// `frankenscipy-2o0vp`: the column-parallel rank-2 trailing update must be
+    /// BIT-IDENTICAL to the serial one, and must be OBSERVED to dispatch.
+    ///
+    /// Bit-identity here is a structural claim, not a tolerance one: distinct columns are
+    /// disjoint slices of `data` and every trailing element is decremented exactly once by
+    /// the same three operands, so no sum is reassociated and no element is touched twice.
+    /// The test drives BOTH arms and compares `to_bits()`, and asserts the hit counter
+    /// MOVED -- without that a refactor that stopped reading the toggle would silently
+    /// compare the serial arm with itself and still pass.
+    #[test]
+    fn eigh_rank2_parallel_update_dispatches_and_is_bit_identical() {
+        let _g = eigh_toggle_lock();
+
+        let n = 300usize;
+        let start = 4usize;
+        let active = n - start;
+        assert!(
+            active >= EIGH_RANK2_PARALLEL_MIN_ACTIVE,
+            "fixture below the parallel gate ({active} < {EIGH_RANK2_PARALLEL_MIN_ACTIVE}); \
+             the parallel arm would never be selected and this test would pass vacuously"
+        );
+
+        let entries: Vec<f64> = (0..n * n)
+            .map(|i| {
+                let x = ((i as u64).wrapping_mul(6_364_136_223_846_793_005) >> 11) as f64;
+                x / (u64::MAX >> 11) as f64 - 0.5
+            })
+            .collect();
+        let base = DMatrix::from_row_slice(n, n, &entries);
+
+        // Exact zeros in the reflector, for the same reason the gather test carries them:
+        // both arms skip `v_col == 0.0` in the matvec that feeds this update.
+        let reflector = HouseholderReflector {
+            start,
+            values: (0..active)
+                .map(|i| if i % 31 == 0 { 0.0 } else { (i as f64 * 0.017).cos() })
+                .collect(),
+            tau: 0.63,
+        };
+
+        let run = |parallel: bool| -> (Vec<f64>, Vec<f64>, usize) {
+            EIGH_RANK2_UPDATE_PARALLEL.store(parallel, Ordering::Relaxed);
+            EIGH_RANK2_UPDATE_PARALLEL_HITS.store(0, Ordering::Relaxed);
+            let mut matrix = base.clone();
+            let mut p = vec![0.0; active];
+            let mut w = vec![0.0; active];
+            apply_symmetric_householder_trailing_rank2_lower_storage(
+                &mut matrix,
+                &reflector,
+                &mut p,
+                &mut w,
+            );
+            let hits = EIGH_RANK2_UPDATE_PARALLEL_HITS.load(Ordering::Relaxed);
+            (p, matrix.as_slice().to_vec(), hits)
+        };
+
+        let (p_serial, matrix_serial, hits_serial) = run(false);
+        let (p_parallel, matrix_parallel, hits_parallel) = run(true);
+        EIGH_RANK2_UPDATE_PARALLEL.store(false, Ordering::Relaxed);
+        EIGH_RANK2_UPDATE_PARALLEL_HITS.store(0, Ordering::Relaxed);
+
+        // BOTH ARMS OBSERVED: the serial arm must NOT dispatch and the parallel arm MUST.
+        assert_eq!(
+            hits_serial, 0,
+            "the serial arm dispatched the parallel update ({hits_serial} hits); the two \
+             arms are not distinct and every comparison below is vacuous"
+        );
+        // `>= 1`, not `== 1`: the toggle is a process-global `pub static`, so a CONCURRENT
+        // test that calls `eigh` while this one holds the flag also increments the counter.
+        // What must be proven is that the candidate arm RAN, not how many times -- pinning
+        // the exact count makes this test fail on test-harness scheduling rather than on
+        // anything about the kernel (`defect_global_toggle_test_race`).
+        assert!(
+            hits_parallel >= 1,
+            "the parallel arm did not dispatch ({hits_parallel} hits); this test would be \
+             comparing the serial arm with itself"
+        );
+
+        // MUST-HIT on the detector itself: an all-zero update would agree trivially.
+        assert!(
+            matrix_serial
+                .iter()
+                .zip(base.as_slice())
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "the rank-2 update changed nothing; the comparison below would be vacuous"
+        );
+
+        for (index, (a, b)) in p_serial.iter().zip(&p_parallel).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "EIGH_RANK2_UPDATE_PARALLEL changed p at {index} ({a} vs {b})"
+            );
+        }
+        for (index, (a, b)) in matrix_serial.iter().zip(&matrix_parallel).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "EIGH_RANK2_UPDATE_PARALLEL is documented BIT-IDENTICAL and is not: \
+                 trailing element {index} differs ({a} vs {b})"
+            );
+        }
+
+        // A one-ulp perturbation must be VISIBLE to this comparison, or the equality above
+        // proves nothing about the comparator.
+        let mut perturbed = matrix_parallel.clone();
+        let victim = perturbed
+            .iter()
+            .position(|v| *v != 0.0)
+            .expect("a non-zero trailing element");
+        perturbed[victim] = f64::from_bits(perturbed[victim].to_bits() ^ 1);
+        assert!(
+            matrix_serial
+                .iter()
+                .zip(&perturbed)
+                .any(|(a, b)| a.to_bits() != b.to_bits()),
+            "a one-ulp perturbation was invisible to the bit comparison"
+        );
     }
 
     #[test]
