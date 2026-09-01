@@ -16479,6 +16479,55 @@ pub static COSM_NALGEBRA_COMPLEX_SOLVE: std::sync::atomic::AtomicBool =
 /// asserted, and it is one of the two in this file that most deserves a test.
 pub static DISABLE_TALL_PINV_TRSM: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+/// Times the tall-`pinv` Cholesky route reached its DEFAULT (fused row-major TRSM) arm.
+///
+/// frankenscipy-bgrq1. This exists because the accuracy A/B over
+/// `DISABLE_TALL_PINV_TRSM` reported a relative gap of exactly `0.000e0` at every
+/// conditioning it swept, and there was no way to tell the two explanations apart:
+/// the arms agreeing to the last bit, or the public `pinv` never reaching this route
+/// at all so that both "arms" ran the same code. A comparison that cannot distinguish
+/// those is an A/A wearing an A/B's label. One `fetch_add` per `pinv` CALL -- not per
+/// entry, not inside any loop -- so it is not an optimisation barrier in the kernel.
+///
+/// CONTRACT: BIT-IDENTICAL. This is an observation counter, not an arm selector. The
+/// `fetch_add` records which route ran and feeds no value into the arithmetic, so each
+/// route produces bit-identical output to its uninstrumented form. It is incremented
+/// once per `pinv` CALL, never inside a loop, so it is not an optimisation barrier in
+/// the kernel either.
+#[doc(hidden)]
+pub static PINV_TALL_CHOLESKY_TRSM_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Times the tall-`pinv` Cholesky route reached its LEGACY arm, i.e. nalgebra's own
+/// `Cholesky::solve` against the transposed matrix, selected by
+/// [`DISABLE_TALL_PINV_TRSM`]. Counterpart of [`PINV_TALL_CHOLESKY_TRSM_HITS`].
+///
+/// CONTRACT: BIT-IDENTICAL. This is an observation counter, not an arm selector. The
+/// `fetch_add` records which route ran and feeds no value into the arithmetic, so each
+/// route produces bit-identical output to its uninstrumented form. It is incremented
+/// once per `pinv` CALL, never inside a loop, so it is not an optimisation barrier in
+/// the kernel either.
+#[doc(hidden)]
+pub static PINV_TALL_CHOLESKY_LEGACY_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Times the wide-`pinv` normal-equations Cholesky route ran to a result.
+///
+/// frankenscipy-bgrq1. The wide A/B already forces its SVD fallback by asserting the
+/// internal helper returns `None`, but that assertion is on a DIFFERENT call than the
+/// one whose output is compared: the helper is invoked directly while the measurement
+/// goes through public `pinv`. This counter closes that gap by proving which route the
+/// PUBLIC call actually took.
+///
+/// CONTRACT: BIT-IDENTICAL. This is an observation counter, not an arm selector. The
+/// `fetch_add` records which route ran and feeds no value into the arithmetic, so each
+/// route produces bit-identical output to its uninstrumented form. It is incremented
+/// once per `pinv` CALL, never inside a loop, so it is not an optimisation barrier in
+/// the kernel either.
+#[doc(hidden)]
+pub static PINV_WIDE_CHOLESKY_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 /// Runtime switch to force the row-major TRSM route to remain single-threaded
 /// for same-binary A/B benchmarks. Defaults off. `#[doc(hidden)]` — internal.
 #[doc(hidden)]
@@ -16715,6 +16764,7 @@ fn pinv_full_rank_tall_cholesky_with_min_cols(
 
     let chol = Cholesky::new(gram)?;
     let pseudo_inverse = if tall_pinv_trsm_disabled() {
+        PINV_TALL_CHOLESKY_LEGACY_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let a_t = matrix.transpose();
         let pinv = chol.solve(&a_t);
         if pinv.iter().any(|value| !value.is_finite()) {
@@ -16740,6 +16790,7 @@ fn pinv_full_rank_tall_cholesky_with_min_cols(
         }
         rows
     } else {
+        PINV_TALL_CHOLESKY_TRSM_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rows = cholesky_solve_transpose_rhs_rows_batched(&chol, matrix)?;
         if rows
             .iter()
@@ -16910,6 +16961,10 @@ fn pinv_full_rank_wide_cholesky_with_min_rows_impl(
         return None;
     }
 
+    // Counted at the SUCCESSFUL return, not on entry: every `return None` above is a
+    // decline that hands the caller back to the SVD route, and counting those would
+    // make the counter say "this route ran" when it had refused (frankenscipy-bgrq1).
+    PINV_WIDE_CHOLESKY_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(FullRankTallPinvResult {
         pseudo_inverse,
         rank: rows,
@@ -44053,7 +44108,9 @@ mod toggle_ab_eigh_rank2_update {
 #[cfg(test)]
 mod toggle_ab_pinv_cholesky {
     use super::{
-        DISABLE_TALL_PINV_TRSM, DISABLE_WIDE_PINV_CHOLESKY, DMatrix, PinvOptions, pinv,
+        DISABLE_TALL_PINV_TRSM, DISABLE_WIDE_PINV_CHOLESKY, DMatrix,
+        PINV_TALL_CHOLESKY_LEGACY_HITS, PINV_TALL_CHOLESKY_TRSM_HITS, PINV_WIDE_CHOLESKY_HITS,
+        PinvOptions, pinv,
         pinv_full_rank_tall_cholesky_with_min_cols, pinv_full_rank_wide_cholesky_with_min_rows,
     };
     use std::sync::Mutex;
@@ -44138,7 +44195,29 @@ mod toggle_ab_pinv_cholesky {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _restore = RestoreToggles::capture();
 
-        for kappa in [1.0_f64, 1.0e2, 1.0e4] {
+        // WHAT CHANGED AND WHY (frankenscipy-bgrq1).
+        //
+        // The previous form swept κ ∈ {1, 1e2, 1e4} and asserted `error <= 512·eps·κ²`.
+        // It passed, and it proved much less than it looked like it did:
+        //
+        //   * The tall arm reported a relative gap of exactly 0.000e0 at every κ. That is
+        //     equally consistent with the two routes agreeing bit-for-bit and with the
+        //     public `pinv` never reaching this route at all, so both "arms" ran the same
+        //     code. The must-hit assertion could not tell them apart because it called the
+        //     internal helper DIRECTLY while the compared values came from public `pinv` --
+        //     a different call, free to take a different route. Hit counters settle it.
+        //   * The κ² bound grows far faster than the observed error, so by κ=1e4 the
+        //     assertion had ten orders of margin. A gate that can never be approached
+        //     cannot answer the question this bead actually asked, which is WHERE the
+        //     normal-equations squaring starts to dominate.
+        //
+        // The sweep now runs into the region where that question has an answer, and the
+        // answer is recorded as an outcome rather than as a failure: past some κ the wide
+        // Cholesky route DECLINES, and declining is the correct behaviour, not a bug.
+        let mut wide_admitted: Vec<f64> = Vec::new();
+        let mut wide_declined: Vec<f64> = Vec::new();
+
+        for kappa in [1.0_f64, 1.0e2, 1.0e4, 1.0e5, 1.0e6, 1.0e7] {
             let tall = tall_fixture(kappa);
             let tall_matrix = DMatrix::from_row_slice(
                 tall.len(),
@@ -44146,16 +44225,74 @@ mod toggle_ab_pinv_cholesky {
                 &tall.iter().flatten().copied().collect::<Vec<_>>(),
             );
             let tall_rtol = (tall.len().max(tall[0].len()) as f64) * f64::EPSILON;
+            let bound = 512.0 * f64::EPSILON * kappa * kappa;
 
-            DISABLE_TALL_PINV_TRSM.store(false, Ordering::Relaxed);
-            assert!(
+            // ---- TALL: fused row-major TRSM against nalgebra's own Cholesky solve ----
+            let tall_admits =
                 pinv_full_rank_tall_cholesky_with_min_cols(&tall_matrix, 0.0, tall_rtol, 128)
-                    .is_some(),
-                "tall Cholesky arm did not admit κ={kappa:.0e}; the public A/B below would be blind"
-            );
-            let tall_fast = pinv(&tall, PinvOptions::default()).expect("tall fast pinv");
-            DISABLE_TALL_PINV_TRSM.store(true, Ordering::Relaxed);
-            let tall_legacy = pinv(&tall, PinvOptions::default()).expect("tall legacy pinv");
+                    .is_some();
+            if tall_admits {
+                DISABLE_TALL_PINV_TRSM.store(false, Ordering::Relaxed);
+                let trsm_before = PINV_TALL_CHOLESKY_TRSM_HITS.load(Ordering::Relaxed);
+                let legacy_before = PINV_TALL_CHOLESKY_LEGACY_HITS.load(Ordering::Relaxed);
+                let tall_fast = pinv(&tall, PinvOptions::default()).expect("tall fast pinv");
+                let trsm_hits = PINV_TALL_CHOLESKY_TRSM_HITS.load(Ordering::Relaxed) - trsm_before;
+                let legacy_leak =
+                    PINV_TALL_CHOLESKY_LEGACY_HITS.load(Ordering::Relaxed) - legacy_before;
+
+                DISABLE_TALL_PINV_TRSM.store(true, Ordering::Relaxed);
+                let legacy_before = PINV_TALL_CHOLESKY_LEGACY_HITS.load(Ordering::Relaxed);
+                let trsm_before = PINV_TALL_CHOLESKY_TRSM_HITS.load(Ordering::Relaxed);
+                let tall_legacy = pinv(&tall, PinvOptions::default()).expect("tall legacy pinv");
+                let legacy_hits =
+                    PINV_TALL_CHOLESKY_LEGACY_HITS.load(Ordering::Relaxed) - legacy_before;
+                let trsm_leak = PINV_TALL_CHOLESKY_TRSM_HITS.load(Ordering::Relaxed) - trsm_before;
+
+                // BOTH ARMS OBSERVED, one hit each and NO leak into the other. A bare
+                // `hits > 0` would pass if the public call took both routes; a bare
+                // `leak == 0` would pass if it took neither.
+                assert_eq!(
+                    (trsm_hits, legacy_leak),
+                    (1, 0),
+                    "κ={kappa:.0e}: toggle-OFF public pinv did not take the fused TRSM arm \
+                     exactly once and only it (trsm={trsm_hits} legacy={legacy_leak}); the \
+                     gap below would be an A/A comparison wearing an A/B's label"
+                );
+                assert_eq!(
+                    (legacy_hits, trsm_leak),
+                    (1, 0),
+                    "κ={kappa:.0e}: toggle-ON public pinv did not take the legacy \
+                     nalgebra-solve arm exactly once and only it (legacy={legacy_hits} \
+                     trsm={trsm_leak})"
+                );
+
+                let tall_error = max_relative_entry_error(
+                    &tall_fast.pseudo_inverse,
+                    &tall_legacy.pseudo_inverse,
+                );
+                println!(
+                    "kappa={kappa:.0e} TALL admitted tall_relative_error={tall_error:.3e} \
+                     bound={bound:.3e} trsm_hits={trsm_hits} legacy_hits={legacy_hits}"
+                );
+
+                // THE CONTRACT IS STRONGER THAN IT WAS ARGUED TO BE. With both routes
+                // proven to have run, the measured gap is 0.0 at every κ this admits --
+                // not "within a κ² tolerance" but bit-identical. Asserting the strong form
+                // is what makes a future edit that introduces ANY drift fail here, instead
+                // of drifting silently inside a tolerance wide enough to hide it.
+                assert_eq!(
+                    tall_error, 0.0,
+                    "κ={kappa:.0e}: the tall TRSM arms are documented BIT-IDENTICAL but \
+                     differ by {tall_error:.3e}. If this divergence is intended, the \
+                     contract on DISABLE_TALL_PINV_TRSM must be downgraded to a tolerance \
+                     and this assertion relaxed DELIBERATELY -- do not widen it to make a \
+                     build pass."
+                );
+            } else {
+                println!("kappa={kappa:.0e} TALL declined (route refuses this conditioning)");
+            }
+
+            // ---- WIDE: normal-equations Cholesky against the public SVD route ----
             let wide = wide_fixture(kappa);
             let wide_matrix = DMatrix::from_row_slice(
                 wide.len(),
@@ -44165,49 +44302,103 @@ mod toggle_ab_pinv_cholesky {
             let wide_rtol = (wide.len().max(wide[0].len()) as f64) * f64::EPSILON;
 
             DISABLE_WIDE_PINV_CHOLESKY.store(false, Ordering::Relaxed);
-            assert!(
-                pinv_full_rank_wide_cholesky_with_min_rows(
-                    &wide,
-                    &wide_matrix,
-                    0.0,
-                    wide_rtol,
-                    128
-                )
-                .is_some(),
-                "wide Cholesky arm did not admit κ={kappa:.0e}; the public A/B below would be blind"
-            );
+            let wide_admits =
+                pinv_full_rank_wide_cholesky_with_min_rows(&wide, &wide_matrix, 0.0, wide_rtol, 128)
+                    .is_some();
+
+            if !wide_admits {
+                // THE ANSWER TO THE BEAD'S QUESTION, and it is a pass, not a failure.
+                // Cholesky on A·Aᵀ squares the condition number, so past some κ the
+                // normal equations stop carrying enough information. The route DECLINES
+                // there rather than returning a corrupted pseudo-inverse, and public
+                // `pinv` still answers via SVD. That is the gate being set correctly.
+                wide_declined.push(kappa);
+                let wide_before = PINV_WIDE_CHOLESKY_HITS.load(Ordering::Relaxed);
+                let fallback = pinv(&wide, PinvOptions::default())
+                    .expect("public pinv must still answer via SVD where Cholesky declines");
+                let leak = PINV_WIDE_CHOLESKY_HITS.load(Ordering::Relaxed) - wide_before;
+                assert_eq!(
+                    leak, 0,
+                    "κ={kappa:.0e}: the wide Cholesky route declined, yet the public pinv \
+                     still counted {leak} hit(s) on it"
+                );
+                assert!(
+                    fallback
+                        .pseudo_inverse
+                        .iter()
+                        .flat_map(|row| row.iter())
+                        .all(|value| value.is_finite()),
+                    "κ={kappa:.0e}: the SVD fallback returned a non-finite pseudo-inverse"
+                );
+                println!(
+                    "kappa={kappa:.0e} WIDE declined -> SVD fallback, finite, chol_hits=0 \
+                     (normal-equations squaring dominates at or before this κ)"
+                );
+                continue;
+            }
+
+            wide_admitted.push(kappa);
+            let wide_before = PINV_WIDE_CHOLESKY_HITS.load(Ordering::Relaxed);
             let wide_fast = pinv(&wide, PinvOptions::default()).expect("wide fast pinv");
+            let wide_hits = PINV_WIDE_CHOLESKY_HITS.load(Ordering::Relaxed) - wide_before;
+
             DISABLE_WIDE_PINV_CHOLESKY.store(true, Ordering::Relaxed);
             assert!(
-                pinv_full_rank_wide_cholesky_with_min_rows(
-                    &wide,
-                    &wide_matrix,
-                    0.0,
-                    wide_rtol,
-                    128
-                )
-                .is_none(),
+                pinv_full_rank_wide_cholesky_with_min_rows(&wide, &wide_matrix, 0.0, wide_rtol, 128)
+                    .is_none(),
                 "wide toggle did not force its SVD fallback for κ={kappa:.0e}"
             );
+            let wide_before = PINV_WIDE_CHOLESKY_HITS.load(Ordering::Relaxed);
             let wide_svd = pinv(&wide, PinvOptions::default()).expect("wide SVD pinv");
+            let wide_svd_leak = PINV_WIDE_CHOLESKY_HITS.load(Ordering::Relaxed) - wide_before;
 
-            let bound = 512.0 * f64::EPSILON * kappa * kappa;
-            let tall_error =
-                max_relative_entry_error(&tall_fast.pseudo_inverse, &tall_legacy.pseudo_inverse);
+            // The `is_none()` assertion above proves the HELPER declines; it does not
+            // prove the public call stopped using it. The counters do.
+            assert_eq!(
+                (wide_hits, wide_svd_leak),
+                (1, 0),
+                "κ={kappa:.0e}: public wide pinv did not take the normal-equations Cholesky \
+                 arm exactly once with the toggle off and zero times with it on \
+                 (chol={wide_hits} leak={wide_svd_leak})"
+            );
+
             let wide_error =
                 max_relative_entry_error(&wide_fast.pseudo_inverse, &wide_svd.pseudo_inverse);
+            // MARGIN, not just pass/fail. "error <= bound" prints PASS both for a gap ten
+            // orders below its bound and for one just under it; the ratio is what moves.
+            let wide_margin = wide_error / bound;
             println!(
-                "kappa={kappa:.0e} tall_relative_error={tall_error:.3e} wide_relative_error={wide_error:.3e} bound={bound:.3e}"
-            );
-            assert!(
-                tall_error <= bound,
-                "tall Cholesky-arm relative gap {tall_error:.3e} exceeded κ² bound {bound:.3e} at κ={kappa:.0e}"
+                "kappa={kappa:.0e} WIDE admitted wide_relative_error={wide_error:.3e} \
+                 bound={bound:.3e} used_fraction_of_bound={wide_margin:.3e} \
+                 chol_hits={wide_hits}"
             );
             assert!(
                 wide_error <= bound,
-                "wide Cholesky/SVD relative gap {wide_error:.3e} exceeded κ² bound {bound:.3e} at κ={kappa:.0e}"
+                "wide Cholesky/SVD relative gap {wide_error:.3e} exceeded κ² bound \
+                 {bound:.3e} at κ={kappa:.0e}"
             );
         }
+
+        // THE SWEEP MUST STRADDLE THE CROSSOVER. Without both of these the test degrades
+        // back into what it was: an all-admitting sweep proves the bound is never
+        // approached, and an all-declining sweep proves the arms were never compared.
+        // Either way it would pass while measuring nothing.
+        assert!(
+            !wide_admitted.is_empty(),
+            "no κ in the sweep admitted the wide Cholesky route, so its arms were never \
+             compared and the accuracy contract is untested again"
+        );
+        assert!(
+            !wide_declined.is_empty(),
+            "every κ in the sweep admitted the wide Cholesky route, so the sweep never \
+             reached the conditioning where the normal-equations squaring dominates -- \
+             widen it rather than deleting this assertion"
+        );
+        println!(
+            "WIDE CROSSOVER: admitted up to κ={:.0e}, first declined at κ={:.0e}",
+            wide_admitted.last().copied().unwrap_or(f64::NAN),
+            wide_declined.first().copied().unwrap_or(f64::NAN)
+        );
     }
 }
 
