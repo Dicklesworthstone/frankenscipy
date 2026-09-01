@@ -77,10 +77,14 @@ fn main() {
         fsci_linalg::EIGH_DSYMV_FORCE_SCALAR.store(force_scalar, Ordering::Relaxed);
         let force_double = std::env::var("EIGH_DSYMV_FORCE_DOUBLE_READ").as_deref() == Ok("1");
         fsci_linalg::EIGH_DSYMV_FORCE_DOUBLE_READ.store(force_double, Ordering::Relaxed);
+        let gather = std::env::var("EIGH_DSYMV_PARALLEL_GATHER").as_deref() == Ok("1");
+        fsci_linalg::EIGH_DSYMV_PARALLEL_GATHER.store(gather, Ordering::Relaxed);
         let a = build(n);
         let result = eigh(&a, DecompOptions::default()).expect("eigh");
         let checksum: f64 = result.eigenvalues.iter().sum();
-        println!("n={n} force_scalar={force_scalar} force_double={force_double} checksum={checksum:.6}");
+        println!(
+            "n={n} force_scalar={force_scalar} force_double={force_double} gather={gather} checksum={checksum:.6}"
+        );
         return;
     }
 
