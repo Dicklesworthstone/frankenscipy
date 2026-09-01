@@ -283,24 +283,33 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
             }
         };
 
-        // The back-merge arm (frankenscipy-xup61). Off is the library default and the
-        // default here, so an invocation written before this argument existed selects
-        // exactly the code it selected then.
-        // DEFAULT TRACKS THE LIBRARY, which is now ON. When this argument was added the
-        // library default was OFF and `"off"` here matched it; the library flipped and
-        // this did not, so a bare invocation silently measured the NON-shipping arm and
-        // reported `partial_inplace_factor_hits=0` while calling itself the shipping
-        // configuration. The hit counter caught it. A harness default that drifts from
-        // the library default is worse than having no default at all.
-        let supernodal_enabled = match args.get(9).map(String::as_str).unwrap_or("off") {
+        // EVERY DEFAULT BELOW TRACKS THE LIBRARY DEFAULT, and the tracking is pinned by
+        // `bare_invocation_defaults_track_the_library_toggles` rather than by these
+        // comments. This mattered once already: when the partial-inplace argument was
+        // added the library default was OFF and `"off"` here matched it; the library
+        // flipped to ON and this did not, so a bare invocation silently measured the
+        // NON-shipping arm and reported `partial_inplace_factor_hits=0` while calling
+        // itself the shipping configuration. Only the hit counter caught it, and only
+        // after the fact. A harness default that has drifted from the library default is
+        // worse than having no default at all, because it still prints a provenance line.
+        //
+        // These four are stored UNCONDITIONALLY at the run site (unlike `FSCI_SPLU_BANDED`,
+        // which only overrides when asked), so the literal tokens here ARE the arm a bare
+        // invocation measures. The drift test reads the library statics and fails closed if
+        // any of them stops agreeing with the token on its own line.
+
+        // The back-merge arm (frankenscipy-xup61); `SPLU_BACK_MERGE_ENABLE` defaults false.
+        let back_merge_enabled = match args.get(7).map(String::as_str).unwrap_or("off") {
             "on" => true,
             "off" => false,
             other => {
                 return Err(format!(
-                    "supernodal arm must be `on` or `off`, got {other:?}"
+                    "back-merge arm must be `on` or `off`, got {other:?}"
                 ));
             }
         };
+
+        // The partial-inplace-prefix arm; `SPLU_PARTIAL_INPLACE_ENABLE` defaults true.
         let partial_inplace_enabled = match args.get(8).map(String::as_str).unwrap_or("on") {
             "on" => true,
             "off" => false,
@@ -310,12 +319,16 @@ and is computed AFTER argument dispatch, so this message costs nothing.";
                 ));
             }
         };
-        let back_merge_enabled = match args.get(7).map(String::as_str).unwrap_or("off") {
+
+        // The supernodal-blocking arm; `SPLU_SUPERNODAL_ENABLE` defaults false. Memory of
+        // this crate: the shipping arm here is BANDED, and rows have been priced against
+        // supernodal twice while `supernodal_factor_hits=0` — so this default is load-bearing.
+        let supernodal_enabled = match args.get(9).map(String::as_str).unwrap_or("off") {
             "on" => true,
             "off" => false,
             other => {
                 return Err(format!(
-                    "back-merge arm must be `on` or `off`, got {other:?}"
+                    "supernodal arm must be `on` or `off`, got {other:?}"
                 ));
             }
         };
@@ -1674,9 +1687,10 @@ for raw_line in sys.stdin.buffer:
     #[cfg(test)]
     mod tests {
         use super::{
-            Fixture, RunConfig, SCIPY_PYTHON_CANDIDATES, SCIPY_SITE_PACKAGES,
-            balanced_square_quiescence, interpreter_can_import_scipy, is_help_request, ns_per_unit,
-            parse_run_config, replicate_summary, run_aggregate,
+            Fixture, Ordering, RunConfig, SCIPY_PYTHON_CANDIDATES, SCIPY_SITE_PACKAGES,
+            SPLU_BACK_MERGE_ENABLE, SPLU_PARTIAL_INPLACE_ENABLE, SPLU_ROW_HEAD_CACHE_DISABLE,
+            SPLU_SUPERNODAL_ENABLE, balanced_square_quiescence, interpreter_can_import_scipy,
+            is_help_request, ns_per_unit, parse_run_config, replicate_summary, run_aggregate,
         };
 
         fn args(values: &[&str]) -> Vec<String> {
@@ -1912,6 +1926,174 @@ for raw_line in sys.stdin.buffer:
             let error = parse_run_config(&args(&["perf_splu", ".", "splu"]))
                 .expect_err("a malformed command must not select default rows");
             assert!(error.contains("side must be an integer"));
+        }
+
+        /// The arm selection a `RunConfig` actually carries.
+        ///
+        /// Split out so the SAME projection is applied to the parsed config and to the
+        /// deliberately drifted one below; comparing two differently-built tuples would
+        /// let a typo in one of them pass as agreement.
+        fn arms_of(config: &RunConfig) -> (bool, bool, bool, bool) {
+            (
+                config.head_cache_enabled,
+                config.back_merge_enabled,
+                config.partial_inplace_enabled,
+                config.supernodal_enabled,
+            )
+        }
+
+        /// The arms the LIBRARY ships, read from the toggles themselves.
+        ///
+        /// Read, never restated. A test that repeated the literals `parse_run_config`
+        /// uses would agree with the harness by construction and would have stayed green
+        /// through exactly the drift this crate has already paid for once.
+        ///
+        /// PRECONDITION, stated because it is the thing that could rot: no test in this
+        /// binary calls `store` on any of these four statics, so what is read here is the
+        /// construction default and not another test's leftover. `cargo test` runs a
+        /// crate's tests concurrently in one process (frankenscipy-0zn0v), so if a
+        /// toggle-writing test is ever added to THIS bin, it must take a shared mutex with
+        /// this one or this assertion becomes a race. The library's own toggle tests live
+        /// in a different test binary and cannot reach these.
+        fn library_shipping_arms() -> (bool, bool, bool, bool) {
+            (
+                // Inverted: the toggle names the DISABLE side.
+                !SPLU_ROW_HEAD_CACHE_DISABLE.load(Ordering::Relaxed),
+                SPLU_BACK_MERGE_ENABLE.load(Ordering::Relaxed),
+                SPLU_PARTIAL_INPLACE_ENABLE.load(Ordering::Relaxed),
+                SPLU_SUPERNODAL_ENABLE.load(Ordering::Relaxed),
+            )
+        }
+
+        #[test]
+        fn bare_invocation_defaults_track_the_library_toggles() {
+            // WHAT THIS PINS. `parse_run_config` hardcodes a token per arm and the run
+            // site stores all four UNCONDITIONALLY, so a bare `perf_splu` measures the
+            // harness's literals, not the library's defaults. Those agree today. The last
+            // time they stopped agreeing, the harness printed a provenance line calling
+            // itself the shipping configuration while measuring the other arm, and only
+            // `partial_inplace_factor_hits=0` gave it away — after the row was taken.
+            let bare =
+                parse_run_config(&args(&["perf_splu"])).expect("a bare invocation must parse");
+            let library = library_shipping_arms();
+
+            // MUST-HIT.
+            assert_eq!(
+                arms_of(&bare),
+                library,
+                "a bare `perf_splu` no longer measures the shipping arms: harness \
+                 (head_cache, back_merge, partial_inplace, supernodal) = {:?} against \
+                 library {library:?}. Update the defaults in `parse_run_config` to match \
+                 the library toggles -- do NOT relax this test. Every row previously taken \
+                 with a bare invocation described the arm this test is now refusing.",
+                arms_of(&bare)
+            );
+
+            // MUST-MISS, one arm at a time. Without this the assertion above would pass
+            // just as happily if both sides were built from the same source -- "we agree"
+            // proves nothing until disagreement has been shown to be detectable.
+            for (index, label) in [
+                (0usize, "head_cache"),
+                (1, "back_merge"),
+                (2, "partial_inplace"),
+                (3, "supernodal"),
+            ] {
+                let mut drifted = bare;
+                match index {
+                    0 => drifted.head_cache_enabled = !drifted.head_cache_enabled,
+                    1 => drifted.back_merge_enabled = !drifted.back_merge_enabled,
+                    2 => drifted.partial_inplace_enabled = !drifted.partial_inplace_enabled,
+                    _ => drifted.supernodal_enabled = !drifted.supernodal_enabled,
+                }
+                assert_ne!(
+                    arms_of(&drifted),
+                    library,
+                    "flipping the {label} arm was not detected, so this comparison cannot \
+                     see drift in it either"
+                );
+            }
+        }
+
+        #[test]
+        fn parse_run_config_refuses_every_malformed_selector_position() {
+            // The bead this closes (frankenscipy-tcg0u) is about commands that parse as
+            // DEFAULTS instead of failing. One position was covered; a selector is only
+            // fail-closed if EVERY position is, so each is asserted here, and each error
+            // must NAME the argument it refused -- a generic refusal sends the operator
+            // back to the same guess that produced the malformed command.
+            for (argv, expected) in [
+                (vec!["perf_splu", "24", "x"], "rounds must be an integer"),
+                (vec!["perf_splu", "24", "41", "x"], "warmup must be an integer"),
+                (
+                    vec!["perf_splu", "24", "41", "4", "maybe"],
+                    "spectral arm must be `on` or `off`",
+                ),
+                (
+                    vec!["perf_splu", "24", "41", "4", "off", "banded"],
+                    "fixture must be `cubic`, `scattered` or `convection`",
+                ),
+                (
+                    vec!["perf_splu", "24", "41", "4", "off", "cubic", "on", "yes"],
+                    "back-merge arm must be `on` or `off`",
+                ),
+                (
+                    vec!["perf_splu", "24", "41", "4", "off", "cubic", "on", "off", "yes"],
+                    "partial-inplace arm must be `on` or `off`",
+                ),
+                (
+                    vec![
+                        "perf_splu", "24", "41", "4", "off", "cubic", "on", "off", "on", "yes",
+                    ],
+                    "supernodal arm must be `on` or `off`",
+                ),
+            ] {
+                let error = match parse_run_config(&args(&argv)) {
+                    Ok(config) => panic!("{argv:?} must be refused, but parsed as {config:?}"),
+                    Err(error) => error,
+                };
+                assert!(
+                    error.contains(expected),
+                    "{argv:?} was refused without naming the argument: wanted {expected:?}, \
+                     got {error:?}"
+                );
+            }
+
+            // EXTRA selectors, the other half of "malformed": an operator who appends one
+            // argument too many has mistaken the positional order, and every arm after the
+            // mistake is then wrong. Refuse the whole command rather than the tail.
+            let error = parse_run_config(&args(&[
+                "perf_splu", "24", "41", "4", "off", "cubic", "on", "off", "on", "off", "off",
+            ]))
+            .expect_err("a tenth selector must be refused, not ignored");
+            assert!(
+                error.contains("expected at most nine arguments"),
+                "the arity refusal must say what the limit is, got {error:?}"
+            );
+
+            // MUST-HIT for this test too: the longest LEGAL command still parses, so the
+            // arity guard is refusing the tenth selector and not the ninth.
+            let full = parse_run_config(&args(&[
+                "perf_splu", "24", "41", "4", "off", "cubic", "on", "off", "on", "off",
+            ]))
+            .expect("the nine-selector form must still parse");
+            assert_eq!(
+                arms_of(&full),
+                (true, false, true, false),
+                "the fully explicit form must reach the config it names"
+            );
+
+            // The two numeric floors are refusals, not clamps -- a silently clamped
+            // `side` would measure a different matrix than the command names.
+            assert!(
+                parse_run_config(&args(&["perf_splu", "3"]))
+                    .expect_err("side 3 must be refused")
+                    .contains("side must be at least 4")
+            );
+            assert!(
+                parse_run_config(&args(&["perf_splu", "24", "8"]))
+                    .expect_err("8 rounds must be refused")
+                    .contains("fewer than 9 rounds")
+            );
         }
 
         #[test]
