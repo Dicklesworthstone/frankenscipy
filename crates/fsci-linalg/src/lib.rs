@@ -19,6 +19,22 @@
 // in progress — see bead frankenscipy-5tmu1).
 pub mod cossin;
 
+// Reconstruction from an interpolative decomposition, and the spectral-norm estimators;
+// the CONSUMING half of `scipy.linalg.interpolative`, where `interp_decomp` in this file
+// only PRODUCES an ID.
+//
+// UNDECLARED FOR EIGHT DAYS, WHICH MEANT NEVER COMPILED (frankenscipy-a623e). The file
+// landed in c59ad67f4 and grew in 05e978713, both under frankenscipy-z3zys and both
+// reporting live-scipy differential coverage. That coverage cannot have run: without this
+// line the module is not part of the crate, so `cargo test -p fsci-linalg` never saw its 14
+// unit tests, and `fsci-conformance`'s two `diff_linalg_interpolative_*` test targets failed
+// to BUILD -- which a suite reports as a build error on one target, not as a failing test,
+// and which nothing in CI was looking at.
+//
+// It is `pub` because those two conformance tests import it by path
+// (`use fsci_linalg::interpolative::{...}`), which is also how the gap was found.
+pub mod interpolative;
+
 // Francis double-shift QR with LAPACK's exceptional shifts; the PARITY half of
 // frankenscipy-sez4r, where bounded_schur was only the robustness half.
 //
@@ -12744,9 +12760,8 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
         let mut row_offset = 0;
         while row_offset + LANES <= active {
             let p_lanes = Simd::<f64, LANES>::from_slice(&p[row_offset..row_offset + LANES]);
-            let v_lanes = Simd::<f64, LANES>::from_slice(
-                &reflector.values[row_offset..row_offset + LANES],
-            );
+            let v_lanes =
+                Simd::<f64, LANES>::from_slice(&reflector.values[row_offset..row_offset + LANES]);
             (p_lanes - Simd::splat(correction) * v_lanes)
                 .copy_to_slice(&mut w[row_offset..row_offset + LANES]);
             row_offset += LANES;
@@ -44110,8 +44125,8 @@ mod toggle_ab_pinv_cholesky {
     use super::{
         DISABLE_TALL_PINV_TRSM, DISABLE_WIDE_PINV_CHOLESKY, DMatrix,
         PINV_TALL_CHOLESKY_LEGACY_HITS, PINV_TALL_CHOLESKY_TRSM_HITS, PINV_WIDE_CHOLESKY_HITS,
-        PinvOptions, pinv,
-        pinv_full_rank_tall_cholesky_with_min_cols, pinv_full_rank_wide_cholesky_with_min_rows,
+        PinvOptions, pinv, pinv_full_rank_tall_cholesky_with_min_cols,
+        pinv_full_rank_wide_cholesky_with_min_rows,
     };
     use std::sync::Mutex;
     use std::sync::atomic::Ordering;
@@ -44302,9 +44317,14 @@ mod toggle_ab_pinv_cholesky {
             let wide_rtol = (wide.len().max(wide[0].len()) as f64) * f64::EPSILON;
 
             DISABLE_WIDE_PINV_CHOLESKY.store(false, Ordering::Relaxed);
-            let wide_admits =
-                pinv_full_rank_wide_cholesky_with_min_rows(&wide, &wide_matrix, 0.0, wide_rtol, 128)
-                    .is_some();
+            let wide_admits = pinv_full_rank_wide_cholesky_with_min_rows(
+                &wide,
+                &wide_matrix,
+                0.0,
+                wide_rtol,
+                128,
+            )
+            .is_some();
 
             if !wide_admits {
                 // THE ANSWER TO THE BEAD'S QUESTION, and it is a pass, not a failure.
@@ -44344,8 +44364,14 @@ mod toggle_ab_pinv_cholesky {
 
             DISABLE_WIDE_PINV_CHOLESKY.store(true, Ordering::Relaxed);
             assert!(
-                pinv_full_rank_wide_cholesky_with_min_rows(&wide, &wide_matrix, 0.0, wide_rtol, 128)
-                    .is_none(),
+                pinv_full_rank_wide_cholesky_with_min_rows(
+                    &wide,
+                    &wide_matrix,
+                    0.0,
+                    wide_rtol,
+                    128
+                )
+                .is_none(),
                 "wide toggle did not force its SVD fallback for κ={kappa:.0e}"
             );
             let wide_before = PINV_WIDE_CHOLESKY_HITS.load(Ordering::Relaxed);

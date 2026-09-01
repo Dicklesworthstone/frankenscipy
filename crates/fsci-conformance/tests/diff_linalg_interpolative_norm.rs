@@ -35,13 +35,47 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsci_linalg::interpolative::{
     DEFAULT_SPECTRAL_NORM_ITERATIONS, estimate_spectral_norm, estimate_spectral_norm_diff,
 };
 use serde::{Deserialize, Serialize};
+
+use fsci_runtime::scipy_incumbent::ScipyIncumbent;
+
+/// Submodules the oracle actually uses.
+const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.linalg.interpolative"];
+
+/// The live-SciPy incumbent this test compares against, resolved once and PROVEN by running
+/// the import rather than by a name resolving on `PATH`.
+///
+/// These two test targets could not BUILD until frankenscipy-a623e, so they were invisible to
+/// the sweep that retired the bare-`python3` spawn everywhere else (frankenscipy-m5s54). On
+/// `thinkstation1` a bare `python3` is 3.14 with no SciPy, so this oracle would have skipped
+/// on the one host that actually carries the pinned incumbent -- while `FSCI_REQUIRE_SCIPY_ORACLE=1`
+/// turned that same skip into a hard failure for a reason unrelated to the code under test.
+///
+/// `None` when the host has no importable SciPy, which is the honest state on most rch
+/// workers and is what the existing skip/assert pair below is written to handle.
+fn incumbent() -> Option<&'static ScipyIncumbent> {
+    static INCUMBENT: std::sync::OnceLock<Option<ScipyIncumbent>> = std::sync::OnceLock::new();
+    INCUMBENT
+        .get_or_init(
+            || match ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES) {
+                Ok(found) => {
+                    eprintln!("{}", found.provenance_line());
+                    Some(found)
+                }
+                Err(error) => {
+                    eprintln!("scipy_incumbent: unresolved -- {error}");
+                    None
+                }
+            },
+        )
+        .as_ref()
+}
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
@@ -314,7 +348,17 @@ for case in q["points"]:
 print(json.dumps({"points": points}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize interpolative norm query");
-    let mut child = match Command::new("python3")
+    let Some(incumbent) = incumbent() else {
+        assert!(
+            std::env::var(REQUIRE_SCIPY_ENV).is_err(),
+            "no interpreter on this host can import scipy.linalg.interpolative, so the \
+             differential arm cannot run"
+        );
+        eprintln!("skipping interpolative oracle: no live SciPy incumbent on this host");
+        return None;
+    };
+    let mut child = match incumbent
+        .command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())
