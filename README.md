@@ -927,7 +927,7 @@ FrankenSciPy is built using a small but specific stack designed for AI-driven, m
 
 | Tool | What it does |
 |---|---|
-| [`br` (beads_rust)](https://github.com/Dicklesworthstone/beads_rust) | Local-first issue tracker. Every TODO, defect, and roadmap item lives in `.beads/issues.jsonl` and surfaces through `br ready`, `br show <id>`, `br create`. The 2,404 closed beads documented in `CHANGELOG.md` are the audit trail. |
+| [`br` (beads_rust)](https://github.com/Dicklesworthstone/beads_rust) | Local-first issue tracker. Every TODO, defect, and roadmap item lives in `.beads/issues.jsonl` and surfaces through `br ready`, `br show <id>`, `br create`. The 4,282 closed beads (as of 2026-09-03) are the audit trail; `CHANGELOG.md` summarizes them by domain. |
 | `bv` | Graph-aware triage on top of beads. `bv --robot-triage` returns the recommended next ticket with reasons. |
 | `agent-mail` | MCP messaging layer that lets multiple agents working on the repo coordinate via threaded conversations and advisory file reservations, all kept under `.agent-mail/` for auditability. |
 | `rch` (Remote Compilation Helper) | Offloads `cargo build`, `cargo test`, and `cargo clippy` to a fleet of remote workers; this is how the project keeps the developer machine responsive when several agents are compiling the workspace in parallel. |
@@ -1204,12 +1204,12 @@ The Rust API is shaped to look like SciPy when you squint. The recurring transla
 | `scipy.linalg.solve(A, b)` | `fsci_linalg::solve(&a, &b, SolveOptions::default())` |
 | `scipy.linalg.lstsq(A, b)` | `fsci_linalg::lstsq(&a, &b, LstsqOptions::default())` |
 | `scipy.linalg.eigh(A)` | `fsci_linalg::eigh(&a, DecompOptions::default())` |
-| `scipy.linalg.expm(A)` | `fsci_linalg::expm(&a)` |
+| `scipy.linalg.expm(A)` | `fsci_linalg::expm(&a, DecompOptions::default())` |
 | `scipy.sparse.csr_matrix(...)` | `fsci_sparse::CsrMatrix::from_rows(Shape2D{...}, idx, data)` |
 | `scipy.sparse.linalg.cg(A, b)` | `fsci_sparse::cg(&a, &b, None, IterativeSolveOptions::default())` |
 | `scipy.optimize.minimize(f, x0, method='BFGS')` | `fsci_opt::bfgs(&f, &x0, MinimizeOptions::default())` |
 | `scipy.optimize.minimize(f, x0, method='L-BFGS-B', bounds=...)` | `fsci_opt::lbfgsb(&f, &x0, opts)` |
-| `scipy.optimize.brentq(f, a, b)` | `fsci_opt::brentq(&f, a, b, RootOptions::default())` |
+| `scipy.optimize.brentq(f, a, b)` | `fsci_opt::brentq(&f, (a, b), RootOptions::default())` |
 | `scipy.integrate.solve_ivp(f, [t0, tf], y0, method='RK45')` | `fsci_integrate::solve_ivp(&mut f, &SolveIvpOptions { method: SolverKind::Rk45, ... })` |
 | `scipy.integrate.quad(f, a, b)` | `fsci_integrate::quad(&f, a, b, QuadOptions::default())` |
 | `scipy.fft.rfft(x)` | `fsci_fft::rfft(&x, &FftOptions::default())` |
@@ -1217,9 +1217,9 @@ The Rust API is shaped to look like SciPy when you squint. The recurring transla
 | `scipy.signal.filtfilt(b, a, x)` | `fsci_signal::filtfilt(&b, &a, &x)` |
 | `scipy.stats.norm.pdf(x, loc, scale)` | `Normal::new(loc, scale).pdf(x)` |
 | `scipy.stats.ttest_ind(a, b, equal_var=False)` | `fsci_stats::ttest_ind_welch(&a, &b)` |
-| `scipy.special.gamma(x)` | `fsci_special::gamma(x)` |
+| `scipy.special.gamma(x)` | `fsci_special::gamma(&SpecialTensor::RealScalar(x), RuntimeMode::Strict)` (tensor-shaped, mode-aware; the scalar helpers such as `gammaln_scalar` live alongside) |
 | `scipy.special.ellipk(m)` | `fsci_special::elliprf(0.0, 1.0 - m, 1.0)` (Carlson form) |
-| `scipy.spatial.KDTree(points).query(q)` | `KdTree::new(&points)?.query(&q)?` |
+| `scipy.spatial.KDTree(points).query(q)` | `KDTree::new(&points)?.query(&q)?` |
 
 Three rules of thumb:
 
@@ -1463,9 +1463,9 @@ When you want to understand a kernel, follow this order:
 4. For "why this algorithm?" questions, the relevant book or paper from the **Bibliography** is the answer.
 5. For "does this match SciPy?" questions, the `fsci-conformance` differential test for that routine is the answer.
 
-The single largest file in the workspace is `crates/fsci-stats/src/lib.rs` at ~48K lines. It is intentionally not split: every distribution is defined inline so a reader can `grep -n "pub struct <Name>"` and land on the entire implementation in one place.
+The single largest file in the workspace is `crates/fsci-stats/src/lib.rs` at ~125K lines, roughly half of it inline tests. It is intentionally not split: every distribution is defined inline so a reader can `grep -n "pub struct <Name>"` and land on the entire implementation in one place.
 
-`fsci-special` takes the opposite approach: ~33K lines of source split across ~10 modules (`gamma.rs`, `hyper.rs`, `orthopoly.rs`, `elliptic.rs`, `beta.rs`, etc.) with `lib.rs` (~2.7K lines) acting as the re-export header. Use either layout when adding new content; match the existing one in the crate you're touching.
+`fsci-special` takes the opposite approach: ~72K lines of source split across ~10 modules (`gamma.rs`, `hyper.rs`, `orthopoly.rs`, `elliptic.rs`, `beta.rs`, etc.) with `lib.rs` acting as the re-export header. Use either layout when adding new content; match the existing one in the crate you're touching.
 
 ---
 
@@ -1475,7 +1475,7 @@ The final reference block: the fuzz harness layout, the anatomy of a conformance
 
 ### The Fuzz Harness
 
-`fuzz/` is a cargo-fuzz workspace (excluded from the main workspace) with **96 fuzz targets** under `fuzz/fuzz_targets/`. Each target is named after the conformance packet it stresses, and each targets one class of input the routine has to be robust against:
+`fuzz/` is a cargo-fuzz workspace (excluded from the main workspace) with **98 fuzz targets** under `fuzz/fuzz_targets/`. Each target is named after the conformance packet it stresses, and each targets one class of input the routine has to be robust against:
 
 ```text
 fuzz/
@@ -1491,13 +1491,13 @@ fuzz/
 │   ├── p2c011_spatial_kdtree.rs                  # KDTree query under degenerate point sets
 │   ├── p2c012_cluster_fcluster_bounds.rs         # hierarchical cluster cut at extreme thresholds
 │   ├── p2c017_io_wav_read.rs                     # WAV header parser against malformed files
-│   └── ...                                        # 86 more
-├── corpus/         # accumulated fuzzer inputs that trigger interesting paths
-├── seeds/          # human-curated seed inputs (e.g., the matrix in the eigsh path-Laplacian bug)
+│   └── ...                                        # 88 more
+├── corpus/         # accumulated fuzzer inputs that trigger interesting paths (923 files)
+├── seeds/          # human-curated seed inputs (569 files)
 └── artifacts/      # minimized reproducers from any crash
 ```
 
-The nightly `fuzz_nightly.yml` GitHub Actions workflow runs every target for a bounded time budget; new corpus inputs are committed back to `fuzz/corpus/`, and any crashes get a minimized reproducer dropped into `fuzz/artifacts/` plus a beads issue filed automatically.
+The nightly `fuzz_nightly.yml` GitHub Actions workflow runs the nine `p2c006_special_*` targets for 900 seconds each under ASan+UBSan; the other 89 targets are run by hand with `cargo fuzz run <target>`. Crash reproducers land in `fuzz/artifacts/` and are triaged into beads by the `fuzz_triage` binary; nothing files beads automatically.
 
 Each target uses `libfuzzer-sys` and is structured around the same three-phase pattern:
 
@@ -1555,7 +1555,7 @@ When migrating a Python codebase to FrankenSciPy, the recurring footguns:
 | **In-place mutation expected** | Python's `arr += 1` modifies in place; Rust's `Vec<f64>` requires an explicit loop or `.iter_mut()` | Use `for x in &mut v { *x += 1.0 }` |
 | **Tuple-returning functions** | SciPy returns tuples, e.g. `(eigenvalues, eigenvectors)` | FrankenSciPy returns named result structs; read the field names, don't destructure positionally |
 | **Implicit `equal_var=True` for t-test** | SciPy defaults to pooled-variance; FrankenSciPy splits into `ttest_ind` (pooled) vs `ttest_ind_welch` (Welch) | Pick the right function (no `equal_var` flag) |
-| **`scipy.linalg.solve` accepts `assume_a='gen'/'sym'/...`** | Python keyword | Use `SolveOptions::default().assume_a(MatrixAssumption::...)` |
+| **`scipy.linalg.solve` accepts `assume_a='gen'/'sym'/...`** | Python keyword | Set the field: `SolveOptions { assume_a: Some(MatrixAssumption::Symmetric), ..Default::default() }` |
 | **Numerical defaults differ slightly** | SciPy's `solve_ivp` default `rtol` is `1e-3`; FrankenSciPy follows the same default, but explicit tolerance always wins | Pass tolerances explicitly when porting numerical regression tests |
 | **Distributions return tuples for `(loc, scale, shape)` params** | SciPy's `stats.beta.pdf(x, a, b, loc, scale)` | FrankenSciPy constructors take only shape parameters; pass `loc`/`scale` to `loc_scale_pdf` companions or shift/scale your input |
 | **Iterative-solver tolerance differs** | SciPy's `cg` defaults to `1e-5`; FrankenSciPy's `IterativeSolveOptions::default().tol` is also `1e-5` but be explicit for production | Always set `tol` explicitly |
@@ -1912,7 +1912,7 @@ cargo tree -i tokio
 
 ### Builds are slow / OOM during `cargo build`
 
-`fsci-stats` (~50K source lines) and `fsci-special` (~33K) are the largest compilation units. Building them in parallel can exhaust RAM on smaller hosts. Use:
+`fsci-stats` (~126K source lines including inline tests) and `fsci-special` (~72K) are the largest compilation units. Building them in parallel can exhaust RAM on smaller hosts. Use:
 
 ```bash
 CARGO_BUILD_JOBS=2 cargo build --workspace --release
@@ -1935,10 +1935,12 @@ FrankenSciPy is pre-1.0. The following are intentional and tracked:
 - **No GPU or distributed backends.** All kernels are single-process CPU.
 - **No FFI to BLAS / LAPACK.** All linear algebra is implemented in safe Rust; we lose hand-tuned-vendor-kernel performance for the largest matrices in exchange for memory safety and embeddability. Profile-first optimization closes this gap routine by routine.
 - **Heavy-tail distribution moments return `NaN`.** For families like `Alpha`, `Cauchy` (mean), `HalfCauchy` (mean/var), and some `Pareto` parameter regimes, the relevant moment integral diverges. We return `NaN` and document it rather than silently returning truncated finite numbers.
-- **Open numerical defects on the backlog** (filed, not yet fixed) as of 2026-05-16:
-  - [`frankenscipy-r1vok`](https://github.com/Dicklesworthstone/frankenscipy/commit/e5f353b5) — `periodogram` and `welch` show an O(N) normalization divergence relative to SciPy under certain length regimes.
-  - [`frankenscipy-cw6k2`](https://github.com/Dicklesworthstone/frankenscipy/commit/a2c47604) — `iirnotch` / `iirpeak` use an `r` approximation that drifts at extreme `Q`.
-  - [`frankenscipy-ot7tm`](https://github.com/Dicklesworthstone/frankenscipy/commit/7d19a662) — `gausspulse` envelope drifts by a √2 factor relative to SciPy's convention.
+- **Open numerical defects on the backlog** (filed, not yet fixed) as of 2026-09-03:
+  - `frankenscipy-5lz5e` — `goodness_of_fit` fits the normal with `ddof=1`, disagreeing with SciPy's own `norm.fit`.
+  - `frankenscipy-2sjwo` — the SVD bounding recipe uses `f64::EPSILON` where the underlying decomposition uses a 5× looser epsilon, shifting results by an ulp.
+  - `frankenscipy-jyfke` — `sos2zpk` trims trailing coefficients at a 1e-15 tolerance where SciPy trims exact zeros only.
+  - `frankenscipy-drb0i` — the CZT family rejects degenerate `w`/`a` (stricter than SciPy) while `czt_points` matches SciPy.
+  - `frankenscipy-0xy3l`, `frankenscipy-6d400` — the `fsci-linalg` bit-identity suite and one `fsci-fft` plan-cache test are load-flaky under the full parallel test run.
 
 Workstreams are tracked in [`.beads/issues.jsonl`](.beads/issues.jsonl) and surfaced through `br ready` and `bv --robot-triage`.
 
