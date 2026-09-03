@@ -235,11 +235,13 @@ fn diff_fft_idct() {
         let Some(expected) = arm.values.as_ref() else {
             continue;
         };
-        let mut opts = FftOptions::default();
-        opts.normalization = match case.norm.as_str() {
-            "backward" => Normalization::Backward,
-            "ortho" => Normalization::Ortho,
-            _ => continue,
+        let opts = FftOptions {
+            normalization: match case.norm.as_str() {
+                "backward" => Normalization::Backward,
+                "ortho" => Normalization::Ortho,
+                _ => continue,
+            },
+            ..Default::default()
         };
         let Ok(y) = idct(&case.x, &opts) else {
             continue;

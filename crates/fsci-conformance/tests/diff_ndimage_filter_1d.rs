@@ -109,7 +109,8 @@ fn generate_query() -> OracleQuery {
     for (label, input, shape) in inputs {
         for axis in 0..=1 {
             for mode in ["reflect", "nearest"] {
-                for op in ["uniform_filter1d"] {
+                {
+                    let op = "uniform_filter1d";
                     points.push(PointCase {
                         case_id: format!("{op}_{label}_ax{axis}_{mode}"),
                         op: op.into(),

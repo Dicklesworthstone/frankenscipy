@@ -21,8 +21,10 @@ fn main() {
                 a[i][j] = s / n as f64 + if i == j { n as f64 } else { 0.0 };
             }
         }
-        let mut pos = InvOptions::default();
-        pos.assume_a = Some(MatrixAssumption::PositiveDefinite);
+        let pos = InvOptions {
+            assume_a: Some(MatrixAssumption::PositiveDefinite),
+            ..Default::default()
+        };
         let ig = inv(&a, InvOptions::default()).unwrap().inverse;
         let ip = inv(&a, pos).unwrap().inverse;
         let maxdiff = ig

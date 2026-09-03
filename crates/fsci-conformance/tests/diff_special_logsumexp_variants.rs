@@ -106,101 +106,99 @@ fn generate_query() -> OracleQuery {
     let m3x4_b: Vec<f64> = vec![1.0, 0.5, 2.0, 1.0, 0.25, 1.5, 0.75, 0.5, 1.0, 2.0, 0.5, 1.0];
     let m2x5: Vec<f64> = (0..10).map(|i| ((i as f64) * 0.3).sin() + 2.0).collect();
 
-    let mut points = Vec::new();
-
-    // logsumexp_with_b: 1-D
-    points.push(Case {
-        case_id: "lse_b_basic".into(),
-        op: "lse_with_b".into(),
-        data_flat: d1.clone(),
-        rows: 1,
-        cols: d1.len(),
-        axis: 0,
-        b_flat: b1.clone(),
-        b_rows: 1,
-        b_cols: b1.len(),
-    });
-    points.push(Case {
-        case_id: "lse_b_neg".into(),
-        op: "lse_with_b".into(),
-        data_flat: d_neg.clone(),
-        rows: 1,
-        cols: d_neg.len(),
-        axis: 0,
-        b_flat: b_uniform.clone(),
-        b_rows: 1,
-        b_cols: b_uniform.len(),
-    });
-
-    // logsumexp_axis_2d: 3x4 matrix
-    points.push(Case {
-        case_id: "lse_ax_3x4_a0".into(),
-        op: "lse_axis_2d".into(),
-        data_flat: m3x4.clone(),
-        rows: 3,
-        cols: 4,
-        axis: 0,
-        b_flat: vec![],
-        b_rows: 0,
-        b_cols: 0,
-    });
-    points.push(Case {
-        case_id: "lse_ax_3x4_a1".into(),
-        op: "lse_axis_2d".into(),
-        data_flat: m3x4.clone(),
-        rows: 3,
-        cols: 4,
-        axis: 1,
-        b_flat: vec![],
-        b_rows: 0,
-        b_cols: 0,
-    });
-    points.push(Case {
-        case_id: "lse_ax_2x5_a0".into(),
-        op: "lse_axis_2d".into(),
-        data_flat: m2x5.clone(),
-        rows: 2,
-        cols: 5,
-        axis: 0,
-        b_flat: vec![],
-        b_rows: 0,
-        b_cols: 0,
-    });
-    points.push(Case {
-        case_id: "lse_ax_2x5_a1".into(),
-        op: "lse_axis_2d".into(),
-        data_flat: m2x5,
-        rows: 2,
-        cols: 5,
-        axis: 1,
-        b_flat: vec![],
-        b_rows: 0,
-        b_cols: 0,
-    });
-
-    // logsumexp_axis_2d_with_b
-    points.push(Case {
-        case_id: "lse_ax_b_3x4_a0".into(),
-        op: "lse_axis_2d_with_b".into(),
-        data_flat: m3x4.clone(),
-        rows: 3,
-        cols: 4,
-        axis: 0,
-        b_flat: m3x4_b.clone(),
-        b_rows: 3,
-        b_cols: 4,
-    });
-    points.push(Case {
-        case_id: "lse_ax_b_3x4_a1".into(),
-        op: "lse_axis_2d_with_b".into(),
-        data_flat: m3x4,
-        rows: 3,
-        cols: 4,
-        axis: 1,
-        b_flat: m3x4_b,
-        b_rows: 3,
-        b_cols: 4,
-    });
+    let points = vec![
+        // logsumexp_with_b: 1-D
+        Case {
+            case_id: "lse_b_basic".into(),
+            op: "lse_with_b".into(),
+            data_flat: d1.clone(),
+            rows: 1,
+            cols: d1.len(),
+            axis: 0,
+            b_flat: b1.clone(),
+            b_rows: 1,
+            b_cols: b1.len(),
+        },
+        Case {
+            case_id: "lse_b_neg".into(),
+            op: "lse_with_b".into(),
+            data_flat: d_neg.clone(),
+            rows: 1,
+            cols: d_neg.len(),
+            axis: 0,
+            b_flat: b_uniform.clone(),
+            b_rows: 1,
+            b_cols: b_uniform.len(),
+        },
+        // logsumexp_axis_2d: 3x4 matrix
+        Case {
+            case_id: "lse_ax_3x4_a0".into(),
+            op: "lse_axis_2d".into(),
+            data_flat: m3x4.clone(),
+            rows: 3,
+            cols: 4,
+            axis: 0,
+            b_flat: vec![],
+            b_rows: 0,
+            b_cols: 0,
+        },
+        Case {
+            case_id: "lse_ax_3x4_a1".into(),
+            op: "lse_axis_2d".into(),
+            data_flat: m3x4.clone(),
+            rows: 3,
+            cols: 4,
+            axis: 1,
+            b_flat: vec![],
+            b_rows: 0,
+            b_cols: 0,
+        },
+        Case {
+            case_id: "lse_ax_2x5_a0".into(),
+            op: "lse_axis_2d".into(),
+            data_flat: m2x5.clone(),
+            rows: 2,
+            cols: 5,
+            axis: 0,
+            b_flat: vec![],
+            b_rows: 0,
+            b_cols: 0,
+        },
+        Case {
+            case_id: "lse_ax_2x5_a1".into(),
+            op: "lse_axis_2d".into(),
+            data_flat: m2x5,
+            rows: 2,
+            cols: 5,
+            axis: 1,
+            b_flat: vec![],
+            b_rows: 0,
+            b_cols: 0,
+        },
+        // logsumexp_axis_2d_with_b
+        Case {
+            case_id: "lse_ax_b_3x4_a0".into(),
+            op: "lse_axis_2d_with_b".into(),
+            data_flat: m3x4.clone(),
+            rows: 3,
+            cols: 4,
+            axis: 0,
+            b_flat: m3x4_b.clone(),
+            b_rows: 3,
+            b_cols: 4,
+        },
+        Case {
+            case_id: "lse_ax_b_3x4_a1".into(),
+            op: "lse_axis_2d_with_b".into(),
+            data_flat: m3x4,
+            rows: 3,
+            cols: 4,
+            axis: 1,
+            b_flat: m3x4_b,
+            b_rows: 3,
+            b_cols: 4,
+        },
+    ];
 
     OracleQuery { points }
 }

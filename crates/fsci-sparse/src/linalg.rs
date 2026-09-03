@@ -4216,7 +4216,9 @@ impl NativeSparseLu {
                     // Two streams are walked per visit -- `vals` (8 bytes) and `cols`
                     // (4 bytes) -- and each has its own boundary that adjacency could
                     // save, so each is counted.
-                    let spanned = (entries * std::mem::size_of::<f64>()).div_ceil(64).max(1)
+                    let spanned = std::mem::size_of_val(target.live_vals())
+                        .div_ceil(64)
+                        .max(1)
                         + (entries * std::mem::size_of::<u32>()).div_ceil(64).max(1);
                     cell.set((
                         visits + 1,
@@ -13461,6 +13463,7 @@ mod tests {
     ///   * MUST-HIT: `Colamd` and `Amd` both reach the cubic-spectral route.
     ///   * MUST-MISS: `Natural`, `ReverseCuthillMcKee`, `MmdAta` and `MmdAtPlusA` name a specific
     ///     algorithm, so the route must stand aside and the general path must answer.
+    ///
     /// Every arm checks the ANSWER as well as the route: a fast path that dispatches and returns
     /// the wrong solution is worse than one that never fires.
     #[test]
@@ -17184,7 +17187,7 @@ mod tests {
         let actual = lu.solve(&b).expect("packed solve");
         assert!(
             SPLU_GATHER_UNPERMUTE_SOLVE_HITS.load(std::sync::atomic::Ordering::Relaxed)
-                >= gathered_before + 1,
+                > gathered_before,
             "the solve must take the counted cached-inverse un-permutation path"
         );
         for (old_i, (actual_value, reference_value)) in
@@ -21050,14 +21053,13 @@ mod tests {
 
         // The arm may legitimately fail outright (a corrupted pattern can hit a zero
         // pivot); either way it must not silently agree with the correct factor.
-        match skipped {
-            Ok(skipped) => assert_ne!(
+        if let Ok(skipped) = skipped {
+            assert_ne!(
                 factor_value_bits(&skipped.u_rows),
                 factor_value_bits(&correct.u_rows),
                 "the skip arm produced a bit-identical factor -- it is not live, so any \
                  bound measured from it would be meaningless"
-            ),
-            Err(_) => {}
+            );
         }
 
         // Restore is asserted rather than assumed: a leaked `true` would corrupt every
@@ -22435,7 +22437,6 @@ mod tests {
             mode: RuntimeMode::Strict,
             ordering: PermutationOrdering::Amd,
             diag_pivot_thresh: 0.0,
-            ..LuOptions::default()
         };
 
         SPLU_SUPERNODAL_ENABLE.store(false, Ordering::Relaxed);

@@ -4,6 +4,7 @@
 //! Resolves [frankenscipy-ldcck]. Two invariants:
 //!   1. Output is a permutation of 0..n (covers all, no duplicates).
 //!   2. Bandwidth(P A Pᵀ) ≤ Bandwidth(A) — the point of RCM.
+//!
 //! Exact permutation may differ from scipy (starting-node heuristics
 //! vary), but the bandwidth-reduction property is the contract.
 
@@ -83,7 +84,7 @@ fn bandwidth(rows: usize, cols: usize, dense: &[f64]) -> usize {
     for i in 0..rows {
         for j in 0..cols {
             if dense[i * cols + j] != 0.0 {
-                bw = bw.max(if i > j { i - j } else { j - i });
+                bw = bw.max(i.abs_diff(j));
             }
         }
     }

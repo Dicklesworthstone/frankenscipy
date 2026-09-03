@@ -176,8 +176,10 @@ impl Scipy {
         let mut read_f64s = |count: usize| -> Vec<f64> {
             let mut raw = vec![0u8; count * 8];
             stdout.read_exact(&mut raw).expect("read reverse channel");
-            raw.chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().expect("8 bytes")))
+            raw.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect()
         };
         let tck = (read_f64s(nt), read_f64s(nc));
@@ -336,7 +338,12 @@ fn main() {
             })
         })
         .collect();
-    let queries: Vec<Vec<f64>> = queries_flat.chunks_exact(3).map(<[f64]>::to_vec).collect();
+    let queries: Vec<Vec<f64>> = queries_flat
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|c| c.to_vec())
+        .collect();
 
     for op in ["splev", "cubic", "rgi"] {
         if !selected.split(',').any(|name| name.trim() == op) {

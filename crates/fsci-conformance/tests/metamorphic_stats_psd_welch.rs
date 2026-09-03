@@ -172,11 +172,7 @@ fn metamorphic_stats_psd_welch() {
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(i, _)| i)
             .unwrap_or(0);
-        let bin_distance = if actual_peak_bin >= expected_peak_bin {
-            actual_peak_bin - expected_peak_bin
-        } else {
-            expected_peak_bin - actual_peak_bin
-        };
+        let bin_distance = actual_peak_bin.abs_diff(expected_peak_bin);
         let peak_pass = bin_distance <= PEAK_BIN_TOL;
         cases.push(CaseLog {
             case_id: f.case_id.to_string(),

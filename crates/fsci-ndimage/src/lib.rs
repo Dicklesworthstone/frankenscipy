@@ -23871,13 +23871,13 @@ mod van22_knob_read_is_per_transform {
         // naive implementation that simply routes every newly accepted mode through
         // the Reflect kernel passes an acceptance-only test but fails this one.
         let scipy_mirror_class = [
-            -1.3550591935007921,
+            -1.355_059_193_500_792,
             2.710118387001584,
             3.6105040157728943,
-            3.5859606896991232,
+            3.585_960_689_699_123,
             2.0834218251103462,
             0.11013871266578582,
-            -1.3380747741866461,
+            -1.338_074_774_186_646,
             -1.4462035193637817,
             -0.06125817559621497,
             2.328436740046853,
@@ -23950,7 +23950,7 @@ mod van22_knob_read_is_per_transform {
         );
         let scipy_grid_wrap = [
             -2.8471809154237673,
-            3.1099347073079859,
+            3.109_934_707_307_986,
             3.5033604564702627,
             3.614718606603249,
             2.075533716796474,

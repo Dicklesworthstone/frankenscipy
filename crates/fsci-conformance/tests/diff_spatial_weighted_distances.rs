@@ -217,7 +217,7 @@ fn invert_3x3_spd(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
             }
             sr += 1;
         }
-        let sign = if (i + j) % 2 == 0 { 1.0 } else { -1.0 };
+        let sign = if (i + j).is_multiple_of(2) { 1.0 } else { -1.0 };
         sign * (sub[0][0] * sub[1][1] - sub[0][1] * sub[1][0])
     };
     let mut inv = [[0.0; 3]; 3];

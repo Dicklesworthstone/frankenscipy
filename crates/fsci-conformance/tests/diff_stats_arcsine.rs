@@ -5,7 +5,7 @@
 //! support (0, 1)) has anchor tests in `fsci-stats/src/lib.rs`
 //! but no dedicated scipy diff harness. 13 x-values × 3 families
 //! + 7 q-values for ppf via subprocess. Skips cleanly if scipy
-//! is unavailable.
+//!   is unavailable.
 
 use std::collections::HashMap;
 use std::fs;

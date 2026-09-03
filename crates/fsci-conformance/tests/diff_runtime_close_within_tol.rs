@@ -57,71 +57,71 @@ fn emit_log(log: &DiffLog) {
 #[test]
 fn diff_runtime_close_within_tol() {
     let start = Instant::now();
-    let mut diffs: Vec<CaseDiff> = Vec::new();
-
-    // 1. NaN, NaN → true
-    diffs.push(CaseDiff {
-        case_id: "nan_nan".into(),
-        expected: true,
-        actual: close_within_tol(f64::NAN, f64::NAN, 1e-8, 1e-8),
-        pass: false,
-    });
-    // 2. +Inf, +Inf → true
-    diffs.push(CaseDiff {
-        case_id: "pos_inf_pos_inf".into(),
-        expected: true,
-        actual: close_within_tol(f64::INFINITY, f64::INFINITY, 1e-8, 1e-8),
-        pass: false,
-    });
-    // 3. -Inf, -Inf → true
-    diffs.push(CaseDiff {
-        case_id: "neg_inf_neg_inf".into(),
-        expected: true,
-        actual: close_within_tol(f64::NEG_INFINITY, f64::NEG_INFINITY, 1e-8, 1e-8),
-        pass: false,
-    });
-    // 4. +Inf, -Inf → false
-    diffs.push(CaseDiff {
-        case_id: "pos_inf_neg_inf".into(),
-        expected: false,
-        actual: close_within_tol(f64::INFINITY, f64::NEG_INFINITY, 1e-8, 1e-8),
-        pass: false,
-    });
-    // 5. NaN, 0.0 → false
-    diffs.push(CaseDiff {
-        case_id: "nan_zero".into(),
-        expected: false,
-        actual: close_within_tol(f64::NAN, 0.0, 1e-8, 1e-8),
-        pass: false,
-    });
-    // 6. Finite within tol → true
-    diffs.push(CaseDiff {
-        case_id: "finite_within".into(),
-        expected: true,
-        actual: close_within_tol(1.0 + 1e-9, 1.0, 1e-8, 1e-8),
-        pass: false,
-    });
-    // 7. Finite outside tol → false
-    diffs.push(CaseDiff {
-        case_id: "finite_outside".into(),
-        expected: false,
-        actual: close_within_tol(2.0, 1.0, 1e-8, 1e-8),
-        pass: false,
-    });
-    // 8. Pure rtol (zero atol, large rtol) → true
-    diffs.push(CaseDiff {
-        case_id: "rtol_only".into(),
-        expected: true,
-        actual: close_within_tol(1.1, 1.0, 0.0, 0.2),
-        pass: false,
-    });
-    // 9. within_tolerance is an alias for close_within_tol
-    diffs.push(CaseDiff {
-        case_id: "alias_within".into(),
-        expected: true,
-        actual: within_tolerance(2.0, 2.0 + 1e-12, 1e-9, 1e-9),
-        pass: false,
-    });
+    let mut diffs: Vec<CaseDiff> = vec![
+        // 1. NaN, NaN → true
+        CaseDiff {
+            case_id: "nan_nan".into(),
+            expected: true,
+            actual: close_within_tol(f64::NAN, f64::NAN, 1e-8, 1e-8),
+            pass: false,
+        },
+        // 2. +Inf, +Inf → true
+        CaseDiff {
+            case_id: "pos_inf_pos_inf".into(),
+            expected: true,
+            actual: close_within_tol(f64::INFINITY, f64::INFINITY, 1e-8, 1e-8),
+            pass: false,
+        },
+        // 3. -Inf, -Inf → true
+        CaseDiff {
+            case_id: "neg_inf_neg_inf".into(),
+            expected: true,
+            actual: close_within_tol(f64::NEG_INFINITY, f64::NEG_INFINITY, 1e-8, 1e-8),
+            pass: false,
+        },
+        // 4. +Inf, -Inf → false
+        CaseDiff {
+            case_id: "pos_inf_neg_inf".into(),
+            expected: false,
+            actual: close_within_tol(f64::INFINITY, f64::NEG_INFINITY, 1e-8, 1e-8),
+            pass: false,
+        },
+        // 5. NaN, 0.0 → false
+        CaseDiff {
+            case_id: "nan_zero".into(),
+            expected: false,
+            actual: close_within_tol(f64::NAN, 0.0, 1e-8, 1e-8),
+            pass: false,
+        },
+        // 6. Finite within tol → true
+        CaseDiff {
+            case_id: "finite_within".into(),
+            expected: true,
+            actual: close_within_tol(1.0 + 1e-9, 1.0, 1e-8, 1e-8),
+            pass: false,
+        },
+        // 7. Finite outside tol → false
+        CaseDiff {
+            case_id: "finite_outside".into(),
+            expected: false,
+            actual: close_within_tol(2.0, 1.0, 1e-8, 1e-8),
+            pass: false,
+        },
+        // 8. Pure rtol (zero atol, large rtol) → true
+        CaseDiff {
+            case_id: "rtol_only".into(),
+            expected: true,
+            actual: close_within_tol(1.1, 1.0, 0.0, 0.2),
+            pass: false,
+        },
+        // 9. within_tolerance is an alias for close_within_tol
+        CaseDiff {
+            case_id: "alias_within".into(),
+            expected: true,
+            actual: within_tolerance(2.0, 2.0 + 1e-12, 1e-9, 1e-9),
+            pass: false,
+        },
+    ];
 
     // Compute pass flag
     for d in &mut diffs {

@@ -6,7 +6,7 @@
 //! harness. Mirrors the diff_stats_foldnorm.rs pattern shipped
 //! in 481a853. 5 c-values × 7 x-values × 3 families (pdf/cdf/sf)
 //! + 5 c × 5 q-values for ppf via subprocess. Skips cleanly if
-//! scipy is unavailable.
+//!   scipy is unavailable.
 
 use std::collections::HashMap;
 use std::fs;

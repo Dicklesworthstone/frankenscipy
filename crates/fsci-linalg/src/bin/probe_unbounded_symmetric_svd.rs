@@ -28,6 +28,7 @@
 //!     means bounding at this value WOULD change behaviour on this input.
 //!   * `K_HUGE = 100 * K_LAPACK` -- a `None` here too means the iteration is not merely slow
 //!     but is not converging at all, which is the real must-hit.
+//!
 //! A case that fails the first and passes the second is not a hang; it is evidence that
 //! sez4r's constant is too tight for this iteration, which is a different bead.
 //!

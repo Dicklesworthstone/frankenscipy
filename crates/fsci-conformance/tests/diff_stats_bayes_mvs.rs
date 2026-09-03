@@ -6,8 +6,8 @@
 //!   - mean.statistic / .low / .high
 //!   - variance.low / .high
 //!   - std.low / .high
-//! against scipy across 3 datasets at two confidence levels
-//! (0.90, 0.95). 3 datasets × 2 alphas × 7 arms = 42 cases.
+//!     against scipy across 3 datasets at two confidence levels
+//!     (0.90, 0.95). 3 datasets × 2 alphas × 7 arms = 42 cases.
 //!
 //! variance.statistic and std.statistic are deliberately
 //! omitted: fsci uses sample variance ss/(n-1) for variance

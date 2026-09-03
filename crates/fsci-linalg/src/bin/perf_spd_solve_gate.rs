@@ -27,10 +27,9 @@ fn main() {
             }
         }
         let b: Vec<f64> = (0..n).map(|_| r()).collect();
-        let opts = || {
-            let mut o = SolveOptions::default();
-            o.assume_a = Some(MatrixAssumption::PositiveDefinite);
-            o
+        let opts = || SolveOptions {
+            assume_a: Some(MatrixAssumption::PositiveDefinite),
+            ..Default::default()
         };
         SOLVE_FLAT_MIN_OVERRIDE.store(1000, Ordering::Relaxed);
         let xp = solve(&a, &b, opts()).unwrap().x;

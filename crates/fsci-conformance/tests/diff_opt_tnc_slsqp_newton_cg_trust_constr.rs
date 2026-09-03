@@ -75,7 +75,7 @@ fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
 
     // tnc/trust_constr: quadratic only (defect do5nd: weak on Rosen).
     let q_x0 = vec![2.0_f64, -1.0];
-    if let Ok(res) = tnc(&quadratic, &q_x0, opts.clone()) {
+    if let Ok(res) = tnc(&quadratic, &q_x0, opts) {
         let fval = res.fun.unwrap_or(f64::INFINITY);
         max_overall = max_overall.max(fval);
         diffs.push(CaseDiff {
@@ -85,7 +85,7 @@ fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
             pass: fval <= TOL,
         });
     }
-    if let Ok(res) = trust_constr(&quadratic, &q_x0, opts.clone()) {
+    if let Ok(res) = trust_constr(&quadratic, &q_x0, opts) {
         let fval = res.fun.unwrap_or(f64::INFINITY);
         max_overall = max_overall.max(fval);
         diffs.push(CaseDiff {
@@ -101,7 +101,7 @@ fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
         ("quad", quadratic as fn(&[f64]) -> f64, vec![2.0_f64, -1.0]),
         ("rosen", rosen as fn(&[f64]) -> f64, vec![0.0_f64, 0.0]),
     ] {
-        if let Ok(res) = slsqp(&f, &x0, opts.clone()) {
+        if let Ok(res) = slsqp(&f, &x0, opts) {
             let fval = res.fun.unwrap_or(f64::INFINITY);
             max_overall = max_overall.max(fval);
             diffs.push(CaseDiff {
@@ -111,7 +111,7 @@ fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
                 pass: fval <= TOL,
             });
         }
-        if let Ok(res) = newton_cg(&f, &x0, opts.clone()) {
+        if let Ok(res) = newton_cg(&f, &x0, opts) {
             let fval = res.fun.unwrap_or(f64::INFINITY);
             max_overall = max_overall.max(fval);
             diffs.push(CaseDiff {
@@ -121,7 +121,7 @@ fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
                 pass: fval <= TOL,
             });
         }
-        if let Ok(res) = trust_exact(&f, &x0, opts.clone()) {
+        if let Ok(res) = trust_exact(&f, &x0, opts) {
             let fval = res.fun.unwrap_or(f64::INFINITY);
             max_overall = max_overall.max(fval);
             diffs.push(CaseDiff {

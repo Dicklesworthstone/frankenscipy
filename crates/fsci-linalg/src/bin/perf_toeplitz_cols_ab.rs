@@ -122,8 +122,8 @@ fn best_of(
 
 fn main() {
     println!(
-        "{:>6} {:>5} {:>12} {:>12} {:>9}  {}",
-        "n", "k", "serial_us", "par_us", "speedup", "exact"
+        "{:>6} {:>5} {:>12} {:>12} {:>9}  exact",
+        "n", "k", "serial_us", "par_us", "speedup"
     );
     for &(n, k) in &[
         (512usize, 4usize),

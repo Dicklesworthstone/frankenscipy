@@ -6,7 +6,7 @@
 //! Mirrors the diff_stats_foldnorm.rs / diff_stats_foldcauchy.rs
 //! pattern. 5 chi-values × 7 x-values × 3 families (pdf/cdf/sf)
 //! + 5 chi × 5 q-values for ppf via subprocess. Skips cleanly
-//! if scipy is unavailable.
+//!   if scipy is unavailable.
 
 use std::collections::HashMap;
 use std::fs;

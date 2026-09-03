@@ -8,7 +8,7 @@
 //!   * sinusoidal (y' = cos t)
 //!   * 2D linear system (y' = -A y, well-scaled)
 //!   * 2D linear system (poorly scaled)
-//! across a sweep of (t0, t_bound, max_step, rtol, atol, order, direction).
+//!     across a sweep of (t0, t_bound, max_step, rtol, atol, order, direction).
 //!
 //! Rel tol 1e-9 (fsci should be bit-for-bit modulo the f1 evaluation).
 

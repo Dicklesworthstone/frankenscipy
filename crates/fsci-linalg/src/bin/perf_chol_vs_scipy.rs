@@ -50,8 +50,6 @@ mod harness {
     use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::time::Instant;
 
-    /// The campaign's pinned, screened SciPy 1.17.1, when this host has it.
-
     /// Backward-error budget for our own factor, in units of `n · f64::EPSILON`.
     ///
     /// WHY NOT AN ELEMENTWISE RELATIVE DIFF. The first version of this harness gated on

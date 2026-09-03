@@ -220,7 +220,9 @@ fn diff_signal_sosfreqz() {
         };
         let sos: Vec<[f64; 6]> = case
             .sos_flat
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|c| [c[0], c[1], c[2], c[3], c[4], c[5]])
             .collect();
         let Ok(res) = sosfreqz(&sos, Some(case.n_freqs)) else {

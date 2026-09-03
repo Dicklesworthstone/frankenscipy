@@ -89,84 +89,79 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn generate_query() -> OracleQuery {
-    let mut points = Vec::new();
-
-    // 1. Canonical 2-var LP: min -x - 2y s.t. x + y ≤ 4, x ≤ 3, y ≤ 3, x,y ≥ 0
-    //    optimum at (1, 3) with value -7.
-    points.push(PointCase {
-        case_id: "canonical_2var".into(),
-        c: vec![-1.0, -2.0],
-        a_ub: vec![vec![1.0, 1.0], vec![1.0, 0.0], vec![0.0, 1.0]],
-        b_ub: vec![4.0, 3.0, 3.0],
-        a_eq: vec![],
-        b_eq: vec![],
-        bounds: vec![(Some(0.0), None), (Some(0.0), None)],
-    });
-
-    // 2. 3-var LP: min x + 2y + 3z s.t. x + y + z = 6, x + y ≥ 2, z ≥ 1, all ≥ 0
-    //    (use ≥ as ≤ negated)
-    points.push(PointCase {
-        case_id: "3var_eq_ge".into(),
-        c: vec![1.0, 2.0, 3.0],
-        a_ub: vec![vec![-1.0, -1.0, 0.0], vec![0.0, 0.0, -1.0]],
-        b_ub: vec![-2.0, -1.0],
-        a_eq: vec![vec![1.0, 1.0, 1.0]],
-        b_eq: vec![6.0],
-        bounds: vec![(Some(0.0), None), (Some(0.0), None), (Some(0.0), None)],
-    });
-
-    // 3. Diet problem (4 var): min nutritional cost.
-    points.push(PointCase {
-        case_id: "diet_4var".into(),
-        c: vec![10.0, 15.0, 8.0, 12.0],
-        a_ub: vec![vec![-2.0, -1.0, -3.0, -1.0], vec![-1.0, -3.0, -1.0, -2.0]],
-        b_ub: vec![-10.0, -8.0],
-        a_eq: vec![],
-        b_eq: vec![],
-        bounds: vec![
-            (Some(0.0), None),
-            (Some(0.0), None),
-            (Some(0.0), None),
-            (Some(0.0), None),
-        ],
-    });
-
-    // 4. Transportation-style 3-var with upper bounds.
-    points.push(PointCase {
-        case_id: "ub_bounded_3var".into(),
-        c: vec![-3.0, -1.0, -2.0],
-        a_ub: vec![vec![1.0, 1.0, 1.0], vec![2.0, 1.0, 0.0]],
-        b_ub: vec![10.0, 12.0],
-        a_eq: vec![],
-        b_eq: vec![],
-        bounds: vec![
-            (Some(0.0), Some(5.0)),
-            (Some(0.0), Some(5.0)),
-            (Some(0.0), Some(5.0)),
-        ],
-    });
-
-    // 5. Minimize with negative bounds allowed.
-    points.push(PointCase {
-        case_id: "neg_bounds_2var".into(),
-        c: vec![1.0, -2.0],
-        a_ub: vec![vec![1.0, 1.0], vec![-1.0, 1.0]],
-        b_ub: vec![6.0, 4.0],
-        a_eq: vec![],
-        b_eq: vec![],
-        bounds: vec![(Some(-3.0), Some(3.0)), (Some(0.0), Some(5.0))],
-    });
-
-    // 6. Pure equality system with a unique optimum.
-    points.push(PointCase {
-        case_id: "eq_only_3var".into(),
-        c: vec![1.0, 1.0, 1.0],
-        a_ub: vec![],
-        b_ub: vec![],
-        a_eq: vec![vec![1.0, 1.0, 1.0], vec![1.0, -1.0, 0.0]],
-        b_eq: vec![10.0, 2.0],
-        bounds: vec![(Some(0.0), None), (Some(0.0), None), (Some(0.0), None)],
-    });
+    let points = vec![
+        // 1. Canonical 2-var LP: min -x - 2y s.t. x + y ≤ 4, x ≤ 3, y ≤ 3, x,y ≥ 0
+        //    optimum at (1, 3) with value -7.
+        PointCase {
+            case_id: "canonical_2var".into(),
+            c: vec![-1.0, -2.0],
+            a_ub: vec![vec![1.0, 1.0], vec![1.0, 0.0], vec![0.0, 1.0]],
+            b_ub: vec![4.0, 3.0, 3.0],
+            a_eq: vec![],
+            b_eq: vec![],
+            bounds: vec![(Some(0.0), None), (Some(0.0), None)],
+        },
+        // 2. 3-var LP: min x + 2y + 3z s.t. x + y + z = 6, x + y ≥ 2, z ≥ 1, all ≥ 0
+        //    (use ≥ as ≤ negated)
+        PointCase {
+            case_id: "3var_eq_ge".into(),
+            c: vec![1.0, 2.0, 3.0],
+            a_ub: vec![vec![-1.0, -1.0, 0.0], vec![0.0, 0.0, -1.0]],
+            b_ub: vec![-2.0, -1.0],
+            a_eq: vec![vec![1.0, 1.0, 1.0]],
+            b_eq: vec![6.0],
+            bounds: vec![(Some(0.0), None), (Some(0.0), None), (Some(0.0), None)],
+        },
+        // 3. Diet problem (4 var): min nutritional cost.
+        PointCase {
+            case_id: "diet_4var".into(),
+            c: vec![10.0, 15.0, 8.0, 12.0],
+            a_ub: vec![vec![-2.0, -1.0, -3.0, -1.0], vec![-1.0, -3.0, -1.0, -2.0]],
+            b_ub: vec![-10.0, -8.0],
+            a_eq: vec![],
+            b_eq: vec![],
+            bounds: vec![
+                (Some(0.0), None),
+                (Some(0.0), None),
+                (Some(0.0), None),
+                (Some(0.0), None),
+            ],
+        },
+        // 4. Transportation-style 3-var with upper bounds.
+        PointCase {
+            case_id: "ub_bounded_3var".into(),
+            c: vec![-3.0, -1.0, -2.0],
+            a_ub: vec![vec![1.0, 1.0, 1.0], vec![2.0, 1.0, 0.0]],
+            b_ub: vec![10.0, 12.0],
+            a_eq: vec![],
+            b_eq: vec![],
+            bounds: vec![
+                (Some(0.0), Some(5.0)),
+                (Some(0.0), Some(5.0)),
+                (Some(0.0), Some(5.0)),
+            ],
+        },
+        // 5. Minimize with negative bounds allowed.
+        PointCase {
+            case_id: "neg_bounds_2var".into(),
+            c: vec![1.0, -2.0],
+            a_ub: vec![vec![1.0, 1.0], vec![-1.0, 1.0]],
+            b_ub: vec![6.0, 4.0],
+            a_eq: vec![],
+            b_eq: vec![],
+            bounds: vec![(Some(-3.0), Some(3.0)), (Some(0.0), Some(5.0))],
+        },
+        // 6. Pure equality system with a unique optimum.
+        PointCase {
+            case_id: "eq_only_3var".into(),
+            c: vec![1.0, 1.0, 1.0],
+            a_ub: vec![],
+            b_ub: vec![],
+            a_eq: vec![vec![1.0, 1.0, 1.0], vec![1.0, -1.0, 0.0]],
+            b_eq: vec![10.0, 2.0],
+            bounds: vec![(Some(0.0), None), (Some(0.0), None), (Some(0.0), None)],
+        },
+    ];
 
     OracleQuery { points }
 }

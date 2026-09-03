@@ -5,13 +5,13 @@
 //!
 //! - `null_space`: basis is non-unique (any orthogonal rotation /
 //!   sign change is equally valid). Property test:
-//!     • shape matches scipy.linalg.null_space
-//!     • ||A · N||_F < 1e-9
-//!     • columns of N are orthonormal: N^T N = I within 1e-9
+//!   •shape matches scipy.linalg.null_space
+//!   •||A · N||_F < 1e-9
+//!   •columns of N are orthonormal: N^T N = I within 1e-9
 //! - `orth`: similar property test:
-//!     • shape matches scipy.linalg.orth
-//!     • Q^T Q = I within 1e-9
-//!     • range(Q) = range(A) verified by ||(I - Q Q^T) A||_F < 1e-9
+//!   •shape matches scipy.linalg.orth
+//!   •Q^T Q = I within 1e-9
+//!   •range(Q) = range(A) verified by ||(I - Q Q^T) A||_F < 1e-9
 //! - `numerical_rank`: returns an int that should match scipy.linalg
 //!   matrix_rank exactly.
 

@@ -6,11 +6,13 @@
 //!   * close within atol+rtol → true; outside → false
 //!   * shape mismatch → false
 //!   * NaN/NaN → true; Inf/Inf → true; mixed → false
+//!
 //! random_matrix:
 //!   * shape correct
 //!   * deterministic for same seed
 //!   * different seeds produce different matrices
 //!   * values in [0, 1)
+//!
 //! random_spd:
 //!   * shape n × n
 //!   * symmetric (A == A^T) within tol
@@ -151,7 +153,7 @@ fn diff_linalg_matrix_random_allclose() {
         check(
             "random_matrix_values_in_unit_interval",
             m.iter().flatten().all(|&v| (0.0..1.0).contains(&v)),
-            format!("range_check"),
+            "range_check".to_string(),
         );
         // Determinism
         let m2 = random_matrix(4, 5, 42);

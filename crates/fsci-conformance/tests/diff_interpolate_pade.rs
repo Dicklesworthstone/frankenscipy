@@ -119,7 +119,7 @@ fn generate_query() -> OracleQuery {
             if k == 0 {
                 0.0
             } else {
-                (-1.0_f64).powi((k + 1) as i32) / (k as f64)
+                (-1.0_f64).powi(k + 1) / (k as f64)
             }
         })
         .collect();

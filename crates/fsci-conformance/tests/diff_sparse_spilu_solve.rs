@@ -10,6 +10,7 @@
 //!   * On moderate-fill banded matrices, ||A x − b||∞ is below an
 //!     ILU-realistic bound (matches scipy.sparse.linalg.spilu's typical
 //!     residual quality after default drop_tol).
+//!
 //! Each probe also runs scipy spilu(A).solve(b) as a sanity baseline.
 
 use std::fs;

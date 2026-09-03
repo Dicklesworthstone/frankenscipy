@@ -2,6 +2,7 @@
 //! Live SciPy differential coverage for sparse LU factor + solve.
 //!   - fsci_sparse::splu(A, options) → SparseLuFactorization
 //!   - fsci_sparse::splu_solve(factorization, b) → solution x
+//!
 //! Oracle: `scipy.sparse.linalg.splu(A).solve(b)`. Solution vector is
 //! unique for nonsingular A.
 //!

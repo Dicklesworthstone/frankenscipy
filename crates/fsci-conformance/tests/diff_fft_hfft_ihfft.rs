@@ -307,7 +307,9 @@ fn diff_fft_hfft_ihfft() {
         };
         let x: Vec<Complex64> = case
             .x_packed
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| (c[0], c[1]))
             .collect();
         let Ok(out) = hfft(&x, Some(case.n), &opts) else {

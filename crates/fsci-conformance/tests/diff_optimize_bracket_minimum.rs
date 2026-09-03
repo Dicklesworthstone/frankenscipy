@@ -499,7 +499,7 @@ fn diff_optimize_bracket_minimum() {
             ours.len(),
             &ours[..ours.len().min(24)],
             sampled.len(),
-            &as_floats(&sampled[..sampled.len().min(24)])
+            as_floats(&sampled[..sampled.len().min(24)])
         );
         assert_eq!(
             status_name(result.status),

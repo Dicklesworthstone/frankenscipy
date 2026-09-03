@@ -107,9 +107,7 @@ fn make_tridiag_banded(n: usize) -> ((usize, usize), Vec<Vec<f64>>) {
     //   ab[1][j] = A[j][j]    (main diagonal)
     //   ab[2][j] = A[j+1][j]  (subdiag, j <= n-2)
     let mut ab = vec![vec![0.0; n]; 3];
-    for col in &mut ab[1] {
-        *col = 4.0;
-    }
+    ab[1].fill(4.0);
     for col in ab[0].iter_mut().skip(1) {
         *col = -1.0;
     }

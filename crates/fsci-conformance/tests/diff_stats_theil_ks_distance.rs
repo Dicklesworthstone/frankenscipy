@@ -321,7 +321,7 @@ fn diff_stats_theil_ks_distance() {
                 }
             }
             "ks_distance" => {
-                let rd = ks_distance(&case.x, &cdf_norm);
+                let rd = ks_distance(&case.x, cdf_norm);
                 if let Some(scipy_d) = scipy_arm.distance
                     && rd.is_finite()
                 {

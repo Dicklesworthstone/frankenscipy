@@ -125,17 +125,13 @@ fn shift_right(x: &[f64], lag: i64) -> Vec<f64> {
         if lag_u >= n {
             return y;
         }
-        for i in lag_u..n {
-            y[i] = x[i - lag_u];
-        }
+        y[lag_u..n].copy_from_slice(&x[..(n - lag_u)]);
     } else {
         let lag_u = (-lag) as usize;
         if lag_u >= n {
             return y;
         }
-        for i in 0..(n - lag_u) {
-            y[i] = x[i + lag_u];
-        }
+        y[..(n - lag_u)].copy_from_slice(&x[lag_u..n]);
     }
     y
 }

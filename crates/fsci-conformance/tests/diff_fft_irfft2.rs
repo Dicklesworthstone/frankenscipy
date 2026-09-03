@@ -246,7 +246,9 @@ fn diff_fft_irfft2() {
         };
         // Unpack scipy's rfft2 output into Complex64 tuples.
         let complex_input: Vec<(f64, f64)> = packed_complex
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| (p[0], p[1]))
             .collect();
         let opts = FftOptions::default();

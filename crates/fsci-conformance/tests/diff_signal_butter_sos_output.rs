@@ -253,7 +253,7 @@ fn diff_signal_butter_sos_output() {
                 max_abs_diff_b: f64::INFINITY,
                 max_abs_diff_a: f64::INFINITY,
                 pass: false,
-                note: format!("length mismatch ba"),
+                note: "length mismatch ba".to_string(),
             });
             continue;
         }

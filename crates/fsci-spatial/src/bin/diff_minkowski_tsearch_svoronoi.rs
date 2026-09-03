@@ -16,6 +16,7 @@
 //!   * `SphericalVoronoi` vertex and region ORDER is not canonical either. The probe emits
 //!     order-independent invariants: the vertex count, the lexicographically sorted vertices, and
 //!     the sorted region sizes.
+//!
 //! `minkowski_distance*` has no such freedom and is compared elementwise.
 //!
 //! Lines: `name|v;v;v`. Inputs must match `python/diff_minkowski_tsearch_svoronoi.py`.

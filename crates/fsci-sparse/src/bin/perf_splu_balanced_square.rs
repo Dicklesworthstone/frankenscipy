@@ -1244,7 +1244,7 @@ for raw_line in sys.stdin.buffer:
         let warm_factor = &ours;
         for _ in 0..warmup {
             if solve_stage {
-                let _ = black_box(splu_solve(&warm_factor, &rhs).expect("fsci splu_solve"));
+                let _ = black_box(splu_solve(warm_factor, &rhs).expect("fsci splu_solve"));
                 let _ = black_box(scipy.solve_time(SOLVES_PER_SLOT));
             } else {
                 let _ = black_box(scipy.factor());
@@ -1279,7 +1279,7 @@ for raw_line in sys.stdin.buffer:
                     // keeps its warm `lu`, so this times the triangular solves alone.
                     let started = Instant::now();
                     for _ in 0..SOLVES_PER_SLOT {
-                        let solution = splu_solve(&warm_factor, &rhs).expect("fsci splu_solve");
+                        let solution = splu_solve(warm_factor, &rhs).expect("fsci splu_solve");
                         black_box(&solution);
                     }
                     b_slots.push(started.elapsed().as_nanos() as f64);

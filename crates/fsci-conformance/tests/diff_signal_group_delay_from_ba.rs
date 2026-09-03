@@ -90,68 +90,63 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn build_query() -> OracleQuery {
-    let mut pts = Vec::new();
-
-    // 1. Identity filter: pure pass-through, gd = 0 everywhere.
-    pts.push(CasePoint {
-        case_id: "identity".into(),
-        b: vec![1.0],
-        a: vec![1.0],
-        n_freqs: 8,
-    });
-
-    // 2. Simple delay: y[n] = x[n-1], gd ≡ 1
-    pts.push(CasePoint {
-        case_id: "unit_delay".into(),
-        b: vec![0.0, 1.0],
-        a: vec![1.0],
-        n_freqs: 16,
-    });
-
-    // 3. Two-sample moving average (FIR): gd ≡ 0.5
-    pts.push(CasePoint {
-        case_id: "ma2_fir".into(),
-        b: vec![0.5, 0.5],
-        a: vec![1.0],
-        n_freqs: 16,
-    });
-
-    // 4. 5-tap moving average FIR: gd ≡ 2
-    pts.push(CasePoint {
-        case_id: "ma5_fir".into(),
-        b: vec![0.2; 5],
-        a: vec![1.0],
-        n_freqs: 16,
-    });
-
-    // 5. Butterworth lowpass order 4 cutoff 0.3
-    //   scipy butter(4, 0.3, 'low') with explicit b, a
-    pts.push(CasePoint {
-        case_id: "butter4_lp_0p3".into(),
-        b: vec![
-            0.010209480799830714,
-            0.040837923199322855,
-            0.06125688479898428,
-            0.04083792319932284,
-            0.010209480799830714,
-        ],
-        a: vec![
-            1.0,
-            -1.967510281586389,
-            1.7095726895791028,
-            -0.6707408258801084,
-            0.10209480799830707,
-        ],
-        n_freqs: 32,
-    });
-
-    // 6. Simple 1st-order IIR: y[n] = 0.5 * x[n] + 0.5 * y[n-1]
-    pts.push(CasePoint {
-        case_id: "iir1_smooth".into(),
-        b: vec![0.5],
-        a: vec![1.0, -0.5],
-        n_freqs: 16,
-    });
+    let pts = vec![
+        // 1. Identity filter: pure pass-through, gd = 0 everywhere.
+        CasePoint {
+            case_id: "identity".into(),
+            b: vec![1.0],
+            a: vec![1.0],
+            n_freqs: 8,
+        },
+        // 2. Simple delay: y[n] = x[n-1], gd ≡ 1
+        CasePoint {
+            case_id: "unit_delay".into(),
+            b: vec![0.0, 1.0],
+            a: vec![1.0],
+            n_freqs: 16,
+        },
+        // 3. Two-sample moving average (FIR): gd ≡ 0.5
+        CasePoint {
+            case_id: "ma2_fir".into(),
+            b: vec![0.5, 0.5],
+            a: vec![1.0],
+            n_freqs: 16,
+        },
+        // 4. 5-tap moving average FIR: gd ≡ 2
+        CasePoint {
+            case_id: "ma5_fir".into(),
+            b: vec![0.2; 5],
+            a: vec![1.0],
+            n_freqs: 16,
+        },
+        // 5. Butterworth lowpass order 4 cutoff 0.3
+        //   scipy butter(4, 0.3, 'low') with explicit b, a
+        CasePoint {
+            case_id: "butter4_lp_0p3".into(),
+            b: vec![
+                0.010209480799830714,
+                0.040837923199322855,
+                0.06125688479898428,
+                0.04083792319932284,
+                0.010209480799830714,
+            ],
+            a: vec![
+                1.0,
+                -1.967510281586389,
+                1.7095726895791028,
+                -0.6707408258801084,
+                0.10209480799830707,
+            ],
+            n_freqs: 32,
+        },
+        // 6. Simple 1st-order IIR: y[n] = 0.5 * x[n] + 0.5 * y[n-1]
+        CasePoint {
+            case_id: "iir1_smooth".into(),
+            b: vec![0.5],
+            a: vec![1.0, -0.5],
+            n_freqs: 16,
+        },
+    ];
 
     OracleQuery { points: pts }
 }

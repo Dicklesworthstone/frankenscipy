@@ -221,7 +221,9 @@ fn diff_signal_sos2tf() {
         // Reshape SOS flat into [f64; 6] sections
         let sos: Vec<[f64; 6]> = case
             .sos_flat
-            .chunks_exact(6)
+            .as_chunks::<6>()
+            .0
+            .iter()
             .map(|c| [c[0], c[1], c[2], c[3], c[4], c[5]])
             .collect();
         let ba = sos2tf(&sos);

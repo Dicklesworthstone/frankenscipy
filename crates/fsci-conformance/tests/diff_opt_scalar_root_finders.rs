@@ -76,7 +76,7 @@ fn diff_opt_scalar_root_finders() {
             "plastic",
             Box::new(|x: f64| x * x * x - x - 1.0),
             (1.0, 2.0),
-            1.324_717_957_244_746_0,
+            1.324_717_957_244_746,
         ),
         // sin x = 0 in [3, 4] → π
         (
@@ -104,11 +104,11 @@ fn diff_opt_scalar_root_finders() {
     for (label, f, br, expected) in &cases {
         for method in ["bisect", "brentq", "brenth", "ridder", "toms748"] {
             let res = match method {
-                "bisect" => bisect(|x| f(x), *br, opts),
-                "brentq" => brentq(|x| f(x), *br, opts),
-                "brenth" => brenth(|x| f(x), *br, opts),
-                "ridder" => ridder(|x| f(x), *br, opts),
-                "toms748" => toms748(|x| f(x), *br, opts),
+                "bisect" => bisect(f, *br, opts),
+                "brentq" => brentq(f, *br, opts),
+                "brenth" => brenth(f, *br, opts),
+                "ridder" => ridder(f, *br, opts),
+                "toms748" => toms748(f, *br, opts),
                 _ => continue,
             };
             let Ok(r) = res else {

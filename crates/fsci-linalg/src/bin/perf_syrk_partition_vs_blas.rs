@@ -72,16 +72,6 @@ fn main() {
     let min_of = env_usize("SYRK_MIN_OF", 9);
     let threads = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
 
-    // Deterministic A (m x k) and its transpose, so C = A * A^T is the SYRK shape.
-    let mut s = 0x5eed_c0de_u64;
-    let mut next = || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
-    };
-    let a: Vec<Vec<f64>> = (0..m).map(|_| (0..k).map(|_| next()).collect()).collect();
-
     // OUR trailing SYRK, at the same shape, timed in isolation via the bench entry point.
     // This is the arm the first version of this binary got wrong: it timed the public `matmul`,
     // which is a general GEMM on a different gate and is not what the factor calls. This calls

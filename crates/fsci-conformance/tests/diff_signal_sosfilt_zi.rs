@@ -213,7 +213,7 @@ fn diff_signal_sosfilt_zi() {
         let Some(scipy_v) = scipy_arm.values.as_ref() else {
             continue;
         };
-        let sos: Vec<SosSection> = case.sos.iter().copied().collect();
+        let sos: Vec<SosSection> = case.sos.to_vec();
         let Ok(zi) = sosfilt_zi(&sos) else { continue };
         // Flatten zi as [z0_0, z0_1, z1_0, z1_1, ...]
         let mut fsci_v = Vec::with_capacity(zi.len() * 2);

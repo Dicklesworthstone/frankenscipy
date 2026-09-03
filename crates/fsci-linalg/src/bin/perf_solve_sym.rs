@@ -23,8 +23,10 @@ fn main() {
             }
         }
         let b: Vec<f64> = (0..n).map(|_| r()).collect();
-        let mut sym = SolveOptions::default();
-        sym.assume_a = Some(MatrixAssumption::Symmetric);
+        let sym = SolveOptions {
+            assume_a: Some(MatrixAssumption::Symmetric),
+            ..Default::default()
+        };
 
         for (name, a) in [("PD", &pd), ("INDEF", &indef)] {
             let xg = solve(a, &b, SolveOptions::default()).unwrap().x;

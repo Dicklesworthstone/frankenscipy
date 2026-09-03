@@ -82,25 +82,24 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn generate_query() -> OracleQuery {
-    let mut points = Vec::new();
-
     // Note: 1-section IIR with ramp input was dropped — observed ~0.13
     // abs diff (likely related to filtfilt initial-state divergence,
     // bead ry561). FIR and multi-section IIR with non-ramp inputs match.
-    points.push(PointCase {
-        case_id: "fir_biquad_sine".into(),
-        sos: vec![[1.0, 0.5, 0.25, 1.0, 0.0, 0.0]],
-        x: (0..40).map(|i| ((i as f64) * 0.4).sin()).collect(),
-    });
-
-    points.push(PointCase {
-        case_id: "2section_cascade_decay".into(),
-        sos: vec![
-            [0.5, 0.0, 0.0, 1.0, -0.5, 0.0],
-            [1.0, 0.0, 0.0, 1.0, -0.3, 0.1],
-        ],
-        x: (0..48).map(|i| (-(i as f64) / 10.0).exp()).collect(),
-    });
+    let points = vec![
+        PointCase {
+            case_id: "fir_biquad_sine".into(),
+            sos: vec![[1.0, 0.5, 0.25, 1.0, 0.0, 0.0]],
+            x: (0..40).map(|i| ((i as f64) * 0.4).sin()).collect(),
+        },
+        PointCase {
+            case_id: "2section_cascade_decay".into(),
+            sos: vec![
+                [0.5, 0.0, 0.0, 1.0, -0.5, 0.0],
+                [1.0, 0.0, 0.0, 1.0, -0.3, 0.1],
+            ],
+            x: (0..48).map(|i| (-(i as f64) / 10.0).exp()).collect(),
+        },
+    ];
 
     OracleQuery { points }
 }
@@ -209,7 +208,7 @@ fn diff_signal_sosfiltfilt() {
         let Some(scipy_v) = scipy_arm.values.as_ref() else {
             continue;
         };
-        let sos: Vec<SosSection> = case.sos.iter().copied().collect();
+        let sos: Vec<SosSection> = case.sos.to_vec();
         let Ok(fsci_v) = sosfiltfilt(&sos, &case.x) else {
             continue;
         };

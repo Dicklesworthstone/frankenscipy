@@ -120,7 +120,7 @@ fn diff_opt_minimize_audit_equivalence() {
             method: Some(method),
             ..MinimizeOptions::default()
         };
-        let plain = minimize(f, &x0, opts.clone());
+        let plain = minimize(f, &x0, opts);
         let audited = minimize_with_audit(f, &x0, opts, &ledger);
         let pass = match (&plain, &audited) {
             (Ok(p), Ok(a)) => {
@@ -146,7 +146,7 @@ fn diff_opt_minimize_audit_equivalence() {
             _ => 0.0,
         };
         diffs.push(CaseDiff {
-            case_id: format!("{label}"),
+            case_id: label.to_string(),
             op: format!("{method:?}"),
             abs_diff: d,
             pass,

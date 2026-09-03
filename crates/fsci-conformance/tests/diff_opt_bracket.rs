@@ -241,7 +241,7 @@ fn diff_opt_bracket() {
             continue;
         };
         let (xa, xb, xc, fa, fb, fc) = bracket(f, case.xa, case.xb);
-        let fsci_v = vec![xa, xb, xc, fa, fb, fc];
+        let fsci_v = [xa, xb, xc, fa, fb, fc];
         if fsci_v.len() != scipy_v.len() {
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),

@@ -493,7 +493,7 @@ fn diff_optimize_find_root() {
             ours.len(),
             &ours[..ours.len().min(20)],
             sampled.len(),
-            &as_floats(&sampled[..sampled.len().min(20)])
+            as_floats(&sampled[..sampled.len().min(20)])
         );
         assert_eq!(
             status_name(result.status),

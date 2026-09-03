@@ -9,6 +9,7 @@
 //!   * closure = min → equals minimum_filter
 //!   * closure = sum / size² → equals uniform_filter
 //!   * closure receives exactly size^ndim values
+//!
 //! Plus edge-case errors: size = 0, empty input.
 
 use std::fs;

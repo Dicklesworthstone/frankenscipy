@@ -78,8 +78,8 @@ fn main() {
 
     println!("stage shares of native eigh, by size (frankenscipy-ll0kk)");
     println!(
-        "{:>6} {:>12} {:>10} {:>10} {:>10}  {}",
-        "n", "total_ms", "reduce%", "solve%", "back%", "note"
+        "{:>6} {:>12} {:>10} {:>10} {:>10}  note",
+        "n", "total_ms", "reduce%", "solve%", "back%"
     );
 
     for &n in &sizes {

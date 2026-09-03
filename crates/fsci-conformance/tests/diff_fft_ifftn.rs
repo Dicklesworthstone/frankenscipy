@@ -228,7 +228,8 @@ fn diff_fft_ifftn() {
         let Some(packed) = scipy_arm.complex_input.as_ref() else {
             continue;
         };
-        let complex_input: Vec<(f64, f64)> = packed.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+        let complex_input: Vec<(f64, f64)> =
+            packed.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect();
         let opts = FftOptions::default();
         let Ok(rec) = ifftn(&complex_input, &case.shape, &opts) else {
             continue;

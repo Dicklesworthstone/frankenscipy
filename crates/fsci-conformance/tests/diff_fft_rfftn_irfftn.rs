@@ -269,7 +269,7 @@ fn diff_fft_rfftn_irfftn() {
                     continue;
                 };
                 let complex_in: Vec<(f64, f64)> =
-                    packed.chunks_exact(2).map(|p| (p[0], p[1])).collect();
+                    packed.as_chunks::<2>().0.iter().map(|p| (p[0], p[1])).collect();
                 let Ok(out) = irfftn(&complex_in, &case.shape, &opts) else {
                     continue;
                 };

@@ -9,7 +9,7 @@
 //!
 //! 4 contingency-table fixtures × 4 arms (statistic + pvalue
 //! + dof + expected_max_abs) = 16 cases via subprocess.
-//! Tol 1e-9 abs (closed-form expected sum + chi-squared cdf).
+//!   Tol 1e-9 abs (closed-form expected sum + chi-squared cdf).
 
 use std::collections::HashMap;
 use std::fs;

@@ -148,20 +148,20 @@ fn diff_linalg_qr_insert_delete_update() {
         }
 
         // qr_delete: delete row k=0
-        if m > 1 {
-            if let Ok(res) = qr_delete(&qra.q, &qra.r, 0, opts) {
-                let mut expected = a.clone();
-                expected.remove(0);
-                let qr_mat = matmul(&res.q, &res.r);
-                let abs_d = frob_diff(&expected, &qr_mat);
-                max_overall = max_overall.max(abs_d);
-                diffs.push(CaseDiff {
-                    case_id: format!("delete_{label}_k0"),
-                    op: "qr_delete".into(),
-                    abs_diff: abs_d,
-                    pass: abs_d <= ABS_TOL,
-                });
-            }
+        if m > 1
+            && let Ok(res) = qr_delete(&qra.q, &qra.r, 0, opts)
+        {
+            let mut expected = a.clone();
+            expected.remove(0);
+            let qr_mat = matmul(&res.q, &res.r);
+            let abs_d = frob_diff(&expected, &qr_mat);
+            max_overall = max_overall.max(abs_d);
+            diffs.push(CaseDiff {
+                case_id: format!("delete_{label}_k0"),
+                op: "qr_delete".into(),
+                abs_diff: abs_d,
+                pass: abs_d <= ABS_TOL,
+            });
         }
 
         // qr_update: rank-1 update A + u vᵀ

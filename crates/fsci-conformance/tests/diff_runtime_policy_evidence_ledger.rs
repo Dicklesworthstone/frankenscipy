@@ -99,7 +99,7 @@ fn diff_runtime_policy_evidence_ledger() {
         let led = ctrl.ledger();
         check(
             "empty_is_empty",
-            led.is_empty() && led.len() == 0,
+            led.is_empty(),
             format!("len={}", led.len()),
         );
         check(

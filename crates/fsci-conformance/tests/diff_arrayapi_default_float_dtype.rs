@@ -55,16 +55,16 @@ fn emit_log(log: &DiffLog) {
 #[test]
 fn diff_arrayapi_default_float_dtype() {
     let start = Instant::now();
-    let mut diffs: Vec<CaseDiff> = Vec::new();
-
-    diffs.push(CaseDiff {
-        case_id: "strict_float64".into(),
-        pass: default_float_dtype(ExecutionMode::Strict) == DType::Float64,
-    });
-    diffs.push(CaseDiff {
-        case_id: "hardened_float64".into(),
-        pass: default_float_dtype(ExecutionMode::Hardened) == DType::Float64,
-    });
+    let diffs: Vec<CaseDiff> = vec![
+        CaseDiff {
+            case_id: "strict_float64".into(),
+            pass: default_float_dtype(ExecutionMode::Strict) == DType::Float64,
+        },
+        CaseDiff {
+            case_id: "hardened_float64".into(),
+            pass: default_float_dtype(ExecutionMode::Hardened) == DType::Float64,
+        },
+    ];
 
     let all_pass = diffs.iter().all(|d| d.pass);
 

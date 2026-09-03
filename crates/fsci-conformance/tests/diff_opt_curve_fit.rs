@@ -237,8 +237,10 @@ fn diff_opt_curve_fit() {
         let Some(expected) = scipy_arm.popt.as_ref() else {
             continue;
         };
-        let mut opts = CurveFitOptions::default();
-        opts.p0 = Some(case.p0.clone());
+        let opts = CurveFitOptions {
+            p0: Some(case.p0.clone()),
+            ..Default::default()
+        };
         let result = match case.model.as_str() {
             "linear" => curve_fit(
                 |x: f64, p: &[f64]| p[0] * x + p[1],

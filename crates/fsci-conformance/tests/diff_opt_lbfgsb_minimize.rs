@@ -200,18 +200,17 @@ fn diff_opt_lbfgsb_minimize() {
             format!("x={:?} fun={:?}", fsci_r.x, fsci_r.fun),
         );
 
-        if let Some(scipy) = scipy_oracle_rosen_lbfgsb_or_skip() {
-            if scipy.converged
-                && let Some(scipy_x) = scipy.x.as_ref()
-            {
-                let close_to_scipy = (fsci_r.x[0] - scipy_x[0]).abs() < 1.0e-3
-                    && (fsci_r.x[1] - scipy_x[1]).abs() < 1.0e-3;
-                check(
-                    "rosenbrock_close_to_scipy",
-                    close_to_scipy,
-                    format!("fsci={:?} scipy={:?}", fsci_r.x, scipy_x),
-                );
-            }
+        if let Some(scipy) = scipy_oracle_rosen_lbfgsb_or_skip()
+            && scipy.converged
+            && let Some(scipy_x) = scipy.x.as_ref()
+        {
+            let close_to_scipy = (fsci_r.x[0] - scipy_x[0]).abs() < 1.0e-3
+                && (fsci_r.x[1] - scipy_x[1]).abs() < 1.0e-3;
+            check(
+                "rosenbrock_close_to_scipy",
+                close_to_scipy,
+                format!("fsci={:?} scipy={:?}", fsci_r.x, scipy_x),
+            );
         }
     }
 

@@ -98,14 +98,14 @@ fn flatten(rows: &[Vec<f64>]) -> Vec<f64> {
 
 fn generate_query() -> OracleQuery {
     // 3 well-separated clusters in 2D
-    let c1 = vec![
+    let c1 = [
         vec![0.1, 0.2],
         vec![0.2, 0.1],
         vec![0.0, 0.0],
         vec![0.15, 0.15],
     ];
-    let c2 = vec![vec![5.0, 5.0], vec![5.1, 5.2], vec![4.9, 5.0]];
-    let c3 = vec![vec![-3.0, -2.0], vec![-2.9, -2.1], vec![-3.1, -2.0]];
+    let c2 = [vec![5.0, 5.0], vec![5.1, 5.2], vec![4.9, 5.0]];
+    let c3 = [vec![-3.0, -2.0], vec![-2.9, -2.1], vec![-3.1, -2.0]];
     let well_separated: Vec<Vec<f64>> = c1
         .iter()
         .chain(c2.iter())
@@ -115,8 +115,8 @@ fn generate_query() -> OracleQuery {
     let well_labels: Vec<usize> = vec![0, 0, 0, 0, 1, 1, 1, 2, 2, 2];
 
     // Overlapping clusters (less well-separated)
-    let o1 = vec![vec![0.0, 0.0], vec![0.5, 0.3], vec![0.2, 0.8]];
-    let o2 = vec![vec![1.0, 0.5], vec![1.5, 0.7], vec![0.7, 1.2]];
+    let o1 = [vec![0.0, 0.0], vec![0.5, 0.3], vec![0.2, 0.8]];
+    let o2 = [vec![1.0, 0.5], vec![1.5, 0.7], vec![0.7, 1.2]];
     let overlap: Vec<Vec<f64>> = o1.iter().chain(o2.iter()).cloned().collect();
     let overlap_labels: Vec<usize> = vec![0, 0, 0, 1, 1, 1];
 

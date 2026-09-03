@@ -17,6 +17,7 @@
 //!   * `kruskal`'s ranking pass switches to a radix argsort above `1<<14`, so its removed
 //!     comparison sort was being weighed against O(n) work. The same is true here, so the share
 //!     model is the same, but the removed constant is larger.
+//!
 //! So the kruskal share (25–32%) is a LOWER bound expectation here, not a prediction.
 //!
 //! WHAT THIS DOES NOT MEASURE. The tie-sum ACCUMULATION added to the ranking pass runs in BOTH

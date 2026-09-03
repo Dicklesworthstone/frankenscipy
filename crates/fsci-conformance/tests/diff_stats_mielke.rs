@@ -5,7 +5,7 @@
 //! `fsci-stats/src/lib.rs` but no dedicated scipy diff harness.
 //! 4 k-values × 4 s-values × 7 x-values × 3 families (pdf/cdf/sf)
 //! + 4 × 4 × 5 ppf cases via subprocess. Skips cleanly if scipy
-//! is unavailable.
+//!   is unavailable.
 
 use std::collections::HashMap;
 use std::fs;

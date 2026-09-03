@@ -7,7 +7,7 @@
 //! LevyLeft (parameterless) had anchor tests but no dedicated
 //! scipy diff harness. 9 x-values for each variant × 3 families
 //! + 5 q-values for ppf via subprocess. Skips cleanly if scipy
-//! is unavailable.
+//!   is unavailable.
 
 use std::collections::HashMap;
 use std::fs;

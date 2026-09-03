@@ -213,7 +213,9 @@ fn diff_spatial_kdtree_query_pairs() {
             continue;
         };
         let scipy_set: HashSet<(usize, usize)> = scipy_flat
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| (c[0] as usize, c[1] as usize))
             .collect();
         let Ok(t) = KDTree::new(&case.pts) else {

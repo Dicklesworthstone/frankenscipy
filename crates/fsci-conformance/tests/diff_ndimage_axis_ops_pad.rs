@@ -101,9 +101,8 @@ fn generate_query() -> OracleQuery {
     let cube_2x3x2: Vec<f64> = (0..12).map(|i| (i as f64) + 1.0).collect();
 
     let mut axis = Vec::new();
-    let mut shapes_2d: Vec<(&str, &[f64], Vec<usize>)> = Vec::new();
-    shapes_2d.push(("2x3", &mat_2x3, vec![2, 3]));
-    shapes_2d.push(("3x4", &mat_3x4, vec![3, 4]));
+    let shapes_2d: Vec<(&str, &[f64], Vec<usize>)> =
+        vec![("2x3", &mat_2x3, vec![2, 3]), ("3x4", &mat_3x4, vec![3, 4])];
     for (label, data, shape) in shapes_2d {
         for op in ["sum", "mean"] {
             for ax in 0..2 {

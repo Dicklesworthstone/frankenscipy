@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn tiled_parallel_matches_sequential_to_tolerance() {
         for &n in &[1usize, 2, 8, 17, 64, 100, 129, 200] {
-            let a = spd(n, 0x0DDB_A11 ^ n as u64);
+            let a = spd(n, 0x00DD_BA11 ^ n as u64);
             let scale = a.iter().flatten().fold(1.0_f64, |m, &v| m.max(v.abs()));
             for &ts in &[8usize, 16, 32, 64] {
                 let seq = cholesky_tiled_lower(&a, ts).unwrap();

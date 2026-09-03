@@ -141,9 +141,7 @@ fn make_overdetermined(rows: usize, cols: usize) -> Vec<Vec<f64>> {
 
 fn make_tridiag_banded(n: usize) -> ((usize, usize), Vec<Vec<f64>>) {
     let mut ab = vec![vec![0.0; n]; 3];
-    for col in &mut ab[1] {
-        *col = 4.0;
-    }
+    ab[1].fill(4.0);
     for col in ab[0].iter_mut().skip(1) {
         *col = -1.0;
     }

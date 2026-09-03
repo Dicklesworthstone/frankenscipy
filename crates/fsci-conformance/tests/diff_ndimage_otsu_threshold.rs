@@ -115,31 +115,32 @@ fn bimodal(n: usize, seed: u64) -> Vec<f64> {
 }
 
 fn generate_query() -> OracleQuery {
-    let mut points = Vec::new();
-    points.push(Case {
-        case_id: "uniform_64x64".into(),
-        rows: 64,
-        cols: 64,
-        data: synth(64 * 64, 0xdead, 0.0, 255.0),
-    });
-    points.push(Case {
-        case_id: "bimodal_32x32".into(),
-        rows: 32,
-        cols: 32,
-        data: bimodal(32 * 32, 0xfeed),
-    });
-    points.push(Case {
-        case_id: "narrow_range_16x16".into(),
-        rows: 16,
-        cols: 16,
-        data: synth(16 * 16, 0xcafe, 50.0, 150.0),
-    });
-    points.push(Case {
-        case_id: "small_image_8x8".into(),
-        rows: 8,
-        cols: 8,
-        data: synth(8 * 8, 0xbeef, 0.0, 1.0),
-    });
+    let points = vec![
+        Case {
+            case_id: "uniform_64x64".into(),
+            rows: 64,
+            cols: 64,
+            data: synth(64 * 64, 0xdead, 0.0, 255.0),
+        },
+        Case {
+            case_id: "bimodal_32x32".into(),
+            rows: 32,
+            cols: 32,
+            data: bimodal(32 * 32, 0xfeed),
+        },
+        Case {
+            case_id: "narrow_range_16x16".into(),
+            rows: 16,
+            cols: 16,
+            data: synth(16 * 16, 0xcafe, 50.0, 150.0),
+        },
+        Case {
+            case_id: "small_image_8x8".into(),
+            rows: 8,
+            cols: 8,
+            data: synth(8 * 8, 0xbeef, 0.0, 1.0),
+        },
+    ];
     OracleQuery { points }
 }
 
