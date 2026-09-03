@@ -168,7 +168,8 @@ fn main() {
 Distribution moments, all closed-form or numerically anchored:
 
 ```rust
-use fsci_stats::{BetaDist, ChiSquared};
+// The moment surface lives on the `ContinuousDistribution` trait, so it must be in scope.
+use fsci_stats::{BetaDist, ChiSquared, ContinuousDistribution};
 
 fn main() {
     // Constructors return the distribution directly; invalid params panic
@@ -687,22 +688,18 @@ use fsci_sparse::{CsrMatrix, Shape2D, cg, IterativeSolveOptions};
 
 fn main() {
     // 5×5 SPD tridiagonal Laplacian, assembled directly in CSR
-    // Rows: [(col, val), ...]
-    let row_indices = vec![
-        vec![0, 1],
-        vec![0, 1, 2],
-        vec![1, 2, 3],
-        vec![2, 3, 4],
-        vec![3, 4],
+    // (data / column indices / row pointers, as scipy.sparse.csr_matrix takes them).
+    let data = vec![
+         2.0, -1.0,
+        -1.0,  2.0, -1.0,
+        -1.0,  2.0, -1.0,
+        -1.0,  2.0, -1.0,
+        -1.0,  2.0,
     ];
-    let row_data = vec![
-        vec![ 2.0, -1.0],
-        vec![-1.0,  2.0, -1.0],
-        vec![-1.0,  2.0, -1.0],
-        vec![-1.0,  2.0, -1.0],
-        vec![-1.0,  2.0],
-    ];
-    let a = CsrMatrix::from_rows(Shape2D { rows: 5, cols: 5 }, row_indices, row_data)
+    let indices = vec![0, 1, 0, 1, 2, 1, 2, 3, 2, 3, 4, 3, 4];
+    let indptr = vec![0, 2, 5, 8, 11, 13];
+    // The final flag asks the constructor to canonicalize (sort + merge duplicates).
+    let a = CsrMatrix::from_components(Shape2D::new(5, 5), data, indices, indptr, true)
         .expect("CSR build");
     let b = vec![1.0, 0.0, 0.0, 0.0, 1.0];
 
@@ -824,7 +821,7 @@ A function-level companion to the recipes table, handy when you are searching fo
 
 #### `fsci-linalg` public surface (selected)
 
-```
+```text
 solve, solve_triangular, solve_banded, solveh_banded, solve_toeplitz, solve_circulant,
 lstsq, pinv, inv, det, slogdet, norm, matrix_rank, matrix_power, signm,
 lu, lu_factor, lu_solve,
@@ -845,7 +842,7 @@ solve_with_casp, solve_with_audit, lstsq_with_casp, …
 
 #### `fsci-sparse` public surface (selected)
 
-```
+```text
 Formats: CsrMatrix, CscMatrix, CooMatrix, BsrMatrix, DiaMatrix, DokMatrix, LilMatrix,
          eye, eye_rectangular, diags, kron, kronsum,
          vstack, hstack, block_diag, stack, bmat,
@@ -873,7 +870,7 @@ The top-level re-exports for direct method calls live on the bare algorithm
 name (no `minimize_` prefix). Other methods are reachable through the
 `minimize(method, …)` dispatch entry point.
 
-```
+```text
 Unconstrained (re-exported direct): bfgs, cg_pr_plus, nelder_mead, powell,
                                     lbfgsb, newton_cg, trust_exact,
 
@@ -903,7 +900,7 @@ Other:         linear_sum_assignment (Hungarian), bracket,
 
 #### `fsci-integrate` public surface (selected)
 
-```
+```text
 IVP:  solve_ivp (Rk23, Rk45, Dop853, Bdf, Radau, Lsoda),
       solve_ivp_with_audit, OdeSolution, EventSpec / EventFn,
       odeint,
@@ -1207,7 +1204,7 @@ The Rust API is shaped to look like SciPy when you squint. The recurring transla
 | `scipy.linalg.lstsq(A, b)` | `fsci_linalg::lstsq(&a, &b, LstsqOptions::default())` |
 | `scipy.linalg.eigh(A)` | `fsci_linalg::eigh(&a, DecompOptions::default())` |
 | `scipy.linalg.expm(A)` | `fsci_linalg::expm(&a, DecompOptions::default())` |
-| `scipy.sparse.csr_matrix(...)` | `fsci_sparse::CsrMatrix::from_rows(Shape2D{...}, idx, data)` |
+| `scipy.sparse.csr_matrix((data, indices, indptr), shape)` | `fsci_sparse::CsrMatrix::from_components(Shape2D::new(m, n), data, indices, indptr, true)` |
 | `scipy.sparse.linalg.cg(A, b)` | `fsci_sparse::cg(&a, &b, None, IterativeSolveOptions::default())` |
 | `scipy.optimize.minimize(f, x0, method='BFGS')` | `fsci_opt::bfgs(&f, &x0, MinimizeOptions::default())` |
 | `scipy.optimize.minimize(f, x0, method='L-BFGS-B', bounds=...)` | `fsci_opt::lbfgsb(&f, &x0, opts)` |
