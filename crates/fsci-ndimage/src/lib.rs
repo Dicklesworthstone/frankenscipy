@@ -1311,18 +1311,12 @@ fn prefilter_spline_coefficients(
     let bspline_reflect = matches!(order, 2..=5);
     let exact_reflect =
         bspline_reflect && mode == BoundaryMode::Reflect && input.shape.iter().all(|&s| s > order);
-    let exact_mirror = bspline_reflect
-        && spline_prefilter_is_mirror_class(mode)
-        && input.shape.iter().all(|&s| s > order);
-    if spline_prefilter_is_mirror_class(mode) && !exact_mirror {
-        // The exact mirror prefilter needs every axis longer than `order`; a
-        // too-short axis would fall through to the clamped de Boor solver,
-        // which does not carry mirror symmetry. Fail closed (tracked separately)
-        // rather than return wrong coefficients.
-        return Err(NdimageError::InvalidArgument(
-            "mirror boundary requires each axis length > spline order".to_string(),
-        ));
-    }
+    // scipy maps CONSTANT/MIRROR/WRAP to the same prefilter (ni_splines.c
+    // `apply_filter`: all three select `_init_causal_mirror`), whose closed-form
+    // initial conditions are valid for EVERY n >= 2 — scipy's own
+    // `spline_filter1d(mode='mirror')` agrees with `bspline_mirror_coefficients`
+    // bit-for-bit on 2..4-sample lines (verified against the 1.17.1 incumbent,
+    // 2026-09-03, frankenscipy-0y8z8). No axis-length constraint, no fallback.
     let pad_input = matches!(mode, BoundaryMode::Nearest | BoundaryMode::Reflect) && !exact_reflect;
     let (mut current, coord_offsets) = if pad_input {
         (
@@ -1440,8 +1434,7 @@ fn prefilter_spline_coefficients(
                                             bspline_reflect_coefficients(&line, order)
                                         }
                                         (_, current_mode)
-                                            if spline_prefilter_is_mirror_class(current_mode)
-                                                && exact_mirror =>
+                                            if spline_prefilter_is_mirror_class(current_mode) =>
                                         {
                                             bspline_mirror_coefficients(&line, order)
                                         }
@@ -1483,7 +1476,7 @@ fn prefilter_spline_coefficients(
                     bspline_reflect_coefficients(&line, order)
                 }
                 (_, current_mode)
-                    if spline_prefilter_is_mirror_class(current_mode) && exact_mirror =>
+                    if spline_prefilter_is_mirror_class(current_mode) =>
                 {
                     bspline_mirror_coefficients(&line, order)
                 }
@@ -1857,7 +1850,13 @@ fn compute_axis_support(
             }
         }
     };
-    let effective_order = order.min(coeff_len.saturating_sub(1));
+    // scipy never degrades the stencil for short axes: the spline prefilter runs
+    // at full order and the boundary fold maps the taps (ni_splines.c applies the
+    // same poles to any line length). The old `order.min(coeff_len - 1)` clamp
+    // collapsed a 2-sample axis to LINEAR taps and returned raw coefficient
+    // values: zoom 2x2 order 3 gave -2.0 where scipy gives 1.0
+    // (frankenscipy-0y8z8).
+    let effective_order = if coeff_len <= 1 { 1 } else { order };
     // Constant/Wrap order-3: cardinal cubic B-spline with a mirror index fold.
     if matches!(mode, BoundaryMode::Wrap | BoundaryMode::Constant) && effective_order == 3 {
         let base = spline_coord.floor() as isize - 1;
@@ -10507,6 +10506,19 @@ pub fn zoom(
         return Ok(zoom_order1_reflect_2d_fast(input, &new_shape));
     }
     let spline = prefilter_spline_coefficients(input, order, mode)?;
+    // scipy splits the boundary mode for spline interpolation: the prefilter and
+    // the COEFFICIENT-tap lookup both run with `spline_mode` (MIRROR for
+    // constant/wrap/mirror — ni_interpolation.c `_get_spline_boundary_mode`,
+    // taps folded at line 517 via `map_coordinate(.., spline_mode)`), while the
+    // user's mode governs only order<=1 / non-prefiltered lookups. Folding the
+    // taps with the user's Constant instead left every boundary tap at `cval`
+    // and returned garbage near edges for axes shorter than the order
+    // (frankenscipy-0y8z8).
+    let coeff_lookup_mode = if order >= 2 && spline_prefilter_is_mirror_class(mode) {
+        BoundaryMode::Mirror
+    } else {
+        mode
+    };
     let mut output = NdArray::zeros(new_shape.clone());
 
     // Each output pixel is an independent interpolation of the (read-only) spline
@@ -10539,7 +10551,7 @@ pub fn zoom(
             &out_shape,
             &spline.coord_offsets,
             order,
-            mode,
+            coeff_lookup_mode,
             offsets,
             flags.compact_disabled,
             |axis, o| {
@@ -10581,7 +10593,7 @@ pub fn zoom(
             &coords,
             &spline.coord_offsets,
             order,
-            mode,
+            coeff_lookup_mode,
             cval,
             flags,
         )
@@ -22293,7 +22305,12 @@ mod tests {
 
     #[test]
     fn zoom_matches_scipy_reference_dimensions() {
-        // scipy.ndimage.zoom([[1, 2], [3, 4]], 2) produces 4x4 array
+        // scipy.ndimage.zoom([[1, 2], [3, 4]], 2) produces a 4x4 array. This
+        // case also pins the VALUES against scipy 1.17.1 (incumbent, captured
+        // 2026-09-03): it exercises the mirror-class spline prefilter on axes
+        // SHORTER than the order (2 <= order 3), which failed closed before
+        // frankenscipy-0y8z8. Zoom coordinates make every interior sample hit
+        // a rational knot blend, so the row structure is exact to ~1e-15.
         let arr = NdArray::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
         let result = zoom(&arr, &[2.0, 2.0], 3, BoundaryMode::Constant, 0.0).expect("zoom");
         assert_eq!(
@@ -22301,6 +22318,30 @@ mod tests {
             vec![4, 4],
             "zoom(2x) should produce 4x4 array"
         );
+        let scipy_reference = [
+            0.9999999999999999,
+            1.2592592592592593,
+            1.7407407407407411,
+            2.0000000000000004,
+            1.5185185185185188,
+            1.777777777777778,
+            2.259259259259259,
+            2.5185185185185186,
+            2.4814814814814823,
+            2.740740740740741,
+            3.2222222222222228,
+            3.481481481481483,
+            3.0000000000000004,
+            3.25925925925926,
+            3.7407407407407427,
+            4.000000000000001,
+        ];
+        for (got, expected) in result.data.iter().zip(scipy_reference) {
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "zoom value {got} vs scipy {expected}"
+            );
+        }
     }
 
     #[test]
