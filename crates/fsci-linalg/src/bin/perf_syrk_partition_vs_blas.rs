@@ -35,7 +35,6 @@ fn main() {
     use fsci_linalg::{bench_trailing_syrk_prepare, bench_trailing_syrk_run};
     use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use std::hint::black_box;
-    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
@@ -82,7 +81,6 @@ fn main() {
         ((s >> 11) as f64 / (1u64 << 53) as f64) - 0.5
     };
     let a: Vec<Vec<f64>> = (0..m).map(|_| (0..k).map(|_| next()).collect()).collect();
-    let at: Vec<Vec<f64>> = (0..k).map(|j| (0..m).map(|i| a[i][j]).collect()).collect();
 
     // OUR trailing SYRK, at the same shape, timed in isolation via the bench entry point.
     // This is the arm the first version of this binary got wrong: it timed the public `matmul`,

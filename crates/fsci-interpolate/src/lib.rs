@@ -15400,7 +15400,6 @@ impl LSQBivariateSpline {
     }
 
     /// Evaluate at scattered points.
-    #[must_use]
     pub fn eval_many(&self, x: &[f64], y: &[f64]) -> Result<Vec<f64>, InterpError> {
         // Returns `Result`, matching the inner type. `eval_many` is the one evaluator
         // here that can fail — it validates that `x` and `y` are the same length — so

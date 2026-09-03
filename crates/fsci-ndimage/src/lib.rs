@@ -13595,16 +13595,6 @@ fn bspline_grid_wrap_coefficients(line: &[f64], order: usize) -> Result<Vec<f64>
     Ok(system.into_iter().map(|row| row[n]).collect())
 }
 
-/// Compute spline filter coefficients along a single axis.
-///
-/// Matches `scipy.ndimage.spline_filter1d`. Computes spline coefficients
-/// along the specified axis, leaving other axes unchanged.
-///
-/// # Arguments
-/// * `input` - Input array
-/// * `order` - Spline order (0-5)
-/// * `axis` - Axis along which to filter
-/// * `mode` - Boundary handling mode (Reflect, Nearest, Mirror, Wrap, or Constant)
 /// Does this boundary mode use the reflect-class spline PREFILTER, as SciPy defines it?
 ///
 /// SciPy's spline prefilter does NOT give each `mode` its own boundary treatment. Measured
@@ -13642,6 +13632,16 @@ fn spline_prefilter_is_mirror_class(mode: BoundaryMode) -> bool {
     )
 }
 
+/// Compute spline filter coefficients along a single axis.
+///
+/// Matches `scipy.ndimage.spline_filter1d`. Computes spline coefficients
+/// along the specified axis, leaving other axes unchanged.
+///
+/// # Arguments
+/// * `input` - Input array
+/// * `order` - Spline order (0-5)
+/// * `axis` - Axis along which to filter
+/// * `mode` - Boundary handling mode (Reflect, Nearest, Mirror, Wrap, or Constant)
 pub fn spline_filter1d(
     input: &NdArray,
     order: usize,

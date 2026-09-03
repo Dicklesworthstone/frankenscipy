@@ -11,6 +11,7 @@ use fsci_sparse::{CsrMatrix, FormatConvertible, Shape2D, random, spmv_csr};
 
 #[cfg(feature = "live-scipy-bench")]
 mod live_cg {
+    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use fsci_sparse::linalg::{
         CG_FORCE_ITERATION_SCOPES, CG_NARROW_INDICES_DISABLE, CG_WORKER_NNZ_SHIFT,
         CG_WORKER_NNZ_SHIFT_DEFAULT,
@@ -24,6 +25,29 @@ mod live_cg {
 
     const DIAGONAL: f64 = 4.001;
     const RTOL: f64 = 1e-5;
+
+    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
+    /// installation whose compiled submodules do not load, and that difference would
+    /// otherwise only surface mid-run.
+    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.sparse"];
+
+    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
+    /// by running the import rather than by a name resolving on `PATH`.
+    ///
+    /// This harness used to spawn a bare `python3`, which on `thinkstation1` is 3.14 with no
+    /// SciPy at all, so the oracle died on its first write and the run read as a flaky pipe
+    /// rather than as a missing incumbent (frankenscipy-m5s54). The resolver had been placed
+    /// in `end_to_end` (which never spawns Python) while its only caller, `Scipy::start`
+    /// below, lives in this feature-gated module; it is now defined where it is used.
+    fn incumbent() -> &'static ScipyIncumbent {
+        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
+        INCUMBENT.get_or_init(|| {
+            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
+                .unwrap_or_else(|error| panic!("{error}"));
+            println!("{}", resolved.provenance_line());
+            resolved
+        })
+    }
 
     fn laplacian_2d(side: usize) -> CsrMatrix {
         let n = side * side;
@@ -924,29 +948,7 @@ fn main() {
 // End-to-end: eigsh (power iteration) does many matvecs; the lib csr_matvec
 // change speeds them. Run this binary after stashing the lib change to compare.
 fn end_to_end() {
-    use fsci_runtime::scipy_incumbent::ScipyIncumbent;
     use fsci_sparse::{EigsOptions, eigsh};
-
-    /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an
-    /// installation whose compiled submodules do not load, and that difference would
-    /// otherwise only surface mid-run.
-    const SCIPY_REQUIRED_MODULES: &[&str] = &["scipy.sparse"];
-
-    /// The one live-SciPy incumbent this process compares against, resolved once and PROVEN
-    /// by running the import rather than by a name resolving on `PATH`.
-    ///
-    /// This harness used to spawn a bare `python3`, which on `thinkstation1` is 3.14 with no
-    /// SciPy at all, so the oracle died on its first write and the run read as a flaky pipe
-    /// rather than as a missing incumbent (frankenscipy-m5s54).
-    fn incumbent() -> &'static ScipyIncumbent {
-        static INCUMBENT: std::sync::OnceLock<ScipyIncumbent> = std::sync::OnceLock::new();
-        INCUMBENT.get_or_init(|| {
-            let resolved = ScipyIncumbent::resolve_with(&[], SCIPY_REQUIRED_MODULES)
-                .unwrap_or_else(|error| panic!("{error}"));
-            println!("{}", resolved.provenance_line());
-            resolved
-        })
-    }
 
     for &(n, density) in &[(100_000usize, 0.00015f64), (300_000, 0.00005)] {
         // Symmetric-ish: A + A^T would be ideal but random is fine for matvec timing.

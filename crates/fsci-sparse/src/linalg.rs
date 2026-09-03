@@ -1036,9 +1036,9 @@ fn sparse_factor_row_with_capacity<S: BuildHasher + Default>(
     HashMap::with_capacity_and_hasher(capacity, S::default())
 }
 
-/// Accumulate one CSR row into sorted order, cancelling duplicates and dropping
-/// exact zeros — the same duplicate-accumulate-and-cancel the hashed builders do,
-/// so a matrix with repeated triplets factors identically either way.
+// Accumulating one CSR row into sorted order cancels duplicates and drops exact zeros —
+// the same duplicate-accumulate-and-cancel the hashed builders do, so a matrix with
+// repeated triplets factors identically either way.
 
 /// Clamped read of the capacity headroom. Zero would allocate nothing and force a
 /// reallocation on the first push, which is the opposite of the intent.
@@ -2093,7 +2093,7 @@ fn scan_matched_prefix(left: &[u32], right: &[u32], bound: usize) -> usize {
         .as_chunks::<BLOCK>()
         .0
         .iter()
-        .zip(right.chunks_exact(BLOCK))
+        .zip(right.as_chunks::<BLOCK>().0.iter())
     {
         let mut all_equal = true;
         for (a, b) in left_block.iter().zip(right_block.iter()) {
@@ -20504,20 +20504,24 @@ mod tests {
 
     /// Holds `BANDED_TOGGLE_LOCK` for the caller's scope AND restores `SPLU_BANDED_ENABLE`
     /// on drop, including on unwind. The restore behaviour is unchanged; the lock is new.
-    struct RestoreBandedToggle(bool, std::sync::MutexGuard<'static, ()>);
+    struct RestoreBandedToggle {
+        previous: bool,
+        /// Never read: held only so the lock is released when the restore runs.
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
     impl RestoreBandedToggle {
         fn new(previous: bool) -> Self {
-            Self(
+            Self {
                 previous,
-                BANDED_TOGGLE_LOCK
+                _guard: BANDED_TOGGLE_LOCK
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )
+            }
         }
     }
     impl Drop for RestoreBandedToggle {
         fn drop(&mut self) {
-            SPLU_BANDED_ENABLE.store(self.0, std::sync::atomic::Ordering::Relaxed);
+            SPLU_BANDED_ENABLE.store(self.previous, std::sync::atomic::Ordering::Relaxed);
         }
     }
 

@@ -12,7 +12,7 @@
 //! Python arm carries a ~1.6e10 import whose run-to-run noise is ~1e9, which is
 //! two orders above the marginal work of a single pass. Repeating the pass lifts
 //! the signal above that floor without growing the array.
-use fsci_stats::{ContinuousDistribution, Normal, NumericalInverseHermite};
+use fsci_stats::{Normal, NumericalInverseHermite};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

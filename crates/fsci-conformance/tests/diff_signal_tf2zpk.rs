@@ -250,6 +250,16 @@ fn diff_signal_tf2zpk() {
         };
         let zs = pack_sorted(&zpk.zeros_re, &zpk.zeros_im);
         let ps = pack_sorted(&zpk.poles_re, &zpk.poles_im);
+        // The oracle reports its zero count separately so a zero/pole miscount cannot hide
+        // behind a coincidentally equal packed length.
+        if scipy_arm.n_zeros.is_some_and(|n| n != zs.len()) {
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                abs_diff: f64::INFINITY,
+                pass: false,
+            });
+            continue;
+        }
         let mut fsci_v = Vec::with_capacity(zs.len() * 2 + ps.len() * 2 + 1);
         for (re, im) in zs {
             fsci_v.push(re);

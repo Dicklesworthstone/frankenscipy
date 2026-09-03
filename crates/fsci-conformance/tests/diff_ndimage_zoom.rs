@@ -275,7 +275,13 @@ fn diff_ndimage_zoom() {
         ) else {
             continue;
         };
-        if out.data.len() != scipy_v.len() {
+        // Shape parity is checked separately from the flattened values: two different
+        // output shapes can flatten to the same length.
+        let shape_mismatch = scipy_arm
+            .out_shape
+            .as_ref()
+            .is_some_and(|shape| *shape != out.shape);
+        if shape_mismatch || out.data.len() != scipy_v.len() {
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 abs_diff: f64::INFINITY,

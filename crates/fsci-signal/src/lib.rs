@@ -21712,7 +21712,6 @@ mod tests {
         }
     }
 
-    #[test]
     // frankenscipy-5bj4e. check_COLA/check_NOLA route through
     // overlap_add_binsums, which calls validate_real_values_finite on the
     // window. That guard had no test: the sibling test below only feeds finite
@@ -23665,7 +23664,6 @@ mod tests {
         assert!(iircomb(0.3, 25.0, CombType::Notch, Some(2.0), false).is_err());
     }
 
-    #[test]
     // Complements analog_frequency_responses_reject_non_finite_inputs, which
     // already covers a non-finite zero, a non-finite frequency and a
     // zeros_re/zeros_im length mismatch on freqs_zpk, a non-finite numerator and

@@ -403,13 +403,13 @@ fn host_provenance() -> String {
     // Physical cores = distinct (physical id, core id) pairs. Counting `processor` lines
     // instead would report SMT siblings as cores and silently double the number.
     let mut cores: Vec<(&str, &str)> = Vec::new();
-    let (mut pkg, mut core) = ("", "");
+    let mut pkg = "";
     for line in cpuinfo.lines() {
         if let Some((k, v)) = line.split_once(':') {
             match k.trim() {
                 "physical id" => pkg = v.trim(),
                 "core id" => {
-                    core = v.trim();
+                    let core = v.trim();
                     if !cores.contains(&(pkg, core)) {
                         cores.push((pkg, core));
                     }
