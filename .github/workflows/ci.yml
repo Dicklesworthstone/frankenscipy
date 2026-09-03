@@ -17,19 +17,28 @@ name: CI Gates (G1-G9)
 #     missing or wrong interpreter is a failure, never a skip; the `g3-oracle-required-control`
 #     job proves that by running one lane without SciPy and asserting it FAILS.
 
+# TRIGGER SHAPE. The shared tree auto-commits and pushes every few minutes, and this account's
+# hosted-runner queue was already 5-7 hours deep with the old one-job workflow. So a PUSH runs
+# only G1 (one job, fmt + clippy) and the newest push cancels the ones still waiting; the full
+# evidence run (per-crate tests, the 14 live-SciPy shards, e2e, perf, evidence packs) runs on
+# the nightly schedule and on demand via workflow_dispatch, where a 40-job fan-out is affordable
+# and nothing races it. Bead syncs and doc-only pushes do not trigger a run at all.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - ".beads/**"
+      - "docs/**"
+      - "**/*.md"
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "23 5 * * *" # 05:23 UTC nightly: the full gate fan-out
   workflow_dispatch:
 
-# At most one run in progress per ref and only the newest pending one waits behind it. The
-# tree auto-commits every few minutes, which previously left a hundred queued runs that took
-# five to seven hours each just to start.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: false
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,6 +79,7 @@ jobs:
   # integration-test binaries are NOT built here (they are the G3 lanes below).
   g2-unit-tests:
     name: "G2: unit + property tests (${{ matrix.crate }})"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     strategy:
@@ -114,6 +124,7 @@ jobs:
   # runs with the oracle REQUIRED: a test that cannot reach SciPy fails instead of skipping.
   g3-diff-live-scipy:
     name: "G3: live-SciPy diff (${{ matrix.shard }})"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 240
     strategy:
@@ -190,6 +201,7 @@ jobs:
   # started to skip-and-pass again and every green shard above is meaningless.
   g3-oracle-required-control:
     name: "G3 control: no SciPy must fail"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -223,6 +235,7 @@ jobs:
   # ── G3b: Live SciPy Oracle Capture (pinned) ───────────────────────
   g3-live-scipy-oracle:
     name: "G3b: live SciPy oracle capture"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -262,6 +275,7 @@ jobs:
   # (no-SciPy) capture mode of live_oracle_capture. These do not need the oracle.
   g3-conformance-other:
     name: "G3c: goldens + metamorphic + fallback capture"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -295,6 +309,7 @@ jobs:
   # ── G4: Adversarial/Smoke Test ─────────────────────────────────────
   g4-adversarial:
     name: "G4: adversarial smoke"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -311,6 +326,7 @@ jobs:
   # ── G5: E2E Scenario Orchestration ────────────────────────────────
   g5-e2e:
     name: "G5: E2E scenarios"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -343,6 +359,7 @@ jobs:
   # compare needs a criterion run on a stable, dedicated host and is tracked separately.
   g6-perf:
     name: "G6: perf smoke + baseline validation"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -383,6 +400,7 @@ jobs:
   # ── G7: Artifact Schema Validation + every evidence pack ──────────
   g7-schema:
     name: "G7: schema + evidence packs"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 150
     steps:
@@ -413,6 +431,7 @@ jobs:
   # ── G8: RaptorQ Decode-Proof Verification ─────────────────────────
   g8-raptorq:
     name: "G8: RaptorQ proofs"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -433,6 +452,7 @@ jobs:
   # tolerances written in the diff_*.rs files themselves.
   g9-tolerance-lint:
     name: "G9: tolerance-policy ratchet"
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
