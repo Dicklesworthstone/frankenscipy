@@ -10,7 +10,7 @@
   <img src="https://img.shields.io/badge/unsafe-%23!%5Bforbid(unsafe__code)%5D-brightgreen.svg" alt="No unsafe code">
   <img src="https://img.shields.io/badge/async-asupersync%20(no%20tokio)-purple.svg" alt="asupersync, no tokio">
   <img src="https://img.shields.io/badge/workspace-19%20crates-informational.svg" alt="19 workspace crates">
-  <img src="https://img.shields.io/badge/conformance-796%20test%20files-success.svg" alt="796 conformance test files">
+  <img src="https://img.shields.io/badge/conformance-793%20test%20files-success.svg" alt="793 conformance test files">
 </p>
 
 > **FrankenSciPy is a clean-room Rust reimplementation of SciPy's core numerical
@@ -90,7 +90,7 @@ Three other crates ship selectors that share the CASP name but not its machinery
 
 ## Workspace at a Glance
 
-FrankenSciPy is a Cargo workspace of **19 crates** spanning ~610,000 lines under `crates/*/src` (implementation plus the inline `#[cfg(test)]` suites, which are the bulk of the larger crates; 10,057 `#[test]` functions in all), plus 796 integration-test files and the fixture tree in `fsci-conformance`. The line counts below are `wc -l` over each crate's `src/`, measured 2026-09-03.
+FrankenSciPy is a Cargo workspace of **19 crates** spanning ~610,000 lines under `crates/*/src` (implementation plus the inline `#[cfg(test)]` suites, which are the bulk of the larger crates; 10,056 `#[test]` functions in all), plus 793 conformance integration-test files and the fixture tree in `fsci-conformance`. The line counts below are `wc -l` over each crate's `src/`, measured 2026-09-03.
 
 | Crate | Lines | Surface |
 |---|---|---|
@@ -112,7 +112,7 @@ FrankenSciPy is a Cargo workspace of **19 crates** spanning ~610,000 lines under
 | [`fsci-datasets`](crates/fsci-datasets/) | ~670 | Deterministic embedded sample fixtures matching SciPy shapes: `ascent`, `face` (RGB / gray), `electrocardiogram` |
 | [`fsci-runtime`](crates/fsci-runtime/) | ~3,650 | The CASP engine: `SolverPortfolio`, `MatrixConditionState`, `StructuralEvidence`, `SolverAction`, `PolicyController`, evidence ledger, conformal calibrator, fail-closed semantics, strict vs hardened modes |
 | [`fsci-arrayapi`](crates/fsci-arrayapi/) | ~4,800 | Contract-first Array API backend (`backend.rs`, `broadcast`, `creation`, `indexing`, `audit`) with integration seams for linalg / opt / sparse |
-| [`fsci-conformance`](crates/fsci-conformance/) | ~33,000 (lib + 9 bins) + **796 test files** | Three-lane differential harness (self-check, SciPy-oracle, dispatch); RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 15 Python oracle scripts; nine binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`, `adversarial_corpus`, `fuzz_triage`) |
+| [`fsci-conformance`](crates/fsci-conformance/) | ~33,000 (lib + 9 bins) + **793 test files** | Three-lane differential harness (self-check, SciPy-oracle, dispatch); RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 15 Python oracle scripts; nine binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`, `adversarial_corpus`, `fuzz_triage`) |
 
 For per-symbol parity assessment see [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md).
 
@@ -626,7 +626,7 @@ V1.0 is gated on the following items. Items 1 and 2 of the original list are don
 6. **Cut a tagged 0.x release with a publish-to-crates.io workflow** and per-crate semver guarantees. There are no tags, no releases, and no `[profile.release]` in the root manifest yet.
 7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are still in `crates/fsci-conformance/fixtures/artifacts/`; pick one, migrate, and freeze it as V1's contract.
 
-As of 2026-09-03 the tracker holds 13 open and 33 in-progress beads, nearly all of them performance-campaign conversions or measurement infrastructure. Run `bv --robot-triage` for the live picture.
+As of 2026-09-03 the tracker holds ~30 open and ~25 in-progress beads, nearly all of them performance-campaign conversions or measurement infrastructure. Run `bv --robot-triage` for the live picture.
 
 ---
 
@@ -926,7 +926,7 @@ FrankenSciPy is built using a small but specific stack designed for AI-driven, m
 
 | Tool | What it does |
 |---|---|
-| [`br` (beads_rust)](https://github.com/Dicklesworthstone/beads_rust) | Local-first issue tracker. Every TODO, defect, and roadmap item lives in `.beads/issues.jsonl` and surfaces through `br ready`, `br show <id>`, `br create`. The 4,282 closed beads (as of 2026-09-03) are the audit trail; `CHANGELOG.md` summarizes them by domain. |
+| [`br` (beads_rust)](https://github.com/Dicklesworthstone/beads_rust) | Local-first issue tracker. Every TODO, defect, and roadmap item lives in `.beads/issues.jsonl` and surfaces through `br ready`, `br show <id>`, `br create`. The 4,285+ closed beads are the audit trail; `CHANGELOG.md` summarizes them by domain. |
 | `bv` | Graph-aware triage on top of beads. `bv --robot-triage` returns the recommended next ticket with reasons. |
 | `agent-mail` | MCP messaging layer that lets multiple agents working on the repo coordinate via threaded conversations and advisory file reservations, all kept under `.agent-mail/` for auditability. |
 | `rch` (Remote Compilation Helper) | Offloads `cargo build`, `cargo test`, and `cargo clippy` to a fleet of remote workers; this is how the project keeps the developer machine responsive when several agents are compiling the workspace in parallel. |
@@ -1473,7 +1473,7 @@ The final reference block: the fuzz harness layout, the anatomy of a conformance
 
 ### The Fuzz Harness
 
-`fuzz/` is a cargo-fuzz workspace (excluded from the main workspace) with **98 fuzz targets** under `fuzz/fuzz_targets/`. Each target is named after the conformance packet it stresses, and each targets one class of input the routine has to be robust against:
+`fuzz/` is a cargo-fuzz workspace (excluded from the main workspace) with **96 fuzz targets** under `fuzz/fuzz_targets/`. Each target is named after the conformance packet it stresses, and each targets one class of input the routine has to be robust against:
 
 ```text
 fuzz/
@@ -1765,7 +1765,7 @@ agreement; that is what the `diff_*` conformance lanes measure, and the
 | `fsci-datasets` | `parity_green` | 100% (5/5) | 0 | Embedded sample fixtures |
 | `fsci-runtime` | `parity_green` | n/a (FrankenSciPy-native) | 8 | CASP engine + audit ledger |
 | `fsci-arrayapi` | `aspirational` | n/a | 5 | Contract-first backend; no other crate depends on it yet |
-| `fsci-conformance` | `parity_green` | n/a (harness) | — | 796 integration test files (731 `diff_*`), 18 packets, 15 oracles |
+| `fsci-conformance` | `parity_green` | n/a (harness) | — | 793 integration test files (731 `diff_*`), 18 packets, 15 oracles |
 
 ---
 
