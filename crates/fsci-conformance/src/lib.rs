@@ -45,6 +45,19 @@
 //! (`Unspecified`/`OracleBacked`/`SelfCheck`, per frankenscipy-fytm) so
 //! downstream dashboards (crate `dashboard`) can distinguish the lanes.
 
+/// Compiles every ```` ```rust ```` block in the repository README as a doctest.
+///
+/// The README is the project's measuring stick, and on 2026-09-03 five of its snippets
+/// named symbols or signatures that did not exist (`KdTree`, `expm(&a)`, `brentq(&f, a, b,
+/// ..)`, `gamma(x)`, a builder-style `assume_a`). Nothing had compiled them since they were
+/// written. This crate depends on every domain crate, so it is the one place all of those
+/// examples resolve. Blocks that are deliberately fragments (schematic harness shape, ledger
+/// patterns, the `AuditEvent` shape) are marked ```` ```rust,ignore ```` in the README.
+/// Run with `cargo test -p fsci-conformance --doc` (the G2 conformance job does).
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+pub struct ReadmeDoctests;
+
 pub mod ci_gates;
 pub mod dashboard;
 pub mod e2e;

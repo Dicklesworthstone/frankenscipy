@@ -457,7 +457,7 @@ There are **two complementary records** in flight:
 1. **`SolveCertificate`** is synchronously returned on every `solve_with_casp`-style call. It carries the full CASP decision data needed for replay (action, rcond estimate, structural evidence, posterior over condition states, expected losses, chosen expected loss, fallback-active flag).
 2. **`AuditEvent`** is appended to the configured `SyncSharedAuditLedger` for *forensic* events: mode decisions, bounded recoveries, fail-closed rejections, and alien-artifact decisions. The shape, taken straight from `crates/fsci-runtime/src/evidence.rs`:
 
-```rust
+```rust,ignore
 pub struct AuditEvent {
     pub timestamp_ms:       u64,    // Unix milliseconds
     pub input_fingerprint:  String, // BLAKE3 hash of the routine's inputs
@@ -617,7 +617,7 @@ The full workflow (capture, regen, provenance, CI lane) lives in `docs/ORACLE_WO
 
 V1.0 is gated on the following items. Items 1 and 2 of the original list are done; the rest are open and, as of 2026-09-03, have no bead behind them:
 
-1. **Surface coverage** — done by name: 1,194 of 1,300 SciPy callables have a same-named public equivalent (`fsci-special` 98.6%, `fsci-sparse` 96.2%, `fsci-fft` 90.2%, `fsci-opt` 84.5%; see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)). What remains is **behavioural** coverage: 201 SciPy-named public entry points have no reference anywhere in the conformance corpus (`frankenscipy-ivxx6`), and one sampled at random (`RbfInterpolator`) turned out to implement a non-default variant until fixed.
+1. **Surface coverage** — done by name: 1,194 of 1,300 SciPy callables have a same-named public equivalent (`fsci-special` 98.6%, `fsci-sparse` 96.2%, `fsci-fft` 90.2%, `fsci-opt` 84.5%; see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)). What remains is **behavioural** coverage. A 2026-08-24 audit found 201 SciPy-named public entry points with no reference anywhere in the conformance corpus (`frankenscipy-ivxx6`); one sampled at random (`RbfInterpolator`) implemented a non-default variant until fixed, five sampled from `fsci-linalg` agreed with SciPy, and by 2026-08-30 `scripts/conformance_coverage_audit.py` reports zero unreferenced entry points. That audit is name-mention based, so "referenced" is weaker than "compared"; a per-routine list of what each `diff_*` file actually asserts does not exist yet.
 2. **The three signal defects** originally listed here (`r1vok` periodogram/welch normalization, `cw6k2` iirnotch `r` approximation, `ot7tm` gausspulse envelope) closed on 2026-05-20.
 3. **A CI run that passes.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`) so that the per-crate unit suites, the full live-SciPy differential corpus, and the evidence packs actually run; the first fully green run has to be cited before any of the gate claims in this README count as enforced.
 4. **Promote `fsci-arrayapi` from `aspirational` to `parity_green`.** No other crate depends on it today; wiring the audited backend through linalg / opt / sparse as the canonical array type is unstarted.
@@ -1512,7 +1512,7 @@ The fuzz harness has been load-bearing on three of the major bug catches landed 
 
 A typical differential test file (`crates/fsci-conformance/tests/diff_<family>_<routine>.rs`) follows a fixed shape so an agent can read any one of them and immediately understand the others. Schematically:
 
-```rust
+```rust,ignore
 // 1. Imports
 use fsci_conformance::{packet_id, run_differential_test, DifferentialCase};
 use fsci_<family>::{<routine>, <Options>};
@@ -1591,7 +1591,7 @@ The ledger is just a `Vec<AuditEvent>` inside an `Arc<Mutex<AuditLedger>>`. Prac
 
 #### Pattern 1: Drain into a JSON line stream
 
-```rust
+```rust,ignore
 let entries = ledger.lock().expect("poisoned").entries().to_vec();
 for event in &entries {
     let line = serde_json::to_string(event).expect("serialize");
@@ -1603,7 +1603,7 @@ for event in &entries {
 
 #### Pattern 2: Filter by fingerprint to scope to a single request
 
-```rust
+```rust,ignore
 let req_fp = blake3::hash(req_body.as_bytes()).to_hex().to_string();
 let relevant: Vec<_> = ledger
     .lock().expect("poisoned")
@@ -1618,7 +1618,7 @@ Since the fingerprint is BLAKE3 of the input bytes, an external request handler 
 
 #### Pattern 3: Count fail-closed events as a rate metric
 
-```rust
+```rust,ignore
 let entries = ledger.lock().expect("poisoned").entries().to_vec();
 let fail_closed_count = entries
     .iter()
@@ -1949,7 +1949,7 @@ The `fsci-conformance` writer for `parity_report.{json,raptorq.json,decode_proof
 FrankenSciPy is pre-1.0. The following are intentional and tracked:
 
 - **No tagged releases yet.** The workspace version is `0.1.0`; there are no semver guarantees between commits.
-- **Name coverage is not behavioural parity.** 1,194 of 1,300 `scipy.*` callables have a same-named public equivalent (91.8%; [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) explains what that census does and does not check). The genuine remaining gaps are `optimize.direct`, the quasi-Newton update-strategy objects, and the `stats` machinery around `rv_continuous` / `CensoredData` / `Covariance`. Separately, 201 SciPy-named public entry points have no reference anywhere in the conformance corpus (`frankenscipy-ivxx6`), so their SciPy agreement is asserted only by their unit tests.
+- **Name coverage is not behavioural parity.** 1,194 of 1,300 `scipy.*` callables have a same-named public equivalent (91.8%; [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) explains what that census does and does not check). The genuine remaining gaps are `optimize.direct`, the quasi-Newton update-strategy objects, and the `stats` machinery around `rv_continuous` / `CensoredData` / `Covariance`. Separately, the conformance-coverage audit (`scripts/conformance_coverage_audit.py`, bead `frankenscipy-ivxx6`) went from 201 unreferenced SciPy-named entry points on 2026-08-24 to zero on 2026-08-30, but it checks that a name is mentioned somewhere in the corpus, not that a differential comparison runs for it.
 - **No GPU or distributed backends.** All kernels are single-process CPU.
 - **No FFI to BLAS / LAPACK.** All linear algebra is implemented in safe Rust; we lose hand-tuned-vendor-kernel performance for the largest matrices in exchange for memory safety and embeddability. Profile-first optimization closes this gap routine by routine.
 - **Heavy-tail distribution moments return `NaN`.** For families like `Alpha`, `Cauchy` (mean), `HalfCauchy` (mean/var), and some `Pareto` parameter regimes, the relevant moment integral diverges. We return `NaN` and document it rather than silently returning truncated finite numbers.

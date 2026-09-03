@@ -105,8 +105,10 @@ jobs:
           - fsci-special
           - fsci-stats
         include:
+          # `--doc` compiles every ```rust block of README.md (see ReadmeDoctests in the
+          # conformance lib), so a README example that stops compiling fails this job.
           - crate: fsci-conformance
-            args: --lib
+            args: --lib --doc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
