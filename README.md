@@ -1741,27 +1741,33 @@ cargo run -p fsci-conformance --bin conformance_dashboard -- \
 
 Detailed feature lists for each crate live in [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md) and the per-crate `src/lib.rs` doc comments. The table below summarizes status against the V1 scope contract.
 
-| Crate | Status | SciPy coverage | Notes |
-|---|---|---|---|
-| `fsci-linalg` | `parity_green` | 114% of `scipy.linalg` core | Exceeds SciPy core; adds CASP audit surface |
-| `fsci-integrate` | `parity_green` | ~80% | Full IVP/BVP/quadrature; LSODA includes nonstiff→BDF auto switching |
-| `fsci-interpolate` | `parity_green` | ~78% | All major splines + scattered-data |
-| `fsci-signal` | `parity_green` | ~86% | IIR/FIR design + SOS + spectral + wavelets + audio features |
-| `fsci-stats` | `parity_green` | ~88% | 95+ continuous, 10+ discrete distributions, all with full moment surface |
-| `fsci-spatial` | `parity_green` | ~85% | KDTree, full pdist/cdist, ConvexHull/Delaunay/Voronoi |
-| `fsci-special` | `parity_gap` | ~47% | Carlson elliptic complete; orthogonal polynomials complete; some long-tail functions remain |
-| `fsci-fft` | `parity_gap` | ~55% | Core 1-D and n-D transforms + DCT/DST + Hilbert; Bluestein for non-power-of-2 |
-| `fsci-sparse` | `parity_gap` | ~45% | Formats + iterative + eigensolvers + graph; some advanced direct solvers pending |
-| `fsci-opt` | `parity_gap` | ~55% | All major minimizers + global + LP/MILP; some `scipy.optimize` long-tail remains |
-| `fsci-cluster` | `parity_green` | covers V1 scope | KMeans + DBSCAN + hierarchical + indices |
-| `fsci-ndimage` | `parity_gap` | growing | Filters, morphology, measurement, geometric transforms |
-| `fsci-io` | `parity_gap` | growing | MATLAB v4/v5, MM, WAV, NetCDF, IDL, Fortran |
-| `fsci-constants` | `parity_green` | 100% | CODATA 2018 + SI + math constants |
-| `fsci-odr` | `parity_green` | covers V1 scope | Explicit + implicit + weighted ODR |
-| `fsci-datasets` | `parity_green` | covers V1 scope | Embedded sample fixtures |
-| `fsci-runtime` | `parity_green` | n/a (FrankenSciPy-native) | CASP engine + audit ledger |
-| `fsci-arrayapi` | `aspirational` | n/a | Contract-first backend; integration seams in flight |
-| `fsci-conformance` | `parity_green` | n/a (harness) | Three lanes, 767 integration test files, 18 packets, 15 oracles |
+The coverage column is the 2026-07-27 name census against scipy 1.17.1
+([`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)): a same-named
+public symbol exists. It says nothing about signatures or numerical
+agreement; that is what the `diff_*` conformance lanes measure, and the
+`diff_*` file count per family is given alongside.
+
+| Crate | Status | Same-named coverage | `diff_*` files | Notes |
+|---|---|---|---|---|
+| `fsci-linalg` | `parity_green` | 96.9% (95/98) | 40 | Dense + structured; CASP audit surface on the solve family |
+| `fsci-integrate` | `parity_green` | 72.7% (24/33) | 19 | IVP (incl. genuine Radau IIA) / BVP / quadrature; the misses are solver classes exposed as `SolverKind` variants |
+| `fsci-interpolate` | `parity_green` | 94.6% (53/56) | 14 | Splines, scattered data, RBF with SciPy's polynomial tail |
+| `fsci-signal` | `parity_green` | 99.4% (156/157) | 81 | IIR/FIR design + SOS + spectral + wavelets + audio features |
+| `fsci-stats` | `parity_green` | 78.9% (239/303) | 256 | Most misses are SciPy's lowercase distribution instances vs. Rust types; the real residual is `rv_continuous`/`CensoredData`/`Covariance` |
+| `fsci-spatial` | `parity_green` | 83.3% (15/18) | 17 | KDTree, pdist/cdist, ConvexHull/Delaunay/Voronoi; plotting helpers excluded by policy |
+| `fsci-special` | `parity_green` | 98.6% (353/358) | 117 | Gamma, Bessel, Carlson, hypergeometric, orthogonal polynomials |
+| `fsci-fft` | `parity_green` | 90.2% (37/41) | 23 | 1-D and n-D transforms + DCT/DST + Hilbert + FHT; the misses are backend-registration hooks |
+| `fsci-sparse` | `parity_green` | 96.2% (51/53) | 46 | Formats + direct + iterative + eigensolvers + graph |
+| `fsci-opt` | `parity_gap` | 84.5% (60/71) | 47 | `optimize.direct` and the quasi-Newton update-strategy objects are the real gaps |
+| `fsci-cluster` | `parity_green` | n/a (SciPy exports submodules only) | 13 | KMeans + DBSCAN + hierarchical + indices |
+| `fsci-ndimage` | `parity_green` | 100% (75/75) | 34 | Filters, morphology, measurement, geometric transforms |
+| `fsci-io` | `parity_green` | 100% (14/14) | 0 | MATLAB v4/v5, MM, WAV, NetCDF, IDL, Fortran, Harwell-Boeing; covered by unit tests and the io oracle packet only |
+| `fsci-constants` | `parity_green` | 87.5% (7/8) | 5 | CODATA 2018 + SI + math constants |
+| `fsci-odr` | `parity_green` | 100% (10/10) | 1 | Explicit + implicit + weighted ODR |
+| `fsci-datasets` | `parity_green` | 100% (5/5) | 0 | Embedded sample fixtures |
+| `fsci-runtime` | `parity_green` | n/a (FrankenSciPy-native) | 8 | CASP engine + audit ledger |
+| `fsci-arrayapi` | `aspirational` | n/a | 5 | Contract-first backend; no other crate depends on it yet |
+| `fsci-conformance` | `parity_green` | n/a (harness) | — | 796 integration test files (731 `diff_*`), 18 packets, 15 oracles |
 
 ---
 
