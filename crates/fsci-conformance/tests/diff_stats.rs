@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // SCOPE NOTE (frankenscipy-1p21x, resolved by frankenscipy-9fjdi): ea0a03be8
@@ -323,7 +323,7 @@ for c in cases:
 json.dump(results, sys.stdout)
 "#;
 
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .args(["-c", script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -552,7 +552,7 @@ for c in cases:
 json.dump(results, sys.stdout)
 "#;
 
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .args(["-c", script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -783,7 +783,7 @@ json.dump({
 }, sys.stdout)
 "#;
 
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .arg("-")
         .stdin(Stdio::piped())
         .stderr(Stdio::null())

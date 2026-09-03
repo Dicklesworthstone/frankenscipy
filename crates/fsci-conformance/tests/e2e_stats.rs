@@ -4389,7 +4389,7 @@ fn e2e_042_continuous_distribution_fit_parity() {
 /// Scenario 43: trimmed descriptive-statistic parity against live SciPy.
 #[test]
 fn e2e_043_trimmed_statistics_live_scipy_parity() {
-    let scipy_check = Command::new("python3")
+    let scipy_check = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg("import scipy; import numpy")
         .status();
@@ -4403,7 +4403,7 @@ fn e2e_043_trimmed_statistics_live_scipy_parity() {
     let mut all_pass = true;
 
     let t = Instant::now();
-    let output = Command::new("python3")
+    let output = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(TRIMMED_STATS_SCIPY_SCRIPT)
         .output()
@@ -4488,7 +4488,7 @@ fn e2e_043_trimmed_statistics_live_scipy_parity() {
 /// Tests the full MGC algorithm (commit 35eb603) matches scipy.stats.multiscale_graphcorr.
 #[test]
 fn e2e_044_multiscale_graphcorr_scipy_parity() {
-    let scipy_check = Command::new("python3")
+    let scipy_check = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg("from scipy.stats import multiscale_graphcorr")
         .status();
@@ -4502,7 +4502,7 @@ fn e2e_044_multiscale_graphcorr_scipy_parity() {
     let mut all_pass = true;
 
     let t = Instant::now();
-    let output = Command::new("python3")
+    let output = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(MGC_SCIPY_SCRIPT)
         .output()
