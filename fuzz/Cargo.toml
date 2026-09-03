@@ -7,8 +7,20 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
-[lints]
-workspace = true
+# `fuzz` is excluded from the root workspace (root Cargo.toml `exclude = ["fuzz"]`), so
+# `[lints] workspace = true` has no workspace to inherit from and cargo refuses to parse this
+# manifest at all ("failed to find a workspace root"). That refusal broke every nightly fuzz
+# run from 2026-08-27 (e36adfdea) until it was noticed. The table below is a copy of the root
+# `[workspace.lints.*]`; keep the two in step by hand.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+neg_cmp_op_on_partial_ord = "allow"
+approx_constant = "allow"
 
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
