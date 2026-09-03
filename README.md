@@ -374,19 +374,21 @@ The dashboard is an `ftui` TUI: arrow keys to move, Tab to cycle panels, `r` to 
 
 ### Companion binaries
 
-The `fsci-conformance` crate ships six companion binaries alongside the dashboard, each fulfilling one slice of the harness lifecycle:
+The `fsci-conformance` crate ships eight companion binaries alongside the dashboard, each fulfilling one slice of the harness lifecycle:
 
 | Binary | Purpose |
 |---|---|
 | `conformance_dashboard` | Interactive TUI for navigating packet results |
 | `e2e_orchestrator` | Runs the registered end-to-end golden-journey scenarios and emits `e2e/*.json` |
 | `fixture_regen` | Regenerates fixture bundles from a `--fixture <name>` and `--oracle <path>` pair; used to refresh tracked artifacts that derive from the oracle capture |
-| `live_oracle_capture` | Captures fresh SciPy oracle outputs in required or fallback mode; the binary the CI G3/G3b lanes drive |
-| `benchmark_gate` | Compares criterion baselines, emits the delta artifact, and fails CI on regressions outside the per-routine envelope |
+| `live_oracle_capture` | Captures fresh SciPy oracle outputs in required or fallback mode; the binary the CI G3b / G3c lanes drive |
+| `benchmark_gate` | `--check-spec` validates the published `docs/baseline_*.json` against the spec §17 budgets; `--compare <dir>` diffs a fresh criterion export against them (used by hand, not in CI) |
 | `raptorq_sidecar` | Generates and verifies the RaptorQ systematic-encoding sidecars for every packet bundle |
-| `tolerance_lint` | Ratchet check that fails the build if any tolerance contract was loosened relative to its prior baseline |
+| `tolerance_lint` | Ratchet check over the `FSCI-P2C-*.json` fixtures that fails the build if the count of unexplained tolerance relaxations rises |
+| `adversarial_corpus` | Emits the adversarial fixture corpus (malformed metadata, NaN/Inf, degenerate shapes) with BLAKE3 manifests under an `--output-root` |
+| `fuzz_triage` | Triages `fuzz/artifacts/` crashes: deduplicates by hash, promotes reproducers to regression fixtures, applies a retention horizon, and files `fuzz-finding` beads |
 
-These map directly to CI gates G3 / G3b / G6 / G8 / G9 and can also be invoked locally during development.
+These map to CI gates G3b / G3c / G6 / G8 / G9 and can also be invoked locally during development.
 
 ---
 
@@ -1497,7 +1499,7 @@ fuzz/
 └── artifacts/      # minimized reproducers from any crash
 ```
 
-The nightly `fuzz_nightly.yml` GitHub Actions workflow runs the nine `p2c006_special_*` targets for 900 seconds each under ASan+UBSan; the other 89 targets are run by hand with `cargo fuzz run <target>`. Crash reproducers land in `fuzz/artifacts/` and are triaged into beads by the `fuzz_triage` binary; nothing files beads automatically.
+The nightly `fuzz_nightly.yml` GitHub Actions workflow runs the nine `p2c006_special_*` targets for 900 seconds each under ASan+UBSan; the other 89 targets are run by hand with `cargo fuzz run <target>`. Crash reproducers land in `fuzz/artifacts/`; the `fuzz_triage` binary promotes them to regression fixtures and files `fuzz-finding` beads when run by hand, but the nightly workflow does not invoke it.
 
 Each target uses `libfuzzer-sys` and is structured around the same three-phase pattern:
 
