@@ -1,0 +1,7 @@
+# Pinned live-SciPy incumbent for the conformance oracle lanes.
+# Must match fsci_runtime::scipy_incumbent::{PINNED_SCIPY, PINNED_NUMPY};
+# the resolver prints both versions and `genuine=` on every harness start.
+# This file also anchors actions/setup-python's pip cache
+# (cache-dependency-path in .github/workflows/ci.yml).
+scipy==1.17.1
+numpy==2.4.3

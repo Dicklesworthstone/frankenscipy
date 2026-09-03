@@ -160,6 +160,7 @@ jobs:
         with:
           python-version: "3.13"
           cache: "pip"
+          cache-dependency-path: crates/fsci-conformance/python_oracle/requirements.txt
       - name: Install the pinned SciPy incumbent
         run: |
           python -m pip install --upgrade pip
@@ -228,7 +229,11 @@ jobs:
           fi
           export SCIPY_PYTHON="$(which python)"
           export FSCI_REQUIRE_SCIPY_ORACLE=1
-          if cargo test -p fsci-conformance --test diff_stats_aic_bic -- --nocapture; then
+          # The canary must be a diff test whose oracle script actually IMPORTS scipy.
+          # diff_stats_aic_bic is stdlib-only (AIC/BIC are closed-form), so it passed
+          # with no SciPy present and the control raged GATE DEFECT on 2026-09-03.
+          # diff_sparse_basic_queries shells to a scipy.sparse-importing script.
+          if cargo test -p fsci-conformance --test diff_sparse_basic_queries -- --nocapture; then
             echo "GATE DEFECT: the oracle-required lane PASSED with no SciPy present" >&2
             exit 1
           fi
@@ -253,6 +258,7 @@ jobs:
         with:
           python-version: "3.13"
           cache: "pip"
+          cache-dependency-path: crates/fsci-conformance/python_oracle/requirements.txt
       - name: Install the pinned SciPy incumbent
         run: |
           python -m pip install --upgrade pip
@@ -273,8 +279,11 @@ jobs:
           if-no-files-found: error
 
   # ── G3c: the rest of the conformance crate ────────────────────────
-  # Golden journeys, metamorphic suites, schema, RaptorQ proofs, smoke, and the fallback
-  # (no-SciPy) capture mode of live_oracle_capture. These do not need the oracle.
+  # Golden journeys, metamorphic suites, schema, RaptorQ proofs, smoke, oracle
+  # topology, and the fallback capture mode of live_oracle_capture. The live_*
+  # suites resolve the pinned incumbent themselves, so this job installs the
+  # same pinned pair as the G3 shards; without it the 2026-09-03 nightly saw
+  # live_scipy_core fail with "scipy_incumbent: unresolved".
   g3-conformance-other:
     name: "G3c: goldens + metamorphic + fallback capture"
     if: github.event_name != 'push'
@@ -289,6 +298,17 @@ jobs:
         with:
           shared-key: workspace-dev
           cache-on-failure: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: crates/fsci-conformance/python_oracle/requirements.txt
+      - name: Install the pinned SciPy incumbent (live_* suites resolve it)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "scipy==${PINNED_SCIPY}" "numpy==${PINNED_NUMPY}"
+          echo "SCIPY_PYTHON=$(which python)" >> "$GITHUB_ENV"
+          echo "FSCI_REQUIRE_SCIPY_ORACLE=1" >> "$GITHUB_ENV"
       - shell: bash
         run: |
           set -euo pipefail
@@ -468,4 +488,4 @@ jobs:
           cache-on-failure: true
       - run: |
           cargo run --release -p fsci-conformance --bin tolerance_lint -- \
-            --max-violations 361
+            --max-violations 360
