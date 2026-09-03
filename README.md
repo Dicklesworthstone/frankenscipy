@@ -256,7 +256,7 @@ In both modes, the tolerance contracts on scoped V1 routines are guarded by the 
 
 ### 3. No tokio
 
-The async-runtime story is exclusively [asupersync](https://github.com/Dicklesworthstone/asupersync): structured concurrency via `Cx` / `Scope` / `region()`, cancel-correct two-phase channels, cancel-aware sync primitives, and a `LabRuntime` with deterministic virtual time for testing. The tokio ecosystem (`tokio`, `hyper`, `reqwest`, `axum`, `async-std`, `smol`, and anything that transitively depends on them) is forbidden.
+Every numerical kernel is synchronous and returns a `Result`; the workspace owns no async runtime and `cargo tree -i tokio` is empty. The only async-capable dependency is [asupersync](https://github.com/Dicklesworthstone/asupersync), and today exactly one piece of it is consumed: its RaptorQ systematic encoder, used by `fsci-conformance` for artifact sidecars. The tokio ecosystem (`tokio`, `hyper`, `reqwest`, `axum`, `async-std`, `smol`, and anything that transitively depends on them) is forbidden.
 
 This makes FrankenSciPy trivially embeddable in any host runtime without dragging in a global async ecosystem.
 
@@ -406,7 +406,7 @@ What follows is the technical-depth pass: which algorithms FrankenSciPy actually
 | `funm` | General matrix-function evaluation via the Schur–Parlett scheme. |
 | `eig` / `eigh` | Householder reduction to Hessenberg or tridiagonal form, then QR-with-Wilkinson-shift iteration. |
 | `eigs` (sparse) | Arnoldi iteration on a Krylov subspace, with the upper Hessenberg factor reduced and the Arnoldi residual used as a stopping criterion. |
-| `eigsh` (symmetric sparse) | Power iteration with deflation. The initial vector is **not** the constant vector `[1/√n, …, 1/√n]` (which is orthogonal to every alternating-sign mode such as a path Laplacian's dominant eigenvector) but a deterministic LCG-based pseudo-random vector that is orthogonal to no eigenmode in general (the issue is documented inline as `br-oyy7`). |
+| `eigsh` (symmetric sparse) | Symmetric Lanczos through the shared Krylov/Arnoldi kernel: a single subspace of `max(2k+1, 20)` vectors (SciPy's `ncv` default) resolves the extreme eigenpairs, `converged` is set from the actual Ritz residuals, and pathologically clustered spectra report `converged = false` rather than looping (an implicitly restarted variant is not implemented). This replaced the original deflated power iteration, whose constant-seed bug on path Laplacians is described under **Case Studies**. |
 | `gmres` | Restarted GMRES with Arnoldi via modified Gram-Schmidt; least-squares step uses Givens rotations on the upper-Hessenberg factor. |
 | `qmr` | Look-ahead Lanczos process building a quasi-minimal residual approximation, using the transpose of `A` to drive the dual sequence. |
 | `lgmres` | Augmented Krylov subspace built from prior approximation-error vectors; the `k=0` lucky-breakdown case is guarded so the outer loop cannot spin forever on identity-like operators. |
@@ -416,7 +416,7 @@ What follows is the technical-depth pass: which algorithms FrankenSciPy actually
 | RK45 | Dormand-Prince embedded 5(4) pair with `select_initial_step` Hairer heuristic for the first step size. |
 | DOP853 | Hairer-Nørsett-Wanner 8(5,3) embedded pair, used when the user opts for tight tolerances on non-stiff problems. |
 | BDF | Variable-order (1–5) backward differentiation formula with Newton iteration; Jacobian is finite-differenced on demand. |
-| Radau | The `SolverKind::Radau` selector is routed to the same BDF kernel today; a dedicated 3-stage Radau IIA implementation is on the V1 roadmap. |
+| Radau | A genuine 3-stage Radau IIA solver (`crates/fsci-integrate/src/radau.rs`) matching `solve_ivp(method='Radau')`; it is no longer an alias of the BDF kernel. |
 | LSODA | Automatic nonstiff ↔ stiff switching via a stiffness-indicator heuristic on step-size rejections; switches into the BDF kernel once the indicator crosses threshold. |
 | `solve_bvp` | Collocation with a free-mesh adaptive solver; Newton on the discretized system. |
 | `quad` | Adaptive Gauss-Kronrod (15-point) with subinterval bisection; short-circuits on NaN/Inf integrand values rather than spinning to the `2^limit` subdivision wall. |
@@ -537,14 +537,12 @@ For every major subsystem, the threat-matrix JSON enumerates the attacker capabi
 
 ### asupersync Integration
 
-FrankenSciPy does not own an async runtime. It uses [asupersync](https://github.com/Dicklesworthstone/asupersync) exclusively, with a few specific patterns:
+FrankenSciPy does not own an async runtime, and none of its public API is async. What [asupersync](https://github.com/Dicklesworthstone/asupersync) provides today:
 
-- **Cx flows from the consumer.** When a function does need to be async (rare for numerical kernels, common for the conformance and evidence-ledger machinery), it takes `&Cx` as the first parameter rather than constructing one. FrankenSciPy is therefore embeddable in any host that already has a `Cx`.
-- **Two-phase channels.** Where the harness shuttles messages between regions (e.g., between a packet runner and a sidecar emitter), it uses `reserve()/send()` so that cancellation cannot drop in-flight data.
-- **Cancel-aware sync primitives.** `asupersync::sync::Mutex`, `RwLock`, `OnceCell`, and `Pool` are used for the few global caches (the FFT plan cache, the conformance writer lock, the calibrator state) so a cancelled region never deadlocks the next caller.
-- **Deterministic testing.** The `LabRuntime` lets conformance tests drive virtual time, deterministic task scheduling, and DPOR-style schedule exploration. Tests that exercise calibrator drift use the LabRuntime so the drift events are reproducible across runs.
+- **RaptorQ systematic encoding.** `fsci-conformance` uses `asupersync::raptorq::systematic::SystematicEncoder` to emit the `*.raptorq.json` sidecars and `*.decode_proof.json` artifacts for parity reports, oracle captures and benchmark baselines. This is the only asupersync code path linked into the workspace.
+- **Nothing else yet.** No function takes a `Cx`; the FFT plan cache, the conformance report-writer lock and the CASP calibrator state are guarded by `std::sync` primitives; the audit ledger handle is `Arc<std::sync::Mutex<AuditLedger>>`; and no test uses `LabRuntime`. The spec's "mandatory future expansions" (packet-level decode replay proofs for real recovery events, supervision integration in the policy controllers, anytime-valid invariant monitors) remain roadmap items with no bead behind them as of 2026-09-03.
 
-**Forbidden.** The workspace forbids `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, and any crate that transitively depends on them. `cargo tree -i tokio` should always return empty on this workspace.
+**Forbidden.** The workspace forbids `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, and any crate that transitively depends on them. `cargo tree -i tokio` returns empty on this workspace.
 
 ### Distribution Moment Surface
 
@@ -615,16 +613,17 @@ The full workflow (capture, regen, provenance, CI lane) lives in `docs/ORACLE_WO
 
 ### Roadmap to V1.0
 
-V1.0 is gated on the following six items, tracked in beads:
+V1.0 is gated on the following items. Items 1 and 2 of the original list are done; the rest are open and, as of 2026-09-03, have no bead behind them:
 
-1. **Close the `parity_gap` crates.** `fsci-special` (47% → ≥75%), `fsci-sparse` (45% → ≥75%), `fsci-opt` (55% → ≥80%), `fsci-fft` (55% → ≥80%), driven by the same beads-tracked port-and-test cycle the rest of the workspace went through.
-2. **Resolve the three filed numerical defects.** `frankenscipy-r1vok` (periodogram/welch normalization), `frankenscipy-cw6k2` (iirnotch `r` approximation), `frankenscipy-ot7tm` (gausspulse √2 envelope).
-3. **Promote `fsci-arrayapi` from `aspirational` to `parity_green`.** Wire the audited backend through linalg / opt / sparse as the canonical array type.
-4. **Stabilize the mode model on every CASP-participating routine.** Today the mode-split is consistent in linalg, sparse, opt, special; ndimage and signal routines that take arrays still need mode-aware variants.
-5. **Cut a tagged 0.x release with a publish-to-crates.io workflow** and per-crate semver guarantees.
-6. **Converge the artifact topology.** Migrate every legacy `P2C-*` packet onto the new flat `FSCI-P2C-*` layout (or vice versa) so there is exactly one topology in tree, then freeze it as V1's contract; subsequent changes go through the governance flow.
+1. **Surface coverage** — done by name: 1,194 of 1,300 SciPy callables have a same-named public equivalent (`fsci-special` 98.6%, `fsci-sparse` 96.2%, `fsci-fft` 90.2%, `fsci-opt` 84.5%; see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)). What remains is **behavioural** coverage: 201 SciPy-named public entry points have no reference anywhere in the conformance corpus (`frankenscipy-ivxx6`), and one sampled at random (`RbfInterpolator`) turned out to implement a non-default variant until fixed.
+2. **The three signal defects** originally listed here (`r1vok` periodogram/welch normalization, `cw6k2` iirnotch `r` approximation, `ot7tm` gausspulse envelope) closed on 2026-05-20.
+3. **A CI run that passes.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`) so that the per-crate unit suites, the full live-SciPy differential corpus, and the evidence packs actually run; the first fully green run has to be cited before any of the gate claims in this README count as enforced.
+4. **Promote `fsci-arrayapi` from `aspirational` to `parity_green`.** No other crate depends on it today; wiring the audited backend through linalg / opt / sparse as the canonical array type is unstarted.
+5. **Extend CASP beyond `fsci-linalg`.** The sparse, optimize and special selectors are rule-based today (see **Condition-Aware Solver Portfolio**); a loss matrix, posterior and calibrator per domain is the design intent and is unbuilt. The strict/hardened mode split is also absent from ndimage, signal, interpolate, spatial, cluster and io.
+6. **Cut a tagged 0.x release with a publish-to-crates.io workflow** and per-crate semver guarantees. There are no tags, no releases, and no `[profile.release]` in the root manifest yet.
+7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are still in `crates/fsci-conformance/fixtures/artifacts/`; pick one, migrate, and freeze it as V1's contract.
 
-There are 59 open beads tracking this work as of the most recent sync. Run `bv --robot-triage` for the live picture.
+As of 2026-09-03 the tracker holds 13 open and 33 in-progress beads, nearly all of them performance-campaign conversions or measurement infrastructure. Run `bv --robot-triage` for the live picture.
 
 ---
 
@@ -768,7 +767,7 @@ fn main() {
 #### KDTree nearest-neighbor
 
 ```rust
-use fsci_spatial::KdTree;
+use fsci_spatial::KDTree;
 
 fn main() {
     let points = vec![
@@ -778,7 +777,7 @@ fn main() {
         vec![1.0, 1.0],
         vec![0.5, 0.5],
     ];
-    let tree = KdTree::new(&points).expect("build");
+    let tree = KDTree::new(&points).expect("build");
     let (idx, dist) = tree.query(&[0.6, 0.4]).expect("query");
     println!("nearest neighbor: point {:?} at distance {:.4}", points[idx], dist);
 }
@@ -810,8 +809,8 @@ fn main() {
 use fsci_stats::qmc::SobolSampler;
 
 fn main() {
-    // 2-dimensional digital-shifted Sobol sampler (current dim ≤ 2 in fsci-stats QMC).
-    // For higher dimensions, use HaltonSampler or LatinHypercubeSampler.
+    // 2-dimensional digital-shifted Sobol sampler (dimensions 1..=32 are supported;
+    // HaltonSampler and LatinHypercubeSampler are unrestricted).
     let mut sobol = SobolSampler::with_digital_shift(2, /*seed=*/ 7).expect("build");
     println!("starting index = {}", sobol.next_index());
 }
@@ -1076,24 +1075,24 @@ Eleven invariants that the workspace commits to and the CI gates enforce:
 7. **No tolerance contract is ever loosened.** CI gate G9 (`tolerance_lint`) fails the build on weakening.
 8. **No schema is ever broken silently.** CI gate G7 validates the three contract schemas against every packet.
 9. **No artifact ships without a RaptorQ sidecar.** CI gate G8 verifies the decode proof.
-10. **Every fix-closed defect has a beads issue.** The three open defects (`r1vok`, `cw6k2`, `ot7tm`) are listed in **Limitations** because they are tracked.
+10. **Every fix-closed defect has a beads issue.** The open numerical defects listed in **Limitations** are each a live bead; the three signal defects that used to be listed there closed on 2026-05-20.
 11. **`main` and `master` stay in sync.** `master` exists only for legacy URL compatibility; every push to `main` is also pushed to `master`.
 
 ### Case Studies: Bugs the Harness Has Caught
 
-Three representative bugs, each preserved as an inline `br-<id>` note in the source so future contributors can see the reasoning:
+Three representative bugs. Two are preserved as inline `br-<id>` notes in the source (grep the id; line numbers rot); the third's kernel has since been replaced:
 
-#### `br-oyy7`: `eigsh` on the path Laplacian
+#### `eigsh` on the path Laplacian (the original power-iteration kernel)
 
-Power iteration is mathematically guaranteed to find the dominant eigenvalue *only when the initial vector has nonzero projection onto its eigenvector*. The constant vector `[1/√n, …, 1/√n]`, a natural default, is orthogonal to every alternating-sign mode. On a path-Laplacian matrix the dominant eigenvector is exactly such an alternating-sign mode, so the iteration silently converged to the *wrong* eigenvalue. The fix replaces the constant seed with a deterministic LCG-based pseudo-random vector that is orthogonal to no eigenmode in general. The comment lives at `crates/fsci-sparse/src/linalg.rs:6303`.
+Power iteration is mathematically guaranteed to find the dominant eigenvalue *only when the initial vector has nonzero projection onto its eigenvector*. The constant vector `[1/√n, …, 1/√n]`, a natural default, is orthogonal to every alternating-sign mode. On a path-Laplacian matrix the dominant eigenvector is exactly such an alternating-sign mode, so the iteration silently converged to the *wrong* eigenvalue. The fix at the time replaced the constant seed with a deterministic pseudo-random vector. The power-iteration kernel was later replaced by Lanczos through the shared Krylov/Arnoldi solver (see **Numerical Recipes**), which does not have this failure mode; the inline note went with it.
 
 #### `br-iq1e`: counting-before-breakdown in LGMRES inner loop
 
-Augmented-Krylov GMRES has a "lucky breakdown" exit when the residual collapses to numerical zero. The pre-fix code decremented `k` after breaking, which made the outer loop see `k = 0` and treat the inner result as never having advanced. On identity-like operators this manifested as an infinite spin. The fix increments `k` *before* the breakdown branch so the outer loop always sees the progress that was made. `crates/fsci-sparse/src/linalg.rs:6445`.
+Augmented-Krylov GMRES has a "lucky breakdown" exit when the residual collapses to numerical zero. The pre-fix code decremented `k` after breaking, which made the outer loop see `k = 0` and treat the inner result as never having advanced. On identity-like operators this manifested as an infinite spin. The fix increments `k` *before* the breakdown branch so the outer loop always sees the progress that was made. The `// br-iq1e:` comment sits on that increment in `crates/fsci-sparse/src/linalg.rs`.
 
 #### `br-nknp`: Mann-Whitney-U tie correction
 
-The Mann-Whitney `U` test uses a normal approximation for large `n` whose standard deviation must be tie-corrected when the combined sample has repeated values. The pre-fix code dropped the tie correction, which made `p`-values systematically too small on discrete or rounded data. Cross-checked against `scipy.stats.mannwhitneyu` in the conformance harness, the difference is invisible on continuous data and obvious on integer-valued samples. The fix lives at `crates/fsci-stats/src/lib.rs:17436`.
+The Mann-Whitney `U` test uses a normal approximation for large `n` whose standard deviation must be tie-corrected when the combined sample has repeated values. The pre-fix code dropped the tie correction, which made `p`-values systematically too small on discrete or rounded data. Cross-checked against `scipy.stats.mannwhitneyu` in the conformance harness, the difference is invisible on continuous data and obvious on integer-valued samples. The three `br-nknp` comments in `crates/fsci-stats/src/lib.rs` mark the sigma correction and the continuity-corrected two-sided branch.
 
 Each case study has a parity test in `fsci-conformance` that would fail again if the regression returned. These are the kinds of bugs the conformance harness exists for: subtle, mathematically-grounded, easily-shipped-without-noticing.
 
@@ -1581,7 +1580,7 @@ A rough sense of where FrankenSciPy is competitive with SciPy and where it isn't
 | **Distributions: pdf/cdf** | Yes | Native | None |
 | **Distributions: fit** | Function-of-distribution; closed-form fits are instant, numerical fits use `L-BFGS-B` with bounds | Often faster | SciPy's vectorized loss helps for huge data |
 | **Hypothesis tests** | Yes | Native | None |
-| **QMC** | Limited (Sobol dim ≤ 2 today; Halton + Latin Hypercube unrestricted) | Halton/LHS at small dims | SciPy's high-dim Sobol (open V1 item) |
+| **QMC** | Sobol up to 32 dimensions; Halton + Latin Hypercube unrestricted | Halton/LHS at small dims | SciPy's Sobol above 32 dimensions |
 
 The "Within 2-3× on uncontested machines" line for large dense linalg is the honest answer. FrankenSciPy is not trying to beat OpenBLAS; the goal is a credible memory-safe alternative that closes the gap routine by routine through the profile-and-prove discipline. Where the gap matters for a specific workload, file a beads issue.
 
