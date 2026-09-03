@@ -10599,9 +10599,11 @@ fn poly_multiply(a: &[f64], b: &[f64]) -> Vec<f64> {
 /// the discarded root is approximately `-b2/b1`. Measured on the oracle for a section
 /// `[1, b1, b2]` with `b2 = 9e-16`, every row of which the old predicate trimmed:
 ///
-///     b1 = 2      scipy root -4.5e-16      ours 0    error 4.5e-16
-///     b1 = 1e-6   scipy root -9.008e-10    ours 0    error 9.0e-10
-///     b1 = 1e-10  scipy |z| ~ 3e-8         ours 0    error 3.0e-08
+/// ```text
+/// b1 = 2      scipy root -4.5e-16      ours 0    error 4.5e-16
+/// b1 = 1e-6   scipy root -9.008e-10    ours 0    error 9.0e-10
+/// b1 = 1e-10  scipy |z| ~ 3e-8         ours 0    error 3.0e-08
+/// ```
 ///
 /// At `b1 = 1e-10` the disagreement is STRUCTURAL rather than numeric: SciPy returns a
 /// complex-conjugate pair, while trimming yields a real root plus a padded exact zero.

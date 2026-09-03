@@ -35,8 +35,8 @@
           29.0,
           36.99999999999999
         ],
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-10,
+        "rtol": 1e-10,
         "contract_ref": "fsci_signal::savgol_filter (scipy default mode=interp)"
       }
     },
@@ -74,8 +74,8 @@
           29.77142857142855,
           35.54285714285713
         ],
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-10,
+        "rtol": 1e-10,
         "contract_ref": "fsci_signal::savgol_filter (mode=nearest)"
       }
     },
@@ -113,8 +113,8 @@
           32.94285714285713,
           26.028571428571418
         ],
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-10,
+        "rtol": 1e-10,
         "contract_ref": "fsci_signal::savgol_filter (mode=constant)"
       }
     },
@@ -152,8 +152,8 @@
           30.457142857142838,
           34.08571428571427
         ],
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-10,
+        "rtol": 1e-10,
         "contract_ref": "fsci_signal::savgol_filter (mode=mirror)"
       }
     },
@@ -191,8 +191,8 @@
           32.85714285714284,
           26.19999999999999
         ],
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-10,
+        "rtol": 1e-10,
         "contract_ref": "fsci_signal::savgol_filter (mode=wrap)"
       }
     },
