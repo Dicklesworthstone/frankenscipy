@@ -12,8 +12,8 @@ use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_interpolate::{
-    interp1d_linear, lagrange, polyfit, polyval, splev, splrep, NearestNDInterpolator,
-    RbfInterpolator, RbfKernel,
+    NearestNDInterpolator, RbfInterpolator, RbfKernel, interp1d_linear, lagrange, polyfit, polyval,
+    splev, splrep,
 };
 use serde::{Deserialize, Serialize};
 

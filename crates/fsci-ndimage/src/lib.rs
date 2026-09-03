@@ -7261,7 +7261,11 @@ fn label_2d_cross_runs(input: &NdArray) -> Result<(NdArray, usize), NdimageError
     }
     let (rows, cols) = (input.shape[0], input.shape[1]);
     let n = input.size();
-    let fg: Vec<u8> = input.data.iter().map(|&value| u8::from(value != 0.0)).collect();
+    let fg: Vec<u8> = input
+        .data
+        .iter()
+        .map(|&value| u8::from(value != 0.0))
+        .collect();
     let mut parent = vec![0u32; n];
     let mut previous: Vec<(usize, usize, u32)> = Vec::new();
     let mut current: Vec<(usize, usize, u32)> = Vec::new();

@@ -6479,7 +6479,7 @@ fn assign_points(
     let chunk = n.div_ceil(nthreads);
     std::thread::scope(|scope| {
         for (t, label_chunk) in labels.chunks_mut(chunk).enumerate() {
-                let i0 = t * chunk;
+            let i0 = t * chunk;
             let centroids_soa = centroids_soa.as_deref();
             scope.spawn(move || {
                 let mut scratch = vec![0.0; k];
@@ -6536,12 +6536,7 @@ fn assign_points_with_distances(
                     scope.spawn(move || {
                         (start..end)
                             .map(|i| {
-                                nearest_centroid(
-                                    &data_flat[i * d..i * d + d],
-                                    centroids_flat,
-                                    k,
-                                    d,
-                                )
+                                nearest_centroid(&data_flat[i * d..i * d + d], centroids_flat, k, d)
                             })
                             .collect::<Vec<_>>()
                     })
@@ -6624,7 +6619,7 @@ fn nearest_centroid_gemm(
 
 #[inline]
 fn argmin_sq_dists_simd(values: &[f64]) -> usize {
-    use std::simd::{cmp::SimdPartialOrd, Simd};
+    use std::simd::{Simd, cmp::SimdPartialOrd};
 
     let mut best = 0usize;
     let mut minimum = values[0];
@@ -11608,7 +11603,9 @@ mod tests {
             for cluster in 0..8 {
                 if counts[cluster] > 0 {
                     let inv = 1.0 / counts[cluster] as f64;
-                    for (centroid, &sum) in expected_centroids[cluster].iter_mut().zip(&sums[cluster]) {
+                    for (centroid, &sum) in
+                        expected_centroids[cluster].iter_mut().zip(&sums[cluster])
+                    {
                         *centroid = sum * inv;
                     }
                 }

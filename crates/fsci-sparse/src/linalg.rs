@@ -88,8 +88,6 @@ impl Default for LuOptions {
     }
 }
 
-
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IluOptions {
     pub mode: RuntimeMode,
@@ -266,7 +264,9 @@ impl TriangularLevelSchedule {
     }
 
     fn has_parallel_rows(&self) -> bool {
-        self.offsets.windows(2).any(|window| window[1] - window[0] > 1)
+        self.offsets
+            .windows(2)
+            .any(|window| window[1] - window[0] > 1)
     }
 
     fn levels(&self) -> impl Iterator<Item = &[usize]> {
@@ -454,10 +454,7 @@ impl PackedTriangularRows {
         // walk of every live `(column, value)` pair merely to count the values the filter
         // will keep. The second pass remains the only payload walk and retains exactly the
         // same predicate, order, and packed output as the former filter-count pass.
-        let entry_count = rows
-            .iter()
-            .map(SortedFactorRow::len)
-            .sum();
+        let entry_count = rows.iter().map(SortedFactorRow::len).sum();
         let mut offsets = Vec::with_capacity(rows.len() + 1);
         let mut columns = Vec::with_capacity(entry_count);
         let mut values = Vec::with_capacity(entry_count);
@@ -4870,10 +4867,10 @@ impl NativeSparseLu {
         // On one pinned CPU the existing serial loops avoid scheduling overhead.  Once the
         // caller grants multiple CPUs, each precomputed level is a safe barrier: all reads
         // target prior levels and the completed values are published together afterwards.
-        let lower_schedule = level_schedule_is_useful(&self.lower_levels)
-            .then_some(&self.lower_levels);
-        let upper_schedule = level_schedule_is_useful(&self.upper_levels)
-            .then_some(&self.upper_levels);
+        let lower_schedule =
+            level_schedule_is_useful(&self.lower_levels).then_some(&self.lower_levels);
+        let upper_schedule =
+            level_schedule_is_useful(&self.upper_levels).then_some(&self.upper_levels);
         if lower_contiguous || upper_contiguous {
             SPLU_CONTIGUOUS_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -5109,8 +5106,7 @@ impl NativeSparseLu {
         let mut solutions = vec![vec![0.0; self.n]; lane_count];
         match self.inverse_fill_perm.as_deref() {
             Some(inverse) => {
-                SPLU_GATHER_UNPERMUTE_SOLVE_HITS
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                SPLU_GATHER_UNPERMUTE_SOLVE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 for old_row in 0..self.n {
                     let input = inverse[old_row] * lane_count;
                     for lane in 0..lane_count {
@@ -15569,7 +15565,11 @@ mod tests {
         let envelope_ordering = LuOptions::default().ordering;
         let cells: [(&str, CsrMatrix, bool); 2] = [
             ("cubic side=16", splu_dirichlet_laplacian_3d(16), false),
-            ("convection side=128", convection_diffusion_2d_probe(128), true),
+            (
+                "convection side=128",
+                convection_diffusion_2d_probe(128),
+                true,
+            ),
         ];
 
         let mut rows = Vec::new();
@@ -15656,8 +15656,7 @@ mod tests {
                     Some(p) => permuted_sorted_rows(&matrix, p),
                     None => csr_sorted_rows(&matrix),
                 };
-                let initial: Vec<Vec<u32>> =
-                    rows.iter().map(|r| r.live_cols().to_vec()).collect();
+                let initial: Vec<Vec<u32>> = rows.iter().map(|r| r.live_cols().to_vec()).collect();
                 let (_u_pattern, l_pattern) = symbolic_fill_pattern(n, &initial);
 
                 for tolerance in [0usize, SUPERNODAL_RELAXATION_TOLERANCE] {
@@ -15712,17 +15711,13 @@ mod tests {
                     Some(p) => permuted_sorted_rows(&matrix, p),
                     None => csr_sorted_rows(&matrix),
                 };
-                let initial: Vec<Vec<u32>> =
-                    rows.iter().map(|r| r.live_cols().to_vec()).collect();
+                let initial: Vec<Vec<u32>> = rows.iter().map(|r| r.live_cols().to_vec()).collect();
 
                 // EXPENSIVE ROUTE: materialise the whole fill pattern, then partition it.
                 let gate_clock = std::time::Instant::now();
                 let (_u, l_pattern) = symbolic_fill_pattern(n, &initial);
-                let widths = supernode_widths_from_symbolic(
-                    n,
-                    &l_pattern,
-                    SUPERNODAL_RELAXATION_TOLERANCE,
-                );
+                let widths =
+                    supernode_widths_from_symbolic(n, &l_pattern, SUPERNODAL_RELAXATION_TOLERANCE);
                 let in_wide: usize = widths.iter().filter(|&&w| w >= 8).sum();
                 let gate_nanos = gate_clock.elapsed().as_nanos();
 
@@ -15750,7 +15745,10 @@ mod tests {
                     .expect("scalar factorization");
                 let factor_nanos = factor_clock.elapsed().as_nanos();
 
-                assert!(gate_nanos > 0 && factor_nanos > 0, "{label}: degenerate timing");
+                assert!(
+                    gate_nanos > 0 && factor_nanos > 0,
+                    "{label}: degenerate timing"
+                );
                 assert!(lu.stored_nnz() > 0, "{label}: degenerate factor");
                 println!(
                     "decline_cost {label} {ordering:?}: symbolic_ms={:.3} etree_ms={:.3} \
@@ -15763,7 +15761,11 @@ mod tests {
                     etree_nanos as f64 / factor_nanos as f64,
                     in_wide as f64 / n as f64,
                     etree_in_wide as f64 / n as f64,
-                    if in_wide as f64 / n as f64 >= 0.10 { "ACCEPT" } else { "DECLINE" },
+                    if in_wide as f64 / n as f64 >= 0.10 {
+                        "ACCEPT"
+                    } else {
+                        "DECLINE"
+                    },
                 );
             }
         }
@@ -15797,16 +15799,14 @@ mod tests {
                     Some(p) => permuted_sorted_rows(&matrix, p),
                     None => csr_sorted_rows(&matrix),
                 };
-                let initial: Vec<Vec<u32>> =
-                    rows.iter().map(|r| r.live_cols().to_vec()).collect();
+                let initial: Vec<Vec<u32>> = rows.iter().map(|r| r.live_cols().to_vec()).collect();
                 let (u_pattern, _l_pattern) = symbolic_fill_pattern(n, &initial);
 
                 // The widths the SHIPPING planner emits, not the pattern-based ones.
                 let perm_for_tree: Vec<usize> =
                     fill_perm.clone().unwrap_or_else(|| (0..n).collect());
                 let parent = elimination_tree_of_permuted(&matrix, &perm_for_tree);
-                let (counts, _total) =
-                    l_column_counts_from_etree(&matrix, &perm_for_tree, &parent);
+                let (counts, _total) = l_column_counts_from_etree(&matrix, &perm_for_tree, &parent);
                 let widths = supernode_widths_from_etree(
                     n,
                     &parent,
@@ -17742,8 +17742,16 @@ mod tests {
         // arm choice ranges over, at matched n where possible, because a single cell's run
         // length has already been quoted for the whole crate once.
         for (label, cell, ordering) in [
-            ("cubic side=16 rcm", splu_dirichlet_laplacian_3d(16), PermutationOrdering::Colamd),
-            ("cubic side=16 amd", splu_dirichlet_laplacian_3d(16), PermutationOrdering::Amd),
+            (
+                "cubic side=16 rcm",
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Colamd,
+            ),
+            (
+                "cubic side=16 amd",
+                splu_dirichlet_laplacian_3d(16),
+                PermutationOrdering::Amd,
+            ),
             (
                 "convection side=64 rcm",
                 convection_diffusion_2d_probe(64),
@@ -17756,8 +17764,8 @@ mod tests {
             ),
         ] {
             let _ = take_merge_shape();
-            let factored = NativeSparseLu::factorize_csr(&cell, 1.0, ordering)
-                .expect("survey factorization");
+            let factored =
+                NativeSparseLu::factorize_csr(&cell, 1.0, ordering).expect("survey factorization");
             let survey = take_merge_shape();
             let elements = survey.run_elements + survey.target_only + survey.tail_only;
             assert!(

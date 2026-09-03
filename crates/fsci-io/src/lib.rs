@@ -5,7 +5,6 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::neg_cmp_op_on_partial_ord)]
 #![allow(clippy::type_complexity)]
-
 #![forbid(unsafe_code)]
 // Numeric kernels: fixture vectors, deliberate min/max comparisons, and helper
 // aliases kept for the variants these modules can be switched to.
@@ -14,7 +13,6 @@
 #![allow(unused_variables)]
 #![allow(clippy::min_max)]
 #![allow(clippy::absurd_extreme_comparisons)]
-
 
 //! Input/Output routines for FrankenSciPy.
 //!

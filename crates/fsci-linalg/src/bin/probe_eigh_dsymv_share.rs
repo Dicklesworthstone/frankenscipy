@@ -72,7 +72,11 @@ fn median(mut v: Vec<f64>) -> f64 {
     if n == 0 {
         return f64::NAN;
     }
-    if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
 }
 
 fn pct(mut v: Vec<f64>, p: f64) -> f64 {
@@ -149,7 +153,11 @@ fn main() {
             .collect();
         let total = stage.iter().sum::<f64>();
         println!("mode=stages n={n} reps={reps} wall_total_ms={wall:.3} stage_sum_ms={total:.3}");
-        let names = ["reduce(tridiagonalize)", "solve(tridiagonal)", "back_transform"];
+        let names = [
+            "reduce(tridiagonalize)",
+            "solve(tridiagonal)",
+            "back_transform",
+        ];
         for (i, name) in names.iter().enumerate() {
             println!(
                 "  stage[{i}] {name:<24} {:9.3} ms  {:5.2}% of stage_sum",
@@ -247,11 +255,7 @@ fn main() {
         null_gather.push(g[0] / g[1]);
     }
 
-    let ratios: Vec<f64> = serial
-        .iter()
-        .zip(&gather)
-        .map(|(s, g)| s / g)
-        .collect();
+    let ratios: Vec<f64> = serial.iter().zip(&gather).map(|(s, g)| s / g).collect();
 
     println!("mode=ab n={n} rounds={rounds} arm={arm_name} warm_checksum={warm:.6}");
     if arm == Arm::Split {

@@ -12776,8 +12776,7 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
     // shape that cost 13% in fsci-sparse's merge; hoisting them further would mean
     // threading state through `symmetric_tridiagonalize_native` for no measurable gain.
     let t_gather = eigh_reduce_substage_start();
-    let split_accumulate = EIGH_DSYMV_SPLIT_ACCUMULATE
-        .load(std::sync::atomic::Ordering::Relaxed)
+    let split_accumulate = EIGH_DSYMV_SPLIT_ACCUMULATE.load(std::sync::atomic::Ordering::Relaxed)
         && active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE;
     if split_accumulate {
         EIGH_DSYMV_SPLIT_ACCUMULATE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12795,31 +12794,31 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
         );
         eigh_reduce_substage_record(0, t_gather);
     } else {
-    let parallel_gather = EIGH_DSYMV_PARALLEL_GATHER.load(std::sync::atomic::Ordering::Relaxed)
-        && active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE;
-    if parallel_gather {
-        let nthreads = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1)
-            .min(active / EIGH_DSYMV_PARALLEL_MIN_ROWS_PER_THREAD)
-            .max(1);
-        symmetric_lower_matvec_double_read_gather_parallel(
-            data,
-            n,
-            start,
-            &reflector.values,
-            p,
-            nthreads,
-        );
-    } else if EIGH_DSYMV_FORCE_DOUBLE_READ.load(std::sync::atomic::Ordering::Relaxed) {
-        symmetric_lower_matvec_double_read(data, n, start, &reflector.values, p);
-    } else if !EIGH_DSYMV_FORCE_SCALAR.load(std::sync::atomic::Ordering::Relaxed) {
-        symmetric_lower_matvec_one_pass_simd(data, n, start, &reflector.values, p);
-    } else {
-        symmetric_lower_matvec_one_pass(data, n, start, &reflector.values, p);
-    }
+        let parallel_gather = EIGH_DSYMV_PARALLEL_GATHER.load(std::sync::atomic::Ordering::Relaxed)
+            && active >= EIGH_DSYMV_PARALLEL_MIN_ACTIVE;
+        if parallel_gather {
+            let nthreads = std::thread::available_parallelism()
+                .map(std::num::NonZero::get)
+                .unwrap_or(1)
+                .min(active / EIGH_DSYMV_PARALLEL_MIN_ROWS_PER_THREAD)
+                .max(1);
+            symmetric_lower_matvec_double_read_gather_parallel(
+                data,
+                n,
+                start,
+                &reflector.values,
+                p,
+                nthreads,
+            );
+        } else if EIGH_DSYMV_FORCE_DOUBLE_READ.load(std::sync::atomic::Ordering::Relaxed) {
+            symmetric_lower_matvec_double_read(data, n, start, &reflector.values, p);
+        } else if !EIGH_DSYMV_FORCE_SCALAR.load(std::sync::atomic::Ordering::Relaxed) {
+            symmetric_lower_matvec_one_pass_simd(data, n, start, &reflector.values, p);
+        } else {
+            symmetric_lower_matvec_one_pass(data, n, start, &reflector.values, p);
+        }
 
-    eigh_reduce_substage_record(0, t_gather);
+        eigh_reduce_substage_record(0, t_gather);
     }
 
     // The scalar A/B arm covers the entire `dsyr2` preparation, not merely the
@@ -12886,8 +12885,8 @@ fn apply_symmetric_householder_trailing_rank2_lower_storage(
         EIGH_RANK2_UPDATE_PARALLEL_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Imported in the narrowest scope that needs it: the crate uses `rayon::scope`
         // elsewhere and does not carry the prelude at module level.
-        use rayon::slice::ParallelSliceMut as _;
         use rayon::iter::{IndexedParallelIterator as _, ParallelIterator as _};
+        use rayon::slice::ParallelSliceMut as _;
         let values = &reflector.values;
         // TASK GRANULARITY IS THE WHOLE GAME HERE, and getting it wrong is what a first
         // attempt measured: one chunk PER COLUMN gives up to `active` tasks for a step
@@ -25188,7 +25187,13 @@ mod tests {
         let reflector = HouseholderReflector {
             start,
             values: (0..active)
-                .map(|i| if i % 41 == 0 { 0.0 } else { (i as f64 * 0.011).sin() })
+                .map(|i| {
+                    if i % 41 == 0 {
+                        0.0
+                    } else {
+                        (i as f64 * 0.011).sin()
+                    }
+                })
                 .collect(),
             tau: 0.55,
         };
@@ -25228,7 +25233,10 @@ mod tests {
         );
 
         let scale = p_serial.iter().fold(0.0f64, |acc, v| acc.max(v.abs()));
-        assert!(scale > 0.0, "the matvec produced an all-zero p; comparison vacuous");
+        assert!(
+            scale > 0.0,
+            "the matvec produced an all-zero p; comparison vacuous"
+        );
 
         // MUST-MISS the bit test: this arm is expected to differ somewhere, so assert that it
         // DOES. If it were bit-identical the tolerance claim would be untested.
@@ -25301,7 +25309,13 @@ mod tests {
         let reflector = HouseholderReflector {
             start,
             values: (0..active)
-                .map(|i| if i % 31 == 0 { 0.0 } else { (i as f64 * 0.017).cos() })
+                .map(|i| {
+                    if i % 31 == 0 {
+                        0.0
+                    } else {
+                        (i as f64 * 0.017).cos()
+                    }
+                })
                 .collect(),
             tau: 0.63,
         };

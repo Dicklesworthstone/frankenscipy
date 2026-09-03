@@ -4168,8 +4168,7 @@ pub static NNLS_GRAM_BLOCKED: std::sync::atomic::AtomicBool =
 /// The shipping arm never forms `AᵀA`: it maintains the passive factorization as columns enter
 /// and uses Givens rotations to downdate it when a trial least-squares solution expels columns.
 /// This avoids both the normal-equations conditioning penalty and the dense Gram precompute.
-pub static NNLS_DIRECT_QR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+pub static NNLS_DIRECT_QR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Counts NNLS calls that entered the direct QR arm. The perf driver checks this around both
 /// arms so an apparently clean A/B cannot be a switch wired to nothing.
@@ -4362,10 +4361,18 @@ fn nnls_direct_qr(a: &[Vec<f64>], b: &[f64], n: usize) -> Result<(Vec<f64>, f64)
 
         for (row_index, row) in a.iter().enumerate() {
             residual[row_index] = b[row_index]
-                - row.iter().zip(x.iter()).map(|(&aij, &xj)| aij * xj).sum::<f64>();
+                - row
+                    .iter()
+                    .zip(x.iter())
+                    .map(|(&aij, &xj)| aij * xj)
+                    .sum::<f64>();
         }
     }
-    let residual_norm = residual.iter().map(|value| value * value).sum::<f64>().sqrt();
+    let residual_norm = residual
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>()
+        .sqrt();
     Ok((x, residual_norm))
 }
 

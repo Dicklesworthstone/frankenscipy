@@ -1,7 +1,6 @@
 // The parity tests below compare our constants against scipy's published literals
 // on purpose; substituting the std constant would make the check self-referential.
 #![allow(clippy::approx_constant)]
-
 #![forbid(unsafe_code)]
 
 //! Physical and mathematical constants for FrankenSciPy.
