@@ -14,15 +14,15 @@
 //! wrong arithmetic:
 //!
 //!   * `cholesky_banded`   — banded storage is a convention (upper vs lower packing, which
-//!diagonal sits in which row); a transposed packing still
-//!produces a plausible triangular factor.
+//!     diagonal sits in which row); a transposed packing still
+//!     produces a plausible triangular factor.
 //!   * `eigvals_banded`    — same storage question, plus ordering: SciPy returns ascending.
 //!   * `diagsvd`           — pure shape/placement; wrong only if m/n are swapped.
 //!   * `pinvh`             — needs a matrix with a genuinely small eigenvalue, or the
-//!cutoff logic is never exercised and any pinv looks right.
+//!     cutoff logic is never exercised and any pinv looks right.
 //!   * `orthogonal_procrustes` — the returned R is only unique up to the sign convention
-//!SciPy's SVD picks; also returns a scale that is easy to define
-//!differently.
+//!     SciPy's SVD picks; also returns a scale that is easy to define
+//!     differently.
 //!
 //! REPORTING. Every case prints `max_abs` and `max_rel` against SciPy's own output plus a
 //! verdict, and the run exits non-zero if any case exceeds its tolerance, so this is a

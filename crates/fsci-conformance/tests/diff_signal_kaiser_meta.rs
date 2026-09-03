@@ -9,6 +9,7 @@
 //!   - kaiser_atten: 6 (numtaps, width) cases × 4 widths = 24
 //!   - kaiser_beta : 8 attenuation values spanning the three
 //!     branches plus boundaries
+//!
 //! through scipy via subprocess oracle and asserts byte-stable
 //! agreement at tol 1e-12. Skips cleanly if scipy/python3 is
 //! unavailable.
