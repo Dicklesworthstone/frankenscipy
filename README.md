@@ -1073,7 +1073,7 @@ Eleven invariants that the workspace commits to and the CI gates enforce:
 3. **Rust 2024 edition, nightly toolchain**, pinned via `rust-toolchain.toml`.
 4. **`cargo fmt --check`** passes on every commit.
 5. **`cargo clippy --workspace --all-targets -- -D warnings`** passes; pedantic + nursery lints are enforced.
-6. **`cargo doc` is warning-free**; math notation in doc comments must be backtick-wrapped, generic parameters must be backtick-wrapped.
+6. **`cargo doc` is kept warning-free by convention** (math notation and generic parameters in doc comments are backtick-wrapped); it is not a CI gate today.
 7. **No tolerance contract is ever loosened.** CI gate G9 (`tolerance_lint`) fails the build on weakening.
 8. **No schema is ever broken silently.** CI gate G7 validates the three contract schemas against every packet.
 9. **No artifact ships without a RaptorQ sidecar.** CI gate G8 verifies the decode proof.
@@ -1288,20 +1288,19 @@ The textbook recommendation (Higham, *Functions of Matrices*) is Padé-13 with s
 
 The Taylor route is chosen because (a) **it has no internal solve**, so it cannot itself trigger a CASP fallback while you're trying to compute `expm`; (b) on the conditioning regimes where matrix functions are typically called (well-conditioned matrices, mostly), the looser error bound is well within the tolerance contract; (c) the smaller code surface is easier to audit. Future work (tracked in beads) will benchmark a Padé switch for the `‖A‖_1 ≫ 1` regime where Taylor's 20 multiplications become expensive.
 
-#### Why `eigsh` uses deflated power iteration instead of Lanczos
+#### Why `eigsh` uses a single Lanczos subspace instead of implicit restarts
 
-SciPy's `eigsh` uses ARPACK's Implicitly Restarted Lanczos Method (IRLM). FrankenSciPy uses deflated power iteration. The trade-off:
+SciPy's `eigsh` uses ARPACK's Implicitly Restarted Lanczos Method (IRLM). FrankenSciPy's first kernel was deflated power iteration (whose constant-seed failure on path Laplacians is one of the **Case Studies**); it now runs symmetric Lanczos through the shared Krylov/Arnoldi solver with one subspace of `max(2k+1, 20)` vectors, SciPy's own `ncv` default. The trade-off that remains:
 
-| Property | IRLM | Deflated power iteration |
+| Property | IRLM (ARPACK) | Single-subspace Lanczos (FrankenSciPy) |
 |---|---|---|
-| Convergence rate | Cubic | Linear |
-| Code complexity | Very high (Krylov-subspace reorthogonalization, shift selection) | Low |
-| Performance on `k = 1` | Best | Comparable |
-| Performance on `k ≫ 1` | Excellent | Poor |
-| Numerical robustness on ill-conditioned spectrum | Depends on shift | Strong if seeded well |
+| Convergence on well-separated extreme eigenpairs | Excellent | Excellent; the subspace resolves them in `O(m)` matvecs |
+| Clustered or interior spectra | Restarts until converged | Reports `converged = false` from the Ritz residuals rather than looping |
+| Code complexity | Very high (restart, shift selection, deflation bookkeeping) | Moderate; shares the Arnoldi kernel used by `eigs` |
+| Performance on `k ≤ 6` | Best | Competitive (the live sparse benchmark uses an 18-vector window at `k = 6`) |
 | `#![forbid(unsafe_code)]` compatibility | Easy | Easy |
 
-Deflated power iteration is the right starting point: it ports cleanly into safe Rust, it converges robustly when seeded correctly (the `br-oyy7` LCG seed fix is the entire numerical story), and the performance is competitive for the small-`k` case that dominates real usage. A future IRLM kernel is on the V1.0+ roadmap; the API surface is stable so callers don't see the swap.
+Implicit restarts are the remaining gap and are not on any bead; the API surface is stable so callers would not see that swap either.
 
 #### Why CG uses no internal restarting
 
