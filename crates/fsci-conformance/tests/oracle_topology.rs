@@ -94,6 +94,18 @@ const ORACLE_EXEMPT: &[(&str, &str)] = &[
         "P2C-018",
         "Signal live-SciPy diff emits per-case diff artifacts and skips when SciPy is unavailable, not consolidated oracle_capture.json",
     ),
+    (
+        "P2C-007",
+        "Array API parity lane uses numpy-referenced creation helpers and self-check contracts (no diff_arrayapi test imports scipy), not a consolidated oracle_capture.json",
+    ),
+    (
+        "P2C-012",
+        "Stats family runs per-case live oracles through scipy_oracle_command inside its 250+ diff_* lanes, not a consolidated packet capture",
+    ),
+    (
+        "P2C-015",
+        "Ndimage family runs per-case live scipy oracles embedded in its diff_* lanes, not a consolidated packet capture",
+    ),
 ];
 
 #[test]

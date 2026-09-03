@@ -127,22 +127,26 @@ fn g6_workflow_invokes_all_listed_perf_tests() -> TestResult {
         )
     })?;
 
-    let mut missing: Vec<&str> = Vec::new();
-    for test_name in G6_PERF_TESTS {
-        if !g6_block.contains(test_name) {
-            missing.push(test_name);
-        }
+    // Since frankenscipy-liel6 the G6 job discovers perf tests with a glob loop
+    // (`for f in crates/fsci-conformance/tests/perf_*.rs`) instead of a literal
+    // per-test list, so the workflow contract is "the glob loop is present and
+    // each discovered file is run via `cargo test --test`". The file-set side of
+    // that contract is guarded by `every_perf_test_in_g6_or_excluded` above.
+    if !g6_block.contains("crates/fsci-conformance/tests/perf_*.rs") {
+        return Err(
+            "G6 job no longer runs the perf_*.rs glob loop; every perf test must \
+             stay wired into CI G6. Restore the loop or update this topology test \
+             to the new invocation shape."
+                .into(),
+        );
     }
-
-    if !missing.is_empty() {
-        missing.sort();
-        return Err(format!(
-            "G6_PERF_TESTS entries not invoked by the CI g6-perf job:\n  {}\n\n\
-             Update .github/workflows/ci.yml or G6_PERF_TESTS so the topology \
-             test verifies the actual workflow contract.",
-            missing.join("\n  ")
-        )
-        .into());
+    if !g6_block.contains("cargo test -p fsci-conformance --test") {
+        return Err(
+            "G6 job no longer runs the discovered perf tests via \
+             `cargo test -p fsci-conformance --test`; verify how perf tests are \
+             invoked and update this topology test."
+                .into(),
+        );
     }
 
     Ok(())
