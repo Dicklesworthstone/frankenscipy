@@ -94,60 +94,57 @@ fn finite_or_sentinel(v: f64) -> f64 {
 }
 
 fn generate_query() -> OracleQuery {
-    let mut points = Vec::new();
-
-    // 4-node weighted directed graph with a clear shortest-path structure.
-    points.push(PointCase {
-        case_id: "4node_directed".into(),
-        n: 4,
-        edges: vec![
-            (0, 1, 1.0),
-            (0, 2, 5.0),
-            (1, 2, 2.0),
-            (1, 3, 4.0),
-            (2, 3, 1.0),
-        ],
-        directed: true,
-    });
-
-    // 5-node undirected graph: symmetric edges.
-    points.push(PointCase {
-        case_id: "5node_undirected".into(),
-        n: 5,
-        edges: vec![
-            (0, 1, 3.0),
-            (0, 2, 8.0),
-            (1, 2, 2.0),
-            (1, 3, 5.0),
-            (2, 3, 1.0),
-            (3, 4, 4.0),
-            (2, 4, 7.0),
-        ],
-        directed: false,
-    });
-
-    // 3-node fully connected with small weights.
-    points.push(PointCase {
-        case_id: "3node_dense_directed".into(),
-        n: 3,
-        edges: vec![
-            (0, 1, 1.5),
-            (0, 2, 4.0),
-            (1, 0, 2.0),
-            (1, 2, 1.0),
-            (2, 0, 3.0),
-            (2, 1, 0.5),
-        ],
-        directed: true,
-    });
-
-    // 4-node with a disconnected component.
-    points.push(PointCase {
-        case_id: "4node_disconnected".into(),
-        n: 4,
-        edges: vec![(0, 1, 1.0), (1, 0, 1.0), (2, 3, 2.0), (3, 2, 2.0)],
-        directed: true,
-    });
+    let points = vec![
+        // 4-node weighted directed graph with a clear shortest-path structure.
+        PointCase {
+            case_id: "4node_directed".into(),
+            n: 4,
+            edges: vec![
+                (0, 1, 1.0),
+                (0, 2, 5.0),
+                (1, 2, 2.0),
+                (1, 3, 4.0),
+                (2, 3, 1.0),
+            ],
+            directed: true,
+        },
+        // 5-node undirected graph: symmetric edges.
+        PointCase {
+            case_id: "5node_undirected".into(),
+            n: 5,
+            edges: vec![
+                (0, 1, 3.0),
+                (0, 2, 8.0),
+                (1, 2, 2.0),
+                (1, 3, 5.0),
+                (2, 3, 1.0),
+                (3, 4, 4.0),
+                (2, 4, 7.0),
+            ],
+            directed: false,
+        },
+        // 3-node fully connected with small weights.
+        PointCase {
+            case_id: "3node_dense_directed".into(),
+            n: 3,
+            edges: vec![
+                (0, 1, 1.5),
+                (0, 2, 4.0),
+                (1, 0, 2.0),
+                (1, 2, 1.0),
+                (2, 0, 3.0),
+                (2, 1, 0.5),
+            ],
+            directed: true,
+        },
+        // 4-node with a disconnected component.
+        PointCase {
+            case_id: "4node_disconnected".into(),
+            n: 4,
+            edges: vec![(0, 1, 1.0), (1, 0, 1.0), (2, 3, 2.0), (3, 2, 2.0)],
+            directed: true,
+        },
+    ];
 
     OracleQuery { points }
 }

@@ -95,63 +95,56 @@ fn time_grid(n: usize, half_width: f64) -> Vec<f64> {
 }
 
 fn generate_cases() -> Vec<GauspulsCase> {
-    let mut cases = Vec::new();
-
-    // Default scipy params: fc=1000, bw=0.5, bwr=-6.
-    cases.push(GauspulsCase {
-        case_id: "default_1000_0p5_neg6".into(),
-        fc: 1000.0,
-        bw: 0.5,
-        bwr: -6.0,
-        t: time_grid(33, 0.001),
-    });
-
-    // Wider bandwidth.
-    cases.push(GauspulsCase {
-        case_id: "wide_bw".into(),
-        fc: 500.0,
-        bw: 1.0,
-        bwr: -6.0,
-        t: time_grid(33, 0.002),
-    });
-
-    // Narrow bandwidth.
-    cases.push(GauspulsCase {
-        case_id: "narrow_bw".into(),
-        fc: 2000.0,
-        bw: 0.2,
-        bwr: -6.0,
-        t: time_grid(33, 0.0005),
-    });
-
-    // Stronger -bwr (deeper Gaussian envelope).
-    cases.push(GauspulsCase {
-        case_id: "deep_envelope_neg20".into(),
-        fc: 1000.0,
-        bw: 0.5,
-        bwr: -20.0,
-        t: time_grid(33, 0.001),
-    });
-
-    // High frequency.
-    cases.push(GauspulsCase {
-        case_id: "high_fc".into(),
-        fc: 1.0e5,
-        bw: 0.5,
-        bwr: -6.0,
-        t: time_grid(33, 1.0e-5),
-    });
-
-    // Low frequency.
-    cases.push(GauspulsCase {
-        case_id: "low_fc".into(),
-        fc: 10.0,
-        bw: 0.5,
-        bwr: -6.0,
-        t: time_grid(33, 0.1),
-    });
-
-    cases
+    vec![
+        // Default scipy params: fc=1000, bw=0.5, bwr=-6.
+        GauspulsCase {
+            case_id: "default_1000_0p5_neg6".into(),
+            fc: 1000.0,
+            bw: 0.5,
+            bwr: -6.0,
+            t: time_grid(33, 0.001),
+        },
+        // Wider bandwidth.
+        GauspulsCase {
+            case_id: "wide_bw".into(),
+            fc: 500.0,
+            bw: 1.0,
+            bwr: -6.0,
+            t: time_grid(33, 0.002),
+        },
+        // Narrow bandwidth.
+        GauspulsCase {
+            case_id: "narrow_bw".into(),
+            fc: 2000.0,
+            bw: 0.2,
+            bwr: -6.0,
+            t: time_grid(33, 0.0005),
+        },
+        // Stronger -bwr (deeper Gaussian envelope).
+        GauspulsCase {
+            case_id: "deep_envelope_neg20".into(),
+            fc: 1000.0,
+            bw: 0.5,
+            bwr: -20.0,
+            t: time_grid(33, 0.001),
+        },
+        // High frequency.
+        GauspulsCase {
+            case_id: "high_fc".into(),
+            fc: 1.0e5,
+            bw: 0.5,
+            bwr: -6.0,
+            t: time_grid(33, 1.0e-5),
+        },
+        // Low frequency.
+        GauspulsCase {
+            case_id: "low_fc".into(),
+            fc: 10.0,
+            bw: 0.5,
+            bwr: -6.0,
+            t: time_grid(33, 0.1),
+        },
+    ]
 }
 
 fn scipy_oracle_or_skip(cases: &[GauspulsCase]) -> Vec<GauspulsOracleResult> {
