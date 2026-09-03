@@ -44,8 +44,10 @@
 //!
 //! A test submitting per-iteration `chunks_mut` across batches fails to compile:
 //!
-//!     error[E0499]: cannot borrow `buf` as mutable more than once at a time
-//!       `buf` was mutably borrowed here in the previous iteration of the loop
+//! ```text
+//! error[E0499]: cannot borrow `buf` as mutable more than once at a time
+//!   `buf` was mutably borrowed here in the previous iteration of the loop
+//! ```
 //!
 //! `run_batch` blocks and drops every box before returning, so the borrows really
 //! are over — but the TYPE cannot say so, and no amount of arranging the call site

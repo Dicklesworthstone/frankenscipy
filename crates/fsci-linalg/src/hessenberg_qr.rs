@@ -19,8 +19,10 @@
 //! trailing-2x2 shift and substitutes an EXCEPTIONAL shift built from the local
 //! subdiagonal magnitude, with the published constants
 //!
-//!     DAT1 =  3/4    = 0.75
-//!     DAT2 = -7/16   = -0.4375
+//! ```text
+//! DAT1 =  3/4    = 0.75
+//! DAT2 = -7/16   = -0.4375
+//! ```
 //!
 //! (cited from dlahqr's parameter block, which is not vendored in this repo — the
 //! constants are quoted from the published routine, not read off a file here, and

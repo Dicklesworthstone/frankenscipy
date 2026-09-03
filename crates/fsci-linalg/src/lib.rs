@@ -1769,6 +1769,22 @@ fn solve_qr(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError> {
 }
 
 fn solve_svd_fallback(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError> {
+    // nalgebra's SVD cannot see a NaN: its internal pivot ordering hits an
+    // unwrap panic (svd.rs) long before the singular values are read. Strict
+    // mode with `check_finite = false` deliberately passes non-finite input
+    // through, and CASP routes the NaN rcond to this fallback, so the
+    // scipy-parity behavior is IEEE passthrough — a NaN solution vector, which
+    // is what LAPACK dgesv would emit for a NaN system (frankenscipy-grkz2).
+    if a.iter().flatten().any(|v| !v.is_finite()) || b.iter().any(|v| !v.is_finite()) {
+        return Ok(SolveResult {
+            x: vec![f64::NAN; b.len()],
+            warning: Some(LinalgWarning::IllConditioned {
+                reciprocal_condition: 0.0,
+            }),
+            backward_error: None,
+            certificate: None,
+        });
+    }
     let matrix = dmatrix_from_rows(a)?;
     let rhs = DVector::from_column_slice(b);
     let svd = safe_svd(matrix.clone(), true, true)?;
@@ -11680,8 +11696,10 @@ pub static EIGH_INVERSE_ITERATIONS_SKIPPED: std::sync::atomic::AtomicUsize =
 /// **MEASURED 1.661x, RANGES DISJOINT — SHIPS ON.** Four replicates alternated ABBA in one
 /// window at n=768, arm proven by `EIGH_INVERSE_INTERLEAVE_HITS` reading 28,416 against 0:
 ///
-///     interleave ON   eigenvectors median 14.82 ms   range [14.40, 15.11]
-///     interleave OFF                median 24.61 ms   range [24.22, 24.72]
+/// ```text
+/// interleave ON   eigenvectors median 14.82 ms   range [14.40, 15.11]
+/// interleave OFF                median 24.61 ms   range [24.22, 24.72]
+/// ```
 ///
 /// Predicted ~1.2x from a cycle count of the recurrence and delivered 1.661x, the same way
 /// the back-transform interleave beat its own estimate. Interleaving independent chains is
@@ -11873,7 +11891,10 @@ pub static EIGH_BACKTRANSFORM_LAST_PANELS: std::sync::atomic::AtomicUsize =
 /// The A/B arm for the blocking itself, so blocked and unblocked live in ONE binary and can
 /// be alternated inside a single window. Comparing them across two builds is what made the
 /// first reading of this lever unusable: the unblocked figure came from a quiet window and
-/// the blocked one from a window at loadavg 63.
+/// the blocked one from a window at loadavg 63. CONTRACT: the blocked compact-WY arm
+/// agrees with the scalar replay it replaces to 1e-9 * scale * sqrt(n) — pinned by
+/// `compact_wy_backtransform_matches_scalar_replay_contract` (the replay is an
+/// unblocked reassociation, so the bound is a measured tolerance, not bit-identity).
 pub static EIGH_BACKTRANSFORM_BLOCKED_ENABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
@@ -11983,7 +12004,9 @@ pub static EIGH_BACKTRANSFORM_PANEL_KBLOCK_HITS: std::sync::atomic::AtomicUsize 
 ///
 /// `[0]` gather (`p = A·v`), `[1]` rank-2 update (`A -= v·wᵀ + w·vᵀ`). Reported as shares;
 /// `Instant::now()` per reflector is instrumentation and the absolute nanoseconds are not a
-/// timing claim.
+/// timing claim. CONTRACT: BIT-IDENTICAL either way — the toggle gates
+/// `Instant::now()` capture and nanosecond accumulation only and touches no
+/// arithmetic, so both arms return the same eigenpairs to the last bit.
 pub static EIGH_REDUCE_SUBSTAGE_TIMING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Accumulated nanoseconds: `[0]` gather, `[1]` rank-2 update.
@@ -11997,6 +12020,9 @@ pub static EIGH_REDUCE_SUBSTAGE_TIMING: std::sync::atomic::AtomicBool =
 /// tridiagonal solve. So the question is which half carries it.
 ///
 /// `[0]` eigenvalues (`eigh_tridiagonal`), `[1]` eigenvectors (inverse iteration).
+/// CONTRACT: BIT-IDENTICAL either way — the toggle gates `Instant::now()`
+/// capture and nanosecond accumulation only and touches no arithmetic, so both
+/// arms return the same eigenpairs to the last bit.
 pub static EIGH_SOLVE_SUBSTAGE_TIMING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Accumulated nanoseconds: `[0]` eigenvalues, `[1]` eigenvectors.
@@ -14776,6 +14802,10 @@ pub static EIGH_DSYMV_PARALLEL_GATHER: std::sync::atomic::AtomicBool =
 /// Same-ELF A/B control for the portable-SIMD one-pass dsymv used by dense
 /// `eigh` tridiagonalisation. Defaults off so the production path uses SIMD;
 /// setting it restores the scalar loop with the same operand order.
+/// CONTRACT: BIT-IDENTICAL with the SIMD arm — same operand order is the
+/// invariant, and the in-crate contract test flips the lever over a fixture
+/// sized above the work gate and asserts `to_bits` equality on the matvec
+/// result and on the downstream rank-2 update.
 #[doc(hidden)]
 pub static EIGH_DSYMV_FORCE_SCALAR: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
