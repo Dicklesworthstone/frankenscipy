@@ -10,16 +10,18 @@
   <img src="https://img.shields.io/badge/unsafe-%23!%5Bforbid(unsafe__code)%5D-brightgreen.svg" alt="No unsafe code">
   <img src="https://img.shields.io/badge/async-asupersync%20(no%20tokio)-purple.svg" alt="asupersync, no tokio">
   <img src="https://img.shields.io/badge/workspace-19%20crates-informational.svg" alt="19 workspace crates">
-  <img src="https://img.shields.io/badge/conformance-767%20test%20files-success.svg" alt="767 conformance test files">
+  <img src="https://img.shields.io/badge/conformance-796%20test%20files-success.svg" alt="796 conformance test files">
 </p>
 
 > **FrankenSciPy is a clean-room Rust reimplementation of SciPy's core numerical
 > routines with a Condition-Aware Solver Portfolio (CASP) at its center.**
-> Every solve, decomposition, transform, optimization, and integration goes
-> through a runtime that inspects matrix conditioning, sparsity, stiffness,
-> and convergence behavior, then picks an algorithm that minimizes expected
-> loss against a calibrated 5×4 decision matrix, and emits an audit trail
-> proving the decision was justified.
+> The dense linear-solve family (`solve_with_casp`, `solve_with_audit`,
+> `lstsq_with_casp` and their siblings in `fsci-linalg`) goes through a runtime
+> that probes matrix conditioning and structure, picks the solver that minimizes
+> expected loss against a calibrated 5×4 decision matrix, falls back on failure,
+> and returns a certificate proving the decision was justified. The sparse,
+> optimize and special crates carry their own rule-based selectors that record a
+> rationale; wiring them onto the same loss-matrix machinery is roadmap work.
 
 ---
 
@@ -48,9 +50,9 @@ FrankenSciPy reimplements the SciPy surface in idiomatic Rust with three guarant
 |---|---|---|---|---|
 | Memory safety | C/Fortran kernels | safe Rust | safe Rust | **`#![forbid(unsafe_code)]`** workspace-wide |
 | Async runtime | N/A (Python) | N/A | tokio-leaning | **asupersync** (no tokio) |
-| Surface area | 1437 symbols | low-level only | optimization or ML focus | **750+ functions across 19 domain crates** |
-| Algorithm selection | hand-rolled per routine | manual | manual | **CASP runtime portfolio** with audit trail |
-| Conformance against SciPy | self-checking | none | partial | **15 Python oracles, 767 differential test files** |
+| Surface area | ~1,300 callable symbols | low-level only | optimization or ML focus | **1,194 same-named public equivalents across 19 crates** (name census; see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)) |
+| Algorithm selection | hand-rolled per routine | manual | manual | **CASP runtime portfolio** with audit trail on the dense solve family; rule-based selectors elsewhere |
+| Conformance against SciPy | self-checking | none | partial | **15 Python oracles, 731 differential test files** that resolve a live SciPy interpreter at test time |
 | Distribution moments | partial closed-forms | none | none | **95+ continuous, 10+ discrete, explicit `skewness`/`kurtosis`/`entropy`** |
 | Numerical-stability contract | implicit | implicit | implicit | **Stability outranks speed; tolerance contracts cannot be weakened** |
 | Artifact durability | none | none | none | **RaptorQ systematic encoding for conformance/benchmark/reproducibility bundles** |
@@ -80,7 +82,7 @@ For a linear solve, CASP:
 4. **Emits an audit event** containing the chosen action, the evidence that drove it, the posterior, the expected loss versus each alternative, and a fingerprint that ties the decision to its inputs.
 5. **Falls back** automatically if the primary solver fails. The failure becomes evidence, the calibrator updates, and the next action is chosen against the same loss matrix with the new posterior.
 
-The same machinery runs in `fsci-sparse` for iterative-solver dispatch (CG vs. BiCGSTAB vs. GMRES vs. LGMRES vs. MINRES vs. QMR), in `fsci-opt` for `minimize` method selection, and in `fsci-special` for branch selection inside `hyp1f1` and `hyp2f1`.
+Three other crates ship selectors that share the CASP name but not its machinery today: `fsci_sparse::select_casp_iterative_solver` (CG / MINRES / LGMRES / BiCGSTAB / QMR / GMRES / LSQR / LSMR from symmetry, diagonal dominance, density and matvec cost), `fsci_opt::select_minimize_method` (constraint and gradient availability, dimension, scaling), and `fsci_special::select_hypergeometric_branch` (series / transformation / continued-fraction branches for `0F1`, `1F1`, `2F1`). Each returns a decision with a written rationale and validates its inputs under the strict/hardened mode split, but none of them consults a loss matrix, posterior, or calibrator. Only `fsci-linalg` does.
 
 **Stability outranks speed.** Tolerance contracts on scoped V1 routines are guarded by the conformance harness. No optimization may weaken them.
 
@@ -88,29 +90,29 @@ The same machinery runs in `fsci-sparse` for iterative-solver dispatch (CG vs. B
 
 ## Workspace at a Glance
 
-FrankenSciPy is a Cargo workspace of **19 crates** spanning ~140,000 lines of Rust source plus ~370,000 lines of tests, harnesses, and conformance fixtures.
+FrankenSciPy is a Cargo workspace of **19 crates** spanning ~610,000 lines under `crates/*/src` (implementation plus the inline `#[cfg(test)]` suites, which are the bulk of the larger crates; 10,057 `#[test]` functions in all), plus 796 integration-test files and the fixture tree in `fsci-conformance`. The line counts below are `wc -l` over each crate's `src/`, measured 2026-09-03.
 
 | Crate | Lines | Surface |
 |---|---|---|
-| [`fsci-linalg`](crates/fsci-linalg/) | ~12,100 | Dense and structured linear algebra; CASP solver selection; LU / QR / Cholesky / SVD / LDL / Schur / Hessenberg / QZ; `expm`, `logm`, `sqrtm`, `funm`, `signm`; Sylvester, Lyapunov, continuous and discrete Riccati; banded specialists; subspace and polar decompositions |
-| [`fsci-sparse`](crates/fsci-sparse/) | ~13,600 | CSR/CSC/COO/BSR/DIA/DOK/LIL formats; `spsolve`/`splu`/`spilu`; CG, GMRES (Arnoldi + Givens), LGMRES, BiCG, BiCGSTAB, CGS, QMR (look-ahead Lanczos), MINRES, LSQR, LSMR (CASP-dispatched); `eigs` via Arnoldi iteration on a Krylov subspace; `eigsh` via deflated power iteration with deterministic LCG seed (orthogonal to no eigenmode); `svds`; Dijkstra, Bellman-Ford, MST, BFS/DFS, connected components, PageRank, Reverse Cuthill-McKee, centrality |
-| [`fsci-integrate`](crates/fsci-integrate/) | ~9,400 | `solve_ivp` (RK23 / RK45 / DOP853 / BDF / Radau / LSODA); `odeint`; `solve_bvp`; `quad` family with Gauss-Kronrod adaptation; `dblquad`, `tplquad`, `nquad`, `cubature`; Romberg; Monte Carlo and QMC quadrature; sample-form rules |
-| [`fsci-interpolate`](crates/fsci-interpolate/) | ~6,300 | `interp1d`, `CubicSpline`, `CubicHermiteSpline`, `BSpline`, `Akima`, `PCHIP`; `RegularGridInterpolator`, `griddata`, `interpn`; Krogh, barycentric, polynomial helpers; `make_lsq_spline` for k = 1/3/5 |
-| [`fsci-opt`](crates/fsci-opt/) | ~15,100 | `minimize` portfolio: Nelder-Mead, BFGS, CG, Powell, L-BFGS-B, Newton-CG, TNC, COBYLA, SLSQP, trust-ncg / -krylov / -exact / -constr, dogleg; `root` family: brentq, brenth, ridder, toms748, newton, halley, broyden1/2, anderson, fsolve, lm_root; `curve_fit`, `least_squares`, NNLS, isotonic regression; global: DE, basinhopping, dual annealing, SHGO, PSO, brute; LP/MILP; `linear_sum_assignment` |
-| [`fsci-fft`](crates/fsci-fft/) | ~5,600 | Cooley-Tukey mixed-radix; Bluestein for non-power-of-2 lengths; `rfft`/`irfft`; n-D transforms (`fftn`/`ifftn`/`rfftn`/`irfftn`); DCT/DST I–IV (1-D and n-D); Hilbert analytic signal; FHT; fingerprinted plan cache with admission policy |
-| [`fsci-signal`](crates/fsci-signal/) | ~17,200 | Windows (Hann, Hamming, Kaiser, Tukey, Blackman, Taylor, exponential, general-Hamming…); filter design (`butter` / `cheby1` / `cheby2` / `ellip` / `bessel`, ZPK and BA forms, full `lp2{lp,hp,bp,bs}` and `lp2{lp,hp,bp,bs}_zpk` transforms, `bilinear` / `bilinear_zpk`); filter-order helpers `buttord` / `cheb1ord` / `cheb2ord` / `ellipord`; analog prototypes `buttap` and `cheb1ap`; `firwin`, `firls`, `remez`; `lfilter`, `filtfilt`, SOS application; `welch`, `periodogram`, `csd`, `coherence`; `find_peaks` with prominence and width; CWT; Daubechies / Morlet / Ricker wavelets; MFCC, mel filterbank, chroma |
-| [`fsci-spatial`](crates/fsci-spatial/) | ~5,600 | KDTree / cKDTree (`query`, `query_pairs`, `count_neighbors`); `pdist` / `cdist` / `distance_matrix` (Euclidean, Manhattan, Chebyshev, Minkowski, Mahalanobis, Hausdorff, weighted variants); ConvexHull; Delaunay; Voronoi; HalfspaceIntersection; Hungarian linear assignment |
-| [`fsci-special`](crates/fsci-special/) | ~33,000 | Gamma family (`gamma`, `gammaln`, `digamma`, `polygamma`, `pentagamma`, `factorialk`); beta family; `erf`/`erfc`/`erfinv`; Bessel J/Y/I/K/H1/H2 and spherical variants; Airy + zeros; hypergeometric `0F1`/`1F1`/`2F1` with **CASP branch selection**; elliptic `K`/`E`/`J` and the full Carlson family `RC`/`RF`/`RD`/`RJ`/`RG`; zeta; Struve; Dawson; spherical harmonics; orthogonal polynomials (Legendre / Cheby T,U,C,S / Hermite / Laguerre / Jacobi / Gegenbauer + shifted variants); Voigt profile; accurate-near-zero `log1pmx`, `powm1`, `cosm1`; Kelvin functions |
-| [`fsci-stats`](crates/fsci-stats/) | ~49,900 | **95+ continuous and 10+ discrete distributions**, each with PDF/CDF/SF/PPF/mean/var/skewness/kurtosis/entropy/mode/fit; t-tests, KS, Shapiro, Mann-Whitney, Wilcoxon, ANOVA, chi-square contingency; Pearson/Spearman/Kendall correlations; linear regression; bootstrap; permutation tests; `gaussian_kde`; Box-Cox; QMC engines (Sobol, Halton, Latin Hypercube) with centered / mixture / wraparound / L2-star discrepancies |
-| [`fsci-cluster`](crates/fsci-cluster/) | ~3,200 | KMeans + KMeans++ initialization; DBSCAN; hierarchical agglomerative linkage; `dendrogram`; `fcluster`; silhouette / Davies-Bouldin / Calinski-Harabasz indices |
-| [`fsci-ndimage`](crates/fsci-ndimage/) | ~3,900 | Uniform / Gaussian / median / minimum / maximum filters; closure-driven `generic_filter`; binary and grayscale morphology (erosion, dilation, opening, closing, hit-or-miss); `label`, `find_objects`; Euclidean distance transform; affine transform, rotate, zoom, shift; Sobel / Prewitt / Laplace edge detectors; histograms and extrema indexed by label |
-| [`fsci-io`](crates/fsci-io/) | ~5,300 | `savemat` / `loadmat` for MATLAB v4 and v5 (incl. compressed and struct arrays); Matrix Market `mmread` / `mmwrite` (dense and sparse); WAV PCM and IEEE-float read/write; simplified NetCDF reader; IDL `.sav` reader; Fortran sequential unformatted reader |
-| [`fsci-constants`](crates/fsci-constants/) | ~960 | CODATA 2018 physical constants; SI prefixes; mathematical constants (`pi`, `e`, `euler_gamma`…); unit conversions |
-| [`fsci-odr`](crates/fsci-odr/) | ~1,300 | Orthogonal Distance Regression: `ODR` driver, `Model`, `Data`, `Output`; explicit and implicit models; weighted, multi-response fits |
-| [`fsci-datasets`](crates/fsci-datasets/) | ~600 | Deterministic embedded sample fixtures matching SciPy shapes: `ascent`, `face` (RGB / gray), `electrocardiogram` |
-| [`fsci-runtime`](crates/fsci-runtime/) | ~1,750 | The CASP engine: `SolverPortfolio`, `MatrixConditionState`, `StructuralEvidence`, `SolverAction`, `PolicyController`, evidence ledger, conformal calibrator, fail-closed semantics, strict vs hardened modes |
-| [`fsci-arrayapi`](crates/fsci-arrayapi/) | ~3,500 | Contract-first Array API backend (`backend.rs`, `broadcast`, `creation`, `indexing`, `audit`) with integration seams for linalg / opt / sparse |
-| [`fsci-conformance`](crates/fsci-conformance/) | ~31,400 (lib + 7 bins) + **767 test files** | Three-lane differential harness (self-check, SciPy-oracle, dispatch); RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 15 Python oracle scripts; seven binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`) |
+| [`fsci-linalg`](crates/fsci-linalg/) | ~60,700 | Dense and structured linear algebra; CASP solver selection; LU / QR / Cholesky / SVD / LDL / Schur / Hessenberg / QZ; `expm`, `logm`, `sqrtm`, `funm`, `signm`; Sylvester, Lyapunov, continuous and discrete Riccati; banded specialists; subspace and polar decompositions |
+| [`fsci-sparse`](crates/fsci-sparse/) | ~73,100 | CSR/CSC/COO/BSR/DIA/DOK/LIL formats; `spsolve`/`splu`/`spilu`; CG, GMRES (Arnoldi + Givens), LGMRES, BiCG, BiCGSTAB, CGS, QMR (look-ahead Lanczos), MINRES, LSQR, LSMR (CASP-dispatched); `eigs` via Arnoldi iteration on a Krylov subspace; `eigsh` via deflated power iteration with deterministic LCG seed (orthogonal to no eigenmode); `svds`; Dijkstra, Bellman-Ford, MST, BFS/DFS, connected components, PageRank, Reverse Cuthill-McKee, centrality |
+| [`fsci-integrate`](crates/fsci-integrate/) | ~34,900 | `solve_ivp` (RK23 / RK45 / DOP853 / BDF / Radau / LSODA); `odeint`; `solve_bvp`; `quad` family with Gauss-Kronrod adaptation; `dblquad`, `tplquad`, `nquad`, `cubature`; Romberg; Monte Carlo and QMC quadrature; sample-form rules |
+| [`fsci-interpolate`](crates/fsci-interpolate/) | ~24,400 | `interp1d`, `CubicSpline`, `CubicHermiteSpline`, `BSpline`, `Akima`, `PCHIP`; `RegularGridInterpolator`, `griddata`, `interpn`; Krogh, barycentric, polynomial helpers; `make_lsq_spline` for k = 1/3/5 |
+| [`fsci-opt`](crates/fsci-opt/) | ~43,100 | `minimize` portfolio: Nelder-Mead, BFGS, CG, Powell, L-BFGS-B, Newton-CG, TNC, COBYLA, SLSQP, trust-ncg / -krylov / -exact / -constr, dogleg; `root` family: brentq, brenth, ridder, toms748, newton, halley, broyden1/2, anderson, fsolve, lm_root; `curve_fit`, `least_squares`, NNLS, isotonic regression; global: DE, basinhopping, dual annealing, SHGO, PSO, brute; LP/MILP; `linear_sum_assignment` |
+| [`fsci-fft`](crates/fsci-fft/) | ~13,500 | Cooley-Tukey mixed-radix; Bluestein for non-power-of-2 lengths; `rfft`/`irfft`; n-D transforms (`fftn`/`ifftn`/`rfftn`/`irfftn`); DCT/DST I–IV (1-D and n-D); Hilbert analytic signal; FHT; fingerprinted plan cache with admission policy |
+| [`fsci-signal`](crates/fsci-signal/) | ~41,000 | Windows (Hann, Hamming, Kaiser, Tukey, Blackman, Taylor, exponential, general-Hamming…); filter design (`butter` / `cheby1` / `cheby2` / `ellip` / `bessel`, ZPK and BA forms, full `lp2{lp,hp,bp,bs}` and `lp2{lp,hp,bp,bs}_zpk` transforms, `bilinear` / `bilinear_zpk`); filter-order helpers `buttord` / `cheb1ord` / `cheb2ord` / `ellipord`; analog prototypes `buttap` and `cheb1ap`; `firwin`, `firls`, `remez`; `lfilter`, `filtfilt`, SOS application; `welch`, `periodogram`, `csd`, `coherence`; `find_peaks` with prominence and width; CWT; Daubechies / Morlet / Ricker wavelets; MFCC, mel filterbank, chroma |
+| [`fsci-spatial`](crates/fsci-spatial/) | ~17,700 | KDTree / cKDTree (`query`, `query_pairs`, `count_neighbors`); `pdist` / `cdist` / `distance_matrix` (Euclidean, Manhattan, Chebyshev, Minkowski, Mahalanobis, Hausdorff, weighted variants); ConvexHull; Delaunay; Voronoi; HalfspaceIntersection; Hungarian linear assignment |
+| [`fsci-special`](crates/fsci-special/) | ~72,100 | Gamma family (`gamma`, `gammaln`, `digamma`, `polygamma`, `pentagamma`, `factorialk`); beta family; `erf`/`erfc`/`erfinv`; Bessel J/Y/I/K/H1/H2 and spherical variants; Airy + zeros; hypergeometric `0F1`/`1F1`/`2F1` with **CASP branch selection**; elliptic `K`/`E`/`J` and the full Carlson family `RC`/`RF`/`RD`/`RJ`/`RG`; zeta; Struve; Dawson; spherical harmonics; orthogonal polynomials (Legendre / Cheby T,U,C,S / Hermite / Laguerre / Jacobi / Gegenbauer + shifted variants); Voigt profile; accurate-near-zero `log1pmx`, `powm1`, `cosm1`; Kelvin functions |
+| [`fsci-stats`](crates/fsci-stats/) | ~126,200 | **95+ continuous and 10+ discrete distributions**, each with PDF/CDF/SF/PPF/mean/var/skewness/kurtosis/entropy/mode/fit; t-tests, KS, Shapiro, Mann-Whitney, Wilcoxon, ANOVA, chi-square contingency; Pearson/Spearman/Kendall correlations; linear regression; bootstrap; permutation tests; `gaussian_kde`; Box-Cox; QMC engines (Sobol, Halton, Latin Hypercube) with centered / mixture / wraparound / L2-star discrepancies |
+| [`fsci-cluster`](crates/fsci-cluster/) | ~17,400 | KMeans + KMeans++ initialization; DBSCAN; hierarchical agglomerative linkage; `dendrogram`; `fcluster`; silhouette / Davies-Bouldin / Calinski-Harabasz indices |
+| [`fsci-ndimage`](crates/fsci-ndimage/) | ~31,000 | Uniform / Gaussian / median / minimum / maximum filters; closure-driven `generic_filter`; binary and grayscale morphology (erosion, dilation, opening, closing, hit-or-miss); `label`, `find_objects`; Euclidean distance transform; affine transform, rotate, zoom, shift; Sobel / Prewitt / Laplace edge detectors; histograms and extrema indexed by label |
+| [`fsci-io`](crates/fsci-io/) | ~8,500 | `savemat` / `loadmat` for MATLAB v4 and v5 (incl. compressed and struct arrays); Matrix Market `mmread` / `mmwrite` (dense and sparse); WAV PCM and IEEE-float read/write; simplified NetCDF reader; IDL `.sav` reader; Fortran sequential unformatted reader |
+| [`fsci-constants`](crates/fsci-constants/) | ~1,700 | CODATA 2018 physical constants; SI prefixes; mathematical constants (`pi`, `e`, `euler_gamma`…); unit conversions |
+| [`fsci-odr`](crates/fsci-odr/) | ~3,000 | Orthogonal Distance Regression: `ODR` driver, `Model`, `Data`, `Output`; explicit and implicit models; weighted, multi-response fits |
+| [`fsci-datasets`](crates/fsci-datasets/) | ~670 | Deterministic embedded sample fixtures matching SciPy shapes: `ascent`, `face` (RGB / gray), `electrocardiogram` |
+| [`fsci-runtime`](crates/fsci-runtime/) | ~3,650 | The CASP engine: `SolverPortfolio`, `MatrixConditionState`, `StructuralEvidence`, `SolverAction`, `PolicyController`, evidence ledger, conformal calibrator, fail-closed semantics, strict vs hardened modes |
+| [`fsci-arrayapi`](crates/fsci-arrayapi/) | ~4,800 | Contract-first Array API backend (`backend.rs`, `broadcast`, `creation`, `indexing`, `audit`) with integration seams for linalg / opt / sparse |
+| [`fsci-conformance`](crates/fsci-conformance/) | ~33,000 (lib + 7 bins) + **796 test files** | Three-lane differential harness (self-check, SciPy-oracle, dispatch); RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 15 Python oracle scripts; seven binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`) |
 
 For per-symbol parity assessment see [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md).
 
