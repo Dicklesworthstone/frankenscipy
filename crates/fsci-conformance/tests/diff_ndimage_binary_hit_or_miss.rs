@@ -86,70 +86,68 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn generate_query() -> OracleQuery {
-    let mut points = Vec::new();
-
-    // 5x5 input, looking for 3x3 cross
-    points.push(PointCase {
-        case_id: "5x5_cross_struct1_default_struct2".into(),
-        input_shape: vec![5, 5],
-        input: vec![
-            0.0, 0.0, 1.0, 0.0, 0.0, //
-            0.0, 1.0, 1.0, 1.0, 0.0, //
-            1.0, 1.0, 1.0, 1.0, 1.0, //
-            0.0, 1.0, 1.0, 1.0, 0.0, //
-            0.0, 0.0, 1.0, 0.0, 0.0, //
-        ],
-        structure1_shape: vec![3, 3],
-        structure1: vec![
-            0.0, 1.0, 0.0, //
-            1.0, 1.0, 1.0, //
-            0.0, 1.0, 0.0, //
-        ],
-        structure2_shape: None,
-        structure2: None,
-    });
-
-    // 6x6 input with corner pattern
-    points.push(PointCase {
-        case_id: "6x6_corner_pattern".into(),
-        input_shape: vec![6, 6],
-        input: vec![
-            1.0, 1.0, 0.0, 0.0, 0.0, 0.0, //
-            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
-            0.0, 0.0, 0.0, 0.0, 1.0, 1.0, //
-            0.0, 0.0, 0.0, 0.0, 1.0, 0.0, //
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
-        ],
-        structure1_shape: vec![2, 2],
-        structure1: vec![1.0, 1.0, 1.0, 0.0],
-        structure2_shape: None,
-        structure2: None,
-    });
-
-    // 4x4 with explicit struct2
-    points.push(PointCase {
-        case_id: "4x4_explicit_struct2".into(),
-        input_shape: vec![4, 4],
-        input: vec![
-            0.0, 1.0, 0.0, 0.0, //
-            1.0, 1.0, 0.0, 0.0, //
-            0.0, 1.0, 0.0, 0.0, //
-            0.0, 0.0, 0.0, 0.0, //
-        ],
-        structure1_shape: vec![3, 3],
-        structure1: vec![
-            0.0, 1.0, 0.0, //
-            1.0, 1.0, 0.0, //
-            0.0, 1.0, 0.0, //
-        ],
-        structure2_shape: Some(vec![3, 3]),
-        structure2: Some(vec![
-            1.0, 0.0, 1.0, //
-            0.0, 0.0, 1.0, //
-            1.0, 0.0, 1.0, //
-        ]),
-    });
+    let points = vec![
+        // 5x5 input, looking for 3x3 cross
+        PointCase {
+            case_id: "5x5_cross_struct1_default_struct2".into(),
+            input_shape: vec![5, 5],
+            input: vec![
+                0.0, 0.0, 1.0, 0.0, 0.0, //
+                0.0, 1.0, 1.0, 1.0, 0.0, //
+                1.0, 1.0, 1.0, 1.0, 1.0, //
+                0.0, 1.0, 1.0, 1.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, 0.0, //
+            ],
+            structure1_shape: vec![3, 3],
+            structure1: vec![
+                0.0, 1.0, 0.0, //
+                1.0, 1.0, 1.0, //
+                0.0, 1.0, 0.0, //
+            ],
+            structure2_shape: None,
+            structure2: None,
+        },
+        // 6x6 input with corner pattern
+        PointCase {
+            case_id: "6x6_corner_pattern".into(),
+            input_shape: vec![6, 6],
+            input: vec![
+                1.0, 1.0, 0.0, 0.0, 0.0, 0.0, //
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0, 1.0, 1.0, //
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+            ],
+            structure1_shape: vec![2, 2],
+            structure1: vec![1.0, 1.0, 1.0, 0.0],
+            structure2_shape: None,
+            structure2: None,
+        },
+        // 4x4 with explicit struct2
+        PointCase {
+            case_id: "4x4_explicit_struct2".into(),
+            input_shape: vec![4, 4],
+            input: vec![
+                0.0, 1.0, 0.0, 0.0, //
+                1.0, 1.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 0.0, 0.0, //
+            ],
+            structure1_shape: vec![3, 3],
+            structure1: vec![
+                0.0, 1.0, 0.0, //
+                1.0, 1.0, 0.0, //
+                0.0, 1.0, 0.0, //
+            ],
+            structure2_shape: Some(vec![3, 3]),
+            structure2: Some(vec![
+                1.0, 0.0, 1.0, //
+                0.0, 0.0, 1.0, //
+                1.0, 0.0, 1.0, //
+            ]),
+        },
+    ];
 
     OracleQuery { points }
 }

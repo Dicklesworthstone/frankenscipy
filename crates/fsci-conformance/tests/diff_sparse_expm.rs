@@ -84,57 +84,54 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn generate_query() -> OracleQuery {
-    let mut points = Vec::new();
-
-    points.push(PointCase {
-        case_id: "3x3_spd_tridiag".into(),
-        n: 3,
-        triplets: vec![
-            (0, 0, 1.0),
-            (0, 1, 0.5),
-            (1, 0, 0.5),
-            (1, 1, 1.0),
-            (1, 2, 0.5),
-            (2, 1, 0.5),
-            (2, 2, 1.0),
-        ],
-    });
-
-    points.push(PointCase {
-        case_id: "4x4_diag".into(),
-        n: 4,
-        triplets: (0..4).map(|i| (i, i, 0.5 + (i as f64) * 0.25)).collect(),
-    });
-
-    points.push(PointCase {
-        case_id: "3x3_skew_sym".into(),
-        n: 3,
-        triplets: vec![
-            (0, 1, 1.0),
-            (1, 0, -1.0),
-            (0, 2, 0.5),
-            (2, 0, -0.5),
-            (1, 2, 0.3),
-            (2, 1, -0.3),
-        ],
-    });
-
-    points.push(PointCase {
-        case_id: "4x4_dense_small".into(),
-        n: 4,
-        triplets: vec![
-            (0, 0, 0.5),
-            (0, 1, 0.2),
-            (1, 0, 0.2),
-            (1, 1, 0.5),
-            (1, 2, 0.2),
-            (2, 1, 0.2),
-            (2, 2, 0.5),
-            (2, 3, 0.2),
-            (3, 2, 0.2),
-            (3, 3, 0.5),
-        ],
-    });
+    let points = vec![
+        PointCase {
+            case_id: "3x3_spd_tridiag".into(),
+            n: 3,
+            triplets: vec![
+                (0, 0, 1.0),
+                (0, 1, 0.5),
+                (1, 0, 0.5),
+                (1, 1, 1.0),
+                (1, 2, 0.5),
+                (2, 1, 0.5),
+                (2, 2, 1.0),
+            ],
+        },
+        PointCase {
+            case_id: "4x4_diag".into(),
+            n: 4,
+            triplets: (0..4).map(|i| (i, i, 0.5 + (i as f64) * 0.25)).collect(),
+        },
+        PointCase {
+            case_id: "3x3_skew_sym".into(),
+            n: 3,
+            triplets: vec![
+                (0, 1, 1.0),
+                (1, 0, -1.0),
+                (0, 2, 0.5),
+                (2, 0, -0.5),
+                (1, 2, 0.3),
+                (2, 1, -0.3),
+            ],
+        },
+        PointCase {
+            case_id: "4x4_dense_small".into(),
+            n: 4,
+            triplets: vec![
+                (0, 0, 0.5),
+                (0, 1, 0.2),
+                (1, 0, 0.2),
+                (1, 1, 0.5),
+                (1, 2, 0.2),
+                (2, 1, 0.2),
+                (2, 2, 0.5),
+                (2, 3, 0.2),
+                (3, 2, 0.2),
+                (3, 3, 0.5),
+            ],
+        },
+    ];
 
     OracleQuery { points }
 }
