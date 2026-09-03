@@ -13111,7 +13111,7 @@ mod tests {
         assert!(sl.eval(-0.1).is_err());
         assert!(sl.eval(6.1).is_err());
         assert!(sl.eval_many(&[1.0, 7.0]).is_err());
-        assert!(Slerp::new(&[0.0], &[kr[0].clone()]).is_err());
+        assert!(Slerp::new(&[0.0], &[kr[0]]).is_err());
     }
 
     #[test]
@@ -14433,7 +14433,7 @@ mod toggle_ab_mahalanobis_assembly {
             &[1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0],
         );
         assert!(
-            inside.iter().any(|&v| v == 1.0) && inside.iter().any(|&v| v == 0.0),
+            inside.contains(&1.0) && inside.contains(&0.0),
             "the tsearch fixture must contain queries BOTH inside and outside the hull"
         );
 
@@ -14463,14 +14463,14 @@ mod toggle_ab_mahalanobis_assembly {
             [0.0, 0.0, 1.0],
             [0.0, 0.0, -1.0],
             [
-                0.577_350_269_189_625_84,
-                0.577_350_269_189_625_84,
-                0.577_350_269_189_625_84,
+                0.577_350_269_189_625_8,
+                0.577_350_269_189_625_8,
+                0.577_350_269_189_625_8,
             ],
             [
-                -0.577_350_269_189_625_84,
-                -0.577_350_269_189_625_84,
-                0.577_350_269_189_625_84,
+                -0.577_350_269_189_625_8,
+                -0.577_350_269_189_625_8,
+                0.577_350_269_189_625_8,
             ],
         ];
         let sv = SphericalVoronoi::new(&sphere, [0.0, 0.0, 0.0], 1.0).expect("spherical voronoi");

@@ -112,7 +112,7 @@ FrankenSciPy is a Cargo workspace of **19 crates** spanning ~610,000 lines under
 | [`fsci-datasets`](crates/fsci-datasets/) | ~670 | Deterministic embedded sample fixtures matching SciPy shapes: `ascent`, `face` (RGB / gray), `electrocardiogram` |
 | [`fsci-runtime`](crates/fsci-runtime/) | ~3,650 | The CASP engine: `SolverPortfolio`, `MatrixConditionState`, `StructuralEvidence`, `SolverAction`, `PolicyController`, evidence ledger, conformal calibrator, fail-closed semantics, strict vs hardened modes |
 | [`fsci-arrayapi`](crates/fsci-arrayapi/) | ~4,800 | Contract-first Array API backend (`backend.rs`, `broadcast`, `creation`, `indexing`, `audit`) with integration seams for linalg / opt / sparse |
-| [`fsci-conformance`](crates/fsci-conformance/) | ~33,000 (lib + 7 bins) + **796 test files** | Three-lane differential harness (self-check, SciPy-oracle, dispatch); RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 15 Python oracle scripts; seven binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`) |
+| [`fsci-conformance`](crates/fsci-conformance/) | ~33,000 (lib + 9 bins) + **796 test files** | Three-lane differential harness (self-check, SciPy-oracle, dispatch); RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 15 Python oracle scripts; nine binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`, `adversarial_corpus`, `fuzz_triage`) |
 
 For per-symbol parity assessment see [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md).
 
@@ -316,7 +316,7 @@ For iterative methods (`fsci-sparse`, `fsci-opt`) the kernel level is the iterat
 
 ## Conformance Harness
 
-The conformance harness in `fsci-conformance` is a first-class subsystem with its own library, seven binaries, and an artifact tree under version control.
+The conformance harness in `fsci-conformance` is a first-class subsystem with its own library, nine binaries, and an artifact tree under version control.
 
 ### Three lanes
 
@@ -1819,25 +1819,36 @@ frankenscipy/
 
 ## Performance and Quality Gates
 
-The CI pipeline (`.github/workflows/ci.yml`) runs **nine gates G1–G9** plus
-the **G3b** live-SciPy-oracle lane on every push to `main`:
+The CI pipeline (`.github/workflows/ci.yml`, restructured 2026-09-03 under
+`frankenscipy-liel6`) runs the gates below on every push to `main`. Every job
+restores one shared dependency cache and pins `nightly-2026-07-20` from
+`rust-toolchain.toml`. The pinned live-SciPy incumbent (scipy 1.17.1 with
+numpy 2.4.3, the pair recorded in `fsci_runtime::scipy_incumbent`) is
+installed for the oracle lanes and **required**: a test that cannot reach it
+fails instead of skipping, and a control job proves that by running one lane
+without SciPy and asserting it fails.
 
 | Gate | Job name | Check |
 |---|---|---|
-| G1 | `fmt + clippy` | `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
-| G2 | `unit + property tests` | `cargo test --workspace -- --nocapture` |
-| G3 | `differential conformance` | Golden journeys, `diff_fft`, `diff_sparse`, `tests::differential` lib suite, plus the `live_oracle_capture` binary in fallback mode |
-| G3b | `live SciPy oracle capture` | Installs SciPy and reruns the capture lane in required-oracle mode; fails if SciPy is absent or any zero-drift threshold is breached |
-| G4 | `adversarial smoke` | Property-based adversarial fixtures, NaN/Inf propagation, malformed inputs |
-| G5 | `E2E scenarios` | Runs the `e2e_orchestrator` binary across registered golden-journey scenarios |
-| G6 | `perf regression` | Criterion baselines + delta artifact via the `benchmark_gate` binary |
-| G7 | `schema + evidence packs` | Validates `behavior_ledger`, `contract_table`, `threat_matrix` schemas and evidence-pack completeness |
-| G8 | `RaptorQ proofs` | Verifies `decode_proof.json` artifacts via the `raptorq_sidecar` binary |
-| G9 | `tolerance-policy ratchet` | Runs `tolerance_lint` to ensure no tolerance contract was loosened relative to the prior baseline |
+| G1 | `fmt + clippy` | `cargo fmt --all -- --check` and `cargo clippy --workspace --all-targets -- -D warnings` |
+| G2 | `unit + property tests (<crate>)` | One job per crate: `cargo test -p <crate>` for the 18 domain crates plus the conformance library |
+| G3 | `live-SciPy diff (<shard>)` | The 731 `diff_*` files in 14 family shards, each binary built and run with `FSCI_REQUIRE_SCIPY_ORACLE=1` against the pinned SciPy |
+| G3 control | `no SciPy must fail` | Runs one oracle-required lane with an interpreter that cannot import SciPy; the job passes only if that lane fails |
+| G3b | `live SciPy oracle capture` | `live_oracle_capture` in required-oracle mode against the pinned versions; uploads the capture, its RaptorQ sidecar and decode proof |
+| G3c | `goldens + metamorphic + fallback capture` | Golden journeys, the metamorphic suites, the oracle/live/fuzz regression files, and `live_oracle_capture --allow-missing-oracle` |
+| G4 | `adversarial smoke` | The conformance `smoke` suite: NaN/Inf propagation and malformed inputs |
+| G5 | `E2E scenarios` | Every `e2e_*` integration test |
+| G6 | `perf smoke + baseline validation` | Every `perf_*` integration test, `benchmark_gate --check-spec` against the spec §17 budgets, and `raptorq_sidecar --verify` on the published baselines. There is no criterion regression compare in CI: hosted runners are not a stable timing host |
+| G7 | `schema + evidence packs` | `schema_validation` plus every `evidence_p2c*` pack |
+| G8 | `RaptorQ proofs` | `raptorq_proofs`: decode-proof verification for the committed sidecars |
+| G9 | `tolerance-policy ratchet` | `tolerance_lint --max-violations 361` over the `FSCI-P2C-*.json` fixtures; the threshold may only fall. It does not yet scan the tolerances written in the `diff_*.rs` files |
 
-A separate `fuzz_nightly.yml` workflow runs the fuzz harness on a nightly schedule.
+A separate `fuzz_nightly.yml` workflow runs nine `fsci-special` fuzz targets
+under ASan+UBSan on a nightly schedule.
 
-The workspace is currently **warning-free across build, test, fuzz, and doc surfaces** (frankenscipy-ql8pu / iznn6 / h3hnk / cgjh3 / fhh87 / xjan0 / zdkmb / uu2hd / zk3q8).
+Before 2026-09-03 the workflow had never completed successfully, so no gate
+claim in this README was enforced by CI; the first fully green run is roadmap
+item 3 above and will be cited here when it exists.
 
 ### Benchmarks
 
