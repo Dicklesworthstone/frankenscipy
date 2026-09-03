@@ -1,87 +1,252 @@
-name: CI Gates (G1-G8)
+name: CI Gates (G1-G9)
+
+# HISTORY THIS FILE HAS TO ANSWER FOR. Measured 2026-09-03 (frankenscipy-yhuux / liel6):
+# the previous revision of this workflow ran 7,914 times and succeeded ZERO times. G1 failed
+# on rustfmt drift in ~30 s, so every gate below it was skipped for the life of the project,
+# and the gates themselves could not have passed anyway: G2 ran `cargo test --workspace`
+# (610K source lines, 10,057 unit tests) under a 5-minute timeout with no build cache; G3 ran
+# 2 of the 731 `diff_*` conformance files; nothing installed SciPy for the 660 test files that
+# resolve a live SciPy interpreter, so under the default env they SKIPPED and passed; G6
+# compared `docs/` baselines against `docs/` (themselves).
+#
+# Rules of this file:
+#   * No gate is weakened to land a change. A vacuous step is deleted, not kept for the tick.
+#   * Every job restores the same dependency cache (one shared key) so the wall is parallel.
+#   * The live-SciPy lanes REQUIRE the oracle (FSCI_REQUIRE_SCIPY_ORACLE=1) against the pinned
+#     incumbent recorded in fsci_runtime::scipy_incumbent (scipy 1.17.1 + numpy 2.4.3). A
+#     missing or wrong interpreter is a failure, never a skip; the `g3-oracle-required-control`
+#     job proves that by running one lane without SciPy and asserting it FAILS.
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+# At most one run in progress per ref and only the newest pending one waits behind it. The
+# tree auto-commits every few minutes, which previously left a hundred queued runs that took
+# five to seven hours each just to start.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # `-D warnings` is the standing policy. It REPLACES the `.cargo/config.toml` rustflags
+  # (`-Z threads=4 -C target-feature=+avx2,+fma`); the AVX2 build is bit-identical to the
+  # baseline build, so correctness gates lose nothing by running on the x86-64 baseline.
   RUSTFLAGS: -D warnings
+  # `.cargo/config.toml` points the target dir at `target-isolated` for the shared dev tree.
+  # The cache action only saves `target`, so pin the dir back here.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  # Pinned live-SciPy incumbent. Must match fsci_runtime::scipy_incumbent::{PINNED_SCIPY,
+  # PINNED_NUMPY}; the resolver prints both versions and `genuine=` on every harness start.
+  PINNED_SCIPY: "1.17.1"
+  PINNED_NUMPY: "2.4.3"
 
 jobs:
   # ── G1: Formatting + Linting ──────────────────────────────────────
   g1-lint:
     name: "G1: fmt + clippy"
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo fmt --check
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
+      - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # ── G2: Unit + Property Tests ─────────────────────────────────────
+  # ── G2: Unit + Property Tests, one job per crate ─────────────────
+  # A failure names its crate, the wall is parallel, and the conformance crate's 796
+  # integration-test binaries are NOT built here (they are the G3 lanes below).
   g2-unit-tests:
-    name: "G2: unit + property tests"
-    needs: g1-lint
+    name: "G2: unit + property tests (${{ matrix.crate }})"
     runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        crate:
+          - fsci-arrayapi
+          - fsci-cluster
+          - fsci-constants
+          - fsci-datasets
+          - fsci-fft
+          - fsci-integrate
+          - fsci-interpolate
+          - fsci-io
+          - fsci-linalg
+          - fsci-ndimage
+          - fsci-odr
+          - fsci-opt
+          - fsci-runtime
+          - fsci-signal
+          - fsci-sparse
+          - fsci-spatial
+          - fsci-special
+          - fsci-stats
+        include:
+          - crate: fsci-conformance
+            args: --lib
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo test --workspace -- --nocapture
-        timeout-minutes: 5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
+      - run: cargo test -p ${{ matrix.crate }} ${{ matrix.args }} -- --nocapture
 
-  # ── G3: Differential Oracle Conformance ───────────────────────────
-  # Runs the actual differential test suite (diff_fft, diff_sparse) PLUS
-  # golden-journey artifact checks. Per bead frankenscipy-zi0q: G3 was
-  # previously golden_journeys + schema_validation only; the real
-  # differential_<family>_quota_and_structured_logs tests in lib.rs
-  # (exercised via `--test differential`) now also run here.
-  g3-conformance:
-    name: "G3: differential conformance"
-    needs: g2-unit-tests
+  # ── G3: Differential conformance against the LIVE, PINNED SciPy ──
+  # 731 `diff_*` files, sharded by family. Each file is its own test binary, so the loop
+  # builds and runs them one at a time against the shared dependency cache. Every shard
+  # runs with the oracle REQUIRED: a test that cannot reach SciPy fails instead of skipping.
+  g3-diff-live-scipy:
+    name: "G3: live-SciPy diff (${{ matrix.shard }})"
     runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { shard: stats-a-c,     glob: "diff_stats_[a-c]*" }
+          - { shard: stats-d-k,     glob: "diff_stats_[d-k]*" }
+          - { shard: stats-l-p,     glob: "diff_stats_[l-p]*" }
+          - { shard: stats-q-z,     glob: "diff_stats_[q-z]*" }
+          - { shard: special-a-h,   glob: "diff_special_[a-h]*" }
+          - { shard: special-i-z,   glob: "diff_special_[i-z]*" }
+          - { shard: signal,        glob: "diff_signal_*" }
+          - { shard: sparse,        glob: "diff_sparse_*" }
+          - { shard: optimize,      glob: "diff_opt*" }
+          - { shard: linalg,        glob: "diff_linalg_*" }
+          - { shard: ndimage,       glob: "diff_ndimage_*" }
+          - { shard: fft-integrate, glob: "diff_@(fft|integrate)*" }
+          - { shard: spatial-interp-cluster, glob: "diff_@(spatial|interpolate|cluster)*" }
+          - { shard: runtime-misc,  glob: "diff_@(runtime|constants|arrayapi|odr)*" }
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo test -p fsci-conformance --test golden_journeys -- --nocapture
-        timeout-minutes: 5
-      - run: cargo test -p fsci-conformance --test diff_fft -- --nocapture
-        timeout-minutes: 5
-      - run: cargo test -p fsci-conformance --test diff_sparse -- --nocapture
-        timeout-minutes: 5
-      - run: cargo test -p fsci-conformance --lib tests::differential -- --nocapture
-        timeout-minutes: 10
-      - run: |
-          cargo run -p fsci-conformance --bin live_oracle_capture -- \
-            --allow-missing-oracle \
-            --output target/live-oracle-capture.json
-        timeout-minutes: 10
-
-  # ── G3b: Live SciPy Oracle Capture ────────────────────────────────
-  # Installs SciPy and runs the capture lane in required-oracle mode.
-  # Unlike G3's non-SciPy fallback smoke, this gate fails if SciPy is absent,
-  # no packets are captured, or any zero-drift threshold is exceeded.
-  g3-live-scipy-oracle:
-    name: "G3b: live SciPy oracle capture"
-    needs: g2-unit-tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.14"
+          python-version: "3.13"
           cache: "pip"
-      - name: Install SciPy oracle dependencies
-        run: python -m pip install --upgrade pip numpy scipy
+      - name: Install the pinned SciPy incumbent
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "scipy==${PINNED_SCIPY}" "numpy==${PINNED_NUMPY}"
+          python - <<'EOF'
+          import numpy, scipy, os, sys
+          print("scipy", scipy.__version__, "numpy", numpy.__version__, sys.executable)
+          assert scipy.__version__ == os.environ["PINNED_SCIPY"], scipy.__version__
+          assert numpy.__version__ == os.environ["PINNED_NUMPY"], numpy.__version__
+          EOF
+          echo "SCIPY_PYTHON=$(which python)" >> "$GITHUB_ENV"
+          echo "FSCI_REQUIRE_SCIPY_ORACLE=1" >> "$GITHUB_ENV"
+      - name: Run the shard (oracle required)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob extglob
+          files=(crates/fsci-conformance/tests/${{ matrix.glob }}.rs)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "shard glob '${{ matrix.glob }}' matched no files" >&2
+            exit 1
+          fi
+          echo "shard ${{ matrix.shard }}: ${#files[@]} test binaries"
+          failed=()
+          for f in "${files[@]}"; do
+            t="$(basename "$f" .rs)"
+            echo "=== $t ==="
+            if ! cargo test -p fsci-conformance --test "$t" -- --nocapture; then
+              failed+=("$t")
+            fi
+          done
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "FAILED (${#failed[@]}/${#files[@]}): ${failed[*]}" >&2
+            exit 1
+          fi
+
+  # ── G3 control: the oracle-required lane must FAIL without SciPy ──
+  # Two-arm proof for the gate itself. Runs one diff binary with FSCI_REQUIRE_SCIPY_ORACLE=1
+  # and SCIPY_PYTHON pointed at an interpreter that cannot import SciPy; the job passes only
+  # if that test FAILS. If this job ever goes green the wrong way, a missing oracle has
+  # started to skip-and-pass again and every green shard above is meaningless.
+  g3-oracle-required-control:
+    name: "G3 control: no SciPy must fail"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Prove the interpreter has no SciPy, then require it
+        shell: bash
+        run: |
+          set -uo pipefail
+          if python -c "import scipy" 2>/dev/null; then
+            echo "control interpreter unexpectedly imports scipy" >&2
+            exit 1
+          fi
+          export SCIPY_PYTHON="$(which python)"
+          export FSCI_REQUIRE_SCIPY_ORACLE=1
+          if cargo test -p fsci-conformance --test diff_stats_aic_bic -- --nocapture; then
+            echo "GATE DEFECT: the oracle-required lane PASSED with no SciPy present" >&2
+            exit 1
+          fi
+          echo "control ok: the lane failed closed without SciPy"
+
+  # ── G3b: Live SciPy Oracle Capture (pinned) ───────────────────────
+  g3-live-scipy-oracle:
+    name: "G3b: live SciPy oracle capture"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+      - name: Install the pinned SciPy incumbent
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "scipy==${PINNED_SCIPY}" "numpy==${PINNED_NUMPY}"
       - name: Capture live SciPy oracle report
         run: |
           cargo run -p fsci-conformance --bin live_oracle_capture -- \
-            --python python \
+            --python "$(which python)" \
             --output target/live-oracle-capture.json
-        timeout-minutes: 15
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -92,138 +257,193 @@ jobs:
             target/live-oracle-capture.json.decode_proof.json
           if-no-files-found: error
 
+  # ── G3c: the rest of the conformance crate ────────────────────────
+  # Golden journeys, metamorphic suites, schema, RaptorQ proofs, smoke, and the fallback
+  # (no-SciPy) capture mode of live_oracle_capture. These do not need the oracle.
+  g3-conformance-other:
+    name: "G3c: goldens + metamorphic + fallback capture"
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
+      - shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          failed=()
+          for f in crates/fsci-conformance/tests/{golden,metamorphic,oracle,live,fuzz}_*.rs; do
+            t="$(basename "$f" .rs)"
+            echo "=== $t ==="
+            cargo test -p fsci-conformance --test "$t" -- --nocapture || failed+=("$t")
+          done
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "FAILED: ${failed[*]}" >&2
+            exit 1
+          fi
+      - run: |
+          cargo run -p fsci-conformance --bin live_oracle_capture -- \
+            --allow-missing-oracle \
+            --output target/live-oracle-capture-fallback.json
+
   # ── G4: Adversarial/Smoke Test ─────────────────────────────────────
-  # Runs the conformance smoke test to catch obvious regressions.
-  # NOTE: This does NOT replay fuzz/seeds/ — full fuzz corpus replay requires
-  # cargo-fuzz with libFuzzer and is too expensive for push CI.
-  # Per /testing-fuzzing rule 10, crash artifacts should be converted to
-  # deterministic regression tests; this gate runs whatever adversarial
-  # regression tests exist in the test suite.
-  # TODO(bead:ff7t): Add nightly workflow for full fuzz corpus replay, or
-  # create a seed-replay test harness that reads fuzz/seeds/* deterministically.
   g4-adversarial:
     name: "G4: adversarial smoke"
-    needs: g2-unit-tests
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
       - run: cargo test -p fsci-conformance --test smoke -- --nocapture
-        timeout-minutes: 5
 
-  # ── G5: E2E Scenario Orchestration (parallel with G3/G4) ─────────
-  # Runs ALL e2e_* integration tests. NO '|| true' suppression — a genuine
-  # test failure fails the gate. Per bead frankenscipy-m0cn: previously
-  # '|| true' silently swallowed failures in G5, turning it into a log-only
-  # step; that is fixed here.
+  # ── G5: E2E Scenario Orchestration ────────────────────────────────
   g5-e2e:
     name: "G5: E2E scenarios"
-    needs: g2-unit-tests
     runs-on: ubuntu-latest
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: |
-          set -e
-          for test in e2e_casp e2e_cluster e2e_fft e2e_interpolate e2e_io \
-                      e2e_ivp e2e_linalg e2e_ndimage e2e_optimize \
-                      e2e_orchestrator e2e_signal e2e_sparse e2e_spatial \
-                      e2e_special e2e_stats; do
-            echo "=== Running $test ==="
-            cargo test -p fsci-conformance --test "$test" -- --nocapture
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
+      - shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          failed=()
+          for f in crates/fsci-conformance/tests/e2e_*.rs; do
+            t="$(basename "$f" .rs)"
+            echo "=== $t ==="
+            cargo test -p fsci-conformance --test "$t" -- --nocapture || failed+=("$t")
           done
-        timeout-minutes: 25
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "FAILED: ${failed[*]}" >&2
+            exit 1
+          fi
 
-  # ── G6: Performance Regression (parallel) ─────────────────────────
-  # Runs ALL perf_* targets with real failure propagation (no '|| true').
-  # Per bead frankenscipy-rvox: previously only ran 3 of 8 perf tests.
+  # ── G6: Performance smoke + baseline artifact validation ──────────
+  # The perf_* tests are real. The previous `benchmark_gate --compare docs` step compared the
+  # published baselines against THEMSELVES and could not fail; it is gone. A true regression
+  # compare needs a criterion run on a stable, dedicated host and is tracked separately.
   g6-perf:
-    name: "G6: perf regression"
-    needs: g2-unit-tests
+    name: "G6: perf smoke + baseline validation"
     runs-on: ubuntu-latest
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - run: |
-          set -e
-          for test in perf_arrayapi perf_casp perf_fft perf_ivp \
-                      perf_linalg perf_optimize perf_sparse perf_special; do
-            echo "=== Running $test ==="
-            cargo test -p fsci-conformance --test "$test" -- --nocapture
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
+      - shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          failed=()
+          for f in crates/fsci-conformance/tests/perf_*.rs; do
+            t="$(basename "$f" .rs)"
+            echo "=== $t ==="
+            cargo test -p fsci-conformance --test "$t" -- --nocapture || failed+=("$t")
           done
-      - name: Validate published benchmark baselines
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "FAILED: ${failed[*]}" >&2
+            exit 1
+          fi
+      - name: Validate published baseline schema and RaptorQ sidecars
         run: |
           cargo run -p fsci-conformance --bin benchmark_gate -- \
             --baselines-dir docs \
             --check-spec
-          cargo run -p fsci-conformance --bin benchmark_gate -- \
-            --baselines-dir docs \
-            --compare docs \
-            --regression-tolerance 0.05
           cargo run -p fsci-conformance --bin raptorq_sidecar -- --verify \
             docs/baseline_linalg.json \
             docs/baseline_sparse.json \
             docs/baseline_opt.json \
             docs/baseline_integrate.json \
             docs/baseline_fft.json
-        timeout-minutes: 20
 
-  # ── G7: Artifact Schema Validation + Evidence Packs (parallel) ────
-  # Previously duplicated G3's schema_validation invocation. Now the
-  # schema gate is owned solely by G7; G3 handles differential+goldens.
-  # Plus G7 runs all evidence_p2c* packs to exercise the end-to-end
-  # evidence-bundling pipeline that conformance ships to users.
+  # ── G7: Artifact Schema Validation + every evidence pack ──────────
   g7-schema:
     name: "G7: schema + evidence packs"
-    needs: g2-unit-tests
     runs-on: ubuntu-latest
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
       - run: cargo test -p fsci-conformance --test schema_validation -- --nocapture
-        timeout-minutes: 5
-      - run: |
-          set -e
-          for test in evidence_p2c001 evidence_p2c002 evidence_p2c003 \
-                      evidence_p2c004 evidence_p2c005 evidence_p2c006 \
-                      evidence_p2c007 evidence_p2c008 evidence_p2c012 \
-                      evidence_p2c016; do
-            echo "=== Running $test ==="
-            cargo test -p fsci-conformance --test "$test" -- --nocapture
+      - shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          failed=()
+          for f in crates/fsci-conformance/tests/evidence_*.rs; do
+            t="$(basename "$f" .rs)"
+            echo "=== $t ==="
+            cargo test -p fsci-conformance --test "$t" -- --nocapture || failed+=("$t")
           done
-        timeout-minutes: 15
+          if [ "${#failed[@]}" -ne 0 ]; then
+            echo "FAILED: ${failed[*]}" >&2
+            exit 1
+          fi
 
-  # ── G8: RaptorQ Decode-Proof Verification (parallel) ─────────────
+  # ── G8: RaptorQ Decode-Proof Verification ─────────────────────────
   g8-raptorq:
     name: "G8: RaptorQ proofs"
-    needs: g2-unit-tests
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
       - run: cargo test -p fsci-conformance --test raptorq_proofs -- --nocapture
-        timeout-minutes: 5
 
-  # ── G9: Tolerance Policy Ratchet (parallel) ──────────────────────
-  # Lints fixture cases against artifacts/TOLERANCE_POLICY.md §2 baseline tiers.
-  # A case is a violation if its rtol exceeds the per-packet baseline AND it
-  # carries no `rationale` field. The threshold below is the audit datum from
-  # artifacts/tolerance-audit-2026-05-03.md (361 violations at policy
-  # publication time).
-  #
-  # Ratchet protocol: when a fixture is regenerated with a `rationale` for
-  # one of its previously-implicit relaxations, the violation count drops.
-  # When that drop is observed, lower --max-violations in this step to the
-  # new count. The threshold MUST monotonically decrease — never raise it.
-  # The eventual goal is --max-violations=0 (full §5 audit-trail compliance).
+  # ── G9: Tolerance Policy Ratchet ──────────────────────────────────
+  # Lints fixture cases against artifacts/TOLERANCE_POLICY.md §2 baseline tiers. The
+  # threshold MUST monotonically decrease, never rise; 361 is the 2026-05-03 audit datum.
+  # Known limit (frankenscipy-liel6): this scans FSCI-P2C-*.json fixtures only, not the
+  # tolerances written in the diff_*.rs files themselves.
   g9-tolerance-lint:
     name: "G9: tolerance-policy ratchet"
-    needs: g2-unit-tests
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+          cache-on-failure: true
       - run: |
           cargo run --release -p fsci-conformance --bin tolerance_lint -- \
             --max-violations 361
-        timeout-minutes: 5
