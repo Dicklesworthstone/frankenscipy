@@ -3489,10 +3489,8 @@ where
                         .map(|h| h.join().expect("bessel array worker panicked"))
                         .collect()
                 });
-                for error in first_errors {
-                    if let Some(error) = error {
-                        return Err(error);
-                    }
+                if let Some(error) = first_errors.into_iter().flatten().next() {
+                    return Err(error);
                 }
                 return Ok(SpecialTensor::RealVec(out));
             }

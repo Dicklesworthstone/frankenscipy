@@ -415,16 +415,12 @@ pub static GAMMA_FAMILY_SERIAL_HITS: std::sync::atomic::AtomicUsize =
 /// BIT-IDENTICAL either way — `map_real_infallible` gives each index its own slot.
 const GAMMA_PAR_MIN: usize = 1 << 22;
 
-/// The effective parallel-fan-out threshold for this batch.
+/// The effective parallel-fan-out threshold for this batch, letting the A/B override win over
+/// whichever default applies.
 ///
 /// Read ONCE per batch at the dispatch boundary and passed down as a `usize`, never consulted
 /// per element — a relaxed load inside a per-item loop is an optimisation barrier this crate
 /// has already paid 13% for.
-fn gamma_family_par_min() -> usize {
-    gamma_family_par_min_of(GAMMA_FAMILY_PAR_MIN)
-}
-
-/// The effective threshold, letting the A/B override win over whichever default applies.
 fn gamma_family_par_min_of(default_threshold: usize) -> usize {
     let override_value = GAMMA_FAMILY_PAR_MIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
     if override_value == 0 {
@@ -2385,23 +2381,21 @@ fn clamp_unit_interval(value: f64) -> f64 {
     value.clamp(0.0, 1.0)
 }
 
-/// REJECTED LEVER, recorded so it is not retried: threading the pole predicate in.
-///
-/// `is_negative_integer_pole` is evaluated THREE times per element on this path — the
-/// Hardened guard in `gamma_scalar`, its non-finite check, and here — and profiling puts its
-/// `is_finite` bit-mask near the top of `gamma_scalar`. Computing it ONCE and passing it down
-/// as a `bool` is the obvious fix and it MADE THINGS WORSE, measured on the identical
-/// fixture:
-///
-/// ```text
-/// gamma    184.4 -> 193.7 instructions per element   (+9.3)
-/// rgamma   225.3 -> 233.9                            (+8.6)
-/// ```
-///
-/// The predicate is three cheap integer ops on a value already in a register. Recomputing it
-/// where it is needed is cheaper than keeping a `bool` live across a call, which costs a
-/// register or a spill and blocks the inlining LLVM was already doing. REMATERIALISATION
-/// BEATS CACHING FOR A PREDICATE THIS CHEAP — "remove the redundant work" is not a rule.
+// REJECTED LEVER, recorded so it is not retried: threading the pole predicate in.
+//
+// `is_negative_integer_pole` is evaluated THREE times per element on this path — the
+// Hardened guard in `gamma_scalar`, its non-finite check, and here — and profiling puts its
+// `is_finite` bit-mask near the top of `gamma_scalar`. Computing it ONCE and passing it down
+// as a `bool` is the obvious fix and it MADE THINGS WORSE, measured on the identical
+// fixture:
+//
+//     gamma    184.4 -> 193.7 instructions per element   (+9.3)
+//     rgamma   225.3 -> 233.9                            (+8.6)
+//
+// The predicate is three cheap integer ops on a value already in a register. Recomputing it
+// where it is needed is cheaper than keeping a `bool` live across a call, which costs a
+// register or a spill and blocks the inlining LLVM was already doing. REMATERIALISATION
+// BEATS CACHING FOR A PREDICATE THIS CHEAP — "remove the redundant work" is not a rule.
 
 /// Read gamma_core's two flags ONCE for a batch, counting the batch, or `None` when the hoist
 /// is switched off and the per-element path should run instead.
