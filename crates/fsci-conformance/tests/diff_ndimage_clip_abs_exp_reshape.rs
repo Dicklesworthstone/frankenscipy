@@ -93,113 +93,114 @@ fn generate_query() -> OracleQuery {
     let pos: Vec<f64> = (0..10).map(|i| (i as f64) * 0.4 + 0.1).collect();
     let mat: Vec<f64> = (0..12).map(|i| (i as f64) * 0.5 - 3.0).collect();
 
-    let mut points = Vec::new();
-    // clip: clip(mixed, -1.0, 2.0)
-    points.push(Case {
-        case_id: "clip_mixed_n1_2".into(),
-        op: "clip".into(),
-        shape: vec![8],
-        data: mixed.clone(),
-        arg1: -1.0,
-        arg2: 2.0,
-        target_shape: vec![],
-    });
-    points.push(Case {
-        case_id: "clip_mat_0_3".into(),
-        op: "clip".into(),
-        shape: vec![3, 4],
-        data: mat.clone(),
-        arg1: 0.0,
-        arg2: 3.0,
-        target_shape: vec![],
-    });
-    // abs_array
-    points.push(Case {
-        case_id: "abs_mixed".into(),
-        op: "abs".into(),
-        shape: vec![8],
-        data: mixed.clone(),
-        arg1: 0.0,
-        arg2: 0.0,
-        target_shape: vec![],
-    });
-    points.push(Case {
-        case_id: "abs_mat".into(),
-        op: "abs".into(),
-        shape: vec![3, 4],
-        data: mat.clone(),
-        arg1: 0.0,
-        arg2: 0.0,
-        target_shape: vec![],
-    });
-    // exp_array
-    points.push(Case {
-        case_id: "exp_pos".into(),
-        op: "exp".into(),
-        shape: vec![10],
-        data: pos.clone(),
-        arg1: 0.0,
-        arg2: 0.0,
-        target_shape: vec![],
-    });
-    points.push(Case {
-        case_id: "exp_mixed".into(),
-        op: "exp".into(),
-        shape: vec![8],
-        data: mixed,
-        arg1: 0.0,
-        arg2: 0.0,
-        target_shape: vec![],
-    });
-    // reshape: 3x4 → 4x3, 4x3 → 12
-    points.push(Case {
-        case_id: "reshape_3x4_to_4x3".into(),
-        op: "reshape".into(),
-        shape: vec![3, 4],
-        data: mat.clone(),
-        arg1: 0.0,
-        arg2: 0.0,
-        target_shape: vec![4, 3],
-    });
-    points.push(Case {
-        case_id: "reshape_3x4_to_12".into(),
-        op: "reshape".into(),
-        shape: vec![3, 4],
-        data: mat.clone(),
-        arg1: 0.0,
-        arg2: 0.0,
-        target_shape: vec![12],
-    });
-    // flatten
-    points.push(Case {
-        case_id: "flatten_3x4".into(),
-        op: "flatten".into(),
-        shape: vec![3, 4],
-        data: mat,
-        arg1: 0.0,
-        arg2: 0.0,
-        target_shape: vec![],
-    });
-    // full: shape (2,3), value 7.0
-    points.push(Case {
-        case_id: "full_2x3_v7".into(),
-        op: "full".into(),
-        shape: vec![],
-        data: vec![],
-        arg1: 7.0,
-        arg2: 0.0,
-        target_shape: vec![2, 3],
-    });
-    // ones: shape (3,4)
-    points.push(Case {
-        case_id: "ones_3x4".into(),
-        op: "ones".into(),
-        shape: vec![],
-        data: vec![],
-        arg1: 0.0,
-        arg2: 0.0,
-        target_shape: vec![3, 4],
-    });
+    let points = vec![
+        // clip: clip(mixed, -1.0, 2.0)
+        Case {
+            case_id: "clip_mixed_n1_2".into(),
+            op: "clip".into(),
+            shape: vec![8],
+            data: mixed.clone(),
+            arg1: -1.0,
+            arg2: 2.0,
+            target_shape: vec![],
+        },
+        Case {
+            case_id: "clip_mat_0_3".into(),
+            op: "clip".into(),
+            shape: vec![3, 4],
+            data: mat.clone(),
+            arg1: 0.0,
+            arg2: 3.0,
+            target_shape: vec![],
+        },
+        // abs_array
+        Case {
+            case_id: "abs_mixed".into(),
+            op: "abs".into(),
+            shape: vec![8],
+            data: mixed.clone(),
+            arg1: 0.0,
+            arg2: 0.0,
+            target_shape: vec![],
+        },
+        Case {
+            case_id: "abs_mat".into(),
+            op: "abs".into(),
+            shape: vec![3, 4],
+            data: mat.clone(),
+            arg1: 0.0,
+            arg2: 0.0,
+            target_shape: vec![],
+        },
+        // exp_array
+        Case {
+            case_id: "exp_pos".into(),
+            op: "exp".into(),
+            shape: vec![10],
+            data: pos.clone(),
+            arg1: 0.0,
+            arg2: 0.0,
+            target_shape: vec![],
+        },
+        Case {
+            case_id: "exp_mixed".into(),
+            op: "exp".into(),
+            shape: vec![8],
+            data: mixed,
+            arg1: 0.0,
+            arg2: 0.0,
+            target_shape: vec![],
+        },
+        // reshape: 3x4 → 4x3, 4x3 → 12
+        Case {
+            case_id: "reshape_3x4_to_4x3".into(),
+            op: "reshape".into(),
+            shape: vec![3, 4],
+            data: mat.clone(),
+            arg1: 0.0,
+            arg2: 0.0,
+            target_shape: vec![4, 3],
+        },
+        Case {
+            case_id: "reshape_3x4_to_12".into(),
+            op: "reshape".into(),
+            shape: vec![3, 4],
+            data: mat.clone(),
+            arg1: 0.0,
+            arg2: 0.0,
+            target_shape: vec![12],
+        },
+        // flatten
+        Case {
+            case_id: "flatten_3x4".into(),
+            op: "flatten".into(),
+            shape: vec![3, 4],
+            data: mat,
+            arg1: 0.0,
+            arg2: 0.0,
+            target_shape: vec![],
+        },
+        // full: shape (2,3), value 7.0
+        Case {
+            case_id: "full_2x3_v7".into(),
+            op: "full".into(),
+            shape: vec![],
+            data: vec![],
+            arg1: 7.0,
+            arg2: 0.0,
+            target_shape: vec![2, 3],
+        },
+        // ones: shape (3,4)
+        Case {
+            case_id: "ones_3x4".into(),
+            op: "ones".into(),
+            shape: vec![],
+            data: vec![],
+            arg1: 0.0,
+            arg2: 0.0,
+            target_shape: vec![3, 4],
+        },
+    ];
 
     OracleQuery { points }
 }

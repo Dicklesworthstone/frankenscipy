@@ -92,66 +92,64 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn generate_query() -> OracleQuery {
-    let mut points = Vec::new();
-
-    // 5x3 over-determined, full column rank
-    points.push(PointCase {
-        case_id: "5x3_overdetermined".into(),
-        rows: 5,
-        cols: 3,
-        triplets: vec![
-            (0, 0, 1.0),
-            (0, 1, 0.5),
-            (1, 0, 0.5),
-            (1, 1, 1.0),
-            (1, 2, 0.5),
-            (2, 1, 0.5),
-            (2, 2, 1.0),
-            (3, 0, 1.0),
-            (3, 2, -0.5),
-            (4, 1, 1.0),
-            (4, 2, 1.0),
-        ],
-        b: vec![1.0, 2.0, 3.0, 1.5, 2.5],
-    });
-
-    // 6x4 over-determined with diagonal dominance
-    points.push(PointCase {
-        case_id: "6x4_diag_dom".into(),
-        rows: 6,
-        cols: 4,
-        triplets: vec![
-            (0, 0, 3.0),
-            (1, 1, 3.0),
-            (2, 2, 3.0),
-            (3, 3, 3.0),
-            (4, 0, 1.0),
-            (4, 1, 1.0),
-            (5, 2, 1.0),
-            (5, 3, 1.0),
-        ],
-        b: vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0],
-    });
-
-    // 4x4 square nonsingular (lsqr converges to A^{-1} b)
-    points.push(PointCase {
-        case_id: "4x4_square_nonsingular".into(),
-        rows: 4,
-        cols: 4,
-        triplets: vec![
-            (0, 0, 4.0),
-            (0, 1, 1.0),
-            (1, 0, 1.0),
-            (1, 1, 4.0),
-            (1, 2, 1.0),
-            (2, 1, 1.0),
-            (2, 2, 4.0),
-            (2, 3, 1.0),
-            (3, 2, 1.0),
-            (3, 3, 4.0),
-        ],
-        b: vec![1.0, 2.0, 3.0, 4.0],
-    });
+    let points = vec![
+        // 5x3 over-determined, full column rank
+        PointCase {
+            case_id: "5x3_overdetermined".into(),
+            rows: 5,
+            cols: 3,
+            triplets: vec![
+                (0, 0, 1.0),
+                (0, 1, 0.5),
+                (1, 0, 0.5),
+                (1, 1, 1.0),
+                (1, 2, 0.5),
+                (2, 1, 0.5),
+                (2, 2, 1.0),
+                (3, 0, 1.0),
+                (3, 2, -0.5),
+                (4, 1, 1.0),
+                (4, 2, 1.0),
+            ],
+            b: vec![1.0, 2.0, 3.0, 1.5, 2.5],
+        },
+        // 6x4 over-determined with diagonal dominance
+        PointCase {
+            case_id: "6x4_diag_dom".into(),
+            rows: 6,
+            cols: 4,
+            triplets: vec![
+                (0, 0, 3.0),
+                (1, 1, 3.0),
+                (2, 2, 3.0),
+                (3, 3, 3.0),
+                (4, 0, 1.0),
+                (4, 1, 1.0),
+                (5, 2, 1.0),
+                (5, 3, 1.0),
+            ],
+            b: vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0],
+        },
+        // 4x4 square nonsingular (lsqr converges to A^{-1} b)
+        PointCase {
+            case_id: "4x4_square_nonsingular".into(),
+            rows: 4,
+            cols: 4,
+            triplets: vec![
+                (0, 0, 4.0),
+                (0, 1, 1.0),
+                (1, 0, 1.0),
+                (1, 1, 4.0),
+                (1, 2, 1.0),
+                (2, 1, 1.0),
+                (2, 2, 4.0),
+                (2, 3, 1.0),
+                (3, 2, 1.0),
+                (3, 3, 4.0),
+            ],
+            b: vec![1.0, 2.0, 3.0, 4.0],
+        },
+    ];
 
     OracleQuery { points }
 }
