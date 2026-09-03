@@ -107,16 +107,12 @@ fn generate_query() -> OracleQuery {
     let mut points = Vec::new();
     for &(big_m, n, big_n) in &triples {
         // Support: [max(0, N+n-M), min(n, N)]
-        let k_min = if big_n + n > big_m {
-            big_n + n - big_m
-        } else {
-            0
-        };
+        let k_min = (big_n + n).saturating_sub(big_m);
         let k_max = n.min(big_n);
         let span = k_max - k_min;
         // Walk the entire support span if it fits in 21 steps,
         // otherwise sample 21 quantile-ish steps.
-        let n_steps = (span + 1).min(21) as u64;
+        let n_steps = (span + 1).min(21);
         for i in 0..n_steps {
             let k = if span < 21 {
                 k_min + i

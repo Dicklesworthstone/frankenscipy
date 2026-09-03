@@ -49,7 +49,7 @@ FrankenSciPy reimplements the SciPy surface in idiomatic Rust with three guarant
 | | SciPy | nalgebra / ndarray | argmin / linfa | **FrankenSciPy** |
 |---|---|---|---|---|
 | Memory safety | C/Fortran kernels | safe Rust | safe Rust | **`#![forbid(unsafe_code)]`** workspace-wide |
-| Async runtime | N/A (Python) | N/A | tokio-leaning | **asupersync** (no tokio) |
+| Async runtime | N/A (Python) | N/A | tokio-leaning | **none in the API** (synchronous kernels; no tokio anywhere in the tree) |
 | Surface area | ~1,300 callable symbols | low-level only | optimization or ML focus | **1,194 same-named public equivalents across 19 crates** (name census; see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)) |
 | Algorithm selection | hand-rolled per routine | manual | manual | **CASP runtime portfolio** with audit trail on the dense solve family; rule-based selectors elsewhere |
 | Conformance against SciPy | self-checking | none | partial | **15 Python oracles, 731 differential test files** that resolve a live SciPy interpreter at test time |
