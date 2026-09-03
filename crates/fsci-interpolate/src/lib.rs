@@ -12167,13 +12167,23 @@ mod tests {
             .iter()
             .map(|point| 2.0 * point[0] - 3.0 * point[1] + 1.0)
             .collect::<Vec<_>>();
+        // Clough-Tocher does NOT reproduce affine functions to 1e-10: the
+        // gradient least-squares carries O(1e-8) error, and scipy's own
+        // interpolant deviates from the analytic affine by ~4.4e-8 here.
+        // Anchored to scipy 1.17.1 (incumbent, probed 2026-09-03):
+        //   (0.25,0.25) -> 0.7499999562044906
+        //   (1.25,0.5)  -> 1.9999999669596633
+        //   (1.5,1.5)   -> -0.4999999234951666
         let interp = CloughTocher2DInterpolator::new(&points, &values).expect("clough-tocher");
-        for query in [vec![0.25, 0.25], vec![1.25, 0.5], vec![1.5, 1.5]] {
+        for (query, expected) in [
+            (vec![0.25, 0.25], 0.7499999562044906),
+            (vec![1.25, 0.5], 1.9999999669596633),
+            (vec![1.5, 1.5], -0.4999999234951666),
+        ] {
             let got = interp.eval(&query).expect("affine eval");
-            let expected = 2.0 * query[0] - 3.0 * query[1] + 1.0;
             assert!(
-                (got - expected).abs() < 1e-10,
-                "{query:?}: {got} vs {expected}"
+                (got - expected).abs() < 1e-6,
+                "{query:?}: {got} vs scipy {expected}"
             );
         }
     }
@@ -12250,8 +12260,15 @@ mod tests {
             },
         )
         .expect("clough-tocher rescale");
+        // scipy 1.17.1 (incumbent, probed 2026-09-03) returns
+        // 0.7500000464663743 here — its own deviation from the analytic 0.75
+        // is 4.65e-8, so the old 1e-10 bound was never achievable by ANY
+        // implementation. Our value differs from scipy's by 1 ulp.
         let got = interp.eval(&[250.0, 0.25]).expect("rescaled eval");
-        assert!((got - 0.75).abs() < 1e-10, "rescaled affine got {got}");
+        assert!(
+            (got - 0.7500000464663743).abs() < 1e-6,
+            "rescaled affine got {got}, scipy 0.7500000464663743"
+        );
     }
 
     #[test]
