@@ -16,7 +16,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_sparse::{CooMatrix, FormatConvertible, IluOptions, Shape2D, spilu};
@@ -211,7 +211,7 @@ for c in q["points"]:
 print(json.dumps({"points": out}))
 "#;
     let query_json = serde_json::to_string(q).expect("serialize");
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_interpolate::{
@@ -318,7 +318,7 @@ fn rbf_kernel(name: &str) -> RbfKernel {
 fn run_scipy_rbf_oracle(case: &RbfCase) -> RbfOracleResult {
     let oracle =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python_oracle/scipy_interpolate_oracle.py");
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .arg(oracle)
         .arg("--rbf-live")
         .stdin(Stdio::piped())
@@ -384,7 +384,7 @@ print(json.dumps(results))
 "#;
 
     let json_input = serde_json::to_string(cases).expect("serialize interp1d cases");
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .args(["-c", python_code])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -440,7 +440,7 @@ print(json.dumps(results))
 "#;
 
     let json_input = serde_json::to_string(cases).expect("serialize lagrange cases");
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .args(["-c", python_code])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -496,7 +496,7 @@ print(json.dumps(results))
 "#;
 
     let json_input = serde_json::to_string(cases).expect("serialize polyfit cases");
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .args(["-c", python_code])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -553,7 +553,7 @@ print(json.dumps(results))
 "#;
 
     let json_input = serde_json::to_string(cases).expect("serialize spline cases");
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .args(["-c", python_code])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

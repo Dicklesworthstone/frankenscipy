@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_sparse::{CsrMatrix, Shape2D, breadth_first_order, depth_first_order};
@@ -179,7 +179,7 @@ for case in q["points"]:
 print(json.dumps({"points": points}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize bfs_dfs query");
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

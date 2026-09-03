@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_spatial::{
@@ -415,7 +415,7 @@ for c in cases:
 json.dump(results, sys.stdout)
 "#;
 
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .args(["-c", script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

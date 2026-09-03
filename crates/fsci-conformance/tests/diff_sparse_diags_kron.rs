@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_sparse::{CsrMatrix, Shape2D, diags, kron, kronsum};
@@ -305,7 +305,7 @@ for c in q["kron_cases"]:
 print(json.dumps({"diags": diags_out, "kron": kron_out}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize diags_kron query");
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_linalg::{DecompOptions, eigh_tridiagonal};
@@ -173,7 +173,7 @@ print(json.dumps({"points": points}))
         eprintln!("skipping eigh_tridiagonal oracle: script write failed ({e})");
         return None;
     }
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg(&script_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

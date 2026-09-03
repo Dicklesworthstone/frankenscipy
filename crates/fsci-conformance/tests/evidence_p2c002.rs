@@ -22,7 +22,6 @@ use fsci_linalg::{
 use fsci_runtime::RuntimeMode;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // ── Fixture data structures ────────────────────────────────────────────────────
 
@@ -659,7 +658,7 @@ fn now_str() -> String {
 #[test]
 fn oracle_capture_p2c002_linalg() {
     // Check if SciPy is available
-    let scipy_check = Command::new("python3")
+    let scipy_check = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg("import scipy; import numpy")
         .status();

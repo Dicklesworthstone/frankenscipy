@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_stats::{SobolSampler, qmc_scale};
@@ -177,7 +177,7 @@ for c in q["scale"]:
 print(json.dumps({"sobol": sobol_out, "scale": scale_out}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize qmc_sobol_scale query");
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

@@ -36,7 +36,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fsci_opt::{BracketOptions, bracket_root};
@@ -337,7 +337,7 @@ for case in q["points"]:
 print(json.dumps({"points": points}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize bracket_root query");
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

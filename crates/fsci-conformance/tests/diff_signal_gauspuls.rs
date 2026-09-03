@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_signal::gauspuls;
@@ -180,7 +180,7 @@ print(json.dumps(results))
 
     let cases_json = serde_json::to_string(cases).expect("serialize gauspuls cases");
 
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use fsci_linalg::{LinalgError, MatrixAssumption, SolveOptions, solve};
 use fsci_runtime::RuntimeMode;
@@ -155,7 +155,7 @@ struct SolveErrorCase {
 }
 
 fn scipy_available_or_skip(test_id: &str) -> Result<bool, String> {
-    let available = Command::new("python3")
+    let available = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg("import scipy")
         .stdout(Stdio::null())
@@ -179,7 +179,7 @@ where
     I: Serialize,
     O: DeserializeOwned,
 {
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

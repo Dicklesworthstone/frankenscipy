@@ -11,7 +11,6 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2015,7 +2014,7 @@ fn e2e_018_strongly_connected_components() {
 /// Scenario 19: Sparse helper parity against live SciPy.
 #[test]
 fn e2e_019_sparse_helper_oracle_match() {
-    let scipy_check = Command::new("python3")
+    let scipy_check = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg("import scipy; import numpy")
         .status();
@@ -2342,7 +2341,7 @@ fn e2e_019_sparse_helper_oracle_match() {
     let oracle_script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("python_oracle/scipy_sparse_oracle.py");
     let t_start = Instant::now();
-    let output = Command::new("python3")
+    let output = fsci_conformance::scipy_oracle_command()
         .arg(&oracle_script)
         .arg("--fixture")
         .arg(&fixture_path)

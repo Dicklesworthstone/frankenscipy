@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_opt::{
@@ -238,7 +238,7 @@ print(json.dumps(results))
 "#;
 
     let json_input = serde_json::to_string(cases).expect("serialize root cases");
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .args(["-c", python_code])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -302,7 +302,7 @@ print(json.dumps(results))
 "#;
 
     let json_input = serde_json::to_string(cases).expect("serialize minimize cases");
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .args(["-c", python_code])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

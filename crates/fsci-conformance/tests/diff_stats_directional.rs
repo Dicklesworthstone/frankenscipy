@@ -195,7 +195,7 @@ for case in q["points"]:
 print(json.dumps({"points": points}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize directional query");
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

@@ -22,7 +22,7 @@ use serde::Serialize;
 use std::fs;
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 // ───────────────────── Structured log types ─────────────────────
@@ -162,7 +162,7 @@ fn append_coo_array_contract(values: &mut Vec<f64>, array: &CooArray) {
 
 fn run_scipy_sparse_oracle(label: &str, script: &str) -> Option<Vec<f64>> {
     let required = std::env::var_os(REQUIRE_SCIPY_ENV).is_some();
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_linalg::{
@@ -394,7 +394,7 @@ for case in q["cho_solve_banded"]:
 print(json.dumps(result, allow_nan=False))
 "#
     .replace("__QUERY_JSON__", &query_json_literal);
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

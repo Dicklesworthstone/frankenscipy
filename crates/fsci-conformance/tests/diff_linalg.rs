@@ -12,7 +12,6 @@ use fsci_runtime::RuntimeMode;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize)]
@@ -58,7 +57,7 @@ const DEFINED_DIFF_CASES: usize = 36;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 fn scipy_available() -> bool {
-    let output = Command::new("python3")
+    let output = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg("from scipy import linalg")
         .output();
@@ -125,7 +124,7 @@ print(json.dumps({{"x": x.tolist()}}))
 "#,
         a_json, b_json
     );
-    let output = Command::new("python3")
+    let output = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(&script)
         .output()
@@ -153,7 +152,7 @@ print(json.dumps({{"det": float(d)}}))
 "#,
         a_json
     );
-    let output = Command::new("python3")
+    let output = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(&script)
         .output()
@@ -177,7 +176,7 @@ print(json.dumps({{"s": s.tolist()}}))
 "#,
         a_json
     );
-    let output = Command::new("python3")
+    let output = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(&script)
         .output()

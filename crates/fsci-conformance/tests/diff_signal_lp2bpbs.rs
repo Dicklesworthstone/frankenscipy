@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_signal::{lp2bp, lp2bs};
@@ -169,7 +169,7 @@ print(json.dumps({"bp": bp_results, "bs": bs_results}))
 
     let cases_json = serde_json::to_string(cases).expect("serialize lp2bpbs cases");
 
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

@@ -10,7 +10,7 @@ use std::error::Error;
 use std::fs;
 use std::io::{Error as IoError, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_special::{bdtrik, bdtrin, nbdtrik, nbdtrin};
@@ -163,7 +163,7 @@ print(json.dumps({"points": points}))
 "#;
 
     let query_json = serde_json::to_string(query)?;
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-")
         .arg(query_json)
         .stdin(Stdio::piped())

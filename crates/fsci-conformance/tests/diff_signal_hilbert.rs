@@ -8,7 +8,7 @@ use std::f64::consts::PI;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_signal::{hilbert, hilbert_envelope};
@@ -289,7 +289,7 @@ print(json.dumps(results))
 
     let cases_json = serde_json::to_string(cases).expect("serialize hilbert cases");
 
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

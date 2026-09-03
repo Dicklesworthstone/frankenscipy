@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_special::orthopoly::{
@@ -230,7 +230,7 @@ for case in cases:
 print(json.dumps(results))
 "#;
 
-    let mut child = Command::new("python3")
+    let mut child = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(python_code)
         .stdin(Stdio::piped())

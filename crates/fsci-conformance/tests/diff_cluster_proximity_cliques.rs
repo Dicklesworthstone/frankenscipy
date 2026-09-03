@@ -19,7 +19,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_cluster::proximity_cliques;
@@ -199,7 +199,7 @@ for case in q["points"]:
 print(json.dumps({"points": points}, allow_nan=False))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize proximity_cliques query");
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())

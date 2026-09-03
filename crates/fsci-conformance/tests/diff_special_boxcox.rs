@@ -7,7 +7,7 @@
 
 use std::error::Error;
 use std::io::{Error as IoError, Write};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use fsci_special::boxcox_scalar;
 use serde::{Deserialize, Serialize};
@@ -125,7 +125,7 @@ print(json.dumps({"points": points}))
 "#;
 
     let query_json = serde_json::to_string(query)?;
-    let mut child = match Command::new("python3")
+    let mut child = match fsci_conformance::scipy_oracle_command()
         .arg("-")
         .arg(query_json)
         .stdin(Stdio::piped())

@@ -2709,6 +2709,23 @@ fn oracle_incumbent() -> Option<&'static ScipyIncumbent> {
         .as_ref()
 }
 
+/// A `Command` for a live-SciPy oracle spawn: the proven incumbent when this host has one,
+/// carrying the `PYTHONPATH` and single-thread environment it was proven under; a bare
+/// `python3` otherwise, so an absent oracle still reports as missing (or fails closed under
+/// `FSCI_REQUIRE_SCIPY_ORACLE=1`) exactly as before rather than panicking here.
+///
+/// Every `diff_*` integration test that shells out to SciPy builds its interpreter through
+/// this. Measured 2026-09-03 (frankenscipy-ivxx6 follow-up): 653 of them spawned
+/// `Command::new("python3")` directly, so on the one host that carries the pinned
+/// scipy 1.17.1 (`thinkstation1`, where `python3` is 3.14 with no SciPy) the whole corpus
+/// skipped silently, and on the rch workers it compared against whatever `python3` had
+/// (1.18.1) without ever saying so. The resolver prints its provenance line once per
+/// process, so a run's log now names the interpreter and both versions.
+#[must_use]
+pub fn scipy_oracle_command() -> Command {
+    oracle_incumbent().map_or_else(|| Command::new("python3"), ScipyIncumbent::command)
+}
+
 /// Interpreter an oracle config defaults to: the proven incumbent when there is one.
 fn default_oracle_python() -> PathBuf {
     oracle_incumbent().map_or_else(
