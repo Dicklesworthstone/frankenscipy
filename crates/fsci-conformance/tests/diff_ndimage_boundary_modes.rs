@@ -93,42 +93,37 @@ const EXPECTED_MAPPING: [(&str, &str); 5] = [
 /// for every order, so ours diverges wherever the boundary is reached and the order is one
 /// nobody special-cased. `Nearest` never appears below: clamping is order-independent, so it is
 /// immune by construction.
-const KNOWN_DIVERGENCES_TO_FIX: [(&str, &str); 23] = [
+const KNOWN_DIVERGENCES_TO_FIX: [(&str, &str); 15] = [
     // Order 0 tie-breaks: scipy maps the coordinate THEN rounds, we round then map, so the two
     // disagree at exact half-integers.
     ("1d-5-order0", "Mirror"),
     ("1d-5-order0", "Wrap"),
     // Orders 2, 4, 5 — the generic prefilter path.
-    ("1d-5-order2", "Reflect"),
     ("1d-5-order2", "Constant"),
     ("1d-5-order2", "Wrap"),
     ("1d-8-neg-order2", "Constant"),
     ("1d-8-neg-order2", "Wrap"),
-    ("1d-5-order4", "Reflect"),
     ("1d-5-order4", "Constant"),
     ("1d-5-order4", "Wrap"),
-    ("1d-8-neg-order4", "Reflect"),
     ("1d-8-neg-order4", "Constant"),
     ("1d-8-neg-order4", "Wrap"),
-    ("1d-5-order5", "Reflect"),
     ("1d-5-order5", "Constant"),
+    ("1d-5-order5", "Reflect"),
     ("1d-5-order5", "Wrap"),
-    ("1d-8-neg-order5", "Reflect"),
     ("1d-8-neg-order5", "Constant"),
     ("1d-8-neg-order5", "Wrap"),
-    // Reflect at order 3: the cubic special case covers Constant and Wrap but not Reflect.
-    ("1d-5-order3", "Reflect"),
-    ("1d-6-bign<", "Reflect"),
-    ("1d-5-cval-o3", "Reflect"),
-    ("2d-4x5-o3", "Reflect"),
 ];
+// The eight Reflect entries removed on 2026-09-04: the short-axis stencil
+// degradation (frankenscipy-0y8z8) was their cause — at full order with the
+// per-tap fold, Reflect matches the incumbent at orders 3, 4 and 5 on every
+// case the ratchet previously excused.
 
-/// Cells where this crate REFUSES an input the incumbent accepts.
-///
-/// SciPy computes an answer for `shift` at spline order 5 on a length-5 axis; we return
-/// "mirror boundary requires each axis length > spline order". A restriction we impose and the
-/// incumbent does not, so it belongs in the same ledger rather than being silently tolerated.
-const KNOWN_REFUSALS_TO_FIX: [(&str, &str); 1] = [("1d-5-order5", "Mirror")];
+/// Cells where this crate REFUSES an input the incumbent accepts. EMPTY since
+/// 2026-09-04: the sole entry ("1d-5-order5", "Mirror" — a length-5 axis at
+/// spline order 5, which scipy computes and we refused with "mirror boundary
+/// requires each axis length > spline order") was produced by the fail-closed
+/// removed with frankenscipy-0y8z8; the case now interpolates and matches.
+const KNOWN_REFUSALS_TO_FIX: [(&str, &str); 0] = [];
 
 fn is_known_divergence(case_id: &str, our_mode: &str) -> bool {
     KNOWN_DIVERGENCES_TO_FIX
