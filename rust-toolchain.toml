@@ -11,5 +11,5 @@
 # 2026-07-20 is the newest nightly that predates the promotion. Bumping the pin is a
 # deliberate, separately-benched act: raise it only together with the lint sweep tracked by
 # `frankenscipy-so4d3`, never as a drive-by.
-channel = "nightly-2026-07-20"
+channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]
