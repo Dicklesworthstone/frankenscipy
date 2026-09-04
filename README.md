@@ -1495,7 +1495,7 @@ fuzz/
 └── artifacts/      # minimized reproducers from any crash
 ```
 
-The nightly `fuzz_nightly.yml` GitHub Actions workflow runs the nine `p2c006_special_*` targets for 900 seconds each under ASan+UBSan; the other 89 targets are run by hand with `cargo fuzz run <target>`. Crash reproducers land in `fuzz/artifacts/`; the `fuzz_triage` binary promotes them to regression fixtures and files `fuzz-finding` beads when run by hand, but the nightly workflow does not invoke it.
+The nightly `fuzz_nightly.yml` GitHub Actions workflow runs the nine `p2c006_special_*` targets for 900 seconds each under ASan (cargo-fuzz's `-Zsanitizer=address`; UBSan is not reachable through `-Zsanitizer` on the pinned toolchain — an earlier `address,undefined` flag was rejected at compile time and kept the workflow red at the build step); the other 89 targets are run by hand with `cargo fuzz run <target>`. Crash reproducers land in `fuzz/artifacts/`; the `fuzz_triage` binary promotes them to regression fixtures and files `fuzz-finding` beads when run by hand, but the nightly workflow does not invoke it.
 
 Each target uses `libfuzzer-sys` and is structured around the same three-phase pattern:
 
@@ -1848,7 +1848,9 @@ without SciPy and asserting it fails.
 | G9 | `tolerance-policy ratchet` | `tolerance_lint --max-violations 361` over the `FSCI-P2C-*.json` fixtures; the threshold may only fall. It does not yet scan the tolerances written in the `diff_*.rs` files |
 
 A separate `fuzz_nightly.yml` workflow runs nine `fsci-special` fuzz targets
-under ASan+UBSan on a nightly schedule.
+under ASan on a nightly schedule (an earlier `address,undefined` sanitizer
+flag was rejected by rustc at compile time and kept the workflow red before
+any target fuzzed; fixed 2026-09-04).
 
 Before 2026-09-03 the workflow had never completed successfully, so no gate
 claim in this README was enforced by CI; the first fully green run is roadmap
