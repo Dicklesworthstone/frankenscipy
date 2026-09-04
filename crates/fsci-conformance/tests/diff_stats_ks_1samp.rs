@@ -149,13 +149,17 @@ for case in q["points"]:
     cid = case["case_id"]
     data = np.array(case["data"], dtype=float)
     try:
-        # method='asymp' to match fsci's kolmogorov_pvalue series
-        # path. (fsci does not implement the exact-distribution branch.)
-        # ks_1samp requires a callable for the cdf — pass stats.norm.cdf
-        # directly. (Earlier this passed the string 'norm' which scipy
-        # silently raised TypeError on, dropping all cases — see commit
-        # log for the case_count=0 regression that hid this for ages.)
-        res = stats.ks_1samp(data, stats.norm.cdf, method='asymp')
+        # scipy's documented default (method='auto') resolves to the EXACT
+        # Kolmogorov distribution for n <= 10000, matching fsci's exact
+        # kolmogn_sf port (frankenscipy-ksk1u) — the earlier method='asymp'
+        # pin compared scipy's asymptotic series against fsci's exact
+        # branch and diverged by up to 0.038 at n=14 on the first live run
+        # (2026-09-04). ks_1samp requires a callable for the cdf — pass
+        # stats.norm.cdf directly. (Earlier this passed the string 'norm'
+        # which scipy silently raised TypeError on, dropping all cases —
+        # see commit log for the case_count=0 regression that hid this
+        # for ages.)
+        res = stats.ks_1samp(data, stats.norm.cdf)
         points.append({
             "case_id": cid,
             "statistic": fnone(res.statistic),

@@ -11,18 +11,16 @@
 //! 16 cases. Tol 1e-12 statistic / 1e-7 pvalue (KS-distribution
 //! tail chain).
 //!
-//! Note: an earlier version of this harness (and
-//! diff_stats_ks_1samp.rs / diff_stats_ks_2samp_alt.rs)
-//! pinned the oracle to `method='asymptotic'` — that's an
-//! UNDOCUMENTED scipy method value that silently returns
-//! pvalue=1.0 as a sentinel. The documented value is
-//! `method='asymp'` (no -tic). Switching the oracle to
-//! `method='asymp'` aligns scipy's Kolmogorov chain with
-//! fsci's `kolmogorov_pvalue` series at 1e-7 across all
-//! fixtures, including the cdf-mode dispatch that previously
-//! appeared to diverge by 0.06 — that gap was actually
-//! scipy returning the 1.0 sentinel, not an fsci defect.
-//! See [frankenscipy-8rfh5] (now closed as not-a-defect).
+//! Note: harness history — an earlier version pinned the oracle to
+//! `method='asymptotic'` (an UNDOCUMENTED scipy value returning pvalue=1.0
+//! as a sentinel), then `method='asymp'` to match fsci's
+//! `kolmogorov_pvalue` series. Since frankenscipy-ksk1u, fsci implements
+//! the EXACT Kolmogorov distribution for n <= 10000 (`kolmogn_sf`:
+//! DMTW/Pomeranz/RRDG — scipy's own `_kolmogn` dispatch), so the oracle
+//! now uses scipy's documented default (`method='auto'`): exact-vs-exact.
+//! The asymp pin diverged from the exact branch by up to 0.038 at n=14 on
+//! the first live-oracle run (2026-09-04). See [frankenscipy-8rfh5] and
+//! [frankenscipy-ksk1u].
 
 use std::collections::HashMap;
 use std::fs;
@@ -35,11 +33,14 @@ use fsci_stats::{ContinuousDistribution, KstestTarget, Normal, kstest};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-// Tols mirror diff_stats_ks_1samp.rs: 1e-12 stat / 1e-7 pvalue
-// after pinning the oracle to method='asymp' to match fsci's
-// Kolmogorov-series default.
+// Tols mirror diff_stats_ks_1samp.rs: 1e-12 statistic / 1e-7 pvalue.
 const STAT_TOL: f64 = 1.0e-12;
 const PVALUE_TOL: f64 = 1.0e-7;
+// The oracle uses scipy's documented default (method='auto'): exact
+// Kolmogorov for n <= 10000, matching fsci's exact kolmogn port
+// (frankenscipy-ksk1u). The earlier method='asymp' pin predates that
+// port and diverged by up to 0.038 at n=14 on the first live run
+// (2026-09-04).
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
@@ -195,10 +196,13 @@ for case in q["points"]:
     stat = None; pval = None
     try:
         if mode == "cdf":
-            # method='asymp' matches fsci's kolmogorov_pvalue series;
-            # scipy's default 'auto' picks exact for n ≤ 50 which fsci
-            # doesn't implement.
-            res = stats.kstest(data, "norm", method="asymp")
+            # scipy's documented default (method='auto') resolves to the
+            # EXACT Kolmogorov distribution for n <= 10000, matching fsci's
+            # exact kolmogn port (DMTW/Pomeranz/RRDG, frankenscipy-ksk1u).
+            # The earlier method='asymp' pin compared scipy's asymptotic
+            # series against fsci's exact branch and diverged by up to
+            # 0.038 at n=14 — exact-vs-exact is the parity contract.
+            res = stats.kstest(data, "norm")
         elif mode == "sample":
             ref = np.array(case["reference"], dtype=float)
             res = stats.kstest(data, ref)
