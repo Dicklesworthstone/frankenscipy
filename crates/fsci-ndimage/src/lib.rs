@@ -1475,9 +1475,7 @@ fn prefilter_spline_coefficients(
                 (_, BoundaryMode::Reflect) if exact_reflect => {
                     bspline_reflect_coefficients(&line, order)
                 }
-                (_, current_mode)
-                    if spline_prefilter_is_mirror_class(current_mode) =>
-                {
+                (_, current_mode) if spline_prefilter_is_mirror_class(current_mode) => {
                     bspline_mirror_coefficients(&line, order)
                 }
                 _ => spline_coefficients_for_line(&line, order)?,
@@ -16293,9 +16291,17 @@ mod tests {
                 "map_coordinates mirror order3 {a} vs {b}"
             );
         }
-        // An axis too short for the order's stencil still fails closed.
+        // An axis shorter than the order's stencil NO LONGER fails closed:
+        // scipy's mirror prefilter is valid for every n >= 2, and
+        // scipy.ndimage.map_coordinates([1,2,3], [1.2], order=3,
+        // mode='mirror') returns 2.296 exactly (incumbent 1.17.1, probed
+        // 2026-09-03, frankenscipy-0y8z8).
         let short = NdArray::new(vec![1.0, 2.0, 3.0], vec![3]).unwrap();
-        assert!(map_coordinates(&short, &[vec![1.2]], 3, m, 0.0).is_err());
+        let short_val = map_coordinates(&short, &[vec![1.2]], 3, m, 0.0).expect("short mirror");
+        assert!(
+            (short_val[0] - 2.296).abs() < 1e-9,
+            "short mirror {short_val:?}"
+        );
 
         // index reflection helpers agree on the whole-sample fold.
         assert_eq!(boundary_index_1d(-1, 8, m), Some(1));

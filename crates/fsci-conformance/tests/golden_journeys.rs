@@ -62,7 +62,11 @@ fn floats_close(a: f64, b: f64) -> bool {
     (a - b).abs() <= ATOL + RTOL * a.abs().max(b.abs())
 }
 
-fn json_close(a: &serde_json::Value, b: &serde_json::Value, path: &mut String) -> Result<(), String> {
+fn json_close(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    path: &mut String,
+) -> Result<(), String> {
     match (a, b) {
         (serde_json::Value::Object(ma), serde_json::Value::Object(mb)) => {
             for (k, va) in ma {
@@ -84,7 +88,11 @@ fn json_close(a: &serde_json::Value, b: &serde_json::Value, path: &mut String) -
         }
         (serde_json::Value::Array(aa), serde_json::Value::Array(ab)) => {
             if aa.len() != ab.len() {
-                return Err(format!("array length {} vs {} at {path}", aa.len(), ab.len()));
+                return Err(format!(
+                    "array length {} vs {} at {path}",
+                    aa.len(),
+                    ab.len()
+                ));
             }
             for (i, (va, vb)) in aa.iter().zip(ab.iter()).enumerate() {
                 let len = path.len();
@@ -105,8 +113,7 @@ fn json_close(a: &serde_json::Value, b: &serde_json::Value, path: &mut String) -
                 // optimizer OUTPUT values in the same snapshot keep the tight
                 // float bound above.
                 (Some(x), Some(y))
-                    if is_count_key(path)
-                        && (x - y).abs() <= 8.0 + (x.abs() + y.abs()) / 4.0 =>
+                    if is_count_key(path) && (x - y).abs() <= 8.0 + (x.abs() + y.abs()) / 4.0 =>
                 {
                     Ok(())
                 }
@@ -149,10 +156,13 @@ fn write_journey(result: &JourneyResult) {
             golden_path.display()
         )
     });
-    let expected: serde_json::Value = serde_json::from_str(&expected_raw)
-        .unwrap_or_else(|err| panic!("golden journey {} is invalid JSON ({err})", normalized.journey_id));
-    let actual_value =
-        serde_json::to_value(&normalized).expect("serialize journey result");
+    let expected: serde_json::Value = serde_json::from_str(&expected_raw).unwrap_or_else(|err| {
+        panic!(
+            "golden journey {} is invalid JSON ({err})",
+            normalized.journey_id
+        )
+    });
+    let actual_value = serde_json::to_value(&normalized).expect("serialize journey result");
 
     let mut path = normalized.journey_id.clone();
     if let Err(mismatch) = json_close(&actual_value, &expected, &mut path) {

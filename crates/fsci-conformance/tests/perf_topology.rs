@@ -141,12 +141,10 @@ fn g6_workflow_invokes_all_listed_perf_tests() -> TestResult {
         );
     }
     if !g6_block.contains("cargo test -p fsci-conformance --test") {
-        return Err(
-            "G6 job no longer runs the discovered perf tests via \
+        return Err("G6 job no longer runs the discovered perf tests via \
              `cargo test -p fsci-conformance --test`; verify how perf tests are \
              invoked and update this topology test."
-                .into(),
-        );
+            .into());
     }
 
     Ok(())
