@@ -2003,6 +2003,7 @@ fn sample_interpolated(
                 }
             }
             let idx: Vec<i64> = coords.iter().map(|&c| round0(c)).collect();
+            return input.get_boundary(&idx, mode, cval);
         }
         if mode == BoundaryMode::Wrap {
             // scipy 'wrap' (probed against 1.17.1, frankenscipy-0y8z8): a
@@ -2013,19 +2014,24 @@ fn sample_interpolated(
             // rounding happens after the fold. Rounding first and folding
             // the rounded index folded the in-range endpoint len-1 to 0 and
             // broke even the identity rotation.
-            let idx: Vec<usize> = coords
-                .iter()
-                .enumerate()
-                .map(|(axis, &coord)| {
-                    let mapped = map_interpolation_coordinate(
-                        coord,
-                        input.shape[axis],
-                        BoundaryMode::Wrap,
-                    )
-                    .unwrap_or(0.0);
-                    round0(mapped) as usize
-                })
-                .collect();
+            // scipy's C casts the mapped coordinate per axis with int
+            // truncation, so fp noise from the rotation matrix (e.g.
+            // -2.2e-16 at the 90-degree corners) snaps back to the true
+            // integer before any boundary fold; without the snap the wrap
+            // fold threw those samples to the opposite edge
+            // (frankenscipy-0y8z8).
+            let mut idx = vec![0usize; coords.len()];
+            for (axis, &coord) in coords.iter().enumerate() {
+                let snapped = if (coord - coord.round()).abs() < 1e-9 {
+                    coord.round()
+                } else {
+                    coord
+                };
+                let mapped =
+                    map_interpolation_coordinate(snapped, input.shape[axis], BoundaryMode::Wrap)
+                        .unwrap_or(0.0);
+                idx[axis] = round0(mapped) as usize;
+            }
             return input.get(&idx);
         }
         let idx: Vec<i64> = coords.iter().map(|&coord| round0(coord)).collect();
@@ -10677,7 +10683,11 @@ pub fn rotate(
     let cx_out = (out_cols as f64 - 1.0) / 2.0;
 
     // Each output pixel is an independent interpolation; fill the row-major flat index
-    // `flat = r*out_cols + c` in parallel — bit-identical to the sequential (r, c) loop.
+    // Rotated deltas sum FIRST, center LAST — scipy's C applies the matrix to
+    // (out - center) and adds center as the final operation, so the residual
+    // fp noise at exact corners stays positive (in-range) instead of flipping
+    // the sample to cval/wrap-fold. Matches scipy 1.17.1 bit-for-bit at the
+    // 5x5 rot90/rot180 corners (frankenscipy-0y8z8).
     let _ = out_rows;
     let kernel_work = (order + 1) * (order + 1);
     // Resolve the spline knobs ONCE, outside the per-pixel work below
@@ -10686,8 +10696,8 @@ pub fn rotate(
     fill_pixels_parallel(&mut output, kernel_work, |flat, _scratch| {
         let dy = (flat / out_cols) as f64 - cy_out;
         let dx = (flat % out_cols) as f64 - cx_out;
-        let src_y = cy_in + cos_a * dy + sin_a * dx;
-        let src_x = cx_in - sin_a * dy + cos_a * dx;
+        let src_y = cos_a * dy + sin_a * dx + cy_in;
+        let src_x = -sin_a * dy + cos_a * dx + cx_in;
         sample_interpolated(
             input,
             &spline.coeffs,
