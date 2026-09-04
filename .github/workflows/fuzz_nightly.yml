@@ -1,8 +1,13 @@
-name: Fuzz (nightly ASan+UBSan)
+name: Fuzz (nightly ASan)
 
 # Scheduled nightly fuzz run for fsci-special oracle-roundtrip and
-# related complex-branch harnesses. Runs with ASan + UBSan per
-# /testing-fuzzing hard rule 5. br-n3au.
+# related complex-branch harnesses, under AddressSanitizer via cargo-fuzz's
+# own -Zsanitizer=address. br-n3au. The original config asked for
+# `-Zsanitizer=address,undefined`, which the pinned toolchain REJECTS at
+# compile time (`undefined` is not a rustc sanitizer value at all — see the
+# accepted list in any `-Z help`), so every nightly failed while BUILDING the
+# first target and never fuzzed anything. UBSan is not available through
+# -Zsanitizer on this toolchain; ASan + libFuzzer's own checks are what runs.
 
 on:
   schedule:
@@ -31,11 +36,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - name: Run fuzz targets with ASan+UBSan (900s each)
+      - name: Run fuzz targets with ASan (900s each)
         env:
-          RUSTFLAGS: "-Zsanitizer=address,undefined"
           ASAN_OPTIONS: "detect_leaks=0"
-          UBSAN_OPTIONS: "print_stacktrace=1"
         run: |
           set -e
           for t in p2c006_special_airy_complex \
@@ -47,7 +50,7 @@ jobs:
                    p2c006_special_hyper_complex \
                    p2c006_special_incomplete_gamma_beta \
                    p2c006_special_oracle_roundtrip; do
-            echo "=== fuzz $t (900s, ASan+UBSan) ==="
+            echo "=== fuzz $t (900s, ASan) ==="
             timeout 920 cargo fuzz run "$t" -- -max_total_time=900 || \
               { echo "$t failed"; exit 1; }
           done
@@ -62,16 +65,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
-      - name: Run fuzz targets with ASan+UBSan (60s each)
+      - name: Run fuzz targets with ASan (60s each)
         env:
-          RUSTFLAGS: "-Zsanitizer=address,undefined"
           ASAN_OPTIONS: "detect_leaks=0"
-          UBSAN_OPTIONS: "print_stacktrace=1"
         run: |
           set -e
           for t in p2c006_special_complex_branches \
                    p2c006_special_oracle_roundtrip; do
-            echo "=== fuzz $t (60s, ASan+UBSan, PR lane) ==="
+            echo "=== fuzz $t (60s, ASan, PR lane) ==="
             timeout 80 cargo fuzz run "$t" -- -max_total_time=60 || \
               { echo "$t failed"; exit 1; }
           done
