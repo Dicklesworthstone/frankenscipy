@@ -8954,7 +8954,9 @@ pub fn lsqr_damped(
 /// WHEN BOTH ARE GIVEN, THE DAMPING APPLIES TO THE CORRECTION, so the problem
 /// minimized is
 ///
-///     ||A x - b||^2 + damp^2 ||x - x0||^2
+/// ```text
+/// ||A x - b||^2 + damp^2 ||x - x0||^2
+/// ```
 ///
 /// not `||A x - b||^2 + damp^2 ||x||^2`. SciPy documents this indirectly rather than
 /// in prose: its `r2norm` is `sqrt(||r||^2 + damp^2 ||x - x0||^2)` and its `arnorm`
@@ -9290,8 +9292,10 @@ pub fn lsmr(
 ///
 /// Solves the damped least-squares problem
 ///
-///     min || [ A      ] x - [ b ] ||
-///         || [ damp*I ]     [ 0 ] ||₂
+/// ```text
+/// min || [ A      ] x - [ b ] ||
+///     || [ damp*I ]     [ 0 ] ||₂
+/// ```
 ///
 /// which is the regularized normal equations `(AᵀA + damp²I) x = Aᵀb`. A positive
 /// `damp` makes the system nonsingular even when `A` is rank-deficient, which is the
@@ -9363,7 +9367,9 @@ pub fn lsmr_damped(
 /// guess the iteration solves for the CORRECTION and the damping applies to the
 /// correction, so the problem actually minimized is
 ///
-///     ||A x - b||^2 + damp^2 ||x - x0||^2
+/// ```text
+/// ||A x - b||^2 + damp^2 ||x - x0||^2
+/// ```
 ///
 /// i.e. `(A^T A + damp^2 I)(x - x0) = A^T (b - A x0)`. SciPy documents the same
 /// thing indirectly rather than in prose: its `r2norm` is
@@ -32137,9 +32143,11 @@ const SUPERNODAL_RELAXATION_TOLERANCE: usize = 8;
 /// `host=thinkstation1`, one pinned CPU, ELF `428fb95f…0469`, every row's A/A nulls inside
 /// the ±0.020 bound:
 ///
-///     cell                      shipping (banded)   general arm   general + SUPERNODAL
-///     cubic side=16  n=4096          1.4666x          0.6988x          0.1685x
-///     convection s=128 n=16384       0.6162x                --         0.0128x
+/// ```text
+/// cell                      shipping (banded)   general arm   general + SUPERNODAL
+/// cubic side=16  n=4096          1.4666x          0.6988x          0.1685x
+/// convection s=128 n=16384       0.6162x                --         0.0128x
+/// ```
 ///
 /// On cubic the blocked arm is **4.15x slower than the very general arm it replaces**, and
 /// on convection it is **48x** below the shipping cell. The direction is not marginal and it
@@ -32172,10 +32180,12 @@ pub static SPLU_SUPERNODAL_ENABLE: PerfToggle = PerfToggle::new(false);
 ///
 /// Measured A/B on the convection cell, five factorizations per arm, three repeats:
 ///
-///     arm        instructions        cycles      L1 misses
-///     general     943,655,267    454,132,145    26,170,574
-///     banded      674,681,519    385,355,882    20,176,132
-///                     -28.5%         -15.1%        -22.9%
+/// ```text
+/// arm        instructions        cycles      L1 misses
+/// general     943,655,267    454,132,145    26,170,574
+/// banded      674,681,519    385,355,882    20,176,132
+///                 -28.5%         -15.1%        -22.9%
+/// ```
 ///
 /// Cycle ranges do not overlap. **This is the only change measured on this kernel that moves
 /// CYCLES** -- three instruction reductions totalling -7.89% and an 8.6% miss reduction all failed
@@ -32184,9 +32194,11 @@ pub static SPLU_SUPERNODAL_ENABLE: PerfToggle = PerfToggle::new(false);
 /// DEFAULT ON. Measured against live SciPy 1.17.1 through the public entry point on both cells
 /// this repo tracks a loss for, balanced square, 41 rounds, both A/A nulls inside +/-0.020:
 ///
-///     cell                   general    banded     effect
-///     cubic (llywn)          0.7126x   1.2536x    1.733x, LOSS -> WIN
-///     convection (run7d)     0.4629x   0.6339x    1.369x, still a loss
+/// ```text
+/// cell                   general    banded     effect
+/// cubic (llywn)          0.7126x   1.2536x    1.733x, LOSS -> WIN
+/// convection (run7d)     0.4629x   0.6339x    1.369x, still a loss
+/// ```
 ///
 /// It declines on its actual precondition rather than a proxy: the dense span is sound only when
 /// the envelope IS the fill, which holds for a PATTERN-SYMMETRIC factor and fails otherwise --
@@ -32446,9 +32458,11 @@ pub static SPLU_ONE_COLUMN_INSERT_HITS: std::sync::atomic::AtomicUsize =
 /// the shipping path and this counter reads **0** there), `perf_splu 64 25 4 off convection`,
 /// live SciPy in the same invocation:
 ///
-///     swap ON   median 0.5247   range [0.4922, 0.5397]
-///     swap OFF  median 0.5361   range [0.5053, 0.5435]
-///     median ON/OFF = 0.9788
+/// ```text
+/// swap ON   median 0.5247   range [0.4922, 0.5397]
+/// swap OFF  median 0.5361   range [0.5053, 0.5435]
+/// median ON/OFF = 0.9788
+/// ```
 ///
 /// The ranges overlap, so this is not a decided regression — but there is no win, and the
 /// point estimate is the wrong way. **Why the copy was not the cost:** removing it also
@@ -32616,10 +32630,10 @@ pub static SPLU_ROW_CAPACITY_HEADROOM: std::sync::atomic::AtomicUsize =
 /// is O(fill) work the shipping path does not do, and it costs far more than the locality is
 /// worth. Measured on the worst cell (convection n=16,384, AMD — the only ordering that
 /// reaches the general path at all), four replicates alternated ABBA in one window,
-/// `perf_spsolve --convection-split 5 128`, arm proven live by `reserve_hits=6` against `0`:
-///
-///     factor, reserve ON    median 217.82 ms   range [150.67, 265.17]
-///     factor, reserve OFF   median  87.87 ms   range [ 79.55,  98.29]
+/// ```text
+/// factor, reserve ON    median 217.82 ms   range [150.67, 265.17]
+/// factor, reserve OFF   median  87.87 ms   range [ 79.55,  98.29]
+/// ```
 ///
 /// **Ranges completely disjoint** — the slowest OFF replicate is faster than the fastest ON
 /// one. The cause is already recorded elsewhere in this campaign: the pattern-based symbolic
