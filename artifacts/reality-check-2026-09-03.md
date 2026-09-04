@@ -165,3 +165,17 @@ Still open (unchanged or newly visible):
    toolchain) queued on the hosted-runner backlog; 33837902066 (fuzz build
    verification); sparse diff find_tril_triu / floyd_warshall unsampled; bead
    8oub0 (016/018 root parity reports).
+
+### Controlled-SHA verdict (dispatch 33837591299 @ 77ecb92bd, completed 2026-09-04)
+
+G1 ✓, G2 domain crates ✓ (all 18), G4 ✓, G7 ✓ — the infrastructure repairs
+hold. The 15 failures are the FIRST genuine live-oracle verdicts in project
+history (bead ia47s): G3 shards stats-{a-c,d-k,l-p,q-z}, special-a-h,
+signal, fft-integrate, ndimage, spatial-interp-cluster; G5; G3b; G3c; G6;
+G8 (fixed post-run: reality-check sidecars, f4ed298c4); G2-conformance
+(--doc). Known root-caused members: ndimage rotate (Wrap period + center
+convention, probe evidence captured), stats KS family (max_abs 0.0382 vs
+1e-6-class tolerances), savgol, romberg/nquad, spl_ops. The scheduled
+nightly (33859739601 @ 5a7053c78) added the toolchain-08-31 variable and
+broader G2 noise from concurrent in-flight work — bisect on a quiet tree
+before attributing those.
