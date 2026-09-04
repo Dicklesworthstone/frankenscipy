@@ -39,6 +39,11 @@ jobs:
       - name: Run fuzz targets with ASan (900s each)
         env:
           ASAN_OPTIONS: "detect_leaks=0"
+          # The ASan link of the fsci-special chain OOM-killed the hosted
+          # runner's ld on 2026-09-04 (10 silent minutes, then death with no
+          # diagnostics; libFuzzer never started). Both ld flags trade peak
+          # RSS for link speed.
+          RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory -Clink-arg=-Wl,--reduce-memory-overheads"
         run: |
           set -e
           for t in p2c006_special_airy_complex \
@@ -68,6 +73,7 @@ jobs:
       - name: Run fuzz targets with ASan (60s each)
         env:
           ASAN_OPTIONS: "detect_leaks=0"
+          RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory -Clink-arg=-Wl,--reduce-memory-overheads"
         run: |
           set -e
           for t in p2c006_special_complex_branches \
