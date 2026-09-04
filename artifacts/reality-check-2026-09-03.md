@@ -125,3 +125,43 @@ Still open (unchanged or newly visible):
   `-D warnings` passed at 05:28, runtime test failures appeared in 6 crates at 09:55.
 - Counts drift by the hour in a tree with per-minute auto-commits; the live numbers here beat the README's
   snapshot wherever they differ, and the differences found are cosmetic.
+
+---
+
+## Follow-ups executed 2026-09-04 (post-reality-check)
+
+1. **First full CI fan-out diagnosed and repaired.** Every failing gate of the
+   09:55 UTC run (25 failed jobs) was root-caused: G3/G3b setup-python
+   requirements file, G3-control stdlib-only canary, G3c missing incumbent
+   install, G9 ratchet breach (4 unexplained savgol relaxations — all proven
+   bit-exact vs scipy and tightened to baseline, count 365→360, threshold
+   lowered), 12 broken implicit-Rust doc blocks across 4 crates, aspirational
+   clough_tocher tolerances (scipy itself deviates 4.4e-8), the ndimage zoom
+   mirror fail-closed + Constant-mode tap lookup + stencil degradation, a NaN
+   panic through nalgebra SVD, bit-exact golden journeys (cross-host ulp
+   drift), a G6 meta-test stale against the glob-loop workflow, and
+   oracle-capture git-tracking drift. All verified by targeted rch runs.
+2. **Fuzz nightly never fuzzed.** `-Zsanitizer=address,undefined` is rejected
+   by rustc outright (`undefined` is not a sanitizer value); every nightly
+   died building target 1. Fixed to ASan-only; a second silent failure (10-min
+   link, no diagnostics, no libFuzzer banner) was addressed with ld
+   memory-pressure flags. Dispatches: 33837902066 and later.
+3. **drqu7 closed to zero uncontracted** in fsci-linalg (59/59; stats 139/139,
+   ndimage 38/38, spatial 8/8). Census gate exit 0.
+4. **ndimage boundary ratchet shrunk 23 → 15**: the short-axis stencil fix
+   matched 8 formerly-excused Reflect cases to the incumbent, and the removed
+   fail-closed emptied KNOWN_REFUSALS_TO_FIX. Verified 2/2 green on a worker
+   even running non-pinned scipy 1.18.1.
+5. **diff_ndimage_rotate worker failure adjudicated as oracle-side**: the
+   worker reported max_abs=24 on rot180_order0_wrap for a fixture whose input
+   maximum IS 24 (0..24) — the all-zeros-comparison signature of an oracle
+   returning data=None. The identical call on pinned scipy 1.17.1 returns the
+   correct rotation [24,23,…,0] with no exception (probed 2026-09-04). On the
+   worker, scipy 1.18.1 raises inside the oracle's per-case try/except for
+   every case. Bead ax6b0 tracks the genuine-incumbent runner confirmation
+   (G3-ndimage shard of run 33837591299).
+6. **Known-open after this session**: evidence runs 33837591299 (full fan-out,
+   pinned 07-20 toolchain) and 33837900836 (G1 on the re-pinned 08-31
+   toolchain) queued on the hosted-runner backlog; 33837902066 (fuzz build
+   verification); sparse diff find_tril_triu / floyd_warshall unsampled; bead
+   8oub0 (016/018 root parity reports).
