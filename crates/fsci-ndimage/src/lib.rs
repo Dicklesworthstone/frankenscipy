@@ -839,17 +839,6 @@ fn map_interpolation_coordinate(coord: f64, len: usize, mode: BoundaryMode) -> O
     }
 }
 
-fn wrap_interpolation_index(idx: i64, len: usize) -> usize {
-    if len <= 1 {
-        return 0;
-    }
-    // scipy `mode='wrap'` has period len-1 (the endpoints are identified), so the
-    // last index len-1 maps to 0. Wrap with period len-1 for every index — the
-    // previous in-range short-circuit wrongly returned len-1 unchanged.
-    let period = (len - 1) as i64;
-    idx.rem_euclid(period) as usize
-}
-
 fn fold_wrap_cubic_index(idx: isize, max: usize) -> usize {
     let max = max as isize;
     if idx < 0 {
@@ -2014,13 +2003,28 @@ fn sample_interpolated(
                 }
             }
             let idx: Vec<i64> = coords.iter().map(|&c| round0(c)).collect();
-            return input.get_boundary(&idx, mode, cval);
         }
         if mode == BoundaryMode::Wrap {
+            // scipy 'wrap' (probed against 1.17.1, frankenscipy-0y8z8): a
+            // coordinate inside [0, len-1] is used as-is — the endpoint
+            // len-1 is a real sample and must NOT fold — while anything
+            // outside folds with period len-1 on the FLOAT coordinate
+            // (4.3 -> 0.3 -> 0, 4.5 -> 0.5 -> 1, -0.5 -> 3.5 -> 4), and the
+            // rounding happens after the fold. Rounding first and folding
+            // the rounded index folded the in-range endpoint len-1 to 0 and
+            // broke even the identity rotation.
             let idx: Vec<usize> = coords
                 .iter()
                 .enumerate()
-                .map(|(axis, &coord)| wrap_interpolation_index(round0(coord), input.shape[axis]))
+                .map(|(axis, &coord)| {
+                    let mapped = map_interpolation_coordinate(
+                        coord,
+                        input.shape[axis],
+                        BoundaryMode::Wrap,
+                    )
+                    .unwrap_or(0.0);
+                    round0(mapped) as usize
+                })
                 .collect();
             return input.get(&idx);
         }
