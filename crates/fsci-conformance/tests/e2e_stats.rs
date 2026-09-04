@@ -4218,8 +4218,11 @@ fn e2e_041_ks_1samp_asymptotic_pvalue_parity() {
     let t = Instant::now();
     let skewed_samples: Vec<f64> = (0..50).map(|i| (i as f64 / 50.0).powi(2)).collect();
     let skewed = ks_1samp(&skewed_samples, |x| x.clamp(0.0, 1.0));
+    // Exact Kolmogorov p (scipy 1.17.1 method='auto'): 0.00103876659196811.
+    // The old 0.001364656 was the method='asymp' series — the two differ by
+    // ~25% at n=50, D=0.27 (frankenscipy-ksk1u).
     let skewed_pass = (skewed.statistic - 0.27).abs() < 1.0e-15
-        && (skewed.pvalue - 0.001_364_656_105_079_237).abs() < 1.0e-15;
+        && (skewed.pvalue - 0.001_038_766_591_968_11).abs() < 1.0e-15;
     if !skewed_pass {
         all_pass = false;
     }
@@ -4240,8 +4243,12 @@ fn e2e_041_ks_1samp_asymptotic_pvalue_parity() {
     let normal = Normal::standard();
     let normalish = [-1.2, -0.7, -0.2, 0.0, 0.1, 0.4, 0.9, 1.3];
     let normalish_result = ks_1samp(&normalish, |x| ContinuousDistribution::cdf(&normal, x));
+    // Golden = scipy 1.17.1 ks_1samp default (method='auto' → EXACT
+    // Kolmogorov for n=8), matching fsci's exact kolmogn_sf branch
+    // (frankenscipy-ksk1u). The old pvalue 0.9738 was the method='asymp'
+    // series — the asymptotic approximation, not the exact distribution.
     let normalish_pass = (normalish_result.statistic - 0.170_740_290_560_896_96).abs() < 1.0e-15
-        && (normalish_result.pvalue - 0.973_828_230_896_588_7).abs() < 1.0e-15;
+        && (normalish_result.pvalue - 0.944_446_367_452_444_6).abs() < 1.0e-15;
     if !normalish_pass {
         all_pass = false;
     }
