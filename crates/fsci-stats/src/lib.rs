@@ -54108,13 +54108,12 @@ pub fn contingency_table(x: &[usize], y: &[usize]) -> (Vec<Vec<usize>>, Vec<usiz
         table
     };
 
-    // Return the marginal totals (row sums, col sums) — the standard contingency-table margins —
-    // rather than the (internal) unique labels. (Bug fix: previously returned row_labels/col_labels.)
-    let row_margins: Vec<usize> = table.iter().map(|row| row.iter().sum()).collect();
-    let col_margins: Vec<usize> = (0..nc)
-        .map(|c| table.iter().map(|row| row[c]).sum())
-        .collect();
-    (table, row_margins, col_margins)
+    // Return the sorted distinct values as the labels — scipy.stats.contingency.crosstab
+    // semantics (row_labels = sorted unique x, col_labels = sorted unique y). A prior
+    // change returned the marginal totals here instead, which broke every label
+    // consumer; the live diff harness caught it on its first run
+    // (frankenscipy-0y8z8 follow-up, 2026-09-04).
+    (table, row_labels, col_labels)
 }
 
 /// Compute the relative risk from a 2x2 contingency table.
@@ -94319,9 +94318,12 @@ mod tests {
         assert_eq!(ef, vec![vec![12.0, 18.0], vec![28.0, 42.0]]);
         // contingency_table of paired labels.
         let (table, rm, cm) = contingency_table(&[0, 0, 1, 1], &[0, 1, 0, 1]);
-        assert_eq!(table, vec![vec![1, 1], vec![1, 1]]);
-        assert_eq!(rm, vec![2, 2]);
-        assert_eq!(cm, vec![2, 2]);
+        // Labels are the sorted distinct values (scipy crosstab semantics),
+        // NOT the marginal totals — the margins-as-labels inversion broke
+        // label consumers and was caught by the live diff harness
+        // (frankenscipy-0y8z8 follow-up).
+        assert_eq!(rm, vec![0, 1]);
+        assert_eq!(cm, vec![0, 1]);
     }
 
     #[test]
