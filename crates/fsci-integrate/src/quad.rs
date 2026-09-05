@@ -1672,9 +1672,19 @@ where
     use std::cell::RefCell;
 
     let ndim = ranges.len();
+    // scipy's nquad with an empty ranges list evaluates the function once at
+    // the (empty) point vector and returns that value with neval = 1 — the
+    // 0-D degenerate case. The earlier blanket rejection broke the
+    // diff_integrate_romberg_nquad live harness (frankenscipy-0y8z8
+    // follow-up, ia47s).
     if ndim == 0 {
-        return Err(IntegrateValidationError::QuadInvalidBounds {
-            detail: "nquad requires at least one integration range".to_string(),
+        let value = func(&[]);
+        let converged = value.is_finite();
+        return Ok(QuadResult {
+            integral: value,
+            error: 0.0,
+            neval: 1,
+            converged,
         });
     }
     // All nquad ranges are static, so reject malformed nested bounds before
