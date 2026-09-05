@@ -14006,6 +14006,11 @@ mod tests {
         let expected_t = [0.0, 0.0, 1.0, 2.0, 3.0, 3.0];
         for tck in &quadratic_bspline_tcks() {
             let (dt, dc, dk) = splder(tck).unwrap();
+            assert_eq!(dk, 1, "derivative degree is k - 1");
+            assert_eq!(dt, expected_t);
+            // scipy 1.17.1 maintains len(c') == len(t') through splder on the
+            // padded tck (probed): the 4 real derivative coefficients + 2
+            // trailing pad zeros.
             assert_eq!(dc.len(), dt.len(), "splder keeps len(c') == len(t')");
             assert_eq!(dc, expected_c_full);
         }
