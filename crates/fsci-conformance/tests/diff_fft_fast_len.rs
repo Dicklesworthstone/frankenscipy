@@ -193,8 +193,8 @@ fn diff_fft_fast_len() {
             continue;
         };
         let fsci_v = match case.op.as_str() {
-            "next" => next_fast_len(case.target),
-            "prev" => prev_fast_len(case.target),
+            "next" => next_fast_len(case.target, true),
+            "prev" => prev_fast_len(case.target, true),
             _ => continue,
         };
         diffs.push(CaseDiff {

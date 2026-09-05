@@ -5452,17 +5452,23 @@ pub fn irfftn_with_audit(
 
 /// Find the next fast length for FFT computation.
 ///
-/// Matches `scipy.fft.next_fast_len(target)`.
+/// Matches `scipy.fft.next_fast_len(target, real)`.
 ///
-/// Returns the smallest integer >= `target` that scipy treats as fast for
-/// complex FFTs: products of the small prime factors 2, 3, 5, 7, and 11.
-pub fn next_fast_len(target: usize) -> usize {
+/// With `real=false` (the scipy default) returns the smallest integer >=
+/// `target` whose factors lie in {2, 3, 5, 7, 11} — the radices pocketfft's
+/// complex transform handles efficiently. With `real=true` (real-input
+/// transforms) the set tightens to {2, 3, 5} — 5-smooth Hamming numbers.
+/// The earlier single-set implementation used the complex factor set for
+/// both and diverged from scipy's `real=True` answers on the first live
+/// run (frankenscipy-0y8z8 follow-up, ia47s).
+#[must_use]
+pub fn next_fast_len(target: usize, real: bool) -> usize {
     if target <= 1 {
         return target;
     }
     let mut n = target;
     loop {
-        if is_fast_len(n) {
+        if is_fast_len(n, real) {
             return n;
         }
         n += 1;
@@ -5471,33 +5477,42 @@ pub fn next_fast_len(target: usize) -> usize {
 
 /// Find the previous fast FFT length.
 ///
-/// Matches `scipy.fft.prev_fast_len(target)`.
+/// Matches `scipy.fft.prev_fast_len(target, real)`.
 ///
-/// Returns the largest integer ≤ `target` that is a product of small
-/// prime factors {2, 3, 5, 7, 11}. Used to downsize an FFT to a length cheaper
-/// than `target`. The empty-product `1` is always fast, so the
-/// search terminates at 1 in the worst case. Input `0` returns `0`.
+/// Returns the largest integer ≤ `target` whose prime factors lie in the
+/// fast set: {2, 3, 5, 7, 11} for `real=false` (the scipy default, complex
+/// transforms), tightened to {2, 3, 5} (5-smooth) for `real=true`. Used to
+/// downsize an FFT to a length cheaper than `target`. The empty-product `1`
+/// is always fast, so the search terminates at 1 in the worst case. Input
+/// `0` returns `0`.
 #[must_use]
-pub fn prev_fast_len(target: usize) -> usize {
+pub fn prev_fast_len(target: usize, real: bool) -> usize {
     if target == 0 {
         return 0;
     }
     let mut n = target;
     loop {
-        if is_fast_len(n) {
+        if is_fast_len(n, real) {
             return n;
         }
         n -= 1;
     }
 }
 
-/// Check if n is composed only of scipy's complex FFT fast factors.
+/// Check if n is composed only of the fast primes for the requested
+/// transform kind: {2, 3, 5, 7, 11} for complex (`real=false`, pocketfft's
+/// efficient radices, incl. 7 and 11 once each) and the 5-smooth subset
+/// {2, 3, 5} for real-input transforms (`real=true`). The earlier
+/// single-set implementation used the complex set for both and diverged
+/// from scipy's `real=True` answers on the first live run
+/// (frankenscipy-0y8z8 follow-up, ia47s).
 #[allow(clippy::manual_is_multiple_of)]
-fn is_fast_len(mut n: usize) -> bool {
+fn is_fast_len(mut n: usize, real: bool) -> bool {
     if n == 0 {
         return false;
     }
-    for factor in [2usize, 3, 5, 7, 11] {
+    let factors: &[usize] = if real { &[2, 3, 5] } else { &[2, 3, 5, 7, 11] };
+    for factor in factors {
         while n % factor == 0 {
             n /= factor;
         }
@@ -7608,29 +7623,29 @@ mod tests {
 
     #[test]
     fn next_fast_len_powers_of_2() {
-        assert_eq!(next_fast_len(1), 1);
-        assert_eq!(next_fast_len(2), 2);
-        assert_eq!(next_fast_len(4), 4);
-        assert_eq!(next_fast_len(8), 8);
+        assert_eq!(next_fast_len(1, false), 1);
+        assert_eq!(next_fast_len(2, false), 2);
+        assert_eq!(next_fast_len(4, false), 4);
+        assert_eq!(next_fast_len(8, false), 8);
     }
 
     #[test]
     fn next_fast_len_non_powers() {
-        assert_eq!(next_fast_len(7), 7);
-        assert_eq!(next_fast_len(11), 11);
-        assert_eq!(next_fast_len(13), 14); // 14 = 2 * 7
-        assert_eq!(next_fast_len(17), 18); // 18 = 2 * 3^2
-        assert_eq!(next_fast_len(101), 105); // 105 = 3 * 5 * 7
+        assert_eq!(next_fast_len(7, false), 7);
+        assert_eq!(next_fast_len(11, false), 11);
+        assert_eq!(next_fast_len(13, false), 14); // 14 = 2 * 7
+        assert_eq!(next_fast_len(17, false), 18); // 18 = 2 * 3^2
+        assert_eq!(next_fast_len(101, false), 105); // 105 = 3 * 5 * 7
     }
 
     #[test]
     fn next_fast_len_already_fast() {
         // 30 = 2 * 3 * 5
-        assert_eq!(next_fast_len(30), 30);
+        assert_eq!(next_fast_len(30, false), 30);
         // 77 = 7 * 11
-        assert_eq!(next_fast_len(77), 77);
+        assert_eq!(next_fast_len(77, false), 77);
         // 100 = 2^2 * 5^2
-        assert_eq!(next_fast_len(100), 100);
+        assert_eq!(next_fast_len(100, false), 100);
     }
 
     // ── dctn / idctn tests ─────────────────────────────────────────
@@ -7719,38 +7734,44 @@ mod tests {
     #[test]
     fn prev_fast_len_already_fast_returns_self() {
         // Each {2,3,5}-smooth value is its own predecessor.
-        assert_eq!(prev_fast_len(1), 1);
-        assert_eq!(prev_fast_len(2), 2);
-        assert_eq!(prev_fast_len(8), 8);
-        assert_eq!(prev_fast_len(30), 30); // 2·3·5
-        assert_eq!(prev_fast_len(100), 100); // 2²·5²
+        assert_eq!(prev_fast_len(1, false), 1);
+        assert_eq!(prev_fast_len(2, false), 2);
+        assert_eq!(prev_fast_len(8, false), 8);
+        assert_eq!(prev_fast_len(30, false), 30); // 2·3·5
+        assert_eq!(prev_fast_len(100, false), 100); // 2²·5²
     }
 
     #[test]
     fn prev_fast_len_non_smooth() {
-        assert_eq!(prev_fast_len(7), 7); // 7 is fast for scipy's complex FFT path
-        assert_eq!(prev_fast_len(11), 11); // 11 is fast for scipy's complex FFT path
-        assert_eq!(prev_fast_len(13), 12); // 12 = 2²·3
-        assert_eq!(prev_fast_len(17), 16); // 16 = 2⁴
-        assert_eq!(prev_fast_len(31), 30); // 30 = 2·3·5
-        assert_eq!(prev_fast_len(1025), 1024);
+        assert_eq!(prev_fast_len(7, false), 7); // 7 is fast for scipy's complex FFT path
+        assert_eq!(prev_fast_len(11, false), 11); // 11 is fast for scipy's complex FFT path
+        assert_eq!(prev_fast_len(13, false), 12); // 12 = 2²·3
+        assert_eq!(prev_fast_len(17, false), 16); // 16 = 2⁴
+        assert_eq!(prev_fast_len(31, false), 30); // 30 = 2·3·5
+        assert_eq!(prev_fast_len(1025, false), 1024);
     }
 
     #[test]
     fn prev_fast_len_zero_input() {
-        assert_eq!(prev_fast_len(0), 0);
+        assert_eq!(prev_fast_len(0, false), 0);
     }
 
     #[test]
     fn prev_next_fast_len_bracket_target() {
         // For any target ≥ 1, prev_fast_len(t) ≤ t ≤ next_fast_len(t).
         for t in 1usize..=128 {
-            let p = prev_fast_len(t);
-            let n = next_fast_len(t);
+            let p = prev_fast_len(t, false);
+            let n = next_fast_len(t, false);
             assert!(p <= t, "prev_fast_len({t}) = {p} should be ≤ {t}");
             assert!(t <= n, "next_fast_len({t}) = {n} should be ≥ {t}");
-            assert!(is_fast_len(p), "prev_fast_len({t}) = {p} not scipy-fast");
-            assert!(is_fast_len(n), "next_fast_len({t}) = {n} not scipy-fast");
+            assert!(
+                is_fast_len(p, false),
+                "prev_fast_len({t}) = {p} not scipy-fast"
+            );
+            assert!(
+                is_fast_len(n, false),
+                "next_fast_len({t}) = {n} not scipy-fast"
+            );
         }
     }
 
