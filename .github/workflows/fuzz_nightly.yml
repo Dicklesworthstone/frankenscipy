@@ -36,13 +36,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
+      - name: Pre-build fuzz targets with ASan (not time-bounded)
+        env:
+          ASAN_OPTIONS: "detect_leaks=0"
+          # The ASan link of the fsci-special chain takes ~10+ minutes cold on
+          # a hosted runner; `timeout 920 cargo fuzz run` below was killing
+          # the whole command MID-BUILD (2026-09-04 run 33831501434: 15m20s
+          # wall, zero libFuzzer output). Pre-build first so the timeout
+          # bounds only the fuzzing.
+          RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory -Clink-arg=-Wl,--reduce-memory-overheads"
+        run: |
+          set -e
+          for t in p2c006_special_airy_complex \
+                   p2c006_special_bessel_base_complex \
+                   p2c006_special_bessel_derivatives \
+                   p2c006_special_complex_branches \
+                   p2c006_special_elliptic_complex \
+                   p2c006_special_hankel_complex \
+                   p2c006_special_hyper_complex \
+                   p2c006_special_incomplete_gamma_beta \
+                   p2c006_special_oracle_roundtrip; do
+            cargo fuzz build "$t"
+          done
       - name: Run fuzz targets with ASan (900s each)
         env:
           ASAN_OPTIONS: "detect_leaks=0"
-          # The ASan link of the fsci-special chain OOM-killed the hosted
-          # runner's ld on 2026-09-04 (10 silent minutes, then death with no
-          # diagnostics; libFuzzer never started). Both ld flags trade peak
-          # RSS for link speed.
           RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory -Clink-arg=-Wl,--reduce-memory-overheads"
         run: |
           set -e
