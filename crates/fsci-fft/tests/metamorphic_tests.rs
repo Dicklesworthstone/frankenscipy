@@ -605,7 +605,7 @@ fn mr_fft_zero_input_zero_spectrum() {
 #[test]
 fn mr_next_fast_len_dominates_input() {
     for n in [0usize, 1, 2, 3, 5, 7, 11, 13, 17, 23, 100, 1000] {
-        let m = next_fast_len(n);
+        let m = next_fast_len(n, false);
         assert!(m >= n, "MR22 next_fast_len({n}) = {m} < {n}");
     }
 }
