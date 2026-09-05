@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 //! Live SciPy differential coverage for `scipy.signal.savgol_filter`.
 //!
-//! Resolves [frankenscipy-3ftqo]. fsci_signal::savgol_filter uses
-//! 'nearest' boundary handling per its docstring, so the oracle is
-//! `scipy.signal.savgol_filter(x, window_length, polyorder, mode='nearest')`.
-//! The coefficient computation is a closed-form least-squares fit, so
-//! tight 1e-10 abs agreement is expected.
+//! Resolves [frankenscipy-3ftqo]. fsci_signal::savgol_filter's 3-arg form
+//! defaults to SavgolMode::Interp (scipy's documented default), so the
+//! oracle is `scipy.signal.savgol_filter(x, window_length, polyorder)`
+//! with its default mode='interp' — polynomial edge fitting. The
+//! coefficient computation is a closed-form least-squares fit, so
+//! tight agreement is expected.
+//!
+//! History: this harness originally pinned the oracle to mode='nearest',
+//! which diverged from the Interp default on step/decaying inputs by up
+//! to 0.14 (first live run 2026-09-04, ia47s).
 
 use std::collections::HashMap;
 use std::fs;
@@ -156,7 +161,12 @@ for case in q["points"]:
     x = np.array(case["x"], dtype=float)
     w = case["window_length"]; p = case["polyorder"]
     try:
-        v = signal.savgol_filter(x, w, p, mode='nearest')
+        # scipy's documented default (mode='interp' — polynomial edge fit),
+        # matching fsci's SavgolMode::Interp default. The earlier
+        # mode='nearest' pin diverged on step/decaying inputs by up to 0.14:
+        # nearest-edge extension and polynomial edge fitting are different
+        # boundary treatments (frankenscipy-ckrdw follow-up).
+        v = signal.savgol_filter(x, w, p)
         points.append({"case_id": cid, "values": finite_vec_or_none(v)})
     except Exception:
         points.append({"case_id": cid, "values": None})
@@ -259,7 +269,7 @@ fn diff_signal_savgol_filter() {
 
     let log = DiffLog {
         test_id: "diff_signal_savgol_filter".into(),
-        category: "scipy.signal.savgol_filter mode=nearest".into(),
+        category: "scipy.signal.savgol_filter (default mode=interp)".into(),
         case_count: diffs.len(),
         max_abs_diff: max_overall,
         pass: all_pass,
