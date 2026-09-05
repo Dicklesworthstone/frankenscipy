@@ -174,10 +174,13 @@ for case in q["points"]:
     x = np.array(case["x"], dtype=float)
     y = np.array(case["y"], dtype=float)
     try:
-        # method='asymptotic' + use_continuity=False matches fsci's
-        # normal-approximation path (no ±0.5 continuity correction).
-        res = stats.mannwhitneyu(x, y, alternative=alt, method='asymptotic',
-                                  use_continuity=False)
+        # scipy's documented defaults (method='auto', use_continuity=True)
+        # mirror fsci's dispatch: mwu_use_exact picks the exact permutation
+        # for n1,n2 <= 8 with no ties, and the asymptotic path applies the
+        # same -0.5 continuity correction as fsci's normal approximation.
+        # The earlier method='asymptotic' + use_continuity=False pin broke
+        # both halves at once (up to 0.015 p divergence, ia47s).
+        res = stats.mannwhitneyu(x, y, alternative=alt)
         # df is not part of MannwhitneyuResult; fsci returns NaN.
         points.append({
             "case_id": cid,
