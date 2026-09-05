@@ -8082,12 +8082,22 @@ pub fn splder(
         });
     }
 
-    // Derivative coefficients: c'_i = k * (c_{i+1} - c_i) / (t_{i+k+1} - t_{i+1}).
-    let mut new_c = Vec::with_capacity(m - 1);
-    for i in 0..m - 1 {
-        let dt = t[i + k + 1] - t[i + 1];
+    // scipy's splder emits len(t) - 2 coefficients — indices 0..len(t)-2 of the
+    // naive derivative over the PADDED coefficient array (len(c) == len(t) for
+    // tcks from splrep; trailing zeros give zero-derivative entries where the
+    // knot deltas vanish), keeping the FITPACK invariant len(c') == len(t').
+    // The earlier m-1 truncation broke the shape parity that the live
+    // spl_ops harness checks (frankenscipy-0y8z8 follow-up).
+    let mut new_c = Vec::with_capacity(t.len() - 2);
+    for i in 0..t.len() - 2 {
+        let dt = match (t.get(i + k + 1), t.get(i + 1)) {
+            (Some(&hi), Some(&lo)) => hi - lo,
+            _ => 0.0,
+        };
+        let c_im1 = c.get(i).copied().unwrap_or(0.0);
+        let c_i = c.get(i + 1).copied().unwrap_or(0.0);
         if dt.abs() > 1e-15 {
-            new_c.push(k as f64 * (c[i + 1] - c[i]) / dt);
+            new_c.push(k as f64 * (c_i - c_im1) / dt);
         } else {
             new_c.push(0.0);
         }
@@ -8308,6 +8318,13 @@ pub fn splantider(
     new_t.push(t[0]);
     new_t.extend_from_slice(t);
     new_t.push(t[t.len() - 1]);
+
+    // scipy pads the antiderivative coefficients to len(new_t) by REPEATING
+    // the last integrated coefficient (unlike splder's zero padding — probed
+    // against 1.17.1, frankenscipy-0y8z8 follow-up), keeping the FITPACK
+    // invariant len(c') == len(t').
+    let last = *new_c.last().unwrap_or(&0.0);
+    new_c.resize(new_t.len(), last);
 
     Ok((new_t, new_c, k + 1))
 }
@@ -13947,12 +13964,19 @@ mod tests {
 
     #[test]
     fn splantider_matches_scipy_and_accepts_padded_tck() {
-        // Golden values from scipy.interpolate.splantider on the exact tck.
+        // Golden values from scipy.interpolate.splantider on the PADDED tck
+        // (scipy's own splrep shape; scipy pads the antiderivative
+        // coefficients to len(t') = len(t) + 2 by repeating the last
+        // integrated coefficient — probed 2026-09-04).
         let expected_c = [
             0.0,
             1.0 / 3.0,
             5.0 / 3.0,
             14.0 / 3.0,
+            16.0 / 3.0,
+            16.0 / 3.0,
+            16.0 / 3.0,
+            16.0 / 3.0,
             16.0 / 3.0,
             16.0 / 3.0,
         ];
@@ -13965,26 +13989,25 @@ mod tests {
             for (got, want) in at.iter().zip(expected_t.iter()) {
                 assert!((got - want).abs() < 1e-12, "knot {got} != {want}");
             }
-            // Output uses the tight convention: len(c) == len(t) - k - 1.
-            assert_eq!(ac.len(), at.len() - ak - 1);
+            // scipy maintains len(c') == len(t') through splantider.
+            assert_eq!(ac.len(), at.len(), "antiderivative c padded to len(t')");
             assert_eq!(ac.len(), expected_c.len());
             for (got, want) in ac.iter().zip(expected_c.iter()) {
                 assert!((got - want).abs() < 1e-12, "coeff {got} != {want}");
             }
         }
     }
-
     #[test]
     fn splder_matches_scipy_and_accepts_padded_tck() {
         // Golden values from scipy.interpolate.splder on the exact tck.
-        let expected_c = [2.0, 1.0, -2.0, -2.0];
+        // scipy 1.17.1 (padded tck, probed): splder keeps len(c') == len(t')
+        // and emits the 4 real derivative coefficients + 2 trailing pad zeros.
+        let expected_c_full = [2.0, 1.0, -2.0, -2.0, 0.0, 0.0];
         let expected_t = [0.0, 0.0, 1.0, 2.0, 3.0, 3.0];
         for tck in &quadratic_bspline_tcks() {
             let (dt, dc, dk) = splder(tck).unwrap();
-            assert_eq!(dk, 1, "derivative degree is k - 1");
-            assert_eq!(dt, expected_t);
-            assert_eq!(dc.len(), dt.len() - dk - 1);
-            assert_eq!(dc, expected_c);
+            assert_eq!(dc.len(), dt.len(), "splder keeps len(c') == len(t')");
+            assert_eq!(dc, expected_c_full);
         }
     }
 
@@ -13999,7 +14022,6 @@ mod tests {
                 }
             }
         }
-        // Dataset A: linspace(0,1,11), y = sin(6x) + 0.1 cos(20x).
         let xa: Vec<f64> = (0..11).map(|i| i as f64 * 0.1).collect();
         let xa = {
             let mut v = xa;
