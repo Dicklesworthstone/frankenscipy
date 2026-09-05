@@ -165,11 +165,16 @@ for case in q["points"]:
     x = np.array(case["x"], dtype=float)
     y = np.array(case["y"], dtype=float)
     try:
-        # mode='approx' + correction=False matches fsci's asymptotic
-        # signed-rank pathway. zero_method='wilcox' (default) drops
-        # exact-zero diffs, also matching fsci's filter.
+        # Mirror fsci's dispatch: exact permutation for len(x) <= 13,
+        # asymptotic normal beyond (frankenscipy-qghyr). The earlier blanket
+        # mode='approx' pin compared scipy's normal approximation against
+        # fsci's exact permutation on small tied cases and diverged by up
+        # to 0.0033 (2026-09-04, ia47s).
+        method = "exact" if len(x) <= 13 else "approx"
+        # fsci's asymptotic path has no continuity correction.
+        correction = False
         res = stats.wilcoxon(
-            x, y, alternative=alt, mode='approx', correction=False,
+            x, y, alternative=alt, mode=method, correction=correction,
             zero_method='wilcox',
         )
         points.append({
