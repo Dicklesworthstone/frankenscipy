@@ -32107,6 +32107,17 @@ mod tests {
             )
             .is_err()
         );
+
+        // czt_points reproduces SciPy's degenerate NaN/Inf behavior on degenerate controls.
+        let pts_w = czt_points(3, Some(zero_polar), None);
+        assert_eq!(pts_w.len(), 3);
+        assert!((pts_w[0].0 - 1.0).abs() < 1e-15 && pts_w[0].1.abs() < 1e-15);
+        assert!(pts_w[1].0.is_infinite() && pts_w[1].1.is_nan());
+
+        let pts_a = czt_points(3, None, Some(zero_polar));
+        assert_eq!(pts_a.len(), 3);
+        assert_eq!(pts_a[0], (0.0, 0.0));
+        assert_eq!(pts_a[1], (0.0, 0.0));
     }
 
     #[test]
