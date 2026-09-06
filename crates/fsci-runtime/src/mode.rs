@@ -16,3 +16,6 @@ pub enum RuntimeMode {
     Strict,
     Hardened,
 }
+
+/// Maximum dimension allowed in Hardened mode for memory/compute bounded defense (§0.3).
+pub const HARDENED_MAX_DIM: usize = 10_000;

@@ -14,8 +14,63 @@
 //! - `CloughTocher2DInterpolator` — Smooth scattered 2D interpolation
 //! - `SmoothBivariateSpline` — Smooth bivariate approximation for scattered 2D data
 
-use fsci_runtime::RuntimeMode;
+pub use fsci_runtime::{
+    AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
+};
+use fsci_runtime::casp_now_unix_ms;
 use std::collections::HashMap;
+
+/// Create a new shared audit ledger for synchronous contexts.
+#[must_use]
+pub fn sync_audit_ledger() -> SyncSharedAuditLedger {
+    AuditLedger::shared()
+}
+
+fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, AuditLedger> {
+    match ledger.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            ledger.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Record a fail-closed audit event when Hardened mode rejects input.
+pub fn record_fail_closed(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    reason: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::FailClosed {
+            reason: reason.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
+/// Record a bounded-recovery audit event when Hardened mode falls back.
+pub fn record_bounded_recovery(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    recovery_action: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::BoundedRecovery {
+            recovery_action: recovery_action.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
 
 mod surfit;
 pub use surfit::{bisplev_derivative, bisplrep, lsq_bivariate_spline};
@@ -119,6 +174,48 @@ pub struct Interp1d {
 impl Interp1d {
     /// Create a new 1D interpolator.
     pub fn new(x: &[f64], y: &[f64], options: Interp1dOptions) -> Result<Self, InterpError> {
+        Self::new_with_audit(x, y, options, None)
+    }
+
+    /// Create a new 1D interpolator with optional audit ledger.
+    pub fn new_with_audit(
+        x: &[f64],
+        y: &[f64],
+        options: Interp1dOptions,
+        audit_ledger: Option<&SyncSharedAuditLedger>,
+    ) -> Result<Self, InterpError> {
+        if matches!(options.mode, RuntimeMode::Hardened) {
+            if x.len() > HARDENED_MAX_DIM {
+                if let Some(ledger) = audit_ledger {
+                    record_fail_closed(
+                        ledger,
+                        &x.len().to_le_bytes(),
+                        "dimension exceeds hardened limit",
+                        "rejected",
+                    );
+                }
+                return Err(InterpError::InvalidArgument {
+                    detail: format!(
+                        "x length ({}) exceeds hardened limit ({HARDENED_MAX_DIM})",
+                        x.len()
+                    ),
+                });
+            }
+            if y.iter().any(|&v| !v.is_finite()) {
+                if let Some(ledger) = audit_ledger {
+                    record_fail_closed(
+                        ledger,
+                        b"non-finite-y",
+                        "non-finite y values in hardened mode",
+                        "rejected",
+                    );
+                }
+                return Err(InterpError::InvalidArgument {
+                    detail: "y values must be finite in hardened mode".to_string(),
+                });
+            }
+        }
+
         if x.len() != y.len() {
             return Err(InterpError::LengthMismatch {
                 x_len: x.len(),
@@ -15969,5 +16066,29 @@ mod rch_source_freshness_tests {
                  {want:.17e}; local-gradient shortcut must not pass this parity check"
             );
         }
+    }
+
+    #[test]
+    fn interp1d_mode_audit_and_dimension_cap() {
+        let x = [1.0, 2.0, 3.0];
+        let y_non_finite = [1.0, f64::NAN, 3.0];
+        let ledger = crate::sync_audit_ledger();
+
+        let options = crate::Interp1dOptions {
+            mode: crate::RuntimeMode::Hardened,
+            ..Default::default()
+        };
+
+        // Hardened mode rejects non-finite y
+        let err = crate::Interp1d::new_with_audit(&x, &y_non_finite, options, Some(&ledger));
+        assert!(err.is_err());
+
+        // Verify audit ledger recorded event
+        let guard = ledger.lock().unwrap();
+        assert_eq!(guard.entries().len(), 1);
+        assert!(matches!(
+            guard.entries()[0].action,
+            crate::AuditAction::FailClosed { .. }
+        ));
     }
 }

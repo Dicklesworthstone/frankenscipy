@@ -39,6 +39,63 @@
 //! can match on the resulting enum variants instead of substring-parsing
 //! `Display` text.
 
+pub use fsci_runtime::{
+    AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
+};
+use fsci_runtime::casp_now_unix_ms;
+
+/// Create a new shared audit ledger for synchronous contexts.
+#[must_use]
+pub fn sync_audit_ledger() -> SyncSharedAuditLedger {
+    AuditLedger::shared()
+}
+
+fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, AuditLedger> {
+    match ledger.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            ledger.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Record a fail-closed audit event when Hardened mode rejects input.
+pub fn record_fail_closed(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    reason: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::FailClosed {
+            reason: reason.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
+/// Record a bounded-recovery audit event when Hardened mode falls back.
+pub fn record_bounded_recovery(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    recovery_action: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::BoundedRecovery {
+            recovery_action: recovery_action.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
 /// Error type for signal processing operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignalError {
@@ -2517,6 +2574,18 @@ pub fn czt_with_mode(
     a: Option<(f64, f64)>,
     mode: fsci_runtime::RuntimeMode,
 ) -> Result<Vec<(f64, f64)>, SignalError> {
+    czt_with_mode_and_audit(x, m, w, a, mode, None)
+}
+
+/// Compute a chirp Z-transform under an explicit runtime policy with optional audit ledger.
+pub fn czt_with_mode_and_audit(
+    x: &[f64],
+    m: usize,
+    w: Option<(f64, f64)>,
+    a: Option<(f64, f64)>,
+    mode: fsci_runtime::RuntimeMode,
+    audit_ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<Vec<(f64, f64)>, SignalError> {
     let n = x.len();
     if n == 0 {
         return Err(SignalError::InvalidArgument(
@@ -2526,7 +2595,34 @@ pub fn czt_with_mode(
     if m == 0 {
         return Ok(vec![]);
     }
-    validate_real_values_finite(x, "czt input samples must be finite")?;
+    if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
+        if n > HARDENED_MAX_DIM || m > HARDENED_MAX_DIM {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    &n.to_le_bytes(),
+                    "dimension exceeds hardened limit",
+                    "rejected",
+                );
+            }
+            return Err(SignalError::InvalidArgument(format!(
+                "czt dimension ({n}, {m}) exceeds hardened limit ({HARDENED_MAX_DIM})"
+            )));
+        }
+    }
+    if let Err(err) = validate_real_values_finite(x, "czt input samples must be finite") {
+        if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    b"non-finite-input",
+                    "non-finite input samples",
+                    "rejected",
+                );
+            }
+        }
+        return Err(err);
+    }
 
     let two_pi = 2.0 * std::f64::consts::PI;
 
@@ -2535,8 +2631,28 @@ pub fn czt_with_mode(
     // Default a: z = 1
     let (a_mag, a_ang) = a.unwrap_or((1.0, 0.0));
     if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
-        validate_czt_polar_control("w", (w_mag, w_ang))?;
-        validate_czt_polar_control("a", (a_mag, a_ang))?;
+        if let Err(err) = validate_czt_polar_control("w", (w_mag, w_ang)) {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    &w_mag.to_le_bytes(),
+                    "degenerate_czt_control",
+                    "rejected",
+                );
+            }
+            return Err(err);
+        }
+        if let Err(err) = validate_czt_polar_control("a", (a_mag, a_ang)) {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    &a_mag.to_le_bytes(),
+                    "degenerate_czt_control",
+                    "rejected",
+                );
+            }
+            return Err(err);
+        }
     }
 
     // Bluestein's algorithm for CZT via convolution:
@@ -32118,6 +32234,46 @@ mod tests {
         assert_eq!(pts_a.len(), 3);
         assert_eq!(pts_a[0], (0.0, 0.0));
         assert_eq!(pts_a[1], (0.0, 0.0));
+    }
+
+    #[test]
+    fn czt_mode_audit_and_dimension_cap() {
+        let x = [1.0, 2.0, 3.0];
+        let ledger = sync_audit_ledger();
+
+        // Hardened mode rejects dimension > HARDENED_MAX_DIM
+        let err = czt_with_mode_and_audit(
+            &x,
+            HARDENED_MAX_DIM + 1,
+            None,
+            None,
+            RuntimeMode::Hardened,
+            Some(&ledger),
+        );
+        assert!(err.is_err());
+
+        // Hardened mode records FailClosed on degenerate controls
+        let err2 = czt_with_mode_and_audit(
+            &x,
+            3,
+            Some((0.0, 0.0)),
+            None,
+            RuntimeMode::Hardened,
+            Some(&ledger),
+        );
+        assert!(err2.is_err());
+
+        // Verify audit ledger recorded events
+        let guard = ledger.lock().unwrap();
+        assert_eq!(guard.entries().len(), 2);
+        assert!(matches!(
+            guard.entries()[0].action,
+            AuditAction::FailClosed { .. }
+        ));
+        assert!(matches!(
+            guard.entries()[1].action,
+            AuditAction::FailClosed { .. }
+        ));
     }
 
     #[test]

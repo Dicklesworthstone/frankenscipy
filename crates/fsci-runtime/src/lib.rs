@@ -27,7 +27,7 @@ pub use evidence::{
     AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, DecisionEvidenceEntry,
     PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
 };
-pub use mode::RuntimeMode;
+pub use mode::{HARDENED_MAX_DIM, RuntimeMode};
 pub use policy::{PolicyAction, PolicyController, PolicyDecision, RiskState, decision_loss_matrix};
 pub use signals::{DecisionSignals, SignalSequence};
 

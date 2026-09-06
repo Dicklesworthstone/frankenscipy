@@ -14,6 +14,63 @@ use fsci_interpolate::make_interp_spline;
 use std::simd::Simd;
 use std::simd::num::SimdFloat;
 
+pub use fsci_runtime::{
+    AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
+};
+use fsci_runtime::casp_now_unix_ms;
+
+/// Create a new shared audit ledger for synchronous contexts.
+#[must_use]
+pub fn sync_audit_ledger() -> SyncSharedAuditLedger {
+    AuditLedger::shared()
+}
+
+fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, AuditLedger> {
+    match ledger.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            ledger.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Record a fail-closed audit event when Hardened mode rejects input.
+pub fn record_fail_closed(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    reason: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::FailClosed {
+            reason: reason.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
+/// Record a bounded-recovery audit event when Hardened mode falls back.
+pub fn record_bounded_recovery(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    recovery_action: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::BoundedRecovery {
+            recovery_action: recovery_action.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
 /// Error type for ndimage operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NdimageError {
@@ -3141,6 +3198,47 @@ pub fn gaussian_filter(
     mode: BoundaryMode,
     cval: f64,
 ) -> Result<NdArray, NdimageError> {
+    gaussian_filter_with_mode(input, sigma, mode, cval, RuntimeMode::Strict, None)
+}
+
+/// Gaussian filter under an explicit runtime policy with optional audit ledger.
+pub fn gaussian_filter_with_mode(
+    input: &NdArray,
+    sigma: f64,
+    mode: BoundaryMode,
+    cval: f64,
+    runtime_mode: RuntimeMode,
+    audit_ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<NdArray, NdimageError> {
+    if matches!(runtime_mode, RuntimeMode::Hardened) {
+        if input.shape.iter().any(|&d| d > HARDENED_MAX_DIM) {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    &input.data.len().to_le_bytes(),
+                    "dimension exceeds hardened limit",
+                    "rejected",
+                );
+            }
+            return Err(NdimageError::InvalidArgument(format!(
+                "input shape {:?} exceeds hardened limit ({HARDENED_MAX_DIM})",
+                input.shape
+            )));
+        }
+        if !sigma.is_finite() || !cval.is_finite() {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    &sigma.to_le_bytes(),
+                    "non-finite parameter in hardened mode",
+                    "rejected",
+                );
+            }
+            return Err(NdimageError::InvalidArgument(
+                "sigma and cval must be finite in hardened mode".to_string(),
+            ));
+        }
+    }
     let axes = (0..input.ndim()).collect::<Vec<_>>();
     gaussian_filter_usize_axes(input, sigma, &axes, mode, cval)
 }
@@ -24101,5 +24199,30 @@ mod van22_knob_read_is_per_transform {
              bitwise-identical output for nearest and reflect, so this must agree to the \
              same 1e-9 the reflect arm holds to"
         );
+    }
+
+    #[test]
+    fn gaussian_filter_mode_audit_and_dimension_cap() {
+        let input = NdArray::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]).unwrap();
+        let ledger = crate::sync_audit_ledger();
+
+        // Hardened mode rejects non-finite sigma
+        let err = crate::gaussian_filter_with_mode(
+            &input,
+            f64::NAN,
+            BoundaryMode::Reflect,
+            0.0,
+            crate::RuntimeMode::Hardened,
+            Some(&ledger),
+        );
+        assert!(err.is_err());
+
+        // Verify audit event
+        let guard = ledger.lock().unwrap();
+        assert_eq!(guard.entries().len(), 1);
+        assert!(matches!(
+            guard.entries()[0].action,
+            crate::AuditAction::FailClosed { .. }
+        ));
     }
 }
