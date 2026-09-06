@@ -836,23 +836,25 @@ fn oscillatory_coefficients(zeta: f64) -> (f64, f64, f64, f64) {
     let l = 1.0 - u2 * iz2 + u4 * iz4 - u6 * iz6;
     let m = u1 * iz - u3 * iz * iz2 + u5 * iz * iz4;
 
-    // v_k for derivatives
+    // v_k for derivatives, v_k = (6k+1)/(6k-1)·u_k. The asymptotic derivative
+    // series is strictly ALTERNATING per DLMF 9.7.6:
+    //   N = 1 + v₂/ζ² − v₄/ζ⁴ + v₆/ζ⁶ − …   (even subsequence)
+    //   O =   + v₁/ζ − v₃/ζ³ + v₅/ζ⁵ − …    (odd subsequence)
+    // frankenscipy-yz8s7 read the intrinsic sign of the DLMF v_k as making the
+    // even subsequence "net positive" (N = 1 + |v₂|/ζ² + |v₄|/ζ⁴); that over-
+    // corrected. Measured against mpmath at 30 dps, the all-positive N left
+    // Ai'(−10) off by exactly 2·v₄/ζ⁴ ≈ 6.25e-7 (Bip ≈ 1.07e-7) — the
+    // diff_special_airy_full p00_xn10 near-miss — while the alternating form
+    // with two extra terms holds ≤ 1.4e-10 across |x| ∈ [10, 100] and keeps
+    // the Wronskian Ai·Bi′ − Ai′·Bi at 1 − 5e-13. frankenscipy-wkf10 item 4.
     let v1 = 7.0 / 72.0;
     let v2 = 455.0 / 10368.0;
     let v3 = 95095.0 / 2239488.0;
     let v4 = 40_415_375.0 / 644_972_544.0;
-
-    // Derivative even-series N = Σ_k (-1)^k v_{2k}/ζ^{2k}. Because the DLMF
-    // v_k are intrinsically negative for k≥1 (v_k = -(6k+1)/(6k-1)·u_k), the
-    // (-1)^k and that intrinsic sign combine so the |v_{2k}| corrections enter
-    // with a NET POSITIVE sign: N = 1 + |v2|/ζ² + |v4|/ζ⁴. The previous
-    // 1 − |v2|/ζ² left a +2|v2|/ζ² ≈ ζ⁻² residual in Ai'(−x)/Bi'(−x) (~6e-5 at
-    // x=−15, ~7e-6 at x=−30) while Ai/Bi were ~1e-10. Fixing the sign drops the
-    // derivative residual to <1e-7. frankenscipy-yz8s7.
-    // N/O (derivative series) keep the verified 4-term form (yz8s7); the residual
-    // there is ~ζ⁻⁴, not truncation, so extra terms don't help.
-    let n = 1.0 + v2 * iz2 + v4 * iz4;
-    let o = v1 * iz - v3 * iz * iz2;
+    let v5 = 167_130_541_775.0 / 1_346_702_671_872.0; // (31/29)·u5
+    let v6 = 216_438_195_598_625.0 / 702_142_910_300_160.0; // (37/35)·u6
+    let n = 1.0 + v2 * iz2 - v4 * iz4 + v6 * iz6;
+    let o = v1 * iz - v3 * iz * iz2 + v5 * iz * iz4;
 
     (l, m, n, o)
 }
@@ -1150,13 +1152,15 @@ mod tests {
     #[allow(clippy::excessive_precision)] // golden constants verbatim from scipy
     fn airy_negative_x_derivatives_match_scipy() {
         // frankenscipy-gby5z: Ai'(-x) had a sign error (~7e-4 off); Bi' was fine.
-        // frankenscipy-yz8s7: the derivative even-series N had the |v2|/|v4|
-        // corrections sign-flipped, leaving a ~ζ⁻² residual in BOTH Ai'/Bi'
-        // (~6e-5 at x=-15, ~7e-6 at x=-30). After the fix the oscillatory
-        // derivatives track scipy to <1e-6 across the moderate-|x| band.
-        // x=-10 exercises the [-12, 4) Maclaurin-series branch (accurate to
-        // ~2e-9); x ≤ -15 exercise the oscillatory ASYMPTOTIC branch where the
-        // N-series sign fix applies.
+        // frankenscipy-yz8s7 over-corrected the derivative even-series N to an
+        // all-positive form, leaving a +2·v₄/ζ⁴ residual — ~6.25e-7 on Ai'(-10),
+        // invisible under this test's old 2e-6 relative tolerance.
+        // frankenscipy-wkf10 (diff_special_airy_full p00_xn10): oscillatory_coefficients
+        // is strictly alternating again (DLMF 9.7.6) with v5/v6 terms added, and the
+        // derivatives hold ≤ 1.4e-10 abs vs scipy across the whole band.
+        // Branch map: AIRY_NEGATIVE_SERIES_LOWER_BOUND is -9, so x=-10 exercises the
+        // oscillatory ASYMPTOTIC branch (the "[-12, 4) series" note here was stale);
+        // every case below is asymptotic.
         // (x, Ai_scipy, Ai'_scipy, Bi_scipy, Bi'_scipy) from scipy.special.airy 1.17.1.
         let cases = [
             (
@@ -1204,26 +1208,27 @@ mod tests {
         ];
         for (x, ai_ref, aip_ref, bi_ref, bip_ref) in cases {
             let r = airy_scalar(x, RuntimeMode::Strict).unwrap();
-            // relative tolerance: the oscillatory series now resolves the
-            // derivatives to <1e-6 (was ~6e-5 with the flipped N sign, ~7e-4
+            // relative tolerance: the alternating N/O series resolves the
+            // derivatives to ≤ 1.4e-10 abs vs scipy (was <1e-6 under yz8s7's
+            // all-positive N; ~6e-5 with its original flipped sign, ~7e-4
             // before the gby5z Ai' sign fix).
             assert!(
-                (r.ai - ai_ref).abs() <= 2e-6 * ai_ref.abs().max(1e-3),
+                (r.ai - ai_ref).abs() <= 1e-8 * ai_ref.abs().max(1e-3),
                 "Ai({x}) = {}, scipy {ai_ref}",
                 r.ai
             );
             assert!(
-                (r.aip - aip_ref).abs() <= 2e-6 * aip_ref.abs().max(1e-3),
+                (r.aip - aip_ref).abs() <= 1e-8 * aip_ref.abs().max(1e-3),
                 "Ai'({x}) = {}, scipy {aip_ref}",
                 r.aip
             );
             assert!(
-                (r.bi - bi_ref).abs() <= 2e-6 * bi_ref.abs().max(1e-3),
+                (r.bi - bi_ref).abs() <= 1e-8 * bi_ref.abs().max(1e-3),
                 "Bi({x}) = {}, scipy {bi_ref}",
                 r.bi
             );
             assert!(
-                (r.bip - bip_ref).abs() <= 2e-6 * bip_ref.abs().max(1e-3),
+                (r.bip - bip_ref).abs() <= 1e-8 * bip_ref.abs().max(1e-3),
                 "Bi'({x}) = {}, scipy {bip_ref}",
                 r.bip
             );
