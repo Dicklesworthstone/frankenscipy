@@ -1,0 +1,1385 @@
+{
+  "schema_version": 2,
+  "packet_id": "FSCI-P2C-016",
+  "family": "constants_core",
+  "case_results": [
+    {
+      "case_id": "speed_of_light_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)"
+    },
+    {
+      "case_id": "planck_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)"
+    },
+    {
+      "case_id": "hbar_derived",
+      "passed": true,
+      "message": "match within tolerance (diff=2.1382117680737565e-50, thr=1.0545718176461563e-49)"
+    },
+    {
+      "case_id": "elementary_charge_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=2.407412430484045e-35, thr=1.6021766340000004e-34)"
+    },
+    {
+      "case_id": "boltzmann_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)"
+    },
+    {
+      "case_id": "avogadro_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)"
+    },
+    {
+      "case_id": "degree_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.7453292519943298e-17)"
+    },
+    {
+      "case_id": "atmosphere_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)"
+    },
+    {
+      "case_id": "calorie_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)"
+    },
+    {
+      "case_id": "pound_mass_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)"
+    },
+    {
+      "case_id": "inch_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)"
+    },
+    {
+      "case_id": "celsius_to_kelvin_freezing",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1e-12)"
+    },
+    {
+      "case_id": "fahrenheit_to_celsius_boiling",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1e-12)"
+    },
+    {
+      "case_id": "kelvin_to_rankine_roundtrip",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1e-12)"
+    },
+    {
+      "case_id": "convert_temperature_unknown_scale",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "ev_to_joules_unit",
+      "passed": true,
+      "message": "match within tolerance (diff=2.407412430484045e-35, thr=1.6021766340000004e-34)"
+    },
+    {
+      "case_id": "joules_to_ev_roundtrip",
+      "passed": true,
+      "message": "match within tolerance (diff=2.220446049250313e-16, thr=1e-15)"
+    },
+    {
+      "case_id": "wavelength_to_freq_visible",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.99584916e2)"
+    },
+    {
+      "case_id": "freq_to_wavelength_inverse",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=4.999999999999999e-19)"
+    },
+    {
+      "case_id": "deg2rad_half_turn",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.1415926535897933e-15)"
+    },
+    {
+      "case_id": "rad2deg_quarter_turn",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=9e-13)"
+    },
+    {
+      "case_id": "lb_to_kg_unit",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)"
+    },
+    {
+      "case_id": "kg_to_lb_roundtrip",
+      "passed": true,
+      "message": "match within tolerance (diff=2.220446049250313e-16, thr=1.0000000000000003e-15)"
+    },
+    {
+      "case_id": "constant_value_unknown",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "faraday_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=1.4551915228366852e-11, thr=9.648533212331001e-11)"
+    },
+    {
+      "case_id": "electron_g_factor",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.00231930436092e-15)"
+    },
+    {
+      "case_id": "proton_g_factor",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.5856946893000005e-15)"
+    },
+    {
+      "case_id": "neutron_g_factor",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.82608552e-15)"
+    },
+    {
+      "case_id": "muon_g_factor",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.0023318412300002e-15)"
+    },
+    {
+      "case_id": "thomson_cross_section",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=6.6524587051e-44)"
+    },
+    {
+      "case_id": "characteristic_impedance_of_vacuum",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.7673031341200003e-13)"
+    },
+    {
+      "case_id": "deuteron_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.3435837768000006e-42)"
+    },
+    {
+      "case_id": "alpha_particle_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=6.644657345000001e-42)"
+    },
+    {
+      "case_id": "muon_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.8835316270000003e-43)"
+    },
+    {
+      "case_id": "tau_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.16754e-42)"
+    },
+    {
+      "case_id": "helion_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.0064127862e-42)"
+    },
+    {
+      "case_id": "triton_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=7.174648137343064e-43, thr=5.0073567512000007e-42)"
+    },
+    {
+      "case_id": "molar_volume_ideal_gas",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.2413969545014138e-17)"
+    },
+    {
+      "case_id": "molar_planck_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=5.169878828456423e-26, thr=3.990312712893431e-25)"
+    },
+    {
+      "case_id": "rydberg_constant_times_c_in_hz",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.2898419602500004e0)"
+    },
+    {
+      "case_id": "inverse_fine_structure_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.3703599917700003e-13)"
+    },
+    {
+      "case_id": "first_radiation_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.7417718521927577e-31)"
+    },
+    {
+      "case_id": "second_radiation_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=1.734723475976807e-18, thr=1.4387768775039335e-17)"
+    },
+    {
+      "case_id": "electron_proton_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.446170214889001e-19)"
+    },
+    {
+      "case_id": "proton_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.836152673426e-12)"
+    },
+    {
+      "case_id": "bohr_magneton_in_ev_per_t",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.7883817982e-20)"
+    },
+    {
+      "case_id": "compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.4263102353800003e-27)"
+    },
+    {
+      "case_id": "electron_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.109989506900001e-16)"
+    },
+    {
+      "case_id": "proton_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=9.382720894300002e-13)"
+    },
+    {
+      "case_id": "neutron_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=9.3956542194e-13)"
+    },
+    {
+      "case_id": "muon_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.0565837550000002e-13)"
+    },
+    {
+      "case_id": "tau_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.77682e-12)"
+    },
+    {
+      "case_id": "deuteron_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.875612945e-12)"
+    },
+    {
+      "case_id": "alpha_particle_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.7273794118e-12)"
+    },
+    {
+      "case_id": "helion_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.8083916111200002e-12)"
+    },
+    {
+      "case_id": "triton_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.8089211366800002e-12)"
+    },
+    {
+      "case_id": "proton_compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=1.9721522630525295e-31, thr=1.3214098535999998e-30)"
+    },
+    {
+      "case_id": "neutron_compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.3195909038200002e-30)"
+    },
+    {
+      "case_id": "muon_compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.17344411e-29)"
+    },
+    {
+      "case_id": "tau_compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=6.97771e-31)"
+    },
+    {
+      "case_id": "neutron_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.838683662e-12)"
+    },
+    {
+      "case_id": "electron_neutron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.438673441600001e-19)"
+    },
+    {
+      "case_id": "muon_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.067682827e-13)"
+    },
+    {
+      "case_id": "electron_muon_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=4.8363317e-18)"
+    },
+    {
+      "case_id": "proton_neutron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=9.9862347797e-16)"
+    },
+    {
+      "case_id": "neutron_proton_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.00137841946e-15)"
+    },
+    {
+      "case_id": "deuteron_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.670482967655e-12)"
+    },
+    {
+      "case_id": "alpha_particle_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=7.294299541710001e-12)"
+    },
+    {
+      "case_id": "helion_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.495885279840001e-12)"
+    },
+    {
+      "case_id": "triton_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.49692153551e-12)"
+    },
+    {
+      "case_id": "tau_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.47723e-12)"
+    },
+    {
+      "case_id": "electron_tau_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.87585e-19)"
+    }
+  ],
+  "passed_cases": 72,
+  "failed_cases": 0,
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-016_constants_core.json",
+  "oracle_status": {
+    "status": "available"
+  },
+  "differential_case_results": [
+    {
+      "case_id": "speed_of_light_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "planck_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hbar_derived",
+      "passed": true,
+      "message": "match within tolerance (diff=2.1382117680737565e-50, thr=1.0545718176461563e-49)",
+      "max_diff": 2.1382117680737565e-50,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "elementary_charge_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=2.407412430484045e-35, thr=1.6021766340000004e-34)",
+      "max_diff": 2.407412430484045e-35,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "boltzmann_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "avogadro_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "degree_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.7453292519943298e-17)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "atmosphere_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "calorie_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "pound_mass_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "inch_exact",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "celsius_to_kelvin_freezing",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "fahrenheit_to_celsius_boiling",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kelvin_to_rankine_roundtrip",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "convert_temperature_unknown_scale",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ev_to_joules_unit",
+      "passed": true,
+      "message": "match within tolerance (diff=2.407412430484045e-35, thr=1.6021766340000004e-34)",
+      "max_diff": 2.407412430484045e-35,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "joules_to_ev_roundtrip",
+      "passed": true,
+      "message": "match within tolerance (diff=2.220446049250313e-16, thr=1e-15)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "wavelength_to_freq_visible",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.99584916e2)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "freq_to_wavelength_inverse",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=4.999999999999999e-19)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "deg2rad_half_turn",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.1415926535897933e-15)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "rad2deg_quarter_turn",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=9e-13)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-14,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "lb_to_kg_unit",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=0e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kg_to_lb_roundtrip",
+      "passed": true,
+      "message": "match within tolerance (diff=2.220446049250313e-16, thr=1.0000000000000003e-15)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "constant_value_unknown",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "faraday_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=1.4551915228366852e-11, thr=9.648533212331001e-11)",
+      "max_diff": 1.4551915228366852e-11,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "electron_g_factor",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.00231930436092e-15)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "proton_g_factor",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.5856946893000005e-15)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "neutron_g_factor",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.82608552e-15)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "muon_g_factor",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.0023318412300002e-15)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "thomson_cross_section",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=6.6524587051e-44)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "characteristic_impedance_of_vacuum",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.7673031341200003e-13)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "deuteron_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.3435837768000006e-42)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "alpha_particle_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=6.644657345000001e-42)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "muon_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.8835316270000003e-43)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "tau_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.16754e-42)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "helion_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.0064127862e-42)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "triton_mass",
+      "passed": true,
+      "message": "match within tolerance (diff=7.174648137343064e-43, thr=5.0073567512000007e-42)",
+      "max_diff": 7.174648137343064e-43,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "molar_volume_ideal_gas",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.2413969545014138e-17)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "molar_planck_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=5.169878828456423e-26, thr=3.990312712893431e-25)",
+      "max_diff": 5.169878828456423e-26,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "rydberg_constant_times_c_in_hz",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.2898419602500004e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "inverse_fine_structure_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.3703599917700003e-13)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "first_radiation_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.7417718521927577e-31)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "second_radiation_constant",
+      "passed": true,
+      "message": "match within tolerance (diff=1.734723475976807e-18, thr=1.4387768775039335e-17)",
+      "max_diff": 1.734723475976807e-18,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "electron_proton_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.446170214889001e-19)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "proton_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.836152673426e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "bohr_magneton_in_ev_per_t",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.7883817982e-20)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.4263102353800003e-27)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "electron_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.109989506900001e-16)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "proton_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=9.382720894300002e-13)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "neutron_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=9.3956542194e-13)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "muon_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.0565837550000002e-13)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "tau_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.77682e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "deuteron_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.875612945e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "alpha_particle_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.7273794118e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "helion_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.8083916111200002e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "triton_mass_energy_mev",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.8089211366800002e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "proton_compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=1.9721522630525295e-31, thr=1.3214098535999998e-30)",
+      "max_diff": 1.9721522630525295e-31,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "neutron_compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.3195909038200002e-30)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "muon_compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.17344411e-29)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "tau_compton_wavelength",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=6.97771e-31)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "neutron_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.838683662e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "electron_neutron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.438673441600001e-19)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "muon_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.067682827e-13)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "electron_muon_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=4.8363317e-18)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "proton_neutron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=9.9862347797e-16)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "neutron_proton_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=1.00137841946e-15)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "deuteron_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.670482967655e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "alpha_particle_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=7.294299541710001e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "helion_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.495885279840001e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "triton_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=5.49692153551e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "tau_electron_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=3.47723e-12)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "electron_tau_mass_ratio",
+      "passed": true,
+      "message": "match within tolerance (diff=0e0, thr=2.87585e-19)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 1e-15,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ],
+  "report_kind": "oracle_backed",
+  "generated_unix_ms": 1788658894144
+}

@@ -6,7 +6,10 @@
 //! Covers constant-value checks, lookup parity, and conversion helper invariants.
 
 use blake3::hash;
-use fsci_conformance::{RaptorQSidecar, generate_raptorq_sidecar};
+use fsci_conformance::{
+    HarnessConfig, RaptorQSidecar, generate_raptorq_sidecar, run_constants_packet,
+    write_parity_artifacts,
+};
 use fsci_constants::{
     DEGREE, ELECTRON_VOLT, PI, PLANCK, SPEED_OF_LIGHT, celsius_to_kelvin, convert_temperature,
     deg2rad, ev_to_joules, find, freq_to_wavelength, joules_to_ev, kg_to_lb, lb_to_kg, rad2deg,
@@ -509,4 +512,40 @@ fn evidence_p2c016_final_pack() {
         );
     }
     assert!(all_gates_pass, "all P2C-016 parity gates must pass");
+}
+
+#[test]
+fn evidence_p2c016_root_parity_report() {
+    // frankenscipy-8oub0: 16 of 18 FSCI packets carry a root
+    // parity_report.json; FSCI-P2C-016 only had a nested
+    // differential/parity_report.json. Generate the root triple through the
+    // constants dispatch lane — run_constants_packet -> write_parity_artifacts,
+    // the same path evidence_p2c012 uses for FSCI-P2C-012 — so the packet
+    // topology converges on the flat layout. The writer is byte-stable
+    // modulo generated_unix_ms (okuhi), so committed artifacts do not churn.
+    let config = HarnessConfig::default_paths();
+    let packet_report = run_constants_packet(&config, "FSCI-P2C-016_constants_core.json")
+        .expect("constants dispatch packet must run");
+    let artifacts = write_parity_artifacts(&config, &packet_report)
+        .expect("root parity artifacts must be written");
+    assert!(
+        artifacts.report_path.exists(),
+        "{:?}",
+        artifacts.report_path
+    );
+    assert!(
+        artifacts.sidecar_path.exists(),
+        "{:?}",
+        artifacts.sidecar_path
+    );
+    assert!(
+        artifacts.decode_proof_path.exists(),
+        "{:?}",
+        artifacts.decode_proof_path
+    );
+    assert_eq!(
+        artifacts.report_path.parent().unwrap().file_name().unwrap(),
+        "FSCI-P2C-016",
+        "report must land at the packet root, not a subdirectory"
+    );
 }
