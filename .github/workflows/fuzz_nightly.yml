@@ -44,7 +44,7 @@ jobs:
           # the whole command MID-BUILD (2026-09-04 run 33831501434: 15m20s
           # wall, zero libFuzzer output). Pre-build first so the timeout
           # bounds only the fuzzing.
-          RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory -Clink-arg=-Wl,--reduce-memory-overheads"
+          RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory"
         run: |
           set -e
           for t in p2c006_special_airy_complex \
@@ -61,7 +61,7 @@ jobs:
       - name: Run fuzz targets with ASan (900s each)
         env:
           ASAN_OPTIONS: "detect_leaks=0"
-          RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory -Clink-arg=-Wl,--reduce-memory-overheads"
+          RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory"
         run: |
           set -e
           for t in p2c006_special_airy_complex \
@@ -91,7 +91,7 @@ jobs:
       - name: Run fuzz targets with ASan (60s each)
         env:
           ASAN_OPTIONS: "detect_leaks=0"
-          RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory -Clink-arg=-Wl,--reduce-memory-overheads"
+          RUSTFLAGS: "-Clink-arg=-Wl,--no-keep-memory"
         run: |
           set -e
           for t in p2c006_special_complex_branches \
