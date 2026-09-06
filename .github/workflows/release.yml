@@ -1,0 +1,129 @@
+name: Release (crates.io publish)
+
+# Tag-driven release pipeline (frankenscipy-jky37). Push a `v*` tag and this
+# workflow re-verifies the exact tagged commit, package-checks every crate,
+# then publishes in dependency order — DRY-RUN ONLY until the owner adds a
+# `CRATES_IO_TOKEN` repository secret, at which point the publish job flips
+# from `--dry-run` to real pushes automatically.
+#
+# Ordering rules this file encodes:
+#   * The tag may only be cut AFTER a fully green CI run exists on the same
+#     commit (bead liel6); this workflow re-runs the core gates anyway.
+#   * Publish order is the workspace dependency topological order (dev-deps
+#     included), since crates.io resolves the workspace's path deps by
+#     version once a crate is published.
+#   * `fsci-conformance` is the harness crate; it publishes last. Remove it
+#     from PUBLISH_CRATES below if the owner prefers to keep it private —
+#     nothing in the workspace outside it depends on it.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Dependency topological order (edges include dev-dependencies).
+  PUBLISH_CRATES: >-
+    fsci-runtime
+    fsci-constants
+    fsci-datasets
+    fsci-odr
+    fsci-arrayapi
+    fsci-fft
+    fsci-io
+    fsci-opt
+    fsci-linalg
+    fsci-integrate
+    fsci-special
+    fsci-sparse
+    fsci-signal
+    fsci-spatial
+    fsci-stats
+    fsci-interpolate
+    fsci-ndimage
+    fsci-cluster
+    fsci-conformance
+
+jobs:
+  verify:
+    name: Verify tagged commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+      - name: Workspace check
+        run: cargo check --workspace --all-targets
+      - name: Workspace unit tests
+        run: cargo test --workspace --lib
+      - name: G9 tolerance ratchet (fixtures + diff harnesses)
+        run: |
+          cargo run --release -p fsci-conformance --bin tolerance_lint -- \
+            --max-violations 360
+
+  package-check:
+    name: Package dry-run (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    needs: verify
+    strategy:
+      fail-fast: true
+      matrix:
+        crate: [
+          fsci-runtime, fsci-constants, fsci-datasets, fsci-odr,
+          fsci-arrayapi, fsci-fft, fsci-io, fsci-opt, fsci-linalg,
+          fsci-integrate, fsci-special, fsci-sparse, fsci-signal,
+          fsci-spatial, fsci-stats, fsci-interpolate, fsci-ndimage,
+          fsci-cluster, fsci-conformance,
+        ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --allow-dirty -p ${{ matrix.crate }}
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [verify, package-check]
+    outputs:
+      should_publish: ${{ steps.token.outputs.should_publish }}
+    steps:
+      - id: token
+        run: |
+          if [[ -n "${{ secrets.CRATES_IO_TOKEN }}" ]]; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "CRATES_IO_TOKEN not set; staying in dry-run mode (frankenscipy-jky37)."
+          fi
+      - uses: actions/checkout@v4
+        if: steps.token.outputs.should_publish == 'true'
+      - uses: dtolnay/rust-toolchain@master
+        if: steps.token.outputs.should_publish == 'true'
+        with:
+          toolchain: nightly-2026-07-20
+      - name: Publish crates in dependency order
+        if: steps.token.outputs.should_publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: |
+          set -e
+          for c in $PUBLISH_CRATES; do
+            echo "=== publish $c ==="
+            cargo publish -p "$c"
+          done
+      - name: Dry-run summary (no token)
+        if: steps.token.outputs.should_publish != 'true'
+        run: |
+          echo "Release $GITHUB_REF verified and package-checked; publish skipped \
+          (dry-run mode). Add the CRATES_IO_TOKEN secret to enable real pushes."

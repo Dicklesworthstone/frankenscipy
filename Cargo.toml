@@ -27,6 +27,7 @@ members = [
 edition = "2024"
 version = "0.1.0"
 license = "MIT"
+repository = "https://github.com/Dicklesworthstone/frankenscipy"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -63,6 +64,20 @@ rand = "0.10.1"
 toml = "1.1.2"
 npyz = "0.9.1"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# ══════════════════════════════════════════════════════════════════════════════
+# Release profile (the AGENTS.md / README documented spec — frankenscipy-jky37)
+# ══════════════════════════════════════════════════════════════════════════════
+# This is a LIBRARY workspace: the shipping artifact is the crate source plus
+# whatever a downstream build produces from these settings. `lto = true` +
+# `codegen-units = 1` turn the final link into a single-threaded pass, so a
+# clean release build is slower than Cargo's defaults (measured numbers live
+# in the bead and the README); the point is maximum optimization of the
+# artifact, not build speed.
+[profile.release]
+opt-level = 3               # Maximum performance optimization
+lto = true                  # Link-time optimization
+codegen-units = 1           # Single codegen unit for better optimization
+strip = true                # Remove debug symbols
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Profiling profiles
