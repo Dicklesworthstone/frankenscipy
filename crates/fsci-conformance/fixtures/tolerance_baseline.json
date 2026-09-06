@@ -1,0 +1,2363 @@
+{
+  "diff_arrayapi_audit_record_fail_closed.rs": {},
+  "diff_arrayapi_broadcast_audit_equivalence.rs": {},
+  "diff_arrayapi_creation_audit_record.rs": {},
+  "diff_arrayapi_creation_helpers_numpy_parity.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_arrayapi_default_float_dtype.rs": {},
+  "diff_cluster.rs": {},
+  "diff_cluster_ars_nmi.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_cluster_davies_bouldin_calinski_harabasz.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_cluster_dbscan_properties.rs": {},
+  "diff_cluster_fclusterdata.rs": {},
+  "diff_cluster_fowlkes_mallows.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_cluster_homog_complete_v.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_cluster_kmeans_properties.rs": {},
+  "diff_cluster_linkage_from_distances.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_cluster_linkage_helpers.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_cluster_proximity_cliques.rs": {},
+  "diff_cluster_silhouette.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_cluster_vq_whiten.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_constants_conversions.rs": {
+    "REL_TOL": 1e-12
+  },
+  "diff_constants_physical.rs": {
+    "REL_TOL": 1e-7
+  },
+  "diff_constants_temp_ev_wavelength_deg.rs": {
+    "ABS_TOL": 1e-12,
+    "REL_TOL": 1e-12
+  },
+  "diff_constants_unit_conversions.rs": {
+    "REL_TOL": 1e-12
+  },
+  "diff_constants_value_lookup.rs": {
+    "REL_TOL": 1e-7
+  },
+  "diff_fft.rs": {
+    "@diff": 1e-15
+  },
+  "diff_fft_audit_variants_equivalence.rs": {
+    "ABS_TOL": 1e-15
+  },
+  "diff_fft_audit_variants_nd_equivalence.rs": {
+    "ABS_TOL": 1e-15
+  },
+  "diff_fft_cross_spectral_density.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_dct_dst.rs": {
+    "ABS_TOL": 5e-13
+  },
+  "diff_fft_dctn_dstn.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_fast_len.rs": {},
+  "diff_fft_fft2_ifft2_numpy_parity.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_fftconvolve_fftcorrelate.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_helpers_windows_pad.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_hfft_ihfft.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_hfft_nd.rs": {},
+  "diff_fft_hilbert_analytic.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_idct.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_fft_ifftn.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_irfft2.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_periodogram_magnitude_phase.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_polymul_analytic_signal.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_rfft2.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_rfftn_irfftn.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_fft_shared_plan_cache.rs": {},
+  "diff_fft_shift_live.rs": {},
+  "diff_fft_take_transform_traces.rs": {},
+  "diff_integrate.rs": {},
+  "diff_integrate_cubature_scalar.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_integrate_cumulative_simpson.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_integrate_cumulative_trapezoid.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_integrate_fixed_quad_gauss_legendre.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_integrate_gauss_kronrod_newton_cotes.rs": {
+    "ABS_TOL": 1e-7
+  },
+  "diff_integrate_monte_carlo_qmc_quad.rs": {},
+  "diff_integrate_odeint_closed_form.rs": {
+    "ABS_TOL": 0.0001
+  },
+  "diff_integrate_quad.rs": {
+    "FIXED_QUAD_TOL": 1e-12,
+    "QUAD_TOL": 1e-10,
+    "ROMBERG_TOL": 1e-10
+  },
+  "diff_integrate_quad_infinite.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_integrate_quad_vec_line_integral.rs": {
+    "LI_ABS_TOL": 0.0001,
+    "QV_ABS_TOL": 1e-8
+  },
+  "diff_integrate_romb_func_quad_explain.rs": {},
+  "diff_integrate_romberg_nquad.rs": {},
+  "diff_integrate_sample_variants.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_integrate_select_initial_step.rs": {
+    "ABS_TOL": 1e-14,
+    "REL_TOL": 1e-9
+  },
+  "diff_integrate_simpson_trapezoid_romb_nc.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_integrate_solve_ivp_audit_equivalence.rs": {
+    "ABS_TOL": 1e-15
+  },
+  "diff_integrate_tplquad.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_integrate_validate_audit_equivalence.rs": {},
+  "diff_interpolate.rs": {
+    "INTERP_TOL": 1e-8,
+    "POLY_TOL": 1e-6
+  },
+  "diff_interpolate_chebyshev_barycentric.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_interpolate_griddata_cubic_hermite.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_interpolate_interp2d.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_interpolate_interpn.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_interpolate_make_lsq_spline.rs": {
+    "ABS_TOL": 1e-9,
+    "REL_TOL": 1e-6
+  },
+  "diff_interpolate_pade.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_interpolate_poly_arith.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_interpolate_poly_extras.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_interpolate_poly_helpers.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_interpolate_polyint_def_polyval_err.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_interpolate_polynomial.rs": {
+    "ABS_TOL": 1e-11
+  },
+  "diff_interpolate_rect_bivariate_bilinear_spline.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_interpolate_spl_ops.rs": {
+    "TCK_TOL": 1e-9,
+    "VAL_TOL": 1e-9
+  },
+  "diff_linalg.rs": {},
+  "diff_linalg_adjugate_cofactor.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_audit_variants_equivalence.rs": {
+    "ABS_TOL": 1e-15
+  },
+  "diff_linalg_basic_matrix_ops.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_linalg_casp_variants_equivalence.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_linalg_cond_fractional_matrix_power.rs": {
+    "COND_TOL": 1e-7,
+    "FMP_TOL": 1e-6
+  },
+  "diff_linalg_eig_banded.rs": {
+    "@eigvec_abs_diff": 1e-8,
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_eigh_tridiagonal.rs": {
+    "@eigvec_abs_diff": 1e-8,
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_eigvals.rs": {
+    "ABS_TOL": 1e-8
+  },
+  "diff_linalg_eigvalsh.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_interpolative_norm.rs": {},
+  "diff_linalg_interpolative_reconstruct.rs": {
+    "REL_TOL": 1e-11
+  },
+  "diff_linalg_inv_pinv_cholesky.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_issymmetric_ishermitian.rs": {},
+  "diff_linalg_ldl_reconstruct.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_lstsq.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_lu_factor_lu_solve.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-8
+  },
+  "diff_linalg_lyapunov.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_matrix_functions.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_matrix_power_signm.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_matrix_property_helpers.rs": {
+    "ABS_TOL": 1e-12,
+    "REL_TOL": 1e-10
+  },
+  "diff_linalg_matrix_random_allclose.rs": {},
+  "diff_linalg_misc_deterministic.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_linalg_norm.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_linalg_null_space_orth_rank.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_ordqz_property.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_permanent.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_linalg_qr_insert_delete_update.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_qr_multiply_property.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_linalg_qz_reconstruct.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_schur_hessenberg_reconstruct.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_solve_continuous_are.rs": {
+    "ABS_TOL": 1e-7
+  },
+  "diff_linalg_solve_discrete_are.rs": {
+    "ABS_TOL": 1e-7
+  },
+  "diff_linalg_solve_sylvester.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_solveh_banded.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-8,
+    "RESIDUAL_TOL": 1e-10
+  },
+  "diff_linalg_special_matrices_extra.rs": {
+    "ABS_TOL": 1e-12,
+    "REL_TOL": 1e-10
+  },
+  "diff_linalg_structural_construct.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_linalg_structured_matrices.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_structured_solvers.rs": {
+    "ABS_TOL": 1e-8
+  },
+  "diff_linalg_subspace_polar.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_linalg_vector_misc.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage.rs": {},
+  "diff_ndimage_affine_transform_properties.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_ndimage_array_api_ops.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_array_histogram_gradient_magnitude.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_array_stats.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_axis_ops_pad.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_binary_array_ops.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_binary_fill_holes.rs": {},
+  "diff_ndimage_binary_hit_or_miss.rs": {},
+  "diff_ndimage_binary_morphology.rs": {},
+  "diff_ndimage_boundary_modes.rs": {
+    "REL_TOL": 1e-11
+  },
+  "diff_ndimage_clip_abs_exp_reshape.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_convolve_correlate.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_distance_transform_edt.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_extrema_labels.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_filter_1d.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_ndimage_filters_edges.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_ndimage_find_objects.rs": {},
+  "diff_ndimage_gaussian_filter.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_generate_binary_structure.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_generic_filter.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_grey_morphology.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_histogram_labels.rs": {},
+  "diff_ndimage_label.rs": {},
+  "diff_ndimage_label_stats.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_map_coordinates.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_ndimage_morph_filters.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_ndimage_otsu_threshold.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_percentile_filter.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_reductions_args_cumops.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_ndimage_rotate.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_ndimage_shift.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_ndimage_sobel_prewitt_laplace.rs": {
+    "ABS_TOL": 1e-12,
+    "REL_TOL": 1e-10
+  },
+  "diff_ndimage_variance_std_range_multisigma.rs": {
+    "FLOOR_ABS_TOL": 1e-12,
+    "GAUSS_ABS_TOL": 1e-10
+  },
+  "diff_ndimage_zoom.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_odr.rs": {
+    "REL_TOL": 0.15
+  },
+  "diff_opt.rs": {
+    "MIN_TOL": 0.0001,
+    "ROOT_TOL": 1e-10
+  },
+  "diff_opt_approx_fprime_check_grad.rs": {
+    "CHECK_GRAD_TOL": 5e-6,
+    "FPRIME_TOL": 1e-6
+  },
+  "diff_opt_approx_fprime_fixed_point.rs": {
+    "FP_ABS_TOL": 1e-8,
+    "GRAD_ABS_TOL": 1e-7
+  },
+  "diff_opt_audit_record_helpers.rs": {},
+  "diff_opt_augmented_lagrangian.rs": {},
+  "diff_opt_bracket.rs": {
+    "ABS_TOL": 0.00001
+  },
+  "diff_opt_broyden1_broyden2_anderson.rs": {
+    "ABS_TOL": 0.00001
+  },
+  "diff_opt_brute.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_opt_brute_pso.rs": {
+    "BRUTE_TOL": 0.5,
+    "PSO_TOL": 0.01
+  },
+  "diff_opt_casp_problem_constructors.rs": {},
+  "diff_opt_cobyla.rs": {},
+  "diff_opt_curve_fit.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_opt_de_constrained.rs": {},
+  "diff_opt_derivative.rs": {
+    "ABS_TOL": 1e-8
+  },
+  "diff_opt_fsolve.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_opt_global_minimizers.rs": {},
+  "diff_opt_gradient_descent.rs": {
+    "ABS_TOL": 0.001
+  },
+  "diff_opt_jacobian_hessian.rs": {
+    "ABS_TOL": 1e-7
+  },
+  "diff_opt_lbfgsb_minimize.rs": {
+    "ABS_TOL": 0.0001
+  },
+  "diff_opt_least_squares.rs": {
+    "COST_ABS_TOL": 1e-10,
+    "COST_REL_TOL": 0.0001,
+    "PARAM_ABS_TOL": 0.001,
+    "PARAM_REL_TOL": 0.001
+  },
+  "diff_opt_line_search_wolfe.rs": {},
+  "diff_opt_linear_sum_assignment.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_opt_linprog.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_opt_lm_root.rs": {
+    "RESIDUAL_TOL": 0.00001
+  },
+  "diff_opt_milp.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_opt_minimize_audit_equivalence.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_opt_minimize_quadratic.rs": {
+    "ABS_TOL": 0.0001
+  },
+  "diff_opt_newton_secant_halley.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_opt_nnls_isotonic.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_opt_nnls_isotonic_lsa.rs": {
+    "ISO_TOL": 1e-12,
+    "LSA_TOL": 1e-12,
+    "NNLS_RES_TOL": 1e-10,
+    "NNLS_X_TOL": 1e-8
+  },
+  "diff_opt_numerical_grad_jac_hess.rs": {
+    "ABS_TOL": 0.0001
+  },
+  "diff_opt_projected_gradient_descent.rs": {},
+  "diff_opt_root_brenth_ridder_toms748.rs": {
+    "RESID_ABS_TOL": 1e-10,
+    "X_ABS_TOL": 1e-9
+  },
+  "diff_opt_rosen.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_opt_rosen_hess_and_prod.rs": {
+    "ABS_TOL": 1e-14,
+    "REL_TOL": 1e-12
+  },
+  "diff_opt_scalar_bounded_trisection.rs": {},
+  "diff_opt_scalar_min_fixed_point.rs": {
+    "FIXED_POINT_TOL": 1e-8,
+    "XMIN_TOL": 5e-6
+  },
+  "diff_opt_scalar_root_finders.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_opt_select_minimize_method.rs": {},
+  "diff_opt_simulated_annealing.rs": {},
+  "diff_opt_tnc_slsqp_newton_cg_trust_constr.rs": {},
+  "diff_opt_validate_wolfe_root_dispatch.rs": {},
+  "diff_optimize_bracket_minimum.rs": {},
+  "diff_optimize_bracket_root.rs": {},
+  "diff_optimize_find_minimum.rs": {},
+  "diff_optimize_find_root.rs": {},
+  "diff_optimize_lbfgs_inv_hess.rs": {
+    "REL_TOL": 1e-12
+  },
+  "diff_runtime_assert_close_helpers.rs": {},
+  "diff_runtime_audit_ledger_json_roundtrip.rs": {},
+  "diff_runtime_close_within_tol.rs": {},
+  "diff_runtime_decision_loss_matrix.rs": {},
+  "diff_runtime_decision_signals_is_finite.rs": {},
+  "diff_runtime_policy_evidence_ledger.rs": {},
+  "diff_runtime_solver_portfolio_calibrator.rs": {},
+  "diff_runtime_test_log_entry_builder.rs": {},
+  "diff_signal.rs": {
+    "CONV_TOL": 1e-10,
+    "LOMBSCARGLE_TOL": 1e-10,
+    "WINDOW_TOL": 1e-7
+  },
+  "diff_signal_analog_prototypes.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_argrelminmax.rs": {},
+  "diff_signal_bessel_filter.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_signal_butter.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_butter_sos_output.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_signal_cheby1.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_cheby2_ellip.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_signal_chirp_sawtooth_unit_impulse.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_coherence_spectrogram.rs": {
+    "ABS_TOL": 1e-8,
+    "SPEC_TOL": 0.0001
+  },
+  "diff_signal_convolve.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_corr_spectral_helpers.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_correlate.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_correlate2d.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_correlation_lags.rs": {},
+  "diff_signal_czt.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_signal_daub_properties.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_deconvolve_envelope.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_detrend.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_filter_ord.rs": {
+    "WN_TOL": 1e-10
+  },
+  "diff_signal_find_delay_sos2zpk.rs": {
+    "SOS_ABS_TOL": 1e-10
+  },
+  "diff_signal_find_peaks_argrelextrema.rs": {},
+  "diff_signal_firls.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_signal_firwin.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_frame_signal.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_freqs.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_freqz.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_freqz_zpk.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_signal_gauspuls.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-10
+  },
+  "diff_signal_general_hamming.rs": {
+    "ABS_TOL": 1e-14
+  },
+  "diff_signal_get_window.rs": {
+    "ABS_TOL": 1e-7
+  },
+  "diff_signal_group_delay.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_signal_group_delay_from_ba.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-8
+  },
+  "diff_signal_hilbert.rs": {
+    "HILBERT_TOL": 1e-10
+  },
+  "diff_signal_hz_mel_kaiserord.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_iirfilter_dispatch.rs": {
+    "ABS_TOL": 1e-14
+  },
+  "diff_signal_impulse_step_response.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_instantaneous_frequency.rs": {
+    "ABS_TOL": 1e-8
+  },
+  "diff_signal_kaiser_bessel_derived.rs": {
+    "ABS_TOL": 1e-8
+  },
+  "diff_signal_kaiser_meta.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_lfilter.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_lfilter_zi.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_lfiltic.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_lombscargle.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_lp2_zpk_transforms.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_lp2bp_lp2bs.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_lp2bpbs.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_lp2hp.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_lp2lp.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_magnitude_phase_response.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_matched_filter.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_medfilt_wiener.rs": {
+    "MED_TOL": 1e-12,
+    "WIENER_TOL": 1e-10
+  },
+  "diff_signal_mel_mfcc_chroma.rs": {
+    "REL_TOL": 1e-10
+  },
+  "diff_signal_morlet2.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_normalize_down_up.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_order_filter_waveforms.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_peak_prominences.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_peak_widths.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_phase_delay.rs": {
+    "ABS_TOL": 1e-8
+  },
+  "diff_signal_preemphasis_db_xcorr.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_resample.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_resample_poly.rs": {
+    "ABS_TOL": 1e-8
+  },
+  "diff_signal_savgol_filter.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_snr_thd_entropy.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_sos2tf.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_sosfilt.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_sosfilt_zi.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_sosfiltfilt.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_signal_sosfreqz.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_stats_summaries.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_sweep_poly.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_taylor_exponential_windows.rs": {
+    "ABS_TOL": 1e-12,
+    "REL_TOL": 1e-10
+  },
+  "diff_signal_tf2sos.rs": {
+    "ABS_TOL": 1e-9,
+    "DIRECT_ABS_TOL": 1e-12
+  },
+  "diff_signal_tf2zpk.rs": {
+    "ABS_TOL": 1e-7
+  },
+  "diff_signal_unique_roots.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_signal_upfirdn.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_signal_vectorstrength_envelope_freq.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_signal_window_more.rs": {
+    "CHEB_TOL": 1e-9,
+    "TIGHT_TOL": 1e-12
+  },
+  "diff_signal_windows.rs": {
+    "ABS_TOL": 1e-15
+  },
+  "diff_signal_windows_extras.rs": {
+    "KAISER_TOL": 5e-8,
+    "STRICT_TOL": 1e-13
+  },
+  "diff_signal_zoom_fft.rs": {
+    "ABS_TOL": 1e-8
+  },
+  "diff_signal_zpk2tf.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_sparse.rs": {},
+  "diff_sparse_audit_record_helpers.rs": {},
+  "diff_sparse_basic_ops.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_basic_queries.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_bellman_ford.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_bfs_dfs_order.rs": {},
+  "diff_sparse_boolean_indexing.rs": {},
+  "diff_sparse_casp_iterative_audit_equivalence.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_centrality.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_sparse_clustering_diameter_eccentricity.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_connected_components.rs": {},
+  "diff_sparse_construct_block_stack.rs": {
+    "ABS_TOL": 1e-14
+  },
+  "diff_sparse_conv_with_mode.rs": {
+    "ABS_TOL": 1e-15
+  },
+  "diff_sparse_density_frob_inner.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_diags_kron.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_dijkstra.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_eigs_residual.rs": {
+    "@max_eigval_diff": 1e-8
+  },
+  "diff_sparse_eigsh_largest.rs": {
+    "ABS_TOL": 0.0001
+  },
+  "diff_sparse_elementwise_reductions.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_eliminate_zeros.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_expm.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_sparse_find_tril_triu.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_floyd_warshall.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_graph_summary.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_iterative_bicg_cgs_qmr_lgmres.rs": {
+    "ABS_TOL": 0.00001
+  },
+  "diff_sparse_iterative_solvers.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_sparse_iterative_solvers_residual.rs": {
+    "RESIDUAL_TOL": 0.0001
+  },
+  "diff_sparse_laplacian.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_sparse_lsqr.rs": {
+    "ABS_TOL": 0.00001
+  },
+  "diff_sparse_matrix_power_kronsum.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_minimum_spanning_tree.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_onenormest_spdiags.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_ops_arith.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_pagerank_properties.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_sparse_pcg.rs": {
+    "ABS_TOL": 0.00001
+  },
+  "diff_sparse_reverse_cuthill_mckee_properties.rs": {},
+  "diff_sparse_row_max_min.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_select_casp_iterative_solver.rs": {},
+  "diff_sparse_shortest_path_properties.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_spilu_solve.rs": {},
+  "diff_sparse_splu_solve.rs": {
+    "ABS_TOL": 1e-8
+  },
+  "diff_sparse_spsolve_triangular.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_sparse_stack_block.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_strongly_connected_components.rs": {},
+  "diff_sparse_structural_rank.rs": {},
+  "diff_sparse_submatrix.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_sparse_svds.rs": {
+    "ABS_TOL": 0.0001
+  },
+  "diff_spatial.rs": {},
+  "diff_spatial_boolean_distances.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_coord_transforms.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_geometry_primitives.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_hausdorff.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_kdtree.rs": {
+    "DIST_TOL": 1e-10
+  },
+  "diff_spatial_kdtree_count_neighbors.rs": {},
+  "diff_spatial_kdtree_query_pairs.rs": {},
+  "diff_spatial_metric_distance_dispatch.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_neighbors.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_pdist_cdist.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_pdist_cdist_func.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_procrustes.rs": {
+    "ABS_TOL_DISPARITY": 1e-10,
+    "ABS_TOL_MTX1": 1e-12,
+    "ABS_TOL_MTX2": 1e-9
+  },
+  "diff_spatial_slerp_rotation.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_squareform.rs": {
+    "ABS_TOL": 1e-15
+  },
+  "diff_spatial_vector_ops.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_spatial_weighted_distances.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-10
+  },
+  "diff_special_activation_extras.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_special_activations.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_agm.rs": {
+    "ABS_TOL": 1e-13,
+    "REL_TOL": 1e-13
+  },
+  "diff_special_airy.rs": {
+    "ABS_TOL": 1e-7,
+    "REL_TOL": 0.00001
+  },
+  "diff_special_airy_full.rs": {
+    "ABS_TOL": 1e-7,
+    "REL_TOL_LARGE": 0.0001
+  },
+  "diff_special_airy_zeros.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_special_airye.rs": {
+    "ABS_TOL": 0.0005,
+    "REL_TOL": 0.0005
+  },
+  "diff_special_audit_record_helpers.rs": {},
+  "diff_special_basic_math.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_bdtr.rs": {
+    "CDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_special_bernoulli_euler.rs": {
+    "ABS_TOL": 1e-13,
+    "REL_TOL": 1e-9
+  },
+  "diff_special_bessel.rs": {
+    "ABS_TOL": 1e-7
+  },
+  "diff_special_bessel_derivs.rs": {
+    "ABS_TOL": 1e-6,
+    "REL_TOL": 1e-6
+  },
+  "diff_special_bessel_jv_yv.rs": {
+    "ABS_TOL": 1e-6,
+    "REL_TOL": 1e-6
+  },
+  "diff_special_bessel_modified.rs": {
+    "ABS_TOL": 1e-7,
+    "REL_TOL": 1e-9
+  },
+  "diff_special_bessel_zeros.rs": {
+    "ABS_TOL": 1e-7
+  },
+  "diff_special_beta.rs": {
+    "BETAINC_TOL": 1e-12,
+    "BETA_TOL_ABS": 1e-10,
+    "BETA_TOL_REL": 1e-12
+  },
+  "diff_special_beta_complex.rs": {
+    "ABS_TOL": 1e-9,
+    "REL_TOL": 1e-9
+  },
+  "diff_special_betaincc.rs": {},
+  "diff_special_betaincinv.rs": {},
+  "diff_special_binom_zetac.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-10
+  },
+  "diff_special_binomial_inverses.rs": {
+    "BINOMIAL_INVERSE_TOL": 2e-6
+  },
+  "diff_special_boxcox.rs": {
+    "BOXCOX_TOL": 2e-14
+  },
+  "diff_special_boxcox_scalar_variants.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_boxcox_sinc.rs": {
+    "ABS_TOL": 1e-13
+  },
+  "diff_special_btdtria_btdtrib_fdtridfd.rs": {
+    "REL_TOL": 0.0001,
+    "ROUND_TRIP_TOL": 1e-6
+  },
+  "diff_special_carlson.rs": {
+    "ABS_TOL": 1e-7,
+    "REL_TOL": 1e-7
+  },
+  "diff_special_chdtriv.rs": {
+    "REL_TOL": 1e-6
+  },
+  "diff_special_common_scalar_wrappers.rs": {
+    "LOOSE_TOL": 0.00001,
+    "TIGHT_TOL": 1e-6
+  },
+  "diff_special_complex_beta_gamma_scalars.rs": {
+    "ABS_TOL": 1e-7,
+    "REL_TOL": 1e-6
+  },
+  "diff_special_complex_gamma_betainc_real_consistency.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_special_conv_scalar_wrappers.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_cosm1.rs": {
+    "ABS_TOL": 1e-13
+  },
+  "diff_special_dawsn_erfcx_exprel.rs": {
+    "ABS_TOL": 5e-9,
+    "REL_TOL": 5e-9
+  },
+  "diff_special_debye_clausen.rs": {
+    "ABS_TOL": 5e-6
+  },
+  "diff_special_digamma_complex.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_special_elementary.rs": {
+    "ABS_TOL": 1e-13,
+    "REL_TOL": 1e-13
+  },
+  "diff_special_ellipj.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-10
+  },
+  "diff_special_ellipk_ellipe.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_ellipkinc_ellipeinc.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_entropy.rs": {
+    "ABS_TOL": 1e-13
+  },
+  "diff_special_erf_complex.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_special_error.rs": {
+    "ERFINV_TOL_REL": 5e-9,
+    "ERF_TOL": 1e-13
+  },
+  "diff_special_exp1_expi.rs": {
+    "REL_TOL": 1e-8
+  },
+  "diff_special_expn.rs": {
+    "ABS_TOL": 5e-7
+  },
+  "diff_special_factorial.rs": {
+    "ABS_TOL": 1e-13,
+    "REL_TOL": 1e-11
+  },
+  "diff_special_factorialk.rs": {
+    "REL_TOL": 1e-9
+  },
+  "diff_special_fdtr.rs": {
+    "CDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_special_finite_difference.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_special_fresnel_shichi.rs": {
+    "ABS_TOL_CHI": 1e-12,
+    "ABS_TOL_FRESNEL_SHI": 0.00001
+  },
+  "diff_special_gamma.rs": {
+    "DIGAMMA_TOL_REL": 5e-10,
+    "GAMMA_TOL_ABS": 1e-10,
+    "GAMMA_TOL_REL": 1e-12
+  },
+  "diff_special_gamma_mod_squared.rs": {
+    "REL_TOL": 0.03
+  },
+  "diff_special_gammainc.rs": {
+    "GAMMAINCINV_TOL_REL": 1e-9,
+    "GAMMAINC_TOL": 1e-12
+  },
+  "diff_special_gammasgn.rs": {},
+  "diff_special_gdtr_pdtr_chdtr.rs": {
+    "CDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_special_gdtrix_fdtridfd.rs": {
+    "ABS_TOL": 1e-6,
+    "REL_TOL": 1e-6
+  },
+  "diff_special_h1vp_h2vp.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_special_hyp0f1.rs": {
+    "REL_TOL": 1e-8
+  },
+  "diff_special_hyp1f1.rs": {},
+  "diff_special_hyp2f1.rs": {},
+  "diff_special_hyperu.rs": {},
+  "diff_special_inv_boxcox1p.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_inverse_hyperbolic_exp2.rs": {
+    "ABS_TOL": 1e-14
+  },
+  "diff_special_iv_hankel_erfi.rs": {
+    "ERFI_ABS_TOL": 1e-9,
+    "ERFI_REL_TOL": 1e-6,
+    "HANKEL_ABS_TOL": 1e-6,
+    "IV_ABS_TOL": 1e-7
+  },
+  "diff_special_kelvin.rs": {
+    "ABS_TOL": 1e-6,
+    "REL_TOL": 1e-6
+  },
+  "diff_special_kelvin_ber_bei_ker_kei.rs": {
+    "ABS_TOL": 1e-12,
+    "REL_TOL_BER_BEI": 1e-9,
+    "REL_TOL_KER_DERIV": 0.005,
+    "REL_TOL_KER_KEI": 0.001
+  },
+  "diff_special_kolmogi_smirnovi.rs": {
+    "KOLMOGI_TOL": 1e-9,
+    "SMIRNOVI_TOL": 0.005
+  },
+  "diff_special_ks.rs": {
+    "KOLMOGOROV_TOL": 1e-9,
+    "SMIRNOV_TOL": 0.05
+  },
+  "diff_special_lambertw.rs": {
+    "ABS_TOL": 1e-13,
+    "REL_TOL": 1e-13
+  },
+  "diff_special_lambertw_struve_scalars.rs": {
+    "ABS_TOL": 0.00001,
+    "REL_TOL": 0.00001
+  },
+  "diff_special_link_shrink.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_special_log_arith.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_log_expit.rs": {
+    "ABS_TOL": 1e-13
+  },
+  "diff_special_loggamma.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_special_loggamma_complex.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_special_logsumexp_variants.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_lpmn_lqmn.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_special_lpmv.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_lpn_lqn.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_misc_scalars.rs": {
+    "STDTRIDF_TOL": 1e-6,
+    "TIGHT_TOL": 1e-12,
+    "VOIGT_TOL": 5e-8
+  },
+  "diff_special_modstruve.rs": {
+    "ABS_TOL": 1e-7,
+    "REL_TOL": 1e-7
+  },
+  "diff_special_multigammaln.rs": {
+    "REL_TOL": 1e-10
+  },
+  "diff_special_ndtr.rs": {
+    "LOG_NDTR_TOL": 1e-6,
+    "NDTRI_EXP_TOL_REL": 2e-6,
+    "NDTRI_TOL_REL": 1e-7,
+    "NDTR_TOL": 5e-13
+  },
+  "diff_special_negentropy_bce.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_nrdtr.rs": {
+    "REL_TOL": 1e-7
+  },
+  "diff_special_orthopoly_extras.rs": {
+    "ABS_TOL": 1e-12,
+    "REL_TOL": 1e-12
+  },
+  "diff_special_owens_t.rs": {
+    "ABS_TOL": 5e-6
+  },
+  "diff_special_param_solvers.rs": {
+    "REL_TOL": 1e-6
+  },
+  "diff_special_pdtrik.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_special_poch.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_special_polygamma.rs": {
+    "ABS_TOL": 1e-8,
+    "REL_TOL": 1e-8
+  },
+  "diff_special_powm1.rs": {
+    "ABS_TOL": 1e-13
+  },
+  "diff_special_powm1_cosm1_log1pmx.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_psi.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_special_relu_sph_harm.rs": {
+    "RELU_TOL": 1e-14,
+    "SPH_TOL": 1e-9
+  },
+  "diff_special_riccati.rs": {
+    "ABS_TOL": 1e-6,
+    "REL_TOL": 1e-6
+  },
+  "diff_special_robust_loss.rs": {
+    "ABS_TOL": 1e-13
+  },
+  "diff_special_roots_extras.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_special_roots_quadrature.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_special_scaled_bessel.rs": {
+    "SCALED_BESSEL_TOL": 5e-8
+  },
+  "diff_special_select_hypergeometric_branch_casp.rs": {},
+  "diff_special_sici.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_softmax.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_softplus_xlog1py.rs": {
+    "ABS_TOL": 1e-14
+  },
+  "diff_special_spence.rs": {
+    "ABS_TOL": 5e-8
+  },
+  "diff_special_sph_harm_y.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_special_spherical_bessel.rs": {
+    "ABS_TOL": 1e-6,
+    "REL_TOL": 1e-6
+  },
+  "diff_special_stdtr_btdtr.rs": {
+    "CDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_special_stirling2.rs": {
+    "STIRLING2_TOL_REL": 0.00002
+  },
+  "diff_special_struve.rs": {
+    "@abs_diff": 5e-6,
+    "@rel_diff": 5e-6,
+    "ABS_TOL": 1e-7,
+    "REL_TOL": 1e-7
+  },
+  "diff_special_take_special_traces.rs": {},
+  "diff_special_trig_deg.rs": {
+    "SC_TOL": 1e-13,
+    "TC_TOL_REL": 1e-10
+  },
+  "diff_special_trig_pi_misc_scalars.rs": {
+    "ABS_TOL": 1e-15
+  },
+  "diff_special_utility_scalars.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_special_wofz_wrightomega.rs": {
+    "WOFZ_TOL": 1e-7,
+    "WRIGHTOMEGA_TOL": 1e-12
+  },
+  "diff_special_wright_bessel.rs": {
+    "ABS_TOL": 1e-9,
+    "REL_TOL": 1e-9
+  },
+  "diff_special_zeta.rs": {
+    "ABS_TOL": 1e-8,
+    "REL_TOL": 1e-10
+  },
+  "diff_stats.rs": {},
+  "diff_stats_2x2_effect_sizes.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_aic_bic.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_aic_bic_fdr.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_alpha.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 5e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_anderson.rs": {
+    "CRIT_TOL": 1e-12,
+    "STAT_TOL": 1e-11
+  },
+  "diff_stats_anderson_ksamp.rs": {
+    "CRIT_TOL": 1e-12,
+    "STAT_TOL": 1e-9
+  },
+  "diff_stats_anderson_ksamp_variants.rs": {
+    "CRIT_TOL": 1e-12,
+    "STAT_TOL": 1e-9
+  },
+  "diff_stats_anglit.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_anova_effects.rs": {
+    "SCALAR_TOL": 1e-12,
+    "STAT_TOL": 1e-9
+  },
+  "diff_stats_ansari.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_ansari_spearmanr_alts.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_arcsine.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_argus.rs": {
+    "CDF_TOL": 5e-8,
+    "PDF_TOL": 1e-11,
+    "PPF_TOL_REL": 1e-6
+  },
+  "diff_stats_audit_record_helpers.rs": {},
+  "diff_stats_bayes_mvs.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_bernoulli.rs": {
+    "POINT_TOL": 1e-14
+  },
+  "diff_stats_beta.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_betaprime.rs": {
+    "CDF_TOL": 1e-10,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_binned_statistic.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_binom.rs": {
+    "CDF_TOL": 1e-11,
+    "PMF_TOL": 1e-12
+  },
+  "diff_stats_binomtest.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_boltzmann.rs": {
+    "CDF_TOL": 1e-12,
+    "PMF_TOL": 1e-12
+  },
+  "diff_stats_bradford.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_brunnermunzel.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_burr12.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12
+  },
+  "diff_stats_burr3.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_cauchy.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12,
+    "SF_TOL": 1e-13
+  },
+  "diff_stats_central_moments.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_chatterjeexi.rs": {
+    "PVALUE_TOL": 1e-9,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_chi.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_chi2.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9,
+    "SF_TOL": 1e-12
+  },
+  "diff_stats_chi2_contingency.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_chi2_contingency_lambda.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_chisquare_power.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_combine_pvalues.rs": {
+    "STOUFFER_TOL": 1e-7,
+    "TIGHT_TOL": 1e-12
+  },
+  "diff_stats_contingency_table.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_correlation.rs": {
+    "PVAL_TOL_KENDALLTAU": 0.05
+  },
+  "diff_stats_correlation_basic.rs": {
+    "PVALUE_TOL": 1e-9,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_cosine.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_count_tied_groups.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_cov_corr_matrix.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_cramervonmises.rs": {
+    "PVALUE_TOL": 0.00001,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_cross_cov.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_crystalball.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_cumsum_cumprod.rs": {
+    "CUMPROD_TOL": 1e-10,
+    "CUMSUM_TOL": 1e-12
+  },
+  "diff_stats_cvm2samp_methods.rs": {
+    "ASYMP_PVALUE_TOL": 0.005,
+    "EXACT_PVALUE_TOL": 0.05,
+    "STAT_TOL": 1e-9
+  },
+  "diff_stats_cvm_2samp.rs": {
+    "PVALUE_TOL": 0.05,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_describe_misc.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_descriptive.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_descriptive_aliases.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_dgamma.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_diff_histogram.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_differential_entropy.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_directional.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_dirichlet.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_discrete_moments.rs": {
+    "ABS_TOL": 1e-12,
+    "REL_TOL": 1e-10
+  },
+  "diff_stats_distribution_distances.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_distributions.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-10
+  },
+  "diff_stats_distributions_more.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-10
+  },
+  "diff_stats_dw_acf.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_dweibull.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12
+  },
+  "diff_stats_ecdf.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_entropy.rs": {
+    "ABS_TOL": 1e-10,
+    "REL_TOL": 1e-9
+  },
+  "diff_stats_entropy_ratios.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_epps_singleton.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_epps_singleton_t.rs": {
+    "PVALUE_TOL": 0.00001,
+    "STAT_TOL": 0.0001
+  },
+  "diff_stats_erlang.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_exp_power_reg.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_expon.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12,
+    "SF_TOL": 1e-13
+  },
+  "diff_stats_exponnorm.rs": {
+    "CDF_TOL": 1e-6,
+    "PDF_TOL": 1e-6,
+    "PPF_TOL_REL": 1e-6
+  },
+  "diff_stats_exponpow.rs": {
+    "ABS_TOL_LOOSE": 1e-9,
+    "ABS_TOL_TIGHT": 1e-12
+  },
+  "diff_stats_exponweib.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_f.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_fatiguelife.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_find_repeats.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_fisher_exact.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_fisk.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_fligner.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_stats_fligner_nan.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_stats_foldcauchy.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_foldnorm.rs": {
+    "CDF_TOL": 5e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_frechet_r.rs": {
+    "ABS_TOL_PDF_CDF": 1e-10,
+    "ABS_TOL_PPF": 1e-8
+  },
+  "diff_stats_freq.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_freqhist.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_friedman.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_gamma.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9,
+    "SF_TOL": 1e-12
+  },
+  "diff_stats_gaussian_kde.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_genextreme.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_genhalflogistic.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_genlogistic.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_gennorm.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_genpareto.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_geom.rs": {
+    "CDF_TOL": 1e-13,
+    "PMF_TOL": 1e-13
+  },
+  "diff_stats_gilbrat.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9,
+    "SF_TOL": 1e-12
+  },
+  "diff_stats_gompertz.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_gumbel_l.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12,
+    "SF_TOL": 1e-13
+  },
+  "diff_stats_gumbel_r.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12,
+    "SF_TOL": 1e-13
+  },
+  "diff_stats_halfcauchy.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12,
+    "SF_TOL": 1e-13
+  },
+  "diff_stats_halfgennorm.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_halflogistic.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12
+  },
+  "diff_stats_halfnorm.rs": {
+    "CDF_TOL": 5e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-7,
+    "SF_TOL": 5e-13
+  },
+  "diff_stats_hd_expectile.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_hdquantiles_sd.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_histogram_bin_edges.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_hypergeom.rs": {
+    "CDF_TOL": 1e-11,
+    "PMF_TOL": 1e-12
+  },
+  "diff_stats_hypsecant.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_idealfourths.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_invgamma.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_invgauss.rs": {
+    "CDF_TOL": 5e-9,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_invweibull.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_irwinhall.rs": {
+    "PDF_TOL": 1e-10,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_johnsonsb.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_johnsonsu.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_kappa3.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_kappa4.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-11,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_kendalltau_alts.rs": {
+    "PVALUE_TOL": 1e-9,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_kruskal.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_ks_1samp.rs": {
+    "PVALUE_TOL": 1e-7,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_ks_2samp.rs": {
+    "PVALUE_TOL": 1e-7,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_ks_2samp_alt.rs": {
+    "PVALUE_TOL": 1e-7,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_kstat.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_kstest.rs": {
+    "PVALUE_TOL": 1e-7,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_kstwobign.rs": {
+    "CDF_TOL": 1e-10,
+    "PDF_TOL": 1e-8,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_laplace.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12,
+    "SF_TOL": 1e-13
+  },
+  "diff_stats_laplace_asymmetric.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_levy.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_linregress_extras.rs": {
+    "CI_TOL": 1e-9,
+    "STDERR_TOL": 1e-12
+  },
+  "diff_stats_lmoment.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_loggamma.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_logistic.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12,
+    "SF_TOL": 1e-13
+  },
+  "diff_stats_loglaplace.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_lognorm.rs": {
+    "CDF_TOL": 5e-13,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_logser.rs": {
+    "CDF_TOL": 1e-12,
+    "PMF_TOL": 1e-13
+  },
+  "diff_stats_loguniform.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_lomax.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_mannkendall.rs": {
+    "PVALUE_TOL": 1e-9,
+    "TAU_TOL": 1e-12
+  },
+  "diff_stats_mannwhitneyu_alt.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_maxwell.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_means_and_circular.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_median_cihs.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_median_mad.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_median_test.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_mielke.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_misc_summary.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_mode.rs": {
+    "ABS_TOL": 1e-13
+  },
+  "diff_stats_moment_etc.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_moments.rs": {
+    "ABS_TOL": 1e-12,
+    "REL_TOL": 1e-10
+  },
+  "diff_stats_moyal.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_mquantiles.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_msign_rank_biserial.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_multiple_regression.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_multipletests.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_mvn.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_nakagami.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_nan_policy.rs": {
+    "ABS_TOL": 1e-6
+  },
+  "diff_stats_nbinom.rs": {
+    "CDF_TOL": 1e-11,
+    "PMF_TOL": 1e-12
+  },
+  "diff_stats_noncentralt.rs": {
+    "CDF_TOL": 1e-9,
+    "PDF_TOL": 1e-9,
+    "PPF_TOL_REL": 1e-6
+  },
+  "diff_stats_norm.rs": {
+    "CDF_TOL": 5e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-6,
+    "SF_TOL": 5e-13
+  },
+  "diff_stats_normality_battery.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_normality_tests.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_normmax.rs": {
+    "ABS_TOL": 0.5
+  },
+  "diff_stats_obrientransform.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_pacf_ljung.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_page_trend.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_pareto.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_pearson3.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_pearsonr_alt.rs": {
+    "PVALUE_TOL": 1e-9,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_percentileofscore.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_planck.rs": {
+    "CDF_TOL": 1e-12,
+    "PMF_TOL": 1e-12
+  },
+  "diff_stats_plotting_positions.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_pmean_loglik.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_pointbiserialr.rs": {
+    "PVALUE_TOL": 1e-9,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_poisson.rs": {
+    "CDF_TOL": 1e-11,
+    "PMF_TOL": 1e-12
+  },
+  "diff_stats_poisson_means.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_polynomial_regression.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_power_divergence.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_power_forward.rs": {
+    "ABS_TOL": 1e-11
+  },
+  "diff_stats_power_transforms.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_powerlaw.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12
+  },
+  "diff_stats_powerlognorm.rs": {
+    "CDF_TOL": 1e-7,
+    "PDF_TOL": 1e-7,
+    "PPF_TOL_ABS": 5e-6
+  },
+  "diff_stats_powernorm.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_probplot_quantiles.rs": {
+    "ABS_TOL": 1e-7
+  },
+  "diff_stats_qmc_discrepancy.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_stats_qmc_halton.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_qmc_sobol_scale.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_qmc_update_geom_disc.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_quantile_percentile.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_quantile_test.rs": {
+    "PVAL_TOL": 1e-12
+  },
+  "diff_stats_quantile_weighted_helpers.rs": {
+    "ABS_TOL": 1e-14,
+    "REL_TOL": 1e-12
+  },
+  "diff_stats_randint.rs": {
+    "POINT_TOL": 1e-14
+  },
+  "diff_stats_rank_distances.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_rankdata.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_ranksums.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_ranksums_brunner_alts.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_rayleigh.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12,
+    "SF_TOL": 1e-13
+  },
+  "diff_stats_rdist.rs": {
+    "CDF_TOL": 1e-9,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_recipinvgauss.rs": {
+    "CDF_TOL": 1e-8,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_regression_metrics.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_rice.rs": {
+    "CDF_TOL": 1e-9,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-6
+  },
+  "diff_stats_ridge_regression.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_runs_test.rs": {
+    "PVALUE_TOL": 1e-9,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_rv_discrete.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_sem_and_trimmed.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_semicircular.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_shapiro.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_siegelslopes.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_sigmaclip.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_sign_test.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_skew_kurt.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_skew_kurt_alt.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_skewcauchy.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_skewnorm.rs": {
+    "CDF_TOL": 1e-9,
+    "PDF_TOL": 1e-12
+  },
+  "diff_stats_somersd.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_somersd_table.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_summary_misc.rs": {
+    "TTEST_TOL": 1e-9
+  },
+  "diff_stats_summary_quantiles.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_t.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9,
+    "SF_TOL": 1e-12
+  },
+  "diff_stats_theil_ks_distance.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_theilslopes.rs": {
+    "SLOPE_BAND_TOL": 1e-9,
+    "TIGHT_TOL": 1e-12
+  },
+  "diff_stats_tiecorrect_yj_inv.rs": {
+    "TIE_TOL": 1e-12,
+    "YJ_TOL": 1e-10
+  },
+  "diff_stats_timeseries_ops.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_stats_trapezoid.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_triang.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_trim_mode.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_trim_mode_full.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_trimmed.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_truncexpon.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_truncnorm.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-7
+  },
+  "diff_stats_truncpareto.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_truncweibull_min.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_ttest_alternatives.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_ttest_basic.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_ttest_from_stats.rs": {
+    "PVALUE_TOL": 1e-9,
+    "STAT_TOL": 1e-12
+  },
+  "diff_stats_ttest_ind_welch.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_ttest_rel.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_tukey_hsd_statistic.rs": {
+    "ABS_TOL": 1e-10
+  },
+  "diff_stats_tukeylambda.rs": {
+    "CDF_TOL": 1e-11,
+    "PDF_TOL": 1e-11,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_two_sample_extras.rs": {
+    "CVM_PVALUE_TOL": 0.00001,
+    "MOOD_PVALUE_TOL": 1e-9,
+    "STAT_TOL": 1e-9
+  },
+  "diff_stats_uniform.rs": {
+    "POINT_TOL": 1e-14,
+    "PPF_TOL_REL": 1e-13
+  },
+  "diff_stats_variance_normality_tests.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_variance_tests.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_variance_tests_nan.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_vonmises.rs": {
+    "CDF_TOL": 0.00001,
+    "PDF_TOL": 1e-12
+  },
+  "diff_stats_weibull_max.rs": {
+    "CDF_TOL": 1e-12,
+    "PDF_TOL": 1e-12,
+    "PPF_TOL_REL": 1e-9
+  },
+  "diff_stats_weibull_min.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13,
+    "PPF_TOL_REL": 1e-12,
+    "SF_TOL": 1e-13
+  },
+  "diff_stats_weighted_mean_var.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_wilcoxon_alt.rs": {
+    "ABS_TOL": 1e-9
+  },
+  "diff_stats_winsorize.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_wrapcauchy.rs": {
+    "CDF_TOL": 1e-13,
+    "PDF_TOL": 1e-13
+  },
+  "diff_stats_yulesimon.rs": {
+    "CDF_TOL": 1e-12,
+    "PMF_TOL": 1e-12
+  },
+  "diff_stats_zipf.rs": {
+    "CDF_TOL": 5e-12,
+    "PMF_TOL": 5e-12
+  },
+  "diff_stats_zipfian.rs": {
+    "CDF_TOL": 1e-12,
+    "PMF_TOL": 1e-12
+  },
+  "diff_stats_zmap.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_zmap_ddof.rs": {
+    "ABS_TOL": 1e-12
+  },
+  "diff_stats_zscore_score.rs": {
+    "ABS_TOL": 1e-12
+  }
+}

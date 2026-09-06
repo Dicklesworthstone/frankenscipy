@@ -385,7 +385,7 @@ The `fsci-conformance` crate ships eight companion binaries alongside the dashbo
 | `live_oracle_capture` | Captures fresh SciPy oracle outputs in required or fallback mode; the binary the CI G3b / G3c lanes drive |
 | `benchmark_gate` | `--check-spec` validates the published `docs/baseline_*.json` against the spec §17 budgets; `--compare <dir>` diffs a fresh criterion export against them (used by hand, not in CI) |
 | `raptorq_sidecar` | Generates and verifies the RaptorQ systematic-encoding sidecars for every packet bundle |
-| `tolerance_lint` | Ratchet check over the `FSCI-P2C-*.json` fixtures that fails the build if the count of unexplained tolerance relaxations rises |
+| `tolerance_lint` | Ratchet check over the `FSCI-P2C-*.json` fixtures (unexplained relaxations may only fall) and over every `tests/diff_*.rs` harness tolerance against the committed `fixtures/tolerance_baseline.json` — loosening or an unanchored contract fails the build; `--write-baseline` adopts tightenings and refuses loosened values |
 | `adversarial_corpus` | Emits the adversarial fixture corpus (malformed metadata, NaN/Inf, degenerate shapes) with BLAKE3 manifests under an `--output-root` |
 | `fuzz_triage` | Triages `fuzz/artifacts/` crashes: deduplicates by hash, promotes reproducers to regression fixtures, applies a retention horizon, and files `fuzz-finding` beads |
 
@@ -1071,7 +1071,7 @@ Eleven invariants that the workspace commits to and the CI gates enforce:
 4. **`cargo fmt --check`** passes on every commit.
 5. **`cargo clippy --workspace --all-targets -- -D warnings`** passes; pedantic + nursery lints are enforced.
 6. **`cargo doc` is kept warning-free by convention** (math notation and generic parameters in doc comments are backtick-wrapped); it is not a CI gate today.
-7. **No tolerance contract is ever loosened.** CI gate G9 (`tolerance_lint`) fails the build on weakening.
+7. **No tolerance contract is ever loosened.** CI gate G9 (`tolerance_lint`) fails the build on weakening — the `FSCI-P2C-*.json` fixture cases via a monotone violation threshold, and every `tests/diff_*.rs` harness tolerance (`const *_TOL: f64` plus bare `<= <literal>` comparisons) against the committed `fixtures/tolerance_baseline.json`: a loosened value, an unanchored contract, or a stale baseline entry is a hard failure, and `--write-baseline` refuses to adopt loosened values so a loosening can only land as a hand-edited baseline reviewers can grep for (frankenscipy-6a5s9).
 8. **No schema is ever broken silently.** CI gate G7 validates the three contract schemas against every packet.
 9. **No artifact ships without a RaptorQ sidecar.** CI gate G8 verifies the decode proof.
 10. **Every fix-closed defect has a beads issue.** The open numerical defects listed in **Limitations** are each a live bead; the three signal defects that used to be listed there closed on 2026-05-20.
@@ -1845,7 +1845,7 @@ without SciPy and asserting it fails.
 | G6 | `perf smoke + baseline validation` | Every `perf_*` integration test, `benchmark_gate --check-spec` against the spec §17 budgets, and `raptorq_sidecar --verify` on the published baselines. There is no criterion regression compare in CI: hosted runners are not a stable timing host |
 | G7 | `schema + evidence packs` | `schema_validation` plus every `evidence_p2c*` pack |
 | G8 | `RaptorQ proofs` | `raptorq_proofs`: decode-proof verification for the committed sidecars |
-| G9 | `tolerance-policy ratchet` | `tolerance_lint --max-violations 361` over the `FSCI-P2C-*.json` fixtures; the threshold may only fall. It does not yet scan the tolerances written in the `diff_*.rs` files |
+| G9 | `tolerance-policy ratchet` | `tolerance_lint --max-violations 361` over the `FSCI-P2C-*.json` fixtures (threshold may only fall) plus the harness ratchet: every `tests/diff_*.rs` tolerance contract (`const *_TOL: f64` and bare `<= <literal>` comparisons) is checked against the committed `fixtures/tolerance_baseline.json` — a loosened value, an unanchored contract, or a stale baseline entry fails the build, and `--write-baseline` refuses to adopt loosened values (frankenscipy-6a5s9) |
 
 A separate `fuzz_nightly.yml` workflow runs nine `fsci-special` fuzz targets
 under ASan on a nightly schedule (an earlier `address,undefined` sanitizer
