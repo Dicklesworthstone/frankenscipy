@@ -27,6 +27,63 @@ impl std::fmt::Display for ClusterError {
 
 impl std::error::Error for ClusterError {}
 
+pub use fsci_runtime::{
+    AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
+};
+use fsci_runtime::casp_now_unix_ms;
+
+/// Create a new shared audit ledger for synchronous contexts.
+#[must_use]
+pub fn sync_audit_ledger() -> SyncSharedAuditLedger {
+    AuditLedger::shared()
+}
+
+fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, AuditLedger> {
+    match ledger.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            ledger.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Record a fail-closed audit event when Hardened mode rejects input.
+pub fn record_fail_closed(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    reason: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::FailClosed {
+            reason: reason.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
+/// Record a bounded-recovery audit event when Hardened mode falls back.
+pub fn record_bounded_recovery(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    recovery_action: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::BoundedRecovery {
+            recovery_action: recovery_action.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Principal Component Analysis (randomized)
 // ══════════════════════════════════════════════════════════════════════
@@ -2812,12 +2869,50 @@ pub fn kmeans(
     max_iter: usize,
     seed: u64,
 ) -> Result<KMeansResult, ClusterError> {
+    kmeans_with_mode(data, k, max_iter, seed, RuntimeMode::Strict, None)
+}
+
+/// K-means clustering under an explicit runtime policy with optional audit ledger.
+pub fn kmeans_with_mode(
+    data: &[Vec<f64>],
+    k: usize,
+    max_iter: usize,
+    seed: u64,
+    mode: RuntimeMode,
+    audit_ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<KMeansResult, ClusterError> {
+    if matches!(mode, RuntimeMode::Hardened) {
+        if data.len() > HARDENED_MAX_DIM || k > HARDENED_MAX_DIM {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    &data.len().to_le_bytes(),
+                    "dimension exceeds hardened limit",
+                    "rejected",
+                );
+            }
+            return Err(ClusterError::InvalidArgument(format!(
+                "data length ({}) or k ({k}) exceeds hardened limit ({HARDENED_MAX_DIM})",
+                data.len()
+            )));
+        }
+    }
     let n = data.len();
     if n == 0 {
         return Err(ClusterError::EmptyData);
     }
     let d = validate_feature_dimensions(data, "kmeans")?;
     if data.iter().flatten().any(|v| !v.is_finite()) {
+        if matches!(mode, RuntimeMode::Hardened) {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    b"non-finite-kmeans-data",
+                    "kmeans input must be finite in hardened mode",
+                    "rejected",
+                );
+            }
+        }
         return Err(ClusterError::InvalidArgument(
             "kmeans input must be finite".to_string(),
         ));
@@ -12410,5 +12505,30 @@ mod max_rstat_matches_scipy {
             &[0.0, 1.0, 0.5, 2.0, 2.0, 3.0, 0.8, 2.0, 4.0, 5.0, 1.4, 4.0],
             1e-12,
         );
+    }
+
+    #[test]
+    fn kmeans_mode_audit_and_dimension_cap() {
+        let data = vec![vec![1.0, 2.0], vec![3.0, f64::NAN]];
+        let ledger = crate::sync_audit_ledger();
+
+        // Hardened mode rejects non-finite point data
+        let err = crate::kmeans_with_mode(
+            &data,
+            1,
+            10,
+            42,
+            crate::RuntimeMode::Hardened,
+            Some(&ledger),
+        );
+        assert!(err.is_err());
+
+        // Verify audit event
+        let guard = ledger.lock().unwrap();
+        assert_eq!(guard.entries().len(), 1);
+        assert!(matches!(
+            guard.entries()[0].action,
+            crate::AuditAction::FailClosed { .. }
+        ));
     }
 }

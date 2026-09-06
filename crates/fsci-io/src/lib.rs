@@ -30,6 +30,63 @@
 // `push_str(&format!(...))` allocates per cell/entry on the hot write paths.
 use std::fmt::Write as _;
 
+pub use fsci_runtime::{
+    AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
+};
+use fsci_runtime::casp_now_unix_ms;
+
+/// Create a new shared audit ledger for synchronous contexts.
+#[must_use]
+pub fn sync_audit_ledger() -> SyncSharedAuditLedger {
+    AuditLedger::shared()
+}
+
+fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, AuditLedger> {
+    match ledger.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            ledger.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Record a fail-closed audit event when Hardened mode rejects input.
+pub fn record_fail_closed(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    reason: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::FailClosed {
+            reason: reason.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
+/// Record a bounded-recovery audit event when Hardened mode falls back.
+pub fn record_bounded_recovery(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    recovery_action: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::BoundedRecovery {
+            recovery_action: recovery_action.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
 /// Error type for I/O operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IoError {
@@ -298,8 +355,34 @@ fn parse_mm_info(lines: &mut std::str::Lines<'_>) -> Result<MmInfo, IoError> {
 ///
 /// Matches `scipy.io.mmread`.
 pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
+    mmread_with_mode(content, RuntimeMode::Strict, None)
+}
+
+/// Read a Matrix Market file under an explicit runtime policy with optional audit ledger.
+pub fn mmread_with_mode(
+    content: &str,
+    mode: RuntimeMode,
+    audit_ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<MmMatrix, IoError> {
     let mut lines = content.lines();
     let info = parse_mm_info(&mut lines)?;
+
+    if matches!(mode, RuntimeMode::Hardened) {
+        if info.rows > HARDENED_MAX_DIM || info.cols > HARDENED_MAX_DIM {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    &info.rows.to_le_bytes(),
+                    "dimension exceeds hardened limit",
+                    "rejected",
+                );
+            }
+            return Err(IoError::InvalidFormat(format!(
+                "Matrix Market dimensions {}x{} exceed hardened limit ({HARDENED_MAX_DIM})",
+                info.rows, info.cols
+            )));
+        }
+    }
 
     if info.symmetry != MmSymmetry::General && info.rows != info.cols {
         let symmetry = match info.symmetry {
@@ -8162,5 +8245,27 @@ mod accuracy_contract_ratchet {
             UNCONTRACTED_TOGGLE_BUDGET,
             uncontracted
         );
+    }
+
+    #[test]
+    fn mmread_mode_audit_and_dimension_cap() {
+        let header = format!("%%MatrixMarket matrix coordinate real general\n{} 10 1\n1 1 1.0\n", crate::HARDENED_MAX_DIM + 1);
+        let ledger = crate::sync_audit_ledger();
+
+        // Hardened mode rejects dimension > HARDENED_MAX_DIM
+        let err = crate::mmread_with_mode(
+            &header,
+            crate::RuntimeMode::Hardened,
+            Some(&ledger),
+        );
+        assert!(err.is_err());
+
+        // Verify audit event
+        let guard = ledger.lock().unwrap();
+        assert_eq!(guard.entries().len(), 1);
+        assert!(matches!(
+            guard.entries()[0].action,
+            crate::AuditAction::FailClosed { .. }
+        ));
     }
 }

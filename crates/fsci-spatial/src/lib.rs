@@ -12,6 +12,63 @@
 
 use std::collections::BTreeMap;
 
+pub use fsci_runtime::{
+    AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
+};
+use fsci_runtime::casp_now_unix_ms;
+
+/// Create a new shared audit ledger for synchronous contexts.
+#[must_use]
+pub fn sync_audit_ledger() -> SyncSharedAuditLedger {
+    AuditLedger::shared()
+}
+
+fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, AuditLedger> {
+    match ledger.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            ledger.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// Record a fail-closed audit event when Hardened mode rejects input.
+pub fn record_fail_closed(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    reason: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::FailClosed {
+            reason: reason.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
+/// Record a bounded-recovery audit event when Hardened mode falls back.
+pub fn record_bounded_recovery(
+    ledger: &SyncSharedAuditLedger,
+    input_bytes: &[u8],
+    recovery_action: &str,
+    outcome: &str,
+) {
+    let event = AuditEvent::new(
+        casp_now_unix_ms(),
+        AuditLedger::fingerprint_bytes(input_bytes),
+        AuditAction::BoundedRecovery {
+            recovery_action: recovery_action.to_string(),
+        },
+        outcome.to_string(),
+    );
+    lock_or_recover(ledger).record(event);
+}
+
 use fsci_linalg::{DecompOptions, svd};
 use fsci_sparse::{CooMatrix, DokMatrix, Shape2D};
 
@@ -3031,6 +3088,30 @@ impl KDTree {
     ///
     /// Each point is a `dim`-dimensional vector.
     pub fn new(data: &[Vec<f64>]) -> Result<Self, SpatialError> {
+        Self::new_with_mode(data, RuntimeMode::Strict, None)
+    }
+
+    /// Build a k-d tree under an explicit runtime policy with optional audit ledger.
+    pub fn new_with_mode(
+        data: &[Vec<f64>],
+        mode: RuntimeMode,
+        audit_ledger: Option<&SyncSharedAuditLedger>,
+    ) -> Result<Self, SpatialError> {
+        if matches!(mode, RuntimeMode::Hardened) {
+            if data.len() > HARDENED_MAX_DIM || (!data.is_empty() && data[0].len() > HARDENED_MAX_DIM) {
+                if let Some(ledger) = audit_ledger {
+                    record_fail_closed(
+                        ledger,
+                        &data.len().to_le_bytes(),
+                        "dimension exceeds hardened limit",
+                        "rejected",
+                    );
+                }
+                return Err(SpatialError::InvalidArgument(format!(
+                    "data count or dimension exceeds hardened limit ({HARDENED_MAX_DIM})"
+                )));
+            }
+        }
         if data.is_empty() {
             return Err(SpatialError::EmptyData);
         }
@@ -3047,6 +3128,16 @@ impl KDTree {
             });
         }
         if data.iter().flatten().any(|value| !value.is_finite()) {
+            if matches!(mode, RuntimeMode::Hardened) {
+                if let Some(ledger) = audit_ledger {
+                    record_fail_closed(
+                        ledger,
+                        b"non-finite-points",
+                        "points must be finite in hardened mode",
+                        "rejected",
+                    );
+                }
+            }
             return Err(SpatialError::InvalidArgument(
                 "points must be finite".to_string(),
             ));
@@ -14656,5 +14747,27 @@ mod toggle_ab_mahalanobis_assembly {
                 tri.simplices.len()
             );
         }
+    }
+
+    #[test]
+    fn kdtree_mode_audit_and_dimension_cap() {
+        let data = vec![vec![1.0, 2.0], vec![3.0, f64::NAN]];
+        let ledger = crate::sync_audit_ledger();
+
+        // Hardened mode rejects non-finite point coordinate
+        let err = crate::KDTree::new_with_mode(
+            &data,
+            crate::RuntimeMode::Hardened,
+            Some(&ledger),
+        );
+        assert!(err.is_err());
+
+        // Verify audit event
+        let guard = ledger.lock().unwrap();
+        assert_eq!(guard.entries().len(), 1);
+        assert!(matches!(
+            guard.entries()[0].action,
+            crate::AuditAction::FailClosed { .. }
+        ));
     }
 }
