@@ -193,14 +193,19 @@ for case in q["points"]:
     taylor = [float(v) for v in case["taylor"]]
     m = int(case["m"]); n = int(case["n"])
     try:
-        p_poly, q_poly = pade(taylor, n, m)
+        # scipy's own argument order: pade(an, m, n) with m = q (denominator)
+        # order, n = p (numerator) order — the same convention fsci's pade
+        # docstring documents. The previous call passed (n, m), so every
+        # asymmetric case compared fsci's numerator against scipy's
+        # denominator and reported abs_diff=inf (frankenscipy-wkf10 item 6).
+        p_poly, q_poly = pade(taylor, m, n)
         # poly1d .coef is HIGH-FIRST; reverse to LOW-FIRST
         p = [float(c) for c in p_poly.coef[::-1]]
         q = [float(c) for c in q_poly.coef[::-1]]
-        # scipy strips leading-zero high coefficients; fsci preserves length m+1 / n+1.
-        # Pad with trailing zeros to align lengths.
-        while len(p) < m + 1: p.append(0.0)
-        while len(q) < n + 1: q.append(0.0)
+        # scipy strips leading-zero high coefficients; fsci preserves length
+        # n+1 for p and m+1 for q. Pad with trailing zeros to align lengths.
+        while len(p) < n + 1: p.append(0.0)
+        while len(q) < m + 1: q.append(0.0)
         # Normalize so q[0] = 1 (fsci convention)
         if abs(q[0]) > 1e-15:
             scale = q[0]
