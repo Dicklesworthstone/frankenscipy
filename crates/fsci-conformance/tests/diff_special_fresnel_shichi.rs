@@ -9,8 +9,9 @@
 //! sister oscillatory and hyperbolic forms.
 //!
 //! Tolerances: 1e-9 abs on x ∈ [−5, 5] for FresnelS/C and Shi;
-//! 1e-12 abs for Chi (which is well-conditioned). fsci's
-//! Fresnel and Shi have wide precision gaps at |x| > 5 (~3e-3
+//! 1e-12 abs for Chi plus a 4·ε·|value| relative ceiling — Chi ~ e^x/(2x)
+//! reaches 1.8e11 at x=30 where one ULP is 3e-5, so a flat abs floor is
+//! unsatisfiable there. fsci's Fresnel and Shi have wide precision gaps at |x| > 5 (~3e-3
 //! abs at FresnelC(10), ~3.5e-4 at FresnelC(30), ~6e-5 at
 //! Shi(30)) — tracked alongside the broader special-function
 //! precision sweep in frankenscipy-0om9c.
@@ -252,7 +253,14 @@ fn diff_special_fresnel_shichi() {
             let abs_diff = (rust_v - scipy_v).abs();
             max_overall = max_overall.max(abs_diff);
             let tol = if case.func == "Chi" {
-                ABS_TOL_CHI
+                // Chi grows like e^x/(2x): Chi(30) ≈ 1.845e11, where one ULP is
+                // 3.05e-5 — a flat 1e-12 abs floor there demands sub-ULP agreement,
+                // which no pair of independent f64 implementations can meet
+                // (scipy's own value is 1 ULP off mpmath at 30 dps; the observed
+                // fsci-vs-scipy gap was 3.05e-5 ≈ 1 ULP). Keep the abs floor where
+                // it bites (small x) and add a 4-ULP relative ceiling for the
+                // exponential tail. frankenscipy-wkf10 item 5.
+                ABS_TOL_CHI.max(4.0 * f64::EPSILON * scipy_v.abs())
             } else {
                 ABS_TOL_FRESNEL_SHI
             };
