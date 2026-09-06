@@ -21923,6 +21923,93 @@ mod tests {
     }
 
     #[test]
+    fn savgol_filter_interp_decay_edges_match_scipy() {
+        // scipy 1.17.1 `savgol_filter(exp(-i/8), 31 pts, w, p)` edge values
+        // (default mode='interp'), captured 2026-09-06. The edge slices are
+        // pure polynomial fits of the boundary window; the old
+        // normal-equations polyfit squared the Vandermonde condition number
+        // and diverged from scipy by up to 22.7 on values bounded by 1
+        // (frankenscipy-wkf10 item 3, diff_signal_savgol_filter).
+        let x: Vec<f64> = (0..31).map(|i| (-(i as f64) / 8.0).exp()).collect();
+        let goldens: &[((usize, usize), &[f64], &[f64])] = &[
+            (
+                (5, 2),
+                &[0.999_691_867_406_576_3, 0.883_118_614_418_264_2],
+                &[0.026_625_835_710_168_883, 0.023_529_482_263_810_325],
+            ),
+            (
+                (7, 3),
+                &[
+                    0.999_963_291_465_090_1,
+                    0.882_583_402_939_909_3,
+                    0.778_786_162_459_338,
+                ],
+                &[
+                    0.030_196_905_434_746_985,
+                    0.026_653_203_991_586_556,
+                    0.023_515_968_231_640_15,
+                ],
+            ),
+            (
+                (9, 2),
+                &[
+                    0.996_475_249_690_470_3,
+                    0.884_418_841_110_589_4,
+                    0.782_043_867_387_030_5,
+                    0.689_350_328_519_793_5,
+                ],
+                &[
+                    0.034_074_033_020_815_23,
+                    0.030_005_073_604_682_124,
+                    0.026_555_027_612_325_748,
+                    0.023_723_895_043_746_1,
+                ],
+            ),
+            (
+                (11, 4),
+                &[
+                    0.999_982_922_133_097_3,
+                    0.882_531_646_568_459_1,
+                    0.778_805_345_505_039,
+                    0.687_266_024_056_517,
+                    0.606_508_955_438_009_9,
+                ],
+                &[
+                    0.038_776_051_240_612_47,
+                    0.034_219_842_142_340_84,
+                    0.030_196_859_387_197_447,
+                    0.026_646_492_538_593_407,
+                    0.023_519_070_471_862_843,
+                ],
+            ),
+            (
+                (5, 0),
+                &[0.791_023_524_831_921_3, 0.791_023_524_831_921_3],
+                &[0.030_671_310_551_614_223, 0.030_671_310_551_614_223],
+            ),
+        ];
+        for &((w, p), left, right) in goldens {
+            let y = savgol_filter(&x, w, p).expect("filter");
+            let half = w / 2;
+            for (i, &g) in left.iter().enumerate() {
+                assert!(
+                    (y[i] - g).abs() <= 1.0e-10,
+                    "w={w} p={p} left[{i}] = {} vs scipy {g}",
+                    y[i]
+                );
+            }
+            for (i, &g) in right.iter().enumerate() {
+                let idx = 31 - half + i;
+                assert!(
+                    (y[idx] - g).abs() <= 1.0e-10,
+                    "w={w} p={p} right[{idx}] = {} vs scipy {g}",
+                    y[idx]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn savgol_filter_modes_match_scipy() {
         // scipy.signal.savgol_filter([1,2,4,7,11,16,22,29,37], 5, 2, mode=m).
         // frankenscipy-ckrdw: nearest/constant/mirror/wrap boundary parity.
