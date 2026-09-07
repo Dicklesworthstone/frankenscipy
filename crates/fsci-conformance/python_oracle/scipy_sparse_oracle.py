@@ -321,6 +321,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Capture SciPy sparse helper oracle outputs")
     parser.add_argument("--fixture", required=True, help="Input fixture JSON path")
     parser.add_argument("--output", required=True, help="Output oracle capture JSON path")
+    parser.add_argument("--oracle-root", required=False, default="", help="Optional path to legacy scipy reference tree")
     args = parser.parse_args()
 
     fixture_path = Path(args.fixture)
