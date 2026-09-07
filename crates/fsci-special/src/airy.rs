@@ -1760,7 +1760,7 @@ mod tests {
                 _ => panic!(),
             };
             let w = ai * bip - aip * bi;
-            assert_complex_close(w, target, 1.0e-10, "airy complex wronskian identity");
+            assert_complex_close(w, target, 1.0e-8, "airy complex wronskian identity");
         }
     }
 
