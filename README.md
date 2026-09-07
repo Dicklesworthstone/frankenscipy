@@ -451,6 +451,27 @@ Every routine that participates in CASP is parameterized by a `RuntimeMode`. The
 
 A typical migration pattern: use `Hardened` in production hot paths (so a single malformed batch doesn't take down a long-running service) and use `Strict` in the conformance harness and during local development (so behavior matches SciPy exactly and surprising auto-repair never masks a real bug).
 
+#### Participating Crates
+
+The strict/hardened mode split, `HARDENED_MAX_DIM` resource capping, and `AuditAction::FailClosed` / `BoundedRecovery` audit ledger emission are enforced across all participating domain crates:
+
+| Crate | Mode-Aware Entry Points | Hardened Dimension Cap | Audit Ledger Emission |
+|---|---|---|---|
+| `fsci-linalg` | `solve_with_casp`, `solve_with_mode`, etc. | `HARDENED_MAX_DIM = 10_000` | `FailClosed`, `BoundedRecovery`, `ModeDecision` |
+| `fsci-opt` | `minimize_with_mode`, solvers | Iteration & dimension bounds | `FailClosed`, `BoundedRecovery` |
+| `fsci-sparse` | `SparseMatrix` solvers with mode | Dimension / non-zero bounds | `FailClosed`, `BoundedRecovery` |
+| `fsci-integrate` | `solve_ivp_with_mode`, quadrature | Step / dimension limits | `FailClosed`, `BoundedRecovery` |
+| `fsci-special` | Tensor APIs with mode | Batch dimension limits | `FailClosed`, `BoundedRecovery` |
+| `fsci-signal` | `czt_with_mode_and_audit`, `czt` | `HARDENED_MAX_DIM = 10_000` | `FailClosed`, `BoundedRecovery` |
+| `fsci-ndimage` | `gaussian_filter_with_mode` | `HARDENED_MAX_DIM = 10_000` | `FailClosed`, `BoundedRecovery` |
+| `fsci-interpolate` | `Interp1d::new_with_audit` | `HARDENED_MAX_DIM = 10_000` | `FailClosed`, `BoundedRecovery` |
+| `fsci-spatial` | `KDTree::new_with_mode` | `HARDENED_MAX_DIM = 10_000` | `FailClosed`, `BoundedRecovery` |
+| `fsci-cluster` | `kmeans_with_mode` | `HARDENED_MAX_DIM = 10_000` | `FailClosed`, `BoundedRecovery` |
+| `fsci-io` | `mmread_with_mode` | `HARDENED_MAX_DIM = 10_000` | `FailClosed`, `BoundedRecovery` |
+| `fsci-fft` | Mode-aware transforms | Transform length limits | `FailClosed` |
+| `fsci-stats` | Distribution fitting / moments | Sample size limits | `FailClosed`, `BoundedRecovery` |
+
+
 ### Audit Ledger: Schema and Lifecycle
 
 There are **two complementary records** in flight:
@@ -622,7 +643,7 @@ V1.0 is gated on the following items. Items 1 and 2 of the original list are don
 2. **The three signal defects** originally listed here (`r1vok` periodogram/welch normalization, `cw6k2` iirnotch `r` approximation, `ot7tm` gausspulse envelope) closed on 2026-05-20.
 3. **A CI run that passes.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`) so that the per-crate unit suites, the full live-SciPy differential corpus, and the evidence packs actually run; the first fully green run has to be cited before any of the gate claims in this README count as enforced.
 4. **Promote `fsci-arrayapi` from `aspirational` to `parity_green`.** No other crate depends on it today; wiring the audited backend through linalg / opt / sparse as the canonical array type is unstarted.
-5. **Extend CASP beyond `fsci-linalg`.** The sparse, optimize and special selectors are rule-based today (see **Condition-Aware Solver Portfolio**); a loss matrix, posterior and calibrator per domain is the design intent and is unbuilt. The strict/hardened mode split is also absent from ndimage, signal, interpolate, spatial, cluster and io.
+5. **Extend CASP beyond `fsci-linalg`.** The sparse, optimize and special selectors are rule-based today (see **Condition-Aware Solver Portfolio**); a loss matrix, posterior and calibrator per domain is the design intent and is unbuilt. The strict/hardened mode split and audit ledger emission have been wired into `fsci-signal`, `fsci-ndimage`, `fsci-interpolate`, `fsci-spatial`, `fsci-cluster`, and `fsci-io` with `HARDENED_MAX_DIM` enforcement (`frankenscipy-mlizi`).
 6. **Cut a tagged 0.x release with a publish-to-crates.io workflow** and per-crate semver guarantees. There are no tags, no releases, and no `[profile.release]` in the root manifest yet.
 7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are still in `crates/fsci-conformance/fixtures/artifacts/`; pick one, migrate, and freeze it as V1's contract.
 

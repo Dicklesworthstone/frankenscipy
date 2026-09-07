@@ -12,10 +12,10 @@
 
 use std::collections::BTreeMap;
 
+use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::casp_now_unix_ms;
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -3098,7 +3098,9 @@ impl KDTree {
         audit_ledger: Option<&SyncSharedAuditLedger>,
     ) -> Result<Self, SpatialError> {
         if matches!(mode, RuntimeMode::Hardened) {
-            if data.len() > HARDENED_MAX_DIM || (!data.is_empty() && data[0].len() > HARDENED_MAX_DIM) {
+            if data.len() > HARDENED_MAX_DIM
+                || (!data.is_empty() && data[0].len() > HARDENED_MAX_DIM)
+            {
                 if let Some(ledger) = audit_ledger {
                     record_fail_closed(
                         ledger,
@@ -14755,11 +14757,7 @@ mod toggle_ab_mahalanobis_assembly {
         let ledger = crate::sync_audit_ledger();
 
         // Hardened mode rejects non-finite point coordinate
-        let err = crate::KDTree::new_with_mode(
-            &data,
-            crate::RuntimeMode::Hardened,
-            Some(&ledger),
-        );
+        let err = crate::KDTree::new_with_mode(&data, crate::RuntimeMode::Hardened, Some(&ledger));
         assert!(err.is_err());
 
         // Verify audit event

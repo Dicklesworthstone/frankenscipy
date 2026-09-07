@@ -14,10 +14,10 @@ use fsci_interpolate::make_interp_spline;
 use std::simd::Simd;
 use std::simd::num::SimdFloat;
 
+use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::casp_now_unix_ms;
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]

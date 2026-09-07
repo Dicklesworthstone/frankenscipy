@@ -39,10 +39,10 @@
 //! can match on the resulting enum variants instead of substring-parsing
 //! `Display` text.
 
+use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::casp_now_unix_ms;
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]

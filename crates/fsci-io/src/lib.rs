@@ -30,10 +30,10 @@
 // `push_str(&format!(...))` allocates per cell/entry on the hot write paths.
 use std::fmt::Write as _;
 
+use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::casp_now_unix_ms;
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -8249,15 +8249,14 @@ mod accuracy_contract_ratchet {
 
     #[test]
     fn mmread_mode_audit_and_dimension_cap() {
-        let header = format!("%%MatrixMarket matrix coordinate real general\n{} 10 1\n1 1 1.0\n", crate::HARDENED_MAX_DIM + 1);
+        let header = format!(
+            "%%MatrixMarket matrix coordinate real general\n{} 10 1\n1 1 1.0\n",
+            crate::HARDENED_MAX_DIM + 1
+        );
         let ledger = crate::sync_audit_ledger();
 
         // Hardened mode rejects dimension > HARDENED_MAX_DIM
-        let err = crate::mmread_with_mode(
-            &header,
-            crate::RuntimeMode::Hardened,
-            Some(&ledger),
-        );
+        let err = crate::mmread_with_mode(&header, crate::RuntimeMode::Hardened, Some(&ledger));
         assert!(err.is_err());
 
         // Verify audit event

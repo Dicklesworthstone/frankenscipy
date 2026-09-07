@@ -14,10 +14,10 @@
 //! - `CloughTocher2DInterpolator` — Smooth scattered 2D interpolation
 //! - `SmoothBivariateSpline` — Smooth bivariate approximation for scattered 2D data
 
+use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::casp_now_unix_ms;
 use std::collections::HashMap;
 
 /// Create a new shared audit ledger for synchronous contexts.
