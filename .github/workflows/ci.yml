@@ -107,8 +107,8 @@ jobs:
         include:
           # `--doc` compiles every ```rust block of README.md (see ReadmeDoctests in the
           # conformance lib), so a README example that stops compiling fails this job.
+          # We run `--lib` and `--doc` separately because cargo forbids combining `--doc` with `--lib`.
           - crate: fsci-conformance
-            args: --lib --doc
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -118,7 +118,15 @@ jobs:
         with:
           shared-key: workspace-dev
           cache-on-failure: true
-      - run: cargo test -p ${{ matrix.crate }} ${{ matrix.args }} -- --nocapture
+      - name: Run tests
+        shell: bash
+        run: |
+          if [ "${{ matrix.crate }}" = "fsci-conformance" ]; then
+            cargo test -p fsci-conformance --lib -- --nocapture
+            cargo test -p fsci-conformance --doc -- --nocapture
+          else
+            cargo test -p ${{ matrix.crate }} -- --nocapture
+          fi
 
   # ── G3: Differential conformance against the LIVE, PINNED SciPy ──
   # 731 `diff_*` files, sharded by family. Each file is its own test binary, so the loop
