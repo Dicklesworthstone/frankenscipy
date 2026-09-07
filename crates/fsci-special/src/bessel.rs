@@ -697,7 +697,8 @@ pub static BESSEL_K01_CEPHES_HITS: std::sync::atomic::AtomicUsize =
 /// arrive back where it started. Cephes computes `K0` below 2 with no exponential at all.
 fn k0_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        return cephes_chbevl(x * x - 2.0, &K0_A) - (0.5 * x).ln() * i0_scalar(x);
+        return cephes_chbevl(x * x - 2.0, &K0_A)
+            - (x.ln() - std::f64::consts::LN_2) * i0_scalar(x);
     }
     (-x).exp() * cephes_chbevl(8.0 / x - 2.0, &K0_B) / x.sqrt()
 }
@@ -705,7 +706,8 @@ fn k0_cephes(x: f64) -> f64 {
 /// `K1(x)` for `x > 0`, UNSCALED. Same story as [`k0_cephes`].
 fn k1_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        return (0.5 * x).ln() * i1_scalar(x) + cephes_chbevl(x * x - 2.0, &K1_A) / x;
+        return (x.ln() - std::f64::consts::LN_2) * i1_scalar(x)
+            + cephes_chbevl(x * x - 2.0, &K1_A) / x;
     }
     (-x).exp() * cephes_chbevl(8.0 / x - 2.0, &K1_B) / x.sqrt()
 }
@@ -2202,7 +2204,8 @@ fn kv_scaled_value(v_abs: f64, z: f64) -> f64 {
 
 fn k0e_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        let y = cephes_chbevl(x * x - 2.0, &K0_A) - (0.5 * x).ln() * i0_scalar(x);
+        let y =
+            cephes_chbevl(x * x - 2.0, &K0_A) - (x.ln() - std::f64::consts::LN_2) * i0_scalar(x);
         y * x.exp()
     } else {
         cephes_chbevl(8.0 / x - 2.0, &K0_B) / x.sqrt()
@@ -2211,7 +2214,8 @@ fn k0e_cephes(x: f64) -> f64 {
 
 fn k1e_cephes(x: f64) -> f64 {
     if x <= 2.0 {
-        let y = (0.5 * x).ln() * i1_scalar(x) + cephes_chbevl(x * x - 2.0, &K1_A) / x;
+        let y = (x.ln() - std::f64::consts::LN_2) * i1_scalar(x)
+            + cephes_chbevl(x * x - 2.0, &K1_A) / x;
         y * x.exp()
     } else {
         cephes_chbevl(8.0 / x - 2.0, &K1_B) / x.sqrt()
@@ -2390,7 +2394,7 @@ fn kv_temme_scaled(v: f64, z: f64) -> f64 {
         } else {
             pimu / pimu.sin()
         };
-        let mut d = -x2.ln();
+        let mut d = -(z.ln() - std::f64::consts::LN_2);
         let e = xmu * d;
         let fact2 = if e.abs() < EPS { 1.0 } else { e.sinh() / e };
         let (gam1, gam2, gampl, gammi) = beschb(xmu);
@@ -10262,6 +10266,23 @@ mod tests {
         let comp =
             super::complex_yv_scalar(0.0, Complex64::new(re, 0.0), RuntimeMode::Strict).unwrap();
         eprintln!("TEST_Y0_REPRO: real={real}, comp={comp:?}");
+        let diff = (real - comp.re).abs();
+        let scale = real.abs().max(comp.re.abs());
+        assert!(
+            diff <= 1e-10 + 1e-10 * scale,
+            "diff={diff}, scale={scale}, real={real}, comp={comp:?}"
+        );
+        assert!(comp.im.abs() <= 1e-10 + 1e-10 * scale);
+    }
+
+    #[test]
+    fn test_kv_subnormal_repro() {
+        let v = -3.553391786260205e-45;
+        let re = 3.5e-323;
+        let real = super::kv_scalar(v, re, RuntimeMode::Strict).unwrap();
+        let comp =
+            super::complex_kv_scalar(v, Complex64::new(re, 0.0), RuntimeMode::Strict).unwrap();
+        eprintln!("TEST_KV_REPRO: real={real}, comp={comp:?}");
         let diff = (real - comp.re).abs();
         let scale = real.abs().max(comp.re.abs());
         assert!(

@@ -1777,7 +1777,7 @@ pub fn iti0k0(x: f64) -> (f64, f64) {
                 break;
             }
         }
-        -((x / 2.0).ln() + EL) * ti + s2 + s3
+        -(x.ln() - (std::f64::consts::LN_2 - EL)) * ti + s2 + s3
     } else {
         // Tail asymptotic. Q(1/x) coefficients (q_n = a_n^K − q_{n-1}(n−½)).
         const Q: [f64; 13] = [
@@ -1845,7 +1845,7 @@ pub fn it2i0k0(x: f64) -> (f64, f64) {
     }
 
     let ik0 = if x <= 12.0 {
-        let l = (x / 2.0).ln() + EL;
+        let l = x.ln() - (std::f64::consts::LN_2 - EL);
         let mut s = 0.0_f64;
         let mut a = 1.0_f64;
         let mut h = 0.0_f64;
@@ -1917,7 +1917,7 @@ pub fn it2j0y0(x: f64) -> (f64, f64) {
 
     if x <= 20.0 {
         let u = x * x / 4.0;
-        let l = (x / 2.0).ln() + EL;
+        let l = x.ln() - (std::f64::consts::LN_2 - EL);
         // ∫(1−J₀)/t alternating series.
         let mut a = 1.0_f64;
         let mut ij0 = 0.0_f64;
@@ -2019,7 +2019,7 @@ pub fn it2j0y0(x: f64) -> (f64, f64) {
             // J₀ = √(2/πt)[P·cos − Q·sin]
             jtot += sg * AC[2 * k] * ic_s - sg * AC[2 * k + 1] * is_c;
         }
-        let ij0 = EL + (x / 2.0).ln() + rc * jtot;
+        let ij0 = x.ln() - (std::f64::consts::LN_2 - EL) + rc * jtot;
         let iy0 = rc * ytot;
         (ij0, iy0)
     }
@@ -2076,7 +2076,7 @@ pub fn itj0y0(x: f64) -> (f64, f64) {
                 break;
             }
         }
-        let ty = (2.0 / pi) * (((x / 2.0).ln() + EL) * tj - s2 - s3);
+        let ty = (2.0 / pi) * ((x.ln() - (std::f64::consts::LN_2 - EL)) * tj - s2 - s3);
         (tj, ty)
     } else {
         // Zhang-Jin oscillatory asymptotic.
