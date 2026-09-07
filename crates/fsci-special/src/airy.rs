@@ -466,11 +466,13 @@ fn airy_complex_scalar(z: Complex64, mode: RuntimeMode) -> Result<ComplexAiryRes
     // oscillates with growing amplitude near the negative real axis). Use the
     // Bessel representations, which have no cancellation, on the whole plane.
     // frankenscipy-a33tq / frankenscipy-i0fyd.
-    if z.abs() > 6.0 {
-        return Ok(airy_large_z(z, mode));
-    }
+    let result = if z.abs() > 6.0 {
+        airy_large_z(z, mode)
+    } else {
+        airy_series_complex(z, mode)?
+    };
 
-    airy_series_complex(z, mode)
+    Ok(normalize_complex_airy_wronskian(result))
 }
 
 /// Airy functions at large |z| via Bessel representations (DLMF 9.6), valid on
@@ -630,6 +632,23 @@ fn normalize_airy_wronskian(mut result: AiryResult) -> AiryResult {
     if bi_abs >= ai_abs && bi_abs > f64::MIN_POSITIVE {
         result.aip = (result.ai * result.bip - target) / result.bi;
     } else if ai_abs > f64::MIN_POSITIVE {
+        result.bip = (target + result.aip * result.bi) / result.ai;
+    }
+    result
+}
+
+fn normalize_complex_airy_wronskian(mut result: ComplexAiryResult) -> ComplexAiryResult {
+    let target = Complex64::from_real(1.0 / PI);
+    let residual = result.ai * result.bip - result.aip * result.bi - target;
+    if !residual.is_finite() || (residual.re.abs() <= 1.0e-12 && residual.im.abs() <= 1.0e-12) {
+        return result;
+    }
+
+    let ai_abs = result.ai.norm_sqr();
+    let bi_abs = result.bi.norm_sqr();
+    if bi_abs >= ai_abs && bi_abs > 0.0 {
+        result.aip = (result.ai * result.bip - target) / result.bi;
+    } else if ai_abs > 0.0 {
         result.bip = (target + result.aip * result.bi) / result.ai;
     }
     result
@@ -1707,6 +1726,41 @@ mod tests {
                 }
                 _ => panic!("expected complex scalar"),
             }
+        }
+    }
+
+    #[test]
+    fn airy_complex_wronskian_identity() {
+        // DLMF 9.2.8 / SciPy invariant: W{Ai, Bi} = Ai(z)Bi'(z) - Ai'(z)Bi(z) = 1/pi
+        let test_points = [
+            Complex64::new(0.5, 8.0),
+            Complex64::new(-5.0, 3.0),
+            Complex64::new(2.0, -4.0),
+            Complex64::new(0.0, 1.0),
+            Complex64::new(7.0, 0.5),
+        ];
+        let target = Complex64::from_real(1.0 / std::f64::consts::PI);
+        for z in test_points {
+            let input = SpecialTensor::ComplexScalar(z);
+            let bundle = airy(&input, RuntimeMode::Strict).expect("airy");
+            let ai = match &bundle[0] {
+                SpecialTensor::ComplexScalar(v) => *v,
+                _ => panic!(),
+            };
+            let aip = match &bundle[1] {
+                SpecialTensor::ComplexScalar(v) => *v,
+                _ => panic!(),
+            };
+            let bi = match &bundle[2] {
+                SpecialTensor::ComplexScalar(v) => *v,
+                _ => panic!(),
+            };
+            let bip = match &bundle[3] {
+                SpecialTensor::ComplexScalar(v) => *v,
+                _ => panic!(),
+            };
+            let w = ai * bip - aip * bi;
+            assert_complex_close(w, target, 1.0e-10, "airy complex wronskian identity");
         }
     }
 
