@@ -6021,13 +6021,12 @@ mod tests {
     }
 
     #[test]
-    fn nquad_rejects_empty_ranges_like_scipy() {
+    fn nquad_empty_ranges_evaluates_0d_like_scipy() {
         let opts = QuadOptions::default();
-        let err = nquad(|_| 42.0, &[], opts).expect_err("empty nquad ranges");
-        assert!(matches!(
-            err,
-            IntegrateValidationError::QuadInvalidBounds { .. }
-        ));
+        let res = nquad(|_| 42.0, &[], opts).expect("empty nquad ranges evaluates 0-D");
+        assert_eq!(res.integral, 42.0);
+        assert_eq!(res.neval, 1);
+        assert!(res.converged);
     }
 
     #[test]
