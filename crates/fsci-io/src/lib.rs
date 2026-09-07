@@ -367,21 +367,21 @@ pub fn mmread_with_mode(
     let mut lines = content.lines();
     let info = parse_mm_info(&mut lines)?;
 
-    if matches!(mode, RuntimeMode::Hardened) {
-        if info.rows > HARDENED_MAX_DIM || info.cols > HARDENED_MAX_DIM {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    &info.rows.to_le_bytes(),
-                    "dimension exceeds hardened limit",
-                    "rejected",
-                );
-            }
-            return Err(IoError::InvalidFormat(format!(
-                "Matrix Market dimensions {}x{} exceed hardened limit ({HARDENED_MAX_DIM})",
-                info.rows, info.cols
-            )));
+    if matches!(mode, RuntimeMode::Hardened)
+        && (info.rows > HARDENED_MAX_DIM || info.cols > HARDENED_MAX_DIM)
+    {
+        if let Some(ledger) = audit_ledger {
+            record_fail_closed(
+                ledger,
+                &info.rows.to_le_bytes(),
+                "dimension exceeds hardened limit",
+                "rejected",
+            );
         }
+        return Err(IoError::InvalidFormat(format!(
+            "Matrix Market dimensions {}x{} exceed hardened limit ({HARDENED_MAX_DIM})",
+            info.rows, info.cols
+        )));
     }
 
     if info.symmetry != MmSymmetry::General && info.rows != info.cols {

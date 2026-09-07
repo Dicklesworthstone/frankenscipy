@@ -2881,21 +2881,21 @@ pub fn kmeans_with_mode(
     mode: RuntimeMode,
     audit_ledger: Option<&SyncSharedAuditLedger>,
 ) -> Result<KMeansResult, ClusterError> {
-    if matches!(mode, RuntimeMode::Hardened) {
-        if data.len() > HARDENED_MAX_DIM || k > HARDENED_MAX_DIM {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    &data.len().to_le_bytes(),
-                    "dimension exceeds hardened limit",
-                    "rejected",
-                );
-            }
-            return Err(ClusterError::InvalidArgument(format!(
-                "data length ({}) or k ({k}) exceeds hardened limit ({HARDENED_MAX_DIM})",
-                data.len()
-            )));
+    if matches!(mode, RuntimeMode::Hardened)
+        && (data.len() > HARDENED_MAX_DIM || k > HARDENED_MAX_DIM)
+    {
+        if let Some(ledger) = audit_ledger {
+            record_fail_closed(
+                ledger,
+                &data.len().to_le_bytes(),
+                "dimension exceeds hardened limit",
+                "rejected",
+            );
         }
+        return Err(ClusterError::InvalidArgument(format!(
+            "data length ({}) or k ({k}) exceeds hardened limit ({HARDENED_MAX_DIM})",
+            data.len()
+        )));
     }
     let n = data.len();
     if n == 0 {
@@ -2903,15 +2903,13 @@ pub fn kmeans_with_mode(
     }
     let d = validate_feature_dimensions(data, "kmeans")?;
     if data.iter().flatten().any(|v| !v.is_finite()) {
-        if matches!(mode, RuntimeMode::Hardened) {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    b"non-finite-kmeans-data",
-                    "kmeans input must be finite in hardened mode",
-                    "rejected",
-                );
-            }
+        if let (RuntimeMode::Hardened, Some(ledger)) = (mode, audit_ledger) {
+            record_fail_closed(
+                ledger,
+                b"non-finite-kmeans-data",
+                "kmeans input must be finite in hardened mode",
+                "rejected",
+            );
         }
         return Err(ClusterError::InvalidArgument(
             "kmeans input must be finite".to_string(),

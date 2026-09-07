@@ -2595,31 +2595,29 @@ pub fn czt_with_mode_and_audit(
     if m == 0 {
         return Ok(vec![]);
     }
-    if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
-        if n > HARDENED_MAX_DIM || m > HARDENED_MAX_DIM {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    &n.to_le_bytes(),
-                    "dimension exceeds hardened limit",
-                    "rejected",
-                );
-            }
-            return Err(SignalError::InvalidArgument(format!(
-                "czt dimension ({n}, {m}) exceeds hardened limit ({HARDENED_MAX_DIM})"
-            )));
+    if matches!(mode, fsci_runtime::RuntimeMode::Hardened)
+        && (n > HARDENED_MAX_DIM || m > HARDENED_MAX_DIM)
+    {
+        if let Some(ledger) = audit_ledger {
+            record_fail_closed(
+                ledger,
+                &n.to_le_bytes(),
+                "dimension exceeds hardened limit",
+                "rejected",
+            );
         }
+        return Err(SignalError::InvalidArgument(format!(
+            "czt dimension ({n}, {m}) exceeds hardened limit ({HARDENED_MAX_DIM})"
+        )));
     }
     if let Err(err) = validate_real_values_finite(x, "czt input samples must be finite") {
-        if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    b"non-finite-input",
-                    "non-finite input samples",
-                    "rejected",
-                );
-            }
+        if let (fsci_runtime::RuntimeMode::Hardened, Some(ledger)) = (mode, audit_ledger) {
+            record_fail_closed(
+                ledger,
+                b"non-finite-input",
+                "non-finite input samples",
+                "rejected",
+            );
         }
         return Err(err);
     }

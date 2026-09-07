@@ -94318,6 +94318,7 @@ mod tests {
         assert_eq!(ef, vec![vec![12.0, 18.0], vec![28.0, 42.0]]);
         // contingency_table of paired labels.
         let (table, rm, cm) = contingency_table(&[0, 0, 1, 1], &[0, 1, 0, 1]);
+        assert_eq!(table, vec![vec![1, 1], vec![1, 1]]);
         // Labels are the sorted distinct values (scipy crosstab semantics),
         // NOT the marginal totals — the margins-as-labels inversion broke
         // label consumers and was caught by the live diff harness

@@ -3097,22 +3097,21 @@ impl KDTree {
         mode: RuntimeMode,
         audit_ledger: Option<&SyncSharedAuditLedger>,
     ) -> Result<Self, SpatialError> {
-        if matches!(mode, RuntimeMode::Hardened) {
-            if data.len() > HARDENED_MAX_DIM
-                || (!data.is_empty() && data[0].len() > HARDENED_MAX_DIM)
-            {
-                if let Some(ledger) = audit_ledger {
-                    record_fail_closed(
-                        ledger,
-                        &data.len().to_le_bytes(),
-                        "dimension exceeds hardened limit",
-                        "rejected",
-                    );
-                }
-                return Err(SpatialError::InvalidArgument(format!(
-                    "data count or dimension exceeds hardened limit ({HARDENED_MAX_DIM})"
-                )));
+        if matches!(mode, RuntimeMode::Hardened)
+            && (data.len() > HARDENED_MAX_DIM
+                || (!data.is_empty() && data[0].len() > HARDENED_MAX_DIM))
+        {
+            if let Some(ledger) = audit_ledger {
+                record_fail_closed(
+                    ledger,
+                    &data.len().to_le_bytes(),
+                    "dimension exceeds hardened limit",
+                    "rejected",
+                );
             }
+            return Err(SpatialError::InvalidArgument(format!(
+                "data count or dimension exceeds hardened limit ({HARDENED_MAX_DIM})"
+            )));
         }
         if data.is_empty() {
             return Err(SpatialError::EmptyData);
@@ -3130,15 +3129,13 @@ impl KDTree {
             });
         }
         if data.iter().flatten().any(|value| !value.is_finite()) {
-            if matches!(mode, RuntimeMode::Hardened) {
-                if let Some(ledger) = audit_ledger {
-                    record_fail_closed(
-                        ledger,
-                        b"non-finite-points",
-                        "points must be finite in hardened mode",
-                        "rejected",
-                    );
-                }
+            if let (RuntimeMode::Hardened, Some(ledger)) = (mode, audit_ledger) {
+                record_fail_closed(
+                    ledger,
+                    b"non-finite-points",
+                    "points must be finite in hardened mode",
+                    "rejected",
+                );
             }
             return Err(SpatialError::InvalidArgument(
                 "points must be finite".to_string(),
