@@ -1698,7 +1698,8 @@ fn jv_series(v: f64, z: f64) -> f64 {
         return f64::NAN;
     }
 
-    let half_z_abs = (z / 2.0).abs();
+    let log_half_z_abs = z.abs().ln() - std::f64::consts::LN_2;
+    let quarter_z2 = z * z / 4.0;
 
     // J_v(z) = Σ_{k=0}^∞ (-1)^k (z/2)^{v+2k} / (k! Γ(v+k+1)).
     // log|term_k| evolves via the recurrence
@@ -1706,13 +1707,19 @@ fn jv_series(v: f64, z: f64) -> f64 {
     // sign(term_k) = (-1)^k · sign(Γ(v+k+1)). Pre-fix the recurrence used
     // log(v+k+1) which is NaN whenever v+k+1<0 — this killed yv at every
     // non-integer v > 1 (frankenscipy-6avjb).
-    let log_first = v * half_z_abs.ln() - lgamma(v + 1.0);
+    let log_first = v * log_half_z_abs - lgamma(v + 1.0);
+    let mut gamma_sign = gamma_sign_fn(v + 1.0);
+    let term0 = if v == 0.0 { 1.0 } else { log_first.exp() };
+
+    if quarter_z2 == 0.0 {
+        return gamma_sign * term0;
+    }
+
     let mut sum = 0.0;
     let mut log_term = log_first;
-    let mut gamma_sign = gamma_sign_fn(v + 1.0);
 
     for k in 0..200 {
-        let term = log_term.exp();
+        let term = if k == 0 { term0 } else { log_term.exp() };
         let alternating = if k % 2 == 0 { 1.0 } else { -1.0 };
         sum += alternating * gamma_sign * term;
 
@@ -1722,7 +1729,7 @@ fn jv_series(v: f64, z: f64) -> f64 {
 
         let kf = k as f64;
         let v_k_1 = v + kf + 1.0;
-        log_term += (z * z / 4.0).ln() - (kf + 1.0).ln() - v_k_1.abs().ln();
+        log_term += quarter_z2.ln() - (kf + 1.0).ln() - v_k_1.abs().ln();
         // sign(Γ(v+k+2)) = sign(v+k+1) · sign(Γ(v+k+1)).
         if v_k_1 < 0.0 {
             gamma_sign = -gamma_sign;
@@ -2014,10 +2021,10 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
     }
 
     // Power series: I_v(z) = (z/2)^v Σ (z²/4)^k / (k! Γ(v+k+1))
-    let half_z = az / 2.0;
     let quarter_z2 = az * az / 4.0;
-
-    let log_first = v * half_z.ln() - lgamma(v + 1.0);
+    let log_half_z = az.ln() - std::f64::consts::LN_2;
+    let log_first = v * log_half_z - lgamma(v + 1.0);
+    let term0 = if v == 0.0 { 1.0 } else { log_first.exp() };
     let mut sum = 0.0;
 
     // The summand peaks near k ≈ (√(v²+z²) − v)/2, which reaches a few hundred
@@ -2034,9 +2041,11 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
     // Every term here is positive, so accumulating them directly cannot cancel; the
     // multiplicative form is at least as accurate as re-exponentiating a running logarithm,
     // which rounds once per term.
-    if IV_SERIES_TERM_RATIO.load(std::sync::atomic::Ordering::Relaxed) {
+    if quarter_z2 == 0.0 {
+        sum = term0;
+    } else if IV_SERIES_TERM_RATIO.load(std::sync::atomic::Ordering::Relaxed) {
         IV_SERIES_TERM_RATIO_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut term = log_first.exp();
+        let mut term = term0;
         for k in 0..1000 {
             sum += term;
             if term < 1e-16 * sum && k > 10 {
@@ -2048,7 +2057,7 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
     } else {
         let mut log_term = log_first;
         for k in 0..1000 {
-            let term = log_term.exp();
+            let term = if k == 0 { term0 } else { log_term.exp() };
             sum += term;
 
             if term < 1e-16 * sum && k > 10 {
@@ -5023,6 +5032,7 @@ fn complex_kv_asymptotic(v: f64, z: Complex64) -> Complex64 {
 /// K grows monotonically with order, so the upward recurrence is stable through
 /// the turning point order = |z| (unlike the oscillatory Y). frankenscipy-d2s72.
 fn complex_kv_band(v: f64, z: Complex64) -> Complex64 {
+    let v = v.abs();
     let frac = v - v.floor();
     let n = (v - frac).round() as usize;
     let z_inv = z.recip();
@@ -5139,6 +5149,10 @@ pub(crate) fn complex_kv_scalar(
     if z.re == 0.0 && z.im == 0.0 {
         return Ok(Complex64::new(f64::INFINITY, 0.0));
     }
+
+    // K_{-v}(z) == K_v(z) identically for all v in C (DLMF 10.27.3).
+    // Normalize to v >= 0 so asymptotic and recurrence orders are non-negative.
+    let v = v.abs();
 
     // Re(z) < 0 is across the K_v branch cut, where every Re(z) ≥ 0 method here
     // (asymptotic / band recurrence / I_{-v}−I_v) is on the wrong sheet. Reflect
@@ -10283,6 +10297,39 @@ mod tests {
         let comp =
             super::complex_kv_scalar(v, Complex64::new(re, 0.0), RuntimeMode::Strict).unwrap();
         eprintln!("TEST_KV_REPRO: real={real}, comp={comp:?}");
+        let diff = (real - comp.re).abs();
+        let scale = real.abs().max(comp.re.abs());
+        assert!(
+            diff <= 1e-10 + 1e-10 * scale,
+            "diff={diff}, scale={scale}, real={real}, comp={comp:?}"
+        );
+        assert!(comp.im.abs() <= 1e-10 + 1e-10 * scale);
+    }
+
+    #[test]
+    fn test_kv_negative_band_repro() {
+        let v = -16.0;
+        let re = 17.20784317189838;
+        let real = super::kv_scalar(v, re, RuntimeMode::Strict).unwrap();
+        let comp =
+            super::complex_kv_scalar(v, Complex64::new(re, 0.0), RuntimeMode::Strict).unwrap();
+        eprintln!("TEST_KV_NEG_BAND: real={real}, comp={comp:?}");
+        let diff = (real - comp.re).abs();
+        let scale = real.abs().max(comp.re.abs());
+        assert!(
+            diff <= 1e-10 + 1e-10 * scale,
+            "diff={diff}, scale={scale}, real={real}, comp={comp:?}"
+        );
+        assert!(comp.im.abs() <= 1e-10 + 1e-10 * scale);
+    }
+
+    #[test]
+    fn test_iv_subnormal_repro() {
+        let v = -1.4751739745752867e-17;
+        let re = 5e-324;
+        let real = super::iv_scalar(v, re);
+        let comp = super::complex_iv_scalar(v, Complex64::new(re, 0.0));
+        eprintln!("TEST_IV_SUBNORMAL: real={real}, comp={comp:?}");
         let diff = (real - comp.re).abs();
         let scale = real.abs().max(comp.re.abs());
         assert!(
