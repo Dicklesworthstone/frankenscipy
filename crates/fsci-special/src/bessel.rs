@@ -4764,6 +4764,14 @@ fn complex_jv_asymptotic(v: f64, z: Complex64) -> Complex64 {
 /// arg z > π/2), routing through the everywhere-accurate jv asymptotic so the
 /// Stokes line on the imaginary axis is dodged (iz rotates it to the real axis).
 fn complex_iv_asymptotic(v: f64, z: Complex64) -> Complex64 {
+    // For real order v, I_v satisfies the Schwarz reflection principle: I_v(\bar{z}) = \overline{I_v(z)}.
+    // Reflect points with negative imaginary parts (including -0.0) to the upper half-plane,
+    // guaranteeing exact conjugate symmetry across the real axis and avoiding branch phase splits in Q3.
+    if z.im < 0.0 || (z.im == 0.0 && z.im.is_sign_negative()) {
+        let ic = complex_iv_asymptotic(v, Complex64::new(z.re, -z.im));
+        return Complex64::new(ic.re, -ic.im);
+    }
+
     let iz = Complex64::new(-z.im, z.re);
     // Full jv router (asymptotic for |iz| > v², Miller for the turning band).
     let jiz = if iz.abs() > v * v {
@@ -10351,4 +10359,26 @@ mod tests {
         assert_eq!(y1.re, y2.re);
         assert_eq!(y1.im, -y2.im);
     }
+
+    #[test]
+    fn test_iv_asymptotic_conj_repro() {
+        let v = 0.5;
+        let z1 = Complex64::new(-2.2250738585072014e-308, -1000.0);
+        let z2 = z1.conj();
+        let i1 = super::complex_iv_scalar(v, z1);
+        let i2 = super::complex_iv_scalar(v, z2);
+        let diff_re = (i1.re - i2.re).abs();
+        let diff_im = (i1.im - (-i2.im)).abs();
+        let scale_re = i1.re.abs().max(i2.re.abs());
+        let scale_im = i1.im.abs().max(i2.im.abs());
+        assert!(
+            diff_re <= 1e-8 + 1e-6 * scale_re,
+            "diff_re={diff_re}, scale={scale_re}, i1={i1:?}, i2={i2:?}"
+        );
+        assert!(
+            diff_im <= 1e-8 + 1e-6 * scale_im,
+            "diff_im={diff_im}, scale={scale_im}, i1={i1:?}, i2={i2:?}"
+        );
+    }
 }
+
