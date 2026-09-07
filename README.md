@@ -111,7 +111,7 @@ FrankenSciPy is a Cargo workspace of **19 crates** spanning ~610,000 lines under
 | [`fsci-odr`](crates/fsci-odr/) | ~3,000 | Orthogonal Distance Regression: `ODR` driver, `Model`, `Data`, `Output`; explicit and implicit models; weighted, multi-response fits |
 | [`fsci-datasets`](crates/fsci-datasets/) | ~670 | Deterministic embedded sample fixtures matching SciPy shapes: `ascent`, `face` (RGB / gray), `electrocardiogram` |
 | [`fsci-runtime`](crates/fsci-runtime/) | ~3,650 | The CASP engine: `SolverPortfolio`, `MatrixConditionState`, `StructuralEvidence`, `SolverAction`, `PolicyController`, evidence ledger, conformal calibrator, fail-closed semantics, strict vs hardened modes |
-| [`fsci-arrayapi`](crates/fsci-arrayapi/) | ~4,800 | Contract-first Array API backend (`backend.rs`, `broadcast`, `creation`, `indexing`, `audit`) with integration seams for linalg / opt / sparse |
+| [`fsci-arrayapi`](crates/fsci-arrayapi/) | ~4,800 | Reference Array API backend and broadcasting/index specification used by the conformance suite (`fsci-conformance`) |
 | [`fsci-conformance`](crates/fsci-conformance/) | ~33,000 (lib + 9 bins) + **793 test files** | Three-lane differential harness (self-check, SciPy-oracle, dispatch); RaptorQ evidence packs; `parity_report.json` and `decode_proof.json` artifacts; 15 Python oracle scripts; nine binaries (`conformance_dashboard`, `e2e_orchestrator`, `fixture_regen`, `live_oracle_capture`, `benchmark_gate`, `raptorq_sidecar`, `tolerance_lint`, `adversarial_corpus`, `fuzz_triage`) |
 
 For per-symbol parity assessment see [`docs/planning/FEATURE_PARITY.md`](docs/planning/FEATURE_PARITY.md).
@@ -642,7 +642,7 @@ V1.0 is gated on the following items. Items 1 and 2 of the original list are don
 1. **Surface coverage** — done by name: 1,194 of 1,300 SciPy callables have a same-named public equivalent (`fsci-special` 98.6%, `fsci-sparse` 96.2%, `fsci-fft` 90.2%, `fsci-opt` 84.5%; see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)). What remains is **behavioural** coverage. A 2026-08-24 audit found 201 SciPy-named public entry points with no reference anywhere in the conformance corpus (`frankenscipy-ivxx6`); one sampled at random (`RbfInterpolator`) implemented a non-default variant until fixed, five sampled from `fsci-linalg` agreed with SciPy, and by 2026-08-30 `scripts/conformance_coverage_audit.py` reports zero unreferenced entry points. That audit is name-mention based, so "referenced" is weaker than "compared"; a per-routine list of what each `diff_*` file actually asserts does not exist yet.
 2. **The three signal defects** originally listed here (`r1vok` periodogram/welch normalization, `cw6k2` iirnotch `r` approximation, `ot7tm` gausspulse envelope) closed on 2026-05-20.
 3. **A CI run that passes.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`) so that the per-crate unit suites, the full live-SciPy differential corpus, and the evidence packs actually run; the first fully green run has to be cited before any of the gate claims in this README count as enforced.
-4. **Promote `fsci-arrayapi` from `aspirational` to `parity_green`.** No other crate depends on it today; wiring the audited backend through linalg / opt / sparse as the canonical array type is unstarted.
+4. **Array API role decided (descoped from V1.0 blocker).** `fsci-arrayapi` serves as the reference backend-negotiation and broadcasting specification for conformance validation (`frankenscipy-0cxgm`); canonical container migration across domain crates is deferred post-V1.0 to preserve bit-identity and stability contracts.
 5. **Extend CASP beyond `fsci-linalg`.** The sparse, optimize and special selectors are rule-based today (see **Condition-Aware Solver Portfolio**); a loss matrix, posterior and calibrator per domain is the design intent and is unbuilt. The strict/hardened mode split and audit ledger emission have been wired into `fsci-signal`, `fsci-ndimage`, `fsci-interpolate`, `fsci-spatial`, `fsci-cluster`, and `fsci-io` with `HARDENED_MAX_DIM` enforcement (`frankenscipy-mlizi`).
 6. **Cut a tagged 0.x release with a publish-to-crates.io workflow** and per-crate semver guarantees. There are no tags, no releases, and no `[profile.release]` in the root manifest yet.
 7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are still in `crates/fsci-conformance/fixtures/artifacts/`; pick one, migrate, and freeze it as V1's contract.
@@ -1785,7 +1785,7 @@ agreement; that is what the `diff_*` conformance lanes measure, and the
 | `fsci-odr` | `parity_green` | 100% (10/10) | 1 | Explicit + implicit + weighted ODR |
 | `fsci-datasets` | `parity_green` | 100% (5/5) | 0 | Embedded sample fixtures |
 | `fsci-runtime` | `parity_green` | n/a (FrankenSciPy-native) | 8 | CASP engine + audit ledger |
-| `fsci-arrayapi` | `aspirational` | n/a | 5 | Contract-first backend; no other crate depends on it yet |
+| `fsci-arrayapi` | `reference` | n/a | 5 | Reference backend and broadcasting spec used by conformance suite |
 | `fsci-conformance` | `parity_green` | n/a (harness) | — | 793 integration test files (731 `diff_*`), 18 packets, 15 oracles |
 
 ---
