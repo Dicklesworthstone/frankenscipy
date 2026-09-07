@@ -4803,12 +4803,18 @@ pub(crate) fn complex_jv_scalar(v: f64, z: Complex64) -> Complex64 {
     let half_z = z / 2.0;
     let neg_quarter_z2 = Complex64::new(-1.0, 0.0) * half_z * half_z;
 
-    // First term: (z/2)^v / Γ(v+1)
-    let log_half_z = half_z.ln();
-    let v_c = Complex64::new(v, 0.0);
-    let log_first = v_c * log_half_z - crate::gamma::complex_gammaln(Complex64::new(v + 1.0, 0.0));
-    let mut sum = log_first.exp();
-    let mut term = sum;
+    // First term: (z/2)^v / Γ(v+1). For v == 0.0, (z/2)^0 / Γ(1) = 1.0 analytically;
+    // evaluating 0.0 * ln(z/2) would produce NaN whenever |z/2| underflows to 0.
+    let (mut sum, mut term) = if v == 0.0 {
+        (Complex64::new(1.0, 0.0), Complex64::new(1.0, 0.0))
+    } else {
+        let log_half_z = z.ln() - Complex64::new(std::f64::consts::LN_2, 0.0);
+        let v_c = Complex64::new(v, 0.0);
+        let log_first =
+            v_c * log_half_z - crate::gamma::complex_gammaln(Complex64::new(v + 1.0, 0.0));
+        let s = log_first.exp();
+        (s, s)
+    };
 
     for k in 1..200 {
         let kf = k as f64;
@@ -4857,12 +4863,18 @@ pub(crate) fn complex_iv_scalar(v: f64, z: Complex64) -> Complex64 {
     let half_z = z / 2.0;
     let quarter_z2 = half_z * half_z;
 
-    // First term: (z/2)^v / Γ(v+1)
-    let log_half_z = half_z.ln();
-    let v_c = Complex64::new(v, 0.0);
-    let log_first = v_c * log_half_z - crate::gamma::complex_gammaln(Complex64::new(v + 1.0, 0.0));
-    let mut sum = log_first.exp();
-    let mut term = sum;
+    // First term: (z/2)^v / Γ(v+1). For v == 0.0, (z/2)^0 / Γ(1) = 1.0 analytically;
+    // evaluating 0.0 * ln(z/2) would produce NaN whenever |z/2| underflows to 0.
+    let (mut sum, mut term) = if v == 0.0 {
+        (Complex64::new(1.0, 0.0), Complex64::new(1.0, 0.0))
+    } else {
+        let log_half_z = z.ln() - Complex64::new(std::f64::consts::LN_2, 0.0);
+        let v_c = Complex64::new(v, 0.0);
+        let log_first =
+            v_c * log_half_z - crate::gamma::complex_gammaln(Complex64::new(v + 1.0, 0.0));
+        let s = log_first.exp();
+        (s, s)
+    };
 
     for k in 1..200 {
         let kf = k as f64;
@@ -5076,7 +5088,7 @@ fn complex_y0_series(z: Complex64) -> Complex64 {
             break;
         }
     }
-    let log_term = (z / 2.0).ln() + Complex64::new(BESSEL_EULER_GAMMA, 0.0);
+    let log_term = z.ln() - Complex64::new(std::f64::consts::LN_2 - BESSEL_EULER_GAMMA, 0.0);
     Complex64::new(FRAC_2_PI, 0.0) * (log_term * j0 - s)
 }
 
@@ -5103,7 +5115,7 @@ fn complex_y1_series(z: Complex64) -> Complex64 {
         t = t * neg_z2_4 / ((kf + 1.0) * (kf + 2.0));
         hk = hk1;
     }
-    let log_term = (z / 2.0).ln() + Complex64::new(BESSEL_EULER_GAMMA, 0.0);
+    let log_term = z.ln() - Complex64::new(std::f64::consts::LN_2 - BESSEL_EULER_GAMMA, 0.0);
     Complex64::new(FRAC_2_PI, 0.0) * log_term * j1
         - Complex64::new(FRAC_2_PI, 0.0) * z.recip()
         - Complex64::new(1.0 / PI, 0.0) * (z / 2.0) * s
@@ -5216,7 +5228,7 @@ fn complex_k0(z: Complex64) -> Complex64 {
             break;
         }
     }
-    let log_term = (z / 2.0).ln() + Complex64::new(BESSEL_EULER_GAMMA, 0.0);
+    let log_term = z.ln() - Complex64::new(std::f64::consts::LN_2 - BESSEL_EULER_GAMMA, 0.0);
     Complex64::new(-1.0, 0.0) * log_term * i0 + s
 }
 
@@ -5243,7 +5255,7 @@ fn complex_k1(z: Complex64) -> Complex64 {
         t = t * z2_4 / ((kf + 1.0) * (kf + 2.0));
         hk = hk1;
     }
-    let log_term = (z / 2.0).ln() + Complex64::new(BESSEL_EULER_GAMMA, 0.0);
+    let log_term = z.ln() - Complex64::new(std::f64::consts::LN_2 - BESSEL_EULER_GAMMA, 0.0);
     log_term * i1 + z.recip() - Complex64::new(0.5, 0.0) * (z / 2.0) * s
 }
 
@@ -10241,5 +10253,21 @@ mod tests {
                 "i1({x}) = {result}, expected {expected}"
             );
         }
+    }
+
+    #[test]
+    fn test_y0_subnormal_repro() {
+        let re = 2.5e-323;
+        let real = super::yv_scalar(0.0, re, RuntimeMode::Strict).unwrap();
+        let comp =
+            super::complex_yv_scalar(0.0, Complex64::new(re, 0.0), RuntimeMode::Strict).unwrap();
+        eprintln!("TEST_Y0_REPRO: real={real}, comp={comp:?}");
+        let diff = (real - comp.re).abs();
+        let scale = real.abs().max(comp.re.abs());
+        assert!(
+            diff <= 1e-10 + 1e-10 * scale,
+            "diff={diff}, scale={scale}, real={real}, comp={comp:?}"
+        );
+        assert!(comp.im.abs() <= 1e-10 + 1e-10 * scale);
     }
 }
