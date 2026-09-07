@@ -170,20 +170,28 @@ import json
 import math
 import sys
 import numpy as np
-import networkx as nx
 
-def build_graph(points, eps):
+def find_maximal_cliques(points, eps):
     n = len(points)
     P = np.asarray(points, dtype=np.float64)
-    g = nx.Graph()
-    g.add_nodes_from(range(n))
     eps2 = eps * eps
+    adj = {i: set() for i in range(n)}
     for i in range(n):
         for j in range(i + 1, n):
             d = float(np.sum((P[i] - P[j]) ** 2))
             if d <= eps2:
-                g.add_edge(i, j)
-    return g
+                adj[i].add(j)
+                adj[j].add(i)
+    def bron_kerbosch(r, p, x):
+        if not p and not x:
+            yield r
+            return
+        u = next(iter(p | x))
+        for v in list(p - adj[u]):
+            yield from bron_kerbosch(r | {v}, p & adj[v], x & adj[v])
+            p.remove(v)
+            x.add(v)
+    return [sorted(list(c)) for c in bron_kerbosch(set(), set(range(n)), set())]
 
 q = json.load(sys.stdin)
 points = []
@@ -191,8 +199,7 @@ for case in q["points"]:
     cid = case["case_id"]
     out = None
     try:
-        g = build_graph(case["data"], case["eps"])
-        out = [sorted(int(v) for v in c) for c in nx.find_cliques(g)]
+        out = find_maximal_cliques(case["data"], case["eps"])
     except Exception:
         out = None
     points.append({"case_id": cid, "cliques": out})

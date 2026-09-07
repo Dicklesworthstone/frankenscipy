@@ -2053,13 +2053,21 @@ fn sample_interpolated(
             // scipy applies 'constant' on the FLOAT coordinate: a point outside
             // [0, len-1] is out of range (→ cval) even if it would round back to a
             // valid index (e.g. coord 4.3 with len 5 rounds to 4 but is outside).
+            // Snap fp rotation/transformation noise within 1e-9 of an integer so
+            // boundary coordinates (e.g. 2.0 + 1e-16 on a length-3 axis) do not
+            // falsely trigger cval.
+            let snap = |c: f64| {
+                let r = c.round();
+                if (c - r).abs() < 1e-9 { r } else { c }
+            };
             for (axis, &coord) in coords.iter().enumerate() {
+                let snapped = snap(coord);
                 let hi = (input.shape[axis] as f64) - 1.0;
-                if coord < 0.0 || coord > hi {
+                if snapped < 0.0 || snapped > hi {
                     return cval;
                 }
             }
-            let idx: Vec<i64> = coords.iter().map(|&c| round0(c)).collect();
+            let idx: Vec<i64> = coords.iter().map(|&c| round0(snap(c))).collect();
             return input.get_boundary(&idx, mode, cval);
         }
         if mode == BoundaryMode::Wrap {
@@ -10737,9 +10745,21 @@ pub fn rotate(
 
     let rows = input.shape[0];
     let cols = input.shape[1];
-    let rad = angle.to_radians();
-    let cos_a = rad.cos();
-    let sin_a = rad.sin();
+    let (cos_a, sin_a) = {
+        let rem = (angle % 360.0 + 360.0) % 360.0;
+        if rem == 0.0 {
+            (1.0, 0.0)
+        } else if (rem - 90.0).abs() < 1e-9 {
+            (0.0, 1.0)
+        } else if (rem - 180.0).abs() < 1e-9 {
+            (-1.0, 0.0)
+        } else if (rem - 270.0).abs() < 1e-9 {
+            (0.0, -1.0)
+        } else {
+            let rad = angle.to_radians();
+            (rad.cos(), rad.sin())
+        }
+    };
 
     let (out_rows, out_cols) = if reshape {
         // Compute new size to contain rotated image

@@ -93,11 +93,10 @@ const EXPECTED_MAPPING: [(&str, &str); 5] = [
 /// for every order, so ours diverges wherever the boundary is reached and the order is one
 /// nobody special-cased. `Nearest` never appears below: clamping is order-independent, so it is
 /// immune by construction.
-const KNOWN_DIVERGENCES_TO_FIX: [(&str, &str); 15] = [
+const KNOWN_DIVERGENCES_TO_FIX: [(&str, &str); 14] = [
     // Order 0 tie-breaks: scipy maps the coordinate THEN rounds, we round then map, so the two
     // disagree at exact half-integers.
     ("1d-5-order0", "Mirror"),
-    ("1d-5-order0", "Wrap"),
     // Orders 2, 4, 5 — the generic prefilter path.
     ("1d-5-order2", "Constant"),
     ("1d-5-order2", "Wrap"),

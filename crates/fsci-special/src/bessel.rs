@@ -4818,14 +4818,15 @@ pub(crate) fn complex_jv_scalar(v: f64, z: Complex64) -> Complex64 {
 
     // First term: (z/2)^v / Γ(v+1). For v == 0.0, (z/2)^0 / Γ(1) = 1.0 analytically;
     // evaluating 0.0 * ln(z/2) would produce NaN whenever |z/2| underflows to 0.
+    // For real order v, Γ(v+1) is real: use lgamma and gamma_sign_fn so no spurious imaginary
+    // phase is introduced from complex_gammaln branching.
     let (mut sum, mut term) = if v == 0.0 {
         (Complex64::new(1.0, 0.0), Complex64::new(1.0, 0.0))
     } else {
         let log_half_z = z.ln() - Complex64::new(std::f64::consts::LN_2, 0.0);
         let v_c = Complex64::new(v, 0.0);
-        let log_first =
-            v_c * log_half_z - crate::gamma::complex_gammaln(Complex64::new(v + 1.0, 0.0));
-        let s = log_first.exp();
+        let log_first = v_c * log_half_z - Complex64::new(lgamma(v + 1.0), 0.0);
+        let s = log_first.exp() * Complex64::new(gamma_sign_fn(v + 1.0), 0.0);
         (s, s)
     };
 
@@ -4878,14 +4879,15 @@ pub(crate) fn complex_iv_scalar(v: f64, z: Complex64) -> Complex64 {
 
     // First term: (z/2)^v / Γ(v+1). For v == 0.0, (z/2)^0 / Γ(1) = 1.0 analytically;
     // evaluating 0.0 * ln(z/2) would produce NaN whenever |z/2| underflows to 0.
+    // For real order v, Γ(v+1) is real: use lgamma and gamma_sign_fn so no spurious imaginary
+    // phase is introduced from complex_gammaln branching.
     let (mut sum, mut term) = if v == 0.0 {
         (Complex64::new(1.0, 0.0), Complex64::new(1.0, 0.0))
     } else {
         let log_half_z = z.ln() - Complex64::new(std::f64::consts::LN_2, 0.0);
         let v_c = Complex64::new(v, 0.0);
-        let log_first =
-            v_c * log_half_z - crate::gamma::complex_gammaln(Complex64::new(v + 1.0, 0.0));
-        let s = log_first.exp();
+        let log_first = v_c * log_half_z - Complex64::new(lgamma(v + 1.0), 0.0);
+        let s = log_first.exp() * Complex64::new(gamma_sign_fn(v + 1.0), 0.0);
         (s, s)
     };
 
@@ -10337,5 +10339,16 @@ mod tests {
             "diff={diff}, scale={scale}, real={real}, comp={comp:?}"
         );
         assert!(comp.im.abs() <= 1e-10 + 1e-10 * scale);
+    }
+
+    #[test]
+    fn test_yv_subnormal_conj_repro() {
+        let v = 13.747079238062724;
+        let z1 = Complex64::new(1.0, 6.23e-322);
+        let z2 = Complex64::new(1.0, -6.23e-322);
+        let y1 = super::complex_yv_scalar(v, z1, RuntimeMode::Strict).unwrap();
+        let y2 = super::complex_yv_scalar(v, z2, RuntimeMode::Strict).unwrap();
+        assert_eq!(y1.re, y2.re);
+        assert_eq!(y1.im, -y2.im);
     }
 }
