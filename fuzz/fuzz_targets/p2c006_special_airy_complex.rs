@@ -142,11 +142,18 @@ fn check_wronskian(bundle: [Complex64; 4], z: Complex64) {
         && bi_value.is_finite()
         && bip_value.is_finite()
     {
-        let wronskian = ai_value * bip_value - aip_value * bi_value;
+        let term1 = ai_value * bip_value;
+        let term2 = aip_value * bi_value;
+        let wronskian = term1 - term2;
         let expected = Complex64::from_real(1.0 / std::f64::consts::PI);
+        // At large |z|, |term1| and |term2| reach ~10^9, so double-precision subtraction
+        // of term1 - term2 experiences cancellation noise proportional to term magnitude * eps.
+        // Scale tolerance by the cancellation magnitude.
+        let cancellation_scale = term1.abs().max(term2.abs()).max(1.0);
+        let tol = ABS_TOL + REL_TOL * cancellation_scale;
         assert!(
-            approx_eq_complex(wronskian, expected),
-            "airy wronskian mismatch for {z:?}: {wronskian:?}"
+            (wronskian - expected).abs() <= tol,
+            "airy wronskian mismatch for {z:?}: {wronskian:?} (tol={tol})"
         );
     }
 }
