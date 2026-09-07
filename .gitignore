@@ -63,10 +63,12 @@ crates/fsci-conformance/fixtures/artifacts/P2C-007/e2e/*
 !crates/fsci-conformance/fixtures/artifacts/P2C-007/perf/
 !crates/fsci-conformance/fixtures/artifacts/P2C-007/perf/perf_profile_report.json
 !crates/fsci-conformance/fixtures/artifacts/P2C-007/evidence/
-!crates/fsci-conformance/fixtures/artifacts/P2C-007/evidence/*.json
-crates/fsci-conformance/fixtures/artifacts/P2C-007/anchor/
-crates/fsci-conformance/fixtures/artifacts/P2C-007/contracts/
-crates/fsci-conformance/fixtures/artifacts/P2C-007/threats/
+!crates/fsci-conformance/fixtures/artifacts/P2C-007/anchor/
+!crates/fsci-conformance/fixtures/artifacts/P2C-007/anchor/*.json
+!crates/fsci-conformance/fixtures/artifacts/P2C-007/contracts/
+!crates/fsci-conformance/fixtures/artifacts/P2C-007/contracts/*.json
+!crates/fsci-conformance/fixtures/artifacts/P2C-007/threats/
+!crates/fsci-conformance/fixtures/artifacts/P2C-007/threats/*.json
 # P2C-006 special contract table — generated once, committed as source-of-truth
 # per frankenscipy-r575 (load_special_contract_table was failing silently)
 !crates/fsci-conformance/fixtures/artifacts/P2C-006/
