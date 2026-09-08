@@ -68,14 +68,17 @@ pub struct PolicyDecision {
     pub reason: String,
 }
 
-/// Bayesian risk-state decision engine.
+use crate::supervision::{PolicySupervisor, SupervisionConfig};
+
+/// Bayesian risk-state decision engine with bounded runtime supervision.
 ///
-/// Each call to [`decide()`](Self::decide) is independent: the ledger
-/// records history for audit but does not influence future decisions.
+/// Records decisions to an evidence ledger and evaluates stability and
+/// degradation bounds through [`PolicySupervisor`].
 #[derive(Debug, Clone)]
 pub struct PolicyController {
     mode: RuntimeMode,
     ledger: PolicyEvidenceLedger,
+    supervisor: PolicySupervisor,
 }
 
 impl PolicyController {
@@ -84,6 +87,20 @@ impl PolicyController {
         Self {
             mode,
             ledger: PolicyEvidenceLedger::new(ledger_capacity),
+            supervisor: PolicySupervisor::new(SupervisionConfig::default()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_supervision(
+        mode: RuntimeMode,
+        ledger_capacity: usize,
+        config: SupervisionConfig,
+    ) -> Self {
+        Self {
+            mode,
+            ledger: PolicyEvidenceLedger::new(ledger_capacity),
+            supervisor: PolicySupervisor::new(config),
         }
     }
 
@@ -97,12 +114,23 @@ impl PolicyController {
         &self.ledger
     }
 
+    #[must_use]
+    pub const fn supervisor(&self) -> &PolicySupervisor {
+        &self.supervisor
+    }
+
+    pub fn supervisor_mut(&mut self) -> &mut PolicySupervisor {
+        &mut self.supervisor
+    }
+
     pub fn decide(&mut self, signals: DecisionSignals) -> PolicyDecision {
         if !signals.is_finite() {
             let logits = [-1.0e30, -1.0e30, 0.0];
             let posterior = [0.0, 0.0, 1.0];
             let expected_losses = expected_loss(self.mode, posterior);
-            let action = PolicyAction::FailClosed;
+            let action = self
+                .supervisor
+                .observe_and_enforce(PolicyAction::FailClosed, &signals);
             let top_state = RiskState::IncompatibleMetadata;
             let reason = format!(
                 "mode={:?}; top_state={:?}; p=1.000000; non_finite_signals=true",
@@ -133,9 +161,10 @@ impl PolicyController {
         let logits = logits_from_signals(signals);
         let posterior = softmax(logits);
         let expected_losses = expected_loss(self.mode, posterior);
-        let (action, action_idx) = select_action(expected_losses);
+        let (raw_action, action_idx) = select_action(expected_losses);
+        let action = self.supervisor.observe_and_enforce(raw_action, &signals);
         let (top_state, top_state_prob) = top_risk_state(posterior);
-        let reason = format!(
+        let mut reason = format!(
             "mode={:?}; top_state={:?}; p={top_state_prob:.6}; cond_log10={:.3}; metadata={:.3}; anomaly={:.3}",
             self.mode,
             top_state,
@@ -143,6 +172,9 @@ impl PolicyController {
             signals.metadata_incompatibility_score,
             signals.input_anomaly_score
         );
+        if action != raw_action {
+            reason.push_str(&format!("; supervised=true; enforced={action:?}"));
+        }
 
         self.ledger.record(DecisionEvidenceEntry {
             mode: self.mode,

@@ -15,14 +15,17 @@
 //! | `booking_claim` | [`BookingClaim`]: verifies the fleet measurement booking a timed row cites |
 
 pub mod booking_claim;
+pub mod eprocess;
 pub mod evidence;
 pub mod mode;
 pub mod policy;
 pub mod scipy_incumbent;
 pub mod signals;
+pub mod supervision;
 
 // ── Re-exports: preserve the flat public API ────────────────────────
 pub use booking_claim::{BookingClaim, ClaimRejection, FleetBooking};
+pub use eprocess::{EProcessConfig, EProcessMonitor, EProcessStatus};
 pub use evidence::{
     AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, DecisionEvidenceEntry,
     PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
@@ -30,6 +33,9 @@ pub use evidence::{
 pub use mode::{HARDENED_MAX_DIM, RuntimeMode};
 pub use policy::{PolicyAction, PolicyController, PolicyDecision, RiskState, decision_loss_matrix};
 pub use signals::{DecisionSignals, SignalSequence};
+pub use supervision::{
+    PolicySupervisor, SupervisionConfig, SupervisionEvent, SupervisionStatus,
+};
 
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
