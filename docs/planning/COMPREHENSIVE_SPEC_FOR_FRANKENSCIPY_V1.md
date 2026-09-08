@@ -104,6 +104,12 @@ Output requirements:
 - evidence ledger entries for consequential decisions
 - calibrated confidence metrics and drift alarms
 
+### 6.1 Domain Scope and Phasing
+
+- **V1 Active Scope (`fsci-linalg` & `fsci-runtime`)**: The complete loss-matrix, posterior update, expected-loss minimization, and conformal calibrator loop (`SolverPortfolio`, `MatrixConditionState`, `SolverAction`, `PolicyController`) governs the linear algebra solve family.
+- **Rule-Based Domain Selectors (`fsci-sparse`, `fsci-opt`, `fsci-special`)**: Iterative sparse solver selection, optimization method selection, and hypergeometric branch selection operate via structured rule-based heuristic selectors with written rationale strings under the strict/hardened mode split.
+- **Multi-Domain CASP Roadmap**: Generalization of formal loss matrices and posteriors to sparse iterative convergence and other domains is tracked post-V1 under Roadmap Item 5.
+
 ## 7. Extreme Optimization Contract
 
 Track solver runtime tails, convergence costs, and memory budgets; gate regressions for core routine families.
