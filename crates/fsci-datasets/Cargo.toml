@@ -3,6 +3,8 @@ name = "fsci-datasets"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Standard sample fixtures and datasets for FrankenSciPy"
 
 [dependencies]
 

@@ -3,6 +3,8 @@ name = "fsci-io"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "File format I/O (MATLAB, Matrix Market, WAV) for FrankenSciPy"
 
 [dependencies]
 fsci-runtime = { workspace = true }

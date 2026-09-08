@@ -3,6 +3,8 @@ name = "fsci-odr"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Orthogonal Distance Regression for FrankenSciPy"
 
 [dependencies]
 

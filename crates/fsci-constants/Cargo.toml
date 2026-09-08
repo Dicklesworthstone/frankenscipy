@@ -3,6 +3,8 @@ name = "fsci-constants"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Physical and mathematical constants for FrankenSciPy"
 
 [dependencies]
 

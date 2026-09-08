@@ -3,6 +3,8 @@ name = "fsci-ndimage"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Multi-dimensional image processing routines for FrankenSciPy"
 
 [features]
 # frankenscipy-22van gate (b). The bead requires the SPECIALISATION half be an A/B of two

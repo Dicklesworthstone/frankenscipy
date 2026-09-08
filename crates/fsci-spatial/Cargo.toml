@@ -3,6 +3,8 @@ name = "fsci-spatial"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Spatial data structures and distance computations for FrankenSciPy"
 
 [dependencies]
 fsci-linalg = { workspace = true }

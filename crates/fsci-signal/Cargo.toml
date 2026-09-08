@@ -3,6 +3,8 @@ name = "fsci-signal"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Signal processing, filter design, and spectral analysis for FrankenSciPy"
 
 [dependencies]
 fsci-fft = { workspace = true }

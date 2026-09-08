@@ -3,6 +3,8 @@ name = "fsci-cluster"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Vector quantization and hierarchical clustering for FrankenSciPy"
 
 [dependencies]
 fsci-runtime = { workspace = true }

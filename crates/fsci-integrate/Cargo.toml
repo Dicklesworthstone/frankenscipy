@@ -1,7 +1,10 @@
 [package]
 name = "fsci-integrate"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Numerical integration and ODE/IVP solvers for FrankenSciPy"
 
 [lints]
 workspace = true

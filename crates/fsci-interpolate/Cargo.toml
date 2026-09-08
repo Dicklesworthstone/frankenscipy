@@ -3,6 +3,8 @@ name = "fsci-interpolate"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Interpolation and spline routines for FrankenSciPy"
 
 [dependencies]
 fsci-fft = { workspace = true }

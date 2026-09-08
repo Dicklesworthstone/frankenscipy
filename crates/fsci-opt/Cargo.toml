@@ -1,7 +1,10 @@
 [package]
 name = "fsci-opt"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Optimization and root-finding solvers for FrankenSciPy"
 
 [features]
 opt-incumbent-bench = ["dep:sha2"]

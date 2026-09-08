@@ -3,6 +3,8 @@ name = "fsci-stats"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Probability distributions and statistical tests for FrankenSciPy"
 
 [features]
 # Perf-only provenance support for live-incumbent harnesses. Off by default so
