@@ -323,10 +323,10 @@ for case in q["points"]:
         A = np.array(unbits(case["a_bits"]), dtype=float).reshape(m, n)
         if case.get("b_bits") is not None:
             B = np.array(unbits(case["b_bits"]), dtype=float).reshape(m, n)
-            est = ii.estimate_spectral_norm_diff(A, B, its=its)
+            est = ii.estimate_spectral_norm_diff(A, B, its=its, rng=0)
             operator = A - B
         else:
-            est = ii.estimate_spectral_norm(A, its=its)
+            est = ii.estimate_spectral_norm(A, its=its, rng=0)
             operator = A
         s = np.linalg.svd(operator, compute_uv=False)
         true_norm = float(s[0]) if s.size else 0.0
