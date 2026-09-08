@@ -34921,6 +34921,7 @@ mod tests {
 
     #[test]
     fn symmetric_eigh_backtransform_parallel_matches_serial_bits() {
+        let _guard = eigh_toggle_lock();
         let n = 160usize;
         let mut serial = DMatrix::<f64>::zeros(n, n);
         for row in 0..n {
@@ -35687,6 +35688,7 @@ mod tests {
 
     #[test]
     fn eigh_index_sort_matches_materialized_pair_sort_bits() {
+        let _guard = eigh_toggle_lock();
         let fixtures = [
             vec![vec![2.0, 1.0], vec![1.0, 3.0]],
             vec![
@@ -35774,6 +35776,7 @@ mod tests {
 
     #[test]
     fn eigvals_is_bit_identical_to_full_eig() {
+        let _guard = eigh_toggle_lock();
         // The eigenvalues-only path (no eigenvector back-substitution) extracts from
         // the same Schur form with the same 1×1/2×2 block logic, so it must be
         // bit-for-bit identical to full eig()'s eigenvalues — for real spectra and
@@ -43034,6 +43037,7 @@ mod proptest_tests {
     /// retire independently.
     #[test]
     fn interleaved_inverse_iteration_matches_scalar_bits() {
+        let _guard = crate::tests::eigh_toggle_lock();
         use std::sync::atomic::Ordering;
         let was = EIGH_INVERSE_CONVERGENCE_STOP.load(Ordering::Relaxed);
         for stop in [false, true] {
@@ -43123,6 +43127,7 @@ mod proptest_tests {
 
     #[test]
     fn sliced_backtransform_is_bit_identical_to_the_indexed_one() {
+        let _guard = crate::tests::eigh_toggle_lock();
         use std::sync::atomic::Ordering;
 
         // Big enough that `eigh` takes the native path the back-transform belongs to.
@@ -43799,6 +43804,7 @@ mod proptest_tests {
 
     #[test]
     fn batch_det_inv_solve_many_match_serial_loop_bit_for_bit() {
+        let _guard = crate::tests::eigh_toggle_lock();
         // det_many / inv_many / solve_many must be bit-identical to the serial
         // per-matrix loop (parallel-across-batch is an order-preserving map).
         let mut s = 0x9E3779B97F4A7C15u64;
@@ -44972,8 +44978,6 @@ mod toggle_ab_eig_francis_schur {
     use super::{DecompOptions, EIG_FRANCIS_FALLBACK, EIG_USE_FRANCIS_SCHUR, LinalgError, eig};
     use std::sync::atomic::Ordering;
 
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn make_diag_dominant(n: usize, seed: u64) -> Vec<Vec<f64>> {
         let mut a = vec![vec![0.0; n]; n];
         for i in 0..n {
@@ -45001,9 +45005,7 @@ mod toggle_ab_eig_francis_schur {
     /// convenience.
     #[test]
     fn francis_arm_agrees_with_nalgebra_where_both_converge() {
-        let _g = LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::tests::eigh_toggle_lock();
 
         for (n, seed) in [(5usize, 0u64), (6, 0), (8, 42), (8, 999), (4, 7)] {
             let a = make_diag_dominant(n, seed);
@@ -45061,9 +45063,7 @@ mod toggle_ab_eig_francis_schur {
     /// all, since it only exercises inputs both arms handle.
     #[test]
     fn the_toggle_changes_behaviour_on_the_non_converging_fixtures() {
-        let _g = LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::tests::eigh_toggle_lock();
 
         // The FALLBACK is disabled for the whole test. It is on by default now, and its
         // entire job is to make these fixtures converge -- so with it live the "old" arm
@@ -45118,8 +45118,6 @@ mod toggle_ab_eig_francis_schur {
 mod toggle_ab_eig_balance {
     use super::{DecompOptions, EIG_BALANCE, eig};
     use std::sync::atomic::Ordering;
-
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// `A = D M D^-1` with `D` a diagonal of POWERS OF TWO, so the construction
     /// itself is exact and `A` has precisely `M`'s spectrum. The spread of `D` is
@@ -45181,9 +45179,7 @@ mod toggle_ab_eig_balance {
 
     #[test]
     fn balanced_eigenpairs_satisfy_the_defining_relation() {
-        let _g = LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::tests::eigh_toggle_lock();
         let (a, m) = badly_scaled();
 
         EIG_BALANCE.store(true, Ordering::Relaxed);
@@ -45221,9 +45217,7 @@ mod toggle_ab_eig_balance {
     /// inputs that never needed it.
     #[test]
     fn balancing_does_not_disturb_an_already_balanced_matrix() {
-        let _g = LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::tests::eigh_toggle_lock();
         let (_a, m) = badly_scaled();
 
         EIG_BALANCE.store(false, Ordering::Relaxed);
@@ -45287,9 +45281,7 @@ mod toggle_ab_eig_balance {
     /// norms and residuals would pass on exactly that.
     #[test]
     fn the_lapack_phase_convention_survives_balancing() {
-        let _g = LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = crate::tests::eigh_toggle_lock();
         let a = badly_scaled_with_complex();
 
         for balanced in [false, true] {
