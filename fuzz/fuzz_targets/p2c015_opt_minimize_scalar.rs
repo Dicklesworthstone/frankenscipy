@@ -57,7 +57,7 @@ fuzz_target!(|input: MinInput| {
     let bracket = (a, b);
     let opts = MinimizeScalarOptions::default();
 
-    if let Ok(result) = minimize_scalar(&f, bracket, opts) {
+    if let Ok(result) = minimize_scalar(f, bracket, opts) {
         let x_min = result.x;
         let f_min = result.fun;
 
@@ -84,7 +84,7 @@ fuzz_target!(|input: MinInput| {
         }
     }
 
-    let (golden_x, golden_f) = golden(&f, a, b, 1e-6, 500);
+    let (golden_x, golden_f) = golden(f, a, b, 1e-6, 500);
 
     if golden_x < a - TOL || golden_x > b + TOL {
         panic!(

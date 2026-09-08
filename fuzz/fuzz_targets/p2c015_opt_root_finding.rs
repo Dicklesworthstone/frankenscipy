@@ -62,11 +62,11 @@ fuzz_target!(|input: RootInput| {
     let opts = RootOptions::default();
 
     let methods: [(&str, Box<dyn Fn() -> Option<f64>>); 5] = [
-        ("bisect", Box::new(|| bisect(&f, bracket, opts).ok().map(|r| r.root))),
-        ("brentq", Box::new(|| brentq(&f, bracket, opts).ok().map(|r| r.root))),
-        ("brenth", Box::new(|| brenth(&f, bracket, opts).ok().map(|r| r.root))),
-        ("ridder", Box::new(|| ridder(&f, bracket, opts).ok().map(|r| r.root))),
-        ("toms748", Box::new(|| toms748(&f, bracket, opts).ok().map(|r| r.root))),
+        ("bisect", Box::new(|| bisect(f, bracket, opts).ok().map(|r| r.root))),
+        ("brentq", Box::new(|| brentq(f, bracket, opts).ok().map(|r| r.root))),
+        ("brenth", Box::new(|| brenth(f, bracket, opts).ok().map(|r| r.root))),
+        ("ridder", Box::new(|| ridder(f, bracket, opts).ok().map(|r| r.root))),
+        ("toms748", Box::new(|| toms748(f, bracket, opts).ok().map(|r| r.root))),
     ];
 
     let mut roots: Vec<(&str, f64)> = Vec::new();

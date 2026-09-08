@@ -14,3 +14,22 @@ fn test_gammaln_overflow() {
         panic!("expected scalar");
     }
 }
+
+#[test]
+fn test_gammaln_near_negative_integer_accuracy() {
+    let mode = RuntimeMode::Hardened;
+    // Point near -1: -1.0 - 4*EPSILON. Catastrophic cancellation in (PI*x).sin() previously
+    // corrupted gammaln_scalar here.
+    let real = -1.0 - 4.0 * f64::EPSILON;
+    let real_result = gammaln(&SpecialTensor::RealScalar(real), mode).expect("gammaln real");
+    if let SpecialTensor::RealScalar(v) = real_result {
+        // Scipy reference: scipy.special.gammaln(-1.0000000000000009) == 34.657359027997266
+        let expected = 34.657359027997266;
+        assert!(
+            (v - expected).abs() <= 1.0e-12,
+            "gammaln({real}) expected {expected}, got {v}"
+        );
+    } else {
+        panic!("expected real scalar");
+    }
+}

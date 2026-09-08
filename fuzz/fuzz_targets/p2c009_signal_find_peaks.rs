@@ -40,7 +40,7 @@ fuzz_target!(|input: FindPeaksInput| {
 
     let signal: Vec<f64> = input.signal.iter().take(n).map(|&v| sanitize(v)).collect();
 
-    let height = input.height.map(|h| sanitize(h));
+    let height = input.height.map(sanitize);
     let distance = input.distance.map(|d| (d as usize).max(1));
     let prominence = input.prominence.map(|p| sanitize(p).abs());
 
@@ -96,13 +96,13 @@ fuzz_target!(|input: FindPeaksInput| {
             );
         }
 
-        if let Some(min_height) = height {
-            if peak_val < min_height {
-                panic!(
-                    "find_peaks peak {} height {} below min_height {}",
-                    peak_idx, peak_val, min_height
-                );
-            }
+        if let Some(min_height) = height
+            && peak_val < min_height
+        {
+            panic!(
+                "find_peaks peak {} height {} below min_height {}",
+                peak_idx, peak_val, min_height
+            );
         }
 
         if (result.peak_heights[i] - peak_val).abs() > 1e-10 {

@@ -42,7 +42,7 @@ fn build_small_case(data: &[u8]) -> Option<(CsrMatrix, Vec<f64>)> {
         });
     }
 
-    for chunk in rest.chunks_exact(3).take(MAX_EXTRA_ENTRIES / 3) {
+    for chunk in rest.as_chunks::<3>().0.iter().take(MAX_EXTRA_ENTRIES / 3) {
         let row = usize::from(chunk[0]) % n;
         let col = usize::from(chunk[1]) % n;
         let value = normalized_value(chunk[2]) / 8.0;

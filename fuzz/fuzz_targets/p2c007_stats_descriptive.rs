@@ -285,7 +285,7 @@ fuzz_target!(|input: DescriptiveInput| {
     let cv = circvar(&data);
     if cv.is_finite() {
         assert!(
-            cv >= -TOL && cv <= 1.0 + TOL,
+            (-TOL..=1.0 + TOL).contains(&cv),
             "circvar {} must be in [0, 1]",
             cv
         );
@@ -387,7 +387,7 @@ fuzz_target!(|input: DescriptiveInput| {
         .raw_quantiles
         .iter()
         .take(20)
-        .filter(|&&q| q.is_finite() && q >= 0.0 && q <= 1.0)
+        .filter(|&&q| q.is_finite() && (0.0..=1.0).contains(&q))
         .copied()
         .collect();
     if !user_qs.is_empty() {
@@ -397,7 +397,7 @@ fuzz_target!(|input: DescriptiveInput| {
                 let min_val = data.iter().cloned().fold(f64::INFINITY, f64::min);
                 let max_val = data.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 assert!(
-                    qv >= min_val - TOL && qv <= max_val + TOL,
+                    (min_val - TOL..=max_val + TOL).contains(&qv),
                     "quantile({}) {} outside data range [{}, {}]",
                     user_qs[i],
                     qv,

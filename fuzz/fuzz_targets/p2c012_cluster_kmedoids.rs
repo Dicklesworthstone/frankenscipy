@@ -124,31 +124,31 @@ fuzz_target!(|input: KmedoidsInput| {
     // Property 6 (metamorphic): vq(points, centroids) reproduces
     // the labels kmedoids assigned. Both choose the nearest
     // centroid by Euclidean distance.
-    if let Ok((vq_labels, _vq_dists)) = vq(&points, &result.centroids) {
-        if vq_labels != result.labels {
-            // It's possible kmedoids ties broke differently than vq's
-            // first-min selection; only fail if any point's vq label
-            // gives a strictly larger distance than its kmedoids label.
-            for (i, (&km_lbl, &vq_lbl)) in
-                result.labels.iter().zip(vq_labels.iter()).enumerate()
-            {
-                if km_lbl != vq_lbl {
-                    let d_km = result.centroids[km_lbl]
-                        .iter()
-                        .zip(points[i].iter())
-                        .map(|(&a, &b)| (a - b) * (a - b))
-                        .sum::<f64>();
-                    let d_vq = result.centroids[vq_lbl]
-                        .iter()
-                        .zip(points[i].iter())
-                        .map(|(&a, &b)| (a - b) * (a - b))
-                        .sum::<f64>();
-                    if d_km > d_vq + 1e-9 {
-                        panic!(
-                            "kmedoids label[{i}] = {km_lbl} sq_dist {d_km} > \
-                             vq label {vq_lbl} sq_dist {d_vq}"
-                        );
-                    }
+    if let Ok((vq_labels, _vq_dists)) = vq(&points, &result.centroids)
+        && vq_labels != result.labels
+    {
+        // It's possible kmedoids ties broke differently than vq's
+        // first-min selection; only fail if any point's vq label
+        // gives a strictly larger distance than its kmedoids label.
+        for (i, (&km_lbl, &vq_lbl)) in
+            result.labels.iter().zip(vq_labels.iter()).enumerate()
+        {
+            if km_lbl != vq_lbl {
+                let d_km = result.centroids[km_lbl]
+                    .iter()
+                    .zip(points[i].iter())
+                    .map(|(&a, &b)| (a - b) * (a - b))
+                    .sum::<f64>();
+                let d_vq = result.centroids[vq_lbl]
+                    .iter()
+                    .zip(points[i].iter())
+                    .map(|(&a, &b)| (a - b) * (a - b))
+                    .sum::<f64>();
+                if d_km > d_vq + 1e-9 {
+                    panic!(
+                        "kmedoids label[{i}] = {km_lbl} sq_dist {d_km} > \
+                         vq label {vq_lbl} sq_dist {d_vq}"
+                    );
                 }
             }
         }

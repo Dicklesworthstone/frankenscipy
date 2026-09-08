@@ -74,13 +74,13 @@ fuzz_target!(|input: CompositeInput| {
         return;
     }
 
-    if let Ok(t) = trapezoid(&ys, &xs) {
-        if !t.integral.is_finite() {
-            panic!(
-                "trapezoid produced non-finite output {} for n={n}",
-                t.integral
-            );
-        }
+    if let Ok(t) = trapezoid(&ys, &xs)
+        && !t.integral.is_finite()
+    {
+        panic!(
+            "trapezoid produced non-finite output {} for n={n}",
+            t.integral
+        );
     }
 
     // Property 2: trapezoid of a constant series.

@@ -1452,7 +1452,7 @@ fn gammaln_scalar_with_threshold(
         } else {
             lngamma_positive(1.0 - x)
         };
-        PI.ln() - (PI * x).sin().abs().ln() - g1mx
+        PI.ln() - crate::convenience::sinpi(x).abs().ln() - g1mx
     };
 
     if !output.is_finite() && !x.is_infinite() {
@@ -1547,7 +1547,7 @@ pub fn gammasgn_scalar(x: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
         return Ok(1.0);
     }
 
-    let sine = (PI * x).sin();
+    let sine = crate::convenience::sinpi(x);
     if sine.is_nan() {
         Ok(f64::NAN)
     } else if sine.is_sign_negative() {
@@ -2469,7 +2469,7 @@ pub(crate) fn gamma_core_with(x: f64, rational: bool, reflection_free: bool, cou
     }
     if x < 0.5 {
         // Reflection formula: Γ(x) = π / (sin(πx) * Γ(1-x))
-        let sin_pi_x = (PI * x).sin();
+        let sin_pi_x = crate::convenience::sinpi(x);
         if sin_pi_x == 0.0 {
             // This matches x = 0 handled above, or integer x < 0
             if x == 0.0 {
@@ -2658,7 +2658,7 @@ fn digamma_core(x: f64) -> f64 {
     }
 
     if x < 0.0 {
-        return digamma_core(1.0 - x) - PI / (PI * x).tan();
+        return digamma_core(1.0 - x) - PI / crate::convenience::tanpi(x);
     }
 
     let mut shifted = x;
@@ -2694,7 +2694,7 @@ fn trigamma_core(x: f64) -> f64 {
     }
 
     if x < 0.0 {
-        let sin_pi_x = (PI * x).sin();
+        let sin_pi_x = crate::convenience::sinpi(x);
         return (PI * PI) / (sin_pi_x * sin_pi_x) - trigamma_core(1.0 - x);
     }
 
@@ -3868,7 +3868,7 @@ pub(crate) fn zeta_scalar(s: f64) -> f64 {
         // Reflection formula: ζ(s) = 2^s * π^(s-1) * sin(πs/2) * Γ(1-s) * ζ(1-s)
         let s1 = 1.0 - s;
         let z1 = zeta_positive(s1);
-        let sin_half_pi_s = (PI * s / 2.0).sin();
+        let sin_half_pi_s = crate::convenience::sinpi(s / 2.0);
         let gamma_1_minus_s = gamma_core(s1);
         // Compute parts carefully to avoid overflow/underflow
         let factor = 2.0_f64.powf(s) * PI.powf(s - 1.0) * sin_half_pi_s * gamma_1_minus_s;

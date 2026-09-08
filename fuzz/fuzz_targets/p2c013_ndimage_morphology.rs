@@ -76,29 +76,29 @@ fuzz_target!(|input: MorphInput| {
     };
 
     // Oracle 1: opening is idempotent — opening(opening(X)) == opening(X)
-    if let Ok(opened1) = binary_opening(&array, struct_size, iterations) {
-        if let Ok(opened2) = binary_opening(&opened1, struct_size, iterations) {
-            assert!(
-                arrays_equal(&opened1, &opened2),
-                "binary_opening not idempotent: shape={:?}, struct_size={}, iterations={}",
-                array.shape,
-                struct_size,
-                iterations
-            );
-        }
+    if let Ok(opened1) = binary_opening(&array, struct_size, iterations)
+        && let Ok(opened2) = binary_opening(&opened1, struct_size, iterations)
+    {
+        assert!(
+            arrays_equal(&opened1, &opened2),
+            "binary_opening not idempotent: shape={:?}, struct_size={}, iterations={}",
+            array.shape,
+            struct_size,
+            iterations
+        );
     }
 
     // Oracle 2: closing is idempotent — closing(closing(X)) == closing(X)
-    if let Ok(closed1) = binary_closing(&array, struct_size, iterations) {
-        if let Ok(closed2) = binary_closing(&closed1, struct_size, iterations) {
-            assert!(
-                arrays_equal(&closed1, &closed2),
-                "binary_closing not idempotent: shape={:?}, struct_size={}, iterations={}",
-                array.shape,
-                struct_size,
-                iterations
-            );
-        }
+    if let Ok(closed1) = binary_closing(&array, struct_size, iterations)
+        && let Ok(closed2) = binary_closing(&closed1, struct_size, iterations)
+    {
+        assert!(
+            arrays_equal(&closed1, &closed2),
+            "binary_closing not idempotent: shape={:?}, struct_size={}, iterations={}",
+            array.shape,
+            struct_size,
+            iterations
+        );
     }
 
     // Oracle 3: opening(X) ⊆ X (erosion removes pixels)

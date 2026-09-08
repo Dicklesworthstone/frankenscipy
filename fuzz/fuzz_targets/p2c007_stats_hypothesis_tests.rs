@@ -48,7 +48,7 @@ fuzz_target!(|input: HypothesisInput| {
                 let result = ttest_1samp(&a, popmean);
                 if result.statistic.is_finite() {
                     assert!(
-                        result.pvalue >= 0.0 && result.pvalue <= 1.0,
+                        (0.0..=1.0).contains(&result.pvalue),
                         "ttest_1samp pvalue {} out of [0,1] for {} samples",
                         result.pvalue,
                         a.len()
@@ -62,7 +62,7 @@ fuzz_target!(|input: HypothesisInput| {
                 let result = ttest_ind(&a, &b);
                 if result.statistic.is_finite() {
                     assert!(
-                        result.pvalue >= 0.0 && result.pvalue <= 1.0,
+                        (0.0..=1.0).contains(&result.pvalue),
                         "ttest_ind pvalue {} out of [0,1]",
                         result.pvalue
                     );
@@ -73,14 +73,14 @@ fuzz_target!(|input: HypothesisInput| {
             // ttest_rel: paired t-test
             if a.len() >= 2 && a.len() == b.len() {
                 let result = ttest_rel(&a, &b, None);
-                if let Ok(r) = result {
-                    if r.statistic.is_finite() {
-                        assert!(
-                            r.pvalue >= 0.0 && r.pvalue <= 1.0,
-                            "ttest_rel pvalue {} out of [0,1]",
-                            r.pvalue
-                        );
-                    }
+                if let Ok(r) = result
+                    && r.statistic.is_finite()
+                {
+                    assert!(
+                        (0.0..=1.0).contains(&r.pvalue),
+                        "ttest_rel pvalue {} out of [0,1]",
+                        r.pvalue
+                    );
                 }
             }
         }
@@ -90,7 +90,7 @@ fuzz_target!(|input: HypothesisInput| {
                 let (chi2, pvalue) = chisquare(&a, None);
                 if chi2.is_finite() {
                     assert!(
-                        pvalue >= 0.0 && pvalue <= 1.0,
+                        (0.0..=1.0).contains(&pvalue),
                         "chisquare pvalue {} out of [0,1]",
                         pvalue
                     );
@@ -104,7 +104,7 @@ fuzz_target!(|input: HypothesisInput| {
                 let result = f_oneway(&groups);
                 if result.statistic.is_finite() {
                     assert!(
-                        result.pvalue >= 0.0 && result.pvalue <= 1.0,
+                        (0.0..=1.0).contains(&result.pvalue),
                         "f_oneway pvalue {} out of [0,1]",
                         result.pvalue
                     );

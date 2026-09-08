@@ -92,7 +92,7 @@ fuzz_target!(|input: Input| {
     // Just check monotone in the deep tail and skip the strict
     // approach-1 gate.
     if c >= 0.2 {
-        let log_probe = (5.0 * s).max(18.4).min(700.0);
+        let log_probe = (5.0 * s).clamp(18.4, 700.0);
         let probe = log_probe.exp();
         if probe.is_finite() {
             let c_high = dist.cdf(probe);

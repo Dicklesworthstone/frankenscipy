@@ -111,7 +111,9 @@ fuzz_target!(|input: PercentileInput| {
 
     let trim = input.trim.finite(0.0, 0.5, 0.0);
     let trimmed = trim_mean(&raw_data, trim);
-    if trimmed.is_finite() {
+    if let Ok(val) = trimmed
+        && val.is_finite()
+    {
         assert!(
             raw_data.iter().any(|value| !value.is_nan()),
             "trim_mean returned finite value for all-NaN data"

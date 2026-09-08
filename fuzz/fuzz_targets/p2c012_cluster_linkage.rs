@@ -143,23 +143,23 @@ fuzz_target!(|input: LinkageInput| {
 
     if n <= 16 {
         for max_clusters in [2, 3, n / 2 + 1, n] {
-            if max_clusters >= 1 && max_clusters <= n {
-                if let Ok(labels) = fcluster(&z, max_clusters) {
-                    if labels.len() != n {
+            if (1..=n).contains(&max_clusters)
+                && let Ok(labels) = fcluster(&z, max_clusters)
+            {
+                if labels.len() != n {
+                    panic!(
+                        "fcluster labels length: expected {}, got {} (max_clusters={})",
+                        n,
+                        labels.len(),
+                        max_clusters
+                    );
+                }
+                for &label in &labels {
+                    if label == 0 || label > max_clusters {
                         panic!(
-                            "fcluster labels length: expected {}, got {} (max_clusters={})",
-                            n,
-                            labels.len(),
-                            max_clusters
+                            "fcluster label out of range: {} not in 1..={} (max_clusters={})",
+                            label, max_clusters, max_clusters
                         );
-                    }
-                    for &label in &labels {
-                        if label == 0 || label > max_clusters {
-                            panic!(
-                                "fcluster label out of range: {} not in 1..={} (max_clusters={})",
-                                label, max_clusters, max_clusters
-                            );
-                        }
                     }
                 }
             }

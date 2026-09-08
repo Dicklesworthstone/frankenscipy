@@ -65,7 +65,7 @@ fn mode_from_flag(hardened: bool) -> RuntimeMode {
 
 fn build_matrix(input: &EigvalsInput) -> Vec<Vec<f64>> {
     let rows = usize::from(input.dim) % (MAX_DIM + 1);
-    let cols = if input.extra_cols % 5 == 0 {
+    let cols = if input.extra_cols.is_multiple_of(5) {
         rows.saturating_add(1).min(MAX_DIM + 1)
     } else {
         rows

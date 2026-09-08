@@ -47,8 +47,7 @@ fn sanitize_bw(value: f64) -> f64 {
 fn sanitize_bwr(value: f64) -> f64 {
     if value.is_finite() {
         // Always negative dB; clamp to a sensible range.
-        let v = -(value.abs().clamp(0.5, 60.0));
-        v
+        -(value.abs().clamp(0.5, 60.0))
     } else {
         -6.0
     }

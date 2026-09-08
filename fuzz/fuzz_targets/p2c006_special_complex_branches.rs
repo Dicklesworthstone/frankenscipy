@@ -178,10 +178,21 @@ fn check_unary(name: &str, func: UnarySpecialFn, z: Complex64, mode: RuntimeMode
                 approx_eq_scalar(complex_value.re, real_value),
                 "{name}: real-axis reduction mismatch for {real}"
             );
-            assert!(
-                complex_value.im.abs() <= ABS_TOL + REL_TOL * complex_value.re.abs(),
-                "{name}: expected near-real output on real axis for {real}, got {complex_value:?}"
-            );
+            if name == "gammaln" && real < 0.0 {
+                // For Re(z) < 0, complex gammaln is LogΓ(z) whose imaginary part winds
+                // by -π per negative unit to preserve exp(gammaln(z)) == gamma(z).
+                // On the real axis, Im must be an integer multiple of π so exp(i*Im) = ±1.
+                let winding = complex_value.im / std::f64::consts::PI;
+                assert!(
+                    (winding - winding.round()).abs() <= ABS_TOL + REL_TOL * winding.abs().max(1.0),
+                    "{name}: expected integer-multiple of π imaginary part on negative real axis for {real}, got {complex_value:?}"
+                );
+            } else {
+                assert!(
+                    complex_value.im.abs() <= ABS_TOL + REL_TOL * complex_value.re.abs(),
+                    "{name}: expected near-real output on real axis for {real}, got {complex_value:?}"
+                );
+            }
         }
     }
 }

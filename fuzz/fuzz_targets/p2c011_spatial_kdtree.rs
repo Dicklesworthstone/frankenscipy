@@ -141,8 +141,9 @@ fuzz_target!(|input: KDTreeInput| {
 
     // Oracle 3: query_ball_point() returns all points within radius
     let radius = sanitize(input.radius).abs().min(1e4);
-    if radius > 0.0 {
-        if let Ok(indices) = tree.query_ball_point(&query, radius) {
+    if radius > 0.0
+        && let Ok(indices) = tree.query_ball_point(&query, radius)
+    {
             // All returned points must be within radius
             for &idx in &indices {
                 assert!(idx < points.len(), "query_ball_point returned invalid index");
@@ -156,15 +157,14 @@ fuzz_target!(|input: KDTreeInput| {
                 );
             }
 
-            // No point outside the result should be within radius
-            for (i, pt) in points.iter().enumerate() {
-                let d = euclidean_dist(&query, pt);
-                if d <= radius - DIST_TOL && !indices.contains(&i) {
-                    panic!(
-                        "query_ball_point missed point {} at distance {} <= radius {}",
-                        i, d, radius
-                    );
-                }
+        // No point outside the result should be within radius
+        for (i, pt) in points.iter().enumerate() {
+            let d = euclidean_dist(&query, pt);
+            if d <= radius - DIST_TOL && !indices.contains(&i) {
+                panic!(
+                    "query_ball_point missed point {} at distance {} <= radius {}",
+                    i, d, radius
+                );
             }
         }
     }

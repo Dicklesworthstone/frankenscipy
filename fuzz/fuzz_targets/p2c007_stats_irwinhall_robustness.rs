@@ -26,8 +26,7 @@ struct Input {
 }
 
 fn sanitize_n(seed: u8) -> u32 {
-    let n = ((seed as u32) % (N_MAX - N_MIN + 1)) + N_MIN;
-    n
+    ((seed as u32) % (N_MAX - N_MIN + 1)) + N_MIN
 }
 
 fn sanitize_x_in_support(seed: f64, n: u32) -> f64 {

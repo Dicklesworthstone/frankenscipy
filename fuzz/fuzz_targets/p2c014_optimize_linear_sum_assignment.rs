@@ -42,14 +42,11 @@ fuzz_target!(|input: AssignmentInput| {
 
     if rows == 0 || cols == 0 {
         let result = linear_sum_assignment(&[]);
-        match result {
-            Ok((r, c)) => {
-                assert!(
-                    r.is_empty() && c.is_empty(),
-                    "Empty matrix should return empty assignment"
-                );
-            }
-            Err(_) => {}
+        if let Ok((r, c)) = result {
+            assert!(
+                r.is_empty() && c.is_empty(),
+                "Empty matrix should return empty assignment"
+            );
         }
         return;
     }
@@ -66,59 +63,56 @@ fuzz_target!(|input: AssignmentInput| {
 
     let result = linear_sum_assignment(&cost_matrix);
 
-    match result {
-        Ok((row_ind, col_ind)) => {
-            let expected_len = rows.min(cols);
-            assert_eq!(
-                row_ind.len(),
-                expected_len,
-                "row assignment length mismatch for {rows}x{cols} matrix"
-            );
-            assert_eq!(
-                col_ind.len(),
-                expected_len,
-                "col assignment length mismatch for {rows}x{cols} matrix"
-            );
+    if let Ok((row_ind, col_ind)) = result {
+        let expected_len = rows.min(cols);
+        assert_eq!(
+            row_ind.len(),
+            expected_len,
+            "row assignment length mismatch for {rows}x{cols} matrix"
+        );
+        assert_eq!(
+            col_ind.len(),
+            expected_len,
+            "col assignment length mismatch for {rows}x{cols} matrix"
+        );
 
-            let row_set: HashSet<usize> = row_ind.iter().copied().collect();
-            assert_eq!(
-                row_set.len(),
-                row_ind.len(),
-                "duplicate row indices in assignment {row_ind:?} for {rows}x{cols} matrix"
-            );
+        let row_set: HashSet<usize> = row_ind.iter().copied().collect();
+        assert_eq!(
+            row_set.len(),
+            row_ind.len(),
+            "duplicate row indices in assignment {row_ind:?} for {rows}x{cols} matrix"
+        );
 
-            let col_set: HashSet<usize> = col_ind.iter().copied().collect();
-            assert_eq!(
-                col_set.len(),
-                col_ind.len(),
-                "duplicate col indices in assignment {col_ind:?} for {rows}x{cols} matrix"
-            );
+        let col_set: HashSet<usize> = col_ind.iter().copied().collect();
+        assert_eq!(
+            col_set.len(),
+            col_ind.len(),
+            "duplicate col indices in assignment {col_ind:?} for {rows}x{cols} matrix"
+        );
 
-            for &r in &row_ind {
-                assert!(
-                    r < rows,
-                    "row index {r} out of bounds for {rows}x{cols} matrix"
-                );
-            }
-
-            for &c in &col_ind {
-                assert!(
-                    c < cols,
-                    "col index {c} out of bounds for {rows}x{cols} matrix"
-                );
-            }
-
-            let computed_cost: f64 = row_ind
-                .iter()
-                .zip(col_ind.iter())
-                .map(|(&r, &c)| cost_matrix[r][c])
-                .sum();
-
+        for &r in &row_ind {
             assert!(
-                computed_cost.is_finite(),
-                "assignment cost is non-finite: {computed_cost} ({rows}x{cols} matrix)"
+                r < rows,
+                "row index {r} out of bounds for {rows}x{cols} matrix"
             );
         }
-        Err(_) => {}
+
+        for &c in &col_ind {
+            assert!(
+                c < cols,
+                "col index {c} out of bounds for {rows}x{cols} matrix"
+            );
+        }
+
+        let computed_cost: f64 = row_ind
+            .iter()
+            .zip(col_ind.iter())
+            .map(|(&r, &c)| cost_matrix[r][c])
+            .sum();
+
+        assert!(
+            computed_cost.is_finite(),
+            "assignment cost is non-finite: {computed_cost} ({rows}x{cols} matrix)"
+        );
     }
 });

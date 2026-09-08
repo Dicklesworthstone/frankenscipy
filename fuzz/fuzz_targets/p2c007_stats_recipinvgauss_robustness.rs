@@ -93,7 +93,7 @@ fuzz_target!(|input: Input| {
     // For very small mu the cdf saturates from huge slope changes
     // and bisection precision degrades; for very large mu the deep
     // right tail makes the bisect bracket inadequate. Skip those.
-    if mu >= 0.5 && mu <= 10.0 && x <= 5.0 * mu {
+    if (0.5..=10.0).contains(&mu) && x <= 5.0 * mu {
         let q = dist.cdf(x);
         if (1e-3..1.0 - 1e-3).contains(&q) {
             let recovered = dist.ppf(q);
