@@ -589,10 +589,10 @@ fn gamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) 
             )))
         }
         SpecialTensor::ComplexScalar(z_val) => {
-            Ok(SpecialTensor::ComplexScalar(complex_gammaln(*z_val).exp()))
+            Ok(SpecialTensor::ComplexScalar(complex_gamma_scalar(*z_val)))
         }
         SpecialTensor::ComplexVec(values) => {
-            par_map_indices(values.len(), |i| Ok(complex_gammaln(values[i]).exp()))
+            par_map_indices(values.len(), |i| Ok(complex_gamma_scalar(values[i])))
                 .map(SpecialTensor::ComplexVec)
         }
         SpecialTensor::Empty => Err(SpecialError {
@@ -2032,6 +2032,9 @@ fn complex_rgamma_scalar(z: Complex64) -> Complex64 {
     }
     if is_complex_real_gamma_pole(z) {
         return Complex64::from_real(0.0);
+    }
+    if z.im == 0.0 {
+        return Complex64::new(rgamma_value(z.re, RuntimeMode::Strict), 0.0);
     }
     (-complex_gammaln(z)).exp()
 }
@@ -4400,21 +4403,45 @@ fn complex_gammaln_lanczos(z: Complex64) -> Complex64 {
     term1 + term2 + term3 + term4
 }
 
-/// Complex sine function.
-fn complex_sin(z: Complex64) -> Complex64 {
-    // sin(a + bi) = sin(a)cosh(b) + i cos(a)sinh(b)
-    Complex64::new(z.re.sin() * z.im.cosh(), z.re.cos() * z.im.sinh())
+/// Complex gamma function Γ(z).
+pub fn complex_gamma_scalar(z: Complex64) -> Complex64 {
+    if !z.is_finite() {
+        return Complex64::new(f64::NAN, f64::NAN);
+    }
+    if is_complex_real_gamma_pole(z) {
+        return Complex64::new(f64::NAN, f64::NAN);
+    }
+    if z.im == 0.0 {
+        return Complex64::new(gamma_core(z.re), 0.0);
+    }
+    complex_gammaln(z).exp()
 }
 
-/// Complex cosine function.
-fn complex_cos(z: Complex64) -> Complex64 {
-    // cos(a + bi) = cos(a)cosh(b) - i sin(a)sinh(b)
-    Complex64::new(z.re.cos() * z.im.cosh(), -z.re.sin() * z.im.sinh())
+/// Complex sin(π*z) using sinpi and cospi to avoid catastrophic cancellation near integers.
+fn complex_sinpi(z: Complex64) -> Complex64 {
+    let pi_y = PI * z.im;
+    Complex64::new(
+        crate::convenience::sinpi(z.re) * pi_y.cosh(),
+        crate::convenience::cospi(z.re) * pi_y.sinh(),
+    )
 }
 
-/// Complex cotangent.
-fn complex_cot(z: Complex64) -> Complex64 {
-    complex_cos(z) / complex_sin(z)
+/// Complex cos(π*z) using sinpi and cospi to avoid catastrophic cancellation near integers.
+fn complex_cospi(z: Complex64) -> Complex64 {
+    let pi_y = PI * z.im;
+    Complex64::new(
+        crate::convenience::cospi(z.re) * pi_y.cosh(),
+        -crate::convenience::sinpi(z.re) * pi_y.sinh(),
+    )
+}
+
+/// Complex cot(π*z) using tanpi on the real axis to avoid cancellation near integers.
+fn complex_cotpi(z: Complex64) -> Complex64 {
+    if z.im == 0.0 {
+        Complex64::new(1.0 / crate::convenience::tanpi(z.re), 0.0)
+    } else {
+        complex_cospi(z) / complex_sinpi(z)
+    }
 }
 
 /// Complex digamma (psi) function.
@@ -4426,12 +4453,14 @@ pub fn complex_digamma_scalar(z: Complex64) -> Complex64 {
     if is_complex_real_gamma_pole(z) {
         return Complex64::new(f64::NAN, f64::NAN);
     }
+    if z.im == 0.0 {
+        return Complex64::new(digamma_core(z.re), 0.0);
+    }
 
     // Reflection for negative real part: ψ(1-z) - π*cot(πz)
     if z.re < 0.5 {
         let one_minus_z = Complex64::new(1.0 - z.re, -z.im);
-        let pi_z = Complex64::new(PI * z.re, PI * z.im);
-        let pi_cot_pi_z = Complex64::new(PI, 0.0) * complex_cot(pi_z);
+        let pi_cot_pi_z = Complex64::new(PI, 0.0) * complex_cotpi(z);
         return complex_digamma_scalar(one_minus_z) - pi_cot_pi_z;
     }
 
@@ -4467,12 +4496,17 @@ fn complex_trigamma_scalar(z: Complex64) -> Complex64 {
     if !z.is_finite() {
         return Complex64::new(f64::NAN, f64::NAN);
     }
+    if is_complex_real_gamma_pole(z) {
+        return Complex64::new(f64::NAN, f64::NAN);
+    }
+    if z.im == 0.0 {
+        return Complex64::new(trigamma_core(z.re), 0.0);
+    }
 
     // Reflection: ψ¹(1-z) + π²/sin²(πz) = ψ¹(z)
     if z.re < 0.5 {
         let one_minus_z = Complex64::new(1.0 - z.re, -z.im);
-        let pi_z = Complex64::new(PI * z.re, PI * z.im);
-        let sin_pi_z = complex_sin(pi_z);
+        let sin_pi_z = complex_sinpi(z);
         let pi_sq_over_sin_sq = Complex64::new(PI * PI, 0.0) / (sin_pi_z * sin_pi_z);
         return pi_sq_over_sin_sq - complex_trigamma_scalar(one_minus_z);
     }

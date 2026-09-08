@@ -33,3 +33,33 @@ fn test_gammaln_near_negative_integer_accuracy() {
         panic!("expected real scalar");
     }
 }
+
+#[test]
+fn test_digamma_real_reduction_near_pole() {
+    use fsci_special::Complex64;
+    let mode = RuntimeMode::Hardened;
+    for real in [
+        -1.0 + 4.0 * f64::EPSILON,
+        -1.0 - 4.0 * f64::EPSILON,
+        -2.0 + 4.0 * f64::EPSILON,
+        -0.5,
+        0.1,
+    ] {
+        let real_res = fsci_special::digamma(&SpecialTensor::RealScalar(real), mode).expect("real");
+        let comp_res = fsci_special::digamma(
+            &SpecialTensor::ComplexScalar(Complex64::from_real(real)),
+            mode,
+        )
+        .expect("complex");
+        if let (SpecialTensor::RealScalar(r), SpecialTensor::ComplexScalar(c)) =
+            (real_res, comp_res)
+        {
+            let scale = r.abs().max(c.re.abs());
+            assert!(
+                (r - c.re).abs() <= 1e-12 + 1e-12 * scale,
+                "digamma({real}): real {r} != complex {c:?}"
+            );
+            assert!(c.im == 0.0, "digamma({real}): expected im == 0, got {c:?}");
+        }
+    }
+}
