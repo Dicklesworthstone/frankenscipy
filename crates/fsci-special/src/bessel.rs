@@ -10636,14 +10636,7 @@ mod tests {
         use crate::SpecialTensor::{ComplexScalar, RealScalar};
 
         let orders = [
-            1.0e8,
-            -1.0e8,
-            1.0e300,
-            -1.0e300,
-            1.0e20,
-            -1.0e20,
-            100_000.0,
-            -100_000.0,
+            1.0e8, -1.0e8, 1.0e300, -1.0e300, 1.0e20, -1.0e20, 100_000.0, -100_000.0,
         ];
         let xs = [0.5, 15.0, 50.0];
 
