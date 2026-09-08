@@ -1014,7 +1014,6 @@ dependencies = [
 name = "fsci-runtime"
 version = "0.1.0"
 dependencies = [
- "asupersync",
  "blake3",
  "criterion",
  "proptest",

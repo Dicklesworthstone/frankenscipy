@@ -10305,6 +10305,8 @@ fn default_differential_oracle_script_path(family: &str) -> PathBuf {
         "scipy_fft_oracle.py"
     } else if family.contains("linalg") {
         "scipy_linalg_oracle.py"
+    } else if family.contains("casp") || family.contains("runtime") {
+        "scipy_runtime_casp_oracle.py"
     } else {
         return DifferentialOracleConfig::default().script_path;
     };
