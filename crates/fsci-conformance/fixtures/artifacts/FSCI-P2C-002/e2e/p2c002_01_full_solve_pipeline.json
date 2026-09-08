@@ -1,0 +1,56 @@
+{
+  "scenario_id": "p2c002_01_full_solve_pipeline",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "construct_and_solve",
+      "action": "solve(A, b)",
+      "input_summary": "3x3 general, b=[10,15,16]",
+      "output_summary": "x=[0.9999999999999997, 2.3333333333333335, 2.3333333333333335], backward_err=Some(0.0)",
+      "duration_ns": 302854,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "verify_residual",
+      "action": "||Ax - b||",
+      "input_summary": "check A*x == b",
+      "output_summary": "residual max_diff=0.00e0",
+      "duration_ns": 5691,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_backward_error",
+      "action": "backward_error < 1e-12",
+      "input_summary": "check backward error is small",
+      "output_summary": "backward_error=0.00e0",
+      "duration_ns": 85622,
+      "mode": "strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "matrix_metadata": {
+    "size": [
+      3,
+      3
+    ],
+    "nnz": null,
+    "rcond_estimate": null,
+    "mode": "strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 406801,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_linalg -- p2c002_01_full_solve_pipeline --nocapture"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_21_freqz",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "freqz_butter_lowpass",
+      "action": "freqz(butter(4, 0.25))",
+      "input_summary": "frequency response of 4th order Butterworth",
+      "output_summary": "DC mag=1.0000, Nyquist mag=0.0000",
+      "duration_ns": 249563,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "freqz_3db_point",
+      "action": "verify -3dB at cutoff",
+      "input_summary": "Butterworth -3dB at cutoff frequency",
+      "output_summary": "magnitude at cutoff = -3.01 dB",
+      "duration_ns": 196002,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "freqz",
+    "signal_length": 512,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 448179,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_21_freqz --nocapture"
+  }
+}

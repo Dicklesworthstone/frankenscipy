@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "source_hash": "749eae6c91d3b78db7f8ec5d56e6d89ce58f199139273fde0b4a6407201178e0",
+  "symbol_size": 128,
+  "seed": 1453,
+  "source_symbols": 6,
+  "repair_symbols": 1,
+  "repair_symbol_hashes": [
+    "c043ff968179d9a20e1f5d7501644ad95108122bf655cbc3753bf506f6b47179"
+  ],
+  "repair_symbol_payloads_hex": [
+    "bb8a377b4cf07fb334095b7e093f3564178312be89bbedb0e90363eff5850be2f8b163105d33e3fca8bed08667d8b7a35b9b5241e5c8373521f76f0b5e10eabaeb648303cda15d43f4d7a51b723d2baa1407e6fb961256db14b557de47ac32dbca0738e36e0a7df2f5c93c983a018e652a3717b7ce7389190eeb36d21c07b49e"
+  ]
+}

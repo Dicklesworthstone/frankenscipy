@@ -1,0 +1,126 @@
+{
+  "packet_id": "FSCI-P2C-004",
+  "generated_at": "unix:1779662447",
+  "fixtures": [
+    {
+      "fixture_id": "random_100x100_d5",
+      "dimensions": [
+        100,
+        100
+      ],
+      "nnz": 500,
+      "structure": "random_sparse",
+      "operations": [
+        "spmv_csr",
+        "format_conversion",
+        "add_csr",
+        "scale_csr"
+      ]
+    },
+    {
+      "fixture_id": "random_500x500_d2",
+      "dimensions": [
+        500,
+        500
+      ],
+      "nnz": 5000,
+      "structure": "random_sparse",
+      "operations": [
+        "spmv_csr",
+        "format_conversion",
+        "add_csr",
+        "scale_csr"
+      ]
+    },
+    {
+      "fixture_id": "random_1000x1000_d1",
+      "dimensions": [
+        1000,
+        1000
+      ],
+      "nnz": 10000,
+      "structure": "random_sparse",
+      "operations": [
+        "spmv_csr",
+        "format_conversion",
+        "add_csr",
+        "scale_csr"
+      ]
+    },
+    {
+      "fixture_id": "identity_50x50",
+      "dimensions": [
+        50,
+        50
+      ],
+      "nnz": 50,
+      "structure": "identity",
+      "operations": [
+        "spmv_csr"
+      ]
+    },
+    {
+      "fixture_id": "tridiag_50x50",
+      "dimensions": [
+        50,
+        50
+      ],
+      "nnz": 148,
+      "structure": "tridiagonal",
+      "operations": [
+        "diags",
+        "spmv_csr"
+      ]
+    },
+    {
+      "fixture_id": "identity_200x200",
+      "dimensions": [
+        200,
+        200
+      ],
+      "nnz": 200,
+      "structure": "identity",
+      "operations": [
+        "spmv_csr"
+      ]
+    },
+    {
+      "fixture_id": "tridiag_200x200",
+      "dimensions": [
+        200,
+        200
+      ],
+      "nnz": 598,
+      "structure": "tridiagonal",
+      "operations": [
+        "diags",
+        "spmv_csr"
+      ]
+    },
+    {
+      "fixture_id": "identity_500x500",
+      "dimensions": [
+        500,
+        500
+      ],
+      "nnz": 500,
+      "structure": "identity",
+      "operations": [
+        "spmv_csr"
+      ]
+    },
+    {
+      "fixture_id": "tridiag_500x500",
+      "dimensions": [
+        500,
+        500
+      ],
+      "nnz": 1498,
+      "structure": "tridiagonal",
+      "operations": [
+        "diags",
+        "spmv_csr"
+      ]
+    }
+  ]
+}

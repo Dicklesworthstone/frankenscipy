@@ -1,0 +1,2 @@
+{"timestamp_ms":1788666501948,"input_fingerprint":"393eb6b49bfc1e207d635e1f76cda23177f40d71b03651a8b5c64536b3a77cad","action":{"kind":"fail_closed","reason":"minimize::InvalidArgument { detail: \"x0 must be a finite 1-D vector with at least one element\" }"},"outcome":"rejected"}
+{"timestamp_ms":1788666501948,"input_fingerprint":"946600e410de27ca24a71100092a365e07481727f00154b779c3e9de87bd00a5","action":{"kind":"fail_closed","reason":"minimize::NanEncountered"},"outcome":"rejected"}

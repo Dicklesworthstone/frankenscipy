@@ -1,0 +1,52 @@
+{
+  "scenario_id": "scenario_02_wav_audio",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "wav_write_mono",
+      "action": "wav_write(44100, 1, sine_wave)",
+      "input_summary": "generate mono WAV",
+      "output_summary": "wrote 8864 bytes for 4410 samples",
+      "duration_ns": 470812,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "wav_roundtrip",
+      "action": "wav_read(wav_write(...))",
+      "input_summary": "verify roundtrip",
+      "output_summary": "roundtrip verified: 1000 samples at 22050Hz",
+      "duration_ns": 197805,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "wav_write_stereo",
+      "action": "wav_write(44100, 2, interleaved)",
+      "input_summary": "generate stereo WAV",
+      "output_summary": "stereo WAV: 4044 bytes",
+      "duration_ns": 333793,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "WAV",
+    "operation": "read/write",
+    "size_bytes": 0
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 1101708,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_02_wav_audio --nocapture"
+  }
+}

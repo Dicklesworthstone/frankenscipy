@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_08_too_few_points",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "reject_single_point_linear",
+      "action": "Interp1d::new([1], [0], Linear)",
+      "input_summary": "single point",
+      "output_summary": "rejected: need 2, got 1",
+      "duration_ns": 4408,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "reject_cubic_with_3_points",
+      "action": "Interp1d::new([1,2,3], [0,1,2], CubicSpline)",
+      "input_summary": "too few for cubic",
+      "output_summary": "rejected: need 4, got 3",
+      "duration_ns": 791,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "error-handling",
+    "num_points": 1,
+    "dimensions": 1,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 11903,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_08_too_few_points --nocapture"
+  }
+}

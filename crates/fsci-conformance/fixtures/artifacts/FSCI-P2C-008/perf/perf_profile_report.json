@@ -1,0 +1,228 @@
+{
+  "generated_at": "unix:1779662458",
+  "operation_benchmarks": [
+    {
+      "operation": "policy_decide",
+      "input_desc": "strict_benign",
+      "iterations": 100,
+      "median_ns": 1252,
+      "p95_ns": 1553,
+      "min_ns": 1222,
+      "max_ns": 5821,
+      "mean_ns": 1360
+    },
+    {
+      "operation": "policy_decide",
+      "input_desc": "strict_high_risk",
+      "iterations": 100,
+      "median_ns": 1553,
+      "p95_ns": 1683,
+      "min_ns": 1493,
+      "max_ns": 1793,
+      "mean_ns": 1569
+    },
+    {
+      "operation": "policy_decide",
+      "input_desc": "hardened_benign",
+      "iterations": 100,
+      "median_ns": 1062,
+      "p95_ns": 1383,
+      "min_ns": 1031,
+      "max_ns": 1903,
+      "mean_ns": 1156
+    },
+    {
+      "operation": "solver_select",
+      "input_desc": "WellConditioned",
+      "iterations": 100,
+      "median_ns": 631,
+      "p95_ns": 641,
+      "min_ns": 631,
+      "max_ns": 691,
+      "mean_ns": 633
+    },
+    {
+      "operation": "solver_select",
+      "input_desc": "ModerateCondition",
+      "iterations": 100,
+      "median_ns": 661,
+      "p95_ns": 672,
+      "min_ns": 641,
+      "max_ns": 701,
+      "mean_ns": 658
+    },
+    {
+      "operation": "solver_select",
+      "input_desc": "IllConditioned",
+      "iterations": 100,
+      "median_ns": 652,
+      "p95_ns": 662,
+      "min_ns": 651,
+      "max_ns": 682,
+      "mean_ns": 655
+    },
+    {
+      "operation": "solver_select",
+      "input_desc": "NearSingular",
+      "iterations": 100,
+      "median_ns": 631,
+      "p95_ns": 632,
+      "min_ns": 621,
+      "max_ns": 691,
+      "mean_ns": 629
+    },
+    {
+      "operation": "calibrator_observe",
+      "input_desc": "10_observations",
+      "iterations": 100,
+      "median_ns": 251,
+      "p95_ns": 281,
+      "min_ns": 170,
+      "max_ns": 320,
+      "mean_ns": 245
+    },
+    {
+      "operation": "calibrator_observe",
+      "input_desc": "100_observations",
+      "iterations": 100,
+      "median_ns": 2285,
+      "p95_ns": 2335,
+      "min_ns": 2264,
+      "max_ns": 2365,
+      "mean_ns": 2292
+    },
+    {
+      "operation": "calibrator_observe",
+      "input_desc": "500_observations",
+      "iterations": 100,
+      "median_ns": 10810,
+      "p95_ns": 11382,
+      "min_ns": 10740,
+      "max_ns": 19897,
+      "mean_ns": 10997
+    },
+    {
+      "operation": "calibrator_fallback_check",
+      "input_desc": "100_obs",
+      "iterations": 100,
+      "median_ns": 30,
+      "p95_ns": 31,
+      "min_ns": 20,
+      "max_ns": 31,
+      "mean_ns": 28
+    },
+    {
+      "operation": "signal_create",
+      "input_desc": "new(8.0,0.5,0.3)",
+      "iterations": 100,
+      "median_ns": 20,
+      "p95_ns": 30,
+      "min_ns": 20,
+      "max_ns": 50,
+      "mean_ns": 23
+    },
+    {
+      "operation": "portfolio_serialize",
+      "input_desc": "jsonl_2entries",
+      "iterations": 100,
+      "median_ns": 60,
+      "p95_ns": 70,
+      "min_ns": 50,
+      "max_ns": 81,
+      "mean_ns": 56
+    }
+  ],
+  "hotspot_ranking": [
+    {
+      "rank": 1,
+      "operation": "calibrator_observe",
+      "input_desc": "500_observations",
+      "median_ns": 10810,
+      "fraction_of_total": 0.8570522476809641
+    },
+    {
+      "rank": 2,
+      "operation": "policy_decide",
+      "input_desc": "hardened_benign",
+      "median_ns": 1062,
+      "fraction_of_total": 0.08419884246412432
+    },
+    {
+      "rank": 3,
+      "operation": "solver_select",
+      "input_desc": "NearSingular",
+      "median_ns": 631,
+      "fraction_of_total": 0.05002774914770475
+    },
+    {
+      "rank": 4,
+      "operation": "portfolio_serialize",
+      "input_desc": "jsonl_2entries",
+      "median_ns": 60,
+      "fraction_of_total": 0.004756996749385555
+    },
+    {
+      "rank": 5,
+      "operation": "calibrator_fallback_check",
+      "input_desc": "100_obs",
+      "median_ns": 30,
+      "fraction_of_total": 0.0023784983746927774
+    },
+    {
+      "rank": 6,
+      "operation": "signal_create",
+      "input_desc": "new(8.0,0.5,0.3)",
+      "median_ns": 20,
+      "fraction_of_total": 0.0015856655831285181
+    }
+  ],
+  "memory_notes": [
+    {
+      "operation": "policy_decide",
+      "notes": "Stack-only: 3 logits, 3-element posterior, 3-element losses. No heap allocation per call."
+    },
+    {
+      "operation": "solver_select",
+      "notes": "Stack-only: 4-element posterior, 5-element losses. O(1) per call."
+    },
+    {
+      "operation": "calibrator",
+      "notes": "Bounded VecDeque with capacity. O(capacity) total memory."
+    }
+  ],
+  "isomorphism_check": {
+    "all_operations_pass": true,
+    "details": [
+      {
+        "operation": "posterior_normalization",
+        "passes": true,
+        "note": "sum=1.000000000000000"
+      },
+      {
+        "operation": "well_conditioned_directlu",
+        "passes": true,
+        "note": "action=DirectLU"
+      },
+      {
+        "operation": "ill_conditioned_svd",
+        "passes": true,
+        "note": "action=SVDFallback"
+      },
+      {
+        "operation": "calibrator_initial_no_fallback",
+        "passes": true,
+        "note": "should_fallback=false"
+      },
+      {
+        "operation": "signal_finiteness",
+        "passes": true,
+        "note": "finite(1,0.5,0.3)=true, finite(NaN,0,0)=false"
+      },
+      {
+        "operation": "decision_determinism",
+        "passes": true,
+        "note": "action1=FullValidate, action2=FullValidate"
+      }
+    ]
+  }
+}

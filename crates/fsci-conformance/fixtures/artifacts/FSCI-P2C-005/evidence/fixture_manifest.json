@@ -1,0 +1,125 @@
+{
+  "packet_id": "FSCI-P2C-005",
+  "generated_at": "unix:1779662447",
+  "fixtures": [
+    {
+      "fixture_id": "complex_n16",
+      "size": 16,
+      "input_type": "complex_sinusoid",
+      "operations": [
+        "fft",
+        "ifft",
+        "parseval"
+      ]
+    },
+    {
+      "fixture_id": "real_n16",
+      "size": 16,
+      "input_type": "real_sinusoid",
+      "operations": [
+        "rfft",
+        "irfft"
+      ]
+    },
+    {
+      "fixture_id": "complex_n32",
+      "size": 32,
+      "input_type": "complex_sinusoid",
+      "operations": [
+        "fft",
+        "ifft",
+        "parseval"
+      ]
+    },
+    {
+      "fixture_id": "real_n32",
+      "size": 32,
+      "input_type": "real_sinusoid",
+      "operations": [
+        "rfft",
+        "irfft"
+      ]
+    },
+    {
+      "fixture_id": "complex_n64",
+      "size": 64,
+      "input_type": "complex_sinusoid",
+      "operations": [
+        "fft",
+        "ifft",
+        "parseval"
+      ]
+    },
+    {
+      "fixture_id": "real_n64",
+      "size": 64,
+      "input_type": "real_sinusoid",
+      "operations": [
+        "rfft",
+        "irfft"
+      ]
+    },
+    {
+      "fixture_id": "complex_n128",
+      "size": 128,
+      "input_type": "complex_sinusoid",
+      "operations": [
+        "fft",
+        "ifft",
+        "parseval"
+      ]
+    },
+    {
+      "fixture_id": "real_n128",
+      "size": 128,
+      "input_type": "real_sinusoid",
+      "operations": [
+        "rfft",
+        "irfft"
+      ]
+    },
+    {
+      "fixture_id": "complex_n256",
+      "size": 256,
+      "input_type": "complex_sinusoid",
+      "operations": [
+        "fft",
+        "ifft",
+        "parseval"
+      ]
+    },
+    {
+      "fixture_id": "real_n256",
+      "size": 256,
+      "input_type": "real_sinusoid",
+      "operations": [
+        "rfft",
+        "irfft"
+      ]
+    },
+    {
+      "fixture_id": "fft2_8x8",
+      "size": 64,
+      "input_type": "complex_2d",
+      "operations": [
+        "fft2"
+      ]
+    },
+    {
+      "fixture_id": "fft2_16x16",
+      "size": 256,
+      "input_type": "complex_2d",
+      "operations": [
+        "fft2"
+      ]
+    },
+    {
+      "fixture_id": "fft2_32x32",
+      "size": 1024,
+      "input_type": "complex_2d",
+      "operations": [
+        "fft2"
+      ]
+    }
+  ]
+}

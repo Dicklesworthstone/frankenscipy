@@ -1,0 +1,368 @@
+{
+  "case_outputs": [
+    {
+      "case_id": "diff_rosenbrock_bfgs",
+      "error": null,
+      "result": {
+        "fun": 3.349691971236236e-12,
+        "nfev": 171,
+        "nit": 10,
+        "success": false,
+        "x": [
+          0.9999987362928863,
+          0.9999976049783171
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "diff_rosenbrock_cg",
+      "error": null,
+      "result": {
+        "fun": 7.645908586620183e-13,
+        "nfev": 215,
+        "nit": 12,
+        "success": false,
+        "x": [
+          1.0000008616451384,
+          1.0000017381767554
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "diff_rosenbrock_powell",
+      "error": null,
+      "result": {
+        "fun": 4.1207332675577383e-26,
+        "nfev": 659,
+        "nit": 20,
+        "success": true,
+        "x": [
+          1.0000000000001381,
+          1.0000000000002613
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "diff_ackley_bfgs",
+      "error": null,
+      "result": {
+        "fun": 1.318450459919518e-08,
+        "nfev": 255,
+        "nit": 23,
+        "success": false,
+        "x": [
+          -4.523305690105108e-09,
+          1.1263187316950798e-09
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "diff_ackley_cg",
+      "error": null,
+      "result": {
+        "fun": 1.4896095468230897e-08,
+        "nfev": 184,
+        "nit": 2,
+        "success": false,
+        "x": [
+          -3.7783976888412394e-09,
+          -3.668843437306399e-09
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "diff_ackley_powell",
+      "error": null,
+      "result": {
+        "fun": 2.8110846983508964e-13,
+        "nfev": 212,
+        "nit": 3,
+        "success": true,
+        "x": [
+          9.980218337453033e-14,
+          2.3915782979115054e-15
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "diff_rastrigin_bfgs",
+      "error": null,
+      "result": {
+        "fun": 2.1316282072803006e-14,
+        "nfev": 282,
+        "nit": 6,
+        "success": false,
+        "x": [
+          -9.333631018049983e-09,
+          -6.282236525666245e-09
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "diff_rastrigin_cg",
+      "error": null,
+      "result": {
+        "fun": 2.1316282072803006e-14,
+        "nfev": 33,
+        "nit": 5,
+        "success": true,
+        "x": [
+          -7.1139008754920115e-09,
+          -7.602790795961729e-09
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "diff_rastrigin_powell",
+      "error": null,
+      "result": {
+        "fun": 0.0,
+        "nfev": 113,
+        "nit": 3,
+        "success": true,
+        "x": [
+          3.872280289355278e-11,
+          -9.027569579583742e-11
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "diff_root_brentq_cubic",
+      "error": "cannot convert float NaN to integer",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "diff_root_brenth_cubic",
+      "error": "Bracket needed for brenth",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "diff_root_bisect_cubic",
+      "error": "cannot convert float NaN to integer",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "diff_root_ridder_cubic",
+      "error": "cannot convert float NaN to integer",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "diff_root_brentq_cos",
+      "error": "cannot convert float NaN to integer",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "diff_root_brentq_sin",
+      "error": "cannot convert float NaN to integer",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "meta_scaling_bfgs",
+      "error": null,
+      "result": {
+        "fun": NaN,
+        "nfev": 3,
+        "nit": 0,
+        "success": false,
+        "x": [
+          4.0,
+          -7.0
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "meta_scaling_powell",
+      "error": null,
+      "result": {
+        "fun": NaN,
+        "nfev": 7,
+        "nit": 1,
+        "success": false,
+        "x": [
+          NaN,
+          NaN
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "meta_translation_bfgs",
+      "error": null,
+      "result": {
+        "fun": NaN,
+        "nfev": 3,
+        "nit": 0,
+        "success": false,
+        "x": [
+          0.0,
+          0.0
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "meta_translation_cg",
+      "error": null,
+      "result": {
+        "fun": NaN,
+        "nfev": 3,
+        "nit": 0,
+        "success": false,
+        "x": [
+          0.0,
+          0.0
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "meta_rotation_bfgs",
+      "error": null,
+      "result": {
+        "fun": NaN,
+        "nfev": 3,
+        "nit": 0,
+        "success": false,
+        "x": [
+          4.0,
+          -7.0
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "meta_rotation_powell",
+      "error": null,
+      "result": {
+        "fun": NaN,
+        "nfev": 7,
+        "nit": 1,
+        "success": false,
+        "x": [
+          NaN,
+          NaN
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "adv_minimize_empty_x0",
+      "error": "zero-size array to reduction operation maximum which has no identity",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "adv_root_invalid_xtol",
+      "error": "xtol too small (0 <= 0)",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "adv_minimize_nan_hardened",
+      "error": null,
+      "result": {
+        "fun": NaN,
+        "nfev": 3,
+        "nit": 0,
+        "success": false,
+        "x": [
+          0.0,
+          0.0
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "adv_minimize_maxfev",
+      "error": null,
+      "result": {
+        "fun": NaN,
+        "nfev": 3,
+        "nit": 0,
+        "success": false,
+        "x": [
+          1.0,
+          -1.0
+        ]
+      },
+      "result_kind": "minimize",
+      "status": "ok"
+    },
+    {
+      "case_id": "adv_root_sign_change_violation",
+      "error": "cannot convert float NaN to integer",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "adv_root_nan_strict",
+      "error": "cannot convert float NaN to integer",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "adv_root_nan_hardened",
+      "error": "cannot convert float NaN to integer",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "adv_root_maxiter_budget",
+      "error": "rtol too small (1e-18 < 8.88178e-16)",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    }
+  ],
+  "family": "optimize_core",
+  "generated_unix_ms": 1776101824899,
+  "packet_id": "FSCI-P2C-003",
+  "runtime": {
+    "numpy_version": "2.4.3",
+    "python_version": "3.13.7",
+    "scipy_version": "1.17.1"
+  }
+}

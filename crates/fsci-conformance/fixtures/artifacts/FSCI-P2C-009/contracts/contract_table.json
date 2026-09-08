@@ -1,0 +1,191 @@
+{
+  "contracts": [
+    {
+      "function_name": "fsci_cluster::adjusted_rand_score",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::cophenet",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::dbscan",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::fcluster",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::inconsistent",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::is_monotonic",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::is_valid_linkage",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::kmeans",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::leaves_list",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::linkage",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::linkage::average",
+      "scipy_equivalent": "scipy.cluster.hierarchy.linkage(method=average)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_cluster::linkage::centroid",
+      "scipy_equivalent": "scipy.cluster.hierarchy.linkage(method=centroid)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_cluster::linkage::complete",
+      "scipy_equivalent": "scipy.cluster.hierarchy.linkage(method=complete)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_cluster::linkage::median",
+      "scipy_equivalent": "scipy.cluster.hierarchy.linkage(method=median)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_cluster::linkage::single",
+      "scipy_equivalent": "scipy.cluster.hierarchy.linkage(method=single)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_cluster::linkage::ward",
+      "scipy_equivalent": "scipy.cluster.hierarchy.linkage(method=ward)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_cluster::linkage::weighted",
+      "scipy_equivalent": "scipy.cluster.hierarchy.linkage(method=weighted)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_cluster::mean_shift",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::num_obs_linkage",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::silhouette_score",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::vq",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_cluster::whiten",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    }
+  ],
+  "domain": "cluster",
+  "generated_at": "2026-04-23T00:00:00Z",
+  "packet_id": "FSCI-P2C-009",
+  "schema_version": 1
+}

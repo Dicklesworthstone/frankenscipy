@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_01_kmeans",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "kmeans_clustering",
+      "action": "kmeans(data, k=3)",
+      "input_summary": "60 points, 3 clusters",
+      "output_summary": "centroids=3, inertia=7.7957",
+      "duration_ns": 194338,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "kmeans_convergence",
+      "action": "check inertia is finite and positive",
+      "input_summary": "verify convergence",
+      "output_summary": "inertia=7.7957",
+      "duration_ns": 98787,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "kmeans",
+    "n_samples": 60,
+    "n_features": 2,
+    "n_clusters": 3
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 314636,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_01_kmeans --nocapture"
+  }
+}

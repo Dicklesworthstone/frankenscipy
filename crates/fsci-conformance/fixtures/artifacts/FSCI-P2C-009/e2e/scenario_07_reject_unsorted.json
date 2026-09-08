@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_07_reject_unsorted",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "reject_unsorted_x",
+      "action": "Interp1d::new([1, 3, 2, 4], [0,1,2,3])",
+      "input_summary": "unsorted x",
+      "output_summary": "correctly rejected with UnsortedX",
+      "duration_ns": 3236,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "reject_duplicate_x",
+      "action": "Interp1d::new([1, 2, 2, 4], [0,1,2,3])",
+      "input_summary": "duplicate x values",
+      "output_summary": "correctly rejected duplicates with UnsortedX",
+      "duration_ns": 861,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "error-handling",
+    "num_points": 4,
+    "dimensions": 1,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 8426,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_07_reject_unsorted --nocapture"
+  }
+}

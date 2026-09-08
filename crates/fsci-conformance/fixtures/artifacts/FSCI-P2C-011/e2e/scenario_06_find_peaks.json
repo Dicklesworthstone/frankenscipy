@@ -1,0 +1,52 @@
+{
+  "scenario_id": "scenario_06_find_peaks",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "find_basic_peaks",
+      "action": "find_peaks(signal, default options)",
+      "input_summary": "find all local maxima",
+      "output_summary": "found 6 peaks at [6, 19, 37]",
+      "duration_ns": 23324,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "find_peaks_with_height",
+      "action": "find_peaks with height threshold",
+      "input_summary": "filter by minimum height",
+      "output_summary": "found 4 peaks above 0.5",
+      "duration_ns": 12473,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "find_peaks_with_distance",
+      "action": "find_peaks with minimum distance",
+      "input_summary": "enforce minimum spacing",
+      "output_summary": "found 6 peaks, min_dist=13",
+      "duration_ns": 65083,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "find_peaks",
+    "signal_length": 100,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 118925,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_06_find_peaks --nocapture"
+  }
+}

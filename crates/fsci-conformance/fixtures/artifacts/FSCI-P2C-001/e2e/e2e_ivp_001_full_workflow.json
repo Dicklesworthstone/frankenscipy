@@ -1,0 +1,67 @@
+{
+  "scenario_id": "e2e_ivp_001_full_workflow",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "validate_tol",
+      "action": "validate",
+      "input_summary": "rtol=1e-3, atol=1e-6, n=1",
+      "output_summary": "warnings=0",
+      "duration_ns": 26430,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "validate_first_step",
+      "action": "validate",
+      "input_summary": "first_step=0.01, t0=0.0, t_bound=10.0",
+      "output_summary": "result=0.01",
+      "duration_ns": 902,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "validate_max_step",
+      "action": "validate",
+      "input_summary": "max_step=1.0",
+      "output_summary": "result=1",
+      "duration_ns": 331,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "solve_ivp",
+      "action": "solve",
+      "input_summary": "dy/dt=-y, t=[0,5], y0=1",
+      "output_summary": "success=true, nfev=319, t_len=54",
+      "duration_ns": 270242,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 5,
+      "step_name": "verify_solution",
+      "action": "check",
+      "input_summary": "y(5.00)=6.73794709e-3",
+      "output_summary": "expected=6.73794700e-3, rel_err=1.41e-8",
+      "duration_ns": 3607,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 404486,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_001_full_workflow --nocapture"
+  }
+}

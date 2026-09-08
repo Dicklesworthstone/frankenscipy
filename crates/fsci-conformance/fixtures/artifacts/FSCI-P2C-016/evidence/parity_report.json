@@ -1,0 +1,33 @@
+{
+  "packet_id": "FSCI-P2C-016",
+  "operation_summaries": [
+    {
+      "category": "derived_units",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "category": "fundamental_values",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "category": "lookup",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "category": "unit_conversion",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    }
+  ]
+}

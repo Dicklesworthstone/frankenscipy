@@ -1,0 +1,399 @@
+{
+  "manifest": {
+    "packet_id": "FSCI-P2C-004",
+    "generated_at": "unix:1779662447",
+    "fixtures": [
+      {
+        "fixture_id": "random_100x100_d5",
+        "dimensions": [
+          100,
+          100
+        ],
+        "nnz": 500,
+        "structure": "random_sparse",
+        "operations": [
+          "spmv_csr",
+          "format_conversion",
+          "add_csr",
+          "scale_csr"
+        ]
+      },
+      {
+        "fixture_id": "random_500x500_d2",
+        "dimensions": [
+          500,
+          500
+        ],
+        "nnz": 5000,
+        "structure": "random_sparse",
+        "operations": [
+          "spmv_csr",
+          "format_conversion",
+          "add_csr",
+          "scale_csr"
+        ]
+      },
+      {
+        "fixture_id": "random_1000x1000_d1",
+        "dimensions": [
+          1000,
+          1000
+        ],
+        "nnz": 10000,
+        "structure": "random_sparse",
+        "operations": [
+          "spmv_csr",
+          "format_conversion",
+          "add_csr",
+          "scale_csr"
+        ]
+      },
+      {
+        "fixture_id": "identity_50x50",
+        "dimensions": [
+          50,
+          50
+        ],
+        "nnz": 50,
+        "structure": "identity",
+        "operations": [
+          "spmv_csr"
+        ]
+      },
+      {
+        "fixture_id": "tridiag_50x50",
+        "dimensions": [
+          50,
+          50
+        ],
+        "nnz": 148,
+        "structure": "tridiagonal",
+        "operations": [
+          "diags",
+          "spmv_csr"
+        ]
+      },
+      {
+        "fixture_id": "identity_200x200",
+        "dimensions": [
+          200,
+          200
+        ],
+        "nnz": 200,
+        "structure": "identity",
+        "operations": [
+          "spmv_csr"
+        ]
+      },
+      {
+        "fixture_id": "tridiag_200x200",
+        "dimensions": [
+          200,
+          200
+        ],
+        "nnz": 598,
+        "structure": "tridiagonal",
+        "operations": [
+          "diags",
+          "spmv_csr"
+        ]
+      },
+      {
+        "fixture_id": "identity_500x500",
+        "dimensions": [
+          500,
+          500
+        ],
+        "nnz": 500,
+        "structure": "identity",
+        "operations": [
+          "spmv_csr"
+        ]
+      },
+      {
+        "fixture_id": "tridiag_500x500",
+        "dimensions": [
+          500,
+          500
+        ],
+        "nnz": 1498,
+        "structure": "tridiagonal",
+        "operations": [
+          "diags",
+          "spmv_csr"
+        ]
+      }
+    ]
+  },
+  "parity_gates": {
+    "packet_id": "FSCI-P2C-004",
+    "all_gates_pass": true,
+    "gates": [
+      {
+        "fixture_id": "identity_50x50",
+        "operation": "spmv_csr",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          50,
+          50
+        ],
+        "nnz": 50
+      },
+      {
+        "fixture_id": "tridiag_50x50",
+        "operation": "diags",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          50,
+          50
+        ],
+        "nnz": 148
+      },
+      {
+        "fixture_id": "identity_200x200",
+        "operation": "spmv_csr",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          200,
+          200
+        ],
+        "nnz": 200
+      },
+      {
+        "fixture_id": "tridiag_200x200",
+        "operation": "diags",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          200,
+          200
+        ],
+        "nnz": 598
+      },
+      {
+        "fixture_id": "identity_500x500",
+        "operation": "spmv_csr",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          500,
+          500
+        ],
+        "nnz": 500
+      },
+      {
+        "fixture_id": "tridiag_500x500",
+        "operation": "diags",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          500,
+          500
+        ],
+        "nnz": 1498
+      },
+      {
+        "fixture_id": "roundtrip_100x100_d5",
+        "operation": "format_conversion",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          100,
+          100
+        ],
+        "nnz": 500
+      },
+      {
+        "fixture_id": "add_commute_100x100_d5",
+        "operation": "add_csr",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          100,
+          100
+        ],
+        "nnz": 978
+      },
+      {
+        "fixture_id": "scale_id_100x100_d5",
+        "operation": "scale_csr",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          100,
+          100
+        ],
+        "nnz": 500
+      },
+      {
+        "fixture_id": "roundtrip_500x500_d2",
+        "operation": "format_conversion",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          500,
+          500
+        ],
+        "nnz": 5000
+      },
+      {
+        "fixture_id": "add_commute_500x500_d2",
+        "operation": "add_csr",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          500,
+          500
+        ],
+        "nnz": 9880
+      },
+      {
+        "fixture_id": "scale_id_500x500_d2",
+        "operation": "scale_csr",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          500,
+          500
+        ],
+        "nnz": 5000
+      },
+      {
+        "fixture_id": "roundtrip_1000x1000_d1",
+        "operation": "format_conversion",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          1000,
+          1000
+        ],
+        "nnz": 10000
+      },
+      {
+        "fixture_id": "add_commute_1000x1000_d1",
+        "operation": "add_csr",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          1000,
+          1000
+        ],
+        "nnz": 19901
+      },
+      {
+        "fixture_id": "scale_id_1000x1000_d1",
+        "operation": "scale_csr",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "matrix_dims": [
+          1000,
+          1000
+        ],
+        "nnz": 10000
+      }
+    ]
+  },
+  "risk_notes": {
+    "packet_id": "FSCI-P2C-004",
+    "notes": [
+      {
+        "category": "structural_singularity",
+        "description": "Zero-pivot in LU can produce inf/NaN. spsolve/splu use dense LU fallback for N <= 32768.",
+        "affected_operations": [
+          "spsolve",
+          "splu"
+        ],
+        "mitigation": "Dense LU fallback with SPSOLVE_DENSE_MAX_N guard. Singular matrices return SparseError. Native sparse-direct path deferred."
+      },
+      {
+        "category": "fill_in_explosion",
+        "description": "LU of sparse matrices can fill in. Current impl converts to dense for N <= 32768; larger matrices rejected.",
+        "affected_operations": [
+          "splu",
+          "spilu"
+        ],
+        "mitigation": "SPSOLVE_DENSE_MAX_N guard rejects large matrices. Native sparse-direct with AMD/RCM ordering deferred to bead u7bd."
+      },
+      {
+        "category": "csr_csc_conversion_fidelity",
+        "description": "Format conversion must preserve canonical ordering (sorted, deduplicated). Non-canonical input in Hardened mode is rejected.",
+        "affected_operations": [
+          "csr_to_csc",
+          "csc_to_csr",
+          "coo_to_csr"
+        ],
+        "mitigation": "Roundtrip parity gates verify conversion preserves values. Hardened mode rejects non-canonical structures."
+      },
+      {
+        "category": "zero_nnz_edge_cases",
+        "description": "Empty matrices (nnz=0) and zero-dimension matrices must preserve shape through all operations without panics.",
+        "affected_operations": [
+          "spmv_csr",
+          "add_csr",
+          "scale_csr",
+          "eye"
+        ],
+        "mitigation": "Explicit zero-NNZ test fixtures in E2E and adversarial test suites."
+      }
+    ]
+  },
+  "parity_report": {
+    "packet_id": "FSCI-P2C-004",
+    "operation_summaries": [
+      {
+        "operation": "spmv_csr",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "operation": "format_conversion",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "operation": "add_csr",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "operation": "scale_csr",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "operation": "diags",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      }
+    ]
+  },
+  "sidecar": null
+}

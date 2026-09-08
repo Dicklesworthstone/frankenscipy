@@ -1,0 +1,142 @@
+{
+  "test_id": "metamorphic_stats_tukey_hsd",
+  "case_count": 22,
+  "pass_count": 22,
+  "pass": true,
+  "timestamp_ms": 1779662457827,
+  "duration_ns": 4142006157,
+  "cases": [
+    {
+      "case_id": "three_distinct_means",
+      "invariant": "stat_antisymmetric",
+      "detail": "max |s[i,j] + s[j,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "three_distinct_means",
+      "invariant": "stat_diagonal_zero",
+      "detail": "max |s[i,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "three_distinct_means",
+      "invariant": "pvalue_symmetric",
+      "detail": "max |p[i,j] - p[j,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "three_distinct_means",
+      "invariant": "pvalue_diagonal_one",
+      "detail": "max |p[i,i] - 1| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "three_distinct_means",
+      "invariant": "pvalues_bounded_0_1",
+      "detail": "all in [0, 1]",
+      "pass": true
+    },
+    {
+      "case_id": "four_mixed",
+      "invariant": "stat_antisymmetric",
+      "detail": "max |s[i,j] + s[j,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "four_mixed",
+      "invariant": "stat_diagonal_zero",
+      "detail": "max |s[i,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "four_mixed",
+      "invariant": "pvalue_symmetric",
+      "detail": "max |p[i,j] - p[j,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "four_mixed",
+      "invariant": "pvalue_diagonal_one",
+      "detail": "max |p[i,i] - 1| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "four_mixed",
+      "invariant": "pvalues_bounded_0_1",
+      "detail": "all in [0, 1]",
+      "pass": true
+    },
+    {
+      "case_id": "three_identical",
+      "invariant": "stat_antisymmetric",
+      "detail": "max |s[i,j] + s[j,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "three_identical",
+      "invariant": "stat_diagonal_zero",
+      "detail": "max |s[i,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "three_identical",
+      "invariant": "pvalue_symmetric",
+      "detail": "max |p[i,j] - p[j,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "three_identical",
+      "invariant": "pvalue_diagonal_one",
+      "detail": "max |p[i,i] - 1| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "three_identical",
+      "invariant": "pvalues_bounded_0_1",
+      "detail": "all in [0, 1]",
+      "pass": true
+    },
+    {
+      "case_id": "three_identical",
+      "invariant": "identical_groups_pvalue_near_1",
+      "detail": "min off-diagonal p = 1",
+      "pass": true
+    },
+    {
+      "case_id": "two_separated",
+      "invariant": "stat_antisymmetric",
+      "detail": "max |s[i,j] + s[j,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "two_separated",
+      "invariant": "stat_diagonal_zero",
+      "detail": "max |s[i,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "two_separated",
+      "invariant": "pvalue_symmetric",
+      "detail": "max |p[i,j] - p[j,i]| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "two_separated",
+      "invariant": "pvalue_diagonal_one",
+      "detail": "max |p[i,i] - 1| = 0",
+      "pass": true
+    },
+    {
+      "case_id": "two_separated",
+      "invariant": "pvalues_bounded_0_1",
+      "detail": "all in [0, 1]",
+      "pass": true
+    },
+    {
+      "case_id": "two_separated",
+      "invariant": "separated_groups_pvalue_small",
+      "detail": "p[0][1] = 0.000000007554185055269613",
+      "pass": true
+    }
+  ]
+}

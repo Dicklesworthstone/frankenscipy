@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_special_004_pole",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "gamma_pole_strict",
+      "action": "gamma",
+      "input_summary": "x=-2.0, strict",
+      "output_summary": "nan_or_inf=true",
+      "duration_ns": 6142,
+      "mode": "strict",
+      "outcome": "expected_behavior"
+    },
+    {
+      "step_id": 2,
+      "step_name": "gamma_pole_hardened",
+      "action": "gamma",
+      "input_summary": "x=-2.0, hardened",
+      "output_summary": "error=true",
+      "duration_ns": 8486,
+      "mode": "strict",
+      "outcome": "expected_error"
+    },
+    {
+      "step_id": 3,
+      "step_name": "gamma_recovery",
+      "action": "gamma",
+      "input_summary": "x=3.0 (non-pole)",
+      "output_summary": "result=2.0000000000000018, expected=2.0, pass=true",
+      "duration_ns": 4608,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 136669,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_special -- e2e_special_004_pole --nocapture"
+  }
+}

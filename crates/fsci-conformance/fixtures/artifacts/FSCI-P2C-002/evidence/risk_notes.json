@@ -1,0 +1,39 @@
+{
+  "packet_id": "FSCI-P2C-002",
+  "notes": [
+    {
+      "category": "near-singular matrices",
+      "description": "Matrices with rcond < 1e-12 may produce inaccurate results. In Strict mode, a LinalgWarning::IllConditioned is emitted. In Hardened mode, rcond < HARDENED_RCOND_THRESHOLD (1e-14) triggers LinalgError::ConditionTooHigh.",
+      "affected_operations": [
+        "solve",
+        "inv",
+        "det"
+      ],
+      "mitigation": "Use RuntimeMode::Hardened for critical paths. Monitor rcond in SolveResult/InvResult warnings. Fall back to lstsq/pinv for ill-conditioned systems."
+    },
+    {
+      "category": "non-square lstsq",
+      "description": "lstsq handles overdetermined (m > n) and underdetermined (m < n) systems via SVD. For underdetermined systems, the minimum-norm solution is returned. Numerical rank is estimated from singular values.",
+      "affected_operations": [
+        "lstsq"
+      ],
+      "mitigation": "Use LstsqOptions::cond to set a condition threshold for rank determination. Default driver Gelsd (SVD divide-and-conquer) is most robust."
+    },
+    {
+      "category": "ill-conditioned pinv",
+      "description": "pinv relies on SVD and thresholding of small singular values. Very ill-conditioned matrices may produce inaccurate pseudoinverses. atol and rtol parameters control singular value cutoff.",
+      "affected_operations": [
+        "pinv"
+      ],
+      "mitigation": "Set PinvOptions::atol/rtol explicitly for precision control. Verify via pinv(A) @ b ≈ lstsq(A, b) cross-check."
+    },
+    {
+      "category": "banded solver edge cases",
+      "description": "solve_banded converts to dense internally. For large banded systems this loses the O(n) advantage. Band storage format follows LAPACK convention: ab[nupper + i - j][j] = A[i][j].",
+      "affected_operations": [
+        "solve_banded"
+      ],
+      "mitigation": "For performance-critical banded systems >1000x1000, consider a dedicated banded solver. Current implementation is correctness-first."
+    }
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-008",
+  "domain": "runtime_casp",
+  "generated_at": "2026-03-13T05:15:00Z",
+  "contracts": [
+    {
+      "function_name": "fsci_runtime::PolicyController::decide",
+      "scipy_equivalent": "N/A (FrankenSciPy innovation, no SciPy equivalent)",
+      "inputs": [
+        {
+          "name": "signals",
+          "type_desc": "DecisionSignals",
+          "required": true,
+          "constraints": "Three f64 signals: condition_number_log10, metadata_incompatibility_score, anomaly_score. Clamped to [0,1] internally (condition scaled by /16)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "decision",
+          "type_desc": "PolicyDecision",
+          "semantics": "Contains action (Allow/FullValidate/FailClosed), top risk state, posterior probabilities, expected losses, and human-readable reason."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "default_atol": null,
+        "default_rtol": null
+      },
+      "strict_mode_behavior": "Uses Strict loss matrix: [[0.0, 65.0, 200.0], [8.0, 4.0, 80.0], [40.0, 25.0, 1.0]]",
+      "hardened_mode_behavior": "Uses Hardened loss matrix: [[0.0, 50.0, 180.0], [5.0, 3.0, 60.0], [55.0, 30.0, 1.0]]. Higher FailClosed+Compatible cost makes Hardened slightly less eager to reject good inputs."
+    },
+    {
+      "function_name": "fsci_runtime::SolverPortfolio::select_action",
+      "scipy_equivalent": "N/A (CASP innovation)",
+      "inputs": [
+        {
+          "name": "condition",
+          "type_desc": "&MatrixConditionState",
+          "required": true,
+          "constraints": "One of: WellConditioned, ModerateCondition, IllConditioned, NearSingular."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "action",
+          "type_desc": "SolverAction",
+          "semantics": "Selected solver: DirectLU, PivotedQR, SVDFallback, DiagonalFastPath, or TriangularFastPath."
+        },
+        {
+          "name": "posterior",
+          "type_desc": "[f64; 4]",
+          "semantics": "Posterior probability distribution over condition states."
+        },
+        {
+          "name": "losses",
+          "type_desc": "[f64; 5]",
+          "semantics": "Expected loss for each candidate action."
+        },
+        {
+          "name": "chosen_loss",
+          "type_desc": "f64",
+          "semantics": "Expected loss of the selected action."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "default_atol": null,
+        "default_rtol": null
+      },
+      "strict_mode_behavior": "Standard 5x4 loss matrix: DirectLU cheapest for WellConditioned, PivotedQR for Moderate, SVD for Ill/NearSingular.",
+      "hardened_mode_behavior": "Same loss matrix and selection logic; mode only affects evidence recording."
+    },
+    {
+      "function_name": "fsci_runtime::ConformalCalibrator::should_fallback",
+      "scipy_equivalent": "N/A (CASP innovation)",
+      "inputs": [
+        {
+          "name": "observations",
+          "type_desc": "sequence of f64 backward errors via observe()",
+          "required": true,
+          "constraints": "At least 10 observations required before fallback can trigger. Violation threshold = 1e-8."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "should_fallback",
+          "type_desc": "bool",
+          "semantics": "True when empirical miscoverage rate exceeds alpha + epsilon (0.05 + 0.02 = 0.07 by default)."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "default_atol": null,
+        "default_rtol": null
+      },
+      "strict_mode_behavior": "Advisory fallback signal; caller decides whether to force SVD.",
+      "hardened_mode_behavior": "Same advisory signal; enforcement is at SolverPortfolio level."
+    }
+  ]
+}

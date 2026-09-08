@@ -1,0 +1,56 @@
+{
+  "scenario_id": "p2c002_10_det_chain",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "compute_det_a",
+      "action": "det(A)",
+      "input_summary": "3x3 general",
+      "output_summary": "det(A)=9",
+      "duration_ns": 25729,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "compute_det_inv_a",
+      "action": "det(inv(A))",
+      "input_summary": "determinant of inverse",
+      "output_summary": "det(inv(A))=0.11111111111111116",
+      "duration_ns": 157067,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_product",
+      "action": "det(A) * det(inv(A)) == 1.0",
+      "input_summary": "fundamental identity",
+      "output_summary": "det(A)*det(inv(A))=1.000000000000, diff=4.44e-16",
+      "duration_ns": 1202,
+      "mode": "strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "matrix_metadata": {
+    "size": [
+      3,
+      3
+    ],
+    "nnz": null,
+    "rcond_estimate": null,
+    "mode": "strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 191012,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_linalg -- p2c002_10_det_chain --nocapture"
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_02_hierarchical",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "linkage_ward",
+      "action": "linkage(data, method=Ward)",
+      "input_summary": "20 points, Ward linkage",
+      "output_summary": "linkage matrix: 19x4",
+      "duration_ns": 149474,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "linkage_validation",
+      "action": "is_valid_linkage and is_monotonic",
+      "input_summary": "validate linkage matrix",
+      "output_summary": "valid=true, monotonic=true",
+      "duration_ns": 119046,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "fcluster_cut",
+      "action": "fcluster(z, max_clusters=3)",
+      "input_summary": "cut dendrogram into 3 clusters",
+      "output_summary": "3 clusters assigned",
+      "duration_ns": 153301,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "linkage",
+    "n_samples": 20,
+    "n_features": 2,
+    "n_clusters": 3
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 437769,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_02_hierarchical --nocapture"
+  }
+}

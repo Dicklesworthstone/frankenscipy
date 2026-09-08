@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_sparse_015_pagerank",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "build_graph",
+      "action": "from_triplets",
+      "input_summary": "4 nodes, chain with hub",
+      "output_summary": "nnz=4",
+      "duration_ns": 45517,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "compute_pagerank",
+      "action": "pagerank",
+      "input_summary": "damping=0.85, max_iter=100",
+      "output_summary": "sum=1.0000, normalized=true",
+      "duration_ns": 37962,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_ranking",
+      "action": "check max rank node",
+      "input_summary": "expected node 2 or 3 highest",
+      "output_summary": "max_rank_node=3, ranks=[0.12045199542192613, 0.1716440938209487, 0.31754157512256465, 0.3903623356345607]",
+      "duration_ns": 5330,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 295340,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_015_pagerank --nocapture"
+  }
+}

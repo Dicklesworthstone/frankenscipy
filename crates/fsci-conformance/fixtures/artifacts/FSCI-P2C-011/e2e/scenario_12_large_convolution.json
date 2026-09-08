@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_12_large_convolution",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "convolve_large",
+      "action": "convolve(10000, 101, same)",
+      "input_summary": "large signal convolution",
+      "output_summary": "len=10000, time=12.451089ms",
+      "duration_ns": 12453704,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "convolve",
+    "signal_length": 10000,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 12822793,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_12_large_convolution --nocapture"
+  }
+}

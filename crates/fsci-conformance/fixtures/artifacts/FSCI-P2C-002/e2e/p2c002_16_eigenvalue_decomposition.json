@@ -1,0 +1,46 @@
+{
+  "scenario_id": "p2c002_16_eigenvalue_decomposition",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "compute_eig",
+      "action": "eig(A)",
+      "input_summary": "3x3 matrix",
+      "output_summary": "eigenvalue decomposition computed",
+      "duration_ns": 60284,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "verify_eigenvalue_equation",
+      "action": "A @ v == λ @ v for each pair",
+      "input_summary": "eigenpair check",
+      "output_summary": "eigenpairs verified: max_residual=1.78e-15, λ=[2.0, 0.9999999999999998, 10.999999999999998]",
+      "duration_ns": 9038,
+      "mode": "strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "matrix_metadata": {
+    "size": [
+      3,
+      3
+    ],
+    "nnz": null,
+    "rcond_estimate": null,
+    "mode": "strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 72678,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_linalg -- p2c002_16_eigenvalue_decomposition --nocapture"
+  }
+}

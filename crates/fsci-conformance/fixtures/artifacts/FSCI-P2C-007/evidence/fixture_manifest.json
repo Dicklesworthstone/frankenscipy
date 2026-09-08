@@ -1,0 +1,312 @@
+{
+  "packet_id": "FSCI-P2C-007",
+  "generated_at": "unix:1779662447",
+  "fixtures": [
+    {
+      "fixture_id": "diff_zeros_scalar_f64",
+      "operation": "zeros",
+      "category": "differential",
+      "shape": "[]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::creation::zeros"
+    },
+    {
+      "fixture_id": "diff_zeros_2x2_f32",
+      "operation": "zeros",
+      "category": "differential",
+      "shape": "[2,2]",
+      "dtype": "float32",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::creation::zeros"
+    },
+    {
+      "fixture_id": "diff_ones_len3_f32",
+      "operation": "ones",
+      "category": "differential",
+      "shape": "[3]",
+      "dtype": "float32",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::creation::ones"
+    },
+    {
+      "fixture_id": "diff_full_complex128",
+      "operation": "full",
+      "category": "differential",
+      "shape": "[2]",
+      "dtype": "complex128",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::creation::full"
+    },
+    {
+      "fixture_id": "diff_arange_ascending",
+      "operation": "arange",
+      "category": "differential",
+      "shape": "[5]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::creation::arange"
+    },
+    {
+      "fixture_id": "diff_arange_descending",
+      "operation": "arange",
+      "category": "differential",
+      "shape": "[3]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::creation::arange"
+    },
+    {
+      "fixture_id": "diff_linspace_endpoint_true",
+      "operation": "linspace",
+      "category": "differential",
+      "shape": "[5]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::creation::linspace"
+    },
+    {
+      "fixture_id": "diff_linspace_endpoint_false",
+      "operation": "linspace",
+      "category": "differential",
+      "shape": "[4]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::creation::linspace"
+    },
+    {
+      "fixture_id": "diff_broadcast_shapes_basic",
+      "operation": "broadcast_shapes",
+      "category": "differential",
+      "shape": "[[2,1],[1,3]]",
+      "dtype": "n/a",
+      "expected_kind": "shape",
+      "contract_ref": "fsci_arrayapi::dtype::promote_and_broadcast"
+    },
+    {
+      "fixture_id": "diff_result_type_complex_promotion",
+      "operation": "result_type",
+      "category": "differential",
+      "shape": "n/a",
+      "dtype": "[\"float32\",\"complex64\"]",
+      "expected_kind": "dtype",
+      "contract_ref": "fsci_arrayapi::dtype::result_type"
+    },
+    {
+      "fixture_id": "diff_from_slice_matrix",
+      "operation": "from_slice",
+      "category": "differential",
+      "shape": "[2,2]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::conversion::asarray"
+    },
+    {
+      "fixture_id": "diff_getitem_basic_slice",
+      "operation": "getitem",
+      "category": "differential",
+      "shape": "[4]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::indexing::getitem"
+    },
+    {
+      "fixture_id": "diff_getitem_advanced_negative",
+      "operation": "getitem",
+      "category": "differential",
+      "shape": "[4]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": "fsci_arrayapi::indexing::getitem"
+    },
+    {
+      "fixture_id": "diff_reshape_2x3_to_3x2",
+      "operation": "reshape",
+      "category": "differential",
+      "shape": "[2,3]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "diff_transpose_2x3",
+      "operation": "transpose",
+      "category": "differential",
+      "shape": "[2,3]",
+      "dtype": "float64",
+      "expected_kind": "array",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "meta_broadcast_commutative_dense",
+      "operation": "relation_broadcast_commutative",
+      "category": "metamorphic",
+      "shape": "[2,1] x [1,3]",
+      "dtype": "n/a",
+      "expected_kind": "bool",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "meta_broadcast_commutative_zero_dim",
+      "operation": "relation_broadcast_commutative",
+      "category": "metamorphic",
+      "shape": "[0,1] x [1,4]",
+      "dtype": "n/a",
+      "expected_kind": "bool",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "meta_result_type_symmetry_f32_c64",
+      "operation": "relation_result_type_symmetry",
+      "category": "metamorphic",
+      "shape": "n/a",
+      "dtype": "[float32,complex64]",
+      "expected_kind": "bool",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "meta_result_type_symmetry_f64_c128",
+      "operation": "relation_result_type_symmetry",
+      "category": "metamorphic",
+      "shape": "n/a",
+      "dtype": "[float64,complex128]",
+      "expected_kind": "bool",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "meta_index_roundtrip_mid",
+      "operation": "relation_index_roundtrip",
+      "category": "metamorphic",
+      "shape": "n/a",
+      "dtype": "float64",
+      "expected_kind": "bool",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "meta_index_roundtrip_negative",
+      "operation": "relation_index_roundtrip",
+      "category": "metamorphic",
+      "shape": "n/a",
+      "dtype": "float64",
+      "expected_kind": "bool",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "adv_arange_zero_step_i64",
+      "operation": "arange",
+      "category": "adversarial",
+      "shape": "n/a",
+      "dtype": "float64",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "adv_arange_zero_step_complex",
+      "operation": "arange",
+      "category": "adversarial",
+      "shape": "n/a",
+      "dtype": "float64",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "adv_result_type_integral_without_force",
+      "operation": "result_type",
+      "category": "adversarial",
+      "shape": "n/a",
+      "dtype": "[\"int64\"]",
+      "expected_kind": "dtype",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "adv_from_slice_len_mismatch",
+      "operation": "from_slice",
+      "category": "adversarial",
+      "shape": "[2,2]",
+      "dtype": "float64",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "adv_getitem_mode_mismatch",
+      "operation": "getitem",
+      "category": "adversarial",
+      "shape": "[3]",
+      "dtype": "n/a",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "adv_reshape_size_mismatch",
+      "operation": "reshape",
+      "category": "adversarial",
+      "shape": "[4]",
+      "dtype": "n/a",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "adv_transpose_rank1",
+      "operation": "transpose",
+      "category": "adversarial",
+      "shape": "[3]",
+      "dtype": "n/a",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "adv_broadcast_incompatible",
+      "operation": "broadcast_shapes",
+      "category": "adversarial",
+      "shape": "[[2,3],[3,2]]",
+      "dtype": "n/a",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "hardened_arange_zero_step_i64",
+      "operation": "arange",
+      "category": "hardened",
+      "shape": "n/a",
+      "dtype": "float64",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "hardened_from_slice_len_mismatch",
+      "operation": "from_slice",
+      "category": "hardened",
+      "shape": "[2,2]",
+      "dtype": "float64",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "hardened_getitem_mode_mismatch",
+      "operation": "getitem",
+      "category": "hardened",
+      "shape": "[3]",
+      "dtype": "n/a",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "hardened_reshape_size_mismatch",
+      "operation": "reshape",
+      "category": "hardened",
+      "shape": "[4]",
+      "dtype": "n/a",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    },
+    {
+      "fixture_id": "hardened_broadcast_incompatible",
+      "operation": "broadcast_shapes",
+      "category": "hardened",
+      "shape": "[[2,3],[3,2]]",
+      "dtype": "n/a",
+      "expected_kind": "error_kind",
+      "contract_ref": null
+    }
+  ]
+}

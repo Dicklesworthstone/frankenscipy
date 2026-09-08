@@ -1,0 +1,41 @@
+{
+  "packet_id": "FSCI-P2C-003",
+  "notes": [
+    {
+      "category": "bfgs_hessian_approximation",
+      "description": "BFGS uses rank-2 Hessian inverse updates. For highly non-quadratic objectives, the approximation may stall. O(n²) memory for Hessian inverse.",
+      "affected_operations": [
+        "bfgs"
+      ],
+      "mitigation": "Armijo line search provides sufficient decrease guarantee. MaxIterations status returned if convergence too slow."
+    },
+    {
+      "category": "finite_difference_gradients",
+      "description": "All gradient-based methods (BFGS, CG) compute gradients via central finite differences (2n function evaluations per gradient). Noisy or discontinuous objectives may produce inaccurate gradients.",
+      "affected_operations": [
+        "bfgs",
+        "cg"
+      ],
+      "mitigation": "gradient_eps parameter (default 1e-8) can be tuned. Powell method is derivative-free alternative."
+    },
+    {
+      "category": "powell_direction_degeneracy",
+      "description": "Powell's direction set method may fail to converge if search directions become linearly dependent. Golden section search has fixed iteration budget.",
+      "affected_operations": [
+        "powell"
+      ],
+      "mitigation": "Direction set is refreshed when improvement stalls. MaxIterations/MaxEvaluations returned on budget exhaustion."
+    },
+    {
+      "category": "root_bracket_requirement",
+      "description": "All root-finding methods require a valid bracket (sign change). If f(a) and f(b) have the same sign, SignChangeRequired error is returned.",
+      "affected_operations": [
+        "brentq",
+        "brenth",
+        "bisect",
+        "ridder"
+      ],
+      "mitigation": "Explicit error with detail string returned. Users should verify bracket validity before calling."
+    }
+  ]
+}

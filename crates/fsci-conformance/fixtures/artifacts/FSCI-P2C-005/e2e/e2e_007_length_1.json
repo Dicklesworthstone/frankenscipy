@@ -1,0 +1,37 @@
+{
+  "scenario_id": "e2e_007_length_1",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "fft_ifft_n1",
+      "action": "roundtrip",
+      "input_summary": "complex n=1",
+      "output_summary": "diff=0.0000e0, pass=true",
+      "duration_ns": 7494,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "rfft_n1",
+      "action": "transform+verify",
+      "input_summary": "real n=1",
+      "output_summary": "spectrum[0]=(42.0, 0.0), pass=true",
+      "duration_ns": 2965,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 106411,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_fft -- e2e_007_length_1 --nocapture"
+  }
+}

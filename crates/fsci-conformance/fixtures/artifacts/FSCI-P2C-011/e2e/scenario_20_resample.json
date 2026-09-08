@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_20_resample",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "resample_upsample",
+      "action": "resample(signal, 2000)",
+      "input_summary": "upsample 1000 -> 2000 samples",
+      "output_summary": "upsampled 1000->2000, energy ratio=1.000",
+      "duration_ns": 5255917,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "resample_downsample",
+      "action": "resample(signal, 500)",
+      "input_summary": "downsample 1000 -> 500 samples",
+      "output_summary": "downsampled 1000->500, energy ratio=1.000",
+      "duration_ns": 1739846,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "resample",
+    "signal_length": 1000,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 7046370,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_20_resample --nocapture"
+  }
+}

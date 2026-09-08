@@ -1,0 +1,33 @@
+{
+  "scenario_id": "scenario_13_large_linkage",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "linkage_200x5",
+      "action": "linkage(data, Ward)",
+      "input_summary": "200 points, 5 dims",
+      "output_summary": "time=35.153379ms, 199 merges",
+      "duration_ns": 35170642,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "linkage",
+    "n_samples": 200,
+    "n_features": 5,
+    "n_clusters": 10
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 35825512,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_13_large_linkage --nocapture"
+  }
+}

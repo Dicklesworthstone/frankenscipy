@@ -1,0 +1,198 @@
+{
+  "packet_id": "FSCI-P2C-002",
+  "all_gates_pass": true,
+  "gates": [
+    {
+      "fixture_id": "diag_dominant_4x4",
+      "operation": "solve",
+      "pass": true,
+      "max_abs_diff": 8.881784197001252e-16,
+      "max_rel_diff": 2.9605947323337506e-16,
+      "tolerance_used": 1e-10,
+      "matrix_dims": [
+        4,
+        4
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_16x16",
+      "operation": "solve",
+      "pass": true,
+      "max_abs_diff": 3.552713678800501e-15,
+      "max_rel_diff": 3.9474596431116675e-16,
+      "tolerance_used": 1e-10,
+      "matrix_dims": [
+        16,
+        16
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_64x64",
+      "operation": "solve",
+      "pass": true,
+      "max_abs_diff": 4.973799150320701e-14,
+      "max_rel_diff": 1.1842378929335002e-15,
+      "tolerance_used": 1e-10,
+      "matrix_dims": [
+        64,
+        64
+      ]
+    },
+    {
+      "fixture_id": "upper_tri_4x4",
+      "operation": "solve_triangular",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "tolerance_used": 1e-10,
+      "matrix_dims": [
+        4,
+        4
+      ]
+    },
+    {
+      "fixture_id": "upper_tri_16x16",
+      "operation": "solve_triangular",
+      "pass": true,
+      "max_abs_diff": 3.552713678800501e-15,
+      "max_rel_diff": 3.552713678800501e-16,
+      "tolerance_used": 1e-10,
+      "matrix_dims": [
+        16,
+        16
+      ]
+    },
+    {
+      "fixture_id": "tridiag_banded_16x16",
+      "operation": "solve_banded",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "max_rel_diff": 0.0,
+      "tolerance_used": 1e-10,
+      "matrix_dims": [
+        16,
+        16
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_4x4",
+      "operation": "inv",
+      "pass": true,
+      "max_abs_diff": 1.235990476633475e-17,
+      "max_rel_diff": 1.235990476633475e-17,
+      "tolerance_used": 1e-8,
+      "matrix_dims": [
+        4,
+        4
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_16x16",
+      "operation": "inv",
+      "pass": true,
+      "max_abs_diff": 5.551115123125783e-16,
+      "max_rel_diff": 5.551115123125783e-16,
+      "tolerance_used": 1e-8,
+      "matrix_dims": [
+        16,
+        16
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_64x64",
+      "operation": "inv",
+      "pass": true,
+      "max_abs_diff": 1.5543122344752192e-15,
+      "max_rel_diff": 1.5543122344752192e-15,
+      "tolerance_used": 1e-8,
+      "matrix_dims": [
+        64,
+        64
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_4x4",
+      "operation": "det",
+      "pass": true,
+      "max_abs_diff": 4.440892098500626e-16,
+      "max_rel_diff": 4.440892098500626e-16,
+      "tolerance_used": 1e-6,
+      "matrix_dims": [
+        4,
+        4
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_16x16",
+      "operation": "det",
+      "pass": true,
+      "max_abs_diff": 8.881784197001252e-16,
+      "max_rel_diff": 8.881784197001252e-16,
+      "tolerance_used": 1e-6,
+      "matrix_dims": [
+        16,
+        16
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_64x64",
+      "operation": "det",
+      "pass": true,
+      "max_abs_diff": 5.10702591327572e-15,
+      "max_rel_diff": 5.10702591327572e-15,
+      "tolerance_used": 1e-6,
+      "matrix_dims": [
+        64,
+        64
+      ]
+    },
+    {
+      "fixture_id": "overdetermined_32x16",
+      "operation": "lstsq",
+      "pass": true,
+      "max_abs_diff": 1.0800249583553523e-12,
+      "max_rel_diff": 0.0,
+      "tolerance_used": 1e-6,
+      "matrix_dims": [
+        32,
+        16
+      ]
+    },
+    {
+      "fixture_id": "overdetermined_128x64",
+      "operation": "lstsq",
+      "pass": true,
+      "max_abs_diff": 5.093170329928398e-11,
+      "max_rel_diff": 0.0,
+      "tolerance_used": 1e-6,
+      "matrix_dims": [
+        128,
+        64
+      ]
+    },
+    {
+      "fixture_id": "overdetermined_32x16",
+      "operation": "pinv",
+      "pass": true,
+      "max_abs_diff": 2.220446049250313e-16,
+      "max_rel_diff": 3.4955719930645315e-15,
+      "tolerance_used": 1e-8,
+      "matrix_dims": [
+        32,
+        16
+      ]
+    },
+    {
+      "fixture_id": "overdetermined_128x64",
+      "operation": "pinv",
+      "pass": true,
+      "max_abs_diff": 4.996003610813204e-16,
+      "max_rel_diff": 2.1360264316070146e-15,
+      "tolerance_used": 1e-8,
+      "matrix_dims": [
+        128,
+        64
+      ]
+    }
+  ]
+}

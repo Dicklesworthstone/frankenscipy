@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_10_kdtree_vs_bruteforce",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "1nn_consistency",
+      "action": "kdtree.query vs brute force",
+      "input_summary": "10 queries on 50 points",
+      "output_summary": "all 10 queries matched",
+      "duration_ns": 139515,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "knn_consistency",
+      "action": "kdtree.query_k vs brute force",
+      "input_summary": "k=5 for each query",
+      "output_summary": "all k-NN queries matched",
+      "duration_ns": 412591,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "ball_query_consistency",
+      "action": "kdtree.query_ball_point vs brute force",
+      "input_summary": "radius=3.0 for each query",
+      "output_summary": "all ball queries matched",
+      "duration_ns": 143161,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "spatial_metadata": {
+    "operation": "consistency",
+    "n_points": 50,
+    "n_dims": 3,
+    "metric": "euclidean"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 866241,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_spatial -- scenario_10_kdtree_vs_bruteforce --nocapture"
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_13_high_dim_regular_grid",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_3d_grid",
+      "action": "RegularGridInterpolator::new(10x10x10)",
+      "input_summary": "3D trilinear",
+      "output_summary": "created in 13.886µs",
+      "duration_ns": 17242,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "eval_3d_interior",
+      "action": "evaluate at interior points",
+      "input_summary": "100 random evaluations",
+      "output_summary": "100 evals in 175.502µs",
+      "duration_ns": 184740,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "RegularGridInterpolator-3D",
+    "num_points": 1000,
+    "dimensions": 3,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 229985,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_13_high_dim_regular_grid --nocapture"
+  }
+}

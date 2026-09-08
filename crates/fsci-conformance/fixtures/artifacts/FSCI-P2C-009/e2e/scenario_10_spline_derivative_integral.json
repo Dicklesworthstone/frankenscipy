@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_10_spline_derivative_integral",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "derivative_accuracy",
+      "action": "spline.derivative(1).eval(t) vs cos(t)",
+      "input_summary": "first derivative",
+      "output_summary": "max_derivative_error=0.0001",
+      "duration_ns": 9408,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "integral_accuracy",
+      "action": "spline.integrate(0, PI) vs 2.0",
+      "input_summary": "integral of sin from 0 to PI",
+      "output_summary": "integral=1.999972, expected=2, err=0.0000",
+      "duration_ns": 2725,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "CubicSpline-derivative",
+    "num_points": 20,
+    "dimensions": 1,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 37701,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_10_spline_derivative_integral --nocapture"
+  }
+}

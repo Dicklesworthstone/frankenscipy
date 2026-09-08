@@ -1,0 +1,124 @@
+{
+  "test_id": "metamorphic_stats_perm_bootstrap_mean",
+  "case_count": 19,
+  "pass_count": 19,
+  "pass": true,
+  "timestamp_ms": 1780777424285,
+  "duration_ns": 52973327,
+  "cases": [
+    {
+      "case_id": "perm_identical_n10",
+      "invariant": "pvalue_in_floor_1_range",
+      "detail": "pval=1, floor=0.0004997501249375312",
+      "pass": true
+    },
+    {
+      "case_id": "perm_identical_n10",
+      "invariant": "identical_samples_pvalue_near_1",
+      "detail": "pval=1",
+      "pass": true
+    },
+    {
+      "case_id": "perm_identical_n10",
+      "invariant": "deterministic_same_seed",
+      "detail": "stat=(0, 0), pval=(1, 1)",
+      "pass": true
+    },
+    {
+      "case_id": "perm_separated_n10",
+      "invariant": "pvalue_in_floor_1_range",
+      "detail": "pval=0.0004997501249375312, floor=0.0004997501249375312",
+      "pass": true
+    },
+    {
+      "case_id": "perm_separated_n10",
+      "invariant": "well_separated_pvalue_at_floor",
+      "detail": "pval=0.0004997501249375312, floor=0.0004997501249375312",
+      "pass": true
+    },
+    {
+      "case_id": "perm_separated_n10",
+      "invariant": "deterministic_same_seed",
+      "detail": "stat=(-100, -100), pval=(0.0004997501249375312, 0.0004997501249375312)",
+      "pass": true
+    },
+    {
+      "case_id": "perm_mild_shift_n12",
+      "invariant": "pvalue_in_floor_1_range",
+      "detail": "pval=0.21039480259870064, floor=0.0004997501249375312",
+      "pass": true
+    },
+    {
+      "case_id": "perm_mild_shift_n12",
+      "invariant": "deterministic_same_seed",
+      "detail": "stat=(-2, -2), pval=(0.21039480259870064, 0.21039480259870064)",
+      "pass": true
+    },
+    {
+      "case_id": "perm_edge_empty",
+      "invariant": "perm_empty_input_returns_nan",
+      "detail": "stat=NaN, pval=NaN",
+      "pass": true
+    },
+    {
+      "case_id": "boot_compact_n10",
+      "invariant": "lo_le_hi",
+      "detail": "lo=3.7, hi=7.2",
+      "pass": true
+    },
+    {
+      "case_id": "boot_compact_n10",
+      "invariant": "covers_empirical_mean",
+      "detail": "lo=3.7, mean=5.5, hi=7.2",
+      "pass": true
+    },
+    {
+      "case_id": "boot_compact_n10",
+      "invariant": "deterministic_same_seed",
+      "detail": "first=(3.7, 7.2), second=(3.7, 7.2)",
+      "pass": true
+    },
+    {
+      "case_id": "boot_compact_n10",
+      "invariant": "confidence_widens_interval",
+      "detail": "w80=2.3, w95=3.5, w99=4.5",
+      "pass": true
+    },
+    {
+      "case_id": "boot_spread_n20",
+      "invariant": "lo_le_hi",
+      "detail": "lo=10.375951296129179, hi=13.946178013399086",
+      "pass": true
+    },
+    {
+      "case_id": "boot_spread_n20",
+      "invariant": "covers_empirical_mean",
+      "detail": "lo=10.375951296129179, mean=12.333195562283962, hi=13.946178013399086",
+      "pass": true
+    },
+    {
+      "case_id": "boot_spread_n20",
+      "invariant": "deterministic_same_seed",
+      "detail": "first=(10.375951296129179, 13.946178013399086), second=(10.375951296129179, 13.946178013399086)",
+      "pass": true
+    },
+    {
+      "case_id": "boot_spread_n20",
+      "invariant": "confidence_widens_interval",
+      "detail": "w80=2.285050105741682, w95=3.5702267172699074, w99=4.753858502619346",
+      "pass": true
+    },
+    {
+      "case_id": "boot_edge_single_point",
+      "invariant": "boot_n_lt_2_returns_nan",
+      "detail": "lo=NaN, hi=NaN",
+      "pass": true
+    },
+    {
+      "case_id": "boot_edge_zero_bootstrap",
+      "invariant": "boot_zero_iterations_returns_nan",
+      "detail": "lo=NaN, hi=NaN",
+      "pass": true
+    }
+  ]
+}

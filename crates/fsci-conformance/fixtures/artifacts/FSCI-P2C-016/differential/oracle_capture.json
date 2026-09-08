@@ -1,0 +1,665 @@
+{
+  "packet_id": "FSCI-P2C-016",
+  "family": "constants_core",
+  "generated_unix_ms": 1788666502058,
+  "runtime": {
+    "python_version": "3.13.12",
+    "numpy_version": "2.4.3",
+    "scipy_version": "1.17.1"
+  },
+  "provenance": {
+    "fixture_input_blake3": "6c5f24182f676609eca4d2ccb2496566f0c2e4e5177ed27932c3b29733679158",
+    "oracle_output_blake3": "a1522641d5586b4a92a60b657421f6cef1c2588575738ed765e2b6513d652c78",
+    "capture_blake3": "9d0e720dc4bd20bf45954bd63065d4bb529983b3198e6f51296df0a5e824c061"
+  },
+  "case_outputs": [
+    {
+      "case_id": "speed_of_light_exact",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 299792458.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "planck_exact",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 6.62607015e-34
+      },
+      "error": null
+    },
+    {
+      "case_id": "hbar_derived",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.0545718176461563e-34
+      },
+      "error": null
+    },
+    {
+      "case_id": "elementary_charge_exact",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.6021766340000001e-19
+      },
+      "error": null
+    },
+    {
+      "case_id": "boltzmann_exact",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.380649e-23
+      },
+      "error": null
+    },
+    {
+      "case_id": "avogadro_exact",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 6.02214076e+23
+      },
+      "error": null
+    },
+    {
+      "case_id": "degree_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.017453292519943295
+      },
+      "error": null
+    },
+    {
+      "case_id": "atmosphere_exact",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 101325.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "calorie_exact",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 4.184
+      },
+      "error": null
+    },
+    {
+      "case_id": "pound_mass_exact",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.45359237
+      },
+      "error": null
+    },
+    {
+      "case_id": "inch_exact",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.0254
+      },
+      "error": null
+    },
+    {
+      "case_id": "celsius_to_kelvin_freezing",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 273.15
+      },
+      "error": null
+    },
+    {
+      "case_id": "fahrenheit_to_celsius_boiling",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 100.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "kelvin_to_rankine_roundtrip",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 540.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "convert_temperature_unknown_scale",
+      "status": "ok",
+      "result_kind": "error",
+      "result": {
+        "error": "unsupported temperature scale"
+      },
+      "error": null
+    },
+    {
+      "case_id": "ev_to_joules_unit",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.6021766340000001e-19
+      },
+      "error": null
+    },
+    {
+      "case_id": "joules_to_ev_roundtrip",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "wavelength_to_freq_visible",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 599584916000000.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "freq_to_wavelength_inverse",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 5e-7
+      },
+      "error": null
+    },
+    {
+      "case_id": "deg2rad_half_turn",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3.141592653589793
+      },
+      "error": null
+    },
+    {
+      "case_id": "rad2deg_quarter_turn",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 90.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "lb_to_kg_unit",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.45359237
+      },
+      "error": null
+    },
+    {
+      "case_id": "kg_to_lb_roundtrip",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.0000000000000002
+      },
+      "error": null
+    },
+    {
+      "case_id": "constant_value_unknown",
+      "status": "ok",
+      "result_kind": "error",
+      "result": {
+        "error": "unknown constant"
+      },
+      "error": null
+    },
+    {
+      "case_id": "faraday_constant",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 96485.33212331
+      },
+      "error": null
+    },
+    {
+      "case_id": "electron_g_factor",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": -2.00231930436092
+      },
+      "error": null
+    },
+    {
+      "case_id": "proton_g_factor",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 5.5856946893
+      },
+      "error": null
+    },
+    {
+      "case_id": "neutron_g_factor",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": -3.82608552
+      },
+      "error": null
+    },
+    {
+      "case_id": "muon_g_factor",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": -2.00233184123
+      },
+      "error": null
+    },
+    {
+      "case_id": "thomson_cross_section",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 6.6524587051e-29
+      },
+      "error": null
+    },
+    {
+      "case_id": "characteristic_impedance_of_vacuum",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 376.730313412
+      },
+      "error": null
+    },
+    {
+      "case_id": "deuteron_mass",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3.3435837768e-27
+      },
+      "error": null
+    },
+    {
+      "case_id": "alpha_particle_mass",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 6.644657345e-27
+      },
+      "error": null
+    },
+    {
+      "case_id": "muon_mass",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.883531627e-28
+      },
+      "error": null
+    },
+    {
+      "case_id": "tau_mass",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3.16754e-27
+      },
+      "error": null
+    },
+    {
+      "case_id": "helion_mass",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 5.0064127862e-27
+      },
+      "error": null
+    },
+    {
+      "case_id": "triton_mass",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 5.0073567512000005e-27
+      },
+      "error": null
+    },
+    {
+      "case_id": "molar_volume_ideal_gas",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.022413969545014137
+      },
+      "error": null
+    },
+    {
+      "case_id": "molar_planck_constant",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3.9903127128934306e-10
+      },
+      "error": null
+    },
+    {
+      "case_id": "rydberg_constant_times_c_in_hz",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3289841960250000.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "inverse_fine_structure_constant",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 137.035999177
+      },
+      "error": null
+    },
+    {
+      "case_id": "first_radiation_constant",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3.7417718521927573e-16
+      },
+      "error": null
+    },
+    {
+      "case_id": "second_radiation_constant",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.014387768775039335
+      },
+      "error": null
+    },
+    {
+      "case_id": "electron_proton_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.0005446170214889
+      },
+      "error": null
+    },
+    {
+      "case_id": "proton_electron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1836.152673426
+      },
+      "error": null
+    },
+    {
+      "case_id": "bohr_magneton_in_ev_per_t",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.000057883817982
+      },
+      "error": null
+    },
+    {
+      "case_id": "compton_wavelength",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 2.42631023538e-12
+      },
+      "error": null
+    },
+    {
+      "case_id": "electron_mass_energy_mev",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.51099895069
+      },
+      "error": null
+    },
+    {
+      "case_id": "proton_mass_energy_mev",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 938.27208943
+      },
+      "error": null
+    },
+    {
+      "case_id": "neutron_mass_energy_mev",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 939.56542194
+      },
+      "error": null
+    },
+    {
+      "case_id": "muon_mass_energy_mev",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 105.6583755
+      },
+      "error": null
+    },
+    {
+      "case_id": "tau_mass_energy_mev",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1776.82
+      },
+      "error": null
+    },
+    {
+      "case_id": "deuteron_mass_energy_mev",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1875.612945
+      },
+      "error": null
+    },
+    {
+      "case_id": "alpha_particle_mass_energy_mev",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3727.3794118
+      },
+      "error": null
+    },
+    {
+      "case_id": "helion_mass_energy_mev",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 2808.39161112
+      },
+      "error": null
+    },
+    {
+      "case_id": "triton_mass_energy_mev",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 2808.92113668
+      },
+      "error": null
+    },
+    {
+      "case_id": "proton_compton_wavelength",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.3214098535999998e-15
+      },
+      "error": null
+    },
+    {
+      "case_id": "neutron_compton_wavelength",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.31959090382e-15
+      },
+      "error": null
+    },
+    {
+      "case_id": "muon_compton_wavelength",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.17344411e-14
+      },
+      "error": null
+    },
+    {
+      "case_id": "tau_compton_wavelength",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 6.97771e-16
+      },
+      "error": null
+    },
+    {
+      "case_id": "neutron_electron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1838.683662
+      },
+      "error": null
+    },
+    {
+      "case_id": "electron_neutron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.00054386734416
+      },
+      "error": null
+    },
+    {
+      "case_id": "muon_electron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 206.7682827
+      },
+      "error": null
+    },
+    {
+      "case_id": "electron_muon_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.0048363317
+      },
+      "error": null
+    },
+    {
+      "case_id": "proton_neutron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.99862347797
+      },
+      "error": null
+    },
+    {
+      "case_id": "neutron_proton_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.00137841946
+      },
+      "error": null
+    },
+    {
+      "case_id": "deuteron_electron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3670.482967655
+      },
+      "error": null
+    },
+    {
+      "case_id": "alpha_particle_electron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 7294.29954171
+      },
+      "error": null
+    },
+    {
+      "case_id": "helion_electron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 5495.88527984
+      },
+      "error": null
+    },
+    {
+      "case_id": "triton_electron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 5496.92153551
+      },
+      "error": null
+    },
+    {
+      "case_id": "tau_electron_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3477.23
+      },
+      "error": null
+    },
+    {
+      "case_id": "electron_tau_mass_ratio",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.000287585
+      },
+      "error": null
+    }
+  ]
+}

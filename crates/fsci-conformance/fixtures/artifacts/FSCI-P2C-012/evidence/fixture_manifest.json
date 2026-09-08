@@ -1,0 +1,646 @@
+{
+  "packet_id": "FSCI-P2C-012",
+  "family": "stats_core",
+  "generated_at": "unix:1779662447",
+  "fixtures": [
+    {
+      "fixture_id": "describe_8pt",
+      "category": "differential",
+      "function": "describe",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::describe",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "skew_asymmetric",
+      "category": "differential",
+      "function": "skew",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::skew (bias=True)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "kurtosis_uniform",
+      "category": "differential",
+      "function": "kurtosis",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::kurtosis (Fisher=True, bias=True)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "pearsonr_linear",
+      "category": "differential",
+      "function": "pearsonr",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::pearsonr",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "pearsonr_negative",
+      "category": "differential",
+      "function": "pearsonr",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::pearsonr",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "spearmanr_monotonic",
+      "category": "differential",
+      "function": "spearmanr",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::spearmanr",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "linregress_perfect",
+      "category": "differential",
+      "function": "linregress",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::linregress",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "linregress_noisy",
+      "category": "differential",
+      "function": "linregress",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::linregress",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "ttest_1samp_zero",
+      "category": "differential",
+      "function": "ttest_1samp",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::ttest_1samp",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "ttest_1samp_shifted",
+      "category": "differential",
+      "function": "ttest_1samp",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::ttest_1samp",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "ks_2samp_same",
+      "category": "differential",
+      "function": "ks_2samp",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::ks_2samp",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "ks_2samp_different",
+      "category": "differential",
+      "function": "ks_2samp",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::ks_2samp",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "zscore_5pt",
+      "category": "differential",
+      "function": "zscore",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::zscore (ddof=0)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "sem_5pt",
+      "category": "differential",
+      "function": "sem",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::sem (ddof=1)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "iqr_8pt",
+      "category": "differential",
+      "function": "iqr",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::iqr",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "moment_k2",
+      "category": "differential",
+      "function": "moment",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::moment (central moment)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "moment_k3",
+      "category": "differential",
+      "function": "moment",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::moment (central moment)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "variation_5pt",
+      "category": "differential",
+      "function": "variation",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::variation (ddof=0)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "entropy_uniform",
+      "category": "differential",
+      "function": "entropy",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::entropy (base=e)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "shapiro_normal",
+      "category": "differential",
+      "function": "shapiro",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::shapiro",
+      "atol": 1e-6,
+      "rtol": 1e-6
+    },
+    {
+      "fixture_id": "skew_symmetric",
+      "category": "differential",
+      "function": "skew",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::skew (bias=True)",
+      "atol": 1e-12,
+      "rtol": 1e-12
+    },
+    {
+      "fixture_id": "kurtosis_peaked",
+      "category": "differential",
+      "function": "kurtosis",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::kurtosis (Fisher=True, bias=True)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "pearsonr_uncorrelated",
+      "category": "differential",
+      "function": "pearsonr",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::pearsonr",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "linregress_negative_slope",
+      "category": "differential",
+      "function": "linregress",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::linregress",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "iqr_small_4pt",
+      "category": "differential",
+      "function": "iqr",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::iqr",
+      "atol": 1e-12,
+      "rtol": 1e-12
+    },
+    {
+      "fixture_id": "moment_k4",
+      "category": "differential",
+      "function": "moment",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::moment (central moment)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "entropy_concentrated",
+      "category": "differential",
+      "function": "entropy",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::entropy (base=e)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "variation_high_mean",
+      "category": "differential",
+      "function": "variation",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::variation (ddof=0)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "sem_10pt",
+      "category": "differential",
+      "function": "sem",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::sem (ddof=1)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "describe_3pt",
+      "category": "differential",
+      "function": "describe",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::describe",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "hardened_describe_8pt",
+      "category": "hardened",
+      "function": "describe",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::describe",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "hardened_skew_asymmetric",
+      "category": "hardened",
+      "function": "skew",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::skew (bias=True)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "hardened_kurtosis_uniform",
+      "category": "hardened",
+      "function": "kurtosis",
+      "argument_count": 1,
+      "contract_ref": "fsci_stats::kurtosis (Fisher=True, bias=True)",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "hardened_pearsonr_linear",
+      "category": "hardened",
+      "function": "pearsonr",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::pearsonr",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "hardened_pearsonr_negative",
+      "category": "hardened",
+      "function": "pearsonr",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::pearsonr",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "ttest_ind_shifted_groups",
+      "category": "hypothesis_test",
+      "function": "ttest_ind",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::ttest_ind",
+      "atol": 1e-9,
+      "rtol": 1e-7
+    },
+    {
+      "fixture_id": "ttest_ind_identical_groups",
+      "category": "hypothesis_test",
+      "function": "ttest_ind",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::ttest_ind",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "mannwhitneyu_shifted_groups",
+      "category": "hypothesis_test",
+      "function": "mannwhitneyu",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::mannwhitneyu",
+      "atol": 1e-9,
+      "rtol": 1e-7
+    },
+    {
+      "fixture_id": "br_4nkk_cauchy_pdf_0_at_origin",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_4nkk_cauchy_pdf_at_scale",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_4nkk_cauchy_cdf_at_origin",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_4nkk_cauchy_cdf_at_scale",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_4nkk_cauchy_ppf_quartile",
+      "category": "distribution",
+      "function": "distribution_ppf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_ppf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_a6qx_chi2_pdf",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-9,
+      "rtol": 1e-7
+    },
+    {
+      "fixture_id": "br_a6qx_chi2_cdf",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-9,
+      "rtol": 1e-7
+    },
+    {
+      "fixture_id": "br_a6qx_chi2_ppf",
+      "category": "distribution",
+      "function": "distribution_ppf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_ppf",
+      "atol": 1e-7,
+      "rtol": 1e-6
+    },
+    {
+      "fixture_id": "br_a6qx_lognorm_pdf",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_a6qx_lognorm_cdf",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_a6qx_lognorm_ppf",
+      "category": "distribution",
+      "function": "distribution_ppf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_ppf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_a6qx_gamma_pdf",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_a6qx_gamma_cdf",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-9,
+      "rtol": 1e-7
+    },
+    {
+      "fixture_id": "br_a6qx_gamma_ppf",
+      "category": "distribution",
+      "function": "distribution_ppf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_ppf",
+      "atol": 1e-7,
+      "rtol": 1e-6
+    },
+    {
+      "fixture_id": "br_5sra_beta_pdf",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_5sra_beta_cdf",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_5sra_pareto_pdf",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_5sra_pareto_cdf",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_5sra_rayleigh_pdf",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_5sra_rayleigh_cdf",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_5sra_logistic_pdf_origin",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_5sra_logistic_cdf_origin",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_5sra_laplace_pdf_origin",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_5sra_laplace_cdf_origin",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-12,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_a6qx_fdist_pdf",
+      "category": "distribution",
+      "function": "distribution_pdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_pdf",
+      "atol": 1e-9,
+      "rtol": 1e-7
+    },
+    {
+      "fixture_id": "br_a6qx_fdist_cdf",
+      "category": "distribution",
+      "function": "distribution_cdf",
+      "argument_count": 3,
+      "contract_ref": "fsci_stats::distribution_cdf",
+      "atol": 1e-9,
+      "rtol": 1e-7
+    },
+    {
+      "fixture_id": "br_hx5t_kendalltau_perfect_concordance_n8",
+      "category": "differential",
+      "function": "kendalltau",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::kendalltau",
+      "atol": 1e-10,
+      "rtol": 1e-7
+    },
+    {
+      "fixture_id": "br_hx5t_kendalltau_perfect_discordance_n8",
+      "category": "differential",
+      "function": "kendalltau",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::kendalltau",
+      "atol": 1e-10,
+      "rtol": 1e-7
+    },
+    {
+      "fixture_id": "br_hx5t_kendalltau_n12_alternating_swaps",
+      "category": "differential",
+      "function": "kendalltau",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::kendalltau",
+      "atol": 1e-9,
+      "rtol": 1e-6
+    },
+    {
+      "fixture_id": "br_hx5t_kendalltau_shuffled_n15_exact",
+      "category": "differential",
+      "function": "kendalltau",
+      "argument_count": 2,
+      "contract_ref": "fsci_stats::kendalltau",
+      "atol": 1e-9,
+      "rtol": 1e-6
+    },
+    {
+      "fixture_id": "br_7vhu_bootstrap_mean_symmetric_5pt",
+      "category": "differential",
+      "function": "bootstrap_mean",
+      "argument_count": 4,
+      "contract_ref": "fsci_stats::bootstrap_mean",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_7vhu_bootstrap_mean_asymmetric_8pt",
+      "category": "differential",
+      "function": "bootstrap_mean",
+      "argument_count": 4,
+      "contract_ref": "fsci_stats::bootstrap_mean",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    },
+    {
+      "fixture_id": "br_7vhu_bootstrap_mean_spread_15pt",
+      "category": "differential",
+      "function": "bootstrap_mean",
+      "argument_count": 4,
+      "contract_ref": "fsci_stats::bootstrap_mean",
+      "atol": 1e-10,
+      "rtol": 1e-10
+    }
+  ]
+}

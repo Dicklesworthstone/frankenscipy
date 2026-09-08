@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_04_clustering_metrics",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "silhouette_score",
+      "action": "silhouette_score(data, labels)",
+      "input_summary": "measure cluster cohesion",
+      "output_summary": "silhouette=0.9636 (good separation)",
+      "duration_ns": 652867,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "calinski_harabasz",
+      "action": "calinski_harabasz_score(data, labels)",
+      "input_summary": "variance ratio criterion",
+      "output_summary": "calinski_harabasz=23484.5692",
+      "duration_ns": 53632,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "davies_bouldin",
+      "action": "davies_bouldin_score(data, labels)",
+      "input_summary": "cluster similarity measure",
+      "output_summary": "davies_bouldin=0.0553",
+      "duration_ns": 48972,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "metrics",
+    "n_samples": 60,
+    "n_features": 2,
+    "n_clusters": 3
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 779276,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_04_clustering_metrics --nocapture"
+  }
+}

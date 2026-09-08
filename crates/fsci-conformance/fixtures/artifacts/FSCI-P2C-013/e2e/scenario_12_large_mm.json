@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_12_large_mm",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "write_large_mm",
+      "action": "mmwrite(500, 500, data)",
+      "input_summary": "250K elements",
+      "output_summary": "wrote 4908792 bytes in 50.638196ms",
+      "duration_ns": 51010240,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "read_large_mm",
+      "action": "mmread(large_content)",
+      "input_summary": "parse 250K elements",
+      "output_summary": "read 500x500 in 67.667318ms",
+      "duration_ns": 116861528,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "Matrix Market",
+    "operation": "large",
+    "size_bytes": 2000000
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 174795055,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_12_large_mm --nocapture"
+  }
+}

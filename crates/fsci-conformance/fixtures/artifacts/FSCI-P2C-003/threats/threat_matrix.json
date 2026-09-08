@@ -1,0 +1,115 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-003",
+  "scope": "packet",
+  "generated_at": "2026-03-13T04:00:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.14.0",
+        "description": "CG method uses Polak-Ribiere+ formula; SciPy uses Fletcher-Reeves by default in older versions.",
+        "affected_functions": ["minimize(method='CG')"]
+      },
+      {
+        "version": "1.12.0",
+        "description": "Ridder method available as root_scalar(method='ridder'); same convergence contract as brentq for smooth functions.",
+        "affected_functions": ["root_scalar"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-OPT-001",
+      "subsystem": "fsci-opt/minimize",
+      "category": "numerical_instability",
+      "severity": "critical",
+      "likelihood": "likely",
+      "description": "BFGS gradient finite-difference approximation can produce catastrophic cancellation on ill-conditioned objectives near machine epsilon, leading to Hessian approximation corruption and divergent search directions.",
+      "mitigation": "Detect non-finite gradient estimates and terminate with NanEncountered status. In hardened mode, reject immediately with diagnostic message.",
+      "test_reference": "FSCI-P2C-003_optimize_core.json::adv_minimize_nan_hardened",
+      "strict_mode_response": "Report NanEncountered convergence status with non-finite context in message.",
+      "hardened_mode_response": "Immediate rejection with 'hardened mode rejects non-finite objective values' message.",
+      "required_artifact": "P2C-003/threats/nan_gradient_corruption.report.json"
+    },
+    {
+      "threat_id": "THREAT-OPT-002",
+      "subsystem": "fsci-opt/minimize",
+      "category": "resource_exhaustion",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Flat or near-flat objective landscapes (e.g., quartic near origin) can cause BFGS/CG to consume function evaluation budget without meaningful progress, effectively creating a compute denial-of-service.",
+      "mitigation": "Enforce strict maxfev budget. Terminate with MaxEvaluations status when budget is exhausted regardless of gradient state.",
+      "test_reference": "FSCI-P2C-003_optimize_core.json::adv_minimize_maxfev",
+      "strict_mode_response": "Terminate and report MaxEvaluations with evaluation count in message.",
+      "hardened_mode_response": "Same as strict; budget enforcement is unconditional.",
+      "required_artifact": "P2C-003/threats/function_eval_exhaustion.report.json"
+    },
+    {
+      "threat_id": "THREAT-OPT-003",
+      "subsystem": "fsci-opt/root",
+      "category": "input_validation",
+      "severity": "high",
+      "likelihood": "moderate",
+      "description": "Bracket endpoints that do not satisfy the sign-change invariant (f(a)*f(b) < 0) will cause bracketing methods to silently compute incorrect results or enter infinite loops if not validated upfront.",
+      "mitigation": "Validate bracket sign change before entering iteration loop. Return immediate error with diagnostic message.",
+      "test_reference": "FSCI-P2C-003_optimize_core.json::adv_root_sign_change_violation",
+      "strict_mode_response": "Error: 'bracketing methods require f(a) and f(b) to have opposite signs'.",
+      "hardened_mode_response": "Same error with additional context about hardened rejection policy.",
+      "required_artifact": "P2C-003/threats/bracket_sign_violation.report.json"
+    },
+    {
+      "threat_id": "THREAT-OPT-004",
+      "subsystem": "fsci-opt/root",
+      "category": "numerical_instability",
+      "severity": "critical",
+      "likelihood": "moderate",
+      "description": "Root functions that return NaN or Inf at evaluation points corrupt the bracketing interval state, potentially causing the algorithm to converge to a non-root or diverge.",
+      "mitigation": "Check every function evaluation for finiteness. In strict mode, return error immediately. In hardened mode, reject with explicit policy message.",
+      "test_reference": "FSCI-P2C-003_optimize_core.json::adv_root_nan_strict, adv_root_nan_hardened",
+      "strict_mode_response": "Error: 'root function returned non-finite value'.",
+      "hardened_mode_response": "Error: 'hardened mode rejects non-finite function values'.",
+      "required_artifact": "P2C-003/threats/root_nonfinite_corruption.report.json"
+    },
+    {
+      "threat_id": "THREAT-OPT-005",
+      "subsystem": "fsci-opt/root",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "moderate",
+      "description": "Extremely tight tolerance requirements (e.g., xtol=1e-18) with low maxiter budgets will prevent convergence, potentially leaving the user with an interval that does not contain the root to desired precision.",
+      "mitigation": "Track convergence status explicitly. Return MaxIterations status with the best estimate when budget is exhausted, so callers can distinguish budget exhaustion from other failures.",
+      "test_reference": "FSCI-P2C-003_optimize_core.json::adv_root_maxiter_budget",
+      "strict_mode_response": "Return unconverged result with MaxIterations status and iteration count.",
+      "hardened_mode_response": "Same behavior; budget enforcement is unconditional.",
+      "required_artifact": "P2C-003/threats/root_maxiter_exhaustion.report.json"
+    },
+    {
+      "threat_id": "THREAT-OPT-006",
+      "subsystem": "fsci-opt/minimize",
+      "category": "input_validation",
+      "severity": "high",
+      "likelihood": "moderate",
+      "description": "Empty or zero-length x0 vectors bypass dimension-dependent default parameter calculations (maxiter, maxfev), and can cause division by zero or index-out-of-bounds in algorithm internals.",
+      "mitigation": "Validate x0 non-emptiness and finiteness before entering any optimization algorithm.",
+      "test_reference": "FSCI-P2C-003_optimize_core.json::adv_minimize_empty_x0",
+      "strict_mode_response": "Error: 'x0 must be a finite 1-D vector with at least one element'.",
+      "hardened_mode_response": "Same error; input validation is unconditional.",
+      "required_artifact": "P2C-003/threats/empty_x0_validation.report.json"
+    },
+    {
+      "threat_id": "THREAT-OPT-007",
+      "subsystem": "fsci-opt/root",
+      "category": "input_validation",
+      "severity": "medium",
+      "likelihood": "moderate",
+      "description": "Zero or negative xtol values can prevent convergence detection, as the interval width check (|b-a| < xtol) would never be satisfied or always be satisfied.",
+      "mitigation": "Validate xtol > 0 before entering iteration loop.",
+      "test_reference": "FSCI-P2C-003_optimize_core.json::adv_root_invalid_xtol",
+      "strict_mode_response": "Error: 'xtol must be finite and > 0'.",
+      "hardened_mode_response": "Same error; parameter validation is unconditional.",
+      "required_artifact": "P2C-003/threats/invalid_xtol_validation.report.json"
+    }
+  ]
+}

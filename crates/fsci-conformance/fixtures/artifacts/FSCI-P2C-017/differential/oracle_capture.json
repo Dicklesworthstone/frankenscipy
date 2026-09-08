@@ -1,0 +1,165 @@
+{
+  "packet_id": "FSCI-P2C-017",
+  "family": "io_core",
+  "generated_unix_ms": 1777085195782,
+  "runtime": {
+    "python_version": "3.13.7",
+    "numpy_version": "2.4.3",
+    "scipy_version": "1.17.1"
+  },
+  "provenance": {
+    "fixture_input_blake3": "5a0d1ee8d2985b2879f7f47be3ba383403a7e8fd35cae0537a903911a94eaac1",
+    "oracle_output_blake3": "90379493eeaef0dbb61449ab4c3fa0e5c1456af7dcfbf66b2a76860dab9ac6ef",
+    "capture_blake3": "a7710fc2e654f5ac483a7441363db4532815656d3638398af209d6588122f731"
+  },
+  "case_outputs": [
+    {
+      "case_id": "mmread_dense_array_column_major",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "cols": 3,
+        "rows": 2,
+        "values": [
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0,
+          6.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "mmread_symmetric_coordinate_expands",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "cols": 3,
+        "rows": 3,
+        "values": [
+          5.0,
+          3.0,
+          0.0,
+          3.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "mmwrite_dense_roundtrip",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "cols": 2,
+        "rows": 2,
+        "values": [
+          1.0,
+          2.0,
+          3.0,
+          4.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "loadmat_v4_real_double_scipy_bytes",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "cols": 2,
+        "rows": 2,
+        "values": [
+          1.0,
+          2.0,
+          3.0,
+          4.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "savemat_v4_real_double_roundtrip",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "cols": 2,
+        "rows": 2,
+        "values": [
+          1.5,
+          2.5,
+          3.5,
+          4.5
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "loadtxt_comments_and_whitespace",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "cols": 3,
+        "rows": 2,
+        "values": [
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0,
+          6.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "savetxt_space_roundtrip",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "cols": 2,
+        "rows": 2,
+        "values": [
+          1.5,
+          2.5,
+          3.5,
+          4.5
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "wav_write_mono_int16_quantization",
+      "status": "ok",
+      "result_kind": "wav",
+      "result": {
+        "bits_per_sample": 16,
+        "channels": 1,
+        "sample_rate": 44100,
+        "values": [
+          0.0,
+          0.499969482421875,
+          -0.499969482421875,
+          0.999969482421875,
+          -0.999969482421875
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "loadtxt_ragged_rows_reject",
+      "status": "ok",
+      "result_kind": "error",
+      "result": {
+        "error": "columns"
+      },
+      "error": null
+    }
+  ]
+}

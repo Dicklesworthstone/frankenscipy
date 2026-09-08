@@ -1,0 +1,698 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-003",
+  "domain": "optimize",
+  "generated_at": "2026-03-13T04:00:00Z",
+  "contracts": [
+    {
+      "function_name": "fsci_opt::basinhopping",
+      "scipy_equivalent": "scipy.optimize.basinhopping",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 0.01,
+        "default_rtol": 0.01
+      }
+    },
+    {
+      "function_name": "fsci_opt::bfgs",
+      "scipy_equivalent": "scipy.optimize.minimize(method='BFGS')",
+      "inputs": [
+        {
+          "name": "fun",
+          "type_desc": "Fn(&[f64]) -> f64",
+          "required": true,
+          "constraints": "Must return finite f64 values for all finite inputs in the optimization domain."
+        },
+        {
+          "name": "x0",
+          "type_desc": "&[f64]",
+          "required": true,
+          "constraints": "Non-empty, all finite. Minimum length 1."
+        },
+        {
+          "name": "tol",
+          "type_desc": "Option<f64>",
+          "required": false,
+          "constraints": "If provided, must be positive and finite. Controls gradient norm convergence threshold."
+        },
+        {
+          "name": "maxiter",
+          "type_desc": "Option<usize>",
+          "required": false,
+          "constraints": "Positive integer. Defaults to 200 * ndim."
+        },
+        {
+          "name": "maxfev",
+          "type_desc": "Option<usize>",
+          "required": false,
+          "constraints": "Positive integer. Defaults to 200 * ndim * (ndim + 1)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "Vec<f64>",
+          "semantics": "Solution vector at termination."
+        },
+        {
+          "name": "fun",
+          "type_desc": "Option<f64>",
+          "semantics": "Objective value at solution."
+        },
+        {
+          "name": "success",
+          "type_desc": "bool",
+          "semantics": "True if gradient norm fell below tolerance threshold."
+        },
+        {
+          "name": "nfev",
+          "type_desc": "usize",
+          "semantics": "Total function evaluations including gradient finite-difference calls."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "x0 is empty",
+          "error_type": "InvalidArgument",
+          "message_pattern": "x0 must be a finite 1-D vector with at least one element",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "x0 contains NaN or Inf",
+          "error_type": "InvalidArgument",
+          "message_pattern": "x0 must be a finite 1-D vector",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 0.005,
+        "default_rtol": 0.005
+      },
+      "strict_mode_behavior": "Report non-finite objective via NanEncountered status without recovery attempt.",
+      "hardened_mode_behavior": "Reject non-finite objective values immediately with explicit hardened-mode rejection message."
+    },
+    {
+      "function_name": "fsci_opt::brenth",
+      "scipy_equivalent": "scipy.optimize.brenth",
+      "inputs": [
+        {
+          "name": "f",
+          "type_desc": "Fn(f64) -> f64",
+          "required": true,
+          "constraints": "Must return finite f64 for all bracket values."
+        },
+        {
+          "name": "bracket",
+          "type_desc": "(f64, f64)",
+          "required": true,
+          "constraints": "f(a) and f(b) must have opposite signs (bracketing)."
+        },
+        {
+          "name": "options",
+          "type_desc": "RootOptions",
+          "required": false,
+          "constraints": "xtol/rtol must be finite > 0; maxiter positive. currently aliased to brentq pending Harris hyperbolic implementation (frankenscipy-88gz)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "root",
+          "type_desc": "f64",
+          "semantics": "Estimated root."
+        },
+        {
+          "name": "converged",
+          "type_desc": "bool",
+          "semantics": "True on convergence."
+        },
+        {
+          "name": "iterations",
+          "type_desc": "usize",
+          "semantics": "Iteration count."
+        },
+        {
+          "name": "function_calls",
+          "type_desc": "usize",
+          "semantics": "Function evals."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "bracket endpoints non-finite",
+          "error_type": "InvalidBounds",
+          "message_pattern": "bracket endpoints must be finite",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "f(a) and f(b) same sign",
+          "error_type": "BracketError",
+          "message_pattern": "bracketing methods require f(a) and f(b) to have opposite signs",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "absolute",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-08
+      },
+      "strict_mode_behavior": "Reject NaN/Inf function values.",
+      "hardened_mode_behavior": "Reject NaN/Inf + explicit hardened reason."
+    },
+    {
+      "function_name": "fsci_opt::brute",
+      "scipy_equivalent": "scipy.optimize.brute",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-12
+      }
+    },
+    {
+      "function_name": "fsci_opt::cg_pr_plus",
+      "scipy_equivalent": "scipy.optimize.minimize(method='CG')",
+      "inputs": [
+        {
+          "name": "fun",
+          "type_desc": "Fn(&[f64]) -> f64",
+          "required": true,
+          "constraints": "Must return finite f64 values for valid inputs."
+        },
+        {
+          "name": "x0",
+          "type_desc": "&[f64]",
+          "required": true,
+          "constraints": "Non-empty, all finite."
+        },
+        {
+          "name": "tol",
+          "type_desc": "Option<f64>",
+          "required": false,
+          "constraints": "Controls gradient norm convergence threshold."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "Vec<f64>",
+          "semantics": "Solution vector at termination."
+        },
+        {
+          "name": "fun",
+          "type_desc": "Option<f64>",
+          "semantics": "Objective value at solution."
+        },
+        {
+          "name": "success",
+          "type_desc": "bool",
+          "semantics": "True if gradient norm fell below tolerance threshold."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "x0 is empty",
+          "error_type": "InvalidArgument",
+          "message_pattern": "x0 must be a finite 1-D vector with at least one element",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 0.01,
+        "default_rtol": 0.01
+      },
+      "strict_mode_behavior": "Report non-finite objective via NanEncountered status.",
+      "hardened_mode_behavior": "Reject non-finite objective values with hardened-mode rejection message."
+    },
+    {
+      "function_name": "fsci_opt::differential_evolution",
+      "scipy_equivalent": "scipy.optimize.differential_evolution",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 0.25,
+        "default_rtol": 0.25
+      }
+    },
+    {
+      "function_name": "fsci_opt::differential_evolution_constrained",
+      "scipy_equivalent": "scipy.optimize.differential_evolution(func, bounds, constraints=...)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 0.25,
+        "default_rtol": 0.25
+      }
+    },
+    {
+      "function_name": "fsci_opt::dual_annealing",
+      "scipy_equivalent": "scipy.optimize.dual_annealing",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 0.01,
+        "default_rtol": 0.01
+      }
+    },
+    {
+      "function_name": "fsci_opt::powell",
+      "scipy_equivalent": "scipy.optimize.minimize(method='Powell')",
+      "inputs": [
+        {
+          "name": "fun",
+          "type_desc": "Fn(&[f64]) -> f64",
+          "required": true,
+          "constraints": "Must return finite f64 values. Derivative-free method; non-differentiable objectives accepted."
+        },
+        {
+          "name": "x0",
+          "type_desc": "&[f64]",
+          "required": true,
+          "constraints": "Non-empty, all finite."
+        },
+        {
+          "name": "tol",
+          "type_desc": "Option<f64>",
+          "required": false,
+          "constraints": "Controls function-value convergence threshold."
+        },
+        {
+          "name": "maxiter",
+          "type_desc": "Option<usize>",
+          "required": false,
+          "constraints": "Positive integer."
+        },
+        {
+          "name": "maxfev",
+          "type_desc": "Option<usize>",
+          "required": false,
+          "constraints": "Positive integer."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "Vec<f64>",
+          "semantics": "Solution vector at termination."
+        },
+        {
+          "name": "fun",
+          "type_desc": "Option<f64>",
+          "semantics": "Objective value at solution."
+        },
+        {
+          "name": "success",
+          "type_desc": "bool",
+          "semantics": "True if function value change fell below threshold."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "x0 is empty",
+          "error_type": "InvalidArgument",
+          "message_pattern": "x0 must be a finite 1-D vector with at least one element",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 0.01,
+        "default_rtol": 0.01
+      },
+      "strict_mode_behavior": "Report non-finite objective via NanEncountered status.",
+      "hardened_mode_behavior": "Reject non-finite objective values with explicit hardened-mode rejection message."
+    },
+    {
+      "function_name": "fsci_opt::ridder",
+      "scipy_equivalent": "scipy.optimize.ridder",
+      "inputs": [
+        {
+          "name": "f",
+          "type_desc": "Fn(f64) -> f64",
+          "required": true,
+          "constraints": "Must return finite f64 for all bracket values."
+        },
+        {
+          "name": "bracket",
+          "type_desc": "(f64, f64)",
+          "required": true,
+          "constraints": "f(a) and f(b) must have opposite signs (bracketing)."
+        },
+        {
+          "name": "options",
+          "type_desc": "RootOptions",
+          "required": false,
+          "constraints": "xtol/rtol must be finite > 0; maxiter positive. "
+        }
+      ],
+      "outputs": [
+        {
+          "name": "root",
+          "type_desc": "f64",
+          "semantics": "Estimated root."
+        },
+        {
+          "name": "converged",
+          "type_desc": "bool",
+          "semantics": "True on convergence."
+        },
+        {
+          "name": "iterations",
+          "type_desc": "usize",
+          "semantics": "Iteration count."
+        },
+        {
+          "name": "function_calls",
+          "type_desc": "usize",
+          "semantics": "Function evals."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "bracket endpoints non-finite",
+          "error_type": "InvalidBounds",
+          "message_pattern": "bracket endpoints must be finite",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "f(a) and f(b) same sign",
+          "error_type": "BracketError",
+          "message_pattern": "bracketing methods require f(a) and f(b) to have opposite signs",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "absolute",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-08
+      },
+      "strict_mode_behavior": "Reject NaN/Inf function values.",
+      "hardened_mode_behavior": "Reject NaN/Inf + explicit hardened reason."
+    },
+    {
+      "function_name": "fsci_opt::root_scalar",
+      "scipy_equivalent": "scipy.optimize.brentq / brenth / bisect / ridder",
+      "inputs": [
+        {
+          "name": "f",
+          "type_desc": "Fn(f64) -> f64",
+          "required": true,
+          "constraints": "Must return finite f64 values. Bracket endpoints must have opposite signs."
+        },
+        {
+          "name": "bracket",
+          "type_desc": "Option<(f64, f64)>",
+          "required": true,
+          "constraints": "f(a) and f(b) must have opposite signs for bracketing methods."
+        },
+        {
+          "name": "xtol",
+          "type_desc": "Option<f64>",
+          "required": false,
+          "constraints": "Must be finite and > 0."
+        },
+        {
+          "name": "rtol",
+          "type_desc": "Option<f64>",
+          "required": false,
+          "constraints": "Must be finite and > 0."
+        },
+        {
+          "name": "maxiter",
+          "type_desc": "Option<usize>",
+          "required": false,
+          "constraints": "Positive integer."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "root",
+          "type_desc": "f64",
+          "semantics": "Estimated root at convergence."
+        },
+        {
+          "name": "converged",
+          "type_desc": "bool",
+          "semantics": "True if interval width fell below tolerance."
+        },
+        {
+          "name": "iterations",
+          "type_desc": "usize",
+          "semantics": "Number of iterations performed."
+        },
+        {
+          "name": "function_calls",
+          "type_desc": "usize",
+          "semantics": "Total function evaluations."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "xtol is zero or negative",
+          "error_type": "InvalidArgument",
+          "message_pattern": "xtol must be finite and > 0",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "f(a) and f(b) have same sign",
+          "error_type": "BracketError",
+          "message_pattern": "bracketing methods require f(a) and f(b) to have opposite signs",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "function returns NaN/Inf",
+          "error_type": "NonFiniteValue",
+          "message_pattern": "root function returned non-finite value",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "absolute",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-08
+      },
+      "strict_mode_behavior": "Reject non-finite function values with error.",
+      "hardened_mode_behavior": "Reject non-finite function values with explicit hardened-mode message."
+    },
+    {
+      "function_name": "fsci_opt::toms748",
+      "scipy_equivalent": "scipy.optimize.toms748",
+      "inputs": [
+        {
+          "name": "f",
+          "type_desc": "Fn(f64) -> f64",
+          "required": true,
+          "constraints": "Must return finite f64 for all bracket values."
+        },
+        {
+          "name": "bracket",
+          "type_desc": "(f64, f64)",
+          "required": true,
+          "constraints": "f(a) and f(b) must have opposite signs (bracketing)."
+        },
+        {
+          "name": "options",
+          "type_desc": "RootOptions",
+          "required": false,
+          "constraints": "xtol/rtol must be finite > 0; maxiter positive. currently uses Illinois-modified Regula Falsi rather than AP-Shi cubic (frankenscipy-88gz)."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "root",
+          "type_desc": "f64",
+          "semantics": "Estimated root."
+        },
+        {
+          "name": "converged",
+          "type_desc": "bool",
+          "semantics": "True on convergence."
+        },
+        {
+          "name": "iterations",
+          "type_desc": "usize",
+          "semantics": "Iteration count."
+        },
+        {
+          "name": "function_calls",
+          "type_desc": "usize",
+          "semantics": "Function evals."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "bracket endpoints non-finite",
+          "error_type": "InvalidBounds",
+          "message_pattern": "bracket endpoints must be finite",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "f(a) and f(b) same sign",
+          "error_type": "BracketError",
+          "message_pattern": "bracketing methods require f(a) and f(b) to have opposite signs",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "absolute",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-08
+      },
+      "strict_mode_behavior": "Reject NaN/Inf function values.",
+      "hardened_mode_behavior": "Reject NaN/Inf + explicit hardened reason."
+    },
+    {
+      "function_name": "fsci_opt::trust_exact",
+      "scipy_equivalent": "scipy.optimize.minimize(method='trust-exact')",
+      "inputs": [
+        {
+          "name": "fun",
+          "type_desc": "Fn(&[f64]) -> f64",
+          "required": true,
+          "constraints": "Objective. Must be twice differentiable; returns finite f64."
+        },
+        {
+          "name": "x0",
+          "type_desc": "&[f64]",
+          "required": true,
+          "constraints": "Non-empty, all finite."
+        },
+        {
+          "name": "options",
+          "type_desc": "MinimizeOptions",
+          "required": false,
+          "constraints": "tol, maxiter, maxfev optional; gradient_eps controls finite-diff Jacobian."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "Vec<f64>",
+          "semantics": "Minimizer estimate."
+        },
+        {
+          "name": "fun",
+          "type_desc": "Option<f64>",
+          "semantics": "Objective at minimizer."
+        },
+        {
+          "name": "success",
+          "type_desc": "bool",
+          "semantics": "Convergence flag."
+        },
+        {
+          "name": "nit",
+          "type_desc": "usize",
+          "semantics": "Iteration count."
+        },
+        {
+          "name": "nfev",
+          "type_desc": "usize",
+          "semantics": "Function evaluations."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "x0 contains NaN",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "x0 must not contain NaN or Inf",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "objective returns NaN/Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "objective returned non-finite value",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 0.0001
+      },
+      "strict_mode_behavior": "Reject NaN/Inf x0 and objective values.",
+      "hardened_mode_behavior": "Reject NaN/Inf with explicit hardened reason."
+    },
+    {
+      "function_name": "fsci_opt::newton_cg:hessp",
+      "scipy_equivalent": "scipy.optimize.minimize(method='Newton-CG', hessp=<callable>)",
+      "inputs": [
+        {
+          "name": "fun",
+          "type_desc": "Fn(&[f64]) -> f64",
+          "required": true,
+          "constraints": "Objective. Must be twice differentiable; returns finite f64."
+        },
+        {
+          "name": "x0",
+          "type_desc": "&[f64]",
+          "required": true,
+          "constraints": "Non-empty, all finite."
+        },
+        {
+          "name": "hessp",
+          "type_desc": "Fn(&[f64], &[f64]) -> Vec<f64>",
+          "required": true,
+          "constraints": "Hessian-vector product callable. The `:hessp` variant uses this in lieu of materializing the full Hessian; output length must equal x0.len()."
+        },
+        {
+          "name": "options",
+          "type_desc": "MinimizeOptions",
+          "required": false,
+          "constraints": "tol, maxiter, maxfev optional; gradient_eps controls finite-diff Jacobian."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "Vec<f64>",
+          "semantics": "Minimizer estimate."
+        },
+        {
+          "name": "fun",
+          "type_desc": "Option<f64>",
+          "semantics": "Objective at minimizer."
+        },
+        {
+          "name": "success",
+          "type_desc": "bool",
+          "semantics": "Convergence flag."
+        },
+        {
+          "name": "nit",
+          "type_desc": "usize",
+          "semantics": "Outer iteration count."
+        },
+        {
+          "name": "nfev",
+          "type_desc": "usize",
+          "semantics": "Function evaluations."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "x0 contains NaN/Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "x0 must not contain NaN or Inf",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "hessp output length mismatches x0",
+          "error_type": "InvalidShape",
+          "message_pattern": "hessp must return a vector of length x0.len()",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "objective or hessp returns NaN/Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "non-finite value encountered",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-08
+      },
+      "strict_mode_behavior": "Reject NaN/Inf x0, objective, or hessp outputs.",
+      "hardened_mode_behavior": "Reject NaN/Inf with explicit hardened reason."
+    }
+  ]
+}

@@ -1,0 +1,52 @@
+{
+  "scenario_id": "scenario_31_filtfilt_padtype_modes",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "filtfilt_odd_padtype_reference",
+      "action": "filtfilt_with_padtype(b, a, x, Some(\"odd\"))",
+      "input_summary": "odd endpoint reflection should match SciPy's default forward-backward reference output",
+      "output_summary": "max_abs_diff=1.11e-16",
+      "duration_ns": 115619,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "filtfilt_even_padtype_reference",
+      "action": "filtfilt_with_padtype(b, a, x, Some(\"even\"))",
+      "input_summary": "even endpoint extension should match SciPy's forward-backward reference output",
+      "output_summary": "max_abs_diff=2.22e-16",
+      "duration_ns": 47950,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "filtfilt_constant_padtype_reference",
+      "action": "filtfilt_with_padtype(b, a, x, Some(\"constant\"))",
+      "input_summary": "constant endpoint extension should match SciPy's constant padtype output",
+      "output_summary": "max_abs_diff=1.11e-16",
+      "duration_ns": 32872,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "filtfilt_padtype",
+    "signal_length": 20,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 201381,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_31_filtfilt_padtype_modes --nocapture"
+  }
+}

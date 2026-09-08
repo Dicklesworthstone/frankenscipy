@@ -1,0 +1,1524 @@
+{
+  "schema_version": 2,
+  "packet_id": "FSCI-P2C-011",
+  "family": "signal_core",
+  "case_results": [
+    {
+      "case_id": "savgol_filter_9pt_w5_p2",
+      "passed": true,
+      "message": "array match (9 elements)"
+    },
+    {
+      "case_id": "savgol_filter_9pt_w5_p2_nearest",
+      "passed": true,
+      "message": "array match (9 elements)"
+    },
+    {
+      "case_id": "savgol_filter_9pt_w5_p2_constant",
+      "passed": true,
+      "message": "array match (9 elements)"
+    },
+    {
+      "case_id": "savgol_filter_9pt_w5_p2_mirror",
+      "passed": true,
+      "message": "array match (9 elements)"
+    },
+    {
+      "case_id": "savgol_filter_9pt_w5_p2_wrap",
+      "passed": true,
+      "message": "array match (9 elements)"
+    },
+    {
+      "case_id": "window_hann_8pt",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "window_hamming_8pt",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "window_blackman_8pt",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "window_kaiser_8pt_beta5",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "convolve_full_3x2",
+      "passed": true,
+      "message": "array match (4 elements)"
+    },
+    {
+      "case_id": "correlate_full_3x2",
+      "passed": true,
+      "message": "array match (4 elements)"
+    },
+    {
+      "case_id": "find_peaks_simple",
+      "passed": true,
+      "message": "indices match: [1, 3, 5]"
+    },
+    {
+      "case_id": "butter_lowpass_order4",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_butter_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_butter_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_butter_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_butter_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_cheby1_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_cheby1_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_cheby1_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_cheby1_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_cheby2_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_cheby2_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_cheby2_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_cheby2_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_ellip_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_ellip_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_ellip_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_ellip_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_bessel_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_bessel_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_bessel_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "iir_bessel_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match"
+    },
+    {
+      "case_id": "freqz_simple_8pt",
+      "passed": true,
+      "message": "freqz match (8 points)"
+    },
+    {
+      "case_id": "hilbert_8pt",
+      "passed": true,
+      "message": "complex array match (8 elements)"
+    },
+    {
+      "case_id": "detrend_linear_5pt",
+      "passed": true,
+      "message": "array match (5 elements)"
+    },
+    {
+      "case_id": "hardened_window_hann_8pt",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "hardened_window_hamming_8pt",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "hardened_window_blackman_8pt",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "hardened_convolve_full_3x2",
+      "passed": true,
+      "message": "array match (4 elements)"
+    },
+    {
+      "case_id": "hardened_find_peaks_simple",
+      "passed": true,
+      "message": "indices match: [1, 3, 5]"
+    },
+    {
+      "case_id": "hardened_iir_butter_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }"
+    },
+    {
+      "case_id": "hardened_iir_cheby1_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }"
+    },
+    {
+      "case_id": "hardened_iir_cheby2_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }"
+    },
+    {
+      "case_id": "hardened_iir_ellip_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }"
+    },
+    {
+      "case_id": "hardened_iir_bessel_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }"
+    },
+    {
+      "case_id": "firwin_lp_11_0p3_hamming",
+      "passed": true,
+      "message": "array match (11 elements)"
+    },
+    {
+      "case_id": "firwin_hp_11_0p3_hamming",
+      "passed": true,
+      "message": "array match (11 elements)"
+    },
+    {
+      "case_id": "firwin_bp_11_0p2_0p5_hamming",
+      "passed": true,
+      "message": "array match (11 elements)"
+    },
+    {
+      "case_id": "firwin_lp_15_0p25_hann",
+      "passed": true,
+      "message": "array match (15 elements)"
+    },
+    {
+      "case_id": "firwin_lp_21_0p1_blackman",
+      "passed": true,
+      "message": "array match (21 elements)"
+    },
+    {
+      "case_id": "firwin2_lp_11_freqsamp",
+      "passed": true,
+      "message": "array match (11 elements)"
+    },
+    {
+      "case_id": "firwin2_bp_15_3band",
+      "passed": true,
+      "message": "array match (15 elements)"
+    },
+    {
+      "case_id": "firls_lp_11_0p4_0p6",
+      "passed": true,
+      "message": "array match (11 elements)"
+    },
+    {
+      "case_id": "firls_hp_15",
+      "passed": true,
+      "message": "array match (15 elements)"
+    },
+    {
+      "case_id": "remez_lp_11_passband_0p2_stopband_0p3",
+      "passed": true,
+      "message": "array match (11 elements)"
+    },
+    {
+      "case_id": "remez_bp_15_3band",
+      "passed": true,
+      "message": "array match (15 elements)"
+    },
+    {
+      "case_id": "minimum_phase_lp15_proto",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "firwin_numtaps_zero_rejected",
+      "passed": true,
+      "message": "error matched: InvalidParameter { detail: \"numtaps must be > 0\" }"
+    },
+    {
+      "case_id": "boxcar_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "bartlett_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "flattop_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "cosine_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "blackmanharris_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "barthann_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "parzen_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "bohman_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "nuttall_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "lanczos_window_7",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "tukey_window_7_alpha_0_5",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "gaussian_window_7_std_2",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "general_hamming_window_7_alpha_0_5",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "exponential_window_7_tau_2",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "chebwin_window_7_at_100",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "kaiser_bessel_derived_8_beta_8",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "taylor_window_8_nbar_4_sll_30",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "taylor_window_11_nbar_5_sll_40_unnormalized",
+      "passed": true,
+      "message": "array match (11 elements)"
+    },
+    {
+      "case_id": "taylor_window_64_nbar_8_sll_60_normalized",
+      "passed": true,
+      "message": "array match (64 elements)"
+    },
+    {
+      "case_id": "general_cosine_window_7_hann_coeffs",
+      "passed": true,
+      "message": "array match (7 elements)"
+    },
+    {
+      "case_id": "dpss_window_8_nw_2_5_symmetric",
+      "passed": true,
+      "message": "array match (8 elements)"
+    },
+    {
+      "case_id": "dpss_window_8_nw_2_5_periodic",
+      "passed": true,
+      "message": "array match (8 elements)"
+    }
+  ],
+  "passed_cases": 81,
+  "failed_cases": 0,
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-011_signal_core.json",
+  "oracle_status": {
+    "status": "available"
+  },
+  "differential_case_results": [
+    {
+      "case_id": "savgol_filter_9pt_w5_p2",
+      "passed": true,
+      "message": "array match (9 elements)",
+      "max_diff": 1.7763568394002505e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savgol_filter_9pt_w5_p2_nearest",
+      "passed": true,
+      "message": "array match (9 elements)",
+      "max_diff": 1.7763568394002505e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savgol_filter_9pt_w5_p2_constant",
+      "passed": true,
+      "message": "array match (9 elements)",
+      "max_diff": 1.7763568394002505e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savgol_filter_9pt_w5_p2_mirror",
+      "passed": true,
+      "message": "array match (9 elements)",
+      "max_diff": 1.7763568394002505e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savgol_filter_9pt_w5_p2_wrap",
+      "passed": true,
+      "message": "array match (9 elements)",
+      "max_diff": 1.7763568394002505e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "window_hann_8pt",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "window_hamming_8pt",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "window_blackman_8pt",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 1.6653345369377348e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "window_kaiser_8pt_beta5",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "convolve_full_3x2",
+      "passed": true,
+      "message": "array match (4 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "correlate_full_3x2",
+      "passed": true,
+      "message": "array match (4 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "find_peaks_simple",
+      "passed": true,
+      "message": "indices match: [1, 3, 5]",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "butter_lowpass_order4",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_butter_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_butter_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_butter_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_butter_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 6.643574579356937e-13,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_cheby1_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 1.6653345369377348e-16,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_cheby1_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 1.3877787807814457e-17,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_cheby1_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 2.575717417130363e-13,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_cheby1_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 7.105427357601002e-15,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_cheby2_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_cheby2_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_cheby2_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 6.439293542825908e-15,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_cheby2_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 1.4530598946294049e-12,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_ellip_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_ellip_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_ellip_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 7.105427357601002e-15,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_ellip_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 3.2152058793144533e-13,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_bessel_lowpass_order2",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_bessel_highpass_order3",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 4.551914400963142e-15,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_bessel_bandpass_order4",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 1.0658141036401503e-14,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iir_bessel_bandstop_order5",
+      "passed": true,
+      "message": "iir coeffs match",
+      "max_diff": 5.364597654988756e-13,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "freqz_simple_8pt",
+      "passed": true,
+      "message": "freqz match (8 points)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hilbert_8pt",
+      "passed": true,
+      "message": "complex array match (8 elements)",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "detrend_linear_5pt",
+      "passed": true,
+      "message": "array match (5 elements)",
+      "max_diff": 3.6637359812630166e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_window_hann_8pt",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_window_hamming_8pt",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_window_blackman_8pt",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 1.6653345369377348e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_convolve_full_3x2",
+      "passed": true,
+      "message": "array match (4 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_find_peaks_simple",
+      "passed": true,
+      "message": "indices match: [1, 3, 5]",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_iir_butter_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_iir_cheby1_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_iir_cheby2_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_iir_ellip_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_iir_bessel_invalid_wn",
+      "passed": true,
+      "message": "error matched: NonFiniteInput { detail: \"Wn values must be finite and in (0, 1) for digital filters\" }",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firwin_lp_11_0p3_hamming",
+      "passed": true,
+      "message": "array match (11 elements)",
+      "max_diff": 8.326672684688674e-17,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firwin_hp_11_0p3_hamming",
+      "passed": true,
+      "message": "array match (11 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firwin_bp_11_0p2_0p5_hamming",
+      "passed": true,
+      "message": "array match (11 elements)",
+      "max_diff": 5.551115123125783e-17,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firwin_lp_15_0p25_hann",
+      "passed": true,
+      "message": "array match (15 elements)",
+      "max_diff": 8.326672684688674e-17,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firwin_lp_21_0p1_blackman",
+      "passed": true,
+      "message": "array match (21 elements)",
+      "max_diff": 2.7755575615628914e-17,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firwin2_lp_11_freqsamp",
+      "passed": true,
+      "message": "array match (11 elements)",
+      "max_diff": 2.03142032633826e-17,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firwin2_bp_15_3band",
+      "passed": true,
+      "message": "array match (15 elements)",
+      "max_diff": 9.020562075079397e-17,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firls_lp_11_0p4_0p6",
+      "passed": true,
+      "message": "array match (11 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 0.00001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firls_hp_15",
+      "passed": true,
+      "message": "array match (15 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 0.00001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "remez_lp_11_passband_0p2_stopband_0p3",
+      "passed": true,
+      "message": "array match (11 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "remez_bp_15_3band",
+      "passed": true,
+      "message": "array match (15 elements)",
+      "max_diff": 4.163336342344337e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "minimum_phase_lp15_proto",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 1.0005885009434223e-14,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 0.00001,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "firwin_numtaps_zero_rejected",
+      "passed": true,
+      "message": "error matched: InvalidParameter { detail: \"numtaps must be > 0\" }",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "boxcar_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "bartlett_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "flattop_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 6.245004513516506e-17,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "cosine_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 4.163336342344337e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "blackmanharris_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 1.6653345369377348e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "barthann_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "parzen_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 8.673617379884035e-19,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "bohman_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 3.191891195797325e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "nuttall_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 1.6653345369377348e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "lanczos_window_7",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "tukey_window_7_alpha_0_5",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "gaussian_window_7_std_2",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "general_hamming_window_7_alpha_0_5",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 3.885780586188048e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "exponential_window_7_tau_2",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 2.7755575615628914e-17,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "chebwin_window_7_at_100",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 6.938893903907228e-17,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kaiser_bessel_derived_8_beta_8",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "taylor_window_8_nbar_4_sll_30",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "taylor_window_11_nbar_5_sll_40_unnormalized",
+      "passed": true,
+      "message": "array match (11 elements)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "taylor_window_64_nbar_8_sll_60_normalized",
+      "passed": true,
+      "message": "array match (64 elements)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "general_cosine_window_7_hann_coeffs",
+      "passed": true,
+      "message": "array match (7 elements)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "dpss_window_8_nw_2_5_symmetric",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "dpss_window_8_nw_2_5_periodic",
+      "passed": true,
+      "message": "array match (8 elements)",
+      "max_diff": 1.1102230246251565e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ],
+  "report_kind": "oracle_backed",
+  "generated_unix_ms": 1788666501921
+}

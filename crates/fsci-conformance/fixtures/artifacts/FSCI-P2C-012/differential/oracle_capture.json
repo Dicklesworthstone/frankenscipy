@@ -1,0 +1,710 @@
+{
+  "packet_id": "FSCI-P2C-012",
+  "family": "stats_core",
+  "generated_unix_ms": 1788666502479,
+  "runtime": {
+    "python_version": "3.13.12",
+    "numpy_version": "2.4.3",
+    "scipy_version": "1.17.1"
+  },
+  "provenance": {
+    "fixture_input_blake3": "2be676420a629001c8c224380868db8c97c7b8e30aa9752e8dabb4c2f6f77fda",
+    "oracle_output_blake3": "fc917ce5ef1d888c5a2e179951995e57bddc40c93475c4e791616387df5c8495",
+    "capture_blake3": "5f32480325eecaa0d1374d5a624678292f7c48e0a2d7f0dd6171e4b4abc3403c"
+  },
+  "case_outputs": [
+    {
+      "case_id": "describe_8pt",
+      "status": "ok",
+      "result_kind": "describe_result",
+      "result": {
+        "kurtosis": -1.238095238095238,
+        "mean": 4.5,
+        "minmax": [
+          1.0,
+          8.0
+        ],
+        "nobs": 8,
+        "skewness": 0.0,
+        "variance": 6.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "skew_asymmetric",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": -0.6
+      },
+      "error": null
+    },
+    {
+      "case_id": "kurtosis_uniform",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": -1.2242424242424244
+      },
+      "error": null
+    },
+    {
+      "case_id": "pearsonr_linear",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 0.0,
+        "statistic": 1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "pearsonr_negative",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 0.0,
+        "statistic": -1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "spearmanr_monotonic",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 1.4042654220543602e-24,
+        "statistic": 1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "linregress_perfect",
+      "status": "ok",
+      "result_kind": "linregress_result",
+      "result": {
+        "intercept": 1.0,
+        "pvalue": 1.2004217548761418e-30,
+        "rvalue": 1.0,
+        "slope": 2.0,
+        "stderr": 0.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "linregress_noisy",
+      "status": "ok",
+      "result_kind": "linregress_result",
+      "result": {
+        "intercept": 0.05000000000000071,
+        "pvalue": 0.00005941539111755929,
+        "rvalue": 0.9986517555689656,
+        "slope": 1.99,
+        "stderr": 0.059721576223897795
+      },
+      "error": null
+    },
+    {
+      "case_id": "ttest_1samp_zero",
+      "status": "ok",
+      "result_kind": "ttest_result",
+      "result": {
+        "pvalue": 1.0,
+        "statistic": 0.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "ttest_1samp_shifted",
+      "status": "ok",
+      "result_kind": "ttest_result",
+      "result": {
+        "pvalue": 0.2301996410804989,
+        "statistic": 1.414213562373095
+      },
+      "error": null
+    },
+    {
+      "case_id": "ks_2samp_same",
+      "status": "ok",
+      "result_kind": "goodness_result",
+      "result": {
+        "pvalue": 1.0,
+        "statistic": 0.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "ks_2samp_different",
+      "status": "ok",
+      "result_kind": "goodness_result",
+      "result": {
+        "pvalue": 0.007936507936507936,
+        "statistic": 1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "zscore_5pt",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "values": [
+          -1.414213562373095,
+          -0.7071067811865475,
+          0.0,
+          0.7071067811865475,
+          1.414213562373095
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "sem_5pt",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.7071067811865476
+      },
+      "error": null
+    },
+    {
+      "case_id": "iqr_8pt",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3.5
+      },
+      "error": null
+    },
+    {
+      "case_id": "moment_k2",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 2.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "moment_k3",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "variation_5pt",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.47140452079103173
+      },
+      "error": null
+    },
+    {
+      "case_id": "entropy_uniform",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.3862943611198906
+      },
+      "error": null
+    },
+    {
+      "case_id": "shapiro_normal",
+      "status": "ok",
+      "result_kind": "goodness_result",
+      "result": {
+        "pvalue": 0.9492885624975852,
+        "statistic": 0.9780016294384768
+      },
+      "error": null
+    },
+    {
+      "case_id": "skew_symmetric",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "kurtosis_peaked",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3.888318009734993
+      },
+      "error": null
+    },
+    {
+      "case_id": "pearsonr_uncorrelated",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 0.5594043441634879,
+        "statistic": 0.3535533905932738
+      },
+      "error": null
+    },
+    {
+      "case_id": "linregress_negative_slope",
+      "status": "ok",
+      "result_kind": "linregress_result",
+      "result": {
+        "intercept": 12.0,
+        "pvalue": 1.2004217548761418e-30,
+        "rvalue": -1.0,
+        "slope": -2.0,
+        "stderr": 0.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "iqr_small_4pt",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.5
+      },
+      "error": null
+    },
+    {
+      "case_id": "moment_k4",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 6.8
+      },
+      "error": null
+    },
+    {
+      "case_id": "entropy_concentrated",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.02371876133018424
+      },
+      "error": null
+    },
+    {
+      "case_id": "variation_high_mean",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.11785113019775792
+      },
+      "error": null
+    },
+    {
+      "case_id": "sem_10pt",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.957427107756338
+      },
+      "error": null
+    },
+    {
+      "case_id": "describe_3pt",
+      "status": "ok",
+      "result_kind": "describe_result",
+      "result": {
+        "kurtosis": -1.5,
+        "mean": 2.0,
+        "minmax": [
+          1.0,
+          3.0
+        ],
+        "nobs": 3,
+        "skewness": 0.0,
+        "variance": 1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_describe_8pt",
+      "status": "ok",
+      "result_kind": "describe_result",
+      "result": {
+        "kurtosis": -1.238095238095238,
+        "mean": 4.5,
+        "minmax": [
+          1.0,
+          8.0
+        ],
+        "nobs": 8,
+        "skewness": 0.0,
+        "variance": 6.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_skew_asymmetric",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": -0.6
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_kurtosis_uniform",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": -1.2242424242424244
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_pearsonr_linear",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 0.0,
+        "statistic": 1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_pearsonr_negative",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 0.0,
+        "statistic": -1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "ttest_ind_shifted_groups",
+      "status": "ok",
+      "result_kind": "ttest_result",
+      "result": {
+        "pvalue": 0.08051623795726262,
+        "statistic": -2.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "ttest_ind_identical_groups",
+      "status": "ok",
+      "result_kind": "ttest_result",
+      "result": {
+        "pvalue": 1.0,
+        "statistic": 0.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "mannwhitneyu_shifted_groups",
+      "status": "ok",
+      "result_kind": "ttest_result",
+      "result": {
+        "pvalue": 0.11384629800665803,
+        "statistic": 4.5
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_4nkk_cauchy_pdf_0_at_origin",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.3183098861837907
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_4nkk_cauchy_pdf_at_scale",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.15915494309189537
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_4nkk_cauchy_cdf_at_origin",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.5
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_4nkk_cauchy_cdf_at_scale",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.75
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_4nkk_cauchy_ppf_quartile",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.0000000000000002
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_chi2_pdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.2075537487102974
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_chi2_cdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.42759329552912023
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_chi2_ppf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 2.3659738843753377
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_lognorm_pdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.3989422804014327
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_lognorm_cdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.5
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_lognorm_ppf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_gamma_pdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.36787944117144233
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_gamma_cdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.2642411176571153
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_gamma_ppf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.6783469900166612
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_beta_pdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.5000000000000004
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_beta_cdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.6875
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_pareto_pdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.1875
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_pareto_cdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.875
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_rayleigh_pdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.6065306597126334
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_rayleigh_cdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.3934693402873666
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_logistic_pdf_origin",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.25
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_logistic_cdf_origin",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.5
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_laplace_pdf_origin",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.5
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_5sra_laplace_cdf_origin",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.5
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_fdist_pdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.4954797834866395
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_a6qx_fdist_cdf",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 0.5348805734621996
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_perfect_concordance_n8",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 0.0000496031746031746,
+        "statistic": 0.9999999999999998
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_perfect_discordance_n8",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 0.0000496031746031746,
+        "statistic": -0.9999999999999998
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_n12_alternating_swaps",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 5.319397680508792e-6,
+        "statistic": 0.8787878787878787
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_shuffled_n15_exact",
+      "status": "ok",
+      "result_kind": "correlation_result",
+      "result": {
+        "pvalue": 0.09264256691158146,
+        "statistic": -0.33333333333333337
+      },
+      "error": null
+    },
+    {
+      "case_id": "br_7vhu_bootstrap_mean_symmetric_5pt",
+      "status": "error",
+      "result_kind": "skipped",
+      "result": {},
+      "error": "bootstrap_mean: oracle skipped (PRNG mismatch with scipy PCG64)"
+    },
+    {
+      "case_id": "br_7vhu_bootstrap_mean_asymmetric_8pt",
+      "status": "error",
+      "result_kind": "skipped",
+      "result": {},
+      "error": "bootstrap_mean: oracle skipped (PRNG mismatch with scipy PCG64)"
+    },
+    {
+      "case_id": "br_7vhu_bootstrap_mean_spread_15pt",
+      "status": "error",
+      "result_kind": "skipped",
+      "result": {},
+      "error": "bootstrap_mean: oracle skipped (PRNG mismatch with scipy PCG64)"
+    }
+  ]
+}

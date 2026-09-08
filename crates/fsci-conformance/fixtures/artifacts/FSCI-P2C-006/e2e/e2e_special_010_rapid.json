@@ -1,0 +1,27 @@
+{
+  "scenario_id": "e2e_special_010_rapid",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "rapid_gamma_gammaln",
+      "action": "gamma+gammaln",
+      "input_summary": "100 iterations, x=0.5..10.4",
+      "output_summary": "all_pass=true",
+      "duration_ns": 49694,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 139945,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_special -- e2e_special_010_rapid --nocapture"
+  }
+}

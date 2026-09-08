@@ -1,0 +1,63 @@
+{
+  "scenario_id": "scenario_15_rect_bivariate_spline_scipy_shape",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_rect_bivariate_spline",
+      "action": "RectBivariateSpline::new(x, y, z, kx=1, ky=1)",
+      "input_summary": "x has 4 points, y has 3 points, z shape is (4, 3)",
+      "output_summary": "created bilinear RectBivariateSpline",
+      "duration_ns": 53221,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "eval_scalar_orientation",
+      "action": "spline.eval(1.5, 0.5)",
+      "input_summary": "asymmetric plane f(x,y)=10x+y",
+      "output_summary": "result=15.5, expected=15.5",
+      "duration_ns": 5992,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "eval_grid_orientation",
+      "action": "spline.eval_grid([0.5, 1.5], [0.5, 1.5])",
+      "input_summary": "grid=True equivalent should be x-major",
+      "output_summary": "max_grid_error=0.00e0",
+      "duration_ns": 13967,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "integral_orientation",
+      "action": "spline.integral(0, 1, 0, 1)",
+      "input_summary": "integral of 10x+y over unit square",
+      "output_summary": "integral=5.499999999999996, expected=5.5",
+      "duration_ns": 55415,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "RectBivariateSpline",
+    "num_points": 12,
+    "dimensions": 2,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 137400,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_15_rect_bivariate_spline_scipy_shape --nocapture"
+  }
+}

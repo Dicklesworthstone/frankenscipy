@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_special_011_logsumexp",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "weighted_logsumexp",
+      "action": "logsumexp_with_b",
+      "input_summary": "a=[1,2,3], b=[1,2,0.5]",
+      "output_summary": "result=3.315609082086973, expected=3.315609082086973",
+      "duration_ns": 7985,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "axis_zero_logsumexp",
+      "action": "logsumexp_axis_2d",
+      "input_summary": "a=[[1,2],[3,4]], axis=0",
+      "output_summary": "result=[3.1269280110429727, 4.126928011042972], expected=[3.1269280110429727, 4.126928011042972]",
+      "duration_ns": 7955,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "axis_one_broadcast_logsumexp",
+      "action": "logsumexp_axis_2d_with_b",
+      "input_summary": "a=[[1,2],[3,4]], axis=1, b=[[1,2]]",
+      "output_summary": "result=[2.8619948040582512, 4.861994804058251], expected=[2.8619948040582512, 4.861994804058251]",
+      "duration_ns": 4739,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 163600,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_special -- e2e_special_011_logsumexp --nocapture"
+  }
+}

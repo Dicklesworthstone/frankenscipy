@@ -1,0 +1,56 @@
+{
+  "scenario_id": "p2c002_05_singular_matrix_recovery",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "attempt_solve",
+      "action": "solve(A_singular, b)",
+      "input_summary": "2x2 singular",
+      "output_summary": "correctly caught SingularMatrix error",
+      "duration_ns": 174831,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "fallback_lstsq",
+      "action": "lstsq(A_singular, b)",
+      "input_summary": "fallback to least-squares",
+      "output_summary": "lstsq succeeded: x=[0.5999999999999999, 1.2], rank=1",
+      "duration_ns": 74441,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_lstsq_consistency",
+      "action": "A @ lstsq_x ~ b (projection)",
+      "input_summary": "verify minimum-norm solution",
+      "output_summary": "solution lies in column space: Ax=[3.0, 6.0], ratio=2.000000",
+      "duration_ns": 85672,
+      "mode": "strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "matrix_metadata": {
+    "size": [
+      2,
+      2
+    ],
+    "nnz": null,
+    "rcond_estimate": null,
+    "mode": "strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 340255,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_linalg -- p2c002_05_singular_matrix_recovery --nocapture"
+  }
+}

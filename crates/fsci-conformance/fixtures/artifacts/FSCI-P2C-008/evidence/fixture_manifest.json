@@ -1,0 +1,214 @@
+{
+  "packet_id": "FSCI-P2C-008",
+  "generated_at": "unix:1779662447",
+  "fixtures": [
+    {
+      "fixture_id": "policy_low_risk_Strict",
+      "subsystem": "policy_controller",
+      "description": "Low-risk signals (cond=0.5, meta=0, anomaly=0) in Strict mode",
+      "signal_triple": [
+        0.5,
+        0.0,
+        0.0
+      ],
+      "matrix_condition": null,
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "policy_low_risk_Hardened",
+      "subsystem": "policy_controller",
+      "description": "Low-risk signals in Hardened mode",
+      "signal_triple": [
+        0.5,
+        0.0,
+        0.0
+      ],
+      "matrix_condition": null,
+      "mode": "Hardened"
+    },
+    {
+      "fixture_id": "policy_high_cond_Strict",
+      "subsystem": "policy_controller",
+      "description": "High condition number (14.0) in Strict mode",
+      "signal_triple": [
+        14.0,
+        0.0,
+        0.0
+      ],
+      "matrix_condition": null,
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "policy_high_cond_Hardened",
+      "subsystem": "policy_controller",
+      "description": "High condition number in Hardened mode",
+      "signal_triple": [
+        14.0,
+        0.0,
+        0.0
+      ],
+      "matrix_condition": null,
+      "mode": "Hardened"
+    },
+    {
+      "fixture_id": "policy_metadata_incompat_Strict",
+      "subsystem": "policy_controller",
+      "description": "High metadata incompatibility (0.9) in Strict mode",
+      "signal_triple": [
+        1.0,
+        0.9,
+        0.0
+      ],
+      "matrix_condition": null,
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "policy_metadata_incompat_Hardened",
+      "subsystem": "policy_controller",
+      "description": "High metadata incompatibility in Hardened mode",
+      "signal_triple": [
+        1.0,
+        0.9,
+        0.0
+      ],
+      "matrix_condition": null,
+      "mode": "Hardened"
+    },
+    {
+      "fixture_id": "policy_anomaly_Strict",
+      "subsystem": "policy_controller",
+      "description": "High anomaly score (0.95) in Strict mode",
+      "signal_triple": [
+        1.0,
+        0.0,
+        0.95
+      ],
+      "matrix_condition": null,
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "policy_anomaly_Hardened",
+      "subsystem": "policy_controller",
+      "description": "High anomaly score in Hardened mode",
+      "signal_triple": [
+        1.0,
+        0.0,
+        0.95
+      ],
+      "matrix_condition": null,
+      "mode": "Hardened"
+    },
+    {
+      "fixture_id": "mode_consistency_hardened_ge_strict",
+      "subsystem": "policy_controller",
+      "description": "Hardened mode at least as strict as Strict for all test signals",
+      "signal_triple": null,
+      "matrix_condition": null,
+      "mode": "both"
+    },
+    {
+      "fixture_id": "portfolio_well_conditioned",
+      "subsystem": "solver_portfolio",
+      "description": "WellConditioned state → DirectLU selection",
+      "signal_triple": null,
+      "matrix_condition": "WellConditioned",
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "portfolio_moderate_condition",
+      "subsystem": "solver_portfolio",
+      "description": "ModerateCondition state → PivotedQR selection",
+      "signal_triple": null,
+      "matrix_condition": "ModerateCondition",
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "portfolio_ill_and_near_singular",
+      "subsystem": "solver_portfolio",
+      "description": "IllConditioned/NearSingular → SVDFallback",
+      "signal_triple": null,
+      "matrix_condition": "IllConditioned+NearSingular",
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "portfolio_all_states_valid",
+      "subsystem": "solver_portfolio",
+      "description": "All 4 condition states produce valid, finite decisions",
+      "signal_triple": null,
+      "matrix_condition": "all",
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "loss_matrix_properties",
+      "subsystem": "solver_portfolio",
+      "description": "Loss matrix structural invariants",
+      "signal_triple": null,
+      "matrix_condition": null,
+      "mode": "n/a"
+    },
+    {
+      "fixture_id": "calibrator_no_fallback",
+      "subsystem": "conformal_calibrator",
+      "description": "50 low-error observations → no fallback",
+      "signal_triple": null,
+      "matrix_condition": null,
+      "mode": "n/a"
+    },
+    {
+      "fixture_id": "calibrator_triggers_fallback",
+      "subsystem": "conformal_calibrator",
+      "description": "75% violation rate → fallback triggered",
+      "signal_triple": null,
+      "matrix_condition": null,
+      "mode": "n/a"
+    },
+    {
+      "fixture_id": "calibrator_min_observations",
+      "subsystem": "conformal_calibrator",
+      "description": "< 10 observations → no fallback",
+      "signal_triple": null,
+      "matrix_condition": null,
+      "mode": "n/a"
+    },
+    {
+      "fixture_id": "portfolio_conformal_override",
+      "subsystem": "conformal_calibrator",
+      "description": "Conformal override forces SVDFallback for WellConditioned",
+      "signal_triple": null,
+      "matrix_condition": "WellConditioned",
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "ledger_capacity_fifo",
+      "subsystem": "evidence_ledger",
+      "description": "Ledger FIFO eviction at capacity=8",
+      "signal_triple": null,
+      "matrix_condition": null,
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "ledger_latest_entry",
+      "subsystem": "evidence_ledger",
+      "description": "Latest entry matches most recent decision",
+      "signal_triple": null,
+      "matrix_condition": null,
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "signal_sequence_replay",
+      "subsystem": "evidence_ledger",
+      "description": "Signal sequence replays are deterministic",
+      "signal_triple": null,
+      "matrix_condition": null,
+      "mode": "Strict"
+    },
+    {
+      "fixture_id": "evidence_jsonl_serialization",
+      "subsystem": "evidence_ledger",
+      "description": "JSONL evidence export produces valid JSON lines",
+      "signal_triple": null,
+      "matrix_condition": null,
+      "mode": "Strict"
+    }
+  ]
+}

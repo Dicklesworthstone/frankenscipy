@@ -1,0 +1,1245 @@
+{
+  "contracts": [
+    {
+      "function_name": "fsci_special::bdtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::bdtrc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::bdtri",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::bei",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ber",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::beta",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::betaln",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::boxcox1p",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::boxcox_transform",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::btdtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::btdtrc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::btdtri",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::btdtria",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::btdtrib",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::cbrt",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::chdtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::chdtrc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::chdtri",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::chdtriv",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::comb",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::cosdg",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::cotdg",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::dawsn",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::digamma",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ellipe",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ellipeinc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ellipj",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ellipk",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ellipkinc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ellipkm1",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::entr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::erf",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::erfc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::erfcinv",
+      "scipy_equivalent": "scipy.special.erfcinv",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::erfcx",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::erfi",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::erfinv",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_chebyt",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_chebyu",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_gegenbauer",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_genlaguerre",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_hermite",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_hermitenorm",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_jacobi",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_laguerre",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_legendre",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_sh_chebyt",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_sh_chebyu",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::eval_sh_legendre",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::exp1",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::exp10",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::exp2",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::expi",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::expit",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::expm1",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::expn",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::exprel",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::factorial",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::factorial2",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::fdtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::fdtrc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::fdtri",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::fdtridfd",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::fresnel",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::gamma",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::gammaln",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::gdtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::gdtrc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::gdtria",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::gdtrib",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::gdtrix",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::huber",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::hurwitz_zeta",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::hyp0f1",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 1e-05
+      }
+    },
+    {
+      "function_name": "fsci_special::hyp1f1",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 1e-05
+      }
+    },
+    {
+      "function_name": "fsci_special::hyp2f1",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 1e-05
+      }
+    },
+    {
+      "function_name": "fsci_special::inv_boxcox",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::inv_boxcox1p",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::iv",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ivp",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::j0",
+      "scipy_equivalent": "scipy.special.j0",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::j1",
+      "scipy_equivalent": "scipy.special.j1",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::jn",
+      "scipy_equivalent": "scipy.special.jn",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::jvp",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::kei",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ker",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::kl_div",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::kolmogi",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::kolmogorov",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::kv",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::kvp",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::lambertw",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 1e-05
+      }
+    },
+    {
+      "function_name": "fsci_special::log1p",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::log_ndtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::logaddexp",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::logaddexp2",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::logit",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::logsumexp",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::lpmv",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::modstruve",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 1e-05
+      }
+    },
+    {
+      "function_name": "fsci_special::multigammaln",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::nbdtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::nbdtrc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::nbdtri",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::ndtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::ndtri",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::nrdtrimn",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::nrdtrisd",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::owens_t",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 1e-05
+      }
+    },
+    {
+      "function_name": "fsci_special::pdtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::pdtrc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::pdtri",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::pdtrik",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::perm",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::poch",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::polygamma",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::pseudo_huber",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::radian",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::rel_entr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::rgamma",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::roots_chebyt",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::roots_chebyu",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::roots_gegenbauer",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::roots_genlaguerre",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::roots_hermite",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::roots_hermitenorm",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::roots_jacobi",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::roots_laguerre",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::roots_legendre",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::shichi",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::sici",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::sinc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::sindg",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::softplus",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::spence",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 1e-05
+      }
+    },
+    {
+      "function_name": "fsci_special::spherical_in",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::spherical_jn",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::spherical_kn",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::spherical_yn",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::sph_harm_y",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-12
+      }
+    },
+    {
+      "function_name": "fsci_special::stdtr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::stdtrc",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::stdtridf",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::stdtrit",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-08,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::struve",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 1e-05
+      }
+    },
+    {
+      "function_name": "fsci_special::tandg",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::wright_bessel",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-06,
+        "default_rtol": 1e-05
+      }
+    },
+    {
+      "function_name": "fsci_special::xlog1py",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::xlogx",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::xlogy",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::yn",
+      "scipy_equivalent": "scipy.special.yn",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-07
+      }
+    },
+    {
+      "function_name": "fsci_special::yvp",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::zeta",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    },
+    {
+      "function_name": "fsci_special::zetac",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-10
+      }
+    }
+  ],
+  "domain": "special",
+  "generated_at": "2026-04-23T00:00:00Z",
+  "packet_id": "FSCI-P2C-006",
+  "schema_version": 1
+}

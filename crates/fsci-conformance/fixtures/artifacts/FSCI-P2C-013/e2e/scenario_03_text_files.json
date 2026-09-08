@@ -1,0 +1,52 @@
+{
+  "scenario_id": "scenario_03_text_files",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "loadtxt",
+      "action": "loadtxt(content)",
+      "input_summary": "3x3 whitespace-delimited",
+      "output_summary": "3x3 matrix loaded",
+      "duration_ns": 25389,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "savetxt",
+      "action": "savetxt(3, 3, data)",
+      "input_summary": "write 3x3 matrix",
+      "output_summary": "wrote 18 chars",
+      "duration_ns": 10440,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "loadtxt_savetxt_roundtrip",
+      "action": "loadtxt(savetxt(...))",
+      "input_summary": "verify roundtrip",
+      "output_summary": "roundtrip verified",
+      "duration_ns": 6452,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "text",
+    "operation": "loadtxt/savetxt",
+    "size_bytes": 0
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 140266,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_03_text_files --nocapture"
+  }
+}

@@ -1,0 +1,227 @@
+{
+  "generated_at": "unix:1779662458",
+  "packet_id": "FSCI-P2C-001",
+  "optimization_name": "remove_intermediate_rms_vectors_in_select_initial_step",
+  "benchmark_rows": [
+    {
+      "hotspot_function": "validate_tol",
+      "scenario": "scalar_n128",
+      "before": {
+        "p50_ns": 501,
+        "p95_ns": 682,
+        "p99_ns": 2845,
+        "min_ns": 481,
+        "max_ns": 2845,
+        "mean_ns": 602
+      },
+      "after": {
+        "p50_ns": 501,
+        "p95_ns": 682,
+        "p99_ns": 2845,
+        "min_ns": 481,
+        "max_ns": 2845,
+        "mean_ns": 602
+      },
+      "p95_delta_pct": 0.0
+    },
+    {
+      "hotspot_function": "validate_tol",
+      "scenario": "vector_n256",
+      "before": {
+        "p50_ns": 21461,
+        "p95_ns": 21541,
+        "p99_ns": 21581,
+        "min_ns": 21410,
+        "max_ns": 21581,
+        "mean_ns": 21467
+      },
+      "after": {
+        "p50_ns": 21461,
+        "p95_ns": 21541,
+        "p99_ns": 21581,
+        "min_ns": 21410,
+        "max_ns": 21581,
+        "mean_ns": 21467
+      },
+      "p95_delta_pct": 0.0
+    },
+    {
+      "hotspot_function": "validate_first_step",
+      "scenario": "positive_within_bounds",
+      "before": {
+        "p50_ns": 30,
+        "p95_ns": 41,
+        "p99_ns": 161,
+        "min_ns": 30,
+        "max_ns": 161,
+        "mean_ns": 36
+      },
+      "after": {
+        "p50_ns": 30,
+        "p95_ns": 41,
+        "p99_ns": 161,
+        "min_ns": 30,
+        "max_ns": 161,
+        "mean_ns": 36
+      },
+      "p95_delta_pct": 0.0
+    },
+    {
+      "hotspot_function": "validate_max_step",
+      "scenario": "finite_positive",
+      "before": {
+        "p50_ns": 30,
+        "p95_ns": 40,
+        "p99_ns": 140,
+        "min_ns": 30,
+        "max_ns": 140,
+        "mean_ns": 35
+      },
+      "after": {
+        "p50_ns": 30,
+        "p95_ns": 40,
+        "p99_ns": 140,
+        "min_ns": 30,
+        "max_ns": 140,
+        "mean_ns": 35
+      },
+      "p95_delta_pct": 0.0
+    },
+    {
+      "hotspot_function": "select_initial_step",
+      "scenario": "lorenz_vector_atol",
+      "before": {
+        "p50_ns": 1313,
+        "p95_ns": 1343,
+        "p99_ns": 1453,
+        "min_ns": 1302,
+        "max_ns": 1453,
+        "mean_ns": 1320
+      },
+      "after": {
+        "p50_ns": 681,
+        "p95_ns": 732,
+        "p99_ns": 821,
+        "min_ns": 681,
+        "max_ns": 821,
+        "mean_ns": 692
+      },
+      "p95_delta_pct": -45.4951600893522
+    },
+    {
+      "hotspot_function": "RkSolver::step_with",
+      "scenario": "lorenz_20_steps",
+      "before": {
+        "p50_ns": 56407,
+        "p95_ns": 57208,
+        "p99_ns": 67027,
+        "min_ns": 56156,
+        "max_ns": 67027,
+        "mean_ns": 56830
+      },
+      "after": {
+        "p50_ns": 56407,
+        "p95_ns": 57208,
+        "p99_ns": 67027,
+        "min_ns": 56156,
+        "max_ns": 67027,
+        "mean_ns": 56830
+      },
+      "p95_delta_pct": 0.0
+    }
+  ],
+  "hotspot_ranking": [
+    {
+      "rank": 1,
+      "hotspot_function": "RkSolver::step_with",
+      "scenario": "lorenz_20_steps",
+      "after_p95_ns": 57208,
+      "share_of_total_p95": 0.71292557699018
+    },
+    {
+      "rank": 2,
+      "hotspot_function": "validate_tol",
+      "scenario": "vector_n256",
+      "after_p95_ns": 21541,
+      "share_of_total_p95": 0.2684437465729525
+    },
+    {
+      "rank": 3,
+      "hotspot_function": "select_initial_step",
+      "scenario": "lorenz_vector_atol",
+      "after_p95_ns": 732,
+      "share_of_total_p95": 0.009122177359054883
+    },
+    {
+      "rank": 4,
+      "hotspot_function": "validate_tol",
+      "scenario": "scalar_n128",
+      "after_p95_ns": 682,
+      "share_of_total_p95": 0.008499077812671353
+    },
+    {
+      "rank": 5,
+      "hotspot_function": "validate_first_step",
+      "scenario": "positive_within_bounds",
+      "after_p95_ns": 41,
+      "share_of_total_p95": 0.0005109416280344947
+    },
+    {
+      "rank": 6,
+      "hotspot_function": "validate_max_step",
+      "scenario": "finite_positive",
+      "after_p95_ns": 40,
+      "share_of_total_p95": 0.0004984796371068241
+    }
+  ],
+  "optimization_attempts": [
+    {
+      "optimization_name": "remove_intermediate_rms_vectors_in_select_initial_step",
+      "hotspot_function": "select_initial_step",
+      "before_p95_ns": 1343,
+      "after_p95_ns": 732,
+      "delta_pct": -45.4951600893522
+    }
+  ],
+  "failed_optimization_attempts": [],
+  "memory_delta": {
+    "method": "algorithmic allocation-count estimate",
+    "before_estimated_alloc_events": 5,
+    "after_estimated_alloc_events": 2,
+    "alloc_count_delta": -3,
+    "note": "Estimate applies to select_initial_step temporaries only; allocator-level instrumentation is not used in this harness."
+  },
+  "isomorphism_check": {
+    "all_cases_pass": true,
+    "details": [
+      {
+        "case_name": "scalar_tol_exponential",
+        "legacy_h_abs": 0.11489280028272648,
+        "optimized_h_abs": 0.11489280028272648,
+        "abs_diff": 0.0,
+        "passes": true
+      },
+      {
+        "case_name": "vector_tol_lorenz",
+        "legacy_h_abs": 0.009201088582775779,
+        "optimized_h_abs": 0.009201088582775779,
+        "abs_diff": 0.0,
+        "passes": true
+      },
+      {
+        "case_name": "backward_integration_scalar_tol",
+        "legacy_h_abs": 0.11489280028272648,
+        "optimized_h_abs": 0.11489280028272648,
+        "abs_diff": 0.0,
+        "passes": true
+      }
+    ]
+  },
+  "methodology": [
+    "warmup_iters=3",
+    "bench_iters=25",
+    "before_select_initial_step=legacy algorithm with temporary scaled vectors",
+    "after_select_initial_step=single-pass RMS accumulation over scale/f0 differences",
+    "top-3 hotspots ranked by after.p95_ns share of total"
+  ]
+}

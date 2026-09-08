@@ -1,0 +1,40 @@
+{
+  "packet_id": "FSCI-P2C-005",
+  "operation_summaries": [
+    {
+      "operation": "fft_ifft_roundtrip",
+      "total_fixtures": 5,
+      "passed": 5,
+      "failed": 0,
+      "max_abs_diff_across_all": 9.036560719766055e-16
+    },
+    {
+      "operation": "rfft_irfft_roundtrip",
+      "total_fixtures": 5,
+      "passed": 5,
+      "failed": 0,
+      "max_abs_diff_across_all": 6.661338147750939e-16
+    },
+    {
+      "operation": "parseval_energy",
+      "total_fixtures": 5,
+      "passed": 5,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.6653345369377376e-15
+    },
+    {
+      "operation": "normalization",
+      "total_fixtures": 5,
+      "passed": 5,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.1024666305413758e-31
+    },
+    {
+      "operation": "fft2",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    }
+  ]
+}

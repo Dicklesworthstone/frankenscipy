@@ -1,0 +1,202 @@
+{
+  "test_id": "metamorphic_cluster_gap_elbow",
+  "case_count": 32,
+  "pass_count": 32,
+  "pass": true,
+  "timestamp_ms": 1780785929223,
+  "duration_ns": 182726617,
+  "cases": [
+    {
+      "case_id": "gap_blobs2_n16",
+      "invariant": "gap_len_eq_min_maxk_n",
+      "detail": "len=5, expected=5",
+      "pass": true
+    },
+    {
+      "case_id": "gap_blobs2_n16",
+      "invariant": "gap_all_finite",
+      "detail": "all_finite=true",
+      "pass": true
+    },
+    {
+      "case_id": "gap_blobs2_n16",
+      "invariant": "gap_deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs2_n16",
+      "invariant": "elbow_len_eq_min_maxk_n",
+      "detail": "len=5, expected=5",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs2_n16",
+      "invariant": "elbow_k1_eq_total_sumsq",
+      "detail": "e[0]=800.6216, sst=800.6216, abs_diff=0",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs2_n16",
+      "invariant": "elbow_monotone_nonincreasing",
+      "detail": "seq=[800.6216, 0.6216000000000003, 0.3847999999999999, 0.3551999999999999, 0.12209999999999999]",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs2_n16",
+      "invariant": "elbow_nonneg",
+      "detail": "min=0.12209999999999999",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs2_n16",
+      "invariant": "elbow_deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "gap_blobs3_n21",
+      "invariant": "gap_len_eq_min_maxk_n",
+      "detail": "len=5, expected=5",
+      "pass": true
+    },
+    {
+      "case_id": "gap_blobs3_n21",
+      "invariant": "gap_all_finite",
+      "detail": "all_finite=true",
+      "pass": true
+    },
+    {
+      "case_id": "gap_blobs3_n21",
+      "invariant": "gap_deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs3_n21",
+      "invariant": "elbow_len_eq_min_maxk_n",
+      "detail": "len=5, expected=5",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs3_n21",
+      "invariant": "elbow_k1_eq_total_sumsq",
+      "detail": "e[0]=700.6010666666666, sst=700.6010666666666, abs_diff=0",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs3_n21",
+      "invariant": "elbow_monotone_nonincreasing",
+      "detail": "seq=[700.6010666666666, 350.6062, 0.6216000000000015, 0.46620000000000067, 0.3108000000000006]",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs3_n21",
+      "invariant": "elbow_nonneg",
+      "detail": "min=0.3108000000000006",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs3_n21",
+      "invariant": "elbow_deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "gap_blobs4_n24",
+      "invariant": "gap_len_eq_min_maxk_n",
+      "detail": "len=6, expected=6",
+      "pass": true
+    },
+    {
+      "case_id": "gap_blobs4_n24",
+      "invariant": "gap_all_finite",
+      "detail": "all_finite=true",
+      "pass": true
+    },
+    {
+      "case_id": "gap_blobs4_n24",
+      "invariant": "gap_deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs4_n24",
+      "invariant": "elbow_len_eq_min_maxk_n",
+      "detail": "len=6, expected=6",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs4_n24",
+      "invariant": "elbow_k1_eq_total_sumsq",
+      "detail": "e[0]=1728.5179999999998, sst=1728.5179999999998, abs_diff=0",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs4_n24",
+      "invariant": "elbow_monotone_nonincreasing",
+      "detail": "seq=[1728.5179999999998, 864.518, 432.518, 0.5180000000000011, 0.418100000000001, 0.3293000000000006]",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs4_n24",
+      "invariant": "elbow_nonneg",
+      "detail": "min=0.3293000000000006",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_blobs4_n24",
+      "invariant": "elbow_deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "gap_single_n15",
+      "invariant": "gap_len_eq_min_maxk_n",
+      "detail": "len=4, expected=4",
+      "pass": true
+    },
+    {
+      "case_id": "gap_single_n15",
+      "invariant": "gap_all_finite",
+      "detail": "all_finite=true",
+      "pass": true
+    },
+    {
+      "case_id": "gap_single_n15",
+      "invariant": "gap_deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_single_n15",
+      "invariant": "elbow_len_eq_min_maxk_n",
+      "detail": "len=4, expected=4",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_single_n15",
+      "invariant": "elbow_k1_eq_total_sumsq",
+      "detail": "e[0]=1.1480000000000001, sst=1.1480000000000001, abs_diff=0",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_single_n15",
+      "invariant": "elbow_monotone_nonincreasing",
+      "detail": "seq=[1.1480000000000001, 0.28700000000000003, 0.12300000000000001, 0.07790000000000001]",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_single_n15",
+      "invariant": "elbow_nonneg",
+      "detail": "min=0.07790000000000001",
+      "pass": true
+    },
+    {
+      "case_id": "elbow_single_n15",
+      "invariant": "elbow_deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    }
+  ]
+}

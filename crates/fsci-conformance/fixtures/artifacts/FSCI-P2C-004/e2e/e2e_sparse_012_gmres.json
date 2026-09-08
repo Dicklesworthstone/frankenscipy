@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_sparse_012_gmres",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "build_nonsym_matrix",
+      "action": "diags",
+      "input_summary": "n=15, bidiag(3, -1, offset=1)",
+      "output_summary": "nnz=29",
+      "duration_ns": 26200,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "compute_rhs",
+      "action": "A * x_true",
+      "input_summary": "x_true = [sin(1), sin(2), ...]",
+      "output_summary": "b len=15",
+      "duration_ns": 16772,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "gmres_solve",
+      "action": "gmres",
+      "input_summary": "maxiter=50, tol=1e-10",
+      "output_summary": "converged=true, iters=15",
+      "duration_ns": 624894,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "verify_solution",
+      "action": "compare x with x_true",
+      "input_summary": "max_diff=6.6613e-16",
+      "output_summary": "pass=true",
+      "duration_ns": 4329,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 833680,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_012_gmres --nocapture"
+  }
+}

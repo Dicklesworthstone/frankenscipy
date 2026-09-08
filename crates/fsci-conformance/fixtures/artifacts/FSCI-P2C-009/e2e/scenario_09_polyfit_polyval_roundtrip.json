@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_09_polyfit_polyval_roundtrip",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "polyfit",
+      "action": "polyfit(x, y, deg=2)",
+      "input_summary": "fit quadratic",
+      "output_summary": "coeffs=[2.000000000000003, 2.999999999999987, 1.0000000000000075]",
+      "duration_ns": 21350,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "polyval_roundtrip",
+      "action": "polyval(coeffs, x) matches y",
+      "input_summary": "evaluate fitted polynomial",
+      "output_summary": "max_diff=7.55e-15",
+      "duration_ns": 3787,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "polyfit-polyval",
+    "num_points": 5,
+    "dimensions": 1,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 30999,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_09_polyfit_polyval_roundtrip --nocapture"
+  }
+}

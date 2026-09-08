@@ -1,0 +1,993 @@
+{
+  "packet_id": "FSCI-P2C-002",
+  "family": "linalg_core",
+  "generated_unix_ms": 1780675575244,
+  "runtime": {
+    "python_version": "3.13.7",
+    "numpy_version": "2.4.3",
+    "scipy_version": "1.17.1"
+  },
+  "provenance": {
+    "fixture_input_blake3": "175b91a591d2d80310986a52e1ff37f0a0bff4fd8533ffb8f457dc036d9a6a1a",
+    "oracle_output_blake3": "8ee5f9b360268b06c2777284015ef5c0d9716962c4990cfec63dd8c202a6094a",
+    "capture_blake3": "b505fe6ecc3b7f45fbcfd469e2d0e37ae3eeae7f46be555916b83f85ea235cf7"
+  },
+  "case_outputs": [
+    {
+      "case_id": "solve_general_2x2",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.0,
+          2.5
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_diagonal_ill_conditioned_warning",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.0,
+          1.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_shape_mismatch",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: incompatible shapes: a1.shape=(2, 2) and b1.shape=(1, 1)"
+    },
+    {
+      "case_id": "solve_triangular_lower",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.0,
+          1.25
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_triangular_singular",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "LinAlgError: singular matrix: resolution failed at diagonal 0"
+    },
+    {
+      "case_id": "solve_banded_tridiagonal_plus",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          -2.372881355932204,
+          3.9322033898305095,
+          -4.000000000000001,
+          4.355932203389831,
+          -1.355932203389831
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_banded_invalid_band_shape",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: invalid values for the number of lower and upper diagonals: l+u+1 (4) does not equal ab.shape[0] (3)"
+    },
+    {
+      "case_id": "inv_2x2",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "values": [
+          [
+            -1.9999999999999996,
+            0.9999999999999998
+          ],
+          [
+            1.4999999999999998,
+            -0.4999999999999999
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "inv_singular",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "LinAlgError: A singular matrix detected: slice(s) [0] are singular."
+    },
+    {
+      "case_id": "det_3x3",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 3.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "det_non_square",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: Last 2 dimensions of the array must be square but received shape (2, 3)."
+    },
+    {
+      "case_id": "lstsq_overdetermined",
+      "status": "ok",
+      "result_kind": "lstsq",
+      "result": {
+        "rank": 2,
+        "residuals": [
+          0.7000000000000002
+        ],
+        "singular_values": [
+          4.10003044816824,
+          1.0907567666961069
+        ],
+        "x": [
+          0.9000000000000001,
+          0.9000000000000001
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "lstsq_shape_mismatch",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: Shape mismatch: a and b should have the same number of rows (4 != 3)."
+    },
+    {
+      "case_id": "pinv_rectangular",
+      "status": "ok",
+      "result_kind": "pinv",
+      "result": {
+        "rank": 2,
+        "values": [
+          [
+            1.0,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            1.0,
+            0.0
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "pinv_invalid_thresholds",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: atol and rtol values must be positive."
+    },
+    {
+      "case_id": "solve_3x3_general",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.0,
+          -1.0,
+          -0.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_identity_3x3",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.0,
+          2.0,
+          3.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_symmetric_spd",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.125,
+          0.25
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_transposed",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.25,
+          1.25
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "inv_3x3",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "values": [
+          [
+            1.4999999999999991,
+            -0.49999999999999933,
+            -1.6653345369377348e-16
+          ],
+          [
+            -2.999999999999999,
+            2.4999999999999987,
+            -0.4999999999999995
+          ],
+          [
+            0.9999999999999996,
+            -1.4999999999999991,
+            0.4999999999999998
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "inv_diagonal_3x3",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "values": [
+          [
+            0.2,
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.5,
+            0.0
+          ],
+          [
+            0.0,
+            0.0,
+            0.125
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "det_2x2",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 13.999999999999998
+      },
+      "error": null
+    },
+    {
+      "case_id": "det_1x1",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 7.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "det_identity_4x4",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.0
+      },
+      "error": null
+    },
+    {
+      "case_id": "lstsq_underdetermined",
+      "status": "ok",
+      "result_kind": "lstsq",
+      "result": {
+        "rank": 1,
+        "residuals": [],
+        "singular_values": [
+          1.4142135623730951
+        ],
+        "x": [
+          0.9999999999999996,
+          1.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "pinv_square",
+      "status": "ok",
+      "result_kind": "pinv",
+      "result": {
+        "rank": 2,
+        "values": [
+          [
+            -2.0000000000000018,
+            1.0000000000000009
+          ],
+          [
+            1.5000000000000018,
+            -0.5000000000000007
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_triangular_upper",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.0,
+          2.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_triangular_transpose",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          -2.125,
+          2.75
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_triangular_unit_diag",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          4.0,
+          -1.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "inv_lower_triangular",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "values": [
+          [
+            0.5,
+            0.0
+          ],
+          [
+            -0.375,
+            0.25
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_1x1",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "det_4x4",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": -11.99999999999998
+      },
+      "error": null
+    },
+    {
+      "case_id": "lstsq_exact_square",
+      "status": "ok",
+      "result_kind": "lstsq",
+      "result": {
+        "rank": 2,
+        "residuals": [],
+        "singular_values": [
+          1.0,
+          1.0
+        ],
+        "x": [
+          3.0,
+          4.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "pinv_zero_matrix",
+      "status": "ok",
+      "result_kind": "pinv",
+      "result": {
+        "rank": 0,
+        "values": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_nonsquare_error",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: Expected square matrix, got a1.shape=(2, 3)"
+    },
+    {
+      "case_id": "inv_nonsquare_error",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: Expected square matrix, got a1.shape=(2, 3)"
+    },
+    {
+      "case_id": "solve_10x10_diag_dominant",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          -0.3358598047280307,
+          0.8542959849070371,
+          0.8905550883023652,
+          0.49379396463156583,
+          0.9783029049831918,
+          0.6243676443274344,
+          0.812794371228029,
+          1.1222297437278994,
+          0.9193579426110134,
+          1.8704330562834397
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "inv_10x10_diag_dominant",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "values": [
+          [
+            0.1319080661286971,
+            0.008334632510099419,
+            -0.01818364696796743,
+            -0.022246333928971632,
+            0.004623965897265276,
+            0.004700339237683995,
+            -0.0253900041751717,
+            -0.011123907537170527,
+            0.005044442611792834,
+            -0.017090141815213764
+          ],
+          [
+            0.005999870015146751,
+            0.094545278066391,
+            -0.000912972997717996,
+            0.01919390511433153,
+            0.016702738312644728,
+            0.016144114687593407,
+            0.010122204087327351,
+            -0.0028626893508769775,
+            0.013807743321988315,
+            0.023256687390398136
+          ],
+          [
+            -0.02406044417786505,
+            -0.002901872538590504,
+            0.1417495170755133,
+            0.0265777043108442,
+            0.004541378243389006,
+            0.000728803987842034,
+            0.021927208833654788,
+            -0.0014786616986180632,
+            0.013508816088789052,
+            0.009853968089775662
+          ],
+          [
+            0.005892688719105799,
+            -0.018506818041890943,
+            -0.0033844658295149837,
+            0.08863364935031354,
+            -0.0067554087532711,
+            0.011361439535201629,
+            -0.006834529934438912,
+            0.018374521664455155,
+            0.014090604152926869,
+            -0.007982778251223212
+          ],
+          [
+            -0.012829577144587342,
+            -0.003860072720670755,
+            0.010484613237627408,
+            0.00865425095613926,
+            0.11566684127301352,
+            0.016734767613532785,
+            0.011042349700581553,
+            -0.010608796316906637,
+            -0.005607032449697147,
+            0.031207618666387386
+          ],
+          [
+            -0.005189210627343802,
+            0.00774959075354984,
+            0.01338494799928025,
+            -0.003225413711251669,
+            -0.015197946844707556,
+            0.1254560959557758,
+            0.017060915284935134,
+            0.0033192733935460857,
+            -0.004791430130904463,
+            -0.01928000801810471
+          ],
+          [
+            0.007952665148681202,
+            -0.0004545122932275176,
+            0.016368272941036946,
+            0.01723292695366399,
+            -0.012571280709251596,
+            -0.01746273641618498,
+            0.1191799831725431,
+            -0.00888899478025012,
+            0.000532258134307862,
+            0.008740877889683245
+          ],
+          [
+            -0.01090754350835178,
+            -0.01591072203100635,
+            0.007413765190901654,
+            -0.012061751196141746,
+            0.028854987679857596,
+            -0.00377190667242215,
+            0.001080711702828061,
+            0.09091056802970644,
+            -0.006796871386677968,
+            0.03956432584680246
+          ],
+          [
+            0.007372190853509699,
+            -0.003222917008039308,
+            -0.03175430543138354,
+            -0.0019546200161898353,
+            0.010101127581749985,
+            0.01078259776041091,
+            -0.01911654102252267,
+            -0.002418681152717097,
+            0.13654011984469783,
+            -0.01693840845616087
+          ],
+          [
+            -0.007959063238674034,
+            -0.01502425015017119,
+            0.02055284599027519,
+            0.004870810426016387,
+            0.000625718711933094,
+            0.03208272456159417,
+            -0.00006309367540279423,
+            -0.0020102421703716137,
+            -0.001401542470008406,
+            0.16608113745392022
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_banded_tridiagonal",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.875,
+          0.75,
+          1.1250000000000002
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_spd_3x3",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          -0.013761467889908268,
+          0.19266055045871555,
+          0.4724770642201836
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_hilbert_4x4",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          -4.00000000000043,
+          60.00000000000515,
+          -180.00000000001296,
+          140.0000000000087
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "det_hilbert_4x4",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 1.653439153439039e-7
+      },
+      "error": null
+    },
+    {
+      "case_id": "lstsq_3x2_overdetermined",
+      "status": "ok",
+      "result_kind": "lstsq",
+      "result": {
+        "rank": 2,
+        "residuals": [
+          1.4999999999999998
+        ],
+        "singular_values": [
+          4.079143328941734,
+          0.6004912172131635
+        ],
+        "x": [
+          5.000000000000002,
+          0.5000000000000001
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "pinv_3x2_tall",
+      "status": "ok",
+      "result_kind": "pinv",
+      "result": {
+        "rank": 2,
+        "values": [
+          [
+            0.6666666666666663,
+            -0.3333333333333332,
+            0.3333333333333332
+          ],
+          [
+            -0.33333333333333326,
+            0.6666666666666665,
+            0.3333333333333333
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "pinv_2x3_wide",
+      "status": "ok",
+      "result_kind": "pinv",
+      "result": {
+        "rank": 2,
+        "values": [
+          [
+            0.6666666666666664,
+            -0.3333333333333331
+          ],
+          [
+            -0.33333333333333337,
+            0.6666666666666666
+          ],
+          [
+            0.3333333333333331,
+            0.3333333333333334
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_4x4_general",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.025316455696203,
+          2.5189873417721516,
+          2.20253164556962,
+          2.936708860759494
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "inv_4x4",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "values": [
+          [
+            -0.025316455696202528,
+            0.26582278481012656,
+            -0.21518987341772153,
+            0.11392405063291142
+          ],
+          [
+            0.4810126582278481,
+            -0.05063291139240504,
+            0.08860759493670886,
+            -0.16455696202531647
+          ],
+          [
+            -0.20253164556962025,
+            0.12658227848101264,
+            0.27848101265822783,
+            -0.08860759493670887
+          ],
+          [
+            0.06329113924050633,
+            -0.16455696202531647,
+            0.03797468354430379,
+            0.21518987341772156
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_vandermonde_4x4",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          4.0,
+          3.0,
+          2.0,
+          1.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "det_vandermonde_4x4",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": 11.999999999999948
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_singular_error",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "LinAlgError: A singular matrix detected: slice(s) [0] are singular."
+    },
+    {
+      "case_id": "inv_singular_3x3_error",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "LinAlgError: A singular matrix detected: slice(s) [0] are singular."
+    },
+    {
+      "case_id": "lstsq_rank_deficient",
+      "status": "ok",
+      "result_kind": "lstsq",
+      "result": {
+        "rank": 1,
+        "residuals": [],
+        "singular_values": [
+          5.291502622129182,
+          7.0216669371534e-16
+        ],
+        "x": [
+          0.9999999999999998,
+          1.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_triangular_upper_trans",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.6666666666666667,
+          1.1666666666666663,
+          1.7083333333333337
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_hardened_nan_matrix_rejected",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          "NaN",
+          1.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "solve_triangular_hardened_inf_rhs_rejected",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          "Infinity",
+          1.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "inv_hardened_neg_inf_matrix_rejected",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "values": [
+          [
+            1.0,
+            0.0
+          ],
+          [
+            0.0,
+            -0.0
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "det_hardened_nan_matrix_rejected",
+      "status": "ok",
+      "result_kind": "scalar",
+      "result": {
+        "value": "NaN"
+      },
+      "error": null
+    },
+    {
+      "case_id": "lstsq_hardened_inf_rhs_rejected",
+      "status": "ok",
+      "result_kind": "lstsq",
+      "result": {
+        "rank": 2,
+        "residuals": [],
+        "singular_values": [
+          1.6180339887498951,
+          0.6180339887498947
+        ],
+        "x": [
+          "NaN",
+          "NaN"
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "qr_r_diagonal_2x2",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "values": [
+          [
+            3.0,
+            0.0
+          ],
+          [
+            0.0,
+            2.0
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "svd_singular_values_diagonal_2x2",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.9999999999999996,
+          2.0000000000000004
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cholesky_lower_spd_2x2",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "values": [
+          [
+            2.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.4142135623730951
+          ]
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "eig_real_diagonal_values_2x2",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.0,
+          3.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "eigh_symmetric_values_2x2",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.0,
+          3.0
+        ]
+      },
+      "error": null
+    }
+  ]
+}

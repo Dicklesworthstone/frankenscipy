@@ -1,0 +1,66 @@
+{
+  "scenario_id": "p2c002_02_decomposition_chain",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "solve",
+      "action": "solve(A, b)",
+      "input_summary": "3x3 general",
+      "output_summary": "x=[1.0, 1.0, 1.0], ill_conditioned=false",
+      "duration_ns": 272105,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "check_condition",
+      "action": "inspect rcond warning",
+      "input_summary": "well-conditioned expected",
+      "output_summary": "well-conditioned, proceeding to inv",
+      "duration_ns": 86694,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "compute_inv",
+      "action": "inv(A)",
+      "input_summary": "3x3 general",
+      "output_summary": "inv computed, warning=false",
+      "duration_ns": 133724,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "verify_identity",
+      "action": "A @ inv(A) == I",
+      "input_summary": "check product is identity",
+      "output_summary": "A @ inv(A) = I verified, max_diff=6.11e-16",
+      "duration_ns": 7664,
+      "mode": "strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "matrix_metadata": {
+    "size": [
+      3,
+      3
+    ],
+    "nnz": null,
+    "rcond_estimate": null,
+    "mode": "strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 506629,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_linalg -- p2c002_02_decomposition_chain --nocapture"
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_sparse_018_scc",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "build_graph",
+      "action": "from_triplets",
+      "input_summary": "4 nodes, 2 SCCs",
+      "output_summary": "nnz=5",
+      "duration_ns": 7604,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "find_scc",
+      "action": "strongly_connected_components",
+      "input_summary": "expected 2 SCCs",
+      "output_summary": "num_sccs=2, labels=[1, 1, 0, 0]",
+      "duration_ns": 4769,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_membership",
+      "action": "check SCC groups",
+      "input_summary": "0,1 same; 2,3 same; groups different",
+      "output_summary": "same_01=true, same_23=true, diff=true",
+      "duration_ns": 792,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 126048,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_018_scc --nocapture"
+  }
+}

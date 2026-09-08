@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_sparse_019_helper_oracle",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "write_fixture",
+      "action": "serialize fixture JSON",
+      "input_summary": "cases=14",
+      "output_summary": "/data/tmp/fsci_sparse_helper_fixture_1782559177635678850.json",
+      "duration_ns": 776130,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "run_scipy_oracle",
+      "action": "python3 scipy_sparse_oracle.py",
+      "input_summary": "/data/projects/frankenscipy/crates/fsci-conformance/python_oracle/scipy_sparse_oracle.py",
+      "output_summary": "success=true",
+      "duration_ns": 345572907,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "load_oracle_output",
+      "action": "parse output JSON",
+      "input_summary": "/data/tmp/fsci_sparse_helper_output_1782559177635690422.json",
+      "output_summary": "case_outputs=14",
+      "duration_ns": 414616,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "compare_results",
+      "action": "rust vs scipy helper outputs",
+      "input_summary": "cases=14",
+      "output_summary": "all helper cases matched",
+      "duration_ns": 748489,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 347706258,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_019_helper_oracle --nocapture"
+  }
+}

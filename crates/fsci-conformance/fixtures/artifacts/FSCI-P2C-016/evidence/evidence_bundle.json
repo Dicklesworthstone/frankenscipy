@@ -1,0 +1,654 @@
+{
+  "packet_id": "FSCI-P2C-016",
+  "generated_at": "unix:1788658893",
+  "fixture_manifest": {
+    "packet_id": "FSCI-P2C-016",
+    "family": "constants_core",
+    "generated_at": "unix:1788658893",
+    "fixtures": [
+      {
+        "fixture_id": "speed_of_light_exact",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "planck_exact",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "hbar_derived",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "elementary_charge_exact",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "boltzmann_exact",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "avogadro_exact",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "degree_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "atmosphere_exact",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "calorie_exact",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "pound_mass_exact",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "inch_exact",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "celsius_to_kelvin_freezing",
+        "category": "unit_conversion",
+        "operation": "convert_temperature",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "fahrenheit_to_celsius_boiling",
+        "category": "unit_conversion",
+        "operation": "convert_temperature",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "kelvin_to_rankine_roundtrip",
+        "category": "unit_conversion",
+        "operation": "convert_temperature",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "convert_temperature_unknown_scale",
+        "category": "unit_conversion",
+        "operation": "convert_temperature",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "ev_to_joules_unit",
+        "category": "unit_conversion",
+        "operation": "ev_to_joules",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "joules_to_ev_roundtrip",
+        "category": "unit_conversion",
+        "operation": "joules_to_ev",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "wavelength_to_freq_visible",
+        "category": "unit_conversion",
+        "operation": "wavelength_to_freq",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "freq_to_wavelength_inverse",
+        "category": "unit_conversion",
+        "operation": "freq_to_wavelength",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "deg2rad_half_turn",
+        "category": "derived_units",
+        "operation": "deg2rad",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "rad2deg_quarter_turn",
+        "category": "derived_units",
+        "operation": "rad2deg",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "lb_to_kg_unit",
+        "category": "derived_units",
+        "operation": "lb_to_kg",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "kg_to_lb_roundtrip",
+        "category": "derived_units",
+        "operation": "kg_to_lb",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "constant_value_unknown",
+        "category": "lookup",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "faraday_constant",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "electron_g_factor",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "proton_g_factor",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "neutron_g_factor",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "muon_g_factor",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "thomson_cross_section",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "characteristic_impedance_of_vacuum",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "deuteron_mass",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "alpha_particle_mass",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "muon_mass",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "tau_mass",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "helion_mass",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "triton_mass",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "molar_volume_ideal_gas",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "molar_planck_constant",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "rydberg_constant_times_c_in_hz",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "inverse_fine_structure_constant",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "first_radiation_constant",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "second_radiation_constant",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "electron_proton_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "proton_electron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "bohr_magneton_in_ev_per_t",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "compton_wavelength",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "electron_mass_energy_mev",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "proton_mass_energy_mev",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "neutron_mass_energy_mev",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "muon_mass_energy_mev",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "tau_mass_energy_mev",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "deuteron_mass_energy_mev",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "alpha_particle_mass_energy_mev",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "helion_mass_energy_mev",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "triton_mass_energy_mev",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "proton_compton_wavelength",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "neutron_compton_wavelength",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "muon_compton_wavelength",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "tau_compton_wavelength",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "neutron_electron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "electron_neutron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "muon_electron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "electron_muon_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "proton_neutron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "neutron_proton_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "deuteron_electron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "alpha_particle_electron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "helion_electron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "triton_electron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "tau_electron_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      },
+      {
+        "fixture_id": "electron_tau_mass_ratio",
+        "category": "fundamental_values",
+        "operation": "constant_value",
+        "description": "",
+        "expected_properties": []
+      }
+    ]
+  },
+  "parity_gates": {
+    "packet_id": "FSCI-P2C-016",
+    "all_gates_pass": true,
+    "gates": [
+      {
+        "fixture_id": "constants_exact_values",
+        "category": "fundamental_values",
+        "operation": "fundamental_constants",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-16,
+        "note": "speed_diff=0.000e0, planck_diff=0.000e0, degree_diff=0.000e0"
+      },
+      {
+        "fixture_id": "lookup_aliases",
+        "category": "lookup",
+        "operation": "value",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 0.0,
+        "note": "lookup aliases and unknown-name behavior verified"
+      },
+      {
+        "fixture_id": "partial_find",
+        "category": "lookup",
+        "operation": "find",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 0.0,
+        "note": "planck_hits=3, charge_hits=1"
+      },
+      {
+        "fixture_id": "temperature_roundtrip",
+        "category": "unit_conversion",
+        "operation": "convert_temperature",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "freeze=0.000e0, boil=0.000e0, roundtrip=0.000e0"
+      },
+      {
+        "fixture_id": "energy_roundtrip",
+        "category": "unit_conversion",
+        "operation": "ev_joules",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "exact=0.000e0, roundtrip=0.000e0"
+      },
+      {
+        "fixture_id": "wave_frequency_roundtrip",
+        "category": "unit_conversion",
+        "operation": "wave_frequency",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-18,
+        "note": "recovered wavelength diff=0.000e0"
+      },
+      {
+        "fixture_id": "angle_and_mass_helpers",
+        "category": "derived_units",
+        "operation": "deg_rad_mass",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "deg_diff=0.000e0, rad_diff=0.000e0, mass_diff=0.000e0"
+      }
+    ]
+  },
+  "parity_report": {
+    "packet_id": "FSCI-P2C-016",
+    "operation_summaries": [
+      {
+        "category": "derived_units",
+        "total_fixtures": 1,
+        "passed": 1,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "category": "fundamental_values",
+        "total_fixtures": 1,
+        "passed": 1,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "category": "lookup",
+        "total_fixtures": 2,
+        "passed": 2,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "category": "unit_conversion",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      }
+    ]
+  },
+  "risk_notes": {
+    "packet_id": "FSCI-P2C-016",
+    "notes": [
+      {
+        "category": "alias_lookup_surface",
+        "description": "Short aliases like `c`, `h`, `sigma`, and `ev` are observable API surface; accidental renames or case-handling changes would silently break callers.",
+        "affected_operations": [
+          "value",
+          "find"
+        ],
+        "mitigation": "Keep alias coverage in conformance fixtures and fail closed (`None`) for unknown names instead of returning approximate matches."
+      },
+      {
+        "category": "unit_roundtrip_drift",
+        "description": "Derived helpers compose multiple floating-point operations, so small arithmetic regressions can accumulate in round-trip conversions.",
+        "affected_operations": [
+          "convert_temperature",
+          "ev_to_joules",
+          "joules_to_ev",
+          "wavelength_to_freq",
+          "freq_to_wavelength"
+        ],
+        "mitigation": "Preserve explicit round-trip fixtures with tight tolerances and keep exact-value checks for constants that should not drift."
+      },
+      {
+        "category": "mixed_exact_and_approximate_constants",
+        "description": "Some constants are exact by definition while others are represented to a practical precision. Treating both classes identically can either over-tighten or under-specify parity gates.",
+        "affected_operations": [
+          "fundamental_constants",
+          "deg2rad",
+          "rad2deg"
+        ],
+        "mitigation": "Use exact equality for definition-fixed constants and explicit tolerances for derived/approximate constants in the evidence pack."
+      }
+    ]
+  },
+  "sidecar": null
+}

@@ -1,0 +1,45 @@
+{
+  "packet_id": "FSCI-P2C-005",
+  "notes": [
+    {
+      "category": "naive_dft_performance",
+      "description": "NaiveDft backend is O(n²). For n>1024, performance degrades significantly. Production use requires FFT algorithm (Cooley-Tukey).",
+      "affected_operations": [
+        "fft",
+        "ifft",
+        "rfft",
+        "irfft",
+        "fft2",
+        "fftn"
+      ],
+      "mitigation": "Backend abstraction allows drop-in replacement. NaiveDft serves as oracle for correctness validation."
+    },
+    {
+      "category": "plan_cache_thread_safety",
+      "description": "Shared global plan cache uses Mutex<HashMap>. Concurrent access from parallel tests can cause cache collisions if test sizes overlap.",
+      "affected_operations": [
+        "fft",
+        "ifft"
+      ],
+      "mitigation": "Tests use unique sizes outside proptest ranges. Plan cache is cleared between test groups."
+    },
+    {
+      "category": "finite_input_validation",
+      "description": "NaN/Inf inputs in Strict mode propagate silently. Hardened mode rejects non-finite inputs.",
+      "affected_operations": [
+        "fft",
+        "rfft",
+        "fft2"
+      ],
+      "mitigation": "check_finite option and adversarial test cases cover NaN/Inf propagation behavior."
+    },
+    {
+      "category": "irfft_length_inference",
+      "description": "When output_len is None, irfft infers 2*(n-1). Mismatched lengths produce incorrect reconstructions.",
+      "affected_operations": [
+        "irfft"
+      ],
+      "mitigation": "E2E tests cover explicit and inferred output lengths. Error cases return FftError."
+    }
+  ]
+}

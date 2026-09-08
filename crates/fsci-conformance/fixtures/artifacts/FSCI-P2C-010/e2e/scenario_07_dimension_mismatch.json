@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_07_dimension_mismatch",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "pdist_dim_mismatch",
+      "action": "pdist([[1,2], [1,2,3]], ...)",
+      "input_summary": "inconsistent dimensions",
+      "output_summary": "correctly rejected dimension mismatch",
+      "duration_ns": 2635,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "cdist_dim_mismatch",
+      "action": "cdist(2D, 3D)",
+      "input_summary": "xa and xb different dims",
+      "output_summary": "correctly rejected dimension mismatch",
+      "duration_ns": 1473,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "kdtree_query_dim_mismatch",
+      "action": "tree.query(wrong_dim)",
+      "input_summary": "query with wrong dimension",
+      "output_summary": "correctly rejected query dimension mismatch",
+      "duration_ns": 17503,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "spatial_metadata": {
+    "operation": "error_handling",
+    "n_points": 0,
+    "n_dims": 0,
+    "metric": "N/A"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 191593,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_spatial -- scenario_07_dimension_mismatch --nocapture"
+  }
+}

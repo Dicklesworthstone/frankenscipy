@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_25_welch_clamps_oversized_nperseg",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "welch_oversized_nperseg_clamps",
+      "action": "welch(x, fs=10.0, nperseg=16)",
+      "input_summary": "oversized nperseg should clamp to signal length and match SciPy reference output",
+      "output_summary": "freq_diff=0.00e0, clamp_psd_diff=0.00e0",
+      "duration_ns": 104699,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "welch",
+    "signal_length": 5,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 106963,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_25_welch_clamps_oversized_nperseg --nocapture"
+  }
+}

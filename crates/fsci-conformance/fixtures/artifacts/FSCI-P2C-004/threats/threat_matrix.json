@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-004",
+  "scope": "packet",
+  "generated_at": "2026-02-14T17:39:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.14.0",
+        "description": "Sparse array API expansion (1D/ND array variants) affects constructor and conversion edge behavior.",
+        "affected_functions": [
+          "csr_array",
+          "coo_array",
+          "csc_array",
+          "coo_array.tocsr",
+          "coo_array.tocsc"
+        ]
+      },
+      {
+        "version": "1.15.0",
+        "description": "Sparse triangular inspection utilities and warning behavior changed for some inefficient format paths.",
+        "affected_functions": [
+          "spsolve_triangular",
+          "is_sptriangular",
+          "spbandwidth"
+        ]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-sparse",
+      "category": "resource_exhaustion",
+      "severity": "critical",
+      "likelihood": "likely",
+      "description": "Sparse LU factorization can exhibit fill-in explosion, causing memory growth toward dense O(n^2) storage and severe runtime tails.",
+      "mitigation": "Track fill ratio (nnz(L+U)/nnz(A)) and enforce hardened-mode fill budget with deterministic termination and artifact capture.",
+      "test_reference": "P2C-004/threats/test_fill_in_explosion.json",
+      "strict_mode_response": "Allow SciPy-compatible factorization progression and surface backend warnings/errors as observed.",
+      "hardened_mode_response": "Fail closed when projected fill exceeds configured budget and emit structured resource-exhaustion diagnostics.",
+      "required_artifact": "P2C-004/threats/fill_in_explosion.report.json"
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-sparse",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Near-structural-singular sparse systems may pass initial checks yet produce large residuals or NaN outputs depending on pivot path.",
+      "mitigation": "Apply structural singularity prechecks and post-solve residual verification; escalate to fail-closed on unstable residual envelopes.",
+      "test_reference": "P2C-004/threats/test_structural_singularity.json",
+      "strict_mode_response": "Preserve SciPy-observable backend behavior, including warning-vs-error distinctions where applicable.",
+      "hardened_mode_response": "Reject numerically unstable solves once residual or pivot diagnostics exceed hardened thresholds.",
+      "required_artifact": "P2C-004/threats/structural_singularity.report.json"
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-sparse",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Permutation-ordering changes (COLAMD vs NATURAL or other orderings) can materially alter conditioning and solver accuracy on the same input.",
+      "mitigation": "Record permutation policy in solver evidence and include ordering-sensitive conformance fixtures to bound acceptable drift.",
+      "test_reference": "P2C-004/threats/test_ordering_sensitivity.json",
+      "strict_mode_response": "Default to SciPy-compatible COLAMD behavior and permit explicit ordering overrides.",
+      "hardened_mode_response": "Restrict to allowlisted orderings and reject unknown/unsafe ordering options fail-closed.",
+      "required_artifact": "P2C-004/threats/ordering_sensitivity.report.json"
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-sparse",
+      "category": "malformed_input",
+      "severity": "critical",
+      "likelihood": "likely",
+      "description": "Out-of-bounds indices in CSR/CSC/COO metadata can trigger undefined access patterns or backend corruption if not validated early.",
+      "mitigation": "Enforce pointer/index bounds validation before conversion or solver dispatch; reject malformed metadata deterministically.",
+      "test_reference": "P2C-004/threats/test_index_out_of_bounds.json",
+      "strict_mode_response": "Raise SciPy-compatible argument/shape errors on invalid index ranges.",
+      "hardened_mode_response": "Reject with diagnostics including offending index and dimension envelope; never forward malformed structures.",
+      "required_artifact": "P2C-004/threats/index_out_of_bounds.report.json"
+    },
+    {
+      "threat_id": "THREAT-005",
+      "subsystem": "fsci-sparse",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "Unsorted compressed indices and duplicate COO entries can produce ambiguous semantics if canonicalization is inconsistently applied.",
+      "mitigation": "Track canonicality explicitly, require deterministic sum_duplicates behavior, and gate conversions on canonicalization policy.",
+      "test_reference": "P2C-004/threats/test_duplicate_unsorted_semantics.json",
+      "strict_mode_response": "Mirror SciPy behavior by allowing non-canonical inputs and applying canonicalization when conversion semantics require it.",
+      "hardened_mode_response": "Require explicit canonicalization for high-risk operations and reject ambiguous duplicate/ordering states when policy demands.",
+      "required_artifact": "P2C-004/threats/duplicate_unsorted_semantics.report.json"
+    },
+    {
+      "threat_id": "THREAT-006",
+      "subsystem": "fsci-sparse",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Corrupted pointer metadata (non-monotone indptr, invalid endpoint nnz, or index-width overflow) can compromise all downstream operations.",
+      "mitigation": "Validate monotonic pointer invariants, endpoint consistency, and index-width representability before any sparse kernel access.",
+      "test_reference": "P2C-004/threats/test_pointer_metadata_corruption.json",
+      "strict_mode_response": "Emit SciPy-compatible validation failure for malformed compressed metadata.",
+      "hardened_mode_response": "Fail closed with detailed pointer invariant diagnostics and disallow recovery-by-guessing.",
+      "required_artifact": "P2C-004/threats/pointer_metadata_corruption.report.json"
+    },
+    {
+      "threat_id": "THREAT-007",
+      "subsystem": "fsci-sparse",
+      "category": "resource_exhaustion",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Pathological sparse construction patterns (block composition, random generators, repeated concatenations) can degrade into dense-equivalent storage.",
+      "mitigation": "Apply construction-time density gates, projected-memory checks, and hardened-mode abort thresholds with reproducible diagnostics.",
+      "test_reference": "P2C-004/threats/test_dense_equivalent_construction.json",
+      "strict_mode_response": "Preserve SciPy-like construction behavior and warnings for inefficient format/materialization paths.",
+      "hardened_mode_response": "Reject construction requests exceeding configured density or memory budgets and emit bounded-recovery reports.",
+      "required_artifact": "P2C-004/threats/dense_equivalent_construction.report.json"
+    },
+    {
+      "threat_id": "THREAT-008",
+      "subsystem": "fsci-sparse",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "likely",
+      "description": "Implicit format conversion behavior (warning vs error, conversion direction, canonicalization timing) drifts across SciPy versions.",
+      "mitigation": "Pin strict-mode compatibility envelope and capture version-specific deltas in explicit allowlisted differences.",
+      "test_reference": "P2C-004/threats/test_implicit_conversion_compat.json",
+      "strict_mode_response": "Conform to the declared SciPy version envelope and warning semantics for conversion pathways.",
+      "hardened_mode_response": "Require explicit conversion intent for unsafe paths and reject unknown conversion drift outside the envelope.",
+      "required_artifact": "P2C-004/threats/implicit_conversion_compat.report.json"
+    },
+    {
+      "threat_id": "THREAT-009",
+      "subsystem": "fsci-sparse",
+      "category": "compatibility_drift",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "UMFPACK-versus-SuperLU dispatch differences can alter both numeric output and failure/warning surface for identical sparse problems.",
+      "mitigation": "Record backend selection deterministically, require oracle-backed differential fixtures for both backend classes, and gate drift in strict mode.",
+      "test_reference": "P2C-004/threats/test_backend_dispatch_drift.json",
+      "strict_mode_response": "Follow SciPy dispatch rules (UMFPACK preference when enabled/available for compatible RHS), including backend-specific semantics.",
+      "hardened_mode_response": "Allow only audited backend configurations and reject unknown backend states or incompatible runtime environments.",
+      "required_artifact": "P2C-004/threats/backend_dispatch_drift.report.json"
+    },
+    {
+      "threat_id": "THREAT-010",
+      "subsystem": "fsci-sparse",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Array-vs-matrix API differences in sparse constructors and return types can introduce user-visible compatibility regressions.",
+      "mitigation": "Codify return-type contracts per operation and enforce strict-mode parity snapshots against SciPy array/matrix behavior.",
+      "test_reference": "P2C-004/threats/test_array_matrix_api_compat.json",
+      "strict_mode_response": "Preserve SciPy-observable type/shape behavior for scoped APIs and compatibility fixtures.",
+      "hardened_mode_response": "Reject unsupported mixed-mode API combinations unless explicitly allowlisted with audit metadata.",
+      "required_artifact": "P2C-004/threats/array_matrix_api_compat.report.json"
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "unknown sparse format tag or unsupported dimensionality",
+      "policy": "reject",
+      "strict_mode_action": "Return compatibility-aligned argument error for unsupported format configuration.",
+      "hardened_mode_action": "Reject immediately with explicit unsupported-format diagnostics and no fallback conversion.",
+      "override_mechanism": "Feature-gated allowlist update with bead-linked audit entry."
+    },
+    {
+      "input_class": "index-domain overflow or malformed compressed pointers",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Raise input validation error consistent with strict compatibility envelope.",
+      "hardened_mode_action": "Reject with structured pointer/index invariant report before kernel invocation.",
+      "override_mechanism": "No runtime override; requires code-level parser contract update."
+    },
+    {
+      "input_class": "unknown backend/permutation configuration",
+      "policy": "allowlist_only",
+      "strict_mode_action": "Use envelope-compatible backend defaults when request is omitted or canonical.",
+      "hardened_mode_action": "Reject non-allowlisted backend/permutation combinations with explicit policy failure.",
+      "override_mechanism": "Controlled backend allowlist expansion with governance review."
+    },
+    {
+      "input_class": "resource budget projection exceeded",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Allow execution to follow SciPy-like behavior unless hard runtime failure occurs.",
+      "hardened_mode_action": "Abort pre-execution when fill/memory budget projection exceeds configured limits.",
+      "override_mechanism": "Temporary budget override flag with mandatory audit artifact."
+    },
+    {
+      "input_class": "compatibility envelope drift beyond declared SciPy range",
+      "policy": "reject",
+      "strict_mode_action": "Block strict-mode execution pending compatibility matrix update.",
+      "hardened_mode_action": "Block execution and emit compatibility drift diagnostics artifact.",
+      "override_mechanism": "Owner-approved envelope update tracked in bead and schema-validation evidence."
+    }
+  ]
+}

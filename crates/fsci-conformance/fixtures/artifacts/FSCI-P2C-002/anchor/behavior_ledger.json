@@ -1,0 +1,287 @@
+{
+  "packet_id": "FSCI-P2C-002",
+  "domain": "linalg",
+  "generated_at": "2026-02-14T06:30:00Z",
+  "schema_version": 1,
+  "functions": [
+    {
+      "name": "solve",
+      "scipy_path": "scipy.linalg.solve",
+      "source_file": "scipy/linalg/_basic.py:58",
+      "signature": "solve(a, b, lower=False, overwrite_a=False, overwrite_b=False, check_finite=True, assume_a=None, transposed=False)",
+      "parameters": [
+        {"name": "a", "type": "array_like, shape (..., N, N)", "required": true, "description": "Square left-hand side matrix or batch of matrices"},
+        {"name": "b", "type": "array_like, shape (..., N) or (..., N, NRHS)", "required": true, "description": "Right-hand side vector or matrix"},
+        {"name": "lower", "type": "bool", "required": false, "default": "false", "description": "Use lower triangle for sym/her/pos. Ignored otherwise."},
+        {"name": "overwrite_a", "type": "bool", "required": false, "default": "false", "description": "Allow overwriting a (performance optimization)"},
+        {"name": "overwrite_b", "type": "bool", "required": false, "default": "false", "description": "Allow overwriting b (performance optimization)"},
+        {"name": "check_finite", "type": "bool", "required": false, "default": "true", "description": "Check inputs for NaN/Inf"},
+        {"name": "assume_a", "type": "str or None", "required": false, "default": "null", "description": "Matrix structure hint: general/diagonal/tridiagonal/banded/upper triangular/lower triangular/symmetric/hermitian/positive definite. None = auto-detect."},
+        {"name": "transposed", "type": "bool", "required": false, "default": "false", "description": "Solve a^T x = b instead of a x = b"}
+      ],
+      "returns": {
+        "type": "ndarray, shape (..., N) or (..., N, NRHS)",
+        "description": "Solution x. Shape matches b."
+      },
+      "error_conditions": [
+        {"condition": "a is not square", "exception": "ValueError", "message_pattern": "Expected square matrix"},
+        {"condition": "a.ndim < 2", "exception": "ValueError", "message_pattern": "Expected at least ndim=2"},
+        {"condition": "b.shape[-2] != a.shape[-1]", "exception": "ValueError", "message_pattern": "incompatible shapes"},
+        {"condition": "a is singular", "exception": "LinAlgError", "message_pattern": "singular matrix"},
+        {"condition": "invalid assume_a value", "exception": "ValueError", "message_pattern": "not a recognized matrix structure"},
+        {"condition": "complex matrix with transposed=True", "exception": "NotImplementedError", "message_pattern": "can currently not solve a^T x = b"}
+      ],
+      "edge_cases": [
+        {"scenario": "empty matrix (a.size == 0 or b.size == 0)", "behavior": "returns empty array with matching shape"},
+        {"scenario": "scalar matrix (a.size == 1)", "behavior": "returns b/a, raises LinAlgError if a==0"},
+        {"scenario": "assume_a=None", "behavior": "auto-detects structure per-slice: diagonal, triangular, symmetric, pos-def, general"},
+        {"scenario": "batch dimensions", "behavior": "broadcast batch dims of a and b, solve per-slice"}
+      ],
+      "lapack_dispatch": {
+        "general": "dgesv (LU factorization + solve)",
+        "symmetric": "dsysv (Bunch-Kaufman)",
+        "positive_definite": "dposv (Cholesky)",
+        "triangular": "dtrsv",
+        "diagonal": "element-wise division",
+        "banded": "dgbsv"
+      }
+    },
+    {
+      "name": "solve_triangular",
+      "scipy_path": "scipy.linalg.solve_triangular",
+      "source_file": "scipy/linalg/_basic.py:273",
+      "signature": "solve_triangular(a, b, trans=0, lower=False, unit_diagonal=False, overwrite_b=False, check_finite=True)",
+      "parameters": [
+        {"name": "a", "type": "array_like, shape (M, M)", "required": true, "description": "Triangular matrix"},
+        {"name": "b", "type": "array_like, shape (M,) or (M, N)", "required": true, "description": "Right-hand side"},
+        {"name": "trans", "type": "int or str", "required": false, "default": "0", "description": "0/'N': a x = b, 1/'T': a^T x = b, 2/'C': a^H x = b"},
+        {"name": "lower", "type": "bool", "required": false, "default": "false", "description": "Use lower triangle of a"},
+        {"name": "unit_diagonal", "type": "bool", "required": false, "default": "false", "description": "Assume diagonal elements are 1"},
+        {"name": "overwrite_b", "type": "bool", "required": false, "default": "false", "description": "Allow overwriting b"},
+        {"name": "check_finite", "type": "bool", "required": false, "default": "true", "description": "Check inputs for NaN/Inf"}
+      ],
+      "returns": {
+        "type": "ndarray, shape (M,) or (M, N)",
+        "description": "Solution x, shape matches b"
+      },
+      "error_conditions": [
+        {"condition": "a is not square", "exception": "ValueError", "message_pattern": "expected square matrix"},
+        {"condition": "a and b shapes incompatible", "exception": "ValueError", "message_pattern": "incompatible dimensions"},
+        {"condition": "singular triangular (zero diagonal)", "exception": "LinAlgError", "message_pattern": "singular matrix"}
+      ],
+      "edge_cases": [
+        {"scenario": "unit_diagonal=True with zero diagonal", "behavior": "diagonal not referenced, no singularity check on diagonal"},
+        {"scenario": "trans=2 with real matrix", "behavior": "equivalent to trans=1 (transpose)"}
+      ],
+      "lapack_dispatch": {
+        "default": "dtrtrs (triangular solve)"
+      }
+    },
+    {
+      "name": "solve_banded",
+      "scipy_path": "scipy.linalg.solve_banded",
+      "source_file": "scipy/linalg/_basic.py:385",
+      "signature": "solve_banded(l_and_u, ab, b, overwrite_ab=False, overwrite_b=False, check_finite=True)",
+      "parameters": [
+        {"name": "l_and_u", "type": "tuple of (int, int)", "required": true, "description": "Number of non-zero lower and upper diagonals (l, u)"},
+        {"name": "ab", "type": "array_like, shape (l+u+1, M)", "required": true, "description": "Banded matrix in LAPACK banded storage: ab[u+i-j, j] == a[i,j]"},
+        {"name": "b", "type": "array_like, shape (M,) or (M, K)", "required": true, "description": "Right-hand side"},
+        {"name": "overwrite_ab", "type": "bool", "required": false, "default": "false", "description": "Allow overwriting ab"},
+        {"name": "overwrite_b", "type": "bool", "required": false, "default": "false", "description": "Allow overwriting b"},
+        {"name": "check_finite", "type": "bool", "required": false, "default": "true", "description": "Check inputs for NaN/Inf"}
+      ],
+      "returns": {
+        "type": "ndarray, shape (M,) or (M, K)",
+        "description": "Solution x"
+      },
+      "error_conditions": [
+        {"condition": "ab.shape[0] != l+u+1", "exception": "ValueError", "message_pattern": "invalid values for the number of lower and upper diagonals"},
+        {"condition": "singular banded matrix", "exception": "LinAlgError", "message_pattern": "singular matrix"}
+      ],
+      "edge_cases": [
+        {"scenario": "l=0, u=0 (diagonal only)", "behavior": "element-wise division"},
+        {"scenario": "batch dimensions", "behavior": "broadcast and solve per-slice"}
+      ],
+      "lapack_dispatch": {
+        "default": "dgbsv (banded LU factorization + solve)"
+      }
+    },
+    {
+      "name": "inv",
+      "scipy_path": "scipy.linalg.inv",
+      "source_file": "scipy/linalg/_basic.py:968",
+      "signature": "inv(a, overwrite_a=False, check_finite=True, *, assume_a=None, lower=False)",
+      "parameters": [
+        {"name": "a", "type": "array_like, shape (..., M, M)", "required": true, "description": "Square matrix or batch to invert"},
+        {"name": "overwrite_a", "type": "bool", "required": false, "default": "false", "description": "Allow overwriting a"},
+        {"name": "check_finite", "type": "bool", "required": false, "default": "true", "description": "Check inputs for NaN/Inf"},
+        {"name": "assume_a", "type": "str or None", "required": false, "default": "null", "description": "Matrix structure hint: general/diagonal/upper triangular/lower triangular/pos/sym/her. None = auto-detect."},
+        {"name": "lower", "type": "bool", "required": false, "default": "false", "description": "Use lower triangle for sym/her/pos"}
+      ],
+      "returns": {
+        "type": "ndarray, shape (..., M, M)",
+        "description": "Inverse of a"
+      },
+      "error_conditions": [
+        {"condition": "a is singular", "exception": "LinAlgError", "message_pattern": "singular matrix"},
+        {"condition": "a is not square", "exception": "ValueError", "message_pattern": "not square"},
+        {"condition": "a.ndim < 2", "exception": "ValueError", "message_pattern": "Expected at least ndim=2"}
+      ],
+      "edge_cases": [
+        {"scenario": "scalar matrix", "behavior": "returns 1/a, raises if a==0"},
+        {"scenario": "empty matrix", "behavior": "returns empty matrix"},
+        {"scenario": "near-singular (high condition)", "behavior": "may emit ill-conditioned warning"}
+      ],
+      "lapack_dispatch": {
+        "general": "dgetrf + dgetri (LU factorize then invert)",
+        "symmetric": "dsytrf + dsytri (Bunch-Kaufman)",
+        "positive_definite": "dpotrf + dpotri (Cholesky)",
+        "triangular": "dtrtri",
+        "diagonal": "element-wise reciprocal"
+      }
+    },
+    {
+      "name": "det",
+      "scipy_path": "scipy.linalg.det",
+      "source_file": "scipy/linalg/_basic.py:1109",
+      "signature": "det(a, overwrite_a=False, check_finite=True)",
+      "parameters": [
+        {"name": "a", "type": "array_like, shape (..., M, M)", "required": true, "description": "Square matrix or batch"},
+        {"name": "overwrite_a", "type": "bool", "required": false, "default": "false", "description": "Allow overwriting a"},
+        {"name": "check_finite", "type": "bool", "required": false, "default": "true", "description": "Check inputs for NaN/Inf"}
+      ],
+      "returns": {
+        "type": "float or complex or ndarray",
+        "description": "Determinant of a"
+      },
+      "error_conditions": [
+        {"condition": "a is not square", "exception": "ValueError", "message_pattern": "Expected square matrix"},
+        {"condition": "a.ndim < 2", "exception": "ValueError", "message_pattern": "Expected at least ndim=2"}
+      ],
+      "edge_cases": [
+        {"scenario": "singular matrix", "behavior": "returns 0.0 (not an error)"},
+        {"scenario": "1x1 matrix", "behavior": "returns the single element"},
+        {"scenario": "2x2 matrix", "behavior": "uses ad-bc formula directly"},
+        {"scenario": "empty matrix (0x0)", "behavior": "returns 1.0 (empty product)"},
+        {"scenario": "batch dimensions", "behavior": "returns array of determinants"}
+      ],
+      "lapack_dispatch": {
+        "default": "dgetrf (LU factorization, then product of diagonal)"
+      }
+    },
+    {
+      "name": "lstsq",
+      "scipy_path": "scipy.linalg.lstsq",
+      "source_file": "scipy/linalg/_basic.py:1237",
+      "signature": "lstsq(a, b, cond=None, overwrite_a=False, overwrite_b=False, check_finite=True, lapack_driver=None)",
+      "parameters": [
+        {"name": "a", "type": "array_like, shape (M, N)", "required": true, "description": "Left-hand side matrix (not necessarily square)"},
+        {"name": "b", "type": "array_like, shape (M,) or (M, K)", "required": true, "description": "Right-hand side"},
+        {"name": "cond", "type": "float or None", "required": false, "default": "null", "description": "Cutoff for small singular values. None = machine precision * max(M,N)"},
+        {"name": "overwrite_a", "type": "bool", "required": false, "default": "false", "description": "Allow overwriting a"},
+        {"name": "overwrite_b", "type": "bool", "required": false, "default": "false", "description": "Allow overwriting b"},
+        {"name": "check_finite", "type": "bool", "required": false, "default": "true", "description": "Check inputs for NaN/Inf"},
+        {"name": "lapack_driver", "type": "str or None", "required": false, "default": "null", "description": "'gelsd' (default), 'gelsy', 'gelss'"}
+      ],
+      "returns": {
+        "type": "tuple (x, residuals, rank, singular_values)",
+        "fields": [
+          {"name": "x", "type": "ndarray, shape (N,) or (N, K)", "description": "Least-squares solution"},
+          {"name": "residuals", "type": "ndarray", "description": "Sum of squared residuals. Empty if rank < N or M <= N."},
+          {"name": "rank", "type": "int", "description": "Effective rank of a"},
+          {"name": "singular_values", "type": "ndarray, shape (min(M,N),)", "description": "Singular values of a in descending order"}
+        ]
+      },
+      "error_conditions": [
+        {"condition": "a.ndim != 2", "exception": "ValueError", "message_pattern": "expected matrix"},
+        {"condition": "M != len(b)", "exception": "ValueError", "message_pattern": "incompatible dimensions"},
+        {"condition": "LAPACK convergence failure", "exception": "LinAlgError", "message_pattern": "SVD did not converge"}
+      ],
+      "edge_cases": [
+        {"scenario": "overdetermined (M > N)", "behavior": "minimizes ||Ax - b||_2"},
+        {"scenario": "underdetermined (M < N)", "behavior": "returns minimum-norm solution"},
+        {"scenario": "rank-deficient a", "behavior": "uses cond to determine effective rank, residuals may be empty"},
+        {"scenario": "cond=None", "behavior": "default cutoff = machine_eps * max(M,N)"}
+      ],
+      "lapack_dispatch": {
+        "gelsd": "SVD-based with divide-and-conquer (default, most robust)",
+        "gelsy": "QR with column pivoting (fastest for well-conditioned)",
+        "gelss": "SVD-based (older, slower than gelsd)"
+      }
+    },
+    {
+      "name": "pinv",
+      "scipy_path": "scipy.linalg.pinv",
+      "source_file": "scipy/linalg/_basic.py:1444",
+      "signature": "pinv(a, *, atol=None, rtol=None, return_rank=False, check_finite=True)",
+      "parameters": [
+        {"name": "a", "type": "array_like, shape (..., M, N)", "required": true, "description": "Matrix to pseudo-invert (may be non-square)"},
+        {"name": "atol", "type": "float or None", "required": false, "default": "null", "description": "Absolute threshold for small singular values. None = 0"},
+        {"name": "rtol", "type": "float or None", "required": false, "default": "null", "description": "Relative threshold. None = max(M,N) * machine_eps"},
+        {"name": "return_rank", "type": "bool", "required": false, "default": "false", "description": "If True, also return the effective rank"},
+        {"name": "check_finite", "type": "bool", "required": false, "default": "true", "description": "Check inputs for NaN/Inf"}
+      ],
+      "returns": {
+        "type": "ndarray, shape (..., N, M) [or tuple with rank]",
+        "description": "Pseudo-inverse of a. If return_rank=True, returns (pinv, rank)."
+      },
+      "error_conditions": [
+        {"condition": "a.ndim < 2", "exception": "ValueError", "message_pattern": "expected at least 2D"}
+      ],
+      "edge_cases": [
+        {"scenario": "square invertible matrix", "behavior": "equivalent to inv(a)"},
+        {"scenario": "all-zero matrix", "behavior": "returns all-zero matrix, rank=0"},
+        {"scenario": "atol and rtol both None", "behavior": "atol=0, rtol=max(M,N)*eps"},
+        {"scenario": "batch dimensions", "behavior": "pseudo-invert per-slice"}
+      ],
+      "lapack_dispatch": {
+        "default": "dgesdd (SVD divide-and-conquer), then threshold singular values"
+      }
+    }
+  ],
+  "version_differences_1_12_to_1_17": [
+    {
+      "version": "1.14",
+      "change": "solve() gained batch dimension support and auto-detection of matrix structure (assume_a=None)"
+    },
+    {
+      "version": "1.14",
+      "change": "inv() gained assume_a parameter for structure-aware inversion"
+    },
+    {
+      "version": "1.14",
+      "change": "det() gained batch dimension support"
+    },
+    {
+      "version": "1.14",
+      "change": "pinv() switched from cond parameter to atol/rtol"
+    }
+  ],
+  "undefined_regions": [
+    {
+      "function": "solve",
+      "region": "NaN/Inf inputs with check_finite=False",
+      "behavior": "undefined: may crash, produce NaN, or silently corrupt output"
+    },
+    {
+      "function": "solve",
+      "region": "extremely ill-conditioned matrix (cond > 1e16)",
+      "behavior": "solution may be numerically meaningless; no error raised but result unreliable"
+    },
+    {
+      "function": "solve_triangular",
+      "region": "non-triangular matrix passed as a",
+      "behavior": "uses only the specified triangle; off-triangle elements ignored silently"
+    },
+    {
+      "function": "lstsq",
+      "region": "residuals when rank(a) < N",
+      "behavior": "returns empty array for residuals"
+    },
+    {
+      "function": "all",
+      "region": "complex-valued inputs",
+      "behavior": "dispatches to complex LAPACK routines (zgesv, etc). dtype of a determines dispatch, not values."
+    }
+  ]
+}

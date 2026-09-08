@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_sparse_022_lil_matrix_slicing",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "row_slice_full_columns",
+      "action": "lil.slice(rows=1:3, cols=:)",
+      "input_summary": "SciPy row slice should preserve row order and full-width columns",
+      "output_summary": "dense=[[0.0, 0.0, 0.0, 5.0, 0.0], [7.0, 0.0, 0.0, 0.0, 0.0]]",
+      "duration_ns": 19116,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "column_slice_full_rows",
+      "action": "lil.slice(rows=:, cols=1:4)",
+      "input_summary": "SciPy column slice should rebase column indices into the sliced matrix",
+      "output_summary": "dense=[[2.0, 0.0, 0.0], [0.0, 0.0, 5.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]",
+      "duration_ns": 3767,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "stepped_column_slice",
+      "action": "lil.slice(rows=1:4, cols=1:5:2)",
+      "input_summary": "positive-step SciPy slicing should keep only every second in-range column",
+      "output_summary": "dense=[[0.0, 5.0], [0.0, 0.0], [0.0, 0.0]]",
+      "duration_ns": 2695,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 178097,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_022_lil_matrix_slicing --nocapture"
+  }
+}

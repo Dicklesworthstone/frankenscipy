@@ -1,0 +1,1007 @@
+{
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-012_stats_core.json",
+  "packet_id": "FSCI-P2C-012",
+  "family": "stats_core",
+  "pass_count": 71,
+  "fail_count": 0,
+  "oracle_status": {
+    "status": "available"
+  },
+  "per_case_results": [
+    {
+      "case_id": "describe_8pt",
+      "passed": true,
+      "message": "describe_result match",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "skew_asymmetric",
+      "passed": true,
+      "message": "scalar match: -0.6",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kurtosis_uniform",
+      "passed": true,
+      "message": "scalar match: -1.2242424242424244",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "pearsonr_linear",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "pearsonr_negative",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "spearmanr_monotonic",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 1.4042654220543602e-24,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linregress_perfect",
+      "passed": true,
+      "message": "linregress_result match",
+      "max_diff": 1.2004217548761418e-30,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linregress_noisy",
+      "passed": true,
+      "message": "linregress_result match",
+      "max_diff": 2.456368441983159e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ttest_1samp_zero",
+      "passed": true,
+      "message": "ttest_result match",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ttest_1samp_shifted",
+      "passed": true,
+      "message": "ttest_result match",
+      "max_diff": 1.8318679906315083e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ks_2samp_same",
+      "passed": true,
+      "message": "goodness_result match",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ks_2samp_different",
+      "passed": true,
+      "message": "goodness_result match",
+      "max_diff": 2.7755575615628914e-17,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "zscore_5pt",
+      "passed": true,
+      "message": "array match (5 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "sem_5pt",
+      "passed": true,
+      "message": "scalar match: 0.7071067811865476",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iqr_8pt",
+      "passed": true,
+      "message": "scalar match: 3.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "moment_k2",
+      "passed": true,
+      "message": "scalar match: 2",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "moment_k3",
+      "passed": true,
+      "message": "scalar match: 0",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "variation_5pt",
+      "passed": true,
+      "message": "scalar match: 0.47140452079103173",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "entropy_uniform",
+      "passed": true,
+      "message": "scalar match: 1.3862943611198906",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "shapiro_normal",
+      "passed": true,
+      "message": "goodness_result match",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 1e-6,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "skew_symmetric",
+      "passed": true,
+      "message": "scalar match: 0",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kurtosis_peaked",
+      "passed": true,
+      "message": "scalar match: 3.888318009734995",
+      "max_diff": 1.7763568394002505e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "pearsonr_uncorrelated",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linregress_negative_slope",
+      "passed": true,
+      "message": "linregress_result match",
+      "max_diff": 1.2004217548761418e-30,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "iqr_small_4pt",
+      "passed": true,
+      "message": "scalar match: 1.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "moment_k4",
+      "passed": true,
+      "message": "scalar match: 6.8",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "entropy_concentrated",
+      "passed": true,
+      "message": "scalar match: 0.02371876133018424",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "variation_high_mean",
+      "passed": true,
+      "message": "scalar match: 0.11785113019775793",
+      "max_diff": 1.3877787807814457e-17,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "sem_10pt",
+      "passed": true,
+      "message": "scalar match: 0.9574271077563381",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "describe_3pt",
+      "passed": true,
+      "message": "describe_result match",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_describe_8pt",
+      "passed": true,
+      "message": "describe_result match",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_skew_asymmetric",
+      "passed": true,
+      "message": "scalar match: -0.6",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_kurtosis_uniform",
+      "passed": true,
+      "message": "scalar match: -1.2242424242424244",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_pearsonr_linear",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_pearsonr_negative",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ttest_ind_shifted_groups",
+      "passed": true,
+      "message": "ttest_result match",
+      "max_diff": 4.163336342344337e-17,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ttest_ind_identical_groups",
+      "passed": true,
+      "message": "ttest_result match",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "mannwhitneyu_shifted_groups",
+      "passed": true,
+      "message": "ttest_result match",
+      "max_diff": 9.71445146547012e-17,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_4nkk_cauchy_pdf_0_at_origin",
+      "passed": true,
+      "message": "scalar match: 0.3183098861837907",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_4nkk_cauchy_pdf_at_scale",
+      "passed": true,
+      "message": "scalar match: 0.15915494309189535",
+      "max_diff": 2.7755575615628914e-17,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_4nkk_cauchy_cdf_at_origin",
+      "passed": true,
+      "message": "scalar match: 0.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_4nkk_cauchy_cdf_at_scale",
+      "passed": true,
+      "message": "scalar match: 0.75",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_4nkk_cauchy_ppf_quartile",
+      "passed": true,
+      "message": "scalar match: 0.9999999999999999",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_chi2_pdf",
+      "passed": true,
+      "message": "scalar match: 0.20755374871029733",
+      "max_diff": 5.551115123125783e-17,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_chi2_cdf",
+      "passed": true,
+      "message": "scalar match: 0.4275932955291201",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_chi2_ppf",
+      "passed": true,
+      "message": "scalar match: 2.3659738843753395",
+      "max_diff": 1.7763568394002505e-15,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-6,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_lognorm_pdf",
+      "passed": true,
+      "message": "scalar match: 0.3989422804014327",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_lognorm_cdf",
+      "passed": true,
+      "message": "scalar match: 0.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_lognorm_ppf",
+      "passed": true,
+      "message": "scalar match: 1",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_gamma_pdf",
+      "passed": true,
+      "message": "scalar match: 0.36787944117144233",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_gamma_cdf",
+      "passed": true,
+      "message": "scalar match: 0.2642411176571152",
+      "max_diff": 5.551115123125783e-17,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_gamma_ppf",
+      "passed": true,
+      "message": "scalar match: 1.6783469900166614",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-6,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_beta_pdf",
+      "passed": true,
+      "message": "scalar match: 1.4999999999999964",
+      "max_diff": 3.9968028886505635e-15,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_beta_cdf",
+      "passed": true,
+      "message": "scalar match: 0.6875000000000009",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_pareto_pdf",
+      "passed": true,
+      "message": "scalar match: 0.1875",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_pareto_cdf",
+      "passed": true,
+      "message": "scalar match: 0.875",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_rayleigh_pdf",
+      "passed": true,
+      "message": "scalar match: 0.6065306597126334",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_rayleigh_cdf",
+      "passed": true,
+      "message": "scalar match: 0.3934693402873666",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_logistic_pdf_origin",
+      "passed": true,
+      "message": "scalar match: 0.25",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_logistic_cdf_origin",
+      "passed": true,
+      "message": "scalar match: 0.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_laplace_pdf_origin",
+      "passed": true,
+      "message": "scalar match: 0.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_5sra_laplace_cdf_origin",
+      "passed": true,
+      "message": "scalar match: 0.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_fdist_pdf",
+      "passed": true,
+      "message": "scalar match: 0.49547978348663907",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_a6qx_fdist_cdf",
+      "passed": true,
+      "message": "scalar match: 0.5348805734622001",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_perfect_concordance_n8",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_perfect_discordance_n8",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_n12_alternating_swaps",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-6,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_shuffled_n15_exact",
+      "passed": true,
+      "message": "correlation_result match",
+      "max_diff": 5.551115123125783e-17,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-6,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_7vhu_bootstrap_mean_symmetric_5pt",
+      "passed": true,
+      "message": "array match (2 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_7vhu_bootstrap_mean_asymmetric_8pt",
+      "passed": true,
+      "message": "array match (2 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_7vhu_bootstrap_mean_spread_15pt",
+      "passed": true,
+      "message": "array match (2 elements)",
+      "max_diff": 5.551115123125783e-17,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ],
+  "generated_unix_ms": 1779662448658
+}

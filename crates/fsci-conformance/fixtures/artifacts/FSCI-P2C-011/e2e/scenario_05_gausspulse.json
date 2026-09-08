@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_05_gausspulse",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "generate_gausspulse",
+      "action": "gausspulse(t, fc=10, bw=0.5)",
+      "input_summary": "101-point centered pulse",
+      "output_summary": "len=101, peak_idx=50",
+      "duration_ns": 19627,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "pulse_envelope",
+      "action": "check envelope is Gaussian",
+      "input_summary": "verify decay shape",
+      "output_summary": "center=1.0000, edge=0.0000",
+      "duration_ns": 6713,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "gausspulse",
+    "signal_length": 101,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 38813,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_05_gausspulse --nocapture"
+  }
+}

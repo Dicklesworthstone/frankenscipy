@@ -1,0 +1,40 @@
+{
+  "packet_id": "FSCI-P2C-008",
+  "notes": [
+    {
+      "category": "posterior collapse",
+      "description": "Hard-classifier condition_posterior assigns probability 1.0 to a single state. If the classification boundary misaligns with ground truth, expected-loss selection may choose a sub-optimal solver with no uncertainty hedge. Future work: logistic blending at state boundaries.",
+      "affected_subsystems": [
+        "solver_portfolio",
+        "policy_controller"
+      ],
+      "mitigation": "Monitor backward errors via ConformalCalibrator. If empirical miscoverage exceeds alpha + epsilon, the SVD fallback engages automatically. Consider softening the posterior via logistic blending in future iterations."
+    },
+    {
+      "category": "asymmetric loss matrix edge cases",
+      "description": "The loss matrix encodes domain knowledge about solver cost/risk trade-offs. DiagonalFastPath and TriangularFastPath have zero loss for WellConditioned/Moderate/IllConditioned but catastrophic loss (100) for NearSingular. These fast paths are never selected by argmin over general solvers (indices 0-2), but if the selection logic changes, the asymmetry could produce unexpected behavior.",
+      "affected_subsystems": [
+        "solver_portfolio"
+      ],
+      "mitigation": "Loss matrix is compile-time constant (default_loss_matrix). Parity gate loss_matrix_properties validates structural invariants: non-negative entries, SVD dominance for ill-conditioned states, LU dominance for well-conditioned state."
+    },
+    {
+      "category": "evidence ledger truncation",
+      "description": "Both PolicyEvidenceLedger and SolverPortfolio evidence buffers use FIFO eviction at capacity. Early decisions are lost, which means long-running sessions cannot replay the full decision history. The ConformalCalibrator's sliding window also evicts old scores.",
+      "affected_subsystems": [
+        "evidence_ledger",
+        "conformal_calibrator"
+      ],
+      "mitigation": "Use serialize_jsonl() to periodically export evidence to persistent storage before eviction. Set evidence_capacity proportional to expected workload. For critical audits, use ledger_capacity >= 1000."
+    },
+    {
+      "category": "NaN/Inf signal injection",
+      "description": "DecisionSignals with NaN or Inf components can propagate through logit computation and softmax, producing undefined posteriors. The is_finite() guard exists but is not enforced at the PolicyController level.",
+      "affected_subsystems": [
+        "policy_controller",
+        "signals"
+      ],
+      "mitigation": "Callers should check signals.is_finite() before calling decide(). The logit computation applies clamping which partially mitigates overflow, but NaN propagation is not fully guarded. Consider adding a pre-check in PolicyController::decide()."
+    }
+  ]
+}

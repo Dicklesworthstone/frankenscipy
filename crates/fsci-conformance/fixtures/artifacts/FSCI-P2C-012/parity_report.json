@@ -1,0 +1,365 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-012",
+  "family": "stats_core",
+  "case_results": [
+    {
+      "case_id": "describe_8pt",
+      "passed": true,
+      "message": "describe_result match"
+    },
+    {
+      "case_id": "skew_asymmetric",
+      "passed": true,
+      "message": "scalar match: -0.6"
+    },
+    {
+      "case_id": "kurtosis_uniform",
+      "passed": true,
+      "message": "scalar match: -1.2242424242424244"
+    },
+    {
+      "case_id": "pearsonr_linear",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "pearsonr_negative",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "spearmanr_monotonic",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "linregress_perfect",
+      "passed": true,
+      "message": "linregress_result match"
+    },
+    {
+      "case_id": "linregress_noisy",
+      "passed": true,
+      "message": "linregress_result match"
+    },
+    {
+      "case_id": "ttest_1samp_zero",
+      "passed": true,
+      "message": "ttest_result match"
+    },
+    {
+      "case_id": "ttest_1samp_shifted",
+      "passed": true,
+      "message": "ttest_result match"
+    },
+    {
+      "case_id": "ks_2samp_same",
+      "passed": true,
+      "message": "goodness_result match"
+    },
+    {
+      "case_id": "ks_2samp_different",
+      "passed": true,
+      "message": "goodness_result match"
+    },
+    {
+      "case_id": "zscore_5pt",
+      "passed": true,
+      "message": "array match (5 elements)"
+    },
+    {
+      "case_id": "sem_5pt",
+      "passed": true,
+      "message": "scalar match: 0.7071067811865476"
+    },
+    {
+      "case_id": "iqr_8pt",
+      "passed": true,
+      "message": "scalar match: 3.5"
+    },
+    {
+      "case_id": "moment_k2",
+      "passed": true,
+      "message": "scalar match: 2"
+    },
+    {
+      "case_id": "moment_k3",
+      "passed": true,
+      "message": "scalar match: 0"
+    },
+    {
+      "case_id": "variation_5pt",
+      "passed": true,
+      "message": "scalar match: 0.47140452079103173"
+    },
+    {
+      "case_id": "entropy_uniform",
+      "passed": true,
+      "message": "scalar match: 1.3862943611198906"
+    },
+    {
+      "case_id": "shapiro_normal",
+      "passed": true,
+      "message": "goodness_result match"
+    },
+    {
+      "case_id": "skew_symmetric",
+      "passed": true,
+      "message": "scalar match: 0"
+    },
+    {
+      "case_id": "kurtosis_peaked",
+      "passed": true,
+      "message": "scalar match: 3.888318009734995"
+    },
+    {
+      "case_id": "pearsonr_uncorrelated",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "linregress_negative_slope",
+      "passed": true,
+      "message": "linregress_result match"
+    },
+    {
+      "case_id": "iqr_small_4pt",
+      "passed": true,
+      "message": "scalar match: 1.5"
+    },
+    {
+      "case_id": "moment_k4",
+      "passed": true,
+      "message": "scalar match: 6.8"
+    },
+    {
+      "case_id": "entropy_concentrated",
+      "passed": true,
+      "message": "scalar match: 0.02371876133018424"
+    },
+    {
+      "case_id": "variation_high_mean",
+      "passed": true,
+      "message": "scalar match: 0.11785113019775793"
+    },
+    {
+      "case_id": "sem_10pt",
+      "passed": true,
+      "message": "scalar match: 0.9574271077563381"
+    },
+    {
+      "case_id": "describe_3pt",
+      "passed": true,
+      "message": "describe_result match"
+    },
+    {
+      "case_id": "hardened_describe_8pt",
+      "passed": true,
+      "message": "describe_result match"
+    },
+    {
+      "case_id": "hardened_skew_asymmetric",
+      "passed": true,
+      "message": "scalar match: -0.6"
+    },
+    {
+      "case_id": "hardened_kurtosis_uniform",
+      "passed": true,
+      "message": "scalar match: -1.2242424242424244"
+    },
+    {
+      "case_id": "hardened_pearsonr_linear",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "hardened_pearsonr_negative",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "ttest_ind_shifted_groups",
+      "passed": true,
+      "message": "ttest_result match"
+    },
+    {
+      "case_id": "ttest_ind_identical_groups",
+      "passed": true,
+      "message": "ttest_result match"
+    },
+    {
+      "case_id": "mannwhitneyu_shifted_groups",
+      "passed": true,
+      "message": "ttest_result match"
+    },
+    {
+      "case_id": "br_4nkk_cauchy_pdf_0_at_origin",
+      "passed": true,
+      "message": "scalar match: 0.3183098861837907"
+    },
+    {
+      "case_id": "br_4nkk_cauchy_pdf_at_scale",
+      "passed": true,
+      "message": "scalar match: 0.15915494309189535"
+    },
+    {
+      "case_id": "br_4nkk_cauchy_cdf_at_origin",
+      "passed": true,
+      "message": "scalar match: 0.5"
+    },
+    {
+      "case_id": "br_4nkk_cauchy_cdf_at_scale",
+      "passed": true,
+      "message": "scalar match: 0.75"
+    },
+    {
+      "case_id": "br_4nkk_cauchy_ppf_quartile",
+      "passed": true,
+      "message": "scalar match: 1.0000000000000002"
+    },
+    {
+      "case_id": "br_a6qx_chi2_pdf",
+      "passed": true,
+      "message": "scalar match: 0.2075537487102974"
+    },
+    {
+      "case_id": "br_a6qx_chi2_cdf",
+      "passed": true,
+      "message": "scalar match: 0.42759329552912023"
+    },
+    {
+      "case_id": "br_a6qx_chi2_ppf",
+      "passed": true,
+      "message": "scalar match: 2.365973884375341"
+    },
+    {
+      "case_id": "br_a6qx_lognorm_pdf",
+      "passed": true,
+      "message": "scalar match: 0.3989422804014327"
+    },
+    {
+      "case_id": "br_a6qx_lognorm_cdf",
+      "passed": true,
+      "message": "scalar match: 0.5"
+    },
+    {
+      "case_id": "br_a6qx_lognorm_ppf",
+      "passed": true,
+      "message": "scalar match: 1"
+    },
+    {
+      "case_id": "br_a6qx_gamma_pdf",
+      "passed": true,
+      "message": "scalar match: 0.36787944117144233"
+    },
+    {
+      "case_id": "br_a6qx_gamma_cdf",
+      "passed": true,
+      "message": "scalar match: 0.2642411176571152"
+    },
+    {
+      "case_id": "br_a6qx_gamma_ppf",
+      "passed": true,
+      "message": "scalar match: 1.6783469900166612"
+    },
+    {
+      "case_id": "br_5sra_beta_pdf",
+      "passed": true,
+      "message": "scalar match: 1.5000000000000004"
+    },
+    {
+      "case_id": "br_5sra_beta_cdf",
+      "passed": true,
+      "message": "scalar match: 0.6875"
+    },
+    {
+      "case_id": "br_5sra_pareto_pdf",
+      "passed": true,
+      "message": "scalar match: 0.1875"
+    },
+    {
+      "case_id": "br_5sra_pareto_cdf",
+      "passed": true,
+      "message": "scalar match: 0.875"
+    },
+    {
+      "case_id": "br_5sra_rayleigh_pdf",
+      "passed": true,
+      "message": "scalar match: 0.6065306597126334"
+    },
+    {
+      "case_id": "br_5sra_rayleigh_cdf",
+      "passed": true,
+      "message": "scalar match: 0.3934693402873666"
+    },
+    {
+      "case_id": "br_5sra_logistic_pdf_origin",
+      "passed": true,
+      "message": "scalar match: 0.25"
+    },
+    {
+      "case_id": "br_5sra_logistic_cdf_origin",
+      "passed": true,
+      "message": "scalar match: 0.5"
+    },
+    {
+      "case_id": "br_5sra_laplace_pdf_origin",
+      "passed": true,
+      "message": "scalar match: 0.5"
+    },
+    {
+      "case_id": "br_5sra_laplace_cdf_origin",
+      "passed": true,
+      "message": "scalar match: 0.5"
+    },
+    {
+      "case_id": "br_a6qx_fdist_pdf",
+      "passed": true,
+      "message": "scalar match: 0.49547978348663907"
+    },
+    {
+      "case_id": "br_a6qx_fdist_cdf",
+      "passed": true,
+      "message": "scalar match: 0.5348805734622001"
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_perfect_concordance_n8",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_perfect_discordance_n8",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_n12_alternating_swaps",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "br_hx5t_kendalltau_shuffled_n15_exact",
+      "passed": true,
+      "message": "correlation_result match"
+    },
+    {
+      "case_id": "br_7vhu_bootstrap_mean_symmetric_5pt",
+      "passed": true,
+      "message": "array match (2 elements)"
+    },
+    {
+      "case_id": "br_7vhu_bootstrap_mean_asymmetric_8pt",
+      "passed": true,
+      "message": "array match (2 elements)"
+    },
+    {
+      "case_id": "br_7vhu_bootstrap_mean_spread_15pt",
+      "passed": true,
+      "message": "array match (2 elements)"
+    }
+  ],
+  "passed_cases": 71,
+  "failed_cases": 0,
+  "generated_unix_ms": 1788666501752
+}

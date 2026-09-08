@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_17_filtfilt",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "filtfilt_preserves_phase",
+      "action": "filtfilt(b, a, signal)",
+      "input_summary": "zero-phase filtering preserves edge location",
+      "output_summary": "edge preserved: orig=99, filt=99, shift=0",
+      "duration_ns": 313344,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "filtfilt",
+    "signal_length": 500,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 394117,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_17_filtfilt --nocapture"
+  }
+}

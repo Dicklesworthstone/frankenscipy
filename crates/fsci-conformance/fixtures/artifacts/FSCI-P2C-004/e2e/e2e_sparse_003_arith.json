@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_sparse_003_arith",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "build_matrices",
+      "action": "diags",
+      "input_summary": "n=4",
+      "output_summary": "A nnz=7, B nnz=7",
+      "duration_ns": 99509,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "add",
+      "action": "add_csr",
+      "input_summary": "A+B",
+      "output_summary": "C nnz=10",
+      "duration_ns": 4308,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "subtract",
+      "action": "sub_csr",
+      "input_summary": "A-B",
+      "output_summary": "D nnz=10",
+      "duration_ns": 1493,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "verify_arithmetic",
+      "action": "spmv+compare",
+      "input_summary": "(A+B)+(A-B) vs 2A, diff=0.0000e0",
+      "output_summary": "pass=true",
+      "duration_ns": 10950,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 322150,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_003_arith --nocapture"
+  }
+}

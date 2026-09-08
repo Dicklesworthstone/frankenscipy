@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_26_csd_scaling_modes",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "csd_density_vs_spectrum",
+      "action": "csd_with_scaling(x, y, fs=16, nperseg=8, noverlap=4)",
+      "input_summary": "explicit noverlap should preserve SciPy density and spectrum scaling outputs",
+      "output_summary": "freq_diff=0.00e0, density_im_diff=1.39e-17, spectrum_im_diff=9.83e-33",
+      "duration_ns": 333883,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "csd",
+    "signal_length": 32,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 345084,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_26_csd_scaling_modes --nocapture"
+  }
+}

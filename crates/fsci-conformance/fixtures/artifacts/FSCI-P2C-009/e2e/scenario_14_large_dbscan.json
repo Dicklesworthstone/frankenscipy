@@ -1,0 +1,33 @@
+{
+  "scenario_id": "scenario_14_large_dbscan",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "dbscan_500x3",
+      "action": "dbscan(data, eps=3.0, min_samples=5)",
+      "input_summary": "500 points, 3 dims",
+      "output_summary": "time=27.602324ms, clusters=5, noise=0",
+      "duration_ns": 27628703,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "dbscan",
+    "n_samples": 500,
+    "n_features": 3,
+    "n_clusters": 5
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 27795640,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_14_large_dbscan --nocapture"
+  }
+}

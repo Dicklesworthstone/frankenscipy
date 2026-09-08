@@ -1,0 +1,63 @@
+{
+  "scenario_id": "scenario_08_linkage_methods",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "linkage_single",
+      "action": "linkage(data, Single)",
+      "input_summary": "Single linkage",
+      "output_summary": "Single valid, 14 merges",
+      "duration_ns": 73640,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "linkage_complete",
+      "action": "linkage(data, Complete)",
+      "input_summary": "Complete linkage",
+      "output_summary": "Complete valid, 14 merges",
+      "duration_ns": 94468,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "linkage_average",
+      "action": "linkage(data, Average)",
+      "input_summary": "Average linkage",
+      "output_summary": "Average valid, 14 merges",
+      "duration_ns": 68380,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "linkage_ward",
+      "action": "linkage(data, Ward)",
+      "input_summary": "Ward linkage",
+      "output_summary": "Ward valid, 14 merges",
+      "duration_ns": 52029,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "linkage",
+    "n_samples": 15,
+    "n_features": 2,
+    "n_clusters": 3
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 306300,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_08_linkage_methods --nocapture"
+  }
+}

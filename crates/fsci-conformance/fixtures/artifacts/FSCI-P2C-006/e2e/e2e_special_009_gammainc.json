@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_special_009_gammainc",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "gammainc_a1_x1",
+      "action": "gammainc+gammaincc",
+      "input_summary": "a=1, x=1",
+      "output_summary": "sum=1.000000, pass=true",
+      "duration_ns": 290580,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "gammainc_a2_x0.5",
+      "action": "gammainc+gammaincc",
+      "input_summary": "a=2, x=0.5",
+      "output_summary": "sum=1.000000, pass=true",
+      "duration_ns": 2485,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "gammainc_a3_x2",
+      "action": "gammainc+gammaincc",
+      "input_summary": "a=3, x=2",
+      "output_summary": "sum=1.000000, pass=true",
+      "duration_ns": 1894,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "gammainc_a0.5_x1.5",
+      "action": "gammainc+gammaincc",
+      "input_summary": "a=0.5, x=1.5",
+      "output_summary": "sum=1.000000, pass=true",
+      "duration_ns": 3576,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 397413,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_special -- e2e_special_009_gammainc --nocapture"
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_08_nonfinite_values",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "kdtree_reject_nan",
+      "action": "KDTree::new([[NaN, 1.0], ...])",
+      "input_summary": "NaN in data",
+      "output_summary": "correctly rejected NaN in data",
+      "duration_ns": 8236,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "kdtree_reject_inf",
+      "action": "KDTree::new([[Inf, 1.0], ...])",
+      "input_summary": "Inf in data",
+      "output_summary": "correctly rejected Inf in data",
+      "duration_ns": 1954,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "kdtree_query_reject_nan",
+      "action": "tree.query([NaN, 1.0])",
+      "input_summary": "NaN in query",
+      "output_summary": "correctly rejected NaN in query",
+      "duration_ns": 25288,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "spatial_metadata": {
+    "operation": "error_handling",
+    "n_points": 0,
+    "n_dims": 0,
+    "metric": "N/A"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 209637,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_spatial -- scenario_08_nonfinite_values --nocapture"
+  }
+}

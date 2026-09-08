@@ -1,0 +1,130 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-014",
+  "family": "interpolate_core",
+  "case_results": [
+    {
+      "case_id": "interp1d_linear_midpoints",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "interp1d_nearest_non_tie",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "interp1d_fill_value_outside_bounds",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "interp1d_empty_eval",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "interp1d_unsorted_x_rejects",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "interp1d_length_mismatch_rejects",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "interp1d_bounds_error_rejects",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "regular_grid_linear_2d_midpoints",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "regular_grid_nearest_2d",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "regular_grid_fill_value_outside_bounds",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "cubic_spline_natural_linear_data",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "cubic_spline_natural_quadratic_data",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=5.55e-17)"
+    },
+    {
+      "case_id": "cubic_spline_natural_nonuniform_grid",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=1.78e-15)"
+    },
+    {
+      "case_id": "cubic_spline_not_a_knot_quadratic_grid",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "cubic_spline_not_a_knot_wavy_grid",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "cubic_spline_clamped_zero_slope",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "cubic_spline_clamped_unit_slopes",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "cubic_spline_clamped_nan_derivative_hardened_error",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "cubic_spline_periodic_sine_full_cycle",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "cubic_spline_periodic_symmetric_wave",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "cubic_spline_tuple_first_derivative_asymmetric",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "cubic_spline_tuple_zero_derivative_matches_clamped",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=5.55e-17)"
+    },
+    {
+      "case_id": "cubic_spline_tuple_second_derivative_natural_zero",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "bspline_linear_hat",
+      "passed": true,
+      "message": "interpolate vector matched (max_diff=0.00e0)"
+    }
+  ],
+  "passed_cases": 24,
+  "failed_cases": 0,
+  "generated_unix_ms": 1777873167009
+}

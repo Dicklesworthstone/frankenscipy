@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_17_smooth_bivariate_spline_piecewise_surface",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_piecewise_smooth_bivariate_spline",
+      "action": "SmoothBivariateSpline::new(x, y, z, kx=1, ky=1, s=0)",
+      "input_summary": "nine scattered samples from |x-0.5| + |y-0.5|",
+      "output_summary": "created piecewise SmoothBivariateSpline",
+      "duration_ns": 86274,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "eval_piecewise_surface",
+      "action": "spline.eval(0.25, 0.75), spline.integral(0, 1, 0, 1)",
+      "input_summary": "piecewise tent surface value and integral",
+      "output_summary": "value=0.5, integral=0.4724252181995386, value_err=0.00e0, integral_err=2.76e-2",
+      "duration_ns": 48572,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "piecewise_metadata",
+      "action": "spline.knots(), spline.coefficients()",
+      "input_summary": "piecewise spline should expose interior knots and more than four coefficients",
+      "output_summary": "tx_len=5, ty_len=5, coeff_count=9",
+      "duration_ns": 621,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "SmoothBivariateSpline",
+    "num_points": 17,
+    "dimensions": 2,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 143552,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_17_smooth_bivariate_spline_piecewise_surface --nocapture"
+  }
+}

@@ -1,0 +1,86 @@
+{
+  "packet_id": "FSCI-P2C-001",
+  "all_gates_pass": true,
+  "gates": [
+    {
+      "fixture_id": "validate_tol_scalar",
+      "operation": "validate_tol",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 0.0,
+      "size": 3
+    },
+    {
+      "fixture_id": "validate_tol_clamping",
+      "operation": "validate_tol",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 2.220446049250313e-14,
+      "size": 1
+    },
+    {
+      "fixture_id": "validate_first_step",
+      "operation": "validate_first_step",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 0.0,
+      "size": 3
+    },
+    {
+      "fixture_id": "validate_max_step",
+      "operation": "validate_max_step",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 0.0,
+      "size": 3
+    },
+    {
+      "fixture_id": "exponential_decay_rk45",
+      "operation": "solve_ivp_rk45",
+      "pass": true,
+      "max_abs_diff": 9.523881076139995e-11,
+      "tolerance_used": 1e-6,
+      "size": 1
+    },
+    {
+      "fixture_id": "exponential_decay_rk23",
+      "operation": "solve_ivp_rk23",
+      "pass": true,
+      "max_abs_diff": 5.342991036671324e-8,
+      "tolerance_used": 0.0001,
+      "size": 1
+    },
+    {
+      "fixture_id": "harmonic_oscillator_rk45",
+      "operation": "solve_ivp_rk45",
+      "pass": true,
+      "max_abs_diff": 7.897860476724361e-9,
+      "tolerance_used": 0.001,
+      "size": 2
+    },
+    {
+      "fixture_id": "lotka_volterra_positive",
+      "operation": "solve_ivp_rk45",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 0.0,
+      "size": 2
+    },
+    {
+      "fixture_id": "rk45_vs_rk23",
+      "operation": "solver_agreement",
+      "pass": true,
+      "max_abs_diff": 4.736813219441416e-9,
+      "tolerance_used": 1e-6,
+      "size": 1
+    },
+    {
+      "fixture_id": "strict_vs_hardened",
+      "operation": "mode_invariance",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 1e-10,
+      "size": 1
+    }
+  ]
+}

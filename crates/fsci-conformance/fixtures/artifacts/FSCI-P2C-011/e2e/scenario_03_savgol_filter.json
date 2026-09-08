@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_03_savgol_filter",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "savgol_coeffs",
+      "action": "savgol_coeffs(7, 2, 0)",
+      "input_summary": "window=7, polyorder=2, deriv=0",
+      "output_summary": "len=7, sum=1.000000",
+      "duration_ns": 88097,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "apply_savgol",
+      "action": "savgol_filter(noisy, 7, 2)",
+      "input_summary": "filter 100-point noisy signal",
+      "output_summary": "noise_var=0.0198, filtered_var=0.0096",
+      "duration_ns": 36179,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "savgol_filter",
+    "signal_length": 100,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 173309,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_03_savgol_filter --nocapture"
+  }
+}

@@ -504,9 +504,15 @@ fn threat_matrix_rejects_additional_properties() {
 
 #[test]
 fn p2c001_threat_matrix_artifact_is_schema_aligned_and_complete() {
-    let schema = load_schema("threat_matrix.schema.json");
-    let artifact_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let canonical = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/artifacts/FSCI-P2C-001/threats/threat_matrix.json");
+    let legacy = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures/artifacts/P2C-001/threats/threat_matrix.json");
+    let artifact_path = if canonical.exists() {
+        canonical
+    } else {
+        legacy
+    };
 
     let raw = fs::read_to_string(&artifact_path).unwrap_or_else(|error| {
         assert_failed(&format!(
@@ -521,6 +527,7 @@ fn p2c001_threat_matrix_artifact_is_schema_aligned_and_complete() {
         ));
     });
 
+    let schema = load_schema("threat_matrix.schema.json");
     let errors = validate_sample_against_schema(&schema, &artifact, "p2c001_threat_matrix");
     assert!(
         errors.is_empty(),

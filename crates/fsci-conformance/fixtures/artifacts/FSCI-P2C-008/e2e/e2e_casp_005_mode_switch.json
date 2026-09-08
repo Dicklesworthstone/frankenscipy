@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_casp_005_mode_switch",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "strict_decision",
+      "action": "decide",
+      "input_summary": "mode=Strict, cond=8, meta=0.3, anom=0.2",
+      "output_summary": "action=FullValidate, reason=mode=Strict; top_state=Compatible; p=0.613972; cond_log10=8.000; metadata=0.300; anomaly=0.200",
+      "duration_ns": 16551,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "hardened_decision",
+      "action": "decide",
+      "input_summary": "mode=Hardened, cond=8, meta=0.3, anom=0.2",
+      "output_summary": "action=FullValidate, reason=mode=Hardened; top_state=Compatible; p=0.613972; cond_log10=8.000; metadata=0.300; anomaly=0.200",
+      "duration_ns": 4037,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "posteriors_normalized",
+      "action": "check",
+      "input_summary": "both posteriors sum to 1",
+      "output_summary": "strict_sum=1.000000000000, hardened_sum=1.000000000000",
+      "duration_ns": 1724,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "losses_finite",
+      "action": "check",
+      "input_summary": "all expected losses finite",
+      "output_summary": "strict_losses=[39.21008123143075, 14.403942650953908, 31.699666593183423], hardened_losses=[32.89676157416103, 10.188985075023819, 42.316487369955645]",
+      "duration_ns": 3667,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 124005,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_005_mode_switch --nocapture"
+  }
+}

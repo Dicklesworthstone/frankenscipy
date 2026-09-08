@@ -1,0 +1,86 @@
+{
+  "packet_id": "FSCI-P2C-001",
+  "generated_at": "unix:1779662446",
+  "fixtures": [
+    {
+      "fixture_id": "validate_tol_scalar",
+      "size": 3,
+      "input_type": "scalar_tol",
+      "operations": [
+        "validate_tol"
+      ]
+    },
+    {
+      "fixture_id": "validate_tol_clamping",
+      "size": 1,
+      "input_type": "clamping_edge",
+      "operations": [
+        "validate_tol"
+      ]
+    },
+    {
+      "fixture_id": "validate_first_step",
+      "size": 3,
+      "input_type": "step_validation",
+      "operations": [
+        "validate_first_step"
+      ]
+    },
+    {
+      "fixture_id": "validate_max_step",
+      "size": 3,
+      "input_type": "step_validation",
+      "operations": [
+        "validate_max_step"
+      ]
+    },
+    {
+      "fixture_id": "exponential_decay_rk45",
+      "size": 1,
+      "input_type": "ode_system",
+      "operations": [
+        "solve_ivp_rk45"
+      ]
+    },
+    {
+      "fixture_id": "exponential_decay_rk23",
+      "size": 1,
+      "input_type": "ode_system",
+      "operations": [
+        "solve_ivp_rk23"
+      ]
+    },
+    {
+      "fixture_id": "harmonic_oscillator_rk45",
+      "size": 2,
+      "input_type": "ode_system",
+      "operations": [
+        "solve_ivp_rk45"
+      ]
+    },
+    {
+      "fixture_id": "lotka_volterra_positive",
+      "size": 2,
+      "input_type": "ode_system",
+      "operations": [
+        "solve_ivp_rk45"
+      ]
+    },
+    {
+      "fixture_id": "rk45_vs_rk23",
+      "size": 1,
+      "input_type": "solver_comparison",
+      "operations": [
+        "solver_agreement"
+      ]
+    },
+    {
+      "fixture_id": "strict_vs_hardened",
+      "size": 1,
+      "input_type": "mode_comparison",
+      "operations": [
+        "mode_invariance"
+      ]
+    }
+  ]
+}

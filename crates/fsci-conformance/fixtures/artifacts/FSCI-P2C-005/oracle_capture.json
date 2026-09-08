@@ -1,0 +1,268 @@
+{
+  "case_outputs": [
+    {
+      "case_id": "fft_impulse_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ]
+        ]
+      },
+      "result_kind": "complex_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "fft_dc_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          [
+            4.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "result_kind": "complex_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "ifft_dc_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ]
+        ]
+      },
+      "result_kind": "complex_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "fft_ifft_roundtrip",
+      "error": null,
+      "result": {
+        "values": [
+          [
+            1.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0
+          ],
+          [
+            0.0,
+            0.0
+          ]
+        ]
+      },
+      "result_kind": "complex_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "rfft_ramp_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          [
+            10.0,
+            0.0
+          ],
+          [
+            -2.0,
+            2.0
+          ],
+          [
+            -2.0,
+            0.0
+          ]
+        ]
+      },
+      "result_kind": "complex_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "fft_ortho_impulse_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          [
+            0.5,
+            0.0
+          ],
+          [
+            0.5,
+            0.0
+          ],
+          [
+            0.5,
+            0.0
+          ],
+          [
+            0.5,
+            0.0
+          ]
+        ]
+      },
+      "result_kind": "complex_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "fftfreq_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          0.0,
+          0.25,
+          -0.5,
+          -0.25
+        ]
+      },
+      "result_kind": "real_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "rfftfreq_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          0.0,
+          0.25,
+          0.5
+        ]
+      },
+      "result_kind": "real_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "fftshift_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          -0.5,
+          -0.25,
+          0.0,
+          0.25
+        ]
+      },
+      "result_kind": "real_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "ifftshift_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          0.0,
+          0.25,
+          -0.5,
+          -0.25
+        ]
+      },
+      "result_kind": "real_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "fft_empty_error",
+      "error": "invalid number of data points (0) specified",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "fftfreq_spacing_zero_error",
+      "error": "float division by zero",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "irfft_from_rfft_4pt",
+      "error": null,
+      "result": {
+        "values": [
+          1.0,
+          2.0,
+          3.0,
+          4.0
+        ]
+      },
+      "result_kind": "real_vector",
+      "status": "ok"
+    },
+    {
+      "case_id": "fft2_impulse_2x2",
+      "error": "axes exceeds dimensionality of input",
+      "result": {},
+      "result_kind": "exception",
+      "status": "error"
+    },
+    {
+      "case_id": "fft_single_element",
+      "error": null,
+      "result": {
+        "values": [
+          [
+            42.0,
+            -7.0
+          ]
+        ]
+      },
+      "result_kind": "complex_vector",
+      "status": "ok"
+    }
+  ],
+  "family": "fft_core",
+  "generated_unix_ms": 1776101782390,
+  "packet_id": "FSCI-P2C-005",
+  "runtime": {
+    "numpy_version": "2.4.3",
+    "python_version": "3.13.7",
+    "scipy_version": "1.17.1"
+  }
+}

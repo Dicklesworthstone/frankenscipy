@@ -1,0 +1,320 @@
+{
+  "packet_id": "FSCI-P2C-014",
+  "family": "interpolate_core",
+  "generated_unix_ms": 1788666502212,
+  "runtime": {
+    "python_version": "3.13.12",
+    "numpy_version": "2.4.3",
+    "scipy_version": "1.17.1"
+  },
+  "provenance": {
+    "fixture_input_blake3": "4b43ccdef7613c8450e8e5d954ae55962c4a2557e030404826ffe0f60e014620",
+    "oracle_output_blake3": "5837de2c2635ad4de297e0c395243a28b1a246c03d1760657121b72d7a6dbe10",
+    "capture_blake3": "83615099fa6b4f1d2bd9e45f4a192a9d2554118530b39c6c6a4cb784756e292a"
+  },
+  "case_outputs": [
+    {
+      "case_id": "interp1d_linear_midpoints",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.0,
+          4.0,
+          7.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "interp1d_nearest_non_tie",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.0,
+          20.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "interp1d_fill_value_outside_bounds",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          -99.0,
+          5.0,
+          -99.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "interp1d_empty_eval",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": []
+      },
+      "error": null
+    },
+    {
+      "case_id": "interp1d_unsorted_x_rejects",
+      "status": "ok",
+      "result_kind": "error",
+      "result": {
+        "error": "strictly increasing"
+      },
+      "error": null
+    },
+    {
+      "case_id": "interp1d_length_mismatch_rejects",
+      "status": "ok",
+      "result_kind": "error",
+      "result": {
+        "error": "same length"
+      },
+      "error": null
+    },
+    {
+      "case_id": "interp1d_bounds_error_rejects",
+      "status": "ok",
+      "result_kind": "error",
+      "result": {
+        "error": "out of bounds"
+      },
+      "error": null
+    },
+    {
+      "case_id": "regular_grid_linear_2d_midpoints",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.5,
+          3.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "regular_grid_nearest_2d",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.0,
+          1.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "regular_grid_fill_value_outside_bounds",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          -7.0,
+          5.5
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_natural_linear_data",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.5,
+          1.5,
+          2.5
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_natural_quadratic_data",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.35000000000000003,
+          2.1999999999999997,
+          6.35
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_natural_nonuniform_grid",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.08795144690870421,
+          0.9837507595321284,
+          4.817667418408722,
+          12.343973112562663
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_not_a_knot_quadratic_grid",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.25,
+          2.25,
+          6.25,
+          12.25
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_not_a_knot_wavy_grid",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.726358557572465,
+          0.5813839670923177,
+          0.3622890196633446,
+          1.0792044266493794
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_clamped_zero_slope",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.5,
+          0.5,
+          0.5,
+          0.5
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_clamped_unit_slopes",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.16768973214285715,
+          0.857421875,
+          1.701171875,
+          1.1877790178571428
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_clamped_nan_derivative_hardened_error",
+      "status": "ok",
+      "result_kind": "error",
+      "result": {
+        "error": "left boundary condition derivative must be finite"
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_periodic_sine_full_cycle",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.0,
+          0.6875,
+          1.2246467991473532e-16,
+          -0.6875,
+          0.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_periodic_symmetric_wave",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.0,
+          1.53125,
+          -0.53125,
+          -0.53125,
+          1.53125,
+          2.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_tuple_first_derivative_asymmetric",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.13805803571428574,
+          1.1097098214285714,
+          1.9981026785714289,
+          2.1478794642857144
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_tuple_zero_derivative_matches_clamped",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.84375,
+          0.15625,
+          0.84375,
+          0.15625
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "cubic_spline_tuple_second_derivative_natural_zero",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.4017857142857142,
+          1.4196428571428572,
+          1.9196428571428572,
+          2.901785714285715
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "bspline_linear_hat",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.0,
+          0.5,
+          1.0,
+          0.5,
+          0.0
+        ]
+      },
+      "error": null
+    }
+  ]
+}

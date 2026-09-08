@@ -1,0 +1,63 @@
+{
+  "scenario_id": "scenario_09_metric_properties",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "triangle_inequality",
+      "action": "d(a,c) <= d(a,b) + d(b,c)",
+      "input_summary": "for euclidean metric",
+      "output_summary": "d(a,c)=1.7321 <= d(a,b)+d(b,c)=8.6603",
+      "duration_ns": 8606,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "symmetry",
+      "action": "d(a,b) == d(b,a)",
+      "input_summary": "for all metrics",
+      "output_summary": "all metrics symmetric",
+      "duration_ns": 5180,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "identity_of_indiscernibles",
+      "action": "d(a,a) == 0",
+      "input_summary": "for all metrics",
+      "output_summary": "d(a,a) = 0 for standard metrics",
+      "duration_ns": 1022,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "minkowski_specializations",
+      "action": "minkowski(p=1) == cityblock, minkowski(p=2) == euclidean",
+      "input_summary": "verify specializations",
+      "output_summary": "minkowski specializations verified",
+      "duration_ns": 1302,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "spatial_metadata": {
+    "operation": "metric_properties",
+    "n_points": 3,
+    "n_dims": 3,
+    "metric": "multiple"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 182105,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_spatial -- scenario_09_metric_properties --nocapture"
+  }
+}

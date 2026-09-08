@@ -1,0 +1,65 @@
+{
+  "packet_id": "FSCI-P2C-006",
+  "generated_at": "unix:1779662447",
+  "fixtures": [
+    {
+      "fixture_id": "gamma_known",
+      "function": "gamma",
+      "input_range": "x in {0.5, 1, 2, 5}",
+      "expected_properties": [
+        "Γ(1)=1",
+        "Γ(n)=(n-1)!",
+        "Γ(0.5)=√π"
+      ]
+    },
+    {
+      "fixture_id": "erf_erfc_complement",
+      "function": "erf+erfc",
+      "input_range": "x in [0, 3]",
+      "expected_properties": [
+        "erf(x)+erfc(x)=1"
+      ]
+    },
+    {
+      "fixture_id": "erfinv_roundtrip",
+      "function": "erfinv",
+      "input_range": "x in (-1, 1)",
+      "expected_properties": [
+        "erf(erfinv(x))=x"
+      ]
+    },
+    {
+      "fixture_id": "gammainc_complement",
+      "function": "gammainc+gammaincc",
+      "input_range": "a,x > 0",
+      "expected_properties": [
+        "P(a,x)+Q(a,x)=1"
+      ]
+    },
+    {
+      "fixture_id": "beta_gamma_relation",
+      "function": "beta",
+      "input_range": "a,b > 0",
+      "expected_properties": [
+        "B(a,b)=Γ(a)Γ(b)/Γ(a+b)"
+      ]
+    },
+    {
+      "fixture_id": "bessel_boundary",
+      "function": "j0,j1,y0",
+      "input_range": "x=0 and x=1",
+      "expected_properties": [
+        "J0(0)=1",
+        "J1(0)=0"
+      ]
+    },
+    {
+      "fixture_id": "gamma_rgamma_inverse",
+      "function": "gamma*rgamma",
+      "input_range": "x in {1,2,3,5,10}",
+      "expected_properties": [
+        "Γ(x)·(1/Γ(x))=1"
+      ]
+    }
+  ]
+}

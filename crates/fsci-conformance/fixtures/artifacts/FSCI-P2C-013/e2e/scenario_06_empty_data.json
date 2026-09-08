@@ -1,0 +1,62 @@
+{
+  "scenario_id": "scenario_06_empty_data",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "loadtxt_empty",
+      "action": "loadtxt('')",
+      "input_summary": "empty content",
+      "output_summary": "accepted empty as 0x0",
+      "duration_ns": 2465,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "mmwrite_zero_dim",
+      "action": "mmwrite(0, 3, [])",
+      "input_summary": "zero rows",
+      "output_summary": "accepted 0x3 matrix: 45 bytes",
+      "duration_ns": 3066,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "wav_write_empty",
+      "action": "wav_write(44100, 1, [])",
+      "input_summary": "empty audio data",
+      "output_summary": "accepted empty: 44 bytes",
+      "duration_ns": 2304,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "json_empty_array",
+      "action": "read_json_array('[]')",
+      "input_summary": "empty JSON array",
+      "output_summary": "correctly parsed empty array",
+      "duration_ns": 2094,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "multiple",
+    "operation": "error_handling",
+    "size_bytes": 0
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 108305,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_06_empty_data --nocapture"
+  }
+}

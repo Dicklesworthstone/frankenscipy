@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-005",
+  "scope": "packet",
+  "generated_at": "2026-03-13T05:15:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.12.0",
+        "description": "fsci-fft uses naive O(n^2) DFT; SciPy uses PocketFFT with Bluestein/Rader for non-power-of-2 sizes. Numerical results may differ at machine epsilon level.",
+        "affected_functions": ["fft", "ifft", "rfft", "irfft"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-FFT-001",
+      "subsystem": "fsci-fft/transforms",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "moderate",
+      "description": "NaN or Inf values in complex input arrays propagate through DFT summation, corrupting all output bins. A single non-finite input element can render the entire transform result unusable.",
+      "mitigation": "When check_finite is enabled or in Hardened mode, scan input for non-finite values before transform. Return NonFiniteInput error immediately.",
+      "test_reference": "FSCI-P2C-005_fft_core.json::fft_empty_error",
+      "strict_mode_response": "Check finiteness when check_finite flag is set.",
+      "hardened_mode_response": "Always check finiteness regardless of flag."
+    },
+    {
+      "threat_id": "THREAT-FFT-002",
+      "subsystem": "fsci-fft/transforms",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "likely",
+      "description": "Naive O(n^2) DFT implementation becomes extremely slow for large inputs. A 2^20 element transform requires ~10^12 floating-point operations, making denial-of-service trivial via large input arrays.",
+      "mitigation": "Document performance characteristics. Future: implement Cooley-Tukey FFT for O(n log n) performance. Consider input size limits for resource-constrained environments.",
+      "test_reference": "N/A (performance characteristic, not correctness bug)",
+      "strict_mode_response": "Allow large transforms with performance warning in trace.",
+      "hardened_mode_response": "Same behavior; no hard size limit currently enforced."
+    },
+    {
+      "threat_id": "THREAT-FFT-003",
+      "subsystem": "fsci-fft/helpers",
+      "category": "input_validation",
+      "severity": "medium",
+      "likelihood": "moderate",
+      "description": "Zero or negative sample spacing in fftfreq/rfftfreq produces nonsensical frequency values or division by zero.",
+      "mitigation": "Validate sample_spacing > 0 and finite before computation. Return NonPositiveSampleSpacing error.",
+      "test_reference": "FSCI-P2C-005_fft_core.json::fftfreq_spacing_zero_error",
+      "strict_mode_response": "Error: 'sample spacing must be finite and greater than zero'.",
+      "hardened_mode_response": "Same error; validation is unconditional."
+    },
+    {
+      "threat_id": "THREAT-FFT-004",
+      "subsystem": "fsci-fft/transforms",
+      "category": "input_validation",
+      "severity": "high",
+      "likelihood": "moderate",
+      "description": "Empty input arrays cause index-out-of-bounds or nonsensical zero-length output. Must be rejected before entering transform loop.",
+      "mitigation": "Validate input length > 0 before any transform. Return InvalidShape error.",
+      "test_reference": "FSCI-P2C-005_fft_core.json::fft_empty_error",
+      "strict_mode_response": "Error: 'input length must be greater than zero'.",
+      "hardened_mode_response": "Same error; input validation is unconditional."
+    }
+  ]
+}

@@ -1,0 +1,314 @@
+{
+  "generated_at": "unix:1779662458",
+  "operation_benchmarks": [
+    {
+      "operation": "bfgs",
+      "input_desc": "rosenbrock_dim2",
+      "iterations": 30,
+      "median_ns": 79782,
+      "p95_ns": 125367,
+      "min_ns": 77347,
+      "max_ns": 158860,
+      "mean_ns": 88645
+    },
+    {
+      "operation": "bfgs",
+      "input_desc": "quadratic_dim2",
+      "iterations": 30,
+      "median_ns": 1724,
+      "p95_ns": 1844,
+      "min_ns": 1683,
+      "max_ns": 7544,
+      "mean_ns": 1930
+    },
+    {
+      "operation": "cg",
+      "input_desc": "rosenbrock_dim2",
+      "iterations": 30,
+      "median_ns": 1088351,
+      "p95_ns": 1353945,
+      "min_ns": 1072943,
+      "max_ns": 1422595,
+      "mean_ns": 1118916
+    },
+    {
+      "operation": "powell",
+      "input_desc": "rosenbrock_dim2",
+      "iterations": 30,
+      "median_ns": 101933,
+      "p95_ns": 115669,
+      "min_ns": 99659,
+      "max_ns": 116561,
+      "mean_ns": 103762
+    },
+    {
+      "operation": "bfgs",
+      "input_desc": "rosenbrock_dim5",
+      "iterations": 30,
+      "median_ns": 207573,
+      "p95_ns": 218504,
+      "min_ns": 203817,
+      "max_ns": 219135,
+      "mean_ns": 208270
+    },
+    {
+      "operation": "bfgs",
+      "input_desc": "quadratic_dim5",
+      "iterations": 30,
+      "median_ns": 2294,
+      "p95_ns": 4118,
+      "min_ns": 2264,
+      "max_ns": 6733,
+      "mean_ns": 2516
+    },
+    {
+      "operation": "cg",
+      "input_desc": "rosenbrock_dim5",
+      "iterations": 30,
+      "median_ns": 1010254,
+      "p95_ns": 1521072,
+      "min_ns": 1002410,
+      "max_ns": 1628595,
+      "mean_ns": 1102162
+    },
+    {
+      "operation": "powell",
+      "input_desc": "rosenbrock_dim5",
+      "iterations": 30,
+      "median_ns": 766282,
+      "p95_ns": 772554,
+      "min_ns": 723160,
+      "max_ns": 778314,
+      "mean_ns": 759709
+    },
+    {
+      "operation": "bfgs",
+      "input_desc": "rosenbrock_dim10",
+      "iterations": 30,
+      "median_ns": 935883,
+      "p95_ns": 982982,
+      "min_ns": 920364,
+      "max_ns": 1012498,
+      "mean_ns": 947739
+    },
+    {
+      "operation": "bfgs",
+      "input_desc": "quadratic_dim10",
+      "iterations": 30,
+      "median_ns": 4589,
+      "p95_ns": 6222,
+      "min_ns": 4488,
+      "max_ns": 8206,
+      "mean_ns": 4824
+    },
+    {
+      "operation": "cg",
+      "input_desc": "rosenbrock_dim10",
+      "iterations": 30,
+      "median_ns": 3163544,
+      "p95_ns": 3239076,
+      "min_ns": 3143215,
+      "max_ns": 3274494,
+      "mean_ns": 3176479
+    },
+    {
+      "operation": "powell",
+      "input_desc": "rosenbrock_dim10",
+      "iterations": 30,
+      "median_ns": 4247277,
+      "p95_ns": 5579480,
+      "min_ns": 4025847,
+      "max_ns": 5873668,
+      "mean_ns": 4347050
+    },
+    {
+      "operation": "brentq",
+      "input_desc": "cubic_[1,3]",
+      "iterations": 30,
+      "median_ns": 1533,
+      "p95_ns": 1563,
+      "min_ns": 1513,
+      "max_ns": 1583,
+      "mean_ns": 1539
+    },
+    {
+      "operation": "brentq",
+      "input_desc": "sin_[3,4]",
+      "iterations": 30,
+      "median_ns": 1563,
+      "p95_ns": 1593,
+      "min_ns": 1552,
+      "max_ns": 1613,
+      "mean_ns": 1564
+    },
+    {
+      "operation": "brenth",
+      "input_desc": "cubic_[1,3]",
+      "iterations": 30,
+      "median_ns": 1853,
+      "p95_ns": 1884,
+      "min_ns": 1843,
+      "max_ns": 1904,
+      "mean_ns": 1854
+    },
+    {
+      "operation": "brenth",
+      "input_desc": "sin_[3,4]",
+      "iterations": 30,
+      "median_ns": 1894,
+      "p95_ns": 1954,
+      "min_ns": 1873,
+      "max_ns": 1954,
+      "mean_ns": 1899
+    },
+    {
+      "operation": "bisect",
+      "input_desc": "cubic_[1,3]",
+      "iterations": 30,
+      "median_ns": 1232,
+      "p95_ns": 1243,
+      "min_ns": 1212,
+      "max_ns": 1283,
+      "mean_ns": 1229
+    },
+    {
+      "operation": "bisect",
+      "input_desc": "sin_[3,4]",
+      "iterations": 30,
+      "median_ns": 1743,
+      "p95_ns": 1773,
+      "min_ns": 1723,
+      "max_ns": 1793,
+      "mean_ns": 1745
+    },
+    {
+      "operation": "ridder",
+      "input_desc": "cubic_[1,3]",
+      "iterations": 30,
+      "median_ns": 481,
+      "p95_ns": 501,
+      "min_ns": 471,
+      "max_ns": 501,
+      "mean_ns": 482
+    },
+    {
+      "operation": "ridder",
+      "input_desc": "sin_[3,4]",
+      "iterations": 30,
+      "median_ns": 1272,
+      "p95_ns": 1332,
+      "min_ns": 1252,
+      "max_ns": 1353,
+      "mean_ns": 1274
+    }
+  ],
+  "hotspot_ranking": [
+    {
+      "rank": 1,
+      "operation": "powell",
+      "input_desc": "rosenbrock_dim10",
+      "median_ns": 4247277,
+      "fraction_of_total": 0.5722641507908641
+    },
+    {
+      "rank": 2,
+      "operation": "cg",
+      "input_desc": "rosenbrock_dim10",
+      "median_ns": 3163544,
+      "fraction_of_total": 0.4262455264042193
+    },
+    {
+      "rank": 3,
+      "operation": "bfgs",
+      "input_desc": "quadratic_dim10",
+      "median_ns": 4589,
+      "fraction_of_total": 0.0006183067852601268
+    },
+    {
+      "rank": 4,
+      "operation": "brenth",
+      "input_desc": "sin_[3,4]",
+      "median_ns": 1894,
+      "fraction_of_total": 0.0002551913382616431
+    },
+    {
+      "rank": 5,
+      "operation": "bisect",
+      "input_desc": "sin_[3,4]",
+      "median_ns": 1743,
+      "fraction_of_total": 0.0002348460942925258
+    },
+    {
+      "rank": 6,
+      "operation": "brentq",
+      "input_desc": "sin_[3,4]",
+      "median_ns": 1563,
+      "fraction_of_total": 0.0002105934855876178
+    },
+    {
+      "rank": 7,
+      "operation": "ridder",
+      "input_desc": "sin_[3,4]",
+      "median_ns": 1272,
+      "fraction_of_total": 0.00017138510151468322
+    }
+  ],
+  "memory_notes": [
+    {
+      "operation": "bfgs",
+      "notes": "Allocates n×n Hessian inverse approximation. O(n²) memory."
+    },
+    {
+      "operation": "cg",
+      "notes": "O(n) memory — stores gradient and direction vectors only."
+    },
+    {
+      "operation": "powell",
+      "notes": "Allocates n direction vectors (n×n total). No gradient needed."
+    },
+    {
+      "operation": "root_finders",
+      "notes": "O(1) memory — all root finders use constant workspace."
+    }
+  ],
+  "isomorphism_check": {
+    "all_operations_pass": true,
+    "details": [
+      {
+        "operation": "bfgs_quadratic_minimum",
+        "passes": true,
+        "note": "x=[6.07747097092215e-9, 1.2154942163888904e-8, -1.5074277825988247e-8], f=Some(4.1191212438496665e-16), success=true"
+      },
+      {
+        "operation": "cg_quadratic_minimum",
+        "passes": true,
+        "note": "x=[-5.024759275329416e-9, 4.753455407069396e-9], f=Some(4.784354408200627e-17)"
+      },
+      {
+        "operation": "powell_quadratic_minimum",
+        "passes": true,
+        "note": "x=[-4.822437839276285e-6, -2.5250612343259883e-5], f=Some(6.608493304232721e-10)"
+      },
+      {
+        "operation": "brentq_cubic_root",
+        "passes": true,
+        "note": "root=2.0945514815, f(root)=2.49e-14"
+      },
+      {
+        "operation": "brentq_bisect_agreement",
+        "passes": true,
+        "note": "brentq=2.0945514815, bisect=2.0945514815, diff=2.17e-13"
+      },
+      {
+        "operation": "sin_root_at_pi",
+        "passes": true,
+        "note": "root=3.141592653590, err_from_pi=0.00e0"
+      },
+      {
+        "operation": "bfgs_rosenbrock_converges",
+        "passes": true,
+        "note": "status=Success, nfev=147, nit=26"
+      }
+    ]
+  }
+}

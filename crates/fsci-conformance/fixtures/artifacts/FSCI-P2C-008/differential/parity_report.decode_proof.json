@@ -1,0 +1,6 @@
+{
+  "ts_unix_ms": 1777873167440,
+  "reason": "recovered from simulated corruption of 1 block",
+  "recovered_blocks": 1,
+  "proof_hash": "510118b6e4b094e60900225a7df51c6f737542ade008f135ffe32c16bbe5f2b8"
+}

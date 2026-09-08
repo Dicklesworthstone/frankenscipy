@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_ivp_006_boundary_tol",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "exact_min_rtol",
+      "action": "validate",
+      "input_summary": "rtol=MIN_RTOL=2.22e-14",
+      "output_summary": "warnings=0",
+      "duration_ns": 10229,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "below_min_rtol",
+      "action": "validate",
+      "input_summary": "rtol=2.22e-15 (below MIN_RTOL)",
+      "output_summary": "warnings=1",
+      "duration_ns": 3176,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "negative_atol",
+      "action": "validate",
+      "input_summary": "atol=-1.0",
+      "output_summary": "is_err=true",
+      "duration_ns": 2285,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "solve_tight_tol",
+      "action": "solve",
+      "input_summary": "rtol=MIN_RTOL=2.22e-14",
+      "output_summary": "err=1.55e-15, nfev=859",
+      "duration_ns": 635534,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 723261,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_006_boundary_tol --nocapture"
+  }
+}

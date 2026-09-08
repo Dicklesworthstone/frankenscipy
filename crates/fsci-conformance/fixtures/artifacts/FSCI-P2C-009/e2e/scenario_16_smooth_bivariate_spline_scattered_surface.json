@@ -1,0 +1,63 @@
+{
+  "scenario_id": "scenario_16_smooth_bivariate_spline_scattered_surface",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_smooth_bivariate_spline",
+      "action": "SmoothBivariateSpline::new(x, y, z, kx=1, ky=1, s=0)",
+      "input_summary": "six scattered samples from f(x,y)=2+3x-4y+5xy",
+      "output_summary": "created SmoothBivariateSpline",
+      "duration_ns": 117031,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "eval_scalar_scattered_surface",
+      "action": "spline.eval(0.25, 0.5)",
+      "input_summary": "bilinear surface exact value",
+      "output_summary": "result=1.3749999999999971, expected=1.375",
+      "duration_ns": 4018,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "derivative_and_integral",
+      "action": "spline.eval_derivative(...), spline.integral(0, 1, 0, 1)",
+      "input_summary": "bilinear derivatives and unit-square integral",
+      "output_summary": "dx=5.500000000000005, dy=-2.7499999999999853, integral=2.7499999999999956, max_err=1.47e-14",
+      "duration_ns": 53021,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "residual_and_metadata",
+      "action": "spline.residual(), spline.degrees(), spline.bbox()",
+      "input_summary": "exact scattered bilinear fit should have near-zero residual",
+      "output_summary": "residual=7.54e-30",
+      "duration_ns": 812,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "SmoothBivariateSpline",
+    "num_points": 16,
+    "dimensions": 2,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 183417,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_16_smooth_bivariate_spline_scattered_surface --nocapture"
+  }
+}

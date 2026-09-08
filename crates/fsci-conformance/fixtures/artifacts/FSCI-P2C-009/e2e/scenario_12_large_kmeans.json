@@ -1,0 +1,33 @@
+{
+  "scenario_id": "scenario_12_large_kmeans",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "kmeans_1000x10",
+      "action": "kmeans(data, k=10)",
+      "input_summary": "1000 points, 10 dims, 10 clusters",
+      "output_summary": "time=15.466943ms, inertia=4992.34",
+      "duration_ns": 15470299,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "kmeans",
+    "n_samples": 1000,
+    "n_features": 10,
+    "n_clusters": 10
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 16030420,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_12_large_kmeans --nocapture"
+  }
+}

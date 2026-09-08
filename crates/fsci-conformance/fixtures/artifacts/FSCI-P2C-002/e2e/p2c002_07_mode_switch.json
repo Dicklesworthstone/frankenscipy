@@ -1,0 +1,56 @@
+{
+  "scenario_id": "p2c002_07_mode_switch",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "strict_nan_passthrough",
+      "action": "solve(A_nan, b, strict, check_finite=false)",
+      "input_summary": "NaN in matrix, strict mode",
+      "output_summary": "strict accepted NaN input: x=[NaN, NaN]",
+      "duration_ns": 218855,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "hardened_nan_rejection",
+      "action": "solve(A_nan, b, hardened, check_finite=false)",
+      "input_summary": "NaN in matrix, hardened mode",
+      "output_summary": "hardened correctly rejected NaN (NonFiniteInput)",
+      "duration_ns": 2485,
+      "mode": "hardened",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_mode_difference",
+      "action": "confirm strict != hardened behavior",
+      "input_summary": "document mode-specific behavior",
+      "output_summary": "strict: NaN passthrough with check_finite=false; hardened: always rejects NaN regardless of check_finite",
+      "duration_ns": 160,
+      "mode": "mixed",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "matrix_metadata": {
+    "size": [
+      2,
+      2
+    ],
+    "nnz": null,
+    "rcond_estimate": null,
+    "mode": "mixed"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 226058,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_linalg -- p2c002_07_mode_switch --nocapture"
+  }
+}

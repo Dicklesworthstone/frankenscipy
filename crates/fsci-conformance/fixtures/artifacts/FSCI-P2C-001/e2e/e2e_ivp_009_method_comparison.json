@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_ivp_009_method_comparison",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "solve_rk45",
+      "action": "solve",
+      "input_summary": "RK45, exponential decay",
+      "output_summary": "nfev=139, t_len=24",
+      "duration_ns": 95531,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "solve_rk23",
+      "action": "solve",
+      "input_summary": "RK23, exponential decay",
+      "output_summary": "nfev=457, t_len=153",
+      "duration_ns": 307403,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "compare_solutions",
+      "action": "check",
+      "input_summary": "RK45 vs RK23 at t=5",
+      "output_summary": "err45=9.14e-9, err23=5.34e-8, diff=6.26e-8",
+      "duration_ns": 1072,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "efficiency_check",
+      "action": "check",
+      "input_summary": "RK45 fewer evals than RK23",
+      "output_summary": "rk45_nfev=139, rk23_nfev=457",
+      "duration_ns": 281,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 475511,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_009_method_comparison --nocapture"
+  }
+}

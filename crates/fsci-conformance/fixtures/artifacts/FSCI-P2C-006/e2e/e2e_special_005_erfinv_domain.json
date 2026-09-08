@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_special_005_erfinv_domain",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "erfinv_oob_strict",
+      "action": "erfinv",
+      "input_summary": "x=1.5 (out of [-1,1])",
+      "output_summary": "nan_or_error=true",
+      "duration_ns": 13165,
+      "mode": "strict",
+      "outcome": "expected_behavior"
+    },
+    {
+      "step_id": 2,
+      "step_name": "erfinv_oob_hardened",
+      "action": "erfinv",
+      "input_summary": "x=1.5, hardened",
+      "output_summary": "domain_error=true",
+      "duration_ns": 1433,
+      "mode": "strict",
+      "outcome": "expected_error"
+    },
+    {
+      "step_id": 3,
+      "step_name": "erfinv_valid",
+      "action": "erfinv",
+      "input_summary": "x=0.5 (valid)",
+      "output_summary": "result=0.476936, finite=true",
+      "duration_ns": 6483,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 150405,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_special -- e2e_special_005_erfinv_domain --nocapture"
+  }
+}

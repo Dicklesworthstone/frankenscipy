@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_sparse_023_csc_boolean_index",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "boolean_row_index",
+      "action": "csc[rows_bool, :]",
+      "input_summary": "SciPy csc_matrix boolean row indexing preserves CSC format and rebases kept rows",
+      "output_summary": "dense=[[1.0, 0.0, 2.0, 0.0], [5.0, 0.0, 6.0, 0.0]]",
+      "duration_ns": 12594,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "boolean_col_index",
+      "action": "csc[:, cols_bool]",
+      "input_summary": "SciPy csc_matrix boolean column indexing preserves CSC format and rebases kept columns",
+      "output_summary": "dense=[[0.0, 2.0], [3.0, 0.0], [0.0, 6.0]]",
+      "duration_ns": 5781,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "boolean_submatrix",
+      "action": "csc[rows_bool, :][:, cols_bool]",
+      "input_summary": "composed boolean row/column indexing should match SciPy's CSC submatrix result",
+      "output_summary": "dense=[[0.0, 2.0], [0.0, 6.0]]",
+      "duration_ns": 4428,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "boolean_mask_values",
+      "action": "csc[mask_2d]",
+      "input_summary": "full-shape boolean masking should include implicit zeros in the SciPy-selected order",
+      "output_summary": "values=[0.0, 2.0, 4.0, 5.0]",
+      "duration_ns": 3116,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 156005,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_023_csc_boolean_index --nocapture"
+  }
+}

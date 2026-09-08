@@ -1,0 +1,33 @@
+{
+  "scenario_id": "scenario_06_whiten",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "whiten_data",
+      "action": "whiten(data)",
+      "input_summary": "normalize features",
+      "output_summary": "all features normalized",
+      "duration_ns": 25058,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "whiten",
+    "n_samples": 20,
+    "n_features": 3,
+    "n_clusters": 0
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 32552,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_06_whiten --nocapture"
+  }
+}

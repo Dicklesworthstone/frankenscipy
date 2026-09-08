@@ -1,0 +1,37 @@
+{
+  "scenario_id": "e2e_sparse_021_dijkstra_negative_weights",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "reachable_negative_edge",
+      "action": "dijkstra(graph, source=0)",
+      "input_summary": "edges: 0->1=1, 1->2=-2",
+      "output_summary": "distances=[0.0, 1.0, -1.0]",
+      "duration_ns": 12954,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "unreachable_negative_component",
+      "action": "dijkstra(graph, source=0)",
+      "input_summary": "negative edge isolated in unreachable component",
+      "output_summary": "distances=[0.0, 1.0, inf, inf]",
+      "duration_ns": 3176,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 227021,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_021_dijkstra_negative_weights --nocapture"
+  }
+}

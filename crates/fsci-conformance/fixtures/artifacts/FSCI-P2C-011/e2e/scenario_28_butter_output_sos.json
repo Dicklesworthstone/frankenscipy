@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_28_butter_output_sos",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "butter_sos_reference_sections",
+      "action": "butter_sos(4, [0.25], lowpass)",
+      "input_summary": "4th-order Butterworth SOS sections should match SciPy's output='sos' coefficients",
+      "output_summary": "max_abs_diff=4.60e-8",
+      "duration_ns": 1341051,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "butter_sos_filter_equivalence",
+      "action": "sosfilt(butter_sos(...), x) == lfilter(butter(...), x)",
+      "input_summary": "returned SOS sections should reproduce the BA filter output on a representative signal",
+      "output_summary": "max_abs_diff=1.54e-14",
+      "duration_ns": 1091679,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "butter_sos",
+    "signal_length": 0,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 2436456,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_28_butter_output_sos --nocapture"
+  }
+}

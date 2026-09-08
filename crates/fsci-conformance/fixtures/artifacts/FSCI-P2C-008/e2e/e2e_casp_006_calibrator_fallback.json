@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_casp_006_calibrator_fallback",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_calibrator",
+      "action": "init",
+      "input_summary": "alpha=0.05, capacity=200",
+      "output_summary": "alpha=0.05",
+      "duration_ns": 2505,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "good_scores",
+      "action": "observe",
+      "input_summary": "50 scores < 1e-8",
+      "output_summary": "should_fallback=false, miscoverage=0.0000",
+      "duration_ns": 4067,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "bad_scores_trigger",
+      "action": "observe",
+      "input_summary": "50 scores = 1.0 (bad)",
+      "output_summary": "should_fallback=true, miscoverage=0.5000",
+      "duration_ns": 3597,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 166114,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_006_calibrator_fallback --nocapture"
+  }
+}

@@ -1,0 +1,304 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-003",
+  "domain": "optimize",
+  "generated_at": "2026-02-14T12:00:00Z",
+  "entries": [
+    {
+      "scipy_module": "scipy.optimize._optimize",
+      "key_functions": ["_minimize_bfgs", "fmin_bfgs", "_line_search_wolfe12", "_prepare_scalar_function", "MemoizeJac"],
+      "behavior_summary": "BFGS quasi-Newton minimization of scalar functions of one or more variables. Uses the Broyden-Fletcher-Goldfarb-Shanno inverse Hessian update formula. The primary convergence criterion is the gradient infinity-norm: terminate successfully when vecnorm(gfk, ord=norm) <= gtol, where the default gtol=1e-5 and default norm=np.inf (max absolute component). Secondary termination via xrtol: if alpha_k*||pk|| <= xrtol*(xrtol + ||xk||), the step is too small relative to xk. Default xrtol=0 (disabled). Default maxiter=len(x0)*200 when not specified. Line search uses Wolfe conditions via _line_search_wolfe12: first tries Minpack's wolfe1 (scalar_search_wolfe1 backed by DCSRCH Fortran), falls back to wolfe2 (zoom algorithm from Nocedal-Wright). Wolfe parameters: c1=1e-4 (sufficient decrease / Armijo), c2=0.9 (curvature). Line search bounds: amin=1e-100, amax=1e100. Initial step guess: old_old_fval = old_fval + ||gfk||/2 to get dx~1. BFGS update: when yk^T*sk == 0, sets rhok=1000 (avoids divide-by-zero). Returns OptimizeResult with hess_inv (dense ndarray of approximate inverse Hessian). Status codes: 0=success, 1=maxiter, 2=precision loss (line search failed), 3=NaN encountered. Supports hess_inv0 for custom initial inverse Hessian (must be positive definite, checked via Cholesky). ScalarFunction caches fun/grad evaluations to reduce redundant calls. fun returns func and grad when jac=True via MemoizeJac decorator pattern.",
+      "rust_strategy": "Implement BFGS as a struct parameterized by gradient tolerance and line search parameters. The inverse Hessian update is a rank-2 matrix operation using nalgebra's DMatrix. Line search: implement both Wolfe condition variants in pure Rust -- scalar_search_wolfe1 (Minpack DCSRCH port) and the zoom-based wolfe2. The MemoizeJac pattern maps to a struct caching the last (x, f, g) triple. The ScalarFunction caching pattern maps to a lazy-evaluation struct. Key numerical concern: the rhok=1000 fallback when yk^T*sk==0 is a known numerical workaround; preserve exactly. The vecnorm function dispatches on ord parameter; for norm=inf use max(abs(x)).",
+      "risk_level": "high",
+      "legacy_paths": ["scipy/optimize/_optimize.py", "scipy/optimize/_linesearch.py", "scipy/optimize/_dcsrch.py"],
+      "semantic_hotspots": [
+        "Default gtol=1e-5, convergence check: vecnorm(gfk, ord=np.inf) <= gtol",
+        "Default maxiter = len(x0) * 200, NOT a fixed constant",
+        "Default norm=np.inf (max absolute gradient component), NOT L2 norm",
+        "Default xrtol=0 disables relative x-tolerance check entirely",
+        "Line search Wolfe parameters: c1=1e-4, c2=0.9 for BFGS (c2=0.4 for CG)",
+        "Line search fallback: wolfe1 (Minpack DCSRCH) -> wolfe2 (zoom), raise _LineSearchError if both fail",
+        "Line search bounds: amin=1e-100, amax=1e100 -- extremely wide range",
+        "Initial step guess: old_old_fval = old_fval + ||gfk||/2 ensures initial dx ~ 1",
+        "BFGS update: when yk^T*sk == 0, rhok = 1000.0 (NOT infinity, NOT error)",
+        "Initial Hk = I (identity) when hess_inv0 is None, checked for positive definiteness via Cholesky if provided",
+        "Status 0=success, 1=maxiter, 2=precision_loss (line search fail), 3=NaN",
+        "Callback receives OptimizeResult(x=xk, fun=old_fval); StopIteration halts with status=99",
+        "When fun value is +-Inf, sets warnflag=2 and breaks (precision loss)",
+        "ScalarFunction caches: nfev and ngev counters track actual function/gradient evaluations",
+        "x0 is flattened via asarray(x0).flatten() -- multi-dimensional input accepted silently"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._optimize",
+      "key_functions": ["_minimize_cg", "fmin_cg"],
+      "behavior_summary": "Nonlinear conjugate gradient minimization using the Polak-Ribiere-Powell variant. Convergence criterion: vecnorm(gfk, ord=norm) <= gtol, with default gtol=1e-5 and default norm=np.inf. Default maxiter=len(x0)*200. Uses strong Wolfe line search with c1=1e-4 and c2=0.4 (stricter curvature than BFGS's 0.9, as required for CG convergence). Line search uses same _line_search_wolfe12 fallback chain as BFGS, but with an extra_condition: the Polak-Ribiere+ variant requires an explicit sufficient descent check because strong Wolfe conditions alone do not guarantee it for CG. Descent condition: dot(pk, gfk) <= -sigma_3 * dot(gfk, gfk) where sigma_3=0.01, OR gnorm <= gtol (accept if converged). Beta computation: beta_k = max(0, dot(yk, gfkp1) / dot(gfk, gfk)) -- the max(0, ...) is the '+' in Polak-Ribiere+, ensuring non-negative beta for descent. Direction reset: when beta would be negative, it is clamped to 0, effectively restarting CG with steepest descent. Does NOT return hess_inv (unlike BFGS). Status codes same as BFGS: 0/1/2/3.",
+      "rust_strategy": "Implement CG as a struct sharing the same line search infrastructure as BFGS. The Polak-Ribiere+ beta computation is a simple dot product formula with max(0, ...) clamping. The descent condition callback integrates with the line search via the extra_condition pattern -- this maps to a closure or trait object passed to the line search. Key difference from BFGS: no Hessian inverse storage, making CG suitable for large-scale problems. The search direction pk = -gfk + beta_k * pk_old is a simple vector operation.",
+      "risk_level": "medium",
+      "legacy_paths": ["scipy/optimize/_optimize.py", "scipy/optimize/_linesearch.py"],
+      "semantic_hotspots": [
+        "Default gtol=1e-5, norm=np.inf, maxiter=len(x0)*200 -- same as BFGS",
+        "Wolfe parameters: c1=1e-4, c2=0.4 -- c2 is DIFFERENT from BFGS (0.9 vs 0.4)",
+        "Polak-Ribiere+ formula: beta_k = max(0, dot(yk, gfkp1) / deltak) where deltak = dot(gfk, gfk)",
+        "max(0, ...) clamp on beta ensures descent direction; negative beta resets to steepest descent",
+        "Descent condition: dot(pk, gfk) <= -sigma_3 * dot(gfk, gfk), sigma_3 = 0.01",
+        "Descent condition allows acceptance if gnorm <= gtol (converged), bypassing descent check",
+        "cached_step optimization: reuse polak_ribiere_powell_step result if alpha matches",
+        "No hess_inv in result (unlike BFGS) -- only fun, jac, nfev, njev, status, x, nit",
+        "Status codes identical to BFGS: 0=success, 1=maxiter, 2=precision_loss, 3=NaN"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._optimize",
+      "key_functions": ["_minimize_powell", "_linesearch_powell", "_line_for_search"],
+      "behavior_summary": "Modified Powell's conjugate direction method for derivative-free minimization. Convergence criteria: (1) ftol: 2*(fx - fval) <= ftol*(|fx| + |fval|) + 1e-20, default ftol=1e-4; (2) xtol: used internally for Powell line searches with tol=xtol*100, default xtol=1e-4. Default maxiter=N*1000 and maxfev=N*1000 (whichever is reached first; if one is set, the other defaults to inf unless the set one is inf). Each outer iteration performs N sequential 1-D line searches along the current direction set, then updates the direction set by replacing the direction with the largest decrease with the extrapolated direction. Direction replacement uses the classic Powell criterion: t = 2*(fx+fx2-2*fval)*(fx-fval-delta)^2 - delta*(fx-fx2)^2 < 0. Supports bounds: line searches are clipped to [lower_bound, upper_bound]. If bounds provided and initial guess outside bounds, a warning is issued but optimization proceeds. If direc is not full rank, a warning is issued that some parameters may not be optimized. Status codes: 0=success, 1=maxfev, 2=maxiter, 3=NaN, 4=out_of_bounds. Returns direc (final direction set) in result. Extrapolation point x2 is clipped to min(lmax, 1)*direc1 to stay within bounds.",
+      "rust_strategy": "Implement Powell's method as a struct with a direction set matrix (nalgebra DMatrix). The 1-D line search (_linesearch_powell) uses Brent's method for scalar minimization along each direction. The _line_for_search helper computes the maximum step size allowed by bounds in a given direction. Key challenge: the direction set update logic (bigind replacement) and the extrapolation criterion must be preserved exactly. The bounded variant clips trial points and adjusts step sizes. No gradient computation required, making this suitable for non-differentiable objectives.",
+      "risk_level": "medium",
+      "legacy_paths": ["scipy/optimize/_optimize.py"],
+      "semantic_hotspots": [
+        "Default ftol=1e-4: convergence when 2*(fx-fval) <= ftol*(|fx|+|fval|) + 1e-20",
+        "Default xtol=1e-4: passed to _linesearch_powell as tol=xtol*100 (i.e., tol=0.01 by default)",
+        "Default maxiter=N*1000 and maxfev=N*1000 (NOT N*200 like BFGS/CG)",
+        "If maxiter=inf and maxfev=None, maxfev defaults to N*1000 (avoids unbounded)",
+        "Direction set replacement: bigind direction replaced by extrapolated direction",
+        "Extrapolation criterion: t = 2*(fx+fx2-2*fval)*(fx-fval-delta)^2 - delta*(fx-fx2)^2 < 0",
+        "Only replaces direction if np.any(direc1) is truthy (non-zero extrapolated direction)",
+        "Bounded: extrapolation clipped via _line_for_search to stay within bounds",
+        "Status 4 = out_of_bounds (unique to Powell, not present in BFGS/CG)",
+        "Initial direc = eye(N) if not provided; non-full-rank direc triggers warning",
+        "NaN in both fx and fval triggers immediate break (nan-region bailout)",
+        "Derivative-free: does NOT use jac, hess, or any gradient information",
+        "Callback receives OptimizeResult(x=x, fun=fval) after each outer iteration"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._optimize",
+      "key_functions": ["_minimize_neldermead", "fmin"],
+      "behavior_summary": "Nelder-Mead simplex algorithm for derivative-free minimization. Convergence criteria: (1) xatol: max(|sim[1:] - sim[0]|) <= xatol, default xatol=1e-4 (absolute x tolerance over all simplex vertices); AND (2) fatol: max(|fsim[0] - fsim[1:]|) <= fatol, default fatol=1e-4 (absolute function value tolerance). BOTH conditions must be satisfied simultaneously. Default maxiter=N*200 and maxfev=N*200 when neither is set. Simplex construction: for each dimension k, perturb x0[k] by (1+nonzdelt)*x0[k] if nonzero (nonzdelt=0.05), or zdelt=0.00025 if zero. Standard simplex coefficients: rho=1 (reflection), chi=2 (expansion), psi=0.5 (contraction), sigma=0.5 (shrink). Adaptive mode (adaptive=True): adjusts coefficients based on dimension: chi=1+2/dim, psi=0.75-1/(2*dim), sigma=1-1/dim. Operations: reflect, expand, outside contract, inside contract, shrink. Simplex always re-sorted after each iteration. Supports bounds: all simplex operations clip to [lower_bound, upper_bound]; initial simplex vertices outside bounds are reflected into interior then clipped. Status codes: 1=maxfev, 2=maxiter (note: unlike BFGS, 1 is maxfev not maxiter). Callback receives OptimizeResult(x=sim[0], fun=fsim[0]).",
+      "rust_strategy": "Implement Nelder-Mead as a struct holding the (N+1, N) simplex matrix and function values. The five operations (reflect, expand, outside-contract, inside-contract, shrink) are straightforward vector arithmetic. The bounded variant clips each trial point. The adaptive coefficients are computed once from dimension and stored. Key concern: the simplex is re-sorted (argsort on function values) after each iteration, and convergence checks use the sorted simplex. The initial simplex construction must handle the x0[k]==0 case with zdelt. MaxFuncCallError exception handling wraps the function; Rust maps this to a Result type with an early-return check.",
+      "risk_level": "medium",
+      "legacy_paths": ["scipy/optimize/_optimize.py"],
+      "semantic_hotspots": [
+        "Default xatol=1e-4, fatol=1e-4: BOTH must be satisfied for convergence",
+        "Convergence: max(ravel(abs(sim[1:]-sim[0]))) <= xatol AND max(abs(fsim[0]-fsim[1:])) <= fatol",
+        "Default maxiter=N*200 and maxfev=N*200 when neither is set",
+        "Standard coefficients: rho=1, chi=2, psi=0.5, sigma=0.5",
+        "Adaptive coefficients: chi=1+2/dim, psi=0.75-1/(2*dim), sigma=1-1/dim, rho=1 (unchanged)",
+        "Simplex construction: nonzdelt=0.05 for nonzero elements, zdelt=0.00025 for zero elements",
+        "Initial simplex: sim[0]=x0, sim[k+1] perturbs only dimension k",
+        "custom initial_simplex must have shape (N+1, N), validated explicitly",
+        "Bounded: reflect vertices exceeding upper_bound via 2*upper_bound - sim, then clip to lower_bound",
+        "Simplex re-sorted by function value after EVERY iteration (argsort + take)",
+        "Status 1=maxfev (NOT maxiter), Status 2=maxiter -- different from BFGS/CG ordering",
+        "Derivative-free: no gradient information used at all",
+        "x0 dtype preserved if inexact, otherwise cast to float64",
+        "Outside contraction: xc = (1+psi*rho)*xbar - psi*rho*sim[-1], accepted if fxc <= fxr",
+        "Inside contraction: xcc = (1-psi)*xbar + psi*sim[-1], accepted if fxcc < fsim[-1]"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._minimize",
+      "key_functions": ["minimize", "minimize_scalar", "standardize_bounds", "standardize_constraints", "_validate_bounds"],
+      "behavior_summary": "Unified dispatch interface for multivariate and scalar minimization. Method selection: if method=None, selects BFGS (unconstrained), L-BFGS-B (bounded), or SLSQP (constrained). Method names are case-insensitive. The tol parameter sets method-specific tolerances via setdefault: Nelder-Mead gets xatol/fatol, Powell gets xtol/ftol, BFGS/CG get gtol, L-BFGS-B gets ftol/gtol, trust-constr gets xtol/gtol/barrier_tol. Callback introspection: inspects callback signature via wrapped_inspect_signature; if parameter name is 'intermediate_result', passes OptimizeResult; otherwise passes copy of xk. All methods except TNC support callback; TNC/COBYLA/COBYQA don't get wrapped. For L-BFGS-B/TNC/SLSQP: fixed variables (lb==ub) are removed from the problem, function/jacobian/constraints are wrapped to insert fixed values. All variables fixed returns immediately with fun(x0). Bounds validated: ub < lb raises ValueError. x0 must be 1-D; integer dtype cast to float. minimize_scalar: default method is 'brent' (no bounds) or 'bounded' (with bounds). StopIteration from callback sets status=99, success=False.",
+      "rust_strategy": "Implement minimize as a generic dispatcher using an enum for method selection. The tol-to-option mapping is a simple match expression. Callback handling maps to a trait object or enum-dispatched closure. The fixed-variable removal/reinsertion logic (_Remove_From_Func, _add_to_array) maps to index-based slicing with a fixed-variable mask. Bounds standardization converts between old-style (list of tuples) and new-style (Bounds struct). The key architectural decision is whether to use dynamic dispatch (trait objects) or static dispatch (generics/enums) for the solver polymorphism.",
+      "risk_level": "medium",
+      "legacy_paths": ["scipy/optimize/_minimize.py", "scipy/optimize/_constraints.py"],
+      "semantic_hotspots": [
+        "Default method: BFGS (no bounds/constraints), L-BFGS-B (bounds), SLSQP (constraints)",
+        "Method names are case-insensitive: method.lower() used for dispatch",
+        "tol sets different options per method via setdefault (does NOT override explicit options)",
+        "Nelder-Mead: tol -> xatol, fatol; Powell: tol -> xtol, ftol; BFGS/CG: tol -> gtol",
+        "L-BFGS-B: tol -> ftol, gtol; trust-constr: tol -> xtol, gtol, barrier_tol",
+        "COBYQA: tol -> final_tr_radius (unique option name)",
+        "x0 must be 1-D: raises ValueError if x0.ndim != 1",
+        "Integer x0 cast to float: if x0.dtype.kind in AllInteger, asarray(x0, dtype=float)",
+        "Fixed variables (lb==ub) removed for L-BFGS-B/TNC/SLSQP when finite differences needed",
+        "All variables fixed: returns OptimizeResult with fun=fun(x0), nfev=1, success=True",
+        "Callback StopIteration: sets res.success=False, res.status=99, res.message describes halt",
+        "Warnings for unsupported options: jac on Nelder-Mead/Powell, hess on non-Newton methods",
+        "bounds.ub < bounds.lb raises ValueError, bounds broadcast to x0.shape",
+        "minimize_scalar: res.fun and res.x shapes are matched via np.reshape after solve"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._zeros_py",
+      "key_functions": ["brentq", "_wrap_nan_raise"],
+      "behavior_summary": "Brent's method for finding a root of f on a sign-changing interval [a, b]. Uses inverse quadratic extrapolation with bisection fallback. Convergence criterion: |x - x0| <= xtol + rtol * |x0|, equivalent to np.isclose(x, x0, atol=xtol, rtol=rtol). Default tolerances: xtol=2e-12 (absolute), rtol=4*np.finfo(float).eps approximately 8.88e-16 (relative). Default maxiter=100. Validation: xtol must be > 0 (ValueError if <= 0), rtol must be >= 4*eps (ValueError if smaller). The function f is wrapped by _wrap_nan_raise which raises ValueError if f returns NaN at any evaluation point (gh-17622 fix). The actual computation delegates to _zeros._brentq (C extension). Requires f(a) and f(b) to have opposite signs; ValueError if not. Returns RootResults object with root, converged, flag, function_calls, iterations, method fields. Brent's method is generally considered the best of the bracketing methods: safe and superlinear convergent. For nice functions, often achieves xtol/2 and rtol/2 accuracy.",
+      "rust_strategy": "Implement Brent's method in pure Rust following the van Wijngaarden-Dekker-Brent algorithm. The C implementation in SciPy's _zeros module is compact (~100 lines) and translates directly. Key: the interpolation step selection (inverse quadratic vs secant vs bisection) must match exactly. The NaN-wrapping behavior (raising on NaN function values) maps to returning Err on non-finite f(x). The convergence check uses the same tolerance formula: |xm| <= tol1 where tol1 = 2*eps*|xb| + (xtol+rtol*|xb|)/2.",
+      "risk_level": "high",
+      "legacy_paths": ["scipy/optimize/_zeros_py.py", "scipy/optimize/_zeros.pyx"],
+      "semantic_hotspots": [
+        "Default xtol=2e-12 (absolute), rtol=4*eps approximately 8.88e-16 (relative)",
+        "Default maxiter=100 (NOT the same as minimize methods)",
+        "Termination: |x - x0| <= xtol + rtol*|x0| (combined absolute+relative)",
+        "xtol must be > 0: raises ValueError('xtol too small') if <= 0",
+        "rtol minimum is 4*np.finfo(float).eps: raises ValueError if smaller",
+        "f(a) and f(b) must have opposite signs: ValueError if same sign",
+        "NaN function values raise ValueError (gh-17622 fix via _wrap_nan_raise)",
+        "C extension _zeros._brentq does the actual computation",
+        "Uses inverse quadratic extrapolation when possible, bisection as fallback",
+        "Superlinear convergence for smooth functions; guaranteed convergence for continuous f",
+        "xtol=2e-12 default can be surprising: roots near 0 get absolute accuracy, roots far from 0 get relative",
+        "Setting xtol=5e-324 (smallest subnormal) gives highest possible accuracy"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._zeros_py",
+      "key_functions": ["brenth"],
+      "behavior_summary": "Brent's method variant using hyperbolic extrapolation instead of inverse quadratic extrapolation (Algorithm M from Bus & Dekker 1975). Same interface and convergence criterion as brentq: |x - x0| <= xtol + rtol * |x0|. Same default tolerances: xtol=2e-12, rtol=4*eps, maxiter=100. Same validation: xtol > 0, rtol >= 4*eps. Same NaN wrapping via _wrap_nan_raise. Bus & Dekker guarantee convergence with upper bound on function evaluations of 4-5 times that of bisection. Generally on par with brentq but not as heavily tested. Delegates to C extension _zeros._brenth. The hyperbolic extrapolation formula differs from brentq's inverse quadratic, potentially offering better performance on certain function shapes, but in practice the two are comparable.",
+      "rust_strategy": "Implement brenth alongside brentq, sharing the same infrastructure (tolerance validation, NaN wrapping, RootResults). The key difference is the interpolation step: hyperbolic extrapolation (Bus & Dekker Algorithm M) instead of inverse quadratic. The C implementation is similarly compact. Both methods share the same convergence check and bisection fallback logic. Consider implementing both as variants of a common Brent framework parameterized by the extrapolation strategy.",
+      "risk_level": "high",
+      "legacy_paths": ["scipy/optimize/_zeros_py.py", "scipy/optimize/_zeros.pyx"],
+      "semantic_hotspots": [
+        "Same defaults as brentq: xtol=2e-12, rtol=4*eps, maxiter=100",
+        "Same validation: xtol > 0, rtol >= 4*eps",
+        "Same convergence criterion: |x - x0| <= xtol + rtol*|x0|",
+        "Same NaN wrapping via _wrap_nan_raise",
+        "Hyperbolic extrapolation (Algorithm M of Bus & Dekker 1975) instead of inverse quadratic",
+        "Convergence guaranteed; upper bound on evaluations is 4-5x bisection",
+        "C extension _zeros._brenth does the actual computation",
+        "Less tested than brentq but comparable performance in practice"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._zeros_py",
+      "key_functions": ["bisect"],
+      "behavior_summary": "Classical bisection method for root-finding on a sign-changing interval [a, b]. The simplest and most robust bracketing method but slowest (linear convergence, halving the interval each step). Same convergence criterion as brentq/brenth: |x - x0| <= xtol + rtol * |x0|. Same default tolerances: xtol=2e-12, rtol=4*eps, maxiter=100. Same validation: xtol > 0, rtol >= 4*eps. Same NaN wrapping. Requires f(a) and f(b) to have opposite signs. Delegates to C extension _zeros._bisect. The convergence rate is exactly one bit of accuracy per iteration (compared to superlinear for brentq). Useful as a reference implementation and for functions where superlinear methods may be unreliable.",
+      "rust_strategy": "Implement bisect in pure Rust as the simplest root-finding method. Each iteration: compute midpoint c=(a+b)/2, evaluate f(c), replace the endpoint with the same sign as f(c). Check convergence via the standard tolerance formula. This serves as both a reference implementation and a fallback for pathological cases. The Rust implementation should use (a+b)/2 computed carefully to avoid overflow for large a, b values.",
+      "risk_level": "low",
+      "legacy_paths": ["scipy/optimize/_zeros_py.py", "scipy/optimize/_zeros.pyx"],
+      "semantic_hotspots": [
+        "Same defaults as brentq: xtol=2e-12, rtol=4*eps, maxiter=100",
+        "Same validation: xtol > 0, rtol >= 4*eps",
+        "Same convergence criterion: |x - x0| <= xtol + rtol*|x0|",
+        "Linear convergence: exactly 1 bit of accuracy per iteration",
+        "Requires f continuous with f(a)*f(b) < 0",
+        "Midpoint computation must avoid overflow: use a + (b-a)/2 instead of (a+b)/2",
+        "Slowest of all bracketing methods but guaranteed to converge",
+        "C extension _zeros._bisect does the actual computation"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._root_scalar",
+      "key_functions": ["root_scalar", "MemoizeDer"],
+      "behavior_summary": "Unified dispatch interface for scalar root-finding. Method auto-selection: if bracket provided, selects 'brentq'; if x0 and fprime and fprime2, selects 'halley'; if x0 and fprime, selects 'newton'; if x0 and x1, selects 'secant'; if only x0, selects 'newton' (with finite-difference fprime approximation). ValueError if neither bracket nor x0 is provided. Supported methods: bisect, brentq, brenth, ridder, toms748 (bracketing); newton, secant, halley (open). fprime=True means f returns (value, derivative); fprime2=True means f returns (value, f', f''). MemoizeDer caches the last (x, f(x)) call to avoid redundant evaluations when fprime/fprime2 are requested. For bracketing methods: bracket must be list/tuple/ndarray of 2 elements, a and b extracted as bracket[:2]. For newton/halley/secant: xtol is renamed to tol in kwargs. For newton without fprime: uses approx_derivative with method='2-point' for finite-difference gradient. The function_calls count is replaced by MemoizeDer.n_calls when memoization is active (avoids double/triple counting). Returns RootResults object.",
+      "rust_strategy": "Implement root_scalar as an enum-dispatched function selecting among the available scalar solvers. The MemoizeDer pattern maps to a struct caching (x, vals) pairs. The fprime=True/fprime2=True convention maps to an enum: FunctionOnly, FunctionAndDerivative, FunctionAndTwoDerivatives. The auto-selection logic is a simple decision tree. For newton without fprime, implement a 2-point finite-difference approximation inline. The xtol->tol rename for newton/halley/secant is a quirk that must be preserved for API compatibility.",
+      "risk_level": "medium",
+      "legacy_paths": ["scipy/optimize/_root_scalar.py"],
+      "semantic_hotspots": [
+        "Method auto-selection priority: bracket -> brentq; x0+fprime+fprime2 -> halley; x0+fprime -> newton; x0+x1 -> secant; x0 alone -> newton",
+        "ValueError if neither bracket nor x0 provided: 'Unable to select a solver'",
+        "fprime=True: f returns (value, derivative), wrapped by MemoizeDer",
+        "fprime2=True: f returns (value, f', f''), wrapped by MemoizeDer",
+        "MemoizeDer checks x != self.x for cache invalidation (scalar equality, not array)",
+        "Bracketing methods: bracket must be list|tuple|ndarray, ValueError if not",
+        "For newton/halley/secant: xtol is renamed to 'tol' in kwargs (API quirk)",
+        "Newton without fprime: uses approx_derivative with method='2-point'",
+        "approx_derivative wraps f to accept array input, extracts scalar output",
+        "function_calls replaced by MemoizeDer.n_calls when memoized (avoids double counting)",
+        "full_output=True and disp=False always passed to underlying methods",
+        "halley requires both fprime and fprime2: ValueError if either missing",
+        "secant requires x0: ValueError if None; x1 optional (default computed internally)"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._zeros_py",
+      "key_functions": ["newton"],
+      "behavior_summary": "Newton-Raphson, secant, and Halley's methods for scalar root-finding. When fprime is provided: Newton-Raphson iteration x_{n+1} = x_n - f(x_n)/f'(x_n), quadratic convergence. When fprime is None and x1 is provided: secant method using two initial points, sub-quadratic convergence. When both fprime and fprime2 are provided: Halley's method x_{n+1} = x_n - 2*f*f'/(2*f'^2 - f*f''), cubic convergence. Default tol=1.48e-8 (absolute tolerance), rtol=0.0 (relative tolerance). Convergence: np.isclose(p, p0, rtol=rtol, atol=tol). Default maxiter=50 (much less than root_scalar's maxiter=100 for bracketing). Supports vectorized operation: if x0 is a sequence, returns array of roots via _array_newton. For scalar x0: converts to float via np.asarray(x0)[()] * 1.0. Newton: zero derivative warning ('zero derivative', no convergence). Secant: if x1 not provided, perturbs x0 by x0*1.01 + 0.01 (or x0*(1+1e-4) + 1e-4 via internal logic). Halley modification: computes discr = (d - p0)**2 - 4*fval*(d-fder)/fder2, adjusts step. Functions counting: 2 per Newton iteration (f + f'), 1 per secant iteration (f only), 3 per Halley iteration (f + f' + f'').",
+      "rust_strategy": "Implement all three methods (Newton, secant, Halley) in a single function dispatched by the presence/absence of fprime/fprime2. The vectorized path (_array_newton) maps to an iterator-based implementation over arrays. For the scalar path: Newton uses a simple loop with derivative evaluation and convergence check via isclose. The Halley cubic correction formula must be ported exactly. The secant method's x1 perturbation formula must match. Key numerical concern: zero derivative detection (fder==0 for Newton, q-p==0 for secant).",
+      "risk_level": "high",
+      "legacy_paths": ["scipy/optimize/_zeros_py.py"],
+      "semantic_hotspots": [
+        "Default tol=1.48e-8 (absolute), rtol=0.0 (relative, disabled by default)",
+        "Default maxiter=50 (much lower than bracketing methods' 100)",
+        "tol must be > 0: raises ValueError if <= 0",
+        "maxiter must be >= 1: raises ValueError if < 1",
+        "Newton convergence: np.isclose(p, p0, rtol=rtol, atol=tol) -- uses BOTH tolerances",
+        "Newton: zero derivative raises RuntimeWarning, iteration continues but may not converge",
+        "Secant: if x1 not provided explicitly, secant falls back to perturbation of x0",
+        "Halley: uses discriminant-based modification, not straightforward f*f'/(f'^2 - 0.5*f*f'')",
+        "Vectorized: if np.size(x0) > 1, dispatches to _array_newton (different code path)",
+        "Scalar conversion: x0 = np.asarray(x0)[()] * 1.0 (supports complex x0)",
+        "No sign-change bracket required: open methods can diverge or oscillate",
+        "funcalls counter tracks total function evaluations (f + fprime + fprime2 calls separately)"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._optimize",
+      "key_functions": ["OptimizeResult", "OptimizeWarning", "_status_message", "_wrap_callback", "_check_unknown_options"],
+      "behavior_summary": "Common infrastructure for all optimization routines. OptimizeResult is a dict subclass (_RichResult) with attribute access for x, fun, success, status, message, nfev, njev, nhev, nit, jac, hess, hess_inv, maxcv. Not all attributes are present for all methods. _status_message provides standard termination messages: 'success' (terminated successfully), 'maxfev' (function evaluations exceeded), 'maxiter' (iterations exceeded), 'pr_loss' (precision loss), 'nan' (NaN encountered), 'out_of_bounds' (result outside bounds). _wrap_callback: inspects callback signature; if parameter is 'intermediate_result', passes OptimizeResult; for trust-constr, passes (copy of x, res); for differential_evolution, passes (copy of x, convergence); otherwise passes copy of xk. Wrapped callback gets stop_iteration=False attribute; set to True when StopIteration caught. _check_unknown_options: warns OptimizeWarning for unrecognized solver options (stacklevel=4 to reach user code). _epsilon = sqrt(machine_epsilon) approximately 1.49e-8, used as default absolute step for finite-difference gradient approximation.",
+      "rust_strategy": "Define OptimizeResult as a Rust struct with Option<T> fields for all attributes (x, fun, success, status, message, nfev, njev, nhev, nit, jac, hess_inv, etc.). The _status_message mapping becomes an enum with Display trait. Callback handling maps to a trait or closure that receives either the full result or just x, depending on solver. The _epsilon constant (sqrt of machine epsilon) is a const. Unknown options handling maps to a warning/log message for unrecognized keys in an options HashMap.",
+      "risk_level": "low",
+      "legacy_paths": ["scipy/optimize/_optimize.py"],
+      "semantic_hotspots": [
+        "OptimizeResult is a _RichResult (dict subclass) with attribute access",
+        "Not all fields are present for all methods: solver-specific fields vary",
+        "_epsilon = sqrt(np.finfo(float).eps) approximately 1.4901161193847656e-08",
+        "Callback signature introspection: 'intermediate_result' parameter name triggers new interface",
+        "Callback StopIteration: caught, sets stop_iteration=True, method breaks, status=99",
+        "trust-constr callback: receives (copy of x, res) -- 2 arguments, different from others",
+        "x is COPIED before passing to callback: np.copy(res.x) prevents mutation",
+        "_check_unknown_options: warns at stacklevel=4 to point to user code",
+        "Standard status messages are shared across BFGS, CG, Powell, Nelder-Mead"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._linesearch",
+      "key_functions": ["line_search_wolfe1", "line_search_wolfe2", "scalar_search_wolfe1", "scalar_search_wolfe2", "line_search_armijo"],
+      "behavior_summary": "Line search algorithms satisfying the strong Wolfe conditions. Wolfe conditions: (1) sufficient decrease (Armijo): f(x+alpha*p) <= f(x) + c1*alpha*f'(x)^T*p; (2) curvature: |f'(x+alpha*p)^T*p| <= c2*|f'(x)^T*p|. c1 and c2 must satisfy 0 < c1 < c2 < 1; ValueError raised otherwise. wolfe1 (scalar_search_wolfe1): wraps DCSRCH from Minpack (Fortran-derived). Parameters: c1=1e-4, c2=0.9, amax=50, amin=1e-8, xtol=1e-14. Returns (alpha, phi(alpha), phi0) or (None, ...) on failure. wolfe2 (scalar_search_wolfe2): pure Python zoom-based algorithm from Nocedal & Wright. Parameters: c1=1e-4, c2=0.9, amax=None, maxiter=10 (for outer loop), extra_condition optional callback. Uses cubic/quadratic interpolation in the zoom phase. _line_search_wolfe12: tries wolfe1 first, falls back to wolfe2, raises _LineSearchError if both fail. If extra_condition is provided and wolfe1 succeeds, checks extra_condition on the result; rejects to wolfe2 if not satisfied.",
+      "rust_strategy": "Implement both Wolfe line search variants in pure Rust. scalar_search_wolfe1 requires porting DCSRCH (the Minpack scalar search), which is a state-machine-based algorithm. scalar_search_wolfe2 is the zoom algorithm from Nocedal & Wright, using cubic/quadratic interpolation. The fallback chain (wolfe1 -> wolfe2 -> error) maps directly. The extra_condition callback pattern maps to an FnMut closure. Key numerical concerns: the cubic interpolation in zoom uses careful arithmetic to avoid overflow, and the safeguarded interpolation bounds (cubicmin, quadmin helpers) must be preserved.",
+      "risk_level": "critical",
+      "legacy_paths": ["scipy/optimize/_linesearch.py", "scipy/optimize/_dcsrch.py"],
+      "semantic_hotspots": [
+        "Wolfe conditions: sufficient decrease (Armijo) + curvature condition",
+        "c1 and c2 must satisfy 0 < c1 < c2 < 1: ValueError from _check_c1_c2 if violated",
+        "wolfe1 default: c1=1e-4, c2=0.9, amax=50, amin=1e-8, xtol=1e-14",
+        "wolfe2 default: c1=1e-4, c2=0.9, amax=None, maxiter=10 for outer loop",
+        "wolfe1 wraps DCSRCH (Minpack Fortran-derived): state machine with isave/dsave arrays",
+        "wolfe2 uses zoom algorithm with cubic/quadratic interpolation (Nocedal & Wright)",
+        "_line_search_wolfe12 fallback: wolfe1 -> reject via extra_condition -> wolfe2 -> _LineSearchError",
+        "BFGS uses c2=0.9, CG uses c2=0.4 -- different curvature conditions",
+        "Line search direction pk: descent direction, derphi0 = dot(gfk, pk) must be < 0",
+        "phi(alpha) = f(xk + alpha*pk), derphi(alpha) = dot(fprime(xk + alpha*pk), pk)",
+        "wolfe2 zoom: uses _cubicmin and _quadmin helpers with safeguard bounds",
+        "amax in _line_search_wolfe12: passed as amin=1e-100, amax=1e100 from BFGS/CG"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._zeros_py",
+      "key_functions": ["ridder"],
+      "behavior_summary": "Ridder's method for root-finding on a sign-changing interval [a, b]. Uses a geometric trick: evaluates f at midpoint m, computes q = sqrt(f(m)^2 - f(a)*f(b)), and then a secant-like step with sign correction. Same interface as brentq/bisect: xtol=2e-12, rtol=4*eps, maxiter=100. Same validation and NaN wrapping. Convergence rate is approximately quadratic (order ~2). Delegates to C extension _zeros._ridder. Generally less robust than brentq but simpler to implement. Useful as an intermediate option between bisect (slow, robust) and brentq (fast, complex).",
+      "rust_strategy": "Implement Ridder's method in pure Rust alongside brentq and bisect. The algorithm evaluates f at three points per iteration (a, midpoint, and Ridder correction), making it slightly more expensive per iteration than brentq but simpler. Share the same tolerance validation and convergence check infrastructure with brentq/bisect.",
+      "risk_level": "medium",
+      "legacy_paths": ["scipy/optimize/_zeros_py.py", "scipy/optimize/_zeros.pyx"],
+      "semantic_hotspots": [
+        "Same defaults as brentq: xtol=2e-12, rtol=4*eps, maxiter=100",
+        "Same validation: xtol > 0, rtol >= 4*eps",
+        "Same convergence criterion: |x - x0| <= xtol + rtol*|x0|",
+        "Approximately quadratic convergence rate",
+        "Evaluates f at 2 points per iteration (midpoint + correction)",
+        "C extension _zeros._ridder does the actual computation",
+        "NaN wrapping via _wrap_nan_raise"
+      ]
+    },
+    {
+      "scipy_module": "scipy.optimize._zeros_py",
+      "key_functions": ["toms748"],
+      "behavior_summary": "TOMS Algorithm 748 for root-finding on a sign-changing interval [a, b]. By Alefeld, Potra, and Shi. Uses up to inverse cubic interpolation, with secant and bisection fallbacks. Parameter k controls the number of additional interpolation steps per bracket update (default k=1). Same default tolerances: xtol=2e-12, rtol=4*eps, maxiter=100. Convergence rate is asymptotically 2+sqrt(3) approximately 3.73 when k=2. The algorithm maintains a bracket [a, b] and tightens it using increasingly sophisticated interpolation. Pure Python implementation (not C extension like brentq/bisect/ridder). Uses helper functions _secant, _update_bracket, _notclose. Fastest among the bracketing methods for smooth functions. More complex implementation than brentq.",
+      "rust_strategy": "Implement TOMS 748 in Rust following the pure Python implementation in _zeros_py.py. The algorithm is more complex than brentq but offers higher-order convergence. Key functions to port: _secant, _update_bracket (tightening the bracket after each interpolation step), _notclose (checking that function values are sufficiently distinct). The k parameter controls the aggressiveness of interpolation (higher k = more interpolation steps per bracket update). Share tolerance validation infrastructure with other bracketing methods.",
+      "risk_level": "high",
+      "legacy_paths": ["scipy/optimize/_zeros_py.py"],
+      "semantic_hotspots": [
+        "Same defaults as brentq: xtol=2e-12, rtol=4*eps, maxiter=100",
+        "Additional parameter k=1: number of extra interpolation steps per bracket update",
+        "Asymptotic convergence order: 2+sqrt(3) approximately 3.73 for k=2",
+        "Pure Python implementation (NOT C extension unlike brentq/bisect/ridder)",
+        "Uses inverse cubic interpolation when 4 distinct function values available",
+        "Falls back to secant when fewer distinct values, then to bisection",
+        "_notclose helper: ensures function values are all finite, nonzero, and distinct",
+        "Most complex bracketing algorithm but fastest for smooth functions",
+        "NaN wrapping via _wrap_nan_raise"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,191 @@
+{
+  "contracts": [
+    {
+      "function_name": "fsci_stats::bootstrap_mean",
+      "scipy_equivalent": "scipy.stats.bootstrap_mean",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_stats::describe",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::distribution_cdf",
+      "scipy_equivalent": "scipy.stats.distribution_cdf",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_stats::distribution_pdf",
+      "scipy_equivalent": "scipy.stats.distribution_pdf",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_stats::distribution_ppf",
+      "scipy_equivalent": "scipy.stats.distribution_ppf",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_stats::entropy (base=e)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::iqr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::kendalltau",
+      "scipy_equivalent": "scipy.stats.kendalltau",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_stats::ks_2samp",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::kurtosis (Fisher=True, bias=True)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::linregress",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::mannwhitneyu",
+      "scipy_equivalent": "scipy.stats.mannwhitneyu",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_stats::moment (central moment)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::pearsonr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::sem (ddof=1)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::shapiro",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::skew (bias=True)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::spearmanr",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::ttest_1samp",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::ttest_ind",
+      "scipy_equivalent": "scipy.stats.ttest_ind",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_stats::variation (ddof=0)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_stats::zscore (ddof=0)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    }
+  ],
+  "domain": "stats",
+  "generated_at": "2026-04-23T00:00:00Z",
+  "packet_id": "FSCI-P2C-012",
+  "schema_version": 1
+}

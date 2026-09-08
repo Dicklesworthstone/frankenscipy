@@ -1,0 +1,67 @@
+{
+  "scenario_id": "e2e_001_lowpass",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "generate_signal",
+      "action": "create",
+      "input_summary": "n=64, freqs=[3,20]Hz",
+      "output_summary": "signal len=64",
+      "duration_ns": 19227,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "rfft",
+      "action": "transform",
+      "input_summary": "real signal n=64",
+      "output_summary": "spectrum len=33",
+      "duration_ns": 66185,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "lowpass_filter",
+      "action": "filter",
+      "input_summary": "cutoff=10Hz",
+      "output_summary": "zeroed high-freq bins",
+      "duration_ns": 10189,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "irfft",
+      "action": "inverse_transform",
+      "input_summary": "spectrum len=33",
+      "output_summary": "signal len=64",
+      "duration_ns": 8366,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 5,
+      "step_name": "verify_output",
+      "action": "compare",
+      "input_summary": "expected 3Hz-only, diff=1.8874e-15",
+      "output_summary": "pass=true",
+      "duration_ns": 2745,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 229926,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_fft -- e2e_001_lowpass --nocapture"
+  }
+}

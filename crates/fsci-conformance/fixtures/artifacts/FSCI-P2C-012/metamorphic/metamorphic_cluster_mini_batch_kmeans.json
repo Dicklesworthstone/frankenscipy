@@ -1,0 +1,172 @@
+{
+  "test_id": "metamorphic_cluster_mini_batch_kmeans",
+  "case_count": 27,
+  "pass_count": 27,
+  "pass": true,
+  "timestamp_ms": 1779662452428,
+  "duration_ns": 2691479,
+  "cases": [
+    {
+      "case_id": "blobs_k2",
+      "invariant": "centroids_shape_k_by_d",
+      "detail": "centroids.len()=2, expected_k=2, d=2",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k2",
+      "invariant": "labels_len_eq_n",
+      "detail": "labels.len()=16, n=16",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k2",
+      "invariant": "labels_in_0_k",
+      "detail": "max_label=1, k=2",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k2",
+      "invariant": "deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k2",
+      "invariant": "labels_match_nearest_center",
+      "detail": "ok=true",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k2",
+      "invariant": "inertia_nonneg",
+      "detail": "inertia=0.6230947766465464",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k2",
+      "invariant": "well_separated_recovery",
+      "detail": "within_same_label=true, cross_diff_label=true",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k3",
+      "invariant": "centroids_shape_k_by_d",
+      "detail": "centroids.len()=3, expected_k=3, d=2",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k3",
+      "invariant": "labels_len_eq_n",
+      "detail": "labels.len()=21, n=21",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k3",
+      "invariant": "labels_in_0_k",
+      "detail": "max_label=2, k=3",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k3",
+      "invariant": "deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k3",
+      "invariant": "labels_match_nearest_center",
+      "detail": "ok=true",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k3",
+      "invariant": "inertia_nonneg",
+      "detail": "inertia=0.6230819635811179",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k3",
+      "invariant": "well_separated_recovery",
+      "detail": "within_same_label=true, cross_diff_label=true",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k4",
+      "invariant": "centroids_shape_k_by_d",
+      "detail": "centroids.len()=4, expected_k=4, d=2",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k4",
+      "invariant": "labels_len_eq_n",
+      "detail": "labels.len()=24, n=24",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k4",
+      "invariant": "labels_in_0_k",
+      "detail": "max_label=3, k=4",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k4",
+      "invariant": "deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k4",
+      "invariant": "labels_match_nearest_center",
+      "detail": "ok=true",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k4",
+      "invariant": "inertia_nonneg",
+      "detail": "inertia=0.520356011625661",
+      "pass": true
+    },
+    {
+      "case_id": "blobs_k4",
+      "invariant": "well_separated_recovery",
+      "detail": "within_same_label=true, cross_diff_label=true",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_k1",
+      "invariant": "centroids_shape_k_by_d",
+      "detail": "centroids.len()=1, expected_k=1, d=2",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_k1",
+      "invariant": "labels_len_eq_n",
+      "detail": "labels.len()=20, n=20",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_k1",
+      "invariant": "labels_in_0_k",
+      "detail": "max_label=0, k=1",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_k1",
+      "invariant": "deterministic_same_seed",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_k1",
+      "invariant": "labels_match_nearest_center",
+      "detail": "ok=true",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_k1",
+      "invariant": "inertia_nonneg",
+      "detail": "inertia=2.26147695625",
+      "pass": true
+    }
+  ]
+}

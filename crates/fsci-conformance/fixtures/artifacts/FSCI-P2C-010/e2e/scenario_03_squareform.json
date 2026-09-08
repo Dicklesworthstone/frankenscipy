@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_03_squareform",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "condensed_to_matrix",
+      "action": "squareform_to_matrix(pdist(...))",
+      "input_summary": "4 points",
+      "output_summary": "4x4 symmetric matrix with zero diagonal",
+      "duration_ns": 33474,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "roundtrip",
+      "action": "condensed -> matrix -> condensed",
+      "input_summary": "verify roundtrip",
+      "output_summary": "roundtrip verified",
+      "duration_ns": 5381,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "spatial_metadata": {
+    "operation": "squareform",
+    "n_points": 4,
+    "n_dims": 2,
+    "metric": "N/A"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 201581,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_spatial -- scenario_03_squareform --nocapture"
+  }
+}

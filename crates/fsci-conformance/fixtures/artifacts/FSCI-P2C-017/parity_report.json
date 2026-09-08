@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-017",
+  "family": "io_core",
+  "case_results": [
+    {
+      "case_id": "mmread_dense_array_column_major",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "mmread_symmetric_coordinate_expands",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "mmwrite_dense_roundtrip",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "loadmat_v4_real_double_scipy_bytes",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "loadmat_v4_row_vector_scipy_bytes",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "savemat_v4_real_double_roundtrip",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "savemat_v4_rectangular_roundtrip",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "loadtxt_comments_and_whitespace",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "savetxt_space_roundtrip",
+      "passed": true,
+      "message": "io matrix matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "wav_write_mono_int16_quantization",
+      "passed": true,
+      "message": "io wav matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "wav_write_stereo_int16_quantization",
+      "passed": true,
+      "message": "io wav matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "loadmat_v4_truncated_header_reject",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "loadtxt_ragged_rows_reject",
+      "passed": true,
+      "message": "error matched"
+    }
+  ],
+  "passed_cases": 13,
+  "failed_cases": 0,
+  "generated_unix_ms": 1777873167005
+}

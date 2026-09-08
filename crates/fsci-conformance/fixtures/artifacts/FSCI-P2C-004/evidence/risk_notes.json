@@ -1,0 +1,44 @@
+{
+  "packet_id": "FSCI-P2C-004",
+  "notes": [
+    {
+      "category": "structural_singularity",
+      "description": "Zero-pivot in LU can produce inf/NaN. spsolve/splu use dense LU fallback for N <= 32768.",
+      "affected_operations": [
+        "spsolve",
+        "splu"
+      ],
+      "mitigation": "Dense LU fallback with SPSOLVE_DENSE_MAX_N guard. Singular matrices return SparseError. Native sparse-direct path deferred."
+    },
+    {
+      "category": "fill_in_explosion",
+      "description": "LU of sparse matrices can fill in. Current impl converts to dense for N <= 32768; larger matrices rejected.",
+      "affected_operations": [
+        "splu",
+        "spilu"
+      ],
+      "mitigation": "SPSOLVE_DENSE_MAX_N guard rejects large matrices. Native sparse-direct with AMD/RCM ordering deferred to bead u7bd."
+    },
+    {
+      "category": "csr_csc_conversion_fidelity",
+      "description": "Format conversion must preserve canonical ordering (sorted, deduplicated). Non-canonical input in Hardened mode is rejected.",
+      "affected_operations": [
+        "csr_to_csc",
+        "csc_to_csr",
+        "coo_to_csr"
+      ],
+      "mitigation": "Roundtrip parity gates verify conversion preserves values. Hardened mode rejects non-canonical structures."
+    },
+    {
+      "category": "zero_nnz_edge_cases",
+      "description": "Empty matrices (nnz=0) and zero-dimension matrices must preserve shape through all operations without panics.",
+      "affected_operations": [
+        "spmv_csr",
+        "add_csr",
+        "scale_csr",
+        "eye"
+      ],
+      "mitigation": "Explicit zero-NNZ test fixtures in E2E and adversarial test suites."
+    }
+  ]
+}

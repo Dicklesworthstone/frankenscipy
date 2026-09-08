@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_14_large_savgol",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "savgol_large",
+      "action": "savgol_filter(100000, 21, 3)",
+      "input_summary": "filter large signal",
+      "output_summary": "len=100000, time=27.528894ms",
+      "duration_ns": 27589790,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "savgol_filter",
+    "signal_length": 100000,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 33412491,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_14_large_savgol --nocapture"
+  }
+}

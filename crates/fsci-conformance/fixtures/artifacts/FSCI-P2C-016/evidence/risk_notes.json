@@ -1,0 +1,36 @@
+{
+  "packet_id": "FSCI-P2C-016",
+  "notes": [
+    {
+      "category": "alias_lookup_surface",
+      "description": "Short aliases like `c`, `h`, `sigma`, and `ev` are observable API surface; accidental renames or case-handling changes would silently break callers.",
+      "affected_operations": [
+        "value",
+        "find"
+      ],
+      "mitigation": "Keep alias coverage in conformance fixtures and fail closed (`None`) for unknown names instead of returning approximate matches."
+    },
+    {
+      "category": "unit_roundtrip_drift",
+      "description": "Derived helpers compose multiple floating-point operations, so small arithmetic regressions can accumulate in round-trip conversions.",
+      "affected_operations": [
+        "convert_temperature",
+        "ev_to_joules",
+        "joules_to_ev",
+        "wavelength_to_freq",
+        "freq_to_wavelength"
+      ],
+      "mitigation": "Preserve explicit round-trip fixtures with tight tolerances and keep exact-value checks for constants that should not drift."
+    },
+    {
+      "category": "mixed_exact_and_approximate_constants",
+      "description": "Some constants are exact by definition while others are represented to a practical precision. Treating both classes identically can either over-tighten or under-specify parity gates.",
+      "affected_operations": [
+        "fundamental_constants",
+        "deg2rad",
+        "rad2deg"
+      ],
+      "mitigation": "Use exact equality for definition-fixed constants and explicit tolerances for derived/approximate constants in the evidence pack."
+    }
+  ]
+}

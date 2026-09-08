@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_29_lombscargle_normalize",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "lombscargle_normalized_reference_vector",
+      "action": "lombscargle(x, y, freqs, normalize=true)",
+      "input_summary": "normalized Lomb-Scargle power should match SciPy for representative uneven samples",
+      "output_summary": "max_abs_diff=1.86e-9",
+      "duration_ns": 11793,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "lombscargle_zero_energy_nan_sentinel",
+      "action": "lombscargle(x, zeros, freqs, normalize=true)",
+      "input_summary": "zero-energy signals should return NaN under normalized SciPy semantics",
+      "output_summary": "nan_count=2",
+      "duration_ns": 2955,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "lombscargle",
+    "signal_length": 5,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 18835,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_29_lombscargle_normalize --nocapture"
+  }
+}

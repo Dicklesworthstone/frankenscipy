@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_ivp_010_first_step_bounds",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "first_step_too_large",
+      "action": "validate",
+      "input_summary": "first_step=20.0, interval=[0,10]",
+      "output_summary": "is_err=true",
+      "duration_ns": 4248,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "first_step_exact_boundary",
+      "action": "validate",
+      "input_summary": "first_step=10.0, interval=[0,10]",
+      "output_summary": "is_ok=true",
+      "duration_ns": 1213,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "max_step_zero",
+      "action": "validate",
+      "input_summary": "max_step=0.0",
+      "output_summary": "is_err=true",
+      "duration_ns": 1984,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "max_step_negative",
+      "action": "validate",
+      "input_summary": "max_step=-1.0",
+      "output_summary": "is_err=true",
+      "duration_ns": 882,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 133342,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_010_first_step_bounds --nocapture"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "scenario_id": "scenario_04_csv_files",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "read_csv_no_header",
+      "action": "read_csv(content, ',', false)",
+      "input_summary": "3x3 numeric CSV",
+      "output_summary": "read 3x3 CSV",
+      "duration_ns": 31660,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "read_csv_with_header",
+      "action": "read_csv(content, ',', true)",
+      "input_summary": "CSV with header row",
+      "output_summary": "header: [\"a\", \"b\", \"c\"], 2 data rows",
+      "duration_ns": 10781,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "write_csv",
+      "action": "write_csv(header, data, ',')",
+      "input_summary": "write CSV with header",
+      "output_summary": "wrote 18 chars",
+      "duration_ns": 21631,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "csv_roundtrip",
+      "action": "read_csv(write_csv(...))",
+      "input_summary": "verify roundtrip",
+      "output_summary": "CSV roundtrip verified",
+      "duration_ns": 8637,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "CSV",
+    "operation": "read/write",
+    "size_bytes": 0
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 209256,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_04_csv_files --nocapture"
+  }
+}

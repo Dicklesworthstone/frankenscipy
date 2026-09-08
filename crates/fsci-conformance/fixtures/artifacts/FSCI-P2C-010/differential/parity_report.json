@@ -1,0 +1,1020 @@
+{
+  "schema_version": 2,
+  "packet_id": "FSCI-P2C-010",
+  "family": "spatial_core",
+  "case_results": [
+    {
+      "case_id": "pdist_euclidean_3pt",
+      "passed": true,
+      "message": "array match (3 elements)"
+    },
+    {
+      "case_id": "cdist_euclidean_2x2",
+      "passed": true,
+      "message": "matrix match (2x2)"
+    },
+    {
+      "case_id": "squareform_to_matrix",
+      "passed": true,
+      "message": "matrix match (3x3)"
+    },
+    {
+      "case_id": "kdtree_query_nearest",
+      "passed": true,
+      "message": "kdtree query match: idx=3, dist=0.5656854249492381"
+    },
+    {
+      "case_id": "directed_hausdorff_basic",
+      "passed": true,
+      "message": "scalar match: 2"
+    },
+    {
+      "case_id": "convex_hull_with_interior",
+      "passed": true,
+      "message": "convex hull match: vertices=[0, 1, 2, 3], area=1"
+    },
+    {
+      "case_id": "procrustes_scaled",
+      "passed": true,
+      "message": "procrustes match: disparity=0.00000000000000000000000000000004930380657631324"
+    },
+    {
+      "case_id": "geometric_slerp_2d",
+      "passed": true,
+      "message": "matrix match (3x2)"
+    },
+    {
+      "case_id": "distance_euclidean",
+      "passed": true,
+      "message": "scalar match: 4.123105625617661"
+    },
+    {
+      "case_id": "distance_cityblock",
+      "passed": true,
+      "message": "scalar match: 7"
+    },
+    {
+      "case_id": "distance_chebyshev",
+      "passed": true,
+      "message": "scalar match: 3"
+    },
+    {
+      "case_id": "distance_cosine",
+      "passed": true,
+      "message": "scalar match: 0.5462573935134849"
+    },
+    {
+      "case_id": "distance_correlation",
+      "passed": true,
+      "message": "scalar match: 1.7205766921228922"
+    },
+    {
+      "case_id": "pdist_cityblock_3pt",
+      "passed": true,
+      "message": "array match (3 elements)"
+    },
+    {
+      "case_id": "cdist_cosine_2x2",
+      "passed": true,
+      "message": "matrix match (2x2)"
+    },
+    {
+      "case_id": "cdist_chebyshev_2x2",
+      "passed": true,
+      "message": "matrix match (2x2)"
+    },
+    {
+      "case_id": "convex_hull_triangle",
+      "passed": true,
+      "message": "convex hull match: vertices=[0, 1, 2], area=1.5"
+    },
+    {
+      "case_id": "pdist_euclidean_5pt",
+      "passed": true,
+      "message": "array match (10 elements)"
+    },
+    {
+      "case_id": "directed_hausdorff_overlap",
+      "passed": true,
+      "message": "scalar match: 1.5"
+    },
+    {
+      "case_id": "squareform_4pt",
+      "passed": true,
+      "message": "matrix match (4x4)"
+    },
+    {
+      "case_id": "halfspace_intersection_unit_square",
+      "passed": true,
+      "message": "halfspace intersection match: 4 intersections, 4 dual points"
+    },
+    {
+      "case_id": "halfspace_intersection_redundant_halfspace",
+      "passed": true,
+      "message": "halfspace intersection match: 4 intersections, 5 dual points"
+    },
+    {
+      "case_id": "halfspace_intersection_unbounded_strip",
+      "passed": true,
+      "message": "halfspace intersection match: 3 intersections, 3 dual points"
+    },
+    {
+      "case_id": "halfspace_intersection_boundary_feasible_point_error",
+      "passed": true,
+      "message": "expected error observed: QH6023"
+    },
+    {
+      "case_id": "halfspace_intersection_bounded_tetrahedron_3d",
+      "passed": true,
+      "message": "halfspace intersection match: 4 intersections, 4 dual points"
+    },
+    {
+      "case_id": "halfspace_intersection_invalid_4d_simplex_error",
+      "passed": true,
+      "message": "expected error observed: need 5"
+    },
+    {
+      "case_id": "hamming_4d_binary",
+      "passed": true,
+      "message": "scalar match: 0.5"
+    },
+    {
+      "case_id": "jaccard_4d_binary",
+      "passed": true,
+      "message": "scalar match: 0.6666666666666666"
+    },
+    {
+      "case_id": "canberra_3d",
+      "passed": true,
+      "message": "scalar match: 1.3619047619047617"
+    },
+    {
+      "case_id": "braycurtis_3d",
+      "passed": true,
+      "message": "scalar match: 0.42857142857142855"
+    },
+    {
+      "case_id": "sqeuclidean_3d",
+      "passed": true,
+      "message": "scalar match: 27"
+    },
+    {
+      "case_id": "minkowski_p1_3d",
+      "passed": true,
+      "message": "scalar match: 9"
+    },
+    {
+      "case_id": "minkowski_p2_3d",
+      "passed": true,
+      "message": "scalar match: 5.196152422706632"
+    },
+    {
+      "case_id": "minkowski_p3_3d",
+      "passed": true,
+      "message": "scalar match: 4.3267487109222245"
+    },
+    {
+      "case_id": "seuclidean_3d",
+      "passed": true,
+      "message": "scalar match: 5.612486080160912"
+    },
+    {
+      "case_id": "mahalanobis_3d",
+      "passed": true,
+      "message": "scalar match: 5.612486080160912"
+    },
+    {
+      "case_id": "wminkowski_p2_3d",
+      "passed": true,
+      "message": "scalar match: 6.87386354243376"
+    },
+    {
+      "case_id": "pdist_hamming_4pts",
+      "passed": true,
+      "message": "array match (6 elements)"
+    },
+    {
+      "case_id": "pdist_canberra_4pts",
+      "passed": true,
+      "message": "array match (6 elements)"
+    },
+    {
+      "case_id": "pdist_sqeuclidean_4pts",
+      "passed": true,
+      "message": "array match (6 elements)"
+    },
+    {
+      "case_id": "cdist_braycurtis_2x2",
+      "passed": true,
+      "message": "matrix match (2x2)"
+    },
+    {
+      "case_id": "kdtree_query_k2_distinct",
+      "passed": true,
+      "message": "kdtree query_k match: k=2"
+    },
+    {
+      "case_id": "kdtree_query_k3_distinct",
+      "passed": true,
+      "message": "kdtree query_k match: k=3"
+    },
+    {
+      "case_id": "kdtree_query_k4_distinct",
+      "passed": true,
+      "message": "kdtree query_k match: k=4"
+    },
+    {
+      "case_id": "kdtree_query_k3_q2_distinct",
+      "passed": true,
+      "message": "kdtree query_k match: k=3"
+    },
+    {
+      "case_id": "kdtree_ball_point_r11_q1",
+      "passed": true,
+      "message": "kdtree ball_point match: 3 hits"
+    },
+    {
+      "case_id": "kdtree_ball_point_r15_q2",
+      "passed": true,
+      "message": "kdtree ball_point match: 4 hits"
+    },
+    {
+      "case_id": "voronoi_unit_square_4pt",
+      "passed": true,
+      "message": "voronoi match: vc=2, rc=5"
+    },
+    {
+      "case_id": "voronoi_5pt_centered",
+      "passed": true,
+      "message": "voronoi match: vc=4, rc=8"
+    },
+    {
+      "case_id": "voronoi_triangle_3pt",
+      "passed": true,
+      "message": "voronoi match: vc=1, rc=3"
+    },
+    {
+      "case_id": "br_q3ut_query_pairs_r_1_5",
+      "passed": true,
+      "message": "kdtree ball_point match: 6 hits"
+    },
+    {
+      "case_id": "br_q3ut_query_pairs_empty",
+      "passed": true,
+      "message": "kdtree ball_point match: 0 hits"
+    },
+    {
+      "case_id": "br_q3ut_count_neighbors_r1",
+      "passed": true,
+      "message": "scalar match: 5"
+    },
+    {
+      "case_id": "br_q3ut_count_neighbors_r2",
+      "passed": true,
+      "message": "scalar match: 9"
+    },
+    {
+      "case_id": "br_uufs_query_ball_tree_r1",
+      "passed": true,
+      "message": "kdtree ball_tree match (4 rows)"
+    },
+    {
+      "case_id": "br_uufs_query_ball_tree_r2",
+      "passed": true,
+      "message": "kdtree ball_tree match (4 rows)"
+    },
+    {
+      "case_id": "br_uufs_query_ball_tree_empty",
+      "passed": true,
+      "message": "kdtree ball_tree match (4 rows)"
+    }
+  ],
+  "passed_cases": 57,
+  "failed_cases": 0,
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-010_spatial_core.json",
+  "oracle_status": {
+    "status": "available"
+  },
+  "differential_case_results": [
+    {
+      "case_id": "pdist_euclidean_3pt",
+      "passed": true,
+      "message": "array match (3 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "cdist_euclidean_2x2",
+      "passed": true,
+      "message": "matrix match (2x2)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "squareform_to_matrix",
+      "passed": true,
+      "message": "matrix match (3x3)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kdtree_query_nearest",
+      "passed": true,
+      "message": "kdtree query match: idx=3, dist=0.5656854249492381",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "directed_hausdorff_basic",
+      "passed": true,
+      "message": "scalar match: 2",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "convex_hull_with_interior",
+      "passed": true,
+      "message": "convex hull match: vertices=[0, 1, 2, 3], area=1",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "procrustes_scaled",
+      "passed": true,
+      "message": "procrustes match: disparity=0.00000000000000000000000000000004930380657631324",
+      "max_diff": 5.854827030937197e-31,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 1e-6,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "geometric_slerp_2d",
+      "passed": true,
+      "message": "matrix match (3x2)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "distance_euclidean",
+      "passed": true,
+      "message": "scalar match: 4.123105625617661",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "distance_cityblock",
+      "passed": true,
+      "message": "scalar match: 7",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "distance_chebyshev",
+      "passed": true,
+      "message": "scalar match: 3",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "distance_cosine",
+      "passed": true,
+      "message": "scalar match: 0.5462573935134849",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "distance_correlation",
+      "passed": true,
+      "message": "scalar match: 1.7205766921228922",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "pdist_cityblock_3pt",
+      "passed": true,
+      "message": "array match (3 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "cdist_cosine_2x2",
+      "passed": true,
+      "message": "matrix match (2x2)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "cdist_chebyshev_2x2",
+      "passed": true,
+      "message": "matrix match (2x2)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "convex_hull_triangle",
+      "passed": true,
+      "message": "convex hull match: vertices=[0, 1, 2], area=1.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "pdist_euclidean_5pt",
+      "passed": true,
+      "message": "array match (10 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "directed_hausdorff_overlap",
+      "passed": true,
+      "message": "scalar match: 1.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "squareform_4pt",
+      "passed": true,
+      "message": "matrix match (4x4)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "halfspace_intersection_unit_square",
+      "passed": true,
+      "message": "halfspace intersection match: 4 intersections, 4 dual points",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "halfspace_intersection_redundant_halfspace",
+      "passed": true,
+      "message": "halfspace intersection match: 4 intersections, 5 dual points",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "halfspace_intersection_unbounded_strip",
+      "passed": true,
+      "message": "halfspace intersection match: 3 intersections, 3 dual points",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "halfspace_intersection_boundary_feasible_point_error",
+      "passed": true,
+      "message": "expected error observed: QH6023",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "halfspace_intersection_bounded_tetrahedron_3d",
+      "passed": true,
+      "message": "halfspace intersection match: 4 intersections, 4 dual points",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "halfspace_intersection_invalid_4d_simplex_error",
+      "passed": true,
+      "message": "expected error observed: need 5",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hamming_4d_binary",
+      "passed": true,
+      "message": "scalar match: 0.5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "jaccard_4d_binary",
+      "passed": true,
+      "message": "scalar match: 0.6666666666666666",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "canberra_3d",
+      "passed": true,
+      "message": "scalar match: 1.3619047619047617",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "braycurtis_3d",
+      "passed": true,
+      "message": "scalar match: 0.42857142857142855",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "sqeuclidean_3d",
+      "passed": true,
+      "message": "scalar match: 27",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "minkowski_p1_3d",
+      "passed": true,
+      "message": "scalar match: 9",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "minkowski_p2_3d",
+      "passed": true,
+      "message": "scalar match: 5.196152422706632",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "minkowski_p3_3d",
+      "passed": true,
+      "message": "scalar match: 4.3267487109222245",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "seuclidean_3d",
+      "passed": true,
+      "message": "scalar match: 5.612486080160912",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "mahalanobis_3d",
+      "passed": true,
+      "message": "scalar match: 5.612486080160912",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "wminkowski_p2_3d",
+      "passed": true,
+      "message": "scalar match: 6.87386354243376",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "pdist_hamming_4pts",
+      "passed": true,
+      "message": "array match (6 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "pdist_canberra_4pts",
+      "passed": true,
+      "message": "array match (6 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "pdist_sqeuclidean_4pts",
+      "passed": true,
+      "message": "array match (6 elements)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "cdist_braycurtis_2x2",
+      "passed": true,
+      "message": "matrix match (2x2)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kdtree_query_k2_distinct",
+      "passed": true,
+      "message": "kdtree query_k match: k=2",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kdtree_query_k3_distinct",
+      "passed": true,
+      "message": "kdtree query_k match: k=3",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kdtree_query_k4_distinct",
+      "passed": true,
+      "message": "kdtree query_k match: k=4",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kdtree_query_k3_q2_distinct",
+      "passed": true,
+      "message": "kdtree query_k match: k=3",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kdtree_ball_point_r11_q1",
+      "passed": true,
+      "message": "kdtree ball_point match: 3 hits",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kdtree_ball_point_r15_q2",
+      "passed": true,
+      "message": "kdtree ball_point match: 4 hits",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "voronoi_unit_square_4pt",
+      "passed": true,
+      "message": "voronoi match: vc=2, rc=5",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "voronoi_5pt_centered",
+      "passed": true,
+      "message": "voronoi match: vc=4, rc=8",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "voronoi_triangle_3pt",
+      "passed": true,
+      "message": "voronoi match: vc=1, rc=3",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_q3ut_query_pairs_r_1_5",
+      "passed": true,
+      "message": "kdtree ball_point match: 6 hits",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_q3ut_query_pairs_empty",
+      "passed": true,
+      "message": "kdtree ball_point match: 0 hits",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_q3ut_count_neighbors_r1",
+      "passed": true,
+      "message": "scalar match: 5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_q3ut_count_neighbors_r2",
+      "passed": true,
+      "message": "scalar match: 9",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.0,
+        "rtol": 0.0,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_uufs_query_ball_tree_r1",
+      "passed": true,
+      "message": "kdtree ball_tree match (4 rows)",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_uufs_query_ball_tree_r2",
+      "passed": true,
+      "message": "kdtree ball_tree match (4 rows)",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_uufs_query_ball_tree_empty",
+      "passed": true,
+      "message": "kdtree ball_tree match (4 rows)",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ],
+  "report_kind": "oracle_backed",
+  "generated_unix_ms": 1788666501933
+}

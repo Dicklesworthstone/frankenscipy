@@ -1,0 +1,785 @@
+{
+  "schema_version": 2,
+  "packet_id": "FSCI-P2C-009",
+  "family": "cluster_core",
+  "case_results": [
+    {
+      "case_id": "linkage_single_5pt",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_complete_5pt",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_average_5pt",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "fcluster_single_2groups",
+      "passed": true,
+      "message": "labels matched: [1, 1, 1, 1, 2]"
+    },
+    {
+      "case_id": "fcluster_complete_3groups",
+      "passed": true,
+      "message": "labels matched: [1, 1, 2, 2, 3]"
+    },
+    {
+      "case_id": "kmeans_two_blobs_seeded",
+      "passed": true,
+      "message": "labels matched: [0, 0, 0, 1, 1, 1]"
+    },
+    {
+      "case_id": "kmeans_three_1d_blobs_seeded",
+      "passed": true,
+      "message": "labels matched: [2, 2, 0, 0, 1, 1]"
+    },
+    {
+      "case_id": "dbscan_two_blobs_seeded",
+      "passed": true,
+      "message": "signed labels matched: [0, 0, 0, 1, 1, 1]"
+    },
+    {
+      "case_id": "dbscan_noise_seeded",
+      "passed": true,
+      "message": "signed labels matched: [0, 0, 0, 1, 1, -1]"
+    },
+    {
+      "case_id": "mean_shift_two_blobs_seeded",
+      "passed": true,
+      "message": "labels matched: [0, 0, 0, 1, 1, 1]"
+    },
+    {
+      "case_id": "vq_3obs_2centroids",
+      "passed": true,
+      "message": "vq_result matched"
+    },
+    {
+      "case_id": "vq_all_to_first",
+      "passed": true,
+      "message": "vq_result matched"
+    },
+    {
+      "case_id": "whiten_3x2",
+      "passed": true,
+      "message": "matrix matched"
+    },
+    {
+      "case_id": "cophenet_single_5pt",
+      "passed": true,
+      "message": "array matched"
+    },
+    {
+      "case_id": "inconsistent_single_5pt_d2",
+      "passed": true,
+      "message": "matrix matched"
+    },
+    {
+      "case_id": "silhouette_perfect_2clusters",
+      "passed": true,
+      "message": "scalar matched: 0.9839052428772979"
+    },
+    {
+      "case_id": "adjusted_rand_perfect_match",
+      "passed": true,
+      "message": "scalar matched: 1"
+    },
+    {
+      "case_id": "adjusted_rand_bad_match",
+      "passed": true,
+      "message": "scalar matched: -0.16666666666666674"
+    },
+    {
+      "case_id": "is_valid_linkage_valid_5pt",
+      "passed": true,
+      "message": "boolean matched: true"
+    },
+    {
+      "case_id": "is_valid_linkage_bad_index",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "is_valid_linkage_negative_dist",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "is_monotonic_monotonic_5pt",
+      "passed": true,
+      "message": "boolean matched: true"
+    },
+    {
+      "case_id": "is_monotonic_not_monotonic",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "leaves_list_5pt",
+      "passed": true,
+      "message": "labels matched: [4, 0, 1, 2, 3]"
+    },
+    {
+      "case_id": "num_obs_linkage_5pt",
+      "passed": true,
+      "message": "scalar matched: 5"
+    },
+    {
+      "case_id": "hardened_is_valid_linkage_valid_5pt",
+      "passed": true,
+      "message": "boolean matched: true"
+    },
+    {
+      "case_id": "hardened_is_valid_linkage_bad_index",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "hardened_is_valid_linkage_negative_dist",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "hardened_is_monotonic_not_monotonic",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "hardened_num_obs_linkage_5pt",
+      "passed": true,
+      "message": "scalar matched: 5"
+    },
+    {
+      "case_id": "linkage_single_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_complete_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_average_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_ward_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_weighted_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_ward_5pt_1D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_ward_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_single_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_complete_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_weighted_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_centroid_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_median_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_centroid_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_median_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    }
+  ],
+  "passed_cases": 44,
+  "failed_cases": 0,
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-009_cluster_core.json",
+  "oracle_status": {
+    "status": "available"
+  },
+  "differential_case_results": [
+    {
+      "case_id": "linkage_single_5pt",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_complete_5pt",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_average_5pt",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "fcluster_single_2groups",
+      "passed": true,
+      "message": "labels matched: [1, 1, 1, 1, 2]",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "fcluster_complete_3groups",
+      "passed": true,
+      "message": "labels matched: [1, 1, 2, 2, 3]",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kmeans_two_blobs_seeded",
+      "passed": true,
+      "message": "labels matched: [0, 0, 0, 1, 1, 1]",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "kmeans_three_1d_blobs_seeded",
+      "passed": true,
+      "message": "labels matched: [2, 2, 0, 0, 1, 1]",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "dbscan_two_blobs_seeded",
+      "passed": true,
+      "message": "signed labels matched: [0, 0, 0, 1, 1, 1]",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "dbscan_noise_seeded",
+      "passed": true,
+      "message": "signed labels matched: [0, 0, 0, 1, 1, -1]",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "mean_shift_two_blobs_seeded",
+      "passed": true,
+      "message": "labels matched: [0, 0, 0, 1, 1, 1]",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "vq_3obs_2centroids",
+      "passed": true,
+      "message": "vq_result matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "vq_all_to_first",
+      "passed": true,
+      "message": "vq_result matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "whiten_3x2",
+      "passed": true,
+      "message": "matrix matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "cophenet_single_5pt",
+      "passed": true,
+      "message": "array matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "inconsistent_single_5pt_d2",
+      "passed": true,
+      "message": "matrix matched",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "silhouette_perfect_2clusters",
+      "passed": true,
+      "message": "scalar matched: 0.9839052428772979",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adjusted_rand_perfect_match",
+      "passed": true,
+      "message": "scalar matched: 1",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adjusted_rand_bad_match",
+      "passed": true,
+      "message": "scalar matched: -0.16666666666666674",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "is_valid_linkage_valid_5pt",
+      "passed": true,
+      "message": "boolean matched: true",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "is_valid_linkage_bad_index",
+      "passed": true,
+      "message": "boolean matched: false",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "is_valid_linkage_negative_dist",
+      "passed": true,
+      "message": "boolean matched: false",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "is_monotonic_monotonic_5pt",
+      "passed": true,
+      "message": "boolean matched: true",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "is_monotonic_not_monotonic",
+      "passed": true,
+      "message": "boolean matched: false",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "leaves_list_5pt",
+      "passed": true,
+      "message": "labels matched: [4, 0, 1, 2, 3]",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "num_obs_linkage_5pt",
+      "passed": true,
+      "message": "scalar matched: 5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_is_valid_linkage_valid_5pt",
+      "passed": true,
+      "message": "boolean matched: true",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_is_valid_linkage_bad_index",
+      "passed": true,
+      "message": "boolean matched: false",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_is_valid_linkage_negative_dist",
+      "passed": true,
+      "message": "boolean matched: false",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_is_monotonic_not_monotonic",
+      "passed": true,
+      "message": "boolean matched: false",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "hardened_num_obs_linkage_5pt",
+      "passed": true,
+      "message": "scalar matched: 5",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_single_5pts",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_complete_5pts",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_average_5pts",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_ward_5pts",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_weighted_5pts",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_ward_5pt_1D",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_ward_6pt_2D",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_single_6pt_2D",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_complete_6pt_2D",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 1.7763568394002505e-15,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_weighted_6pt_2D",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_centroid_6pt_2D",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 1.7763568394002505e-15,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_median_6pt_2D",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_centroid_5pts",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "linkage_median_5pts",
+      "passed": true,
+      "message": "linkage matched",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-9,
+        "rtol": 1e-9,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ],
+  "report_kind": "oracle_backed",
+  "generated_unix_ms": 1788666501935
+}

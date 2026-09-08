@@ -1,0 +1,670 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-004",
+  "domain": "sparse",
+  "generated_at": "2026-02-14T17:35:00Z",
+  "contracts": [
+    {
+      "function_name": "fsci_sparse::csr::from_components",
+      "scipy_equivalent": "scipy.sparse.csr_matrix((data, indices, indptr), shape=...)",
+      "inputs": [
+        {
+          "name": "data",
+          "type_desc": "Vec<f64>",
+          "required": true,
+          "constraints": "len(data) must equal len(indices); values map 1:1 to compressed entries."
+        },
+        {
+          "name": "indices",
+          "type_desc": "Vec<usize>",
+          "required": true,
+          "constraints": "Column indices for each nonzero; every value must be < shape.1."
+        },
+        {
+          "name": "indptr",
+          "type_desc": "Vec<usize>",
+          "required": true,
+          "constraints": "Row pointer array with len(indptr) == shape.0 + 1, indptr[0] == 0, indptr last == nnz, monotone non-decreasing."
+        },
+        {
+          "name": "shape",
+          "type_desc": "(usize, usize)",
+          "required": true,
+          "constraints": "Matrix shape (rows, cols)."
+        },
+        {
+          "name": "canonicalize",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "When true, sort indices within each row and sum duplicate entries."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "matrix",
+          "type_desc": "CsrMatrix<f64>",
+          "semantics": "CSR matrix with explicit canonicality metadata (sorted, deduplicated flags)."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "len(indptr) != rows + 1",
+          "error_type": "InvalidShape",
+          "message_pattern": "indptr length must equal nrows + 1",
+          "scipy_behavior": "ValueError on malformed compressed index pointer."
+        },
+        {
+          "condition": "indptr is not monotone or indptr[0] != 0 or indptr[-1] != nnz",
+          "error_type": "InvalidSparseStructure",
+          "message_pattern": "invalid CSR pointer structure",
+          "scipy_behavior": "ValueError for invalid index pointer invariants."
+        },
+        {
+          "condition": "any indices[k] >= ncols",
+          "error_type": "IndexOutOfBounds",
+          "message_pattern": "column index out of bounds",
+          "scipy_behavior": "ValueError for index outside matrix dimensions."
+        },
+        {
+          "condition": "len(data) != len(indices)",
+          "error_type": "IncompatibleShape",
+          "message_pattern": "data and indices length mismatch",
+          "scipy_behavior": "ValueError for inconsistent compressed arrays."
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "not_applicable",
+        "notes": "Structural constructor; no floating tolerance comparison."
+      },
+      "strict_mode_behavior": "Matches SciPy compressed constructor semantics: unsorted indices and duplicates are accepted by default, canonicalization is optional, and observable structure mirrors input metadata.",
+      "hardened_mode_behavior": "Preserves strict observable outputs but adds fail-closed guards for pointer overflow, index-domain violations, and malformed metadata before allocation or kernel dispatch.",
+      "invariants": [
+        "nnz == len(data) == len(indices)",
+        "len(indptr) == rows + 1",
+        "indptr[0] == 0 and indptr[last] == nnz",
+        "indptr is monotone non-decreasing",
+        "all indices are in [0, ncols)"
+      ],
+      "performance_sentinel": "PERF-SPARSE-CSR-CONSTRUCT"
+    },
+    {
+      "function_name": "fsci_sparse::csc::from_components",
+      "scipy_equivalent": "scipy.sparse.csc_matrix((data, indices, indptr), shape=...)",
+      "inputs": [
+        {
+          "name": "data",
+          "type_desc": "Vec<f64>",
+          "required": true,
+          "constraints": "len(data) must equal len(indices)."
+        },
+        {
+          "name": "indices",
+          "type_desc": "Vec<usize>",
+          "required": true,
+          "constraints": "Row indices for each nonzero; every value must be < shape.0."
+        },
+        {
+          "name": "indptr",
+          "type_desc": "Vec<usize>",
+          "required": true,
+          "constraints": "Column pointer array with len(indptr) == shape.1 + 1 and monotone non-decreasing offsets."
+        },
+        {
+          "name": "shape",
+          "type_desc": "(usize, usize)",
+          "required": true,
+          "constraints": "Matrix shape (rows, cols)."
+        },
+        {
+          "name": "canonicalize",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "When true, sort row indices in each column and sum duplicate entries."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "matrix",
+          "type_desc": "CscMatrix<f64>",
+          "semantics": "CSC matrix preserving compressed-column semantics and canonical flags."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "len(indptr) != ncols + 1",
+          "error_type": "InvalidShape",
+          "message_pattern": "indptr length must equal ncols + 1",
+          "scipy_behavior": "ValueError on malformed CSC pointer length."
+        },
+        {
+          "condition": "indptr structure invalid (non-monotone, bad endpoints)",
+          "error_type": "InvalidSparseStructure",
+          "message_pattern": "invalid CSC pointer structure",
+          "scipy_behavior": "ValueError for invalid compressed pointer invariants."
+        },
+        {
+          "condition": "any indices[k] >= nrows",
+          "error_type": "IndexOutOfBounds",
+          "message_pattern": "row index out of bounds",
+          "scipy_behavior": "ValueError for out-of-domain row indices."
+        },
+        {
+          "condition": "len(data) != len(indices)",
+          "error_type": "IncompatibleShape",
+          "message_pattern": "data and indices length mismatch",
+          "scipy_behavior": "ValueError for inconsistent CSC arrays."
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "not_applicable",
+        "notes": "Structural constructor; no numeric tolerance policy."
+      },
+      "strict_mode_behavior": "Mirrors SciPy CSC constructor behavior, including acceptance of unsorted and duplicate coordinates until canonicalization is explicitly requested.",
+      "hardened_mode_behavior": "Adds fail-closed structural validation (bounds, pointer consistency, overflow checks) before accepting metadata; resulting matrix semantics remain SciPy-compatible.",
+      "invariants": [
+        "nnz == len(data) == len(indices)",
+        "len(indptr) == ncols + 1",
+        "indptr[0] == 0 and indptr[last] == nnz",
+        "indptr is monotone non-decreasing",
+        "all indices are in [0, nrows)"
+      ],
+      "performance_sentinel": "PERF-SPARSE-CSC-CONSTRUCT"
+    },
+    {
+      "function_name": "fsci_sparse::coo::from_triplets",
+      "scipy_equivalent": "scipy.sparse.coo_matrix((data, (row, col)), shape=...)",
+      "inputs": [
+        {
+          "name": "data",
+          "type_desc": "Vec<f64>",
+          "required": true,
+          "constraints": "len(data) must equal len(row) and len(col)."
+        },
+        {
+          "name": "row",
+          "type_desc": "Vec<usize>",
+          "required": true,
+          "constraints": "Row coordinates for each nonzero, each < shape.0."
+        },
+        {
+          "name": "col",
+          "type_desc": "Vec<usize>",
+          "required": true,
+          "constraints": "Column coordinates for each nonzero, each < shape.1."
+        },
+        {
+          "name": "shape",
+          "type_desc": "(usize, usize)",
+          "required": true,
+          "constraints": "Matrix shape (rows, cols)."
+        },
+        {
+          "name": "sum_duplicates",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "When true, lexicographically sort coordinates and sum duplicate entries."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "matrix",
+          "type_desc": "CooMatrix<f64>",
+          "semantics": "COO matrix preserving duplicate semantics unless explicit deduplication is requested."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "len(data), len(row), and len(col) are not equal",
+          "error_type": "IncompatibleShape",
+          "message_pattern": "coordinate and data length mismatch",
+          "scipy_behavior": "ValueError for inconsistent COO arrays."
+        },
+        {
+          "condition": "any row[k] >= nrows or col[k] >= ncols",
+          "error_type": "IndexOutOfBounds",
+          "message_pattern": "COO coordinate out of bounds",
+          "scipy_behavior": "ValueError from coordinate check path."
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Coordinate and value streams are discrete artifacts; deduplication sums must be deterministic for identical input order."
+      },
+      "strict_mode_behavior": "Duplicates are allowed and preserved unless sum_duplicates=true. Conversion to compressed formats may trigger canonicalization exactly as in SciPy COO conversion paths.",
+      "hardened_mode_behavior": "Maintains strict semantics while fail-closing on coordinate overflow and malformed metadata; optional finite checks can reject NaN payloads before conversion.",
+      "invariants": [
+        "len(data) == len(row) == len(col)",
+        "all row indices are in [0, nrows)",
+        "all col indices are in [0, ncols)",
+        "sum_duplicates=true yields sorted unique coordinates with additive value merging"
+      ],
+      "performance_sentinel": "PERF-SPARSE-COO-CONSTRUCT"
+    },
+    {
+      "function_name": "fsci_sparse::convert::coo_to_csr",
+      "scipy_equivalent": "scipy.sparse.coo_matrix.tocsr",
+      "inputs": [
+        {
+          "name": "coo",
+          "type_desc": "CooMatrix<f64>",
+          "required": true,
+          "constraints": "2D COO matrix; coordinates must be within bounds."
+        },
+        {
+          "name": "sum_duplicates",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true, duplicates are merged during conversion."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "csr",
+          "type_desc": "CsrMatrix<f64>",
+          "semantics": "CSR matrix with row-compressed pointers; duplicate handling follows sum_duplicates policy."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "source COO metadata is invalid",
+          "error_type": "InvalidSparseStructure",
+          "message_pattern": "invalid COO structure for conversion",
+          "scipy_behavior": "ValueError for malformed COO coordinates."
+        },
+        {
+          "condition": "index conversion overflows target pointer domain",
+          "error_type": "IndexOverflow",
+          "message_pattern": "sparse index width overflow",
+          "scipy_behavior": "Implementation-dependent failure in index casting path."
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Conversion must preserve algebraic equivalence exactly; duplicate summation is deterministic."
+      },
+      "strict_mode_behavior": "Implements SciPy-style COO compression semantics: duplicates are summed when canonicalization is requested or required by downstream compressed representation.",
+      "hardened_mode_behavior": "Pre-validates coordinate domains and pointer-size bounds before conversion, failing closed on any malformed or incompatible metadata.",
+      "invariants": [
+        "dense(coo) == dense(csr) elementwise",
+        "csr.indptr length equals nrows + 1",
+        "csr.indices are in [0, ncols)",
+        "empty COO converts to structurally valid empty CSR"
+      ],
+      "performance_sentinel": "PERF-SPARSE-CONVERT-COO-CSR"
+    },
+    {
+      "function_name": "fsci_sparse::convert::csr_to_csc",
+      "scipy_equivalent": "scipy.sparse.csr_matrix.tocsc",
+      "inputs": [
+        {
+          "name": "csr",
+          "type_desc": "CsrMatrix<f64>",
+          "required": true,
+          "constraints": "Valid CSR structure."
+        },
+        {
+          "name": "copy",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "false",
+          "constraints": "When false, implementation may reuse backing storage where safe."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "csc",
+          "type_desc": "CscMatrix<f64>",
+          "semantics": "CSC matrix algebraically equivalent to source CSR."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "source CSR pointers/indices violate invariants",
+          "error_type": "InvalidSparseStructure",
+          "message_pattern": "invalid CSR structure for transpose conversion",
+          "scipy_behavior": "ValueError for malformed compressed metadata."
+        },
+        {
+          "condition": "index-domain conversion cannot be represented",
+          "error_type": "IndexOverflow",
+          "message_pattern": "sparse transpose index overflow",
+          "scipy_behavior": "Backend casting failure or ValueError."
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Format conversion is exact; no floating approximation introduced."
+      },
+      "strict_mode_behavior": "Uses SciPy-equivalent compressed-transpose behavior and preserves observable value equality and shape; canonical flags follow conversion algorithm output.",
+      "hardened_mode_behavior": "Adds fail-closed verification of source compressed metadata and prevents conversion if index-domain or pointer integrity checks fail.",
+      "invariants": [
+        "dense(csr) == dense(csc) elementwise",
+        "csc.indptr length equals ncols + 1",
+        "csc.indices are in [0, nrows)",
+        "single-element and empty matrices remain valid after conversion"
+      ],
+      "performance_sentinel": "PERF-SPARSE-CONVERT-CSR-CSC"
+    },
+    {
+      "function_name": "fsci_sparse::construct::diags",
+      "scipy_equivalent": "scipy.sparse.diags / scipy.sparse.diags_array",
+      "inputs": [
+        {
+          "name": "diagonals",
+          "type_desc": "Vec<Vec<f64>>",
+          "required": true,
+          "constraints": "Each entry is values for one diagonal; lengths must match offset and shape constraints."
+        },
+        {
+          "name": "offsets",
+          "type_desc": "Vec<isize>",
+          "required": true,
+          "constraints": "Offsets must be unique; repeated offsets are invalid."
+        },
+        {
+          "name": "shape",
+          "type_desc": "Option<(usize, usize)>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "If omitted, infer minimal square shape consistent with diagonals."
+        },
+        {
+          "name": "format",
+          "type_desc": "Option<SparseFormat>",
+          "required": false,
+          "default_value": "None",
+          "constraints": "Requested output format (CSR/CSC/COO/DIA); default follows constructor policy."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "matrix",
+          "type_desc": "SparseMatrix<f64>",
+          "semantics": "Sparse matrix with diagonal placement matching provided offsets and values."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "offsets contain duplicates",
+          "error_type": "InvalidArgument",
+          "message_pattern": "repeated diagonal offsets are not allowed",
+          "scipy_behavior": "ValueError for repeated offsets."
+        },
+        {
+          "condition": "diagonal length incompatible with shape and offset",
+          "error_type": "InvalidShape",
+          "message_pattern": "diagonal length does not fit shape",
+          "scipy_behavior": "ValueError for diagonal/shape mismatch."
+        },
+        {
+          "condition": "shape inference or explicit shape overflows index domain",
+          "error_type": "IndexOverflow",
+          "message_pattern": "shape exceeds sparse index limits",
+          "scipy_behavior": "Implementation-dependent overflow failure."
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Deterministic constructor; exact value placement is required."
+      },
+      "strict_mode_behavior": "Follows SciPy diags semantics (no DIA-style padding in input, explicit offset validation, and format-dependent materialization).",
+      "hardened_mode_behavior": "Adds fail-closed guards for shape/offset overflow and malformed diagonal metadata while preserving strict-mode observable placement semantics.",
+      "invariants": [
+        "matrix shape matches explicit or inferred shape",
+        "every provided diagonal value appears exactly once at its offset location",
+        "unfilled coordinates are structural zeros",
+        "offset uniqueness is enforced"
+      ],
+      "performance_sentinel": "PERF-SPARSE-CONSTRUCT-DIAGS"
+    },
+    {
+      "function_name": "fsci_sparse::linalg::spsolve",
+      "scipy_equivalent": "scipy.sparse.linalg.spsolve",
+      "inputs": [
+        {
+          "name": "a",
+          "type_desc": "SparseMatrix<f64>",
+          "required": true,
+          "constraints": "Must be square; CSR/CSC accepted and normalized for backend execution."
+        },
+        {
+          "name": "b",
+          "type_desc": "DenseVectorOrMatrix<f64>",
+          "required": true,
+          "constraints": "Leading dimension must equal a.nrows."
+        },
+        {
+          "name": "use_umfpack",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true and RHS is vector, UMFPACK is preferred if available; otherwise SuperLU path is used."
+        },
+        {
+          "name": "permc_spec",
+          "type_desc": "Option<String>",
+          "required": false,
+          "default_value": "Some(\"COLAMD\")",
+          "constraints": "Column permutation strategy for SuperLU path."
+        },
+        {
+          "name": "check_finite",
+          "type_desc": "bool",
+          "required": false,
+          "default_value": "true",
+          "constraints": "When true, reject NaN/Inf in both matrix values and RHS."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "x",
+          "type_desc": "DenseVectorOrMatrix<f64>",
+          "semantics": "Solution of A x = b with shape matching b."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "A is not square",
+          "error_type": "InvalidShape",
+          "message_pattern": "spsolve requires a square sparse matrix",
+          "scipy_behavior": "ValueError for non-square coefficient matrix."
+        },
+        {
+          "condition": "b has incompatible leading dimension",
+          "error_type": "IncompatibleShape",
+          "message_pattern": "rhs dimension does not match matrix size",
+          "scipy_behavior": "ValueError for incompatible dimensions."
+        },
+        {
+          "condition": "matrix structure is malformed (pointer/index invariants fail)",
+          "error_type": "InvalidSparseStructure",
+          "message_pattern": "invalid sparse structure for solve",
+          "scipy_behavior": "ValueError in sparse validation paths."
+        },
+        {
+          "condition": "requested permutation/backend is unsupported or unknown",
+          "error_type": "UnsupportedBackend",
+          "message_pattern": "unsupported sparse solver backend configuration",
+          "scipy_behavior": "Backend-configuration error or fallback depending on installed stack."
+        },
+        {
+          "condition": "matrix is structurally singular or numeric factorization fails",
+          "error_type": "SingularMatrix",
+          "message_pattern": "sparse matrix is singular",
+          "scipy_behavior": "MatrixRankWarning with NaN result in some paths, LinAlgError in triangular paths."
+        },
+        {
+          "condition": "check_finite=true and any input contains NaN or Inf",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "non-finite values detected in sparse solve inputs",
+          "scipy_behavior": "ValueError when finite checks are enabled."
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-7,
+        "notes": "Residual checks are condition-aware; ill-conditioned systems require relative tolerance scaling."
+      },
+      "backend_semantics": "Dispatch order: UMFPACK (vector RHS, enabled, available) -> SuperLU gssv; SuperLU permutation default is COLAMD unless explicitly overridden.",
+      "strict_mode_behavior": "Matches SciPy dispatch semantics and default permutation behavior (COLAMD). Auto-conversion between CSR/CSC follows SciPy compatibility expectations.",
+      "hardened_mode_behavior": "Performs mandatory structural validation and pre-solve singularity screening; unknown backend or permutation options fail closed instead of permissive fallback.",
+      "invariants": [
+        "output shape equals rhs shape",
+        "residual norm follows configured tolerance policy for nonsingular systems",
+        "backend decision is recorded deterministically from inputs and availability",
+        "malformed sparse metadata never reaches numeric kernels"
+      ],
+      "performance_sentinel": "PERF-SPARSE-SPSOLVE"
+    },
+    {
+      "function_name": "fsci_sparse::linalg::splu",
+      "scipy_equivalent": "scipy.sparse.linalg.splu",
+      "inputs": [
+        {
+          "name": "a",
+          "type_desc": "SparseMatrix<f64>",
+          "required": true,
+          "constraints": "Must be square; preferred CSC input."
+        },
+        {
+          "name": "permc_spec",
+          "type_desc": "Option<String>",
+          "required": false,
+          "default_value": "Some(\"COLAMD\")",
+          "constraints": "Valid options include NATURAL, MMD_ATA, MMD_AT_PLUS_A, and COLAMD."
+        },
+        {
+          "name": "diag_pivot_thresh",
+          "type_desc": "f64",
+          "required": false,
+          "default_value": "1.0",
+          "constraints": "Pivot threshold in [0, 1] for SuperLU factorization policy."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "lu",
+          "type_desc": "SparseLuFactorization<f64>",
+          "semantics": "Reusable sparse LU factors with solve/reuse capability."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "A is not square",
+          "error_type": "InvalidShape",
+          "message_pattern": "splu requires a square sparse matrix",
+          "scipy_behavior": "ValueError for non-square matrix."
+        },
+        {
+          "condition": "permutation option is unknown",
+          "error_type": "InvalidArgument",
+          "message_pattern": "invalid permutation specification",
+          "scipy_behavior": "ValueError for invalid permc_spec."
+        },
+        {
+          "condition": "pivot threshold outside [0, 1]",
+          "error_type": "InvalidArgument",
+          "message_pattern": "diag_pivot_thresh out of range",
+          "scipy_behavior": "ValueError for invalid pivot threshold."
+        },
+        {
+          "condition": "factorization detects structural or numeric singularity",
+          "error_type": "SingularMatrix",
+          "message_pattern": "sparse LU factorization failed due to singularity",
+          "scipy_behavior": "RuntimeError/LinAlgError from SuperLU failure path."
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "not_applicable",
+        "notes": "Factorization contract; numeric comparison applied in downstream solve contract."
+      },
+      "backend_semantics": "SuperLU gstrf-backed LU factorization with CSC normalization and explicit permutation strategy.",
+      "strict_mode_behavior": "Auto-converts non-CSC input with SciPy-compatible efficiency warning semantics before factorization.",
+      "hardened_mode_behavior": "Requires valid compressed metadata and fail-closes before backend call when structural diagnostics indicate singularity or incompatible permutation configuration.",
+      "invariants": [
+        "LU factors represent the same linear operator as input A modulo row/column permutations",
+        "factor object can solve for multiple RHS without re-factorization",
+        "factorization metadata records chosen permutation and pivot policy"
+      ],
+      "performance_sentinel": "PERF-SPARSE-SPLU"
+    },
+    {
+      "function_name": "fsci_sparse::linalg::spilu",
+      "scipy_equivalent": "scipy.sparse.linalg.spilu",
+      "inputs": [
+        {
+          "name": "a",
+          "type_desc": "SparseMatrix<f64>",
+          "required": true,
+          "constraints": "Must be square; CSC preferred."
+        },
+        {
+          "name": "drop_tol",
+          "type_desc": "f64",
+          "required": false,
+          "default_value": "1e-4",
+          "constraints": "Drop tolerance must be >= 0."
+        },
+        {
+          "name": "fill_factor",
+          "type_desc": "f64",
+          "required": false,
+          "default_value": "10.0",
+          "constraints": "Fill factor must be >= 1.0."
+        },
+        {
+          "name": "permc_spec",
+          "type_desc": "Option<String>",
+          "required": false,
+          "default_value": "Some(\"COLAMD\")",
+          "constraints": "Column permutation policy for ILU setup."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "ilu",
+          "type_desc": "SparseIluFactorization<f64>",
+          "semantics": "Incomplete LU preconditioner object for iterative methods."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "A is not square",
+          "error_type": "InvalidShape",
+          "message_pattern": "spilu requires a square sparse matrix",
+          "scipy_behavior": "ValueError for non-square matrix."
+        },
+        {
+          "condition": "drop_tol < 0 or fill_factor < 1",
+          "error_type": "InvalidArgument",
+          "message_pattern": "invalid ILU drop or fill parameters",
+          "scipy_behavior": "ValueError for invalid ILU parameterization."
+        },
+        {
+          "condition": "sparse structure malformed or incompatible",
+          "error_type": "InvalidSparseStructure",
+          "message_pattern": "invalid sparse structure for ILU factorization",
+          "scipy_behavior": "ValueError before SuperLU ILU call."
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "not_applicable",
+        "notes": "Preconditioner construction contract; quality assessed by downstream iterative convergence metrics."
+      },
+      "backend_semantics": "SuperLU ILU routine with configurable dropping and fill controls, normalized through CSC-compatible metadata.",
+      "strict_mode_behavior": "Matches SciPy ILU parameter semantics and defaults, including COLAMD permutation default and tolerance interpretation.",
+      "hardened_mode_behavior": "Adds fail-closed parameter and structure validation, plus conservative guards against pathological fill growth before backend invocation.",
+      "invariants": [
+        "ILU factor object is reusable across RHS vectors with matching dimensions",
+        "drop_tol and fill_factor settings are persisted in factor metadata",
+        "input sparse metadata is validated before any backend memory allocation"
+      ],
+      "performance_sentinel": "PERF-SPARSE-SPILU"
+    }
+  ]
+}

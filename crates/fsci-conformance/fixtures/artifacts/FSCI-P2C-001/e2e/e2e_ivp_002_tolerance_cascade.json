@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_ivp_002_tolerance_cascade",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "scalar_tol",
+      "action": "validate",
+      "input_summary": "rtol=1e-6, atol=1e-9, n=3",
+      "output_summary": "warnings=0",
+      "duration_ns": 16641,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "vector_atol",
+      "action": "validate",
+      "input_summary": "rtol=1e-6, atol=[1e-8, 1e-9, 1e-10], n=3",
+      "output_summary": "warnings=0",
+      "duration_ns": 7895,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "solve_harmonic",
+      "action": "solve",
+      "input_summary": "harmonic oscillator, t=[0,2pi], y0=[1,0]",
+      "output_summary": "success=true, nfev=505",
+      "duration_ns": 467656,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "verify_periodicity",
+      "action": "check",
+      "input_summary": "y(2pi) ≈ [1, 0]",
+      "output_summary": "err_x=7.90e-9, err_v=1.21e-9",
+      "duration_ns": 1392,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 601189,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_002_tolerance_cascade --nocapture"
+  }
+}

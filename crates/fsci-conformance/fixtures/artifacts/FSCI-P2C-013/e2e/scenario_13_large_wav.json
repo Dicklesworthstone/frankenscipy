@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_13_large_wav",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "write_large_wav",
+      "action": "wav_write(5 seconds of audio)",
+      "input_summary": "220K samples",
+      "output_summary": "wrote 441044 bytes (0.4MB) in 10.861107ms",
+      "duration_ns": 18732229,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "wav_roundtrip_large",
+      "action": "wav_read(wav_write(5 sec))",
+      "input_summary": "large roundtrip",
+      "output_summary": "roundtrip 220500 samples in 20.758668ms",
+      "duration_ns": 26707268,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "WAV",
+    "operation": "large",
+    "size_bytes": 441000
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 45519468,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_13_large_wav --nocapture"
+  }
+}

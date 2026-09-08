@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_14_large_csv",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "write_large_csv",
+      "action": "write_csv(1000x100)",
+      "input_summary": "100K values",
+      "output_summary": "wrote 1963053 bytes (1917.0KB) in 26.476892ms",
+      "duration_ns": 26615855,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "read_large_csv",
+      "action": "read_csv(1000x100)",
+      "input_summary": "parse 100K values",
+      "output_summary": "read 1000x100 in 22.027321ms",
+      "duration_ns": 45614788,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "CSV",
+    "operation": "large",
+    "size_bytes": 800000
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 75851914,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_14_large_csv --nocapture"
+  }
+}

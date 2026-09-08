@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_09_hilbert_envelope",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "compute_envelope",
+      "action": "hilbert_envelope(signal)",
+      "input_summary": "extract amplitude envelope",
+      "output_summary": "len=128, rms=1.0607",
+      "duration_ns": 328182,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "hilbert",
+    "signal_length": 128,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 382896,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_09_hilbert_envelope --nocapture"
+  }
+}

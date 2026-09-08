@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_11_wav_bit_depth",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "wav_16bit_range",
+      "action": "WAV 16-bit quantization",
+      "input_summary": "full dynamic range",
+      "output_summary": "max quantization error: 0.000060",
+      "duration_ns": 45076,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "wav_clipping",
+      "action": "WAV clipping behavior",
+      "input_summary": "values outside [-1, 1]",
+      "output_summary": "clipping handled correctly",
+      "duration_ns": 2945,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "WAV",
+    "operation": "bit_depth",
+    "size_bytes": 0
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 138783,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_11_wav_bit_depth --nocapture"
+  }
+}

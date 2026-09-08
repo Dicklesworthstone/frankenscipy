@@ -1,0 +1,87 @@
+{
+  "scenario_id": "e2e_002_norm_sweep",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "generate_signal",
+      "action": "create",
+      "input_summary": "complex signal n=32",
+      "output_summary": "len=32",
+      "duration_ns": 0,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "fft_Backward",
+      "action": "transform",
+      "input_summary": "norm=Backward",
+      "output_summary": "spectrum len=32",
+      "duration_ns": 11472,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "ifft_Backward_verify",
+      "action": "compare",
+      "input_summary": "diff=3.0531e-16",
+      "output_summary": "pass=true",
+      "duration_ns": 6722,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "fft_Forward",
+      "action": "transform",
+      "input_summary": "norm=Forward",
+      "output_summary": "spectrum len=32",
+      "duration_ns": 1753,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 5,
+      "step_name": "ifft_Forward_verify",
+      "action": "compare",
+      "input_summary": "diff=3.0531e-16",
+      "output_summary": "pass=true",
+      "duration_ns": 1623,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 6,
+      "step_name": "fft_Ortho",
+      "action": "transform",
+      "input_summary": "norm=Ortho",
+      "output_summary": "spectrum len=32",
+      "duration_ns": 1252,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 7,
+      "step_name": "ifft_Ortho_verify",
+      "action": "compare",
+      "input_summary": "diff=3.3307e-16",
+      "output_summary": "pass=true",
+      "duration_ns": 4218,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 133433,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_fft -- e2e_002_norm_sweep --nocapture"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "scenario_id": "e2e_special_007_bessel",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "j0_zero",
+      "action": "j0",
+      "input_summary": "x=0",
+      "output_summary": "result=1, expected=1.0",
+      "duration_ns": 2204,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "j1_zero",
+      "action": "j1",
+      "input_summary": "x=0",
+      "output_summary": "result=0, expected=0.0",
+      "duration_ns": 792,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 163099,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_special -- e2e_special_007_bessel --nocapture"
+  }
+}

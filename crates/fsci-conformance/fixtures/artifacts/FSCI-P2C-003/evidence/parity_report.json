@@ -1,0 +1,68 @@
+{
+  "packet_id": "FSCI-P2C-003",
+  "operation_summaries": [
+    {
+      "operation": "bfgs",
+      "total_fixtures": 4,
+      "passed": 4,
+      "failed": 0,
+      "max_abs_diff_across_all": 6.07747097092215e-9
+    },
+    {
+      "operation": "cg",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 5.024759275329416e-9
+    },
+    {
+      "operation": "powell",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 4.822437839276285e-6
+    },
+    {
+      "operation": "brentq",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 2.4868995751603507e-14
+    },
+    {
+      "operation": "brenth",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 2.4868995751603507e-14
+    },
+    {
+      "operation": "bisect",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 2.3945290195115376e-12
+    },
+    {
+      "operation": "ridder",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 8.881784197001252e-16
+    },
+    {
+      "operation": "root_agreement",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 2.1671553440683056e-13
+    },
+    {
+      "operation": "minimize_agreement",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.2748493634603e-9
+    }
+  ]
+}

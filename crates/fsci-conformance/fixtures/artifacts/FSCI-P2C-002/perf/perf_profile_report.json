@@ -1,0 +1,458 @@
+{
+  "generated_at": "unix:1776863248",
+  "operation_benchmarks": [
+    {
+      "operation": "solve",
+      "matrix_desc": "4x4",
+      "rows": 4,
+      "cols": 4,
+      "iterations": 20,
+      "median_ns": 75333,
+      "p95_ns": 248080,
+      "min_ns": 74390,
+      "max_ns": 248080,
+      "mean_ns": 91477
+    },
+    {
+      "operation": "solve",
+      "matrix_desc": "16x16",
+      "rows": 16,
+      "cols": 16,
+      "iterations": 20,
+      "median_ns": 290760,
+      "p95_ns": 531105,
+      "min_ns": 279219,
+      "max_ns": 531105,
+      "mean_ns": 320112
+    },
+    {
+      "operation": "solve",
+      "matrix_desc": "64x64",
+      "rows": 64,
+      "cols": 64,
+      "iterations": 20,
+      "median_ns": 7416722,
+      "p95_ns": 16269102,
+      "min_ns": 5650378,
+      "max_ns": 16269102,
+      "mean_ns": 7783458
+    },
+    {
+      "operation": "solve",
+      "matrix_desc": "256x256",
+      "rows": 256,
+      "cols": 256,
+      "iterations": 20,
+      "median_ns": 235800427,
+      "p95_ns": 251709388,
+      "min_ns": 218299073,
+      "max_ns": 251709388,
+      "mean_ns": 234780677
+    },
+    {
+      "operation": "solve_triangular",
+      "matrix_desc": "4x4",
+      "rows": 4,
+      "cols": 4,
+      "iterations": 20,
+      "median_ns": 1513,
+      "p95_ns": 1664,
+      "min_ns": 1492,
+      "max_ns": 1664,
+      "mean_ns": 1521
+    },
+    {
+      "operation": "solve_triangular",
+      "matrix_desc": "16x16",
+      "rows": 16,
+      "cols": 16,
+      "iterations": 20,
+      "median_ns": 12103,
+      "p95_ns": 18134,
+      "min_ns": 12083,
+      "max_ns": 18134,
+      "mean_ns": 12418
+    },
+    {
+      "operation": "solve_triangular",
+      "matrix_desc": "64x64",
+      "rows": 64,
+      "cols": 64,
+      "iterations": 20,
+      "median_ns": 158380,
+      "p95_ns": 166956,
+      "min_ns": 158229,
+      "max_ns": 166956,
+      "mean_ns": 159601
+    },
+    {
+      "operation": "solve_triangular",
+      "matrix_desc": "256x256",
+      "rows": 256,
+      "cols": 256,
+      "iterations": 20,
+      "median_ns": 2440341,
+      "p95_ns": 2450239,
+      "min_ns": 2431754,
+      "max_ns": 2450239,
+      "mean_ns": 2440453
+    },
+    {
+      "operation": "solve_banded",
+      "matrix_desc": "4x4",
+      "rows": 4,
+      "cols": 4,
+      "iterations": 20,
+      "median_ns": 81133,
+      "p95_ns": 95672,
+      "min_ns": 80773,
+      "max_ns": 95672,
+      "mean_ns": 82531
+    },
+    {
+      "operation": "solve_banded",
+      "matrix_desc": "16x16",
+      "rows": 16,
+      "cols": 16,
+      "iterations": 20,
+      "median_ns": 283627,
+      "p95_ns": 295580,
+      "min_ns": 282265,
+      "max_ns": 295580,
+      "mean_ns": 286131
+    },
+    {
+      "operation": "solve_banded",
+      "matrix_desc": "64x64",
+      "rows": 64,
+      "cols": 64,
+      "iterations": 20,
+      "median_ns": 5686937,
+      "p95_ns": 7773698,
+      "min_ns": 5605062,
+      "max_ns": 7773698,
+      "mean_ns": 5999801
+    },
+    {
+      "operation": "solve_banded",
+      "matrix_desc": "256x256",
+      "rows": 256,
+      "cols": 256,
+      "iterations": 20,
+      "median_ns": 228784412,
+      "p95_ns": 303126887,
+      "min_ns": 217929842,
+      "max_ns": 303126887,
+      "mean_ns": 231392487
+    },
+    {
+      "operation": "inv",
+      "matrix_desc": "4x4",
+      "rows": 4,
+      "cols": 4,
+      "iterations": 20,
+      "median_ns": 101823,
+      "p95_ns": 113826,
+      "min_ns": 101502,
+      "max_ns": 113826,
+      "mean_ns": 103189
+    },
+    {
+      "operation": "inv",
+      "matrix_desc": "16x16",
+      "rows": 16,
+      "cols": 16,
+      "iterations": 20,
+      "median_ns": 596439,
+      "p95_ns": 601379,
+      "min_ns": 586350,
+      "max_ns": 601379,
+      "mean_ns": 593479
+    },
+    {
+      "operation": "inv",
+      "matrix_desc": "64x64",
+      "rows": 64,
+      "cols": 64,
+      "iterations": 20,
+      "median_ns": 14956537,
+      "p95_ns": 22423515,
+      "min_ns": 14869653,
+      "max_ns": 22423515,
+      "mean_ns": 15352374
+    },
+    {
+      "operation": "inv",
+      "matrix_desc": "256x256",
+      "rows": 256,
+      "cols": 256,
+      "iterations": 20,
+      "median_ns": 707462035,
+      "p95_ns": 737643102,
+      "min_ns": 662223928,
+      "max_ns": 737643102,
+      "mean_ns": 702552184
+    },
+    {
+      "operation": "det",
+      "matrix_desc": "4x4",
+      "rows": 4,
+      "cols": 4,
+      "iterations": 20,
+      "median_ns": 7574,
+      "p95_ns": 7825,
+      "min_ns": 7514,
+      "max_ns": 7825,
+      "mean_ns": 7589
+    },
+    {
+      "operation": "det",
+      "matrix_desc": "16x16",
+      "rows": 16,
+      "cols": 16,
+      "iterations": 20,
+      "median_ns": 112964,
+      "p95_ns": 124987,
+      "min_ns": 95331,
+      "max_ns": 124987,
+      "mean_ns": 107449
+    },
+    {
+      "operation": "det",
+      "matrix_desc": "64x64",
+      "rows": 64,
+      "cols": 64,
+      "iterations": 20,
+      "median_ns": 2749927,
+      "p95_ns": 3761462,
+      "min_ns": 2499262,
+      "max_ns": 3761462,
+      "mean_ns": 2835870
+    },
+    {
+      "operation": "det",
+      "matrix_desc": "256x256",
+      "rows": 256,
+      "cols": 256,
+      "iterations": 20,
+      "median_ns": 145738897,
+      "p95_ns": 157001991,
+      "min_ns": 134567787,
+      "max_ns": 157001991,
+      "mean_ns": 145881246
+    },
+    {
+      "operation": "lstsq",
+      "matrix_desc": "8x4",
+      "rows": 8,
+      "cols": 4,
+      "iterations": 20,
+      "median_ns": 176795,
+      "p95_ns": 315097,
+      "min_ns": 175623,
+      "max_ns": 315097,
+      "mean_ns": 188895
+    },
+    {
+      "operation": "lstsq",
+      "matrix_desc": "32x16",
+      "rows": 32,
+      "cols": 16,
+      "iterations": 20,
+      "median_ns": 3022313,
+      "p95_ns": 3779346,
+      "min_ns": 3012463,
+      "max_ns": 3779346,
+      "mean_ns": 3132185
+    },
+    {
+      "operation": "lstsq",
+      "matrix_desc": "128x64",
+      "rows": 128,
+      "cols": 64,
+      "iterations": 20,
+      "median_ns": 130257505,
+      "p95_ns": 138817271,
+      "min_ns": 120287478,
+      "max_ns": 138817271,
+      "mean_ns": 130159372
+    },
+    {
+      "operation": "lstsq",
+      "matrix_desc": "512x256",
+      "rows": 512,
+      "cols": 256,
+      "iterations": 20,
+      "median_ns": 7042842482,
+      "p95_ns": 7192596323,
+      "min_ns": 6832588037,
+      "max_ns": 7192596323,
+      "mean_ns": 7039571561
+    },
+    {
+      "operation": "pinv",
+      "matrix_desc": "8x4",
+      "rows": 8,
+      "cols": 4,
+      "iterations": 20,
+      "median_ns": 116560,
+      "p95_ns": 147559,
+      "min_ns": 116070,
+      "max_ns": 147559,
+      "mean_ns": 119546
+    },
+    {
+      "operation": "pinv",
+      "matrix_desc": "32x16",
+      "rows": 32,
+      "cols": 16,
+      "iterations": 20,
+      "median_ns": 2187612,
+      "p95_ns": 3653246,
+      "min_ns": 2167203,
+      "max_ns": 3653246,
+      "mean_ns": 2388758
+    },
+    {
+      "operation": "pinv",
+      "matrix_desc": "128x64",
+      "rows": 128,
+      "cols": 64,
+      "iterations": 20,
+      "median_ns": 97304618,
+      "p95_ns": 107762126,
+      "min_ns": 92452042,
+      "max_ns": 107762126,
+      "mean_ns": 98039658
+    },
+    {
+      "operation": "pinv",
+      "matrix_desc": "512x256",
+      "rows": 512,
+      "cols": 256,
+      "iterations": 20,
+      "median_ns": 5399888304,
+      "p95_ns": 5624086768,
+      "min_ns": 5244934362,
+      "max_ns": 5624086768,
+      "mean_ns": 5398035486
+    }
+  ],
+  "hotspot_ranking": [
+    {
+      "rank": 1,
+      "operation": "lstsq",
+      "matrix_desc": "512x256",
+      "median_ns": 7042842482,
+      "fraction_of_total": 0.5117245177904647
+    },
+    {
+      "rank": 2,
+      "operation": "pinv",
+      "matrix_desc": "512x256",
+      "median_ns": 5399888304,
+      "fraction_of_total": 0.392349430723328
+    },
+    {
+      "rank": 3,
+      "operation": "inv",
+      "matrix_desc": "256x256",
+      "median_ns": 707462035,
+      "fraction_of_total": 0.05140334597013863
+    },
+    {
+      "rank": 4,
+      "operation": "solve",
+      "matrix_desc": "256x256",
+      "median_ns": 235800427,
+      "fraction_of_total": 0.01713297721903539
+    },
+    {
+      "rank": 5,
+      "operation": "solve_banded",
+      "matrix_desc": "256x256",
+      "median_ns": 228784412,
+      "fraction_of_total": 0.01662320195402533
+    },
+    {
+      "rank": 6,
+      "operation": "det",
+      "matrix_desc": "256x256",
+      "median_ns": 145738897,
+      "fraction_of_total": 0.010589214082417015
+    },
+    {
+      "rank": 7,
+      "operation": "solve_triangular",
+      "matrix_desc": "256x256",
+      "median_ns": 2440341,
+      "fraction_of_total": 0.00017731226059093628
+    }
+  ],
+  "memory_notes": [
+    {
+      "operation": "solve",
+      "matrix_size": "256x256",
+      "estimated_input_bytes": 526336,
+      "notes": "Input: A (512KB) + b (2KB). LU decomposition allocates DMatrix clone."
+    },
+    {
+      "operation": "inv",
+      "matrix_size": "256x256",
+      "estimated_input_bytes": 524288,
+      "notes": "Input: A (512KB). LU + solve for each column of identity = n solves."
+    },
+    {
+      "operation": "lstsq",
+      "matrix_size": "512x256",
+      "estimated_input_bytes": 1052672,
+      "notes": "Input: A (1MB) + b (4KB). SVD (Gelsd) allocates U, S, Vt matrices."
+    },
+    {
+      "operation": "pinv",
+      "matrix_size": "512x256",
+      "estimated_input_bytes": 1048576,
+      "notes": "Input: A (1MB). Full SVD + matrix multiply for pseudoinverse."
+    }
+  ],
+  "isomorphism_check": {
+    "all_operations_pass": true,
+    "details": [
+      {
+        "operation": "solve",
+        "passes": true,
+        "note": "max_residual=3.55e-15"
+      },
+      {
+        "operation": "solve_triangular",
+        "passes": true,
+        "note": "max_residual=3.55e-15"
+      },
+      {
+        "operation": "solve_banded",
+        "passes": true,
+        "note": "banded_vs_dense_diff=0.00e0"
+      },
+      {
+        "operation": "inv",
+        "passes": true,
+        "note": "max_identity_err=5.55e-16"
+      },
+      {
+        "operation": "det",
+        "passes": true,
+        "note": "det(A)*det(inv(A))=1.000000e0"
+      },
+      {
+        "operation": "lstsq",
+        "passes": true,
+        "note": "normal_eq_err=9.09e-13"
+      },
+      {
+        "operation": "pinv",
+        "passes": true,
+        "note": "pinv_vs_lstsq_diff=0.00e0"
+      }
+    ]
+  }
+}

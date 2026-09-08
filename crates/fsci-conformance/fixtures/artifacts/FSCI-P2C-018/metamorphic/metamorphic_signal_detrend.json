@@ -1,0 +1,88 @@
+{
+  "test_id": "metamorphic_signal_detrend",
+  "case_count": 13,
+  "pass_count": 13,
+  "pass": true,
+  "timestamp_ms": 1779662452431,
+  "duration_ns": 121701,
+  "cases": [
+    {
+      "case_id": "mixed_offsets_n5",
+      "invariant": "constant_zero_mean",
+      "detail": "abs_mean=0",
+      "pass": true
+    },
+    {
+      "case_id": "mixed_offsets_n5",
+      "invariant": "constant_idempotent",
+      "detail": "max_diff=0",
+      "pass": true
+    },
+    {
+      "case_id": "wide_dynamic_range_n7",
+      "invariant": "constant_zero_mean",
+      "detail": "abs_mean=0.000000000008315380130495343",
+      "pass": true
+    },
+    {
+      "case_id": "wide_dynamic_range_n7",
+      "invariant": "constant_idempotent",
+      "detail": "max_diff=0.000000000014551915228366852",
+      "pass": true
+    },
+    {
+      "case_id": "oscillating_n9",
+      "invariant": "constant_zero_mean",
+      "detail": "abs_mean=0.000000000000000049343245538895844",
+      "pass": true
+    },
+    {
+      "case_id": "oscillating_n9",
+      "invariant": "constant_idempotent",
+      "detail": "max_diff=0.00000000000000005551115123125783",
+      "pass": true
+    },
+    {
+      "case_id": "positive_slope_n8",
+      "invariant": "linear_removes_affine_sequence",
+      "detail": "max_abs=0, tolerance=0.0000000001, len=8, slope=2.5, intercept=-7",
+      "pass": true
+    },
+    {
+      "case_id": "negative_slope_n13",
+      "invariant": "linear_removes_affine_sequence",
+      "detail": "max_abs=0, tolerance=0.0000000001, len=13, slope=-0.75, intercept=4.25",
+      "pass": true
+    },
+    {
+      "case_id": "flat_affine_n3",
+      "invariant": "linear_removes_affine_sequence",
+      "detail": "max_abs=0, tolerance=0.0000000001, len=3, slope=0, intercept=11",
+      "pass": true
+    },
+    {
+      "case_id": "large_intercept_n21",
+      "invariant": "linear_removes_affine_sequence",
+      "detail": "max_abs=0.0000002384185791015625, tolerance=0.00000100000000002, len=21, slope=0.001, intercept=1000000000",
+      "pass": true
+    },
+    {
+      "case_id": "curved_residual_n8",
+      "invariant": "linear_residual_invariant_to_added_affine",
+      "detail": "max_diff=0, slope=3.5, intercept=-12",
+      "pass": true
+    },
+    {
+      "case_id": "oscillating_residual_n16",
+      "invariant": "linear_residual_invariant_to_added_affine",
+      "detail": "max_diff=0.0000000000000011657341758564144, slope=-1.25, intercept=8",
+      "pass": true
+    },
+    {
+      "case_id": "signed_residual_n9",
+      "invariant": "linear_residual_invariant_to_added_affine",
+      "detail": "max_diff=0.000000000000005773159728050814, slope=0.125, intercept=100",
+      "pass": true
+    }
+  ]
+}

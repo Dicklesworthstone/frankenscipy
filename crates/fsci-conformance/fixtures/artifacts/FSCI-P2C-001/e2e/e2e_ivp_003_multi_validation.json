@@ -1,0 +1,67 @@
+{
+  "scenario_id": "e2e_ivp_003_multi_validation",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "validate_tol",
+      "action": "validate",
+      "input_summary": "rtol=1e-4, atol=1e-7, n=2",
+      "output_summary": "ok, warnings=0",
+      "duration_ns": 20419,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "validate_first_step",
+      "action": "validate",
+      "input_summary": "first_step=0.001, t0=0.0, t_bound=100.0",
+      "output_summary": "result=0.001",
+      "duration_ns": 1673,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "validate_max_step",
+      "action": "validate",
+      "input_summary": "max_step=10.0",
+      "output_summary": "result=10",
+      "duration_ns": 682,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "solve_lotka_volterra",
+      "action": "solve",
+      "input_summary": "Lotka-Volterra, t=[0,10], y0=[1,0.5]",
+      "output_summary": "success=true, nfev=355, t_len=46",
+      "duration_ns": 582444,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 5,
+      "step_name": "verify_positive",
+      "action": "check",
+      "input_summary": "all y > 0 (biological constraint)",
+      "output_summary": "all_positive=true",
+      "duration_ns": 2295,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 738710,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_003_multi_validation --nocapture"
+  }
+}

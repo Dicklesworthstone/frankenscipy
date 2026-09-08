@@ -1,0 +1,37 @@
+{
+  "scenario_id": "e2e_002c_basic_ifft_irfft_numpy_goldens",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "ifft_exact_numpy_inverse_dft",
+      "action": "ifft",
+      "input_summary": "complex length-5 spectrum",
+      "output_summary": "max_abs_diff=4.441e-16",
+      "duration_ns": 22923,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "irfft_exact_numpy_inverse_dft",
+      "action": "irfft",
+      "input_summary": "half-complex length-3 spectrum, n=5",
+      "output_summary": "max_abs_diff=1.110e-16",
+      "duration_ns": 8356,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 269852,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_fft -- e2e_002c_basic_ifft_irfft_numpy_goldens --nocapture"
+  }
+}

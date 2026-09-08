@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_ivp_011_bdf_newton",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "solve_bdf_stiff_decay",
+      "action": "solve",
+      "input_summary": "BDF, dy/dt=-1000y, t=[0,0.01], y0=1",
+      "output_summary": "success=true, nfev=14750, njev=924, nlu=924, steps=4610",
+      "duration_ns": 17595214,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "verify_stiff_solution",
+      "action": "check",
+      "input_summary": "final_y=4.63668496e-5",
+      "output_summary": "expected=4.53999298e-5, abs_err=9.67e-7",
+      "duration_ns": 1713,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_newton_diagnostics",
+      "action": "check",
+      "input_summary": "BDF should evaluate Jacobians and factorize Newton systems",
+      "output_summary": "njev=924, nlu=924",
+      "duration_ns": 301,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 17661621,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_011_bdf_newton --nocapture"
+  }
+}

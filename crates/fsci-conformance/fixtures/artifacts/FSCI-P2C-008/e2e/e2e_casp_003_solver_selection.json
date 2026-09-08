@@ -1,0 +1,67 @@
+{
+  "scenario_id": "e2e_casp_003_solver_selection",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "select_WellConditioned",
+      "action": "select_action",
+      "input_summary": "state=WellConditioned",
+      "output_summary": "action=DirectLU, chosen_loss=1.00, posterior_sum=1.000000000000",
+      "duration_ns": 72838,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "select_ModerateCondition",
+      "action": "select_action",
+      "input_summary": "state=ModerateCondition",
+      "output_summary": "action=PivotedQR, chosen_loss=1.00, posterior_sum=1.000000000000",
+      "duration_ns": 6813,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "select_IllConditioned",
+      "action": "select_action",
+      "input_summary": "state=IllConditioned",
+      "output_summary": "action=SVDFallback, chosen_loss=1.00, posterior_sum=1.000000000000",
+      "duration_ns": 2295,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "select_NearSingular",
+      "action": "select_action",
+      "input_summary": "state=NearSingular",
+      "output_summary": "action=SVDFallback, chosen_loss=1.00, posterior_sum=1.000000000000",
+      "duration_ns": 1823,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 5,
+      "step_name": "verify_expected_selections",
+      "action": "check",
+      "input_summary": "well→DirectLU, ill→SVDFallback",
+      "output_summary": "well=DirectLU, ill=SVDFallback",
+      "duration_ns": 2485,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 189980,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_003_solver_selection --nocapture"
+  }
+}

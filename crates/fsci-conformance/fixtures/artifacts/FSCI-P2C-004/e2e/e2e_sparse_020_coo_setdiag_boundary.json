@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_sparse_020_coo_setdiag_boundary",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "set_superdiag",
+      "action": "coo.setdiag(values, k=1)",
+      "input_summary": "shape=(3,4), values=[1,2,3,4]",
+      "output_summary": "rows=[0, 0, 1, 2] cols=[3, 1, 2, 3] data=[8.0, 1.0, 2.0, 3.0]",
+      "duration_ns": 36950,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "set_partial_main_diag",
+      "action": "coo.setdiag(values, k=0)",
+      "input_summary": "shape=(3,3), values=[5]",
+      "output_summary": "rows=[1, 2, 0] cols=[1, 2, 0] data=[20.0, 30.0, 5.0]",
+      "duration_ns": 5140,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "broadcast_scalar",
+      "action": "coo.setdiag_scalar(value, k=1)",
+      "input_summary": "shape=(3,4), value=9",
+      "output_summary": "rows=[0, 1, 2] cols=[1, 2, 3] data=[9.0, 9.0, 9.0]",
+      "duration_ns": 4899,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "reject_out_of_bounds_k",
+      "action": "coo.setdiag(values, k=4)",
+      "input_summary": "shape=(3,4), values=[1]",
+      "output_summary": "invalid argument: k exceeds array dimensions",
+      "duration_ns": 2384,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 161106,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_020_coo_setdiag_boundary --nocapture"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_08_spectral_features",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "spectral_centroid",
+      "action": "spectral_centroid(magnitudes, freqs)",
+      "input_summary": "compute frequency centroid",
+      "output_summary": "centroid=25.00 Hz",
+      "duration_ns": 9157,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "spectral_flatness",
+      "action": "spectral_flatness(magnitudes)",
+      "input_summary": "measure spectral flatness",
+      "output_summary": "flatness=0.0000",
+      "duration_ns": 6102,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "spectral",
+    "signal_length": 64,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 52340,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_08_spectral_features --nocapture"
+  }
+}

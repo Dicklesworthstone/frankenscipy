@@ -1,0 +1,37 @@
+{
+  "scenario_id": "e2e_special_003_beta_gamma",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "beta",
+      "action": "beta",
+      "input_summary": "a=2, b=3",
+      "output_summary": "beta=0.083333",
+      "duration_ns": 37040,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "verify_relation",
+      "action": "gamma+compare",
+      "input_summary": "ga=1.0000, gb=2.0000, gab=24.0000",
+      "output_summary": "expected=0.083333, diff=1.3878e-17",
+      "duration_ns": 5510,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 128033,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_special -- e2e_special_003_beta_gamma --nocapture"
+  }
+}

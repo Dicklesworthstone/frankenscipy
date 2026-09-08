@@ -1,0 +1,100 @@
+{
+  "test_id": "metamorphic_stats_psd_welch",
+  "case_count": 15,
+  "pass_count": 15,
+  "pass": true,
+  "timestamp_ms": 1779662453682,
+  "duration_ns": 46269799,
+  "cases": [
+    {
+      "case_id": "tone_25hz_fs100_n512_w64",
+      "invariant": "length_eq_n_over_2_plus_1",
+      "detail": "psd.len()=33, expected=33",
+      "pass": true
+    },
+    {
+      "case_id": "tone_25hz_fs100_n512_w64",
+      "invariant": "peak_bin_at_tone_freq",
+      "detail": "actual_bin=16, expected_bin=16, distance=0",
+      "pass": true
+    },
+    {
+      "case_id": "tone_25hz_fs100_n512_w64",
+      "invariant": "amplitude_quadratic_scaling",
+      "detail": "max_rel_diff=0",
+      "pass": true
+    },
+    {
+      "case_id": "tone_10hz_fs100_n1024_w128",
+      "invariant": "length_eq_n_over_2_plus_1",
+      "detail": "psd.len()=65, expected=65",
+      "pass": true
+    },
+    {
+      "case_id": "tone_10hz_fs100_n1024_w128",
+      "invariant": "peak_bin_at_tone_freq",
+      "detail": "actual_bin=13, expected_bin=13, distance=0",
+      "pass": true
+    },
+    {
+      "case_id": "tone_10hz_fs100_n1024_w128",
+      "invariant": "amplitude_quadratic_scaling",
+      "detail": "max_rel_diff=0",
+      "pass": true
+    },
+    {
+      "case_id": "tone_50hz_fs200_n2048_w256",
+      "invariant": "length_eq_n_over_2_plus_1",
+      "detail": "psd.len()=129, expected=129",
+      "pass": true
+    },
+    {
+      "case_id": "tone_50hz_fs200_n2048_w256",
+      "invariant": "peak_bin_at_tone_freq",
+      "detail": "actual_bin=64, expected_bin=64, distance=0",
+      "pass": true
+    },
+    {
+      "case_id": "tone_50hz_fs200_n2048_w256",
+      "invariant": "amplitude_quadratic_scaling",
+      "detail": "max_rel_diff=0",
+      "pass": true
+    },
+    {
+      "case_id": "tone_5hz_fs50_n256_w32",
+      "invariant": "length_eq_n_over_2_plus_1",
+      "detail": "psd.len()=17, expected=17",
+      "pass": true
+    },
+    {
+      "case_id": "tone_5hz_fs50_n256_w32",
+      "invariant": "peak_bin_at_tone_freq",
+      "detail": "actual_bin=3, expected_bin=3, distance=0",
+      "pass": true
+    },
+    {
+      "case_id": "tone_5hz_fs50_n256_w32",
+      "invariant": "amplitude_quadratic_scaling",
+      "detail": "max_rel_diff=0",
+      "pass": true
+    },
+    {
+      "case_id": "tone_aligned_4hz_fs16_n128_w16",
+      "invariant": "length_eq_n_over_2_plus_1",
+      "detail": "psd.len()=9, expected=9",
+      "pass": true
+    },
+    {
+      "case_id": "tone_aligned_4hz_fs16_n128_w16",
+      "invariant": "peak_bin_at_tone_freq",
+      "detail": "actual_bin=4, expected_bin=4, distance=0",
+      "pass": true
+    },
+    {
+      "case_id": "tone_aligned_4hz_fs16_n128_w16",
+      "invariant": "amplitude_quadratic_scaling",
+      "detail": "max_rel_diff=0",
+      "pass": true
+    }
+  ]
+}

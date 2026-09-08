@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_19_splev_second_derivative",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "splev_der2_reference",
+      "action": "splev_with_derivative(points, tck, 2)",
+      "input_summary": "SciPy cubic tck for x^3 sampled on [0,4]",
+      "output_summary": "max_abs_diff=3.553e-15",
+      "duration_ns": 22142,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "splev_der_above_degree_rejected",
+      "action": "splev_with_derivative([0.5], tck, 4)",
+      "input_summary": "SciPy rejects derivative order above spline degree",
+      "output_summary": "0<=der=4<=k=3 must hold",
+      "duration_ns": 1343,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "splev-der2",
+    "num_points": 4,
+    "dimensions": 1,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 29566,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_19_splev_second_derivative --nocapture"
+  }
+}

@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_casp_001_policy_well_cond",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_controller",
+      "action": "init",
+      "input_summary": "mode=Strict, capacity=64",
+      "output_summary": "mode=Strict",
+      "duration_ns": 3908,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "benign_decision",
+      "action": "decide",
+      "input_summary": "cond=2.0, meta=0.0, anom=0.0",
+      "output_summary": "action=Allow, top_state=Compatible, reason=mode=Strict; top_state=Compatible; p=0.940946; cond_log10=2.000; metadata=0.000; anomaly=0.000",
+      "duration_ns": 34887,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "posterior_normalized",
+      "action": "check",
+      "input_summary": "posterior=[0.9409462429483226, 0.05049559023426266, 0.008558166817414595]",
+      "output_summary": "sum=1.000000000000",
+      "duration_ns": 2475,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "ledger_recorded",
+      "action": "check",
+      "input_summary": "ledger.len()",
+      "output_summary": "len=1",
+      "duration_ns": 811,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 161706,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_001_policy_well_cond --nocapture"
+  }
+}

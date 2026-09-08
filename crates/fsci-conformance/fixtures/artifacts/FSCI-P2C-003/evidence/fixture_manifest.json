@@ -1,0 +1,110 @@
+{
+  "packet_id": "FSCI-P2C-003",
+  "generated_at": "unix:1779662447",
+  "fixtures": [
+    {
+      "fixture_id": "bfgs_quadratic_dim2",
+      "size": 2,
+      "input_type": "minimize",
+      "operations": [
+        "bfgs"
+      ]
+    },
+    {
+      "fixture_id": "bfgs_quadratic_dim5",
+      "size": 5,
+      "input_type": "minimize",
+      "operations": [
+        "bfgs"
+      ]
+    },
+    {
+      "fixture_id": "bfgs_quadratic_dim10",
+      "size": 10,
+      "input_type": "minimize",
+      "operations": [
+        "bfgs"
+      ]
+    },
+    {
+      "fixture_id": "bfgs_rosenbrock_2d",
+      "size": 2,
+      "input_type": "minimize",
+      "operations": [
+        "bfgs"
+      ]
+    },
+    {
+      "fixture_id": "cg_quadratic_dim2",
+      "size": 2,
+      "input_type": "minimize",
+      "operations": [
+        "cg"
+      ]
+    },
+    {
+      "fixture_id": "cg_quadratic_dim5",
+      "size": 5,
+      "input_type": "minimize",
+      "operations": [
+        "cg"
+      ]
+    },
+    {
+      "fixture_id": "powell_quadratic_dim2",
+      "size": 2,
+      "input_type": "minimize",
+      "operations": [
+        "powell"
+      ]
+    },
+    {
+      "fixture_id": "powell_quadratic_dim5",
+      "size": 5,
+      "input_type": "minimize",
+      "operations": [
+        "powell"
+      ]
+    },
+    {
+      "fixture_id": "brentq_cubic",
+      "size": 1,
+      "input_type": "root_finding",
+      "operations": [
+        "brentq"
+      ]
+    },
+    {
+      "fixture_id": "brenth_cubic",
+      "size": 1,
+      "input_type": "root_finding",
+      "operations": [
+        "brenth"
+      ]
+    },
+    {
+      "fixture_id": "bisect_cubic",
+      "size": 1,
+      "input_type": "root_finding",
+      "operations": [
+        "bisect"
+      ]
+    },
+    {
+      "fixture_id": "ridder_cubic",
+      "size": 1,
+      "input_type": "root_finding",
+      "operations": [
+        "ridder"
+      ]
+    },
+    {
+      "fixture_id": "brentq_sin_pi",
+      "size": 1,
+      "input_type": "root_finding",
+      "operations": [
+        "brentq"
+      ]
+    }
+  ]
+}

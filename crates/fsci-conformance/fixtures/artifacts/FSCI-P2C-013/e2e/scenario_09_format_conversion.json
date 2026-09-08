@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_09_format_conversion",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "mm_to_csv_to_mm",
+      "action": "MM -> CSV -> MM",
+      "input_summary": "cross-format roundtrip",
+      "output_summary": "MM -> CSV preserves data",
+      "duration_ns": 46699,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "txt_to_json_consistency",
+      "action": "savetxt vs JSON array",
+      "input_summary": "different formats, same data",
+      "output_summary": "txt and JSON preserve same data",
+      "duration_ns": 17714,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "multiple",
+    "operation": "conversion",
+    "size_bytes": 0
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 220057,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_09_format_conversion --nocapture"
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "packet_id": "FSCI-P2C-002",
+  "operation_summaries": [
+    {
+      "operation": "solve",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 4.973799150320701e-14,
+      "max_rel_diff_across_all": 1.1842378929335002e-15
+    },
+    {
+      "operation": "solve_triangular",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 3.552713678800501e-15,
+      "max_rel_diff_across_all": 3.552713678800501e-16
+    },
+    {
+      "operation": "solve_banded",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0,
+      "max_rel_diff_across_all": 0.0
+    },
+    {
+      "operation": "inv",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.5543122344752192e-15,
+      "max_rel_diff_across_all": 1.5543122344752192e-15
+    },
+    {
+      "operation": "det",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 5.10702591327572e-15,
+      "max_rel_diff_across_all": 5.10702591327572e-15
+    },
+    {
+      "operation": "lstsq",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 5.093170329928398e-11,
+      "max_rel_diff_across_all": 0.0
+    },
+    {
+      "operation": "pinv",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 4.996003610813204e-16,
+      "max_rel_diff_across_all": 3.4955719930645315e-15
+    }
+  ]
+}

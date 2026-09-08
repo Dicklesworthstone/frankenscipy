@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-007",
+  "scope": "packet",
+  "generated_at": "2026-02-14T17:05:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "1.12.0",
+    "scipy_version_max": "1.17.0",
+    "known_differences": [
+      {
+        "version": "1.17.0",
+        "description": "Event API supports terminal as bool or positive int; fail count semantics must match upstream.",
+        "affected_functions": ["solve_ivp"]
+      },
+      {
+        "version": "1.14.0",
+        "description": "Tolerance warning surfaces for tiny rtol values; strict mode mirrors warning behavior.",
+        "affected_functions": ["validate_tol", "solve_ivp"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-001",
+      "subsystem": "fsci-integrate",
+      "category": "numerical_instability",
+      "severity": "critical",
+      "likelihood": "likely",
+      "description": "Explicit RK methods on stiff systems can collapse step size and consume extreme compute before failing.",
+      "mitigation": "Detect repeated rejections and terminate with explicit diagnostics; in hardened mode recommend implicit solver fallback.",
+      "test_reference": "P2C-001/threats/test_stiff_step_collapse.json",
+      "strict_mode_response": "Mirror SciPy termination behavior when required step size falls below floating-point spacing.",
+      "hardened_mode_response": "Fail early after bounded rejection budget and emit structured stiffness warning.",
+      "required_artifact": "P2C-001/threats/stiff_step_collapse.report.json"
+    },
+    {
+      "threat_id": "THREAT-002",
+      "subsystem": "fsci-integrate",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Error norm scaling near zero-crossings can amplify floating-point cancellation and destabilize accept/reject decisions.",
+      "mitigation": "Preserve strict-mode scaling parity and add hardened-mode finite floor for denominator stability.",
+      "test_reference": "P2C-001/threats/test_cancellation_error_norm.json",
+      "strict_mode_response": "Keep SciPy-compatible scale computation.",
+      "hardened_mode_response": "Use lower-bounded scale and emit warning when pure relative control is unsafe.",
+      "required_artifact": "P2C-001/threats/cancellation_error_norm.report.json"
+    },
+    {
+      "threat_id": "THREAT-003",
+      "subsystem": "fsci-integrate",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Multi-scale systems can force oscillatory step-size controller behavior with repeated shrink/grow cycles.",
+      "mitigation": "Track oscillation signatures and cap pathological controller churn under hardened mode.",
+      "test_reference": "P2C-001/threats/test_step_size_oscillation.json",
+      "strict_mode_response": "Retain SciPy controller constants and no-growth-after-reject semantics.",
+      "hardened_mode_response": "Emit oscillation diagnostics and clamp repeated alternation sequences.",
+      "required_artifact": "P2C-001/threats/step_size_oscillation.report.json"
+    },
+    {
+      "threat_id": "THREAT-004",
+      "subsystem": "fsci-integrate",
+      "category": "malformed_input",
+      "severity": "high",
+      "likelihood": "likely",
+      "description": "NaN or Inf in tolerance, step size, or interval inputs can poison error control and lead to undefined flow.",
+      "mitigation": "Hardened mode rejects non-finite inputs fail-closed; strict mode tracks SciPy parity behavior and diagnostics.",
+      "test_reference": "P2C-001/threats/test_nonfinite_tolerances.json",
+      "strict_mode_response": "Preserve SciPy-observable validation outputs.",
+      "hardened_mode_response": "Reject with deterministic NonFiniteInput error and audit metadata.",
+      "required_artifact": "P2C-001/threats/nonfinite_input.report.json"
+    },
+    {
+      "threat_id": "THREAT-005",
+      "subsystem": "fsci-integrate",
+      "category": "malformed_input",
+      "severity": "medium",
+      "likelihood": "likely",
+      "description": "Invalid step-size parameters (negative, zero, or interval-inconsistent) can break integrator invariants.",
+      "mitigation": "Centralize first_step/max_step validation and enforce exact boundary semantics.",
+      "test_reference": "P2C-001/threats/test_negative_step_sizes.json",
+      "strict_mode_response": "Raise argument errors matching SciPy semantics.",
+      "hardened_mode_response": "Reject earlier and include corrective guidance in diagnostics.",
+      "required_artifact": "P2C-001/threats/step_size_validation.report.json"
+    },
+    {
+      "threat_id": "THREAT-006",
+      "subsystem": "fsci-integrate",
+      "category": "malformed_input",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Shape-mismatched atol arrays or malformed vector tolerances can bypass intended per-component error policy.",
+      "mitigation": "Enforce exact (n,) shape for vector atol and validate all components before solver entry.",
+      "test_reference": "P2C-001/threats/test_wrong_shape_atol.json",
+      "strict_mode_response": "Return shape mismatch errors consistent with upstream behavior.",
+      "hardened_mode_response": "Fail-closed with explicit shape metadata and fixture reference.",
+      "required_artifact": "P2C-001/threats/atol_shape_mismatch.report.json"
+    },
+    {
+      "threat_id": "THREAT-007",
+      "subsystem": "fsci-integrate",
+      "category": "resource_exhaustion",
+      "severity": "critical",
+      "likelihood": "possible",
+      "description": "Implicit solver Newton retries can consume unbounded evaluations on discontinuous or highly pathological systems.",
+      "mitigation": "Add hardened-mode caps on consecutive failures and total evaluations with deterministic cutoff reasons.",
+      "test_reference": "P2C-001/threats/test_newton_nonconvergence_loop.json",
+      "strict_mode_response": "Maintain SciPy-compatible convergence behavior and failure message.",
+      "hardened_mode_response": "Terminate once bounded limits are exceeded and emit triage-ready evidence.",
+      "required_artifact": "P2C-001/threats/newton_nonconvergence.report.json"
+    },
+    {
+      "threat_id": "THREAT-008",
+      "subsystem": "fsci-integrate",
+      "category": "resource_exhaustion",
+      "severity": "high",
+      "likelihood": "possible",
+      "description": "Dense output accumulation can trigger unbounded memory growth on long integrations.",
+      "mitigation": "Track dense-output memory budget and enforce hardened-mode hard limit with fail-closed behavior.",
+      "test_reference": "P2C-001/threats/test_dense_output_memory.json",
+      "strict_mode_response": "Mirror SciPy accumulation behavior.",
+      "hardened_mode_response": "Abort with explicit memory-budget violation diagnostics.",
+      "required_artifact": "P2C-001/threats/dense_output_memory.report.json"
+    },
+    {
+      "threat_id": "THREAT-009",
+      "subsystem": "fsci-integrate",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "likely",
+      "description": "Default tolerance/step parameter drift between SciPy releases can silently change solver outcomes.",
+      "mitigation": "Pin strict-mode defaults to SciPy 1.17.0 and capture version envelope differences explicitly.",
+      "test_reference": "P2C-001/threats/test_tolerance_defaults_compat.json",
+      "strict_mode_response": "Use 1.17.0-compatible defaults and warning text.",
+      "hardened_mode_response": "Keep defaults but log effective tolerances and suspicious values.",
+      "required_artifact": "P2C-001/threats/defaults_compat.report.json"
+    },
+    {
+      "threat_id": "THREAT-010",
+      "subsystem": "fsci-integrate",
+      "category": "compatibility_drift",
+      "severity": "medium",
+      "likelihood": "possible",
+      "description": "Event API semantics (terminal count and direction handling) differ across SciPy versions and can alter stop behavior.",
+      "mitigation": "Implement SciPy 1.17-compatible event semantics and record deviations via compatibility envelope entries.",
+      "test_reference": "P2C-001/threats/test_event_api_compat.json",
+      "strict_mode_response": "Match terminal/direction behavior for 1.17 exactly.",
+      "hardened_mode_response": "Validate event metadata and reject unsupported combinations fail-closed.",
+      "required_artifact": "P2C-001/threats/event_api_compat.report.json"
+    }
+  ],
+  "fail_closed_policies": [
+    {
+      "input_class": "non-finite numeric inputs",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Preserve SciPy-observable behavior where required by compatibility contracts.",
+      "hardened_mode_action": "Reject input and emit deterministic NonFiniteInput diagnostics.",
+      "override_mechanism": "Explicit compatibility override with audit record in policy ledger."
+    },
+    {
+      "input_class": "unknown solver method",
+      "policy": "reject",
+      "strict_mode_action": "Return argument error matching upstream naming constraints.",
+      "hardened_mode_action": "Reject and include allowlisted methods in error payload.",
+      "override_mechanism": "No runtime override; requires explicit code-level allowlist update."
+    },
+    {
+      "input_class": "incompatible event metadata",
+      "policy": "allowlist_only",
+      "strict_mode_action": "Use SciPy-compatible fallback defaults when metadata is omitted.",
+      "hardened_mode_action": "Reject unsupported event metadata shape and log policy decision.",
+      "override_mechanism": "Feature-flagged compatibility shim with mandatory audit note."
+    },
+    {
+      "input_class": "resource budget exhaustion",
+      "policy": "reject_with_diagnostics",
+      "strict_mode_action": "Allow full SciPy-like retry budget and terminate at solver failure threshold.",
+      "hardened_mode_action": "Fail early once evaluation or memory budget limit is crossed.",
+      "override_mechanism": "Controlled budget override via runtime policy config and audit trail."
+    },
+    {
+      "input_class": "unknown compatibility envelope version",
+      "policy": "reject",
+      "strict_mode_action": "Block execution pending explicit compatibility matrix update.",
+      "hardened_mode_action": "Block execution and emit drift diagnostics artifact.",
+      "override_mechanism": "Governed compatibility approval recorded in bead and artifact ledger."
+    }
+  ]
+}

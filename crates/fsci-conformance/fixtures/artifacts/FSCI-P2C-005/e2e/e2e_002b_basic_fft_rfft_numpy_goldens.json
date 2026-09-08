@@ -1,0 +1,37 @@
+{
+  "scenario_id": "e2e_002b_basic_fft_rfft_numpy_goldens",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "fft_exact_numpy_dft",
+      "action": "fft",
+      "input_summary": "complex length-5 signal",
+      "output_summary": "max_abs_diff=1.776e-15",
+      "duration_ns": 43763,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "rfft_exact_numpy_dft",
+      "action": "rfft",
+      "input_summary": "real length-5 signal",
+      "output_summary": "max_abs_diff=4.441e-16",
+      "duration_ns": 2655,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 199438,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_fft -- e2e_002b_basic_fft_rfft_numpy_goldens --nocapture"
+  }
+}

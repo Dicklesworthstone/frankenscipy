@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_18_firwin",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "firwin_lowpass",
+      "action": "firwin(101, [0.3], hamming, pass_zero=true)",
+      "input_summary": "design 101-tap lowpass FIR",
+      "output_summary": "symmetric FIR, DC gain=1.0000, len=101",
+      "duration_ns": 59813,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "firwin_bandpass",
+      "action": "firwin(101, [0.2, 0.4], hamming, pass_zero=false)",
+      "input_summary": "design 101-tap bandpass FIR",
+      "output_summary": "bandpass FIR, DC gain=0.0008 (near zero)",
+      "duration_ns": 16481,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "firwin",
+    "signal_length": 101,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 78899,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_18_firwin --nocapture"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_22_tf2sos",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "butter_to_sos",
+      "action": "tf2sos(butter(4, 0.3))",
+      "input_summary": "convert Butterworth to SOS form",
+      "output_summary": "2 SOS sections, each properly normalized",
+      "duration_ns": 1383351,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "sos_filter_equivalence",
+      "action": "sosfilt(sos) == lfilter(b,a)",
+      "input_summary": "SOS and TF forms give same result",
+      "output_summary": "TF and SOS forms equivalent, max_diff=1.88e-14",
+      "duration_ns": 1104192,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "tf2sos",
+    "signal_length": 0,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 2491601,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_22_tf2sos --nocapture"
+  }
+}

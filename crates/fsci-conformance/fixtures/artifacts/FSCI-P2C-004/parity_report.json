@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-004",
+  "family": "sparse_ops",
+  "case_results": [
+    {
+      "case_id": "spmv_coo_identity_3x3",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "spmv_csr_general_3x3",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "spmv_csc_general_3x3",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "spmv_csr_rectangular_2x4",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "spmv_coo_empty_matrix",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "format_roundtrip_3x3",
+      "passed": true,
+      "message": "shape matched (3x3, nnz=4)"
+    },
+    {
+      "case_id": "format_roundtrip_empty",
+      "passed": true,
+      "message": "shape matched (4x5, nnz=0)"
+    },
+    {
+      "case_id": "format_roundtrip_single_element",
+      "passed": true,
+      "message": "shape matched (1x1, nnz=1)"
+    },
+    {
+      "case_id": "format_roundtrip_with_duplicates",
+      "passed": true,
+      "message": "shape matched (2x2, nnz=2)"
+    },
+    {
+      "case_id": "add_self_doubles_values",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "add_self_identity_3x3",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "add_self_shape_2x2",
+      "passed": true,
+      "message": "shape matched (2x2, nnz=2)"
+    },
+    {
+      "case_id": "add_self_vector_2x2",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "scale_by_minus_two",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "scale_by_zero",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "scale_shape_preserves_nnz",
+      "passed": true,
+      "message": "shape matched (3x3, nnz=3)"
+    },
+    {
+      "case_id": "scale_vector_2x2",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "spsolve_identity_2x2",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "spsolve_non_square_error",
+      "passed": true,
+      "message": "error matched: invalid shape: spsolve requires a square matrix"
+    },
+    {
+      "case_id": "spsolve_singular_error",
+      "passed": true,
+      "message": "error matched: singular matrix: LU factorization detected singular matrix"
+    },
+    {
+      "case_id": "spmv_csr_dimension_mismatch",
+      "passed": true,
+      "message": "error matched: incompatible shape: spmv vector length must match matrix columns"
+    },
+    {
+      "case_id": "spsolve_rhs_mismatch_error",
+      "passed": true,
+      "message": "error matched: incompatible shape: rhs length must match matrix rows"
+    },
+    {
+      "case_id": "spsolve_hardened_empty_row_error",
+      "passed": true,
+      "message": "error matched: singular matrix: detected empty structural row in hardened mode"
+    },
+    {
+      "case_id": "spsolve_tridiag_3x3",
+      "passed": true,
+      "message": "vector matched (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "spsolve_diag_3x3",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "spsolve_sparse_4x4",
+      "passed": true,
+      "message": "vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "spsolve_lower_tri_3x3",
+      "passed": true,
+      "message": "vector matched (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "spsolve_hardened_nan_data_rejected",
+      "passed": true,
+      "message": "error matched: non-finite input: matrix/rhs contains NaN or Inf"
+    },
+    {
+      "case_id": "spsolve_hardened_inf_rhs_rejected",
+      "passed": true,
+      "message": "error matched: non-finite input: matrix/rhs contains NaN or Inf"
+    },
+    {
+      "case_id": "eigsh_diag_4x4_top2",
+      "passed": true,
+      "message": "eigenvalues matched (2 values, abs-sorted)"
+    },
+    {
+      "case_id": "svds_5x4_top2",
+      "passed": true,
+      "message": "eigenvalues matched (2 values, abs-sorted)"
+    },
+    {
+      "case_id": "eigsh_diag_5x5_top3",
+      "passed": true,
+      "message": "eigenvalues matched (3 values, abs-sorted)"
+    },
+    {
+      "case_id": "svds_3x3_top1",
+      "passed": true,
+      "message": "eigenvalues matched (1 values, abs-sorted)"
+    },
+    {
+      "case_id": "eigs_uppertri_4x4_top2",
+      "passed": true,
+      "message": "eigenvalues matched (2 values, abs-sorted)"
+    },
+    {
+      "case_id": "eigsh_diag_6x6_top2",
+      "passed": true,
+      "message": "eigenvalues matched (2 values, abs-sorted)"
+    },
+    {
+      "case_id": "eigsh_tridiag_4x4_top2",
+      "passed": true,
+      "message": "eigenvalues matched (2 values, abs-sorted)"
+    }
+  ],
+  "passed_cases": 36,
+  "failed_cases": 0,
+  "generated_unix_ms": 1777873167013
+}

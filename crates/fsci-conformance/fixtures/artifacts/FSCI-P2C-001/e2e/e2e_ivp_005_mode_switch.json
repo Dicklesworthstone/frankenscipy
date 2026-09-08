@@ -1,0 +1,67 @@
+{
+  "scenario_id": "e2e_ivp_005_mode_switch",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "strict_validate",
+      "action": "validate",
+      "input_summary": "mode=Strict, rtol=1e-4",
+      "output_summary": "ok, mode=Strict",
+      "duration_ns": 6793,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "hardened_validate",
+      "action": "validate",
+      "input_summary": "mode=Hardened, rtol=1e-4",
+      "output_summary": "ok, mode=Hardened",
+      "duration_ns": 1312,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "strict_solve",
+      "action": "solve",
+      "input_summary": "mode=Strict, exponential decay",
+      "output_summary": "nfev=25",
+      "duration_ns": 47891,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "hardened_solve",
+      "action": "solve",
+      "input_summary": "mode=Hardened, exponential decay",
+      "output_summary": "nfev=25",
+      "duration_ns": 23275,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 5,
+      "step_name": "compare_modes",
+      "action": "check",
+      "input_summary": "strict vs hardened final y",
+      "output_summary": "diff=0.00e0, strict=1.35498699e-1, hardened=1.35498699e-1",
+      "duration_ns": 1293,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 154833,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_005_mode_switch --nocapture"
+  }
+}

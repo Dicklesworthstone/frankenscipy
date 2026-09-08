@@ -1,0 +1,583 @@
+{
+  "packet_id": "FSCI-P2C-007",
+  "family": "array_api_core",
+  "generated_unix_ms": 1788666502028,
+  "runtime": {
+    "python_version": "3.13.12",
+    "numpy_version": "2.4.3",
+    "scipy_version": "1.17.1"
+  },
+  "provenance": {
+    "fixture_input_blake3": "5de39d89c2d75b99f8af33e0f3c8b4828649b0b3677bea7abe00fb5559445b8e",
+    "oracle_output_blake3": "249d614059b39ae7162a3a1545e887e7c4cdbb0442104d73a6e9523453c2e1f0",
+    "capture_blake3": "870656e375e34d8843c3ee8ab00611918c9bbed0fd43ae0564d50f0694acb38f"
+  },
+  "case_outputs": [
+    {
+      "case_id": "diff_zeros_scalar_f64",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 0.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_zeros_2x2_f32",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float32",
+        "shape": [
+          2,
+          2
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 0.0
+          },
+          {
+            "kind": "f64",
+            "value": 0.0
+          },
+          {
+            "kind": "f64",
+            "value": 0.0
+          },
+          {
+            "kind": "f64",
+            "value": 0.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_ones_len3_f32",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float32",
+        "shape": [
+          3
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 1.0
+          },
+          {
+            "kind": "f64",
+            "value": 1.0
+          },
+          {
+            "kind": "f64",
+            "value": 1.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_full_complex128",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "complex128",
+        "shape": [
+          2
+        ],
+        "values": [
+          {
+            "im": -2.0,
+            "kind": "complex_f64",
+            "re": 1.5
+          },
+          {
+            "im": -2.0,
+            "kind": "complex_f64",
+            "re": 1.5
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_arange_ascending",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [
+          5
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 0.0
+          },
+          {
+            "kind": "f64",
+            "value": 1.0
+          },
+          {
+            "kind": "f64",
+            "value": 2.0
+          },
+          {
+            "kind": "f64",
+            "value": 3.0
+          },
+          {
+            "kind": "f64",
+            "value": 4.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_arange_descending",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [
+          3
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 5.0
+          },
+          {
+            "kind": "f64",
+            "value": 3.0
+          },
+          {
+            "kind": "f64",
+            "value": 1.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_linspace_endpoint_true",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [
+          5
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 0.0
+          },
+          {
+            "kind": "f64",
+            "value": 0.25
+          },
+          {
+            "kind": "f64",
+            "value": 0.5
+          },
+          {
+            "kind": "f64",
+            "value": 0.75
+          },
+          {
+            "kind": "f64",
+            "value": 1.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_linspace_endpoint_false",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [
+          4
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 0.0
+          },
+          {
+            "kind": "f64",
+            "value": 0.25
+          },
+          {
+            "kind": "f64",
+            "value": 0.5
+          },
+          {
+            "kind": "f64",
+            "value": 0.75
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_broadcast_shapes_basic",
+      "status": "ok",
+      "result_kind": "shape",
+      "result": {
+        "dims": [
+          2,
+          3
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_result_type_complex_promotion",
+      "status": "ok",
+      "result_kind": "dtype",
+      "result": {
+        "dtype": "complex64"
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_from_slice_matrix",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [
+          2,
+          2
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 1.0
+          },
+          {
+            "kind": "f64",
+            "value": 2.0
+          },
+          {
+            "kind": "f64",
+            "value": 3.0
+          },
+          {
+            "kind": "f64",
+            "value": 4.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_getitem_basic_slice",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [
+          2
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 20.0
+          },
+          {
+            "kind": "f64",
+            "value": 30.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_getitem_advanced_negative",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [
+          2
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 40.0
+          },
+          {
+            "kind": "f64",
+            "value": 10.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_reshape_2x3_to_3x2",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [
+          3,
+          2
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 1.0
+          },
+          {
+            "kind": "f64",
+            "value": 2.0
+          },
+          {
+            "kind": "f64",
+            "value": 3.0
+          },
+          {
+            "kind": "f64",
+            "value": 4.0
+          },
+          {
+            "kind": "f64",
+            "value": 5.0
+          },
+          {
+            "kind": "f64",
+            "value": 6.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "diff_transpose_2x3",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "dtype": "float64",
+        "shape": [
+          3,
+          2
+        ],
+        "values": [
+          {
+            "kind": "f64",
+            "value": 1.0
+          },
+          {
+            "kind": "f64",
+            "value": 4.0
+          },
+          {
+            "kind": "f64",
+            "value": 2.0
+          },
+          {
+            "kind": "f64",
+            "value": 5.0
+          },
+          {
+            "kind": "f64",
+            "value": 3.0
+          },
+          {
+            "kind": "f64",
+            "value": 6.0
+          }
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "meta_broadcast_commutative_dense",
+      "status": "ok",
+      "result_kind": "bool",
+      "result": {
+        "value": true
+      },
+      "error": null
+    },
+    {
+      "case_id": "meta_broadcast_commutative_zero_dim",
+      "status": "ok",
+      "result_kind": "bool",
+      "result": {
+        "value": true
+      },
+      "error": null
+    },
+    {
+      "case_id": "meta_result_type_symmetry_f32_c64",
+      "status": "ok",
+      "result_kind": "bool",
+      "result": {
+        "value": true
+      },
+      "error": null
+    },
+    {
+      "case_id": "meta_result_type_symmetry_f64_c128",
+      "status": "ok",
+      "result_kind": "bool",
+      "result": {
+        "value": true
+      },
+      "error": null
+    },
+    {
+      "case_id": "meta_index_roundtrip_mid",
+      "status": "ok",
+      "result_kind": "bool",
+      "result": {
+        "value": true
+      },
+      "error": null
+    },
+    {
+      "case_id": "meta_index_roundtrip_negative",
+      "status": "ok",
+      "result_kind": "bool",
+      "result": {
+        "value": true
+      },
+      "error": null
+    },
+    {
+      "case_id": "adv_arange_zero_step_i64",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidStep"
+      },
+      "error": null
+    },
+    {
+      "case_id": "adv_arange_zero_step_complex",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidStep"
+      },
+      "error": null
+    },
+    {
+      "case_id": "adv_result_type_integral_without_force",
+      "status": "ok",
+      "result_kind": "dtype",
+      "result": {
+        "dtype": "int64"
+      },
+      "error": null
+    },
+    {
+      "case_id": "adv_from_slice_len_mismatch",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidShape"
+      },
+      "error": null
+    },
+    {
+      "case_id": "adv_getitem_mode_mismatch",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidIndex"
+      },
+      "error": null
+    },
+    {
+      "case_id": "adv_reshape_size_mismatch",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidShape"
+      },
+      "error": null
+    },
+    {
+      "case_id": "adv_transpose_rank1",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidShape"
+      },
+      "error": null
+    },
+    {
+      "case_id": "adv_broadcast_incompatible",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "BroadcastIncompatible"
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_arange_zero_step_i64",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidStep"
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_from_slice_len_mismatch",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidShape"
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_getitem_mode_mismatch",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidIndex"
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_reshape_size_mismatch",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "InvalidShape"
+      },
+      "error": null
+    },
+    {
+      "case_id": "hardened_broadcast_incompatible",
+      "status": "ok",
+      "result_kind": "error_kind",
+      "result": {
+        "error": "BroadcastIncompatible"
+      },
+      "error": null
+    }
+  ]
+}

@@ -1,0 +1,62 @@
+{
+  "scenario_id": "scenario_23_lfiltic",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "lfiltic_reference_vector",
+      "action": "lfiltic(b, a, y_hist, x_hist)",
+      "input_summary": "SciPy reference vector with a[0] != 1",
+      "output_summary": "zi=[0.4249999999999998, -1.775]",
+      "duration_ns": 14879,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "lfiltic_restore_state",
+      "action": "lfiltic(history) -> zi",
+      "input_summary": "recover final Direct Form II transposed state from prior I/O",
+      "output_summary": "restored zi=[0.241796875, 4.112734375]",
+      "duration_ns": 3076,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "lfiltic_continuation_matches_reference",
+      "action": "lfilter(b, a, x_future, zi=lfiltic(...))",
+      "input_summary": "continued filtering should match SciPy tail output",
+      "output_summary": "continued output=[0.466796875, 4.3043359375, -2.73736328125, -5.147822265625001]",
+      "duration_ns": 6612,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "lfiltic_invalid_a0",
+      "action": "lfiltic(b, a=[0,...], y, x)",
+      "input_summary": "zero leading denominator coefficient should fail closed",
+      "output_summary": "invalid parameter: First `a` filter coefficient must be non-zero.",
+      "duration_ns": 17773,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "lfiltic",
+    "signal_length": 10,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 47790,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_23_lfiltic --nocapture"
+  }
+}

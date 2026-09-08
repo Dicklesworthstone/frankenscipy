@@ -1,0 +1,40 @@
+{
+  "packet_id": "FSCI-P2C-004",
+  "operation_summaries": [
+    {
+      "operation": "spmv_csr",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "operation": "format_conversion",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "operation": "add_csr",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "operation": "scale_csr",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "operation": "diags",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    }
+  ]
+}

@@ -1,0 +1,1011 @@
+{
+  "schema_version": 2,
+  "packet_id": "FSCI-P2C-003",
+  "family": "optimize_core",
+  "case_results": [
+    {
+      "case_id": "diff_rosenbrock_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.66e-11, fun_diff=7.18e-23, success=true)"
+    },
+    {
+      "case_id": "diff_rosenbrock_cg",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.24e-8, fun_diff=3.82e-17, success=true)"
+    },
+    {
+      "case_id": "diff_rosenbrock_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.69e-5, fun_diff=9.02e-8, success=true)"
+    },
+    {
+      "case_id": "diff_ackley_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=8.98e-17, fun_diff=0.00e0, success=true)"
+    },
+    {
+      "case_id": "diff_ackley_cg",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.92e-4, fun_diff=7.71e-4, success=false)"
+    },
+    {
+      "case_id": "diff_ackley_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=9.59e-6, fun_diff=3.84e-5, success=true)"
+    },
+    {
+      "case_id": "diff_rastrigin_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.11e-16, fun_diff=0.00e0, success=true)"
+    },
+    {
+      "case_id": "diff_rastrigin_cg",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.05e-9, fun_diff=0.00e0, success=false)"
+    },
+    {
+      "case_id": "diff_rastrigin_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=9.59e-6, fun_diff=3.65e-8, success=true)"
+    },
+    {
+      "case_id": "diff_shifted_quadratic_trust_exact",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.89e-12, fun_diff=1.35e-23, success=true)"
+    },
+    {
+      "case_id": "diff_translated_quadratic_trust_exact",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.54e-12, fun_diff=3.19e-24, success=true)"
+    },
+    {
+      "case_id": "diff_scaled_quadratic_newton_cg_hessp",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.22e-16, fun_diff=1.97e-30, success=true)"
+    },
+    {
+      "case_id": "diff_rosenbrock_differential_evolution_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.02e-5, fun_diff=4.12e-9, success=true)"
+    },
+    {
+      "case_id": "diff_rastrigin_dual_annealing_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=6.48e-11, fun_diff=0.00e0, success=true)"
+    },
+    {
+      "case_id": "diff_himmelblau_basinhopping_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.42e-14, fun_diff=1.41e-26, success=true)"
+    },
+    {
+      "case_id": "diff_ackley_differential_evolution_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=3.80e-9, fun_diff=1.35e-8, success=true)"
+    },
+    {
+      "case_id": "diff_sin1d_brute_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)"
+    },
+    {
+      "case_id": "diff_sphere_differential_evolution_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.01e-5, fun_diff=1.04e-10, success=true)"
+    },
+    {
+      "case_id": "diff_shifted_quadratic_differential_evolution_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=3.10e-5, fun_diff=1.76e-9, success=true)"
+    },
+    {
+      "case_id": "diff_sphere_basinhopping_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=6.52e-19, fun_diff=6.63e-37, success=true)"
+    },
+    {
+      "case_id": "diff_sphere_brute_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)"
+    },
+    {
+      "case_id": "diff_shifted_quadratic_brute_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)"
+    },
+    {
+      "case_id": "diff_root_brentq_cubic",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_brenth_cubic",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_bisect_cubic",
+      "passed": true,
+      "message": "root matched (diff=2.11e-11, converged=true)"
+    },
+    {
+      "case_id": "diff_root_ridder_cubic",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_brentq_cos",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_brentq_sin",
+      "passed": true,
+      "message": "root matched (diff=1.18e-12, converged=true)"
+    },
+    {
+      "case_id": "meta_scaling_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=9.16e-13, fun_diff=3.76e-23, success=true)"
+    },
+    {
+      "case_id": "meta_scaling_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.53e-5, fun_diff=1.01e-8, success=true)"
+    },
+    {
+      "case_id": "meta_translation_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=8.57e-11, fun_diff=1.93e-20, success=true)"
+    },
+    {
+      "case_id": "meta_translation_cg",
+      "passed": true,
+      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)"
+    },
+    {
+      "case_id": "meta_rotation_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=7.41e-12, fun_diff=7.70e-23, success=true)"
+    },
+    {
+      "case_id": "meta_rotation_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.47e-5, fun_diff=1.57e-9, success=true)"
+    },
+    {
+      "case_id": "adv_minimize_empty_x0",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "adv_root_invalid_xtol",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "adv_minimize_nan_hardened",
+      "passed": true,
+      "message": "minimize status matched"
+    },
+    {
+      "case_id": "adv_minimize_maxfev",
+      "passed": true,
+      "message": "minimize status matched"
+    },
+    {
+      "case_id": "adv_root_sign_change_violation",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "adv_root_nan_strict",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "adv_root_nan_hardened",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "adv_root_maxiter_budget",
+      "passed": true,
+      "message": "root status matched"
+    },
+    {
+      "case_id": "diff_root_toms748_cubic",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_toms748_cos_minus_x",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_toms748_sin_minus_half",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_toms748_linear",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_ridder_cos_minus_x",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_ridder_sin_minus_half",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_brenth_cos_minus_x",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)"
+    },
+    {
+      "case_id": "diff_root_brenth_sin_minus_half",
+      "passed": true,
+      "message": "root matched (diff=1.18e-12, converged=true)"
+    },
+    {
+      "case_id": "br_7470_de_rosenbrock_linear_x0_plus_x1_eq_1",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.05e-5, fun_diff=3.78e-10, success=true)"
+    },
+    {
+      "case_id": "br_7470_de_rastrigin_nonlinear_unit_disk",
+      "passed": true,
+      "message": "minimize matched (x_diff=3.26e-7, fun_diff=2.90e-11, success=true)"
+    },
+    {
+      "case_id": "br_7470_de_sphere_box_only",
+      "passed": true,
+      "message": "minimize matched (x_diff=5.59e-6, fun_diff=4.05e-11, success=true)"
+    },
+    {
+      "case_id": "br_7470_de_sphere_linear_sum_ge_2",
+      "passed": true,
+      "message": "minimize matched (x_diff=3.97e-3, fun_diff=1.19e-2, success=true)"
+    }
+  ],
+  "passed_cases": 54,
+  "failed_cases": 0,
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-003_optimize_core.json",
+  "oracle_status": {
+    "status": "available"
+  },
+  "differential_case_results": [
+    {
+      "case_id": "diff_rosenbrock_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.66e-11, fun_diff=7.18e-23, success=true)",
+      "max_diff": 1.65868430102023e-11,
+      "tolerance_used": {
+        "atol": 0.005,
+        "rtol": 0.005,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_rosenbrock_cg",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.24e-8, fun_diff=3.82e-17, success=true)",
+      "max_diff": 1.237275437659946e-8,
+      "tolerance_used": {
+        "atol": 0.01,
+        "rtol": 0.01,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_rosenbrock_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.69e-5, fun_diff=9.02e-8, success=true)",
+      "max_diff": 0.000016941320126528936,
+      "tolerance_used": {
+        "atol": 0.02,
+        "rtol": 0.02,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_ackley_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=8.98e-17, fun_diff=0.00e0, success=true)",
+      "max_diff": 8.983462031989659e-17,
+      "tolerance_used": {
+        "atol": 0.1,
+        "rtol": 0.1,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_ackley_cg",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.92e-4, fun_diff=7.71e-4, success=false)",
+      "max_diff": 0.0007708638233019371,
+      "tolerance_used": {
+        "atol": 0.12,
+        "rtol": 0.12,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_ackley_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=9.59e-6, fun_diff=3.84e-5, success=true)",
+      "max_diff": 0.00003836940558699098,
+      "tolerance_used": {
+        "atol": 0.12,
+        "rtol": 0.12,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_rastrigin_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.11e-16, fun_diff=0.00e0, success=true)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 0.05,
+        "rtol": 0.05,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_rastrigin_cg",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.05e-9, fun_diff=0.00e0, success=false)",
+      "max_diff": 1.0473085196080316e-9,
+      "tolerance_used": {
+        "atol": 0.15,
+        "rtol": 0.15,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_rastrigin_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=9.59e-6, fun_diff=3.65e-8, success=true)",
+      "max_diff": 9.591126628556243e-6,
+      "tolerance_used": {
+        "atol": 0.15,
+        "rtol": 0.15,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_shifted_quadratic_trust_exact",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.89e-12, fun_diff=1.35e-23, success=true)",
+      "max_diff": 2.894795514407633e-12,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 1e-6,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_translated_quadratic_trust_exact",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.54e-12, fun_diff=3.19e-24, success=true)",
+      "max_diff": 1.5361045768713666e-12,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 1e-6,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_scaled_quadratic_newton_cg_hessp",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.22e-16, fun_diff=1.97e-30, success=true)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_rosenbrock_differential_evolution_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.02e-5, fun_diff=4.12e-9, success=true)",
+      "max_diff": 0.000020153358284646927,
+      "tolerance_used": {
+        "atol": 0.25,
+        "rtol": 0.25,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_rastrigin_dual_annealing_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=6.48e-11, fun_diff=0.00e0, success=true)",
+      "max_diff": 6.47770990725556e-11,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 1e-6,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_himmelblau_basinhopping_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.42e-14, fun_diff=1.41e-26, success=true)",
+      "max_diff": 1.4210854715202004e-14,
+      "tolerance_used": {
+        "atol": 0.01,
+        "rtol": 0.01,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_ackley_differential_evolution_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=3.80e-9, fun_diff=1.35e-8, success=true)",
+      "max_diff": 1.3466433301800862e-8,
+      "tolerance_used": {
+        "atol": 0.2,
+        "rtol": 0.2,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_sin1d_brute_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_sphere_differential_evolution_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.01e-5, fun_diff=1.04e-10, success=true)",
+      "max_diff": 0.000010099983614730828,
+      "tolerance_used": {
+        "atol": 0.25,
+        "rtol": 0.25,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_shifted_quadratic_differential_evolution_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=3.10e-5, fun_diff=1.76e-9, success=true)",
+      "max_diff": 0.00003096271789948535,
+      "tolerance_used": {
+        "atol": 0.25,
+        "rtol": 0.25,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_sphere_basinhopping_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=6.52e-19, fun_diff=6.63e-37, success=true)",
+      "max_diff": 6.515461802702559e-19,
+      "tolerance_used": {
+        "atol": 0.001,
+        "rtol": 0.001,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_sphere_brute_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_shifted_quadratic_brute_seeded",
+      "passed": true,
+      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-12,
+        "rtol": 1e-12,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_brentq_cubic",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_brenth_cubic",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_bisect_cubic",
+      "passed": true,
+      "message": "root matched (diff=2.11e-11, converged=true)",
+      "max_diff": 2.1062929178583545e-11,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 1e-6,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_ridder_cubic",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-6,
+        "rtol": 1e-6,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_brentq_cos",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_brentq_sin",
+      "passed": true,
+      "message": "root matched (diff=1.18e-12, converged=true)",
+      "max_diff": 1.1847189895775045e-12,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "meta_scaling_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=9.16e-13, fun_diff=3.76e-23, success=true)",
+      "max_diff": 9.161560399206792e-13,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "meta_scaling_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.53e-5, fun_diff=1.01e-8, success=true)",
+      "max_diff": 0.000025250612175398146,
+      "tolerance_used": {
+        "atol": 0.001,
+        "rtol": 0.001,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "meta_translation_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=8.57e-11, fun_diff=1.93e-20, success=true)",
+      "max_diff": 8.574785326231904e-11,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "meta_translation_cg",
+      "passed": true,
+      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 0.001,
+        "rtol": 0.001,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "meta_rotation_bfgs",
+      "passed": true,
+      "message": "minimize matched (x_diff=7.41e-12, fun_diff=7.70e-23, success=true)",
+      "max_diff": 7.41162686779262e-12,
+      "tolerance_used": {
+        "atol": 0.0001,
+        "rtol": 0.0001,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "meta_rotation_powell",
+      "passed": true,
+      "message": "minimize matched (x_diff=2.47e-5, fun_diff=1.57e-9, success=true)",
+      "max_diff": 0.000024727025983883877,
+      "tolerance_used": {
+        "atol": 0.001,
+        "rtol": 0.001,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adv_minimize_empty_x0",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adv_root_invalid_xtol",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adv_minimize_nan_hardened",
+      "passed": true,
+      "message": "minimize status matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adv_minimize_maxfev",
+      "passed": true,
+      "message": "minimize status matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adv_root_sign_change_violation",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adv_root_nan_strict",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adv_root_nan_hardened",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "adv_root_maxiter_budget",
+      "passed": true,
+      "message": "root status matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_toms748_cubic",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_toms748_cos_minus_x",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_toms748_sin_minus_half",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_toms748_linear",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_ridder_cos_minus_x",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_ridder_sin_minus_half",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_brenth_cos_minus_x",
+      "passed": true,
+      "message": "root matched (diff=0.00e0, converged=true)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_root_brenth_sin_minus_half",
+      "passed": true,
+      "message": "root matched (diff=1.18e-12, converged=true)",
+      "max_diff": 1.1847189895775045e-12,
+      "tolerance_used": {
+        "atol": 1e-8,
+        "rtol": 1e-8,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_7470_de_rosenbrock_linear_x0_plus_x1_eq_1",
+      "passed": true,
+      "message": "minimize matched (x_diff=1.05e-5, fun_diff=3.78e-10, success=true)",
+      "max_diff": 0.00001052082476227234,
+      "tolerance_used": {
+        "atol": 0.1,
+        "rtol": 0.1,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_7470_de_rastrigin_nonlinear_unit_disk",
+      "passed": true,
+      "message": "minimize matched (x_diff=3.26e-7, fun_diff=2.90e-11, success=true)",
+      "max_diff": 3.258732062428105e-7,
+      "tolerance_used": {
+        "atol": 0.1,
+        "rtol": 0.5,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_7470_de_sphere_box_only",
+      "passed": true,
+      "message": "minimize matched (x_diff=5.59e-6, fun_diff=4.05e-11, success=true)",
+      "max_diff": 5.588712301744231e-6,
+      "tolerance_used": {
+        "atol": 0.05,
+        "rtol": 0.05,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "br_7470_de_sphere_linear_sum_ge_2",
+      "passed": true,
+      "message": "minimize matched (x_diff=3.97e-3, fun_diff=1.19e-2, success=true)",
+      "max_diff": 0.011874050146052362,
+      "tolerance_used": {
+        "atol": 0.2,
+        "rtol": 0.2,
+        "comparison_mode": "mixed"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ],
+  "report_kind": "oracle_backed",
+  "generated_unix_ms": 1788666501949
+}

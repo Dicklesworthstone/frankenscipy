@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_11_pdist_cdist_consistency",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "pdist_vs_cdist_same_set",
+      "action": "pdist(X) vs cdist(X, X)",
+      "input_summary": "should give same distances",
+      "output_summary": "pdist and cdist upper triangle match",
+      "duration_ns": 29926,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "squareform_vs_cdist",
+      "action": "squareform(pdist(X)) vs cdist(X, X)",
+      "input_summary": "full matrix comparison",
+      "output_summary": "squareform(pdist) == cdist",
+      "duration_ns": 19927,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "spatial_metadata": {
+    "operation": "consistency",
+    "n_points": 10,
+    "n_dims": 3,
+    "metric": "euclidean"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 165102,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_spatial -- scenario_11_pdist_cdist_consistency --nocapture"
+  }
+}

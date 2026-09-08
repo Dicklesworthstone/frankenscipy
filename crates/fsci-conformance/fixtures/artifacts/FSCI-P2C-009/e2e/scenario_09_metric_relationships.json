@@ -1,0 +1,33 @@
+{
+  "scenario_id": "scenario_09_metric_relationships",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "vmeasure_harmonic_mean",
+      "action": "verify V = 2*h*c/(h+c)",
+      "input_summary": "V-measure formula",
+      "output_summary": "h=0.5695, c=0.5737, v=0.5716=expected",
+      "duration_ns": 130347,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "metrics",
+    "n_samples": 40,
+    "n_features": 2,
+    "n_clusters": 4
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 170753,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_09_metric_relationships --nocapture"
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "scenario_id": "e2e_sparse_008_single",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "roundtrip_1x1",
+      "action": "convert",
+      "input_summary": "1x1 matrix val=7",
+      "output_summary": "pass=true",
+      "duration_ns": 18525,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "spmv_1x1",
+      "action": "spmv_csr",
+      "input_summary": "7 * [2] = [14]",
+      "output_summary": "result=14, pass=true",
+      "duration_ns": 2214,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 197194,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_008_single --nocapture"
+  }
+}

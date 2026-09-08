@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_003_fft2_filter",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "generate_2d_signal",
+      "action": "create",
+      "input_summary": "8x8 spatial signal",
+      "output_summary": "len=64",
+      "duration_ns": 7604,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "fft2",
+      "action": "transform",
+      "input_summary": "shape=(8,8)",
+      "output_summary": "spectrum len=64",
+      "duration_ns": 18696,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "ifft2_roundtrip",
+      "action": "inverse_transform+verify",
+      "input_summary": "diff=2.2204e-16",
+      "output_summary": "pass=true",
+      "duration_ns": 9639,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 242470,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_fft -- e2e_003_fft2_filter --nocapture"
+  }
+}

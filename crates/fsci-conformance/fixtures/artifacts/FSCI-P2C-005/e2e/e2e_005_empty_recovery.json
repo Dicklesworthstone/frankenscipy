@@ -1,0 +1,37 @@
+{
+  "scenario_id": "e2e_005_empty_recovery",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "submit_empty",
+      "action": "fft",
+      "input_summary": "empty input",
+      "output_summary": "got_invalid_shape=true",
+      "duration_ns": 1253,
+      "mode": "strict",
+      "outcome": "expected_error"
+    },
+    {
+      "step_id": 2,
+      "step_name": "retry_with_data",
+      "action": "fft",
+      "input_summary": "valid input n=8",
+      "output_summary": "success=true",
+      "duration_ns": 10209,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 98947,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_fft -- e2e_005_empty_recovery --nocapture"
+  }
+}

@@ -1,0 +1,130 @@
+{
+  "test_id": "metamorphic_stats_multivariate_normal_rvs",
+  "case_count": 20,
+  "pass_count": 20,
+  "pass": true,
+  "timestamp_ms": 1780784158561,
+  "duration_ns": 103553607,
+  "cases": [
+    {
+      "case_id": "d1_standard",
+      "invariant": "shape_n_by_d",
+      "detail": "rows=50000, expected_n=50000, all_cols_eq_d=true",
+      "pass": true
+    },
+    {
+      "case_id": "d1_standard",
+      "invariant": "deterministic_under_fixed_seed",
+      "detail": "first_eq_second=true; first[0][0]=-1.1714803610082185",
+      "pass": true
+    },
+    {
+      "case_id": "d1_standard",
+      "invariant": "sample_mean_lln_converges",
+      "detail": "max |m̂ - μ| = 0.0018680218432998977",
+      "pass": true
+    },
+    {
+      "case_id": "d1_standard",
+      "invariant": "sample_cov_lln_converges",
+      "detail": "max |Σ̂ - Σ| = 0.0028083865724350954",
+      "pass": true
+    },
+    {
+      "case_id": "d1_standard",
+      "invariant": "first_row_dimension",
+      "detail": "first row has 1 entries, expected 1",
+      "pass": true
+    },
+    {
+      "case_id": "d2_identity",
+      "invariant": "shape_n_by_d",
+      "detail": "rows=50000, expected_n=50000, all_cols_eq_d=true",
+      "pass": true
+    },
+    {
+      "case_id": "d2_identity",
+      "invariant": "deterministic_under_fixed_seed",
+      "detail": "first_eq_second=true; first[0][0]=-0.28897703352782367",
+      "pass": true
+    },
+    {
+      "case_id": "d2_identity",
+      "invariant": "sample_mean_lln_converges",
+      "detail": "max |m̂ - μ| = 0.002578267502146847",
+      "pass": true
+    },
+    {
+      "case_id": "d2_identity",
+      "invariant": "sample_cov_lln_converges",
+      "detail": "max |Σ̂ - Σ| = 0.01262720669308448",
+      "pass": true
+    },
+    {
+      "case_id": "d2_identity",
+      "invariant": "first_row_dimension",
+      "detail": "first row has 2 entries, expected 2",
+      "pass": true
+    },
+    {
+      "case_id": "d2_correlated",
+      "invariant": "shape_n_by_d",
+      "detail": "rows=50000, expected_n=50000, all_cols_eq_d=true",
+      "pass": true
+    },
+    {
+      "case_id": "d2_correlated",
+      "invariant": "deterministic_under_fixed_seed",
+      "detail": "first_eq_second=true; first[0][0]=5.591221354813375",
+      "pass": true
+    },
+    {
+      "case_id": "d2_correlated",
+      "invariant": "sample_mean_lln_converges",
+      "detail": "max |m̂ - μ| = 0.007003263152280503",
+      "pass": true
+    },
+    {
+      "case_id": "d2_correlated",
+      "invariant": "sample_cov_lln_converges",
+      "detail": "max |Σ̂ - Σ| = 0.009600301378263731",
+      "pass": true
+    },
+    {
+      "case_id": "d2_correlated",
+      "invariant": "first_row_dimension",
+      "detail": "first row has 2 entries, expected 2",
+      "pass": true
+    },
+    {
+      "case_id": "d3_mild_corr",
+      "invariant": "shape_n_by_d",
+      "detail": "rows=50000, expected_n=50000, all_cols_eq_d=true",
+      "pass": true
+    },
+    {
+      "case_id": "d3_mild_corr",
+      "invariant": "deterministic_under_fixed_seed",
+      "detail": "first_eq_second=true; first[0][0]=-0.5588401871078407",
+      "pass": true
+    },
+    {
+      "case_id": "d3_mild_corr",
+      "invariant": "sample_mean_lln_converges",
+      "detail": "max |m̂ - μ| = 0.004026016529639838",
+      "pass": true
+    },
+    {
+      "case_id": "d3_mild_corr",
+      "invariant": "sample_cov_lln_converges",
+      "detail": "max |Σ̂ - Σ| = 0.007982656543866068",
+      "pass": true
+    },
+    {
+      "case_id": "d3_mild_corr",
+      "invariant": "first_row_dimension",
+      "detail": "first row has 3 entries, expected 3",
+      "pass": true
+    }
+  ]
+}

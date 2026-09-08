@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_04_regular_grid_2d",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_regular_grid",
+      "action": "RegularGridInterpolator::new(points, values, Linear)",
+      "input_summary": "3x3 grid, f(x,y)=x+y",
+      "output_summary": "created 2D regular grid interpolator",
+      "duration_ns": 9949,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "eval_center",
+      "action": "interp.eval([1.0, 1.0])",
+      "input_summary": "center of grid",
+      "output_summary": "result=2",
+      "duration_ns": 7083,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "eval_interior",
+      "action": "interp.eval([0.5, 0.5])",
+      "input_summary": "interior point",
+      "output_summary": "result=1",
+      "duration_ns": 2074,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "RegularGridInterpolator-Linear",
+    "num_points": 9,
+    "dimensions": 2,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 29937,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_04_regular_grid_2d --nocapture"
+  }
+}

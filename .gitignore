@@ -50,6 +50,9 @@ target_*/
 
 # Conformance test output artifacts (generated per-run)
 crates/fsci-conformance/fixtures/artifacts/*
+!crates/fsci-conformance/fixtures/artifacts/FSCI-P2C-*/
+crates/fsci-conformance/fixtures/artifacts/FSCI-P2C-*/e2e/runs/
+crates/fsci-conformance/fixtures/artifacts/FSCI-P2C-*/diff/
 !crates/fsci-conformance/fixtures/artifacts/P2C-001/
 crates/fsci-conformance/fixtures/artifacts/P2C-001/*
 !crates/fsci-conformance/fixtures/artifacts/P2C-001/perf/

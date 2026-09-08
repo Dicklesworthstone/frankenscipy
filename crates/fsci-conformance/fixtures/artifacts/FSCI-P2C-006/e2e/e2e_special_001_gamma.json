@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_special_001_gamma",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "gamma_1",
+      "action": "gamma",
+      "input_summary": "x=1.0",
+      "output_summary": "result=1, expected=1.0",
+      "duration_ns": 6592,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "gamma_5",
+      "action": "gamma",
+      "input_summary": "x=5.0",
+      "output_summary": "result=23.99999999999996, expected=24.0",
+      "duration_ns": 1644,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "gamma_half",
+      "action": "gamma",
+      "input_summary": "x=0.5",
+      "output_summary": "result=1.772454, expected=1.772454",
+      "duration_ns": 1833,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "gammaln_5",
+      "action": "gammaln",
+      "input_summary": "x=5.0",
+      "output_summary": "result=3.178054, expected=3.178054",
+      "duration_ns": 1493,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 134364,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_special -- e2e_special_001_gamma --nocapture"
+  }
+}

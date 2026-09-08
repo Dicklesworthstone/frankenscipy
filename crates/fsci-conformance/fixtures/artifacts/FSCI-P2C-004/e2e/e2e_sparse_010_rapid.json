@@ -1,0 +1,27 @@
+{
+  "scenario_id": "e2e_sparse_010_rapid",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "rapid_spmv",
+      "action": "spmv+verify",
+      "input_summary": "50 iterations, sizes 3-7",
+      "output_summary": "all_pass=true",
+      "duration_ns": 363359,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 501070,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_010_rapid --nocapture"
+  }
+}

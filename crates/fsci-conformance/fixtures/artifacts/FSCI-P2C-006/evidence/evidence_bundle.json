@@ -1,0 +1,411 @@
+{
+  "manifest": {
+    "packet_id": "FSCI-P2C-006",
+    "generated_at": "unix:1779662447",
+    "fixtures": [
+      {
+        "fixture_id": "gamma_known",
+        "function": "gamma",
+        "input_range": "x in {0.5, 1, 2, 5}",
+        "expected_properties": [
+          "Γ(1)=1",
+          "Γ(n)=(n-1)!",
+          "Γ(0.5)=√π"
+        ]
+      },
+      {
+        "fixture_id": "erf_erfc_complement",
+        "function": "erf+erfc",
+        "input_range": "x in [0, 3]",
+        "expected_properties": [
+          "erf(x)+erfc(x)=1"
+        ]
+      },
+      {
+        "fixture_id": "erfinv_roundtrip",
+        "function": "erfinv",
+        "input_range": "x in (-1, 1)",
+        "expected_properties": [
+          "erf(erfinv(x))=x"
+        ]
+      },
+      {
+        "fixture_id": "gammainc_complement",
+        "function": "gammainc+gammaincc",
+        "input_range": "a,x > 0",
+        "expected_properties": [
+          "P(a,x)+Q(a,x)=1"
+        ]
+      },
+      {
+        "fixture_id": "beta_gamma_relation",
+        "function": "beta",
+        "input_range": "a,b > 0",
+        "expected_properties": [
+          "B(a,b)=Γ(a)Γ(b)/Γ(a+b)"
+        ]
+      },
+      {
+        "fixture_id": "bessel_boundary",
+        "function": "j0,j1,y0",
+        "input_range": "x=0 and x=1",
+        "expected_properties": [
+          "J0(0)=1",
+          "J1(0)=0"
+        ]
+      },
+      {
+        "fixture_id": "gamma_rgamma_inverse",
+        "function": "gamma*rgamma",
+        "input_range": "x in {1,2,3,5,10}",
+        "expected_properties": [
+          "Γ(x)·(1/Γ(x))=1"
+        ]
+      }
+    ]
+  },
+  "parity_gates": {
+    "packet_id": "FSCI-P2C-006",
+    "all_gates_pass": true,
+    "gates": [
+      {
+        "fixture_id": "gamma_1",
+        "operation": "gamma",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "gamma(1)=1.000000e0, expected=1.000000e0"
+      },
+      {
+        "fixture_id": "gamma_2",
+        "operation": "gamma",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "gamma(2)=1.000000e0, expected=1.000000e0"
+      },
+      {
+        "fixture_id": "gamma_5",
+        "operation": "gamma",
+        "pass": true,
+        "max_abs_diff": 3.907985046680551e-14,
+        "tolerance_used": 1e-10,
+        "note": "gamma(5)=2.400000e1, expected=2.400000e1"
+      },
+      {
+        "fixture_id": "gamma_half",
+        "operation": "gamma",
+        "pass": true,
+        "max_abs_diff": 6.661338147750939e-16,
+        "tolerance_used": 1e-10,
+        "note": "gamma(0.5)=1.772454e0, expected=1.772454e0"
+      },
+      {
+        "fixture_id": "erf_erfc_x0",
+        "operation": "erf_erfc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "erf(0)+erfc(0)=1.000000e0"
+      },
+      {
+        "fixture_id": "erf_erfc_x0.5",
+        "operation": "erf_erfc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "erf(0.5)+erfc(0.5)=1.000000e0"
+      },
+      {
+        "fixture_id": "erf_erfc_x1",
+        "operation": "erf_erfc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "erf(1)+erfc(1)=1.000000e0"
+      },
+      {
+        "fixture_id": "erf_erfc_x1.5",
+        "operation": "erf_erfc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "erf(1.5)+erfc(1.5)=1.000000e0"
+      },
+      {
+        "fixture_id": "erf_erfc_x2",
+        "operation": "erf_erfc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "erf(2)+erfc(2)=1.000000e0"
+      },
+      {
+        "fixture_id": "erf_erfc_x3",
+        "operation": "erf_erfc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-12,
+        "note": "erf(3)+erfc(3)=1.000000e0"
+      },
+      {
+        "fixture_id": "erfinv_rt_x-0.9",
+        "operation": "erfinv",
+        "pass": true,
+        "max_abs_diff": 1.1102230246251565e-16,
+        "tolerance_used": 1e-10,
+        "note": "erf(erfinv(-0.9))=-9.000000e-1"
+      },
+      {
+        "fixture_id": "erfinv_rt_x-0.5",
+        "operation": "erfinv",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "erf(erfinv(-0.5))=-5.000000e-1"
+      },
+      {
+        "fixture_id": "erfinv_rt_x0",
+        "operation": "erfinv",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "erf(erfinv(0))=0.000000e0"
+      },
+      {
+        "fixture_id": "erfinv_rt_x0.5",
+        "operation": "erfinv",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "erf(erfinv(0.5))=5.000000e-1"
+      },
+      {
+        "fixture_id": "erfinv_rt_x0.9",
+        "operation": "erfinv",
+        "pass": true,
+        "max_abs_diff": 1.1102230246251565e-16,
+        "tolerance_used": 1e-10,
+        "note": "erf(erfinv(0.9))=9.000000e-1"
+      },
+      {
+        "fixture_id": "gammainc_a1_x1",
+        "operation": "gammainc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "P(1,1)+Q(1,1)=1.000000e0"
+      },
+      {
+        "fixture_id": "gammainc_a2_x2",
+        "operation": "gammainc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "P(2,2)+Q(2,2)=1.000000e0"
+      },
+      {
+        "fixture_id": "gammainc_a3_x2",
+        "operation": "gammainc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "P(3,2)+Q(3,2)=1.000000e0"
+      },
+      {
+        "fixture_id": "gammainc_a5_x5",
+        "operation": "gammainc",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "P(5,5)+Q(5,5)=1.000000e0"
+      },
+      {
+        "fixture_id": "beta_gamma_a1_b1",
+        "operation": "beta",
+        "pass": true,
+        "max_abs_diff": 1.7763568394002505e-15,
+        "tolerance_used": 1e-10,
+        "note": "B(1,1)=1.000000e0, Γ(a)Γ(b)/Γ(a+b)=1.000000e0"
+      },
+      {
+        "fixture_id": "beta_gamma_a2_b3",
+        "operation": "beta",
+        "pass": true,
+        "max_abs_diff": 1.6653345369377309e-16,
+        "tolerance_used": 1e-10,
+        "note": "B(2,3)=8.333333e-2, Γ(a)Γ(b)/Γ(a+b)=8.333333e-2"
+      },
+      {
+        "fixture_id": "beta_gamma_a0.5_b0.5",
+        "operation": "beta",
+        "pass": true,
+        "max_abs_diff": 7.067899292141145e-16,
+        "tolerance_used": 1e-10,
+        "note": "B(0.5,0.5)=3.141593e0, Γ(a)Γ(b)/Γ(a+b)=3.141593e0"
+      },
+      {
+        "fixture_id": "j0_zero",
+        "operation": "bessel",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-8,
+        "note": "j0(0)=1.000000e0"
+      },
+      {
+        "fixture_id": "j1_zero",
+        "operation": "bessel",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-8,
+        "note": "j1(0)=0.000000e0"
+      },
+      {
+        "fixture_id": "y0_one",
+        "operation": "bessel",
+        "pass": true,
+        "max_abs_diff": 1.5677001363734178e-11,
+        "tolerance_used": 0.0001,
+        "note": "y0(1)=8.825696e-2"
+      },
+      {
+        "fixture_id": "gamma_rgamma_x1",
+        "operation": "rgamma",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "gamma(1)*rgamma(1)=1.000000e0"
+      },
+      {
+        "fixture_id": "gamma_rgamma_x2",
+        "operation": "rgamma",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "gamma(2)*rgamma(2)=1.000000e0"
+      },
+      {
+        "fixture_id": "gamma_rgamma_x3",
+        "operation": "rgamma",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "gamma(3)*rgamma(3)=1.000000e0"
+      },
+      {
+        "fixture_id": "gamma_rgamma_x5",
+        "operation": "rgamma",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "gamma(5)*rgamma(5)=1.000000e0"
+      },
+      {
+        "fixture_id": "gamma_rgamma_x10",
+        "operation": "rgamma",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "note": "gamma(10)*rgamma(10)=1.000000e0"
+      }
+    ]
+  },
+  "risk_notes": {
+    "packet_id": "FSCI-P2C-006",
+    "notes": [
+      {
+        "category": "pole_handling",
+        "description": "Gamma function has poles at non-positive integers. Strict mode returns NaN; Hardened mode returns error.",
+        "affected_operations": [
+          "gamma",
+          "gammaln",
+          "rgamma"
+        ],
+        "mitigation": "Domain validation in Hardened mode. Strict mode NaN propagation matches SciPy behavior."
+      },
+      {
+        "category": "bessel_rational_approximation",
+        "description": "J0/J1 use rational polynomial approximation (Numerical Recipes). Accuracy is ~1e-8 near x=0 due to coefficient precision limits.",
+        "affected_operations": [
+          "j0",
+          "j1",
+          "jn"
+        ],
+        "mitigation": "Tolerances set to 1e-8 for bessel boundary checks. Higher-precision coefficients can be substituted."
+      },
+      {
+        "category": "erfinv_domain",
+        "description": "erfinv is only defined on (-1, 1). Values at ±1 produce ±Inf, values outside produce NaN in Strict mode.",
+        "affected_operations": [
+          "erfinv",
+          "erfcinv"
+        ],
+        "mitigation": "Hardened mode rejects out-of-domain inputs. E2E tests cover boundary and out-of-domain cases."
+      },
+      {
+        "category": "gammainc_convergence",
+        "description": "Incomplete gamma uses series/continued fraction expansion. Convergence can be slow for large a or x.",
+        "affected_operations": [
+          "gammainc",
+          "gammaincc"
+        ],
+        "mitigation": "Complement identity P+Q=1 verified in parity gates. Series truncation monitored by iteration count."
+      }
+    ]
+  },
+  "parity_report": {
+    "packet_id": "FSCI-P2C-006",
+    "operation_summaries": [
+      {
+        "operation": "gamma",
+        "total_fixtures": 4,
+        "passed": 4,
+        "failed": 0,
+        "max_abs_diff_across_all": 3.907985046680551e-14
+      },
+      {
+        "operation": "erf_erfc",
+        "total_fixtures": 6,
+        "passed": 6,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "operation": "erfinv",
+        "total_fixtures": 5,
+        "passed": 5,
+        "failed": 0,
+        "max_abs_diff_across_all": 1.1102230246251565e-16
+      },
+      {
+        "operation": "gammainc",
+        "total_fixtures": 4,
+        "passed": 4,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "operation": "beta",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 1.7763568394002505e-15
+      },
+      {
+        "operation": "bessel",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 1.5677001363734178e-11
+      },
+      {
+        "operation": "rgamma",
+        "total_fixtures": 5,
+        "passed": 5,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      }
+    ]
+  },
+  "sidecar": null
+}

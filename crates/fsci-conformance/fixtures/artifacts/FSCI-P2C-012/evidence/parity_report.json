@@ -1,0 +1,159 @@
+{
+  "packet_id": "FSCI-P2C-012",
+  "operation_summaries": [
+    {
+      "function": "bootstrap_mean",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 5.551115123125783e-17
+    },
+    {
+      "function": "describe",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 2.220446049250313e-16
+    },
+    {
+      "function": "distribution_cdf",
+      "total_fixtures": 11,
+      "passed": 11,
+      "failed": 0,
+      "max_abs_diff_across_all": 8.881784197001252e-16
+    },
+    {
+      "function": "distribution_pdf",
+      "total_fixtures": 11,
+      "passed": 11,
+      "failed": 0,
+      "max_abs_diff_across_all": 3.9968028886505635e-15
+    },
+    {
+      "function": "distribution_ppf",
+      "total_fixtures": 4,
+      "passed": 4,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.7763568394002505e-15
+    },
+    {
+      "function": "entropy",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "function": "iqr",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "function": "kendalltau",
+      "total_fixtures": 4,
+      "passed": 4,
+      "failed": 0,
+      "max_abs_diff_across_all": 2.220446049250313e-16
+    },
+    {
+      "function": "ks_2samp",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 2.7755575615628914e-17
+    },
+    {
+      "function": "kurtosis",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.7763568394002505e-15
+    },
+    {
+      "function": "linregress",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 2.456368441983159e-15
+    },
+    {
+      "function": "mannwhitneyu",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 9.71445146547012e-17
+    },
+    {
+      "function": "moment",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "function": "pearsonr",
+      "total_fixtures": 5,
+      "passed": 5,
+      "failed": 0,
+      "max_abs_diff_across_all": 2.220446049250313e-16
+    },
+    {
+      "function": "sem",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.1102230246251565e-16
+    },
+    {
+      "function": "shapiro",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.1102230246251565e-16
+    },
+    {
+      "function": "skew",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "function": "spearmanr",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.4042654220543602e-24
+    },
+    {
+      "function": "ttest_1samp",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.8318679906315083e-15
+    },
+    {
+      "function": "ttest_ind",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 4.163336342344337e-17
+    },
+    {
+      "function": "variation",
+      "total_fixtures": 2,
+      "passed": 2,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.3877787807814457e-17
+    },
+    {
+      "function": "zscore",
+      "total_fixtures": 1,
+      "passed": 1,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    }
+  ]
+}

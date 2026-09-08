@@ -1,0 +1,151 @@
+{
+  "packet_id": "FSCI-P2C-015",
+  "family": "ndimage_core",
+  "generated_unix_ms": 1788666502122,
+  "runtime": {
+    "python_version": "3.13.12",
+    "numpy_version": "2.4.3",
+    "scipy_version": "1.17.1"
+  },
+  "provenance": {
+    "fixture_input_blake3": "4f72d49b23aec2bd2fab848592846e1c57aba4e1060f8043eb1280f8e5c0dded",
+    "oracle_output_blake3": "e9de8b0e276ce6cda68b4f85a4e35234fa4b00c35411ef82770a72c2fb31d1fa",
+    "capture_blake3": "c60d369aec9e674117f02bedd7e6b0a06c6729eed1b24c9c6f4fbcd69b924ea3"
+  },
+  "case_outputs": [
+    {
+      "case_id": "gaussian_filter_constant_reflect_preserves_signal",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "shape": [
+          3
+        ],
+        "values": [
+          2.0,
+          2.0,
+          2.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "gaussian_filter_non_positive_sigma_rejects",
+      "status": "ok",
+      "result_kind": "error",
+      "result": {
+        "error": "sigma must be positive"
+      },
+      "error": null
+    },
+    {
+      "case_id": "label_two_face_connected_components_2d",
+      "status": "ok",
+      "result_kind": "label",
+      "result": {
+        "labels": [
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          2.0,
+          2.0,
+          0.0,
+          0.0,
+          2.0
+        ],
+        "num_features": 2,
+        "shape": [
+          3,
+          3
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "binary_erosion_square_shrinks_to_center",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "shape": [
+          5,
+          5
+        ],
+        "values": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "binary_dilation_center_pixel_expands_to_square",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "shape": [
+          3,
+          3
+        ],
+        "values": [
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "distance_transform_center_background_2d",
+      "status": "ok",
+      "result_kind": "array",
+      "result": {
+        "shape": [
+          3,
+          3
+        ],
+        "values": [
+          1.4142135623730951,
+          1.0,
+          1.4142135623730951,
+          1.0,
+          0.0,
+          1.0,
+          1.4142135623730951,
+          1.0,
+          1.4142135623730951
+        ]
+      },
+      "error": null
+    }
+  ]
+}

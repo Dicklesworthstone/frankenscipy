@@ -1,0 +1,33 @@
+{
+  "scenario_id": "scenario_10_elbow_property",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "elbow_monotonic",
+      "action": "inertia decreases as k increases",
+      "input_summary": "k=2,3,4,5",
+      "output_summary": "inertias=[9978.085275, 3991.278, 1995.675574999999, 0.07314999999999977]",
+      "duration_ns": 1167371,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "kmeans",
+    "n_samples": 100,
+    "n_features": 2,
+    "n_clusters": 5
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 1186337,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_10_elbow_property --nocapture"
+  }
+}

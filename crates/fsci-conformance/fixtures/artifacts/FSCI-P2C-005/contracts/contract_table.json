@@ -1,0 +1,134 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-005",
+  "domain": "fft",
+  "generated_at": "2026-03-13T05:15:00Z",
+  "contracts": [
+    {
+      "function_name": "fsci_fft::fft",
+      "scipy_equivalent": "scipy.fft.fft",
+      "inputs": [
+        {
+          "name": "input",
+          "type_desc": "&[Complex64]",
+          "required": true,
+          "constraints": "Non-empty. All elements must be finite when check_finite is enabled."
+        },
+        {
+          "name": "options",
+          "type_desc": "&FftOptions",
+          "required": true,
+          "constraints": "Controls normalization (Forward/Backward/Ortho), mode (Strict/Hardened), and backend."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Vec<Complex64>",
+          "semantics": "DFT of input. Length equals input length."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "input is empty",
+          "error_type": "InvalidShape",
+          "message_pattern": "input length must be greater than zero",
+          "scipy_behavior": "ValueError"
+        },
+        {
+          "condition": "input contains NaN/Inf with check_finite",
+          "error_type": "NonFiniteInput",
+          "message_pattern": "non-finite input",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "absolute",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-8
+      },
+      "strict_mode_behavior": "Check finiteness only when check_finite is explicitly set.",
+      "hardened_mode_behavior": "Always check finiteness regardless of check_finite flag."
+    },
+    {
+      "function_name": "fsci_fft::rfft",
+      "scipy_equivalent": "scipy.fft.rfft",
+      "inputs": [
+        {
+          "name": "input",
+          "type_desc": "&[f64]",
+          "required": true,
+          "constraints": "Non-empty real array."
+        },
+        {
+          "name": "options",
+          "type_desc": "&FftOptions",
+          "required": true,
+          "constraints": "Same as fft."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Vec<Complex64>",
+          "semantics": "Positive-frequency DFT coefficients. Length = n/2 + 1."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "input is empty",
+          "error_type": "InvalidShape",
+          "message_pattern": "input length must be greater than zero",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "absolute",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-8
+      },
+      "strict_mode_behavior": "Standard finite checking behavior.",
+      "hardened_mode_behavior": "Always enforce finite checking."
+    },
+    {
+      "function_name": "fsci_fft::fftfreq",
+      "scipy_equivalent": "scipy.fft.fftfreq",
+      "inputs": [
+        {
+          "name": "n",
+          "type_desc": "usize",
+          "required": true,
+          "constraints": "Window length for frequency computation."
+        },
+        {
+          "name": "sample_spacing",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Must be finite and > 0."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Vec<f64>",
+          "semantics": "Sample frequencies in cycles per unit of sample spacing."
+        }
+      ],
+      "error_conditions": [
+        {
+          "condition": "sample_spacing <= 0 or non-finite",
+          "error_type": "NonPositiveSampleSpacing",
+          "message_pattern": "sample spacing must be finite and greater than zero",
+          "scipy_behavior": "ValueError"
+        }
+      ],
+      "tolerance_policy": {
+        "comparison_mode": "absolute",
+        "default_atol": 1e-15,
+        "default_rtol": 1e-15
+      },
+      "strict_mode_behavior": "Standard validation.",
+      "hardened_mode_behavior": "Same validation; arithmetic is exact for this function."
+    }
+  ]
+}

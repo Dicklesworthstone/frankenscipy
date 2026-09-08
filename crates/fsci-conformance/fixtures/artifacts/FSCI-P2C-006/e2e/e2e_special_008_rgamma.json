@@ -1,0 +1,67 @@
+{
+  "scenario_id": "e2e_special_008_rgamma",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "gamma_rgamma_x0.5",
+      "action": "gamma*rgamma",
+      "input_summary": "x=0.5",
+      "output_summary": "product=1.000000, pass=true",
+      "duration_ns": 5139,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "gamma_rgamma_x1",
+      "action": "gamma*rgamma",
+      "input_summary": "x=1",
+      "output_summary": "product=1.000000, pass=true",
+      "duration_ns": 1623,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "gamma_rgamma_x2.5",
+      "action": "gamma*rgamma",
+      "input_summary": "x=2.5",
+      "output_summary": "product=1.000000, pass=true",
+      "duration_ns": 1664,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "gamma_rgamma_x4",
+      "action": "gamma*rgamma",
+      "input_summary": "x=4",
+      "output_summary": "product=1.000000, pass=true",
+      "duration_ns": 1142,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 5,
+      "step_name": "gamma_rgamma_x7.5",
+      "action": "gamma*rgamma",
+      "input_summary": "x=7.5",
+      "output_summary": "product=1.000000, pass=true",
+      "duration_ns": 1102,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 163370,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_special -- e2e_special_008_rgamma --nocapture"
+  }
+}

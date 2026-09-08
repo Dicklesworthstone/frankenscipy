@@ -1,0 +1,40 @@
+{
+  "packet_id": "FSCI-P2C-012",
+  "notes": [
+    {
+      "category": "finite_sample_definition_drift",
+      "description": "Descriptive statistics and correlation helpers depend on exact sample-size conventions, divisor choices, and bias flags. Small implementation changes can silently shift results while still looking numerically plausible.",
+      "affected_operations": [
+        "describe",
+        "skew",
+        "kurtosis",
+        "sem",
+        "variation"
+      ],
+      "mitigation": "Keep fixture-derived parity gates at the function level and preserve explicit per-case tolerances instead of collapsing everything to a single suite-wide threshold."
+    },
+    {
+      "category": "distribution_free_test_sensitivity",
+      "description": "Rank-based and goodness-of-fit tests are sensitive to sample ordering, ties, and tail behavior. Regressions often appear first in p-values rather than headline statistics.",
+      "affected_operations": [
+        "ks_2samp",
+        "shapiro",
+        "ttest_1samp",
+        "pearsonr",
+        "spearmanr"
+      ],
+      "mitigation": "Track both statistic and p-value parity in the evidence bundle and keep edge-case fixtures for tied, monotone, and boundary-distribution samples."
+    },
+    {
+      "category": "normalization_and_entropy_guards",
+      "description": "Utilities like z-score normalization and entropy can degrade under degenerate or nearly degenerate inputs, producing NaNs or masking divide-by-zero behavior.",
+      "affected_operations": [
+        "zscore",
+        "entropy",
+        "moment",
+        "iqr"
+      ],
+      "mitigation": "Retain differential fixtures that cover narrow spreads and probability-style inputs, and fail the evidence pack if any previously finite path starts emitting non-finite outputs."
+    }
+  ]
+}

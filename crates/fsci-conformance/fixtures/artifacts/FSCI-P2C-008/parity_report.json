@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-008",
+  "family": "runtime_casp",
+  "case_results": [
+    {
+      "case_id": "policy_low_risk_strict",
+      "passed": true,
+      "message": "policy action matched: allow"
+    },
+    {
+      "case_id": "policy_high_metadata_strict",
+      "passed": true,
+      "message": "policy action matched: fail_closed"
+    },
+    {
+      "case_id": "policy_high_metadata_hardened",
+      "passed": true,
+      "message": "policy action matched: fail_closed"
+    },
+    {
+      "case_id": "policy_moderate_condition_strict",
+      "passed": true,
+      "message": "policy action matched: full_validate"
+    },
+    {
+      "case_id": "policy_high_anomaly_strict",
+      "passed": true,
+      "message": "policy action matched: full_validate"
+    },
+    {
+      "case_id": "policy_all_bad_signals_strict",
+      "passed": true,
+      "message": "policy action matched: fail_closed"
+    },
+    {
+      "case_id": "solver_well_conditioned",
+      "passed": true,
+      "message": "solver action matched: direct_lu"
+    },
+    {
+      "case_id": "solver_moderate_condition",
+      "passed": true,
+      "message": "solver action matched: pivoted_qr"
+    },
+    {
+      "case_id": "solver_ill_conditioned",
+      "passed": true,
+      "message": "solver action matched: svd_fallback"
+    },
+    {
+      "case_id": "solver_near_singular",
+      "passed": true,
+      "message": "solver action matched: svd_fallback"
+    },
+    {
+      "case_id": "solver_well_conditioned_hardened",
+      "passed": true,
+      "message": "solver action matched: direct_lu"
+    },
+    {
+      "case_id": "calibrator_no_observations",
+      "passed": true,
+      "message": "calibrator fallback matched: false"
+    },
+    {
+      "case_id": "calibrator_all_good",
+      "passed": true,
+      "message": "calibrator fallback matched: false"
+    },
+    {
+      "case_id": "calibrator_high_violations",
+      "passed": true,
+      "message": "calibrator fallback matched: true"
+    },
+    {
+      "case_id": "calibrator_few_observations",
+      "passed": true,
+      "message": "calibrator fallback matched: false"
+    }
+  ],
+  "passed_cases": 15,
+  "failed_cases": 0,
+  "generated_unix_ms": 1777873167003
+}

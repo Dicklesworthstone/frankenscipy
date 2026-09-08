@@ -1,0 +1,353 @@
+{
+  "generated_at": "unix:1779662466",
+  "operation_benchmarks": [
+    {
+      "operation": "coo_to_csr",
+      "matrix_desc": "100x100_d5",
+      "matrix_n": 100,
+      "nnz": 500,
+      "iterations": 20,
+      "median_ns": 72187,
+      "p95_ns": 91002,
+      "min_ns": 71446,
+      "max_ns": 91002,
+      "mean_ns": 76281
+    },
+    {
+      "operation": "coo_to_csr",
+      "matrix_desc": "1000x1000_d1",
+      "matrix_n": 1000,
+      "nnz": 10000,
+      "iterations": 20,
+      "median_ns": 1444337,
+      "p95_ns": 1540930,
+      "min_ns": 1146251,
+      "max_ns": 1540930,
+      "mean_ns": 1439623
+    },
+    {
+      "operation": "coo_to_csr",
+      "matrix_desc": "10000x10000_d01",
+      "matrix_n": 10000,
+      "nnz": 100000,
+      "iterations": 20,
+      "median_ns": 11968515,
+      "p95_ns": 20799305,
+      "min_ns": 11317301,
+      "max_ns": 20799305,
+      "mean_ns": 12789136
+    },
+    {
+      "operation": "spmv_csr",
+      "matrix_desc": "100x100_d5",
+      "matrix_n": 100,
+      "nnz": 500,
+      "iterations": 20,
+      "median_ns": 6913,
+      "p95_ns": 7705,
+      "min_ns": 6883,
+      "max_ns": 7705,
+      "mean_ns": 6964
+    },
+    {
+      "operation": "spmv_csr",
+      "matrix_desc": "1000x1000_d1",
+      "matrix_n": 1000,
+      "nnz": 10000,
+      "iterations": 20,
+      "median_ns": 126199,
+      "p95_ns": 136589,
+      "min_ns": 125939,
+      "max_ns": 136589,
+      "mean_ns": 128323
+    },
+    {
+      "operation": "spmv_csr",
+      "matrix_desc": "10000x10000_d01",
+      "matrix_n": 10000,
+      "nnz": 100000,
+      "iterations": 20,
+      "median_ns": 1349206,
+      "p95_ns": 1617895,
+      "min_ns": 1276939,
+      "max_ns": 1617895,
+      "mean_ns": 1344020
+    },
+    {
+      "operation": "csr_to_csc",
+      "matrix_desc": "100x100_d5",
+      "matrix_n": 100,
+      "nnz": 500,
+      "iterations": 20,
+      "median_ns": 211481,
+      "p95_ns": 235607,
+      "min_ns": 210368,
+      "max_ns": 235607,
+      "mean_ns": 214170
+    },
+    {
+      "operation": "csr_to_csc",
+      "matrix_desc": "1000x1000_d1",
+      "matrix_n": 1000,
+      "nnz": 10000,
+      "iterations": 20,
+      "median_ns": 5731779,
+      "p95_ns": 5831427,
+      "min_ns": 5708084,
+      "max_ns": 5831427,
+      "mean_ns": 5751997
+    },
+    {
+      "operation": "csr_to_csc",
+      "matrix_desc": "10000x10000_d01",
+      "matrix_n": 10000,
+      "nnz": 100000,
+      "iterations": 20,
+      "median_ns": 70366501,
+      "p95_ns": 80887063,
+      "min_ns": 67117957,
+      "max_ns": 80887063,
+      "mean_ns": 70780685
+    },
+    {
+      "operation": "add_csr",
+      "matrix_desc": "100x100_d5",
+      "matrix_n": 100,
+      "nnz": 1000,
+      "iterations": 20,
+      "median_ns": 552327,
+      "p95_ns": 591180,
+      "min_ns": 545664,
+      "max_ns": 591180,
+      "mean_ns": 552342
+    },
+    {
+      "operation": "add_csr",
+      "matrix_desc": "1000x1000_d1",
+      "matrix_n": 1000,
+      "nnz": 20000,
+      "iterations": 20,
+      "median_ns": 14820668,
+      "p95_ns": 20164702,
+      "min_ns": 13883493,
+      "max_ns": 20164702,
+      "mean_ns": 15563235
+    },
+    {
+      "operation": "add_csr",
+      "matrix_desc": "10000x10000_d01",
+      "matrix_n": 10000,
+      "nnz": 200000,
+      "iterations": 20,
+      "median_ns": 174581659,
+      "p95_ns": 187486619,
+      "min_ns": 164401924,
+      "max_ns": 187486619,
+      "mean_ns": 174103886
+    },
+    {
+      "operation": "scale_csr",
+      "matrix_desc": "100x100_d5",
+      "matrix_n": 100,
+      "nnz": 500,
+      "iterations": 20,
+      "median_ns": 11422,
+      "p95_ns": 11502,
+      "min_ns": 11402,
+      "max_ns": 11502,
+      "mean_ns": 11432
+    },
+    {
+      "operation": "scale_csr",
+      "matrix_desc": "1000x1000_d1",
+      "matrix_n": 1000,
+      "nnz": 10000,
+      "iterations": 20,
+      "median_ns": 191834,
+      "p95_ns": 202744,
+      "min_ns": 191684,
+      "max_ns": 202744,
+      "mean_ns": 193703
+    },
+    {
+      "operation": "scale_csr",
+      "matrix_desc": "10000x10000_d01",
+      "matrix_n": 10000,
+      "nnz": 100000,
+      "iterations": 20,
+      "median_ns": 1944213,
+      "p95_ns": 2036869,
+      "min_ns": 1939074,
+      "max_ns": 2036869,
+      "mean_ns": 1948686
+    },
+    {
+      "operation": "eye",
+      "matrix_desc": "100x100",
+      "matrix_n": 100,
+      "nnz": 100,
+      "iterations": 20,
+      "median_ns": 17082,
+      "p95_ns": 17423,
+      "min_ns": 16952,
+      "max_ns": 17423,
+      "mean_ns": 17091
+    },
+    {
+      "operation": "eye",
+      "matrix_desc": "1000x1000",
+      "matrix_n": 1000,
+      "nnz": 1000,
+      "iterations": 20,
+      "median_ns": 166185,
+      "p95_ns": 179059,
+      "min_ns": 165003,
+      "max_ns": 179059,
+      "mean_ns": 168062
+    },
+    {
+      "operation": "eye",
+      "matrix_desc": "10000x10000",
+      "matrix_n": 10000,
+      "nnz": 10000,
+      "iterations": 20,
+      "median_ns": 1692045,
+      "p95_ns": 1967127,
+      "min_ns": 1669984,
+      "max_ns": 1967127,
+      "mean_ns": 1705307
+    },
+    {
+      "operation": "diags_tridiag",
+      "matrix_desc": "100x100",
+      "matrix_n": 100,
+      "nnz": 298,
+      "iterations": 20,
+      "median_ns": 133533,
+      "p95_ns": 142089,
+      "min_ns": 126490,
+      "max_ns": 142089,
+      "mean_ns": 133924
+    },
+    {
+      "operation": "diags_tridiag",
+      "matrix_desc": "1000x1000",
+      "matrix_n": 1000,
+      "nnz": 2998,
+      "iterations": 20,
+      "median_ns": 1687607,
+      "p95_ns": 1772428,
+      "min_ns": 1673190,
+      "max_ns": 1772428,
+      "mean_ns": 1703694
+    },
+    {
+      "operation": "diags_tridiag",
+      "matrix_desc": "10000x10000",
+      "matrix_n": 10000,
+      "nnz": 29998,
+      "iterations": 20,
+      "median_ns": 22005670,
+      "p95_ns": 27117455,
+      "min_ns": 20832969,
+      "max_ns": 27117455,
+      "mean_ns": 22024089
+    }
+  ],
+  "hotspot_ranking": [
+    {
+      "rank": 1,
+      "operation": "add_csr",
+      "matrix_desc": "10000x10000_d01",
+      "median_ns": 174581659,
+      "fraction_of_total": 0.6149237656228047
+    },
+    {
+      "rank": 2,
+      "operation": "csr_to_csc",
+      "matrix_desc": "10000x10000_d01",
+      "median_ns": 70366501,
+      "fraction_of_total": 0.24784982578622908
+    },
+    {
+      "rank": 3,
+      "operation": "diags_tridiag",
+      "matrix_desc": "10000x10000",
+      "median_ns": 22005670,
+      "fraction_of_total": 0.07750991449481405
+    },
+    {
+      "rank": 4,
+      "operation": "coo_to_csr",
+      "matrix_desc": "10000x10000_d01",
+      "median_ns": 11968515,
+      "fraction_of_total": 0.042156343082482804
+    },
+    {
+      "rank": 5,
+      "operation": "scale_csr",
+      "matrix_desc": "10000x10000_d01",
+      "median_ns": 1944213,
+      "fraction_of_total": 0.006848043408344573
+    },
+    {
+      "rank": 6,
+      "operation": "eye",
+      "matrix_desc": "10000x10000",
+      "median_ns": 1692045,
+      "fraction_of_total": 0.005959839590041005
+    },
+    {
+      "rank": 7,
+      "operation": "spmv_csr",
+      "matrix_desc": "10000x10000_d01",
+      "median_ns": 1349206,
+      "fraction_of_total": 0.004752268015283792
+    }
+  ],
+  "memory_notes": [
+    {
+      "operation": "spmv_csr",
+      "matrix_size": "10000x10000_d01",
+      "estimated_input_bytes": 1680000,
+      "notes": "CSR: ~10k nnz × (8B data + 8B index) + 10k indptr. Vector: 80KB."
+    },
+    {
+      "operation": "csr_to_csc",
+      "matrix_size": "10000x10000_d01",
+      "estimated_input_bytes": 1600000,
+      "notes": "Transpose allocates new indptr/indices/data arrays of same nnz."
+    },
+    {
+      "operation": "add_csr",
+      "matrix_size": "10000x10000_d01",
+      "estimated_input_bytes": 3200000,
+      "notes": "Two CSR inputs. Output nnz <= sum of input nnz."
+    }
+  ],
+  "isomorphism_check": {
+    "all_operations_pass": true,
+    "details": [
+      {
+        "operation": "spmv_identity",
+        "passes": true,
+        "note": "max_err=0.00e0"
+      },
+      {
+        "operation": "format_roundtrip",
+        "passes": true,
+        "note": "spmv_diff=0.00e0"
+      },
+      {
+        "operation": "add_zero_identity",
+        "passes": true,
+        "note": "max_err=0.00e0"
+      },
+      {
+        "operation": "scale_identity",
+        "passes": true,
+        "note": "max_err=0.00e0"
+      }
+    ]
+  }
+}

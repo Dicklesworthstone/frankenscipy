@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_casp_002_policy_ill_cond",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "high_cond_decision",
+      "action": "decide",
+      "input_summary": "cond=16.0, meta=0.0, anom=0.0",
+      "output_summary": "action=FullValidate, top_state=Compatible",
+      "duration_ns": 13566,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "high_meta_decision",
+      "action": "decide",
+      "input_summary": "cond=0.0, meta=1.0, anom=0.0",
+      "output_summary": "action=FailClosed, top_state=IncompatibleMetadata, posterior=[0.1229222542571761, 0.05523252917233068, 0.8218452165704931]",
+      "duration_ns": 4398,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "all_high_decision",
+      "action": "decide",
+      "input_summary": "cond=16.0, meta=1.0, anom=1.0",
+      "output_summary": "action=FailClosed, reason=mode=Strict; top_state=IncompatibleMetadata; p=0.800240; cond_log10=16.000; metadata=1.000; anomaly=1.000",
+      "duration_ns": 3186,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 114267,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_002_policy_ill_cond --nocapture"
+  }
+}

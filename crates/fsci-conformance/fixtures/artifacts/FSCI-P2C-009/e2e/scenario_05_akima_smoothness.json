@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_05_akima_smoothness",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_akima",
+      "action": "Akima1DInterpolator::new(x, y)",
+      "input_summary": "Runge function data",
+      "output_summary": "created Akima interpolator",
+      "duration_ns": 12153,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "eval_no_overshoot",
+      "action": "verify no wild oscillations",
+      "input_summary": "check values stay bounded",
+      "output_summary": "range=[0.038, 1.000]",
+      "duration_ns": 19577,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "Akima",
+    "num_points": 10,
+    "dimensions": 1,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 38723,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_05_akima_smoothness --nocapture"
+  }
+}

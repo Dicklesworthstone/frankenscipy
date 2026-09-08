@@ -1,0 +1,52 @@
+{
+  "scenario_id": "scenario_02_convolution_modes",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "convolve_full",
+      "action": "convolve(signal, kernel, full)",
+      "input_summary": "5-element signal, 3-element kernel",
+      "output_summary": "len=7, correct values",
+      "duration_ns": 13266,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "convolve_same",
+      "action": "convolve(signal, kernel, same)",
+      "input_summary": "same mode - output length = input length",
+      "output_summary": "len=5",
+      "duration_ns": 4749,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "convolve_valid",
+      "action": "convolve(signal, kernel, valid)",
+      "input_summary": "valid mode - no boundary effects",
+      "output_summary": "len=3, correct values",
+      "duration_ns": 2785,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "convolve",
+    "signal_length": 10,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 33063,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_02_convolution_modes --nocapture"
+  }
+}

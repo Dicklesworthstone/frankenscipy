@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_sparse_005_mode_switch",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "build_unsorted",
+      "action": "from_components",
+      "input_summary": "2x3 unsorted CSR",
+      "output_summary": "sorted=false",
+      "duration_ns": 5981,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "hardened_convert",
+      "action": "csr_to_csc",
+      "input_summary": "hardened mode, unsorted input",
+      "output_summary": "error=true",
+      "duration_ns": 1142,
+      "mode": "strict",
+      "outcome": "expected_error"
+    },
+    {
+      "step_id": 3,
+      "step_name": "strict_convert",
+      "action": "csr_to_csc",
+      "input_summary": "strict mode, same unsorted input",
+      "output_summary": "success=true, nnz=3",
+      "duration_ns": 18515,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 149723,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_005_mode_switch --nocapture"
+  }
+}

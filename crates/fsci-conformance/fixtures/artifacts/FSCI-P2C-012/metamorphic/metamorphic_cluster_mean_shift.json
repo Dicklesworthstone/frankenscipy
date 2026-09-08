@@ -1,0 +1,148 @@
+{
+  "test_id": "metamorphic_cluster_mean_shift",
+  "case_count": 23,
+  "pass_count": 23,
+  "pass": true,
+  "timestamp_ms": 1779662452423,
+  "duration_ns": 2196060,
+  "cases": [
+    {
+      "case_id": "single_cluster_n12",
+      "invariant": "labels_len_eq_n",
+      "detail": "labels.len()=12, n=12",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_n12",
+      "invariant": "labels_in_centers_range",
+      "detail": "centers=1, max_label=0",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_n12",
+      "invariant": "centers_nonempty",
+      "detail": "centers.len()=1",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_n12",
+      "invariant": "centers_dim_eq_input",
+      "detail": "input_d=2, all_centers_d=true",
+      "pass": true
+    },
+    {
+      "case_id": "single_cluster_n12",
+      "invariant": "deterministic_same_input",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "two_clusters_n16",
+      "invariant": "labels_len_eq_n",
+      "detail": "labels.len()=16, n=16",
+      "pass": true
+    },
+    {
+      "case_id": "two_clusters_n16",
+      "invariant": "labels_in_centers_range",
+      "detail": "centers=2, max_label=1",
+      "pass": true
+    },
+    {
+      "case_id": "two_clusters_n16",
+      "invariant": "centers_nonempty",
+      "detail": "centers.len()=2",
+      "pass": true
+    },
+    {
+      "case_id": "two_clusters_n16",
+      "invariant": "centers_dim_eq_input",
+      "detail": "input_d=2, all_centers_d=true",
+      "pass": true
+    },
+    {
+      "case_id": "two_clusters_n16",
+      "invariant": "deterministic_same_input",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "two_clusters_n16",
+      "invariant": "well_separated_recovery",
+      "detail": "within_same_label=true, cross_diff_label=true",
+      "pass": true
+    },
+    {
+      "case_id": "three_clusters_n21",
+      "invariant": "labels_len_eq_n",
+      "detail": "labels.len()=21, n=21",
+      "pass": true
+    },
+    {
+      "case_id": "three_clusters_n21",
+      "invariant": "labels_in_centers_range",
+      "detail": "centers=3, max_label=2",
+      "pass": true
+    },
+    {
+      "case_id": "three_clusters_n21",
+      "invariant": "centers_nonempty",
+      "detail": "centers.len()=3",
+      "pass": true
+    },
+    {
+      "case_id": "three_clusters_n21",
+      "invariant": "centers_dim_eq_input",
+      "detail": "input_d=2, all_centers_d=true",
+      "pass": true
+    },
+    {
+      "case_id": "three_clusters_n21",
+      "invariant": "deterministic_same_input",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "three_clusters_n21",
+      "invariant": "well_separated_recovery",
+      "detail": "within_same_label=true, cross_diff_label=true",
+      "pass": true
+    },
+    {
+      "case_id": "four_clusters_n24",
+      "invariant": "labels_len_eq_n",
+      "detail": "labels.len()=24, n=24",
+      "pass": true
+    },
+    {
+      "case_id": "four_clusters_n24",
+      "invariant": "labels_in_centers_range",
+      "detail": "centers=4, max_label=3",
+      "pass": true
+    },
+    {
+      "case_id": "four_clusters_n24",
+      "invariant": "centers_nonempty",
+      "detail": "centers.len()=4",
+      "pass": true
+    },
+    {
+      "case_id": "four_clusters_n24",
+      "invariant": "centers_dim_eq_input",
+      "detail": "input_d=2, all_centers_d=true",
+      "pass": true
+    },
+    {
+      "case_id": "four_clusters_n24",
+      "invariant": "deterministic_same_input",
+      "detail": "equal=true",
+      "pass": true
+    },
+    {
+      "case_id": "four_clusters_n24",
+      "invariant": "well_separated_recovery",
+      "detail": "within_same_label=true, cross_diff_label=true",
+      "pass": true
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "schema_version": 2,
+  "packet_id": "FSCI-P2C-001",
+  "family": "integrate.validate_tol",
+  "case_results": [
+    {
+      "case_id": "scalar_rtol_clamp",
+      "passed": true,
+      "message": "tolerance contract matched"
+    },
+    {
+      "case_id": "vector_passthrough",
+      "passed": true,
+      "message": "tolerance contract matched"
+    },
+    {
+      "case_id": "wrong_shape",
+      "passed": true,
+      "message": "error matched"
+    },
+    {
+      "case_id": "negative_atol",
+      "passed": true,
+      "message": "error matched"
+    }
+  ],
+  "passed_cases": 4,
+  "failed_cases": 0,
+  "fixture_path": "/data/projects/frankenscipy/crates/fsci-conformance/fixtures/FSCI-P2C-001_validate_tol.json",
+  "oracle_status": {
+    "status": "available"
+  },
+  "differential_case_results": [
+    {
+      "case_id": "scalar_rtol_clamp",
+      "passed": true,
+      "message": "tolerance contract matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "vector_passthrough",
+      "passed": true,
+      "message": "tolerance contract matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "wrong_shape",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "negative_atol",
+      "passed": true,
+      "message": "error matched",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ],
+  "report_kind": "oracle_backed",
+  "generated_unix_ms": 1788666501928
+}

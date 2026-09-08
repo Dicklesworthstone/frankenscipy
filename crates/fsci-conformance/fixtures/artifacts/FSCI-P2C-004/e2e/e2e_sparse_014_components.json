@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_sparse_014_components",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "build_graph",
+      "action": "from_triplets",
+      "input_summary": "5 nodes, 2 components",
+      "output_summary": "nnz=8",
+      "duration_ns": 8507,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "find_components",
+      "action": "connected_component_sizes",
+      "input_summary": "expected 2 components",
+      "output_summary": "found=2, sizes=[3, 2]",
+      "duration_ns": 7324,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "check_connectivity",
+      "action": "is_connected",
+      "input_summary": "expected false (2 components)",
+      "output_summary": "is_connected=false",
+      "duration_ns": 1944,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 168830,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_014_components --nocapture"
+  }
+}

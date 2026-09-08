@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_11_signal_metrics",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "rms_sine",
+      "action": "rms(sin)",
+      "input_summary": "RMS of pure sine should be 1/sqrt(2)",
+      "output_summary": "rms=0.7071, expected=0.7071",
+      "duration_ns": 4959,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "metrics",
+    "signal_length": 100,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 12213,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_11_signal_metrics --nocapture"
+  }
+}

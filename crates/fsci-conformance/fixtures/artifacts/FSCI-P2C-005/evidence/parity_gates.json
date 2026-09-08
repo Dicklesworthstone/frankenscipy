@@ -1,0 +1,190 @@
+{
+  "packet_id": "FSCI-P2C-005",
+  "all_gates_pass": true,
+  "gates": [
+    {
+      "fixture_id": "fft_ifft_n16",
+      "operation": "fft_ifft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 2.482534153247273e-16,
+      "tolerance_used": 1e-10,
+      "size": 16
+    },
+    {
+      "fixture_id": "rfft_irfft_n16",
+      "operation": "rfft_irfft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 2.220446049250313e-16,
+      "tolerance_used": 1e-10,
+      "size": 16
+    },
+    {
+      "fixture_id": "parseval_n16",
+      "operation": "parseval_energy",
+      "pass": true,
+      "max_abs_diff": 1.1102230246251568e-16,
+      "tolerance_used": 1e-10,
+      "size": 16
+    },
+    {
+      "fixture_id": "normalization_n16",
+      "operation": "normalization",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 1e-10,
+      "size": 16
+    },
+    {
+      "fixture_id": "fft_ifft_n32",
+      "operation": "fft_ifft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 4.577566798522237e-16,
+      "tolerance_used": 1e-10,
+      "size": 32
+    },
+    {
+      "fixture_id": "rfft_irfft_n32",
+      "operation": "rfft_irfft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 4.440892098500626e-16,
+      "tolerance_used": 1e-10,
+      "size": 32
+    },
+    {
+      "fixture_id": "parseval_n32",
+      "operation": "parseval_energy",
+      "pass": true,
+      "max_abs_diff": 1.1102230246251565e-16,
+      "tolerance_used": 1e-10,
+      "size": 32
+    },
+    {
+      "fixture_id": "normalization_n32",
+      "operation": "normalization",
+      "pass": true,
+      "max_abs_diff": 9.860761315262648e-32,
+      "tolerance_used": 1e-10,
+      "size": 32
+    },
+    {
+      "fixture_id": "fft_ifft_n64",
+      "operation": "fft_ifft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 6.753223014464259e-16,
+      "tolerance_used": 1e-10,
+      "size": 64
+    },
+    {
+      "fixture_id": "rfft_irfft_n64",
+      "operation": "rfft_irfft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 4.440892098500626e-16,
+      "tolerance_used": 1e-10,
+      "size": 64
+    },
+    {
+      "fixture_id": "parseval_n64",
+      "operation": "parseval_energy",
+      "pass": true,
+      "max_abs_diff": 3.330669073875471e-16,
+      "tolerance_used": 1e-10,
+      "size": 64
+    },
+    {
+      "fixture_id": "normalization_n64",
+      "operation": "normalization",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 1e-10,
+      "size": 64
+    },
+    {
+      "fixture_id": "fft_ifft_n128",
+      "operation": "fft_ifft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 6.753223014464259e-16,
+      "tolerance_used": 1e-10,
+      "size": 128
+    },
+    {
+      "fixture_id": "rfft_irfft_n128",
+      "operation": "rfft_irfft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 5.551115123125783e-16,
+      "tolerance_used": 1e-10,
+      "size": 128
+    },
+    {
+      "fixture_id": "parseval_n128",
+      "operation": "parseval_energy",
+      "pass": true,
+      "max_abs_diff": 2.2204460492503126e-16,
+      "tolerance_used": 1e-10,
+      "size": 128
+    },
+    {
+      "fixture_id": "normalization_n128",
+      "operation": "normalization",
+      "pass": true,
+      "max_abs_diff": 1.1024666305413758e-31,
+      "tolerance_used": 1e-10,
+      "size": 128
+    },
+    {
+      "fixture_id": "fft_ifft_n256",
+      "operation": "fft_ifft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 9.036560719766055e-16,
+      "tolerance_used": 1e-10,
+      "size": 256
+    },
+    {
+      "fixture_id": "rfft_irfft_n256",
+      "operation": "rfft_irfft_roundtrip",
+      "pass": true,
+      "max_abs_diff": 6.661338147750939e-16,
+      "tolerance_used": 1e-10,
+      "size": 256
+    },
+    {
+      "fixture_id": "parseval_n256",
+      "operation": "parseval_energy",
+      "pass": true,
+      "max_abs_diff": 1.6653345369377376e-15,
+      "tolerance_used": 1e-10,
+      "size": 256
+    },
+    {
+      "fixture_id": "normalization_n256",
+      "operation": "normalization",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 1e-10,
+      "size": 256
+    },
+    {
+      "fixture_id": "fft2_8x8",
+      "operation": "fft2",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 0.0,
+      "size": 64
+    },
+    {
+      "fixture_id": "fft2_16x16",
+      "operation": "fft2",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 0.0,
+      "size": 256
+    },
+    {
+      "fixture_id": "fft2_32x32",
+      "operation": "fft2",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 0.0,
+      "size": 1024
+    }
+  ]
+}

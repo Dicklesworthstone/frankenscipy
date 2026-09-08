@@ -1,0 +1,126 @@
+{
+  "packet_id": "FSCI-P2C-003",
+  "all_gates_pass": true,
+  "gates": [
+    {
+      "fixture_id": "bfgs_quadratic_dim2",
+      "operation": "bfgs",
+      "pass": true,
+      "max_abs_diff": 2.2492017137665243e-9,
+      "tolerance_used": 0.001,
+      "size": 2
+    },
+    {
+      "fixture_id": "bfgs_quadratic_dim5",
+      "operation": "bfgs",
+      "pass": true,
+      "max_abs_diff": 5.024759275329416e-9,
+      "tolerance_used": 0.001,
+      "size": 5
+    },
+    {
+      "fixture_id": "bfgs_quadratic_dim10",
+      "operation": "bfgs",
+      "pass": true,
+      "max_abs_diff": 6.07747097092215e-9,
+      "tolerance_used": 0.001,
+      "size": 10
+    },
+    {
+      "fixture_id": "bfgs_rosenbrock_2d",
+      "operation": "bfgs",
+      "pass": true,
+      "max_abs_diff": 1.235921587294797e-9,
+      "tolerance_used": 0.1,
+      "size": 2
+    },
+    {
+      "fixture_id": "cg_quadratic_dim2",
+      "operation": "cg",
+      "pass": true,
+      "max_abs_diff": 2.2492017137665243e-9,
+      "tolerance_used": 0.001,
+      "size": 2
+    },
+    {
+      "fixture_id": "cg_quadratic_dim5",
+      "operation": "cg",
+      "pass": true,
+      "max_abs_diff": 5.024759275329416e-9,
+      "tolerance_used": 0.001,
+      "size": 5
+    },
+    {
+      "fixture_id": "powell_quadratic_dim2",
+      "operation": "powell",
+      "pass": true,
+      "max_abs_diff": 4.822437839276285e-6,
+      "tolerance_used": 0.01,
+      "size": 2
+    },
+    {
+      "fixture_id": "powell_quadratic_dim5",
+      "operation": "powell",
+      "pass": true,
+      "max_abs_diff": 4.822437839276285e-6,
+      "tolerance_used": 0.01,
+      "size": 5
+    },
+    {
+      "fixture_id": "brentq_cubic",
+      "operation": "brentq",
+      "pass": true,
+      "max_abs_diff": 2.4868995751603507e-14,
+      "tolerance_used": 1e-10,
+      "size": 1
+    },
+    {
+      "fixture_id": "brenth_cubic",
+      "operation": "brenth",
+      "pass": true,
+      "max_abs_diff": 2.4868995751603507e-14,
+      "tolerance_used": 1e-10,
+      "size": 1
+    },
+    {
+      "fixture_id": "bisect_cubic",
+      "operation": "bisect",
+      "pass": true,
+      "max_abs_diff": 2.3945290195115376e-12,
+      "tolerance_used": 1e-10,
+      "size": 1
+    },
+    {
+      "fixture_id": "ridder_cubic",
+      "operation": "ridder",
+      "pass": true,
+      "max_abs_diff": 8.881784197001252e-16,
+      "tolerance_used": 1e-10,
+      "size": 1
+    },
+    {
+      "fixture_id": "brentq_sin_pi",
+      "operation": "brentq",
+      "pass": true,
+      "max_abs_diff": 0.0,
+      "tolerance_used": 1e-10,
+      "size": 1
+    },
+    {
+      "fixture_id": "root_methods_agreement",
+      "operation": "root_agreement",
+      "pass": true,
+      "max_abs_diff": 2.1671553440683056e-13,
+      "tolerance_used": 1e-10,
+      "size": 4
+    },
+    {
+      "fixture_id": "minimize_methods_agreement",
+      "operation": "minimize_agreement",
+      "pass": true,
+      "max_abs_diff": 1.2748493634603e-9,
+      "tolerance_used": 0.001,
+      "size": 3
+    }
+  ]
+}

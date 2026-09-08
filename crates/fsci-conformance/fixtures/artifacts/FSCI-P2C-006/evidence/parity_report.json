@@ -1,0 +1,54 @@
+{
+  "packet_id": "FSCI-P2C-006",
+  "operation_summaries": [
+    {
+      "operation": "gamma",
+      "total_fixtures": 4,
+      "passed": 4,
+      "failed": 0,
+      "max_abs_diff_across_all": 3.907985046680551e-14
+    },
+    {
+      "operation": "erf_erfc",
+      "total_fixtures": 6,
+      "passed": 6,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "operation": "erfinv",
+      "total_fixtures": 5,
+      "passed": 5,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.1102230246251565e-16
+    },
+    {
+      "operation": "gammainc",
+      "total_fixtures": 4,
+      "passed": 4,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    },
+    {
+      "operation": "beta",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.7763568394002505e-15
+    },
+    {
+      "operation": "bessel",
+      "total_fixtures": 3,
+      "passed": 3,
+      "failed": 0,
+      "max_abs_diff_across_all": 1.5677001363734178e-11
+    },
+    {
+      "operation": "rgamma",
+      "total_fixtures": 5,
+      "passed": 5,
+      "failed": 0,
+      "max_abs_diff_across_all": 0.0
+    }
+  ]
+}

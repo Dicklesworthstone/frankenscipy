@@ -1,0 +1,67 @@
+{
+  "scenario_id": "e2e_ivp_004_invalid_tol_recovery",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "submit_bad_atol",
+      "action": "validate",
+      "input_summary": "atol vec len=2 for n=3",
+      "output_summary": "is_err=true",
+      "duration_ns": 21991,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "catch_error",
+      "action": "inspect",
+      "input_summary": "error from step 1",
+      "output_summary": "err=AtolWrongShape { expected: 3, actual: 2 }",
+      "duration_ns": 5952,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "correct_and_retry",
+      "action": "validate",
+      "input_summary": "atol vec len=3 for n=3",
+      "output_summary": "is_ok=true",
+      "duration_ns": 2735,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "bad_first_step",
+      "action": "validate",
+      "input_summary": "first_step=-0.01",
+      "output_summary": "is_err=true",
+      "duration_ns": 1583,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 5,
+      "step_name": "correct_first_step",
+      "action": "validate",
+      "input_summary": "first_step=0.01",
+      "output_summary": "is_ok=true",
+      "duration_ns": 340,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 155876,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_004_invalid_tol_recovery --nocapture"
+  }
+}

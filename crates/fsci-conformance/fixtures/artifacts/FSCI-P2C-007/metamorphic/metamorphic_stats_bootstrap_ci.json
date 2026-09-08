@@ -1,0 +1,94 @@
+{
+  "test_id": "metamorphic_stats_bootstrap_ci",
+  "case_count": 14,
+  "pass_count": 14,
+  "pass": true,
+  "timestamp_ms": 1780777723794,
+  "duration_ns": 53792549,
+  "cases": [
+    {
+      "case_id": "compact_n10",
+      "invariant": "lo_le_hi",
+      "detail": "lo=3.7, hi=7.3",
+      "pass": true
+    },
+    {
+      "case_id": "compact_n10",
+      "invariant": "covers_empirical_mean",
+      "detail": "lo=3.7, mean=5.5, hi=7.3, bracketed=true",
+      "pass": true
+    },
+    {
+      "case_id": "compact_n10",
+      "invariant": "deterministic_same_seed",
+      "detail": "first=(3.7, 7.3), second=(3.7, 7.3)",
+      "pass": true
+    },
+    {
+      "case_id": "compact_n10",
+      "invariant": "confidence_widens_interval",
+      "detail": "w80=2.4000000000000004, w95=3.5999999999999996, w99=4.6000000000000005",
+      "pass": true
+    },
+    {
+      "case_id": "spread_n30",
+      "invariant": "lo_le_hi",
+      "detail": "lo=13.054828851283526, hi=16.660536211022926",
+      "pass": true
+    },
+    {
+      "case_id": "spread_n30",
+      "invariant": "covers_empirical_mean",
+      "detail": "lo=13.054828851283526, mean=14.944379362092386, hi=16.660536211022926, bracketed=true",
+      "pass": true
+    },
+    {
+      "case_id": "spread_n30",
+      "invariant": "deterministic_same_seed",
+      "detail": "first=(13.054828851283526, 16.660536211022926), second=(13.054828851283526, 16.660536211022926)",
+      "pass": true
+    },
+    {
+      "case_id": "spread_n30",
+      "invariant": "confidence_widens_interval",
+      "detail": "w80=2.271097010134911, w95=3.6057073597394, w99=4.602674068085726",
+      "pass": true
+    },
+    {
+      "case_id": "with_negatives_n12",
+      "invariant": "lo_le_hi",
+      "detail": "lo=1.375, hi=7.583333333333333",
+      "pass": true
+    },
+    {
+      "case_id": "with_negatives_n12",
+      "invariant": "covers_empirical_mean",
+      "detail": "lo=1.375, mean=4.375, hi=7.583333333333333, bracketed=true",
+      "pass": true
+    },
+    {
+      "case_id": "with_negatives_n12",
+      "invariant": "deterministic_same_seed",
+      "detail": "first=(1.375, 7.583333333333333), second=(1.375, 7.583333333333333)",
+      "pass": true
+    },
+    {
+      "case_id": "with_negatives_n12",
+      "invariant": "confidence_widens_interval",
+      "detail": "w80=4.041666666666667, w95=6.208333333333333, w99=8",
+      "pass": true
+    },
+    {
+      "case_id": "edge_empty_data",
+      "invariant": "empty_data_returns_nan",
+      "detail": "lo=NaN, hi=NaN",
+      "pass": true
+    },
+    {
+      "case_id": "edge_zero_bootstrap",
+      "invariant": "zero_bootstrap_returns_nan",
+      "detail": "lo=NaN, hi=NaN",
+      "pass": true
+    }
+  ]
+}

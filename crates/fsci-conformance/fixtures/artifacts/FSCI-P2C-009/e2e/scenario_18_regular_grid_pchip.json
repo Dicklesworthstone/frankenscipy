@@ -1,0 +1,63 @@
+{
+  "scenario_id": "scenario_18_regular_grid_pchip",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_regular_grid_pchip",
+      "action": "RegularGridInterpolator::new(points, values, Pchip)",
+      "input_summary": "4x4 grid, f(x,y)=x^4*y^4",
+      "output_summary": "created 2D regular grid pchip interpolator",
+      "duration_ns": 6512,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "eval_reference_points",
+      "action": "interp.eval_many([[1.5,2.0],[2.5,2.5],[3.5,3.0]])",
+      "input_summary": "SciPy reference points",
+      "output_summary": "max_abs_diff=2.274e-13",
+      "duration_ns": 35247,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "fill_value_out_of_bounds",
+      "action": "RegularGridInterpolator::new(..., fill_value=-123.0).eval([-1,2])",
+      "input_summary": "out-of-bounds fill contract",
+      "output_summary": "returned configured fill_value",
+      "duration_ns": 1964,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "extrapolation_when_fill_none",
+      "action": "RegularGridInterpolator::new(..., fill_value=None).eval([-1,2])",
+      "input_summary": "SciPy extrapolation contract",
+      "output_summary": "actual=2056",
+      "duration_ns": 8567,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "RegularGridInterpolator-Pchip",
+    "num_points": 16,
+    "dimensions": 2,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 59413,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_18_regular_grid_pchip --nocapture"
+  }
+}

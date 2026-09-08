@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_15_butter_lfilter",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "design_butter_lowpass",
+      "action": "butter(4, [0.03], lowpass)",
+      "input_summary": "4th order Butterworth lowpass at 15Hz (wn=15/500=0.03)",
+      "output_summary": "4th order Butterworth designed",
+      "duration_ns": 29335,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "apply_lfilter",
+      "action": "lfilter(b, a, signal)",
+      "input_summary": "apply filter to mixed-frequency signal",
+      "output_summary": "filtering reduced variance: 0.6250 -> 0.4813",
+      "duration_ns": 187956,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "butter+lfilter",
+    "signal_length": 1000,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 282856,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_15_butter_lfilter --nocapture"
+  }
+}

@@ -1,0 +1,167 @@
+{
+  "packet_id": "FSCI-P2C-008",
+  "all_gates_pass": true,
+  "gates": [
+    {
+      "fixture_id": "policy_low_risk_Strict",
+      "subsystem": "policy_controller",
+      "pass": true,
+      "description": "Low-risk signals → Allow in Strict mode",
+      "detail": "action=Allow, top_state=Compatible, posterior=[0.950478846659508, 0.04150093290903514, 0.008020220431456877]"
+    },
+    {
+      "fixture_id": "policy_high_cond_Strict",
+      "subsystem": "policy_controller",
+      "pass": true,
+      "description": "High condition number → escalated action in Strict",
+      "detail": "action=FullValidate, top_state=Compatible, posterior=[0.7716027689585448, 0.21560970881240504, 0.012787522229050148]"
+    },
+    {
+      "fixture_id": "policy_metadata_incompat_Strict",
+      "subsystem": "policy_controller",
+      "pass": true,
+      "description": "High metadata incompatibility → escalated in Strict",
+      "detail": "action=FailClosed, top_state=IncompatibleMetadata, posterior=[0.19991226927498473, 0.0810753214219017, 0.7190124093031135]"
+    },
+    {
+      "fixture_id": "policy_anomaly_Strict",
+      "subsystem": "policy_controller",
+      "pass": true,
+      "description": "High anomaly score → escalated action in Strict",
+      "detail": "action=FullValidate, top_state=Compatible, posterior=[0.5068334393979732, 0.40980540608191485, 0.083361154520112]"
+    },
+    {
+      "fixture_id": "policy_low_risk_Hardened",
+      "subsystem": "policy_controller",
+      "pass": true,
+      "description": "Low-risk signals → Allow in Hardened mode",
+      "detail": "action=Allow, top_state=Compatible, posterior=[0.950478846659508, 0.04150093290903514, 0.008020220431456877]"
+    },
+    {
+      "fixture_id": "policy_high_cond_Hardened",
+      "subsystem": "policy_controller",
+      "pass": true,
+      "description": "High condition number → escalated action in Hardened",
+      "detail": "action=FullValidate, top_state=Compatible, posterior=[0.7716027689585448, 0.21560970881240504, 0.012787522229050148]"
+    },
+    {
+      "fixture_id": "policy_metadata_incompat_Hardened",
+      "subsystem": "policy_controller",
+      "pass": true,
+      "description": "High metadata incompatibility → escalated in Hardened",
+      "detail": "action=FailClosed, top_state=IncompatibleMetadata, posterior=[0.19991226927498473, 0.0810753214219017, 0.7190124093031135]"
+    },
+    {
+      "fixture_id": "policy_anomaly_Hardened",
+      "subsystem": "policy_controller",
+      "pass": true,
+      "description": "High anomaly score → escalated action in Hardened",
+      "detail": "action=FullValidate, top_state=Compatible, posterior=[0.5068334393979732, 0.40980540608191485, 0.083361154520112]"
+    },
+    {
+      "fixture_id": "mode_consistency_hardened_ge_strict",
+      "subsystem": "policy_controller",
+      "pass": true,
+      "description": "Hardened mode at least as strict as Strict mode",
+      "detail": "All 5 signal triples: Hardened >= Strict"
+    },
+    {
+      "fixture_id": "portfolio_well_conditioned",
+      "subsystem": "solver_portfolio",
+      "pass": true,
+      "description": "WellConditioned → DirectLU (min expected loss)",
+      "detail": "action=DirectLU, losses=[1.0, 3.0, 15.0, 0.0, 0.0], chosen=1.00"
+    },
+    {
+      "fixture_id": "portfolio_moderate_condition",
+      "subsystem": "solver_portfolio",
+      "pass": true,
+      "description": "ModerateCondition → PivotedQR",
+      "detail": "action=PivotedQR, losses=[5.0, 1.0, 10.0, 0.0, 0.0]"
+    },
+    {
+      "fixture_id": "portfolio_ill_and_near_singular",
+      "subsystem": "solver_portfolio",
+      "pass": true,
+      "description": "IllConditioned/NearSingular → SVDFallback",
+      "detail": "ill=SVDFallback, near_singular=SVDFallback"
+    },
+    {
+      "fixture_id": "portfolio_all_states_valid",
+      "subsystem": "solver_portfolio",
+      "pass": true,
+      "description": "All MatrixConditionStates produce valid portfolio decisions",
+      "detail": "All 4 condition states produce valid, finite outputs"
+    },
+    {
+      "fixture_id": "loss_matrix_properties",
+      "subsystem": "solver_portfolio",
+      "pass": true,
+      "description": "Loss matrix structural properties hold",
+      "detail": "Loss matrix satisfies: non-negative, SVD dominates ill-conditioned, LU dominates well-conditioned"
+    },
+    {
+      "fixture_id": "calibrator_no_fallback",
+      "subsystem": "conformal_calibrator",
+      "pass": true,
+      "description": "50 low-error observations → no fallback triggered",
+      "detail": "should_fallback=false, miscoverage=0.000000, total=50"
+    },
+    {
+      "fixture_id": "calibrator_triggers_fallback",
+      "subsystem": "conformal_calibrator",
+      "pass": true,
+      "description": "75% violation rate → fallback triggered",
+      "detail": "should_fallback=true, miscoverage=0.7500, alpha=0.05"
+    },
+    {
+      "fixture_id": "calibrator_min_observations",
+      "subsystem": "conformal_calibrator",
+      "pass": true,
+      "description": "< 10 observations → no fallback even with 100% violations",
+      "detail": "should_fallback=false, predictions=9"
+    },
+    {
+      "fixture_id": "portfolio_conformal_override",
+      "subsystem": "conformal_calibrator",
+      "pass": true,
+      "description": "Conformal override → SVDFallback even for WellConditioned",
+      "detail": "action=SVDFallback, calibrator_fallback=true"
+    },
+    {
+      "fixture_id": "ledger_capacity_fifo",
+      "subsystem": "evidence_ledger",
+      "pass": true,
+      "description": "Ledger respects capacity=8 with FIFO eviction",
+      "detail": "ledger_len=8, capacity=8"
+    },
+    {
+      "fixture_id": "ledger_latest_entry",
+      "subsystem": "evidence_ledger",
+      "pass": true,
+      "description": "Latest ledger entry matches most recent decision",
+      "detail": "latest_action=Some(Allow), decision_action=Allow"
+    },
+    {
+      "fixture_id": "signal_sequence_replay",
+      "subsystem": "evidence_ledger",
+      "pass": true,
+      "description": "Signal sequence replays produce identical decisions",
+      "detail": "run_a=[Allow, FullValidate, FailClosed], run_b=[Allow, FullValidate, FailClosed]"
+    },
+    {
+      "fixture_id": "evidence_jsonl_serialization",
+      "subsystem": "evidence_ledger",
+      "pass": true,
+      "description": "JSONL evidence serialization produces valid JSON lines",
+      "detail": "lines=4, all_valid=true"
+    },
+    {
+      "fixture_id": "audit_ledger_structured_decision_event",
+      "subsystem": "evidence_ledger",
+      "pass": true,
+      "description": "Shared AuditLedger emits full AlienArtifactDecision records",
+      "detail": "action=FullValidate, top_state=Compatible, selected=String(\"FullValidate\")"
+    }
+  ]
+}

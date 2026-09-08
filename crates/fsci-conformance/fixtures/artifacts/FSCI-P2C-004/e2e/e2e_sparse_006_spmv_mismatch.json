@@ -1,0 +1,37 @@
+{
+  "scenario_id": "e2e_sparse_006_spmv_mismatch",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "spmv_wrong_len",
+      "action": "spmv_csr",
+      "input_summary": "4x4 matrix, vector len=2",
+      "output_summary": "error=true",
+      "duration_ns": 1593,
+      "mode": "strict",
+      "outcome": "expected_error"
+    },
+    {
+      "step_id": 2,
+      "step_name": "spmv_correct",
+      "action": "spmv_csr",
+      "input_summary": "4x4 identity, vector len=4",
+      "output_summary": "diff=0.0000e0, pass=true",
+      "duration_ns": 3767,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 162779,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_006_spmv_mismatch --nocapture"
+  }
+}

@@ -10807,7 +10807,7 @@ fn is_p2c_fixture_path(path: &Path) -> bool {
         && path
             .file_name()
             .and_then(OsStr::to_str)
-            .is_some_and(|name| name.starts_with("FSCI-P2C-"))
+            .is_some_and(|name| name.starts_with("FSCI-P2C-") && !name.ends_with("_golden.json"))
 }
 
 fn matches_packet_filter(path: &Path, packet_filter: Option<&str>) -> bool {
@@ -13837,6 +13837,9 @@ pub fn run_differential_test(
         "constants_core" | "constants" => {
             run_differential_constants(fixture_path, &raw, &resolved_oracle_config)
         }
+        "sparse_ops" | "sparse_core" | "sparse" => {
+            run_differential_sparse(fixture_path, &raw, &resolved_oracle_config)
+        }
         _ => Err(HarnessError::FixtureParse {
             path: fixture_path.to_path_buf(),
             source: serde::de::Error::custom(format!("unknown fixture family: {family}")),
@@ -15319,6 +15322,98 @@ fn run_differential_constants(
         let ledger = recover_sync_audit_ledger(audit_ledger.as_ref());
         let _ =
             emit_differential_audit_ledger_for_fixture(fixture_path, &fixture.packet_id, &ledger)?;
+    }
+
+    Ok(ConformanceReport {
+        fixture_path: fixture_path.display().to_string(),
+        packet_id: fixture.packet_id,
+        family: fixture.family,
+        pass_count,
+        fail_count,
+        oracle_status,
+        per_case_results,
+        generated_unix_ms: now_unix_ms(),
+    })
+}
+
+fn run_differential_sparse(
+    fixture_path: &Path,
+    raw: &str,
+    oracle_config: &DifferentialOracleConfig,
+) -> Result<ConformanceReport, HarnessError> {
+    let fixture: SparsePacketFixture =
+        serde_json::from_str(raw).map_err(|source| HarnessError::FixtureParse {
+            path: fixture_path.to_path_buf(),
+            source,
+        })?;
+
+    let resolved_oracle_config = resolve_differential_oracle_config(oracle_config, &fixture.family);
+    let probed_oracle_status = probe_oracle_availability(&resolved_oracle_config);
+    let mut capture_failure_status = None;
+    let oracle_capture = if resolved_oracle_config.required
+        || matches!(probed_oracle_status, OracleStatus::Available)
+    {
+        match capture_python_oracle_inner(
+            fixture_path,
+            raw,
+            &fixture.packet_id,
+            &HarnessConfig::default_paths().oracle_root,
+            &resolved_oracle_config,
+        ) {
+            Ok(capture) => Some(capture),
+            Err(error) => {
+                if resolved_oracle_config.required {
+                    return Err(error);
+                }
+                capture_failure_status = Some(oracle_status_from_capture_error(&error));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let oracle_status = match (&oracle_capture, resolved_oracle_config.required) {
+        (Some(_), _) => OracleStatus::Available,
+        (None, true) => probed_oracle_status.clone(),
+        (None, false) => capture_failure_status.unwrap_or(probed_oracle_status),
+    };
+
+    let mut per_case_results = Vec::with_capacity(fixture.cases.len());
+    let audit_ledger = neutral_audit_ledger();
+
+    for case in &fixture.cases {
+        per_case_results.push(run_case_with_panic_capture(
+            case.case_id(),
+            &oracle_status,
+            Some(audit_ledger.as_ref()),
+            || {
+                let observed = execute_sparse_case(case);
+                let (passed, message) = compare_sparse_outcome(&case.expected, &observed);
+                let tolerance = match &case.expected {
+                    SparseExpectedOutcome::Vector { atol, rtol, .. }
+                    | SparseExpectedOutcome::EigenvaluesAbsSorted { atol, rtol, .. } => {
+                        Some(ToleranceUsed {
+                            atol: atol.unwrap_or(1.0e-10),
+                            rtol: rtol.unwrap_or(1.0e-8),
+                            comparison_mode: "allclose".to_owned(),
+                        })
+                    }
+                    _ => None,
+                };
+                (passed, message, None, tolerance)
+            },
+        ));
+    }
+
+    let pass_count = per_case_results
+        .iter()
+        .filter(|result| result.passed)
+        .count();
+    let fail_count = per_case_results.len().saturating_sub(pass_count);
+
+    let ledger = recover_sync_audit_ledger(audit_ledger.as_ref());
+    if !ledger.is_empty() {
+        emit_differential_audit_ledger_for_fixture(fixture_path, &fixture.packet_id, &ledger)?;
     }
 
     Ok(ConformanceReport {

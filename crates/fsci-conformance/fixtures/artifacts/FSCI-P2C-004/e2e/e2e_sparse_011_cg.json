@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_sparse_011_cg",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "build_spd_matrix",
+      "action": "diags",
+      "input_summary": "n=20, tridiag(-1, 4, -1)",
+      "output_summary": "nnz=58",
+      "duration_ns": 26080,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "compute_rhs",
+      "action": "A * x_true",
+      "input_summary": "x_true = [1/n, 2/n, ..., 1]",
+      "output_summary": "b len=20",
+      "duration_ns": 2705,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "cg_solve",
+      "action": "cg",
+      "input_summary": "maxiter=100, tol=1e-10",
+      "output_summary": "converged=false, iters=14",
+      "duration_ns": 53622,
+      "mode": "strict",
+      "outcome": "fail"
+    },
+    {
+      "step_id": 4,
+      "step_name": "verify_solution",
+      "action": "compare x with x_true",
+      "input_summary": "max_diff=6.3301e-9, converged=false",
+      "output_summary": "pass=true",
+      "duration_ns": 2605,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 200420,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_011_cg --nocapture"
+  }
+}

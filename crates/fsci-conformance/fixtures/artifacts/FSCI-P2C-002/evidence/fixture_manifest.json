@@ -1,0 +1,110 @@
+{
+  "packet_id": "FSCI-P2C-002",
+  "generated_at": "unix:1780675574",
+  "fixtures": [
+    {
+      "fixture_id": "diag_dominant_4x4",
+      "dimensions": [
+        4,
+        4
+      ],
+      "structure": "diag_dominant",
+      "condition_note": "well-conditioned, rcond ~ O(1/n)",
+      "operations": [
+        "solve",
+        "inv",
+        "det"
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_16x16",
+      "dimensions": [
+        16,
+        16
+      ],
+      "structure": "diag_dominant",
+      "condition_note": "well-conditioned",
+      "operations": [
+        "solve",
+        "inv",
+        "det"
+      ]
+    },
+    {
+      "fixture_id": "diag_dominant_64x64",
+      "dimensions": [
+        64,
+        64
+      ],
+      "structure": "diag_dominant",
+      "condition_note": "well-conditioned",
+      "operations": [
+        "solve",
+        "inv",
+        "det"
+      ]
+    },
+    {
+      "fixture_id": "upper_tri_4x4",
+      "dimensions": [
+        4,
+        4
+      ],
+      "structure": "upper_triangular",
+      "condition_note": "triangular, rcond varies",
+      "operations": [
+        "solve_triangular"
+      ]
+    },
+    {
+      "fixture_id": "upper_tri_16x16",
+      "dimensions": [
+        16,
+        16
+      ],
+      "structure": "upper_triangular",
+      "condition_note": "triangular",
+      "operations": [
+        "solve_triangular"
+      ]
+    },
+    {
+      "fixture_id": "tridiag_banded_16x16",
+      "dimensions": [
+        16,
+        16
+      ],
+      "structure": "tridiagonal_banded",
+      "condition_note": "banded, l=1, u=1",
+      "operations": [
+        "solve_banded"
+      ]
+    },
+    {
+      "fixture_id": "overdetermined_32x16",
+      "dimensions": [
+        32,
+        16
+      ],
+      "structure": "overdetermined_rectangular",
+      "condition_note": "tall matrix, well-conditioned",
+      "operations": [
+        "lstsq",
+        "pinv"
+      ]
+    },
+    {
+      "fixture_id": "overdetermined_128x64",
+      "dimensions": [
+        128,
+        64
+      ],
+      "structure": "overdetermined_rectangular",
+      "condition_note": "tall matrix",
+      "operations": [
+        "lstsq",
+        "pinv"
+      ]
+    }
+  ]
+}

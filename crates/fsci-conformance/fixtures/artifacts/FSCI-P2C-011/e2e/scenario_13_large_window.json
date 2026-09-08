@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_13_large_window",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "large_kaiser",
+      "action": "kaiser(65536, 8.0)",
+      "input_summary": "large Kaiser window",
+      "output_summary": "len=65536, time=4.271372ms",
+      "duration_ns": 4320556,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "window",
+    "signal_length": 65536,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 4325775,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_13_large_window --nocapture"
+  }
+}

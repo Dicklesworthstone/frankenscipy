@@ -1,0 +1,62 @@
+{
+  "scenario_id": "scenario_05_json_and_mat",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "read_json_array",
+      "action": "read_json_array([1,2,3])",
+      "input_summary": "simple JSON array",
+      "output_summary": "read 4 elements",
+      "duration_ns": 26099,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "write_json_array",
+      "action": "write_json_array([1,2,3])",
+      "input_summary": "write JSON array",
+      "output_summary": "wrote 9 chars",
+      "duration_ns": 13806,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "json_roundtrip",
+      "action": "read_json_array(write_json_array(...))",
+      "input_summary": "verify roundtrip",
+      "output_summary": "JSON roundtrip verified",
+      "duration_ns": 8286,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "savemat_loadmat_roundtrip",
+      "action": "loadmat_text(savemat_text(...))",
+      "input_summary": "MATLAB text format roundtrip",
+      "output_summary": "MAT text roundtrip verified",
+      "duration_ns": 28985,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "JSON/MAT",
+    "operation": "read/write",
+    "size_bytes": 0
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 208395,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_05_json_and_mat --nocapture"
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_06_reject_nan_coordinates",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "reject_nan_x",
+      "action": "Interp1d::new([1, NaN, 3], [0,1,2])",
+      "input_summary": "NaN in x",
+      "output_summary": "correctly rejected with NonFiniteX",
+      "duration_ns": 1863,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "reject_inf_x",
+      "action": "Interp1d::new([1, INF, 3], [0,1,2])",
+      "input_summary": "Inf in x",
+      "output_summary": "correctly rejected with NonFiniteX",
+      "duration_ns": 892,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "reject_nan_regulargrid",
+      "action": "RegularGridInterpolator with NaN in points",
+      "input_summary": "NaN in axis",
+      "output_summary": "correctly rejected with NonFiniteX",
+      "duration_ns": 2264,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "error-handling",
+    "num_points": 3,
+    "dimensions": 1,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 12544,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_06_reject_nan_coordinates --nocapture"
+  }
+}

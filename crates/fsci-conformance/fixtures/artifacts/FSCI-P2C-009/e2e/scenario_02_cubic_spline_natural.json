@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_02_cubic_spline_natural",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_cubic_spline",
+      "action": "CubicSplineStandalone::new(x, y, Natural)",
+      "input_summary": "n=10 points on sin(x)",
+      "output_summary": "created natural cubic spline",
+      "duration_ns": 24526,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "eval_midpoint",
+      "action": "spline.eval(PI/4)",
+      "input_summary": "x_new=PI/4",
+      "output_summary": "result=0.707088, expected=0.707107, err=1.88e-5",
+      "duration_ns": 3096,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "check_natural_bc",
+      "action": "verify second derivative near zero at endpoints",
+      "input_summary": "S''(0) and S''(PI) should be ~0",
+      "output_summary": "S''(0)=0.00e0, S''(PI)=0.00e0",
+      "duration_ns": 4879,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "CubicSpline-Natural",
+    "num_points": 10,
+    "dimensions": 1,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 56848,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_02_cubic_spline_natural --nocapture"
+  }
+}

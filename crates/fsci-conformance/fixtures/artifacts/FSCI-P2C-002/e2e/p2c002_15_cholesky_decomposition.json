@@ -1,0 +1,56 @@
+{
+  "scenario_id": "p2c002_15_cholesky_decomposition",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "compute_cholesky",
+      "action": "cholesky(A)",
+      "input_summary": "3x3 SPD matrix",
+      "output_summary": "Cholesky decomposition computed",
+      "duration_ns": 29626,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "verify_a_equals_llt",
+      "action": "A == L @ L'",
+      "input_summary": "Cholesky identity",
+      "output_summary": "A == LL' verified: max_diff=0.00e0",
+      "duration_ns": 7545,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_l_lower_triangular",
+      "action": "L is lower triangular",
+      "input_summary": "structural check",
+      "output_summary": "L is lower triangular",
+      "duration_ns": 1563,
+      "mode": "strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "matrix_metadata": {
+    "size": [
+      3,
+      3
+    ],
+    "nnz": null,
+    "rcond_estimate": null,
+    "mode": "strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 46878,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_linalg -- p2c002_15_cholesky_decomposition --nocapture"
+  }
+}

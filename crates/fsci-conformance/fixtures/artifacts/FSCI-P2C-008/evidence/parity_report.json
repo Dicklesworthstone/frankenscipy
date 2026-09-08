@@ -1,0 +1,29 @@
+{
+  "packet_id": "FSCI-P2C-008",
+  "operation_summaries": [
+    {
+      "subsystem": "policy_controller",
+      "total_gates": 9,
+      "passed": 9,
+      "failed": 0
+    },
+    {
+      "subsystem": "solver_portfolio",
+      "total_gates": 5,
+      "passed": 5,
+      "failed": 0
+    },
+    {
+      "subsystem": "conformal_calibrator",
+      "total_gates": 4,
+      "passed": 4,
+      "failed": 0
+    },
+    {
+      "subsystem": "evidence_ledger",
+      "total_gates": 5,
+      "passed": 5,
+      "failed": 0
+    }
+  ]
+}

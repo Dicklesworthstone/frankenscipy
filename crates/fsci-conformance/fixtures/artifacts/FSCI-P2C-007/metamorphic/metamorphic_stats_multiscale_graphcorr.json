@@ -1,0 +1,154 @@
+{
+  "test_id": "metamorphic_stats_multiscale_graphcorr",
+  "case_count": 24,
+  "pass_count": 24,
+  "pass": true,
+  "timestamp_ms": 1779662453425,
+  "duration_ns": 955404913,
+  "cases": [
+    {
+      "case_id": "linear_n20",
+      "invariant": "statistic_in_0_1",
+      "detail": "statistic=0.9999999999999999",
+      "pass": true
+    },
+    {
+      "case_id": "linear_n20",
+      "invariant": "pvalue_in_0_1",
+      "detail": "pvalue=0.6274509803921569",
+      "pass": true
+    },
+    {
+      "case_id": "linear_n20",
+      "invariant": "mgc_map_n_by_n",
+      "detail": "rows=20, all_cols_n=true, expected n=20",
+      "pass": true
+    },
+    {
+      "case_id": "linear_n20",
+      "invariant": "opt_scale_in_1_n",
+      "detail": "opt_scale=(20, 20), n=20",
+      "pass": true
+    },
+    {
+      "case_id": "linear_n20",
+      "invariant": "dependent_data_high_statistic",
+      "detail": "statistic=0.9999999999999999, expected ≥ 0.5",
+      "pass": true
+    },
+    {
+      "case_id": "linear_n20",
+      "invariant": "deterministic_same_seed",
+      "detail": "stat=(0.9999999999999999, 0.9999999999999999), pval=(0.6274509803921569, 0.6274509803921569)",
+      "pass": true
+    },
+    {
+      "case_id": "quadratic_n20",
+      "invariant": "statistic_in_0_1",
+      "detail": "statistic=1",
+      "pass": true
+    },
+    {
+      "case_id": "quadratic_n20",
+      "invariant": "pvalue_in_0_1",
+      "detail": "pvalue=0.6666666666666666",
+      "pass": true
+    },
+    {
+      "case_id": "quadratic_n20",
+      "invariant": "mgc_map_n_by_n",
+      "detail": "rows=21, all_cols_n=true, expected n=21",
+      "pass": true
+    },
+    {
+      "case_id": "quadratic_n20",
+      "invariant": "opt_scale_in_1_n",
+      "detail": "opt_scale=(2, 2), n=21",
+      "pass": true
+    },
+    {
+      "case_id": "quadratic_n20",
+      "invariant": "dependent_data_high_statistic",
+      "detail": "statistic=1, expected ≥ 0.5",
+      "pass": true
+    },
+    {
+      "case_id": "quadratic_n20",
+      "invariant": "deterministic_same_seed",
+      "detail": "stat=(1, 1), pval=(0.6666666666666666, 0.6666666666666666)",
+      "pass": true
+    },
+    {
+      "case_id": "two_d_dep_n15",
+      "invariant": "statistic_in_0_1",
+      "detail": "statistic=0.9999999999999999",
+      "pass": true
+    },
+    {
+      "case_id": "two_d_dep_n15",
+      "invariant": "pvalue_in_0_1",
+      "detail": "pvalue=0.5882352941176471",
+      "pass": true
+    },
+    {
+      "case_id": "two_d_dep_n15",
+      "invariant": "mgc_map_n_by_n",
+      "detail": "rows=15, all_cols_n=true, expected n=15",
+      "pass": true
+    },
+    {
+      "case_id": "two_d_dep_n15",
+      "invariant": "opt_scale_in_1_n",
+      "detail": "opt_scale=(15, 15), n=15",
+      "pass": true
+    },
+    {
+      "case_id": "two_d_dep_n15",
+      "invariant": "dependent_data_high_statistic",
+      "detail": "statistic=0.9999999999999999, expected ≥ 0.5",
+      "pass": true
+    },
+    {
+      "case_id": "two_d_dep_n15",
+      "invariant": "deterministic_same_seed",
+      "detail": "stat=(0.9999999999999999, 0.9999999999999999), pval=(0.5882352941176471, 0.5882352941176471)",
+      "pass": true
+    },
+    {
+      "case_id": "permuted_n20",
+      "invariant": "statistic_in_0_1",
+      "detail": "statistic=1",
+      "pass": true
+    },
+    {
+      "case_id": "permuted_n20",
+      "invariant": "pvalue_in_0_1",
+      "detail": "pvalue=0.7058823529411765",
+      "pass": true
+    },
+    {
+      "case_id": "permuted_n20",
+      "invariant": "mgc_map_n_by_n",
+      "detail": "rows=20, all_cols_n=true, expected n=20",
+      "pass": true
+    },
+    {
+      "case_id": "permuted_n20",
+      "invariant": "opt_scale_in_1_n",
+      "detail": "opt_scale=(2, 5), n=20",
+      "pass": true
+    },
+    {
+      "case_id": "permuted_n20",
+      "invariant": "deterministic_same_seed",
+      "detail": "stat=(1, 1), pval=(0.7058823529411765, 0.7058823529411765)",
+      "pass": true
+    },
+    {
+      "case_id": "edge_reps_zero",
+      "invariant": "reps_zero_pvalue_sentinel",
+      "detail": "pvalue=1",
+      "pass": true
+    }
+  ]
+}

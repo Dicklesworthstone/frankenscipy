@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_sparse_001_tridiag",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "construct_tridiag",
+      "action": "diags",
+      "input_summary": "n=10, diags=[-1,2,-1]",
+      "output_summary": "csr nnz=28",
+      "duration_ns": 136279,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "csr_to_csc",
+      "action": "convert",
+      "input_summary": "csr nnz=28",
+      "output_summary": "csc nnz=28",
+      "duration_ns": 13225,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "roundtrip_verify",
+      "action": "compare",
+      "input_summary": "max_diff=0.0000e0",
+      "output_summary": "pass=true",
+      "duration_ns": 40677,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 353861,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_001_tridiag --nocapture"
+  }
+}

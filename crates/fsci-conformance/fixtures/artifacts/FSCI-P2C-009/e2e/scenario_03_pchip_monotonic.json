@@ -1,0 +1,43 @@
+{
+  "scenario_id": "scenario_03_pchip_monotonic",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "create_pchip",
+      "action": "PchipInterpolator::new(x, y)",
+      "input_summary": "monotonic data",
+      "output_summary": "created PCHIP interpolator",
+      "duration_ns": 17072,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "verify_monotonicity",
+      "action": "check interpolated values are monotonic",
+      "input_summary": "eval at 100 points",
+      "output_summary": "all interpolated values monotonically increasing",
+      "duration_ns": 17343,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "interpolator_metadata": {
+    "kind": "PCHIP",
+    "num_points": 5,
+    "dimensions": 1,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 44464,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_interpolate -- scenario_03_pchip_monotonic --nocapture"
+  }
+}

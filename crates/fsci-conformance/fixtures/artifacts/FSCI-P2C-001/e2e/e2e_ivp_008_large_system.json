@@ -1,0 +1,47 @@
+{
+  "scenario_id": "e2e_ivp_008_large_system",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "validate_large_tol",
+      "action": "validate",
+      "input_summary": "n=1000, vector atol",
+      "output_summary": "ok, duration_ms=0",
+      "duration_ns": 145786,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "solve_large_system",
+      "action": "solve",
+      "input_summary": "n=1000, dy/dt=-0.1*y, t=[0,1]",
+      "output_summary": "success=true, nfev=10, duration_ms=1",
+      "duration_ns": 1197950,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_accuracy",
+      "action": "check",
+      "input_summary": "n=1000 components",
+      "output_summary": "max_err=8.13e-7",
+      "duration_ns": 59183,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 1487037,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_ivp -- e2e_ivp_008_large_system --nocapture"
+  }
+}

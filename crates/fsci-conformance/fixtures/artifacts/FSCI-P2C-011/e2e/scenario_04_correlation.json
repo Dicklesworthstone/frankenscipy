@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_04_correlation",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "correlate_full",
+      "action": "correlate(signal, template, full)",
+      "input_summary": "find template in signal",
+      "output_summary": "len=24, peak_idx=17",
+      "duration_ns": 84881,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "autocorrelation",
+      "action": "autocorrelation(signal, 10)",
+      "input_summary": "self-correlation up to lag 10",
+      "output_summary": "len=11, r[0]=1.0000",
+      "duration_ns": 25208,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "correlate",
+    "signal_length": 20,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 186583,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_04_correlation --nocapture"
+  }
+}

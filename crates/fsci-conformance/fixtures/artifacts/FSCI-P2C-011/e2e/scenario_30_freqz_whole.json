@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_30_freqz_whole",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "freqz_whole_reference_response",
+      "action": "freqz([1, 0.5, 0.25], [1, -0.3, 0.2], worN=8, whole=true)",
+      "input_summary": "whole-spectrum response should match SciPy's sampled magnitudes and phases",
+      "output_summary": "mag_diff=4.44e-9, phase_diff=3.82e-9",
+      "duration_ns": 16492,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "freqz_whole",
+    "signal_length": 8,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 19317,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_30_freqz_whole --nocapture"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_10_ricker_wavelet",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "generate_ricker",
+      "action": "ricker(101, 4.0)",
+      "input_summary": "Mexican hat wavelet",
+      "output_summary": "center=0.4337, integral=0.0000",
+      "duration_ns": 16341,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "ricker",
+    "signal_length": 101,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 18815,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_10_ricker_wavelet --nocapture"
+  }
+}

@@ -1,0 +1,42 @@
+{
+  "scenario_id": "scenario_16_sosfilt",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "sosfilt_impulse_response",
+      "action": "sosfilt(sos, impulse)",
+      "input_summary": "compute impulse response of biquad",
+      "output_summary": "h[0]=0.0675, decaying response verified",
+      "duration_ns": 12253,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "sosfilt_sine_attenuation",
+      "action": "sosfilt(sos, high_freq_sine)",
+      "input_summary": "verify high frequencies are attenuated",
+      "output_summary": "high freq attenuated by 39.1 dB",
+      "duration_ns": 28534,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "sosfilt",
+    "signal_length": 1000,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 46388,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_16_sosfilt --nocapture"
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "scenario_id": "scenario_24_get_window_fftbins",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "hann_default_is_periodic",
+      "action": "get_window('hann', 8)",
+      "input_summary": "SciPy default fftbins=True periodic Hann",
+      "output_summary": "periodic hann max_diff=1.11e-16",
+      "duration_ns": 17583,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "hann_explicit_symmetric",
+      "action": "get_window_with_fftbins('hann', 8, false)",
+      "input_summary": "fftbins=False should return symmetric Hann",
+      "output_summary": "symmetric hann max_diff=1.11e-16",
+      "duration_ns": 2926,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "suffix_overrides_flag",
+      "action": "get_window_with_fftbins('hann_periodic', 8, false)",
+      "input_summary": "_periodic/_symmetric suffixes should override fftbins",
+      "output_summary": "periodic_diff=1.11e-16, symmetric_diff=1.11e-16",
+      "duration_ns": 10420,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "parameterized_gaussian_fftbins",
+      "action": "get_window('gaussian,2.0', 8)",
+      "input_summary": "parameterized windows should respect periodic vs symmetric forms",
+      "output_summary": "periodic_diff=0.00e0, symmetric_diff=0.00e0",
+      "duration_ns": 36229,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "get_window",
+    "signal_length": 8,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 82717,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_24_get_window_fftbins --nocapture"
+  }
+}

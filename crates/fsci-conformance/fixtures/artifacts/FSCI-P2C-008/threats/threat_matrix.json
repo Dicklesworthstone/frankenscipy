@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-008",
+  "scope": "packet",
+  "generated_at": "2026-03-13T05:15:00Z",
+  "compatibility_envelope": {
+    "scipy_version_min": "N/A",
+    "scipy_version_max": "N/A",
+    "known_differences": [
+      {
+        "version": "N/A",
+        "description": "CASP runtime is a FrankenSciPy innovation with no SciPy equivalent. All behavior is novel.",
+        "affected_functions": ["PolicyController", "SolverPortfolio", "ConformalCalibrator"]
+      }
+    ]
+  },
+  "threats": [
+    {
+      "threat_id": "THREAT-CASP-001",
+      "subsystem": "fsci-runtime/policy",
+      "category": "numerical_instability",
+      "severity": "high",
+      "likelihood": "moderate",
+      "description": "NaN or Inf signal values in DecisionSignals can corrupt logit computation and softmax posterior, leading to incorrect policy decisions. Clamping to [0,1] mitigates but extreme values (Inf) may still produce unexpected behavior before clamping.",
+      "mitigation": "DecisionSignals provides is_finite() check. Logit computation clamps all signal values to [0,1] range before use. NaN signals are clamped to 0.0.",
+      "test_reference": "FSCI-P2C-008_runtime_casp.json::policy_low_risk_strict",
+      "strict_mode_response": "Clamping applied unconditionally; no explicit error for non-finite signals.",
+      "hardened_mode_response": "Same clamping behavior; callers should check is_finite() pre-decision."
+    },
+    {
+      "threat_id": "THREAT-CASP-002",
+      "subsystem": "fsci-runtime/solver_portfolio",
+      "category": "misclassification",
+      "severity": "critical",
+      "likelihood": "moderate",
+      "description": "Hard classification of matrix condition state into unit posterior (100% probability) means any misclassification of the condition state propagates directly into solver selection with no hedging. If condition estimation is wrong, the selected solver may be inappropriate.",
+      "mitigation": "ConformalCalibrator monitors backward errors and triggers SVD fallback when empirical miscoverage rate exceeds threshold, providing a safety net for systematic misclassification.",
+      "test_reference": "FSCI-P2C-008_runtime_casp.json::calibrator_high_violations",
+      "strict_mode_response": "SVD fallback triggered by calibrator when drift detected.",
+      "hardened_mode_response": "Same fallback mechanism."
+    },
+    {
+      "threat_id": "THREAT-CASP-003",
+      "subsystem": "fsci-runtime/calibrator",
+      "category": "resource_exhaustion",
+      "severity": "medium",
+      "likelihood": "low",
+      "description": "Bounded circular buffer (default 200 entries) means the calibrator has finite memory. Long-running applications that alternate between good and bad phases may not detect drift if the violation window is larger than the buffer capacity.",
+      "mitigation": "Buffer capacity is configurable at construction. Applications with long drift windows should increase capacity. Minimum 10 observations before fallback triggers prevents false positives during warmup.",
+      "test_reference": "FSCI-P2C-008_runtime_casp.json::calibrator_few_observations",
+      "strict_mode_response": "No fallback with fewer than 10 observations regardless of violation rate.",
+      "hardened_mode_response": "Same behavior; warmup threshold is unconditional."
+    },
+    {
+      "threat_id": "THREAT-CASP-004",
+      "subsystem": "fsci-runtime/policy",
+      "category": "information_leakage",
+      "severity": "low",
+      "likelihood": "low",
+      "description": "PolicyEvidenceLedger records all decision evidence including signal values, posteriors, and actions. In multi-tenant environments, this audit trail could leak information about one workload's numerical characteristics to another.",
+      "mitigation": "Evidence ledger is bounded (FIFO eviction) and local to each PolicyController instance. No cross-instance sharing. Callers are responsible for access control on evidence data.",
+      "test_reference": "N/A (architectural concern, not testable via fixture)",
+      "strict_mode_response": "Evidence recorded with full detail.",
+      "hardened_mode_response": "Same recording behavior."
+    }
+  ]
+}

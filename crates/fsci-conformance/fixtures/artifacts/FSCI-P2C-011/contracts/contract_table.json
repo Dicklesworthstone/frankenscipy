@@ -1,0 +1,388 @@
+{
+  "contracts": [
+    {
+      "function_name": "fsci_signal::barthann",
+      "scipy_equivalent": "scipy.signal.windows.barthann",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::bartlett",
+      "scipy_equivalent": "scipy.signal.windows.bartlett",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::bessel",
+      "scipy_equivalent": "scipy.signal.bessel",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::blackman",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::blackmanharris",
+      "scipy_equivalent": "scipy.signal.windows.blackmanharris",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::bohman",
+      "scipy_equivalent": "scipy.signal.windows.bohman",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::boxcar",
+      "scipy_equivalent": "scipy.signal.windows.boxcar",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::butter",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::chebwin",
+      "scipy_equivalent": "scipy.signal.windows.chebwin",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::cheby1",
+      "scipy_equivalent": "scipy.signal.cheby1",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::cheby2",
+      "scipy_equivalent": "scipy.signal.cheby2",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::convolve",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::correlate",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::cosine",
+      "scipy_equivalent": "scipy.signal.windows.cosine",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::detrend",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::dpss",
+      "scipy_equivalent": "scipy.signal.windows.dpss",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::ellip",
+      "scipy_equivalent": "scipy.signal.ellip",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::exponential",
+      "scipy_equivalent": "scipy.signal.windows.exponential",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::find_peaks",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::firls",
+      "scipy_equivalent": "scipy.signal.firls",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::firwin",
+      "scipy_equivalent": "scipy.signal.firwin",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::firwin2",
+      "scipy_equivalent": "scipy.signal.firwin2",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::flattop",
+      "scipy_equivalent": "scipy.signal.windows.flattop",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::freqz",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::gaussian",
+      "scipy_equivalent": "scipy.signal.windows.gaussian",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::general_cosine",
+      "scipy_equivalent": "scipy.signal.windows.general_cosine",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::general_hamming",
+      "scipy_equivalent": "scipy.signal.windows.general_hamming",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::hamming",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::hann",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::hilbert",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::kaiser",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::kaiser_bessel_derived",
+      "scipy_equivalent": "scipy.signal.windows.kaiser_bessel_derived",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::lanczos",
+      "scipy_equivalent": "scipy.signal.windows.lanczos",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::minimum_phase",
+      "scipy_equivalent": "scipy.signal.minimum_phase",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::nuttall",
+      "scipy_equivalent": "scipy.signal.windows.nuttall",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::parzen",
+      "scipy_equivalent": "scipy.signal.windows.parzen",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::remez",
+      "scipy_equivalent": "scipy.signal.remez",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::savgol_filter (mode=nearest)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::savgol_filter (mode=constant)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::savgol_filter (mode=mirror)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::savgol_filter (mode=wrap)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::savgol_filter (scipy default mode=interp)",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-08
+      }
+    },
+    {
+      "function_name": "fsci_signal::taylor",
+      "scipy_equivalent": "scipy.signal.windows.taylor",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    },
+    {
+      "function_name": "fsci_signal::tukey",
+      "scipy_equivalent": "scipy.signal.windows.tukey",
+      "tolerance_policy": {
+        "comparison_mode": "allclose",
+        "default_atol": 1e-10,
+        "default_rtol": 1e-09
+      }
+    }
+  ],
+  "domain": "signal",
+  "generated_at": "2026-04-23T00:00:00Z",
+  "packet_id": "FSCI-P2C-011",
+  "schema_version": 1
+}

@@ -1,0 +1,330 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-007",
+  "domain": "arrayapi",
+  "generated_at": "2026-04-22T23:19:05Z",
+  "contracts": [
+    {
+      "function_name": "fsci_arrayapi::creation::zeros",
+      "scipy_equivalent": "numpy.zeros",
+      "inputs": [
+        {
+          "name": "shape",
+          "type_desc": "&[usize]",
+          "required": true,
+          "constraints": "Any fixture-supported shape, including rank-0 scalars and higher-rank tensors."
+        },
+        {
+          "name": "dtype",
+          "type_desc": "ArrayApiFixtureDType",
+          "required": true,
+          "constraints": "Any dtype supported by the Array API fixture surface."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Array",
+          "semantics": "Array of the requested shape and dtype filled with additive identity 0."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Zero construction is deterministic; values, shape, and dtype must match exactly."
+      },
+      "strict_mode_behavior": "Return zeros for every element in the requested output shape using the requested dtype.",
+      "hardened_mode_behavior": "Same as strict mode; malformed shapes or unsupported dtypes fail before allocation."
+    },
+    {
+      "function_name": "fsci_arrayapi::creation::ones",
+      "scipy_equivalent": "numpy.ones",
+      "inputs": [
+        {
+          "name": "shape",
+          "type_desc": "&[usize]",
+          "required": true,
+          "constraints": "Any fixture-supported shape."
+        },
+        {
+          "name": "dtype",
+          "type_desc": "ArrayApiFixtureDType",
+          "required": true,
+          "constraints": "Any dtype supported by the Array API fixture surface."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Array",
+          "semantics": "Array of the requested shape and dtype filled with multiplicative identity 1."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "One construction is deterministic; values, shape, and dtype must match exactly."
+      },
+      "strict_mode_behavior": "Return ones for every element in the requested output shape using the requested dtype.",
+      "hardened_mode_behavior": "Same as strict mode; malformed shapes or unsupported dtypes fail before allocation."
+    },
+    {
+      "function_name": "fsci_arrayapi::creation::full",
+      "scipy_equivalent": "numpy.full",
+      "inputs": [
+        {
+          "name": "shape",
+          "type_desc": "&[usize]",
+          "required": true,
+          "constraints": "Any fixture-supported shape."
+        },
+        {
+          "name": "fill_value",
+          "type_desc": "ArrayApiFixtureScalar",
+          "required": true,
+          "constraints": "Scalar value broadcast into every element."
+        },
+        {
+          "name": "dtype",
+          "type_desc": "ArrayApiFixtureDType",
+          "required": true,
+          "constraints": "Target dtype for the constructed array."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Array",
+          "semantics": "Array filled with the provided scalar value after dtype conversion."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Fill construction is deterministic for the fixture surface, including complex128 payloads."
+      },
+      "strict_mode_behavior": "Broadcast the fill value to the requested shape and cast into the requested dtype.",
+      "hardened_mode_behavior": "Same as strict mode; reject malformed scalar encodings before construction."
+    },
+    {
+      "function_name": "fsci_arrayapi::creation::arange",
+      "scipy_equivalent": "numpy.arange",
+      "inputs": [
+        {
+          "name": "start",
+          "type_desc": "ArrayApiFixtureScalar",
+          "required": true,
+          "constraints": "Inclusive lower bound for range generation."
+        },
+        {
+          "name": "stop",
+          "type_desc": "ArrayApiFixtureScalar",
+          "required": true,
+          "constraints": "Exclusive upper bound for range generation."
+        },
+        {
+          "name": "step",
+          "type_desc": "ArrayApiFixtureScalar",
+          "required": true,
+          "constraints": "Non-zero step value with sign consistent with the desired traversal."
+        },
+        {
+          "name": "dtype",
+          "type_desc": "Option<ArrayApiFixtureDType>",
+          "required": false,
+          "constraints": "Optional dtype override for the result."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Array",
+          "semantics": "Half-open numeric sequence produced by repeated stepping from start toward stop."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-12,
+        "notes": "Floating-point stepping may accumulate endpoint drift; near-equal values should still match."
+      },
+      "strict_mode_behavior": "Emit the half-open range defined by start, stop, and step, mirroring the Array API fixture semantics.",
+      "hardened_mode_behavior": "Same as strict mode; reject zero steps and impossible traversals before sequence generation."
+    },
+    {
+      "function_name": "fsci_arrayapi::creation::linspace",
+      "scipy_equivalent": "numpy.linspace",
+      "inputs": [
+        {
+          "name": "start",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Lower endpoint of the interpolation interval."
+        },
+        {
+          "name": "stop",
+          "type_desc": "f64",
+          "required": true,
+          "constraints": "Upper endpoint of the interpolation interval."
+        },
+        {
+          "name": "num",
+          "type_desc": "usize",
+          "required": true,
+          "constraints": "Number of samples to emit."
+        },
+        {
+          "name": "endpoint",
+          "type_desc": "bool",
+          "required": true,
+          "constraints": "Whether the stop value is included in the output."
+        },
+        {
+          "name": "dtype",
+          "type_desc": "Option<ArrayApiFixtureDType>",
+          "required": false,
+          "constraints": "Optional dtype override for the result."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Array",
+          "semantics": "Evenly spaced samples spanning the requested interval."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "mixed",
+        "default_atol": 1e-12,
+        "default_rtol": 1e-12,
+        "notes": "Floating-point interpolation of evenly spaced samples may differ by rounding at the final ulps."
+      },
+      "strict_mode_behavior": "Emit evenly spaced samples across the interval, respecting the endpoint flag and requested dtype.",
+      "hardened_mode_behavior": "Same as strict mode; reject zero-length and malformed requests before interpolation."
+    },
+    {
+      "function_name": "fsci_arrayapi::dtype::promote_and_broadcast",
+      "scipy_equivalent": "array_api.broadcast_shapes",
+      "inputs": [
+        {
+          "name": "shapes",
+          "type_desc": "&[Vec<usize>]",
+          "required": true,
+          "constraints": "Two or more shapes participating in an Array API broadcast computation."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "shape",
+          "type_desc": "Vec<usize>",
+          "semantics": "Broadcast-compatible result shape."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Broadcasted shape resolution is categorical; no numeric tolerance applies."
+      },
+      "strict_mode_behavior": "Return the broadcast-compatible output shape for the provided inputs.",
+      "hardened_mode_behavior": "Same as strict mode; reject impossible broadcast combinations with an error before shape synthesis."
+    },
+    {
+      "function_name": "fsci_arrayapi::dtype::result_type",
+      "scipy_equivalent": "numpy.result_type",
+      "inputs": [
+        {
+          "name": "dtypes",
+          "type_desc": "&[ArrayApiFixtureDType]",
+          "required": true,
+          "constraints": "At least one dtype from the fixture-supported set."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "dtype",
+          "type_desc": "ArrayApiFixtureDType",
+          "semantics": "Promoted result dtype for the provided dtype set."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Type promotion is categorical; no numeric tolerance applies."
+      },
+      "strict_mode_behavior": "Return the Array API result-type promotion for the provided dtypes.",
+      "hardened_mode_behavior": "Same as strict mode."
+    },
+    {
+      "function_name": "fsci_arrayapi::conversion::asarray",
+      "scipy_equivalent": "numpy.asarray",
+      "inputs": [
+        {
+          "name": "values",
+          "type_desc": "&[ArrayApiFixtureScalar]",
+          "required": true,
+          "constraints": "Flat source values compatible with the requested shape."
+        },
+        {
+          "name": "shape",
+          "type_desc": "&[usize]",
+          "required": true,
+          "constraints": "Requested output shape whose element count matches the source values."
+        },
+        {
+          "name": "dtype",
+          "type_desc": "ArrayApiFixtureDType",
+          "required": true,
+          "constraints": "Target dtype for the constructed array."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Array",
+          "semantics": "Array with the requested shape, dtype, and source values preserved in row-major order."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Asarray conversion in the fixture surface is deterministic and should match exactly."
+      },
+      "strict_mode_behavior": "Construct an array from the provided scalar payload, preserving row-major ordering.",
+      "hardened_mode_behavior": "Same as strict mode; reject length/shape mismatches before allocation."
+    },
+    {
+      "function_name": "fsci_arrayapi::indexing::getitem",
+      "scipy_equivalent": "numpy.ndarray.__getitem__",
+      "inputs": [
+        {
+          "name": "source",
+          "type_desc": "Array",
+          "required": true,
+          "constraints": "Source array built from fixture values and shape metadata."
+        },
+        {
+          "name": "index",
+          "type_desc": "ArrayApiFixtureIndexExpr",
+          "required": true,
+          "constraints": "Basic or advanced indexing expression within the bounds of the source array."
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "type_desc": "Array",
+          "semantics": "Indexed view/materialization produced by the requested getitem operation."
+        }
+      ],
+      "error_conditions": [],
+      "tolerance_policy": {
+        "comparison_mode": "exact",
+        "notes": "Indexed values and ordering should match exactly for the fixture surface."
+      },
+      "strict_mode_behavior": "Apply the requested basic or advanced indexing expression and return the selected values.",
+      "hardened_mode_behavior": "Same as strict mode; reject malformed indexing metadata before execution."
+    }
+  ]
+}

@@ -1,0 +1,347 @@
+{
+  "generated_at": "unix:1780765806",
+  "operation_benchmarks": [
+    {
+      "operation": "fft",
+      "size_desc": "n=16",
+      "n": 16,
+      "iterations": 20,
+      "median_ns": 6242,
+      "p95_ns": 19948,
+      "min_ns": 6091,
+      "max_ns": 19948,
+      "mean_ns": 7105
+    },
+    {
+      "operation": "fft",
+      "size_desc": "n=64",
+      "n": 64,
+      "iterations": 20,
+      "median_ns": 14187,
+      "p95_ns": 27372,
+      "min_ns": 14056,
+      "max_ns": 27372,
+      "mean_ns": 16054
+    },
+    {
+      "operation": "fft",
+      "size_desc": "n=256",
+      "n": 256,
+      "iterations": 20,
+      "median_ns": 36148,
+      "p95_ns": 99850,
+      "min_ns": 35137,
+      "max_ns": 99850,
+      "mean_ns": 41216
+    },
+    {
+      "operation": "fft",
+      "size_desc": "n=1024",
+      "n": 1024,
+      "iterations": 20,
+      "median_ns": 150716,
+      "p95_ns": 196623,
+      "min_ns": 120409,
+      "max_ns": 196623,
+      "mean_ns": 151211
+    },
+    {
+      "operation": "ifft",
+      "size_desc": "n=16",
+      "n": 16,
+      "iterations": 20,
+      "median_ns": 4008,
+      "p95_ns": 4128,
+      "min_ns": 3957,
+      "max_ns": 4128,
+      "mean_ns": 4008
+    },
+    {
+      "operation": "ifft",
+      "size_desc": "n=64",
+      "n": 64,
+      "iterations": 20,
+      "median_ns": 9268,
+      "p95_ns": 17483,
+      "min_ns": 9217,
+      "max_ns": 17483,
+      "mean_ns": 10059
+    },
+    {
+      "operation": "ifft",
+      "size_desc": "n=256",
+      "n": 256,
+      "iterations": 20,
+      "median_ns": 29536,
+      "p95_ns": 35036,
+      "min_ns": 29435,
+      "max_ns": 35036,
+      "mean_ns": 29938
+    },
+    {
+      "operation": "ifft",
+      "size_desc": "n=1024",
+      "n": 1024,
+      "iterations": 20,
+      "median_ns": 157418,
+      "p95_ns": 245505,
+      "min_ns": 156026,
+      "max_ns": 245505,
+      "mean_ns": 168908
+    },
+    {
+      "operation": "rfft",
+      "size_desc": "n=16",
+      "n": 16,
+      "iterations": 20,
+      "median_ns": 4569,
+      "p95_ns": 10761,
+      "min_ns": 4499,
+      "max_ns": 10761,
+      "mean_ns": 4882
+    },
+    {
+      "operation": "rfft",
+      "size_desc": "n=64",
+      "n": 64,
+      "iterations": 20,
+      "median_ns": 10149,
+      "p95_ns": 10239,
+      "min_ns": 10009,
+      "max_ns": 10239,
+      "mean_ns": 10138
+    },
+    {
+      "operation": "rfft",
+      "size_desc": "n=256",
+      "n": 256,
+      "iterations": 20,
+      "median_ns": 26541,
+      "p95_ns": 36178,
+      "min_ns": 26421,
+      "max_ns": 36178,
+      "mean_ns": 27072
+    },
+    {
+      "operation": "rfft",
+      "size_desc": "n=1024",
+      "n": 1024,
+      "iterations": 20,
+      "median_ns": 101262,
+      "p95_ns": 207444,
+      "min_ns": 99649,
+      "max_ns": 207444,
+      "mean_ns": 114125
+    },
+    {
+      "operation": "irfft",
+      "size_desc": "n=16",
+      "n": 16,
+      "iterations": 20,
+      "median_ns": 5451,
+      "p95_ns": 12364,
+      "min_ns": 5390,
+      "max_ns": 12364,
+      "mean_ns": 5806
+    },
+    {
+      "operation": "irfft",
+      "size_desc": "n=64",
+      "n": 64,
+      "iterations": 20,
+      "median_ns": 13786,
+      "p95_ns": 13956,
+      "min_ns": 13636,
+      "max_ns": 13956,
+      "mean_ns": 13801
+    },
+    {
+      "operation": "irfft",
+      "size_desc": "n=256",
+      "n": 256,
+      "iterations": 20,
+      "median_ns": 44143,
+      "p95_ns": 50966,
+      "min_ns": 43683,
+      "max_ns": 50966,
+      "mean_ns": 44557
+    },
+    {
+      "operation": "irfft",
+      "size_desc": "n=1024",
+      "n": 1024,
+      "iterations": 20,
+      "median_ns": 148882,
+      "p95_ns": 198396,
+      "min_ns": 146377,
+      "max_ns": 198396,
+      "mean_ns": 159949
+    },
+    {
+      "operation": "fft2",
+      "size_desc": "8x8",
+      "n": 64,
+      "iterations": 20,
+      "median_ns": 14116,
+      "p95_ns": 14367,
+      "min_ns": 13936,
+      "max_ns": 14367,
+      "mean_ns": 14110
+    },
+    {
+      "operation": "fft2",
+      "size_desc": "16x16",
+      "n": 256,
+      "iterations": 20,
+      "median_ns": 44364,
+      "p95_ns": 52910,
+      "min_ns": 44194,
+      "max_ns": 52910,
+      "mean_ns": 44870
+    },
+    {
+      "operation": "fft2",
+      "size_desc": "32x32",
+      "n": 1024,
+      "iterations": 20,
+      "median_ns": 175553,
+      "p95_ns": 228544,
+      "min_ns": 174140,
+      "max_ns": 228544,
+      "mean_ns": 179046
+    },
+    {
+      "operation": "polynomial_multiply_fft",
+      "size_desc": "degree<16 x degree<16",
+      "n": 16,
+      "iterations": 20,
+      "median_ns": 21280,
+      "p95_ns": 40717,
+      "min_ns": 21140,
+      "max_ns": 40717,
+      "mean_ns": 23259
+    },
+    {
+      "operation": "polynomial_multiply_fft",
+      "size_desc": "degree<64 x degree<64",
+      "n": 64,
+      "iterations": 20,
+      "median_ns": 52159,
+      "p95_ns": 63300,
+      "min_ns": 51918,
+      "max_ns": 63300,
+      "mean_ns": 52944
+    },
+    {
+      "operation": "polynomial_multiply_fft",
+      "size_desc": "degree<256 x degree<256",
+      "n": 256,
+      "iterations": 20,
+      "median_ns": 193977,
+      "p95_ns": 208104,
+      "min_ns": 193226,
+      "max_ns": 208104,
+      "mean_ns": 195851
+    },
+    {
+      "operation": "polynomial_multiply_fft",
+      "size_desc": "degree<1024 x degree<1024",
+      "n": 1024,
+      "iterations": 20,
+      "median_ns": 1166421,
+      "p95_ns": 1427886,
+      "min_ns": 887452,
+      "max_ns": 1427886,
+      "mean_ns": 1190395
+    }
+  ],
+  "hotspot_ranking": [
+    {
+      "rank": 1,
+      "operation": "polynomial_multiply_fft",
+      "size_desc": "degree<1024 x degree<1024",
+      "median_ns": 1166421,
+      "fraction_of_total": 0.6138243769773694
+    },
+    {
+      "rank": 2,
+      "operation": "fft2",
+      "size_desc": "32x32",
+      "median_ns": 175553,
+      "fraction_of_total": 0.09238406274536219
+    },
+    {
+      "rank": 3,
+      "operation": "ifft",
+      "size_desc": "n=1024",
+      "median_ns": 157418,
+      "fraction_of_total": 0.08284059166889444
+    },
+    {
+      "rank": 4,
+      "operation": "fft",
+      "size_desc": "n=1024",
+      "median_ns": 150716,
+      "fraction_of_total": 0.07931369102624283
+    },
+    {
+      "rank": 5,
+      "operation": "irfft",
+      "size_desc": "n=1024",
+      "median_ns": 148882,
+      "fraction_of_total": 0.078348555875747
+    },
+    {
+      "rank": 6,
+      "operation": "rfft",
+      "size_desc": "n=1024",
+      "median_ns": 101262,
+      "fraction_of_total": 0.053288721706384205
+    }
+  ],
+  "memory_notes": [
+    {
+      "operation": "fft",
+      "size": "n=1024",
+      "estimated_input_bytes": 16384,
+      "notes": "Input: 1024 complex64 (16KB). O(n²) naive DFT allocates output vec."
+    },
+    {
+      "operation": "fft2",
+      "size": "32x32",
+      "estimated_input_bytes": 16384,
+      "notes": "Input: 1024 complex64 (16KB). Row + column transforms, two allocations."
+    },
+    {
+      "operation": "polynomial_multiply_fft",
+      "size": "degree<1024 x degree<1024",
+      "estimated_input_bytes": 16384,
+      "notes": "Two real coefficient buffers; FFT path pads to next power-of-two product length and compares against direct O(n^2) oracle."
+    }
+  ],
+  "isomorphism_check": {
+    "all_operations_pass": true,
+    "details": [
+      {
+        "operation": "fft_ifft_roundtrip",
+        "passes": true,
+        "note": "max_err=3.14e-16"
+      },
+      {
+        "operation": "rfft_irfft_roundtrip",
+        "passes": true,
+        "note": "max_err=4.44e-16"
+      },
+      {
+        "operation": "parseval_energy",
+        "passes": true,
+        "note": "rel_err=0.00e0"
+      },
+      {
+        "operation": "polynomial_multiply_fft_direct_convolution",
+        "passes": true,
+        "note": "max_err=2.84e-14"
+      }
+    ]
+  }
+}

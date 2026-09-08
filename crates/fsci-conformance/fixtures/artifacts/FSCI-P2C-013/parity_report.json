@@ -1,0 +1,280 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-013",
+  "family": "integrate_core",
+  "case_results": [
+    {
+      "case_id": "trapezoid_linear_5pt",
+      "passed": true,
+      "message": "scalar match: 8"
+    },
+    {
+      "case_id": "trapezoid_quadratic_5pt",
+      "passed": true,
+      "message": "scalar match: 22"
+    },
+    {
+      "case_id": "simpson_linear_5pt",
+      "passed": true,
+      "message": "scalar match: 8"
+    },
+    {
+      "case_id": "simpson_quadratic_5pt",
+      "passed": true,
+      "message": "scalar match: 21.333333333333332"
+    },
+    {
+      "case_id": "cumulative_trapezoid_linear",
+      "passed": true,
+      "message": "array match (4 elements)"
+    },
+    {
+      "case_id": "cumulative_simpson_linear",
+      "passed": true,
+      "message": "array match (4 elements)"
+    },
+    {
+      "case_id": "romb_uniform_9pt",
+      "passed": true,
+      "message": "scalar match: 21.333333333333332"
+    },
+    {
+      "case_id": "newton_cotes_n3",
+      "passed": true,
+      "message": "array match (4 elements)"
+    },
+    {
+      "case_id": "newton_cotes_n4",
+      "passed": true,
+      "message": "array match (5 elements)"
+    },
+    {
+      "case_id": "fixed_quad_linear_n5",
+      "passed": true,
+      "message": "scalar match: 1.9999999999999998"
+    },
+    {
+      "case_id": "fixed_quad_quadratic_n5",
+      "passed": true,
+      "message": "scalar match: 0.33333333333333326"
+    },
+    {
+      "case_id": "gauss_legendre_linear_n5",
+      "passed": true,
+      "message": "scalar match: 1.9999999999999998"
+    },
+    {
+      "case_id": "gauss_legendre_cubic_n5",
+      "passed": true,
+      "message": "scalar match: 0.24999999999999994"
+    },
+    {
+      "case_id": "trapezoid_uniform_10pt",
+      "passed": true,
+      "message": "scalar match: 244.5"
+    },
+    {
+      "case_id": "simpson_quadratic_uniform_9pt",
+      "passed": true,
+      "message": "scalar match: 170.66666666666666"
+    },
+    {
+      "case_id": "newton_cotes_n2",
+      "passed": true,
+      "message": "array match (3 elements)"
+    },
+    {
+      "case_id": "trapezoid_2pt_minimal",
+      "passed": true,
+      "message": "scalar match: 0.5"
+    },
+    {
+      "case_id": "cumulative_trapezoid_quadratic",
+      "passed": true,
+      "message": "array match (4 elements)"
+    },
+    {
+      "case_id": "trapezoid_constant_function",
+      "passed": true,
+      "message": "scalar match: 12"
+    },
+    {
+      "case_id": "simpson_cubic_7pt",
+      "passed": true,
+      "message": "scalar match: 324"
+    },
+    {
+      "case_id": "newton_cotes_n1",
+      "passed": true,
+      "message": "array match (2 elements)"
+    },
+    {
+      "case_id": "trapezoid_nonuniform_spacing",
+      "passed": true,
+      "message": "scalar match: 10"
+    },
+    {
+      "case_id": "fixed_quad_sine_n10",
+      "passed": true,
+      "message": "scalar match: 1.9999999999999996"
+    },
+    {
+      "case_id": "cubature_scalar_unit_square_product",
+      "passed": true,
+      "message": "scalar match: 0.25"
+    },
+    {
+      "case_id": "cubature_vector_1d_powers",
+      "passed": true,
+      "message": "array match (2 elements)"
+    },
+    {
+      "case_id": "cubature_reversed_bounds_preserve_orientation",
+      "passed": true,
+      "message": "scalar match: -1"
+    },
+    {
+      "case_id": "cubature_zero_dim_vector",
+      "passed": true,
+      "message": "array match (2 elements)"
+    },
+    {
+      "case_id": "cubature_rejects_mismatched_bounds",
+      "passed": true,
+      "message": "error match: cubature bounds must have the same dimensionality"
+    },
+    {
+      "case_id": "ivp_solve_exponential_decay_rk45",
+      "passed": true,
+      "message": "ivp match (3 steps, 1 vars)"
+    },
+    {
+      "case_id": "ivp_solve_linear_growth_rk45",
+      "passed": true,
+      "message": "ivp match (3 steps, 1 vars)"
+    },
+    {
+      "case_id": "ivp_solve_harmonic_oscillator_rk45",
+      "passed": true,
+      "message": "ivp match (3 steps, 2 vars)"
+    },
+    {
+      "case_id": "ivp_solve_stiff_decay_bdf",
+      "passed": true,
+      "message": "ivp match (3 steps, 1 vars)"
+    },
+    {
+      "case_id": "ivp_solve_linear_growth_terminal_event",
+      "passed": true,
+      "message": "ivp match (2 steps, 1 vars)"
+    },
+    {
+      "case_id": "ivp_solve_nan_rtol_hardened",
+      "passed": true,
+      "message": "error match: NonFiniteRtol"
+    },
+    {
+      "case_id": "ivp_solve_nan_first_step_hardened",
+      "passed": true,
+      "message": "error match: NonFiniteFirstStep"
+    },
+    {
+      "case_id": "odeint_linear_growth_legacy",
+      "passed": true,
+      "message": "ivp match (3 steps, 1 vars)"
+    },
+    {
+      "case_id": "quad_x_squared_unit",
+      "passed": true,
+      "message": "scalar match: 0.33333333333333354"
+    },
+    {
+      "case_id": "quad_vec_linear_square_unit",
+      "passed": true,
+      "message": "array match (2 elements)"
+    },
+    {
+      "case_id": "dblquad_xy_unit_square",
+      "passed": true,
+      "message": "scalar match: 0.2500000000000002"
+    },
+    {
+      "case_id": "tplquad_xyz_unit_cube",
+      "passed": true,
+      "message": "scalar match: 0.12500000000000017"
+    },
+    {
+      "case_id": "quad_x_over_0_1",
+      "passed": true,
+      "message": "scalar match: 0.5000000000000002"
+    },
+    {
+      "case_id": "quad_sin_over_0_pi",
+      "passed": true,
+      "message": "scalar match: 2.000000000000001"
+    },
+    {
+      "case_id": "quad_vec_linear_square",
+      "passed": true,
+      "message": "array match (2 elements)"
+    },
+    {
+      "case_id": "dblquad_xy_prod_unit",
+      "passed": true,
+      "message": "scalar match: 0.2500000000000002"
+    },
+    {
+      "case_id": "tplquad_xyz_prod_unit",
+      "passed": true,
+      "message": "scalar match: 0.12500000000000017"
+    },
+    {
+      "case_id": "ivp_lsoda_robertson_short",
+      "passed": true,
+      "message": "ivp match (4 steps, 3 vars)"
+    },
+    {
+      "case_id": "ivp_lsoda_linear_growth",
+      "passed": true,
+      "message": "ivp match (3 steps, 1 vars)"
+    },
+    {
+      "case_id": "ivp_lsoda_exponential_decay",
+      "passed": true,
+      "message": "ivp match (5 steps, 1 vars)"
+    },
+    {
+      "case_id": "ivp_dense_rk45_expdecay",
+      "passed": true,
+      "message": "ivp match (5 steps, 1 vars)"
+    },
+    {
+      "case_id": "ivp_dense_lsoda_linear_growth",
+      "passed": true,
+      "message": "ivp match (5 steps, 1 vars)"
+    },
+    {
+      "case_id": "br_gm7n_qmc_quad_1d_x_squared",
+      "passed": true,
+      "message": "scalar match: 0.33327230066106495"
+    },
+    {
+      "case_id": "br_gm7n_qmc_quad_1d_sin_oscillatory",
+      "passed": true,
+      "message": "scalar match: 2.000000049022855"
+    },
+    {
+      "case_id": "br_gm7n_qmc_quad_2d_linear",
+      "passed": true,
+      "message": "scalar match: 0.9997093067041005"
+    },
+    {
+      "case_id": "br_gm7n_qmc_quad_2d_exp_neg_xy",
+      "passed": true,
+      "message": "scalar match: 0.7967366093084669"
+    }
+  ],
+  "passed_cases": 54,
+  "failed_cases": 0,
+  "generated_unix_ms": 1782538342446
+}

@@ -1,0 +1,411 @@
+{
+  "manifest": {
+    "packet_id": "FSCI-P2C-002",
+    "generated_at": "unix:1780675574",
+    "fixtures": [
+      {
+        "fixture_id": "diag_dominant_4x4",
+        "dimensions": [
+          4,
+          4
+        ],
+        "structure": "diag_dominant",
+        "condition_note": "well-conditioned, rcond ~ O(1/n)",
+        "operations": [
+          "solve",
+          "inv",
+          "det"
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_16x16",
+        "dimensions": [
+          16,
+          16
+        ],
+        "structure": "diag_dominant",
+        "condition_note": "well-conditioned",
+        "operations": [
+          "solve",
+          "inv",
+          "det"
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_64x64",
+        "dimensions": [
+          64,
+          64
+        ],
+        "structure": "diag_dominant",
+        "condition_note": "well-conditioned",
+        "operations": [
+          "solve",
+          "inv",
+          "det"
+        ]
+      },
+      {
+        "fixture_id": "upper_tri_4x4",
+        "dimensions": [
+          4,
+          4
+        ],
+        "structure": "upper_triangular",
+        "condition_note": "triangular, rcond varies",
+        "operations": [
+          "solve_triangular"
+        ]
+      },
+      {
+        "fixture_id": "upper_tri_16x16",
+        "dimensions": [
+          16,
+          16
+        ],
+        "structure": "upper_triangular",
+        "condition_note": "triangular",
+        "operations": [
+          "solve_triangular"
+        ]
+      },
+      {
+        "fixture_id": "tridiag_banded_16x16",
+        "dimensions": [
+          16,
+          16
+        ],
+        "structure": "tridiagonal_banded",
+        "condition_note": "banded, l=1, u=1",
+        "operations": [
+          "solve_banded"
+        ]
+      },
+      {
+        "fixture_id": "overdetermined_32x16",
+        "dimensions": [
+          32,
+          16
+        ],
+        "structure": "overdetermined_rectangular",
+        "condition_note": "tall matrix, well-conditioned",
+        "operations": [
+          "lstsq",
+          "pinv"
+        ]
+      },
+      {
+        "fixture_id": "overdetermined_128x64",
+        "dimensions": [
+          128,
+          64
+        ],
+        "structure": "overdetermined_rectangular",
+        "condition_note": "tall matrix",
+        "operations": [
+          "lstsq",
+          "pinv"
+        ]
+      }
+    ]
+  },
+  "parity_gates": {
+    "packet_id": "FSCI-P2C-002",
+    "all_gates_pass": true,
+    "gates": [
+      {
+        "fixture_id": "diag_dominant_4x4",
+        "operation": "solve",
+        "pass": true,
+        "max_abs_diff": 8.881784197001252e-16,
+        "max_rel_diff": 2.9605947323337506e-16,
+        "tolerance_used": 1e-10,
+        "matrix_dims": [
+          4,
+          4
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_16x16",
+        "operation": "solve",
+        "pass": true,
+        "max_abs_diff": 3.552713678800501e-15,
+        "max_rel_diff": 3.9474596431116675e-16,
+        "tolerance_used": 1e-10,
+        "matrix_dims": [
+          16,
+          16
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_64x64",
+        "operation": "solve",
+        "pass": true,
+        "max_abs_diff": 4.973799150320701e-14,
+        "max_rel_diff": 1.1842378929335002e-15,
+        "tolerance_used": 1e-10,
+        "matrix_dims": [
+          64,
+          64
+        ]
+      },
+      {
+        "fixture_id": "upper_tri_4x4",
+        "operation": "solve_triangular",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "max_rel_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "matrix_dims": [
+          4,
+          4
+        ]
+      },
+      {
+        "fixture_id": "upper_tri_16x16",
+        "operation": "solve_triangular",
+        "pass": true,
+        "max_abs_diff": 3.552713678800501e-15,
+        "max_rel_diff": 3.552713678800501e-16,
+        "tolerance_used": 1e-10,
+        "matrix_dims": [
+          16,
+          16
+        ]
+      },
+      {
+        "fixture_id": "tridiag_banded_16x16",
+        "operation": "solve_banded",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "max_rel_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "matrix_dims": [
+          16,
+          16
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_4x4",
+        "operation": "inv",
+        "pass": true,
+        "max_abs_diff": 1.235990476633475e-17,
+        "max_rel_diff": 1.235990476633475e-17,
+        "tolerance_used": 1e-8,
+        "matrix_dims": [
+          4,
+          4
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_16x16",
+        "operation": "inv",
+        "pass": true,
+        "max_abs_diff": 5.551115123125783e-16,
+        "max_rel_diff": 5.551115123125783e-16,
+        "tolerance_used": 1e-8,
+        "matrix_dims": [
+          16,
+          16
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_64x64",
+        "operation": "inv",
+        "pass": true,
+        "max_abs_diff": 1.5543122344752192e-15,
+        "max_rel_diff": 1.5543122344752192e-15,
+        "tolerance_used": 1e-8,
+        "matrix_dims": [
+          64,
+          64
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_4x4",
+        "operation": "det",
+        "pass": true,
+        "max_abs_diff": 4.440892098500626e-16,
+        "max_rel_diff": 4.440892098500626e-16,
+        "tolerance_used": 1e-6,
+        "matrix_dims": [
+          4,
+          4
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_16x16",
+        "operation": "det",
+        "pass": true,
+        "max_abs_diff": 8.881784197001252e-16,
+        "max_rel_diff": 8.881784197001252e-16,
+        "tolerance_used": 1e-6,
+        "matrix_dims": [
+          16,
+          16
+        ]
+      },
+      {
+        "fixture_id": "diag_dominant_64x64",
+        "operation": "det",
+        "pass": true,
+        "max_abs_diff": 5.10702591327572e-15,
+        "max_rel_diff": 5.10702591327572e-15,
+        "tolerance_used": 1e-6,
+        "matrix_dims": [
+          64,
+          64
+        ]
+      },
+      {
+        "fixture_id": "overdetermined_32x16",
+        "operation": "lstsq",
+        "pass": true,
+        "max_abs_diff": 1.0800249583553523e-12,
+        "max_rel_diff": 0.0,
+        "tolerance_used": 1e-6,
+        "matrix_dims": [
+          32,
+          16
+        ]
+      },
+      {
+        "fixture_id": "overdetermined_128x64",
+        "operation": "lstsq",
+        "pass": true,
+        "max_abs_diff": 5.093170329928398e-11,
+        "max_rel_diff": 0.0,
+        "tolerance_used": 1e-6,
+        "matrix_dims": [
+          128,
+          64
+        ]
+      },
+      {
+        "fixture_id": "overdetermined_32x16",
+        "operation": "pinv",
+        "pass": true,
+        "max_abs_diff": 2.220446049250313e-16,
+        "max_rel_diff": 3.4955719930645315e-15,
+        "tolerance_used": 1e-8,
+        "matrix_dims": [
+          32,
+          16
+        ]
+      },
+      {
+        "fixture_id": "overdetermined_128x64",
+        "operation": "pinv",
+        "pass": true,
+        "max_abs_diff": 4.996003610813204e-16,
+        "max_rel_diff": 2.1360264316070146e-15,
+        "tolerance_used": 1e-8,
+        "matrix_dims": [
+          128,
+          64
+        ]
+      }
+    ]
+  },
+  "risk_notes": {
+    "packet_id": "FSCI-P2C-002",
+    "notes": [
+      {
+        "category": "near-singular matrices",
+        "description": "Matrices with rcond < 1e-12 may produce inaccurate results. In Strict mode, a LinalgWarning::IllConditioned is emitted. In Hardened mode, rcond < HARDENED_RCOND_THRESHOLD (1e-14) triggers LinalgError::ConditionTooHigh.",
+        "affected_operations": [
+          "solve",
+          "inv",
+          "det"
+        ],
+        "mitigation": "Use RuntimeMode::Hardened for critical paths. Monitor rcond in SolveResult/InvResult warnings. Fall back to lstsq/pinv for ill-conditioned systems."
+      },
+      {
+        "category": "non-square lstsq",
+        "description": "lstsq handles overdetermined (m > n) and underdetermined (m < n) systems via SVD. For underdetermined systems, the minimum-norm solution is returned. Numerical rank is estimated from singular values.",
+        "affected_operations": [
+          "lstsq"
+        ],
+        "mitigation": "Use LstsqOptions::cond to set a condition threshold for rank determination. Default driver Gelsd (SVD divide-and-conquer) is most robust."
+      },
+      {
+        "category": "ill-conditioned pinv",
+        "description": "pinv relies on SVD and thresholding of small singular values. Very ill-conditioned matrices may produce inaccurate pseudoinverses. atol and rtol parameters control singular value cutoff.",
+        "affected_operations": [
+          "pinv"
+        ],
+        "mitigation": "Set PinvOptions::atol/rtol explicitly for precision control. Verify via pinv(A) @ b ≈ lstsq(A, b) cross-check."
+      },
+      {
+        "category": "banded solver edge cases",
+        "description": "solve_banded converts to dense internally. For large banded systems this loses the O(n) advantage. Band storage format follows LAPACK convention: ab[nupper + i - j][j] = A[i][j].",
+        "affected_operations": [
+          "solve_banded"
+        ],
+        "mitigation": "For performance-critical banded systems >1000x1000, consider a dedicated banded solver. Current implementation is correctness-first."
+      }
+    ]
+  },
+  "parity_report": {
+    "packet_id": "FSCI-P2C-002",
+    "operation_summaries": [
+      {
+        "operation": "solve",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 4.973799150320701e-14,
+        "max_rel_diff_across_all": 1.1842378929335002e-15
+      },
+      {
+        "operation": "solve_triangular",
+        "total_fixtures": 2,
+        "passed": 2,
+        "failed": 0,
+        "max_abs_diff_across_all": 3.552713678800501e-15,
+        "max_rel_diff_across_all": 3.552713678800501e-16
+      },
+      {
+        "operation": "solve_banded",
+        "total_fixtures": 1,
+        "passed": 1,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0,
+        "max_rel_diff_across_all": 0.0
+      },
+      {
+        "operation": "inv",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 1.5543122344752192e-15,
+        "max_rel_diff_across_all": 1.5543122344752192e-15
+      },
+      {
+        "operation": "det",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 5.10702591327572e-15,
+        "max_rel_diff_across_all": 5.10702591327572e-15
+      },
+      {
+        "operation": "lstsq",
+        "total_fixtures": 2,
+        "passed": 2,
+        "failed": 0,
+        "max_abs_diff_across_all": 5.093170329928398e-11,
+        "max_rel_diff_across_all": 0.0
+      },
+      {
+        "operation": "pinv",
+        "total_fixtures": 2,
+        "passed": 2,
+        "failed": 0,
+        "max_abs_diff_across_all": 4.996003610813204e-16,
+        "max_rel_diff_across_all": 3.4955719930645315e-15
+      }
+    ]
+  },
+  "sidecar": null
+}

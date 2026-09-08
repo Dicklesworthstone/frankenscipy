@@ -1,0 +1,72 @@
+{
+  "scenario_id": "scenario_01_matrix_market",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "mmread_dense",
+      "action": "mmread(dense_matrix)",
+      "input_summary": "3x2 array format",
+      "output_summary": "3x2 matrix read",
+      "duration_ns": 52890,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "mminfo",
+      "action": "mminfo(content)",
+      "input_summary": "parse header only",
+      "output_summary": "object=Matrix, format=Array, field=Real",
+      "duration_ns": 7835,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "mmwrite_dense",
+      "action": "mmwrite(3, 2, data)",
+      "input_summary": "write 3x2 matrix",
+      "output_summary": "wrote 57 bytes",
+      "duration_ns": 12203,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "mmread_sparse",
+      "action": "mmread(sparse_matrix)",
+      "input_summary": "3x3 coordinate format",
+      "output_summary": "sparse 3x3 read, nnz=4",
+      "duration_ns": 14016,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 5,
+      "step_name": "mmwrite_sparse",
+      "action": "mmwrite_sparse(triplets)",
+      "input_summary": "write sparse matrix",
+      "output_summary": "wrote 70 bytes",
+      "duration_ns": 4037,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "io_metadata": {
+    "format": "Matrix Market",
+    "operation": "read/write",
+    "size_bytes": 0
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 238873,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_io -- scenario_01_matrix_market --nocapture"
+  }
+}

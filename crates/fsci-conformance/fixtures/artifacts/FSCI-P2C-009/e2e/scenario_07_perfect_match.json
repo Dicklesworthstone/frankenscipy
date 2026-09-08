@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_07_perfect_match",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "perfect_ari",
+      "action": "adjusted_rand_score(labels, labels)",
+      "input_summary": "self-comparison should be 1.0",
+      "output_summary": "perfect ARI=1.0000",
+      "duration_ns": 44675,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "perfect_nmi",
+      "action": "normalized_mutual_info(labels, labels)",
+      "input_summary": "self-comparison should be 1.0",
+      "output_summary": "perfect NMI=1.0000",
+      "duration_ns": 24456,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "perfect_vmeasure",
+      "action": "v_measure_score(labels, labels)",
+      "input_summary": "self-comparison should be 1.0",
+      "output_summary": "perfect V=1.0000",
+      "duration_ns": 42000,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "perfect",
+    "n_samples": 30,
+    "n_features": 2,
+    "n_clusters": 3
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 114758,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_07_perfect_match --nocapture"
+  }
+}

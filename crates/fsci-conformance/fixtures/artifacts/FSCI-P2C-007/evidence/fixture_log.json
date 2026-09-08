@@ -1,0 +1,240 @@
+[
+  {
+    "fixture_id": "diff_zeros_scalar_f64",
+    "operation": "zeros",
+    "pass_fail": true,
+    "shape": "[]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "diff_zeros_2x2_f32",
+    "operation": "zeros",
+    "pass_fail": true,
+    "shape": "[2,2]",
+    "dtype": "float32"
+  },
+  {
+    "fixture_id": "diff_ones_len3_f32",
+    "operation": "ones",
+    "pass_fail": true,
+    "shape": "[3]",
+    "dtype": "float32"
+  },
+  {
+    "fixture_id": "diff_full_complex128",
+    "operation": "full",
+    "pass_fail": true,
+    "shape": "[2]",
+    "dtype": "complex128"
+  },
+  {
+    "fixture_id": "diff_arange_ascending",
+    "operation": "arange",
+    "pass_fail": true,
+    "shape": "[5]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "diff_arange_descending",
+    "operation": "arange",
+    "pass_fail": true,
+    "shape": "[3]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "diff_linspace_endpoint_true",
+    "operation": "linspace",
+    "pass_fail": true,
+    "shape": "[5]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "diff_linspace_endpoint_false",
+    "operation": "linspace",
+    "pass_fail": true,
+    "shape": "[4]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "diff_broadcast_shapes_basic",
+    "operation": "broadcast_shapes",
+    "pass_fail": true,
+    "shape": "[[2,1],[1,3]]",
+    "dtype": "n/a"
+  },
+  {
+    "fixture_id": "diff_result_type_complex_promotion",
+    "operation": "result_type",
+    "pass_fail": true,
+    "shape": "n/a",
+    "dtype": "[\"float32\",\"complex64\"]"
+  },
+  {
+    "fixture_id": "diff_from_slice_matrix",
+    "operation": "from_slice",
+    "pass_fail": true,
+    "shape": "[2,2]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "diff_getitem_basic_slice",
+    "operation": "getitem",
+    "pass_fail": true,
+    "shape": "[4]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "diff_getitem_advanced_negative",
+    "operation": "getitem",
+    "pass_fail": true,
+    "shape": "[4]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "diff_reshape_2x3_to_3x2",
+    "operation": "reshape",
+    "pass_fail": true,
+    "shape": "[2,3]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "diff_transpose_2x3",
+    "operation": "transpose",
+    "pass_fail": true,
+    "shape": "[2,3]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "meta_broadcast_commutative_dense",
+    "operation": "relation_broadcast_commutative",
+    "pass_fail": true,
+    "shape": "[2,1] x [1,3]",
+    "dtype": "n/a"
+  },
+  {
+    "fixture_id": "meta_broadcast_commutative_zero_dim",
+    "operation": "relation_broadcast_commutative",
+    "pass_fail": true,
+    "shape": "[0,1] x [1,4]",
+    "dtype": "n/a"
+  },
+  {
+    "fixture_id": "meta_result_type_symmetry_f32_c64",
+    "operation": "relation_result_type_symmetry",
+    "pass_fail": true,
+    "shape": "n/a",
+    "dtype": "[float32,complex64]"
+  },
+  {
+    "fixture_id": "meta_result_type_symmetry_f64_c128",
+    "operation": "relation_result_type_symmetry",
+    "pass_fail": true,
+    "shape": "n/a",
+    "dtype": "[float64,complex128]"
+  },
+  {
+    "fixture_id": "meta_index_roundtrip_mid",
+    "operation": "relation_index_roundtrip",
+    "pass_fail": true,
+    "shape": "n/a",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "meta_index_roundtrip_negative",
+    "operation": "relation_index_roundtrip",
+    "pass_fail": true,
+    "shape": "n/a",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "adv_arange_zero_step_i64",
+    "operation": "arange",
+    "pass_fail": true,
+    "shape": "n/a",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "adv_arange_zero_step_complex",
+    "operation": "arange",
+    "pass_fail": true,
+    "shape": "n/a",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "adv_result_type_integral_without_force",
+    "operation": "result_type",
+    "pass_fail": true,
+    "shape": "n/a",
+    "dtype": "[\"int64\"]"
+  },
+  {
+    "fixture_id": "adv_from_slice_len_mismatch",
+    "operation": "from_slice",
+    "pass_fail": true,
+    "shape": "[2,2]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "adv_getitem_mode_mismatch",
+    "operation": "getitem",
+    "pass_fail": true,
+    "shape": "[3]",
+    "dtype": "n/a"
+  },
+  {
+    "fixture_id": "adv_reshape_size_mismatch",
+    "operation": "reshape",
+    "pass_fail": true,
+    "shape": "[4]",
+    "dtype": "n/a"
+  },
+  {
+    "fixture_id": "adv_transpose_rank1",
+    "operation": "transpose",
+    "pass_fail": true,
+    "shape": "[3]",
+    "dtype": "n/a"
+  },
+  {
+    "fixture_id": "adv_broadcast_incompatible",
+    "operation": "broadcast_shapes",
+    "pass_fail": true,
+    "shape": "[[2,3],[3,2]]",
+    "dtype": "n/a"
+  },
+  {
+    "fixture_id": "hardened_arange_zero_step_i64",
+    "operation": "arange",
+    "pass_fail": true,
+    "shape": "n/a",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "hardened_from_slice_len_mismatch",
+    "operation": "from_slice",
+    "pass_fail": true,
+    "shape": "[2,2]",
+    "dtype": "float64"
+  },
+  {
+    "fixture_id": "hardened_getitem_mode_mismatch",
+    "operation": "getitem",
+    "pass_fail": true,
+    "shape": "[3]",
+    "dtype": "n/a"
+  },
+  {
+    "fixture_id": "hardened_reshape_size_mismatch",
+    "operation": "reshape",
+    "pass_fail": true,
+    "shape": "[4]",
+    "dtype": "n/a"
+  },
+  {
+    "fixture_id": "hardened_broadcast_incompatible",
+    "operation": "broadcast_shapes",
+    "pass_fail": true,
+    "shape": "[[2,3],[3,2]]",
+    "dtype": "n/a"
+  }
+]

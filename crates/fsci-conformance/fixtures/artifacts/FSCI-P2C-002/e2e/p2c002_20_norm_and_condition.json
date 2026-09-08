@@ -1,0 +1,66 @@
+{
+  "scenario_id": "p2c002_20_norm_and_condition",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "compute_frobenius_norm",
+      "action": "norm(A, 'fro')",
+      "input_summary": "Frobenius norm of diagonal",
+      "output_summary": "||A||_F = 3.741657 (expected 3.741657)",
+      "duration_ns": 19256,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "compute_spectral_norm",
+      "action": "norm(A, 'spectral')",
+      "input_summary": "spectral norm (largest singular value)",
+      "output_summary": "||A||_2 = 3.000000 (expected 3.000000)",
+      "duration_ns": 85402,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "verify_cond_well_conditioned",
+      "action": "cond(A_good) is small",
+      "input_summary": "diagonal matrix condition number",
+      "output_summary": "cond(A_good) = 3.000000 (expected 3.000000, well-conditioned)",
+      "duration_ns": 72568,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "verify_cond_ill_conditioned",
+      "action": "cond(A_bad) is large",
+      "input_summary": "ill-conditioned matrix",
+      "output_summary": "cond(A_bad) = 1.00e10 (large, ill-conditioned)",
+      "duration_ns": 40266,
+      "mode": "strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "matrix_metadata": {
+    "size": [
+      3,
+      3
+    ],
+    "nnz": null,
+    "rcond_estimate": null,
+    "mode": "strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 225297,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_linalg -- p2c002_20_norm_and_condition --nocapture"
+  }
+}

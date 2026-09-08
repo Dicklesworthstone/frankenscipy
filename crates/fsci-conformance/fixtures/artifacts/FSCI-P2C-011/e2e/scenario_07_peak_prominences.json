@@ -1,0 +1,32 @@
+{
+  "scenario_id": "scenario_07_peak_prominences",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "compute_prominences",
+      "action": "peak_prominences(signal, [10, 30])",
+      "input_summary": "compute prominence for known peaks",
+      "output_summary": "proms=[5.0, 2.760750670786018], left=[0, 29], right=[47, 47]",
+      "duration_ns": 20439,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "peak_prominences",
+    "signal_length": 50,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 34265,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_07_peak_prominences --nocapture"
+  }
+}

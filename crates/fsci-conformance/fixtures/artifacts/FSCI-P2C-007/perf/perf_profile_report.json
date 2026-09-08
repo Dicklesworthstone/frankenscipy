@@ -1,0 +1,706 @@
+{
+  "generated_at": "unix:1779662458",
+  "optimization_name": "broadcast optimization plus creation-path characterization",
+  "hotspot_function": "fsci-arrayapi hotpath portfolio",
+  "benchmark_rows": [
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 10,
+      "output_elements": 20,
+      "dtype": "Float32",
+      "before_p95_ns": 59573,
+      "after_p95_ns": 2555,
+      "before_median_ns": 3917,
+      "after_median_ns": 2505,
+      "p95_improvement_ns": 57018,
+      "alloc_count_delta": -38
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 100,
+      "output_elements": 200,
+      "dtype": "Float32",
+      "before_p95_ns": 46588,
+      "after_p95_ns": 19628,
+      "before_median_ns": 40407,
+      "after_median_ns": 19587,
+      "p95_improvement_ns": 26960,
+      "alloc_count_delta": -398
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 1000,
+      "output_elements": 2000,
+      "dtype": "Float32",
+      "before_p95_ns": 534071,
+      "after_p95_ns": 195190,
+      "before_median_ns": 370853,
+      "after_median_ns": 153360,
+      "p95_improvement_ns": 338881,
+      "alloc_count_delta": -3998
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 10000,
+      "output_elements": 20000,
+      "dtype": "Float32",
+      "before_p95_ns": 4401348,
+      "after_p95_ns": 1549125,
+      "before_median_ns": 3007848,
+      "after_median_ns": 1536982,
+      "p95_improvement_ns": 2852223,
+      "alloc_count_delta": -39998
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 10,
+      "output_elements": 20,
+      "dtype": "Float64",
+      "before_p95_ns": 2936,
+      "after_p95_ns": 1943,
+      "before_median_ns": 2875,
+      "after_median_ns": 1913,
+      "p95_improvement_ns": 993,
+      "alloc_count_delta": -38
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 100,
+      "output_elements": 200,
+      "dtype": "Float64",
+      "before_p95_ns": 28865,
+      "after_p95_ns": 15048,
+      "before_median_ns": 28103,
+      "after_median_ns": 14898,
+      "p95_improvement_ns": 13817,
+      "alloc_count_delta": -398
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 1000,
+      "output_elements": 2000,
+      "dtype": "Float64",
+      "before_p95_ns": 340164,
+      "after_p95_ns": 156266,
+      "before_median_ns": 294308,
+      "after_median_ns": 146407,
+      "p95_improvement_ns": 183898,
+      "alloc_count_delta": -3998
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 10000,
+      "output_elements": 20000,
+      "dtype": "Float64",
+      "before_p95_ns": 3059656,
+      "after_p95_ns": 1519318,
+      "before_median_ns": 2903190,
+      "after_median_ns": 1479583,
+      "p95_improvement_ns": 1540338,
+      "alloc_count_delta": -39998
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 10,
+      "output_elements": 20,
+      "dtype": "Complex128",
+      "before_p95_ns": 2956,
+      "after_p95_ns": 1964,
+      "before_median_ns": 2916,
+      "after_median_ns": 1933,
+      "p95_improvement_ns": 992,
+      "alloc_count_delta": -38
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 100,
+      "output_elements": 200,
+      "dtype": "Complex128",
+      "before_p95_ns": 29396,
+      "after_p95_ns": 15149,
+      "before_median_ns": 28544,
+      "after_median_ns": 15038,
+      "p95_improvement_ns": 14247,
+      "alloc_count_delta": -398
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 1000,
+      "output_elements": 2000,
+      "dtype": "Complex128",
+      "before_p95_ns": 297553,
+      "after_p95_ns": 164552,
+      "before_median_ns": 286884,
+      "after_median_ns": 153331,
+      "p95_improvement_ns": 133001,
+      "alloc_count_delta": -3998
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::broadcast_to",
+      "array_size": 10000,
+      "output_elements": 20000,
+      "dtype": "Complex128",
+      "before_p95_ns": 3056190,
+      "after_p95_ns": 1532033,
+      "before_median_ns": 2898131,
+      "after_median_ns": 1481897,
+      "p95_improvement_ns": 1524157,
+      "alloc_count_delta": -39998
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 10,
+      "output_elements": 10,
+      "dtype": "Float32",
+      "before_p95_ns": 501,
+      "after_p95_ns": 211,
+      "before_median_ns": 290,
+      "after_median_ns": 191,
+      "p95_improvement_ns": 290,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 10,
+      "output_elements": 10,
+      "dtype": "Float32",
+      "before_p95_ns": 451,
+      "after_p95_ns": 211,
+      "before_median_ns": 290,
+      "after_median_ns": 191,
+      "p95_improvement_ns": 240,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 100,
+      "output_elements": 100,
+      "dtype": "Float32",
+      "before_p95_ns": 702,
+      "after_p95_ns": 621,
+      "before_median_ns": 651,
+      "after_median_ns": 561,
+      "p95_improvement_ns": 81,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 100,
+      "output_elements": 100,
+      "dtype": "Float32",
+      "before_p95_ns": 771,
+      "after_p95_ns": 631,
+      "before_median_ns": 701,
+      "after_median_ns": 561,
+      "p95_improvement_ns": 140,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 1000,
+      "output_elements": 1000,
+      "dtype": "Float32",
+      "before_p95_ns": 4770,
+      "after_p95_ns": 4659,
+      "before_median_ns": 3858,
+      "after_median_ns": 3767,
+      "p95_improvement_ns": 111,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 1000,
+      "output_elements": 1000,
+      "dtype": "Float32",
+      "before_p95_ns": 4168,
+      "after_p95_ns": 4639,
+      "before_median_ns": 3907,
+      "after_median_ns": 3797,
+      "p95_improvement_ns": -471,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 10000,
+      "output_elements": 10000,
+      "dtype": "Float32",
+      "before_p95_ns": 42300,
+      "after_p95_ns": 41198,
+      "before_median_ns": 37892,
+      "after_median_ns": 38093,
+      "p95_improvement_ns": 1102,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 10000,
+      "output_elements": 10000,
+      "dtype": "Float32",
+      "before_p95_ns": 41729,
+      "after_p95_ns": 47049,
+      "before_median_ns": 37641,
+      "after_median_ns": 38143,
+      "p95_improvement_ns": -5320,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 10,
+      "output_elements": 10,
+      "dtype": "Float64",
+      "before_p95_ns": 311,
+      "after_p95_ns": 200,
+      "before_median_ns": 291,
+      "after_median_ns": 190,
+      "p95_improvement_ns": 111,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 10,
+      "output_elements": 10,
+      "dtype": "Float64",
+      "before_p95_ns": 320,
+      "after_p95_ns": 210,
+      "before_median_ns": 291,
+      "after_median_ns": 191,
+      "p95_improvement_ns": 110,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 100,
+      "output_elements": 100,
+      "dtype": "Float64",
+      "before_p95_ns": 681,
+      "after_p95_ns": 602,
+      "before_median_ns": 651,
+      "after_median_ns": 541,
+      "p95_improvement_ns": 79,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 100,
+      "output_elements": 100,
+      "dtype": "Float64",
+      "before_p95_ns": 651,
+      "after_p95_ns": 571,
+      "before_median_ns": 631,
+      "after_median_ns": 551,
+      "p95_improvement_ns": 80,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 1000,
+      "output_elements": 1000,
+      "dtype": "Float64",
+      "before_p95_ns": 3888,
+      "after_p95_ns": 4639,
+      "before_median_ns": 3837,
+      "after_median_ns": 3797,
+      "p95_improvement_ns": -751,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 1000,
+      "output_elements": 1000,
+      "dtype": "Float64",
+      "before_p95_ns": 3908,
+      "after_p95_ns": 4088,
+      "before_median_ns": 3877,
+      "after_median_ns": 3767,
+      "p95_improvement_ns": -180,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 10000,
+      "output_elements": 10000,
+      "dtype": "Float64",
+      "before_p95_ns": 39926,
+      "after_p95_ns": 40757,
+      "before_median_ns": 36499,
+      "after_median_ns": 38633,
+      "p95_improvement_ns": -831,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 10000,
+      "output_elements": 10000,
+      "dtype": "Float64",
+      "before_p95_ns": 48632,
+      "after_p95_ns": 42711,
+      "before_median_ns": 37672,
+      "after_median_ns": 38163,
+      "p95_improvement_ns": 5921,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 10,
+      "output_elements": 10,
+      "dtype": "Complex128",
+      "before_p95_ns": 301,
+      "after_p95_ns": 220,
+      "before_median_ns": 291,
+      "after_median_ns": 200,
+      "p95_improvement_ns": 81,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 10,
+      "output_elements": 10,
+      "dtype": "Complex128",
+      "before_p95_ns": 311,
+      "after_p95_ns": 211,
+      "before_median_ns": 291,
+      "after_median_ns": 201,
+      "p95_improvement_ns": 100,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 100,
+      "output_elements": 100,
+      "dtype": "Complex128",
+      "before_p95_ns": 701,
+      "after_p95_ns": 631,
+      "before_median_ns": 642,
+      "after_median_ns": 612,
+      "p95_improvement_ns": 70,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 100,
+      "output_elements": 100,
+      "dtype": "Complex128",
+      "before_p95_ns": 1362,
+      "after_p95_ns": 1102,
+      "before_median_ns": 681,
+      "after_median_ns": 982,
+      "p95_improvement_ns": 260,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 1000,
+      "output_elements": 1000,
+      "dtype": "Complex128",
+      "before_p95_ns": 62258,
+      "after_p95_ns": 6062,
+      "before_median_ns": 5150,
+      "after_median_ns": 6032,
+      "p95_improvement_ns": 56196,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 1000,
+      "output_elements": 1000,
+      "dtype": "Complex128",
+      "before_p95_ns": 6202,
+      "after_p95_ns": 6071,
+      "before_median_ns": 5070,
+      "after_median_ns": 4949,
+      "p95_improvement_ns": 131,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::zeros",
+      "array_size": 10000,
+      "output_elements": 10000,
+      "dtype": "Complex128",
+      "before_p95_ns": 78849,
+      "after_p95_ns": 153852,
+      "before_median_ns": 49183,
+      "after_median_ns": 51398,
+      "p95_improvement_ns": -75003,
+      "alloc_count_delta": 0
+    },
+    {
+      "hotspot_function": "CoreArrayBackend::full",
+      "array_size": 10000,
+      "output_elements": 10000,
+      "dtype": "Complex128",
+      "before_p95_ns": 40146,
+      "after_p95_ns": 49293,
+      "before_median_ns": 38192,
+      "after_median_ns": 37611,
+      "p95_improvement_ns": -9147,
+      "alloc_count_delta": 0
+    }
+  ],
+  "isomorphism_check": {
+    "all_cases_pass": true,
+    "details": [
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 10,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 100,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 1000,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 10000,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 10,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 100,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 1000,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 10000,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 10,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 100,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 1000,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::broadcast_to",
+        "array_size": 10000,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "legacy and optimized outputs are byte-identical"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 10,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 10,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 100,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 100,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 1000,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 1000,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 10000,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 10000,
+        "dtype": "Float32",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 10,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 10,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 100,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 100,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 1000,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 1000,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 10000,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 10000,
+        "dtype": "Float64",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 10,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 10,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 100,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 100,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 1000,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 1000,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::zeros",
+        "array_size": 10000,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "current and log-free zeros paths match exactly"
+      },
+      {
+        "hotspot_function": "CoreArrayBackend::full",
+        "array_size": 10000,
+        "dtype": "Complex128",
+        "passes": true,
+        "note": "current and log-free full paths match exactly"
+      }
+    ]
+  },
+  "methodology": [
+    "warmup_iters=5",
+    "bench_iters=30",
+    "broadcast before=legacy per-element unravel/ravel + per-iteration coordinate Vec allocations",
+    "broadcast after=CoreArrayBackend::broadcast_to with precomputed strides and in-place coordinate advancement",
+    "creation before=current CoreArrayBackend creation path with dtype dispatch logging enabled",
+    "creation after=local log-free profiling backend matching scoped observable creation semantics",
+    "broadcast alloc_count_delta is an algorithmic estimate (after - before), not allocator-instrumented",
+    "creation alloc_count_delta is set to 0 because the characterization isolates hot-path logging overhead rather than allocator-instrumented buffer counts"
+  ]
+}

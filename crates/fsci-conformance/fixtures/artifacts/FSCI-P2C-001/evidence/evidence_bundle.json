@@ -1,0 +1,268 @@
+{
+  "manifest": {
+    "packet_id": "FSCI-P2C-001",
+    "generated_at": "unix:1779662446",
+    "fixtures": [
+      {
+        "fixture_id": "validate_tol_scalar",
+        "size": 3,
+        "input_type": "scalar_tol",
+        "operations": [
+          "validate_tol"
+        ]
+      },
+      {
+        "fixture_id": "validate_tol_clamping",
+        "size": 1,
+        "input_type": "clamping_edge",
+        "operations": [
+          "validate_tol"
+        ]
+      },
+      {
+        "fixture_id": "validate_first_step",
+        "size": 3,
+        "input_type": "step_validation",
+        "operations": [
+          "validate_first_step"
+        ]
+      },
+      {
+        "fixture_id": "validate_max_step",
+        "size": 3,
+        "input_type": "step_validation",
+        "operations": [
+          "validate_max_step"
+        ]
+      },
+      {
+        "fixture_id": "exponential_decay_rk45",
+        "size": 1,
+        "input_type": "ode_system",
+        "operations": [
+          "solve_ivp_rk45"
+        ]
+      },
+      {
+        "fixture_id": "exponential_decay_rk23",
+        "size": 1,
+        "input_type": "ode_system",
+        "operations": [
+          "solve_ivp_rk23"
+        ]
+      },
+      {
+        "fixture_id": "harmonic_oscillator_rk45",
+        "size": 2,
+        "input_type": "ode_system",
+        "operations": [
+          "solve_ivp_rk45"
+        ]
+      },
+      {
+        "fixture_id": "lotka_volterra_positive",
+        "size": 2,
+        "input_type": "ode_system",
+        "operations": [
+          "solve_ivp_rk45"
+        ]
+      },
+      {
+        "fixture_id": "rk45_vs_rk23",
+        "size": 1,
+        "input_type": "solver_comparison",
+        "operations": [
+          "solver_agreement"
+        ]
+      },
+      {
+        "fixture_id": "strict_vs_hardened",
+        "size": 1,
+        "input_type": "mode_comparison",
+        "operations": [
+          "mode_invariance"
+        ]
+      }
+    ]
+  },
+  "parity_gates": {
+    "packet_id": "FSCI-P2C-001",
+    "all_gates_pass": true,
+    "gates": [
+      {
+        "fixture_id": "validate_tol_scalar",
+        "operation": "validate_tol",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 0.0,
+        "size": 3
+      },
+      {
+        "fixture_id": "validate_tol_clamping",
+        "operation": "validate_tol",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 2.220446049250313e-14,
+        "size": 1
+      },
+      {
+        "fixture_id": "validate_first_step",
+        "operation": "validate_first_step",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 0.0,
+        "size": 3
+      },
+      {
+        "fixture_id": "validate_max_step",
+        "operation": "validate_max_step",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 0.0,
+        "size": 3
+      },
+      {
+        "fixture_id": "exponential_decay_rk45",
+        "operation": "solve_ivp_rk45",
+        "pass": true,
+        "max_abs_diff": 9.523881076139995e-11,
+        "tolerance_used": 1e-6,
+        "size": 1
+      },
+      {
+        "fixture_id": "exponential_decay_rk23",
+        "operation": "solve_ivp_rk23",
+        "pass": true,
+        "max_abs_diff": 5.342991036671324e-8,
+        "tolerance_used": 0.0001,
+        "size": 1
+      },
+      {
+        "fixture_id": "harmonic_oscillator_rk45",
+        "operation": "solve_ivp_rk45",
+        "pass": true,
+        "max_abs_diff": 7.897860476724361e-9,
+        "tolerance_used": 0.001,
+        "size": 2
+      },
+      {
+        "fixture_id": "lotka_volterra_positive",
+        "operation": "solve_ivp_rk45",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 0.0,
+        "size": 2
+      },
+      {
+        "fixture_id": "rk45_vs_rk23",
+        "operation": "solver_agreement",
+        "pass": true,
+        "max_abs_diff": 4.736813219441416e-9,
+        "tolerance_used": 1e-6,
+        "size": 1
+      },
+      {
+        "fixture_id": "strict_vs_hardened",
+        "operation": "mode_invariance",
+        "pass": true,
+        "max_abs_diff": 0.0,
+        "tolerance_used": 1e-10,
+        "size": 1
+      }
+    ]
+  },
+  "risk_notes": {
+    "packet_id": "FSCI-P2C-001",
+    "notes": [
+      {
+        "category": "step_size_selection",
+        "description": "Initial step size heuristic (Hairer II.4) may overshoot for stiff systems. P2C-001 still gates explicit RK paths here, while solve_ivp now dispatches BDF/Radau through the BDF backend and LSODA can switch from RK to BDF on stiff-like dynamics.",
+        "affected_operations": [
+          "select_initial_step",
+          "solve_ivp"
+        ],
+        "mitigation": "Step size is bounded by max_step and min_step floor. Stiff solver behavior is covered by the BDF/LSODA solve_ivp lanes rather than being reported as unsupported in this evidence packet."
+      },
+      {
+        "category": "tolerance_clamping",
+        "description": "rtol below MIN_RTOL (100*eps ≈ 2.2e-14) is silently clamped with warning. Users may not notice the clamping if they don't check warnings.",
+        "affected_operations": [
+          "validate_tol"
+        ],
+        "mitigation": "ToleranceWarning::RtolClamped is emitted in the warnings vector. Hardened mode applies same clamping with identical warning."
+      },
+      {
+        "category": "adaptive_step_rejection",
+        "description": "Adaptive step-size control may reject many steps for stiff-like problems, causing excessive function evaluations without convergence.",
+        "affected_operations": [
+          "solve_ivp",
+          "RkSolver::step_with"
+        ],
+        "mitigation": "MIN_FACTOR=0.2 prevents catastrophic step shrinkage. StepSizeTooSmall failure returned when h < machine epsilon."
+      },
+      {
+        "category": "dense_output_not_implemented",
+        "description": "Dense output (continuous solution interpolation) is partially implemented. OdeSolution struct exists but interpolation quality may vary.",
+        "affected_operations": [
+          "solve_ivp"
+        ],
+        "mitigation": "Users can set dense_output=false and use t_eval for specific output times."
+      }
+    ]
+  },
+  "parity_report": {
+    "packet_id": "FSCI-P2C-001",
+    "operation_summaries": [
+      {
+        "operation": "validate_tol",
+        "total_fixtures": 2,
+        "passed": 2,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "operation": "validate_first_step",
+        "total_fixtures": 1,
+        "passed": 1,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "operation": "validate_max_step",
+        "total_fixtures": 1,
+        "passed": 1,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      },
+      {
+        "operation": "solve_ivp_rk45",
+        "total_fixtures": 3,
+        "passed": 3,
+        "failed": 0,
+        "max_abs_diff_across_all": 7.897860476724361e-9
+      },
+      {
+        "operation": "solve_ivp_rk23",
+        "total_fixtures": 1,
+        "passed": 1,
+        "failed": 0,
+        "max_abs_diff_across_all": 5.342991036671324e-8
+      },
+      {
+        "operation": "solver_agreement",
+        "total_fixtures": 1,
+        "passed": 1,
+        "failed": 0,
+        "max_abs_diff_across_all": 4.736813219441416e-9
+      },
+      {
+        "operation": "mode_invariance",
+        "total_fixtures": 1,
+        "passed": 1,
+        "failed": 0,
+        "max_abs_diff_across_all": 0.0
+      }
+    ]
+  },
+  "sidecar": null
+}

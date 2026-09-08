@@ -1,0 +1,39 @@
+{
+  "packet_id": "FSCI-P2C-001",
+  "notes": [
+    {
+      "category": "step_size_selection",
+      "description": "Initial step size heuristic (Hairer II.4) may overshoot for stiff systems. P2C-001 still gates explicit RK paths here, while solve_ivp now dispatches BDF/Radau through the BDF backend and LSODA can switch from RK to BDF on stiff-like dynamics.",
+      "affected_operations": [
+        "select_initial_step",
+        "solve_ivp"
+      ],
+      "mitigation": "Step size is bounded by max_step and min_step floor. Stiff solver behavior is covered by the BDF/LSODA solve_ivp lanes rather than being reported as unsupported in this evidence packet."
+    },
+    {
+      "category": "tolerance_clamping",
+      "description": "rtol below MIN_RTOL (100*eps ≈ 2.2e-14) is silently clamped with warning. Users may not notice the clamping if they don't check warnings.",
+      "affected_operations": [
+        "validate_tol"
+      ],
+      "mitigation": "ToleranceWarning::RtolClamped is emitted in the warnings vector. Hardened mode applies same clamping with identical warning."
+    },
+    {
+      "category": "adaptive_step_rejection",
+      "description": "Adaptive step-size control may reject many steps for stiff-like problems, causing excessive function evaluations without convergence.",
+      "affected_operations": [
+        "solve_ivp",
+        "RkSolver::step_with"
+      ],
+      "mitigation": "MIN_FACTOR=0.2 prevents catastrophic step shrinkage. StepSizeTooSmall failure returned when h < machine epsilon."
+    },
+    {
+      "category": "dense_output_not_implemented",
+      "description": "Dense output (continuous solution interpolation) is partially implemented. OdeSolution struct exists but interpolation quality may vary.",
+      "affected_operations": [
+        "solve_ivp"
+      ],
+      "mitigation": "Users can set dense_output=false and use t_eval for specific output times."
+    }
+  ]
+}

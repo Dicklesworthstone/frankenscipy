@@ -1,0 +1,818 @@
+{
+  "packet_id": "FSCI-P2C-001",
+  "bead_id": "bd-3jh.12.1",
+  "domain": "integrate",
+  "generated_at": "2026-02-14T00:00:00Z",
+  "source_scipy_version": "1.17.0",
+  "functions": [
+    {
+      "name": "solve_ivp",
+      "module": "scipy.integrate._ivp.ivp",
+      "kind": "function",
+      "signature": "solve_ivp(fun, t_span, y0, method='RK45', t_eval=None, dense_output=False, events=None, vectorized=False, args=None, **options)",
+      "parameters": [
+        {
+          "name": "fun",
+          "type": "callable",
+          "default": null,
+          "required": true,
+          "semantics": "Right-hand side function fun(t, y) -> array_like of shape (n,). When args is provided, signature becomes fun(t, y, *args). The return is cast to ndarray with dtype matching y0 (float or complex) by check_arguments in the solver constructor."
+        },
+        {
+          "name": "t_span",
+          "type": "2-member sequence",
+          "default": null,
+          "required": true,
+          "semantics": "Integration interval (t0, tf). Both values are converted to float via map(float, t_span). t0 > tf is allowed (backward integration). t0 == tf produces a degenerate result with a single point. No explicit validation for NaN/Inf -- these will propagate or cause failures in solvers."
+        },
+        {
+          "name": "y0",
+          "type": "array_like, shape (n,)",
+          "default": null,
+          "required": true,
+          "semantics": "Initial state vector. Converted to ndarray by check_arguments. Must be 1-D. All components must be finite. Complex dtype triggers complex-domain integration (requires solver support). Cast to float64 or complex128."
+        },
+        {
+          "name": "method",
+          "type": "str or OdeSolver subclass",
+          "default": "'RK45'",
+          "required": false,
+          "semantics": "Solver selection. String values: 'RK23', 'RK45', 'DOP853', 'Radau', 'BDF', 'LSODA'. Alternatively, pass a class (not instance) that is a subclass of OdeSolver. Invalid strings or non-OdeSolver classes raise ValueError."
+        },
+        {
+          "name": "t_eval",
+          "type": "array_like or None",
+          "default": "None",
+          "required": false,
+          "semantics": "Times at which to store solution. Must be 1-D, within [min(t0,tf), max(t0,tf)], sorted consistently with integration direction (ascending if tf > t0, descending if tf < t0). When None, solver-chosen points are stored. When provided, dense output interpolation is used to evaluate at these points."
+        },
+        {
+          "name": "dense_output",
+          "type": "bool",
+          "default": "False",
+          "required": false,
+          "semantics": "If True, compute and return a continuous OdeSolution object in result.sol. Enables sol(t) evaluation at arbitrary points within t_span. When True with t_eval, the solver timepoints (not t_eval) are used as interpolant knots."
+        },
+        {
+          "name": "events",
+          "type": "callable, list of callables, or None",
+          "default": "None",
+          "required": false,
+          "semantics": "Event functions event(t, y) -> float. Zero crossings trigger events. Each event function may have attributes: terminal (bool or positive int) and direction (float: +1 for up-crossing, -1 for down-crossing, 0 for both). When args is given, events must accept same extra args. Terminal events stop integration."
+        },
+        {
+          "name": "vectorized",
+          "type": "bool",
+          "default": "False",
+          "required": false,
+          "semantics": "If True, fun may be called with y of shape (n, k) and must return shape (n, k). Passed through to solver constructor. Benefits Radau and BDF Jacobian finite-difference computation."
+        },
+        {
+          "name": "args",
+          "type": "tuple or None",
+          "default": "None",
+          "required": false,
+          "semantics": "Extra arguments passed to fun, jac, and event functions. Must be iterable (unpacked via [*(args)]). When provided, fun is wrapped as lambda t, x, fun=fun: fun(t, x, *args), and jac similarly. TypeError if args cannot be unpacked."
+        },
+        {
+          "name": "**options",
+          "type": "dict",
+          "default": "{}",
+          "required": false,
+          "semantics": "Solver-specific options passed directly to the solver constructor. Common: first_step, max_step, rtol, atol, jac, jac_sparsity. LSODA-specific: min_step, lband, uband. Unrecognized options trigger a warning via warn_extraneous."
+        }
+      ],
+      "returns": {
+        "type": "OdeResult (subclass of OptimizeResult)",
+        "fields": [
+          {"name": "t", "type": "ndarray, shape (n_points,)", "description": "Time points. Solver-chosen if t_eval is None, otherwise t_eval points."},
+          {"name": "y", "type": "ndarray, shape (n, n_points)", "description": "Solution values. Columns correspond to time points in t."},
+          {"name": "sol", "type": "OdeSolution or None", "description": "Continuous solution if dense_output=True, else None."},
+          {"name": "t_events", "type": "list of ndarray or None", "description": "For each event, array of times at which it occurred. None if events=None."},
+          {"name": "y_events", "type": "list of ndarray or None", "description": "For each event, corresponding solution values. None if events=None."},
+          {"name": "nfev", "type": "int", "description": "Number of RHS evaluations."},
+          {"name": "njev", "type": "int", "description": "Number of Jacobian evaluations."},
+          {"name": "nlu", "type": "int", "description": "Number of LU decompositions."},
+          {"name": "status", "type": "int", "description": "-1 (failed), 0 (reached tf), 1 (terminal event)."},
+          {"name": "message", "type": "str", "description": "Human-readable termination reason."},
+          {"name": "success", "type": "bool", "description": "True if status >= 0."}
+        ]
+      },
+      "edge_cases": [
+        "t0 == tf: solver immediately finishes. Returns single point (t0, y0).",
+        "Empty y0 (n=0): solver immediately finishes. step() returns with no function evaluations.",
+        "t_eval empty array: returns empty ts and ys arrays.",
+        "t_eval with single point equal to t0: works correctly via searchsorted.",
+        "NaN in t_span: float('nan') passes through map(float,...). Solver direction becomes NaN, behavior undefined.",
+        "Inf in t_span: float('inf') is valid. Integration proceeds indefinitely until step failure.",
+        "Events with identical zeros: only one root found per step (Brent finds one root in bracket).",
+        "All events non-terminal: integration continues to tf regardless of events.",
+        "Terminal event at exact t_bound: both status=0 and status=1 could apply; implementation gives status=0 from solver.status='finished' check before event handling."
+      ],
+      "error_conditions": [
+        {"exception": "ValueError", "condition": "method not in METHODS and not a valid OdeSolver subclass"},
+        {"exception": "ValueError", "condition": "t_eval is not 1-dimensional"},
+        {"exception": "ValueError", "condition": "t_eval values outside [min(t0,tf), max(t0,tf)]"},
+        {"exception": "ValueError", "condition": "t_eval values not sorted consistently with direction"},
+        {"exception": "TypeError", "condition": "args cannot be unpacked (not iterable)"},
+        {"exception": "ValueError", "condition": "Propagated from solver constructor: y0 not 1-D, y0 not finite, complex y0 with unsupported solver"},
+        {"exception": "ValueError", "condition": "Propagated from solver constructor: invalid first_step, max_step, atol shape"}
+      ],
+      "lapack_dispatch": null,
+      "version_differences": [
+        "The terminal attribute accepting positive integers (for max event count) is a relatively recent addition.",
+        "The args parameter was added in SciPy 1.4.0.",
+        "The alt_segment parameter for OdeSolution was added for correctness of BDF/LSODA dense output."
+      ]
+    },
+    {
+      "name": "OdeSolver.__init__",
+      "module": "scipy.integrate._ivp.base",
+      "kind": "constructor",
+      "signature": "OdeSolver.__init__(self, fun, t0, y0, t_bound, vectorized, support_complex=False)",
+      "parameters": [
+        {
+          "name": "fun",
+          "type": "callable",
+          "default": null,
+          "required": true,
+          "semantics": "RHS function fun(t, y). Wrapped by check_arguments to cast output to appropriate dtype. Further wrapped to create self.fun (nfev-counting), self.fun_single (non-vectorized), self.fun_vectorized (vectorized)."
+        },
+        {
+          "name": "t0",
+          "type": "float",
+          "default": null,
+          "required": true,
+          "semantics": "Initial time. Stored as self.t."
+        },
+        {
+          "name": "y0",
+          "type": "array_like, shape (n,)",
+          "default": null,
+          "required": true,
+          "semantics": "Initial state. Validated by check_arguments: must be 1-D, all finite, cast to float64 or complex128. Stored as self.y."
+        },
+        {
+          "name": "t_bound",
+          "type": "float",
+          "default": null,
+          "required": true,
+          "semantics": "End of integration interval. Determines direction = sign(t_bound - t0). If t_bound == t0, direction = 1."
+        },
+        {
+          "name": "vectorized",
+          "type": "bool",
+          "default": null,
+          "required": true,
+          "semantics": "Whether fun accepts vectorized y of shape (n, k). If True, fun_single wraps to add/remove column dimension. If False, fun_vectorized loops over columns."
+        },
+        {
+          "name": "support_complex",
+          "type": "bool",
+          "default": "False",
+          "required": false,
+          "semantics": "Whether the solver supports complex-valued integration. If False and y0 is complex, check_arguments raises ValueError."
+        }
+      ],
+      "returns": {
+        "type": "None (constructor)",
+        "fields": []
+      },
+      "state_initialized": [
+        "self.t = t0",
+        "self.y = validated y0 ndarray",
+        "self.t_bound = t_bound",
+        "self.vectorized = vectorized",
+        "self.direction = sign(t_bound - t0) or 1 if equal",
+        "self.n = y0.size",
+        "self.status = 'running'",
+        "self.t_old = None",
+        "self.nfev = 0, self.njev = 0, self.nlu = 0",
+        "self.fun = nfev-counting wrapper",
+        "self.fun_single = non-vectorized wrapper",
+        "self.fun_vectorized = vectorized wrapper"
+      ],
+      "edge_cases": [
+        "y0 is scalar: np.asarray(scalar) produces 0-D array, then ndim != 1 check raises ValueError.",
+        "y0 is 2-D: raises ValueError('y0 must be 1-dimensional').",
+        "y0 contains NaN: raises ValueError('All components of the initial state y0 must be finite').",
+        "y0 contains Inf: same ValueError as NaN case.",
+        "t0 == t_bound: direction = 1 (positive by convention).",
+        "Empty y0 (shape (0,)): allowed, n=0, step() immediately finishes."
+      ],
+      "error_conditions": [
+        {"exception": "ValueError", "condition": "y0 is complex and support_complex is False"},
+        {"exception": "ValueError", "condition": "y0.ndim != 1"},
+        {"exception": "ValueError", "condition": "not np.isfinite(y0).all()"}
+      ],
+      "lapack_dispatch": null,
+      "version_differences": []
+    },
+    {
+      "name": "RK45.__init__",
+      "module": "scipy.integrate._ivp.rk",
+      "kind": "constructor",
+      "signature": "RK45(fun, t0, y0, t_bound, max_step=np.inf, rtol=1e-3, atol=1e-6, vectorized=False, first_step=None, **extraneous)",
+      "parameters": [
+        {"name": "fun", "type": "callable", "default": null, "required": true, "semantics": "RHS function fun(t, y). See OdeSolver."},
+        {"name": "t0", "type": "float", "default": null, "required": true, "semantics": "Initial time."},
+        {"name": "y0", "type": "array_like, shape (n,)", "default": null, "required": true, "semantics": "Initial state."},
+        {"name": "t_bound", "type": "float", "default": null, "required": true, "semantics": "Boundary time."},
+        {"name": "max_step", "type": "float", "default": "np.inf", "required": false, "semantics": "Maximum allowed step size. Must be > 0. Validated by validate_max_step."},
+        {"name": "rtol", "type": "float", "default": "1e-3", "required": false, "semantics": "Relative tolerance. Clamped to max(rtol, 100*EPS) with warning if too small."},
+        {"name": "atol", "type": "float or array_like, shape (n,)", "default": "1e-6", "required": false, "semantics": "Absolute tolerance. Scalar or per-component. Must be non-negative. Shape (n,) if array."},
+        {"name": "vectorized", "type": "bool", "default": "False", "required": false, "semantics": "Whether fun is vectorized."},
+        {"name": "first_step", "type": "float or None", "default": "None", "required": false, "semantics": "User-specified initial step size. Must be > 0 and <= |t_bound - t0|. If None, auto-selected via select_initial_step with error_estimator_order=4."},
+        {"name": "**extraneous", "type": "dict", "default": "{}", "required": false, "semantics": "Unrecognized kwargs trigger warning via warn_extraneous."}
+      ],
+      "returns": {
+        "type": "None (constructor)",
+        "fields": []
+      },
+      "class_constants": {
+        "order": 5,
+        "error_estimator_order": 4,
+        "n_stages": 6,
+        "C": "[0, 1/5, 3/10, 4/5, 8/9, 1]",
+        "A": "6x5 lower-triangular Dormand-Prince coefficients",
+        "B": "[35/384, 0, 500/1113, 125/192, -2187/6784, 11/84]",
+        "E": "[-71/57600, 0, 71/16695, -71/1920, 17253/339200, -22/525, 1/40] (7 elements)",
+        "P": "7x4 dense output interpolation matrix"
+      },
+      "state_initialized": [
+        "Inherits all OdeSolver state (support_complex=True)",
+        "self.y_old = None",
+        "self.max_step = validated max_step",
+        "self.rtol, self.atol = validated tolerances",
+        "self.f = self.fun(self.t, self.y) -- initial function evaluation (increments nfev)",
+        "self.h_abs = auto-selected or validated first_step",
+        "self.K = empty array shape (n_stages+1, n) = (7, n)",
+        "self.error_exponent = -1/(error_estimator_order+1) = -0.2",
+        "self.h_previous = None"
+      ],
+      "edge_cases": [
+        "max_step <= 0: ValueError from validate_max_step.",
+        "rtol = 0: clamped to 100*EPS with warning.",
+        "atol = 0: allowed (no error on zero atol).",
+        "atol negative: ValueError.",
+        "atol wrong shape: ValueError if atol.ndim > 0 and atol.shape != (n,).",
+        "first_step = 0: ValueError (must be positive).",
+        "first_step > |t_bound - t0|: ValueError (exceeds bounds).",
+        "Empty y0: select_initial_step returns inf; K shape is (7, 0)."
+      ],
+      "error_conditions": [
+        {"exception": "ValueError", "condition": "max_step <= 0"},
+        {"exception": "ValueError", "condition": "atol < 0 (any element)"},
+        {"exception": "ValueError", "condition": "atol has wrong shape"},
+        {"exception": "ValueError", "condition": "first_step <= 0"},
+        {"exception": "ValueError", "condition": "first_step > |t_bound - t0|"},
+        {"exception": "UserWarning", "condition": "rtol < 100*EPS (clamped with warning)"},
+        {"exception": "UserWarning", "condition": "Extraneous keyword arguments"}
+      ],
+      "lapack_dispatch": null,
+      "version_differences": []
+    },
+    {
+      "name": "RK23.__init__",
+      "module": "scipy.integrate._ivp.rk",
+      "kind": "constructor",
+      "signature": "RK23(fun, t0, y0, t_bound, max_step=np.inf, rtol=1e-3, atol=1e-6, vectorized=False, first_step=None, **extraneous)",
+      "parameters": [
+        {"name": "fun", "type": "callable", "default": null, "required": true, "semantics": "RHS function. Same as RK45."},
+        {"name": "t0", "type": "float", "default": null, "required": true, "semantics": "Initial time."},
+        {"name": "y0", "type": "array_like, shape (n,)", "default": null, "required": true, "semantics": "Initial state."},
+        {"name": "t_bound", "type": "float", "default": null, "required": true, "semantics": "Boundary time."},
+        {"name": "max_step", "type": "float", "default": "np.inf", "required": false, "semantics": "Maximum step size. Must be > 0."},
+        {"name": "rtol", "type": "float", "default": "1e-3", "required": false, "semantics": "Relative tolerance."},
+        {"name": "atol", "type": "float or array_like", "default": "1e-6", "required": false, "semantics": "Absolute tolerance."},
+        {"name": "vectorized", "type": "bool", "default": "False", "required": false, "semantics": "Whether fun is vectorized."},
+        {"name": "first_step", "type": "float or None", "default": "None", "required": false, "semantics": "Initial step size. Auto-selected with error_estimator_order=2 if None."},
+        {"name": "**extraneous", "type": "dict", "default": "{}", "required": false, "semantics": "Unrecognized kwargs trigger warning."}
+      ],
+      "returns": {"type": "None (constructor)", "fields": []},
+      "class_constants": {
+        "order": 3,
+        "error_estimator_order": 2,
+        "n_stages": 3,
+        "C": "[0, 1/2, 3/4]",
+        "A": "3x3 lower-triangular Bogacki-Shampine coefficients",
+        "B": "[2/9, 1/3, 4/9]",
+        "E": "[5/72, -1/12, -1/9, 1/8] (4 elements)",
+        "P": "4x3 dense output interpolation matrix (cubic Hermite)"
+      },
+      "state_initialized": [
+        "Same as RK45 but with RK23 constants",
+        "self.K shape (4, n) = (n_stages+1, n)",
+        "self.error_exponent = -1/3"
+      ],
+      "edge_cases": [
+        "Same as RK45. All validation is in RungeKutta base class."
+      ],
+      "error_conditions": [
+        {"exception": "Same as RK45", "condition": "All validation in RungeKutta.__init__"}
+      ],
+      "lapack_dispatch": null,
+      "version_differences": []
+    },
+    {
+      "name": "Radau.__init__",
+      "module": "scipy.integrate._ivp.radau",
+      "kind": "constructor",
+      "signature": "Radau(fun, t0, y0, t_bound, max_step=np.inf, rtol=1e-3, atol=1e-6, jac=None, jac_sparsity=None, vectorized=False, first_step=None, **extraneous)",
+      "parameters": [
+        {"name": "fun", "type": "callable", "default": null, "required": true, "semantics": "RHS function."},
+        {"name": "t0", "type": "float", "default": null, "required": true, "semantics": "Initial time."},
+        {"name": "y0", "type": "array_like, shape (n,)", "default": null, "required": true, "semantics": "Initial state."},
+        {"name": "t_bound", "type": "float", "default": null, "required": true, "semantics": "Boundary time."},
+        {"name": "max_step", "type": "float", "default": "np.inf", "required": false, "semantics": "Maximum step size. Must be > 0."},
+        {"name": "rtol", "type": "float", "default": "1e-3", "required": false, "semantics": "Relative tolerance."},
+        {"name": "atol", "type": "float or array_like", "default": "1e-6", "required": false, "semantics": "Absolute tolerance."},
+        {"name": "jac", "type": "None, array_like, sparse_matrix, or callable", "default": "None", "required": false, "semantics": "Jacobian matrix. None: finite-difference approximation (uses num_jac with fun_vectorized). Callable: jac(t, y) -> array or sparse matrix. Array/sparse: constant Jacobian. Callable Jacobian wrapping adds njev counting. Constant Jacobian sets jac_wrapped=None (never recomputed). Shape must be (n, n)."},
+        {"name": "jac_sparsity", "type": "None, array_like, or sparse_matrix", "default": "None", "required": false, "semantics": "Sparsity structure for finite-difference Jacobian. Ignored if jac is not None. Sparse input converted to csc_matrix, then columns grouped via group_columns for efficient coloring."},
+        {"name": "vectorized", "type": "bool", "default": "False", "required": false, "semantics": "Whether fun is vectorized. Affects Jacobian finite-difference efficiency."},
+        {"name": "first_step", "type": "float or None", "default": "None", "required": false, "semantics": "Initial step size. Auto-selected with order=3 (error estimator order) if None."},
+        {"name": "**extraneous", "type": "dict", "default": "{}", "required": false, "semantics": "Unrecognized kwargs trigger warning."}
+      ],
+      "returns": {"type": "None (constructor)", "fields": []},
+      "state_initialized": [
+        "Inherits OdeSolver state (support_complex=False -- Radau does NOT support complex)",
+        "self.y_old = None",
+        "self.max_step, self.rtol, self.atol = validated",
+        "self.f = initial RHS evaluation",
+        "self.h_abs = auto or validated first_step (using order=3 for select_initial_step)",
+        "self.h_abs_old = None",
+        "self.error_norm_old = None",
+        "self.newton_tol = max(10*EPS/rtol, min(0.03, rtol**0.5))",
+        "self.sol = None",
+        "self.jac_factor = None",
+        "self.jac, self.J = validated Jacobian (callable or None, and initial J matrix)",
+        "self.lu = LU decomposition function (lu_factor or splu depending on sparse)",
+        "self.solve_lu = LU solve function (lu_solve or LU.solve)",
+        "self.I = identity matrix (dense or sparse eye)",
+        "self.current_jac = True",
+        "self.LU_real = None, self.LU_complex = None",
+        "self.Z = None"
+      ],
+      "edge_cases": [
+        "Complex y0: raises ValueError because Radau passes support_complex=False to OdeSolver.",
+        "jac shape mismatch: ValueError if jac shape != (n, n).",
+        "jac=None with jac_sparsity: finite-difference Jacobian uses sparsity coloring.",
+        "jac callable returning sparse: wrapped to ensure csc_matrix format.",
+        "jac constant sparse: converted to csc_matrix once.",
+        "Newton tolerance with very small rtol: dominated by 10*EPS/rtol term (can be very large).",
+        "Newton tolerance with large rtol (e.g. 1.0): min(0.03, 1.0) = 0.03."
+      ],
+      "error_conditions": [
+        {"exception": "ValueError", "condition": "y0 is complex (complex domain not supported)"},
+        {"exception": "ValueError", "condition": "max_step <= 0"},
+        {"exception": "ValueError", "condition": "atol < 0 or wrong shape"},
+        {"exception": "ValueError", "condition": "first_step <= 0 or exceeds bounds"},
+        {"exception": "ValueError", "condition": "jac shape != (n, n)"}
+      ],
+      "lapack_dispatch": {
+        "dense_path": "scipy.linalg.lu_factor(A, overwrite_a=True) for LU decomposition, scipy.linalg.lu_solve(LU, b, overwrite_b=True) for solve. System matrices: (MU_REAL/h)*I - J (real) and (MU_COMPLEX/h)*I - J (complex).",
+        "sparse_path": "scipy.sparse.linalg.splu(A) for LU decomposition, LU.solve(b) for solve. Identity is sparse eye(n, format='csc'). Jacobian must be csc_matrix.",
+        "dispatch_criterion": "issparse(self.J) after _validate_jac. If initial J (or constant jac) is sparse, sparse path is taken for all subsequent LU operations."
+      },
+      "version_differences": []
+    },
+    {
+      "name": "BDF.__init__",
+      "module": "scipy.integrate._ivp.bdf",
+      "kind": "constructor",
+      "signature": "BDF(fun, t0, y0, t_bound, max_step=np.inf, rtol=1e-3, atol=1e-6, jac=None, jac_sparsity=None, vectorized=False, first_step=None, **extraneous)",
+      "parameters": [
+        {"name": "fun", "type": "callable", "default": null, "required": true, "semantics": "RHS function."},
+        {"name": "t0", "type": "float", "default": null, "required": true, "semantics": "Initial time."},
+        {"name": "y0", "type": "array_like, shape (n,)", "default": null, "required": true, "semantics": "Initial state."},
+        {"name": "t_bound", "type": "float", "default": null, "required": true, "semantics": "Boundary time."},
+        {"name": "max_step", "type": "float", "default": "np.inf", "required": false, "semantics": "Maximum step size. Must be > 0."},
+        {"name": "rtol", "type": "float", "default": "1e-3", "required": false, "semantics": "Relative tolerance."},
+        {"name": "atol", "type": "float or array_like", "default": "1e-6", "required": false, "semantics": "Absolute tolerance."},
+        {"name": "jac", "type": "None, array_like, sparse_matrix, or callable", "default": "None", "required": false, "semantics": "Jacobian matrix. Same options as Radau. Key difference: BDF _validate_jac uses y0.dtype for casting (preserves complex dtype), while Radau uses float."},
+        {"name": "jac_sparsity", "type": "None, array_like, or sparse_matrix", "default": "None", "required": false, "semantics": "Sparsity structure for finite-difference Jacobian."},
+        {"name": "vectorized", "type": "bool", "default": "False", "required": false, "semantics": "Whether fun is vectorized."},
+        {"name": "first_step", "type": "float or None", "default": "None", "required": false, "semantics": "Initial step size. Auto-selected with order=1 (starting BDF order) if None."},
+        {"name": "**extraneous", "type": "dict", "default": "{}", "required": false, "semantics": "Unrecognized kwargs trigger warning."}
+      ],
+      "returns": {"type": "None (constructor)", "fields": []},
+      "state_initialized": [
+        "Inherits OdeSolver state (support_complex=True -- BDF supports complex)",
+        "self.max_step, self.rtol, self.atol = validated",
+        "f = initial RHS evaluation (nfev incremented)",
+        "self.h_abs = auto or validated first_step (using order=1)",
+        "self.h_abs_old = None, self.error_norm_old = None",
+        "self.newton_tol = max(10*EPS/rtol, min(0.03, rtol**0.5))",
+        "self.jac_factor = None",
+        "self.jac, self.J = validated Jacobian",
+        "self.lu, self.solve_lu, self.I = LU dispatch setup (same pattern as Radau)",
+        "kappa = [0, -0.1850, -1/9, -0.0823, -0.0415, 0]",
+        "self.gamma = [0, 1, 1.5, 11/6, 25/12, 137/60] (cumsum of 1/k)",
+        "self.alpha = (1-kappa) * gamma",
+        "self.error_const = kappa * gamma + 1/(1..MAX_ORDER+1)",
+        "D = empty (MAX_ORDER+3, n); D[0]=y0, D[1]=f*h_abs*direction",
+        "self.order = 1, self.n_equal_steps = 0, self.LU = None"
+      ],
+      "edge_cases": [
+        "Complex y0: allowed (BDF supports complex domain).",
+        "Initial D[1] depends on h_abs and direction: if h_abs is very large, D[1] may overflow.",
+        "jac shape mismatch: ValueError.",
+        "BDF _validate_jac casts to y0.dtype (complex preserved), Radau casts to float.",
+        "BDF identity matrix uses y0.dtype (complex identity for complex problems)."
+      ],
+      "error_conditions": [
+        {"exception": "ValueError", "condition": "max_step <= 0"},
+        {"exception": "ValueError", "condition": "atol < 0 or wrong shape"},
+        {"exception": "ValueError", "condition": "first_step <= 0 or exceeds bounds"},
+        {"exception": "ValueError", "condition": "jac shape != (n, n)"}
+      ],
+      "lapack_dispatch": {
+        "dense_path": "scipy.linalg.lu_factor/lu_solve. System: I - c*J where c = h/alpha[order].",
+        "sparse_path": "scipy.sparse.linalg.splu / LU.solve. Same criterion as Radau.",
+        "dispatch_criterion": "issparse(self.J) after _validate_jac."
+      },
+      "version_differences": [
+        "BDF supports complex domain (support_complex=True). This was added to allow complex-valued BDF integration."
+      ]
+    },
+    {
+      "name": "LSODA.__init__",
+      "module": "scipy.integrate._ivp.lsoda",
+      "kind": "constructor",
+      "signature": "LSODA(fun, t0, y0, t_bound, first_step=None, min_step=0.0, max_step=np.inf, rtol=1e-3, atol=1e-6, jac=None, lband=None, uband=None, vectorized=False, **extraneous)",
+      "parameters": [
+        {"name": "fun", "type": "callable", "default": null, "required": true, "semantics": "RHS function."},
+        {"name": "t0", "type": "float", "default": null, "required": true, "semantics": "Initial time."},
+        {"name": "y0", "type": "array_like, shape (n,)", "default": null, "required": true, "semantics": "Initial state."},
+        {"name": "t_bound", "type": "float", "default": null, "required": true, "semantics": "Boundary time."},
+        {"name": "first_step", "type": "float or None", "default": "None", "required": false, "semantics": "Initial step size. None becomes 0 (Fortran auto-select). If given, must be > 0 and <= |t_bound-t0|. User value is multiplied by self.direction before passing to Fortran."},
+        {"name": "min_step", "type": "float", "default": "0.0", "required": false, "semantics": "Minimum allowed step size. Must be >= 0. Default 0.0 (no minimum). Unique to LSODA among solve_ivp solvers."},
+        {"name": "max_step", "type": "float", "default": "np.inf", "required": false, "semantics": "Maximum step size. np.inf is converted to 0 (Fortran convention for no limit). Must be > 0 if not inf."},
+        {"name": "rtol", "type": "float", "default": "1e-3", "required": false, "semantics": "Relative tolerance."},
+        {"name": "atol", "type": "float or array_like", "default": "1e-6", "required": false, "semantics": "Absolute tolerance."},
+        {"name": "jac", "type": "None or callable", "default": "None", "required": false, "semantics": "Jacobian function jac(t, y). Only None or callable supported (NOT constant array, unlike Radau/BDF). None means finite-difference approximation by Fortran."},
+        {"name": "lband", "type": "int or None", "default": "None", "required": false, "semantics": "Lower bandwidth of banded Jacobian. Requires jac to return packed format."},
+        {"name": "uband", "type": "int or None", "default": "None", "required": false, "semantics": "Upper bandwidth of banded Jacobian. Requires jac to return packed format."},
+        {"name": "vectorized", "type": "bool", "default": "False", "required": false, "semantics": "Whether fun is vectorized. Not beneficial for LSODA itself."},
+        {"name": "**extraneous", "type": "dict", "default": "{}", "required": false, "semantics": "Unrecognized kwargs trigger warning."}
+      ],
+      "returns": {"type": "None (constructor)", "fields": []},
+      "state_initialized": [
+        "Inherits OdeSolver state (support_complex NOT set -- defaults to False)",
+        "first_step converted: None->0, else validated and multiplied by direction",
+        "max_step converted: np.inf->0, else validated > 0",
+        "min_step validated >= 0",
+        "rtol, atol validated",
+        "self._lsoda_solver = ode(self.fun, jac) with lsoda integrator configured",
+        "t_bound injected into rwork[0] for itask=5",
+        "call_args[4] updated to point to rwork"
+      ],
+      "edge_cases": [
+        "Complex y0: raises ValueError (no support_complex).",
+        "max_step = 0: raises ValueError (must be positive).",
+        "max_step = np.inf: becomes 0 for Fortran (no limit).",
+        "min_step < 0: raises ValueError.",
+        "min_step = 0: default, no minimum enforced.",
+        "jac as constant array: not rejected here but passed to ode(); behavior depends on Fortran wrapper.",
+        "lband/uband without jac: used for finite-difference banded approximation."
+      ],
+      "error_conditions": [
+        {"exception": "ValueError", "condition": "y0 is complex (not supported)"},
+        {"exception": "ValueError", "condition": "first_step <= 0 (via validate_first_step)"},
+        {"exception": "ValueError", "condition": "first_step > |t_bound - t0| (via validate_first_step)"},
+        {"exception": "ValueError", "condition": "max_step <= 0 (when not np.inf)"},
+        {"exception": "ValueError", "condition": "min_step < 0"}
+      ],
+      "lapack_dispatch": {
+        "dense_path": "Handled internally by Fortran LSODA via ODEPACK. Uses DGEFA/DGESL (Linpack) for dense LU, DGBFA/DGBSL for banded.",
+        "sparse_path": "Not supported directly. Use lband/uband for banded structure.",
+        "dispatch_criterion": "Controlled by lband/uband parameters. If both None, dense Jacobian. If set, banded Jacobian."
+      },
+      "version_differences": [
+        "LSODA wraps legacy Fortran code via scipy.integrate.ode. The Fortran workspace layout may vary between ODEPACK versions.",
+        "The itask=5 single-step mode and rwork[0]=t_bound injection are implementation-specific."
+      ]
+    },
+    {
+      "name": "validate_tol",
+      "module": "scipy.integrate._ivp.common",
+      "kind": "function",
+      "signature": "validate_tol(rtol, atol, n)",
+      "parameters": [
+        {"name": "rtol", "type": "float or array_like", "default": null, "required": true, "semantics": "Relative tolerance. Any element < 100*EPS is clamped to 100*EPS with a UserWarning. After clamping, returned as-is (may be scalar or array)."},
+        {"name": "atol", "type": "float or array_like", "default": null, "required": true, "semantics": "Absolute tolerance. Converted to ndarray via np.asarray. If ndim > 0, shape must be exactly (n,). Any negative element raises ValueError. Zero is allowed."},
+        {"name": "n", "type": "int", "default": null, "required": true, "semantics": "Number of equations (system size). Used for atol shape validation."}
+      ],
+      "returns": {
+        "type": "tuple (rtol, atol)",
+        "fields": [
+          {"name": "rtol", "type": "float or ndarray", "description": "Validated (and possibly clamped) relative tolerance."},
+          {"name": "atol", "type": "ndarray", "description": "Validated absolute tolerance as ndarray."}
+        ]
+      },
+      "edge_cases": [
+        "rtol = 0: clamped to 100*EPS (approximately 2.22e-14) with warning.",
+        "rtol = -1: np.any(-1 < 100*EPS) is True, clamped to 100*EPS. No error for negative rtol (only clamping).",
+        "atol = 0: allowed (no error). This means only relative error control.",
+        "atol = -1: ValueError ('atol must be positive').",
+        "atol scalar: ndim == 0, shape check skipped, returned as 0-D ndarray.",
+        "atol shape (n,): valid.",
+        "atol shape (n, 1) or (1, n): ndim > 0 and shape != (n,), ValueError.",
+        "atol shape (m,) where m != n: ValueError ('atol has wrong shape')."
+      ],
+      "error_conditions": [
+        {"exception": "ValueError", "condition": "atol.ndim > 0 and atol.shape != (n,)"},
+        {"exception": "ValueError", "condition": "np.any(atol < 0)"},
+        {"exception": "UserWarning", "condition": "np.any(rtol < 100 * EPS)"}
+      ],
+      "lapack_dispatch": null,
+      "version_differences": []
+    },
+    {
+      "name": "validate_first_step",
+      "module": "scipy.integrate._ivp.common",
+      "kind": "function",
+      "signature": "validate_first_step(first_step, t0, t_bound)",
+      "parameters": [
+        {"name": "first_step", "type": "float", "default": null, "required": true, "semantics": "User-specified initial step size. Must be strictly positive. Must not exceed |t_bound - t0|."},
+        {"name": "t0", "type": "float", "default": null, "required": true, "semantics": "Initial time."},
+        {"name": "t_bound", "type": "float", "default": null, "required": true, "semantics": "Boundary time."}
+      ],
+      "returns": {
+        "type": "float",
+        "fields": [
+          {"name": "first_step", "type": "float", "description": "The validated first_step value (returned unchanged)."}
+        ]
+      },
+      "edge_cases": [
+        "first_step = 0: ValueError (must be positive).",
+        "first_step < 0: ValueError (must be positive, since <= 0 check).",
+        "first_step = |t_bound - t0|: allowed (not strictly less than).",
+        "first_step > |t_bound - t0| by any amount: ValueError (exceeds bounds).",
+        "t0 == t_bound: |t_bound - t0| = 0, so any positive first_step > 0 raises ValueError.",
+        "NaN first_step: first_step <= 0 is False for NaN, first_step > 0 is also False. Returns NaN."
+      ],
+      "error_conditions": [
+        {"exception": "ValueError", "condition": "first_step <= 0"},
+        {"exception": "ValueError", "condition": "first_step > np.abs(t_bound - t0)"}
+      ],
+      "lapack_dispatch": null,
+      "version_differences": []
+    },
+    {
+      "name": "select_initial_step",
+      "module": "scipy.integrate._ivp.common",
+      "kind": "function",
+      "signature": "select_initial_step(fun, t0, y0, t_bound, max_step, f0, direction, order, rtol, atol)",
+      "parameters": [
+        {"name": "fun", "type": "callable", "default": null, "required": true, "semantics": "RHS function fun(t, y). Called once during step selection to evaluate f1 = fun(t0 + h0*direction, y1)."},
+        {"name": "t0", "type": "float", "default": null, "required": true, "semantics": "Initial time."},
+        {"name": "y0", "type": "ndarray, shape (n,)", "default": null, "required": true, "semantics": "Initial state vector."},
+        {"name": "t_bound", "type": "float", "default": null, "required": true, "semantics": "End of integration interval. Used to compute interval_length and to clamp h0."},
+        {"name": "max_step", "type": "float", "default": null, "required": true, "semantics": "Maximum allowed step size. Used as upper bound in final min()."},
+        {"name": "f0", "type": "ndarray, shape (n,)", "default": null, "required": true, "semantics": "Initial derivative fun(t0, y0). Pre-computed to avoid redundant evaluation."},
+        {"name": "direction", "type": "float", "default": null, "required": true, "semantics": "Integration direction: +1.0 or -1.0."},
+        {"name": "order", "type": "float", "default": null, "required": true, "semantics": "Error estimator order. Used to compute h1 = (0.01/max(d1,d2))^(1/(order+1)). Different per solver: RK23=2, RK45=4, DOP853=7, Radau=3, BDF=1."},
+        {"name": "rtol", "type": "float", "default": null, "required": true, "semantics": "Relative tolerance for scale computation."},
+        {"name": "atol", "type": "float or ndarray", "default": null, "required": true, "semantics": "Absolute tolerance for scale computation."}
+      ],
+      "returns": {
+        "type": "float",
+        "fields": [
+          {"name": "h_abs", "type": "float", "description": "Absolute value of suggested initial step. Always positive."}
+        ]
+      },
+      "algorithm": [
+        "1. If y0.size == 0: return np.inf",
+        "2. interval_length = |t_bound - t0|; if 0: return 0.0",
+        "3. scale = atol + |y0| * rtol",
+        "4. d0 = norm(y0/scale), d1 = norm(f0/scale) where norm = RMS norm",
+        "5. If d0 < 1e-5 or d1 < 1e-5: h0 = 1e-6, else: h0 = 0.01 * d0/d1",
+        "6. h0 = min(h0, interval_length)",
+        "7. y1 = y0 + h0 * direction * f0",
+        "8. f1 = fun(t0 + h0 * direction, y1)",
+        "9. d2 = norm((f1-f0)/scale) / h0",
+        "10. If d1 <= 1e-15 and d2 <= 1e-15: h1 = max(1e-6, h0*1e-3)",
+        "11. Else: h1 = (0.01/max(d1,d2))^(1/(order+1))",
+        "12. Return min(100*h0, h1, interval_length, max_step)"
+      ],
+      "edge_cases": [
+        "Empty y0 (size 0): returns np.inf immediately.",
+        "t0 == t_bound (interval_length 0): returns 0.0 immediately.",
+        "Very small y0 and f0 (both near zero): d0 < 1e-5 and d1 < 1e-5, h0 = 1e-6.",
+        "Very small derivatives (d1 and d2 both <= 1e-15): h1 = max(1e-6, h0*1e-3).",
+        "NaN in y0 or f0: propagates through norms, may produce NaN h_abs.",
+        "Extremely stiff system (large f0): d1 large, h0 = 0.01*d0/d1 very small.",
+        "max_step = 0: would give min(..., 0) = 0, but max_step is always validated > 0 before this call."
+      ],
+      "error_conditions": [],
+      "lapack_dispatch": null,
+      "version_differences": []
+    }
+  ],
+  "auxiliary_functions": [
+    {
+      "name": "validate_max_step",
+      "module": "scipy.integrate._ivp.common",
+      "signature": "validate_max_step(max_step)",
+      "semantics": "Rejects max_step <= 0 with ValueError. Returns max_step unchanged.",
+      "error_conditions": [{"exception": "ValueError", "condition": "max_step <= 0"}]
+    },
+    {
+      "name": "warn_extraneous",
+      "module": "scipy.integrate._ivp.common",
+      "signature": "warn_extraneous(extraneous)",
+      "semantics": "Issues UserWarning listing unrecognized keyword arguments. stacklevel=3 to point at user code."
+    },
+    {
+      "name": "norm",
+      "module": "scipy.integrate._ivp.common",
+      "signature": "norm(x)",
+      "semantics": "RMS norm: np.linalg.norm(x) / x.size ** 0.5. This is the L2 norm divided by sqrt(n), producing a per-component average error measure. Critical: all error control in IVP solvers uses this norm, NOT the raw L2 norm."
+    },
+    {
+      "name": "check_arguments",
+      "module": "scipy.integrate._ivp.base",
+      "signature": "check_arguments(fun, y0, support_complex)",
+      "semantics": "Validates y0 (1-D, finite, complex support check), wraps fun to cast output to appropriate dtype. Returns (fun_wrapped, y0)."
+    },
+    {
+      "name": "rk_step",
+      "module": "scipy.integrate._ivp.rk",
+      "signature": "rk_step(fun, t, y, f, h, A, B, C, K)",
+      "semantics": "Single explicit RK step. Fills K array in-place with stage derivatives. Returns (y_new, f_new). K[0]=f is set by caller convention. FSAL: K[-1]=f_new."
+    },
+    {
+      "name": "solve_collocation_system",
+      "module": "scipy.integrate._ivp.radau",
+      "signature": "solve_collocation_system(fun, t, y, h, Z0, scale, tol, LU_real, LU_complex, solve_lu)",
+      "semantics": "Newton iteration for Radau collocation equations. Max 6 iterations. Returns (converged, n_iter, Z, rate). Uses TI transformation to decouple into real and complex systems."
+    },
+    {
+      "name": "solve_bdf_system",
+      "module": "scipy.integrate._ivp.bdf",
+      "signature": "solve_bdf_system(fun, t_new, y_predict, c, psi, LU, solve_lu, scale, tol)",
+      "semantics": "Newton iteration for BDF algebraic system. Max 4 iterations. Returns (converged, n_iter, y_new, d). Simpler than Radau: single real LU system."
+    },
+    {
+      "name": "predict_factor",
+      "module": "scipy.integrate._ivp.radau",
+      "signature": "predict_factor(h_abs, h_abs_old, error_norm, error_norm_old)",
+      "semantics": "Two-step step size prediction (Hairer-Wanner Sec IV.8). If previous values available: multiplier = h_abs/h_abs_old * (error_norm_old/error_norm)^0.25. Factor = min(1, multiplier) * error_norm^(-0.25). One-step if h_abs_old or error_norm_old is None."
+    },
+    {
+      "name": "compute_R",
+      "module": "scipy.integrate._ivp.bdf",
+      "signature": "compute_R(order, factor)",
+      "semantics": "Computes the (order+1)x(order+1) transformation matrix for rescaling the differences array when step size changes by given factor. Uses cumulative product."
+    },
+    {
+      "name": "change_D",
+      "module": "scipy.integrate._ivp.bdf",
+      "signature": "change_D(D, order, factor)",
+      "semantics": "In-place modification of differences array D when step size changes. Computes R(order, factor) and R(order, 1), then applies (R*U)^T to D[:order+1]."
+    },
+    {
+      "name": "num_jac",
+      "module": "scipy.integrate._ivp.common",
+      "signature": "num_jac(fun, t, y, f, threshold, factor, sparsity=None)",
+      "semantics": "Adaptive finite-difference Jacobian. Adjusts step sizes to keep finite differences well-separated from roundoff. Returns (J, factor). Factor is updated for next call. Supports both dense and sparse (with column coloring) modes."
+    },
+    {
+      "name": "OdeSolution",
+      "module": "scipy.integrate._ivp.common",
+      "signature": "OdeSolution(ts, interpolants, alt_segment=False)",
+      "semantics": "Piecewise continuous solution from collection of DenseOutput interpolants. Uses np.searchsorted for segment selection. alt_segment=True selects the segment where t corresponded to t_old (used by BDF/LSODA). Supports scalar and array evaluation."
+    },
+    {
+      "name": "prepare_events",
+      "module": "scipy.integrate._ivp.ivp",
+      "signature": "prepare_events(events)",
+      "semantics": "Normalizes events: single callable -> tuple. Extracts terminal (None/False/0 -> inf max_events; True -> 1; positive int -> that many) and direction (default 0) attributes from each event function."
+    }
+  ],
+  "constants": {
+    "EPS": "np.finfo(float).eps, approximately 2.220446049250313e-16",
+    "RK_SAFETY": 0.9,
+    "RK_MIN_FACTOR": 0.2,
+    "RK_MAX_FACTOR": 10,
+    "RADAU_NEWTON_MAXITER": 6,
+    "RADAU_MIN_FACTOR": 0.2,
+    "RADAU_MAX_FACTOR": 10,
+    "BDF_NEWTON_MAXITER": 4,
+    "BDF_MIN_FACTOR": 0.2,
+    "BDF_MAX_FACTOR": 10,
+    "BDF_MAX_ORDER": 5,
+    "DOP853_N_STAGES": 12,
+    "DOP853_N_STAGES_EXTENDED": 16,
+    "DOP853_INTERPOLATOR_POWER": 7,
+    "NUM_JAC_DIFF_REJECT": "EPS^0.875",
+    "NUM_JAC_DIFF_SMALL": "EPS^0.75",
+    "NUM_JAC_DIFF_BIG": "EPS^0.25",
+    "NUM_JAC_MIN_FACTOR": "1e3 * EPS",
+    "NUM_JAC_FACTOR_INCREASE": 10,
+    "NUM_JAC_FACTOR_DECREASE": 0.1,
+    "RADAU_MU_REAL": "3 + 3^(2/3) - 3^(1/3) = ~3.637834",
+    "RADAU_MU_COMPLEX": "(3 + 0.5*(3^(1/3) - 3^(2/3))) - 0.5j*(3^(5/6) + 3^(7/6))",
+    "RADAU_C": "[(4-sqrt(6))/10, (4+sqrt(6))/10, 1]",
+    "RADAU_E": "[-13-7*sqrt(6), -13+7*sqrt(6), -1] / 3",
+    "BDF_KAPPA": "[0, -0.1850, -1/9, -0.0823, -0.0415, 0]"
+  },
+  "complex_domain_support": {
+    "RK23": true,
+    "RK45": true,
+    "DOP853": true,
+    "Radau": false,
+    "BDF": true,
+    "LSODA": false
+  },
+  "solver_comparison_matrix": {
+    "RK23": {
+      "type": "explicit",
+      "stiffness": "non-stiff",
+      "order": 3,
+      "error_order": 2,
+      "stages": 3,
+      "jacobian": false,
+      "dense_output": "cubic Hermite polynomial",
+      "initial_step_order": 2,
+      "newton_iterations": null,
+      "complex_support": true
+    },
+    "RK45": {
+      "type": "explicit",
+      "stiffness": "non-stiff",
+      "order": 5,
+      "error_order": 4,
+      "stages": 6,
+      "jacobian": false,
+      "dense_output": "quartic polynomial",
+      "initial_step_order": 4,
+      "newton_iterations": null,
+      "complex_support": true
+    },
+    "DOP853": {
+      "type": "explicit",
+      "stiffness": "non-stiff",
+      "order": 8,
+      "error_order": 7,
+      "stages": "12 (16 for dense output)",
+      "jacobian": false,
+      "dense_output": "7th-order polynomial (7 coefficients, Aitken-Neville-like)",
+      "initial_step_order": 7,
+      "newton_iterations": null,
+      "complex_support": true
+    },
+    "Radau": {
+      "type": "implicit",
+      "stiffness": "stiff",
+      "order": 5,
+      "error_order": 3,
+      "stages": 3,
+      "jacobian": true,
+      "dense_output": "cubic polynomial (collocation conditions)",
+      "initial_step_order": 3,
+      "newton_iterations": 6,
+      "complex_support": false
+    },
+    "BDF": {
+      "type": "implicit multistep",
+      "stiffness": "stiff",
+      "order": "1-5 (variable)",
+      "error_order": "order-dependent",
+      "stages": null,
+      "jacobian": true,
+      "dense_output": "Newton backward differences interpolation",
+      "initial_step_order": 1,
+      "newton_iterations": 4,
+      "complex_support": true
+    },
+    "LSODA": {
+      "type": "hybrid Adams/BDF",
+      "stiffness": "auto-detect",
+      "order": "1-12 (Adams) / 1-5 (BDF)",
+      "error_order": "variable",
+      "stages": null,
+      "jacobian": true,
+      "dense_output": "Nordsieck polynomial",
+      "initial_step_order": "Fortran auto-select",
+      "newton_iterations": "Fortran internal",
+      "complex_support": false
+    }
+  },
+  "critical_invariants_for_rust_port": [
+    "norm() is RMS (L2/sqrt(n)), NOT L2. Every error comparison depends on this.",
+    "Error scale = atol + rtol * max(|y|, |y_new|) for explicit RK; atol + rtol * |y| for initial step and implicit methods.",
+    "validate_tol allows atol=0 but warns and clamps rtol < 100*EPS. Negative atol is rejected.",
+    "select_initial_step calls fun once (increments nfev). The fun passed is the nfev-counting wrapper.",
+    "Radau error is computed by LU-solving, not direct estimation. This mixes error estimation with the linear algebra.",
+    "BDF differences array D must be updated in-place consistently with step size changes via compute_R/change_D.",
+    "BDF order changes only after n_equal_steps >= order+1. This prevents premature order switching.",
+    "LSODA njev == nlu (from Fortran iwork[12]). This is a property of the Fortran implementation, not a mathematical invariant.",
+    "OdeSolution alt_segment=True for BDF and LSODA. This affects which interpolant is selected at knot points.",
+    "All solvers: step size bounded below by 10*ULP(t). If step < this, solver fails with TOO_SMALL_STEP.",
+    "RungeKutta: after step rejection, next accepted step growth factor capped at 1 (no growth).",
+    "Radau/BDF: if Newton convergence fails with current Jacobian, recompute Jacobian once. If still fails, halve step.",
+    "solve_ivp deduplicates consecutive equal timepoints when dense_output=True and t_eval=None."
+  ]
+}

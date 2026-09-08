@@ -1,0 +1,62 @@
+{
+  "scenario_id": "scenario_32_lfilter_zi",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "lfilter_zi_reference_vector",
+      "action": "lfilter_zi(b, a)",
+      "input_summary": "SciPy steady-state vector for a normalized first-order IIR",
+      "output_summary": "zi=[1.5]",
+      "duration_ns": 39805,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "lfilter_zi_step_response",
+      "action": "lfilter(b, a, ones, zi=lfilter_zi(...))",
+      "input_summary": "steady-state zi should make the unit-step response constant from the first sample",
+      "output_summary": "step response=[0.9090909090909092, 0.909090909090909, 0.909090909090909]",
+      "duration_ns": 107234,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "lfilter_zi_trims_leading_zero_a",
+      "action": "lfilter_zi(b, a=[0, ...])",
+      "input_summary": "SciPy trims leading zero denominator coefficients before solving the steady-state system",
+      "output_summary": "trimmed zi=[1.6428571428571428]",
+      "duration_ns": 18665,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "lfilter_zi_scalar_transfer_rejected",
+      "action": "lfilter_zi([b0], [a0])",
+      "input_summary": "scalar transfer functions should fail with SciPy's degenerate-system error",
+      "output_summary": "invalid parameter: The length of `a` along the last axis must be at least 2.",
+      "duration_ns": 21781,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "lfilter_zi",
+    "signal_length": 12,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 191923,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_32_lfilter_zi --nocapture"
+  }
+}

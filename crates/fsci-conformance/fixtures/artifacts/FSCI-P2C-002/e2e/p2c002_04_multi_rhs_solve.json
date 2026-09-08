@@ -1,0 +1,76 @@
+{
+  "scenario_id": "p2c002_04_multi_rhs_solve",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "solve_rhs_0",
+      "action": "solve(A, b_i)",
+      "input_summary": "b=[5.0, 5.0, 3.0]",
+      "output_summary": "x=[1.0, 1.0, 1.0], residual=0.00e0",
+      "duration_ns": 221740,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "solve_rhs_1",
+      "action": "solve(A, b_i)",
+      "input_summary": "b=[1.0, 0.0, 0.0]",
+      "output_summary": "x=[0.2777777777777778, -0.11111111111111112, 0.05555555555555556], residual=2.08e-17",
+      "duration_ns": 149083,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "solve_rhs_2",
+      "action": "solve(A, b_i)",
+      "input_summary": "b=[0.0, 1.0, 0.0]",
+      "output_summary": "x=[-0.11111111111111112, 0.4444444444444445, -0.22222222222222224], residual=0.00e0",
+      "duration_ns": 82777,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "solve_rhs_3",
+      "action": "solve(A, b_i)",
+      "input_summary": "b=[0.0, 0.0, 1.0]",
+      "output_summary": "x=[0.05555555555555556, -0.22222222222222224, 0.6111111111111112], residual=0.00e0",
+      "duration_ns": 78399,
+      "mode": "strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 5,
+      "step_name": "solve_rhs_4",
+      "action": "solve(A, b_i)",
+      "input_summary": "b=[10.0, 20.0, 30.0]",
+      "output_summary": "x=[2.2222222222222223, 1.1111111111111105, 14.444444444444446], residual=3.55e-15",
+      "duration_ns": 81805,
+      "mode": "strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "matrix_metadata": {
+    "size": [
+      3,
+      3
+    ],
+    "nnz": null,
+    "rcond_estimate": null,
+    "mode": "strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 642958,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_linalg -- p2c002_04_multi_rhs_solve --nocapture"
+  }
+}

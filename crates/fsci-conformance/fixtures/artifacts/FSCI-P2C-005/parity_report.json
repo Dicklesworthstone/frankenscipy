@@ -1,0 +1,475 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-005",
+  "family": "fft_core",
+  "case_results": [
+    {
+      "case_id": "fft_impulse_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft_dc_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft_forward_dc_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft_forward_impulse_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft_forward_dc_5pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft_forward_impulse_5pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "ifft_dc_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "ifft_forward_dc_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft_ifft_roundtrip",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfft_ramp_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=7.35e-16)"
+    },
+    {
+      "case_id": "rfft_forward_ramp_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=1.84e-16)"
+    },
+    {
+      "case_id": "rfft_forward_impulse_5pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfft_ortho_impulse_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft_ortho_impulse_4pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fftfreq_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fftfreq_1pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fftfreq_5pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfftfreq_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfftfreq_1pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfftfreq_5pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fftfreq_4pt_spacing_half",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfftfreq_4pt_spacing_half",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fftshift_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fftshift_5pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "ifftshift_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "ifftshift_5pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft_empty_error",
+      "passed": true,
+      "message": "error matched: invalid shape: input length must be greater than zero"
+    },
+    {
+      "case_id": "fftfreq_spacing_zero_error",
+      "passed": true,
+      "message": "error matched: sample spacing must be non-zero"
+    },
+    {
+      "case_id": "irfft_from_rfft_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfft_impulse_5pt",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "irfft_impulse_5pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft2_impulse_2x2",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft2_dc_2x2",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "ifft2_dc_2x2",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfft2_ramp_2x2",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "irfft2_ramp_2x2",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfftn_impulse_2x2x2",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "irfftn_impulse_2x2x2",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fft_single_element",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "hfft_from_rfft_impulse_4",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fftn_2x3_impulse",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "fftn_2x3_constant",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "ifftn_2x3_constant",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "ifftn_2x3_ones",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "ifftn_2x2x2_dc",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "ihfft_from_hfft_impulse_4",
+      "passed": true,
+      "message": "complex vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "dct_impulse_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "dct_constant_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=3.46e-16)"
+    },
+    {
+      "case_id": "idct_from_dct_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "dct_i_impulse_5pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "dst_i_impulse_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "dst_ii_impulse_4pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "dct_iii_8pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "dct_iv_8pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=1.42e-14)"
+    },
+    {
+      "case_id": "dst_iii_8pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=1.78e-15)"
+    },
+    {
+      "case_id": "dst_iv_8pt",
+      "passed": true,
+      "message": "real vector matched (max_diff=9.10e-15)"
+    },
+    {
+      "case_id": "fft_hardened_rejects_nan_real",
+      "passed": true,
+      "message": "error matched: non-finite input rejected by policy"
+    },
+    {
+      "case_id": "ifft_hardened_rejects_inf_imag",
+      "passed": true,
+      "message": "error matched: non-finite input rejected by policy"
+    },
+    {
+      "case_id": "rfft_hardened_rejects_neg_inf",
+      "passed": true,
+      "message": "error matched: non-finite input rejected by policy"
+    },
+    {
+      "case_id": "irfft_hardened_rejects_nan_spectrum",
+      "passed": true,
+      "message": "error matched: non-finite input rejected by policy"
+    },
+    {
+      "case_id": "dct_hardened_rejects_inf_real",
+      "passed": true,
+      "message": "error matched: non-finite input rejected by policy"
+    },
+    {
+      "case_id": "rfft2_4x4_ramp",
+      "passed": true,
+      "message": "complex vector matched (max_diff=8.82e-15)"
+    },
+    {
+      "case_id": "irfft2_4x4_roundtrip",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfftn_2x3x4_ramp",
+      "passed": true,
+      "message": "complex vector matched (max_diff=1.76e-14)"
+    },
+    {
+      "case_id": "irfftn_2x3x4_roundtrip",
+      "passed": true,
+      "message": "real vector matched (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "rfft2_hardened_rejects_nan_real",
+      "passed": true,
+      "message": "error matched: non-finite input rejected by policy"
+    },
+    {
+      "case_id": "irfftn_hardened_rejects_inf_imag",
+      "passed": true,
+      "message": "error matched: non-finite input rejected by policy"
+    },
+    {
+      "case_id": "br_yjas_dct_iv_4pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "br_yjas_dct_iv_4pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "br_yjas_dst_iv_4pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=1.78e-15)"
+    },
+    {
+      "case_id": "br_yjas_dst_iv_4pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=3.47e-16)"
+    },
+    {
+      "case_id": "br_mhnr_dct_iv_8pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=3.55e-15)"
+    },
+    {
+      "case_id": "br_mhnr_dct_iv_8pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "br_mhnr_dst_iv_8pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=2.28e-15)"
+    },
+    {
+      "case_id": "br_mhnr_dst_iv_8pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=5.69e-16)"
+    },
+    {
+      "case_id": "br_0wg1_dct_4pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=1.78e-15)"
+    },
+    {
+      "case_id": "br_0wg1_dct_4pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=1.08e-16)"
+    },
+    {
+      "case_id": "br_0wg1_dst_ii_4pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "br_0wg1_dst_ii_4pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "br_0wg1_dct_i_4pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=3.70e-17)"
+    },
+    {
+      "case_id": "br_0wg1_dst_i_4pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "br_0wg1_dst_i_4pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "br_mhnr_dct_i_4pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "br_mhnr_dct_iii_8pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=1.78e-15)"
+    },
+    {
+      "case_id": "br_mhnr_dct_iii_8pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "br_mhnr_dst_iii_8pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "br_mhnr_dst_iii_8pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=9.02e-17)"
+    },
+    {
+      "case_id": "br_mhnr_dct_5pt_backward",
+      "passed": true,
+      "message": "real vector matched (max_diff=3.55e-15)"
+    },
+    {
+      "case_id": "br_mhnr_dct_5pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "br_mhnr_dct_5pt_forward",
+      "passed": true,
+      "message": "real vector matched (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "br_mhnr_dst_i_5pt_ortho",
+      "passed": true,
+      "message": "real vector matched (max_diff=1.11e-15)"
+    },
+    {
+      "case_id": "br_mhnr_dst_iv_5pt_backward",
+      "passed": true,
+      "message": "real vector matched (max_diff=4.22e-15)"
+    },
+    {
+      "case_id": "br_mhnr_dct_iv_5pt_backward",
+      "passed": true,
+      "message": "real vector matched (max_diff=3.55e-15)"
+    }
+  ],
+  "passed_cases": 93,
+  "failed_cases": 0,
+  "generated_unix_ms": 1787003411114
+}

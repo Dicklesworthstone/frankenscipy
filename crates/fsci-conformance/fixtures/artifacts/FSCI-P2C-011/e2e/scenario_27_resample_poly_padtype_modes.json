@@ -1,0 +1,52 @@
+{
+  "scenario_id": "scenario_27_resample_poly_padtype_modes",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "resample_poly_line_reference",
+      "action": "resample_poly_with_padtype(x, 3, 2, Some(\"line\"), None)",
+      "input_summary": "global line extrapolation should match SciPy's line padtype output",
+      "output_summary": "max_abs_diff=5.70e-9",
+      "duration_ns": 39695,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "resample_poly_mean_reference",
+      "action": "resample_poly_with_padtype(x, 3, 2, Some(\"mean\"), None)",
+      "input_summary": "background-subtracted mean padding should match SciPy's mean padtype output",
+      "output_summary": "max_abs_diff=2.31e-9",
+      "duration_ns": 20969,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "resample_poly_constant_cval_reference",
+      "action": "resample_poly_with_padtype(x, 3, 2, Some(\"constant\"), Some(5.0))",
+      "input_summary": "constant padding with an explicit cval should match SciPy's nonzero boundary fill",
+      "output_summary": "max_abs_diff=3.10e-9",
+      "duration_ns": 17964,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "signal_metadata": {
+    "operation": "resample_poly",
+    "signal_length": 4,
+    "mode": "Strict"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 84080,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_signal -- scenario_27_resample_poly_padtype_modes --nocapture"
+  }
+}

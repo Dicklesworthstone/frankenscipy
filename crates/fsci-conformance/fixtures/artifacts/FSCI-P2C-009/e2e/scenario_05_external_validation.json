@@ -1,0 +1,53 @@
+{
+  "scenario_id": "scenario_05_external_validation",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "adjusted_rand",
+      "action": "adjusted_rand_score(true, pred)",
+      "input_summary": "compare clusterings",
+      "output_summary": "adjusted_rand=0.6563",
+      "duration_ns": 79290,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "normalized_mutual_info",
+      "action": "normalized_mutual_info(true, pred)",
+      "input_summary": "information-theoretic metric",
+      "output_summary": "nmi=0.6963",
+      "duration_ns": 48221,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "homogeneity_completeness_vmeasure",
+      "action": "homogeneity, completeness, v_measure",
+      "input_summary": "label assignment quality",
+      "output_summary": "h=0.6963, c=0.6963, v=0.6963",
+      "duration_ns": 131800,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "cluster_metadata": {
+    "algorithm": "external_metrics",
+    "n_samples": 30,
+    "n_features": 2,
+    "n_clusters": 3
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 267026,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_cluster -- scenario_05_external_validation --nocapture"
+  }
+}

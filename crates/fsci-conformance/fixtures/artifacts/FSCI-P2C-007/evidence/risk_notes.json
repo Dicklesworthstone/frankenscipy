@@ -1,0 +1,34 @@
+{
+  "packet_id": "FSCI-P2C-007",
+  "notes": [
+    {
+      "category": "empty array edge cases",
+      "description": "Zero-length and scalar-shape creation/indexing can diverge between Strict and Hardened flows when downstream operations assume at least one element.",
+      "affected_operations": [
+        "zeros",
+        "ones",
+        "from_slice",
+        "getitem"
+      ],
+      "mitigation": "Maintain explicit empty-shape fixtures and keep error-kind assertions for malformed index/mask combinations in differential + adversarial cases."
+    },
+    {
+      "category": "zero-stride broadcasting",
+      "description": "Broadcast expansion from singleton dimensions can alias logical coordinates to one source index; incorrect stride/index mapping can silently corrupt values.",
+      "affected_operations": [
+        "broadcast_shapes",
+        "relation_broadcast_commutative"
+      ],
+      "mitigation": "Retain commutativity and incompatibility fixtures, and keep broadcast index-mapping parity checks against fixture expectations for each release."
+    },
+    {
+      "category": "mixed-dtype promotion",
+      "description": "Float/complex and integer promotion boundaries can produce behavior drift or unsupported-dtype regressions when force_floating and symmetry rules interact.",
+      "affected_operations": [
+        "result_type",
+        "relation_result_type_symmetry"
+      ],
+      "mitigation": "Keep promotion matrix fixtures (including adversarial integral cases) and enforce symmetry/property cases in parity gates before packet sign-off."
+    }
+  ]
+}

@@ -1,0 +1,230 @@
+{
+  "schema_version": 1,
+  "packet_id": "FSCI-P2C-009",
+  "family": "cluster_core",
+  "case_results": [
+    {
+      "case_id": "linkage_single_5pt",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_complete_5pt",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_average_5pt",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "fcluster_single_2groups",
+      "passed": true,
+      "message": "labels matched: [1, 1, 1, 1, 2]"
+    },
+    {
+      "case_id": "fcluster_complete_3groups",
+      "passed": true,
+      "message": "labels matched: [1, 1, 2, 2, 3]"
+    },
+    {
+      "case_id": "kmeans_two_blobs_seeded",
+      "passed": true,
+      "message": "labels matched: [0, 0, 0, 1, 1, 1]"
+    },
+    {
+      "case_id": "kmeans_three_1d_blobs_seeded",
+      "passed": true,
+      "message": "labels matched: [2, 2, 0, 0, 1, 1]"
+    },
+    {
+      "case_id": "dbscan_two_blobs_seeded",
+      "passed": true,
+      "message": "signed labels matched: [0, 0, 0, 1, 1, 1]"
+    },
+    {
+      "case_id": "dbscan_noise_seeded",
+      "passed": true,
+      "message": "signed labels matched: [0, 0, 0, 1, 1, -1]"
+    },
+    {
+      "case_id": "mean_shift_two_blobs_seeded",
+      "passed": true,
+      "message": "labels matched: [0, 0, 0, 1, 1, 1]"
+    },
+    {
+      "case_id": "vq_3obs_2centroids",
+      "passed": true,
+      "message": "vq_result matched"
+    },
+    {
+      "case_id": "vq_all_to_first",
+      "passed": true,
+      "message": "vq_result matched"
+    },
+    {
+      "case_id": "whiten_3x2",
+      "passed": true,
+      "message": "matrix matched"
+    },
+    {
+      "case_id": "cophenet_single_5pt",
+      "passed": true,
+      "message": "array matched"
+    },
+    {
+      "case_id": "inconsistent_single_5pt_d2",
+      "passed": true,
+      "message": "matrix matched"
+    },
+    {
+      "case_id": "silhouette_perfect_2clusters",
+      "passed": true,
+      "message": "scalar matched: 0.9839052428772979"
+    },
+    {
+      "case_id": "adjusted_rand_perfect_match",
+      "passed": true,
+      "message": "scalar matched: 1"
+    },
+    {
+      "case_id": "adjusted_rand_bad_match",
+      "passed": true,
+      "message": "scalar matched: -0.16666666666666674"
+    },
+    {
+      "case_id": "is_valid_linkage_valid_5pt",
+      "passed": true,
+      "message": "boolean matched: true"
+    },
+    {
+      "case_id": "is_valid_linkage_bad_index",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "is_valid_linkage_negative_dist",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "is_monotonic_monotonic_5pt",
+      "passed": true,
+      "message": "boolean matched: true"
+    },
+    {
+      "case_id": "is_monotonic_not_monotonic",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "leaves_list_5pt",
+      "passed": true,
+      "message": "labels matched: [4, 0, 1, 2, 3]"
+    },
+    {
+      "case_id": "num_obs_linkage_5pt",
+      "passed": true,
+      "message": "scalar matched: 5"
+    },
+    {
+      "case_id": "hardened_is_valid_linkage_valid_5pt",
+      "passed": true,
+      "message": "boolean matched: true"
+    },
+    {
+      "case_id": "hardened_is_valid_linkage_bad_index",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "hardened_is_valid_linkage_negative_dist",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "hardened_is_monotonic_not_monotonic",
+      "passed": true,
+      "message": "boolean matched: false"
+    },
+    {
+      "case_id": "hardened_num_obs_linkage_5pt",
+      "passed": true,
+      "message": "scalar matched: 5"
+    },
+    {
+      "case_id": "linkage_single_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_complete_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_average_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_ward_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_weighted_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_ward_5pt_1D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_ward_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_single_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_complete_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_weighted_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_centroid_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_median_6pt_2D",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_centroid_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    },
+    {
+      "case_id": "linkage_median_5pts",
+      "passed": true,
+      "message": "linkage matched"
+    }
+  ],
+  "passed_cases": 44,
+  "failed_cases": 0,
+  "generated_unix_ms": 1777873167015
+}

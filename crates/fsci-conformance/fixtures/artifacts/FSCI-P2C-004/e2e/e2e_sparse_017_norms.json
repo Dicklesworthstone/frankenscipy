@@ -1,0 +1,57 @@
+{
+  "scenario_id": "e2e_sparse_017_norms",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "build_matrix",
+      "action": "tridiag",
+      "input_summary": "3x3 tridiag(-1, 2, -1)",
+      "output_summary": "nnz=7",
+      "duration_ns": 60364,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 2,
+      "step_name": "frobenius_norm",
+      "action": "sparse_norm(fro)",
+      "input_summary": "expected 4",
+      "output_summary": "computed=4.000000, pass=true",
+      "duration_ns": 8506,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 3,
+      "step_name": "one_norm",
+      "action": "sparse_norm(1)",
+      "input_summary": "expected 4",
+      "output_summary": "computed=4.000000, pass=true",
+      "duration_ns": 3237,
+      "mode": "strict",
+      "outcome": "ok"
+    },
+    {
+      "step_id": 4,
+      "step_name": "inf_norm",
+      "action": "sparse_norm(inf)",
+      "input_summary": "expected 4",
+      "output_summary": "computed=4.000000, pass=true",
+      "duration_ns": 1342,
+      "mode": "strict",
+      "outcome": "ok"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 249402,
+    "replay_command": "cargo test -p fsci-conformance --test e2e_sparse -- e2e_sparse_017_norms --nocapture"
+  }
+}

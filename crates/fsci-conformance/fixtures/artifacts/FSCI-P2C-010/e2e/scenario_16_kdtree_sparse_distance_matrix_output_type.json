@@ -1,0 +1,73 @@
+{
+  "scenario_id": "scenario_16_kdtree_sparse_distance_matrix_output_type",
+  "steps": [
+    {
+      "step_id": 1,
+      "step_name": "default_dok",
+      "action": "KDTree::sparse_distance_matrix(other, 0.75)",
+      "input_summary": "SciPy default output_type='dok_matrix'",
+      "output_summary": "default DOK output matches expected dense matrix",
+      "duration_ns": 25248,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 2,
+      "step_name": "dict_output",
+      "action": "KDTree::sparse_distance_matrix_with_output_type(other, 0.75, 'dict')",
+      "input_summary": "SciPy dict output_type",
+      "output_summary": "dict output matches expected dense matrix",
+      "duration_ns": 10941,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 3,
+      "step_name": "ndarray_output",
+      "action": "KDTree::sparse_distance_matrix_with_output_type(other, 0.75, 'ndarray')",
+      "input_summary": "SciPy ndarray record output_type",
+      "output_summary": "ndarray output matches expected dense matrix",
+      "duration_ns": 4980,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 4,
+      "step_name": "coo_output",
+      "action": "KDTree::sparse_distance_matrix_with_output_type(other, 0.75, 'coo_matrix')",
+      "input_summary": "SciPy COO output_type",
+      "output_summary": "coo output matches expected dense matrix",
+      "duration_ns": 3978,
+      "mode": "Strict",
+      "outcome": "pass"
+    },
+    {
+      "step_id": 5,
+      "step_name": "invalid_output_type",
+      "action": "KDTree::sparse_distance_matrix_with_output_type(other, 0.75, 'bad')",
+      "input_summary": "SciPy rejects invalid output_type",
+      "output_summary": "invalid output type rejected",
+      "duration_ns": 1052,
+      "mode": "Strict",
+      "outcome": "pass"
+    }
+  ],
+  "artifacts": [],
+  "environment": {
+    "rust_version": "0.1.0",
+    "os": "linux",
+    "cpu_count": 64,
+    "total_memory_mb": "unknown"
+  },
+  "spatial_metadata": {
+    "operation": "KDTree",
+    "n_points": 2,
+    "n_dims": 2,
+    "metric": "euclidean"
+  },
+  "overall": {
+    "status": "pass",
+    "total_duration_ns": 180231,
+    "replay_command": "rch exec -- cargo test -p fsci-conformance --test e2e_spatial -- scenario_16_kdtree_sparse_distance_matrix_output_type --nocapture"
+  }
+}
