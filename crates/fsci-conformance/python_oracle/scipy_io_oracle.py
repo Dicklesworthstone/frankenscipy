@@ -6,10 +6,25 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0.0 else "-Infinity"
+        return value
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    return value
 
 
 def _float_list(values: Any) -> List[float]:
@@ -67,7 +82,7 @@ def _run_mmread(case: Dict[str, Any], scipy_io: Any, np: Any) -> Dict[str, Any]:
     try:
         stream = io.BytesIO(case["content"].encode("utf-8"))
         return _ok(case_id, "matrix", _matrix_payload(scipy_io.mmread(stream), np))
-    except (ArithmeticError, OverflowError, TypeError, ValueError) as exc:
+    except Exception as exc:
         return _err(case_id, _fixture_error(case, str(exc)))
 
 
@@ -81,7 +96,7 @@ def _run_mmwrite(case: Dict[str, Any], scipy_io: Any, np: Any) -> Dict[str, Any]
         scipy_io.mmwrite(stream, matrix)
         stream.seek(0)
         return _ok(case_id, "matrix", _matrix_payload(scipy_io.mmread(stream), np))
-    except (ArithmeticError, OverflowError, TypeError, ValueError) as exc:
+    except Exception as exc:
         return _err(case_id, _fixture_error(case, str(exc)))
 
 
@@ -94,7 +109,7 @@ def _run_loadmat(case: Dict[str, Any], scipy_io: Any, np: Any) -> Dict[str, Any]
         if not keys:
             return _err(case_id, _fixture_error(case, "MAT file did not contain any arrays"))
         return _ok(case_id, "matrix", _matrix_payload(loaded[keys[0]], np))
-    except (ArithmeticError, OverflowError, TypeError, ValueError) as exc:
+    except Exception as exc:
         return _err(case_id, _fixture_error(case, str(exc)))
 
 
@@ -110,7 +125,7 @@ def _run_savemat(case: Dict[str, Any], scipy_io: Any, np: Any) -> Dict[str, Any]
         stream.seek(0)
         loaded = scipy_io.loadmat(stream)
         return _ok(case_id, "matrix", _matrix_payload(loaded[name], np))
-    except (ArithmeticError, OverflowError, TypeError, ValueError) as exc:
+    except Exception as exc:
         return _err(case_id, _fixture_error(case, str(exc)))
 
 
@@ -119,7 +134,7 @@ def _run_loadtxt(case: Dict[str, Any], np: Any) -> Dict[str, Any]:
     try:
         stream = io.StringIO(case["content"])
         return _ok(case_id, "matrix", _matrix_payload(np.loadtxt(stream), np))
-    except (ArithmeticError, OverflowError, TypeError, ValueError) as exc:
+    except Exception as exc:
         return _err(case_id, _fixture_error(case, str(exc)))
 
 
@@ -133,7 +148,7 @@ def _run_savetxt(case: Dict[str, Any], np: Any) -> Dict[str, Any]:
         np.savetxt(stream, matrix, delimiter=str(case.get("delimiter", " ")))
         stream.seek(0)
         return _ok(case_id, "matrix", _matrix_payload(np.loadtxt(stream), np))
-    except (ArithmeticError, OverflowError, TypeError, ValueError) as exc:
+    except Exception as exc:
         return _err(case_id, _fixture_error(case, str(exc)))
 
 
@@ -162,33 +177,36 @@ def _run_wav_write(case: Dict[str, Any], wavfile: Any, np: Any) -> Dict[str, Any
                 "values": _float_list(values),
             },
         )
-    except (ArithmeticError, OverflowError, TypeError, ValueError) as exc:
+    except Exception as exc:
         return _err(case_id, _fixture_error(case, str(exc)))
 
 
 def _run_case(case: Dict[str, Any], scipy_io: Any, wavfile: Any, np: Any) -> Dict[str, Any]:
-    operation = case.get("operation")
-    if operation == "mmread":
-        return _run_mmread(case, scipy_io, np)
-    if operation == "mmwrite":
-        return _run_mmwrite(case, scipy_io, np)
-    if operation == "loadmat":
-        return _run_loadmat(case, scipy_io, np)
-    if operation == "savemat":
-        return _run_savemat(case, scipy_io, np)
-    if operation == "loadtxt":
-        return _run_loadtxt(case, np)
-    if operation == "savetxt":
-        return _run_savetxt(case, np)
-    if operation == "wav_write":
-        return _run_wav_write(case, wavfile, np)
-    return {
-        "case_id": case.get("case_id", "<missing>"),
-        "status": "error",
-        "result_kind": "unsupported_operation",
-        "result": {},
-        "error": f"unsupported operation: {operation}",
-    }
+    try:
+        operation = case.get("operation")
+        if operation == "mmread":
+            return _run_mmread(case, scipy_io, np)
+        if operation == "mmwrite":
+            return _run_mmwrite(case, scipy_io, np)
+        if operation == "loadmat":
+            return _run_loadmat(case, scipy_io, np)
+        if operation == "savemat":
+            return _run_savemat(case, scipy_io, np)
+        if operation == "loadtxt":
+            return _run_loadtxt(case, np)
+        if operation == "savetxt":
+            return _run_savetxt(case, np)
+        if operation == "wav_write":
+            return _run_wav_write(case, wavfile, np)
+        return {
+            "case_id": case.get("case_id", "<missing>"),
+            "status": "error",
+            "result_kind": "unsupported_operation",
+            "result": {},
+            "error": f"unsupported operation: {operation}",
+        }
+    except Exception as exc:
+        return _err(case.get("case_id", "<missing>"), _fixture_error(case, str(exc)))
 
 
 def main() -> int:
@@ -236,7 +254,10 @@ def main() -> int:
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(_json_safe(payload), indent=2, sort_keys=True, allow_nan=False),
+        encoding="utf-8",
+    )
     return 0
 
 

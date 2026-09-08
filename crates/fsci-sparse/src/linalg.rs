@@ -21931,6 +21931,9 @@ mod tests {
     #[test]
     fn symbolic_reserve_ships_disabled() {
         use std::sync::atomic::Ordering;
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The lever is unmeasured: the symbolic pass is O(fill) work the shipping path
         // does not currently do and may cost more than the locality is worth.
         assert!(
