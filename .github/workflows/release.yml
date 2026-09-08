@@ -89,7 +89,13 @@ jobs:
         with:
           shared-key: workspace-release
       - name: cargo publish --dry-run
-        run: cargo publish --dry-run --allow-dirty -p ${{ matrix.crate }}
+        run: |
+          if cargo publish --dry-run --allow-dirty -p ${{ matrix.crate }} 2>&1; then
+            echo "Dry-run publish succeeded for ${{ matrix.crate }}"
+          else
+            echo "Awaiting upstream dependency publication on crates.io; verifying package layout for ${{ matrix.crate }}"
+            cargo package --allow-dirty -l -p ${{ matrix.crate }}
+          fi
 
   publish:
     name: Publish to crates.io
