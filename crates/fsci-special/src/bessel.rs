@@ -4914,7 +4914,7 @@ fn complex_yv_scalar(v: f64, z: Complex64, _mode: RuntimeMode) -> Result<Complex
     }
 
     // Integer or near-integer order: use recurrence to avoid cancellation in (J_v cos(vπ) - J_{-v}) / sin(vπ)
-    if (v - v.round()).abs() < 1e-12 && v.abs() <= i32::MAX as f64 {
+    if (v - v.round()).abs() < 1e-6 && v.abs() <= i32::MAX as f64 {
         let round_v = v.round();
         let n = round_v.abs() as u32;
         let result = complex_yn_integer(n, z);
@@ -5188,19 +5188,24 @@ pub(crate) fn complex_kv_scalar(
         });
     }
 
-    // For non-integer v: K_v = π/2 * (I_{-v} - I_v) / sin(vπ)
-    let sin_vpi = (v * PI).sin();
-    if sin_vpi.abs() > 1e-10 {
-        let iv_neg = complex_iv_scalar(-v, z);
-        let iv_pos = complex_iv_scalar(v, z);
-        let pi_half = Complex64::new(PI / 2.0, 0.0);
-        let sin_vpi_c = Complex64::new(sin_vpi, 0.0);
-        return Ok(pi_half * (iv_neg - iv_pos) / sin_vpi_c);
+    // Integer or near-integer order: use recurrence to avoid catastrophic cancellation in (I_{-v} - I_v) / sin(vπ)
+    let round_v = v.round();
+    if (v - round_v).abs() < 1e-6 && round_v <= i32::MAX as f64 {
+        let n = round_v as u32;
+        return Ok(complex_kn_integer(n, z));
     }
 
-    // Integer order: use recurrence
-    let n = v.abs().round() as u32;
-    Ok(complex_kn_integer(n, z))
+    // For non-integer v: K_v = π/2 * (I_{-v} - I_v) / sin(vπ)
+    let sin_vpi = (v * PI).sin();
+    if sin_vpi.abs() < 1e-15 {
+        return Ok(Complex64::new(f64::NAN, f64::NAN));
+    }
+
+    let iv_neg = complex_iv_scalar(-v, z);
+    let iv_pos = complex_iv_scalar(v, z);
+    let pi_half = Complex64::new(PI / 2.0, 0.0);
+    let sin_vpi_c = Complex64::new(sin_vpi, 0.0);
+    Ok(pi_half * (iv_neg - iv_pos) / sin_vpi_c)
 }
 
 /// Complex K_n(z) for integer order: accurate K_0/K_1 (DLMF 10.31.2 series for
@@ -5625,6 +5630,20 @@ fn bessel_complex_scalar(
     mode: RuntimeMode,
     kind: BesselKind,
 ) -> Result<Complex64, SpecialError> {
+    if z.im == 0.0 && z.re > 0.0 {
+        let val = match kind {
+            BesselKind::Jv => Ok(jv_scalar(order, z.re)),
+            BesselKind::Yv => yv_scalar(order, z.re, mode),
+            BesselKind::Jve => Ok(jv_scalar(order, z.re)),
+            BesselKind::Yve => yv_scalar(order, z.re, mode),
+            BesselKind::Iv => Ok(iv_scalar(order, z.re)),
+            BesselKind::Kv => kv_scalar(order, z.re, mode),
+            BesselKind::Ive => Ok(ive_scalar(order, z.re)),
+            BesselKind::Kve => Ok(kve_scalar(order, z.re)),
+        }?;
+        return Ok(Complex64::new(val, 0.0));
+    }
+
     match kind {
         BesselKind::Jv => Ok(complex_jv_scalar(order, z)),
         BesselKind::Yv => complex_yv_scalar(order, z, mode),
@@ -10378,6 +10397,26 @@ mod tests {
         let z_c = Complex64::new(z_re, 0.0);
         let real_val = super::yv_scalar(v, z_re, RuntimeMode::Strict).unwrap();
         let complex_val = super::complex_yv_scalar(v, z_c, RuntimeMode::Strict).unwrap();
+        let scale = real_val.abs().max(complex_val.re.abs());
+        let diff = (real_val - complex_val.re).abs();
+        assert!(
+            diff <= 1e-8 + 1e-6 * scale,
+            "real_val={real_val}, complex_val={complex_val:?}, diff={diff}"
+        );
+        assert!(
+            complex_val.im.abs() <= 1e-8 + 1e-6 * scale,
+            "complex_val.im={}",
+            complex_val.im
+        );
+    }
+
+    #[test]
+    fn test_kv_near_integer_real_axis_reduction() {
+        let v = -5.001106195775107e-10;
+        let z_re = 0.5;
+        let z_c = Complex64::new(z_re, 0.0);
+        let real_val = super::kv_scalar(v, z_re, RuntimeMode::Strict).unwrap();
+        let complex_val = super::complex_kv_scalar(v, z_c, RuntimeMode::Strict).unwrap();
         let scale = real_val.abs().max(complex_val.re.abs());
         let diff = (real_val - complex_val.re).abs();
         assert!(
