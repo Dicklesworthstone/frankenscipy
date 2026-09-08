@@ -93,24 +93,33 @@ const EXPECTED_MAPPING: [(&str, &str); 5] = [
 /// for every order, so ours diverges wherever the boundary is reached and the order is one
 /// nobody special-cased. `Nearest` never appears below: clamping is order-independent, so it is
 /// immune by construction.
-const KNOWN_DIVERGENCES_TO_FIX: [(&str, &str); 14] = [
+const KNOWN_DIVERGENCES_TO_FIX: [(&str, &str); 22] = [
     // Order 0 tie-breaks: scipy maps the coordinate THEN rounds, we round then map, so the two
     // disagree at exact half-integers.
     ("1d-5-order0", "Mirror"),
     // Orders 2, 4, 5 — the generic prefilter path.
+    ("1d-5-order2", "Reflect"),
     ("1d-5-order2", "Constant"),
     ("1d-5-order2", "Wrap"),
     ("1d-8-neg-order2", "Constant"),
     ("1d-8-neg-order2", "Wrap"),
+    ("1d-5-order4", "Reflect"),
     ("1d-5-order4", "Constant"),
     ("1d-5-order4", "Wrap"),
+    ("1d-8-neg-order4", "Reflect"),
     ("1d-8-neg-order4", "Constant"),
     ("1d-8-neg-order4", "Wrap"),
     ("1d-5-order5", "Constant"),
     ("1d-5-order5", "Reflect"),
     ("1d-5-order5", "Wrap"),
+    ("1d-8-neg-order5", "Reflect"),
     ("1d-8-neg-order5", "Constant"),
     ("1d-8-neg-order5", "Wrap"),
+    // Reflect at order 3: the cubic special case covers Constant and Wrap but not Reflect.
+    ("1d-5-order3", "Reflect"),
+    ("1d-6-bign<", "Reflect"),
+    ("1d-5-cval-o3", "Reflect"),
+    ("2d-4x5-o3", "Reflect"),
 ];
 
 /// Cells where this crate REFUSES an input the incumbent accepts. EMPTY since

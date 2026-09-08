@@ -215,7 +215,14 @@ impl HarnessConfig {
 
     #[must_use]
     pub fn artifact_dir_for(&self, packet_id: &str) -> PathBuf {
-        self.fixture_root.join("artifacts").join(packet_id)
+        let base = self.fixture_root.join("artifacts");
+        if packet_id.starts_with("P2C-") {
+            let canonical = base.join(format!("FSCI-{packet_id}"));
+            if canonical.exists() {
+                return canonical;
+            }
+        }
+        base.join(packet_id)
     }
 
     /// True when [`Self::oracle_root`] holds a usable legacy SciPy checkout.
@@ -12946,11 +12953,24 @@ static SIGNAL_CONTRACT_TABLE: OnceLock<Option<ContractTable>> = OnceLock::new();
 static STATS_CONTRACT_TABLE: OnceLock<Option<ContractTable>> = OnceLock::new();
 static INTEGRATE_CONTRACT_TABLE: OnceLock<Option<ContractTable>> = OnceLock::new();
 
+fn resolve_contract_table_path(packet_id: &str) -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let canonical = manifest_dir.join(format!(
+        "fixtures/artifacts/FSCI-{packet_id}/contracts/contract_table.json"
+    ));
+    if canonical.exists() {
+        canonical
+    } else {
+        manifest_dir.join(format!(
+            "fixtures/artifacts/{packet_id}/contracts/contract_table.json"
+        ))
+    }
+}
+
 fn load_optimize_contract_table() -> Option<&'static ContractTable> {
     OPTIMIZE_CONTRACT_TABLE
         .get_or_init(|| {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/artifacts/P2C-003/contracts/contract_table.json");
+            let path = resolve_contract_table_path("P2C-003");
             let raw = fs::read_to_string(path).ok()?;
             serde_json::from_str::<ContractTable>(&raw).ok()
         })
@@ -12960,8 +12980,7 @@ fn load_optimize_contract_table() -> Option<&'static ContractTable> {
 fn load_special_contract_table() -> Option<&'static ContractTable> {
     SPECIAL_CONTRACT_TABLE
         .get_or_init(|| {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/artifacts/P2C-006/contracts/contract_table.json");
+            let path = resolve_contract_table_path("P2C-006");
             let raw = fs::read_to_string(path).ok()?;
             serde_json::from_str::<ContractTable>(&raw).ok()
         })
@@ -12971,8 +12990,7 @@ fn load_special_contract_table() -> Option<&'static ContractTable> {
 fn load_array_api_contract_table() -> Option<&'static ContractTable> {
     ARRAY_API_CONTRACT_TABLE
         .get_or_init(|| {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/artifacts/P2C-007/contracts/contract_table.json");
+            let path = resolve_contract_table_path("P2C-007");
             let raw = fs::read_to_string(path).ok()?;
             serde_json::from_str::<ContractTable>(&raw).ok()
         })
@@ -12982,8 +13000,7 @@ fn load_array_api_contract_table() -> Option<&'static ContractTable> {
 fn load_cluster_contract_table() -> Option<&'static ContractTable> {
     CLUSTER_CONTRACT_TABLE
         .get_or_init(|| {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/artifacts/P2C-009/contracts/contract_table.json");
+            let path = resolve_contract_table_path("P2C-009");
             let raw = fs::read_to_string(path).ok()?;
             serde_json::from_str::<ContractTable>(&raw).ok()
         })
@@ -12993,8 +13010,7 @@ fn load_cluster_contract_table() -> Option<&'static ContractTable> {
 fn load_spatial_contract_table() -> Option<&'static ContractTable> {
     SPATIAL_CONTRACT_TABLE
         .get_or_init(|| {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/artifacts/P2C-010/contracts/contract_table.json");
+            let path = resolve_contract_table_path("P2C-010");
             let raw = fs::read_to_string(path).ok()?;
             serde_json::from_str::<ContractTable>(&raw).ok()
         })
@@ -13004,8 +13020,7 @@ fn load_spatial_contract_table() -> Option<&'static ContractTable> {
 fn load_signal_contract_table() -> Option<&'static ContractTable> {
     SIGNAL_CONTRACT_TABLE
         .get_or_init(|| {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/artifacts/P2C-011/contracts/contract_table.json");
+            let path = resolve_contract_table_path("P2C-011");
             let raw = fs::read_to_string(path).ok()?;
             serde_json::from_str::<ContractTable>(&raw).ok()
         })
@@ -13015,8 +13030,7 @@ fn load_signal_contract_table() -> Option<&'static ContractTable> {
 fn load_stats_contract_table() -> Option<&'static ContractTable> {
     STATS_CONTRACT_TABLE
         .get_or_init(|| {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/artifacts/P2C-012/contracts/contract_table.json");
+            let path = resolve_contract_table_path("P2C-012");
             let raw = fs::read_to_string(path).ok()?;
             serde_json::from_str::<ContractTable>(&raw).ok()
         })
@@ -13026,8 +13040,7 @@ fn load_stats_contract_table() -> Option<&'static ContractTable> {
 fn load_integrate_contract_table() -> Option<&'static ContractTable> {
     INTEGRATE_CONTRACT_TABLE
         .get_or_init(|| {
-            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("fixtures/artifacts/P2C-013/contracts/contract_table.json");
+            let path = resolve_contract_table_path("P2C-013");
             let raw = fs::read_to_string(path).ok()?;
             serde_json::from_str::<ContractTable>(&raw).ok()
         })

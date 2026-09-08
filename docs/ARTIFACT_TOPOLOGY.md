@@ -22,11 +22,11 @@ docs/
 
 ## Per-Packet Artifacts (Phase-2C)
 
-Each packet `FSCI-P2C-{001..008}` produces artifacts in two locations:
+Each canonical packet `FSCI-P2C-{001..018}` produces artifacts in:
 
 ### Conformance Fixtures and Reports
 
-Runtime test fixtures and generated parity evidence:
+Runtime test fixtures, generated parity evidence, and unified contract artifacts:
 
 ```
 crates/fsci-conformance/fixtures/
@@ -38,6 +38,24 @@ crates/fsci-conformance/fixtures/
     parity_report.decode_proof.json         # decode proof artifact
     oracle_capture.json                     # Python oracle output (optional)
     oracle_capture.error.txt                # oracle fallback log (when scipy absent)
+    anchor/
+      behavior_ledger.json                  # structured behavior ledger
+    contracts/
+      contract_table.json                   # contract table (tolerances, strict/hardened semantics)
+    evidence/
+      differential_report.json              # differential verification report
+      evidence_bundle.json                  # aggregated evidence bundle
+      evidence_bundle.raptorq.json          # RaptorQ repair sidecar
+      evidence_bundle.blake3                # BLAKE3 checksum of bundle
+      fixture_manifest.json                 # fixture manifest
+      parity_gates.json                     # parity gate evaluations
+      parity_report.json                    # evidence parity report
+      risk_notes.json                       # risk and failure mode mitigations
+      runner_report.json                    # test runner output
+    perf/
+      perf_profile_report.json              # benchmark profiling summary
+    threats/
+      threat_matrix.json                    # threat model and failure-closed policies
     e2e/
       scenarios/
         *.json                              # packet-aware E2E scenario descriptors
@@ -49,13 +67,10 @@ crates/fsci-conformance/fixtures/
 ```
 
 Legacy exception:
-
 ```
 crates/fsci-conformance/fixtures/
-  artifacts/P2C-003/e2e/runs/*.json         # optimize forensic bundles emitted by legacy test path
+  artifacts/P2C-*/...                       # legacy mirrored tree maintained until formal retirement
 ```
-
-New packet E2E outputs should use the canonical `artifacts/FSCI-P2C-{NNN}/e2e/...` layout.
 
 ### Packet Documentation Artifacts
 

@@ -5,10 +5,25 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0.0 else "-Infinity"
+        return value
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    return value
 
 
 def _coerce_maybe_nan_f64(value: Any) -> float:
@@ -357,7 +372,10 @@ def main() -> int:
     }
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(_json_safe(payload), allow_nan=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     return 0
 
 

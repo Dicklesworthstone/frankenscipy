@@ -426,7 +426,7 @@ Mandatory future expansions:
 
 ## 25. Packetized Porting Execution Law
 
-Porting progression is locked to `FSCI-P2C-001..008` packets and each packet must ship:
+Porting progression is locked to `FSCI-P2C-001..018` canonical packets and each packet must ship:
 1. clean-room implementation artifact in target crate,
 2. conformance fixture family,
 3. strict/hardened gate outcomes,

@@ -1943,33 +1943,22 @@ pub(crate) fn yv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, Specia
         );
     }
 
-    // Integer order: delegate
-    if v.fract() == 0.0 && v.abs() <= i32::MAX as f64 {
-        let n = v as i32;
+    // Integer or near-integer order: delegate to avoid catastrophic cancellation in (J_v cos(vπ) - J_{-v}) / sin(vπ)
+    if (v - v.round()).abs() < 1e-12 && v.abs() <= i32::MAX as f64 {
+        let n = v.round() as i32;
         return yn_scalar(n as f64, z, mode);
     }
 
-    // Large order in the band z ≤ v²: the J_{±v} reflection below cancels
-    // catastrophically because for z ≤ |v| the J_{-v} term carries the huge
-    // dominant Y component (yv(100.5,95.5) was ~1000× off). Compute Y directly
-    // by its (stable) upward recurrence instead; negative order via
-    // Y_{-p} = cos(pπ)Y_p + sin(pπ)J_p, with cos forced to 0 at half-integers so
-    // a ~1e-15 rounding does not swamp a tiny true value. frankenscipy-87poa.
-    let av = v.abs();
-    if av >= 1.0 && z >= 20.0 && z <= av * av {
-        let yav = yv_upward(av, z);
-        if v > 0.0 {
-            return Ok(yav);
-        }
-        let (cos_av, sin_av) = bessel_reflection_trig(av);
-        return Ok(cos_av * yav + sin_av * jv_miller(av, z));
+    // For z ≥ 20 compute Y_v via the Hankel/K relation (DLMF 10.27.8), matching complex_yv_scalar
+    if z >= 20.0 {
+        return Ok(complex_yv_hankel(v, Complex64::from_real(z), mode).re);
     }
 
     // Non-integer order: Y_v = (J_v cos(vπ) - J_{-v}) / sin(vπ)
     let sin_vpi = (v * PI).sin();
     if sin_vpi.abs() < 1e-15 {
-        // Near integer order — should have been caught above
-        return Ok(f64::NAN);
+        let n = v.round() as i32;
+        return yn_scalar(n as f64, z, mode);
     }
 
     let jv_pos = jv_scalar(v, z);
@@ -4924,11 +4913,12 @@ fn complex_yv_scalar(v: f64, z: Complex64, _mode: RuntimeMode) -> Result<Complex
         return Ok(Complex64::new(f64::NEG_INFINITY, 0.0));
     }
 
-    // Integer order: use recurrence
-    if v.fract() == 0.0 && v.abs() <= i32::MAX as f64 {
-        let n = v.abs() as u32;
+    // Integer or near-integer order: use recurrence to avoid cancellation in (J_v cos(vπ) - J_{-v}) / sin(vπ)
+    if (v - v.round()).abs() < 1e-12 && v.abs() <= i32::MAX as f64 {
+        let round_v = v.round();
+        let n = round_v.abs() as u32;
         let result = complex_yn_integer(n, z);
-        return if v < 0.0 && n % 2 == 1 {
+        return if round_v < 0.0 && n % 2 == 1 {
             Ok(Complex64::new(-result.re, -result.im))
         } else {
             Ok(result)
@@ -10378,6 +10368,26 @@ mod tests {
         assert!(
             diff_im <= 1e-8 + 1e-6 * scale_im,
             "diff_im={diff_im}, scale={scale_im}, i1={i1:?}, i2={i2:?}"
+        );
+    }
+
+    #[test]
+    fn test_yv_near_integer_real_axis_reduction() {
+        let v = 8.000000000001819;
+        let z_re = 1000.0;
+        let z_c = Complex64::new(z_re, 0.0);
+        let real_val = super::yv_scalar(v, z_re, RuntimeMode::Strict).unwrap();
+        let complex_val = super::complex_yv_scalar(v, z_c, RuntimeMode::Strict).unwrap();
+        let scale = real_val.abs().max(complex_val.re.abs());
+        let diff = (real_val - complex_val.re).abs();
+        assert!(
+            diff <= 1e-8 + 1e-6 * scale,
+            "real_val={real_val}, complex_val={complex_val:?}, diff={diff}"
+        );
+        assert!(
+            complex_val.im.abs() <= 1e-8 + 1e-6 * scale,
+            "complex_val.im={}",
+            complex_val.im
         );
     }
 }
