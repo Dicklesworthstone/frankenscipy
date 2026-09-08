@@ -1682,6 +1682,9 @@ pub(crate) fn jv_scalar(v: f64, z: f64) -> f64 {
     if av < 1.0 || az > av * av {
         return jv_asymptotic(v, az);
     }
+    if av > 20_000.0 {
+        return 0.0;
+    }
     let jav = jv_miller(av, az);
     if v > 0.0 {
         jav
@@ -1710,6 +1713,9 @@ fn jv_series(v: f64, z: f64) -> f64 {
     let log_first = v * log_half_z_abs - lgamma(v + 1.0);
     let mut gamma_sign = gamma_sign_fn(v + 1.0);
     let term0 = if v == 0.0 { 1.0 } else { log_first.exp() };
+    if !term0.is_finite() || term0 == 0.0 {
+        return gamma_sign * term0;
+    }
 
     if quarter_z2 == 0.0 {
         return gamma_sign * term0;
@@ -1838,8 +1844,14 @@ fn yv_asymptotic(v: f64, z: f64) -> f64 {
 /// run is rescaled by the accurate small-order asymptotic value (whichever base
 /// order has the larger magnitude, to avoid normalizing through a J zero).
 fn jv_miller(av: f64, z: f64) -> f64 {
+    if av > 20_000.0 || z > 20_000.0 {
+        return 0.0;
+    }
     let frac = av - av.floor();
     let n = (av - frac).round() as usize;
+    if n > 20_000 {
+        return 0.0;
+    }
     // Start well above both the target order n and the argument z. The extra
     // 2·n margin (and the rescaling below) lets the recurrence also serve the
     // recessive region av ≥ z, where J grows steeply going downward from the
@@ -1909,8 +1921,14 @@ fn bessel_reflection_trig(av: f64) -> (f64, f64) {
 /// Y_{ν+1} = (2ν/z)Y_ν − Y_{ν−1} is stable for any av (including the recessive
 /// av ≥ z region, where Y grows large); the base orders use [`yv_asymptotic`].
 fn yv_upward(av: f64, z: f64) -> f64 {
+    if av > 20_000.0 {
+        return f64::NEG_INFINITY;
+    }
     let frac = av - av.floor();
     let n = (av - frac).round() as usize;
+    if n > 20_000 {
+        return f64::NEG_INFINITY;
+    }
     if n == 0 {
         return yv_asymptotic(frac, z);
     }
@@ -1922,6 +1940,9 @@ fn yv_upward(av: f64, z: f64) -> f64 {
         ym1 = ym;
         ym = next;
         order += 1.0;
+        if !ym.is_finite() {
+            break;
+        }
     }
     ym
 }
@@ -1960,6 +1981,9 @@ pub(crate) fn yv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, Specia
         let n = v.round() as i32;
         return yn_scalar(n as f64, z, mode);
     }
+    if v.abs() > 20_000.0 {
+        return Ok(f64::NEG_INFINITY);
+    }
 
     let jv_pos = jv_scalar(v, z);
     let jv_neg = jv_scalar(-v, z);
@@ -1995,6 +2019,9 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
     // the NaN returned by the power-series branch below.
     if v < 0.0 && v.fract() != 0.0 && z > 0.0 {
         let p = -v;
+        if p > 20_000.0 {
+            return f64::INFINITY;
+        }
         let kp = kv_scaled_value(p, z) * (-z).exp();
         return iv_scalar(p, z) + (2.0 / PI) * (p * PI).sin() * kp;
     }
@@ -2014,6 +2041,9 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
     let log_half_z = az.ln() - std::f64::consts::LN_2;
     let log_first = v * log_half_z - lgamma(v + 1.0);
     let term0 = if v == 0.0 { 1.0 } else { log_first.exp() };
+    if !term0.is_finite() || term0 == 0.0 {
+        return term0;
+    }
     let mut sum = 0.0;
 
     // The summand peaks near k ≈ (√(v²+z²) − v)/2, which reaches a few hundred
@@ -2042,6 +2072,9 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
             }
             let kf = k as f64;
             term *= quarter_z2 / ((kf + 1.0) * (v + kf + 1.0));
+            if !term.is_finite() {
+                break;
+            }
         }
     } else {
         let mut log_term = log_first;
@@ -2050,6 +2083,9 @@ pub(crate) fn iv_scalar(v: f64, z: f64) -> f64 {
             sum += term;
 
             if term < 1e-16 * sum && k > 10 {
+                break;
+            }
+            if !term.is_finite() {
                 break;
             }
 
@@ -2123,6 +2159,9 @@ fn kv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if steps == 0 {
         return Ok(base0);
     }
+    if steps > 20_000 {
+        return Ok(f64::INFINITY);
+    }
     let base1 = kv_scaled_value(v0 + 1.0, z) * (-z).exp();
     let (mut k_prev, mut k_curr) = (base0, base1);
     for i in 1..steps {
@@ -2130,6 +2169,9 @@ fn kv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
         let k_next = k_prev + 2.0 * order / z * k_curr;
         k_prev = k_curr;
         k_curr = k_next;
+        if !k_curr.is_finite() {
+            break;
+        }
     }
     Ok(k_curr)
 }
@@ -2139,6 +2181,9 @@ fn kv_scalar(v: f64, z: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
 /// underflow/overflow round-trip and the tiny-magnitude integral that defeated
 /// the absolute-tolerance quadrature. frankenscipy-j3bw7.
 fn kv_scaled_value(v_abs: f64, z: f64) -> f64 {
+    if v_abs > 20_000.0 {
+        return f64::INFINITY;
+    }
     // Large z relative to v²: DLMF 10.40.2 asymptotic (scaled form, no e^{-z}).
     if z >= 30.0 && z >= 0.5 * v_abs * v_abs {
         return kv_asymptotic_scaled(v_abs, z);
@@ -2162,6 +2207,9 @@ fn kv_scaled_value(v_abs: f64, z: f64) -> f64 {
             let k_next = k_prev + 2.0 * nu / z * k_curr;
             k_prev = k_curr;
             k_curr = k_next;
+            if !k_curr.is_finite() {
+                break;
+            }
         }
         return k_curr;
     }
@@ -2196,6 +2244,9 @@ fn kv_scaled_value(v_abs: f64, z: f64) -> f64 {
         let k_next = k_prev + 2.0 * i as f64 / z * k_curr;
         k_prev = k_curr;
         k_curr = k_next;
+        if !k_curr.is_finite() {
+            break;
+        }
     }
     k_curr
 }
@@ -2374,6 +2425,9 @@ fn beschb(x: f64) -> (f64, f64, f64, f64) {
 /// forms). Self-validating (each branch converges to `EPS`) and ~machine-accurate
 /// (worst 4e-15 vs mpmath 40-dps over the full reachable `(v, z)` domain).
 fn kv_temme_scaled(v: f64, z: f64) -> f64 {
+    if v > 20_000.0 {
+        return f64::INFINITY;
+    }
     const EPS: f64 = 1e-16;
     const MAXIT: usize = 10_000;
     let nl = (v + 0.5) as i64;
@@ -2463,6 +2517,9 @@ fn kv_temme_scaled(v: f64, z: f64) -> f64 {
         let rktemp = (xmu + i as f64) * xi2 * rk1 + rkmu;
         rkmu = rk1;
         rk1 = rktemp;
+        if !rk1.is_finite() {
+            break;
+        }
     }
     rkmu
 }
@@ -2829,6 +2886,9 @@ fn spherical_kn_scalar(order: f64, x: f64, mode: RuntimeMode) -> Result<f64, Spe
 /// j_0(z) = sin(z)/z, j_1(z) = sin(z)/z² - cos(z)/z
 /// Forward recurrence: j_{k+1}(z) = (2k+1)/z * j_k(z) - j_{k-1}(z)
 fn spherical_jn_nonneg(n: u32, x: f64) -> f64 {
+    if n > 20_000 {
+        return 0.0;
+    }
     if x.is_infinite() {
         return 0.0;
     }
@@ -2904,6 +2964,9 @@ fn spherical_jn_nonneg(n: u32, x: f64) -> f64 {
         let next = (2.0 * k as f64 + 1.0) / x * j_curr - j_prev;
         j_prev = j_curr;
         j_curr = next;
+        if !j_curr.is_finite() {
+            break;
+        }
     }
     j_curr
 }
@@ -2911,6 +2974,9 @@ fn spherical_jn_nonneg(n: u32, x: f64) -> f64 {
 /// y_0(z) = -cos(z)/z, y_1(z) = -cos(z)/z² - sin(z)/z
 /// Forward recurrence: y_{k+1}(z) = (2k+1)/z * y_k(z) - y_{k-1}(z)
 fn spherical_yn_nonneg(n: u32, x: f64) -> f64 {
+    if n > 20_000 {
+        return f64::NEG_INFINITY;
+    }
     if x.is_infinite() {
         return 0.0;
     }
@@ -2941,6 +3007,9 @@ fn spherical_yn_nonneg(n: u32, x: f64) -> f64 {
 /// (2k+1)/z grows), so we switch to Miller's downward recurrence
 /// exactly as in spherical_jn_nonneg. Resolves [frankenscipy-0j009].
 fn spherical_in_nonneg(n: u32, x: f64) -> f64 {
+    if n > 20_000 {
+        return 0.0;
+    }
     if x == 0.0 {
         return if n == 0 { 1.0 } else { 0.0 };
     }
@@ -2999,6 +3068,9 @@ fn spherical_in_nonneg(n: u32, x: f64) -> f64 {
         let next = i_prev - (2.0 * k as f64 + 1.0) / ax * i_curr;
         i_prev = i_curr;
         i_curr = next;
+        if !i_curr.is_finite() {
+            break;
+        }
     }
     // Parity: i_n(-x) = (-1)^n i_n(x)
     if x < 0.0 && !n.is_multiple_of(2) {
@@ -3011,6 +3083,9 @@ fn spherical_in_nonneg(n: u32, x: f64) -> f64 {
 /// k_0(z) = π exp(-z)/(2z), k_1(z) = π exp(-z)/(2z) * (1 + 1/z)
 /// Recurrence: k_{k+1}(z) = k_{k-1}(z) + (2k+1)/z * k_k(z)
 fn spherical_kn_nonneg(n: u32, x: f64) -> f64 {
+    if n > 20_000 {
+        return f64::INFINITY;
+    }
     if x.is_infinite() {
         return 0.0;
     }
@@ -3046,6 +3121,9 @@ fn spherical_kn_nonneg(n: u32, x: f64) -> f64 {
 /// the same forward-recurrence catastrophic cancellation that affects
 /// the real-valued spherical_jn (resolves [frankenscipy-tt2v2]).
 fn complex_spherical_jn(n: u32, z: Complex64) -> Complex64 {
+    if n > 20_000 {
+        return Complex64::new(0.0, 0.0);
+    }
     if z.re == 0.0 && z.im == 0.0 {
         return if n == 0 {
             Complex64::new(1.0, 0.0)
@@ -3059,9 +3137,6 @@ fn complex_spherical_jn(n: u32, z: Complex64) -> Complex64 {
     let n_f = n as f64;
 
     if n >= 2 && z.abs() < n_f {
-        if n > 20_000 {
-            return Complex64::new(0.0, 0.0);
-        }
         let m_start = (2 * n + 30).max((n_f + 8.0 * (40.0 * n_f).sqrt().ceil()) as u32);
         let mut j_kplus1 = Complex64::new(0.0, 0.0);
         let mut j_k = Complex64::new(1.0e-30, 0.0);
@@ -3103,12 +3178,18 @@ fn complex_spherical_jn(n: u32, z: Complex64) -> Complex64 {
         let next = coeff * j_curr - j_prev;
         j_prev = j_curr;
         j_curr = next;
+        if !j_curr.is_finite() {
+            break;
+        }
     }
     j_curr
 }
 
 /// Complex spherical Bessel function of the second kind y_n(z).
 fn complex_spherical_yn(n: u32, z: Complex64) -> Complex64 {
+    if n > 20_000 {
+        return Complex64::new(f64::NEG_INFINITY, 0.0);
+    }
     if z.re == 0.0 && z.im == 0.0 {
         return Complex64::new(f64::NEG_INFINITY, 0.0);
     }
@@ -3145,6 +3226,9 @@ fn complex_spherical_yn(n: u32, z: Complex64) -> Complex64 {
 /// Same Miller's-recurrence treatment as complex_spherical_jn for the
 /// |z| < n regime (resolves [frankenscipy-tt2v2]).
 fn complex_spherical_in(n: u32, z: Complex64) -> Complex64 {
+    if n > 20_000 {
+        return Complex64::new(0.0, 0.0);
+    }
     if z.re == 0.0 && z.im == 0.0 {
         return if n == 0 {
             Complex64::new(1.0, 0.0)
@@ -3158,9 +3242,6 @@ fn complex_spherical_in(n: u32, z: Complex64) -> Complex64 {
     let n_f = n as f64;
 
     if n >= 2 && z.abs() < n_f {
-        if n > 20_000 {
-            return Complex64::new(0.0, 0.0);
-        }
         let m_start = (2 * n + 30).max((n_f + 8.0 * (40.0 * n_f).sqrt().ceil()) as u32);
         let mut i_kplus1 = Complex64::new(0.0, 0.0);
         let mut i_k = Complex64::new(1.0e-30, 0.0);
@@ -3201,12 +3282,18 @@ fn complex_spherical_in(n: u32, z: Complex64) -> Complex64 {
         let next = i_prev - coeff * i_curr;
         i_prev = i_curr;
         i_curr = next;
+        if !i_curr.is_finite() {
+            break;
+        }
     }
     i_curr
 }
 
 /// Complex modified spherical Bessel function of the second kind k_n(z).
 fn complex_spherical_kn(n: u32, z: Complex64) -> Complex64 {
+    if n > 20_000 {
+        return Complex64::new(f64::INFINITY, 0.0);
+    }
     if z.re == 0.0 && z.im == 0.0 {
         return Complex64::new(f64::INFINITY, 0.0);
     }
@@ -4003,6 +4090,9 @@ fn complex_domain_error_by_mode(
 }
 
 fn jn_nonnegative(n: u32, x: f64) -> f64 {
+    if n > 20_000 {
+        return 0.0;
+    }
     if x.is_nan() {
         return f64::NAN;
     }
@@ -4057,11 +4147,17 @@ fn jn_nonnegative(n: u32, x: f64) -> f64 {
         let next = (2.0 * k as f64 / x) * j_curr - j_prev;
         j_prev = j_curr;
         j_curr = next;
+        if !j_curr.is_finite() {
+            break;
+        }
     }
     j_curr
 }
 
 fn yn_nonnegative(n: u32, x: f64) -> f64 {
+    if n > 20_000 {
+        return f64::NEG_INFINITY;
+    }
     if n == 0 {
         return y0_core_positive(x);
     }
@@ -4819,6 +4915,10 @@ pub(crate) fn complex_jv_scalar(v: f64, z: Complex64) -> Complex64 {
         };
     }
 
+    if v > 20_000.0 {
+        return Complex64::new(0.0, 0.0);
+    }
+
     // Large |z|: the 200-term power series truncates and cancels (max term
     // ~e^{|z|}). The Hankel asymptotic converges only for |z| > v²; in the
     // turning band v < |z| ≤ v² it diverges, so use Miller's backward recurrence
@@ -4889,6 +4989,14 @@ pub(crate) fn complex_iv_scalar(v: f64, z: Complex64) -> Complex64 {
         };
     }
 
+    if v.abs() > 20_000.0 {
+        return if v > 0.0 {
+            Complex64::new(0.0, 0.0)
+        } else {
+            Complex64::new(f64::INFINITY, 0.0)
+        };
+    }
+
     // Large |z|: power series cancels; route through the jv relation, which
     // itself picks the asymptotic (|z| > v²) or Miller's recurrence (the
     // turning band). Restricted to v ≥ 0 in the band (the negative-order Miller
@@ -4940,6 +5048,10 @@ fn complex_yv_scalar(v: f64, z: Complex64, _mode: RuntimeMode) -> Result<Complex
     }
 
     if z.re == 0.0 && z.im == 0.0 {
+        return Ok(Complex64::new(f64::NEG_INFINITY, 0.0));
+    }
+
+    if v.abs() > 20_000.0 {
         return Ok(Complex64::new(f64::NEG_INFINITY, 0.0));
     }
 
@@ -5003,6 +5115,9 @@ fn complex_yv_hankel(v: f64, z: Complex64, mode: RuntimeMode) -> Complex64 {
 
 /// Complex Y_n(z) for integer order via recurrence.
 fn complex_yn_integer(n: u32, z: Complex64) -> Complex64 {
+    if n > 20_000 {
+        return Complex64::new(f64::NEG_INFINITY, 0.0);
+    }
     // Y_0 and Y_1 via formula, then recurrence
     let y0 = complex_y0_series(z);
     if n == 0 {
@@ -5192,6 +5307,9 @@ pub(crate) fn complex_kv_scalar(
     // K_{-v}(z) == K_v(z) identically for all v in C (DLMF 10.27.3).
     // Normalize to v >= 0 so asymptotic and recurrence orders are non-negative.
     let v = v.abs();
+    if v > 20_000.0 {
+        return Ok(Complex64::new(f64::INFINITY, 0.0));
+    }
 
     // Re(z) < 0 is across the K_v branch cut, where every Re(z) ≥ 0 method here
     // (asymptotic / band recurrence / I_{-v}−I_v) is on the wrong sheet. Reflect
@@ -5251,6 +5369,9 @@ pub(crate) fn complex_kv_scalar(
 /// |z| < 11, asymptotic above), then the upward recurrence
 /// K_{n+1} = K_{n-1} + (2n/z)K_n, which is stable (K grows with order).
 fn complex_kn_integer(n: u32, z: Complex64) -> Complex64 {
+    if n > 20_000 {
+        return Complex64::new(f64::INFINITY, 0.0);
+    }
     let z_inv = z.recip();
     let mut k_prev = complex_k0(z);
     if n == 0 {
@@ -10507,5 +10628,44 @@ mod tests {
         );
         assert!(!super::spherical_yn_nonneg(100_000_000, 25.0).is_finite());
         assert!(!super::spherical_kn_nonneg(100_000_000, 25.0).is_finite());
+    }
+
+    #[test]
+    fn test_extreme_order_real_and_complex_bessel_derivatives_no_hang() {
+        use super::{ivp, jvp, kvp, yvp};
+        use crate::SpecialTensor::{ComplexScalar, RealScalar};
+
+        let orders = [
+            1.0e8,
+            -1.0e8,
+            1.0e300,
+            -1.0e300,
+            1.0e20,
+            -1.0e20,
+            100_000.0,
+            -100_000.0,
+        ];
+        let xs = [0.5, 15.0, 50.0];
+
+        for &v in &orders {
+            let v_real = RealScalar(v);
+            for &x in &xs {
+                let x_real = RealScalar(x);
+                let z_comp = ComplexScalar(Complex64::new(x, 0.0));
+                for d in 0..=4 {
+                    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+                        let _ = jvp(&v_real, &x_real, d, mode);
+                        let _ = yvp(&v_real, &x_real, d, mode);
+                        let _ = ivp(&v_real, &x_real, d, mode);
+                        let _ = kvp(&v_real, &x_real, d, mode);
+
+                        let _ = jvp(&v_real, &z_comp, d, mode);
+                        let _ = yvp(&v_real, &z_comp, d, mode);
+                        let _ = ivp(&v_real, &z_comp, d, mode);
+                        let _ = kvp(&v_real, &z_comp, d, mode);
+                    }
+                }
+            }
+        }
     }
 }
