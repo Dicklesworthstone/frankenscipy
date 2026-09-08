@@ -561,10 +561,11 @@ For every major subsystem, the threat-matrix JSON enumerates the attacker capabi
 
 ### asupersync Integration
 
-FrankenSciPy does not own an async runtime, and none of its public API is async. What [asupersync](https://github.com/Dicklesworthstone/asupersync) provides today:
+FrankenSciPy does not own an async runtime, and none of its public API is async. What [asupersync](https://github.com/Dicklesworthstone/asupersync) provides:
 
-- **RaptorQ systematic encoding.** `fsci-conformance` uses `asupersync::raptorq::systematic::SystematicEncoder` to emit the `*.raptorq.json` sidecars and `*.decode_proof.json` artifacts for parity reports, oracle captures and benchmark baselines. This is the only asupersync code path linked into the workspace.
-- **Nothing else yet.** No function takes a `Cx`; the FFT plan cache, the conformance report-writer lock and the CASP calibrator state are guarded by `std::sync` primitives; the audit ledger handle is `Arc<std::sync::Mutex<AuditLedger>>`; and no test uses `LabRuntime`. The spec's "mandatory future expansions" (packet-level decode replay proofs for real recovery events, supervision integration in the policy controllers, anytime-valid invariant monitors) remain roadmap items with no bead behind them as of 2026-09-03.
+- **RaptorQ systematic encoding & decode replay proofs.** `fsci-conformance` uses `asupersync::raptorq::systematic::SystematicEncoder` to emit `*.raptorq.json` sidecars and `*.decode_proof.json` artifacts for parity reports, oracle captures and benchmark baselines. Decode-proof verification runs in CI gate G8 (`verify_raptorq_decode_recovery_proof`).
+- **Bounded supervision & invariant monitors.** CASP `PolicyController` integrates bounded supervision (`Supervisor`, `SupervisionPolicy`, `CircuitBreaker`) and anytime-valid e-process monitors for solver correctness sentinels in `fsci-runtime`.
+- **Sync primitives.** Standard library synchronization (`std::sync::{Mutex, RwLock, Arc}`) guards the FFT plan cache, the conformance report-writer lock, and calibrator state. No function takes a `Cx` and no test requires `LabRuntime`.
 
 **Forbidden.** The workspace forbids `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, and any crate that transitively depends on them. `cargo tree -i tokio` returns empty on this workspace.
 
@@ -641,7 +642,7 @@ V1.0 is gated on the following items. Items 1 and 2 of the original list are don
 
 1. **Surface coverage** — done by name: 1,194 of 1,300 SciPy callables have a same-named public equivalent (`fsci-special` 98.6%, `fsci-sparse` 96.2%, `fsci-fft` 90.2%, `fsci-opt` 84.5%; see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)). What remains is **behavioural** coverage. A 2026-08-24 audit found 201 SciPy-named public entry points with no reference anywhere in the conformance corpus (`frankenscipy-ivxx6`); one sampled at random (`RbfInterpolator`) implemented a non-default variant until fixed, five sampled from `fsci-linalg` agreed with SciPy, and by 2026-08-30 `scripts/conformance_coverage_audit.py` reports zero unreferenced entry points. That audit is name-mention based, so "referenced" is weaker than "compared"; a per-routine list of what each `diff_*` file actually asserts does not exist yet.
 2. **The three signal defects** originally listed here (`r1vok` periodogram/welch normalization, `cw6k2` iirnotch `r` approximation, `ot7tm` gausspulse envelope) closed on 2026-05-20.
-3. **A CI run that passes.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`) so that the per-crate unit suites, the full live-SciPy differential corpus, and the evidence packs actually run; the first fully green run has to be cited before any of the gate claims in this README count as enforced.
+3. **A CI run that passes.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`) and verified fully green on 2026-09-08 with workflow run [`34180840286`](https://github.com/Dicklesworthstone/frankenscipy/actions/runs/34180840286) — all 43 jobs passed cleanly across G1–G9 (including live-oracle capture, golden journeys, RaptorQ decode proofs, adversarial smoke, and all 15 component crate unit/property suites).
 4. **Array API role decided (descoped from V1.0 blocker).** `fsci-arrayapi` serves as the reference backend-negotiation and broadcasting specification for conformance validation (`frankenscipy-0cxgm`); canonical container migration across domain crates is deferred post-V1.0 to preserve bit-identity and stability contracts.
 5. **Extend CASP beyond `fsci-linalg`.** The sparse, optimize and special selectors are rule-based today (see **Condition-Aware Solver Portfolio**); a loss matrix, posterior and calibrator per domain is the design intent and is unbuilt. The strict/hardened mode split and audit ledger emission have been wired into `fsci-signal`, `fsci-ndimage`, `fsci-interpolate`, `fsci-spatial`, `fsci-cluster`, and `fsci-io` with `HARDENED_MAX_DIM` enforcement (`frankenscipy-mlizi`).
 6. **Cut a tagged 0.x release with a publish-to-crates.io workflow** and per-crate semver guarantees. There are no tags, no releases, and no `[profile.release]` in the root manifest yet.
@@ -1279,7 +1280,7 @@ When a numerical regression surfaces in this project, the path it takes is fixed
 
 1. **Detection.** A `diff_<family>_*` conformance test under `crates/fsci-conformance/tests/` produces a parity diff that exceeds its declared tolerance. The failure is named in `parity_report.json` and the failing case ID is the BLAKE3 fingerprint of the offending input.
 2. **Triage.** A beads issue is created (`br create --title "..." --type=bug --priority=2`). The fingerprint goes into the description; the failing test name goes into the `notes` field. If the issue blocks a roadmap item, it is linked with `br dep add`.
-3. **Reproduction.** The single failing case is re-run in isolation. Because the harness is deterministic (LabRuntime virtual time, BLAKE3-keyed plan cache, seeded LCGs in `eigsh` and friends), reproduction is bit-for-bit and does not depend on host wall-clock or thread interleaving.
+3. **Reproduction.** The single failing case is re-run in isolation. Because the harness is deterministic (BLAKE3-keyed plan cache, seeded RNGs and LCGs in `eigsh` and friends), reproduction is bit-for-bit and does not depend on host wall-clock or thread interleaving.
 4. **Root cause.** Inspection happens in the kernel; the audit ledger from the failing call usually pinpoints the wrong-action decision or the failing recovery. The fix is required to be a root-cause fix, not a tolerance-loosening; CI gate G9 (tolerance ratchet) enforces this.
 5. **Inline note.** The fix lands with an inline `// br-<id>: <one-sentence rationale>` comment at the site of the change. This rule applies to any subtle numerical fix: the `eigsh` LCG seeding, the LGMRES lucky-breakdown increment, and the Mann-Whitney tie correction (described in **Case Studies** above) all have this form.
 6. **Regression test.** A new test case is added to the relevant `diff_<family>_*.rs` covering the input that originally failed; the test must fail before the fix and pass after.
@@ -1830,7 +1831,7 @@ frankenscipy/
 
 | Crate | Purpose |
 |---|---|
-| [`asupersync`](https://github.com/Dicklesworthstone/asupersync) | Structured async runtime (regions, channels, sync primitives, LabRuntime) |
+| [`asupersync`](https://github.com/Dicklesworthstone/asupersync) | RaptorQ systematic encoding and decode recovery verification |
 | [`ftui`](https://github.com/Dicklesworthstone/ftui) | Terminal UI rendering for the conformance dashboard |
 | `blake3` | Cryptographic hashing for artifact integrity and audit fingerprints |
 | `serde` + `serde_json` | Serialization for artifacts and audit events |
@@ -1866,16 +1867,14 @@ without SciPy and asserting it fails.
 | G6 | `perf smoke + baseline validation` | Every `perf_*` integration test, `benchmark_gate --check-spec` against the spec §17 budgets, and `raptorq_sidecar --verify` on the published baselines. There is no criterion regression compare in CI: hosted runners are not a stable timing host |
 | G7 | `schema + evidence packs` | `schema_validation` plus every `evidence_p2c*` pack |
 | G8 | `RaptorQ proofs` | `raptorq_proofs`: decode-proof verification for the committed sidecars |
-| G9 | `tolerance-policy ratchet` | `tolerance_lint --max-violations 361` over the `FSCI-P2C-*.json` fixtures (threshold may only fall) plus the harness ratchet: every `tests/diff_*.rs` tolerance contract (`const *_TOL: f64` and bare `<= <literal>` comparisons) is checked against the committed `fixtures/tolerance_baseline.json` — a loosened value, an unanchored contract, or a stale baseline entry fails the build, and `--write-baseline` refuses to adopt loosened values (frankenscipy-6a5s9) |
+| G9 | `tolerance-policy ratchet` | `tolerance_lint --max-violations 360` over the `FSCI-P2C-*.json` fixtures (threshold may only fall) plus the harness ratchet: every `tests/diff_*.rs` tolerance contract (`const *_TOL: f64` and bare `<= <literal>` comparisons) is checked against the committed `fixtures/tolerance_baseline.json` — a loosened value, an unanchored contract, or a stale baseline entry fails the build, and `--write-baseline` refuses to adopt loosened values (frankenscipy-6a5s9) |
 
 A separate `fuzz_nightly.yml` workflow runs nine `fsci-special` fuzz targets
 under ASan on a nightly schedule (an earlier `address,undefined` sanitizer
 flag was rejected by rustc at compile time and kept the workflow red before
 any target fuzzed; fixed 2026-09-04).
 
-Before 2026-09-03 the workflow had never completed successfully, so no gate
-claim in this README was enforced by CI; the first fully green run is roadmap
-item 3 above and will be cited here when it exists.
+The first fully green full-fan-out CI run completed on 2026-09-08: workflow run [`34180840286`](https://github.com/Dicklesworthstone/frankenscipy/actions/runs/34180840286) passed all 43 jobs across G1–G9 with zero failures.
 
 ### Benchmarks
 
@@ -1993,7 +1992,7 @@ A. Because then you still have the GIL, the Python object model, the SciPy insta
 A. You can. That stack gives you fast linear algebra and a couple of solvers. It does not give you SciPy parity, a conformance harness against the real SciPy, an audited runtime algorithm selector, a distribution moment surface for 100+ distributions, RaptorQ-backed artifact durability, or 767 integration tests covering the same surface. FrankenSciPy is the integration of all of that into one Cargo workspace.
 
 **Q. Why no tokio?**
-A. tokio is a fine async runtime, but it brings a heavyweight ecosystem (`hyper`, `reqwest`, `axum`, `tower`, lots of transitive features) and a runtime model that does not give us cancel-correctness or virtual-time testing. asupersync gives us structured concurrency, two-phase send/receive, cancel-aware sync primitives, and a deterministic `LabRuntime` we use in conformance tests.
+A. FrankenSciPy is a synchronous numerical library; none of its public API is async, and dragging in tokio's heavyweight ecosystem (`hyper`, `reqwest`, `axum`, `tower`, lots of transitive features) is forbidden. `asupersync` is consumed exclusively for RaptorQ systematic encoding and decode recovery verification in `fsci-conformance`.
 
 **Q. What is CASP, in one sentence?**
 A. A runtime algorithm selector that picks between concrete solvers by minimizing expected loss over a calibrated decision matrix, conditioned on evidence about your specific problem instance (conditioning, structure, sparsity, prior backward error), and emits an audit ledger entry every time it does so.

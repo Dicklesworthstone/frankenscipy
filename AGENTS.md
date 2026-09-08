@@ -77,24 +77,19 @@ We only use **Cargo** in this project, NEVER any other package manager.
 - **Unsafe code:** Forbidden (`#![forbid(unsafe_code)]`)
 - If narrow unsafe usage is unavoidable, isolate it behind audited interfaces and tests
 
-### Async Runtime: asupersync (MANDATORY — NO TOKIO)
+### Async Runtime: asupersync & Tokio Ban
 
-**This project uses [asupersync](/dp/asupersync) exclusively for all async/concurrent operations. Tokio and the entire tokio ecosystem are FORBIDDEN.**
+**FrankenSciPy is a synchronous numerical library. Tokio and the entire tokio ecosystem are strictly FORBIDDEN.**
 
-- **Structured concurrency**: `Cx`, `Scope`, `region()` — no orphan tasks
-- **Cancel-correct channels**: Two-phase `reserve()/send()` — no data loss on cancellation
-- **Sync primitives**: `asupersync::sync::Mutex`, `RwLock`, `OnceCell`, `Pool` — cancel-aware
-- **Deterministic testing**: `LabRuntime` with virtual time, DPOR, oracles
-
-**Forbidden crates**: `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, or any crate that transitively depends on tokio.
-
-**Pattern**: All async functions take `&Cx` as first parameter. The `Cx` flows down from the consumer's runtime — FrankenSciPy does NOT create its own runtime.
+- **RaptorQ systematic encoding:** `asupersync::raptorq::systematic::SystematicEncoder` powers artifact durability and decode recovery proofs in `fsci-conformance`
+- **Forbidden crates:** `tokio`, `hyper`, `reqwest`, `axum`, `tower` (tokio adapter), `async-std`, `smol`, or any crate that transitively depends on tokio (`cargo tree -i tokio` must stay empty)
+- **Synchronous public API:** All numerical routines, solvers, and pipelines are synchronous and deterministic
 
 ### Key Dependencies
 
 | Crate | Purpose |
 |-------|---------|
-| `asupersync` | Structured async runtime (channels, sync, regions, testing) |
+| `asupersync` | RaptorQ systematic encoding and decode recovery verification |
 | `fsci-arrayapi` | Array API abstraction layer |
 | `fsci-linalg` | Linear algebra routines |
 | `fsci-sparse` | Sparse matrix operations |
