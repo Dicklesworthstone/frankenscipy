@@ -33,9 +33,7 @@ pub use evidence::{
 pub use mode::{HARDENED_MAX_DIM, RuntimeMode};
 pub use policy::{PolicyAction, PolicyController, PolicyDecision, RiskState, decision_loss_matrix};
 pub use signals::{DecisionSignals, SignalSequence};
-pub use supervision::{
-    PolicySupervisor, SupervisionConfig, SupervisionEvent, SupervisionStatus,
-};
+pub use supervision::{PolicySupervisor, SupervisionConfig, SupervisionEvent, SupervisionStatus};
 
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
