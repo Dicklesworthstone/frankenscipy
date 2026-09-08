@@ -2927,6 +2927,9 @@ fn spherical_yn_nonneg(n: u32, x: f64) -> f64 {
         let next = (2.0 * k as f64 + 1.0) / x * y_curr - y_prev;
         y_prev = y_curr;
         y_curr = next;
+        if !y_curr.is_finite() {
+            break;
+        }
     }
     y_curr
 }
@@ -3026,6 +3029,9 @@ fn spherical_kn_nonneg(n: u32, x: f64) -> f64 {
         let next = k_prev + (2.0 * k as f64 + 1.0) / x * k_curr;
         k_prev = k_curr;
         k_curr = next;
+        if !k_curr.is_finite() {
+            break;
+        }
     }
     k_curr
 }
@@ -3053,6 +3059,9 @@ fn complex_spherical_jn(n: u32, z: Complex64) -> Complex64 {
     let n_f = n as f64;
 
     if n >= 2 && z.abs() < n_f {
+        if n > 20_000 {
+            return Complex64::new(0.0, 0.0);
+        }
         let m_start = (2 * n + 30).max((n_f + 8.0 * (40.0 * n_f).sqrt().ceil()) as u32);
         let mut j_kplus1 = Complex64::new(0.0, 0.0);
         let mut j_k = Complex64::new(1.0e-30, 0.0);
@@ -3124,6 +3133,9 @@ fn complex_spherical_yn(n: u32, z: Complex64) -> Complex64 {
         let next = coeff * y_curr - y_prev;
         y_prev = y_curr;
         y_curr = next;
+        if !y_curr.is_finite() {
+            break;
+        }
     }
     y_curr
 }
@@ -3146,6 +3158,9 @@ fn complex_spherical_in(n: u32, z: Complex64) -> Complex64 {
     let n_f = n as f64;
 
     if n >= 2 && z.abs() < n_f {
+        if n > 20_000 {
+            return Complex64::new(0.0, 0.0);
+        }
         let m_start = (2 * n + 30).max((n_f + 8.0 * (40.0 * n_f).sqrt().ceil()) as u32);
         let mut i_kplus1 = Complex64::new(0.0, 0.0);
         let mut i_k = Complex64::new(1.0e-30, 0.0);
@@ -3217,6 +3232,9 @@ fn complex_spherical_kn(n: u32, z: Complex64) -> Complex64 {
         let next = k_prev + coeff * k_curr;
         k_prev = k_curr;
         k_curr = next;
+        if !k_curr.is_finite() {
+            break;
+        }
     }
     k_curr
 }
@@ -4057,6 +4075,9 @@ fn yn_nonnegative(n: u32, x: f64) -> f64 {
         let next = (2.0 * k as f64 / x) * y_curr - y_prev;
         y_prev = y_curr;
         y_curr = next;
+        if !y_curr.is_finite() {
+            break;
+        }
     }
     y_curr
 }
@@ -4654,6 +4675,9 @@ fn complex_jv_miller(v: f64, z: Complex64) -> Complex64 {
     // descend through 0 to it. Base orders frac (m=0) and frac+1 (m=1) supply
     // the normalization.
     let off = (v - frac).round() as isize;
+    if off.abs() > 20_000 || z.abs() > 20_000.0 {
+        return Complex64::new(0.0, 0.0);
+    }
     let lo = off.min(0);
     let m_start = z.abs() as isize + off.max(0) + 60 + 2 * off.unsigned_abs() as isize;
     let z_inv = z.recip();
@@ -4802,7 +4826,7 @@ pub(crate) fn complex_jv_scalar(v: f64, z: Complex64) -> Complex64 {
     // downward recurrence is stable, whereas for J_{-v} (used by yv/kv) the run
     // descends past order 0 into the growing-Y regime and loses accuracy
     // (~1e-3). frankenscipy-8eiog. frankenscipy-oisri.
-    if z.abs() >= 20.0 && (z.abs() > v * v || v >= 0.0) {
+    if z.abs() >= 20.0 && (z.abs() > v * v || (z.abs() > v && v >= 0.0)) {
         return if z.abs() > v * v {
             complex_jv_asymptotic(v, z)
         } else {
@@ -4826,6 +4850,9 @@ pub(crate) fn complex_jv_scalar(v: f64, z: Complex64) -> Complex64 {
         let s = log_first.exp() * Complex64::new(gamma_sign_fn(v + 1.0), 0.0);
         (s, s)
     };
+    if !term.is_finite() || term == Complex64::new(0.0, 0.0) {
+        return term;
+    }
 
     for k in 1..200 {
         let kf = k as f64;
@@ -4867,7 +4894,7 @@ pub(crate) fn complex_iv_scalar(v: f64, z: Complex64) -> Complex64 {
     // turning band). Restricted to v ≥ 0 in the band (the negative-order Miller
     // that I_{-v} would need loses accuracy); larger |z| handles any sign.
     // frankenscipy-oisri / frankenscipy-8eiog.
-    if z.abs() >= 20.0 && (z.abs() > v * v || v >= 0.0) {
+    if z.abs() >= 20.0 && (z.abs() > v * v || (z.abs() > v && v >= 0.0)) {
         return complex_iv_asymptotic(v, z);
     }
 
@@ -4887,6 +4914,9 @@ pub(crate) fn complex_iv_scalar(v: f64, z: Complex64) -> Complex64 {
         let s = log_first.exp() * Complex64::new(gamma_sign_fn(v + 1.0), 0.0);
         (s, s)
     };
+    if !term.is_finite() || term == Complex64::new(0.0, 0.0) {
+        return term;
+    }
 
     for k in 1..200 {
         let kf = k as f64;
@@ -4991,6 +5021,9 @@ fn complex_yn_integer(n: u32, z: Complex64) -> Complex64 {
         let next = coeff * y_curr - y_prev;
         y_prev = y_curr;
         y_curr = next;
+        if !y_curr.is_finite() {
+            break;
+        }
     }
     y_curr
 }
@@ -5035,6 +5068,9 @@ fn complex_kv_band(v: f64, z: Complex64) -> Complex64 {
     let v = v.abs();
     let frac = v - v.floor();
     let n = (v - frac).round() as usize;
+    if n > 20_000 || z.abs() > 20_000.0 {
+        return Complex64::new(f64::INFINITY, 0.0);
+    }
     let z_inv = z.recip();
     let mut km1 = complex_kv_asymptotic(frac, z);
     if n == 0 {
@@ -5047,6 +5083,9 @@ fn complex_kv_band(v: f64, z: Complex64) -> Complex64 {
         km1 = km;
         km = next;
         order += 1.0;
+        if !km.is_finite() {
+            break;
+        }
     }
     km
 }
@@ -5226,6 +5265,9 @@ fn complex_kn_integer(n: u32, z: Complex64) -> Complex64 {
         let next = k_prev + coeff * k_curr;
         k_prev = k_curr;
         k_curr = next;
+        if !k_curr.is_finite() {
+            break;
+        }
     }
     k_curr
 }
@@ -10428,5 +10470,42 @@ mod tests {
             "complex_val.im={}",
             complex_val.im
         );
+    }
+
+    #[test]
+    fn test_extreme_order_bessel_evaluations_do_not_hang() {
+        let z = Complex64::new(25.0, 0.5);
+
+        // jv, iv with huge positive orders underflow to 0 in O(1)
+        assert_eq!(super::complex_jv_scalar(1e8, z), Complex64::new(0.0, 0.0));
+        assert_eq!(super::complex_jv_scalar(1e300, z), Complex64::new(0.0, 0.0));
+        assert_eq!(super::complex_iv_scalar(1e8, z), Complex64::new(0.0, 0.0));
+        assert_eq!(super::complex_iv_scalar(1e300, z), Complex64::new(0.0, 0.0));
+
+        // Miller guard
+        assert_eq!(super::complex_jv_miller(1e8, z), Complex64::new(0.0, 0.0));
+
+        // yv, kv integer and non-integer with huge orders terminate promptly
+        let yv = super::complex_yv_scalar(1e8, z, RuntimeMode::Strict).unwrap();
+        assert!(!yv.is_finite());
+        let kv = super::complex_kv_scalar(1e8, z, RuntimeMode::Strict).unwrap();
+        assert!(!kv.is_finite());
+
+        let yn = super::complex_yn_integer(100_000_000, z);
+        assert!(!yn.is_finite());
+        let kn = super::complex_kn_integer(100_000_000, z);
+        assert!(!kn.is_finite());
+
+        // Spherical functions with huge orders terminate promptly
+        assert_eq!(
+            super::complex_spherical_jn(100_000_000, z),
+            Complex64::new(0.0, 0.0)
+        );
+        assert_eq!(
+            super::complex_spherical_in(100_000_000, z),
+            Complex64::new(0.0, 0.0)
+        );
+        assert!(!super::spherical_yn_nonneg(100_000_000, 25.0).is_finite());
+        assert!(!super::spherical_kn_nonneg(100_000_000, 25.0).is_finite());
     }
 }

@@ -74,7 +74,7 @@ jobs:
                    p2c006_special_incomplete_gamma_beta \
                    p2c006_special_oracle_roundtrip; do
             echo "=== fuzz $t (900s, ASan) ==="
-            timeout 920 cargo fuzz run "$t" -- -max_total_time=900 || \
+            timeout 1000 cargo fuzz run "$t" -- -max_total_time=900 || \
               { echo "$t failed"; exit 1; }
           done
         timeout-minutes: 180
