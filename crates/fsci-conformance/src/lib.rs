@@ -2645,6 +2645,23 @@ pub struct DecodeProofArtifact {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryReplayProof {
+    pub schema_version: String,
+    pub packet_id: String,
+    pub artifact_name: String,
+    pub ts_unix_ms: u128,
+    pub original_byte_count: usize,
+    pub symbol_size: usize,
+    pub source_symbols_total: usize,
+    pub dropped_symbol_indices: Vec<usize>,
+    pub repair_symbols_used: usize,
+    pub pre_recovery_blake3: String,
+    pub post_recovery_blake3: String,
+    pub verified_match: bool,
+    pub decoder_audit: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParityArtifactBundle {
     pub report_path: PathBuf,
     pub sidecar_path: PathBuf,
@@ -10656,6 +10673,65 @@ pub fn generate_decode_proof_artifact(
         recovered_blocks,
         proof_hash,
     })
+}
+
+pub fn replay_packet_decode_recovery(
+    packet_id: &str,
+    artifact_name: &str,
+    payload: &[u8],
+    sidecar: &RaptorQSidecar,
+    dropped_symbol_indices: &[usize],
+) -> Result<RecoveryReplayProof, HarnessError> {
+    if payload.is_empty() {
+        return Err(HarnessError::RaptorQ(
+            "payload must not be empty for decode recovery".to_string(),
+        ));
+    }
+    let pre_recovery_blake3 = hash(payload).to_hex().to_string();
+    let recovered = recover_payload_with_sidecar(payload, sidecar, dropped_symbol_indices)?;
+    let post_recovery_blake3 = hash(&recovered).to_hex().to_string();
+    let verified_match = pre_recovery_blake3 == post_recovery_blake3;
+    if !verified_match {
+        return Err(HarnessError::RaptorQ(format!(
+            "recovery hash mismatch: expected {pre_recovery_blake3}, got {post_recovery_blake3}"
+        )));
+    }
+
+    Ok(RecoveryReplayProof {
+        schema_version: "frankenscipy-decode-replay-v1".to_string(),
+        packet_id: packet_id.to_string(),
+        artifact_name: artifact_name.to_string(),
+        ts_unix_ms: now_unix_ms(),
+        original_byte_count: payload.len(),
+        symbol_size: sidecar.symbol_size,
+        source_symbols_total: sidecar.source_symbols,
+        dropped_symbol_indices: dropped_symbol_indices.to_vec(),
+        repair_symbols_used: sidecar.repair_symbol_payloads_hex.len(),
+        pre_recovery_blake3,
+        post_recovery_blake3,
+        verified_match,
+        decoder_audit: format!(
+            "asupersync-inactivation-decoder: recovered {} symbols from {} dropped",
+            dropped_symbol_indices.len(),
+            dropped_symbol_indices.len()
+        ),
+    })
+}
+
+pub fn verify_packet_decode_replay_proof(
+    proof: &RecoveryReplayProof,
+    expected_blake3: &str,
+) -> Result<bool, HarnessError> {
+    if !proof.verified_match {
+        return Ok(false);
+    }
+    if proof.pre_recovery_blake3 != proof.post_recovery_blake3 {
+        return Ok(false);
+    }
+    if proof.post_recovery_blake3 != expected_blake3 {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 #[must_use]
@@ -19410,6 +19486,39 @@ mod tests {
             proof.proof_hash, expected,
             "decode-proof hash must round-trip"
         );
+    }
+
+    #[test]
+    fn test_recovery_replay_proof_end_to_end() {
+        let payload: Vec<u8> = (0..4096u32)
+            .flat_map(|i| (i as u16).to_le_bytes())
+            .collect();
+        let sidecar = super::generate_raptorq_sidecar(&payload).expect("sidecar");
+        let dropped = vec![0, 2];
+        let proof = super::replay_packet_decode_recovery(
+            "FSCI-P2C-001",
+            "parity_report.json",
+            &payload,
+            &sidecar,
+            &dropped,
+        )
+        .expect("recovery replay proof generation");
+
+        assert!(proof.verified_match);
+        assert_eq!(proof.dropped_symbol_indices, vec![0, 2]);
+        assert_eq!(proof.original_byte_count, payload.len());
+
+        let expected_hash = super::hash(&payload).to_hex().to_string();
+        let valid = super::verify_packet_decode_replay_proof(&proof, &expected_hash)
+            .expect("proof verification");
+        assert!(valid);
+
+        let invalid = super::verify_packet_decode_replay_proof(
+            &proof,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("proof verification with wrong hash");
+        assert!(!invalid);
     }
 
     #[test]
