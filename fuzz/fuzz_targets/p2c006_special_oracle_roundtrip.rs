@@ -917,6 +917,17 @@ fn to_current_packet(packet: &FuturePacketFixture) -> Option<SpecialPacketFixtur
                         rtol: *rtol,
                         contract_ref: contract_ref.clone(),
                     },
+                    FutureExpectedOutcome::Vector {
+                        values,
+                        atol,
+                        rtol,
+                        contract_ref,
+                    } => SpecialExpectedOutcome::Vector {
+                        values: values.clone(),
+                        atol: *atol,
+                        rtol: *rtol,
+                        contract_ref: contract_ref.clone(),
+                    },
                     FutureExpectedOutcome::Class { class } => {
                         SpecialExpectedOutcome::Class { class: *class }
                     }
@@ -925,8 +936,7 @@ fn to_current_packet(packet: &FuturePacketFixture) -> Option<SpecialPacketFixtur
                             error: error.clone(),
                         }
                     }
-                    FutureExpectedOutcome::Vector { .. }
-                    | FutureExpectedOutcome::ComplexScalar { .. }
+                    FutureExpectedOutcome::ComplexScalar { .. }
                     | FutureExpectedOutcome::ComplexVector { .. } => return None,
                 },
             })
@@ -1000,6 +1010,40 @@ fn assert_same_current_packet(lhs: &SpecialPacketFixture, rhs: &SpecialPacketFix
                 );
             }
             (
+                SpecialExpectedOutcome::Vector {
+                    values: left_values,
+                    atol: left_atol,
+                    rtol: left_rtol,
+                    contract_ref: left_contract,
+                },
+                SpecialExpectedOutcome::Vector {
+                    values: right_values,
+                    atol: right_atol,
+                    rtol: right_rtol,
+                    contract_ref: right_contract,
+                },
+            ) => {
+                assert_eq!(
+                    left_values.len(),
+                    right_values.len(),
+                    "current vector len mismatch at case {index}"
+                );
+                for (val_index, (left_val, right_val)) in
+                    left_values.iter().zip(right_values.iter()).enumerate()
+                {
+                    assert!(
+                        same_f64_bits(*left_val, *right_val),
+                        "current vector bits mismatch at case {index}/{val_index}"
+                    );
+                }
+                assert_same_optional_bits(*left_atol, *right_atol, "current vector atol");
+                assert_same_optional_bits(*left_rtol, *right_rtol, "current vector rtol");
+                assert_eq!(
+                    left_contract, right_contract,
+                    "current vector contract ref mismatch"
+                );
+            }
+            (
                 SpecialExpectedOutcome::Class { class: left_class },
                 SpecialExpectedOutcome::Class { class: right_class },
             ) => {
@@ -1037,7 +1081,7 @@ fuzz_target!(|input: PacketInput| {
     } else {
         assert!(
             serde_json::from_str::<SpecialPacketFixture>(&future_json).is_err(),
-            "current schema unexpectedly accepted future-only complex/vector payload"
+            "current schema unexpectedly accepted future-only complex payload"
         );
     }
 });
