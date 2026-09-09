@@ -4357,11 +4357,25 @@ pub fn zetac_scalar(s: f64) -> f64 {
 /// Complex log-gamma using Lanczos approximation.
 /// Matches scipy.special.loggamma for complex arguments.
 pub fn complex_gammaln(z: Complex64) -> Complex64 {
+    if !z.is_finite() {
+        return Complex64::new(f64::NAN, f64::NAN);
+    }
     if is_complex_real_gamma_pole(z) {
         return Complex64::new(f64::NAN, f64::NAN);
     }
 
     if z.re < 0.5 {
+        if z.re < -50.0 {
+            // Hare's reflection formula (Proposition 3.1 in Hare 1997):
+            // ln Γ(z) = ln(π) + i*tmp - ln(sin πz) - ln Γ(1-z)
+            // Evaluates in O(1) time and avoids infinite/large loops where w.re + 1.0 == w.re.
+            let tmp = 2.0 * PI * (0.5 * z.re + 0.25).floor().copysign(z.im);
+            let sinpi_z = complex_sinpi(z);
+            let one_minus_z = Complex64::new(1.0 - z.re, -z.im);
+            return Complex64::new(PI.ln(), tmp)
+                - sinpi_z.ln()
+                - complex_gammaln_lanczos(one_minus_z);
+        }
         // Upward recurrence loggamma(z) = loggamma(z+1) - log(z), shifting until the
         // Lanczos region (Re >= 0.5) and accumulating PRINCIPAL logs. Summing principal
         // logs lets the imaginary part track the analytic continuation — scipy.special
@@ -4372,8 +4386,12 @@ pub fn complex_gammaln(z: Complex64) -> Complex64 {
         let mut acc = Complex64::new(0.0, 0.0);
         let mut w = z;
         while w.re < 0.5 {
+            let next_re = w.re + 1.0;
+            if next_re <= w.re {
+                break;
+            }
             acc = acc + w.ln();
-            w = Complex64::new(w.re + 1.0, w.im);
+            w = Complex64::new(next_re, w.im);
         }
         complex_gammaln_lanczos(w) - acc
     } else {

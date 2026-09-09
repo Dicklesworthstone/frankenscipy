@@ -94,3 +94,23 @@ fn test_complex_gamma_exp_gammaln_consistency() {
         panic!("expected complex scalars");
     }
 }
+
+#[test]
+fn test_complex_gammaln_large_negative_and_non_finite_no_hang() {
+    use fsci_special::Complex64;
+    let mode = RuntimeMode::Strict;
+    for z in [
+        Complex64::new(f64::NEG_INFINITY, 0.0),
+        Complex64::new(f64::NEG_INFINITY, 1.0),
+        Complex64::new(f64::NAN, 0.0),
+        Complex64::new(0.0, f64::NAN),
+        Complex64::new(-1.0e300, 1.0),
+        Complex64::new(-1.0e300, 0.0),
+        Complex64::new(-1000.5, 1.0),
+        Complex64::new(-100.5, 1.0),
+        Complex64::new(-50.5, 1.0),
+    ] {
+        let res = fsci_special::gammaln(&SpecialTensor::ComplexScalar(z), mode);
+        assert!(res.is_ok(), "gammaln({z:?}) failed");
+    }
+}
