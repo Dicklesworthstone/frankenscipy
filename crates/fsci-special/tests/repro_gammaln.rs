@@ -310,3 +310,71 @@ fn test_ellipkinc_conjugation() {
         }
     }
 }
+
+#[test]
+fn test_hyp2f1_branch_cut_hardened_and_strict() {
+    use fsci_special::Complex64;
+    let a = SpecialTensor::RealScalar(1.0);
+    let b = SpecialTensor::RealScalar(1.25);
+    let c = SpecialTensor::RealScalar(1.75);
+
+    let z_upper = Complex64::new(1.5, 1.0e-9);
+    let z_lower = Complex64::new(1.5, -1.0e-9);
+
+    // Hardened mode: branch-cut boundary layer must fail closed
+    let res_upper_hard = fsci_special::hyp2f1(
+        &a,
+        &b,
+        &c,
+        &SpecialTensor::ComplexScalar(z_upper),
+        RuntimeMode::Hardened,
+    );
+    let res_lower_hard = fsci_special::hyp2f1(
+        &a,
+        &b,
+        &c,
+        &SpecialTensor::ComplexScalar(z_lower),
+        RuntimeMode::Hardened,
+    );
+    assert!(
+        res_upper_hard.is_err(),
+        "hardened mode should fail closed on upper branch-cut boundary"
+    );
+    assert!(
+        res_lower_hard.is_err(),
+        "hardened mode should fail closed on lower branch-cut boundary"
+    );
+
+    // Strict mode: branch-cut lanes preserve Schwarz reflection conjugation symmetry
+    let res_upper_strict = fsci_special::hyp2f1(
+        &a,
+        &b,
+        &c,
+        &SpecialTensor::ComplexScalar(z_upper),
+        RuntimeMode::Strict,
+    )
+    .expect("strict upper");
+    let res_lower_strict = fsci_special::hyp2f1(
+        &a,
+        &b,
+        &c,
+        &SpecialTensor::ComplexScalar(z_lower),
+        RuntimeMode::Strict,
+    )
+    .expect("strict lower");
+    if let (SpecialTensor::ComplexScalar(u), SpecialTensor::ComplexScalar(l)) =
+        (res_upper_strict, res_lower_strict)
+    {
+        assert!(
+            u.is_finite() && l.is_finite(),
+            "strict values should be finite"
+        );
+        let diff = (l - u.conj()).abs();
+        assert!(
+            diff <= 1.0e-7,
+            "conjugation mismatch: upper={u:?}, lower={l:?}, diff={diff}"
+        );
+    } else {
+        panic!("expected complex scalars");
+    }
+}

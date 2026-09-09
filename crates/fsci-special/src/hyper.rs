@@ -2783,6 +2783,12 @@ fn hyp2f1_complex_parameters(
         return Ok((one - z).powc(-b));
     }
 
+    let terminates = (a.im == 0.0 && is_nonpositive_integer(a.re))
+        || (b.im == 0.0 && is_nonpositive_integer(b.re));
+    if terminates {
+        return hyp2f1_series_complex(a, b, c, z, mode);
+    }
+
     if z.abs() < 1.0 {
         return hyp2f1_series_complex(a, b, c, z, mode);
     }
@@ -2803,6 +2809,15 @@ fn hyp2f1_complex_parameters(
         if value.is_finite() {
             return Ok(value);
         }
+    }
+
+    if mode == RuntimeMode::Hardened && z.re >= 1.0 && z.im.abs() <= 1.0e-8 {
+        return Err(SpecialError {
+            function: "hyp2f1",
+            kind: SpecialErrorKind::DomainError,
+            mode,
+            detail: "z is in the branch-cut boundary layer [1, inf) in hardened mode",
+        });
     }
 
     // z -> 1/z connection (DLMF 15.8.2) reaches the right half-plane Re(z) >= 1/2
