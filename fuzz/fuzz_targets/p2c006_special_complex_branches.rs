@@ -326,4 +326,5 @@ fuzz_target!(|input: ComplexBranchInput| {
 
     check_gamma_family(z, mode, input.vectorize);
     check_branch_cuts(mode);
+    let _ = fsci_special::take_special_traces();
 });

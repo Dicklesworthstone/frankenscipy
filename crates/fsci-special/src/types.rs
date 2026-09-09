@@ -353,6 +353,8 @@ pub fn take_special_traces() -> Vec<SpecialTraceEntry> {
     out
 }
 
+const MAX_SPECIAL_TRACES: usize = 10_000;
+
 pub fn record_special_trace(
     function: &'static str,
     mode: RuntimeMode,
@@ -363,6 +365,9 @@ pub fn record_special_trace(
     clamped: bool,
 ) {
     let mut log = lock_trace_log_or_recover();
+    if log.len() >= MAX_SPECIAL_TRACES {
+        log.drain(0..MAX_SPECIAL_TRACES / 2);
+    }
     log.push(SpecialTraceEntry {
         timestamp_ms: now_unix_ms(),
         function,
