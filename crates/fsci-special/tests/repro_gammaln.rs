@@ -75,7 +75,8 @@ fn test_complex_gamma_exp_gammaln_consistency() {
         (g_res, gl_res)
     {
         let expected = gammaln_z.exp();
-        let scale = (gamma_z.re.abs().max(gamma_z.im.abs())).max(expected.re.abs().max(expected.im.abs()));
+        let scale =
+            (gamma_z.re.abs().max(gamma_z.im.abs())).max(expected.re.abs().max(expected.im.abs()));
         let tol = 1.0e-8 + 1.0e-6 * scale;
         assert!(
             (gamma_z.re - expected.re).abs() <= tol,
