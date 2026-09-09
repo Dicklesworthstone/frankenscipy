@@ -589,3 +589,31 @@ fn adv_extreme_combined_signals() {
         true,
     );
 }
+
+#[test]
+fn test_serde_json_float_roundtrip_precision() {
+    let test_floats = [
+        -8.778143165047872e-97f64,
+        0.0f64,
+        -0.0f64,
+        1.0f64,
+        -1.0f64,
+        0.5f64,
+        -0.5f64,
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        1.0e6,
+        -1.0e6,
+    ];
+    for &x in &test_floats {
+        let json = serde_json::to_string(&x).expect("serialize f64");
+        let parsed: f64 = serde_json::from_str(&json).expect("deserialize f64");
+        assert_eq!(
+            x.to_bits(),
+            parsed.to_bits(),
+            "mismatch for {x:?}: original bits {:016x}, parsed bits {:016x}",
+            x.to_bits(),
+            parsed.to_bits()
+        );
+    }
+}
