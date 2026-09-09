@@ -152,3 +152,43 @@ fn test_gammaln_subnormal_real_axis_reduction() {
         }
     }
 }
+
+#[test]
+fn test_gammaln_negative_subnormal_real_axis_reduction() {
+    use fsci_special::Complex64;
+    let mode = RuntimeMode::Strict;
+    for &x in &[
+        -8.0e-323,
+        -1.6e-322,
+        -1.0e-320,
+        -1.0e-310,
+        -f64::MIN_POSITIVE * 0.5,
+        -f64::MIN_POSITIVE,
+        -1.0e-300,
+        -1.0e-100,
+        -1.0e-10,
+        -0.1,
+        -0.499,
+    ] {
+        let real_res = fsci_special::gammaln(&SpecialTensor::RealScalar(x), mode).expect("real");
+        let comp_res =
+            fsci_special::gammaln(&SpecialTensor::ComplexScalar(Complex64::from_real(x)), mode)
+                .expect("complex");
+        if let (SpecialTensor::RealScalar(r), SpecialTensor::ComplexScalar(c)) =
+            (real_res, comp_res)
+        {
+            let scale = r.abs().max(c.re.abs());
+            let diff = (r - c.re).abs();
+            assert!(
+                diff <= 1e-8 + 1e-6 * scale,
+                "gammaln({x}): real {r} != complex {c:?}, diff {diff}"
+            );
+            // Verify winding behavior: imaginary part on negative real axis must be integer multiple of π
+            let winding = c.im / std::f64::consts::PI;
+            assert!(
+                (winding - winding.round()).abs() <= 1e-8 + 1e-6 * winding.abs().max(1.0),
+                "gammaln({x}): expected integer-multiple of π imaginary part, got {c:?}"
+            );
+        }
+    }
+}
