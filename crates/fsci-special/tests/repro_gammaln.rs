@@ -229,7 +229,25 @@ fn test_complex_erfinv_conjugation_and_accuracy() {
 #[test]
 fn test_ellipkinc_conjugation() {
     use fsci_special::Complex64;
-    let mode = RuntimeMode::Hardened;
+    let mode = RuntimeMode::Strict;
+    let phi = 6.280026599764828;
+    let m = 1.0;
+    let real_res = fsci_special::ellipeinc(
+        &SpecialTensor::RealScalar(phi),
+        &SpecialTensor::RealScalar(m),
+        mode,
+    )
+    .expect("real");
+    let comp_res = fsci_special::ellipeinc(
+        &SpecialTensor::ComplexScalar(Complex64::from_real(phi)),
+        &SpecialTensor::ComplexScalar(Complex64::from_real(m)),
+        mode,
+    )
+    .expect("complex");
+    if let (SpecialTensor::RealScalar(r), SpecialTensor::ComplexScalar(c)) = (real_res, comp_res) {
+        assert_eq!(r, c.re);
+        assert_eq!(c.im, 0.0);
+    }
     for phi in [
         Complex64::new(0.0, std::f64::consts::FRAC_PI_2),
         Complex64::new(0.5, 1.0),

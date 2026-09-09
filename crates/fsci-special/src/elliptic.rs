@@ -734,6 +734,11 @@ fn ellipk_complex_scalar(m: Complex64) -> Result<Complex64, SpecialError> {
     if !m.is_finite() {
         return Ok(complex_nan());
     }
+    if m.im == 0.0
+        && let Ok(real_val) = ellipk_scalar(m.re, RuntimeMode::Strict)
+    {
+        return Ok(Complex64::from_real(real_val));
+    }
     if m.re == 0.0 && m.im == 0.0 {
         return Ok(Complex64::from_real(PI / 2.0));
     }
@@ -752,6 +757,11 @@ fn ellipk_complex_scalar(m: Complex64) -> Result<Complex64, SpecialError> {
 fn ellipe_complex_scalar(m: Complex64) -> Result<Complex64, SpecialError> {
     if !m.is_finite() {
         return Ok(complex_nan());
+    }
+    if m.im == 0.0
+        && let Ok(real_val) = ellipe_scalar(m.re, RuntimeMode::Strict)
+    {
+        return Ok(Complex64::from_real(real_val));
     }
     if m.re == 0.0 && m.im == 0.0 {
         return Ok(Complex64::from_real(PI / 2.0));
@@ -772,8 +782,10 @@ fn ellipkm1_complex_scalar(p: Complex64, mode: RuntimeMode) -> Result<Complex64,
     if !p.is_finite() {
         return Ok(complex_nan());
     }
-    if p.im == 0.0 && (0.0..=1.0).contains(&p.re) {
-        return ellipkm1_scalar(p.re, mode).map(Complex64::from_real);
+    if p.im == 0.0
+        && let Ok(real_val) = ellipkm1_scalar(p.re, mode)
+    {
+        return Ok(Complex64::from_real(real_val));
     }
     ellipk_complex_scalar(Complex64::from_real(1.0) - p)
 }
@@ -781,6 +793,12 @@ fn ellipkm1_complex_scalar(p: Complex64, mode: RuntimeMode) -> Result<Complex64,
 fn ellipkinc_complex_scalar(phi: Complex64, m: Complex64) -> Result<Complex64, SpecialError> {
     if !phi.is_finite() || !m.is_finite() {
         return Ok(complex_nan());
+    }
+    if phi.im == 0.0
+        && m.im == 0.0
+        && let Ok(real_val) = ellipkinc_scalar(phi.re, m.re, RuntimeMode::Strict)
+    {
+        return Ok(Complex64::from_real(real_val));
     }
     if phi.re == 0.0 && phi.im == 0.0 {
         return Ok(Complex64::from_real(0.0));
@@ -797,6 +815,12 @@ fn ellipkinc_complex_scalar(phi: Complex64, m: Complex64) -> Result<Complex64, S
 fn ellipeinc_complex_scalar(phi: Complex64, m: Complex64) -> Result<Complex64, SpecialError> {
     if !phi.is_finite() || !m.is_finite() {
         return Ok(complex_nan());
+    }
+    if phi.im == 0.0
+        && m.im == 0.0
+        && let Ok(real_val) = ellipeinc_scalar(phi.re, m.re, RuntimeMode::Strict)
+    {
+        return Ok(Complex64::from_real(real_val));
     }
     if phi.re == 0.0 && phi.im == 0.0 {
         return Ok(Complex64::from_real(0.0));
