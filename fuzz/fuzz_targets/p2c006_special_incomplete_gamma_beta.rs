@@ -281,4 +281,5 @@ fuzz_target!(|input: IncompleteInput| {
             "gammaincinv roundtrip mismatch: expected {x_real}, got {x_roundtrip}"
         );
     }
+    let _ = fsci_special::take_special_traces();
 });

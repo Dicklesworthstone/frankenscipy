@@ -507,4 +507,5 @@ fuzz_target!(|input: HyperInput| {
         mismatch_lengths: input.mismatch_lengths,
         branch_z,
     });
+    let _ = fsci_special::take_special_traces();
 });

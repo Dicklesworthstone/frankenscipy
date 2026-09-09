@@ -740,6 +740,9 @@ fn ellipk_complex_scalar(m: Complex64) -> Result<Complex64, SpecialError> {
     if m.re == 1.0 && m.im == 0.0 {
         return Ok(Complex64::new(f64::INFINITY, 0.0));
     }
+    if m.im < 0.0 {
+        return ellipk_complex_scalar(m.conj()).map(|res| res.conj());
+    }
     Ok(complex_gauss_legendre_elliptic_f(
         Complex64::from_real(PI / 2.0),
         m,
@@ -755,6 +758,9 @@ fn ellipe_complex_scalar(m: Complex64) -> Result<Complex64, SpecialError> {
     }
     if m.re == 1.0 && m.im == 0.0 {
         return Ok(Complex64::from_real(1.0));
+    }
+    if m.im < 0.0 {
+        return ellipe_complex_scalar(m.conj()).map(|res| res.conj());
     }
     Ok(complex_gauss_legendre_elliptic_e(
         Complex64::from_real(PI / 2.0),
@@ -782,6 +788,9 @@ fn ellipkinc_complex_scalar(phi: Complex64, m: Complex64) -> Result<Complex64, S
     if phi.im == 0.0 && (phi.re - PI / 2.0).abs() < 1.0e-15 {
         return ellipk_complex_scalar(m);
     }
+    if phi.im < 0.0 || (phi.im == 0.0 && m.im < 0.0) {
+        return ellipkinc_complex_scalar(phi.conj(), m.conj()).map(|res| res.conj());
+    }
     Ok(complex_gauss_legendre_elliptic_f(phi, m))
 }
 
@@ -794,6 +803,9 @@ fn ellipeinc_complex_scalar(phi: Complex64, m: Complex64) -> Result<Complex64, S
     }
     if phi.im == 0.0 && (phi.re - PI / 2.0).abs() < 1.0e-15 {
         return ellipe_complex_scalar(m);
+    }
+    if phi.im < 0.0 || (phi.im == 0.0 && m.im < 0.0) {
+        return ellipeinc_complex_scalar(phi.conj(), m.conj()).map(|res| res.conj());
     }
     Ok(complex_gauss_legendre_elliptic_e(phi, m))
 }

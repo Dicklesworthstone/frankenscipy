@@ -225,3 +225,70 @@ fn test_complex_erfinv_conjugation_and_accuracy() {
         }
     }
 }
+
+#[test]
+fn test_ellipkinc_conjugation() {
+    use fsci_special::Complex64;
+    let mode = RuntimeMode::Hardened;
+    for phi in [
+        Complex64::new(0.0, std::f64::consts::FRAC_PI_2),
+        Complex64::new(0.5, 1.0),
+        Complex64::new(-0.5, 1.0),
+        Complex64::new(0.5, -1.0),
+        Complex64::new(1.0, 0.0),
+    ] {
+        for m in [
+            Complex64::new(-0.5, 0.0),
+            Complex64::new(0.5, 0.25),
+            Complex64::new(0.5, -0.25),
+            Complex64::new(-2.0, 0.5),
+            Complex64::new(2.0, -0.5),
+        ] {
+            let res_k = fsci_special::ellipkinc(
+                &SpecialTensor::ComplexScalar(phi),
+                &SpecialTensor::ComplexScalar(m),
+                mode,
+            )
+            .expect("k phi, m");
+            let res_k_conj = fsci_special::ellipkinc(
+                &SpecialTensor::ComplexScalar(phi.conj()),
+                &SpecialTensor::ComplexScalar(m.conj()),
+                mode,
+            )
+            .expect("k conj");
+            if let (SpecialTensor::ComplexScalar(c), SpecialTensor::ComplexScalar(cc)) =
+                (res_k, res_k_conj)
+                && c.is_finite()
+                && cc.is_finite()
+            {
+                assert!(
+                    (cc.re - c.conj().re).abs() <= 1e-7 && (cc.im - c.conj().im).abs() <= 1e-7,
+                    "ellipkinc conjugation mismatch for phi={phi:?}, m={m:?}: {c:?} vs {cc:?}"
+                );
+            }
+
+            let res_e = fsci_special::ellipeinc(
+                &SpecialTensor::ComplexScalar(phi),
+                &SpecialTensor::ComplexScalar(m),
+                mode,
+            )
+            .expect("e phi, m");
+            let res_e_conj = fsci_special::ellipeinc(
+                &SpecialTensor::ComplexScalar(phi.conj()),
+                &SpecialTensor::ComplexScalar(m.conj()),
+                mode,
+            )
+            .expect("e conj");
+            if let (SpecialTensor::ComplexScalar(c), SpecialTensor::ComplexScalar(cc)) =
+                (res_e, res_e_conj)
+                && c.is_finite()
+                && cc.is_finite()
+            {
+                assert!(
+                    (cc.re - c.conj().re).abs() <= 1e-7 && (cc.im - c.conj().im).abs() <= 1e-7,
+                    "ellipeinc conjugation mismatch for phi={phi:?}, m={m:?}: {c:?} vs {cc:?}"
+                );
+            }
+        }
+    }
+}

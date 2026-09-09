@@ -314,4 +314,5 @@ fuzz_target!(|input: EllipticInput| {
             );
         }
     }
+    let _ = fsci_special::take_special_traces();
 });

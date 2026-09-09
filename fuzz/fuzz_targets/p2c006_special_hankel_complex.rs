@@ -208,4 +208,5 @@ fuzz_target!(|input: HankelInput| {
             "hankel2: mismatched vector lengths should fail closed"
         );
     }
+    let _ = fsci_special::take_special_traces();
 });
