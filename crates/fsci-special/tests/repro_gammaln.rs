@@ -63,3 +63,33 @@ fn test_digamma_real_reduction_near_pole() {
         }
     }
 }
+
+#[test]
+fn test_complex_gamma_exp_gammaln_consistency() {
+    use fsci_special::Complex64;
+    let mode = RuntimeMode::Strict;
+    let z = Complex64::new(-f64::MIN_POSITIVE, 0.0);
+    let g_res = fsci_special::gamma(&SpecialTensor::ComplexScalar(z), mode).expect("gamma");
+    let gl_res = fsci_special::gammaln(&SpecialTensor::ComplexScalar(z), mode).expect("gammaln");
+    if let (SpecialTensor::ComplexScalar(gamma_z), SpecialTensor::ComplexScalar(gammaln_z)) =
+        (g_res, gl_res)
+    {
+        let expected = gammaln_z.exp();
+        let scale = (gamma_z.re.abs().max(gamma_z.im.abs())).max(expected.re.abs().max(expected.im.abs()));
+        let tol = 1.0e-8 + 1.0e-6 * scale;
+        assert!(
+            (gamma_z.re - expected.re).abs() <= tol,
+            "re mismatch: {} vs {}",
+            gamma_z.re,
+            expected.re
+        );
+        assert!(
+            (gamma_z.im - expected.im).abs() <= tol,
+            "im mismatch: {} vs {}",
+            gamma_z.im,
+            expected.im
+        );
+    } else {
+        panic!("expected complex scalars");
+    }
+}

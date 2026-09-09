@@ -105,18 +105,16 @@ fn approx_eq_scalar(lhs: f64, rhs: f64) -> bool {
 }
 
 fn approx_eq_complex(lhs: Complex64, rhs: Complex64) -> bool {
-    approx_eq_scalar(lhs.re, rhs.re) && approx_eq_scalar(lhs.im, rhs.im)
+    approx_eq_complex_with_tol(lhs, rhs, ABS_TOL, REL_TOL)
 }
 
 fn approx_eq_complex_with_tol(lhs: Complex64, rhs: Complex64, abs_tol: f64, rel_tol: f64) -> bool {
-    let approx_scalar = |left: f64, right: f64| {
-        if !(left.is_finite() && right.is_finite()) {
-            return false;
-        }
-        let scale = left.abs().max(right.abs());
-        (left - right).abs() <= abs_tol + rel_tol * scale
-    };
-    approx_scalar(lhs.re, rhs.re) && approx_scalar(lhs.im, rhs.im)
+    if !(lhs.is_finite() && rhs.is_finite()) {
+        return false;
+    }
+    let scale = (lhs.re.abs().max(lhs.im.abs())).max(rhs.re.abs().max(rhs.im.abs()));
+    let tol = abs_tol + rel_tol * scale;
+    (lhs.re - rhs.re).abs() <= tol && (lhs.im - rhs.im).abs() <= tol
 }
 
 fn complex_from_result(result: SpecialResult) -> Option<Complex64> {
