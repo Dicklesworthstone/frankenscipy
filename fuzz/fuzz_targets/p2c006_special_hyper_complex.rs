@@ -162,13 +162,16 @@ fn check_hyp0f1(
 
     if vectorize {
         let values = complex_vec_from_result(hyp0f1(
-            &ComplexScalar(b),
+            &ComplexVec(vec![b, b.conj()]),
             &ComplexVec(vec![z, z.conj()]),
             mode,
         ));
         if let Some(vec_values) = values {
             assert_eq!(vec_values.len(), 2, "hyp0f1: vector output length mismatch");
-            if vec_values[0].is_finite() && vec_values[1].is_finite() && z.im != 0.0 {
+            if vec_values[0].is_finite()
+                && vec_values[1].is_finite()
+                && (b.im != 0.0 || z.im != 0.0)
+            {
                 assert!(
                     approx_eq_complex(vec_values[1], vec_values[0].conj()),
                     "hyp0f1 vector conjugation mismatch for b={b:?}, z={z:?}"
@@ -253,14 +256,17 @@ fn check_hyp1f1(
 
     if vectorize {
         let values = complex_vec_from_result(hyp1f1(
-            &ComplexScalar(a),
-            &ComplexScalar(b),
+            &ComplexVec(vec![a, a.conj()]),
+            &ComplexVec(vec![b, b.conj()]),
             &ComplexVec(vec![z, z.conj()]),
             mode,
         ));
         if let Some(vec_values) = values {
             assert_eq!(vec_values.len(), 2, "hyp1f1: vector output length mismatch");
-            if vec_values[0].is_finite() && vec_values[1].is_finite() && z.im != 0.0 {
+            if vec_values[0].is_finite()
+                && vec_values[1].is_finite()
+                && (a.im != 0.0 || b.im != 0.0 || z.im != 0.0)
+            {
                 assert!(
                     approx_eq_complex(vec_values[1], vec_values[0].conj()),
                     "hyp1f1 vector conjugation mismatch for a={a:?}, b={b:?}, z={z:?}"
@@ -362,15 +368,18 @@ fn check_hyp2f1(case: Hyp2f1Case) {
 
     if case.vectorize {
         let values = complex_vec_from_result(hyp2f1(
-            &ComplexScalar(case.a),
-            &ComplexScalar(case.b),
-            &ComplexScalar(case.c),
+            &ComplexVec(vec![case.a, case.a.conj()]),
+            &ComplexVec(vec![case.b, case.b.conj()]),
+            &ComplexVec(vec![case.c, case.c.conj()]),
             &ComplexVec(vec![case.z, case.z.conj()]),
             case.mode,
         ));
         if let Some(vec_values) = values {
             assert_eq!(vec_values.len(), 2, "hyp2f1: vector output length mismatch");
-            if vec_values[0].is_finite() && vec_values[1].is_finite() && case.z.im != 0.0 {
+            if vec_values[0].is_finite()
+                && vec_values[1].is_finite()
+                && (case.a.im != 0.0 || case.b.im != 0.0 || case.c.im != 0.0 || case.z.im != 0.0)
+            {
                 assert!(
                     approx_eq_complex(vec_values[1], vec_values[0].conj()),
                     "hyp2f1 vector conjugation mismatch for a={:?}, b={:?}, c={:?}, z={:?}",
