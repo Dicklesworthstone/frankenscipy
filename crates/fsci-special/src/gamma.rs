@@ -1444,9 +1444,19 @@ fn gammaln_scalar_with_threshold(
         } else {
             lngamma_positive(x)
         }
+    } else if x > 0.0 {
+        // For 0 < x < 0.5, use recurrence: ln Γ(x) = ln Γ(x+1) - ln(x).
+        // This avoids multiplying by π in sinpi(x) which suffers subnormal
+        // quantization for x < 1e-308, and matches complex_gammaln bit-accurately.
+        let g1px = if x + 1.0 < asymptotic_min_x {
+            lngamma_lanczos(x + 1.0)
+        } else {
+            lngamma_positive(x + 1.0)
+        };
+        g1px - x.ln()
     } else {
         // Reflection formula: ln|Γ(x)| = ln(π) - ln|sin(πx)| - ln|Γ(1-x)|
-        // Valid for all x < 0.5 (except poles handled above)
+        // Valid for all x < 0.0 (except poles handled above)
         let g1mx = if 1.0 - x < 100.0 {
             lngamma_lanczos(1.0 - x)
         } else {
