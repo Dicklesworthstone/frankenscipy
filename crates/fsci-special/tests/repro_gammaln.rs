@@ -378,3 +378,45 @@ fn test_hyp2f1_branch_cut_hardened_and_strict() {
         panic!("expected complex scalars");
     }
 }
+
+#[test]
+fn test_gammaincinv_small_a_roundtrip() {
+    let mode = RuntimeMode::Strict;
+    for (a_val, x_val) in [
+        (1.0e-6, 1.0e-6),
+        (1.0e-6, 0.1),
+        (1.0e-6, 1.0),
+        (1.0e-4, 1.0e-4),
+        (0.01, 0.01),
+        (0.1, 0.5),
+        (0.5, 0.5),
+        (1.0, 1.0),
+        (2.0, 2.0),
+    ] {
+        let p_res = fsci_special::gammainc(
+            &SpecialTensor::RealScalar(a_val),
+            &SpecialTensor::RealScalar(x_val),
+            mode,
+        )
+        .expect("gammainc");
+        if let SpecialTensor::RealScalar(p) = p_res
+            && p > 1.0e-9
+            && p < 1.0 - 1.0e-9
+        {
+            let x_inv_res = fsci_special::gammaincinv(
+                &SpecialTensor::RealScalar(a_val),
+                &SpecialTensor::RealScalar(p),
+                mode,
+            )
+            .expect("gammaincinv");
+            if let SpecialTensor::RealScalar(x_inv) = x_inv_res {
+                let scale = x_val.abs().max(x_inv.abs());
+                let diff = (x_val - x_inv).abs();
+                assert!(
+                    diff <= 1.0e-7 + 1.0e-5 * scale,
+                    "roundtrip failed for a={a_val}, x={x_val}, p={p}: got x_inv={x_inv}, diff={diff}"
+                );
+            }
+        }
+    }
+}

@@ -5195,15 +5195,31 @@ pub fn gammaincinv_scalar(a: f64, y: f64) -> f64 {
     let mode = fsci_runtime::RuntimeMode::Strict;
     let ln_gamma_a = crate::gammaln_scalar(a, mode).unwrap_or(f64::NAN);
 
-    // Initial guess using Wilson-Hilferty approximation for chi-squared quantiles
-    let x0 = if y < 0.5 {
-        // For small y, use inverse of the leading term: P(a,x) ~ x^a / (a * Gamma(a))
-        // x ~ (y * a * Gamma(a))^(1/a)
-        (y * a * ln_gamma_a.exp()).powf(1.0 / a)
+    // Initial guess using leading-term power inversion for a < 1, Wilson-Hilferty for a >= 1 and y >= 0.5
+    let x0 = if a < 1.0 {
+        // For a < 1, P(a, x) ~ x^a / Gamma(a+1) across x in (0, 1).
+        // Wilson-Hilferty is invalid for a < 1 (h = 1/(9a) > 1/9 yields negative w and cubes to negative numbers).
+        // Invert in log-space: ln(x) ~ (ln(y) + ln_gamma(a+1)) / a.
+        let ln_gamma_a1 = crate::gammaln_scalar(a + 1.0, mode).unwrap_or(0.0);
+        let ln_x0 = (y.ln() + ln_gamma_a1) / a;
+        if ln_x0 <= 0.0 {
+            ln_x0.exp().max(1e-300)
+        } else {
+            let q = 1.0 - y;
+            if q > 0.0 {
+                (-q.ln() + ln_gamma_a).max(1.0)
+            } else {
+                1.0
+            }
+        }
+    } else if y < 0.5 {
+        // For small y and a >= 1: P(a, x) ~ x^a / (a * Gamma(a))
+        let ln_gamma_a1 = crate::gammaln_scalar(a + 1.0, mode).unwrap_or(0.0);
+        let ln_x0 = (y.ln() + ln_gamma_a1) / a;
+        ln_x0.exp().max(1e-300)
     } else {
         // Wilson-Hilferty: the Gamma(a,1) quantile ≈ a·(1 − 1/(9a) + z/√(9a))³ with z = Φ⁻¹(y).
-        // Far better than the bare `a` seed → ~3-4 Newton iters instead of ~15 (compounds the
-        // now-fast ndtri). Same converged root ⇒ accuracy unchanged.
+        // For a >= 1 and y >= 0.5, h = 1/(9a) <= 1/9 and z >= 0, guaranteeing w > 0.
         let z = ndtri_scalar(y);
         let h = 1.0 / (9.0 * a);
         let w = 1.0 - h + z * h.sqrt();
