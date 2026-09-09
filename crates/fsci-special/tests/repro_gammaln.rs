@@ -192,3 +192,36 @@ fn test_gammaln_negative_subnormal_real_axis_reduction() {
         }
     }
 }
+
+#[test]
+fn test_complex_erfinv_conjugation_and_accuracy() {
+    use fsci_special::Complex64;
+    let mode = RuntimeMode::Strict;
+    for z in [
+        Complex64::new(5.0e-322, 1360.2499972730875),
+        Complex64::new(-5.0e-322, 1360.2499972730875),
+        Complex64::new(5.0e-322, -1360.2499972730875),
+        Complex64::new(-5.0e-322, -1360.2499972730875),
+        Complex64::new(0.5, 2.0),
+        Complex64::new(-0.5, 2.0),
+        Complex64::new(0.5, -2.0),
+        Complex64::new(-0.5, -2.0),
+        Complex64::new(10.0, 5.0),
+    ] {
+        let z_conj = z.conj();
+        let res = fsci_special::erfinv(&SpecialTensor::ComplexScalar(z), mode).expect("erfinv z");
+        let res_conj = fsci_special::erfinv(&SpecialTensor::ComplexScalar(z_conj), mode)
+            .expect("erfinv z_conj");
+
+        if let (SpecialTensor::ComplexScalar(c), SpecialTensor::ComplexScalar(cc)) = (res, res_conj)
+            && c.is_finite()
+            && cc.is_finite()
+        {
+            assert_eq!(
+                cc,
+                c.conj(),
+                "erfinv conjugation mismatch for {z:?}: {c:?} vs {cc:?}"
+            );
+        }
+    }
+}

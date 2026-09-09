@@ -850,32 +850,67 @@ fn erfinv_complex_scalar(y: Complex64, mode: RuntimeMode) -> Result<Complex64, S
     if y.im == 0.0 {
         return erfinv_scalar(y.re, mode).map(Complex64::from_real);
     }
-    if y.re < 0.0 || (y.re == 0.0 && y.im < 0.0) {
-        return erfinv_complex_scalar(-y, mode).map(|value| -value);
-    }
     if y == Complex64::new(0.0, 0.0) {
         return Ok(y);
     }
 
+    // Map to the first quadrant (Re >= 0, Im >= 0) via symmetries:
+    // erfinv(z*) = (erfinv(z))* and erfinv(-z) = -erfinv(z).
+    // These imply Re(erfinv(z)) is odd in Re(z) and even in Im(z),
+    // while Im(erfinv(z)) is even in Re(z) and odd in Im(z).
+    let q1 = Complex64::new(y.re.abs(), y.im.abs());
+    let res = erfinv_complex_scalar_first_quadrant(q1, mode)?;
+    Ok(Complex64::new(res.re.copysign(y.re), res.im.copysign(y.im)))
+}
+
+fn erfinv_complex_scalar_first_quadrant(
+    y: Complex64,
+    mode: RuntimeMode,
+) -> Result<Complex64, SpecialError> {
     let mut x = erfinv_complex_initial_guess(y);
     if !x.re.is_finite() || !x.im.is_finite() {
         x = y * (PI.sqrt() / 2.0);
     }
+    x = Complex64::new(x.re.abs(), x.im.abs());
 
-    for _ in 0..20 {
+    let mut converged = false;
+    for _ in 0..30 {
         let fx = erf_complex_scalar(x) - y;
+        let err = fx.abs();
+        if err <= 1.0e-14 * y.abs().max(1.0) {
+            converged = true;
+            break;
+        }
         let dfx = (-x * x).exp() * TWO_INV_SQRT_PI;
         if dfx.abs() < 1.0e-300 {
             break;
         }
-        let correction = fx / dfx;
-        x = x - correction;
-        if correction.abs() <= 1.0e-14 * x.abs().max(1.0) {
+        let corr = fx / dfx;
+        // Damped line search to prevent super-exponential overshoot:
+        let mut step = corr;
+        let mut step_accepted = false;
+        for _ in 0..8 {
+            let trial = x - step;
+            let trial_proj = Complex64::new(trial.re.abs(), trial.im.abs());
+            let trial_fx = erf_complex_scalar(trial_proj) - y;
+            if trial_fx.abs() <= err {
+                x = trial_proj;
+                step_accepted = true;
+                break;
+            }
+            step = step * 0.5;
+        }
+        if !step_accepted {
+            x = x - corr * 0.1;
+            x = Complex64::new(x.re.abs(), x.im.abs());
+        }
+        if corr.abs() <= 1.0e-14 * x.abs().max(1.0) {
+            converged = true;
             break;
         }
     }
 
-    if !x.re.is_finite() || !x.im.is_finite() {
+    if !x.re.is_finite() || !x.im.is_finite() || !converged {
         return match mode {
             RuntimeMode::Strict => Ok(Complex64::new(f64::NAN, f64::NAN)),
             RuntimeMode::Hardened => Err(SpecialError {
