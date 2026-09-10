@@ -3233,6 +3233,19 @@ mod cubic_live {
         std::env::var(name).map_err(|_| format!("required provenance variable {name} is absent"))
     }
 
+    fn verify_booking_claim() -> Result<String, String> {
+        let claim = fsci_runtime::booking_claim::verify_for_harness()
+            .map_err(|rejection| rejection.to_string())?;
+        println!("{}", claim.provenance_line());
+        for conflict in fsci_runtime::booking_claim::fleet_conflicts_now() {
+            println!(
+                "fleet_booking_conflict: project={} agent={} age_seconds={} subject={:?}",
+                conflict.project_slug, conflict.agent, conflict.age_seconds, conflict.subject
+            );
+        }
+        Ok(claim.message_id.to_string())
+    }
+
     fn ready_value<'a>(identity: &'a str, prefix: &str) -> Option<&'a str> {
         identity
             .split_whitespace()
@@ -3332,7 +3345,7 @@ mod cubic_live {
         let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
         let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
         let build_route = required_env("BINARY_BUILD_ROUTE")?;
-        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
+        let booking_claim = verify_booking_claim()?;
         println!("elf_sha256={elf_sha256}");
         println!("frankenscipy_engine_sha256={elf_sha256}");
         println!(
@@ -3542,7 +3555,7 @@ mod cubic_live {
         let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
         let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
         let build_route = required_env("BINARY_BUILD_ROUTE")?;
-        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
+        let booking_claim = verify_booking_claim()?;
         println!("elf_sha256={elf_sha256}");
         println!("frankenscipy_engine_sha256={elf_sha256}");
         println!(
@@ -4218,7 +4231,7 @@ mod cubic_live {
         let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
         let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
         let build_route = required_env("BINARY_BUILD_ROUTE")?;
-        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
+        let booking_claim = verify_booking_claim()?;
         println!("elf_sha256={elf_sha256}");
         println!("frankenscipy_engine_sha256={elf_sha256}");
         println!(

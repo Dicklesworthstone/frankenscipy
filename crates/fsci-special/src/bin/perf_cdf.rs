@@ -1270,8 +1270,16 @@ for line in sys.stdin:
         let source_commit = required_env("BINARY_SOURCE_COMMIT")?;
         let builder_identity = required_env("BINARY_BUILDER_IDENTITY")?;
         let build_route = required_env("BINARY_BUILD_ROUTE")?;
-        let booking_claim = required_env("TRJ_BOOKING_CLAIM_MESSAGE_ID")?;
-        parse::<u64>(&booking_claim, "numeric booking claim")?;
+        let claim = fsci_runtime::booking_claim::verify_for_harness()
+            .map_err(|rejection| rejection.to_string())?;
+        println!("{}", claim.provenance_line());
+        for conflict in fsci_runtime::booking_claim::fleet_conflicts_now() {
+            println!(
+                "fleet_booking_conflict: project={} agent={} age_seconds={} subject={:?}",
+                conflict.project_slug, conflict.agent, conflict.age_seconds, conflict.subject
+            );
+        }
+        let booking_claim = claim.message_id.to_string();
         // frankenscipy-2b7tr gate 3, brought into line with `perf_minimize_many_scipy` and
         // `perf_dblquad_many_scipy` (95d6f6ef4).
         //
