@@ -1,7 +1,7 @@
 //! P2C-006-H: Performance profiling tests for special function operations.
 //!
 //! Produces structured JSON artifacts at:
-//!   fixtures/artifacts/P2C-006/perf/
+//!   fixtures/artifacts/FSCI-P2C-006/perf/
 //!
 //! Covers gamma, gammaln, rgamma, gammainc, erf, erfc, erfinv, beta, j0, j1, y0.
 
@@ -379,8 +379,8 @@ fn perf_p2c006_full_profile() {
     };
 
     // Write artifact
-    let artifact_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-006/perf");
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/artifacts/FSCI-P2C-006/perf");
     std::fs::create_dir_all(&artifact_dir).unwrap();
 
     let json = serde_json::to_string_pretty(&report).unwrap();

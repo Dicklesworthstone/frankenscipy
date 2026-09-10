@@ -1,7 +1,7 @@
 //! bd-3jh.12.9: [FSCI-P2C-001-I] Final Evidence Pack
 //!
 //! Produces a self-contained evidence bundle at:
-//!   fixtures/artifacts/P2C-001/evidence/
+//!   fixtures/artifacts/FSCI-P2C-001/evidence/
 //!
 //! Covers IVP solver validation, step-size selection, and explicit RK
 //! integration with parity gates and risk notes.
@@ -373,7 +373,7 @@ fn check_mode_invariance() -> ParityGate {
 #[test]
 fn evidence_p2c001_final_pack() {
     let evidence_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-001/evidence");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-001/evidence");
     std::fs::create_dir_all(&evidence_dir).expect("evidence directory");
 
     // Fixture manifest

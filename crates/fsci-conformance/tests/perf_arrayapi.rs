@@ -1,7 +1,7 @@
 //! P2C-007-H: Performance profiling for Array API broadcast and creation hot paths.
 //!
 //! Produces structured JSON artifact at:
-//!   fixtures/artifacts/P2C-007/perf/perf_profile_report.json
+//!   fixtures/artifacts/FSCI-P2C-007/perf/perf_profile_report.json
 //!
 //! The report includes the required log fields:
 //! - hotspot_function
@@ -1415,8 +1415,8 @@ fn perf_p2c007_arrayapi_hotpath_profile() {
         ],
     };
 
-    let artifact_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-007/perf");
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/artifacts/FSCI-P2C-007/perf");
     std::fs::create_dir_all(&artifact_dir).expect("perf artifact directory should be creatable");
 
     let pretty_json = serde_json::to_string_pretty(&report).expect("perf report should serialize");

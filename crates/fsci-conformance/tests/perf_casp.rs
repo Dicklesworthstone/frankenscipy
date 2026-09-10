@@ -1,7 +1,7 @@
 //! P2C-008-H: Performance profiling tests for CASP runtime operations.
 //!
 //! Produces structured JSON artifact at:
-//!   fixtures/artifacts/P2C-008/perf/perf_profile_report.json
+//!   fixtures/artifacts/FSCI-P2C-008/perf/perf_profile_report.json
 //!
 //! Covers PolicyController, SolverPortfolio, ConformalCalibrator, DecisionSignals.
 
@@ -427,8 +427,8 @@ fn perf_p2c008_casp_profile() {
         },
     };
 
-    let artifact_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-008/perf");
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/artifacts/FSCI-P2C-008/perf");
     std::fs::create_dir_all(&artifact_dir).unwrap();
 
     let json = serde_json::to_string_pretty(&report).unwrap();

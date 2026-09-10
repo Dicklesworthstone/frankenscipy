@@ -1,0 +1,21 @@
+{
+  "scenario_id": "p2c007_05_zero_dim_and_scalar_edge_cases",
+  "seed": 7005,
+  "steps": [
+    {
+      "step_name": "ensure_behavior_ledger_present",
+      "kind": "check_path_exists",
+      "path": "FSCI-P2C-007/anchor/behavior_ledger.json"
+    },
+    {
+      "step_name": "ensure_contract_table_present",
+      "kind": "check_path_exists",
+      "path": "FSCI-P2C-007/contracts/contract_table.json"
+    },
+    {
+      "step_name": "run_arrayapi_differential_fixture",
+      "kind": "run_differential_fixture",
+      "fixture": "FSCI-P2C-007_arrayapi_core.json"
+    }
+  ]
+}

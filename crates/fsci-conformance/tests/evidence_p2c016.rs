@@ -1,7 +1,7 @@
 //! [FSCI-P2C-016-I] Final Evidence Pack for fsci-constants.
 //!
 //! Produces a self-contained evidence bundle at:
-//!   fixtures/artifacts/P2C-016/evidence/
+//!   fixtures/artifacts/FSCI-P2C-016/evidence/
 //!
 //! Covers constant-value checks, lookup parity, and conversion helper invariants.
 
@@ -365,7 +365,7 @@ fn evidence_p2c016_final_pack() {
     let fixture_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/FSCI-P2C-016_constants_core.json");
     let evidence_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-016/evidence");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-016/evidence");
     std::fs::create_dir_all(&evidence_dir).expect("evidence directory should be creatable");
 
     let fixture_raw =

@@ -1,0 +1,16 @@
+{
+  "scenario_id": "p2c007_02_shape_mismatch_recovery",
+  "seed": 7002,
+  "steps": [
+    {
+      "step_name": "ensure_threat_matrix_present",
+      "kind": "check_path_exists",
+      "path": "FSCI-P2C-007/threats/threat_matrix.json"
+    },
+    {
+      "step_name": "run_arrayapi_differential_fixture",
+      "kind": "run_differential_fixture",
+      "fixture": "FSCI-P2C-007_arrayapi_core.json"
+    }
+  ]
+}

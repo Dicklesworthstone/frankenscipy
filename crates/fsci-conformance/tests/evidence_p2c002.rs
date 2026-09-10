@@ -1,7 +1,7 @@
 //! bd-3jh.13.9: [FSCI-P2C-002-I] Final Evidence Pack
 //!
 //! Produces a self-contained evidence bundle at:
-//!   fixtures/artifacts/P2C-002/evidence/
+//!   fixtures/artifacts/FSCI-P2C-002/evidence/
 //!
 //! Artifacts:
 //! 1. fixture_manifest.json — all test matrices with dimensions, conditions, types
@@ -354,7 +354,7 @@ fn check_pinv_parity(n: usize) -> ParityGate {
 #[test]
 fn evidence_p2c002_final_pack() {
     let evidence_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-002/evidence");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-002/evidence");
     std::fs::create_dir_all(&evidence_dir).unwrap();
 
     // 1. Fixture manifest

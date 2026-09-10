@@ -1,7 +1,7 @@
 //! P2C-004-H: Performance profiling tests for sparse matrix operations.
 //!
 //! Produces structured JSON artifacts at:
-//!   fixtures/artifacts/P2C-004/perf/
+//!   fixtures/artifacts/FSCI-P2C-004/perf/
 //!
 //! Covers CSR construction, spmv, format conversion, arithmetic across
 //! [100×100 5%, 1000×1000 1%, 10000×10000 0.1%] configurations.
@@ -455,8 +455,8 @@ fn perf_p2c004_full_profile() {
     };
 
     // Write artifact
-    let artifact_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-004/perf");
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/artifacts/FSCI-P2C-004/perf");
     std::fs::create_dir_all(&artifact_dir).unwrap();
 
     let json = serde_json::to_string_pretty(&report).unwrap();

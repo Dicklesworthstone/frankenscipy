@@ -1,7 +1,7 @@
 //! bd-3jh.18.9: [FSCI-P2C-007-I] Final Evidence Pack
 //!
 //! Produces a self-contained evidence bundle at:
-//!   fixtures/artifacts/P2C-007/evidence/
+//!   fixtures/artifacts/FSCI-P2C-007/evidence/
 //!
 //! Artifacts:
 //! 1. fixture_manifest.json — operation fixtures with shape/dtype metadata
@@ -134,7 +134,7 @@ fn evidence_p2c007_final_pack() {
     let fixture_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/FSCI-P2C-007_arrayapi_core.json");
     let evidence_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-007/evidence");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-007/evidence");
     std::fs::create_dir_all(&evidence_dir).expect("evidence directory should be creatable");
 
     let fixture_raw =

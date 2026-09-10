@@ -3979,11 +3979,7 @@ where
         } else {
             p2
         };
-        let relerr = if p0 != 0.0 {
-            (p - p0) / p0
-        } else {
-            p
-        };
+        let relerr = if p0 != 0.0 { (p - p0) / p0 } else { p };
         if relerr.abs() < tol {
             return Ok(p);
         }

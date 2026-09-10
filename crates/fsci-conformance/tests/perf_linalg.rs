@@ -1,7 +1,7 @@
 //! P2C-002-H: Performance profiling tests for linalg operations.
 //!
 //! Produces structured JSON artifacts at:
-//!   fixtures/artifacts/P2C-002/perf/
+//!   fixtures/artifacts/FSCI-P2C-002/perf/
 //!
 //! Covers all 7 operations × 4 matrix sizes with:
 //! - Median/p95 timing in nanoseconds
@@ -553,8 +553,8 @@ fn perf_p2c002_full_profile() {
     };
 
     // Write artifact
-    let artifact_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-002/perf");
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/artifacts/FSCI-P2C-002/perf");
     std::fs::create_dir_all(&artifact_dir).unwrap();
 
     let json = serde_json::to_string_pretty(&report).unwrap();

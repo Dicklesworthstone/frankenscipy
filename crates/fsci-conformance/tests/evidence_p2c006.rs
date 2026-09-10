@@ -1,7 +1,7 @@
 //! bd-3jh.17.9: [FSCI-P2C-006-I] Final Evidence Pack
 //!
 //! Produces a self-contained evidence bundle at:
-//!   fixtures/artifacts/P2C-006/evidence/
+//!   fixtures/artifacts/FSCI-P2C-006/evidence/
 //!
 //! Covers gamma, erf, beta, bessel families with parity gates and risk notes.
 
@@ -272,7 +272,7 @@ fn check_gamma_rgamma_inverse() -> Vec<ParityGate> {
 #[test]
 fn evidence_p2c006_final_pack() {
     let evidence_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-006/evidence");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-006/evidence");
     std::fs::create_dir_all(&evidence_dir).expect("evidence directory");
 
     // Fixture manifest

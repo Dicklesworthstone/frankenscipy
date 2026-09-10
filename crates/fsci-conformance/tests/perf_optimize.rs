@@ -1,7 +1,7 @@
 //! P2C-003-H: Performance profiling tests for optimize/root-finding operations.
 //!
 //! Produces structured JSON artifact at:
-//!   fixtures/artifacts/P2C-003/perf/perf_profile_report.json
+//!   fixtures/artifacts/FSCI-P2C-003/perf/perf_profile_report.json
 //!
 //! Covers BFGS, CG, Powell, brentq, brenth, bisect, ridder.
 
@@ -450,8 +450,8 @@ fn perf_p2c003_optimize_profile() {
     };
 
     // Write artifact
-    let artifact_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-003/perf");
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/artifacts/FSCI-P2C-003/perf");
     std::fs::create_dir_all(&artifact_dir).unwrap();
 
     let json = serde_json::to_string_pretty(&report).unwrap();

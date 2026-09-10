@@ -1,0 +1,16 @@
+{
+  "scenario_id": "p2c007_01_happy_path_creation_and_broadcast",
+  "seed": 7001,
+  "steps": [
+    {
+      "step_name": "ensure_contract_table_present",
+      "kind": "check_path_exists",
+      "path": "FSCI-P2C-007/contracts/contract_table.json"
+    },
+    {
+      "step_name": "run_arrayapi_differential_fixture",
+      "kind": "run_differential_fixture",
+      "fixture": "FSCI-P2C-007_arrayapi_core.json"
+    }
+  ]
+}

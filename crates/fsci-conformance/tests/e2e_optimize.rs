@@ -197,7 +197,7 @@ fn now_unix_ms() -> u128 {
 }
 
 fn e2e_output_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-003/e2e/runs")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-003/e2e/runs")
 }
 
 fn replay_cmd(scenario_id: &str) -> String {

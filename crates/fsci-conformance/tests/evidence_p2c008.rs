@@ -1,7 +1,7 @@
 //! bd-3jh.19.9: [FSCI-P2C-008-I] Final Evidence Pack
 //!
 //! Produces a self-contained evidence bundle at:
-//!   fixtures/artifacts/P2C-008/evidence/
+//!   fixtures/artifacts/FSCI-P2C-008/evidence/
 //!
 //! Artifacts:
 //! 1. fixture_manifest.json — policy decision scenarios with signal triples
@@ -665,7 +665,7 @@ fn check_audit_ledger_structured_decision_event() -> ParityGate {
 #[test]
 fn evidence_p2c008_final_pack() {
     let evidence_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-008/evidence");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-008/evidence");
     std::fs::create_dir_all(&evidence_dir).unwrap();
 
     // 1. Fixture manifest

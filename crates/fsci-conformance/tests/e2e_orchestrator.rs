@@ -67,9 +67,9 @@ fn collect_named_files(root: &Path, file_name: &str, out: &mut Vec<PathBuf>) {
 fn e2e_orchestrator_runs_arrayapi_packet_with_minimum_scenarios() {
     let temp_root = unique_temp_dir("arrayapi");
     let artifact_root = temp_root.join("artifacts");
-    let packet_dir = artifact_root.join("P2C-007");
+    let packet_dir = artifact_root.join("FSCI-P2C-007");
     let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-    let source_packet_dir = fixture_root.join("artifacts/P2C-007");
+    let source_packet_dir = fixture_root.join("artifacts/FSCI-P2C-007");
     let source_scenarios_dir = source_packet_dir.join("e2e/scenarios");
     let target_scenarios_dir = packet_dir.join("e2e/scenarios");
 
@@ -133,7 +133,7 @@ fn e2e_orchestrator_runs_arrayapi_packet_with_minimum_scenarios() {
         .arg("--fixture-root")
         .arg(&fixture_root)
         .arg("--packet")
-        .arg("P2C-007")
+        .arg("FSCI-P2C-007")
         .output()
         .expect("failed to execute e2e_orchestrator");
 
@@ -175,7 +175,7 @@ fn e2e_orchestrator_runs_arrayapi_packet_with_minimum_scenarios() {
         let json: Value = serde_json::from_str(&raw).unwrap_or_else(|error| {
             panic!("failed to parse {}: {error}", summary_file.display());
         });
-        assert_eq!(json["packet_id"], "P2C-007");
+        assert_eq!(json["packet_id"], "FSCI-P2C-007");
         assert_eq!(json["passed"], true);
         assert!(json["replay_command"].is_string());
     }

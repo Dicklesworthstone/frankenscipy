@@ -1,7 +1,7 @@
 //! [FSCI-P2C-012-I] Final Evidence Pack for stats conformance.
 //!
 //! Produces a self-contained evidence bundle at:
-//!   fixtures/artifacts/P2C-012/evidence/
+//!   fixtures/artifacts/FSCI-P2C-012/evidence/
 //!
 //! Covers packet-runner parity, fixture-driven differential outcomes, and
 //! stats-specific risk notes for descriptive statistics and inference helpers.
@@ -128,7 +128,7 @@ fn evidence_p2c012_final_pack() -> Result<(), Box<dyn Error>> {
     let fixture_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/FSCI-P2C-012_stats_core.json");
     let evidence_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-012/evidence");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-012/evidence");
     std::fs::create_dir_all(&evidence_dir)?;
 
     let fixture_raw = std::fs::read_to_string(&fixture_path)?;

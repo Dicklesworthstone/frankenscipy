@@ -1,7 +1,7 @@
 //! P2C-005-H: Performance profiling tests for FFT operations.
 //!
 //! Produces structured JSON artifacts at:
-//!   fixtures/artifacts/P2C-005/perf/
+//!   fixtures/artifacts/FSCI-P2C-005/perf/
 //!
 //! Covers fft, ifft, rfft, irfft, fft2, and FFT polynomial multiplication at
 //! sizes [16, 64, 256, 1024].
@@ -426,8 +426,8 @@ fn perf_p2c005_full_profile() {
     };
 
     // Write artifact
-    let artifact_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-005/perf");
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/artifacts/FSCI-P2C-005/perf");
     std::fs::create_dir_all(&artifact_dir).unwrap();
 
     let json = serde_json::to_string_pretty(&report).unwrap();

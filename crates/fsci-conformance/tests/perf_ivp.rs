@@ -1,7 +1,7 @@
 //! P2C-001-H: Performance profiling and behavior-isomorphism evidence for IVP.
 //!
 //! Produces structured JSON artifact at:
-//!   fixtures/artifacts/P2C-001/perf/perf_profile_report.json
+//!   fixtures/artifacts/FSCI-P2C-001/perf/perf_profile_report.json
 //!
 //! Focuses on validation + initial-step hotspots and includes:
 //! - p50/p95/p99 timing
@@ -572,8 +572,8 @@ fn perf_p2c001_ivp_profile_and_isomorphism() {
         ],
     };
 
-    let artifact_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-001/perf");
+    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/artifacts/FSCI-P2C-001/perf");
     std::fs::create_dir_all(&artifact_dir).expect("perf artifact directory should be creatable");
 
     let pretty_json = serde_json::to_string_pretty(&report).expect("perf report should serialize");

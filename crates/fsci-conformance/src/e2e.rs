@@ -588,7 +588,21 @@ fn resolve_from_root(root: &Path, raw_path: &str) -> PathBuf {
     if candidate.is_absolute() {
         candidate
     } else {
-        root.join(candidate)
+        let direct = root.join(&candidate);
+        if !direct.exists() {
+            if let Some(stripped) = raw_path.strip_prefix("P2C-") {
+                let canonical = root.join(format!("FSCI-P2C-{stripped}"));
+                if canonical.exists() {
+                    return canonical;
+                }
+            } else if let Some(stripped) = raw_path.strip_prefix("FSCI-P2C-") {
+                let legacy = root.join(format!("P2C-{stripped}"));
+                if legacy.exists() {
+                    return legacy;
+                }
+            }
+        }
+        direct
     }
 }
 

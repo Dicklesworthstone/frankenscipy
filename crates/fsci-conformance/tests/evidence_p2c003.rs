@@ -1,7 +1,7 @@
 //! bd-3jh.14.9: [FSCI-P2C-003-I] Final Evidence Pack
 //!
 //! Produces a self-contained evidence bundle at:
-//!   fixtures/artifacts/P2C-003/evidence/
+//!   fixtures/artifacts/FSCI-P2C-003/evidence/
 //!
 //! Covers BFGS, CG, Powell, brentq, brenth, bisect, ridder with parity gates
 //! and risk notes.
@@ -369,7 +369,7 @@ fn check_minimize_methods_agree() -> ParityGate {
 #[test]
 fn evidence_p2c003_final_pack() {
     let evidence_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-003/evidence");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-003/evidence");
     std::fs::create_dir_all(&evidence_dir).expect("evidence directory");
 
     let fixture_entries = vec![

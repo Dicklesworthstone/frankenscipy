@@ -1,7 +1,7 @@
 //! bd-3jh.15.9: [FSCI-P2C-004-I] Final Evidence Pack
 //!
 //! Produces a self-contained evidence bundle at:
-//!   fixtures/artifacts/P2C-004/evidence/
+//!   fixtures/artifacts/FSCI-P2C-004/evidence/
 //!
 //! Artifacts:
 //! 1. fixture_manifest.json — sparse matrices with nnz, structure types
@@ -259,7 +259,7 @@ fn check_diags_tridiag(n: usize) -> ParityGate {
 #[test]
 fn evidence_p2c004_final_pack() {
     let evidence_dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/P2C-004/evidence");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/artifacts/FSCI-P2C-004/evidence");
     std::fs::create_dir_all(&evidence_dir).expect("evidence directory");
 
     let configs: &[(usize, f64)] = &[(100, 0.05), (500, 0.02), (1000, 0.01)];
