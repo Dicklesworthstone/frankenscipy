@@ -1732,7 +1732,21 @@ Speedup grows with N as parallelism amortises (all integrals converge). The call
 I(p=100,c=0.5,w=10)=0.039156400368 == scipy 0.039156400368 to 3.84e-13; (3) fsci-integrate quad_many test
 green. The vmap-over-solver vein now spans FIVE solver families.
 
-### ✅✅✅ integrate: dblquad_many (vmap-over-solver 2D-integral sweep) — 62.7-211× faster than looped scipy
+### CONVERTED-CLAIM / DECIDED WIN: integrate: dblquad_many (vmap-over-solver 2D-integral sweep) — 3.47x whole-job win vs strongest live SciPy public arm
+**2026-09-10 conversion verdict (frankenscipy-44mb8):** historical 62.7-211x looped-SciPy claim converted.
+Re-measured in same invocation on host `threadripperje` under 32-CPU affinity (`taskset -c 0-31`), performance governor,
+against live SciPy 1.17.1 + NumPy 2.4.3 screened across eligible public arms (`dblquad_scalar`, `quad_vec`, `cubature_gk21`, `cubature_genz_malik`, `cubature_workers_gk21`).
+Strongest public SciPy arm: `cubature_workers_gk21` (vectorized cubature with persistent 32-worker multiprocessing pool, wall p50 4.19 ms vs FrankenSciPy 1.20 ms).
+Incumbent ratio: SciPy / FrankenSciPy = 3.4674x, bootstrap_median_ci95=[3.4202, 3.6181].
+Both same-invocation A/A nulls passed tightly within 2%: ours median 1.0179 (ci95 [0.9957, 1.0321]), SciPy median 1.0064 (ci95 [0.9876, 1.0125]).
+**CHOOSER STATEMENT:** choose FrankenSciPy dblquad_many for this exact 128-parameter job; retire the historical scalar-loop 62.7-211x magnitude for this workload.
+Decision: `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=true`.
+ELF SHA-256: `16b2a407d12fcd85555a7bc008b1be543e8ca51bcc4d131a7f5751ea80c488fe`.
+SciPy engine SHA-256: `ea9508bc9cb04b80cca5c0aafb0a46c6e9db8960da890dedc5777b970ec2fccf`.
+TRJ booking claim: message 41188. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
+The historical text and timings remain below as lab-notebook provenance; they are not admissible competitive evidence:
+
 Sixth vmap-over-solver family — and the heaviest-callback integration case. dblquad's inner adaptive integral
 is RE-RUN for each outer node, so each 2-D integral makes O(n²) integrand calls; in SciPy those are all Python
 calls, and a parameter sweep loops dblquad in Python, N integrals SERIALLY. fsci `dblquad_many` (param-sweep
