@@ -43648,3 +43648,44 @@ the smaller difference, and should be sized from the estimate that fires it leas
   spread recorded here — 0.096 on convection, 0.010 on cubic — and must report closure. A
   reciprocal lever, which remains the only candidate with the right per-row shape, must also
   carry an accuracy contract and a ULP bound, since it is not bit-identical.
+
+## 2026-09-10 — frankenscipy-40h1j — root_many 11–25× looped-SciPy claim converted and retired on threadripperje
+
+Bead `frankenscipy-40h1j`: converted the historical `root_many` serial-loop claim into a same-invocation 2,048-system steady-state parameter-study ratio against live SciPy 1.17.1 under 32-CPU affinity on host `threadripperje`.
+
+### Provenance and Measurement Table
+
+| Metric / Parameter | Value |
+|---|---|
+| harness | `perf_root_many_scipy` (`crates/fsci-opt/src/bin/perf_root_many_scipy.rs`) |
+| host | `threadripperje` (64 cores / 128 threads, 512 GiB RAM, 1 NUMA) |
+| boot ID | `a1b7d4b2-0459-4272-ad8c-bcc61108ecb8` |
+| affinity | 32 CPUs (`taskset -c 0-31`), CPU governor `performance` |
+| ELF SHA-256 | `8ce8a4a8a076afac45eb730445feb552d5eb77e9d95f72c07d17d8964741991d` |
+| source commit | `04560e9fbe4be5847ed5f7d3853e49c9e8019d89` |
+| builder | `RubyBeacon` |
+| build route | `rch-exec-base-clean-overlay-no-overlay` |
+| booking claim | message `41179` (verified via `fsci_runtime::booking_claim`) |
+| incumbent | SciPy 1.17.1 + NumPy 2.4.3 (`genuine=True`, `fsci_loaded=False`) |
+| SciPy engine SHA-256 | `acf52d861f9401c217c383b2ae74541cfe54ab3083208050f4f8870350255f2c` |
+| fixture | 2,048-system 3-eq nonlinear coupled equilibrium study, `tol=1e-10`, `x0=[1,1,1]` |
+| fixture SHA-256 | targets `dbb24d3a...`, params `d73ca890...`, input `c778c4c4...` |
+| rounds × reps | 15 × 3, balanced-square `ABBAABBA` schedule |
+| FrankenSciPy wall | p50 = 1.614 ms, p95 = 1.676 ms, p99 = 1.676 ms |
+| SciPy wall (`root_jac_process`) | p50 = 8.285 ms, p95 = 8.517 ms, p99 = 8.517 ms |
+| A/A null, ours | median 1.0081, ci95 [0.9939, 1.0186] (straddles 1.0, width within 2%) |
+| A/A null, SciPy | median 0.9963, ci95 [0.9744, 1.0075] (cv = 5.35%, straddles 1.0, width > 2%) |
+| incumbent ratio | SciPy / FrankenSciPy = 5.2250x, bootstrap_median_ci95 = [5.0322, 5.3474] |
+| scientific gate | all 2,048/2,048 converged, max cross-root error 1.133e-10 vs SciPy |
+| strongest public arm | `root_jac_process` (persistent 32-worker process pool, analytic Jacobian) |
+| screened arms | scalar (74.3 ms), jac_scalar (72.8 ms), thread (106.1 ms), jac_thread (103.7 ms), process (21.0 ms), jac_process (8.5 ms), joint_sparse (17.0 ms) |
+| serial tax removed | 8.21x–8.77x speedup from SciPy scalar to SciPy process pool |
+| old claim status | **RETIRED** (`old_11_1_to_25_1x_retired=true`) |
+| chooser statement | **CHOOSER STATEMENT:** choose deployment/API fit (no speed chooser) for this exact 2,048-system coupled-equilibrium study; durable_frankenscipy_boundary=3x durable_frankenscipy_win=false outcome=NULL-FAILED ratio_ci_low=5.032216416 old_11_1_to_25_1x_retired=true |
+
+### Observations and Verdict
+
+1. **The historical 11.1–25.1x claim is retired:** The previous claim compared FrankenSciPy's multithreaded batched solver against a Python for-loop calling `scipy.optimize.root` serially. When SciPy is evaluated using its strongest public concurrency mechanism (a persistent 32-worker multiprocessing pool with analytic Jacobian evaluation), the gap narrows to 5.22x (CI [5.03, 5.35]).
+2. **SciPy multiprocessing jitter causes NULL-FAILED:** FrankenSciPy's self A/A null passed tightly (median 1.0081, CI [0.9939, 1.0186], well within the 2% null gate). SciPy's multiprocessing worker pool exhibited inter-process IPC/scheduling variance (CV 5.35%, CI [0.9744, 1.0075]), causing the joint null gate condition `c3` (both null CIs within 2%) to fail. Per standing orders, this is recorded honestly as `outcome=NULL-FAILED`.
+3. **Evidence host unblocked:** This execution demonstrates that evidence runs pinned to host `threadripperje` under 32-CPU affinity are fully operational via remote task execution and Agent Mail booking synchronization (`frankenscipy-2auhe`).
+

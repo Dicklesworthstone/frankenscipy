@@ -1647,7 +1647,21 @@ scipy 622 success / 782 reached-global-min — fsci optimises at least as well. 
 test green. Callback lever (inline Rust objective, no Python per-eval) gives the per-run win; N-way parallelism
 multiplies it. The vmap-over-solver vein is now proven across curve_fit / solve_ivp / minimize.
 
-### ✅✅ opt: root_many (vmap-over-solver nonlinear-system sweep) — 11-25× faster than looped scipy
+### CONVERTED-CLAIM / RETIRED: opt: root_many (vmap-over-solver nonlinear-system sweep) — historical 11-25× claim retired; live SciPy 1.17.1 whole-job chooser ratio 5.22x
+**2026-09-10 conversion verdict (frankenscipy-40h1j):** historical 11-25x looped-SciPy claim retired.
+The historical A/B was run against a serial Python loop over `scipy.optimize.root` with no live whole-job incumbent, no A/A null, and no dual-arm screening.
+Re-measured in same invocation on host `threadripperje` under 32-CPU affinity (`taskset -c 0-31`), performance governor,
+against live SciPy 1.17.1 + NumPy 2.4.3 screened across 7 public arms.
+Strongest public SciPy arm: `root_jac_process` (persistent 32-worker process pool with analytic Jacobian).
+Incumbent ratio: SciPy / FrankenSciPy = 5.2250x, bootstrap_median_ci95=[5.0322, 5.3474].
+Due to inter-process worker pool jitter in Python, SciPy A/A null was 0.9963 ci95=[0.9744, 1.0075] (outcome=NULL-FAILED against strict 2% gate; ours passed at median 1.0081, ci95=[0.9939, 1.0186]).
+**CHOOSER STATEMENT:** choose deployment/API fit (no speed chooser) for this exact 2,048-system coupled-equilibrium study; durable_frankenscipy_boundary=3x durable_frankenscipy_win=false outcome=NULL-FAILED ratio_ci_low=5.032216416 old_11_1_to_25_1x_retired=true.
+ELF SHA-256: `8ce8a4a8a076afac45eb730445feb552d5eb77e9d95f72c07d17d8964741991d`.
+SciPy engine SHA-256: `acf52d861f9401c217c383b2ae74541cfe54ab3083208050f4f8870350255f2c`.
+TRJ booking claim: message 41179. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
+The historical text and timings remain below as lab-notebook provenance; they are not admissible competitive evidence:
+
 Fourth vmap-over-solver family (curve_fit / solve_ivp / minimize / root). A parameter sweep — solve
 `func(x, params)=0` for many parameter sets, shared start — is common in equilibrium/steady-state analysis;
 SciPy loops `root` in Python, N solves serially. fsci `root_many` (param-sweep signature `F: Fn(&[f64] x,
