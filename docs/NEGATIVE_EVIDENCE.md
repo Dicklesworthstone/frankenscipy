@@ -44038,3 +44038,41 @@ Bead `frankenscipy-bh6hy`: converted the historical `normaltest_many` (2267x), `
 2. **Null Gate Verification:** Both FrankenSciPy (median 1.0010, cv 0.614%) and SciPy (median 1.0020, cv 1.335%) passed the dual A/A null gates well within the 2% margin. Point effect and effect endpoint decisively exceed 2x null half-width / endpoint deviations.
 3. **Chooser Decision:** Because the lower bound of the 95% bootstrap-median CI (4.8922x) strictly exceeds the durable win boundary of 3.0x, `durable_frankenscipy_win=true`. The chooser selects FrankenSciPy for this deployment.
 
+## 2026-09-10 — frankenscipy-2b7tr — ndtri central-region SIMD re-adjudication on AVX2+FMA; 2.33× central win, 1.09× vs live SciPy
+
+Bead `frankenscipy-2b7tr`: Re-adjudicated the 2026-07-04 NO-SHIP verdict under the fleet ISA pin (AVX2+FMA) on host `threadripperje` pinned to CPU 0 (`taskset -c 0`) with CPU governor `performance`.
+Reconstructed the candidate AVX2+FMA central SIMD mechanism and measured same-invocation baseline, candidate, and dual nulls against live SciPy 1.17.1 ufunc (`scipy.special.ndtri`) over 200,000 elements across central, tail, and mixed fixtures (15 rounds × 10 repetitions).
+
+### Provenance and Measurement Table
+
+| Metric / Parameter | Value |
+|---|---|
+| harness | `perf_cdf` (`crates/fsci-special/src/bin/perf_cdf.rs`) |
+| host | `threadripperje` (64 cores / 128 threads, 512 GiB RAM, 1 NUMA) |
+| boot ID | `a1b7d4b2-0459-4272-ad8c-bcc61108ecb8` |
+| affinity | CPU 0 (`taskset -c 0`), CPU governor `performance`, driver `amd-pstate-epp` |
+| ELF SHA-256 | `97187307abe6e2df6cb475844b6f6ee28d603c37ff309003e6677386d1237862` |
+| source commit | `d41062129eb0e5272a0889269cb1e138a0631ba9` |
+| builder | `RubyBeacon` |
+| build route | `rch-exec-base-clean-overlay-no-overlay` |
+| booking claim | message `41202` (verified via `fsci_runtime::booking_claim`) |
+| incumbent | SciPy 1.17.1 + NumPy 2.4.3 (`genuine=true`, `fsci_loaded=false`) |
+| SciPy engine SHA-256 | `f30d6a7ba69af4e2a7b5acfbc8e2a55e6f8ba675e9b95e6750257de9f4fd3531` |
+| fixture | 200,000 elements across central, tail, and mixed distributions |
+| rounds × reps | 15 × 10 |
+| parity proof | 600,013 bit-identical values tested vs scalar (0 bit mismatches); max abs difference vs SciPy: 4.441e-16 (tolerance 2.000e-13) |
+| central self ratio (scalar / SIMD) | median 2.3283x, ci95 [2.2341, 2.3348] (`outcome=WIN`), scalar p50 1080.92 us vs SIMD p50 472.26 us |
+| tail self ratio (scalar / SIMD) | median 0.9401x, ci95 [0.9360, 0.9468] (`outcome=LOSS`), scalar p50 53.66 ms vs SIMD p50 56.96 ms |
+| mixed self ratio (scalar / SIMD) | median 1.1944x, ci95 [1.1929, 1.1952] (`outcome=WIN`), scalar p50 2508.50 us vs SIMD p50 2099.78 us |
+| mixed incumbent ratio (SciPy / SIMD) | median 1.0914x, ci95 [1.0806, 1.1069] (`outcome=WIN`), SciPy p50 2123.75 us vs SIMD p50 1892.30 us |
+| dual null gates | central nulls: scalar 0.9879, SIMD 0.9994; mixed nulls: scalar 0.9998, SIMD 1.0002; incumbent mixed: SIMD 0.9974, SciPy 1.0164 |
+| decision | `production_decision=KEEP-SIMD` |
+| chooser statement | **CHOOSER STATEMENT:** use central SIMD only in ndtri's existing serial middle-size band; central-only evidence never creates a distribution-sensitive public chooser. |
+
+### Observations and Verdict
+
+1. **Re-adjudication Resolution:** The 2026-07-04 NO-SHIP verdict was re-evaluated under AVX2+FMA. On central inputs, AVX2 SIMD provides a 2.33x speedup over scalar Cephes rational.
+2. **Tail Penalty Isolated:** Tail lanes incur a ~6% regression (0.9401x) due to branch overhead, confirming the original finding that tail lanes should not be routed through SIMD masking.
+3. **Mixed Workload & SciPy Comparison:** On a uniform mixed workload, SIMD wins 1.1944x over scalar and 1.0914x over live SciPy 1.17.1 ufunc.
+4. **Policy Chooser:** Production decision is `KEEP-SIMD`, scoped strictly to ndtri's middle-size array band without exposing distribution-sensitive public switches.
+

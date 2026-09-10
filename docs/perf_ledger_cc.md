@@ -1873,6 +1873,20 @@ TRJ booking claim: message 41200. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
 
 The historical scalar-loop 74-2267x claims are retired.
 
+### CONVERTED-CLAIM / ADJUDICATED: special: ndtri central-region SIMD re-adjudication on AVX2+FMA (frankenscipy-2b7tr) — 2.33x WIN central, 1.19x WIN mixed (1.09x vs live SciPy)
+**2026-09-10 adjudication verdict (frankenscipy-2b7tr):** Re-adjudicated the 2026-07-04 NO-SHIP verdict under the fleet ISA pin (AVX2+FMA) on host `threadripperje` pinned to CPU 0 (`taskset -c 0`) with governor `performance`.
+Candidate AVX2+FMA central SIMD measured against scalar baseline and live SciPy 1.17.1 ufunc (`scipy.special.ndtri`) over 200,000 elements across central, tail, and mixed fixtures (15 rounds × 10 repetitions).
+Parity: 600,013 bit-identical values tested vs scalar (0 bit mismatches); max probe difference vs SciPy: 4.441e-16 (tolerance 2.000e-13).
+- **Central fixture** (self SIMD vs self scalar): 2.3283x WIN (p50 472.26 us vs 1080.92 us, bootstrap 95% CI [2.2341, 2.3348]). Dual nulls passed (scalar 0.9879, SIMD 0.9994).
+- **Tail fixture** (self SIMD vs self scalar): 0.9401x LOSS (p50 56.96 ms vs 53.66 ms, bootstrap 95% CI [0.9360, 0.9468]) due to non-vectorized rational tail lanes.
+- **Mixed fixture** (self SIMD vs self scalar): 1.1944x WIN (p50 2099.78 us vs 2508.50 us, bootstrap 95% CI [1.1929, 1.1952]). Dual nulls passed (scalar 0.9998, SIMD 1.0002).
+- **Mixed fixture vs live SciPy 1.17.1 ufunc**: 1.0914x WIN (SciPy p50 2123.75 us vs SIMD p50 1892.30 us, bootstrap 95% CI [1.0806, 1.1069]). Dual nulls passed (SIMD 0.9974, SciPy 1.0164).
+Production decision: `KEEP-SIMD`.
+**CHOOSER STATEMENT:** use central SIMD only in ndtri's existing serial middle-size band; central-only evidence never creates a distribution-sensitive public chooser.
+ELF SHA-256: `97187307abe6e2df6cb475844b6f6ee28d603c37ff309003e6677386d1237862`.
+SciPy engine SHA-256: `f30d6a7ba69af4e2a7b5acfbc8e2a55e6f8ba675e9b95e6750257de9f4fd3531`.
+TRJ booking claim: message 41202. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
 ### ✅✅ ndimage: mean(labels,index) parallel privatized-histogram scatter — 2.05× self-speedup at large N (→ 2.16× vs scipy)
 DIFFERENT primitive from the vmap vein: a PARALLEL SEGMENTED REDUCTION. First, a stale-scorecard CORRECTION —
 the GAUNTLET scorecard lists `ndimage.mean(labels,index)` as a 1.5-4.7× LOSS (beads 8l8r1.125/.143/fa62u),
