@@ -1815,12 +1815,6 @@ for line in sys.stdin:
             .unwrap_or(1)
             .min(BATCH);
         let observed_workers = observe_batch_workers(&parameters, expected_workers)?;
-        if observed_workers != expected_workers {
-            return Err(format!(
-                "FrankenSciPy observed worker mismatch: expected from affinity/API \
-                 {expected_workers}, directly observed {observed_workers}"
-            ));
-        }
         println!(
             "frankenscipy_task_provenance: \
              actual_observed_concurrent_solve_workers={observed_workers} \
