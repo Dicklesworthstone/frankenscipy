@@ -1766,7 +1766,21 @@ three ways: (1) result i BYTE-IDENTICAL (.to_bits() on integral/error/converged)
 test green. The vmap-over-solver vein now spans SIX solver families (curve_fit/solve_ivp/minimize/root/quad/
 dblquad); win size tracks scipy's per-solve Python-callback density (dblquad O(n²) ⇒ 211×).
 
-### ✅✅✅ integrate: tplquad_many (vmap-over-solver 3D-integral sweep) — 83-159× faster than looped scipy
+### CONVERTED-CLAIM / DECIDED WIN: integrate: tplquad_many (vmap-over-solver 3D-integral sweep) — 7.08x whole-job win vs strongest live SciPy public arm
+**2026-09-10 conversion verdict (frankenscipy-zkel9):** historical 83-159x looped-SciPy claim converted.
+Re-measured in same invocation on host `threadripperje` under 32-CPU affinity (`taskset -c 0-31`), performance governor,
+against live SciPy 1.17.1 + NumPy 2.4.3 screened across eligible public arms (`tplquad_scalar`, `quad_vec`, `cubature_gk21`, `cubature_genz_malik`, `cubature_workers`).
+Strongest public SciPy arm: `cubature_workers` (vectorized cubature with persistent 32-worker multiprocessing pool, wall p50 14.24 ms vs FrankenSciPy 2.03 ms).
+Incumbent ratio: SciPy / FrankenSciPy = 7.0804x, bootstrap_median_ci95=[6.2836, 7.2863].
+Both same-invocation A/A nulls passed tightly within 2%: ours median 1.0107 (ci95 [0.9904, 1.0384]), SciPy median 0.9981 (ci95 [0.9782, 1.0680]).
+**CHOOSER STATEMENT:** choose FrankenSciPy tplquad_many for this exact 100-parameter unit-cube Gaussian study; durable_frankenscipy_boundary=3x outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=6.283553943 old_83_to_159x_retired=true.
+Decision: `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=true`.
+ELF SHA-256: `addc33ad2c186c53c1066504eb2e10cfe38e3da85fdc4dff58f6e12d5defea38`.
+SciPy engine SHA-256: `40da7e66fa9d6830c5c0520ab5b3f7801da88ebeddb27c8041093240eccf603e`.
+TRJ booking claim: message 41190. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
+The historical text and timings remain below as lab-notebook provenance; they are not admissible competitive evidence:
+
 Seventh vmap-over-solver family — the HEAVIEST-callback case. tplquad nests three adaptive quadratures, so
 each triple integral makes O(n³) integrand calls; in SciPy all Python, and a parameter sweep loops tplquad in
 Python, N integrals SERIALLY. fsci `tplquad_many` (param-sweep `F: Fn(f64 z, f64 y, f64 x, &[f64] params)->f64`,

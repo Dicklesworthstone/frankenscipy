@@ -43804,3 +43804,42 @@ Bead `frankenscipy-44mb8`: converted the historical `dblquad_many` serial-loop c
 2. **Null Gate Verification:** Both A/A null medians are within the required 2% margin (ours 1.0179, SciPy 1.0064; `c1`, `c2`, `c2b`, and `c3` satisfied, `decidable=true`).
 3. **Durable Win:** The lower bound of the 95% bootstrap-median CI (3.4202x) exceeds the durable win boundary of 3.0x (`durable_frankenscipy_win=true`).
 4. **Retired Claim:** The historical looped-SciPy 62.7–211x claim is officially retired in favor of the live-incumbent 3.47x ratio.
+
+## 2026-09-10 — frankenscipy-zkel9 — tplquad_many 83–159× looped claim converted to 7.08× DECIDED WIN vs live SciPy
+
+Bead `frankenscipy-zkel9`: converted the historical `tplquad_many` serial-loop claim into a same-invocation 100-parameter whole-job ratio against live SciPy 1.17.1 under 32-CPU affinity on host `threadripperje`.
+
+### Provenance and Measurement Table
+
+| Metric / Parameter | Value |
+|---|---|
+| harness | `perf_tplquad_many_scipy` (`crates/fsci-integrate/src/bin/perf_tplquad_many_scipy.rs`) |
+| host | `threadripperje` (64 cores / 128 threads, 512 GiB RAM, 1 NUMA) |
+| boot ID | `a1b7d4b2-0459-4272-ad8c-bcc61108ecb8` |
+| affinity | 32 CPUs (`taskset -c 0-31`), CPU governor `performance` |
+| ELF SHA-256 | `addc33ad2c186c53c1066504eb2e10cfe38e3da85fdc4dff58f6e12d5defea38` |
+| source commit | `bc016a3528b809180f90fe21ebec9fb6e1a4f001` |
+| builder | `RubyBeacon` |
+| build route | `rch-exec-base-clean-overlay-no-overlay` |
+| booking claim | message `41190` (verified via `fsci_runtime::booking_claim`) |
+| incumbent | SciPy 1.17.1 + NumPy 2.4.3 (`genuine=True`, `fsci_loaded=False`) |
+| SciPy engine SHA-256 | `40da7e66fa9d6830c5c0520ab5b3f7801da88ebeddb27c8041093240eccf603e` |
+| fixture | 100-parameter unit-cube Gaussian parameter sweep (`p` in [2, 15]) |
+| rounds × reps | 15 × 5 |
+| FrankenSciPy wall | p50 = 2.032 ms, p95 = 2.225 ms, p99 = 2.225 ms |
+| SciPy wall (`cubature_workers`) | p50 = 14.237 ms, p95 = 14.631 ms, p99 = 14.631 ms |
+| A/A null, ours | median 1.0107, ci95 [0.9904, 1.0384] (cv = 4.746%, straddles 1.0) |
+| A/A null, SciPy | median 0.9981, ci95 [0.9782, 1.0680] (cv = 6.638%, straddles 1.0) |
+| incumbent ratio | SciPy / FrankenSciPy = 7.0804x, bootstrap_median_ci95 = [6.2836, 7.2863] (cv = 8.054%) |
+| scientific gate | all 100/100 converged, max scaled reference error 2.3e-7 vs closed form |
+| strongest public arm | `cubature_workers` (vectorized cubature with 32 workers, screened against `tplquad_scalar`, `quad_vec`, `cubature_gk21`, `cubature_genz_malik`) |
+| serial tax removed | 15.36x speedup from SciPy scalar tplquad to SciPy cubature workers |
+| decision | `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=true` |
+| chooser statement | **CHOOSER STATEMENT:** choose FrankenSciPy tplquad_many for this exact 100-parameter unit-cube Gaussian study; durable_frankenscipy_boundary=3x outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=6.283553943 old_83_to_159x_retired=true |
+
+### Observations and Verdict
+
+1. **Certified Campaign Win under Incumbent Gate:** The historical 83–159x looped-SciPy claim is converted to a verified 7.08x whole-job win against the fastest screened SciPy public arm (`cubature_workers`).
+2. **Null Gate Verification:** Both A/A null medians are within the required 2% margin (ours 1.0107, SciPy 0.9981; `c1`, `c2`, `c2b`, and `c3` satisfied, `decidable=true`).
+3. **Durable Win:** The lower bound of the 95% bootstrap-median CI (6.2836x) exceeds the durable win boundary of 3.0x (`durable_frankenscipy_win=true`).
+4. **Retired Claim:** The historical looped-SciPy 83–159x claim is officially retired in favor of the live-incumbent 7.08x ratio.
