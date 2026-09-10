@@ -3969,25 +3969,25 @@ where
             detail: "maxiter must be greater than zero".to_string(),
         });
     }
-    let mut x = x0;
+    let mut p0 = x0;
     for _iter in 0..maxiter {
-        let x_new = f(x);
-        if (x_new - x).abs() < tol {
-            return Ok(x_new);
-        }
-
-        // Steffensen's method acceleration
-        let x_new2 = f(x_new);
-        let denom = x_new2 - 2.0 * x_new + x;
-        if denom.abs() > 1e-30 {
-            let x_acc = x - (x_new - x).powi(2) / denom;
-            if (x_acc - x).abs() < tol {
-                return Ok(x_acc);
-            }
-            x = x_acc;
+        let p1 = f(p0);
+        let p2 = f(p1);
+        let d = p2 - 2.0 * p1 + p0;
+        let p = if d != 0.0 {
+            p0 - (p1 - p0).powi(2) / d
         } else {
-            x = x_new;
+            p2
+        };
+        let relerr = if p0 != 0.0 {
+            (p - p0) / p0
+        } else {
+            p
+        };
+        if relerr.abs() < tol {
+            return Ok(p);
         }
+        p0 = p;
     }
     Err(OptError::InvalidArgument {
         detail: format!("fixed_point did not converge in {maxiter} iterations"),
