@@ -57,7 +57,7 @@ mod expm_bench {
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::sync::atomic::Ordering;
     use std::thread;
     use std::time::{Duration, Instant};

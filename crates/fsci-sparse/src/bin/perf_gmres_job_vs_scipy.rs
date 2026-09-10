@@ -23,7 +23,7 @@ mod bench {
     use std::hint::black_box;
     use std::io::{BufRead, BufReader, Write};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
     use std::time::{Duration, Instant};
 
     /// Submodules the oracle actually uses. A bare `import scipy` can succeed on an

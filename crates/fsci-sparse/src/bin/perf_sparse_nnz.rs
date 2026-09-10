@@ -859,7 +859,7 @@ for raw in sys.stdin:
         println!("live_identity: {identity}");
         if !identity.starts_with("READY ")
             || !identity.contains("scipy=1.17.1")
-            || !identity.contains(&format!("python={PYTHON}"))
+            || !identity.contains(&format!("python={}", incumbent().executable))
             || !identity.contains("affinity=25")
             || !identity.contains("actual_observed_worker_threads=1")
             || !identity.contains("fsci_loaded=False")
