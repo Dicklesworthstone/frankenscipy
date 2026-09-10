@@ -43961,3 +43961,43 @@ Bead `frankenscipy-dw6du`: converted the historical `secant_many` serial-loop 53
 2. **Null Gate Verification:** Both A/A null medians are within the required 2% margin (ours 0.9946, SciPy 0.9876; `c1`, `c2`, `c2b`, and `c3` satisfied, `decidable=true`).
 3. **Chooser Decision:** Because the lower bound of the 95% bootstrap-median CI (1.6661x) is below the durable win boundary of 3.0x, `durable_frankenscipy_win=false`. The chooser selects `array_process` for this exact deployment.
 4. **Retired Claim:** The historical looped-SciPy 536x claim is officially retired in favor of the live-incumbent 1.84x ratio.
+
+## 2026-09-10 — frankenscipy-5e4xq — fixed_point_many 1920× looped claim retired; 2.12× ratio vs live SciPy
+
+Bead `frankenscipy-5e4xq`: converted the historical `fixed_point_many` serial-loop 1920x claim into a same-invocation 65,536-pipe Colebrook friction-factor plus Darcy pressure-loss whole-job ratio against live SciPy 1.17.1 under 32-CPU affinity on host `threadripperje`.
+
+### Provenance and Measurement Table
+
+| Metric / Parameter | Value |
+|---|---|
+| harness | `perf_newton_many_scipy` (`crates/fsci-opt/src/bin/perf_newton_many_scipy.rs`) |
+| host | `threadripperje` (64 cores / 128 threads, 512 GiB RAM, 1 NUMA) |
+| boot ID | `a1b7d4b2-0459-4272-ad8c-bcc61108ecb8` |
+| affinity | 32 CPUs (`taskset -c 0-31`), CPU governor `performance` |
+| ELF SHA-256 | `488386ff4157e0b63804527b72e3573bae1c487e41947592380ff23eef044107` |
+| source commit | `67e04b8fbe394bfe21f46c5a312b331f7d8cc5d6` |
+| builder | `RubyBeacon` |
+| build route | `rch-exec-base-clean-overlay-no-overlay` |
+| booking claim | message `41198` (verified via `fsci_runtime::booking_claim`) |
+| incumbent | SciPy 1.17.1 + NumPy 2.4.3 (`genuine=true`, `fsci_loaded=false`) |
+| SciPy engine SHA-256 | `c6ad455287fc7a8a9a38440dfada1bfe5b371212f27db9e11cfb4abfb70630b7` |
+| solver engine SHA-256 | `cc3cb698d859c5f71276bbedf2a3c49a488d26ecf1d3bbe2db7812c9374bdc46` |
+| numeric engine SHA-256 | `2e0027bba6fda9e61d8e57aa53a1636ede5a6a9fd8ece76b08625d7da1e15d48` |
+| fixture | 65,536-pipe Colebrook friction calibration (`fixture_sha256=2bf3d704db8f73fee2301f792c987ee1cac53bf3c8d1c934e52d9eabce15867f`) |
+| rounds × reps | 15 × 3 |
+| FrankenSciPy wall | p50 = 5.184 ms, p95 = 5.296 ms, p99 = 5.297 ms |
+| SciPy wall (`array_process`) | p50 = 10.946 ms, p95 = 11.922 ms, p99 = 12.175 ms |
+| A/A null, ours | median 1.0027, ci95 [0.9828, 1.0114] (cv = 2.723%, straddles 1.0) |
+| A/A null, SciPy | median 1.0356, ci95 [0.9986, 1.0865] (cv = 7.041%, straddles 1.0) |
+| incumbent ratio | SciPy / FrankenSciPy = 2.1186x, bootstrap_median_ci95 = [2.0766, 2.1662] (cv = 4.967%) |
+| scientific gate | all 65536/65536 converged, max cross-root error 2.78e-17 vs SciPy |
+| strongest public arm | `array_process` (persistent 32-worker multiprocessing pool, screened against `scalar_loop`, `array_single`, `scalar_thread`, `scalar_process`, `array_thread`, `array_process`) |
+| decision | `outcome=NOT DECIDED`, `durable_frankenscipy_win=false` (ratio < 3.0x boundary, SciPy null median 1.0356) |
+| chooser statement | **CHOOSER STATEMENT:** choose array_process for this exact 65,536-pipe Colebrook friction-factor and Darcy pressure-loss report; solver_mode=fixed_point durable_frankenscipy_boundary=3x durable_frankenscipy_win=false outcome=NOT DECIDED ratio_ci_low=2.076630894 old_scalar_loop_claim=1920x retired=true |
+
+### Observations and Verdict
+
+1. **Historical Claim Retired:** The historical 1920x looped-SciPy claim is officially retired in favor of the live whole-job ratio of 2.12x against the fastest screened SciPy public arm (`array_process`).
+2. **Null Gate Verification:** Ours A/A null passed tightly within the 2% margin (median 1.0027). SciPy A/A null median was 1.0356 due to inter-process worker pool jitter in Python (`c3` not satisfied, `outcome=NOT DECIDED`).
+3. **Chooser Decision:** Because the lower bound of the 95% bootstrap-median CI (2.0766x) is below the durable win boundary of 3.0x, `durable_frankenscipy_win=false`. The chooser selects `array_process` for this exact deployment.
+

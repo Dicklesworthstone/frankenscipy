@@ -1843,6 +1843,21 @@ TRJ booking claim: message 41196. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
 
 The historical scalar-loop 536x claim is retired.
 
+### CONVERTED-CLAIM / RETIRED: opt: fixed_point_many (vmap-over-solver Colebrook hydraulic sweep) — historical 1920x claim retired; live SciPy 1.17.1 whole-job chooser ratio 2.12x
+**2026-09-10 conversion verdict (frankenscipy-5e4xq):** historical 1920x looped-SciPy claim retired.
+Re-measured in same invocation on host `threadripperje` under 32-CPU affinity (`taskset -c 0-31`), performance governor,
+against live SciPy 1.17.1 + NumPy 2.4.3 screened across eligible public arms (`scalar_loop`, `array_single`, `scalar_thread`, `scalar_process`, `array_thread`, `array_process`).
+Strongest public SciPy arm: `array_process` (persistent 32-worker multiprocessing pool, wall p50 10.95 ms vs FrankenSciPy 5.18 ms).
+Incumbent ratio: SciPy / FrankenSciPy = 2.1186x, bootstrap_median_ci95=[2.0766, 2.1662].
+Due to inter-process worker pool jitter in Python, SciPy A/A null was 1.0356 ci95=[0.9986, 1.0865] (outcome=NOT DECIDED against strict 2% gate; ours passed at median 1.0027, ci95=[0.9828, 1.0114]).
+**CHOOSER STATEMENT:** choose array_process for this exact 65,536-pipe Colebrook friction-factor and Darcy pressure-loss report; solver_mode=fixed_point durable_frankenscipy_boundary=3x durable_frankenscipy_win=false outcome=NOT DECIDED ratio_ci_low=2.076630894 old_scalar_loop_claim=1920x retired=true.
+Decision: `outcome=NOT DECIDED`, `durable_frankenscipy_win=false` (ratio < 3.0x boundary, SciPy null median 1.0356).
+ELF SHA-256: `488386ff4157e0b63804527b72e3573bae1c487e41947592380ff23eef044107`.
+SciPy engine SHA-256: `c6ad455287fc7a8a9a38440dfada1bfe5b371212f27db9e11cfb4abfb70630b7`.
+TRJ booking claim: message 41198. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
+The historical scalar-loop 1920x claim is retired.
+
 ### ✅✅ ndimage: mean(labels,index) parallel privatized-histogram scatter — 2.05× self-speedup at large N (→ 2.16× vs scipy)
 DIFFERENT primitive from the vmap vein: a PARALLEL SEGMENTED REDUCTION. First, a stale-scorecard CORRECTION —
 the GAUNTLET scorecard lists `ndimage.mean(labels,index)` as a 1.5-4.7× LOSS (beads 8l8r1.125/.143/fa62u),
