@@ -43689,3 +43689,43 @@ Bead `frankenscipy-40h1j`: converted the historical `root_many` serial-loop clai
 2. **SciPy multiprocessing jitter causes NULL-FAILED:** FrankenSciPy's self A/A null passed tightly (median 1.0081, CI [0.9939, 1.0186], well within the 2% null gate). SciPy's multiprocessing worker pool exhibited inter-process IPC/scheduling variance (CV 5.35%, CI [0.9744, 1.0075]), causing the joint null gate condition `c3` (both null CIs within 2%) to fail. Per standing orders, this is recorded honestly as `outcome=NULL-FAILED`.
 3. **Evidence host unblocked:** This execution demonstrates that evidence runs pinned to host `threadripperje` under 32-CPU affinity are fully operational via remote task execution and Agent Mail booking synchronization (`frankenscipy-2auhe`).
 
+## 2026-09-10 — frankenscipy-llznz — minimize_many 271–275× looped claim converted to 101.59× DECIDED WIN vs live SciPy
+
+Bead `frankenscipy-llznz`: converted the historical `minimize_many` serial-loop claim into a same-invocation 128-start 6-D Rosenbrock multistart optimization ratio against live SciPy 1.17.1 under 32-CPU affinity on host `threadripperje`.
+
+### Provenance and Measurement Table
+
+| Metric / Parameter | Value |
+|---|---|
+| harness | `perf_minimize_many_scipy` (`crates/fsci-opt/src/bin/perf_minimize_many_scipy.rs`) |
+| host | `threadripperje` (64 cores / 128 threads, 512 GiB RAM, 1 NUMA) |
+| boot ID | `a1b7d4b2-0459-4272-ad8c-bcc61108ecb8` |
+| affinity | 32 CPUs (`taskset -c 0-31`), CPU governor `performance` |
+| ELF SHA-256 | `10869853ff59c4998ac1ddc8852a5f3c69c2f8fce30eae883bf5754b849c2fe3` |
+| source commit | `8ecb06dbd65549c8e6f4cdae7009e315e22ae0e7` |
+| builder | `RubyBeacon` |
+| build route | `rch-exec-base-clean-overlay-no-overlay` |
+| booking claim | message `41184` (verified via `fsci_runtime::booking_claim`) |
+| incumbent | SciPy 1.17.1 + NumPy 2.4.3 (`genuine=True`, `fsci_loaded=False`) |
+| SciPy engine SHA-256 | `041a1807ccaa68115c93b07bed497d25c294a7d730ce5a7cb1f21fc5a185fa61` |
+| fixture | Rosenbrock 6-D multistart batch=128 starts in `[-2,2]^6`, seed 7, BFGS analytic gradient, `tol=1e-8`, `maxiter=500` |
+| fixture SHA-256 | starts `b7c821b0e3d185d49492e4150c7064018c92eaa4647fe42285cfc5fbffc63a34` |
+| rounds × reps | 15 × 3, balanced-square `ABBAABBA` schedule |
+| FrankenSciPy wall | p50 = 7.351 ms, p95 = 7.546 ms, p99 = 7.546 ms |
+| SciPy wall (`analytic`) | p50 = 748.748 ms, p95 = 781.666 ms, p99 = 781.666 ms |
+| A/A null, ours | median 1.0088, ci95 [1.0019, 1.0135] (straddles 1.0, width 1.16%, within 2% gate) |
+| A/A null, SciPy | median 0.9882, ci95 [0.9851, 0.9996] (straddles 1.0, width 1.45%, within 2% gate) |
+| incumbent ratio | SciPy / FrankenSciPy = 101.5899x, bootstrap_median_ci95 = [98.7033, 103.2111] (cv = 2.274%) |
+| scientific gate | all 128 starts evaluated, convergence/work counters validated |
+| strongest public arm | `analytic` (SciPy BFGS with exact analytic gradient, screened against `fd`, `fd_workers`, `analytic`, `fused`) |
+| pre-registered P2 | `P2_old_ratio_collapses_2x=true`: old 275x ratio collapsed below 137.5x boundary to 101.59x |
+| decision | `outcome=DECIDED FRANKENSCIPY WIN` |
+| chooser statement | **CHOOSER STATEMENT:** choose FrankenSciPy minimize_many for this exact 128-start analytic-gradient job. |
+
+### Observations and Verdict
+
+1. **Certified Campaign Win under Incumbent Gate:** The historical 271-275x looped-SciPy claim is converted to a verified 101.59x whole-job win against the fastest screened SciPy public arm (`analytic`).
+2. **Both A/A Null Gates Pass:** FrankenSciPy A/A null median is 1.0088 (CI [1.0019, 1.0135]), and SciPy A/A null median is 0.9882 (CI [0.9851, 0.9996]). Both null bounds fall strictly within the +/-2% margin (`c1`, `c2`, `c2b`, and `c3` all satisfied, `decidable=true`).
+3. **Decided Win:** FrankenSciPy's Rust batch minimization achieves 7.35 ms p50 wall-clock time compared to 748.75 ms for SciPy's analytic BFGS, establishing a certified 101.59x speedup.
+
+

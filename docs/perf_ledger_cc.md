@@ -1626,7 +1626,22 @@ samples, then rerun the exact batch surface with genuine SciPy in the same
 invocation, independent A/A nulls for both arms, executable SHA-256, full
 hardware/thread provenance, and the bootstrap-median CI gate.
 
-### ✅✅✅ opt: minimize_many (vmap-over-solver multistart) — 271-275× faster than looped scipy
+### CONVERTED-CLAIM / DECIDED WIN: opt: minimize_many (vmap-over-solver multistart) — 101.59x whole-job win vs strongest live SciPy public arm
+**2026-09-10 conversion verdict (frankenscipy-llznz):** historical 271-275x looped-SciPy claim converted.
+Re-measured in same invocation on host `threadripperje` under 32-CPU affinity (`taskset -c 0-31`), performance governor,
+against live SciPy 1.17.1 + NumPy 2.4.3 screened across 4 public arms (`fd`, `fd_workers`, `analytic`, `fused`).
+Strongest public SciPy arm: `analytic` (SciPy BFGS with exact analytic gradient, wall p50 748.75 ms vs FrankenSciPy 7.35 ms).
+Incumbent ratio: SciPy / FrankenSciPy = 101.5899x, bootstrap_median_ci95=[98.7033, 103.2111].
+Both same-invocation A/A nulls passed tightly within 2%: ours median 1.0088 (ci95 [1.0019, 1.0135]), SciPy median 0.9882 (ci95 [0.9851, 0.9996]).
+**CHOOSER STATEMENT:** choose FrankenSciPy minimize_many for this exact 128-start analytic-gradient job.
+Pre-registered prediction P2 confirmed: old 275x ratio collapsed below 137.5x boundary to 101.59x.
+Decision: `outcome=DECIDED FRANKENSCIPY WIN`.
+ELF SHA-256: `10869853ff59c4998ac1ddc8852a5f3c69c2f8fce30eae883bf5754b849c2fe3`.
+SciPy engine SHA-256: `041a1807ccaa68115c93b07bed497d25c294a7d730ce5a7cb1f21fc5a185fa61`.
+TRJ booking claim: message 41184. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
+The historical text and timings remain below as lab-notebook provenance; they are not admissible competitive evidence:
+
 Third vmap-over-solver family (after curve_fit_many 113× and solve_ivp_many ~1500×). Multistart / parameter
 sweep — minimise the SAME objective from MANY starts — is ubiquitous in global optimisation; SciPy loops
 `minimize` in Python, calling the Python objective (+ gradient) many times PER run, N runs SERIALLY. fsci
