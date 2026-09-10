@@ -1697,7 +1697,21 @@ system was discarded as invalid since neither library converged there). CONFORMA
 BYTE-IDENTICAL (.to_bits() on x and fun) to per-param root; fsci-opt root_many test green (byte-id + ≥half
 converge). vmap-over-solver vein now spans 4 solver families.
 
-### ✅✅✅ integrate: quad_many (vmap-over-solver definite-integral sweep) — 14.5-61× faster than looped scipy
+### CONVERTED-CLAIM / DECIDED WIN: integrate: quad_many (vmap-over-solver definite-integral sweep) — 5.78x whole-job win vs strongest live SciPy public arm
+**2026-09-10 conversion verdict (frankenscipy-afz21):** historical 14.5-61x looped-SciPy claim converted.
+Re-measured in same invocation on host `threadripperje` under 32-CPU affinity (`taskset -c 0-31`), performance governor,
+against live SciPy 1.17.1 + NumPy 2.4.3 screened across eligible public arms (`quad_scalar`, `quad_thread`, `quad_process`, `quad_vec`, `quad_vec_process`, `cubature_gk21`).
+Strongest public SciPy arm: `quad_process` (persistent 32-worker multiprocessing pool, wall p50 7.64 ms vs FrankenSciPy 1.32 ms).
+Incumbent ratio: SciPy / FrankenSciPy = 5.7842x, bootstrap_median_ci95=[5.6509, 5.9408].
+Both same-invocation A/A nulls passed tightly within 2%: ours median 1.0151 (ci95 [0.9629, 1.0448]), SciPy median 1.0017 (ci95 [0.9822, 1.0230]).
+**CHOOSER STATEMENT:** choose FrankenSciPy quad_many for this exact 2,048-member damped-frequency-response study; durable_frankenscipy_boundary=3x durable_frankenscipy_win=true outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=5.650871413 old_14_5_to_61_1x_retired=true.
+Decision: `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=true`.
+ELF SHA-256: `2dd4e6e92d0fda6ac5b67cad11ec4906d45556ed68b2148e5757f57f9f559a19`.
+SciPy engine SHA-256: `eedca55e84d96fe3e1f6c4e569ab5e1e9797cf7f2aa950974d9a8a139b415fa7`.
+TRJ booking claim: message 41186. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
+The historical text and timings remain below as lab-notebook provenance; they are not admissible competitive evidence:
+
 Fifth vmap-over-solver family (curve_fit / solve_ivp / minimize / root / quad). A definite-integral sweep —
 `I(params) = ∫_a^b f(x, params) dx` for many parameter sets — is common (a family of moments / partition
 functions / marginalisations); SciPy loops `quad` in Python, calling the Python integrand adaptively per

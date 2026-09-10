@@ -43728,4 +43728,43 @@ Bead `frankenscipy-llznz`: converted the historical `minimize_many` serial-loop 
 2. **Both A/A Null Gates Pass:** FrankenSciPy A/A null median is 1.0088 (CI [1.0019, 1.0135]), and SciPy A/A null median is 0.9882 (CI [0.9851, 0.9996]). Both null bounds fall strictly within the +/-2% margin (`c1`, `c2`, `c2b`, and `c3` all satisfied, `decidable=true`).
 3. **Decided Win:** FrankenSciPy's Rust batch minimization achieves 7.35 ms p50 wall-clock time compared to 748.75 ms for SciPy's analytic BFGS, establishing a certified 101.59x speedup.
 
+## 2026-09-10 — frankenscipy-afz21 — quad_many 14.5–61× looped claim converted to 5.78× DECIDED WIN vs live SciPy
+
+Bead `frankenscipy-afz21`: converted the historical `quad_many` serial-loop claim into a same-invocation 2,048-member damped-frequency-response parameter-sweep ratio against live SciPy 1.17.1 under 32-CPU affinity on host `threadripperje`.
+
+### Provenance and Measurement Table
+
+| Metric / Parameter | Value |
+|---|---|
+| harness | `perf_quad_many_scipy` (`crates/fsci-integrate/src/bin/perf_quad_many_scipy.rs`) |
+| host | `threadripperje` (64 cores / 128 threads, 512 GiB RAM, 1 NUMA) |
+| boot ID | `a1b7d4b2-0459-4272-ad8c-bcc61108ecb8` |
+| affinity | 32 CPUs (`taskset -c 0-31`), CPU governor `performance` |
+| ELF SHA-256 | `2dd4e6e92d0fda6ac5b67cad11ec4906d45556ed68b2148e5757f57f9f559a19` |
+| source commit | `fec5343677daea9f6c299bdb632c6e227e13a08c` |
+| builder | `RubyBeacon` |
+| build route | `rch-exec-base-clean-overlay-no-overlay` |
+| booking claim | message `41186` (verified via `fsci_runtime::booking_claim`) |
+| incumbent | SciPy 1.17.1 + NumPy 2.4.3 (`genuine=True`, `fsci_loaded=False`) |
+| SciPy engine SHA-256 | `eedca55e84d96fe3e1f6c4e569ab5e1e9797cf7f2aa950974d9a8a139b415fa7` |
+| fixture | 2,048-member damped-frequency-response study |
+| rounds × reps | 15 × 3, balanced-square `ABBAABBA` schedule |
+| FrankenSciPy wall | p50 = 1.321 ms, p95 = 1.442 ms, p99 = 1.442 ms |
+| SciPy wall (`quad_process`) | p50 = 7.642 ms, p95 = 7.907 ms, p99 = 7.907 ms |
+| A/A null, ours | median 1.0151, ci95 [0.9629, 1.0448] (cv = 5.48%, straddles 1.0) |
+| A/A null, SciPy | median 1.0017, ci95 [0.9822, 1.0230] (cv = 7.18%, straddles 1.0) |
+| incumbent ratio | SciPy / FrankenSciPy = 5.7842x, bootstrap_median_ci95 = [5.6509, 5.9408] (cv = 4.929%) |
+| scientific gate | all 2,048/2,048 converged, max cross-scaled error 5.2e-8 vs SciPy |
+| strongest public arm | `quad_process` (persistent 32-worker multiprocessing pool, screened against `quad_scalar`, `quad_thread`, `quad_process`, `quad_vec`, `quad_vec_process`, `cubature_gk21`) |
+| serial tax removed | 3.89x speedup from SciPy scalar quad to SciPy multiprocessing pool |
+| decision | `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=true` |
+| chooser statement | **CHOOSER STATEMENT:** choose FrankenSciPy quad_many for this exact 2,048-member damped-frequency-response study; durable_frankenscipy_boundary=3x durable_frankenscipy_win=true outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=5.650871413 old_14_5_to_61_1x_retired=true |
+
+### Observations and Verdict
+
+1. **Certified Campaign Win under Incumbent Gate:** The historical 14.5–61.1x looped-SciPy claim is converted to a verified 5.78x whole-job win against the fastest screened SciPy public arm (`quad_process`).
+2. **Null Gate Verification:** Both A/A null medians are within the required 2% margin (ours 1.0151, SciPy 1.0017; `c1`, `c2`, `c2b`, and `c3` satisfied, `decidable=true`).
+3. **Durable Win:** The lower bound of the 95% bootstrap-median CI (5.65x) exceeds the durable win boundary of 3.0x (`durable_frankenscipy_win=true`).
+
+
 
