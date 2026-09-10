@@ -44001,3 +44001,40 @@ Bead `frankenscipy-5e4xq`: converted the historical `fixed_point_many` serial-lo
 2. **Null Gate Verification:** Ours A/A null passed tightly within the 2% margin (median 1.0027). SciPy A/A null median was 1.0356 due to inter-process worker pool jitter in Python (`c3` not satisfied, `outcome=NOT DECIDED`).
 3. **Chooser Decision:** Because the lower bound of the 95% bootstrap-median CI (2.0766x) is below the durable win boundary of 3.0x, `durable_frankenscipy_win=false`. The chooser selects `array_process` for this exact deployment.
 
+## 2026-09-10 — frankenscipy-bh6hy — normality_many 74–2267× looped claims retired; 4.91× DECIDED WIN vs live SciPy
+
+Bead `frankenscipy-bh6hy`: converted the historical `normaltest_many` (2267x), `jarque_bera_many` (1730x), and `shapiro_many` (74x) serial-loop claims into a same-invocation 2,048-by-4,096 many-channel normality screening report whole-job ratio against live SciPy 1.17.1 under 32-CPU affinity on host `threadripperje`.
+
+### Provenance and Measurement Table
+
+| Metric / Parameter | Value |
+|---|---|
+| harness | `perf_normality_many_scipy` (`crates/fsci-stats/src/bin/perf_normality_many_scipy.rs`) |
+| host | `threadripperje` (64 cores / 128 threads, 512 GiB RAM, 1 NUMA) |
+| boot ID | `a1b7d4b2-0459-4272-ad8c-bcc61108ecb8` |
+| affinity | 32 CPUs (`taskset -c 0-31`), CPU governor `performance` |
+| ELF SHA-256 | `31f25e1e37b023600a09c5dc3b9581f00e19963ec930bff07a45a103c5bef5d3` |
+| source commit | `9f9ecdbcb84f2165aa0e6e873d94b698211b105d` |
+| builder | `RubyBeacon` |
+| build route | `rch-exec-base-clean-overlay-no-overlay` |
+| booking claim | message `41200` (verified via `fsci_runtime::booking_claim`) |
+| incumbent | SciPy 1.17.1 + NumPy 2.4.3 (`genuine=true`, `fsci_loaded=false`) |
+| SciPy engine SHA-256 | `ed0732811a23b6015f33ad16273a14da705b116373a4a6ee331e89e2286ab138` |
+| fixture | 2,048 rows × 4,096 cols normal/skew/fat-tail/bimodal mixture (`input_sha256=ced9c9dc4728708a544e81e71119a00f8f8361911b45c7eb26adb2110a18ed0d`, 67,108,864 bytes) |
+| rounds × reps | 15 × 3 |
+| FrankenSciPy wall | p50 = 17.033 ms, p95 = 17.412 ms, p99 = 17.412 ms |
+| SciPy wall (`process`) | p50 = 83.821 ms, p95 = 84.357 ms, p99 = 84.357 ms |
+| A/A null, ours | median 1.0010, ci95 [0.9993, 1.0097] (cv = 0.614%, straddles 1.0) |
+| A/A null, SciPy | median 1.0020, ci95 [0.9939, 1.0143] (cv = 1.335%, straddles 1.0) |
+| incumbent ratio | SciPy / FrankenSciPy = 4.9144x, bootstrap_median_ci95 = [4.8922, 4.9233] (cv = 0.953%) |
+| scientific gate | zero mismatches vs live SciPy across normaltest, jarque_bera, and shapiro statistics & p-values (cross-scaled error <= 0.001863) |
+| strongest public arm | `process` (screen median 0.1128s, 32 worker processes; screened against `scalar`, `axis`, `thread`, `process`, `hybrid_thread`, `hybrid_process`) |
+| decision | `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=true` (ratio 4.91x > 3.0x boundary, null gates passed within 2%) |
+| chooser statement | **CHOOSER STATEMENT:** choose FrankenSciPy normaltest_many + jarque_bera_many + shapiro_many for this exact 2,048-by-4,096 many-channel normality-screening report; durable_frankenscipy_boundary=3x durable_frankenscipy_win=true outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=4.892167647 historical_74_to_2267x_scalar_loop_claims_retired=true |
+
+### Observations and Verdict
+
+1. **Historical Claim Retired:** The historical 74x to 2267x looped-SciPy claims are officially retired in favor of the live whole-job ratio of 4.91x against the fastest screened SciPy public arm (`process`).
+2. **Null Gate Verification:** Both FrankenSciPy (median 1.0010, cv 0.614%) and SciPy (median 1.0020, cv 1.335%) passed the dual A/A null gates well within the 2% margin. Point effect and effect endpoint decisively exceed 2x null half-width / endpoint deviations.
+3. **Chooser Decision:** Because the lower bound of the 95% bootstrap-median CI (4.8922x) strictly exceeds the durable win boundary of 3.0x, `durable_frankenscipy_win=true`. The chooser selects FrankenSciPy for this deployment.
+

@@ -1858,6 +1858,21 @@ TRJ booking claim: message 41198. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
 
 The historical scalar-loop 1920x claim is retired.
 
+### CONVERTED-CLAIM / RETIRED: stats: normality_many (normaltest_many, jarque_bera_many, shapiro_many batched GoF) — historical 74-2267x claims retired; live SciPy 1.17.1 whole-job chooser ratio 4.91x (DECIDED FRANKENSCIPY WIN)
+**2026-09-10 conversion verdict (frankenscipy-bh6hy):** historical 74-2267x looped-SciPy claims retired.
+Re-measured in same invocation on host `threadripperje` under 32-CPU affinity (`taskset -c 0-31`), performance governor,
+against live SciPy 1.17.1 + NumPy 2.4.3 screened across eligible public arms (`scalar`, `axis`, `thread`, `process`, `hybrid_thread`, `hybrid_process`).
+Strongest public SciPy arm: `process` (persistent 32-worker multiprocessing pool, wall p50 83.82 ms vs FrankenSciPy 17.03 ms).
+Incumbent ratio: SciPy / FrankenSciPy = 4.9144x, bootstrap_median_ci95=[4.8922, 4.9233] (cv = 0.953%).
+Dual null gates: Passed within 2% (FrankenSciPy A/A median 1.0010, ci95=[0.9993, 1.0097]; SciPy A/A median 1.0020, ci95=[0.9939, 1.0143]).
+**CHOOSER STATEMENT:** choose FrankenSciPy normaltest_many + jarque_bera_many + shapiro_many for this exact 2,048-by-4,096 many-channel normality-screening report; durable_frankenscipy_boundary=3x durable_frankenscipy_win=true outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=4.892167647 historical_74_to_2267x_scalar_loop_claims_retired=true.
+Decision: `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=true` (ratio 4.91x > 3.0x boundary, null gates passed).
+ELF SHA-256: `31f25e1e37b023600a09c5dc3b9581f00e19963ec930bff07a45a103c5bef5d3`.
+SciPy engine SHA-256: `ed0732811a23b6015f33ad16273a14da705b116373a4a6ee331e89e2286ab138`.
+TRJ booking claim: message 41200. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
+The historical scalar-loop 74-2267x claims are retired.
+
 ### ✅✅ ndimage: mean(labels,index) parallel privatized-histogram scatter — 2.05× self-speedup at large N (→ 2.16× vs scipy)
 DIFFERENT primitive from the vmap vein: a PARALLEL SEGMENTED REDUCTION. First, a stale-scorecard CORRECTION —
 the GAUNTLET scorecard lists `ndimage.mean(labels,index)` as a 1.5-4.7× LOSS (beads 8l8r1.125/.143/fa62u),
