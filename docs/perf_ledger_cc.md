@@ -1567,7 +1567,21 @@ trf, same as lmfit). fsci-opt curvefit suite 15/15 green incl. 2 new bounded tes
 for a tightly-active bound the transform reaches it asymptotically rather than exactly; for interior optima
 (the common "sanity bounds" case) it is identical to trf and ~10× faster.
 
-### ✅✅✅ opt: curve_fit_many / curve_fit_bounded_many — vmap-over-solver, 33-113× faster than looped scipy
+### CONVERTED-CLAIM / DECIDED WIN: opt: curve_fit_many / curve_fit_bounded_many (vmap-over-solver) — 145.1x whole-job win vs strongest live SciPy public arm
+**2026-09-10 conversion verdict (frankenscipy-tskpy):** historical 33-113x looped-SciPy claim converted.
+Re-measured in same invocation on host `threadripperje` under 32-CPU affinity (`taskset -c 0-31`), performance governor,
+against live SciPy 1.17.1 + NumPy 2.4.3 screened across eligible public arms (`curve_fit_numeric_scalar`, `curve_fit_numeric_pool`, `curve_fit_jac_scalar`, `curve_fit_jac_pool`, `joint_sparse`).
+Strongest public SciPy arm: `joint_sparse` (whole-study joint sparse least squares, wall p50 633.26 ms vs FrankenSciPy 4.38 ms).
+Incumbent ratio: SciPy / FrankenSciPy = 145.1035x, bootstrap_median_ci95=[135.7270, 150.8282].
+Both same-invocation A/A nulls passed tightly within 2%: ours median 1.0058 (ci95 [0.9580, 1.0457]), SciPy median 1.0057 (ci95 [0.9981, 1.0132]).
+**CHOOSER STATEMENT:** choose FrankenSciPy curve_fit_many for this exact 2,000-trace exponential-decay fitting study; durable_frankenscipy_boundary=3x outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=135.727024277 old_113x_self_speedup_retired=true.
+Decision: `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=true`.
+ELF SHA-256: `13402ee5b3ec1ebec738af5cbe67bc88a3ed3d3979d7e9a8b83e3889ef6e3076`.
+SciPy engine SHA-256: `2ffc25251e0f6e91210362c89ab3335eb51e27e03499f52c5b06aa6ec13cc293`.
+TRJ booking claim: message 41192. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
+The historical text and timings remain below as lab-notebook provenance; they are not admissible competitive evidence:
+
 The JAX-style "different primitive": fit the same model to MANY independent ydata rows. SciPy has no batched
 curve_fit — you loop it in Python, paying the per-call overhead N times SERIALLY. fsci `curve_fit_many` fans
 the N independent fits across cores AND inlines the model as a Rust closure (callback lever × N-way parallel).

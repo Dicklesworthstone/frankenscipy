@@ -43843,3 +43843,41 @@ Bead `frankenscipy-zkel9`: converted the historical `tplquad_many` serial-loop c
 2. **Null Gate Verification:** Both A/A null medians are within the required 2% margin (ours 1.0107, SciPy 0.9981; `c1`, `c2`, `c2b`, and `c3` satisfied, `decidable=true`).
 3. **Durable Win:** The lower bound of the 95% bootstrap-median CI (6.2836x) exceeds the durable win boundary of 3.0x (`durable_frankenscipy_win=true`).
 4. **Retired Claim:** The historical looped-SciPy 83–159x claim is officially retired in favor of the live-incumbent 7.08x ratio.
+
+## 2026-09-10 — frankenscipy-tskpy — curve_fit_many 33–113× looped claim converted to 145.1× DECIDED WIN vs live SciPy
+
+Bead `frankenscipy-tskpy`: converted the historical `curve_fit_many` serial-loop claim into a same-invocation 2,000-trace exponential-decay whole-job ratio against live SciPy 1.17.1 under 32-CPU affinity on host `threadripperje`.
+
+### Provenance and Measurement Table
+
+| Metric / Parameter | Value |
+|---|---|
+| harness | `perf_curve_fit_many_scipy` (`crates/fsci-opt/src/bin/perf_curve_fit_many_scipy.rs`) |
+| host | `threadripperje` (64 cores / 128 threads, 512 GiB RAM, 1 NUMA) |
+| boot ID | `a1b7d4b2-0459-4272-ad8c-bcc61108ecb8` |
+| affinity | 32 CPUs (`taskset -c 0-31`), CPU governor `performance` |
+| ELF SHA-256 | `13402ee5b3ec1ebec738af5cbe67bc88a3ed3d3979d7e9a8b83e3889ef6e3076` |
+| source commit | `a462fbbe5b54c1d5868abf0cd25b33f9c3f5a8b9` |
+| builder | `RubyBeacon` |
+| build route | `rch-exec-base-clean-overlay-no-overlay` |
+| booking claim | message `41192` (verified via `fsci_runtime::booking_claim`) |
+| incumbent | SciPy 1.17.1 + NumPy 2.4.3 (`genuine=True`, `fsci_loaded=False`) |
+| SciPy engine SHA-256 | `2ffc25251e0f6e91210362c89ab3335eb51e27e03499f52c5b06aa6ec13cc293` |
+| fixture | 2,000-trace exponential-decay fitting study (`BATCH=2000, POINTS=80`) |
+| rounds × reps | 15 × 5 |
+| FrankenSciPy wall | p50 = 4.385 ms, p95 = 6.580 ms, p99 = 6.580 ms |
+| SciPy wall (`joint_sparse`) | p50 = 633.261 ms, p95 = 644.690 ms, p99 = 644.690 ms |
+| A/A null, ours | median 1.0058, ci95 [0.9580, 1.0457] (cv = 6.983%, straddles 1.0) |
+| A/A null, SciPy | median 1.0057, ci95 [0.9981, 1.0132] (cv = 1.137%, straddles 1.0) |
+| incumbent ratio | SciPy / FrankenSciPy = 145.1035x, bootstrap_median_ci95 = [135.7270, 150.8282] (cv = 14.889%) |
+| scientific gate | all 2000/2000 converged, max cross-curve RMSE 9.05e-6 vs SciPy |
+| strongest public arm | `joint_sparse` (whole-study joint sparse least squares, screened against `curve_fit_numeric_scalar`, `curve_fit_numeric_pool`, `curve_fit_jac_scalar`, `curve_fit_jac_pool`, `joint_sparse`) |
+| decision | `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=true` |
+| chooser statement | **CHOOSER STATEMENT:** choose FrankenSciPy curve_fit_many for this exact 2,000-trace exponential-decay fitting study; durable_frankenscipy_boundary=3x outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=135.727024277 old_113x_self_speedup_retired=true |
+
+### Observations and Verdict
+
+1. **Certified Campaign Win under Incumbent Gate:** The historical 33–113x looped-SciPy claim is converted to a verified 145.1x whole-job win against the fastest screened SciPy public arm (`joint_sparse`).
+2. **Null Gate Verification:** Both A/A null medians are within the required 2% margin (ours 1.0058, SciPy 1.0057; `c1`, `c2`, `c2b`, and `c3` satisfied, `decidable=true`).
+3. **Durable Win:** The lower bound of the 95% bootstrap-median CI (135.73x) far exceeds the durable win boundary of 3.0x (`durable_frankenscipy_win=true`).
+4. **Retired Claim:** The historical looped-SciPy 33–113x claim is officially retired in favor of the live-incumbent 145.1x ratio.
