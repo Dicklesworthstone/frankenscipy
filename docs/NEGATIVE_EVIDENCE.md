@@ -43922,3 +43922,42 @@ Bead `frankenscipy-9nzg9`: converted the historical `newton_many` serial-loop 49
 3. **Chooser Decision:** Because the lower bound of the 95% bootstrap-median CI (1.9692x) is below the durable win boundary of 3.0x, `durable_frankenscipy_win=false`. The chooser selects `array_process` for this exact deployment.
 4. **Retired Claim:** The historical looped-SciPy 495–986x claim is officially retired in favor of the live-incumbent 1.99x ratio.
 
+## 2026-09-10 — frankenscipy-dw6du — secant_many 536× looped claim converted to 1.84× DECIDED WIN vs live SciPy
+
+Bead `frankenscipy-dw6du`: converted the historical `secant_many` serial-loop 536x claim into a same-invocation 65,536-contract derivative-free implied-volatility calibration whole-job ratio against live SciPy 1.17.1 under 32-CPU affinity on host `threadripperje`.
+
+### Provenance and Measurement Table
+
+| Metric / Parameter | Value |
+|---|---|
+| harness | `perf_newton_many_scipy` (`crates/fsci-opt/src/bin/perf_newton_many_scipy.rs`) |
+| host | `threadripperje` (64 cores / 128 threads, 512 GiB RAM, 1 NUMA) |
+| boot ID | `a1b7d4b2-0459-4272-ad8c-bcc61108ecb8` |
+| affinity | 32 CPUs (`taskset -c 0-31`), CPU governor `performance` |
+| ELF SHA-256 | `6b1829ff28cc723b6ac59ca313fc682831ac20a2f44be92d183dfa8c8f275b6d` |
+| source commit | `60cfd8e305978e52f14aa85122b0a66097b5119a` |
+| builder | `RubyBeacon` |
+| build route | `rch-exec-base-clean-overlay-no-overlay` |
+| booking claim | message `41196` (verified via `fsci_runtime::booking_claim`) |
+| incumbent | SciPy 1.17.1 + NumPy 2.4.3 (`genuine=true`, `fsci_loaded=false`) |
+| SciPy engine SHA-256 | `686488a1e10da03baac124f8d73b5b590d23ce76adbdf0347d8c572c01c264b2` |
+| solver engine SHA-256 | `14f88f1080985eae0af84bb5952da5b994ab2043e7fe5b0c8603839475391161` |
+| numeric engine SHA-256 | `f30d6a7ba69af4e2a7b5acfbc8e2a55e6f8ba675e9b95e6750257de9f4fd3531` |
+| fixture | 65,536-contract implied-volatility calibration (`fixture_sha256=cefb608a8ed640c6ac46e8ea2ed69eba4214b691661b126aba5f058e7e61107d`) |
+| rounds × reps | 15 × 3 |
+| FrankenSciPy wall | p50 = 7.730 ms, p95 = 8.275 ms, p99 = 8.276 ms |
+| SciPy wall (`array_process`) | p50 = 14.371 ms, p95 = 16.191 ms, p99 = 16.475 ms |
+| A/A null, ours | median 0.9946, ci95 [0.9676, 1.0165] (cv = 3.925%, straddles 1.0) |
+| A/A null, SciPy | median 0.9876, ci95 [0.9605, 1.0431] (cv = 7.991%, straddles 1.0) |
+| incumbent ratio | SciPy / FrankenSciPy = 1.8399x, bootstrap_median_ci95 = [1.6661, 1.9382] (cv = 10.348%) |
+| scientific gate | all 65536/65536 converged, max cross-root error 2.26e-11 vs SciPy |
+| strongest public arm | `array_process` (persistent 32-worker multiprocessing pool, screened against `scalar_loop`, `array_single`, `scalar_thread`, `scalar_process`, `array_thread`, `array_process`) |
+| decision | `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=false` (ratio < 3.0x boundary) |
+| chooser statement | **CHOOSER STATEMENT:** choose array_process for this exact 65,536-contract derivative-free implied-volatility calibration and risk report; solver_mode=secant durable_frankenscipy_boundary=3x durable_frankenscipy_win=false outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=1.666108243 old_scalar_loop_claim=536x retired=true |
+
+### Observations and Verdict
+
+1. **Certified Decided Win under Incumbent Gate:** The historical 536x looped-SciPy claim is converted to a verified 1.84x whole-job win against the fastest screened SciPy public arm (`array_process`).
+2. **Null Gate Verification:** Both A/A null medians are within the required 2% margin (ours 0.9946, SciPy 0.9876; `c1`, `c2`, `c2b`, and `c3` satisfied, `decidable=true`).
+3. **Chooser Decision:** Because the lower bound of the 95% bootstrap-median CI (1.6661x) is below the durable win boundary of 3.0x, `durable_frankenscipy_win=false`. The chooser selects `array_process` for this exact deployment.
+4. **Retired Claim:** The historical looped-SciPy 536x claim is officially retired in favor of the live-incumbent 1.84x ratio.

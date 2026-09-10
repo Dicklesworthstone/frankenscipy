@@ -1828,6 +1828,21 @@ TRJ booking claim: message 41194. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
 
 The historical scalar-loop 495-986x claim is retired.
 
+### CONVERTED-CLAIM / DECIDED WIN: opt: secant_many (vmap-over-solver derivative-free implied-volatility calibration) — 1.84x whole-job win vs strongest live SciPy public arm
+**2026-09-10 conversion verdict (frankenscipy-dw6du):** historical 536x looped-SciPy claim converted.
+Re-measured in same invocation on host `threadripperje` under 32-CPU affinity (`taskset -c 0-31`), performance governor,
+against live SciPy 1.17.1 + NumPy 2.4.3 screened across eligible public arms (`scalar_loop`, `array_single`, `scalar_thread`, `scalar_process`, `array_thread`, `array_process`).
+Strongest public SciPy arm: `array_process` (persistent 32-worker multiprocessing pool, wall p50 14.37 ms vs FrankenSciPy 7.73 ms).
+Incumbent ratio: SciPy / FrankenSciPy = 1.8399x, bootstrap_median_ci95=[1.6661, 1.9382].
+Both same-invocation A/A nulls passed tightly within 2%: ours median 0.9946 (ci95 [0.9676, 1.0165]), SciPy median 0.9876 (ci95 [0.9605, 1.0431]).
+**CHOOSER STATEMENT:** choose array_process for this exact 65,536-contract derivative-free implied-volatility calibration and risk report; solver_mode=secant durable_frankenscipy_boundary=3x durable_frankenscipy_win=false outcome=DECIDED FRANKENSCIPY WIN ratio_ci_low=1.666108243 old_scalar_loop_claim=536x retired=true.
+Decision: `outcome=DECIDED FRANKENSCIPY WIN`, `durable_frankenscipy_win=false` (ratio < 3.0x boundary).
+ELF SHA-256: `6b1829ff28cc723b6ac59ca313fc682831ac20a2f44be92d183dfa8c8f275b6d`.
+SciPy engine SHA-256: `686488a1e10da03baac124f8d73b5b590d23ce76adbdf0347d8c572c01c264b2`.
+TRJ booking claim: message 41196. Full entry in `docs/NEGATIVE_EVIDENCE.md`.
+
+The historical scalar-loop 536x claim is retired.
+
 ### ✅✅ ndimage: mean(labels,index) parallel privatized-histogram scatter — 2.05× self-speedup at large N (→ 2.16× vs scipy)
 DIFFERENT primitive from the vmap vein: a PARALLEL SEGMENTED REDUCTION. First, a stale-scorecard CORRECTION —
 the GAUNTLET scorecard lists `ndimage.mean(labels,index)` as a 1.5-4.7× LOSS (beads 8l8r1.125/.143/fa62u),
