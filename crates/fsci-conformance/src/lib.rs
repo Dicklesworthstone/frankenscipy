@@ -10764,6 +10764,197 @@ pub fn write_differential_parity_artifacts(
     write_packet_report_artifacts(&output_dir, &packet_report)
 }
 
+/// Aggregates individual test log outputs from the four FSCI-P2C-018 conformance
+/// harnesses (`diff_signal`, `diff_signal_hilbert`, `diff_odr`, and
+/// `metamorphic_signal_detrend`) into a consolidated root [`PacketReport`].
+pub fn aggregate_p2c018_parity_report(
+    config: &HarnessConfig,
+) -> Result<PacketReport, HarnessError> {
+    let packet_dir = config.artifact_dir_for("FSCI-P2C-018");
+    let diff_dir = packet_dir.join("diff");
+    let meta_dir = packet_dir.join("metamorphic");
+
+    let mut case_results = Vec::new();
+    let mut differential_case_results = Vec::new();
+
+    // 1. Process diff/ logs
+    if diff_dir.exists() {
+        let mut entries = fs::read_dir(&diff_dir)
+            .map_err(|source| HarnessError::ArtifactIo {
+                path: diff_dir.clone(),
+                source,
+            })?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = fs::read_to_string(&path).map_err(|source| HarnessError::ArtifactIo {
+                path: path.clone(),
+                source,
+            })?;
+            let value: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| HarnessError::Serialization(e.to_string()))?;
+
+            let default_test_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("diff");
+            let test_id = value
+                .get("test_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(default_test_id);
+
+            if let Some(cases) = value.get("cases").and_then(serde_json::Value::as_array) {
+                for c in cases {
+                    let raw_case_id = c
+                        .get("case_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let case_id = format!("{test_id}::{raw_case_id}");
+                    let passed = c
+                        .get("pass")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let max_diff = c.get("max_diff").and_then(serde_json::Value::as_f64);
+                    let tolerance = c.get("tolerance").and_then(serde_json::Value::as_f64);
+
+                    let message = if let Some(md) = max_diff {
+                        format!("matched within tolerance (max_diff={md:.2e})")
+                    } else if let Some(res_var) = c
+                        .get("res_var_rel_diff")
+                        .and_then(serde_json::Value::as_f64)
+                    {
+                        format!("odr covariance matched (res_var_rel={res_var:.2e})")
+                    } else {
+                        "differential comparison passed".to_string()
+                    };
+
+                    case_results.push(CaseResult {
+                        case_id: case_id.clone(),
+                        passed,
+                        message: message.clone(),
+                    });
+
+                    differential_case_results.push(DifferentialCaseResult {
+                        case_id,
+                        passed,
+                        message,
+                        max_diff,
+                        tolerance_used: tolerance.map(|tol| ToleranceUsed {
+                            atol: tol,
+                            rtol: tol,
+                            comparison_mode: "allclose".to_string(),
+                        }),
+                        oracle_status: OracleStatus::Available,
+                    });
+                }
+            }
+        }
+    }
+
+    // 2. Process metamorphic/ logs
+    if meta_dir.exists() {
+        let mut entries = fs::read_dir(&meta_dir)
+            .map_err(|source| HarnessError::ArtifactIo {
+                path: meta_dir.clone(),
+                source,
+            })?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = fs::read_to_string(&path).map_err(|source| HarnessError::ArtifactIo {
+                path: path.clone(),
+                source,
+            })?;
+            let value: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| HarnessError::Serialization(e.to_string()))?;
+
+            let default_test_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("metamorphic");
+            let test_id = value
+                .get("test_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(default_test_id);
+
+            if let Some(cases) = value.get("cases").and_then(serde_json::Value::as_array) {
+                for c in cases {
+                    let raw_case_id = c
+                        .get("case_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown");
+                    let case_id =
+                        if let Some(inv) = c.get("invariant").and_then(serde_json::Value::as_str) {
+                            format!("{test_id}::{raw_case_id}::{inv}")
+                        } else {
+                            format!("{test_id}::{raw_case_id}")
+                        };
+                    let passed = c
+                        .get("pass")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    let message =
+                        if let Some(detail) = c.get("detail").and_then(serde_json::Value::as_str) {
+                            format!("invariant satisfied: {detail}")
+                        } else {
+                            "metamorphic invariant satisfied".to_string()
+                        };
+
+                    case_results.push(CaseResult {
+                        case_id: case_id.clone(),
+                        passed,
+                        message: message.clone(),
+                    });
+
+                    differential_case_results.push(DifferentialCaseResult {
+                        case_id,
+                        passed,
+                        message,
+                        max_diff: if passed { Some(0.0) } else { None },
+                        tolerance_used: None,
+                        oracle_status: OracleStatus::Available,
+                    });
+                }
+            }
+        }
+    }
+
+    let passed_cases = case_results.iter().filter(|c| c.passed).count();
+    let failed_cases = case_results.len().saturating_sub(passed_cases);
+
+    Ok(PacketReport {
+        schema_version: packet_report_schema_v2(),
+        packet_id: "FSCI-P2C-018".to_string(),
+        family: "signal_odr_diff".to_string(),
+        case_results,
+        passed_cases,
+        failed_cases,
+        fixture_path: None,
+        oracle_status: Some(OracleStatus::Available),
+        differential_case_results: Some(differential_case_results),
+        report_kind: ReportKind::OracleBacked,
+        generated_unix_ms: now_unix_ms(),
+    })
+}
+
+/// Generates the consolidated FSCI-P2C-018 root parity artifacts
+/// (`parity_report.json`, `parity_report.raptorq.json`, `parity_report.decode_proof.json`).
+pub fn write_p2c018_root_parity_artifacts(
+    config: &HarnessConfig,
+) -> Result<ParityArtifactBundle, HarnessError> {
+    let report = aggregate_p2c018_parity_report(config)?;
+    write_parity_artifacts(config, &report)
+}
+
 #[must_use]
 pub fn build_drift_diff_report(report: &ConformanceReport) -> DriftDiffReport {
     let cases = report

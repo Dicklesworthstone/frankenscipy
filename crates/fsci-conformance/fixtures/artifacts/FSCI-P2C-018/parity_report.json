@@ -1,0 +1,2103 @@
+{
+  "schema_version": 2,
+  "packet_id": "FSCI-P2C-018",
+  "family": "signal_odr_diff",
+  "case_results": [
+    {
+      "case_id": "convolve::conv_simple_full",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "convolve::conv_simple_same",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "convolve::conv_simple_valid",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "convolve::corr_simple_full",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=0.00e0)"
+    },
+    {
+      "case_id": "convolve::conv_longer_full",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "convolve::conv_longer_same",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "diff_odr_covariance_coupling::linear_equal_input_response_weights",
+      "passed": true,
+      "message": "odr covariance matched (res_var_rel=3.22e-9)"
+    },
+    {
+      "case_id": "diff_odr_covariance_coupling::linear_stronger_input_weight",
+      "passed": true,
+      "message": "odr covariance matched (res_var_rel=1.64e-10)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f0_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f0_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f0_n2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f0_n3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f1_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f1_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f1_n2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.83e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f1_n3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f2_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f2_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f2_n2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f2_n3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=7.22e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f3_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f3_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f3_n2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f3_n3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f0_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f0_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f1_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f1_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.80e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f2_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f2_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::am_c0_m0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=7.77e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::am_c0_m1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::am_c1_m0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::am_c1_m1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::impulse",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.77e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::step",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=7.77e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-15)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::odd_even_n15",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.72e-15)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::odd_even_n17",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.44e-15)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::odd_even_n31",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.03e-14)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::odd_even_n33",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.38e-14)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::chirp_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::chirp_1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=7.77e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::chirp_2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.03e-15)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::dc_offset_5",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::dc_offset_10",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-15)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::dc_offset_20",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-15)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::square_wave",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::sawtooth_wave",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::gaussian_pulse_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::gaussian_pulse_1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::gaussian_pulse_2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::exp_decay_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.36e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::exp_decay_1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "diff_signal_hilbert::exp_decay_2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_1_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.55e-15)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_1_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_2_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.20e-14)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_2_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.33e-15)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_4_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.20e-14)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_4_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.55e-15)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_8_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.07e-14)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_8_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::irregular_reference_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "diff_signal_lombscargle::irregular_reference_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)"
+    },
+    {
+      "case_id": "ricker::ricker_32_4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-17)"
+    },
+    {
+      "case_id": "ricker::ricker_64_8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-17)"
+    },
+    {
+      "case_id": "ricker::ricker_128_16",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-17)"
+    },
+    {
+      "case_id": "savgol_coeffs::savgol_5_2_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.67e-16)"
+    },
+    {
+      "case_id": "savgol_coeffs::savgol_7_3_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)"
+    },
+    {
+      "case_id": "savgol_coeffs::savgol_9_4_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.30e-14)"
+    },
+    {
+      "case_id": "savgol_coeffs::savgol_11_5_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.05e-14)"
+    },
+    {
+      "case_id": "windows::hann_8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "windows::hamming_8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)"
+    },
+    {
+      "case_id": "windows::blackman_8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.67e-16)"
+    },
+    {
+      "case_id": "windows::hann_16",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-16)"
+    },
+    {
+      "case_id": "windows::hamming_16",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-16)"
+    },
+    {
+      "case_id": "windows::blackman_16",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.67e-16)"
+    },
+    {
+      "case_id": "windows::hann_32",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)"
+    },
+    {
+      "case_id": "windows::hamming_32",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "windows::blackman_32",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)"
+    },
+    {
+      "case_id": "windows::hann_64",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.00e-16)"
+    },
+    {
+      "case_id": "windows::hamming_64",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)"
+    },
+    {
+      "case_id": "windows::blackman_64",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)"
+    },
+    {
+      "case_id": "windows::hann_128",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)"
+    },
+    {
+      "case_id": "windows::hamming_128",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)"
+    },
+    {
+      "case_id": "windows::blackman_128",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)"
+    },
+    {
+      "case_id": "windows::kaiser_16_b4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.75e-8)"
+    },
+    {
+      "case_id": "windows::kaiser_16_b8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.07e-8)"
+    },
+    {
+      "case_id": "windows::kaiser_16_b14",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.30e-9)"
+    },
+    {
+      "case_id": "windows::kaiser_32_b4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.17e-8)"
+    },
+    {
+      "case_id": "windows::kaiser_32_b8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.06e-8)"
+    },
+    {
+      "case_id": "windows::kaiser_32_b14",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.34e-9)"
+    },
+    {
+      "case_id": "windows::kaiser_64_b4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.11e-8)"
+    },
+    {
+      "case_id": "windows::kaiser_64_b8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.07e-8)"
+    },
+    {
+      "case_id": "windows::kaiser_64_b14",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.36e-9)"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::mixed_offsets_n5::constant_zero_mean",
+      "passed": true,
+      "message": "invariant satisfied: abs_mean=0"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::mixed_offsets_n5::constant_idempotent",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::wide_dynamic_range_n7::constant_zero_mean",
+      "passed": true,
+      "message": "invariant satisfied: abs_mean=0.000000000008315380130495343"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::wide_dynamic_range_n7::constant_idempotent",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0.000000000014551915228366852"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::oscillating_n9::constant_zero_mean",
+      "passed": true,
+      "message": "invariant satisfied: abs_mean=0.000000000000000049343245538895844"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::oscillating_n9::constant_idempotent",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0.00000000000000005551115123125783"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::positive_slope_n8::linear_removes_affine_sequence",
+      "passed": true,
+      "message": "invariant satisfied: max_abs=0, tolerance=0.0000000001, len=8, slope=2.5, intercept=-7"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::negative_slope_n13::linear_removes_affine_sequence",
+      "passed": true,
+      "message": "invariant satisfied: max_abs=0, tolerance=0.0000000001, len=13, slope=-0.75, intercept=4.25"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::flat_affine_n3::linear_removes_affine_sequence",
+      "passed": true,
+      "message": "invariant satisfied: max_abs=0, tolerance=0.0000000001, len=3, slope=0, intercept=11"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::large_intercept_n21::linear_removes_affine_sequence",
+      "passed": true,
+      "message": "invariant satisfied: max_abs=0.0000002384185791015625, tolerance=0.00000100000000002, len=21, slope=0.001, intercept=1000000000"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::curved_residual_n8::linear_residual_invariant_to_added_affine",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0, slope=3.5, intercept=-12"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::oscillating_residual_n16::linear_residual_invariant_to_added_affine",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0.0000000000000011657341758564144, slope=-1.25, intercept=8"
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::signed_residual_n9::linear_residual_invariant_to_added_affine",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0.000000000000005773159728050814, slope=0.125, intercept=100"
+    }
+  ],
+  "passed_cases": 113,
+  "failed_cases": 0,
+  "oracle_status": {
+    "status": "available"
+  },
+  "differential_case_results": [
+    {
+      "case_id": "convolve::conv_simple_full",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "convolve::conv_simple_same",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "convolve::conv_simple_valid",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "convolve::corr_simple_full",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=0.00e0)",
+      "max_diff": 0.0,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "convolve::conv_longer_full",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "convolve::conv_longer_same",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_odr_covariance_coupling::linear_equal_input_response_weights",
+      "passed": true,
+      "message": "odr covariance matched (res_var_rel=3.22e-9)",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_odr_covariance_coupling::linear_stronger_input_weight",
+      "passed": true,
+      "message": "odr covariance matched (res_var_rel=1.64e-10)",
+      "max_diff": null,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f0_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f0_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f0_n2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f0_n3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f1_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f1_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f1_n2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.83e-16)",
+      "max_diff": 5.828670879282072e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f1_n3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f2_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f2_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f2_n2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f2_n3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=7.22e-16)",
+      "max_diff": 7.216449660063518e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f3_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f3_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f3_n2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sine_f3_n3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f0_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f0_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f1_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f1_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.80e-16)",
+      "max_diff": 6.800116025829084e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f2_n0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::cosine_f2_n1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::am_c0_m0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=7.77e-16)",
+      "max_diff": 7.771561172376096e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::am_c0_m1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::am_c1_m0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::am_c1_m1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::impulse",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.77e-16)",
+      "max_diff": 2.7719034580617774e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::step",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=7.77e-16)",
+      "max_diff": 7.771561172376096e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_3",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-15)",
+      "max_diff": 1.1102230246251565e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::pseudo_random_4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::odd_even_n15",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.72e-15)",
+      "max_diff": 2.7237471537470505e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::odd_even_n17",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.44e-15)",
+      "max_diff": 3.4416913763379853e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::odd_even_n31",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.03e-14)",
+      "max_diff": 1.0325074129013956e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::odd_even_n33",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.38e-14)",
+      "max_diff": 1.3822276656583199e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::chirp_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::chirp_1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=7.77e-16)",
+      "max_diff": 7.771561172376096e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::chirp_2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.03e-15)",
+      "max_diff": 1.0269562977782698e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::dc_offset_5",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::dc_offset_10",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-15)",
+      "max_diff": 1.1102230246251565e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::dc_offset_20",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-15)",
+      "max_diff": 1.1102230246251565e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::square_wave",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=8.88e-16)",
+      "max_diff": 8.881784197001252e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::sawtooth_wave",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=6.66e-16)",
+      "max_diff": 6.661338147750939e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::gaussian_pulse_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::gaussian_pulse_1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::gaussian_pulse_2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::exp_decay_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.36e-16)",
+      "max_diff": 2.3592239273284576e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::exp_decay_1",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_hilbert::exp_decay_2",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_1_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.55e-15)",
+      "max_diff": 3.552713678800501e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_1_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_2_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.20e-14)",
+      "max_diff": 3.197442310920451e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_2_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.33e-15)",
+      "max_diff": 1.3322676295501878e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_4_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.20e-14)",
+      "max_diff": 3.197442310920451e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_4_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.55e-15)",
+      "max_diff": 1.5543122344752192e-15,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_8_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.07e-14)",
+      "max_diff": 1.0658141036401503e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::regular_omega_8_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::irregular_reference_power",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "diff_signal_lombscargle::irregular_reference_norm",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.22e-16)",
+      "max_diff": 2.220446049250313e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ricker::ricker_32_4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-17)",
+      "max_diff": 2.7755575615628914e-17,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ricker::ricker_64_8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-17)",
+      "max_diff": 2.7755575615628914e-17,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "ricker::ricker_128_16",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-17)",
+      "max_diff": 2.7755575615628914e-17,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savgol_coeffs::savgol_5_2_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.67e-16)",
+      "max_diff": 1.6653345369377348e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savgol_coeffs::savgol_7_3_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.33e-16)",
+      "max_diff": 3.3306690738754696e-16,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savgol_coeffs::savgol_9_4_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.30e-14)",
+      "max_diff": 1.304512053934559e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "savgol_coeffs::savgol_11_5_0",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.05e-14)",
+      "max_diff": 2.0483614804334138e-14,
+      "tolerance_used": {
+        "atol": 1e-10,
+        "rtol": 1e-10,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hann_8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hamming_8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::blackman_8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.67e-16)",
+      "max_diff": 1.6653345369377348e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hann_16",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-16)",
+      "max_diff": 2.7755575615628914e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hamming_16",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.78e-16)",
+      "max_diff": 2.7755575615628914e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::blackman_16",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.67e-16)",
+      "max_diff": 1.6653345369377348e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hann_32",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hamming_32",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::blackman_32",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hann_64",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.00e-16)",
+      "max_diff": 4.996003610813204e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hamming_64",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::blackman_64",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hann_128",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::hamming_128",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=4.44e-16)",
+      "max_diff": 4.440892098500626e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::blackman_128",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=5.55e-16)",
+      "max_diff": 5.551115123125783e-16,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::kaiser_16_b4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.75e-8)",
+      "max_diff": 1.745009914344564e-8,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::kaiser_16_b8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.07e-8)",
+      "max_diff": 1.0708261666270147e-8,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::kaiser_16_b14",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.30e-9)",
+      "max_diff": 3.2970941532539655e-9,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::kaiser_32_b4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.17e-8)",
+      "max_diff": 2.1704067210137623e-8,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::kaiser_32_b8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.06e-8)",
+      "max_diff": 1.0587138332684987e-8,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::kaiser_32_b14",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.34e-9)",
+      "max_diff": 3.3363982687717453e-9,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::kaiser_64_b4",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=2.11e-8)",
+      "max_diff": 2.1124768045943654e-8,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::kaiser_64_b8",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=1.07e-8)",
+      "max_diff": 1.0721210530473257e-8,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "windows::kaiser_64_b14",
+      "passed": true,
+      "message": "matched within tolerance (max_diff=3.36e-9)",
+      "max_diff": 3.357913946899771e-9,
+      "tolerance_used": {
+        "atol": 1e-7,
+        "rtol": 1e-7,
+        "comparison_mode": "allclose"
+      },
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::mixed_offsets_n5::constant_zero_mean",
+      "passed": true,
+      "message": "invariant satisfied: abs_mean=0",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::mixed_offsets_n5::constant_idempotent",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::wide_dynamic_range_n7::constant_zero_mean",
+      "passed": true,
+      "message": "invariant satisfied: abs_mean=0.000000000008315380130495343",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::wide_dynamic_range_n7::constant_idempotent",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0.000000000014551915228366852",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::oscillating_n9::constant_zero_mean",
+      "passed": true,
+      "message": "invariant satisfied: abs_mean=0.000000000000000049343245538895844",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::oscillating_n9::constant_idempotent",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0.00000000000000005551115123125783",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::positive_slope_n8::linear_removes_affine_sequence",
+      "passed": true,
+      "message": "invariant satisfied: max_abs=0, tolerance=0.0000000001, len=8, slope=2.5, intercept=-7",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::negative_slope_n13::linear_removes_affine_sequence",
+      "passed": true,
+      "message": "invariant satisfied: max_abs=0, tolerance=0.0000000001, len=13, slope=-0.75, intercept=4.25",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::flat_affine_n3::linear_removes_affine_sequence",
+      "passed": true,
+      "message": "invariant satisfied: max_abs=0, tolerance=0.0000000001, len=3, slope=0, intercept=11",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::large_intercept_n21::linear_removes_affine_sequence",
+      "passed": true,
+      "message": "invariant satisfied: max_abs=0.0000002384185791015625, tolerance=0.00000100000000002, len=21, slope=0.001, intercept=1000000000",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::curved_residual_n8::linear_residual_invariant_to_added_affine",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0, slope=3.5, intercept=-12",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::oscillating_residual_n16::linear_residual_invariant_to_added_affine",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0.0000000000000011657341758564144, slope=-1.25, intercept=8",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    },
+    {
+      "case_id": "metamorphic_signal_detrend::signed_residual_n9::linear_residual_invariant_to_added_affine",
+      "passed": true,
+      "message": "invariant satisfied: max_diff=0.000000000000005773159728050814, slope=0.125, intercept=100",
+      "max_diff": 0.0,
+      "tolerance_used": null,
+      "oracle_status": {
+        "status": "available"
+      }
+    }
+  ],
+  "report_kind": "oracle_backed",
+  "generated_unix_ms": 1789105545182
+}
