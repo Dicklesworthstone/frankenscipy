@@ -146,9 +146,12 @@ pub fn euclidean(a: &[f64], b: &[f64]) -> f64 {
 /// not auto-vectorized), with a scalar tail — the dominant inner kernel of
 /// `cdist`/`pdist`/nearest-neighbour searches.
 pub fn sqeuclidean(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     use std::simd::{Simd, num::SimdFloat};
     const L: usize = 8;
-    let n = a.len().min(b.len());
+    let n = a.len();
     let mut acc0 = Simd::<f64, L>::splat(0.0);
     let mut acc1 = Simd::<f64, L>::splat(0.0);
     let mut i = 0;
@@ -333,9 +336,12 @@ fn collect_dim4_points(x: &[Vec<f64>]) -> Vec<[f64; 4]> {
 
 /// Manhattan (L1) distance: `Σ |a[i]-b[i]|`, 8-wide.
 pub fn cityblock(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     use std::simd::{Simd, num::SimdFloat};
     const L: usize = 8;
-    let n = a.len().min(b.len());
+    let n = a.len();
     let mut acc0 = Simd::<f64, L>::splat(0.0);
     let mut acc1 = Simd::<f64, L>::splat(0.0);
     let mut i = 0;
@@ -360,9 +366,12 @@ pub fn cityblock(a: &[f64], b: &[f64]) -> f64 {
 
 /// Chebyshev (L∞) distance.
 pub fn chebyshev(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     use std::simd::{Select, Simd, cmp::SimdPartialEq, cmp::SimdPartialOrd, num::SimdFloat};
     const L: usize = 8;
-    let n = a.len().min(b.len());
+    let n = a.len();
     let mut vmax = Simd::<f64, L>::splat(0.0);
     let mut nan_mask = vmax.simd_ne(vmax);
     let mut i = 0usize;
@@ -397,11 +406,14 @@ pub static COSINE_FUSE_DISABLE: std::sync::atomic::AtomicBool =
 
 /// Cosine distance: 1 - cosine_similarity(a, b).
 pub fn cosine(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     // Fuse the dot product and the two squared-norms into ONE pass over (a, b) — byte-identical to
     // the three separate SIMD helpers (see `fused_dot_sqsum`) but reading each vector once instead
-    // of twice. Only for equal-length inputs (the helpers cover different ranges otherwise).
+    // of twice.
     let (dot, sqsum_a, sqsum_b) =
-        if COSINE_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) || a.len() != b.len() {
+        if COSINE_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
             (simd_dot(a, b), simd_sqsum(a), simd_sqsum(b))
         } else {
             fused_dot_sqsum(a, b)
@@ -427,7 +439,7 @@ pub fn cosine(a: &[f64], b: &[f64]) -> f64 {
 fn minkowski_pow_sum(a: &[f64], b: &[f64], p: u32) -> f64 {
     use std::simd::{Simd, num::SimdFloat};
     const L: usize = 8;
-    let n = a.len().min(b.len());
+    let n = a.len();
     let mut acc0 = Simd::<f64, L>::splat(0.0);
     let mut acc1 = Simd::<f64, L>::splat(0.0);
     let mut i = 0;
@@ -474,7 +486,7 @@ fn minkowski_int(a: &[f64], b: &[f64], p: u32) -> f64 {
 }
 
 pub fn minkowski(a: &[f64], b: &[f64], p: f64) -> f64 {
-    if p <= 0.0 || p.is_nan() {
+    if a.len() != b.len() || p <= 0.0 || p.is_nan() {
         return f64::NAN;
     }
     if p == f64::INFINITY {
@@ -532,6 +544,9 @@ pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
 /// Matches `scipy.spatial.distance.hamming(u, v)`.
 /// For real-valued vectors, counts positions where u_i != v_i.
 pub fn hamming(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     if a.is_empty() {
         return 0.0;
     }
@@ -558,6 +573,9 @@ pub fn hamming(a: &[f64], b: &[f64]) -> f64 {
 /// result. Since 1.15.0, numeric input is converted to Boolean
 /// before computation.")
 pub fn jaccard(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     let mut nonzero = 0usize;
     let mut unequal_nonzero = 0usize;
     for (&ai, &bi) in a.iter().zip(b.iter()) {
@@ -581,12 +599,15 @@ pub fn jaccard(a: &[f64], b: &[f64]) -> f64 {
 /// Matches `scipy.spatial.distance.canberra(u, v)`.
 /// d(u,v) = Σ|u_i - v_i| / (|u_i| + |v_i|)
 pub fn canberra(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     // Σ |ai-bi| / (|ai|+|bi|), term=0 when denom==0. The per-element divide makes this
     // compute-bound, so 8-wide SIMD wins ~2x. `simd_eq(0)` reproduces the denom==0⇒0 guard
     // via a lane mask (denom==0 ⇒ both 0 ⇒ 0/0=NaN, masked to 0 before the add).
     use std::simd::{Select, Simd, cmp::SimdPartialEq, num::SimdFloat};
     const L: usize = 8;
-    let n = a.len().min(b.len());
+    let n = a.len();
     let zero = Simd::<f64, L>::splat(0.0);
     let mut acc = Simd::<f64, L>::splat(0.0);
     let mut i = 0;
@@ -621,6 +642,9 @@ pub static BRAYCURTIS_FUSE_DISABLE: std::sync::atomic::AtomicBool =
 /// Matches `scipy.spatial.distance.braycurtis(u, v)`.
 /// d(u,v) = Σ|u_i - v_i| / Σ|u_i + v_i|
 pub fn braycurtis(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     // The numerator `Σ|a-b|` and denominator `Σ|a+b|` are two independent reductions over the same
     // (a, b) — accumulate both in ONE pass so each vector is read once instead of twice.
     // BYTE-IDENTICAL: each Σ stays a scalar left-to-right `+=` from 0.0 in the same index order as
@@ -7275,6 +7299,9 @@ fn minkowski_rowwise(
 ///
 /// Matches `scipy.spatial.distance.yule`.
 pub fn yule(u: &[bool], v: &[bool]) -> f64 {
+    if u.len() != v.len() {
+        return f64::NAN;
+    }
     let mut ctf = 0usize; // true-false
     let mut cft = 0usize; // false-true
     let mut ctt = 0usize; // true-true
@@ -7302,6 +7329,9 @@ pub fn yule(u: &[bool], v: &[bool]) -> f64 {
 ///
 /// Matches `scipy.spatial.distance.dice`.
 pub fn dice(u: &[bool], v: &[bool]) -> f64 {
+    if u.len() != v.len() {
+        return f64::NAN;
+    }
     let mut ctf = 0usize;
     let mut cft = 0usize;
     let mut ctt = 0usize;
@@ -7330,6 +7360,9 @@ pub fn dice(u: &[bool], v: &[bool]) -> f64 {
 /// and **removed it in SciPy 1.15+** (gone from 1.17), so there is no current
 /// SciPy oracle; retained here for backward compatibility.
 pub fn kulsinski(u: &[bool], v: &[bool]) -> f64 {
+    if u.len() != v.len() {
+        return f64::NAN;
+    }
     let n = u.len() as f64;
     let mut ctf = 0usize;
     let mut cft = 0usize;
@@ -7356,6 +7389,9 @@ pub fn kulsinski(u: &[bool], v: &[bool]) -> f64 {
 ///
 /// Matches `scipy.spatial.distance.rogerstanimoto`.
 pub fn rogerstanimoto(u: &[bool], v: &[bool]) -> f64 {
+    if u.len() != v.len() {
+        return f64::NAN;
+    }
     let mut ndiff = 0usize;
     let mut nsame = 0usize;
 
@@ -7375,6 +7411,9 @@ pub fn rogerstanimoto(u: &[bool], v: &[bool]) -> f64 {
 ///
 /// Matches `scipy.spatial.distance.russellrao`.
 pub fn russellrao(u: &[bool], v: &[bool]) -> f64 {
+    if u.len() != v.len() {
+        return f64::NAN;
+    }
     let n = u.len();
     if n == 0 {
         return 0.0;
@@ -7396,6 +7435,9 @@ pub fn sokalmichener(u: &[bool], v: &[bool]) -> f64 {
 ///
 /// Matches `scipy.spatial.distance.sokalsneath`.
 pub fn sokalsneath(u: &[bool], v: &[bool]) -> f64 {
+    if u.len() != v.len() {
+        return f64::NAN;
+    }
     let mut ctf = 0usize;
     let mut cft = 0usize;
     let mut ctt = 0usize;
@@ -7424,6 +7466,9 @@ pub fn sokalsneath(u: &[bool], v: &[bool]) -> f64 {
 /// `hamming` that SciPy **removed in 1.15+** (gone from 1.17); use [`hamming`]
 /// for current SciPy parity.
 pub fn matching(u: &[bool], v: &[bool]) -> f64 {
+    if u.len() != v.len() {
+        return f64::NAN;
+    }
     let n = u.len();
     if n == 0 {
         return 0.0;
@@ -9907,6 +9952,23 @@ mod tests {
         // length mismatch -> NaN
         assert!(angle_between(&[1.0, 0.0], &[1.0, 0.0, 0.0]).is_nan());
         assert!(dot(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(euclidean(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(sqeuclidean(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(cityblock(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(chebyshev(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(cosine(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(minkowski(&[1.0, 2.0], &[1.0, 2.0, 3.0], 3.0).is_nan());
+        assert!(hamming(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(jaccard(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(canberra(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(braycurtis(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
+        assert!(matching(&[true, false], &[true, false, true]).is_nan());
+        assert!(yule(&[true, false], &[true, false, true]).is_nan());
+        assert!(dice(&[true, false], &[true, false, true]).is_nan());
+        assert!(kulsinski(&[true, false], &[true, false, true]).is_nan());
+        assert!(rogerstanimoto(&[true, false], &[true, false, true]).is_nan());
+        assert!(russellrao(&[true, false], &[true, false, true]).is_nan());
+        assert!(sokalsneath(&[true, false], &[true, false, true]).is_nan());
         // matching = boolean Hamming = fraction differing; 2 of 4 differ. (scipy 1.17
         // removed matching as a deprecated hamming alias, so assert the identity.)
         let m = matching(&[true, false, true, true], &[true, true, false, true]);
