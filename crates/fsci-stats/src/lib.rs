@@ -48971,16 +48971,9 @@ pub fn rank_biserial(u_stat: f64, n1: usize, n2: usize) -> f64 {
 /// * `r` — Correlation coefficient in range [-1, 1]
 ///
 /// # Returns
-/// Fisher's z value (unbounded)
+/// Fisher's z value (unbounded), or NaN if |r| > 1 or r is NaN.
 pub fn fisher_z(r: f64) -> f64 {
-    if r <= -1.0 || r >= 1.0 {
-        return if r <= -1.0 {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        };
-    }
-    0.5 * ((1.0 + r) / (1.0 - r)).ln()
+    r.atanh()
 }
 
 /// Inverse Fisher's z transformation.
@@ -51715,9 +51708,11 @@ pub fn rel_entr(x: f64, y: f64) -> f64 {
 
 /// Logit function: log(p / (1 - p)).
 pub fn logit(p: f64) -> f64 {
-    if p <= 0.0 {
+    if p.is_nan() || p < 0.0 || p > 1.0 {
+        f64::NAN
+    } else if p == 0.0 {
         f64::NEG_INFINITY
-    } else if p >= 1.0 {
+    } else if p == 1.0 {
         f64::INFINITY
     } else {
         (p / (1.0 - p)).ln()
@@ -86311,6 +86306,15 @@ mod tests {
     }
 
     #[test]
+    fn fisher_z_domain_boundaries() {
+        assert_eq!(fisher_z(1.0), f64::INFINITY);
+        assert_eq!(fisher_z(-1.0), f64::NEG_INFINITY);
+        assert!(fisher_z(1.5).is_nan());
+        assert!(fisher_z(-1.5).is_nan());
+        assert!(fisher_z(f64::NAN).is_nan());
+    }
+
+    #[test]
     fn correlation_ci_contains_true() {
         let (lo, hi) = correlation_ci(0.5, 100, 0.95);
         assert!(lo < 0.5 && hi > 0.5, "CI should contain true r=0.5");
@@ -93107,6 +93111,11 @@ mod tests {
             "logit(0.5) should be 0, got {}",
             result
         );
+        assert_eq!(logit(0.0), f64::NEG_INFINITY);
+        assert_eq!(logit(1.0), f64::INFINITY);
+        assert!(logit(-0.2).is_nan());
+        assert!(logit(1.2).is_nan());
+        assert!(logit(f64::NAN).is_nan());
     }
 
     #[test]
