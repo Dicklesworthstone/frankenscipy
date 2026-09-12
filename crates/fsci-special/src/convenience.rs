@@ -7946,14 +7946,14 @@ pub fn softplus_scalar(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }
-    // For large positive x, softplus(x) ≈ x
-    // For large negative x, softplus(x) ≈ exp(x) ≈ 0
-    if x > 20.0 {
-        x
-    } else if x < -20.0 {
-        x.exp()
+    // Numerically stable softplus(x) = ln(1 + exp(x)):
+    // For x > 0: ln(1 + exp(x)) = x + ln(1 + exp(-x)) = x + ln_1p(exp(-x))
+    // For x <= 0: ln(1 + exp(x)) = ln_1p(exp(x))
+    // Avoids overflow for large positive x and maintains full 53-bit precision everywhere.
+    if x > 0.0 {
+        x + (-x).exp().ln_1p()
     } else {
-        (1.0 + x.exp()).ln()
+        x.exp().ln_1p()
     }
 }
 
@@ -8321,16 +8321,16 @@ pub fn log_expit_scalar(x: f64) -> f64 {
 /// The cloglog link function, used in survival analysis and
 /// generalized linear models. Maps (0, 1) to (-∞, +∞).
 ///
-/// Returns -∞ for p ≤ 0, +∞ for p ≥ 1.
+/// Returns -∞ for p = 0, +∞ for p = 1, and NaN for p < 0 or p > 1.
 #[must_use]
 pub fn cloglog(p: f64) -> f64 {
-    if p.is_nan() {
+    if p.is_nan() || !(0.0..=1.0).contains(&p) {
         return f64::NAN;
     }
-    if p <= 0.0 {
+    if p == 0.0 {
         return f64::NEG_INFINITY;
     }
-    if p >= 1.0 {
+    if p == 1.0 {
         return f64::INFINITY;
     }
     // Use log1p for numerical stability when p is near 0
@@ -8374,16 +8374,16 @@ pub fn cloglog_inv(x: f64) -> f64 {
 /// The log-log link function, used in extreme value distributions.
 /// Maps (0, 1) to (-∞, +∞). The negative of the Gumbel quantile function.
 ///
-/// Returns -∞ for p ≤ 0, +∞ for p ≥ 1.
+/// Returns -∞ for p = 0, +∞ for p = 1, and NaN for p < 0 or p > 1.
 #[must_use]
 pub fn loglog(p: f64) -> f64 {
-    if p.is_nan() {
+    if p.is_nan() || !(0.0..=1.0).contains(&p) {
         return f64::NAN;
     }
-    if p <= 0.0 {
+    if p == 0.0 {
         return f64::NEG_INFINITY;
     }
-    if p >= 1.0 {
+    if p == 1.0 {
         return f64::INFINITY;
     }
     -(-p.ln()).ln()
@@ -8419,20 +8419,20 @@ pub fn loglog_inv(x: f64) -> f64 {
 /// The inverse Cauchy CDF, used as a link function for heavy-tailed
 /// distributions. Maps (0, 1) to (-∞, +∞).
 ///
-/// Returns -∞ for p ≤ 0, +∞ for p ≥ 1.
+/// Returns -∞ for p = 0, +∞ for p = 1, and NaN for p < 0 or p > 1.
 pub fn cauchit(p_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real("cauchit", p_tensor, mode, |p| Ok(cauchit_scalar(p)))
 }
 
 #[must_use]
 pub fn cauchit_scalar(p: f64) -> f64 {
-    if p.is_nan() {
+    if p.is_nan() || !(0.0..=1.0).contains(&p) {
         return f64::NAN;
     }
-    if p <= 0.0 {
+    if p == 0.0 {
         return f64::NEG_INFINITY;
     }
-    if p >= 1.0 {
+    if p == 1.0 {
         return f64::INFINITY;
     }
     (std::f64::consts::PI * (p - 0.5)).tan()
@@ -8577,24 +8577,20 @@ pub fn log1mexp(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 
 #[must_use]
 pub fn log1mexp_scalar(x: f64) -> f64 {
-    if x.is_nan() {
-        return f64::NAN;
-    }
-    if x > 0.0 {
-        return f64::NAN; // log of negative number
+    if x.is_nan() || x > 0.0 {
+        return f64::NAN; // log of negative number for x > 0
     }
     if x == 0.0 {
         return f64::NEG_INFINITY; // log(0)
     }
-    // For x < 0:
-    // If x is close to 0 (say x > -0.693 = -ln(2)), use log1p(-exp(x))
-    // Otherwise use log(1 - exp(x)) directly
+    // For x < 0: log(1 - exp(x))
+    // Martin Mächler (2012) "Accurately Computing log(1 - exp(-a))":
+    // For x > -ln(2) (x near 0): 1 - exp(x) = -expm1(x), so log(1 - exp(x)) = ln(-expm1(x))
+    // For x <= -ln(2): exp(x) <= 0.5, so log(1 - exp(x)) = ln_1p(-exp(x))
     if x > -std::f64::consts::LN_2 {
-        // x close to 0: exp(x) close to 1, use log1p for accuracy
-        (-x.exp()).ln_1p()
+        (-x.exp_m1()).ln()
     } else {
-        // x far from 0: exp(x) small, direct computation is fine
-        (1.0 - x.exp()).ln()
+        (-x.exp()).ln_1p()
     }
 }
 
@@ -13127,6 +13123,8 @@ mod tests {
         // Boundary behavior
         assert!(cloglog(0.0).is_infinite() && cloglog(0.0) < 0.0);
         assert!(cloglog(1.0).is_infinite() && cloglog(1.0) > 0.0);
+        assert!(cloglog(-0.1).is_nan());
+        assert!(cloglog(1.1).is_nan());
 
         // Near boundaries should still work
         assert!(cloglog(1e-10).is_finite());
@@ -13178,6 +13176,8 @@ mod tests {
         // Boundary behavior (opposite direction of cloglog)
         assert!(loglog(0.0).is_infinite() && loglog(0.0) < 0.0);
         assert!(loglog(1.0).is_infinite() && loglog(1.0) > 0.0);
+        assert!(loglog(-0.1).is_nan());
+        assert!(loglog(1.1).is_nan());
     }
 
     #[test]
@@ -13228,6 +13228,8 @@ mod tests {
         // Boundary behavior
         assert!(cauchit_scalar(0.0).is_infinite() && cauchit_scalar(0.0) < 0.0);
         assert!(cauchit_scalar(1.0).is_infinite() && cauchit_scalar(1.0) > 0.0);
+        assert!(cauchit_scalar(-0.1).is_nan());
+        assert!(cauchit_scalar(1.1).is_nan());
     }
 
     #[test]
@@ -13534,6 +13536,12 @@ mod tests {
 
         // log1mexp(x) is NaN for x > 0
         assert!(log1mexp_scalar(1.0).is_nan());
+
+        // High precision for small |x| near 0 (Martin Maechler algorithm)
+        let small_x = -1.0e-15_f64;
+        let expected_small = (-small_x.exp_m1()).ln();
+        assert!((log1mexp_scalar(small_x) - expected_small).abs() < 1e-14);
+        assert!((log1mexp_scalar(small_x) - small_x.abs().ln()).abs() < 1e-12);
     }
 
     #[test]
