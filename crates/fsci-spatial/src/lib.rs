@@ -6691,6 +6691,9 @@ pub fn rotate_point(r: &[[f64; 3]; 3], p: &[f64; 3]) -> [f64; 3] {
 
 /// Compute the angle between two vectors.
 pub fn angle_between(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     let dot: f64 = a.iter().zip(b.iter()).map(|(&ai, &bi)| ai * bi).sum();
     let na: f64 = a.iter().map(|&x| x * x).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|&x| x * x).sum::<f64>().sqrt();
@@ -6711,6 +6714,9 @@ pub fn cross_3d(a: &[f64; 3], b: &[f64; 3]) -> [f64; 3] {
 
 /// Dot product of two vectors.
 pub fn dot(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() != b.len() {
+        return f64::NAN;
+    }
     a.iter().zip(b.iter()).map(|(&ai, &bi)| ai * bi).sum()
 }
 
@@ -9898,6 +9904,9 @@ mod tests {
             (angle_between(&[1.0, 0.0], &[0.0, 1.0]) - std::f64::consts::FRAC_PI_2).abs() < 1e-12,
             "angle"
         );
+        // length mismatch -> NaN
+        assert!(angle_between(&[1.0, 0.0], &[1.0, 0.0, 0.0]).is_nan());
+        assert!(dot(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
         // matching = boolean Hamming = fraction differing; 2 of 4 differ. (scipy 1.17
         // removed matching as a deprecated hamming alias, so assert the identity.)
         let m = matching(&[true, false, true, true], &[true, true, false, true]);
