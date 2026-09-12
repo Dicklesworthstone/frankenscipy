@@ -48971,16 +48971,9 @@ pub fn rank_biserial(u_stat: f64, n1: usize, n2: usize) -> f64 {
 /// * `r` — Correlation coefficient in range [-1, 1]
 ///
 /// # Returns
-/// Fisher's z value (unbounded)
+/// Fisher's z value (unbounded), or NaN if |r| > 1 or r is NaN.
 pub fn fisher_z(r: f64) -> f64 {
-    if r <= -1.0 || r >= 1.0 {
-        return if r <= -1.0 {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        };
-    }
-    0.5 * ((1.0 + r) / (1.0 - r)).ln()
+    r.atanh()
 }
 
 /// Inverse Fisher's z transformation.
@@ -86310,6 +86303,15 @@ mod tests {
             let r_back = fisher_z_inv(z);
             assert_close(r_back, r, 1e-10, &format!("roundtrip r={}", r));
         }
+    }
+
+    #[test]
+    fn fisher_z_domain_boundaries() {
+        assert_eq!(fisher_z(1.0), f64::INFINITY);
+        assert_eq!(fisher_z(-1.0), f64::NEG_INFINITY);
+        assert!(fisher_z(1.5).is_nan());
+        assert!(fisher_z(-1.5).is_nan());
+        assert!(fisher_z(f64::NAN).is_nan());
     }
 
     #[test]
