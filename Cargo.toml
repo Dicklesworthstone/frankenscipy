@@ -25,7 +25,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 repository = "https://github.com/Dicklesworthstone/frankenscipy"
 
@@ -33,25 +33,25 @@ repository = "https://github.com/Dicklesworthstone/frankenscipy"
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-fsci-arrayapi = { version = "0.1.0", path = "crates/fsci-arrayapi" }
-fsci-cluster = { version = "0.1.0", path = "crates/fsci-cluster" }
-fsci-conformance = { version = "0.1.0", path = "crates/fsci-conformance" }
-fsci-constants = { version = "0.1.0", path = "crates/fsci-constants" }
-fsci-datasets = { version = "0.1.0", path = "crates/fsci-datasets" }
-fsci-fft = { version = "0.1.0", path = "crates/fsci-fft" }
-fsci-integrate = { version = "0.1.0", path = "crates/fsci-integrate" }
-fsci-interpolate = { version = "0.1.0", path = "crates/fsci-interpolate" }
-fsci-io = { version = "0.1.0", path = "crates/fsci-io" }
-fsci-linalg = { version = "0.1.0", path = "crates/fsci-linalg" }
-fsci-ndimage = { version = "0.1.0", path = "crates/fsci-ndimage" }
-fsci-odr = { version = "0.1.0", path = "crates/fsci-odr" }
-fsci-opt = { version = "0.1.0", path = "crates/fsci-opt" }
-fsci-runtime = { version = "0.1.0", path = "crates/fsci-runtime" }
-fsci-sparse = { version = "0.1.0", path = "crates/fsci-sparse" }
-fsci-signal = { version = "0.1.0", path = "crates/fsci-signal" }
-fsci-spatial = { version = "0.1.0", path = "crates/fsci-spatial" }
-fsci-special = { version = "0.1.0", path = "crates/fsci-special" }
-fsci-stats = { version = "0.1.0", path = "crates/fsci-stats" }
+fsci-arrayapi = { version = "0.2.0", path = "crates/fsci-arrayapi" }
+fsci-cluster = { version = "0.2.0", path = "crates/fsci-cluster" }
+fsci-conformance = { version = "0.2.0", path = "crates/fsci-conformance" }
+fsci-constants = { version = "0.2.0", path = "crates/fsci-constants" }
+fsci-datasets = { version = "0.2.0", path = "crates/fsci-datasets" }
+fsci-fft = { version = "0.2.0", path = "crates/fsci-fft" }
+fsci-integrate = { version = "0.2.0", path = "crates/fsci-integrate" }
+fsci-interpolate = { version = "0.2.0", path = "crates/fsci-interpolate" }
+fsci-io = { version = "0.2.0", path = "crates/fsci-io" }
+fsci-linalg = { version = "0.2.0", path = "crates/fsci-linalg" }
+fsci-ndimage = { version = "0.2.0", path = "crates/fsci-ndimage" }
+fsci-odr = { version = "0.2.0", path = "crates/fsci-odr" }
+fsci-opt = { version = "0.2.0", path = "crates/fsci-opt" }
+fsci-runtime = { version = "0.2.0", path = "crates/fsci-runtime" }
+fsci-sparse = { version = "0.2.0", path = "crates/fsci-sparse" }
+fsci-signal = { version = "0.2.0", path = "crates/fsci-signal" }
+fsci-spatial = { version = "0.2.0", path = "crates/fsci-spatial" }
+fsci-special = { version = "0.2.0", path = "crates/fsci-special" }
+fsci-stats = { version = "0.2.0", path = "crates/fsci-stats" }
 asupersync = { version = "0.3.9", default-features = false }
 ftui = { version = "0.3.1", default-features = false }
 blake3 = "1.8.7"
