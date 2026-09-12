@@ -939,3 +939,31 @@ fn diff_ricker() {
     assert_all_cases_compared("ricker", log.case_count, cases.len());
     assert!(all_pass, "ricker diff failed: max_diff={max_global}");
 }
+
+#[test]
+fn diff_signal_p2c018_root_parity_report() {
+    // frankenscipy-8oub0: FSCI-P2C-018 multi-harness root parity report.
+    // Aggregates the four FSCI-P2C-018 conformance harnesses:
+    // diff_signal (windows, convolve, lombscargle, ricker, savgol_coeffs),
+    // diff_signal_hilbert, diff_odr, and metamorphic_signal_detrend.
+    // Emits root parity_report.json + parity_report.raptorq.json +
+    // parity_report.decode_proof.json under FSCI-P2C-018/ for topology convergence.
+    let config = fsci_conformance::HarnessConfig::default_paths();
+    let artifacts = fsci_conformance::write_p2c018_root_parity_artifacts(&config)
+        .expect("root parity artifacts must be written");
+    assert!(
+        artifacts.report_path.exists(),
+        "{:?}",
+        artifacts.report_path
+    );
+    assert!(
+        artifacts.sidecar_path.exists(),
+        "{:?}",
+        artifacts.sidecar_path
+    );
+    assert!(
+        artifacts.decode_proof_path.exists(),
+        "{:?}",
+        artifacts.decode_proof_path
+    );
+}
