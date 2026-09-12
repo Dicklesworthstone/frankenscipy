@@ -54,14 +54,14 @@ fsci-special = { version = "0.1.0", path = "crates/fsci-special" }
 fsci-stats = { version = "0.1.0", path = "crates/fsci-stats" }
 asupersync = { version = "0.3.9", default-features = false }
 ftui = { version = "0.3.1", default-features = false }
-blake3 = "1.8.4"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.149", features = ["preserve_order", "float_roundtrip"] }
-thiserror = "2.0.18"
+blake3 = "1.8.7"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order", "float_roundtrip"] }
+thiserror = "2.0.20"
 proptest = "1.11.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
-rand = "0.10.1"
-toml = "1.1.2"
+rand = "0.10.2"
+toml = "1.1.6"
 npyz = "0.9.1"
 zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 # ══════════════════════════════════════════════════════════════════════════════
