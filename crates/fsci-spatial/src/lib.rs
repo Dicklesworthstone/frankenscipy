@@ -412,12 +412,12 @@ pub fn cosine(a: &[f64], b: &[f64]) -> f64 {
     // Fuse the dot product and the two squared-norms into ONE pass over (a, b) — byte-identical to
     // the three separate SIMD helpers (see `fused_dot_sqsum`) but reading each vector once instead
     // of twice.
-    let (dot, sqsum_a, sqsum_b) =
-        if COSINE_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
-            (simd_dot(a, b), simd_sqsum(a), simd_sqsum(b))
-        } else {
-            fused_dot_sqsum(a, b)
-        };
+    let (dot, sqsum_a, sqsum_b) = if COSINE_FUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        (simd_dot(a, b), simd_sqsum(a), simd_sqsum(b))
+    } else {
+        fused_dot_sqsum(a, b)
+    };
     let norm_a = sqsum_a.sqrt();
     let norm_b = sqsum_b.sqrt();
     let denom = norm_a * norm_b;
