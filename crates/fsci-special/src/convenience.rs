@@ -5968,7 +5968,7 @@ pub fn debye(n: usize, x: f64) -> f64 {
             // L'Hôpital: t^n / (e^t - 1) → t^(n-1) for small t
             t.powi(n as i32 - 1)
         } else {
-            t.powi(n as i32) / (t.exp() - 1.0)
+            t.powi(n as i32) / t.exp_m1()
         }
     };
 
@@ -7982,8 +7982,11 @@ pub fn huber_scalar(delta: f64, x: f64) -> f64 {
     if delta.is_nan() || x.is_nan() {
         return f64::NAN;
     }
-    if delta <= 0.0 {
-        return f64::NAN;
+    if delta < 0.0 {
+        return f64::INFINITY;
+    }
+    if delta == 0.0 {
+        return 0.0;
     }
 
     let ax = x.abs();
@@ -8017,12 +8020,15 @@ pub fn pseudo_huber_scalar(delta: f64, x: f64) -> f64 {
     if delta.is_nan() || x.is_nan() {
         return f64::NAN;
     }
-    if delta <= 0.0 {
-        return f64::NAN;
+    if delta < 0.0 {
+        return f64::INFINITY;
+    }
+    if delta == 0.0 {
+        return 0.0;
     }
 
     let ratio = x / delta;
-    delta * delta * ((1.0 + ratio * ratio).sqrt() - 1.0)
+    delta * delta * (0.5 * (ratio * ratio).ln_1p()).exp_m1()
 }
 
 /// Exponential Linear Unit (ELU).
@@ -8037,7 +8043,7 @@ pub fn elu(x: f64, alpha: f64) -> f64 {
     if x.is_nan() || alpha.is_nan() {
         return f64::NAN;
     }
-    if x > 0.0 { x } else { alpha * (x.exp() - 1.0) }
+    if x > 0.0 { x } else { alpha * x.exp_m1() }
 }
 
 /// Leaky Rectified Linear Unit.
@@ -8088,7 +8094,7 @@ pub fn selu(x: f64) -> f64 {
     if x > 0.0 {
         SCALE * x
     } else {
-        SCALE * ALPHA * (x.exp() - 1.0)
+        SCALE * ALPHA * x.exp_m1()
     }
 }
 
@@ -8126,15 +8132,7 @@ pub fn mish_scalar(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
     }
-    // softplus(x) = ln(1 + exp(x)), computed stably
-    let sp = if x > 20.0 {
-        x
-    } else if x < -20.0 {
-        x.exp()
-    } else {
-        (1.0 + x.exp()).ln()
-    };
-    x * sp.tanh()
+    x * softplus_scalar(x).tanh()
 }
 
 /// Hard sigmoid activation function.
@@ -8544,7 +8542,7 @@ pub fn celu(x: f64, alpha: f64) -> f64 {
     if x >= 0.0 {
         x
     } else {
-        alpha * ((x / alpha).exp() - 1.0)
+        alpha * (x / alpha).exp_m1()
     }
 }
 
@@ -11762,9 +11760,11 @@ mod tests {
         // At boundary
         assert!((huber_scalar(delta, 1.0) - 0.5).abs() < 1e-14);
 
-        // Invalid delta
-        assert!(huber_scalar(0.0, 1.0).is_nan());
-        assert!(huber_scalar(-1.0, 1.0).is_nan());
+        // Domain edge cases matching SciPy
+        assert_eq!(huber_scalar(0.0, 1.0), 0.0);
+        assert_eq!(huber_scalar(-1.0, 1.0), f64::INFINITY);
+        assert!(huber_scalar(f64::NAN, 1.0).is_nan());
+        assert!(huber_scalar(1.0, f64::NAN).is_nan());
     }
 
     #[test]
@@ -11774,17 +11774,19 @@ mod tests {
         // pseudo_huber(delta, 0) = 0
         assert!((pseudo_huber_scalar(delta, 0.0) - 0.0).abs() < 1e-14);
 
-        // For small x, pseudo_huber ≈ 0.5 * x^2
-        let small = 0.01;
+        // For small x, pseudo_huber ≈ 0.5 * x^2 without catastrophic cancellation
+        let small = 1e-10;
         let expected = 0.5 * small * small;
-        assert!((pseudo_huber_scalar(delta, small) - expected).abs() < 1e-6);
+        assert!((pseudo_huber_scalar(delta, small) - expected).abs() < 1e-25);
 
         // Symmetric
         assert!((pseudo_huber_scalar(delta, 2.0) - pseudo_huber_scalar(delta, -2.0)).abs() < 1e-14);
 
-        // Invalid delta
-        assert!(pseudo_huber_scalar(0.0, 1.0).is_nan());
-        assert!(pseudo_huber_scalar(-1.0, 1.0).is_nan());
+        // Domain edge cases matching SciPy
+        assert_eq!(pseudo_huber_scalar(0.0, 1.0), 0.0);
+        assert_eq!(pseudo_huber_scalar(-1.0, 1.0), f64::INFINITY);
+        assert!(pseudo_huber_scalar(f64::NAN, 1.0).is_nan());
+        assert!(pseudo_huber_scalar(1.0, f64::NAN).is_nan());
     }
 
     #[test]
@@ -11863,8 +11865,8 @@ mod tests {
             .map_err(|err| err.to_string())?,
         )?;
         assert_eq!(huber_values[0], 0.5);
-        assert!(huber_values[1].is_nan());
-        assert!(huber_values[2].is_nan());
+        assert_eq!(huber_values[1], 0.0);
+        assert_eq!(huber_values[2], f64::INFINITY);
         assert!(huber_values[3].is_nan());
 
         let pseudo_values = expect_real_vec(
@@ -11876,8 +11878,8 @@ mod tests {
             .map_err(|err| err.to_string())?,
         )?;
         assert!(pseudo_values[0] > 0.0);
-        assert!(pseudo_values[1].is_nan());
-        assert!(pseudo_values[2].is_nan());
+        assert_eq!(pseudo_values[1], 0.0);
+        assert_eq!(pseudo_values[2], f64::INFINITY);
         assert!(pseudo_values[3].is_nan());
         Ok(())
     }
@@ -11896,6 +11898,9 @@ mod tests {
 
         // Different alpha
         assert!((elu(-1.0, 2.0) - 2.0 * ((-1.0_f64).exp() - 1.0)).abs() < 1e-14);
+
+        // Small negative x maintains full precision via exp_m1
+        assert!((elu(-1e-10, 1.0) - (-1e-10_f64).exp_m1()).abs() < 1e-25);
     }
 
     #[test]
