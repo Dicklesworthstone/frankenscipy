@@ -32417,7 +32417,7 @@ pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
         };
 
     let denom = (ssxm * ssym).sqrt();
-    if denom == 0.0 {
+    if denom == 0.0 || denom.is_nan() || ssxym.is_nan() {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -32429,6 +32429,12 @@ pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
     let r = r.clamp(-1.0, 1.0);
     // scipy returns exactly ±1 for n == 2 (mask = (n == 2) → round).
     let r = if n == 2 { r.round() } else { r };
+    if r.is_nan() {
+        return CorrelationResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
 
     // p-value via t-distribution: t = r * sqrt((n-2)/(1-r²))
     let df = nf - 2.0;
@@ -32479,7 +32485,7 @@ pub fn pearsonr_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correlat
     let ym: Vec<f64> = y.iter().map(|&yi| yi - ymean).collect();
     let xmax = xm.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     let ymax = ym.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-    if xmax == 0.0 || ymax == 0.0 {
+    if xmax == 0.0 || ymax == 0.0 || xmax.is_nan() || ymax.is_nan() {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -32487,7 +32493,7 @@ pub fn pearsonr_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correlat
     }
     let normxm = xmax * xm.iter().map(|v| (v / xmax).powi(2)).sum::<f64>().sqrt();
     let normym = ymax * ym.iter().map(|v| (v / ymax).powi(2)).sum::<f64>().sqrt();
-    if normxm == 0.0 || normym == 0.0 {
+    if normxm == 0.0 || normym == 0.0 || normxm.is_nan() || normym.is_nan() {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -32502,6 +32508,12 @@ pub fn pearsonr_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correlat
     // scipy rounds r to exactly ±1 for n == 2 (two points are always perfectly correlated; see
     // scipy.stats.pearsonr `mask = (n == 2)` → round). The vecdot otherwise lands ~1 ULP short.
     let r = if n == 2 { r.round() } else { r };
+    if r.is_nan() {
+        return CorrelationResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
 
     // p-value via the scipy convention: under the null, r is distributed
     // as Beta(n/2 − 1, n/2 − 1) on (−1, 1). Translate r ∈ [−1, 1] onto
@@ -34234,8 +34246,8 @@ pub fn skew_weighted(data: &[f64], weights: &[f64]) -> f64 {
     }
     m2 /= total_w;
     m3 /= total_w;
-    if m2 == 0.0 {
-        return 0.0;
+    if m2 == 0.0 || m2.is_nan() {
+        return f64::NAN;
     }
     m3 / m2.powf(1.5)
 }
@@ -34348,8 +34360,8 @@ pub fn kurtosis_weighted(data: &[f64], weights: &[f64]) -> f64 {
     }
     m2 /= total_w;
     m4 /= total_w;
-    if m2 == 0.0 {
-        return 0.0;
+    if m2 == 0.0 || m2.is_nan() {
+        return f64::NAN;
     }
     m4 / (m2 * m2) - 3.0
 }
@@ -73290,6 +73302,25 @@ mod tests {
             assert_eq!(negative.statistic, -1.0);
             assert_eq!(negative.pvalue, 1.0);
         }
+    }
+
+    #[test]
+    fn pearsonr_edge_cases_and_weighted_moments() {
+        // Constant inputs (zero variance) -> NaN
+        let res_const = pearsonr(&[2.0, 2.0, 2.0], &[1.0, 2.0, 3.0]);
+        assert!(res_const.statistic.is_nan());
+        assert!(res_const.pvalue.is_nan());
+
+        // NaN inputs -> NaN
+        let res_nan = pearsonr(&[1.0, f64::NAN, 3.0], &[1.0, 2.0, 3.0]);
+        assert!(res_nan.statistic.is_nan());
+        assert!(res_nan.pvalue.is_nan());
+
+        // Weighted moments on degenerate (constant) data -> NaN (matching unweighted)
+        let const_data = [3.0, 3.0, 3.0, 3.0];
+        let weights = [1.0, 2.0, 1.0, 2.0];
+        assert!(skew_weighted(&const_data, &weights).is_nan());
+        assert!(kurtosis_weighted(&const_data, &weights).is_nan());
     }
 
     // ── Spearman correlation ──────────────────────────────────────
