@@ -51715,9 +51715,11 @@ pub fn rel_entr(x: f64, y: f64) -> f64 {
 
 /// Logit function: log(p / (1 - p)).
 pub fn logit(p: f64) -> f64 {
-    if p <= 0.0 {
+    if p.is_nan() || p < 0.0 || p > 1.0 {
+        f64::NAN
+    } else if p == 0.0 {
         f64::NEG_INFINITY
-    } else if p >= 1.0 {
+    } else if p == 1.0 {
         f64::INFINITY
     } else {
         (p / (1.0 - p)).ln()
@@ -93107,6 +93109,11 @@ mod tests {
             "logit(0.5) should be 0, got {}",
             result
         );
+        assert_eq!(logit(0.0), f64::NEG_INFINITY);
+        assert_eq!(logit(1.0), f64::INFINITY);
+        assert!(logit(-0.2).is_nan());
+        assert!(logit(1.2).is_nan());
+        assert!(logit(f64::NAN).is_nan());
     }
 
     #[test]

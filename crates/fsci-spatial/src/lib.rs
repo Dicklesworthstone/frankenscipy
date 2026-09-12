@@ -502,10 +502,10 @@ pub fn minkowski(a: &[f64], b: &[f64], p: f64) -> f64 {
 ///
 /// Treats a and b as samples and computes 1 minus the Pearson correlation.
 pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len() as f64;
-    if a.len() < 2 {
-        return 0.0;
+    if a.len() != b.len() || a.len() < 2 {
+        return f64::NAN;
     }
+    let n = a.len() as f64;
     let mean_a: f64 = a.iter().sum::<f64>() / n;
     let mean_b: f64 = b.iter().sum::<f64>() / n;
     let mut ssab = 0.0;
@@ -12674,6 +12674,7 @@ mod tests {
         assert!(correlation(&[2.0, 2.0, 2.0], &[5.0, 5.0, 5.0]).is_nan());
         assert!(correlation(&[2.0, 2.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
         assert!(correlation(&[1.0, 2.0, 3.0], &[7.0, 7.0, 7.0]).is_nan());
+        assert!(correlation(&[1.0, 2.0], &[1.0, 2.0, 3.0]).is_nan());
     }
 
     #[test]
