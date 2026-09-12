@@ -5183,6 +5183,11 @@ pub fn leaves_list(z: &[[f64; 4]]) -> Vec<usize> {
 /// optimal endpoints break ties toward the lowest `(u, w)`, and the recovered
 /// per-node swaps are propagated to descendants via the rotation parity rule.
 pub fn optimal_leaf_ordering(z: &[[f64; 4]], y: &[f64]) -> Result<Vec<[f64; 4]>, ClusterError> {
+    if !is_valid_linkage(z) {
+        return Err(ClusterError::InvalidArgument(
+            "invalid linkage matrix".to_string(),
+        ));
+    }
     let n = z.len() + 1;
     if n < 2 {
         return Ok(z.to_vec());
@@ -5629,6 +5634,11 @@ pub fn maxinconsts(z: &[[f64; 4]], r: &[[f64; 4]]) -> Result<Vec<f64>, ClusterEr
 /// `T` is not a valid flat clustering of `Z` (a cluster spans more than one
 /// subtree), an error is returned.
 pub fn leaders(z: &[[f64; 4]], t: &[usize]) -> Result<(Vec<usize>, Vec<usize>), ClusterError> {
+    if !is_valid_linkage(z) {
+        return Err(ClusterError::InvalidArgument(
+            "invalid linkage matrix".to_string(),
+        ));
+    }
     let n = z.len() + 1;
     if t.len() != n {
         return Err(ClusterError::InvalidArgument(format!(
@@ -5696,6 +5706,11 @@ pub fn max_rstat(z: &[[f64; 4]], r: &[[f64; 4]], i: usize) -> Result<Vec<f64>, C
     if z.is_empty() {
         return Ok(vec![]);
     }
+    if !is_valid_linkage(z) {
+        return Err(ClusterError::InvalidArgument(
+            "invalid linkage matrix".to_string(),
+        ));
+    }
     let n = z.len() + 1;
     let mut out = vec![0.0_f64; z.len()];
     for (j, row) in z.iter().enumerate() {
@@ -5755,6 +5770,11 @@ pub fn cut_tree(
     n_clusters: Option<usize>,
     height: Option<f64>,
 ) -> Result<Vec<usize>, ClusterError> {
+    if !is_valid_linkage(z) {
+        return Err(ClusterError::InvalidArgument(
+            "invalid linkage matrix".to_string(),
+        ));
+    }
     let n = z.len() + 1;
     let num_merges = match (n_clusters, height) {
         (Some(k), None) => {
@@ -10422,6 +10442,22 @@ mod tests {
         let invalid = [[0.0, 99.0, 1.0, 2.0]];
         assert!(matches!(
             fcluster(&invalid, 1),
+            Err(ClusterError::InvalidArgument(msg)) if msg == "invalid linkage matrix"
+        ));
+        assert!(matches!(
+            cut_tree(&invalid, Some(1), None),
+            Err(ClusterError::InvalidArgument(msg)) if msg == "invalid linkage matrix"
+        ));
+        assert!(matches!(
+            leaders(&invalid, &[1, 2]),
+            Err(ClusterError::InvalidArgument(msg)) if msg == "invalid linkage matrix"
+        ));
+        assert!(matches!(
+            max_rstat(&invalid, &[[0.0, 0.0, 1.0, 0.0]], 3),
+            Err(ClusterError::InvalidArgument(msg)) if msg == "invalid linkage matrix"
+        ));
+        assert!(matches!(
+            optimal_leaf_ordering(&invalid, &[1.0]),
             Err(ClusterError::InvalidArgument(msg)) if msg == "invalid linkage matrix"
         ));
     }
