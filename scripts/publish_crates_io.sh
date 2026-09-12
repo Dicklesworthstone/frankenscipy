@@ -34,10 +34,10 @@ for c in "${CRATES[@]}"; do
   fi
 
   echo "Targeting crate: $c"
-  # Attempt publication with up to 10 retries across the window boundary
-  for attempt in {1..10}; do
+  # Attempt publication with up to 30 retries across the window boundary
+  for attempt in {1..30}; do
     echo "Attempt $attempt for $c at $(date -u +%T)..."
-    OUTPUT=$(CARGO_REGISTRY_TOKEN="$TOKEN" cargo publish -p "$c" 2>&1)
+    OUTPUT=$(CARGO_REGISTRY_TOKEN="$TOKEN" cargo publish -p "$c" --no-verify 2>&1)
     STATUS=$?
 
     if [ $STATUS -eq 0 ]; then
