@@ -33,23 +33,29 @@ for c in "${CRATES[@]}"; do
     continue
   fi
 
-  echo "Attempting publish for $c..."
-  OUTPUT=$(CARGO_REGISTRY_TOKEN="$TOKEN" cargo publish -p "$c" 2>&1)
-  STATUS=$?
+  echo "Targeting crate: $c"
+  # Attempt publication with up to 5 immediate retries if close to boundary
+  for attempt in {1..5}; do
+    echo "Attempt $attempt for $c at $(date -u +%T)..."
+    OUTPUT=$(CARGO_REGISTRY_TOKEN="$TOKEN" cargo publish -p "$c" 2>&1)
+    STATUS=$?
 
-  if [ $STATUS -eq 0 ]; then
-    echo "★ Successfully published $c v0.2.0 to crates.io!"
-    exit 0
-  else
-    echo "Publish attempt for $c failed (exit $STATUS):"
-    echo "$OUTPUT" | tail -n 5
+    if [ $STATUS -eq 0 ]; then
+      echo "★ Successfully published $c v0.2.0 to crates.io!"
+      exit 0
+    fi
+
     if echo "$OUTPUT" | grep -q "429 Too Many Requests"; then
       RESET_TIME=$(echo "$OUTPUT" | grep -o "after [^.]*" | sed 's/after //')
-      echo ">> RATE LIMITED: Next window resets at: $RESET_TIME"
-      exit 42
+      echo ">> Rate limited: $RESET_TIME"
+      sleep 1
+    else
+      echo "$OUTPUT" | tail -n 5
+      exit $STATUS
     fi
-    exit $STATUS
-  fi
+  done
+
+  exit 42
 done
 
 echo "All 19 crates are published!"
