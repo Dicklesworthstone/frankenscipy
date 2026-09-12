@@ -881,15 +881,53 @@ fn logit_scalar(p: f64, mode: RuntimeMode) -> Result<f64, SpecialError> {
     if p.is_nan() {
         return Ok(f64::NAN);
     }
-    if p <= 0.0 || p >= 1.0 {
+    if p < 0.0 || p > 1.0 {
         return match mode {
-            RuntimeMode::Strict => {
-                if p <= 0.0 {
-                    Ok(f64::NEG_INFINITY)
-                } else {
-                    Ok(f64::INFINITY)
-                }
+            RuntimeMode::Strict => Ok(f64::NAN),
+            RuntimeMode::Hardened => {
+                record_special_trace(
+                    "logit",
+                    mode,
+                    "domain_error",
+                    format!("p={p}"),
+                    "fail_closed",
+                    "p must be in (0, 1)",
+                    false,
+                );
+                Err(SpecialError {
+                    function: "logit",
+                    kind: SpecialErrorKind::DomainError,
+                    mode,
+                    detail: "p must be in (0, 1)",
+                })
             }
+        };
+    }
+    if p == 0.0 {
+        return match mode {
+            RuntimeMode::Strict => Ok(f64::NEG_INFINITY),
+            RuntimeMode::Hardened => {
+                record_special_trace(
+                    "logit",
+                    mode,
+                    "domain_error",
+                    format!("p={p}"),
+                    "fail_closed",
+                    "p must be in (0, 1)",
+                    false,
+                );
+                Err(SpecialError {
+                    function: "logit",
+                    kind: SpecialErrorKind::DomainError,
+                    mode,
+                    detail: "p must be in (0, 1)",
+                })
+            }
+        };
+    }
+    if p == 1.0 {
+        return match mode {
+            RuntimeMode::Strict => Ok(f64::INFINITY),
             RuntimeMode::Hardened => {
                 record_special_trace(
                     "logit",
@@ -9447,6 +9485,16 @@ mod tests {
             (logit_scalar(0.880_797_077_977_882_3, m).unwrap() - 2.0).abs() < 1e-12,
             "logit round-trip"
         );
+        assert_eq!(logit_scalar(0.0, m).unwrap(), f64::NEG_INFINITY);
+        assert_eq!(logit_scalar(1.0, m).unwrap(), f64::INFINITY);
+        assert!(logit_scalar(-0.1, m).unwrap().is_nan());
+        assert!(logit_scalar(1.1, m).unwrap().is_nan());
+        assert!(logit_scalar(f64::NAN, m).unwrap().is_nan());
+        let mh = RuntimeMode::Hardened;
+        assert!(logit_scalar(-0.1, mh).is_err());
+        assert!(logit_scalar(0.0, mh).is_err());
+        assert!(logit_scalar(1.0, mh).is_err());
+        assert!(logit_scalar(1.1, mh).is_err());
     }
 
     #[test]

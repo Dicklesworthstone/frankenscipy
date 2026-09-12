@@ -8992,29 +8992,29 @@ pub fn polyfromroots(roots: &[f64]) -> Vec<f64> {
 /// Uses companion matrix eigenvalue method for degree > 2.
 /// Matches `numpy.roots`.
 pub fn polyroots(coeffs: &[f64]) -> Vec<f64> {
-    let n = coeffs.len();
+    if coeffs.iter().any(|&c| !c.is_finite()) {
+        return vec![];
+    }
+    // Trim leading zeros, matching numpy.roots behavior (np.trim_zeros(p, 'f'))
+    let mut start = 0;
+    while start < coeffs.len() && coeffs[start] == 0.0 {
+        start += 1;
+    }
+    let c = &coeffs[start..];
+    let n = c.len();
     if n <= 1 {
         return vec![];
     }
     if n == 2 {
         // Linear: ax + b = 0 → x = -b/a
-        if coeffs[0] == 0.0 {
-            return vec![];
-        }
-        return vec![-coeffs[1] / coeffs[0]];
+        return vec![-c[1] / c[0]];
     }
     if n == 3 {
         // Quadratic: ax² + bx + c = 0
-        let a = coeffs[0];
-        let b = coeffs[1];
-        let c = coeffs[2];
-        if a == 0.0 {
-            if b == 0.0 {
-                return vec![];
-            }
-            return vec![-c / b];
-        }
-        let disc = b * b - 4.0 * a * c;
+        let a = c[0];
+        let b = c[1];
+        let c_val = c[2];
+        let disc = b * b - 4.0 * a * c_val;
         if disc < 0.0 {
             return vec![]; // complex roots, skip for real-only
         }
@@ -9023,8 +9023,8 @@ pub fn polyroots(coeffs: &[f64]) -> Vec<f64> {
     } else {
         // For higher degree, use Durand-Kerner method
         let degree = n - 1;
-        let a0 = coeffs[0];
-        let norm_coeffs: Vec<f64> = coeffs.iter().map(|&c| c / a0).collect();
+        let a0 = c[0];
+        let norm_coeffs: Vec<f64> = c.iter().map(|&val| val / a0).collect();
 
         // Initial guesses on unit circle
         let mut roots: Vec<(f64, f64)> = (0..degree)
@@ -15193,6 +15193,17 @@ mod tests {
         assert_eq!(polyroots(&[2.0, -4.0]), vec![2.0]);
         // x^2+1 has only complex roots -> no real roots.
         assert!(polyroots(&[1.0, 0.0, 1.0]).is_empty());
+        // Leading zeros trimming: 0*x^3 + 0*x^2 + 2x - 4 = 0 -> x = 2.
+        assert_eq!(polyroots(&[0.0, 0.0, 2.0, -4.0]), vec![2.0]);
+        // Leading zero before quadratic: 0*x^3 + x^2 - 5x + 6 = 0 -> [3.0, 2.0]
+        let r_lz = polyroots(&[0.0, 1.0, -5.0, 6.0]);
+        assert_eq!(r_lz.len(), 2);
+        assert!((r_lz[0] - 3.0).abs() < 1e-12);
+        assert!((r_lz[1] - 2.0).abs() < 1e-12);
+        // All zeros -> empty roots
+        assert!(polyroots(&[0.0, 0.0, 0.0]).is_empty());
+        // Non-finite inputs -> empty roots
+        assert!(polyroots(&[f64::NAN, 1.0, 2.0]).is_empty());
     }
 
     #[test]
