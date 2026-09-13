@@ -138,8 +138,8 @@
         "kind": "scalar",
         "value": 0.45359237,
         "atol": 0.0,
-        "rtol": 0.0,
-        "contract_ref": "scipy.constants.pound"
+        "rtol": 1e-15,
+        "contract_ref": "scipy.constants.pound (exact SI pound; 1-ULP rtol for SciPy 7000*grain float arithmetic)"
       }
     },
     {
@@ -304,8 +304,8 @@
         "kind": "scalar",
         "value": 0.45359237,
         "atol": 0.0,
-        "rtol": 0.0,
-        "contract_ref": "scipy.constants.pound"
+        "rtol": 1e-15,
+        "contract_ref": "scipy.constants.pound (exact SI pound; 1-ULP rtol for SciPy 7000*grain float arithmetic)"
       }
     },
     {
