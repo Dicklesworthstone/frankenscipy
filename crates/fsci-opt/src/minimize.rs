@@ -9,8 +9,7 @@ use crate::types::{
     OptimizeResult, OptimizeTraceEntry,
 };
 use fsci_runtime::{
-    LandscapeConditionState, OptSolverAction, OptSolverEvidenceEntry, OptSolverPortfolio,
-    RuntimeMode,
+    OptSolverAction, OptSolverEvidenceEntry, OptSolverPortfolio, RuntimeMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -227,7 +226,7 @@ where
         OptSolverAction::DIRECT => {
             let bounds: Vec<(f64, f64)> = if let Some(bnds) = options.bounds {
                 bnds.iter()
-                    .map(|b| (b.lower.unwrap_or(-10.0), b.upper.unwrap_or(10.0)))
+                    .map(|b| (b.0.unwrap_or(-10.0), b.1.unwrap_or(10.0)))
                     .collect()
             } else {
                 x0.iter().map(|&x| (x - 10.0, x + 10.0)).collect()
@@ -235,13 +234,21 @@ where
             let direct_res = crate::direct::direct(&fun, &bounds, crate::direct::DirectOptions::default())?;
             let res = OptimizeResult {
                 x: direct_res.x,
-                fun: direct_res.fun,
+                fun: Some(direct_res.fun),
                 nit: direct_res.nit,
                 nfev: direct_res.nfev,
+                njev: 0,
+                nhev: 0,
                 success: direct_res.success,
-                status: if direct_res.success { 0 } else { 1 },
+                status: if direct_res.success {
+                    ConvergenceStatus::Success
+                } else {
+                    ConvergenceStatus::MaxIterations
+                },
                 message: direct_res.message,
-                ..Default::default()
+                jac: None,
+                hess_inv: None,
+                maxcv: None,
             };
             (res, false)
         }
@@ -262,13 +269,13 @@ where
     portfolio.record_evidence(OptSolverEvidenceEntry {
         component: "fsci-opt",
         dimension: x0.len(),
-        cond_estimate,
+        condition_number_estimate: cond_estimate,
         chosen_action: action,
         posterior: posterior.to_vec(),
         expected_losses: expected_losses.to_vec(),
         chosen_expected_loss: chosen_loss,
         fallback_active: final_fallback,
-        final_fun: Some(final_res.fun),
+        gradient_norm: None,
     });
 
     Ok(OptPortfolioResult {
