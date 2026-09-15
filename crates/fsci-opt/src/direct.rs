@@ -218,7 +218,6 @@ where
     // Helper to evaluate in original space
     let mut nfev = 0;
     let mut eval_point = |norm_point: &[f64]| -> Result<f64, OptError> {
-        nfev += 1;
         let mut x = vec![0.0; n];
         for i in 0..n {
             x[i] = lb[i] + norm_point[i] * scales[i];
@@ -238,6 +237,7 @@ where
 
     // Initialization: center of unit hypercube
     let c0 = vec![0.5; n];
+    nfev += 1;
     let f0 = eval_point(&c0)?;
 
     let mut f_best = f0;
@@ -251,10 +251,12 @@ where
     for i in 0..n {
         let mut c_plus = c0.clone();
         c_plus[i] += 1.0 / 3.0;
+        nfev += 1;
         let f_plus = eval_point(&c_plus)?;
 
         let mut c_minus = c0.clone();
         c_minus[i] -= 1.0 / 3.0;
+        nfev += 1;
         let f_minus = eval_point(&c_minus)?;
 
         if f_plus < f_best {
@@ -505,10 +507,15 @@ where
                 }
                 let mut c_plus = rectangles[rect_idx].center.clone();
                 c_plus[dim] += delta;
+                nfev += 1;
                 let f_plus = eval_point(&c_plus)?;
 
+                if nfev >= maxfun {
+                    break;
+                }
                 let mut c_minus = rectangles[rect_idx].center.clone();
                 c_minus[dim] -= delta;
+                nfev += 1;
                 let f_minus = eval_point(&c_minus)?;
 
                 if f_plus < f_best {
