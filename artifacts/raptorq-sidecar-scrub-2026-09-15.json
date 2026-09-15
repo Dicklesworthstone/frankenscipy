@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "generated_unix_ms": 1789507637755,
+  "checked_artifacts": 4,
+  "entries": [
+    {
+      "artifact_path": "fixtures/artifacts/baselines/baseline_initial.json",
+      "sidecar_path": "fixtures/artifacts/baselines/baseline_initial.json.raptorq.json",
+      "decode_proof_path": "fixtures/artifacts/baselines/baseline_initial.json.decode_proof.json",
+      "source_hash": "fe41e77164469bf12437db3b8629fd9aa58d98160153df972b034379fb2ba511",
+      "source_symbols": 11,
+      "repair_symbols": 2,
+      "recovered_blocks": 1,
+      "status": "ok"
+    },
+    {
+      "artifact_path": "fixtures/artifacts/P2C-008/anchor/behavior_ledger.json",
+      "sidecar_path": "fixtures/artifacts/P2C-008/anchor/behavior_ledger.json.raptorq.json",
+      "decode_proof_path": "fixtures/artifacts/P2C-008/anchor/behavior_ledger.json.decode_proof.json",
+      "source_hash": "62b59570d10ce13eee78791a37bc7211bcebb5bac4286644bee5d2efdca74fd1",
+      "source_symbols": 119,
+      "repair_symbols": 23,
+      "recovered_blocks": 1,
+      "status": "ok"
+    },
+    {
+      "artifact_path": "crates/fsci-conformance/fixtures/artifacts/P2C-007/anchor/behavior_ledger.json",
+      "sidecar_path": "crates/fsci-conformance/fixtures/artifacts/P2C-007/anchor/behavior_ledger.json.raptorq.json",
+      "decode_proof_path": "crates/fsci-conformance/fixtures/artifacts/P2C-007/anchor/behavior_ledger.json.decode_proof.json",
+      "source_hash": "9c51e8cd9bd3920fe0087bd14f15cd0a627aaa49986b0f3638b1c6a481c506d6",
+      "source_symbols": 144,
+      "repair_symbols": 28,
+      "recovered_blocks": 1,
+      "status": "ok"
+    },
+    {
+      "artifact_path": "crates/fsci-conformance/fixtures/tolerance_baseline.json",
+      "sidecar_path": "crates/fsci-conformance/fixtures/tolerance_baseline.json.raptorq.json",
+      "decode_proof_path": "crates/fsci-conformance/fixtures/tolerance_baseline.json.decode_proof.json",
+      "source_hash": "29df144cf0c102bf1ed64acd948d5f0d1c2627b7946e192dc9b0eb76750773f7",
+      "source_symbols": 400,
+      "repair_symbols": 80,
+      "recovered_blocks": 1,
+      "status": "ok"
+    }
+  ]
+}

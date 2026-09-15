@@ -651,6 +651,8 @@ fn baselines_and_ledgers_have_decode_proofs() {
     let targets = [
         repo_root.join("fixtures/artifacts/baselines/baseline_initial.json"),
         repo_root.join("fixtures/artifacts/P2C-008/anchor/behavior_ledger.json"),
+        repo_root.join("crates/fsci-conformance/fixtures/artifacts/P2C-007/anchor/behavior_ledger.json"),
+        repo_root.join("crates/fsci-conformance/fixtures/tolerance_baseline.json"),
     ];
 
     let mut checked = 0;
@@ -700,7 +702,7 @@ fn baselines_and_ledgers_have_decode_proofs() {
     }
 
     assert!(
-        checked >= 2,
+        checked >= 4,
         "expected baseline bundles and differential audit ledgers to carry sidecars and decode proofs"
     );
 }
