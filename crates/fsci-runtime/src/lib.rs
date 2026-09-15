@@ -543,12 +543,12 @@ impl SparseSolverPortfolio {
     pub const fn default_loss_matrix() -> [[f64; 4]; 6] {
         [
             // SPD,   GenWell, Indef,  IllCond
-            [1.0, 150.0, 200.0, 250.0], // ConjugateGradient
-            [3.0, 100.0, 2.0, 200.0],   // MinRes
-            [6.0, 1.0, 45.0, 180.0],    // BiCGSTAB
-            [10.0, 4.0, 6.0, 60.0],     // GMRES
-            [12.0, 5.0, 8.0, 70.0],     // QMR
-            [40.0, 30.0, 25.0, 2.0],    // SuperLU
+            [1.0, 40.0, 50.0, 100.0], // ConjugateGradient
+            [3.0, 30.0, 2.0, 80.0],   // MinRes
+            [5.0, 1.0, 15.0, 60.0],   // BiCGSTAB
+            [8.0, 4.0, 5.0, 30.0],    // GMRES
+            [10.0, 5.0, 6.0, 35.0],   // QMR
+            [25.0, 20.0, 18.0, 2.0],  // SuperLU
         ]
     }
 
@@ -642,23 +642,25 @@ impl SparseSolverPortfolio {
         if is_sym {
             if pd_hint == Some(true) {
                 if cond_estimate < 1e4 {
-                    [0.9, 0.05, 0.03, 0.02]
+                    [0.98, 0.0, 0.0, 0.02]
                 } else {
-                    [0.6, 0.1, 0.1, 0.2]
+                    [0.78, 0.0, 0.0, 0.22]
                 }
             } else if pd_hint == Some(false) {
                 if cond_estimate < 1e4 {
-                    [0.0, 0.1, 0.85, 0.05]
+                    [0.0, 0.0, 0.97, 0.03]
                 } else {
-                    [0.0, 0.1, 0.6, 0.3]
+                    [0.0, 0.0, 0.70, 0.30]
                 }
+            } else if cond_estimate < 1e4 {
+                [0.70, 0.0, 0.28, 0.02]
             } else {
-                [0.45, 0.1, 0.4, 0.05]
+                [0.45, 0.0, 0.35, 0.20]
             }
         } else if cond_estimate < 1e4 {
-            [0.0, 0.85, 0.1, 0.05]
+            [0.0, 0.96, 0.02, 0.02]
         } else {
-            [0.0, 0.5, 0.2, 0.3]
+            [0.0, 0.60, 0.15, 0.25]
         }
     }
 }
@@ -777,8 +779,8 @@ impl OptSolverPortfolio {
             // SmoothConvex, Valley,  MultiModal, NoisyNonSmooth
             [1.0, 15.0, 120.0, 150.0], // BFGS
             [2.0, 20.0, 120.0, 150.0], // LBFGSB
-            [50.0, 60.0, 80.0, 2.0],   // NelderMead
-            [80.0, 40.0, 2.0, 10.0],   // DIRECT
+            [30.0, 30.0, 40.0, 1.0],   // NelderMead
+            [80.0, 40.0, 2.0, 20.0],   // DIRECT
             [8.0, 2.0, 70.0, 180.0],   // TrustRegionNewtonCG
         ]
     }
