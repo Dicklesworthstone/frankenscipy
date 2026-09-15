@@ -43392,11 +43392,14 @@ pub fn entropy(pk: &[f64], base: Option<f64>) -> f64 {
     if pk.is_empty() {
         return 0.0;
     }
+    if pk.iter().any(|&p| p.is_nan()) {
+        return f64::NAN;
+    }
     if pk.iter().any(|&p| p < 0.0) {
         return f64::NEG_INFINITY;
     }
     let total: f64 = pk.iter().sum();
-    if total == 0.0 {
+    if total == 0.0 || total.is_nan() {
         return f64::NAN;
     }
 
@@ -43481,13 +43484,16 @@ pub fn kl_divergence(pk: &[f64], qk: &[f64], base: Option<f64>) -> f64 {
     if pk.len() != qk.len() || pk.is_empty() {
         return f64::NAN;
     }
+    if pk.iter().any(|&p| p.is_nan()) || qk.iter().any(|&q| q.is_nan()) {
+        return f64::NAN;
+    }
     if pk.iter().any(|&p| p < 0.0) || qk.iter().any(|&q| q < 0.0) {
         return f64::NAN;
     }
 
     let sum_p: f64 = pk.iter().sum();
     let sum_q: f64 = qk.iter().sum();
-    if sum_p == 0.0 || sum_q == 0.0 {
+    if sum_p == 0.0 || sum_q == 0.0 || sum_p.is_nan() || sum_q.is_nan() {
         return f64::NAN;
     }
 
@@ -43598,13 +43604,16 @@ pub fn cross_entropy(pk: &[f64], qk: &[f64], base: Option<f64>) -> f64 {
     if pk.len() != qk.len() || pk.is_empty() {
         return f64::NAN;
     }
+    if pk.iter().any(|&p| p.is_nan()) || qk.iter().any(|&q| q.is_nan()) {
+        return f64::NAN;
+    }
     if pk.iter().any(|&p| p < 0.0) || qk.iter().any(|&q| q < 0.0) {
         return f64::NAN;
     }
 
     let sum_p: f64 = pk.iter().sum();
     let sum_q: f64 = qk.iter().sum();
-    if sum_p == 0.0 || sum_q == 0.0 {
+    if sum_p == 0.0 || sum_q == 0.0 || sum_p.is_nan() || sum_q.is_nan() {
         return f64::NAN;
     }
 
@@ -51199,7 +51208,7 @@ pub static GEOMETRIC_MEAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 pub fn geometric_mean(data: &[f64]) -> f64 {
-    if data.is_empty() || data.iter().any(|&x| x <= 0.0) {
+    if data.is_empty() || data.iter().any(|&x| x.is_nan() || x <= 0.0) {
         return f64::NAN;
     }
     // `ln` is a heavy per-element transcendental that dominates this reduction. Parallelize ONLY the
@@ -51215,7 +51224,7 @@ pub fn geometric_mean(data: &[f64]) -> f64 {
 
 /// Harmonic mean of positive values.
 pub fn harmonic_mean(data: &[f64]) -> f64 {
-    if data.is_empty() || data.iter().any(|&x| x <= 0.0) {
+    if data.is_empty() || data.iter().any(|&x| x.is_nan() || x <= 0.0) {
         return f64::NAN;
     }
     let recip_sum: f64 = data.iter().map(|&x| 1.0 / x).sum();
@@ -51225,7 +51234,7 @@ pub fn harmonic_mean(data: &[f64]) -> f64 {
 /// Power mean (generalized mean) of order p.
 /// p=1 gives arithmetic, p=-1 gives harmonic, p->0 gives geometric.
 pub fn power_mean(data: &[f64], p: f64) -> f64 {
-    if data.is_empty() {
+    if data.is_empty() || p.is_nan() || data.iter().any(|&x| x.is_nan()) {
         return f64::NAN;
     }
     if p.abs() < 1e-10 {
@@ -51254,7 +51263,7 @@ pub static POWER_MEAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// Gini coefficient - measure of statistical dispersion (inequality).
 /// Returns value between 0 (perfect equality) and 1 (perfect inequality).
 pub fn gini_coefficient(data: &[f64]) -> f64 {
-    if data.is_empty() || data.iter().any(|&x| x < 0.0) {
+    if data.is_empty() || data.iter().any(|&x| x.is_nan() || x < 0.0) {
         return f64::NAN;
     }
     let n = data.len();
@@ -51299,7 +51308,7 @@ pub fn lorenz_curve(data: &[f64]) -> (Vec<f64>, Vec<f64>) {
 
 /// Theil T index - entropy-based inequality measure.
 pub fn theil_t_index(data: &[f64]) -> f64 {
-    if data.is_empty() || data.iter().any(|&x| x <= 0.0) {
+    if data.is_empty() || data.iter().any(|&x| x.is_nan() || x <= 0.0) {
         return f64::NAN;
     }
     let n = data.len() as f64;
@@ -51315,7 +51324,7 @@ pub fn theil_t_index(data: &[f64]) -> f64 {
 
 /// Theil L index (mean log deviation).
 pub fn theil_l_index(data: &[f64]) -> f64 {
-    if data.is_empty() || data.iter().any(|&x| x <= 0.0) {
+    if data.is_empty() || data.iter().any(|&x| x.is_nan() || x <= 0.0) {
         return f64::NAN;
     }
     let n = data.len() as f64;
@@ -51328,7 +51337,7 @@ pub fn theil_l_index(data: &[f64]) -> f64 {
 
 /// Hoover index (Robin Hood index) - proportion that must be redistributed.
 pub fn hoover_index(data: &[f64]) -> f64 {
-    if data.is_empty() || data.iter().any(|&x| x < 0.0) {
+    if data.is_empty() || data.iter().any(|&x| x.is_nan() || x < 0.0) {
         return f64::NAN;
     }
     let total: f64 = data.iter().sum();
@@ -51696,25 +51705,35 @@ pub fn hausdorff_1d(u: &[f64], v: &[f64]) -> f64 {
 }
 
 /// Compute x*log(y) with proper handling of x=0.
-/// Returns 0 when x=0, regardless of y.
+/// Returns 0 when x=0, regardless of y (unless y is NaN).
 pub fn xlogy(x: f64, y: f64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
     if x == 0.0 { 0.0 } else { x * y.ln() }
 }
 
 /// Compute x*log1p(y) with proper handling of x=0.
+/// Returns 0 when x=0, regardless of y (unless y is NaN).
 pub fn xlog1py(x: f64, y: f64) -> f64 {
-    if x == 0.0 { 0.0 } else { x * (1.0 + y).ln() }
+    if x.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
+    if x == 0.0 { 0.0 } else { x * y.ln_1p() }
 }
 
 /// Relative entropy (elementwise): x*log(x/y).
-/// Returns 0 when x=0, inf when x>0 and y=0.
+/// Matches `scipy.special.rel_entr(x, y)`.
 pub fn rel_entr(x: f64, y: f64) -> f64 {
-    if x == 0.0 {
+    if x.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
+    if x == 0.0 && y >= 0.0 {
         0.0
-    } else if y == 0.0 {
-        f64::INFINITY
-    } else {
+    } else if x > 0.0 && y > 0.0 {
         x * (x / y).ln()
+    } else {
+        f64::INFINITY
     }
 }
 
@@ -93795,6 +93814,38 @@ mod tests {
     }
 
     #[test]
+    fn test_means_and_inequality_nan_handling() {
+        let nan_data = [1.0, f64::NAN, 4.0];
+        assert!(geometric_mean(&nan_data).is_nan());
+        assert!(geometric_mean(&[]).is_nan());
+        assert!(geometric_mean(&[-1.0, 2.0]).is_nan());
+
+        assert!(harmonic_mean(&nan_data).is_nan());
+        assert!(harmonic_mean(&[]).is_nan());
+        assert!(harmonic_mean(&[-1.0, 2.0]).is_nan());
+
+        assert!(power_mean(&nan_data, 1.0).is_nan());
+        assert!(power_mean(&[1.0, 2.0], f64::NAN).is_nan());
+        assert!(power_mean(&[], 1.0).is_nan());
+
+        assert!(gini_coefficient(&nan_data).is_nan());
+        assert!(gini_coefficient(&[]).is_nan());
+        assert!(gini_coefficient(&[-1.0, 2.0]).is_nan());
+
+        assert!(theil_t_index(&nan_data).is_nan());
+        assert!(theil_t_index(&[]).is_nan());
+        assert!(theil_t_index(&[-1.0, 2.0]).is_nan());
+
+        assert!(theil_l_index(&nan_data).is_nan());
+        assert!(theil_l_index(&[]).is_nan());
+        assert!(theil_l_index(&[-1.0, 2.0]).is_nan());
+
+        assert!(hoover_index(&nan_data).is_nan());
+        assert!(hoover_index(&[]).is_nan());
+        assert!(hoover_index(&[-1.0, 2.0]).is_nan());
+    }
+
+    #[test]
     fn histogram_matches_numpy_reference() {
         // numpy.histogram([1,2,2,3,3,3,4,4,4,4], bins=4)
         // Returns (counts, bin_edges)
@@ -94841,6 +94892,10 @@ mod tests {
             0.510_825_623_765_990_6,
             "kl",
         );
+        assert!(entropy(&[f64::NAN, 0.5], None).is_nan());
+        assert!(entropy(&[0.5, f64::NAN], None).is_nan());
+        assert!(kl_divergence(&[f64::NAN, 0.5], &[0.5, 0.5], None).is_nan());
+        assert!(kl_divergence(&[0.5, 0.5], &[f64::NAN, 0.5], None).is_nan());
     }
 
     #[test]
@@ -95653,6 +95708,13 @@ mod tests {
             (unnorm - 1.3862943611198906).abs() < 1e-12,
             "unnormalized uniform entropy"
         );
+
+        // Edge cases and NaNs
+        assert!(entropy(&[0.5, f64::NAN], None).is_nan());
+        assert!(entropy(&[f64::NAN, 0.5], None).is_nan());
+        assert_eq!(entropy(&[], None), 0.0);
+        assert_eq!(entropy(&[-0.5, 0.5], None), f64::NEG_INFINITY);
+        assert!(entropy(&[0.0, 0.0], None).is_nan());
     }
 
     #[test]
@@ -95687,6 +95749,16 @@ mod tests {
             (kl1 - kl2).abs() > 0.1,
             "KL divergence should be asymmetric"
         );
+
+        // Edge cases and NaNs
+        assert!(kl_divergence(&[0.5, f64::NAN], &[0.5, 0.5], None).is_nan());
+        assert!(kl_divergence(&[0.5, 0.5], &[0.5, f64::NAN], None).is_nan());
+        assert!(kl_divergence(&[-0.5, 0.5], &[0.5, 0.5], None).is_nan());
+        assert!(kl_divergence(&[0.5, 0.5], &[-0.5, 0.5], None).is_nan());
+        assert!(kl_divergence(&[0.0, 0.0], &[0.5, 0.5], None).is_nan());
+        assert!(kl_divergence(&[0.5, 0.5], &[0.0, 0.0], None).is_nan());
+        assert!(kl_divergence(&[0.5], &[0.5, 0.5], None).is_nan());
+        assert!(kl_divergence(&[], &[], None).is_nan());
     }
 
     #[test]
@@ -95704,30 +95776,56 @@ mod tests {
 
         // scipy.special.rel_entr(0, y) = 0 for y >= 0
         assert!(rel_entr(0.0, 0.5).abs() < 1e-12, "rel_entr(0, 0.5) = 0");
+        assert_eq!(rel_entr(0.0, 0.0), 0.0);
+        assert_eq!(rel_entr(0.0, 1.0), 0.0);
 
         // scipy.special.rel_entr(x, 0) = inf for x > 0
         assert!(
             rel_entr(0.5, 0.0).is_infinite() && rel_entr(0.5, 0.0) > 0.0,
             "rel_entr(0.5, 0) = inf"
         );
+        assert_eq!(rel_entr(0.0, -1.0), f64::INFINITY);
+        assert_eq!(rel_entr(-1.0, 0.0), f64::INFINITY);
+        assert_eq!(rel_entr(-1.0, 1.0), f64::INFINITY);
+        assert_eq!(rel_entr(1.0, -1.0), f64::INFINITY);
+        assert_eq!(rel_entr(-1.0, -1.0), f64::INFINITY);
+        assert!(rel_entr(0.0, f64::NAN).is_nan());
+        assert!(rel_entr(f64::NAN, 0.0).is_nan());
+        assert!(rel_entr(f64::NAN, f64::NAN).is_nan());
+        assert!(rel_entr(1.0, f64::NAN).is_nan());
+        assert!(rel_entr(f64::NAN, 1.0).is_nan());
     }
 
     #[test]
     fn xlogy_xlog1py_match_scipy_special() {
-        // scipy.special.xlogy(0, y) = 0 for any y
+        // scipy.special.xlogy(0, y) = 0 for any y (except NaN)
         assert!(xlogy(0.0, 5.0).abs() < 1e-12, "xlogy(0, 5) = 0");
         assert!(xlogy(0.0, 0.0).abs() < 1e-12, "xlogy(0, 0) = 0");
+        assert!(xlogy(0.0, -2.0).abs() < 1e-12, "xlogy(0, -2) = 0");
+        assert!(xlogy(0.0, f64::NAN).is_nan(), "xlogy(0, NaN) = NaN");
+        assert!(xlogy(f64::NAN, 0.0).is_nan(), "xlogy(NaN, 0) = NaN");
+        assert!(xlogy(f64::NAN, f64::NAN).is_nan(), "xlogy(NaN, NaN) = NaN");
 
         // scipy.special.xlogy(2, 3) = 2 * ln(3) = 2.1972245773362196
         let xy1 = xlogy(2.0, 3.0);
         assert!((xy1 - 2.1972245773362196).abs() < 1e-12, "xlogy(2, 3)");
 
-        // scipy.special.xlog1py(0, y) = 0 for any y
+        // scipy.special.xlog1py(0, y) = 0 for any y (except NaN)
         assert!(xlog1py(0.0, 5.0).abs() < 1e-12, "xlog1py(0, 5) = 0");
+        assert!(xlog1py(0.0, 0.0).abs() < 1e-12, "xlog1py(0, 0) = 0");
+        assert!(xlog1py(0.0, -0.5).abs() < 1e-12, "xlog1py(0, -0.5) = 0");
+        assert!(xlog1py(0.0, f64::NAN).is_nan(), "xlog1py(0, NaN) = NaN");
+        assert!(xlog1py(f64::NAN, 0.0).is_nan(), "xlog1py(NaN, 0) = NaN");
+        assert!(xlog1py(f64::NAN, f64::NAN).is_nan(), "xlog1py(NaN, NaN) = NaN");
 
         // scipy.special.xlog1py(2, 3) = 2 * ln(4) = 2.772588722239781
         let xy2 = xlog1py(2.0, 3.0);
         assert!((xy2 - 2.772588722239781).abs() < 1e-12, "xlog1py(2, 3)");
+
+        // Small y precision test for xlog1py (checking ln_1p avoids cancellation)
+        let small_y: f64 = 1e-15;
+        let expected_small = 2.0 * small_y.ln_1p();
+        assert!((xlog1py(2.0, small_y) - expected_small).abs() < 1e-25);
     }
 
     #[test]
@@ -99569,6 +99667,11 @@ mod tests {
         // A zero-mass q cannot itself be normalized; SciPy reports NaN for it.
         assert!(cross_entropy(&[1.0], &[0.0], None).is_nan());
         assert!(cross_entropy(&[1.0], &[-1.0], None).is_nan());
+        assert!(cross_entropy(&[1.0, f64::NAN], &[1.0, 3.0], None).is_nan());
+        assert!(cross_entropy(&[1.0, 1.0], &[1.0, f64::NAN], None).is_nan());
+        assert!(cross_entropy(&[f64::NAN], &[1.0], None).is_nan());
+        assert!(cross_entropy(&[], &[], None).is_nan());
+        assert!(cross_entropy(&[1.0], &[1.0, 2.0], None).is_nan());
 
         // pandas.Series([1, 2, 3]).ewm(span=2, adjust=False).mean().
         let smoothed = ewma(&[1.0, 2.0, 3.0], 2.0);
