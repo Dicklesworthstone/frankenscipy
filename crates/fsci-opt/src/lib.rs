@@ -38,9 +38,11 @@ pub use linesearch::{
 };
 pub use minimize::{
     MinimizeScalarOptions, MinimizeScalarResult, OptCaspDecision, OptCaspProblem,
+    OptPortfolioResult,
     TRUST_EXACT_CHOLESKY_DISABLE, TRUST_EXACT_FLAT_AUGMENTED_DISABLE,
     TRUST_EXACT_FOLD_SHIFT_DISABLE, bfgs, cg_pr_plus, get_optimize_traces, lbfgsb, minimize,
-    minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit, nelder_mead,
+    minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit,
+    minimize_with_casp_portfolio, nelder_mead,
     newton_cg, powell, select_minimize_method, trust_exact,
 };
 // NOTE on the two `anderson` functions, resolved conservatively rather than by
