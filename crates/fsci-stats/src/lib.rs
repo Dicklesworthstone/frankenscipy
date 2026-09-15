@@ -31390,9 +31390,8 @@ pub fn logrank_censored(x: &CensoredData, y: &CensoredData, alternative: &str) -
     y_deaths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let count_ge = |s: &[f64], t: f64| (s.len() - s.partition_point(|&v| v < t)) as f64;
-    let count_eq = |s: &[f64], t: f64| {
-        (s.partition_point(|&v| v <= t) - s.partition_point(|&v| v < t)) as f64
-    };
+    let count_eq =
+        |s: &[f64], t: f64| (s.partition_point(|&v| v <= t) - s.partition_point(|&v| v < t)) as f64;
 
     let mut sum_var = 0.0_f64;
     let mut sum_exp_x = 0.0_f64;
@@ -95913,7 +95912,10 @@ mod tests {
         assert!(xlog1py(0.0, -0.5).abs() < 1e-12, "xlog1py(0, -0.5) = 0");
         assert!(xlog1py(0.0, f64::NAN).is_nan(), "xlog1py(0, NaN) = NaN");
         assert!(xlog1py(f64::NAN, 0.0).is_nan(), "xlog1py(NaN, 0) = NaN");
-        assert!(xlog1py(f64::NAN, f64::NAN).is_nan(), "xlog1py(NaN, NaN) = NaN");
+        assert!(
+            xlog1py(f64::NAN, f64::NAN).is_nan(),
+            "xlog1py(NaN, NaN) = NaN"
+        );
 
         // scipy.special.xlog1py(2, 3) = 2 * ln(4) = 2.772588722239781
         let xy2 = xlog1py(2.0, 3.0);
@@ -104479,16 +104481,12 @@ mod histogram_distribution_matches_scipy {
     fn test_censored_data_and_logrank() {
         use crate::{CensoredData, logrank_censored};
 
-        let x = CensoredData::right_censored(
-            &[10.0, 20.0, 30.0, 40.0],
-            &[false, true, false, true],
-        )
-        .unwrap();
-        let y = CensoredData::right_censored(
-            &[15.0, 25.0, 35.0, 45.0],
-            &[false, false, true, false],
-        )
-        .unwrap();
+        let x =
+            CensoredData::right_censored(&[10.0, 20.0, 30.0, 40.0], &[false, true, false, true])
+                .unwrap();
+        let y =
+            CensoredData::right_censored(&[15.0, 25.0, 35.0, 45.0], &[false, false, true, false])
+                .unwrap();
 
         assert_eq!(x.len(), 4);
         assert_eq!(x.num_censored(), 2);
@@ -104528,4 +104526,3 @@ mod histogram_distribution_matches_scipy {
         assert!((color[2] - 4.0).abs() < 1e-12);
     }
 }
-

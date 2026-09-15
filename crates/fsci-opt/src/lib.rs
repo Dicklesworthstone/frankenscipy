@@ -16,11 +16,11 @@ pub mod root;
 pub mod types;
 
 pub use audit::{SyncSharedAuditLedger, record_fail_closed, sync_audit_ledger};
-pub use direct::{DirectOptions, DirectResult, direct, direct_with_callback};
 pub use bracket::{
     BracketOptions, BracketResult, MinimumBracketOptions, MinimumBracketResult,
     MinimumBracketStatus, bracket_minimum, bracket_root,
 };
+pub use direct::{DirectOptions, DirectResult, direct, direct_with_callback};
 pub use lbfgs_inv_hess::LbfgsInvHessProduct;
 
 pub use chandrupatla::{
@@ -38,12 +38,11 @@ pub use linesearch::{
 };
 pub use minimize::{
     MinimizeScalarOptions, MinimizeScalarResult, OptCaspDecision, OptCaspProblem,
-    OptPortfolioResult,
-    TRUST_EXACT_CHOLESKY_DISABLE, TRUST_EXACT_FLAT_AUGMENTED_DISABLE,
+    OptPortfolioResult, TRUST_EXACT_CHOLESKY_DISABLE, TRUST_EXACT_FLAT_AUGMENTED_DISABLE,
     TRUST_EXACT_FOLD_SHIFT_DISABLE, bfgs, cg_pr_plus, get_optimize_traces, lbfgsb, minimize,
     minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit,
-    minimize_with_casp_portfolio, nelder_mead,
-    newton_cg, powell, select_minimize_method, trust_exact,
+    minimize_with_casp_portfolio, nelder_mead, newton_cg, powell, select_minimize_method,
+    trust_exact,
 };
 // NOTE on the two `anderson` functions, resolved conservatively rather than by
 // picking a winner. `root::anderson(func, x0, tol, maxiter, m, beta) ->

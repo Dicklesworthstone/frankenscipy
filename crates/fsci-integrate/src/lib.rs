@@ -13,12 +13,13 @@ pub mod step_size;
 pub mod validation;
 
 pub use api::{
-    EventFn, EventSpec, OdePortfolioResult, OdeSolution, SolveIvpOptions, SolveIvpResult, SolverKind,
-    solve_ivp, solve_ivp_many, solve_ivp_with_audit, solve_ivp_with_casp_portfolio,
+    EventFn, EventSpec, OdePortfolioResult, OdeSolution, SolveIvpOptions, SolveIvpResult,
+    SolverKind, solve_ivp, solve_ivp_many, solve_ivp_with_audit, solve_ivp_with_casp_portfolio,
 };
 pub use bdf::{BdfSolver, BdfSolverConfig};
 pub use bvp::{BvpError, BvpOptions, BvpResult, solve_bvp, solve_bvp_many};
 pub use complex::{ComplexOdeResult, complex_ode};
+pub use fsci_runtime::{StiffnessConditionState, StiffnessDetector};
 pub use lebedev::{LebedevRule, lebedev_rule};
 pub use quad::{
     CompositeQuadResult, CubatureOptions, CubatureRegion, CubatureResult, CubatureRule,

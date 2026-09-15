@@ -584,7 +584,12 @@ impl SparseSolverPortfolio {
             }
         }
 
-        (SparseSolverAction::ALL[best_idx], posterior, losses, best_loss)
+        (
+            SparseSolverAction::ALL[best_idx],
+            posterior,
+            losses,
+            best_loss,
+        )
     }
 
     pub fn record_evidence(&mut self, entry: SparseSolverEvidenceEntry) {
@@ -929,13 +934,7 @@ pub enum OdeSolverAction {
 }
 
 impl OdeSolverAction {
-    pub const ALL: [Self; 5] = [
-        Self::RK45,
-        Self::RK23,
-        Self::DOP853,
-        Self::Radau,
-        Self::BDF,
-    ];
+    pub const ALL: [Self; 5] = [Self::RK45, Self::RK23, Self::DOP853, Self::Radau, Self::BDF];
 
     #[must_use]
     pub fn index(self) -> usize {
@@ -1076,11 +1075,8 @@ impl OdeSolverPortfolio {
         is_algebraic_dae: bool,
     ) -> (OdeSolverAction, [f64; 4], [f64; 5], f64) {
         let online_stiff = self.detector.is_stiff(stiffness_ratio_estimate);
-        let posterior = Self::stiffness_posterior(
-            stiffness_ratio_estimate,
-            is_algebraic_dae,
-            online_stiff,
-        );
+        let posterior =
+            Self::stiffness_posterior(stiffness_ratio_estimate, is_algebraic_dae, online_stiff);
 
         // If conformal calibrator triggers drift, fallback to Radau
         if self.calibrator.should_fallback() {

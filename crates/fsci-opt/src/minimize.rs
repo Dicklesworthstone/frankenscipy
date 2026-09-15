@@ -5,12 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::linesearch::{WolfeParams, line_search_wolfe2, line_search_wolfe2_with_gradient_probe};
 use crate::types::{
-    Bound, ConvergenceStatus, GradientFunc, MinimizeOptions, OptError, OptimizeMethod,
+    Bound, Bounds, ConvergenceStatus, GradientFunc, MinimizeOptions, OptError, OptimizeMethod,
     OptimizeResult, OptimizeTraceEntry,
 };
-use fsci_runtime::{
-    OptSolverAction, OptSolverEvidenceEntry, OptSolverPortfolio, RuntimeMode,
-};
+use fsci_runtime::{OptSolverAction, OptSolverEvidenceEntry, OptSolverPortfolio, RuntimeMode};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OptCaspProblem {
@@ -224,14 +222,19 @@ where
             (res, false)
         }
         OptSolverAction::DIRECT => {
-            let bounds: Vec<(f64, f64)> = if let Some(bnds) = options.bounds {
+            let (lb, ub): (Vec<f64>, Vec<f64>) = if let Some(bnds) = options.bounds {
                 bnds.iter()
                     .map(|b| (b.0.unwrap_or(-10.0), b.1.unwrap_or(10.0)))
-                    .collect()
+                    .unzip()
             } else {
-                x0.iter().map(|&x| (x - 10.0, x + 10.0)).collect()
+                x0.iter().map(|&x| (x - 10.0, x + 10.0)).unzip()
             };
-            let direct_res = crate::direct::direct(&fun, &bounds, crate::direct::DirectOptions::default())?;
+            let direct_bounds = Bounds::new(lb, ub)?;
+            let direct_res = crate::direct::direct(
+                &fun,
+                &direct_bounds,
+                crate::direct::DirectOptions::default(),
+            )?;
             let res = OptimizeResult {
                 x: direct_res.x,
                 fun: Some(direct_res.fun),
@@ -4317,13 +4320,13 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use fsci_runtime::RuntimeMode;
+    use fsci_runtime::{OptSolverAction, OptSolverPortfolio, RuntimeMode};
     use proptest::prelude::*;
     use serde::Serialize;
 
     use super::{slsqp, tnc, trust_constr};
 
-    use super::{Objective, golden_section_direction_search};
+    use super::{Objective, golden_section_direction_search, minimize_with_casp_portfolio};
     use crate::{
         Bound, ConvergenceStatus, MinimizeOptions, MinimizeScalarOptions, OptCaspProblem, OptError,
         OptimizeMethod, OptimizeResult, bfgs, cg_pr_plus, get_optimize_traces, minimize,

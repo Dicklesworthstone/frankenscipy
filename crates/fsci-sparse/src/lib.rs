@@ -194,6 +194,7 @@ pub use linalg::{
     reverse_cuthill_mckee,
     select_casp_iterative_solver,
     shortest_path,
+    solve_with_casp_portfolio,
     sparse_abs,
     sparse_add,
     sparse_col_sums,
@@ -228,7 +229,6 @@ pub use linalg::{
     // Direct solvers
     spsolve,
     spsolve_triangular,
-    solve_with_casp_portfolio,
     strongly_connected_components,
     structural_rank,
     svds,
@@ -2773,7 +2773,10 @@ mod tests {
         )
         .expect("portfolio solve");
 
-        assert_eq!(res.chosen_action, fsci_runtime::SparseSolverAction::ConjugateGradient);
+        assert_eq!(
+            res.chosen_action,
+            fsci_runtime::SparseSolverAction::ConjugateGradient
+        );
         assert!(res.converged);
         assert_eq!(portfolio.evidence_len(), 1);
     }
@@ -2841,9 +2844,11 @@ mod tests {
         )
         .expect("portfolio solve");
 
-        assert_eq!(res.chosen_action, fsci_runtime::SparseSolverAction::BiCGSTAB);
+        assert_eq!(
+            res.chosen_action,
+            fsci_runtime::SparseSolverAction::BiCGSTAB
+        );
         assert!(res.converged);
         assert_eq!(portfolio.evidence_len(), 1);
     }
 }
-

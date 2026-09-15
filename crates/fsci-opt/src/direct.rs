@@ -344,7 +344,10 @@ where
     let format_message = |code: i32| -> String {
         match code {
             1 => format!("Number of function evaluations done is larger than maxfun={maxfun}"),
-            2 => format!("Number of iterations is larger than maxiter={}", options.maxiter),
+            2 => format!(
+                "Number of iterations is larger than maxiter={}",
+                options.maxiter
+            ),
             3 => format!(
                 "The best function value found is within a relative error={} of the (known) global optimum f_min",
                 options.f_min_rtol
@@ -362,38 +365,36 @@ where
     };
 
     // Check termination after initialization
-    let check_termination = |best_rect: &HyperRectangle,
-                             nit: usize,
-                             nfev: usize|
-     -> Option<(i32, bool, String)> {
-        // 1. Known f_min condition
-        if options.f_min > f64::NEG_INFINITY {
-            let denom = options.f_min.abs().max(1.0);
-            if (best_rect.f - options.f_min).abs() / denom <= options.f_min_rtol {
-                return Some((3, true, format_message(3)));
+    let check_termination =
+        |best_rect: &HyperRectangle, nit: usize, nfev: usize| -> Option<(i32, bool, String)> {
+            // 1. Known f_min condition
+            if options.f_min > f64::NEG_INFINITY {
+                let denom = options.f_min.abs().max(1.0);
+                if (best_rect.f - options.f_min).abs() / denom <= options.f_min_rtol {
+                    return Some((3, true, format_message(3)));
+                }
             }
-        }
 
-        // 2. Volume tolerance
-        if best_rect.volume(&pow3_inv) <= options.vol_tol {
-            return Some((4, true, format_message(4)));
-        }
+            // 2. Volume tolerance
+            if best_rect.volume(&pow3_inv) <= options.vol_tol {
+                return Some((4, true, format_message(4)));
+            }
 
-        // 3. Side length measure tolerance
-        if best_rect.side_length_measure(options.locally_biased, &pow3_inv) <= options.len_tol {
-            return Some((5, true, format_message(5)));
-        }
+            // 3. Side length measure tolerance
+            if best_rect.side_length_measure(options.locally_biased, &pow3_inv) <= options.len_tol {
+                return Some((5, true, format_message(5)));
+            }
 
-        // 4. Budgets
-        if nfev >= maxfun {
-            return Some((1, false, format_message(1)));
-        }
-        if nit >= options.maxiter {
-            return Some((2, false, format_message(2)));
-        }
+            // 4. Budgets
+            if nfev >= maxfun {
+                return Some((1, false, format_message(1)));
+            }
+            if nit >= options.maxiter {
+                return Some((2, false, format_message(2)));
+            }
 
-        None
-    };
+            None
+        };
 
     if let Some((status, success, message)) =
         check_termination(&rectangles[best_rect_idx], nit, nfev)
@@ -675,8 +676,7 @@ mod tests {
         opts.len_tol = 1e-3;
         let res = direct(
             |x| {
-                0.5 * (x[0].powi(4) - 16.0 * x[0].powi(2) + 5.0 * x[0]
-                    + x[1].powi(4)
+                0.5 * (x[0].powi(4) - 16.0 * x[0].powi(2) + 5.0 * x[0] + x[1].powi(4)
                     - 16.0 * x[1].powi(2)
                     + 5.0 * x[1])
             },

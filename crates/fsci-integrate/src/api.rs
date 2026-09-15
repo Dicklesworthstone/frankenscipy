@@ -2,10 +2,7 @@
 
 use fsci_opt::root::brentq;
 use fsci_opt::types::RootOptions;
-use fsci_runtime::{
-    OdeSolverAction, OdeSolverEvidenceEntry, OdeSolverPortfolio, RuntimeMode,
-    StiffnessConditionState, StiffnessDetector,
-};
+use fsci_runtime::{OdeSolverAction, OdeSolverEvidenceEntry, OdeSolverPortfolio, RuntimeMode};
 
 use crate::IntegrateValidationError;
 use crate::bdf::{BdfSolver, BdfSolverConfig};

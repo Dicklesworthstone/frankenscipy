@@ -11,8 +11,8 @@ use fsci_linalg::{
     solve_banded as dense_solve_banded, solveh_banded as dense_solveh_banded,
 };
 use fsci_runtime::{
-    RuntimeMode, SparseConditionState, SparseSolverAction, SparseSolverEvidenceEntry,
-    SparseSolverPortfolio, SparseStructuralEvidence,
+    RuntimeMode, SparseSolverAction, SparseSolverEvidenceEntry, SparseSolverPortfolio,
+    SparseStructuralEvidence,
 };
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use rayon::prelude::*;
@@ -9842,11 +9842,17 @@ pub fn solve_with_casp_portfolio(
 ) -> SparseResult<CaspPortfolioSolveResult> {
     let shape = a.shape();
     if !shape.is_square() {
-        return Err(SparseError::ExpectedSquareMatrix);
+        return Err(SparseError::InvalidShape {
+            message: "matrix must be square".to_string(),
+        });
     }
     if b.len() != shape.rows {
         return Err(SparseError::IncompatibleShape {
-            message: format!("rhs length {} must match matrix rows {}", b.len(), shape.rows),
+            message: format!(
+                "rhs length {} must match matrix rows {}",
+                b.len(),
+                shape.rows
+            ),
         });
     }
     if let Some(initial) = x0
@@ -9911,46 +9917,75 @@ pub fn solve_with_casp_portfolio(
     let (x, converged, iters, res_norm, fallback_active) = match action {
         SparseSolverAction::ConjugateGradient => {
             let res = cg(a, b, x0, iterative_opts)?;
-            (res.x, res.converged, res.iterations, res.residual_norm, false)
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
         }
         SparseSolverAction::MinRes => {
             let res = minres(a, b, x0, iterative_opts)?;
-            (res.x, res.converged, res.iterations, res.residual_norm, false)
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
         }
         SparseSolverAction::BiCGSTAB => {
             let res = bicgstab(a, b, x0, iterative_opts)?;
-            (res.x, res.converged, res.iterations, res.residual_norm, false)
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
         }
         SparseSolverAction::GMRES => {
             let res = gmres(a, b, x0, iterative_opts)?;
-            (res.x, res.converged, res.iterations, res.residual_norm, false)
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
         }
         SparseSolverAction::QMR => {
             let res = qmr(a, b, x0, iterative_opts)?;
-            (res.x, res.converged, res.iterations, res.residual_norm, false)
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
         }
         SparseSolverAction::SuperLU => {
             let res = spsolve(a, b, SolveOptions::default())?;
-            (res.x, true, 1, 0.0, false)
+            (res.solution, true, 1, 0.0, false)
         }
     };
 
-    let (final_x, final_converged, final_iters, final_res, final_fallback) =
-        if !converged
-            && action != SparseSolverAction::SuperLU
-            && portfolio.mode() == RuntimeMode::Hardened
-        {
-            match spsolve(a, b, SolveOptions::default()) {
-                Ok(slv) => (slv.x, true, iters + 1, 0.0, true),
-                Err(_) => (x, converged, iters, res_norm, fallback_active),
-            }
-        } else {
-            (x, converged, iters, res_norm, fallback_active)
-        };
+    let (final_x, final_converged, final_iters, final_res, final_fallback) = if !converged
+        && action != SparseSolverAction::SuperLU
+        && portfolio.mode() == RuntimeMode::Hardened
+    {
+        match spsolve(a, b, SolveOptions::default()) {
+            Ok(slv) => (slv.solution, true, iters + 1, 0.0, true),
+            Err(_) => (x, converged, iters, res_norm, fallback_active),
+        }
+    } else {
+        (x, converged, iters, res_norm, fallback_active)
+    };
 
     portfolio.record_evidence(SparseSolverEvidenceEntry {
         component: "fsci-sparse",
-        shape: (shape.rows, shape.cols),
+        matrix_shape: (shape.rows, shape.cols),
         nnz: a.nnz(),
         cond_estimate,
         chosen_action: action,
@@ -9958,7 +9993,7 @@ pub fn solve_with_casp_portfolio(
         expected_losses: expected_losses.to_vec(),
         chosen_expected_loss: chosen_loss,
         fallback_active: final_fallback,
-        residual_norm: Some(final_res),
+        relative_residual: Some(final_res),
     });
 
     Ok(CaspPortfolioSolveResult {
