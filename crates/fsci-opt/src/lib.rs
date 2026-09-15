@@ -7,6 +7,7 @@ pub mod audit;
 pub mod bracket;
 pub mod chandrupatla;
 pub mod curvefit;
+pub mod direct;
 pub mod lbfgs_inv_hess;
 pub mod linesearch;
 pub mod minimize;
@@ -15,6 +16,7 @@ pub mod root;
 pub mod types;
 
 pub use audit::{SyncSharedAuditLedger, record_fail_closed, sync_audit_ledger};
+pub use direct::{DirectOptions, DirectResult, direct, direct_with_callback};
 pub use bracket::{
     BracketOptions, BracketResult, MinimumBracketOptions, MinimumBracketResult,
     MinimumBracketStatus, bracket_minimum, bracket_root,
