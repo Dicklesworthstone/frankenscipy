@@ -104477,6 +104477,8 @@ mod histogram_distribution_matches_scipy {
 
     #[test]
     fn test_censored_data_and_logrank() {
+        use crate::{CensoredData, logrank_censored};
+
         let x = CensoredData::right_censored(
             &[10.0, 20.0, 30.0, 40.0],
             &[false, true, false, true],
@@ -104508,6 +104510,8 @@ mod histogram_distribution_matches_scipy {
 
     #[test]
     fn test_covariance_diagonal() {
+        use crate::Covariance;
+
         let cov = Covariance::from_diagonal(&[1.0, 2.0, 4.0]).unwrap();
         assert_eq!(cov.shape(), (3, 3));
         assert_eq!(cov.rank(), 3);
