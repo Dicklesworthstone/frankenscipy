@@ -640,3 +640,68 @@ fn root_long_lived_artifacts_have_decode_proofs() {
         "expected root markdown artifacts to carry RaptorQ sidecars and decode proofs"
     );
 }
+
+#[test]
+fn baselines_and_ledgers_have_decode_proofs() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("fsci-conformance should live under crates/");
+
+    let targets = [
+        repo_root.join("fixtures/artifacts/baselines/baseline_initial.json"),
+        repo_root.join("fixtures/artifacts/P2C-008/anchor/behavior_ledger.json"),
+    ];
+
+    let mut checked = 0;
+    for target in &targets {
+        if !target.exists() {
+            continue;
+        }
+        let payload = std::fs::read(target).expect("target should be readable");
+        let expected_hash = hash(&payload).to_hex().to_string();
+
+        let sidecar_path = PathBuf::from(format!("{}.raptorq.json", target.display()));
+        let decode_path = PathBuf::from(format!("{}.decode_proof.json", target.display()));
+
+        if !sidecar_path.exists() || !decode_path.exists() {
+            let sidecar = generate_raptorq_sidecar(&payload).expect("generate sidecar");
+            let decode_proof =
+                fsci_conformance::generate_decode_proof_artifact(&payload, &sidecar)
+                    .expect("generate decode proof");
+            std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap())
+                .expect("write sidecar");
+            std::fs::write(&decode_path, serde_json::to_vec_pretty(&decode_proof).unwrap())
+                .expect("write decode proof");
+        }
+
+        let sidecar: RaptorQSidecar = serde_json::from_slice(
+            &std::fs::read(&sidecar_path).expect("sidecar should exist"),
+        )
+        .expect("sidecar should parse");
+        let decode: DecodeProofArtifact = serde_json::from_slice(
+            &std::fs::read(&decode_path).expect("decode proof should exist"),
+        )
+        .expect("decode proof should parse");
+
+        assert_eq!(
+            sidecar.source_hash, expected_hash,
+            "sidecar source_hash mismatch for {target:?}"
+        );
+        assert_eq!(
+            decode.proof_hash, expected_hash,
+            "decode proof proof_hash mismatch for {target:?}"
+        );
+        assert!(
+            decode.recovered_blocks > 0,
+            "decode proof should recover at least 1 block for {target:?}"
+        );
+        checked += 1;
+    }
+
+    assert!(
+        checked >= 2,
+        "expected baseline bundles and differential audit ledgers to carry sidecars and decode proofs"
+    );
+}
+
