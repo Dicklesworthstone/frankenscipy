@@ -2,7 +2,10 @@
 
 use fsci_opt::root::brentq;
 use fsci_opt::types::RootOptions;
-use fsci_runtime::RuntimeMode;
+use fsci_runtime::{
+    OdeSolverAction, OdeSolverEvidenceEntry, OdeSolverPortfolio, RuntimeMode,
+    StiffnessConditionState, StiffnessDetector,
+};
 
 use crate::IntegrateValidationError;
 use crate::bdf::{BdfSolver, BdfSolverConfig};
@@ -927,6 +930,73 @@ where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
     solve_ivp_impl(fun, options, Some(audit_ledger))
+}
+
+impl From<OdeSolverAction> for SolverKind {
+    fn from(action: OdeSolverAction) -> Self {
+        match action {
+            OdeSolverAction::RK45 => Self::Rk45,
+            OdeSolverAction::RK23 => Self::Rk23,
+            OdeSolverAction::DOP853 => Self::Dop853,
+            OdeSolverAction::Radau => Self::Radau,
+            OdeSolverAction::BDF => Self::Bdf,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OdePortfolioResult {
+    pub chosen_action: OdeSolverAction,
+    pub posterior: [f64; 4],
+    pub expected_losses: [f64; 5],
+    pub result: SolveIvpResult,
+    pub fallback_active: bool,
+}
+
+/// Solve an initial value problem using CASP Bayesian expected-loss portfolio selection.
+///
+/// Selects RK45 for non-stiff dynamics, Radau IIA for algebraic/DAE constraints,
+/// and BDF for stiff systems, with online stiffness detection and conformal drift fallback.
+pub fn solve_ivp_with_casp_portfolio<F>(
+    fun: &mut F,
+    options: &SolveIvpOptions<'_>,
+    portfolio: &mut OdeSolverPortfolio,
+    stiffness_ratio_estimate: f64,
+    is_algebraic_dae: bool,
+) -> Result<OdePortfolioResult, IntegrateValidationError>
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64>,
+{
+    let (action, posterior, expected_losses, chosen_loss) =
+        portfolio.select_action(stiffness_ratio_estimate, is_algebraic_dae);
+
+    let method: SolverKind = action.into();
+    let mut resolved_opts = options.clone();
+    resolved_opts.method = method;
+
+    let res = solve_ivp(fun, &resolved_opts)?;
+    let fallback_active = portfolio.calibrator().should_fallback();
+
+    portfolio.observe_step(res.success);
+    portfolio.record_evidence(OdeSolverEvidenceEntry {
+        component: "fsci-integrate",
+        system_dim: options.y0.len(),
+        stiffness_ratio_estimate,
+        chosen_action: action,
+        posterior: posterior.to_vec(),
+        expected_losses: expected_losses.to_vec(),
+        chosen_expected_loss: chosen_loss,
+        fallback_active,
+        step_rejections: if res.success { Some(0) } else { Some(1) },
+    });
+
+    Ok(OdePortfolioResult {
+        chosen_action: action,
+        posterior,
+        expected_losses,
+        result: res,
+        fallback_active,
+    })
 }
 
 /// Batched ODE integration: integrate the SAME dynamics `fun` from MANY initial conditions
@@ -2219,5 +2289,56 @@ mod tests {
             vdp.y[last][0],
             vdp.y[last][1]
         );
+    }
+
+    #[test]
+    fn test_solve_ivp_with_casp_portfolio_nonstiff_routes_to_rk45() {
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let opts = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0, 0.0],
+            ..SolveIvpOptions::default()
+        };
+        let mut f = |_t: f64, y: &[f64]| vec![y[1], -y[0]];
+        let res = solve_ivp_with_casp_portfolio(&mut f, &opts, &mut portfolio, 1.0, false)
+            .expect("solve_ivp portfolio");
+
+        assert_eq!(res.chosen_action, OdeSolverAction::RK45);
+        assert!(res.result.success);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_solve_ivp_with_casp_portfolio_stiff_routes_to_bdf() {
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let opts = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0, 0.0],
+            ..SolveIvpOptions::default()
+        };
+        let mut f = |_t: f64, y: &[f64]| vec![y[1], -y[0]];
+        let res = solve_ivp_with_casp_portfolio(&mut f, &opts, &mut portfolio, 1e6, false)
+            .expect("solve_ivp portfolio");
+
+        assert_eq!(res.chosen_action, OdeSolverAction::BDF);
+        assert!(res.result.success);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_solve_ivp_with_casp_portfolio_algebraic_routes_to_radau() {
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let opts = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0, 0.0],
+            ..SolveIvpOptions::default()
+        };
+        let mut f = |_t: f64, y: &[f64]| vec![y[1], -y[0]];
+        let res = solve_ivp_with_casp_portfolio(&mut f, &opts, &mut portfolio, 10.0, true)
+            .expect("solve_ivp portfolio");
+
+        assert_eq!(res.chosen_action, OdeSolverAction::Radau);
+        assert!(res.result.success);
+        assert_eq!(portfolio.evidence_len(), 1);
     }
 }
