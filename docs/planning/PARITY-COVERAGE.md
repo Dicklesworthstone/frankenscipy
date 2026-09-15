@@ -83,11 +83,13 @@ Every remaining miss, classified. **The great majority are deliberate scope deci
 
 Ranked by user value.
 
-| Symbols | Why it matters | Effort |
-|---|---|---|
-| `optimize.direct` | DIRECT global optimizer — a real algorithm we do not have | large |
-| `optimize.SR1`, `HessianUpdateStrategy`, `BroydenFirst`, `KrylovJacobian`, `InverseJacobian`, `LbfgsInvHessProduct` | Quasi-Newton update strategies as first-class objects | medium |
-| `stats.goodness_of_fit`, `make_distribution`, `CensoredData`, `Covariance`, `Mixture`, `order_statistic`, `rv_continuous`, `rv_histogram` | Genuinely absent statistical machinery — the real `stats` residual once naming artifacts are removed | large |
+| Symbols | Why it matters | Status | Effort |
+|---|---|---|---|
+| `optimize.direct` | DIRECT (DIviding RECTangles) global optimizer — real algorithm not yet ported | Missing (tracked in `frankenscipy-bjxy7`) | medium |
+| `stats.CensoredData` | Right-, left-, and interval-censored data container for survival analysis and fitting | Missing (tracked in `frankenscipy-951hg`) | medium |
+| `stats.Covariance` | First-class covariance representations (`CovViaPrecision`, `CovViaPSD`, `CovViaDiagonal`) | Missing (tracked in `frankenscipy-951hg`) | medium |
+| `optimize.SR1`, `HessianUpdateStrategy`, `BroydenFirst`, `KrylovJacobian`, `InverseJacobian` | Quasi-Newton update strategies as first-class objects | **Implemented** in `fsci-opt` | complete |
+| `stats.goodness_of_fit`, `order_statistic`, `rv_histogram` | Statistical goodness of fit, order statistics, and histogram distributions | **Implemented** in `fsci-stats` | complete |
 
 ---
 
