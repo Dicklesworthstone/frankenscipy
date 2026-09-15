@@ -12,10 +12,15 @@
 //! Each distribution implements pdf, cdf, sf, ppf (inverse CDF), mean, var, std.
 
 pub mod audit;
+pub mod censored;
+pub mod covariance;
 pub mod qmc;
+
 pub use audit::{
     SyncSharedAuditLedger, record_bounded_recovery, record_fail_closed, sync_audit_ledger,
 };
+pub use censored::CensoredData;
+pub use covariance::Covariance;
 pub use qmc::{
     DiscrepancyMethod, GeometricDiscrepancyMethod, HaltonSampler, LatinHypercubeSampler,
     MultinomialQmc, MultivariateNormalQmc, PoissonDiskSampler, QmcEngine, SobolSampler,
@@ -31322,6 +31327,98 @@ pub fn logrank(x: &[f64], y: &[f64], alternative: &str) -> LogRankResult {
 
     let observed_x = x.len() as f64;
     let statistic = (observed_x - sum_exp_x) / sum_var.sqrt();
+
+    let normal = Normal::standard();
+    let pvalue = match alternative {
+        "less" => normal.cdf(statistic),
+        "greater" => normal.sf(statistic),
+        _ => (2.0 * normal.sf(statistic.abs())).clamp(0.0, 1.0),
+    };
+
+    LogRankResult { statistic, pvalue }
+}
+
+/// Log-rank (Mantel–Cox) test comparing the survival distributions of two
+/// samples with support for right-censored observations via [`CensoredData`].
+///
+/// Matches `scipy.stats.logrank(x, y, alternative)`.
+#[must_use]
+pub fn logrank_censored(x: &CensoredData, y: &CensoredData, alternative: &str) -> LogRankResult {
+    if x.is_empty() || y.is_empty() {
+        return LogRankResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
+    let has_nan = x
+        .uncensored
+        .iter()
+        .chain(&x.right)
+        .chain(&y.uncensored)
+        .chain(&y.right)
+        .any(|v| v.is_nan());
+    if has_nan {
+        return LogRankResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
+
+    let mut death_times: Vec<f64> = x
+        .uncensored
+        .iter()
+        .chain(y.uncensored.iter())
+        .copied()
+        .collect();
+    if death_times.is_empty() {
+        return LogRankResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
+    death_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    death_times.dedup();
+
+    let mut x_all: Vec<f64> = x.uncensored.iter().chain(&x.right).copied().collect();
+    let mut y_all: Vec<f64> = y.uncensored.iter().chain(&y.right).copied().collect();
+    let mut x_deaths: Vec<f64> = x.uncensored.clone();
+    let mut y_deaths: Vec<f64> = y.uncensored.clone();
+
+    x_all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    y_all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x_deaths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    y_deaths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let count_ge = |s: &[f64], t: f64| (s.len() - s.partition_point(|&v| v < t)) as f64;
+    let count_eq = |s: &[f64], t: f64| {
+        (s.partition_point(|&v| v <= t) - s.partition_point(|&v| v < t)) as f64
+    };
+
+    let mut sum_var = 0.0_f64;
+    let mut sum_exp_x = 0.0_f64;
+
+    for &t in &death_times {
+        let at_risk_x = count_ge(&x_all, t);
+        let at_risk_y = count_ge(&y_all, t);
+        let at_risk_xy = at_risk_x + at_risk_y;
+
+        let deaths_x = count_eq(&x_deaths, t);
+        let deaths_y = count_eq(&y_deaths, t);
+        let deaths_xy = deaths_x + deaths_y;
+
+        if at_risk_xy > 1.0 {
+            sum_var += at_risk_x * at_risk_y * deaths_xy * (at_risk_xy - deaths_xy)
+                / (at_risk_xy * at_risk_xy * (at_risk_xy - 1.0));
+        }
+        sum_exp_x += at_risk_x * (deaths_xy / at_risk_xy);
+    }
+
+    let observed_x = x.uncensored.len() as f64;
+    let statistic = if sum_var > 0.0 {
+        (observed_x - sum_exp_x) / sum_var.sqrt()
+    } else {
+        f64::NAN
+    };
 
     let normal = Normal::standard();
     let pvalue = match alternative {
@@ -104377,4 +104474,54 @@ mod histogram_distribution_matches_scipy {
             "logrank: less and greater must give different p-values on this fixture"
         );
     }
+
+    #[test]
+    fn test_censored_data_and_logrank() {
+        let x = CensoredData::right_censored(
+            &[10.0, 20.0, 30.0, 40.0],
+            &[false, true, false, true],
+        )
+        .unwrap();
+        let y = CensoredData::right_censored(
+            &[15.0, 25.0, 35.0, 45.0],
+            &[false, false, true, false],
+        )
+        .unwrap();
+
+        assert_eq!(x.len(), 4);
+        assert_eq!(x.num_censored(), 2);
+        assert_eq!(y.len(), 4);
+        assert_eq!(y.num_censored(), 1);
+
+        let lr = logrank_censored(&x, &y, "two-sided");
+        assert!(
+            (lr.statistic - 0.17273788080853764).abs() < 1e-10,
+            "logrank statistic = {}, expected 0.17273788080853764",
+            lr.statistic
+        );
+        assert!(
+            (lr.pvalue - 0.8628574667601336).abs() < 1e-10,
+            "logrank pvalue = {}, expected 0.8628574667601336",
+            lr.pvalue
+        );
+    }
+
+    #[test]
+    fn test_covariance_diagonal() {
+        let cov = Covariance::from_diagonal(&[1.0, 2.0, 4.0]).unwrap();
+        assert_eq!(cov.shape(), (3, 3));
+        assert_eq!(cov.rank(), 3);
+        assert!((cov.log_pdet() - 2.0794415416798357).abs() < 1e-12);
+
+        let white = cov.whiten(&[1.0, 2.0, 4.0]).unwrap();
+        assert!((white[0] - 1.0).abs() < 1e-12);
+        assert!((white[1] - std::f64::consts::SQRT_2).abs() < 1e-12);
+        assert!((white[2] - 2.0).abs() < 1e-12);
+
+        let color = cov.colorize(&white).unwrap();
+        assert!((color[0] - 1.0).abs() < 1e-12);
+        assert!((color[1] - 2.0).abs() < 1e-12);
+        assert!((color[2] - 4.0).abs() < 1e-12);
+    }
 }
+
