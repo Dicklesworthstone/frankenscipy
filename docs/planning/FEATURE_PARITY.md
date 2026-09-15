@@ -39,14 +39,14 @@ Overall V1 coverage: **~52% of full SciPy surface** (targets highest-value funct
 
 ### fsci-sparse (44% coverage)
 
-**Implemented:** COO/CSR/CSC/BSR/DIA/DOK/LIL formats, spsolve, splu, spilu, cg, pcg, gmres, lgmres, bicg, bicgstab, cgs, qmr, minres, lsqr, lsmr, eigsh, eigs, svds, expm, norm, spsolve_triangular, eye, diags, random, block_diag, bmat, vstack, hstack, kron, find, tril, triu, dijkstra, bellman_ford, breadth_first_order, depth_first_order, minimum_spanning_tree, connected_components, laplacian, floyd_warshall, shortest_path, reverse_cuthill_mckee, strongly_connected_components, topological_sort, pagerank, betweenness_centrality, closeness_centrality, sparse_norm, sparse_diagonal, sparse_trace, sparse_transpose, matrix_power
+**Implemented:** COO/CSR/CSC/BSR/DIA/DOK/LIL formats, spsolve, splu, spilu, cg, pcg, gmres, lgmres, bicg, bicgstab, cgs, qmr, minres, lsqr, lsmr, eigsh, eigs, svds, expm, norm, spsolve_triangular, solve_with_casp_portfolio, eye, diags, random, block_diag, bmat, vstack, hstack, kron, find, tril, triu, dijkstra, bellman_ford, breadth_first_order, depth_first_order, minimum_spanning_tree, connected_components, laplacian, floyd_warshall, shortest_path, reverse_cuthill_mckee, strongly_connected_components, topological_sort, pagerank, betweenness_centrality, closeness_centrality, sparse_norm, sparse_diagonal, sparse_trace, sparse_transpose, matrix_power
 
 **Missing (MEDIUM priority):**
 - No remaining core sparse storage formats; remaining parity work is broader API surface and specialized ops
 
 ### fsci-opt (55% coverage)
 
-**Implemented:** minimize (BFGS, CG, Powell, NM, L-BFGS-B, Newton-CG, TNC, COBYLA, SLSQP, trust-ncg, trust-krylov, trust-constr, dogleg), minimize_scalar, brentq, brenth, bisect, ridder, toms748, halley, newton_scalar, secant, root_scalar, root, fsolve, broyden1, broyden2, anderson, lm_root, curve_fit, least_squares, line_search, Bounds, LinearConstraint, NonlinearConstraint, differential_evolution, basinhopping, dual_annealing, shgo, pso, linprog, milp, linear_sum_assignment, approx_fprime, check_grad, cobyla, rosen, rosen_der, rosen_hess, rosen_hess_prod
+**Implemented:** minimize (BFGS, CG, Powell, NM, L-BFGS-B, Newton-CG, TNC, COBYLA, SLSQP, trust-ncg, trust-krylov, trust-constr, dogleg), direct (DIRECT and DIRECT-L), minimize_with_casp_portfolio, minimize_scalar, brentq, brenth, bisect, ridder, toms748, halley, newton_scalar, secant, root_scalar, root, fsolve, broyden1, broyden2, anderson, lm_root, curve_fit, least_squares, line_search, Bounds, LinearConstraint, NonlinearConstraint, differential_evolution, basinhopping, dual_annealing, shgo, pso, linprog, milp, linear_sum_assignment, approx_fprime, check_grad, cobyla, rosen, rosen_der, rosen_hess, rosen_hess_prod
 
 **Missing (LOW priority):**
 - `minimize` methods: `trust-exact`, `Newton-CG` hessian product
@@ -55,7 +55,7 @@ Overall V1 coverage: **~52% of full SciPy surface** (targets highest-value funct
 
 ### fsci-integrate (80% coverage)
 
-**Implemented:** solve_ivp (RK23, RK45, DOP853, BDF, Radau, LSODA), odeint, solve_bvp, quad, quad_vec, quad_explain, quad_inf, quad_neg_inf, quad_full_inf, quad_cauchy_pv, dblquad, dblquad_rect, tplquad, tplquad_rect, nquad, trapezoid, trapezoid_uniform, trapezoid_irregular, trapezoid_richardson, simpson, simpson_uniform, simpson_irregular, cumulative_trapezoid, cumulative_trapezoid_uniform, cumulative_trapezoid_initial, cumulative_simpson, romb, romb_func, romberg, fixed_quad, gauss_kronrod_quad, gauss_legendre, newton_cotes, newton_cotes_quad, monte_carlo_integrate, line_integral
+**Implemented:** solve_ivp (RK23, RK45, DOP853, BDF, Radau, LSODA), solve_ivp_with_casp_portfolio, odeint, solve_bvp, quad, quad_vec, quad_explain, quad_inf, quad_neg_inf, quad_full_inf, quad_cauchy_pv, dblquad, dblquad_rect, tplquad, tplquad_rect, nquad, trapezoid, trapezoid_uniform, trapezoid_irregular, trapezoid_richardson, simpson, simpson_uniform, simpson_irregular, cumulative_trapezoid, cumulative_trapezoid_uniform, cumulative_trapezoid_initial, cumulative_simpson, romb, romb_func, romberg, fixed_quad, gauss_kronrod_quad, gauss_legendre, newton_cotes, newton_cotes_quad, monte_carlo_integrate, line_integral
 
 **Missing (LOW priority):**
 - ~~`cubature` (adaptive N-dimensional cubature)~~ ✓ DONE
@@ -80,7 +80,7 @@ Overall V1 coverage: **~52% of full SciPy surface** (targets highest-value funct
 
 ### fsci-stats (88% coverage - near-complete)
 
-**Implemented:** 24+ distributions (Normal, StudentT, ChiSquared, Chi, Uniform, Exponential, ExponNorm, PowerNorm, JohnsonSU, JohnsonSB, F, Beta, Gamma, Weibull, Lognormal, LogGamma, Alpha, Poisson, LogSeries, RandInt, Cauchy, HalfCauchy, HalfGenNorm, FatigueLife, DoubleGamma, Laplace, Triangular, Binomial, NegBinomial, Geometric, Hypergeometric, Lomax, Pareto, Rayleigh, Gumbel, GumbelL, Logistic, HypSecant, LevyL, Pearson3, HalfLogistic, Maxwell, VonMises, InverseGaussian/Wald, Argus, Kappa4, Bernoulli), describe, skew, kurtosis, mode, moment, sem, iqr, variation, zscore, ttest_1samp, ttest_ind, ttest_ind_welch, ttest_rel, ks_1samp, ks_2samp, shapiro, normaltest, mannwhitneyu, wilcoxon, kruskal, f_oneway, chi2_contingency, fisher_exact, linregress, pearsonr, spearmanr, kendalltau, pointbiserialr, weightedtau, chatterjeexi, multiscale_graphcorr, rankdata, gaussian_kde, boxcox, boxcox_normmax, entropy, differential_entropy, circmean, circvar, circstd, bootstrap, permutation_test, power_divergence, median_abs_deviation, trim_mean, tmean, tvar, tstd, tsem, mstats, and many more
+**Implemented:** 24+ distributions (Normal, StudentT, ChiSquared, Chi, Uniform, Exponential, ExponNorm, PowerNorm, JohnsonSU, JohnsonSB, F, Beta, Gamma, Weibull, Lognormal, LogGamma, Alpha, Poisson, LogSeries, RandInt, Cauchy, HalfCauchy, HalfGenNorm, FatigueLife, DoubleGamma, Laplace, Triangular, Binomial, NegBinomial, Geometric, Hypergeometric, Lomax, Pareto, Rayleigh, Gumbel, GumbelL, Logistic, HypSecant, LevyL, Pearson3, HalfLogistic, Maxwell, VonMises, InverseGaussian/Wald, Argus, Kappa4, Bernoulli), CensoredData, Covariance (CovViaPrecision, CovViaPSD, CovViaDiagonal), describe, skew, kurtosis, mode, moment, sem, iqr, variation, zscore, ttest_1samp, ttest_ind, ttest_ind_welch, ttest_rel, ks_1samp, ks_2samp, shapiro, normaltest, mannwhitneyu, wilcoxon, kruskal, f_oneway, chi2_contingency, fisher_exact, linregress, pearsonr, spearmanr, kendalltau, pointbiserialr, weightedtau, chatterjeexi, multiscale_graphcorr, rankdata, gaussian_kde, boxcox, boxcox_normmax, entropy, differential_entropy, circmean, circvar, circstd, bootstrap, permutation_test, power_divergence, median_abs_deviation, trim_mean, tmean, tvar, tstd, tsem, mstats, and many more
 
 **Missing (LOW priority):**
 - Some exotic distributions (~80+ remaining from SciPy's 100+)

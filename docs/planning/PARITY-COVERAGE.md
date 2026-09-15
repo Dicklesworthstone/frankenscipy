@@ -85,9 +85,9 @@ Ranked by user value.
 
 | Symbols | Why it matters | Status | Effort |
 |---|---|---|---|
-| `optimize.direct` | DIRECT (DIviding RECTangles) global optimizer — real algorithm not yet ported | Missing (tracked in `frankenscipy-bjxy7`) | medium |
-| `stats.CensoredData` | Right-, left-, and interval-censored data container for survival analysis and fitting | Missing (tracked in `frankenscipy-951hg`) | medium |
-| `stats.Covariance` | First-class covariance representations (`CovViaPrecision`, `CovViaPSD`, `CovViaDiagonal`) | Missing (tracked in `frankenscipy-951hg`) | medium |
+| `optimize.direct` | DIRECT (DIviding RECTangles) global optimizer — real algorithm not yet ported | **Implemented** in `fsci-opt` | complete |
+| `stats.CensoredData` | Right-, left-, and interval-censored data container for survival analysis and fitting | **Implemented** in `fsci-stats` | complete |
+| `stats.Covariance` | First-class covariance representations (`CovViaPrecision`, `CovViaPSD`, `CovViaDiagonal`) | **Implemented** in `fsci-stats` | complete |
 | `optimize.SR1`, `HessianUpdateStrategy`, `BroydenFirst`, `KrylovJacobian`, `InverseJacobian` | Quasi-Newton update strategies as first-class objects | **Implemented** in `fsci-opt` | complete |
 | `stats.goodness_of_fit`, `order_statistic`, `rv_histogram` | Statistical goodness of fit, order statistics, and histogram distributions | **Implemented** in `fsci-stats` | complete |
 
