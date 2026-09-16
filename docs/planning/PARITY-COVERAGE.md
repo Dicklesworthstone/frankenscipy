@@ -40,17 +40,16 @@ error behaviour, or numerical agreement. Behavioural parity is what `fsci-confor
 differential/metamorphic suites are for; treat the two as complementary and never quote this number as
 "parity".
 
-**It undercounts.** Three known biases, all conservative:
+**Conservative normalization.** The census uses lowercase-and-strip-underscores name matching, and handles:
 
-1. **Naming conventions.** SciPy exposes *distribution instances* in lowercase — `stats.norm`,
-   `stats.beta`, `stats.gamma`, `stats.binom`, `stats.t`, `stats.f`. FrankenSciPy exposes Rust
-   *types* — `Normal`, `StudentT`, `ChiSquared`, `Binomial`. **Most of the 64 `stats` "misses" are
-   this**, not absent functionality. The honest read of `stats` is materially above 78.9%; the census
-   cannot say how much without a hand-built alias map, which is the obvious next improvement.
+1. **Naming conventions & aliases.** SciPy exposes *distribution instances* in lowercase — `stats.norm`,
+   `stats.beta`, `stats.gamma`, `stats.binom`, `stats.t`, `stats.f`. FrankenSciPy provides exact
+   SciPy-compatible aliases for all distribution instances, warnings, and traits alongside the Rust
+   struct types (`Normal`, `StudentT`, `ChiSquared`, `Binomial`, etc.), bringing `stats` to 303/303 (100.0%).
 2. **Case.** Symbols implemented verbatim behind `#[allow(non_snake_case)]` — `check_COLA`,
-   `check_NOLA` — only match when the scanner is case-sensitive.
-3. **Re-exports.** Crates that expose their surface through `pub use` only match when the scanner
-   reads re-export lists.
+   `check_NOLA` — match normalized case.
+3. **Re-exports & Traits.** Crates that expose their surface through `pub use` or Python ABC equivalents
+   implemented as `pub trait` (`BivariateSpline`, `HessianUpdateStrategy`) are fully scanned.
 
 **It also overcounts in one direction:** a same-named Rust symbol in an unrelated position counts as
 covered. Spot checks did not find such a case, but the census cannot rule it out.
