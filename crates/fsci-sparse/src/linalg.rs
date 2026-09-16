@@ -10,7 +10,10 @@ use fsci_linalg::{
     DecompOptions, LinalgError, SolveOptions as DenseSolveOptions, expm as dense_expm,
     solve_banded as dense_solve_banded, solveh_banded as dense_solveh_banded,
 };
-use fsci_runtime::RuntimeMode;
+use fsci_runtime::{
+    RuntimeMode, SparseSolverAction, SparseSolverEvidenceEntry, SparseSolverPortfolio,
+    SparseStructuralEvidence,
+};
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use rayon::prelude::*;
 
@@ -9811,6 +9814,198 @@ pub fn casp_iterative_solve_with_audit(
         ),
     );
     Ok(solved)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaspPortfolioSolveResult {
+    pub chosen_action: SparseSolverAction,
+    pub posterior: [f64; 4],
+    pub expected_losses: [f64; 6],
+    pub x: Vec<f64>,
+    pub converged: bool,
+    pub iterations: usize,
+    pub residual_norm: f64,
+    pub fallback_active: bool,
+}
+
+/// Solve a sparse linear system using CASP Bayesian expected-loss portfolio selection.
+///
+/// Dispatches to Conjugate Gradient on SPD systems, MINRES on symmetric indefinite systems,
+/// BiCGSTAB on general well-conditioned systems, and SuperLU direct LU factorization on
+/// ill-conditioned systems or when conformal drift triggers fallback.
+pub fn solve_with_casp_portfolio(
+    a: &CsrMatrix,
+    b: &[f64],
+    x0: Option<&[f64]>,
+    portfolio: &mut SparseSolverPortfolio,
+    iterative_opts: IterativeSolveOptions,
+) -> SparseResult<CaspPortfolioSolveResult> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        return Err(SparseError::InvalidShape {
+            message: "matrix must be square".to_string(),
+        });
+    }
+    if b.len() != shape.rows {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "rhs length {} must match matrix rows {}",
+                b.len(),
+                shape.rows
+            ),
+        });
+    }
+    if let Some(initial) = x0
+        && initial.len() != shape.cols
+    {
+        return Err(SparseError::IncompatibleShape {
+            message: format!(
+                "initial guess length {} must match matrix cols {}",
+                initial.len(),
+                shape.cols
+            ),
+        });
+    }
+    validate_iterative_finite_inputs(a, b, x0, iterative_opts)?;
+
+    let is_sym = sparse_is_symmetric(a, iterative_opts.tol.max(1e-12));
+    let pd_hint = if is_sym {
+        if has_strictly_positive_diagonal(a)
+            && is_row_diagonally_dominant(a, iterative_opts.tol.max(1e-12))
+        {
+            Some(true)
+        } else {
+            let diag = sparse_diagonal(a);
+            if diag.iter().any(|&d| d <= 0.0) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let diag = sparse_diagonal(a);
+    let mut min_diag = f64::INFINITY;
+    let mut max_diag = 0.0_f64;
+    for &d in &diag {
+        let abs_d = d.abs();
+        if abs_d > 0.0 {
+            if abs_d < min_diag {
+                min_diag = abs_d;
+            }
+            if abs_d > max_diag {
+                max_diag = abs_d;
+            }
+        }
+    }
+    let cond_estimate = if min_diag > 0.0 && min_diag.is_finite() {
+        (max_diag / min_diag).max(1.0)
+    } else {
+        1e9
+    };
+
+    let structural = SparseStructuralEvidence {
+        is_symmetric: is_sym,
+        is_positive_definite_hint: pd_hint,
+    };
+
+    let (action, posterior, expected_losses, chosen_loss) =
+        portfolio.select_action(cond_estimate, Some(structural));
+
+    let (x, converged, iters, res_norm, fallback_active) = match action {
+        SparseSolverAction::ConjugateGradient => {
+            let res = cg(a, b, x0, iterative_opts)?;
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
+        }
+        SparseSolverAction::MinRes => {
+            let res = minres(a, b, x0, iterative_opts)?;
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
+        }
+        SparseSolverAction::BiCGSTAB => {
+            let res = bicgstab(a, b, x0, iterative_opts)?;
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
+        }
+        SparseSolverAction::GMRES => {
+            let res = gmres(a, b, x0, iterative_opts)?;
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
+        }
+        SparseSolverAction::QMR => {
+            let res = qmr(a, b, x0, iterative_opts)?;
+            (
+                res.solution,
+                res.converged,
+                res.iterations,
+                res.residual_norm,
+                false,
+            )
+        }
+        SparseSolverAction::SuperLU => {
+            let res = spsolve(a, b, SolveOptions::default())?;
+            (res.solution, true, 1, 0.0, false)
+        }
+    };
+
+    let (final_x, final_converged, final_iters, final_res, final_fallback) = if !converged
+        && action != SparseSolverAction::SuperLU
+        && portfolio.mode() == RuntimeMode::Hardened
+    {
+        match spsolve(a, b, SolveOptions::default()) {
+            Ok(slv) => (slv.solution, true, iters + 1, 0.0, true),
+            Err(_) => (x, converged, iters, res_norm, fallback_active),
+        }
+    } else {
+        (x, converged, iters, res_norm, fallback_active)
+    };
+
+    portfolio.record_evidence(SparseSolverEvidenceEntry {
+        component: "fsci-sparse",
+        matrix_shape: (shape.rows, shape.cols),
+        nnz: a.nnz(),
+        cond_estimate,
+        chosen_action: action,
+        posterior: posterior.to_vec(),
+        expected_losses: expected_losses.to_vec(),
+        chosen_expected_loss: chosen_loss,
+        fallback_active: final_fallback,
+        relative_residual: Some(final_res),
+    });
+
+    Ok(CaspPortfolioSolveResult {
+        chosen_action: action,
+        posterior,
+        expected_losses,
+        x: final_x,
+        converged: final_converged,
+        iterations: final_iters,
+        residual_norm: final_res,
+        fallback_active: final_fallback,
+    })
 }
 
 fn casp_iterative_solve_inner(

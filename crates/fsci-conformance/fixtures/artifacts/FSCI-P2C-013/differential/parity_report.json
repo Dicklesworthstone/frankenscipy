@@ -156,7 +156,7 @@
     {
       "case_id": "ivp_solve_harmonic_oscillator_rk45",
       "passed": true,
-      "message": "integrate ivp matched (3 steps, 2 vars, max_diff=3.33e-16)"
+      "message": "integrate ivp matched (3 steps, 2 vars, max_diff=2.65e-16)"
     },
     {
       "case_id": "ivp_solve_stiff_decay_bdf",
@@ -226,7 +226,7 @@
     {
       "case_id": "tplquad_xyz_prod_unit",
       "passed": true,
-      "message": "integrate scalar matched (diff=1.67e-16)"
+      "message": "integrate scalar matched (diff=1.80e-16)"
     },
     {
       "case_id": "ivp_lsoda_robertson_short",
@@ -246,7 +246,7 @@
     {
       "case_id": "ivp_dense_rk45_expdecay",
       "passed": true,
-      "message": "integrate ivp matched (5 steps, 1 vars, max_diff=5.55e-17)"
+      "message": "integrate ivp matched (5 steps, 1 vars, max_diff=1.11e-16)"
     },
     {
       "case_id": "ivp_dense_lsoda_linear_growth",
@@ -700,8 +700,8 @@
     {
       "case_id": "ivp_solve_harmonic_oscillator_rk45",
       "passed": true,
-      "message": "integrate ivp matched (3 steps, 2 vars, max_diff=3.33e-16)",
-      "max_diff": 3.3306690738754696e-16,
+      "message": "integrate ivp matched (3 steps, 2 vars, max_diff=2.65e-16)",
+      "max_diff": 2.654126918244515e-16,
       "tolerance_used": {
         "atol": 1e-6,
         "rtol": 1e-6,
@@ -888,8 +888,8 @@
     {
       "case_id": "tplquad_xyz_prod_unit",
       "passed": true,
-      "message": "integrate scalar matched (diff=1.67e-16)",
-      "max_diff": 1.6653345369377348e-16,
+      "message": "integrate scalar matched (diff=1.80e-16)",
+      "max_diff": 1.8041124150158794e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -944,8 +944,8 @@
     {
       "case_id": "ivp_dense_rk45_expdecay",
       "passed": true,
-      "message": "integrate ivp matched (5 steps, 1 vars, max_diff=5.55e-17)",
-      "max_diff": 5.551115123125783e-17,
+      "message": "integrate ivp matched (5 steps, 1 vars, max_diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
       "tolerance_used": {
         "atol": 0.001,
         "rtol": 0.001,
@@ -1027,5 +1027,5 @@
     }
   ],
   "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788666502427
+  "generated_unix_ms": 1789523529993
 }

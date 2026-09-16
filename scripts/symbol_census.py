@@ -42,7 +42,8 @@ def rust_symbols(crate):
     # reported those as MISSING when they are implemented, understating coverage.
     pat = re.compile(
         r"pub (?:async )?fn ([A-Za-z0-9_]+)|pub struct ([A-Za-z0-9_]+)|"
-        r"pub enum ([A-Za-z0-9_]+)|pub type ([A-Za-z0-9_]+)|pub const ([A-Za-z0-9_]+)")
+        r"pub enum ([A-Za-z0-9_]+)|pub type ([A-Za-z0-9_]+)|pub const ([A-Za-z0-9_]+)|"
+        r"pub trait ([A-Za-z0-9_]+)")
     for f in d.rglob("*.rs"):
         try:
             for m in pat.finditer(f.read_text(errors="replace")):

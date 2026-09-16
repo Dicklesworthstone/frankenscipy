@@ -899,6 +899,9 @@ pub struct CubicSplineStandalone {
     coeffs: Vec<[f64; 4]>,
 }
 
+/// SciPy-compatible type alias for [`CubicSplineStandalone`], matching `scipy.interpolate.CubicSpline`.
+pub type CubicSpline = CubicSplineStandalone;
+
 impl CubicSplineStandalone {
     pub fn new(x: &[f64], y: &[f64], bc: SplineBc) -> Result<Self, InterpError> {
         if x.len() != y.len() {
@@ -5340,6 +5343,9 @@ pub struct RbfInterpolator {
     dim: usize,
     degree: i32,
 }
+
+/// SciPy-compatible type alias for [`RbfInterpolator`], matching `scipy.interpolate.Rbf`.
+pub type Rbf = RbfInterpolator;
 
 const MAX_RBF_POINTS: usize = 4096;
 
@@ -10227,6 +10233,46 @@ fn smooth_bivariate_bbox(
         });
     }
     Ok(bbox)
+}
+
+/// Base trait for bivariate splines, matching `scipy.interpolate.BivariateSpline`.
+pub trait BivariateSpline {
+    /// Evaluate the spline at a single point (x, y).
+    fn eval(&self, x: f64, y: f64) -> f64;
+
+    /// Evaluate the spline at multiple points (x[i], y[i]).
+    fn eval_many(&self, x: &[f64], y: &[f64]) -> Result<Vec<f64>, InterpError>;
+
+    /// Evaluate the spline on a grid and return a 2D array of values.
+    fn eval_grid(&self, x: &[f64], y: &[f64]) -> Vec<Vec<f64>>;
+}
+
+impl BivariateSpline for RectBivariateSpline {
+    fn eval(&self, x: f64, y: f64) -> f64 {
+        self.eval(x, y)
+    }
+
+    fn eval_many(&self, x: &[f64], y: &[f64]) -> Result<Vec<f64>, InterpError> {
+        self.eval_many(x, y)
+    }
+
+    fn eval_grid(&self, x: &[f64], y: &[f64]) -> Vec<Vec<f64>> {
+        self.eval_grid(x, y)
+    }
+}
+
+impl BivariateSpline for SmoothBivariateSpline {
+    fn eval(&self, x: f64, y: f64) -> f64 {
+        self.eval(x, y)
+    }
+
+    fn eval_many(&self, x: &[f64], y: &[f64]) -> Result<Vec<f64>, InterpError> {
+        self.eval_many(x, y)
+    }
+
+    fn eval_grid(&self, x: &[f64], y: &[f64]) -> Vec<Vec<f64>> {
+        self.eval_grid(x, y)
+    }
 }
 
 struct SmoothBivariateFit<'a> {

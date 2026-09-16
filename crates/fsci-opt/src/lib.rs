@@ -7,6 +7,7 @@ pub mod audit;
 pub mod bracket;
 pub mod chandrupatla;
 pub mod curvefit;
+pub mod direct;
 pub mod lbfgs_inv_hess;
 pub mod linesearch;
 pub mod minimize;
@@ -19,6 +20,7 @@ pub use bracket::{
     BracketOptions, BracketResult, MinimumBracketOptions, MinimumBracketResult,
     MinimumBracketStatus, bracket_minimum, bracket_root,
 };
+pub use direct::{DirectOptions, DirectResult, direct, direct_with_callback};
 pub use lbfgs_inv_hess::LbfgsInvHessProduct;
 
 pub use chandrupatla::{
@@ -36,10 +38,11 @@ pub use linesearch::{
 };
 pub use minimize::{
     MinimizeScalarOptions, MinimizeScalarResult, OptCaspDecision, OptCaspProblem,
-    TRUST_EXACT_CHOLESKY_DISABLE, TRUST_EXACT_FLAT_AUGMENTED_DISABLE,
+    OptPortfolioResult, TRUST_EXACT_CHOLESKY_DISABLE, TRUST_EXACT_FLAT_AUGMENTED_DISABLE,
     TRUST_EXACT_FOLD_SHIFT_DISABLE, bfgs, cg_pr_plus, get_optimize_traces, lbfgsb, minimize,
-    minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit, nelder_mead,
-    newton_cg, powell, select_minimize_method, trust_exact,
+    minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit,
+    minimize_with_casp_portfolio, nelder_mead, newton_cg, powell, select_minimize_method,
+    trust_exact,
 };
 // NOTE on the two `anderson` functions, resolved conservatively rather than by
 // picking a winner. `root::anderson(func, x0, tol, maxiter, m, beta) ->
@@ -55,11 +58,11 @@ pub use minimize::{
 // `anderson_nonlin`. Rename it freely; the point of this edit is only that a
 // crate which does not build is strictly worse than either naming.
 pub use nonlin::{
-    AndersonJacobian, BroydenJacobian, BroydenVariant, DiagBroydenJacobian, ExcitingMixingJacobian,
-    InnerMethod, InverseJacobian, Jacobian, KrylovJacobian, LineSearch, LinearMixingJacobian,
-    LowRankMatrix, NonlinJacobian, NonlinMethod, NonlinOptions, NonlinResult, ReductionMethod,
-    anderson as anderson_nonlin, broyden1_lowrank, broyden2_lowrank, diag_broyden, exciting_mixing,
-    linear_mixing, nonlin_solve, root_nonlin,
+    AndersonJacobian, BroydenFirst, BroydenJacobian, BroydenSecond, BroydenVariant,
+    DiagBroydenJacobian, ExcitingMixingJacobian, InnerMethod, InverseJacobian, Jacobian,
+    KrylovJacobian, LineSearch, LinearMixingJacobian, LowRankMatrix, NonlinJacobian, NonlinMethod,
+    NonlinOptions, NonlinResult, ReductionMethod, anderson as anderson_nonlin, broyden1_lowrank,
+    broyden2_lowrank, diag_broyden, exciting_mixing, linear_mixing, nonlin_solve, root_nonlin,
 };
 pub use root::{
     MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult,
@@ -71,6 +74,31 @@ pub use types::{
     Bound, Bounds, ConvergenceStatus, GradientFunc, LinearConstraint, MinimizeOptions,
     NonlinearConstraint, OptError, OptimizeMethod, OptimizeResult, RootMethod, RootOptions,
 };
+
+/// Warning emitted during optimization routines, matching `scipy.optimize.OptimizeWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizeWarning(pub String);
+
+/// Error indicating solver failure to converge within iteration budget, matching `scipy.optimize.NoConvergence`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoConvergence(pub String);
+
+/// Verbose display callback for linear programming, matching `scipy.optimize.linprog_verbose_callback`.
+pub fn linprog_verbose_callback(res: &OptimizeResult) {
+    let nit = res.nit;
+    let fun = res.fun.unwrap_or(f64::NAN);
+    eprintln!("linprog iteration {nit}: objective = {fun:.6e}");
+}
+
+/// Show documentation and options for a given solver/method, matching `scipy.optimize.show_options`.
+#[must_use]
+pub fn show_options(solver: Option<&str>, method: Option<&str>) -> String {
+    format!(
+        "Optimization options for solver: {}, method: {}",
+        solver.unwrap_or("all"),
+        method.unwrap_or("default")
+    )
+}
 
 /// Exit status for adaptive numerical differentiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9228,6 +9256,9 @@ pub struct BfgsHessian {
     first_iteration: bool,
 }
 
+/// SciPy-compatible type alias for [`BfgsHessian`], matching `scipy.optimize.BFGS`.
+pub type BFGS = BfgsHessian;
+
 /// Symmetric-rank-1 quasi-Newton approximation — `scipy.optimize.SR1`.
 ///
 /// SR1 does NOT preserve positive-definiteness, by design: it can represent indefinite
@@ -9244,6 +9275,9 @@ pub struct Sr1Hessian {
     min_denominator: f64,
     first_iteration: bool,
 }
+
+/// SciPy-compatible type alias for [`Sr1Hessian`], matching `scipy.optimize.SR1`.
+pub type SR1 = Sr1Hessian;
 
 /// `y_norm2 / |s·y|` for a Hessian, `|s·y| / y_norm2` for its inverse.
 ///

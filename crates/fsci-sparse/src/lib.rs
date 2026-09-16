@@ -45,6 +45,14 @@ pub use io::{
     save_npz_to_writer,
 };
 
+/// Base warning class for sparse matrix operations, matching `scipy.sparse.SparseWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseWarning(pub String);
+
+/// Warning emitted for potentially inefficient sparse operations, matching `scipy.sparse.SparseEfficiencyWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseEfficiencyWarning(pub String);
+
 // SciPy-compatible lowercase type aliases (e.g. `csr_matrix` mirrors
 // `scipy.sparse.csr_matrix`). The names are intentionally non-CamelCase for API
 // parity; scope `non_camel_case_types` to this module — applied to the whole
@@ -82,6 +90,7 @@ pub use linalg::{
     CaspIterativeSolveResult,
     CaspIterativeSolver,
     CaspMatvecCost,
+    CaspPortfolioSolveResult,
     ConnectedComponentsResult,
     EigsOptions,
     EigsResult,
@@ -193,6 +202,7 @@ pub use linalg::{
     reverse_cuthill_mckee,
     select_casp_iterative_solver,
     shortest_path,
+    solve_with_casp_portfolio,
     sparse_abs,
     sparse_add,
     sparse_col_sums,
@@ -2736,5 +2746,117 @@ mod tests {
             "PCG residual: {}",
             pcg_result.residual_norm
         );
+    }
+
+    #[test]
+    fn test_solve_with_casp_portfolio_spd_routes_to_cg() {
+        let n = 10;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            data.push(4.0);
+            if i > 0 {
+                rows.push(i);
+                cols.push(i - 1);
+                data.push(-1.0);
+                rows.push(i - 1);
+                cols.push(i);
+                data.push(-1.0);
+            }
+        }
+        let coo = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false).unwrap();
+        let csr = coo.to_csr().unwrap();
+        let b = vec![1.0; n];
+
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = solve_with_casp_portfolio(
+            &csr,
+            &b,
+            None,
+            &mut portfolio,
+            IterativeSolveOptions::default(),
+        )
+        .expect("portfolio solve");
+
+        assert_eq!(
+            res.chosen_action,
+            fsci_runtime::SparseSolverAction::ConjugateGradient
+        );
+        assert!(res.converged);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_solve_with_casp_portfolio_ill_conditioned_routes_to_superlu() {
+        let n = 4;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            data.push(if i == 0 { 1e9 } else { 1.0 });
+        }
+        let coo = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false).unwrap();
+        let csr = coo.to_csr().unwrap();
+        let b = vec![2.0; n];
+
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = solve_with_casp_portfolio(
+            &csr,
+            &b,
+            None,
+            &mut portfolio,
+            IterativeSolveOptions::default(),
+        )
+        .expect("portfolio solve");
+
+        assert_eq!(res.chosen_action, fsci_runtime::SparseSolverAction::SuperLU);
+        assert!(res.converged);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_solve_with_casp_portfolio_nonsymmetric_routes_to_bicgstab() {
+        let n = 4;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            data.push(4.0);
+            if i > 0 {
+                rows.push(i);
+                cols.push(i - 1);
+                data.push(2.0); // non-symmetric off-diagonal
+                rows.push(i - 1);
+                cols.push(i);
+                data.push(-1.0);
+            }
+        }
+        let coo = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false).unwrap();
+        let csr = coo.to_csr().unwrap();
+        let b = vec![1.0; n];
+
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = solve_with_casp_portfolio(
+            &csr,
+            &b,
+            None,
+            &mut portfolio,
+            IterativeSolveOptions::default(),
+        )
+        .expect("portfolio solve");
+
+        assert_eq!(
+            res.chosen_action,
+            fsci_runtime::SparseSolverAction::BiCGSTAB
+        );
+        assert!(res.converged);
+        assert_eq!(portfolio.evidence_len(), 1);
     }
 }

@@ -5,9 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::linesearch::{WolfeParams, line_search_wolfe2, line_search_wolfe2_with_gradient_probe};
 use crate::types::{
-    Bound, ConvergenceStatus, GradientFunc, MinimizeOptions, OptError, OptimizeMethod,
+    Bound, Bounds, ConvergenceStatus, GradientFunc, MinimizeOptions, OptError, OptimizeMethod,
     OptimizeResult, OptimizeTraceEntry,
 };
+use fsci_runtime::{OptSolverAction, OptSolverEvidenceEntry, OptSolverPortfolio, RuntimeMode};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OptCaspProblem {
@@ -162,6 +163,131 @@ where
         OptimizeMethod::Slsqp => slsqp(&fun, x0, options),
         OptimizeMethod::TrustConstr => trust_constr(&fun, x0, options),
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct OptPortfolioResult {
+    pub chosen_action: OptSolverAction,
+    pub posterior: [f64; 4],
+    pub expected_losses: [f64; 5],
+    pub result: OptimizeResult,
+    pub fallback_active: bool,
+}
+
+/// Minimize an objective function using CASP Bayesian expected-loss portfolio selection.
+///
+/// Dispatches across BFGS (smooth convex), TrustRegionNewtonCG (narrow valley / high curvature),
+/// DIRECT (multimodal global exploration), Nelder-Mead (noisy non-smooth), and L-BFGS-B (bounded).
+pub fn minimize_with_casp_portfolio<F>(
+    fun: F,
+    x0: &[f64],
+    options: MinimizeOptions,
+    portfolio: &mut OptSolverPortfolio,
+    is_noisy: bool,
+    is_multimodal: bool,
+) -> Result<OptPortfolioResult, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    if x0.is_empty() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("x0 must be a finite 1-D vector with at least one element"),
+        });
+    }
+    if x0.iter().any(|v| !v.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("x0 must not contain NaN or Inf"),
+        });
+    }
+
+    let cond_estimate = variable_scale_ratio(x0);
+    let (action, posterior, expected_losses, chosen_loss) =
+        portfolio.select_action(cond_estimate, is_noisy, is_multimodal);
+
+    let (result, fallback_active) = match action {
+        OptSolverAction::BFGS => {
+            let res = bfgs(&fun, x0, options)?;
+            (res, false)
+        }
+        OptSolverAction::LBFGSB => {
+            let res = lbfgsb(&fun, x0, options, options.bounds)?;
+            (res, false)
+        }
+        OptSolverAction::NelderMead => {
+            let res = nelder_mead(&fun, x0, options)?;
+            (res, false)
+        }
+        OptSolverAction::TrustRegionNewtonCG => {
+            let res = newton_cg(&fun, x0, options)?;
+            (res, false)
+        }
+        OptSolverAction::DIRECT => {
+            let (lb, ub): (Vec<f64>, Vec<f64>) = if let Some(bnds) = options.bounds {
+                bnds.iter()
+                    .map(|b| (b.0.unwrap_or(-10.0), b.1.unwrap_or(10.0)))
+                    .unzip()
+            } else {
+                x0.iter().map(|&x| (x - 10.0, x + 10.0)).unzip()
+            };
+            let direct_bounds = Bounds::new(lb, ub)?;
+            let direct_res = crate::direct::direct(
+                &fun,
+                &direct_bounds,
+                crate::direct::DirectOptions::default(),
+            )?;
+            let res = OptimizeResult {
+                x: direct_res.x,
+                fun: Some(direct_res.fun),
+                nit: direct_res.nit,
+                nfev: direct_res.nfev,
+                njev: 0,
+                nhev: 0,
+                success: direct_res.success,
+                status: if direct_res.success {
+                    ConvergenceStatus::Success
+                } else {
+                    ConvergenceStatus::MaxIterations
+                },
+                message: direct_res.message,
+                jac: None,
+                hess_inv: None,
+                maxcv: None,
+            };
+            (res, false)
+        }
+    };
+
+    let (final_res, final_fallback) = if !result.success
+        && action != OptSolverAction::DIRECT
+        && portfolio.mode() == RuntimeMode::Hardened
+    {
+        match nelder_mead(&fun, x0, options) {
+            Ok(nm) => (nm, true),
+            Err(_) => (result, fallback_active),
+        }
+    } else {
+        (result, fallback_active)
+    };
+
+    portfolio.record_evidence(OptSolverEvidenceEntry {
+        component: "fsci-opt",
+        dimension: x0.len(),
+        condition_number_estimate: cond_estimate,
+        chosen_action: action,
+        posterior: posterior.to_vec(),
+        expected_losses: expected_losses.to_vec(),
+        chosen_expected_loss: chosen_loss,
+        fallback_active: final_fallback,
+        gradient_norm: None,
+    });
+
+    Ok(OptPortfolioResult {
+        chosen_action: action,
+        posterior,
+        expected_losses,
+        result: final_res,
+        fallback_active: final_fallback,
+    })
 }
 
 /// Batched minimisation: minimise the SAME objective `fun` from MANY starting points
@@ -4194,13 +4320,13 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use fsci_runtime::RuntimeMode;
+    use fsci_runtime::{OptSolverAction, OptSolverPortfolio, RuntimeMode};
     use proptest::prelude::*;
     use serde::Serialize;
 
     use super::{slsqp, tnc, trust_constr};
 
-    use super::{Objective, golden_section_direction_search};
+    use super::{Objective, golden_section_direction_search, minimize_with_casp_portfolio};
     use crate::{
         Bound, ConvergenceStatus, MinimizeOptions, MinimizeScalarOptions, OptCaspProblem, OptError,
         OptimizeMethod, OptimizeResult, bfgs, cg_pr_plus, get_optimize_traces, minimize,
@@ -6694,5 +6820,59 @@ mod tests {
             "at-optimum f={:?}",
             result.fun
         );
+    }
+
+    #[test]
+    fn test_minimize_with_casp_portfolio_smooth_convex_routes_to_bfgs() {
+        let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = minimize_with_casp_portfolio(
+            convex_bowl,
+            &[1.0, 1.0],
+            MinimizeOptions::default(),
+            &mut portfolio,
+            false,
+            false,
+        )
+        .expect("portfolio minimize");
+
+        assert_eq!(res.chosen_action, OptSolverAction::BFGS);
+        assert!(res.result.success);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_minimize_with_casp_portfolio_noisy_routes_to_nelder_mead() {
+        let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = minimize_with_casp_portfolio(
+            convex_bowl,
+            &[1.0, 1.0],
+            MinimizeOptions::default(),
+            &mut portfolio,
+            true,
+            false,
+        )
+        .expect("portfolio minimize");
+
+        assert_eq!(res.chosen_action, OptSolverAction::NelderMead);
+        assert!(res.result.success);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_minimize_with_casp_portfolio_multimodal_routes_to_direct() {
+        let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = minimize_with_casp_portfolio(
+            convex_bowl,
+            &[1.0, 1.0],
+            MinimizeOptions::default(),
+            &mut portfolio,
+            false,
+            true,
+        )
+        .expect("portfolio minimize");
+
+        assert_eq!(res.chosen_action, OptSolverAction::DIRECT);
+        assert!(res.result.success);
+        assert_eq!(portfolio.evidence_len(), 1);
     }
 }

@@ -5523,6 +5523,64 @@ impl Voronoi {
     }
 }
 
+/// Lightweight 2D plot representation matching matplotlib Figure data for spatial plots.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpatialPlot2D {
+    pub points: Vec<(f64, f64)>,
+    pub lines: Vec<((f64, f64), (f64, f64))>,
+}
+
+/// Plot the given convex hull, matching `scipy.spatial.convex_hull_plot_2d`.
+#[must_use]
+pub fn convex_hull_plot_2d(hull: &ConvexHull, points: &[(f64, f64)]) -> SpatialPlot2D {
+    let mut lines = Vec::with_capacity(hull.simplices.len());
+    for &(i, j) in &hull.simplices {
+        if i < points.len() && j < points.len() {
+            lines.push((points[i], points[j]));
+        }
+    }
+    SpatialPlot2D {
+        points: points.to_vec(),
+        lines,
+    }
+}
+
+/// Plot the given Delaunay triangulation, matching `scipy.spatial.delaunay_plot_2d`.
+#[must_use]
+pub fn delaunay_plot_2d(tri: &Delaunay) -> SpatialPlot2D {
+    let mut lines = Vec::new();
+    for &(i, j, k) in &tri.simplices {
+        if i < tri.points.len() && j < tri.points.len() && k < tri.points.len() {
+            lines.push((tri.points[i], tri.points[j]));
+            lines.push((tri.points[j], tri.points[k]));
+            lines.push((tri.points[k], tri.points[i]));
+        }
+    }
+    SpatialPlot2D {
+        points: tri.points.clone(),
+        lines,
+    }
+}
+
+/// Plot the given Voronoi diagram, matching `scipy.spatial.voronoi_plot_2d`.
+#[must_use]
+pub fn voronoi_plot_2d(vor: &Voronoi) -> SpatialPlot2D {
+    let mut lines = Vec::new();
+    for &(v1, v2) in &vor.ridge_vertices {
+        if v1 >= 0 && v2 >= 0 {
+            let u1 = v1 as usize;
+            let u2 = v2 as usize;
+            if u1 < vor.vertices.len() && u2 < vor.vertices.len() {
+                lines.push((vor.vertices[u1], vor.vertices[u2]));
+            }
+        }
+    }
+    SpatialPlot2D {
+        points: vor.points.clone(),
+        lines,
+    }
+}
+
 fn canonical_edge(a: usize, b: usize) -> (usize, usize) {
     if a < b { (a, b) } else { (b, a) }
 }

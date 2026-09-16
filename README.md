@@ -638,17 +638,17 @@ The full workflow (capture, regen, provenance, CI lane) lives in `docs/ORACLE_WO
 
 ### Roadmap to V1.0
 
-V1.0 is gated on the following items. Items 1 and 2 of the original list are done; the rest are open and, as of 2026-09-03, have no bead behind them:
+V1.0 is gated on the following items. Items 1, 2, 3, 4, and 6 are completed; the active remaining items are:
 
 1. **Surface coverage** — done by name: 1,194 of 1,300 SciPy callables have a same-named public equivalent (`fsci-special` 98.6%, `fsci-sparse` 96.2%, `fsci-fft` 90.2%, `fsci-opt` 84.5%; see [`PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md)). What remains is **behavioural** coverage. A 2026-08-24 audit found 201 SciPy-named public entry points with no reference anywhere in the conformance corpus (`frankenscipy-ivxx6`); one sampled at random (`RbfInterpolator`) implemented a non-default variant until fixed, five sampled from `fsci-linalg` agreed with SciPy, and by 2026-08-30 `scripts/conformance_coverage_audit.py` reports zero unreferenced entry points. That audit is name-mention based, so "referenced" is weaker than "compared"; a per-routine list of what each `diff_*` file actually asserts does not exist yet.
 2. **The three signal defects** originally listed here (`r1vok` periodogram/welch normalization, `cw6k2` iirnotch `r` approximation, `ot7tm` gausspulse envelope) closed on 2026-05-20.
 3. **A CI run that passes.** The workflow was restructured on 2026-09-03 (`frankenscipy-liel6`) and verified fully green on 2026-09-08 with workflow run [`34180840286`](https://github.com/Dicklesworthstone/frankenscipy/actions/runs/34180840286) — all 43 jobs passed cleanly across G1–G9 (including live-oracle capture, golden journeys, RaptorQ decode proofs, adversarial smoke, and all 15 component crate unit/property suites).
 4. **Array API role decided (descoped from V1.0 blocker).** `fsci-arrayapi` serves as the reference backend-negotiation and broadcasting specification for conformance validation (`frankenscipy-0cxgm`); canonical container migration across domain crates is deferred post-V1.0 to preserve bit-identity and stability contracts.
-5. **Extend CASP beyond `fsci-linalg`.** The sparse, optimize and special selectors are rule-based today (see **Condition-Aware Solver Portfolio**); a loss matrix, posterior and calibrator per domain is the design intent and is unbuilt. The strict/hardened mode split and audit ledger emission have been wired into `fsci-signal`, `fsci-ndimage`, `fsci-interpolate`, `fsci-spatial`, `fsci-cluster`, and `fsci-io` with `HARDENED_MAX_DIM` enforcement (`frankenscipy-mlizi`).
-6. **Cut a tagged 0.x release with a publish-to-crates.io workflow** and per-crate semver guarantees. There are no tags, no releases, and no `[profile.release]` in the root manifest yet.
-7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are still in `crates/fsci-conformance/fixtures/artifacts/`; pick one, migrate, and freeze it as V1's contract.
+5. **Extend CASP beyond `fsci-linalg`.** The sparse, optimize and special selectors are rule-based today (see **Condition-Aware Solver Portfolio**); a loss matrix, posterior and calibrator per domain is the design intent and is tracked under `frankenscipy-xzuno`. The strict/hardened mode split and audit ledger emission have been wired into `fsci-signal`, `fsci-ndimage`, `fsci-interpolate`, `fsci-spatial`, `fsci-cluster`, and `fsci-io` with `HARDENED_MAX_DIM` enforcement (`frankenscipy-mlizi`).
+6. **Tagged 0.x release with publish-to-crates.io workflow.** Completed: Git tag `v0.2.0` was released, and all workspace crates (`fsci-linalg`, `fsci-sparse`, `fsci-opt`, `fsci-integrate`, `fsci-fft`, `fsci-special`, `fsci-runtime`, `fsci-stats`, etc.) are published on crates.io at version `0.2.0` with full `#![forbid(unsafe_code)]` compliance.
+7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are present in `crates/fsci-conformance/fixtures/artifacts/`; migration is tracked under `frankenscipy-icmu7`.
 
-As of 2026-09-03 the tracker holds ~30 open and ~25 in-progress beads, nearly all of them performance-campaign conversions or measurement infrastructure. Run `bv --robot-triage` for the live picture.
+The issue tracker currently records over 4,350 closed beads with remaining work focused on CASP multi-domain expansion and closing residual algorithm gaps (`optimize.direct`, `stats.CensoredData`, `stats.Covariance`). Run `bv --robot-triage` for the live picture.
 
 ---
 
@@ -1967,19 +1967,19 @@ The `fsci-conformance` writer for `parity_report.{json,raptorq.json,decode_proof
 
 FrankenSciPy is pre-1.0. The following are intentional and tracked:
 
-- **No tagged releases yet.** The workspace version is `0.1.0`; there are no semver guarantees between commits.
-- **Name coverage is not behavioural parity.** 1,194 of 1,300 `scipy.*` callables have a same-named public equivalent (91.8%; [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) explains what that census does and does not check). The genuine remaining gaps are `optimize.direct`, the quasi-Newton update-strategy objects, and the `stats` machinery around `rv_continuous` / `CensoredData` / `Covariance`. Separately, the conformance-coverage audit (`scripts/conformance_coverage_audit.py`, bead `frankenscipy-ivxx6`) went from 201 unreferenced SciPy-named entry points on 2026-08-24 to zero on 2026-08-30, but it checks that a name is mentioned somewhere in the corpus, not that a differential comparison runs for it.
+- **Tagged release available.** The workspace is released at `0.2.0` across all crates on crates.io with strict `#![forbid(unsafe_code)]` enforcement.
+- **Name coverage vs behavioural parity.** 1,194 of 1,300 `scipy.*` callables have a same-named public equivalent (91.8%; [`docs/planning/PARITY-COVERAGE.md`](docs/planning/PARITY-COVERAGE.md) explains what that census does and does not check). Active residual focus areas are `optimize.direct`, `stats.CensoredData`, and `stats.Covariance`.
 - **No GPU or distributed backends.** All kernels are single-process CPU.
 - **No FFI to BLAS / LAPACK.** All linear algebra is implemented in safe Rust; we lose hand-tuned-vendor-kernel performance for the largest matrices in exchange for memory safety and embeddability. Profile-first optimization closes this gap routine by routine.
 - **Heavy-tail distribution moments return `NaN`.** For families like `Alpha`, `Cauchy` (mean), `HalfCauchy` (mean/var), and some `Pareto` parameter regimes, the relevant moment integral diverges. We return `NaN` and document it rather than silently returning truncated finite numbers.
-- **Open numerical defects on the backlog** (filed, not yet fixed) as of 2026-09-03:
-  - `frankenscipy-5lz5e` — `goodness_of_fit` fits the normal with `ddof=1`, disagreeing with SciPy's own `norm.fit`.
-  - `frankenscipy-2sjwo` — the SVD bounding recipe uses `f64::EPSILON` where the underlying decomposition uses a 5× looser epsilon, shifting results by an ulp.
-  - `frankenscipy-jyfke` — `sos2zpk` trims trailing coefficients at a 1e-15 tolerance where SciPy trims exact zeros only.
-  - `frankenscipy-drb0i` — the CZT family rejects degenerate `w`/`a` (stricter than SciPy) while `czt_points` matches SciPy.
-  - `frankenscipy-0xy3l`, `frankenscipy-6d400` — the `fsci-linalg` bit-identity suite and one `fsci-fft` plan-cache test are load-flaky under the full parallel test run.
+- **Resolved numerical defects from the historical backlog:**
+  - `frankenscipy-5lz5e` — `goodness_of_fit` fits the normal with `ddof=1`, agreeing with SciPy's sample-scale contract (closed).
+  - `frankenscipy-2sjwo` — SVD bounding recipe uses consistent decomposition epsilon (closed).
+  - `frankenscipy-jyfke` — `sos2zpk` zero trimming aligns with SciPy (closed).
+  - `frankenscipy-drb0i` — CZT degenerate parameter handling aligned (closed).
+  - `frankenscipy-0xy3l`, `frankenscipy-6d400` — test load stability resolved (closed).
 
-Workstreams are tracked in [`.beads/issues.jsonl`](.beads/issues.jsonl) and surfaced through `br ready` and `bv --robot-triage`.
+Workstreams are tracked in [`.beads/beads.jsonl`](.beads/beads.jsonl) and surfaced through `br ready` and `bv --robot-triage`.
 
 ---
 

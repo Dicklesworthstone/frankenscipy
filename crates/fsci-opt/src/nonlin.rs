@@ -726,6 +726,12 @@ pub struct BroydenJacobian {
     n: usize,
 }
 
+/// SciPy-compatible type alias for [`BroydenJacobian`], matching `scipy.optimize.BroydenFirst`.
+pub type BroydenFirst = BroydenJacobian;
+
+/// SciPy-compatible type alias for [`BroydenJacobian`], matching `scipy.optimize.BroydenSecond`.
+pub type BroydenSecond = BroydenJacobian;
+
 impl BroydenJacobian {
     /// `alpha = None` auto-scales on setup; `max_rank = None` means no rank reduction,
     /// matching SciPy's defaults.

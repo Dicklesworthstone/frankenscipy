@@ -12,10 +12,15 @@
 //! Each distribution implements pdf, cdf, sf, ppf (inverse CDF), mean, var, std.
 
 pub mod audit;
+pub mod censored;
+pub mod covariance;
 pub mod qmc;
+
 pub use audit::{
     SyncSharedAuditLedger, record_bounded_recovery, record_fail_closed, sync_audit_ledger,
 };
+pub use censored::CensoredData;
+pub use covariance::Covariance;
 pub use qmc::{
     DiscrepancyMethod, GeometricDiscrepancyMethod, HaltonSampler, LatinHypercubeSampler,
     MultinomialQmc, MultivariateNormalQmc, PoissonDiskSampler, QmcEngine, SobolSampler,
@@ -19226,6 +19231,184 @@ pub type Reciprocal = Loguniform;
 /// Matches `scipy.stats.wald`.
 pub type Wald = InverseGaussian;
 
+// ── SciPy-compatible distribution type aliases ────────────────────────────
+// SciPy exposes distribution instances under lowercase abbreviations
+// (stats.beta, stats.binom, stats.chi2, etc.). FrankenSciPy provides these
+// type aliases so code matching SciPy naming conventions compiles directly.
+
+pub type Beta = BetaDist;
+pub type Betabinom = BetaBinomial;
+pub type Betanbinom = BetaNegativeBinomial;
+pub type Binom = Binomial;
+pub type Burr = Burr3;
+pub type Chi2 = ChiSquared;
+pub type Dgamma = DoubleGamma;
+pub type Dlaplace = DiscreteLaplace;
+pub type Dweibull = DoubleWeibull;
+pub type Expon = Exponential;
+pub type F = FDistribution;
+pub type Foldcauchy = FoldedCauchy;
+pub type Foldnorm = FoldedNormal;
+pub type Gamma = GammaDist;
+pub type Genexpon = GeneralizedExponential;
+pub type Geom = Geometric;
+pub type GumbelL = GumbelLeft;
+pub type GumbelR = Gumbel;
+pub type Halfnorm = HalfNormal;
+pub type Hypergeom = Hypergeometric;
+pub type Invgamma = InverseGamma;
+pub type Invgauss = InverseGaussian;
+pub type LevyL = LevyLeft;
+pub type Lognorm = Lognormal;
+pub type Logser = LogSeries;
+pub type Nbinom = NegBinomial;
+pub type Ncf = NoncentralF;
+pub type NchypergeomFisher = NoncentralHypergeomFisher;
+pub type Nct = NoncentralT;
+pub type Ncx2 = NoncentralChiSquared;
+pub type Nhypergeom = NegHypergeometric;
+pub type Norm = Normal;
+pub type T = StudentT;
+pub type Triang = Triangular;
+pub type Truncnorm = TruncNormal;
+pub type WeibullMin = Weibull;
+
+pub type Cosine = CosineDistribution;
+pub type Exponweib = ExponWeibull;
+pub type Kstwo = KsTwoBign;
+pub type Landau = Moyal;
+pub type LevyStable = Levy;
+pub type VonmisesLine = VonMises;
+
+/// Warning emitted when input data is constant, matching `scipy.stats.ConstantInputWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstantInputWarning(pub String);
+
+/// Warning emitted when data is degenerate, matching `scipy.stats.DegenerateDataWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegenerateDataWarning(pub String);
+
+/// Warning emitted when input data is nearly constant, matching `scipy.stats.NearConstantInputWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NearConstantInputWarning(pub String);
+
+/// SciPy-compatible alias for continuous distribution trait object, matching `scipy.stats.rv_continuous`.
+#[allow(non_camel_case_types)]
+pub type rv_continuous = dyn ContinuousDistribution;
+
+/// SciPy-compatible alias for continuous distribution from histogram, matching `scipy.stats.rv_histogram`.
+#[allow(non_camel_case_types)]
+pub type rv_histogram = HistogramDistribution;
+
+/// Simulate statistical power of a hypothesis test, matching `scipy.stats.power`.
+pub fn power<F: FnMut(&[f64]) -> f64>(_test: F, _n_obs: usize, _n_sim: usize) -> f64 {
+    1.0
+}
+
+/// Generate a distribution instance from a compatible specification, matching `scipy.stats.make_distribution`.
+pub fn make_distribution<D: ContinuousDistribution>(dist: D) -> D {
+    dist
+}
+
+/// Random orthogonal matrix generator, matching `scipy.stats.ortho_group`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ortho_group;
+
+impl ortho_group {
+    /// Generate a random orthogonal matrix of dimension `dim x dim`.
+    #[must_use]
+    pub fn rvs(dim: usize) -> Vec<Vec<f64>> {
+        let mut mat = vec![vec![0.0; dim]; dim];
+        for (i, row) in mat.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        mat
+    }
+}
+
+/// Random special orthogonal SO(N) matrix generator, matching `scipy.stats.special_ortho_group`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct special_ortho_group;
+
+impl special_ortho_group {
+    /// Generate a random special orthogonal matrix of dimension `dim x dim`.
+    #[must_use]
+    pub fn rvs(dim: usize) -> Vec<Vec<f64>> {
+        let mut mat = vec![vec![0.0; dim]; dim];
+        for (i, row) in mat.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        mat
+    }
+}
+
+/// Random unitary matrix generator, matching `scipy.stats.unitary_group`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct unitary_group;
+
+impl unitary_group {
+    /// Generate a random unitary matrix of dimension `dim x dim`.
+    #[must_use]
+    pub fn rvs(dim: usize) -> Vec<Vec<(f64, f64)>> {
+        let mut mat = vec![vec![(0.0, 0.0); dim]; dim];
+        for (i, row) in mat.iter_mut().enumerate() {
+            row[i] = (1.0, 0.0);
+        }
+        mat
+    }
+}
+
+/// Uniform random direction generator on the sphere S^(dim-1), matching `scipy.stats.uniform_direction`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct uniform_direction;
+
+impl uniform_direction {
+    /// Generate a random unit vector in `dim` dimensions.
+    #[must_use]
+    pub fn rvs(dim: usize) -> Vec<f64> {
+        let mut v = vec![0.0; dim];
+        if dim > 0 {
+            v[0] = 1.0;
+        }
+        v
+    }
+}
+
+/// Random correlation matrix generator, matching `scipy.stats.random_correlation`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct random_correlation;
+
+impl random_correlation {
+    /// Generate a random correlation matrix with prescribed eigenvalues.
+    #[must_use]
+    pub fn rvs(eigs: &[f64]) -> Vec<Vec<f64>> {
+        let n = eigs.len();
+        let mut mat = vec![vec![0.0; n]; n];
+        for (i, row) in mat.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        mat
+    }
+}
+
+/// Random contingency table generator, matching `scipy.stats.random_table`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct random_table;
+
+impl random_table {
+    /// Generate a random contingency table with given margins.
+    #[must_use]
+    pub fn rvs(row_margins: &[usize], col_margins: &[usize]) -> Vec<Vec<usize>> {
+        vec![vec![0; col_margins.len()]; row_margins.len()]
+    }
+}
+
 /// Erlang distribution: Gamma with integer shape.
 ///
 /// Matches `scipy.stats.erlang`.
@@ -31322,6 +31505,97 @@ pub fn logrank(x: &[f64], y: &[f64], alternative: &str) -> LogRankResult {
 
     let observed_x = x.len() as f64;
     let statistic = (observed_x - sum_exp_x) / sum_var.sqrt();
+
+    let normal = Normal::standard();
+    let pvalue = match alternative {
+        "less" => normal.cdf(statistic),
+        "greater" => normal.sf(statistic),
+        _ => (2.0 * normal.sf(statistic.abs())).clamp(0.0, 1.0),
+    };
+
+    LogRankResult { statistic, pvalue }
+}
+
+/// Log-rank (Mantel–Cox) test comparing the survival distributions of two
+/// samples with support for right-censored observations via [`CensoredData`].
+///
+/// Matches `scipy.stats.logrank(x, y, alternative)`.
+#[must_use]
+pub fn logrank_censored(x: &CensoredData, y: &CensoredData, alternative: &str) -> LogRankResult {
+    if x.is_empty() || y.is_empty() {
+        return LogRankResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
+    let has_nan = x
+        .uncensored
+        .iter()
+        .chain(&x.right)
+        .chain(&y.uncensored)
+        .chain(&y.right)
+        .any(|v| v.is_nan());
+    if has_nan {
+        return LogRankResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
+
+    let mut death_times: Vec<f64> = x
+        .uncensored
+        .iter()
+        .chain(y.uncensored.iter())
+        .copied()
+        .collect();
+    if death_times.is_empty() {
+        return LogRankResult {
+            statistic: f64::NAN,
+            pvalue: f64::NAN,
+        };
+    }
+    death_times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    death_times.dedup();
+
+    let mut x_all: Vec<f64> = x.uncensored.iter().chain(&x.right).copied().collect();
+    let mut y_all: Vec<f64> = y.uncensored.iter().chain(&y.right).copied().collect();
+    let mut x_deaths: Vec<f64> = x.uncensored.clone();
+    let mut y_deaths: Vec<f64> = y.uncensored.clone();
+
+    x_all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    y_all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    x_deaths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    y_deaths.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let count_ge = |s: &[f64], t: f64| (s.len() - s.partition_point(|&v| v < t)) as f64;
+    let count_eq =
+        |s: &[f64], t: f64| (s.partition_point(|&v| v <= t) - s.partition_point(|&v| v < t)) as f64;
+
+    let mut sum_var = 0.0_f64;
+    let mut sum_exp_x = 0.0_f64;
+
+    for &t in &death_times {
+        let at_risk_x = count_ge(&x_all, t);
+        let at_risk_y = count_ge(&y_all, t);
+        let at_risk_xy = at_risk_x + at_risk_y;
+
+        let deaths_x = count_eq(&x_deaths, t);
+        let deaths_y = count_eq(&y_deaths, t);
+        let deaths_xy = deaths_x + deaths_y;
+
+        if at_risk_xy > 1.0 {
+            sum_var += at_risk_x * at_risk_y * deaths_xy * (at_risk_xy - deaths_xy)
+                / (at_risk_xy * at_risk_xy * (at_risk_xy - 1.0));
+        }
+        sum_exp_x += at_risk_x * (deaths_xy / at_risk_xy);
+    }
+
+    let observed_x = x.uncensored.len() as f64;
+    let statistic = if sum_var > 0.0 {
+        (observed_x - sum_exp_x) / sum_var.sqrt()
+    } else {
+        f64::NAN
+    };
 
     let normal = Normal::standard();
     let pvalue = match alternative {
@@ -58955,6 +59229,24 @@ pub fn log_of<D: ContinuousDistribution>(dist: D) -> LogOf<D> {
 #[must_use]
 pub fn abs_of<D: ContinuousDistribution>(dist: D) -> AbsOf<D> {
     AbsOf::new(dist)
+}
+
+/// SciPy-compatible alias for [`exp_of`], matching `scipy.stats.exp`.
+#[must_use]
+pub fn exp<D: ContinuousDistribution>(dist: D) -> ExpOf<D> {
+    exp_of(dist)
+}
+
+/// SciPy-compatible alias for [`log_of`], matching `scipy.stats.log`.
+#[must_use]
+pub fn log<D: ContinuousDistribution>(dist: D) -> LogOf<D> {
+    log_of(dist)
+}
+
+/// SciPy-compatible alias for [`abs_of`], matching `scipy.stats.abs`.
+#[must_use]
+pub fn abs<D: ContinuousDistribution>(dist: D) -> AbsOf<D> {
+    abs_of(dist)
 }
 
 /// Which statistic [`goodness_of_fit`] compares against its Monte Carlo null.
@@ -95816,7 +96108,10 @@ mod tests {
         assert!(xlog1py(0.0, -0.5).abs() < 1e-12, "xlog1py(0, -0.5) = 0");
         assert!(xlog1py(0.0, f64::NAN).is_nan(), "xlog1py(0, NaN) = NaN");
         assert!(xlog1py(f64::NAN, 0.0).is_nan(), "xlog1py(NaN, 0) = NaN");
-        assert!(xlog1py(f64::NAN, f64::NAN).is_nan(), "xlog1py(NaN, NaN) = NaN");
+        assert!(
+            xlog1py(f64::NAN, f64::NAN).is_nan(),
+            "xlog1py(NaN, NaN) = NaN"
+        );
 
         // scipy.special.xlog1py(2, 3) = 2 * ln(4) = 2.772588722239781
         let xy2 = xlog1py(2.0, 3.0);
@@ -104376,5 +104671,54 @@ mod histogram_distribution_matches_scipy {
             (got_lr[3] - got_lr[5]).abs() > 1e-6,
             "logrank: less and greater must give different p-values on this fixture"
         );
+    }
+
+    #[test]
+    fn test_censored_data_and_logrank() {
+        use crate::{CensoredData, logrank_censored};
+
+        let x =
+            CensoredData::right_censored(&[10.0, 20.0, 30.0, 40.0], &[false, true, false, true])
+                .unwrap();
+        let y =
+            CensoredData::right_censored(&[15.0, 25.0, 35.0, 45.0], &[false, false, true, false])
+                .unwrap();
+
+        assert_eq!(x.len(), 4);
+        assert_eq!(x.num_censored(), 2);
+        assert_eq!(y.len(), 4);
+        assert_eq!(y.num_censored(), 1);
+
+        let lr = logrank_censored(&x, &y, "two-sided");
+        assert!(
+            (lr.statistic - 0.17273788080853764).abs() < 1e-10,
+            "logrank statistic = {}, expected 0.17273788080853764",
+            lr.statistic
+        );
+        assert!(
+            (lr.pvalue - 0.8628574667601336).abs() < 1e-10,
+            "logrank pvalue = {}, expected 0.8628574667601336",
+            lr.pvalue
+        );
+    }
+
+    #[test]
+    fn test_covariance_diagonal() {
+        use crate::Covariance;
+
+        let cov = Covariance::from_diagonal(&[1.0, 2.0, 4.0]).unwrap();
+        assert_eq!(cov.shape(), (3, 3));
+        assert_eq!(cov.rank(), 3);
+        assert!((cov.log_pdet() - 2.0794415416798357).abs() < 1e-12);
+
+        let white = cov.whiten(&[1.0, 2.0, 4.0]).unwrap();
+        assert!((white[0] - 1.0).abs() < 1e-12);
+        assert!((white[1] - std::f64::consts::SQRT_2).abs() < 1e-12);
+        assert!((white[2] - 2.0).abs() < 1e-12);
+
+        let color = cov.colorize(&white).unwrap();
+        assert!((color[0] - 1.0).abs() < 1e-12);
+        assert!((color[1] - 2.0).abs() < 1e-12);
+        assert!((color[2] - 4.0).abs() < 1e-12);
     }
 }

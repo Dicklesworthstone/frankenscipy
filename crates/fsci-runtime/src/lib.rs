@@ -421,6 +421,759 @@ pub fn casp_now_unix_ms() -> u64 {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// CASP Sparse — Iterative & Direct Sparse Solver Portfolio
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SparseConditionState {
+    SymmetricPositiveDefinite,
+    GeneralWellConditioned,
+    Indefinite,
+    IllConditioned,
+}
+
+impl SparseConditionState {
+    pub const ALL: [Self; 4] = [
+        Self::SymmetricPositiveDefinite,
+        Self::GeneralWellConditioned,
+        Self::Indefinite,
+        Self::IllConditioned,
+    ];
+
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::SymmetricPositiveDefinite => 0,
+            Self::GeneralWellConditioned => 1,
+            Self::Indefinite => 2,
+            Self::IllConditioned => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SparseSolverAction {
+    ConjugateGradient,
+    MinRes,
+    BiCGSTAB,
+    GMRES,
+    QMR,
+    SuperLU,
+}
+
+impl SparseSolverAction {
+    pub const ALL: [Self; 6] = [
+        Self::ConjugateGradient,
+        Self::MinRes,
+        Self::BiCGSTAB,
+        Self::GMRES,
+        Self::QMR,
+        Self::SuperLU,
+    ];
+
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::ConjugateGradient => 0,
+            Self::MinRes => 1,
+            Self::BiCGSTAB => 2,
+            Self::GMRES => 3,
+            Self::QMR => 4,
+            Self::SuperLU => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SparseStructuralEvidence {
+    pub is_symmetric: bool,
+    pub is_positive_definite_hint: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SparseSolverEvidenceEntry {
+    pub component: &'static str,
+    pub matrix_shape: (usize, usize),
+    pub nnz: usize,
+    pub cond_estimate: f64,
+    pub chosen_action: SparseSolverAction,
+    pub posterior: Vec<f64>,
+    pub expected_losses: Vec<f64>,
+    pub chosen_expected_loss: f64,
+    pub fallback_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_residual: Option<f64>,
+}
+
+/// Sparse solver selection portfolio engine.
+///
+/// Loss matrix (6 actions × 4 states):
+///
+/// | Action \ State       | SPD | GenWell | Indef | IllCond |
+/// |----------------------|-----|---------|-------|---------|
+/// | ConjugateGradient    |   1 |     150 |   200 |     250 |
+/// | MinRes               |   3 |     100 |     2 |     200 |
+/// | BiCGSTAB             |   6 |       1 |    45 |     180 |
+/// | GMRES                |  10 |       4 |     6 |      60 |
+/// | QMR                  |  12 |       5 |     8 |      70 |
+/// | SuperLU              |  40 |      30 |    25 |       2 |
+#[derive(Debug, Clone)]
+pub struct SparseSolverPortfolio {
+    mode: RuntimeMode,
+    loss_matrix: [[f64; 4]; 6],
+    evidence: VecDeque<SparseSolverEvidenceEntry>,
+    evidence_capacity: usize,
+    calibrator: ConformalCalibrator,
+}
+
+impl SparseSolverPortfolio {
+    #[must_use]
+    pub fn new(mode: RuntimeMode, evidence_capacity: usize) -> Self {
+        let evidence_capacity = evidence_capacity.max(1);
+        Self {
+            mode,
+            loss_matrix: Self::default_loss_matrix(),
+            evidence: VecDeque::with_capacity(evidence_capacity),
+            evidence_capacity,
+            calibrator: ConformalCalibrator::new(0.05, 200),
+        }
+    }
+
+    #[must_use]
+    pub const fn default_loss_matrix() -> [[f64; 4]; 6] {
+        [
+            // SPD,   GenWell, Indef,  IllCond
+            [1.0, 40.0, 50.0, 100.0], // ConjugateGradient
+            [3.0, 30.0, 2.0, 80.0],   // MinRes
+            [5.0, 1.0, 15.0, 60.0],   // BiCGSTAB
+            [8.0, 4.0, 5.0, 30.0],    // GMRES
+            [10.0, 5.0, 6.0, 35.0],   // QMR
+            [25.0, 20.0, 18.0, 2.0],  // SuperLU
+        ]
+    }
+
+    /// Select optimal sparse solver via expected-loss minimization.
+    pub fn select_action(
+        &self,
+        cond_estimate: f64,
+        structure: Option<SparseStructuralEvidence>,
+    ) -> (SparseSolverAction, [f64; 4], [f64; 6], f64) {
+        let posterior = Self::condition_posterior(cond_estimate, structure);
+
+        // If conformal calibrator triggers drift, fallback to SuperLU direct solver
+        if self.calibrator.should_fallback() {
+            let losses = self.compute_expected_losses(posterior);
+            return (
+                SparseSolverAction::SuperLU,
+                posterior,
+                losses,
+                losses[SparseSolverAction::SuperLU.index()],
+            );
+        }
+
+        let losses = self.compute_expected_losses(posterior);
+        let mut best_idx = 0;
+        let mut best_loss = losses[0];
+
+        for (idx, &loss) in losses.iter().enumerate().skip(1) {
+            if loss < best_loss {
+                best_loss = loss;
+                best_idx = idx;
+            } else if (loss - best_loss).abs() <= 1e-12 && idx > best_idx {
+                best_idx = idx;
+            }
+        }
+
+        (
+            SparseSolverAction::ALL[best_idx],
+            posterior,
+            losses,
+            best_loss,
+        )
+    }
+
+    pub fn record_evidence(&mut self, entry: SparseSolverEvidenceEntry) {
+        if let Some(res) = entry.relative_residual {
+            self.calibrator.observe(res);
+        }
+        if self.evidence.len() >= self.evidence_capacity {
+            let _ = self.evidence.pop_front();
+        }
+        self.evidence.push_back(entry);
+    }
+
+    pub fn observe_relative_residual(&mut self, residual: f64) {
+        self.calibrator.observe(residual);
+    }
+
+    #[must_use]
+    pub fn evidence_len(&self) -> usize {
+        self.evidence.len()
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> RuntimeMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn calibrator(&self) -> &ConformalCalibrator {
+        &self.calibrator
+    }
+
+    fn compute_expected_losses(&self, posterior: [f64; 4]) -> [f64; 6] {
+        let mut losses = [0.0; 6];
+        for (action_idx, row) in self.loss_matrix.iter().enumerate() {
+            losses[action_idx] = row.iter().zip(posterior.iter()).map(|(l, p)| l * p).sum();
+        }
+        losses
+    }
+
+    fn condition_posterior(
+        cond_estimate: f64,
+        structure: Option<SparseStructuralEvidence>,
+    ) -> [f64; 4] {
+        if !cond_estimate.is_finite() || cond_estimate <= 0.0 {
+            return [0.0, 0.0, 0.0, 1.0];
+        }
+
+        let is_sym = structure.is_some_and(|s| s.is_symmetric);
+        let pd_hint = structure.and_then(|s| s.is_positive_definite_hint);
+
+        if cond_estimate >= 1e8 {
+            return [0.0, 0.0, 0.0, 1.0]; // IllConditioned
+        }
+
+        if is_sym {
+            if pd_hint == Some(true) {
+                if cond_estimate < 1e4 {
+                    [0.98, 0.0, 0.0, 0.02]
+                } else {
+                    [0.78, 0.0, 0.0, 0.22]
+                }
+            } else if pd_hint == Some(false) {
+                if cond_estimate < 1e4 {
+                    [0.0, 0.0, 0.97, 0.03]
+                } else {
+                    [0.0, 0.0, 0.70, 0.30]
+                }
+            } else if cond_estimate < 1e4 {
+                [0.70, 0.0, 0.28, 0.02]
+            } else {
+                [0.45, 0.0, 0.35, 0.20]
+            }
+        } else if cond_estimate < 1e4 {
+            [0.0, 0.96, 0.02, 0.02]
+        } else {
+            [0.0, 0.60, 0.15, 0.25]
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CASP Opt — Continuous & Global Optimization Solver Portfolio
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LandscapeConditionState {
+    SmoothConvex,
+    IllConditionedValley,
+    NonConvexMultiModal,
+    NoisyNonSmooth,
+}
+
+impl LandscapeConditionState {
+    pub const ALL: [Self; 4] = [
+        Self::SmoothConvex,
+        Self::IllConditionedValley,
+        Self::NonConvexMultiModal,
+        Self::NoisyNonSmooth,
+    ];
+
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::SmoothConvex => 0,
+            Self::IllConditionedValley => 1,
+            Self::NonConvexMultiModal => 2,
+            Self::NoisyNonSmooth => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OptSolverAction {
+    BFGS,
+    LBFGSB,
+    NelderMead,
+    DIRECT,
+    TrustRegionNewtonCG,
+}
+
+impl OptSolverAction {
+    pub const ALL: [Self; 5] = [
+        Self::BFGS,
+        Self::LBFGSB,
+        Self::NelderMead,
+        Self::DIRECT,
+        Self::TrustRegionNewtonCG,
+    ];
+
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::BFGS => 0,
+            Self::LBFGSB => 1,
+            Self::NelderMead => 2,
+            Self::DIRECT => 3,
+            Self::TrustRegionNewtonCG => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OptSolverEvidenceEntry {
+    pub component: &'static str,
+    pub dimension: usize,
+    pub condition_number_estimate: f64,
+    pub chosen_action: OptSolverAction,
+    pub posterior: Vec<f64>,
+    pub expected_losses: Vec<f64>,
+    pub chosen_expected_loss: f64,
+    pub fallback_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gradient_norm: Option<f64>,
+}
+
+/// Optimization solver selection portfolio engine.
+///
+/// Loss matrix (5 actions × 4 states):
+///
+/// | Action \ State          | SmoothConvex | Valley | MultiModal | NoisyNonSmooth |
+/// |-------------------------|--------------|--------|------------|----------------|
+/// | BFGS                    |            1 |     15 |        120 |            150 |
+/// | LBFGSB                  |            2 |     20 |        120 |            150 |
+/// | NelderMead              |           50 |     60 |         80 |              2 |
+/// | DIRECT                  |           80 |     40 |          2 |             10 |
+/// | TrustRegionNewtonCG     |            8 |      2 |         70 |            180 |
+#[derive(Debug, Clone)]
+pub struct OptSolverPortfolio {
+    mode: RuntimeMode,
+    loss_matrix: [[f64; 4]; 5],
+    evidence: VecDeque<OptSolverEvidenceEntry>,
+    evidence_capacity: usize,
+    calibrator: ConformalCalibrator,
+}
+
+impl OptSolverPortfolio {
+    #[must_use]
+    pub fn new(mode: RuntimeMode, evidence_capacity: usize) -> Self {
+        let evidence_capacity = evidence_capacity.max(1);
+        Self {
+            mode,
+            loss_matrix: Self::default_loss_matrix(),
+            evidence: VecDeque::with_capacity(evidence_capacity),
+            evidence_capacity,
+            calibrator: ConformalCalibrator::new(0.05, 200),
+        }
+    }
+
+    #[must_use]
+    pub const fn default_loss_matrix() -> [[f64; 4]; 5] {
+        [
+            // SmoothConvex, Valley,  MultiModal, NoisyNonSmooth
+            [1.0, 15.0, 120.0, 150.0], // BFGS
+            [2.0, 20.0, 120.0, 150.0], // LBFGSB
+            [30.0, 30.0, 40.0, 1.0],   // NelderMead
+            [80.0, 40.0, 2.0, 20.0],   // DIRECT
+            [8.0, 2.0, 70.0, 180.0],   // TrustRegionNewtonCG
+        ]
+    }
+
+    pub fn select_action(
+        &self,
+        hessian_cond_estimate: f64,
+        is_noisy_or_discontinuous: bool,
+        is_global_bounds_constrained: bool,
+    ) -> (OptSolverAction, [f64; 4], [f64; 5], f64) {
+        let posterior = Self::landscape_posterior(
+            hessian_cond_estimate,
+            is_noisy_or_discontinuous,
+            is_global_bounds_constrained,
+        );
+
+        // If conformal calibrator triggers drift, fallback to DIRECT or NelderMead
+        if self.calibrator.should_fallback() {
+            let losses = self.compute_expected_losses(posterior);
+            let fallback_action = if is_global_bounds_constrained {
+                OptSolverAction::DIRECT
+            } else {
+                OptSolverAction::NelderMead
+            };
+            return (
+                fallback_action,
+                posterior,
+                losses,
+                losses[fallback_action.index()],
+            );
+        }
+
+        let losses = self.compute_expected_losses(posterior);
+        let mut best_idx = 0;
+        let mut best_loss = losses[0];
+
+        for (idx, &loss) in losses.iter().enumerate().skip(1) {
+            if loss < best_loss {
+                best_loss = loss;
+                best_idx = idx;
+            } else if (loss - best_loss).abs() <= 1e-12 && idx > best_idx {
+                best_idx = idx;
+            }
+        }
+
+        (OptSolverAction::ALL[best_idx], posterior, losses, best_loss)
+    }
+
+    pub fn record_evidence(&mut self, entry: OptSolverEvidenceEntry) {
+        if let Some(gnorm) = entry.gradient_norm {
+            self.calibrator.observe(gnorm);
+        }
+        if self.evidence.len() >= self.evidence_capacity {
+            let _ = self.evidence.pop_front();
+        }
+        self.evidence.push_back(entry);
+    }
+
+    pub fn observe_step_failure(&mut self, failure_score: f64) {
+        self.calibrator.observe(failure_score);
+    }
+
+    #[must_use]
+    pub fn evidence_len(&self) -> usize {
+        self.evidence.len()
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> RuntimeMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn calibrator(&self) -> &ConformalCalibrator {
+        &self.calibrator
+    }
+
+    fn compute_expected_losses(&self, posterior: [f64; 4]) -> [f64; 5] {
+        let mut losses = [0.0; 5];
+        for (action_idx, row) in self.loss_matrix.iter().enumerate() {
+            losses[action_idx] = row.iter().zip(posterior.iter()).map(|(l, p)| l * p).sum();
+        }
+        losses
+    }
+
+    fn landscape_posterior(
+        hessian_cond_estimate: f64,
+        is_noisy_or_discontinuous: bool,
+        is_global_bounds_constrained: bool,
+    ) -> [f64; 4] {
+        if is_noisy_or_discontinuous {
+            return [0.05, 0.05, 0.1, 0.8]; // NoisyNonSmooth
+        }
+        if is_global_bounds_constrained {
+            return [0.05, 0.1, 0.8, 0.05]; // NonConvexMultiModal
+        }
+        if !hessian_cond_estimate.is_finite() || hessian_cond_estimate >= 1e6 {
+            return [0.05, 0.85, 0.05, 0.05]; // IllConditionedValley
+        }
+        if hessian_cond_estimate < 1e3 {
+            [0.85, 0.05, 0.05, 0.05] // SmoothConvex
+        } else {
+            [0.3, 0.6, 0.05, 0.05]
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// CASP Integrate — ODE & IVP Solver Portfolio with Stiffness Tracking
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StiffnessConditionState {
+    NonStiffSmooth,
+    MildlyStiff,
+    Stiff,
+    AlgebraicConstrained,
+}
+
+impl StiffnessConditionState {
+    pub const ALL: [Self; 4] = [
+        Self::NonStiffSmooth,
+        Self::MildlyStiff,
+        Self::Stiff,
+        Self::AlgebraicConstrained,
+    ];
+
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::NonStiffSmooth => 0,
+            Self::MildlyStiff => 1,
+            Self::Stiff => 2,
+            Self::AlgebraicConstrained => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OdeSolverAction {
+    RK45,
+    RK23,
+    DOP853,
+    Radau,
+    BDF,
+}
+
+impl OdeSolverAction {
+    pub const ALL: [Self; 5] = [Self::RK45, Self::RK23, Self::DOP853, Self::Radau, Self::BDF];
+
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::RK45 => 0,
+            Self::RK23 => 1,
+            Self::DOP853 => 2,
+            Self::Radau => 3,
+            Self::BDF => 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OdeSolverEvidenceEntry {
+    pub component: &'static str,
+    pub system_dim: usize,
+    pub stiffness_ratio_estimate: f64,
+    pub chosen_action: OdeSolverAction,
+    pub posterior: Vec<f64>,
+    pub expected_losses: Vec<f64>,
+    pub chosen_expected_loss: f64,
+    pub fallback_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_rejections: Option<usize>,
+}
+
+/// Online stiffness detection for adaptive step and solver control.
+#[derive(Debug, Clone)]
+pub struct StiffnessDetector {
+    stiffness_threshold: f64,
+    consecutive_rejections: usize,
+    rejection_threshold: usize,
+    rejection_history: VecDeque<bool>,
+    history_capacity: usize,
+}
+
+impl StiffnessDetector {
+    #[must_use]
+    pub fn new(stiffness_threshold: f64, rejection_threshold: usize) -> Self {
+        Self {
+            stiffness_threshold: stiffness_threshold.max(1.0),
+            consecutive_rejections: 0,
+            rejection_threshold: rejection_threshold.max(1),
+            rejection_history: VecDeque::with_capacity(100),
+            history_capacity: 100,
+        }
+    }
+
+    /// Record a step outcome (true = accepted, false = rejected due to stability/tolerance).
+    pub fn observe_step(&mut self, accepted: bool) {
+        if accepted {
+            self.consecutive_rejections = 0;
+        } else {
+            self.consecutive_rejections += 1;
+        }
+        if self.rejection_history.len() >= self.history_capacity {
+            let _ = self.rejection_history.pop_front();
+        }
+        self.rejection_history.push_back(!accepted);
+    }
+
+    /// Check if stiffness is detected based on consecutive rejections or ratio estimate.
+    #[must_use]
+    pub fn is_stiff(&self, stiffness_ratio_estimate: f64) -> bool {
+        if self.consecutive_rejections >= self.rejection_threshold {
+            return true;
+        }
+        stiffness_ratio_estimate.is_finite() && stiffness_ratio_estimate >= self.stiffness_threshold
+    }
+
+    #[must_use]
+    pub fn rejection_rate(&self) -> f64 {
+        if self.rejection_history.is_empty() {
+            return 0.0;
+        }
+        let rejections = self.rejection_history.iter().filter(|&&r| r).count();
+        rejections as f64 / self.rejection_history.len() as f64
+    }
+}
+
+impl Default for StiffnessDetector {
+    fn default() -> Self {
+        Self::new(1e3, 3)
+    }
+}
+
+/// ODE solver selection portfolio engine.
+///
+/// Loss matrix (5 actions × 4 states):
+///
+/// | Action \ State  | NonStiff | MildlyStiff | Stiff | Algebraic |
+/// |-----------------|----------|-------------|-------|-----------|
+/// | RK45            |        1 |          25 |   200 |       300 |
+/// | RK23            |        5 |          40 |   250 |       300 |
+/// | DOP853          |        2 |          35 |   250 |       150 |
+/// | Radau           |       35 |           3 |     2 |         1 |
+/// | BDF             |       25 |           2 |     1 |        15 |
+#[derive(Debug, Clone)]
+pub struct OdeSolverPortfolio {
+    mode: RuntimeMode,
+    loss_matrix: [[f64; 4]; 5],
+    evidence: VecDeque<OdeSolverEvidenceEntry>,
+    evidence_capacity: usize,
+    calibrator: ConformalCalibrator,
+    detector: StiffnessDetector,
+}
+
+impl OdeSolverPortfolio {
+    #[must_use]
+    pub fn new(mode: RuntimeMode, evidence_capacity: usize) -> Self {
+        let evidence_capacity = evidence_capacity.max(1);
+        Self {
+            mode,
+            loss_matrix: Self::default_loss_matrix(),
+            evidence: VecDeque::with_capacity(evidence_capacity),
+            evidence_capacity,
+            calibrator: ConformalCalibrator::new(0.05, 200),
+            detector: StiffnessDetector::default(),
+        }
+    }
+
+    #[must_use]
+    pub const fn default_loss_matrix() -> [[f64; 4]; 5] {
+        [
+            // NonStiff, MildlyStiff, Stiff,  Algebraic
+            [1.0, 25.0, 200.0, 300.0], // RK45
+            [5.0, 40.0, 250.0, 300.0], // RK23
+            [2.0, 35.0, 250.0, 150.0], // DOP853
+            [35.0, 3.0, 2.0, 1.0],     // Radau
+            [25.0, 2.0, 1.0, 15.0],    // BDF
+        ]
+    }
+
+    pub fn select_action(
+        &self,
+        stiffness_ratio_estimate: f64,
+        is_algebraic_dae: bool,
+    ) -> (OdeSolverAction, [f64; 4], [f64; 5], f64) {
+        let online_stiff = self.detector.is_stiff(stiffness_ratio_estimate);
+        let posterior =
+            Self::stiffness_posterior(stiffness_ratio_estimate, is_algebraic_dae, online_stiff);
+
+        // If conformal calibrator triggers drift, fallback to Radau
+        if self.calibrator.should_fallback() {
+            let losses = self.compute_expected_losses(posterior);
+            return (
+                OdeSolverAction::Radau,
+                posterior,
+                losses,
+                losses[OdeSolverAction::Radau.index()],
+            );
+        }
+
+        let losses = self.compute_expected_losses(posterior);
+        let mut best_idx = 0;
+        let mut best_loss = losses[0];
+
+        for (idx, &loss) in losses.iter().enumerate().skip(1) {
+            if loss < best_loss {
+                best_loss = loss;
+                best_idx = idx;
+            } else if (loss - best_loss).abs() <= 1e-12 && idx > best_idx {
+                best_idx = idx;
+            }
+        }
+
+        (OdeSolverAction::ALL[best_idx], posterior, losses, best_loss)
+    }
+
+    pub fn record_evidence(&mut self, entry: OdeSolverEvidenceEntry) {
+        if let Some(rejections) = entry.step_rejections {
+            self.calibrator.observe(rejections as f64);
+        }
+        if self.evidence.len() >= self.evidence_capacity {
+            let _ = self.evidence.pop_front();
+        }
+        self.evidence.push_back(entry);
+    }
+
+    pub fn observe_step(&mut self, accepted: bool) {
+        self.detector.observe_step(accepted);
+        if !accepted {
+            self.calibrator.observe(1.0);
+        } else {
+            self.calibrator.observe(0.0);
+        }
+    }
+
+    #[must_use]
+    pub fn evidence_len(&self) -> usize {
+        self.evidence.len()
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> RuntimeMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn calibrator(&self) -> &ConformalCalibrator {
+        &self.calibrator
+    }
+
+    #[must_use]
+    pub fn detector(&self) -> &StiffnessDetector {
+        &self.detector
+    }
+
+    fn compute_expected_losses(&self, posterior: [f64; 4]) -> [f64; 5] {
+        let mut losses = [0.0; 5];
+        for (action_idx, row) in self.loss_matrix.iter().enumerate() {
+            losses[action_idx] = row.iter().zip(posterior.iter()).map(|(l, p)| l * p).sum();
+        }
+        losses
+    }
+
+    fn stiffness_posterior(
+        stiffness_ratio_estimate: f64,
+        is_algebraic_dae: bool,
+        online_stiff: bool,
+    ) -> [f64; 4] {
+        if is_algebraic_dae {
+            return [0.0, 0.05, 0.1, 0.85]; // AlgebraicConstrained
+        }
+        if online_stiff || stiffness_ratio_estimate >= 1e5 {
+            return [0.0, 0.1, 0.85, 0.05]; // Stiff
+        }
+        if stiffness_ratio_estimate >= 1e2 {
+            return [0.1, 0.7, 0.15, 0.05]; // MildlyStiff
+        }
+        if stiffness_ratio_estimate <= 0.0 || !stiffness_ratio_estimate.is_finite() {
+            return [0.0, 0.1, 0.8, 0.1];
+        }
+        [0.85, 0.1, 0.03, 0.02] // NonStiffSmooth
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Test Helpers — Shared assertion and logging utilities (§bd-3jh.5)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1011,5 +1764,113 @@ mod tests {
         assert!(parsed.get("fixture_id").is_none());
         assert!(parsed.get("mode").is_none());
         assert!(parsed.get("result").is_none());
+    }
+
+    #[test]
+    fn test_sparse_solver_portfolio_spd_selects_cg() {
+        let p = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _post, _losses, _best) = p.select_action(
+            100.0,
+            Some(SparseStructuralEvidence {
+                is_symmetric: true,
+                is_positive_definite_hint: Some(true),
+            }),
+        );
+        assert_eq!(action, SparseSolverAction::ConjugateGradient);
+    }
+
+    #[test]
+    fn test_sparse_solver_portfolio_general_well_selects_bicgstab() {
+        let p = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _post, _losses, _best) = p.select_action(
+            100.0,
+            Some(SparseStructuralEvidence {
+                is_symmetric: false,
+                is_positive_definite_hint: None,
+            }),
+        );
+        assert_eq!(action, SparseSolverAction::BiCGSTAB);
+    }
+
+    #[test]
+    fn test_sparse_solver_portfolio_indefinite_selects_minres() {
+        let p = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _post, _losses, _best) = p.select_action(
+            100.0,
+            Some(SparseStructuralEvidence {
+                is_symmetric: true,
+                is_positive_definite_hint: Some(false),
+            }),
+        );
+        assert_eq!(action, SparseSolverAction::MinRes);
+    }
+
+    #[test]
+    fn test_sparse_solver_portfolio_ill_conditioned_selects_superlu() {
+        let p = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _post, _losses, _best) = p.select_action(1e9, None);
+        assert_eq!(action, SparseSolverAction::SuperLU);
+    }
+
+    #[test]
+    fn test_opt_solver_portfolio_smooth_convex_selects_bfgs() {
+        let p = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(100.0, false, false);
+        assert_eq!(action, OptSolverAction::BFGS);
+    }
+
+    #[test]
+    fn test_opt_solver_portfolio_valley_selects_trust_region_newton_cg() {
+        let p = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(1e7, false, false);
+        assert_eq!(action, OptSolverAction::TrustRegionNewtonCG);
+    }
+
+    #[test]
+    fn test_opt_solver_portfolio_multimodal_selects_direct() {
+        let p = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(100.0, false, true);
+        assert_eq!(action, OptSolverAction::DIRECT);
+    }
+
+    #[test]
+    fn test_opt_solver_portfolio_noisy_selects_nelder_mead() {
+        let p = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(100.0, true, false);
+        assert_eq!(action, OptSolverAction::NelderMead);
+    }
+
+    #[test]
+    fn test_ode_solver_portfolio_nonstiff_selects_rk45() {
+        let p = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(1.0, false);
+        assert_eq!(action, OdeSolverAction::RK45);
+    }
+
+    #[test]
+    fn test_ode_solver_portfolio_stiff_selects_bdf() {
+        let p = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(1e6, false);
+        assert_eq!(action, OdeSolverAction::BDF);
+    }
+
+    #[test]
+    fn test_ode_solver_portfolio_algebraic_selects_radau() {
+        let p = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(10.0, true);
+        assert_eq!(action, OdeSolverAction::Radau);
+    }
+
+    #[test]
+    fn test_stiffness_detector_online_trigger() {
+        let mut detector = StiffnessDetector::new(1e3, 3);
+        assert!(!detector.is_stiff(1.0));
+        detector.observe_step(false);
+        detector.observe_step(false);
+        assert!(!detector.is_stiff(1.0));
+        detector.observe_step(false);
+        assert!(detector.is_stiff(1.0)); // 3 consecutive rejections
+        detector.observe_step(true);
+        assert!(!detector.is_stiff(1.0)); // reset by acceptance
     }
 }
