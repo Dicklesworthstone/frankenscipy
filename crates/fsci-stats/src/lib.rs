@@ -19231,6 +19231,48 @@ pub type Reciprocal = Loguniform;
 /// Matches `scipy.stats.wald`.
 pub type Wald = InverseGaussian;
 
+// ── SciPy-compatible distribution type aliases ────────────────────────────
+// SciPy exposes distribution instances under lowercase abbreviations
+// (stats.beta, stats.binom, stats.chi2, etc.). FrankenSciPy provides these
+// type aliases so code matching SciPy naming conventions compiles directly.
+
+pub type Beta = BetaDist;
+pub type Betabinom = BetaBinomial;
+pub type Betanbinom = BetaNegativeBinomial;
+pub type Binom = Binomial;
+pub type Burr = Burr3;
+pub type Chi2 = ChiSquared;
+pub type Dgamma = DoubleGamma;
+pub type Dlaplace = DiscreteLaplace;
+pub type Dweibull = DoubleWeibull;
+pub type Expon = Exponential;
+pub type F = FDistribution;
+pub type Foldcauchy = FoldedCauchy;
+pub type Foldnorm = FoldedNormal;
+pub type Gamma = GammaDist;
+pub type Genexpon = GeneralizedExponential;
+pub type Geom = Geometric;
+pub type GumbelL = GumbelLeft;
+pub type GumbelR = Gumbel;
+pub type Halfnorm = HalfNormal;
+pub type Hypergeom = Hypergeometric;
+pub type Invgamma = InverseGamma;
+pub type Invgauss = InverseGaussian;
+pub type LevyL = LevyLeft;
+pub type Lognorm = Lognormal;
+pub type Logser = LogSeries;
+pub type Nbinom = NegBinomial;
+pub type Ncf = NoncentralF;
+pub type NchypergeomFisher = NoncentralHypergeomFisher;
+pub type Nct = NoncentralT;
+pub type Ncx2 = NoncentralChiSquared;
+pub type Nhypergeom = NegHypergeometric;
+pub type Norm = Normal;
+pub type T = StudentT;
+pub type Triang = Triangular;
+pub type Truncnorm = TruncNormal;
+pub type WeibullMin = Weibull;
+
 /// Erlang distribution: Gamma with integer shape.
 ///
 /// Matches `scipy.stats.erlang`.
