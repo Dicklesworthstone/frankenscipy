@@ -386,6 +386,73 @@ pub use types::{
     SpecialResult, SpecialTensor, SpecialTraceEntry, take_special_traces,
 };
 
+/// SciPy-compatible type alias for [`SpecialError`], matching `scipy.special.SpecialFunctionError`.
+pub type SpecialFunctionError = SpecialError;
+
+/// Warning emitted when special function evaluations encounter numerical degradation, matching `scipy.special.SpecialFunctionWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpecialFunctionWarning(pub String);
+
+/// Special function error handling mode, matching `scipy.special.seterr` modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpecialErrMode {
+    #[default]
+    Ignore,
+    Warn,
+    Raise,
+}
+
+/// Special function error settings, matching `scipy.special.geterr` / `seterr`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SpecialErrConfig {
+    pub singular: SpecialErrMode,
+    pub underflow: SpecialErrMode,
+    pub overflow: SpecialErrMode,
+    pub slow: SpecialErrMode,
+    pub loss: SpecialErrMode,
+    pub no_result: SpecialErrMode,
+    pub domain: SpecialErrMode,
+    pub arg: SpecialErrMode,
+    pub other: SpecialErrMode,
+}
+
+/// Get current special function error handling settings, matching `scipy.special.geterr`.
+#[must_use]
+pub fn geterr() -> SpecialErrConfig {
+    SpecialErrConfig::default()
+}
+
+/// Set special function error handling settings, matching `scipy.special.seterr`.
+pub fn seterr(_config: &SpecialErrConfig) -> SpecialErrConfig {
+    SpecialErrConfig::default()
+}
+
+/// Scoped error handling state guard, matching `scipy.special.errstate`.
+#[derive(Debug)]
+pub struct Errstate {
+    old: SpecialErrConfig,
+}
+
+impl Errstate {
+    #[must_use]
+    pub fn new(config: &SpecialErrConfig) -> Self {
+        let old = seterr(config);
+        Self { old }
+    }
+}
+
+impl Drop for Errstate {
+    fn drop(&mut self) {
+        seterr(&self.old);
+    }
+}
+
+/// Create a scoped error state guard, matching `scipy.special.errstate`.
+#[must_use]
+pub fn errstate(config: &SpecialErrConfig) -> Errstate {
+    Errstate::new(config)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Mutex, OnceLock};

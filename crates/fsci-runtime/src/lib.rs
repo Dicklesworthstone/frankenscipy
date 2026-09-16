@@ -637,7 +637,7 @@ impl SparseSolverPortfolio {
             return [0.0, 0.0, 0.0, 1.0];
         }
 
-        let is_sym = structure.map_or(false, |s| s.is_symmetric);
+        let is_sym = structure.is_some_and(|s| s.is_symmetric);
         let pd_hint = structure.and_then(|s| s.is_positive_definite_hint);
 
         if cond_estimate >= 1e8 {

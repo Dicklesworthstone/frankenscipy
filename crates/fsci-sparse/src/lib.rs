@@ -45,6 +45,14 @@ pub use io::{
     save_npz_to_writer,
 };
 
+/// Base warning class for sparse matrix operations, matching `scipy.sparse.SparseWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseWarning(pub String);
+
+/// Warning emitted for potentially inefficient sparse operations, matching `scipy.sparse.SparseEfficiencyWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseEfficiencyWarning(pub String);
+
 // SciPy-compatible lowercase type aliases (e.g. `csr_matrix` mirrors
 // `scipy.sparse.csr_matrix`). The names are intentionally non-CamelCase for API
 // parity; scope `non_camel_case_types` to this module — applied to the whole

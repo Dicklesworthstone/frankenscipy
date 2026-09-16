@@ -1057,6 +1057,10 @@ pub fn lb_to_kg(lb: f64) -> f64 {
     lb * POUND
 }
 
+/// Warning emitted for obsolete or precision issues with constants, matching `scipy.constants.ConstantWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstantWarning(pub String);
+
 #[cfg(test)]
 mod tests {
     use super::*;

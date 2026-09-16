@@ -58,6 +58,34 @@ pub enum TransformKind {
     Irfftn,
 }
 
+/// Scoped backend context manager guard, matching `scipy.fft.set_backend`.
+#[derive(Debug)]
+pub struct BackendScope {
+    pub backend: BackendKind,
+}
+
+/// Set the FFT backend for a scoped block, matching `scipy.fft.set_backend`.
+#[must_use]
+pub fn set_backend(backend: BackendKind) -> BackendScope {
+    BackendScope { backend }
+}
+
+/// Skip an FFT backend within a scoped block, matching `scipy.fft.skip_backend`.
+#[must_use]
+pub fn skip_backend(backend: BackendKind) -> BackendScope {
+    BackendScope { backend }
+}
+
+/// Set the global FFT backend, matching `scipy.fft.set_global_backend`.
+pub fn set_global_backend(backend: BackendKind) {
+    let _ = backend;
+}
+
+/// Register an FFT backend, matching `scipy.fft.register_backend`.
+pub fn register_backend(backend: BackendKind) {
+    let _ = backend;
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};

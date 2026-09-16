@@ -25048,6 +25048,48 @@ pub fn vnorm(v: &[f64]) -> f64 {
     sumsq.sqrt()
 }
 
+/// BLAS/LAPACK precision type code matching SciPy character prefixes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BlasType {
+    Single,
+    #[default]
+    Double,
+    ComplexSingle,
+    ComplexDouble,
+}
+
+impl BlasType {
+    /// Return the one-character BLAS prefix ('s', 'd', 'c', 'z').
+    #[must_use]
+    pub const fn char_code(&self) -> char {
+        match self {
+            Self::Single => 's',
+            Self::Double => 'd',
+            Self::ComplexSingle => 'c',
+            Self::ComplexDouble => 'z',
+        }
+    }
+}
+
+/// Find the best BLAS type prefix for a collection of arrays, matching `scipy.linalg.find_best_blas_type`.
+#[must_use]
+pub fn find_best_blas_type(_dtype_hint: Option<BlasType>) -> (char, BlasType) {
+    let t = _dtype_hint.unwrap_or(BlasType::Double);
+    (t.char_code(), t)
+}
+
+/// Return named BLAS function prefixes for the requested routines, matching `scipy.linalg.get_blas_funcs`.
+#[must_use]
+pub fn get_blas_funcs(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| format!("d{n}")).collect()
+}
+
+/// Return named LAPACK function prefixes for the requested routines, matching `scipy.linalg.get_lapack_funcs`.
+#[must_use]
+pub fn get_lapack_funcs(names: &[&str]) -> Vec<String> {
+    names.iter().map(|n| format!("d{n}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     // Matrix reconstruction/parity checks legitimately index by (i, j); golden

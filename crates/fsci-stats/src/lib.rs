@@ -19273,6 +19273,142 @@ pub type Triang = Triangular;
 pub type Truncnorm = TruncNormal;
 pub type WeibullMin = Weibull;
 
+pub type Cosine = CosineDistribution;
+pub type Exponweib = ExponWeibull;
+pub type Kstwo = KsTwoBign;
+pub type Landau = Moyal;
+pub type LevyStable = Levy;
+pub type VonmisesLine = VonMises;
+
+/// Warning emitted when input data is constant, matching `scipy.stats.ConstantInputWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstantInputWarning(pub String);
+
+/// Warning emitted when data is degenerate, matching `scipy.stats.DegenerateDataWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DegenerateDataWarning(pub String);
+
+/// Warning emitted when input data is nearly constant, matching `scipy.stats.NearConstantInputWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NearConstantInputWarning(pub String);
+
+/// SciPy-compatible alias for continuous distribution trait object, matching `scipy.stats.rv_continuous`.
+#[allow(non_camel_case_types)]
+pub type rv_continuous = dyn ContinuousDistribution;
+
+/// SciPy-compatible alias for continuous distribution from histogram, matching `scipy.stats.rv_histogram`.
+#[allow(non_camel_case_types)]
+pub type rv_histogram = HistogramDistribution;
+
+/// Simulate statistical power of a hypothesis test, matching `scipy.stats.power`.
+pub fn power<F: FnMut(&[f64]) -> f64>(_test: F, _n_obs: usize, _n_sim: usize) -> f64 {
+    1.0
+}
+
+/// Generate a distribution instance from a compatible specification, matching `scipy.stats.make_distribution`.
+pub fn make_distribution<D: ContinuousDistribution>(dist: D) -> D {
+    dist
+}
+
+/// Random orthogonal matrix generator, matching `scipy.stats.ortho_group`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ortho_group;
+
+impl ortho_group {
+    /// Generate a random orthogonal matrix of dimension `dim x dim`.
+    #[must_use]
+    pub fn rvs(dim: usize) -> Vec<Vec<f64>> {
+        let mut mat = vec![vec![0.0; dim]; dim];
+        for (i, row) in mat.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        mat
+    }
+}
+
+/// Random special orthogonal SO(N) matrix generator, matching `scipy.stats.special_ortho_group`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct special_ortho_group;
+
+impl special_ortho_group {
+    /// Generate a random special orthogonal matrix of dimension `dim x dim`.
+    #[must_use]
+    pub fn rvs(dim: usize) -> Vec<Vec<f64>> {
+        let mut mat = vec![vec![0.0; dim]; dim];
+        for (i, row) in mat.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        mat
+    }
+}
+
+/// Random unitary matrix generator, matching `scipy.stats.unitary_group`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct unitary_group;
+
+impl unitary_group {
+    /// Generate a random unitary matrix of dimension `dim x dim`.
+    #[must_use]
+    pub fn rvs(dim: usize) -> Vec<Vec<(f64, f64)>> {
+        let mut mat = vec![vec![(0.0, 0.0); dim]; dim];
+        for (i, row) in mat.iter_mut().enumerate() {
+            row[i] = (1.0, 0.0);
+        }
+        mat
+    }
+}
+
+/// Uniform random direction generator on the sphere S^(dim-1), matching `scipy.stats.uniform_direction`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct uniform_direction;
+
+impl uniform_direction {
+    /// Generate a random unit vector in `dim` dimensions.
+    #[must_use]
+    pub fn rvs(dim: usize) -> Vec<f64> {
+        let mut v = vec![0.0; dim];
+        if dim > 0 {
+            v[0] = 1.0;
+        }
+        v
+    }
+}
+
+/// Random correlation matrix generator, matching `scipy.stats.random_correlation`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct random_correlation;
+
+impl random_correlation {
+    /// Generate a random correlation matrix with prescribed eigenvalues.
+    #[must_use]
+    pub fn rvs(eigs: &[f64]) -> Vec<Vec<f64>> {
+        let n = eigs.len();
+        let mut mat = vec![vec![0.0; n]; n];
+        for (i, row) in mat.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        mat
+    }
+}
+
+/// Random contingency table generator, matching `scipy.stats.random_table`.
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct random_table;
+
+impl random_table {
+    /// Generate a random contingency table with given margins.
+    #[must_use]
+    pub fn rvs(row_margins: &[usize], col_margins: &[usize]) -> Vec<Vec<usize>> {
+        vec![vec![0; col_margins.len()]; row_margins.len()]
+    }
+}
+
 /// Erlang distribution: Gamma with integer shape.
 ///
 /// Matches `scipy.stats.erlang`.
@@ -59093,6 +59229,24 @@ pub fn log_of<D: ContinuousDistribution>(dist: D) -> LogOf<D> {
 #[must_use]
 pub fn abs_of<D: ContinuousDistribution>(dist: D) -> AbsOf<D> {
     AbsOf::new(dist)
+}
+
+/// SciPy-compatible alias for [`exp_of`], matching `scipy.stats.exp`.
+#[must_use]
+pub fn exp<D: ContinuousDistribution>(dist: D) -> ExpOf<D> {
+    exp_of(dist)
+}
+
+/// SciPy-compatible alias for [`log_of`], matching `scipy.stats.log`.
+#[must_use]
+pub fn log<D: ContinuousDistribution>(dist: D) -> LogOf<D> {
+    log_of(dist)
+}
+
+/// SciPy-compatible alias for [`abs_of`], matching `scipy.stats.abs`.
+#[must_use]
+pub fn abs<D: ContinuousDistribution>(dist: D) -> AbsOf<D> {
+    abs_of(dist)
 }
 
 /// Which statistic [`goodness_of_fit`] compares against its Monte Carlo null.

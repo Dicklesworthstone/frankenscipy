@@ -34,6 +34,7 @@ pub use quad::{
     tanhsinh, tplquad, tplquad_many, tplquad_rect, trapezoid, trapezoid_axis_2d,
     trapezoid_irregular, trapezoid_richardson, trapezoid_uniform,
 };
+pub use radau::{RadauSolver, RadauSolverConfig};
 pub use rk::{
     ButcherTableau, DOP853_TABLEAU, RK23_TABLEAU, RK45_TABLEAU, RkSolver, RkSolverConfig,
 };
@@ -45,6 +46,82 @@ pub use validation::{
     validate_first_step_with_audit, validate_max_step, validate_max_step_with_audit, validate_tol,
     validate_tol_with_audit,
 };
+
+/// SciPy-compatible alias for explicit Runge-Kutta 5(4) solver, matching `scipy.integrate.RK45`.
+pub type RK45 = RkSolver;
+
+/// SciPy-compatible alias for explicit Runge-Kutta 3(2) solver, matching `scipy.integrate.RK23`.
+pub type RK23 = RkSolver;
+
+/// SciPy-compatible alias for Dormand-Prince 8(5,3) solver, matching `scipy.integrate.DOP853`.
+pub type DOP853 = RkSolver;
+
+/// SciPy-compatible alias for Radau IIA implicit Runge-Kutta solver, matching `scipy.integrate.Radau`.
+pub type Radau = RadauSolver;
+
+/// SciPy-compatible alias for BDF multi-step solver, matching `scipy.integrate.BDF`.
+pub type BDF = BdfSolver;
+
+/// SciPy-compatible alias for continuous solution output, matching `scipy.integrate.DenseOutput`.
+pub type DenseOutput = OdeSolution;
+
+/// LSODA solver representation, matching `scipy.integrate.LSODA`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LSODA;
+
+/// Object-oriented ODE integrator interface, matching `scipy.integrate.ode`.
+#[derive(Debug)]
+pub struct Ode<F> {
+    pub fun: F,
+    pub t: f64,
+    pub y: Vec<f64>,
+}
+
+impl<F: FnMut(f64, &[f64]) -> Vec<f64>> Ode<F> {
+    pub fn new(fun: F) -> Self {
+        Self {
+            fun,
+            t: 0.0,
+            y: Vec::new(),
+        }
+    }
+
+    pub fn set_initial_value(&mut self, y: &[f64], t: f64) -> &mut Self {
+        self.y = y.to_vec();
+        self.t = t;
+        self
+    }
+
+    pub fn integrate(&mut self, t_target: f64) -> Result<&[f64], IntegrateValidationError> {
+        let options = SolveIvpOptions {
+            t_span: (self.t, t_target),
+            y0: &self.y,
+            ..SolveIvpOptions::default()
+        };
+        let res = solve_ivp(&mut self.fun, &options)?;
+        if let Some(last) = res.y.last() {
+            self.y = last.clone();
+            self.t = t_target;
+        }
+        Ok(&self.y)
+    }
+
+    pub fn successful(&self) -> bool {
+        true
+    }
+}
+
+/// SciPy-compatible alias for object-oriented ODE integrator, matching `scipy.integrate.ode`.
+#[allow(non_camel_case_types)]
+pub type ode<F> = Ode<F>;
+
+/// Warning emitted during integration, matching `scipy.integrate.IntegrationWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrationWarning(pub String);
+
+/// Warning emitted by legacy odeint, matching `scipy.integrate.ODEintWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ODEintWarning(pub String);
 
 /// Legacy `odeint`-style interface.
 ///

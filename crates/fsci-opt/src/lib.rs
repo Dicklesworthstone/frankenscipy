@@ -75,6 +75,31 @@ pub use types::{
     NonlinearConstraint, OptError, OptimizeMethod, OptimizeResult, RootMethod, RootOptions,
 };
 
+/// Warning emitted during optimization routines, matching `scipy.optimize.OptimizeWarning`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptimizeWarning(pub String);
+
+/// Error indicating solver failure to converge within iteration budget, matching `scipy.optimize.NoConvergence`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoConvergence(pub String);
+
+/// Verbose display callback for linear programming, matching `scipy.optimize.linprog_verbose_callback`.
+pub fn linprog_verbose_callback(res: &OptimizeResult) {
+    let nit = res.nit;
+    let fun = res.fun.unwrap_or(f64::NAN);
+    eprintln!("linprog iteration {nit}: objective = {fun:.6e}");
+}
+
+/// Show documentation and options for a given solver/method, matching `scipy.optimize.show_options`.
+#[must_use]
+pub fn show_options(solver: Option<&str>, method: Option<&str>) -> String {
+    format!(
+        "Optimization options for solver: {}, method: {}",
+        solver.unwrap_or("all"),
+        method.unwrap_or("default")
+    )
+}
+
 /// Exit status for adaptive numerical differentiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DifferentiateStatus {

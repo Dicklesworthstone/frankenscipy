@@ -96,6 +96,10 @@ pub fn record_bounded_recovery(
     lock_or_recover(ledger).record(event);
 }
 
+/// Warning emitted when filter coefficients are numerically unstable or degenerate, matching `scipy.signal.BadCoefficients`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadCoefficients(pub String);
+
 /// Error type for signal processing operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignalError {
