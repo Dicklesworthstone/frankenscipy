@@ -58,11 +58,11 @@ pub use minimize::{
 // `anderson_nonlin`. Rename it freely; the point of this edit is only that a
 // crate which does not build is strictly worse than either naming.
 pub use nonlin::{
-    AndersonJacobian, BroydenJacobian, BroydenVariant, DiagBroydenJacobian, ExcitingMixingJacobian,
-    InnerMethod, InverseJacobian, Jacobian, KrylovJacobian, LineSearch, LinearMixingJacobian,
-    LowRankMatrix, NonlinJacobian, NonlinMethod, NonlinOptions, NonlinResult, ReductionMethod,
-    anderson as anderson_nonlin, broyden1_lowrank, broyden2_lowrank, diag_broyden, exciting_mixing,
-    linear_mixing, nonlin_solve, root_nonlin,
+    AndersonJacobian, BroydenFirst, BroydenJacobian, BroydenSecond, BroydenVariant,
+    DiagBroydenJacobian, ExcitingMixingJacobian, InnerMethod, InverseJacobian, Jacobian,
+    KrylovJacobian, LineSearch, LinearMixingJacobian, LowRankMatrix, NonlinJacobian, NonlinMethod,
+    NonlinOptions, NonlinResult, ReductionMethod, anderson as anderson_nonlin, broyden1_lowrank,
+    broyden2_lowrank, diag_broyden, exciting_mixing, linear_mixing, nonlin_solve, root_nonlin,
 };
 pub use root::{
     MultivariateRootMethod, MultivariateRootOptions, MultivariateRootResult, RootResult,
@@ -9231,6 +9231,9 @@ pub struct BfgsHessian {
     first_iteration: bool,
 }
 
+/// SciPy-compatible type alias for [`BfgsHessian`], matching `scipy.optimize.BFGS`.
+pub type BFGS = BfgsHessian;
+
 /// Symmetric-rank-1 quasi-Newton approximation — `scipy.optimize.SR1`.
 ///
 /// SR1 does NOT preserve positive-definiteness, by design: it can represent indefinite
@@ -9247,6 +9250,9 @@ pub struct Sr1Hessian {
     min_denominator: f64,
     first_iteration: bool,
 }
+
+/// SciPy-compatible type alias for [`Sr1Hessian`], matching `scipy.optimize.SR1`.
+pub type SR1 = Sr1Hessian;
 
 /// `y_norm2 / |s·y|` for a Hessian, `|s·y| / y_norm2` for its inverse.
 ///
