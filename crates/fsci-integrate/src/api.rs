@@ -2031,6 +2031,43 @@ mod tests {
     }
 
     #[test]
+    fn solve_ivp_lsoda_van_der_pol_matches_scipy_reference() {
+        let mu = 10.0;
+        let mut fun = |_t: f64, y: &[f64]| vec![y[1], mu * (1.0 - y[0] * y[0]) * y[1] - y[0]];
+        let y0 = [2.0, 0.0];
+        let t_eval = [0.0, 0.5, 1.0, 2.0];
+        let opts = SolveIvpOptions {
+            t_span: (0.0, 2.0),
+            y0: &y0,
+            method: SolverKind::Lsoda,
+            rtol: 1e-8,
+            atol: ToleranceValue::Scalar(1e-10),
+            t_eval: Some(&t_eval),
+            mode: RuntimeMode::Strict,
+            ..Default::default()
+        };
+        let r = solve_ivp(&mut fun, &opts).expect("LSODA solve should succeed");
+        assert!(r.success, "LSODA should succeed on Van der Pol");
+        assert_eq!(r.t, vec![0.0, 0.5, 1.0, 2.0]);
+        let expected_y0 = [2.0, 1.96853255, 1.93385289, 1.86106865];
+        let expected_y1 = [0.0, -0.06832900, -0.07042352, -0.07532164];
+        for (i, y_step) in r.y.iter().enumerate() {
+            assert!(
+                (y_step[0] - expected_y0[i]).abs() < 1e-4,
+                "step {i} y[0]: got {}, expected {}",
+                y_step[0],
+                expected_y0[i]
+            );
+            assert!(
+                (y_step[1] - expected_y1[i]).abs() < 1e-4,
+                "step {i} y[1]: got {}, expected {}",
+                y_step[1],
+                expected_y1[i]
+            );
+        }
+    }
+
+    #[test]
     fn solve_ivp_exponential_decay_matches_scipy_reference_values() {
         // scipy.integrate.solve_ivp(exp_decay, [0, 4], [1.0], t_eval=[0, 1, 2, 3, 4], method='RK45')
         // where exp_decay = lambda t, y: -0.5 * y
