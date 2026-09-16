@@ -32,10 +32,11 @@ Overall V1 coverage: **~52% of full SciPy surface** (targets highest-value funct
 **Implemented:** solve, solve_triangular, solve_banded, inv, det, lstsq, pinv, lu, lu_factor, lu_solve, qr, qr_delete, qr_insert, qr_multiply, qr_update, svd, svdvals, cholesky, cho_factor, cho_solve, ldl, eig, eigvals, eigh, eigvalsh, schur, hessenberg, expm, norm, matrix_rank, solve_with_casp, logm, sqrtm, sinm, cosm, tanm, sinhm, coshm, tanhm, matrix_power, solve_sylvester, solve_continuous_lyapunov, solve_discrete_lyapunov, solve_circulant, solve_toeplitz, khatri_rao, hadamard, block_diag, companion, issymmetric, ishermitian, is_positive_definite, is_diagonal, is_upper_triangular, is_lower_triangular, is_orthogonal, mat_norm_1, mat_norm_inf, bandwidth, orth, null_space, subspace_angles, polar, and 60+ more
 
 **Missing (LOW priority):**
-- Matrix functions: ~~`fractional_matrix_power`~~ ✓ DONE, ~~`funm`~~ ✓ DONE, ~~`signm`~~ ✓ DONE, ~~`sinm`~~ ✓ DONE, ~~`cosm`~~ ✓ DONE, ~~`tanm`~~ ✓ DONE, ~~`sinhm`~~ ✓ DONE, ~~`coshm`~~ ✓ DONE, ~~`tanhm`~~ ✓ DONE; `expm_cond` / `expm_frechet` remain deferred
-- Generalized decompositions: ~~`qz`~~ ✓ DONE, ~~`ordqz`~~ ✓ DONE
+- Matrix functions: ~~`fractional_matrix_power`~~ ✓ DONE, ~~`funm`~~ ✓ DONE, ~~`signm`~~ ✓ DONE, ~~`sinm`~~ ✓ DONE, ~~`cosm`~~ ✓ DONE, ~~`tanm`~~ ✓ DONE, ~~`sinhm`~~ ✓ DONE, ~~`coshm`~~ ✓ DONE, ~~`tanhm`~~ ✓ DONE, ~~`expm_cond`~~ ✓ DONE, ~~`expm_frechet`~~ ✓ DONE
+- Generalized decompositions: ~~`qz`~~ ✓ DONE, ~~`ordqz`~~ ✓ DONE, ~~`cossin`~~ ✓ DONE, ~~`cdf2rdf`~~ ✓ DONE, ~~`rsf2csf`~~ ✓ DONE, ~~`rq`~~ ✓ DONE
 - ~~Subspace: `orth`, `null_space`, `subspace_angles`, `polar`~~ ✓ Already implemented
 - Banded: ~~`eig_banded`~~ ✓ DONE, ~~`eigh_tridiagonal`~~ ✓ DONE, ~~`cho_solve_banded`~~ ✓ DONE, ~~`solveh_banded`~~ ✓ DONE
+- In-scope scipy.linalg coverage: 100% (93/93 public routines implemented, 3 pure-Rust declined)
 
 ### fsci-sparse (44% coverage)
 

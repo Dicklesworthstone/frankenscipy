@@ -11,10 +11,14 @@ re-audit).
 
 | Status | Count | % of scipy surface |
 |--------|------:|------------------:|
-| ✅ full     | 63 | 65.6% |
+| ✅ full     | 92 | 95.8% |
 | ↪️ aliased  |  1 |  1.0% |
-| ❌ missing  | 32 | 33.3% |
+| 🚫 declined |  3 |  3.1% |
+| ❌ missing  |  0 |  0.0% |
 | **scipy.linalg public functions** | **96** | **100%** |
+
+Coverage of in-scope surface: **93 of 93 (100.0%)**.
+The 3 declined symbols (`find_best_blas_type`, `get_blas_funcs`, `get_lapack_funcs`) are BLAS/LAPACK introspection hooks that do not apply to FrankenSciPy's pure-Rust engine (see `DISCREPANCIES.md`).
 
 Plus 14 modules + 2 exception classes in `scipy.linalg.__all__` that
 do not need fsci counterparts (`special_matrices`, `LinAlgError`,
@@ -26,7 +30,7 @@ functions that are NOT in scipy.linalg — see "fsci-only extras" below.
 
 ## By family
 
-Legend: ✅ full match · ↪️ aliased · ❌ missing · ⚠️ partial
+Legend: ✅ full match · ↪️ aliased · 🚫 declined · ❌ missing · ⚠️ partial
 
 ### solve (9 of 9 — 100%)
 
@@ -52,25 +56,25 @@ Legend: ✅ full match · ↪️ aliased · ❌ missing · ⚠️ partial
 | `null_space` | `null_space` | ✅ |
 | `orth` | `orth` | ✅ |
 
-### inv / pinv / det (3 of 5 — 60%)
+### inv / pinv / det (5 of 5 — 100%)
 
 | scipy | fsci | status |
 |-------|------|--------|
 | `det` | `det` (+ `det_with_audit`) | ✅ |
 | `inv` | `inv` (+ `inv_with_audit`, `inv_with_casp`) | ✅ |
-| `matrix_balance` | — | ❌ |
+| `matrix_balance` | `matrix_balance` | ✅ |
 | `pinv` | `pinv` (+ `pinv_with_audit`, `pinv_with_casp`) | ✅ |
-| `pinvh` | — | ❌ |
+| `pinvh` | `pinvh` | ✅ |
 
-### decompositions (13 of 18 — 72%)
+### decompositions (18 of 18 — 100%)
 
 | scipy | fsci | status |
 |-------|------|--------|
-| `cdf2rdf` | — | ❌ |
+| `cdf2rdf` | `cdf2rdf` | ✅ |
 | `cho_factor` | `cho_factor` | ✅ |
 | `cholesky` | `cholesky` | ✅ |
-| `cholesky_banded` | — | ❌ |
-| `cossin` | — | ❌ |
+| `cholesky_banded` | `cholesky_banded` | ✅ |
+| `cossin` | `cossin` | ✅ |
 | `hessenberg` | `hessenberg` | ✅ |
 | `ldl` | `ldl` | ✅ |
 | `lu` | `lu` | ✅ |
@@ -79,8 +83,8 @@ Legend: ✅ full match · ↪️ aliased · ❌ missing · ⚠️ partial
 | `polar` | `polar` | ✅ |
 | `qr` | `qr` | ✅ |
 | `qz` | `qz` | ✅ |
-| `rq` | — | ❌ |
-| `rsf2csf` | — | ❌ |
+| `rq` | `rq` | ✅ |
+| `rsf2csf` | `rsf2csf` | ✅ |
 | `schur` | `schur` | ✅ |
 | `svd` | `svd` | ✅ |
 | `svdvals` | `svdvals` | ✅ |
@@ -94,7 +98,7 @@ Legend: ✅ full match · ↪️ aliased · ❌ missing · ⚠️ partial
 | `qr_multiply` | `qr_multiply` | ✅ |
 | `qr_update` | `qr_update` | ✅ |
 
-### eigen (6 of 8 — 75%)
+### eigen (8 of 8 — 100%)
 
 | scipy | fsci | status |
 |-------|------|--------|
@@ -103,19 +107,19 @@ Legend: ✅ full match · ↪️ aliased · ❌ missing · ⚠️ partial
 | `eigh` | `eigh` | ✅ |
 | `eigh_tridiagonal` | `eigh_tridiagonal` | ✅ |
 | `eigvals` | `eigvals` | ✅ |
-| `eigvals_banded` | — | ❌ |
+| `eigvals_banded` | `eigvals_banded` | ✅ |
 | `eigvalsh` | `eigvalsh` | ✅ |
-| `eigvalsh_tridiagonal` | — | ❌ |
+| `eigvalsh_tridiagonal` | `eigvalsh_tridiagonal` | ✅ |
 
-### matrix functions (12 of 14 — 86%)
+### matrix functions (14 of 14 — 100%)
 
 | scipy | fsci | status |
 |-------|------|--------|
 | `coshm` | `coshm` | ✅ |
 | `cosm` | `cosm` | ✅ |
 | `expm` | `expm` | ✅ |
-| `expm_cond` | — | ❌ |
-| `expm_frechet` | — | ❌ |
+| `expm_cond` | `expm_cond` | ✅ |
+| `expm_frechet` | `expm_frechet` | ✅ |
 | `fractional_matrix_power` | `fractional_matrix_power` | ✅ |
 | `funm` | `funm` | ✅ |
 | `logm` | `logm` | ✅ |
@@ -126,7 +130,7 @@ Legend: ✅ full match · ↪️ aliased · ❌ missing · ⚠️ partial
 | `tanhm` | `tanhm` | ✅ |
 | `tanm` | `tanm` | ✅ |
 
-### special matrices (15 of 16 — 94% incl. alias)
+### special matrices (16 of 16 — 100% incl. alias)
 
 | scipy | fsci | status |
 |-------|------|--------|
@@ -142,7 +146,7 @@ Legend: ✅ full match · ↪️ aliased · ❌ missing · ⚠️ partial
 | `helmert` | `helmert` | ✅ |
 | `hilbert` | `hilbert` | ✅ |
 | `invhilbert` | `invhilbert` | ✅ |
-| `invpascal` | — | ❌ |
+| `invpascal` | `invpascal` | ✅ |
 | `leslie` | `leslie` | ✅ |
 | `pascal` | `pascal` | ✅ |
 | `toeplitz` | `toeplitz` | ✅ |
@@ -150,7 +154,7 @@ Legend: ✅ full match · ↪️ aliased · ❌ missing · ⚠️ partial
 (`tri` exists in fsci-linalg as a numpy-style helper but is not in
 `scipy.linalg.__all__`; tracked under "fsci-only extras" below.)
 
-### special solvers (5 of 6 — 83%)
+### special solvers (6 of 6 — 100%)
 
 | scipy | fsci | status |
 |-------|------|--------|
@@ -158,24 +162,24 @@ Legend: ✅ full match · ↪️ aliased · ❌ missing · ⚠️ partial
 | `solve_continuous_lyapunov` | `solve_continuous_lyapunov` | ✅ |
 | `solve_discrete_are` | `solve_discrete_are` | ✅ (br-60cm) |
 | `solve_discrete_lyapunov` | `solve_discrete_lyapunov` | ✅ |
-| `solve_lyapunov` | — | ❌ (deprecated alias for `solve_continuous_lyapunov` in scipy) |
+| `solve_lyapunov` | `solve_lyapunov` | ✅ (alias for `solve_continuous_lyapunov`) |
 | `solve_sylvester` | `solve_sylvester` | ✅ |
 
-### utility (4 of 11 — 36%)
+### utility (11 of 11 — 100% incl. declined)
 
 | scipy | fsci | status |
 |-------|------|--------|
 | `bandwidth` | `bandwidth` | ✅ |
-| `clarkson_woodruff_transform` | — | ❌ |
-| `diagsvd` | — | ❌ |
-| `find_best_blas_type` | — | ❌ (declined — see DISCREPANCIES.md) |
-| `get_blas_funcs` | — | ❌ (declined — see DISCREPANCIES.md) |
-| `get_lapack_funcs` | — | ❌ (declined — see DISCREPANCIES.md) |
+| `clarkson_woodruff_transform` | `clarkson_woodruff_transform` | ✅ |
+| `diagsvd` | `diagsvd` | ✅ |
+| `find_best_blas_type` | — | 🚫 declined (pure-Rust — see DISCREPANCIES.md) |
+| `get_blas_funcs` | — | 🚫 declined (pure-Rust — see DISCREPANCIES.md) |
+| `get_lapack_funcs` | — | 🚫 declined (pure-Rust — see DISCREPANCIES.md) |
 | `ishermitian` | `ishermitian` | ✅ |
 | `issymmetric` | `issymmetric` | ✅ |
 | `khatri_rao` | `khatri_rao` | ✅ |
-| `matmul_toeplitz` | — | ❌ |
-| `orthogonal_procrustes` | — | ❌ (covered by fsci-spatial::procrustes — see l15l) |
+| `matmul_toeplitz` | `matmul_toeplitz` | ✅ |
+| `orthogonal_procrustes` | `orthogonal_procrustes` | ✅ |
 
 ## fsci-only extras (50)
 
@@ -203,30 +207,15 @@ variants, or rolled-in functionality from numpy.
 
 ## Top-priority gaps
 
-The gap-analysis bead set spawned by this audit (file as needed):
+All gap families previously identified in this audit are now fully implemented and tested:
 
-1. **qr_updates family (4/4)** — qr_delete / qr_insert / qr_multiply /
-   qr_update now ship as recompute-backed dense real helpers over the
-   existing `qr` implementation.
-2. **matrix_funcs trig (sinm/cosm/tanm + their hyperbolic siblings)** —
-   complete. These entry points now route through `funm` with the
-   corresponding scalar transform.
-3. **expm_cond / expm_frechet** — sensitivity / derivative analyses of
-   matrix exponential. Useful for control theory but lower priority
-   than the trig set.
-4. **solve_continuous_are / solve_discrete_are** — algebraic Riccati
-   equations. Required by control-theory consumers; matching scipy's
-   schur-based approach is non-trivial.
-5. **cdf2rdf / rsf2csf** — complex/real Schur form converters. Pair
-   with the existing schur impl.
-6. **cossin** — cosine-sine decomposition, niche but called out by
-   scipy as core.
-7. **rq** — RQ decomposition (mirror of QR). Trivial wrapper around qr
-   on row-reversed input.
-
-These would naturally form a "linalg-completeness" sub-track of P1
-beads. Filed-out from this bead are deliberately deferred — see
-DISCREPANCIES.md for declines.
+1. **qr_updates family (4/4)** — `qr_delete`, `qr_insert`, `qr_multiply`, `qr_update` implemented (100%).
+2. **matrix_funcs trig (sinm/cosm/tanm + hyperbolic siblings)** — complete (`funm`-backed with scalar transforms).
+3. **expm_cond / expm_frechet** — complete (13/13 Padé scaling & squaring on block-triangular representation, with `expm_cond` SVD condition number).
+4. **solve_continuous_are / solve_discrete_are** — complete (Schur-based continuous/discrete algebraic Riccati equation solvers).
+5. **cdf2rdf / rsf2csf** — complete (complex-to-real and real-to-complex Schur form converters).
+6. **cossin** — complete (CS decomposition with balanced angles in `fsci_linalg::cossin`).
+7. **rq** — complete (RQ decomposition via reversed-permutation QR).
 
 ## How to refresh this audit
 
