@@ -656,8 +656,10 @@ mod tests {
     #[test]
     fn test_direct_rosenbrock_2d() {
         let bounds = Bounds::new(vec![-2.0, -1.0], vec![2.0, 3.0]).unwrap();
-        let mut opts = DirectOptions::default();
-        opts.maxiter = 50;
+        let opts = DirectOptions {
+            maxiter: 50,
+            ..Default::default()
+        };
         let res = direct(
             |x| 100.0 * (x[1] - x[0] * x[0]).powi(2) + (1.0 - x[0]).powi(2),
             &bounds,
@@ -672,8 +674,10 @@ mod tests {
     #[test]
     fn test_direct_styblinski_tang() {
         let bounds = Bounds::new(vec![-4.0, -4.0], vec![4.0, 4.0]).unwrap();
-        let mut opts = DirectOptions::default();
-        opts.len_tol = 1e-3;
+        let opts = DirectOptions {
+            len_tol: 1e-3,
+            ..Default::default()
+        };
         let res = direct(
             |x| {
                 0.5 * (x[0].powi(4) - 16.0 * x[0].powi(2) + 5.0 * x[0] + x[1].powi(4)
