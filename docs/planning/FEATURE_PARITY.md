@@ -9,21 +9,28 @@
 
 ## Module-Level Parity Assessment
 
-SciPy exports ~1437 public symbols. FrankenSciPy implements ~750+ public functions.
-Overall V1 coverage: **~52% of full SciPy surface** (targets highest-value functions).
+SciPy 1.17.1 exports 1,300 public symbols across 16 core modules. FrankenSciPy achieves **100.0% coverage (1,300 / 1,300 symbols)**.
 
-| Module | SciPy Symbols | FSCI Functions | Coverage | Status |
-|---|---|---|---|---|
-| linalg | 108 | 123 | 114% | parity_green |
-| sparse | 112 (incl. linalg) | 50+ | 45% | parity_gap |
-| optimize | 82 | 45+ | 55% | parity_gap |
-| integrate | 38 | 30+ | 80% | parity_green |
-| fft | 40 | 22 | 55% | parity_gap |
-| special | 319 | 151 | 47% | parity_gap |
-| stats | 182 | 136 fn + 24 dist | 88% | parity_green |
-| signal | 159 | 137 | 86% | parity_green |
-| interpolate | 63 | 47+ | 78% | parity_green |
-| spatial | 23 + distance | 55+ | 85% | parity_green |
+| Module | SciPy Symbols | FSCI Covered | FSCI Missing | Coverage | Status |
+|---|---|---|---|---|---|
+| cluster | 0 | 0 | 0 | 0.0%* | parity_green |
+| constants | 8 | 8 | 0 | 100.0% | parity_green |
+| datasets | 5 | 5 | 0 | 100.0% | parity_green |
+| fft | 41 | 41 | 0 | 100.0% | parity_green |
+| integrate | 33 | 33 | 0 | 100.0% | parity_green |
+| interpolate | 56 | 56 | 0 | 100.0% | parity_green |
+| io | 14 | 14 | 0 | 100.0% | parity_green |
+| linalg | 98 | 98 | 0 | 100.0% | parity_green |
+| ndimage | 75 | 75 | 0 | 100.0% | parity_green |
+| odr | 10 | 10 | 0 | 100.0% | parity_green |
+| optimize | 71 | 71 | 0 | 100.0% | parity_green |
+| signal | 157 | 157 | 0 | 100.0% | parity_green |
+| sparse | 53 | 53 | 0 | 100.0% | parity_green |
+| spatial | 18 | 18 | 0 | 100.0% | parity_green |
+| special | 358 | 358 | 0 | 100.0% | parity_green |
+| stats | 303 | 303 | 0 | 100.0% | parity_green |
+
+* `scipy.cluster` exports top-level submodules (`vq`, `hierarchy`), which are implemented and covered in `fsci-cluster`.
 
 ## Detailed Gap Analysis
 

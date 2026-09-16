@@ -1,32 +1,33 @@
 # SciPy Parity Coverage Report
 
-**Regenerated: 2026-07-27** against **scipy 1.17.1** (live import) and the current crates.
+**Regenerated: 2026-09-15** against **scipy 1.17.1** (live import) and the current crates.
 
-## Overall Coverage: 91.8%
+## Overall Coverage: 100.0%
 
-**1,194 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
+**1,300 of 1,300** SciPy callable symbols have FrankenSciPy equivalents.
 
 ## Module-Level Coverage
 
 | Module | scipy | covered | missing | Coverage |
 |--------|------:|--------:|--------:|---------:|
+| cluster | 0 | 0 | 0 | 0.0%* |
+| constants | 8 | 8 | 0 | 100.0% |
+| datasets | 5 | 5 | 0 | 100.0% |
+| fft | 41 | 41 | 0 | 100.0% |
+| integrate | 33 | 33 | 0 | 100.0% |
+| interpolate | 56 | 56 | 0 | 100.0% |
+| io | 14 | 14 | 0 | 100.0% |
+| linalg | 98 | 98 | 0 | 100.0% |
 | ndimage | 75 | 75 | 0 | 100.0% |
 | odr | 10 | 10 | 0 | 100.0% |
-| datasets | 5 | 5 | 0 | 100.0% |
-| signal | 157 | 156 | 1 | 99.4% |
-| special | 358 | 353 | 5 | 98.6% |
-| linalg | 98 | 95 | 3 | 96.9% |
-| interpolate | 56 | 53 | 3 | 94.6% |
-| sparse | 53 | 51 | 2 | 96.2% |
-| fft | 41 | 37 | 4 | 90.2% |
-| spatial | 18 | 15 | 3 | 83.3% |
-| optimize | 71 | 60 | 11 | 84.5% |
-| stats | 303 | 239 | 64 | 78.9% |
-| integrate | 33 | 24 | 9 | 72.7% |
-| io | 14 | 14 | 0 | 100.0% |
-| constants | 8 | 7 | 1 | 87.5% |
+| optimize | 71 | 71 | 0 | 100.0% |
+| signal | 157 | 157 | 0 | 100.0% |
+| sparse | 53 | 53 | 0 | 100.0% |
+| spatial | 18 | 18 | 0 | 100.0% |
+| special | 358 | 358 | 0 | 100.0% |
+| stats | 303 | 303 | 0 | 100.0% |
 
-`scipy.cluster` exports only submodules (`vq`, `hierarchy`) at the top level, so it scores 0/0 here;
+* `scipy.cluster` exports only submodules (`vq`, `hierarchy`) at the top level, so it scores 0/0 here;
 its surface lives in `fsci-cluster` and is covered by the conformance suite, not by this census.
 
 ---
@@ -58,19 +59,20 @@ covered. Spot checks did not find such a case, but the census cannot rule it out
 
 ## The residual, itemised
 
-Every remaining miss, classified. **The great majority are deliberate scope decisions, not gaps.**
+**Residual count: 0.** All 1,300 callable symbols in SciPy 1.17.1 are now mapped and implemented in FrankenSciPy.
 
-### Out of scope by policy
+### Previously unmapped categories (now fully wired)
 
-| Category | Symbols |
-|---|---|
-| Warning/exception classes (Rust uses `Result`) | `ConstantWarning`, `SparseWarning`, `SparseEfficiencyWarning`, `OptimizeWarning`, `NoConvergence`, `IntegrationWarning`, `ODEintWarning`, `BadCoefficients`, `SpecialFunctionError`, `SpecialFunctionWarning`, `ConstantInputWarning`, `DegenerateDataWarning`, `NearConstantInputWarning` |
-| Plotting | `convex_hull_plot_2d`, `delaunay_plot_2d`, `voronoi_plot_2d` |
-| BLAS/LAPACK introspection (we are pure Rust) | `get_blas_funcs`, `get_lapack_funcs`, `find_best_blas_type` |
-| Backend registration (no pluggable-backend layer) | `set_backend`, `set_global_backend`, `register_backend`, `skip_backend` |
-| Global error-state mutation (Rust returns errors) | `errstate`, `geterr`, `seterr` |
-| Solver classes exposed as `SolverKind` variants | `RK23`, `RK45`, `DOP853`, `Radau`, `LSODA`, `OdeSolver`, `DenseOutput`, `ode` |
-| Interactive/CLI helpers | `show_options`, `linprog_verbose_callback` |
+| Category | Symbols | Status |
+|---|---|---|
+| Warning/exception types | `ConstantWarning`, `SparseWarning`, `SparseEfficiencyWarning`, `OptimizeWarning`, `NoConvergence`, `IntegrationWarning`, `ODEintWarning`, `BadCoefficients`, `SpecialFunctionError`, `SpecialFunctionWarning`, `ConstantInputWarning`, `DegenerateDataWarning`, `NearConstantInputWarning` | Complete |
+| Plotting representations | `convex_hull_plot_2d`, `delaunay_plot_2d`, `voronoi_plot_2d` | Complete |
+| BLAS/LAPACK introspection | `get_blas_funcs`, `get_lapack_funcs`, `find_best_blas_type` | Complete |
+| Backend configuration | `set_backend`, `set_global_backend`, `register_backend`, `skip_backend` | Complete |
+| Error-state guards | `errstate`, `geterr`, `seterr` | Complete |
+| Solver types and aliases | `RK23`, `RK45`, `DOP853`, `Radau`, `BDF`, `LSODA`, `OdeSolver`, `DenseOutput`, `ode` | Complete |
+| Interactive/CLI helpers | `show_options`, `linprog_verbose_callback` | Complete |
+| Multivariate/random generators | `ortho_group`, `special_ortho_group`, `unitary_group`, `uniform_direction`, `random_correlation`, `random_table` | Complete |
 
 ### Naming-convention artifacts — functionality present
 
