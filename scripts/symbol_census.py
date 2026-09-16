@@ -88,4 +88,5 @@ print(f"{'module':22s} {'scipy':>6s} {'covered':>8s} {'missing':>8s}  cov%")
 for mod, crate, n, c, err in sorted(rows, key=lambda r: (r[3]-r[2])):
     if err: print(f"{mod:22s} ERROR {err[:40]}"); continue
     print(f"{mod:22s} {n:6d} {c:8d} {n-c:8d}  {100*c/n if n else 0:5.1f}%")
-Path(sys.argv[1]).write_text(json.dumps(detail, indent=1))
+if len(sys.argv) > 1:
+    Path(sys.argv[1]).write_text(json.dumps(detail, indent=1))
