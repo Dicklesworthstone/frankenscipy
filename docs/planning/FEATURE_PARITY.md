@@ -57,8 +57,8 @@ SciPy 1.17.1 exports 1,300 public symbols across 16 core modules. FrankenSciPy a
 **Implemented:** minimize (BFGS, CG, Powell, NM, L-BFGS-B, Newton-CG, TNC, COBYLA, SLSQP, trust-ncg, trust-krylov, trust-constr, dogleg), direct (DIRECT and DIRECT-L), minimize_with_casp_portfolio, minimize_scalar, brentq, brenth, bisect, ridder, toms748, halley, newton_scalar, secant, root_scalar, root, fsolve, broyden1, broyden2, anderson, lm_root, curve_fit, least_squares, line_search, Bounds, LinearConstraint, NonlinearConstraint, differential_evolution, basinhopping, dual_annealing, shgo, pso, linprog, milp, linear_sum_assignment, approx_fprime, check_grad, cobyla, rosen, rosen_der, rosen_hess, rosen_hess_prod
 
 **Missing (LOW priority):**
-- `minimize` methods: `trust-exact`, `Newton-CG` hessian product
-- Root: ~~`broyden2`~~ ✓ DONE, ~~`anderson`~~ ✓ DONE, `hybr`, ~~`lm`~~ ✓ DONE
+- `minimize` methods: ~~`trust-exact`~~ ✓ DONE, ~~`Newton-CG` hessian product~~ ✓ DONE
+- Root: ~~`broyden2`~~ ✓ DONE, ~~`anderson`~~ ✓ DONE, ~~`hybr`~~ ✓ DONE, ~~`lm`~~ ✓ DONE
 - ~~Utilities: `rosen` family test functions~~ ✓ DONE
 
 ### fsci-integrate (80% coverage)
