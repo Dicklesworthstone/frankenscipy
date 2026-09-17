@@ -1,16 +1,16 @@
 {
   "packet_id": "FSCI-P2C-016",
   "family": "constants_core",
-  "generated_unix_ms": 1788666502058,
+  "generated_unix_ms": 1789628402227,
   "runtime": {
     "python_version": "3.13.12",
     "numpy_version": "2.4.3",
     "scipy_version": "1.17.1"
   },
   "provenance": {
-    "fixture_input_blake3": "6c5f24182f676609eca4d2ccb2496566f0c2e4e5177ed27932c3b29733679158",
-    "oracle_output_blake3": "a1522641d5586b4a92a60b657421f6cef1c2588575738ed765e2b6513d652c78",
-    "capture_blake3": "9d0e720dc4bd20bf45954bd63065d4bb529983b3198e6f51296df0a5e824c061"
+    "fixture_input_blake3": "bdc638b9a8c24aeb939ea0a01ab6d35d715ff7fd625b86bfb45e8429a7e10aa0",
+    "oracle_output_blake3": "bde96d9cbc79ed23ba68ad1b05c40bc00c682cf169f500d021a2b266aaa4d7e2",
+    "capture_blake3": "2f8a955bf4cd1c547dd9f579f682f4265691383616d927cfea78e5fd5204ad90"
   },
   "case_outputs": [
     {
@@ -36,7 +36,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 1.0545718176461563e-34
+        "value": 1.0545718176461565e-34
       },
       "error": null
     },
@@ -45,7 +45,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 1.6021766340000001e-19
+        "value": 1.602176634e-19
       },
       "error": null
     },
@@ -99,7 +99,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 0.45359237
+        "value": 0.45359236999999997
       },
       "error": null
     },
@@ -153,7 +153,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 1.6021766340000001e-19
+        "value": 1.602176634e-19
       },
       "error": null
     },
@@ -207,7 +207,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 0.45359237
+        "value": 0.45359236999999997
       },
       "error": null
     },
@@ -234,7 +234,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 96485.33212331
+        "value": 96485.33212331001
       },
       "error": null
     },
@@ -342,7 +342,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 5.0073567512000005e-27
+        "value": 5.0073567512e-27
       },
       "error": null
     },
@@ -360,7 +360,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 3.9903127128934306e-10
+        "value": 3.990312712893431e-10
       },
       "error": null
     },
@@ -396,7 +396,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 0.014387768775039335
+        "value": 0.014387768775039337
       },
       "error": null
     },
@@ -522,7 +522,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 1.3214098535999998e-15
+        "value": 1.3214098536e-15
       },
       "error": null
     },

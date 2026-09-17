@@ -46,7 +46,7 @@
       "total_fixtures": 2,
       "passed": 2,
       "failed": 0,
-      "max_abs_diff_across_all": 5.093170329928398e-11,
+      "max_abs_diff_across_all": 4.9112713895738125e-11,
       "max_rel_diff_across_all": 0.0
     },
     {

@@ -216,22 +216,22 @@
     {
       "case_id": "br_4nkk_cauchy_ppf_quartile",
       "passed": true,
-      "message": "scalar match: 0.9999999999999999"
+      "message": "scalar match: 1.0000000000000002"
     },
     {
       "case_id": "br_a6qx_chi2_pdf",
       "passed": true,
-      "message": "scalar match: 0.20755374871029733"
+      "message": "scalar match: 0.2075537487102974"
     },
     {
       "case_id": "br_a6qx_chi2_cdf",
       "passed": true,
-      "message": "scalar match: 0.4275932955291201"
+      "message": "scalar match: 0.42759329552912023"
     },
     {
       "case_id": "br_a6qx_chi2_ppf",
       "passed": true,
-      "message": "scalar match: 2.3659738843753395"
+      "message": "scalar match: 2.365973884375341"
     },
     {
       "case_id": "br_a6qx_lognorm_pdf",
@@ -261,17 +261,17 @@
     {
       "case_id": "br_a6qx_gamma_ppf",
       "passed": true,
-      "message": "scalar match: 1.6783469900166614"
+      "message": "scalar match: 1.6783469900166612"
     },
     {
       "case_id": "br_5sra_beta_pdf",
       "passed": true,
-      "message": "scalar match: 1.4999999999999964"
+      "message": "scalar match: 1.5000000000000004"
     },
     {
       "case_id": "br_5sra_beta_cdf",
       "passed": true,
-      "message": "scalar match: 0.6875000000000009"
+      "message": "scalar match: 0.6875"
     },
     {
       "case_id": "br_5sra_pareto_pdf",
@@ -361,5 +361,5 @@
   ],
   "passed_cases": 71,
   "failed_cases": 0,
-  "generated_unix_ms": 1779662447846
+  "generated_unix_ms": 1789628397526
 }

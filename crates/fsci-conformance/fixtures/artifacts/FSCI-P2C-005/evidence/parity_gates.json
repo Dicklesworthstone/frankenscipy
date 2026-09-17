@@ -14,7 +14,7 @@
       "fixture_id": "rfft_irfft_n16",
       "operation": "rfft_irfft_roundtrip",
       "pass": true,
-      "max_abs_diff": 2.220446049250313e-16,
+      "max_abs_diff": 2.7755575615628914e-16,
       "tolerance_used": 1e-10,
       "size": 16
     },
@@ -110,7 +110,7 @@
       "fixture_id": "rfft_irfft_n128",
       "operation": "rfft_irfft_roundtrip",
       "pass": true,
-      "max_abs_diff": 5.551115123125783e-16,
+      "max_abs_diff": 6.106226635438361e-16,
       "tolerance_used": 1e-10,
       "size": 128
     },
@@ -142,7 +142,7 @@
       "fixture_id": "rfft_irfft_n256",
       "operation": "rfft_irfft_roundtrip",
       "pass": true,
-      "max_abs_diff": 6.661338147750939e-16,
+      "max_abs_diff": 8.881784197001252e-16,
       "tolerance_used": 1e-10,
       "size": 256
     },

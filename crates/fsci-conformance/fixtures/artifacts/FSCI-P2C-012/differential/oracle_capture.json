@@ -1,7 +1,7 @@
 {
   "packet_id": "FSCI-P2C-012",
   "family": "stats_core",
-  "generated_unix_ms": 1788666502479,
+  "generated_unix_ms": 1789628398496,
   "runtime": {
     "python_version": "3.13.12",
     "numpy_version": "2.4.3",
@@ -9,8 +9,8 @@
   },
   "provenance": {
     "fixture_input_blake3": "2be676420a629001c8c224380868db8c97c7b8e30aa9752e8dabb4c2f6f77fda",
-    "oracle_output_blake3": "fc917ce5ef1d888c5a2e179951995e57bddc40c93475c4e791616387df5c8495",
-    "capture_blake3": "5f32480325eecaa0d1374d5a624678292f7c48e0a2d7f0dd6171e4b4abc3403c"
+    "oracle_output_blake3": "ae7a124c6b97308dbc53905ed5b8c1bad0d3073538aa41c8aaa252b4a0520177",
+    "capture_blake3": "14e90ce7bde1dd9512aeb70374c0941321bba4b9557f690d4a6420fcd83577cf"
   },
   "case_outputs": [
     {
@@ -18,7 +18,7 @@
       "status": "ok",
       "result_kind": "describe_result",
       "result": {
-        "kurtosis": -1.238095238095238,
+        "kurtosis": -1.2380952380952381,
         "mean": 4.5,
         "minmax": [
           1.0,
@@ -74,7 +74,7 @@
       "result_kind": "correlation_result",
       "result": {
         "pvalue": 1.4042654220543602e-24,
-        "statistic": 1.0
+        "statistic": 0.9999999999999999
       },
       "error": null
     },
@@ -219,7 +219,7 @@
       "result_kind": "goodness_result",
       "result": {
         "pvalue": 0.9492885624975852,
-        "statistic": 0.9780016294384768
+        "statistic": 0.9780016294384769
       },
       "error": null
     },
@@ -296,7 +296,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 0.11785113019775792
+        "value": 0.11785113019775793
       },
       "error": null
     },
@@ -305,7 +305,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 0.957427107756338
+        "value": 0.9574271077563381
       },
       "error": null
     },
@@ -331,7 +331,7 @@
       "status": "ok",
       "result_kind": "describe_result",
       "result": {
-        "kurtosis": -1.238095238095238,
+        "kurtosis": -1.2380952380952381,
         "mean": 4.5,
         "minmax": [
           1.0,
@@ -406,7 +406,7 @@
       "status": "ok",
       "result_kind": "ttest_result",
       "result": {
-        "pvalue": 0.11384629800665803,
+        "pvalue": 0.11384629800665805,
         "statistic": 4.5
       },
       "error": null
@@ -425,7 +425,7 @@
       "status": "ok",
       "result_kind": "scalar",
       "result": {
-        "value": 0.15915494309189537
+        "value": 0.15915494309189535
       },
       "error": null
     },

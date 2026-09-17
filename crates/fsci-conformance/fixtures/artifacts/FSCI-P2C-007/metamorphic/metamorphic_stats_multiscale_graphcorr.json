@@ -3,13 +3,13 @@
   "case_count": 24,
   "pass_count": 24,
   "pass": true,
-  "timestamp_ms": 1779662453425,
-  "duration_ns": 955404913,
+  "timestamp_ms": 1789628105483,
+  "duration_ns": 58022055,
   "cases": [
     {
       "case_id": "linear_n20",
       "invariant": "statistic_in_0_1",
-      "detail": "statistic=0.9999999999999999",
+      "detail": "statistic=1",
       "pass": true
     },
     {
@@ -33,13 +33,13 @@
     {
       "case_id": "linear_n20",
       "invariant": "dependent_data_high_statistic",
-      "detail": "statistic=0.9999999999999999, expected ≥ 0.5",
+      "detail": "statistic=1, expected ≥ 0.5",
       "pass": true
     },
     {
       "case_id": "linear_n20",
       "invariant": "deterministic_same_seed",
-      "detail": "stat=(0.9999999999999999, 0.9999999999999999), pval=(0.6274509803921569, 0.6274509803921569)",
+      "detail": "stat=(1, 1), pval=(0.6274509803921569, 0.6274509803921569)",
       "pass": true
     },
     {
@@ -81,7 +81,7 @@
     {
       "case_id": "two_d_dep_n15",
       "invariant": "statistic_in_0_1",
-      "detail": "statistic=0.9999999999999999",
+      "detail": "statistic=1",
       "pass": true
     },
     {
@@ -105,13 +105,13 @@
     {
       "case_id": "two_d_dep_n15",
       "invariant": "dependent_data_high_statistic",
-      "detail": "statistic=0.9999999999999999, expected ≥ 0.5",
+      "detail": "statistic=1, expected ≥ 0.5",
       "pass": true
     },
     {
       "case_id": "two_d_dep_n15",
       "invariant": "deterministic_same_seed",
-      "detail": "stat=(0.9999999999999999, 0.9999999999999999), pval=(0.5882352941176471, 0.5882352941176471)",
+      "detail": "stat=(1, 1), pval=(0.5882352941176471, 0.5882352941176471)",
       "pass": true
     },
     {

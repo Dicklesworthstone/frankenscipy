@@ -16,12 +16,12 @@
     {
       "case_id": "hbar_derived",
       "passed": true,
-      "message": "match within tolerance (diff=2.1382117680737565e-50, thr=1.0545718176461563e-49)"
+      "message": "match within tolerance (diff=0e0, thr=1.0545718176461565e-49)"
     },
     {
       "case_id": "elementary_charge_exact",
       "passed": true,
-      "message": "match within tolerance (diff=2.407412430484045e-35, thr=1.6021766340000004e-34)"
+      "message": "match within tolerance (diff=0e0, thr=1.602176634e-34)"
     },
     {
       "case_id": "boltzmann_exact",
@@ -51,7 +51,7 @@
     {
       "case_id": "pound_mass_exact",
       "passed": true,
-      "message": "match within tolerance (diff=0e0, thr=0e0)"
+      "message": "match within tolerance (diff=5.551115123125783e-17, thr=4.5359237e-16)"
     },
     {
       "case_id": "inch_exact",
@@ -81,12 +81,12 @@
     {
       "case_id": "ev_to_joules_unit",
       "passed": true,
-      "message": "match within tolerance (diff=2.407412430484045e-35, thr=1.6021766340000004e-34)"
+      "message": "match within tolerance (diff=0e0, thr=1.602176634e-34)"
     },
     {
       "case_id": "joules_to_ev_roundtrip",
       "passed": true,
-      "message": "match within tolerance (diff=2.220446049250313e-16, thr=1e-15)"
+      "message": "match within tolerance (diff=0e0, thr=1e-15)"
     },
     {
       "case_id": "wavelength_to_freq_visible",
@@ -111,7 +111,7 @@
     {
       "case_id": "lb_to_kg_unit",
       "passed": true,
-      "message": "match within tolerance (diff=0e0, thr=0e0)"
+      "message": "match within tolerance (diff=5.551115123125783e-17, thr=4.5359237e-16)"
     },
     {
       "case_id": "kg_to_lb_roundtrip",
@@ -126,7 +126,7 @@
     {
       "case_id": "faraday_constant",
       "passed": true,
-      "message": "match within tolerance (diff=1.4551915228366852e-11, thr=9.648533212331001e-11)"
+      "message": "match within tolerance (diff=0e0, thr=9.648533212331003e-11)"
     },
     {
       "case_id": "electron_g_factor",
@@ -186,7 +186,7 @@
     {
       "case_id": "triton_mass",
       "passed": true,
-      "message": "match within tolerance (diff=7.174648137343064e-43, thr=5.0073567512000007e-42)"
+      "message": "match within tolerance (diff=0e0, thr=5.0073567512e-42)"
     },
     {
       "case_id": "molar_volume_ideal_gas",
@@ -196,7 +196,7 @@
     {
       "case_id": "molar_planck_constant",
       "passed": true,
-      "message": "match within tolerance (diff=5.169878828456423e-26, thr=3.990312712893431e-25)"
+      "message": "match within tolerance (diff=0e0, thr=3.9903127128934313e-25)"
     },
     {
       "case_id": "rydberg_constant_times_c_in_hz",
@@ -216,7 +216,7 @@
     {
       "case_id": "second_radiation_constant",
       "passed": true,
-      "message": "match within tolerance (diff=1.734723475976807e-18, thr=1.4387768775039335e-17)"
+      "message": "match within tolerance (diff=0e0, thr=1.4387768775039338e-17)"
     },
     {
       "case_id": "electron_proton_mass_ratio",
@@ -286,7 +286,7 @@
     {
       "case_id": "proton_compton_wavelength",
       "passed": true,
-      "message": "match within tolerance (diff=1.9721522630525295e-31, thr=1.3214098535999998e-30)"
+      "message": "match within tolerance (diff=0e0, thr=1.3214098536000002e-30)"
     },
     {
       "case_id": "neutron_compton_wavelength",
@@ -402,8 +402,8 @@
     {
       "case_id": "hbar_derived",
       "passed": true,
-      "message": "match within tolerance (diff=2.1382117680737565e-50, thr=1.0545718176461563e-49)",
-      "max_diff": 2.1382117680737565e-50,
+      "message": "match within tolerance (diff=0e0, thr=1.0545718176461565e-49)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
         "rtol": 1e-15,
@@ -416,8 +416,8 @@
     {
       "case_id": "elementary_charge_exact",
       "passed": true,
-      "message": "match within tolerance (diff=2.407412430484045e-35, thr=1.6021766340000004e-34)",
-      "max_diff": 2.407412430484045e-35,
+      "message": "match within tolerance (diff=0e0, thr=1.602176634e-34)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
         "rtol": 1e-15,
@@ -500,11 +500,11 @@
     {
       "case_id": "pound_mass_exact",
       "passed": true,
-      "message": "match within tolerance (diff=0e0, thr=0e0)",
-      "max_diff": 0.0,
+      "message": "match within tolerance (diff=5.551115123125783e-17, thr=4.5359237e-16)",
+      "max_diff": 5.551115123125783e-17,
       "tolerance_used": {
         "atol": 0.0,
-        "rtol": 0.0,
+        "rtol": 1e-15,
         "comparison_mode": "allclose"
       },
       "oracle_status": {
@@ -584,8 +584,8 @@
     {
       "case_id": "ev_to_joules_unit",
       "passed": true,
-      "message": "match within tolerance (diff=2.407412430484045e-35, thr=1.6021766340000004e-34)",
-      "max_diff": 2.407412430484045e-35,
+      "message": "match within tolerance (diff=0e0, thr=1.602176634e-34)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
         "rtol": 1e-15,
@@ -598,8 +598,8 @@
     {
       "case_id": "joules_to_ev_roundtrip",
       "passed": true,
-      "message": "match within tolerance (diff=2.220446049250313e-16, thr=1e-15)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "match within tolerance (diff=0e0, thr=1e-15)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
         "rtol": 1e-15,
@@ -668,11 +668,11 @@
     {
       "case_id": "lb_to_kg_unit",
       "passed": true,
-      "message": "match within tolerance (diff=0e0, thr=0e0)",
-      "max_diff": 0.0,
+      "message": "match within tolerance (diff=5.551115123125783e-17, thr=4.5359237e-16)",
+      "max_diff": 5.551115123125783e-17,
       "tolerance_used": {
         "atol": 0.0,
-        "rtol": 0.0,
+        "rtol": 1e-15,
         "comparison_mode": "allclose"
       },
       "oracle_status": {
@@ -710,8 +710,8 @@
     {
       "case_id": "faraday_constant",
       "passed": true,
-      "message": "match within tolerance (diff=1.4551915228366852e-11, thr=9.648533212331001e-11)",
-      "max_diff": 1.4551915228366852e-11,
+      "message": "match within tolerance (diff=0e0, thr=9.648533212331003e-11)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
         "rtol": 1e-15,
@@ -878,8 +878,8 @@
     {
       "case_id": "triton_mass",
       "passed": true,
-      "message": "match within tolerance (diff=7.174648137343064e-43, thr=5.0073567512000007e-42)",
-      "max_diff": 7.174648137343064e-43,
+      "message": "match within tolerance (diff=0e0, thr=5.0073567512e-42)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
         "rtol": 1e-15,
@@ -906,8 +906,8 @@
     {
       "case_id": "molar_planck_constant",
       "passed": true,
-      "message": "match within tolerance (diff=5.169878828456423e-26, thr=3.990312712893431e-25)",
-      "max_diff": 5.169878828456423e-26,
+      "message": "match within tolerance (diff=0e0, thr=3.9903127128934313e-25)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
         "rtol": 1e-15,
@@ -962,8 +962,8 @@
     {
       "case_id": "second_radiation_constant",
       "passed": true,
-      "message": "match within tolerance (diff=1.734723475976807e-18, thr=1.4387768775039335e-17)",
-      "max_diff": 1.734723475976807e-18,
+      "message": "match within tolerance (diff=0e0, thr=1.4387768775039338e-17)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
         "rtol": 1e-15,
@@ -1158,8 +1158,8 @@
     {
       "case_id": "proton_compton_wavelength",
       "passed": true,
-      "message": "match within tolerance (diff=1.9721522630525295e-31, thr=1.3214098535999998e-30)",
-      "max_diff": 1.9721522630525295e-31,
+      "message": "match within tolerance (diff=0e0, thr=1.3214098536000002e-30)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 0.0,
         "rtol": 1e-15,
@@ -1381,5 +1381,5 @@
     }
   ],
   "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788658894144
+  "generated_unix_ms": 1789628402261
 }

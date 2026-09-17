@@ -22,7 +22,7 @@
       "fixture_id": "gamma_5",
       "operation": "gamma",
       "pass": true,
-      "max_abs_diff": 3.907985046680551e-14,
+      "max_abs_diff": 0.0,
       "tolerance_used": 1e-10,
       "note": "gamma(5)=2.400000e1, expected=2.400000e1"
     },
@@ -30,7 +30,7 @@
       "fixture_id": "gamma_half",
       "operation": "gamma",
       "pass": true,
-      "max_abs_diff": 6.661338147750939e-16,
+      "max_abs_diff": 0.0,
       "tolerance_used": 1e-10,
       "note": "gamma(0.5)=1.772454e0, expected=1.772454e0"
     },
@@ -86,7 +86,7 @@
       "fixture_id": "erfinv_rt_x-0.9",
       "operation": "erfinv",
       "pass": true,
-      "max_abs_diff": 1.1102230246251565e-16,
+      "max_abs_diff": 0.0,
       "tolerance_used": 1e-10,
       "note": "erf(erfinv(-0.9))=-9.000000e-1"
     },
@@ -158,7 +158,7 @@
       "fixture_id": "beta_gamma_a1_b1",
       "operation": "beta",
       "pass": true,
-      "max_abs_diff": 1.7763568394002505e-15,
+      "max_abs_diff": 0.0,
       "tolerance_used": 1e-10,
       "note": "B(1,1)=1.000000e0, Γ(a)Γ(b)/Γ(a+b)=1.000000e0"
     },
@@ -166,7 +166,7 @@
       "fixture_id": "beta_gamma_a2_b3",
       "operation": "beta",
       "pass": true,
-      "max_abs_diff": 1.6653345369377309e-16,
+      "max_abs_diff": 0.0,
       "tolerance_used": 1e-10,
       "note": "B(2,3)=8.333333e-2, Γ(a)Γ(b)/Γ(a+b)=8.333333e-2"
     },
@@ -174,7 +174,7 @@
       "fixture_id": "beta_gamma_a0.5_b0.5",
       "operation": "beta",
       "pass": true,
-      "max_abs_diff": 7.067899292141145e-16,
+      "max_abs_diff": 0.0,
       "tolerance_used": 1e-10,
       "note": "B(0.5,0.5)=3.141593e0, Γ(a)Γ(b)/Γ(a+b)=3.141593e0"
     },
@@ -198,7 +198,7 @@
       "fixture_id": "y0_one",
       "operation": "bessel",
       "pass": true,
-      "max_abs_diff": 1.5677001363734178e-11,
+      "max_abs_diff": 1.5676973608158562e-11,
       "tolerance_used": 0.0001,
       "note": "y0(1)=8.825696e-2"
     },
