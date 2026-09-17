@@ -653,10 +653,10 @@ fn bit_comparator_rejects_the_differences_it_exists_to_catch() {
 
 /// The transport bug that made the first version of this test fail, pinned as a control.
 ///
-/// Both arms had computed identical bits; `serde_json` invented the difference while parsing
-/// the incumbent's decimal text. If this ever starts passing — because the dependency gained
-/// `float_roundtrip`, say — the bit transport is still correct and this test simply documents
-/// history; if it keeps failing, the transport is still load-bearing.
+/// Both arms had computed identical bits; `serde_json` (without `float_roundtrip`) invented
+/// the difference while parsing the incumbent's decimal text. When `serde_json` gained
+/// `float_roundtrip`, decimal transport became correctly rounded here too. Either way,
+/// the bit transport this test uses is bit-exact and does not depend on decimal rounding.
 #[test]
 fn bit_transport_survives_values_decimal_json_would_corrupt() {
     const TEXT: &str = "0.0017144775390624983";
@@ -668,11 +668,12 @@ fn bit_transport_survives_values_decimal_json_would_corrupt() {
         0x3f5c_170a_3d70_a3cf,
         "Rust's own parser is correctly rounded for this text"
     );
-    assert_ne!(
-        via_json.to_bits(),
-        via_rust_literal.to_bits(),
-        "if serde_json ever becomes correctly rounded here, decimal transport would be safe \
-         again — but the bit transport this test uses does not depend on that"
+    // With `float_roundtrip` enabled on `serde_json` in Cargo.toml, `via_json` parses bit-exact.
+    // Without `float_roundtrip`, `via_json` parsed as `0x3f5c_170a_3d70_a3d0` (1 ULP off).
+    assert!(
+        via_json.to_bits() == via_rust_literal.to_bits()
+            || via_json.to_bits() == 0x3f5c_170a_3d70_a3d0,
+        "if float_roundtrip is enabled, decimal transport matches; otherwise 1-ULP drift is seen"
     );
 
     // The channel this test actually uses is exact for the same value.
