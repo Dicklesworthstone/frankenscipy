@@ -1,7 +1,7 @@
 {
   "packet_id": "FSCI-P2C-012",
   "family": "stats_core",
-  "generated_at": "unix:1779662447",
+  "generated_at": "unix:1789628397",
   "fixtures": [
     {
       "fixture_id": "describe_8pt",

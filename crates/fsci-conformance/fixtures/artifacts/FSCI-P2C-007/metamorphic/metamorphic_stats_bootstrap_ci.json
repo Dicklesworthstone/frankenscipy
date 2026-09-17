@@ -3,8 +3,8 @@
   "case_count": 14,
   "pass_count": 14,
   "pass": true,
-  "timestamp_ms": 1780777723794,
-  "duration_ns": 53792549,
+  "timestamp_ms": 1789628105422,
+  "duration_ns": 53207240,
   "cases": [
     {
       "case_id": "compact_n10",

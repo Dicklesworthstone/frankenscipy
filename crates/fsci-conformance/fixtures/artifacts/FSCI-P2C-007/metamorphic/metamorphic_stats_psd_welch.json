@@ -3,8 +3,8 @@
   "case_count": 15,
   "pass_count": 15,
   "pass": true,
-  "timestamp_ms": 1779662453682,
-  "duration_ns": 46269799,
+  "timestamp_ms": 1789628105658,
+  "duration_ns": 21712630,
   "cases": [
     {
       "case_id": "tone_25hz_fs100_n512_w64",

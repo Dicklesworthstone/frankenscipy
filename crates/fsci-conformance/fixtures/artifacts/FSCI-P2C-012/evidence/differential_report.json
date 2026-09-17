@@ -12,7 +12,7 @@
       "case_id": "describe_8pt",
       "passed": true,
       "message": "describe_result match",
-      "max_diff": 2.220446049250313e-16,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -82,7 +82,7 @@
       "case_id": "spearmanr_monotonic",
       "passed": true,
       "message": "correlation_result match",
-      "max_diff": 1.4042654220543602e-24,
+      "max_diff": 1.1102230246251565e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -96,7 +96,7 @@
       "case_id": "linregress_perfect",
       "passed": true,
       "message": "linregress_result match",
-      "max_diff": 1.2004217548761418e-30,
+      "max_diff": 7.181654629664687e-45,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -138,7 +138,7 @@
       "case_id": "ttest_1samp_shifted",
       "passed": true,
       "message": "ttest_result match",
-      "max_diff": 1.8318679906315083e-15,
+      "max_diff": 1.6653345369377348e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -166,7 +166,7 @@
       "case_id": "ks_2samp_different",
       "passed": true,
       "message": "goodness_result match",
-      "max_diff": 2.7755575615628914e-17,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -278,7 +278,7 @@
       "case_id": "shapiro_normal",
       "passed": true,
       "message": "goodness_result match",
-      "max_diff": 1.1102230246251565e-16,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-6,
         "rtol": 1e-6,
@@ -334,7 +334,7 @@
       "case_id": "linregress_negative_slope",
       "passed": true,
       "message": "linregress_result match",
-      "max_diff": 1.2004217548761418e-30,
+      "max_diff": 7.181654629664687e-45,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -390,7 +390,7 @@
       "case_id": "variation_high_mean",
       "passed": true,
       "message": "scalar match: 0.11785113019775793",
-      "max_diff": 1.3877787807814457e-17,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -404,7 +404,7 @@
       "case_id": "sem_10pt",
       "passed": true,
       "message": "scalar match: 0.9574271077563381",
-      "max_diff": 1.1102230246251565e-16,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -432,7 +432,7 @@
       "case_id": "hardened_describe_8pt",
       "passed": true,
       "message": "describe_result match",
-      "max_diff": 2.220446049250313e-16,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -502,7 +502,7 @@
       "case_id": "ttest_ind_shifted_groups",
       "passed": true,
       "message": "ttest_result match",
-      "max_diff": 4.163336342344337e-17,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-7,
@@ -530,7 +530,7 @@
       "case_id": "mannwhitneyu_shifted_groups",
       "passed": true,
       "message": "ttest_result match",
-      "max_diff": 9.71445146547012e-17,
+      "max_diff": 8.326672684688674e-17,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-7,
@@ -558,7 +558,7 @@
       "case_id": "br_4nkk_cauchy_pdf_at_scale",
       "passed": true,
       "message": "scalar match: 0.15915494309189535",
-      "max_diff": 2.7755575615628914e-17,
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-10,
@@ -599,8 +599,8 @@
     {
       "case_id": "br_4nkk_cauchy_ppf_quartile",
       "passed": true,
-      "message": "scalar match: 0.9999999999999999",
-      "max_diff": 3.3306690738754696e-16,
+      "message": "scalar match: 1.0000000000000002",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-10,
@@ -613,8 +613,8 @@
     {
       "case_id": "br_a6qx_chi2_pdf",
       "passed": true,
-      "message": "scalar match: 0.20755374871029733",
-      "max_diff": 5.551115123125783e-17,
+      "message": "scalar match: 0.2075537487102974",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-7,
@@ -627,8 +627,8 @@
     {
       "case_id": "br_a6qx_chi2_cdf",
       "passed": true,
-      "message": "scalar match: 0.4275932955291201",
-      "max_diff": 1.1102230246251565e-16,
+      "message": "scalar match: 0.42759329552912023",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-9,
         "rtol": 1e-7,
@@ -641,8 +641,8 @@
     {
       "case_id": "br_a6qx_chi2_ppf",
       "passed": true,
-      "message": "scalar match: 2.3659738843753395",
-      "max_diff": 1.7763568394002505e-15,
+      "message": "scalar match: 2.365973884375341",
+      "max_diff": 3.1086244689504383e-15,
       "tolerance_used": {
         "atol": 1e-7,
         "rtol": 1e-6,
@@ -725,8 +725,8 @@
     {
       "case_id": "br_a6qx_gamma_ppf",
       "passed": true,
-      "message": "scalar match: 1.6783469900166614",
-      "max_diff": 2.220446049250313e-16,
+      "message": "scalar match: 1.6783469900166612",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-7,
         "rtol": 1e-6,
@@ -739,8 +739,8 @@
     {
       "case_id": "br_5sra_beta_pdf",
       "passed": true,
-      "message": "scalar match: 1.4999999999999964",
-      "max_diff": 3.9968028886505635e-15,
+      "message": "scalar match: 1.5000000000000004",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-10,
@@ -753,8 +753,8 @@
     {
       "case_id": "br_5sra_beta_cdf",
       "passed": true,
-      "message": "scalar match: 0.6875000000000009",
-      "max_diff": 8.881784197001252e-16,
+      "message": "scalar match: 0.6875",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-12,
         "rtol": 1e-10,
@@ -1003,5 +1003,5 @@
       }
     }
   ],
-  "generated_unix_ms": 1779662448658
+  "generated_unix_ms": 1789628398626
 }

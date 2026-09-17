@@ -3,8 +3,8 @@
   "case_count": 27,
   "pass_count": 27,
   "pass": true,
-  "timestamp_ms": 1779662452428,
-  "duration_ns": 2691479,
+  "timestamp_ms": 1789628105357,
+  "duration_ns": 3535591,
   "cases": [
     {
       "case_id": "blobs_k2",

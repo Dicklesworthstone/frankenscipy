@@ -3,8 +3,8 @@
   "case_count": 19,
   "pass_count": 19,
   "pass": true,
-  "timestamp_ms": 1780777424285,
-  "duration_ns": 52973327,
+  "timestamp_ms": 1789628105633,
+  "duration_ns": 47650880,
   "cases": [
     {
       "case_id": "perm_identical_n10",
@@ -45,13 +45,13 @@
     {
       "case_id": "perm_mild_shift_n12",
       "invariant": "pvalue_in_floor_1_range",
-      "detail": "pval=0.21039480259870064, floor=0.0004997501249375312",
+      "detail": "pval=0.19790104947526238, floor=0.0004997501249375312",
       "pass": true
     },
     {
       "case_id": "perm_mild_shift_n12",
       "invariant": "deterministic_same_seed",
-      "detail": "stat=(-2, -2), pval=(0.21039480259870064, 0.21039480259870064)",
+      "detail": "stat=(-2, -2), pval=(0.19790104947526238, 0.19790104947526238)",
       "pass": true
     },
     {

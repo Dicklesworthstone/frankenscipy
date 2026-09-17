@@ -13,28 +13,28 @@
       "total_fixtures": 3,
       "passed": 3,
       "failed": 0,
-      "max_abs_diff_across_all": 2.220446049250313e-16
+      "max_abs_diff_across_all": 0.0
     },
     {
       "function": "distribution_cdf",
       "total_fixtures": 11,
       "passed": 11,
       "failed": 0,
-      "max_abs_diff_across_all": 8.881784197001252e-16
+      "max_abs_diff_across_all": 4.440892098500626e-16
     },
     {
       "function": "distribution_pdf",
       "total_fixtures": 11,
       "passed": 11,
       "failed": 0,
-      "max_abs_diff_across_all": 3.9968028886505635e-15
+      "max_abs_diff_across_all": 4.440892098500626e-16
     },
     {
       "function": "distribution_ppf",
       "total_fixtures": 4,
       "passed": 4,
       "failed": 0,
-      "max_abs_diff_across_all": 1.7763568394002505e-15
+      "max_abs_diff_across_all": 3.1086244689504383e-15
     },
     {
       "function": "entropy",
@@ -62,7 +62,7 @@
       "total_fixtures": 2,
       "passed": 2,
       "failed": 0,
-      "max_abs_diff_across_all": 2.7755575615628914e-17
+      "max_abs_diff_across_all": 0.0
     },
     {
       "function": "kurtosis",
@@ -83,7 +83,7 @@
       "total_fixtures": 1,
       "passed": 1,
       "failed": 0,
-      "max_abs_diff_across_all": 9.71445146547012e-17
+      "max_abs_diff_across_all": 8.326672684688674e-17
     },
     {
       "function": "moment",
@@ -104,14 +104,14 @@
       "total_fixtures": 2,
       "passed": 2,
       "failed": 0,
-      "max_abs_diff_across_all": 1.1102230246251565e-16
+      "max_abs_diff_across_all": 0.0
     },
     {
       "function": "shapiro",
       "total_fixtures": 1,
       "passed": 1,
       "failed": 0,
-      "max_abs_diff_across_all": 1.1102230246251565e-16
+      "max_abs_diff_across_all": 0.0
     },
     {
       "function": "skew",
@@ -125,28 +125,28 @@
       "total_fixtures": 1,
       "passed": 1,
       "failed": 0,
-      "max_abs_diff_across_all": 1.4042654220543602e-24
+      "max_abs_diff_across_all": 1.1102230246251565e-16
     },
     {
       "function": "ttest_1samp",
       "total_fixtures": 2,
       "passed": 2,
       "failed": 0,
-      "max_abs_diff_across_all": 1.8318679906315083e-15
+      "max_abs_diff_across_all": 1.6653345369377348e-16
     },
     {
       "function": "ttest_ind",
       "total_fixtures": 2,
       "passed": 2,
       "failed": 0,
-      "max_abs_diff_across_all": 4.163336342344337e-17
+      "max_abs_diff_across_all": 0.0
     },
     {
       "function": "variation",
       "total_fixtures": 2,
       "passed": 2,
       "failed": 0,
-      "max_abs_diff_across_all": 1.3877787807814457e-17
+      "max_abs_diff_across_all": 0.0
     },
     {
       "function": "zscore",

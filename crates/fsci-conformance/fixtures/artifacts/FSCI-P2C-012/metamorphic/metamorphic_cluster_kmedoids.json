@@ -3,8 +3,8 @@
   "case_count": 31,
   "pass_count": 31,
   "pass": true,
-  "timestamp_ms": 1779662452419,
-  "duration_ns": 430125,
+  "timestamp_ms": 1789628105341,
+  "duration_ns": 550363,
   "cases": [
     {
       "case_id": "single_cluster_k1",

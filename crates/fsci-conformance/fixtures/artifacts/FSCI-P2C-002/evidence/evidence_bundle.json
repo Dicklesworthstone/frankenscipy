@@ -1,7 +1,7 @@
 {
   "manifest": {
     "packet_id": "FSCI-P2C-002",
-    "generated_at": "unix:1780675574",
+    "generated_at": "unix:1789628205",
     "fixtures": [
       {
         "fixture_id": "diag_dominant_4x4",
@@ -273,7 +273,7 @@
         "fixture_id": "overdetermined_128x64",
         "operation": "lstsq",
         "pass": true,
-        "max_abs_diff": 5.093170329928398e-11,
+        "max_abs_diff": 4.9112713895738125e-11,
         "max_rel_diff": 0.0,
         "tolerance_used": 1e-6,
         "matrix_dims": [
@@ -298,7 +298,7 @@
         "operation": "pinv",
         "pass": true,
         "max_abs_diff": 4.996003610813204e-16,
-        "max_rel_diff": 2.1360264316070146e-15,
+        "max_rel_diff": 3.1200136146838724e-15,
         "tolerance_used": 1e-8,
         "matrix_dims": [
           128,
@@ -394,7 +394,7 @@
         "total_fixtures": 2,
         "passed": 2,
         "failed": 0,
-        "max_abs_diff_across_all": 5.093170329928398e-11,
+        "max_abs_diff_across_all": 4.9112713895738125e-11,
         "max_rel_diff_across_all": 0.0
       },
       {
