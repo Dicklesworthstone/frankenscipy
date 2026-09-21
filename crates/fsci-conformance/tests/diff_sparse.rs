@@ -9,14 +9,15 @@
 //! All tests emit structured JSON logs to
 //! `fixtures/artifacts/FSCI-P2C-004/diff/`.
 
-use fsci_runtime::RuntimeMode;
+use fsci_runtime::{RuntimeMode, SparseSolverPortfolio};
 use fsci_sparse::{
     BsrMatrix, CooArray, CooMatrix, CsrMatrix, DiaMatrix, DokMatrix, FormatConvertible, IndexArray,
     IndexArrayRef, IndexDtype, Shape2D, SolveOptions, SparseArrayOutput, SparseError, SparseFormat,
     SparseIndexArrays, SparseMatrixOutput, SparseNpz, SparseObject, add_csr, coo_to_csr_with_mode,
     csr_to_csc_with_mode, diags, expand_dims, eye, get_index_dtype, issparse, isspmatrix,
     load_npz_from_reader, permute_dims, random, safely_cast_index_arrays, save_npz_to_writer,
-    scale_coo, scale_csc, scale_csr, spmv_coo, spmv_csc, spmv_csr, spsolve, sub_csr, swapaxes,
+    scale_coo, scale_csc, scale_csr, spmv_coo, spmv_csc, spmv_csr, spsolve, spsolve_with_audit,
+    spsolve_with_casp, sub_csr, swapaxes, sync_audit_ledger,
 };
 use serde::Serialize;
 use std::fs;
@@ -1486,6 +1487,124 @@ fn diff_021_sparse_npz_wire_compatibility_vs_scipy() {
     assert!(
         pass,
         "sparse NPZ wire diff={diff}; scipy->rust={scipy_to_rust_diff}; rust->scipy={rust_to_scipy_diff}"
+    );
+}
+
+#[test]
+fn diff_022_spsolve_with_casp_vs_scipy_superlu_4x4() {
+    let start = Instant::now();
+    let Some(scipy_result) = scipy_spsolve_tridiagonal_4x4() else {
+        eprintln!("SciPy sparse spsolve oracle unavailable; skipping diff_022");
+        return;
+    };
+
+    let coo = make_test_coo(
+        4,
+        4,
+        &[
+            (0, 0, 4.0),
+            (0, 1, -1.0),
+            (1, 0, -1.0),
+            (1, 1, 4.0),
+            (1, 2, -1.0),
+            (2, 1, -1.0),
+            (2, 2, 4.0),
+            (2, 3, -1.0),
+            (3, 2, -1.0),
+            (3, 3, 3.0),
+        ],
+    );
+    let csr = coo.to_csr().expect("csr");
+    let rhs = vec![15.0, 10.0, 10.0, 10.0];
+    let mut portfolio = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+    let rust_result = spsolve_with_casp(&csr, &rhs, SolveOptions::default(), &mut portfolio)
+        .expect("rust spsolve_with_casp")
+        .solution;
+    let diff = max_abs_diff_vec(&rust_result, &scipy_result);
+    let tolerance = 1e-10;
+    let pass = diff <= tolerance;
+    emit_log(&DiffTestLog {
+        test_id: "diff_022_spsolve_with_casp_vs_scipy_superlu_4x4".into(),
+        category: "scipy_differential".into(),
+        input_summary:
+            "4x4 SPD tridiagonal CSR solve via spsolve_with_casp vs scipy.sparse.linalg.spsolve"
+                .into(),
+        expected: format!("scipy={scipy_result:?}"),
+        actual: format!("rust={rust_result:?}"),
+        diff,
+        tolerance,
+        pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+    });
+    assert!(
+        pass,
+        "spsolve_with_casp SciPy oracle diff={diff} > tol={tolerance}"
+    );
+    assert_eq!(
+        portfolio.evidence_len(),
+        1,
+        "portfolio should record evidence entry"
+    );
+}
+
+#[test]
+fn diff_023_spsolve_with_audit_records_evidence_and_matches_scipy() {
+    let start = Instant::now();
+    let Some(scipy_result) = scipy_spsolve_tridiagonal_4x4() else {
+        eprintln!("SciPy sparse spsolve oracle unavailable; skipping diff_023");
+        return;
+    };
+
+    let coo = make_test_coo(
+        4,
+        4,
+        &[
+            (0, 0, 4.0),
+            (0, 1, -1.0),
+            (1, 0, -1.0),
+            (1, 1, 4.0),
+            (1, 2, -1.0),
+            (2, 1, -1.0),
+            (2, 2, 4.0),
+            (2, 3, -1.0),
+            (3, 2, -1.0),
+            (3, 3, 3.0),
+        ],
+    );
+    let csr = coo.to_csr().expect("csr");
+    let rhs = vec![15.0, 10.0, 10.0, 10.0];
+    let mut portfolio = SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+    let ledger = sync_audit_ledger();
+    let rust_result =
+        spsolve_with_audit(&csr, &rhs, SolveOptions::default(), &mut portfolio, &ledger)
+            .expect("rust spsolve_with_audit")
+            .solution;
+    let diff = max_abs_diff_vec(&rust_result, &scipy_result);
+    let tolerance = 1e-10;
+    let pass = diff <= tolerance;
+    emit_log(&DiffTestLog {
+        test_id: "diff_023_spsolve_with_audit_records_evidence_and_matches_scipy".into(),
+        category: "scipy_differential".into(),
+        input_summary:
+            "4x4 SPD tridiagonal CSR solve via spsolve_with_audit vs scipy.sparse.linalg.spsolve"
+                .into(),
+        expected: format!("scipy={scipy_result:?}"),
+        actual: format!("rust={rust_result:?}"),
+        diff,
+        tolerance,
+        pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+    });
+    assert!(
+        pass,
+        "spsolve_with_audit SciPy oracle diff={diff} > tol={tolerance}"
+    );
+    assert_eq!(
+        portfolio.evidence_len(),
+        1,
+        "portfolio should record evidence entry"
     );
 }
 
