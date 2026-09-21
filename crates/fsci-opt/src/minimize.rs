@@ -290,6 +290,23 @@ where
     })
 }
 
+/// Minimize an objective function using CASP condition-aware portfolio selection.
+///
+/// Dispatches among BFGS (smooth), L-BFGS-B (bounded), Nelder-Mead (noisy),
+/// TrustRegionNewtonCG (narrow valley), and DIRECT (global exploration)
+/// via Bayesian expected-loss minimization, with automatic condition diagnostics.
+pub fn minimize_with_casp<F>(
+    fun: F,
+    x0: &[f64],
+    options: MinimizeOptions,
+    portfolio: &mut OptSolverPortfolio,
+) -> Result<OptPortfolioResult, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    minimize_with_casp_portfolio(fun, x0, options, portfolio, false, false)
+}
+
 /// Batched minimisation: minimise the SAME objective `fun` from MANY starting points
 /// (`x0_rows`), one [`OptimizeResult`] per start. This is the vmap-over-solver primitive
 /// SciPy lacks — there a multistart / parameter sweep loops `minimize` in Python, calling the
@@ -6873,6 +6890,24 @@ mod tests {
 
         assert_eq!(res.chosen_action, OptSolverAction::DIRECT);
         assert!(res.result.success);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_minimize_with_casp_standard_entrypoint() {
+        let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = minimize_with_casp(
+            convex_bowl,
+            &[1.0, 1.0],
+            MinimizeOptions::default(),
+            &mut portfolio,
+        )
+        .expect("minimize_with_casp");
+
+        assert_eq!(res.chosen_action, OptSolverAction::BFGS);
+        assert!(res.result.success);
+        assert!(res.result.x[0].abs() < 1e-4);
+        assert!(res.result.x[1].abs() < 1e-4);
         assert_eq!(portfolio.evidence_len(), 1);
     }
 }
