@@ -13,8 +13,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_runtime::RuntimeMode;
-use fsci_special::{HyperCaspProblem, HypergeometricBranch, select_hypergeometric_branch};
+use fsci_runtime::{HyperSolverPortfolio, RuntimeMode};
+use fsci_special::{
+    HyperCaspProblem, HypergeometricBranch, select_hypergeometric_branch,
+    select_hypergeometric_branch_with_casp,
+};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -246,4 +249,91 @@ fn diff_special_select_hypergeometric_branch_casp() {
         "hypergeometric CASP branch coverage failed: {} cases",
         diffs.len(),
     );
+}
+
+#[test]
+fn diff_special_select_hypergeometric_branch_with_casp_portfolio() {
+    let start = Instant::now();
+    let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut portfolio = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
+
+    let mut probe_casp = |id: &str,
+                          problem: HyperCaspProblem,
+                          mode: RuntimeMode,
+                          portfolio: &mut HyperSolverPortfolio,
+                          expected: HypergeometricBranch| {
+        let actual_res = select_hypergeometric_branch_with_casp(problem, mode, portfolio);
+        let (actual_str, pass, note) = match actual_res {
+            Ok(d) => (
+                format!("{:?}", d.branch),
+                d.branch == expected,
+                String::new(),
+            ),
+            Err(e) => ("Err".into(), false, format!("err: {e:?}")),
+        };
+        diffs.push(CaseDiff {
+            case_id: id.into(),
+            expected: format!("{expected:?}"),
+            actual: actual_str,
+            pass,
+            note,
+        });
+    };
+
+    // 1. Direct series near zero
+    probe_casp(
+        "casp_hyp2f1_direct_series",
+        HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 0.2, 1.0e-14),
+        RuntimeMode::Strict,
+        &mut portfolio,
+        HypergeometricBranch::DirectSeries,
+    );
+
+    // 2. Kummer transform for negative real confluent argument
+    probe_casp(
+        "casp_hyp1f1_kummer_transform",
+        HyperCaspProblem::hyp1f1(1.0, 2.0, -3.0, 1.0e-14),
+        RuntimeMode::Strict,
+        &mut portfolio,
+        HypergeometricBranch::KummerTransform,
+    );
+
+    // 3. Asymptotic expansion for large argument
+    probe_casp(
+        "casp_hyp2f1_asymptotic",
+        HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 25.0, 1.0e-14),
+        RuntimeMode::Strict,
+        &mut portfolio,
+        HypergeometricBranch::AsymptoticExpansion,
+    );
+
+    // 4. Parameter guard fallback near pole / boundary
+    probe_casp(
+        "casp_hyp2f1_boundary_near_pole",
+        HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 1.0, 1.0e-14),
+        RuntimeMode::Strict,
+        &mut portfolio,
+        HypergeometricBranch::ParameterGuard,
+    );
+
+    assert_eq!(
+        portfolio.evidence_len(),
+        4,
+        "portfolio must accumulate 4 evidence entries"
+    );
+
+    let all_pass = diffs.iter().all(|d| d.pass);
+    let log = DiffLog {
+        test_id: "diff_special_select_hypergeometric_branch_with_casp_portfolio".into(),
+        category: "fsci_special::select_hypergeometric_branch_with_casp CASP portfolio routing"
+            .into(),
+        case_count: diffs.len(),
+        pass: all_pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+        cases: diffs.clone(),
+    };
+    emit_log(&log);
+
+    assert!(all_pass, "all casp portfolio routing cases must pass");
 }
