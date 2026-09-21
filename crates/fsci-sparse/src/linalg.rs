@@ -10112,15 +10112,15 @@ fn spsolve_with_casp_internal(
 
     let casp_res = solve_with_casp_portfolio(a, b, None, portfolio, iterative_opts)?;
 
-    if casp_res.fallback_active {
-        if let Some(ledger) = audit_ledger {
-            crate::audit::record_bounded_recovery(
-                ledger,
-                b"casp_fallback",
-                "casp_iterative_to_superlu_fallback",
-                "recovered: direct solve succeeded after iterative non-convergence",
-            );
-        }
+    if casp_res.fallback_active
+        && let Some(ledger) = audit_ledger
+    {
+        crate::audit::record_bounded_recovery(
+            ledger,
+            b"casp_fallback",
+            "casp_iterative_to_superlu_fallback",
+            "recovered: direct solve succeeded after iterative non-convergence",
+        );
     }
 
     let backend_used = match casp_res.chosen_action {
