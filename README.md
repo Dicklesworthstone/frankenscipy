@@ -648,7 +648,7 @@ V1.0 is gated on the following items. Items 1, 2, 3, 4, 5, and 6 are completed; 
 6. **Tagged 0.x release with publish-to-crates.io workflow.** Completed: Git tag `v0.2.0` was released, and all workspace crates (`fsci-linalg`, `fsci-sparse`, `fsci-opt`, `fsci-integrate`, `fsci-fft`, `fsci-special`, `fsci-runtime`, `fsci-stats`, etc.) are published on crates.io at version `0.2.0` with full `#![forbid(unsafe_code)]` compliance.
 7. **Converge the artifact topology.** Both the legacy `P2C-*` tree and the flat `FSCI-P2C-*` tree are present in `crates/fsci-conformance/fixtures/artifacts/`; migration is tracked under `frankenscipy-icmu7`.
 
-The issue tracker currently records over 4,350 closed beads with remaining work focused on CASP multi-domain expansion and closing residual algorithm gaps (`optimize.direct`, `stats.CensoredData`, `stats.Covariance`). Run `bv --robot-triage` for the live picture.
+The issue tracker currently records over 4,370 closed beads, with 5-domain CASP portfolios and core algorithm gaps (`optimize.direct`, `stats.CensoredData`, `stats.Covariance`) fully implemented and verified across the workspace. Run `bv --robot-triage` for the live picture.
 
 ---
 
