@@ -7,30 +7,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdist",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ]
-        ],
-        "euclidean"
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], "euclidean"],
       "expected": {
         "kind": "array",
-        "value": [
-          1.0,
-          1.0,
-          1.4142135623730951
-        ],
+        "value": [1.0, 1.0, 1.4142135623730951],
         "atol": 1e-10,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::pdist"
@@ -41,41 +21,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "cdist",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ]
-        ],
-        [
-          [
-            0.0,
-            1.0
-          ],
-          [
-            1.0,
-            1.0
-          ]
-        ],
-        "euclidean"
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0]], [[0.0, 1.0], [1.0, 1.0]], "euclidean"],
       "expected": {
         "kind": "matrix",
-        "value": [
-          [
-            1.0,
-            1.4142135623730951
-          ],
-          [
-            1.4142135623730951,
-            1.0
-          ]
-        ],
+        "value": [[1.0, 1.4142135623730951], [1.4142135623730951, 1.0]],
         "atol": 1e-10,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::cdist"
@@ -86,32 +35,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "squareform_to_matrix",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0]],
       "expected": {
         "kind": "matrix",
-        "value": [
-          [
-            0.0,
-            1.0,
-            2.0
-          ],
-          [
-            1.0,
-            0.0,
-            3.0
-          ],
-          [
-            2.0,
-            3.0,
-            0.0
-          ]
-        ],
+        "value": [[0.0, 1.0, 2.0], [1.0, 0.0, 3.0], [2.0, 3.0, 0.0]],
         "atol": 1e-10,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::squareform_to_matrix"
@@ -122,30 +49,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kdtree_query",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ],
-          [
-            1.0,
-            1.0
-          ]
-        ],
-        [
-          0.6,
-          0.6
-        ]
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], [0.6, 0.6]],
       "expected": {
         "kind": "kdtree_query_result",
         "index": 3,
@@ -160,28 +64,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "directed_hausdorff",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ]
-        ],
-        [
-          [
-            0.0,
-            2.0
-          ],
-          [
-            1.0,
-            2.0
-          ]
-        ]
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0]], [[0.0, 2.0], [1.0, 2.0]]],
       "expected": {
         "kind": "scalar",
         "value": 2.0,
@@ -195,38 +78,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "convex_hull",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            1.0,
-            1.0
-          ],
-          [
-            0.0,
-            1.0
-          ],
-          [
-            0.5,
-            0.5
-          ]
-        ]
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0], [0.5, 0.5]]],
       "expected": {
         "kind": "convex_hull",
-        "vertices": [
-          0,
-          1,
-          2,
-          3
-        ],
+        "vertices": [0, 1, 2, 3],
         "area": 1.0,
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -238,41 +93,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "procrustes",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ]
-        ],
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            2.0,
-            0.0
-          ],
-          [
-            0.0,
-            2.0
-          ]
-        ]
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]], [[0.0, 0.0], [2.0, 0.0], [0.0, 2.0]]],
       "expected": {
         "kind": "procrustes_result",
         "disparity": 6.347865096700329e-31,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_spatial::procrustes"
       }
     },
@@ -281,36 +107,13 @@
       "category": "differential",
       "mode": "Strict",
       "function": "geometric_slerp",
-      "args": [
-        [
-          1.0,
-          0.0
-        ],
-        [
-          0.0,
-          1.0
-        ],
-        [
-          0.0,
-          0.5,
-          1.0
-        ]
-      ],
+      "args": [[1.0, 0.0], [0.0, 1.0], [0.0, 0.5, 1.0]],
       "expected": {
         "kind": "matrix",
         "value": [
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.7071067811865476,
-            0.7071067811865475
-          ],
-          [
-            6.123233995736766e-17,
-            1.0
-          ]
+          [1.0, 0.0],
+          [0.7071067811865476, 0.7071067811865475],
+          [6.123233995736766e-17, 1.0]
         ],
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -322,18 +125,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "euclidean",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          0.0,
-          1.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 0.0, 1.0]],
       "expected": {
         "kind": "scalar",
         "value": 4.123105625617661,
@@ -347,18 +139,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "cityblock",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          0.0,
-          1.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 0.0, 1.0]],
       "expected": {
         "kind": "scalar",
         "value": 7.0,
@@ -372,18 +153,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "chebyshev",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          0.0,
-          1.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 0.0, 1.0]],
       "expected": {
         "kind": "scalar",
         "value": 3.0,
@@ -397,18 +167,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "cosine",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          0.0,
-          1.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 0.0, 1.0]],
       "expected": {
         "kind": "scalar",
         "value": 0.5462573935134849,
@@ -422,18 +181,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "correlation",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          0.0,
-          1.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 0.0, 1.0]],
       "expected": {
         "kind": "scalar",
         "value": 1.7205766921228922,
@@ -447,30 +195,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdist",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            3.0,
-            0.0
-          ],
-          [
-            0.0,
-            4.0
-          ]
-        ],
-        "cityblock"
-      ],
+      "args": [[[0.0, 0.0], [3.0, 0.0], [0.0, 4.0]], "cityblock"],
       "expected": {
         "kind": "array",
-        "value": [
-          3.0,
-          4.0,
-          7.0
-        ],
+        "value": [3.0, 4.0, 7.0],
         "atol": 1e-10,
         "rtol": 1e-10,
         "note": "3-4-5 right triangle with Manhattan distances",
@@ -482,40 +210,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "cdist",
-      "args": [
-        [
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ]
-        ],
-        [
-          [
-            1.0,
-            1.0
-          ],
-          [
-            1.0,
-            -1.0
-          ]
-        ],
-        "cosine"
-      ],
+      "args": [[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]], "cosine"],
       "expected": {
         "kind": "matrix",
         "value": [
-          [
-            0.29289321881345254,
-            0.29289321881345254
-          ],
-          [
-            0.29289321881345254,
-            1.7071067811865475
-          ]
+          [0.29289321881345254, 0.29289321881345254],
+          [0.29289321881345254, 1.7071067811865475]
         ],
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -527,41 +227,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "cdist",
-      "args": [
-        [
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ]
-        ],
-        [
-          [
-            1.0,
-            1.0
-          ],
-          [
-            1.0,
-            -1.0
-          ]
-        ],
-        "chebyshev"
-      ],
+      "args": [[[1.0, 0.0], [0.0, 1.0]], [[1.0, 1.0], [1.0, -1.0]], "chebyshev"],
       "expected": {
         "kind": "matrix",
-        "value": [
-          [
-            1.0,
-            1.0
-          ],
-          [
-            1.0,
-            2.0
-          ]
-        ],
+        "value": [[1.0, 1.0], [1.0, 2.0]],
         "atol": 1e-10,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::cdist"
@@ -572,29 +241,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "convex_hull",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            2.0,
-            0.0
-          ],
-          [
-            1.0,
-            1.5
-          ]
-        ]
-      ],
+      "args": [[[0.0, 0.0], [2.0, 0.0], [1.0, 1.5]]],
       "expected": {
         "kind": "convex_hull",
-        "vertices": [
-          0,
-          1,
-          2
-        ],
+        "vertices": [0, 1, 2],
         "area": 1.5,
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -607,44 +257,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdist",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            2.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ],
-          [
-            1.0,
-            1.0
-          ]
-        ],
-        "euclidean"
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [0.0, 1.0], [1.0, 1.0]], "euclidean"],
       "expected": {
         "kind": "array",
         "value": [
-          1.0,
-          2.0,
-          1.0,
-          1.4142135623730951,
-          1.0,
-          1.4142135623730951,
-          1.0,
-          2.23606797749979,
-          1.4142135623730951,
-          1.0
+          1.0, 2.0, 1.0, 1.4142135623730951, 1.0, 1.4142135623730951, 1.0, 2.23606797749979,
+          1.4142135623730951, 1.0
         ],
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -657,36 +275,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "directed_hausdorff",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            2.0,
-            0.0
-          ]
-        ],
-        [
-          [
-            1.5,
-            0.0
-          ],
-          [
-            2.5,
-            0.0
-          ],
-          [
-            3.5,
-            0.0
-          ]
-        ]
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]], [[1.5, 0.0], [2.5, 0.0], [3.5, 0.0]]],
       "expected": {
         "kind": "scalar",
         "value": 1.5,
@@ -701,43 +290,14 @@
       "category": "differential",
       "mode": "Strict",
       "function": "squareform_to_matrix",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0,
-          4.0,
-          5.0,
-          6.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]],
       "expected": {
         "kind": "matrix",
         "value": [
-          [
-            0.0,
-            1.0,
-            2.0,
-            3.0
-          ],
-          [
-            1.0,
-            0.0,
-            4.0,
-            5.0
-          ],
-          [
-            2.0,
-            4.0,
-            0.0,
-            6.0
-          ],
-          [
-            3.0,
-            5.0,
-            6.0,
-            0.0
-          ]
+          [0.0, 1.0, 2.0, 3.0],
+          [1.0, 0.0, 4.0, 5.0],
+          [2.0, 4.0, 0.0, 6.0],
+          [3.0, 5.0, 6.0, 0.0]
         ],
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -751,78 +311,15 @@
       "mode": "Strict",
       "function": "halfspace_intersection",
       "args": [
-        [
-          [
-            -1.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            -1.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0,
-            -1.0
-          ],
-          [
-            0.0,
-            1.0,
-            -1.0
-          ]
-        ],
-        [
-          0.5,
-          0.5
-        ]
+        [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, -1.0], [0.0, 1.0, -1.0]],
+        [0.5, 0.5]
       ],
       "expected": {
         "kind": "halfspace_intersection",
         "value": {
-          "intersections": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              1.0,
-              0.0
-            ],
-            [
-              0.0,
-              1.0
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "dual_points": [
-            [
-              -2.0,
-              0.0
-            ],
-            [
-              0.0,
-              -2.0
-            ],
-            [
-              2.0,
-              0.0
-            ],
-            [
-              0.0,
-              2.0
-            ]
-          ],
-          "dual_vertices": [
-            0,
-            1,
-            2,
-            3
-          ],
+          "intersections": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+          "dual_points": [[-2.0, 0.0], [0.0, -2.0], [2.0, 0.0], [0.0, 2.0]],
+          "dual_vertices": [0, 1, 2, 3],
           "dual_area": 11.313708498984761,
           "dual_volume": 8.0,
           "is_bounded": true
@@ -838,59 +335,13 @@
       "mode": "Strict",
       "function": "halfspace_intersection",
       "args": [
-        [
-          [
-            -1.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            -1.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0,
-            -1.0
-          ],
-          [
-            0.0,
-            1.0,
-            -1.0
-          ],
-          [
-            1.0,
-            0.0,
-            -2.0
-          ]
-        ],
-        [
-          0.5,
-          0.5
-        ]
+        [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, -1.0], [0.0, 1.0, -1.0], [1.0, 0.0, -2.0]],
+        [0.5, 0.5]
       ],
       "expected": {
         "kind": "halfspace_intersection",
         "value": {
-          "intersections": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              1.0,
-              0.0
-            ],
-            [
-              0.0,
-              1.0
-            ],
-            [
-              1.0,
-              1.0
-            ]
-          ],
+          "intersections": [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
           "is_bounded": true
         },
         "atol": 1e-10,
@@ -903,42 +354,11 @@
       "category": "differential",
       "mode": "Strict",
       "function": "halfspace_intersection",
-      "args": [
-        [
-          [
-            -1.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            -1.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0,
-            -1.0
-          ]
-        ],
-        [
-          0.5,
-          0.5
-        ]
-      ],
+      "args": [[[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, -1.0]], [0.5, 0.5]],
       "expected": {
         "kind": "halfspace_intersection",
         "value": {
-          "finite_intersections": [
-            [
-              0.0,
-              0.0
-            ],
-            [
-              1.0,
-              0.0
-            ]
-          ],
+          "finite_intersections": [[0.0, 0.0], [1.0, 0.0]],
           "has_nonfinite_intersection": true,
           "is_bounded": false
         },
@@ -953,32 +373,8 @@
       "mode": "Strict",
       "function": "halfspace_intersection",
       "args": [
-        [
-          [
-            -1.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            -1.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0,
-            -1.0
-          ],
-          [
-            0.0,
-            1.0,
-            -1.0
-          ]
-        ],
-        [
-          0.0,
-          0.5
-        ]
+        [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [1.0, 0.0, -1.0], [0.0, 1.0, -1.0]],
+        [0.0, 0.5]
       ],
       "expected": {
         "kind": "error_contains",
@@ -993,68 +389,18 @@
       "function": "halfspace_intersection",
       "args": [
         [
-          [
-            -1.0,
-            0.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            -1.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            0.0,
-            -1.0,
-            0.0
-          ],
-          [
-            1.0,
-            1.0,
-            1.0,
-            -1.0
-          ]
+          [-1.0, 0.0, 0.0, 0.0],
+          [0.0, -1.0, 0.0, 0.0],
+          [0.0, 0.0, -1.0, 0.0],
+          [1.0, 1.0, 1.0, -1.0]
         ],
-        [
-          0.2,
-          0.2,
-          0.2
-        ]
+        [0.2, 0.2, 0.2]
       ],
       "expected": {
         "kind": "halfspace_intersection",
         "value": {
-          "intersections": [
-            [
-              0.0,
-              0.0,
-              0.0
-            ],
-            [
-              1.0,
-              0.0,
-              0.0
-            ],
-            [
-              0.0,
-              1.0,
-              0.0
-            ],
-            [
-              0.0,
-              0.0,
-              1.0
-            ]
-          ],
-          "dual_vertices": [
-            0,
-            1,
-            2,
-            3
-          ],
+          "intersections": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+          "dual_vertices": [0, 1, 2, 3],
           "is_bounded": true
         },
         "atol": 1e-10,
@@ -1069,41 +415,12 @@
       "function": "halfspace_intersection",
       "args": [
         [
-          [
-            -1.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            -1.0,
-            0.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            0.0,
-            -1.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            0.0,
-            0.0,
-            -1.0,
-            0.0
-          ]
+          [-1.0, 0.0, 0.0, 0.0, 0.0],
+          [0.0, -1.0, 0.0, 0.0, 0.0],
+          [0.0, 0.0, -1.0, 0.0, 0.0],
+          [0.0, 0.0, 0.0, -1.0, 0.0]
         ],
-        [
-          0.25,
-          0.25,
-          0.25,
-          0.25
-        ]
+        [0.25, 0.25, 0.25, 0.25]
       ],
       "expected": {
         "kind": "error_contains",
@@ -1116,20 +433,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "hamming",
-      "args": [
-        [
-          1.0,
-          0.0,
-          1.0,
-          1.0
-        ],
-        [
-          0.0,
-          0.0,
-          1.0,
-          0.0
-        ]
-      ],
+      "args": [[1.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
       "expected": {
         "kind": "scalar",
         "value": 0.5,
@@ -1143,20 +447,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "jaccard",
-      "args": [
-        [
-          1.0,
-          0.0,
-          1.0,
-          1.0
-        ],
-        [
-          0.0,
-          0.0,
-          1.0,
-          0.0
-        ]
-      ],
+      "args": [[1.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 0.0]],
       "expected": {
         "kind": "scalar",
         "value": 0.6666666666666666,
@@ -1170,18 +461,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "canberra",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          5.0,
-          6.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
       "expected": {
         "kind": "scalar",
         "value": 1.3619047619047617,
@@ -1195,18 +475,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "braycurtis",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          5.0,
-          6.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
       "expected": {
         "kind": "scalar",
         "value": 0.42857142857142855,
@@ -1220,18 +489,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "sqeuclidean",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          5.0,
-          6.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
       "expected": {
         "kind": "scalar",
         "value": 27.0,
@@ -1245,19 +503,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "minkowski",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          5.0,
-          6.0
-        ],
-        1.0
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 1.0],
       "expected": {
         "kind": "scalar",
         "value": 9.0,
@@ -1271,19 +517,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "minkowski",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          5.0,
-          6.0
-        ],
-        2.0
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 2.0],
       "expected": {
         "kind": "scalar",
         "value": 5.196152422706632,
@@ -1297,19 +531,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "minkowski",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          5.0,
-          6.0
-        ],
-        3.0
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 3.0],
       "expected": {
         "kind": "scalar",
         "value": 4.3267487109222245,
@@ -1323,23 +545,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "seuclidean",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          5.0,
-          6.0
-        ],
-        [
-          1.0,
-          2.0,
-          0.5
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [1.0, 2.0, 0.5]],
       "expected": {
         "kind": "scalar",
         "value": 5.612486080160912,
@@ -1354,33 +560,9 @@
       "mode": "Strict",
       "function": "mahalanobis",
       "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          5.0,
-          6.0
-        ],
-        [
-          [
-            2.0,
-            0.0,
-            0.0
-          ],
-          [
-            0.0,
-            0.5,
-            0.0
-          ],
-          [
-            0.0,
-            0.0,
-            1.0
-          ]
-        ]
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 6.0],
+        [[2.0, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 1.0]]
       ],
       "expected": {
         "kind": "scalar",
@@ -1395,24 +577,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "wminkowski",
-      "args": [
-        [
-          1.0,
-          2.0,
-          3.0
-        ],
-        [
-          4.0,
-          5.0,
-          6.0
-        ],
-        2.0,
-        [
-          0.5,
-          1.0,
-          2.0
-        ]
-      ],
+      "args": [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], 2.0, [0.5, 1.0, 2.0]],
       "expected": {
         "kind": "scalar",
         "value": 6.87386354243376,
@@ -1426,37 +591,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdist",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ],
-          [
-            1.0,
-            1.0
-          ]
-        ],
-        "hamming"
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], "hamming"],
       "expected": {
         "kind": "array",
-        "value": [
-          0.5,
-          0.5,
-          1.0,
-          1.0,
-          0.5,
-          0.5
-        ],
+        "value": [0.5, 0.5, 1.0, 1.0, 0.5, 0.5],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::pdist::hamming"
@@ -1467,37 +605,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdist",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ],
-          [
-            1.0,
-            1.0
-          ]
-        ],
-        "canberra"
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], "canberra"],
       "expected": {
         "kind": "array",
-        "value": [
-          1.0,
-          1.0,
-          2.0,
-          2.0,
-          1.0,
-          1.0
-        ],
+        "value": [1.0, 1.0, 2.0, 2.0, 1.0, 1.0],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::pdist::canberra"
@@ -1508,37 +619,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdist",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ],
-          [
-            1.0,
-            1.0
-          ]
-        ],
-        "sqeuclidean"
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], "sqeuclidean"],
       "expected": {
         "kind": "array",
-        "value": [
-          1.0,
-          1.0,
-          2.0,
-          2.0,
-          1.0,
-          1.0
-        ],
+        "value": [1.0, 1.0, 2.0, 2.0, 1.0, 1.0],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::pdist::sqeuclidean"
@@ -1549,41 +633,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "cdist",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            1.0
-          ]
-        ],
-        [
-          [
-            1.0,
-            0.0
-          ],
-          [
-            0.0,
-            1.0
-          ]
-        ],
-        "braycurtis"
-      ],
+      "args": [[[0.0, 0.0], [1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]], "braycurtis"],
       "expected": {
         "kind": "matrix",
-        "value": [
-          [
-            1.0,
-            1.0
-          ],
-          [
-            0.3333333333333333,
-            0.3333333333333333
-          ]
-        ],
+        "value": [[1.0, 1.0], [0.3333333333333333, 0.3333333333333333]],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::cdist::braycurtis"
@@ -1594,45 +647,11 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kdtree_query_k",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.5,
-            0.2
-          ],
-          [
-            0.3,
-            1.0
-          ],
-          [
-            2.0,
-            2.1
-          ],
-          [
-            -0.5,
-            1.7
-          ]
-        ],
-        [
-          0.5,
-          0.5
-        ],
-        2
-      ],
+      "args": [[[0.0, 0.0], [1.5, 0.2], [0.3, 1.0], [2.0, 2.1], [-0.5, 1.7]], [0.5, 0.5], 2],
       "expected": {
         "kind": "kdtree_query_k_result",
-        "indices": [
-          2,
-          0
-        ],
-        "distances": [
-          0.5385164807134505,
-          0.7071067811865476
-        ],
+        "indices": [2, 0],
+        "distances": [0.5385164807134505, 0.7071067811865476],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::KDTree::query_k"
@@ -1643,47 +662,11 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kdtree_query_k",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.5,
-            0.2
-          ],
-          [
-            0.3,
-            1.0
-          ],
-          [
-            2.0,
-            2.1
-          ],
-          [
-            -0.5,
-            1.7
-          ]
-        ],
-        [
-          0.5,
-          0.5
-        ],
-        3
-      ],
+      "args": [[[0.0, 0.0], [1.5, 0.2], [0.3, 1.0], [2.0, 2.1], [-0.5, 1.7]], [0.5, 0.5], 3],
       "expected": {
         "kind": "kdtree_query_k_result",
-        "indices": [
-          2,
-          0,
-          1
-        ],
-        "distances": [
-          0.5385164807134505,
-          0.7071067811865476,
-          1.044030650891055
-        ],
+        "indices": [2, 0, 1],
+        "distances": [0.5385164807134505, 0.7071067811865476, 1.044030650891055],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::KDTree::query_k"
@@ -1694,48 +677,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kdtree_query_k",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.5,
-            0.2
-          ],
-          [
-            0.3,
-            1.0
-          ],
-          [
-            2.0,
-            2.1
-          ],
-          [
-            -0.5,
-            1.7
-          ]
-        ],
-        [
-          0.5,
-          0.5
-        ],
-        4
-      ],
+      "args": [[[0.0, 0.0], [1.5, 0.2], [0.3, 1.0], [2.0, 2.1], [-0.5, 1.7]], [0.5, 0.5], 4],
       "expected": {
         "kind": "kdtree_query_k_result",
-        "indices": [
-          2,
-          0,
-          1,
-          4
-        ],
+        "indices": [2, 0, 1, 4],
         "distances": [
-          0.5385164807134505,
-          0.7071067811865476,
-          1.044030650891055,
-          1.5620499351813308
+          0.5385164807134505, 0.7071067811865476, 1.044030650891055, 1.5620499351813308
         ],
         "atol": 1e-12,
         "rtol": 1e-10,
@@ -1747,47 +694,11 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kdtree_query_k",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.5,
-            0.2
-          ],
-          [
-            0.3,
-            1.0
-          ],
-          [
-            2.0,
-            2.1
-          ],
-          [
-            -0.5,
-            1.7
-          ]
-        ],
-        [
-          1.0,
-          1.0
-        ],
-        3
-      ],
+      "args": [[[0.0, 0.0], [1.5, 0.2], [0.3, 1.0], [2.0, 2.1], [-0.5, 1.7]], [1.0, 1.0], 3],
       "expected": {
         "kind": "kdtree_query_k_result",
-        "indices": [
-          2,
-          1,
-          0
-        ],
-        "distances": [
-          0.7,
-          0.9433981132056605,
-          1.4142135623730951
-        ],
+        "indices": [2, 1, 0],
+        "distances": [0.7, 0.9433981132056605, 1.4142135623730951],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::KDTree::query_k"
@@ -1798,42 +709,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kdtree_query_ball_point",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.5,
-            0.2
-          ],
-          [
-            0.3,
-            1.0
-          ],
-          [
-            2.0,
-            2.1
-          ],
-          [
-            -0.5,
-            1.7
-          ]
-        ],
-        [
-          0.5,
-          0.5
-        ],
-        1.1
-      ],
+      "args": [[[0.0, 0.0], [1.5, 0.2], [0.3, 1.0], [2.0, 2.1], [-0.5, 1.7]], [0.5, 0.5], 1.1],
       "expected": {
         "kind": "kdtree_ball_point_result",
-        "indices": [
-          0,
-          1,
-          2
-        ],
+        "indices": [0, 1, 2],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::KDTree::query_ball_point"
@@ -1844,43 +723,10 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kdtree_query_ball_point",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.5,
-            0.2
-          ],
-          [
-            0.3,
-            1.0
-          ],
-          [
-            2.0,
-            2.1
-          ],
-          [
-            -0.5,
-            1.7
-          ]
-        ],
-        [
-          1.0,
-          1.0
-        ],
-        1.5
-      ],
+      "args": [[[0.0, 0.0], [1.5, 0.2], [0.3, 1.0], [2.0, 2.1], [-0.5, 1.7]], [1.0, 1.0], 1.5],
       "expected": {
         "kind": "kdtree_ball_point_result",
-        "indices": [
-          0,
-          1,
-          2,
-          3
-        ],
+        "indices": [0, 1, 2, 3],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::KDTree::query_ball_point"
@@ -1891,40 +737,12 @@
       "category": "voronoi",
       "mode": "Strict",
       "function": "voronoi",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            1.0,
-            1.0
-          ],
-          [
-            0.0,
-            1.0
-          ]
-        ]
-      ],
+      "args": [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]],
       "expected": {
         "kind": "voronoi_result",
         "vertex_count": 2,
         "ridge_count": 5,
-        "sorted_vertices": [
-          [
-            0.5,
-            0.5
-          ],
-          [
-            0.5,
-            0.5
-          ]
-        ],
+        "sorted_vertices": [[0.5, 0.5], [0.5, 0.5]],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::Voronoi"
@@ -1935,52 +753,12 @@
       "category": "voronoi",
       "mode": "Strict",
       "function": "voronoi",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            2.0,
-            0.0
-          ],
-          [
-            2.0,
-            2.0
-          ],
-          [
-            0.0,
-            2.0
-          ],
-          [
-            1.0,
-            1.0
-          ]
-        ]
-      ],
+      "args": [[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0], [1.0, 1.0]]],
       "expected": {
         "kind": "voronoi_result",
         "vertex_count": 4,
         "ridge_count": 8,
-        "sorted_vertices": [
-          [
-            0.0,
-            1.0
-          ],
-          [
-            1.0,
-            0.0
-          ],
-          [
-            1.0,
-            2.0
-          ],
-          [
-            2.0,
-            1.0
-          ]
-        ],
+        "sorted_vertices": [[0.0, 1.0], [1.0, 0.0], [1.0, 2.0], [2.0, 1.0]],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::Voronoi"
@@ -1991,32 +769,12 @@
       "category": "voronoi",
       "mode": "Strict",
       "function": "voronoi",
-      "args": [
-        [
-          [
-            0.0,
-            0.0
-          ],
-          [
-            4.0,
-            0.0
-          ],
-          [
-            2.0,
-            3.0
-          ]
-        ]
-      ],
+      "args": [[[0.0, 0.0], [4.0, 0.0], [2.0, 3.0]]],
       "expected": {
         "kind": "voronoi_result",
         "vertex_count": 1,
         "ridge_count": 3,
-        "sorted_vertices": [
-          [
-            2.0,
-            0.8333333333333335
-          ]
-        ],
+        "sorted_vertices": [[2.0, 0.8333333333333335]],
         "atol": 1e-12,
         "rtol": 1e-10,
         "contract_ref": "fsci_spatial::Voronoi"
@@ -2027,36 +785,10 @@
       "category": "kdtree",
       "mode": "Strict",
       "function": "kdtree_query_pairs",
-      "args": [
-        [
-          [
-            0.0
-          ],
-          [
-            1.0
-          ],
-          [
-            2.0
-          ],
-          [
-            4.0
-          ],
-          [
-            5.0
-          ]
-        ],
-        1.5
-      ],
+      "args": [[[0.0], [1.0], [2.0], [4.0], [5.0]], 1.5],
       "expected": {
         "kind": "kdtree_ball_point_result",
-        "indices": [
-          0,
-          1,
-          1,
-          2,
-          3,
-          4
-        ],
+        "indices": [0, 1, 1, 2, 3, 4],
         "atol": 0.0,
         "rtol": 0.0,
         "contract_ref": "fsci_spatial::cKDTree::query_pairs"
@@ -2067,26 +799,7 @@
       "category": "kdtree",
       "mode": "Strict",
       "function": "kdtree_query_pairs",
-      "args": [
-        [
-          [
-            0.0
-          ],
-          [
-            1.0
-          ],
-          [
-            2.0
-          ],
-          [
-            4.0
-          ],
-          [
-            5.0
-          ]
-        ],
-        0.5
-      ],
+      "args": [[[0.0], [1.0], [2.0], [4.0], [5.0]], 0.5],
       "expected": {
         "kind": "kdtree_ball_point_result",
         "indices": [],
@@ -2100,34 +813,7 @@
       "category": "kdtree",
       "mode": "Strict",
       "function": "kdtree_count_neighbors",
-      "args": [
-        [
-          [
-            0.0
-          ],
-          [
-            1.0
-          ],
-          [
-            2.0
-          ],
-          [
-            3.0
-          ]
-        ],
-        [
-          [
-            0.5
-          ],
-          [
-            1.5
-          ],
-          [
-            4.0
-          ]
-        ],
-        1.0
-      ],
+      "args": [[[0.0], [1.0], [2.0], [3.0]], [[0.5], [1.5], [4.0]], 1.0],
       "expected": {
         "kind": "scalar",
         "value": 5.0,
@@ -2141,34 +827,7 @@
       "category": "kdtree",
       "mode": "Strict",
       "function": "kdtree_count_neighbors",
-      "args": [
-        [
-          [
-            0.0
-          ],
-          [
-            1.0
-          ],
-          [
-            2.0
-          ],
-          [
-            3.0
-          ]
-        ],
-        [
-          [
-            0.5
-          ],
-          [
-            1.5
-          ],
-          [
-            4.0
-          ]
-        ],
-        2.0
-      ],
+      "args": [[[0.0], [1.0], [2.0], [3.0]], [[0.5], [1.5], [4.0]], 2.0],
       "expected": {
         "kind": "scalar",
         "value": 9.0,
@@ -2182,51 +841,10 @@
       "category": "kdtree",
       "mode": "Strict",
       "function": "kdtree_query_ball_tree",
-      "args": [
-        [
-          [
-            0.0
-          ],
-          [
-            1.0
-          ],
-          [
-            2.0
-          ],
-          [
-            3.0
-          ]
-        ],
-        [
-          [
-            0.5
-          ],
-          [
-            1.5
-          ],
-          [
-            4.0
-          ]
-        ],
-        1.0
-      ],
+      "args": [[[0.0], [1.0], [2.0], [3.0]], [[0.5], [1.5], [4.0]], 1.0],
       "expected": {
         "kind": "kdtree_ball_tree_result",
-        "neighbors": [
-          [
-            0
-          ],
-          [
-            0,
-            1
-          ],
-          [
-            1
-          ],
-          [
-            2
-          ]
-        ],
+        "neighbors": [[0], [0, 1], [1], [2]],
         "atol": 0.0,
         "rtol": 0.0,
         "contract_ref": "fsci_spatial::cKDTree::query_ball_tree"
@@ -2237,55 +855,10 @@
       "category": "kdtree",
       "mode": "Strict",
       "function": "kdtree_query_ball_tree",
-      "args": [
-        [
-          [
-            0.0
-          ],
-          [
-            1.0
-          ],
-          [
-            2.0
-          ],
-          [
-            3.0
-          ]
-        ],
-        [
-          [
-            0.5
-          ],
-          [
-            1.5
-          ],
-          [
-            4.0
-          ]
-        ],
-        2.0
-      ],
+      "args": [[[0.0], [1.0], [2.0], [3.0]], [[0.5], [1.5], [4.0]], 2.0],
       "expected": {
         "kind": "kdtree_ball_tree_result",
-        "neighbors": [
-          [
-            0,
-            1
-          ],
-          [
-            0,
-            1
-          ],
-          [
-            0,
-            1,
-            2
-          ],
-          [
-            1,
-            2
-          ]
-        ],
+        "neighbors": [[0, 1], [0, 1], [0, 1, 2], [1, 2]],
         "atol": 0.0,
         "rtol": 0.0,
         "contract_ref": "fsci_spatial::cKDTree::query_ball_tree"
@@ -2296,42 +869,10 @@
       "category": "kdtree",
       "mode": "Strict",
       "function": "kdtree_query_ball_tree",
-      "args": [
-        [
-          [
-            0.0
-          ],
-          [
-            1.0
-          ],
-          [
-            2.0
-          ],
-          [
-            3.0
-          ]
-        ],
-        [
-          [
-            0.5
-          ],
-          [
-            1.5
-          ],
-          [
-            4.0
-          ]
-        ],
-        0.1
-      ],
+      "args": [[[0.0], [1.0], [2.0], [3.0]], [[0.5], [1.5], [4.0]], 0.1],
       "expected": {
         "kind": "kdtree_ball_tree_result",
-        "neighbors": [
-          [],
-          [],
-          [],
-          []
-        ],
+        "neighbors": [[], [], [], []],
         "atol": 0.0,
         "rtol": 0.0,
         "contract_ref": "fsci_spatial::cKDTree::query_ball_tree"

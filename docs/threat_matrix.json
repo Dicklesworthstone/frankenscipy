@@ -9,7 +9,15 @@
       {
         "version": "1.14.0",
         "description": "sparse array interface (csr_array, csc_array, etc.) became the recommended API, deprecating sparse matrix classes",
-        "affected_functions": ["csr_matrix", "csc_matrix", "coo_matrix", "bsr_matrix", "lil_matrix", "dok_matrix", "dia_matrix"]
+        "affected_functions": [
+          "csr_matrix",
+          "csc_matrix",
+          "coo_matrix",
+          "bsr_matrix",
+          "lil_matrix",
+          "dok_matrix",
+          "dia_matrix"
+        ]
       },
       {
         "version": "1.14.0",

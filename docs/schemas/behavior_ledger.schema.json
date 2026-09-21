@@ -19,7 +19,28 @@
     },
     "domain": {
       "type": "string",
-      "enum": ["integrate", "linalg", "optimize", "sparse", "fft", "special", "stats", "signal", "spatial", "interpolate", "ndimage", "io", "cluster", "constants", "misc", "odr", "datasets", "differentiate", "arrayapi", "conformance"],
+      "enum": [
+        "integrate",
+        "linalg",
+        "optimize",
+        "sparse",
+        "fft",
+        "special",
+        "stats",
+        "signal",
+        "spatial",
+        "interpolate",
+        "ndimage",
+        "io",
+        "cluster",
+        "constants",
+        "misc",
+        "odr",
+        "datasets",
+        "differentiate",
+        "arrayapi",
+        "conformance"
+      ],
       "description": "SciPy domain family this ledger covers. Full parity — every SciPy module is represented."
     },
     "generated_at": {
@@ -38,7 +59,13 @@
   "$defs": {
     "BehaviorEntry": {
       "type": "object",
-      "required": ["scipy_module", "key_functions", "behavior_summary", "rust_strategy", "risk_level"],
+      "required": [
+        "scipy_module",
+        "key_functions",
+        "behavior_summary",
+        "rust_strategy",
+        "risk_level"
+      ],
       "additionalProperties": false,
       "properties": {
         "scipy_module": {

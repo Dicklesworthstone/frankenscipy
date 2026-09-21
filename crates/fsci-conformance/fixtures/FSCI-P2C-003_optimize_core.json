@@ -9,19 +9,13 @@
       "mode": "Strict",
       "method": "Bfgs",
       "objective": "rosenbrock2",
-      "x0": [
-        1.2,
-        1.2
-      ],
-      "tol": 1E-8,
+      "x0": [1.2, 1.2],
+      "tol": 1e-8,
       "maxiter": 300,
       "maxfev": 10000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          1.0
-        ],
+        "x": [1.0, 1.0],
         "fun": 0.0,
         "atol": 0.005,
         "rtol": 0.005,
@@ -36,19 +30,13 @@
       "mode": "Strict",
       "method": "ConjugateGradient",
       "objective": "rosenbrock2",
-      "x0": [
-        1.2,
-        1.2
-      ],
-      "tol": 1E-8,
+      "x0": [1.2, 1.2],
+      "tol": 1e-8,
       "maxiter": 600,
       "maxfev": 20000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          1.0
-        ],
+        "x": [1.0, 1.0],
         "fun": 0.0,
         "atol": 0.01,
         "rtol": 0.01,
@@ -63,19 +51,13 @@
       "mode": "Strict",
       "method": "Powell",
       "objective": "rosenbrock2",
-      "x0": [
-        1.2,
-        1.2
-      ],
-      "tol": 1E-8,
+      "x0": [1.2, 1.2],
+      "tol": 1e-8,
       "maxiter": 300,
       "maxfev": 20000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          1.0
-        ],
+        "x": [1.0, 1.0],
         "fun": 0.0,
         "atol": 0.02,
         "rtol": 0.02,
@@ -90,19 +72,13 @@
       "mode": "Strict",
       "method": "Bfgs",
       "objective": "ackley2",
-      "x0": [
-        0.1,
-        -0.1
-      ],
-      "tol": 1E-8,
+      "x0": [0.1, -0.1],
+      "tol": 1e-8,
       "maxiter": 500,
       "maxfev": 20000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.1,
         "rtol": 0.1,
@@ -117,19 +93,13 @@
       "mode": "Strict",
       "method": "ConjugateGradient",
       "objective": "ackley2",
-      "x0": [
-        0.1,
-        -0.1
-      ],
-      "tol": 1E-8,
+      "x0": [0.1, -0.1],
+      "tol": 1e-8,
       "maxiter": 600,
       "maxfev": 25000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.12,
         "rtol": 0.12,
@@ -144,19 +114,13 @@
       "mode": "Strict",
       "method": "Powell",
       "objective": "ackley2",
-      "x0": [
-        0.1,
-        -0.1
-      ],
-      "tol": 1E-8,
+      "x0": [0.1, -0.1],
+      "tol": 1e-8,
       "maxiter": 300,
       "maxfev": 25000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.12,
         "rtol": 0.12,
@@ -171,19 +135,13 @@
       "mode": "Strict",
       "method": "Bfgs",
       "objective": "rastrigin2",
-      "x0": [
-        0.1,
-        -0.1
-      ],
-      "tol": 1E-8,
+      "x0": [0.1, -0.1],
+      "tol": 1e-8,
       "maxiter": 600,
       "maxfev": 25000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          -0.9949586376319983,
-          0.9949586376319983
-        ],
+        "x": [-0.9949586376319983, 0.9949586376319983],
         "fun": 1.9899181141865796,
         "atol": 0.05,
         "rtol": 0.05,
@@ -198,19 +156,13 @@
       "mode": "Strict",
       "method": "ConjugateGradient",
       "objective": "rastrigin2",
-      "x0": [
-        0.1,
-        -0.1
-      ],
-      "tol": 1E-8,
+      "x0": [0.1, -0.1],
+      "tol": 1e-8,
       "maxiter": 700,
       "maxfev": 30000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.15,
         "rtol": 0.15,
@@ -225,19 +177,13 @@
       "mode": "Strict",
       "method": "Powell",
       "objective": "rastrigin2",
-      "x0": [
-        0.1,
-        -0.1
-      ],
-      "tol": 1E-8,
+      "x0": [0.1, -0.1],
+      "tol": 1e-8,
       "maxiter": 300,
       "maxfev": 30000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.15,
         "rtol": 0.15,
@@ -252,19 +198,13 @@
       "mode": "Strict",
       "method": "TrustExact",
       "objective": "shifted_quadratic",
-      "x0": [
-        8.0,
-        -8.0
-      ],
-      "tol": 1E-10,
+      "x0": [8.0, -8.0],
+      "tol": 1e-10,
       "maxiter": 100,
       "maxfev": 20000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          -2.0
-        ],
+        "x": [1.0, -2.0],
         "fun": 0.0,
         "atol": 0.000001,
         "rtol": 0.000001,
@@ -279,19 +219,13 @@
       "mode": "Strict",
       "method": "TrustExact",
       "objective": "translated_quadratic",
-      "x0": [
-        -6.0,
-        4.0
-      ],
-      "tol": 1E-10,
+      "x0": [-6.0, 4.0],
+      "tol": 1e-10,
       "maxiter": 100,
       "maxfev": 20000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          4.0,
-          -3.0
-        ],
+        "x": [4.0, -3.0],
         "fun": 0.0,
         "atol": 0.000001,
         "rtol": 0.000001,
@@ -306,23 +240,17 @@
       "mode": "Strict",
       "method": "NewtonCg",
       "objective": "scaled_quadratic",
-      "x0": [
-        8.0,
-        -8.0
-      ],
+      "x0": [8.0, -8.0],
       "hessp": true,
-      "tol": 1E-10,
+      "tol": 1e-10,
       "maxiter": 50,
       "maxfev": 100,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          -2.0
-        ],
+        "x": [1.0, -2.0],
         "fun": 0.0,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_success": true,
         "contract_ref": "fsci_opt::newton_cg:hessp"
       }
@@ -333,26 +261,14 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "rosenbrock2",
-      "bounds": [
-        [
-          -2.0,
-          2.0
-        ],
-        [
-          -1.0,
-          3.0
-        ]
-      ],
+      "bounds": [[-2.0, 2.0], [-1.0, 3.0]],
       "seed": 42,
-      "tol": 1E-7,
+      "tol": 1e-7,
       "maxiter": 80,
       "popsize": 8,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          1.0
-        ],
+        "x": [1.0, 1.0],
         "fun": 0.0,
         "atol": 0.25,
         "rtol": 0.25,
@@ -366,24 +282,12 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "rastrigin2",
-      "bounds": [
-        [
-          -5.12,
-          5.12
-        ],
-        [
-          -5.12,
-          5.12
-        ]
-      ],
+      "bounds": [[-5.12, 5.12], [-5.12, 5.12]],
       "seed": 42,
       "maxiter": 80,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.000001,
         "rtol": 0.000001,
@@ -397,19 +301,13 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "himmelblau2",
-      "x0": [
-        -3.0,
-        -3.0
-      ],
+      "x0": [-3.0, -3.0],
       "seed": 42,
       "maxiter": 60,
-      "tol": 1E-8,
+      "tol": 1e-8,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          -3.779310253377747,
-          -3.283185991286169
-        ],
+        "x": [-3.779310253377747, -3.283185991286169],
         "fun": 0.0,
         "atol": 0.01,
         "rtol": 0.01,
@@ -423,26 +321,14 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "ackley2",
-      "bounds": [
-        [
-          -5.0,
-          5.0
-        ],
-        [
-          -5.0,
-          5.0
-        ]
-      ],
+      "bounds": [[-5.0, 5.0], [-5.0, 5.0]],
       "seed": 42,
-      "tol": 1E-7,
+      "tol": 1e-7,
       "maxiter": 80,
       "popsize": 8,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.2,
         "rtol": 0.2,
@@ -456,22 +342,15 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "sin1d",
-      "ranges": [
-        [
-          4.0,
-          5.0
-        ]
-      ],
+      "ranges": [[4.0, 5.0]],
       "ns": 41,
       "seed": 42,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          4.7
-        ],
+        "x": [4.7],
         "fun": -0.9999232575641008,
-        "atol": 1E-12,
-        "rtol": 1E-12,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "require_success": true,
         "contract_ref": "fsci_opt::brute"
       }
@@ -482,26 +361,14 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "sphere2",
-      "bounds": [
-        [
-          -3.0,
-          3.0
-        ],
-        [
-          -3.0,
-          3.0
-        ]
-      ],
+      "bounds": [[-3.0, 3.0], [-3.0, 3.0]],
       "seed": 7,
-      "tol": 1E-7,
+      "tol": 1e-7,
       "maxiter": 60,
       "popsize": 8,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.25,
         "rtol": 0.25,
@@ -515,26 +382,14 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "shifted_quadratic",
-      "bounds": [
-        [
-          -2.0,
-          3.0
-        ],
-        [
-          -4.0,
-          1.0
-        ]
-      ],
+      "bounds": [[-2.0, 3.0], [-4.0, 1.0]],
       "seed": 123,
-      "tol": 1E-7,
+      "tol": 1e-7,
       "maxiter": 60,
       "popsize": 8,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          -2.0
-        ],
+        "x": [1.0, -2.0],
         "fun": 0.0,
         "atol": 0.25,
         "rtol": 0.25,
@@ -548,19 +403,13 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "sphere2",
-      "x0": [
-        4.0,
-        -3.0
-      ],
+      "x0": [4.0, -3.0],
       "seed": 7,
       "maxiter": 40,
-      "tol": 1E-8,
+      "tol": 1e-8,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.001,
         "rtol": 0.001,
@@ -574,27 +423,15 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "sphere2",
-      "ranges": [
-        [
-          -1.0,
-          1.0
-        ],
-        [
-          -1.0,
-          1.0
-        ]
-      ],
+      "ranges": [[-1.0, 1.0], [-1.0, 1.0]],
       "ns": 21,
       "seed": 42,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
-        "atol": 1E-12,
-        "rtol": 1E-12,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "require_success": true,
         "contract_ref": "fsci_opt::brute"
       }
@@ -605,27 +442,15 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "shifted_quadratic",
-      "ranges": [
-        [
-          0.0,
-          2.0
-        ],
-        [
-          -3.0,
-          -1.0
-        ]
-      ],
+      "ranges": [[0.0, 2.0], [-3.0, -1.0]],
       "ns": 21,
       "seed": 42,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          -2.0
-        ],
+        "x": [1.0, -2.0],
         "fun": 0.0,
-        "atol": 1E-12,
-        "rtol": 1E-12,
+        "atol": 1e-12,
+        "rtol": 1e-12,
         "require_success": true,
         "contract_ref": "fsci_opt::brute"
       }
@@ -637,18 +462,15 @@
       "mode": "Strict",
       "method": "Brentq",
       "objective": "cubic_minus_two",
-      "bracket": [
-        0.0,
-        2.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 2.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 1.2599210498948732,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::root_scalar"
       }
@@ -660,18 +482,15 @@
       "mode": "Strict",
       "method": "Brenth",
       "objective": "cubic_minus_two",
-      "bracket": [
-        0.0,
-        2.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 2.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 1.2599210498948732,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::root_scalar"
       }
@@ -683,12 +502,9 @@
       "mode": "Strict",
       "method": "Bisect",
       "objective": "cubic_minus_two",
-      "bracket": [
-        0.0,
-        2.0
-      ],
-      "xtol": 1E-10,
-      "rtol": 1E-10,
+      "bracket": [0.0, 2.0],
+      "xtol": 1e-10,
+      "rtol": 1e-10,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
@@ -706,12 +522,9 @@
       "mode": "Strict",
       "method": "Ridder",
       "objective": "cubic_minus_two",
-      "bracket": [
-        0.0,
-        2.0
-      ],
-      "xtol": 1E-10,
-      "rtol": 1E-10,
+      "bracket": [0.0, 2.0],
+      "xtol": 1e-10,
+      "rtol": 1e-10,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
@@ -729,18 +542,15 @@
       "mode": "Strict",
       "method": "Brentq",
       "objective": "cos_minus_x",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 0.7390851332151607,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::root_scalar"
       }
@@ -752,18 +562,15 @@
       "mode": "Strict",
       "method": "Brentq",
       "objective": "sin_minus_half",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 0.5235987755982989,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::root_scalar"
       }
@@ -775,19 +582,13 @@
       "mode": "Strict",
       "method": "Bfgs",
       "objective": "scaled_quadratic",
-      "x0": [
-        4.0,
-        -7.0
-      ],
-      "tol": 1E-9,
+      "x0": [4.0, -7.0],
+      "tol": 1e-9,
       "maxiter": 300,
       "maxfev": 10000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          -2.0
-        ],
+        "x": [1.0, -2.0],
         "fun": 0.0,
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -802,19 +603,13 @@
       "mode": "Strict",
       "method": "Powell",
       "objective": "scaled_quadratic",
-      "x0": [
-        4.0,
-        -7.0
-      ],
-      "tol": 1E-9,
+      "x0": [4.0, -7.0],
+      "tol": 1e-9,
       "maxiter": 300,
       "maxfev": 20000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          -2.0
-        ],
+        "x": [1.0, -2.0],
         "fun": 0.0,
         "atol": 0.001,
         "rtol": 0.001,
@@ -829,19 +624,13 @@
       "mode": "Strict",
       "method": "Bfgs",
       "objective": "translated_quadratic",
-      "x0": [
-        0.0,
-        0.0
-      ],
-      "tol": 1E-9,
+      "x0": [0.0, 0.0],
+      "tol": 1e-9,
       "maxiter": 300,
       "maxfev": 10000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          4.0,
-          -3.0
-        ],
+        "x": [4.0, -3.0],
         "fun": 0.0,
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -856,19 +645,13 @@
       "mode": "Strict",
       "method": "ConjugateGradient",
       "objective": "translated_quadratic",
-      "x0": [
-        0.0,
-        0.0
-      ],
-      "tol": 1E-9,
+      "x0": [0.0, 0.0],
+      "tol": 1e-9,
       "maxiter": 400,
       "maxfev": 15000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          4.0,
-          -3.0
-        ],
+        "x": [4.0, -3.0],
         "fun": 0.0,
         "atol": 0.001,
         "rtol": 0.001,
@@ -883,19 +666,13 @@
       "mode": "Strict",
       "method": "Bfgs",
       "objective": "rotated_quadratic",
-      "x0": [
-        4.0,
-        -7.0
-      ],
-      "tol": 1E-9,
+      "x0": [4.0, -7.0],
+      "tol": 1e-9,
       "maxiter": 300,
       "maxfev": 10000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          -2.0
-        ],
+        "x": [1.0, -2.0],
         "fun": 0.0,
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -910,19 +687,13 @@
       "mode": "Strict",
       "method": "Powell",
       "objective": "rotated_quadratic",
-      "x0": [
-        4.0,
-        -7.0
-      ],
-      "tol": 1E-9,
+      "x0": [4.0, -7.0],
+      "tol": 1e-9,
       "maxiter": 300,
       "maxfev": 20000,
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          -2.0
-        ],
+        "x": [1.0, -2.0],
         "fun": 0.0,
         "atol": 0.001,
         "rtol": 0.001,
@@ -950,10 +721,7 @@
       "mode": "Strict",
       "method": "Bisect",
       "objective": "linear_shift03",
-      "bracket": [
-        0.0,
-        1.0
-      ],
+      "bracket": [0.0, 1.0],
       "xtol": 0.0,
       "expected": {
         "kind": "error",
@@ -967,10 +735,7 @@
       "mode": "Hardened",
       "method": "Bfgs",
       "objective": "nan_branch",
-      "x0": [
-        0.0,
-        0.0
-      ],
+      "x0": [0.0, 0.0],
       "expected": {
         "kind": "minimize_status",
         "status": "NanEncountered",
@@ -984,10 +749,7 @@
       "mode": "Strict",
       "method": "Bfgs",
       "objective": "flat_quartic",
-      "x0": [
-        1.0,
-        -1.0
-      ],
+      "x0": [1.0, -1.0],
       "maxiter": 50,
       "maxfev": 2,
       "expected": {
@@ -1003,10 +765,7 @@
       "mode": "Strict",
       "method": "Brentq",
       "objective": "linear_shift03",
-      "bracket": [
-        0.4,
-        0.9
-      ],
+      "bracket": [0.4, 0.9],
       "expected": {
         "kind": "error",
         "error": "bracketing methods require f(a) and f(b) to have opposite signs"
@@ -1019,10 +778,7 @@
       "mode": "Strict",
       "method": "Bisect",
       "objective": "nan_branch",
-      "bracket": [
-        0.1,
-        0.9
-      ],
+      "bracket": [0.1, 0.9],
       "expected": {
         "kind": "error",
         "error": "root function returned non-finite value"
@@ -1035,10 +791,7 @@
       "mode": "Hardened",
       "method": "Bisect",
       "objective": "nan_branch",
-      "bracket": [
-        0.1,
-        0.9
-      ],
+      "bracket": [0.1, 0.9],
       "expected": {
         "kind": "error",
         "error": "hardened mode rejects non-finite function values"
@@ -1051,12 +804,9 @@
       "mode": "Strict",
       "method": "Bisect",
       "objective": "linear_shift03",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-18,
-      "rtol": 1E-18,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-18,
+      "rtol": 1e-18,
       "maxiter": 1,
       "expected": {
         "kind": "root_status",
@@ -1071,18 +821,15 @@
       "mode": "Strict",
       "method": "Toms748",
       "objective": "cubic_minus_two",
-      "bracket": [
-        0.0,
-        2.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 2.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 1.2599210498948732,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::toms748"
       }
@@ -1094,18 +841,15 @@
       "mode": "Strict",
       "method": "Toms748",
       "objective": "cos_minus_x",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 0.7390851332151607,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::toms748"
       }
@@ -1117,18 +861,15 @@
       "mode": "Strict",
       "method": "Toms748",
       "objective": "sin_minus_half",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 0.5235987755982989,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::toms748"
       }
@@ -1140,18 +881,15 @@
       "mode": "Strict",
       "method": "Toms748",
       "objective": "linear_shift03",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 0.3,
-        "atol": 1E-10,
-        "rtol": 1E-10,
+        "atol": 1e-10,
+        "rtol": 1e-10,
         "require_converged": true,
         "contract_ref": "fsci_opt::toms748"
       }
@@ -1163,18 +901,15 @@
       "mode": "Strict",
       "method": "Ridder",
       "objective": "cos_minus_x",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 0.7390851332151607,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::ridder"
       }
@@ -1186,18 +921,15 @@
       "mode": "Strict",
       "method": "Ridder",
       "objective": "sin_minus_half",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 0.5235987755982989,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::ridder"
       }
@@ -1209,18 +941,15 @@
       "mode": "Strict",
       "method": "Brenth",
       "objective": "cos_minus_x",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 0.7390851332151607,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::brenth"
       }
@@ -1232,18 +961,15 @@
       "mode": "Strict",
       "method": "Brenth",
       "objective": "sin_minus_half",
-      "bracket": [
-        0.0,
-        1.0
-      ],
-      "xtol": 1E-12,
-      "rtol": 1E-12,
+      "bracket": [0.0, 1.0],
+      "xtol": 1e-12,
+      "rtol": 1e-12,
       "maxiter": 200,
       "expected": {
         "kind": "root_value",
         "root": 0.5235987755982989,
-        "atol": 1E-8,
-        "rtol": 1E-8,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "require_converged": true,
         "contract_ref": "fsci_opt::brenth"
       }
@@ -1254,43 +980,22 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "rosenbrock2",
-      "bounds": [
-        [
-          -2.0,
-          2.0
-        ],
-        [
-          -1.0,
-          3.0
-        ]
-      ],
+      "bounds": [[-2.0, 2.0], [-1.0, 3.0]],
       "seed": 42,
-      "tol": 1E-7,
+      "tol": 1e-7,
       "maxiter": 200,
       "popsize": 15,
       "constraints": [
         {
           "kind": "linear",
-          "A": [
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "lb": [
-            2.0
-          ],
-          "ub": [
-            2.0
-          ]
+          "A": [[1.0, 1.0]],
+          "lb": [2.0],
+          "ub": [2.0]
         }
       ],
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          1.0
-        ],
+        "x": [1.0, 1.0],
         "fun": 0.0,
         "atol": 0.1,
         "rtol": 0.1,
@@ -1304,38 +1009,22 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "rastrigin2",
-      "bounds": [
-        [
-          -5.12,
-          5.12
-        ],
-        [
-          -5.12,
-          5.12
-        ]
-      ],
+      "bounds": [[-5.12, 5.12], [-5.12, 5.12]],
       "seed": 42,
-      "tol": 1E-8,
+      "tol": 1e-8,
       "maxiter": 300,
       "popsize": 20,
       "constraints": [
         {
           "kind": "nonlinear",
           "fn_name": "unit_disk",
-          "lb": [
-            0.0
-          ],
-          "ub": [
-            1.0
-          ]
+          "lb": [0.0],
+          "ub": [1.0]
         }
       ],
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.1,
         "rtol": 0.5,
@@ -1349,27 +1038,15 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "sphere2",
-      "bounds": [
-        [
-          -3.0,
-          3.0
-        ],
-        [
-          -3.0,
-          3.0
-        ]
-      ],
+      "bounds": [[-3.0, 3.0], [-3.0, 3.0]],
       "seed": 42,
-      "tol": 1E-8,
+      "tol": 1e-8,
       "maxiter": 100,
       "popsize": 10,
       "constraints": [],
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          0.0,
-          0.0
-        ],
+        "x": [0.0, 0.0],
         "fun": 0.0,
         "atol": 0.05,
         "rtol": 0.05,
@@ -1383,43 +1060,22 @@
       "category": "differential",
       "mode": "Strict",
       "objective": "sphere2",
-      "bounds": [
-        [
-          -3.0,
-          3.0
-        ],
-        [
-          -3.0,
-          3.0
-        ]
-      ],
+      "bounds": [[-3.0, 3.0], [-3.0, 3.0]],
       "seed": 42,
-      "tol": 1E-8,
+      "tol": 1e-8,
       "maxiter": 300,
       "popsize": 20,
       "constraints": [
         {
           "kind": "linear",
-          "A": [
-            [
-              1.0,
-              1.0
-            ]
-          ],
-          "lb": [
-            2.0
-          ],
-          "ub": [
-            10.0
-          ]
+          "A": [[1.0, 1.0]],
+          "lb": [2.0],
+          "ub": [10.0]
         }
       ],
       "expected": {
         "kind": "minimize_point",
-        "x": [
-          1.0,
-          1.0
-        ],
+        "x": [1.0, 1.0],
         "fun": 2.0,
         "atol": 0.2,
         "rtol": 0.2,

@@ -7,9 +7,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -23,9 +21,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 1.772453850905516,
@@ -39,9 +35,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gammaln",
-      "args": [
-        5.0
-      ],
+      "args": [5.0],
       "expected": {
         "kind": "scalar",
         "value": 3.1780538303479458,
@@ -55,10 +49,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "multigammaln",
-      "args": [
-        3.5,
-        2.0
-      ],
+      "args": [3.5, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 2.4664857258317197,
@@ -72,10 +63,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "multigammaln",
-      "args": [
-        4.0,
-        3.0
-      ],
+      "args": [4.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 5.402975080909175,
@@ -89,10 +77,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "multigammaln",
-      "args": [
-        3.5,
-        1.2
-      ],
+      "args": [3.5, 1.2],
       "expected": {
         "kind": "error_kind",
         "error": "DomainError"
@@ -103,14 +88,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "digamma",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": -0.5772156649015329,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::digamma"
       }
     },
@@ -119,14 +102,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "digamma",
-      "args": [
-        3.5
-      ],
+      "args": [3.5],
       "expected": {
         "kind": "scalar",
         "value": 1.103156640645243,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::digamma"
       }
     },
@@ -135,15 +116,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "polygamma",
-      "args": [
-        1.0,
-        2.5
-      ],
+      "args": [1.0, 2.5],
       "expected": {
         "kind": "scalar",
         "value": 0.4903577561002349,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::polygamma"
       }
     },
@@ -152,15 +130,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "polygamma",
-      "args": [
-        2.0,
-        1.5
-      ],
+      "args": [2.0, 1.5],
       "expected": {
         "kind": "scalar",
         "value": -0.8287966442343201,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::polygamma"
       }
     },
@@ -169,10 +144,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "polygamma",
-      "args": [
-        3.0,
-        1.0
-      ],
+      "args": [3.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 6.493939402266829,
@@ -186,9 +158,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "rgamma",
-      "args": [
-        3.5
-      ],
+      "args": [3.5],
       "expected": {
         "kind": "scalar",
         "value": 0.30090111122547003,
@@ -202,9 +172,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "rgamma",
-      "args": [
-        -2.0
-      ],
+      "args": [-2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -218,13 +186,11 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        100.0
-      ],
+      "args": [100.0],
       "expected": {
         "kind": "scalar",
-        "value": 9.332621544394417e+155,
-        "atol": 1e+144,
+        "value": 9.332621544394417e155,
+        "atol": 1e144,
         "rtol": 1e-12,
         "contract_ref": "fsci_special::gamma"
       }
@@ -234,13 +200,11 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        170.0
-      ],
+      "args": [170.0],
       "expected": {
         "kind": "scalar",
-        "value": 4.269068009004706e+304,
-        "atol": 1e+292,
+        "value": 4.269068009004706e304,
+        "atol": 1e292,
         "rtol": 1e-12,
         "contract_ref": "fsci_special::gamma"
       }
@@ -250,9 +214,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gammaln",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -263,9 +225,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "digamma",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -276,9 +236,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "rgamma",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -292,14 +250,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "j0",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::j0"
       }
     },
@@ -308,9 +264,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "j1",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -324,9 +278,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "y0",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -337,9 +289,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "y1",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -350,10 +300,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "iv",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -367,10 +314,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kv",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -381,9 +325,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfcx",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -397,9 +339,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "expi",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -410,9 +350,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "exp1",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -423,9 +361,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "expm1",
-      "args": [
-        -745.0
-      ],
+      "args": [-745.0],
       "expected": {
         "kind": "scalar",
         "value": -1.0,
@@ -439,9 +375,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ndtri",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -452,9 +386,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ndtri",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -465,9 +397,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ndtr",
-      "args": [
-        -40.0
-      ],
+      "args": [-40.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -481,9 +411,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        -1.0
-      ],
+      "args": [-1.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -494,9 +422,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        -2.0
-      ],
+      "args": [-2.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -507,9 +433,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        -3.0
-      ],
+      "args": [-3.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -520,9 +444,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        -0.0
-      ],
+      "args": [-0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -533,9 +455,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -546,9 +466,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gammaln",
-      "args": [
-        -1.0
-      ],
+      "args": [-1.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -559,9 +477,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gammaln",
-      "args": [
-        -2.0
-      ],
+      "args": [-2.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -572,9 +488,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gammaln",
-      "args": [
-        -3.0
-      ],
+      "args": [-3.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -585,9 +499,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gammaln",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -598,9 +510,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "digamma",
-      "args": [
-        -1.0
-      ],
+      "args": [-1.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -611,9 +521,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "digamma",
-      "args": [
-        -2.0
-      ],
+      "args": [-2.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -624,9 +532,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "digamma",
-      "args": [
-        -3.0
-      ],
+      "args": [-3.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -637,9 +543,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "digamma",
-      "args": [
-        -0.0
-      ],
+      "args": [-0.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -650,9 +554,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "digamma",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -663,9 +565,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "rgamma",
-      "args": [
-        -1.0
-      ],
+      "args": [-1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -679,9 +579,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "rgamma",
-      "args": [
-        -3.0
-      ],
+      "args": [-3.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -695,9 +593,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "rgamma",
-      "args": [
-        -0.0
-      ],
+      "args": [-0.0],
       "expected": {
         "kind": "scalar",
         "value": -0.0,
@@ -711,9 +607,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "rgamma",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -727,10 +621,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "jn",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -744,10 +635,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "jn",
-      "args": [
-        1.0,
-        0.0
-      ],
+      "args": [1.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -761,10 +649,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "jn",
-      "args": [
-        2.0,
-        0.0
-      ],
+      "args": [2.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -778,10 +663,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "jn",
-      "args": [
-        0.0,
-        50.0
-      ],
+      "args": [0.0, 50.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0558123276692518,
@@ -795,10 +677,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "jn",
-      "args": [
-        1.0,
-        50.0
-      ],
+      "args": [1.0, 50.0],
       "expected": {
         "kind": "scalar",
         "value": -0.09751182812517514,
@@ -812,10 +691,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "yn",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -826,10 +702,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "yn",
-      "args": [
-        1.0,
-        0.0
-      ],
+      "args": [1.0, 0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -840,10 +713,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "yn",
-      "args": [
-        0.0,
-        50.0
-      ],
+      "args": [0.0, 50.0],
       "expected": {
         "kind": "scalar",
         "value": -0.09806499547007692,
@@ -857,10 +727,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "yn",
-      "args": [
-        1.0,
-        50.0
-      ],
+      "args": [1.0, 50.0],
       "expected": {
         "kind": "scalar",
         "value": -0.05679566856201487,
@@ -874,15 +741,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "iv",
-      "args": [
-        0.5,
-        1.0
-      ],
+      "args": [0.5, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.9376748882454876,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::iv"
       }
     },
@@ -891,15 +755,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "iv",
-      "args": [
-        0.5,
-        5.0
-      ],
+      "args": [0.5, 5.0],
       "expected": {
         "kind": "scalar",
         "value": 26.477547497559065,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::iv"
       }
     },
@@ -908,15 +769,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kv",
-      "args": [
-        0.5,
-        1.0
-      ],
+      "args": [0.5, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.4610685044478946,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::kv"
       }
     },
@@ -925,15 +783,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kv",
-      "args": [
-        0.5,
-        5.0
-      ],
+      "args": [0.5, 5.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0037766133746428825,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::kv"
       }
     },
@@ -942,15 +797,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_jn",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::spherical_jn"
       }
     },
@@ -959,15 +811,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_jn",
-      "args": [
-        1.0,
-        0.0
-      ],
+      "args": [1.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::spherical_jn"
       }
     },
@@ -976,15 +825,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_jn",
-      "args": [
-        0.0,
-        50.0
-      ],
+      "args": [0.0, 50.0],
       "expected": {
         "kind": "scalar",
         "value": -0.005247497074078575,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::spherical_jn"
       }
     },
@@ -993,10 +839,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_yn",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -1007,10 +850,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_yn",
-      "args": [
-        1.0,
-        0.0
-      ],
+      "args": [1.0, 0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -1021,15 +861,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_yn",
-      "args": [
-        0.0,
-        50.0
-      ],
+      "args": [0.0, 50.0],
       "expected": {
         "kind": "scalar",
         "value": -0.019299320569842265,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::spherical_yn"
       }
     },
@@ -1038,15 +875,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_in",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::spherical_in"
       }
     },
@@ -1055,15 +889,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_in",
-      "args": [
-        1.0,
-        0.0
-      ],
+      "args": [1.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::spherical_in"
       }
     },
@@ -1072,10 +903,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_kn",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -1086,10 +914,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gammainc",
-      "args": [
-        2.0,
-        1.0
-      ],
+      "args": [2.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.26424111765711533,
@@ -1103,10 +928,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gammaincc",
-      "args": [
-        2.0,
-        1.0
-      ],
+      "args": [2.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.7357588823428847,
@@ -1120,9 +942,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "factorial",
-      "args": [
-        6.0
-      ],
+      "args": [6.0],
       "expected": {
         "kind": "scalar",
         "value": 720.0,
@@ -1136,9 +956,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "factorial2",
-      "args": [
-        9.0
-      ],
+      "args": [9.0],
       "expected": {
         "kind": "scalar",
         "value": 945.0,
@@ -1152,9 +970,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "factorial2",
-      "args": [
-        -1.0
-      ],
+      "args": [-1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -1168,10 +984,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "comb",
-      "args": [
-        10.0,
-        3.0
-      ],
+      "args": [10.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 120.0,
@@ -1185,10 +998,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "comb",
-      "args": [
-        5.0,
-        7.0
-      ],
+      "args": [5.0, 7.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -1202,10 +1012,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "perm",
-      "args": [
-        10.0,
-        3.0
-      ],
+      "args": [10.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 720.0,
@@ -1219,10 +1026,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "perm",
-      "args": [
-        5.0,
-        7.0
-      ],
+      "args": [5.0, 7.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -1236,10 +1040,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "poch",
-      "args": [
-        2.5,
-        3.0
-      ],
+      "args": [2.5, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 39.375,
@@ -1253,10 +1054,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "poch",
-      "args": [
-        -2.0,
-        3.0
-      ],
+      "args": [-2.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -1270,14 +1068,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erf",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.8427007929497149,
-        "atol": 2e-07,
-        "rtol": 2e-07,
+        "atol": 2e-7,
+        "rtol": 2e-7,
         "contract_ref": "fsci_special::erf"
       }
     },
@@ -1286,14 +1082,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfc",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.15729920705028513,
-        "atol": 2e-07,
-        "rtol": 2e-07,
+        "atol": 2e-7,
+        "rtol": 2e-7,
         "contract_ref": "fsci_special::erfc"
       }
     },
@@ -1302,14 +1096,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfinv",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.4769362762044699,
-        "atol": 4e-06,
-        "rtol": 4e-06,
+        "atol": 4e-6,
+        "rtol": 4e-6,
         "contract_ref": "fsci_special::erfinv"
       }
     },
@@ -1318,14 +1110,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfcinv",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.4769362762044699,
-        "atol": 4e-06,
-        "rtol": 4e-06
+        "atol": 4e-6,
+        "rtol": 4e-6
       }
     },
     {
@@ -1333,9 +1123,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfcx",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.427583576155807,
@@ -1349,9 +1137,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfi",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.6504257587975428,
@@ -1365,10 +1151,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "owens_t",
-      "args": [
-        0.5,
-        1.0
-      ],
+      "args": [0.5, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.10667106296144852,
@@ -1382,10 +1165,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "beta",
-      "args": [
-        2.0,
-        3.0
-      ],
+      "args": [2.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 0.08333333333333333,
@@ -1399,10 +1179,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "betaln",
-      "args": [
-        2.0,
-        3.0
-      ],
+      "args": [2.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": -2.4849066497880004,
@@ -1416,11 +1193,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "betainc",
-      "args": [
-        2.0,
-        3.0,
-        0.5
-      ],
+      "args": [2.0, 3.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.6875,
@@ -1434,11 +1207,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "btdtr",
-      "args": [
-        2.0,
-        5.0,
-        0.3
-      ],
+      "args": [2.0, 5.0, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 0.5798250000000003,
@@ -1452,11 +1221,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "btdtrc",
-      "args": [
-        2.0,
-        5.0,
-        0.3
-      ],
+      "args": [2.0, 5.0, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 0.4201749999999999,
@@ -1470,11 +1235,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "btdtrc",
-      "args": [
-        2.0,
-        3.0,
-        0.999999
-      ],
+      "args": [2.0, 3.0, 0.999999],
       "expected": {
         "kind": "scalar",
         "value": 3.9999969999999994e-18,
@@ -1488,11 +1249,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "btdtri",
-      "args": [
-        2.0,
-        5.0,
-        0.4
-      ],
+      "args": [2.0, 5.0, 0.4],
       "expected": {
         "kind": "scalar",
         "value": 0.2225835336154239,
@@ -1506,11 +1263,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "btdtria",
-      "args": [
-        0.5,
-        2.0,
-        0.3
-      ],
+      "args": [0.5, 2.0, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 1.0249306894715173,
@@ -1524,11 +1277,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "btdtria",
-      "args": [
-        0.9999999999999998,
-        13.584377534422599,
-        0.9654253202433963
-      ],
+      "args": [0.9999999999999998, 13.584377534422599, 0.9654253202433963],
       "expected": {
         "kind": "scalar",
         "value": 6.500293340049934,
@@ -1542,11 +1291,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "btdtrib",
-      "args": [
-        2.0,
-        0.5,
-        0.3
-      ],
+      "args": [2.0, 0.5, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 4.246702175718102,
@@ -1560,11 +1305,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "btdtrib",
-      "args": [
-        0.04395757565162919,
-        0.9999999999999998,
-        0.7611845908830768
-      ],
+      "args": [0.04395757565162919, 0.9999999999999998, 0.7611845908830768],
       "expected": {
         "kind": "scalar",
         "value": 21.139084078921783,
@@ -1578,11 +1319,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "fdtr",
-      "args": [
-        5.0,
-        2.0,
-        1.25
-      ],
+      "args": [5.0, 2.0, 1.25],
       "expected": {
         "kind": "scalar",
         "value": 0.49953413669564345,
@@ -1596,11 +1333,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "fdtrc",
-      "args": [
-        5.0,
-        2.0,
-        1.25
-      ],
+      "args": [5.0, 2.0, 1.25],
       "expected": {
         "kind": "scalar",
         "value": 0.5004658633043565,
@@ -1614,11 +1347,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "fdtri",
-      "args": [
-        5.0,
-        2.0,
-        0.7
-      ],
+      "args": [5.0, 2.0, 0.7],
       "expected": {
         "kind": "scalar",
         "value": 2.6084273054201277,
@@ -1632,11 +1361,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "fdtridfd",
-      "args": [
-        5.0,
-        0.7,
-        1.5
-      ],
+      "args": [5.0, 0.7, 1.5],
       "expected": {
         "kind": "scalar",
         "value": 7.1205455518861855,
@@ -1650,11 +1375,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "fdtridfd",
-      "args": [
-        5.0,
-        0.5,
-        0.0
-      ],
+      "args": [5.0, 0.5, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 1e-100,
@@ -1668,10 +1389,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "stdtr",
-      "args": [
-        10.0,
-        1.25
-      ],
+      "args": [10.0, 1.25],
       "expected": {
         "kind": "scalar",
         "value": 0.8801196948723322,
@@ -1685,10 +1403,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "stdtrc",
-      "args": [
-        10.0,
-        1.25
-      ],
+      "args": [10.0, 1.25],
       "expected": {
         "kind": "scalar",
         "value": 0.1198803051276678,
@@ -1702,10 +1417,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "stdtridf",
-      "args": [
-        0.8,
-        1.25
-      ],
+      "args": [0.8, 1.25],
       "expected": {
         "kind": "scalar",
         "value": 1.2176499408295116,
@@ -1719,10 +1431,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "stdtrit",
-      "args": [
-        10.0,
-        0.8
-      ],
+      "args": [10.0, 0.8],
       "expected": {
         "kind": "scalar",
         "value": 0.8790578285505889,
@@ -1736,11 +1445,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "bdtr",
-      "args": [
-        3.0,
-        10.0,
-        0.4
-      ],
+      "args": [3.0, 10.0, 0.4],
       "expected": {
         "kind": "scalar",
         "value": 0.3822806016000002,
@@ -1754,11 +1459,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "bdtrc",
-      "args": [
-        3.0,
-        10.0,
-        0.4
-      ],
+      "args": [3.0, 10.0, 0.4],
       "expected": {
         "kind": "scalar",
         "value": 0.6177193983999998,
@@ -1772,11 +1473,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "bdtri",
-      "args": [
-        3.0,
-        10.0,
-        0.6
-      ],
+      "args": [3.0, 10.0, 0.6],
       "expected": {
         "kind": "scalar",
         "value": 0.3183961714766643,
@@ -1790,11 +1487,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nbdtr",
-      "args": [
-        4.0,
-        3.0,
-        0.5
-      ],
+      "args": [4.0, 3.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.7734375000000002,
@@ -1808,11 +1501,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nbdtrc",
-      "args": [
-        4.0,
-        3.0,
-        0.5
-      ],
+      "args": [4.0, 3.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.2265624999999998,
@@ -1826,11 +1515,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nbdtri",
-      "args": [
-        4.0,
-        3.0,
-        0.65
-      ],
+      "args": [4.0, 3.0, 0.65],
       "expected": {
         "kind": "scalar",
         "value": 0.4331406303324592,
@@ -1844,10 +1529,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdtr",
-      "args": [
-        3.0,
-        2.5
-      ],
+      "args": [3.0, 2.5],
       "expected": {
         "kind": "scalar",
         "value": 0.7575761331330662,
@@ -1861,10 +1543,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdtrc",
-      "args": [
-        3.0,
-        2.5
-      ],
+      "args": [3.0, 2.5],
       "expected": {
         "kind": "scalar",
         "value": 0.2424238668669339,
@@ -1878,10 +1557,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdtri",
-      "args": [
-        3.0,
-        0.6
-      ],
+      "args": [3.0, 0.6],
       "expected": {
         "kind": "scalar",
         "value": 3.211322780120959,
@@ -1895,10 +1571,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pdtrik",
-      "args": [
-        0.7,
-        2.5
-      ],
+      "args": [0.7, 2.5],
       "expected": {
         "kind": "scalar",
         "value": 2.692718092203629,
@@ -1912,10 +1585,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "chdtr",
-      "args": [
-        4.0,
-        3.5
-      ],
+      "args": [4.0, 3.5],
       "expected": {
         "kind": "scalar",
         "value": 0.522121655511276,
@@ -1929,10 +1599,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "chdtrc",
-      "args": [
-        4.0,
-        3.5
-      ],
+      "args": [4.0, 3.5],
       "expected": {
         "kind": "scalar",
         "value": 0.477878344488724,
@@ -1946,10 +1613,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "chdtri",
-      "args": [
-        4.0,
-        0.6
-      ],
+      "args": [4.0, 0.6],
       "expected": {
         "kind": "scalar",
         "value": 2.7528426841257754,
@@ -1963,10 +1627,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "chdtriv",
-      "args": [
-        0.5,
-        2.0
-      ],
+      "args": [0.5, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 2.6285000206907014,
@@ -1980,11 +1641,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtr",
-      "args": [
-        2.0,
-        3.0,
-        4.0
-      ],
+      "args": [2.0, 3.0, 4.0],
       "expected": {
         "kind": "scalar",
         "value": 0.986246032255997,
@@ -1998,11 +1655,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtrc",
-      "args": [
-        2.0,
-        3.0,
-        4.0
-      ],
+      "args": [2.0, 3.0, 4.0],
       "expected": {
         "kind": "scalar",
         "value": 0.013753967744002971,
@@ -2016,11 +1669,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtria",
-      "args": [
-        0.4,
-        1.25,
-        3.2
-      ],
+      "args": [0.4, 1.25, 3.2],
       "expected": {
         "kind": "scalar",
         "value": 0.22483440431273446,
@@ -2034,11 +1683,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtria",
-      "args": [
-        0.7,
-        3.0,
-        2.0
-      ],
+      "args": [0.7, 3.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 1.8077838329329956,
@@ -2052,11 +1697,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtrib",
-      "args": [
-        2.5,
-        0.4,
-        3.2
-      ],
+      "args": [2.5, 0.4, 3.2],
       "expected": {
         "kind": "scalar",
         "value": 9.05581244967315,
@@ -2070,11 +1711,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtrib",
-      "args": [
-        2.0,
-        0.7,
-        1.5
-      ],
+      "args": [2.0, 0.7, 1.5],
       "expected": {
         "kind": "scalar",
         "value": 2.472602993054606,
@@ -2088,11 +1725,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtrix",
-      "args": [
-        2.5,
-        1.25,
-        0.4
-      ],
+      "args": [2.5, 1.25, 0.4],
       "expected": {
         "kind": "scalar",
         "value": 0.28778803752030013,
@@ -2106,11 +1739,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtrix",
-      "args": [
-        2.0,
-        3.0,
-        0.7
-      ],
+      "args": [2.0, 3.0, 0.7],
       "expected": {
         "kind": "scalar",
         "value": 1.8077838329329956,
@@ -2124,11 +1753,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtrix",
-      "args": [
-        0.0,
-        1.25,
-        0.4
-      ],
+      "args": [0.0, 1.25, 0.4],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -2139,11 +1764,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "gdtrix",
-      "args": [
-        -2.5,
-        1.25,
-        0.4
-      ],
+      "args": [-2.5, 1.25, 0.4],
       "expected": {
         "kind": "scalar",
         "value": -0.28778803752030013,
@@ -2157,9 +1778,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "j0",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.7651976865579666,
@@ -2172,9 +1791,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "j1",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.4400505857449335,
@@ -2187,9 +1804,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "y0",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.08825696421567697,
@@ -2202,14 +1817,12 @@
       "category": "metamorphic",
       "mode": "Strict",
       "function": "rel_erf_erfc_identity",
-      "args": [
-        -2.0
-      ],
+      "args": [-2.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 3e-07,
-        "rtol": 3e-07
+        "atol": 3e-7,
+        "rtol": 3e-7
       }
     },
     {
@@ -2217,14 +1830,12 @@
       "category": "metamorphic",
       "mode": "Strict",
       "function": "rel_erf_erfc_identity",
-      "args": [
-        0.3
-      ],
+      "args": [0.3],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
-        "atol": 3e-07,
-        "rtol": 3e-07
+        "atol": 3e-7,
+        "rtol": 3e-7
       }
     },
     {
@@ -2232,9 +1843,7 @@
       "category": "metamorphic",
       "mode": "Strict",
       "function": "rel_gamma_recurrence",
-      "args": [
-        2.5
-      ],
+      "args": [2.5],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -2248,10 +1857,7 @@
       "category": "metamorphic",
       "mode": "Strict",
       "function": "rel_beta_symmetry",
-      "args": [
-        0.75,
-        2.5
-      ],
+      "args": [0.75, 2.5],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -2265,10 +1871,7 @@
       "category": "metamorphic",
       "mode": "Strict",
       "function": "rel_gammainc_complement",
-      "args": [
-        2.5,
-        1.7
-      ],
+      "args": [2.5, 1.7],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -2281,15 +1884,12 @@
       "category": "metamorphic",
       "mode": "Strict",
       "function": "rel_jn_recurrence",
-      "args": [
-        3.0,
-        2.5
-      ],
+      "args": [3.0, 2.5],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
-        "atol": 3e-06,
-        "rtol": 3e-06
+        "atol": 3e-6,
+        "rtol": 3e-6
       }
     },
     {
@@ -2297,9 +1897,7 @@
       "category": "adversarial",
       "mode": "Strict",
       "function": "gamma",
-      "args": [
-        -2.0
-      ],
+      "args": [-2.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -2310,9 +1908,7 @@
       "category": "adversarial",
       "mode": "Hardened",
       "function": "gamma",
-      "args": [
-        -2.0
-      ],
+      "args": [-2.0],
       "expected": {
         "kind": "error_kind",
         "error": "PoleInput"
@@ -2323,9 +1919,7 @@
       "category": "adversarial",
       "mode": "Strict",
       "function": "erfinv",
-      "args": [
-        1.2
-      ],
+      "args": [1.2],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -2336,9 +1930,7 @@
       "category": "adversarial",
       "mode": "Hardened",
       "function": "erfinv",
-      "args": [
-        1.2
-      ],
+      "args": [1.2],
       "expected": {
         "kind": "error_kind",
         "error": "DomainError"
@@ -2349,9 +1941,7 @@
       "category": "adversarial",
       "mode": "Hardened",
       "function": "erfcinv",
-      "args": [
-        3.0
-      ],
+      "args": [3.0],
       "expected": {
         "kind": "error_kind",
         "error": "DomainError"
@@ -2362,10 +1952,7 @@
       "category": "adversarial",
       "mode": "Strict",
       "function": "beta",
-      "args": [
-        1e-308,
-        1e-308
-      ],
+      "args": [1e-308, 1e-308],
       "expected": {
         "kind": "class",
         "class": "pos_inf"
@@ -2376,10 +1963,7 @@
       "category": "adversarial",
       "mode": "Hardened",
       "function": "beta",
-      "args": [
-        1e-308,
-        1e-308
-      ],
+      "args": [1e-308, 1e-308],
       "expected": {
         "kind": "error_kind",
         "error": "OverflowRisk"
@@ -2390,9 +1974,7 @@
       "category": "adversarial",
       "mode": "Hardened",
       "function": "y0",
-      "args": [
-        -1.0
-      ],
+      "args": [-1.0],
       "expected": {
         "kind": "error_kind",
         "error": "DomainError"
@@ -2403,10 +1985,7 @@
       "category": "adversarial",
       "mode": "Hardened",
       "function": "jn",
-      "args": [
-        0.5,
-        1.0
-      ],
+      "args": [0.5, 1.0],
       "expected": {
         "kind": "error_kind",
         "error": "DomainError"
@@ -2417,9 +1996,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "sinc",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -2433,9 +2010,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "sinc",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.6366197723675814,
@@ -2449,10 +2024,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "iv",
-      "args": [
-        0.0,
-        1.0
-      ],
+      "args": [0.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.2660658777520084,
@@ -2466,10 +2038,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "iv",
-      "args": [
-        1.0,
-        2.0
-      ],
+      "args": [1.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 1.590636854637329,
@@ -2483,10 +2052,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kv",
-      "args": [
-        0.0,
-        1.0
-      ],
+      "args": [0.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.42102443824070834,
@@ -2500,10 +2066,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kv",
-      "args": [
-        1.0,
-        2.0
-      ],
+      "args": [1.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.13986588181652246,
@@ -2517,11 +2080,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "wright_bessel",
-      "args": [
-        0.0,
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -2535,11 +2094,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "wright_bessel",
-      "args": [
-        20.0,
-        1.5,
-        2.0
-      ],
+      "args": [20.0, 1.5, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 1.1283791670955126,
@@ -2553,11 +2108,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "wright_bessel",
-      "args": [
-        50.0,
-        0.25,
-        0.1
-      ],
+      "args": [50.0, 0.25, 0.1],
       "expected": {
         "kind": "scalar",
         "value": 0.2758156628302093,
@@ -2571,11 +2122,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "wright_bessel",
-      "args": [
-        100.0,
-        0.0,
-        1e+20
-      ],
+      "args": [100.0, 0.0, 1e20],
       "expected": {
         "kind": "scalar",
         "value": 1.0715102881254462e-136,
@@ -2589,11 +2136,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "wright_bessel",
-      "args": [
-        100.0,
-        100.0,
-        1e+20
-      ],
+      "args": [100.0, 100.0, 1e20],
       "expected": {
         "kind": "scalar",
         "value": 1.0715102881254683e-156,
@@ -2607,11 +2150,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "wright_bessel",
-      "args": [
-        -0.5,
-        2.0,
-        0.1
-      ],
+      "args": [-0.5, 2.0, 0.1],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -2622,11 +2161,7 @@
       "category": "adversarial",
       "mode": "Hardened",
       "function": "wright_bessel",
-      "args": [
-        -0.5,
-        2.0,
-        0.1
-      ],
+      "args": [-0.5, 2.0, 0.1],
       "expected": {
         "kind": "error_kind",
         "error": "DomainError"
@@ -2637,11 +2172,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "jvp",
-      "args": [
-        0.0,
-        1.25,
-        1.0
-      ],
+      "args": [0.0, 1.25, 1.0],
       "expected": {
         "kind": "scalar",
         "value": -0.5106232603198806,
@@ -2655,11 +2186,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "jvp",
-      "args": [
-        0.0,
-        1.25,
-        2.0
-      ],
+      "args": [0.0, 1.25, 2.0],
       "expected": {
         "kind": "scalar",
         "value": -0.23740747701538087,
@@ -2687,8 +2214,8 @@
           "re": -0.11214969843562081,
           "im": -0.4076726886839208
         },
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::jvp"
       }
     },
@@ -2697,11 +2224,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "yvp",
-      "args": [
-        0.0,
-        1.75,
-        1.0
-      ],
+      "args": [0.0, 1.75, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.2539729859462456,
@@ -2729,8 +2252,8 @@
           "re": 0.7637865221106478,
           "im": -0.24054051327926187
         },
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::yvp"
       }
     },
@@ -2739,11 +2262,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ivp",
-      "args": [
-        0.0,
-        1.1,
-        1.0
-      ],
+      "args": [0.0, 1.1, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.637488876453882,
@@ -2771,8 +2290,8 @@
           "re": 0.6780846475208375,
           "im": 0.44317266980331826
         },
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::ivp"
       }
     },
@@ -2781,16 +2300,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kvp",
-      "args": [
-        0.0,
-        1.1,
-        1.0
-      ],
+      "args": [0.0, 1.1, 1.0],
       "expected": {
         "kind": "scalar",
         "value": -0.5097600271670271,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::kvp"
       }
     },
@@ -2813,8 +2328,8 @@
           "re": -0.1566369922006784,
           "im": 0.3554607702130256
         },
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::kvp"
       }
     },
@@ -2823,10 +2338,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_jn",
-      "args": [
-        0.0,
-        1.0
-      ],
+      "args": [0.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.8414709848078965,
@@ -2840,10 +2352,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_jn",
-      "args": [
-        1.0,
-        2.0
-      ],
+      "args": [1.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.43539777497999166,
@@ -2857,10 +2366,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_jn",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -2874,10 +2380,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_yn",
-      "args": [
-        0.0,
-        1.0
-      ],
+      "args": [0.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": -0.5403023058681398,
@@ -2891,10 +2394,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_yn",
-      "args": [
-        0.0,
-        0.0
-      ],
+      "args": [0.0, 0.0],
       "expected": {
         "kind": "class",
         "class": "neg_inf"
@@ -2905,10 +2405,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_yn",
-      "args": [
-        1.0,
-        2.0
-      ],
+      "args": [1.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": -0.35061200427605527,
@@ -2922,10 +2419,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_in",
-      "args": [
-        0.0,
-        1.25
-      ],
+      "args": [0.0, 1.25],
       "expected": {
         "kind": "scalar",
         "value": 1.2815352642406603,
@@ -2939,10 +2433,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_in",
-      "args": [
-        3.0,
-        2.5
-      ],
+      "args": [3.0, 2.5],
       "expected": {
         "kind": "scalar",
         "value": 0.20843886982513898,
@@ -2956,10 +2447,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_kn",
-      "args": [
-        0.0,
-        1.25
-      ],
+      "args": [0.0, 1.25],
       "expected": {
         "kind": "scalar",
         "value": 0.36003254601368373,
@@ -2973,10 +2461,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spherical_kn",
-      "args": [
-        3.0,
-        2.5
-      ],
+      "args": [3.0, 2.5],
       "expected": {
         "kind": "scalar",
         "value": 0.3486505539304314,
@@ -2990,10 +2475,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "xlogy",
-      "args": [
-        0.0,
-        5.0
-      ],
+      "args": [0.0, 5.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -3007,10 +2489,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "xlogy",
-      "args": [
-        2.0,
-        3.0
-      ],
+      "args": [2.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 2.1972245773362196,
@@ -3024,10 +2503,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "xlog1py",
-      "args": [
-        0.0,
-        5.0
-      ],
+      "args": [0.0, 5.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -3041,10 +2517,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "xlog1py",
-      "args": [
-        2.0,
-        0.5
-      ],
+      "args": [2.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.8109302162163288,
@@ -3058,9 +2531,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "xlogx",
-      "args": [
-        2.0
-      ],
+      "args": [2.0],
       "expected": {
         "kind": "scalar",
         "value": 1.3862943611198906,
@@ -3074,9 +2545,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kolmogorov",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.26999967167735456,
@@ -3090,9 +2559,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kolmogorov",
-      "args": [
-        1.5
-      ],
+      "args": [1.5],
       "expected": {
         "kind": "scalar",
         "value": 0.022217962616525127,
@@ -3106,9 +2573,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kolmogi",
-      "args": [
-        0.27
-      ],
+      "args": [0.27],
       "expected": {
         "kind": "scalar",
         "value": 0.999999693714313,
@@ -3122,9 +2587,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kolmogi",
-      "args": [
-        0.1
-      ],
+      "args": [0.1],
       "expected": {
         "kind": "scalar",
         "value": 1.2238478702170823,
@@ -3138,9 +2601,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "log1p",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.6931471805599453,
@@ -3154,9 +2615,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "expm1",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.718281828459045,
@@ -3170,10 +2629,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "logaddexp",
-      "args": [
-        1.0,
-        2.0
-      ],
+      "args": [1.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 2.313261687518223,
@@ -3187,10 +2643,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "logaddexp2",
-      "args": [
-        1.0,
-        2.0
-      ],
+      "args": [1.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 2.584962500721156,
@@ -3204,9 +2657,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "softplus",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.3132616875182228,
@@ -3220,10 +2671,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "huber",
-      "args": [
-        1.0,
-        2.0
-      ],
+      "args": [1.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 1.5,
@@ -3237,10 +2685,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "pseudo_huber",
-      "args": [
-        1.0,
-        2.0
-      ],
+      "args": [1.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 1.2360679774997896,
@@ -3254,9 +2699,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "cosdg",
-      "args": [
-        90.0
-      ],
+      "args": [90.0],
       "expected": {
         "kind": "scalar",
         "value": -0.0,
@@ -3270,9 +2713,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "sindg",
-      "args": [
-        30.0
-      ],
+      "args": [30.0],
       "expected": {
         "kind": "scalar",
         "value": 0.49999999999999994,
@@ -3286,9 +2727,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "tandg",
-      "args": [
-        45.0
-      ],
+      "args": [45.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -3302,9 +2741,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "cotdg",
-      "args": [
-        45.0
-      ],
+      "args": [45.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -3318,11 +2755,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "radian",
-      "args": [
-        180.0,
-        0.0,
-        0.0
-      ],
+      "args": [180.0, 0.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 3.141592653589793,
@@ -3336,9 +2769,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "cbrt",
-      "args": [
-        -8.0
-      ],
+      "args": [-8.0],
       "expected": {
         "kind": "scalar",
         "value": -2.0,
@@ -3352,9 +2783,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "exp2",
-      "args": [
-        3.0
-      ],
+      "args": [3.0],
       "expected": {
         "kind": "scalar",
         "value": 8.0,
@@ -3368,9 +2797,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "exp10",
-      "args": [
-        2.0
-      ],
+      "args": [2.0],
       "expected": {
         "kind": "scalar",
         "value": 100.0,
@@ -3384,10 +2811,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "boxcox",
-      "args": [
-        2.0,
-        0.5
-      ],
+      "args": [2.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.8284271247461901,
@@ -3401,10 +2825,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "inv_boxcox",
-      "args": [
-        0.8284271247461901,
-        0.5
-      ],
+      "args": [0.8284271247461901, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 2.0,
@@ -3418,10 +2839,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "boxcox1p",
-      "args": [
-        1.0,
-        0.5
-      ],
+      "args": [1.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.8284271247461901,
@@ -3435,10 +2853,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "inv_boxcox1p",
-      "args": [
-        0.8284271247461901,
-        0.5
-      ],
+      "args": [0.8284271247461901, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -3452,9 +2867,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "entr",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.34657359027997264,
@@ -3468,9 +2881,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "entr",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -3484,10 +2895,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "rel_entr",
-      "args": [
-        2.0,
-        3.0
-      ],
+      "args": [2.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": -0.8109302162163288,
@@ -3501,10 +2909,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kl_div",
-      "args": [
-        2.0,
-        3.0
-      ],
+      "args": [2.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 0.18906978378367123,
@@ -3518,9 +2923,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ndtr",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5,
@@ -3534,9 +2937,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ndtr",
-      "args": [
-        1.25
-      ],
+      "args": [1.25],
       "expected": {
         "kind": "scalar",
         "value": 0.8943502263331446,
@@ -3550,14 +2951,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ndtri",
-      "args": [
-        0.975
-      ],
+      "args": [0.975],
       "expected": {
         "kind": "scalar",
         "value": 1.959963984540054,
-        "atol": 5e-05,
-        "rtol": 5e-05,
+        "atol": 5e-5,
+        "rtol": 5e-5,
         "contract_ref": "fsci_special::ndtri"
       }
     },
@@ -3566,11 +2965,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nrdtrimn",
-      "args": [
-        0.8,
-        2.0,
-        1.0
-      ],
+      "args": [0.8, 2.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": -0.6832424671458288,
@@ -3584,11 +2979,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nrdtrimn",
-      "args": [
-        0.5,
-        1.0,
-        1.0
-      ],
+      "args": [0.5, 1.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -3602,11 +2993,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nrdtrimn",
-      "args": [
-        0.0,
-        2.0,
-        1.0
-      ],
+      "args": [0.0, 2.0, 1.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -3617,11 +3004,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nrdtrimn",
-      "args": [
-        1.0,
-        2.0,
-        1.0
-      ],
+      "args": [1.0, 2.0, 1.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -3632,11 +3015,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nrdtrisd",
-      "args": [
-        3.0,
-        0.9331927987311419,
-        6.0
-      ],
+      "args": [3.0, 0.9331927987311419, 6.0],
       "expected": {
         "kind": "scalar",
         "value": 2.0000000000000004,
@@ -3650,11 +3029,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nrdtrisd",
-      "args": [
-        0.5,
-        0.5,
-        0.5
-      ],
+      "args": [0.5, 0.5, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -3668,11 +3043,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nrdtrisd",
-      "args": [
-        1.0,
-        0.5,
-        0.5
-      ],
+      "args": [1.0, 0.5, 0.5],
       "expected": {
         "kind": "scalar",
         "value": -7532401279578852.0,
@@ -3686,11 +3057,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "nrdtrisd",
-      "args": [
-        0.0,
-        0.0,
-        1.0
-      ],
+      "args": [0.0, 0.0, 1.0],
       "expected": {
         "kind": "class",
         "class": "nan"
@@ -3701,14 +3068,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "log_ndtr",
-      "args": [
-        -8.0
-      ],
+      "args": [-8.0],
       "expected": {
         "kind": "scalar",
         "value": -35.01343715991456,
-        "atol": 1e-06,
-        "rtol": 1e-06,
+        "atol": 1e-6,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::log_ndtr"
       }
     },
@@ -3717,11 +3082,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "logsumexp",
-      "args": [
-        1.0,
-        2.0,
-        3.0
-      ],
+      "args": [1.0, 2.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 3.40760596444438,
@@ -3735,14 +3096,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "fresnel_s",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.4382591473903547,
-        "atol": 5e-08,
-        "rtol": 5e-08,
+        "atol": 5e-8,
+        "rtol": 5e-8,
         "contract_ref": "fsci_special::fresnel"
       }
     },
@@ -3751,14 +3110,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "fresnel_c",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.779893400376823,
-        "atol": 5e-08,
-        "rtol": 5e-08,
+        "atol": 5e-8,
+        "rtol": 5e-8,
         "contract_ref": "fsci_special::fresnel"
       }
     },
@@ -3767,14 +3124,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "dawsn",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5380795069127684,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::dawsn"
       }
     },
@@ -3783,9 +3138,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "sici_si",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.9460830703671831,
@@ -3799,9 +3152,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "sici_ci",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.33740392290096816,
@@ -3815,9 +3166,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "shichi_shi",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0572508753757286,
@@ -3831,9 +3180,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "shichi_chi",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.8378669409802082,
@@ -3847,10 +3194,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "struve",
-      "args": [
-        0.0,
-        1.0
-      ],
+      "args": [0.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5686566270482881,
@@ -3864,10 +3208,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "modstruve",
-      "args": [
-        0.0,
-        1.0
-      ],
+      "args": [0.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.710243185937891,
@@ -3881,9 +3222,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ber",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.984381781213087,
@@ -3897,9 +3236,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "bei",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.24956604003665972,
@@ -3913,9 +3250,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ker",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.28670620872831604,
@@ -3929,9 +3264,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "kei",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": -0.49499463651872,
@@ -3945,14 +3278,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "spence",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.5822405264650135,
-        "atol": 1e-07,
-        "rtol": 1e-07,
+        "atol": 1e-7,
+        "rtol": 1e-7,
         "contract_ref": "fsci_special::spence"
       }
     },
@@ -3961,14 +3292,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "zeta",
-      "args": [
-        2.0
-      ],
+      "args": [2.0],
       "expected": {
         "kind": "scalar",
         "value": 1.6449340668482264,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::zeta"
       }
     },
@@ -3977,14 +3306,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "zetac",
-      "args": [
-        2.0
-      ],
+      "args": [2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.6449340668482264,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::zetac"
       }
     },
@@ -3993,15 +3320,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "hurwitz_zeta",
-      "args": [
-        2.0,
-        0.5
-      ],
+      "args": [2.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 4.93480220054468,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::hurwitz_zeta"
       }
     },
@@ -4010,9 +3334,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "expit",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5,
@@ -4026,9 +3348,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "expit",
-      "args": [
-        2.0
-      ],
+      "args": [2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.8807970779778823,
@@ -4042,9 +3362,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "logit",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -4058,9 +3376,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "logit",
-      "args": [
-        0.8
-      ],
+      "args": [0.8],
       "expected": {
         "kind": "scalar",
         "value": 1.3862943611198906,
@@ -4074,9 +3390,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "exprel",
-      "args": [
-        1e-10
-      ],
+      "args": [1e-10],
       "expected": {
         "kind": "scalar",
         "value": 1.00000000005,
@@ -4090,9 +3404,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "exprel",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.718281828459045,
@@ -4106,9 +3418,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipk",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 1.8540746773013719,
@@ -4122,9 +3432,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipkm1",
-      "args": [
-        0.25
-      ],
+      "args": [0.25],
       "expected": {
         "kind": "scalar",
         "value": 2.156515647499643,
@@ -4138,9 +3446,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipe",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 1.3506438810476755,
@@ -4154,10 +3460,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipkinc",
-      "args": [
-        0.7,
-        0.2
-      ],
+      "args": [0.7, 0.2],
       "expected": {
         "kind": "scalar",
         "value": 0.7107841364378853,
@@ -4171,10 +3474,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipeinc",
-      "args": [
-        0.7,
-        0.2
-      ],
+      "args": [0.7, 0.2],
       "expected": {
         "kind": "scalar",
         "value": 0.6894990277704386,
@@ -4188,10 +3488,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_sn",
-      "args": [
-        0.7,
-        0.2
-      ],
+      "args": [0.7, 0.2],
       "expected": {
         "kind": "scalar",
         "value": 0.6362806256364313,
@@ -4205,10 +3502,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_cn",
-      "args": [
-        0.7,
-        0.2
-      ],
+      "args": [0.7, 0.2],
       "expected": {
         "kind": "scalar",
         "value": 0.771457688690515,
@@ -4222,10 +3516,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_dn",
-      "args": [
-        0.7,
-        0.2
-      ],
+      "args": [0.7, 0.2],
       "expected": {
         "kind": "scalar",
         "value": 0.9586602073143238,
@@ -4239,10 +3530,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_ph",
-      "args": [
-        0.7,
-        0.2
-      ],
+      "args": [0.7, 0.2],
       "expected": {
         "kind": "scalar",
         "value": 0.6896673935732983,
@@ -4256,9 +3544,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipk",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.5707963267948966,
@@ -4272,9 +3558,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipk",
-      "args": [
-        0.999999999999
-      ],
+      "args": [0.999999999999],
       "expected": {
         "kind": "scalar",
         "value": 15.201815980070121,
@@ -4288,9 +3572,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipkm1",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.5707963267948966,
@@ -4304,9 +3586,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipe",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.5707963267948966,
@@ -4320,9 +3600,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipe",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -4336,10 +3614,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipkinc",
-      "args": [
-        0.7853981633974483,
-        0.5
-      ],
+      "args": [0.7853981633974483, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.826017876249245,
@@ -4353,10 +3628,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipkinc",
-      "args": [
-        1.5707963267948966,
-        0.99
-      ],
+      "args": [1.5707963267948966, 0.99],
       "expected": {
         "kind": "scalar",
         "value": 3.695637362989875,
@@ -4370,10 +3642,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipkinc",
-      "args": [
-        0.0,
-        0.5
-      ],
+      "args": [0.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -4387,10 +3656,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipeinc",
-      "args": [
-        0.7853981633974483,
-        0.5
-      ],
+      "args": [0.7853981633974483, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.7481865041776612,
@@ -4404,10 +3670,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipeinc",
-      "args": [
-        1.5707963267948966,
-        0.99
-      ],
+      "args": [1.5707963267948966, 0.99],
       "expected": {
         "kind": "scalar",
         "value": 1.015993545025224,
@@ -4421,10 +3684,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipeinc",
-      "args": [
-        0.0,
-        0.5
-      ],
+      "args": [0.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -4438,10 +3698,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_sn",
-      "args": [
-        0.5,
-        0.3
-      ],
+      "args": [0.5, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 0.47421562271182066,
@@ -4455,10 +3712,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_cn",
-      "args": [
-        0.5,
-        0.3
-      ],
+      "args": [0.5, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 0.8804087364264624,
@@ -4472,10 +3726,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_dn",
-      "args": [
-        0.5,
-        0.3
-      ],
+      "args": [0.5, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 0.9656789647459512,
@@ -4489,10 +3740,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_ph",
-      "args": [
-        0.5,
-        0.3
-      ],
+      "args": [0.5, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 0.4940728937110473,
@@ -4506,10 +3754,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_sn",
-      "args": [
-        1.0,
-        0.99
-      ],
+      "args": [1.0, 0.99],
       "expected": {
         "kind": "scalar",
         "value": 0.7624477227446591,
@@ -4523,10 +3768,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_cn",
-      "args": [
-        1.0,
-        0.99
-      ],
+      "args": [1.0, 0.99],
       "expected": {
         "kind": "scalar",
         "value": 0.6470498204013996,
@@ -4540,10 +3782,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_dn",
-      "args": [
-        1.0,
-        0.99
-      ],
+      "args": [1.0, 0.99],
       "expected": {
         "kind": "scalar",
         "value": 0.6515264656026404,
@@ -4557,10 +3796,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "ellipj_ph",
-      "args": [
-        1.0,
-        0.99
-      ],
+      "args": [1.0, 0.99],
       "expected": {
         "kind": "scalar",
         "value": 0.8670876269614121,
@@ -4574,9 +3810,7 @@
       "category": "differential",
       "mode": "Hardened",
       "function": "ellipk",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "error_kind",
         "error": "DomainError"
@@ -4587,10 +3821,7 @@
       "category": "differential",
       "mode": "Hardened",
       "function": "ellipkinc",
-      "args": [
-        0.7853981633974483,
-        1.0
-      ],
+      "args": [0.7853981633974483, 1.0],
       "expected": {
         "kind": "error_kind",
         "error": "DomainError"
@@ -4601,11 +3832,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "lpmv",
-      "args": [
-        1.0,
-        3.0,
-        0.5
-      ],
+      "args": [1.0, 3.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": -0.3247595264191645,
@@ -4619,11 +3846,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "lpmv",
-      "args": [
-        -1.0,
-        3.0,
-        0.5
-      ],
+      "args": [-1.0, 3.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.02706329386826371,
@@ -4637,12 +3860,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "sph_harm_y",
-      "args": [
-        0.0,
-        0.0,
-        0.5,
-        1.0
-      ],
+      "args": [0.0, 0.0, 0.5, 1.0],
       "expected": {
         "kind": "complex_scalar",
         "value": {
@@ -4659,12 +3877,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "sph_harm_y",
-      "args": [
-        1.0,
-        1.0,
-        0.5,
-        1.0
-      ],
+      "args": [1.0, 1.0, 0.5, 1.0],
       "expected": {
         "kind": "complex_scalar",
         "value": {
@@ -4681,10 +3894,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_legendre",
-      "args": [
-        4.0,
-        0.25
-      ],
+      "args": [4.0, 0.25],
       "expected": {
         "kind": "scalar",
         "value": 0.15771484375,
@@ -4698,10 +3908,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_chebyt",
-      "args": [
-        5.0,
-        0.3
-      ],
+      "args": [5.0, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 0.99888,
@@ -4715,10 +3922,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_chebyu",
-      "args": [
-        4.0,
-        0.3
-      ],
+      "args": [4.0, 0.3],
       "expected": {
         "kind": "scalar",
         "value": 0.04960000000000009,
@@ -4732,10 +3936,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_hermite",
-      "args": [
-        4.0,
-        0.5
-      ],
+      "args": [4.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -4749,10 +3950,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_hermitenorm",
-      "args": [
-        4.0,
-        0.5
-      ],
+      "args": [4.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 1.5625,
@@ -4766,10 +3964,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_laguerre",
-      "args": [
-        3.0,
-        2.0
-      ],
+      "args": [3.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": -0.33333333333333337,
@@ -4783,11 +3978,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_genlaguerre",
-      "args": [
-        3.0,
-        1.5,
-        2.0
-      ],
+      "args": [3.0, 1.5, 2.0],
       "expected": {
         "kind": "scalar",
         "value": -1.520833333333333,
@@ -4801,12 +3992,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_jacobi",
-      "args": [
-        3.0,
-        0.5,
-        1.0,
-        0.25
-      ],
+      "args": [3.0, 0.5, 1.0, 0.25],
       "expected": {
         "kind": "scalar",
         "value": -0.39465332031250006,
@@ -4820,12 +4006,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_jacobi",
-      "args": [
-        4.0,
-        1.5,
-        0.5,
-        -0.2
-      ],
+      "args": [4.0, 1.5, 0.5, -0.2],
       "expected": {
         "kind": "scalar",
         "value": 0.5499375000000001,
@@ -4839,11 +4020,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_gegenbauer",
-      "args": [
-        4.0,
-        1.25,
-        0.3
-      ],
+      "args": [4.0, 1.25, 0.3],
       "expected": {
         "kind": "scalar",
         "value": -0.029285156250000055,
@@ -4857,11 +4034,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_gegenbauer",
-      "args": [
-        5.0,
-        0.75,
-        -0.4
-      ],
+      "args": [5.0, 0.75, -0.4],
       "expected": {
         "kind": "scalar",
         "value": -0.46431,
@@ -4875,10 +4048,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_sh_legendre",
-      "args": [
-        4.0,
-        0.75
-      ],
+      "args": [4.0, 0.75],
       "expected": {
         "kind": "scalar",
         "value": -0.28906249999999994,
@@ -4892,10 +4062,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_sh_chebyt",
-      "args": [
-        5.0,
-        0.8
-      ],
+      "args": [5.0, 0.8],
       "expected": {
         "kind": "scalar",
         "value": -0.07584000000000046,
@@ -4909,10 +4076,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "eval_sh_chebyu",
-      "args": [
-        4.0,
-        0.8
-      ],
+      "args": [4.0, 0.8],
       "expected": {
         "kind": "scalar",
         "value": -1.2464,
@@ -4926,10 +4090,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_chebyt_node",
-      "args": [
-        4.0,
-        0.0
-      ],
+      "args": [4.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": -0.9238795325112867,
@@ -4943,10 +4104,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_chebyt_node",
-      "args": [
-        4.0,
-        3.0
-      ],
+      "args": [4.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 0.9238795325112867,
@@ -4960,10 +4118,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_chebyt_weight",
-      "args": [
-        4.0,
-        0.0
-      ],
+      "args": [4.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.7853981633974483,
@@ -4977,10 +4132,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_chebyu_node",
-      "args": [
-        4.0,
-        0.0
-      ],
+      "args": [4.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": -0.8090169943749473,
@@ -4994,10 +4146,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_chebyu_node",
-      "args": [
-        4.0,
-        3.0
-      ],
+      "args": [4.0, 3.0],
       "expected": {
         "kind": "scalar",
         "value": 0.8090169943749475,
@@ -5011,10 +4160,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_chebyu_weight",
-      "args": [
-        4.0,
-        0.0
-      ],
+      "args": [4.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.21707871342270607,
@@ -5028,10 +4174,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_chebyu_weight",
-      "args": [
-        4.0,
-        1.0
-      ],
+      "args": [4.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5683194499747424,
@@ -5045,10 +4188,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_hermite_node",
-      "args": [
-        3.0,
-        0.0
-      ],
+      "args": [3.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": -1.224744871391589,
@@ -5062,10 +4202,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_hermite_node",
-      "args": [
-        3.0,
-        1.0
-      ],
+      "args": [3.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -5079,10 +4216,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_hermite_weight",
-      "args": [
-        3.0,
-        1.0
-      ],
+      "args": [3.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.1816359006036774,
@@ -5096,10 +4230,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_hermitenorm_node",
-      "args": [
-        3.0,
-        0.0
-      ],
+      "args": [3.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": -1.7320508075688774,
@@ -5113,10 +4244,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_hermitenorm_node",
-      "args": [
-        3.0,
-        1.0
-      ],
+      "args": [3.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -5130,10 +4258,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_hermitenorm_weight",
-      "args": [
-        3.0,
-        1.0
-      ],
+      "args": [3.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.6710855164206668,
@@ -5147,10 +4272,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_laguerre_node",
-      "args": [
-        3.0,
-        0.0
-      ],
+      "args": [3.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.41577455678347913,
@@ -5164,10 +4286,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_laguerre_node",
-      "args": [
-        3.0,
-        2.0
-      ],
+      "args": [3.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 6.289945082937478,
@@ -5181,10 +4300,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_laguerre_weight",
-      "args": [
-        3.0,
-        0.0
-      ],
+      "args": [3.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.7110930099291731,
@@ -5198,10 +4314,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_laguerre_weight",
-      "args": [
-        3.0,
-        2.0
-      ],
+      "args": [3.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.010389256501586133,
@@ -5215,11 +4328,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_genlaguerre_node",
-      "args": [
-        4.0,
-        1.5,
-        2.0
-      ],
+      "args": [4.0, 1.5, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 6.319300497896596,
@@ -5233,11 +4342,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_genlaguerre_weight",
-      "args": [
-        4.0,
-        1.5,
-        2.0
-      ],
+      "args": [4.0, 1.5, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.11894878057553862,
@@ -5251,12 +4356,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_jacobi_node",
-      "args": [
-        4.0,
-        0.5,
-        1.0,
-        1.0
-      ],
+      "args": [4.0, 0.5, 1.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": -0.23082864090118665,
@@ -5270,12 +4370,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_jacobi_weight",
-      "args": [
-        4.0,
-        0.5,
-        1.0,
-        1.0
-      ],
+      "args": [4.0, 0.5, 1.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5011891464890381,
@@ -5289,11 +4384,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_gegenbauer_node",
-      "args": [
-        4.0,
-        1.25,
-        2.0
-      ],
+      "args": [4.0, 1.25, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.29640932576492884,
@@ -5307,11 +4398,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_gegenbauer_weight",
-      "args": [
-        4.0,
-        1.25,
-        2.0
-      ],
+      "args": [4.0, 1.25, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5366920142035819,
@@ -5325,10 +4412,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_legendre_node",
-      "args": [
-        3.0,
-        0.0
-      ],
+      "args": [3.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": -0.7745966692414834,
@@ -5342,10 +4426,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_legendre_node",
-      "args": [
-        3.0,
-        1.0
-      ],
+      "args": [3.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -5359,10 +4440,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_legendre_node",
-      "args": [
-        3.0,
-        2.0
-      ],
+      "args": [3.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.7745966692414834,
@@ -5376,10 +4454,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_legendre_weight",
-      "args": [
-        3.0,
-        0.0
-      ],
+      "args": [3.0, 0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5555555555555558,
@@ -5393,10 +4468,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_legendre_weight",
-      "args": [
-        3.0,
-        1.0
-      ],
+      "args": [3.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.8888888888888883,
@@ -5410,10 +4482,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "roots_legendre_weight",
-      "args": [
-        3.0,
-        2.0
-      ],
+      "args": [3.0, 2.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5555555555555558,
@@ -5427,9 +4496,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "lambertw",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.5671432904097838,
@@ -5501,14 +4568,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "exp1",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.2193839343955205,
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::exp1"
       }
     },
@@ -5529,8 +4594,8 @@
           "re": -9.933832570625416,
           "im": -3.141592653589793
         },
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::exp1"
       }
     },
@@ -5539,14 +4604,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "expi",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 1.895117816355937,
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -5567,8 +4630,8 @@
           "re": 0.33740392290096816,
           "im": 2.5168793971620795
         },
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -5577,15 +4640,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "expn",
-      "args": [
-        2.0,
-        1.0
-      ],
+      "args": [2.0, 1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.14849550677592194,
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::expn"
       }
     },
@@ -5594,15 +4654,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "hyp0f1",
-      "args": [
-        1.5,
-        0.25
-      ],
+      "args": [1.5, 0.25],
       "expected": {
         "kind": "scalar",
         "value": 1.1752011936438014,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::hyp0f1"
       }
     },
@@ -5611,16 +4668,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "hyp1f1",
-      "args": [
-        1.0,
-        2.0,
-        0.5
-      ],
+      "args": [1.0, 2.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 1.2974425414002564,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::hyp1f1"
       }
     },
@@ -5629,17 +4682,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "hyp2f1",
-      "args": [
-        1.0,
-        1.0,
-        2.0,
-        0.5
-      ],
+      "args": [1.0, 1.0, 2.0, 0.5],
       "expected": {
         "kind": "scalar",
         "value": 1.3862943611198901,
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::hyp2f1"
       }
     },
@@ -5660,8 +4708,8 @@
           "re": 0.408340591652994,
           "im": 0.34711702315061466
         },
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::lambertw"
       }
     },
@@ -5682,8 +4730,8 @@
           "re": 0.36952511391841775,
           "im": 0.6785354011085766
         },
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::lambertw"
       }
     },
@@ -5704,8 +4752,8 @@
           "re": -0.59587823367154,
           "im": 0.23777430918164083
         },
-        "atol": 1e-09,
-        "rtol": 1e-09,
+        "atol": 1e-9,
+        "rtol": 1e-9,
         "contract_ref": "fsci_special::lambertw"
       }
     },
@@ -5726,8 +4774,8 @@
           "re": 0.0002816244519814326,
           "im": -0.17932453503935886
         },
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::exp1"
       }
     },
@@ -5748,8 +4796,8 @@
           "re": -0.0002816244519814326,
           "im": 2.9622681185504343
         },
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -5770,8 +4818,8 @@
           "re": -0.0002816244519814326,
           "im": -2.9622681185504343
         },
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -5792,8 +4840,8 @@
           "re": 0.8901275333915287,
           "im": 2.939664001213473
         },
-        "atol": 1e-08,
-        "rtol": 1e-08,
+        "atol": 1e-8,
+        "rtol": 1e-8,
         "contract_ref": "fsci_special::expi"
       }
     },
@@ -5816,8 +4864,8 @@
           "re": -0.19223259376895815,
           "im": 0.0953019560177715
         },
-        "atol": 1e-07,
-        "rtol": 1e-07,
+        "atol": 1e-7,
+        "rtol": 1e-7,
         "contract_ref": "fsci_special::jvp"
       }
     },
@@ -5840,8 +4888,8 @@
           "re": 0.26748064523955956,
           "im": 0.36276374710793996
         },
-        "atol": 1e-07,
-        "rtol": 1e-07,
+        "atol": 1e-7,
+        "rtol": 1e-7,
         "contract_ref": "fsci_special::jvp"
       }
     },
@@ -5864,8 +4912,8 @@
           "re": 0.07621252944147514,
           "im": 2.6014005823050814
         },
-        "atol": 1e-07,
-        "rtol": 1e-07,
+        "atol": 1e-7,
+        "rtol": 1e-7,
         "contract_ref": "fsci_special::yvp"
       }
     },
@@ -5888,8 +4936,8 @@
           "re": -0.1804902751582525,
           "im": 0.15516306557796217
         },
-        "atol": 1e-07,
-        "rtol": 1e-07,
+        "atol": 1e-7,
+        "rtol": 1e-7,
         "contract_ref": "fsci_special::ivp"
       }
     },
@@ -5912,8 +4960,8 @@
           "re": 0.042756480365161366,
           "im": -0.06214397988657908
         },
-        "atol": 1e-07,
-        "rtol": 1e-07,
+        "atol": 1e-7,
+        "rtol": 1e-7,
         "contract_ref": "fsci_special::ivp"
       }
     },
@@ -5936,8 +4984,8 @@
           "re": 0.08060111568567119,
           "im": -3.9979885617571163
         },
-        "atol": 1e-07,
-        "rtol": 1e-07,
+        "atol": 1e-7,
+        "rtol": 1e-7,
         "contract_ref": "fsci_special::kvp"
       }
     },
@@ -5946,9 +4994,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erf",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -5962,14 +5008,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erf",
-      "args": [
-        -1.0
-      ],
+      "args": [-1.0],
       "expected": {
         "kind": "scalar",
         "value": -0.8427007929497148,
-        "atol": 2e-07,
-        "rtol": 2e-07,
+        "atol": 2e-7,
+        "rtol": 2e-7,
         "contract_ref": "fsci_special::erf"
       }
     },
@@ -5978,14 +5022,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erf",
-      "args": [
-        1e-10
-      ],
+      "args": [1e-10],
       "expected": {
         "kind": "scalar",
         "value": 1.1283791670955126e-10,
         "atol": 1e-15,
-        "rtol": 1e-06,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::erf"
       }
     },
@@ -5994,14 +5036,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erf",
-      "args": [
-        5.0
-      ],
+      "args": [5.0],
       "expected": {
         "kind": "scalar",
         "value": 0.9999999999984626,
         "atol": 1e-12,
-        "rtol": 1e-07,
+        "rtol": 1e-7,
         "contract_ref": "fsci_special::erf"
       }
     },
@@ -6010,9 +5050,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfc",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 1.0,
@@ -6026,14 +5064,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfc",
-      "args": [
-        -5.0
-      ],
+      "args": [-5.0],
       "expected": {
         "kind": "scalar",
         "value": 1.9999999999984626,
         "atol": 1e-12,
-        "rtol": 1e-07,
+        "rtol": 1e-7,
         "contract_ref": "fsci_special::erfc"
       }
     },
@@ -6042,9 +5078,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfinv",
-      "args": [
-        0.0
-      ],
+      "args": [0.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,
@@ -6058,14 +5092,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfinv",
-      "args": [
-        0.5
-      ],
+      "args": [0.5],
       "expected": {
         "kind": "scalar",
         "value": 0.4769362762044699,
-        "atol": 1e-07,
-        "rtol": 1e-06,
+        "atol": 1e-7,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::erfinv"
       }
     },
@@ -6074,14 +5106,12 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfinv",
-      "args": [
-        -0.5
-      ],
+      "args": [-0.5],
       "expected": {
         "kind": "scalar",
         "value": -0.4769362762044699,
-        "atol": 1e-07,
-        "rtol": 1e-06,
+        "atol": 1e-7,
+        "rtol": 1e-6,
         "contract_ref": "fsci_special::erfinv"
       }
     },
@@ -6090,9 +5120,7 @@
       "category": "differential",
       "mode": "Strict",
       "function": "erfcinv",
-      "args": [
-        1.0
-      ],
+      "args": [1.0],
       "expected": {
         "kind": "scalar",
         "value": 0.0,

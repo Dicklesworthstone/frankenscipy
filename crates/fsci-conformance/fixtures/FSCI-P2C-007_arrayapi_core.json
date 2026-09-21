@@ -13,9 +13,7 @@
         "kind": "array",
         "shape": [],
         "dtype": "float64",
-        "values": [
-          { "kind": "f64", "value": 0.0 }
-        ],
+        "values": [{ "kind": "f64", "value": 0.0 }],
         "contract_ref": "fsci_arrayapi::creation::zeros"
       }
     },
@@ -235,18 +233,13 @@
       "indexing_mode": "basic",
       "index": {
         "kind": "basic",
-        "slices": [
-          { "start": 1, "stop": 3, "step": 1 }
-        ]
+        "slices": [{ "start": 1, "stop": 3, "step": 1 }]
       },
       "expected": {
         "kind": "array",
         "shape": [2],
         "dtype": "float64",
-        "values": [
-          { "kind": "f64", "value": 20.0 },
-          { "kind": "f64", "value": 30.0 }
-        ],
+        "values": [{ "kind": "f64", "value": 20.0 }, { "kind": "f64", "value": 30.0 }],
         "contract_ref": "fsci_arrayapi::indexing::getitem"
       }
     },
@@ -272,10 +265,7 @@
         "kind": "array",
         "shape": [2],
         "dtype": "float64",
-        "values": [
-          { "kind": "f64", "value": 40.0 },
-          { "kind": "f64", "value": 10.0 }
-        ],
+        "values": [{ "kind": "f64", "value": 40.0 }, { "kind": "f64", "value": 10.0 }],
         "contract_ref": "fsci_arrayapi::indexing::getitem"
       }
     },

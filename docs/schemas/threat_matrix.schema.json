@@ -50,7 +50,15 @@
   "$defs": {
     "ThreatEntry": {
       "type": "object",
-      "required": ["threat_id", "subsystem", "category", "severity", "likelihood", "mitigation", "test_reference"],
+      "required": [
+        "threat_id",
+        "subsystem",
+        "category",
+        "severity",
+        "likelihood",
+        "mitigation",
+        "test_reference"
+      ],
       "additionalProperties": false,
       "properties": {
         "threat_id": {
@@ -64,7 +72,12 @@
         },
         "category": {
           "type": "string",
-          "enum": ["numerical_instability", "malformed_input", "resource_exhaustion", "compatibility_drift"],
+          "enum": [
+            "numerical_instability",
+            "malformed_input",
+            "resource_exhaustion",
+            "compatibility_drift"
+          ],
           "description": "Threat category from the security model."
         },
         "severity": {

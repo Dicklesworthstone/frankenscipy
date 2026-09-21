@@ -6,7 +6,13 @@
   "entries": [
     {
       "scipy_module": "scipy.integrate._ivp.ivp",
-      "key_functions": ["solve_ivp", "prepare_events", "solve_event_equation", "handle_events", "find_active_events"],
+      "key_functions": [
+        "solve_ivp",
+        "prepare_events",
+        "solve_event_equation",
+        "handle_events",
+        "find_active_events"
+      ],
       "behavior_summary": "Main entry point for initial value problem solving. Accepts a callable RHS, 2-element t_span, initial state y0, and dispatches to one of six solver classes (RK23, RK45, DOP853, Radau, BDF, LSODA) by string name or OdeSolver subclass. Manages the stepping loop, dense output collection, event detection via sign-change + Brent root-finding, and t_eval interpolation. Returns an OdeResult bunch with t, y, sol, t_events, y_events, nfev, njev, nlu, status, message, success fields. Events support terminal (bool or positive int for max count) and direction (+1/-1/0) attributes. The function wraps user fun/jac with args if provided. t_eval values must be sorted consistently with integration direction and lie within t_span.",
       "rust_strategy": "Implement solve_ivp as a generic orchestrator parameterized by a SolverKind enum. Use trait objects or an enum dispatch for the solver polymorphism. The stepping loop, event detection, and dense output collection translate directly. OdeResult maps to a Rust struct. Event root-finding uses Brent's method from a local implementation (no Fortran dependency). The args-wrapping pattern becomes a closure capture. t_eval handling uses binary search (equivalent to np.searchsorted).",
       "risk_level": "high",
@@ -27,7 +33,15 @@
     },
     {
       "scipy_module": "scipy.integrate._ivp.base",
-      "key_functions": ["OdeSolver", "OdeSolver.__init__", "OdeSolver.step", "OdeSolver.dense_output", "DenseOutput", "ConstantDenseOutput", "check_arguments"],
+      "key_functions": [
+        "OdeSolver",
+        "OdeSolver.__init__",
+        "OdeSolver.step",
+        "OdeSolver.dense_output",
+        "DenseOutput",
+        "ConstantDenseOutput",
+        "check_arguments"
+      ],
       "behavior_summary": "OdeSolver is the abstract base for all IVP solvers. Constructor validates y0 (must be 1-D, finite, cast to float or complex), wraps fun for nfev counting, sets up vectorized/non-vectorized variants, computes direction=sign(t_bound-t0) (or 1 if equal), initializes counters. The step() method calls _step_impl(), updates status to 'finished' when direction*(t-t_bound)>=0, or 'failed' on unsuccessful step. Corner cases: n==0 (empty system) or t==t_bound immediately finishes. dense_output() requires at least one successful step (t_old != None). DenseOutput base stores t_old, t, t_min, t_max and validates t dimensionality. ConstantDenseOutput returns the constant value for degenerate cases.",
       "rust_strategy": "Define an OdeSolver trait with step_impl() and dense_output_impl() methods. The base state (t, y, t_old, t_bound, direction, nfev, njev, nlu, status) goes into a common struct composed into each solver. The fun-wrapping logic (vectorized vs single) becomes trait-based dispatch. check_arguments becomes a validation function returning Result<(WrappedFun, Array1<f64>), Error>.",
       "risk_level": "medium",
@@ -46,7 +60,15 @@
     },
     {
       "scipy_module": "scipy.integrate._ivp.rk",
-      "key_functions": ["RungeKutta", "RK23", "RK45", "DOP853", "rk_step", "RkDenseOutput", "Dop853DenseOutput"],
+      "key_functions": [
+        "RungeKutta",
+        "RK23",
+        "RK45",
+        "DOP853",
+        "rk_step",
+        "RkDenseOutput",
+        "Dop853DenseOutput"
+      ],
       "behavior_summary": "Explicit Runge-Kutta solvers. RungeKutta base constructor validates max_step (>0), tolerances, selects initial step (automatic or user-provided), allocates K storage. Step implementation uses adaptive step size control: SAFETY=0.9, MIN_FACTOR=0.2, MAX_FACTOR=10. Error norm < 1 accepts step; error_norm==0 gives MAX_FACTOR growth. After rejection, growth factor capped at 1. Minimum step size is 10*ULP(t). RK23: Bogacki-Shampine order 3(2), 3 stages. RK45: Dormand-Prince order 5(4), 6 stages. DOP853: order 8, 12 stages with extended 16 stages for dense output; uses dual error estimators E3 and E5 with hypot-based combination. All support complex domain. Dense output: RK23/RK45 use polynomial interpolation via Q=K^T*P; DOP853 uses 7th-order Aitken-Neville like scheme with F coefficients.",
       "rust_strategy": "Implement RungeKutta as a generic struct parameterized by Butcher tableau constants (compile-time arrays or const generics where possible). RK23/RK45/DOP853 become type aliases or specific instantiations. The step loop with adaptive step control translates directly. Dense output interpolants become separate structs implementing a DenseOutput trait. DOP853's extended stages and dual error estimator need careful porting. FSAL (first-same-as-last) property is implicit in rk_step where K[-1]=f_new.",
       "risk_level": "high",
@@ -140,7 +162,16 @@
     },
     {
       "scipy_module": "scipy.integrate._ivp.common",
-      "key_functions": ["validate_tol", "validate_first_step", "validate_max_step", "select_initial_step", "norm", "warn_extraneous", "OdeSolution", "num_jac"],
+      "key_functions": [
+        "validate_tol",
+        "validate_first_step",
+        "validate_max_step",
+        "select_initial_step",
+        "norm",
+        "warn_extraneous",
+        "OdeSolution",
+        "num_jac"
+      ],
       "behavior_summary": "Utility functions for IVP solver infrastructure. validate_tol: clamps rtol to max(rtol, 100*EPS) with warning, validates atol shape (scalar or (n,)), rejects negative atol. validate_first_step: rejects <= 0 or exceeding |t_bound-t0|. validate_max_step: rejects <= 0. select_initial_step: Hairer-Norsett-Wanner algorithm from 'Solving ODEs I' Sec II.4 -- computes d0, d1 norms, estimates h0, evaluates f1 at h0 step, computes d2, then h1. Returns min(100*h0, h1, interval_length, max_step). Special cases: empty y0 returns inf, zero interval returns 0. norm: RMS norm = ||x||_2 / sqrt(size). OdeSolution: piecewise interpolant collection with binary search segment selection. num_jac: adaptive finite-difference Jacobian with step-size correction, supports dense and sparse structures.",
       "rust_strategy": "All utility functions are pure numerical computation and translate directly to Rust. validate_tol maps to a function returning Result<(f64, Array1<f64>), Error>. select_initial_step is the core heuristic requiring careful f64 arithmetic. norm is trivial. OdeSolution becomes a struct with Vec<Box<dyn DenseOutput>> and binary search. num_jac requires the most work: the adaptive step-size correction algorithm with the reject/small/big thresholds. Sparse num_jac uses COO->CSC conversion.",
       "risk_level": "medium",

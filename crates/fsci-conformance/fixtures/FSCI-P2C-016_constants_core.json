@@ -636,7 +636,7 @@
       "args": ["BOHR_MAGNETON_EV_T"],
       "expected": {
         "kind": "scalar",
-        "value": 5.7883817982e-05,
+        "value": 5.7883817982e-5,
         "atol": 0.0,
         "rtol": 1e-15,
         "contract_ref": "scipy.constants.value('Bohr magneton in eV/T')"

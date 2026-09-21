@@ -7,18 +7,9 @@
   "all_pass": true,
   "duration_ns": 0,
   "snapshot": {
-    "zeros_shape": [
-      3,
-      4
-    ],
+    "zeros_shape": [3, 4],
     "linspace_len": 10,
-    "transposed_shape": [
-      4,
-      3
-    ],
-    "broadcast_result": [
-      3,
-      4
-    ]
+    "transposed_shape": [4, 3],
+    "broadcast_result": [3, 4]
   }
 }

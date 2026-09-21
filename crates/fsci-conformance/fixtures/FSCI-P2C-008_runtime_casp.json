@@ -191,7 +191,10 @@
       "metadata_signal": null,
       "anomaly_signal": null,
       "condition_state": null,
-      "observations": [1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15],
+      "observations": [
+        1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15,
+        1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15
+      ],
       "expected": {
         "kind": "calibrator_fallback",
         "should_fallback": false
@@ -206,7 +209,10 @@
       "metadata_signal": null,
       "anomaly_signal": null,
       "condition_state": null,
-      "observations": [1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+      "observations": [
+        1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1e-15, 1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0
+      ],
       "expected": {
         "kind": "calibrator_fallback",
         "should_fallback": true

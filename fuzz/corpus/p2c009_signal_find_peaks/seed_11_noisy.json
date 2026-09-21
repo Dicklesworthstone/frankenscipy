@@ -1,1 +1,6 @@
-{"signal":[0.1,0.9,0.2,0.8,0.3,1.0,0.25,0.7,0.15],"height":null,"distance":null,"prominence":null}
+{
+  "signal": [0.1, 0.9, 0.2, 0.8, 0.3, 1.0, 0.25, 0.7, 0.15],
+  "height": null,
+  "distance": null,
+  "prominence": null
+}

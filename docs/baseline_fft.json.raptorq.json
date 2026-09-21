@@ -5,9 +5,7 @@
   "seed": 1414,
   "source_symbols": 7,
   "repair_symbols": 1,
-  "repair_symbol_hashes": [
-    "654685de81f0267af3900e2718bbfe5beeb9a6d7f31ea22a55adf89bda765205"
-  ],
+  "repair_symbol_hashes": ["654685de81f0267af3900e2718bbfe5beeb9a6d7f31ea22a55adf89bda765205"],
   "repair_symbol_payloads_hex": [
     "53ea15c3fc85eb5cf81cb9049365db0be823f0156bc61d2b36c88945ddecb094ddd290a3b64ed542a516fc523e09f275135f1963838ec818fdb65c7d41af7ac9519eee37bce8a9d87e5c8b179d0ed502a24937f3c5c7e40930b6f3b25829b23b661afd57503166895cd9c4f0ee64d1505c70c5eead478a7e082ce9dc1cf72406"
   ]

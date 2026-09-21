@@ -10,9 +10,9 @@
   "benchmarks": {
     "bfgs": {
       "rosenbrock_dim2": {
-        "median_us": 2.900,
-        "lower_us": 2.800,
-        "upper_us": 3.000,
+        "median_us": 2.9,
+        "lower_us": 2.8,
+        "upper_us": 3.0,
         "sample_size": 100
       },
       "rosenbrock_dim5": {
@@ -24,7 +24,7 @@
       "rosenbrock_dim10": {
         "median_us": 76.571,
         "lower_us": 75.552,
-        "upper_us": 77.680,
+        "upper_us": 77.68,
         "sample_size": 100
       },
       "quadratic_dim2": {
@@ -35,12 +35,12 @@
       },
       "quadratic_dim5": {
         "median_ns": 649.22,
-        "lower_ns": 641.90,
-        "upper_ns": 656.10,
+        "lower_ns": 641.9,
+        "upper_ns": 656.1,
         "sample_size": 100
       },
       "quadratic_dim10": {
-        "median_ns": 938.20,
+        "median_ns": 938.2,
         "lower_ns": 929.61,
         "upper_ns": 946.46,
         "sample_size": 100
