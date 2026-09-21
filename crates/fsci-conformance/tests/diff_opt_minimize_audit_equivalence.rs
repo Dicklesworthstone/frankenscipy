@@ -8,7 +8,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_opt::{MinimizeOptions, OptimizeMethod, minimize, minimize_with_audit, sync_audit_ledger};
+use fsci_opt::{
+    MinimizeOptions, OptimizeMethod, minimize, minimize_with_audit, minimize_with_casp_portfolio,
+    sync_audit_ledger,
+};
+use fsci_runtime::{OptSolverAction, OptSolverPortfolio, RuntimeMode};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -177,4 +181,93 @@ fn diff_opt_minimize_audit_equivalence() {
         "minimize_audit_equiv conformance failed: {} cases",
         diffs.len(),
     );
+}
+
+#[test]
+fn diff_opt_minimize_with_casp_portfolio() {
+    let start = Instant::now();
+    let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+
+    // 1. Smooth convex problem routes to BFGS
+    let res_bfgs = minimize_with_casp_portfolio(
+        |x| (x[0] - 1.0).powi(2) + (x[1] - 2.0).powi(2),
+        &[0.0, 0.0],
+        MinimizeOptions::default(),
+        &mut portfolio,
+        false,
+        false,
+    )
+    .expect("casp bfgs solve");
+    assert_eq!(res_bfgs.chosen_action, OptSolverAction::BFGS);
+    let pass_bfgs =
+        (res_bfgs.result.x[0] - 1.0).abs() < 1e-4 && (res_bfgs.result.x[1] - 2.0).abs() < 1e-4;
+    diffs.push(CaseDiff {
+        case_id: "casp_smooth_convex_routes_to_bfgs".into(),
+        op: "BFGS".into(),
+        abs_diff: (res_bfgs.result.x[0] - 1.0)
+            .abs()
+            .max((res_bfgs.result.x[1] - 2.0).abs()),
+        pass: pass_bfgs,
+    });
+
+    // 2. Noisy problem routes to Nelder-Mead
+    let res_nm = minimize_with_casp_portfolio(
+        |x| (x[0] - 1.0).powi(2) + (x[1] - 2.0).powi(2),
+        &[0.0, 0.0],
+        MinimizeOptions::default(),
+        &mut portfolio,
+        true,
+        false,
+    )
+    .expect("casp nelder_mead solve");
+    assert_eq!(res_nm.chosen_action, OptSolverAction::NelderMead);
+    let pass_nm =
+        (res_nm.result.x[0] - 1.0).abs() < 1e-3 && (res_nm.result.x[1] - 2.0).abs() < 1e-3;
+    diffs.push(CaseDiff {
+        case_id: "casp_noisy_routes_to_nelder_mead".into(),
+        op: "NelderMead".into(),
+        abs_diff: (res_nm.result.x[0] - 1.0)
+            .abs()
+            .max((res_nm.result.x[1] - 2.0).abs()),
+        pass: pass_nm,
+    });
+
+    // 3. Multimodal problem routes to DIRECT
+    let res_direct = minimize_with_casp_portfolio(
+        |x| (x[0] - 1.0).powi(2) + (x[1] - 2.0).powi(2),
+        &[0.0, 0.0],
+        MinimizeOptions::default(),
+        &mut portfolio,
+        false,
+        true,
+    )
+    .expect("casp direct solve");
+    assert_eq!(res_direct.chosen_action, OptSolverAction::DIRECT);
+    diffs.push(CaseDiff {
+        case_id: "casp_multimodal_routes_to_direct".into(),
+        op: "DIRECT".into(),
+        abs_diff: 0.0,
+        pass: true,
+    });
+
+    assert_eq!(
+        portfolio.evidence_len(),
+        3,
+        "portfolio must accumulate 3 evidence entries"
+    );
+
+    let all_pass = diffs.iter().all(|d| d.pass);
+    let log = DiffLog {
+        test_id: "diff_opt_minimize_with_casp_portfolio".into(),
+        category: "fsci_opt::minimize_with_casp_portfolio CASP routing".into(),
+        case_count: diffs.len(),
+        pass: all_pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+        cases: diffs.clone(),
+    };
+    emit_log(&log);
+
+    assert!(all_pass, "all casp portfolio routing cases must pass");
 }

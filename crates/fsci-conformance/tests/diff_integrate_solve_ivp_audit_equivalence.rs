@@ -9,8 +9,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_integrate::{SolveIvpOptions, SolverKind, solve_ivp, solve_ivp_with_audit};
-use fsci_runtime::{AuditLedger, RuntimeMode};
+use fsci_integrate::{
+    SolveIvpOptions, SolverKind, solve_ivp, solve_ivp_with_audit, solve_ivp_with_casp_portfolio,
+};
+use fsci_runtime::{AuditLedger, OdeSolverAction, OdeSolverPortfolio, RuntimeMode};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -156,4 +158,83 @@ fn diff_integrate_solve_ivp_audit_equivalence() {
         diffs.len(),
         max_overall
     );
+}
+
+#[test]
+fn diff_integrate_solve_ivp_with_casp_portfolio() {
+    let start = Instant::now();
+    let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+
+    let mut f = |_t: f64, y: &[f64]| vec![-y[0]];
+    let opts = SolveIvpOptions {
+        t_span: (0.0, 1.0),
+        y0: &[1.0],
+        method: SolverKind::Rk45,
+        t_eval: None,
+        dense_output: false,
+        events: None,
+        rtol: 1e-6,
+        atol: fsci_integrate::ToleranceValue::Scalar(1e-9),
+        first_step: None,
+        max_step: f64::INFINITY,
+        mode: RuntimeMode::Strict,
+    };
+
+    // 1. Non-stiff system routes to RK45
+    let res_nonstiff = solve_ivp_with_casp_portfolio(&mut f, &opts, &mut portfolio, 1.0, false)
+        .expect("casp rk45 solve");
+    assert_eq!(res_nonstiff.chosen_action, OdeSolverAction::RK45);
+    let exact = (-1.0_f64).exp();
+    let last_y = *res_nonstiff.result.y.last().unwrap().first().unwrap();
+    let d1 = (last_y - exact).abs();
+    diffs.push(CaseDiff {
+        case_id: "casp_nonstiff_routes_to_rk45".into(),
+        op: "RK45".into(),
+        abs_diff: d1,
+        pass: d1 < 1e-5,
+    });
+
+    // 2. Stiff system routes to BDF
+    let res_stiff = solve_ivp_with_casp_portfolio(&mut f, &opts, &mut portfolio, 1e6, false)
+        .expect("casp bdf solve");
+    assert_eq!(res_stiff.chosen_action, OdeSolverAction::BDF);
+    diffs.push(CaseDiff {
+        case_id: "casp_stiff_routes_to_bdf".into(),
+        op: "BDF".into(),
+        abs_diff: 0.0,
+        pass: res_stiff.result.success,
+    });
+
+    // 3. Algebraic / DAE constrained system routes to Radau
+    let res_radau = solve_ivp_with_casp_portfolio(&mut f, &opts, &mut portfolio, 10.0, true)
+        .expect("casp radau solve");
+    assert_eq!(res_radau.chosen_action, OdeSolverAction::Radau);
+    diffs.push(CaseDiff {
+        case_id: "casp_algebraic_routes_to_radau".into(),
+        op: "Radau".into(),
+        abs_diff: 0.0,
+        pass: res_radau.result.success,
+    });
+
+    assert_eq!(
+        portfolio.evidence_len(),
+        3,
+        "portfolio must accumulate 3 evidence entries"
+    );
+
+    let all_pass = diffs.iter().all(|d| d.pass);
+    let log = DiffLog {
+        test_id: "diff_integrate_solve_ivp_with_casp_portfolio".into(),
+        category: "fsci_integrate::solve_ivp_with_casp_portfolio CASP routing".into(),
+        case_count: diffs.len(),
+        max_abs_diff: d1,
+        pass: all_pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+        cases: diffs.clone(),
+    };
+    emit_log(&log);
+
+    assert!(all_pass, "all casp portfolio routing cases must pass");
 }
