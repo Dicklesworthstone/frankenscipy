@@ -237,6 +237,8 @@ pub use linalg::{
     // Direct solvers
     spsolve,
     spsolve_triangular,
+    spsolve_with_audit,
+    spsolve_with_casp,
     strongly_connected_components,
     structural_rank,
     svds,
@@ -2859,4 +2861,93 @@ mod tests {
         assert!(res.converged);
         assert_eq!(portfolio.evidence_len(), 1);
     }
+
+    #[test]
+    fn test_spsolve_with_casp_spd_system() {
+        let n = 5;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            data.push(4.0);
+            if i > 0 {
+                rows.push(i);
+                cols.push(i - 1);
+                data.push(-1.0);
+                rows.push(i - 1);
+                cols.push(i);
+                data.push(-1.0);
+            }
+        }
+        let coo = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false).unwrap();
+        let csr = coo.to_csr().unwrap();
+        let b = vec![2.0; n];
+
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = spsolve_with_casp(&csr, &b, SolveOptions::default(), &mut portfolio)
+            .expect("spsolve_with_casp");
+
+        assert_eq!(res.solution.len(), n);
+        assert_eq!(portfolio.evidence_len(), 1);
+
+        // Check residual Ax - b is small
+        let ax = spmv_csr(&csr, &res.solution).unwrap();
+        for i in 0..n {
+            assert!((ax[i] - b[i]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_spsolve_with_casp_ill_conditioned_system() {
+        let n = 4;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            data.push(if i == 0 { 1e9 } else { 1.0 });
+        }
+        let coo = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false).unwrap();
+        let csr = coo.to_csr().unwrap();
+        let b = vec![1.0; n];
+
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = spsolve_with_casp(&csr, &b, SolveOptions::default(), &mut portfolio)
+            .expect("spsolve_with_casp");
+
+        assert_eq!(res.solution.len(), n);
+        assert_eq!(res.backend_used, SparseBackend::NativeSparseLu);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_spsolve_with_audit_fail_closed() {
+        let n = 3;
+        let coo = CooMatrix::from_triplets(
+            Shape2D::new(n, n + 1), // Non-square
+            vec![1.0, 1.0, 1.0],
+            vec![0, 1, 2],
+            vec![0, 1, 2],
+            false,
+        )
+        .unwrap();
+        let csr = coo.to_csr().unwrap();
+        let b = vec![1.0; n];
+
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let ledger = sync_audit_ledger();
+        let res = spsolve_with_audit(&csr, &b, SolveOptions::default(), &mut portfolio, &ledger);
+        assert!(res.is_err());
+
+        let guard = ledger.lock().unwrap();
+        assert_eq!(guard.len(), 1);
+        assert!(matches!(
+            guard.entries()[0].action,
+            fsci_runtime::AuditAction::FailClosed { .. }
+        ));
+    }
 }
+

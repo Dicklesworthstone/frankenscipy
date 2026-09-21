@@ -10008,6 +10008,144 @@ pub fn solve_with_casp_portfolio(
     })
 }
 
+/// Solve a sparse linear system using CASP Bayesian expected-loss portfolio selection.
+///
+/// Matches the ergonomics of `fsci_linalg::solve_with_casp`.
+/// Dispatches dynamically to Conjugate Gradient on SPD systems, MINRES on symmetric indefinite systems,
+/// BiCGSTAB on general well-conditioned systems, and SuperLU direct LU factorization on
+/// ill-conditioned systems or when conformal drift triggers fallback.
+pub fn spsolve_with_casp(
+    a: &CsrMatrix,
+    b: &[f64],
+    options: SolveOptions,
+    portfolio: &mut SparseSolverPortfolio,
+) -> SparseResult<SolveResult> {
+    spsolve_with_casp_internal(a, b, options, portfolio, None)
+}
+
+/// Solve a sparse linear system using CASP Bayesian expected-loss portfolio selection with audit logging.
+///
+/// Matches the ergonomics of `fsci_linalg::solve_with_audit`.
+/// Records to the provided `SyncSharedAuditLedger`:
+/// - `FailClosed` events when input validation rejects malformed or non-finite inputs
+/// - `BoundedRecovery` events when iterative solver fails to converge and falls back to direct LU in hardened mode
+pub fn spsolve_with_audit(
+    a: &CsrMatrix,
+    b: &[f64],
+    options: SolveOptions,
+    portfolio: &mut SparseSolverPortfolio,
+    audit_ledger: &crate::audit::SyncSharedAuditLedger,
+) -> SparseResult<SolveResult> {
+    spsolve_with_casp_internal(a, b, options, portfolio, Some(audit_ledger))
+}
+
+fn spsolve_with_casp_internal(
+    a: &CsrMatrix,
+    b: &[f64],
+    options: SolveOptions,
+    portfolio: &mut SparseSolverPortfolio,
+    audit_ledger: Option<&crate::audit::SyncSharedAuditLedger>,
+) -> SparseResult<SolveResult> {
+    let shape = a.shape();
+    if !shape.is_square() {
+        if let Some(ledger) = audit_ledger {
+            crate::audit::record_fail_closed(
+                ledger,
+                b"shape",
+                "spsolve_with_casp::non_square",
+                "rejected: matrix must be square",
+            );
+        }
+        return Err(SparseError::InvalidShape {
+            message: "spsolve requires a square matrix".to_string(),
+        });
+    }
+    if b.len() != shape.rows {
+        if let Some(ledger) = audit_ledger {
+            crate::audit::record_fail_closed(
+                ledger,
+                b"shape",
+                "spsolve_with_casp::rhs_mismatch",
+                "rejected: rhs length must match matrix rows",
+            );
+        }
+        return Err(SparseError::IncompatibleShape {
+            message: "rhs length must match matrix rows".to_string(),
+        });
+    }
+    if (options.check_finite || options.mode == RuntimeMode::Hardened)
+        && (a.data().iter().any(|v| !v.is_finite()) || b.iter().any(|v| !v.is_finite()))
+    {
+        if let Some(ledger) = audit_ledger {
+            crate::audit::record_fail_closed(
+                ledger,
+                b"non_finite",
+                "spsolve_with_casp::non_finite",
+                "rejected: matrix/rhs contains NaN or Inf",
+            );
+        }
+        return Err(SparseError::NonFiniteInput {
+            message: "matrix/rhs contains NaN or Inf".to_string(),
+        });
+    }
+
+    if options.mode == RuntimeMode::Hardened && has_empty_structural_row(a) {
+        if let Some(ledger) = audit_ledger {
+            crate::audit::record_fail_closed(
+                ledger,
+                b"singular",
+                "spsolve_with_casp::empty_structural_row",
+                "rejected: detected empty structural row in hardened mode",
+            );
+        }
+        return Err(SparseError::SingularMatrix {
+            message: "detected empty structural row in hardened mode".to_string(),
+        });
+    }
+
+    let iterative_opts = IterativeSolveOptions {
+        mode: options.mode,
+        tol: 1e-10,
+        max_iter: Some(shape.rows.saturating_mul(2).max(50)),
+        check_finite: false,
+    };
+
+    let casp_res = solve_with_casp_portfolio(a, b, None, portfolio, iterative_opts)?;
+
+    if casp_res.fallback_active {
+        if let Some(ledger) = audit_ledger {
+            crate::audit::record_bounded_recovery(
+                ledger,
+                b"casp_fallback",
+                "casp_iterative_to_superlu_fallback",
+                "recovered: direct solve succeeded after iterative non-convergence",
+            );
+        }
+    }
+
+    let backend_used = match casp_res.chosen_action {
+        SparseSolverAction::SuperLU => SparseBackend::NativeSparseLu,
+        _ => SparseBackend::Auto,
+    };
+
+    let mut warnings = Vec::new();
+    if casp_res.fallback_active {
+        warnings.push("CASP iterative solve fallback to direct LU triggered".to_string());
+    } else if !casp_res.converged {
+        warnings.push(format!(
+            "CASP iterative solver did not converge; residual_norm={:.3e}",
+            casp_res.residual_norm
+        ));
+    }
+
+    Ok(SolveResult {
+        solution: casp_res.x,
+        backend_used,
+        ordering_used: options.ordering,
+        warnings,
+    })
+}
+
 fn casp_iterative_solve_inner(
     a: &CsrMatrix,
     b: &[f64],
