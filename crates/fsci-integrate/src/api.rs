@@ -996,6 +996,22 @@ where
     })
 }
 
+/// Solve an initial value problem using CASP condition-aware portfolio selection.
+///
+/// Selects RK45 for non-stiff dynamics, Radau IIA for algebraic/DAE constraints,
+/// and BDF for stiff systems via Bayesian expected-loss minimization, with
+/// online stiffness detection and conformal drift fallback.
+pub fn solve_ivp_with_casp<F>(
+    fun: &mut F,
+    options: &SolveIvpOptions<'_>,
+    portfolio: &mut OdeSolverPortfolio,
+) -> Result<OdePortfolioResult, IntegrateValidationError>
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64>,
+{
+    solve_ivp_with_casp_portfolio(fun, options, portfolio, 1.0, false)
+}
+
 /// Batched ODE integration: integrate the SAME dynamics `fun` from MANY initial conditions
 /// (`y0_rows`), one [`SolveIvpResult`] per row. This is the vmap-over-solver primitive SciPy
 /// lacks — there you loop `solve_ivp` in Python, calling the Python RHS thousands of times per
@@ -2372,6 +2388,22 @@ mod tests {
             .expect("solve_ivp portfolio");
 
         assert_eq!(res.chosen_action, OdeSolverAction::Radau);
+        assert!(res.result.success);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_solve_ivp_with_casp_standard_entrypoint() {
+        let mut portfolio = OdeSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let opts = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &[1.0, 0.0],
+            ..SolveIvpOptions::default()
+        };
+        let mut f = |_t: f64, y: &[f64]| vec![y[1], -y[0]];
+        let res = solve_ivp_with_casp(&mut f, &opts, &mut portfolio).expect("solve_ivp_with_casp");
+
+        assert_eq!(res.chosen_action, OdeSolverAction::RK45);
         assert!(res.result.success);
         assert_eq!(portfolio.evidence_len(), 1);
     }
