@@ -362,6 +362,7 @@ pub use hyper::{
     HYPER_DISPATCH_PLAN, HyperCaspDecision, HyperCaspProblem, HypergeometricBranch,
     HypergeometricFunction, hyp0f1, hyp0f1_scalar, hyp1f1, hyp2f1, hyperu, hyperu_scalar, pbdn_seq,
     pbdv, pbdv_seq, pbvv, pbvv_seq, pbwa, select_hypergeometric_branch,
+    select_hypergeometric_branch_with_casp,
 };
 pub use orthopoly::{
     MATHIEU_PERIODIC_CACHE_DISABLE_FOR_BENCH, assoc_laguerre, assoc_legendre_p,
