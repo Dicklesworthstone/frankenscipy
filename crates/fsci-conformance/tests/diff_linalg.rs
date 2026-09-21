@@ -7,8 +7,11 @@
 //! All tests emit structured JSON logs to
 //! `fixtures/artifacts/FSCI-P2C-002/diff/`.
 
-use fsci_linalg::{DecompOptions, SolveOptions, det, solve, svd};
-use fsci_runtime::RuntimeMode;
+use fsci_linalg::{
+    DecompOptions, SolveOptions, det, solve, solve_with_audit, solve_with_casp, svd,
+    sync_audit_ledger,
+};
+use fsci_runtime::{RuntimeMode, SolverPortfolio};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -53,7 +56,7 @@ fn emit_log(log: &DiffTestLog) {
 }
 
 const TOL: f64 = 1e-10;
-const DEFINED_DIFF_CASES: usize = 36;
+const DEFINED_DIFF_CASES: usize = 44;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 fn scipy_available() -> bool {
@@ -220,6 +223,12 @@ fn make_diag_dominant(n: usize, seed: u64) -> Vec<Vec<f64>> {
     m
 }
 
+fn make_hilbert_matrix(n: usize) -> Vec<Vec<f64>> {
+    (0..n)
+        .map(|i| (0..n).map(|j| 1.0 / ((i + j + 1) as f64)).collect())
+        .collect()
+}
+
 fn run_solve_diff(test_id: &str, a: &[Vec<f64>], b: &[f64]) {
     if !scipy_available_or_skip(test_id) {
         return;
@@ -278,6 +287,146 @@ fn run_solve_diff(test_id: &str, a: &[Vec<f64>], b: &[f64]) {
         eprintln!("  FAIL: {} — diff={:.2e}", test_id, diff);
     }
     assert!(pass, "Differential test {} failed: diff={}", test_id, diff);
+}
+
+fn run_solve_with_casp_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) {
+    if !scipy_available_or_skip(test_id) {
+        return;
+    }
+
+    let start = Instant::now();
+    let opts = SolveOptions {
+        mode: RuntimeMode::Strict,
+        check_finite: true,
+        ..SolveOptions::default()
+    };
+    let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 1);
+    let rust_result = solve_with_casp(a, b, opts, &mut portfolio);
+    let scipy_result = scipy_solve(a, b);
+
+    let (diff, pass, expected_str, actual_str) = match (&rust_result, &scipy_result) {
+        (Ok(rust), Some(scipy)) => {
+            let d = max_abs_diff_vec(&rust.x, &scipy.x);
+            let has_certificate = rust.certificate.is_some();
+            (
+                d,
+                d < tol && has_certificate,
+                format!("{:?}", scipy.x),
+                format!("{:?} (cert={})", rust.x, has_certificate),
+            )
+        }
+        (Err(e), None) => (0.0, true, "error".into(), format!("{:?}", e)),
+        (Ok(rust), None) => (
+            f64::NAN,
+            false,
+            "scipy unavailable".into(),
+            format!("{:?}", rust.x),
+        ),
+        (Err(e), Some(scipy)) => (
+            f64::INFINITY,
+            false,
+            format!("{:?}", scipy.x),
+            format!("{:?}", e),
+        ),
+    };
+
+    let log = DiffTestLog {
+        test_id: test_id.to_string(),
+        category: "differential_solve_with_casp".to_string(),
+        input_summary: format!("{}x{} matrix", a.len(), a.first().map_or(0, |r| r.len())),
+        expected: expected_str,
+        actual: actual_str,
+        diff,
+        tolerance: tol,
+        pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+    };
+    emit_log(&log);
+    if pass {
+        eprintln!("  PASS: {} — diff={:.2e}", test_id, diff);
+    } else {
+        eprintln!("  FAIL: {} — diff={:.2e}", test_id, diff);
+    }
+    assert!(pass, "Differential test {} failed: diff={}", test_id, diff);
+}
+
+fn run_solve_with_audit_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) {
+    if !scipy_available_or_skip(test_id) {
+        return;
+    }
+
+    let start = Instant::now();
+    let opts = SolveOptions {
+        mode: RuntimeMode::Strict,
+        check_finite: true,
+        ..SolveOptions::default()
+    };
+    let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 1);
+    let ledger = sync_audit_ledger();
+    let initial_entries = ledger.lock().map_or(0, |g| g.len());
+    let rust_result = solve_with_audit(a, b, opts, &mut portfolio, &ledger);
+    let scipy_result = scipy_solve(a, b);
+    let post_entries = ledger.lock().map_or(0, |g| g.len());
+    let recorded_audit = post_entries > initial_entries;
+
+    let (diff, pass, expected_str, actual_str) = match (&rust_result, &scipy_result) {
+        (Ok(rust), Some(scipy)) => {
+            let d = max_abs_diff_vec(&rust.x, &scipy.x);
+            let has_certificate = rust.certificate.is_some();
+            (
+                d,
+                d < tol && has_certificate && recorded_audit,
+                format!("{:?}", scipy.x),
+                format!(
+                    "{:?} (cert={}, audit_recorded={})",
+                    rust.x, has_certificate, recorded_audit
+                ),
+            )
+        }
+        (Err(e), None) => (
+            0.0,
+            recorded_audit,
+            "error".into(),
+            format!("{:?} (audit_recorded={})", e, recorded_audit),
+        ),
+        (Ok(rust), None) => (
+            f64::NAN,
+            false,
+            "scipy unavailable".into(),
+            format!("{:?}", rust.x),
+        ),
+        (Err(e), Some(scipy)) => (
+            f64::INFINITY,
+            false,
+            format!("{:?}", scipy.x),
+            format!("{:?}", e),
+        ),
+    };
+
+    let log = DiffTestLog {
+        test_id: test_id.to_string(),
+        category: "differential_solve_with_audit".to_string(),
+        input_summary: format!("{}x{} matrix", a.len(), a.first().map_or(0, |r| r.len())),
+        expected: expected_str,
+        actual: actual_str,
+        diff,
+        tolerance: tol,
+        pass,
+        timestamp_ms: timestamp_ms(),
+        duration_ns: start.elapsed().as_nanos(),
+    };
+    emit_log(&log);
+    if pass {
+        eprintln!("  PASS: {} — diff={:.2e}", test_id, diff);
+    } else {
+        eprintln!("  FAIL: {} — diff={:.2e}", test_id, diff);
+    }
+    assert!(
+        pass,
+        "Differential test {} failed: diff={}, audit_recorded={}",
+        test_id, diff, recorded_audit
+    );
 }
 
 fn run_det_diff(test_id: &str, a: &[Vec<f64>]) {
@@ -495,6 +644,74 @@ fn diff_solve_hilbert_like_4x4() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// DIFFERENTIAL TESTS: solve_with_casp (4 cases)
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn diff_solve_with_casp_hilbert_4x4() {
+    let a = make_hilbert_matrix(4);
+    let b = vec![1.0, 1.0, 1.0, 1.0];
+    run_solve_with_casp_diff("solve_with_casp_hilbert_4x4", &a, &b, 1e-8);
+}
+
+#[test]
+fn diff_solve_with_casp_hilbert_6x6() {
+    let a = make_hilbert_matrix(6);
+    let b = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    // Hilbert 6x6 has cond ~1.5e7 with solution components up to 6300;
+    // 5e-7 abs tol corresponds to ~2.4e-11 relative error.
+    run_solve_with_casp_diff("solve_with_casp_hilbert_6x6", &a, &b, 5e-7);
+}
+
+#[test]
+fn diff_solve_with_casp_diag_dominant_4x4() {
+    let a = make_diag_dominant(4, 0x1234);
+    let b = make_test_vector(4, 0x5678);
+    run_solve_with_casp_diff("solve_with_casp_diag_dominant_4x4", &a, &b, 1e-10);
+}
+
+#[test]
+fn diff_solve_with_casp_diag_dominant_8x8() {
+    let a = make_diag_dominant(8, 0x2345);
+    let b = make_test_vector(8, 0x6789);
+    run_solve_with_casp_diff("solve_with_casp_diag_dominant_8x8", &a, &b, 1e-10);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DIFFERENTIAL TESTS: solve_with_audit (4 cases)
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn diff_solve_with_audit_hilbert_4x4() {
+    let a = make_hilbert_matrix(4);
+    let b = vec![1.0, 1.0, 1.0, 1.0];
+    run_solve_with_audit_diff("solve_with_audit_hilbert_4x4", &a, &b, 1e-8);
+}
+
+#[test]
+fn diff_solve_with_audit_hilbert_6x6() {
+    let a = make_hilbert_matrix(6);
+    let b = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+    // Hilbert 6x6 has cond ~1.5e7 with solution components up to 6300;
+    // 5e-7 abs tol corresponds to ~2.4e-11 relative error.
+    run_solve_with_audit_diff("solve_with_audit_hilbert_6x6", &a, &b, 5e-7);
+}
+
+#[test]
+fn diff_solve_with_audit_diag_dominant_4x4() {
+    let a = make_diag_dominant(4, 0x1234);
+    let b = make_test_vector(4, 0x5678);
+    run_solve_with_audit_diff("solve_with_audit_diag_dominant_4x4", &a, &b, 1e-10);
+}
+
+#[test]
+fn diff_solve_with_audit_diag_dominant_8x8() {
+    let a = make_diag_dominant(8, 0x2345);
+    let b = make_test_vector(8, 0x6789);
+    run_solve_with_audit_diff("solve_with_audit_diag_dominant_8x8", &a, &b, 1e-10);
+}
+
+// ═══════════════════════════════════════════════════════════════
 // DIFFERENTIAL TESTS: det (15 cases)
 // ═══════════════════════════════════════════════════════════════
 
@@ -671,6 +888,8 @@ fn diff_linalg_summary() {
     eprintln!("\n── diff_linalg Summary ──");
     if scipy_available() {
         eprintln!("  solve differential tests: 12 cases");
+        eprintln!("  solve_with_casp differential tests: 4 cases");
+        eprintln!("  solve_with_audit differential tests: 4 cases");
         eprintln!("  det differential tests: 10 cases");
         eprintln!("  svd differential tests: 14 cases");
         eprintln!("  Total: {DEFINED_DIFF_CASES} subprocess-based differential tests");
