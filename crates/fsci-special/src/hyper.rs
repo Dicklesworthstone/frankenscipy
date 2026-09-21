@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
-use fsci_runtime::RuntimeMode;
+use fsci_runtime::{
+    HyperBranchAction, HyperSolverEvidenceEntry, HyperSolverPortfolio, RuntimeMode,
+};
 
 use crate::convenience::erfcx_scalar;
 use crate::gamma::{gammaincc_scalar, log_gammaincc_scalar};
@@ -324,6 +326,110 @@ pub fn select_hypergeometric_branch(
         HypergeometricFunction::Hyp1f1 => Ok(select_hyp1f1_branch(problem)),
         HypergeometricFunction::Hyp2f1 => select_hyp2f1_branch(problem, mode),
     }
+}
+
+/// Select the hypergeometric branch for a scalar special-function problem using CASP portfolio expected-loss minimization.
+pub fn select_hypergeometric_branch_with_casp(
+    problem: HyperCaspProblem,
+    mode: RuntimeMode,
+    portfolio: &mut HyperSolverPortfolio,
+) -> Result<HyperCaspDecision, SpecialError> {
+    if !problem.precision_target.is_finite() || problem.precision_target <= 0.0 {
+        return Err(SpecialError {
+            function: hyper_function_name(problem.function),
+            kind: SpecialErrorKind::DomainError,
+            mode,
+            detail: "precision_target must be positive and finite",
+        });
+    }
+
+    if !problem.a.is_finite()
+        || !problem.b.is_finite()
+        || !problem.z.is_finite()
+        || !problem.parameter_stability_margin.is_finite()
+        || problem.c.is_some_and(|c| !c.is_finite())
+    {
+        if mode == RuntimeMode::Hardened {
+            return Err(SpecialError {
+                function: hyper_function_name(problem.function),
+                kind: SpecialErrorKind::NonFiniteInput,
+                mode,
+                detail: "hypergeometric CASP inputs must be finite",
+            });
+        }
+        return Ok(hyper_casp_decision(
+            HypergeometricBranch::UnsupportedAnalyticContinuation,
+            problem,
+            0,
+            HYPER_UNSUPPORTED_CHAIN,
+            "non-finite strict-mode input is delegated to the unsupported branch",
+        ));
+    }
+
+    let is_negative_real_confluent =
+        problem.function == HypergeometricFunction::Hyp1f1 && problem.z < -2.0;
+
+    let (action, posterior, expected_losses, chosen_loss) = portfolio.select_action(
+        problem.z,
+        problem.parameter_stability_margin,
+        is_negative_real_confluent,
+    );
+
+    let fallback_active = portfolio.calibrator().should_fallback();
+
+    let decision = match action {
+        HyperBranchAction::DirectSeries => select_hypergeometric_branch(problem, mode)?,
+        HyperBranchAction::KummerTransform => hyper_casp_decision(
+            HypergeometricBranch::KummerTransform,
+            problem,
+            500,
+            HYP1F1_KUMMER_CHAIN,
+            "CASP portfolio selected Kummer transformation for negative argument",
+        ),
+        HyperBranchAction::PfaffTransform => hyper_casp_decision(
+            HypergeometricBranch::PfaffTransform,
+            problem,
+            500,
+            HYP2F1_PFAFF_CHAIN,
+            "CASP portfolio selected Pfaff linear transformation",
+        ),
+        HyperBranchAction::Asymptotic => hyper_casp_decision(
+            HypergeometricBranch::AsymptoticExpansion,
+            problem,
+            500,
+            HYP1F1_ASYMPTOTIC_CHAIN,
+            "CASP portfolio selected asymptotic expansion for large argument",
+        ),
+        HyperBranchAction::ContinuedFraction => hyper_casp_decision(
+            HypergeometricBranch::GaussSummation,
+            problem,
+            300,
+            HYP2F1_GAUSS_CHAIN,
+            "CASP portfolio selected boundary continued fraction or summation",
+        ),
+        HyperBranchAction::GuardedFallback => hyper_casp_decision(
+            HypergeometricBranch::ParameterGuard,
+            problem,
+            0,
+            HYPER_GUARD_CHAIN,
+            "CASP portfolio selected parameter guard / conformal fallback",
+        ),
+    };
+
+    portfolio.record_evidence(HyperSolverEvidenceEntry {
+        component: "fsci-special",
+        function_kind: hyper_function_name(problem.function),
+        z_abs: problem.z_abs,
+        parameter_stability_margin: problem.parameter_stability_margin,
+        chosen_action: action,
+        posterior: posterior.to_vec(),
+        expected_losses: expected_losses.to_vec(),
+        chosen_expected_loss: chosen_loss,
+        fallback_active,
+        term_count: Some(decision.max_terms),
+    });
+
+    Ok(decision)
 }
 
 /// Confluent hypergeometric function 1F1(a; b; z).
@@ -3884,6 +3990,54 @@ mod tests {
         };
 
         assert_eq!(kind, SpecialErrorKind::NonFiniteInput);
+    }
+
+    #[test]
+    fn test_select_hypergeometric_branch_with_casp_direct_series() {
+        let problem = HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 0.2, 1.0e-14);
+        let mut portfolio = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let decision =
+            select_hypergeometric_branch_with_casp(problem, RuntimeMode::Strict, &mut portfolio)
+                .expect("casp branch selection");
+
+        assert_eq!(decision.branch, HypergeometricBranch::DirectSeries);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_select_hypergeometric_branch_with_casp_kummer_transform() {
+        let problem = HyperCaspProblem::hyp1f1(1.0, 2.0, -3.0, 1.0e-14);
+        let mut portfolio = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let decision =
+            select_hypergeometric_branch_with_casp(problem, RuntimeMode::Strict, &mut portfolio)
+                .expect("casp branch selection");
+
+        assert_eq!(decision.branch, HypergeometricBranch::KummerTransform);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_select_hypergeometric_branch_with_casp_asymptotic() {
+        let problem = HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 25.0, 1.0e-14);
+        let mut portfolio = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let decision =
+            select_hypergeometric_branch_with_casp(problem, RuntimeMode::Strict, &mut portfolio)
+                .expect("casp branch selection");
+
+        assert_eq!(decision.branch, HypergeometricBranch::AsymptoticExpansion);
+        assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    #[test]
+    fn test_select_hypergeometric_branch_with_casp_boundary_near_pole() {
+        let problem = HyperCaspProblem::hyp2f1(1.0, 2.0, 3.0, 1.0, 1.0e-14);
+        let mut portfolio = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let decision =
+            select_hypergeometric_branch_with_casp(problem, RuntimeMode::Strict, &mut portfolio)
+                .expect("casp branch selection");
+
+        assert_eq!(decision.branch, HypergeometricBranch::ParameterGuard);
+        assert_eq!(portfolio.evidence_len(), 1);
     }
 
     #[test]
