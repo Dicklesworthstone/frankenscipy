@@ -66057,6 +66057,36 @@ mod tests {
             "from_covariance PSD matches raw",
         );
 
+        // Precision covariance: P = [[2, 1], [1, 3]], inv(P) = [[0.6, -0.2], [-0.2, 0.4]]
+        let p = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
+        let cov_prec = Covariance::from_precision(&p).expect("cov prec");
+        let mvn_prec = MultivariateNormal::from_covariance(&mean, &cov_prec).expect("mvn prec");
+        let expected_cov = vec![vec![0.6, -0.2], vec![-0.2, 0.4]];
+        let mvn_raw_prec = MultivariateNormal::new(&mean, &expected_cov).expect("mvn raw prec");
+        assert_close(
+            mvn_prec.logpdf(&x).unwrap(),
+            mvn_raw_prec.logpdf(&x).unwrap(),
+            1e-14,
+            "from_covariance precision matches raw",
+        );
+
+        // Eigendecomposition covariance
+        let l1 = 0.5 + 0.05_f64.sqrt();
+        let l2 = 0.5 - 0.05_f64.sqrt();
+        let theta = 0.5 * ((-0.4_f64) / (0.6 - 0.4)).atan();
+        let v = vec![
+            vec![theta.cos(), -theta.sin()],
+            vec![theta.sin(), theta.cos()],
+        ];
+        let cov_eig = Covariance::from_eigendecomposition(&[l1, l2], &v).expect("cov eig");
+        let mvn_eig = MultivariateNormal::from_covariance(&mean, &cov_eig).expect("mvn eig");
+        assert_close(
+            mvn_eig.logpdf(&x).unwrap(),
+            mvn_raw_prec.logpdf(&x).unwrap(),
+            1e-14,
+            "from_covariance eigendecomposition matches raw",
+        );
+
         // Rejection of dimension mismatch
         let mismatch_cov = Covariance::from_diagonal(&[1.0, 2.0, 3.0]).expect("cov 3d");
         assert!(MultivariateNormal::from_covariance(&mean, &mismatch_cov).is_err());
