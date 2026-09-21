@@ -1174,6 +1174,235 @@ impl OdeSolverPortfolio {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// CASP Special — Hypergeometric Branch Selection Portfolio
+// ═══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HyperConditionState {
+    NearZeroDirectSeries,
+    TransformDomain,
+    LargeArgumentAsymptotic,
+    BoundaryNearPole,
+}
+
+impl HyperConditionState {
+    pub const ALL: [Self; 4] = [
+        Self::NearZeroDirectSeries,
+        Self::TransformDomain,
+        Self::LargeArgumentAsymptotic,
+        Self::BoundaryNearPole,
+    ];
+
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::NearZeroDirectSeries => 0,
+            Self::TransformDomain => 1,
+            Self::LargeArgumentAsymptotic => 2,
+            Self::BoundaryNearPole => 3,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HyperBranchAction {
+    DirectSeries,
+    KummerTransform,
+    PfaffTransform,
+    Asymptotic,
+    ContinuedFraction,
+    GuardedFallback,
+}
+
+impl HyperBranchAction {
+    pub const ALL: [Self; 6] = [
+        Self::DirectSeries,
+        Self::KummerTransform,
+        Self::PfaffTransform,
+        Self::Asymptotic,
+        Self::ContinuedFraction,
+        Self::GuardedFallback,
+    ];
+
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Self::DirectSeries => 0,
+            Self::KummerTransform => 1,
+            Self::PfaffTransform => 2,
+            Self::Asymptotic => 3,
+            Self::ContinuedFraction => 4,
+            Self::GuardedFallback => 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HyperSolverEvidenceEntry {
+    pub component: &'static str,
+    pub function_kind: &'static str,
+    pub z_abs: f64,
+    pub parameter_stability_margin: f64,
+    pub chosen_action: HyperBranchAction,
+    pub posterior: Vec<f64>,
+    pub expected_losses: Vec<f64>,
+    pub chosen_expected_loss: f64,
+    pub fallback_active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub term_count: Option<usize>,
+}
+
+/// Hypergeometric branch selection portfolio engine.
+///
+/// Loss matrix (6 actions × 4 states):
+///
+/// | Action \ State       | NearZero | Transform | Asymptotic | BoundaryNearPole |
+/// |----------------------|----------|-----------|------------|------------------|
+/// | DirectSeries         |        1 |        40 |        150 |              200 |
+/// | KummerTransform      |       20 |         2 |        100 |              200 |
+/// | PfaffTransform       |       25 |         3 |         90 |              200 |
+/// | Asymptotic           |       80 |        50 |          2 |              100 |
+/// | ContinuedFraction    |       30 |        10 |         20 |                5 |
+/// | GuardedFallback      |      100 |        80 |         70 |                1 |
+#[derive(Debug, Clone)]
+pub struct HyperSolverPortfolio {
+    mode: RuntimeMode,
+    loss_matrix: [[f64; 4]; 6],
+    evidence: VecDeque<HyperSolverEvidenceEntry>,
+    evidence_capacity: usize,
+    calibrator: ConformalCalibrator,
+}
+
+impl HyperSolverPortfolio {
+    #[must_use]
+    pub fn new(mode: RuntimeMode, evidence_capacity: usize) -> Self {
+        let evidence_capacity = evidence_capacity.max(1);
+        Self {
+            mode,
+            loss_matrix: Self::default_loss_matrix(),
+            evidence: VecDeque::with_capacity(evidence_capacity),
+            evidence_capacity,
+            calibrator: ConformalCalibrator::new(0.05, 200),
+        }
+    }
+
+    #[must_use]
+    pub const fn default_loss_matrix() -> [[f64; 4]; 6] {
+        [
+            // NearZero, Transform, Asymptotic, BoundaryNearPole
+            [1.0, 25.0, 80.0, 100.0], // DirectSeries
+            [15.0, 1.0, 60.0, 80.0],  // KummerTransform
+            [20.0, 2.0, 60.0, 80.0],  // PfaffTransform
+            [50.0, 30.0, 1.0, 60.0],  // Asymptotic
+            [25.0, 15.0, 15.0, 10.0], // ContinuedFraction
+            [35.0, 20.0, 20.0, 1.0],  // GuardedFallback
+        ]
+    }
+
+    pub fn select_action(
+        &self,
+        z: f64,
+        stability_margin: f64,
+        is_negative_real_confluent: bool,
+    ) -> (HyperBranchAction, [f64; 4], [f64; 6], f64) {
+        let posterior = Self::branch_posterior(z, stability_margin, is_negative_real_confluent);
+
+        // If conformal calibrator triggers drift, fallback to GuardedFallback
+        if self.calibrator.should_fallback() {
+            let losses = self.compute_expected_losses(posterior);
+            return (
+                HyperBranchAction::GuardedFallback,
+                posterior,
+                losses,
+                losses[HyperBranchAction::GuardedFallback.index()],
+            );
+        }
+
+        let losses = self.compute_expected_losses(posterior);
+        let mut best_idx = 0;
+        let mut best_loss = losses[0];
+
+        for (idx, &loss) in losses.iter().enumerate().skip(1) {
+            if loss < best_loss {
+                best_loss = loss;
+                best_idx = idx;
+            } else if (loss - best_loss).abs() <= 1e-12 && idx > best_idx {
+                best_idx = idx;
+            }
+        }
+
+        (
+            HyperBranchAction::ALL[best_idx],
+            posterior,
+            losses,
+            best_loss,
+        )
+    }
+
+    pub fn record_evidence(&mut self, entry: HyperSolverEvidenceEntry) {
+        if let Some(terms) = entry.term_count {
+            self.calibrator.observe(terms as f64);
+        }
+        if self.evidence.len() >= self.evidence_capacity {
+            let _ = self.evidence.pop_front();
+        }
+        self.evidence.push_back(entry);
+    }
+
+    pub fn observe_relative_error(&mut self, error: f64) {
+        self.calibrator.observe(error);
+    }
+
+    #[must_use]
+    pub fn evidence_len(&self) -> usize {
+        self.evidence.len()
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> RuntimeMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub fn calibrator(&self) -> &ConformalCalibrator {
+        &self.calibrator
+    }
+
+    fn compute_expected_losses(&self, posterior: [f64; 4]) -> [f64; 6] {
+        let mut losses = [0.0; 6];
+        for (action_idx, row) in self.loss_matrix.iter().enumerate() {
+            losses[action_idx] = row.iter().zip(posterior.iter()).map(|(l, p)| l * p).sum();
+        }
+        losses
+    }
+
+    fn branch_posterior(
+        z: f64,
+        stability_margin: f64,
+        is_negative_real_confluent: bool,
+    ) -> [f64; 4] {
+        if !z.is_finite() || !stability_margin.is_finite() || stability_margin <= 1e-12 {
+            return [0.0, 0.0, 0.0, 1.0]; // BoundaryNearPole
+        }
+        if (z - 1.0).abs() <= 0.05 {
+            return [0.0, 0.02, 0.01, 0.97]; // BoundaryNearPole
+        }
+        let abs_z = z.abs();
+        if abs_z >= 10.0 {
+            return [0.0, 0.05, 0.9, 0.05]; // LargeArgumentAsymptotic
+        }
+        if is_negative_real_confluent || (z < -0.5 && abs_z < 10.0) {
+            return [0.02, 0.95, 0.02, 0.01]; // TransformDomain
+        }
+        if abs_z <= 1.0 {
+            [0.85, 0.05, 0.02, 0.08] // NearZeroDirectSeries
+        } else {
+            [0.35, 0.45, 0.15, 0.05]
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // Test Helpers — Shared assertion and logging utilities (§bd-3jh.5)
 // ═══════════════════════════════════════════════════════════════════
 
@@ -1872,5 +2101,36 @@ mod tests {
         assert!(detector.is_stiff(1.0)); // 3 consecutive rejections
         detector.observe_step(true);
         assert!(!detector.is_stiff(1.0)); // reset by acceptance
+    }
+
+    #[test]
+    fn test_hyper_solver_portfolio_near_zero_selects_direct_series() {
+        let p = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(0.2, 1.0, false);
+        assert_eq!(action, HyperBranchAction::DirectSeries);
+    }
+
+    #[test]
+    fn test_hyper_solver_portfolio_transform_selects_kummer_or_pfaff() {
+        let p = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(-3.0, 1.0, true);
+        assert_eq!(action, HyperBranchAction::KummerTransform);
+    }
+
+    #[test]
+    fn test_hyper_solver_portfolio_asymptotic_selects_asymptotic() {
+        let p = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(25.0, 1.0, false);
+        assert_eq!(action, HyperBranchAction::Asymptotic);
+    }
+
+    #[test]
+    fn test_hyper_solver_portfolio_boundary_near_pole_selects_guarded_fallback() {
+        let p = HyperSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let (action, _, _, _) = p.select_action(1.0, 1.0, false);
+        assert_eq!(action, HyperBranchAction::GuardedFallback);
+
+        let (action_pole, _, _, _) = p.select_action(0.5, 1e-15, false);
+        assert_eq!(action_pole, HyperBranchAction::GuardedFallback);
     }
 }
