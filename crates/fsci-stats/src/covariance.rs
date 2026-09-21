@@ -167,6 +167,12 @@ impl Covariance {
         self.rank_val
     }
 
+    /// Lower-triangular Cholesky factor L (if available), where Cov = L * L^T.
+    #[must_use]
+    pub fn cholesky_factor(&self) -> Option<&[Vec<f64>]> {
+        self.cholesky_factor.as_deref()
+    }
+
     /// Whiten a vector: computes L^{-1} x.
     pub fn whiten(&self, x: &[f64]) -> Result<Vec<f64>, String> {
         if x.len() != self.dim {

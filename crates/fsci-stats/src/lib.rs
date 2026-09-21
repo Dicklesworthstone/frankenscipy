@@ -7670,6 +7670,43 @@ impl MultivariateNormal {
         })
     }
 
+    /// Create a multivariate normal distribution from a mean vector and a [`Covariance`] representation.
+    pub fn from_covariance(mean: &[f64], cov: &Covariance) -> Result<Self, StatsError> {
+        if mean.is_empty() {
+            return Err(StatsError::InvalidArgument(
+                "mean must be non-empty".to_string(),
+            ));
+        }
+        if cov.dim() != mean.len() {
+            return Err(StatsError::InvalidArgument(format!(
+                "cov dimension ({}) must match mean length ({})",
+                cov.dim(),
+                mean.len()
+            )));
+        }
+
+        let chol = if let Some(chol_ref) = cov.cholesky_factor() {
+            for (i, row) in chol_ref.iter().enumerate() {
+                if i >= row.len() || row[i] <= 1e-15 || !row[i].is_finite() {
+                    return Err(StatsError::InvalidArgument(
+                        "covariance matrix must be symmetric positive definite".to_string(),
+                    ));
+                }
+            }
+            chol_ref.to_vec()
+        } else {
+            cholesky_decompose(cov.covariance())?
+        };
+
+        let log_det = 2.0 * (0..chol.len()).map(|i| chol[i][i].ln()).sum::<f64>();
+        Ok(Self {
+            mean: mean.to_vec(),
+            cov: cov.covariance().to_vec(),
+            chol,
+            log_det,
+        })
+    }
+
     pub fn logpdf(&self, x: &[f64]) -> Result<f64, StatsError> {
         if x.len() != self.mean.len() {
             return Err(StatsError::InvalidArgument(format!(
@@ -65982,6 +66019,50 @@ mod tests {
             super::multivariate_normal_rng_jump_steps(usize::MAX, 2),
             usize::MAX
         );
+    }
+
+    #[test]
+    fn multivariate_normal_from_covariance_matches_new() {
+        let mean = vec![0.5, -1.0];
+        let diag = vec![2.0, 3.0];
+        let cov_diag = Covariance::from_diagonal(&diag).expect("cov diag");
+        let mvn_cov = MultivariateNormal::from_covariance(&mean, &cov_diag).expect("mvn from cov");
+
+        let raw_cov = vec![vec![2.0, 0.0], vec![0.0, 3.0]];
+        let mvn_raw = MultivariateNormal::new(&mean, &raw_cov).expect("mvn raw");
+
+        let x = vec![1.0, -0.5];
+        assert_close(
+            mvn_cov.logpdf(&x).unwrap(),
+            mvn_raw.logpdf(&x).unwrap(),
+            1e-14,
+            "from_covariance logpdf matches raw",
+        );
+        assert_close(
+            mvn_cov.pdf(&x).unwrap(),
+            mvn_raw.pdf(&x).unwrap(),
+            1e-14,
+            "from_covariance pdf matches raw",
+        );
+
+        // PSD covariance
+        let psd = vec![vec![2.0, 0.5], vec![0.5, 1.5]];
+        let cov_psd = Covariance::from_psd(&psd).expect("cov psd");
+        let mvn_psd = MultivariateNormal::from_covariance(&mean, &cov_psd).expect("mvn from psd");
+        let mvn_raw_psd = MultivariateNormal::new(&mean, &psd).expect("mvn raw psd");
+        assert_close(
+            mvn_psd.logpdf(&x).unwrap(),
+            mvn_raw_psd.logpdf(&x).unwrap(),
+            1e-14,
+            "from_covariance PSD matches raw",
+        );
+
+        // Rejection of dimension mismatch
+        let mismatch_cov = Covariance::from_diagonal(&[1.0, 2.0, 3.0]).expect("cov 3d");
+        assert!(MultivariateNormal::from_covariance(&mean, &mismatch_cov).is_err());
+
+        // Rejection of empty mean
+        assert!(MultivariateNormal::from_covariance(&[], &cov_diag).is_err());
     }
 
     #[test]
