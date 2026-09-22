@@ -13,7 +13,11 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_stats::{Covariance, InvWishart, MultivariateNormal, MultivariateT, Wishart};
+use fsci_stats::{
+    Covariance, Dirichlet, DirichletMultinomial, InvWishart, MatrixNormal, MatrixT, Multinomial,
+    MultivariateHypergeom, MultivariateNormal, MultivariateT, NormalInverseGamma, VonMisesFisher,
+    Wishart,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -95,11 +99,88 @@ struct InvWishartCase {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct MatrixNormalCase {
+    case_id: String,
+    mean: Vec<Vec<f64>>,
+    rowcov: Vec<Vec<f64>>,
+    colcov: Vec<Vec<f64>>,
+    x: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MatrixTCase {
+    case_id: String,
+    mean: Vec<Vec<f64>>,
+    row_spread: Vec<Vec<f64>>,
+    col_spread: Vec<Vec<f64>>,
+    df: f64,
+    x: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct VonMisesFisherCase {
+    case_id: String,
+    mu: Vec<f64>,
+    kappa: f64,
+    x: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DirichletCase {
+    case_id: String,
+    alpha: Vec<f64>,
+    x: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MultivariateHypergeomCase {
+    case_id: String,
+    m: Vec<usize>,
+    n: usize,
+    x: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct NormalInverseGammaCase {
+    case_id: String,
+    mu: f64,
+    lmbda: f64,
+    a: f64,
+    b: f64,
+    x: f64,
+    s2: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MultinomialCase {
+    case_id: String,
+    n: usize,
+    p: Vec<f64>,
+    x: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DirichletMultinomialCase {
+    case_id: String,
+    alpha: Vec<f64>,
+    n: usize,
+    x: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct OracleQuery {
     mvn_cases: Vec<MvnCase>,
     mvt_cases: Vec<MvtCase>,
     wishart_cases: Vec<WishartCase>,
     invwishart_cases: Vec<InvWishartCase>,
+    matrix_normal_cases: Vec<MatrixNormalCase>,
+    matrix_t_cases: Vec<MatrixTCase>,
+    vmf_cases: Vec<VonMisesFisherCase>,
+    dirichlet_cases: Vec<DirichletCase>,
+    mhypergeom_cases: Vec<MultivariateHypergeomCase>,
+    nig_cases: Vec<NormalInverseGammaCase>,
+    multinomial_cases: Vec<MultinomialCase>,
+    dirichlet_multinomial_cases: Vec<DirichletMultinomialCase>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,11 +219,93 @@ struct InvWishartOracleResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct MatrixNormalOracleResponse {
+    case_id: String,
+    pdf: f64,
+    logpdf: f64,
+    entropy: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MatrixTOracleResponse {
+    case_id: String,
+    pdf: f64,
+    logpdf: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct VonMisesFisherOracleResponse {
+    case_id: String,
+    pdf: f64,
+    logpdf: f64,
+    entropy: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DirichletOracleResponse {
+    case_id: String,
+    pdf: f64,
+    logpdf: f64,
+    mean: Vec<f64>,
+    var: Vec<f64>,
+    cov: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MultivariateHypergeomOracleResponse {
+    case_id: String,
+    pmf: f64,
+    logpmf: f64,
+    mean: Vec<f64>,
+    var: Vec<f64>,
+    cov: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NormalInverseGammaOracleResponse {
+    case_id: String,
+    pdf: f64,
+    logpdf: f64,
+    mean_x: f64,
+    mean_s2: f64,
+    var_x: f64,
+    var_s2: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MultinomialOracleResponse {
+    case_id: String,
+    pmf: f64,
+    logpmf: f64,
+    mean: Vec<f64>,
+    cov: Vec<Vec<f64>>,
+    entropy: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DirichletMultinomialOracleResponse {
+    case_id: String,
+    pmf: f64,
+    logpmf: f64,
+    mean: Vec<f64>,
+    var: Vec<f64>,
+    cov: Vec<Vec<f64>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OracleResponse {
     mvn: Vec<MvnOracleResponse>,
     mvt: Vec<MvtOracleResponse>,
     wishart: Vec<WishartOracleResponse>,
     invwishart: Vec<InvWishartOracleResponse>,
+    matrix_normal: Vec<MatrixNormalOracleResponse>,
+    matrix_t: Vec<MatrixTOracleResponse>,
+    vmf: Vec<VonMisesFisherOracleResponse>,
+    dirichlet: Vec<DirichletOracleResponse>,
+    mhypergeom: Vec<MultivariateHypergeomOracleResponse>,
+    nig: Vec<NormalInverseGammaOracleResponse>,
+    multinomial: Vec<MultinomialOracleResponse>,
+    dirichlet_multinomial: Vec<DirichletMultinomialOracleResponse>,
 }
 
 fn run_python_oracle(query: &OracleQuery) -> Option<OracleResponse> {
@@ -153,7 +316,20 @@ import numpy as np
 from scipy import stats
 
 query = json.load(sys.stdin)
-out = {"mvn": [], "mvt": [], "wishart": [], "invwishart": []}
+out = {
+    "mvn": [],
+    "mvt": [],
+    "wishart": [],
+    "invwishart": [],
+    "matrix_normal": [],
+    "matrix_t": [],
+    "vmf": [],
+    "dirichlet": [],
+    "mhypergeom": [],
+    "nig": [],
+    "multinomial": [],
+    "dirichlet_multinomial": [],
+}
 
 for c in query["mvn_cases"]:
     cid = c["case_id"]
@@ -219,6 +395,131 @@ for c in query["invwishart_cases"]:
         "pdf": float(rv.pdf(x)),
         "logpdf": float(rv.logpdf(x)),
         "mean_00": mean_00,
+    })
+
+for c in query["matrix_normal_cases"]:
+    cid = c["case_id"]
+    mean = np.array(c["mean"], dtype=np.float64)
+    rowcov = np.array(c["rowcov"], dtype=np.float64)
+    colcov = np.array(c["colcov"], dtype=np.float64)
+    x = np.array(c["x"], dtype=np.float64)
+    rv = stats.matrix_normal(mean=mean, rowcov=rowcov, colcov=colcov)
+    out["matrix_normal"].append({
+        "case_id": cid,
+        "pdf": float(rv.pdf(x)),
+        "logpdf": float(rv.logpdf(x)),
+        "entropy": float(rv.entropy()),
+    })
+
+for c in query["matrix_t_cases"]:
+    cid = c["case_id"]
+    mean = np.array(c["mean"], dtype=np.float64)
+    row_spread = np.array(c["row_spread"], dtype=np.float64)
+    col_spread = np.array(c["col_spread"], dtype=np.float64)
+    df = float(c["df"])
+    x = np.array(c["x"], dtype=np.float64)
+    rv = stats.matrix_t(mean=mean, row_spread=row_spread, col_spread=col_spread, df=df)
+    out["matrix_t"].append({
+        "case_id": cid,
+        "pdf": float(rv.pdf(x)),
+        "logpdf": float(rv.logpdf(x)),
+    })
+
+for c in query["vmf_cases"]:
+    cid = c["case_id"]
+    mu = np.array(c["mu"], dtype=np.float64)
+    kappa = float(c["kappa"])
+    x = np.array(c["x"], dtype=np.float64)
+    rv = stats.vonmises_fisher(mu, kappa)
+    out["vmf"].append({
+        "case_id": cid,
+        "pdf": float(rv.pdf(x)),
+        "logpdf": float(rv.logpdf(x)),
+        "entropy": float(rv.entropy()),
+    })
+
+for c in query["dirichlet_cases"]:
+    cid = c["case_id"]
+    alpha = np.array(c["alpha"], dtype=np.float64)
+    x = np.array(c["x"], dtype=np.float64)
+    rv = stats.dirichlet(alpha)
+    cov_mat = [[float(v) for v in row] for row in rv.cov()]
+    out["dirichlet"].append({
+        "case_id": cid,
+        "pdf": float(rv.pdf(x)),
+        "logpdf": float(rv.logpdf(x)),
+        "mean": [float(m) for m in rv.mean()],
+        "var": [float(v) for v in rv.var()],
+        "cov": cov_mat,
+    })
+
+for c in query["mhypergeom_cases"]:
+    cid = c["case_id"]
+    m = [int(v) for v in c["m"]]
+    n = int(c["n"])
+    x = [int(v) for v in c["x"]]
+    rv = stats.multivariate_hypergeom(m=m, n=n)
+    cov_mat = [[float(v) for v in row] for row in rv.cov()]
+    out["mhypergeom"].append({
+        "case_id": cid,
+        "pmf": float(rv.pmf(x)),
+        "logpmf": float(rv.logpmf(x)),
+        "mean": [float(m) for m in rv.mean()],
+        "var": [float(v) for v in rv.var()],
+        "cov": cov_mat,
+    })
+
+for c in query["nig_cases"]:
+    cid = c["case_id"]
+    mu = float(c["mu"])
+    lmbda = float(c["lmbda"])
+    a = float(c["a"])
+    b = float(c["b"])
+    x = float(c["x"])
+    s2 = float(c["s2"])
+    rv = stats.normal_inverse_gamma(mu=mu, lmbda=lmbda, a=a, b=b)
+    m = rv.mean()
+    v = rv.var()
+    out["nig"].append({
+        "case_id": cid,
+        "pdf": float(rv.pdf(x, s2)),
+        "logpdf": float(rv.logpdf(x, s2)),
+        "mean_x": float(m[0]),
+        "mean_s2": float(m[1]),
+        "var_x": float(v[0]),
+        "var_s2": float(v[1]),
+    })
+
+for c in query["multinomial_cases"]:
+    cid = c["case_id"]
+    n = int(c["n"])
+    p = np.array(c["p"], dtype=np.float64)
+    x = np.array(c["x"], dtype=np.float64)
+    rv = stats.multinomial(n=n, p=p)
+    cov_mat = [[float(val) for val in row] for row in rv.cov()]
+    out["multinomial"].append({
+        "case_id": cid,
+        "pmf": float(rv.pmf(x)),
+        "logpmf": float(rv.logpmf(x)),
+        "mean": [float(m) for m in rv.mean()],
+        "cov": cov_mat,
+        "entropy": float(rv.entropy()),
+    })
+
+for c in query["dirichlet_multinomial_cases"]:
+    cid = c["case_id"]
+    alpha = np.array(c["alpha"], dtype=np.float64)
+    n = int(c["n"])
+    x = np.array(c["x"], dtype=np.float64)
+    rv = stats.dirichlet_multinomial(alpha=alpha, n=n)
+    cov_mat = [[float(val) for val in row] for row in rv.cov()]
+    out["dirichlet_multinomial"].append({
+        "case_id": cid,
+        "pmf": float(rv.pmf(x)),
+        "logpmf": float(rv.logpmf(x)),
+        "mean": [float(m) for m in rv.mean()],
+        "var": [float(v) for v in rv.var()],
+        "cov": cov_mat,
     })
 
 json.dump(out, sys.stdout)
@@ -388,11 +689,178 @@ fn diff_multivariate_stats_scipy_oracle() {
         },
     ];
 
+    let matrix_normal_cases = vec![
+        MatrixNormalCase {
+            case_id: "matrix_normal_2x2".into(),
+            mean: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            rowcov: vec![vec![2.0, 0.3], vec![0.3, 1.0]],
+            colcov: vec![vec![1.0, 0.2], vec![0.2, 1.5]],
+            x: vec![vec![1.5, 2.5], vec![2.5, 3.5]],
+        },
+        MatrixNormalCase {
+            case_id: "matrix_normal_3x2".into(),
+            mean: vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]],
+            rowcov: vec![
+                vec![2.0, 0.1, 0.0],
+                vec![0.1, 1.0, 0.2],
+                vec![0.0, 0.2, 1.5],
+            ],
+            colcov: vec![vec![1.0, 0.3], vec![0.3, 2.0]],
+            x: vec![vec![1.5, 2.5], vec![2.5, 3.5], vec![4.5, 7.0]],
+        },
+    ];
+
+    let matrix_t_cases = vec![
+        MatrixTCase {
+            case_id: "matrix_t_2x2_df5".into(),
+            mean: vec![vec![1.0, 2.0], vec![3.0, 4.0]],
+            row_spread: vec![vec![2.0, 0.3], vec![0.3, 1.0]],
+            col_spread: vec![vec![1.0, 0.2], vec![0.2, 1.5]],
+            df: 5.0,
+            x: vec![vec![1.5, 2.5], vec![2.5, 3.5]],
+        },
+        MatrixTCase {
+            case_id: "matrix_t_2x3_df8".into(),
+            mean: vec![vec![0.5, 1.0, -0.5], vec![1.2, 0.0, 2.1]],
+            row_spread: vec![vec![1.5, 0.2], vec![0.2, 1.2]],
+            col_spread: vec![
+                vec![2.0, 0.1, 0.0],
+                vec![0.1, 1.0, 0.3],
+                vec![0.0, 0.3, 1.5],
+            ],
+            df: 8.0,
+            x: vec![vec![0.6, 0.9, -0.4], vec![1.1, 0.1, 2.0]],
+        },
+    ];
+
+    let vmf_cases = vec![
+        VonMisesFisherCase {
+            case_id: "vmf_3d_kappa5".into(),
+            mu: vec![0.0, 0.0, 1.0],
+            kappa: 5.0,
+            x: vec![0.0, 0.6, 0.8],
+        },
+        VonMisesFisherCase {
+            case_id: "vmf_4d_kappa2".into(),
+            mu: vec![0.5, 0.5, 0.5, 0.5],
+            kappa: 2.0,
+            x: vec![0.0, 0.0, 0.0, 1.0],
+        },
+    ];
+
+    let dirichlet_cases = vec![
+        DirichletCase {
+            case_id: "dirichlet_3d".into(),
+            alpha: vec![1.0, 2.0, 3.0],
+            x: vec![0.2, 0.3, 0.5],
+        },
+        DirichletCase {
+            case_id: "dirichlet_4d".into(),
+            alpha: vec![2.0, 1.5, 0.5, 3.0],
+            x: vec![0.25, 0.2, 0.15, 0.4],
+        },
+    ];
+
+    let mhypergeom_cases = vec![
+        MultivariateHypergeomCase {
+            case_id: "mhypergeom_3d".into(),
+            m: vec![10, 8, 6],
+            n: 5,
+            x: vec![2, 2, 1],
+        },
+        MultivariateHypergeomCase {
+            case_id: "mhypergeom_4d".into(),
+            m: vec![5, 4, 3, 2],
+            n: 4,
+            x: vec![2, 1, 1, 0],
+        },
+    ];
+
+    let nig_cases = vec![
+        NormalInverseGammaCase {
+            case_id: "nig_case1".into(),
+            mu: 1.0,
+            lmbda: 2.0,
+            a: 3.0,
+            b: 4.0,
+            x: 1.5,
+            s2: 2.0,
+        },
+        NormalInverseGammaCase {
+            case_id: "nig_case2".into(),
+            mu: -0.5,
+            lmbda: 1.5,
+            a: 4.0,
+            b: 2.5,
+            x: -0.2,
+            s2: 1.0,
+        },
+        NormalInverseGammaCase {
+            case_id: "nig_case3".into(),
+            mu: 0.0,
+            lmbda: 0.5,
+            a: 5.0,
+            b: 1.0,
+            x: 0.8,
+            s2: 0.5,
+        },
+    ];
+
+    let multinomial_cases = vec![
+        MultinomialCase {
+            case_id: "multinomial_3d".into(),
+            n: 10,
+            p: vec![0.2, 0.3, 0.5],
+            x: vec![2.0, 3.0, 5.0],
+        },
+        MultinomialCase {
+            case_id: "multinomial_4d".into(),
+            n: 20,
+            p: vec![0.1, 0.2, 0.3, 0.4],
+            x: vec![3.0, 4.0, 6.0, 7.0],
+        },
+        MultinomialCase {
+            case_id: "multinomial_equal_p".into(),
+            n: 12,
+            p: vec![0.25, 0.25, 0.25, 0.25],
+            x: vec![3.0, 3.0, 3.0, 3.0],
+        },
+    ];
+
+    let dirichlet_multinomial_cases = vec![
+        DirichletMultinomialCase {
+            case_id: "dir_multinomial_3d".into(),
+            alpha: vec![1.0, 2.0, 3.0],
+            n: 6,
+            x: vec![1.0, 2.0, 3.0],
+        },
+        DirichletMultinomialCase {
+            case_id: "dir_multinomial_4d".into(),
+            alpha: vec![2.0, 1.5, 3.5, 1.0],
+            n: 10,
+            x: vec![2.0, 1.0, 5.0, 2.0],
+        },
+        DirichletMultinomialCase {
+            case_id: "dir_multinomial_fractional_alpha".into(),
+            alpha: vec![0.5, 0.5, 1.0],
+            n: 8,
+            x: vec![1.0, 2.0, 5.0],
+        },
+    ];
+
     let query = OracleQuery {
         mvn_cases: mvn_cases.clone(),
         mvt_cases: mvt_cases.clone(),
         wishart_cases: wishart_cases.clone(),
         invwishart_cases: invwishart_cases.clone(),
+        matrix_normal_cases: matrix_normal_cases.clone(),
+        matrix_t_cases: matrix_t_cases.clone(),
+        vmf_cases: vmf_cases.clone(),
+        dirichlet_cases: dirichlet_cases.clone(),
+        mhypergeom_cases: mhypergeom_cases.clone(),
+        nig_cases: nig_cases.clone(),
+        multinomial_cases: multinomial_cases.clone(),
+        dirichlet_multinomial_cases: dirichlet_multinomial_cases.clone(),
     };
 
     let oracle_opt = run_python_oracle(&query);
@@ -663,6 +1131,521 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert!(
             (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
         );
+    }
+
+    // Test MatrixNormal
+    for (case, resp) in matrix_normal_cases.iter().zip(oracle.matrix_normal.iter()) {
+        assert_eq!(case.case_id, resp.case_id);
+        let dist =
+            MatrixNormal::new(&case.mean, &case.rowcov, &case.colcov).expect("matrix_normal new");
+
+        assert_eq!(dist.dims(), (case.mean.len(), case.mean[0].len()));
+        assert_eq!(dist.mean(), &case.mean);
+        assert_eq!(dist.rowcov(), &case.rowcov);
+        assert_eq!(dist.colcov(), &case.colcov);
+
+        let rust_pdf = dist.pdf(&case.x).expect("matrix_normal pdf");
+        let rust_logpdf = dist.logpdf(&case.x).expect("matrix_normal logpdf");
+        check_pair(
+            &format!("{}_pdf", case.case_id),
+            "MatrixNormal",
+            rust_pdf,
+            resp.pdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_logpdf", case.case_id),
+            "MatrixNormal",
+            rust_logpdf,
+            resp.logpdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+
+        let rust_entropy = dist.entropy();
+        check_pair(
+            &format!("{}_entropy", case.case_id),
+            "MatrixNormal",
+            rust_entropy,
+            resp.entropy,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+
+        // from_covariance
+        let cov_u = Covariance::from_psd(&case.rowcov).expect("cov_u psd");
+        let cov_v = Covariance::from_psd(&case.colcov).expect("cov_v psd");
+        let dist_from_cov =
+            MatrixNormal::from_covariance(&case.mean, &cov_u, &cov_v).expect("from_covariance");
+        assert_eq!(dist.dims(), dist_from_cov.dims());
+        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < 1e-14);
+        assert!(
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+        );
+    }
+
+    // Test MatrixT
+    for (case, resp) in matrix_t_cases.iter().zip(oracle.matrix_t.iter()) {
+        assert_eq!(case.case_id, resp.case_id);
+        let dist = MatrixT::new(&case.mean, &case.row_spread, &case.col_spread, case.df)
+            .expect("matrix_t new");
+
+        assert_eq!(dist.dims(), (case.mean.len(), case.mean[0].len()));
+        assert_eq!(dist.mean(), &case.mean);
+        assert_eq!(dist.df(), case.df);
+        assert_eq!(dist.row_spread(), &case.row_spread);
+        assert_eq!(dist.col_spread(), &case.col_spread);
+
+        let rust_pdf = dist.pdf(&case.x).expect("matrix_t pdf");
+        let rust_logpdf = dist.logpdf(&case.x).expect("matrix_t logpdf");
+        check_pair(
+            &format!("{}_pdf", case.case_id),
+            "MatrixT",
+            rust_pdf,
+            resp.pdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_logpdf", case.case_id),
+            "MatrixT",
+            rust_logpdf,
+            resp.logpdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+
+        // from_covariance
+        let cov_u = Covariance::from_psd(&case.row_spread).expect("cov_u psd");
+        let cov_v = Covariance::from_psd(&case.col_spread).expect("cov_v psd");
+        let dist_from_cov =
+            MatrixT::from_covariance(&case.mean, &cov_u, &cov_v, case.df).expect("from_covariance");
+        assert_eq!(dist.dims(), dist_from_cov.dims());
+        assert_eq!(dist.df(), dist_from_cov.df());
+        assert!(
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+        );
+    }
+
+    // Test VonMisesFisher
+    for (case, resp) in vmf_cases.iter().zip(oracle.vmf.iter()) {
+        assert_eq!(case.case_id, resp.case_id);
+        let dist = VonMisesFisher::new(&case.mu, case.kappa);
+
+        assert_eq!(dist.dim(), case.mu.len());
+        assert_eq!(dist.mu(), &case.mu);
+        assert_eq!(dist.kappa(), case.kappa);
+
+        let rust_pdf = dist.pdf(&case.x);
+        let rust_logpdf = dist.logpdf(&case.x);
+        check_pair(
+            &format!("{}_pdf", case.case_id),
+            "VonMisesFisher",
+            rust_pdf,
+            resp.pdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_logpdf", case.case_id),
+            "VonMisesFisher",
+            rust_logpdf,
+            resp.logpdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+
+        let rust_entropy = dist.entropy();
+        check_pair(
+            &format!("{}_entropy", case.case_id),
+            "VonMisesFisher",
+            rust_entropy,
+            resp.entropy,
+            1e-9,
+            1e-8,
+            &mut records,
+        );
+    }
+
+    // Test Dirichlet
+    for (case, resp) in dirichlet_cases.iter().zip(oracle.dirichlet.iter()) {
+        assert_eq!(case.case_id, resp.case_id);
+        let dist = Dirichlet::new(&case.alpha);
+
+        assert_eq!(dist.dim(), case.alpha.len());
+
+        let rust_pdf = dist.pdf(&case.x);
+        let rust_logpdf = dist.logpdf(&case.x);
+        check_pair(
+            &format!("{}_pdf", case.case_id),
+            "Dirichlet",
+            rust_pdf,
+            resp.pdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_logpdf", case.case_id),
+            "Dirichlet",
+            rust_logpdf,
+            resp.logpdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+
+        let rust_mean = dist.mean();
+        for (k, (&rm, &sm)) in rust_mean.iter().zip(&resp.mean).enumerate() {
+            check_pair(
+                &format!("{}_mean_{k}", case.case_id),
+                "Dirichlet",
+                rm,
+                sm,
+                1e-11,
+                1e-10,
+                &mut records,
+            );
+        }
+
+        let rust_var = dist.var();
+        for (k, (&rv, &sv)) in rust_var.iter().zip(&resp.var).enumerate() {
+            check_pair(
+                &format!("{}_var_{k}", case.case_id),
+                "Dirichlet",
+                rv,
+                sv,
+                1e-11,
+                1e-10,
+                &mut records,
+            );
+        }
+
+        let rust_cov = dist.cov();
+        for i in 0..case.alpha.len() {
+            for j in 0..case.alpha.len() {
+                check_pair(
+                    &format!("{}_cov_{i}_{j}", case.case_id),
+                    "Dirichlet",
+                    rust_cov[i][j],
+                    resp.cov[i][j],
+                    1e-11,
+                    1e-10,
+                    &mut records,
+                );
+            }
+        }
+    }
+
+    // Test MultivariateHypergeom
+    for (case, resp) in mhypergeom_cases.iter().zip(oracle.mhypergeom.iter()) {
+        assert_eq!(case.case_id, resp.case_id);
+        let dist = MultivariateHypergeom::new(&case.m, case.n);
+
+        assert_eq!(dist.dim(), case.m.len());
+        assert_eq!(dist.m(), &case.m);
+        assert_eq!(dist.n(), case.n);
+        assert_eq!(dist.total(), case.m.iter().sum::<usize>());
+
+        let rust_pmf = dist.pmf(&case.x);
+        let rust_logpmf = dist.logpmf(&case.x);
+        check_pair(
+            &format!("{}_pmf", case.case_id),
+            "MultivariateHypergeom",
+            rust_pmf,
+            resp.pmf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_logpmf", case.case_id),
+            "MultivariateHypergeom",
+            rust_logpmf,
+            resp.logpmf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+
+        let rust_mean = dist.mean();
+        for (k, (&rm, &sm)) in rust_mean.iter().zip(&resp.mean).enumerate() {
+            check_pair(
+                &format!("{}_mean_{k}", case.case_id),
+                "MultivariateHypergeom",
+                rm,
+                sm,
+                1e-11,
+                1e-10,
+                &mut records,
+            );
+        }
+
+        let rust_var = dist.var();
+        for (k, (&rv, &sv)) in rust_var.iter().zip(&resp.var).enumerate() {
+            check_pair(
+                &format!("{}_var_{k}", case.case_id),
+                "MultivariateHypergeom",
+                rv,
+                sv,
+                1e-11,
+                1e-10,
+                &mut records,
+            );
+        }
+
+        let rust_cov = dist.cov();
+        for i in 0..case.m.len() {
+            for j in 0..case.m.len() {
+                check_pair(
+                    &format!("{}_cov_{i}_{j}", case.case_id),
+                    "MultivariateHypergeom",
+                    rust_cov[i][j],
+                    resp.cov[i][j],
+                    1e-11,
+                    1e-10,
+                    &mut records,
+                );
+            }
+        }
+    }
+
+    // Test NormalInverseGamma
+    for (case, resp) in nig_cases.iter().zip(oracle.nig.iter()) {
+        assert_eq!(case.case_id, resp.case_id);
+        let dist = NormalInverseGamma::new(case.mu, case.lmbda, case.a, case.b);
+
+        assert_eq!(dist.mu(), case.mu);
+        assert_eq!(dist.lmbda(), case.lmbda);
+        assert_eq!(dist.a(), case.a);
+        assert_eq!(dist.b(), case.b);
+
+        let rust_pdf = dist.pdf(case.x, case.s2);
+        let rust_logpdf = dist.logpdf(case.x, case.s2);
+        check_pair(
+            &format!("{}_pdf", case.case_id),
+            "NormalInverseGamma",
+            rust_pdf,
+            resp.pdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_logpdf", case.case_id),
+            "NormalInverseGamma",
+            rust_logpdf,
+            resp.logpdf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+
+        let (mean_x, mean_s2) = dist.mean();
+        check_pair(
+            &format!("{}_mean_x", case.case_id),
+            "NormalInverseGamma",
+            mean_x,
+            resp.mean_x,
+            1e-11,
+            1e-10,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_mean_s2", case.case_id),
+            "NormalInverseGamma",
+            mean_s2,
+            resp.mean_s2,
+            1e-11,
+            1e-10,
+            &mut records,
+        );
+
+        let (var_x, var_s2) = dist.var();
+        check_pair(
+            &format!("{}_var_x", case.case_id),
+            "NormalInverseGamma",
+            var_x,
+            resp.var_x,
+            1e-11,
+            1e-10,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_var_s2", case.case_id),
+            "NormalInverseGamma",
+            var_s2,
+            resp.var_s2,
+            1e-11,
+            1e-10,
+            &mut records,
+        );
+    }
+
+    // Test Multinomial
+    for (case, resp) in multinomial_cases.iter().zip(oracle.multinomial.iter()) {
+        assert_eq!(case.case_id, resp.case_id);
+        let dist = Multinomial::new(case.n, &case.p);
+
+        assert_eq!(dist.dim(), case.p.len());
+        assert_eq!(dist.n(), case.n);
+        assert_eq!(dist.p(), &case.p);
+
+        let rust_pmf = dist.pmf(&case.x);
+        let rust_logpmf = dist.logpmf(&case.x);
+        check_pair(
+            &format!("{}_pmf", case.case_id),
+            "Multinomial",
+            rust_pmf,
+            resp.pmf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_logpmf", case.case_id),
+            "Multinomial",
+            rust_logpmf,
+            resp.logpmf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+
+        let rust_mean = dist.mean();
+        for (k, (&rm, &sm)) in rust_mean.iter().zip(&resp.mean).enumerate() {
+            check_pair(
+                &format!("{}_mean_{k}", case.case_id),
+                "Multinomial",
+                rm,
+                sm,
+                1e-11,
+                1e-10,
+                &mut records,
+            );
+        }
+
+        let rust_cov = dist.cov();
+        for i in 0..case.p.len() {
+            for j in 0..case.p.len() {
+                check_pair(
+                    &format!("{}_cov_{i}_{j}", case.case_id),
+                    "Multinomial",
+                    rust_cov[i][j],
+                    resp.cov[i][j],
+                    1e-11,
+                    1e-10,
+                    &mut records,
+                );
+            }
+        }
+
+        let rust_var = dist.var();
+        for (k, &rv) in rust_var.iter().enumerate() {
+            check_pair(
+                &format!("{}_var_{k}", case.case_id),
+                "Multinomial",
+                rv,
+                resp.cov[k][k],
+                1e-11,
+                1e-10,
+                &mut records,
+            );
+        }
+
+        let rust_entropy = dist.entropy();
+        check_pair(
+            &format!("{}_entropy", case.case_id),
+            "Multinomial",
+            rust_entropy,
+            resp.entropy,
+            1e-9,
+            1e-8,
+            &mut records,
+        );
+    }
+
+    // Test DirichletMultinomial
+    for (case, resp) in dirichlet_multinomial_cases
+        .iter()
+        .zip(oracle.dirichlet_multinomial.iter())
+    {
+        assert_eq!(case.case_id, resp.case_id);
+        let dist = DirichletMultinomial::new(&case.alpha, case.n);
+
+        assert_eq!(dist.dim(), case.alpha.len());
+        assert_eq!(dist.n(), case.n);
+        assert_eq!(dist.alpha(), &case.alpha);
+
+        let rust_pmf = dist.pmf(&case.x);
+        let rust_logpmf = dist.logpmf(&case.x);
+        check_pair(
+            &format!("{}_pmf", case.case_id),
+            "DirichletMultinomial",
+            rust_pmf,
+            resp.pmf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_logpmf", case.case_id),
+            "DirichletMultinomial",
+            rust_logpmf,
+            resp.logpmf,
+            1e-10,
+            1e-9,
+            &mut records,
+        );
+
+        let rust_mean = dist.mean();
+        for (k, (&rm, &sm)) in rust_mean.iter().zip(&resp.mean).enumerate() {
+            check_pair(
+                &format!("{}_mean_{k}", case.case_id),
+                "DirichletMultinomial",
+                rm,
+                sm,
+                1e-11,
+                1e-10,
+                &mut records,
+            );
+        }
+
+        let rust_var = dist.var();
+        for (k, (&rv, &sv)) in rust_var.iter().zip(&resp.var).enumerate() {
+            check_pair(
+                &format!("{}_var_{k}", case.case_id),
+                "DirichletMultinomial",
+                rv,
+                sv,
+                1e-11,
+                1e-10,
+                &mut records,
+            );
+        }
+
+        let rust_cov = dist.cov();
+        for i in 0..case.alpha.len() {
+            for j in 0..case.alpha.len() {
+                check_pair(
+                    &format!("{}_cov_{i}_{j}", case.case_id),
+                    "DirichletMultinomial",
+                    rust_cov[i][j],
+                    resp.cov[i][j],
+                    1e-11,
+                    1e-10,
+                    &mut records,
+                );
+            }
+        }
     }
 
     let duration_ns = t0.elapsed().as_nanos();

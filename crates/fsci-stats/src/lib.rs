@@ -7739,6 +7739,29 @@ impl MultivariateNormal {
         0.5 * (k * (1.0 + (2.0 * PI).ln()) + self.log_det)
     }
 
+    /// Create a marginal multivariate normal distribution over the specified subset of coordinate indices.
+    pub fn marginal(&self, indices: &[usize]) -> Result<Self, StatsError> {
+        if indices.is_empty() {
+            return Err(StatsError::InvalidArgument(
+                "indices must be non-empty".to_string(),
+            ));
+        }
+        let n = self.mean.len();
+        for &idx in indices {
+            if idx >= n {
+                return Err(StatsError::InvalidArgument(format!(
+                    "index {idx} out of bounds for dimension {n}"
+                )));
+            }
+        }
+        let sub_mean: Vec<f64> = indices.iter().map(|&i| self.mean[i]).collect();
+        let sub_cov: Vec<Vec<f64>> = indices
+            .iter()
+            .map(|&i| indices.iter().map(|&j| self.cov[i][j]).collect())
+            .collect();
+        Self::new(&sub_mean, &sub_cov)
+    }
+
     /// Squared Mahalanobis distance `(x - μ)ᵀ Σ⁻¹ (x - μ)`.
     pub fn mahalanobis_squared(&self, x: &[f64]) -> Result<f64, StatsError> {
         if x.len() != self.mean.len() {
@@ -7952,6 +7975,18 @@ impl Dirichlet {
         self.logpdf(x).exp()
     }
 
+    /// Dimensionality (number of categories).
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.alpha.len()
+    }
+
+    /// Concentration parameters `alpha`.
+    #[inline]
+    pub fn alpha(&self) -> &[f64] {
+        &self.alpha
+    }
+
     /// Mean of the distribution.
     pub fn mean(&self) -> Vec<f64> {
         self.alpha.iter().map(|&a| a / self.alpha_sum).collect()
@@ -7962,6 +7997,29 @@ impl Dirichlet {
         let s = self.alpha_sum;
         let denom = s * s * (s + 1.0);
         self.alpha.iter().map(|&a| a * (s - a) / denom).collect()
+    }
+
+    /// Covariance matrix of the Dirichlet distribution.
+    /// `cov[i][j] = -alpha_i * alpha_j / (alpha_0^2 * (alpha_0 + 1))` for `i != j`,
+    /// `cov[i][i] = alpha_i * (alpha_0 - alpha_i) / (alpha_0^2 * (alpha_0 + 1))`.
+    pub fn cov(&self) -> Vec<Vec<f64>> {
+        let k = self.alpha.len();
+        let s = self.alpha_sum;
+        let denom = s * s * (s + 1.0);
+        (0..k)
+            .map(|i| {
+                let ai = self.alpha[i];
+                (0..k)
+                    .map(|j| {
+                        if i == j {
+                            ai * (s - ai) / denom
+                        } else {
+                            -ai * self.alpha[j] / denom
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Generate random variates from the distribution.
@@ -7997,6 +8055,7 @@ impl Dirichlet {
 }
 
 /// The multinomial distribution, matching `scipy.stats.multinomial(n, p)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Multinomial {
     pub n: usize,
     pub p: Vec<f64>,
@@ -8008,6 +8067,24 @@ impl Multinomial {
     pub fn new(n: usize, p: &[f64]) -> Self {
         assert!(!p.is_empty(), "p must be non-empty");
         Self { n, p: p.to_vec() }
+    }
+
+    /// Dimensionality of the category space.
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.p.len()
+    }
+
+    /// Number of trials `n`.
+    #[inline]
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Category probabilities `p`.
+    #[inline]
+    pub fn p(&self) -> &[f64] {
+        &self.p
     }
 
     /// Log probability mass function. Returns `-inf` unless the counts are non-negative
@@ -8056,6 +8133,12 @@ impl Multinomial {
     /// Mean vector `n·p`.
     pub fn mean(&self) -> Vec<f64> {
         self.p.iter().map(|&pi| self.n as f64 * pi).collect()
+    }
+
+    /// Variance vector `n·p_i·(1 − p_i)` (diagonal of [`cov`](Self::cov)).
+    pub fn var(&self) -> Vec<f64> {
+        let nf = self.n as f64;
+        self.p.iter().map(|&pi| nf * pi * (1.0 - pi)).collect()
     }
 
     /// Covariance matrix `cov[i][j] = n·p_i·(δ_ij − p_j)`.
@@ -8154,10 +8237,11 @@ impl PoissonBinom {
 /// The multivariate hypergeometric distribution — drawing `n` items without
 /// replacement from a collection with `m_i` items of each color, matching
 /// `scipy.stats.multivariate_hypergeom(m, n)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MultivariateHypergeom {
-    m: Vec<usize>,
-    n: usize,
-    total: usize,
+    pub m: Vec<usize>,
+    pub n: usize,
+    pub total: usize,
 }
 
 impl MultivariateHypergeom {
@@ -8171,14 +8255,45 @@ impl MultivariateHypergeom {
         }
     }
 
-    /// Probability mass function `Π C(m_i, x_i) / C(M, n)`; zero unless the
-    /// draw is valid (`0 ≤ x_i ≤ m_i` and `Σ x_i = n`).
-    pub fn pmf(&self, x: &[usize]) -> f64 {
+    /// Dimensionality (number of categories).
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.m.len()
+    }
+
+    /// Number of items of each category.
+    #[inline]
+    pub fn m(&self) -> &[usize] {
+        &self.m
+    }
+
+    /// Number of items drawn.
+    #[inline]
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    /// Total population size `M = Σ m_i`.
+    #[inline]
+    pub fn total(&self) -> usize {
+        self.total
+    }
+
+    /// Total population size `M = Σ m_i`, matching SciPy's `M` property.
+    #[inline]
+    #[allow(non_snake_case)]
+    pub fn M(&self) -> usize {
+        self.total
+    }
+
+    /// Log probability mass function. Returns `f64::NEG_INFINITY` unless
+    /// `0 ≤ x_i ≤ m_i` and `Σ x_i = n`.
+    pub fn logpmf(&self, x: &[usize]) -> f64 {
         if x.len() != self.m.len()
             || x.iter().sum::<usize>() != self.n
             || x.iter().zip(&self.m).any(|(&xi, &mi)| xi > mi)
         {
-            return 0.0;
+            return f64::NEG_INFINITY;
         }
         let ln_c = |a: usize, b: usize| -> f64 {
             ln_gamma(a as f64 + 1.0) - ln_gamma(b as f64 + 1.0) - ln_gamma((a - b) as f64 + 1.0)
@@ -8187,7 +8302,13 @@ impl MultivariateHypergeom {
         for (&xi, &mi) in x.iter().zip(&self.m) {
             ln_p += ln_c(mi, xi);
         }
-        ln_p.exp()
+        ln_p
+    }
+
+    /// Probability mass function `Π C(m_i, x_i) / C(M, n)`; zero unless the
+    /// draw is valid (`0 ≤ x_i ≤ m_i` and `Σ x_i = n`).
+    pub fn pmf(&self, x: &[usize]) -> f64 {
+        self.logpmf(x).exp()
     }
 
     /// Mean vector `n·m_i/M`.
@@ -8224,6 +8345,7 @@ impl MultivariateHypergeom {
 
 /// The Dirichlet-multinomial (compound) distribution, matching
 /// `scipy.stats.dirichlet_multinomial(alpha, n)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DirichletMultinomial {
     alpha: Vec<f64>,
     n: usize,
@@ -8241,6 +8363,24 @@ impl DirichletMultinomial {
             n,
             alpha_sum,
         }
+    }
+
+    /// Dimensionality of the category space.
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.alpha.len()
+    }
+
+    /// Concentration parameters `alpha`.
+    #[inline]
+    pub fn alpha(&self) -> &[f64] {
+        &self.alpha
+    }
+
+    /// Number of trials `n`.
+    #[inline]
+    pub fn n(&self) -> usize {
+        self.n
     }
 
     /// Log probability mass function. Returns `-inf` unless the counts are non-negative
@@ -8485,6 +8625,55 @@ impl MultivariateT {
         }
     }
 
+    /// Differential entropy of the multivariate Student-t distribution in nats.
+    pub fn entropy(&self) -> f64 {
+        let dim = self.loc.len() as f64;
+        let df = self.df;
+        let shape_term = 0.5 * self.log_det;
+        let threshold = dim * 100.0 * 4.0 / (dim.ln() + 1.0);
+        if df >= threshold {
+            let two_pi = 2.0 * std::f64::consts::PI;
+            let norm_entropy = 0.5 * (1.0 + two_pi.ln());
+            dim * norm_entropy + dim / df - dim * (dim - 2.0) * df.powi(-2) / 4.0
+                + dim.powi(2) * (dim - 2.0) * df.powi(-3) / 6.0
+                + dim * (-3.0 * dim.powi(3) + 8.0 * dim.powi(2) - 8.0) * df.powi(-4) / 24.0
+                + dim.powi(2) * (3.0 * dim.powi(3) - 10.0 * dim.powi(2) + 16.0) * df.powi(-5) / 30.0
+                + shape_term
+        } else {
+            let halfsum = 0.5 * (dim + df);
+            let half_df = 0.5 * df;
+            let pi = std::f64::consts::PI;
+            -ln_gamma(halfsum)
+                + ln_gamma(half_df)
+                + 0.5 * dim * (df * pi).ln()
+                + halfsum * (digamma(halfsum) - digamma(half_df))
+                + shape_term
+        }
+    }
+
+    /// Create a marginal multivariate Student-t distribution over the specified subset of coordinate indices.
+    pub fn marginal(&self, indices: &[usize]) -> Result<Self, StatsError> {
+        if indices.is_empty() {
+            return Err(StatsError::InvalidArgument(
+                "indices must be non-empty".to_string(),
+            ));
+        }
+        let n = self.loc.len();
+        for &idx in indices {
+            if idx >= n {
+                return Err(StatsError::InvalidArgument(format!(
+                    "index {idx} out of bounds for dimension {n}"
+                )));
+            }
+        }
+        let sub_loc: Vec<f64> = indices.iter().map(|&i| self.loc[i]).collect();
+        let sub_shape: Vec<Vec<f64>> = indices
+            .iter()
+            .map(|&i| indices.iter().map(|&j| self.shape[i][j]).collect())
+            .collect();
+        Self::new(&sub_loc, &sub_shape, self.df)
+    }
+
     /// Log probability density function.
     pub fn logpdf(&self, x: &[f64]) -> Result<f64, StatsError> {
         let maha = self.mahalanobis_squared(x)?;
@@ -8605,8 +8794,11 @@ impl MultivariateT {
 
 /// The matrix normal distribution, matching
 /// `scipy.stats.matrix_normal(mean, rowcov, colcov)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MatrixNormal {
-    mean: Vec<Vec<f64>>,
+    pub mean: Vec<Vec<f64>>,
+    pub rowcov: Vec<Vec<f64>>,
+    pub colcov: Vec<Vec<f64>>,
     chol_u: Vec<Vec<f64>>,
     chol_v: Vec<Vec<f64>>,
     log_det_u: f64,
@@ -8638,11 +8830,101 @@ impl MatrixNormal {
         let log_det_v = 2.0 * (0..ncol).map(|i| chol_v[i][i].ln()).sum::<f64>();
         Ok(Self {
             mean: mean.to_vec(),
+            rowcov: rowcov.to_vec(),
+            colcov: colcov.to_vec(),
             chol_u,
             chol_v,
             log_det_u,
             log_det_v,
         })
+    }
+
+    /// Create the distribution from a mean matrix and [`Covariance`] representations
+    /// of the row covariance and column covariance.
+    pub fn from_covariance(
+        mean: &[Vec<f64>],
+        rowcov: &Covariance,
+        colcov: &Covariance,
+    ) -> Result<Self, StatsError> {
+        if mean.is_empty() || mean[0].is_empty() {
+            return Err(StatsError::InvalidArgument(
+                "mean must be non-empty".to_string(),
+            ));
+        }
+        let (nrow, ncol) = (mean.len(), mean[0].len());
+        if rowcov.dim() != nrow || colcov.dim() != ncol {
+            return Err(StatsError::InvalidArgument(format!(
+                "rowcov dim {} / colcov dim {} must match mean shape {nrow}x{ncol}",
+                rowcov.dim(),
+                colcov.dim()
+            )));
+        }
+        let chol_u = if let Some(c) = rowcov.cholesky_factor() {
+            c.to_vec()
+        } else {
+            cholesky_decompose(rowcov.covariance())?
+        };
+        let chol_v = if let Some(c) = colcov.cholesky_factor() {
+            c.to_vec()
+        } else {
+            cholesky_decompose(colcov.covariance())?
+        };
+        let log_det_u = 2.0 * (0..nrow).map(|i| chol_u[i][i].ln()).sum::<f64>();
+        let log_det_v = 2.0 * (0..ncol).map(|i| chol_v[i][i].ln()).sum::<f64>();
+        Ok(Self {
+            mean: mean.to_vec(),
+            rowcov: rowcov.covariance().to_vec(),
+            colcov: colcov.covariance().to_vec(),
+            chol_u,
+            chol_v,
+            log_det_u,
+            log_det_v,
+        })
+    }
+
+    /// Dimensions of the matrix distribution `(rows, cols)`.
+    #[inline]
+    pub fn dims(&self) -> (usize, usize) {
+        (self.mean.len(), self.mean[0].len())
+    }
+
+    /// Mean matrix.
+    #[inline]
+    pub fn mean(&self) -> &[Vec<f64>] {
+        &self.mean
+    }
+
+    /// Row covariance matrix `U` (among rows).
+    #[inline]
+    pub fn rowcov(&self) -> &[Vec<f64>] {
+        &self.rowcov
+    }
+
+    /// Column covariance matrix `V` (among columns).
+    #[inline]
+    pub fn colcov(&self) -> &[Vec<f64>] {
+        &self.colcov
+    }
+
+    /// Log determinant of row covariance matrix `U`.
+    #[inline]
+    pub fn log_det_rowcov(&self) -> f64 {
+        self.log_det_u
+    }
+
+    /// Log determinant of column covariance matrix `V`.
+    #[inline]
+    pub fn log_det_colcov(&self) -> f64 {
+        self.log_det_v
+    }
+
+    /// Differential entropy in nats:
+    /// `H = 0.5 * n * p * (1 + ln(2π)) + 0.5 * p * ln|U| + 0.5 * n * ln|V|`.
+    pub fn entropy(&self) -> f64 {
+        let (n, p) = self.dims();
+        let (nf, pf) = (n as f64, p as f64);
+        let two_pi = 2.0 * std::f64::consts::PI;
+        0.5 * nf * pf * (1.0 + two_pi.ln()) + 0.5 * pf * self.log_det_u + 0.5 * nf * self.log_det_v
     }
 
     /// Log probability density function.
@@ -8916,6 +9198,39 @@ impl Wishart {
             .map(|row| row.iter().map(|&v| self.df * v).collect())
             .collect()
     }
+
+    /// Mode of the Wishart distribution: `(df - p - 1) * scale` for `df >= p + 1`.
+    /// Returns `None` if `df < p + 1`.
+    pub fn mode(&self) -> Option<Vec<Vec<f64>>> {
+        let pf = self.p as f64;
+        if self.df >= pf + 1.0 {
+            let mult = self.df - pf - 1.0;
+            Some(
+                self.scale
+                    .iter()
+                    .map(|row| row.iter().map(|&v| mult * v).collect())
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    }
+
+    /// Variance of each element: `Var(X_ij) = df * (V_ij^2 + V_ii * V_jj)`.
+    pub fn var(&self) -> Vec<Vec<f64>> {
+        let p = self.p;
+        (0..p)
+            .map(|i| {
+                (0..p)
+                    .map(|j| {
+                        self.df
+                            * (self.scale[i][j] * self.scale[i][j]
+                                + self.scale[i][i] * self.scale[j][j])
+                    })
+                    .collect()
+            })
+            .collect()
+    }
 }
 
 /// The inverse Wishart distribution, matching `scipy.stats.invwishart(df, scale)`.
@@ -9068,16 +9383,69 @@ impl InvWishart {
             .map(|row| row.iter().map(|&v| v / denom).collect())
             .collect()
     }
+
+    /// Mode of the inverse Wishart distribution: `scale / (df + p + 1)`.
+    pub fn mode(&self) -> Vec<Vec<f64>> {
+        let denom = self.df + self.p as f64 + 1.0;
+        self.scale
+            .iter()
+            .map(|row| row.iter().map(|&v| v / denom).collect())
+            .collect()
+    }
+
+    /// Variance of each element for `df > p + 3`.
+    /// Returns `None` if `df <= p + 3`.
+    pub fn var(&self) -> Option<Vec<Vec<f64>>> {
+        let pf = self.p as f64;
+        if self.df > pf + 3.0 {
+            let denom = (self.df - pf) * (self.df - pf - 1.0).powi(2) * (self.df - pf - 3.0);
+            let coeff1 = self.df - pf + 1.0;
+            let coeff2 = self.df - pf - 1.0;
+            let p = self.p;
+            let out = (0..p)
+                .map(|i| {
+                    (0..p)
+                        .map(|j| {
+                            (coeff1 * self.scale[i][j] * self.scale[i][j]
+                                + coeff2 * self.scale[i][i] * self.scale[j][j])
+                                / denom
+                        })
+                        .collect()
+                })
+                .collect();
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    /// Differential entropy of the inverse Wishart distribution in nats:
+    /// `H(X) = ln Γ_p(df/2) + 0.5*p*df + 0.5*(p+1)*(ln|V| - ln(2)) - 0.5*(df+p+1)*Σ ψ((df-p+i)/2)`.
+    pub fn entropy(&self) -> f64 {
+        let p = self.p;
+        let pf = p as f64;
+        let n = self.df;
+        let mut psi_sum = 0.0;
+        for i in 1..=p {
+            let arg = 0.5 * (n - pf + i as f64);
+            psi_sum += digamma(arg);
+        }
+        ln_multivariate_gamma(p, 0.5 * n)
+            + 0.5 * pf * n
+            + 0.5 * (pf + 1.0) * (self.ln_det_v - 2.0_f64.ln())
+            - 0.5 * (n + pf + 1.0) * psi_sum
+    }
 }
 
 /// The normal-inverse-gamma distribution over `(x, σ²)`, matching
 /// `scipy.stats.normal_inverse_gamma(mu, lmbda, a, b)`: `x | σ² ~
 /// Normal(μ, σ²/λ)`, `σ² ~ InvGamma(a, b)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct NormalInverseGamma {
-    mu: f64,
-    lmbda: f64,
-    a: f64,
-    b: f64,
+    pub mu: f64,
+    pub lmbda: f64,
+    pub a: f64,
+    pub b: f64,
 }
 
 impl NormalInverseGamma {
@@ -9085,6 +9453,57 @@ impl NormalInverseGamma {
     /// inverse-gamma shape/scale `a`/`b` (all of `lmbda`, `a`, `b` positive).
     pub fn new(mu: f64, lmbda: f64, a: f64, b: f64) -> Self {
         Self { mu, lmbda, a, b }
+    }
+
+    /// Location parameter `mu`.
+    #[inline]
+    pub fn mu(&self) -> f64 {
+        self.mu
+    }
+
+    /// Precision-scale parameter `lmbda`.
+    #[inline]
+    pub fn lmbda(&self) -> f64 {
+        self.lmbda
+    }
+
+    /// Inverse-gamma shape parameter `a`.
+    #[inline]
+    pub fn a(&self) -> f64 {
+        self.a
+    }
+
+    /// Inverse-gamma scale parameter `b`.
+    #[inline]
+    pub fn b(&self) -> f64 {
+        self.b
+    }
+
+    /// Mean of the distribution `(E[X], E[σ²])`.
+    /// Defined when `a > 1.0`, otherwise components are `f64::NAN`.
+    pub fn mean(&self) -> (f64, f64) {
+        if self.lmbda <= 0.0 || self.a <= 1.0 || self.b <= 0.0 {
+            (f64::NAN, f64::NAN)
+        } else {
+            (self.mu, self.b / (self.a - 1.0))
+        }
+    }
+
+    /// Variance of the distribution `(Var(X), Var(σ²))`.
+    /// `Var(X)` is defined for `a > 1.0`, and `Var(σ²)` is defined for `a > 2.0`.
+    /// Undefined components are `f64::NAN`.
+    pub fn var(&self) -> (f64, f64) {
+        let var_x = if self.lmbda > 0.0 && self.a > 1.0 && self.b > 0.0 {
+            self.b / ((self.a - 1.0) * self.lmbda)
+        } else {
+            f64::NAN
+        };
+        let var_s2 = if self.lmbda > 0.0 && self.a > 2.0 && self.b > 0.0 {
+            (self.b * self.b) / ((self.a - 1.0).powi(2) * (self.a - 2.0))
+        } else {
+            f64::NAN
+        };
+        (var_x, var_s2)
     }
 
     /// Joint log probability density at `(x, s2)`; `-inf` for `s2 ≤ 0`.
@@ -9107,9 +9526,10 @@ impl NormalInverseGamma {
 
 /// The von Mises-Fisher distribution on the unit `(p−1)`-sphere, matching
 /// `scipy.stats.vonmises_fisher(mu, kappa)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct VonMisesFisher {
-    mu: Vec<f64>,
-    kappa: f64,
+    pub mu: Vec<f64>,
+    pub kappa: f64,
 }
 
 impl VonMisesFisher {
@@ -9120,6 +9540,39 @@ impl VonMisesFisher {
             mu: mu.to_vec(),
             kappa,
         }
+    }
+
+    /// Dimensionality of the sphere embedding space.
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.mu.len()
+    }
+
+    /// Mean direction vector (unit vector).
+    #[inline]
+    pub fn mu(&self) -> &[f64] {
+        &self.mu
+    }
+
+    /// Concentration parameter `kappa`.
+    #[inline]
+    pub fn kappa(&self) -> f64 {
+        self.kappa
+    }
+
+    /// Differential entropy in nats:
+    /// `-log_c - kappa * I_{p/2}(kappa) / I_{p/2-1}(kappa)`.
+    pub fn entropy(&self) -> f64 {
+        let p = self.mu.len() as f64;
+        let halfdim = 0.5 * p;
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let ive_hminus1 = fsci_special::ive_scalar(halfdim - 1.0, self.kappa);
+        let ive_h = fsci_special::ive_scalar(halfdim, self.kappa);
+        let log_norm = 0.5 * (p - 2.0) * self.kappa.ln()
+            - halfdim * two_pi.ln()
+            - ive_hminus1.ln()
+            - self.kappa;
+        -log_norm - self.kappa * ive_h / ive_hminus1
     }
 
     /// Log probability density at a unit vector `x`:
@@ -9210,9 +9663,12 @@ impl NoncentralHypergeomFisher {
 
 /// The matrix t-distribution, matching `scipy.stats.matrix_t(mean, row_spread,
 /// col_spread, df)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MatrixT {
-    mean: Vec<Vec<f64>>,
-    df: f64,
+    pub mean: Vec<Vec<f64>>,
+    pub df: f64,
+    pub row_spread: Vec<Vec<f64>>,
+    pub col_spread: Vec<Vec<f64>>,
     chol_u: Vec<Vec<f64>>,
     chol_v: Vec<Vec<f64>>,
     ln_det_u: f64,
@@ -9233,6 +9689,11 @@ impl MatrixT {
                 "mean must be non-empty".to_string(),
             ));
         }
+        if !df.is_finite() || df <= 0.0 {
+            return Err(StatsError::InvalidArgument(
+                "df must be positive and finite".to_string(),
+            ));
+        }
         let (m, n) = (mean.len(), mean[0].len());
         if row_spread.len() != m || col_spread.len() != n {
             return Err(StatsError::InvalidArgument(
@@ -9246,11 +9707,105 @@ impl MatrixT {
         Ok(Self {
             mean: mean.to_vec(),
             df,
+            row_spread: row_spread.to_vec(),
+            col_spread: col_spread.to_vec(),
             chol_u,
             chol_v,
             ln_det_u,
             ln_det_v,
         })
+    }
+
+    /// Create the distribution from a mean matrix, [`Covariance`] representations
+    /// of the row spread and column spread, and degrees of freedom `df`.
+    pub fn from_covariance(
+        mean: &[Vec<f64>],
+        row_spread: &Covariance,
+        col_spread: &Covariance,
+        df: f64,
+    ) -> Result<Self, StatsError> {
+        if mean.is_empty() || mean[0].is_empty() {
+            return Err(StatsError::InvalidArgument(
+                "mean must be non-empty".to_string(),
+            ));
+        }
+        if !df.is_finite() || df <= 0.0 {
+            return Err(StatsError::InvalidArgument(
+                "df must be positive and finite".to_string(),
+            ));
+        }
+        let (m, n) = (mean.len(), mean[0].len());
+        if row_spread.dim() != m || col_spread.dim() != n {
+            return Err(StatsError::InvalidArgument(format!(
+                "row_spread dim {} / col_spread dim {} must match mean shape {m}x{n}",
+                row_spread.dim(),
+                col_spread.dim()
+            )));
+        }
+        let chol_u = if let Some(c) = row_spread.cholesky_factor() {
+            c.to_vec()
+        } else {
+            cholesky_decompose(row_spread.covariance())?
+        };
+        let chol_v = if let Some(c) = col_spread.cholesky_factor() {
+            c.to_vec()
+        } else {
+            cholesky_decompose(col_spread.covariance())?
+        };
+        let ln_det_u = 2.0 * (0..m).map(|i| chol_u[i][i].ln()).sum::<f64>();
+        let ln_det_v = 2.0 * (0..n).map(|i| chol_v[i][i].ln()).sum::<f64>();
+        Ok(Self {
+            mean: mean.to_vec(),
+            df,
+            row_spread: row_spread.covariance().to_vec(),
+            col_spread: col_spread.covariance().to_vec(),
+            chol_u,
+            chol_v,
+            ln_det_u,
+            ln_det_v,
+        })
+    }
+
+    /// Dimensions of the matrix distribution `(rows, cols)`.
+    #[inline]
+    pub fn dims(&self) -> (usize, usize) {
+        (self.mean.len(), self.mean[0].len())
+    }
+
+    /// Mean matrix.
+    #[inline]
+    pub fn mean(&self) -> &[Vec<f64>] {
+        &self.mean
+    }
+
+    /// Degrees of freedom.
+    #[inline]
+    pub fn df(&self) -> f64 {
+        self.df
+    }
+
+    /// Row spread matrix `U`.
+    #[inline]
+    pub fn row_spread(&self) -> &[Vec<f64>] {
+        &self.row_spread
+    }
+
+    /// Column spread matrix `V`.
+    #[inline]
+    pub fn col_spread(&self) -> &[Vec<f64>] {
+        &self.col_spread
+    }
+
+    /// Log determinant of row spread matrix `U`.
+    #[inline]
+    pub fn log_det_row_spread(&self) -> f64 {
+        self.ln_det_u
+    }
+
+    /// Log determinant of column spread matrix `V`.
+    #[inline]
+    pub fn log_det_col_spread(&self) -> f64 {
+        self.ln_det_v
     }
 
     /// Log probability density function at an `m×n` matrix `x`.
@@ -63525,16 +64080,23 @@ mod tests {
 
     #[test]
     fn matrix_t_matches_scipy() {
-        let d = MatrixT::new(
-            &[vec![1.0, 2.0], vec![3.0, 4.0]],
-            &[vec![2.0, 0.3], vec![0.3, 1.0]],
-            &[vec![1.0, 0.2], vec![0.2, 1.5]],
-            5.0,
-        )
-        .unwrap();
+        let m = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let u = vec![vec![2.0, 0.3], vec![0.3, 1.0]];
+        let v = vec![vec![1.0, 0.2], vec![0.2, 1.5]];
+        let d = MatrixT::new(&m, &u, &v, 5.0).unwrap();
         let x = vec![vec![1.5, 2.5], vec![2.5, 3.5]];
         assert!((d.logpdf(&x).unwrap() - (-3.369933397330304)).abs() < 1e-10);
         assert!((d.pdf(&x).unwrap() - 0.03439192786140613).abs() < 1e-12);
+        assert_eq!(d.dims(), (2, 2));
+        assert_eq!(d.df(), 5.0);
+        assert_eq!(d.mean(), &m);
+        assert_eq!(d.row_spread(), &u);
+        assert_eq!(d.col_spread(), &v);
+
+        let cov_u = Covariance::from_psd(&u).unwrap();
+        let cov_v = Covariance::from_psd(&v).unwrap();
+        let d_cov = MatrixT::from_covariance(&m, &cov_u, &cov_v, 5.0).unwrap();
+        assert!((d_cov.logpdf(&x).unwrap() - d.logpdf(&x).unwrap()).abs() < 1e-14);
     }
 
     #[test]
@@ -63563,33 +64125,101 @@ mod tests {
         let d = VonMisesFisher::new(&[0.0, 0.0, 1.0], 5.0);
         assert!((d.logpdf(&[0.0, 0.6, 0.8]) - (-1.228393753014882)).abs() < 1e-10);
         assert!((d.pdf(&[0.0, 0.6, 0.8]) - 0.29276244901621606).abs() < 1e-12);
+        assert_eq!(d.dim(), 3);
+        assert_eq!(d.mu(), &[0.0, 0.0, 1.0]);
+        assert_eq!(d.kappa(), 5.0);
+        assert!((d.entropy() - 1.2279397331047859).abs() < 1e-10);
     }
 
     #[test]
     fn normal_inverse_gamma_matches_scipy() {
         let d = NormalInverseGamma::new(1.0, 2.0, 3.0, 4.0);
+        assert_eq!(d.mu(), 1.0);
+        assert_eq!(d.lmbda(), 2.0);
+        assert_eq!(d.a(), 3.0);
+        assert_eq!(d.b(), 4.0);
+        assert_eq!(d.mean(), (1.0, 2.0));
+        assert_eq!(d.var(), (1.0, 4.0));
         assert!((d.pdf(1.5, 2.0) - 0.09529372143087414).abs() < 1e-14);
         assert!((d.logpdf(1.5, 2.0) - (-2.3507913526447277)).abs() < 1e-12);
         assert_eq!(d.logpdf(1.5, -1.0), f64::NEG_INFINITY);
+
+        // Out-of-bounds moment tests
+        let d_low_a = NormalInverseGamma::new(1.0, 2.0, 0.5, 4.0);
+        let (m_x, m_s2) = d_low_a.mean();
+        assert!(m_x.is_nan() && m_s2.is_nan());
+        let (v_x, v_s2) = d_low_a.var();
+        assert!(v_x.is_nan() && v_s2.is_nan());
+
+        let d_a15 = NormalInverseGamma::new(1.0, 2.0, 1.5, 4.0);
+        assert_eq!(d_a15.mean(), (1.0, 8.0));
+        let (v15_x, v15_s2) = d_a15.var();
+        assert!((v15_x - 4.0).abs() < 1e-12);
+        assert!(v15_s2.is_nan());
     }
 
     #[test]
     fn invwishart_matches_scipy() {
-        let d = InvWishart::new(5.0, &[vec![1.0, 0.3], vec![0.3, 2.0]]).unwrap();
+        let scale = vec![vec![1.0, 0.3], vec![0.3, 2.0]];
+        let d = InvWishart::new(5.0, &scale).unwrap();
         let x = vec![vec![2.0, 0.5], vec![0.5, 3.0]];
         assert!((d.logpdf(&x).unwrap() - (-10.28443372594021)).abs() < 1e-10);
         assert!((d.pdf(&x).unwrap() - 3.416073318749046e-05).abs() < 1e-16);
         assert_eq!(d.mean(), vec![vec![0.5, 0.15], vec![0.15, 1.0]]);
+
+        // Mode: scale / (df + p + 1) = scale / 8.0
+        let mode = d.mode();
+        assert_eq!(
+            mode,
+            vec![vec![1.0 / 8.0, 0.3 / 8.0], vec![0.3 / 8.0, 2.0 / 8.0]]
+        );
+
+        // Var is None when df <= p + 3 (5 <= 5)
+        assert_eq!(d.var(), None);
+
+        // When df > p + 3:
+        let d6 = InvWishart::new(6.0, &[vec![2.0, 0.3], vec![0.3, 1.0]]).unwrap();
+        let mode6 = d6.mode();
+        assert_eq!(
+            mode6,
+            vec![vec![2.0 / 9.0, 0.3 / 9.0], vec![0.3 / 9.0, 1.0 / 9.0]]
+        );
+        let var6 = d6.var().expect("var defined for df > p + 3");
+        assert!((var6[0][0] - 8.0 / 9.0).abs() < 1e-12);
+        assert!((var6[1][1] - 2.0 / 9.0).abs() < 1e-12);
+        assert!((var6[0][1] - 0.17916666666666667).abs() < 1e-12);
+
+        // Entropy matches scipy
+        let d_ent = InvWishart::new(5.0, &[vec![2.0, 0.3], vec![0.3, 1.0]]).unwrap();
+        assert!((d_ent.entropy() - 1.2842180026706682).abs() < 1e-10);
     }
 
     #[test]
     fn wishart_matches_scipy() {
-        let d = Wishart::new(5.0, &[vec![1.0, 0.3], vec![0.3, 2.0]]).unwrap();
+        let scale = vec![vec![1.0, 0.3], vec![0.3, 2.0]];
+        let d = Wishart::new(5.0, &scale).unwrap();
         let x = vec![vec![2.0, 0.5], vec![0.5, 3.0]];
         assert!((d.logpdf(&x).unwrap() - (-5.945268668105113)).abs() < 1e-10);
         assert!((d.pdf(&x).unwrap() - 0.0026181988273429446).abs() < 1e-14);
         let mean = d.mean();
         assert_eq!(mean, vec![vec![5.0, 1.5], vec![1.5, 10.0]]);
+
+        // Mode: (df - p - 1) * scale = 2.0 * scale
+        let mode = d.mode().expect("mode defined for df >= p + 1");
+        assert_eq!(mode, vec![vec![2.0, 0.6], vec![0.6, 4.0]]);
+
+        // Var and Mode on second case
+        let d2 = Wishart::new(5.0, &[vec![2.0, 0.3], vec![0.3, 1.0]]).unwrap();
+        let mode2 = d2.mode().unwrap();
+        assert_eq!(mode2, vec![vec![4.0, 0.6], vec![0.6, 2.0]]);
+        let var2 = d2.var();
+        assert!((var2[0][0] - 40.0).abs() < 1e-12);
+        assert!((var2[1][1] - 10.0).abs() < 1e-12);
+        assert!((var2[0][1] - 10.45).abs() < 1e-12);
+
+        // Mode is None when df < p + 1
+        let d_small_df = Wishart::new(2.5, &scale).unwrap();
+        assert_eq!(d_small_df.mode(), None);
     }
 
     #[test]
@@ -63674,14 +64304,86 @@ mod tests {
         let x = vec![vec![1.5, 2.5], vec![2.5, 3.5], vec![4.5, 7.0]];
         assert!((d.logpdf(&x).unwrap() - (-8.125193864853545)).abs() < 1e-10);
         assert!((d.pdf(&x).unwrap() - 0.00029598734295147136).abs() < 1e-14);
+        assert_eq!(d.dims(), (3, 2));
+        assert_eq!(d.mean(), &m);
+        assert_eq!(d.rowcov(), &u);
+        assert_eq!(d.colcov(), &v);
+        assert!((d.entropy() - 10.550719452619719).abs() < 1e-10);
+
+        let cov_u = Covariance::from_psd(&u).unwrap();
+        let cov_v = Covariance::from_psd(&v).unwrap();
+        let d_cov = MatrixNormal::from_covariance(&m, &cov_u, &cov_v).unwrap();
+        assert!((d_cov.logpdf(&x).unwrap() - d.logpdf(&x).unwrap()).abs() < 1e-14);
+        assert!((d_cov.entropy() - d.entropy()).abs() < 1e-14);
     }
 
     #[test]
     fn multivariate_t_matches_scipy() {
-        let d = MultivariateT::new(&[1.0, 2.0], &[vec![2.0, 0.3], vec![0.3, 1.0]], 5.0).unwrap();
+        let loc = [1.0, 2.0];
+        let shape = [vec![2.0, 0.3], vec![0.3, 1.0]];
+        let d = MultivariateT::new(&loc, &shape, 5.0).unwrap();
+        assert_eq!(d.dim(), 2);
+        assert_eq!(d.df(), 5.0);
+        assert_eq!(d.loc(), &loc);
+        assert_eq!(d.shape(), &shape);
         assert!((d.pdf(&[1.5, 2.5]).unwrap() - 0.0930430847783872).abs() < 1e-12);
         assert!((d.logpdf(&[1.5, 2.5]).unwrap() - (-2.3746926159216657)).abs() < 1e-12);
         assert_eq!(d.mean(), vec![1.0, 2.0]);
+
+        // Covariance for df > 2: (5 / 3) * shape
+        let cov = d.cov().expect("cov exists for df > 2");
+        assert!((cov[0][0] - 10.0 / 3.0).abs() < 1e-12);
+        assert!((cov[1][1] - 5.0 / 3.0).abs() < 1e-12);
+        assert!((cov[0][1] - 0.5).abs() < 1e-12);
+
+        // Covariance is None for df <= 2
+        let d_low_df = MultivariateT::new(&loc, &shape, 1.5).unwrap();
+        assert_eq!(d_low_df.cov(), None);
+
+        // Entropy: standard branch (df < threshold)
+        let d_t3 = MultivariateT::new(&[0.0, 0.0], &[vec![1.0, 0.0], vec![0.0, 1.0]], 3.0).unwrap();
+        assert!((d_t3.entropy() - 3.5045437330760123).abs() < 1e-10);
+
+        // Entropy: asymptotic branch (df >= threshold)
+        let d_t1000 =
+            MultivariateT::new(&[0.0, 0.0], &[vec![1.0, 0.0], vec![0.0, 1.0]], 1000.0).unwrap();
+        assert!((d_t1000.entropy() - 2.839877066409345).abs() < 1e-10);
+
+        // Marginal distribution
+        let m0 = d.marginal(&[0]).unwrap();
+        assert_eq!(m0.dim(), 1);
+        assert_eq!(m0.loc(), &[1.0]);
+        assert_eq!(m0.shape(), &[vec![2.0]]);
+        assert_eq!(m0.df(), 5.0);
+
+        let m10 = d.marginal(&[1, 0]).unwrap();
+        assert_eq!(m10.dim(), 2);
+        assert_eq!(m10.loc(), &[2.0, 1.0]);
+        assert_eq!(m10.shape(), &[vec![1.0, 0.3], vec![0.3, 2.0]]);
+        assert_eq!(m10.df(), 5.0);
+
+        assert!(d.marginal(&[]).is_err());
+        assert!(d.marginal(&[2]).is_err());
+    }
+
+    #[test]
+    fn multivariate_normal_marginal_matches_scipy() {
+        let mean = [1.0, 2.0, 3.0];
+        let cov = [
+            vec![2.0, 0.5, 0.1],
+            vec![0.5, 3.0, 0.2],
+            vec![0.1, 0.2, 4.0],
+        ];
+        let mvn = MultivariateNormal::new(&mean, &cov).unwrap();
+        assert_eq!(mvn.dim(), 3);
+
+        let marg = mvn.marginal(&[0, 2]).unwrap();
+        assert_eq!(marg.dim(), 2);
+        assert_eq!(marg.mean(), &[1.0, 3.0]);
+        assert_eq!(marg.cov(), &[vec![2.0, 0.1], vec![0.1, 4.0]]);
+
+        assert!(mvn.marginal(&[]).is_err());
+        assert!(mvn.marginal(&[3]).is_err());
     }
 
     #[test]
@@ -63744,6 +64446,9 @@ mod tests {
     #[test]
     fn dirichlet_multinomial_matches_scipy() {
         let d = DirichletMultinomial::new(&[1.0, 2.0, 3.0], 6);
+        assert_eq!(d.dim(), 3);
+        assert_eq!(d.n(), 6);
+        assert_eq!(d.alpha(), &[1.0, 2.0, 3.0]);
         assert!((d.pmf(&[1.0, 2.0, 3.0]) - 0.06493506493506493).abs() < 1e-12);
         assert!((d.logpmf(&[1.0, 2.0, 3.0]) - (-2.7343675094195836)).abs() < 1e-12);
         assert_eq!(d.mean(), vec![1.0, 2.0, 3.0]);
@@ -63760,8 +64465,15 @@ mod tests {
     #[test]
     fn multivariate_hypergeom_matches_scipy() {
         let d = MultivariateHypergeom::new(&[10, 8, 6], 5);
+        assert_eq!(d.dim(), 3);
+        assert_eq!(d.m(), &[10, 8, 6]);
+        assert_eq!(d.n(), 5);
+        assert_eq!(d.total(), 24);
+        assert_eq!(d.M(), 24);
         assert!((d.pmf(&[2, 2, 1]) - 0.1778656126482213).abs() < 1e-12);
+        assert!((d.logpmf(&[2, 2, 1]) - 0.1778656126482213_f64.ln()).abs() < 1e-12);
         assert_eq!(d.pmf(&[2, 2, 2]), 0.0); // sum != n
+        assert_eq!(d.logpmf(&[2, 2, 2]), f64::NEG_INFINITY);
         let mean_exp = [2.0833333333333335, 1.6666666666666667, 1.25];
         for (g, e) in d.mean().iter().zip(&mean_exp) {
             assert!((g - e).abs() < 1e-10, "mean {g} vs {e}");
@@ -63794,10 +64506,17 @@ mod tests {
     #[test]
     fn multinomial_matches_scipy() {
         let mn = Multinomial::new(10, &[0.2, 0.3, 0.5]);
+        assert_eq!(mn.dim(), 3);
+        assert_eq!(mn.n(), 10);
+        assert_eq!(mn.p(), &[0.2, 0.3, 0.5]);
         assert!((mn.pmf(&[2.0, 3.0, 5.0]) - 0.08504999999999999).abs() < 1e-12);
         assert!((mn.logpmf(&[2.0, 3.0, 5.0]) - (-2.4645159601402664)).abs() < 1e-12);
         assert_eq!(mn.pmf(&[2.0, 3.0, 4.0]), 0.0); // sum != n
         assert_eq!(mn.mean(), vec![2.0, 3.0, 5.0]);
+        let var_exp = [10.0 * 0.2 * 0.8, 10.0 * 0.3 * 0.7, 10.0 * 0.5 * 0.5];
+        for (g, e) in mn.var().iter().zip(&var_exp) {
+            assert!((g - e).abs() < 1e-12, "var {g} vs {e}");
+        }
         let cov = mn.cov();
         let cov_exp = [[1.6, -0.6, -1.0], [-0.6, 2.1, -1.5], [-1.0, -1.5, 2.5]];
         for i in 0..3 {
@@ -66720,6 +67439,37 @@ mod tests {
         let d = Dirichlet::new(&[1.0, 1.0]);
         assert!(d.pdf(&[0.5, 0.6]).abs() < 1e-300);
         assert!(d.pdf(&[-0.1, 1.1]).abs() < 1e-300);
+    }
+
+    #[test]
+    fn dirichlet_cov_matches_formula() {
+        let alpha = [1.0, 2.0, 3.0];
+        let d = Dirichlet::new(&alpha);
+        assert_eq!(d.dim(), 3);
+        assert_eq!(d.alpha(), &alpha);
+        let cov = d.cov();
+        let expected = [
+            [
+                0.01984126984126984,
+                -0.007936507936507936,
+                -0.011904761904761904,
+            ],
+            [
+                -0.007936507936507936,
+                0.031746031746031744,
+                -0.023809523809523808,
+            ],
+            [
+                -0.011904761904761904,
+                -0.023809523809523808,
+                0.03571428571428571,
+            ],
+        ];
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((cov[i][j] - expected[i][j]).abs() < 1e-12);
+            }
+        }
     }
 
     #[test]
