@@ -8750,9 +8750,10 @@ fn ln_multivariate_gamma(p: usize, a: f64) -> f64 {
 }
 
 /// The Wishart distribution, matching `scipy.stats.wishart(df, scale)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Wishart {
-    df: f64,
-    scale: Vec<Vec<f64>>,
+    pub df: f64,
+    pub scale: Vec<Vec<f64>>,
     chol_v: Vec<Vec<f64>>,
     ln_det_v: f64,
     p: usize,
@@ -8768,6 +8769,27 @@ impl Wishart {
                 "scale must be non-empty".to_string(),
             ));
         }
+        if !df.is_finite() || df <= (p as f64 - 1.0) {
+            return Err(StatsError::InvalidArgument(format!(
+                "df must be greater than p - 1 = {}, got {df}",
+                p as f64 - 1.0
+            )));
+        }
+        for (i, row_i) in scale.iter().enumerate() {
+            if row_i.len() != p {
+                return Err(StatsError::InvalidArgument(format!(
+                    "scale row {i} has length {}, expected {p}",
+                    row_i.len()
+                )));
+            }
+            for (j, &val_ij) in row_i.iter().enumerate() {
+                if (val_ij - scale[j][i]).abs() > 1e-12 {
+                    return Err(StatsError::InvalidArgument(
+                        "scale matrix must be symmetric".to_string(),
+                    ));
+                }
+            }
+        }
         let chol_v = cholesky_decompose(scale)?;
         let ln_det_v = 2.0 * (0..p).map(|i| chol_v[i][i].ln()).sum::<f64>();
         Ok(Self {
@@ -8777,6 +8799,87 @@ impl Wishart {
             ln_det_v,
             p,
         })
+    }
+
+    /// Create a Wishart distribution from degrees of freedom `df` and a [`Covariance`]
+    /// representation of the scale matrix.
+    pub fn from_covariance(df: f64, cov: &Covariance) -> Result<Self, StatsError> {
+        let p = cov.dim();
+        if p == 0 {
+            return Err(StatsError::InvalidArgument(
+                "covariance representation must have dimension > 0".to_string(),
+            ));
+        }
+        if !df.is_finite() || df <= (p as f64 - 1.0) {
+            return Err(StatsError::InvalidArgument(format!(
+                "df must be greater than p - 1 = {}, got {df}",
+                p as f64 - 1.0
+            )));
+        }
+
+        let chol_v = if let Some(chol_ref) = cov.cholesky_factor() {
+            for (i, row) in chol_ref.iter().enumerate() {
+                if i >= row.len() || row[i] <= 1e-15 || !row[i].is_finite() {
+                    return Err(StatsError::InvalidArgument(
+                        "scale matrix must be symmetric positive definite".to_string(),
+                    ));
+                }
+            }
+            chol_ref.to_vec()
+        } else {
+            cholesky_decompose(cov.covariance())?
+        };
+
+        let ln_det_v = 2.0 * (0..p).map(|i| chol_v[i][i].ln()).sum::<f64>();
+        Ok(Self {
+            df,
+            scale: cov.covariance().to_vec(),
+            chol_v,
+            ln_det_v,
+            p,
+        })
+    }
+
+    /// Dimensionality of the distribution.
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.p
+    }
+
+    /// Degrees of freedom.
+    #[inline]
+    pub fn df(&self) -> f64 {
+        self.df
+    }
+
+    /// Reference to the scale matrix.
+    #[inline]
+    pub fn scale(&self) -> &[Vec<f64>] {
+        &self.scale
+    }
+
+    /// Logarithm of the determinant of the scale matrix.
+    #[inline]
+    pub fn log_det_scale(&self) -> f64 {
+        self.ln_det_v
+    }
+
+    /// Differential entropy of the Wishart distribution in nats:
+    /// `H(W) = ln Γ_p(n/2) + 0.5*n*p + 0.5*p*(p+1)*ln(2) + 0.5*(p+1)*ln|V| + 0.5*(p+1-n)*Σ ψ((n-i+1)/2)`.
+    pub fn entropy(&self) -> f64 {
+        let p = self.p;
+        let pf = p as f64;
+        let n = self.df;
+        let mut psi_sum = 0.0;
+        for i in 1..=p {
+            let arg = (n - i as f64 + 1.0) / 2.0;
+            psi_sum += digamma(arg);
+        }
+        ln_multivariate_gamma(p, n / 2.0)
+            + 0.5 * n * pf
+            + 0.5 * pf * (pf + 1.0) * 2.0_f64.ln()
+            + 0.5 * (pf + 1.0) * self.ln_det_v
+            + 0.5 * (pf + 1.0 - n) * psi_sum
     }
 
     /// Log probability density function at a `p×p` symmetric positive-definite
@@ -8816,9 +8919,10 @@ impl Wishart {
 }
 
 /// The inverse Wishart distribution, matching `scipy.stats.invwishart(df, scale)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct InvWishart {
-    df: f64,
-    scale: Vec<Vec<f64>>,
+    pub df: f64,
+    pub scale: Vec<Vec<f64>>,
     chol_v: Vec<Vec<f64>>,
     ln_det_v: f64,
     p: usize,
@@ -8834,6 +8938,27 @@ impl InvWishart {
                 "scale must be non-empty".to_string(),
             ));
         }
+        if !df.is_finite() || df <= (p as f64 - 1.0) {
+            return Err(StatsError::InvalidArgument(format!(
+                "df must be greater than p - 1 = {}, got {df}",
+                p as f64 - 1.0
+            )));
+        }
+        for (i, row_i) in scale.iter().enumerate() {
+            if row_i.len() != p {
+                return Err(StatsError::InvalidArgument(format!(
+                    "scale row {i} has length {}, expected {p}",
+                    row_i.len()
+                )));
+            }
+            for (j, &val_ij) in row_i.iter().enumerate() {
+                if (val_ij - scale[j][i]).abs() > 1e-12 {
+                    return Err(StatsError::InvalidArgument(
+                        "scale matrix must be symmetric".to_string(),
+                    ));
+                }
+            }
+        }
         let chol_v = cholesky_decompose(scale)?;
         let ln_det_v = 2.0 * (0..p).map(|i| chol_v[i][i].ln()).sum::<f64>();
         Ok(Self {
@@ -8843,6 +8968,69 @@ impl InvWishart {
             ln_det_v,
             p,
         })
+    }
+
+    /// Create an inverse Wishart distribution from degrees of freedom `df` and a
+    /// [`Covariance`] representation of the scale matrix.
+    pub fn from_covariance(df: f64, cov: &Covariance) -> Result<Self, StatsError> {
+        let p = cov.dim();
+        if p == 0 {
+            return Err(StatsError::InvalidArgument(
+                "covariance representation must have dimension > 0".to_string(),
+            ));
+        }
+        if !df.is_finite() || df <= (p as f64 - 1.0) {
+            return Err(StatsError::InvalidArgument(format!(
+                "df must be greater than p - 1 = {}, got {df}",
+                p as f64 - 1.0
+            )));
+        }
+
+        let chol_v = if let Some(chol_ref) = cov.cholesky_factor() {
+            for (i, row) in chol_ref.iter().enumerate() {
+                if i >= row.len() || row[i] <= 1e-15 || !row[i].is_finite() {
+                    return Err(StatsError::InvalidArgument(
+                        "scale matrix must be symmetric positive definite".to_string(),
+                    ));
+                }
+            }
+            chol_ref.to_vec()
+        } else {
+            cholesky_decompose(cov.covariance())?
+        };
+
+        let ln_det_v = 2.0 * (0..p).map(|i| chol_v[i][i].ln()).sum::<f64>();
+        Ok(Self {
+            df,
+            scale: cov.covariance().to_vec(),
+            chol_v,
+            ln_det_v,
+            p,
+        })
+    }
+
+    /// Dimensionality of the distribution.
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.p
+    }
+
+    /// Degrees of freedom.
+    #[inline]
+    pub fn df(&self) -> f64 {
+        self.df
+    }
+
+    /// Reference to the scale matrix.
+    #[inline]
+    pub fn scale(&self) -> &[Vec<f64>] {
+        &self.scale
+    }
+
+    /// Logarithm of the determinant of the scale matrix.
+    #[inline]
+    pub fn log_det_scale(&self) -> f64 {
+        self.ln_det_v
     }
 
     /// Log probability density function at a `p×p` symmetric positive-definite
@@ -63402,6 +63590,69 @@ mod tests {
         assert!((d.pdf(&x).unwrap() - 0.0026181988273429446).abs() < 1e-14);
         let mean = d.mean();
         assert_eq!(mean, vec![vec![5.0, 1.5], vec![1.5, 10.0]]);
+    }
+
+    #[test]
+    fn wishart_and_invwishart_from_covariance_and_methods() {
+        let df = 5.0;
+        let scale = vec![vec![1.0, 0.3], vec![0.3, 2.0]];
+        let cov = Covariance::from_psd(&scale).expect("cov psd");
+
+        let w_raw = Wishart::new(df, &scale).expect("wishart raw");
+        let w_cov = Wishart::from_covariance(df, &cov).expect("wishart from cov");
+
+        assert_eq!(w_cov.dim(), 2);
+        assert_eq!(w_cov.df(), 5.0);
+        assert_eq!(w_cov.scale(), &scale);
+        let det_v: f64 = 1.0 * 2.0 - 0.3 * 0.3;
+        assert_close(w_cov.log_det_scale(), det_v.ln(), 1e-12, "log_det_scale");
+
+        let x = vec![vec![2.0, 0.5], vec![0.5, 3.0]];
+        assert_close(
+            w_cov.logpdf(&x).unwrap(),
+            w_raw.logpdf(&x).unwrap(),
+            1e-14,
+            "wishart from_covariance logpdf matches raw",
+        );
+        assert_close(
+            w_cov.pdf(&x).unwrap(),
+            w_raw.pdf(&x).unwrap(),
+            1e-14,
+            "wishart from_covariance pdf matches raw",
+        );
+
+        // Entropy is finite and positive
+        let ent = w_cov.entropy();
+        assert!(ent.is_finite(), "wishart entropy must be finite");
+        assert!(ent > 0.0, "wishart entropy positive for this scale");
+
+        // InvWishart from_covariance
+        let iw_raw = InvWishart::new(df, &scale).expect("invwishart raw");
+        let iw_cov = InvWishart::from_covariance(df, &cov).expect("invwishart from cov");
+
+        assert_eq!(iw_cov.dim(), 2);
+        assert_eq!(iw_cov.df(), 5.0);
+        assert_eq!(iw_cov.scale(), &scale);
+
+        assert_close(
+            iw_cov.logpdf(&x).unwrap(),
+            iw_raw.logpdf(&x).unwrap(),
+            1e-14,
+            "invwishart from_covariance logpdf matches raw",
+        );
+        assert_close(
+            iw_cov.pdf(&x).unwrap(),
+            iw_raw.pdf(&x).unwrap(),
+            1e-14,
+            "invwishart from_covariance pdf matches raw",
+        );
+
+        // Error checking
+        assert!(Wishart::new(1.0, &scale).is_err(), "df <= p - 1 is rejected");
+        assert!(Wishart::new(-1.0, &scale).is_err());
+        assert!(InvWishart::new(1.0, &scale).is_err(), "df <= p - 1 is rejected");
+        assert!(Wishart::new(df, &[]).is_err());
+        assert!(InvWishart::new(df, &[]).is_err());
     }
 
     #[test]
