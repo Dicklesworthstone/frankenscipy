@@ -890,6 +890,7 @@ dependencies = [
  "fsci-stats",
  "ftui",
  "proptest",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tempfile",

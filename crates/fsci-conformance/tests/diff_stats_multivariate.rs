@@ -237,6 +237,7 @@ struct MatrixNormalOracleResponse {
     pdf: f64,
     logpdf: f64,
     entropy: f64,
+    rvs_shape: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -244,6 +245,7 @@ struct MatrixTOracleResponse {
     case_id: String,
     pdf: f64,
     logpdf: f64,
+    rvs_shape: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -252,6 +254,8 @@ struct VonMisesFisherOracleResponse {
     pdf: f64,
     logpdf: f64,
     entropy: f64,
+    rvs_shape: Vec<usize>,
+    rvs_norm_err: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -272,6 +276,7 @@ struct MultivariateHypergeomOracleResponse {
     mean: Vec<f64>,
     var: Vec<f64>,
     cov: Vec<Vec<f64>>,
+    rvs_shape: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -283,6 +288,7 @@ struct NormalInverseGammaOracleResponse {
     mean_s2: f64,
     var_x: f64,
     var_s2: f64,
+    rvs_len: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -293,6 +299,7 @@ struct MultinomialOracleResponse {
     mean: Vec<f64>,
     cov: Vec<Vec<f64>>,
     entropy: f64,
+    rvs_shape: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -438,11 +445,13 @@ for c in query["matrix_normal_cases"]:
     colcov = np.array(c["colcov"], dtype=np.float64)
     x = np.array(c["x"], dtype=np.float64)
     rv = stats.matrix_normal(mean=mean, rowcov=rowcov, colcov=colcov)
+    rvs_samp = rv.rvs(size=50, random_state=42)
     out["matrix_normal"].append({
         "case_id": cid,
         "pdf": float(rv.pdf(x)),
         "logpdf": float(rv.logpdf(x)),
         "entropy": float(rv.entropy()),
+        "rvs_shape": list(rvs_samp.shape),
     })
 
 for c in query["matrix_t_cases"]:
@@ -453,10 +462,12 @@ for c in query["matrix_t_cases"]:
     df = float(c["df"])
     x = np.array(c["x"], dtype=np.float64)
     rv = stats.matrix_t(mean=mean, row_spread=row_spread, col_spread=col_spread, df=df)
+    rvs_samp = rv.rvs(size=50, random_state=42)
     out["matrix_t"].append({
         "case_id": cid,
         "pdf": float(rv.pdf(x)),
         "logpdf": float(rv.logpdf(x)),
+        "rvs_shape": list(rvs_samp.shape),
     })
 
 for c in query["vmf_cases"]:
@@ -465,11 +476,15 @@ for c in query["vmf_cases"]:
     kappa = float(c["kappa"])
     x = np.array(c["x"], dtype=np.float64)
     rv = stats.vonmises_fisher(mu, kappa)
+    rvs_samp = rv.rvs(size=50, random_state=42)
+    vmf_norm_err = float(np.max(np.abs(np.linalg.norm(rvs_samp, axis=-1) - 1.0)))
     out["vmf"].append({
         "case_id": cid,
         "pdf": float(rv.pdf(x)),
         "logpdf": float(rv.logpdf(x)),
         "entropy": float(rv.entropy()),
+        "rvs_shape": list(rvs_samp.shape),
+        "rvs_norm_err": vmf_norm_err,
     })
 
 for c in query["dirichlet_cases"]:
@@ -494,6 +509,7 @@ for c in query["mhypergeom_cases"]:
     x = [int(v) for v in c["x"]]
     rv = stats.multivariate_hypergeom(m=m, n=n)
     cov_mat = [[float(v) for v in row] for row in rv.cov()]
+    rvs_samp = rv.rvs(size=50, random_state=42)
     out["mhypergeom"].append({
         "case_id": cid,
         "pmf": float(rv.pmf(x)),
@@ -501,6 +517,7 @@ for c in query["mhypergeom_cases"]:
         "mean": [float(m) for m in rv.mean()],
         "var": [float(v) for v in rv.var()],
         "cov": cov_mat,
+        "rvs_shape": list(rvs_samp.shape),
     })
 
 for c in query["nig_cases"]:
@@ -514,6 +531,8 @@ for c in query["nig_cases"]:
     rv = stats.normal_inverse_gamma(mu=mu, lmbda=lmbda, a=a, b=b)
     m = rv.mean()
     v = rv.var()
+    rvs_samp = rv.rvs(size=50, random_state=42)
+    rvs_len = int(len(rvs_samp[0]))
     out["nig"].append({
         "case_id": cid,
         "pdf": float(rv.pdf(x, s2)),
@@ -522,6 +541,7 @@ for c in query["nig_cases"]:
         "mean_s2": float(m[1]),
         "var_x": float(v[0]),
         "var_s2": float(v[1]),
+        "rvs_len": rvs_len,
     })
 
 for c in query["multinomial_cases"]:
@@ -531,6 +551,7 @@ for c in query["multinomial_cases"]:
     x = np.array(c["x"], dtype=np.float64)
     rv = stats.multinomial(n=n, p=p)
     cov_mat = [[float(val) for val in row] for row in rv.cov()]
+    rvs_samp = rv.rvs(size=50, random_state=42)
     out["multinomial"].append({
         "case_id": cid,
         "pmf": float(rv.pmf(x)),
@@ -538,6 +559,7 @@ for c in query["multinomial_cases"]:
         "mean": [float(m) for m in rv.mean()],
         "cov": cov_mat,
         "entropy": float(rv.entropy()),
+        "rvs_shape": list(rvs_samp.shape),
     })
 
 for c in query["dirichlet_multinomial_cases"]:
@@ -1317,6 +1339,38 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert!(
             (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
         );
+
+        // rvs differential test
+        let mut rng = StdRng::seed_from_u64(42);
+        let rvs_samples = dist.rvs(50, &mut rng);
+        assert_eq!(rvs_samples.len(), resp.rvs_shape[0]);
+        for s in &rvs_samples {
+            assert_eq!(s.len(), resp.rvs_shape[1]);
+            assert_eq!(s[0].len(), resp.rvs_shape[2]);
+        }
+        let large_samples = dist.rvs(1000, &mut rng);
+        let mut sample_sum = vec![vec![0.0; case.mean[0].len()]; case.mean.len()];
+        for s in &large_samples {
+            for r in 0..case.mean.len() {
+                for c in 0..case.mean[0].len() {
+                    sample_sum[r][c] += s[r][c];
+                }
+            }
+        }
+        for r in 0..case.mean.len() {
+            for c in 0..case.mean[0].len() {
+                let m_est = sample_sum[r][c] / 1000.0;
+                check_pair(
+                    &format!("{}_rvs_mean_{r}_{c}", case.case_id),
+                    "MatrixNormal",
+                    m_est,
+                    case.mean[r][c],
+                    0.25,
+                    0.25,
+                    &mut records,
+                );
+            }
+        }
     }
 
     // Test MatrixT
@@ -1362,6 +1416,38 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert!(
             (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
         );
+
+        // rvs differential test
+        let mut rng = StdRng::seed_from_u64(42);
+        let rvs_samples = dist.rvs(50, &mut rng).expect("matrix_t rvs");
+        assert_eq!(rvs_samples.len(), resp.rvs_shape[0]);
+        for s in &rvs_samples {
+            assert_eq!(s.len(), resp.rvs_shape[1]);
+            assert_eq!(s[0].len(), resp.rvs_shape[2]);
+        }
+        let large_samples = dist.rvs(1000, &mut rng).expect("matrix_t rvs large");
+        let mut sample_sum = vec![vec![0.0; case.mean[0].len()]; case.mean.len()];
+        for s in &large_samples {
+            for r in 0..case.mean.len() {
+                for c in 0..case.mean[0].len() {
+                    sample_sum[r][c] += s[r][c];
+                }
+            }
+        }
+        for r in 0..case.mean.len() {
+            for c in 0..case.mean[0].len() {
+                let m_est = sample_sum[r][c] / 1000.0;
+                check_pair(
+                    &format!("{}_rvs_mean_{r}_{c}", case.case_id),
+                    "MatrixT",
+                    m_est,
+                    case.mean[r][c],
+                    0.35,
+                    0.35,
+                    &mut records,
+                );
+            }
+        }
     }
 
     // Test VonMisesFisher
@@ -1404,6 +1490,32 @@ fn diff_multivariate_stats_scipy_oracle() {
             1e-8,
             &mut records,
         );
+
+        // rvs differential test
+        let mut rng = StdRng::seed_from_u64(42);
+        let rvs_samples = dist.rvs(50, &mut rng);
+        assert_eq!(rvs_samples.len(), resp.rvs_shape[0]);
+        let mut max_norm_err = 0.0_f64;
+        let mut mean_dir = vec![0.0; case.mu.len()];
+        for s in &rvs_samples {
+            assert_eq!(s.len(), resp.rvs_shape[1]);
+            let norm: f64 = s.iter().map(|&v| v * v).sum::<f64>().sqrt();
+            max_norm_err = max_norm_err.max((norm - 1.0).abs());
+            for (idx, &v) in s.iter().enumerate() {
+                mean_dir[idx] += v;
+            }
+        }
+        check_pair(
+            &format!("{}_rvs_unit_norm_err", case.case_id),
+            "VonMisesFisher",
+            max_norm_err,
+            resp.rvs_norm_err,
+            1e-9,
+            1e-9,
+            &mut records,
+        );
+        let dot_mu: f64 = mean_dir.iter().zip(&case.mu).map(|(&d, &m)| d * m).sum();
+        assert!(dot_mu > 0.0, "vmf sample mean aligns with concentration mu");
     }
 
     // Test Dirichlet
@@ -1547,6 +1659,37 @@ fn diff_multivariate_stats_scipy_oracle() {
                 );
             }
         }
+
+        // rvs differential test
+        let mut rng = StdRng::seed_from_u64(42);
+        let rvs_samples = dist.rvs(50, &mut rng);
+        assert_eq!(rvs_samples.len(), resp.rvs_shape[0]);
+        for s in &rvs_samples {
+            assert_eq!(s.len(), resp.rvs_shape[1]);
+            assert_eq!(s.iter().sum::<usize>(), case.n);
+            for (idx, &v) in s.iter().enumerate() {
+                assert!(v <= case.m[idx]);
+            }
+        }
+        let large_samples = dist.rvs(1000, &mut rng);
+        let mut sample_sum = vec![0.0; case.m.len()];
+        for s in &large_samples {
+            for (idx, &v) in s.iter().enumerate() {
+                sample_sum[idx] += v as f64;
+            }
+        }
+        for (k, (&sm, &exp_m)) in sample_sum.iter().zip(&resp.mean).enumerate() {
+            let m_est = sm / 1000.0;
+            check_pair(
+                &format!("{}_rvs_mean_{k}", case.case_id),
+                "MultivariateHypergeom",
+                m_est,
+                exp_m,
+                0.2,
+                0.2,
+                &mut records,
+            );
+        }
     }
 
     // Test NormalInverseGamma
@@ -1617,6 +1760,42 @@ fn diff_multivariate_stats_scipy_oracle() {
             resp.var_s2,
             1e-11,
             1e-10,
+            &mut records,
+        );
+
+        // rvs differential test
+        let mut rng = StdRng::seed_from_u64(42);
+        let rvs_samples = dist.rvs(50, &mut rng);
+        assert_eq!(rvs_samples.len(), resp.rvs_len);
+        for &(x_val, s2_val) in &rvs_samples {
+            assert!(s2_val > 0.0, "s2 must be strictly positive");
+            assert!(x_val.is_finite());
+        }
+        let large_samples = dist.rvs(2000, &mut rng);
+        let mut sum_x = 0.0;
+        let mut sum_s2 = 0.0;
+        for &(x_val, s2_val) in &large_samples {
+            sum_x += x_val;
+            sum_s2 += s2_val;
+        }
+        let est_mean_x = sum_x / 2000.0;
+        let est_mean_s2 = sum_s2 / 2000.0;
+        check_pair(
+            &format!("{}_rvs_mean_x", case.case_id),
+            "NormalInverseGamma",
+            est_mean_x,
+            resp.mean_x,
+            0.25,
+            0.25,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_rvs_mean_s2", case.case_id),
+            "NormalInverseGamma",
+            est_mean_s2,
+            resp.mean_s2,
+            0.25,
+            0.25,
             &mut records,
         );
     }
@@ -1702,6 +1881,34 @@ fn diff_multivariate_stats_scipy_oracle() {
             1e-8,
             &mut records,
         );
+
+        // rvs differential test
+        let mut rng = StdRng::seed_from_u64(42);
+        let rvs_samples = dist.rvs(50, &mut rng);
+        assert_eq!(rvs_samples.len(), resp.rvs_shape[0]);
+        for s in &rvs_samples {
+            assert_eq!(s.len(), resp.rvs_shape[1]);
+            assert_eq!(s.iter().sum::<usize>(), case.n);
+        }
+        let large_samples = dist.rvs(1500, &mut rng);
+        let mut sample_sum = vec![0.0; case.p.len()];
+        for s in &large_samples {
+            for (idx, &v) in s.iter().enumerate() {
+                sample_sum[idx] += v as f64;
+            }
+        }
+        for (k, (&sm, &exp_m)) in sample_sum.iter().zip(&resp.mean).enumerate() {
+            let m_est = sm / 1500.0;
+            check_pair(
+                &format!("{}_rvs_mean_{k}", case.case_id),
+                "Multinomial",
+                m_est,
+                exp_m,
+                0.25,
+                0.25,
+                &mut records,
+            );
+        }
     }
 
     // Test DirichletMultinomial

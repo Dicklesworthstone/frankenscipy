@@ -8185,6 +8185,48 @@ impl Multinomial {
         }
         h
     }
+
+    /// Draw `n_samples` random vectors from the multinomial distribution.
+    ///
+    /// Each sample is a vector of counts of length `p.len()` summing to `self.n`.
+    pub fn rvs(&self, n_samples: usize, rng: &mut impl Rng) -> Vec<Vec<usize>> {
+        let k = self.p.len();
+        if k == 0 || n_samples == 0 {
+            return Vec::new();
+        }
+        let p_sum: f64 = self.p.iter().sum();
+        let normalized_p: Vec<f64> = if (p_sum - 1.0).abs() > 1e-12 && p_sum > 0.0 {
+            self.p.iter().map(|&pi| pi / p_sum).collect()
+        } else {
+            self.p.clone()
+        };
+        let mut cumsum = vec![0.0_f64; k];
+        let mut sum = 0.0_f64;
+        for (i, &pi) in normalized_p.iter().enumerate() {
+            sum += pi;
+            cumsum[i] = sum;
+        }
+        if let Some(last) = cumsum.last_mut() {
+            *last = 1.0;
+        }
+        let mut samples = Vec::with_capacity(n_samples);
+        for _ in 0..n_samples {
+            let mut counts = vec![0usize; k];
+            for _ in 0..self.n {
+                let u: f64 = rng.random();
+                let mut chosen = k - 1;
+                for (idx, &c) in cumsum.iter().enumerate() {
+                    if u <= c {
+                        chosen = idx;
+                        break;
+                    }
+                }
+                counts[chosen] += 1;
+            }
+            samples.push(counts);
+        }
+        samples
+    }
 }
 
 /// The Poisson binomial distribution — the number of successes in `n`
@@ -8340,6 +8382,59 @@ impl MultivariateHypergeom {
                     .collect()
             })
             .collect()
+    }
+
+    /// Draw `n_samples` random vectors from the multivariate hypergeometric distribution.
+    ///
+    /// Each sample is a vector of counts of length `m.len()` summing to `self.n`, drawn
+    /// without replacement from an urn with category populations `self.m`.
+    pub fn rvs(&self, n_samples: usize, rng: &mut impl Rng) -> Vec<Vec<usize>> {
+        let k = self.m.len();
+        if k == 0 || n_samples == 0 {
+            return Vec::new();
+        }
+        let total = self.total;
+        let draw_n = self.n;
+        if total == 0 || draw_n == 0 {
+            return vec![vec![0usize; k]; n_samples];
+        }
+        // If draw_n > total / 2, draw the unchosen items (total - draw_n) and subtract from m.
+        let complement = draw_n > total / 2;
+        let actual_draws = if complement { total - draw_n } else { draw_n };
+        let mut samples = Vec::with_capacity(n_samples);
+        for _ in 0..n_samples {
+            let mut m_rem = self.m.clone();
+            let mut tot_rem = total;
+            let mut drawn = vec![0usize; k];
+            for _ in 0..actual_draws {
+                if tot_rem == 0 {
+                    break;
+                }
+                let u = rng.random::<f64>() * tot_rem as f64;
+                let mut cum = 0usize;
+                let mut chosen = k - 1;
+                for (idx, &cnt) in m_rem.iter().enumerate() {
+                    cum += cnt;
+                    if u <= cum as f64 {
+                        chosen = idx;
+                        break;
+                    }
+                }
+                drawn[chosen] += 1;
+                m_rem[chosen] -= 1;
+                tot_rem -= 1;
+            }
+            if complement {
+                let mut result = vec![0usize; k];
+                for i in 0..k {
+                    result[i] = self.m[i] - drawn[i];
+                }
+                samples.push(result);
+            } else {
+                samples.push(drawn);
+            }
+        }
+        samples
     }
 }
 
@@ -9044,6 +9139,42 @@ impl MatrixNormal {
     pub fn pdf(&self, x: &[Vec<f64>]) -> Result<f64, StatsError> {
         Ok(self.logpdf(x)?.exp())
     }
+
+    /// Draw `n` random matrix samples from the matrix normal distribution.
+    ///
+    /// Each sample is an `nrow × ncol` matrix `X = M + L_U · Z · L_V^T`, where `Z`
+    /// is an `nrow × ncol` matrix of independent standard normals, `L_U` is the
+    /// Cholesky factor of the row covariance `U`, and `L_V` is the Cholesky factor
+    /// of the column covariance `V`.
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<Vec<f64>>> {
+        let (nrow, ncol) = self.dims();
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let z_flat = sample_standard_normals(nrow * ncol, rng);
+            let mut w = vec![vec![0.0_f64; ncol]; nrow];
+            for r in 0..nrow {
+                for c in 0..ncol {
+                    let mut sum = 0.0_f64;
+                    for k in 0..=c {
+                        sum += z_flat[r * ncol + k] * self.chol_v[c][k];
+                    }
+                    w[r][c] = sum;
+                }
+            }
+            let mut x = vec![vec![0.0_f64; ncol]; nrow];
+            for r in 0..nrow {
+                for c in 0..ncol {
+                    let mut sum = 0.0_f64;
+                    for k in 0..=r {
+                        sum += self.chol_u[r][k] * w[k][c];
+                    }
+                    x[r][c] = self.mean[r][c] + sum;
+                }
+            }
+            samples.push(x);
+        }
+        samples
+    }
 }
 
 /// Log of the multivariate gamma function `Γ_p(a) = π^{p(p-1)/4} Π Γ(a+(1-i)/2)`.
@@ -9684,6 +9815,26 @@ impl NormalInverseGamma {
     pub fn pdf(&self, x: f64, s2: f64) -> f64 {
         self.logpdf(x, s2).exp()
     }
+
+    /// Draw `n` random samples `(x, s2)` from the normal-inverse-gamma distribution.
+    ///
+    /// Following SciPy, draws `s2 ~ InvGamma(a, scale=b)` and then `x | s2 ~ Normal(mu, sqrt(s2 / lmbda))`.
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<(f64, f64)> {
+        if n == 0 {
+            return Vec::new();
+        }
+        let gamma_dist = GammaDist::new(self.a, 1.0);
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let y = gamma_dist.rvs(1, rng)[0].max(1e-300);
+            let s2 = self.b / y;
+            let std_dev = (s2 / self.lmbda).sqrt();
+            let z = sample_standard_normals(1, rng)[0];
+            let x = self.mu + std_dev * z;
+            samples.push((x, s2));
+        }
+        samples
+    }
 }
 
 /// The von Mises-Fisher distribution on the unit `(p−1)`-sphere, matching
@@ -9755,6 +9906,126 @@ impl VonMisesFisher {
     /// Probability density at a unit vector `x`.
     pub fn pdf(&self, x: &[f64]) -> f64 {
         self.logpdf(x).exp()
+    }
+
+    /// Draw `n` random sample vectors from the von Mises-Fisher distribution on S^(p-1).
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+        let p = self.mu.len();
+        if p == 0 || n == 0 {
+            return Vec::new();
+        }
+        if self.kappa <= 1e-12 {
+            let mut samples = Vec::with_capacity(n);
+            for _ in 0..n {
+                samples.push(uniform_direction::rvs_with_rng(p, rng));
+            }
+            return samples;
+        }
+        if p == 2 {
+            let mean_angle = self.mu[1].atan2(self.mu[0]);
+            let mut samples = Vec::with_capacity(n);
+            for _ in 0..n {
+                let theta = sample_von_mises_best_fisher(self.kappa, mean_angle, rng);
+                samples.push(vec![theta.cos(), theta.sin()]);
+            }
+            return samples;
+        }
+        let mut samples = Vec::with_capacity(n);
+        let e1_dot_mu = self.mu[0];
+        let reflect_v: Option<Vec<f64>> = if (e1_dot_mu - 1.0).abs() < 1e-12 {
+            None
+        } else if (e1_dot_mu + 1.0).abs() < 1e-12 {
+            let mut v = vec![0.0; p];
+            v[0] = 1.0;
+            Some(v)
+        } else {
+            let mut v = vec![0.0; p];
+            v[0] = 1.0 - self.mu[0];
+            for i in 1..p {
+                v[i] = -self.mu[i];
+            }
+            let norm: f64 = v.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            for vi in v.iter_mut() {
+                *vi /= norm;
+            }
+            Some(v)
+        };
+
+        for _ in 0..n {
+            let (x, temp) = if p == 3 {
+                let u: f64 = rng.random();
+                let x_val = (1.0 + (u + (1.0 - u) * (-2.0 * self.kappa).exp()).ln() / self.kappa)
+                    .clamp(-1.0, 1.0);
+                let temp = (1.0 - x_val * x_val).max(0.0).sqrt();
+                (x_val, temp)
+            } else {
+                let dim_m1 = (p - 1) as f64;
+                let sqrt_val = (4.0 * self.kappa * self.kappa + dim_m1 * dim_m1).sqrt();
+                let mut b = (-2.0 * self.kappa + sqrt_val) / dim_m1;
+                if b <= 0.0 {
+                    b = dim_m1 / (4.0 * self.kappa) - dim_m1.powi(3) / (64.0 * self.kappa.powi(3));
+                }
+                let x0 = (1.0 - b) / (1.0 + b);
+                let c = self.kappa * x0 + dim_m1 * (4.0_f64.ln() + b.ln() - 2.0 * (1.0 + b).ln());
+                let halfdim = 0.5 * dim_m1;
+                let gamma_dist = GammaDist::new(halfdim, 1.0);
+                let x_val = loop {
+                    let g1 = gamma_dist.rvs(1, rng)[0].max(1e-300);
+                    let g2 = gamma_dist.rvs(1, rng)[0].max(1e-300);
+                    let z = (g1 / (g1 + g2)).clamp(1e-12, 1.0 - 1e-12);
+                    let w = (1.0 - (1.0 + b) * z) / (1.0 - (1.0 - b) * z);
+                    let u: f64 = rng.random();
+                    let crit =
+                        self.kappa * w + dim_m1 * ((1.0 + b - w + w * b) / (1.0 + b)).ln() - c;
+                    if crit > u.ln() {
+                        break w.clamp(-1.0, 1.0);
+                    }
+                };
+                let temp = (1.0 - x_val * x_val).max(0.0).sqrt();
+                (x_val, temp)
+            };
+
+            let sphere_rest = uniform_direction::rvs_with_rng(p - 1, rng);
+            let mut y = vec![0.0; p];
+            y[0] = x;
+            for i in 1..p {
+                y[i] = temp * sphere_rest[i - 1];
+            }
+
+            if let Some(ref v) = reflect_v {
+                let dot: f64 = y.iter().zip(v).map(|(&yi, &vi)| yi * vi).sum();
+                for i in 0..p {
+                    y[i] -= 2.0 * dot * v[i];
+                }
+            }
+            samples.push(y);
+        }
+        samples
+    }
+}
+
+/// Draw a sample from the von Mises circular distribution using the Best & Fisher (1979) algorithm.
+fn sample_von_mises_best_fisher(kappa: f64, loc: f64, rng: &mut impl Rng) -> f64 {
+    if kappa <= 1e-12 {
+        return rng.random::<f64>() * 2.0 * PI - PI + loc;
+    }
+    let tau = 1.0 + (1.0 + 4.0 * kappa * kappa).sqrt();
+    let rho = (tau - (2.0 * tau).sqrt()) / (2.0 * kappa);
+    let r = (1.0 + rho * rho) / (2.0 * rho);
+    loop {
+        let u1 = rng.random::<f64>();
+        let z = (PI * u1).cos();
+        let f = (1.0 + r * z) / (r + z);
+        let c = kappa * (r - f);
+        let u2 = rng.random::<f64>();
+        if c * (2.0 - c) - u2 > 0.0 || (c / u2).ln() + 1.0 - c >= 0.0 {
+            let u3 = rng.random::<f64>();
+            let mut theta = f.clamp(-1.0, 1.0).acos();
+            if u3 > 0.5 {
+                theta = -theta;
+            }
+            return theta + loc;
+        }
     }
 }
 
@@ -10060,6 +10331,81 @@ impl MatrixT {
     /// Probability density function.
     pub fn pdf(&self, x: &[Vec<f64>]) -> Result<f64, StatsError> {
         Ok(self.logpdf(x)?.exp())
+    }
+
+    /// Draw `n` random matrix samples from the matrix t-distribution.
+    ///
+    /// Following SciPy, uses the representation of the matrix t-distribution as a
+    /// scale mixture of matrix normal distributions:
+    /// - If `nrow <= ncol`, samples row covariance `U_sample ~ InvWishart(df + nrow - 1, row_spread)`
+    ///   with Cholesky factor `L_U`, while `L_V` is fixed from `col_spread`.
+    /// - If `nrow > ncol`, samples column covariance `V_sample ~ InvWishart(df + ncol - 1, col_spread)`
+    ///   with Cholesky factor `L_V`, while `L_U` is fixed from `row_spread`.
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Result<Vec<Vec<Vec<f64>>>, StatsError> {
+        let (nrow, ncol) = self.dims();
+        let mut samples = Vec::with_capacity(n);
+        if nrow <= ncol {
+            let df_iw = self.df + nrow as f64 - 1.0;
+            let iw = InvWishart::new(df_iw, &self.row_spread)?;
+            let lv = &self.chol_v;
+            for _ in 0..n {
+                let iw_sample = iw.rvs(1, rng);
+                let lu = cholesky_decompose(&iw_sample[0])?;
+                let z_flat = sample_standard_normals(nrow * ncol, rng);
+                let mut w = vec![vec![0.0_f64; ncol]; nrow];
+                for r in 0..nrow {
+                    for c in 0..ncol {
+                        let mut sum = 0.0_f64;
+                        for k in 0..=c {
+                            sum += z_flat[r * ncol + k] * lv[c][k];
+                        }
+                        w[r][c] = sum;
+                    }
+                }
+                let mut x = vec![vec![0.0_f64; ncol]; nrow];
+                for r in 0..nrow {
+                    for c in 0..ncol {
+                        let mut sum = 0.0_f64;
+                        for k in 0..=r {
+                            sum += lu[r][k] * w[k][c];
+                        }
+                        x[r][c] = self.mean[r][c] + sum;
+                    }
+                }
+                samples.push(x);
+            }
+        } else {
+            let df_iw = self.df + ncol as f64 - 1.0;
+            let iw = InvWishart::new(df_iw, &self.col_spread)?;
+            let lu = &self.chol_u;
+            for _ in 0..n {
+                let iw_sample = iw.rvs(1, rng);
+                let lv = cholesky_decompose(&iw_sample[0])?;
+                let z_flat = sample_standard_normals(nrow * ncol, rng);
+                let mut w = vec![vec![0.0_f64; ncol]; nrow];
+                for r in 0..nrow {
+                    for c in 0..ncol {
+                        let mut sum = 0.0_f64;
+                        for k in 0..=c {
+                            sum += z_flat[r * ncol + k] * lv[c][k];
+                        }
+                        w[r][c] = sum;
+                    }
+                }
+                let mut x = vec![vec![0.0_f64; ncol]; nrow];
+                for r in 0..nrow {
+                    for c in 0..ncol {
+                        let mut sum = 0.0_f64;
+                        for k in 0..=r {
+                            sum += lu[r][k] * w[k][c];
+                        }
+                        x[r][c] = self.mean[r][c] + sum;
+                    }
+                }
+                samples.push(x);
+            }
+        }
+        Ok(samples)
     }
 }
 
@@ -64616,6 +64962,56 @@ mod tests {
     }
 
     #[test]
+    fn matrix_t_rvs_properties() {
+        let mut rng = StdRng::seed_from_u64(42);
+        // Case 1: nrow <= ncol (2x2)
+        let m = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
+        let u = vec![vec![2.0, 0.3], vec![0.3, 1.0]];
+        let v = vec![vec![1.0, 0.2], vec![0.2, 1.5]];
+        let d = MatrixT::new(&m, &u, &v, 20.0).unwrap();
+        let samples = d.rvs(500, &mut rng).unwrap();
+        assert_eq!(samples.len(), 500);
+        for s in &samples {
+            assert_eq!(s.len(), 2);
+            assert_eq!(s[0].len(), 2);
+            assert_eq!(s[1].len(), 2);
+        }
+        let mut mean_est = vec![vec![0.0; 2]; 2];
+        for s in &samples {
+            for r in 0..2 {
+                for c in 0..2 {
+                    mean_est[r][c] += s[r][c];
+                }
+            }
+        }
+        for r in 0..2 {
+            for c in 0..2 {
+                mean_est[r][c] /= 500.0;
+                assert!((mean_est[r][c] - m[r][c]).abs() < 0.4);
+            }
+        }
+
+        // Case 2: nrow > ncol (3x2)
+        let m_tall = vec![vec![0.0, 1.0], vec![2.0, -1.0], vec![1.0, 0.5]];
+        let u_tall = vec![
+            vec![2.0, 0.1, 0.0],
+            vec![0.1, 1.5, 0.2],
+            vec![0.0, 0.2, 1.0],
+        ];
+        let v_tall = vec![vec![1.0, 0.3], vec![0.3, 2.0]];
+        let d_tall = MatrixT::new(&m_tall, &u_tall, &v_tall, 15.0).unwrap();
+        let tall_samples = d_tall.rvs(100, &mut rng).unwrap();
+        assert_eq!(tall_samples.len(), 100);
+        for s in &tall_samples {
+            assert_eq!(s.len(), 3);
+            assert_eq!(s[0].len(), 2);
+            assert_eq!(s[1].len(), 2);
+            assert_eq!(s[2].len(), 2);
+        }
+        assert_eq!(d_tall.rvs(0, &mut rng).unwrap().len(), 0);
+    }
+
+    #[test]
     fn nchypergeom_fisher_matches_scipy() {
         let d = NoncentralHypergeomFisher::new(20, 7, 8, 2.5);
         let pmf_exp = [
@@ -64648,6 +65044,55 @@ mod tests {
     }
 
     #[test]
+    fn vonmises_fisher_rvs_properties() {
+        let mut rng = StdRng::seed_from_u64(12345);
+        // 2D case
+        let vmf2 = VonMisesFisher::new(&[1.0, 0.0], 5.0);
+        let s2 = vmf2.rvs(100, &mut rng);
+        assert_eq!(s2.len(), 100);
+        for s in &s2 {
+            assert_eq!(s.len(), 2);
+            let norm = (s[0] * s[0] + s[1] * s[1]).sqrt();
+            assert!((norm - 1.0).abs() < 1e-10);
+        }
+
+        // 3D case
+        let vmf3 = VonMisesFisher::new(&[0.0, 0.0, 1.0], 10.0);
+        let s3 = vmf3.rvs(200, &mut rng);
+        assert_eq!(s3.len(), 200);
+        let mut mean_z = 0.0;
+        for s in &s3 {
+            assert_eq!(s.len(), 3);
+            let norm = (s[0] * s[0] + s[1] * s[1] + s[2] * s[2]).sqrt();
+            assert!((norm - 1.0).abs() < 1e-10);
+            mean_z += s[2];
+        }
+        mean_z /= 200.0;
+        assert!(mean_z > 0.7); // strongly concentrated near mu = [0, 0, 1]
+
+        // 4D case
+        let mu4 = vec![0.5, 0.5, 0.5, 0.5];
+        let vmf4 = VonMisesFisher::new(&mu4, 4.0);
+        let s4 = vmf4.rvs(50, &mut rng);
+        assert_eq!(s4.len(), 50);
+        for s in &s4 {
+            assert_eq!(s.len(), 4);
+            let norm = s.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-10);
+        }
+
+        // Kappa = 0 case (uniform on sphere)
+        let vmf_zero = VonMisesFisher::new(&[0.0, 1.0, 0.0], 0.0);
+        let s_zero = vmf_zero.rvs(50, &mut rng);
+        for s in &s_zero {
+            assert_eq!(s.len(), 3);
+            let norm = s.iter().map(|&x| x * x).sum::<f64>().sqrt();
+            assert!((norm - 1.0).abs() < 1e-10);
+        }
+        assert_eq!(vmf_zero.rvs(0, &mut rng).len(), 0);
+    }
+
+    #[test]
     fn normal_inverse_gamma_matches_scipy() {
         let d = NormalInverseGamma::new(1.0, 2.0, 3.0, 4.0);
         assert_eq!(d.mu(), 1.0);
@@ -64672,6 +65117,28 @@ mod tests {
         let (v15_x, v15_s2) = d_a15.var();
         assert!((v15_x - 4.0).abs() < 1e-12);
         assert!(v15_s2.is_nan());
+    }
+
+    #[test]
+    fn normal_inverse_gamma_rvs_properties() {
+        let mut rng = StdRng::seed_from_u64(9876);
+        let d = NormalInverseGamma::new(2.0, 3.0, 5.0, 8.0);
+        let samples = d.rvs(1000, &mut rng);
+        assert_eq!(samples.len(), 1000);
+        let mut sum_x = 0.0;
+        let mut sum_s2 = 0.0;
+        for &(x, s2) in &samples {
+            assert!(s2 > 0.0);
+            sum_x += x;
+            sum_s2 += s2;
+        }
+        let mean_x = sum_x / 1000.0;
+        let mean_s2 = sum_s2 / 1000.0;
+        // Theoretical E[sigma^2] = b / (a - 1) = 8.0 / 4.0 = 2.0
+        assert!((mean_s2 - 2.0).abs() < 0.25);
+        // Theoretical E[X] = mu = 2.0
+        assert!((mean_x - 2.0).abs() < 0.2);
+        assert_eq!(d.rvs(0, &mut rng).len(), 0);
     }
 
     #[test]
@@ -64871,6 +65338,38 @@ mod tests {
         let d_cov = MatrixNormal::from_covariance(&m, &cov_u, &cov_v).unwrap();
         assert!((d_cov.logpdf(&x).unwrap() - d.logpdf(&x).unwrap()).abs() < 1e-14);
         assert!((d_cov.entropy() - d.entropy()).abs() < 1e-14);
+    }
+
+    #[test]
+    fn matrix_normal_rvs_properties() {
+        let mut rng = StdRng::seed_from_u64(54321);
+        let m = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
+        let u = vec![
+            vec![2.0, 0.1, 0.0],
+            vec![0.1, 1.0, 0.2],
+            vec![0.0, 0.2, 1.5],
+        ];
+        let v = vec![vec![1.0, 0.3], vec![0.3, 2.0]];
+        let d = MatrixNormal::new(&m, &u, &v).unwrap();
+        assert_eq!(d.rvs(0, &mut rng).len(), 0);
+        let samples = d.rvs(500, &mut rng);
+        assert_eq!(samples.len(), 500);
+        let mut mean_est = vec![vec![0.0; 2]; 3];
+        for s in &samples {
+            assert_eq!(s.len(), 3);
+            for r in 0..3 {
+                assert_eq!(s[r].len(), 2);
+                for c in 0..2 {
+                    mean_est[r][c] += s[r][c];
+                }
+            }
+        }
+        for r in 0..3 {
+            for c in 0..2 {
+                mean_est[r][c] /= 500.0;
+                assert!((mean_est[r][c] - m[r][c]).abs() < 0.3);
+            }
+        }
     }
 
     #[test]
@@ -65233,6 +65732,67 @@ mod tests {
     }
 
     #[test]
+    fn multivariate_hypergeom_rvs_properties() {
+        let mut rng = StdRng::seed_from_u64(42);
+        // Case 1: n <= M / 2 (standard urn draw path)
+        let d = MultivariateHypergeom::new(&[10, 8, 6], 5);
+        let n_samples = 1500;
+        let samples = d.rvs(n_samples, &mut rng);
+        assert_eq!(samples.len(), n_samples);
+        let mut sum_vec = vec![0.0; 3];
+        for s in &samples {
+            assert_eq!(s.len(), 3);
+            assert_eq!(s.iter().sum::<usize>(), 5);
+            assert!(s[0] <= 10);
+            assert!(s[1] <= 8);
+            assert!(s[2] <= 6);
+            for i in 0..3 {
+                sum_vec[i] += s[i] as f64;
+            }
+        }
+        let exp_mean = d.mean();
+        for i in 0..3 {
+            let sample_mean = sum_vec[i] / n_samples as f64;
+            assert!((sample_mean - exp_mean[i]).abs() < 0.15);
+        }
+
+        // Case 2: n > M / 2 (complement draw path)
+        // M = 24, n = 20 > 12
+        let d_comp = MultivariateHypergeom::new(&[10, 8, 6], 20);
+        let comp_samples = d_comp.rvs(1500, &mut rng);
+        assert_eq!(comp_samples.len(), 1500);
+        let mut comp_sum = vec![0.0; 3];
+        for s in &comp_samples {
+            assert_eq!(s.len(), 3);
+            assert_eq!(s.iter().sum::<usize>(), 20);
+            assert!(s[0] <= 10);
+            assert!(s[1] <= 8);
+            assert!(s[2] <= 6);
+            for i in 0..3 {
+                comp_sum[i] += s[i] as f64;
+            }
+        }
+        let exp_comp_mean = d_comp.mean();
+        for i in 0..3 {
+            let sample_mean = comp_sum[i] / 1500.0;
+            assert!((sample_mean - exp_comp_mean[i]).abs() < 0.15);
+        }
+
+        // Edge cases
+        let d_zero = MultivariateHypergeom::new(&[10, 8, 6], 0);
+        let z_samples = d_zero.rvs(5, &mut rng);
+        for s in &z_samples {
+            assert_eq!(s, &vec![0, 0, 0]);
+        }
+        let d_full = MultivariateHypergeom::new(&[10, 8, 6], 24);
+        let f_samples = d_full.rvs(5, &mut rng);
+        for s in &f_samples {
+            assert_eq!(s, &vec![10, 8, 6]);
+        }
+        assert_eq!(d.rvs(0, &mut rng).len(), 0);
+    }
+
+    #[test]
     fn poisson_binom_matches_scipy() {
         let d = PoissonBinom::new(&[0.1, 0.5, 0.8, 0.3]);
         let pmf_exp = [0.063, 0.349, 0.425, 0.151, 0.012];
@@ -65274,6 +65834,36 @@ mod tests {
             "entropy {}",
             mn.entropy()
         );
+    }
+
+    #[test]
+    fn multinomial_rvs_properties() {
+        let mut rng = StdRng::seed_from_u64(12345);
+        let mn = Multinomial::new(10, &[0.2, 0.3, 0.5]);
+        let n_samples = 2000;
+        let samples = mn.rvs(n_samples, &mut rng);
+        assert_eq!(samples.len(), n_samples);
+        let mut sum_vec = vec![0.0; 3];
+        for s in &samples {
+            assert_eq!(s.len(), 3);
+            assert_eq!(s.iter().sum::<usize>(), 10);
+            for i in 0..3 {
+                sum_vec[i] += s[i] as f64;
+            }
+        }
+        let exp_mean = mn.mean();
+        for i in 0..3 {
+            let sample_mean = sum_vec[i] / n_samples as f64;
+            assert!((sample_mean - exp_mean[i]).abs() < 0.15);
+        }
+
+        // Edge case: n = 0
+        let mn_zero = Multinomial::new(0, &[0.2, 0.3, 0.5]);
+        let z_samples = mn_zero.rvs(5, &mut rng);
+        for s in &z_samples {
+            assert_eq!(s, &vec![0, 0, 0]);
+        }
+        assert_eq!(mn.rvs(0, &mut rng).len(), 0);
     }
 
     #[test]
