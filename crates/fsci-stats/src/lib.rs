@@ -7707,7 +7707,40 @@ impl MultivariateNormal {
         })
     }
 
-    pub fn logpdf(&self, x: &[f64]) -> Result<f64, StatsError> {
+    /// Dimensionality of the distribution.
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.mean.len()
+    }
+
+    /// Reference to the mean vector.
+    #[inline]
+    pub fn mean(&self) -> &[f64] {
+        &self.mean
+    }
+
+    /// Reference to the covariance matrix.
+    #[inline]
+    pub fn cov(&self) -> &[Vec<f64>] {
+        &self.cov
+    }
+
+    /// Logarithm of the determinant of the covariance matrix.
+    #[inline]
+    pub fn log_det(&self) -> f64 {
+        self.log_det
+    }
+
+    /// Differential entropy of the multivariate normal distribution in nats:
+    /// `H(X) = 0.5 * (k * (1 + ln(2π)) + ln|Σ|)`.
+    #[inline]
+    pub fn entropy(&self) -> f64 {
+        let k = self.mean.len() as f64;
+        0.5 * (k * (1.0 + (2.0 * PI).ln()) + self.log_det)
+    }
+
+    /// Squared Mahalanobis distance `(x - μ)ᵀ Σ⁻¹ (x - μ)`.
+    pub fn mahalanobis_squared(&self, x: &[f64]) -> Result<f64, StatsError> {
         if x.len() != self.mean.len() {
             return Err(StatsError::InvalidArgument(format!(
                 "x length ({}) must match dimension ({})",
@@ -7721,7 +7754,16 @@ impl MultivariateNormal {
             .map(|(&xi, &mi)| xi - mi)
             .collect();
         let solved = solve_lower_triangular(&self.chol, &centered)?;
-        let mahalanobis = solved.iter().map(|value| value * value).sum::<f64>();
+        Ok(solved.iter().map(|value| value * value).sum::<f64>())
+    }
+
+    /// Mahalanobis distance `sqrt((x - μ)ᵀ Σ⁻¹ (x - μ))`.
+    pub fn mahalanobis(&self, x: &[f64]) -> Result<f64, StatsError> {
+        Ok(self.mahalanobis_squared(x)?.sqrt())
+    }
+
+    pub fn logpdf(&self, x: &[f64]) -> Result<f64, StatsError> {
+        let mahalanobis = self.mahalanobis_squared(x)?;
         let dim = self.mean.len() as f64;
         Ok(-0.5 * (dim * (2.0 * PI).ln() + self.log_det + mahalanobis))
     }
@@ -8279,8 +8321,10 @@ impl DirichletMultinomial {
 
 /// The multivariate Student-t distribution, matching
 /// `scipy.stats.multivariate_t(loc, shape, df)`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MultivariateT {
     pub loc: Vec<f64>,
+    pub shape: Vec<Vec<f64>>,
     df: f64,
     chol: Vec<Vec<f64>>,
     log_det: f64,
@@ -8300,18 +8344,115 @@ impl MultivariateT {
                 "shape dimension must match loc".to_string(),
             ));
         }
+        if !df.is_finite() || df <= 0.0 {
+            return Err(StatsError::InvalidArgument(format!(
+                "df must be positive and finite, got {df}"
+            )));
+        }
+        for (i, row_i) in shape.iter().enumerate() {
+            if row_i.len() != loc.len() {
+                return Err(StatsError::InvalidArgument(format!(
+                    "shape row {i} has length {}, expected {}",
+                    row_i.len(),
+                    loc.len()
+                )));
+            }
+            for (j, &val_ij) in row_i.iter().enumerate() {
+                if (val_ij - shape[j][i]).abs() > 1e-12 {
+                    return Err(StatsError::InvalidArgument(
+                        "shape matrix must be symmetric".to_string(),
+                    ));
+                }
+            }
+        }
         let chol = cholesky_decompose(shape)?;
         let log_det = 2.0 * (0..chol.len()).map(|i| chol[i][i].ln()).sum::<f64>();
         Ok(Self {
             loc: loc.to_vec(),
+            shape: shape.to_vec(),
             df,
             chol,
             log_det,
         })
     }
 
-    /// Log probability density function.
-    pub fn logpdf(&self, x: &[f64]) -> Result<f64, StatsError> {
+    /// Create a multivariate Student-t distribution from a location vector,
+    /// a [`Covariance`] representation of the shape matrix, and degrees of freedom `df`.
+    pub fn from_covariance(loc: &[f64], cov: &Covariance, df: f64) -> Result<Self, StatsError> {
+        if loc.is_empty() {
+            return Err(StatsError::InvalidArgument(
+                "loc must be non-empty".to_string(),
+            ));
+        }
+        if cov.dim() != loc.len() {
+            return Err(StatsError::InvalidArgument(format!(
+                "cov dimension ({}) must match loc length ({})",
+                cov.dim(),
+                loc.len()
+            )));
+        }
+        if !df.is_finite() || df <= 0.0 {
+            return Err(StatsError::InvalidArgument(format!(
+                "df must be positive and finite, got {df}"
+            )));
+        }
+
+        let chol = if let Some(chol_ref) = cov.cholesky_factor() {
+            for (i, row) in chol_ref.iter().enumerate() {
+                if i >= row.len() || row[i] <= 1e-15 || !row[i].is_finite() {
+                    return Err(StatsError::InvalidArgument(
+                        "shape matrix must be symmetric positive definite".to_string(),
+                    ));
+                }
+            }
+            chol_ref.to_vec()
+        } else {
+            cholesky_decompose(cov.covariance())?
+        };
+
+        let log_det = 2.0 * (0..chol.len()).map(|i| chol[i][i].ln()).sum::<f64>();
+        Ok(Self {
+            loc: loc.to_vec(),
+            shape: cov.covariance().to_vec(),
+            df,
+            chol,
+            log_det,
+        })
+    }
+
+    /// Dimensionality of the distribution.
+    #[inline]
+    pub fn dim(&self) -> usize {
+        self.loc.len()
+    }
+
+    /// Reference to the location vector.
+    #[inline]
+    pub fn loc(&self) -> &[f64] {
+        &self.loc
+    }
+
+    /// Reference to the shape matrix.
+    #[inline]
+    pub fn shape(&self) -> &[Vec<f64>] {
+        &self.shape
+    }
+
+    /// Degrees of freedom.
+    #[inline]
+    pub fn df(&self) -> f64 {
+        self.df
+    }
+
+    /// Logarithm of the determinant of the shape matrix.
+    #[inline]
+    pub fn log_det(&self) -> f64 {
+        self.log_det
+    }
+
+    /// Squared Mahalanobis distance with respect to the shape matrix:
+    /// `(x - μ)ᵀ Σ⁻¹ (x - μ)`.
+    pub fn mahalanobis_squared(&self, x: &[f64]) -> Result<f64, StatsError> {
         if x.len() != self.loc.len() {
             return Err(StatsError::InvalidArgument(
                 "x length must match dimension".to_string(),
@@ -8319,7 +8460,34 @@ impl MultivariateT {
         }
         let centered: Vec<f64> = x.iter().zip(&self.loc).map(|(&xi, &li)| xi - li).collect();
         let solved = solve_lower_triangular(&self.chol, &centered)?;
-        let maha: f64 = solved.iter().map(|v| v * v).sum();
+        Ok(solved.iter().map(|v| v * v).sum())
+    }
+
+    /// Mahalanobis distance with respect to the shape matrix:
+    /// `sqrt((x - μ)ᵀ Σ⁻¹ (x - μ))`.
+    pub fn mahalanobis(&self, x: &[f64]) -> Result<f64, StatsError> {
+        Ok(self.mahalanobis_squared(x)?.sqrt())
+    }
+
+    /// Covariance matrix: defined as `(df / (df - 2)) * shape` for `df > 2`.
+    /// Returns `None` if `df <= 2` as covariance is undefined / infinite.
+    pub fn cov(&self) -> Option<Vec<Vec<f64>>> {
+        if self.df > 2.0 {
+            let scale = self.df / (self.df - 2.0);
+            let cov = self
+                .shape
+                .iter()
+                .map(|row| row.iter().map(|&v| v * scale).collect())
+                .collect();
+            Some(cov)
+        } else {
+            None
+        }
+    }
+
+    /// Log probability density function.
+    pub fn logpdf(&self, x: &[f64]) -> Result<f64, StatsError> {
+        let maha = self.mahalanobis_squared(x)?;
         let p = self.loc.len() as f64;
         let df = self.df;
         let pi = std::f64::consts::PI;
@@ -66093,6 +66261,166 @@ mod tests {
 
         // Rejection of empty mean
         assert!(MultivariateNormal::from_covariance(&[], &cov_diag).is_err());
+    }
+
+    #[test]
+    fn multivariate_normal_entropy_and_mahalanobis() {
+        // 1D standard normal
+        let mvn_1d = MultivariateNormal::new(&[0.0], &[vec![1.0]]).expect("1D MVN");
+        assert_eq!(mvn_1d.dim(), 1);
+        assert_eq!(mvn_1d.mean(), &[0.0]);
+        assert_eq!(mvn_1d.cov(), &[vec![1.0]]);
+        assert_close(mvn_1d.log_det(), 0.0, 1e-14, "1D log_det is 0");
+        let expected_entropy_1d = 0.5 * (1.0 + (2.0 * std::f64::consts::PI).ln());
+        assert_close(
+            mvn_1d.entropy(),
+            expected_entropy_1d,
+            1e-14,
+            "1D MVN entropy matches 0.5*(1+ln(2pi))",
+        );
+
+        // 2D standard normal
+        let mvn_2d = MultivariateNormal::new(&[1.0, 2.0], &[vec![1.0, 0.0], vec![0.0, 1.0]])
+            .expect("2D MVN");
+        assert_eq!(mvn_2d.dim(), 2);
+        assert_eq!(mvn_2d.mean(), &[1.0, 2.0]);
+        assert_close(
+            mvn_2d.entropy(),
+            2.0 * expected_entropy_1d,
+            1e-14,
+            "2D standard MVN entropy is 2 * 1D",
+        );
+
+        // 2D correlated normal
+        let mean = vec![0.5, -1.0];
+        let cov = vec![vec![2.0, 0.5], vec![0.5, 1.5]];
+        let mvn_corr = MultivariateNormal::new(&mean, &cov).expect("corr MVN");
+        let det: f64 = 2.0 * 1.5 - 0.5 * 0.5; // 2.75
+        let expected_corr_entropy =
+            0.5 * (2.0 * (1.0 + (2.0 * std::f64::consts::PI).ln()) + det.ln());
+        assert_close(
+            mvn_corr.entropy(),
+            expected_corr_entropy,
+            1e-14,
+            "2D correlated MVN entropy matches analytic formula",
+        );
+
+        // Mahalanobis distance
+        // Point at mean has distance 0
+        assert_close(
+            mvn_corr.mahalanobis(&mean).unwrap(),
+            0.0,
+            1e-14,
+            "Mahalanobis at mean is 0",
+        );
+        assert_close(
+            mvn_corr.mahalanobis_squared(&mean).unwrap(),
+            0.0,
+            1e-14,
+            "Mahalanobis squared at mean is 0",
+        );
+
+        // Diagonal test point: cov = diag([2, 3]), mean = [0.5, -1.0], x = [2.5, 2.0]
+        // diff = [2.0, 3.0] -> diff^T * inv(cov) * diff = 2^2/2 + 3^2/3 = 2 + 3 = 5.0
+        let diag_mvn =
+            MultivariateNormal::new(&mean, &[vec![2.0, 0.0], vec![0.0, 3.0]]).expect("diag MVN");
+        let test_x = vec![2.5, 2.0];
+        assert_close(
+            diag_mvn.mahalanobis_squared(&test_x).unwrap(),
+            5.0,
+            1e-14,
+            "Mahalanobis squared matches 5.0",
+        );
+        assert_close(
+            diag_mvn.mahalanobis(&test_x).unwrap(),
+            5.0_f64.sqrt(),
+            1e-14,
+            "Mahalanobis matches sqrt(5.0)",
+        );
+
+        // Dimension mismatch returns error
+        assert!(mvn_corr.mahalanobis(&[1.0]).is_err());
+        assert!(mvn_corr.mahalanobis_squared(&[1.0, 2.0, 3.0]).is_err());
+    }
+
+    #[test]
+    fn multivariate_t_from_covariance_and_methods() {
+        let loc = vec![0.5, -1.0];
+        let diag = vec![2.0, 3.0];
+        let cov_diag = Covariance::from_diagonal(&diag).expect("cov diag");
+        let df = 5.0;
+
+        let mvt_cov = MultivariateT::from_covariance(&loc, &cov_diag, df).expect("mvt from cov");
+        let raw_shape = vec![vec![2.0, 0.0], vec![0.0, 3.0]];
+        let mvt_raw = MultivariateT::new(&loc, &raw_shape, df).expect("mvt raw");
+
+        // Parity with new()
+        assert_eq!(mvt_cov.dim(), 2);
+        assert_eq!(mvt_cov.loc(), &[0.5, -1.0]);
+        assert_eq!(mvt_cov.shape(), &raw_shape);
+        assert_eq!(mvt_cov.df(), 5.0);
+        assert_close(mvt_cov.log_det(), (6.0_f64).ln(), 1e-14, "mvt log_det");
+
+        let x = vec![1.0, -0.5];
+        assert_close(
+            mvt_cov.logpdf(&x).unwrap(),
+            mvt_raw.logpdf(&x).unwrap(),
+            1e-14,
+            "mvt from_covariance logpdf matches raw",
+        );
+        assert_close(
+            mvt_cov.pdf(&x).unwrap(),
+            mvt_raw.pdf(&x).unwrap(),
+            1e-14,
+            "mvt from_covariance pdf matches raw",
+        );
+
+        // Covariance method for df > 2 vs df <= 2
+        let cov_mat = mvt_cov.cov().expect("cov for df=5.0");
+        let scale = 5.0 / (5.0 - 2.0); // 5/3
+        assert_close(cov_mat[0][0], 2.0 * scale, 1e-14, "cov scale [0][0]");
+        assert_close(cov_mat[1][1], 3.0 * scale, 1e-14, "cov scale [1][1]");
+        assert_close(cov_mat[0][1], 0.0, 1e-14, "cov scale [0][1]");
+
+        let mvt_df2 = MultivariateT::new(&loc, &raw_shape, 2.0).expect("mvt df=2");
+        assert!(mvt_df2.cov().is_none(), "cov is None for df=2");
+
+        let mvt_df1 = MultivariateT::new(&loc, &raw_shape, 1.0).expect("mvt df=1");
+        assert!(mvt_df1.cov().is_none(), "cov is None for df=1");
+
+        // Mahalanobis distance
+        assert_close(
+            mvt_cov.mahalanobis(&loc).unwrap(),
+            0.0,
+            1e-14,
+            "MVT Mahalanobis at loc is 0",
+        );
+        let test_x = vec![2.5, 2.0];
+        assert_close(
+            mvt_cov.mahalanobis_squared(&test_x).unwrap(),
+            5.0,
+            1e-14,
+            "MVT Mahalanobis squared matches 5.0",
+        );
+        assert_close(
+            mvt_cov.mahalanobis(&test_x).unwrap(),
+            5.0_f64.sqrt(),
+            1e-14,
+            "MVT Mahalanobis matches sqrt(5.0)",
+        );
+
+        // Error cases
+        assert!(MultivariateT::new(&loc, &raw_shape, 0.0).is_err());
+        assert!(MultivariateT::new(&loc, &raw_shape, -1.0).is_err());
+        assert!(MultivariateT::new(&loc, &raw_shape, f64::NAN).is_err());
+        assert!(MultivariateT::new(&[], &raw_shape, 5.0).is_err());
+        assert!(MultivariateT::from_covariance(&loc, &cov_diag, 0.0).is_err());
+        assert!(MultivariateT::from_covariance(&loc, &cov_diag, -2.0).is_err());
+        assert!(MultivariateT::from_covariance(&[], &cov_diag, 5.0).is_err());
+
+        let mismatch_cov = Covariance::from_diagonal(&[1.0, 2.0, 3.0]).expect("cov 3d");
+        assert!(MultivariateT::from_covariance(&loc, &mismatch_cov, 5.0).is_err());
+        assert!(mvt_cov.mahalanobis(&[1.0]).is_err());
     }
 
     #[test]
