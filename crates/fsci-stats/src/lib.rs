@@ -8790,6 +8790,31 @@ impl MultivariateT {
     pub fn mean(&self) -> Vec<f64> {
         self.loc.clone()
     }
+
+    /// Draw `n` random samples from the multivariate Student-t distribution.
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+        let p = self.loc.len();
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            let scale_factor = if self.df.is_infinite() {
+                1.0
+            } else {
+                let chi2 = GammaDist::new(self.df / 2.0, 2.0).rvs(1, rng)[0];
+                (chi2 / self.df).max(1e-300).sqrt()
+            };
+            let z = sample_standard_normals(p, rng);
+            let mut sample = self.loc.clone();
+            for (i, row) in self.chol.iter().enumerate() {
+                let mut chol_z = 0.0;
+                for (j, &zj) in z.iter().take(i + 1).enumerate() {
+                    chol_z += row[j] * zj;
+                }
+                sample[i] += chol_z / scale_factor;
+            }
+            samples.push(sample);
+        }
+        samples
+    }
 }
 
 /// The matrix normal distribution, matching
@@ -9231,6 +9256,68 @@ impl Wishart {
             })
             .collect()
     }
+
+    /// Cholesky factorization of the scale matrix, lower triangular (matching `scipy.stats.wishart.C`).
+    #[inline]
+    pub fn c(&self) -> &[Vec<f64>] {
+        &self.chol_v
+    }
+
+    /// Alias for [`Wishart::c`] matching SciPy attribute `C`.
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn C(&self) -> &[Vec<f64>] {
+        &self.chol_v
+    }
+
+    /// Draw `n` random sample matrices from the Wishart distribution via Bartlett decomposition.
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<Vec<f64>>> {
+        let p = self.p;
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            // Lower-triangular Bartlett matrix A:
+            // A_ii ~ sqrt(chi^2(df - i)), A_ij ~ N(0, 1) for i > j
+            let mut a = vec![vec![0.0; p]; p];
+            for i in 0..p {
+                let chi_df = self.df - i as f64;
+                let chi = GammaDist::new(chi_df / 2.0, 2.0).rvs(1, rng)[0]
+                    .max(0.0)
+                    .sqrt();
+                a[i][i] = chi;
+                if i > 0 {
+                    let normals = sample_standard_normals(i, rng);
+                    for (j, &norm_val) in normals.iter().enumerate() {
+                        a[i][j] = norm_val;
+                    }
+                }
+            }
+            // CA = C * A (both lower triangular)
+            let mut ca = vec![vec![0.0; p]; p];
+            for i in 0..p {
+                for j in 0..=i {
+                    let mut sum = 0.0;
+                    for k in j..=i {
+                        sum += self.chol_v[i][k] * a[k][j];
+                    }
+                    ca[i][j] = sum;
+                }
+            }
+            // SA = CA * CA^T
+            let mut sa = vec![vec![0.0; p]; p];
+            for i in 0..p {
+                for j in 0..=i {
+                    let mut sum = 0.0;
+                    for k in 0..=j {
+                        sum += ca[i][k] * ca[j][k];
+                    }
+                    sa[i][j] = sum;
+                    sa[j][i] = sum;
+                }
+            }
+            samples.push(sa);
+        }
+        samples
+    }
 }
 
 /// The inverse Wishart distribution, matching `scipy.stats.invwishart(df, scale)`.
@@ -9434,6 +9521,81 @@ impl InvWishart {
             + 0.5 * pf * n
             + 0.5 * (pf + 1.0) * (self.ln_det_v - 2.0_f64.ln())
             - 0.5 * (n + pf + 1.0) * psi_sum
+    }
+
+    /// Cholesky factorization of the scale matrix, lower triangular (matching `scipy.stats.invwishart.C`).
+    #[inline]
+    pub fn c(&self) -> &[Vec<f64>] {
+        &self.chol_v
+    }
+
+    /// Alias for [`InvWishart::c`] matching SciPy attribute `C`.
+    #[allow(non_snake_case)]
+    #[inline]
+    pub fn C(&self) -> &[Vec<f64>] {
+        &self.chol_v
+    }
+
+    /// Draw `n` random sample matrices from the inverse Wishart distribution.
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<Vec<Vec<f64>>> {
+        let p = self.p;
+        let mut samples = Vec::with_capacity(n);
+        for _ in 0..n {
+            // Lower-triangular matrix A where A_ii ~ sqrt(chi^2(df - p + 1 + i))
+            // and A_ij ~ N(0, 1) for i > j.
+            let mut a = vec![vec![0.0; p]; p];
+            for i in 0..p {
+                let chi_df = self.df - p as f64 + 1.0 + i as f64;
+                let chi = GammaDist::new(chi_df / 2.0, 2.0).rvs(1, rng)[0]
+                    .max(1e-300)
+                    .sqrt();
+                a[i][i] = chi;
+                if i > 0 {
+                    let normals = sample_standard_normals(i, rng);
+                    for (j, &norm_val) in normals.iter().enumerate() {
+                        a[i][j] = norm_val;
+                    }
+                }
+            }
+            // Invert lower triangular A:
+            // inv_a[i][i] = 1 / a[i][i]; inv_a[i][j] = -sum(a[i][k] * inv_a[k][j]) / a[i][i]
+            let mut inv_a = vec![vec![0.0; p]; p];
+            for i in 0..p {
+                inv_a[i][i] = 1.0 / a[i][i];
+                for j in 0..i {
+                    let mut s = 0.0;
+                    for k in j..i {
+                        s += a[i][k] * inv_a[k][j];
+                    }
+                    inv_a[i][j] = -s / a[i][i];
+                }
+            }
+            // CA = C * A^{-1} (both lower triangular)
+            let mut ca = vec![vec![0.0; p]; p];
+            for i in 0..p {
+                for j in 0..=i {
+                    let mut sum = 0.0;
+                    for k in j..=i {
+                        sum += self.chol_v[i][k] * inv_a[k][j];
+                    }
+                    ca[i][j] = sum;
+                }
+            }
+            // SA = CA * CA^T
+            let mut sa = vec![vec![0.0; p]; p];
+            for i in 0..p {
+                for j in 0..=i {
+                    let mut sum = 0.0;
+                    for k in 0..=j {
+                        sum += ca[i][k] * ca[j][k];
+                    }
+                    sa[i][j] = sum;
+                    sa[j][i] = sum;
+                }
+            }
+            samples.push(sa);
+        }
+        samples
     }
 }
 
@@ -14208,6 +14370,202 @@ fn sample_standard_normals(n: usize, rng: &mut impl Rng) -> Vec<f64> {
         }
     }
     values
+}
+
+fn sample_haar_orthogonal(dim: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+    if dim == 0 {
+        return Vec::new();
+    }
+    if dim == 1 {
+        let sign = if rng.random::<bool>() { 1.0 } else { -1.0 };
+        return vec![vec![sign]];
+    }
+    // Generate dim x dim Gaussian matrix (columns A_0 .. A_{dim-1})
+    let mut a = vec![vec![0.0; dim]; dim];
+    for col in 0..dim {
+        let z = sample_standard_normals(dim, rng);
+        for row in 0..dim {
+            a[row][col] = z[row];
+        }
+    }
+    // Modified Gram-Schmidt with reorthogonalization
+    let mut q = vec![vec![0.0; dim]; dim];
+    for j in 0..dim {
+        let mut v = vec![0.0; dim];
+        for i in 0..dim {
+            v[i] = a[i][j];
+        }
+        for _ in 0..2 {
+            for k in 0..j {
+                let dot: f64 = (0..dim).map(|i| q[i][k] * v[i]).sum();
+                for i in 0..dim {
+                    v[i] -= dot * q[i][k];
+                }
+            }
+        }
+        let norm: f64 = (0..dim).map(|i| v[i] * v[i]).sum::<f64>().sqrt();
+        let inv_norm = if norm > 1e-15 { 1.0 / norm } else { 1.0 };
+        for i in 0..dim {
+            q[i][j] = v[i] * inv_norm;
+        }
+    }
+    q
+}
+
+fn sample_haar_unitary(dim: usize, rng: &mut impl Rng) -> Vec<Vec<(f64, f64)>> {
+    if dim == 0 {
+        return Vec::new();
+    }
+    let inv_sqrt2 = 1.0 / std::f64::consts::SQRT_2;
+    let mut a = vec![vec![(0.0, 0.0); dim]; dim];
+    for col in 0..dim {
+        let re = sample_standard_normals(dim, rng);
+        let im = sample_standard_normals(dim, rng);
+        for row in 0..dim {
+            a[row][col] = (re[row] * inv_sqrt2, im[row] * inv_sqrt2);
+        }
+    }
+    // Complex Modified Gram-Schmidt with reorthogonalization
+    let mut q = vec![vec![(0.0, 0.0); dim]; dim];
+    for j in 0..dim {
+        let mut v = vec![(0.0, 0.0); dim];
+        for i in 0..dim {
+            v[i] = a[i][j];
+        }
+        for _ in 0..2 {
+            for k in 0..j {
+                let mut dot_re = 0.0;
+                let mut dot_im = 0.0;
+                for i in 0..dim {
+                    let (q_re, q_im) = q[i][k];
+                    let (v_re, v_im) = v[i];
+                    dot_re += q_re * v_re + q_im * v_im;
+                    dot_im += q_re * v_im - q_im * v_re;
+                }
+                for i in 0..dim {
+                    let (q_re, q_im) = q[i][k];
+                    v[i].0 -= dot_re * q_re - dot_im * q_im;
+                    v[i].1 -= dot_re * q_im + dot_im * q_re;
+                }
+            }
+        }
+        let norm_sq: f64 = (0..dim).map(|i| v[i].0 * v[i].0 + v[i].1 * v[i].1).sum();
+        let inv_norm = if norm_sq > 1e-30 {
+            1.0 / norm_sq.sqrt()
+        } else {
+            1.0
+        };
+        for i in 0..dim {
+            q[i][j] = (v[i].0 * inv_norm, v[i].1 * inv_norm);
+        }
+    }
+    q
+}
+
+fn matrix_determinant(a: &[Vec<f64>]) -> f64 {
+    let n = a.len();
+    if n == 0 {
+        return 1.0;
+    }
+    if n == 1 {
+        return a[0][0];
+    }
+    if n == 2 {
+        return a[0][0] * a[1][1] - a[0][1] * a[1][0];
+    }
+    let mut m = a.to_vec();
+    let mut sign = 1.0;
+    for i in 0..n {
+        let mut pivot = i;
+        let mut max_val = m[i][i].abs();
+        for k in (i + 1)..n {
+            let val = m[k][i].abs();
+            if val > max_val {
+                max_val = val;
+                pivot = k;
+            }
+        }
+        if max_val < 1e-15 {
+            return 0.0;
+        }
+        if pivot != i {
+            m.swap(i, pivot);
+            sign = -sign;
+        }
+        let diag = m[i][i];
+        for j in (i + 1)..n {
+            let factor = m[j][i] / diag;
+            for k in (i + 1)..n {
+                let subtrahend = factor * m[i][k];
+                m[j][k] -= subtrahend;
+            }
+        }
+    }
+    let mut det = sign;
+    for i in 0..n {
+        det *= m[i][i];
+    }
+    det
+}
+
+fn givens_to_1(aii: f64, ajj: f64, aij: f64) -> (f64, f64) {
+    let aiid = aii - 1.0;
+    let ajjd = ajj - 1.0;
+    if ajjd.abs() < 1e-15 {
+        return (0.0, 1.0);
+    }
+    let dd = (aij * aij - aiid * ajjd).max(0.0).sqrt();
+    let t = (aij + dd.copysign(aij)) / ajjd;
+    let c = 1.0 / (1.0 + t * t).sqrt();
+    let s = if c == 0.0 { 1.0 } else { c * t };
+    (c, s)
+}
+
+fn rotate_to_correlation(m: &mut [Vec<f64>]) {
+    let d = m.len();
+    for i in 0..d.saturating_sub(1) {
+        if (m[i][i] - 1.0).abs() < 1e-12 {
+            continue;
+        }
+        let mut target_j = None;
+        if m[i][i] > 1.0 {
+            for j in (i + 1)..d {
+                if m[j][j] < 1.0 {
+                    target_j = Some(j);
+                    break;
+                }
+            }
+        } else {
+            for j in (i + 1)..d {
+                if m[j][j] > 1.0 {
+                    target_j = Some(j);
+                    break;
+                }
+            }
+        }
+        let Some(j) = target_j else { continue };
+        let (c, s) = givens_to_1(m[i][i], m[j][j], m[i][j]);
+        let m_ii = m[i][i];
+        let m_jj = m[j][j];
+        let m_ij = m[i][j];
+        m[i][i] = c * c * m_ii - 2.0 * c * s * m_ij + s * s * m_jj;
+        m[j][j] = s * s * m_ii + 2.0 * c * s * m_ij + c * c * m_jj;
+        let new_ij = c * s * (m_ii - m_jj) + (c * c - s * s) * m_ij;
+        m[i][j] = new_ij;
+        m[j][i] = new_ij;
+        for k in 0..d {
+            if k != i && k != j {
+                let m_ik = m[i][k];
+                let m_jk = m[j][k];
+                let new_ik = c * m_ik - s * m_jk;
+                let new_jk = s * m_ik + c * m_jk;
+                m[i][k] = new_ik;
+                m[k][i] = new_ik;
+                m[j][k] = new_jk;
+                m[k][j] = new_jk;
+            }
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -20264,14 +20622,17 @@ pub fn make_distribution<D: ContinuousDistribution>(dist: D) -> D {
 pub struct ortho_group;
 
 impl ortho_group {
-    /// Generate a random orthogonal matrix of dimension `dim x dim`.
+    /// Generate a random orthogonal matrix of dimension `dim x dim` distributed according
+    /// to Haar measure on O(N).
     #[must_use]
     pub fn rvs(dim: usize) -> Vec<Vec<f64>> {
-        let mut mat = vec![vec![0.0; dim]; dim];
-        for (i, row) in mat.iter_mut().enumerate() {
-            row[i] = 1.0;
-        }
-        mat
+        let mut rng = rand::rng();
+        Self::rvs_with_rng(dim, &mut rng)
+    }
+
+    /// Generate a random orthogonal matrix of dimension `dim x dim` using the provided RNG.
+    pub fn rvs_with_rng(dim: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+        sample_haar_orthogonal(dim, rng)
     }
 }
 
@@ -20281,14 +20642,26 @@ impl ortho_group {
 pub struct special_ortho_group;
 
 impl special_ortho_group {
-    /// Generate a random special orthogonal matrix of dimension `dim x dim`.
+    /// Generate a random special orthogonal matrix of dimension `dim x dim` with determinant +1,
+    /// distributed according to Haar measure on SO(N).
     #[must_use]
     pub fn rvs(dim: usize) -> Vec<Vec<f64>> {
-        let mut mat = vec![vec![0.0; dim]; dim];
-        for (i, row) in mat.iter_mut().enumerate() {
-            row[i] = 1.0;
+        let mut rng = rand::rng();
+        Self::rvs_with_rng(dim, &mut rng)
+    }
+
+    /// Generate a random special orthogonal matrix of dimension `dim x dim` using the provided RNG.
+    pub fn rvs_with_rng(dim: usize, rng: &mut impl Rng) -> Vec<Vec<f64>> {
+        let mut q = sample_haar_orthogonal(dim, rng);
+        if dim > 0 {
+            let det = matrix_determinant(&q);
+            if det < 0.0 {
+                for row in &mut q {
+                    row[0] = -row[0];
+                }
+            }
         }
-        mat
+        q
     }
 }
 
@@ -20298,14 +20671,17 @@ impl special_ortho_group {
 pub struct unitary_group;
 
 impl unitary_group {
-    /// Generate a random unitary matrix of dimension `dim x dim`.
+    /// Generate a random unitary matrix of dimension `dim x dim` distributed according
+    /// to Haar measure on U(N), represented as pairs of (real, imag) components.
     #[must_use]
     pub fn rvs(dim: usize) -> Vec<Vec<(f64, f64)>> {
-        let mut mat = vec![vec![(0.0, 0.0); dim]; dim];
-        for (i, row) in mat.iter_mut().enumerate() {
-            row[i] = (1.0, 0.0);
-        }
-        mat
+        let mut rng = rand::rng();
+        Self::rvs_with_rng(dim, &mut rng)
+    }
+
+    /// Generate a random unitary matrix of dimension `dim x dim` using the provided RNG.
+    pub fn rvs_with_rng(dim: usize, rng: &mut impl Rng) -> Vec<Vec<(f64, f64)>> {
+        sample_haar_unitary(dim, rng)
     }
 }
 
@@ -20315,14 +20691,27 @@ impl unitary_group {
 pub struct uniform_direction;
 
 impl uniform_direction {
-    /// Generate a random unit vector in `dim` dimensions.
+    /// Generate a random unit vector in `dim` dimensions uniformly distributed on S^(dim-1).
     #[must_use]
     pub fn rvs(dim: usize) -> Vec<f64> {
-        let mut v = vec![0.0; dim];
-        if dim > 0 {
-            v[0] = 1.0;
+        let mut rng = rand::rng();
+        Self::rvs_with_rng(dim, &mut rng)
+    }
+
+    /// Generate a random unit vector in `dim` dimensions using the provided RNG.
+    pub fn rvs_with_rng(dim: usize, rng: &mut impl Rng) -> Vec<f64> {
+        if dim == 0 {
+            return Vec::new();
         }
-        v
+        let normals = sample_standard_normals(dim, rng);
+        let norm_sq: f64 = normals.iter().map(|&x| x * x).sum();
+        if norm_sq <= 0.0 || !norm_sq.is_finite() {
+            let mut v = vec![0.0; dim];
+            v[0] = 1.0;
+            return v;
+        }
+        let inv_norm = 1.0 / norm_sq.sqrt();
+        normals.into_iter().map(|x| x * inv_norm).collect()
     }
 }
 
@@ -20335,12 +20724,37 @@ impl random_correlation {
     /// Generate a random correlation matrix with prescribed eigenvalues.
     #[must_use]
     pub fn rvs(eigs: &[f64]) -> Vec<Vec<f64>> {
+        let mut rng = rand::rng();
+        Self::rvs_with_rng(eigs, &mut rng)
+    }
+
+    /// Generate a random correlation matrix with prescribed eigenvalues using the provided RNG.
+    pub fn rvs_with_rng(eigs: &[f64], rng: &mut impl Rng) -> Vec<Vec<f64>> {
         let n = eigs.len();
-        let mut mat = vec![vec![0.0; n]; n];
-        for (i, row) in mat.iter_mut().enumerate() {
-            row[i] = 1.0;
+        if n == 0 {
+            return Vec::new();
         }
-        mat
+        if n == 1 {
+            return vec![vec![1.0]];
+        }
+        let sum: f64 = eigs.iter().sum();
+        if (sum - n as f64).abs() > 1e-6 || eigs.iter().any(|&e| e < 0.0 || !e.is_finite()) {
+            return identity_matrix(n);
+        }
+        let q = sample_haar_orthogonal(n, rng);
+        let mut m = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..=i {
+                let mut val = 0.0;
+                for (k, &eig) in eigs.iter().enumerate() {
+                    val += q[i][k] * eig * q[j][k];
+                }
+                m[i][j] = val;
+                m[j][i] = val;
+            }
+        }
+        rotate_to_correlation(&mut m);
+        m
     }
 }
 
@@ -20353,7 +20767,42 @@ impl random_table {
     /// Generate a random contingency table with given margins.
     #[must_use]
     pub fn rvs(row_margins: &[usize], col_margins: &[usize]) -> Vec<Vec<usize>> {
-        vec![vec![0; col_margins.len()]; row_margins.len()]
+        let mut rng = rand::rng();
+        Self::rvs_with_rng(row_margins, col_margins, &mut rng)
+    }
+
+    /// Generate a random contingency table with given margins using the provided RNG (Boyett 1979 algorithm).
+    pub fn rvs_with_rng(
+        row_margins: &[usize],
+        col_margins: &[usize],
+        rng: &mut impl Rng,
+    ) -> Vec<Vec<usize>> {
+        let num_rows = row_margins.len();
+        let num_cols = col_margins.len();
+        if num_rows == 0 || num_cols == 0 {
+            return vec![vec![0; num_cols]; num_rows];
+        }
+        let r_sum: usize = row_margins.iter().sum();
+        let c_sum: usize = col_margins.iter().sum();
+        if r_sum != c_sum || r_sum == 0 {
+            return vec![vec![0; num_cols]; num_rows];
+        }
+        let mut items = Vec::with_capacity(r_sum);
+        for (r_idx, &count) in row_margins.iter().enumerate() {
+            for _ in 0..count {
+                items.push(r_idx);
+            }
+        }
+        items.shuffle(rng);
+        let mut table = vec![vec![0; num_cols]; num_rows];
+        let mut pos = 0;
+        for (c_idx, &c_count) in col_margins.iter().enumerate() {
+            for &r_idx in &items[pos..pos + c_count] {
+                table[r_idx][c_idx] += 1;
+            }
+            pos += c_count;
+        }
+        table
     }
 }
 
@@ -64192,6 +64641,26 @@ mod tests {
         // Entropy matches scipy
         let d_ent = InvWishart::new(5.0, &[vec![2.0, 0.3], vec![0.3, 1.0]]).unwrap();
         assert!((d_ent.entropy() - 1.2842180026706682).abs() < 1e-10);
+
+        // c and C accessors
+        let chol = d.c();
+        assert_eq!(chol, d.C());
+        assert_eq!(chol.len(), 2);
+        assert!((chol[0][0] * chol[0][0] - scale[0][0]).abs() < 1e-12);
+        assert!((chol[1][0] * chol[0][0] - scale[1][0]).abs() < 1e-12);
+        assert_eq!(chol[0][1], 0.0);
+
+        // rvs sampling
+        let mut rng = StdRng::seed_from_u64(42);
+        let samples = d.rvs(10, &mut rng);
+        assert_eq!(samples.len(), 10);
+        for s in &samples {
+            assert_eq!(s.len(), 2);
+            assert_eq!(s[0].len(), 2);
+            assert_eq!(s[1].len(), 2);
+            assert!((s[0][1] - s[1][0]).abs() < 1e-12, "symmetric");
+            assert!(s[0][0] > 0.0 && s[1][1] > 0.0, "positive diagonals");
+        }
     }
 
     #[test]
@@ -64220,6 +64689,26 @@ mod tests {
         // Mode is None when df < p + 1
         let d_small_df = Wishart::new(2.5, &scale).unwrap();
         assert_eq!(d_small_df.mode(), None);
+
+        // c and C accessors
+        let chol = d.c();
+        assert_eq!(chol, d.C());
+        assert_eq!(chol.len(), 2);
+        assert!((chol[0][0] * chol[0][0] - scale[0][0]).abs() < 1e-12);
+        assert!((chol[1][0] * chol[0][0] - scale[1][0]).abs() < 1e-12);
+        assert_eq!(chol[0][1], 0.0);
+
+        // rvs sampling
+        let mut rng = StdRng::seed_from_u64(42);
+        let samples = d.rvs(10, &mut rng);
+        assert_eq!(samples.len(), 10);
+        for s in &samples {
+            assert_eq!(s.len(), 2);
+            assert_eq!(s[0].len(), 2);
+            assert_eq!(s[1].len(), 2);
+            assert!((s[0][1] - s[1][0]).abs() < 1e-12, "symmetric");
+            assert!(s[0][0] > 0.0 && s[1][1] > 0.0, "positive diagonals");
+        }
     }
 
     #[test]
@@ -64364,6 +64853,145 @@ mod tests {
 
         assert!(d.marginal(&[]).is_err());
         assert!(d.marginal(&[2]).is_err());
+
+        // rvs sampling
+        let mut rng = StdRng::seed_from_u64(42);
+        let samples = d.rvs(20, &mut rng);
+        assert_eq!(samples.len(), 20);
+        for s in &samples {
+            assert_eq!(s.len(), 2);
+            assert!(s[0].is_finite() && s[1].is_finite());
+        }
+    }
+
+    #[test]
+    fn test_random_matrix_and_direction_generators() {
+        let mut rng = StdRng::seed_from_u64(20260922);
+
+        // 1. uniform_direction
+        let v0 = uniform_direction::rvs_with_rng(0, &mut rng);
+        assert!(v0.is_empty());
+        let v1 = uniform_direction::rvs(1);
+        assert_eq!(v1.len(), 1);
+        assert!((v1[0].abs() - 1.0).abs() < 1e-12);
+        for _ in 0..10 {
+            let v = uniform_direction::rvs_with_rng(4, &mut rng);
+            assert_eq!(v.len(), 4);
+            let norm_sq: f64 = v.iter().map(|&x| x * x).sum();
+            assert!((norm_sq - 1.0).abs() < 1e-12, "unit vector norm");
+        }
+
+        // 2. ortho_group
+        let q_empty = ortho_group::rvs_with_rng(0, &mut rng);
+        assert!(q_empty.is_empty());
+        let q1 = ortho_group::rvs(1);
+        assert_eq!(q1.len(), 1);
+        assert!((q1[0][0].abs() - 1.0).abs() < 1e-12);
+        for _ in 0..5 {
+            let n = 3;
+            let q = ortho_group::rvs_with_rng(n, &mut rng);
+            assert_eq!(q.len(), n);
+            for row in &q {
+                assert_eq!(row.len(), n);
+            }
+            // Q Q^T = I
+            for i in 0..n {
+                for j in 0..n {
+                    let dot: f64 = (0..n).map(|k| q[i][k] * q[j][k]).sum();
+                    let expected = if i == j { 1.0 } else { 0.0 };
+                    assert!((dot - expected).abs() < 1e-10, "orthonormality: Q Q^T = I");
+                }
+            }
+            let det = matrix_determinant(&q);
+            assert!((det.abs() - 1.0).abs() < 1e-8, "|det(Q)| = 1");
+        }
+
+        // 3. special_ortho_group
+        let so_empty = special_ortho_group::rvs_with_rng(0, &mut rng);
+        assert!(so_empty.is_empty());
+        let so1 = special_ortho_group::rvs(1);
+        assert_eq!(so1.len(), 1);
+        assert!((so1[0][0] - 1.0).abs() < 1e-12);
+        for _ in 0..5 {
+            let n = 3;
+            let so = special_ortho_group::rvs_with_rng(n, &mut rng);
+            // Q Q^T = I
+            for i in 0..n {
+                for j in 0..n {
+                    let dot: f64 = (0..n).map(|k| so[i][k] * so[j][k]).sum();
+                    let expected = if i == j { 1.0 } else { 0.0 };
+                    assert!((dot - expected).abs() < 1e-10, "orthonormality");
+                }
+            }
+            let det = matrix_determinant(&so);
+            assert!((det - 1.0).abs() < 1e-8, "det(SO) must be +1.0, got {det}");
+        }
+
+        // 4. unitary_group
+        let u_empty = unitary_group::rvs_with_rng(0, &mut rng);
+        assert!(u_empty.is_empty());
+        for _ in 0..5 {
+            let n = 3;
+            let u = unitary_group::rvs_with_rng(n, &mut rng);
+            assert_eq!(u.len(), n);
+            // U U^dagger = I
+            for i in 0..n {
+                for j in 0..n {
+                    let mut re_dot = 0.0;
+                    let mut im_dot = 0.0;
+                    for k in 0..n {
+                        let (u_ik_re, u_ik_im) = u[i][k];
+                        let (u_jk_re, u_jk_im) = u[j][k];
+                        re_dot += u_ik_re * u_jk_re + u_ik_im * u_jk_im;
+                        im_dot += u_ik_im * u_jk_re - u_ik_re * u_jk_im;
+                    }
+                    let expected_re = if i == j { 1.0 } else { 0.0 };
+                    assert!((re_dot - expected_re).abs() < 1e-10, "U U^dagger real part");
+                    assert!(im_dot.abs() < 1e-10, "U U^dagger imag part");
+                }
+            }
+        }
+
+        // 5. random_correlation
+        let empty_corr = random_correlation::rvs(&[]);
+        assert!(empty_corr.is_empty());
+        let one_corr = random_correlation::rvs(&[1.0]);
+        assert_eq!(one_corr, vec![vec![1.0]]);
+        let eigs = [1.8, 0.7, 0.5];
+        for _ in 0..5 {
+            let c = random_correlation::rvs_with_rng(&eigs, &mut rng);
+            let n = eigs.len();
+            assert_eq!(c.len(), n);
+            for i in 0..n {
+                assert_eq!(c[i].len(), n);
+                assert!((c[i][i] - 1.0).abs() < 1e-7, "diagonal is 1.0: {}", c[i][i]);
+                for j in 0..n {
+                    assert!((c[i][j] - c[j][i]).abs() < 1e-10, "symmetric");
+                    assert!(
+                        c[i][j] >= -1.0 - 1e-7 && c[i][j] <= 1.0 + 1e-7,
+                        "valid correlation entry"
+                    );
+                }
+            }
+        }
+
+        // 6. random_table
+        let empty_table = random_table::rvs(&[], &[]);
+        assert!(empty_table.is_empty());
+        let rows = [10, 20, 30];
+        let cols = [15, 25, 20];
+        for _ in 0..5 {
+            let tbl = random_table::rvs_with_rng(&rows, &cols, &mut rng);
+            assert_eq!(tbl.len(), rows.len());
+            for (i, row_sum_target) in rows.iter().enumerate() {
+                let actual_sum: usize = tbl[i].iter().sum();
+                assert_eq!(actual_sum, *row_sum_target, "row {i} sum matches");
+            }
+            for j in 0..cols.len() {
+                let actual_sum: usize = (0..rows.len()).map(|i| tbl[i][j]).sum();
+                assert_eq!(actual_sum, cols[j], "col {j} sum matches");
+            }
+        }
     }
 
     #[test]
