@@ -63648,9 +63648,15 @@ mod tests {
         );
 
         // Error checking
-        assert!(Wishart::new(1.0, &scale).is_err(), "df <= p - 1 is rejected");
+        assert!(
+            Wishart::new(1.0, &scale).is_err(),
+            "df <= p - 1 is rejected"
+        );
         assert!(Wishart::new(-1.0, &scale).is_err());
-        assert!(InvWishart::new(1.0, &scale).is_err(), "df <= p - 1 is rejected");
+        assert!(
+            InvWishart::new(1.0, &scale).is_err(),
+            "df <= p - 1 is rejected"
+        );
         assert!(Wishart::new(df, &[]).is_err());
         assert!(InvWishart::new(df, &[]).is_err());
     }
