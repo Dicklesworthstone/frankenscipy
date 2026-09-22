@@ -65079,7 +65079,10 @@ mod tests {
             30,
             2000,
         );
-        assert!((null_power - 0.05).abs() < 0.03, "null size near 0.05: {null_power}");
+        assert!(
+            (null_power - 0.05).abs() < 0.03,
+            "null size near 0.05: {null_power}"
+        );
 
         // Under strong alternative: shift by 2.0 (mean 2.0)
         let alt_res = power_simulate(
@@ -65101,7 +65104,11 @@ mod tests {
             0.05,
         );
         assert_eq!(alt_res.pvalues.len(), 100);
-        assert!(alt_res.power > 0.95, "power under strong alternative: {}", alt_res.power);
+        assert!(
+            alt_res.power > 0.95,
+            "power under strong alternative: {}",
+            alt_res.power
+        );
     }
 
     #[test]

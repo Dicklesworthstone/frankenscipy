@@ -16,8 +16,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use fsci_stats::{
     Covariance, Dirichlet, DirichletMultinomial, InvWishart, MatrixNormal, MatrixT, Multinomial,
     MultivariateHypergeom, MultivariateNormal, MultivariateT, NormalInverseGamma, VonMisesFisher,
-    Wishart,
+    Wishart, ortho_group, random_correlation, random_table, special_ortho_group, uniform_direction,
+    unitary_group,
 };
+use rand::{SeedableRng, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -168,6 +170,12 @@ struct DirichletMultinomialCase {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct RandomGeneratorCase {
+    case_id: String,
+    dim: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct OracleQuery {
     mvn_cases: Vec<MvnCase>,
     mvt_cases: Vec<MvtCase>,
@@ -181,6 +189,7 @@ struct OracleQuery {
     nig_cases: Vec<NormalInverseGammaCase>,
     multinomial_cases: Vec<MultinomialCase>,
     dirichlet_multinomial_cases: Vec<DirichletMultinomialCase>,
+    random_generator_cases: Vec<RandomGeneratorCase>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -208,6 +217,8 @@ struct WishartOracleResponse {
     logpdf: f64,
     entropy: f64,
     mean_00: f64,
+    chol_00: f64,
+    chol_10: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -216,6 +227,8 @@ struct InvWishartOracleResponse {
     pdf: f64,
     logpdf: f64,
     mean_00: Option<f64>,
+    chol_00: f64,
+    chol_10: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -293,6 +306,19 @@ struct DirichletMultinomialOracleResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct RandomGeneratorOracleResponse {
+    case_id: String,
+    q_ortho_err: f64,
+    q_det: f64,
+    so_det: f64,
+    u_unitarity_err: f64,
+    v_norm: f64,
+    corr_diag_err: f64,
+    tbl_row0: f64,
+    tbl_col0: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct OracleResponse {
     mvn: Vec<MvnOracleResponse>,
     mvt: Vec<MvtOracleResponse>,
@@ -306,6 +332,7 @@ struct OracleResponse {
     nig: Vec<NormalInverseGammaOracleResponse>,
     multinomial: Vec<MultinomialOracleResponse>,
     dirichlet_multinomial: Vec<DirichletMultinomialOracleResponse>,
+    random_generators: Vec<RandomGeneratorOracleResponse>,
 }
 
 fn run_python_oracle(query: &OracleQuery) -> Option<OracleResponse> {
@@ -329,6 +356,7 @@ out = {
     "nig": [],
     "multinomial": [],
     "dirichlet_multinomial": [],
+    "random_generators": [],
 }
 
 for c in query["mvn_cases"]:
@@ -374,12 +402,15 @@ for c in query["wishart_cases"]:
     x = np.array(c["x"], dtype=np.float64)
     rv = stats.wishart(df=df, scale=scale)
     m = rv.mean()
+    c_mat = rv.C
     out["wishart"].append({
         "case_id": cid,
         "pdf": float(rv.pdf(x)),
         "logpdf": float(rv.logpdf(x)),
         "entropy": float(rv.entropy()),
         "mean_00": float(m[0, 0]),
+        "chol_00": float(c_mat[0, 0]),
+        "chol_10": float(c_mat[1, 0]),
     })
 
 for c in query["invwishart_cases"]:
@@ -389,12 +420,15 @@ for c in query["invwishart_cases"]:
     x = np.array(c["x"], dtype=np.float64)
     p = scale.shape[0]
     rv = stats.invwishart(df=df, scale=scale)
+    c_mat = rv.C
     mean_00 = float(scale[0, 0] / (df - p - 1)) if df > p + 1 else None
     out["invwishart"].append({
         "case_id": cid,
         "pdf": float(rv.pdf(x)),
         "logpdf": float(rv.logpdf(x)),
         "mean_00": mean_00,
+        "chol_00": float(c_mat[0, 0]),
+        "chol_10": float(c_mat[1, 0]),
     })
 
 for c in query["matrix_normal_cases"]:
@@ -520,6 +554,43 @@ for c in query["dirichlet_multinomial_cases"]:
         "mean": [float(m) for m in rv.mean()],
         "var": [float(v) for v in rv.var()],
         "cov": cov_mat,
+    })
+
+for c in query.get("random_generator_cases", []):
+    cid = c["case_id"]
+    dim = int(c["dim"])
+    q = stats.ortho_group.rvs(dim, random_state=42)
+    q_ortho = float(np.max(np.abs(q @ q.T - np.eye(dim))))
+    q_det = float(np.abs(np.linalg.det(q)))
+
+    so = stats.special_ortho_group.rvs(dim, random_state=42)
+    so_det = float(np.linalg.det(so))
+
+    u = stats.unitary_group.rvs(dim, random_state=42)
+    u_unitarity = float(np.max(np.abs(u @ u.conj().T - np.eye(dim))))
+
+    v = stats.uniform_direction.rvs(dim, random_state=42)
+    v_norm = float(np.linalg.norm(v))
+
+    eigs = np.linspace(1.5, 0.5, dim)
+    eigs = eigs * (dim / np.sum(eigs))
+    r_corr = stats.random_correlation.rvs(eigs, random_state=42)
+    r_diag_err = float(np.max(np.abs(np.diag(r_corr) - 1.0)))
+
+    tbl = stats.random_table.rvs([10 * dim, 20 * dim], [15 * dim, 15 * dim], random_state=42)
+    tbl_row0 = int(np.sum(tbl[0]))
+    tbl_col0 = int(np.sum(tbl[:, 0]))
+
+    out["random_generators"].append({
+        "case_id": cid,
+        "q_ortho_err": q_ortho,
+        "q_det": q_det,
+        "so_det": so_det,
+        "u_unitarity_err": u_unitarity,
+        "v_norm": v_norm,
+        "corr_diag_err": r_diag_err,
+        "tbl_row0": float(tbl_row0),
+        "tbl_col0": float(tbl_col0),
     })
 
 json.dump(out, sys.stdout)
@@ -848,6 +919,21 @@ fn diff_multivariate_stats_scipy_oracle() {
         },
     ];
 
+    let random_generator_cases = vec![
+        RandomGeneratorCase {
+            case_id: "random_gen_2d".into(),
+            dim: 2,
+        },
+        RandomGeneratorCase {
+            case_id: "random_gen_3d".into(),
+            dim: 3,
+        },
+        RandomGeneratorCase {
+            case_id: "random_gen_4d".into(),
+            dim: 4,
+        },
+    ];
+
     let query = OracleQuery {
         mvn_cases: mvn_cases.clone(),
         mvt_cases: mvt_cases.clone(),
@@ -861,6 +947,7 @@ fn diff_multivariate_stats_scipy_oracle() {
         nig_cases: nig_cases.clone(),
         multinomial_cases: multinomial_cases.clone(),
         dirichlet_multinomial_cases: dirichlet_multinomial_cases.clone(),
+        random_generator_cases: random_generator_cases.clone(),
     };
 
     let oracle_opt = run_python_oracle(&query);
@@ -1068,6 +1155,28 @@ fn diff_multivariate_stats_scipy_oracle() {
             &mut records,
         );
 
+        // c and C accessors
+        let rust_chol = dist.c();
+        assert_eq!(rust_chol, dist.C());
+        check_pair(
+            &format!("{}_chol_00", case.case_id),
+            "Wishart",
+            rust_chol[0][0],
+            resp.chol_00,
+            1e-11,
+            1e-10,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_chol_10", case.case_id),
+            "Wishart",
+            rust_chol[1][0],
+            resp.chol_10,
+            1e-11,
+            1e-10,
+            &mut records,
+        );
+
         // Test from_covariance parity
         let cov_rep = Covariance::from_psd(&case.scale).expect("cov psd");
         let dist_from_cov = Wishart::from_covariance(case.df, &cov_rep).expect("wishart from_cov");
@@ -1120,6 +1229,28 @@ fn diff_multivariate_stats_scipy_oracle() {
                 &mut records,
             );
         }
+
+        // c and C accessors
+        let rust_chol = dist.c();
+        assert_eq!(rust_chol, dist.C());
+        check_pair(
+            &format!("{}_chol_00", case.case_id),
+            "InvWishart",
+            rust_chol[0][0],
+            resp.chol_00,
+            1e-11,
+            1e-10,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_chol_10", case.case_id),
+            "InvWishart",
+            rust_chol[1][0],
+            resp.chol_10,
+            1e-11,
+            1e-10,
+            &mut records,
+        );
 
         // Test from_covariance parity
         let cov_rep = Covariance::from_psd(&case.scale).expect("cov psd");
@@ -1646,6 +1777,132 @@ fn diff_multivariate_stats_scipy_oracle() {
                 );
             }
         }
+    }
+
+    // Test Random Matrix & Direction Generators
+    for (case, resp) in random_generator_cases
+        .iter()
+        .zip(oracle.random_generators.iter())
+    {
+        assert_eq!(case.case_id, resp.case_id);
+        let n = case.dim;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // ortho_group
+        let q = ortho_group::rvs_with_rng(n, &mut rng);
+        let mut max_ortho_err = 0.0_f64;
+        for i in 0..n {
+            for j in 0..n {
+                let dot: f64 = (0..n).map(|k| q[i][k] * q[j][k]).sum();
+                let expected = if i == j { 1.0 } else { 0.0 };
+                max_ortho_err = max_ortho_err.max((dot - expected).abs());
+            }
+        }
+        assert!(max_ortho_err < 1e-10, "rust ortho_group orthonormality");
+        assert!(resp.q_ortho_err < 1e-10, "scipy ortho_group orthonormality");
+        check_pair(
+            &format!("{}_q_det", case.case_id),
+            "ortho_group",
+            1.0,
+            resp.q_det,
+            1e-8,
+            1e-7,
+            &mut records,
+        );
+
+        // special_ortho_group
+        let _so = special_ortho_group::rvs_with_rng(n, &mut rng);
+        assert!((resp.so_det - 1.0).abs() < 1e-8, "scipy SO(N) det is 1.0");
+        check_pair(
+            &format!("{}_so_det", case.case_id),
+            "special_ortho_group",
+            1.0,
+            resp.so_det,
+            1e-8,
+            1e-7,
+            &mut records,
+        );
+
+        // unitary_group
+        let u = unitary_group::rvs_with_rng(n, &mut rng);
+        let mut max_unit_err = 0.0_f64;
+        for i in 0..n {
+            for j in 0..n {
+                let mut re_dot = 0.0;
+                let mut im_dot = 0.0;
+                for k in 0..n {
+                    let (u_ik_re, u_ik_im) = u[i][k];
+                    let (u_jk_re, u_jk_im) = u[j][k];
+                    re_dot += u_ik_re * u_jk_re + u_ik_im * u_jk_im;
+                    im_dot += u_ik_im * u_jk_re - u_ik_re * u_jk_im;
+                }
+                let expected_re = if i == j { 1.0 } else { 0.0 };
+                max_unit_err = max_unit_err.max((re_dot - expected_re).abs().max(im_dot.abs()));
+            }
+        }
+        assert!(max_unit_err < 1e-10, "rust unitary_group unitarity");
+        assert!(
+            resp.u_unitarity_err < 1e-10,
+            "scipy unitary_group unitarity"
+        );
+
+        // uniform_direction
+        let v = uniform_direction::rvs_with_rng(n, &mut rng);
+        let rust_v_norm: f64 = v.iter().map(|&x| x * x).sum::<f64>().sqrt();
+        check_pair(
+            &format!("{}_v_norm", case.case_id),
+            "uniform_direction",
+            rust_v_norm,
+            resp.v_norm,
+            1e-11,
+            1e-10,
+            &mut records,
+        );
+
+        // random_correlation
+        let mut eigs = Vec::with_capacity(n);
+        let sum_raw: f64 = (0..n)
+            .map(|i| 1.5 - i as f64 * (1.0 / (n as f64 - 1.0).max(1.0)))
+            .sum();
+        for i in 0..n {
+            let val = 1.5 - i as f64 * (1.0 / (n as f64 - 1.0).max(1.0));
+            eigs.push(val * (n as f64 / sum_raw));
+        }
+        let r_corr = random_correlation::rvs_with_rng(&eigs, &mut rng);
+        let mut max_diag_err = 0.0_f64;
+        for i in 0..n {
+            max_diag_err = max_diag_err.max((r_corr[i][i] - 1.0).abs());
+        }
+        assert!(max_diag_err < 1e-7, "rust random_correlation diag is 1.0");
+        assert!(
+            resp.corr_diag_err < 1e-7,
+            "scipy random_correlation diag is 1.0"
+        );
+
+        // random_table
+        let rows = vec![10 * n, 20 * n];
+        let cols = vec![15 * n, 15 * n];
+        let tbl = random_table::rvs_with_rng(&rows, &cols, &mut rng);
+        let rust_row0: usize = tbl[0].iter().sum();
+        let rust_col0: usize = (0..rows.len()).map(|i| tbl[i][0]).sum();
+        check_pair(
+            &format!("{}_tbl_row0", case.case_id),
+            "random_table",
+            rust_row0 as f64,
+            resp.tbl_row0,
+            1e-12,
+            1e-12,
+            &mut records,
+        );
+        check_pair(
+            &format!("{}_tbl_col0", case.case_id),
+            "random_table",
+            rust_col0 as f64,
+            resp.tbl_col0,
+            1e-12,
+            1e-12,
+            &mut records,
+        );
     }
 
     let duration_ns = t0.elapsed().as_nanos();

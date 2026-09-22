@@ -66,4 +66,5 @@ toml = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+rand = { workspace = true }
 tempfile = "3.27.0"
