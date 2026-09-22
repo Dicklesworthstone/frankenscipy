@@ -20606,9 +20606,76 @@ pub type rv_continuous = dyn ContinuousDistribution;
 #[allow(non_camel_case_types)]
 pub type rv_histogram = HistogramDistribution;
 
+/// Result of statistical power simulation matching `scipy.stats.power`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PowerResult {
+    /// The estimated power against the alternative (fraction of p-values <= significance).
+    pub power: f64,
+    /// The p-values observed under the alternative hypothesis across all simulation runs.
+    pub pvalues: Vec<f64>,
+}
+
 /// Simulate statistical power of a hypothesis test, matching `scipy.stats.power`.
-pub fn power<F: FnMut(&[f64]) -> f64>(_test: F, _n_obs: usize, _n_sim: usize) -> f64 {
-    1.0
+///
+/// Draws `n_sim` samples of size `n_obs` from standard normal distribution, evaluates `test(&sample)`
+/// to compute the p-value, and returns the empirical power (fraction of p-values <= 0.05).
+pub fn power<F: FnMut(&[f64]) -> f64>(test: F, n_obs: usize, n_sim: usize) -> f64 {
+    power_with_significance(test, n_obs, n_sim, 0.05)
+}
+
+/// Simulate statistical power of a hypothesis test with custom significance level alpha.
+pub fn power_with_significance<F: FnMut(&[f64]) -> f64>(
+    mut test: F,
+    n_obs: usize,
+    n_sim: usize,
+    significance: f64,
+) -> f64 {
+    if n_obs == 0 || n_sim == 0 {
+        return 0.0;
+    }
+    let mut rng = rand::rng();
+    let mut rejections = 0;
+    for _ in 0..n_sim {
+        let sample = sample_standard_normals(n_obs, &mut rng);
+        let p = test(&sample);
+        if p.is_finite() && p <= significance {
+            rejections += 1;
+        }
+    }
+    rejections as f64 / n_sim as f64
+}
+
+/// Simulate statistical power of a hypothesis test using a custom random generator and significance level,
+/// returning both the estimated power and the observed p-values.
+pub fn power_simulate<F, R>(
+    mut test: F,
+    mut rvs: R,
+    n_obs: usize,
+    n_sim: usize,
+    significance: f64,
+) -> PowerResult
+where
+    F: FnMut(&[f64]) -> f64,
+    R: FnMut(usize) -> Vec<f64>,
+{
+    if n_obs == 0 || n_sim == 0 {
+        return PowerResult {
+            power: 0.0,
+            pvalues: Vec::new(),
+        };
+    }
+    let mut pvalues = Vec::with_capacity(n_sim);
+    let mut rejections = 0;
+    for _ in 0..n_sim {
+        let sample = rvs(n_obs);
+        let p = test(&sample);
+        if p.is_finite() && p <= significance {
+            rejections += 1;
+        }
+        pvalues.push(p);
+    }
+    let power = rejections as f64 / n_sim as f64;
+    PowerResult { power, pvalues }
 }
 
 /// Generate a distribution instance from a compatible specification, matching `scipy.stats.make_distribution`.
@@ -64992,6 +65059,49 @@ mod tests {
                 assert_eq!(actual_sum, cols[j], "col {j} sum matches");
             }
         }
+    }
+
+    #[test]
+    fn test_power_simulation() {
+        // Edge cases
+        assert_eq!(power(|_| 0.01, 0, 100), 0.0);
+        assert_eq!(power(|_| 0.01, 50, 0), 0.0);
+
+        // Under null: standard normal data tested against mean 0 (z-test)
+        // With significance 0.05, empirical rejection rate (Type I error) should be close to 0.05
+        let null_power = power(
+            |sample| {
+                let n = sample.len() as f64;
+                let mean = sample.iter().sum::<f64>() / n;
+                let z = mean * n.sqrt(); // std dev is 1
+                2.0 * (1.0 - Normal::standard().cdf(z.abs()))
+            },
+            30,
+            2000,
+        );
+        assert!((null_power - 0.05).abs() < 0.03, "null size near 0.05: {null_power}");
+
+        // Under strong alternative: shift by 2.0 (mean 2.0)
+        let alt_res = power_simulate(
+            |sample| {
+                let n = sample.len() as f64;
+                let mean = sample.iter().sum::<f64>() / n;
+                let z = mean * n.sqrt();
+                2.0 * (1.0 - Normal::standard().cdf(z.abs()))
+            },
+            |n| {
+                let mut rng = StdRng::seed_from_u64(12345);
+                sample_standard_normals(n, &mut rng)
+                    .into_iter()
+                    .map(|x| x + 2.0)
+                    .collect()
+            },
+            25,
+            100,
+            0.05,
+        );
+        assert_eq!(alt_res.pvalues.len(), 100);
+        assert!(alt_res.power > 0.95, "power under strong alternative: {}", alt_res.power);
     }
 
     #[test]
