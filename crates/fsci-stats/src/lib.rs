@@ -13131,6 +13131,31 @@ impl YuleSimon {
         // ln B(k, α + 1) = ln Γ(k) + ln Γ(α + 1) − ln Γ(k + α + 1)
         ln_gamma(kf) + ln_gamma(self.alpha + 1.0) - ln_gamma(kf + self.alpha + 1.0)
     }
+
+    /// Draw `count` random variates from the Yule-Simon distribution.
+    ///
+    /// Support: $k \in \{1, 2, 3, \dots\}$.
+    /// Generated via compound Beta-Geometric mixture:
+    /// $P \sim \mathrm{Beta}(\alpha, 1)$, then $K \sim \mathrm{Geometric}(P)$ on $\{1, 2, \dots\}$.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let inv_alpha = 1.0 / self.alpha;
+        (0..count)
+            .map(|_| {
+                let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+                let p = u1.powf(inv_alpha);
+                if p >= 1.0 {
+                    1
+                } else {
+                    let u2: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+                    let ln_1mp = (-p).ln_1p();
+                    (u2.ln() / ln_1mp).floor() as u64 + 1
+                }
+            })
+            .collect()
+    }
 }
 
 impl DiscreteDistribution for YuleSimon {
@@ -13407,6 +13432,10 @@ impl DiscreteDistribution for Geometric {
 
     fn mode(&self) -> f64 {
         1.0
+    }
+
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(n, rng)
     }
 }
 
