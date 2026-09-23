@@ -11420,6 +11420,51 @@ fn discrete_support_lower<D: DiscreteDistribution + ?Sized>(dist: &D) -> u64 {
     a
 }
 
+/// Draw a standard normal variate N(0, 1) using the Box-Muller transform.
+fn sample_standard_normal(rng: &mut impl Rng) -> f64 {
+    let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+    let u2: f64 = rng.random::<f64>();
+    (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+}
+
+/// Draw a standard Gamma(a, scale = 1.0) variate using Marsaglia and Tsang (2000).
+fn sample_standard_gamma(a: f64, rng: &mut impl Rng) -> f64 {
+    if a < 1.0 {
+        let g = sample_standard_gamma(a + 1.0, rng);
+        let u: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+        return g * u.powf(1.0 / a);
+    }
+    let d = a - 1.0 / 3.0;
+    let c = 1.0 / (9.0 * d).sqrt();
+    loop {
+        let z = sample_standard_normal(rng);
+        let v = 1.0 + c * z;
+        if v <= 0.0 {
+            continue;
+        }
+        let v3 = v * v * v;
+        let u: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+        if u < 1.0 - 0.0331 * z * z * z * z {
+            return d * v3;
+        }
+        if u.ln() < 0.5 * z * z + d * (1.0 - v3 + v3.ln()) {
+            return d * v3;
+        }
+    }
+}
+
+/// Draw a Beta(a, b) variate via the Gamma ratio X / (X + Y).
+fn sample_beta(a: f64, b: f64, rng: &mut impl Rng) -> f64 {
+    let ga = sample_standard_gamma(a, rng);
+    let gb = sample_standard_gamma(b, rng);
+    let sum = ga + gb;
+    if sum > 0.0 {
+        ga / sum
+    } else {
+        0.5
+    }
+}
+
 impl DiscreteDistribution for Poisson {
     fn pmf(&self, k: u64) -> f64 {
         Poisson::pmf(self, k)
@@ -11577,6 +11622,23 @@ impl Skellam {
         let bessel_val = fsci_special::bessel::ive_scalar(k.unsigned_abs() as f64, bessel_arg)
             * bessel_arg.exp();
         exp_term * ratio * bessel_val
+    }
+
+    /// Draw `count` random variates from the Skellam distribution.
+    ///
+    /// Skellam variates are signed integers $K \in \mathbb{Z}$, representing
+    /// the difference $X_1 - X_2$ where $X_1 \sim \mathrm{Poisson}(\mu_1)$ and
+    /// $X_2 \sim \mathrm{Poisson}(\mu_2)$.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let p1 = Poisson::new(self.mu1).rvs(count, rng);
+        let p2 = Poisson::new(self.mu2).rvs(count, rng);
+        p1.into_iter()
+            .zip(p2)
+            .map(|(k1, k2)| k1 as i64 - k2 as i64)
+            .collect()
     }
 }
 
@@ -12456,6 +12518,28 @@ impl BetaNegativeBinomial {
 
         ks.iter().map(|&k| table[k as usize]).collect()
     }
+
+    /// Draw `count` random variates from the BetaNegativeBinomial distribution.
+    ///
+    /// Compound distribution: $P \sim \mathrm{Beta}(a, b)$, then $X \sim \mathrm{NegBinomial}(n, P)$.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        if count == 0 {
+            return Vec::new();
+        }
+        (0..count)
+            .map(|_| {
+                let p = sample_beta(self.a, self.b, rng);
+                if p >= 1.0 {
+                    0
+                } else if p <= 0.0 {
+                    u64::MAX
+                } else {
+                    let y = ((1.0 - p) / p) * sample_standard_gamma(self.n as f64, rng);
+                    Poisson::new(y).rvs(1, rng)[0]
+                }
+            })
+            .collect()
+    }
 }
 
 impl DiscreteDistribution for BetaNegativeBinomial {
@@ -12581,6 +12665,10 @@ impl DiscreteDistribution for BetaNegativeBinomial {
             }
         }
         h
+    }
+
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng)
     }
 }
 
@@ -12750,6 +12838,24 @@ impl Boltzmann {
         // Normalization: Z = 1 − e^(−λn).
         -(-self.lambda * self.n as f64).exp_m1()
     }
+
+    /// Draw `count` random variates from the Boltzmann distribution.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let z = self.z();
+        let n_bound = (self.n - 1) as u64;
+        (0..count)
+            .map(|_| {
+                let u: f64 = rng.random();
+                let w = (u * z).min(1.0 - f64::EPSILON);
+                let neg_ln = -(-w).ln_1p();
+                let k = (neg_ln / self.lambda).floor() as u64;
+                k.min(n_bound)
+            })
+            .collect()
+    }
 }
 
 impl DiscreteDistribution for Boltzmann {
@@ -12879,6 +12985,10 @@ impl DiscreteDistribution for Boltzmann {
         // so the mode is the leftmost support point (frankenscipy-ckykz).
         0.0
     }
+
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng)
+    }
 }
 
 /// Discrete Laplace distribution.
@@ -12903,6 +13013,25 @@ impl DiscreteLaplace {
 
     pub fn pmf_signed(&self, k: i64) -> f64 {
         (self.a / 2.0).tanh() * (-self.a * k.unsigned_abs() as f64).exp()
+    }
+
+    /// Draw `count` random variates from the DiscreteLaplace distribution.
+    ///
+    /// Support: all integers $\mathbb{Z}$.
+    /// Generated as the difference of two independent Planck (geometric) variables.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        if count == 0 {
+            return Vec::new();
+        }
+        (0..count)
+            .map(|_| {
+                let u1: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+                let u2: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+                let x1 = (-u1.ln() / self.a).floor() as i64;
+                let x2 = (-u2.ln() / self.a).floor() as i64;
+                x1 - x2
+            })
+            .collect()
     }
 }
 
