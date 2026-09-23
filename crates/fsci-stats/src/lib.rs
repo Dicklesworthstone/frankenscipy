@@ -596,6 +596,18 @@ where
     D::fit(data)
 }
 
+/// Generic fitting helper for discrete distributions with built-in MLE/MOM support.
+///
+/// This is the Rust-generic equivalent of SciPy's distribution-specific fit surface
+/// for the implemented discrete distributions in this crate.
+#[must_use]
+pub fn fit_discrete<D>(data: &[u64]) -> D
+where
+    D: DiscreteDistribution,
+{
+    D::fit(data)
+}
+
 /// Vectorised maximum-likelihood [`fit`] over `n` independent datasets — parallel
 /// across the batch. `scipy.stats.<dist>.fit` loops in Python, and for
 /// distributions WITHOUT a closed form (e.g. `weibull_min`, `beta`) it runs a
@@ -11229,6 +11241,19 @@ impl Poisson {
         }
         (0..n).map(|_| sample_poisson(self.mu, rng)).collect()
     }
+
+    /// Fit a Poisson distribution to sample observations via maximum likelihood ($\hat{\mu} = \bar{x}$).
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let sum: u64 = data.iter().sum();
+        let mu = sum as f64 / data.len() as f64;
+        Ok(Self::new(mu))
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -11369,7 +11394,10 @@ pub trait DiscreteDistribution {
     }
 
     /// Generate `n` random variates via inverse transform sampling using [`ppf`](Self::ppf).
-    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64>
+    where
+        Self: Sized,
+    {
         (0..n)
             .map(|_| {
                 let u: f64 = rng.random();
@@ -11381,6 +11409,27 @@ pub trait DiscreteDistribution {
                 }
             })
             .collect()
+    }
+
+    /// Non-panicking parameter fit from discrete observations.
+    fn try_fit(_data: &[u64]) -> Result<Self, FitError>
+    where
+        Self: Sized,
+    {
+        Err(FitError::NotImplemented {
+            distribution: std::any::type_name::<Self>(),
+        })
+    }
+
+    /// Fit the distribution parameters from discrete observations. Panics on error.
+    fn fit(data: &[u64]) -> Self
+    where
+        Self: Sized,
+    {
+        match Self::try_fit(data) {
+            Ok(dist) => dist,
+            Err(err) => panic!("{err}"),
+        }
     }
 }
 
@@ -11461,6 +11510,221 @@ fn sample_poisson(mu: f64, rng: &mut impl Rng) -> u64 {
         let u: f64 = rng.random();
         DiscreteDistribution::ppf(&dist, u) as u64
     }
+}
+
+/// Draw a single Binomial(n, p) variate.
+fn sample_binomial(n: u64, p: f64, rng: &mut impl Rng) -> u64 {
+    if n == 0 || p <= 0.0 {
+        return 0;
+    }
+    if p >= 1.0 {
+        return n;
+    }
+    if n <= 30 {
+        let mut s = 0u64;
+        for _ in 0..n {
+            if rng.random::<f64>() < p {
+                s += 1;
+            }
+        }
+        s
+    } else {
+        let (p_eff, invert) = if p <= 0.5 {
+            (p, false)
+        } else {
+            (1.0 - p, true)
+        };
+        let log_q = (1.0 - p_eff).ln();
+        let mut k = 0u64;
+        let mut i = 0u64;
+        loop {
+            let u: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+            let skip = (u.ln() / log_q).floor() as u64;
+            i += skip + 1;
+            if i > n {
+                break;
+            }
+            k += 1;
+        }
+        if invert { n - k } else { k }
+    }
+}
+
+/// Draw a single Hypergeometric(M, n, N) variate.
+///
+/// `total` = M, `good` = n (Type I items), `sample` = N (draw count).
+fn sample_hypergeometric(total: u64, good: u64, sample: u64, rng: &mut impl Rng) -> u64 {
+    if total == 0 || sample == 0 || good == 0 {
+        return 0;
+    }
+    if good >= total {
+        return sample;
+    }
+    if sample >= total {
+        return good;
+    }
+    // Symmetry 1: sample > total / 2
+    if sample > total / 2 {
+        return good - sample_hypergeometric(total, good, total - sample, rng);
+    }
+    // Symmetry 2: good > total / 2
+    if good > total / 2 {
+        return sample - sample_hypergeometric(total, total - good, sample, rng);
+    }
+    // Symmetry 3: good < sample
+    if good < sample {
+        return sample_hypergeometric(total, sample, good, rng);
+    }
+    // Now sample <= good <= total / 2, so sample <= total / 4.
+    let mut rem_good = good;
+    let mut rem_tot = total;
+    let mut k = 0u64;
+    for _ in 0..sample {
+        let p = rem_good as f64 / rem_tot as f64;
+        if rng.random::<f64>() < p {
+            k += 1;
+            rem_good -= 1;
+        }
+        rem_tot -= 1;
+    }
+    k
+}
+
+/// Draw a single NegHypergeometric(M, n, r) variate.
+///
+/// Draws without replacement from population of size `m` containing `n` failures
+/// and `m - n` successes, until `r` successes are observed. Returns count of failures observed.
+fn sample_nhypergeom(m: u64, n: u64, r: u64, rng: &mut impl Rng) -> u64 {
+    if r == 0 || m == 0 {
+        return 0;
+    }
+    let succ_total = m - n;
+    if succ_total < r {
+        return n;
+    }
+    let mut rem_succ = succ_total;
+    let mut rem_tot = m;
+    let mut succ = 0u64;
+    let mut fail = 0u64;
+    while succ < r {
+        if rem_tot == 0 {
+            break;
+        }
+        let p = rem_succ as f64 / rem_tot as f64;
+        if rng.random::<f64>() < p {
+            succ += 1;
+            rem_succ -= 1;
+        } else {
+            fail += 1;
+        }
+        rem_tot -= 1;
+    }
+    fail
+}
+
+/// Draw a single Zipf(a) variate for a > 1.
+#[allow(dead_code)]
+fn sample_zipf(a: f64, rng: &mut impl Rng) -> u64 {
+    if a >= 1025.0 {
+        return 1;
+    }
+    let am1 = a - 1.0;
+    let b = 2.0_f64.powf(am1);
+    let max_val = 9.2233720368547758e+18_f64;
+    let c = max_val.powf(-am1);
+    loop {
+        let u: f64 = rng.random();
+        let t = (1.0 - u) + u * c;
+        let v: f64 = rng.random();
+        let x = t.powf(-1.0 / am1);
+        let k = x.floor();
+        if k > max_val || k < 1.0 {
+            continue;
+        }
+        let w = (1.0 + 1.0 / k).powf(am1);
+        let lhs = w / b;
+        let rhs = (v * k * (w - 1.0)) / (b - 1.0);
+        if lhs >= rhs {
+            return k as u64;
+        }
+    }
+}
+
+/// Draw a single NegBinomial(n, p) variate.
+///
+/// Convention: number of failures before `n` successes, support $\{0, 1, 2, \dots\}$.
+/// Uses Gamma-Poisson mixture representation:
+/// $\lambda \sim \mathrm{Gamma}(n, (1-p)/p)$, then $K \sim \mathrm{Poisson}(\lambda)$.
+fn sample_nbinom(n: f64, p: f64, rng: &mut impl Rng) -> u64 {
+    if p >= 1.0 || n <= 0.0 {
+        return 0;
+    }
+    let scale = (1.0 - p) / p;
+    let gamma = sample_standard_gamma(n, rng) * scale;
+    sample_poisson(gamma, rng)
+}
+
+/// Draw a single LogSeries(p) variate.
+///
+/// Convention: support $\{1, 2, 3, \dots\}$.
+/// Inversion method via PMF recurrence: $P(1) = -p / \ln(1-p)$, $P(k+1) = P(k) \cdot p \cdot k/(k+1)$.
+#[allow(dead_code)]
+fn sample_logseries(p: f64, rng: &mut impl Rng) -> u64 {
+    let r = -(-p).ln_1p();
+    let u: f64 = rng.random();
+    let mut k = 1u64;
+    let mut term = p / r;
+    let mut sum = term;
+    while u > sum && k < 1_000_000 {
+        k += 1;
+        term *= p * (k - 1) as f64 / k as f64;
+        sum += term;
+    }
+    k
+}
+
+/// Draw a single Planck(lambda) variate.
+///
+/// Convention: support $\{0, 1, 2, \dots\}$, $P(X \le k) = 1 - e^{-\lambda(k+1)}$.
+fn sample_planck(lambda: f64, rng: &mut impl Rng) -> u64 {
+    let u: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+    (-u.ln() / lambda).floor() as u64
+}
+
+/// Draw a single Wallenius noncentral hypergeometric variate.
+///
+/// Urn drawing without replacement where Type I items have relative odds `odds`.
+fn sample_nchypergeom_wallenius(
+    big_m: u64,
+    n: u64,
+    big_n: u64,
+    odds: f64,
+    rng: &mut impl Rng,
+) -> u64 {
+    let mut n1 = n;
+    let mut n2 = big_m.saturating_sub(n);
+    let mut drawn1 = 0u64;
+    for _ in 0..big_n {
+        if n1 == 0 {
+            break;
+        }
+        if n2 == 0 {
+            drawn1 += 1;
+            n1 -= 1;
+            continue;
+        }
+        let w1 = n1 as f64 * odds;
+        let w2 = n2 as f64;
+        let p1 = w1 / (w1 + w2);
+        let u: f64 = rng.random();
+        if u < p1 {
+            drawn1 += 1;
+            n1 -= 1;
+        } else {
+            n2 -= 1;
+        }
+    }
+    drawn1
 }
 
 impl DiscreteDistribution for Poisson {
@@ -11561,6 +11825,14 @@ impl DiscreteDistribution for Poisson {
     fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
         self.rvs(n, rng)
     }
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -11637,6 +11909,30 @@ impl Skellam {
             .zip(p2)
             .map(|(k1, k2)| k1 as i64 - k2 as i64)
             .collect()
+    }
+
+    /// Fit a Skellam distribution to sample data via method of moments.
+    ///
+    /// Since $E[X] = \mu_1 - \mu_2$ and $\mathrm{Var}(X) = \mu_1 + \mu_2$,
+    /// the moment estimators are $\hat{\mu}_1 = (s^2 + \bar{x}) / 2$ and $\hat{\mu}_2 = (s^2 - \bar{x}) / 2$.
+    pub fn fit(data: &[i64]) -> Result<Self, StatsError> {
+        if data.len() < 2 {
+            return Err(StatsError::DataTooSmall {
+                required: 2,
+                got: data.len(),
+            });
+        }
+        let n = data.len() as f64;
+        let mean = data.iter().map(|&x| x as f64).sum::<f64>() / n;
+        let var = data.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / (n - 1.0);
+        let mu1 = (var + mean) / 2.0;
+        let mu2 = (var - mean) / 2.0;
+        if mu1 < 0.0 || mu2 < 0.0 {
+            return Err(StatsError::InvalidArgument(format!(
+                "sample variance ({var:.4}) must be >= |mean| ({mean:.4}) for Skellam"
+            )));
+        }
+        Ok(Self::new(mu1, mu2))
     }
 }
 
@@ -11743,6 +12039,20 @@ impl DiscreteDistribution for Skellam {
             }
         }
         acc
+    }
+
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng).into_iter().map(|x| x as u64).collect()
+    }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        let signed: Vec<i64> = data.iter().map(|&x| x as i64).collect();
+        Self::fit(&signed).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
     }
 }
 
@@ -11970,48 +12280,66 @@ impl Binomial {
         if count == 0 {
             return Vec::new();
         }
-        if self.n == 0 || self.p == 0.0 {
-            return vec![0; count];
+        (0..count).map(|_| sample_binomial(self.n, self.p, rng)).collect()
+    }
+
+    /// Fit a Binomial distribution to sample observations.
+    ///
+    /// If $n$ is not specified, estimates $n$ and $p$ via method of moments when
+    /// the sample is underdispersed ($s^2 < \bar{x}$), or defaults $n = \max(\text{data})$.
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
         }
-        if self.p == 1.0 {
-            return vec![self.n; count];
+        let max_val = *data.iter().max().unwrap_or(&0);
+        if max_val == 0 {
+            return Ok(Self::new(1, 0.0));
         }
-        if self.n <= 30 {
-            (0..count)
-                .map(|_| {
-                    let mut s = 0u64;
-                    for _ in 0..self.n {
-                        if rng.random::<f64>() < self.p {
-                            s += 1;
-                        }
-                    }
-                    s
-                })
-                .collect()
+        let m = data.len() as f64;
+        let sum: u64 = data.iter().sum();
+        let mean = sum as f64 / m;
+        if data.len() == 1 {
+            return Ok(Self::new(max_val, 1.0));
+        }
+        let var = data.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / (m - 1.0);
+        let (n, p) = if var > 0.0 && var < mean {
+            let n_est = (mean * mean / (mean - var)).round() as u64;
+            let n = n_est.max(max_val);
+            let p = (mean / n as f64).clamp(0.0, 1.0);
+            (n, p)
         } else {
-            let (p_eff, invert) = if self.p <= 0.5 {
-                (self.p, false)
-            } else {
-                (1.0 - self.p, true)
-            };
-            let log_q = (1.0 - p_eff).ln();
-            (0..count)
-                .map(|_| {
-                    let mut k = 0u64;
-                    let mut i = 0u64;
-                    loop {
-                        let u: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
-                        let skip = (u.ln() / log_q).floor() as u64;
-                        i += skip + 1;
-                        if i > self.n {
-                            break;
-                        }
-                        k += 1;
-                    }
-                    if invert { self.n - k } else { k }
-                })
-                .collect()
+            let n = max_val;
+            let p = (mean / n as f64).clamp(0.0, 1.0);
+            (n, p)
+        };
+        Ok(Self::new(n, p))
+    }
+
+    /// Fit a Binomial distribution with known number of trials $n$ via maximum likelihood.
+    pub fn fit_with_n(data: &[u64], n: u64) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
         }
+        for &x in data {
+            if x > n {
+                return Err(StatsError::InvalidArgument(format!(
+                    "observation {x} exceeds trial count n={n}"
+                )));
+            }
+        }
+        if n == 0 {
+            return Ok(Self::new(0, 0.0));
+        }
+        let sum: u64 = data.iter().sum();
+        let total_trials = data.len() as f64 * n as f64;
+        let p = (sum as f64 / total_trials).clamp(0.0, 1.0);
+        Ok(Self::new(n, p))
     }
 }
 
@@ -12155,6 +12483,14 @@ impl DiscreteDistribution for Binomial {
     fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
         self.rvs(count, rng)
     }
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 /// Beta-binomial distribution.
@@ -12233,6 +12569,62 @@ impl BetaBinomial {
                 Binomial::new(self.n, p).rvs(1, rng)[0]
             })
             .collect()
+    }
+
+    /// Fit a Beta-Binomial distribution with known number of trials $n$ via method of moments.
+    pub fn fit_with_n(data: &[u64], n: u64) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        for &x in data {
+            if x > n {
+                return Err(StatsError::InvalidArgument(format!(
+                    "observation {x} exceeds trial count n={n}"
+                )));
+            }
+        }
+        if n == 0 {
+            return Ok(Self::new(0, 1.0, 1.0));
+        }
+        let m = data.len() as f64;
+        let sum: u64 = data.iter().sum();
+        let mean = sum as f64 / m;
+        let p = (mean / n as f64).clamp(1e-6, 1.0 - 1e-6);
+        let var = if data.len() == 1 {
+            0.0
+        } else {
+            data.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / (m - 1.0)
+        };
+        let binom_var = n as f64 * p * (1.0 - p);
+        let s_ab = if var > binom_var && binom_var > 0.0 {
+            let num = n as f64 * binom_var - var;
+            let den = var - binom_var;
+            if den > 0.0 && num > 0.0 {
+                num / den
+            } else {
+                100.0
+            }
+        } else {
+            100.0
+        };
+        let a = (s_ab * p).clamp(1e-4, 1e6);
+        let b = (s_ab * (1.0 - p)).clamp(1e-4, 1e6);
+        Ok(Self::new(n, a, b))
+    }
+
+    /// Fit a Beta-Binomial distribution to sample observations.
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let n = (*data.iter().max().unwrap_or(&0)).max(1);
+        Self::fit_with_n(data, n)
     }
 }
 
@@ -12431,6 +12823,15 @@ impl DiscreteDistribution for BetaBinomial {
     fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
         self.rvs(count, rng)
     }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 /// Beta-negative-binomial distribution.
@@ -12537,6 +12938,62 @@ impl BetaNegativeBinomial {
                 }
             })
             .collect()
+    }
+
+    /// Fit a Beta-Negative-Binomial distribution with known number of successes $n$ via method of moments.
+    pub fn fit_with_n(data: &[u64], n: u64) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        if n == 0 {
+            return Err(StatsError::InvalidArgument("n must be at least 1".to_string()));
+        }
+        let m = data.len() as f64;
+        let sum: u64 = data.iter().sum();
+        let mean = sum as f64 / m;
+        if mean == 0.0 {
+            return Ok(Self::new(n, 10.0, 1e-4));
+        }
+        let var = if data.len() == 1 {
+            mean * 1.5
+        } else {
+            let v = data.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / (m - 1.0);
+            if v > 0.0 { v } else { mean * 1.5 }
+        };
+        let a = if var > mean {
+            let ratio = var / mean;
+            let mut lo = 2.001;
+            let mut hi = 500.0;
+            for _ in 0..50 {
+                let mid = 0.5 * (lo + hi);
+                let b_mid = mean * (mid - 1.0) / n as f64;
+                let var_ratio = (mid + b_mid + n as f64 - 1.0) * (mid + n as f64) / ((mid - 1.0) * (mid - 2.0));
+                if var_ratio > ratio {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            0.5 * (lo + hi)
+        } else {
+            5.0
+        };
+        let b = (mean * (a - 1.0) / n as f64).clamp(1e-4, 1e6);
+        Ok(Self::new(n, a, b))
+    }
+
+    /// Fit a Beta-Negative-Binomial distribution to sample observations.
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        Self::fit_with_n(data, 1)
     }
 }
 
@@ -12668,6 +13125,15 @@ impl DiscreteDistribution for BetaNegativeBinomial {
     fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
         self.rvs(count, rng)
     }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 /// Bernoulli distribution: single trial with probability p.
@@ -12691,6 +13157,27 @@ impl Bernoulli {
         (0..n)
             .map(|_| if rng.random::<f64>() < self.p { 1 } else { 0 })
             .collect()
+    }
+
+    /// Fit a Bernoulli distribution to binary observations via maximum likelihood ($\hat{p} = \bar{x}$).
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let mut sum = 0u64;
+        for &x in data {
+            if x > 1 {
+                return Err(StatsError::InvalidArgument(format!(
+                    "Bernoulli observations must be 0 or 1, got {x}"
+                )));
+            }
+            sum += x;
+        }
+        let p = (sum as f64 / data.len() as f64).clamp(0.0, 1.0);
+        Ok(Self::new(p))
     }
 }
 
@@ -12767,6 +13254,15 @@ impl DiscreteDistribution for Bernoulli {
     fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
         self.rvs(n, rng)
     }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 /// Geometric distribution: number of trials until first success.
@@ -12803,6 +13299,28 @@ impl Geometric {
                 (u.ln() / ln_q).floor() as u64 + 1
             })
             .collect()
+    }
+
+    /// Fit a Geometric distribution to positive integer observations via maximum likelihood ($\hat{p} = 1/\bar{x}$).
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let mut sum = 0u64;
+        for &x in data {
+            if x == 0 {
+                return Err(StatsError::InvalidArgument(
+                    "Geometric observations must be >= 1".to_string(),
+                ));
+            }
+            sum += x;
+        }
+        let mean = sum as f64 / data.len() as f64;
+        let p = (1.0 / mean).clamp(f64::MIN_POSITIVE, 1.0);
+        Ok(Self::new(p))
     }
 }
 
@@ -12853,6 +13371,65 @@ impl Boltzmann {
                 k.min(n_bound)
             })
             .collect()
+    }
+
+    /// Fit a Boltzmann distribution with fixed truncation parameter $n$.
+    pub fn fit_with_n(data: &[u64], n: usize) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        if n < 2 {
+            return Err(StatsError::InvalidArgument(
+                "n must be at least 2".to_string(),
+            ));
+        }
+        let nu = n as u64;
+        for &x in data {
+            if x >= nu {
+                return Err(StatsError::InvalidArgument(format!(
+                    "observation {x} is out of support [0, {n})"
+                )));
+            }
+        }
+        let mean = data.iter().sum::<u64>() as f64 / data.len() as f64;
+        let nf = n as f64;
+        let max_mean = (nf - 1.0) / 2.0;
+        if mean >= max_mean - 1e-12 {
+            return Ok(Self::new(1e-6, n as u32));
+        }
+        if mean <= 1e-12 {
+            return Ok(Self::new(50.0, n as u32));
+        }
+        // Mean as function of lambda: 1/(e^lam - 1) - n/(e^(lam*n) - 1).
+        // Decreasing from (n-1)/2 to 0.
+        let mut lo = 1e-6_f64;
+        let mut hi = 100.0_f64;
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            let expected = 1.0 / mid.exp_m1() - nf / (mid * nf).exp_m1();
+            if expected > mean {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        Ok(Self::new(0.5 * (lo + hi), n as u32))
+    }
+
+    /// Fit a Boltzmann distribution to observations.
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let max_k = data.iter().copied().max().unwrap_or(0);
+        let n = (max_k + 1).max(2) as usize;
+        Self::fit_with_n(data, n)
     }
 }
 
@@ -12987,6 +13564,15 @@ impl DiscreteDistribution for Boltzmann {
     fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
         self.rvs(count, rng)
     }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 /// Discrete Laplace distribution.
@@ -13030,6 +13616,25 @@ impl DiscreteLaplace {
                 x1 - x2
             })
             .collect()
+    }
+
+    /// Fit a Discrete Laplace distribution to signed integer observations via maximum likelihood ($a = \mathrm{asinh}(1/\overline{|x|})$).
+    pub fn fit(data: &[i64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let sum_abs: u64 = data.iter().map(|&x| x.unsigned_abs()).sum();
+        let mean_abs = sum_abs as f64 / data.len() as f64;
+        if mean_abs == 0.0 {
+            return Err(StatsError::InvalidArgument(
+                "cannot fit DiscreteLaplace to all-zero data (scale parameter a diverges to infinity)".to_string(),
+            ));
+        }
+        let a = (1.0 / mean_abs).asinh();
+        Ok(Self::new(a))
     }
 }
 
@@ -13097,6 +13702,20 @@ impl DiscreteDistribution for DiscreteLaplace {
         let mean_abs = 2.0 * norm * ea / ((1.0 - ea) * (1.0 - ea));
         -norm.ln() + self.a * mean_abs
     }
+
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng).into_iter().map(|x| x as u64).collect()
+    }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        let signed: Vec<i64> = data.iter().map(|&x| x as i64).collect();
+        Self::fit(&signed).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 /// Yule-Simon distribution.
@@ -13155,6 +13774,33 @@ impl YuleSimon {
                 }
             })
             .collect()
+    }
+
+    /// Fit a Yule-Simon distribution to sample observations via method of moments ($\alpha = \bar{x} / (\bar{x} - 1)$).
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let mut sum = 0u64;
+        for &x in data {
+            if x == 0 {
+                return Err(StatsError::InvalidArgument(
+                    "Yule-Simon observations must be >= 1".to_string(),
+                ));
+            }
+            sum += x;
+        }
+        let mean = sum as f64 / data.len() as f64;
+        if mean <= 1.0 {
+            return Err(StatsError::InvalidArgument(
+                "Yule-Simon requires sample mean > 1 for finite alpha".to_string(),
+            ));
+        }
+        let alpha = mean / (mean - 1.0);
+        Ok(Self::new(alpha))
     }
 }
 
@@ -13277,6 +13923,19 @@ impl DiscreteDistribution for YuleSimon {
         }
         h
     }
+
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng)
+    }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 /// Planck (untruncated geometric) distribution.
@@ -13304,6 +13963,30 @@ impl Planck {
             "lambda must be positive and finite"
         );
         Self { lambda }
+    }
+
+    /// Draw `count` random variates from the Planck distribution.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        (0..count).map(|_| sample_planck(self.lambda, rng)).collect()
+    }
+
+    /// Fit a Planck distribution to non-negative integer observations via maximum likelihood ($\lambda = \ln(1 + 1/\bar{x})$).
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let sum: u64 = data.iter().sum();
+        let mean = sum as f64 / data.len() as f64;
+        if mean == 0.0 {
+            return Err(StatsError::InvalidArgument(
+                "cannot fit Planck to all-zero data (lambda diverges to infinity)".to_string(),
+            ));
+        }
+        let lambda = (1.0 / mean).ln_1p();
+        Ok(Self::new(lambda))
     }
 }
 
@@ -13372,6 +14055,19 @@ impl DiscreteDistribution for Planck {
         // mode at the leftmost support point (frankenscipy-ckykz).
         0.0
     }
+
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(n, rng)
+    }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 impl DiscreteDistribution for Geometric {
@@ -13436,6 +14132,15 @@ impl DiscreteDistribution for Geometric {
 
     fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
         self.rvs(n, rng)
+    }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
     }
 }
 
@@ -13648,6 +14353,59 @@ impl NegBinomial {
             par_continuous_map_min(qs, 400_000, eval)
         }
     }
+
+    /// Draw `count` random variates from the Negative Binomial distribution.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        (0..count).map(|_| sample_nbinom(self.n, self.p, rng)).collect()
+    }
+
+    /// Fit a Negative Binomial distribution with fixed number of successes $n$.
+    pub fn fit_with_n(data: &[u64], n: f64) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        if n <= 0.0 || !n.is_finite() {
+            return Err(StatsError::InvalidArgument(
+                "n must be positive and finite".to_string(),
+            ));
+        }
+        let mean = data.iter().sum::<u64>() as f64 / data.len() as f64;
+        let p = (n / (n + mean)).clamp(f64::MIN_POSITIVE, 1.0);
+        Ok(Self::new(n, p))
+    }
+
+    /// Fit a Negative Binomial distribution to sample observations via method of moments.
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let m = data.len() as f64;
+        let mean = data.iter().sum::<u64>() as f64 / m;
+        if mean <= 0.0 {
+            return Ok(Self::new(1.0, 1.0));
+        }
+        let var = if data.len() > 1 {
+            let s2: f64 = data.iter().map(|&x| (x as f64 - mean).powi(2)).sum();
+            s2 / (m - 1.0)
+        } else {
+            mean * 1.5
+        };
+        if var > mean {
+            let p = (mean / var).clamp(1e-6, 1.0 - 1e-6);
+            let n = (mean * p / (1.0 - p)).max(1e-4);
+            Ok(Self::new(n, p))
+        } else {
+            let n = 1.0;
+            let p = (n / (n + mean)).clamp(1e-6, 1.0);
+            Ok(Self::new(n, p))
+        }
+    }
 }
 
 impl DiscreteDistribution for NegBinomial {
@@ -13743,6 +14501,19 @@ impl DiscreteDistribution for NegBinomial {
         }
         h
     }
+
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng)
+    }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 /// Hypergeometric distribution: draws without replacement.
@@ -13767,6 +14538,65 @@ impl Hypergeometric {
         assert!(n <= big_m, "n must be <= M, got n={n}, M={big_m}");
         assert!(big_n <= big_m, "N must be <= M, got N={big_n}, M={big_m}");
         Self { big_m, n, big_n }
+    }
+
+    /// Draw `count` random variates from the Hypergeometric distribution.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        (0..count)
+            .map(|_| sample_hypergeometric(self.big_m, self.n, self.big_n, rng))
+            .collect()
+    }
+
+    /// Fit a Hypergeometric distribution to sample observations given population size `big_m` and draw count `big_n`.
+    pub fn fit_with_m_and_big_n(data: &[u64], big_m: u64, big_n: u64) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        if big_n > big_m {
+            return Err(StatsError::InvalidArgument(format!(
+                "big_n ({big_n}) cannot exceed big_m ({big_m})"
+            )));
+        }
+        let mut max_k = 0u64;
+        let mut sum = 0u64;
+        for &x in data {
+            if x > big_n {
+                return Err(StatsError::InvalidArgument(format!(
+                    "observation {x} exceeds draw count {big_n}"
+                )));
+            }
+            if x > max_k {
+                max_k = x;
+            }
+            sum = sum.saturating_add(x);
+        }
+        let mean = sum as f64 / data.len() as f64;
+        let n = if big_n == 0 {
+            0
+        } else {
+            ((mean * big_m as f64) / big_n as f64).round() as u64
+        };
+        let min_n = max_k;
+        let max_n = big_m.saturating_sub(big_n.saturating_sub(max_k));
+        let n = n.clamp(min_n, max_n);
+        Ok(Self::new(big_m, n, big_n))
+    }
+
+    /// Fit a Hypergeometric distribution to sample observations.
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let max_k = *data.iter().max().unwrap_or(&0);
+        let big_n = max_k.max(1);
+        let big_m = big_n.saturating_mul(2);
+        Self::fit_with_m_and_big_n(data, big_m, big_n)
     }
 
     /// Log-pmf at many outcomes, hoisting the FIVE parameter-only lgamma terms
@@ -14064,6 +14894,19 @@ impl DiscreteDistribution for Hypergeometric {
             .map(|&p| if p > 0.0 { -p * p.ln() } else { 0.0 })
             .sum()
     }
+
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng)
+    }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -14111,6 +14954,13 @@ impl NchypergeomWallenius {
         let hi = self.n.min(self.big_n);
         (lo, hi)
     }
+
+    /// Draw `count` random variates from Wallenius' noncentral hypergeometric distribution.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        (0..count)
+            .map(|_| sample_nchypergeom_wallenius(self.big_m, self.n, self.big_n, self.odds, rng))
+            .collect()
+    }
 }
 
 impl DiscreteDistribution for NchypergeomWallenius {
@@ -14155,6 +15005,10 @@ impl DiscreteDistribution for NchypergeomWallenius {
         let e2: f64 = (lo..=hi).map(|x| (x as f64).powi(2) * self.pmf(x)).sum();
         e2 - mean * mean
     }
+
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng)
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -14184,6 +15038,64 @@ impl NegHypergeometric {
             big_m - n
         );
         Self { big_m, n, r }
+    }
+
+    /// Draw `count` random variates from the Negative Hypergeometric distribution.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        (0..count)
+            .map(|_| sample_nhypergeom(self.big_m, self.n, self.r, rng))
+            .collect()
+    }
+
+    /// Fit a Negative Hypergeometric distribution to sample observations given population size `big_m` and success count `r`.
+    pub fn fit_with_m_and_r(data: &[u64], big_m: u64, r: u64) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        if r > big_m {
+            return Err(StatsError::InvalidArgument(format!(
+                "r ({r}) cannot exceed big_m ({big_m})"
+            )));
+        }
+        let max_possible_k = big_m - r;
+        let mut max_k = 0u64;
+        let mut sum = 0u64;
+        for &x in data {
+            if x > max_possible_k {
+                return Err(StatsError::InvalidArgument(format!(
+                    "observation {x} exceeds maximum possible value {max_possible_k} (big_m - r)"
+                )));
+            }
+            if x > max_k {
+                max_k = x;
+            }
+            sum = sum.saturating_add(x);
+        }
+        let mean = sum as f64 / data.len() as f64;
+        let n = if r == 0 && mean == 0.0 {
+            0
+        } else {
+            ((mean * (big_m as f64 + 1.0)) / (r as f64 + mean)).round() as u64
+        };
+        let n = n.clamp(max_k, big_m.saturating_sub(r));
+        Ok(Self::new(big_m, n, r))
+    }
+
+    /// Fit a Negative Hypergeometric distribution to sample observations.
+    pub fn fit(data: &[u64]) -> Result<Self, StatsError> {
+        if data.is_empty() {
+            return Err(StatsError::DataTooSmall {
+                required: 1,
+                got: 0,
+            });
+        }
+        let max_k = *data.iter().max().unwrap_or(&0);
+        let r = 1u64;
+        let big_m = (max_k + r).saturating_mul(2).max(2);
+        Self::fit_with_m_and_r(data, big_m, r)
     }
 
     fn ln_comb(n: u64, k: u64) -> f64 {
@@ -14425,6 +15337,19 @@ impl DiscreteDistribution for NegHypergeometric {
             }
         }
         h
+    }
+
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng)
+    }
+
+    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
+            StatsError::DataTooSmall { required, got } => {
+                FitError::InsufficientData { required, actual: got }
+            }
+            _ => FitError::UnsupportedData(e.to_string()),
+        })
     }
 }
 
@@ -69518,6 +70443,33 @@ mod tests {
     }
 
     #[test]
+    fn nchypergeom_wallenius_rvs() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let d = NchypergeomWallenius::new(20, 7, 12, 2.5);
+        let samples = d.rvs(10_000, &mut rng);
+        assert_eq!(samples.len(), 10_000);
+
+        // Support: max(0, N - (M - n)) ..= min(n, N)
+        // max(0, 12 - (20 - 7)) = 0 ..= min(7, 12) = 7
+        for &s in &samples {
+            assert!(s <= 7);
+        }
+
+        // Empirical mean vs theoretical mean (approx 5.6788)
+        let sum: u64 = samples.iter().sum();
+        let mean = sum as f64 / samples.len() as f64;
+        let expected_mean = d.mean();
+        assert!(
+            (mean - expected_mean).abs() < 0.1,
+            "empirical mean {mean} vs expected {expected_mean}"
+        );
+
+        // Trait method rvs
+        let trait_samples = <NchypergeomWallenius as DiscreteDistribution>::rvs(&d, 100, &mut rng);
+        assert_eq!(trait_samples.len(), 100);
+    }
+
+    #[test]
     fn poisson_pmf_known() {
         let p = Poisson::new(3.0);
         // P(0) = exp(-3) ≈ 0.04979
@@ -78463,6 +79415,54 @@ mod tests {
         assert_close(h.pmf(4), 0.0, 1e-15, "k > n");
         // k > N=5 is impossible
         assert_close(h.pmf(6), 0.0, 1e-15, "k > N");
+    }
+
+    #[test]
+    fn hypergeometric_rvs_and_fit() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let h = Hypergeometric::new(50, 20, 15);
+        let samples = h.rvs(10_000, &mut rng);
+        assert_eq!(samples.len(), 10_000);
+
+        // Check bounds: max(0, N + n - M) ..= min(n, N)
+        // 50, 20, 15 => max(0, 35 - 50) = 0 ..= min(20, 15) = 15
+        for &s in &samples {
+            assert!(s <= 15);
+        }
+
+        // Empirical mean vs theoretical mean: E[X] = N * n / M = 15 * 20 / 50 = 6.0
+        let sum: u64 = samples.iter().sum();
+        let mean = sum as f64 / samples.len() as f64;
+        assert!((mean - 6.0).abs() < 0.1, "empirical mean {mean} vs 6.0");
+
+        // Trait method rvs
+        let trait_samples = <Hypergeometric as DiscreteDistribution>::rvs(&h, 100, &mut rng);
+        assert_eq!(trait_samples.len(), 100);
+
+        // Fitting with known M and N
+        let fitted = Hypergeometric::fit_with_m_and_big_n(&samples, 50, 15).unwrap();
+        assert_eq!(fitted.big_m, 50);
+        assert_eq!(fitted.big_n, 15);
+        assert!((fitted.n as i64 - 20).abs() <= 1);
+
+        // General fit
+        let fitted_gen = Hypergeometric::fit(&samples).unwrap();
+        assert!(fitted_gen.big_m >= fitted_gen.n);
+        assert!(fitted_gen.big_m >= fitted_gen.big_n);
+
+        // Trait try_fit
+        let try_fitted = Hypergeometric::try_fit(&samples).unwrap();
+        assert_eq!(try_fitted.big_m, fitted_gen.big_m);
+
+        // Error cases
+        assert!(matches!(
+            Hypergeometric::try_fit(&[]),
+            Err(FitError::InsufficientData { required: 1, actual: 0 })
+        ));
+        assert!(matches!(
+            Hypergeometric::fit_with_m_and_big_n(&samples, 10, 15),
+            Err(StatsError::InvalidArgument(_))
+        ));
     }
 
     #[test]
@@ -96310,6 +97310,53 @@ mod tests {
         assert!(mu > 0.0 && mu.is_finite());
         assert!(nhg.var() > 0.0);
         assert!((nhg.cdf(0) - nhg.pmf(0)).abs() < 1e-14);
+    }
+
+    #[test]
+    fn neg_hypergeometric_rvs_and_fit() {
+        let mut rng = StdRng::seed_from_u64(42);
+        // M=20, n=7, r=3. Support is 0..=n (0..=7).
+        // Mean = r * n / (M - n + 1) = 3 * 7 / (20 - 7 + 1) = 21 / 14 = 1.5
+        let d = NegHypergeometric::new(20, 7, 3);
+        let samples = d.rvs(10_000, &mut rng);
+        assert_eq!(samples.len(), 10_000);
+
+        for &s in &samples {
+            assert!(s <= 7);
+        }
+
+        let sum: u64 = samples.iter().sum();
+        let mean = sum as f64 / samples.len() as f64;
+        assert!((mean - 1.5).abs() < 0.1, "empirical mean {mean} vs 1.5");
+
+        // Trait method rvs
+        let trait_samples = <NegHypergeometric as DiscreteDistribution>::rvs(&d, 100, &mut rng);
+        assert_eq!(trait_samples.len(), 100);
+
+        // Fitting with known M and r
+        let fitted = NegHypergeometric::fit_with_m_and_r(&samples, 20, 3).unwrap();
+        assert_eq!(fitted.big_m, 20);
+        assert_eq!(fitted.r, 3);
+        assert!((fitted.n as i64 - 7).abs() <= 1);
+
+        // General fit
+        let fitted_gen = NegHypergeometric::fit(&samples).unwrap();
+        assert!(fitted_gen.n <= fitted_gen.big_m);
+        assert!(fitted_gen.r <= fitted_gen.big_m - fitted_gen.n);
+
+        // Trait try_fit
+        let try_fitted = NegHypergeometric::try_fit(&samples).unwrap();
+        assert_eq!(try_fitted.big_m, fitted_gen.big_m);
+
+        // Error cases
+        assert!(matches!(
+            NegHypergeometric::try_fit(&[]),
+            Err(FitError::InsufficientData { required: 1, actual: 0 })
+        ));
+        assert!(matches!(
+            NegHypergeometric::fit_with_m_and_r(&samples, 2, 5),
+            Err(StatsError::InvalidArgument(_))
+        ));
     }
 
     #[test]
