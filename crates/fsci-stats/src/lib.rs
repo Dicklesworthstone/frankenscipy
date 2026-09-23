@@ -8274,6 +8274,26 @@ impl PoissonBinom {
     pub fn var(&self) -> f64 {
         self.p.iter().map(|&pi| pi * (1.0 - pi)).sum()
     }
+
+    /// Draw `n_samples` random variates from the Poisson binomial distribution.
+    ///
+    /// Each sample is the sum of independent Bernoulli trials with probabilities `self.p`.
+    pub fn rvs(&self, n_samples: usize, rng: &mut impl Rng) -> Vec<usize> {
+        if n_samples == 0 || self.p.is_empty() {
+            return Vec::new();
+        }
+        let mut samples = Vec::with_capacity(n_samples);
+        for _ in 0..n_samples {
+            let mut count = 0;
+            for &pi in &self.p {
+                if pi > 0.0 && (pi >= 1.0 || rng.random::<f64>() < pi) {
+                    count += 1;
+                }
+            }
+            samples.push(count);
+        }
+        samples
+    }
 }
 
 /// The multivariate hypergeometric distribution — drawing `n` items without
@@ -8551,6 +8571,28 @@ impl DirichletMultinomial {
                     .collect()
             })
             .collect()
+    }
+
+    /// Draw `n_samples` random vectors from the Dirichlet-multinomial compound distribution.
+    ///
+    /// Each sample is drawn by first generating a probability vector $p \sim \text{Dirichlet}(\alpha)$,
+    /// and then drawing trial outcomes $x \sim \text{Multinomial}(n, p)$.
+    pub fn rvs(&self, n_samples: usize, rng: &mut impl Rng) -> Vec<Vec<usize>> {
+        let k = self.alpha.len();
+        if k == 0 || n_samples == 0 {
+            return Vec::new();
+        }
+        let dirichlet = Dirichlet::new(&self.alpha);
+        let p_samples = dirichlet.rvs(n_samples, rng);
+        let mut samples = Vec::with_capacity(n_samples);
+        for p in p_samples {
+            let mn = Multinomial::new(self.n, &p);
+            let s = mn.rvs(1, rng);
+            if let Some(counts) = s.into_iter().next() {
+                samples.push(counts);
+            }
+        }
+        samples
     }
 }
 
@@ -11176,6 +11218,43 @@ impl Poisson {
     pub fn var(&self) -> f64 {
         self.mu
     }
+
+    /// Draw `n` random variates from the Poisson distribution.
+    ///
+    /// For $\mu < 30$, Knuth's multiplicative algorithm is used. For $\mu \ge 30$,
+    /// inverse-CDF transform sampling is used.
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
+        if n == 0 {
+            return Vec::new();
+        }
+        if self.mu == 0.0 {
+            return vec![0; n];
+        }
+        if self.mu < 30.0 {
+            let l = (-self.mu).exp();
+            (0..n)
+                .map(|_| {
+                    let mut k = 0u64;
+                    let mut p = 1.0f64;
+                    loop {
+                        k += 1;
+                        p *= rng.random::<f64>();
+                        if p <= l {
+                            break;
+                        }
+                    }
+                    k - 1
+                })
+                .collect()
+        } else {
+            (0..n)
+                .map(|_| {
+                    let u: f64 = rng.random();
+                    DiscreteDistribution::ppf(self, u) as u64
+                })
+                .collect()
+        }
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -11314,6 +11393,21 @@ pub trait DiscreteDistribution {
         }
         lo as f64
     }
+
+    /// Generate `n` random variates via inverse transform sampling using [`ppf`](Self::ppf).
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
+        (0..n)
+            .map(|_| {
+                let u: f64 = rng.random();
+                let q = self.ppf(u);
+                if q.is_finite() && q >= 0.0 {
+                    q as u64
+                } else {
+                    0
+                }
+            })
+            .collect()
+    }
 }
 
 /// Smallest `k` with `cdf(k) > 0`, i.e. the lower bound of a discrete
@@ -11420,6 +11514,9 @@ impl DiscreteDistribution for Poisson {
     }
     fn mode(&self) -> f64 {
         self.mu.floor()
+    }
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(n, rng)
     }
 }
 
@@ -11807,6 +11904,55 @@ impl Binomial {
             par_continuous_map_min(qs, 400_000, eval)
         }
     }
+
+    /// Draw `count` random variates from the Binomial distribution.
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        if count == 0 {
+            return Vec::new();
+        }
+        if self.n == 0 || self.p == 0.0 {
+            return vec![0; count];
+        }
+        if self.p == 1.0 {
+            return vec![self.n; count];
+        }
+        if self.n <= 30 {
+            (0..count)
+                .map(|_| {
+                    let mut s = 0u64;
+                    for _ in 0..self.n {
+                        if rng.random::<f64>() < self.p {
+                            s += 1;
+                        }
+                    }
+                    s
+                })
+                .collect()
+        } else {
+            let (p_eff, invert) = if self.p <= 0.5 {
+                (self.p, false)
+            } else {
+                (1.0 - self.p, true)
+            };
+            let log_q = (1.0 - p_eff).ln();
+            (0..count)
+                .map(|_| {
+                    let mut k = 0u64;
+                    let mut i = 0u64;
+                    loop {
+                        let u: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+                        let skip = (u.ln() / log_q).floor() as u64;
+                        i += skip + 1;
+                        if i > self.n {
+                            break;
+                        }
+                        k += 1;
+                    }
+                    if invert { self.n - k } else { k }
+                })
+                .collect()
+        }
+    }
 }
 
 impl DiscreteDistribution for Binomial {
@@ -11946,6 +12092,9 @@ impl DiscreteDistribution for Binomial {
         }
         h
     }
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng)
+    }
 }
 
 /// Beta-binomial distribution.
@@ -12006,6 +12155,24 @@ impl BetaBinomial {
                 ln_gamma(kf + self.a) + ln_gamma((self.n - k) as f64 + self.b) - lg_nab;
             (ln_comb + ln_beta_num - ln_beta_den).exp()
         })
+    }
+
+    /// Draw `count` random variates from the BetaBinomial distribution via Beta-Binomial mixture:
+    /// P ~ Beta(a, b), then X ~ Binomial(n, P).
+    pub fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        if count == 0 {
+            return Vec::new();
+        }
+        if self.n == 0 {
+            return vec![0; count];
+        }
+        let beta = BetaDist::new(self.a, self.b);
+        (0..count)
+            .map(|_| {
+                let p = beta.rvs(1, rng)[0].clamp(0.0, 1.0);
+                Binomial::new(self.n, p).rvs(1, rng)[0]
+            })
+            .collect()
     }
 }
 
@@ -12200,6 +12367,9 @@ impl DiscreteDistribution for BetaBinomial {
             }
         }
         h
+    }
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(count, rng)
     }
 }
 
@@ -12429,6 +12599,13 @@ impl Bernoulli {
         assert!((0.0..=1.0).contains(&p), "p must be in [0, 1], got {p}");
         Self { p }
     }
+
+    /// Draw `n` random variates from the Bernoulli distribution.
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
+        (0..n)
+            .map(|_| if rng.random::<f64>() < self.p { 1 } else { 0 })
+            .collect()
+    }
 }
 
 impl DiscreteDistribution for Bernoulli {
@@ -12500,6 +12677,10 @@ impl DiscreteDistribution for Bernoulli {
             f64::NAN
         }
     }
+
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
+        self.rvs(n, rng)
+    }
 }
 
 /// Geometric distribution: number of trials until first success.
@@ -12517,6 +12698,25 @@ impl Geometric {
     pub fn new(p: f64) -> Self {
         assert!(p > 0.0 && p <= 1.0, "p must be in (0, 1], got {p}");
         Self { p }
+    }
+
+    /// Draw `n` random variates from the Geometric distribution.
+    ///
+    /// Convention: support is {1, 2, 3, ...}, matching SciPy.
+    pub fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
+        if n == 0 {
+            return Vec::new();
+        }
+        if self.p >= 1.0 {
+            return vec![1; n];
+        }
+        let ln_q = (1.0 - self.p).ln();
+        (0..n)
+            .map(|_| {
+                let u: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
+                (u.ln() / ln_q).floor() as u64 + 1
+            })
+            .collect()
     }
 }
 
