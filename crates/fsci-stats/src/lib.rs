@@ -11227,33 +11227,7 @@ impl Poisson {
         if n == 0 {
             return Vec::new();
         }
-        if self.mu == 0.0 {
-            return vec![0; n];
-        }
-        if self.mu < 30.0 {
-            let l = (-self.mu).exp();
-            (0..n)
-                .map(|_| {
-                    let mut k = 0u64;
-                    let mut p = 1.0f64;
-                    loop {
-                        k += 1;
-                        p *= rng.random::<f64>();
-                        if p <= l {
-                            break;
-                        }
-                    }
-                    k - 1
-                })
-                .collect()
-        } else {
-            (0..n)
-                .map(|_| {
-                    let u: f64 = rng.random();
-                    DiscreteDistribution::ppf(self, u) as u64
-                })
-                .collect()
-        }
+        (0..n).map(|_| sample_poisson(self.mu, rng)).collect()
     }
 }
 
@@ -11462,6 +11436,30 @@ fn sample_beta(a: f64, b: f64, rng: &mut impl Rng) -> f64 {
         ga / sum
     } else {
         0.5
+    }
+}
+
+/// Draw a Poisson(mu) variate.
+fn sample_poisson(mu: f64, rng: &mut impl Rng) -> u64 {
+    if mu <= 0.0 {
+        return 0;
+    }
+    if mu < 30.0 {
+        let l = (-mu).exp();
+        let mut k = 0u64;
+        let mut p = 1.0f64;
+        loop {
+            k += 1;
+            p *= rng.random::<f64>();
+            if p <= l {
+                break;
+            }
+        }
+        k - 1
+    } else {
+        let dist = Poisson::new(mu);
+        let u: f64 = rng.random();
+        DiscreteDistribution::ppf(&dist, u) as u64
     }
 }
 
@@ -12535,7 +12533,7 @@ impl BetaNegativeBinomial {
                     u64::MAX
                 } else {
                     let y = ((1.0 - p) / p) * sample_standard_gamma(self.n as f64, rng);
-                    Poisson::new(y).rvs(1, rng)[0]
+                    sample_poisson(y, rng)
                 }
             })
             .collect()
@@ -12798,7 +12796,7 @@ impl Geometric {
         if self.p >= 1.0 {
             return vec![1; n];
         }
-        let ln_q = (1.0 - self.p).ln();
+        let ln_q = (-self.p).ln_1p();
         (0..n)
             .map(|_| {
                 let u: f64 = rng.random::<f64>().max(f64::MIN_POSITIVE);
