@@ -77,8 +77,8 @@ pub enum StructuralEvidence {
     General,
     Diagonal,
     Triangular,
-    /// Exactly symmetric (and neither diagonal nor triangular): SciPy's structure detection
-    /// tries Cholesky on it first, so it may be positive definite. Cholesky's own pivots decide.
+    /// Exactly symmetric (and neither diagonal nor triangular), or declared symmetric /
+    /// positive definite: SciPy factors it as symmetric (Cholesky, then Bunch–Kaufman LDLᵀ).
     Symmetric,
 }
 
@@ -89,7 +89,10 @@ pub enum SolverAction {
     SVDFallback,
     DiagonalFastPath,
     TriangularFastPath,
-    CholeskyFastPath,
+    /// SciPy's factorization of a symmetric matrix: Cholesky (`potrf`), falling back to
+    /// Bunch–Kaufman LDLᵀ (`sytrf`) where a pivot is not positive. Fails only on an exactly
+    /// singular `D`, or on a non-positive-definite matrix declared positive definite.
+    SymmetricFastPath,
 }
 
 impl SolverAction {
@@ -99,7 +102,7 @@ impl SolverAction {
         Self::SVDFallback,
         Self::DiagonalFastPath,
         Self::TriangularFastPath,
-        Self::CholeskyFastPath,
+        Self::SymmetricFastPath,
     ];
 
     #[must_use]
@@ -110,7 +113,7 @@ impl SolverAction {
             Self::SVDFallback => 2,
             Self::DiagonalFastPath => 3,
             Self::TriangularFastPath => 4,
-            Self::CholeskyFastPath => 5,
+            Self::SymmetricFastPath => 5,
         }
     }
 }
@@ -140,7 +143,7 @@ pub struct SolverEvidenceEntry {
 /// | SVDFallback        |       15 |       10 |       1 |            1 |
 /// | DiagonalFastPath   |        0 |        0 |       0 |          100 |
 /// | TriangularFastPath |        0 |        0 |       0 |          100 |
-/// | CholeskyFastPath   |        0 |        0 |       0 |          100 |
+/// | SymmetricFastPath  |        0 |        0 |       0 |          100 |
 ///
 /// Decision: a* = argmin_a Σ_s L(a,s) × P(s|evidence)
 #[derive(Debug, Clone)]
@@ -187,7 +190,7 @@ const OK_PROBABILITY: [[f64; 4]; 6] = [
     [0.99, 0.99, 0.95, 0.90], // SVDFallback
     [0.99, 0.99, 0.99, 0.30], // DiagonalFastPath
     [0.99, 0.99, 0.95, 0.30], // TriangularFastPath
-    [0.99, 0.99, 0.95, 0.30], // CholeskyFastPath (a not-positive-definite breakdown is not recorded)
+    [0.99, 0.99, 0.95, 0.30], // SymmetricFastPath
 ];
 
 /// Share of the non-`Ok` probability that is `Inaccurate` (the rest is `Failed`).
@@ -305,7 +308,7 @@ impl SolverPortfolio {
             [15.0, 10.0, 1.0, 1.0],  // SVDFallback
             [0.0, 0.0, 0.0, 100.0],  // DiagonalFastPath
             [0.0, 0.0, 0.0, 100.0],  // TriangularFastPath
-            [0.0, 0.0, 0.0, 100.0],  // CholeskyFastPath
+            [0.0, 0.0, 0.0, 100.0],  // SymmetricFastPath
         ]
     }
 
@@ -2040,21 +2043,21 @@ mod tests {
         assert_eq!(action, SolverAction::DiagonalFastPath);
     }
 
-    // frankenscipy-7tb8d.14: Cholesky is a candidate only for symmetric evidence, and loses to
-    // SVD where the posterior is all near-singular.
+    // frankenscipy-7tb8d.14: the symmetric factorization is a candidate only for symmetric
+    // evidence, and loses to SVD where the posterior is all near-singular.
     #[test]
-    fn casp_offers_cholesky_only_for_symmetric_evidence() {
+    fn casp_offers_the_symmetric_path_only_for_symmetric_evidence() {
         let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
         let symmetric = Some(StructuralEvidence::Symmetric);
         for rcond in [1e-2, 1e-6, 1e-11] {
             assert_eq!(
                 portfolio.select_action(rcond, symmetric).0,
-                SolverAction::CholeskyFastPath
+                SolverAction::SymmetricFastPath
             );
             for other in [None, Some(StructuralEvidence::General)] {
                 assert_ne!(
                     portfolio.select_action(rcond, other).0,
-                    SolverAction::CholeskyFastPath
+                    SolverAction::SymmetricFastPath
                 );
             }
         }
@@ -2063,7 +2066,7 @@ mod tests {
             SolverAction::SVDFallback
         );
         let excluded = portfolio
-            .select_action_excluding(1e-2, symmetric, &[SolverAction::CholeskyFastPath])
+            .select_action_excluding(1e-2, symmetric, &[SolverAction::SymmetricFastPath])
             .expect("the general solvers remain");
         assert_eq!(excluded.0, SolverAction::DirectLU);
     }

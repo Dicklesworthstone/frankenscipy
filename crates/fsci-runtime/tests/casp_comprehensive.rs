@@ -1462,9 +1462,9 @@ fn sa_index_tri() {
 }
 
 #[test]
-fn sa_index_cholesky() {
-    assert_eq!(SolverAction::CholeskyFastPath.index(), 5);
-    assert_eq!(SolverAction::ALL[5], SolverAction::CholeskyFastPath);
+fn sa_index_symmetric() {
+    assert_eq!(SolverAction::SymmetricFastPath.index(), 5);
+    assert_eq!(SolverAction::ALL[5], SolverAction::SymmetricFastPath);
 }
 
 #[test]
@@ -2239,7 +2239,7 @@ fn golden_portfolio_well_cond_losses() {
     assert_close(losses[2], 15.0, 1e-12, 0.0); // SVDFallback
     assert_close(losses[3], 0.0, 1e-12, 0.0); // DiagonalFastPath
     assert_close(losses[4], 0.0, 1e-12, 0.0); // TriangularFastPath
-    assert_close(losses[5], 0.0, 1e-12, 0.0); // CholeskyFastPath
+    assert_close(losses[5], 0.0, 1e-12, 0.0); // SymmetricFastPath
 }
 
 #[test]

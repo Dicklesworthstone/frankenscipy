@@ -644,7 +644,7 @@ fn diff_solve_hilbert_like_4x4() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DIFFERENTIAL TESTS: solve_with_casp (4 cases)
+// DIFFERENTIAL TESTS: solve_with_casp (5 cases)
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
@@ -661,6 +661,22 @@ fn diff_solve_with_casp_hilbert_6x6() {
     // Hilbert 6x6 has cond ~1.5e7 with solution components up to 6300;
     // 5e-7 abs tol corresponds to ~2.4e-11 relative error.
     run_solve_with_casp_diff("solve_with_casp_hilbert_6x6", &a, &b, 5e-7);
+}
+
+/// `Pᵀ·diag(-1, 1, 1, -1)·P` with `P` unit upper triangular and integer: symmetric
+/// indefinite, det = 1, cond ≈ 1.3e9 (frankenscipy-7tb8d.15). SciPy factors it with
+/// Bunch–Kaufman LDLᵀ (sytrf): its answer (|x| up to 5.0e6) moves by at most 1.2e-10 across
+/// OpenBLAS's kernels, while an LU answer lands 2.4e-3 away.
+#[test]
+fn diff_solve_with_casp_symmetric_indefinite_4x4() {
+    let a = vec![
+        vec![-1.0, -9.0, 2.0, -5.0],
+        vec![-9.0, -80.0, 30.0, -48.0],
+        vec![2.0, 30.0, 141.0, -8.0],
+        vec![-5.0, -48.0, -8.0, 307.0],
+    ];
+    let b = vec![1.0, -2.0, 3.0, -4.0];
+    run_solve_with_casp_diff("solve_with_casp_symmetric_indefinite_4x4", &a, &b, 1e-8);
 }
 
 #[test]

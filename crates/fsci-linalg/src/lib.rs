@@ -74,6 +74,11 @@ mod cholesky_tiled;
 // `qz` / `ordqz` (frankenscipy-szq1n.5). See generalized_schur.rs.
 mod generalized_schur;
 
+// Bunch–Kaufman LDLᵀ (LAPACK dsytf2 / dsytrs / dsytri) behind `solve` / `inv` on symmetric
+// matrices that are not positive definite and on `assume_a='sym'` (frankenscipy-7tb8d.15).
+mod bunch_kaufman;
+use bunch_kaufman::{BunchKaufman, Triangle};
+
 pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
     AttemptOutcome, AuditAction, AuditEvent, AuditLedger, DecisionSignals, PolicyAction,
@@ -856,12 +861,18 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
     let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
     let a = mirrored.as_deref().unwrap_or(a);
     let n = a.len();
+    // SciPy's structure detection for `assume_a = None`, which the fast paths below follow.
+    let detected = (n >= solve_flat_min()
+        && options.mode == RuntimeMode::Strict
+        && options.assume_a.is_none()
+        && rows_are_rectangular(a, n))
+    .then(|| scipy_structure(a, DetectionFor::Solve));
     // Fast path for large symmetric positive-definite systems: our own blocked
     // Cholesky (parallel trailing update), for `assume_a = pos` and — as SciPy's
     // auto-detection does — for an exactly symmetric matrix under `assume_a = None`
     // (frankenscipy-7tb8d.14). A non-positive pivot (not actually PD) returns None and
     // falls through: to the LU fast path below for `None`, and to the portfolio solver
-    // for `pos`, which preserves the exact `assume_a = pos` rejection behavior.
+    // for `pos`, which raises SciPy's singular-matrix error there.
     if n >= solve_flat_min()
         && options.mode == RuntimeMode::Strict
         && !options.transposed
@@ -870,7 +881,7 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
         && a.iter().flatten().all(|v| v.is_finite())
         && b.iter().all(|v| v.is_finite())
         && (options.assume_a == Some(MatrixAssumption::PositiveDefinite)
-            || (options.assume_a.is_none() && scipy_detects_symmetric(a, DetectionFor::Solve)))
+            || detected == Some(ScipyStructure::Symmetric))
         && let Some(x) = cholesky_solve_blocked(a, b)
     {
         let backward_error = compute_backward_error_dense(a, &x, b);
@@ -893,11 +904,22 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
     // (trailing update on all cores). Restricted to the plain Strict / untransposed /
     // General case so all the portfolio diagnostics (rcond, hardened checks, special
     // assumptions, transposition) keep their exact behavior; a singular pivot or any
-    // unmet precondition falls through to the portfolio solver unchanged.
+    // unmet precondition falls through to the portfolio solver unchanged. A matrix SciPy
+    // detects as diagonal or triangular falls through too, to the portfolio's diagonal /
+    // triangular solve (frankenscipy-7tb8d.15); a symmetric one that Cholesky rejected is
+    // solved here (see `strict_order_action` for why).
     if n >= solve_flat_min()
         && options.mode == RuntimeMode::Strict
         && !options.transposed
-        && matches!(options.assume_a, None | Some(MatrixAssumption::General))
+        && (options.assume_a == Some(MatrixAssumption::General)
+            || matches!(
+                detected,
+                Some(
+                    ScipyStructure::Symmetric
+                        | ScipyStructure::Tridiagonal
+                        | ScipyStructure::General
+                )
+            ))
         && b.len() == n
         && rows_are_rectangular(a, n)
         && a.iter().flatten().all(|v| v.is_finite())
@@ -1106,12 +1128,18 @@ pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError
     // Restricted to the plain Strict / General case; a singular pivot or any unmet
     // precondition falls through to the portfolio inverse (diagnostics preserved).
     let n = a.len();
+    // SciPy's structure detection for `assume_a = None`, which the fast paths below follow.
+    let detected = (n >= inv_flat_min()
+        && options.mode == RuntimeMode::Strict
+        && options.assume_a.is_none()
+        && rows_are_rectangular(a, n))
+    .then(|| scipy_structure(a, DetectionFor::Inv));
     // Fast path for SPD (`assume_a = pos`): factor once via Cholesky and read the
     // inverse off the batched identity solve `L·Lᵀ·X = I`. A Cholesky inverse is
     // ~2x cheaper than an LU inverse, so declaring the matrix SPD should be FASTER —
     // but it was routing to the slow portfolio (3x slower than General @512). A
     // non-PD matrix makes `Cholesky::new` return None → falls through to the
-    // portfolio, preserving the exact `assume_a = pos` rejection behavior. SciPy's
+    // portfolio, which raises SciPy's singular-matrix error for `pos`. SciPy's
     // auto-detection (`assume_a = None`) takes the same route for an exactly symmetric
     // matrix, and a non-PD one falls through to the LU fast path (frankenscipy-7tb8d.14).
     if n >= inv_flat_min()
@@ -1119,7 +1147,7 @@ pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError
         && rows_are_rectangular(a, n)
         && a.iter().flatten().all(|v| v.is_finite())
         && (options.assume_a == Some(MatrixAssumption::PositiveDefinite)
-            || (options.assume_a.is_none() && scipy_detects_symmetric(a, DetectionFor::Inv)))
+            || detected == Some(ScipyStructure::Symmetric))
         && let Ok(matrix) = dmatrix_from_rows(a)
         && let Some(chol) = Cholesky::new(matrix)
         && let Some(inverse) = cholesky_solve_identity_rhs_rows_batched(&chol)
@@ -1138,9 +1166,15 @@ pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError
             certificate: None,
         });
     }
+    // Large general inverse: blocked LU. A matrix SciPy detects as diagonal or triangular
+    // falls through to the portfolio's `1/d` / `trtri` inverse (frankenscipy-7tb8d.15).
     if n >= inv_flat_min()
         && options.mode == RuntimeMode::Strict
-        && matches!(options.assume_a, None | Some(MatrixAssumption::General))
+        && (options.assume_a == Some(MatrixAssumption::General)
+            || matches!(
+                detected,
+                Some(ScipyStructure::Symmetric | ScipyStructure::General)
+            ))
         && rows_are_rectangular(a, n)
         && a.iter().flatten().all(|v| v.is_finite())
         && let Some(inverse) = inv_blocked(a)
@@ -1416,15 +1450,18 @@ fn fast_rcond_from_lu(lu: &LU<f64, Dyn, Dyn>, a_norm: f64, n: usize) -> f64 {
     if rcond.is_nan() { 0.0 } else { rcond.min(1.0) }
 }
 
-/// Map linalg assumption to runtime structural evidence for CASP.
+/// Map linalg assumption to runtime structural evidence for CASP. An explicit assumption is
+/// SciPy's `assume_a`, which SciPy uses as given, with no detection.
 fn assumption_to_evidence(a: MatrixAssumption) -> fsci_runtime::StructuralEvidence {
     match a {
         MatrixAssumption::Diagonal => fsci_runtime::StructuralEvidence::Diagonal,
         MatrixAssumption::UpperTriangular | MatrixAssumption::LowerTriangular => {
             fsci_runtime::StructuralEvidence::Triangular
         }
-        // `assume_a='pos'`: SciPy factors with Cholesky (potrf).
-        MatrixAssumption::PositiveDefinite => fsci_runtime::StructuralEvidence::Symmetric,
+        // 'pos': Cholesky (potrf); 'sym' / 'her': Bunch–Kaufman LDLᵀ (sytrf).
+        MatrixAssumption::PositiveDefinite
+        | MatrixAssumption::Symmetric
+        | MatrixAssumption::Hermitian => fsci_runtime::StructuralEvidence::Symmetric,
         _ => fsci_runtime::StructuralEvidence::General,
     }
 }
@@ -1433,31 +1470,93 @@ fn assumption_to_evidence(a: MatrixAssumption) -> fsci_runtime::StructuralEviden
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DetectionFor {
     /// `solve`: a tridiagonal matrix with n > 3 is its own structure (tridiagonal LU), checked
-    /// before symmetry; no positive-definiteness probe.
+    /// before triangularity and symmetry; no positive-definiteness probe.
     Solve,
-    /// `inv` (and the public report): every exactly symmetric matrix goes to Cholesky; the
-    /// report also probes positive definiteness.
+    /// `inv` (and the public report): no tridiagonal class; the report also probes positive
+    /// definiteness.
     Inv,
 }
 
-/// SciPy 1.17's `solve` / `inv` with `assume_a=None` factor an EXACTLY symmetric matrix with
-/// Cholesky first (then LDLᵀ when a pivot fails): Hilbert(6) is solved by Cholesky, and one ulp
-/// of asymmetry makes it general LU (measured live, frankenscipy-7tb8d.14). A diagonal matrix
-/// is classified before symmetry, and `solve` also takes a tridiagonal n > 3 first.
-fn scipy_detects_symmetric(a: &[Vec<f64>], detection: DetectionFor) -> bool {
+/// The structure SciPy 1.17's `solve` / `inv` detect with `assume_a=None`
+/// (`_linalg_solve.hh` / `_linalg_inv.hh`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScipyStructure {
+    /// Divided by the diagonal (`b·(1/d)`, and `1/d` for the inverse).
+    Diagonal,
+    /// `solve` only, n > 3: tridiagonal LU (`gttrf`), the same pivots as dense LU.
+    Tridiagonal,
+    /// `trtrs` / `trtri`.
+    Triangular { lower: bool },
+    /// Cholesky (`potrf`), then Bunch–Kaufman LDLᵀ (`sytrf`) when a pivot is not positive.
+    /// Hilbert(6) is solved by Cholesky, and one ulp of asymmetry makes it general LU
+    /// (frankenscipy-7tb8d.14).
+    Symmetric,
+    /// LU (`getrf`).
+    General,
+}
+
+/// SciPy's detection, which is EXACT: the bandwidth counts every entry that is not zero
+/// (NaN included), and symmetry is `a[i][j] == a[j][i]`. A matrix with one 1e-300 entry below
+/// the diagonal is general to SciPy, not triangular. Checked in SciPy's order: diagonal,
+/// tridiagonal (`solve`, n > 3), upper triangular, lower triangular, symmetric.
+fn scipy_structure(a: &[Vec<f64>], detection: DetectionFor) -> ScipyStructure {
     let n = a.len();
-    if n < 2 || !rows_are_rectangular(a, n) || !issymmetric(a, 0.0, 0.0).unwrap_or(false) {
-        return false;
+    if !rows_are_rectangular(a, n) {
+        return ScipyStructure::General;
     }
-    // Exact bandwidth test, as SciPy's: every entry more than `k` off the diagonal is zero.
-    let within_band = |k: usize| {
-        a.iter().enumerate().all(|(i, row)| {
-            row.iter()
-                .enumerate()
-                .all(|(j, &value)| i.abs_diff(j) <= k || value == 0.0)
-        })
-    };
-    !(within_band(0) || (detection == DetectionFor::Solve && n > 3 && within_band(1)))
+    let (lower_band, upper_band) = bandwidth_with_tolerance(a, 0.0);
+    if lower_band == 0 && upper_band == 0 {
+        ScipyStructure::Diagonal
+    } else if detection == DetectionFor::Solve && n > 3 && lower_band == 1 && upper_band == 1 {
+        ScipyStructure::Tridiagonal
+    } else if lower_band == 0 {
+        ScipyStructure::Triangular { lower: false }
+    } else if upper_band == 0 {
+        ScipyStructure::Triangular { lower: true }
+    } else if issymmetric(a, 0.0, 0.0).unwrap_or(false) {
+        ScipyStructure::Symmetric
+    } else {
+        ScipyStructure::General
+    }
+}
+
+/// How SciPy factors a matrix it treats as symmetric (`St::POS_DEF` / `St::SYM` in
+/// `_linalg_solve.hh` / `_linalg_inv.hh`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SymmetricRoute {
+    /// `assume_a=None` on an exactly symmetric matrix: Cholesky, then Bunch–Kaufman LDLᵀ when
+    /// a pivot is not positive.
+    CholeskyThenLdl,
+    /// `assume_a='pos'`: Cholesky only (`posdef_fallback = false`). A non-positive pivot is
+    /// SciPy's `LinAlgError("A singular matrix detected")`, for `solve` and `inv` alike.
+    CholeskyOnly,
+    /// `assume_a='sym'` / `'her'`: Bunch–Kaufman LDLᵀ directly, even on a positive definite
+    /// matrix.
+    Ldl,
+}
+
+/// The symmetric factorization SciPy runs for an assumption, and the triangle it reads
+/// (`uplo = lower ? 'L' : 'U'`, whatever the assumption).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SymmetricFactorization {
+    route: SymmetricRoute,
+    triangle: Triangle,
+}
+
+impl SymmetricFactorization {
+    fn new(assumption: Option<MatrixAssumption>, lower: bool) -> Self {
+        let route = match assumption {
+            Some(MatrixAssumption::PositiveDefinite) => SymmetricRoute::CholeskyOnly,
+            Some(MatrixAssumption::Symmetric | MatrixAssumption::Hermitian) => SymmetricRoute::Ldl,
+            _ => SymmetricRoute::CholeskyThenLdl,
+        };
+        let triangle = if lower {
+            Triangle::Lower
+        } else {
+            Triangle::Upper
+        };
+        Self { route, triangle }
+    }
 }
 
 fn normalize_assumption_for_effective_matrix(
@@ -1529,15 +1628,15 @@ fn condition_diagnostics_with_assumption_mode(
 ) -> Result<ConditionDiagnosticsWork, LinalgError> {
     let evaluate_positive_definite = detection == DetectionFor::Inv;
     let (rows, cols) = matrix_shape(a)?;
-    let tol = structure_tolerance(a);
 
-    let diagonal = assumption == Some(MatrixAssumption::Diagonal) || is_diagonal(a, tol);
-    let upper_triangular = diagonal
-        || assumption == Some(MatrixAssumption::UpperTriangular)
-        || is_upper_triangular(a, tol);
-    let lower_triangular = diagonal
-        || assumption == Some(MatrixAssumption::LowerTriangular)
-        || is_lower_triangular(a, tol);
+    // Structure is EXACT, as SciPy's detection is: a matrix with one 1e-300 entry below the
+    // diagonal is not triangular (frankenscipy-7tb8d.15; this used to allow 64·eps·max|a|).
+    let bandwidth = bandwidth_with_tolerance(a, 0.0);
+    let diagonal = assumption == Some(MatrixAssumption::Diagonal) || bandwidth == (0, 0);
+    let upper_triangular =
+        diagonal || assumption == Some(MatrixAssumption::UpperTriangular) || bandwidth.0 == 0;
+    let lower_triangular =
+        diagonal || assumption == Some(MatrixAssumption::LowerTriangular) || bandwidth.1 == 0;
     let symmetric = matches!(
         assumption,
         Some(
@@ -1545,10 +1644,9 @@ fn condition_diagnostics_with_assumption_mode(
                 | MatrixAssumption::Hermitian
                 | MatrixAssumption::PositiveDefinite
         )
-    ) || (rows == cols && issymmetric(a, tol, tol)?);
+    ) || (rows == cols && issymmetric(a, 0.0, 0.0)?);
     let positive_definite = assumption == Some(MatrixAssumption::PositiveDefinite)
         || (evaluate_positive_definite && symmetric && is_positive_definite(a));
-    let bandwidth = bandwidth_with_tolerance(a, tol);
     let banded = rows > 0
         && cols > 0
         && (diagonal
@@ -1556,27 +1654,36 @@ fn condition_diagnostics_with_assumption_mode(
             || lower_triangular
             || bandwidth.0 + bandwidth.1 + 1 < rows.max(cols));
     let total_values = rows.saturating_mul(cols);
-    let near_zero_values = a
+    let zero_values = a
         .iter()
         .flat_map(|row| row.iter())
-        .filter(|&&value| value.abs() <= tol)
+        .filter(|&&value| value == 0.0)
         .count();
     let sparsity_ratio = if total_values == 0 {
         1.0
     } else {
-        near_zero_values as f64 / total_values as f64
+        zero_values as f64 / total_values as f64
     };
 
-    let structural_evidence = if diagonal {
-        StructuralEvidence::Diagonal
-    } else if upper_triangular || lower_triangular {
-        StructuralEvidence::Triangular
-    } else if assumption.is_none() && symmetric && scipy_detects_symmetric(a, detection) {
-        StructuralEvidence::Symmetric
-    } else {
-        assumption
-            .map(assumption_to_evidence)
-            .unwrap_or(StructuralEvidence::General)
+    // An explicit assumption is used as given, as SciPy's `assume_a` is; `None` is SciPy's
+    // detection.
+    let structural_evidence = match assumption {
+        Some(assumption) => assumption_to_evidence(assumption),
+        None if rows != cols => {
+            if diagonal {
+                StructuralEvidence::Diagonal
+            } else if upper_triangular || lower_triangular {
+                StructuralEvidence::Triangular
+            } else {
+                StructuralEvidence::General
+            }
+        }
+        None => match scipy_structure(a, detection) {
+            ScipyStructure::Diagonal => StructuralEvidence::Diagonal,
+            ScipyStructure::Triangular { .. } => StructuralEvidence::Triangular,
+            ScipyStructure::Symmetric => StructuralEvidence::Symmetric,
+            ScipyStructure::Tridiagonal | ScipyStructure::General => StructuralEvidence::General,
+        },
     };
 
     let mut matrix_cache = None;
@@ -1946,12 +2053,22 @@ fn build_solve_certificate(
 
 /// The action `solve` / `inv` try next, given the posterior's `candidate` and the actions
 /// already `tried`. Strict mode maximizes observable compatibility, so it follows SciPy's order
-/// rather than the posterior's: Cholesky first on an exactly symmetric matrix (SciPy's
-/// auto-detection), then LU (getrf) at every conditioning, and QR / SVD only once LU has failed
-/// its backward-error certificate. On a non-symmetric matrix at rcond 2.5e-5 the posterior's
-/// QR is not SciPy's answer; on Hilbert(6) SciPy's Cholesky is 1.8e-8 from the exact solution,
-/// where the posterior's QR was 7.6e-7 away from it (frankenscipy-7tb8d.14). Hardened mode
-/// keeps the posterior's choice.
+/// rather than the posterior's: the symmetric factorization first on symmetric evidence
+/// (exact symmetry under `assume_a=None`, or 'sym' / 'her' / 'pos'), then LU (getrf) at every
+/// conditioning, and QR / SVD only once LU has failed its backward-error certificate. On a
+/// non-symmetric matrix at rcond 2.5e-5 the posterior's QR is not SciPy's answer; on
+/// Hilbert(6) SciPy's Cholesky is 1.8e-8 from the exact solution, where the posterior's QR was
+/// 7.6e-7 away from it (frankenscipy-7tb8d.14). Hardened mode keeps the posterior's choice.
+///
+/// Where Strict still departs from SciPy's structure dispatch (frankenscipy-7tb8d.15):
+/// - n ≥ [`solve_flat_min`] / [`inv_flat_min`]: a symmetric matrix that is not positive
+///   definite, and `assume_a='sym'` / `'her'`, take the blocked LU fast path (after Cholesky
+///   when that succeeds) instead of Bunch–Kaufman. SciPy's `sytrf` is blocked there too
+///   (`dlasyf`, n > 64), and its answer moves by 2e-8 to 1.3e-7 (relative, cond 1e10)
+///   between OpenBLAS's own kernels, as far as LU is from it.
+/// - A tridiagonal `solve` (n > 3) is dense LU; SciPy's `gttrf` has the same pivots.
+/// - Triangular solves use a row-oriented substitution; SciPy's `trtrs` is column-oriented,
+///   so the two differ by rounding.
 fn strict_order_action(
     mode: RuntimeMode,
     structural_evidence: StructuralEvidence,
@@ -1962,9 +2079,9 @@ fn strict_order_action(
         return candidate;
     }
     if structural_evidence == StructuralEvidence::Symmetric
-        && !tried.contains(&SolverAction::CholeskyFastPath)
+        && !tried.contains(&SolverAction::SymmetricFastPath)
     {
-        return SolverAction::CholeskyFastPath;
+        return SolverAction::SymmetricFastPath;
     }
     if matches!(
         candidate,
@@ -1985,23 +2102,89 @@ fn candidate_actions(structural_evidence: StructuralEvidence) -> Vec<SolverActio
     match structural_evidence {
         StructuralEvidence::Diagonal => actions.push(SolverAction::DiagonalFastPath),
         StructuralEvidence::Triangular => actions.push(SolverAction::TriangularFastPath),
-        StructuralEvidence::Symmetric => actions.push(SolverAction::CholeskyFastPath),
+        StructuralEvidence::Symmetric => actions.push(SolverAction::SymmetricFastPath),
         StructuralEvidence::General => {}
     }
     actions
 }
 
-fn not_positive_definite() -> LinalgError {
-    LinalgError::InvalidArgument {
-        detail: "matrix is not positive definite".into(),
+/// Whether a failed attempt ends the search. In Strict mode a failed symmetric factorization
+/// is SciPy's answer: `sytrf` found `D` exactly singular, or `assume_a='pos'` met a pivot that
+/// is not positive, and SciPy raises `LinAlgError` for both rather than trying LU.
+fn failure_is_final(mode: RuntimeMode, action: SolverAction) -> bool {
+    mode == RuntimeMode::Strict && action == SolverAction::SymmetricFastPath
+}
+
+/// `x` with `A·x = b` by SciPy's symmetric factorization: Cholesky (`potrf` / `potrs`), and
+/// Bunch–Kaufman LDLᵀ (`sytrf` / `sytrs`) where the route allows it. `Err(SingularMatrix)`
+/// where SciPy raises "A singular matrix detected".
+fn symmetric_solve(
+    a: &[Vec<f64>],
+    b: &[f64],
+    factorization: SymmetricFactorization,
+) -> Result<Vec<f64>, LinalgError> {
+    let n = a.len();
+    let ldl = || {
+        let factor = BunchKaufman::factor(a, factorization.triangle);
+        if factor.is_singular() {
+            return Err(LinalgError::SingularMatrix);
+        }
+        Ok(factor.solve(b))
+    };
+    if factorization.route == SymmetricRoute::Ldl {
+        return ldl();
+    }
+    match cholesky_lower_factor(a, n) {
+        Some(l_flat) => cho_solve_lower_flat(&l_flat, n, b).ok_or(LinalgError::SingularMatrix),
+        None if factorization.route == SymmetricRoute::CholeskyThenLdl => ldl(),
+        None => Err(LinalgError::SingularMatrix),
     }
 }
 
+/// `A⁻¹` by SciPy's symmetric factorization: Cholesky (`potrf` / `potri`), and Bunch–Kaufman
+/// LDLᵀ (`sytrf` / `sytri`) where the route allows it. Both return one triangle mirrored, so
+/// the inverse is exactly symmetric.
+fn symmetric_inverse(
+    a: &[Vec<f64>],
+    factorization: SymmetricFactorization,
+) -> Result<Vec<Vec<f64>>, LinalgError> {
+    let n = a.len();
+    let ldl = || {
+        let factor = BunchKaufman::factor(a, factorization.triangle);
+        if factor.is_singular() {
+            return Err(LinalgError::SingularMatrix);
+        }
+        Ok(factor.inverse())
+    };
+    if factorization.route == SymmetricRoute::Ldl {
+        return ldl();
+    }
+    let Some(l_flat) = cholesky_lower_factor(a, n) else {
+        return if factorization.route == SymmetricRoute::CholeskyThenLdl {
+            ldl()
+        } else {
+            Err(LinalgError::SingularMatrix)
+        };
+    };
+    let columns = (0..n)
+        .map(|j| {
+            let mut unit = vec![0.0; n];
+            unit[j] = 1.0;
+            cho_solve_lower_flat(&l_flat, n, &unit).ok_or(LinalgError::SingularMatrix)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((0..n)
+        .map(|i| (0..n).map(|j| columns[i.min(j)][i.max(j)]).collect())
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_solve_action(
     action: SolverAction,
     effective_a: &[Vec<f64>],
     b: &[f64],
     report: &ConditionReport,
+    symmetric: SymmetricFactorization,
     matrix_cache: &mut Option<DMatrix<f64>>,
     lu_cache: &mut Option<LU<f64, Dyn, Dyn>>,
 ) -> Result<SolveResult, LinalgError> {
@@ -2037,10 +2220,8 @@ fn dispatch_solve_action(
             report.lower_triangular,
             false,
         ),
-        SolverAction::CholeskyFastPath => {
-            let n = effective_a.len();
-            let l_flat = cholesky_lower_factor(effective_a, n).ok_or_else(not_positive_definite)?;
-            let x = cho_solve_lower_flat(&l_flat, n, b).ok_or(LinalgError::SingularMatrix)?;
+        SolverAction::SymmetricFastPath => {
+            let x = symmetric_solve(effective_a, b, symmetric)?;
             let backward_error = compute_backward_error_dense(effective_a, &x, b);
             Ok(SolveResult {
                 x,
@@ -2074,6 +2255,7 @@ fn run_portfolio_attempts(
     effective_a: &[Vec<f64>],
     b: &[f64],
     report: &ConditionReport,
+    symmetric: SymmetricFactorization,
     matrix_cache: &mut Option<DMatrix<f64>>,
     lu_cache: &mut Option<LU<f64, Dyn, Dyn>>,
     selected_action: SolverAction,
@@ -2089,7 +2271,15 @@ fn run_portfolio_attempts(
     let mut action = selected_action;
     loop {
         tried.push(action);
-        match dispatch_solve_action(action, effective_a, b, report, matrix_cache, lu_cache) {
+        match dispatch_solve_action(
+            action,
+            effective_a,
+            b,
+            report,
+            symmetric,
+            matrix_cache,
+            lu_cache,
+        ) {
             Ok(solve_result) => {
                 let omega = solve_result.backward_error.unwrap_or(0.0);
                 if omega <= ATTEMPT_BACKWARD_ERROR_TOL {
@@ -2106,13 +2296,18 @@ fn run_portfolio_attempts(
                 }
             }
             Err(err) => {
-                // A Cholesky breakdown refutes positive definiteness, which says nothing about
-                // the conditioning state the posterior tracks; like SciPy, move on to the next
-                // factorization without counting it.
-                if action != SolverAction::CholeskyFastPath {
+                // A breakdown of Cholesky-only ('pos') refutes positive definiteness, which says
+                // nothing about the conditioning state the posterior tracks, so it is not
+                // counted. Every other failure is a singular factor.
+                if !(action == SolverAction::SymmetricFastPath
+                    && symmetric.route == SymmetricRoute::CholeskyOnly)
+                {
                     portfolio.record_outcome(rcond, action, AttemptOutcome::Failed);
                 }
                 last_error = Some(err);
+                if failure_is_final(mode, action) {
+                    break;
+                }
             }
         }
         match portfolio.select_action_excluding(rcond, Some(report.structural_evidence), &tried) {
@@ -2235,6 +2430,7 @@ fn solve_with_portfolio_internal(
         &effective_a,
         b,
         &report,
+        SymmetricFactorization::new(effective_assumption, options.lower),
         &mut matrix_cache,
         &mut lu_cache,
         selected_action,
@@ -2453,6 +2649,7 @@ pub fn solve_with_audit(
         &effective_a,
         b,
         &report,
+        SymmetricFactorization::new(effective_assumption, options.lower),
         &mut matrix_cache,
         &mut lu_cache,
         selected_action,
@@ -2579,8 +2776,11 @@ pub fn inv_with_casp(
         SolverAction::PivotedQR,
         SolverAction::SVDFallback,
     ];
-    if report.structural_evidence == StructuralEvidence::Symmetric {
-        actions.push(SolverAction::CholeskyFastPath);
+    match report.structural_evidence {
+        StructuralEvidence::Symmetric => actions.push(SolverAction::SymmetricFastPath),
+        StructuralEvidence::Diagonal => actions.push(SolverAction::DiagonalFastPath),
+        StructuralEvidence::Triangular => actions.push(SolverAction::TriangularFastPath),
+        StructuralEvidence::General => {}
     }
     actions
         .sort_by(|lhs, rhs| expected_losses[lhs.index()].total_cmp(&expected_losses[rhs.index()]));
@@ -2599,35 +2799,51 @@ pub fn inv_with_casp(
         actions.insert(1, lu_action);
     }
 
+    let symmetric = SymmetricFactorization::new(options.assume_a, options.lower);
+    let lower_triangular = match options.assume_a {
+        Some(MatrixAssumption::LowerTriangular) => true,
+        Some(MatrixAssumption::UpperTriangular) => false,
+        _ => report.lower_triangular && !report.upper_triangular,
+    };
     let mut last_error = None;
     let mut actual_action = selected_action;
-
-    let result = actions
-        .into_iter()
-        .find_map(|action| {
-            match dispatch_inv_action(action, a, rows, options.mode, &matrix_cache, &lu_cache) {
-                Ok(mut inv_result) => {
-                    let fallback_active = action != selected_action;
-                    inv_result.certificate = Some(SolveCertificate {
-                        action,
-                        matrix_shape: (rows, cols),
-                        rcond_estimate: report.rcond_estimate,
-                        structural_evidence: report.structural_evidence,
-                        posterior: posterior.to_vec(),
-                        expected_losses: expected_losses.to_vec(),
-                        chosen_expected_loss: expected_losses[action.index()],
-                        fallback_active,
-                    });
-                    actual_action = action;
-                    Some(Ok(inv_result))
-                }
-                Err(err) => {
-                    last_error = Some(err);
-                    None
+    let mut result = None;
+    for action in actions {
+        match dispatch_inv_action(
+            action,
+            a,
+            rows,
+            options.mode,
+            symmetric,
+            lower_triangular,
+            &matrix_cache,
+            &lu_cache,
+        ) {
+            Ok(mut inv_result) => {
+                let fallback_active = action != selected_action;
+                inv_result.certificate = Some(SolveCertificate {
+                    action,
+                    matrix_shape: (rows, cols),
+                    rcond_estimate: report.rcond_estimate,
+                    structural_evidence: report.structural_evidence,
+                    posterior: posterior.to_vec(),
+                    expected_losses: expected_losses.to_vec(),
+                    chosen_expected_loss: expected_losses[action.index()],
+                    fallback_active,
+                });
+                actual_action = action;
+                result = Some(inv_result);
+                break;
+            }
+            Err(err) => {
+                last_error = Some(err);
+                if failure_is_final(options.mode, action) {
+                    break;
                 }
             }
-        })
-        .unwrap_or_else(|| Err(last_error.unwrap_or(LinalgError::SingularMatrix)));
+        }
+    }
+    let result = result.ok_or_else(|| last_error.unwrap_or(LinalgError::SingularMatrix));
 
     emit_trace(LinalgTrace {
         operation: "inv_with_casp",
@@ -2656,37 +2872,131 @@ pub fn inv_with_casp(
     result
 }
 
+/// SciPy's inverse of a diagonal matrix: `1/d` on the diagonal, zero elsewhere (only the
+/// diagonal is read). An exactly zero `d` is singular.
+fn diagonal_inverse(a: &[Vec<f64>], n: usize) -> Result<Vec<Vec<f64>>, LinalgError> {
+    let mut inverse = vec![vec![0.0; n]; n];
+    for (i, row) in inverse.iter_mut().enumerate() {
+        if a[i][i] == 0.0 {
+            return Err(LinalgError::SingularMatrix);
+        }
+        row[i] = 1.0 / a[i][i];
+    }
+    Ok(inverse)
+}
+
+/// SciPy's inverse of a triangular matrix: LAPACK `dtrti2` (column by column, `dtrmv` then
+/// `dscal` by `-1/a[j][j]`, in reference BLAS order), reading only the `lower` / upper
+/// triangle; the other triangle of the result is zero. An exactly zero diagonal entry is
+/// singular (`trtri` INFO > 0).
+fn triangular_inverse(a: &[Vec<f64>], n: usize, lower: bool) -> Result<Vec<Vec<f64>>, LinalgError> {
+    if (0..n).any(|i| a[i][i] == 0.0) {
+        return Err(LinalgError::SingularMatrix);
+    }
+    // Column-major working copy of the triangle; `inv[j]` is column j.
+    let mut inv: Vec<Vec<f64>> = (0..n)
+        .map(|j| {
+            (0..n)
+                .map(|i| {
+                    let in_triangle = if lower { i >= j } else { i <= j };
+                    if in_triangle { a[i][j] } else { 0.0 }
+                })
+                .collect()
+        })
+        .collect();
+    if lower {
+        for j in (0..n).rev() {
+            inv[j][j] = 1.0 / inv[j][j];
+            let ajj = -inv[j][j];
+            // x := T·x with T the already inverted trailing block, x = column j below the
+            // diagonal (reference DTRMV 'L', 'N', non-unit).
+            let (head, tail) = inv.split_at_mut(j + 1);
+            let x = &mut head[j];
+            for jj in (j + 1..n).rev() {
+                let temp = x[jj];
+                if temp != 0.0 {
+                    for i in (jj + 1..n).rev() {
+                        x[i] += temp * tail[jj - j - 1][i];
+                    }
+                    x[jj] *= tail[jj - j - 1][jj];
+                }
+            }
+            for value in &mut x[j + 1..] {
+                *value *= ajj;
+            }
+        }
+    } else {
+        for j in 0..n {
+            inv[j][j] = 1.0 / inv[j][j];
+            let ajj = -inv[j][j];
+            // x := T·x with T the already inverted leading block, x = column j above the
+            // diagonal (reference DTRMV 'U', 'N', non-unit).
+            let (head, tail) = inv.split_at_mut(j);
+            let x = &mut tail[0];
+            for jj in 0..j {
+                let temp = x[jj];
+                if temp != 0.0 {
+                    for i in 0..jj {
+                        x[i] += temp * head[jj][i];
+                    }
+                    x[jj] *= head[jj][jj];
+                }
+            }
+            for value in &mut x[..j] {
+                *value *= ajj;
+            }
+        }
+    }
+    Ok((0..n)
+        .map(|i| (0..n).map(|j| inv[j][i]).collect())
+        .collect())
+}
+
+/// `1/(‖A‖₁·‖A⁻¹‖₁)` from an explicit inverse (0 when either norm is 0).
+fn rcond_from_inverse(a: &[Vec<f64>], inverse: &[Vec<f64>], n: usize) -> f64 {
+    let a_norm_1 = matrix_norm1_rows(a, n);
+    let inv_norm_1 = matrix_norm1_rows(inverse, n);
+    if a_norm_1 > 0.0 && inv_norm_1 > 0.0 {
+        1.0 / (a_norm_1 * inv_norm_1)
+    } else {
+        0.0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_inv_action(
     action: SolverAction,
     a: &[Vec<f64>],
     n: usize,
     mode: RuntimeMode,
+    symmetric: SymmetricFactorization,
+    lower_triangular: bool,
     matrix_cache: &Option<DMatrix<f64>>,
     lu_cache: &Option<LU<f64, Dyn, Dyn>>,
 ) -> Result<InvResult, LinalgError> {
     match action {
-        SolverAction::CholeskyFastPath => {
-            // SciPy's inverse of a symmetric positive definite matrix (potrf / potri): factor
-            // once, solve L·Lᵀ·X = I, and return one triangle mirrored, so the inverse is
-            // exactly symmetric as potri's is.
-            let l_flat = cholesky_lower_factor(a, n).ok_or_else(not_positive_definite)?;
-            let columns = (0..n)
-                .map(|j| {
-                    let mut unit = vec![0.0; n];
-                    unit[j] = 1.0;
-                    cho_solve_lower_flat(&l_flat, n, &unit).ok_or(LinalgError::SingularMatrix)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let inverse: Vec<Vec<f64>> = (0..n)
-                .map(|i| (0..n).map(|j| columns[i.min(j)][i.max(j)]).collect())
-                .collect();
-            let a_norm_1 = matrix_norm1_rows(a, n);
-            let inv_norm_1 = matrix_norm1_rows(&inverse, n);
-            let rcond = if a_norm_1 > 0.0 && inv_norm_1 > 0.0 {
-                1.0 / (a_norm_1 * inv_norm_1)
+        SolverAction::DiagonalFastPath | SolverAction::TriangularFastPath => {
+            let inverse = if action == SolverAction::DiagonalFastPath {
+                diagonal_inverse(a, n)?
             } else {
-                0.0
+                triangular_inverse(a, n, lower_triangular)?
             };
+            let rcond = rcond_from_inverse(a, &inverse, n);
+            if mode == RuntimeMode::Hardened && rcond < HARDENED_RCOND_THRESHOLD && rcond > 0.0 {
+                return Err(LinalgError::ConditionTooHigh {
+                    rcond,
+                    threshold: HARDENED_RCOND_THRESHOLD,
+                });
+            }
+            Ok(InvResult {
+                inverse,
+                warning: rcond_warning(rcond),
+                certificate: None,
+            })
+        }
+        SolverAction::SymmetricFastPath => {
+            let inverse = symmetric_inverse(a, symmetric)?;
+            let rcond = rcond_from_inverse(a, &inverse, n);
             if mode == RuntimeMode::Hardened && rcond < HARDENED_RCOND_THRESHOLD && rcond > 0.0 {
                 return Err(LinalgError::ConditionTooHigh {
                     rcond,
@@ -2702,9 +3012,7 @@ fn dispatch_inv_action(
                 certificate: None,
             })
         }
-        SolverAction::DirectLU
-        | SolverAction::DiagonalFastPath
-        | SolverAction::TriangularFastPath => {
+        SolverAction::DirectLU => {
             // Use cached LU if available
             let (matrix, lu) = match (matrix_cache, lu_cache) {
                 (Some(m), Some(lu)) => (m.clone(), lu.clone()),
@@ -11410,7 +11718,9 @@ fn solve_diagonal(a: &[Vec<f64>], b: &[f64]) -> Result<SolveResult, LinalgError>
         let abs_diag = diag.abs();
         max_diag = max_diag.max(abs_diag);
         min_diag = min_diag.min(abs_diag);
-        x[i] = b[i] / diag;
+        // SciPy multiplies by the reciprocal (`solve_slice_diagonal`), which differs from
+        // `b / d` in the last bit for about a quarter of random entries (frankenscipy-7tb8d.15).
+        x[i] = b[i] * (1.0 / diag);
     }
     let rcond = if max_diag > 0.0 {
         min_diag / max_diag
@@ -28734,7 +29044,7 @@ mod tests {
             certificate.structural_evidence,
             StructuralEvidence::Symmetric
         );
-        assert_eq!(certificate.action, SolverAction::CholeskyFastPath);
+        assert_eq!(certificate.action, SolverAction::SymmetricFastPath);
         assert!(!certificate.fallback_active);
         // SciPy 1.17.1 `solve(hilbert(6), ones(6))`; an LU answer is 7.5e-7 away.
         let scipy_x = [
@@ -28754,7 +29064,7 @@ mod tests {
         let inverse = inv_with_casp(&h, InvOptions::default(), &mut portfolio).expect("inv");
         assert_eq!(
             inverse.certificate.expect("certificate").action,
-            SolverAction::CholeskyFastPath
+            SolverAction::SymmetricFastPath
         );
         for (i, row) in inverse.inverse.iter().enumerate() {
             for (j, value) in row.iter().enumerate() {
@@ -28787,8 +29097,9 @@ mod tests {
         assert_eq!(certificate.structural_evidence, StructuralEvidence::General);
         assert_eq!(certificate.action, SolverAction::DirectLU);
 
-        // Symmetric but indefinite: Cholesky breaks down and the solve moves on to LU (SciPy
-        // moves on to LDLᵀ) without counting the breakdown as conditioning evidence.
+        // Symmetric but indefinite: Cholesky breaks down and the same action moves on to
+        // Bunch–Kaufman LDLᵀ, as SciPy does (one 2×2 pivot here, which solves it exactly). The
+        // one recorded outcome is that success (frankenscipy-7tb8d.15).
         let indefinite = vec![vec![1.0, 2.0], vec![2.0, 1.0]];
         let mut fresh = SolverPortfolio::new(RuntimeMode::Strict, 64);
         let result = solve_with_casp(
@@ -28803,11 +29114,9 @@ mod tests {
             certificate.structural_evidence,
             StructuralEvidence::Symmetric
         );
-        assert_eq!(certificate.action, SolverAction::DirectLU);
-        assert!(certificate.fallback_active);
-        for got in &result.x {
-            assert!((got - 1.0).abs() <= 1e-15, "x = {:?}", result.x);
-        }
+        assert_eq!(certificate.action, SolverAction::SymmetricFastPath);
+        assert!(!certificate.fallback_active);
+        assert_eq!(result.x, [1.0, 1.0]);
         let recorded: f64 = fresh
             .outcome_counts(certificate.rcond_estimate)
             .iter()
@@ -28842,7 +29151,351 @@ mod tests {
             .expect("inv")
             .certificate
             .expect("certificate");
-        assert_eq!(certificate.action, SolverAction::CholeskyFastPath);
+        assert_eq!(certificate.action, SolverAction::SymmetricFastPath);
+    }
+
+    /// `Pᵀ·diag(-1, 1, 1, -1)·P` with `P` unit upper triangular and integer: symmetric
+    /// indefinite, det = 1, cond ≈ 1.3e9 (frankenscipy-7tb8d.15).
+    fn unimodular_indefinite() -> Vec<Vec<f64>> {
+        vec![
+            vec![-1.0, -9.0, 2.0, -5.0],
+            vec![-9.0, -80.0, 30.0, -48.0],
+            vec![2.0, 30.0, 141.0, -8.0],
+            vec![-5.0, -48.0, -8.0, 307.0],
+        ]
+    }
+
+    fn max_relative_gap(got: &[f64], want: &[f64]) -> f64 {
+        let scale = want.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        got.iter()
+            .zip(want)
+            .fold(0.0_f64, |m, (g, w)| m.max((g - w).abs()))
+            / scale
+    }
+
+    fn assert_same_bits(got: &[f64], want: &[f64]) {
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "entry {i}: {got:?} vs {want:?}");
+        }
+    }
+
+    /// frankenscipy-7tb8d.15: on a symmetric matrix that is not positive definite SciPy's
+    /// `solve` / `inv` factor with Bunch–Kaufman LDLᵀ (sytrf), and so does Strict now. LU was
+    /// used before, which lands 4.7e-10 (relative) from SciPy's answer on this matrix, where
+    /// every OpenBLAS kernel's LDLᵀ answer agrees to 3e-17.
+    #[test]
+    fn strict_symmetric_indefinite_takes_scipys_ldl() {
+        let a = unimodular_indefinite();
+        let b = [1.0, -2.0, 3.0, -4.0];
+        // SciPy 1.17.1 `solve(a, b)` (Zen kernel; Prescott differs by 1 ulp in x[1..]). The
+        // exact solution is (-5030928, 547597, -45007, 2508).
+        let scipy_x = [
+            -5_030_928.001_527_862,
+            547_597.000_166_301_8,
+            -45_007.000_013_668_374,
+            2_508.000_000_761_682,
+        ];
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
+        let result =
+            solve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio).expect("solve");
+        let certificate = result.certificate.expect("certificate");
+        assert_eq!(certificate.action, SolverAction::SymmetricFastPath);
+        assert!(!certificate.fallback_active);
+        assert!(
+            max_relative_gap(&result.x, &scipy_x) <= 1e-15,
+            "x = {:?}",
+            result.x
+        );
+        // Must-differ arm: LU on the same matrix is where the old route landed.
+        let lu = solve(
+            &a,
+            &b,
+            SolveOptions {
+                assume_a: Some(MatrixAssumption::General),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("LU solve");
+        assert!(
+            max_relative_gap(&lu.x, &scipy_x) > 1e-11,
+            "LU x = {:?}",
+            lu.x
+        );
+
+        // `inv(a)`: sytrf / sytri, bit-identical to SciPy's Nehalem through Zen kernels.
+        let inverse = inv(&a, InvOptions::default()).expect("inv");
+        assert_eq!(
+            inverse.certificate.expect("certificate").action,
+            SolverAction::SymmetricFastPath
+        );
+        assert_same_bits(
+            &inverse.inverse.concat(),
+            &[
+                -4_035_964.001_225_698,
+                439_299.000_133_412_4,
+                -36_106.000_010_965_18,
+                2_012.000_000_611_036_5,
+                439_299.000_133_412_4,
+                -47_816.000_014_521_42,
+                3_930.000_001_193_517,
+                -219.000_000_066_508_1,
+                -36_106.000_010_965_18,
+                3_930.000_001_193_517,
+                -323.000_000_098_095_2,
+                18.000_000_005_466_37,
+                2_012.000_000_611_036_5,
+                -219.000_000_066_508_1,
+                18.000_000_005_466_37,
+                -1.000_000_000_304_487_8,
+            ],
+        );
+    }
+
+    /// frankenscipy-7tb8d.15: `assume_a='sym'` is LDLᵀ in SciPy even on a positive definite
+    /// matrix, reading the triangle `lower` names; 'pos' is Cholesky with no fallback, and a
+    /// singular `D` is an error. Every value below was identical under OpenBLAS's Prescott,
+    /// Nehalem, Sandybridge, Haswell and Zen kernels.
+    #[test]
+    fn strict_declared_symmetric_and_positive_definite_follow_scipy() {
+        let h3 = hilbert(3);
+        let b = [1.0, 2.0, 3.0];
+        let with = |assume_a, lower| SolveOptions {
+            assume_a,
+            lower,
+            ..SolveOptions::default()
+        };
+        let sym = solve(&h3, &b, with(Some(MatrixAssumption::Symmetric), false)).expect("sym");
+        assert_same_bits(
+            &sym.x,
+            &[
+                27.000_000_000_000_206,
+                -192.000_000_000_001_02,
+                210.000_000_000_000_94,
+            ],
+        );
+        let sym_lower =
+            solve(&h3, &b, with(Some(MatrixAssumption::Symmetric), true)).expect("sym, lower");
+        assert_same_bits(
+            &sym_lower.x,
+            &[
+                27.000_000_000_000_227,
+                -192.000_000_000_001_2,
+                210.000_000_000_001_1,
+            ],
+        );
+        let her = solve(&h3, &b, with(Some(MatrixAssumption::Hermitian), false)).expect("her");
+        assert_same_bits(&her.x, &sym.x);
+        // Must-differ arm: the default (Cholesky) answer is a different rounding
+        // (SciPy: 27.000000000000142, ...).
+        let default = solve(&h3, &b, SolveOptions::default()).expect("default");
+        assert_ne!(default.x[0].to_bits(), sym.x[0].to_bits());
+
+        let inverse = inv(
+            &h3,
+            InvOptions {
+                assume_a: Some(MatrixAssumption::Symmetric),
+                lower: true,
+                ..InvOptions::default()
+            },
+        )
+        .expect("inv sym");
+        assert_same_bits(
+            &inverse.inverse.concat(),
+            &[
+                9.000_000_000_000_046,
+                -36.000_000_000_000_24,
+                30.000_000_000_000_227,
+                -36.000_000_000_000_24,
+                192.000_000_000_001_25,
+                -180.000_000_000_001_17,
+                30.000_000_000_000_227,
+                -180.000_000_000_001_17,
+                180.000_000_000_001_08,
+            ],
+        );
+
+        // 'pos' on an indefinite matrix: SciPy raises "A singular matrix detected" for both,
+        // where the default (LDLᵀ) solves it. Strict `solve` refuses it one step earlier: the
+        // policy controller fails closed on a declared structure the matrix does not have
+        // (metadata incompatibility 1.0), before any factorization. `inv` has no policy gate,
+        // so there the Cholesky-only route's breakdown is the error, as in SciPy.
+        let indefinite = vec![vec![1.0, 2.0], vec![2.0, 1.0]];
+        let pos = with(Some(MatrixAssumption::PositiveDefinite), false);
+        let refused = solve(&indefinite, &[1.0, 1.0], pos);
+        assert!(
+            matches!(
+                &refused,
+                Err(LinalgError::PolicyRejected { reason }) if reason.contains("IncompatibleMetadata")
+            ),
+            "'pos' on an indefinite matrix must be refused: {refused:?}"
+        );
+        assert_eq!(
+            inv(
+                &indefinite,
+                InvOptions {
+                    assume_a: Some(MatrixAssumption::PositiveDefinite),
+                    ..InvOptions::default()
+                }
+            )
+            .map(|r| r.inverse),
+            Err(LinalgError::SingularMatrix)
+        );
+        assert!(solve(&indefinite, &[1.0, 1.0], SolveOptions::default()).is_ok());
+
+        // An exactly singular D: SciPy raises for None and 'sym' alike, rather than trying LU.
+        let singular = vec![
+            vec![1.0, 2.0, 0.0],
+            vec![2.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0],
+        ];
+        for assume_a in [None, Some(MatrixAssumption::Symmetric)] {
+            assert_eq!(
+                solve(&singular, &[1.0, 1.0, 1.0], with(assume_a, false)),
+                Err(LinalgError::SingularMatrix)
+            );
+            assert_eq!(
+                inv(
+                    &singular,
+                    InvOptions {
+                        assume_a,
+                        ..InvOptions::default()
+                    }
+                )
+                .map(|r| r.inverse),
+                Err(LinalgError::SingularMatrix)
+            );
+        }
+    }
+
+    /// frankenscipy-7tb8d.15: SciPy divides a detected diagonal by multiplying with `1/d`, which
+    /// differs from `b / d` (3·(1/10) = 0.30000000000000004), inverts a diagonal as `1/d` and a
+    /// triangle with `trtri`, and does so at every size; the large-n fast paths used to send
+    /// both to blocked LU.
+    #[test]
+    fn strict_diagonal_and_triangular_follow_scipy_at_every_size() {
+        let diagonal = vec![vec![10.0, 0.0], vec![0.0, 3.0]];
+        let x = solve(&diagonal, &[3.0, 2.0], SolveOptions::default()).expect("diag solve");
+        assert_same_bits(&x.x, &[0.300_000_000_000_000_04, 0.666_666_666_666_666_6]);
+        // Must-differ arm: 'gen' is LU, which divides (SciPy: 0.3).
+        let general = solve(
+            &diagonal,
+            &[3.0, 2.0],
+            SolveOptions {
+                assume_a: Some(MatrixAssumption::General),
+                ..SolveOptions::default()
+            },
+        )
+        .expect("gen solve");
+        assert_eq!(general.x[0], 0.3);
+        let inverse = inv(&diagonal, InvOptions::default()).expect("diag inv");
+        assert_same_bits(
+            &inverse.inverse.concat(),
+            &[0.1, 0.0, 0.0, 0.333_333_333_333_333_3],
+        );
+
+        // trtri, both triangles (SciPy's upper and lower differ in the last digit of one entry).
+        let upper = vec![
+            vec![3.0, 1.0, 2.0],
+            vec![0.0, 7.0, 5.0],
+            vec![0.0, 0.0, 9.0],
+        ];
+        let lower = transpose(&upper);
+        let inverse = inv(&upper, InvOptions::default()).expect("upper inv");
+        assert_eq!(
+            inverse.certificate.expect("certificate").action,
+            SolverAction::TriangularFastPath
+        );
+        assert_same_bits(
+            &inverse.inverse.concat(),
+            &[
+                0.333_333_333_333_333_3,
+                -0.047_619_047_619_047_616,
+                -0.047_619_047_619_047_616,
+                0.0,
+                0.142_857_142_857_142_85,
+                -0.079_365_079_365_079_35,
+                0.0,
+                0.0,
+                0.111_111_111_111_111_1,
+            ],
+        );
+        let inverse = inv(&lower, InvOptions::default()).expect("lower inv");
+        assert_same_bits(
+            &inverse.inverse.concat(),
+            &[
+                0.333_333_333_333_333_3,
+                0.0,
+                0.0,
+                -0.047_619_047_619_047_616,
+                0.142_857_142_857_142_85,
+                0.0,
+                -0.047_619_047_619_047_616,
+                -0.079_365_079_365_079_36,
+                0.111_111_111_111_111_1,
+            ],
+        );
+
+        // Above the fast-path gates: the structural paths, not blocked LU.
+        let n = solve_flat_min();
+        let big_diagonal: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..n).map(|j| if i == j { 10.0 } else { 0.0 }).collect())
+            .collect();
+        let result = solve(&big_diagonal, &vec![3.0; n], SolveOptions::default()).expect("solve");
+        assert_eq!(
+            result.certificate.expect("certificate").action,
+            SolverAction::DiagonalFastPath
+        );
+        assert!(result.x.iter().all(|x| *x == 0.300_000_000_000_000_04));
+        let big_upper: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| match j.cmp(&i) {
+                        std::cmp::Ordering::Less => 0.0,
+                        std::cmp::Ordering::Equal => 4.0,
+                        std::cmp::Ordering::Greater => 1.0 / (j - i) as f64,
+                    })
+                    .collect()
+            })
+            .collect();
+        let result = solve(&big_upper, &vec![1.0; n], SolveOptions::default()).expect("solve");
+        assert_eq!(
+            result.certificate.expect("certificate").action,
+            SolverAction::TriangularFastPath
+        );
+        let n = inv_flat_min();
+        let big_diagonal: Vec<Vec<f64>> = (0..n)
+            .map(|i| (0..n).map(|j| if i == j { 10.0 } else { 0.0 }).collect())
+            .collect();
+        let inverse = inv(&big_diagonal, InvOptions::default()).expect("inv");
+        assert_eq!(
+            inverse.certificate.expect("certificate").action,
+            SolverAction::DiagonalFastPath
+        );
+        assert!((0..n).all(|i| inverse.inverse[i][i] == 0.1));
+    }
+
+    /// frankenscipy-7tb8d.15: SciPy's structure detection is exact, so one tiny entry below
+    /// the diagonal makes a triangular matrix general (it used to count as triangular up to
+    /// 64·eps·max|a|).
+    #[test]
+    fn structure_detection_is_exact() {
+        let mut a = vec![
+            vec![4.0, -2.0, 1.0],
+            vec![0.0, 3.0, 5.0],
+            vec![0.0, 0.0, 2.0],
+        ];
+        let report = condition_diagnostics(&a).expect("triangular");
+        assert_eq!(report.structural_evidence, StructuralEvidence::Triangular);
+        a[2][0] = 1e-300;
+        let report = condition_diagnostics(&a).expect("general");
+        assert_eq!(report.structural_evidence, StructuralEvidence::General);
+        assert!(!report.upper_triangular);
+        let certificate = solve(&a, &[1.0, 2.0, 3.0], SolveOptions::default())
+            .expect("solve")
+            .certificate
+            .expect("certificate");
+        assert_eq!(certificate.action, SolverAction::DirectLU);
     }
 
     #[test]
