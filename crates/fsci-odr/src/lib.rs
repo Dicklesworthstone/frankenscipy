@@ -17,10 +17,19 @@ use std::sync::Arc;
 /// Callable shape used by `Model`: `f(beta, x) -> y`.
 pub type ModelFn = Arc<dyn Fn(&[f64], &[f64]) -> Vec<f64> + Send + Sync + 'static>;
 
-/// Optional Jacobian callback shape. Rows correspond to observations.
+/// Analytic Jacobian callback, called as `jac(beta, x + delta)` with one ROW PER OBSERVATION.
+///
+/// * `fjacb` returns `∂f_i/∂β_j`: `n_obs × len(beta)`.
+/// * `fjacd` returns `∂f_i/∂x` for observation `i`'s OWN inputs: `n_obs × m`, where the `m =
+///   len(x)/n_obs` inputs of observation `i` are `x[i·m .. (i+1)·m]`. That is ODRPACK's model:
+///   `f_i` depends on no other observation's input.
+///
+/// SciPy's `fjacb`/`fjacd` return the transposes, shapes `(p, n)` and `(m, n)`. When a model
+/// supplies one, the fit uses it in place of finite differences.
 pub type JacobianFn = Arc<dyn Fn(&[f64], &[f64]) -> Vec<Vec<f64>> + Send + Sync + 'static>;
 
-/// Optional parameter-estimate callback.
+/// Parameter-estimate callback: `estimate(data) -> beta0`, used by
+/// [`ODR::from_model_estimate`] when no `beta0` is given (SciPy's `ODR(data, model)`).
 pub type EstimateFn = Arc<dyn Fn(&Data) -> Vec<f64> + Send + Sync + 'static>;
 
 /// Warning marker matching SciPy's `OdrWarning` symbol.
@@ -362,6 +371,18 @@ impl ODR {
         })
     }
 
+    /// `scipy.odr.ODR(data, model)` without `beta0`: the starting parameters come from the
+    /// model's `estimate(data)`. Fails, as SciPy does, when the model has no estimator.
+    pub fn from_model_estimate(data: Data, model: Model) -> Result<Self, OdrError> {
+        let Some(estimate) = model.estimate.clone() else {
+            return Err(OdrError::InvalidArgument {
+                detail: String::from("must specify beta0 or provide an estimator with the model"),
+            });
+        };
+        let beta0 = estimate(&data);
+        Self::new(data, model, beta0)
+    }
+
     pub fn with_options(mut self, options: OdrOptions) -> Result<Self, OdrError> {
         validate_options(options)?;
         self.options = options;
@@ -525,7 +546,12 @@ impl ODR {
                 cov: CovSource::Struct(sr.jac),
             }
         } else {
-            let lr = solve_least_squares(&residuals, &variable0, self.options)?;
+            let lr = solve_least_squares(
+                &residuals,
+                |x: &[f64], r: &[f64]| ctx.dense_jac(&residuals, x, r),
+                &variable0,
+                self.options,
+            )?;
             SolvedFit {
                 x: lr.x,
                 cost: lr.cost,
@@ -672,21 +698,58 @@ pub fn public_api_symbols() -> &'static [&'static str] {
     ]
 }
 
+// The standard models below are `scipy.odr.models`: the same function, parameter order,
+// analytic `fjacb`/`fjacd` and `estimate` (all ones: ODRPACK's scaling dislikes zeros).
+
+/// `scipy.odr.unilinear`: `y = β0·x + β1`.
 pub fn unilinear() -> Model {
     Model::new(|beta, x| {
         let slope = beta.first().copied().unwrap_or(0.0);
         let intercept = beta.get(1).copied().unwrap_or(0.0);
         x.iter().map(|value| slope * value + intercept).collect()
     })
+    .with_fjacb(|_beta, x| x.iter().map(|&value| vec![value, 1.0]).collect())
+    .with_fjacd(|beta, x| {
+        let slope = beta.first().copied().unwrap_or(0.0);
+        x.iter().map(|_| vec![slope]).collect()
+    })
+    .with_estimate(|_data| vec![1.0, 1.0])
     .with_name("unilinear")
     .with_parameter_count(2)
     .with_scalar_separable(true)
 }
 
+/// `scipy.odr.quadratic`: `y = β0·x² + β1·x + β2` -- HIGHEST degree first, unlike
+/// [`polynomial`]. This used to be `polynomial(2)` (lowest degree first), so a SciPy `beta0`
+/// fitted a different model.
 pub fn quadratic() -> Model {
-    polynomial(2).with_name("quadratic")
+    Model::new(|beta, x| {
+        let (a, b, c) = (
+            beta.first().copied().unwrap_or(0.0),
+            beta.get(1).copied().unwrap_or(0.0),
+            beta.get(2).copied().unwrap_or(0.0),
+        );
+        x.iter().map(|&value| value * (value * a + b) + c).collect()
+    })
+    .with_fjacb(|_beta, x| {
+        x.iter()
+            .map(|&value| vec![value * value, value, 1.0])
+            .collect()
+    })
+    .with_fjacd(|beta, x| {
+        let (a, b) = (
+            beta.first().copied().unwrap_or(0.0),
+            beta.get(1).copied().unwrap_or(0.0),
+        );
+        x.iter().map(|&value| vec![2.0 * value * a + b]).collect()
+    })
+    .with_estimate(|_data| vec![1.0, 1.0, 1.0])
+    .with_name("quadratic")
+    .with_parameter_count(3)
+    .with_scalar_separable(true)
 }
 
+/// `scipy.odr.polynomial(order)`: `y = β0 + β1·x + … + β_order·x^order` (lowest degree first).
 pub fn polynomial(order: usize) -> Model {
     Model::new(move |beta, x| {
         x.iter()
@@ -698,25 +761,67 @@ pub fn polynomial(order: usize) -> Model {
             })
             .collect()
     })
+    .with_fjacb(move |_beta, x| {
+        x.iter()
+            .map(|&value| {
+                let mut power = 1.0;
+                (0..=order)
+                    .map(|_| {
+                        let term = power;
+                        power *= value;
+                        term
+                    })
+                    .collect()
+            })
+            .collect()
+    })
+    .with_fjacd(move |beta, x| {
+        x.iter()
+            .map(|&value| {
+                // Σ k·β_k·x^(k−1), by Horner on the derivative's coefficients.
+                let derivative = (1..=order).rev().fold(0.0, |acc, k| {
+                    acc * value + k as f64 * beta.get(k).copied().unwrap_or(0.0)
+                });
+                vec![derivative]
+            })
+            .collect()
+    })
+    .with_estimate(move |_data| vec![1.0; order + 1])
     .with_name(format!("polynomial({order})"))
     .with_parameter_count(order + 1)
     .with_scalar_separable(true)
 }
 
+/// `scipy.odr.exponential`: `y = β0 + exp(β1·x)`. This used to be a three-parameter
+/// `β0·exp(β1·x) + β2`, so a SciPy `beta0` did not even have the right length.
 pub fn exponential() -> Model {
     Model::new(|beta, x| {
-        let amplitude = beta.first().copied().unwrap_or(1.0);
-        let rate = beta.get(1).copied().unwrap_or(1.0);
-        let offset = beta.get(2).copied().unwrap_or(0.0);
+        let offset = beta.first().copied().unwrap_or(0.0);
+        let rate = beta.get(1).copied().unwrap_or(0.0);
         x.iter()
-            .map(|value| amplitude * (rate * value).exp() + offset)
+            .map(|&value| offset + (rate * value).exp())
             .collect()
     })
+    .with_fjacb(|beta, x| {
+        let rate = beta.get(1).copied().unwrap_or(0.0);
+        x.iter()
+            .map(|&value| vec![1.0, value * (rate * value).exp()])
+            .collect()
+    })
+    .with_fjacd(|beta, x| {
+        let rate = beta.get(1).copied().unwrap_or(0.0);
+        x.iter()
+            .map(|&value| vec![rate * (rate * value).exp()])
+            .collect()
+    })
+    .with_estimate(|_data| vec![1.0, 1.0])
     .with_name("exponential")
-    .with_parameter_count(3)
+    .with_parameter_count(2)
     .with_scalar_separable(true)
 }
 
+/// `scipy.odr.multilinear` with `input_dim` inputs per observation, laid out contiguously in
+/// `x` (`x[i·input_dim + k]` is input `k` of observation `i`): `y_i = β0 + Σ_k β_{k+1}·x_ik`.
 pub fn multilinear(input_dim: usize) -> Model {
     Model::new(move |beta, x| {
         if input_dim == 0 {
@@ -732,6 +837,24 @@ pub fn multilinear(input_dim: usize) -> Model {
             })
             .collect()
     })
+    .with_fjacb(move |_beta, x| {
+        if input_dim == 0 {
+            return Vec::new();
+        }
+        x.chunks_exact(input_dim)
+            .map(|row| std::iter::once(1.0).chain(row.iter().copied()).collect())
+            .collect()
+    })
+    .with_fjacd(move |beta, x| {
+        if input_dim == 0 {
+            return Vec::new();
+        }
+        let slopes: Vec<f64> = (1..=input_dim)
+            .map(|k| beta.get(k).copied().unwrap_or(0.0))
+            .collect();
+        x.chunks_exact(input_dim).map(|_| slopes.clone()).collect()
+    })
+    .with_estimate(move |_data| vec![1.0; input_dim + 1])
     .with_name(format!("multilinear({input_dim})"))
     .with_parameter_count(input_dim + 1)
     .with_scalar_separable(true)
@@ -946,13 +1069,17 @@ struct LocalLeastSquaresResult {
     jac: Vec<Vec<f64>>,
 }
 
-fn solve_least_squares<F>(
+/// Dense Levenberg–Marquardt on `residuals`. `jacobian(x, r)` returns the residual Jacobian at
+/// `x` (base residual `r`) and the number of residual evaluations it spent.
+fn solve_least_squares<F, J>(
     residuals: F,
+    jacobian: J,
     x0: &[f64],
     options: OdrOptions,
 ) -> Result<LocalLeastSquaresResult, OdrError>
 where
     F: Fn(&[f64]) -> Vec<f64>,
+    J: Fn(&[f64], &[f64]) -> Result<(Vec<Vec<f64>>, usize), OdrError>,
 {
     if x0.is_empty() {
         return Err(OdrError::InvalidArgument {
@@ -974,15 +1101,16 @@ where
     validate_finite_slice("initial residuals", &r)?;
     let mut cost = 0.5 * dot(&r, &r);
     let mut damping = 1.0e-3;
-    let mut jac = finite_diff_jacobian(&residuals, &x, &r, options.diff_step)?;
-    nfev += x.len();
+    let (mut jac, jac_evals) = jacobian(&x, &r)?;
+    nfev += jac_evals;
     let mut njev = 1usize;
     for nit in 0..options.maxit {
         let gradient = jt_residual(&jac, &r);
-        if max_abs(&gradient) <= options.sstol {
+        if gradient_cosine(&gradient, &column_norms(&jac), &r) <= options.sstol {
             return Ok(LocalLeastSquaresResult {
                 x,
                 cost,
+                // status: max_j |cos(r, J_j)| <= sstol (MINPACK's scale-free gtol test)
                 success: true,
                 message: String::from("gradient tolerance reached"),
                 nfev,
@@ -1009,10 +1137,29 @@ where
                 Some((normal, rhs)) => solve_damped_normal(normal, rhs, damping)?,
                 None => solve_lm_step(&jac, &r, damping)?,
             };
-            if max_abs(&step) <= options.partol * (1.0 + max_abs(&x)) {
+            let candidate = x
+                .iter()
+                .zip(step.iter())
+                .map(|(value, delta)| value + delta)
+                .collect::<Vec<_>>();
+            let candidate_r = residuals(&candidate);
+            nfev += 1;
+            if step_within_partol(&step, &x, options.partol) {
+                // Take the converged step, as ODRPACK does (see the structured solver).
+                let candidate_cost = 0.5 * dot(&candidate_r, &candidate_r);
+                if candidate_cost <= cost {
+                    x = candidate;
+                    r = candidate_r;
+                    cost = candidate_cost;
+                    let (new_jac, jac_evals) = jacobian(&x, &r)?;
+                    jac = new_jac;
+                    nfev += jac_evals;
+                    njev += 1;
+                }
                 return Ok(LocalLeastSquaresResult {
                     x,
                     cost,
+                    // status: max|step| <= partol·max|x| (ODRPACK's relative parameter test)
                     success: true,
                     message: String::from("parameter tolerance reached"),
                     nfev,
@@ -1021,25 +1168,19 @@ where
                     jac,
                 });
             }
-            let candidate = x
-                .iter()
-                .zip(step.iter())
-                .map(|(value, delta)| value + delta)
-                .collect::<Vec<_>>();
-            let candidate_r = residuals(&candidate);
-            nfev += 1;
             if candidate_r.iter().any(|value| !value.is_finite()) {
                 damping *= 10.0;
                 continue;
             }
             let candidate_cost = 0.5 * dot(&candidate_r, &candidate_r);
             if candidate_cost < cost {
-                let rel_change = (cost - candidate_cost).abs() / cost.max(1.0);
+                let rel_change = relative_ss_reduction(cost, candidate_cost);
                 x = candidate;
                 r = candidate_r;
                 cost = candidate_cost;
-                jac = finite_diff_jacobian(&residuals, &x, &r, options.diff_step)?;
-                nfev += x.len();
+                let (new_jac, jac_evals) = jacobian(&x, &r)?;
+                jac = new_jac;
+                nfev += jac_evals;
                 njev += 1;
                 damping = (damping * 0.3).max(1.0e-12);
                 accepted = true;
@@ -1047,6 +1188,7 @@ where
                     return Ok(LocalLeastSquaresResult {
                         x,
                         cost,
+                        // status: accepted step with (SS_old - SS_new)/SS_old <= sstol
                         success: true,
                         message: String::from("sum-of-squares tolerance reached"),
                         nfev,
@@ -1141,11 +1283,11 @@ impl OdrStruct<'_> {
         self.free_delta.len()
     }
 
-    /// Structured finite-difference Jacobian at packed variables `x` with base
-    /// residual `r`. The β columns reproduce the dense path bit-for-bit; the δ
-    /// diagonal comes from a single all-δ-perturbed model evaluation (each output
-    /// point depends only on its own input, so the batched value equals the
-    /// one-at-a-time perturbation).
+    /// Structured Jacobian at packed variables `x` with base residual `r`: from the
+    /// model's `fjacb`/`fjacd` when it has them, else by finite differences. The FD β
+    /// columns reproduce the dense path bit-for-bit; the FD δ diagonal comes from a
+    /// single all-δ-perturbed model evaluation (each output point depends only on
+    /// its own input, so the batched value equals the one-at-a-time perturbation).
     fn jac(&self, x: &[f64], r: &[f64]) -> Result<StructJac, OdrError> {
         let (n, p, m) = (self.n(), self.p(), self.m());
         let (beta, delta) = unpack_variables(
@@ -1158,26 +1300,46 @@ impl OdrStruct<'_> {
         let xplus = add_slices(&self.data.x, &delta);
 
         let mut a = vec![vec![0.0; p]; n];
-        for k in 0..p {
-            let h = self.diff_step * x[k].abs().max(1.0);
-            let mut beta_pert = beta.clone();
-            beta_pert[self.free_beta[k]] += h;
-            let pred = self.model.evaluate(&beta_pert, &xplus);
-            if pred.len() != n {
-                return Err(jac_length_error(pred.len(), n));
-            }
-            for i in 0..n {
-                let r_pert = self.data.we[i].sqrt() * (self.y[i] - pred[i]);
-                if !r_pert.is_finite() {
-                    return Err(jac_nonfinite_error());
+        if let Some(fjacb) = &self.model.fjacb {
+            // r_i = √we_i·(y_i − f_i), so ∂r_i/∂β = −√we_i·∂f_i/∂β.
+            let jb = analytic_model_jacobian(fjacb, "fjacb", &beta, &xplus, n, beta.len())?;
+            for (i, row) in a.iter_mut().enumerate() {
+                let scale = -self.data.we[i].sqrt();
+                for (k, value) in row.iter_mut().enumerate() {
+                    *value = scale * jb[i][self.free_beta[k]];
                 }
-                a[i][k] = (r_pert - r[i]) / h;
+            }
+        } else {
+            for k in 0..p {
+                let h = self.diff_step * x[k].abs().max(1.0);
+                let mut beta_pert = beta.clone();
+                beta_pert[self.free_beta[k]] += h;
+                let pred = self.model.evaluate(&beta_pert, &xplus);
+                if pred.len() != n {
+                    return Err(jac_length_error(pred.len(), n));
+                }
+                for i in 0..n {
+                    let r_pert = self.data.we[i].sqrt() * (self.y[i] - pred[i]);
+                    if !r_pert.is_finite() {
+                        return Err(jac_nonfinite_error());
+                    }
+                    a[i][k] = (r_pert - r[i]) / h;
+                }
             }
         }
 
         let mut d_diag = vec![0.0; m];
         let mut b = vec![0.0; m];
-        if m > 0 {
+        if m > 0
+            && let Some(fjacd) = &self.model.fjacd
+        {
+            // The structured path has one input per observation (x.len() == n).
+            let jd = analytic_model_jacobian(fjacd, "fjacd", &beta, &xplus, n, 1)?;
+            for (j, &dj) in self.free_delta.iter().enumerate() {
+                b[j] = self.data.wd[dj].sqrt();
+                d_diag[j] = -self.data.we[dj].sqrt() * jd[dj][0];
+            }
+        } else if m > 0 {
             let mut xpert = xplus.clone();
             let mut hs = vec![0.0; m];
             for (j, &dj) in self.free_delta.iter().enumerate() {
@@ -1201,28 +1363,107 @@ impl OdrStruct<'_> {
         Ok(StructJac { a, d_diag, b })
     }
 
+    /// The full residual Jacobian for the dense solver at packed variables `x` (base residual
+    /// `r`), with the number of residual evaluations it spent. Columns come from the model's
+    /// `fjacb`/`fjacd` where it has them and from finite differences otherwise; with neither
+    /// this is exactly [`finite_diff_jacobian`].
+    fn dense_jac<F>(
+        &self,
+        residuals: &F,
+        x: &[f64],
+        r: &[f64],
+    ) -> Result<(Vec<Vec<f64>>, usize), OdrError>
+    where
+        F: Fn(&[f64]) -> Vec<f64>,
+    {
+        if self.model.fjacb.is_none() && self.model.fjacd.is_none() {
+            return Ok((
+                finite_diff_jacobian(residuals, x, r, self.diff_step)?,
+                x.len(),
+            ));
+        }
+        let (p, m) = (self.p(), self.m());
+        let n_obs = self.y.len();
+        let (beta, delta) = unpack_variables(
+            x,
+            self.beta_template,
+            self.delta_template,
+            self.free_beta,
+            self.free_delta,
+        );
+        let xplus = add_slices(&self.data.x, &delta);
+        let mut jac = vec![vec![0.0; x.len()]; r.len()];
+        let mut evals = 0;
+
+        // Response rows are r_i = √we_i·(y_i − f_i); δ-penalty rows (n_obs + k) are √wd_k·δ_k.
+        if let Some(fjacb) = &self.model.fjacb {
+            let jb = analytic_model_jacobian(fjacb, "fjacb", &beta, &xplus, n_obs, beta.len())?;
+            for (i, row) in jac.iter_mut().take(n_obs).enumerate() {
+                let scale = -self.data.we[i].sqrt();
+                for (k, &beta_index) in self.free_beta.iter().enumerate() {
+                    row[k] = scale * jb[i][beta_index];
+                }
+            }
+        } else {
+            finite_diff_columns(residuals, x, r, self.diff_step, 0..p, &mut jac)?;
+            evals += p;
+        }
+        if let Some(fjacd) = &self.model.fjacd {
+            let inputs = self.data.x.len();
+            if !inputs.is_multiple_of(n_obs) {
+                return Err(OdrError::InvalidArgument {
+                    detail: format!(
+                        "fjacd needs the same number of inputs per observation ({inputs} inputs, {n_obs} observations)"
+                    ),
+                });
+            }
+            let per_obs = inputs / n_obs;
+            let jd = analytic_model_jacobian(fjacd, "fjacd", &beta, &xplus, n_obs, per_obs)?;
+            for (j, &dj) in self.free_delta.iter().enumerate() {
+                let (obs, input) = (dj / per_obs, dj % per_obs);
+                jac[obs][p + j] = -self.data.we[obs].sqrt() * jd[obs][input];
+                jac[n_obs + dj][p + j] = self.data.wd[dj].sqrt();
+            }
+        } else {
+            finite_diff_columns(residuals, x, r, self.diff_step, p..p + m, &mut jac)?;
+            evals += m;
+        }
+        Ok((jac, evals))
+    }
+
     /// Number of model evaluations the structured Jacobian consumes: one full
-    /// evaluation per free β column, plus one batched evaluation for all δ.
+    /// evaluation per free β column, plus one batched evaluation for all δ, each
+    /// skipped when the model supplies that Jacobian analytically.
     fn jac_evals(&self) -> usize {
-        self.p() + usize::from(self.m() > 0)
+        let beta_evals = if self.model.fjacb.is_some() {
+            0
+        } else {
+            self.p()
+        };
+        beta_evals + usize::from(self.m() > 0 && self.model.fjacd.is_none())
     }
 
     /// `max_abs(Jᵀr)`, matching the dense gradient-tolerance convergence test.
-    fn gradient_maxabs(&self, sj: &StructJac, r: &[f64]) -> f64 {
+    /// The structured form of [`gradient_cosine`]: β column k holds `a[·][k]` on the response
+    /// rows; free-δ column j holds `d_diag[j]` (response row) and `b[j]` (its δ row).
+    fn gradient_cosine(&self, sj: &StructJac, r: &[f64]) -> f64 {
         let (n, p) = (self.n(), self.p());
-        let mut worst = 0.0_f64;
+        let mut gradient = Vec::with_capacity(p + self.free_delta.len());
+        let mut norms = Vec::with_capacity(p + self.free_delta.len());
         for k in 0..p {
-            let mut g = 0.0;
-            for (i, &ri) in r.iter().take(n).enumerate() {
-                g += sj.a[i][k] * ri;
+            let (mut g, mut sq) = (0.0, 0.0);
+            for (row, &ri) in sj.a.iter().zip(r).take(n) {
+                g += row[k] * ri;
+                sq += row[k] * row[k];
             }
-            worst = worst.max(g.abs());
+            gradient.push(g);
+            norms.push(sq.sqrt());
         }
         for (j, &dj) in self.free_delta.iter().enumerate() {
-            let g = sj.d_diag[j] * r[dj] + sj.b[j] * r[n + dj];
-            worst = worst.max(g.abs());
+            gradient.push(sj.d_diag[j] * r[dj] + sj.b[j] * r[n + dj]);
+            norms.push(sj.d_diag[j].hypot(sj.b[j]));
         }
-        worst
+        gradient_cosine(&gradient, &norms, r)
     }
 
     /// LM step `(JᵀJ + μI) s = -Jᵀr` solved by eliminating the diagonal δ block:
@@ -1350,6 +1591,32 @@ impl OdrStruct<'_> {
     }
 }
 
+/// Evaluates a model's analytic Jacobian at `(beta, xplus)` and checks that it is `rows × cols`
+/// and finite.
+fn analytic_model_jacobian(
+    jacobian: &JacobianFn,
+    name: &str,
+    beta: &[f64],
+    xplus: &[f64],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<Vec<f64>>, OdrError> {
+    let value = jacobian(beta, xplus);
+    if value.len() != rows || value.iter().any(|row| row.len() != cols) {
+        return Err(OdrError::InvalidArgument {
+            detail: format!(
+                "{name} must return {rows} rows (one per observation) of {cols} entries"
+            ),
+        });
+    }
+    if value.iter().flatten().any(|entry| !entry.is_finite()) {
+        return Err(OdrError::NonFiniteInput {
+            detail: format!("{name} returned a non-finite entry"),
+        });
+    }
+    Ok(value)
+}
+
 fn jac_length_error(got: usize, expected: usize) -> OdrError {
     OdrError::InvalidArgument {
         detail: format!(
@@ -1401,10 +1668,11 @@ where
     nfev += ctx.jac_evals();
     let mut njev = 1usize;
     for nit in 0..options.maxit {
-        if ctx.gradient_maxabs(&jac, &r) <= options.sstol {
+        if ctx.gradient_cosine(&jac, &r) <= options.sstol {
             return Ok(StructResult {
                 x,
                 cost,
+                // status: max_j |cos(r, J_j)| <= sstol (structured MINPACK gtol test)
                 success: true,
                 message: String::from("gradient tolerance reached"),
                 nfev,
@@ -1421,10 +1689,31 @@ where
                 .ok_or_else(|| OdrError::SolverFailure {
                     detail: String::from("normal equations are singular"),
                 })?;
-            if max_abs(&step) <= options.partol * (1.0 + max_abs(&x)) {
+            let candidate = x
+                .iter()
+                .zip(step.iter())
+                .map(|(value, delta)| value + delta)
+                .collect::<Vec<_>>();
+            let candidate_r = residuals(&candidate);
+            nfev += 1;
+            if step_within_partol(&step, &x, options.partol) {
+                // ODRPACK tests parameter convergence on the step it has just TAKEN, so the
+                // returned β includes it. Stopping before it left the fit one Gauss–Newton
+                // step short: 3 − 5.3e-6 on exact data where SciPy returns 3.0
+                // (frankenscipy-szq1n.12).
+                let candidate_cost = 0.5 * dot(&candidate_r, &candidate_r);
+                if candidate_cost <= cost {
+                    x = candidate;
+                    r = candidate_r;
+                    cost = candidate_cost;
+                    jac = ctx.jac(&x, &r)?;
+                    nfev += ctx.jac_evals();
+                    njev += 1;
+                }
                 return Ok(StructResult {
                     x,
                     cost,
+                    // status: max|step| <= partol·max|x| (ODRPACK's relative parameter test)
                     success: true,
                     message: String::from("parameter tolerance reached"),
                     nfev,
@@ -1433,20 +1722,13 @@ where
                     jac,
                 });
             }
-            let candidate = x
-                .iter()
-                .zip(step.iter())
-                .map(|(value, delta)| value + delta)
-                .collect::<Vec<_>>();
-            let candidate_r = residuals(&candidate);
-            nfev += 1;
             if candidate_r.iter().any(|value| !value.is_finite()) {
                 damping *= 10.0;
                 continue;
             }
             let candidate_cost = 0.5 * dot(&candidate_r, &candidate_r);
             if candidate_cost < cost {
-                let rel_change = (cost - candidate_cost).abs() / cost.max(1.0);
+                let rel_change = relative_ss_reduction(cost, candidate_cost);
                 x = candidate;
                 r = candidate_r;
                 cost = candidate_cost;
@@ -1459,6 +1741,7 @@ where
                     return Ok(StructResult {
                         x,
                         cost,
+                        // status: accepted step with (SS_old - SS_new)/SS_old <= sstol
                         success: true,
                         message: String::from("sum-of-squares tolerance reached"),
                         nfev,
@@ -1515,7 +1798,23 @@ where
     F: Fn(&[f64]) -> Vec<f64>,
 {
     let mut jac = vec![vec![0.0; x.len()]; r0.len()];
-    for col in 0..x.len() {
+    finite_diff_columns(residuals, x, r0, step, 0..x.len(), &mut jac)?;
+    Ok(jac)
+}
+
+/// Forward-difference columns `cols` of the residual Jacobian into `jac`.
+fn finite_diff_columns<F>(
+    residuals: &F,
+    x: &[f64],
+    r0: &[f64],
+    step: f64,
+    cols: std::ops::Range<usize>,
+    jac: &mut [Vec<f64>],
+) -> Result<(), OdrError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    for col in cols {
         let mut x_plus = x.to_vec();
         let h = step * x[col].abs().max(1.0);
         x_plus[col] += h;
@@ -1534,7 +1833,7 @@ where
             jac[row][col] = (r_plus[row] - r0[row]) / h;
         }
     }
-    Ok(jac)
+    Ok(())
 }
 
 /// When `true`, [`solve_lm_step`] builds its `JᵀJ` normal matrix and `Jᵀr` vector serially (the ORIG
@@ -1695,6 +1994,50 @@ fn gaussian_solve(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Option<Vec<f6
         }
     }
     Some(rhs)
+}
+
+// Convergence tests (frankenscipy-szq1n.7). All three used to be ABSOLUTE, so the verdict
+// depended on the units of the data: `max|Jᵀr| <= sstol` reported success at nit = 0 with β0
+// unchanged for small-magnitude data, `|step| <= partol*(1 + |x|)` put a floor of about 6e-6 on
+// the step so parameters near 1e-7 "converged" at once, and the SS change divided by
+// max(cost, 1) was absolute whenever cost < 1. Each is now invariant to rescaling the data.
+
+/// MINPACK's scale-free `gtol` measure: the largest `|cos|` of the angle between the residual
+/// and a Jacobian column, `max_j |(Jᵀr)_j| / (‖r‖·‖J_j‖)`. Zero-norm columns are skipped; an
+/// exact fit (`r = 0`) is optimal.
+fn gradient_cosine(gradient: &[f64], column_norms: &[f64], residuals: &[f64]) -> f64 {
+    let r_norm = dot(residuals, residuals).sqrt();
+    if r_norm == 0.0 {
+        return 0.0;
+    }
+    gradient
+        .iter()
+        .zip(column_norms)
+        .filter(|&(_, &norm)| norm > 0.0)
+        .map(|(&g, &norm)| g.abs() / (r_norm * norm))
+        .fold(0.0_f64, f64::max)
+}
+
+fn column_norms(jacobian: &[Vec<f64>]) -> Vec<f64> {
+    let n = jacobian.first().map_or(0, Vec::len);
+    let mut sq = vec![0.0; n];
+    for row in jacobian {
+        for (acc, &value) in sq.iter_mut().zip(row) {
+            *acc += value * value;
+        }
+    }
+    sq.into_iter().map(f64::sqrt).collect()
+}
+
+/// ODRPACK's relative parameter-change test, `‖step‖ <= partol·‖x‖` (no additive floor).
+fn step_within_partol(step: &[f64], x: &[f64], partol: f64) -> bool {
+    max_abs(step) <= partol * max_abs(x)
+}
+
+/// ODRPACK's relative sum-of-squares reduction, `(SS_old - SS_new) / SS_old`; only called
+/// for an accepted step, so `old > new >= 0`.
+fn relative_ss_reduction(old: f64, new: f64) -> f64 {
+    (old - new) / old
 }
 
 fn jt_residual(jacobian: &[Vec<f64>], residuals: &[f64]) -> Vec<f64> {
@@ -1915,6 +2258,44 @@ mod tests {
         Ok(())
     }
 
+    // frankenscipy-szq1n.7: the tolerance tests were absolute. With every parameter near 1e-7,
+    // the first LM step (~1e-7) fell under `partol*(1 + |x|)` ~ 6e-6 and the solver reported
+    // "parameter tolerance reached" at beta0 = [0, 0] without moving. SciPy 1.17.1:
+    // odr(unilinear, beta0=[0,0]) on y = 2e-7 x + 1e-7 -> beta = [2e-7, 1e-7], info 2.
+    #[test]
+    fn odr_convergence_tests_are_invariant_to_data_scale() -> Result<(), OdrError> {
+        let x = vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+        let y = x.iter().map(|value| 2.0e-7 * value + 1.0e-7).collect();
+        let output = ODR::new(Data::new(x, y)?, unilinear(), vec![0.0, 0.0])?.run()?;
+        println!(
+            "small-scale ODR: beta={:?} nit={} success={} stop={:?}",
+            output.beta, output.nit, output.success, output.stopreason
+        );
+        assert!(output.success);
+        assert!(output.nit > 0, "stopped before taking a step");
+        assert_close(output.beta[0], 2.0e-7, 1.0e-12);
+        assert_close(output.beta[1], 1.0e-7, 1.0e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn odr_convergence_measures_are_scale_free() {
+        // cos(r, J_j): scaling J or r leaves it unchanged; an exact fit is optimal.
+        let g = [3.0, 0.0];
+        let norms = [2.0, 5.0];
+        let r = [1.0, 1.0];
+        let c = gradient_cosine(&g, &norms, &r);
+        let scaled = gradient_cosine(&[3.0e-9, 0.0], &[2.0e-9, 5.0e-9], &r);
+        assert!((c - scaled).abs() < 1e-15 && c > 0.0);
+        assert_eq!(gradient_cosine(&g, &norms, &[0.0, 0.0]), 0.0);
+        assert!(step_within_partol(&[1e-13], &[1e-7], 1e-5));
+        assert!(
+            !step_within_partol(&[1e-9], &[1e-7], 1e-5),
+            "the old +1 floor accepted this"
+        );
+        assert!((relative_ss_reduction(1e-10, 0.5e-10) - 0.5).abs() < 1e-15);
+    }
+
     #[test]
     fn odr_matches_scipy_odr_on_noisy_data() -> Result<(), OdrError> {
         // Golden values from scipy.odr.ODR(Data(x,y), unilinear, beta0).run()
@@ -2067,11 +2448,23 @@ mod tests {
     #[test]
     fn polynomial_model_recovers_quadratic_coefficients() -> Result<(), OdrError> {
         let x = vec![-2.0, -1.0, 0.0, 1.0, 2.0];
-        let y = x
+        let y: Vec<f64> = x
             .iter()
             .map(|value| 1.0 - 2.0 * value + 0.5 * value * value)
             .collect();
-        let mut odr = ODR::new(Data::new(x, y)?, quadratic(), vec![0.0, 0.0, 0.0])?;
+        // `quadratic` is SciPy's: highest degree first. SciPy 1.17.1 OLS: [0.5, -2.0, 1.0].
+        let mut odr = ODR::new(
+            Data::new(x.clone(), y.clone())?,
+            quadratic(),
+            vec![0.0, 0.0, 0.0],
+        )?;
+        odr.set_job(FitType::Ols);
+        let output = odr.run()?;
+        assert_close(output.beta[0], 0.5, 1.0e-6);
+        assert_close(output.beta[1], -2.0, 1.0e-6);
+        assert_close(output.beta[2], 1.0, 1.0e-6);
+        // `polynomial(2)` is lowest degree first.
+        let mut odr = ODR::new(Data::new(x, y)?, polynomial(2), vec![0.0, 0.0, 0.0])?;
         odr.set_job(FitType::Ols);
         let output = odr.run()?;
         assert_close(output.beta[0], 1.0, 1.0e-6);
@@ -2118,24 +2511,27 @@ mod tests {
         let data = Data::new(x, y)?;
         let odr = ODR::new(data, unilinear(), vec![1.0, 0.0])?;
         let output = odr.run()?;
-        // scipy reference: beta = [2.00192, 0.01424]
-        assert_close(output.beta[0], 2.00192, 0.01);
-        assert_close(output.beta[1], 0.01424, 0.1);
+        // scipy.odr 1.17.1, same data and beta0: [2.00192013931748, 0.014239795736218601].
+        assert_close(output.beta[0], 2.001_920_139_317_48, 1.0e-6);
+        assert_close(output.beta[1], 0.014_239_795_736_218_601, 1.0e-5);
         Ok(())
     }
 
     #[test]
     fn odr_quadratic_matches_scipy_reference_values() -> Result<(), OdrError> {
-        // scipy.odr with quadratic model on y = x^2 + noise
-        // Polynomial params are [c, b, a] for ax^2 + bx + c (Horner form)
+        // scipy.odr 1.17.1: ODR(Data(x, y), quadratic, beta0=[1, 0, 0]).run().beta. SciPy's
+        // quadratic is β0·x² + β1·x + β2.
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0];
         let y = vec![1.1, 4.0, 9.1, 15.9, 25.0];
         let data = Data::new(x, y)?;
-        // Initial guess: c=0, b=0, a=1
-        let odr = ODR::new(data, quadratic(), vec![0.0, 0.0, 1.0])?;
+        let odr = ODR::new(data, quadratic(), vec![1.0, 0.0, 0.0])?;
         let output = odr.run()?;
-        // Expect quadratic coeff (beta[2]) ≈ 1
-        assert_close(output.beta[2], 1.0, 0.1);
+        let scipy = [
+            1.009_873_295_116_383_1,
+            -0.087_567_362_326_858_98,
+            0.174_187_411_993_578_4,
+        ];
+        assert_vec_close(&output.beta, &scipy, 1.0e-6);
         Ok(())
     }
 
@@ -2158,18 +2554,105 @@ mod tests {
 
     #[test]
     fn odr_exponential_matches_scipy_reference_values() -> Result<(), OdrError> {
-        // scipy.odr with exponential model y = a * exp(b * x) + c
-        // Test data: y = 2 * exp(0.5 * x) + 0
+        // scipy.odr's exponential is y = β0 + exp(β1·x) (two parameters). SciPy 1.17.1 on
+        // y = 3 + exp(0.5x) from beta0 = [1, 1] -- and from the model's own estimate -- returns
+        // [3.0, 0.5] to rounding.
         let x: Vec<f64> = vec![0.0, 1.0, 2.0, 3.0, 4.0];
-        let y: Vec<f64> = x.iter().map(|&xi| 2.0 * (0.5_f64 * xi).exp()).collect();
-        let data = Data::new(x, y)?;
-        // Initial guess: amplitude=1, rate=1, offset=0
-        let odr = ODR::new(data, exponential(), vec![1.0, 1.0, 0.0])?;
-        let output = odr.run()?;
-        // Should fit: beta[0]=amplitude≈2, beta[1]=rate≈0.5, beta[2]=offset≈0
-        assert_close(output.beta[0], 2.0, 0.5);
-        assert_close(output.beta[1], 0.5, 0.3);
-        assert!(output.beta[2].abs() < 0.5, "offset should be near 0");
+        let y: Vec<f64> = x.iter().map(|&xi| 3.0 + (0.5_f64 * xi).exp()).collect();
+        let output = ODR::new(
+            Data::new(x.clone(), y.clone())?,
+            exponential(),
+            vec![1.0, 1.0],
+        )?
+        .run()?;
+        assert_vec_close(&output.beta, &[3.0, 0.5], 1.0e-8);
+        let estimated = ODR::from_model_estimate(Data::new(x, y)?, exponential())?;
+        assert_eq!(estimated.beta0, vec![1.0, 1.0]);
+        assert_vec_close(&estimated.run()?.beta, &[3.0, 0.5], 1.0e-8);
+        Ok(())
+    }
+
+    /// frankenscipy-szq1n.12: `fjacb`, `fjacd` and `estimate` were stored and never read, so
+    /// every fit ran on finite differences whatever the model supplied. SciPy 1.17.1 fits this
+    /// model and data to β = [2.4988338487313224, 1.3001941322482524] with or without the
+    /// analytic Jacobians.
+    #[test]
+    fn analytic_jacobians_are_used_on_both_solver_paths() -> Result<(), OdrError> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let x: Vec<f64> = (0..12).map(|i| 0.1 + 2.9 * f64::from(i) / 11.0).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|&v| 2.5 * (1.3 * v).sin() + 0.01 * (7.0 * v).cos())
+            .collect();
+        let scipy = [2.498_833_848_731_322_4, 1.300_194_132_248_252_4];
+        let fcn = |beta: &[f64], x: &[f64]| -> Vec<f64> {
+            x.iter().map(|&v| beta[0] * (beta[1] * v).sin()).collect()
+        };
+        let calls = Arc::new((AtomicUsize::new(0), AtomicUsize::new(0)));
+        let (cb, cd) = (Arc::clone(&calls), Arc::clone(&calls));
+        let analytic = Model::new(fcn)
+            .with_fjacb(move |beta, x| {
+                cb.0.fetch_add(1, Ordering::Relaxed);
+                x.iter()
+                    .map(|&v| vec![(beta[1] * v).sin(), beta[0] * v * (beta[1] * v).cos()])
+                    .collect()
+            })
+            .with_fjacd(move |beta, x| {
+                cd.1.fetch_add(1, Ordering::Relaxed);
+                x.iter()
+                    .map(|&v| vec![beta[0] * beta[1] * (beta[1] * v).cos()])
+                    .collect()
+            });
+        for model in [analytic.clone(), analytic.with_scalar_separable(true)] {
+            let path = if model.is_scalar_separable() {
+                "structured"
+            } else {
+                "dense"
+            };
+            let before = (
+                calls.0.load(Ordering::Relaxed),
+                calls.1.load(Ordering::Relaxed),
+            );
+            let fit = ODR::new(Data::new(x.clone(), y.clone())?, model, vec![2.0, 1.0])?.run()?;
+            let after = (
+                calls.0.load(Ordering::Relaxed),
+                calls.1.load(Ordering::Relaxed),
+            );
+            assert!(
+                after.0 > before.0 && after.1 > before.1,
+                "{path}: fjacb/fjacd were not called ({before:?} -> {after:?})"
+            );
+            assert!(fit.success, "{path}: {:?}", fit.stopreason);
+            assert_vec_close(&fit.beta, &scipy, 1.0e-6);
+
+            // Finite differences reach the same fit with more model evaluations.
+            let fd = ODR::new(
+                Data::new(x.clone(), y.clone())?,
+                Model::new(fcn),
+                vec![2.0, 1.0],
+            )?
+            .run()?;
+            assert_vec_close(&fd.beta, &scipy, 1.0e-6);
+            assert!(fit.nfev < fd.nfev, "{path}: {} vs {}", fit.nfev, fd.nfev);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn analytic_jacobian_shape_and_estimate_are_checked() -> Result<(), OdrError> {
+        let data = Data::new(vec![1.0, 2.0, 3.0], vec![2.0, 4.1, 5.9])?;
+        // fjacb must have one row per observation and one column per parameter.
+        let bad = unilinear().with_fjacb(|_beta, x| x.iter().map(|&v| vec![v]).collect());
+        let err = ODR::new(data.clone(), bad, vec![1.0, 1.0])?
+            .run()
+            .expect_err("bad fjacb");
+        assert!(matches!(err, OdrError::InvalidArgument { .. }), "{err:?}");
+        // SciPy: "must specify beta0 or provide an estimator with the model".
+        let no_estimate =
+            Model::new(|beta: &[f64], x: &[f64]| x.iter().map(|&v| beta[0] * v).collect());
+        assert!(ODR::from_model_estimate(data.clone(), no_estimate).is_err());
+        let estimated = ODR::from_model_estimate(data, unilinear())?;
+        assert_eq!(estimated.beta0, vec![1.0, 1.0]);
         Ok(())
     }
 

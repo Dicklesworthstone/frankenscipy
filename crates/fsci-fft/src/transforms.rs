@@ -2025,6 +2025,10 @@ fn dispatch_worker_limit() -> usize {
 }
 
 /// Common options shared by FFT transform entrypoints.
+///
+/// There is no counterpart to SciPy's `overwrite_x`: every transform borrows its input, so it is
+/// never overwritten (an `overwrite_input` field used to be accepted and ignored,
+/// frankenscipy-szq1n.12).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FftOptions {
     pub mode: RuntimeMode,
@@ -2032,7 +2036,6 @@ pub struct FftOptions {
     pub workers: WorkerPolicy,
     pub backend: BackendKind,
     pub check_finite: bool,
-    pub overwrite_input: bool,
 }
 
 impl Default for FftOptions {
@@ -2043,7 +2046,6 @@ impl Default for FftOptions {
             workers: WorkerPolicy::Exact(get_workers()),
             backend: BackendKind::default(),
             check_finite: false,
-            overwrite_input: false,
         }
     }
 }

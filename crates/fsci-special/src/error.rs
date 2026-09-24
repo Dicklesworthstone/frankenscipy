@@ -878,6 +878,7 @@ fn erfinv_complex_scalar_first_quadrant(
         let fx = erf_complex_scalar(x) - y;
         let err = fx.abs();
         if err <= 1.0e-14 * y.abs().max(1.0) {
+            // status: residual |erf(x) - y| <= 1e-14·max(|y|,1)
             converged = true;
             break;
         }
@@ -905,6 +906,7 @@ fn erfinv_complex_scalar_first_quadrant(
             x = Complex64::new(x.re.abs(), x.im.abs());
         }
         if corr.abs() <= 1.0e-14 * x.abs().max(1.0) {
+            // status: Newton correction |fx/erf'(x)| <= 1e-14·max(|x|,1)
             converged = true;
             break;
         }

@@ -9393,6 +9393,7 @@ impl RotationSpline {
             }
             let sol = solve_linear_system(&mat, &rhs, 1e-12)
                 .expect("RotationSpline banded system is solvable");
+            // status: per-sweep flag, cleared by any |Δrate| >= TOL·(1+|new|) below
             let mut converged = true;
             for i in 0..nb {
                 let new_i = [sol[3 * i], sol[3 * i + 1], sol[3 * i + 2]];

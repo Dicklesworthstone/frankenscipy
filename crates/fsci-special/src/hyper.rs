@@ -2709,7 +2709,7 @@ fn hyp2f1_scalar(a: f64, b: f64, c: f64, z: f64, mode: RuntimeMode) -> Result<f6
     // 5000-term cap → previously SLOW (z≈0.99) then WRONG (NaN for z ≳ 0.999). Use
     // the DLMF 15.8.4 z→1−z connection formula: two series in the SMALL argument
     // (1−z) that converge in ~10 terms, plus SciPy-matching gamma prefactors. The
-    // integer c−a−b log case (15.8.10) is left to the normal path (deferred).
+    // integer c−a−b case uses the 15.8.10 logarithmic form below.
     if (0.9..1.0).contains(&z) {
         let cab = c - a - b;
         if (cab - cab.round()).abs() > 1e-6 {
@@ -2807,9 +2807,11 @@ fn hyp2f1_scalar(a: f64, b: f64, c: f64, z: f64, mode: RuntimeMode) -> Result<f6
 /// `max_terms` is sized for |z| up to ~0.99: the term ratio approaches z
 /// for large n, so the convergence criterion needs roughly
 /// log(EPSILON)/log(|z|) ≈ 3.7 × 10³ iterations at z = 0.99. Smaller |z|
-/// reaches the early-out within tens of iterations. For |z| close to 1
-/// from above scipy uses the (1−z)-transform with gamma ratios, which
-/// is not implemented here — frankenscipy-3zzep.
+/// reaches the early-out within tens of iterations. For z in [0.9, 1)
+/// `hyp2f1` first tries the DLMF 15.8.4 (1−z) connection formula (15.8.10
+/// when c−a−b is an integer and a, b > 0); only the cases those leave
+/// (non-finite prefactors, integer c−a−b with a or b ≤ 0) reach this series
+/// that close to z = 1.
 fn hyp2f1_series(a: f64, b: f64, c: f64, z: f64) -> Result<f64, SpecialError> {
     let max_terms = 5000;
     let eps = f64::EPSILON;
@@ -3104,6 +3106,7 @@ fn hyp2f1_inv_z_connection_degenerate(
         }
         s2 = s2 + term;
         if k > m + 2 && complex_series_converged(term, s2, tol) {
+            // status: k > m+2 and |term| <= 1e-15·max(|s2|,1) (complex_series_converged)
             converged = true;
             break;
         }

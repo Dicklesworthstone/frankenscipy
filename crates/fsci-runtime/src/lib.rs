@@ -143,6 +143,59 @@ pub struct SolverPortfolio {
     evidence: VecDeque<SolverEvidenceEntry>,
     evidence_capacity: usize,
     calibrator: ConformalCalibrator,
+    /// Dirichlet outcome counts over the four condition states, one row per decade of rcond
+    /// (see [`rcond_decade`]). Filled by [`SolverPortfolio::record_outcome`].
+    outcome_counts: [[f64; 4]; RCOND_DECADES],
+}
+
+/// How an attempted dense solve turned out, as fed back to the portfolio.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttemptOutcome {
+    /// Returned a solution meeting the accuracy test.
+    Ok,
+    /// Returned a solution whose backward error failed the accuracy test.
+    Inaccurate,
+    /// Returned an error (singular factor, breakdown, ...).
+    Failed,
+}
+
+/// Decades of rcond the outcome counts are kept for: `[1e0, 1e-1)`, ..., `[1e-16, 1e-17)`, and
+/// everything at or below 1e-17 (including 0 and NaN) in the last one.
+const RCOND_DECADES: usize = 18;
+
+/// Pseudo-count mass of the prior map in the Dirichlet posterior (per state row, total 4).
+const PRIOR_MASS: f64 = 4.0;
+
+/// Per-state smoothing used when ATTRIBUTING an outcome to states, so that a state the prior
+/// map gives zero weight can still accumulate evidence. It is not part of the decision
+/// posterior (see [`SolverPortfolio::posterior`]).
+const STATE_SMOOTHING: f64 = 0.05;
+
+/// P(`AttemptOutcome::Ok` | state, action) for the observation model. Rows follow
+/// `SolverAction::index`, columns the condition states (well, moderate, ill, near-singular).
+/// Hand-set, like the loss matrix; a calibrated table is frankenscipy-7tb8d.2.
+const OK_PROBABILITY: [[f64; 4]; 5] = [
+    [0.99, 0.95, 0.40, 0.05], // DirectLU
+    [0.99, 0.98, 0.70, 0.20], // PivotedQR
+    [0.99, 0.99, 0.95, 0.90], // SVDFallback
+    [0.99, 0.99, 0.99, 0.30], // DiagonalFastPath
+    [0.99, 0.99, 0.95, 0.30], // TriangularFastPath
+];
+
+/// Share of the non-`Ok` probability that is `Inaccurate` (the rest is `Failed`).
+const INACCURATE_SHARE: f64 = 0.7;
+
+/// The decade row an rcond value's outcomes are counted in.
+fn rcond_decade(rcond: f64) -> usize {
+    if !rcond.is_finite() || rcond <= 0.0 {
+        return RCOND_DECADES - 1;
+    }
+    let decade = (-rcond.log10()).floor();
+    if decade <= 0.0 {
+        0
+    } else {
+        (decade as usize).min(RCOND_DECADES - 1)
+    }
 }
 
 impl SolverPortfolio {
@@ -155,7 +208,85 @@ impl SolverPortfolio {
             evidence: VecDeque::with_capacity(evidence_capacity),
             evidence_capacity,
             calibrator: ConformalCalibrator::new(0.05, 200),
+            outcome_counts: [[0.0; 4]; RCOND_DECADES],
         }
+    }
+
+    /// Posterior over the four condition states at `rcond`.
+    ///
+    /// A Dirichlet posterior whose prior is the fixed rcond map ([`Self::condition_posterior`])
+    /// with pseudo-count mass [`PRIOR_MASS`], updated by the outcome counts recorded for this
+    /// rcond decade. With no outcomes recorded for the decade it returns the prior map EXACTLY,
+    /// so a fresh portfolio decides bit-for-bit as the map alone did (frankenscipy-7tb8d.1).
+    ///
+    /// The decision posterior carries NO smoothing mass: smoothing is only used to attribute
+    /// an outcome to states in [`Self::record_outcome`]. Putting it here would move ~1% onto
+    /// NearSingular after a single SUCCESSFUL LU at rcond 1e-3 and, with LU's loss of 120
+    /// there, flip the next decision away from the action that just succeeded.
+    #[must_use]
+    pub fn posterior(&self, rcond: f64) -> [f64; 4] {
+        let counts = &self.outcome_counts[rcond_decade(rcond)];
+        let observed: f64 = counts.iter().sum();
+        if observed == 0.0 {
+            return Self::condition_posterior(rcond);
+        }
+        let prior = Self::condition_posterior(rcond);
+        let total = PRIOR_MASS + observed;
+        let mut posterior = [0.0; 4];
+        for (state, p) in posterior.iter_mut().enumerate() {
+            *p = (PRIOR_MASS * prior[state] + counts[state]) / total;
+        }
+        posterior
+    }
+
+    /// The posterior used to ATTRIBUTE an outcome: [`Self::posterior`] plus
+    /// [`STATE_SMOOTHING`] per state, so a state the prior map gives zero weight can still
+    /// receive responsibility for an outcome only it explains.
+    fn smoothed_posterior(&self, rcond: f64) -> [f64; 4] {
+        let prior = Self::condition_posterior(rcond);
+        let counts = &self.outcome_counts[rcond_decade(rcond)];
+        let observed: f64 = counts.iter().sum();
+        let total = PRIOR_MASS + 4.0 * STATE_SMOOTHING + observed;
+        let mut posterior = [0.0; 4];
+        for (state, p) in posterior.iter_mut().enumerate() {
+            *p = (PRIOR_MASS * prior[state] + STATE_SMOOTHING + counts[state]) / total;
+        }
+        posterior
+    }
+
+    /// Feed back how an attempt with `action` at `rcond` turned out.
+    ///
+    /// The condition state is latent, so the outcome contributes a fractional count to each
+    /// state in proportion to its responsibility P(state | outcome, action) under the current
+    /// (smoothed) posterior and the [`OK_PROBABILITY`] observation model. Repeated inaccurate
+    /// LU results at an rcond the map calls well conditioned therefore move that decade's
+    /// posterior toward the ill-conditioned states, and the next decision there changes.
+    pub fn record_outcome(&mut self, rcond: f64, action: SolverAction, outcome: AttemptOutcome) {
+        let prior = self.smoothed_posterior(rcond);
+        let ok = OK_PROBABILITY[action.index()];
+        let mut responsibility = [0.0; 4];
+        for state in 0..4 {
+            let likelihood = match outcome {
+                AttemptOutcome::Ok => ok[state],
+                AttemptOutcome::Inaccurate => (1.0 - ok[state]) * INACCURATE_SHARE,
+                AttemptOutcome::Failed => (1.0 - ok[state]) * (1.0 - INACCURATE_SHARE),
+            };
+            responsibility[state] = prior[state] * likelihood;
+        }
+        let norm: f64 = responsibility.iter().sum();
+        if !norm.is_finite() || norm <= 0.0 {
+            return;
+        }
+        let row = &mut self.outcome_counts[rcond_decade(rcond)];
+        for (count, r) in row.iter_mut().zip(responsibility) {
+            *count += r / norm;
+        }
+    }
+
+    /// Outcome counts recorded for `rcond`'s decade (for diagnostics and audit).
+    #[must_use]
+    pub fn outcome_counts(&self, rcond: f64) -> [f64; 4] {
+        self.outcome_counts[rcond_decade(rcond)]
     }
 
     #[must_use]
@@ -176,20 +307,33 @@ impl SolverPortfolio {
         rcond: f64,
         structure: Option<StructuralEvidence>,
     ) -> (SolverAction, [f64; 4], [f64; 5], f64) {
-        let posterior = Self::condition_posterior(rcond);
+        self.select_action_excluding(rcond, structure, &[])
+            .expect("the three general solvers are never all excluded here")
+    }
+
+    /// [`Self::select_action`] restricted to the actions NOT in `excluded`: the fallback path
+    /// re-ranks the remaining actions under the posterior as it stands after the failed
+    /// attempts were recorded, instead of walking a ranking fixed before the first attempt.
+    /// `None` when every applicable action is excluded.
+    #[must_use]
+    pub fn select_action_excluding(
+        &self,
+        rcond: f64,
+        structure: Option<StructuralEvidence>,
+        excluded: &[SolverAction],
+    ) -> Option<(SolverAction, [f64; 4], [f64; 5], f64)> {
+        let posterior = self.posterior(rcond);
+        let losses = self.compute_expected_losses(posterior);
 
         // If conformal calibrator detects drift, override to SVDFallback
-        if self.calibrator.should_fallback() {
-            let losses = self.compute_expected_losses(posterior);
-            return (
+        if self.calibrator.should_fallback() && !excluded.contains(&SolverAction::SVDFallback) {
+            return Some((
                 SolverAction::SVDFallback,
                 posterior,
                 losses,
                 losses[SolverAction::SVDFallback.index()],
-            );
+            ));
         }
-
-        let losses = self.compute_expected_losses(posterior);
 
         // argmin over expected losses
         // We consider general solvers (0, 1, 2) and applicable fast paths (3, 4)
@@ -208,25 +352,29 @@ impl SolverPortfolio {
             _ => {}
         }
 
-        let mut best_idx = candidates[0];
-        let mut best_loss = losses[best_idx];
-
-        for &idx in candidates.iter().take(count).skip(1) {
-            let loss = losses[idx];
-            if loss < best_loss {
-                best_loss = loss;
-                best_idx = idx;
-            } else if (loss - best_loss).abs() <= 1e-12 {
-                // Tie-break toward safer action for general solvers (higher index = safer: LU < QR < SVD)
-                // or toward fast paths if they have equal expected loss.
-                if (idx < 3 && idx > best_idx) || (idx >= 3 && best_idx < 3) {
-                    best_idx = idx;
-                }
+        let mut best: Option<(usize, f64)> = None;
+        for &idx in candidates.iter().take(count) {
+            if excluded.contains(&SolverAction::ALL[idx]) {
+                continue;
             }
+            let loss = losses[idx];
+            best = match best {
+                None => Some((idx, loss)),
+                Some((_, best_loss)) if loss < best_loss => Some((idx, loss)),
+                Some((best_idx, best_loss)) if (loss - best_loss).abs() <= 1e-12 => {
+                    // Tie-break toward safer action for general solvers (higher index = safer:
+                    // LU < QR < SVD) or toward fast paths if they have equal expected loss.
+                    if (idx < 3 && idx > best_idx) || (idx >= 3 && best_idx < 3) {
+                        Some((idx, loss))
+                    } else {
+                        Some((best_idx, best_loss))
+                    }
+                }
+                keep => keep,
+            };
         }
 
-        let action = SolverAction::ALL[best_idx];
-        (action, posterior, losses, best_loss)
+        best.map(|(idx, loss)| (SolverAction::ALL[idx], posterior, losses, loss))
     }
 
     /// Record solver evidence for audit trail and calibration.
@@ -284,8 +432,10 @@ impl SolverPortfolio {
         losses
     }
 
-    /// Hard-classify condition state into posterior distribution.
-    /// Uses soft transitions at boundaries via logistic blending.
+    /// The PRIOR map from rcond to condition states: piecewise-linear in `log10(rcond)` between
+    /// the state centres -2, -6, -11 and -16 (all mass on the end states outside that range,
+    /// on NearSingular for a non-finite or non-positive rcond). [`Self::posterior`] updates it
+    /// with recorded outcomes.
     fn condition_posterior(rcond: f64) -> [f64; 4] {
         // Guard: if rcond is NaN/Inf, assume worst case (NearSingular)
         if !rcond.is_finite() || rcond <= 0.0 {
@@ -790,25 +940,78 @@ impl OptSolverPortfolio {
         ]
     }
 
+    /// Select among all five actions (an unconstrained problem).
     pub fn select_action(
         &self,
         hessian_cond_estimate: f64,
         is_noisy_or_discontinuous: bool,
-        is_global_bounds_constrained: bool,
+        is_multimodal: bool,
     ) -> (OptSolverAction, [f64; 4], [f64; 5], f64) {
+        self.select_action_among(
+            hessian_cond_estimate,
+            is_noisy_or_discontinuous,
+            is_multimodal,
+            &OptSolverAction::ALL,
+        )
+    }
+
+    /// Select the minimum-expected-loss action among `allowed` only (an empty slice
+    /// means all actions).
+    ///
+    /// br-szq1n.9: feasibility is a hard requirement, not a loss term. A bounded
+    /// problem can only be answered by a method that honours bounds (L-BFGS-B,
+    /// Nelder-Mead, and DIRECT on a finite box); scoring BFGS lower than L-BFGS-B must not be able to
+    /// route it to a method that ignores the bounds and returns an infeasible point.
+    /// Filtering the candidate set before the argmin is also what makes L-BFGS-B
+    /// reachable: its loss row is dominated by BFGS whenever both are candidates.
+    pub fn select_action_among(
+        &self,
+        hessian_cond_estimate: f64,
+        is_noisy_or_discontinuous: bool,
+        is_multimodal: bool,
+        allowed: &[OptSolverAction],
+    ) -> (OptSolverAction, [f64; 4], [f64; 5], f64) {
+        let allowed: &[OptSolverAction] = if allowed.is_empty() {
+            &OptSolverAction::ALL
+        } else {
+            allowed
+        };
         let posterior = Self::landscape_posterior(
             hessian_cond_estimate,
             is_noisy_or_discontinuous,
-            is_global_bounds_constrained,
+            is_multimodal,
         );
+        let losses = self.compute_expected_losses(posterior);
 
-        // If conformal calibrator triggers drift, fallback to DIRECT or NelderMead
+        // Minimum expected loss over the allowed actions, in ALL order; an exact
+        // tie goes to the later action.
+        let mut best: Option<(OptSolverAction, f64)> = None;
+        for action in OptSolverAction::ALL {
+            if !allowed.contains(&action) {
+                continue;
+            }
+            let loss = losses[action.index()];
+            best = match best {
+                None => Some((action, loss)),
+                Some((_, best_loss)) if loss < best_loss => Some((action, loss)),
+                Some((_, best_loss)) if (loss - best_loss).abs() <= 1e-12 => Some((action, loss)),
+                keep => keep,
+            };
+        }
+        let (argmin, argmin_loss) = best.expect("allowed is non-empty");
+
+        // Calibrator drift: prefer the conservative method for the landscape, but
+        // never one outside the feasible set.
         if self.calibrator.should_fallback() {
-            let losses = self.compute_expected_losses(posterior);
-            let fallback_action = if is_global_bounds_constrained {
+            let preferred = if is_multimodal {
                 OptSolverAction::DIRECT
             } else {
                 OptSolverAction::NelderMead
+            };
+            let fallback_action = if allowed.contains(&preferred) {
+                preferred
+            } else {
+                argmin
             };
             return (
                 fallback_action,
@@ -818,20 +1021,7 @@ impl OptSolverPortfolio {
             );
         }
 
-        let losses = self.compute_expected_losses(posterior);
-        let mut best_idx = 0;
-        let mut best_loss = losses[0];
-
-        for (idx, &loss) in losses.iter().enumerate().skip(1) {
-            if loss < best_loss {
-                best_loss = loss;
-                best_idx = idx;
-            } else if (loss - best_loss).abs() <= 1e-12 && idx > best_idx {
-                best_idx = idx;
-            }
-        }
-
-        (OptSolverAction::ALL[best_idx], posterior, losses, best_loss)
+        (argmin, posterior, losses, argmin_loss)
     }
 
     pub fn record_evidence(&mut self, entry: OptSolverEvidenceEntry) {
@@ -874,12 +1064,12 @@ impl OptSolverPortfolio {
     fn landscape_posterior(
         hessian_cond_estimate: f64,
         is_noisy_or_discontinuous: bool,
-        is_global_bounds_constrained: bool,
+        is_multimodal: bool,
     ) -> [f64; 4] {
         if is_noisy_or_discontinuous {
             return [0.05, 0.05, 0.1, 0.8]; // NoisyNonSmooth
         }
-        if is_global_bounds_constrained {
+        if is_multimodal {
             return [0.05, 0.1, 0.8, 0.05]; // NonConvexMultiModal
         }
         if !hessian_cond_estimate.is_finite() || hessian_cond_estimate >= 1e6 {
@@ -1645,6 +1835,118 @@ mod tests {
         }
     }
 
+    /// The pre-7tb8d.1 decision rule, reproduced independently: argmin of the fixed map's
+    /// expected losses with the safer-action tie-break.
+    fn former_decision(rcond: f64, structure: Option<StructuralEvidence>) -> SolverAction {
+        let p = condition_posterior_former(rcond);
+        let m = SolverPortfolio::default_loss_matrix();
+        let loss = |a: usize| (0..4).map(|s| m[a][s] * p[s]).sum::<f64>();
+        let mut candidates = vec![0, 1, 2];
+        match structure {
+            Some(StructuralEvidence::Diagonal) => candidates.push(3),
+            Some(StructuralEvidence::Triangular) => candidates.push(4),
+            _ => {}
+        }
+        let mut best = candidates[0];
+        for &idx in &candidates[1..] {
+            let (l, b) = (loss(idx), loss(best));
+            if l < b
+                || ((l - b).abs() <= 1e-12 && ((idx < 3 && idx > best) || (idx >= 3 && best < 3)))
+            {
+                best = idx;
+            }
+        }
+        SolverAction::ALL[best]
+    }
+
+    // frankenscipy-7tb8d.1: with no outcomes recorded, the Dirichlet posterior IS the prior map,
+    // so a fresh portfolio decides exactly as before on 200 log-spaced rcond values and the
+    // special values.
+    #[test]
+    fn fresh_portfolio_decides_exactly_as_the_fixed_map() {
+        let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        let mut rconds: Vec<f64> = (0..200)
+            .map(|i| 10f64.powf(-(i as f64) * 18.0 / 199.0))
+            .collect();
+        rconds.extend([0.0, -1.0, f64::NAN, f64::INFINITY, 1e-2, 1e-16]);
+        for rcond in rconds {
+            for structure in [
+                None,
+                Some(StructuralEvidence::Diagonal),
+                Some(StructuralEvidence::Triangular),
+            ] {
+                let (action, posterior, _, _) = portfolio.select_action(rcond, structure);
+                assert_eq!(
+                    posterior.map(f64::to_bits),
+                    condition_posterior_former(rcond).map(f64::to_bits),
+                    "posterior at rcond={rcond:e}"
+                );
+                assert_eq!(action, former_decision(rcond, structure), "rcond={rcond:e}");
+            }
+        }
+    }
+
+    // frankenscipy-7tb8d.1: the posterior LEARNS. At rcond = 1e-3 the map says mostly
+    // well-conditioned and LU wins; 50 recorded "LU was inaccurate" outcomes there must move
+    // mass to the ill-conditioned states and change the decision. Before this bead the
+    // posterior was a pure function of rcond, so this failed.
+    #[test]
+    fn recorded_outcomes_move_the_posterior_and_the_decision() {
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        let rcond = 1e-3;
+        let (before, p0, _, _) = portfolio.select_action(rcond, None);
+        assert_eq!(before, SolverAction::DirectLU);
+        for _ in 0..50 {
+            portfolio.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Inaccurate);
+        }
+        let (after, p1, losses, _) = portfolio.select_action(rcond, None);
+        println!(
+            "rcond 1e-3: prior {p0:?} -> posterior {p1:?}, losses {losses:?}, {before:?} -> {after:?}"
+        );
+        assert!(p1[2] + p1[3] > p0[2] + p0[3] + 0.5, "{p0:?} -> {p1:?}");
+        assert!(matches!(
+            after,
+            SolverAction::PivotedQR | SolverAction::SVDFallback
+        ));
+        // Another decade is untouched.
+        assert_eq!(portfolio.select_action(0.5, None).0, SolverAction::DirectLU);
+
+        // Negative arm: successes at the same rcond keep LU -- including the FIRST one, which
+        // a smoothed decision posterior would have flipped to QR.
+        let mut ok = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        ok.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Ok);
+        assert_eq!(ok.select_action(rcond, None).0, SolverAction::DirectLU);
+        for _ in 1..50 {
+            ok.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Ok);
+        }
+        assert_eq!(ok.select_action(rcond, None).0, SolverAction::DirectLU);
+        assert!(ok.posterior(rcond)[0] >= p0[0] - 0.05);
+    }
+
+    // frankenscipy-7tb8d.1: the fallback re-ranks the REMAINING actions under the updated
+    // posterior, and returns None once every applicable action has been tried.
+    #[test]
+    fn select_action_excluding_reranks_the_remaining_actions() {
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        let rcond = 1e-3;
+        portfolio.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Failed);
+        let (second, ..) = portfolio
+            .select_action_excluding(rcond, None, &[SolverAction::DirectLU])
+            .expect("QR and SVD remain");
+        assert_ne!(second, SolverAction::DirectLU);
+        let all = [
+            SolverAction::DirectLU,
+            SolverAction::PivotedQR,
+            SolverAction::SVDFallback,
+        ];
+        assert!(
+            portfolio
+                .select_action_excluding(rcond, None, &all)
+                .is_none()
+        );
+        assert!(portfolio.outcome_counts(rcond).iter().sum::<f64>() > 0.99);
+    }
+
     #[test]
     fn strict_mode_fails_closed_on_incompatible_metadata() {
         let mut controller = PolicyController::new(RuntimeMode::Strict, 16);
@@ -2067,6 +2369,59 @@ mod tests {
         let p = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
         let (action, _, _, _) = p.select_action(100.0, true, false);
         assert_eq!(action, OptSolverAction::NelderMead);
+    }
+
+    // br-szq1n.9: every action must be the argmin for SOME problem, or it is dead code.
+    // L-BFGS-B is only reachable through the feasible set: its loss row is dominated
+    // by BFGS whenever both are candidates.
+    #[test]
+    fn test_opt_solver_portfolio_every_action_is_reachable() {
+        let p = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let bounded = [OptSolverAction::LBFGSB, OptSolverAction::DIRECT];
+        let mut reached: Vec<OptSolverAction> = Vec::new();
+        for &(cond, noisy, multimodal) in &[
+            (100.0, false, false),
+            (1e7, false, false),
+            (100.0, false, true),
+            (100.0, true, false),
+        ] {
+            reached.push(p.select_action(cond, noisy, multimodal).0);
+            reached.push(p.select_action_among(cond, noisy, multimodal, &bounded).0);
+        }
+        for action in OptSolverAction::ALL {
+            assert!(reached.contains(&action), "{action:?} is never selected");
+        }
+    }
+
+    #[test]
+    fn test_opt_solver_portfolio_bounded_never_selects_an_infeasible_action() {
+        let mut p = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let bounded_only = [OptSolverAction::LBFGSB];
+        for &(cond, noisy, multimodal) in &[
+            (100.0, false, false),
+            (1e7, false, false),
+            (100.0, false, true),
+            (100.0, true, false),
+        ] {
+            let (action, _, _, _) = p.select_action_among(cond, noisy, multimodal, &bounded_only);
+            // Without the feasible set this is BFGS / TrustRegionNewtonCG / DIRECT /
+            // NelderMead, none of which reads a non-box bound.
+            assert_eq!(
+                action,
+                OptSolverAction::LBFGSB,
+                "state ({cond}, {noisy}, {multimodal})"
+            );
+        }
+        // Drift must not escape the feasible set either.
+        for _ in 0..400 {
+            p.observe_step_failure(1.0);
+        }
+        assert!(
+            p.calibrator().should_fallback(),
+            "drift fallback must be active"
+        );
+        let (action, _, _, _) = p.select_action_among(100.0, true, false, &bounded_only);
+        assert_eq!(action, OptSolverAction::LBFGSB);
     }
 
     #[test]

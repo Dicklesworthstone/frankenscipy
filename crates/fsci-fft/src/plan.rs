@@ -3,14 +3,14 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::{Normalization, TransformKind};
 
-/// How planning heuristics are produced for a transform key.
+/// How a cached plan's heuristics were produced. Only static estimation exists: a
+/// `MeasureAndPersist` variant and a `PlanCacheConfig.planning_strategy` field selecting it
+/// used to be accepted and ignored (frankenscipy-szq1n.12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum PlanningStrategy {
     /// Static estimate only; cheapest and deterministic.
     #[default]
     EstimateOnly,
-    /// Measure candidate paths and persist chosen plan metadata.
-    MeasureAndPersist,
 }
 
 /// Admission mode controlling what enters the plan cache.
@@ -72,7 +72,6 @@ pub struct PlanMetadata {
 pub struct PlanCacheConfig {
     pub capacity: usize,
     pub max_working_set_bytes: usize,
-    pub planning_strategy: PlanningStrategy,
     pub admission_policy: CacheAdmissionPolicy,
 }
 
@@ -81,7 +80,6 @@ impl Default for PlanCacheConfig {
         Self {
             capacity: 128,
             max_working_set_bytes: 64 * 1024 * 1024,
-            planning_strategy: PlanningStrategy::EstimateOnly,
             admission_policy: CacheAdmissionPolicy::CostWeightedLru,
         }
     }
@@ -499,7 +497,6 @@ mod tests {
             capacity: 4096,
             max_working_set_bytes: 64 * 1024 * 1024,
             admission_policy: CacheAdmissionPolicy::AlwaysInsert,
-            ..PlanCacheConfig::default()
         };
         let key = PlanKey::new(
             TransformKind::Fft,
@@ -664,7 +661,6 @@ mod tests {
             capacity: 8,
             max_working_set_bytes: 160,
             admission_policy: CacheAdmissionPolicy::AlwaysInsert,
-            ..PlanCacheConfig::default()
         };
 
         assert!(cache.store_with_config(test_metadata(16, 320, 64), config.clone()));

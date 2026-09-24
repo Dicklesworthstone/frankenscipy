@@ -238,7 +238,6 @@ fn diff_fft_shared_plan_cache() {
         capacity: 8,
         max_working_set_bytes: 160,
         admission_policy: CacheAdmissionPolicy::AlwaysInsert,
-        ..PlanCacheConfig::default()
     };
     let stored_ws_1 = store_shared_plan_with_config(mk_metadata(16, 320, 64), cfg_ws.clone());
     let stored_ws_2 = store_shared_plan_with_config(mk_metadata(32, 800, 64), cfg_ws);
