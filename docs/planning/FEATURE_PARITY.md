@@ -54,7 +54,7 @@ SciPy 1.17.1 exports 1,300 public symbols across 16 core modules. FrankenSciPy a
 
 ### fsci-opt (55% coverage)
 
-**Implemented:** minimize (BFGS, CG, Powell, NM, L-BFGS-B, Newton-CG, TNC, COBYLA, SLSQP, trust-ncg, trust-krylov, trust-constr, dogleg), direct (DIRECT and DIRECT-L), minimize_with_casp_portfolio, minimize_scalar, brentq, brenth, bisect, ridder, toms748, halley, newton_scalar, secant, root_scalar, root, fsolve, broyden1, broyden2, anderson, lm_root, curve_fit, least_squares, line_search, Bounds, LinearConstraint, NonlinearConstraint, differential_evolution, basinhopping, dual_annealing, shgo, pso, linprog, milp, linear_sum_assignment, approx_fprime, check_grad, cobyla, rosen, rosen_der, rosen_hess, rosen_hess_prod
+**Implemented:** minimize (BFGS, CG, Powell, NM, L-BFGS-B, Newton-CG, TNC, SLSQP with equality/inequality constraints and bounds, trust-ncg, dogleg, trust-exact — SciPy's trust-region driver and subproblems when given `hess`/`hessp` — trust-constr without constraints or bounds; no trust-krylov), direct (DIRECT and DIRECT-L), minimize_with_casp_portfolio, minimize_scalar, brentq, brenth, bisect, ridder, toms748, halley, newton_scalar, secant, root_scalar, root, fsolve, broyden1, broyden2, anderson, lm_root, curve_fit, least_squares, line_search, Bounds, LinearConstraint, NonlinearConstraint, differential_evolution, basinhopping, dual_annealing, shgo, pso, linprog, milp, linear_sum_assignment, approx_fprime, check_grad, cobyla, rosen, rosen_der, rosen_hess, rosen_hess_prod
 
 **Missing (LOW priority):**
 - `minimize` methods: ~~`trust-exact`~~ ✓ DONE, ~~`Newton-CG` hessian product~~ ✓ DONE
@@ -63,7 +63,7 @@ SciPy 1.17.1 exports 1,300 public symbols across 16 core modules. FrankenSciPy a
 
 ### fsci-integrate (80% coverage)
 
-**Implemented:** solve_ivp (RK23, RK45, DOP853, BDF, Radau, LSODA), solve_ivp_with_casp_portfolio, odeint, solve_bvp, quad, quad_vec, quad_explain, quad_inf, quad_neg_inf, quad_full_inf, quad_cauchy_pv, dblquad, dblquad_rect, tplquad, tplquad_rect, nquad, trapezoid, trapezoid_uniform, trapezoid_irregular, trapezoid_richardson, simpson, simpson_uniform, simpson_irregular, cumulative_trapezoid, cumulative_trapezoid_uniform, cumulative_trapezoid_initial, cumulative_simpson, romb, romb_func, romberg, fixed_quad, gauss_kronrod_quad, gauss_legendre, newton_cotes, newton_cotes_quad, monte_carlo_integrate, line_integral
+**Implemented:** solve_ivp (RK23, RK45, DOP853, BDF, Radau, LSODA), solve_ivp_with_casp_portfolio, odeint, solve_bvp, quad (QUADPACK qagse/qagie; infinite bounds), quad_points (qagpe), quad_full_output, quad_weighted (cos/sin/alg*/cauchy: qawoe/qawfe/qawse/qawce), quad_vec, quad_explain, quad_inf, quad_neg_inf, quad_full_inf, dblquad, dblquad_rect, tplquad, tplquad_rect, nquad, trapezoid, trapezoid_uniform, trapezoid_irregular, trapezoid_richardson, simpson, simpson_uniform, simpson_irregular, cumulative_trapezoid, cumulative_trapezoid_uniform, cumulative_trapezoid_initial, cumulative_simpson, romb, romb_func, romberg, fixed_quad, gauss_kronrod_quad, gauss_legendre, newton_cotes, newton_cotes_quad, monte_carlo_integrate, line_integral
 
 **Missing (LOW priority):**
 - ~~`cubature` (adaptive N-dimensional cubature)~~ ✓ DONE
