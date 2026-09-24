@@ -31,7 +31,8 @@ struct OracleFamily {
     ppf: Vec<f64>,
     mean: f64,
     var: f64,
-    support: (f64, f64),
+    /// Python's `str(float(end))`: "-inf", "inf" or a finite value.
+    support: (String, String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -65,8 +66,9 @@ for name, d in fams:
                 "sf": [float(d.sf(k)) for k in KS],
                 "ppf": [float(d.ppf(q)) for q in QS],
                 "mean": float(d.mean()), "var": float(d.var()),
-                "support": [float(lo), float(hi)]})
-print(json.dumps(out))
+                # JSON has no infinity: the (possibly infinite) ends travel as "-inf" / "inf".
+                "support": [str(float(lo)), str(float(hi))]})
+print(json.dumps(out, allow_nan=False))
 "#;
     let child = match fsci_conformance::scipy_oracle_command()
         .arg("-c")
@@ -132,8 +134,24 @@ fn compare<D: DiscreteDistribution>(rows: &mut Vec<Row>, d: &D, oracle: &OracleF
     check(rows, name, "mean", f64::NAN, d.mean(), oracle.mean);
     check(rows, name, "var", f64::NAN, d.var(), oracle.var);
     let (lo, hi) = d.support();
-    check(rows, name, "support_lo", f64::NAN, lo, oracle.support.0);
-    check(rows, name, "support_hi", f64::NAN, hi, oracle.support.1);
+    // An unparseable end becomes NaN, which fails the exact comparison.
+    let end = |s: &str| s.parse::<f64>().unwrap_or(f64::NAN);
+    check(
+        rows,
+        name,
+        "support_lo",
+        f64::NAN,
+        lo,
+        end(&oracle.support.0),
+    );
+    check(
+        rows,
+        name,
+        "support_hi",
+        f64::NAN,
+        hi,
+        end(&oracle.support.1),
+    );
 }
 
 #[test]
