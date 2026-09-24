@@ -217,7 +217,11 @@ print(json.dumps({"points": points}))
 
 fn fsci_eval(func: &str, x: &[f64], order: usize) -> Vec<usize> {
     match func {
-        "find_peaks" => find_peaks(x, FindPeaksOptions::default()).peaks,
+        "find_peaks" => {
+            find_peaks(x, FindPeaksOptions::default())
+                .expect("default find_peaks options are valid")
+                .peaks
+        }
         "argrelextrema_max" => argrelextrema(x, order, true),
         "argrelextrema_min" => argrelextrema(x, order, false),
         _ => Vec::new(),

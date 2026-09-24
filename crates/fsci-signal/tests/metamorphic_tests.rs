@@ -273,7 +273,7 @@ fn mr_hilbert_of_constant() {
 fn mr_find_peaks_monotone_has_no_peaks() {
     // Strictly increasing: no peak at any interior position.
     let x: Vec<f64> = (0..50).map(|i| i as f64 * 0.1).collect();
-    let result = find_peaks(&x, FindPeaksOptions::default());
+    let result = find_peaks(&x, FindPeaksOptions::default()).expect("find_peaks");
     assert!(
         result.peaks.is_empty(),
         "MR12 monotone signal should have no peaks, got {:?}",
@@ -281,7 +281,7 @@ fn mr_find_peaks_monotone_has_no_peaks() {
     );
     // Strictly decreasing: also no peaks.
     let y: Vec<f64> = (0..50).rev().map(|i| i as f64 * 0.1).collect();
-    let result = find_peaks(&y, FindPeaksOptions::default());
+    let result = find_peaks(&y, FindPeaksOptions::default()).expect("find_peaks");
     assert!(
         result.peaks.is_empty(),
         "MR12 monotone-decreasing signal should have no peaks, got {:?}",
@@ -296,7 +296,7 @@ fn mr_find_peaks_monotone_has_no_peaks() {
 #[test]
 fn mr_find_peaks_tent() {
     let x = vec![0.0, 1.0, 0.0];
-    let result = find_peaks(&x, FindPeaksOptions::default());
+    let result = find_peaks(&x, FindPeaksOptions::default()).expect("find_peaks");
     assert_eq!(result.peaks, vec![1], "MR13 expected single peak at idx 1");
 }
 
@@ -1159,7 +1159,7 @@ fn mr_find_peaks_finds_single_peak() {
         })
         .collect();
     let opts = FindPeaksOptions::default();
-    let res = find_peaks(&x, opts);
+    let res = find_peaks(&x, opts).expect("find_peaks");
     assert!(
         !res.peaks.is_empty(),
         "MR53 find_peaks on Gaussian bump returned 0 peaks"

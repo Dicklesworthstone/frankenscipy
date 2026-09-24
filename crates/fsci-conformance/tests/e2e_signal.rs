@@ -12,13 +12,13 @@
 
 use fsci_conformance::PacketFamily;
 use fsci_signal::{
-    BaCoeffs, ConvolveMode, FilterType, FindPeaksOptions, FirWindow, SosSection, SpectralScaling,
-    autocorrelation, blackman, butter, butter_sos, convolve, correlate, csd_with_scaling, filtfilt,
-    filtfilt_with_padtype, find_peaks, firwin, freqz, freqz_with_whole, gausspulse, get_window,
-    get_window_with_fftbins, hamming, hann, hilbert_envelope, kaiser, lfilter, lfilter_zi, lfiltic,
-    lombscargle, peak_prominences, resample, resample_poly_with_padtype, ricker, rms,
-    savgol_coeffs, savgol_filter, sosfilt, spectral_centroid, spectral_flatness, stft, tf2sos,
-    welch,
+    BaCoeffs, ConvolveMode, FilterType, FindPeaksOptions, FirWindow, PeakCondition, SosSection,
+    SpectralScaling, autocorrelation, blackman, butter, butter_sos, convolve, correlate,
+    csd_with_scaling, filtfilt, filtfilt_with_padtype, find_peaks, firwin, freqz, freqz_with_whole,
+    gausspulse, get_window, get_window_with_fftbins, hamming, hann, hilbert_envelope, kaiser,
+    lfilter, lfilter_zi, lfiltic, lombscargle, peak_prominences, resample,
+    resample_poly_with_padtype, ricker, rms, savgol_coeffs, savgol_filter, sosfilt,
+    spectral_centroid, spectral_flatness, stft, tf2sos, welch,
 };
 use serde::Serialize;
 use std::f64::consts::PI;
@@ -620,7 +620,8 @@ fn scenario_06_find_peaks() {
         "find all local maxima",
         "Strict",
         || {
-            let result = find_peaks(&signal, FindPeaksOptions::default());
+            let result = find_peaks(&signal, FindPeaksOptions::default())
+                .map_err(|e| format!("find_peaks: {e}"))?;
             // Should find multiple peaks
             if result.peaks.len() >= 3 {
                 Ok(format!(
@@ -641,10 +642,10 @@ fn scenario_06_find_peaks() {
         "Strict",
         || {
             let opts = FindPeaksOptions {
-                height: Some(0.5),
+                height: Some(PeakCondition::at_least(0.5)),
                 ..Default::default()
             };
-            let result = find_peaks(&signal, opts);
+            let result = find_peaks(&signal, opts).map_err(|e| format!("find_peaks: {e}"))?;
             // All found peaks should have height > 0.5
             let all_high = result.peaks.iter().all(|&i| signal[i] > 0.5);
             if all_high {
@@ -665,7 +666,7 @@ fn scenario_06_find_peaks() {
                 distance: Some(10),
                 ..Default::default()
             };
-            let result = find_peaks(&signal, opts);
+            let result = find_peaks(&signal, opts).map_err(|e| format!("find_peaks: {e}"))?;
             // Check minimum distance between consecutive peaks
             let min_dist = result
                 .peaks

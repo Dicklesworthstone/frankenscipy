@@ -3963,197 +3963,370 @@ pub fn bohman_window(m: usize) -> Vec<f64> {
 // Peak Detection
 // ══════════════════════════════════════════════════════════════════════
 
-/// Options for peak detection.
+/// One `find_peaks` condition: SciPy's number-or-`(min, max)` interval. A bare number in SciPy
+/// is the minimum; either bound may be absent.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct FindPeaksOptions {
-    /// Minimum height of peaks.
-    pub height: Option<f64>,
-    /// Minimum horizontal distance between peaks (in samples).
-    pub distance: Option<usize>,
-    /// Minimum prominence of peaks.
-    pub prominence: Option<f64>,
-    /// Minimum width of peaks (in samples).
-    pub width: Option<f64>,
+pub struct PeakCondition {
+    /// Inclusive lower bound.
+    pub min: Option<f64>,
+    /// Inclusive upper bound.
+    pub max: Option<f64>,
 }
 
-/// Result of peak detection.
-#[derive(Debug, Clone, PartialEq)]
+impl PeakCondition {
+    /// `value <= property` (SciPy's scalar condition).
+    #[must_use]
+    pub const fn at_least(value: f64) -> Self {
+        Self {
+            min: Some(value),
+            max: None,
+        }
+    }
+
+    /// `min <= property <= max` (SciPy's `(min, max)` condition).
+    #[must_use]
+    pub const fn between(min: f64, max: f64) -> Self {
+        Self {
+            min: Some(min),
+            max: Some(max),
+        }
+    }
+
+    /// SciPy's `_select_by_property`: a NaN property fails every present bound.
+    fn keeps(self, value: f64) -> bool {
+        self.min.is_none_or(|lo| lo <= value) && self.max.is_none_or(|hi| value <= hi)
+    }
+}
+
+impl From<f64> for PeakCondition {
+    fn from(value: f64) -> Self {
+        Self::at_least(value)
+    }
+}
+
+/// Options for [`find_peaks`], mirroring `scipy.signal.find_peaks`'s keyword arguments.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FindPeaksOptions {
+    /// Required peak height.
+    pub height: Option<PeakCondition>,
+    /// Required vertical distance to BOTH neighbouring samples.
+    pub threshold: Option<PeakCondition>,
+    /// Minimal horizontal distance between neighbouring peaks, in samples (>= 1).
+    pub distance: Option<usize>,
+    /// Required prominence.
+    pub prominence: Option<PeakCondition>,
+    /// Required width, in samples, measured at `rel_height`.
+    pub width: Option<PeakCondition>,
+    /// Window length (> 1) that bounds the prominence search; `None` is unbounded.
+    pub wlen: Option<f64>,
+    /// Relative height at which widths are measured (SciPy default 0.5).
+    pub rel_height: f64,
+    /// Required size of the flat top, in samples.
+    pub plateau_size: Option<PeakCondition>,
+}
+
+impl Default for FindPeaksOptions {
+    fn default() -> Self {
+        Self {
+            height: None,
+            threshold: None,
+            distance: None,
+            prominence: None,
+            width: None,
+            wlen: None,
+            rel_height: 0.5,
+            plateau_size: None,
+        }
+    }
+}
+
+/// Result of [`find_peaks`]: the peaks and SciPy's `properties` dict. As in SciPy, a property
+/// is present only when the condition that computes it was given.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FindPeaksResult {
-    /// Indices of detected peaks.
+    /// Indices of the peaks that satisfy every condition.
     pub peaks: Vec<usize>,
-    /// Heights of detected peaks (if height filter was used).
-    pub peak_heights: Vec<f64>,
-    /// Prominences of detected peaks (if prominence filter was used).
-    pub prominences: Vec<f64>,
+    /// `plateau_size`: flat-top sizes and their first / last indices.
+    pub plateau_sizes: Option<Vec<usize>>,
+    pub left_edges: Option<Vec<usize>>,
+    pub right_edges: Option<Vec<usize>>,
+    /// `height`.
+    pub peak_heights: Option<Vec<f64>>,
+    /// `threshold`: vertical distance to the left / right neighbour.
+    pub left_thresholds: Option<Vec<f64>>,
+    pub right_thresholds: Option<Vec<f64>>,
+    /// `prominence` or `width`.
+    pub prominences: Option<Vec<f64>>,
+    pub left_bases: Option<Vec<usize>>,
+    pub right_bases: Option<Vec<usize>>,
+    /// `width`.
+    pub widths: Option<Vec<f64>>,
+    pub width_heights: Option<Vec<f64>>,
+    pub left_ips: Option<Vec<f64>>,
+    pub right_ips: Option<Vec<f64>>,
+}
+
+impl FindPeaksResult {
+    /// Keep the peaks (and every property computed so far) whose flag is set.
+    fn retain(&mut self, keep: &[bool]) {
+        fn filter<T: Copy>(values: &mut Option<Vec<T>>, keep: &[bool]) {
+            if let Some(values) = values {
+                *values = values
+                    .iter()
+                    .zip(keep)
+                    .filter_map(|(&v, &k)| k.then_some(v))
+                    .collect();
+            }
+        }
+        let mut peaks = Some(std::mem::take(&mut self.peaks));
+        filter(&mut peaks, keep);
+        self.peaks = peaks.unwrap_or_default();
+        filter(&mut self.plateau_sizes, keep);
+        filter(&mut self.left_edges, keep);
+        filter(&mut self.right_edges, keep);
+        filter(&mut self.peak_heights, keep);
+        filter(&mut self.left_thresholds, keep);
+        filter(&mut self.right_thresholds, keep);
+        filter(&mut self.prominences, keep);
+        filter(&mut self.left_bases, keep);
+        filter(&mut self.right_bases, keep);
+        filter(&mut self.widths, keep);
+        filter(&mut self.width_heights, keep);
+        filter(&mut self.left_ips, keep);
+        filter(&mut self.right_ips, keep);
+    }
 }
 
 /// Find peaks in a 1-D signal.
 ///
-/// Matches `scipy.signal.find_peaks(x, height, distance, prominence, width)`.
+/// Matches `scipy.signal.find_peaks(x, height, threshold, distance, prominence, width, wlen,
+/// rel_height, plateau_size)`: local maxima (a flat top counts once, at its middle sample), then
+/// the conditions in SciPy's order -- plateau size, height, threshold, distance, prominence,
+/// width. The order matters: `distance` keeps the highest peak of each neighbourhood among the
+/// peaks that survived the earlier conditions, and `prominence` / `width` are computed only for
+/// the peaks left at that point (frankenscipy-szq1n.10; width used to be ignored and distance
+/// ran after prominence).
 ///
-/// A sample is a peak if it is strictly greater than its immediate neighbors.
-pub fn find_peaks(x: &[f64], options: FindPeaksOptions) -> FindPeaksResult {
-    if x.len() < 3 {
-        return FindPeaksResult {
-            peaks: Vec::new(),
-            peak_heights: Vec::new(),
-            prominences: Vec::new(),
-        };
+/// # Errors
+/// As SciPy: `distance < 1`, `wlen` not a finite number > 1, or `rel_height < 0` when widths
+/// are computed.
+pub fn find_peaks(x: &[f64], options: FindPeaksOptions) -> Result<FindPeaksResult, SignalError> {
+    if options.distance == Some(0) {
+        return Err(SignalError::InvalidArgument(
+            "`distance` must be greater or equal to 1".to_string(),
+        ));
     }
-
-    // Step 1: find all local maxima (including plateaus)
-    let mut peaks: Vec<usize> = Vec::new();
-    let mut i = 1;
-    while i < x.len() - 1 {
-        if x[i] > x[i - 1] {
-            let mut j = i + 1;
-            while j < x.len() && x[j] == x[i] {
-                j += 1;
-            }
-            // If the plateau is followed by a smaller value or the end of the signal
-            if j < x.len() && x[i] > x[j] {
-                // Peak is the middle of the plateau
-                peaks.push((i + j - 1) / 2);
-            }
-            i = j;
-        } else {
-            i += 1;
+    let wlen = match options.wlen {
+        None => None,
+        Some(w) if w.is_finite() && w > 1.0 => Some(w.ceil() as usize),
+        Some(w) => {
+            return Err(SignalError::InvalidArgument(format!(
+                "`wlen` must be larger than 1, was {w}"
+            )));
         }
+    };
+    if options.width.is_some() && (options.rel_height.is_nan() || options.rel_height < 0.0) {
+        return Err(SignalError::InvalidArgument(
+            "`rel_height` must be greater or equal to 0.0".to_string(),
+        ));
     }
 
-    // Step 2: filter by height
-    if let Some(min_height) = options.height {
-        peaks.retain(|&i| x[i] >= min_height);
-    }
-
-    // Step 3: compute prominences (needed for prominence and width filters)
-    let prominences: Vec<f64> = peaks.iter().map(|&pk| compute_prominence(x, pk)).collect();
-
-    // Step 4: filter by prominence
-    if let Some(min_prom) = options.prominence {
-        let mut keep = Vec::new();
-        for (idx, &pk) in peaks.iter().enumerate() {
-            if prominences[idx] >= min_prom {
-                keep.push((pk, prominences[idx]));
-            }
-        }
-        peaks = keep.iter().map(|&(pk, _)| pk).collect();
-        let proms: Vec<f64> = keep.iter().map(|&(_, p)| p).collect();
-        // Rebuild prominences for kept peaks
-        let peak_heights: Vec<f64> = peaks.iter().map(|&i| x[i]).collect();
-
-        // Step 5: filter by distance (keep highest peak within each distance window)
-        if let Some(min_dist) = options.distance {
-            let filtered = filter_by_distance(&peaks, &peak_heights, min_dist);
-            let final_proms: Vec<f64> = filtered
-                .iter()
-                .map(|&pk| proms[peaks.binary_search(&pk).unwrap_or(0)])
-                .collect();
-            let final_heights: Vec<f64> = filtered.iter().map(|&i| x[i]).collect();
-            return FindPeaksResult {
-                peaks: filtered,
-                peak_heights: final_heights,
-                prominences: final_proms,
-            };
-        }
-
-        return FindPeaksResult {
-            peaks,
-            peak_heights,
-            prominences: proms,
-        };
-    }
-
-    let peak_heights: Vec<f64> = peaks.iter().map(|&i| x[i]).collect();
-
-    // Step 5: filter by distance
-    if let Some(min_dist) = options.distance {
-        let filtered = filter_by_distance(&peaks, &peak_heights, min_dist);
-        let final_heights: Vec<f64> = filtered.iter().map(|&i| x[i]).collect();
-        let final_proms: Vec<f64> = filtered
-            .iter()
-            .map(|&pk| compute_prominence(x, pk))
-            .collect();
-        return FindPeaksResult {
-            peaks: filtered,
-            peak_heights: final_heights,
-            prominences: final_proms,
-        };
-    }
-
-    FindPeaksResult {
+    let (peaks, left_edges, right_edges) = local_maxima_1d(x);
+    let mut result = FindPeaksResult {
         peaks,
-        peak_heights,
-        prominences,
+        ..FindPeaksResult::default()
+    };
+
+    if let Some(cond) = options.plateau_size {
+        let sizes: Vec<usize> = left_edges
+            .iter()
+            .zip(&right_edges)
+            .map(|(&l, &r)| r - l + 1)
+            .collect();
+        let keep: Vec<bool> = sizes.iter().map(|&s| cond.keeps(s as f64)).collect();
+        result.plateau_sizes = Some(sizes);
+        result.left_edges = Some(left_edges);
+        result.right_edges = Some(right_edges);
+        result.retain(&keep);
     }
+
+    if let Some(cond) = options.height {
+        let heights: Vec<f64> = result.peaks.iter().map(|&p| x[p]).collect();
+        let keep: Vec<bool> = heights.iter().map(|&h| cond.keeps(h)).collect();
+        result.peak_heights = Some(heights);
+        result.retain(&keep);
+    }
+
+    if let Some(cond) = options.threshold {
+        // SciPy's `_select_by_peak_threshold`: the minimum must hold for the SMALLER of the two
+        // neighbour distances and the maximum for the LARGER (NaN-propagating, like np.min/max).
+        let left: Vec<f64> = result.peaks.iter().map(|&p| x[p] - x[p - 1]).collect();
+        let right: Vec<f64> = result.peaks.iter().map(|&p| x[p] - x[p + 1]).collect();
+        let keep: Vec<bool> = left
+            .iter()
+            .zip(&right)
+            .map(|(&l, &r)| {
+                let (lo, hi) = if l.is_nan() || r.is_nan() {
+                    (f64::NAN, f64::NAN)
+                } else {
+                    (l.min(r), l.max(r))
+                };
+                cond.min.is_none_or(|t| t <= lo) && cond.max.is_none_or(|t| hi <= t)
+            })
+            .collect();
+        result.left_thresholds = Some(left);
+        result.right_thresholds = Some(right);
+        result.retain(&keep);
+    }
+
+    if let Some(distance) = options.distance {
+        let priority: Vec<f64> = result.peaks.iter().map(|&p| x[p]).collect();
+        let keep = select_by_peak_distance(&result.peaks, &priority, distance);
+        result.retain(&keep);
+    }
+
+    if options.prominence.is_some() || options.width.is_some() {
+        let (prominences, left_bases, right_bases) =
+            peak_prominences_in_window(x, &result.peaks, wlen);
+        result.prominences = Some(prominences);
+        result.left_bases = Some(left_bases);
+        result.right_bases = Some(right_bases);
+    }
+
+    if let Some(cond) = options.prominence {
+        let keep: Vec<bool> = result
+            .prominences
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|&p| cond.keeps(p))
+            .collect();
+        result.retain(&keep);
+    }
+
+    if let Some(cond) = options.width {
+        let (widths, width_heights, left_ips, right_ips) = peak_widths_from_bases(
+            x,
+            &result.peaks,
+            options.rel_height,
+            result.prominences.as_deref().unwrap_or_default(),
+            result.left_bases.as_deref().unwrap_or_default(),
+            result.right_bases.as_deref().unwrap_or_default(),
+        );
+        let keep: Vec<bool> = widths.iter().map(|&w| cond.keeps(w)).collect();
+        result.widths = Some(widths);
+        result.width_heights = Some(width_heights);
+        result.left_ips = Some(left_ips);
+        result.right_ips = Some(right_ips);
+        result.retain(&keep);
+    }
+
+    Ok(result)
 }
 
-/// Compute the prominence of a peak.
-/// Prominence = peak height - max(left base, right base).
-fn compute_prominence(x: &[f64], peak_idx: usize) -> f64 {
-    let peak_val = x[peak_idx];
-
-    // Search left for the lowest point before reaching a higher peak or the edge
-    let mut left_min = peak_val;
-    for &xi in x[..peak_idx].iter().rev() {
-        left_min = left_min.min(xi);
-        if xi > peak_val {
-            break;
-        }
+/// SciPy's `_local_maxima_1d`: every sample (not the first or last) greater than its left
+/// neighbour whose next UNEQUAL sample is smaller; a flat top is one maximum at its middle
+/// (rounded down). Returns (midpoints, left edges, right edges).
+fn local_maxima_1d(x: &[f64]) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    let mut midpoints = Vec::new();
+    let mut left_edges = Vec::new();
+    let mut right_edges = Vec::new();
+    if x.len() < 3 {
+        return (midpoints, left_edges, right_edges);
     }
-
-    // Search right
-    let mut right_min = peak_val;
-    for &xi in &x[peak_idx + 1..] {
-        right_min = right_min.min(xi);
-        if xi > peak_val {
-            break;
+    let i_max = x.len() - 1;
+    let mut i = 1;
+    while i < i_max {
+        if x[i - 1] < x[i] {
+            let mut i_ahead = i + 1;
+            while i_ahead < i_max && x[i_ahead] == x[i] {
+                i_ahead += 1;
+            }
+            if x[i_ahead] < x[i] {
+                left_edges.push(i);
+                right_edges.push(i_ahead - 1);
+                midpoints.push((i + i_ahead - 1) / 2);
+                i = i_ahead;
+            }
         }
+        i += 1;
     }
-
-    peak_val - left_min.max(right_min)
+    (midpoints, left_edges, right_edges)
 }
 
-/// Filter peaks by minimum distance, keeping the highest peak in each window.
-fn filter_by_distance(peaks: &[usize], heights: &[f64], min_dist: usize) -> Vec<usize> {
-    if peaks.is_empty() {
-        return Vec::new();
-    }
-
-    // Sort peaks by height (descending) for greedy selection.
-    // Store original index to quickly access 'excluded' status.
-    let mut indexed: Vec<(usize, usize, f64)> = peaks
-        .iter()
-        .zip(heights.iter())
-        .enumerate()
-        .map(|(i, (&p, &h))| (i, p, h))
-        .collect();
-    indexed.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
-
-    let mut selected = Vec::new();
-    let mut excluded = vec![false; peaks.len()];
-
-    for &(orig_idx, pk, _) in &indexed {
-        if excluded[orig_idx] {
+/// SciPy's `_select_by_peak_distance`: visit peaks from highest to lowest (`priority`) and drop
+/// every not-yet-dropped neighbour closer than `distance` samples. Equal priorities are visited
+/// right to left (numpy's stable ascending argsort, walked backwards).
+fn select_by_peak_distance(peaks: &[usize], priority: &[f64], distance: usize) -> Vec<bool> {
+    let mut keep = vec![true; peaks.len()];
+    let mut order: Vec<usize> = (0..peaks.len()).collect();
+    order.sort_by(|&a, &b| priority[a].total_cmp(&priority[b]).then(a.cmp(&b)));
+    for &j in order.iter().rev() {
+        if !keep[j] {
             continue;
         }
-        selected.push(pk);
-
-        // Exclude all peaks within min_dist of pk.
-        // Since 'peaks' is sorted by position, use binary search to find the range.
-        let start_val = pk.saturating_sub(min_dist.saturating_sub(1));
-        let end_val = pk.saturating_add(min_dist);
-
-        let left = peaks.binary_search(&start_val).unwrap_or_else(|x| x);
-        let right = peaks.binary_search(&end_val).unwrap_or_else(|x| x);
-
-        for slot in excluded.iter_mut().take(right).skip(left) {
-            *slot = true;
+        let mut k = j;
+        while k > 0 && peaks[j] - peaks[k - 1] < distance {
+            keep[k - 1] = false;
+            k -= 1;
+        }
+        let mut k = j + 1;
+        while k < peaks.len() && peaks[k] - peaks[j] < distance {
+            keep[k] = false;
+            k += 1;
         }
     }
+    keep
+}
 
-    selected.sort_unstable();
-    selected
+/// Prominences as SciPy's `_peak_prominences`, optionally restricted to a window of `wlen`
+/// samples centred on each peak (an even `wlen` is rounded up to the next odd length).
+fn peak_prominences_in_window(
+    x: &[f64],
+    peaks: &[usize],
+    wlen: Option<usize>,
+) -> (Vec<f64>, Vec<usize>, Vec<usize>) {
+    let Some(wlen) = wlen else {
+        return peak_prominences(x, peaks);
+    };
+    let mut prominences = Vec::with_capacity(peaks.len());
+    let mut left_bases = Vec::with_capacity(peaks.len());
+    let mut right_bases = Vec::with_capacity(peaks.len());
+    for &peak in peaks {
+        let i_min = peak.saturating_sub(wlen / 2);
+        let i_max = (peak + wlen / 2).min(x.len() - 1);
+        let mut left_base = peak;
+        let mut left_min = x[peak];
+        let mut i = peak;
+        loop {
+            // SciPy's loop runs while `x[i] <= x[peak]`, so a NaN sample also ends it.
+            if x[i] > x[peak] || x[i].is_nan() {
+                break;
+            }
+            if x[i] < left_min {
+                left_min = x[i];
+                left_base = i;
+            }
+            if i == i_min {
+                break;
+            }
+            i -= 1;
+        }
+        let mut right_base = peak;
+        let mut right_min = x[peak];
+        let mut i = peak;
+        while i <= i_max && x[i] <= x[peak] {
+            if x[i] < right_min {
+                right_min = x[i];
+                right_base = i;
+            }
+            i += 1;
+        }
+        prominences.push(x[peak] - left_min.max(right_min));
+        left_bases.push(left_base);
+        right_bases.push(right_base);
+    }
+    (prominences, left_bases, right_bases)
 }
 
 /// Compute peak prominences for given peak indices.
@@ -4377,50 +4550,64 @@ pub fn peak_widths(
     rel_height: f64,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let (prominences, left_bases, right_bases) = peak_prominences(x, peaks);
+    peak_widths_from_bases(
+        x,
+        peaks,
+        rel_height,
+        &prominences,
+        &left_bases,
+        &right_bases,
+    )
+}
 
+/// SciPy's `_peak_widths` given the prominence data: from the peak, walk outwards while the
+/// signal stays above `height = x[peak] - prominence * rel_height` (not past the base), then
+/// interpolate linearly where the crossing falls strictly between two samples. An out-of-range
+/// peak index gives a zero-width entry at that index.
+fn peak_widths_from_bases(
+    x: &[f64],
+    peaks: &[usize],
+    rel_height: f64,
+    prominences: &[f64],
+    left_bases: &[usize],
+    right_bases: &[usize],
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
     let mut widths = Vec::with_capacity(peaks.len());
     let mut width_heights = Vec::with_capacity(peaks.len());
     let mut left_ips = Vec::with_capacity(peaks.len());
     let mut right_ips = Vec::with_capacity(peaks.len());
 
-    for (idx, &pk) in peaks.iter().enumerate() {
-        if pk >= x.len() {
-            let ip = pk as f64;
+    for (idx, &peak) in peaks.iter().enumerate() {
+        if peak >= x.len() {
+            let ip = peak as f64;
             widths.push(0.0);
             width_heights.push(0.0);
             left_ips.push(ip);
             right_ips.push(ip);
             continue;
         }
-
-        let height = x[pk] - prominences[idx] * rel_height;
+        let (i_min, i_max) = (left_bases[idx], right_bases[idx]);
+        let height = x[peak] - prominences[idx] * rel_height;
         width_heights.push(height);
 
-        // Find left intersection point (interpolated)
-        let mut left_ip = left_bases[idx] as f64;
-        for i in (left_bases[idx]..pk).rev() {
-            if x[i] <= height {
-                // Linear interpolation between i and i+1
-                if i + 1 < x.len() && (x[i + 1] - x[i]).abs() > 1e-15 {
-                    left_ip = i as f64 + (height - x[i]) / (x[i + 1] - x[i]);
-                } else {
-                    left_ip = i as f64;
-                }
-                break;
-            }
+        let mut i = peak;
+        while i_min < i && height < x[i] {
+            i -= 1;
+        }
+        let mut left_ip = i as f64;
+        // `i < peak` always holds here for rel_height >= 0 (height <= x[peak]); the guard
+        // only keeps a negative rel_height from indexing past the signal.
+        if x[i] < height && i < peak {
+            left_ip += (height - x[i]) / (x[i + 1] - x[i]);
         }
 
-        // Find right intersection point
-        let mut right_ip = right_bases[idx] as f64;
-        for i in pk + 1..=right_bases[idx] {
-            if x[i] <= height {
-                if i > 0 && (x[i] - x[i - 1]).abs() > 1e-15 {
-                    right_ip = i as f64 - (x[i] - height) / (x[i] - x[i - 1]);
-                } else {
-                    right_ip = i as f64;
-                }
-                break;
-            }
+        let mut i = peak;
+        while i < i_max && height < x[i] {
+            i += 1;
+        }
+        let mut right_ip = i as f64;
+        if x[i] < height && i > peak {
+            right_ip -= (height - x[i]) / (x[i - 1] - x[i]);
         }
 
         left_ips.push(left_ip);
@@ -12624,6 +12811,21 @@ pub fn remez(
             nbands
         )));
     }
+    // SciPy's _remez: every edge must lie in [0, fs/2] (fs = 1 here) and the whole
+    // edge sequence must be nondecreasing -- not just each band on its own.
+    if bands
+        .iter()
+        .any(|&edge| !edge.is_finite() || !(0.0..=0.5).contains(&edge))
+    {
+        return Err(SignalError::InvalidArgument(
+            "Band edges should be less than 1/2 the sampling frequency".to_string(),
+        ));
+    }
+    if bands.windows(2).any(|pair| pair[1] < pair[0]) {
+        return Err(SignalError::InvalidArgument(
+            "Bands must be monotonic starting at zero.".to_string(),
+        ));
+    }
 
     let weights: Vec<f64> = weight.map_or_else(|| vec![1.0; nbands], |w| w.to_vec());
     if weights.len() != nbands {
@@ -12635,102 +12837,17 @@ pub fn remez(
     // Odd numtaps: true Parks-McClellan (Type I equiripple). Even numtaps:
     // Type-II Parks-McClellan via the cos(ω/2) factorization. Both are the
     // unique equiripple minimax optimum, so they match scipy.signal.remez to
-    // machine precision. The least-squares fallback below is retained only for
-    // pathological grids where the exchange cannot form `nz` alternations.
+    // machine precision.
+    //
+    // br-szq1n.13: when the even-length exchange failed, this used to return a
+    // frequency-sampling least-squares design instead -- a different filter
+    // (not equiripple) handed back as if it were the minimax one. SciPy's remez
+    // raises ("Failure to converge ..., try reducing transition band width"), so
+    // the Parks-McClellan error is propagated.
     if numtaps % 2 == 1 {
         return remez_type1_pm(numtaps, bands, desired, &weights);
     }
-    if let Ok(h) = remez_type2_pm(numtaps, bands, desired, &weights) {
-        return Ok(h);
-    }
-
-    // Least-squares fallback (even numtaps): frequency-sampling approximation.
-    let n = numtaps;
-    let m = n / 2; // number of cosine coefficients for type I (odd length)
-
-    // Create dense frequency grid
-    let grid_size = 512.max(16 * n);
-    let mut freq_grid = Vec::with_capacity(grid_size);
-    let mut desired_grid = Vec::with_capacity(grid_size);
-    let mut weight_grid = Vec::with_capacity(grid_size);
-
-    for band_idx in 0..nbands {
-        let f_start = bands[2 * band_idx];
-        let f_end = bands[2 * band_idx + 1];
-        let npts = (grid_size as f64 * (f_end - f_start) * 2.0).ceil() as usize;
-        let npts = npts.max(4);
-
-        for k in 0..npts {
-            let freq = f_start + (f_end - f_start) * k as f64 / (npts - 1).max(1) as f64;
-            freq_grid.push(freq);
-            desired_grid.push(desired[band_idx]);
-            weight_grid.push(weights[band_idx]);
-        }
-    }
-
-    // Least-squares design on the cosine basis
-    // H(f) = sum_{k=0}^{m} a_k * cos(2π * k * f)
-    // Minimize weighted error: sum w_i * (H(f_i) - D(f_i))^2
-    let n_coeffs = m + 1;
-    let ng = freq_grid.len();
-
-    // Normal equations: A^T W A x = A^T W d
-    let mut ata = vec![vec![0.0; n_coeffs]; n_coeffs];
-    let mut atd = vec![0.0; n_coeffs];
-    let two_pi = 2.0 * std::f64::consts::PI;
-    let mut cos_basis = vec![0.0; n_coeffs];
-
-    for i in 0..ng {
-        let f = freq_grid[i];
-        let w = weight_grid[i]; // WLS weight: minimize Σ w_i * (H(f_i) - D(f_i))²
-        let d = desired_grid[i];
-        // cos(2π·j·f) for j=0..n_coeffs via the Chebyshev recurrence
-        // cos(jθ) = 2cos(θ)·cos((j-1)θ) − cos((j-2)θ): ONE cos() per grid point instead of
-        // n_coeffs, accurate to ~1e-14 (well within remez's ~1e-6 tolerance). frankenscipy-9l5oo.
-        cos_basis[0] = 1.0;
-        if n_coeffs > 1 {
-            let c1 = (two_pi * f).cos();
-            cos_basis[1] = c1;
-            let two_c1 = 2.0 * c1;
-            for j in 2..n_coeffs {
-                cos_basis[j] = two_c1 * cos_basis[j - 1] - cos_basis[j - 2];
-            }
-        }
-
-        for j in 0..n_coeffs {
-            let cj = cos_basis[j];
-            atd[j] += w * cj * d;
-            let (head, tail) = ata.split_at_mut(j + 1);
-            let ata_j = &mut head[j];
-            ata_j[j] += w * cj * cj;
-            for (offset, ata_row) in tail.iter_mut().enumerate() {
-                let k = j + 1 + offset;
-                let ck = cos_basis[k];
-                let value = w * cj * ck;
-                ata_row[j] += value;
-                ata_j[k] += value;
-            }
-        }
-    }
-
-    // Solve normal equations (Cholesky or simple Gaussian elimination)
-    let a_coeffs = solve_symmetric(&ata, &atd)?;
-
-    // Convert cosine coefficients to symmetric FIR filter taps.
-    // H(f) = a_0 + 2 * Σ_{k=1}^{m} a_k cos(2πkf)
-    // corresponds to h[m] = a_0, h[m±k] = a_k/2 for k=1..m
-    let mut h = vec![0.0; n];
-    h[m] = a_coeffs[0];
-    for k in 1..n_coeffs {
-        if m >= k {
-            h[m - k] = a_coeffs[k] / 2.0;
-        }
-        if m + k < n {
-            h[m + k] = a_coeffs[k] / 2.0;
-        }
-    }
-
-    Ok(h)
+    remez_type2_pm(numtaps, bands, desired, &weights)
 }
 
 /// Parks-McClellan (Remez exchange) for a Type-I (odd `numtaps`, symmetric)
@@ -19592,25 +19709,27 @@ impl Lti {
         (mag, phase)
     }
 
-    /// Compute the step response of the system.
-    ///
-    /// Uses numerical simulation with RK4 integration.
+    /// Step response at the times `t` (`t[0] ≥ 0`, equally spaced): `scipy.signal.step`, i.e.
+    /// [`Lti::lsim`] with a unit input held constant between samples — exact up to the matrix
+    /// exponential, however stiff the system.
     pub fn step(&self, t: &[f64]) -> Result<Vec<f64>, SignalError> {
         if t.is_empty() {
             return Ok(Vec::new());
         }
-        // Convert to state-space and simulate
-        let (a, b, c, d) = tf2ss_controllable(&self.num, &self.den)?;
-        simulate_lti_step(&a, &b, &c, d, t)
+        let ss = tf2ss(&self.num, &self.den)?;
+        lsim_state_space(&ss, Some(&vec![1.0; t.len()]), t, None, false)
     }
 
-    /// Compute the impulse response of the system.
+    /// Impulse response at the times `t`: `scipy.signal.impulse`, the zero-input response from
+    /// `x(0) = B`. As in SciPy, the feedthrough term `D·δ(t)` has no sampled value and is not
+    /// added.
     pub fn impulse(&self, t: &[f64]) -> Result<Vec<f64>, SignalError> {
         if t.is_empty() {
             return Ok(Vec::new());
         }
-        let (a, b, c, d) = tf2ss_controllable(&self.num, &self.den)?;
-        simulate_lti_impulse(&a, &b, &c, d, t)
+        let ss = tf2ss(&self.num, &self.den)?;
+        let x0 = ss.1.clone();
+        lsim_state_space(&ss, None, t, Some(&x0), false)
     }
 
     /// Get the system's poles (roots of denominator).
@@ -19625,18 +19744,21 @@ impl Lti {
         Ok(re.into_iter().zip(im).collect())
     }
 
-    /// Simulate the response of the LTI system to arbitrary input.
+    /// Response to the input `u` sampled at the equally spaced times `t` (`t[0] ≥ 0`):
+    /// `scipy.signal.lsim(system, u, t, x0, interp)`.
     ///
-    /// Matches `scipy.signal.lsim`. Uses state-space representation with RK4.
-    ///
-    /// # Arguments
-    /// * `u` - Input signal values at each time point
-    /// * `t` - Time points (must be uniformly spaced)
-    /// * `x0` - Initial state (None for zero initial conditions)
-    ///
-    /// # Returns
-    /// Output signal values at each time point
-    pub fn lsim(&self, u: &[f64], t: &[f64], x0: Option<&[f64]>) -> Result<Vec<f64>, SignalError> {
+    /// Exact for an input linear between samples (`interp = true`, SciPy's default) or
+    /// constant between samples (`interp = false`): each step applies the matrix exponential of
+    /// the augmented system `[[A·dt, B·dt, 0], [0, 0, I], [0, 0, 0]]` (or `[[A·dt, B·dt], [0,
+    /// 0]]`), as SciPy does. `x0` is the initial state of `tf2ss`'s realization (SciPy's);
+    /// with `t[0] > 0` it is first advanced to `t[0]` with zero input.
+    pub fn lsim(
+        &self,
+        u: &[f64],
+        t: &[f64],
+        x0: Option<&[f64]>,
+        interp: bool,
+    ) -> Result<Vec<f64>, SignalError> {
         if t.is_empty() {
             return Ok(Vec::new());
         }
@@ -19647,50 +19769,135 @@ impl Lti {
                 t.len()
             )));
         }
-
-        let (a, b, c, d) = tf2ss_controllable(&self.num, &self.den)?;
-        let n = b.len();
-
-        // Initialize state
-        let mut x = if let Some(x0_init) = x0 {
-            if x0_init.len() != n {
-                return Err(SignalError::InvalidArgument(format!(
-                    "initial state length {} must match system order {}",
-                    x0_init.len(),
-                    n
-                )));
-            }
-            x0_init.to_vec()
-        } else {
-            vec![0.0; n]
-        };
-
-        if n == 0 {
-            // Static system: y = d*u
-            return Ok(u.iter().map(|&ui| d * ui).collect());
-        }
-
-        let mut y = Vec::with_capacity(t.len());
-
-        for i in 0..t.len() {
-            // Output: y = c'x + d*u
-            let output: f64 = c
-                .iter()
-                .zip(x.iter())
-                .map(|(&ci, &xi)| ci * xi)
-                .sum::<f64>()
-                + d * u[i];
-            y.push(output);
-
-            if i + 1 < t.len() {
-                let dt = t[i + 1] - t[i];
-                // RK4 step with current input
-                x = rk4_step(&a, &b, &x, u[i], dt);
-            }
-        }
-
-        Ok(y)
+        let ss = tf2ss(&self.num, &self.den)?;
+        lsim_state_space(&ss, Some(u), t, x0, interp)
     }
+}
+
+/// `scipy.signal.lsim` on the single-input single-output realization `(A, B, C, D)` (`None`
+/// input = zero input).
+fn lsim_state_space(
+    ss: &(Vec<Vec<f64>>, Vec<f64>, Vec<f64>, f64),
+    u: Option<&[f64]>,
+    t: &[f64],
+    x0: Option<&[f64]>,
+    interp: bool,
+) -> Result<Vec<f64>, SignalError> {
+    let (a, b, c, d) = ss;
+    let n = b.len();
+    if t.iter().any(|v| !v.is_finite()) {
+        return Err(SignalError::InvalidArgument(
+            "time points must be finite".to_string(),
+        ));
+    }
+    let x_init = match x0 {
+        Some(x) if x.len() != n => {
+            return Err(SignalError::InvalidArgument(format!(
+                "initial state length {} must match system order {n}",
+                x.len()
+            )));
+        }
+        Some(x) => x.to_vec(),
+        None => vec![0.0; n],
+    };
+    if t[0] < 0.0 {
+        return Err(SignalError::InvalidArgument(
+            "Initial time must be nonnegative".to_string(),
+        ));
+    }
+    let no_input = u.is_none_or(|u| u.iter().all(|&v| v == 0.0));
+    let dt = if t.len() > 1 { t[1] - t[0] } else { 0.0 };
+    // np.allclose(np.diff(T), dt): |Δt − dt| ≤ 1e-8 + 1e-5·|dt|.
+    if t.windows(2)
+        .any(|w| ((w[1] - w[0]) - dt).abs() > 1e-8 + 1e-5 * dt.abs())
+    {
+        return Err(SignalError::InvalidArgument(
+            "Time steps are not equally spaced.".to_string(),
+        ));
+    }
+    let feedthrough = |i: usize| match u {
+        Some(u) if !no_input => d * u[i],
+        _ => 0.0,
+    };
+    if n == 0 {
+        return Ok((0..t.len()).map(feedthrough).collect());
+    }
+
+    // State rows are advanced as row vectors times exp(Mᵀ), exactly as SciPy writes it.
+    let expm_of_transpose = |m: &[Vec<f64>]| -> Result<Vec<Vec<f64>>, SignalError> {
+        let size = m.len();
+        let mt: Vec<Vec<f64>> = (0..size)
+            .map(|i| (0..size).map(|j| m[j][i]).collect())
+            .collect();
+        fsci_linalg::expm(&mt, fsci_linalg::DecompOptions::default())
+            .map_err(|e| SignalError::InvalidArgument(format!("expm failed: {e}")))
+    };
+    let row_times = |x: &[f64], e: &[Vec<f64>]| -> Vec<f64> {
+        (0..n)
+            .map(|j| x.iter().zip(e).map(|(xk, row)| xk * row[j]).sum())
+            .collect()
+    };
+    let scaled_a = |s: f64| -> Vec<Vec<f64>> {
+        a.iter()
+            .map(|row| row.iter().map(|v| v * s).collect())
+            .collect()
+    };
+
+    let mut xout = Vec::with_capacity(t.len());
+    xout.push(if t[0] == 0.0 {
+        x_init
+    } else {
+        row_times(&x_init, &expm_of_transpose(&scaled_a(t[0]))?)
+    });
+    if t.len() > 1 {
+        if no_input {
+            let e = expm_of_transpose(&scaled_a(dt))?;
+            for i in 1..t.len() {
+                let next = row_times(&xout[i - 1], &e);
+                xout.push(next);
+            }
+        } else {
+            let u = u.expect("an input is present when no_input is false");
+            let blocks = if interp { n + 2 } else { n + 1 };
+            let mut m = vec![vec![0.0; blocks]; blocks];
+            for i in 0..n {
+                for j in 0..n {
+                    m[i][j] = a[i][j] * dt;
+                }
+                m[i][n] = b[i] * dt;
+            }
+            if interp {
+                m[n][n + 1] = 1.0;
+            }
+            let e = expm_of_transpose(&m)?;
+            let ad: Vec<Vec<f64>> = e[..n].iter().map(|row| row[..n].to_vec()).collect();
+            if interp {
+                let bd1 = &e[n + 1][..n];
+                let bd0: Vec<f64> = e[n][..n].iter().zip(bd1).map(|(p, q)| p - q).collect();
+                for i in 1..t.len() {
+                    let mut next = row_times(&xout[i - 1], &ad);
+                    for (k, v) in next.iter_mut().enumerate() {
+                        *v += u[i - 1] * bd0[k] + u[i] * bd1[k];
+                    }
+                    xout.push(next);
+                }
+            } else {
+                let bd = &e[n][..n];
+                for i in 1..t.len() {
+                    let mut next = row_times(&xout[i - 1], &ad);
+                    for (k, v) in next.iter_mut().enumerate() {
+                        *v += u[i - 1] * bd[k];
+                    }
+                    xout.push(next);
+                }
+            }
+        }
+    }
+    Ok(xout
+        .iter()
+        .enumerate()
+        .map(|(i, x)| x.iter().zip(c).map(|(xk, ck)| xk * ck).sum::<f64>() + feedthrough(i))
+        .collect())
 }
 
 /// Continuous-time LTI system in transfer-function form, matching
@@ -19985,20 +20192,16 @@ impl Dlti {
 
 /// Simulate the response of a continuous-time LTI system.
 ///
-/// Standalone function matching `scipy.signal.lsim`.
-///
-/// # Arguments
-/// * `system` - The LTI system
-/// * `u` - Input signal values
-/// * `t` - Time points
-/// * `x0` - Initial state (None for zero)
+/// Standalone function matching `scipy.signal.lsim(system, u, t, x0, interp)`; see
+/// [`Lti::lsim`].
 pub fn lsim(
     system: &Lti,
     u: &[f64],
     t: &[f64],
     x0: Option<&[f64]>,
+    interp: bool,
 ) -> Result<Vec<f64>, SignalError> {
-    system.lsim(u, t, x0)
+    system.lsim(u, t, x0, interp)
 }
 
 /// Simulate the response of a discrete-time LTI system.
@@ -20107,66 +20310,6 @@ fn poly_eval_complex(coeffs: &[f64], z_re: f64, z_im: f64) -> (f64, f64) {
         im = new_im;
     }
     (re, im)
-}
-
-/// Internal transfer-function → state-space realization used by the LTI
-/// simulation helpers. This uses a different (equally valid) canonical form
-/// than scipy's [`tf2ss`]; since simulation output is realization-independent,
-/// the two are interchangeable for the simulators. Public scipy-matching
-/// conversion is [`tf2ss`].
-type SsControllable = (Vec<Vec<f64>>, Vec<f64>, Vec<f64>, f64);
-
-fn tf2ss_controllable(num: &[f64], den: &[f64]) -> Result<SsControllable, SignalError> {
-    if den.is_empty() || den[0] == 0.0 {
-        return Err(SignalError::InvalidArgument(
-            "denominator leading coefficient cannot be zero".to_string(),
-        ));
-    }
-
-    let n = den.len() - 1; // System order
-    if n == 0 {
-        // Static gain
-        let d = if num.is_empty() { 0.0 } else { num[0] / den[0] };
-        return Ok((Vec::new(), Vec::new(), Vec::new(), d));
-    }
-
-    // Normalize denominator
-    let a0 = den[0];
-    let den_norm: Vec<f64> = den.iter().map(|&x| x / a0).collect();
-
-    // Pad numerator to match denominator length
-    let mut num_padded = vec![0.0; den.len()];
-    let offset = den.len().saturating_sub(num.len());
-    for (i, &c) in num.iter().enumerate() {
-        if offset + i < num_padded.len() {
-            num_padded[offset + i] = c / a0;
-        }
-    }
-
-    // Controllable canonical form
-    // A matrix (n x n)
-    let mut a = vec![vec![0.0; n]; n];
-    for i in 0..n - 1 {
-        a[i][i + 1] = 1.0;
-    }
-    for i in 0..n {
-        a[n - 1][i] = -den_norm[n - i];
-    }
-
-    // B vector (n x 1)
-    let mut b = vec![0.0; n];
-    b[n - 1] = 1.0;
-
-    // C vector (1 x n)
-    let mut c = vec![0.0; n];
-    for i in 0..n {
-        c[i] = num_padded[n - i] - num_padded[0] * den_norm[n - i];
-    }
-
-    // D scalar
-    let d = num_padded[0];
-
-    Ok((a, b, c, d))
 }
 
 /// Characteristic polynomial coefficients (monic, descending powers) of a
@@ -20859,124 +21002,6 @@ pub fn residuez(
         .collect();
     let k: Vec<f64> = k_rev.iter().rev().map(|&(re, _)| re).collect();
     Ok((r, poles_full, k))
-}
-
-/// Simulate step response using RK4 integration.
-fn simulate_lti_step(
-    a: &[Vec<f64>],
-    b: &[f64],
-    c: &[f64],
-    d: f64,
-    t: &[f64],
-) -> Result<Vec<f64>, SignalError> {
-    let n = b.len();
-    if n == 0 {
-        // Static system
-        return Ok(vec![d; t.len()]);
-    }
-
-    let mut x = vec![0.0; n];
-    let mut y = Vec::with_capacity(t.len());
-
-    for i in 0..t.len() {
-        // Output: y = c'x + d*u (u = 1 for step)
-        let output: f64 = c
-            .iter()
-            .zip(x.iter())
-            .map(|(&ci, &xi)| ci * xi)
-            .sum::<f64>()
-            + d;
-        y.push(output);
-
-        if i + 1 < t.len() {
-            let dt = t[i + 1] - t[i];
-            // RK4 step with u = 1
-            x = rk4_step(a, b, &x, 1.0, dt);
-        }
-    }
-
-    Ok(y)
-}
-
-/// Simulate impulse response.
-fn simulate_lti_impulse(
-    a: &[Vec<f64>],
-    b: &[f64],
-    c: &[f64],
-    d: f64,
-    t: &[f64],
-) -> Result<Vec<f64>, SignalError> {
-    let n = b.len();
-    if n == 0 {
-        // Static system - impulse response is delta * d
-        let mut y = vec![0.0; t.len()];
-        if !y.is_empty() {
-            y[0] = d;
-        }
-        return Ok(y);
-    }
-
-    // Initial condition: x(0+) = b (from impulse)
-    let mut x = b.to_vec();
-    let mut y = Vec::with_capacity(t.len());
-
-    for i in 0..t.len() {
-        // Output: y = c'x (no feedthrough for impulse after t=0)
-        let output: f64 = c.iter().zip(x.iter()).map(|(&ci, &xi)| ci * xi).sum();
-        y.push(output);
-
-        if i + 1 < t.len() {
-            let dt = t[i + 1] - t[i];
-            // RK4 step with u = 0 (no input after initial impulse)
-            x = rk4_step(a, b, &x, 0.0, dt);
-        }
-    }
-
-    // Add direct feedthrough at t=0
-    if !y.is_empty() && d != 0.0 {
-        // The impulse contribution at t=0 should include d*delta(0)
-        // For discrete representation, we add d to y[0]
-        y[0] += d;
-    }
-
-    Ok(y)
-}
-
-/// Single RK4 integration step for x' = Ax + Bu.
-fn rk4_step(a: &[Vec<f64>], b: &[f64], x: &[f64], u: f64, dt: f64) -> Vec<f64> {
-    let n = x.len();
-
-    let f = |x: &[f64]| -> Vec<f64> {
-        let mut dx = vec![0.0; n];
-        for i in 0..n {
-            for j in 0..n {
-                dx[i] += a[i][j] * x[j];
-            }
-            dx[i] += b[i] * u;
-        }
-        dx
-    };
-
-    let k1 = f(x);
-    let x1: Vec<f64> = x
-        .iter()
-        .zip(&k1)
-        .map(|(&xi, &ki)| xi + 0.5 * dt * ki)
-        .collect();
-    let k2 = f(&x1);
-    let x2: Vec<f64> = x
-        .iter()
-        .zip(&k2)
-        .map(|(&xi, &ki)| xi + 0.5 * dt * ki)
-        .collect();
-    let k3 = f(&x2);
-    let x3: Vec<f64> = x.iter().zip(&k3).map(|(&xi, &ki)| xi + dt * ki).collect();
-    let k4 = f(&x3);
-
-    x.iter()
-        .enumerate()
-        .map(|(i, &xi)| xi + dt / 6.0 * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i]))
-        .collect()
 }
 
 /// Daubechies orthogonal wavelet filter coefficients of order `p`.
@@ -23338,7 +23363,7 @@ mod tests {
     #[test]
     fn find_peaks_simple() {
         let x = [0.0, 1.0, 0.0, 2.0, 0.0, 1.5, 0.0];
-        let result = find_peaks(&x, FindPeaksOptions::default());
+        let result = find_peaks(&x, FindPeaksOptions::default()).expect("find_peaks");
         assert_eq!(result.peaks, vec![1, 3, 5]);
     }
 
@@ -23348,11 +23373,13 @@ mod tests {
         let result = find_peaks(
             &x,
             FindPeaksOptions {
-                height: Some(1.5),
+                height: Some(PeakCondition::at_least(1.5)),
                 ..FindPeaksOptions::default()
             },
-        );
+        )
+        .expect("find_peaks");
         assert_eq!(result.peaks, vec![3]); // only the peak at 2.0
+        assert_eq!(result.peak_heights, Some(vec![2.0]));
     }
 
     #[test]
@@ -23364,7 +23391,8 @@ mod tests {
                 distance: Some(3),
                 ..FindPeaksOptions::default()
             },
-        );
+        )
+        .expect("find_peaks");
         // Distance=3: peaks at 1 and 3 are too close (dist=2), keep highest (1.0 at idx 1)
         // Peak at 5 (2.0) is far enough from both
         assert!(result.peaks.contains(&5));
@@ -23379,7 +23407,8 @@ mod tests {
                 distance: Some(3),
                 ..FindPeaksOptions::default()
             },
-        );
+        )
+        .expect("find_peaks");
         assert_eq!(result.peaks, vec![3]);
     }
 
@@ -23392,7 +23421,8 @@ mod tests {
                 distance: Some(usize::MAX),
                 ..FindPeaksOptions::default()
             },
-        );
+        )
+        .expect("find_peaks");
         assert_eq!(result.peaks, vec![3]);
     }
 
@@ -23402,11 +23432,64 @@ mod tests {
         let result = find_peaks(
             &x,
             FindPeaksOptions {
-                prominence: Some(1.0),
+                prominence: Some(PeakCondition::at_least(1.0)),
                 ..FindPeaksOptions::default()
             },
-        );
+        )
+        .expect("find_peaks");
         assert_eq!(result.peaks, vec![1]); // only the prominent peak
+    }
+
+    // frankenscipy-szq1n.10: SciPy 1.17.1 on the two literal cases from the bead. The first
+    // needs distance BEFORE prominence (prominence first keeps [1, 6]); the second needs the
+    // width filter at all (without it the result is [2, 7]).
+    #[test]
+    fn find_peaks_filter_order_and_width_match_scipy() {
+        let x = [7.0, 10.0, 9.0, 8.0, 8.0, 4.0, 6.0, 2.0, 8.0, 8.0, 7.0];
+        let r = find_peaks(
+            &x,
+            FindPeaksOptions {
+                distance: Some(3),
+                prominence: Some(PeakCondition::at_least(2.0)),
+                ..FindPeaksOptions::default()
+            },
+        )
+        .expect("find_peaks");
+        assert_eq!(r.peaks, vec![1]);
+
+        let y = [0.0, 1.0, 5.0, 1.0, 0.0, 2.0, 4.0, 4.0, 4.0, 2.0, 0.0];
+        let r = find_peaks(
+            &y,
+            FindPeaksOptions {
+                width: Some(PeakCondition::at_least(2.0)),
+                ..FindPeaksOptions::default()
+            },
+        )
+        .expect("find_peaks");
+        assert_eq!(r.peaks, vec![7]);
+        assert!(r.widths.is_some() && r.left_bases.is_some());
+    }
+
+    #[test]
+    fn find_peaks_rejects_what_scipy_rejects() {
+        let x = [0.0, 1.0, 0.0];
+        for bad in [
+            FindPeaksOptions {
+                distance: Some(0),
+                ..FindPeaksOptions::default()
+            },
+            FindPeaksOptions {
+                wlen: Some(1.0),
+                ..FindPeaksOptions::default()
+            },
+            FindPeaksOptions {
+                width: Some(PeakCondition::at_least(0.0)),
+                rel_height: -0.5,
+                ..FindPeaksOptions::default()
+            },
+        ] {
+            assert!(find_peaks(&x, bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
@@ -23415,7 +23498,7 @@ mod tests {
         let x: Vec<f64> = (0..n)
             .map(|i| (2.0 * std::f64::consts::PI * 3.0 * i as f64 / n as f64).sin())
             .collect();
-        let result = find_peaks(&x, FindPeaksOptions::default());
+        let result = find_peaks(&x, FindPeaksOptions::default()).expect("find_peaks");
         // 3 full cycles should have ~3 peaks
         assert!(
             result.peaks.len() >= 2 && result.peaks.len() <= 4,
@@ -23426,21 +23509,10 @@ mod tests {
 
     #[test]
     fn find_peaks_too_short() {
-        assert!(
-            find_peaks(&[1.0, 2.0], FindPeaksOptions::default())
-                .peaks
-                .is_empty()
-        );
-        assert!(
-            find_peaks(&[1.0], FindPeaksOptions::default())
-                .peaks
-                .is_empty()
-        );
-        assert!(
-            find_peaks(&[], FindPeaksOptions::default())
-                .peaks
-                .is_empty()
-        );
+        for x in [&[1.0, 2.0][..], &[1.0][..], &[][..]] {
+            let r = find_peaks(x, FindPeaksOptions::default()).expect("find_peaks");
+            assert!(r.peaks.is_empty());
+        }
     }
 
     #[test]
@@ -23455,7 +23527,7 @@ mod tests {
     #[test]
     fn find_peaks_flat_signal() {
         let x = [5.0; 10];
-        let result = find_peaks(&x, FindPeaksOptions::default());
+        let result = find_peaks(&x, FindPeaksOptions::default()).expect("find_peaks");
         assert!(result.peaks.is_empty(), "flat signal has no peaks");
     }
 
@@ -23533,7 +23605,8 @@ mod tests {
         let r = find_peaks(
             &[1.0, 3.0, 1.0, 4.0, 1.0, 5.0, 2.0, 6.0, 1.0],
             FindPeaksOptions::default(),
-        );
+        )
+        .expect("find_peaks");
         assert_eq!(r.peaks, vec![1, 3, 5, 7]);
     }
 
@@ -32537,6 +32610,28 @@ mod tests {
     }
 
     #[test]
+    fn remez_rejects_band_specs_scipy_rejects_instead_of_substituting_a_design() {
+        // br-szq1n.13: live SciPy 1.17.1 raises on both of these, for odd and even
+        // numtaps. The old even-length path swallowed the Parks-McClellan error
+        // and returned a frequency-sampling least-squares filter.
+        for numtaps in [4, 5] {
+            // Second band descends (0.4 -> 0.3): "Bands must be monotonic starting at zero."
+            assert!(remez(numtaps, &[0.0, 0.2, 0.4, 0.3], &[1.0, 0.0], None).is_err());
+            // Overlapping bands (0.2 then 0.1).
+            assert!(remez(numtaps, &[0.0, 0.2, 0.1, 0.5], &[1.0, 0.0], None).is_err());
+            // Edge above Nyquist: "Band edges should be less than 1/2 the sampling frequency".
+            assert!(remez(numtaps, &[0.0, 0.2, 0.3, 0.6], &[1.0, 0.0], None).is_err());
+        }
+        // Positive arm: a valid even-length spec still designs (SciPy returns 4 taps).
+        assert_eq!(
+            remez(4, &[0.0, 0.2, 0.3, 0.5], &[1.0, 0.0], None)
+                .expect("valid type II design")
+                .len(),
+            4
+        );
+    }
+
+    #[test]
     fn remez_matches_scipy_reference() {
         // True Parks-McClellan equiripple — matches scipy.signal.remez to
         // machine precision (the minimax optimum is unique). frankenscipy-zxxdi.
@@ -32760,7 +32855,7 @@ mod tests {
         let sys = Lti::new(vec![1.0], vec![1.0, 1.0]).expect("valid");
         let t: Vec<f64> = (0..50).map(|i| i as f64 * 0.1).collect();
         let u: Vec<f64> = vec![1.0; t.len()]; // step input
-        let y_lsim = sys.lsim(&u, &t, None).expect("lsim");
+        let y_lsim = sys.lsim(&u, &t, None, true).expect("lsim");
         let y_step = sys.step(&t).expect("step");
         for (i, (a, b)) in y_lsim.iter().zip(y_step.iter()).enumerate() {
             assert!(
@@ -32778,7 +32873,7 @@ mod tests {
         let sys = Lti::new(vec![1.0], vec![1.0, 1.0]).expect("valid");
         let t: Vec<f64> = (0..20).map(|i| i as f64 * 0.1).collect();
         let u: Vec<f64> = vec![0.0; t.len()];
-        let y = sys.lsim(&u, &t, None).expect("lsim");
+        let y = sys.lsim(&u, &t, None, true).expect("lsim");
         for (i, &yi) in y.iter().enumerate() {
             assert!(yi.abs() < 1e-12, "y[{i}] = {yi}, expected 0");
         }
@@ -32789,8 +32884,87 @@ mod tests {
         let sys = Lti::new(vec![1.0], vec![1.0, 1.0]).expect("valid");
         let t: Vec<f64> = (0..10).map(|i| i as f64 * 0.1).collect();
         let u: Vec<f64> = vec![1.0; 5]; // shorter than t
-        let err = sys.lsim(&u, &t, None).expect_err("mismatched");
+        let err = sys.lsim(&u, &t, None, true).expect_err("mismatched");
         assert!(err.is_argument_error());
+    }
+
+    // frankenscipy-1ksfv.15, the negative case: H(s) = 1e4/((s+1)(s+1e4)) sampled at dt = 0.01.
+    // One RK4 step per sample has h·λ = −100 for the fast pole, far outside RK4's stability
+    // interval (≈ −2.785), and diverged; the exact discretization matches the analytic step
+    // response 1 − (1e4·e^(−t) − e^(−1e4·t))/(1e4 − 1) as SciPy's does (SciPy 1.17.1: 6.3e-14).
+    #[test]
+    fn lti_step_is_exact_on_a_stiff_system() {
+        let sys = Lti::new(vec![1e4], vec![1.0, 10001.0, 1e4]).expect("valid");
+        let t: Vec<f64> = (0..500).map(|i| i as f64 * 0.01).collect();
+        let y = sys.step(&t).expect("step");
+        let worst = t
+            .iter()
+            .zip(&y)
+            .map(|(&ti, yi)| {
+                let exact = 1.0 - (1e4 * (-ti).exp() - (-1e4 * ti).exp()) / (1e4 - 1.0);
+                (yi - exact).abs()
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(worst < 1e-12, "max error {worst:e}");
+    }
+
+    // lsim with interp = true is exact for an input linear between samples: 1/(s+1) driven by
+    // u = t gives t − 1 + e^(−t). With interp = false the input is held constant per sample
+    // (SciPy 1.17.1 at t = 2 on linspace(0, 2, 21): 1.0913816135315424, max error 0.04395).
+    #[test]
+    fn lti_lsim_interpolates_or_holds_the_input_like_scipy() {
+        let sys = Lti::new(vec![1.0], vec![1.0, 1.0]).expect("valid");
+        let t: Vec<f64> = (0..21).map(|i| i as f64 * 0.1).collect();
+        let linear = sys.lsim(&t, &t, None, true).expect("lsim interp");
+        for (&ti, yi) in t.iter().zip(&linear) {
+            assert!((yi - (ti - 1.0 + (-ti).exp())).abs() < 1e-14, "t = {ti}");
+        }
+        let held = sys.lsim(&t, &t, None, false).expect("lsim zoh");
+        assert!(
+            (held[20] - 1.091_381_613_531_542_4).abs() < 1e-13,
+            "{}",
+            held[20]
+        );
+    }
+
+    // impulse of (s+2)/(s+1) = 1 + 1/(s+1) is e^(−t): SciPy does not add the D·δ(t) term.
+    #[test]
+    fn lti_impulse_omits_the_feedthrough_delta_like_scipy() {
+        let sys = Lti::new(vec![1.0, 2.0], vec![1.0, 1.0]).expect("valid");
+        let t: Vec<f64> = (0..31).map(|i| i as f64 * 0.1).collect();
+        let h = sys.impulse(&t).expect("impulse");
+        for (&ti, hi) in t.iter().zip(&h) {
+            assert!((hi - (-ti).exp()).abs() < 1e-14, "t = {ti}: {hi}");
+        }
+    }
+
+    // x0 in SciPy's tf2ss realization, first advanced from 0 to t[0] = 0.5 with zero input:
+    // SciPy 1.17.1 lsim(([1], [1, 3, 2]), sin(T), T, X0=[0.3, -0.2]) on linspace(0.5, 2.5, 11).
+    #[test]
+    fn lti_lsim_initial_state_and_nonzero_start_time_like_scipy() {
+        let sys = Lti::new(vec![1.0], vec![1.0, 3.0, 2.0]).expect("valid");
+        let t: Vec<f64> = (0..11).map(|i| 0.5 + i as f64 * 0.2).collect();
+        let u: Vec<f64> = t.iter().map(|v| v.sin()).collect();
+        let y = sys.lsim(&u, &t, Some(&[0.3, -0.2]), true).expect("lsim");
+        for (i, want) in [
+            (0, -0.097_441_010_088_407_58),
+            (5, 0.126_156_993_786_637_33),
+            (10, 0.317_455_923_653_287),
+        ] {
+            assert!((y[i] - want).abs() < 1e-12, "y[{i}] = {} vs {want}", y[i]);
+        }
+    }
+
+    #[test]
+    fn lti_lsim_rejects_what_scipy_rejects() {
+        let sys = Lti::new(vec![1.0], vec![1.0, 1.0]).expect("valid");
+        let uneven = [0.0, 0.1, 0.3];
+        assert!(sys.lsim(&[1.0; 3], &uneven, None, true).is_err());
+        assert!(sys.lsim(&[1.0; 3], &[-0.1, 0.0, 0.1], None, true).is_err());
+        assert!(
+            sys.lsim(&[1.0; 3], &[0.0, 0.1, 0.2], Some(&[1.0, 2.0]), true)
+                .is_err()
+        );
     }
 
     #[test]
@@ -32810,8 +32984,8 @@ mod tests {
         let sys = Lti::new(vec![2.0], vec![1.0, 0.5]).expect("valid");
         let t: Vec<f64> = (0..30).map(|i| i as f64 * 0.1).collect();
         let u: Vec<f64> = t.iter().map(|&ti| ti.sin()).collect();
-        let y_method = sys.lsim(&u, &t, None).expect("method");
-        let y_standalone = lsim(&sys, &u, &t, None).expect("standalone");
+        let y_method = sys.lsim(&u, &t, None, true).expect("method");
+        let y_standalone = lsim(&sys, &u, &t, None, true).expect("standalone");
         for (i, (a, b)) in y_method.iter().zip(y_standalone.iter()).enumerate() {
             assert!((a - b).abs() < 1e-12, "y[{i}]: {} vs {}", a, b);
         }
@@ -34397,7 +34571,7 @@ mod tests {
     fn find_peaks_matches_scipy_reference_values() {
         // scipy.signal.find_peaks([0, 1, 0, 2, 0, 3, 0, 2, 0, 1, 0])
         let x = vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 2.0, 0.0, 1.0, 0.0];
-        let result = find_peaks(&x, FindPeaksOptions::default());
+        let result = find_peaks(&x, FindPeaksOptions::default()).expect("find_peaks");
         let expected_peaks = [1, 3, 5, 7, 9];
         assert_eq!(
             result.peaks, expected_peaks,
@@ -34411,10 +34585,10 @@ mod tests {
         // scipy.signal.find_peaks([0, 1, 0, 2, 0, 3, 0, 2, 0, 1, 0], height=1.5)
         let x = vec![0.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 2.0, 0.0, 1.0, 0.0];
         let opts = FindPeaksOptions {
-            height: Some(1.5),
+            height: Some(PeakCondition::at_least(1.5)),
             ..Default::default()
         };
-        let result = find_peaks(&x, opts);
+        let result = find_peaks(&x, opts).expect("find_peaks");
         let expected_peaks = [3, 5, 7];
         assert_eq!(
             result.peaks, expected_peaks,
@@ -34431,7 +34605,7 @@ mod tests {
             distance: Some(3),
             ..Default::default()
         };
-        let result = find_peaks(&x, opts);
+        let result = find_peaks(&x, opts).expect("find_peaks");
         let expected_peaks = [1, 5, 9];
         assert_eq!(
             result.peaks, expected_peaks,
@@ -34817,7 +34991,7 @@ mod tests {
     fn find_peaks_matches_scipy_basic_reference() {
         // scipy.signal.find_peaks([1, 3, 2, 4, 1]) -> (array([1, 3]),)
         let x = vec![1.0, 3.0, 2.0, 4.0, 1.0];
-        let result = find_peaks(&x, FindPeaksOptions::default());
+        let result = find_peaks(&x, FindPeaksOptions::default()).expect("find_peaks");
         let expected = vec![1, 3];
         assert_eq!(result.peaks, expected, "find_peaks mismatch");
     }
