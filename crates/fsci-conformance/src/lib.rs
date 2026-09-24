@@ -2745,16 +2745,69 @@ fn oracle_incumbent() -> Option<&'static ScipyIncumbent> {
 /// skipped silently, and on the rch workers it compared against whatever `python3` had
 /// (1.18.1) without ever saying so. The resolver prints its provenance line once per
 /// process, so a run's log now names the interpreter and both versions.
+///
+/// # Panics
+/// Under `FSCI_REQUIRE_SCIPY_ORACLE`, unless the resolved incumbent is the PINNED pair
+/// (`fsci_runtime::scipy_incumbent::{PINNED_SCIPY, PINNED_NUMPY}`); see
+/// [`enforce_pinned_oracle`].
 #[must_use]
 pub fn scipy_oracle_command() -> Command {
-    oracle_incumbent().map_or_else(|| Command::new("python3"), ScipyIncumbent::command)
+    let incumbent = oracle_incumbent();
+    if let Err(refusal) = enforce_pinned_oracle(incumbent, scipy_oracle_required()) {
+        panic!("{refusal}");
+    }
+    incumbent.map_or_else(|| Command::new("python3"), ScipyIncumbent::command)
+}
+
+/// Is the live-SciPy oracle REQUIRED for this run (`FSCI_REQUIRE_SCIPY_ORACLE` set)?
+fn scipy_oracle_required() -> bool {
+    std::env::var_os("FSCI_REQUIRE_SCIPY_ORACLE").is_some()
+}
+
+/// Under a required oracle, a live-SciPy row is evidence only against the PINNED pair: SciPy
+/// removes functions, changes defaults and fixes numerics between releases, so a green diff
+/// against another version (the rch workers carry 1.18.1, or no SciPy at all) says nothing
+/// about parity with the contract version. The resolver used to accept the first interpreter
+/// that could import any SciPy, and fell back to a bare `python3` when none could
+/// (frankenscipy-olv0j.5). Without the requirement nothing changes: a missing oracle still
+/// skips, and the resolver's provenance line names the versions a row was compared against.
+///
+/// # Errors
+/// The refusal text, naming the versions found (or the absence of an interpreter) and the pin.
+pub fn enforce_pinned_oracle(
+    incumbent: Option<&ScipyIncumbent>,
+    required: bool,
+) -> Result<(), String> {
+    if !required {
+        return Ok(());
+    }
+    match incumbent {
+        None => Err(format!(
+            "FSCI_REQUIRE_SCIPY_ORACLE is set but no interpreter on this host imports SciPy; \
+             the oracle pin is scipy {} / numpy {}",
+            fsci_runtime::scipy_incumbent::PINNED_SCIPY,
+            fsci_runtime::scipy_incumbent::PINNED_NUMPY
+        )),
+        Some(found) => match found.disagreement() {
+            None => Ok(()),
+            Some(reason) => Err(format!(
+                "FSCI_REQUIRE_SCIPY_ORACLE is set but the resolved oracle is not the pinned \
+                 incumbent: {reason} ({})",
+                found.provenance_line()
+            )),
+        },
+    }
 }
 
 /// Interpreter an oracle config defaults to: the proven incumbent when there is one.
 fn default_oracle_python() -> PathBuf {
-    oracle_incumbent().map_or_else(
+    let incumbent = oracle_incumbent();
+    if let Err(refusal) = enforce_pinned_oracle(incumbent, scipy_oracle_required()) {
+        panic!("{refusal}");
+    }
+    incumbent.map_or_else(
         || PathBuf::from("python3"),
-        |incumbent| PathBuf::from(&incumbent.python),
+        |found| PathBuf::from(&found.python),
     )
 }
 
@@ -6726,14 +6779,10 @@ fn execute_find_peaks(case: &SignalCase) -> SignalObserved {
         Ok(v) => v,
         Err(e) => return SignalObserved::Error(format!("parse x: {e}")),
     };
-    let options = fsci_signal::FindPeaksOptions {
-        height: None,
-        distance: None,
-        prominence: None,
-        width: None,
-    };
-    let result = fsci_signal::find_peaks(&x, options);
-    SignalObserved::Indices(result.peaks)
+    match fsci_signal::find_peaks(&x, fsci_signal::FindPeaksOptions::default()) {
+        Ok(result) => SignalObserved::Indices(result.peaks),
+        Err(e) => SignalObserved::Error(format!("find_peaks: {e}")),
+    }
 }
 
 fn parse_signal_f64(value: &serde_json::Value) -> Result<f64, String> {
@@ -19092,6 +19141,59 @@ pub fn run_all_packets(config: &HarnessConfig) -> Result<AggregateParityReport, 
     }
 
     Ok(aggregate_packet_reports(&reports))
+}
+
+#[cfg(test)]
+mod pinned_oracle_tests {
+    use super::{ScipyIncumbent, enforce_pinned_oracle};
+    use fsci_runtime::scipy_incumbent::{PINNED_NUMPY, PINNED_SCIPY};
+
+    fn incumbent(scipy: &str, numpy: &str) -> ScipyIncumbent {
+        ScipyIncumbent {
+            python: "/fake/python3".to_string(),
+            pythonpath: None,
+            env: std::collections::BTreeMap::new(),
+            scipy_version: scipy.to_string(),
+            numpy_version: numpy.to_string(),
+            fsci_loaded: false,
+            executable: "/fake/python3".to_string(),
+            probe_trail: Vec::new(),
+        }
+    }
+
+    // frankenscipy-olv0j.5: under FSCI_REQUIRE_SCIPY_ORACLE an unpinned SciPy used to be
+    // accepted silently (the rch workers carry 1.18.1). Both arms of the gate:
+    #[test]
+    fn a_required_oracle_must_be_the_pinned_pair() {
+        let rch_like = incumbent("1.18.1", "2.5.2");
+        let refusal =
+            enforce_pinned_oracle(Some(&rch_like), true).expect_err("1.18.1 must be refused");
+        println!("refusal: {refusal}");
+        assert!(
+            refusal.contains("1.18.1") && refusal.contains(PINNED_SCIPY),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("2.5.2") && refusal.contains(PINNED_NUMPY),
+            "{refusal}"
+        );
+
+        let pinned = incumbent(PINNED_SCIPY, PINNED_NUMPY);
+        assert_eq!(enforce_pinned_oracle(Some(&pinned), true), Ok(()));
+
+        let missing = enforce_pinned_oracle(None, true).expect_err("no interpreter");
+        assert!(missing.contains(PINNED_SCIPY), "{missing}");
+
+        // Without the requirement nothing is refused: a missing or unpinned oracle still
+        // skips or runs as before, and its provenance line names the versions.
+        assert_eq!(enforce_pinned_oracle(Some(&rch_like), false), Ok(()));
+        assert_eq!(enforce_pinned_oracle(None, false), Ok(()));
+
+        // A pinned SciPy with FrankenSciPy resident is not an independent oracle.
+        let mut contaminated = incumbent(PINNED_SCIPY, PINNED_NUMPY);
+        contaminated.fsci_loaded = true;
+        assert!(enforce_pinned_oracle(Some(&contaminated), true).is_err());
+    }
 }
 
 #[cfg(test)]

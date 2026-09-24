@@ -11,7 +11,7 @@
     "sparse_spmv": {
       "100x100_d5_nnz500": {
         "median_ns": 656.06,
-        "lower_ns": 647.4,
+        "lower_ns": 647.40,
         "upper_ns": 664.75,
         "sample_size": 100
       },
@@ -24,7 +24,7 @@
       "10000x10000_d0_nnz99930": {
         "median_us": 153.32,
         "lower_us": 152.05,
-        "upper_us": 154.5,
+        "upper_us": 154.50,
         "sample_size": 100
       }
     }

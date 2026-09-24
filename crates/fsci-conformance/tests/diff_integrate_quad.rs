@@ -208,12 +208,11 @@ for case in q["points"]:
             n = int(case["fq_n"])
             val, _ = integrate.fixed_quad(lambda xs: [fn(x) for x in xs], a, b, n=n)
         elif routine == "romberg":
-            # romberg was removed in newer scipy; fall back to quad
-            # which is even more accurate.
-            try:
-                val = integrate.romberg(fn, a, b)
-            except AttributeError:
-                val, _err = integrate.quad(fn, a, b)
+            # br-olv0j.2: scipy.integrate.romberg was removed from SciPy (1.15), so
+            # this row's reference is the integral VALUE from integrate.quad. It
+            # checks fsci's romberg converges to the right number; it is not a
+            # comparison with SciPy's (non-existent) romberg iterates.
+            val, _err = integrate.quad(fn, a, b)
         else:
             val = None
         points.append({"case_id": cid, "value": fnone(val)})

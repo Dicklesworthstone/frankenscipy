@@ -399,11 +399,12 @@ for c in cases:
         elif metric == "mahalanobis":
             val = distance.mahalanobis(u, v, VI=np.array(vi))
         elif metric == "wminkowski":
+            # br-olv0j.2: distance.wminkowski was removed from SciPy (1.8); the
+            # fallback here used to be a hand-written NumPy formula, i.e. not a
+            # SciPy reference at all. SciPy's minkowski weights |u-v|^p by w, so
+            # wminkowski(u, v, p, w) == minkowski(u, v, p, w=w**p) exactly.
             weights = np.array(w)
-            if hasattr(distance, "wminkowski"):
-                val = distance.wminkowski(u, v, p=p, w=weights)
-            else:
-                val = (np.sum((weights * np.abs(u - v)) ** p)) ** (1.0 / p)
+            val = distance.minkowski(u, v, p=p, w=weights ** p)
         else:
             continue
 

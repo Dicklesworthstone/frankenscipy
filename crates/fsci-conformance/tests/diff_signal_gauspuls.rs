@@ -1,12 +1,17 @@
 #![forbid(unsafe_code)]
-//! Live SciPy differential coverage for scipy.signal.gauspuls.
+//! Live SciPy differential coverage for fsci_signal::gauspuls against
+//! scipy.signal.gausspulse.
 //!
 //! Resolves [frankenscipy-mevjv]. Drives a curated set of
-//! (fc, bw, bwr) tuples × t-grid through scipy.signal.gauspuls
+//! (fc, bw, bwr) tuples × t-grid through scipy.signal.gausspulse
 //! (retquad=True, retenv=True) and diffs the in-phase, quadrature,
-//! and envelope outputs against the just-shipped fsci_signal::gauspuls
-//! port (b1b5886). Skips cleanly if scipy/python3 is unavailable
-//! unless `FSCI_REQUIRE_SCIPY_ORACLE` is set.
+//! and envelope outputs against fsci_signal::gauspuls. Skips cleanly
+//! if scipy/python3 is unavailable unless `FSCI_REQUIRE_SCIPY_ORACLE` is set.
+//!
+//! br-olv0j.2: the oracle used to call `signal.gauspuls`, which does not exist
+//! in SciPy (the function is `gausspulse`). Every case raised, was mapped to
+//! None and skipped, and the test passed having compared nothing since
+//! 2026-05-06. It now asserts that every case is compared.
 
 use std::collections::HashMap;
 use std::fs;
@@ -157,7 +162,7 @@ cases = json.load(sys.stdin)
 results = []
 for c in cases:
     try:
-        i_arr, q_arr, env = signal.gauspuls(
+        i_arr, q_arr, env = signal.gausspulse(
             c["t"], fc=c["fc"], bw=c["bw"], bwr=c["bwr"],
             retquad=True, retenv=True,
         )
@@ -314,6 +319,14 @@ fn diff_signal_gauspuls() {
             );
         }
     }
+
+    assert_eq!(
+        diffs.len(),
+        cases.len(),
+        "gauspuls: compared {} of {} cases (a SciPy arm returned None)",
+        diffs.len(),
+        cases.len()
+    );
 
     assert!(
         all_pass,

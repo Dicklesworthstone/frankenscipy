@@ -19,10 +19,12 @@ name: CI Gates (G1-G9)
 
 # TRIGGER SHAPE. The shared tree auto-commits and pushes every few minutes, and this account's
 # hosted-runner queue was already 5-7 hours deep with the old one-job workflow. So a PUSH runs
-# only G1 (one job, fmt + clippy) and the newest push cancels the ones still waiting; the full
-# evidence run (per-crate tests, the 14 live-SciPy shards, e2e, perf, evidence packs) runs on
-# the nightly schedule and on demand via workflow_dispatch, where a 40-job fan-out is affordable
-# and nothing races it. Bead syncs and doc-only pushes do not trigger a run at all.
+# only G1 (fmt + clippy) and G0 (the cheap integrity checks: sidecar hashes, shard partition,
+# fsci-runtime tests, tolerance ratchet), and the newest push cancels the ones still waiting;
+# the full evidence run (per-crate tests, the 15 live-SciPy shards, e2e, perf, evidence packs)
+# runs on the nightly schedule and on demand via workflow_dispatch, where a 40-job fan-out is
+# affordable and nothing races it. Bead syncs and doc-only pushes do not trigger a run at all,
+# so a docs/-only change to a sidecar-protected baseline is still caught only nightly.
 on:
   push:
     branches: [main]
@@ -65,14 +67,96 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
           cache-on-failure: true
+      # rust-toolchain.toml moved to nightly-2026-08-31 on 2026-09-04 (5306413c6) while every
+      # job here kept installing nightly-2026-07-20, so CI linted with a different compiler
+      # than every developer and rch worker for three weeks (frankenscipy-zbtht). The pin in
+      # this file must equal the toolchain file; fail fast when they drift again.
+      - name: CI toolchain pin matches rust-toolchain.toml
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          test "$channel" = "nightly-2026-08-31" || { echo "rust-toolchain.toml pins '$channel'; update ci.yml" >&2; exit 1; }
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ── G0: integrity fast lane (every push) ─────────────────────────
+  # Observed 2026-09-22/23 (frankenscipy-zbtht): a JSON pretty-print commit (ffaebe504) made
+  # four RaptorQ baseline sidecars stale and broke a byte-exact runtime golden, and a new diff
+  # file landed without a tolerance anchor. Each check takes seconds to minutes, but a push ran
+  # only G1, so main sat red until the nightly fan-out found them. They run on every push now.
+  g0-integrity:
+    name: "G0: integrity fast lane"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every tracked RaptorQ sidecar matches its source (blake3)
+        run: |
+          python3 -m pip install --quiet blake3
+          python3 - <<'EOF'
+          import json, os, subprocess, sys
+          import blake3
+          files = subprocess.run(["git", "ls-files", "*.raptorq.json"],
+                                 capture_output=True, text=True, check=True).stdout.split()
+          bad = []
+          for sidecar in files:
+              base = sidecar[: -len(".raptorq.json")]
+              src = base if os.path.exists(base) else base + ".json"
+              if not os.path.exists(src):
+                  bad.append(f"MISSING SOURCE for {sidecar}")
+                  continue
+              recorded = json.load(open(sidecar)).get("source_hash", "").removeprefix("blake3:")
+              if blake3.blake3(open(src, "rb").read()).hexdigest() != recorded:
+                  bad.append(f"STALE {src}")
+          print(f"{len(files)} sidecars checked, {len(bad)} bad")
+          print("\n".join(bad))
+          sys.exit(1 if bad or not files else 0)
+          EOF
+      # A literal `converged: true` / `success: true` in library code must name the check that
+      # earned it (`// status: <criterion>`); frankenscipy-szq1n.7 found ~30 that named none.
+      - name: Status literals carry their criterion
+        run: python3 scripts/status_literal_guard.py
+      # A public *Options/*Config field must be read by its library; frankenscipy-szq1n.12
+      # found eight that were accepted and silently ignored.
+      - name: Public option fields are read
+        run: python3 scripts/unread_option_fields.py
+      - name: Every diff_*.rs belongs to exactly one G3 shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob extglob
+          mapfile -t globs < <(grep -oP '\{ shard: [^,]+,\s+glob: "\K[^"]+' .github/workflows/ci.yml)
+          declare -A seen=()
+          for g in "${globs[@]}"; do
+            for f in crates/fsci-conformance/tests/$g.rs; do
+              seen[$f]=$(( ${seen[$f]:-0} + 1 ))
+            done
+          done
+          status=0
+          total=0
+          for f in crates/fsci-conformance/tests/diff_*.rs; do
+            total=$((total + 1))
+            n=${seen[$f]:-0}
+            if [ "$n" -ne 1 ]; then echo "$f is in $n shards" >&2; status=1; fi
+          done
+          echo "${#globs[@]} shard globs, $total diff files"
+          exit $status
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-08-31
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-dev
+          cache-on-failure: true
+      - name: fsci-runtime tests (byte-exact audit-ledger golden)
+        run: cargo test -p fsci-runtime
+      - name: Tolerance ratchet (G9) incl. unanchored diff files
+        run: cargo run -p fsci-conformance --bin tolerance_lint -- --max-violations 360
 
   # ── G2: Unit + Property Tests, one job per crate ─────────────────
   # A failure names its crate, the wall is parallel, and the conformance crate's 796
@@ -113,7 +197,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -155,11 +239,14 @@ jobs:
           - { shard: fft-integrate, glob: "diff_@(fft|integrate)*" }
           - { shard: spatial-interp-cluster, glob: "diff_@(spatial|interpolate|cluster)*" }
           - { shard: runtime-misc,  glob: "diff_@(runtime|constants|arrayapi|odr)*" }
+          # The bare family roots (diff_linalg.rs, diff_stats.rs, ...) and diff_stats_2x2_*
+          # matched no shard glob, so no CI job ever ran them (frankenscipy-olv0j.4).
+          - { shard: family-roots,  glob: "@(diff_linalg|diff_special|diff_stats|diff_signal|diff_sparse|diff_ndimage|diff_stats_[0-9]*)" }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -219,7 +306,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -257,7 +344,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -301,7 +388,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -346,7 +433,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -363,7 +450,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -396,7 +483,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -437,7 +524,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -468,7 +555,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-dev
@@ -489,7 +576,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-07-20
+          toolchain: nightly-2026-08-31
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-release
@@ -497,3 +584,19 @@ jobs:
       - run: |
           cargo run --release -p fsci-conformance --bin tolerance_lint -- \
             --max-violations 360
+      # Every scipy.* attribute an inline oracle names must exist in the pinned SciPy
+      # (frankenscipy-olv0j.3). A removed function raises AttributeError, the harness maps that
+      # to "no SciPy value", and the column silently compares nothing: nine such references
+      # (gauspuls, stdtrc, btdtr/btdtrc/btdtri, lpmn, lpn, romberg, wminkowski) sat in the
+      # corpus until frankenscipy-olv0j.2. The script refuses an unpinned interpreter and runs
+      # a must-miss / must-hit self-test before scanning.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+          cache-dependency-path: crates/fsci-conformance/python_oracle/requirements.txt
+      - name: Oracle attributes resolve under the pinned SciPy
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "scipy==${PINNED_SCIPY}" "numpy==${PINNED_NUMPY}"
+          python scripts/oracle_attr_check.py

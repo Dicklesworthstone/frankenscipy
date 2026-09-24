@@ -142,7 +142,12 @@ for case in q["points"]:
     m = int(case["m_max"]); n = int(case["n_max"]); x = float(case["x"])
     try:
         if op == "lpmn":
-            tbl, _ = sp.lpmn(m, n, x)
+            # br-olv0j.2: sp.lpmn was removed from SciPy (every lpmn case raised,
+            # became None and was skipped). Build the same (m+1)x(n+1) table,
+            # tbl[j][i] = P_i^j(x) with the Condon-Shortley phase and 0 where
+            # j > i, from sp.lpmv, which SciPy still ships.
+            tbl = [[sp.lpmv(j, i, x) if j <= i else 0.0 for i in range(n + 1)]
+                   for j in range(m + 1)]
         elif op == "lqmn":
             tbl, _ = sp.lqmn(m, n, x)
         else:
@@ -257,6 +262,13 @@ fn diff_special_lpmn_lqmn() {
         });
     }
 
+    // br-olv0j.2: every x is inside (-1, 1); every case must be compared. The lpmn
+    // column compared nothing for months because its oracle raised.
+    for op in ["lpmn", "lqmn"] {
+        let wanted = query.points.iter().filter(|c| c.op == op).count();
+        let got = diffs.iter().filter(|d| d.op == op).count();
+        assert_eq!(got, wanted, "{op}: compared {got} of {wanted} cases");
+    }
     let all_pass = diffs.iter().all(|d| d.pass);
 
     let log = DiffLog {

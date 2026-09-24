@@ -193,12 +193,16 @@ for case in q["points"]:
     cid = case["case_id"]; func = case["func"]
     a = float(case["a"]); b = float(case["b"]); arg = float(case["arg"])
     try:
+        # br-olv0j.2: SciPy 1.17 has no stdtrc/btdtr/btdtrc/btdtri (all raised
+        # AttributeError, were mapped to None and silently skipped). Their exact
+        # SciPy identities: stdtrc(df, t) = stdtr(df, -t) (t is symmetric), and
+        # btdtr/btdtrc/btdtri = betainc/betaincc/betaincinv.
         if func == "stdtr":     value = special.stdtr(a, arg)
-        elif func == "stdtrc":  value = special.stdtrc(a, arg)
+        elif func == "stdtrc":  value = special.stdtr(a, -arg)
         elif func == "stdtrit": value = special.stdtrit(a, arg)
-        elif func == "btdtr":   value = special.btdtr(a, b, arg)
-        elif func == "btdtrc":  value = special.btdtrc(a, b, arg)
-        elif func == "btdtri":  value = special.btdtri(a, b, arg)
+        elif func == "btdtr":   value = special.betainc(a, b, arg)
+        elif func == "btdtrc":  value = special.betaincc(a, b, arg)
+        elif func == "btdtri":  value = special.betaincinv(a, b, arg)
         else: value = None
         points.append({"case_id": cid, "value": finite_or_none(value)})
     except Exception:
@@ -299,6 +303,15 @@ fn diff_special_stdtr_btdtr() {
         }
     }
 
+    // Every case is finite and in-domain on both sides, so every case must be
+    // compared; a missing SciPy arm is how four of six columns went dark.
+    assert_eq!(
+        diffs.len(),
+        query.points.len(),
+        "stdtr/btdtr: compared {} of {} cases",
+        diffs.len(),
+        query.points.len()
+    );
     let all_pass = diffs.iter().all(|d| d.pass);
 
     let log = DiffLog {

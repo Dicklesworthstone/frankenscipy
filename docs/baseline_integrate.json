@@ -28,7 +28,7 @@
       "scalar": {
         "median_ns": 12.475,
         "lower_ns": 12.291,
-        "upper_ns": 12.67,
+        "upper_ns": 12.670,
         "sample_size": 100
       },
       "vector_100": {

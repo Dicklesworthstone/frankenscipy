@@ -148,7 +148,10 @@ for case in q["points"]:
     n = int(case["n"]); x = float(case["x"])
     try:
         if func == "lpn":
-            v_arr, d_arr = special.lpn(n, x)
+            # br-olv0j.2: special.lpn was removed from SciPy (every lpn case raised,
+            # became None and was skipped). legendre_p_all(n, x, diff_n=1) returns
+            # the same P_0..P_n values and first derivatives.
+            v_arr, d_arr = special.legendre_p_all(n, x, diff_n=1)
         elif func == "lqn":
             v_arr, d_arr = special.lqn(n, x)
         else:
@@ -274,6 +277,16 @@ fn diff_special_lpn_lqn() {
         });
     }
 
+    // Every x is inside (-1, 1), so every case must be compared on both sides.
+    let compared: std::collections::HashSet<&str> =
+        diffs.iter().map(|d| d.case_id.as_str()).collect();
+    assert_eq!(
+        compared.len(),
+        query.points.len(),
+        "lpn/lqn: compared {} of {} cases",
+        compared.len(),
+        query.points.len()
+    );
     let all_pass = diffs.iter().all(|d| d.pass);
 
     let log = DiffLog {

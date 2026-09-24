@@ -16,7 +16,7 @@
         "sample_size": 100
       },
       "500x500": {
-        "median_ms": 30.98,
+        "median_ms": 30.980,
         "lower_ms": 30.564,
         "upper_ms": 31.411,
         "sample_size": 100

@@ -58,19 +58,19 @@ covered. Spot checks did not find such a case, but the census cannot rule it out
 
 ## The residual, itemised
 
-**Residual count: 0.** All 1,300 callable symbols in SciPy 1.17.1 are now mapped and implemented in FrankenSciPy.
+**Residual count: not 0.** The 2026-09-15 census counted all 1,300 callable symbols as mapped, but 25 of those names were no-op stand-ins (frankenscipy-8dndw.1). Nine have been removed as not applicable or missing (the BLAS/LAPACK introspection functions, the FFT backend hooks, `show_options`, `make_distribution`); the rest are listed with their real status below. A declared / real / compared recount is frankenscipy-8dndw.2.
 
 ### Previously unmapped categories (now fully wired)
 
 | Category | Symbols | Status |
 |---|---|---|
-| Warning/exception types | `ConstantWarning`, `SparseWarning`, `SparseEfficiencyWarning`, `OptimizeWarning`, `NoConvergence`, `IntegrationWarning`, `ODEintWarning`, `BadCoefficients`, `SpecialFunctionError`, `SpecialFunctionWarning`, `ConstantInputWarning`, `DegenerateDataWarning`, `NearConstantInputWarning` | Complete |
+| Warning/exception types | `ConstantWarning`, `SparseWarning`, `SparseEfficiencyWarning`, `OptimizeWarning`, `NoConvergence`, `IntegrationWarning`, `ODEintWarning`, `BadCoefficients`, `SpecialFunctionError`, `SpecialFunctionWarning`, `ConstantInputWarning`, `DegenerateDataWarning`, `NearConstantInputWarning` | Names exist; none is emitted anywhere yet (frankenscipy-8dndw.1) |
 | Plotting representations | `convex_hull_plot_2d`, `delaunay_plot_2d`, `voronoi_plot_2d` | Complete |
-| BLAS/LAPACK introspection | `get_blas_funcs`, `get_lapack_funcs`, `find_best_blas_type` | Complete |
-| Backend configuration | `set_backend`, `set_global_backend`, `register_backend`, `skip_backend` | Complete |
-| Error-state guards | `errstate`, `geterr`, `seterr` | Complete |
-| Solver types and aliases | `RK23`, `RK45`, `DOP853`, `Radau`, `BDF`, `LSODA`, `OdeSolver`, `DenseOutput`, `ode` | Complete |
-| Interactive/CLI helpers | `show_options`, `linprog_verbose_callback` | Complete |
+| BLAS/LAPACK introspection | `get_blas_funcs`, `get_lapack_funcs`, `find_best_blas_type` | N/A: no BLAS/LAPACK underneath; the fabricated-string no-ops were removed |
+| Backend configuration | `set_backend`, `set_global_backend`, `register_backend`, `skip_backend` | N/A: one native backend, no uarray protocol; the no-ops were removed |
+| Error-state guards | `errstate`, `geterr`, `seterr` | No-ops: no special function reads the state yet (frankenscipy-8dndw.1) |
+| Solver types and aliases | `RK23`, `RK45`, `DOP853`, `Radau`, `BDF`, `OdeSolver`, `DenseOutput`, `ode` | Complete; `LSODA` is still an empty type (frankenscipy-8dndw.1) |
+| Interactive/CLI helpers | `linprog_verbose_callback` | Complete; `show_options` N/A (interactive doc printer) and removed |
 | Multivariate/random generators | `ortho_group`, `special_ortho_group`, `unitary_group`, `uniform_direction`, `random_correlation`, `random_table` | Complete |
 
 ### Naming-convention artifacts — functionality present

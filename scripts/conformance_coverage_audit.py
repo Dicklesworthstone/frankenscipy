@@ -24,17 +24,44 @@ exposed as `pub` for benchmarking (`bench_trailing_syrk_prepare`, `correlate1d_p
 
 The result is a TRIAGE BACKLOG, not a defect count. It is a name-level heuristic: a name may be
 exercised indirectly or under another name. Verify any individual claim with
-`grep -rli <name> crates/fsci-conformance/{tests,python_oracle,src} crates/*/src/bin`.
+`grep -rli <name> crates/fsci-conformance/{tests,src} crates/*/src/bin`.
+
+FAIL-CLOSED (frankenscipy-olv0j.6). This script used to `continue` past any SciPy module it
+could not import, so under an interpreter without SciPy it skipped every crate and reported
+"0 uncovered" -- and bead frankenscipy-ivxx6 was closed on that 0 (the pinned interpreter
+reports 167). It now:
+  * refuses to run unless scipy and numpy are the pinned pair (override the pin with
+    FSCI_AUDIT_SCIPY / FSCI_AUDIT_NUMPY only on purpose), and exits 2 if any module is missing;
+  * counts a name as referenced only from RUST sources (tests, src/bin diff files, the
+    conformance lib), not from the Python oracle scripts: a name that appears only on the SciPy
+    side of an oracle string is exactly the uncompared case this audit exists to find;
+  * scans every `src/**/*.rs` of a crate (not only lib.rs), skipping `src/bin/`.
+Run it with the pinned incumbent: /home/ubuntu/.local/bin/python3.13 scripts/conformance_coverage_audit.py
 """
 import importlib
+import os
 import pathlib
 import re
+import sys
 
 ROOT = pathlib.Path('/data/projects/frankenscipy')
+PINNED_SCIPY = os.environ.get('FSCI_AUDIT_SCIPY', '1.17.1')
+PINNED_NUMPY = os.environ.get('FSCI_AUDIT_NUMPY', '2.4.3')
+
+try:
+    import numpy
+    import scipy
+except ImportError as err:
+    sys.exit(f"REFUSING: {sys.executable} cannot import scipy/numpy ({err}); a run without the "
+             f"oracle would report every entry point as covered.")
+if scipy.__version__ != PINNED_SCIPY or numpy.__version__ != PINNED_NUMPY:
+    sys.exit(f"REFUSING: {sys.executable} has scipy {scipy.__version__} / numpy {numpy.__version__}, "
+             f"pinned pair is {PINNED_SCIPY} / {PINNED_NUMPY}")
+print(f"interpreter: {sys.executable}  scipy {scipy.__version__}  numpy {numpy.__version__}")
 
 corpus_files = []
 conf = ROOT / 'crates' / 'fsci-conformance'
-for pat in ('tests/*.rs', 'python_oracle/*.py', 'src/*.rs'):
+for pat in ('tests/*.rs', 'src/*.rs'):
     corpus_files.extend(conf.glob(pat))
 # per-crate differential tests, which the first pass missed entirely
 corpus_files.extend(ROOT.glob('crates/*/src/bin/diff_*.rs'))
@@ -69,16 +96,23 @@ def snake(n):
 
 total = 0
 findings = []
+missing_modules = []
 for crate, modname in sorted(CRATE_TO_MOD.items()):
-    lib = ROOT / 'crates' / crate / 'src' / 'lib.rs'
-    if not lib.exists():
+    src = ROOT / 'crates' / crate / 'src'
+    sources = [p for p in src.rglob('*.rs') if 'bin' not in p.relative_to(src).parts]
+    if not sources:
+        missing_modules.append(f"{crate}: no sources under {src}")
         continue
     try:
         mod = importlib.import_module(modname)
-    except Exception:
+    except Exception as err:
+        missing_modules.append(f"{modname}: {err}")
         continue
+    names = set()
+    for path in sources:
+        names.update(PUB_RE.findall(path.read_text(errors='ignore')))
     hits = set()
-    for n in sorted(set(PUB_RE.findall(lib.read_text(errors='ignore')))):
+    for n in sorted(names):
         if n.lower() in blob or snake(n) in blob:
             continue
         if hasattr(mod, n):
@@ -88,6 +122,12 @@ for crate, modname in sorted(CRATE_TO_MOD.items()):
     if hits:
         findings.append((crate, modname, sorted(hits)))
         total += len(hits)
+
+if missing_modules:
+    print("REFUSING: could not audit every crate; a partial audit under-reports:", file=sys.stderr)
+    for line in missing_modules:
+        print(f"  {line}", file=sys.stderr)
+    sys.exit(2)
 
 print(f"SciPy-named public entry points with NO differential coverage: {total}\n")
 for crate, modname, hits in sorted(findings, key=lambda r: -len(r[2])):
