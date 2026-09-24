@@ -22676,7 +22676,8 @@ Path(args.output).write_text(json.dumps(result, indent=2))
                 "mode": "Hardened",
                 "method": "Bfgs",
                 "objective": "nan_branch",
-                "x0": [0.0, 0.0],
+                // BFGS's first trial step from here enters the NaN half-plane x₀ < 0.
+                "x0": [1.0, 0.0],
                 "expected": {
                     "kind": "minimize_status",
                     "status": "NanEncountered",

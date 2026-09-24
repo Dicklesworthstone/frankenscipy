@@ -124,7 +124,9 @@ pub struct MinimizeOptions<'a> {
     pub tol: Option<f64>,
     pub maxiter: Option<usize>,
     pub maxfev: Option<usize>,
-    pub gradient_eps: f64,
+    /// SciPy `eps`, the finite-difference step when `gradient` is absent. `None` is the
+    /// method's SciPy default: √ε for BFGS, CG and SLSQP, 1e-8 for the others.
+    pub gradient_eps: Option<f64>,
     pub callback: Option<MinimizeCallback>,
     pub gradient: Option<GradientFunc>,
     /// SciPy `hess=`: used by trust-exact, dogleg, trust-ncg and Newton-CG.
@@ -149,7 +151,7 @@ impl Default for MinimizeOptions<'_> {
             tol: None,
             maxiter: None,
             maxfev: None,
-            gradient_eps: 1.0e-8,
+            gradient_eps: None,
             callback: None,
             gradient: None,
             hess: None,

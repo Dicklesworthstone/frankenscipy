@@ -313,9 +313,12 @@ fn e2e_p2c003_01_happy_path_minimize_bfgs() {
     let mut trace_cache = Vec::new();
 
     runner.record_step("run_rosenbrock_bfgs", "bfgs", || {
+        // SciPy's default gtol (1e-5). At tol = 1e-8 by finite differences SciPy 1.17.1's own
+        // verdict on this problem depends on its BLAS kernel: precision loss (31, 159, 49) under
+        // OPENBLAS_CORETYPE Prescott / Nehalem / Sandybridge, success (34, 123, 41) under
+        // Haswell / Zen. At the default it converges on all five (nit 31).
         let opts = MinimizeOptions {
             method: Some(OptimizeMethod::Bfgs),
-            tol: Some(1.0e-8),
             maxiter: Some(400),
             mode: RuntimeMode::Strict,
             ..MinimizeOptions::default()
@@ -637,10 +640,17 @@ fn e2e_p2c003_05_mode_switch_non_finite_objective() {
         if result.success {
             return Err("strict mode unexpectedly reported success on NaN objective".to_owned());
         }
-        if !result.message.contains("non-finite") {
+        // Strict hands the NaN to the algorithm as SciPy does: f(x0) is NaN, so SciPy 1.17.1
+        // stops at once with status 3, "NaN result encountered." (nit 0, nfev 3, njev 1).
+        if result.status != ConvergenceStatus::NanEncountered
+            || result.message != "NaN result encountered."
+            || (result.nit, result.nfev, result.njev) != (0, 3, 1)
+        {
             return Err(format!(
-                "strict mode message missing non-finite context: {}",
-                result.message
+                "strict mode is not SciPy's NaN stop: status={:?} message={} counts={:?}",
+                result.status,
+                result.message,
+                (result.nit, result.nfev, result.njev)
             ));
         }
         Ok(StepOutcome::with_trace(

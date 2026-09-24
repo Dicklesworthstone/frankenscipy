@@ -5,8 +5,8 @@
 //! incompatible constraints, an iteration limit, the unconstrained case, and SciPy's
 //! `new_constraint_to_old` conversions of `LinearConstraint` / `NonlinearConstraint`.
 //!
-//! Both sides use SciPy's default forward-difference step `eps = √ε` (fsci:
-//! `gradient_eps = f64::EPSILON.sqrt()`). Per case the exit message (SciPy's exit mode) must
+//! Both sides use their default forward-difference step, SciPy's `eps = √ε` (fsci:
+//! `gradient_eps: None`). Per case the exit message (SciPy's exit mode) must
 //! match. When SciPy succeeded, `x` must agree to `X_REL_TOL` (relative to max(|x|, 1)), `fun`
 //! to `FUN_REL_TOL`, and fsci's constraint violation must be at most `MAXCV_TOL` — SLSQP's
 //! own success contract (Σ violation < `ftol` = 1e-6); SciPy itself ends HS71 at a violation
@@ -438,7 +438,6 @@ fn diff_opt_slsqp_constrained() {
             bounds: case.bounds.as_deref(),
             constraints: &constraints,
             maxiter: Some(case.maxiter),
-            gradient_eps: f64::EPSILON.sqrt(),
             ..MinimizeOptions::default()
         };
         let fsci = minimize(case.fun, &case.x0, options);

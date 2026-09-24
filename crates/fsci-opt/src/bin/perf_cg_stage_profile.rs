@@ -248,6 +248,8 @@ where
     let tol = options.tol.unwrap_or(1.0e-6).max(1.0e-12);
     let maxiter = options.maxiter.unwrap_or((250 * n).max(120));
     let maxfev = options.maxfev.unwrap_or((2500 * n).max(500));
+    // cg_pr_plus's default step (central differences).
+    let gradient_eps = options.gradient_eps.unwrap_or(1.0e-8);
     let mut objective = Objective::new(fun, options.mode, maxfev);
 
     profile.record_vec(x0.len());
@@ -257,7 +259,7 @@ where
         Err(err) => return Ok(result_from_error(x0, 0, 0, 0, err, profile)),
     };
     let mut njev = 0usize;
-    let mut grad = match finite_diff_gradient(&mut objective, &x, options.gradient_eps, profile) {
+    let mut grad = match finite_diff_gradient(&mut objective, &x, gradient_eps, profile) {
         Ok(value) => {
             njev += 1;
             value
@@ -313,15 +315,8 @@ where
 
         let wolfe_search = {
             let started = Instant::now();
-            let res = line_search_wolfe2_profiled(
-                fun,
-                &x,
-                &direction,
-                f,
-                &grad,
-                options.gradient_eps,
-                profile,
-            );
+            let res =
+                line_search_wolfe2_profiled(fun, &x, &direction, f, &grad, gradient_eps, profile);
             profile.wolfe_runtime += started.elapsed();
             if let Ok(ls) = res {
                 objective.nfev += ls.actual_objective_calls;
@@ -393,25 +388,22 @@ where
                 njev += 1;
                 accepted_gradient
             }
-            None => {
-                match finite_diff_gradient(&mut objective, &search.x, options.gradient_eps, profile)
-                {
-                    Ok(value) => {
-                        njev += 1;
-                        value
-                    }
-                    Err(err) => {
-                        return Ok(result_from_error(
-                            &search.x,
-                            nit,
-                            objective.nfev,
-                            njev,
-                            err,
-                            profile,
-                        ));
-                    }
+            None => match finite_diff_gradient(&mut objective, &search.x, gradient_eps, profile) {
+                Ok(value) => {
+                    njev += 1;
+                    value
                 }
-            }
+                Err(err) => {
+                    return Ok(result_from_error(
+                        &search.x,
+                        nit,
+                        objective.nfev,
+                        njev,
+                        err,
+                        profile,
+                    ));
+                }
+            },
         };
 
         let direction_started = Instant::now();

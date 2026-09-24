@@ -539,9 +539,9 @@ fn evidence_p2c003_final_pack() {
             },
             RiskNote {
                 category: "finite_difference_gradients",
-                description: "All gradient-based methods (BFGS, CG) compute gradients via central finite differences (2n function evaluations per gradient). Noisy or discontinuous objectives may produce inaccurate gradients.".into(),
+                description: "Without a gradient, BFGS differences forward as SciPy does (n evaluations per gradient) and CG centrally (2n). Noisy or discontinuous objectives may produce inaccurate gradients.".into(),
                 affected_operations: vec!["bfgs", "cg"],
-                mitigation: "gradient_eps parameter (default 1e-8) can be tuned. Powell method is derivative-free alternative.".into(),
+                mitigation: "gradient_eps (default: SciPy's per-method eps, √ε for BFGS, 1e-8 for CG's central scheme) can be tuned. Powell method is derivative-free alternative.".into(),
             },
             RiskNote {
                 category: "powell_direction_degeneracy",

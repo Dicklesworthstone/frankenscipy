@@ -3,7 +3,8 @@
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::linesearch::{WolfeParams, line_search_wolfe2, line_search_wolfe2_with_gradient_probe};
+use crate::bfgs::{self, BfgsParams, CgParams, LineObjective};
+use crate::linesearch::{WolfeParams, line_search_wolfe2};
 use crate::trust_region::{self, Subproblem, TrustObjective, TrustParams};
 use crate::types::{
     Bound, Bounds, Constraint, ConstraintType, ConvergenceStatus, GradientFunc, HessFunc,
@@ -492,168 +493,253 @@ fn requested_tolerance(tol: Option<f64>) -> f64 {
     tol.unwrap_or(1.0e-6).max(0.0)
 }
 
+/// SciPy's `_epsilon` (√ε), the default `eps` of BFGS, CG and SLSQP, whose finite differences
+/// are SciPy's forward scheme.
+const SCIPY_SQRT_EPS: f64 = 1.490_116_119_384_765_6e-8;
+
+/// The default `gradient_eps` of the methods that difference with fsci's central scheme
+/// (`eps·(1 + |x|)`), SciPy's own default for L-BFGS-B and TNC.
+const CENTRAL_DIFF_EPS: f64 = 1.0e-8;
+
+/// `scipy.optimize.minimize(method='BFGS')`: SciPy's `_minimize_bfgs` (see [`crate::bfgs`]),
+/// its MINPACK-2 `dcsrch` line search with the Wolfe-2 fallback, and its inverse-Hessian update.
+///
+/// SciPy's option mapping: `tol` is `gtol` (default 1e-5, on the ∞-norm of the gradient),
+/// `maxiter` defaults to 200·n, and `gradient_eps` is `eps` (default √ε), the absolute
+/// forward-difference step for the gradient when `options.gradient` is absent. SciPy has no
+/// evaluation cap, so one applies only when `options.maxfev` is set. Evaluations are cached at
+/// the last point as SciPy's `ScalarFunction` caches them, so `nfev` / `njev` count what SciPy
+/// counts. The callback runs after each iteration, as SciPy's does. In Strict mode a
+/// non-finite objective or gradient value is passed to the algorithm as SciPy's is (status 2 or
+/// 3 follows); Hardened mode rejects it.
 pub fn bfgs<F>(fun: &F, x0: &[f64], options: MinimizeOptions) -> Result<OptimizeResult, OptError>
 where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
-
     let n = x0.len();
-    let tol = requested_tolerance(options.tol);
-    let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
-    let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
-    let mut objective = Objective::new(fun, options.mode, maxfev);
-
-    let mut x = x0.to_vec();
-    let mut f = match objective.eval(&x) {
-        Ok(value) => value,
-        Err(err) => return Ok(result_from_error(x0, 0, 0, 0, err)),
+    let params = BfgsParams {
+        gtol: options.tol.unwrap_or(1.0e-5),
+        norm_inf: true,
+        maxiter: options.maxiter.unwrap_or(200 * n),
+        xrtol: 0.0,
+        c1: 1.0e-4,
+        c2: 0.9,
     };
-    let mut njev = 0usize;
-    let exact_gradient = options.gradient;
-    let mut grad = match evaluate_minimize_gradient(
-        &mut objective,
-        exact_gradient,
-        &x,
-        options.gradient_eps,
-    ) {
-        Ok(value) => {
-            njev += 1;
-            value
-        }
-        Err(err) => return Ok(result_from_error(&x, 0, objective.nfev, njev, err)),
-    };
-
-    let mut h_inv = identity_matrix(n);
-    let mut nit = 0usize;
-
-    for iteration in 0..maxiter {
-        let grad_norm = l2_norm(&grad);
-        if grad_norm <= tol {
-            let result = OptimizeResult {
-                x: x.clone(),
-                fun: Some(f),
-                // status: ‖∇f‖₂ ≤ tol
-                success: true,
-                status: ConvergenceStatus::Success,
-                message: String::from("optimization converged (gradient norm <= tol)"),
-                nfev: objective.nfev,
-                njev,
+    let mut adapter = ScalarFunction::new(fun, options, OptimizeMethod::Bfgs, x0);
+    let outcome = bfgs::minimize_bfgs(&mut adapter, x0, &params);
+    let result = match outcome {
+        Ok(outcome) => {
+            let (success, status, message) =
+                warnflag_result(outcome.status, outcome.stopped_by_callback);
+            OptimizeResult {
+                fun: Some(outcome.fun),
+                success,
+                status,
+                message,
+                nfev: adapter.nfev,
+                njev: adapter.njev,
                 nhev: 0,
-                nit,
-                jac: Some(grad.clone()),
-                hess_inv: Some(h_inv.clone()),
+                nit: outcome.nit,
+                jac: Some(outcome.jac),
+                hess_inv: Some(
+                    outcome
+                        .hess_inv
+                        .chunks(n.max(1))
+                        .map(<[f64]>::to_vec)
+                        .collect(),
+                ),
                 maxcv: None,
-            };
-            log_completion(OptimizeMethod::Bfgs, options, iteration, &result);
-            return Ok(result);
-        }
-
-        if let Some(callback) = options.callback
-            && !callback(&x)
-        {
-            let result = OptimizeResult {
-                x: x.clone(),
-                fun: Some(f),
-                success: false,
-                status: ConvergenceStatus::CallbackStop,
-                message: String::from("callback requested stop"),
-                nfev: objective.nfev,
-                njev,
-                nhev: 0,
-                nit,
-                jac: Some(grad.clone()),
-                hess_inv: Some(h_inv.clone()),
-                maxcv: None,
-            };
-            log_completion(OptimizeMethod::Bfgs, options, iteration, &result);
-            return Ok(result);
-        }
-
-        let mut direction = matrix_vector_mul(&h_inv, &scale_vector(&grad, -1.0));
-        if dot(&direction, &grad) >= 0.0 {
-            direction = scale_vector(&grad, -1.0);
-        }
-        let search = match armijo_backtracking(&mut objective, &x, f, &grad, &direction) {
-            Ok(Some(value)) => value,
-            Ok(None) => {
-                let result = OptimizeResult {
-                    x: x.clone(),
-                    fun: Some(f),
-                    success: false,
-                    status: ConvergenceStatus::PrecisionLoss,
-                    message: String::from("line search failed to find a sufficient decrease"),
-                    nfev: objective.nfev,
-                    njev,
-                    nhev: 0,
-                    nit,
-                    jac: Some(grad.clone()),
-                    hess_inv: Some(h_inv.clone()),
-                    maxcv: None,
-                };
-                log_completion(OptimizeMethod::Bfgs, options, iteration, &result);
-                return Ok(result);
+                x: outcome.x,
             }
-            Err(err) => return Ok(result_from_error(&x, nit, objective.nfev, njev, err)),
-        };
-
-        let next_grad = match evaluate_minimize_gradient(
-            &mut objective,
-            exact_gradient,
-            &search.x,
-            options.gradient_eps,
-        ) {
-            Ok(value) => {
-                njev += 1;
-                value
-            }
-            Err(err) => return Ok(result_from_error(&search.x, nit, objective.nfev, njev, err)),
-        };
-
-        let s = sub_vectors(&search.x, &x);
-        let y = sub_vectors(&next_grad, &grad);
-        let ys = dot(&y, &s);
-        if ys > 1.0e-12 {
-            let rho = 1.0 / ys;
-            h_inv = bfgs_inverse_update(&h_inv, &s, &y, rho);
         }
-        // If ys <= 1e-12, skip the update to preserve existing curvature info.
-        // Resetting to identity would lose all accumulated information.
-
-        log_iteration(
-            OptimizeMethod::Bfgs,
-            options,
-            iteration + 1,
-            search.f,
-            l2_norm(&next_grad),
-            search.alpha,
-            objective.nfev,
-        );
-
-        x = search.x;
-        f = search.f;
-        grad = next_grad;
-        nit = iteration + 1;
-    }
-
-    let result = OptimizeResult {
-        x: x.clone(),
-        fun: Some(f),
-        success: false,
-        status: ConvergenceStatus::MaxIterations,
-        message: String::from("maximum iterations exceeded"),
-        nfev: objective.nfev,
-        njev,
-        nhev: 0,
-        nit,
-        jac: Some(grad),
-        hess_inv: Some(h_inv),
-        maxcv: None,
+        Err(err) => result_from_error(
+            &adapter.iterate,
+            adapter.nit,
+            adapter.nfev,
+            adapter.njev,
+            err,
+        ),
     };
-    log_completion(OptimizeMethod::Bfgs, options, nit, &result);
+    log_completion(OptimizeMethod::Bfgs, options, result.nit, &result);
     Ok(result)
 }
 
+/// A SciPy BFGS / CG warnflag (0 success, 1 maxiter, 2 precision loss, 3 NaN) as fsci's
+/// `(success, status, message)`; a callback stop is fsci's `CallbackStop`.
+fn warnflag_result(warnflag: u8, stopped_by_callback: bool) -> (bool, ConvergenceStatus, String) {
+    if stopped_by_callback {
+        return (
+            false,
+            ConvergenceStatus::CallbackStop,
+            String::from("callback requested stop"),
+        );
+    }
+    let status = match warnflag {
+        0 => ConvergenceStatus::Success,
+        1 => ConvergenceStatus::MaxIterations,
+        2 => ConvergenceStatus::PrecisionLoss,
+        _ => ConvergenceStatus::NanEncountered,
+    };
+    (
+        warnflag == 0,
+        status,
+        String::from(bfgs::status_message(warnflag)),
+    )
+}
+
+/// [`LineObjective`] with SciPy `ScalarFunction`'s semantics: the last point's `f` and gradient
+/// are cached, the gradient is the caller's or SciPy's `approx_derivative(method='2-point',
+/// abs_step=eps)` from the cached `f`, and `nfev` / `njev` count as SciPy counts.
+struct ScalarFunction<'a, F> {
+    fun: &'a F,
+    options: MinimizeOptions<'a>,
+    /// Whose iterations the trace log records.
+    method: OptimizeMethod,
+    maxfev: usize,
+    nfev: usize,
+    njev: usize,
+    cached_x: Option<Vec<f64>>,
+    cached_f: Option<f64>,
+    cached_g: Option<Vec<f64>>,
+    /// The last accepted iterate (`x0` before the first), reported if an evaluation fails.
+    iterate: Vec<f64>,
+    nit: usize,
+}
+
+impl<'a, F> ScalarFunction<'a, F>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    fn new(fun: &'a F, options: MinimizeOptions<'a>, method: OptimizeMethod, x0: &[f64]) -> Self {
+        Self {
+            fun,
+            options,
+            method,
+            maxfev: options.maxfev.unwrap_or(usize::MAX),
+            nfev: 0,
+            njev: 0,
+            cached_x: None,
+            cached_f: None,
+            cached_g: None,
+            iterate: x0.to_vec(),
+            nit: 0,
+        }
+    }
+
+    fn move_to(&mut self, x: &[f64]) {
+        if self.cached_x.as_deref() != Some(x) {
+            self.cached_x = Some(x.to_vec());
+            self.cached_f = None;
+            self.cached_g = None;
+        }
+    }
+
+    fn eval_raw(&mut self, x: &[f64]) -> Result<f64, OptError> {
+        if self.nfev >= self.maxfev {
+            return Err(OptError::EvaluationBudgetExceeded {
+                detail: format!("max function evaluations exceeded ({})", self.maxfev),
+            });
+        }
+        self.nfev += 1;
+        let value = (self.fun)(x);
+        if !value.is_finite() && self.options.mode == RuntimeMode::Hardened {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("hardened mode rejects non-finite objective values"),
+            });
+        }
+        Ok(value)
+    }
+}
+
+impl<F> LineObjective for ScalarFunction<'_, F>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    type Error = OptError;
+
+    fn fun(&mut self, x: &[f64]) -> Result<f64, OptError> {
+        self.move_to(x);
+        if let Some(f) = self.cached_f {
+            return Ok(f);
+        }
+        let f = self.eval_raw(x)?;
+        self.cached_f = Some(f);
+        Ok(f)
+    }
+
+    fn grad(&mut self, x: &[f64]) -> Result<Vec<f64>, OptError> {
+        self.move_to(x);
+        if let Some(g) = &self.cached_g {
+            return Ok(g.clone());
+        }
+        self.njev += 1;
+        let n = x.len();
+        let g = if let Some(gradient) = self.options.gradient {
+            let g = gradient(x);
+            if self.options.mode == RuntimeMode::Hardened {
+                validate_gradient_output(g, n)?
+            } else if g.len() != n {
+                return Err(OptError::InvalidArgument {
+                    detail: format!(
+                        "gradient callback returned length {}, expected {n}",
+                        g.len()
+                    ),
+                });
+            } else {
+                g
+            }
+        } else {
+            let f0 = self.fun(x)?;
+            let mut xp = x.to_vec();
+            let mut g = vec![0.0; n];
+            for i in 0..n {
+                let mut h = self.options.gradient_eps.unwrap_or(SCIPY_SQRT_EPS);
+                if (x[i] + h) - x[i] == 0.0 {
+                    let sign = if x[i] >= 0.0 { 1.0 } else { -1.0 };
+                    h = f64::EPSILON.sqrt() * sign * x[i].abs().max(1.0);
+                }
+                xp[i] = x[i] + h;
+                let dx = xp[i] - x[i];
+                g[i] = (self.eval_raw(&xp)? - f0) / dx;
+                xp[i] = x[i];
+            }
+            g
+        };
+        self.cached_g = Some(g.clone());
+        Ok(g)
+    }
+
+    fn callback(&mut self, x: &[f64], fun: f64) -> bool {
+        self.nit += 1;
+        let grad_norm = match (&self.cached_x, &self.cached_g) {
+            (Some(at), Some(g)) if at.as_slice() == x => l2_norm(g),
+            _ => f64::NAN,
+        };
+        let step = l2_norm(&sub_vectors(x, &self.iterate));
+        self.iterate.clear();
+        self.iterate.extend_from_slice(x);
+        log_iteration(
+            self.method,
+            self.options,
+            self.nit,
+            fun,
+            grad_norm,
+            step,
+            self.nfev,
+        );
+        self.options.callback.is_some_and(|callback| !callback(x))
+    }
+}
+
+/// `scipy.optimize.minimize(method='CG')`: SciPy's `_minimize_cg` (see [`crate::bfgs`]),
+/// Polak–Ribière+ on the same `dcsrch` / Wolfe-2 line search, which must also pass Gilbert &
+/// Nocedal's sufficient-descent test.
+///
+/// SciPy's option mapping: `tol` is `gtol` (default 1e-5, on the ∞-norm of the gradient),
+/// `maxiter` defaults to 200·n, the curvature constant is SciPy's `c2 = 0.4`, and
+/// `gradient_eps` is `eps` (default √ε), the absolute forward-difference step. Evaluation
+/// caching, counting, the callback and the Strict / Hardened split are as in [`bfgs`].
 pub fn cg_pr_plus<F>(
     fun: &F,
     x0: &[f64],
@@ -663,258 +749,48 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
-
-    let n = x0.len();
-    let tol = requested_tolerance(options.tol);
-    let maxiter = options.maxiter.unwrap_or((250 * n).max(120));
-    let maxfev = options.maxfev.unwrap_or((2500 * n).max(500));
-    let mut objective = Objective::new(fun, options.mode, maxfev);
-
-    let mut x = x0.to_vec();
-    let mut f = match objective.eval(&x) {
-        Ok(value) => value,
-        Err(err) => return Ok(result_from_error(x0, 0, 0, 0, err)),
+    let params = CgParams {
+        gtol: options.tol.unwrap_or(1.0e-5),
+        norm_inf: true,
+        maxiter: options.maxiter.unwrap_or(200 * x0.len()),
+        c1: 1.0e-4,
+        c2: 0.4,
     };
-    let mut njev = 0usize;
-    let exact_gradient = options.gradient;
-    let mut grad = match evaluate_minimize_gradient(
-        &mut objective,
-        exact_gradient,
-        &x,
-        options.gradient_eps,
-    ) {
-        Ok(value) => {
-            njev += 1;
-            value
-        }
-        Err(err) => return Ok(result_from_error(&x, 0, objective.nfev, njev, err)),
-    };
-    let mut direction = scale_vector(&grad, -1.0);
-    let mut nit = 0usize;
-
-    for iteration in 0..maxiter {
-        let grad_norm = l2_norm(&grad);
-        if grad_norm <= tol {
-            let result = OptimizeResult {
-                x: x.clone(),
-                fun: Some(f),
-                // status: ‖∇f‖₂ ≤ tol
-                success: true,
-                status: ConvergenceStatus::Success,
-                message: String::from("optimization converged (gradient norm <= tol)"),
-                nfev: objective.nfev,
-                njev,
+    let mut adapter = ScalarFunction::new(fun, options, OptimizeMethod::ConjugateGradient, x0);
+    let outcome = bfgs::minimize_cg(&mut adapter, x0, &params);
+    let result = match outcome {
+        Ok(outcome) => {
+            let (success, status, message) =
+                warnflag_result(outcome.status, outcome.stopped_by_callback);
+            OptimizeResult {
+                fun: Some(outcome.fun),
+                success,
+                status,
+                message,
+                nfev: adapter.nfev,
+                njev: adapter.njev,
                 nhev: 0,
-                nit,
-                jac: Some(grad.clone()),
+                nit: outcome.nit,
+                jac: Some(outcome.jac),
                 hess_inv: None,
                 maxcv: None,
-            };
-            log_completion(
-                OptimizeMethod::ConjugateGradient,
-                options,
-                iteration,
-                &result,
-            );
-            return Ok(result);
-        }
-
-        if let Some(callback) = options.callback
-            && !callback(&x)
-        {
-            let result = OptimizeResult {
-                x: x.clone(),
-                fun: Some(f),
-                success: false,
-                status: ConvergenceStatus::CallbackStop,
-                message: String::from("callback requested stop"),
-                nfev: objective.nfev,
-                njev,
-                nhev: 0,
-                nit,
-                jac: Some(grad.clone()),
-                hess_inv: None,
-                maxcv: None,
-            };
-            log_completion(
-                OptimizeMethod::ConjugateGradient,
-                options,
-                iteration,
-                &result,
-            );
-            return Ok(result);
-        }
-
-        if dot(&direction, &grad) >= 0.0 {
-            direction = scale_vector(&grad, -1.0);
-        }
-        // Strong-Wolfe line search: nonlinear CG needs the curvature condition to
-        // keep generating descent directions; Armijo-only steps stall the
-        // Polak-Ribière recurrence (e.g. Rosenbrock). scipy's CG uses the same.
-        let wolfe_search = {
-            let eps = options.gradient_eps;
-            let counter = std::cell::Cell::new(0usize);
-            let mut wolfe_gradient_evals = 0usize;
-            let mut gradient_error: Option<OptError> = None;
-            let f_closure = |xv: &[f64]| {
-                counter.set(counter.get() + 1);
-                (fun)(xv)
-            };
-            let mut g_closure = |xv: &mut [f64], gradient: &mut Vec<f64>| {
-                if let Some(gradient_fn) = exact_gradient {
-                    match validate_gradient_output(gradient_fn(xv), xv.len()) {
-                        Ok(value) => {
-                            *gradient = value;
-                            wolfe_gradient_evals += 1;
-                        }
-                        Err(err) => {
-                            gradient_error = Some(err);
-                            gradient.clear();
-                            gradient.resize(xv.len(), f64::NAN);
-                            return f64::NAN;
-                        }
-                    }
-                } else {
-                    if gradient.len() != xv.len() {
-                        gradient.resize(xv.len(), 0.0);
-                    }
-                    for i in 0..xv.len() {
-                        let step = eps * (1.0 + xv[i].abs());
-                        let orig = xv[i];
-                        xv[i] = orig + step;
-                        counter.set(counter.get() + 1);
-                        let fp = (fun)(xv);
-                        xv[i] = orig - step;
-                        counter.set(counter.get() + 1);
-                        let fm = (fun)(xv);
-                        xv[i] = orig;
-                        gradient[i] = (fp - fm) / (2.0 * step);
-                    }
-                }
-                dot(gradient, &direction)
-            };
-            let res = line_search_wolfe2_with_gradient_probe(
-                &f_closure,
-                &mut g_closure,
-                &x,
-                &direction,
-                f,
-                &grad,
-                WolfeParams::default(),
-            );
-            if let Some(err) = gradient_error {
-                return Ok(result_from_error(&x, nit, objective.nfev, njev, err));
+                x: outcome.x,
             }
-            if let Ok(ls) = res {
-                objective.nfev += counter.get();
-                njev += wolfe_gradient_evals;
-                Some(LineSearchStep {
-                    x: add_scaled(&x, &direction, ls.result.alpha),
-                    f: ls.result.f_at_alpha,
-                    alpha: ls.result.alpha,
-                    accepted_gradient: ls.accepted_gradient,
-                })
-            } else {
-                None
-            }
-        };
-        let search = match wolfe_search {
-            Some(value) => value,
-            None => match armijo_backtracking(&mut objective, &x, f, &grad, &direction) {
-                Ok(Some(value)) => value,
-                Ok(None) => {
-                    let result = OptimizeResult {
-                        x: x.clone(),
-                        fun: Some(f),
-                        success: false,
-                        status: ConvergenceStatus::PrecisionLoss,
-                        message: String::from("line search failed to find a sufficient decrease"),
-                        nfev: objective.nfev,
-                        njev,
-                        nhev: 0,
-                        nit,
-                        jac: Some(grad.clone()),
-                        hess_inv: None,
-                        maxcv: None,
-                    };
-                    log_completion(
-                        OptimizeMethod::ConjugateGradient,
-                        options,
-                        iteration,
-                        &result,
-                    );
-                    return Ok(result);
-                }
-                Err(err) => return Ok(result_from_error(&x, nit, objective.nfev, njev, err)),
-            },
-        };
-
-        let next_grad = match search.accepted_gradient {
-            Some(accepted_gradient) => {
-                if exact_gradient.is_none() {
-                    if let Err(err) = objective.reserve_evaluations(n * 2) {
-                        return Ok(result_from_error(&search.x, nit, objective.nfev, njev, err));
-                    }
-                    njev += 1;
-                }
-                accepted_gradient
-            }
-            None => match evaluate_minimize_gradient(
-                &mut objective,
-                exact_gradient,
-                &search.x,
-                options.gradient_eps,
-            ) {
-                Ok(value) => {
-                    njev += 1;
-                    value
-                }
-                Err(err) => {
-                    return Ok(result_from_error(&search.x, nit, objective.nfev, njev, err));
-                }
-            },
-        };
-
-        let denom = dot(&grad, &grad).max(1.0e-18);
-        let grad_delta = sub_vectors(&next_grad, &grad);
-        let beta_pr = dot(&next_grad, &grad_delta) / denom;
-        let beta = beta_pr.max(0.0);
-        direction = sub_vectors(
-            &scale_vector(&next_grad, -1.0),
-            &scale_vector(&direction, -beta),
-        );
-
-        log_iteration(
-            OptimizeMethod::ConjugateGradient,
-            options,
-            iteration + 1,
-            search.f,
-            l2_norm(&next_grad),
-            search.alpha,
-            objective.nfev,
-        );
-
-        x = search.x;
-        f = search.f;
-        grad = next_grad;
-        nit = iteration + 1;
-    }
-
-    let result = OptimizeResult {
-        x: x.clone(),
-        fun: Some(f),
-        success: false,
-        status: ConvergenceStatus::MaxIterations,
-        message: String::from("maximum iterations exceeded"),
-        nfev: objective.nfev,
-        njev,
-        nhev: 0,
-        nit,
-        jac: Some(grad),
-        hess_inv: None,
-        maxcv: None,
+        }
+        Err(err) => result_from_error(
+            &adapter.iterate,
+            adapter.nit,
+            adapter.nfev,
+            adapter.njev,
+            err,
+        ),
     };
-    log_completion(OptimizeMethod::ConjugateGradient, options, nit, &result);
+    log_completion(
+        OptimizeMethod::ConjugateGradient,
+        options,
+        result.nit,
+        &result,
+    );
     Ok(result)
 }
 
@@ -1497,7 +1373,7 @@ where
         &mut objective,
         options.gradient,
         &x,
-        options.gradient_eps,
+        options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
     ) {
         Ok(value) => {
             njev += 1;
@@ -1607,7 +1483,7 @@ where
                         &mut objective,
                         options.gradient,
                         &x,
-                        options.gradient_eps,
+                        options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
                     ) {
                         Ok(g) => {
                             njev += 1;
@@ -1654,7 +1530,7 @@ where
             ..WolfeParams::default()
         };
         if wolfe_params.amax > wolfe_params.amin {
-            let eps = options.gradient_eps;
+            let eps = options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS);
             let counter = std::cell::Cell::new(0usize);
             let gradient_calls = std::cell::Cell::new(0usize);
             let f_closure = |xv: &[f64]| {
@@ -1779,7 +1655,7 @@ where
                                 &mut objective,
                                 options.gradient,
                                 &x,
-                                options.gradient_eps,
+                                options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
                             ) {
                                 Ok(g) => {
                                     njev += 1;
@@ -1966,7 +1842,7 @@ where
     let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
     let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
-    let eps = options.gradient_eps;
+    let eps = options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS);
     let mut objective = Objective::new(fun, options.mode, maxfev);
 
     let mut x = x0.to_vec();
@@ -2172,7 +2048,7 @@ where
     let tol = requested_tolerance(options.tol);
     let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
     let maxfev = options.maxfev.unwrap_or((5000 * n).max(1_000));
-    let eps = options.gradient_eps;
+    let eps = options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS);
     let mut objective = Objective::new(fun, options.mode, maxfev);
 
     let mut x = x0.to_vec();
@@ -2540,7 +2416,7 @@ where
         } else {
             None
         },
-        gradient_eps: options.gradient_eps,
+        gradient_eps: options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
         callback: options.callback,
         njev: 0,
         nhev: 0,
@@ -3211,7 +3087,6 @@ struct LineSearchStep {
     alpha: f64,
     x: Vec<f64>,
     f: f64,
-    accepted_gradient: Option<Vec<f64>>,
 }
 
 struct Objective<'a, F>
@@ -3256,18 +3131,6 @@ where
             };
         }
         Ok(value)
-    }
-
-    fn reserve_evaluations(&mut self, count: usize) -> Result<(), OptError> {
-        let remaining = self.maxfev.saturating_sub(self.nfev);
-        if remaining < count {
-            self.nfev = self.maxfev;
-            return Err(OptError::EvaluationBudgetExceeded {
-                detail: format!("max function evaluations exceeded ({})", self.maxfev),
-            });
-        }
-        self.nfev += count;
-        Ok(())
     }
 }
 
@@ -3368,42 +3231,6 @@ fn validate_hessp_output(product: Vec<f64>, n: usize) -> Result<Vec<f64>, OptErr
     Ok(product)
 }
 
-fn armijo_backtracking<F>(
-    objective: &mut Objective<'_, F>,
-    x: &[f64],
-    fx: f64,
-    grad: &[f64],
-    direction: &[f64],
-) -> Result<Option<LineSearchStep>, OptError>
-where
-    F: Fn(&[f64]) -> f64,
-{
-    let directional_derivative = dot(grad, direction);
-    if directional_derivative >= 0.0 {
-        return Ok(None);
-    }
-
-    let c1 = 1.0e-4;
-    let mut alpha = 1.0;
-    for _ in 0..24 {
-        let candidate_x = add_scaled(x, direction, alpha);
-        let candidate_f = objective.eval(&candidate_x)?;
-        if candidate_f <= fx + c1 * alpha * directional_derivative {
-            return Ok(Some(LineSearchStep {
-                alpha,
-                x: candidate_x,
-                f: candidate_f,
-                accepted_gradient: None,
-            }));
-        }
-        alpha *= 0.5;
-        if alpha < 1.0e-12 {
-            break;
-        }
-    }
-    Ok(None)
-}
-
 /// Step lengths `alpha` keeping `x + alpha*direction` inside the box: SciPy's `_line_for_search`.
 /// `x` must be feasible, so the interval always contains 0.
 fn feasible_step_interval(x: &[f64], direction: &[f64], bounds: &[Bound]) -> (f64, f64) {
@@ -3454,7 +3281,6 @@ where
         alpha: 0.0,
         x: x.to_vec(),
         f: fx,
-        accepted_gradient: None,
     };
     if direction.iter().all(|&d| d == 0.0) {
         return Ok(stay);
@@ -3502,7 +3328,6 @@ where
         alpha,
         x: best_x,
         f: f_alpha,
-        accepted_gradient: None,
     })
 }
 
@@ -3834,7 +3659,9 @@ fn validate_minimize_options(options: MinimizeOptions) -> Result<(), OptError> {
             detail: String::from("tol must be finite and > 0"),
         });
     }
-    if !options.gradient_eps.is_finite() || options.gradient_eps <= 0.0 {
+    if let Some(eps) = options.gradient_eps
+        && (!eps.is_finite() || eps <= 0.0)
+    {
         return Err(OptError::InvalidArgument {
             detail: String::from("gradient_eps must be finite and > 0"),
         });
@@ -3883,49 +3710,6 @@ fn validate_bounds_for_x0(x0: &[f64], bounds: Option<&[Bound]>) -> Result<(), Op
 
 fn bounds_have_finite_limit(bounds: &[Bound]) -> bool {
     bounds.iter().any(|(lo, hi)| lo.is_some() || hi.is_some())
-}
-
-fn bfgs_inverse_update(h_inv: &[Vec<f64>], s: &[f64], y: &[f64], rho: f64) -> Vec<Vec<f64>> {
-    let n = s.len();
-
-    // H_new = (I - rho*s*y^T) * H * (I - rho*y*s^T) + rho*s*s^T
-    //
-    // Let A = (I - rho*s*y^T) * H = H - rho*s*(y^T * H)
-    // Then H_new = A * (I - rho*y*s^T) + rho*s*s^T = A - rho*(A*y)*s^T + rho*s*s^T
-
-    // 1. v^T = y^T * H  (O(n^2))
-    let mut v = vec![0.0; n];
-    for j in 0..n {
-        for i in 0..n {
-            v[j] += y[i] * h_inv[i][j];
-        }
-    }
-
-    // 2. A = H - rho * s * v^T  (O(n^2))
-    let mut a = vec![vec![0.0; n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            a[i][j] = h_inv[i][j] - rho * s[i] * v[j];
-        }
-    }
-
-    // 3. u = A * y  (O(n^2))
-    let mut u = vec![0.0; n];
-    for i in 0..n {
-        for j in 0..n {
-            u[i] += a[i][j] * y[j];
-        }
-    }
-
-    // 4. H_new = A - rho * u * s^T + rho * s * s^T (O(n^2))
-    let mut h_new = a;
-    for i in 0..n {
-        for j in 0..n {
-            h_new[i][j] += rho * (s[i] * s[j] - u[i] * s[j]);
-        }
-    }
-
-    h_new
 }
 
 fn log_iteration(
@@ -4365,8 +4149,12 @@ where
     let mut njev = 0usize;
 
     let mut grad = {
-        let value =
-            evaluate_minimize_gradient(&mut objective, options.gradient, &x, options.gradient_eps)?;
+        let value = evaluate_minimize_gradient(
+            &mut objective,
+            options.gradient,
+            &x,
+            options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
+        )?;
         njev += 1;
         value
     };
@@ -4477,7 +4265,7 @@ where
             &mut objective,
             options.gradient,
             &x_new,
-            options.gradient_eps,
+            options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
         ) {
             Ok(v) => {
                 njev += 1;
@@ -4631,10 +4419,10 @@ fn reject_unhonoured_constraints(method: &str, options: MinimizeOptions) -> Resu
 /// [`crate::slsqp`]) under `options.bounds` and `options.constraints`.
 ///
 /// SciPy's option mapping: `tol` is `ftol` (default 1e-6), `maxiter` defaults to 100, and
-/// `gradient_eps` is `eps`, the absolute forward-difference step for the gradient (when
-/// `options.gradient` is absent) and for every constraint without `jac` — stepped backwards or
-/// shortened at a bound exactly as `approx_derivative(..., '2-point', abs_step=eps, bounds)`
-/// does. SciPy's default `eps` is √ε ≈ 1.49e-8; fsci's shared default is 1e-8. `x0` is clipped
+/// `gradient_eps` is `eps` (default √ε), the absolute forward-difference step for the gradient
+/// (when `options.gradient` is absent) and for every constraint without `jac` — stepped
+/// backwards or shortened at a bound exactly as `approx_derivative(..., '2-point',
+/// abs_step=eps, bounds)` does. `x0` is clipped
 /// into the bounds first. The message is SciPy's exit-mode text; `maxcv` is the largest
 /// constraint violation at `x`. In Strict mode a non-finite objective value is passed to the
 /// algorithm as SciPy's is (its convergence tests never accept one); Hardened mode rejects it.
@@ -4707,7 +4495,7 @@ where
         m,
         gradient: options.gradient,
         callback: options.callback,
-        eps: options.gradient_eps,
+        eps: options.gradient_eps.unwrap_or(SCIPY_SQRT_EPS),
         lb,
         ub,
         mode: options.mode,
@@ -4983,8 +4771,12 @@ where
     let mut x = x0.to_vec();
     let mut f = objective.eval(&x)?;
 
-    let mut grad =
-        evaluate_minimize_gradient(&mut objective, options.gradient, &x, options.gradient_eps)?;
+    let mut grad = evaluate_minimize_gradient(
+        &mut objective,
+        options.gradient,
+        &x,
+        options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
+    )?;
     let mut trust_radius = 1.0;
     let eta = 0.15;
     // Quasi-Newton Hessian approximation B for the quadratic trust-region
@@ -5087,7 +4879,7 @@ where
                 &mut objective,
                 options.gradient,
                 &x_new,
-                options.gradient_eps,
+                options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
             )?;
             // BFGS update of the Hessian model:
             //   B_{k+1} = B_k - (B s)(B s)^T / (s^T B s) + (y y^T) / (y^T s).
@@ -5252,7 +5044,7 @@ mod tests {
         powell_line_search,
     };
     use crate::{
-        Bound, Constraint, ConvergenceStatus, HessFunc, HesspFunc, LinearConstraint,
+        Bound, Constraint, ConvergenceStatus, GradientFunc, HessFunc, HesspFunc, LinearConstraint,
         MinimizeOptions, MinimizeScalarOptions, NonlinearConstraint, OptCaspProblem, OptError,
         OptimizeMethod, OptimizeResult, bfgs, cg_pr_plus, get_optimize_traces, minimize,
         minimize_many, minimize_scalar, minimize_scalar_many, powell, select_minimize_method,
@@ -5739,7 +5531,12 @@ mod tests {
         let result = minimize(rosenbrock, &[-1.2, 1.0], options).expect("minimize executes");
         assert!(!result.success);
         assert_eq!(result.status, ConvergenceStatus::MaxIterations);
-        assert!(result.message.contains("maximum iterations"));
+        // SciPy 1.17.1: status 1, nit 1, nfev 9, njev 3 (forward differences, eps = √ε).
+        assert_eq!(
+            result.message,
+            "Maximum number of iterations has been exceeded."
+        );
+        assert_eq!((result.nit, result.nfev, result.njev), (1, 9, 3));
         push_test_log(
             "optimize-result-maxiter",
             "bfgs",
@@ -5758,7 +5555,7 @@ mod tests {
             tol: Some(1.0e-12),
             maxiter: Some(50),
             maxfev: Some(20_000),
-            gradient_eps: 1.0e-6,
+            gradient_eps: Some(1.0e-6),
             mode: RuntimeMode::Strict,
             ..MinimizeOptions::default()
         };
@@ -5766,7 +5563,13 @@ mod tests {
             minimize(step_plateau, &[0.499_999], options).expect("minimize returns a result");
         assert!(!result.success);
         assert_eq!(result.status, ConvergenceStatus::PrecisionLoss);
-        assert!(result.message.contains("line search failed"));
+        // SciPy 1.17.1 (eps = 1e-6): both line searches fail at the first step.
+        assert_eq!(
+            result.message,
+            "Desired error not necessarily achieved due to precision loss."
+        );
+        assert_eq!((result.nit, result.nfev, result.njev), (0, 86, 37));
+        assert_eq!(result.x, vec![0.499_999]);
         push_test_log(
             "optimize-result-linesearch-failure",
             "bfgs",
@@ -5883,27 +5686,37 @@ mod tests {
     }
 
     #[test]
-    fn bfgs_exact_gradient_rejects_nonfinite_callback() {
+    fn bfgs_nonfinite_gradient_is_scipys_nan_status_in_strict_and_refused_in_hardened() {
         fn nonfinite_gradient(x: &[f64]) -> Vec<f64> {
             vec![f64::NAN; x.len()]
         }
+        let run = |mode| {
+            bfgs(
+                &sphere,
+                &[2.0, -3.0],
+                MinimizeOptions {
+                    method: Some(OptimizeMethod::Bfgs),
+                    gradient: Some(nonfinite_gradient),
+                    mode,
+                    ..MinimizeOptions::default()
+                },
+            )
+            .expect("bfgs returns a result")
+        };
 
-        let result = bfgs(
-            &sphere,
-            &[2.0, -3.0],
-            MinimizeOptions {
-                method: Some(OptimizeMethod::Bfgs),
-                gradient: Some(nonfinite_gradient),
-                mode: RuntimeMode::Strict,
-                ..MinimizeOptions::default()
-            },
-        )
-        .expect("bfgs returns non-finite result");
+        // SciPy 1.17.1: status 3 "NaN result encountered.", nit 0, nfev 1, njev 1, fun 13.
+        let strict = run(RuntimeMode::Strict);
+        assert!(!strict.success);
+        assert_eq!(strict.status, ConvergenceStatus::NanEncountered);
+        assert_eq!(strict.message, "NaN result encountered.");
+        assert_eq!((strict.nit, strict.nfev, strict.njev), (0, 1, 1));
+        assert_eq!(strict.fun, Some(13.0));
 
-        assert!(!result.success);
-        assert_eq!(result.status, ConvergenceStatus::NanEncountered);
+        let hardened = run(RuntimeMode::Hardened);
+        assert!(!hardened.success);
+        assert_eq!(hardened.status, ConvergenceStatus::NanEncountered);
         assert!(
-            result
+            hardened
                 .message
                 .contains("gradient callback returned NaN or Inf")
         );
@@ -5934,6 +5747,9 @@ mod tests {
 
     #[test]
     fn bfgs_zero_gradient_at_start_converges_immediately() {
+        fn sphere_gradient(x: &[f64]) -> Vec<f64> {
+            x.iter().map(|v| 2.0 * v).collect()
+        }
         let options = MinimizeOptions {
             method: Some(OptimizeMethod::Bfgs),
             tol: Some(1.0e-8),
@@ -5942,9 +5758,26 @@ mod tests {
             mode: RuntimeMode::Strict,
             ..MinimizeOptions::default()
         };
+        let exact = bfgs(
+            &sphere,
+            &[0.0, 0.0],
+            MinimizeOptions {
+                gradient: Some(sphere_gradient),
+                ..options
+            },
+        )
+        .expect("bfgs executes");
+        // SciPy 1.17.1 with jac: status 0, nit 0, nfev 1, njev 1.
+        assert!(exact.success);
+        assert_eq!((exact.nit, exact.nfev, exact.njev), (0, 1, 1));
+
+        // Without jac the forward difference at the origin is h = √ε ≈ 1.49e-8 > gtol, and
+        // SciPy's line searches then fail: status 2, nit 0, nfev 315, njev 101.
         let result = bfgs(&sphere, &[0.0, 0.0], options).expect("bfgs executes");
-        assert!(result.success);
-        assert_eq!(result.nit, 0);
+        assert!(!result.success);
+        assert_eq!(result.status, ConvergenceStatus::PrecisionLoss);
+        assert_eq!((result.nit, result.nfev, result.njev), (0, 315, 101));
+        assert_eq!(result.x, vec![0.0, 0.0]);
         push_test_log(
             "bfgs-zero-gradient-start",
             "bfgs",
@@ -5990,9 +5823,32 @@ mod tests {
             mode: RuntimeMode::Hardened,
             ..MinimizeOptions::default()
         };
-        let result = minimize(objective, &[0.0], options).expect("returns an OptimizeResult");
+        // From x = 1 the first trial step is 0.505 · (−2), into the NaN half-line.
+        let result = minimize(objective, &[1.0], options).expect("returns an OptimizeResult");
         assert!(!result.success);
         assert_eq!(result.status, ConvergenceStatus::NanEncountered);
+
+        // Strict hands the NaN to the line search as SciPy 1.17.1 does: status 2 after one
+        // iteration at x = −1033.24, nfev 224, njev 112, fun NaN.
+        let strict = minimize(
+            objective,
+            &[1.0],
+            MinimizeOptions {
+                mode: RuntimeMode::Strict,
+                ..options
+            },
+        )
+        .expect("returns an OptimizeResult");
+        assert_eq!(strict.status, ConvergenceStatus::PrecisionLoss);
+        assert_eq!((strict.nit, strict.nfev, strict.njev), (1, 224, 112));
+        assert_eq!(strict.x, vec![-1033.24]);
+        assert!(strict.fun.is_some_and(f64::is_nan));
+
+        // From x = 0 the forward difference never leaves the domain: SciPy converges at once
+        // (nit 0, nfev 2, njev 1) in either mode.
+        let origin = minimize(objective, &[0.0], options).expect("returns an OptimizeResult");
+        assert!(origin.success, "{}", origin.message);
+        assert_eq!((origin.nit, origin.nfev, origin.njev), (0, 2, 1));
         push_test_log(
             "bfgs-hardened-nan-gradient",
             "bfgs",
@@ -6006,22 +5862,31 @@ mod tests {
 
     #[test]
     fn bfgs_callback_receives_intermediate_points() {
-        callback_points()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        // Its own recorder: `callback_points` is shared with tests running concurrently.
+        static SEEN: Mutex<Vec<Vec<f64>>> = Mutex::new(Vec::new());
+        fn record_and_stop(x: &[f64]) -> bool {
+            SEEN.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(x.to_vec());
+            false
+        }
         let options = MinimizeOptions {
             method: Some(OptimizeMethod::Bfgs),
-            callback: Some(callback_record_and_stop),
+            callback: Some(record_and_stop),
             maxiter: Some(40),
             maxfev: Some(10_000),
             mode: RuntimeMode::Strict,
             ..MinimizeOptions::default()
         };
         let result = bfgs(&sphere, &[2.5, -1.5], options).expect("bfgs executes");
-        let points = callback_points().lock().unwrap_or_else(|e| e.into_inner());
-        assert!(!points.is_empty());
-        assert_eq!(points[0], vec![2.5, -1.5]);
+        let points = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        // SciPy 1.17.1 calls back after each iteration, never with x0; a StopIteration on the
+        // first call ends it at nit 1, nfev 6, njev 2, x = (1.6339321450303306, −0.98035928…).
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0], result.x);
+        assert!((result.x[0] - 1.633_932_145_030_330_6).abs() <= 1e-15);
+        assert!((result.x[1] + 0.980_359_287_018_198_4).abs() <= 1e-15);
+        assert_eq!((result.nit, result.nfev, result.njev), (1, 6, 2));
         assert_eq!(result.status, ConvergenceStatus::CallbackStop);
         push_test_log(
             "bfgs-callback-points",
@@ -6058,8 +5923,141 @@ mod tests {
         );
     }
 
+    /// `scipy.optimize.minimize(method='BFGS')` at its defaults, SciPy 1.17.1 values.
+    #[test]
+    fn bfgs_takes_scipys_path() {
+        // SciPy's `rosen` / `rosen_der`.
+        fn rosen(x: &[f64]) -> f64 {
+            (0..x.len() - 1)
+                .map(|i| 100.0 * (x[i + 1] - x[i] * x[i]).powi(2) + (1.0 - x[i]).powi(2))
+                .sum()
+        }
+        fn rosen_der(x: &[f64]) -> Vec<f64> {
+            let n = x.len();
+            let mut d = vec![0.0; n];
+            for i in 1..n - 1 {
+                d[i] = 200.0 * (x[i] - x[i - 1] * x[i - 1])
+                    - 400.0 * (x[i + 1] - x[i] * x[i]) * x[i]
+                    - 2.0 * (1.0 - x[i]);
+            }
+            d[0] = -400.0 * x[0] * (x[1] - x[0] * x[0]) - 2.0 * (1.0 - x[0]);
+            d[n - 1] = 200.0 * (x[n - 1] - x[n - 2] * x[n - 2]);
+            d
+        }
+        // Indefinite at x0: two wells in x₀, two in x₂.
+        fn nonconvex(x: &[f64]) -> f64 {
+            0.25 * x[0].powi(4) - 0.5 * x[0] * x[0]
+                + x[1] * x[1]
+                + 0.1 * x[0] * x[1]
+                + 0.05 * x[2].powi(4)
+                - x[2] * x[2]
+        }
+        fn nonconvex_grad(x: &[f64]) -> Vec<f64> {
+            vec![
+                x[0].powi(3) - x[0] + 0.1 * x[1],
+                2.0 * x[1] + 0.1 * x[0],
+                0.2 * x[2].powi(3) - 2.0 * x[2],
+            ]
+        }
+        type Case = (
+            &'static str,
+            fn(&[f64]) -> f64,
+            Option<GradientFunc>,
+            &'static [f64],
+            (usize, usize, usize),
+            &'static [f64],
+        );
+        let cases: [Case; 5] = [
+            (
+                "rosen2/jac",
+                rosen,
+                Some(rosen_der),
+                &[-1.2, 1.0],
+                (32, 39, 39),
+                &[0.999_999_971_001_401_1, 0.999_999_946_119_096_5],
+            ),
+            (
+                "rosen3/jac",
+                rosen,
+                Some(rosen_der),
+                &[1.3, 0.7, 0.8],
+                (13, 20, 20),
+                &[
+                    1.000_000_001_386_452_3,
+                    1.000_000_006_876_866_6,
+                    1.000_000_010_860_801_8,
+                ],
+            ),
+            (
+                "nonconvex/jac",
+                nonconvex,
+                Some(nonconvex_grad),
+                &[0.1, 0.2, 0.3],
+                (11, 18, 18),
+                &[
+                    1.002_496_802_905_991_7,
+                    -0.050_124_628_905_726_15,
+                    3.162_277_541_589_315_6,
+                ],
+            ),
+            (
+                "rosen2/fd",
+                rosen,
+                None,
+                &[-1.2, 1.0],
+                (32, 117, 39),
+                &[0.999_995_501_496_128_8, 0.999_990_994_780_780_5],
+            ),
+            (
+                "nonconvex/fd",
+                nonconvex,
+                None,
+                &[0.1, 0.2, 0.3],
+                (11, 72, 18),
+                &[
+                    1.002_496_817_710_361,
+                    -0.050_124_627_141_102_07,
+                    3.162_277_533_334_137_3,
+                ],
+            ),
+        ];
+        for (label, fun, gradient, x0, counts, want) in cases {
+            let result = bfgs(
+                &fun,
+                x0,
+                MinimizeOptions {
+                    method: Some(OptimizeMethod::Bfgs),
+                    gradient,
+                    ..MinimizeOptions::default()
+                },
+            )
+            .expect("bfgs executes");
+            assert!(result.success, "{label}: {}", result.message);
+            assert_eq!(result.message, "Optimization terminated successfully.");
+            assert_eq!(
+                (result.nit, result.nfev, result.njev),
+                counts,
+                "{label}: (nit, nfev, njev)"
+            );
+            // With a finite-difference gradient the path is SciPy's to the iteration, but the
+            // inverse-Hessian products are numpy's BLAS in SciPy and ordered sums here, and the
+            // differences amplify that rounding to ~2e-8 in x (measured 2.1e-8 and 8.3e-9).
+            let tol = if gradient.is_some() { 1e-12 } else { 1e-7 };
+            for (got, want) in result.x.iter().zip(want) {
+                assert!(
+                    (got - want).abs() <= tol * want.abs().max(1.0),
+                    "{label}: x = {:?}",
+                    result.x
+                );
+            }
+        }
+    }
+
     #[test]
     fn cg_quadratic_converges_with_small_iterations() {
+        fn sphere_gradient(x: &[f64]) -> Vec<f64> {
+            x.iter().map(|v| 2.0 * v).collect()
+        }
         let options = MinimizeOptions {
             method: Some(OptimizeMethod::ConjugateGradient),
             tol: Some(1.0e-8),
@@ -6068,9 +6066,25 @@ mod tests {
             mode: RuntimeMode::Strict,
             ..MinimizeOptions::default()
         };
+        let exact = cg_pr_plus(
+            &sphere,
+            &[4.0, -1.5],
+            MinimizeOptions {
+                gradient: Some(sphere_gradient),
+                ..options
+            },
+        )
+        .expect("cg executes");
+        assert!(exact.success, "{}", exact.message);
+        assert!(exact.nit <= 20);
+
+        // By forward differences the gradient cannot fall below gtol = 1e-8 (h = √ε leaves
+        // ~1.5e-8), and SciPy 1.17.1 ends in precision loss after 2 iterations, (nfev, njev) =
+        // (101, 30), at x within 1e-8 of the minimizer.
         let result = cg_pr_plus(&sphere, &[4.0, -1.5], options).expect("cg executes");
-        assert!(result.success, "{}", result.message);
-        assert!(result.nit <= 20);
+        assert_eq!(result.status, ConvergenceStatus::PrecisionLoss);
+        assert_eq!((result.nit, result.nfev, result.njev), (2, 101, 30));
+        assert!(result.x.iter().all(|v| v.abs() < 1.0e-8));
         push_test_log(
             "cg-quadratic",
             "cg_pr_plus",
@@ -6080,6 +6094,68 @@ mod tests {
             &result,
             112,
         );
+    }
+
+    /// `scipy.optimize.minimize(method='CG')` at its defaults: SciPy 1.17.1's (status, nit,
+    /// nfev, njev) and x to the bit — CG has no BLAS product, so nothing rounds differently.
+    #[test]
+    fn cg_takes_scipys_path() {
+        let cases: [(
+            Option<GradientFunc>,
+            Option<usize>,
+            ConvergenceStatus,
+            [usize; 3],
+            [f64; 2],
+        ); 3] = [
+            (
+                Some(rosenbrock_gradient),
+                None,
+                ConvergenceStatus::Success,
+                [36, 78, 77],
+                [1.000_000_005_485_334, 0.999_999_997_275_824_1],
+            ),
+            (
+                None,
+                None,
+                ConvergenceStatus::Success,
+                [37, 280, 93],
+                [0.999_996_778_620_981_7, 0.999_993_554_925_881],
+            ),
+            (
+                Some(rosenbrock_gradient),
+                Some(3),
+                ConvergenceStatus::MaxIterations,
+                [3, 12, 11],
+                [-0.477_789_082_671_575_05, 0.199_857_261_632_542_25],
+            ),
+        ];
+        for (gradient, maxiter, status, counts, want) in cases {
+            let result = cg_pr_plus(
+                &rosenbrock,
+                &[-1.2, 1.0],
+                MinimizeOptions {
+                    method: Some(OptimizeMethod::ConjugateGradient),
+                    gradient,
+                    maxiter,
+                    ..MinimizeOptions::default()
+                },
+            )
+            .expect("cg executes");
+            assert_eq!(result.status, status, "{}", result.message);
+            assert_eq!([result.nit, result.nfev, result.njev], counts);
+            assert_eq!(
+                result.x[0].to_bits(),
+                want[0].to_bits(),
+                "x = {:?}",
+                result.x
+            );
+            assert_eq!(
+                result.x[1].to_bits(),
+                want[1].to_bits(),
+                "x = {:?}",
+                result.x
+            );
+        }
     }
 
     #[test]
@@ -6671,7 +6747,7 @@ mod tests {
     fn invalid_gradient_epsilon_is_rejected() {
         let options = MinimizeOptions {
             method: Some(OptimizeMethod::Bfgs),
-            gradient_eps: 0.0,
+            gradient_eps: Some(0.0),
             ..MinimizeOptions::default()
         };
         let err = bfgs(&sphere, &[1.0, 1.0], options).expect_err("invalid options should fail");
@@ -7372,7 +7448,14 @@ mod tests {
                 ..MinimizeOptions::default()
             };
             let r = minimize(rosenbrock, &[-1.2, 1.0], options).expect("minimize");
-            assert!(r.success, "{method:?} should converge: {}", r.message);
+            if method == OptimizeMethod::ConjugateGradient {
+                // SciPy 1.17.1's CG reaches (1, 1) to 3.3e-6 here but, by forward differences,
+                // cannot bring the gradient under gtol = 1e-6: status 2 after 37 iterations.
+                assert_eq!(r.status, ConvergenceStatus::PrecisionLoss, "{}", r.message);
+                assert_eq!(r.nit, 37);
+            } else {
+                assert!(r.success, "{method:?} should converge: {}", r.message);
+            }
             assert!(
                 (r.x[0] - 1.0).abs() < 1e-3 && (r.x[1] - 1.0).abs() < 1e-3,
                 "{method:?} x={:?}",
@@ -8296,7 +8379,7 @@ mod tests {
                     bounds: Some(&bounds),
                     constraints: cons,
                     gradient,
-                    gradient_eps: f64::EPSILON.sqrt(),
+                    // SciPy's default `eps` (√ε) is SLSQP's default here too.
                     ..MinimizeOptions::default()
                 },
             )

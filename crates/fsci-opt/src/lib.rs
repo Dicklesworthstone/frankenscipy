@@ -4,10 +4,12 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+mod bfgs;
 pub mod bracket;
 pub mod chandrupatla;
 pub mod curvefit;
 pub mod direct;
+mod gsa;
 pub mod lbfgs_inv_hess;
 pub mod linesearch;
 pub mod minimize;
@@ -2506,7 +2508,8 @@ pub struct BasinhoppingOptions {
     pub stepsize: f64,
     /// Random seed for reproducibility.
     pub seed: Option<u64>,
-    /// Tolerance for local minimizer.
+    /// Tolerance for the local minimizer (`minimizer_kwargs={'tol': ...}`); `None` is SciPy's
+    /// default, the local BFGS's own `gtol` of 1e-5.
     pub minimizer_tol: Option<f64>,
 }
 
@@ -2517,7 +2520,7 @@ impl Default for BasinhoppingOptions {
             temperature: 1.0,
             stepsize: 0.5,
             seed: None,
-            minimizer_tol: Some(1e-8),
+            minimizer_tol: None,
         }
     }
 }
@@ -2588,10 +2591,11 @@ where
         None => rand::rngs::StdRng::from_rng(&mut rand::rng()),
     };
 
+    // SciPy's default `minimizer_kwargs` is `minimize`'s own default for an unconstrained
+    // problem: BFGS with its default `maxiter` (200 n).
     let minimize_opts = MinimizeOptions {
         method: Some(OptimizeMethod::Bfgs),
         tol: opts.minimizer_tol,
-        maxiter: Some(200),
         ..MinimizeOptions::default()
     };
 
@@ -2637,7 +2641,11 @@ where
                 rng.random_range(0.0..1.0) < prob
             };
 
-            if f_new < f_best {
+            // SciPy's `Storage.update`: only a SUCCESSFUL local minimisation becomes the new
+            // lowest (or replaces a stored one that failed). A run that ends in precision loss
+            // often stops LOWER than the successful ones — 27-34% of SciPy's own BFGS runs at
+            // tol 1e-8 by finite differences do — and must not be reported as the minimum.
+            if result.success && (f_new < f_best || !best_success) {
                 f_best = f_new;
                 x_best.clone_from(&result.x);
                 best_success = result.success;
@@ -2675,16 +2683,19 @@ where
     })
 }
 
-/// Dual annealing global optimization.
+/// Dual annealing global optimization: `scipy.optimize.dual_annealing(func, bounds,
+/// maxiter=maxiter, rng=seed)` with SciPy's other defaults.
 ///
-/// Simulated annealing with a local minimization after every annealing step, under the name
-/// and signature of `scipy.optimize.dual_annealing(func, bounds, maxiter, seed)`.
-///
-/// NOT SciPy's generalized simulated annealing: candidates come from a UNIFORM perturbation
-/// scaled by `√T/(1+T)` with `T = 5230/ln(k+1)`, not the Tsallis–Stariolo visiting
-/// distribution (`visit = 2.62`), there is no restart temperature, and the local search is
-/// BFGS clamped to the bounds rather than L-BFGS-B. Expect the same kind of answer on a
-/// multimodal problem, not the same iterates, `nfev` or (on a tie) the same minimizer.
+/// SciPy's generalized simulated annealing as SciPy 1.17.1 implements it (see [`crate::gsa`]):
+/// Tsallis–Stariolo visits (`visit = 2.62`) of every coordinate and then of one coordinate at a
+/// time along a chain of 2·n steps, the generalized Metropolis test (`accept = -5`), the
+/// temperature `5230·(2^1.62 − 1)/((k + 2)^1.62 − 1)` with a restart below `5230·2e-5`, and a
+/// local search — L-BFGS-B inside the bounds, `maxiter = min(max(6 n, 100), 1000)` — from the
+/// best point whenever the chain improved it and from the chain's minimum after 1000 iterations
+/// without improvement. The random stream is fsci's own (xorshift), so a seed does not
+/// reproduce SciPy's iterates, but the search is SciPy's: on Rastrigin in 2-D it finds the
+/// global minimum from 10 of 20 seeds at `maxiter = 80` (SciPy: 9 of 20) and from 20 of 20 at
+/// SciPy's default 1000 (SciPy: 20 of 20).
 ///
 /// # Arguments
 /// * `func` — Objective function to minimize.
@@ -2725,133 +2736,46 @@ where
     }
 
     let mut rng = SimpleRng::new(seed);
+    let lower: Vec<f64> = bounds.iter().map(|&(lo, _)| lo).collect();
+    let upper: Vec<f64> = bounds.iter().map(|&(_, hi)| hi).collect();
 
-    // Initialize with random point in bounds. SciPy's `EnergyState.reset` redraws a starting
-    // point whose energy is not finite, up to MAX_REINIT_COUNT times, then raises: a NaN start
-    // would otherwise stick (every later `<` against NaN is false) and come back as the answer
-    // with `fun = NaN` (frankenscipy-0v9od).
-    const MAX_REINIT_COUNT: usize = 1000;
-    let mut draw = || -> Vec<f64> {
-        bounds
-            .iter()
-            .map(|&(lo, hi)| lo + rng.next_f64() * (hi - lo))
-            .collect()
-    };
-    let mut x_best = draw();
-    let mut f_best = func(&x_best);
-    let mut nfev = 1usize;
-    let mut reinit_count = 0;
-    while !f_best.is_finite() {
-        if reinit_count >= MAX_REINIT_COUNT {
-            return Err(OptError::NonFiniteInput {
-                detail: "Stopping algorithm because function create NaN or (+/-) infinity values \
-                         even with trying new random parameters"
-                    .to_string(),
-            });
-        }
-        x_best = draw();
-        f_best = func(&x_best);
-        nfev += 1;
-        reinit_count += 1;
-    }
-
-    let mut x_current = x_best.clone();
-    let mut f_current = f_best;
-
-    // Local search: dual annealing's defining step is a deterministic local
-    // minimization after each annealing move (scipy uses L-BFGS-B). The bfgs
-    // result is clamped back into the bounds and re-evaluated.
+    // SciPy's `LocalSearchWrapper`: L-BFGS-B inside the bounds with
+    // `maxiter = min(max(6 n, 100), 1000)`.
+    let local_bounds: Vec<Bound> = bounds
+        .iter()
+        .map(|&(lo, hi)| (Some(lo), Some(hi)))
+        .collect();
     let minimize_opts = MinimizeOptions {
-        method: Some(OptimizeMethod::Bfgs),
-        maxiter: Some(200),
+        method: Some(OptimizeMethod::LBfgsB),
+        maxiter: Some((6 * ndim).clamp(100, 1000)),
+        bounds: Some(&local_bounds),
         ..MinimizeOptions::default()
     };
-    let local_search = |start: &[f64], nfev: &mut usize| -> (Vec<f64>, f64) {
-        match crate::bfgs(&func, start, minimize_opts) {
-            Ok(res) => {
-                *nfev += res.nfev;
-                let x_clamped: Vec<f64> = res
-                    .x
-                    .iter()
-                    .zip(bounds.iter())
-                    .map(|(&xi, &(lo, hi))| xi.clamp(lo, hi))
-                    .collect();
-                let f_clamped = func(&x_clamped);
-                *nfev += 1;
-                (x_clamped, f_clamped)
-            }
-            Err(_) => {
-                let f = func(start);
-                *nfev += 1;
-                (start.to_vec(), f)
-            }
-        }
+    let mut local = |start: &[f64]| -> Option<(f64, Vec<f64>, usize, usize)> {
+        let res = crate::lbfgsb(&func, start, minimize_opts, Some(&local_bounds)).ok()?;
+        Some((res.fun.unwrap_or(f64::NAN), res.x, res.nfev, res.njev))
     };
 
-    // Temperature schedule
-    let t_initial = 5230.0; // SciPy default
-    for iteration in 0..maxiter {
-        let temp = t_initial / (iteration as f64 + 1.0).ln().max(1.0);
-
-        // Candidate: a uniform perturbation of each coordinate, shrinking with temperature
-        let x_candidate: Vec<f64> = x_current
-            .iter()
-            .zip(bounds.iter())
-            .map(|(&xi, &(lo, hi))| {
-                let range = hi - lo;
-                let perturbation = range * (rng.next_f64() - 0.5) * temp.sqrt() / (1.0 + temp);
-                (xi + perturbation).clamp(lo, hi)
-            })
-            .collect();
-
-        let f_candidate = func(&x_candidate);
-        nfev += 1;
-
-        // Metropolis acceptance
-        let delta = f_candidate - f_current;
-        let accept = if delta < 0.0 {
-            true
-        } else {
-            let prob = (-delta / temp.max(1e-30)).exp();
-            rng.next_f64() < prob
-        };
-
-        if accept {
-            x_current = x_candidate.clone();
-            f_current = f_candidate;
-        }
-
-        // Local search from the annealing candidate.
-        let (x_local, f_local) = local_search(&x_candidate, &mut nfev);
-        if f_local < f_current {
-            x_current = x_local.clone();
-            f_current = f_local;
-        }
-
-        if f_current < f_best {
-            x_best.clone_from(&x_current);
-            f_best = f_current;
-        }
-    }
-
-    // Final local polish of the best point found.
-    let (x_polished, f_polished) = local_search(&x_best, &mut nfev);
-    if f_polished < f_best {
-        x_best = x_polished;
-        f_best = f_polished;
-    }
-
+    // SciPy's `EnergyState.reset` redraws a start whose energy is not finite up to 1000 times,
+    // then raises; a NaN start would otherwise stick and come back as the answer
+    // (frankenscipy-0v9od).
+    let outcome = gsa::anneal(&func, &lower, &upper, maxiter, &mut rng, Some(&mut local))
+        .map_err(|detail| OptError::NonFiniteInput { detail })?;
     Ok(OptimizeResult {
-        x: x_best,
-        fun: Some(f_best),
-        nit: maxiter,
-        nfev,
-        njev: 0,
+        x: outcome.x,
+        fun: Some(outcome.fun),
+        nit: outcome.nit,
+        nfev: outcome.nfev,
+        njev: outcome.njev,
         nhev: 0,
-        // status: SciPy parity -- success at maxiter; SciPy fails only on maxfun (none here)
-        success: true,
-        status: ConvergenceStatus::Success,
-        message: "dual_annealing completed".to_string(),
+        // status: SciPy's `success` is false only when maxfun stopped the search
+        success: outcome.success,
+        status: if outcome.success {
+            ConvergenceStatus::Success
+        } else {
+            ConvergenceStatus::MaxEvaluations
+        },
+        message: outcome.message,
         jac: None,
         hess_inv: None,
         maxcv: None,
@@ -3164,6 +3088,12 @@ impl SimpleRng {
     }
     fn next_f64(&mut self) -> f64 {
         (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+impl gsa::Uniform for SimpleRng {
+    fn next_f64(&mut self) -> f64 {
+        Self::next_f64(self)
     }
 }
 
@@ -8289,24 +8219,61 @@ mod tests {
 
     #[test]
     fn basinhopping_finds_global_minimum() {
-        // Multi-modal function: f(x) = x^4 - 4x^2 + x
-        // Has two local minima, global near x ≈ -1.38
+        // Multi-modal function: f(x) = x^4 - 4x^2 + x, local minima at x ≈ 1.347 (f ≈ -2.6186)
+        // and x ≈ -1.473 (global, f ≈ -5.4442), separated by the maximum at x ≈ 0.126.
         let func = |x: &[f64]| -> f64 {
             let xi = x[0];
             xi.powi(4) - 4.0 * xi * xi + xi
         };
+        let run = |stepsize| {
+            let opts = BasinhoppingOptions {
+                niter: 50,
+                seed: Some(42),
+                stepsize,
+                ..Default::default()
+            };
+            basinhopping(func, &[3.0], opts).unwrap().fun.unwrap()
+        };
 
+        // SciPy 1.17.1 basinhopping(f, [3.0], niter=50, stepsize=2.0) reaches the global minimum
+        // (x = -1.472998, f = -5.444192) for seeds 0-3 and 42.
+        let fun = run(2.0);
+        assert!(
+            (fun - -5.444_192).abs() < 1e-5,
+            "basinhopping should find global minimum, got f={fun}"
+        );
+
+        // With stepsize=1.0 no hop from x ≈ 1.347 crosses the barrier at 0.126, and SciPy stays
+        // at the local minimum (f = -2.618556) for every one of those seeds; a local search that
+        // overshoots into the other basin is not SciPy's.
+        let fun = run(1.0);
+        assert!(
+            (fun - -2.618_556).abs() < 1e-5,
+            "stepsize 1 stays in the start basin as SciPy's does, got f={fun}"
+        );
+    }
+
+    #[test]
+    fn basinhopping_reports_only_successful_local_minima() {
+        // Local BFGS at tol 1e-8 by forward differences ends in precision loss in about a third
+        // of SciPy's own runs, and those stop LOWER (f ~ 1e-18) than the successful ones
+        // (f ~ 1e-17 .. 1e-16). SciPy's Storage keeps only successful minimisations, so
+        // basinhopping(sphere, [4, -3], niter=40, minimizer_kwargs={'tol': 1e-8}) reports
+        // success for every seed tried (42, 7, 0, 1, 2). Keeping the lowest run regardless
+        // reported a failed one here (seed 7).
+        let sphere = |x: &[f64]| x[0] * x[0] + x[1] * x[1];
         let opts = BasinhoppingOptions {
-            niter: 50,
-            seed: Some(42),
-            stepsize: 1.0,
+            niter: 40,
+            seed: Some(7),
+            minimizer_tol: Some(1e-8),
             ..Default::default()
         };
-        let result = basinhopping(func, &[3.0], opts).unwrap();
-        let fun = result.fun.unwrap();
+        let result = basinhopping(sphere, &[4.0, -3.0], opts).unwrap();
+        assert!(result.success, "{}", result.message);
         assert!(
-            fun < -3.0,
-            "basinhopping should find global minimum, got f={fun}"
+            result.x.iter().all(|v| v.abs() < 1e-6),
+            "x = {:?}",
+            result.x
         );
     }
 

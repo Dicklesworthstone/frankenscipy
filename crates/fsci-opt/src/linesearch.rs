@@ -31,12 +31,6 @@ pub struct LineSearchResult {
     pub evaluations: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LineSearchWithGradient {
-    pub result: LineSearchResult,
-    pub accepted_gradient: Option<Vec<f64>>,
-}
-
 pub fn validate_wolfe_params(params: WolfeParams) -> Result<(), OptError> {
     if !(0.0 < params.c1 && params.c1 < params.c2 && params.c2 < 1.0) {
         return Err(OptError::InvalidArgument {
@@ -118,7 +112,7 @@ where
         });
     }
 
-    Ok(line_search_wolfe_impl(f, grad, x, direction, f0, dg0, params, false)?.result)
+    line_search_wolfe_impl(f, grad, x, direction, f0, dg0, params, false)
 }
 
 /// Strong Wolfe line search.
@@ -151,32 +145,7 @@ where
         });
     }
 
-    Ok(line_search_wolfe_impl(f, grad, x, direction, f0, dg0, params, true)?.result)
-}
-
-pub(crate) fn line_search_wolfe2_with_gradient_probe<F, G>(
-    f: &F,
-    grad_dot: &mut G,
-    x: &[f64],
-    direction: &[f64],
-    f0: f64,
-    g0: &[f64],
-    params: WolfeParams,
-) -> Result<LineSearchWithGradient, OptError>
-where
-    F: Fn(&[f64]) -> f64,
-    G: FnMut(&mut [f64], &mut Vec<f64>) -> f64,
-{
-    validate_wolfe_params(params)?;
-    validate_line_search_inputs(x, direction, g0)?;
-    let dg0 = dot(g0, direction);
-    if dg0 >= 0.0 {
-        return Err(OptError::InvalidArgument {
-            detail: "search direction is not a descent direction".to_string(),
-        });
-    }
-
-    line_search_wolfe_probe_impl(f, grad_dot, x, direction, f0, dg0, params)
+    line_search_wolfe_impl(f, grad, x, direction, f0, dg0, params, true)
 }
 
 /// Core Wolfe line search implementation (Nocedal & Wright Algorithm 3.5 + 3.6).
@@ -190,7 +159,7 @@ fn line_search_wolfe_impl<F, G>(
     dg0: f64,
     params: WolfeParams,
     strong: bool,
-) -> Result<LineSearchWithGradient, OptError>
+) -> Result<LineSearchResult, OptError>
 where
     F: Fn(&[f64]) -> f64,
     G: Fn(&[f64]) -> Vec<f64>,
@@ -204,12 +173,12 @@ where
         f(&xp)
     };
 
-    let eval_dg = |alpha: f64, evals: &mut usize| -> Result<(f64, Vec<f64>), OptError> {
+    let eval_dg = |alpha: f64, evals: &mut usize| -> Result<f64, OptError> {
         let xp: Vec<f64> = (0..n).map(|i| x[i] + alpha * d[i]).collect();
         let gp = grad(&xp);
         *evals += 1;
         validate_gradient_output_len(&gp, n)?;
-        Ok((dot(&gp, d), gp))
+        Ok(dot(&gp, d))
     };
 
     // Bracketing phase (Algorithm 3.5)
@@ -227,7 +196,7 @@ where
             );
         }
 
-        let (dgi, gi) = eval_dg(alpha, &mut evals)?;
+        let dgi = eval_dg(alpha, &mut evals)?;
 
         // Curvature condition satisfied
         let curvature_ok = if strong {
@@ -237,14 +206,11 @@ where
         };
 
         if curvature_ok {
-            return Ok(LineSearchWithGradient {
-                result: LineSearchResult {
-                    alpha,
-                    f_at_alpha: fi,
-                    directional_derivative: dgi,
-                    evaluations: evals,
-                },
-                accepted_gradient: Some(gi),
+            return Ok(LineSearchResult {
+                alpha,
+                f_at_alpha: fi,
+                directional_derivative: dgi,
+                evaluations: evals,
             });
         }
 
@@ -262,211 +228,12 @@ where
 
     // Failed to find a step satisfying Wolfe — return best so far
     let fi = eval_f(alpha, &mut evals);
-    Ok(LineSearchWithGradient {
-        result: LineSearchResult {
-            alpha,
-            f_at_alpha: fi,
-            directional_derivative: dg0,
-            evaluations: evals,
-        },
-        accepted_gradient: None,
+    Ok(LineSearchResult {
+        alpha,
+        f_at_alpha: fi,
+        directional_derivative: dg0,
+        evaluations: evals,
     })
-}
-
-/// Strong-Wolfe line search for callers that can fill a reusable gradient buffer.
-#[allow(clippy::too_many_arguments)]
-fn line_search_wolfe_probe_impl<F, G>(
-    f: &F,
-    grad_dot: &mut G,
-    x: &[f64],
-    d: &[f64],
-    f0: f64,
-    dg0: f64,
-    params: WolfeParams,
-) -> Result<LineSearchWithGradient, OptError>
-where
-    F: Fn(&[f64]) -> f64,
-    G: FnMut(&mut [f64], &mut Vec<f64>) -> f64,
-{
-    let n = x.len();
-    let mut evals = 0;
-    let mut trial = vec![0.0; n];
-    let mut gradient = vec![0.0; n];
-
-    let mut alpha_prev = 0.0;
-    let mut f_prev = f0;
-    let mut alpha = 1.0_f64.min(params.amax);
-
-    for i in 0..params.maxiter {
-        let fi = eval_f_at(f, x, d, &mut trial, alpha, &mut evals);
-
-        if fi > f0 + params.c1 * alpha * dg0 || (i > 0 && fi >= f_prev) {
-            return zoom_probe(
-                f,
-                grad_dot,
-                x,
-                d,
-                f0,
-                dg0,
-                alpha_prev,
-                alpha,
-                f_prev,
-                &params,
-                &mut evals,
-                &mut trial,
-                &mut gradient,
-            );
-        }
-
-        let dgi = eval_dg_current(grad_dot, &mut trial, &mut gradient, &mut evals)?;
-
-        if dgi.abs() <= params.c2 * dg0.abs() {
-            return Ok(LineSearchWithGradient {
-                result: LineSearchResult {
-                    alpha,
-                    f_at_alpha: fi,
-                    directional_derivative: dgi,
-                    evaluations: evals,
-                },
-                accepted_gradient: Some(std::mem::take(&mut gradient)),
-            });
-        }
-
-        if dgi >= 0.0 {
-            return zoom_probe(
-                f,
-                grad_dot,
-                x,
-                d,
-                f0,
-                dg0,
-                alpha,
-                alpha_prev,
-                fi,
-                &params,
-                &mut evals,
-                &mut trial,
-                &mut gradient,
-            );
-        }
-
-        alpha_prev = alpha;
-        f_prev = fi;
-        alpha = (2.0 * alpha).min(params.amax);
-    }
-
-    let fi = eval_f_at(f, x, d, &mut trial, alpha, &mut evals);
-    Ok(LineSearchWithGradient {
-        result: LineSearchResult {
-            alpha,
-            f_at_alpha: fi,
-            directional_derivative: dg0,
-            evaluations: evals,
-        },
-        accepted_gradient: None,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-fn zoom_probe<F, G>(
-    f: &F,
-    grad_dot: &mut G,
-    x: &[f64],
-    d: &[f64],
-    f0: f64,
-    dg0: f64,
-    mut alpha_lo: f64,
-    mut alpha_hi: f64,
-    mut f_lo: f64,
-    params: &WolfeParams,
-    evals: &mut usize,
-    trial: &mut [f64],
-    gradient: &mut Vec<f64>,
-) -> Result<LineSearchWithGradient, OptError>
-where
-    F: Fn(&[f64]) -> f64,
-    G: FnMut(&mut [f64], &mut Vec<f64>) -> f64,
-{
-    for _ in 0..params.maxiter {
-        let alpha_j = 0.5 * (alpha_lo + alpha_hi);
-        let fj = eval_f_at(f, x, d, trial, alpha_j, evals);
-
-        if fj > f0 + params.c1 * alpha_j * dg0 || fj >= f_lo {
-            alpha_hi = alpha_j;
-        } else {
-            let dgj = eval_dg_current(grad_dot, trial, gradient, evals)?;
-
-            if dgj.abs() <= params.c2 * dg0.abs() {
-                return Ok(LineSearchWithGradient {
-                    result: LineSearchResult {
-                        alpha: alpha_j,
-                        f_at_alpha: fj,
-                        directional_derivative: dgj,
-                        evaluations: *evals,
-                    },
-                    accepted_gradient: Some(std::mem::take(gradient)),
-                });
-            }
-
-            if dgj * (alpha_hi - alpha_lo) >= 0.0 {
-                alpha_hi = alpha_lo;
-            }
-
-            alpha_lo = alpha_j;
-            f_lo = fj;
-        }
-
-        if (alpha_hi - alpha_lo).abs() < params.amin {
-            break;
-        }
-    }
-
-    Ok(LineSearchWithGradient {
-        result: LineSearchResult {
-            alpha: alpha_lo,
-            f_at_alpha: f_lo,
-            directional_derivative: dg0,
-            evaluations: *evals,
-        },
-        accepted_gradient: None,
-    })
-}
-
-fn eval_f_at<F>(
-    f: &F,
-    x: &[f64],
-    d: &[f64],
-    trial: &mut [f64],
-    alpha: f64,
-    evals: &mut usize,
-) -> f64
-where
-    F: Fn(&[f64]) -> f64,
-{
-    fill_trial(trial, x, d, alpha);
-    *evals += 1;
-    f(trial)
-}
-
-fn eval_dg_current<G>(
-    grad_dot: &mut G,
-    trial: &mut [f64],
-    gradient: &mut Vec<f64>,
-    evals: &mut usize,
-) -> Result<f64, OptError>
-where
-    G: FnMut(&mut [f64], &mut Vec<f64>) -> f64,
-{
-    *evals += 1;
-    let directional_derivative = grad_dot(trial, gradient);
-    validate_gradient_output_len(gradient, trial.len())?;
-    Ok(directional_derivative)
-}
-
-fn fill_trial(out: &mut [f64], x: &[f64], d: &[f64], alpha: f64) {
-    for ((out_value, xi), di) in out.iter_mut().zip(x.iter()).zip(d.iter()) {
-        *out_value = xi + alpha * di;
-    }
 }
 
 /// Zoom phase (Nocedal & Wright Algorithm 3.6).
@@ -486,7 +253,7 @@ fn zoom<F, G>(
     params: &WolfeParams,
     strong: bool,
     evals: &mut usize,
-) -> Result<LineSearchWithGradient, OptError>
+) -> Result<LineSearchResult, OptError>
 where
     F: Fn(&[f64]) -> f64,
     G: Fn(&[f64]) -> Vec<f64>,
@@ -516,14 +283,11 @@ where
             };
 
             if curvature_ok {
-                return Ok(LineSearchWithGradient {
-                    result: LineSearchResult {
-                        alpha: alpha_j,
-                        f_at_alpha: fj,
-                        directional_derivative: dgj,
-                        evaluations: *evals,
-                    },
-                    accepted_gradient: Some(gj),
+                return Ok(LineSearchResult {
+                    alpha: alpha_j,
+                    f_at_alpha: fj,
+                    directional_derivative: dgj,
+                    evaluations: *evals,
                 });
             }
 
@@ -541,14 +305,11 @@ where
     }
 
     // Return best found
-    Ok(LineSearchWithGradient {
-        result: LineSearchResult {
-            alpha: alpha_lo,
-            f_at_alpha: f_lo,
-            directional_derivative: dg0,
-            evaluations: *evals,
-        },
-        accepted_gradient: None,
+    Ok(LineSearchResult {
+        alpha: alpha_lo,
+        f_at_alpha: f_lo,
+        directional_derivative: dg0,
+        evaluations: *evals,
     })
 }
 
@@ -934,64 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn wolfe2_with_gradient_matches_public_result_and_carries_gradient() {
-        let x = vec![-1.2, 1.0];
-        let g = rosenbrock_grad(&x);
-        let f0 = rosenbrock(&x);
-        let d: Vec<f64> = g.iter().map(|gi| -gi).collect();
-
-        let public = line_search_wolfe2(
-            &rosenbrock,
-            &rosenbrock_grad,
-            &x,
-            &d,
-            f0,
-            &g,
-            WolfeParams::default(),
-        )
-        .expect("public wolfe2 works");
-        let mut grad_dot = |xv: &mut [f64], gradient: &mut Vec<f64>| {
-            gradient.clear();
-            gradient.extend_from_slice(&rosenbrock_grad(xv));
-            dot(gradient, &d)
-        };
-        let probed = line_search_wolfe2_with_gradient_probe(
-            &rosenbrock,
-            &mut grad_dot,
-            &x,
-            &d,
-            f0,
-            &g,
-            WolfeParams::default(),
-        )
-        .expect("probed wolfe2 works");
-
-        assert_eq!(probed.result.alpha.to_bits(), public.alpha.to_bits());
-        assert_eq!(
-            probed.result.f_at_alpha.to_bits(),
-            public.f_at_alpha.to_bits()
-        );
-        assert_eq!(
-            probed.result.directional_derivative.to_bits(),
-            public.directional_derivative.to_bits()
-        );
-        assert_eq!(probed.result.evaluations, public.evaluations);
-
-        let probed_gradient = probed
-            .accepted_gradient
-            .expect("strong Wolfe probe carries its gradient");
-        let accepted_x: Vec<f64> = x
-            .iter()
-            .zip(d.iter())
-            .map(|(xi, di)| xi + public.alpha * di)
-            .collect();
-        let expected_gradient = rosenbrock_grad(&accepted_x);
-        for (accepted, expected) in probed_gradient.iter().zip(expected_gradient.iter()) {
-            assert_eq!(accepted.to_bits(), expected.to_bits());
-        }
-    }
-
-    #[test]
     fn wolfe1_quadratic_descent() {
         let x = vec![5.0, 3.0];
         let g = quadratic_grad(&x);
@@ -1116,21 +819,6 @@ mod tests {
         )
         .expect_err("short initial gradient should fail before dot truncation");
         assert!(matches!(err, OptError::InvalidArgument { .. }));
-
-        let mut grad_dot = |_trial: &mut [f64], _gradient: &mut Vec<f64>| {
-            panic!("dimension validation should run before gradient probe")
-        };
-        let err = line_search_wolfe2_with_gradient_probe(
-            &quadratic,
-            &mut grad_dot,
-            &x,
-            &short_direction,
-            f0,
-            &g,
-            WolfeParams::default(),
-        )
-        .expect_err("probe path should share dimension validation");
-        assert!(matches!(err, OptError::InvalidArgument { .. }));
     }
 
     #[test]
@@ -1151,23 +839,6 @@ mod tests {
             WolfeParams::default(),
         )
         .expect_err("short gradient output should fail before dot truncation");
-        assert!(matches!(err, OptError::InvalidArgument { .. }));
-
-        let mut short_probe_grad = |_trial: &mut [f64], gradient: &mut Vec<f64>| {
-            gradient.clear();
-            gradient.push(1.0);
-            -1.0
-        };
-        let err = line_search_wolfe2_with_gradient_probe(
-            &quadratic,
-            &mut short_probe_grad,
-            &x,
-            &direction,
-            f0,
-            &g,
-            WolfeParams::default(),
-        )
-        .expect_err("short probe gradient output should fail");
         assert!(matches!(err, OptError::InvalidArgument { .. }));
     }
 
