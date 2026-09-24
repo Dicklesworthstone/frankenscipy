@@ -44,7 +44,7 @@ fn cont<D: ContinuousDistribution + 'static>(d: D) -> Eval {
 }
 
 fn disc<D: DiscreteDistribution + 'static>(d: D) -> Eval {
-    Box::new(move |k| (d.pmf(k as u64), d.cdf(k as u64)))
+    Box::new(move |k| (d.pmf(k as i64), d.cdf(k as i64)))
 }
 
 fn cases() -> Vec<AliasCase> {

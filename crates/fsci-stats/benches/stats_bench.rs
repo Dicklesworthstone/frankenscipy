@@ -581,7 +581,7 @@ fn bench_distribution_batch(c: &mut Criterion) {
     let bin_ks: Vec<u64> = (0..=2000).collect();
     group.bench_function("binomial/pmf_many", |b| b.iter(|| bin.pmf_many(&bin_ks)));
     group.bench_function("binomial/map_pmf", |b| {
-        b.iter(|| bin_ks.iter().map(|&k| bin.pmf(k)).collect::<Vec<_>>())
+        b.iter(|| bin_ks.iter().map(|&k| bin.pmf(k as i64)).collect::<Vec<_>>())
     });
 
     // Negative binomial: parameter-only lnGamma/log terms hoisted across a long tail.
@@ -589,7 +589,7 @@ fn bench_distribution_batch(c: &mut Criterion) {
     let tail_ks: Vec<u64> = (0..n as u64).collect();
     group.bench_function("negbinom/pmf_many", |b| b.iter(|| nbin.pmf_many(&tail_ks)));
     group.bench_function("negbinom/map_pmf", |b| {
-        b.iter(|| tail_ks.iter().map(|&k| nbin.pmf(k)).collect::<Vec<_>>())
+        b.iter(|| tail_ks.iter().map(|&k| nbin.pmf(k as i64)).collect::<Vec<_>>())
     });
 
     // Beta-binomial: 5 lgamma/point hoisted over a bounded support.
@@ -597,7 +597,7 @@ fn bench_distribution_batch(c: &mut Criterion) {
     let bb_ks: Vec<u64> = (0..=2000).collect();
     group.bench_function("betabinom/pmf_many", |b| b.iter(|| bb.pmf_many(&bb_ks)));
     group.bench_function("betabinom/map_pmf", |b| {
-        b.iter(|| bb_ks.iter().map(|&k| bb.pmf(k)).collect::<Vec<_>>())
+        b.iter(|| bb_ks.iter().map(|&k| bb.pmf(k as i64)).collect::<Vec<_>>())
     });
 
     // Hypergeometric: 5 lgamma/point hoisted (Fisher's-exact-test full support).
@@ -605,7 +605,7 @@ fn bench_distribution_batch(c: &mut Criterion) {
     let ks: Vec<u64> = (0..=700).collect();
     group.bench_function("hypergeom/pmf_many", |b| b.iter(|| h.pmf_many(&ks)));
     group.bench_function("hypergeom/map_pmf", |b| {
-        b.iter(|| ks.iter().map(|&k| h.pmf(k)).collect::<Vec<_>>())
+        b.iter(|| ks.iter().map(|&k| h.pmf(k as i64)).collect::<Vec<_>>())
     });
 
     // Poisson log-pmf: ln(mu) hoisted over a full count-data support sweep.
@@ -618,7 +618,7 @@ fn bench_distribution_batch(c: &mut Criterion) {
         b.iter(|| {
             poisson_ks
                 .iter()
-                .map(|&k| poisson.logpmf(k))
+                .map(|&k| poisson.logpmf(k as i64))
                 .collect::<Vec<_>>()
         })
     });
@@ -1399,10 +1399,10 @@ fn bench_skellam_cdf(c: &mut Criterion) {
             .map(|i| (mean + (i as f64 - 128.0) / 256.0 * 6.0 * std).max(0.0) as u64)
             .collect();
         group.bench_function(BenchmarkId::new("cdf", format!("mu{mu1}_{mu2}")), |b| {
-            b.iter(|| ks.iter().map(|&k| sk.cdf(black_box(k))).sum::<f64>())
+            b.iter(|| ks.iter().map(|&k| sk.cdf(black_box(k as i64))).sum::<f64>())
         });
         group.bench_function(BenchmarkId::new("sf", format!("mu{mu1}_{mu2}")), |b| {
-            b.iter(|| ks.iter().map(|&k| sk.sf(black_box(k))).sum::<f64>())
+            b.iter(|| ks.iter().map(|&k| sk.sf(black_box(k as i64))).sum::<f64>())
         });
     }
     group.finish();
@@ -1418,7 +1418,7 @@ fn bench_betabinom_cdf(c: &mut Criterion) {
         let d = BetaBinomial::new(n, 2.0, 3.0);
         let ks: Vec<u64> = (0..=n).collect();
         group.bench_function(BenchmarkId::new("cdf", n), |b| {
-            b.iter(|| ks.iter().map(|&k| d.cdf(black_box(k))).sum::<f64>())
+            b.iter(|| ks.iter().map(|&k| d.cdf(black_box(k as i64))).sum::<f64>())
         });
     }
     group.finish();
@@ -1501,7 +1501,7 @@ fn bench_neghypergeom_cdf(c: &mut Criterion) {
         let d = NegHypergeometric::new(2 * n + 100, n, n + 50);
         let ks: Vec<u64> = (0..=n).collect();
         group.bench_function(BenchmarkId::new("cdf", n), |b| {
-            b.iter(|| ks.iter().map(|&k| d.cdf(black_box(k))).sum::<f64>())
+            b.iter(|| ks.iter().map(|&k| d.cdf(black_box(k as i64))).sum::<f64>())
         });
     }
     group.finish();
@@ -1548,7 +1548,7 @@ fn bench_zipfian_cdf(c: &mut Criterion) {
         let d = Zipfian::new(1.3, n);
         let ks: Vec<u64> = (1..=20).map(|i| (n as u64 * i) / 20).collect();
         group.bench_function(BenchmarkId::new("cdf", n), |b| {
-            b.iter(|| ks.iter().map(|&k| d.cdf(black_box(k))).sum::<f64>())
+            b.iter(|| ks.iter().map(|&k| d.cdf(black_box(k as i64))).sum::<f64>())
         });
     }
     group.finish();

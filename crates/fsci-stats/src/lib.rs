@@ -601,7 +601,7 @@ where
 /// This is the Rust-generic equivalent of SciPy's distribution-specific fit surface
 /// for the implemented discrete distributions in this crate.
 #[must_use]
-pub fn fit_discrete<D>(data: &[u64]) -> D
+pub fn fit_discrete<D>(data: &[i64]) -> D
 where
     D: DiscreteDistribution,
 {
@@ -11272,31 +11272,41 @@ impl Poisson {
 
 /// Trait for discrete probability distributions.
 pub trait DiscreteDistribution {
-    /// Probability mass function.
-    fn pmf(&self, k: u64) -> f64;
-    /// Cumulative distribution function: P(X <= k).
-    fn cdf(&self, k: u64) -> f64 {
-        (0..=k).map(|i| self.pmf(i)).sum::<f64>().min(1.0)
+    /// Probability mass function at the integer `k`; 0 off the support, as in SciPy. The
+    /// argument is signed because SciPy's discrete distributions live on the integers
+    /// (`skellam` and `dlaplace` on all of ℤ).
+    fn pmf(&self, k: i64) -> f64;
+    /// SciPy `support()`: the smallest and largest values with positive mass, as `f64` so that
+    /// an unbounded side is `±inf`.
+    fn support(&self) -> (f64, f64);
+    /// Cumulative distribution function: P(X <= k). The default sums the pmf over the support
+    /// up to `k` (a family unbounded below overrides it).
+    fn cdf(&self, k: i64) -> f64 {
+        let start = discrete_sum_start(self.support().0, k);
+        if k < start {
+            return 0.0;
+        }
+        (start..=k).map(|i| self.pmf(i)).sum::<f64>().min(1.0)
     }
     /// Survival function: P(X > k) = 1 - cdf(k).
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
         1.0 - self.cdf(k)
     }
     /// Log CDF. Default `ln(cdf)` loses precision in the left tail; override
     /// with a log-space closed form (e.g. `log_gammaincc`/`log_betainc`) for
     /// distributions whose CDF underflows.
-    fn logcdf(&self, k: u64) -> f64 {
+    fn logcdf(&self, k: i64) -> f64 {
         log_probability(self.cdf(k))
     }
     /// Log survival function. Default `ln(sf)` loses precision in the right
     /// tail; override with a log-space closed form where `sf` underflows.
-    fn logsf(&self, k: u64) -> f64 {
+    fn logsf(&self, k: i64) -> f64 {
         log_probability(self.sf(k))
     }
     /// Log probability mass function. Default `ln(pmf)` loses precision (returns
     /// `-inf`) where the pmf underflows; override with a closed log-space form
     /// (the workhorse of count-data GLM log-likelihoods).
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
         log_probability(self.pmf(k))
     }
     /// Mean of the distribution.
@@ -11340,89 +11350,68 @@ pub trait DiscreteDistribution {
     }
     /// Percent-point (inverse CDF) function: the smallest integer `k` with
     /// `cdf(k) >= q`. Matches SciPy's discrete `ppf`: `q == 0` returns the
-    /// support's lower bound minus one, `q == 1` returns `+inf`, and `q` outside
-    /// `[0, 1]` returns `NaN`. Default via monotone-CDF binary search; override
-    /// when a closed-form quantile is available.
+    /// support's lower bound minus one, `q == 1` its upper bound (`+inf` when
+    /// unbounded), and `q` outside `[0, 1]` returns `NaN`. Default via monotone-CDF
+    /// binary search; override when a closed-form quantile is available.
     fn ppf(&self, q: f64) -> f64 {
         if q.is_nan() || !(0.0..=1.0).contains(&q) {
             return f64::NAN;
         }
         if q == 0.0 {
-            return discrete_support_lower(self) as f64 - 1.0;
+            return discrete_support_lower(self) - 1.0;
         }
         if q >= 1.0 {
-            return f64::INFINITY;
+            // SciPy rv_discrete.ppf(1) is the support's upper bound (inf when unbounded).
+            return self.support().1;
         }
-        let mut hi: u64 = 1;
-        while self.cdf(hi) < q {
-            if hi > (1u64 << 62) {
-                return f64::INFINITY;
-            }
-            hi = hi.saturating_mul(2);
-        }
-        let mut lo: u64 = 0;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.cdf(mid) >= q {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        lo as f64
+        smallest_integer_where(self.support().0, self.mean(), |k| self.cdf(k) >= q)
     }
     /// Inverse survival function: the smallest integer `k` with `sf(k) <= q`.
-    /// Matches SciPy's discrete `isf`: `q == 0` returns `+inf`, `q == 1` returns
-    /// the support's lower bound minus one, and `q` outside `[0, 1]` returns `NaN`.
+    /// Matches SciPy's discrete `isf`: `q == 0` returns the support's upper bound
+    /// (`+inf` when unbounded), `q == 1` the lower bound minus one, and `q` outside
+    /// `[0, 1]` returns `NaN`.
     fn isf(&self, q: f64) -> f64 {
         if q.is_nan() || !(0.0..=1.0).contains(&q) {
             return f64::NAN;
         }
         if q == 0.0 {
-            return f64::INFINITY;
+            // SciPy rv_discrete.isf(0) is the support's upper bound (inf when unbounded).
+            return self.support().1;
         }
         if q >= 1.0 {
-            return discrete_support_lower(self) as f64 - 1.0;
+            return discrete_support_lower(self) - 1.0;
         }
-        let mut hi: u64 = 1;
-        while self.sf(hi) > q {
-            if hi > (1u64 << 62) {
-                return f64::INFINITY;
-            }
-            hi = hi.saturating_mul(2);
-        }
-        let mut lo: u64 = 0;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if self.sf(mid) <= q {
-                hi = mid;
-            } else {
-                lo = mid + 1;
-            }
-        }
-        lo as f64
+        smallest_integer_where(self.support().0, self.mean(), |k| self.sf(k) <= q)
     }
 
     /// Generate `n` random variates via inverse transform sampling using [`ppf`](Self::ppf).
-    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64>
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<i64>
     where
         Self: Sized,
     {
+        let lower = self.support().0;
+        let floor = if lower >= 0.0 {
+            0
+        } else if lower.is_finite() {
+            lower as i64
+        } else {
+            i64::MIN
+        };
         (0..n)
             .map(|_| {
                 let u: f64 = rng.random();
                 let q = self.ppf(u);
-                if q.is_finite() && q >= 0.0 {
-                    q as u64
+                if q.is_finite() {
+                    (q as i64).max(floor)
                 } else {
-                    0
+                    floor
                 }
             })
             .collect()
     }
 
     /// Non-panicking parameter fit from discrete observations.
-    fn try_fit(_data: &[u64]) -> Result<Self, FitError>
+    fn try_fit(_data: &[i64]) -> Result<Self, FitError>
     where
         Self: Sized,
     {
@@ -11432,7 +11421,7 @@ pub trait DiscreteDistribution {
     }
 
     /// Fit the distribution parameters from discrete observations. Panics on error.
-    fn fit(data: &[u64]) -> Self
+    fn fit(data: &[i64]) -> Self
     where
         Self: Sized,
     {
@@ -11443,14 +11432,124 @@ pub trait DiscreteDistribution {
     }
 }
 
-/// Smallest `k` with `cdf(k) > 0`, i.e. the lower bound of a discrete
-/// distribution's support (used by the default `ppf`/`isf` boundary handling).
-fn discrete_support_lower<D: DiscreteDistribution + ?Sized>(dist: &D) -> u64 {
-    let mut a = 0u64;
-    while a < (1u64 << 20) && dist.cdf(a) <= 0.0 {
+/// The lower bound of a discrete distribution's support (used by the default `ppf`/`isf`
+/// boundary handling). For a support starting at or above 0 it is the smallest `k >= 0` with
+/// `cdf(k) > 0`, as the unsigned trait always computed it; a support reaching below 0 is taken
+/// from [`DiscreteDistribution::support`].
+fn discrete_support_lower<D: DiscreteDistribution + ?Sized>(dist: &D) -> f64 {
+    let lower = dist.support().0;
+    if lower < 0.0 {
+        return lower;
+    }
+    let mut a = 0_i64;
+    while a < (1_i64 << 20) && dist.cdf(a) <= 0.0 {
         a += 1;
     }
-    a
+    a as f64
+}
+
+/// Where the default `cdf` starts summing the pmf: 0 for a support at or above 0 (as the
+/// unsigned trait did), the support's lower bound when it is finite and negative, and a
+/// 2^20-term window below `k` for a support unbounded below (such families override `cdf`).
+fn discrete_sum_start(lower: f64, k: i64) -> i64 {
+    if lower >= 0.0 {
+        0
+    } else if lower.is_finite() {
+        lower as i64
+    } else {
+        k.saturating_sub(1 << 20)
+    }
+}
+
+/// The smallest integer `k` with `pred(k)` for a predicate that is false then true along the
+/// integers (`cdf(k) >= q` for `ppf`, `sf(k) <= q` for `isf`). For a support starting at or
+/// above 0 this is the unsigned trait's search, unchanged (double from 1, then bisect from 0);
+/// a finite negative lower bound shifts that search to start there; a support unbounded below
+/// is bracketed outward from the rounded mean.
+fn smallest_integer_where(lower: f64, mean: f64, pred: impl Fn(i64) -> bool) -> f64 {
+    const LIMIT: i64 = 1 << 62;
+    if lower.is_finite() || lower.is_nan() {
+        let base = if lower >= 0.0 || lower.is_nan() { 0 } else { lower as i64 };
+        let mut hi: i64 = 1;
+        while !pred(base.saturating_add(hi)) {
+            if hi > LIMIT {
+                return f64::INFINITY;
+            }
+            hi = hi.saturating_mul(2);
+        }
+        let mut lo: i64 = 0;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if pred(base + mid) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        return (base + lo) as f64;
+    }
+    let center = if mean.is_finite() && mean.abs() < LIMIT as f64 {
+        mean.round() as i64
+    } else {
+        0
+    };
+    // hi: pred true; lo: pred false.
+    let mut step: i64 = 1;
+    let mut hi = center;
+    while !pred(hi) {
+        if step > LIMIT {
+            return f64::INFINITY;
+        }
+        hi = center.saturating_add(step);
+        step = step.saturating_mul(2);
+    }
+    step = 1;
+    let mut lo = hi.saturating_sub(1);
+    while pred(lo) {
+        if step > LIMIT {
+            return f64::NEG_INFINITY;
+        }
+        step = step.saturating_mul(2);
+        lo = hi.saturating_sub(step);
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if pred(mid) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi as f64
+}
+
+/// Observations of a family supported on the non-negative integers as the `u64` counts its
+/// estimator takes; a negative observation lies outside the support.
+fn nonnegative_observations(data: &[i64]) -> Result<Vec<u64>, FitError> {
+    data.iter()
+        .map(|&x| {
+            u64::try_from(x).map_err(|_| {
+                FitError::UnsupportedData(format!(
+                    "observation {x} lies outside the support [0, inf)"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// SciPy `hypergeom(M, n, N).support()` (also `nchypergeom_wallenius`):
+/// `(max(0, N − (M − n)), min(n, N))`.
+fn hypergeometric_support(big_m: u64, n: u64, big_n: u64) -> (f64, f64) {
+    let lower = big_n.saturating_sub(big_m.saturating_sub(n));
+    (lower as f64, n.min(big_n) as f64)
+}
+
+/// Variates of a family supported on the non-negative integers as the trait's signed integers.
+fn signed_variates(samples: Vec<u64>) -> Vec<i64> {
+    samples
+        .into_iter()
+        .map(|k| i64::try_from(k).unwrap_or(i64::MAX))
+        .collect()
 }
 
 /// Draw a standard normal variate N(0, 1) using the Box-Muller transform.
@@ -11739,26 +11838,35 @@ fn sample_nchypergeom_wallenius(
 }
 
 impl DiscreteDistribution for Poisson {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (0.0, f64::INFINITY)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         Poisson::pmf(self, k)
     }
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         Poisson::cdf(self, k)
     }
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 1.0 };
         // P(X>k) = P(k+1, mu) (lower regularized gamma); direct so the right
         // tail does not collapse like the default 1-cdf. frankenscipy-r4933
         lower_regularized_gamma(k as f64 + 1.0, self.mu)
     }
-    fn logcdf(&self, k: u64) -> f64 {
+    fn logcdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return f64::NEG_INFINITY };
         // log P(X<=k) = log Q(k+1, mu); finite in the left tail. frankenscipy-r4933
         fsci_special::log_gammaincc_scalar(k as f64 + 1.0, self.mu)
     }
-    fn logsf(&self, k: u64) -> f64 {
+    fn logsf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // log P(X>k) = log P(k+1, mu); finite in the right tail. frankenscipy-r4933
         fsci_special::log_gammainc_scalar(k as f64 + 1.0, self.mu)
     }
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return f64::NEG_INFINITY };
         // k·ln(mu) − mu − lnΓ(k+1); finite where pmf underflows (Poisson-GLM
         // log-likelihood term). frankenscipy-7m3xk
         if self.mu == 0.0 {
@@ -11787,7 +11895,7 @@ impl DiscreteDistribution for Poisson {
             // scipy.stats.poisson.entropy).
             let kmax = (mu + 12.0 * mu.sqrt() + 12.0).ceil() as u64;
             let m = (mu.floor() as u64).min(kmax);
-            let lp_m = self.logpmf(m);
+            let lp_m = DiscreteDistribution::logpmf(self, m as i64);
             let pm = lp_m.exp();
             let mut h = if pm > 0.0 { -pm * lp_m } else { 0.0 };
             // Downward from the mode to 0.
@@ -11833,11 +11941,11 @@ impl DiscreteDistribution for Poisson {
     fn mode(&self) -> f64 {
         self.mu.floor()
     }
-    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(n, rng)
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(n, rng))
     }
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -11948,59 +12056,67 @@ impl Skellam {
 }
 
 impl DiscreteDistribution for Skellam {
-    // Skellam has full-integer (signed) support; the u64 `DiscreteDistribution`
-    // ppf/isf cannot represent negative quantiles, so they are unsupported here
-    // (the default would silently clamp to 0). Use the signed pmf/cdf API instead.
-    fn ppf(&self, _q: f64) -> f64 {
-        f64::NAN
+    fn support(&self) -> (f64, f64) {
+        (f64::NEG_INFINITY, f64::INFINITY)
     }
-    fn isf(&self, _q: f64) -> f64 {
-        f64::NAN
+    fn pmf(&self, k: i64) -> f64 {
+        self.pmf_signed(k)
     }
-    fn pmf(&self, k: u64) -> f64 {
-        self.pmf_signed(k as i64)
-    }
-    fn logpmf(&self, k: u64) -> f64 {
-        // −(μ1+μ2) + (k/2)·ln(μ1/μ2) + ln I_k(2√(μ1μ2)), with ln I_k=log_ive(k,z)+z
-        // — finite for large μ1·μ2 where the pmf's I_k overflows to NaN.
-        // frankenscipy-7m3xk
+    fn logpmf(&self, k: i64) -> f64 {
+        // −(μ1+μ2) + (k/2)·ln(μ1/μ2) + ln I_|k|(2√(μ1μ2)), with ln I = log_ive(|k|,z)+z
+        // (I_{−k} = I_k for integer k) — finite for large μ1·μ2 where the pmf's I_k
+        // overflows to NaN. frankenscipy-7m3xk
         let kf = k as f64;
         let (mu1, mu2) = (self.mu1, self.mu2);
         if mu1 == 0.0 && mu2 == 0.0 {
             return if k == 0 { 0.0 } else { f64::NEG_INFINITY };
         }
         if mu1 == 0.0 {
-            return if k == 0 { -mu2 } else { f64::NEG_INFINITY };
+            // −Poisson(μ2) on k ≤ 0.
+            if k > 0 {
+                return f64::NEG_INFINITY;
+            }
+            return -mu2 - kf * mu2.ln() - ln_gamma(1.0 - kf);
         }
         if mu2 == 0.0 {
             // Poisson(μ1) on k ≥ 0.
+            if k < 0 {
+                return f64::NEG_INFINITY;
+            }
             return -mu1 + kf * mu1.ln() - ln_gamma(kf + 1.0);
         }
         let z = 2.0 * (mu1 * mu2).sqrt();
-        -(mu1 + mu2) + 0.5 * kf * (mu1 / mu2).ln() + fsci_special::log_ive_scalar(kf, z) + z
+        -(mu1 + mu2) + 0.5 * kf * (mu1 / mu2).ln() + fsci_special::log_ive_scalar(kf.abs(), z) + z
     }
 
-    fn cdf(&self, k: u64) -> f64 {
-        // scipy.stats.skellam.cdf via the noncentral chi-square (ncx2) identity:
-        // for k ≥ 0, P(X ≤ k) = 1 − ncx2.cdf(2·μ1; df = 2(k+1), nc = 2·μ2)
-        //                     = 1 − chndtr(2·μ1, 2(k+1), 2·μ2).
-        // This is O(√nc) cheap regularized-gamma terms (chndtr's Poisson mixture)
-        // instead of the prior O(σ) per-point Bessel-`ive` window sum, and it
-        // reproduces P(X ≤ k) over Skellam's FULL integer support — the negative
-        // tail is folded into the identity, no manual window needed. Verified vs
-        // scipy to ≤4.4e-16 across μ∈[0,1000], k∈[0,50]. Exact at the degenerate
-        // edges: μ1=0 ⇒ chndtr(0,·,·)=0 ⇒ cdf=1; μ2=0 ⇒ Poisson(μ1) cdf.
-        let kf = k.min(i64::MAX as u64) as f64;
+    fn cdf(&self, k: i64) -> f64 {
+        // scipy.stats.skellam.cdf via the noncentral chi-square (ncx2) identities:
+        //   k ≥ 0: P(X ≤ k) = 1 − ncx2.cdf(2·μ1; df = 2(k+1), nc = 2·μ2)
+        //                   = 1 − chndtr(2·μ1, 2(k+1), 2·μ2);
+        //   k < 0: P(X ≤ k) = chndtr(2·μ2, −2k, 2·μ1)   (SciPy's negative branch).
+        // O(√nc) cheap regularized-gamma terms (chndtr's Poisson mixture) instead of
+        // a per-point Bessel-`ive` window sum. The k ≥ 0 branch was verified vs scipy
+        // to ≤4.4e-16 across μ∈[0,1000], k∈[0,50]. Exact at the degenerate edges:
+        // μ1=0 ⇒ chndtr(0,·,·)=0 ⇒ cdf=1 on k ≥ 0; μ2=0 ⇒ Poisson(μ1) cdf.
+        let kf = k as f64;
+        if k < 0 {
+            return fsci_special::gamma::chndtr(2.0 * self.mu2, -2.0 * kf, 2.0 * self.mu1)
+                .clamp(0.0, 1.0);
+        }
         (1.0 - fsci_special::gamma::chndtr(2.0 * self.mu1, 2.0 * (kf + 1.0), 2.0 * self.mu2))
             .clamp(0.0, 1.0)
     }
 
-    fn sf(&self, k: u64) -> f64 {
-        // sf(k) = 1 − cdf(k) = chndtr(2·μ1, 2(k+1), 2·μ2) directly — the small
-        // upper-tail probability WITHOUT a 1−cdf cancellation, matching scipy's
-        // ncx2-based skellam.sf to ≤4.7e-16. O(√nc) gamma terms vs the prior
-        // O(σ) Bessel-`ive` window sum.
-        let kf = k.min(i64::MAX as u64) as f64;
+    fn sf(&self, k: i64) -> f64 {
+        // k ≥ 0: sf(k) = chndtr(2·μ1, 2(k+1), 2·μ2) directly — the small upper-tail
+        // probability WITHOUT a 1−cdf cancellation, matching scipy's ncx2-based
+        // skellam.sf to ≤4.7e-16. k < 0: 1 − cdf(k), as SciPy's generic sf.
+        let kf = k as f64;
+        if k < 0 {
+            return 1.0
+                - fsci_special::gamma::chndtr(2.0 * self.mu2, -2.0 * kf, 2.0 * self.mu1)
+                    .clamp(0.0, 1.0);
+        }
         fsci_special::gamma::chndtr(2.0 * self.mu1, 2.0 * (kf + 1.0), 2.0 * self.mu2)
             .clamp(0.0, 1.0)
     }
@@ -12052,13 +12168,12 @@ impl DiscreteDistribution for Skellam {
         acc
     }
 
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng).into_iter().map(|x| x as u64).collect()
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        self.rvs(count, rng)
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        let signed: Vec<i64> = data.iter().map(|&x| x as i64).collect();
-        Self::fit(&signed).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -12268,10 +12383,10 @@ impl Binomial {
             let mut k = idx;
             let near = (k > 0 && q - cdf_ref[k - 1] < 1e-11) || (cdf_ref[k] - q < 1e-11);
             if near {
-                while k > 0 && this.cdf((k - 1) as u64) >= q {
+                while k > 0 && this.cdf((k - 1) as i64) >= q {
                     k -= 1;
                 }
-                while (k as u64) < n && this.cdf(k as u64) < q {
+                while (k as u64) < n && this.cdf(k as i64) < q {
                     k += 1;
                 }
             }
@@ -12355,7 +12470,11 @@ impl Binomial {
 }
 
 impl DiscreteDistribution for Binomial {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (0.0, self.n as f64)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k > self.n {
             return 0.0;
         }
@@ -12372,7 +12491,8 @@ impl DiscreteDistribution for Binomial {
         ln_pmf.exp()
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // Closed form P(X<=k) = I_{1-p}(n-k, k+1), matching scipy's bdtr. O(1)
         // vs the old O(k) pmf summation. frankenscipy-7kq9d
         if k >= self.n {
@@ -12380,7 +12500,10 @@ impl DiscreteDistribution for Binomial {
         }
         regularized_incomplete_beta((self.n - k) as f64, k as f64 + 1.0, 1.0 - self.p)
     }
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // ln C(n,k) + k·ln(p) + (n−k)·ln(1−p); finite where pmf underflows
         // (binomial/logistic-GLM log-likelihood term). frankenscipy-7m3xk
         if k > self.n {
@@ -12397,7 +12520,8 @@ impl DiscreteDistribution for Binomial {
             - ln_gamma((self.n - k) as f64 + 1.0);
         ln_comb + k as f64 * self.p.ln() + (self.n - k) as f64 * (1.0 - self.p).ln()
     }
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 1.0 };
         // P(X>k) = I_p(k+1, n-k); direct so the right tail does not collapse
         // like the default 1-cdf. frankenscipy-r4933
         if k >= self.n {
@@ -12405,14 +12529,18 @@ impl DiscreteDistribution for Binomial {
         }
         regularized_incomplete_beta(k as f64 + 1.0, (self.n - k) as f64, self.p)
     }
-    fn logcdf(&self, k: u64) -> f64 {
+    fn logcdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // log P(X<=k) = log I_{1-p}(n-k, k+1); finite in the left tail. frankenscipy-r4933
         if k >= self.n {
             return 0.0;
         }
         fsci_special::log_betainc_scalar((self.n - k) as f64, k as f64 + 1.0, 1.0 - self.p)
     }
-    fn logsf(&self, k: u64) -> f64 {
+    fn logsf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // log P(X>k) = log I_p(k+1, n-k); finite in the right tail. frankenscipy-r4933
         if k >= self.n {
             return f64::NEG_INFINITY;
@@ -12456,7 +12584,7 @@ impl DiscreteDistribution for Binomial {
         let p = self.p;
         let odds = p / (1.0 - p);
         let m = (((nf + 1.0) * p).floor() as u64).min(n);
-        let lp_m = self.logpmf(m);
+        let lp_m = self.logpmf(m as i64);
         let pm = lp_m.exp();
         let mut h = if pm > 0.0 { -pm * lp_m } else { 0.0 };
         // Downward from the mode to 0.
@@ -12491,11 +12619,11 @@ impl DiscreteDistribution for Binomial {
         }
         h
     }
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng)
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(count, rng))
     }
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -12640,7 +12768,11 @@ impl BetaBinomial {
 }
 
 impl DiscreteDistribution for BetaBinomial {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (0.0, self.n as f64)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k > self.n {
             return 0.0;
         }
@@ -12653,7 +12785,10 @@ impl DiscreteDistribution for BetaBinomial {
         (ln_comb + ln_beta_num - ln_beta_den).exp()
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // ln C(n,k) + ln B(k+a, n−k+b) − ln B(a,b); finite where pmf underflows
         // (the pmf already forms this then exp's it). frankenscipy-7m3xk
         if k > self.n {
@@ -12668,7 +12803,8 @@ impl DiscreteDistribution for BetaBinomial {
         ln_comb + ln_beta_num - ln_beta_den
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // Default DiscreteDistribution::cdf sums pmf(0..=k) and each BetaBinomial
         // pmf costs ~6 ln_gamma calls — O(k) lgamma. Instead walk the pmf RATIO
         // recurrence (each consecutive pmf is one multiply):
@@ -12684,7 +12820,7 @@ impl DiscreteDistribution for BetaBinomial {
         let nf = n as f64;
         let (a, b) = (self.a, self.b);
         let m = (self.mode() as u64).min(n);
-        let pm = self.logpmf(m).exp();
+        let pm = self.logpmf(m as i64).exp();
         let mut total = 0.0_f64;
         // Downward from the mode to 0, counting indices ≤ k.
         let mut pk = pm;
@@ -12746,7 +12882,7 @@ impl DiscreteDistribution for BetaBinomial {
         let nf = n as f64;
         let (a, b) = (self.a, self.b);
         let m = (self.mode() as u64).min(n);
-        let pm = self.logpmf(m).exp();
+        let pm = self.logpmf(m as i64).exp();
         let d0 = m as f64 - mu;
         let mut m4 = pm * d0 * d0 * d0 * d0;
         // Downward from the mode to 0.
@@ -12796,7 +12932,7 @@ impl DiscreteDistribution for BetaBinomial {
         let nf = n as f64;
         let (a, b) = (self.a, self.b);
         let m = (self.mode() as u64).min(n);
-        let lp_m = self.logpmf(m);
+        let lp_m = self.logpmf(m as i64);
         let pm = lp_m.exp();
         let mut h = if pm > 0.0 { -pm * lp_m } else { 0.0 };
         // Downward from the mode to 0.
@@ -12831,12 +12967,12 @@ impl DiscreteDistribution for BetaBinomial {
         }
         h
     }
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng)
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(count, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -12905,12 +13041,12 @@ impl BetaNegativeBinomial {
             return Vec::new();
         }
         if BETANBINOM_CDF_MANY_DISABLE.load(std::sync::atomic::Ordering::Relaxed) {
-            return ks.iter().map(|&k| self.cdf(k)).collect();
+            return ks.iter().map(|&k| self.cdf(k as i64)).collect();
         }
         let max_k = *ks.iter().max().expect("non-empty ks");
         const MAX_PREFIX_K: u64 = 1_000_000;
         if max_k > MAX_PREFIX_K {
-            return ks.iter().map(|&k| self.cdf(k)).collect();
+            return ks.iter().map(|&k| self.cdf(k as i64)).collect();
         }
 
         let nf = self.n as f64;
@@ -13009,7 +13145,11 @@ impl BetaNegativeBinomial {
 }
 
 impl DiscreteDistribution for BetaNegativeBinomial {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (0.0, f64::INFINITY)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         let n = self.n as f64;
         let kf = k as f64;
         let ln_comb = ln_gamma(n + kf) - ln_gamma(kf + 1.0) - ln_gamma(n);
@@ -13019,7 +13159,10 @@ impl DiscreteDistribution for BetaNegativeBinomial {
         (ln_comb + ln_beta_num - ln_beta_den).exp()
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // ln C(n+k-1,k) + ln B(a+n, b+k) − ln B(a,b); finite where pmf underflows
         // (pmf forms this then exp's it). frankenscipy-7m3xk
         let n = self.n as f64;
@@ -13031,7 +13174,8 @@ impl DiscreteDistribution for BetaNegativeBinomial {
         ln_comb + ln_beta_num - ln_beta_den
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // Default DiscreteDistribution::cdf sums pmf(0..=k) and each pmf costs ~6
         // ln_gamma. The pmf has a closed ratio and the mode is 0, so pmf(0) is the
         // largest term (never underflows): pmf(i+1)/pmf(i) = (n+i)(b+i)/((i+1)(a+n+b+i)).
@@ -13101,7 +13245,7 @@ impl DiscreteDistribution for BetaNegativeBinomial {
         let mut k = 0u64;
         let mut p = self.pmf(0);
         loop {
-            let next = self.pmf(k + 1);
+            let next = self.pmf(k as i64 + 1);
             if !(next > p) {
                 return k as f64;
             }
@@ -13144,12 +13288,12 @@ impl DiscreteDistribution for BetaNegativeBinomial {
         h
     }
 
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng)
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(count, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -13204,14 +13348,21 @@ impl Bernoulli {
 }
 
 impl DiscreteDistribution for Bernoulli {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (0.0, 1.0)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         match k {
             0 => 1.0 - self.p,
             1 => self.p,
             _ => 0.0,
         }
     }
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // ln(1−p) / ln(p); finite where pmf underflows. frankenscipy-7m3xk
         match k {
             0 => (1.0 - self.p).ln(),
@@ -13220,17 +13371,20 @@ impl DiscreteDistribution for Bernoulli {
         }
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 { 1.0 - self.p } else { 1.0 }
     }
 
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 1.0 };
         // P(X > k): p at k=0, else 0. The default 1−cdf at k=0 is
         // 1−(1−p)=p but cancels; the closed form is exact. frankenscipy-k0sce
         if k == 0 { self.p } else { 0.0 }
     }
 
-    fn logsf(&self, k: u64) -> f64 {
+    fn logsf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 {
             self.p.ln()
         } else {
@@ -13273,12 +13427,12 @@ impl DiscreteDistribution for Bernoulli {
         }
     }
 
-    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(n, rng)
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(n, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -13456,7 +13610,11 @@ impl Boltzmann {
 }
 
 impl DiscreteDistribution for Boltzmann {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (0.0, f64::from(self.n) - 1.0)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k >= self.n as u64 {
             return 0.0;
         }
@@ -13465,7 +13623,10 @@ impl DiscreteDistribution for Boltzmann {
         (-(-self.lambda).exp_m1()) * (-self.lambda * kf).exp() / self.z()
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // ln(1 − e^{−λ}) − λk − ln(z); finite where pmf underflows. frankenscipy-7m3xk
         if k >= self.n as u64 {
             return f64::NEG_INFINITY;
@@ -13473,7 +13634,8 @@ impl DiscreteDistribution for Boltzmann {
         (-(-self.lambda).exp_m1()).ln() - self.lambda * k as f64 - self.z().ln()
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k >= self.n as u64 {
             return 1.0;
         }
@@ -13482,7 +13644,8 @@ impl DiscreteDistribution for Boltzmann {
         (-(-self.lambda * kp1).exp_m1()) / self.z()
     }
 
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 1.0 };
         // P(X > k) = (e^(−λ(k+1)) − e^(−λn)) / z. The default 1−cdf cancels near
         // the upper edge (k → n−1). Factor as e^(−λ(k+1))·(1−e^(−λ(n−k−1))) so the
         // last terms stay exact (sf(n−1)=0). frankenscipy-k0sce
@@ -13493,7 +13656,8 @@ impl DiscreteDistribution for Boltzmann {
         (-self.lambda * (k + 1) as f64).exp() * (-(-self.lambda * m).exp_m1()) / self.z()
     }
 
-    fn logsf(&self, k: u64) -> f64 {
+    fn logsf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k >= self.n as u64 {
             return f64::NEG_INFINITY;
         }
@@ -13521,7 +13685,7 @@ impl DiscreteDistribution for Boltzmann {
         let mut e_k_sq = 0.0_f64;
         for k in 0..self.n as u64 {
             let kf = k as f64;
-            e_k_sq += kf * kf * self.pmf(k);
+            e_k_sq += kf * kf * self.pmf(k as i64);
         }
         (e_k_sq - m * m).max(0.0)
     }
@@ -13535,7 +13699,7 @@ impl DiscreteDistribution for Boltzmann {
         let mut m3 = 0.0;
         for k in 0..self.n as u64 {
             let kf = k as f64;
-            let p = self.pmf(k);
+            let p = self.pmf(k as i64);
             m1 += kf * p;
             m2 += kf * kf * p;
             m3 += kf * kf * kf * p;
@@ -13555,7 +13719,7 @@ impl DiscreteDistribution for Boltzmann {
         let mut m4 = 0.0;
         for k in 0..self.n as u64 {
             let kf = k as f64;
-            let p = self.pmf(k);
+            let p = self.pmf(k as i64);
             m1 += kf * p;
             m2 += kf * kf * p;
             m3 += kf * kf * kf * p;
@@ -13583,12 +13747,12 @@ impl DiscreteDistribution for Boltzmann {
         0.0
     }
 
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng)
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(count, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -13661,25 +13825,23 @@ impl DiscreteLaplace {
 }
 
 impl DiscreteDistribution for DiscreteLaplace {
-    // DiscreteLaplace has full-integer (signed) support; the u64 ppf/isf cannot
-    // represent negative quantiles, so they are unsupported here (the default
-    // would silently clamp to 0).
-    fn ppf(&self, _q: f64) -> f64 {
-        f64::NAN
+    fn support(&self) -> (f64, f64) {
+        (f64::NEG_INFINITY, f64::INFINITY)
     }
-    fn isf(&self, _q: f64) -> f64 {
-        f64::NAN
-    }
-    fn pmf(&self, k: u64) -> f64 {
-        (self.a / 2.0).tanh() * (-self.a * k as f64).exp()
+    fn pmf(&self, k: i64) -> f64 {
+        (self.a / 2.0).tanh() * (-self.a * k.unsigned_abs() as f64).exp()
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
-        // ln(tanh(a/2)) − a·k; finite where pmf underflows. frankenscipy-7m3xk
-        (self.a / 2.0).tanh().ln() - self.a * k as f64
+    fn logpmf(&self, k: i64) -> f64 {
+        // ln(tanh(a/2)) − a·|k|; finite where pmf underflows. frankenscipy-7m3xk
+        (self.a / 2.0).tanh().ln() - self.a * k.unsigned_abs() as f64
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        if k < 0 {
+            // SciPy dlaplace._cdf for k < 0: e^{a(k+1)} / (e^a + 1).
+            return (self.a * (k as f64 + 1.0)).exp() / (self.a.exp() + 1.0);
+        }
         let kf = k as f64;
         let ea = (-self.a).exp();
         let norm = (self.a / 2.0).tanh();
@@ -13725,13 +13887,12 @@ impl DiscreteDistribution for DiscreteLaplace {
         -norm.ln() + self.a * mean_abs
     }
 
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng).into_iter().map(|x| x as u64).collect()
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        self.rvs(count, rng)
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        let signed: Vec<i64> = data.iter().map(|&x| x as i64).collect();
-        Self::fit(&signed).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(data).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -13827,7 +13988,11 @@ impl YuleSimon {
 }
 
 impl DiscreteDistribution for YuleSimon {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (1.0, f64::INFINITY)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 {
             return 0.0;
         }
@@ -13836,7 +14001,10 @@ impl DiscreteDistribution for YuleSimon {
         self.alpha * self.ln_beta_k(kf).exp()
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // ln(α) + ln B(k, α+1); finite power-law tail. frankenscipy-7m3xk
         if k == 0 {
             return f64::NEG_INFINITY;
@@ -13844,7 +14012,8 @@ impl DiscreteDistribution for YuleSimon {
         self.alpha.ln() + self.ln_beta_k(k as f64)
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 {
             return 0.0;
         }
@@ -13853,7 +14022,8 @@ impl DiscreteDistribution for YuleSimon {
         (1.0 - kf * self.ln_beta_k(kf).exp()).clamp(0.0, 1.0)
     }
 
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 1.0 };
         // P(X > k) = k · B(k, α + 1) directly (the default 1 − cdf cancels and
         // underflows to 0 in the power-law tail). Matches scipy yulesimon._sf.
         // frankenscipy.
@@ -13864,7 +14034,8 @@ impl DiscreteDistribution for YuleSimon {
         (kf * self.ln_beta_k(kf).exp()).clamp(0.0, 1.0)
     }
 
-    fn logsf(&self, k: u64) -> f64 {
+    fn logsf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // ln(k) + ln B(k, α + 1); finite deep in the tail where ln(sf) → −inf.
         // Matches scipy yulesimon._logsf. frankenscipy.
         if k == 0 {
@@ -13928,7 +14099,7 @@ impl DiscreteDistribution for YuleSimon {
         let mut h = 0.0_f64;
         let max_k: u64 = 2_000_000;
         for k in 1..=max_k {
-            let p = self.pmf(k);
+            let p = self.pmf(k as i64);
             if p <= 0.0 {
                 if k > 100 {
                     break;
@@ -13946,12 +14117,12 @@ impl DiscreteDistribution for YuleSimon {
         h
     }
 
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng)
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(count, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -14013,30 +14184,40 @@ impl Planck {
 }
 
 impl DiscreteDistribution for Planck {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (0.0, f64::INFINITY)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         let kf = k as f64;
         // (1 − e^(−λ)) · e^(−λk) — expm1 keeps precision when λ is small.
         (-(-self.lambda).exp_m1()) * (-self.lambda * kf).exp()
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // ln(1 − e^{−λ}) − λk; finite where pmf underflows. frankenscipy-7m3xk
         (-(-self.lambda).exp_m1()).ln() - self.lambda * k as f64
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         let kp1 = (k + 1) as f64;
         // 1 − e^(−λ(k+1))
         -(-self.lambda * kp1).exp_m1()
     }
 
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 1.0 };
         // P(X > k) = e^(−λ(k+1)). The default 1−cdf underflows to 0 in the
         // right tail (sf(150,0.5) gave 0 vs scipy 1.6e-33). frankenscipy-k0sce
         (-self.lambda * (k + 1) as f64).exp()
     }
 
-    fn logsf(&self, k: u64) -> f64 {
+    fn logsf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // ln(sf) = −λ(k+1); finite where sf underflows (default gave −inf).
         -self.lambda * (k + 1) as f64
     }
@@ -14078,12 +14259,12 @@ impl DiscreteDistribution for Planck {
         0.0
     }
 
-    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(n, rng)
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(n, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -14093,14 +14274,21 @@ impl DiscreteDistribution for Planck {
 }
 
 impl DiscreteDistribution for Geometric {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (1.0, f64::INFINITY)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 {
             return 0.0;
         }
         self.p * (1.0 - self.p).powi((k - 1) as i32)
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // ln(p) + (k−1)·ln(1−p); finite where pmf underflows. frankenscipy-7m3xk
         if k == 0 {
             return f64::NEG_INFINITY;
@@ -14108,21 +14296,24 @@ impl DiscreteDistribution for Geometric {
         self.p.ln() + (k - 1) as f64 * (1.0 - self.p).ln()
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 {
             return 0.0;
         }
         1.0 - (1.0 - self.p).powi(k as i32)
     }
 
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 1.0 };
         // P(X > k) = (1−p)^k. The default 1−cdf underflows to 0 in the right
         // tail (sf(700,0.1) gave 0 vs scipy 9.3e-33) and cancels mid-tail
         // (sf(300) was 1.25e-3 off). frankenscipy-k0sce
         (1.0 - self.p).powi(k as i32)
     }
 
-    fn logsf(&self, k: u64) -> f64 {
+    fn logsf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // ln(sf) = k·ln(1−p); finite where sf underflows (default gave −inf).
         k as f64 * (-self.p).ln_1p()
     }
@@ -14152,12 +14343,12 @@ impl DiscreteDistribution for Geometric {
         1.0
     }
 
-    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(n, rng)
+    fn rvs(&self, n: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(n, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -14358,10 +14549,10 @@ impl NegBinomial {
             let mut k = idx;
             let near = (k > 0 && q - cdf_ref[k - 1] < 1e-11) || (cdf_ref[k] - q < 1e-11);
             if near {
-                while k > 0 && this.cdf((k - 1) as u64) >= q {
+                while k > 0 && this.cdf((k - 1) as i64) >= q {
                     k -= 1;
                 }
-                while k < k_hi && this.cdf(k as u64) < q {
+                while k < k_hi && this.cdf(k as i64) < q {
                     k += 1;
                 }
             }
@@ -14431,7 +14622,11 @@ impl NegBinomial {
 }
 
 impl DiscreteDistribution for NegBinomial {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (0.0, f64::INFINITY)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // Limit case: with p=1 every trial succeeds, so the count of
         // failures is 0 with probability 1. Without this short-circuit
         // the formula evaluates 0 · ln(0) = NaN at k=0.
@@ -14445,12 +14640,16 @@ impl DiscreteDistribution for NegBinomial {
         ln_pmf.exp()
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // Closed form P(X<=k) = I_p(n, k+1), matching scipy's nbdtr. O(1) vs the
         // old O(k) pmf summation. frankenscipy-7kq9d
         regularized_incomplete_beta(self.n, k as f64 + 1.0, self.p)
     }
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // ln C(k+n−1,k) + n·ln(p) + k·ln(1−p); finite where pmf underflows
         // (negative-binomial-GLM log-likelihood term). frankenscipy-7m3xk
         if self.p == 1.0 {
@@ -14460,16 +14659,21 @@ impl DiscreteDistribution for NegBinomial {
         let ln_comb = ln_gamma(kf + self.n) - ln_gamma(kf + 1.0) - ln_gamma(self.n);
         ln_comb + self.n * self.p.ln() + kf * (1.0 - self.p).ln()
     }
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 1.0 };
         // P(X>k) = I_{1-p}(k+1, n); direct so the right tail does not collapse
         // like the default 1-cdf. frankenscipy-r4933
         regularized_incomplete_beta(k as f64 + 1.0, self.n, 1.0 - self.p)
     }
-    fn logcdf(&self, k: u64) -> f64 {
+    fn logcdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // log P(X<=k) = log I_p(n, k+1); finite in the left tail. frankenscipy-r4933
         fsci_special::log_betainc_scalar(self.n, k as f64 + 1.0, self.p)
     }
-    fn logsf(&self, k: u64) -> f64 {
+    fn logsf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // log P(X>k) = log I_{1-p}(k+1, n); finite in the right tail. frankenscipy-r4933
         fsci_special::log_betainc_scalar(k as f64 + 1.0, self.n, 1.0 - self.p)
     }
@@ -14512,7 +14716,7 @@ impl DiscreteDistribution for NegBinomial {
         let max_k: u64 = 1_000_000;
         let mut tail = 1.0_f64;
         for k in 0..=max_k {
-            let p = self.pmf(k);
+            let p = self.pmf(k as i64);
             if p > 0.0 {
                 h -= p * p.ln();
                 tail -= p;
@@ -14524,12 +14728,12 @@ impl DiscreteDistribution for NegBinomial {
         h
     }
 
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng)
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(count, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -14755,7 +14959,11 @@ impl Hypergeometric {
 }
 
 impl DiscreteDistribution for Hypergeometric {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        hypergeometric_support(self.big_m, self.n, self.big_n)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         let m = self.big_m as f64;
         let n = self.n as f64;
         let big_n = self.big_n as f64;
@@ -14790,7 +14998,10 @@ impl DiscreteDistribution for Hypergeometric {
         ln_pmf.exp()
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // log of the hypergeometric pmf (the pmf forms this then exp's it);
         // finite where pmf underflows. frankenscipy-7m3xk
         let m = self.big_m as f64;
@@ -14827,7 +15038,8 @@ impl DiscreteDistribution for Hypergeometric {
         big_n * (n / m) * ((m - n) / m) * ((m - big_n) / (m - 1.0))
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // Lower-tail sum via the recurrence sweep (pmf_many) instead of the trait default
         // (0..=k).map(self.pmf).sum(), which is O(k·N) now that the single pmf is O(N+k). pmf(i)=0
         // for i>k_max so capping the range is byte-identical; pmf_many==map(pmf). O(N+k).
@@ -14837,7 +15049,8 @@ impl DiscreteDistribution for Hypergeometric {
         self.pmf_many(&ks).iter().sum::<f64>().min(1.0)
     }
 
-    fn sf(&self, k: u64) -> f64 {
+    fn sf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 1.0 };
         // P(X > k) summed DIRECTLY over the upper tail [k+1, k_max]. The trait
         // default 1 - cdf cancels and underflows to 0 deep in the right tail
         // (e.g. hypergeom(500,50,100).sf(40) = 5.9e-24 vs 0.0 from 1-cdf, and
@@ -14917,12 +15130,12 @@ impl DiscreteDistribution for Hypergeometric {
             .sum()
     }
 
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng)
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(count, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -14986,7 +15199,11 @@ impl NchypergeomWallenius {
 }
 
 impl DiscreteDistribution for NchypergeomWallenius {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        hypergeometric_support(self.big_m, self.n, self.big_n)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         let (lo, hi) = self.support();
         if k < lo || k > hi {
             return 0.0;
@@ -15018,18 +15235,18 @@ impl DiscreteDistribution for NchypergeomWallenius {
 
     fn mean(&self) -> f64 {
         let (lo, hi) = self.support();
-        (lo..=hi).map(|x| x as f64 * self.pmf(x)).sum()
+        (lo..=hi).map(|x| x as f64 * self.pmf(x as i64)).sum()
     }
 
     fn var(&self) -> f64 {
         let (lo, hi) = self.support();
         let mean = self.mean();
-        let e2: f64 = (lo..=hi).map(|x| (x as f64).powi(2) * self.pmf(x)).sum();
+        let e2: f64 = (lo..=hi).map(|x| (x as f64).powi(2) * self.pmf(x as i64)).sum();
         e2 - mean * mean
     }
 
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng)
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(count, rng))
     }
 }
 
@@ -15146,7 +15363,7 @@ impl NegHypergeometric {
             ((rf * (nf + 1.0) - mf) / denom).floor()
         };
         let m = mode.clamp(0.0, nf) as u64;
-        let pm = self.logpmf(m).exp();
+        let pm = self.logpmf(m as i64).exp();
         let (mut m2, mut m3, mut m4) = (0.0_f64, 0.0_f64, 0.0_f64);
         let d = m as f64 - mu;
         let d2 = d * d;
@@ -15186,7 +15403,11 @@ impl NegHypergeometric {
 }
 
 impl DiscreteDistribution for NegHypergeometric {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (0.0, self.n as f64)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         let m = self.big_m;
         let n = self.n;
         let r = self.r;
@@ -15203,7 +15424,10 @@ impl DiscreteDistribution for NegHypergeometric {
         (ln_num1 + ln_num2 - ln_den).exp()
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // log of the negative-hypergeometric pmf (pmf forms this then exp's it);
         // finite where pmf underflows. frankenscipy-7m3xk
         let m = self.big_m;
@@ -15218,7 +15442,8 @@ impl DiscreteDistribution for NegHypergeometric {
         Self::ln_comb(k + r - 1, k) + Self::ln_comb(m - r - k, n - k) - Self::ln_comb(m, n)
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         // The fresh-pmf sum below paid 3 ln_comb (~6 ln_gamma) PER term. The pmf has
         // a closed ratio: pmf(i+1)/pmf(i) = (i+r)(n−i) / ((i+1)(M−r−i)). Anchor at
         // the mode (the largest pmf — never underflows; the constructor guarantees
@@ -15241,7 +15466,7 @@ impl DiscreteDistribution for NegHypergeometric {
             ((rf * (nf + 1.0) - mf) / denom).floor()
         };
         let m = mode.clamp(0.0, nf) as u64;
-        let pm = self.logpmf(m).exp();
+        let pm = self.logpmf(m as i64).exp();
         let mut total = 0.0_f64;
         // Downward from the mode to 0, counting indices ≤ k.
         let mut pk = pm;
@@ -15310,7 +15535,7 @@ impl DiscreteDistribution for NegHypergeometric {
         let mut k = 0u64;
         let mut p = self.pmf(0);
         loop {
-            let next = self.pmf(k + 1);
+            let next = self.pmf(k as i64 + 1);
             if !(next > p) {
                 return k as f64;
             }
@@ -15337,7 +15562,7 @@ impl DiscreteDistribution for NegHypergeometric {
             ((rf * (nf + 1.0) - mf) / denom).floor()
         };
         let m = mode.clamp(0.0, nf) as u64;
-        let lp_m = self.logpmf(m);
+        let lp_m = self.logpmf(m as i64);
         let pm = lp_m.exp();
         let mut h = if pm > 0.0 { -pm * lp_m } else { 0.0 };
         // Downward from the mode to 0.
@@ -15373,12 +15598,12 @@ impl DiscreteDistribution for NegHypergeometric {
         h
     }
 
-    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<u64> {
-        self.rvs(count, rng)
+    fn rvs(&self, count: usize, rng: &mut impl Rng) -> Vec<i64> {
+        signed_variates(self.rvs(count, rng))
     }
 
-    fn try_fit(data: &[u64]) -> Result<Self, FitError> {
-        Self::fit(data).map_err(|e| match e {
+    fn try_fit(data: &[i64]) -> Result<Self, FitError> {
+        Self::fit(&nonnegative_observations(data)?).map_err(|e| match e {
             StatsError::DataTooSmall { required, got } => {
                 FitError::InsufficientData { required, actual: got }
             }
@@ -15437,14 +15662,21 @@ impl LogSeries {
 }
 
 impl DiscreteDistribution for LogSeries {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (1.0, f64::INFINITY)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 {
             return 0.0;
         }
         self.p.powf(k as f64) / (k as f64 * self.norm())
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // k·ln(p) − ln(k) − ln(norm); finite where pmf underflows. frankenscipy-7m3xk
         if k == 0 {
             return f64::NEG_INFINITY;
@@ -15452,7 +15684,8 @@ impl DiscreteDistribution for LogSeries {
         k as f64 * self.p.ln() - (k as f64).ln() - self.norm().ln()
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 {
             return 0.0;
         }
@@ -15523,7 +15756,7 @@ impl DiscreteDistribution for LogSeries {
         let mut tail = 1.0_f64;
         let max_k: u64 = 1_000_000;
         for k in 1..=max_k {
-            let p_k = self.pmf(k);
+            let p_k = self.pmf(k as i64);
             if p_k > 0.0 {
                 h -= p_k * p_k.ln();
                 tail -= p_k;
@@ -15595,6 +15828,39 @@ impl RandInt {
     pub fn var(&self) -> f64 {
         let n = self.width() as f64;
         (n * n - 1.0) / 12.0
+    }
+}
+
+/// `scipy.stats.randint(low, high)` through the generic discrete API: support `[low, high − 1]`.
+impl DiscreteDistribution for RandInt {
+    fn support(&self) -> (f64, f64) {
+        (self.low as f64, (self.high - 1) as f64)
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        RandInt::pmf(self, k)
+    }
+    fn cdf(&self, k: i64) -> f64 {
+        RandInt::cdf(self, k)
+    }
+    fn ppf(&self, q: f64) -> f64 {
+        RandInt::ppf(self, q)
+    }
+    fn mean(&self) -> f64 {
+        RandInt::mean(self)
+    }
+    fn var(&self) -> f64 {
+        RandInt::var(self)
+    }
+    fn entropy(&self) -> f64 {
+        (self.width() as f64).ln()
+    }
+    fn skewness(&self) -> f64 {
+        0.0
+    }
+    fn kurtosis(&self) -> f64 {
+        // SciPy randint._stats: g2 = −(6/5)·(d² + 1)/(d² − 1), d = high − low.
+        let d = self.width() as f64;
+        -6.0 / 5.0 * (d * d + 1.0) / (d * d - 1.0)
     }
 }
 
@@ -20933,14 +21199,21 @@ impl Zipfian {
 }
 
 impl DiscreteDistribution for Zipfian {
-    fn pmf(&self, k: u64) -> f64 {
+    fn support(&self) -> (f64, f64) {
+        (1.0, f64::from(self.n))
+    }
+    fn pmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 || k > self.n as u64 {
             return 0.0;
         }
         (k as f64).powf(-self.a) / self.z()
     }
 
-    fn logpmf(&self, k: u64) -> f64 {
+    fn logpmf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else {
+            return f64::NEG_INFINITY;
+        };
         // −a·ln(k) − ln(Z); finite where pmf underflows. frankenscipy-7m3xk
         if k == 0 || k > self.n as u64 {
             return f64::NEG_INFINITY;
@@ -20948,7 +21221,8 @@ impl DiscreteDistribution for Zipfian {
         -self.a * (k as f64).ln() - self.z().ln()
     }
 
-    fn cdf(&self, k: u64) -> f64 {
+    fn cdf(&self, k: i64) -> f64 {
+        let Ok(k) = u64::try_from(k) else { return 0.0 };
         if k == 0 {
             return 0.0;
         }
@@ -39291,12 +39565,12 @@ pub fn median_cihs(data: &[f64], alpha: f64) -> (f64, f64) {
     let binom = Binomial::new(n as u64, 0.5);
 
     let mut k = binomial_ppf(&binom, alpha / 2.0);
-    let mut gk = binom.cdf(n as u64 - k) - binom.cdf(k.saturating_sub(1));
+    let mut gk = binom.cdf((n as u64 - k) as i64) - binom.cdf(k.saturating_sub(1) as i64);
     if gk < 1.0 - alpha {
         k = k.saturating_sub(1);
-        gk = binom.cdf(n as u64 - k) - binom.cdf(k.saturating_sub(1));
+        gk = binom.cdf((n as u64 - k) as i64) - binom.cdf(k.saturating_sub(1) as i64);
     }
-    let gkk = binom.cdf(n as u64 - k - 1) - binom.cdf(k);
+    let gkk = binom.cdf((n as u64 - k - 1) as i64) - binom.cdf(k as i64);
     let i_val = (gk - 1.0 + alpha) / (gk - gkk);
     let n_minus_k = n as f64 - k as f64;
     let lambd = n_minus_k * i_val / (k as f64 + (n as f64 - 2.0 * k as f64) * i_val);
@@ -39322,7 +39596,7 @@ fn binomial_ppf(binom: &Binomial, q: f64) -> u64 {
         return binom.n;
     }
     for k in 0..=binom.n {
-        if binom.cdf(k) >= q {
+        if binom.cdf(k as i64) >= q {
             return k;
         }
     }
@@ -43307,9 +43581,9 @@ pub fn quantile_test(x: &[f64], q: f64, p: f64) -> QuantileTestResult {
     // p_greater: P(Y <= t1) for alternative='greater'
     // p_less: P(Y >= t2) = 1 - P(Y < t2) = 1 - P(Y <= t2-1) for alternative='less'
 
-    let p_greater = DiscreteDistribution::cdf(&binom, t1 as u64);
+    let p_greater = DiscreteDistribution::cdf(&binom, t1 as i64);
     let p_less = if t2 > 0 {
-        1.0 - DiscreteDistribution::cdf(&binom, (t2 - 1) as u64)
+        1.0 - DiscreteDistribution::cdf(&binom, (t2 - 1) as i64)
     } else {
         1.0
     };
@@ -43377,10 +43651,10 @@ pub fn binomtest(k: u64, n: u64, p: f64) -> Result<f64, StatsError> {
     let binom = Binomial::new(n, p);
 
     // Two-sided p-value: sum P(X=j) for all j where P(X=j) <= P(X=k)
-    let p_observed = DiscreteDistribution::pmf(&binom, k);
+    let p_observed = DiscreteDistribution::pmf(&binom, k as i64);
     let mut pvalue = 0.0;
     for j in 0..=n {
-        let p_j = DiscreteDistribution::pmf(&binom, j);
+        let p_j = DiscreteDistribution::pmf(&binom, j as i64);
         if p_j <= p_observed + 1e-14 {
             pvalue += p_j;
         }
@@ -49621,14 +49895,14 @@ pub fn fisher_exact(table: &[[f64; 2]; 2]) -> FisherExactResult {
     // Two-sided p-value: sum probabilities of all outcomes as extreme or more extreme
     // than the observed value (where "extreme" means pmf <= pmf(observed))
     let observed_k = a as u64;
-    let p_observed = hyper.pmf(observed_k);
+    let p_observed = hyper.pmf(observed_k as i64);
 
     let k_min = (n_draw + n_succ).saturating_sub(big_m);
     let k_max = n_draw.min(n_succ);
 
     let mut pvalue = 0.0;
     for k in k_min..=k_max {
-        let p_k = hyper.pmf(k);
+        let p_k = hyper.pmf(k as i64);
         if p_k <= p_observed + 1e-14 {
             pvalue += p_k;
         }
@@ -49783,7 +50057,7 @@ fn barnard_pvalue_at_p(n1: u64, n2: u64, p: f64, observed_stat: f64, alternative
             };
 
             if is_extreme {
-                let prob = binom1.pmf(x1) * binom2.pmf(x2);
+                let prob = binom1.pmf(x1 as i64) * binom2.pmf(x2 as i64);
                 pvalue += prob;
             }
         }
@@ -49930,15 +50204,15 @@ fn fisher_one_sided_pvalue(a: usize, b: usize, c: usize, d: usize, alternative: 
     match alternative {
         "less" => {
             // P(X <= observed)
-            (k_min..=observed_k).map(|k| hyper.pmf(k)).sum()
+            (k_min..=observed_k).map(|k| hyper.pmf(k as i64)).sum()
         }
         "greater" => {
             // P(X >= observed)
-            (observed_k..=k_max).map(|k| hyper.pmf(k)).sum()
+            (observed_k..=k_max).map(|k| hyper.pmf(k as i64)).sum()
         }
         _ => {
-            let less: f64 = (k_min..=observed_k).map(|k| hyper.pmf(k)).sum();
-            let greater: f64 = (observed_k..=k_max).map(|k| hyper.pmf(k)).sum();
+            let less: f64 = (k_min..=observed_k).map(|k| hyper.pmf(k as i64)).sum();
+            let greater: f64 = (observed_k..=k_max).map(|k| hyper.pmf(k as i64)).sum();
             (2.0 * less.min(greater)).clamp(0.0, 1.0)
         }
     }
@@ -49967,7 +50241,7 @@ fn boschloo_pvalue_at_p(n1: u64, n2: u64, p: f64, observed_stat: f64, alternativ
 
             // Is this table as or more extreme? (smaller Fisher p-value)
             if fisher_p <= observed_stat + 1e-14 {
-                let prob = binom1.pmf(a) * binom2.pmf(c);
+                let prob = binom1.pmf(a as i64) * binom2.pmf(c as i64);
                 pvalue += prob;
             }
         }
@@ -65800,7 +66074,7 @@ mod tests {
         // cdf now streams p^i (term *= p) instead of p.powf(i) per term. References
         // from scipy.stats.logser (1.17.1); asserted to 1e-10.
         let cases = [
-            (0.5, 3u64, 0.961796693926),
+            (0.5, 3_i64, 0.961796693926),
             (0.9, 20, 0.98296029994),
             (0.99, 50, 0.880414344802),
             (0.99, 200, 0.989600754605),
@@ -68455,16 +68729,17 @@ mod tests {
             ($d:expr, $ks:expr) => {{
                 let d = $d;
                 for &k in $ks {
+                    let k: i64 = k;
                     // sf == 1 - cdf (cdf is the scipy-validated pmf-sum).
                     assert!(
-                        (d.sf(k) - (1.0 - d.cdf(k))).abs() <= 1e-9,
+                        (d.sf(k) - (1.0 - DiscreteDistribution::cdf(&d, k))).abs() <= 1e-9,
                         "{}: sf({k})={} vs 1-cdf={}",
                         stringify!($d),
                         d.sf(k),
-                        1.0 - d.cdf(k)
+                        1.0 - DiscreteDistribution::cdf(&d, k)
                     );
                     // logcdf == ln(cdf), logsf == ln(sf) where representable.
-                    let c = d.cdf(k);
+                    let c = DiscreteDistribution::cdf(&d, k);
                     if c > 0.0 {
                         assert!(
                             (d.logcdf(k) - c.ln()).abs() <= 1e-8 * c.ln().abs().max(1.0),
@@ -68494,21 +68769,21 @@ mod tests {
         // Closed-form cdf must match an independent pmf-sum reference in the bulk
         // (the O(k)→O(1) swap is faithful). frankenscipy-7kq9d
         let pmf_sum_cdf =
-            |pmf: &dyn Fn(u64) -> f64, k: u64| -> f64 { (0..=k).map(pmf).sum::<f64>().min(1.0) };
+            |pmf: &dyn Fn(i64) -> f64, k: i64| -> f64 { (0..=k).map(pmf).sum::<f64>().min(1.0) };
         {
             let d = Poisson::new(10.0);
-            for k in [0u64, 3, 8, 12, 20] {
-                let r = pmf_sum_cdf(&|i| d.pmf(i), k);
+            for k in [0_i64, 3, 8, 12, 20] {
+                let r = pmf_sum_cdf(&|i| DiscreteDistribution::pmf(&d, i), k);
                 assert!(
-                    (d.cdf(k) - r).abs() <= 1e-9,
+                    (DiscreteDistribution::cdf(&d, k) - r).abs() <= 1e-9,
                     "poisson cdf({k})={} vs {r}",
-                    d.cdf(k)
+                    DiscreteDistribution::cdf(&d, k)
                 );
             }
         }
         {
             let d = Binomial::new(20, 0.3);
-            for k in [0u64, 3, 6, 10, 19, 20] {
+            for k in [0_i64, 3, 6, 10, 19, 20] {
                 let r = pmf_sum_cdf(&|i| d.pmf(i), k);
                 assert!(
                     (d.cdf(k) - r).abs() <= 1e-9,
@@ -68519,7 +68794,7 @@ mod tests {
         }
         {
             let d = NegBinomial::new(5.0, 0.5);
-            for k in [0u64, 3, 8, 15, 30] {
+            for k in [0_i64, 3, 8, 15, 30] {
                 let r = pmf_sum_cdf(&|i| d.pmf(i), k);
                 assert!(
                     (d.cdf(k) - r).abs() <= 1e-9,
@@ -68999,8 +69274,9 @@ mod tests {
             ($d:expr, $ks:expr) => {{
                 let d = $d;
                 for &k in $ks {
+                    let k: i64 = k;
                     let lp = d.logpmf(k);
-                    let p = d.pmf(k);
+                    let p = DiscreteDistribution::pmf(&d, k);
                     if p > 0.0 {
                         assert!(
                             (lp - p.ln()).abs() <= 1e-9 * p.ln().abs().max(1.0),
@@ -70556,9 +70832,12 @@ mod tests {
         assert_eq!(p.isf(1.0), -1.0);
         assert!(p.isf(0.0).is_infinite() && p.isf(0.0) > 0.0);
 
-        // Signed-support distributions are unsupported via the u64 ppf/isf.
-        assert!(Skellam::new(2.0, 1.0).ppf(0.5).is_nan());
-        assert!(DiscreteLaplace::new(0.5).isf(0.5).is_nan());
+        // Signed-support distributions (these returned NaN while the trait was u64-only,
+        // frankenscipy-szq1n.8): scipy.stats.skellam(2, 1) / dlaplace(0.5).
+        assert_eq!(Skellam::new(2.0, 1.0).ppf(0.5), 1.0);
+        assert_eq!(Skellam::new(2.0, 1.0).ppf(0.05), -2.0);
+        assert_eq!(DiscreteLaplace::new(0.5).isf(0.5), 0.0);
+        assert_eq!(DiscreteLaplace::new(0.5).isf(0.9), -3.0);
     }
 
     #[test]
@@ -79318,7 +79597,7 @@ mod tests {
         ] {
             let pm = b.pmf_many(&ks);
             for (i, &k) in ks.iter().enumerate() {
-                assert_eq!(pm[i], b.pmf(k), "pmf_many != pmf at k={k}");
+                assert_eq!(pm[i], b.pmf(k as i64), "pmf_many != pmf at k={k}");
             }
         }
     }
@@ -79337,12 +79616,12 @@ mod tests {
             let cm = b.cdf_many(&ks);
             for (i, &k) in ks.iter().enumerate() {
                 assert!(
-                    (cm[i] - b.cdf(k)).abs() < 1e-9,
+                    (cm[i] - b.cdf(k as i64)).abs() < 1e-9,
                     "cdf_many mismatch n={} p={} k={k}: {} vs {}",
                     b.n,
                     b.p,
                     cm[i],
-                    b.cdf(k)
+                    b.cdf(k as i64)
                 );
             }
         }
@@ -79443,7 +79722,7 @@ mod tests {
         let mut rng2 = StdRng::seed_from_u64(99);
         let d_samples = b_small.rvs(10, &mut rng2);
         assert_eq!(d_samples.len(), 10);
-        let fitted_trait = Binomial::try_fit(&samples_small);
+        let fitted_trait = Binomial::try_fit(&signed_variates(samples_small.clone()));
         assert!(fitted_trait.is_ok());
     }
 
@@ -79497,7 +79776,7 @@ mod tests {
         let mut rng2 = StdRng::seed_from_u64(99);
         let d_samples = b.rvs(10, &mut rng2);
         assert_eq!(d_samples.len(), 10);
-        let fitted_trait = Bernoulli::try_fit(&samples);
+        let fitted_trait = Bernoulli::try_fit(&signed_variates(samples.clone()));
         assert!(fitted_trait.is_ok());
     }
 
@@ -79561,7 +79840,7 @@ mod tests {
         let mut rng2 = StdRng::seed_from_u64(99);
         let d_samples = g.rvs(10, &mut rng2);
         assert_eq!(d_samples.len(), 10);
-        let fitted_trait = Geometric::try_fit(&samples);
+        let fitted_trait = Geometric::try_fit(&signed_variates(samples.clone()));
         assert!(fitted_trait.is_ok());
     }
 
@@ -79580,7 +79859,7 @@ mod tests {
         for nb in [NegBinomial::new(5.0, 0.4), NegBinomial::new(2.5, 1.0)] {
             let pm = nb.pmf_many(&ks);
             for (i, &k) in ks.iter().enumerate() {
-                assert_eq!(pm[i], nb.pmf(k), "pmf_many != pmf at k={k}");
+                assert_eq!(pm[i], nb.pmf(k as i64), "pmf_many != pmf at k={k}");
             }
         }
     }
@@ -79599,11 +79878,11 @@ mod tests {
             let cm = nb.cdf_many(&ks);
             let sm = nb.sf_many(&ks);
             for (i, &k) in ks.iter().enumerate() {
-                let wc = nb.cdf(k);
+                let wc = nb.cdf(k as i64);
                 if wc > 1e-13 {
                     assert!((cm[i] - wc).abs() < 1e-9, "cdf_many n={} k={k}", nb.n);
                 }
-                let ws = nb.sf(k);
+                let ws = nb.sf(k as i64);
                 if ws > 1e-13 {
                     assert!((sm[i] - ws).abs() < 1e-9, "sf_many n={} k={k}", nb.n);
                 }
@@ -79652,8 +79931,8 @@ mod tests {
         let pm = h.pmf_many(&ks);
         let lpm = h.logpmf_many(&ks);
         for (i, &k) in ks.iter().enumerate() {
-            assert_eq!(pm[i], h.pmf(k), "pmf_many != pmf at k={k}");
-            assert_eq!(lpm[i], h.logpmf(k), "logpmf_many != logpmf at k={k}");
+            assert_eq!(pm[i], h.pmf(k as i64), "pmf_many != pmf at k={k}");
+            assert_eq!(lpm[i], h.logpmf(k as i64), "logpmf_many != logpmf at k={k}");
         }
     }
 
@@ -79720,7 +79999,7 @@ mod tests {
         assert!(fitted_gen.big_m >= fitted_gen.big_n);
 
         // Trait try_fit
-        let try_fitted = Hypergeometric::try_fit(&samples).unwrap();
+        let try_fitted = Hypergeometric::try_fit(&signed_variates(samples.clone())).unwrap();
         assert_eq!(try_fitted.big_m, fitted_gen.big_m);
 
         // Error cases
@@ -79752,7 +80031,7 @@ mod tests {
             let ks: Vec<u64> = (0..=15).collect();
             let lpm = p.logpmf_many(&ks);
             for (i, &k) in ks.iter().enumerate() {
-                assert_eq!(lpm[i], p.logpmf(k), "logpmf_many != logpmf at k={k}");
+                assert_eq!(lpm[i], p.logpmf(k as i64), "logpmf_many != logpmf at k={k}");
             }
         }
     }
@@ -79788,7 +80067,7 @@ mod tests {
                 let ks: Vec<u64> = (0..=hi).collect();
                 let sm = p.sf_many(&ks);
                 for (i, &k) in ks.iter().enumerate() {
-                    let want = p.sf(k);
+                    let want = p.sf(k as i64);
                     if want > 1e-13 {
                         assert!(
                             (sm[i] - want).abs() < 1e-9,
@@ -79863,7 +80142,7 @@ mod tests {
             let ks: Vec<u64> = (0..=(b.n + 2)).collect();
             let sm = b.sf_many(&ks);
             for (i, &k) in ks.iter().enumerate() {
-                let want = b.sf(k);
+                let want = b.sf(k as i64);
                 if want > 1e-13 {
                     assert!(
                         (sm[i] - want).abs() < 1e-9,
@@ -79928,7 +80207,7 @@ mod tests {
         let mut rng2 = StdRng::seed_from_u64(99);
         let d_samples = p_small.rvs(10, &mut rng2);
         assert_eq!(d_samples.len(), 10);
-        let fitted_trait = Poisson::try_fit(&samples_small);
+        let fitted_trait = Poisson::try_fit(&signed_variates(samples_small.clone()));
         assert!(fitted_trait.is_ok());
     }
 
@@ -79970,9 +80249,9 @@ mod tests {
         for &(q, want) in &cases {
             let x = dist.ppf(q);
             assert_close(x, want, 1e-12, &format!("LogSeries ppf({q})"));
-            assert!(dist.cdf(x as u64) >= q, "cdf(ppf({q}))");
+            assert!(dist.cdf(x as i64) >= q, "cdf(ppf({q}))");
             if x > 1.0 {
-                assert!(dist.cdf(x as u64 - 1) < q, "ppf minimality at {q}");
+                assert!(dist.cdf(x as i64 - 1) < q, "ppf minimality at {q}");
             }
         }
     }
@@ -88462,7 +88741,7 @@ mod tests {
             (
                 1.0_f64,
                 5u32,
-                0u64,
+                0_i64,
                 0.636_408_646_558_830_8,
                 0.636_408_646_558_830_8,
             ),
@@ -88483,19 +88762,19 @@ mod tests {
         // /porting-to-rust [frankenscipy-nvrxh]: pmf normalisation.
         for &(lam, n) in &[(0.5_f64, 10u32), (1.0, 5), (2.0, 3), (0.1, 20), (3.0, 8)] {
             let dist = Boltzmann::new(lam, n);
-            let total: f64 = (0..n as u64).map(|k| dist.pmf(k)).sum();
+            let total: f64 = (0..i64::from(n)).map(|k| dist.pmf(k)).sum();
             assert!(
                 (total - 1.0).abs() < 1e-12,
                 "Boltzmann(λ={lam}, N={n}).pmf sums to {total}, want 1"
             );
             // cdf(N-1) = 1 exactly (by construction of Z).
             assert!(
-                (dist.cdf((n - 1) as u64) - 1.0).abs() < 1e-12,
+                (dist.cdf(i64::from(n) - 1) - 1.0).abs() < 1e-12,
                 "Boltzmann(λ={lam}, N={n}).cdf(N-1) = {}, want 1",
-                dist.cdf((n - 1) as u64)
+                dist.cdf(i64::from(n) - 1)
             );
             // pmf = 0 outside support.
-            assert_eq!(dist.pmf(n as u64), 0.0);
+            assert_eq!(dist.pmf(i64::from(n)), 0.0);
         }
     }
 
@@ -88518,7 +88797,7 @@ mod tests {
             (
                 2.0_f64,
                 5u32,
-                1u64,
+                1_i64,
                 0.683_241_601_821_977_6,
                 0.683_241_601_821_977_6,
             ),
@@ -88570,7 +88849,7 @@ mod tests {
                     n as u64,
                     n as u64 + 5,
                 ] {
-                    let got = d.cdf(k);
+                    let got = d.cdf(k as i64);
                     let want = sum_cdf(a, n, k);
                     assert!(
                         (got - want).abs() <= 1e-11 + 1e-11 * want.abs(),
@@ -88579,7 +88858,7 @@ mod tests {
                 }
                 // Monotone non-decreasing + bounded.
                 let mut prev = 0.0;
-                for k in 0..=(n as u64 + 2) {
+                for k in 0..=(i64::from(n) + 2) {
                     let c = d.cdf(k);
                     assert!(
                         (0.0..=1.0).contains(&c) && c >= prev - 1e-12,
@@ -88588,7 +88867,7 @@ mod tests {
                     prev = c;
                 }
                 assert!(
-                    (d.cdf(n as u64) - 1.0).abs() <= 1e-12,
+                    (d.cdf(i64::from(n)) - 1.0).abs() <= 1e-12,
                     "cdf(n)=1 a={a} n={n}"
                 );
             }
@@ -88608,18 +88887,18 @@ mod tests {
         // and cdf(n) = 1 across the support.
         for &(a, n) in &[(1.5_f64, 5u32), (2.0, 10), (3.0, 20), (1.1, 50), (5.0, 4)] {
             let dist = Zipfian::new(a, n);
-            let total: f64 = (1..=n as u64).map(|k| dist.pmf(k)).sum();
+            let total: f64 = (1..=i64::from(n)).map(|k| dist.pmf(k)).sum();
             assert!(
                 (total - 1.0).abs() < 1e-12,
                 "Zipfian(a={a}, n={n}).pmf sums to {total}, want 1"
             );
             assert!(
-                (dist.cdf(n as u64) - 1.0).abs() < 1e-12,
+                (dist.cdf(i64::from(n)) - 1.0).abs() < 1e-12,
                 "Zipfian(a={a}, n={n}).cdf(n) = {}, want 1",
-                dist.cdf(n as u64)
+                dist.cdf(i64::from(n))
             );
             assert_eq!(dist.pmf(0), 0.0);
-            assert_eq!(dist.pmf((n as u64) + 1), 0.0);
+            assert_eq!(dist.pmf(i64::from(n) + 1), 0.0);
         }
     }
 
@@ -88678,7 +88957,7 @@ mod tests {
         let cases = [
             (
                 2.0_f64,
-                1u64,
+                1_i64,
                 0.666_666_666_666_666_6,
                 0.666_666_666_666_666_7,
             ),
@@ -88782,7 +89061,7 @@ mod tests {
         // /porting-to-rust [frankenscipy-1obtd]: pmf(k) = cdf(k) - cdf(k-1).
         for &alpha in &[1.5_f64, 2.5, 3.0, 5.0, 10.0] {
             let dist = YuleSimon::new(alpha);
-            for k in 1..=10u64 {
+            for k in 1..=10_i64 {
                 let prev = if k == 1 { 0.0 } else { dist.cdf(k - 1) };
                 let diff = dist.cdf(k) - prev;
                 assert!(
@@ -88810,7 +89089,7 @@ mod tests {
         let cases = [
             (
                 1.0_f64,
-                0u64,
+                0_i64,
                 0.632_120_558_828_557_7,
                 0.632_120_558_828_557_7,
             ),
@@ -88872,7 +89151,7 @@ mod tests {
         for &lam in &[1.0_f64, 1.5, 2.0, 3.0] {
             let pl = Planck::new(lam);
             let bo = Boltzmann::new(lam, 50);
-            for k in 0..6u64 {
+            for k in 0..6_i64 {
                 assert!(
                     (pl.pmf(k) - bo.pmf(k)).abs() < 1e-12,
                     "Planck.pmf({k}; λ={lam}) ≠ Boltzmann.pmf({k}; λ={lam}, N=50)"
@@ -88896,7 +89175,7 @@ mod tests {
         let lam = 1.5_f64;
         let p = -(-lam).exp_m1();
         let large = Boltzmann::new(lam, 100);
-        for k in 0..6u64 {
+        for k in 0..6_i64 {
             let want = p * (-lam * k as f64).exp();
             assert!(
                 (large.pmf(k) - want).abs() < 1e-12,
@@ -90436,7 +90715,7 @@ mod tests {
         let dist = LogSeries::new(0.5);
         let log_half = (0.5_f64).ln();
         for &(k, expected) in &[
-            (1u64, -0.5 / log_half),
+            (1_i64, -0.5 / log_half),
             (2, -0.25 / (2.0 * log_half)),
             (3, -0.125 / (3.0 * log_half)),
         ] {
@@ -90447,7 +90726,7 @@ mod tests {
             );
         }
         // pmf(0) = 0 (out of support)
-        assert_eq!(dist.pmf(0u64), 0.0);
+        assert_eq!(dist.pmf(0), 0.0);
     }
 
     #[test]
@@ -90455,7 +90734,7 @@ mod tests {
         // The PMF sums to 1 by construction; cdf at large k should
         // be very close to 1.
         let dist = LogSeries::new(0.7);
-        let tail = dist.cdf(200u64);
+        let tail = dist.cdf(200);
         assert!(
             (tail - 1.0).abs() < 1e-9,
             "logser cdf(200; 0.7) = {tail}, expected ≈ 1"
@@ -96729,8 +97008,8 @@ mod tests {
         let pm = bb.pmf_many(&ks);
         let lpm = bb.logpmf_many(&ks);
         for (i, &k) in ks.iter().enumerate() {
-            assert_eq!(pm[i], bb.pmf(k), "pmf_many != pmf at k={k}");
-            assert_eq!(lpm[i], bb.logpmf(k), "logpmf_many != logpmf at k={k}");
+            assert_eq!(pm[i], bb.pmf(k as i64), "pmf_many != pmf at k={k}");
+            assert_eq!(lpm[i], bb.logpmf(k as i64), "logpmf_many != logpmf at k={k}");
         }
     }
 
@@ -96756,7 +97035,7 @@ mod tests {
         // n, and a deep tail — exactly where the recurrence must stay accurate.
         let bb = BetaBinomial::new(20, 2.0, 3.0);
         for (k, want) in [
-            (0u64, 2.173_913_043_478e-2_f64),
+            (0_i64, 2.173_913_043_478e-2_f64),
             (2, 1.149_068_322_981e-1),
             (10, 7.049_689_440_994e-1),
             (19, 9.980_237_154_150e-1),
@@ -96831,7 +97110,7 @@ mod tests {
         // beta_negative_binomial_pmf_cdf_match_scipy test only pins cdf(3)).
         // Golden values from scipy.stats.betanbinom(n,a,b).cdf(k) 1.17.1.
         for (k, n, a, b, want) in [
-            (0u64, 4u64, 5.0_f64, 3.0_f64, 2.121_212_121_212e-1_f64),
+            (0_i64, 4u64, 5.0_f64, 3.0_f64, 2.121_212_121_212e-1_f64),
             (10, 4, 5.0, 3.0, 9.592_363_261_094e-1),
             (50, 2, 3.0, 2.0, 9.994_309_673_555e-1),
             (100, 1, 2.0, 3.0, 9.989_010_989_011e-1),
@@ -96855,7 +97134,7 @@ mod tests {
         BETANBINOM_CDF_MANY_DISABLE.store(false, Ordering::Relaxed);
         let got = d.cdf_many(&ks);
         for (i, &k) in ks.iter().enumerate() {
-            assert_eq!(got[i].to_bits(), d.cdf(k).to_bits(), "cdf_many({k})");
+            assert_eq!(got[i].to_bits(), d.cdf(k as i64).to_bits(), "cdf_many({k})");
         }
 
         BETANBINOM_CDF_MANY_DISABLE.store(true, Ordering::Relaxed);
@@ -97195,7 +97474,7 @@ mod tests {
     fn discrete_pmfs_sum_to_one() {
         // Discrete analog of the pdf-normalization guard: each pmf must sum to
         // ~1 over its support. Upper bounds validated against scipy.
-        fn sum_pmf<D: DiscreteDistribution>(d: &D, n: u64) -> f64 {
+        fn sum_pmf<D: DiscreteDistribution>(d: &D, n: i64) -> f64 {
             (0..=n).map(|k| d.pmf(k)).sum()
         }
         let check = |name: &str, s: f64| {
@@ -97701,7 +97980,7 @@ mod tests {
         assert!(fitted_gen.r <= fitted_gen.big_m - fitted_gen.n);
 
         // Trait try_fit
-        let try_fitted = NegHypergeometric::try_fit(&samples).unwrap();
+        let try_fitted = NegHypergeometric::try_fit(&signed_variates(samples.clone())).unwrap();
         assert_eq!(try_fitted.big_m, fitted_gen.big_m);
 
         // Error cases
@@ -97742,7 +98021,7 @@ mod tests {
         // Regression: Skellam.cdf summed only pmf(0..=k) → P(0≤X≤k), missing the
         // negative-support mass (scipy.skellam.cdf(k) = P(X≤k)). Golden values
         // from scipy.stats.skellam(mu1, mu2).cdf(k).
-        let cases: &[(f64, f64, u64, f64)] = &[
+        let cases: &[(f64, f64, i64, f64)] = &[
             (3.0, 2.0, 0, 0.414_710_59),
             (3.0, 2.0, 2, 0.757_805_09),
             (1.0, 4.0, 0, 0.952_770_30),
@@ -97757,6 +98036,109 @@ mod tests {
                 "skellam({mu1},{mu2}).cdf({k}) = {c} vs scipy {golden}"
             );
         }
+    }
+
+    /// frankenscipy-szq1n.8: the trait is on the signed integers, as SciPy's discrete
+    /// distributions are. Every value below is live SciPy 1.17.1 (`skellam(2, 3)`,
+    /// `dlaplace(0.8)`, `poisson(3)`).
+    #[test]
+    fn discrete_trait_reaches_negative_support_like_scipy() {
+        fn close(got: f64, want: f64, what: &str) {
+            assert!(
+                (got - want).abs() <= 1e-12 * want.abs().max(1e-300) + 1e-15,
+                "{what}: {got} vs scipy {want}"
+            );
+        }
+        let sk = Skellam::new(2.0, 3.0);
+        assert_eq!(
+            DiscreteDistribution::support(&sk),
+            (f64::NEG_INFINITY, f64::INFINITY)
+        );
+        for &(k, pmf, cdf, sf, logpmf) in &[
+            (-5_i64, 0.034873900830553264, 0.05932010895599637, 0.9406798910440036, -3.356016556740782),
+            (-3, 0.11446386011704218, 0.24219491374554375, 0.7578050862544563, -2.167496137975729),
+            (-1, 0.1830233444549473, 0.5852894147658702, 0.41471058523412985, -1.6981415689488997),
+            (0, 0.1677218858619017, 0.7530113006277718, 0.24698869937222823, -1.7854481126341462),
+            (2, 0.0711427362512795, 0.9461695998490165, 0.053830400150983504, -2.6430670502934452),
+        ] {
+            close(DiscreteDistribution::pmf(&sk, k), pmf, &format!("skellam pmf({k})"));
+            close(DiscreteDistribution::cdf(&sk, k), cdf, &format!("skellam cdf({k})"));
+            close(DiscreteDistribution::sf(&sk, k), sf, &format!("skellam sf({k})"));
+            close(DiscreteDistribution::logpmf(&sk, k), logpmf, &format!("skellam logpmf({k})"));
+        }
+        for &(q, ppf, isf) in &[
+            (0.01, -6.0, 4.0),
+            (0.25, -2.0, 0.0),
+            (0.5, -1.0, -1.0),
+            (0.75, 0.0, -2.0),
+            (0.99, 4.0, -6.0),
+        ] {
+            assert_eq!(DiscreteDistribution::ppf(&sk, q), ppf, "skellam ppf({q})");
+            assert_eq!(DiscreteDistribution::isf(&sk, q), isf, "skellam isf({q})");
+        }
+        assert_eq!(DiscreteDistribution::ppf(&sk, 0.0), f64::NEG_INFINITY);
+        assert_eq!(DiscreteDistribution::ppf(&sk, 1.0), f64::INFINITY);
+
+        let dl = DiscreteLaplace::new(0.8);
+        for &(k, pmf, cdf, sf) in &[
+            (-4_i64, 0.015487557100816042, 0.028124880539591116, 0.9718751194604088),
+            (-1, 0.1707220736275535, 0.31002551887238755, 0.6899744811276125),
+            (0, 0.3799489622552249, 0.6899744811276125, 0.3100255188723875),
+            (3, 0.03446819221023023, 0.9718751194604088, 0.02812488053959117),
+        ] {
+            close(DiscreteDistribution::pmf(&dl, k), pmf, &format!("dlaplace pmf({k})"));
+            close(DiscreteDistribution::cdf(&dl, k), cdf, &format!("dlaplace cdf({k})"));
+            // SciPy's dlaplace.sf is the generic 1 − cdf, so compare to its rounding.
+            assert!(
+                (DiscreteDistribution::sf(&dl, k) - sf).abs() <= 1e-15,
+                "dlaplace sf({k})"
+            );
+        }
+        for &(q, ppf, isf) in &[
+            (0.01, -5.0, 5.0),
+            (0.25, -1.0, 1.0),
+            (0.5, 0.0, 0.0),
+            (0.75, 1.0, -1.0),
+            (0.99, 5.0, -5.0),
+        ] {
+            assert_eq!(DiscreteDistribution::ppf(&dl, q), ppf, "dlaplace ppf({q})");
+            assert_eq!(DiscreteDistribution::isf(&dl, q), isf, "dlaplace isf({q})");
+        }
+
+        // The negative case the u64 trait failed: its rvs cast −1 to 18446744073709551615, so
+        // the mean of these draws was ~1e18.
+        let mut rng = StdRng::seed_from_u64(20260924);
+        let draws = <Skellam as DiscreteDistribution>::rvs(&sk, 100_000, &mut rng);
+        let mean = draws.iter().map(|&x| x as f64).sum::<f64>() / draws.len() as f64;
+        assert!((mean + 1.0).abs() < 0.02, "skellam(2,3) sample mean {mean}");
+        assert!(draws.iter().any(|&x| x < 0), "no negative draw");
+        let mut rng = StdRng::seed_from_u64(7);
+        let draws = <DiscreteLaplace as DiscreteDistribution>::rvs(&dl, 50_000, &mut rng);
+        assert!(draws.iter().any(|&x| x < 0) && draws.iter().any(|&x| x > 0));
+        // try_fit takes the signed draws back.
+        let fitted = <Skellam as DiscreteDistribution>::try_fit(&draws).expect("skellam fit");
+        assert!(fitted.mu1 > 0.0 && fitted.mu2 > 0.0);
+
+        // A family supported on k >= 0 answers below its support as SciPy does, and its fit
+        // refuses a negative observation instead of wrapping it.
+        let p = Poisson::new(3.0);
+        assert_eq!(DiscreteDistribution::support(&p), (0.0, f64::INFINITY));
+        assert_eq!(DiscreteDistribution::pmf(&p, -1), 0.0);
+        assert_eq!(DiscreteDistribution::cdf(&p, -1), 0.0);
+        assert_eq!(DiscreteDistribution::sf(&p, -1), 1.0);
+        assert_eq!(DiscreteDistribution::logpmf(&p, -1), f64::NEG_INFINITY);
+        assert_eq!(DiscreteDistribution::logcdf(&p, -1), f64::NEG_INFINITY);
+        assert_eq!(DiscreteDistribution::logsf(&p, -1), 0.0);
+        assert!(matches!(
+            <Poisson as DiscreteDistribution>::try_fit(&[1, 2, -3]),
+            Err(FitError::UnsupportedData(_))
+        ));
+        // Finite supports as SciPy reports them.
+        assert_eq!(Binomial::new(7, 0.3).support(), (0.0, 7.0));
+        assert_eq!(Hypergeometric::new(20, 15, 12).support(), (7.0, 12.0));
+        assert_eq!(Boltzmann::new(1.4, 19).support(), (0.0, 18.0));
+        assert_eq!(Geometric::new(0.3).support(), (1.0, f64::INFINITY));
+        assert_eq!(Zipfian::new(1.2, 10).support(), (1.0, 10.0));
     }
 
     #[test]
@@ -97814,7 +98196,7 @@ mod tests {
         let d = NegHypergeometric::new(20, 7, 3);
         assert!((d.mean() - 1.5).abs() < 1e-12, "mean = {}", d.mean());
         assert!((d.var() - 1.65).abs() < 1e-12, "var = {}", d.var());
-        let pmf_ref: &[(u64, f64)] = &[
+        let pmf_ref: &[(i64, f64)] = &[
             (0, 0.250_877_192_982_456_1),
             (1, 0.309_907_120_743_034_1),
             (2, 0.232_430_340_557_275_4),

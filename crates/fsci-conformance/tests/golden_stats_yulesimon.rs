@@ -53,8 +53,8 @@ fn golden_stats_yulesimon() {
 
     for case in &table.points {
         let dist = YuleSimon::new(case.alpha);
-        let pmf_diff = (dist.pmf(case.k) - case.pmf).abs();
-        let cdf_diff = (dist.cdf(case.k) - case.cdf).abs();
+        let pmf_diff = (dist.pmf(case.k as i64) - case.pmf).abs();
+        let cdf_diff = (dist.cdf(case.k as i64) - case.cdf).abs();
         max_pmf = max_pmf.max(pmf_diff);
         max_cdf = max_cdf.max(cdf_diff);
         assert!(

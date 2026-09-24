@@ -13,7 +13,7 @@ fn main() {
     }
     for &(m1, m2) in &[(8.0, 5.0), (20.0, 3.0), (2.0, 2.0)] {
         let d = Skellam::new(m1, m2);
-        for &k in &[0u64, 5, 50, 100, 267, 500] {
+        for &k in &[0_i64, 5, 50, 100, 267, 500] {
             println!("skellam,{m1},{m2},{k},{:.17e}", d.logpmf(k));
         }
     }

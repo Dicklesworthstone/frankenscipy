@@ -204,7 +204,7 @@ fn diff_stats_geom() {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
         let dist = Geometric::new(case.p);
         if let Some(spmf) = oracle.pmf {
-            let d = (dist.pmf(case.k) - spmf).abs();
+            let d = (dist.pmf(case.k as i64) - spmf).abs();
             max_overall = max_overall.max(d);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
@@ -214,7 +214,7 @@ fn diff_stats_geom() {
             });
         }
         if let Some(scdf) = oracle.cdf {
-            let d = (dist.cdf(case.k) - scdf).abs();
+            let d = (dist.cdf(case.k as i64) - scdf).abs();
             max_overall = max_overall.max(d);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),

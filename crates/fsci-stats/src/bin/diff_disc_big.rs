@@ -1,5 +1,5 @@
 use fsci_stats::*;
-fn em<D: DiscreteDistribution>(label: &str, d: &D, ks: &[u64]) {
+fn em<D: DiscreteDistribution>(label: &str, d: &D, ks: &[i64]) {
     println!("{label},mean,0,{:.16e}", d.mean());
     println!("{label},var,0,{:.16e}", d.var());
     println!("{label},skew,0,{:.16e}", d.skewness());

@@ -1,6 +1,6 @@
 //! discrete sf/logsf/logcdf right-tail probe vs scipy (gitignored).
 use fsci_stats::*;
-fn emit<D: DiscreteDistribution>(label: &str, d: &D, ks: &[u64]) {
+fn emit<D: DiscreteDistribution>(label: &str, d: &D, ks: &[i64]) {
     for &k in ks {
         println!("{label},sf,{k},{:.17e}", d.sf(k));
         println!("{label},logsf,{k},{:.17e}", d.logsf(k));

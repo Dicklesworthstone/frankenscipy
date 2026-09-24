@@ -5,7 +5,7 @@ fn emit<D: DiscreteDistribution>(label: &str, d: &D) {
     println!("{label},skew,{:.17e}", d.skewness());
     println!("{label},kurt,{:.17e}", d.kurtosis());
     println!("{label},entropy,{:.17e}", d.entropy());
-    for k in [0u64, 1, 2, 3, 5, 10] {
+    for k in [0_i64, 1, 2, 3, 5, 10] {
         println!("{label},pmf{k},{:.17e}", d.pmf(k));
         println!("{label},cdf{k},{:.17e}", d.cdf(k));
     }

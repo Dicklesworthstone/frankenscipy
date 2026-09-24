@@ -303,7 +303,7 @@ fn mr_binomial_pmf_sums_to_one() {
     for &n in &[1_u64, 5, 10, 25, 50] {
         for &p in &[0.1_f64, 0.5, 0.9] {
             let d = Binomial::new(n, p);
-            let sum: f64 = (0..=n).map(|k| d.pmf(k)).sum();
+            let sum: f64 = (0..=n as i64).map(|k| d.pmf(k)).sum();
             assert_close(sum, 1.0, &format!("MR11 Binomial n={n}, p={p}"));
         }
     }
