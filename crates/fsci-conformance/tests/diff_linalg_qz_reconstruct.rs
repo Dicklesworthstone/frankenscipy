@@ -153,18 +153,36 @@ fn fixtures() -> Vec<(String, Vec<Vec<f64>>, Vec<Vec<f64>>)> {
                 vec![0.0, 0.0, 0.0, 4.5],
             ],
         ),
+        (
+            // Rank-deficient B (column 3 = column 1): an infinite eigenvalue. qz used to form
+            // A·B⁻¹ and reject this pencil (frankenscipy-szq1n.5).
+            "general_4x4_singular_b".into(),
+            vec![
+                vec![1.0_f64, -2.0, 0.5, 3.0],
+                vec![0.3, 4.0, -1.0, 0.2],
+                vec![2.0, 0.1, 1.5, -0.7],
+                vec![-1.2, 0.6, 0.8, 2.5],
+            ],
+            vec![
+                vec![1.0_f64, 0.4, 1.0, 0.0],
+                vec![0.5, 2.0, 0.5, 0.3],
+                vec![0.0, 0.7, 0.0, 1.0],
+                vec![0.2, 0.0, 0.2, 1.5],
+            ],
+        ),
     ]
 }
 
 #[test]
-fn diff_linalg_qz_reconstruct() {
+fn diff_linalg_qz_reconstruct() -> Result<(), String> {
     let opts = DecompOptions::default();
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
 
     for (label, a, b) in fixtures() {
-        let Ok(res) = qz(&a, &b, opts) else { continue };
+        // A failed call is a failed case, never a skipped one.
+        let res = qz(&a, &b, opts).map_err(|e| format!("qz {label} failed: {e:?}"))?;
 
         // Qᵀ A Z ≈ AA
         let qt = transpose(&res.q);
@@ -241,4 +259,5 @@ fn diff_linalg_qz_reconstruct() {
         diffs.len(),
         max_overall
     );
+    Ok(())
 }

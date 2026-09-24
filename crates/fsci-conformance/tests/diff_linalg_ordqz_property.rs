@@ -3,17 +3,19 @@
 //!
 //! Resolves [frankenscipy-x1rjd]. ordqz returns (Q, Z, AA, BB) such
 //! that Qᵀ A Z = AA, Qᵀ B Z = BB, Q and Z orthogonal, and the
-//! generalized eigenvalues are ordered with stable first.
+//! generalized eigenvalues are ordered with the selected ones first.
 //!
-//! Narrowed to B = identity: fsci's ordqz permutation breaks the
-//! Qᵀ A Z = AA relation for non-identity diagonal B (defect
-//! frankenscipy-ijt72; Frobenius diff up to 0.91 abs).
+//! ordqz used to reorder by PERMUTING rows and columns of AA and BB, which keeps the
+//! relations but not the (quasi-)triangular form once B or the Schur form has
+//! off-diagonal entries (frankenscipy-szq1n.5). The dense-B, singular-B and
+//! complex-pair probes exercise exactly that, and every case checks the structure
+//! and the ordering, not only the relations.
 //!
 //! Property tests:
-//! - ||Qᵀ A Z − AA||_F < 1e-9
-//! - ||Qᵀ B Z − BB||_F < 1e-9
-//! - ||QᵀQ − I||_F < 1e-9
-//! - ||ZᵀZ − I||_F < 1e-9
+//! - max |Qᵀ A Z − AA| < 1e-9, max |Qᵀ B Z − BB| < 1e-9
+//! - max |QᵀQ − I| < 1e-9, max |ZᵀZ − I| < 1e-9
+//! - BB upper triangular, AA quasi-upper-triangular (exact zeros)
+//! - no selected diagonal block follows an unselected one
 
 use std::fs;
 use std::path::PathBuf;
@@ -33,6 +35,8 @@ struct CaseDiff {
     case_id: String,
     sort: String,
     abs_diff: f64,
+    schur_form: bool,
+    selected_first: bool,
     pass: bool,
 }
 
@@ -100,6 +104,59 @@ fn frob_diff(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
     max
 }
 
+/// BB upper triangular and AA quasi-upper-triangular with non-overlapping 2×2 blocks.
+fn is_generalized_schur_form(aa: &[Vec<f64>], bb: &[Vec<f64>]) -> bool {
+    let n = aa.len();
+    let triangular =
+        (0..n).all(|i| (0..i).all(|j| bb[i][j] == 0.0 && (i <= j + 1 || aa[i][j] == 0.0)));
+    let blocks_disjoint =
+        (1..n.saturating_sub(1)).all(|i| aa[i][i - 1] == 0.0 || aa[i + 1][i] == 0.0);
+    triangular && blocks_disjoint
+}
+
+/// Does `sort` select the diagonal block at `start`? A 2×2 block carries a complex pair and a
+/// diagonal BB block; `lhp` tests its real part, `iuc` its modulus (scipy `_lhp` / `_iuc`).
+fn block_selected(
+    aa: &[Vec<f64>],
+    bb: &[Vec<f64>],
+    start: usize,
+    size: usize,
+    sort: OrdQzSort,
+) -> bool {
+    let (re, modulus) = if size == 1 {
+        if bb[start][start] == 0.0 {
+            return false;
+        }
+        let lambda = aa[start][start] / bb[start][start];
+        (lambda, lambda.abs())
+    } else {
+        let (b1, b2) = (bb[start][start], bb[start + 1][start + 1]);
+        let (m11, m12) = (aa[start][start] / b1, aa[start][start + 1] / b1);
+        let (m21, m22) = (aa[start + 1][start] / b2, aa[start + 1][start + 1] / b2);
+        (0.5 * (m11 + m22), (m11 * m22 - m12 * m21).sqrt())
+    };
+    match sort {
+        OrdQzSort::LeftHalfPlane => re < 0.0,
+        OrdQzSort::InsideUnitCircle => modulus < 1.0,
+    }
+}
+
+fn selected_first(aa: &[Vec<f64>], bb: &[Vec<f64>], sort: OrdQzSort) -> bool {
+    let n = aa.len();
+    let mut flags = Vec::new();
+    let mut j = 0;
+    while j < n {
+        let size = if j + 1 < n && aa[j + 1][j] != 0.0 {
+            2
+        } else {
+            1
+        };
+        flags.push(block_selected(aa, bb, j, size, sort));
+        j += size;
+    }
+    flags.windows(2).all(|w| w[0] || !w[1])
+}
+
 fn ident(n: usize) -> Vec<Vec<f64>> {
     (0..n)
         .map(|i| (0..n).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
@@ -107,16 +164,55 @@ fn ident(n: usize) -> Vec<Vec<f64>> {
 }
 
 #[test]
-fn diff_linalg_ordqz_property() {
+fn diff_linalg_ordqz_property() -> Result<(), String> {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let mut max_overall = 0.0_f64;
     let opts = DecompOptions::default();
 
-    // The reordering permutation P acts as Q→QP, Z→ZP, AA→PᵀAA P, so
-    // QᵀAZ=AA is preserved for any regular B (frankenscipy-ijt72) — both
-    // identity and non-identity diagonal B are exercised.
     let probes: &[OrdqzProbe] = &[
+        (
+            // Eigenvalues 2, 0.25, -3 in that order: both sorts must move a block.
+            "triangular_3x3_Bdense",
+            vec![
+                vec![2.0, 1.0, 1.0],
+                vec![0.0, 0.25, 1.0],
+                vec![0.0, 0.0, -3.0],
+            ],
+            vec![
+                vec![1.0, 1.0, 0.5],
+                vec![0.0, 1.0, 1.0],
+                vec![0.0, 0.0, 1.0],
+            ],
+        ),
+        (
+            // Rank-deficient B: one infinite eigenvalue, never selected.
+            "general_3x3_Bsingular",
+            vec![
+                vec![1.0, 2.0, 0.5],
+                vec![3.0, 4.0, -1.0],
+                vec![0.5, -2.0, 0.25],
+            ],
+            vec![
+                vec![1.0, 0.5, 1.0],
+                vec![0.0, 2.0, 0.0],
+                vec![0.5, 1.0, 0.5],
+            ],
+        ),
+        (
+            // Eigenvalues 3 and -1 ± 2i: lhp moves the complex pair as one 2x2 block.
+            "complex_pair_3x3_Bid",
+            vec![
+                vec![3.0, 1.0, 2.0],
+                vec![0.0, -1.0, 2.0],
+                vec![0.0, -2.0, -1.0],
+            ],
+            vec![
+                vec![1.0, 0.0, 0.0],
+                vec![0.0, 1.0, 0.0],
+                vec![0.0, 0.0, 1.0],
+            ],
+        ),
         (
             "sym_pd_3x3_Bid",
             vec![
@@ -206,33 +302,29 @@ fn diff_linalg_ordqz_property() {
             (OrdQzSort::LeftHalfPlane, "lhp"),
             (OrdQzSort::InsideUnitCircle, "iuc"),
         ] {
-            let Ok(r) = ordqz(a, b, sort, opts) else {
-                continue;
-            };
+            // A failed call is a failed case, never a skipped one.
+            let r = ordqz(a, b, sort, opts)
+                .map_err(|e| format!("ordqz {label} {sort_label} failed: {e:?}"))?;
+            let product = |x: &[Vec<f64>], y: &[Vec<f64>]| matmul(x, y).expect("square product");
             let qt = transpose(&r.q);
-            let Ok(qta) = matmul(&qt, a) else { continue };
-            let Ok(qtaz) = matmul(&qta, &r.z) else {
-                continue;
-            };
-            let Ok(qtb) = matmul(&qt, b) else { continue };
-            let Ok(qtbz) = matmul(&qtb, &r.z) else {
-                continue;
-            };
+            let qtaz = product(&product(&qt, a), &r.z);
+            let qtbz = product(&product(&qt, b), &r.z);
             let d_aa = frob_diff(&qtaz, &r.aa);
             let d_bb = frob_diff(&qtbz, &r.bb);
             let n = r.q.len();
-            let Ok(qtq) = matmul(&qt, &r.q) else { continue };
-            let zt = transpose(&r.z);
-            let Ok(ztz) = matmul(&zt, &r.z) else { continue };
-            let d_q_orth = frob_diff(&qtq, &ident(n));
-            let d_z_orth = frob_diff(&ztz, &ident(n));
+            let d_q_orth = frob_diff(&product(&qt, &r.q), &ident(n));
+            let d_z_orth = frob_diff(&product(&transpose(&r.z), &r.z), &ident(n));
             let abs_d = d_aa.max(d_bb).max(d_q_orth).max(d_z_orth);
             max_overall = max_overall.max(abs_d);
+            let schur_form = is_generalized_schur_form(&r.aa, &r.bb);
+            let sorted = selected_first(&r.aa, &r.bb, sort);
             diffs.push(CaseDiff {
                 case_id: format!("ordqz_{label}_{sort_label}"),
                 sort: sort_label.into(),
                 abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
+                schur_form,
+                selected_first: sorted,
+                pass: abs_d <= ABS_TOL && schur_form && sorted,
             });
         }
     }
@@ -241,7 +333,7 @@ fn diff_linalg_ordqz_property() {
 
     let log = DiffLog {
         test_id: "diff_linalg_ordqz_property".into(),
-        category: "fsci_linalg::ordqz property test (QT A Z=AA, QT B Z=BB, Q/Z orthogonal)".into(),
+        category: "fsci_linalg::ordqz property test (QT A Z=AA, QT B Z=BB, Q/Z orthogonal, Schur form, selection first)".into(),
         case_count: diffs.len(),
         max_abs_diff: max_overall,
         pass: all_pass,
@@ -253,14 +345,23 @@ fn diff_linalg_ordqz_property() {
 
     for d in &diffs {
         if !d.pass {
-            eprintln!("ordqz mismatch: {} abs_diff={}", d.case_id, d.abs_diff);
+            eprintln!(
+                "ordqz mismatch: {} abs_diff={} schur_form={} selected_first={}",
+                d.case_id, d.abs_diff, d.schur_form, d.selected_first
+            );
         }
     }
 
+    assert_eq!(
+        diffs.len(),
+        2 * probes.len(),
+        "every probe and sort must be compared"
+    );
     assert!(
         all_pass,
         "ordqz conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
     );
+    Ok(())
 }

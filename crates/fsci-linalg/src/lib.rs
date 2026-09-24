@@ -70,11 +70,15 @@ mod panel_pool;
 // the public path). See cholesky_tiled.rs.
 mod cholesky_tiled;
 
+// Real QZ (Moler–Stewart, LAPACK dhgeqz-style deflation) and dtgsen-style reordering behind
+// `qz` / `ordqz` (frankenscipy-szq1n.5). See generalized_schur.rs.
+mod generalized_schur;
+
 pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
-    AuditAction, AuditEvent, AuditLedger, DecisionSignals, PolicyAction, PolicyController,
-    PolicyDecision, RuntimeMode, SolverAction, SolverEvidenceEntry, SolverPortfolio,
-    StructuralEvidence, casp_now_unix_ms,
+    AttemptOutcome, AuditAction, AuditEvent, AuditLedger, DecisionSignals, PolicyAction,
+    PolicyController, PolicyDecision, RuntimeMode, SolverAction, SolverEvidenceEntry,
+    SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
 };
 use std::{borrow::Cow, fmt, simd::Simd};
 
@@ -303,15 +307,17 @@ impl MatrixSizeCategory {
     }
 }
 
-/// LAPACK driver selection for least-squares problems.
+/// SciPy's `lapack_driver` for [`lstsq`]. All three compute the minimum-norm least-squares
+/// solution with the same fsci kernel; the driver selects SciPy's OUTPUT shape: `Gelsy` returns
+/// no singular values and empty residuals, as SciPy's gelsy does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LstsqDriver {
-    /// SVD with divide-and-conquer (default, most robust).
+    /// SciPy's default (SVD, divide and conquer): singular values and residuals returned.
     #[default]
     Gelsd,
-    /// QR with column pivoting (fastest for well-conditioned).
+    /// SciPy's complete-orthogonal-factorization driver: no singular values, empty residuals.
     Gelsy,
-    /// SVD (older, slower than Gelsd).
+    /// SciPy's plain-SVD driver: same outputs as `Gelsd`.
     Gelss,
 }
 
@@ -680,7 +686,7 @@ pub struct QzResult {
     pub bb: Vec<Vec<f64>>,
 }
 
-/// Ordering selector for the simplified real `ordqz` path.
+/// Ordering selector for `ordqz` (SciPy's `sort='lhp'` / `sort='iuc'`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrdQzSort {
     /// Stable generalized eigenvalues first for continuous-time systems:
@@ -808,7 +814,47 @@ impl std::fmt::Display for LinalgError {
 
 impl std::error::Error for LinalgError {}
 
+/// The matrix SciPy's `assume_a in {'sym', 'her', 'pos'}` routines actually see: LAPACK reads
+/// ONE triangle (`lower` picks it; upper by default) and ignores the other, so the result is
+/// that triangle mirrored. `None` for every other assumption, and for a ragged or non-square
+/// input, which the shape validation downstream reports. `lower` used to be accepted and never
+/// read, so a lower-only matrix was solved as if its zero upper triangle were data
+/// (frankenscipy-szq1n.12).
+fn triangle_selected_matrix(
+    a: &[Vec<f64>],
+    assume_a: Option<MatrixAssumption>,
+    lower: bool,
+) -> Option<Vec<Vec<f64>>> {
+    if !matches!(
+        assume_a,
+        Some(
+            MatrixAssumption::Symmetric
+                | MatrixAssumption::Hermitian
+                | MatrixAssumption::PositiveDefinite
+        )
+    ) {
+        return None;
+    }
+    let n = a.len();
+    if !a.iter().all(|row| row.len() == n) {
+        return None;
+    }
+    let mut full = a.to_vec();
+    for i in 0..n {
+        for j in 0..i {
+            if lower {
+                full[j][i] = a[i][j];
+            } else {
+                full[i][j] = a[j][i];
+            }
+        }
+    }
+    Some(full)
+}
+
 pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveResult, LinalgError> {
+    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
+    let a = mirrored.as_deref().unwrap_or(a);
     // Fast path for large general square systems: our own multithreaded blocked LU
     // (trailing update on all cores). Restricted to the plain Strict / untransposed /
     // General case so all the portfolio diagnostics (rcond, hardened checks, special
@@ -1050,6 +1096,8 @@ pub fn solve_banded_with_audit(
 }
 
 pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError> {
+    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
+    let a = mirrored.as_deref().unwrap_or(a);
     // Fast path for large general square matrices: factor once with the in-house
     // parallel blocked LU, then solve A X = I over the identity columns on all cores.
     // Restricted to the plain Strict / General case; a singular pivot or any unmet
@@ -1911,6 +1959,86 @@ fn dispatch_solve_action(
     }
 }
 
+/// Backward error above which an attempt that returned `Ok` still counts as a FAILED attempt:
+/// the portfolio records it as `Inaccurate` and the next action is tried. Same bar as the
+/// drift counter and the full-validation policy.
+const ATTEMPT_BACKWARD_ERROR_TOL: f64 = POLICY_FULL_VALIDATION_BACKWARD_ERROR_THRESHOLD;
+
+/// Try portfolio actions until one returns an accurate solution; returns the action that
+/// produced the result (or `selected_action` when every attempt errored).
+///
+/// frankenscipy-7tb8d.1: every attempt's outcome is fed back to the portfolio, and after a
+/// failed attempt the REMAINING actions are re-ranked under the updated posterior (the old
+/// loop walked an order fixed before the first attempt and learned nothing). An attempt that
+/// returns Ok with a backward error above [`ATTEMPT_BACKWARD_ERROR_TOL`] is a failed attempt
+/// too; it used to be accepted unexamined. If every applicable action is inaccurate, the most
+/// accurate result is still returned (SciPy returns a solution there, with a warning), and the
+/// full-validation policy downstream may still reject it.
+#[allow(clippy::too_many_arguments)]
+fn run_portfolio_attempts(
+    portfolio: &mut SolverPortfolio,
+    effective_a: &[Vec<f64>],
+    b: &[f64],
+    report: &ConditionReport,
+    matrix_cache: &mut Option<DMatrix<f64>>,
+    lu_cache: &mut Option<LU<f64, Dyn, Dyn>>,
+    selected_action: SolverAction,
+    posterior: [f64; 4],
+    expected_losses: [f64; 5],
+) -> (SolverAction, Result<SolveResult, LinalgError>) {
+    let applicable = candidate_actions(report.structural_evidence);
+    let rcond = report.rcond_estimate;
+    let mut tried: Vec<SolverAction> = Vec::with_capacity(applicable.len());
+    let mut last_error = None;
+    let mut accepted: Option<(SolverAction, SolveResult)> = None;
+    let mut least_inaccurate: Option<(SolverAction, SolveResult)> = None;
+    let mut action = selected_action;
+    loop {
+        tried.push(action);
+        match dispatch_solve_action(action, effective_a, b, report, matrix_cache, lu_cache) {
+            Ok(solve_result) => {
+                let omega = solve_result.backward_error.unwrap_or(0.0);
+                if omega <= ATTEMPT_BACKWARD_ERROR_TOL {
+                    portfolio.record_outcome(rcond, action, AttemptOutcome::Ok);
+                    accepted = Some((action, solve_result));
+                    break;
+                }
+                portfolio.record_outcome(rcond, action, AttemptOutcome::Inaccurate);
+                let improves = least_inaccurate
+                    .as_ref()
+                    .is_none_or(|(_, best)| omega < best.backward_error.unwrap_or(f64::INFINITY));
+                if improves {
+                    least_inaccurate = Some((action, solve_result));
+                }
+            }
+            Err(err) => {
+                portfolio.record_outcome(rcond, action, AttemptOutcome::Failed);
+                last_error = Some(err);
+            }
+        }
+        match portfolio.select_action_excluding(rcond, Some(report.structural_evidence), &tried) {
+            Some((next, ..)) if applicable.contains(&next) => action = next,
+            _ => break,
+        }
+    }
+    match accepted.or(least_inaccurate) {
+        Some((action, mut solve_result)) => {
+            solve_result.certificate = Some(build_solve_certificate(
+                report,
+                action,
+                posterior,
+                expected_losses,
+                action != selected_action,
+            ));
+            (action, Ok(solve_result))
+        }
+        None => (
+            selected_action,
+            Err(last_error.unwrap_or(LinalgError::SingularMatrix)),
+        ),
+    }
+}
+
 fn solve_with_portfolio_internal(
     a: &[Vec<f64>],
     b: &[f64],
@@ -1994,45 +2122,17 @@ fn solve_with_portfolio_internal(
     let (selected_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
 
-    let mut actions = candidate_actions(report.structural_evidence);
-    actions
-        .sort_by(|lhs, rhs| expected_losses[lhs.index()].total_cmp(&expected_losses[rhs.index()]));
-    if let Some(position) = actions.iter().position(|action| *action == selected_action) {
-        actions.swap(0, position);
-    }
-
-    let mut last_error = None;
-    let mut actual_action = selected_action;
-    let result = actions
-        .into_iter()
-        .find_map(|action| {
-            match dispatch_solve_action(
-                action,
-                &effective_a,
-                b,
-                &report,
-                &mut matrix_cache,
-                &mut lu_cache,
-            ) {
-                Ok(mut solve_result) => {
-                    let fallback_active = action != selected_action;
-                    solve_result.certificate = Some(build_solve_certificate(
-                        &report,
-                        action,
-                        posterior,
-                        expected_losses,
-                        fallback_active,
-                    ));
-                    actual_action = action;
-                    Some(Ok(solve_result))
-                }
-                Err(err) => {
-                    last_error = Some(err);
-                    None
-                }
-            }
-        })
-        .unwrap_or_else(|| Err(last_error.unwrap_or(LinalgError::SingularMatrix)));
+    let (actual_action, result) = run_portfolio_attempts(
+        portfolio,
+        &effective_a,
+        b,
+        &report,
+        &mut matrix_cache,
+        &mut lu_cache,
+        selected_action,
+        posterior,
+        expected_losses,
+    );
     let result = result.and_then(|solve_result| {
         enforce_policy_full_validation(policy_decision.as_ref(), &solve_result)?;
         Ok(solve_result)
@@ -2080,6 +2180,8 @@ pub fn solve_with_casp(
     options: SolveOptions,
     portfolio: &mut SolverPortfolio,
 ) -> Result<SolveResult, LinalgError> {
+    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
+    let a = mirrored.as_deref().unwrap_or(a);
     solve_with_portfolio_internal(a, b, options, portfolio, "solve_with_casp", true)
 }
 
@@ -2097,6 +2199,8 @@ pub fn solve_with_audit(
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<SolveResult, LinalgError> {
     let fingerprint = matrix_fingerprint(a);
+    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
+    let a = mirrored.as_deref().unwrap_or(a);
     let (rows, cols) = matrix_shape(a)?;
 
     // Validation with audit logging
@@ -2229,45 +2333,17 @@ pub fn solve_with_audit(
     let (selected_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
 
-    let mut actions = candidate_actions(report.structural_evidence);
-    actions
-        .sort_by(|lhs, rhs| expected_losses[lhs.index()].total_cmp(&expected_losses[rhs.index()]));
-    if let Some(position) = actions.iter().position(|action| *action == selected_action) {
-        actions.swap(0, position);
-    }
-
-    let mut last_error = None;
-    let mut actual_action = selected_action;
-    let result = actions
-        .into_iter()
-        .find_map(|action| {
-            match dispatch_solve_action(
-                action,
-                &effective_a,
-                b,
-                &report,
-                &mut matrix_cache,
-                &mut lu_cache,
-            ) {
-                Ok(mut solve_result) => {
-                    let fallback_active = action != selected_action;
-                    solve_result.certificate = Some(build_solve_certificate(
-                        &report,
-                        action,
-                        posterior,
-                        expected_losses,
-                        fallback_active,
-                    ));
-                    actual_action = action;
-                    Some(Ok(solve_result))
-                }
-                Err(err) => {
-                    last_error = Some(err);
-                    None
-                }
-            }
-        })
-        .unwrap_or_else(|| Err(last_error.unwrap_or(LinalgError::SingularMatrix)));
+    let (actual_action, result) = run_portfolio_attempts(
+        portfolio,
+        &effective_a,
+        b,
+        &report,
+        &mut matrix_cache,
+        &mut lu_cache,
+        selected_action,
+        posterior,
+        expected_losses,
+    );
     let result = result.and_then(|solve_result| {
         enforce_policy_full_validation(policy_decision.as_ref(), &solve_result)?;
         Ok(solve_result)
@@ -2344,6 +2420,8 @@ pub fn inv_with_casp(
     options: InvOptions,
     portfolio: &mut SolverPortfolio,
 ) -> Result<InvResult, LinalgError> {
+    let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
+    let a = mirrored.as_deref().unwrap_or(a);
     let (rows, cols) = matrix_shape(a)?;
     if rows != cols {
         return Err(LinalgError::ExpectedSquareMatrix);
@@ -2558,6 +2636,25 @@ fn dispatch_inv_action(
 /// Uses condition diagnostics to select between QR (fast, well-conditioned)
 /// or SVD (robust, rank-deficient/ill-conditioned) paths.
 pub fn lstsq_with_casp(
+    a: &[Vec<f64>],
+    b: &[f64],
+    options: LstsqOptions,
+    portfolio: &mut SolverPortfolio,
+) -> Result<LstsqResult, LinalgError> {
+    let mut result = lstsq_with_casp_kernel(a, b, options, portfolio)?;
+    // Every driver computes the same minimum-norm least-squares solution with the kernel below
+    // (SciPy's gelsd and gelss agree to rounding; gelsy differs only in rounding and in how the
+    // numerical rank is thresholded). What `driver` changes observably is the output shape:
+    // SciPy's gelsy returns no singular values (`s = None`) and empty residuals. `driver` used
+    // to be accepted and never read (frankenscipy-szq1n.12).
+    if options.driver == LstsqDriver::Gelsy {
+        result.singular_values.clear();
+        result.residuals.clear();
+    }
+    Ok(result)
+}
+
+fn lstsq_with_casp_kernel(
     a: &[Vec<f64>],
     b: &[f64],
     options: LstsqOptions,
@@ -4127,7 +4224,18 @@ pub fn svd(a: &[Vec<f64>], options: DecompOptions) -> Result<SvdResult, LinalgEr
 // values trivially (zero/orthogonal columns need no rotation), so rank-deficient inputs that
 // stall the bidiagonal QR (frankenscipy-9xrce) finish in a couple of sweeps. Returns thin
 // (U: m×n, s: n desc, Vᵀ: n×n).
-fn one_sided_jacobi_svd_tall(a: &[Vec<f64>], m: usize, n: usize) -> SvdResult {
+//
+// Errors when `max_sweeps` sweeps pass and the last one still rotated, as LAPACK `dgesvj`
+// reports INFO > 0; it used to build U, s and Vᵀ from the unconverged state and return them as
+// if converged (frankenscipy-cb92n).
+const JACOBI_SVD_MAX_SWEEPS: usize = 60;
+
+fn one_sided_jacobi_svd_tall(
+    a: &[Vec<f64>],
+    m: usize,
+    n: usize,
+    max_sweeps: usize,
+) -> Result<SvdResult, String> {
     // Column-major working copies: w[j] is column j of W = A·V (length m); v[j] is column j of
     // the accumulated right factor V (length n).
     let mut w: Vec<Vec<f64>> = (0..n).map(|j| (0..m).map(|i| a[i][j]).collect()).collect();
@@ -4139,7 +4247,6 @@ fn one_sided_jacobi_svd_tall(a: &[Vec<f64>], m: usize, n: usize) -> SvdResult {
         })
         .collect();
     let tol = f64::EPSILON;
-    const MAX_SWEEPS: usize = 60;
     // Cached squared column norms of W: α = nrm2[i], β = nrm2[j] are read instead of recomputed,
     // so a skipped (already-orthogonal) pair costs only one dot product γ — the common case for
     // rank-deficient inputs whose zero columns are mutually orthogonal.
@@ -4151,8 +4258,9 @@ fn one_sided_jacobi_svd_tall(a: &[Vec<f64>], m: usize, n: usize) -> SvdResult {
     // collapse and this prunes the bulk of the pair work in later sweeps.
     let zero_tol = nrm2.iter().cloned().fold(0.0_f64, f64::max) * 1e-26;
 
-    for _ in 0..MAX_SWEEPS {
-        let mut converged = true;
+    let mut converged = false;
+    for _ in 0..max_sweeps {
+        let mut rotated = false;
         for i in 0..n {
             if nrm2[i] <= zero_tol {
                 continue;
@@ -4171,7 +4279,7 @@ fn one_sided_jacobi_svd_tall(a: &[Vec<f64>], m: usize, n: usize) -> SvdResult {
                 if gamma.abs() <= tol * (alpha * beta).sqrt() {
                     continue; // columns already orthogonal (covers zero columns: γ = 0)
                 }
-                converged = false;
+                rotated = true;
                 let zeta = (beta - alpha) / (2.0 * gamma);
                 let t = if zeta == 0.0 {
                     1.0
@@ -4204,9 +4312,16 @@ fn one_sided_jacobi_svd_tall(a: &[Vec<f64>], m: usize, n: usize) -> SvdResult {
                 }
             }
         }
-        if converged {
+        if !rotated {
+            // status: a full sweep found every pair orthogonal (|γ| ≤ eps·√(αβ))
+            converged = true;
             break;
         }
+    }
+    if !converged {
+        return Err(format!(
+            "one-sided Jacobi SVD did not converge in {max_sweeps} sweeps"
+        ));
     }
 
     // Singular values = column norms of W; sort descending (stable on index for ties).
@@ -4227,7 +4342,7 @@ fn one_sided_jacobi_svd_tall(a: &[Vec<f64>], m: usize, n: usize) -> SvdResult {
         }
         vt[out].copy_from_slice(&v[orig]);
     }
-    SvdResult { u, s, vt }
+    Ok(SvdResult { u, s, vt })
 }
 
 /// Singular value decomposition by the one-sided Jacobi method — `A = U·Σ·Vᵀ` (thin).
@@ -4253,21 +4368,22 @@ pub fn jacobi_svd(a: &[Vec<f64>], options: DecompOptions) -> Result<SvdResult, L
     }
 
     let result = if rows >= cols {
-        one_sided_jacobi_svd_tall(a, rows, cols)
+        one_sided_jacobi_svd_tall(a, rows, cols, JACOBI_SVD_MAX_SWEEPS)
     } else {
         // Work on Aᵀ (tall), then A = (Aᵀ)ᵀ ⇒ swap the roles of U and Vᵀ.
         let at: Vec<Vec<f64>> = (0..cols)
             .map(|i| (0..rows).map(|j| a[j][i]).collect())
             .collect();
-        let t = one_sided_jacobi_svd_tall(&at, cols, rows);
-        // t: U' (cols×rows), s (rows), Vᵀ' (rows×rows). A = Vᵀ'ᵀ·Σ·U'ᵀ.
-        let u: Vec<Vec<f64>> = (0..rows)
-            .map(|i| (0..rows).map(|j| t.vt[j][i]).collect())
-            .collect();
-        let vt: Vec<Vec<f64>> = (0..rows)
-            .map(|i| (0..cols).map(|j| t.u[j][i]).collect())
-            .collect();
-        SvdResult { u, s: t.s, vt }
+        one_sided_jacobi_svd_tall(&at, cols, rows, JACOBI_SVD_MAX_SWEEPS).map(|t| {
+            // t: U' (cols×rows), s (rows), Vᵀ' (rows×rows). A = Vᵀ'ᵀ·Σ·U'ᵀ.
+            let u: Vec<Vec<f64>> = (0..rows)
+                .map(|i| (0..rows).map(|j| t.vt[j][i]).collect())
+                .collect();
+            let vt: Vec<Vec<f64>> = (0..rows)
+                .map(|i| (0..cols).map(|j| t.u[j][i]).collect())
+                .collect();
+            SvdResult { u, s: t.s, vt }
+        })
     };
 
     emit_trace(LinalgTrace {
@@ -4276,10 +4392,10 @@ pub fn jacobi_svd(a: &[Vec<f64>], options: DecompOptions) -> Result<SvdResult, L
         mode: options.mode,
         rcond: None,
         warning: None,
-        error: None,
+        error: result.as_ref().err().cloned(),
     });
 
-    Ok(result)
+    result.map_err(|detail| LinalgError::ConvergenceFailure { detail })
 }
 
 /// Compute singular values only (without U and Vᵀ).
@@ -8447,12 +8563,17 @@ pub fn hessenberg_h(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f6
 
 /// Generalized Schur (QZ) decomposition for the matrix pencil (A, B).
 ///
-/// Returns matrices `(AA, BB, Q, Z)` satisfying `Qᵀ A Z = AA` and `Qᵀ B Z = BB`.
-/// This implementation currently supports the regular, invertible-`B` case by
-/// reducing `A B⁻¹` to real Schur form and choosing `Z = B⁻¹ Q`, which yields
-/// `BB = I` and an upper quasi-triangular `AA`.
+/// Returns matrices `(AA, BB, Q, Z)` satisfying `Qᵀ A Z = AA` and `Qᵀ B Z = BB`, with `Q`
+/// and `Z` orthogonal, `AA` upper quasi-triangular (2×2 blocks for complex-conjugate pairs)
+/// and `BB` upper triangular with a non-negative diagonal (diagonal on the 2×2 blocks), as
+/// `scipy.linalg.qz(a, b)` returns them.
 ///
-/// Matches the core algebraic contract of `scipy.linalg.qz(a, b)`.
+/// The real QZ algorithm (Moler–Stewart; Hessenberg–triangular reduction, double-shift QZ
+/// sweeps, LAPACK `dhgeqz`-style deflation). `B` may be singular: its infinite generalized
+/// eigenvalues appear as zero diagonal entries of `BB`. This used to form `A·B⁻¹` and fail on
+/// a singular `B` (frankenscipy-szq1n.5). The Schur form is not unique, so `AA`/`BB` can
+/// differ from SciPy's by the order of the diagonal blocks and by orthogonal changes within
+/// them; the generalized eigenvalues and the decomposition identities are what agree.
 pub fn qz(a: &[Vec<f64>], b: &[Vec<f64>], options: DecompOptions) -> Result<QzResult, LinalgError> {
     let (ar, ac) = matrix_shape(a)?;
     let (br, bc) = matrix_shape(b)?;
@@ -8479,86 +8600,17 @@ pub fn qz(a: &[Vec<f64>], b: &[Vec<f64>], options: DecompOptions) -> Result<QzRe
         });
     }
 
-    let a_mat = dmatrix_from_rows(a)?;
-    let b_mat = dmatrix_from_rows(b)?;
-    let identity = DMatrix::<f64>::identity(ar, ar);
-    let b_inv = b_mat
-        .clone()
-        .lu()
-        .solve(&identity)
-        .ok_or(LinalgError::SingularMatrix)?;
-
-    // Real Schur of A·B⁻¹ = Q·T·Qᵀ gives the orthogonal Q and a real
-    // quasi-upper-triangular T.
-    let schur_decomp = bounded_schur(&a_mat * &b_inv)?;
-    let (q_mat, _t_mat) = schur_decomp.unpack();
-
-    // Choose an orthogonal Z that upper-triangularizes Qᵀ·B. Writing
-    // C = Qᵀ·B, an RQ factorization C = R·Zᵀ yields BB = Qᵀ·B·Z = R
-    // (upper-triangular) and AA = Qᵀ·A·Z = T·R (quasi-upper-triangular),
-    // with both Q and Z orthogonal — unlike the previous Z = B⁻¹·Q,
-    // which was not orthogonal.
-    let c_mat = q_mat.transpose() * &b_mat;
-    let mut z_mat = qz_orthogonal_z(&c_mat);
-
-    let mut aa_mat = q_mat.transpose() * &a_mat * &z_mat;
-    let mut bb_mat = q_mat.transpose() * &b_mat * &z_mat;
-
-    // LAPACK's generalized Schur form normalizes BB to a non-negative
-    // diagonal. Flip the sign of any Z column whose BB diagonal entry is
-    // negative; this keeps Z orthogonal and AA/BB (quasi-)triangular, and
-    // makes qz(A, I) return BB = I as scipy.linalg.qz does.
-    for j in 0..ar {
-        if bb_mat[(j, j)] < 0.0 {
-            for i in 0..ar {
-                z_mat[(i, j)] = -z_mat[(i, j)];
-                aa_mat[(i, j)] = -aa_mat[(i, j)];
-                bb_mat[(i, j)] = -bb_mat[(i, j)];
-            }
-        }
-    }
-
+    let result = generalized_schur::real_qz(a, b);
     emit_trace(LinalgTrace {
         operation: "qz",
         matrix_size: (ar, ac),
         mode: options.mode,
         rcond: None,
         warning: None,
-        error: None,
+        error: result.as_ref().err().cloned(),
     });
-
-    Ok(QzResult {
-        q: rows_from_dmatrix(&q_mat),
-        z: rows_from_dmatrix(&z_mat),
-        aa: rows_from_dmatrix(&aa_mat),
-        bb: rows_from_dmatrix(&bb_mat),
-    })
-}
-
-/// Orthogonal `Z` such that `C·Z` is upper-triangular — the orthogonal
-/// factor of the RQ decomposition `C = R·Zᵀ`.
-///
-/// Built from a QR factorization of the row-reversed transpose: with `J`
-/// the exchange matrix, `(J·C)ᵀ = Q₂·R₂` gives `C = (J·R₂ᵀ·J)·(Q₂·J)ᵀ`,
-/// so `Z = Q₂·J` (the columns of `Q₂` reversed) is orthogonal.
-fn qz_orthogonal_z(c: &DMatrix<f64>) -> DMatrix<f64> {
-    let n = c.nrows();
-    // Row-reverse C, then transpose.
-    let mut jc_t = DMatrix::<f64>::zeros(n, n);
-    for i in 0..n {
-        for j in 0..n {
-            jc_t[(i, j)] = c[(n - 1 - j, i)];
-        }
-    }
-    let q2 = jc_t.qr().q();
-    // Z = Q₂·J: reverse the columns of Q₂.
-    let mut z = DMatrix::<f64>::zeros(n, n);
-    for i in 0..n {
-        for j in 0..n {
-            z[(i, j)] = q2[(i, n - 1 - j)];
-        }
-    }
-    z
+    let (aa, bb, q, z) = result.map_err(|detail| LinalgError::ConvergenceFailure { detail })?;
+    Ok(QzResult { q, z, aa, bb })
 }
 
 /// Is this generalized eigenvalue α/β in the region `sort` asks for?
@@ -8566,8 +8618,8 @@ fn qz_orthogonal_z(c: &DMatrix<f64>) -> DMatrix<f64> {
 /// The β test used to be `beta.abs() <= f64::EPSILON`, an ABSOLUTE floor on the
 /// diagonal of the QZ B factor — a quantity that carries the scale of the
 /// pencil. Every eigenvalue of a uniformly scaled pencil therefore came back
-/// unselected, `stable_first_permutation` selected nothing, and `ordqz` returned
-/// the factorization UNSORTED, which is the whole of what it is for. Measured
+/// unselected and `ordqz` returned the factorization UNSORTED, which is the
+/// whole of what it is for. Measured
 /// on a diagonal pencil A = diag(2, 0.25, -3), B = I, scaled by 2^-60: SciPy
 /// still returns ratios [0.25, 2.0, -3.0] and we returned [2.0, 0.25, -3.0]
 /// (frankenscipy-i8gy5).
@@ -8589,70 +8641,51 @@ fn ordqz_selected(alpha: f64, beta: f64, sort: OrdQzSort) -> bool {
     }
 }
 
-fn stable_first_permutation(diagonal_pairs: &[(f64, f64)], sort: OrdQzSort) -> Vec<usize> {
-    let mut selected = Vec::with_capacity(diagonal_pairs.len());
-    let mut rejected = Vec::with_capacity(diagonal_pairs.len());
-    for (index, &(alpha, beta)) in diagonal_pairs.iter().enumerate() {
-        if ordqz_selected(alpha, beta, sort) {
-            selected.push(index);
-        } else {
-            rejected.push(index);
-        }
+/// [`ordqz_selected`] for a block's eigenvalue `(alpha_re + i·alpha_im)/beta`; for a complex
+/// pair SciPy's `_lhp` tests the real part and `_iuc` the modulus.
+fn ordqz_block_selected(alpha_re: f64, alpha_im: f64, beta: f64, sort: OrdQzSort) -> bool {
+    if alpha_im == 0.0 {
+        return ordqz_selected(alpha_re, beta, sort);
     }
-    selected.extend(rejected);
-    selected
+    if !alpha_re.is_finite() || !alpha_im.is_finite() || !beta.is_finite() || beta == 0.0 {
+        return false;
+    }
+    let (re, im) = (alpha_re / beta, alpha_im / beta);
+    match sort {
+        OrdQzSort::LeftHalfPlane => re < 0.0,
+        OrdQzSort::InsideUnitCircle => re.hypot(im) < 1.0,
+    }
 }
 
-fn permute_columns(matrix: &[Vec<f64>], permutation: &[usize]) -> Vec<Vec<f64>> {
-    matrix
-        .iter()
-        .map(|row| permutation.iter().map(|&j| row[j]).collect())
-        .collect()
-}
-
-fn permute_similarity(matrix: &[Vec<f64>], permutation: &[usize]) -> Vec<Vec<f64>> {
-    permutation
-        .iter()
-        .map(|&i| permutation.iter().map(|&j| matrix[i][j]).collect())
-        .collect()
-}
-
-/// Reorders a simplified real generalized Schur form so selected generalized
-/// eigenvalues appear first.
+/// Reorders the real generalized Schur form of `(a, b)` so the selected generalized
+/// eigenvalues come first, matching `scipy.linalg.ordqz(a, b, sort)`.
 ///
-/// This implementation is intentionally scoped to the current regular,
-/// invertible-`B` `qz` path in FrankenSciPy. It computes `qz(a, b, ...)`, then
-/// applies a stable-first permutation to the real diagonal generalized
-/// eigenvalue ratios `aa[i][i] / bb[i][i]`. The same permutation is applied to
-/// `Q`, `Z`, `AA`, and `BB`, preserving the generalized Schur relation.
+/// LAPACK `dtgsen`'s strategy: the selection is decided once, on the QZ output, and each
+/// selected diagonal block (1×1, or 2×2 for a complex pair) moves up past the unselected ones
+/// by adjacent block swaps that keep `AA` quasi-triangular and `BB` triangular, preserving
+/// the relative order within each group. This used to PERMUTE rows and columns of `AA` and
+/// `BB`, which does not preserve the (quasi-)triangular form (frankenscipy-szq1n.5).
+///
+/// # Errors
+/// As [`qz`], and when a block swap is too ill-conditioned to perform stably (LAPACK reports
+/// the same condition as `info = 1`).
 pub fn ordqz(
     a: &[Vec<f64>],
     b: &[Vec<f64>],
     sort: OrdQzSort,
     options: DecompOptions,
 ) -> Result<QzResult, LinalgError> {
-    let result = qz(a, b, options)?;
-    if result.aa.is_empty() {
-        return Ok(result);
-    }
-
-    let n = result.aa.len();
-    if result.bb.len() != n {
-        return Err(LinalgError::InvalidArgument {
-            detail: "ordqz received inconsistent QZ factors".to_string(),
-        });
-    }
-
-    let diagonal_pairs: Vec<(f64, f64)> =
-        (0..n).map(|i| (result.aa[i][i], result.bb[i][i])).collect();
-    let permutation = stable_first_permutation(&diagonal_pairs, sort);
-
-    Ok(QzResult {
-        q: permute_columns(&result.q, &permutation),
-        z: permute_columns(&result.z, &permutation),
-        aa: permute_similarity(&result.aa, &permutation),
-        bb: permute_similarity(&result.bb, &permutation),
+    let QzResult {
+        mut q,
+        mut z,
+        mut aa,
+        mut bb,
+    } = qz(a, b, options)?;
+    generalized_schur::reorder_selected_first(&mut aa, &mut bb, &mut q, &mut z, |re, im, beta| {
+        ordqz_block_selected(re, im, beta, sort)
     })
+    .map_err(|detail| LinalgError::ConvergenceFailure { detail })?;
+    Ok(QzResult { q, z, aa, bb })
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -9554,6 +9587,32 @@ fn schur_parlett_complex(
     n: usize,
     f: impl Fn(Complex<f64>) -> Complex<f64>,
 ) -> DMatrix<f64> {
+    // f(A) = Q · Re(W F_tri Wᴴ) · Qᵀ.
+    let ft = schur_parlett_complex_schur_basis(t, n, f, false);
+    let mut ft_real = DMatrix::<f64>::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n {
+            ft_real[(i, j)] = ft[(i, j)].re;
+        }
+    }
+    q * ft_real * q.transpose()
+}
+
+/// Core of the complex Schur–Parlett evaluator. Returns `W · F_tri · Wᴴ`, the
+/// function of the complexified real-Schur factor `T` expressed in the Schur
+/// basis, so that `f(A) = Q · (result) · Qᵀ`.
+///
+/// On an exactly repeated diagonal entry (zero recurrence denominator) the
+/// Parlett recurrence cannot resolve the entry. `scipy_confluent = true` keeps
+/// the undivided numerator, which is what `scipy.linalg.funm` does; otherwise
+/// the entry is set to 0 (the historical behaviour of this evaluator's other
+/// callers, kept unchanged).
+fn schur_parlett_complex_schur_basis(
+    t: &DMatrix<f64>,
+    n: usize,
+    f: impl Fn(Complex<f64>) -> Complex<f64>,
+    scipy_confluent: bool,
+) -> DMatrix<Complex<f64>> {
     let zero = Complex::new(0.0, 0.0);
     let mut tc = DMatrix::<Complex<f64>>::from_element(n, n, zero);
     for i in 0..n {
@@ -9605,7 +9664,9 @@ fn schur_parlett_complex(
                 sum += tt[(i, k)] * fmat[(k, j)] - fmat[(i, k)] * tt[(k, j)];
             }
             let denom = tt[(j, j)] - tt[(i, i)];
-            fmat[(i, j)] = if denom.norm() > 1e-300 {
+            fmat[(i, j)] = if scipy_confluent {
+                if denom != zero { sum / denom } else { sum }
+            } else if denom.norm() > 1e-300 {
                 sum / denom
             } else {
                 zero // confluent eigenvalues: rare for distinct Schur values
@@ -9613,15 +9674,62 @@ fn schur_parlett_complex(
         }
     }
 
-    // f(A) = Q · Re(W F_tri Wᴴ) · Qᵀ.
-    let ft = &w * &fmat * w.adjoint();
-    let mut ft_real = DMatrix::<f64>::zeros(n, n);
+    &w * &fmat * w.adjoint()
+}
+
+/// Matrix function `f(A)` of a real square matrix, matching
+/// `scipy.linalg.funm(A, func)`.
+///
+/// As in SciPy (`schur` + `rsf2csf`), `func` is evaluated on the eigenvalues of
+/// the complex Schur form — complex for a matrix with complex eigenvalues — and
+/// the Schur–Parlett recurrence fills the off-diagonal. Like SciPy, an exactly
+/// repeated eigenvalue keeps the undivided recurrence numerator: the recurrence
+/// cannot resolve confluent eigenvalues, so prefer a dedicated routine (`expm`,
+/// `logm`, `sqrtm`, ...) for those.
+///
+/// The result is real when its imaginary part is at most `1e6·eps` elementwise
+/// (SciPy's `_maybe_real` tolerance for float64). A genuinely complex `f(A)`, e.g.
+/// `sqrt` of a matrix with a negative eigenvalue, is `InvalidArgument`, because
+/// this API returns real matrices.
+///
+/// br-szq1n.6: this used to take `Fn(f64) -> f64` and evaluate it on the REAL
+/// Schur diagonal, which is wrong (or NaN) whenever `A` has complex eigenvalues:
+/// the 2×2 real-Schur blocks were treated as if `func(t[i,i])` were `f(λ)`.
+pub fn funm(
+    a: &[Vec<f64>],
+    func: impl Fn(Complex<f64>) -> Complex<f64>,
+    options: DecompOptions,
+) -> Result<Vec<Vec<f64>>, LinalgError> {
+    let matrix = validated_square_dmatrix(a, options)?;
+    let n = matrix.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let schur = bounded_schur(matrix)?;
+    let (q, t) = schur.unpack();
+    let ft = schur_parlett_complex_schur_basis(&t, n, func, true);
+    let mut ft_re = DMatrix::<f64>::zeros(n, n);
+    let mut ft_im = DMatrix::<f64>::zeros(n, n);
     for i in 0..n {
         for j in 0..n {
-            ft_real[(i, j)] = ft[(i, j)].re;
+            ft_re[(i, j)] = ft[(i, j)].re;
+            ft_im[(i, j)] = ft[(i, j)].im;
         }
     }
-    q * ft_real * q.transpose()
+    let imag = &q * ft_im * q.transpose();
+    let tol = 1.0e6 * f64::EPSILON;
+    let max_imag = imag
+        .iter()
+        .filter(|v| v.is_finite())
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    if max_imag > tol {
+        return Err(LinalgError::InvalidArgument {
+            detail: format!(
+                "funm: f(A) is complex (max |Im| = {max_imag:.3e} > {tol:.3e}); this API returns real matrices"
+            ),
+        });
+    }
+    Ok(rows_from_dmatrix(&(&q * ft_re * q.transpose())))
 }
 
 /// General logm for non-symmetric matrices. A real spectrum (no 2×2 Schur
@@ -9702,12 +9810,17 @@ fn logm_real_triangular(q: &DMatrix<f64>, t: &DMatrix<f64>, n: usize) -> DMatrix
     q * log_t * q.transpose()
 }
 
-/// Matrix square root.
+/// Matrix square root: the real `X` with `X·X = A` that `scipy.linalg.sqrtm(A)` returns when
+/// no eigenvalue of `A` lies on the negative real axis.
 ///
-/// Matches `scipy.linalg.sqrtm(A)`.
+/// Symmetric input (to 1e-12 relative) uses the eigendecomposition `A = V·diag(d)·Vᵀ`,
+/// `X = V·diag(√d)·Vᵀ`. Any other input uses the real Schur form `A = Q·T·Qᵀ` and the
+/// Björck–Hammarling recurrence for `√T`, or the complex Schur–Parlett evaluator when `T` has
+/// 2×2 blocks (complex-conjugate eigenvalue pairs). SciPy uses the blocked Schur method of
+/// Deadman–Higham–Ralha, so results can differ in the last digits.
 ///
-/// Computes sqrtm via eigendecomposition: if A = V D V^{-1}, then
-/// sqrtm(A) = V diag(sqrt(d_i)) V^{-1}.
+/// Where SciPy returns a COMPLEX square root (a negative eigenvalue), this returns NaN: the
+/// whole matrix on the symmetric path, the affected entries on the Schur path.
 pub fn sqrtm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     if rows != cols {
@@ -9917,7 +10030,7 @@ pub fn signm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
     let is_symmetric = (0..n)
         .all(|i| (0..n).all(|j| (m[(i, j)] - m[(j, i)]).abs() < 1e-12 * m[(i, j)].abs().max(1.0)));
     if is_symmetric {
-        return funm(a, |x| if x >= 0.0 { 1.0 } else { -1.0 }, options);
+        return funm_real_spectrum(a, |x| if x >= 0.0 { 1.0 } else { -1.0 }, options);
     }
 
     // The matrix sign function maps each eigenvalue to sign(Re λ). For a complex
@@ -9933,7 +10046,7 @@ pub fn signm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
         });
         Ok(rows_from_dmatrix(&result))
     } else {
-        funm(a, |x| if x >= 0.0 { 1.0 } else { -1.0 }, options)
+        funm_real_spectrum(a, |x| if x >= 0.0 { 1.0 } else { -1.0 }, options)
     }
 }
 
@@ -10196,15 +10309,12 @@ pub fn tanhm(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<Vec<f64>>, Li
     Ok(rows_from_dmatrix(&x))
 }
 
-/// General matrix function via eigendecomposition.
-///
-/// Computes f(A) = V * diag(f(λ_i)) * V^{-1} where A = V * diag(λ) * V^{-1}.
-///
-/// For symmetric matrices, uses orthogonal eigendecomposition (more stable).
-/// For general matrices, uses Schur decomposition with Parlett's recurrence.
-///
-/// Matches `scipy.linalg.funm(A, func)`.
-pub fn funm(
+/// Real-scalar matrix function for callers that have already established a REAL
+/// spectrum (no 2×2 real-Schur blocks): `signm` and `fractional_matrix_power` use
+/// it on that branch and route complex spectra through [`schur_parlett_complex`].
+/// It evaluates `func` only on the real Schur diagonal, so it must not be used when
+/// `A` has complex eigenvalues — that is what made the old public `funm` wrong.
+fn funm_real_spectrum(
     a: &[Vec<f64>],
     func: impl Fn(f64) -> f64,
     options: DecompOptions,
@@ -10311,7 +10421,7 @@ pub fn fractional_matrix_power(
         })
     });
     if is_symmetric {
-        return funm(a, |x| x.powf(p), options);
+        return funm_real_spectrum(a, |x| x.powf(p), options);
     }
 
     let schur = bounded_schur(matrix.clone())?;
@@ -10321,7 +10431,7 @@ pub fn fractional_matrix_power(
         let result = schur_parlett_complex(&q, &t, n, |z| (z.ln() * Complex::new(p, 0.0)).exp());
         Ok(rows_from_dmatrix(&result))
     } else {
-        funm(a, |x| x.powf(p), options)
+        funm_real_spectrum(a, |x| x.powf(p), options)
     }
 }
 
@@ -14547,7 +14657,6 @@ fn solve_shifted_tridiagonal_system_x4(
     }
     for row in (0..n - 1).rev() {
         let base = row * 4;
-        let next = base + 4;
         for lane in 0..4 {
             solution[lane][row] =
                 reduced_rhs[base + lane] - upper_factors[base + lane] * solution[lane][row + 1];
@@ -25048,47 +25157,10 @@ pub fn vnorm(v: &[f64]) -> f64 {
     sumsq.sqrt()
 }
 
-/// BLAS/LAPACK precision type code matching SciPy character prefixes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub enum BlasType {
-    Single,
-    #[default]
-    Double,
-    ComplexSingle,
-    ComplexDouble,
-}
-
-impl BlasType {
-    /// Return the one-character BLAS prefix ('s', 'd', 'c', 'z').
-    #[must_use]
-    pub const fn char_code(&self) -> char {
-        match self {
-            Self::Single => 's',
-            Self::Double => 'd',
-            Self::ComplexSingle => 'c',
-            Self::ComplexDouble => 'z',
-        }
-    }
-}
-
-/// Find the best BLAS type prefix for a collection of arrays, matching `scipy.linalg.find_best_blas_type`.
-#[must_use]
-pub fn find_best_blas_type(_dtype_hint: Option<BlasType>) -> (char, BlasType) {
-    let t = _dtype_hint.unwrap_or(BlasType::Double);
-    (t.char_code(), t)
-}
-
-/// Return named BLAS function prefixes for the requested routines, matching `scipy.linalg.get_blas_funcs`.
-#[must_use]
-pub fn get_blas_funcs(names: &[&str]) -> Vec<String> {
-    names.iter().map(|n| format!("d{n}")).collect()
-}
-
-/// Return named LAPACK function prefixes for the requested routines, matching `scipy.linalg.get_lapack_funcs`.
-#[must_use]
-pub fn get_lapack_funcs(names: &[&str]) -> Vec<String> {
-    names.iter().map(|n| format!("d{n}")).collect()
-}
+// scipy.linalg's BLAS/LAPACK introspection (`find_best_blas_type`, `get_blas_funcs`,
+// `get_lapack_funcs`) is not applicable: there is no BLAS or LAPACK underneath by design (README,
+// "Why we don't FFI to BLAS"). The no-ops that used to stand in for them returned fabricated
+// `d<name>` strings and were counted as covered (frankenscipy-8dndw.1).
 
 #[cfg(test)]
 mod tests {
@@ -31599,6 +31671,30 @@ mod tests {
         }
     }
 
+    /// frankenscipy-cb92n: running out of sweeps must be reported, not returned as a converged
+    /// SVD. A single sweep over non-orthogonal columns always rotates, so a cap of one sweep
+    /// must fail; orthogonal columns need no rotation and converge within it.
+    #[test]
+    fn jacobi_svd_reports_sweep_exhaustion() {
+        let a = vec![
+            vec![4.0, 1.0, 2.0],
+            vec![1.0, 3.0, 0.5],
+            vec![2.0, 0.5, 5.0],
+            vec![0.3, 0.2, 0.1],
+        ];
+        let err = one_sided_jacobi_svd_tall(&a, 4, 3, 1).expect_err("one sweep cannot converge");
+        assert!(err.contains("did not converge in 1 sweeps"), "{err}");
+        let res = one_sided_jacobi_svd_tall(&a, 4, 3, JACOBI_SVD_MAX_SWEEPS).expect("converges");
+        let reference = svd(&a, DecompOptions::default()).expect("svd");
+        for (x, y) in res.s.iter().zip(&reference.s) {
+            assert!((x - y).abs() < 1e-12, "singular value mismatch {x} vs {y}");
+        }
+
+        let orthogonal = vec![vec![3.0, 0.0], vec![0.0, 2.0], vec![0.0, 0.0]];
+        let res = one_sided_jacobi_svd_tall(&orthogonal, 3, 2, 1).expect("already orthogonal");
+        assert_eq!(res.s, vec![3.0, 2.0]);
+    }
+
     #[test]
     fn randomized_svd_matches_full_svd_on_low_rank() {
         // When the sketch dimension l = k + oversamples exceeds the true rank r, the random
@@ -36307,12 +36403,135 @@ mod tests {
         assert!(result.bb.is_empty());
     }
 
+    /// Q·S·Zᵀ ≈ A and Q·T·Zᵀ ≈ B, `T` upper triangular and `S` quasi-upper-triangular.
+    fn assert_qz_form(a: &[Vec<f64>], b: &[Vec<f64>], result: &QzResult) {
+        let n = a.len();
+        let mut qtaz = vec![vec![0.0; n]; n];
+        let mut qtbz = vec![vec![0.0; n]; n];
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    for l in 0..n {
+                        qtaz[i][j] += result.q[k][i] * a[k][l] * result.z[l][j];
+                        qtbz[i][j] += result.q[k][i] * b[k][l] * result.z[l][j];
+                    }
+                }
+            }
+        }
+        assert_close_matrix(&qtaz, &result.aa, 1e-12, 1e-12);
+        assert_close_matrix(&qtbz, &result.bb, 1e-12, 1e-12);
+        for i in 0..n {
+            for j in 0..i {
+                assert_eq!(result.bb[i][j], 0.0, "BB[{i}][{j}] must be zero");
+                if i > j + 1 {
+                    assert_eq!(result.aa[i][j], 0.0, "AA[{i}][{j}] must be zero");
+                }
+            }
+        }
+    }
+
+    /// frankenscipy-szq1n.5: a singular B is the case QZ exists for. SciPy 1.17.1 returns
+    /// diag(BB) = [0.8, 0] for this pencil (the finite eigenvalue -0.5 and an infinite one);
+    /// the old `A·B⁻¹` implementation rejected it as singular.
     #[test]
-    fn qz_singular_b_rejected() {
+    fn qz_accepts_a_singular_b_like_scipy() {
         let a = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
         let b = vec![vec![1.0, 0.0], vec![0.0, 0.0]];
-        let err = qz(&a, &b, DecompOptions::default()).expect_err("singular B");
-        assert!(matches!(err, LinalgError::SingularMatrix));
+        let result = qz(&a, &b, DecompOptions::default()).expect("singular B is a valid pencil");
+        assert_qz_form(&a, &b, &result);
+        let finite: Vec<f64> = (0..2)
+            .filter(|&i| result.bb[i][i].abs() > 1e-12)
+            .map(|i| result.aa[i][i] / result.bb[i][i])
+            .collect();
+        assert_eq!(
+            finite.len(),
+            1,
+            "exactly one infinite eigenvalue: {result:?}"
+        );
+        assert!(
+            (finite[0] + 0.5).abs() < 1e-14,
+            "finite eigenvalue {finite:?}"
+        );
+
+        // ordqz leaves the infinite eigenvalue unselected, so it goes last.
+        let sorted = ordqz(
+            &a,
+            &b,
+            OrdQzSort::InsideUnitCircle,
+            DecompOptions::default(),
+        )
+        .expect("ordqz with singular B");
+        assert_qz_form(&a, &b, &sorted);
+        assert!((sorted.aa[0][0] / sorted.bb[0][0] + 0.5).abs() < 1e-14);
+        assert!(sorted.bb[1][1].abs() < 1e-14, "{sorted:?}");
+    }
+
+    /// frankenscipy-szq1n.5: `ordqz` used to PERMUTE rows and columns of AA and BB, which is a
+    /// similarity only for a diagonal pencil. On a triangular pencil the permutation moved
+    /// BB[0][1] below the diagonal. The block-swap reorder keeps the Schur form.
+    #[test]
+    fn ordqz_keeps_the_schur_form_of_a_triangular_pencil() {
+        let a = vec![
+            vec![2.0, 1.0, 1.0],
+            vec![0.0, 0.25, 1.0],
+            vec![0.0, 0.0, -3.0],
+        ];
+        let b = vec![
+            vec![1.0, 1.0, 0.5],
+            vec![0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let result = ordqz(
+            &a,
+            &b,
+            OrdQzSort::InsideUnitCircle,
+            DecompOptions::default(),
+        )
+        .expect("ordqz");
+        assert_qz_form(&a, &b, &result);
+        let ratios: Vec<f64> = (0..3).map(|i| result.aa[i][i] / result.bb[i][i]).collect();
+        assert!((ratios[0] - 0.25).abs() < 1e-13, "{ratios:?}");
+        assert!(
+            ratios[1].abs() >= 1.0 && ratios[2].abs() >= 1.0,
+            "{ratios:?}"
+        );
+    }
+
+    /// A complex pair moves as a 2×2 block: `_lhp` selects it by its real part.
+    #[test]
+    fn ordqz_moves_a_complex_pair_as_one_block() {
+        // Eigenvalues 3 (real) and -1 ± 2i (complex pair) for B = I.
+        let a = vec![
+            vec![3.0, 1.0, 2.0],
+            vec![0.0, -1.0, 2.0],
+            vec![0.0, -2.0, -1.0],
+        ];
+        let b = vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ];
+        let result =
+            ordqz(&a, &b, OrdQzSort::LeftHalfPlane, DecompOptions::default()).expect("ordqz");
+        assert_qz_form(&a, &b, &result);
+        assert_ne!(
+            result.aa[1][0], 0.0,
+            "the complex pair must lead as a 2x2 block"
+        );
+        assert_eq!(result.aa[2][1], 0.0);
+        assert!((result.aa[2][2] / result.bb[2][2] - 3.0).abs() < 1e-13);
+        let (re, im, beta) = generalized_schur::block_eigenvalue(&result.aa, &result.bb, 0, 2);
+        assert!((re / beta + 1.0).abs() < 1e-13 && (im.abs() / beta - 2.0).abs() < 1e-13);
+
+        // The pair is outside the unit circle (|-1 ± 2i| = √5), so `iuc` selects nothing.
+        let iuc = ordqz(
+            &a,
+            &b,
+            OrdQzSort::InsideUnitCircle,
+            DecompOptions::default(),
+        )
+        .expect("ordqz");
+        assert_qz_form(&a, &b, &iuc);
     }
 
     #[test]
@@ -40110,7 +40329,7 @@ mod proptest_tests {
     #[test]
     fn funm_exp_matches_expm() {
         let a = vec![vec![1.0, 0.0], vec![0.0, 2.0]];
-        let funm_result = funm(&a, f64::exp, DecompOptions::default()).expect("funm exp");
+        let funm_result = funm(&a, |z| z.exp(), DecompOptions::default()).expect("funm exp");
         let expm_result = expm(&a, DecompOptions::default()).expect("expm");
         for i in 0..2 {
             for j in 0..2 {
@@ -40122,6 +40341,267 @@ mod proptest_tests {
                 );
             }
         }
+    }
+
+    // br-szq1n.12: `lower` was accepted and never read. For assume_a sym/her/pos SciPy reads only
+    // the selected triangle (upper by default). Live SciPy 1.17.1:
+    //   solve(L, b, assume_a='pos', lower=True) with L lower-only -> [2/9, 1/9, 13/9]
+    //   solve(A, b, assume_a='sym') reads A's UPPER triangle, lower=True its LOWER one
+    //   inv(L, assume_a='pos', lower=True) -> the inverse of L mirrored
+    #[test]
+    fn solve_and_inv_read_only_the_triangle_lower_selects() {
+        let l = vec![
+            vec![4.0, 0.0, 0.0],
+            vec![1.0, 3.0, 0.0],
+            vec![0.0, 1.0, 2.0],
+        ];
+        let b = [1.0, 2.0, 3.0];
+        let close = |got: &[f64], want: &[f64], what: &str| {
+            for (g, w) in got.iter().zip(want) {
+                assert!((g - w).abs() <= 1e-14, "{what}: {got:?} vs SciPy {want:?}");
+            }
+        };
+        let pos_lower = SolveOptions {
+            assume_a: Some(MatrixAssumption::PositiveDefinite),
+            lower: true,
+            ..SolveOptions::default()
+        };
+        let x = solve(&l, &b, pos_lower).expect("pos lower solve");
+        println!("solve(L, pos, lower=true) = {:?}", x.x);
+        close(
+            &x.x,
+            &[
+                0.222_222_222_222_222_2,
+                0.111_111_111_111_111_1,
+                1.444_444_444_444_444_4,
+            ],
+            "pos lower",
+        );
+
+        let a = vec![
+            vec![4.0, 7.0, 0.0],
+            vec![1.0, 3.0, 9.0],
+            vec![0.0, 1.0, 2.0],
+        ];
+        let sym = |lower| SolveOptions {
+            assume_a: Some(MatrixAssumption::Symmetric),
+            lower,
+            ..SolveOptions::default()
+        };
+        let upper = solve(&a, &b, sym(false)).expect("sym upper");
+        close(
+            &upper.x,
+            &[
+                -0.216_080_402_010_050_35,
+                0.266_331_658_291_457_3,
+                0.301_507_537_688_442_3,
+            ],
+            "sym upper (default)",
+        );
+        let lower = solve(&a, &b, sym(true)).expect("sym lower");
+        close(
+            &lower.x,
+            &[
+                0.222_222_222_222_222_24,
+                0.111_111_111_111_111_01,
+                1.444_444_444_444_444_6,
+            ],
+            "sym lower",
+        );
+
+        let inv_lower = inv(
+            &l,
+            InvOptions {
+                assume_a: Some(MatrixAssumption::PositiveDefinite),
+                lower: true,
+                ..InvOptions::default()
+            },
+        )
+        .expect("pos lower inv");
+        let want = [
+            [
+                0.277_777_777_777_777_8,
+                -0.111_111_111_111_111_12,
+                0.055_555_555_555_555_56,
+            ],
+            [
+                -0.111_111_111_111_111_12,
+                0.444_444_444_444_444_5,
+                -0.222_222_222_222_222_24,
+            ],
+            [
+                0.055_555_555_555_555_56,
+                -0.222_222_222_222_222_24,
+                0.611_111_111_111_111,
+            ],
+        ];
+        for (row, w) in inv_lower.inverse.iter().zip(&want) {
+            close(row, w, "inv pos lower");
+        }
+        // A General assumption still uses the whole matrix.
+        let general = solve(&a, &b, SolveOptions::default()).expect("general");
+        assert!(
+            (general.x[0] - upper.x[0]).abs() > 1e-3,
+            "general must not mirror"
+        );
+    }
+
+    // frankenscipy-7tb8d.1: an Ok-but-inaccurate attempt is a FAILED attempt. Wilkinson's
+    // growth matrix (1 on the diagonal, -1 below, 1 in the last column) is well conditioned
+    // (cond ~27 at n = 60, so the portfolio picks LU), yet partial-pivoting LU grows by 2^59 and
+    // returns backward error ~0.04 (SciPy's lu_solve: 0.0409). That result used to be returned
+    // unexamined; now the attempt is recorded as inaccurate, the remaining actions are re-ranked
+    // and a stable one answers.
+    #[test]
+    fn inaccurate_lu_is_retried_and_the_outcome_is_learned() {
+        let n = 60;
+        let a: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        if j == n - 1 || i == j {
+                            1.0
+                        } else if j < i {
+                            -1.0
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let b: Vec<f64> = (0..n).map(|i| (i as f64).cos()).collect();
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        let result =
+            solve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio).expect("solves");
+        let certificate = result.certificate.as_ref().expect("certificate");
+        let omega = result.backward_error.expect("backward error");
+        println!(
+            "wilkinson n=60: action {:?} fallback {} omega {omega:e} counts {:?}",
+            certificate.action,
+            certificate.fallback_active,
+            portfolio.outcome_counts(certificate.rcond_estimate)
+        );
+        assert_ne!(
+            certificate.action,
+            SolverAction::DirectLU,
+            "LU's answer was accepted"
+        );
+        assert!(certificate.fallback_active);
+        assert!(omega <= 1e-12, "backward error {omega:e}");
+        // Both attempts were fed back: LU inaccurate, the fallback ok.
+        let counts = portfolio.outcome_counts(certificate.rcond_estimate);
+        assert!(
+            (counts.iter().sum::<f64>() - 2.0).abs() < 1e-12,
+            "{counts:?}"
+        );
+    }
+
+    // br-szq1n.12: `driver` was never read. SciPy 1.17.1, lstsq([[1,0],[0,1],[1,1]], [1,2,4]):
+    // gelsd/gelss -> x [4/3, 7/3], residues 1/3, s [sqrt(3), 1]; gelsy -> same x, residues [],
+    // s None.
+    #[test]
+    fn lstsq_driver_selects_scipys_output_shape() {
+        let a = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![1.0, 1.0]];
+        let b = [1.0, 2.0, 4.0];
+        let run = |driver| {
+            lstsq(
+                &a,
+                &b,
+                LstsqOptions {
+                    driver,
+                    ..LstsqOptions::default()
+                },
+            )
+            .expect("lstsq")
+        };
+        for driver in [LstsqDriver::Gelsd, LstsqDriver::Gelss, LstsqDriver::Gelsy] {
+            let r = run(driver);
+            println!(
+                "{driver:?}: x={:?} residuals={:?} s={:?}",
+                r.x, r.residuals, r.singular_values
+            );
+            assert!((r.x[0] - 4.0 / 3.0).abs() < 1e-14 && (r.x[1] - 7.0 / 3.0).abs() < 1e-14);
+            assert_eq!(r.rank, 2);
+            if driver == LstsqDriver::Gelsy {
+                assert!(r.singular_values.is_empty() && r.residuals.is_empty());
+            } else {
+                assert_eq!(r.singular_values.len(), 2);
+                assert!((r.singular_values[0] - 3.0_f64.sqrt()).abs() < 1e-14);
+                assert!((r.residuals[0] - 1.0 / 3.0).abs() < 1e-14);
+            }
+        }
+    }
+
+    // br-szq1n.6: matrices WITH complex eigenvalues, where the old real-diagonal funm
+    // evaluated f on the 2×2 real-Schur block entries instead of the eigenvalues.
+    // Expected values: live SciPy 1.17.1 scipy.linalg.funm.
+    #[test]
+    fn funm_complex_eigenvalues_match_scipy() {
+        // Eigenvalues 0.0771 ± 1.1949i and -0.1541: funm(exp) must equal expm (SciPy: 1.3e-15).
+        let r = vec![
+            vec![0.3, -1.2, 0.5],
+            vec![1.1, 0.2, -0.4],
+            vec![0.0, 0.7, -0.5],
+        ];
+        let f = funm(&r, |z| z.exp(), DecompOptions::default()).expect("funm exp");
+        let e = expm(&r, DecompOptions::default()).expect("expm");
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (f[i][j] - e[i][j]).abs() < 1e-12,
+                    "funm(exp) vs expm at [{i}][{j}]: {} vs {}",
+                    f[i][j],
+                    e[i][j]
+                );
+            }
+        }
+        // cos of [[1, 2], [-3, 1]] (eigenvalues 1 ± i·sqrt(6)).
+        let c = funm(
+            &[vec![1.0, 2.0], vec![-3.0, 1.0]],
+            |z| z.cos(),
+            DecompOptions::default(),
+        )
+        .expect("funm cos");
+        let expected = [[3.152_332_43, -3.949_243_95], [5.923_865_92, 3.152_332_43]];
+        for i in 0..2 {
+            for j in 0..2 {
+                assert!(
+                    (c[i][j] - expected[i][j]).abs() < 1e-7,
+                    "funm(cos)[{i}][{j}] = {} vs SciPy {}",
+                    c[i][j],
+                    expected[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn funm_confluent_and_complex_results_follow_scipy() {
+        // Exactly repeated eigenvalue: SciPy keeps the undivided Parlett numerator,
+        // which for [[2,1],[0,2]] and exp is 1·(e²−e²) = 0 (SciPy warns that the
+        // result may be inaccurate; expm has e² there). Parity, not a recommendation.
+        let j = funm(
+            &[vec![2.0, 1.0], vec![0.0, 2.0]],
+            |z| z.exp(),
+            DecompOptions::default(),
+        )
+        .expect("funm jordan");
+        let e2 = 2.0_f64.exp();
+        assert!((j[0][0] - e2).abs() < 1e-12 && (j[1][1] - e2).abs() < 1e-12);
+        assert!(j[0][1].abs() < 1e-12 && j[1][0].abs() < 1e-12, "{j:?}");
+        // sqrt of a matrix with eigenvalue -4 is complex in SciPy; this API returns
+        // real matrices, so it must refuse rather than drop the imaginary part.
+        let err = funm(
+            &[vec![-4.0, 1.0], vec![0.0, 9.0]],
+            |z| z.sqrt(),
+            DecompOptions::default(),
+        )
+        .expect_err("complex result");
+        assert!(
+            matches!(err, LinalgError::InvalidArgument { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
