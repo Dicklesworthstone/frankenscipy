@@ -477,6 +477,12 @@ pub struct BdfSolver {
     lu: Option<NewtonFactor>,
     /// The value of `c = h/alpha[order]` for which `lu` was factorized.
     lu_c: Option<f64>,
+    /// This solver's Newton factorizations that took the diagonal / banded path. The global
+    /// [`BDF_DIAG_NEWTON_HITS`] / [`BDF_BAND_NEWTON_HITS`] sum over every solver in the
+    /// process, so a test reading them races every other BDF solve running beside it
+    /// (frankenscipy-gj3mi); these do not.
+    diag_factorizations: usize,
+    band_factorizations: usize,
 
     // Previous step values for interpolation
     t_old: Option<f64>,
@@ -577,6 +583,8 @@ impl BdfSolver {
             jac_band: None,
             lu: None,
             lu_c: None,
+            diag_factorizations: 0,
+            band_factorizations: 0,
             t_old: None,
             y_old: None,
         })
@@ -772,6 +780,7 @@ impl BdfSolver {
                     self.lu = Some(match diag {
                         Some(d) => {
                             BDF_DIAG_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+                            self.diag_factorizations += 1;
                             NewtonFactor::Diagonal(d)
                         }
                         None => {
@@ -814,6 +823,7 @@ impl BdfSolver {
                                 Some((kl, ku)) => match BandedLu::factor(system, kl, ku) {
                                     Some(banded) => {
                                         BDF_BAND_NEWTON_HITS.fetch_add(1, Ordering::Relaxed);
+                                        self.band_factorizations += 1;
                                         NewtonFactor::Banded(banded)
                                     }
                                     // Unreachable given the dominance check above, but
@@ -1179,10 +1189,12 @@ where
 mod tests {
     use super::*;
 
-    /// `BDF_FORCE_DENSE_NEWTON` and the two hit counters are process-global, and the
-    /// test harness runs tests concurrently — so every test that toggles them must hold
-    /// this lock or they interleave and read each other's counts. (Observed, not
-    /// hypothetical: the banded test read 18 hits and then 32.)
+    /// `BDF_FORCE_DENSE_NEWTON` is process-global and the test harness runs tests
+    /// concurrently, so every test that toggles it must hold this lock. The lock does NOT
+    /// make the global hit counters safe to read: any other test's BDF solve (none of which
+    /// take it) moves them, which is why the toggle tests count each solver's own
+    /// factorizations instead (frankenscipy-gj3mi; observed: the banded test read 18 hits
+    /// and then 32, and the coupled arm read 1 where 0 was expected).
     static NEWTON_FLAG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -1250,7 +1262,15 @@ mod tests {
     #[test]
     fn bdf_diagonal_newton_is_bit_identical_to_dense_lu() {
         let _guard = NEWTON_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        fn run<F>(fun_builder: impl Fn() -> F, y0: &[f64], t_end: f64, dense: bool) -> Vec<u64>
+        /// The solve's bits and counters, and ITS OWN diagonal factorizations: the global
+        /// `BDF_DIAG_NEWTON_HITS` also counts every other BDF solve running in the process
+        /// (frankenscipy-gj3mi).
+        fn run<F>(
+            fun_builder: impl Fn() -> F,
+            y0: &[f64],
+            t_end: f64,
+            dense: bool,
+        ) -> (Vec<u64>, usize)
         where
             F: FnMut(f64, &[f64]) -> Vec<f64>,
         {
@@ -1281,10 +1301,10 @@ mod tests {
             bits.push(solver.njev() as u64);
             bits.push(solver.nlu() as u64);
             BDF_FORCE_DENSE_NEWTON.store(false, Ordering::Relaxed);
-            bits
+            (bits, solver.diag_factorizations)
         }
 
-        // 1. Exactly diagonal stiff decay — the fast path fires. The hit counter is
+        // 1. Exactly diagonal stiff decay — the fast path fires. The hit count is
         //    the EXECUTION PROOF: without it a broken structural predicate would make
         //    this test pass by never running the code under test.
         let diagonal = || {
@@ -1295,17 +1315,14 @@ mod tests {
             }
         };
         let y0: Vec<f64> = (0..16).map(|j| 1.0 + 0.25 * j as f64).collect();
-        BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
-        let cand = run(diagonal, &y0, 2.0, false);
-        let hits = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
-        let base = run(diagonal, &y0, 2.0, true);
+        let (cand, hits) = run(diagonal, &y0, 2.0, false);
+        let (base, base_hits) = run(diagonal, &y0, 2.0, true);
         assert!(
             hits > 0,
             "diagonal path never executed — the comparison would be vacuous"
         );
         assert_eq!(
-            BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed),
-            hits,
+            base_hits, 0,
             "the forced-dense arm must take zero diagonal factorizations"
         );
         assert_eq!(cand, base, "diagonal arm diverged from the dense LU arm");
@@ -1320,16 +1337,14 @@ mod tests {
                     .collect::<Vec<f64>>()
             }
         };
-        BDF_DIAG_NEWTON_HITS.store(0, Ordering::Relaxed);
-        let cand = run(coupled, &y0, 2.0, false);
+        let (cand, coupled_hits) = run(coupled, &y0, 2.0, false);
         assert_eq!(
-            BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed),
-            0,
+            coupled_hits, 0,
             "the structural predicate accepted a coupled Jacobian"
         );
         assert_eq!(
             cand,
-            run(coupled, &y0, 2.0, true),
+            run(coupled, &y0, 2.0, true).0,
             "coupled system must take the dense path in both arms"
         );
 
@@ -1344,8 +1359,8 @@ mod tests {
             }
         };
         assert_eq!(
-            run(mixed, &y0, 1.0, false),
-            run(mixed, &y0, 1.0, true),
+            run(mixed, &y0, 1.0, false).0,
+            run(mixed, &y0, 1.0, true).0,
             "mixed zero-row system diverged from the dense LU arm"
         );
     }
@@ -1464,7 +1479,9 @@ mod tests {
         };
         let y0: Vec<f64> = (0..n).map(|j| ((j % 7) as f64) * 0.5 + 1.0).collect();
 
-        fn run<F>(builder: impl Fn() -> F, y0: &[f64], dense: bool) -> Vec<u64>
+        /// The solve's bits and counters, and ITS OWN banded factorizations (the global
+        /// counter races every other BDF solve in the process, frankenscipy-gj3mi).
+        fn run<F>(builder: impl Fn() -> F, y0: &[f64], dense: bool) -> (Vec<u64>, usize)
         where
             F: FnMut(f64, &[f64]) -> Vec<f64>,
         {
@@ -1492,23 +1509,79 @@ mod tests {
             bits.push(solver.njev() as u64);
             bits.push(solver.nlu() as u64);
             BDF_FORCE_DENSE_NEWTON.store(false, Ordering::Relaxed);
-            bits
+            (bits, solver.band_factorizations)
         }
 
-        BDF_BAND_NEWTON_HITS.store(0, Ordering::Relaxed);
-        let cand = run(heat, &y0, false);
-        let band_hits = BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed);
-        let base = run(heat, &y0, true);
+        let (cand, band_hits) = run(heat, &y0, false);
+        let (base, base_band_hits) = run(heat, &y0, true);
         assert!(
             band_hits > 0,
             "banded path never executed — the comparison would be vacuous"
         );
         assert_eq!(
-            BDF_BAND_NEWTON_HITS.load(Ordering::Relaxed),
-            band_hits,
+            base_band_hits, 0,
             "the forced-dense arm must take zero banded factorizations"
         );
         assert_eq!(cand, base, "banded arm diverged from the dense LU arm");
+    }
+
+    /// frankenscipy-gj3mi, both arms of the probe: a diagonal BDF solve on ANOTHER thread
+    /// moves the process-global `BDF_DIAG_NEWTON_HITS` (the defect the toggle tests hit),
+    /// while this thread's coupled solver counts zero diagonal factorizations of its own.
+    #[test]
+    fn per_solver_factorization_counts_ignore_other_solves() {
+        let _guard = NEWTON_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        fn solve(fun: &mut impl FnMut(f64, &[f64]) -> Vec<f64>, y0: &[f64]) -> usize {
+            let config = BdfSolverConfig {
+                t0: 0.0,
+                y0,
+                t_bound: 1.0,
+                rtol: 1e-8,
+                atol: ToleranceValue::Scalar(1e-10),
+                max_step: f64::INFINITY,
+                first_step: None,
+                mode: RuntimeMode::Strict,
+                max_order: 5,
+            };
+            let mut solver = BdfSolver::new(fun, config).expect("BDF init");
+            while solver.state() == OdeSolverState::Running {
+                solver.step_with(fun).expect("BDF step");
+            }
+            solver.diag_factorizations
+        }
+        let y0: Vec<f64> = (0..8).map(|j| 1.0 + 0.25 * j as f64).collect();
+        let before = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed);
+        let background = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut diagonal = |_t: f64, y: &[f64]| {
+                        (0..y.len())
+                            .map(|j| -(1.0 + 10.0 * j as f64) * y[j])
+                            .collect::<Vec<f64>>()
+                    };
+                    solve(&mut diagonal, &y0)
+                })
+                .join()
+                .expect("background solve")
+        });
+        let mut coupled = |_t: f64, y: &[f64]| {
+            let n = y.len();
+            (0..n)
+                .map(|j| -2.0 * y[j] + 0.5 * y[(j + 1) % n])
+                .collect::<Vec<f64>>()
+        };
+        let own = solve(&mut coupled, &y0);
+        let global_delta = BDF_DIAG_NEWTON_HITS.load(Ordering::Relaxed) - before;
+        assert!(
+            background > 0,
+            "the background solve never took the diagonal path"
+        );
+        assert!(
+            global_delta >= background,
+            "the global counter must see the other thread's {background} factorizations, \
+             moved by {global_delta}"
+        );
+        assert_eq!(own, 0, "the coupled solver took a diagonal factorization");
     }
 
     #[test]
