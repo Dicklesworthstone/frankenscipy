@@ -1,15 +1,14 @@
 #![forbid(unsafe_code)]
-//! Property-based parity harness for fsci_linalg::ldl on symmetric SPD
-//! matrices: verify A ≈ L D Lᵀ.
+//! Differential harness for `fsci_linalg::ldl` against `scipy.linalg.ldl`, both `lower` values.
 //!
-//! Resolves [frankenscipy-i2gb3]. scipy.linalg.ldl uses permutation +
-//! block-diagonal D and a different storage convention, so direct
-//! element parity is impractical. We check the reconstruction
-//! invariant — which is the contract LDL provides — at 1e-9 abs.
-//! Verification also calls scipy.linalg.eigvals(A) to confirm the test
-//! input is well-conditioned (all-positive eigenvalues).
+//! frankenscipy-zqtde: `ldl` is SciPy's Bunch–Kaufman factorization (`sytrf` plus SciPy's own
+//! post-processing), so its `lu`, `d` and `perm` are compared element by element: `perm`
+//! exactly, `lu` and `d` to 1e-12 relative to the matrix scale (OpenBLAS kernels that fuse
+//! `dsyr`'s multiply-add round a few ulps differently). `A ≈ lu·d·luᵀ` is checked as well.
+//! The cases include symmetric indefinite matrices that need 2×2 pivots and row interchanges,
+//! which the old unpivoted `ldl` factored wrongly while returning `Ok`. Every case must be
+//! compared: an `Err` from either side fails the test.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,14 +19,13 @@ use fsci_linalg::{DecompOptions, ldl};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
-const ABS_TOL: f64 = 1.0e-9;
+const REL_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
     case_id: String,
-    rows: usize,
-    cols: usize,
+    n: usize,
     a: Vec<f64>,
 }
 
@@ -37,11 +35,17 @@ struct OracleQuery {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct Factorization {
+    lu: Vec<f64>,
+    d: Vec<f64>,
+    perm: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
-    /// scipy.linalg.eigvals(A).real sorted — used to verify the input
-    /// is SPD (all eigenvalues > 0) so the test is meaningful.
-    eigvals_sorted: Option<Vec<f64>>,
+    lower: Factorization,
+    upper: Factorization,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,7 +56,10 @@ struct OracleResult {
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
     case_id: String,
-    abs_diff: f64,
+    lower: bool,
+    perm_equal: bool,
+    factor_rel_diff: f64,
+    reconstruction_rel_diff: f64,
     pass: bool,
 }
 
@@ -61,7 +68,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
-    max_abs_diff: f64,
+    max_factor_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -72,8 +79,11 @@ fn output_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("fixtures/artifacts/{PACKET_ID}/diff"))
 }
 
-fn ensure_output_dir() {
+fn emit_log(log: &DiffLog) {
     fs::create_dir_all(output_dir()).expect("create ldl diff output dir");
+    let path = output_dir().join(format!("{}.json", log.test_id));
+    let json = serde_json::to_string_pretty(log).expect("serialize ldl diff log");
+    fs::write(path, json).expect("write ldl diff log");
 }
 
 fn timestamp_ms() -> u128 {
@@ -82,102 +92,112 @@ fn timestamp_ms() -> u128 {
         .map_or(0, |d| d.as_millis())
 }
 
-fn emit_log(log: &DiffLog) {
-    ensure_output_dir();
-    let path = output_dir().join(format!("{}.json", log.test_id));
-    let json = serde_json::to_string_pretty(log).expect("serialize ldl diff log");
-    fs::write(path, json).expect("write ldl diff log");
+fn rows_of(flat: &[f64], n: usize) -> Vec<Vec<f64>> {
+    (0..n).map(|r| flat[r * n..(r + 1) * n].to_vec()).collect()
 }
 
-fn rows_of(a_flat: &[f64], rows: usize, cols: usize) -> Vec<Vec<f64>> {
-    (0..rows)
-        .map(|r| (0..cols).map(|c| a_flat[r * cols + c]).collect())
-        .collect()
-}
-
-fn frob_diff(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
-    let mut max = 0.0_f64;
-    for (ra, rb) in a.iter().zip(b.iter()) {
-        for (&va, &vb) in ra.iter().zip(rb.iter()) {
-            max = max.max((va - vb).abs());
+/// A symmetric matrix from a closed form, so the Python arm needs no data.
+fn symmetric(n: usize, entry: impl Fn(usize, usize) -> f64) -> Vec<f64> {
+    let mut a = vec![0.0; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            let value = entry(i, j);
+            a[i * n + j] = value;
+            a[j * n + i] = value;
         }
     }
-    max
+    a
 }
 
 fn generate_query() -> OracleQuery {
-    let points = vec![
-        PointCase {
-            case_id: "spd_2x2".into(),
-            rows: 2,
-            cols: 2,
-            a: vec![4.0, 1.0, 1.0, 3.0],
-        },
-        PointCase {
-            case_id: "spd_3x3".into(),
-            rows: 3,
-            cols: 3,
-            a: vec![4.0, 1.0, 0.5, 1.0, 5.0, 0.3, 0.5, 0.3, 6.0],
-        },
-        PointCase {
-            case_id: "spd_4x4".into(),
-            rows: 4,
-            cols: 4,
-            a: vec![
-                10.0, 2.0, 1.0, 0.5, 2.0, 8.0, 1.5, 0.7, 1.0, 1.5, 9.0, 1.2, 0.5, 0.7, 1.2, 7.0,
-            ],
-        },
-        PointCase {
-            case_id: "diag_3x3".into(),
-            rows: 3,
-            cols: 3,
-            a: vec![2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 5.0],
-        },
-    ];
-    OracleQuery { points }
+    let case = |id: &str, n: usize, a: Vec<f64>| PointCase {
+        case_id: id.into(),
+        n,
+        a,
+    };
+    OracleQuery {
+        points: vec![
+            case("spd_2x2", 2, vec![4.0, 1.0, 1.0, 3.0]),
+            case(
+                "spd_4x4",
+                4,
+                vec![
+                    10.0, 2.0, 1.0, 0.5, 2.0, 8.0, 1.5, 0.7, 1.0, 1.5, 9.0, 1.2, 0.5, 0.7, 1.2, 7.0,
+                ],
+            ),
+            case(
+                "diag_3x3",
+                3,
+                vec![2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 5.0],
+            ),
+            case("indefinite_2x2", 2, vec![1.0, 2.0, 2.0, -3.0]),
+            // Zero diagonal: only 2×2 pivots and interchanges factor it.
+            case(
+                "zero_diagonal_3x3",
+                3,
+                vec![0.0, 1.0, 2.0, 1.0, 0.0, 3.0, 2.0, 3.0, 0.0],
+            ),
+            case(
+                "saddle_4x4",
+                4,
+                vec![
+                    4.0, 1.0, 0.0, 2.0, 1.0, 0.0, 3.0, 0.0, 0.0, 3.0, -1.0, 1.0, 2.0, 0.0, 1.0, 0.0,
+                ],
+            ),
+            case(
+                "zero_diagonal_9x9",
+                9,
+                symmetric(9, |i, j| {
+                    if i == j {
+                        0.0
+                    } else {
+                        ((i * 7 + j * 3) % 11) as f64 - 5.0
+                    }
+                }),
+            ),
+            case(
+                "indefinite_16x16",
+                16,
+                symmetric(16, |i, j| {
+                    (((i + 1) * (j + 2)) % 13) as f64 - 6.0 + 0.25 * (i == j) as u8 as f64
+                }),
+            ),
+            // Singular: SciPy returns the factorization with a zero pivot, not an error.
+            case("singular_2x2", 2, vec![1.0, 2.0, 2.0, 4.0]),
+        ],
+    }
 }
 
 fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
     let script = r#"
 import json
-import math
 import sys
 import numpy as np
 from scipy import linalg
 
-def finite_sorted_real_or_none(arr):
-    flat = []
-    for v in np.asarray(arr).flatten().tolist():
-        re = float(v.real) if hasattr(v, "real") else float(v)
-        if not math.isfinite(re):
-            return None
-        flat.append(re)
-    flat.sort()
-    return flat
-
 q = json.load(sys.stdin)
 points = []
 for case in q["points"]:
-    cid = case["case_id"]
-    r = int(case["rows"]); c = int(case["cols"])
-    A = np.array(case["a"], dtype=float).reshape(r, c)
-    try:
-        w = linalg.eigvals(A)
-        points.append({"case_id": cid, "eigvals_sorted": finite_sorted_real_or_none(w)})
-    except Exception:
-        points.append({"case_id": cid, "eigvals_sorted": None})
+    n = int(case["n"])
+    A = np.array(case["a"], dtype=float).reshape(n, n)
+    arm = {"case_id": case["case_id"]}
+    for key, lower in (("lower", True), ("upper", False)):
+        lu, d, perm = linalg.ldl(A, lower=lower)
+        arm[key] = {"lu": lu.ravel().tolist(), "d": d.ravel().tolist(),
+                    "perm": [int(p) for p in perm]}
+    points.append(arm)
 print(json.dumps({"points": points}))
 "#;
     let query_json = serde_json::to_string(query).expect("serialize ldl query");
-    let mut child = match fsci_conformance::scipy_oracle_command()
+    let spawned = fsci_conformance::scipy_oracle_command()
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
         Err(e) => {
             assert!(
                 std::env::var(REQUIRE_SCIPY_ENV).is_err(),
@@ -187,19 +207,12 @@ print(json.dumps({"points": points}))
             return None;
         }
     };
-    {
-        let stdin = child.stdin.as_mut().expect("open ldl oracle stdin");
-        if let Err(err) = stdin.write_all(query_json.as_bytes()) {
-            let output = child.wait_with_output().expect("wait for failed oracle");
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                std::env::var(REQUIRE_SCIPY_ENV).is_err(),
-                "ldl oracle stdin write failed: {err}; stderr: {stderr}"
-            );
-            eprintln!("skipping ldl oracle: stdin write failed ({err})\n{stderr}");
-            return None;
-        }
-    }
+    child
+        .stdin
+        .as_mut()
+        .expect("open ldl oracle stdin")
+        .write_all(query_json.as_bytes())
+        .expect("write ldl oracle stdin");
     let output = child.wait_with_output().expect("wait for ldl oracle");
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -214,6 +227,10 @@ print(json.dumps({"points": points}))
     Some(serde_json::from_str(&stdout).expect("parse ldl oracle JSON"))
 }
 
+fn max_abs(values: impl IntoIterator<Item = f64>) -> f64 {
+    values.into_iter().fold(0.0_f64, |m, v| m.max(v.abs()))
+}
+
 #[test]
 fn diff_linalg_ldl_reconstruct() {
     let query = generate_query();
@@ -222,82 +239,88 @@ fn diff_linalg_ldl_reconstruct() {
     };
     assert_eq!(oracle.points.len(), query.points.len());
 
-    let pmap: HashMap<String, PointArm> = oracle
-        .points
-        .into_iter()
-        .map(|d| (d.case_id.clone(), d))
-        .collect();
-
     let start = Instant::now();
     let mut diffs = Vec::new();
-    let mut max_overall = 0.0_f64;
-
-    for case in &query.points {
-        let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(eigs) = scipy_arm.eigvals_sorted.as_ref() else {
-            continue;
-        };
-        // Sanity-check the input is SPD (all eigenvalues positive)
-        if eigs.iter().any(|&e| e <= 0.0) {
-            // Test case isn't valid for LDL on SPD; skip
-            continue;
-        }
-        let a = rows_of(&case.a, case.rows, case.cols);
-        let opts = DecompOptions::default();
-        let Ok(res) = ldl(&a, opts) else {
-            continue;
-        };
-        // Build L D Lᵀ
-        let n = res.l.len();
-        // L * D = scale each column j of L by d[j]
-        let mut ld = vec![vec![0.0_f64; n]; n];
-        for i in 0..n {
-            for j in 0..n {
-                ld[i][j] = res.l[i][j] * res.d[j];
-            }
-        }
-        // (L D) * Lᵀ
-        let mut ldl_t = vec![vec![0.0_f64; n]; n];
-        for i in 0..n {
-            for k in 0..n {
+    for (case, arm) in query.points.iter().zip(&oracle.points) {
+        assert_eq!(case.case_id, arm.case_id);
+        let n = case.n;
+        let a = rows_of(&case.a, n);
+        let scale = max_abs(case.a.iter().copied()).max(f64::MIN_POSITIVE);
+        for (lower, scipy) in [(true, &arm.lower), (false, &arm.upper)] {
+            let ours = match ldl(&a, lower, DecompOptions::default()) {
+                Ok(ours) => ours,
+                Err(e) => {
+                    // A failing case, not a skipped one: the final assertions count it.
+                    eprintln!("ldl {} lower={lower}: {e}", case.case_id);
+                    diffs.push(CaseDiff {
+                        case_id: case.case_id.clone(),
+                        lower,
+                        perm_equal: false,
+                        factor_rel_diff: f64::INFINITY,
+                        reconstruction_rel_diff: f64::INFINITY,
+                        pass: false,
+                    });
+                    continue;
+                }
+            };
+            let lu: Vec<f64> = ours.lu.concat();
+            let d: Vec<f64> = ours.d.concat();
+            let factor_rel_diff = max_abs(
+                lu.iter()
+                    .zip(&scipy.lu)
+                    .chain(d.iter().zip(&scipy.d))
+                    .map(|(x, y)| x - y),
+            ) / scale;
+            // A = lu·d·luᵀ.
+            let mut reconstruction = 0.0_f64;
+            for i in 0..n {
                 for j in 0..n {
-                    ldl_t[i][j] += ld[i][k] * res.l[j][k];
+                    let mut sum = 0.0;
+                    for k in 0..n {
+                        for l in 0..n {
+                            sum += ours.lu[i][k] * ours.d[k][l] * ours.lu[j][l];
+                        }
+                    }
+                    reconstruction = reconstruction.max((sum - a[i][j]).abs());
                 }
             }
+            let reconstruction_rel_diff = reconstruction / scale;
+            let perm_equal = ours.perm == scipy.perm;
+            let pass = perm_equal
+                && lu.len() == scipy.lu.len()
+                && d.len() == scipy.d.len()
+                && factor_rel_diff <= REL_TOL
+                && reconstruction_rel_diff <= 1e-12;
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                lower,
+                perm_equal,
+                factor_rel_diff,
+                reconstruction_rel_diff,
+                pass,
+            });
         }
-        let abs_d = frob_diff(&a, &ldl_t);
-        max_overall = max_overall.max(abs_d);
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            abs_diff: abs_d,
-            pass: abs_d <= ABS_TOL,
-        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
-
     let log = DiffLog {
         test_id: "diff_linalg_ldl_reconstruct".into(),
-        category: "fsci_linalg.ldl A ≈ L D Lᵀ reconstruction".into(),
+        category: "fsci_linalg.ldl vs scipy.linalg.ldl (lu, d, perm; both triangles)".into(),
         case_count: diffs.len(),
-        max_abs_diff: max_overall,
+        max_factor_rel_diff: max_abs(diffs.iter().map(|d| d.factor_rel_diff)),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
         cases: diffs.clone(),
     };
     emit_log(&log);
-
-    for d in &diffs {
-        if !d.pass {
-            eprintln!("ldl mismatch: {} abs_diff={}", d.case_id, d.abs_diff);
-        }
+    for d in diffs.iter().filter(|d| !d.pass) {
+        eprintln!("ldl mismatch: {d:?}");
     }
-
-    assert!(
-        all_pass,
-        "ldl conformance failed: {} cases, max_diff={}",
+    assert_eq!(
         diffs.len(),
-        max_overall
+        2 * query.points.len(),
+        "every case must be compared"
     );
+    assert!(all_pass, "ldl conformance failed: {log:?}");
 }

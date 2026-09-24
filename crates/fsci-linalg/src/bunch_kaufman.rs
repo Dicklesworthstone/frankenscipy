@@ -100,6 +100,17 @@ impl BunchKaufman {
         self.info > 0
     }
 
+    /// LAPACK's `IPIV` (see the field).
+    pub(crate) fn ipiv(&self) -> &[isize] {
+        &self.ipiv
+    }
+
+    /// Entry `(i, j)` (0-based) of the factored storage: `D` and the multipliers in the
+    /// factored triangle.
+    pub(crate) fn packed(&self, i: usize, j: usize) -> f64 {
+        self.a[i + j * self.n]
+    }
+
     /// `dsytrs(uplo, n, 1, a, ipiv, b)`: `x` with `A·x = b`. Callers check
     /// [`Self::is_singular`] first, as `dsytrf`'s INFO > 0 stops SciPy before it solves.
     pub(crate) fn solve(&self, b: &[f64]) -> Vec<f64> {

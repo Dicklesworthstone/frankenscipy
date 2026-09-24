@@ -619,10 +619,13 @@ pub struct CholeskyResult {
 /// Result of LDL decomposition: A = L * D * Lᵀ.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LdlResult {
-    /// Unit lower triangular factor L.
-    pub l: Vec<Vec<f64>>,
-    /// Diagonal entries of D.
-    pub d: Vec<f64>,
+    /// The outer factor, `scipy.linalg.ldl`'s `lu`: `lu[perm]` is unit lower (`lower`) or unit
+    /// upper triangular, and `A = lu · d · luᵀ`.
+    pub lu: Vec<Vec<f64>>,
+    /// The block diagonal factor: 1×1 and symmetric 2×2 blocks.
+    pub d: Vec<Vec<f64>>,
+    /// The row permutation that makes `lu` triangular (`lu[perm[i]]` is row `i`).
+    pub perm: Vec<usize>,
 }
 
 /// Compact Cholesky factorization for use with `cho_solve`.
@@ -6803,12 +6806,20 @@ pub fn cholesky_banded(ab: &[Vec<f64>], lower: bool) -> Result<Vec<Vec<f64>>, Li
     Ok(c)
 }
 
-/// LDL decomposition for symmetric indefinite matrices.
+/// `scipy.linalg.ldl(a, lower)` for a real symmetric matrix: the Bunch–Kaufman factorization
+/// `A = lu · d · luᵀ`, where `d` is block diagonal (1×1 and 2×2 blocks) and `lu[perm]` is
+/// unit lower (`lower`, SciPy's default) or unit upper triangular. Only the `lower` / upper
+/// triangle of `a` is read, as in SciPy.
 ///
-/// Factors A = L * D * Lᵀ where L is unit lower triangular and D is diagonal.
-/// Unlike Cholesky, this works for symmetric matrices that are not positive definite.
-/// Matches `scipy.linalg.ldl(a)` for the real symmetric case.
-pub fn ldl(a: &[Vec<f64>], options: DecompOptions) -> Result<LdlResult, LinalgError> {
+/// `sytrf` (here `dsytf2`, see `bunch_kaufman.rs`) followed by SciPy's own post-processing
+/// (`_ldl_sanitize_ipiv`, `_ldl_get_d_and_l`, `_ldl_construct_tri_factor`), which only moves
+/// entries. Measured against `scipy.linalg.ldl` on 60 symmetric matrices (n = 1..64), both
+/// triangles: `lu`, `d` and `perm` bit-identical 120/120 under OpenBLAS's non-FMA kernels;
+/// `perm` 120/120 and `lu` / `d` 97/120 under Haswell / Zen, whose `dsyr` fuses. This replaced
+/// an unpivoted LDLᵀ that returned `Ok` with `L·D·Lᵀ ≠ A` whenever a pivot was zero, e.g. on
+/// any zero-diagonal matrix (frankenscipy-zqtde). Like SciPy, a singular `D` is returned, not
+/// an error.
+pub fn ldl(a: &[Vec<f64>], lower: bool, options: DecompOptions) -> Result<LdlResult, LinalgError> {
     let (rows, cols) = matrix_shape(a)?;
     if rows != cols {
         return Err(LinalgError::ExpectedSquareMatrix);
@@ -6819,8 +6830,9 @@ pub fn ldl(a: &[Vec<f64>], options: DecompOptions) -> Result<LdlResult, LinalgEr
     let n = rows;
     if n == 0 {
         return Ok(LdlResult {
-            l: Vec::new(),
+            lu: Vec::new(),
             d: Vec::new(),
+            perm: Vec::new(),
         });
     }
 
@@ -6840,65 +6852,107 @@ pub fn ldl(a: &[Vec<f64>], options: DecompOptions) -> Result<LdlResult, LinalgEr
         }
     }
 
-    // Aasen / Bunch-Kaufman-style 1×1 pivoting LDL factorization
-    // (no permutation for simplicity — matches basic scipy.linalg.ldl behavior)
-    let mut l_mat = vec![vec![0.0; n]; n];
-    let mut d_vec = vec![0.0; n];
+    let triangle = if lower {
+        Triangle::Lower
+    } else {
+        Triangle::Upper
+    };
+    let factor = BunchKaufman::factor(a, triangle);
+    let ipiv = factor.ipiv();
 
-    // Copy lower triangle of A
-    let mut work = vec![vec![0.0; n]; n];
-    for i in 0..n {
-        for j in 0..=i {
-            work[i][j] = a[i][j];
+    // `_ldl_sanitize_ipiv`: the row swaps, and the block sizes (2 at a 2×2 block's first index,
+    // then 0).
+    let mut swap: Vec<usize> = (0..n).collect();
+    let mut blocks = vec![0_usize; n];
+    let order: Vec<usize> = if lower {
+        (0..n).collect()
+    } else {
+        (0..n).rev().collect()
+    };
+    let mut skip_2x2 = false;
+    for ind in order {
+        if skip_2x2 {
+            skip_2x2 = false;
+            continue;
+        }
+        let pivot = ipiv[ind];
+        let row = pivot.unsigned_abs();
+        if pivot > 0 {
+            if row != ind + 1 {
+                swap[ind] = swap[row - 1];
+            }
+            blocks[ind] = 1;
+        } else {
+            // A 2×2 block: `dsytf2` gives both of its rows the same negative entry, and the
+            // other row is below `ind` for `lower`, above it otherwise.
+            let partner = if lower { ind + 1 } else { ind - 1 };
+            debug_assert_eq!(ipiv[partner], pivot);
+            if row != ind + 2 {
+                swap[partner] = swap[row - 1];
+            }
+            blocks[if lower { ind } else { partner }] = 2;
+            skip_2x2 = true;
         }
     }
 
-    // The pivot floor below which `d[j]` counts as unusable, expressed relative
-    // to the largest diagonal of A rather than as the absolute `f64::EPSILON *
-    // 1e3` this used to be. An absolute floor asks whether the MATRIX is small,
-    // not whether the pivot is degenerate: uniformly scaling a well-conditioned
-    // symmetric matrix by 2^-46 put every pivot under 2.22e-13, so the skip
-    // branch fired on every column and `ldl` returned an `Ok` factorization that
-    // missed A by 7.1% relative — silently, with no error (frankenscipy-ze5a6).
-    // Measured live, `scipy.linalg.ldl` reconstructs the same fixture to
-    // 8.474e-17 at every scale down to 2^-60, where its own min |d| is 5.118e-18.
-    // Relative-to-largest-diagonal is the form frankenscipy-4u7vp established
-    // for `update_solution`, and it makes the question scale-free while keeping
-    // what the guard was for: never divide by a numerically zero pivot.
-    let largest_diagonal = (0..n).fold(0.0_f64, |largest, i| largest.max(a[i][i].abs()));
-    let pivot_floor = f64::EPSILON * 1e3 * largest_diagonal;
-
-    for j in 0..n {
-        // Compute d[j]
-        let mut sum = work[j][j];
-        for k in 0..j {
-            sum -= l_mat[j][k] * l_mat[j][k] * d_vec[k];
-        }
-        d_vec[j] = sum;
-
-        // Set diagonal of L to 1
-        l_mat[j][j] = 1.0;
-
-        // The `== 0.0` arm is not redundant: a matrix whose diagonal is entirely
-        // zero leaves `pivot_floor` at zero, and `0.0 < 0.0` is false, so the
-        // relative test alone would divide by the pivot it was meant to catch.
-        if d_vec[j] == 0.0 || d_vec[j].abs() < pivot_floor {
-            // Near-zero diagonal: skip to avoid division by zero
-            // The matrix has a near-zero eigenvalue
-            for row in l_mat.iter_mut().skip(j + 1) {
-                row[j] = 0.0;
+    // `_ldl_get_d_and_l`: `d` from the diagonal and each 2×2 block's off-diagonal entry, `lu`
+    // from the rest of the factored triangle with a unit diagonal.
+    let mut d = vec![vec![0.0; n]; n];
+    let mut lu = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        d[i][i] = factor.packed(i, i);
+        for j in 0..n {
+            if (lower && i > j) || (!lower && i < j) {
+                lu[i][j] = factor.packed(i, j);
             }
+        }
+        lu[i][i] = 1.0;
+    }
+    let mut start = 0;
+    for &size in blocks.iter().filter(|&&size| size != 0) {
+        if size == 2 {
+            let (r, c) = if lower {
+                (start + 1, start)
+            } else {
+                (start, start + 1)
+            };
+            let off_diagonal = factor.packed(r, c);
+            d[r][c] = off_diagonal;
+            d[c][r] = off_diagonal;
+            lu[r][c] = 0.0;
+        }
+        start += size;
+    }
+
+    // `_ldl_construct_tri_factor`: apply the swaps to rows of `lu` (both columns of a 2×2
+    // block), then invert the permutation.
+    let mut perm: Vec<usize> = (0..n).collect();
+    let order: Vec<usize> = if lower {
+        (0..n).rev().collect()
+    } else {
+        (0..n).collect()
+    };
+    for ind in order {
+        let target = swap[ind];
+        if target == ind {
             continue;
         }
-
-        // Compute column j of L below diagonal
-        for i in (j + 1)..n {
-            let mut sum = work[i][j];
-            for k in 0..j {
-                sum -= l_mat[i][k] * l_mat[j][k] * d_vec[k];
-            }
-            l_mat[i][j] = sum / d_vec[j];
+        let (mut first, mut end) = if lower { (ind, n) } else { (0, ind + 1) };
+        if lower && blocks[ind] == 0 {
+            first -= 1;
+        } else if !lower && blocks[ind] == 2 {
+            end += 1;
         }
+        for column in first..end {
+            let value = lu[target][column];
+            lu[target][column] = lu[ind][column];
+            lu[ind][column] = value;
+        }
+        perm.swap(target, ind);
+    }
+    let mut inverse = vec![0; n];
+    for (position, &row) in perm.iter().enumerate() {
+        inverse[row] = position;
     }
 
     emit_trace(LinalgTrace {
@@ -6910,7 +6964,11 @@ pub fn ldl(a: &[Vec<f64>], options: DecompOptions) -> Result<LdlResult, LinalgEr
         error: None,
     });
 
-    Ok(LdlResult { l: l_mat, d: d_vec })
+    Ok(LdlResult {
+        lu,
+        d,
+        perm: inverse,
+    })
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -40113,17 +40171,46 @@ mod proptest_tests {
 
     // ── LDL decomposition tests ─────────────────────────────────────
 
+    /// `lu · d · luᵀ` of an `ldl` result.
+    fn ldl_product(result: &LdlResult) -> Vec<Vec<f64>> {
+        let n = result.lu.len();
+        (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        let mut sum = 0.0;
+                        for k in 0..n {
+                            for l in 0..n {
+                                sum += result.lu[i][k] * result.d[k][l] * result.lu[j][l];
+                            }
+                        }
+                        sum
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     fn verify_ldl_reconstruction(a: &[Vec<f64>], result: &LdlResult) {
-        let n = result.d.len();
-        for (i, row_a) in a.iter().enumerate().take(n) {
-            for (j, &aij) in row_a.iter().enumerate().take(n) {
-                let sum: f64 = (0..n)
-                    .map(|k| result.l[i][k] * result.d[k] * result.l[j][k])
-                    .sum();
+        for (i, (row_a, row_p)) in a.iter().zip(ldl_product(result)).enumerate() {
+            for (j, (&aij, pij)) in row_a.iter().zip(row_p).enumerate() {
                 assert!(
-                    (sum - aij).abs() < 1e-10,
-                    "LDLᵀ[{i}][{j}]={sum} != A[{i}][{j}]={aij}",
+                    (pij - aij).abs() < 1e-10,
+                    "LDLᵀ[{i}][{j}]={pij} != A[{i}][{j}]={aij}",
                 );
+            }
+        }
+    }
+
+    /// `lu[perm]` is unit lower (`lower`) or unit upper triangular.
+    fn assert_ldl_triangular(result: &LdlResult, lower: bool) {
+        for (i, &row) in result.perm.iter().enumerate() {
+            for (j, &value) in result.lu[row].iter().enumerate() {
+                if i == j {
+                    assert_eq!(value, 1.0, "lu[perm] diagonal at {i}");
+                } else if (lower && j > i) || (!lower && j < i) {
+                    assert_eq!(value, 0.0, "lu[perm][{i}][{j}] outside the triangle");
+                }
             }
         }
     }
@@ -40254,15 +40341,11 @@ mod proptest_tests {
     /// an absolute `< 1e-10` assertion passes over it without noticing
     /// (frankenscipy-ze5a6).
     fn ldl_relative_reconstruction_error(a: &[Vec<f64>], result: &LdlResult) -> f64 {
-        let n = result.d.len();
         let mut worst = 0.0_f64;
         let mut largest = 0.0_f64;
-        for (i, row_a) in a.iter().enumerate().take(n) {
-            for (j, &aij) in row_a.iter().enumerate().take(n) {
-                let sum: f64 = (0..n)
-                    .map(|k| result.l[i][k] * result.d[k] * result.l[j][k])
-                    .sum();
-                worst = worst.max((sum - aij).abs());
+        for (row_a, row_p) in a.iter().zip(ldl_product(result)) {
+            for (&aij, pij) in row_a.iter().zip(row_p) {
+                worst = worst.max((pij - aij).abs());
                 largest = largest.max(aij.abs());
             }
         }
@@ -40287,7 +40370,7 @@ mod proptest_tests {
         for exponent in [0_i32, 20, 40, 44, 46, 50, 60] {
             let scale = 2.0_f64.powi(-exponent);
             let a = ldl_scaled_fixture(n, scale);
-            let result = ldl(&a, DecompOptions::default()).expect("ldl works");
+            let result = ldl(&a, true, DecompOptions::default()).expect("ldl works");
             let error = ldl_relative_reconstruction_error(&a, &result);
             assert!(
                 error < 1e-14,
@@ -40295,18 +40378,16 @@ mod proptest_tests {
                  reconstructs the same matrix to 8.474e-17 at this scale"
             );
             assert!(
-                result.d.iter().all(|value| *value != 0.0),
-                "no pivot of a well-conditioned matrix should have been skipped at 2^-{exponent}"
+                (0..n).all(|i| result.d[i][i] != 0.0),
+                "no pivot of a well-conditioned matrix should be zero at 2^-{exponent}"
             );
         }
     }
 
-    /// The factorization `ldl` performed BEFORE frankenscipy-ze5a6: identical in
-    /// every respect except that the pivot guard is the old absolute
-    /// `f64::EPSILON * 1e3`. Kept as a reference arm rather than a recorded
-    /// golden so the comparison is made by this build against this build — a
-    /// stored constant could only ever prove what some earlier binary did.
-    fn ldl_with_the_old_absolute_pivot_floor(a: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<f64>) {
+    /// The unpivoted factorization `ldl` performed BEFORE frankenscipy-ze5a6, with its
+    /// absolute pivot guard `f64::EPSILON * 1e3`. Kept as a reference arm rather than a
+    /// recorded golden so the comparison is made by this build against this build.
+    fn ldl_with_the_old_absolute_pivot_floor(a: &[Vec<f64>]) -> LdlResult {
         let n = a.len();
         let mut l_mat = vec![vec![0.0; n]; n];
         let mut d_vec = vec![0.0; n];
@@ -40337,43 +40418,30 @@ mod proptest_tests {
                 l_mat[i][j] = sum / d_vec[j];
             }
         }
-        (l_mat, d_vec)
+        LdlResult {
+            lu: l_mat,
+            d: (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| if i == j { d_vec[i] } else { 0.0 })
+                        .collect()
+                })
+                .collect(),
+            perm: (0..n).collect(),
+        }
     }
 
-    /// Negative case (2) for frankenscipy-ze5a6: making the pivot floor relative
-    /// must leave a WELL-SCALED factorization untouched, byte for byte. This
-    /// fixture's largest diagonal is 7.0, so the floor moves from 2.22e-13 to
-    /// 1.55e-12 — every pivot here is order 1, neither value is reachable, and
-    /// the two guards must therefore produce identical bits.
-    ///
-    /// The same comparison at 2^-46 is what makes this test more than a
-    /// restatement: there the two arms MUST differ, and the test says so, so it
-    /// cannot pass by comparing a routine against itself.
+    /// frankenscipy-ze5a6's must-differ arm, kept for the Bunch–Kaufman `ldl`
+    /// (frankenscipy-zqtde): at 2^-46 the old absolute floor swallows every pivot and the
+    /// reference arm reconstructs A badly, while `ldl` does not. It also shows the unpivoted
+    /// algorithm failing on a zero diagonal, which `ldl` factors exactly. (The byte-identity
+    /// with the unpivoted loop at scale 1 that this test used to assert no longer applies:
+    /// `ldl` is now `dsytf2`'s right-looking update, in SciPy's operation order.)
     #[test]
-    fn a_well_scaled_ldl_is_untouched_by_the_relative_pivot_floor() {
-        let well_scaled = ldl_scaled_fixture(8, 1.0);
-        let current = ldl(&well_scaled, DecompOptions::default()).expect("ldl works");
-        let (reference_l, reference_d) = ldl_with_the_old_absolute_pivot_floor(&well_scaled);
-        assert_eq!(
-            current.l, reference_l,
-            "L of a well-scaled matrix moved when the pivot floor became relative"
-        );
-        assert_eq!(
-            current.d, reference_d,
-            "D of a well-scaled matrix moved when the pivot floor became relative"
-        );
-
-        // And the arm that proves the comparison above can tell the two apart:
-        // at 2^-46 the old absolute floor swallows every pivot and the new one
-        // swallows none, so the reference must reconstruct A badly while the
-        // current routine reconstructs it well.
+    fn the_old_unpivoted_ldl_fails_where_ldl_does_not() {
         let scaled = ldl_scaled_fixture(8, 2.0_f64.powi(-46));
-        let current = ldl(&scaled, DecompOptions::default()).expect("ldl works");
-        let (reference_l, reference_d) = ldl_with_the_old_absolute_pivot_floor(&scaled);
-        let reference = LdlResult {
-            l: reference_l,
-            d: reference_d,
-        };
+        let current = ldl(&scaled, true, DecompOptions::default()).expect("ldl works");
+        let reference = ldl_with_the_old_absolute_pivot_floor(&scaled);
         let reference_error = ldl_relative_reconstruction_error(&scaled, &reference);
         let current_error = ldl_relative_reconstruction_error(&scaled, &current);
         assert!(
@@ -40383,73 +40451,158 @@ mod proptest_tests {
         );
         assert!(
             current_error < 1e-14,
-            "the relative floor must reconstruct A at 2^-46, got {current_error:.3e}"
+            "ldl must reconstruct A at 2^-46, got {current_error:.3e}"
+        );
+
+        let zero_diagonal = vec![
+            vec![0.0, 1.0, 2.0],
+            vec![1.0, 0.0, 3.0],
+            vec![2.0, 3.0, 0.0],
+        ];
+        let reference = ldl_with_the_old_absolute_pivot_floor(&zero_diagonal);
+        assert!(ldl_relative_reconstruction_error(&zero_diagonal, &reference) > 0.5);
+        let current = ldl(&zero_diagonal, true, DecompOptions::default()).expect("ldl works");
+        assert_eq!(
+            ldl_relative_reconstruction_error(&zero_diagonal, &current),
+            0.0
         );
     }
 
-    /// Negative case (1) for frankenscipy-ze5a6: a pivot that is genuinely zero
-    /// must still take the skip branch rather than dividing by it. The
-    /// all-zero-diagonal arm is the one a purely relative floor gets wrong —
-    /// there the floor is itself zero and `0.0 < 0.0` is false.
+    fn assert_ldl_bits(result: &LdlResult, lu: &[&[f64]], d: &[&[f64]], perm: &[usize]) {
+        let bits =
+            |rows: &[Vec<f64>]| -> Vec<u64> { rows.concat().iter().map(|v| v.to_bits()).collect() };
+        let want =
+            |rows: &[&[f64]]| -> Vec<u64> { rows.concat().iter().map(|v| v.to_bits()).collect() };
+        assert_eq!(bits(&result.lu), want(lu), "lu = {:?}", result.lu);
+        assert_eq!(bits(&result.d), want(d), "d = {:?}", result.d);
+        assert_eq!(result.perm, perm);
+    }
+
+    /// frankenscipy-zqtde: `ldl` is `scipy.linalg.ldl`. Every value below is SciPy 1.17.1's,
+    /// identical under OpenBLAS's Prescott, Nehalem, Sandybridge, Haswell and Zen kernels,
+    /// compared bit for bit (signed zeros included). The zero-diagonal matrix needs a 2×2
+    /// block and a row interchange; the unpivoted `ldl` this replaced returned `Ok` with every
+    /// pivot zero and `L·D·Lᵀ = 0`.
     #[test]
-    fn ldl_still_skips_a_pivot_that_is_actually_zero() {
-        // Diagonal is entirely zero, so the relative floor degenerates to zero.
+    fn ldl_matches_scipy_bunch_kaufman() {
+        let options = DecompOptions::default();
+        let zero_diagonal = vec![
+            vec![0.0, 1.0, 2.0],
+            vec![1.0, 0.0, 3.0],
+            vec![2.0, 3.0, 0.0],
+        ];
+        let lower = ldl(&zero_diagonal, true, options).expect("ldl lower");
+        assert_ldl_bits(
+            &lower,
+            &[&[1.0, 0.0, 0.0], &[1.5, 0.5, 1.0], &[0.0, 1.0, 0.0]],
+            &[&[0.0, 2.0, 0.0], &[2.0, 0.0, 0.0], &[0.0, 0.0, -3.0]],
+            &[0, 2, 1],
+        );
+        assert_ldl_triangular(&lower, true);
+        let upper = ldl(&zero_diagonal, false, options).expect("ldl upper");
+        assert_ldl_bits(
+            &upper,
+            &[
+                &[1.0, 0.666_666_666_666_666_6, 0.333_333_333_333_333_3],
+                &[0.0, 1.0, 0.0],
+                &[0.0, 0.0, 1.0],
+            ],
+            &[
+                &[-1.333_333_333_333_333_3, 0.0, 0.0],
+                &[0.0, 0.0, 3.0],
+                &[0.0, 3.0, 0.0],
+            ],
+            &[0, 1, 2],
+        );
+        assert_ldl_triangular(&upper, false);
+        for result in [&lower, &upper] {
+            verify_ldl_reconstruction(&zero_diagonal, result);
+        }
+
+        // A 1×1 pivot with an interchange, both triangles.
+        let indefinite = vec![vec![1.0, 2.0], vec![2.0, -3.0]];
+        assert_ldl_bits(
+            &ldl(&indefinite, true, options).expect("ldl"),
+            &[&[-0.666_666_666_666_666_6, 1.0], &[1.0, 0.0]],
+            &[&[-3.0, 0.0], &[0.0, 2.333_333_333_333_333]],
+            &[1, 0],
+        );
+        assert_ldl_bits(
+            &ldl(&indefinite, false, options).expect("ldl"),
+            &[&[1.0, -0.666_666_666_666_666_6], &[0.0, 1.0]],
+            &[&[2.333_333_333_333_333, 0.0], &[0.0, -3.0]],
+            &[0, 1],
+        );
+
+        // scipy.linalg.ldl([[2, 1], [1, 3]]) and its upper form.
+        let spd = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
+        assert_ldl_bits(
+            &ldl(&spd, true, options).expect("ldl"),
+            &[&[1.0, 0.0], &[0.5, 1.0]],
+            &[&[2.0, 0.0], &[0.0, 2.5]],
+            &[0, 1],
+        );
+        assert_ldl_bits(
+            &ldl(&spd, false, options).expect("ldl"),
+            &[&[1.0, 0.333_333_333_333_333_3], &[0.0, 1.0]],
+            &[&[1.666_666_666_666_666_7, 0.0], &[0.0, 3.0]],
+            &[0, 1],
+        );
+    }
+
+    /// A zero pivot is never divided by: like SciPy, `ldl` returns the singular `D` (with a
+    /// zero block or entry), and the factors stay finite and reconstruct `A` exactly.
+    #[test]
+    fn ldl_returns_a_singular_d_without_dividing_by_it() {
+        let options = DecompOptions::default();
         let hollow = vec![
             vec![0.0, 1.0, 0.0],
             vec![1.0, 0.0, 1.0],
             vec![0.0, 1.0, 0.0],
         ];
-        let result = ldl(&hollow, DecompOptions::default()).expect("ldl works");
-        assert!(
-            result.l.iter().flatten().all(|value| value.is_finite()),
-            "a zero pivot must be skipped, not divided by: {:?}",
-            result.l
+        assert_ldl_bits(
+            &ldl(&hollow, true, options).expect("ldl"),
+            &[&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0], &[1.0, -0.0, 1.0]],
+            &[&[0.0, 1.0, 0.0], &[1.0, 0.0, 0.0], &[0.0, 0.0, 0.0]],
+            &[0, 1, 2],
         );
-        assert!(
-            result.d.iter().all(|value| value.is_finite()),
-            "D must stay finite for a zero pivot: {:?}",
-            result.d
+        assert_ldl_bits(
+            &ldl(&hollow, false, options).expect("ldl"),
+            &[&[1.0, -0.0, 1.0], &[0.0, 1.0, 0.0], &[0.0, 0.0, 1.0]],
+            &[&[0.0, 0.0, 0.0], &[0.0, 0.0, 1.0], &[0.0, 1.0, 0.0]],
+            &[0, 1, 2],
         );
-
-        // A singular matrix with a nonzero diagonal still reaches the skip
-        // branch through the relative floor rather than through `== 0.0`.
-        let singular = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
-        let result = ldl(&singular, DecompOptions::default()).expect("ldl works");
-        assert!(
-            result.d.iter().all(|value| value.is_finite())
-                && result.l.iter().flatten().all(|value| value.is_finite()),
-            "a rank-deficient matrix must not produce a non-finite factor"
+        let rank_one = vec![vec![1.0, 1.0], vec![1.0, 1.0]];
+        for lower in [true, false] {
+            let result = ldl(&rank_one, lower, options).expect("ldl");
+            assert!(result.d.concat().iter().all(|value| value.is_finite()));
+            verify_ldl_reconstruction(&rank_one, &result);
+        }
+        assert_ldl_bits(
+            &ldl(&rank_one, true, options).expect("ldl"),
+            &[&[1.0, 0.0], &[1.0, 1.0]],
+            &[&[1.0, 0.0], &[0.0, 0.0]],
+            &[0, 1],
         );
     }
 
     #[test]
     fn ldl_identity() {
         let a = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        let result = ldl(&a, DecompOptions::default()).expect("ldl works");
-        // L should be identity, D should be [1, 1]
-        assert_eq!(result.l, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
-        assert_eq!(result.d, vec![1.0, 1.0]);
+        let result = ldl(&a, true, DecompOptions::default()).expect("ldl works");
+        assert_eq!(result.lu, a);
+        assert_eq!(result.d, a);
+        assert_eq!(result.perm, [0, 1]);
     }
 
     #[test]
     fn ldl_positive_definite() {
-        // A = [[4, 2], [2, 3]]
         let a = vec![vec![4.0, 2.0], vec![2.0, 3.0]];
-        let result = ldl(&a, DecompOptions::default()).expect("ldl works");
-        verify_ldl_reconstruction(&a, &result);
-    }
-
-    #[test]
-    fn ldl_symmetric_indefinite() {
-        // A = [[1, 2], [2, -3]] — symmetric but not positive definite
-        let a = vec![vec![1.0, 2.0], vec![2.0, -3.0]];
-        let result = ldl(&a, DecompOptions::default()).expect("ldl works");
-        verify_ldl_reconstruction(&a, &result);
-        // D should have a negative element (indefinite)
-        assert!(
-            result.d.iter().any(|&v| v < 0.0),
-            "D should have negative entry for indefinite matrix"
-        );
+        for lower in [true, false] {
+            let result = ldl(&a, lower, DecompOptions::default()).expect("ldl works");
+            verify_ldl_reconstruction(&a, &result);
+            assert_ldl_triangular(&result, lower);
+        }
     }
 
     #[test]
@@ -40459,37 +40612,35 @@ mod proptest_tests {
             vec![1.0, 5.0, 3.0],
             vec![2.0, 3.0, 6.0],
         ];
-        let result = ldl(&a, DecompOptions::default()).expect("ldl works");
-        verify_ldl_reconstruction(&a, &result);
-        // L should be unit lower triangular
-        for (i, row) in result.l.iter().enumerate() {
-            assert_eq!(row[i], 1.0, "L diagonal should be 1");
-            for &val in row.iter().skip(i + 1) {
-                assert_eq!(val, 0.0, "L upper triangle should be 0");
-            }
+        for lower in [true, false] {
+            let result = ldl(&a, lower, DecompOptions::default()).expect("ldl works");
+            verify_ldl_reconstruction(&a, &result);
+            assert_ldl_triangular(&result, lower);
         }
     }
 
     #[test]
     fn ldl_empty_matrix() {
         let a: Vec<Vec<f64>> = Vec::new();
-        let result = ldl(&a, DecompOptions::default()).expect("ldl empty");
-        assert!(result.l.is_empty());
+        let result = ldl(&a, true, DecompOptions::default()).expect("ldl empty");
+        assert!(result.lu.is_empty());
         assert!(result.d.is_empty());
+        assert!(result.perm.is_empty());
     }
 
     #[test]
     fn ldl_1x1() {
         let a = vec![vec![7.0]];
-        let result = ldl(&a, DecompOptions::default()).expect("ldl 1x1");
-        assert_eq!(result.l, vec![vec![1.0]]);
-        assert_eq!(result.d, vec![7.0]);
+        let result = ldl(&a, true, DecompOptions::default()).expect("ldl 1x1");
+        assert_eq!(result.lu, vec![vec![1.0]]);
+        assert_eq!(result.d, vec![vec![7.0]]);
+        assert_eq!(result.perm, [0]);
     }
 
     #[test]
     fn ldl_non_square_rejected() {
         let a = vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0, 6.0]];
-        let err = ldl(&a, DecompOptions::default()).expect_err("non-square");
+        let err = ldl(&a, true, DecompOptions::default()).expect_err("non-square");
         assert!(matches!(err, LinalgError::ExpectedSquareMatrix));
     }
 
@@ -40500,7 +40651,7 @@ mod proptest_tests {
             mode: RuntimeMode::Hardened,
             check_finite: true,
         };
-        let err = ldl(&a, options).expect_err("asymmetric in hardened");
+        let err = ldl(&a, true, options).expect_err("asymmetric in hardened");
         assert!(matches!(err, LinalgError::InvalidArgument { .. }));
     }
 
@@ -44847,16 +44998,12 @@ mod proptest_tests {
     #[test]
     fn ldl_matches_scipy_reference_values() {
         // scipy.linalg.ldl([[2, 1], [1, 3]])
-        // -> l = [[1, 0], [0.5, 1]], d = [[2, 0], [0, 2.5]]
+        // -> lu = [[1, 0], [0.5, 1]], d = [[2, 0], [0, 2.5]], perm = [0, 1]
         let a = vec![vec![2.0, 1.0], vec![1.0, 3.0]];
-        let result = ldl(&a, DecompOptions::default()).expect("ldl");
-        // Check L matrix
-        assert!((result.l[0][0] - 1.0).abs() < 1e-10);
-        assert!((result.l[1][0] - 0.5).abs() < 1e-10);
-        assert!((result.l[1][1] - 1.0).abs() < 1e-10);
-        // Check D diagonal
-        assert!((result.d[0] - 2.0).abs() < 1e-10);
-        assert!((result.d[1] - 2.5).abs() < 1e-10);
+        let result = ldl(&a, true, DecompOptions::default()).expect("ldl");
+        assert_eq!(result.lu, vec![vec![1.0, 0.0], vec![0.5, 1.0]]);
+        assert_eq!(result.d, vec![vec![2.0, 0.0], vec![0.0, 2.5]]);
+        assert_eq!(result.perm, [0, 1]);
     }
 
     #[test]
