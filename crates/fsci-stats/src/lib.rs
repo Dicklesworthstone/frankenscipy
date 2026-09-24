@@ -11731,6 +11731,10 @@ fn sample_nhypergeom(m: u64, n: u64, r: u64, rng: &mut impl Rng) -> u64 {
     fail
 }
 
+/// 2^63, the largest Zipf variate `sample_zipf` returns, written so the literal is exactly
+/// representable (clippy::excessive_precision).
+const ZIPF_MAX_VAL: f64 = 9_223_372_036_854_775_808.0;
+
 /// Draw a single Zipf(a) variate for a > 1.
 #[allow(dead_code)]
 fn sample_zipf(a: f64, rng: &mut impl Rng) -> u64 {
@@ -11739,8 +11743,7 @@ fn sample_zipf(a: f64, rng: &mut impl Rng) -> u64 {
     }
     let am1 = a - 1.0;
     let b = 2.0_f64.powf(am1);
-    // 2^63, written so the literal is exactly representable (clippy::excessive_precision).
-    let max_val = 9_223_372_036_854_775_808.0_f64;
+    let max_val = ZIPF_MAX_VAL;
     let c = max_val.powf(-am1);
     loop {
         let u: f64 = rng.random();
@@ -11757,6 +11760,20 @@ fn sample_zipf(a: f64, rng: &mut impl Rng) -> u64 {
         if lhs >= rhs {
             return k as u64;
         }
+    }
+}
+
+#[cfg(test)]
+mod zipf_max_val_tests {
+    /// The bound is 2^63 to the bit: rounding the literal to quiet clippy (e.g. to
+    /// 9.223372036854775e18, which is 2^63 − 1024 — a different double) fails here.
+    #[test]
+    fn zipf_max_val_is_exactly_two_to_the_63() {
+        assert_eq!(super::ZIPF_MAX_VAL.to_bits(), 2.0_f64.powi(63).to_bits());
+        assert_ne!(
+            super::ZIPF_MAX_VAL.to_bits(),
+            9.223_372_036_854_775e18_f64.to_bits()
+        );
     }
 }
 
