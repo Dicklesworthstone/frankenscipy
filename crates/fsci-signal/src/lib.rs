@@ -4255,12 +4255,12 @@ fn local_maxima_1d(x: &[f64]) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
 }
 
 /// SciPy's `_select_by_peak_distance`: visit peaks from highest to lowest (`priority`) and drop
-/// every not-yet-dropped neighbour closer than `distance` samples. Equal priorities are visited
-/// right to left (numpy's stable ascending argsort, walked backwards).
+/// every not-yet-dropped neighbour closer than `distance` samples. The visiting order is
+/// `np.argsort(priority)` walked backwards, so equal priorities come in the order of numpy's
+/// portable argsort ([`numpy_argsort`]): index order only below 17 peaks (frankenscipy-80z9v).
 fn select_by_peak_distance(peaks: &[usize], priority: &[f64], distance: usize) -> Vec<bool> {
     let mut keep = vec![true; peaks.len()];
-    let mut order: Vec<usize> = (0..peaks.len()).collect();
-    order.sort_by(|&a, &b| priority[a].total_cmp(&priority[b]).then(a.cmp(&b)));
+    let order = numpy_argsort(priority);
     for &j in order.iter().rev() {
         if !keep[j] {
             continue;
@@ -4277,6 +4277,135 @@ fn select_by_peak_distance(peaks: &[usize], priority: &[f64], distance: usize) -
         }
     }
     keep
+}
+
+/// numpy's `less` for sorting float64: NaN after every number, NaNs equal to each other.
+fn numpy_less(a: f64, b: f64) -> bool {
+    a < b || (b.is_nan() && !a.is_nan())
+}
+
+/// numpy 2.4's portable default `argsort` for float64 (`aquicksort_<double_tag>` in
+/// `npysort/quicksort.cpp`): a median-of-three quicksort over index ranges of more than 16,
+/// insertion sort below that, and `aheapsort_` for a range whose depth budget (`2·⌊log2 n⌋`) is
+/// spent. Equal keys come out in this algorithm's order, which is index order only for short
+/// arrays. Where numpy dispatches to x86-simd-sort (X86_V3 / X86_V4 CPUs) its ties differ again;
+/// this is the path numpy takes everywhere else, and SciPy's result with that dispatch disabled.
+fn numpy_argsort(v: &[f64]) -> Vec<usize> {
+    const SMALL_QUICKSORT: usize = 15;
+    let num = v.len();
+    let mut t: Vec<usize> = (0..num).collect();
+    if num < 2 {
+        return t;
+    }
+    let msb = usize::BITS - 1 - num.leading_zeros();
+    let mut cdepth = 2 * i64::from(msb);
+    let (mut pl, mut pr) = (0usize, num - 1);
+    let mut stack: Vec<(usize, usize, i64)> = Vec::new();
+    loop {
+        if cdepth < 0 {
+            numpy_aheapsort(v, &mut t[pl..=pr]);
+        } else {
+            while pr - pl > SMALL_QUICKSORT {
+                let pm = pl + ((pr - pl) >> 1);
+                if numpy_less(v[t[pm]], v[t[pl]]) {
+                    t.swap(pm, pl);
+                }
+                if numpy_less(v[t[pr]], v[t[pm]]) {
+                    t.swap(pr, pm);
+                }
+                if numpy_less(v[t[pm]], v[t[pl]]) {
+                    t.swap(pm, pl);
+                }
+                let vp = v[t[pm]];
+                let mut pi = pl;
+                let mut pj = pr - 1;
+                t.swap(pm, pj);
+                loop {
+                    pi += 1;
+                    while numpy_less(v[t[pi]], vp) {
+                        pi += 1;
+                    }
+                    pj -= 1;
+                    while numpy_less(vp, v[t[pj]]) {
+                        pj -= 1;
+                    }
+                    if pi >= pj {
+                        break;
+                    }
+                    t.swap(pi, pj);
+                }
+                t.swap(pi, pr - 1);
+                // Push the larger partition, keep sorting the smaller.
+                cdepth -= 1;
+                if pi - pl < pr - pi {
+                    stack.push((pi + 1, pr, cdepth));
+                    pr = pi - 1;
+                } else {
+                    stack.push((pl, pi - 1, cdepth));
+                    pl = pi + 1;
+                }
+            }
+            for pi in pl + 1..=pr {
+                let vi = t[pi];
+                let vp = v[vi];
+                let mut pj = pi;
+                while pj > pl && numpy_less(vp, v[t[pj - 1]]) {
+                    t[pj] = t[pj - 1];
+                    pj -= 1;
+                }
+                t[pj] = vi;
+            }
+        }
+        let Some((l, r, d)) = stack.pop() else {
+            break;
+        };
+        (pl, pr, cdepth) = (l, r, d);
+    }
+    t
+}
+
+/// numpy's `aheapsort_` on one index range (1-based heap arithmetic, as in the C source).
+fn numpy_aheapsort(v: &[f64], t: &mut [usize]) {
+    let mut n = t.len();
+    let at = |t: &[usize], k: usize| t[k - 1];
+    let mut l = n >> 1;
+    while l > 0 {
+        let tmp = at(t, l);
+        let (mut i, mut j) = (l, l << 1);
+        while j <= n {
+            if j < n && numpy_less(v[at(t, j)], v[at(t, j + 1)]) {
+                j += 1;
+            }
+            if numpy_less(v[tmp], v[at(t, j)]) {
+                t[i - 1] = at(t, j);
+                i = j;
+                j += j;
+            } else {
+                break;
+            }
+        }
+        t[i - 1] = tmp;
+        l -= 1;
+    }
+    while n > 1 {
+        let tmp = at(t, n);
+        t[n - 1] = at(t, 1);
+        n -= 1;
+        let (mut i, mut j) = (1, 2);
+        while j <= n {
+            if j < n && numpy_less(v[at(t, j)], v[at(t, j + 1)]) {
+                j += 1;
+            }
+            if numpy_less(v[tmp], v[at(t, j)]) {
+                t[i - 1] = at(t, j);
+                i = j;
+                j += j;
+            } else {
+                break;
+            }
+        }
+        t[i - 1] = tmp;
+    }
 }
 
 /// Prominences as SciPy's `_peak_prominences`, optionally restricted to a window of `wlen`
@@ -23410,6 +23539,49 @@ mod tests {
         )
         .expect("find_peaks");
         assert_eq!(result.peaks, vec![3]);
+    }
+
+    /// frankenscipy-80z9v: `distance` visits equal-height peaks in `np.argsort` order, which
+    /// above 16 candidates is numpy's introsort order, not index order. SciPy 1.17.1 with numpy
+    /// 2.4.3's portable argsort (every SIMD dispatch group disabled) keeps [4, 9, 15, 19, 26, 31,
+    /// 39] of this signal's 17 peaks at distance 4. The index-order tie rule fsci used before
+    /// keeps [4, 9, 15, 19, 23, 28, 34, 39], and numpy's AVX2 dispatch [1, 6, 11, 15, 19, 23,
+    /// 28, 34, 39].
+    #[test]
+    fn find_peaks_distance_ties_follow_numpys_portable_argsort() {
+        let x: Vec<f64> = [
+            1, 2, 0, 0, 2, 1, 2, 2, 0, 2, 0, 1, 0, 1, 0, 1, 0, 1, 0, 2, 0, 1, 0, 1, 0, 1, 2, 1, 2,
+            2, 1, 2, 0, 1, 2, 0, 0, 1, 0, 2, 0,
+        ]
+        .iter()
+        .map(|&v| f64::from(v))
+        .collect();
+        let result = find_peaks(
+            &x,
+            FindPeaksOptions {
+                distance: Some(4),
+                ..FindPeaksOptions::default()
+            },
+        )
+        .expect("find_peaks");
+        assert_eq!(result.peaks, vec![4, 9, 15, 19, 26, 31, 39]);
+    }
+
+    /// `np.argsort` of these arrays under numpy 2.4.3's portable path: 20 elements on three
+    /// levels (index order would be [0, 3, 6, ...]), and NaNs sorted last.
+    #[test]
+    fn numpy_argsort_matches_numpys_portable_argsort() {
+        let v: Vec<f64> = (0..20).map(|i| f64::from(i % 3)).collect();
+        assert_eq!(
+            super::numpy_argsort(&v),
+            vec![
+                0, 15, 12, 18, 6, 9, 3, 4, 7, 10, 13, 1, 16, 19, 8, 11, 2, 14, 17, 5
+            ]
+        );
+        let w = [2.0, f64::NAN, 1.0, 2.0, f64::NAN, 0.0];
+        assert_eq!(super::numpy_argsort(&w), vec![5, 2, 0, 3, 1, 4]);
+        assert!(super::numpy_argsort(&[]).is_empty());
+        assert_eq!(super::numpy_argsort(&[7.0]), vec![0]);
     }
 
     #[test]

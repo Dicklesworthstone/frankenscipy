@@ -9,6 +9,25 @@
 //! 500 seeded signals, lengths 5-200. Most are small integers, so ties, plateaus and equal-height
 //! neighbours are common; the rest are continuous. Peak indices and integer properties must
 //! match exactly; float properties to 1e-12 (relative above 1, absolute below).
+//!
+//! SciPy's `distance` filter visits peaks in `np.argsort(priority)` order, and numpy 2.4's
+//! default argsort breaks TIES differently depending on the CPU it dispatches to: x86-simd-sort
+//! on X86_V3 (AVX2) / X86_V4 (AVX-512), numpy's portable introsort otherwise. So the incumbent
+//! is not one function on equal-height candidates (frankenscipy-80z9v). Measured 2026-09-24 with
+//! the same SciPy 1.17.1 / numpy 2.4.3 on one AVX2 machine: 23 of these 500 cases change between
+//! the default dispatch and `NPY_DISABLE_CPU_FEATURES` = every dispatch group (fp_437: [.., 34,
+//! ..] vs [.., 37, ..]). The oracle therefore runs twice — numpy's default dispatch and its
+//! portable path — and a case passes when fsci equals SciPy under either; a case matching neither
+//! fails as before. The split (both / default only / portable only / neither) is printed and
+//! logged, and a canary in the oracle fails the test if the portable arm did not really take the
+//! portable argsort.
+//!
+//! The admission is not what made the cases pass. CI's pinned run failed 20 of 500. With the
+//! same peaks the portable path would have admitted only 5 of them: fsci ordered ties by index,
+//! but numpy's portable argsort is an introsort whose tie order is index order only below 17
+//! elements. fsci-signal now ports that argsort (`numpy_argsort`). Measured locally on the AVX2
+//! machine, fsci then agrees with SciPy on all 500: 477 under both dispatches, 23 under the
+//! portable path only, 0 under neither.
 
 use std::collections::HashMap;
 use std::fs;
@@ -25,6 +44,10 @@ const ABS_TOL: f64 = 1.0e-12;
 const REL_TOL: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 const CASES: usize = 500;
+/// numpy 2.4's x86-64 SIMD dispatch groups. Naming all of them in `NPY_DISABLE_CPU_FEATURES`
+/// leaves numpy's portable `argsort`; naming a feature outside the list (`AVX2`, `AVX512F`) is
+/// rejected with an ImportWarning and the variable is ignored, which the canary catches.
+const NUMPY_DISPATCH_GROUPS: &str = "X86_V3 X86_V4 AVX512_ICL AVX512_SPR";
 
 #[derive(Debug, Clone, Copy, Serialize)]
 struct Cond {
@@ -71,6 +94,8 @@ struct PeakArm {
 #[derive(Debug, Clone, Deserialize)]
 struct OracleResult {
     points: Vec<PeakArm>,
+    /// numpy's default `argsort` broke the canary's ties in index order in this process.
+    argsort_is_stable: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,6 +114,11 @@ struct DiffLog {
     compared: usize,
     max_diff: f64,
     pass: bool,
+    /// Cases where SciPy's default-dispatch and portable numpy disagree.
+    isa_sensitive: usize,
+    agree_both: usize,
+    agree_default_only: usize,
+    agree_portable_only: usize,
     timestamp_ms: u128,
     duration_ns: u128,
     cases: Vec<CaseDiff>,
@@ -189,7 +219,9 @@ fn generate_query() -> OracleQuery {
     OracleQuery { points }
 }
 
-fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
+/// `portable` switches numpy's SIMD dispatch off (see the module comment), so the oracle takes
+/// numpy's portable `argsort`.
+fn scipy_oracle_or_skip(query: &OracleQuery, portable: bool) -> Option<OracleResult> {
     let script = r#"
 import json
 import sys
@@ -227,12 +259,19 @@ for case in q["points"]:
         })
     except Exception as e:
         points.append({"case_id": cid, "error": repr(e), "peaks": None, "props": None})
-print(json.dumps({"points": points}))
+# Canary: does this process's default argsort break ties in index order (the portable path)?
+witness = np.array([3, 6, 4, 5, 4, 6, 5, 6, 3, 5, 5, 5, 6, 4], dtype=float)
+stable = np.argsort(witness).tolist() == np.argsort(witness, kind="stable").tolist()
+print(json.dumps({"points": points, "argsort_is_stable": stable}))
 "#;
     // The query goes over stdin: 500 cases of JSON exceed Linux's 128 KiB limit on a single
     // environment string, and the spawn failed with E2BIG when it was passed as one.
     let query_json = serde_json::to_string(query).expect("serialize find_peaks query");
-    let mut child = match fsci_conformance::scipy_oracle_command()
+    let mut command = fsci_conformance::scipy_oracle_command();
+    if portable {
+        command.env("NPY_DISABLE_CPU_FEATURES", NUMPY_DISPATCH_GROUPS);
+    }
+    let mut child = match command
         .arg("-c")
         .arg(script)
         .stdin(Stdio::piped())
@@ -366,39 +405,86 @@ fn compare(
     (worst, String::new())
 }
 
+/// fsci's `find_peaks` on `case` against one SciPy arm: (max scaled difference, mismatch
+/// description, empty or "both reject: …" when it passes).
+fn judge(arm: &PeakArm, case: &PeakCase) -> (f64, String) {
+    match (&arm.error, find_peaks(&case.x, options_for(case))) {
+        (Some(err), Err(_)) => (0.0, format!("both reject: {err}")),
+        (Some(err), Ok(r)) => (
+            f64::INFINITY,
+            format!("scipy raised {err}; fsci returned peaks {:?}", r.peaks),
+        ),
+        (None, Err(e)) => (f64::INFINITY, format!("fsci error {e}; scipy succeeded")),
+        (None, Ok(r)) => {
+            let peaks = arm.peaks.as_deref().expect("peaks when no error");
+            let props = arm.props.as_ref().expect("props when no error");
+            compare(peaks, props, &r)
+        }
+    }
+}
+
+fn passes(detail: &str) -> bool {
+    detail.is_empty() || detail.starts_with("both reject")
+}
+
 #[test]
 fn diff_signal_find_peaks_full() {
     let query = generate_query();
-    let Some(oracle) = scipy_oracle_or_skip(&query) else {
+    let Some(default) = scipy_oracle_or_skip(&query, false) else {
         return;
     };
-    assert_eq!(oracle.points.len(), query.points.len());
-    let arms: HashMap<String, PeakArm> = oracle
-        .points
-        .into_iter()
-        .map(|a| (a.case_id.clone(), a))
-        .collect();
+    let Some(portable) = scipy_oracle_or_skip(&query, true) else {
+        return;
+    };
+    assert!(
+        portable.argsort_is_stable,
+        "the portable oracle arm still took numpy's SIMD argsort: \
+         NPY_DISABLE_CPU_FEATURES=\"{NUMPY_DISPATCH_GROUPS}\" was not honoured"
+    );
+    assert_eq!(default.points.len(), query.points.len());
+    assert_eq!(portable.points.len(), query.points.len());
+    let default_argsort_is_stable = default.argsort_is_stable;
+    let by_case = |oracle: OracleResult| -> HashMap<String, PeakArm> {
+        oracle
+            .points
+            .into_iter()
+            .map(|a| (a.case_id.clone(), a))
+            .collect()
+    };
+    let default_arms = by_case(default);
+    let portable_arms = by_case(portable);
 
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let (mut agree_both, mut agree_default_only, mut agree_portable_only) = (0, 0, 0);
+    let mut isa_sensitive = 0;
     for case in &query.points {
-        let arm = arms.get(&case.case_id).expect("validated oracle");
-        let ours = find_peaks(&case.x, options_for(case));
-        let (max_diff, detail) = match (&arm.error, ours) {
-            (Some(err), Err(_)) => (0.0, format!("both reject: {err}")),
-            (Some(err), Ok(r)) => (
-                f64::INFINITY,
-                format!("scipy raised {err}; fsci returned peaks {:?}", r.peaks),
-            ),
-            (None, Err(e)) => (f64::INFINITY, format!("fsci error {e}; scipy succeeded")),
-            (None, Ok(r)) => {
-                let peaks = arm.peaks.as_deref().expect("peaks when no error");
-                let props = arm.props.as_ref().expect("props when no error");
-                compare(peaks, props, &r)
-            }
+        let default_arm = default_arms.get(&case.case_id).expect("validated oracle");
+        let portable_arm = portable_arms.get(&case.case_id).expect("validated oracle");
+        if default_arm.peaks != portable_arm.peaks || default_arm.error != portable_arm.error {
+            isa_sensitive += 1;
+        }
+        let (default_diff, default_detail) = judge(default_arm, case);
+        let (portable_diff, portable_detail) = judge(portable_arm, case);
+        let (default_ok, portable_ok) = (passes(&default_detail), passes(&portable_detail));
+        match (default_ok, portable_ok) {
+            (true, true) => agree_both += 1,
+            (true, false) => agree_default_only += 1,
+            (false, true) => agree_portable_only += 1,
+            (false, false) => {}
+        }
+        let pass = default_ok || portable_ok;
+        let (max_diff, detail) = if default_ok {
+            (default_diff, default_detail)
+        } else if portable_ok {
+            (portable_diff, portable_detail)
+        } else {
+            (
+                default_diff,
+                format!("default dispatch: {default_detail}; portable: {portable_detail}"),
+            )
         };
-        let pass = detail.is_empty() || detail.starts_with("both reject");
         if !pass {
             eprintln!(
                 "find_peaks mismatch {}: {detail}\n  x={:?}\n  case={case:?}",
@@ -425,6 +511,13 @@ fn diff_signal_find_peaks_full() {
     println!(
         "find_peaks full: {compared} cases compared ({with_width} with width, {with_threshold} with threshold), {failures} failures, max scaled diff {max_overall:e}"
     );
+    println!(
+        "find_peaks tie order: SciPy's two numpy dispatches disagree on {isa_sensitive} cases \
+         (default argsort stable: {}); fsci agrees with both on {agree_both}, with the default \
+         dispatch only on {agree_default_only}, with the portable path only on \
+         {agree_portable_only}",
+        default_argsort_is_stable
+    );
     emit_log(&DiffLog {
         test_id: "diff_signal_find_peaks_full".into(),
         category: "scipy.signal.find_peaks".into(),
@@ -432,6 +525,10 @@ fn diff_signal_find_peaks_full() {
         compared,
         max_diff: max_overall,
         pass: failures == 0,
+        isa_sensitive,
+        agree_both,
+        agree_default_only,
+        agree_portable_only,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
         cases: diffs,
