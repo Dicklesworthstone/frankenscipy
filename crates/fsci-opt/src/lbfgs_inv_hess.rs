@@ -6,13 +6,14 @@
 //! caller gets an inverse-Hessian — and hence a covariance-like — estimate out of L-BFGS-B
 //! without ever forming an `n × n` matrix.
 //!
-//! ## It is NOT the crate's existing two-loop recursion, and reusing that would be a bug
+//! ## It is NOT the optimizer's own limited-memory matrix, and reusing that would be a bug
 //!
-//! `minimize::lbfgs_two_loop` computes SEARCH DIRECTIONS, and like most implementations it
-//! scales the initial inverse Hessian by `γ = sᵀy / yᵀy` to improve step quality. SciPy's
-//! `LbfgsInvHessProduct` does NOT: it starts from `H₀ = I`. The two therefore compute different
-//! operators from the same history, and wiring this module to the existing helper would produce
-//! numbers that are individually reasonable and differ from the incumbent everywhere.
+//! L-BFGS-B's search directions (`crate::lbfgsb`, the compact representation of L-BFGS-B 3.0)
+//! start from `B₀ = θ·I` with `θ = yᵀy / sᵀy`, i.e. an initial inverse Hessian scaled by
+//! `γ = sᵀy / yᵀy`, to improve step quality. SciPy's `LbfgsInvHessProduct` does NOT: it starts
+//! from `H₀ = I`. The two therefore compute different operators from the same history, and
+//! wiring this module to the optimizer's matrix would produce numbers that are individually
+//! reasonable and differ from the incumbent everywhere.
 //!
 //! ## One deliberate divergence, at the curvature condition
 //!
@@ -382,8 +383,8 @@ mod tests {
 
     #[test]
     fn h0_is_the_identity_not_the_gamma_scaled_initial_hessian() {
-        // THE DISTINCTION THAT MATTERS. `minimize::lbfgs_two_loop` scales H₀ by
-        // γ = sᵀy / yᵀy; this operator does not, because the incumbent does not. With a single
+        // THE DISTINCTION THAT MATTERS. L-BFGS-B's own matrix scales H₀ by γ = sᵀy / yᵀy
+        // (`B₀ = θ·I`); this operator does not, because the incumbent does not. With a single
         // correction where s and y are parallel — y = c·s — the two-loop recursion collapses to
         // H = ρ s sᵀ + (I - ρ s yᵀ)(I - ρ y sᵀ), and applying it to s itself gives exactly s/c,
         // whereas a γ-scaled variant would give something else entirely.

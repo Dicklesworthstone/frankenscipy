@@ -45,7 +45,7 @@ fn np_clip(x: f64, lo: f64, hi: f64) -> f64 {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Task {
+pub(crate) enum Task {
     Start,
     Fg,
     Convergence,
@@ -53,8 +53,44 @@ enum Task {
     Error,
 }
 
+/// Which of SciPy 1.17.1's two transcriptions of MINPACK-2 `dcsrch` / `dcstep` to follow: the
+/// Python `_dcsrch.py` (BFGS, CG, Newton-CG) or the C one inside `__lbfgsb.c` (L-BFGS-B). They
+/// differ in Python's versus C's `min` / `max` / clip on NaN, and in one comparison: the C
+/// `dcstep` takes the cubic step in its first case only when it is STRICTLY closer (`<`),
+/// the Python one when it is no farther (`<=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Minpack {
+    Python,
+    C,
+}
+
+impl Minpack {
+    fn max(self, a: f64, b: f64) -> f64 {
+        match self {
+            Self::Python => py_max(a, b),
+            Self::C => a.max(b),
+        }
+    }
+
+    fn min(self, a: f64, b: f64) -> f64 {
+        match self {
+            Self::Python => py_min(a, b),
+            Self::C => a.min(b),
+        }
+    }
+
+    /// `np.clip(x, lo, hi)`, or C's `fmin(hi, fmax(lo, x))`.
+    fn clip(self, x: f64, lo: f64, hi: f64) -> f64 {
+        match self {
+            Self::Python => np_clip(x, lo, hi),
+            Self::C => hi.min(lo.max(x)),
+        }
+    }
+}
+
 /// MINPACK-2 `dcsrch` state (SciPy `DCSRCH`).
-struct Dcsrch {
+pub(crate) struct Dcsrch {
+    variant: Minpack,
     ftol: f64,
     gtol: f64,
     xtol: f64,
@@ -78,8 +114,16 @@ struct Dcsrch {
 }
 
 impl Dcsrch {
-    fn new(ftol: f64, gtol: f64, xtol: f64, stpmin: f64, stpmax: f64) -> Self {
+    pub(crate) fn new(
+        variant: Minpack,
+        ftol: f64,
+        gtol: f64,
+        xtol: f64,
+        stpmin: f64,
+        stpmax: f64,
+    ) -> Self {
         Self {
+            variant,
             ftol,
             gtol,
             xtol,
@@ -103,7 +147,13 @@ impl Dcsrch {
         }
     }
 
-    fn iterate(&mut self, mut stp: f64, f: f64, g: f64, task: Task) -> (f64, Task) {
+    /// A new search's `stpmax`, keeping the rest of the saved state: `__lbfgsb.c` keeps one
+    /// `dcsrch` state across its line searches, which shows only when a START is refused.
+    pub(crate) fn set_stpmax(&mut self, stpmax: f64) {
+        self.stpmax = stpmax;
+    }
+
+    pub(crate) fn iterate(&mut self, mut stp: f64, f: f64, g: f64, task: Task) -> (f64, Task) {
         const P5: f64 = 0.5;
         const P66: f64 = 0.66;
         const XTRAPL: f64 = 1.1;
@@ -171,6 +221,7 @@ impl Dcsrch {
             let gxm = self.gx - self.gtest;
             let gym = self.gy - self.gtest;
             let s = dcstep(
+                self.variant,
                 self.stx,
                 fxm,
                 gxm,
@@ -194,6 +245,7 @@ impl Dcsrch {
             self.gy = s.dy + self.gtest;
         } else {
             let s = dcstep(
+                self.variant,
                 self.stx,
                 self.fx,
                 self.gx,
@@ -225,13 +277,13 @@ impl Dcsrch {
             self.width = (self.sty - self.stx).abs();
         }
         if self.brackt {
-            self.stmin = py_min(self.stx, self.sty);
-            self.stmax = py_max(self.stx, self.sty);
+            self.stmin = self.variant.min(self.stx, self.sty);
+            self.stmax = self.variant.max(self.stx, self.sty);
         } else {
             self.stmin = stp + XTRAPL * (stp - self.stx);
             self.stmax = stp + XTRAPU * (stp - self.stx);
         }
-        stp = np_clip(stp, self.stpmin, self.stpmax);
+        stp = self.variant.clip(stp, self.stpmin, self.stpmax);
         if self.brackt && (stp <= self.stmin || stp >= self.stmax)
             || (self.brackt && self.stmax - self.stmin <= self.xtol * self.stmax)
         {
@@ -255,6 +307,7 @@ struct Step {
 /// MINPACK-2 `dcstep` (SciPy `dcstep`): the safeguarded cubic/quadratic step.
 #[allow(clippy::too_many_arguments)]
 fn dcstep(
+    variant: Minpack,
     mut stx: f64,
     mut fx: f64,
     mut dx: f64,
@@ -268,11 +321,18 @@ fn dcstep(
     stpmin: f64,
     stpmax: f64,
 ) -> Step {
-    let sgnd = np_sign(dp) * np_sign(dx);
+    let sgnd = match variant {
+        Minpack::Python => np_sign(dp) * np_sign(dx),
+        Minpack::C => dp * (dx / dx.abs()),
+    };
+    let max3 = |a: f64, b: f64, c: f64| match variant {
+        Minpack::Python => py_max3(a, b, c),
+        Minpack::C => a.max(b.max(c)),
+    };
     let stpf;
     if fp > fx {
         let theta = 3.0 * (fx - fp) / (stp - stx) + dx + dp;
-        let s = py_max3(theta.abs(), dx.abs(), dp.abs());
+        let s = max3(theta.abs(), dx.abs(), dp.abs());
         let mut gamma = s * ((theta / s).powi(2) - (dx / s) * (dp / s)).sqrt();
         if stp < stx {
             gamma = -gamma;
@@ -282,7 +342,11 @@ fn dcstep(
         let r = p / q;
         let stpc = stx + r * (stp - stx);
         let stpq = stx + ((dx / ((fx - fp) / (stp - stx) + dx)) / 2.0) * (stp - stx);
-        stpf = if (stpc - stx).abs() <= (stpq - stx).abs() {
+        let cubic_closer = match variant {
+            Minpack::Python => (stpc - stx).abs() <= (stpq - stx).abs(),
+            Minpack::C => (stpc - stx).abs() < (stpq - stx).abs(),
+        };
+        stpf = if cubic_closer {
             stpc
         } else {
             stpc + (stpq - stpc) / 2.0
@@ -290,7 +354,7 @@ fn dcstep(
         brackt = true;
     } else if sgnd < 0.0 {
         let theta = 3.0 * (fx - fp) / (stp - stx) + dx + dp;
-        let s = py_max3(theta.abs(), dx.abs(), dp.abs());
+        let s = max3(theta.abs(), dx.abs(), dp.abs());
         let mut gamma = s * ((theta / s).powi(2) - (dx / s) * (dp / s)).sqrt();
         if stp > stx {
             gamma = -gamma;
@@ -308,8 +372,10 @@ fn dcstep(
         brackt = true;
     } else if dp.abs() < dx.abs() {
         let theta = 3.0 * (fx - fp) / (stp - stx) + dx + dp;
-        let s = py_max3(theta.abs(), dx.abs(), dp.abs());
-        let mut gamma = s * py_max(0.0, (theta / s).powi(2) - (dx / s) * (dp / s)).sqrt();
+        let s = max3(theta.abs(), dx.abs(), dp.abs());
+        let mut gamma = s * variant
+            .max(0.0, (theta / s).powi(2) - (dx / s) * (dp / s))
+            .sqrt();
         if stp > stx {
             gamma = -gamma;
         }
@@ -331,9 +397,9 @@ fn dcstep(
                 stpq
             };
             f = if stp > stx {
-                py_min(stp + 0.66 * (sty - stp), f)
+                variant.min(stp + 0.66 * (sty - stp), f)
             } else {
-                py_max(stp + 0.66 * (sty - stp), f)
+                variant.max(stp + 0.66 * (sty - stp), f)
             };
             stpf = f;
         } else {
@@ -342,11 +408,11 @@ fn dcstep(
             } else {
                 stpq
             };
-            stpf = np_clip(f, stpmin, stpmax);
+            stpf = variant.clip(f, stpmin, stpmax);
         }
     } else if brackt {
         let theta = 3.0 * (fp - fy) / (sty - stp) + dy + dp;
-        let s = py_max3(theta.abs(), dy.abs(), dp.abs());
+        let s = max3(theta.abs(), dy.abs(), dp.abs());
         let mut gamma = s * ((theta / s).powi(2) - (dy / s) * (dp / s)).sqrt();
         if stp > sty {
             gamma = -gamma;
@@ -442,7 +508,7 @@ pub(crate) fn line_search_wolfe1<O: LineObjective>(
         }
         _ => 1.0,
     };
-    let mut search = Dcsrch::new(c1, c2, xtol, amin, amax);
+    let mut search = Dcsrch::new(Minpack::Python, c1, c2, xtol, amin, amax);
     let mut phi1 = phi0;
     let mut derphi1 = derphi0;
     let mut gval = gfk.to_vec();
@@ -1234,6 +1300,7 @@ pub(crate) fn minimize_newton_cg<O: NewtonObjective>(
         for i in 0..cg_maxiter {
             let abs_r: Vec<f64> = ri.iter().map(|v| v.abs()).collect();
             if np_add_reduce(&abs_r) <= termcond {
+                // status: inner CG residual 1-norm <= termcond (SciPy's `cg_maxiter` loop exit)
                 converged = true;
                 break;
             }
@@ -1253,6 +1320,7 @@ pub(crate) fn minimize_newton_cg<O: NewtonObjective>(
             };
             let curv = dot(&psupi, &ap);
             if (0.0..=3.0 * f64::EPSILON).contains(&curv) {
+                // status: curvature in [0, 3ε] ends the inner CG (SciPy)
                 converged = true;
                 break;
             } else if curv < 0.0 {
@@ -1261,6 +1329,7 @@ pub(crate) fn minimize_newton_cg<O: NewtonObjective>(
                     let scale = dri0 / -curv;
                     xsupi = b.iter().map(|v| scale * v).collect();
                 }
+                // status: negative curvature ends the inner CG (SciPy)
                 converged = true;
                 break;
             }

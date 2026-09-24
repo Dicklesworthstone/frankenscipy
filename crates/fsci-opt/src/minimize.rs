@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::bfgs::{
     self, BfgsParams, CgParams, LineObjective, NewtonCgParams, NewtonCgStop, NewtonObjective,
 };
-use crate::linesearch::{WolfeParams, line_search_wolfe2};
+use crate::lbfgsb::{self, LbfgsbObjective, LbfgsbStop};
 use crate::trust_region::{self, Subproblem, TrustObjective, TrustParams};
 use crate::types::{
     Bound, Bounds, Constraint, ConstraintType, ConvergenceStatus, GradientFunc, HessFunc,
@@ -500,8 +500,14 @@ fn requested_tolerance(tol: Option<f64>) -> f64 {
 const SCIPY_SQRT_EPS: f64 = 1.490_116_119_384_765_6e-8;
 
 /// The default `gradient_eps` of the methods that difference with fsci's central scheme
-/// (`eps·(1 + |x|)`), SciPy's own default for L-BFGS-B and TNC.
+/// (`eps·(1 + |x|)`), SciPy's own default for TNC.
 const CENTRAL_DIFF_EPS: f64 = 1.0e-8;
+
+/// `_minimize_lbfgsb`'s default `eps`: the absolute forward-difference step.
+const LBFGSB_EPS: f64 = 1.0e-8;
+
+/// `_minimize_lbfgsb`'s default `ftol` (`factr = 1e7`).
+const LBFGSB_FTOL: f64 = 2.220_446_049_250_313e-9;
 
 /// `scipy.optimize.minimize(method='BFGS')`: SciPy's `_minimize_bfgs` (see [`crate::bfgs`]),
 /// its MINPACK-2 `dcsrch` line search with the Wolfe-2 fallback, and its inverse-Hessian update.
@@ -592,13 +598,17 @@ fn warnflag_result(warnflag: u8, stopped_by_callback: bool) -> (bool, Convergenc
 
 /// [`LineObjective`] with SciPy `ScalarFunction`'s semantics: the last point's `f` and gradient
 /// are cached, the gradient is the caller's or SciPy's `approx_derivative(method='2-point',
-/// abs_step=eps)` from the cached `f`, and `nfev` / `njev` count as SciPy counts.
+/// abs_step=eps, bounds)` from the cached `f`, and `nfev` / `njev` count as SciPy counts.
 struct ScalarFunction<'a, F> {
     fun: &'a F,
     options: MinimizeOptions<'a>,
     /// Whose iterations the trace log records.
     method: OptimizeMethod,
     maxfev: usize,
+    /// The absolute forward-difference step: `gradient_eps`, else the method's SciPy default.
+    eps: f64,
+    /// The `bounds` `approx_derivative` keeps its steps inside, infinite where absent.
+    fd_bounds: Option<(Vec<f64>, Vec<f64>)>,
     nfev: usize,
     njev: usize,
     cached_x: Option<Vec<f64>>,
@@ -614,11 +624,18 @@ where
     F: Fn(&[f64]) -> f64,
 {
     fn new(fun: &'a F, options: MinimizeOptions<'a>, method: OptimizeMethod, x0: &[f64]) -> Self {
+        let default_eps = if method == OptimizeMethod::LBfgsB {
+            LBFGSB_EPS
+        } else {
+            SCIPY_SQRT_EPS
+        };
         Self {
             fun,
             options,
             method,
             maxfev: options.maxfev.unwrap_or(usize::MAX),
+            eps: options.gradient_eps.unwrap_or(default_eps),
+            fd_bounds: None,
             nfev: 0,
             njev: 0,
             cached_x: None,
@@ -627,6 +644,13 @@ where
             iterate: x0.to_vec(),
             nit: 0,
         }
+    }
+
+    /// Keep the finite-difference steps inside `[lower, upper]`, as SciPy's bounded
+    /// `approx_derivative` does.
+    fn with_fd_bounds(mut self, lower: Vec<f64>, upper: Vec<f64>) -> Self {
+        self.fd_bounds = Some((lower, upper));
+        self
     }
 
     fn move_to(&mut self, x: &[f64]) {
@@ -693,15 +717,17 @@ where
             }
         } else {
             let f0 = self.fun(x)?;
+            let steps = fd_steps_2point(
+                x,
+                self.eps,
+                self.fd_bounds
+                    .as_ref()
+                    .map(|(lower, upper)| (lower.as_slice(), upper.as_slice())),
+            );
             let mut xp = x.to_vec();
             let mut g = vec![0.0; n];
             for i in 0..n {
-                let mut h = self.options.gradient_eps.unwrap_or(SCIPY_SQRT_EPS);
-                if (x[i] + h) - x[i] == 0.0 {
-                    let sign = if x[i] >= 0.0 { 1.0 } else { -1.0 };
-                    h = f64::EPSILON.sqrt() * sign * x[i].abs().max(1.0);
-                }
-                xp[i] = x[i] + h;
+                xp[i] = x[i] + steps[i];
                 let dx = xp[i] - x[i];
                 g[i] = (self.eval_raw(&xp)? - f0) / dx;
                 xp[i] = x[i];
@@ -763,6 +789,60 @@ where
         };
         validate_hessp_output(hessp(x, p), x.len())
     }
+}
+
+impl<F> LbfgsbObjective for ScalarFunction<'_, F>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    type Error = OptError;
+
+    fn fun_and_grad(&mut self, x: &[f64]) -> Result<(f64, Vec<f64>), OptError> {
+        let f = LineObjective::fun(self, x)?;
+        let g = LineObjective::grad(self, x)?;
+        Ok((f, g))
+    }
+
+    fn nfev(&self) -> usize {
+        self.nfev
+    }
+
+    fn callback(&mut self, x: &[f64], f: f64) -> bool {
+        LineObjective::callback(self, x, f)
+    }
+}
+
+/// SciPy's `approx_derivative(method='2-point', abs_step=eps, bounds=(lb, ub))` steps: `eps`, or
+/// `√ε·sign(x)·max(1, |x|)` where `x + eps` rounds back to `x`, then — unless every bound is
+/// infinite — reversed or shortened to stay inside the box (`_adjust_scheme_to_bounds`,
+/// one-sided).
+fn fd_steps_2point(x: &[f64], eps: f64, bounds: Option<(&[f64], &[f64])>) -> Vec<f64> {
+    let bounds = bounds.filter(|(lb, ub)| {
+        !(lb.iter().all(|v| *v == f64::NEG_INFINITY) && ub.iter().all(|v| *v == f64::INFINITY))
+    });
+    x.iter()
+        .enumerate()
+        .map(|(i, &xi)| {
+            let mut h = eps;
+            if (xi + h) - xi == 0.0 {
+                let sign = if xi >= 0.0 { 1.0 } else { -1.0 };
+                h = f64::EPSILON.sqrt() * sign * xi.abs().max(1.0);
+            }
+            if let Some((lb, ub)) = bounds {
+                let lower = xi - lb[i];
+                let upper = ub[i] - xi;
+                let trial = xi + h;
+                let violated = trial < lb[i] || trial > ub[i];
+                let fitting = h.abs() <= lower.max(upper);
+                if violated && fitting {
+                    h = -h;
+                } else if !fitting {
+                    h = if upper >= lower { upper } else { -lower };
+                }
+            }
+            h
+        })
+        .collect()
 }
 
 /// `scipy.optimize.minimize(method='CG')`: SciPy's `_minimize_cg` (see [`crate::bfgs`]),
@@ -1367,10 +1447,20 @@ where
     Ok(())
 }
 
-/// L-BFGS-B: Limited-memory BFGS with box constraints.
+/// `scipy.optimize.minimize(method='L-BFGS-B')`: SciPy's `_minimize_lbfgsb` driving L-BFGS-B 3.0
+/// (see [`crate::lbfgsb`]) — the generalized Cauchy point, the direct primal subspace
+/// minimization and the MINPACK-2 line search — under `bounds`.
 ///
-/// Matches `scipy.optimize.minimize(f, x0, method='L-BFGS-B', bounds=...)`.
-/// Uses two-loop recursion with limited memory (m=10 corrections).
+/// SciPy's option mapping: `tol` sets both `ftol` (default 2.2e-9, the relative-reduction test)
+/// and `gtol` (default 1e-5, the projected-gradient test); `maxiter` and `maxfev` (`maxfun`,
+/// checked between iterations as SciPy checks it, so a run can end a few evaluations past it)
+/// default to 15000; `maxcor` is 10 and `maxls` 20. `gradient_eps` is `eps` (default 1e-8), the
+/// absolute forward-difference step when `options.gradient` is absent, stepped backwards or
+/// shortened at a bound as `approx_derivative(..., '2-point', abs_step=eps, bounds)` does. `x0`
+/// is clipped into the bounds. The message is SciPy's task text. `hess_inv` is not materialized:
+/// SciPy returns it as a lazy `LbfgsInvHessProduct`, and a dense `n × n` copy is what a
+/// large-scale method must not allocate. In Strict mode a non-finite objective value is passed
+/// to the algorithm as SciPy's is; Hardened mode rejects it.
 pub fn lbfgsb<F>(
     fun: &F,
     x0: &[f64],
@@ -1382,385 +1472,81 @@ where
 {
     validate_minimize_options(options)?;
     validate_bounds_for_x0(x0, bounds)?;
-
     let n = x0.len();
-    let tol = requested_tolerance(options.tol);
-    let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
-    let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
-    let m = 10; // number of correction pairs stored
-    let mut objective = Objective::new(fun, options.mode, maxfev);
-
-    // Project x0 onto bounds
-    let mut x = x0.to_vec();
-    if let Some(bounds) = bounds {
-        project_onto_bounds(&mut x, bounds);
-    }
-
-    let mut f = match objective.eval(&x) {
-        Ok(value) => value,
-        Err(err) => return Ok(result_from_error(x0, 0, 0, 0, err)),
+    let (lower, upper): (Vec<f64>, Vec<f64>) = match bounds {
+        Some(bounds) => bounds
+            .iter()
+            .map(|&(lo, hi)| (lo.unwrap_or(f64::NEG_INFINITY), hi.unwrap_or(f64::INFINITY)))
+            .unzip(),
+        None => (vec![f64::NEG_INFINITY; n], vec![f64::INFINITY; n]),
     };
-
-    let mut njev = 0usize;
-    let mut grad = match evaluate_minimize_gradient(
-        &mut objective,
-        options.gradient,
-        &x,
-        options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
-    ) {
-        Ok(value) => {
-            njev += 1;
-            value
-        }
-        Err(err) => return Ok(result_from_error(&x, 0, objective.nfev, njev, err)),
+    // `np.clip(x0, lb, ub)`, which keeps a NaN.
+    let x0: Vec<f64> = x0
+        .iter()
+        .zip(lower.iter().zip(&upper))
+        .map(|(&x, (&lo, &hi))| {
+            if x < lo {
+                lo
+            } else if x > hi {
+                hi
+            } else {
+                x
+            }
+        })
+        .collect();
+    let (l, u, nbd) = lbfgsb::encode_bounds(&lower, &upper);
+    let params = lbfgsb::LbfgsbParams {
+        m: 10,
+        factr: options.tol.unwrap_or(LBFGSB_FTOL) / f64::EPSILON,
+        pgtol: options.tol.unwrap_or(1.0e-5),
+        maxfun: options.maxfev.unwrap_or(15_000),
+        maxiter: options.maxiter.unwrap_or(15_000),
+        maxls: 20,
     };
-
-    // L-BFGS correction history
-    let mut s_history: Vec<Vec<f64>> = Vec::with_capacity(m);
-    let mut y_history: Vec<Vec<f64>> = Vec::with_capacity(m);
-    let mut rho_history: Vec<f64> = Vec::with_capacity(m);
-
-    let mut nit = 0usize;
-
-    for iteration in 0..maxiter {
-        nit = iteration + 1;
-
-        // Project gradient for bound-constrained case
-        let projected_grad = if let Some(bounds) = bounds {
-            projected_gradient(&x, &grad, bounds)
-        } else {
-            grad.clone()
-        };
-
-        let grad_norm = l2_norm(&projected_grad);
-        if grad_norm <= tol {
-            let result = OptimizeResult {
-                x: x.clone(),
-                fun: Some(f),
-                // status: ‖projected ∇f‖₂ ≤ tol (plain ∇f when no bounds)
-                success: true,
-                status: ConvergenceStatus::Success,
-                message: String::from("optimization converged (L-BFGS-B gradient norm <= tol)"),
-                nfev: objective.nfev,
-                njev,
+    // SciPy checks `maxfun` between iterations; the adapter must not cut an evaluation off.
+    let adapter_options = MinimizeOptions {
+        maxfev: None,
+        ..options
+    };
+    let mut adapter = ScalarFunction::new(fun, adapter_options, OptimizeMethod::LBfgsB, &x0)
+        .with_fd_bounds(lower, upper);
+    let outcome = lbfgsb::minimize_lbfgsb(&mut adapter, &x0, &l, &u, &nbd, &params);
+    let result = match outcome {
+        Ok(outcome) => {
+            let status = match outcome.stop {
+                LbfgsbStop::ProjectedGradient | LbfgsbStop::RelativeReduction => {
+                    ConvergenceStatus::Success
+                }
+                LbfgsbStop::MaxIter => ConvergenceStatus::MaxIterations,
+                LbfgsbStop::MaxFun => ConvergenceStatus::MaxEvaluations,
+                LbfgsbStop::Callback => ConvergenceStatus::CallbackStop,
+                LbfgsbStop::Abnormal => ConvergenceStatus::PrecisionLoss,
+            };
+            OptimizeResult {
+                x: outcome.x,
+                fun: Some(outcome.fun),
+                // status: SciPy's warnflag 0 (projected gradient or relative reduction test)
+                success: outcome.warnflag == 0,
+                status,
+                message: String::from(outcome.stop.message()),
+                nfev: adapter.nfev,
+                njev: adapter.njev,
                 nhev: 0,
-                nit,
-                jac: Some(grad.clone()),
+                nit: outcome.nit,
+                jac: Some(outcome.jac),
                 hess_inv: None,
                 maxcv: None,
-            };
-            log_completion(OptimizeMethod::LBfgsB, options, iteration, &result);
-            return Ok(result);
-        }
-
-        if let Some(callback) = options.callback
-            && !callback(&x)
-        {
-            let result = OptimizeResult {
-                x: x.clone(),
-                fun: Some(f),
-                success: false,
-                status: ConvergenceStatus::CallbackStop,
-                message: String::from("callback requested stop"),
-                nfev: objective.nfev,
-                njev,
-                nhev: 0,
-                nit,
-                jac: Some(grad.clone()),
-                hess_inv: None,
-                maxcv: None,
-            };
-            log_completion(OptimizeMethod::LBfgsB, options, iteration, &result);
-            return Ok(result);
-        }
-
-        // Two-loop recursion for the L-BFGS direction. With bounds this is an ACTIVE-SET
-        // projected method: a variable held at a bound by an outward gradient (the entries
-        // `projected_gradient` zeroed) stays fixed, and the quasi-Newton step is built from the
-        // projected gradient over the free variables. Building it from the full gradient and
-        // projecting afterwards failed the line search at an active bound and returned
-        // "maximum iterations" short of the optimum: bounded Rosenbrock stopped at
-        // [0.5, 0.2519] where SciPy returns [0.5, 0.25] (frankenscipy-szq1n.9).
-        let mut direction: Vec<f64> =
-            lbfgs_two_loop(&projected_grad, &s_history, &y_history, &rho_history)
-                .iter()
-                .map(|&d| -d)
-                .collect();
-        for ((d, &pg), &g) in direction.iter_mut().zip(&projected_grad).zip(&grad) {
-            if pg == 0.0 && g != 0.0 {
-                *d = 0.0;
             }
         }
-
-        // Line search with bound projection
-        let mut alpha = 1.0;
-        let directional_deriv = dot(&grad, &direction);
-        if directional_deriv >= 0.0 {
-            // Not a descent direction — reset history and use (projected) steepest descent
-            s_history.clear();
-            y_history.clear();
-            rho_history.clear();
-            let direction: Vec<f64> = projected_grad.iter().map(|&g| -g).collect();
-            alpha = 1.0 / l2_norm(&direction).max(1.0);
-            let candidate_x = add_scaled(&x, &direction, alpha);
-            let mut projected_candidate = candidate_x;
-            if let Some(bounds) = bounds {
-                project_onto_bounds(&mut projected_candidate, bounds);
-            }
-            match objective.eval(&projected_candidate) {
-                Ok(fv) => {
-                    let s = sub_vectors(&projected_candidate, &x);
-                    x = projected_candidate;
-                    f = fv;
-                    let new_grad = match evaluate_minimize_gradient(
-                        &mut objective,
-                        options.gradient,
-                        &x,
-                        options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
-                    ) {
-                        Ok(g) => {
-                            njev += 1;
-                            g
-                        }
-                        Err(err) => {
-                            return Ok(result_from_error(&x, nit, objective.nfev, njev, err));
-                        }
-                    };
-                    let y = sub_vectors(&new_grad, &grad);
-                    let sy = dot(&s, &y);
-                    if sy > 1e-10 {
-                        push_lbfgs_history(
-                            &mut s_history,
-                            &mut y_history,
-                            &mut rho_history,
-                            s,
-                            y,
-                            sy,
-                            m,
-                        );
-                    }
-                    grad = new_grad;
-                }
-                Err(err) => return Ok(result_from_error(&x, nit, objective.nfev, njev, err)),
-            }
-            continue;
-        }
-
-        // Strong-Wolfe line search. The curvature condition |g(x+αd)·d| ≤ c2·|g·d|
-        // guarantees s·y > 0, so every L-BFGS correction pair is valid; with Armijo-only
-        // steps the limited-memory model degrades to steepest descent and stalls (e.g.
-        // Rosenbrock from a hard start). scipy's L-BFGS-B uses an equivalent dcsrch line
-        // search. With bounds the search is capped at the largest step that stays in the
-        // box (`amax`), so its trial points stay inside it (the central-difference gradient
-        // still probes ±1e-8·(1+|x|) at an active bound); bounded problems used to get
-        // projected Armijo only, and stalled the same way (Rosenbrock in a [-5, 5] box
-        // stopped at f = 3.47, SciPy reaches 1e-11).
-        let max_feasible_step = bounds.map_or(f64::INFINITY, |b| {
-            feasible_step_interval(&x, &direction, b).1
-        });
-        let wolfe_params = WolfeParams {
-            amax: WolfeParams::default().amax.min(max_feasible_step),
-            ..WolfeParams::default()
-        };
-        if wolfe_params.amax > wolfe_params.amin {
-            let eps = options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS);
-            let counter = std::cell::Cell::new(0usize);
-            let gradient_calls = std::cell::Cell::new(0usize);
-            let f_closure = |xv: &[f64]| {
-                counter.set(counter.get() + 1);
-                (fun)(xv)
-            };
-            let g_closure = |xv: &[f64]| {
-                if let Some(gradient) = options.gradient {
-                    gradient_calls.set(gradient_calls.get() + 1);
-                    return gradient(xv);
-                }
-                let mut g = vec![0.0; xv.len()];
-                let mut xp = xv.to_vec();
-                for i in 0..xv.len() {
-                    let step = eps * (1.0 + xv[i].abs());
-                    let orig = xp[i];
-                    xp[i] = orig + step;
-                    counter.set(counter.get() + 1);
-                    let fp = (fun)(&xp);
-                    xp[i] = orig - step;
-                    counter.set(counter.get() + 1);
-                    let fm = (fun)(&xp);
-                    xp[i] = orig;
-                    g[i] = (fp - fm) / (2.0 * step);
-                }
-                g
-            };
-            let wolfe = line_search_wolfe2(
-                &f_closure,
-                &g_closure,
-                &x,
-                &direction,
-                f,
-                &grad,
-                wolfe_params,
-            );
-            // Count the search's evaluations whether or not its step is used.
-            objective.nfev += counter.get();
-            njev += gradient_calls.get();
-            if let Ok(ls) = wolfe {
-                let mut new_x = add_scaled(&x, &direction, ls.alpha);
-                if let Some(b) = bounds {
-                    // ls.alpha ≤ amax keeps x + αd in the box up to rounding.
-                    project_onto_bounds(&mut new_x, b);
-                }
-                let s = sub_vectors(&new_x, &x);
-                x = new_x;
-                f = ls.f_at_alpha;
-                let new_grad =
-                    match evaluate_minimize_gradient(&mut objective, options.gradient, &x, eps) {
-                        Ok(g) => {
-                            njev += 1;
-                            g
-                        }
-                        Err(err) => {
-                            return Ok(result_from_error(&x, nit, objective.nfev, njev, err));
-                        }
-                    };
-                let y = sub_vectors(&new_grad, &grad);
-                let sy = dot(&s, &y);
-                if sy > 1e-10 {
-                    push_lbfgs_history(
-                        &mut s_history,
-                        &mut y_history,
-                        &mut rho_history,
-                        s,
-                        y,
-                        sy,
-                        m,
-                    );
-                }
-                grad = new_grad;
-                log_iteration(
-                    OptimizeMethod::LBfgsB,
-                    options,
-                    iteration,
-                    f,
-                    grad_norm,
-                    ls.alpha,
-                    objective.nfev,
-                );
-                continue;
-            }
-            // Wolfe search failed → fall through to the projected Armijo fallback.
-        }
-
-        // Armijo backtracking with bound projection. With bounds, a quasi-Newton direction
-        // that yields no acceptable step is not the end: the history is cleared and the
-        // search retried once along projected steepest descent.
-        let c1 = 1e-4;
-        let mut step_accepted = false;
-        let steepest: Vec<f64> = projected_grad.iter().map(|&g| -g).collect();
-        let mut attempts = vec![direction];
-        if bounds.is_some() && attempts[0] != steepest {
-            attempts.push(steepest);
-        }
-        for (attempt, direction) in attempts.iter().enumerate() {
-            if step_accepted {
-                break;
-            }
-            if attempt > 0 {
-                s_history.clear();
-                y_history.clear();
-                rho_history.clear();
-                alpha = 1.0;
-            }
-            for _ in 0..24 {
-                let mut candidate_x = add_scaled(&x, direction, alpha);
-                if let Some(bounds) = bounds {
-                    project_onto_bounds(&mut candidate_x, bounds);
-                }
-                match objective.eval(&candidate_x) {
-                    Ok(fv) => {
-                        let actual_step = sub_vectors(&candidate_x, &x);
-                        let actual_directional_deriv = dot(&grad, &actual_step);
-
-                        if fv <= f + c1 * actual_directional_deriv {
-                            let s = actual_step;
-                            x = candidate_x;
-                            f = fv;
-                            let new_grad = match evaluate_minimize_gradient(
-                                &mut objective,
-                                options.gradient,
-                                &x,
-                                options.gradient_eps.unwrap_or(CENTRAL_DIFF_EPS),
-                            ) {
-                                Ok(g) => {
-                                    njev += 1;
-                                    g
-                                }
-                                Err(err) => {
-                                    return Ok(result_from_error(
-                                        &x,
-                                        nit,
-                                        objective.nfev,
-                                        njev,
-                                        err,
-                                    ));
-                                }
-                            };
-                            let y = sub_vectors(&new_grad, &grad);
-                            let sy = dot(&s, &y);
-                            if sy > 1e-10 {
-                                push_lbfgs_history(
-                                    &mut s_history,
-                                    &mut y_history,
-                                    &mut rho_history,
-                                    s,
-                                    y,
-                                    sy,
-                                    m,
-                                );
-                            }
-                            grad = new_grad;
-                            step_accepted = true;
-                            break;
-                        }
-                    }
-                    Err(err) => return Ok(result_from_error(&x, nit, objective.nfev, njev, err)),
-                }
-                alpha *= 0.5;
-                if alpha < 1e-12 {
-                    break;
-                }
-            }
-        }
-
-        if !step_accepted {
-            break;
-        }
-
-        log_iteration(
-            OptimizeMethod::LBfgsB,
-            options,
-            iteration,
-            f,
-            grad_norm,
-            alpha,
-            objective.nfev,
-        );
-    }
-
-    let result = OptimizeResult {
-        x: x.clone(),
-        fun: Some(f),
-        success: false,
-        status: ConvergenceStatus::MaxIterations,
-        message: format!("maximum iterations reached ({maxiter})"),
-        nfev: objective.nfev,
-        njev,
-        nhev: 0,
-        nit,
-        jac: Some(grad),
-        hess_inv: None,
-        maxcv: None,
+        Err(err) => result_from_error(
+            &adapter.iterate,
+            adapter.nit,
+            adapter.nfev,
+            adapter.njev,
+            err,
+        ),
     };
-    log_completion(OptimizeMethod::LBfgsB, options, nit, &result);
+    log_completion(OptimizeMethod::LBfgsB, options, result.nit, &result);
     Ok(result)
 }
 
@@ -1797,61 +1583,6 @@ fn projected_gradient(x: &[f64], grad: &[f64], bounds: &[Bound]) -> Vec<f64> {
         }
     }
     pg
-}
-
-/// L-BFGS two-loop recursion to compute H*g.
-fn lbfgs_two_loop(
-    grad: &[f64],
-    s_hist: &[Vec<f64>],
-    y_hist: &[Vec<f64>],
-    rho_hist: &[f64],
-) -> Vec<f64> {
-    let k = s_hist.len();
-    if k == 0 {
-        return grad.to_vec();
-    }
-
-    let mut q = grad.to_vec();
-    let mut alpha_cache = vec![0.0; k];
-
-    // Forward loop
-    for i in (0..k).rev() {
-        alpha_cache[i] = rho_hist[i] * dot(&s_hist[i], &q);
-        q = add_scaled(&q, &y_hist[i], -alpha_cache[i]);
-    }
-
-    // Initial Hessian scaling: H0 = (s^T y / y^T y) * I
-    let sy = dot(&s_hist[k - 1], &y_hist[k - 1]);
-    let yy = dot(&y_hist[k - 1], &y_hist[k - 1]);
-    let gamma = if yy > 1e-15 { sy / yy } else { 1.0 };
-    let mut r = scale_vector(&q, gamma);
-
-    // Backward loop
-    for i in 0..k {
-        let beta = rho_hist[i] * dot(&y_hist[i], &r);
-        r = add_scaled(&r, &s_hist[i], alpha_cache[i] - beta);
-    }
-
-    r
-}
-
-fn push_lbfgs_history(
-    s_hist: &mut Vec<Vec<f64>>,
-    y_hist: &mut Vec<Vec<f64>>,
-    rho_hist: &mut Vec<f64>,
-    s: Vec<f64>,
-    y: Vec<f64>,
-    sy: f64,
-    max_m: usize,
-) {
-    if s_hist.len() >= max_m {
-        s_hist.remove(0);
-        y_hist.remove(0);
-        rho_hist.remove(0);
-    }
-    s_hist.push(s);
-    y_hist.push(y);
-    rho_hist.push(1.0 / sy);
 }
 
 /// `scipy.optimize.minimize(method='Newton-CG')`: SciPy's `_minimize_newtoncg` (see
@@ -4445,31 +4176,7 @@ where
 
     /// SciPy `approx_derivative(method='2-point', abs_step=eps, bounds=(lb, ub))` steps.
     fn fd_steps(&self, x: &[f64]) -> Vec<f64> {
-        let unbounded = self.lb.iter().all(|v| *v == f64::NEG_INFINITY)
-            && self.ub.iter().all(|v| *v == f64::INFINITY);
-        x.iter()
-            .enumerate()
-            .map(|(i, &xi)| {
-                let mut h = self.eps;
-                if (xi + h) - xi == 0.0 {
-                    let sign = if xi >= 0.0 { 1.0 } else { -1.0 };
-                    h = f64::EPSILON.sqrt() * sign * xi.abs().max(1.0);
-                }
-                if !unbounded {
-                    let lower = xi - self.lb[i];
-                    let upper = self.ub[i] - xi;
-                    let trial = xi + h;
-                    let violated = trial < self.lb[i] || trial > self.ub[i];
-                    let fitting = h.abs() <= lower.max(upper);
-                    if violated && fitting {
-                        h = -h;
-                    } else if !fitting {
-                        h = if upper >= lower { upper } else { -lower };
-                    }
-                }
-                h
-            })
-            .collect()
+        fd_steps_2point(x, self.eps, Some((&self.lb, &self.ub)))
     }
 
     fn max_violation(&self, x: &[f64]) -> f64 {
@@ -8106,8 +7813,21 @@ mod tests {
             let label = format!("{method:?} hess={}", hess.is_some());
             assert!(calls > 0, "{label}: the caller's gradient was never called");
             assert!(result.success, "{label}: {}", result.message);
+            // L-BFGS-B at tol = 1e-8 stops on its relative-reduction test (ftol = tol) short of
+            // 1e-6: SciPy 1.17.1 with this objective and gradient ends at
+            // (0.9999989453492792, 0.9999980209057279), and fsci takes SciPy's path.
+            let target = if method == OptimizeMethod::LBfgsB {
+                [0.999_998_945_349_279_2, 0.999_998_020_905_727_9]
+            } else {
+                [1.0, 1.0]
+            };
+            let x_tol = if method == OptimizeMethod::LBfgsB {
+                1e-9
+            } else {
+                1e-6
+            };
             assert!(
-                (result.x[0] - 1.0).abs() < 1e-6 && (result.x[1] - 1.0).abs() < 1e-6,
+                (result.x[0] - target[0]).abs() < x_tol && (result.x[1] - target[1]).abs() < x_tol,
                 "{label}: x = {:?}",
                 result.x
             );
@@ -8668,6 +8388,183 @@ mod tests {
                 r.x
             );
         }
+    }
+
+    /// frankenscipy-1ksfv.18: `lbfgsb` is SciPy 1.17.1's L-BFGS-B 3.0 to the evaluation. Each
+    /// pinned result is `minimize(method='L-BFGS-B')` on the same explicit-operation objective,
+    /// bit-identical under OPENBLAS_CORETYPE = Prescott / Nehalem / Sandybridge / Haswell / Zen,
+    /// and fsci must reproduce x to the bit and (nit, nfev, njev) and the message exactly: a
+    /// bounded Rosenbrock stopping on the projected gradient, lower bounds only, Powell's badly
+    /// scaled function stopping on the relative reduction, and a `maxfev` limit that SciPy checks
+    /// only between iterations (22 evaluations against a limit of 20).
+    #[test]
+    fn lbfgsb_takes_scipys_path() {
+        use crate::minimize::lbfgsb;
+        fn rosen(x: &[f64]) -> f64 {
+            let mut s = 0.0;
+            for i in 0..x.len() - 1 {
+                let a = x[i + 1] - x[i] * x[i];
+                let b = 1.0 - x[i];
+                s += 100.0 * a * a + b * b;
+            }
+            s
+        }
+        fn rosen_der(x: &[f64]) -> Vec<f64> {
+            let n = x.len();
+            let mut g = vec![0.0; n];
+            g[0] = -400.0 * x[0] * (x[1] - x[0] * x[0]) - 2.0 * (1.0 - x[0]);
+            for i in 1..n - 1 {
+                g[i] = 200.0 * (x[i] - x[i - 1] * x[i - 1])
+                    - 400.0 * x[i] * (x[i + 1] - x[i] * x[i])
+                    - 2.0 * (1.0 - x[i]);
+            }
+            g[n - 1] = 200.0 * (x[n - 1] - x[n - 2] * x[n - 2]);
+            g
+        }
+        fn quad(x: &[f64]) -> f64 {
+            let mut s = 0.0;
+            for (i, &xi) in x.iter().enumerate() {
+                let c = if i.is_multiple_of(2) {
+                    (i + 1) as f64
+                } else {
+                    -((i + 1) as f64)
+                };
+                let d = xi - c;
+                s += ((i + 1) as f64) * d * d;
+            }
+            s
+        }
+        fn quad_der(x: &[f64]) -> Vec<f64> {
+            x.iter()
+                .enumerate()
+                .map(|(i, &xi)| {
+                    let c = if i.is_multiple_of(2) {
+                        (i + 1) as f64
+                    } else {
+                        -((i + 1) as f64)
+                    };
+                    2.0 * ((i + 1) as f64) * (xi - c)
+                })
+                .collect()
+        }
+        fn powell_bs(x: &[f64]) -> f64 {
+            let f1 = 10000.0 * x[0] * x[1] - 1.0;
+            let f2 = (-x[0]).exp() + (-x[1]).exp() - 1.0001;
+            f1 * f1 + f2 * f2
+        }
+        fn powell_bs_der(x: &[f64]) -> Vec<f64> {
+            let f1 = 10000.0 * x[0] * x[1] - 1.0;
+            let f2 = (-x[0]).exp() + (-x[1]).exp() - 1.0001;
+            vec![
+                2.0 * f1 * 10000.0 * x[1] - 2.0 * f2 * (-x[0]).exp(),
+                2.0 * f1 * 10000.0 * x[0] - 2.0 * f2 * (-x[1]).exp(),
+            ]
+        }
+        let alternating: Vec<f64> = (0..10)
+            .map(|i| if i % 2 == 0 { -1.2 } else { 1.0 })
+            .collect();
+        let options = |gradient: Option<GradientFunc>, maxfev: Option<usize>| MinimizeOptions {
+            method: Some(OptimizeMethod::LBfgsB),
+            gradient,
+            maxfev,
+            ..MinimizeOptions::default()
+        };
+        let check = |label: &str,
+                     result: OptimizeResult,
+                     x: &[f64],
+                     counts: (usize, usize, usize),
+                     message: &str| {
+            let got: Vec<u64> = result.x.iter().map(|v| v.to_bits()).collect();
+            let want: Vec<u64> = x.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got, want, "{label}: x = {:?}", result.x);
+            assert_eq!((result.nit, result.nfev, result.njev), counts, "{label}");
+            assert_eq!(result.message, message, "{label}");
+        };
+
+        let r = lbfgsb(
+            &rosen,
+            &[1.3, 0.7, 0.8, 1.9, 1.2],
+            options(Some(rosen_der), None),
+            Some(&[(Some(-2.0), Some(0.5)); 5]),
+        )
+        .expect("bounded rosen");
+        assert_eq!(r.status, ConvergenceStatus::Success);
+        check(
+            "rosen5 in [-2, 0.5]",
+            r,
+            &[
+                0.5,
+                0.263_037_383_182_917_64,
+                0.079_962_310_584_494_13,
+                0.016_231_644_140_291_21,
+                0.000_263_455_983_679_337_8,
+            ],
+            (12, 14, 14),
+            "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+        );
+
+        let r = lbfgsb(
+            &quad,
+            &[1.0; 8],
+            options(Some(quad_der), None),
+            Some(&[(Some(0.0), None); 8]),
+        )
+        .expect("lower-bounded quadratic");
+        check(
+            "quad8 >= 0",
+            r,
+            &[
+                1.0,
+                0.0,
+                3.000_000_171_554_962_2,
+                0.0,
+                5.000_000_214_014_39,
+                0.0,
+                7.000_000_199_958_738_5,
+                0.0,
+            ],
+            (7, 8, 8),
+            "CONVERGENCE: NORM OF PROJECTED GRADIENT <= PGTOL",
+        );
+
+        let r = lbfgsb(
+            &powell_bs,
+            &[0.0, 1.0],
+            options(Some(powell_bs_der), None),
+            None,
+        )
+        .expect("powell badly scaled");
+        check(
+            "powell badly scaled",
+            r,
+            &[0.000_100_003_676_309_729_37, 1.000_000_002_705_369_5],
+            (2, 4, 4),
+            "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+        );
+
+        // The evaluation cap is SciPy's: the first iteration finishes (22 evaluations with the
+        // forward difference) before `nfev > maxfun` stops the run between iterations.
+        let r = lbfgsb(&rosen, &alternating, options(None, Some(20)), None).expect("maxfev");
+        assert_eq!(r.status, ConvergenceStatus::MaxEvaluations);
+        assert!(!r.success);
+        check(
+            "rosen10 maxfev 20",
+            r,
+            &[
+                -1.095_816_581_571_935,
+                0.617_285_394_517_458_5,
+                -0.883_197_361_187_090_2,
+                0.617_285_394_517_458_5,
+                -0.883_197_361_187_090_2,
+                0.617_285_394_517_458_5,
+                -0.883_197_339_212_537_8,
+                0.617_285_394_517_458_5,
+                -0.883_197_361_187_090_2,
+                1.042_523_835_287_148,
+            ],
+            (1, 22, 2),
+            "STOP: TOTAL NO. OF F,G EVALUATIONS EXCEEDS LIMIT",
+        );
     }
 
     #[test]

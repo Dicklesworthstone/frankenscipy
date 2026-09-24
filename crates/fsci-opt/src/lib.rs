@@ -11,6 +11,7 @@ pub mod curvefit;
 pub mod direct;
 mod gsa;
 pub mod lbfgs_inv_hess;
+mod lbfgsb;
 pub mod linesearch;
 pub mod minimize;
 pub mod nonlin;
