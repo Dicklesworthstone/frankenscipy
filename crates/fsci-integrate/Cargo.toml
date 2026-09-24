@@ -24,6 +24,7 @@ tplquad-incumbent-bench = ["dep:sha2"]
 [dependencies]
 fsci-opt = { workspace = true }
 fsci-runtime = { workspace = true }
+fsci-sparse = { workspace = true }
 nalgebra = "0.35"
 sha2 = { version = "0.10.9", optional = true }
 

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! Live scipy.integrate parity for fsci_integrate::gauss_kronrod_quad,
-//! newton_cotes_quad, and quad_cauchy_pv.
+//! newton_cotes_quad, and quad_weighted with the Cauchy weight.
 //!
 //! Resolves [frankenscipy-llatt].
 //!
@@ -9,12 +9,12 @@
 //! - `newton_cotes_quad`: composite Newton-Cotes of given order over
 //!   n_panels. order=2 (Simpson) is exact for cubics. Compare against
 //!   scipy.integrate.quad on polynomial integrands.
-//! - `quad_cauchy_pv`: principal-value integral by symmetric eps-trim
-//!   around singular point. Compare against
-//!   scipy.integrate.quad(weight='cauchy', wvar=sing) for f(x)/(x-c).
+//! - `quad_weighted(.., QuadWeight::Cauchy(c), ..)`: QUADPACK QAWCE, the same
+//!   routine as scipy.integrate.quad(f, a, b, weight='cauchy', wvar=c), called
+//!   with the same numerator f. (It replaced `quad_cauchy_pv`, which cut
+//!   ±1e-8·(b−a) out around the pole of f(x)/(x−c).)
 //!
-//! Tolerances: 1e-7 abs (GK15/G7 has ~1e-9 abs error on smooth
-//! integrands; Cauchy PV via eps-trim has ~eps*max|f'| error).
+//! Tolerances: 1e-7 abs (GK15/G7 has ~1e-9 abs error on smooth integrands).
 
 use std::collections::HashMap;
 use std::fs;
@@ -23,7 +23,10 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_integrate::{QuadOptions, gauss_kronrod_quad, newton_cotes_quad, quad_cauchy_pv};
+use fsci_integrate::{
+    QuadOptions, QuadWeight, QuadWeightOptions, gauss_kronrod_quad, newton_cotes_quad,
+    quad_weighted,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -115,10 +118,6 @@ fn f1d(name: &str, x: f64) -> f64 {
     }
 }
 
-fn f1d_div_singular(name: &str, x: f64, c: f64) -> f64 {
-    f1d(name, x) / (x - c)
-}
-
 fn generate_query() -> OracleQuery {
     let mut points = Vec::new();
 
@@ -164,7 +163,7 @@ fn generate_query() -> OracleQuery {
         });
     }
 
-    // quad_cauchy_pv probes — PV ∫ f(x)/(x-c) dx with c inside [a,b]
+    // Cauchy-weight probes — PV ∫ f(x)/(x-c) dx with c inside [a,b]
     let cpv_probes: &[(&str, f64, f64, f64)] = &[
         ("one", -1.0, 1.0, 0.0),       // ∫_{-1}^{1} 1/(x) dx PV = 0
         ("x_squared", -1.0, 1.0, 0.0), // ∫_{-1}^{1} x^2/x dx = ∫ x dx = 0
@@ -312,9 +311,16 @@ fn diff_integrate_gauss_kronrod_newton_cotes() {
                 }
             }
             "cpv" => {
-                let sing = case.singular;
-                let f = move |x: f64| f1d_div_singular(&fname, x, sing);
-                match quad_cauchy_pv(&f, case.a, case.b, sing, opts) {
+                // Same call shape as SciPy's: the numerator f with weight 1/(x - c).
+                let f = move |x: f64| f1d(&fname, x);
+                match quad_weighted(
+                    &f,
+                    case.a,
+                    case.b,
+                    QuadWeight::Cauchy(case.singular),
+                    opts,
+                    QuadWeightOptions::default(),
+                ) {
                     Ok(r) => r.integral,
                     Err(_) => continue,
                 }
@@ -336,7 +342,7 @@ fn diff_integrate_gauss_kronrod_newton_cotes() {
     let log = DiffLog {
         test_id: "diff_integrate_gauss_kronrod_newton_cotes".into(),
         category:
-            "fsci_integrate::{gauss_kronrod_quad, newton_cotes_quad, quad_cauchy_pv} vs scipy.integrate.quad"
+            "fsci_integrate::{gauss_kronrod_quad, newton_cotes_quad, quad_weighted(Cauchy)} vs scipy.integrate.quad"
                 .into(),
         case_count: diffs.len(),
         max_abs_diff: max_overall,

@@ -54,6 +54,14 @@ pub struct ButcherTableau {
     pub order: usize,
     /// Order of the error estimator.
     pub error_estimator_order: usize,
+    /// "First same as last": the last stage is evaluated at `(t + h, y_new)`,
+    /// i.e. `a[n_stages - 1] == b`, so it IS the derivative the next step starts
+    /// from. RK23 and RK45 count that stage inside `n_stages`; DOP853's 12 stages
+    /// are all genuine and it must evaluate `f(t + h, y_new)` separately.
+    pub fsal: bool,
+    /// Third-order error weights for methods whose SciPy error norm blends two
+    /// embedded estimates (DOP853's E5/E3 pair); `None` uses the plain RMS of `e`.
+    pub e3: Option<&'static [f64]>,
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -119,6 +127,8 @@ pub static RK45_TABLEAU: ButcherTableau = ButcherTableau {
     n_stages: 7,
     order: 5,
     error_estimator_order: 4,
+    fsal: true,
+    e3: None,
 };
 
 /// Dense-output interpolation matrix for RK45, as exact rationals.
@@ -203,6 +213,8 @@ pub static RK23_TABLEAU: ButcherTableau = ButcherTableau {
     n_stages: 4,
     order: 3,
     error_estimator_order: 2,
+    fsal: true,
+    e3: None,
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -339,7 +351,7 @@ static DOP853_B: &[f64] = &[
 ];
 
 // Error estimation weights (E5): 5th-order embedded error from SciPy.
-// E[12] = 0.0 since k[12] = f_new (FSAL).
+// E[12] = 0.0: the error never reads k[12] = f(t + h, y_new). DOP853 is not FSAL.
 // Source: scipy/integrate/_ivp/dop853_coefficients.py
 static DOP853_E: &[f64] = &[
     0.1312004499419488073250102996e-1,
@@ -357,6 +369,25 @@ static DOP853_E: &[f64] = &[
     0.0,
 ];
 
+// Third-order error weights E3 (SciPy: `E3[:-1] = B; E3[0] -= 0.2440944881...;
+// E3[8] -= 0.7338466882...; E3[11] -= 0.0220588235...`), as the exact doubles SciPy
+// computes. E3[12] = 0: the error never reads f(t + h, y_new).
+static DOP853_E3: &[f64] = &[
+    -0.18980075407240762,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    4.450312892752409,
+    1.8915178993145003,
+    -5.801203960010585,
+    -0.4226823213237919,
+    -0.1521609496625161,
+    0.20136540080403034,
+    0.02265179219836082,
+    0.0,
+];
+
 pub static DOP853_TABLEAU: ButcherTableau = ButcherTableau {
     a: DOP853_A,
     b: DOP853_B,
@@ -365,6 +396,10 @@ pub static DOP853_TABLEAU: ButcherTableau = ButcherTableau {
     n_stages: 12,
     order: 8,
     error_estimator_order: 7,
+    // br-szq1n.1: DOP853's last stage row is NOT the B weights, so k[11] is not
+    // f(t + h, y_new); reusing it fed a wrong derivative into every next step.
+    fsal: false,
+    e3: Some(DOP853_E3),
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -437,10 +472,17 @@ where
         }
     }
 
-    // FSAL (First Same As Last) property: for methods like Dormand-Prince RK45
-    // and Bogacki-Shampine RK23, the last stage k[n_stages-1] is the derivative
-    // at (t+h, y_new).
-    f_new.copy_from_slice(&k[tableau.n_stages - 1]);
+    if tableau.fsal {
+        // FSAL (First Same As Last): for Dormand-Prince RK45 and Bogacki-Shampine
+        // RK23 the last stage k[n_stages-1] is evaluated at (t+h, y_new).
+        f_new.copy_from_slice(&k[tableau.n_stages - 1]);
+    } else {
+        // br-szq1n.1: not FSAL (DOP853) -- evaluate the derivative at the new
+        // point, exactly as SciPy's rk_step does (`K[-1] = fun(t + h, y_new)`).
+        let derivative = fun(t + h, y_new);
+        validate_stage_rhs_shape(derivative.len(), n)?;
+        f_new.copy_from_slice(&derivative);
+    }
     k[tableau.n_stages].copy_from_slice(f_new); // store for next step if needed
 
     Ok(())
@@ -460,6 +502,12 @@ fn error_scale(atol: f64, rtol: f64, y: f64, y_new: f64) -> f64 {
         a.max(b)
     };
     atol + max_val * rtol
+}
+
+/// Right-hand-side evaluations per attempted step: stages 1..n_stages (k[0] is the
+/// carried derivative), plus the explicit f(t + h, y_new) for a non-FSAL tableau.
+fn evals_per_step(tableau: &ButcherTableau) -> usize {
+    tableau.n_stages - 1 + usize::from(!tableau.fsal)
 }
 
 fn estimate_error_component(k: &[Vec<f64>], e: &[f64], h: f64, component: usize) -> f64 {
@@ -901,7 +949,7 @@ impl RkSolver {
                 &mut self.dy,
                 &mut self.y_stage,
             )?;
-            self.nfev += self.tableau.n_stages - 1; // leverage FSAL: exactly n_stages - 1 new evals per step
+            self.nfev += evals_per_step(self.tableau);
 
             let err_norm = self.estimate_error_norm(h, &self.y_new);
 
@@ -956,6 +1004,9 @@ impl RkSolver {
         if self.n == 0 {
             return 0.0;
         }
+        if let Some(e3) = self.tableau.e3 {
+            return self.estimate_blended_error_norm(h, y_new, e3);
+        }
 
         let mut sum_sq = 0.0;
         match &self.atol {
@@ -991,6 +1042,34 @@ impl RkSolver {
         }
 
         (sum_sq / self.n as f64).sqrt()
+    }
+
+    /// SciPy `DOP853._estimate_error_norm` (br-szq1n.1): with `err5 = K^T E5 / scale`
+    /// and `err3 = K^T E3 / scale`, the norm is
+    /// `|h| * ||err5||^2 / sqrt((||err5||^2 + 0.01 * ||err3||^2) * n)`, which damps the
+    /// fifth-order estimate by the third-order one. The plain RMS of E5 that DOP853
+    /// used before accepts and rejects different steps than SciPy.
+    fn estimate_blended_error_norm(&self, h: f64, y_new: &[f64], e3: &[f64]) -> f64 {
+        let atol_at = |i: usize| match &self.atol {
+            ToleranceValue::Scalar(atol) => *atol,
+            ToleranceValue::Vector(atol_vec) => atol_vec[i],
+        };
+        let mut scale_len = self.n.min(self.y.len()).min(y_new.len());
+        if let ToleranceValue::Vector(atol_vec) = &self.atol {
+            scale_len = scale_len.min(atol_vec.len());
+        }
+        let (mut err5_sq, mut err3_sq) = (0.0_f64, 0.0_f64);
+        for i in 0..scale_len {
+            let scale = error_scale(atol_at(i), self.rtol, self.y[i], y_new[i]);
+            let err5 = estimate_error_component(&self.k, self.tableau.e, 1.0, i) / scale;
+            let err3 = estimate_error_component(&self.k, e3, 1.0, i) / scale;
+            err5_sq += err5 * err5;
+            err3_sq += err3 * err3;
+        }
+        if err5_sq == 0.0 && err3_sq == 0.0 {
+            return 0.0;
+        }
+        h.abs() * err5_sq / ((err5_sq + 0.01 * err3_sq) * self.n as f64).sqrt()
     }
 
     /// Internal step implementation using the stored ODE function.
@@ -1078,7 +1157,7 @@ impl RkSolver {
                     &mut self.y_stage,
                 )?;
             };
-            self.nfev += self.tableau.n_stages - 1;
+            self.nfev += evals_per_step(self.tableau);
 
             let err_norm = self.estimate_error_norm(h, &self.y_new);
 
@@ -1319,6 +1398,77 @@ mod tests {
                 "only RK45 provides a solver-specific dense output today"
             );
         }
+    }
+
+    // br-szq1n.1: a tableau may only claim FSAL if its last stage row IS the B weights
+    // (so the last stage is evaluated at (t + h, y_new)).
+    #[test]
+    fn tableau_fsal_flag_matches_last_row_equal_to_b() {
+        for (name, tableau) in [
+            ("RK23", &RK23_TABLEAU),
+            ("RK45", &RK45_TABLEAU),
+            ("DOP853", &DOP853_TABLEAU),
+        ] {
+            let last = tableau.a[tableau.n_stages - 1];
+            let row_is_b =
+                tableau.b.iter().enumerate().all(|(j, &b_j)| {
+                    last.get(j).copied().unwrap_or(0.0).to_bits() == b_j.to_bits()
+                });
+            assert_eq!(
+                tableau.fsal, row_is_b,
+                "{name}: fsal flag disagrees with A[last] == B"
+            );
+        }
+    }
+
+    /// Fixed-step DOP853 on y' = -y cos t (exact exp(-sin t)) over [0, 8], carrying
+    /// f_new into the next step exactly as the adaptive solver does.
+    fn dop853_fixed_step_error(h: f64) -> f64 {
+        let mut fun = |t: f64, y: &[f64]| vec![-y[0] * t.cos()];
+        let (mut k, mut y_new, mut f_new, mut dy, mut y_stage) = rk_scratch(1, &DOP853_TABLEAU);
+        let (mut t, mut y) = (0.0_f64, vec![1.0_f64]);
+        let mut f = fun(t, &y);
+        let steps = (8.0 / h).round() as usize;
+        for _ in 0..steps {
+            rk_step(
+                &mut fun,
+                t,
+                &y,
+                &f,
+                h,
+                &DOP853_TABLEAU,
+                &mut k,
+                &mut y_new,
+                &mut f_new,
+                &mut dy,
+                &mut y_stage,
+            )
+            .expect("dop853 step");
+            t += h;
+            y.copy_from_slice(&y_new);
+            f.copy_from_slice(&f_new);
+        }
+        (y[0] - (-t.sin()).exp()).abs()
+    }
+
+    // br-szq1n.1 negative case: reusing the non-FSAL stage k[11] as f(t + h, y_new)
+    // degraded DOP853 far below 8th order. Reference ratios (numpy port of the same
+    // loop with SciPy's coefficients): correct 256 / 357, buggy 263 / 24; error at
+    // h = 0.2 correct 2.3e-12, buggy 7.1e-9.
+    #[test]
+    fn dop853_is_eighth_order_with_fixed_steps() {
+        let errs: Vec<f64> = [0.8, 0.4, 0.2]
+            .iter()
+            .map(|&h| dop853_fixed_step_error(h))
+            .collect();
+        for pair in errs.windows(2) {
+            let ratio = pair[0] / pair[1];
+            assert!(
+                ratio >= 2f64.powf(7.5),
+                "DOP853 error ratio per halving {ratio:.1} < 2^7.5 (errors {errs:?})"
+            );
+        }
+        assert!(errs[2] < 1.0e-10, "DOP853 error at h=0.2 is {:e}", errs[2]);
     }
 
     #[test]

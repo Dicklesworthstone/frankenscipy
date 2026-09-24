@@ -49,19 +49,25 @@ pub struct QuadVecResult {
     pub converged: bool,
 }
 
-/// Rule selector for [`cubature`].
+/// Rule selector for [`cubature`], SciPy's `rule=` argument.
+///
+/// Each rule yields a higher-order estimate and an embedded lower-order one; a region's error
+/// is their difference. Every rule avoids the region boundary, which is what `points` relies
+/// on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CubatureRule {
-    /// Tensor-product Gauss-Kronrod style rule. The current Rust kernel uses an
-    /// embedded Gauss-Legendre rule with adaptive subdivision.
+    /// SciPy's `"gauss-kronrod"`: the same rule as [`CubatureRule::Gk21`].
     GaussKronrod,
-    /// Compatibility alias for SciPy's `gk21` spelling.
+    /// `"gk21"` (SciPy's default): the tensor product of the 21-point Kronrod rule in every
+    /// dimension (21^ndim evaluations per region), error against the embedded 10-point Gauss
+    /// product.
     #[default]
     Gk21,
-    /// Compatibility alias for SciPy's `gk15` spelling.
+    /// `"gk15"`: the tensor product of the 15-point Kronrod rule, error against the embedded
+    /// 7-point Gauss product.
     Gk15,
-    /// Genz-Malik compatibility spelling. The current implementation uses the
-    /// same embedded adaptive rule and keeps this selector for API parity.
+    /// `"genz-malik"`: the degree-7 Genz–Malik rule with its embedded degree-5 rule,
+    /// 2^ndim + 2·ndim² + 2·ndim + 1 evaluations per region. Defined for ndim ≥ 2 only.
     GenzMalik,
 }
 
@@ -74,12 +80,11 @@ pub struct CubatureOptions {
     pub atol: f64,
     /// Maximum number of region subdivisions.
     pub max_subdivisions: usize,
-    /// Rule selector retained for SciPy-observable API parity.
+    /// The cubature rule applied on each region.
     pub rule: CubatureRule,
-    /// Points that should be avoided by rules that do not evaluate boundaries.
-    ///
-    /// The current embedded rule never evaluates region boundaries; points are
-    /// validated for dimensionality and otherwise retained as caller intent.
+    /// Points where the integrand must not be evaluated (e.g. singularities). The initial
+    /// region is split so that each point lies on subregion boundaries, which no rule
+    /// evaluates. Points on an infinite axis are mapped through the same transform.
     pub points: Vec<Vec<f64>>,
 }
 
@@ -207,10 +212,43 @@ impl BoundTransform {
     }
 }
 
-/// Numerically integrate a scalar function over a finite interval [a, b].
+/// QUADPACK's diagnostics for one integration: `scipy.integrate.quad(..., full_output=1)`'s
+/// `ier`, message and `infodict`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuadInfo {
+    /// QUADPACK's `ier`: 0 success, 1 `limit` subintervals reached, 2 roundoff prevents the
+    /// tolerance, 3 extremely bad integrand behaviour, 4 roundoff in the extrapolation table,
+    /// 5 the integral is probably divergent or slowly convergent.
+    pub ier: u8,
+    /// SciPy's message for `ier` (empty on success).
+    pub message: String,
+    /// Number of subintervals produced (`infodict["last"]`).
+    pub last: usize,
+    /// Left ends, right ends, integrals and error estimates of the subintervals. For an
+    /// infinite range they are on the transformed variable `t ∈ (0, 1]`, as in SciPy.
+    pub alist: Vec<f64>,
+    pub blist: Vec<f64>,
+    pub rlist: Vec<f64>,
+    pub elist: Vec<f64>,
+    /// Subinterval indices (0-based) in decreasing order of error estimate.
+    pub iord: Vec<usize>,
+}
+
+/// `scipy.integrate.quad(f, a, b, epsabs, epsrel, limit)`: adaptive QUADPACK integration.
 ///
-/// Uses adaptive Gauss-Kronrod quadrature (7-point Gauss / 15-point Kronrod).
-/// Matches the core behavior of `scipy.integrate.quad(f, a, b)`.
+/// Finite `[a, b]` runs QAGSE: 21-point Gauss–Kronrod panels, the worst panel bisected first,
+/// at most `limit` subintervals, and Wynn's epsilon algorithm extrapolating the sum (so
+/// integrable endpoint singularities such as `x^-0.9` converge). An infinite bound runs QAGIE
+/// on `x = bound ± (1 − t)/t`. `b < a` integrates over `[b, a]` and negates, as SciPy does.
+/// `converged` is QUADPACK's `ier == 0`; [`quad_full_output`] reports `ier` and the intervals.
+///
+/// This used to be a recursive GK15 bisection that treated `limit` as a recursion depth (up to
+/// 2^limit panels), refined every unconverged panel, had no extrapolation, rejected infinite
+/// bounds, and truncated [`quad_inf`]'s mapped range at `t = 1 − 1e-10` (frankenscipy-1ksfv.8).
+///
+/// # Errors
+/// NaN bounds, negative or non-finite tolerances, and QUADPACK's invalid input
+/// (`epsabs <= 0` with `epsrel < max(50·eps, 5e-29)`, SciPy's ValueError).
 pub fn quad<F>(
     f: F,
     a: f64,
@@ -220,9 +258,46 @@ pub fn quad<F>(
 where
     F: Fn(f64) -> f64,
 {
-    if !a.is_finite() || !b.is_finite() {
+    quad_full_output(f, a, b, &[], options).map(|(result, _)| result)
+}
+
+/// [`quad`] with breakpoints: `scipy.integrate.quad(f, a, b, points=points)`. The points
+/// strictly inside `(min(a, b), max(a, b))` become initial panel edges (QUADPACK QAGPE), so a
+/// kink or singularity there is never sampled across; the rest are ignored, as in SciPy.
+///
+/// # Errors
+/// As [`quad`], and infinite bounds (SciPy: "Infinity inputs cannot be used with break
+/// points").
+pub fn quad_points<F>(
+    f: F,
+    a: f64,
+    b: f64,
+    points: &[f64],
+    options: QuadOptions,
+) -> Result<QuadResult, IntegrateValidationError>
+where
+    F: Fn(f64) -> f64,
+{
+    quad_full_output(f, a, b, points, options).map(|(result, _)| result)
+}
+
+/// [`quad`] / [`quad_points`] with SciPy's `full_output=1` diagnostics.
+///
+/// # Errors
+/// As [`quad_points`].
+pub fn quad_full_output<F>(
+    f: F,
+    a: f64,
+    b: f64,
+    points: &[f64],
+    options: QuadOptions,
+) -> Result<(QuadResult, QuadInfo), IntegrateValidationError>
+where
+    F: Fn(f64) -> f64,
+{
+    if a.is_nan() || b.is_nan() {
         return Err(IntegrateValidationError::QuadInvalidBounds {
-            detail: "integration bounds must be finite".to_string(),
+            detail: "integration bounds must not be NaN".to_string(),
         });
     }
     if !options.epsabs.is_finite()
@@ -234,33 +309,406 @@ where
             detail: "tolerances must be finite and non-negative".to_string(),
         });
     }
+    let limit = options.limit.max(1);
 
-    if (a - b).abs() < f64::EPSILON {
-        return Ok(QuadResult {
+    // Exact equality, as SciPy: a tiny but nonzero interval can still carry a large integral.
+    if a == b {
+        let result = QuadResult {
             integral: 0.0,
             error: 0.0,
             neval: 0,
+            // status: a == b exactly, the integral is 0
             converged: true,
-        });
+        };
+        let info = QuadInfo {
+            ier: 0,
+            message: String::new(),
+            last: 0,
+            alist: Vec::new(),
+            blist: Vec::new(),
+            rlist: Vec::new(),
+            elist: Vec::new(),
+            iord: Vec::new(),
+        };
+        return Ok((result, info));
     }
 
-    let mut neval = 0;
-    let result = adaptive_gk15(
-        &f,
-        a,
-        b,
-        options.epsabs,
-        options.epsrel,
-        options.limit,
-        &mut neval,
-    );
+    let flip = b < a;
+    let (lo, hi) = if flip { (b, a) } else { (a, b) };
+    let mut g = |x: f64| f(x);
+    let (epsabs, epsrel) = (options.epsabs, options.epsrel);
+    let run = if lo.is_finite() && hi.is_finite() {
+        let mut inside: Vec<f64> = points
+            .iter()
+            .copied()
+            .filter(|&p| lo < p && p < hi)
+            .collect();
+        inside.sort_by(f64::total_cmp);
+        inside.dedup();
+        if inside.is_empty() {
+            crate::quadpack::qagse(&mut g, lo, hi, epsabs, epsrel, limit)
+        } else {
+            crate::quadpack::qagpe(&mut g, lo, hi, &inside, epsabs, epsrel, limit)
+        }
+    } else {
+        if !points.is_empty() {
+            return Err(IntegrateValidationError::QuadInvalidBounds {
+                detail: "Infinity inputs cannot be used with break points.".to_string(),
+            });
+        }
+        match (lo.is_finite(), hi.is_finite()) {
+            (true, false) => crate::quadpack::qagie(&mut g, lo, 1, epsabs, epsrel, limit),
+            (false, true) => crate::quadpack::qagie(&mut g, hi, -1, epsabs, epsrel, limit),
+            _ => crate::quadpack::qagie(&mut g, 0.0, 2, epsabs, epsrel, limit),
+        }
+    };
+    if run.ier == 6 {
+        return Err(IntegrateValidationError::QuadInvalidTolerance {
+            detail: "If 'epsabs'<=0, 'epsrel' must be greater than both 5e-29 and \
+                     50*(machine epsilon)."
+                .to_string(),
+        });
+    }
+    let result = QuadResult {
+        integral: if flip { -run.result } else { run.result },
+        error: run.abserr,
+        neval: run.neval,
+        // status: QUADPACK ier == 0 (abserr <= max(epsabs, epsrel*|result|) was reached)
+        converged: run.ier == 0,
+    };
+    let info = QuadInfo {
+        ier: run.ier,
+        message: quadpack_message(run.ier, limit),
+        last: run.last,
+        alist: run.alist,
+        blist: run.blist,
+        rlist: run.rlist,
+        elist: run.elist,
+        iord: run.iord,
+    };
+    Ok((result, info))
+}
 
-    Ok(QuadResult {
-        integral: result.0,
-        error: result.1,
-        neval,
-        converged: result.2,
-    })
+/// The weight functions of `scipy.integrate.quad(f, a, b, weight=..., wvar=...)`: the
+/// integral is of `f(x)·w(x)`, with `f` the smooth part.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QuadWeight {
+    /// `weight='cos'`, `wvar=omega`: `w(x) = cos(omega·x)` (QAWOE; QAWFE on `[a, ∞)`).
+    Cos(f64),
+    /// `weight='sin'`, `wvar=omega`: `w(x) = sin(omega·x)`.
+    Sin(f64),
+    /// `weight='alg'`, `wvar=(alpha, beta)`: `w(x) = (x−a)^alpha·(b−x)^beta` (QAWSE),
+    /// `alpha, beta > −1`.
+    Alg { alpha: f64, beta: f64 },
+    /// `weight='alg-loga'`: the `Alg` weight times `log(x−a)`.
+    AlgLogA { alpha: f64, beta: f64 },
+    /// `weight='alg-logb'`: the `Alg` weight times `log(b−x)`.
+    AlgLogB { alpha: f64, beta: f64 },
+    /// `weight='alg-log'`: the `Alg` weight times `log(x−a)·log(b−x)`.
+    AlgLog { alpha: f64, beta: f64 },
+    /// `weight='cauchy'`, `wvar=c`: `w(x) = 1/(x−c)`, the Cauchy principal value when `c` is
+    /// inside the interval (QAWCE); `c` must not be an endpoint.
+    Cauchy(f64),
+}
+
+/// The controls only the cos/sin weights use: SciPy's `maxp1` (Chebyshev moment levels kept)
+/// and `limlst` (cycles on an infinite range). SciPy's defaults are 50 and 50.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuadWeightOptions {
+    pub maxp1: usize,
+    pub limlst: usize,
+}
+
+impl Default for QuadWeightOptions {
+    fn default() -> Self {
+        Self {
+            maxp1: 50,
+            limlst: 50,
+        }
+    }
+}
+
+/// `scipy.integrate.quad(f, a, b, weight=..., wvar=...)`: `∫_a^b f(x)·w(x) dx` for a
+/// [`QuadWeight`], by QUADPACK's weighted integrators (QAWOE/QAWFE for cos/sin, QAWSE for the
+/// algebraic–logarithmic weights, QAWCE for the Cauchy principal value). `b < a` integrates
+/// over `[b, a]` and negates, as SciPy does.
+///
+/// # Errors
+/// As [`quad`]; an infinite range with an `Alg*`/`Cauchy` weight or with both ends infinite;
+/// and QUADPACK's invalid input (e.g. `alpha <= -1`, `c` on an endpoint, `epsabs <= 0` on an
+/// infinite cos/sin range), SciPy's ValueError.
+pub fn quad_weighted<F>(
+    f: F,
+    a: f64,
+    b: f64,
+    weight: QuadWeight,
+    options: QuadOptions,
+    weight_options: QuadWeightOptions,
+) -> Result<QuadResult, IntegrateValidationError>
+where
+    F: Fn(f64) -> f64,
+{
+    quad_weighted_full_output(f, a, b, weight, options, weight_options).map(|(result, _)| result)
+}
+
+/// [`quad_weighted`] with SciPy's `full_output=1` diagnostics. On `[a, ∞)` with a cos/sin
+/// weight the subinterval lists are per CYCLE (SciPy's `rslst`/`erlst`), `last` is the number
+/// of cycles, and `ier` follows QAWFE (1: `limlst` cycles, 4: the extrapolation over cycles did
+/// not converge, 7: a cycle did not converge).
+///
+/// One divergence from SciPy 1.17.1: with `omega == 0` on `[a, ∞)`, SciPy (as netlib
+/// QUADPACK's `dqawfe`) integrates from 0 instead of `a`; this integrates from `a`.
+///
+/// # Errors
+/// As [`quad_weighted`].
+pub fn quad_weighted_full_output<F>(
+    f: F,
+    a: f64,
+    b: f64,
+    weight: QuadWeight,
+    options: QuadOptions,
+    weight_options: QuadWeightOptions,
+) -> Result<(QuadResult, QuadInfo), IntegrateValidationError>
+where
+    F: Fn(f64) -> f64,
+{
+    use crate::quadpack::{FourierMoments, qawce, qawfe, qawoe, qawse};
+    if a.is_nan() || b.is_nan() {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: "integration bounds must not be NaN".to_string(),
+        });
+    }
+    if !options.epsabs.is_finite()
+        || !options.epsrel.is_finite()
+        || options.epsabs < 0.0
+        || options.epsrel < 0.0
+    {
+        return Err(IntegrateValidationError::QuadInvalidTolerance {
+            detail: "tolerances must be finite and non-negative".to_string(),
+        });
+    }
+    let limit = options.limit.max(1);
+    let (epsabs, epsrel) = (options.epsabs, options.epsrel);
+    let empty_info = || QuadInfo {
+        ier: 0,
+        message: String::new(),
+        last: 0,
+        alist: Vec::new(),
+        blist: Vec::new(),
+        rlist: Vec::new(),
+        elist: Vec::new(),
+        iord: Vec::new(),
+    };
+    if a == b {
+        let result = QuadResult {
+            integral: 0.0,
+            error: 0.0,
+            neval: 0,
+            // status: a == b exactly, the integral is 0
+            converged: true,
+        };
+        return Ok((result, empty_info()));
+    }
+    let flip = b < a;
+    let (lo, hi) = if flip { (b, a) } else { (a, b) };
+    let invalid = |detail: &str| IntegrateValidationError::QuadInvalidBounds {
+        detail: detail.to_string(),
+    };
+    let finite_only = |run: crate::quadpack::Qags| (run, None::<crate::quadpack::Qawfe>);
+    let mut g = |x: f64| f(x);
+    let (run, cycles) = match weight {
+        QuadWeight::Cos(omega) | QuadWeight::Sin(omega) => {
+            let integr = if matches!(weight, QuadWeight::Cos(_)) {
+                1
+            } else {
+                2
+            };
+            match (lo.is_finite(), hi.is_finite()) {
+                (true, true) => {
+                    let mut moments = FourierMoments::new(weight_options.maxp1.max(1));
+                    finite_only(qawoe(
+                        &mut g,
+                        lo,
+                        hi,
+                        omega,
+                        integr,
+                        epsabs,
+                        epsrel,
+                        limit,
+                        1,
+                        weight_options.maxp1,
+                        &mut moments,
+                    ))
+                }
+                (true, false) | (false, true) => {
+                    // (-∞, b] is SciPy's remap: ∫_{-b}^∞ f(-y)·w(y), negated for sin.
+                    let negative = !lo.is_finite();
+                    let start = if negative { -hi } else { lo };
+                    let mut h = |x: f64| {
+                        if !negative {
+                            f(x)
+                        } else if integr == 1 {
+                            f(-x)
+                        } else {
+                            -f(-x)
+                        }
+                    };
+                    let fourier = qawfe(
+                        &mut h,
+                        start,
+                        omega,
+                        integr,
+                        epsabs,
+                        weight_options.limlst,
+                        limit,
+                        weight_options.maxp1.max(1),
+                    );
+                    if fourier.ier == 6 {
+                        return Err(IntegrateValidationError::QuadInvalidTolerance {
+                            detail: "Sine or cosine weighted integrals with infinite domain \
+                                     must have 'epsabs'>0 and limlst >= 3."
+                                .to_string(),
+                        });
+                    }
+                    let run = crate::quadpack::Qags {
+                        result: fourier.result,
+                        abserr: fourier.abserr,
+                        neval: fourier.neval,
+                        ier: fourier.ier,
+                        last: fourier.lst,
+                        alist: Vec::new(),
+                        blist: Vec::new(),
+                        rlist: fourier.rslst.clone(),
+                        elist: fourier.erlst.clone(),
+                        iord: Vec::new(),
+                    };
+                    (run, Some(fourier))
+                }
+                (false, false) => {
+                    return Err(invalid(
+                        "Cannot integrate with this weight from -Inf to +Inf.",
+                    ));
+                }
+            }
+        }
+        QuadWeight::Alg { alpha, beta }
+        | QuadWeight::AlgLogA { alpha, beta }
+        | QuadWeight::AlgLogB { alpha, beta }
+        | QuadWeight::AlgLog { alpha, beta } => {
+            if !lo.is_finite() || !hi.is_finite() {
+                return Err(invalid(
+                    "Cannot integrate with this weight over an infinite interval.",
+                ));
+            }
+            let integr = match weight {
+                QuadWeight::Alg { .. } => 1,
+                QuadWeight::AlgLogA { .. } => 2,
+                QuadWeight::AlgLogB { .. } => 3,
+                _ => 4,
+            };
+            if !(alpha > -1.0 && beta > -1.0) {
+                return Err(invalid("Alpha and beta must be greater than -1."));
+            }
+            finite_only(qawse(
+                &mut g, lo, hi, alpha, beta, integr, epsabs, epsrel, limit,
+            ))
+        }
+        QuadWeight::Cauchy(c) => {
+            if !lo.is_finite() || !hi.is_finite() {
+                return Err(invalid(
+                    "Cannot integrate with this weight over an infinite interval.",
+                ));
+            }
+            // QUADPACK rejects only c on an endpoint; outside the interval there is no pole.
+            if c.is_nan() || c == lo || c == hi {
+                return Err(invalid(
+                    "The Cauchy weight's wvar must not be NaN or an endpoint of the interval.",
+                ));
+            }
+            finite_only(qawce(&mut g, lo, hi, c, epsabs, epsrel, limit))
+        }
+    };
+    if run.ier == 6 {
+        return Err(IntegrateValidationError::QuadInvalidTolerance {
+            detail: "The input is invalid (QUADPACK ier=6): if 'epsabs'<=0, 'epsrel' must be \
+                     greater than both 5e-29 and 50*(machine epsilon); the weighted \
+                     integrators need limit >= 2 (alg) and maxp1 >= 1 (cos/sin)."
+                .to_string(),
+        });
+    }
+    let message = match &cycles {
+        Some(fourier) => qawfe_message(fourier.ier),
+        None => quadpack_message(run.ier, limit),
+    };
+    let result = QuadResult {
+        integral: if flip { -run.result } else { run.result },
+        error: run.abserr,
+        neval: run.neval,
+        // status: QUADPACK ier == 0 for the weighted integrator that ran
+        converged: run.ier == 0,
+    };
+    let info = QuadInfo {
+        ier: run.ier,
+        message,
+        last: run.last,
+        alist: run.alist,
+        blist: run.blist,
+        rlist: run.rlist,
+        elist: run.elist,
+        iord: run.iord,
+    };
+    Ok((result, info))
+}
+
+/// SciPy's `quad` messages for QAWFE's cycle-level `ier` (cos/sin weight on an infinite range).
+fn qawfe_message(ier: u8) -> String {
+    match ier {
+        0 => String::new(),
+        1 => "The maximum number of cycles allowed has been achieved. One can allow more \
+              cycles by increasing the value of limlst."
+            .to_string(),
+        4 => "The extrapolation table constructed for convergence acceleration of the series \
+              formed by the integral contributions over the cycles, does not converge to \
+              within the requested accuracy."
+            .to_string(),
+        7 => "Bad integrand behavior occurs within one or more of the cycles.".to_string(),
+        _ => "Unknown error.".to_string(),
+    }
+}
+
+/// SciPy's `quad` message for a QUADPACK `ier`.
+fn quadpack_message(ier: u8, limit: usize) -> String {
+    match ier {
+        0 => String::new(),
+        1 => format!(
+            "The maximum number of subdivisions ({limit}) has been achieved. If increasing the \
+             limit yields no improvement it is advised to analyze the integrand in order to \
+             determine the difficulties. If the position of a local difficulty can be \
+             determined (singularity, discontinuity) one will probably gain from splitting up \
+             the interval and calling the integrator on the subranges. Perhaps a \
+             special-purpose integrator should be used."
+        ),
+        2 => "The occurrence of roundoff error is detected, which prevents the requested \
+              tolerance from being achieved. The error may be underestimated."
+            .to_string(),
+        3 => "Extremely bad integrand behavior occurs at some points of the integration \
+              interval."
+            .to_string(),
+        4 => "The algorithm does not converge. Roundoff error is detected in the extrapolation \
+              table. It is assumed that the requested tolerance cannot be achieved, and that \
+              the returned result (if full_output = 1) is the best which can be obtained."
+            .to_string(),
+        5 => "The integral is probably divergent, or slowly convergent.".to_string(),
+        _ => "Unknown error.".to_string(),
+    }
+}
+
+/// QUADPACK's acceptance test on the SUMMED result: `abserr <= max(epsabs, epsrel*|result|)`.
+/// Each leaf of the recursion only tests `epsrel` against its own piece, so when pieces cancel the
+/// leaves can all pass while the total misses its relative tolerance; the reported flag must be
+/// decided on the total.
+fn meets_global_tolerance(magnitude: f64, error: f64, epsabs: f64, epsrel: f64) -> bool {
+    error <= epsabs.max(epsrel * magnitude)
 }
 
 /// Batched adaptive integration: evaluate `I(params) = ∫_a^b f(x, params) dx` for MANY parameter
@@ -359,11 +807,12 @@ where
 
     let sample = f(a);
     let dim = sample.len();
-    if (a - b).abs() < f64::EPSILON {
+    if a == b {
         return Ok(QuadVecResult {
             integral: vec![0.0; dim],
             error: 0.0,
             neval: 1,
+            // status: a == b exactly, every component integral is 0
             converged: true,
         });
     }
@@ -374,8 +823,15 @@ where
         epsrel: options.epsrel,
         dim,
     };
-    let (integral, error, converged) =
+    let (integral, error, leaves_converged) =
         adaptive_gk15_vec(&f, a, b, options.limit, &mut neval, spec)?;
+    let converged = leaves_converged
+        && meets_global_tolerance(
+            max_abs_component(&integral),
+            error,
+            options.epsabs,
+            options.epsrel,
+        );
 
     Ok(QuadVecResult {
         integral,
@@ -383,53 +839,6 @@ where
         neval,
         converged,
     })
-}
-
-/// Adaptive Gauss-Kronrod 15-point quadrature with recursive subdivision.
-fn adaptive_gk15<F>(
-    f: &F,
-    a: f64,
-    b: f64,
-    epsabs: f64,
-    epsrel: f64,
-    limit: usize,
-    neval: &mut usize,
-) -> (f64, f64, bool)
-where
-    F: Fn(f64) -> f64,
-{
-    let (integral, error) = gauss_kronrod_15(f, a, b, neval);
-
-    // Short-circuit on non-finite values: a NaN integrand would otherwise
-    // bypass the `error <= tolerance` check (NaN comparisons return false)
-    // and force the recursion to expand to 2^limit leaves, hanging the
-    // caller. Surface the non-finite result immediately and let upstream
-    // wrappers (e.g. nquad) translate it into a typed error.
-    // (frankenscipy-t45u3)
-    if !integral.is_finite() || !error.is_finite() {
-        return (integral, error, false);
-    }
-
-    let tolerance = epsabs.max(epsrel * integral.abs());
-
-    if error <= tolerance || limit == 0 {
-        return (integral, error, error <= tolerance);
-    }
-
-    // Subdivide at midpoint
-    let mid = 0.5 * (a + b);
-    let next_limit = limit.saturating_sub(1);
-
-    let (i_left, e_left, c_left) =
-        adaptive_gk15(f, a, mid, epsabs / 2.0, epsrel, next_limit, neval);
-    let (i_right, e_right, c_right) =
-        adaptive_gk15(f, mid, b, epsabs / 2.0, epsrel, next_limit, neval);
-
-    let total_integral = i_left + i_right;
-    let total_error = e_left + e_right;
-    let converged = c_left && c_right;
-
-    (total_integral, total_error, converged)
 }
 
 /// Adaptive Gauss-Kronrod 15-point quadrature for vector-valued integrands.
@@ -477,95 +886,6 @@ where
     let converged = c_left && c_right;
 
     Ok((total_integral, total_error, converged))
-}
-
-/// Gauss-Kronrod 15-point / 7-point quadrature rule on [a, b].
-///
-/// Returns (integral_estimate, error_estimate).
-/// The error is estimated as |K15 - G7| where K15 is the 15-point Kronrod
-/// estimate and G7 is the embedded 7-point Gauss estimate.
-fn gauss_kronrod_15<F>(f: &F, a: f64, b: f64, neval: &mut usize) -> (f64, f64)
-where
-    F: Fn(f64) -> f64,
-{
-    // Kronrod nodes on [-1, 1] (15 points)
-    // The 7 Gauss nodes are at indices 1, 3, 5, 7, 9, 11, 13
-    const XGK: [f64; 15] = [
-        -0.991_455_371_120_812_6,
-        -0.949_107_912_342_759,
-        -0.864_864_423_359_769_1,
-        -0.741_531_185_599_394_4,
-        -0.586_087_235_467_691_1,
-        -0.405_845_151_377_397_2,
-        -0.207_784_955_007_898_5,
-        0.0,
-        0.207_784_955_007_898_5,
-        0.405_845_151_377_397_2,
-        0.586_087_235_467_691_1,
-        0.741_531_185_599_394_4,
-        0.864_864_423_359_769_1,
-        0.949_107_912_342_759,
-        0.991_455_371_120_812_6,
-    ];
-
-    // Kronrod weights (15 points)
-    const WGK: [f64; 15] = [
-        0.022_935_322_010_529_2,
-        0.063_092_092_629_979,
-        0.104_790_010_322_250_2,
-        0.140_653_259_715_525_9,
-        0.169_004_726_639_267_9,
-        0.190_350_578_064_785_4,
-        0.204_432_940_075_298_9,
-        0.209_482_141_084_728,
-        0.204_432_940_075_298_9,
-        0.190_350_578_064_785_4,
-        0.169_004_726_639_267_9,
-        0.140_653_259_715_525_9,
-        0.104_790_010_322_250_2,
-        0.063_092_092_629_979,
-        0.022_935_322_010_529_2,
-    ];
-
-    // Gauss weights (7 points, at odd indices of XGK)
-    const WG: [f64; 7] = [
-        0.129_484_966_168_869_7,
-        0.279_705_391_489_276_7,
-        0.381_830_050_505_118_9,
-        0.417_959_183_673_469_4,
-        0.381_830_050_505_118_9,
-        0.279_705_391_489_276_7,
-        0.129_484_966_168_869_7,
-    ];
-
-    let half_length = 0.5 * (b - a);
-    let center = 0.5 * (a + b);
-
-    let mut result_kronrod = 0.0;
-    let mut result_gauss = 0.0;
-
-    for (i, (&xgk, &wgk)) in XGK.iter().zip(WGK.iter()).enumerate() {
-        let x = center + half_length * xgk;
-        let fval = f(x);
-        *neval += 1;
-
-        result_kronrod += wgk * fval;
-
-        // Gauss nodes are at odd indices: 1, 3, 5, 7, 9, 11, 13
-        if i % 2 == 1 {
-            result_gauss += WG[i / 2] * fval;
-        }
-    }
-
-    result_kronrod *= half_length;
-    result_gauss *= half_length;
-
-    let mut error = (result_kronrod - result_gauss).abs();
-    if error.is_nan() {
-        error = f64::INFINITY;
-    }
-
-    (result_kronrod, error)
 }
 
 /// Vector-valued Gauss-Kronrod 15-point / 7-point quadrature rule on [a, b].
@@ -744,9 +1064,11 @@ where
     GL: Fn(f64) -> f64,
     GH: Fn(f64) -> f64,
 {
-    if !a.is_finite() || !b.is_finite() {
+    // Infinite limits are integrated by `quad` (QUADPACK QAGIE), as in SciPy; they used to be
+    // rejected (frankenscipy-1ksfv.8).
+    if a.is_nan() || b.is_nan() {
         return Err(IntegrateValidationError::QuadInvalidBounds {
-            detail: "outer integration bounds must be finite".to_string(),
+            detail: "outer integration bounds must not be NaN".to_string(),
         });
     }
     if !options.epsabs.is_finite()
@@ -759,10 +1081,11 @@ where
         });
     }
 
-    if (a - b).abs() < f64::EPSILON {
+    if a == b {
         return Ok(DblquadResult {
             integral: 0.0,
             error: 0.0,
+            // status: outer a == b exactly, the integral is 0
             converged: true,
         });
     }
@@ -772,18 +1095,26 @@ where
         epsrel: options.epsrel,
         limit: options.limit,
     };
+    // An inner integral that misses its tolerance makes the whole result unconverged (SciPy
+    // raises an IntegrationWarning from the inner quad); the outer flag alone cannot see it.
+    let inner_converged = std::cell::Cell::new(true);
 
     // Outer integral over x, inner integral over y for each x
     let outer_result = quad(
         |x| {
             let y_lo = gfun(x);
             let y_hi = hfun(x);
-            if (y_lo - y_hi).abs() < f64::EPSILON {
+            if y_lo == y_hi {
                 return 0.0;
             }
             // Inner integral of f(y, x) over y ∈ [gfun(x), hfun(x)]
             match quad(|y| f(y, x), y_lo, y_hi, inner_opts) {
-                Ok(r) => r.integral,
+                Ok(r) => {
+                    if !r.converged {
+                        inner_converged.set(false);
+                    }
+                    r.integral
+                }
                 Err(_) => f64::INFINITY, // Trigger error in outer quad
             }
         },
@@ -807,7 +1138,7 @@ where
     Ok(DblquadResult {
         integral: outer_result.integral,
         error: outer_result.error,
-        converged: outer_result.converged,
+        converged: outer_result.converged && inner_converged.get(),
     })
 }
 
@@ -1326,9 +1657,10 @@ where
     QL: Fn(f64, f64) -> f64,
     QH: Fn(f64, f64) -> f64,
 {
-    if !a.is_finite() || !b.is_finite() {
+    // Infinite limits are integrated by `quad` (QUADPACK QAGIE), as in SciPy.
+    if a.is_nan() || b.is_nan() {
         return Err(IntegrateValidationError::QuadInvalidBounds {
-            detail: "outer integration bounds must be finite".to_string(),
+            detail: "outer integration bounds must not be NaN".to_string(),
         });
     }
 
@@ -1338,22 +1670,29 @@ where
         limit: options.limit,
     };
 
+    // Any nested integral that misses its tolerance makes the result unconverged (see dblquad).
+    let inner_converged = std::cell::Cell::new(true);
     let outer_result = quad(
         |x| {
             let y_lo = gfun(x);
             let y_hi = hfun(x);
-            if (y_lo - y_hi).abs() < f64::EPSILON {
+            if y_lo == y_hi {
                 return 0.0;
             }
             match quad(
                 |y| {
                     let z_lo = qfun(x, y);
                     let z_hi = rfun(x, y);
-                    if (z_lo - z_hi).abs() < f64::EPSILON {
+                    if z_lo == z_hi {
                         return 0.0;
                     }
                     match quad(|z| f(z, y, x), z_lo, z_hi, inner_opts) {
-                        Ok(r) => r.integral,
+                        Ok(r) => {
+                            if !r.converged {
+                                inner_converged.set(false);
+                            }
+                            r.integral
+                        }
                         Err(_) => f64::INFINITY,
                     }
                 },
@@ -1361,7 +1700,12 @@ where
                 y_hi,
                 inner_opts,
             ) {
-                Ok(r) => r.integral,
+                Ok(r) => {
+                    if !r.converged {
+                        inner_converged.set(false);
+                    }
+                    r.integral
+                }
                 Err(_) => f64::INFINITY,
             }
         },
@@ -1373,7 +1717,7 @@ where
     Ok(DblquadResult {
         integral: outer_result.integral,
         error: outer_result.error,
-        converged: outer_result.converged,
+        converged: outer_result.converged && inner_converged.get(),
     })
 }
 
@@ -1529,6 +1873,7 @@ where
                 integral: r[i][i],
                 error: (r[i][i] - r[i - 1][i - 1]).abs(),
                 neval,
+                // status: |R[i][i] - R[i-1][i-1]| < tol with i >= 2 (checked just above)
                 converged: true,
             });
         }
@@ -1692,12 +2037,14 @@ where
     // call leaves the outer callback to discover the same error repeatedly.
     // Besides wasting work, that was the source of long-running interrupted
     // nquad tests that could outlive their cargo parent.
+    // Infinite limits are integrated by `quad` (QUADPACK QAGIE), as in SciPy's nquad; only NaN
+    // is malformed.
     if ranges
         .iter()
-        .any(|&(lower, upper)| !lower.is_finite() || !upper.is_finite())
+        .any(|&(lower, upper)| lower.is_nan() || upper.is_nan())
     {
         return Err(IntegrateValidationError::QuadInvalidBounds {
-            detail: "nquad integration bounds must be finite".to_string(),
+            detail: "nquad integration bounds must not be NaN".to_string(),
         });
     }
 
@@ -1710,16 +2057,27 @@ where
     // it after the outer quad and propagates instead of silently
     // distorting the integral. Resolves [frankenscipy-vetrv].
     let inner_error: RefCell<Option<IntegrateValidationError>> = RefCell::new(None);
+    // Cleared by ANY nested quad that misses its tolerance, at any depth.
+    let all_converged = std::cell::Cell::new(true);
+    // SciPy's `_NQuad` keeps `self.abserr = max(self.abserr, abserr)` over EVERY nested quad
+    // call, so an unresolved inner integral shows in the reported error even when the outer
+    // integrand is smooth (frankenscipy-szq1n.7; the error used to be a literal 0.0).
+    let max_abserr = std::cell::Cell::new(0.0_f64);
 
     let result = nquad_inner(
         &func,
         ranges,
         &options,
-        &args,
-        &total_neval,
-        &inner_error,
+        &NquadState {
+            args: &args,
+            total_neval: &total_neval,
+            inner_error: &inner_error,
+            all_converged: &all_converged,
+            max_abserr: &max_abserr,
+        },
         0,
     )?;
+    let error = max_abserr.get();
 
     if let Some(err) = inner_error.into_inner() {
         return Err(err);
@@ -1741,10 +2099,30 @@ where
 
     Ok(QuadResult {
         integral: result,
-        error: 0.0,
+        error,
         neval: *total_neval.borrow(),
-        converged: true,
+        converged: all_converged.get(),
     })
+}
+
+/// Shared interior state of one `nquad` evaluation (the callbacks are `Fn`, so it is borrowed).
+struct NquadState<'s> {
+    args: &'s std::cell::RefCell<Vec<f64>>,
+    total_neval: &'s std::cell::RefCell<usize>,
+    inner_error: &'s std::cell::RefCell<Option<IntegrateValidationError>>,
+    all_converged: &'s std::cell::Cell<bool>,
+    max_abserr: &'s std::cell::Cell<f64>,
+}
+
+impl NquadState<'_> {
+    /// Fold one nested quad's verdict into the shared state.
+    fn record(&self, result: &QuadResult) {
+        *self.total_neval.borrow_mut() += result.neval;
+        if !result.converged {
+            self.all_converged.set(false);
+        }
+        self.max_abserr.set(self.max_abserr.get().max(result.error));
+    }
 }
 
 /// Batched N-dimensional integration: evaluate `I(params) = ∫…∫ f(x⃗, params) dx⃗` over a shared
@@ -1811,18 +2189,20 @@ where
     out
 }
 
+/// Returns this level's integral; its evaluation count, convergence and abserr go into `state`.
 fn nquad_inner<F>(
     func: &F,
     ranges: &[(f64, f64)],
     options: &QuadOptions,
-    args: &std::cell::RefCell<Vec<f64>>,
-    total_neval: &std::cell::RefCell<usize>,
-    inner_error: &std::cell::RefCell<Option<IntegrateValidationError>>,
+    state: &NquadState<'_>,
     dim: usize,
 ) -> Result<f64, IntegrateValidationError>
 where
     F: Fn(&[f64]) -> f64,
 {
+    let NquadState {
+        args, inner_error, ..
+    } = *state;
     let (a, b) = ranges[dim];
 
     if dim == ranges.len() - 1 {
@@ -1836,7 +2216,7 @@ where
             b,
             *options,
         )?;
-        *total_neval.borrow_mut() += result.neval;
+        state.record(&result);
         Ok(result.integral)
     } else {
         // Outer dimension: integrate by nesting. Capture the first
@@ -1854,15 +2234,7 @@ where
                     return 0.0;
                 }
                 args.borrow_mut()[dim] = x;
-                match nquad_inner(
-                    func,
-                    ranges,
-                    options,
-                    args,
-                    total_neval,
-                    inner_error,
-                    dim + 1,
-                ) {
+                match nquad_inner(func, ranges, options, state, dim + 1) {
                     Ok(v) => v,
                     Err(e) => {
                         let mut slot = inner_error.borrow_mut();
@@ -1877,7 +2249,7 @@ where
             b,
             *options,
         )?;
-        *total_neval.borrow_mut() += result.neval;
+        state.record(&result);
         Ok(result.integral)
     }
 }
@@ -1953,13 +2325,21 @@ where
     let mut neval = 1;
     let mut regions = Vec::with_capacity(initial_regions.len());
     for (initial_a, initial_b) in initial_regions {
-        let initial =
-            estimate_cubature_region(&f, &transforms, &initial_a, &initial_b, output_dim)?;
+        let initial = estimate_cubature_region(
+            &f,
+            &transforms,
+            &initial_a,
+            &initial_b,
+            output_dim,
+            options.rule,
+        )?;
         neval += initial.neval;
         regions.push(initial.region);
     }
     let mut subdivisions = 0usize;
 
+    // SciPy's loop: take the region with the largest error and split it at its midpoint in
+    // EVERY dimension (2^ndim subregions, `_split_subregion`).
     while !cubature_converged(&regions, options.atol, options.rtol)
         && subdivisions < options.max_subdivisions
     {
@@ -1967,21 +2347,33 @@ where
             break;
         };
         let region = regions.swap_remove(split_index);
-        let split_dim = widest_region_dimension(&region);
-        let midpoint = 0.5 * (region.a[split_dim] + region.b[split_dim]);
-
-        let left_a = region.a.clone();
-        let mut left_b = region.b.clone();
-        left_b[split_dim] = midpoint;
-        let mut right_a = region.a;
-        let right_b = region.b;
-        right_a[split_dim] = midpoint;
-
-        let left = estimate_cubature_region(&f, &transforms, &left_a, &left_b, output_dim)?;
-        let right = estimate_cubature_region(&f, &transforms, &right_a, &right_b, output_dim)?;
-        neval += left.neval + right.neval;
-        regions.push(left.region);
-        regions.push(right.region);
+        let midpoint: Vec<f64> = region
+            .a
+            .iter()
+            .zip(region.b.iter())
+            .map(|(&lower, &upper)| 0.5 * (lower + upper))
+            .collect();
+        for corner in 0..(1_usize << region.a.len()) {
+            let (sub_a, sub_b): (Vec<f64>, Vec<f64>) = (0..region.a.len())
+                .map(|k| {
+                    if (corner >> k) & 1 == 0 {
+                        (region.a[k], midpoint[k])
+                    } else {
+                        (midpoint[k], region.b[k])
+                    }
+                })
+                .unzip();
+            let sub = estimate_cubature_region(
+                &f,
+                &transforms,
+                &sub_a,
+                &sub_b,
+                output_dim,
+                options.rule,
+            )?;
+            neval += sub.neval;
+            regions.push(sub.region);
+        }
         subdivisions += 1;
     }
 
@@ -2050,6 +2442,11 @@ fn validate_cubature_inputs(
     {
         return Err(IntegrateValidationError::QuadInvalidTolerance {
             detail: "cubature tolerances must be finite and non-negative".to_string(),
+        });
+    }
+    if options.rule == CubatureRule::GenzMalik && a.len() < 2 {
+        return Err(IntegrateValidationError::QuadInvalidBounds {
+            detail: "Genz-Malik cubature is only defined for ndim >= 2".to_string(),
         });
     }
     for point in &options.points {
@@ -2190,119 +2587,290 @@ fn cubature_breakpoints_equal(left: f64, right: f64) -> bool {
     (left - right).abs() <= f64::EPSILON * (1.0 + left.abs().max(right.abs()))
 }
 
+/// A 1-D Kronrod rule on [-1, 1] with its embedded Gauss rule: `gauss[i]` is the Gauss weight
+/// of `nodes[i]`, 0 where the node is a Kronrod-only node. The tables are SciPy's
+/// `GaussKronrodQuadrature(21 | 15)` (QUADPACK `qk21`/`qk15`) rounded to f64.
+struct NestedRule1d {
+    nodes: &'static [f64],
+    kronrod: &'static [f64],
+    gauss: &'static [f64],
+}
+
+const GK21_RULE: NestedRule1d = NestedRule1d {
+    nodes: &[
+        0.995_657_163_025_808_1,
+        0.973_906_528_517_171_7,
+        0.930_157_491_355_708_2,
+        0.865_063_366_688_984_5,
+        0.780_817_726_586_416_9,
+        0.679_409_568_299_024_4,
+        0.562_757_134_668_604_7,
+        0.433_395_394_129_247_2,
+        0.294_392_862_701_460_2,
+        0.148_874_338_981_631_22,
+        0.0,
+        -0.148_874_338_981_631_22,
+        -0.294_392_862_701_460_2,
+        -0.433_395_394_129_247_2,
+        -0.562_757_134_668_604_7,
+        -0.679_409_568_299_024_4,
+        -0.780_817_726_586_416_9,
+        -0.865_063_366_688_984_5,
+        -0.930_157_491_355_708_2,
+        -0.973_906_528_517_171_7,
+        -0.995_657_163_025_808_1,
+    ],
+    kronrod: &[
+        0.011_694_638_867_371_874,
+        0.032_558_162_307_964_725,
+        0.054_755_896_574_351_995,
+        0.075_039_674_810_919_96,
+        0.093_125_454_583_697_6,
+        0.109_387_158_802_297_64,
+        0.123_491_976_262_065_84,
+        0.134_709_217_311_473_34,
+        0.142_775_938_577_060_09,
+        0.147_739_104_901_338_49,
+        0.149_445_554_002_916_9,
+        0.147_739_104_901_338_49,
+        0.142_775_938_577_060_09,
+        0.134_709_217_311_473_34,
+        0.123_491_976_262_065_84,
+        0.109_387_158_802_297_64,
+        0.093_125_454_583_697_6,
+        0.075_039_674_810_919_96,
+        0.054_755_896_574_351_995,
+        0.032_558_162_307_964_725,
+        0.011_694_638_867_371_874,
+    ],
+    gauss: &[
+        0.0,
+        0.066_671_344_308_688_14,
+        0.0,
+        0.149_451_349_150_580_6,
+        0.0,
+        0.219_086_362_515_982_04,
+        0.0,
+        0.269_266_719_309_996_35,
+        0.0,
+        0.295_524_224_714_752_87,
+        0.0,
+        0.295_524_224_714_752_87,
+        0.0,
+        0.269_266_719_309_996_35,
+        0.0,
+        0.219_086_362_515_982_04,
+        0.0,
+        0.149_451_349_150_580_6,
+        0.0,
+        0.066_671_344_308_688_14,
+        0.0,
+    ],
+};
+
+const GK15_RULE: NestedRule1d = NestedRule1d {
+    nodes: &[
+        0.991_455_371_120_812_6,
+        0.949_107_912_342_758_5,
+        0.864_864_423_359_769_1,
+        0.741_531_185_599_394_5,
+        0.586_087_235_467_691_1,
+        0.405_845_151_377_397_2,
+        0.207_784_955_007_898_48,
+        0.0,
+        -0.207_784_955_007_898_48,
+        -0.405_845_151_377_397_2,
+        -0.586_087_235_467_691_1,
+        -0.741_531_185_599_394_5,
+        -0.864_864_423_359_769_1,
+        -0.949_107_912_342_758_5,
+        -0.991_455_371_120_812_6,
+    ],
+    kronrod: &[
+        0.022_935_322_010_529_224,
+        0.063_092_092_629_978_56,
+        0.104_790_010_322_250_19,
+        0.140_653_259_715_525_92,
+        0.169_004_726_639_267_9,
+        0.190_350_578_064_785_42,
+        0.204_432_940_075_298_89,
+        0.209_482_141_084_727_82,
+        0.204_432_940_075_298_89,
+        0.190_350_578_064_785_42,
+        0.169_004_726_639_267_9,
+        0.140_653_259_715_525_92,
+        0.104_790_010_322_250_19,
+        0.063_092_092_629_978_56,
+        0.022_935_322_010_529_224,
+    ],
+    gauss: &[
+        0.0,
+        0.129_484_966_168_869_7,
+        0.0,
+        0.279_705_391_489_276_64,
+        0.0,
+        0.381_830_050_505_118_9,
+        0.0,
+        0.417_959_183_673_469_4,
+        0.0,
+        0.381_830_050_505_118_9,
+        0.0,
+        0.279_705_391_489_276_64,
+        0.0,
+        0.129_484_966_168_869_7,
+        0.0,
+    ],
+};
+
+/// Calls `visit(node, higher_weight, lower_weight)` for every node of the tensor-product rule
+/// on [-1, 1]^ndim (SciPy's `ProductNestedFixed`); the lower weight is the embedded Gauss
+/// product, 0 at every node with a Kronrod-only coordinate.
+fn for_each_product_node(
+    rule: &NestedRule1d,
+    ndim: usize,
+    mut visit: impl FnMut(&[f64], f64, f64) -> Result<(), IntegrateValidationError>,
+) -> Result<(), IntegrateValidationError> {
+    let mut index = vec![0_usize; ndim];
+    let mut node = vec![0.0; ndim];
+    loop {
+        let (mut higher, mut lower) = (1.0, 1.0);
+        for (coord, &i) in node.iter_mut().zip(index.iter()) {
+            *coord = rule.nodes[i];
+            higher *= rule.kronrod[i];
+            lower *= rule.gauss[i];
+        }
+        visit(&node, higher, lower)?;
+        let mut dim = ndim;
+        loop {
+            if dim == 0 {
+                return Ok(());
+            }
+            dim -= 1;
+            index[dim] += 1;
+            if index[dim] < rule.nodes.len() {
+                break;
+            }
+            index[dim] = 0;
+        }
+    }
+}
+
+/// Calls `visit(node, higher_weight, lower_weight)` for every node of the degree-7 Genz–Malik
+/// rule on [-1, 1]^ndim with its embedded degree-5 rule (SciPy's `GenzMalikCubature`; the
+/// 2^ndim corner nodes carry no degree-5 weight).
+fn for_each_genz_malik_node(
+    ndim: usize,
+    mut visit: impl FnMut(&[f64], f64, f64) -> Result<(), IntegrateValidationError>,
+) -> Result<(), IntegrateValidationError> {
+    let d = ndim as f64;
+    let scale = 2.0_f64.powi(ndim as i32);
+    let (l2, l3, l4, l5) = (
+        (9.0_f64 / 70.0).sqrt(),
+        (9.0_f64 / 10.0).sqrt(),
+        (9.0_f64 / 10.0).sqrt(),
+        (9.0_f64 / 19.0).sqrt(),
+    );
+    let w1 = scale * (12824.0 - 9120.0 * d + 400.0 * d * d) / 19683.0;
+    let w2 = scale * 980.0 / 6561.0;
+    let w3 = scale * (1820.0 - 400.0 * d) / 19683.0;
+    let w4 = scale * 200.0 / 19683.0;
+    let w5 = 6859.0 / 19683.0;
+    let v1 = scale * (729.0 - 950.0 * d + 50.0 * d * d) / 729.0;
+    let v2 = scale * 245.0 / 486.0;
+    let v3 = scale * (265.0 - 100.0 * d) / 1458.0;
+    let v4 = scale * 25.0 / 729.0;
+
+    let mut node = vec![0.0; ndim];
+    visit(&node, w1, v1)?;
+    for i in 0..ndim {
+        for (value, higher, lower) in [(l2, w2, v2), (-l2, w2, v2), (l3, w3, v3), (-l3, w3, v3)] {
+            node[i] = value;
+            visit(&node, higher, lower)?;
+        }
+        node[i] = 0.0;
+    }
+    for i in 0..ndim {
+        for j in (i + 1)..ndim {
+            for (si, sj) in [(1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0)] {
+                node[i] = si * l4;
+                node[j] = sj * l4;
+                visit(&node, w4, v4)?;
+            }
+            node[i] = 0.0;
+            node[j] = 0.0;
+        }
+    }
+    for corner in 0..(1_usize << ndim) {
+        for (k, coord) in node.iter_mut().enumerate() {
+            *coord = if (corner >> k) & 1 == 0 { l5 } else { -l5 };
+        }
+        visit(&node, w5, 0.0)?;
+    }
+    Ok(())
+}
+
+/// One region's estimate under `rule`: the higher-order rule's value and, as its error, the
+/// absolute difference from the embedded lower-order rule (SciPy `NestedFixedRule`). Nodes
+/// map from [-1, 1]^ndim onto the region, then through the infinite-limit transforms.
 fn estimate_cubature_region<F>(
     f: &F,
     transforms: &[BoundTransform],
     a: &[f64],
     b: &[f64],
     output_dim: usize,
+    rule: CubatureRule,
 ) -> Result<CubatureEstimate, IntegrateValidationError>
 where
     F: Fn(&[f64]) -> Vec<f64>,
 {
-    const NODES: [f64; 3] = [-0.774_596_669_241_483_4, 0.0, 0.774_596_669_241_483_4];
-    const WEIGHTS: [f64; 3] = [
-        0.555_555_555_555_555_6,
-        0.888_888_888_888_888_8,
-        0.555_555_555_555_555_6,
-    ];
-
     let ndim = a.len();
-    let mut high = vec![0.0; output_dim];
+    let center: Vec<f64> = a.iter().zip(b).map(|(&lo, &hi)| 0.5 * (lo + hi)).collect();
+    let half: Vec<f64> = a.iter().zip(b).map(|(&lo, &hi)| 0.5 * (hi - lo)).collect();
+    let mut higher = vec![0.0; output_dim];
+    let mut lower = vec![0.0; output_dim];
     let mut t = vec![0.0; ndim];
     let mut x = vec![0.0; ndim];
-    let mut neval = 0usize;
+    let mut neval = 0_usize;
 
-    struct TensorState<'a, F>
-    where
-        F: Fn(&[f64]) -> Vec<f64>,
-    {
-        f: &'a F,
-        transforms: &'a [BoundTransform],
-        a: &'a [f64],
-        b: &'a [f64],
-        t: &'a mut [f64],
-        x: &'a mut [f64],
-        high: &'a mut [f64],
-        neval: &'a mut usize,
-        output_dim: usize,
-    }
-
-    fn visit_tensor<F>(
-        state: &mut TensorState<'_, F>,
-        dim: usize,
-        weight: f64,
-    ) -> Result<(), IntegrateValidationError>
-    where
-        F: Fn(&[f64]) -> Vec<f64>,
-    {
-        if dim == state.a.len() {
-            let mut jacobian = 1.0;
-            map_cubature_point(state.t, state.transforms, state.x, &mut jacobian);
-            let values = (state.f)(state.x);
-            validate_cubature_output(&values, state.output_dim)?;
-            for (total, value) in state.high.iter_mut().zip(values.iter()) {
-                *total += weight * jacobian * value;
+    let visit =
+        |node: &[f64], w_higher: f64, w_lower: f64| -> Result<(), IntegrateValidationError> {
+            for ((tk, &nk), (&ck, &hk)) in t.iter_mut().zip(node).zip(center.iter().zip(&half)) {
+                *tk = ck + hk * nk;
             }
-            *state.neval += 1;
-            return Ok(());
+            let mut jacobian = 1.0;
+            map_cubature_point(&t, transforms, &mut x, &mut jacobian);
+            let values = f(&x);
+            validate_cubature_output(&values, output_dim)?;
+            neval += 1;
+            for ((h, l), &value) in higher.iter_mut().zip(lower.iter_mut()).zip(&values) {
+                *h += w_higher * jacobian * value;
+                *l += w_lower * jacobian * value;
+            }
+            Ok(())
+        };
+    match rule {
+        CubatureRule::GaussKronrod | CubatureRule::Gk21 => {
+            for_each_product_node(&GK21_RULE, ndim, visit)?;
         }
-
-        let center = 0.5 * (state.a[dim] + state.b[dim]);
-        let half_width = 0.5 * (state.b[dim] - state.a[dim]);
-        for (&node, &node_weight) in NODES.iter().zip(WEIGHTS.iter()) {
-            state.t[dim] = center + half_width * node;
-            visit_tensor(state, dim + 1, weight * half_width * node_weight)?;
-        }
-        Ok(())
+        CubatureRule::Gk15 => for_each_product_node(&GK15_RULE, ndim, visit)?,
+        CubatureRule::GenzMalik => for_each_genz_malik_node(ndim, visit)?,
     }
 
-    let mut state = TensorState {
-        f,
-        transforms,
-        a,
-        b,
-        t: &mut t,
-        x: &mut x,
-        high: &mut high,
-        neval: &mut neval,
-        output_dim,
-    };
-    visit_tensor(&mut state, 0, 1.0)?;
-
-    let mut midpoint = vec![0.0; ndim];
-    let mut midpoint_weight = 1.0;
-    for ((mid, &lower), &upper) in midpoint.iter_mut().zip(a.iter()).zip(b.iter()) {
-        *mid = 0.5 * (lower + upper);
-        midpoint_weight *= upper - lower;
-    }
-    let mut midpoint_x = vec![0.0; ndim];
-    let mut midpoint_jacobian = 1.0;
-    map_cubature_point(
-        &midpoint,
-        transforms,
-        &mut midpoint_x,
-        &mut midpoint_jacobian,
-    );
-    let low_values = f(&midpoint_x);
-    validate_cubature_output(&low_values, output_dim)?;
-    neval += 1;
-
-    let low = low_values
+    // prod(b − a)/2^ndim: the Jacobian of [-1, 1]^ndim onto the region (signed, so reversed
+    // limits keep their orientation).
+    let volume: f64 = half.iter().product();
+    let estimate: Vec<f64> = higher.iter().map(|h| h * volume).collect();
+    let error: Vec<f64> = higher
         .iter()
-        .map(|value| midpoint_weight * midpoint_jacobian * value)
-        .collect::<Vec<_>>();
-    let error = high
-        .iter()
-        .zip(low.iter())
-        .map(|(high_value, low_value)| (high_value - low_value).abs())
-        .collect::<Vec<_>>();
+        .zip(&lower)
+        .map(|(h, l)| ((h - l) * volume).abs())
+        .collect();
 
     Ok(CubatureEstimate {
         region: CubatureRegion {
             a: a.to_vec(),
             b: b.to_vec(),
-            estimate: high,
+            estimate,
             error,
         },
         neval,
@@ -2357,19 +2925,6 @@ fn largest_error_region(regions: &[CubatureRegion]) -> Option<usize> {
             max_abs_component(&left.error).total_cmp(&max_abs_component(&right.error))
         })
         .map(|(index, _)| index)
-}
-
-fn widest_region_dimension(region: &CubatureRegion) -> usize {
-    let mut widest_index = 0;
-    let mut widest_width = 0.0;
-    for (index, (&lower, &upper)) in region.a.iter().zip(region.b.iter()).enumerate() {
-        let width = (upper - lower).abs();
-        if width > widest_width {
-            widest_width = width;
-            widest_index = index;
-        }
-    }
-    widest_index
 }
 
 /// Compute n-point Gauss-Legendre nodes and weights on [-1, 1].
@@ -2664,6 +3219,7 @@ where
                 integral: r[n][n],
                 error,
                 neval,
+                // status: |R[n][n] - R[n-1][n-1]| < tol (checked just above)
                 converged: true,
             };
         }
@@ -2744,6 +3300,7 @@ where
                 integral: cur,
                 error: last_err,
                 neval,
+                // status: level >= 2 and d1²/d2 error estimate <= atol + rtol·|I|
                 converged: true,
             };
         }
@@ -2793,6 +3350,7 @@ where
             integral: 0.0,
             error: 0.0,
             neval: 0,
+            // status: a == b exactly, the integral is 0
             converged: true,
         };
     }
@@ -2949,6 +3507,7 @@ where
                 sum: 0.0,
                 error: 0.0,
                 nfev: 0,
+                // status: finite b < a is an empty range, the sum is exactly 0
                 converged: true,
             };
         }
@@ -2959,11 +3518,12 @@ where
             sum += f(a + k as f64 * step);
             nfev += 1;
         }
+        // A non-finite partial sum is SciPy's status -3, not a converged result.
         return NsumResult {
             sum,
             error: 0.0,
             nfev,
-            converged: true,
+            converged: sum.is_finite(),
         };
     }
     if b != f64::INFINITY {
@@ -3008,11 +3568,14 @@ where
         let est = direct + tail;
 
         last_err = (est - prev_est).abs();
-        if last_err <= atol + rtol * est.abs() {
+        // Two successive estimates agreeing is not enough if the tail integral itself missed its
+        // tolerance: both could carry the same unconverged tail.
+        if integ.converged && last_err <= atol + rtol * est.abs() {
             return NsumResult {
                 sum: est,
                 error: last_err,
                 nfev,
+                // status: tail integral converged and |est - prev| <= atol + rtol·|est|
                 converged: true,
             };
         }
@@ -3204,8 +3767,9 @@ fn gauss_kronrod_inner(f: &dyn Fn(f64) -> f64, a: f64, b: f64, options: QuadOpti
         * half;
 
     let error = (kronrod_sum - gauss_sum).abs();
+    let within_tolerance = !(error > options.epsabs && error > options.epsrel * kronrod_sum.abs());
 
-    if error > options.epsabs && error > options.epsrel * kronrod_sum.abs() && options.limit > 1 {
+    if !within_tolerance && options.limit > 1 {
         let left = gauss_kronrod_inner(
             f,
             a,
@@ -3232,11 +3796,13 @@ fn gauss_kronrod_inner(f: &dyn Fn(f64) -> f64, a: f64, b: f64, options: QuadOpti
         };
     }
 
+    // br-szq1n.7: a leaf is converged only if its tolerance test passed. Reaching
+    // the depth limit with the error still too large used to report `true`.
     QuadResult {
         integral: kronrod_sum,
         error,
         neval,
-        converged: true,
+        converged: within_tolerance,
     }
 }
 
@@ -3388,10 +3954,11 @@ where
     }
 }
 
-/// Integrate a function over an infinite interval [a, ∞).
+/// `scipy.integrate.quad(f, a, np.inf)`: [`quad`] over `[a, ∞)` (QUADPACK QAGIE). This used
+/// to map to `t ∈ [0, 1)` and stop at `t = 1 − 1e-10`, losing the tail it cut off.
 ///
-/// Uses the substitution t = 1/(1+u) to map [0, ∞) to [0, 1].
-/// Matches `scipy.integrate.quad(f, a, np.inf)`.
+/// # Errors
+/// A non-finite `a`, and as [`quad`].
 pub fn quad_inf<F>(
     f: F,
     a: f64,
@@ -3405,23 +3972,13 @@ where
             detail: "quad_inf: finite endpoint must be finite".to_string(),
         });
     }
-
-    // Substitution: x = a + t/(1-t), dx = 1/(1-t)² dt, t ∈ [0, 1)
-    let g = |t: f64| {
-        if t >= 1.0 - 1e-15 {
-            return 0.0;
-        }
-        let x = a + t / (1.0 - t);
-        let jacobian = 1.0 / ((1.0 - t) * (1.0 - t));
-        f(x) * jacobian
-    };
-
-    quad(g, 0.0, 1.0 - 1e-10, options)
+    quad(f, a, f64::INFINITY, options)
 }
 
-/// Integrate a function over (-∞, b].
+/// `scipy.integrate.quad(f, -np.inf, b)`: [`quad`] over `(-∞, b]` (QUADPACK QAGIE).
 ///
-/// Uses substitution to map (-∞, b] to [0, 1].
+/// # Errors
+/// A non-finite `b`, and as [`quad`].
 pub fn quad_neg_inf<F>(
     f: F,
     b: f64,
@@ -3435,75 +3992,19 @@ where
             detail: "quad_neg_inf: finite endpoint must be finite".to_string(),
         });
     }
-
-    // Substitution: x = b - t/(1-t), dx = -1/(1-t)² dt, t ∈ [0, 1)
-    let g = |t: f64| {
-        if t >= 1.0 - 1e-15 {
-            return 0.0;
-        }
-        let x = b - t / (1.0 - t);
-        let jacobian = 1.0 / ((1.0 - t) * (1.0 - t));
-        f(x) * jacobian
-    };
-
-    quad(g, 0.0, 1.0 - 1e-10, options)
+    quad(f, f64::NEG_INFINITY, b, options)
 }
 
-/// Integrate a function over (-∞, ∞).
+/// `scipy.integrate.quad(f, -np.inf, np.inf)`: [`quad`] over the real line (QUADPACK QAGIE
+/// with both tails folded onto one transformed interval).
 ///
-/// Splits at 0 and uses substitutions for both halves.
+/// # Errors
+/// As [`quad`].
 pub fn quad_full_inf<F>(f: F, options: QuadOptions) -> Result<QuadResult, IntegrateValidationError>
 where
     F: Fn(f64) -> f64,
 {
-    let left = quad_neg_inf(&f, 0.0, options)?;
-    let right = quad_inf(&f, 0.0, options)?;
-
-    Ok(QuadResult {
-        integral: left.integral + right.integral,
-        error: left.error + right.error,
-        neval: left.neval + right.neval,
-        converged: left.converged && right.converged,
-    })
-}
-
-/// Compute the Cauchy principal value of a singular integral.
-///
-/// Integrates f(x) over [a, b] with a singularity at `singular_point`.
-/// Splits the interval and approaches the singularity from both sides.
-pub fn quad_cauchy_pv<F>(
-    f: F,
-    a: f64,
-    b: f64,
-    singular_point: f64,
-    options: QuadOptions,
-) -> Result<QuadResult, IntegrateValidationError>
-where
-    F: Fn(f64) -> f64,
-{
-    if !a.is_finite() || !b.is_finite() || !singular_point.is_finite() {
-        return Err(IntegrateValidationError::QuadInvalidBounds {
-            detail: "integration bounds and singular point must be finite".to_string(),
-        });
-    }
-    let lo = a.min(b);
-    let hi = a.max(b);
-    if !(singular_point > lo && singular_point < hi) {
-        return Err(IntegrateValidationError::QuadInvalidBounds {
-            detail: "singular point must lie strictly inside the integration interval".to_string(),
-        });
-    }
-    let eps = 1e-8 * (b - a).abs();
-
-    let left = quad(&f, a, singular_point - eps, options)?;
-    let right = quad(&f, singular_point + eps, b, options)?;
-
-    Ok(QuadResult {
-        integral: left.integral + right.integral,
-        error: left.error + right.error,
-        neval: left.neval + right.neval,
-        converged: left.converged && right.converged,
-    })
+    quad(f, f64::NEG_INFINITY, f64::INFINITY, options)
 }
 
 /// Compute the integral of a function given at discrete points using
@@ -4909,13 +5410,241 @@ mod tests {
         );
     }
 
+    /// NaN bounds are rejected; infinite bounds are integrated (QAGIE), with `b < a` negated,
+    /// as SciPy does. Infinite bounds used to be rejected.
     #[test]
-    fn quad_nonfinite_bounds_error() {
-        let err =
-            quad(|x| x, f64::INFINITY, 1.0, QuadOptions::default()).expect_err("infinite bounds");
+    fn quad_rejects_nan_bounds_and_integrates_infinite_ones() {
+        for (a, b) in [(f64::NAN, 1.0), (0.0, f64::NAN)] {
+            let err = quad(|x| x, a, b, QuadOptions::default()).expect_err("NaN bound");
+            assert!(matches!(
+                err,
+                IntegrateValidationError::QuadInvalidBounds { .. }
+            ));
+        }
+        let tail = (-1.0_f64).exp();
+        let forward = quad(|x| (-x).exp(), 1.0, f64::INFINITY, QuadOptions::default()).unwrap();
+        let reversed = quad(|x| (-x).exp(), f64::INFINITY, 1.0, QuadOptions::default()).unwrap();
+        assert!(forward.converged && (forward.integral - tail).abs() < 1e-14);
+        assert_eq!(reversed.integral, -forward.integral);
+        let err = quad_points(|x| x, 0.0, f64::INFINITY, &[1.0], QuadOptions::default())
+            .expect_err("points with an infinite range");
         assert!(matches!(
             err,
             IntegrateValidationError::QuadInvalidBounds { .. }
+        ));
+    }
+
+    /// frankenscipy-1ksfv.8: `quad` is QUADPACK. Each case is SciPy 1.17.1's
+    /// `quad(f, a, b, full_output=1)` (points where given): the value, and the SAME
+    /// neval / last / ier, because the algorithm is the same statement by statement. The old
+    /// recursive GK15 differed in all of them, e.g. it could not extrapolate x^-0.9 and it
+    /// truncated [0, ∞) at t = 1 − 1e-10.
+    #[test]
+    fn quad_matches_scipy_quadpack_full_output() {
+        type Integrand = fn(f64) -> f64;
+        // (name, f, a, b, points, SciPy value, SciPy abserr, neval, last, ier)
+        let cases: [(
+            &str,
+            Integrand,
+            f64,
+            f64,
+            &[f64],
+            f64,
+            f64,
+            usize,
+            usize,
+            u8,
+        ); 12] = [
+            (
+                "x^-0.5",
+                |x| x.powf(-0.5),
+                0.0,
+                1.0,
+                &[],
+                1.999_999_999_999_999_1,
+                3.774_758_283_725_532e-15,
+                231,
+                6,
+                0,
+            ),
+            (
+                "log x",
+                f64::ln,
+                0.0,
+                1.0,
+                &[],
+                -0.999_999_999_999_999_9,
+                1.110_223_024_625_156_3e-15,
+                231,
+                6,
+                0,
+            ),
+            (
+                "x^-0.9",
+                |x| x.powf(-0.9),
+                0.0,
+                1.0,
+                &[],
+                9.999_999_999_999_792,
+                6.803_446_694_902_959e-13,
+                231,
+                6,
+                0,
+            ),
+            (
+                "1/(1+x^2)",
+                |x| 1.0 / (1.0 + x * x),
+                0.0,
+                f64::INFINITY,
+                &[],
+                1.570_796_326_794_896_6,
+                2.577_791_520_551_927_4e-10,
+                45,
+                2,
+                0,
+            ),
+            (
+                "exp(-x^2)",
+                |x| (-x * x).exp(),
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                &[],
+                1.772_453_850_905_515_9,
+                1.420_263_678_094_492_3e-8,
+                270,
+                5,
+                0,
+            ),
+            (
+                "exp",
+                f64::exp,
+                f64::NEG_INFINITY,
+                1.0,
+                &[],
+                std::f64::consts::E,
+                1.588_185_429_179_666_6e-10,
+                135,
+                5,
+                0,
+            ),
+            (
+                "sin(1e4 x)",
+                |x| (1e4 * x).sin(),
+                0.0,
+                1.0,
+                &[],
+                -0.004_014_431_846_301_359_4,
+                0.158_410_487_996_306_91,
+                2079,
+                50,
+                1,
+            ),
+            (
+                "|x-1|",
+                |x| (x - 1.0).abs(),
+                0.0,
+                3.0,
+                &[],
+                2.5,
+                2.775_557_561_562_891_4e-15,
+                189,
+                5,
+                0,
+            ),
+            (
+                "|x-1| points",
+                |x| (x - 1.0).abs(),
+                0.0,
+                3.0,
+                &[1.0],
+                2.5,
+                2.775_557_561_562_891_4e-14,
+                42,
+                2,
+                0,
+            ),
+            (
+                "|x-0.3|^-0.5 points",
+                |x| (x - 0.3).abs().powf(-0.5),
+                0.0,
+                1.0,
+                &[0.3],
+                2.768_765_168_078_440_6,
+                2.176_037_128_265_306_8e-13,
+                462,
+                12,
+                0,
+            ),
+            (
+                "cos",
+                f64::cos,
+                0.0,
+                std::f64::consts::FRAC_PI_2,
+                &[],
+                0.999_999_999_999_999_9,
+                1.110_223_024_625_156_4e-14,
+                21,
+                1,
+                0,
+            ),
+            (
+                "x^2 reversed",
+                |x| x * x,
+                2.0,
+                0.0,
+                &[],
+                -2.666_666_666_666_667,
+                2.960_594_732_333_751e-14,
+                21,
+                1,
+                0,
+            ),
+        ];
+        for (name, f, a, b, points, value, abserr, neval, last, ier) in cases {
+            let (result, info) =
+                quad_full_output(f, a, b, points, QuadOptions::default()).expect(name);
+            assert!(
+                (result.integral - value).abs() <= 1e-14 * value.abs(),
+                "{name}: {} vs SciPy {value}",
+                result.integral
+            );
+            assert!(
+                (result.error - abserr).abs() <= 1e-3 * abserr,
+                "{name}: abserr {} vs SciPy {abserr}",
+                result.error
+            );
+            assert_eq!(
+                (result.neval, info.last, info.ier),
+                (neval, last, ier),
+                "{name}: (neval, last, ier)"
+            );
+            assert_eq!(result.converged, ier == 0, "{name}");
+            assert_eq!(info.message.is_empty(), ier == 0, "{name}");
+        }
+    }
+
+    /// A NaN integrand must not make `quad` run away (frankenscipy-t45u3): QUADPACK's work is
+    /// bounded by `limit` subintervals. It reports non-convergence.
+    #[test]
+    fn quad_nan_integrand_is_bounded_and_not_converged() {
+        let r = quad(|_| f64::NAN, 0.0, 1.0, QuadOptions::default()).expect("quad");
+        assert!(!r.converged);
+        assert!(r.neval <= 21 * (2 * 50 - 1), "neval {}", r.neval);
+        // QUADPACK's invalid-input case is SciPy's ValueError.
+        let err = quad(
+            |x| x,
+            0.0,
+            1.0,
+            QuadOptions {
+                epsabs: 0.0,
+                epsrel: 1e-20,
+                ..QuadOptions::default()
+            },
+        )
+        .expect_err("epsabs 0 with a tiny epsrel");
+        assert!(matches!(
+            err,
+            IntegrateValidationError::QuadInvalidTolerance { .. }
         ));
     }
 
@@ -4946,27 +5675,193 @@ mod tests {
         }
     }
 
+    /// frankenscipy-1ksfv.8: `quad(weight=...)` is QUADPACK's QAWCE / QAWSE / QAWOE / QAWFE.
+    /// Each case is SciPy 1.17.1's `quad(f, a, b, weight=..., wvar=..., full_output=1)`: the
+    /// value and the same (neval, last). The Cauchy weight replaces `quad_cauchy_pv`, which
+    /// excised ±1e-8·(b−a) around the pole.
     #[test]
-    fn quad_cauchy_pv_rejects_singularity_outside_interval() {
-        for (a, b, singular_point) in [
-            (0.0, 1.0, -0.5),
-            (0.0, 1.0, 0.0),
-            (0.0, 1.0, 1.0),
-            (0.0, 1.0, 1.5),
-            (1.0, 0.0, -0.5),
-        ] {
-            let err = quad_cauchy_pv(
-                |_| -> f64 { panic!("invalid Cauchy-PV singular point should not be sampled") },
-                a,
-                b,
-                singular_point,
-                QuadOptions::default(),
-            )
-            .expect_err("singular point outside interval should fail");
-            assert!(matches!(
-                err,
-                IntegrateValidationError::QuadInvalidBounds { .. }
-            ));
+    fn quad_weighted_matches_scipy_quadpack() {
+        type Integrand = fn(f64) -> f64;
+        let w = QuadWeightOptions::default();
+        let inf = f64::INFINITY;
+        // (name, f, a, b, weight, SciPy value, neval, last)
+        let cases: [(&str, Integrand, f64, f64, QuadWeight, f64, usize, usize); 10] = [
+            (
+                "cauchy 1",
+                |_| 1.0,
+                -1.0,
+                2.0,
+                QuadWeight::Cauchy(0.0),
+                std::f64::consts::LN_2,
+                25,
+                1,
+            ),
+            (
+                "cauchy lorentz",
+                |x| 1.0 / (1.0 + x * x),
+                0.0,
+                5.0,
+                QuadWeight::Cauchy(2.0),
+                -0.794_076_938_958_521_6,
+                145,
+                4,
+            ),
+            (
+                "alg chebyshev",
+                |_| 1.0,
+                -1.0,
+                1.0,
+                QuadWeight::Alg {
+                    alpha: -0.5,
+                    beta: -0.5,
+                },
+                3.141_592_653_589_792_7,
+                50,
+                2,
+            ),
+            (
+                "alg-loga",
+                f64::cos,
+                0.0,
+                1.0,
+                QuadWeight::AlgLogA {
+                    alpha: 0.5,
+                    beta: 0.25,
+                },
+                -0.360_298_430_050_768,
+                50,
+                2,
+            ),
+            (
+                "alg-logb",
+                f64::exp,
+                0.0,
+                1.0,
+                QuadWeight::AlgLogB {
+                    alpha: 0.0,
+                    beta: -0.5,
+                },
+                -9.850_406_137_810_443,
+                40,
+                2,
+            ),
+            (
+                "alg-log",
+                |_| 1.0,
+                0.0,
+                1.0,
+                QuadWeight::AlgLog {
+                    alpha: -0.3,
+                    beta: -0.3,
+                },
+                0.602_161_690_066_764_7,
+                50,
+                2,
+            ),
+            (
+                "sin 50",
+                |x| 1.0 / (1.0 + x * x),
+                0.0,
+                3.0,
+                QuadWeight::Sin(50.0),
+                0.018_635_017_300_020_58,
+                75,
+                2,
+            ),
+            (
+                "cos 200",
+                |x| (-x * x).exp(),
+                -3.0,
+                3.0,
+                QuadWeight::Cos(200.0),
+                9.143_821_840_874_086e-8,
+                75,
+                2,
+            ),
+            (
+                "sin -30",
+                f64::exp,
+                0.0,
+                2.0,
+                QuadWeight::Sin(-30.0),
+                -0.265_117_342_364_312_56,
+                25,
+                0,
+            ),
+            (
+                "sin 2 on [0, inf)",
+                |x| 1.0 / (1.0 + x * x),
+                0.0,
+                inf,
+                QuadWeight::Sin(2.0),
+                0.515_905_663_307_661_9,
+                410,
+                12,
+            ),
+        ];
+        for (name, f, a, b, weight, value, neval, last) in cases {
+            let (result, info) =
+                quad_weighted_full_output(f, a, b, weight, QuadOptions::default(), w).expect(name);
+            assert!(
+                (result.integral - value).abs() <= 1e-14 * value.abs(),
+                "{name}: {} vs SciPy {value}",
+                result.integral
+            );
+            assert_eq!(
+                (result.neval, info.last, info.ier),
+                (neval, last, 0),
+                "{name}"
+            );
+            assert!(result.converged, "{name}");
+        }
+
+        // cos(0·x) on [1, ∞): SciPy (netlib dqawfe) integrates from 0 and returns 1.0; the
+        // integral is e^-1.
+        let r = quad_weighted(
+            |x| (-x).exp(),
+            1.0,
+            inf,
+            QuadWeight::Cos(0.0),
+            QuadOptions::default(),
+            w,
+        )
+        .expect("omega 0");
+        assert!(
+            (r.integral - (-1.0_f64).exp()).abs() < 1e-12,
+            "{}",
+            r.integral
+        );
+
+        // (-∞, 0] remaps to [0, ∞) as in SciPy: ∫ e^x cos x = 1/2, ∫ e^x sin x = -1/2.
+        for (weight, value) in [(QuadWeight::Cos(1.0), 0.5), (QuadWeight::Sin(1.0), -0.5)] {
+            let r = quad_weighted(f64::exp, -inf, 0.0, weight, QuadOptions::default(), w)
+                .expect("negative half line");
+            assert!(
+                (r.integral - value).abs() < 1e-12,
+                "{weight:?}: {}",
+                r.integral
+            );
+        }
+
+        // What SciPy rejects.
+        let rejected = [
+            (0.0, inf, QuadWeight::Cauchy(1.0)),
+            (0.0, 1.0, QuadWeight::Cauchy(0.0)),
+            (
+                0.0,
+                1.0,
+                QuadWeight::Alg {
+                    alpha: -1.0,
+                    beta: 0.0,
+                },
+            ),
+            (-inf, inf, QuadWeight::Cos(1.0)),
+        ];
+        for (a, b, weight) in rejected {
+            assert!(
+                quad_weighted(|x| x, a, b, weight, QuadOptions::default(), w).is_err(),
+                "{weight:?} on [{a}, {b}] must be rejected"
+            );
         }
     }
 
@@ -5198,6 +6093,104 @@ mod tests {
         );
     }
 
+    /// frankenscipy-szq1n.12: `rule` used to be accepted and ignored (every rule ran one
+    /// embedded 3-point Gauss rule). With no subdivision each rule's single-region estimate,
+    /// error and node count must be SciPy's: `ProductNestedFixed([GaussKronrodQuadrature(21 |
+    /// 15)] * 2)` and `GenzMalikCubature(2)`, SciPy 1.17.1.
+    #[test]
+    fn cubature_rule_selects_the_scipy_rule() {
+        let f = |x: &[f64]| (1.3 * (x[0] + x[1])).exp() * (1.0 + x[0] * x[0]);
+        let single_region = |rule| {
+            cubature_scalar(
+                f,
+                &[0.0, 0.0],
+                &[1.0, 1.5],
+                CubatureOptions {
+                    rule,
+                    max_subdivisions: 0,
+                    ..CubatureOptions::default()
+                },
+            )
+            .expect("cubature")
+        };
+        // (rule, SciPy estimate, SciPy error, rule nodes); neval adds the one sample call.
+        let cases = [
+            (CubatureRule::Gk21, 13.742_741_172_032_046, 1.4e-14, 441),
+            (
+                CubatureRule::GaussKronrod,
+                13.742_741_172_032_046,
+                1.4e-14,
+                441,
+            ),
+            (CubatureRule::Gk15, 13.742_741_172_032_044, 1.4e-14, 225),
+            (
+                CubatureRule::GenzMalik,
+                13.742_792_387_031_008,
+                0.020_992_239_217_037_377,
+                17,
+            ),
+        ];
+        for (rule, estimate, error, nodes) in cases {
+            let result = single_region(rule);
+            assert!(
+                (result.estimate - estimate).abs() <= 1e-13 * estimate,
+                "{rule:?}: estimate {} vs SciPy {estimate}",
+                result.estimate
+            );
+            if error > 1e-6 {
+                assert!(
+                    (result.error - error).abs() <= 1e-9 * error,
+                    "{rule:?}: error {} vs SciPy {error}",
+                    result.error
+                );
+            } else {
+                assert!(result.error < 1e-12, "{rule:?}: error {}", result.error);
+            }
+            assert_eq!(result.neval, nodes + 1, "{rule:?}");
+        }
+
+        // Adaptive runs converge with every rule; the exact value is 13.74274117203205.
+        for rule in [
+            CubatureRule::Gk21,
+            CubatureRule::Gk15,
+            CubatureRule::GenzMalik,
+        ] {
+            let result = cubature_scalar(
+                f,
+                &[0.0, 0.0],
+                &[1.0, 1.5],
+                CubatureOptions {
+                    rule,
+                    rtol: 1e-10,
+                    ..CubatureOptions::default()
+                },
+            )
+            .expect("cubature");
+            assert_eq!(result.status, CubatureStatus::Converged, "{rule:?}");
+            assert!(
+                (result.estimate - 13.742_741_172_032_05).abs() < 1e-9,
+                "{rule:?}: {}",
+                result.estimate
+            );
+        }
+
+        // SciPy: "Genz-Malik cubature is only defined for ndim >= 2".
+        let err = cubature_scalar(
+            |x| x[0],
+            &[0.0],
+            &[1.0],
+            CubatureOptions {
+                rule: CubatureRule::GenzMalik,
+                ..CubatureOptions::default()
+            },
+        )
+        .expect_err("1-D Genz-Malik");
+        assert!(matches!(
+            err,
+            IntegrateValidationError::QuadInvalidBounds { .. }
+        ));
+    }
+
     #[test]
     fn cubature_rejects_invalid_inputs() {
         let bounds_err = cubature_scalar(|x| x[0], &[0.0], &[1.0, 2.0], CubatureOptions::default())
@@ -5402,19 +6395,75 @@ mod tests {
     }
 
     #[test]
-    fn dblquad_nonfinite_bounds_error() {
+    fn dblquad_nan_bounds_error() {
         let err = dblquad(
             |y, x| x * y,
-            f64::INFINITY,
+            f64::NAN,
             1.0,
             |_| 0.0,
             |_| 1.0,
             DblquadOptions::default(),
         )
-        .expect_err("nonfinite");
+        .expect_err("NaN bound");
         assert!(matches!(
             err,
             IntegrateValidationError::QuadInvalidBounds { .. }
+        ));
+    }
+
+    /// Infinite limits, now that `quad` is QUADPACK (they used to be rejected). SciPy 1.17.1:
+    /// dblquad(exp(-x-y), 0, ∞, 0, ∞) = 0.9999999999976233; dblquad and nquad of
+    /// exp(-x²-y²) over R² = 3.141592653589777; tplquad(exp(-x-y-z), [0, ∞)³) =
+    /// 0.9999999999603953.
+    #[test]
+    fn multi_dimensional_quad_integrates_infinite_limits() {
+        let inf = f64::INFINITY;
+        let d = dblquad(
+            |y, x| (-x - y).exp(),
+            0.0,
+            inf,
+            |_| 0.0,
+            |_| inf,
+            DblquadOptions::default(),
+        )
+        .expect("dblquad");
+        assert!(d.converged && (d.integral - 1.0).abs() < 1e-8, "{d:?}");
+        let g = dblquad(
+            |y, x| (-x * x - y * y).exp(),
+            -inf,
+            inf,
+            |_| -inf,
+            |_| inf,
+            DblquadOptions::default(),
+        )
+        .expect("dblquad R^2");
+        assert!((g.integral - std::f64::consts::PI).abs() < 1e-8, "{g:?}");
+        let t = tplquad(
+            |z, y, x| (-x - y - z).exp(),
+            0.0,
+            inf,
+            |_| 0.0,
+            |_| inf,
+            |_, _| 0.0,
+            |_, _| inf,
+            DblquadOptions::default(),
+        )
+        .expect("tplquad");
+        assert!((t.integral - 1.0).abs() < 1e-8, "{t:?}");
+        let n = nquad(
+            |v| (-v[0] * v[0] - v[1] * v[1]).exp(),
+            &[(-inf, inf), (-inf, inf)],
+            QuadOptions::default(),
+        )
+        .expect("nquad R^2");
+        assert!(
+            n.converged && (n.integral - std::f64::consts::PI).abs() < 1e-8,
+            "{n:?}"
+        );
+        let nan = nquad(|v| v[0], &[(f64::NAN, 1.0)], QuadOptions::default());
+        assert!(matches!(
+            nan,
+            Err(IntegrateValidationError::QuadInvalidBounds { .. })
         ));
     }
 
@@ -6336,6 +7385,159 @@ mod tests {
             result.integral,
             exact
         );
+    }
+
+    // br-szq1n.7: `converged` must be false when the depth limit stops refinement
+    // while the error estimate is still above tolerance (it used to be `true`),
+    // and true when the tolerance test passes.
+    #[test]
+    fn gauss_kronrod_converged_flag_reflects_the_tolerance_test() {
+        let singular = |x: f64| (x - 1.0 / 3.0).abs().powf(-0.9);
+        let shallow = gauss_kronrod_quad(
+            singular,
+            0.0,
+            1.0,
+            QuadOptions {
+                limit: 3,
+                ..QuadOptions::default()
+            },
+        );
+        assert!(
+            !shallow.converged,
+            "depth limit 3 cannot resolve |x-1/3|^-0.9 (error {:e})",
+            shallow.error
+        );
+        let smooth = gauss_kronrod_quad(|x| x.exp(), 0.0, 1.0, QuadOptions::default());
+        assert!(smooth.converged, "exp on [0,1] meets the default tolerance");
+    }
+
+    // br-szq1n.7: every leaf of ∫₀^{2π} sin passes its own epsrel test (each half is ±2), but the
+    // total is ~1e-16 and its error cannot meet epsrel·|total|. SciPy flags this (ier != 0,
+    // roundoff); the flag used to be the AND of the leaves, i.e. true.
+    #[test]
+    fn quad_converged_is_decided_on_the_total_not_the_leaves() {
+        let rel_only = QuadOptions {
+            epsabs: 0.0,
+            epsrel: 1e-10,
+            ..QuadOptions::default()
+        };
+        let cancelling = quad(f64::sin, 0.0, 2.0 * std::f64::consts::PI, rel_only).unwrap();
+        let bound = rel_only.epsrel * cancelling.integral.abs();
+        println!(
+            "sin over [0,2pi]: I={:e} err={:e} bound={bound:e}",
+            cancelling.integral, cancelling.error
+        );
+        assert!(
+            !cancelling.converged,
+            "error {:e} exceeds epsrel*|I| = {bound:e}",
+            cancelling.error
+        );
+        let one_sign = quad(f64::sin, 0.0, std::f64::consts::PI, rel_only).unwrap();
+        assert!(one_sign.converged, "sin over [0,pi] = 2 meets epsrel 1e-10");
+        let vec = quad_vec(|x| vec![x.sin()], 0.0, 2.0 * std::f64::consts::PI, rel_only).unwrap();
+        assert!(!vec.converged, "quad_vec uses the same total test");
+    }
+
+    // br-szq1n.7: a zero-width test of |a-b| < EPSILON returned 0 for ∫₀^{1e-17} 1e20 dx = 1000.
+    // SciPy only short-circuits a == b exactly.
+    #[test]
+    fn quad_integrates_a_tiny_but_nonzero_interval() {
+        let tiny = quad(|_| 1e20, 0.0, 1e-17, QuadOptions::default()).unwrap();
+        assert!(
+            (tiny.integral - 1000.0).abs() < 1e-9,
+            "got {} (SciPy 1000.0000000000001)",
+            tiny.integral
+        );
+        let empty = quad(|_| 1e20, 0.5, 0.5, QuadOptions::default()).unwrap();
+        assert_eq!(empty.integral, 0.0);
+        assert!(empty.converged);
+    }
+
+    // br-szq1n.7: nquad used to return error 0.0 and converged true whatever the nested quads did.
+    // SciPy: nquad(|x-1/3|^-0.9, [(0,1),(0,1)], opts={'limit':3}) -> (8.2256, abserr 4.70), the
+    // abserr being the MAX over every nested quad call. The singular variable here is the
+    // innermost one (SciPy's first argument), so the outer integrand is constant and only the
+    // inner calls carry the error.
+    #[test]
+    fn nquad_reports_the_largest_nested_error_and_any_unconverged_inner_quad() {
+        let shallow = QuadOptions {
+            limit: 3,
+            ..QuadOptions::default()
+        };
+        let singular = nquad(
+            |args| (args[1] - 1.0 / 3.0).abs().powf(-0.9),
+            &[(0.0, 1.0), (0.0, 1.0)],
+            shallow,
+        )
+        .unwrap();
+        println!(
+            "nquad singular: I={} err={:e} converged={}",
+            singular.integral, singular.error, singular.converged
+        );
+        assert!(!singular.converged, "inner quad cannot converge at limit 3");
+        assert!(singular.error > 1e-3, "outer abserr is reported, not 0.0");
+        let smooth = nquad(
+            |args| args[0] * args[1],
+            &[(0.0, 1.0), (0.0, 1.0)],
+            QuadOptions::default(),
+        )
+        .unwrap();
+        assert!(smooth.converged);
+        assert!(smooth.error < 1e-12, "smooth abserr {:e}", smooth.error);
+
+        // dblquad and tplquad AND the inner flags in the same way.
+        let d = dblquad(
+            |y, _x| (y - 1.0 / 3.0).abs().powf(-0.9),
+            0.0,
+            1.0,
+            |_| 0.0,
+            |_| 1.0,
+            DblquadOptions {
+                limit: 3,
+                ..DblquadOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !d.converged,
+            "dblquad inner quad cannot converge at limit 3"
+        );
+        let t = tplquad(
+            |z, _y, _x| (z - 1.0 / 3.0).abs().powf(-0.9),
+            0.0,
+            1.0,
+            |_| 0.0,
+            |_| 1.0,
+            |_, _| 0.0,
+            |_, _| 1.0,
+            DblquadOptions {
+                limit: 3,
+                ..DblquadOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !t.converged,
+            "tplquad innermost quad cannot converge at limit 3"
+        );
+    }
+
+    // br-szq1n.7: a non-finite finite-range partial sum is SciPy's status -3, not converged.
+    #[test]
+    fn nsum_nonfinite_finite_range_is_not_converged() {
+        let bad = nsum(
+            |n| if n == 3.0 { f64::NAN } else { n },
+            1.0,
+            5.0,
+            1.0,
+            0.0,
+            0.0,
+        );
+        assert!(bad.sum.is_nan());
+        assert!(!bad.converged);
+        let good = nsum(|n| n, 1.0, 5.0, 1.0, 0.0, 0.0);
+        assert_eq!(good.sum, 15.0);
+        assert!(good.converged);
     }
 
     #[test]

@@ -130,21 +130,46 @@ pub enum IntegrateValidationError {
     NonFiniteMaxStep,
     NonFiniteRtol,
     NonFiniteAtol,
-    AtolWrongShape { expected: usize, actual: usize },
+    AtolWrongShape {
+        expected: usize,
+        actual: usize,
+    },
     AtolMustBePositive,
     NonFiniteY0,
     NonFiniteSpan,
     NonFiniteF0,
-    RhsWrongShape { expected: usize, actual: usize },
-    NonFiniteEventDirection { index: usize },
-    EventMaxEventsMustBePositive { index: usize },
-    NonFiniteEventValue { index: usize },
+    RhsWrongShape {
+        expected: usize,
+        actual: usize,
+    },
+    NonFiniteEventDirection {
+        index: usize,
+    },
+    EventMaxEventsMustBePositive {
+        index: usize,
+    },
+    NonFiniteEventValue {
+        index: usize,
+    },
     TEvalOutOfSpan,
     TEvalNotSorted,
-    NotYetImplemented { function: &'static str },
-    QuadInvalidBounds { detail: String },
-    QuadInvalidTolerance { detail: String },
-    LebedevOrderUnavailable { order: i64 },
+    NotYetImplemented {
+        function: &'static str,
+    },
+    QuadInvalidBounds {
+        detail: String,
+    },
+    QuadInvalidTolerance {
+        detail: String,
+    },
+    LebedevOrderUnavailable {
+        order: i64,
+    },
+    /// The integrator stopped before reaching every requested time (e.g. the step
+    /// size underflowed on a finite-time blow-up). Carries the solver's message.
+    IntegrationFailed {
+        message: String,
+    },
 }
 
 impl std::fmt::Display for IntegrateValidationError {
@@ -189,6 +214,7 @@ impl std::fmt::Display for IntegrateValidationError {
                  9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31, 35, 41, 47, 53, 59, \
                  65, 71, 77, 83, 89, 95, 101, 107, 113, 119, 125, 131."
             ),
+            Self::IntegrationFailed { message } => write!(f, "integration failed: {message}"),
         }
     }
 }

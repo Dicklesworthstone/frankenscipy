@@ -836,6 +836,7 @@ impl BdfSolver {
                 }
                 match self.newton_bdf(fun, t_new, &y_predict, c, &psi, &scale, newton_tol) {
                     Some((iters, y_sol, d_sol)) => {
+                        // status: newton_bdf is Some only on its Newton rate criterion
                         converged = true;
                         n_iter = iters;
                         y_new = y_sol;

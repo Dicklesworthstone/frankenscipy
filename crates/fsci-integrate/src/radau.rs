@@ -800,6 +800,7 @@ impl RadauSolver {
                     break;
                 }
                 if dz_norm == 0.0 || rate.is_some_and(|r| r / (1.0 - r) * dz_norm < newton_tol) {
+                    // status: ‖ΔZ‖ == 0 or rate/(1-rate)·‖ΔZ‖ < newton_tol (SciPy's Radau)
                     converged = true;
                     break;
                 }

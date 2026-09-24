@@ -1,72 +1,119 @@
 #![forbid(unsafe_code)]
 
-//! Boundary Value Problem (BVP) solver using the shooting method.
+//! Boundary value problems: `scipy.integrate.solve_bvp`.
 //!
-//! Solves two-point BVPs of the form:
-//!   y' = f(t, y),  y(a) partially known, y(b) partially known
+//! [`solve_bvp`] solves `y' = f(x, y, p) + S·y/(x − a)` on `[a, b]` with
+//! `bc(y(a), y(b), p) = 0` by SciPy's algorithm (Kierzenka & Shampine 2001, transcribed in
+//! `collocation.rs`): a C¹ cubic spline collocated at the mesh nodes and interval midpoints
+//! (4th-order Lobatto IIIA), a damped Newton method on the sparse collocation Jacobian
+//! (factorized by `fsci_sparse::splu`), and mesh refinement until the RMS relative residual on
+//! every interval is below `tol`. Unknown parameters `p` are solved for alongside `y`; the
+//! singular term `S` handles `y' = S·y/x + f` problems on `[0, b]`.
 //!
-//! Uses single shooting with Newton iteration to find missing initial conditions.
+//! This replaced a single-shooting solver, which fails on exactly the problems collocation is
+//! for: `y'' = 100·y` on `[0, 10]` (a boundary layer the forward IVP amplifies by e¹⁰⁰) and
+//! Troesch's problem (frankenscipy-1ksfv.7).
 
-use crate::api::{SolveIvpOptions, SolverKind, solve_ivp};
-use crate::validation::ToleranceValue;
+use crate::collocation::{self, LinearSolver, Problem, Singular, Spline};
+use fsci_sparse::{
+    CooMatrix, FormatConvertible, LuOptions, Shape2D, SparseLuFactorization, splu, splu_solve,
+};
+use nalgebra::DMatrix;
 
-/// Options for BVP solver.
-#[derive(Debug, Clone)]
-pub struct BvpOptions {
-    /// Tolerance for the boundary condition residual.
+/// `fun_jac(x, y, p) -> (∂f/∂y, ∂f/∂p)`: n×n and n×k, one row per component of `f`.
+pub type BvpFunJac<'a> = &'a (dyn Fn(f64, &[f64], &[f64]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) + Sync);
+/// `bc_jac(ya, yb, p) -> (∂bc/∂ya, ∂bc/∂yb, ∂bc/∂p)`: (n+k)×n, (n+k)×n and (n+k)×k.
+pub type BvpBcJac<'a> =
+    &'a (dyn Fn(&[f64], &[f64], &[f64]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<Vec<f64>>) + Sync);
+
+/// SciPy's `solve_bvp` keyword arguments.
+#[derive(Clone, Copy)]
+pub struct BvpOptions<'a> {
+    /// Tolerance on the RMS relative residual per interval (default 1e-3; floored at 100·ε).
     pub tol: f64,
-    /// Maximum Newton iterations.
-    pub max_iter: usize,
-    /// IVP solver tolerances.
-    pub rtol: f64,
-    pub atol: f64,
+    /// Maximum number of mesh nodes (default 1000).
+    pub max_nodes: usize,
+    /// Tolerance on the boundary-condition residuals (default: `tol`).
+    pub bc_tol: Option<f64>,
+    /// The singular term `S` (n×n) of `y' = S·y/(x − a) + f(x, y, p)`.
+    pub singular_term: Option<&'a [Vec<f64>]>,
+    /// Analytic Jacobian of `f`; forward differences when `None`.
+    pub fun_jac: Option<BvpFunJac<'a>>,
+    /// Analytic Jacobian of `bc`; forward differences when `None`.
+    pub bc_jac: Option<BvpBcJac<'a>>,
 }
 
-impl Default for BvpOptions {
+impl Default for BvpOptions<'_> {
     fn default() -> Self {
         Self {
-            tol: 1e-8,
-            max_iter: 50,
-            rtol: 1e-8,
-            atol: 1e-10,
+            tol: 1e-3,
+            max_nodes: 1000,
+            bc_tol: None,
+            singular_term: None,
+            fun_jac: None,
+            bc_jac: None,
         }
     }
 }
 
-/// Result of BVP solve.
-#[derive(Debug, Clone)]
-pub struct BvpResult {
-    /// Solution time points.
-    pub t: Vec<f64>,
-    /// Solution values at each time point (each entry is a state vector).
-    pub y: Vec<Vec<f64>>,
-    /// Whether the solver converged.
-    pub converged: bool,
-    /// Number of Newton iterations.
-    pub iterations: usize,
-    /// Final boundary condition residual norm.
-    pub residual: f64,
+impl std::fmt::Debug for BvpOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BvpOptions")
+            .field("tol", &self.tol)
+            .field("max_nodes", &self.max_nodes)
+            .field("bc_tol", &self.bc_tol)
+            .field("singular_term", &self.singular_term)
+            .field("fun_jac", &self.fun_jac.map(|_| "<function>"))
+            .field("bc_jac", &self.bc_jac.map(|_| "<function>"))
+            .finish()
+    }
 }
 
-/// Error type for BVP operations.
+/// SciPy's `BVPResult`.
+#[derive(Debug, Clone)]
+pub struct BvpResult {
+    /// Final mesh.
+    pub x: Vec<f64>,
+    /// Solution at the mesh nodes, `y[i][j]` = component `i` at node `j` (SciPy's `(n, m)`).
+    pub y: Vec<Vec<f64>>,
+    /// `f(x, y, p)` at the mesh nodes, same layout.
+    pub yp: Vec<Vec<f64>>,
+    /// Found unknown parameters (empty when there are none).
+    pub p: Vec<f64>,
+    /// RMS relative residual on each mesh interval.
+    pub rms_residuals: Vec<f64>,
+    /// Number of mesh refinement iterations.
+    pub niter: usize,
+    /// 0 converged, 1 `max_nodes` exceeded, 2 singular Jacobian, 3 `bc_tol` not met.
+    pub status: usize,
+    pub message: String,
+    pub success: bool,
+    spline: Spline,
+}
+
+impl BvpResult {
+    /// SciPy's `sol(x)`: the C¹ cubic spline solution at `x` (extrapolated outside `[a, b]`).
+    #[must_use]
+    pub fn sol(&self, x: f64) -> Vec<f64> {
+        self.spline.eval(x, 0)
+    }
+
+    /// `sol(x, 1)`: the derivative of the spline solution at `x`.
+    #[must_use]
+    pub fn sol_derivative(&self, x: f64) -> Vec<f64> {
+        self.spline.eval(x, 1)
+    }
+}
+
+/// Invalid input, as SciPy raises `ValueError`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BvpError {
-    IvpFailed(String),
-    DidNotConverge { iterations: usize, residual: f64 },
     InvalidArgument(String),
 }
 
 impl std::fmt::Display for BvpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::IvpFailed(msg) => write!(f, "IVP solve failed: {msg}"),
-            Self::DidNotConverge {
-                iterations,
-                residual,
-            } => write!(
-                f,
-                "BVP did not converge after {iterations} iterations (residual={residual})"
-            ),
             Self::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
         }
     }
@@ -74,142 +121,233 @@ impl std::fmt::Display for BvpError {
 
 impl std::error::Error for BvpError {}
 
-/// Solve a two-point BVP using single shooting.
-///
-/// Given:
-///   y' = f(t, y)
-///   bc(y(a), y(b)) = 0  (boundary condition residual)
-///
-/// The solver adjusts the initial conditions y(a) until bc(y(a), y(b)) = 0.
-///
-/// # Arguments
-/// * `f` - ODE right-hand side f(t, y) -> y'
-/// * `bc` - Boundary condition residual bc(ya, yb) -> residual vector (must have same length as y)
-/// * `t_span` - Integration interval (a, b)
-/// * `y_guess` - Initial guess for y(a)
-/// * `options` - Solver options
-pub fn solve_bvp<F, BC>(
-    f: &mut F,
-    bc: &BC,
-    t_span: (f64, f64),
-    y_guess: &[f64],
-    options: BvpOptions,
-) -> Result<BvpResult, BvpError>
-where
-    F: FnMut(f64, &[f64]) -> Vec<f64>,
-    BC: Fn(&[f64], &[f64]) -> Vec<f64>,
-{
-    let n = y_guess.len();
-    if n == 0 {
-        return Err(BvpError::InvalidArgument(
-            "y_guess must be non-empty".to_string(),
-        ));
-    }
-    if !t_span.0.is_finite() || !t_span.1.is_finite() {
-        return Err(BvpError::InvalidArgument(
-            "t_span endpoints must be finite".to_string(),
-        ));
-    }
-    if y_guess.iter().any(|value| !value.is_finite()) {
-        return Err(BvpError::InvalidArgument(
-            "y_guess values must be finite".to_string(),
-        ));
-    }
-    validate_bvp_options(&options)?;
+struct SparseLu(SparseLuFactorization);
 
-    let mut y0 = y_guess.to_vec();
-
-    for iteration in 0..options.max_iter {
-        // Solve IVP with current y0
-        let ivp_result = solve_ivp_internal(f, t_span, &y0, options.rtol, options.atol)?;
-        let yb = ivp_result
-            .y
-            .last()
-            .ok_or_else(|| BvpError::IvpFailed("IVP result is empty".to_string()))?
-            .clone();
-
-        // Evaluate boundary condition residual
-        let residual = bc(&y0, &yb);
-        validate_boundary_residual_len(&residual, n)?;
-        let residual_norm: f64 = residual.iter().map(|r| r * r).sum::<f64>().sqrt();
-
-        if residual_norm < options.tol {
-            return Ok(BvpResult {
-                t: ivp_result.t,
-                y: ivp_result.y,
-                converged: true,
-                iterations: iteration,
-                residual: residual_norm,
-            });
-        }
-
-        // Compute Jacobian of bc w.r.t. y0 using finite differences
-        let mut jac = vec![vec![0.0; n]; n];
-        for j in 0..n {
-            // Scale perturbation by parameter magnitude for numerical stability
-            let eps_j = 1e-7 * (1.0 + y0[j].abs());
-            let mut y0_pert = y0.clone();
-            y0_pert[j] += eps_j;
-            let ivp_pert = solve_ivp_internal(f, t_span, &y0_pert, options.rtol, options.atol)?;
-            let yb_pert = ivp_pert.y.last().ok_or_else(|| {
-                BvpError::IvpFailed("IVP perturbation result is empty".to_string())
-            })?;
-            let residual_pert = bc(&y0_pert, yb_pert);
-            validate_boundary_residual_len(&residual_pert, n)?;
-            for i in 0..n {
-                jac[i][j] = (residual_pert[i] - residual[i]) / eps_j;
-            }
-        }
-
-        // Newton step: solve J * delta = -residual
-        let delta = solve_small_system(&jac, &residual.iter().map(|r| -r).collect::<Vec<_>>());
-
-        // Update y0
-        for j in 0..n {
-            y0[j] += delta[j];
-        }
-    }
-
-    // Final evaluation
-    let ivp_result = solve_ivp_internal(f, t_span, &y0, options.rtol, options.atol)?;
-    let yb = ivp_result
-        .y
-        .last()
-        .ok_or_else(|| BvpError::IvpFailed("Final IVP result is empty".to_string()))?;
-    let residual = bc(&y0, yb);
-    validate_boundary_residual_len(&residual, n)?;
-    let residual_norm: f64 = residual.iter().map(|r| r * r).sum::<f64>().sqrt();
-
-    if residual_norm < options.tol {
-        Ok(BvpResult {
-            t: ivp_result.t,
-            y: ivp_result.y,
-            converged: true,
-            iterations: options.max_iter,
-            residual: residual_norm,
-        })
-    } else {
-        Err(BvpError::DidNotConverge {
-            iterations: options.max_iter,
-            residual: residual_norm,
-        })
+impl LinearSolver for SparseLu {
+    fn solve(&self, b: &[f64]) -> Option<Vec<f64>> {
+        splu_solve(&self.0, b).ok()
     }
 }
 
-/// Batched boundary-value problems: solve N independent BVPs that share the dynamics/BC SHAPE but
-/// differ by a parameter vector, one [`BvpResult`] per set. This is the vmap-over-solver primitive
-/// for BVPs — a parameter study (vary a nonlinearity strength, a boundary value, a forcing term)
-/// loops `solve_bvp` in Python, N collocation-Newton solves SERIALLY, each calling the Python RHS
-/// at every mesh node every Newton iteration. fsci `solve_bvp_many` (`f: Fn(t, y, params)->Vec`,
-/// `bc: Fn(ya, yb, params)->Vec`) fans the N independent solves across cores and inlines both
-/// callbacks. Result `i` is byte-identical to the per-parameter `solve_bvp` call.
-pub fn solve_bvp_many<F, BC>(
-    f: F,
+/// The collocation Jacobian through `fsci_sparse::splu`, as SciPy uses `scipy.sparse.linalg.splu`.
+fn factorize_sparse(
+    size: usize,
+    triplets: &[(usize, usize, f64)],
+) -> Option<Box<dyn LinearSolver>> {
+    let rows = triplets.iter().map(|t| t.0).collect();
+    let cols = triplets.iter().map(|t| t.1).collect();
+    let data = triplets.iter().map(|t| t.2).collect();
+    let coo = CooMatrix::from_triplets(Shape2D::new(size, size), data, rows, cols, true).ok()?;
+    let lu = splu(&coo.to_csc().ok()?, LuOptions::default()).ok()?;
+    Some(Box::new(SparseLu(lu)))
+}
+
+/// NumPy's `pinv`: singular values below `max(rows, cols)·ε·σ_max` are dropped.
+fn pinv(a: &DMatrix<f64>) -> Result<DMatrix<f64>, BvpError> {
+    let n = a.nrows().max(a.ncols());
+    let svd = nalgebra::SVD::try_new(a.clone(), true, true, f64::EPSILON * 5.0, 30 * n.max(10))
+        .ok_or_else(|| BvpError::InvalidArgument("SVD of `S` did not converge".to_string()))?;
+    let (Some(u), Some(v_t)) = (svd.u, svd.v_t) else {
+        return Err(BvpError::InvalidArgument(
+            "SVD of `S` did not converge".to_string(),
+        ));
+    };
+    let s_max = svd.singular_values.iter().fold(0.0_f64, |m, &s| m.max(s));
+    let cutoff = n as f64 * f64::EPSILON * s_max;
+    let mut s_inv = DMatrix::zeros(v_t.nrows(), u.ncols());
+    for (i, &s) in svd.singular_values.iter().enumerate() {
+        if s > cutoff {
+            s_inv[(i, i)] = 1.0 / s;
+        }
+    }
+    Ok(v_t.transpose() * s_inv * u.transpose())
+}
+
+fn row_major(m: &DMatrix<f64>) -> Vec<f64> {
+    let mut out = Vec::with_capacity(m.nrows() * m.ncols());
+    for i in 0..m.nrows() {
+        for j in 0..m.ncols() {
+            out.push(m[(i, j)]);
+        }
+    }
+    out
+}
+
+fn flatten_rows(rows: &[Vec<f64>], ncols: usize) -> Vec<f64> {
+    let mut out = Vec::with_capacity(rows.len() * ncols);
+    for r in rows {
+        out.extend(r.iter().take(ncols));
+        out.extend(std::iter::repeat_n(f64::NAN, ncols.saturating_sub(r.len())));
+    }
+    out
+}
+
+/// Solve `y' = f(x, y, p)` (plus `S·y/(x − a)` when `options.singular_term` is set) on the
+/// mesh `x` with `bc(y(a), y(b), p) = 0` (n + k residuals): `scipy.integrate.solve_bvp(fun, bc,
+/// x, y, p, S, fun_jac, bc_jac, tol, max_nodes, bc_tol=bc_tol)`.
+///
+/// `y` is the initial guess at the mesh nodes in SciPy's `(n, m)` layout (`y[i][j]` =
+/// component `i` at node `j`) and `p` the initial guess for the k unknown parameters. A
+/// solution that does not meet `tol` is not an error: it comes back with `success = false` and
+/// SciPy's `status` (1 `max_nodes` exceeded, 2 singular Jacobian, 3 `bc_tol` not met).
+///
+/// # Errors
+/// `BvpError::InvalidArgument` for the inputs SciPy rejects with `ValueError` (a mesh that is
+/// not strictly increasing, a guess of the wrong shape, `fun`/`bc`/Jacobians returning the
+/// wrong number of values, `S` not n×n), and for non-finite mesh or tolerance values.
+pub fn solve_bvp<F, BC>(
+    fun: F,
     bc: BC,
-    t_span: (f64, f64),
-    y_guess: &[f64],
+    x: &[f64],
+    y: &[Vec<f64>],
+    p: &[f64],
+    options: BvpOptions<'_>,
+) -> Result<BvpResult, BvpError>
+where
+    F: Fn(f64, &[f64], &[f64]) -> Vec<f64>,
+    BC: Fn(&[f64], &[f64], &[f64]) -> Vec<f64>,
+{
+    let m = x.len();
+    if m < 2 {
+        return Err(BvpError::InvalidArgument(
+            "`x` must have at least 2 nodes".to_string(),
+        ));
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(BvpError::InvalidArgument("`x` must be finite".to_string()));
+    }
+    if x.windows(2).any(|w| w[1] - w[0] <= 0.0) {
+        return Err(BvpError::InvalidArgument(
+            "`x` must be strictly increasing.".to_string(),
+        ));
+    }
+    let n = y.len();
+    if n == 0 {
+        return Err(BvpError::InvalidArgument(
+            "`y` must have at least one row".to_string(),
+        ));
+    }
+    if let Some(row) = y.iter().find(|row| row.len() != m) {
+        return Err(BvpError::InvalidArgument(format!(
+            "`y` is expected to have {m} columns, but actually has {}.",
+            row.len()
+        )));
+    }
+    if !options.tol.is_finite() {
+        return Err(BvpError::InvalidArgument(
+            "`tol` must be finite".to_string(),
+        ));
+    }
+    // SciPy warns and raises a tolerance below 100·eps to 100·eps.
+    let tol = options.tol.max(100.0 * f64::EPSILON);
+    let bc_tol = options.bc_tol.unwrap_or(tol);
+    if bc_tol.is_nan() {
+        return Err(BvpError::InvalidArgument(
+            "`bc_tol` must not be NaN".to_string(),
+        ));
+    }
+    let k = p.len();
+
+    let singular = match options.singular_term {
+        None => None,
+        Some(s_rows) => {
+            if s_rows.len() != n || s_rows.iter().any(|r| r.len() != n) {
+                return Err(BvpError::InvalidArgument(format!(
+                    "`S` is expected to have shape ({n}, {n})"
+                )));
+            }
+            let s = DMatrix::from_fn(n, n, |i, j| s_rows[i][j]);
+            let identity = DMatrix::<f64>::identity(n, n);
+            let b = &identity - pinv(&s)? * &s;
+            let d = pinv(&(&identity - &s))?;
+            Some(Singular {
+                s: row_major(&s),
+                b: row_major(&b),
+                d: row_major(&d),
+            })
+        }
+    };
+
+    let fun_dyn = |xq: f64, yq: &[f64], pq: &[f64]| fun(xq, yq, pq);
+    let bc_dyn = |ya: &[f64], yb: &[f64], pq: &[f64]| bc(ya, yb, pq);
+    let fun_jac_flat = options.fun_jac.map(|jac| {
+        move |xq: f64, yq: &[f64], pq: &[f64]| {
+            let (dy, dp) = jac(xq, yq, pq);
+            (flatten_rows(&dy, n), flatten_rows(&dp, k))
+        }
+    });
+    let bc_jac_flat = options.bc_jac.map(|jac| {
+        move |ya: &[f64], yb: &[f64], pq: &[f64]| {
+            let (da, db, dp) = jac(ya, yb, pq);
+            (
+                flatten_rows(&da, n),
+                flatten_rows(&db, n),
+                flatten_rows(&dp, k),
+            )
+        }
+    });
+    let problem = Problem {
+        n,
+        k,
+        a: x[0],
+        fun: &fun_dyn,
+        bc: &bc_dyn,
+        fun_jac: fun_jac_flat
+            .as_ref()
+            .map(|f| f as &dyn Fn(f64, &[f64], &[f64]) -> (Vec<f64>, Vec<f64>)),
+        bc_jac: bc_jac_flat
+            .as_ref()
+            .map(|f| f as &dyn Fn(&[f64], &[f64], &[f64]) -> (Vec<f64>, Vec<f64>, Vec<f64>)),
+        singular,
+    };
+    let y_nodes: Vec<f64> = (0..m)
+        .flat_map(|j| y.iter().map(move |row| row[j]))
+        .collect();
+    let (out, spline) = collocation::solve(
+        &problem,
+        x.to_vec(),
+        y_nodes,
+        p.to_vec(),
+        tol,
+        options.max_nodes,
+        bc_tol,
+        &factorize_sparse,
+    )
+    .map_err(BvpError::InvalidArgument)?;
+
+    let m_out = out.x.len();
+    let unpack = |flat: &[f64]| -> Vec<Vec<f64>> {
+        (0..n)
+            .map(|i| (0..m_out).map(|j| flat[j * n + i]).collect())
+            .collect()
+    };
+    Ok(BvpResult {
+        y: unpack(&out.y),
+        yp: unpack(&out.yp),
+        x: out.x,
+        p: out.p,
+        rms_residuals: out.rms_residuals,
+        niter: out.niter,
+        // status: SciPy's termination code; 0 = every interval's RMS residual <= tol and
+        // every bc residual <= bc_tol
+        success: out.status == 0,
+        message: collocation::termination_message(out.status).to_string(),
+        status: out.status,
+        spline,
+    })
+}
+
+/// Batched boundary-value problems: N independent [`solve_bvp`] calls that share the mesh,
+/// guess and options but differ by a parameter row (`fun(x, y, params)`,
+/// `bc(ya, yb, params)`; no unknown parameters), fanned across cores. Result `i` is
+/// byte-identical to the per-row `solve_bvp` call.
+pub fn solve_bvp_many<F, BC>(
+    fun: F,
+    bc: BC,
+    x: &[f64],
+    y: &[Vec<f64>],
     param_rows: &[Vec<f64>],
-    options: BvpOptions,
+    options: BvpOptions<'_>,
 ) -> Vec<Result<BvpResult, BvpError>>
 where
     F: Fn(f64, &[f64], &[f64]) -> Vec<f64> + Sync,
@@ -219,14 +357,16 @@ where
     if nrows == 0 {
         return Vec::new();
     }
-    let f_ref = &f;
-    let bc_ref = &bc;
+    let (fun_ref, bc_ref) = (&fun, &bc);
     let solve_one = move |params: &[f64]| {
-        // solve_bvp wants `&mut F: FnMut` and `&BC: Fn`; wrap the shared user closures so each
-        // member gets a fresh local closure capturing its own parameter row.
-        let mut local_f = |t: f64, y: &[f64]| f_ref(t, y, params);
-        let local_bc = |ya: &[f64], yb: &[f64]| bc_ref(ya, yb, params);
-        solve_bvp(&mut local_f, &local_bc, t_span, y_guess, options.clone())
+        solve_bvp(
+            |xq: f64, yq: &[f64], _: &[f64]| fun_ref(xq, yq, params),
+            |ya: &[f64], yb: &[f64], _: &[f64]| bc_ref(ya, yb, params),
+            x,
+            y,
+            &[],
+            options,
+        )
     };
 
     // Each BVP is an independent, expensive (collocation-Newton) solve → fan whole parameter sets
@@ -268,144 +408,208 @@ where
     out
 }
 
-fn validate_bvp_options(options: &BvpOptions) -> Result<(), BvpError> {
-    if options.max_iter == 0 {
-        return Err(BvpError::InvalidArgument(
-            "max_iter must be positive".to_string(),
-        ));
-    }
-    if !options.tol.is_finite() || options.tol < 0.0 {
-        return Err(BvpError::InvalidArgument(
-            "tol must be finite and non-negative".to_string(),
-        ));
-    }
-    if !options.rtol.is_finite() || options.rtol <= 0.0 {
-        return Err(BvpError::InvalidArgument(
-            "rtol must be finite and positive".to_string(),
-        ));
-    }
-    if !options.atol.is_finite() || options.atol <= 0.0 {
-        return Err(BvpError::InvalidArgument(
-            "atol must be finite and positive".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-fn validate_boundary_residual_len(residual: &[f64], expected: usize) -> Result<(), BvpError> {
-    if residual.len() != expected {
-        return Err(BvpError::InvalidArgument(format!(
-            "bc residual length must match y_guess length (expected {expected}, got {})",
-            residual.len()
-        )));
-    }
-    if residual.iter().any(|value| !value.is_finite()) {
-        return Err(BvpError::InvalidArgument(
-            "bc residual values must be finite".to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Internal IVP solver wrapper.
-fn solve_ivp_internal<F>(
-    f: &mut F,
-    t_span: (f64, f64),
-    y0: &[f64],
-    rtol: f64,
-    atol: f64,
-) -> Result<crate::api::SolveIvpResult, BvpError>
-where
-    F: FnMut(f64, &[f64]) -> Vec<f64>,
-{
-    let result = solve_ivp(
-        f,
-        &SolveIvpOptions {
-            t_span,
-            y0,
-            method: SolverKind::Rk45,
-            rtol,
-            atol: ToleranceValue::Scalar(atol),
-            ..SolveIvpOptions::default()
-        },
-    )
-    .map_err(|e| BvpError::IvpFailed(format!("{e}")))?;
-
-    if !result.success {
-        return Err(BvpError::IvpFailed(result.message));
-    }
-    Ok(result)
-}
-
-/// Solve a small dense linear system Ax = b using Gaussian elimination.
-fn solve_small_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
-    let n = b.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    if n == 1 {
-        return if a[0][0].abs() > f64::EPSILON {
-            vec![b[0] / a[0][0]]
-        } else {
-            vec![0.0]
-        };
-    }
-
-    // Augmented matrix
-    let mut aug: Vec<Vec<f64>> = a
-        .iter()
-        .zip(b.iter())
-        .map(|(row, &bi)| {
-            let mut r = row.clone();
-            r.push(bi);
-            r
-        })
-        .collect();
-
-    // Forward elimination with partial pivoting
-    for col in 0..n {
-        // Find pivot
-        let mut max_row = col;
-        let mut max_val = aug[col][col].abs();
-        for (row, aug_row) in aug.iter().enumerate().skip(col + 1) {
-            if aug_row[col].abs() > max_val {
-                max_val = aug_row[col].abs();
-                max_row = row;
-            }
-        }
-        aug.swap(col, max_row);
-
-        if aug[col][col].abs() < f64::EPSILON * 1e6 {
-            continue;
-        }
-
-        let pivot_row = aug[col].clone();
-        for aug_row in aug.iter_mut().skip(col + 1) {
-            let factor = aug_row[col] / pivot_row[col];
-            for (j, pivot_val) in pivot_row.iter().enumerate().skip(col) {
-                aug_row[j] -= factor * pivot_val;
-            }
-        }
-    }
-
-    // Back substitution
-    let mut x = vec![0.0; n];
-    for i in (0..n).rev() {
-        if aug[i][i].abs() < f64::EPSILON * 1e6 {
-            continue;
-        }
-        x[i] = aug[i][n];
-        for j in (i + 1)..n {
-            x[i] -= aug[i][j] * x[j];
-        }
-        x[i] /= aug[i][i];
-    }
-    x
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn linspace(a: f64, b: f64, m: usize) -> Vec<f64> {
+        (0..m)
+            .map(|i| a + (b - a) * i as f64 / (m - 1) as f64)
+            .collect()
+    }
+
+    // frankenscipy-1ksfv.7, the negative case: y'' = 100·y on [0, 10], y(0) = 1, y(10) = 0.
+    // Single shooting integrates an IVP that grows like e^(10·t) and cannot hit y(10) = 0;
+    // collocation resolves the boundary layer. SciPy 1.17.1 (tol 1e-6, x = linspace(0, 10, 11),
+    // y = 0): status 0, 233 nodes, 7 iterations, max |error| vs sinh(10(10−t))/sinh(100) 2.1e-9.
+    #[test]
+    fn solve_bvp_resolves_a_boundary_layer_like_scipy() {
+        let x = linspace(0.0, 10.0, 11);
+        let r = solve_bvp(
+            |_, y, _| vec![y[1], 100.0 * y[0]],
+            |ya, yb, _| vec![ya[0] - 1.0, yb[0]],
+            &x,
+            &[vec![0.0; 11], vec![0.0; 11]],
+            &[],
+            BvpOptions {
+                tol: 1e-6,
+                ..BvpOptions::default()
+            },
+        )
+        .expect("solve_bvp");
+        assert!(r.success, "{}", r.message);
+        assert_eq!((r.status, r.niter, r.x.len()), (0, 7, 233), "SciPy's path");
+        let worst = linspace(0.0, 10.0, 201)
+            .iter()
+            .map(|&t| {
+                let exact = (10.0 * (10.0 - t)).sinh() / 100.0_f64.sinh();
+                (r.sol(t)[0] - exact).abs()
+            })
+            .fold(0.0_f64, f64::max);
+        assert!(worst < 1e-8, "max error {worst:e}");
+        assert!(r.rms_residuals.iter().all(|&v| v <= 1e-6));
+    }
+
+    // Troesch's problem y'' = 5·sinh(5y), y(0) = 0, y(1) = 1: y'(0) = 4.575046e-2 (literature);
+    // SciPy (x = linspace(0, 1, 11), y = [x, 1]): 29 nodes, y'(0) = 0.04575624953958903.
+    #[test]
+    fn solve_bvp_solves_troesch() {
+        let x = linspace(0.0, 1.0, 11);
+        let r = solve_bvp(
+            |_, y, _| vec![y[1], 5.0 * (5.0 * y[0]).sinh()],
+            |ya, yb, _| vec![ya[0], yb[0] - 1.0],
+            &x,
+            &[x.clone(), vec![1.0; 11]],
+            &[],
+            BvpOptions::default(),
+        )
+        .expect("solve_bvp");
+        assert!(r.success, "{}", r.message);
+        assert_eq!(r.x.len(), 29);
+        assert!((r.sol(0.0)[1] - 0.045_756_249_539_589_03).abs() < 1e-12);
+    }
+
+    // SciPy's docs example: y'' + k²y = 0, y(0) = y(1) = 0, y'(0) = k, unknown k from 6
+    // converges to 2π (SciPy: 6.283294600464651 at tol 1e-3).
+    #[test]
+    fn solve_bvp_finds_an_unknown_parameter() {
+        let x = linspace(0.0, 1.0, 5);
+        let r = solve_bvp(
+            |_, y, p| vec![y[1], -p[0] * p[0] * y[0]],
+            |ya, yb, p| vec![ya[0], yb[0], ya[1] - p[0]],
+            &x,
+            &[vec![0.0, 1.0, 0.0, -1.0, 0.0], vec![0.0; 5]],
+            &[6.0],
+            BvpOptions::default(),
+        )
+        .expect("solve_bvp");
+        assert!(r.success, "{}", r.message);
+        assert!(
+            (r.p[0] - 6.283_294_600_464_651).abs() < 1e-10,
+            "p = {:?}",
+            r.p
+        );
+    }
+
+    // Emden: y'' + (2/x)·y' + y⁵ = 0, y'(0) = 0, y(1) = √(3/4) with the singular term
+    // S = [[0, 0], [0, −2]]; exact solution (1 + x²/3)^(−1/2).
+    #[test]
+    fn solve_bvp_handles_the_singular_term() {
+        let x = linspace(0.0, 1.0, 10);
+        let s = [vec![0.0, 0.0], vec![0.0, -2.0]];
+        let r = solve_bvp(
+            |_, y, _| vec![y[1], -y[0].powi(5)],
+            |ya, yb, _| vec![ya[1], yb[0] - 0.75_f64.sqrt()],
+            &x,
+            &[vec![0.75_f64.sqrt(); 10], vec![1e-4; 10]],
+            &[],
+            BvpOptions {
+                singular_term: Some(&s),
+                ..BvpOptions::default()
+            },
+        )
+        .expect("solve_bvp");
+        assert!(r.success, "{}", r.message);
+        for t in linspace(0.0, 1.0, 21) {
+            let exact = (1.0 + t * t / 3.0).powf(-0.5);
+            assert!((r.sol(t)[0] - exact).abs() < 1e-4, "t = {t}");
+        }
+    }
+
+    // SciPy status 1: the same boundary layer with max_nodes = 40 stops after 2 iterations at
+    // 31 nodes, not converged — and must not claim success.
+    #[test]
+    fn solve_bvp_reports_max_nodes_exceeded() {
+        let x = linspace(0.0, 10.0, 11);
+        let r = solve_bvp(
+            |_, y, _| vec![y[1], 100.0 * y[0]],
+            |ya, yb, _| vec![ya[0] - 1.0, yb[0]],
+            &x,
+            &[vec![0.0; 11], vec![0.0; 11]],
+            &[],
+            BvpOptions {
+                tol: 1e-6,
+                max_nodes: 40,
+                ..BvpOptions::default()
+            },
+        )
+        .expect("solve_bvp");
+        assert!(!r.success);
+        assert_eq!((r.status, r.niter, r.x.len()), (1, 2, 31));
+        assert_eq!(r.message, "The maximum number of mesh nodes is exceeded.");
+    }
+
+    // Analytic Jacobians reach the same solution as SciPy's finite differences.
+    #[test]
+    fn solve_bvp_uses_analytic_jacobians() {
+        let x = linspace(0.0, 1.0, 5);
+        let fun_jac = |_: f64, y: &[f64], _: &[f64]| {
+            (
+                vec![vec![0.0, 1.0], vec![-y[0].exp(), 0.0]],
+                vec![vec![], vec![]],
+            )
+        };
+        let bc_jac = |_: &[f64], _: &[f64], _: &[f64]| {
+            (
+                vec![vec![1.0, 0.0], vec![0.0, 0.0]],
+                vec![vec![0.0, 0.0], vec![1.0, 0.0]],
+                vec![vec![], vec![]],
+            )
+        };
+        let r = solve_bvp(
+            |_, y, _| vec![y[1], -y[0].exp()],
+            |ya, yb, _| vec![ya[0], yb[0]],
+            &x,
+            &[vec![3.0; 5], vec![0.0; 5]],
+            &[],
+            BvpOptions {
+                fun_jac: Some(&fun_jac),
+                bc_jac: Some(&bc_jac),
+                ..BvpOptions::default()
+            },
+        )
+        .expect("solve_bvp");
+        assert!(r.success, "{}", r.message);
+        // Bratu's upper branch: SciPy y'(0) = 10.846976018307315 (finite differences).
+        assert!((r.sol(0.0)[1] - 10.846_976_018_307_315).abs() < 1e-3);
+    }
+
+    #[test]
+    fn solve_bvp_rejects_what_scipy_rejects() {
+        let f = |_: f64, y: &[f64], _: &[f64]| vec![y[1], 0.0];
+        let bc = |ya: &[f64], yb: &[f64], _: &[f64]| vec![ya[0], yb[0] - 1.0];
+        let guess = [vec![0.0; 3], vec![0.0; 3]];
+        let opts = BvpOptions::default();
+        let err = |x: &[f64], y: &[Vec<f64>]| solve_bvp(f, bc, x, y, &[], opts).unwrap_err();
+        assert!(
+            matches!(err(&[0.0, 1.0, 1.0], &guess), BvpError::InvalidArgument(m) if m.contains("strictly increasing"))
+        );
+        assert!(
+            matches!(err(&[0.0, 0.5, f64::NAN], &guess), BvpError::InvalidArgument(m) if m.contains("finite"))
+        );
+        assert!(
+            matches!(err(&[0.0, 1.0], &guess), BvpError::InvalidArgument(m) if m.contains("columns"))
+        );
+        let short_bc = |ya: &[f64], _: &[f64], _: &[f64]| vec![ya[0]];
+        let e = solve_bvp(f, short_bc, &[0.0, 0.5, 1.0], &guess, &[], opts).unwrap_err();
+        assert!(
+            matches!(e, BvpError::InvalidArgument(m) if m.contains("`bc` returned 1 values, expected 2"))
+        );
+        let s = [vec![0.0]];
+        let e = solve_bvp(
+            f,
+            bc,
+            &[0.0, 0.5, 1.0],
+            &guess,
+            &[],
+            BvpOptions {
+                singular_term: Some(&s),
+                ..opts
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(e, BvpError::InvalidArgument(m) if m.contains("`S`")));
+    }
 
     #[test]
     fn solve_bvp_many_byte_identical_to_per_param() {
@@ -420,29 +624,27 @@ mod tests {
         };
         let nrows = 8usize; // crosses the serial->parallel gate
         let params: Vec<Vec<f64>> = (0..nrows).map(|_| vec![rng()]).collect();
+        let x = linspace(0.0, 1.0, 6);
+        let guess = [x.clone(), vec![1.0; 6]];
         let opts = BvpOptions::default();
 
-        let batched = solve_bvp_many(f, bc, (0.0, 1.0), &[0.0, 0.0], &params, opts.clone());
+        let batched = solve_bvp_many(f, bc, &x, &guess, &params, opts);
         assert_eq!(batched.len(), nrows);
         for (i, p) in params.iter().enumerate() {
-            let mut local_f = |t: f64, y: &[f64]| f(t, y, p);
-            let local_bc = |ya: &[f64], yb: &[f64]| bc(ya, yb, p);
             let single = solve_bvp(
-                &mut local_f,
-                &local_bc,
-                (0.0, 1.0),
-                &[0.0, 0.0],
-                opts.clone(),
+                |t: f64, y: &[f64], _: &[f64]| f(t, y, p),
+                |ya: &[f64], yb: &[f64], _: &[f64]| bc(ya, yb, p),
+                &x,
+                &guess,
+                &[],
+                opts,
             )
             .expect("single solve");
             let many = batched[i].as_ref().expect("batched member");
-            assert_eq!(
-                many.converged, single.converged,
-                "converged mismatch param {i}"
-            );
-            assert_eq!(many.t.len(), single.t.len(), "mesh size mismatch param {i}");
-            for (a, b) in many.t.iter().zip(&single.t) {
-                assert_eq!(a.to_bits(), b.to_bits(), "t mismatch param {i}");
+            assert_eq!(many.status, single.status, "status mismatch param {i}");
+            assert_eq!(many.x.len(), single.x.len(), "mesh size mismatch param {i}");
+            for (a, b) in many.x.iter().zip(&single.x) {
+                assert_eq!(a.to_bits(), b.to_bits(), "x mismatch param {i}");
             }
             for (ra, rb) in many.y.iter().zip(&single.y) {
                 for (a, b) in ra.iter().zip(rb) {
@@ -450,195 +652,7 @@ mod tests {
                 }
             }
         }
-        // The sweep exercises genuine converging solves.
-        assert!(
-            batched
-                .iter()
-                .filter(|r| r.as_ref().map(|x| x.converged).unwrap_or(false))
-                .count()
-                >= nrows / 2
-        );
-        assert!(solve_bvp_many(f, bc, (0.0, 1.0), &[0.0, 0.0], &[], opts).is_empty());
-    }
-
-    #[test]
-    fn bvp_linear_ode() {
-        // y'' = 0, y(0) = 0, y(1) = 1 => y = t
-        // Convert to system: y0' = y1, y1' = 0
-        let mut f = |_t: f64, y: &[f64]| vec![y[1], 0.0];
-        let bc = |ya: &[f64], yb: &[f64]| vec![ya[0] - 0.0, yb[0] - 1.0];
-
-        let result = solve_bvp(&mut f, &bc, (0.0, 1.0), &[0.0, 0.5], BvpOptions::default())
-            .expect("BVP should converge");
-        assert!(result.converged, "should converge");
-        let y_final = result.y.last().unwrap();
-        assert!(
-            (y_final[0] - 1.0).abs() < 1e-6,
-            "y(1) = {}, expected 1.0",
-            y_final[0]
-        );
-    }
-
-    #[test]
-    fn bvp_exponential_boundary() {
-        // y' = y, y(0) = 1 => y(t) = exp(t)
-        // BC: y(0) = 1 (trivially satisfied by guess)
-        let mut f = |_t: f64, y: &[f64]| vec![y[0]];
-        let bc = |ya: &[f64], _yb: &[f64]| vec![ya[0] - 1.0];
-
-        let result = solve_bvp(
-            &mut f,
-            &bc,
-            (0.0, 1.0),
-            &[1.0], // exact initial condition
-            BvpOptions::default(),
-        )
-        .expect("BVP should converge");
-        assert!(result.converged);
-        let y_final = result.y.last().unwrap()[0];
-        assert!(
-            (y_final - std::f64::consts::E).abs() < 1e-4,
-            "y(1) = {y_final}, expected e"
-        );
-    }
-
-    #[test]
-    fn bvp_second_order_quadratic() {
-        // y'' = 2, y(0) = 0, y(1) = 1 => y = t² (exact for this BC)
-        // System: y0' = y1, y1' = 2
-        let mut f = |_t: f64, y: &[f64]| vec![y[1], 2.0];
-        let bc = |ya: &[f64], yb: &[f64]| vec![ya[0] - 0.0, yb[0] - 1.0];
-
-        let result = solve_bvp(&mut f, &bc, (0.0, 1.0), &[0.0, 0.0], BvpOptions::default())
-            .expect("BVP should converge");
-        assert!(result.converged);
-        let y_final = result.y.last().unwrap();
-        assert!(
-            (y_final[0] - 1.0).abs() < 1e-4,
-            "y(1) = {}, expected 1.0",
-            y_final[0]
-        );
-    }
-
-    #[test]
-    fn bvp_empty_guess_rejected() {
-        let mut f = |_t: f64, _y: &[f64]| vec![];
-        let bc = |_ya: &[f64], _yb: &[f64]| vec![];
-        let err = solve_bvp(&mut f, &bc, (0.0, 1.0), &[], BvpOptions::default())
-            .expect_err("empty guess");
-        assert!(matches!(err, BvpError::InvalidArgument(_)));
-    }
-
-    #[test]
-    fn bvp_rejects_non_finite_span_and_initial_guess() {
-        for span in [
-            (f64::NAN, 1.0),
-            (0.0, f64::NAN),
-            (f64::NEG_INFINITY, 1.0),
-            (0.0, f64::INFINITY),
-        ] {
-            let mut f = |_t: f64, _y: &[f64]| vec![0.0];
-            let bc = |ya: &[f64], _yb: &[f64]| vec![ya[0]];
-            let err = solve_bvp(&mut f, &bc, span, &[0.0], BvpOptions::default())
-                .expect_err("non-finite span");
-            assert!(matches!(err, BvpError::InvalidArgument(msg) if msg.contains("t_span")));
-        }
-
-        for bad_y0 in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let mut f = |_t: f64, _y: &[f64]| vec![0.0];
-            let bc = |ya: &[f64], _yb: &[f64]| vec![ya[0]];
-            let err = solve_bvp(&mut f, &bc, (0.0, 1.0), &[bad_y0], BvpOptions::default())
-                .expect_err("non-finite y_guess");
-            assert!(matches!(err, BvpError::InvalidArgument(msg) if msg.contains("y_guess")));
-        }
-    }
-
-    #[test]
-    fn bvp_rejects_invalid_boundary_tolerance() {
-        for tol in [f64::NAN, f64::INFINITY, -1e-6] {
-            let mut f = |_t: f64, _y: &[f64]| vec![0.0];
-            let bc = |_ya: &[f64], _yb: &[f64]| vec![1.0];
-            let options = BvpOptions {
-                tol,
-                ..BvpOptions::default()
-            };
-            let err = solve_bvp(&mut f, &bc, (0.0, 1.0), &[0.0], options)
-                .expect_err("invalid boundary tolerance");
-            assert!(matches!(err, BvpError::InvalidArgument(msg) if msg.contains("tol")));
-        }
-    }
-
-    #[test]
-    fn bvp_rejects_invalid_ivp_tolerances() {
-        for (rtol, atol, expected) in [
-            (f64::NAN, 1e-10, "rtol"),
-            (f64::INFINITY, 1e-10, "rtol"),
-            (0.0, 1e-10, "rtol"),
-            (-1e-8, 1e-10, "rtol"),
-            (1e-8, f64::NAN, "atol"),
-            (1e-8, f64::INFINITY, "atol"),
-            (1e-8, 0.0, "atol"),
-            (1e-8, -1e-10, "atol"),
-        ] {
-            let mut f = |_t: f64, _y: &[f64]| vec![0.0];
-            let bc = |_ya: &[f64], _yb: &[f64]| vec![1.0];
-            let options = BvpOptions {
-                rtol,
-                atol,
-                ..BvpOptions::default()
-            };
-            let err = solve_bvp(&mut f, &bc, (0.0, 1.0), &[0.0], options)
-                .expect_err("invalid IVP tolerance");
-            assert!(
-                matches!(&err, BvpError::InvalidArgument(msg) if msg.contains(expected)),
-                "expected {expected} validation error, got {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn bvp_rejects_zero_iteration_budget() {
-        let mut f = |_t: f64, _y: &[f64]| vec![0.0];
-        let bc = |ya: &[f64], _yb: &[f64]| vec![ya[0]];
-        let options = BvpOptions {
-            max_iter: 0,
-            ..BvpOptions::default()
-        };
-        let err = solve_bvp(&mut f, &bc, (0.0, 1.0), &[0.0], options).expect_err("zero max_iter");
-        assert!(matches!(
-            err,
-            BvpError::InvalidArgument(msg) if msg.contains("max_iter")
-        ));
-    }
-
-    #[test]
-    fn bvp_rejects_short_boundary_residual() {
-        let mut f = |_t: f64, _y: &[f64]| vec![0.0, 0.0];
-        let bc = |_ya: &[f64], _yb: &[f64]| vec![0.0];
-        let err = solve_bvp(&mut f, &bc, (0.0, 1.0), &[0.0, 0.0], BvpOptions::default())
-            .expect_err("short boundary residual");
-        assert!(matches!(err, BvpError::InvalidArgument(msg) if msg.contains("expected 2, got 1")));
-    }
-
-    #[test]
-    fn bvp_rejects_long_boundary_residual() {
-        let mut f = |_t: f64, _y: &[f64]| vec![0.0, 0.0];
-        let bc = |_ya: &[f64], _yb: &[f64]| vec![0.0, 0.0, 0.0];
-        let err = solve_bvp(&mut f, &bc, (0.0, 1.0), &[0.0, 0.0], BvpOptions::default())
-            .expect_err("long boundary residual");
-        assert!(matches!(err, BvpError::InvalidArgument(msg) if msg.contains("expected 2, got 3")));
-    }
-
-    #[test]
-    fn bvp_rejects_non_finite_boundary_residual() {
-        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let mut f = |_t: f64, _y: &[f64]| vec![0.0, 0.0];
-            let bc = move |_ya: &[f64], _yb: &[f64]| vec![0.0, bad];
-            let err = solve_bvp(&mut f, &bc, (0.0, 1.0), &[0.0, 0.0], BvpOptions::default())
-                .expect_err("non-finite boundary residual");
-            assert!(
-                matches!(err, BvpError::InvalidArgument(msg) if msg.contains("residual values"))
-            );
-        }
+        assert!(batched.iter().all(|r| r.as_ref().is_ok_and(|x| x.success)));
+        assert!(solve_bvp_many(f, bc, &x, &guess, &[], opts).is_empty());
     }
 }
