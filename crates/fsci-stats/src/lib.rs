@@ -3282,7 +3282,17 @@ impl ContinuousDistribution for GeneralizedExponential {
     }
 
     fn mode(&self) -> f64 {
-        0.0
+        // br-szq1n.14 (was a hardcoded 0.0). With u = e^{-cx}, d/dx ln f = 0 reduces
+        // to b·c·u = (a + b − b·u)², so v = a + b − b·u solves v² + c·v − c(a + b) = 0.
+        // The derivative is increasing in u, so the mode is interior (x = −ln u / c)
+        // exactly when it is positive at x = 0, i.e. b·c > a²; otherwise the density
+        // decreases from 0. Matches SciPy's genexpon pdf argmax (0.5, 4, 3 -> 0.2258608).
+        let (a, b, c) = (self.a, self.b, self.c);
+        if b * c <= a * a {
+            return 0.0;
+        }
+        let v = (-c + (c * c + 4.0 * c * (a + b)).sqrt()) / 2.0;
+        -((a + b - v) / b).ln() / c
     }
 }
 
@@ -11630,7 +11640,8 @@ fn sample_zipf(a: f64, rng: &mut impl Rng) -> u64 {
     }
     let am1 = a - 1.0;
     let b = 2.0_f64.powf(am1);
-    let max_val = 9.2233720368547758e+18_f64;
+    // 2^63, written so the literal is exactly representable (clippy::excessive_precision).
+    let max_val = 9_223_372_036_854_775_808.0_f64;
     let c = max_val.powf(-am1);
     loop {
         let u: f64 = rng.random();
@@ -13085,7 +13096,18 @@ impl DiscreteDistribution for BetaNegativeBinomial {
     }
 
     fn mode(&self) -> f64 {
-        0.0
+        // br-szq1n.14 (was a hardcoded 0.0; betanbinom(5, 2, 3) peaks at k = 2).
+        // Unimodal, so the mode is the first k where the pmf stops increasing.
+        let mut k = 0u64;
+        let mut p = self.pmf(0);
+        loop {
+            let next = self.pmf(k + 1);
+            if !(next > p) {
+                return k as f64;
+            }
+            p = next;
+            k += 1;
+        }
     }
 
     fn entropy(&self) -> f64 {
@@ -15282,7 +15304,19 @@ impl DiscreteDistribution for NegHypergeometric {
     }
 
     fn mode(&self) -> f64 {
-        0.0
+        // br-szq1n.14 (was a hardcoded 0.0; nhypergeom(20, 7, 12) peaks at k = 7).
+        // Unimodal on [0, n], so the mode is the first k where the pmf stops
+        // increasing (the pmf is 0 past the support, which ends the scan).
+        let mut k = 0u64;
+        let mut p = self.pmf(0);
+        loop {
+            let next = self.pmf(k + 1);
+            if !(next > p) {
+                return k as f64;
+            }
+            p = next;
+            k += 1;
+        }
     }
 
     fn entropy(&self) -> f64 {
@@ -21842,6 +21876,28 @@ pub struct WrapCauchy {
     pub c: f64,
 }
 
+/// Polylogarithm Li_n(c) = Σ_{k≥1} c^k / k^n for 0 ≤ c < 1 (WrapCauchy moments).
+/// Summed until the term no longer changes the sum; c^k decays geometrically, so
+/// even c = 0.999 needs only a few tens of thousands of terms.
+fn wrapcauchy_polylog(n: i32, c: f64) -> f64 {
+    if c == 0.0 {
+        return 0.0;
+    }
+    let mut sum = 0.0_f64;
+    let mut power = 1.0_f64;
+    let mut k = 1.0_f64;
+    loop {
+        power *= c;
+        let term = power / k.powi(n);
+        let next = sum + term;
+        if next == sum {
+            return sum;
+        }
+        sum = next;
+        k += 1.0;
+    }
+}
+
 impl WrapCauchy {
     #[must_use]
     pub fn new(c: f64) -> Self {
@@ -21894,24 +21950,27 @@ impl ContinuousDistribution for WrapCauchy {
         PI
     }
 
+    // br-szq1n.14: the linear moments over [0, 2π) have closed forms. With the
+    // Fourier series pdf = (1/2π)(1 + 2 Σ c^k cos kx) and u = x − π, the integrals
+    // ∫u² cos(ku) du = 4π(−1)^k/k² and ∫u⁴ cos(ku) du = (−1)^k(8π³/k² − 48π/k⁴) give
+    //   E[u²] = π²/3 + 4·Li₂(c),   E[u⁴] = π⁴/5 + 8π²·Li₂(c) − 48·Li₄(c),
+    // and skewness 0 by symmetry about π. These match SciPy's `wrapcauchy(c).stats('mvsk')`
+    // (c = 0.5: var 5.618830239556502, excess kurtosis -1.7135546311486953). They used
+    // to return NaN under a comment claiming SciPy does the same; it does not.
     fn var(&self) -> f64 {
-        // Linear variance over [0, 2π) — closed form depends on c via
-        // ∫(x-π)² · pdf(x) dx; we report π²/3 as a fallback (uniform
-        // variance) since scipy reports a tabulated value scipy users
-        // rarely need. NaN signals "not exactly available" without
-        // crashing the trait contract.
-        f64::NAN
+        PI * PI / 3.0 + 4.0 * wrapcauchy_polylog(2, self.c)
     }
 
     fn skewness(&self) -> f64 {
-        // Linear higher moments of WrapCauchy aren't routinely
-        // tabulated; scipy itself returns NaN. We do the same to
-        // preserve trait-contract symmetry with var.
-        f64::NAN
+        0.0
     }
 
     fn kurtosis(&self) -> f64 {
-        f64::NAN
+        let li2 = wrapcauchy_polylog(2, self.c);
+        let li4 = wrapcauchy_polylog(4, self.c);
+        let var = PI * PI / 3.0 + 4.0 * li2;
+        let fourth = PI.powi(4) / 5.0 + 8.0 * PI * PI * li2 - 48.0 * li4;
+        fourth / (var * var) - 3.0
     }
 
     fn entropy(&self) -> f64 {
@@ -22208,10 +22267,12 @@ pub type WeibullMin = Weibull;
 
 pub type Cosine = CosineDistribution;
 pub type Exponweib = ExponWeibull;
-pub type Kstwo = KsTwoBign;
-pub type Landau = Moyal;
-pub type LevyStable = Levy;
-pub type VonmisesLine = VonMises;
+// br-szq1n.2: `Kstwo = KsTwoBign`, `Landau = Moyal`, `LevyStable = Levy` and
+// `VonmisesLine = VonMises` used to live here. Each named a DIFFERENT SciPy
+// distribution (e.g. landau.pdf(0) = 0.26224 vs moyal.pdf(0) = 0.24197; kstwo is the
+// finite-n KS law, kstwobign its n -> inf limit; vonmises_line is zero outside
+// [-pi, pi] while VonMises is periodic). A name that returns another distribution's
+// numbers is worse than a missing name; real implementations are tracked separately.
 
 /// Warning emitted when input data is constant, matching `scipy.stats.ConstantInputWarning`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22242,34 +22303,22 @@ pub struct PowerResult {
     pub pvalues: Vec<f64>,
 }
 
-/// Simulate statistical power of a hypothesis test, matching `scipy.stats.power`.
+/// Simulate the power of a hypothesis test, matching
+/// `scipy.stats.power(test, rvs, n_observations, significance=0.01, n_resamples=...)`.
 ///
-/// Draws `n_sim` samples of size `n_obs` from standard normal distribution, evaluates `test(&sample)`
-/// to compute the p-value, and returns the empirical power (fraction of p-values <= 0.05).
-pub fn power<F: FnMut(&[f64]) -> f64>(test: F, n_obs: usize, n_sim: usize) -> f64 {
-    power_with_significance(test, n_obs, n_sim, 0.05)
-}
-
-/// Simulate statistical power of a hypothesis test with custom significance level alpha.
-pub fn power_with_significance<F: FnMut(&[f64]) -> f64>(
-    mut test: F,
-    n_obs: usize,
-    n_sim: usize,
-    significance: f64,
-) -> f64 {
-    if n_obs == 0 || n_sim == 0 {
-        return 0.0;
-    }
-    let mut rng = rand::rng();
-    let mut rejections = 0;
-    for _ in 0..n_sim {
-        let sample = sample_standard_normals(n_obs, &mut rng);
-        let p = test(&sample);
-        if p.is_finite() && p <= significance {
-            rejections += 1;
-        }
-    }
-    rejections as f64 / n_sim as f64
+/// `rvs(n)` draws a sample of size `n` from the ALTERNATIVE distribution and
+/// `test(sample)` returns its p-value; the power is the fraction of the
+/// `n_resamples` simulated p-values at or below SciPy's default significance 0.01.
+/// Use [`power_simulate`] for another significance level.
+///
+/// br-szq1n.11: this used to take no `rvs`, always sample N(0, 1) and use 0.05,
+/// so for the usual location test it returned the test's SIZE, not its power.
+pub fn power<F, R>(test: F, rvs: R, n_observations: usize, n_resamples: usize) -> PowerResult
+where
+    F: FnMut(&[f64]) -> f64,
+    R: FnMut(usize) -> Vec<f64>,
+{
+    power_simulate(test, rvs, n_observations, n_resamples, 0.01)
 }
 
 /// Simulate statistical power of a hypothesis test using a custom random generator and significance level,
@@ -22305,10 +22354,9 @@ where
     PowerResult { power, pvalues }
 }
 
-/// Generate a distribution instance from a compatible specification, matching `scipy.stats.make_distribution`.
-pub fn make_distribution<D: ContinuousDistribution>(dist: D) -> D {
-    dist
-}
+// `scipy.stats.make_distribution` builds a distribution from a user-supplied specification; it
+// is MISSING until a generic user-defined distribution mechanism exists (bead frankenscipy-1ksfv).
+// An identity function used to stand in for it and was counted as covered (frankenscipy-8dndw.1).
 
 /// Random orthogonal matrix generator, matching `scipy.stats.ortho_group`.
 #[allow(non_camel_case_types)]
@@ -66843,51 +66891,53 @@ mod tests {
 
     #[test]
     fn test_power_simulation() {
+        let z_test = |sample: &[f64]| {
+            let n = sample.len() as f64;
+            let mean = sample.iter().sum::<f64>() / n;
+            let z = mean * n.sqrt(); // known sd = 1
+            2.0 * (1.0 - Normal::standard().cdf(z.abs()))
+        };
+
         // Edge cases
-        assert_eq!(power(|_| 0.01, 0, 100), 0.0);
-        assert_eq!(power(|_| 0.01, 50, 0), 0.0);
+        assert_eq!(power(|_| 0.01, |n| vec![0.0; n], 0, 100).power, 0.0);
+        assert_eq!(power(|_| 0.01, |n| vec![0.0; n], 50, 0).power, 0.0);
 
-        // Under null: standard normal data tested against mean 0 (z-test)
-        // With significance 0.05, empirical rejection rate (Type I error) should be close to 0.05
-        let null_power = power(
-            |sample| {
-                let n = sample.len() as f64;
-                let mean = sample.iter().sum::<f64>() / n;
-                let z = mean * n.sqrt(); // std dev is 1
-                2.0 * (1.0 - Normal::standard().cdf(z.abs()))
-            },
-            30,
-            2000,
-        );
-        assert!(
-            (null_power - 0.05).abs() < 0.03,
-            "null size near 0.05: {null_power}"
-        );
-
-        // Under strong alternative: shift by 2.0 (mean 2.0)
-        let alt_res = power_simulate(
-            |sample| {
-                let n = sample.len() as f64;
-                let mean = sample.iter().sum::<f64>() / n;
-                let z = mean * n.sqrt();
-                2.0 * (1.0 - Normal::standard().cdf(z.abs()))
-            },
-            |n| {
-                let mut rng = StdRng::seed_from_u64(12345);
+        // br-szq1n.11: power under a shift-0.5 alternative with n = 25 and SciPy's
+        // default significance 0.01 is Phi(2.5 - z_0.995) + Phi(-2.5 - z_0.995)
+        // = 0.4698. The old `power` sampled N(0, 1) (the null) at 0.05 and returned
+        // ~0.05; at 0.05 the true power would be ~0.705, so this also pins the default.
+        let mut rng = StdRng::seed_from_u64(20260923);
+        let alt = power(
+            z_test,
+            move |n| {
                 sample_standard_normals(n, &mut rng)
                     .into_iter()
-                    .map(|x| x + 2.0)
+                    .map(|x| x + 0.5)
                     .collect()
             },
             25,
-            100,
+            4000,
+        );
+        assert_eq!(alt.pvalues.len(), 4000);
+        assert!(
+            (alt.power - 0.4698).abs() < 0.03,
+            "power under shift 0.5 at alpha 0.01: {}",
+            alt.power
+        );
+
+        // Size under the null at an explicit significance (power_simulate).
+        let mut null_rng = StdRng::seed_from_u64(7);
+        let null = power_simulate(
+            z_test,
+            move |n| sample_standard_normals(n, &mut null_rng),
+            30,
+            4000,
             0.05,
         );
-        assert_eq!(alt_res.pvalues.len(), 100);
         assert!(
-            alt_res.power > 0.95,
-            "power under strong alternative: {}",
-            alt_res.power
+            (null.power - 0.05).abs() < 0.015,
+            "null rejection rate near 0.05: {}",
+            null.power
         );
     }
 
@@ -67145,6 +67195,89 @@ mod tests {
             assert_eq!(s, &vec![0, 0, 0]);
         }
         assert_eq!(mn.rvs(0, &mut rng).len(), 0);
+    }
+
+    #[test]
+    fn dirichlet_multinomial_rvs_properties() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let dm = DirichletMultinomial::new(&[2.0, 3.0, 5.0], 20);
+        let n_samples = 3000;
+        let samples = dm.rvs(n_samples, &mut rng);
+        assert_eq!(samples.len(), n_samples);
+
+        let mut sum_vec = vec![0.0; 3];
+        for s in &samples {
+            assert_eq!(s.len(), 3);
+            assert_eq!(s.iter().sum::<usize>(), 20);
+            for i in 0..3 {
+                sum_vec[i] += s[i] as f64;
+            }
+        }
+        let exp_mean = dm.mean();
+        for i in 0..3 {
+            let sample_mean = sum_vec[i] / n_samples as f64;
+            assert!(
+                (sample_mean - exp_mean[i]).abs() < 0.25,
+                "DM empirical mean {sample_mean} vs {}",
+                exp_mean[i]
+            );
+        }
+
+        // Edge case: 0 samples
+        assert!(dm.rvs(0, &mut rng).is_empty());
+
+        // Edge case: n = 0
+        let dm_zero = DirichletMultinomial::new(&[1.0, 2.0], 0);
+        let z_samples = dm_zero.rvs(5, &mut rng);
+        assert_eq!(z_samples.len(), 5);
+        for s in &z_samples {
+            assert_eq!(s, &vec![0, 0]);
+        }
+    }
+
+    #[test]
+    fn poisson_binom_rvs_properties() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let probs = [0.1, 0.25, 0.4, 0.7, 0.85];
+        let pb = PoissonBinom::new(&probs);
+        let n_samples = 4000;
+        let samples = pb.rvs(n_samples, &mut rng);
+        assert_eq!(samples.len(), n_samples);
+
+        let mut sum = 0.0;
+        let mut sq_sum = 0.0;
+        for &s in &samples {
+            assert!(s <= probs.len(), "sample {s} exceeds max possible {}", probs.len());
+            sum += s as f64;
+            sq_sum += (s as f64) * (s as f64);
+        }
+        let sample_mean = sum / n_samples as f64;
+        let sample_var = (sq_sum / n_samples as f64) - sample_mean * sample_mean;
+
+        let exp_mean = pb.mean();
+        let exp_var = pb.var();
+        assert!(
+            (sample_mean - exp_mean).abs() < 0.08,
+            "PB empirical mean {sample_mean} vs {exp_mean}"
+        );
+        assert!(
+            (sample_var - exp_var).abs() < 0.1,
+            "PB empirical var {sample_var} vs {exp_var}"
+        );
+
+        // Edge cases
+        assert!(pb.rvs(0, &mut rng).is_empty());
+        let pb_empty = PoissonBinom::new(&[]);
+        assert!(pb_empty.rvs(5, &mut rng).is_empty());
+
+        // Deterministic cases
+        let pb_zeros = PoissonBinom::new(&[0.0, 0.0, 0.0]);
+        let z = pb_zeros.rvs(10, &mut rng);
+        assert!(z.iter().all(|&x| x == 0));
+
+        let pb_ones = PoissonBinom::new(&[1.0, 1.0, 1.0, 1.0]);
+        let o = pb_ones.rvs(10, &mut rng);
+        assert!(o.iter().all(|&x| x == 4));
     }
 
     #[test]
@@ -79251,6 +79384,70 @@ mod tests {
     }
 
     #[test]
+    fn binomial_rvs_and_fit() {
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Path 1: small n (<= 30)
+        let b_small = Binomial::new(20, 0.4);
+        let n_samples = 4000;
+        let samples_small = b_small.rvs(n_samples, &mut rng);
+        assert_eq!(samples_small.len(), n_samples);
+        for &s in &samples_small {
+            assert!(s <= 20, "sample {s} exceeds n=20");
+        }
+        let mean_small: f64 = samples_small.iter().sum::<u64>() as f64 / n_samples as f64;
+        let var_small: f64 = samples_small
+            .iter()
+            .map(|&s| (s as f64 - mean_small).powi(2))
+            .sum::<f64>()
+            / n_samples as f64;
+        assert!((mean_small - 8.0).abs() < 0.15, "small n mean {mean_small} vs 8.0");
+        assert!((var_small - 4.8).abs() < 0.25, "small n var {var_small} vs 4.8");
+
+        // Path 2: large n (> 30) with p <= 0.5
+        let b_large = Binomial::new(100, 0.25);
+        let samples_large = b_large.rvs(n_samples, &mut rng);
+        for &s in &samples_large {
+            assert!(s <= 100, "sample {s} exceeds n=100");
+        }
+        let mean_large: f64 = samples_large.iter().sum::<u64>() as f64 / n_samples as f64;
+        assert!((mean_large - 25.0).abs() < 0.35, "large n mean {mean_large} vs 25.0");
+
+        // Path 3: large n (> 30) with p > 0.5 (inverted path)
+        let b_large_inv = Binomial::new(80, 0.75);
+        let samples_inv = b_large_inv.rvs(n_samples, &mut rng);
+        for &s in &samples_inv {
+            assert!(s <= 80, "sample {s} exceeds n=80");
+        }
+        let mean_inv: f64 = samples_inv.iter().sum::<u64>() as f64 / n_samples as f64;
+        assert!((mean_inv - 60.0).abs() < 0.35, "large n inv mean {mean_inv} vs 60.0");
+
+        // Edge cases
+        assert!(b_small.rvs(0, &mut rng).is_empty());
+        let b_n0 = Binomial::new(0, 0.5);
+        assert!(b_n0.rvs(5, &mut rng).iter().all(|&x| x == 0));
+        let b_p0 = Binomial::new(10, 0.0);
+        assert!(b_p0.rvs(5, &mut rng).iter().all(|&x| x == 0));
+        let b_p1 = Binomial::new(10, 1.0);
+        assert!(b_p1.rvs(5, &mut rng).iter().all(|&x| x == 10));
+
+        // Fitting with known n
+        let fitted = Binomial::fit_with_n(&samples_small, 20).unwrap();
+        assert!((fitted.p - 0.4).abs() < 0.02, "fitted p {} vs 0.4", fitted.p);
+
+        // Error cases in fitting
+        assert!(Binomial::fit_with_n(&[], 20).is_err());
+        assert!(Binomial::fit_with_n(&[21], 20).is_err());
+
+        // Trait methods
+        let mut rng2 = StdRng::seed_from_u64(99);
+        let d_samples = b_small.rvs(10, &mut rng2);
+        assert_eq!(d_samples.len(), 10);
+        let fitted_trait = Binomial::try_fit(&samples_small);
+        assert!(fitted_trait.is_ok());
+    }
+
+    #[test]
     fn bernoulli_basic() {
         let b = Bernoulli::new(0.7);
         assert_close(b.pmf(0), 0.3, 1e-15, "P(0)");
@@ -79265,6 +79462,43 @@ mod tests {
         let b = Bernoulli::new(0.4);
         assert_close(b.cdf(0), 0.6, 1e-15, "CDF(0)");
         assert_close(b.cdf(1), 1.0, 1e-15, "CDF(1)");
+    }
+
+    #[test]
+    fn bernoulli_rvs_and_fit() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let b = Bernoulli::new(0.35);
+        let n_samples = 5000;
+        let samples = b.rvs(n_samples, &mut rng);
+        assert_eq!(samples.len(), n_samples);
+
+        for &s in &samples {
+            assert!(s == 0 || s == 1, "Bernoulli sample {s} not in {{0, 1}}");
+        }
+        let mean = samples.iter().sum::<u64>() as f64 / n_samples as f64;
+        assert!((mean - 0.35).abs() < 0.03, "Bernoulli empirical mean {mean} vs 0.35");
+
+        // Edge cases
+        assert!(b.rvs(0, &mut rng).is_empty());
+        let b0 = Bernoulli::new(0.0);
+        assert!(b0.rvs(10, &mut rng).iter().all(|&x| x == 0));
+        let b1 = Bernoulli::new(1.0);
+        assert!(b1.rvs(10, &mut rng).iter().all(|&x| x == 1));
+
+        // Fitting
+        let fitted = Bernoulli::fit(&samples).unwrap();
+        assert!((fitted.p - 0.35).abs() < 0.03, "fitted Bernoulli p {} vs 0.35", fitted.p);
+
+        // Error cases
+        assert!(Bernoulli::fit(&[]).is_err());
+        assert!(Bernoulli::fit(&[0, 1, 2]).is_err());
+
+        // Trait methods
+        let mut rng2 = StdRng::seed_from_u64(99);
+        let d_samples = b.rvs(10, &mut rng2);
+        assert_eq!(d_samples.len(), 10);
+        let fitted_trait = Bernoulli::try_fit(&samples);
+        assert!(fitted_trait.is_ok());
     }
 
     #[test]
@@ -79294,6 +79528,41 @@ mod tests {
     fn geometric_pmf_at_zero() {
         let g = Geometric::new(0.5);
         assert_close(g.pmf(0), 0.0, 1e-15, "P(0) = 0 for geom");
+    }
+
+    #[test]
+    fn geometric_rvs_and_fit() {
+        let mut rng = StdRng::seed_from_u64(42);
+        let g = Geometric::new(0.25);
+        let n_samples = 5000;
+        let samples = g.rvs(n_samples, &mut rng);
+        assert_eq!(samples.len(), n_samples);
+
+        for &s in &samples {
+            assert!(s >= 1, "Geometric sample {s} < 1");
+        }
+        let mean = samples.iter().sum::<u64>() as f64 / n_samples as f64;
+        assert!((mean - 4.0).abs() < 0.15, "Geometric empirical mean {mean} vs 4.0");
+
+        // Edge cases
+        assert!(g.rvs(0, &mut rng).is_empty());
+        let g1 = Geometric::new(1.0);
+        assert!(g1.rvs(10, &mut rng).iter().all(|&x| x == 1));
+
+        // Fitting
+        let fitted = Geometric::fit(&samples).unwrap();
+        assert!((fitted.p - 0.25).abs() < 0.02, "fitted Geometric p {} vs 0.25", fitted.p);
+
+        // Error cases
+        assert!(Geometric::fit(&[]).is_err());
+        assert!(Geometric::fit(&[0, 1, 2]).is_err());
+
+        // Trait methods
+        let mut rng2 = StdRng::seed_from_u64(99);
+        let d_samples = g.rvs(10, &mut rng2);
+        assert_eq!(d_samples.len(), 10);
+        let fitted_trait = Geometric::try_fit(&samples);
+        assert!(fitted_trait.is_ok());
     }
 
     #[test]
@@ -79617,6 +79886,50 @@ mod tests {
         assert_close(d.var(), 3.0, 1e-12, "Poisson var via trait");
         let sum: f64 = (0..=30).map(|k| d.pmf(k)).sum();
         assert!((sum - 1.0).abs() < 1e-6, "Poisson PMF sum via trait");
+    }
+
+    #[test]
+    fn poisson_rvs_and_fit() {
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Case 1: small mu (Knuth algorithm)
+        let p_small = Poisson::new(3.5);
+        let n_samples = 4000;
+        let samples_small = p_small.rvs(n_samples, &mut rng);
+        assert_eq!(samples_small.len(), n_samples);
+        let mean_small = samples_small.iter().sum::<u64>() as f64 / n_samples as f64;
+        let var_small = samples_small
+            .iter()
+            .map(|&s| (s as f64 - mean_small).powi(2))
+            .sum::<f64>()
+            / n_samples as f64;
+        assert!((mean_small - 3.5).abs() < 0.12, "small mu mean {mean_small} vs 3.5");
+        assert!((var_small - 3.5).abs() < 0.25, "small mu var {var_small} vs 3.5");
+
+        // Case 2: large mu (Gaussian transformed rejection)
+        let p_large = Poisson::new(50.0);
+        let samples_large = p_large.rvs(n_samples, &mut rng);
+        let mean_large = samples_large.iter().sum::<u64>() as f64 / n_samples as f64;
+        assert!((mean_large - 50.0).abs() < 0.4, "large mu mean {mean_large} vs 50.0");
+
+        // Edge cases
+        assert!(p_small.rvs(0, &mut rng).is_empty());
+        let p_tiny = Poisson::new(1e-12);
+        assert!(p_tiny.rvs(10, &mut rng).iter().all(|&x| x == 0));
+
+        // Fitting
+        let fitted = Poisson::fit(&samples_small).unwrap();
+        assert!((fitted.mu - 3.5).abs() < 0.12, "fitted Poisson mu {} vs 3.5", fitted.mu);
+
+        // Error cases
+        assert!(Poisson::fit(&[]).is_err());
+
+        // Trait methods
+        let mut rng2 = StdRng::seed_from_u64(99);
+        let d_samples = p_small.rvs(10, &mut rng2);
+        assert_eq!(d_samples.len(), 10);
+        let fitted_trait = Poisson::try_fit(&samples_small);
+        assert!(fitted_trait.is_ok());
     }
 
     #[test]
@@ -96004,6 +96317,49 @@ mod tests {
             (s_skew - 0.6).abs() < 1e-12,
             "skew(right-skewed) = {s_skew}, expected 0.6"
         );
+    }
+
+    // br-szq1n.14: values are live SciPy 1.17.1 `wrapcauchy(c).stats('mvsk')`; these
+    // all returned NaN before (var/skew/kurt), under a comment claiming SciPy did too.
+    #[test]
+    fn wrapcauchy_linear_moments_match_scipy() {
+        for &(c, var, kurt) in &[
+            (0.1, 3.700_339_298_094_016_6, -1.338_246_198_260_451_4),
+            (0.5, 5.618_830_239_556_502, -1.713_554_631_148_695_3),
+            (0.9, 8.488_727_025_716_301, -1.947_647_594_934_922_6),
+        ] {
+            let d = WrapCauchy::new(c);
+            assert!((d.mean() - PI).abs() < 1e-15, "c={c} mean");
+            assert!((d.var() - var).abs() <= 1e-12 * var, "c={c} var {} vs {var}", d.var());
+            assert!(d.skewness().abs() < 1e-12, "c={c} skew");
+            assert!((d.kurtosis() - kurt).abs() <= 1e-11, "c={c} kurt {} vs {kurt}", d.kurtosis());
+        }
+        // c = 0 is the uniform distribution on [0, 2π): var π²/3, excess kurtosis −6/5.
+        let u = WrapCauchy::new(0.0);
+        assert!((u.var() - PI * PI / 3.0).abs() < 1e-14);
+        assert!((u.kurtosis() + 1.2).abs() < 1e-14);
+    }
+
+    // br-szq1n.14: modes were hardcoded 0.0. Expected values: SciPy genexpon pdf argmax
+    // (bounded minimize_scalar, agrees with the closed form to 1e-10) and the integer
+    // argmax of SciPy's betanbinom / nhypergeom pmf.
+    #[test]
+    fn modes_match_scipy_argmax_for_three_families() {
+        for &(a, b, c, mode) in &[
+            (0.5, 4.0, 3.0, 0.225_860_808_522_507_42),
+            (1.0, 2.0, 3.0, 0.185_652_847_337_014_23),
+            (0.3, 5.0, 0.7, 0.433_117_379_982_182_8),
+            (2.0, 1.0, 1.0, 0.0), // b·c <= a²: the density decreases from 0
+        ] {
+            let got = GeneralizedExponential::new(a, b, c).mode();
+            assert!((got - mode).abs() < 1e-9, "genexpon({a},{b},{c}) mode {got} vs {mode}");
+        }
+        for &((n, a, b), mode) in &[((5, 2.0, 3.0), 2.0), ((10, 3.0, 2.0), 2.0), ((1, 1.5, 1.5), 0.0)] {
+            assert_eq!(BetaNegativeBinomial::new(n, a, b).mode(), mode, "betanbinom({n},{a},{b})");
+        }
+        for &((m, n, r), mode) in &[((20, 7, 12), 7.0), ((30, 10, 5), 2.0), ((15, 3, 2), 0.0)] {
+            assert_eq!(NegHypergeometric::new(m, n, r).mode(), mode, "nhypergeom({m},{n},{r})");
+        }
     }
 
     #[test]
