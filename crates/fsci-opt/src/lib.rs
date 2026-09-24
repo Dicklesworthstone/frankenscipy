@@ -13,6 +13,9 @@ pub mod linesearch;
 pub mod minimize;
 pub mod nonlin;
 pub mod root;
+mod slsqp;
+mod trf;
+mod trust_region;
 pub mod types;
 
 pub use audit::{SyncSharedAuditLedger, record_fail_closed, sync_audit_ledger};
@@ -28,9 +31,9 @@ pub use chandrupatla::{
     FindRootStatus, find_minimum, find_root,
 };
 pub use curvefit::{
-    CurveFitOptions, CurveFitResult, LeastSquaresOptions, LeastSquaresResult, LeastsqResult,
-    curve_fit, curve_fit_bounded, curve_fit_bounded_many, curve_fit_many, least_squares,
-    least_squares_bounded, least_squares_many, leastsq,
+    CurveFitOptions, CurveFitResult, LeastSquaresMethod, LeastSquaresOptions, LeastSquaresResult,
+    LeastsqResult, curve_fit, curve_fit_bounded, curve_fit_bounded_many, curve_fit_many,
+    least_squares, least_squares_bounded, least_squares_many, leastsq,
 };
 pub use linesearch::{
     LineSearchResult, ScipyLineSearchResult, WolfeParams, line_search, line_search_wolfe1,
@@ -39,11 +42,12 @@ pub use linesearch::{
 pub use minimize::{
     MinimizeScalarOptions, MinimizeScalarResult, OptCaspDecision, OptCaspProblem,
     OptPortfolioResult, TRUST_EXACT_CHOLESKY_DISABLE, TRUST_EXACT_FLAT_AUGMENTED_DISABLE,
-    TRUST_EXACT_FOLD_SHIFT_DISABLE, bfgs, cg_pr_plus, get_optimize_traces, lbfgsb, minimize,
-    minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit, minimize_with_casp,
-    minimize_with_casp_portfolio, nelder_mead, newton_cg, powell, select_minimize_method,
-    trust_exact,
+    TRUST_EXACT_FOLD_SHIFT_DISABLE, bfgs, cg_pr_plus, dogleg, get_optimize_traces, lbfgsb,
+    minimize, minimize_many, minimize_scalar, minimize_scalar_many, minimize_with_audit,
+    minimize_with_casp, minimize_with_casp_portfolio, nelder_mead, newton_cg, powell,
+    select_minimize_method, trust_exact, trust_ncg,
 };
+pub use trf::LossKind;
 // NOTE on the two `anderson` functions, resolved conservatively rather than by
 // picking a winner. `root::anderson(func, x0, tol, maxiter, m, beta) ->
 // Result<MultivariateRootResult, OptError>` predates the nonlin family;
@@ -71,8 +75,9 @@ pub use root::{
     root_many, root_scalar, secant, secant_many, toms748,
 };
 pub use types::{
-    Bound, Bounds, ConvergenceStatus, GradientFunc, LinearConstraint, MinimizeOptions,
-    NonlinearConstraint, OptError, OptimizeMethod, OptimizeResult, RootMethod, RootOptions,
+    Bound, Bounds, Constraint, ConstraintFn, ConstraintJacFn, ConstraintType, ConvergenceStatus,
+    GradientFunc, HessFunc, HesspFunc, LinearConstraint, MinimizeOptions, NonlinearConstraint,
+    OptError, OptimizeMethod, OptimizeResult, RootMethod, RootOptions,
 };
 
 /// Warning emitted during optimization routines, matching `scipy.optimize.OptimizeWarning`.
@@ -90,15 +95,9 @@ pub fn linprog_verbose_callback(res: &OptimizeResult) {
     eprintln!("linprog iteration {nit}: objective = {fun:.6e}");
 }
 
-/// Show documentation and options for a given solver/method, matching `scipy.optimize.show_options`.
-#[must_use]
-pub fn show_options(solver: Option<&str>, method: Option<&str>) -> String {
-    format!(
-        "Optimization options for solver: {}, method: {}",
-        solver.unwrap_or("all"),
-        method.unwrap_or("default")
-    )
-}
+// `scipy.optimize.show_options` (an interactive documentation printer) is not applicable; the
+// option structs' rustdoc is the reference. A template-string stand-in used to be counted as
+// covered (frankenscipy-8dndw.1).
 
 /// Exit status for adaptive numerical differentiation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1353,9 +1352,15 @@ fn build_standard_form_transform(
     })
 }
 
-/// Solve a linear programming problem using the revised simplex method.
+/// Solve a linear programming problem with a dense two-phase TABLEAU simplex.
 ///
-/// Matches `scipy.optimize.linprog(c, A_ub, b_ub, A_eq, b_eq, bounds, method)`.
+/// Same problem statement and `status` codes as `scipy.optimize.linprog(c, A_ub, b_ub, A_eq,
+/// b_eq, bounds)`, but a different method. SciPy's default is HiGHS (dual simplex / IPM on
+/// sparse data); this is the textbook dense tableau with Dantzig pricing that falls back to
+/// Bland's rule after a run of degenerate pivots. It costs O(m·n) memory and time per pivot,
+/// and it returns no dual values (`marginals`) and no equality residuals (`con`). On an LP
+/// with several optimal vertices it can return a different optimal `x` from HiGHS. `fun` is
+/// the same.
 ///
 /// Minimizes `c^T x` subject to:
 ///   `A_ub @ x <= b_ub` (inequality constraints)
@@ -1742,6 +1747,7 @@ pub fn linprog(
         x: x_orig,
         fun,
         slack,
+        // status: Phase I feasible (Σartificials ≤ 1e-8) and no Phase II reduced cost < -1e-12
         success: true,
         status: 0,
         message: "Optimization terminated successfully".to_string(),
@@ -1861,6 +1867,10 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
     let mut total_nit = 0usize;
     let mut best: Option<LinprogResult> = None;
     let mut root_status = None;
+    // Node LPs that failed for a reason OTHER than infeasibility (iteration limit, unbounded,
+    // numerical trouble). Pruning one is not a proof that its subtree holds nothing better, so
+    // any such node leaves the incumbent unproven (frankenscipy-szq1n.7).
+    let mut unresolved_nodes = 0usize;
     let mut stack = vec![root_bounds];
 
     while let Some(node_bounds) = stack.pop() {
@@ -1904,6 +1914,9 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
             root_status = Some(lp.status);
         }
         if !lp.success {
+            if lp.status != 2 {
+                unresolved_nodes += 1;
+            }
             continue;
         }
         if best
@@ -1950,9 +1963,21 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
     }
 
     Ok(match best {
+        Some(best) if unresolved_nodes > 0 => MilpResult {
+            x: best.x,
+            fun: best.fun,
+            success: false,
+            status: 1,
+            message: format!(
+                "incumbent not proven optimal: {unresolved_nodes} node LP relaxation(s) stopped without an optimum (raise lp_maxiter)"
+            ),
+            mip_node_count: node_count,
+            nit: total_nit,
+        },
         Some(best) => MilpResult {
             x: best.x,
             fun: best.fun,
+            // status: B&B stack exhausted, integral incumbent, zero unresolved node LPs
             success: true,
             status: 0,
             message: "Optimization terminated successfully".to_string(),
@@ -1962,6 +1987,13 @@ pub fn milp(problem: MilpProblem<'_>, options: MilpOptions) -> Result<MilpResult
         None => {
             let (status, message) = match root_status {
                 Some(3) => (3, "LP relaxation is unbounded".to_string()),
+                // An LP stopped at its iteration limit proves nothing about feasibility.
+                _ if unresolved_nodes > 0 => (
+                    1,
+                    format!(
+                        "no integer solution found and {unresolved_nodes} node LP relaxation(s) stopped without an optimum (raise lp_maxiter)"
+                    ),
+                ),
                 _ => (2, "Problem is infeasible".to_string()),
             };
             MilpResult {
@@ -2151,6 +2183,42 @@ pub fn differential_evolution<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
+    // Every point is feasible, so the tournament below reduces exactly to `f_trial <= f_orig`.
+    differential_evolution_core(|x| (func(x), 0.0), bounds, opts).map(|(result, _)| result)
+}
+
+/// SciPy's `_accept_trial` for one scalar violation `v >= 0` (0 = feasible): a feasible trial
+/// needs a lower-or-equal objective against a feasible original and always beats an infeasible
+/// one; an infeasible trial needs a lower-or-equal violation.
+fn de_accepts(trial: (f64, f64), orig: (f64, f64)) -> bool {
+    match (trial.1 == 0.0, orig.1 == 0.0) {
+        (true, true) => trial.0 <= orig.0,
+        (true, false) => true,
+        (false, _) => trial.1 <= orig.1,
+    }
+}
+
+/// Strict "ranks before" for the best member (SciPy's `_promote_lowest_energy`): the lowest
+/// objective among feasible members, else the least violation.
+fn de_ranks_before(a: (f64, f64), b: (f64, f64)) -> bool {
+    match (a.1 == 0.0, b.1 == 0.0) {
+        (true, true) => a.0 < b.0,
+        (true, false) => true,
+        (false, true) => false,
+        (false, false) => a.1 < b.1,
+    }
+}
+
+/// Differential evolution over `evaluate(x) = (objective, violation)`. Returns the result and
+/// the violation of the reported point.
+fn differential_evolution_core<E>(
+    evaluate: E,
+    bounds: &[(f64, f64)],
+    opts: DifferentialEvolutionOptions,
+) -> Result<(OptimizeResult, f64), OptError>
+where
+    E: Fn(&[f64]) -> (f64, f64),
+{
     let ndim = bounds.len();
     if ndim == 0 {
         return Err(OptError::InvalidArgument {
@@ -2232,15 +2300,17 @@ where
         })
         .collect();
 
-    let mut fitness: Vec<f64> = population.iter().map(|x| func(x)).collect();
+    let (mut fitness, mut violation): (Vec<f64>, Vec<f64>) =
+        population.iter().map(|x| evaluate(x)).unzip();
     let mut nfev = pop_count;
 
     // Track best.
     let mut best_idx = 0;
-    let mut best_fun = fitness[0];
-    for (i, &f) in fitness.iter().enumerate() {
-        if f < best_fun {
-            best_fun = f;
+    for i in 1..pop_count {
+        if de_ranks_before(
+            (fitness[i], violation[i]),
+            (fitness[best_idx], violation[best_idx]),
+        ) {
             best_idx = i;
         }
     }
@@ -2278,13 +2348,12 @@ where
             }
 
             // Selection.
-            let f_trial = func(&trial);
+            let scored_trial = evaluate(&trial);
             nfev += 1;
-            if f_trial <= fitness[i] {
+            if de_accepts(scored_trial, (fitness[i], violation[i])) {
                 population[i].copy_from_slice(&trial);
-                fitness[i] = f_trial;
-                if f_trial < best_fun {
-                    best_fun = f_trial;
+                (fitness[i], violation[i]) = scored_trial;
+                if de_ranks_before(scored_trial, (fitness[best_idx], violation[best_idx])) {
                     best_idx = i;
                 }
             }
@@ -2311,15 +2380,21 @@ where
                     a.max(b)
                 }
             });
-        if (fmax - fmin).abs() <= opts.tol * (1.0 + fmin.abs()) {
+        // As SciPy, whose infeasible members carry infinite energy: no spread test passes while
+        // any member is infeasible.
+        if violation.iter().all(|&v| v == 0.0)
+            && (fmax - fmin).abs() <= opts.tol * (1.0 + fmin.abs())
+        {
+            // status: all members feasible and fitness spread ≤ tol·(1+|fmin|)
             converged = true;
             break;
         }
     }
 
-    Ok(OptimizeResult {
+    let best_violation = violation[best_idx];
+    let result = OptimizeResult {
         x: population[best_idx].clone(),
-        fun: Some(best_fun),
+        fun: Some(fitness[best_idx]),
         success: converged,
         status: if converged {
             ConvergenceStatus::Success
@@ -2338,28 +2413,22 @@ where
         jac: None,
         hess_inv: None,
         maxcv: None,
-    })
+    };
+    Ok((result, best_violation))
 }
 
-/// br-7470: Penalty-based constraint handling for differential evolution.
+/// Differential evolution under a constraint, with SciPy's feasibility tournament.
 ///
-/// Wraps the user objective with a quadratic exterior penalty: for each
-/// candidate x, the effective cost is
+/// `constraint_violation(x)` returns the total violation, `>= 0`, zero meaning feasible (a NaN
+/// counts as infeasible). Selection follows scipy.optimize.differential_evolution's constrained
+/// mode (Lampinen): a feasible point beats an infeasible one, feasible points compare by
+/// objective, infeasible ones by violation; the population converges only once every member is
+/// feasible. `maxcv` reports the violation of the returned point, and an infeasible point is
+/// never a success ("The solution does not satisfy the constraints, MAXCV = ...").
 ///
-/// ```text
-/// func(x) + penalty * sum_j violation_j(x)^2
-/// ```
-///
-/// where `violation` returns the sum of squared boundary excess across
-/// all linear and nonlinear constraints. A feasible point has zero
-/// penalty; an infeasible point pays a large cost that pushes selection
-/// away. Mirrors the spirit of scipy.optimize.differential_evolution's
-/// constrained mode, which uses a feasibility-tournament with similar
-/// boundary-excess penalty (the underlying numerics differ — scipy
-/// uses a Lampinen tournament — but for unimodal global minima both
-/// converge to the same constrained optimum).
-///
-/// `constraint_violation` should return >= 0; zero means feasible.
+/// This replaced a quadratic exterior penalty (br-7470), which could only discourage
+/// infeasibility: it put the optimum of `x^2` under `x >= 1` at `x = 1 - 1e-6` and reported
+/// that infeasible point as a success (frankenscipy-szq1n.7).
 pub fn differential_evolution_constrained<F, G>(
     func: F,
     bounds: &[(f64, f64)],
@@ -2370,16 +2439,26 @@ where
     F: Fn(&[f64]) -> f64,
     G: Fn(&[f64]) -> f64,
 {
-    const PENALTY: f64 = 1.0e6;
-    let penalized = |x: &[f64]| {
+    let scored = |x: &[f64]| {
         let v = constraint_violation(x);
-        if v <= 0.0 {
-            func(x)
-        } else {
-            func(x) + PENALTY * v * v
-        }
+        (
+            func(x),
+            if v.is_nan() {
+                f64::INFINITY
+            } else {
+                v.max(0.0)
+            },
+        )
     };
-    differential_evolution(penalized, bounds, opts)
+    let (mut result, violation) = differential_evolution_core(scored, bounds, opts)?;
+    result.maxcv = Some(violation);
+    if violation > 0.0 {
+        result.success = false;
+        result.status = ConvergenceStatus::Infeasible;
+        result.message =
+            format!("The solution does not satisfy the constraints, MAXCV = {violation:e}");
+    }
+    Ok(result)
 }
 
 /// Select three distinct random indices from [0, n), all different from `exclude`.
@@ -2522,6 +2601,11 @@ where
             detail: format!("initial local minimization failed: {e}"),
         })?;
 
+    // SciPy: `res.success = res.lowest_optimization_result.success` -- the verdict belongs to
+    // the local minimisation that produced the reported point (frankenscipy-szq1n.7).
+    let mut best_success = local_result.success;
+    let mut best_status = local_result.status;
+    let mut best_message = local_result.message.clone();
     let mut x_current = local_result.x;
     let mut f_current = local_result.fun.unwrap_or(f64::INFINITY);
     let mut x_best = x_current.clone();
@@ -2556,6 +2640,9 @@ where
             if f_new < f_best {
                 f_best = f_new;
                 x_best.clone_from(&result.x);
+                best_success = result.success;
+                best_status = result.status;
+                best_message.clone_from(&result.message);
             }
 
             if accept {
@@ -2568,9 +2655,16 @@ where
     Ok(OptimizeResult {
         x: x_best,
         fun: Some(f_best),
-        success: true,
-        status: ConvergenceStatus::Success,
-        message: format!("Basin-hopping completed after {} iterations", opts.niter),
+        success: best_success,
+        status: best_status,
+        message: if best_success {
+            format!("Basin-hopping completed after {} iterations", opts.niter)
+        } else {
+            format!(
+                "Basin-hopping completed after {} iterations; the lowest local minimisation failed: {best_message}",
+                opts.niter
+            )
+        },
         nfev: total_nfev,
         njev: 0,
         nhev: 0,
@@ -2583,10 +2677,14 @@ where
 
 /// Dual annealing global optimization.
 ///
-/// Combines simulated annealing with periodic local minimization.
-/// Effective for finding global minima of multimodal functions.
+/// Simulated annealing with a local minimization after every annealing step, under the name
+/// and signature of `scipy.optimize.dual_annealing(func, bounds, maxiter, seed)`.
 ///
-/// Matches `scipy.optimize.dual_annealing(func, bounds)`.
+/// NOT SciPy's generalized simulated annealing: candidates come from a UNIFORM perturbation
+/// scaled by `√T/(1+T)` with `T = 5230/ln(k+1)`, not the Tsallis–Stariolo visiting
+/// distribution (`visit = 2.62`), there is no restart temperature, and the local search is
+/// BFGS clamped to the bounds rather than L-BFGS-B. Expect the same kind of answer on a
+/// multimodal problem, not the same iterates, `nfev` or (on a tie) the same minimizer.
 ///
 /// # Arguments
 /// * `func` — Objective function to minimize.
@@ -2628,13 +2726,34 @@ where
 
     let mut rng = SimpleRng::new(seed);
 
-    // Initialize with random point in bounds
-    let mut x_best: Vec<f64> = bounds
-        .iter()
-        .map(|&(lo, hi)| lo + rng.next_f64() * (hi - lo))
-        .collect();
+    // Initialize with random point in bounds. SciPy's `EnergyState.reset` redraws a starting
+    // point whose energy is not finite, up to MAX_REINIT_COUNT times, then raises: a NaN start
+    // would otherwise stick (every later `<` against NaN is false) and come back as the answer
+    // with `fun = NaN` (frankenscipy-0v9od).
+    const MAX_REINIT_COUNT: usize = 1000;
+    let mut draw = || -> Vec<f64> {
+        bounds
+            .iter()
+            .map(|&(lo, hi)| lo + rng.next_f64() * (hi - lo))
+            .collect()
+    };
+    let mut x_best = draw();
     let mut f_best = func(&x_best);
     let mut nfev = 1usize;
+    let mut reinit_count = 0;
+    while !f_best.is_finite() {
+        if reinit_count >= MAX_REINIT_COUNT {
+            return Err(OptError::NonFiniteInput {
+                detail: "Stopping algorithm because function create NaN or (+/-) infinity values \
+                         even with trying new random parameters"
+                    .to_string(),
+            });
+        }
+        x_best = draw();
+        f_best = func(&x_best);
+        nfev += 1;
+        reinit_count += 1;
+    }
 
     let mut x_current = x_best.clone();
     let mut f_current = f_best;
@@ -2674,7 +2793,7 @@ where
     for iteration in 0..maxiter {
         let temp = t_initial / (iteration as f64 + 1.0).ln().max(1.0);
 
-        // Generate candidate via visiting distribution (Cauchy-like perturbation)
+        // Candidate: a uniform perturbation of each coordinate, shrinking with temperature
         let x_candidate: Vec<f64> = x_current
             .iter()
             .zip(bounds.iter())
@@ -2729,6 +2848,7 @@ where
         nfev,
         njev: 0,
         nhev: 0,
+        // status: SciPy parity -- success at maxiter; SciPy fails only on maxfun (none here)
         success: true,
         status: ConvergenceStatus::Success,
         message: "dual_annealing completed".to_string(),
@@ -2817,14 +2937,19 @@ where
         });
     }
 
+    // Start from the first grid point, which is SciPy's `argmin` when no value is finite; the
+    // old `[0.0; ndim]` start could lie outside every range (frankenscipy-szq1n.7).
     let mut best_x = vec![0.0; ndim];
-    let mut best_f = f64::INFINITY;
+    fill_point(0, &mut best_x);
+    let mut best_f = fs[0];
     for (idx, &f) in fs.iter().enumerate() {
-        if f < best_f {
+        if f < best_f || (best_f.is_nan() && !f.is_nan()) {
             best_f = f;
             fill_point(idx, &mut best_x);
         }
     }
+    // No finite objective value anywhere on the grid is not a minimum.
+    let success = best_f.is_finite();
 
     Ok(OptimizeResult {
         x: best_x,
@@ -2833,9 +2958,17 @@ where
         nfev,
         njev: 0,
         nhev: 0,
-        success: true,
-        status: ConvergenceStatus::Success,
-        message: "brute completed".to_string(),
+        success,
+        status: if success {
+            ConvergenceStatus::Success
+        } else {
+            ConvergenceStatus::NanEncountered
+        },
+        message: if success {
+            "brute completed".to_string()
+        } else {
+            "brute: the objective is not finite anywhere on the grid".to_string()
+        },
         jac: None,
         hess_inv: None,
         maxcv: None,
@@ -2940,6 +3073,7 @@ where
     Ok(OptimizeResult {
         x: best_x,
         fun: Some(best_fun),
+        // status: SciPy parity -- shgo fails only with no feasible sample; that case errs above
         success: true,
         status: ConvergenceStatus::Success,
         message: "shgo completed".to_string(),
@@ -3033,14 +3167,16 @@ impl SimpleRng {
     }
 }
 
-/// COBYLA: Constrained Optimization BY Linear Approximation.
+/// Derivative-free constrained minimization under SciPy's COBYLA name.
 ///
 /// Minimizes `func(x)` subject to `constraints[i](x) >= 0` for all i.
 ///
-/// Uses a simplex-based method that approximates the objective and constraints
-/// with linear models at each iteration.
-///
-/// Matches `scipy.optimize.minimize(func, x0, method='COBYLA', constraints=...)`.
+/// NOT Powell's COBYLA (no linear-interpolation models): this is a coordinate
+/// compass search on the penalty `f + 1000 * violation`, halving the step `rho`
+/// when no coordinate move improves it. It shares the signature of
+/// `scipy.optimize.fmin_cobyla` but not its iterates or results; a real COBYLA is
+/// tracked separately. `success` is true only when the step contracted below
+/// 1e-12 AND the final point satisfies every constraint to 1e-8 (`maxcv`).
 pub fn cobyla<F, G>(
     func: F,
     x0: &[f64],
@@ -3078,8 +3214,11 @@ where
     let mut f_best = func(&x);
     let mut nfev = 1usize;
     let mut rho = rhobeg;
+    let mut iterations = 0usize;
+    let mut contracted = false;
 
     for _iteration in 0..maxiter {
+        iterations += 1;
         // Check constraints
         let mut max_violation = 0.0_f64;
         for constraint in constraints {
@@ -3125,24 +3264,52 @@ where
         if !improved {
             rho *= 0.5;
             if rho < 1e-12 {
+                contracted = true;
                 break;
             }
         }
     }
 
+    // br-szq1n.7: this used to report `success: true`, `nit = maxiter` and no
+    // `maxcv` whatever happened -- including an infeasible final point or an
+    // exhausted iteration budget.
+    let maxcv = constraints
+        .iter()
+        .map(|constraint| (-constraint(&x)).max(0.0))
+        .fold(0.0_f64, f64::max);
+    let (success, status, message) = if maxcv > 1.0e-8 {
+        (
+            false,
+            ConvergenceStatus::Infeasible,
+            format!("did not converge to a point satisfying the constraints (maxcv = {maxcv:.3e})"),
+        )
+    } else if contracted {
+        (
+            true,
+            ConvergenceStatus::Success,
+            "step size contracted below 1e-12 at a feasible point".to_string(),
+        )
+    } else {
+        (
+            false,
+            ConvergenceStatus::MaxIterations,
+            format!("maximum number of iterations ({maxiter}) reached"),
+        )
+    };
+
     Ok(OptimizeResult {
         x,
         fun: Some(f_best),
-        nit: maxiter,
+        nit: iterations,
         nfev,
         njev: 0,
         nhev: 0,
-        success: true,
-        status: ConvergenceStatus::Success,
-        message: "cobyla completed".to_string(),
+        success,
+        status,
+        message,
         jac: None,
         hess_inv: None,
-        maxcv: None,
+        maxcv: Some(maxcv),
     })
 }
 
@@ -3228,6 +3395,7 @@ where
         };
         let result = crate::minimize(penalty_fn, &x, opts)?;
         total_nfev += result.nfev;
+        let inner_converged = result.success;
         x = result.x;
 
         // Update multipliers
@@ -3249,12 +3417,16 @@ where
             };
         }
 
-        // Check convergence
-        if max_violation < 1e-6 {
+        // Check convergence. Feasibility alone is not optimality: a feasible x0 with a small
+        // `max_inner` used to be reported as the solution on the first pass, far from the optimum
+        // (frankenscipy-szq1n.7). A feasible point whose subproblem did not converge is
+        // warm-started into another outer pass instead.
+        if max_violation < 1e-6 && inner_converged {
             let fval = f(&x);
             return Ok(OptimizeResult {
                 x,
                 fun: Some(fval),
+                // status: max constraint violation < 1e-6 and inner subproblem success
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: format!("augmented lagrangian converged in {outer} outer iterations"),
@@ -5252,6 +5424,7 @@ where
             return OptimizeResult {
                 x,
                 fun: Some(fval),
+                // status: ‖∇f‖₂ < tol (gradient checked finite above)
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: format!("gradient descent converged in {iter} iterations"),
@@ -5413,6 +5586,7 @@ where
             return OptimizeResult {
                 x,
                 fun: Some(fval),
+                // status: projected step ‖clamp(x − lr·g) − x‖₂ < tol
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: format!("projected GD converged in {iter} iterations"),
@@ -5493,6 +5667,7 @@ where
     let mut df = vec![vec![0.0; columns]; rows];
     let mut error = vec![vec![0.0; columns]; rows];
     let mut status = DifferentiateStatus::Converged;
+    // status: AND identity; `&=` with every partial's success below (rows, cols ≥ 1)
     let mut success = true;
     let mut nit = 0;
     let mut nfev = 1;
@@ -5603,6 +5778,7 @@ where
     let mut ddf = vec![vec![0.0; n]; n];
     let mut error = vec![vec![0.0; n]; n];
     let mut status = DifferentiateStatus::Converged;
+    // status: AND identity; `&=` with every component's success below (n ≥ 1 validated)
     let mut success = true;
     let mut nit = 0;
     let mut nfev = 1;
@@ -5923,6 +6099,7 @@ where
             return Ok(DerivativeResult {
                 df: estimate,
                 error,
+                // status: finite successive-estimate error ≤ atol + rtol·|estimate|
                 success: true,
                 status: DifferentiateStatus::Converged,
                 nit,
@@ -6017,6 +6194,7 @@ where
             return Ok(DerivativeResult {
                 df: estimate,
                 error,
+                // status: finite successive-estimate error ≤ atol + rtol·|estimate|
                 success: true,
                 status: DifferentiateStatus::Converged,
                 nit,
@@ -6646,6 +6824,29 @@ mod tests {
         let constraints = |x: &[f64]| vec![x[0] + 1.0];
         assert!(augmented_lagrangian(f, constraints, &[0.0], 1, 0, 10).is_err());
         assert!(augmented_lagrangian(f, constraints, &[0.0], 1, 10, 0).is_err());
+    }
+
+    // frankenscipy-szq1n.7: feasibility alone was treated as convergence, so a feasible x0 with a
+    // one-iteration inner budget was reported as the optimum of (x-3)^2 under x <= 5.
+    #[test]
+    fn augmented_lagrangian_needs_a_converged_subproblem_not_just_feasibility() {
+        use crate::augmented_lagrangian;
+
+        let f = |x: &[f64]| (x[0] - 3.0).powi(2);
+        let inactive = |x: &[f64]| vec![5.0 - x[0]];
+        let starved = augmented_lagrangian(f, inactive, &[0.0], 1, 1, 1).expect("runs");
+        println!(
+            "starved AL: x={:?} fun={:?} success={}",
+            starved.x, starved.fun, starved.success
+        );
+        assert!(
+            !starved.success,
+            "x={:?} is feasible but not optimal",
+            starved.x
+        );
+        let solved = augmented_lagrangian(f, inactive, &[0.0], 1, 20, 1000).expect("runs");
+        assert!(solved.success, "{}", solved.message);
+        assert!((solved.x[0] - 3.0).abs() < 1e-3, "x={:?}", solved.x);
     }
 
     #[test]
@@ -7644,6 +7845,44 @@ mod tests {
         assert!((result.fun + 7.0).abs() < 1e-9);
     }
 
+    // frankenscipy-szq1n.7: a node LP stopped at its iteration limit was pruned as if infeasible.
+    // At the root that turned "LP budget too small" into "Problem is infeasible" (status 2); below
+    // the root it let the search finish with status 0 on an unproven incumbent. SciPy reports an
+    // iteration limit as status 1.
+    #[test]
+    fn milp_lp_iteration_limit_is_not_infeasibility() {
+        let c = vec![-1.0, -2.0];
+        let a_ub = vec![vec![1.0, 1.0]];
+        let b_ub = vec![4.0];
+        let bounds = vec![(Some(0.0), Some(3.0)), (Some(0.0), Some(3.0))];
+        let problem = MilpProblem {
+            c: &c,
+            integrality: &[Integrality::Integer, Integrality::Integer],
+            a_ub: &a_ub,
+            b_ub: &b_ub,
+            a_eq: &[],
+            b_eq: &[],
+            bounds: &bounds,
+        };
+        let starved = milp(
+            problem,
+            MilpOptions {
+                lp_maxiter: Some(1),
+                ..MilpOptions::default()
+            },
+        )
+        .expect("milp");
+        println!(
+            "milp lp_maxiter=1: status={} success={} msg={}",
+            starved.status, starved.success, starved.message
+        );
+        assert!(!starved.success);
+        assert_eq!(starved.status, 1, "{}", starved.message);
+        let solved = milp(problem, MilpOptions::default()).expect("milp");
+        assert_eq!(solved.status, 0, "{}", solved.message);
+        assert_eq!(solved.x, vec![1.0, 3.0]);
+    }
+
     #[test]
     fn milp_handles_binary_variables() {
         let c = vec![-3.0, -2.0];
@@ -7997,6 +8236,53 @@ mod tests {
             result.fun.unwrap_or(f64::INFINITY) < 1.05,
             "objective should be close to boundary optimum"
         );
+        // frankenscipy-szq1n.7: a success must be feasible EXACTLY. The quadratic penalty this
+        // replaced converged to x = 1 - 1e-6, violation 1e-6, under success = true.
+        assert_eq!(result.maxcv, Some(0.0), "x = {:?}", result.x);
+        assert!(result.x[0] >= 1.0, "x = {:?}", result.x);
+    }
+
+    // frankenscipy-szq1n.7: an infeasible answer is reported as one. x >= 3 cannot be met inside
+    // the box [0, 2]; the least-violating point x = 2 is returned with MAXCV 1 and success false.
+    #[test]
+    fn de_constrained_reports_an_unsatisfiable_constraint() {
+        let objective = |x: &[f64]| x[0] * x[0];
+        let impossible = |x: &[f64]| (3.0 - x[0]).max(0.0);
+        let opts = DifferentialEvolutionOptions {
+            maxiter: 100,
+            seed: Some(5),
+            ..Default::default()
+        };
+        let result = differential_evolution_constrained(objective, &[(0.0, 2.0)], impossible, opts)
+            .expect("runs");
+        println!(
+            "DE impossible: x={:?} maxcv={:?} success={} msg={}",
+            result.x, result.maxcv, result.success, result.message
+        );
+        assert!(!result.success);
+        assert_eq!(result.status, ConvergenceStatus::Infeasible);
+        assert!(
+            (result.x[0] - 2.0).abs() < 1e-6,
+            "least violation is at x = 2"
+        );
+        assert!((result.maxcv.unwrap() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn de_tournament_matches_scipy_accept_trial() {
+        use crate::{de_accepts, de_ranks_before};
+        // both feasible: objective decides, ties accepted
+        assert!(de_accepts((1.0, 0.0), (1.0, 0.0)));
+        assert!(!de_accepts((2.0, 0.0), (1.0, 0.0)));
+        // feasible trial always beats an infeasible original, whatever the objective
+        assert!(de_accepts((1e9, 0.0), (-1e9, 0.5)));
+        // infeasible trial never replaces a feasible original
+        assert!(!de_accepts((-1e9, 1e-12), (1e9, 0.0)));
+        // infeasible vs infeasible: violation decides
+        assert!(de_accepts((5.0, 0.1), (0.0, 0.2)));
+        assert!(!de_accepts((0.0, 0.3), (5.0, 0.2)));
+        assert!(de_ranks_before((0.0, 0.1), (0.0, 0.2)));
+        assert!(!de_ranks_before((-5.0, 0.1), (5.0, 0.0)));
     }
 
     // ── Basinhopping tests ─────────────────────────────────────────
@@ -8039,6 +8325,40 @@ mod tests {
             fun < 0.01,
             "basinhopping on sphere should find near-zero, got f={fun}"
         );
+    }
+
+    // frankenscipy-szq1n.7: basinhopping reported success = true unconditionally. SciPy uses
+    // `lowest_optimization_result.success`. The fixture needs local runs that cannot succeed:
+    // any objective with an attainable minimum lets a finite-difference gradient reach exactly
+    // 0 (the kink |x - 1/3| + 1 did, BFGS landing on x = 1/3 where the central difference
+    // vanishes). A linear objective has a constant gradient of 1 and no stationary point, so
+    // every BFGS run ends at its iteration limit (SciPy: success False as well).
+    #[test]
+    fn basinhopping_success_is_the_lowest_local_minimisations() {
+        let linear = |x: &[f64]| -> f64 { x[0] };
+        let unreachable = BasinhoppingOptions {
+            niter: 5,
+            seed: Some(7),
+            minimizer_tol: Some(f64::MIN_POSITIVE),
+            ..Default::default()
+        };
+        let failed = basinhopping(linear, &[2.0], unreachable).unwrap();
+        println!(
+            "basinhopping, unreachable local tol: success={} fun={:?} msg={}",
+            failed.success, failed.fun, failed.message
+        );
+        assert!(!failed.success, "every local minimisation failed");
+        assert_ne!(failed.status, ConvergenceStatus::Success);
+        // The positive arm: a smooth bowl, default tolerance, every local run converges.
+        let bowl = |x: &[f64]| -> f64 { (x[0] - 1.0 / 3.0).powi(2) + 1.0 };
+        let fine = BasinhoppingOptions {
+            niter: 5,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let ok = basinhopping(bowl, &[2.0], fine).unwrap();
+        assert!(ok.success, "{}", ok.message);
+        assert!((ok.fun.unwrap() - 1.0).abs() < 1e-10);
     }
 
     #[test]
@@ -8162,6 +8482,43 @@ mod tests {
         assert!(matches!(err, crate::OptError::InvalidBounds { .. }));
     }
 
+    /// frankenscipy-0v9od: a NaN at the seeded starting point used to stick -- no later `<`
+    /// against NaN succeeds -- and came back as `fun = NaN` with `success = true`. SciPy redraws
+    /// a non-finite starting energy.
+    #[test]
+    fn dual_annealing_redraws_a_nan_starting_point() {
+        let bounds = [(-10.0, 10.0), (-10.0, 10.0)];
+        // A seed whose first draw lands in the NaN region x[0] < -1.
+        let seed = (0..1000_u64)
+            .find(|&s| {
+                let mut rng = crate::SimpleRng::new(s);
+                bounds[0].0 + rng.next_f64() * (bounds[0].1 - bounds[0].0) < -1.0
+            })
+            .expect("a seed starting in the NaN region");
+        let objective = |x: &[f64]| {
+            if x[0] < -1.0 {
+                f64::NAN
+            } else {
+                (x[0] - 0.5).powi(2) + (x[1] + 0.25).powi(2)
+            }
+        };
+        let result = dual_annealing(objective, &bounds, 50, seed).expect("dual_annealing");
+        let fun = result.fun.expect("fun");
+        assert!(
+            fun.is_finite() && fun < 1e-10,
+            "fun = {fun}, x = {:?}",
+            result.x
+        );
+        assert!((result.x[0] - 0.5).abs() < 1e-5 && (result.x[1] + 0.25).abs() < 1e-5);
+
+        // NaN everywhere: SciPy raises after MAX_REINIT_COUNT redraws.
+        let err = dual_annealing(|_| f64::NAN, &bounds, 50, seed).expect_err("all NaN");
+        assert!(
+            matches!(err, crate::OptError::NonFiniteInput { .. }),
+            "{err:?}"
+        );
+    }
+
     #[test]
     fn pso_zero_particles_falls_back_to_single_particle() {
         let sphere = |x: &[f64]| -> f64 { x.iter().map(|xi| xi * xi).sum() };
@@ -8254,6 +8611,29 @@ mod tests {
         assert_eq!(tie.nfev, ns * ns);
     }
 
+    // frankenscipy-szq1n.7: an objective finite nowhere on the grid returned x = [0.0] (outside
+    // the range) with success = true. It now returns the first grid point, as SciPy's argmin
+    // does, and success = false.
+    #[test]
+    fn brute_with_no_finite_value_is_not_a_success() {
+        let nan = crate::brute(|_| f64::NAN, &[(1.0, 2.0)], 3).expect("brute runs");
+        assert!(!nan.success);
+        assert_eq!(nan.x, vec![1.0]);
+        let inf = crate::brute(|_| f64::INFINITY, &[(1.0, 2.0)], 3).expect("brute runs");
+        assert!(!inf.success);
+        assert_eq!(inf.x, vec![1.0]);
+        // A single finite value among NaNs is found.
+        let one = crate::brute(
+            |x| if x[0] == 1.5 { 4.0 } else { f64::NAN },
+            &[(1.0, 2.0)],
+            3,
+        )
+        .expect("brute runs");
+        assert!(one.success);
+        assert_eq!(one.x, vec![1.5]);
+        assert_eq!(one.fun, Some(4.0));
+    }
+
     #[test]
     fn brute_rejects_overflowing_grid_size() {
         let result = crate::brute(|_| 0.0, &[(0.0, 1.0), (0.0, 1.0)], usize::MAX);
@@ -8319,6 +8699,50 @@ mod tests {
             "cobyla should minimize: {}",
             result.fun.unwrap()
         );
+    }
+
+    // br-szq1n.7: the status must describe what happened; it used to be a literal
+    // success with nit = maxiter and no maxcv.
+    #[test]
+    fn cobyla_status_is_honest() {
+        type ConstraintFn = dyn Fn(&[f64]) -> f64;
+        // x >= 1 and x <= 0 cannot both hold.
+        let contradictory: Vec<Box<ConstraintFn>> = vec![
+            Box::new(|x: &[f64]| x[0] - 1.0),
+            Box::new(|x: &[f64]| -x[0]),
+        ];
+        let refs: Vec<&ConstraintFn> = contradictory.iter().map(|b| b.as_ref()).collect();
+        let infeasible = cobyla(|x| x[0] * x[0], &[0.5], &refs, 500, 0.5).expect("runs");
+        assert!(!infeasible.success);
+        assert_eq!(infeasible.status, ConvergenceStatus::Infeasible);
+        assert!(infeasible.maxcv.expect("maxcv reported") > 1e-8);
+
+        // One iteration cannot contract rho from 0.5 below 1e-12.
+        let starved = cobyla(
+            |x| (x[0] - 3.0).powi(2),
+            &[0.0],
+            &[] as &[fn(&[f64]) -> f64],
+            1,
+            0.5,
+        )
+        .expect("runs");
+        assert!(!starved.success);
+        assert_eq!(starved.status, ConvergenceStatus::MaxIterations);
+        assert_eq!(starved.nit, 1);
+
+        // Positive arm: feasible, contracted.
+        let ok = cobyla(
+            |x| (x[0] - 3.0).powi(2),
+            &[0.0],
+            &[] as &[fn(&[f64]) -> f64],
+            5000,
+            0.5,
+        )
+        .expect("runs");
+        assert!(ok.success, "{}", ok.message);
+        assert_eq!(ok.status, ConvergenceStatus::Success);
+        assert!(ok.nit < 5000);
+        assert!((ok.x[0] - 3.0).abs() < 1e-6, "x = {:?}", ok.x);
     }
 
     #[test]

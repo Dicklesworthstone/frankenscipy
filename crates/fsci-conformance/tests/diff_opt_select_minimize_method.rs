@@ -61,7 +61,9 @@ fn diff_opt_select_minimize_method() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
 
-    // 1. General constraints → TrustConstr
+    // 1. General constraints → Slsqp: scipy.optimize.minimize's own routing when constraints
+    // are given and no method is (frankenscipy-1ksfv.1). The old TrustConstr route led to a
+    // kernel that has to refuse constraints (frankenscipy-1ksfv.2).
     let p1 = OptCaspProblem {
         dimension: 3,
         variable_scale_ratio: 1.0,
@@ -73,9 +75,9 @@ fn diff_opt_select_minimize_method() {
     let d1 = select_minimize_method(p1).expect("p1 ok");
     diffs.push(CaseDiff {
         case_id: "general_constr".into(),
-        expected: format!("{:?}", OptimizeMethod::TrustConstr),
+        expected: format!("{:?}", OptimizeMethod::Slsqp),
         actual: format!("{:?}", d1.method),
-        pass: d1.method == OptimizeMethod::TrustConstr,
+        pass: d1.method == OptimizeMethod::Slsqp,
     });
 
     // 2. Box bounds (no general constr) → LBfgsB
@@ -112,7 +114,8 @@ fn diff_opt_select_minimize_method() {
         pass: d3.method == OptimizeMethod::NelderMead,
     });
 
-    // 4. Hessian product available + ill-scaled small → TrustExact
+    // 4. Hessian products available + ill-scaled small → trust-ncg, which uses the products
+    //    (the BFGS-model trust-exact this used to pick never called hessp; frankenscipy-1ksfv.4)
     let p4 = OptCaspProblem {
         dimension: 3,
         variable_scale_ratio: 1.0e5,
@@ -124,9 +127,9 @@ fn diff_opt_select_minimize_method() {
     let d4 = select_minimize_method(p4).expect("p4 ok");
     diffs.push(CaseDiff {
         case_id: "hessp_small_illscaled".into(),
-        expected: format!("{:?}", OptimizeMethod::TrustExact),
+        expected: format!("{:?}", OptimizeMethod::TrustNcg),
         actual: format!("{:?}", d4.method),
-        pass: d4.method == OptimizeMethod::TrustExact,
+        pass: d4.method == OptimizeMethod::TrustNcg,
     });
 
     // 5. Hessian product, well-scaled → NewtonCg

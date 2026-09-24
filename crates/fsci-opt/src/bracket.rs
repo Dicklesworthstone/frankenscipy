@@ -220,6 +220,7 @@ where
             f_bracket,
             nit: 0,
             nfev,
+            // status: initial.brackets() -- sign change or exact zero at an endpoint
             success: true,
         });
     }
@@ -272,6 +273,7 @@ where
                     f_bracket,
                     nit,
                     nfev,
+                    // status: side.brackets() -- sign change or exact zero at an endpoint
                     success: true,
                 });
             }

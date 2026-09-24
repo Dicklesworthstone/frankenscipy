@@ -97,7 +97,7 @@ fn now_str() -> String {
     format!("unix:{secs}")
 }
 
-fn minimize_opts(method: OptimizeMethod) -> MinimizeOptions {
+fn minimize_opts(method: OptimizeMethod) -> MinimizeOptions<'static> {
     MinimizeOptions {
         method: Some(method),
         mode: RuntimeMode::Strict,

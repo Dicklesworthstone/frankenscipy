@@ -1,13 +1,32 @@
 #![forbid(unsafe_code)]
 
-//! Nonlinear least-squares curve fitting (Levenberg-Marquardt).
-//!
-//! Provides `curve_fit` (matching `scipy.optimize.curve_fit`) and `least_squares`
-//! (matching `scipy.optimize.least_squares`).
+//! Nonlinear least squares: `least_squares` (SciPy's default Trust Region Reflective method,
+//! bounds, robust losses, or Levenberg–Marquardt), `curve_fit`, and the batched variants.
 
 use fsci_runtime::RuntimeMode;
 
+use crate::trf::{self, Loss, LossKind, XScale};
 use crate::types::OptError;
+
+/// SciPy's `least_squares(method=...)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeastSquaresMethod {
+    /// Trust Region Reflective (Branch, Coleman & Li): bounds, robust losses, `x_scale`.
+    Trf,
+    /// Levenberg–Marquardt: no bounds, `m ≥ n`, linear loss only.
+    Lm,
+}
+
+/// SciPy's `least_squares` termination messages by status.
+fn termination_message(status: i32) -> &'static str {
+    match status {
+        0 => "The maximum number of function evaluations is exceeded.",
+        1 => "`gtol` termination condition is satisfied.",
+        2 => "`ftol` termination condition is satisfied.",
+        3 => "`xtol` termination condition is satisfied.",
+        _ => "Both `ftol` and `xtol` termination conditions are satisfied.",
+    }
+}
 
 /// Result from `least_squares`.
 #[derive(Debug, Clone, PartialEq)]
@@ -26,25 +45,44 @@ pub struct LeastSquaresResult {
     pub nfev: usize,
     /// Number of Jacobian evaluations.
     pub njev: usize,
-    /// Number of iterations.
+    /// Number of iterations (accepted steps for `Trf`).
     pub nit: usize,
-    /// Jacobian at the solution (row-major, m rows x n cols).
+    /// Jacobian at the solution (row-major, m rows x n cols; for a robust loss, SciPy's
+    /// loss-scaled Jacobian).
     pub jac: Vec<Vec<f64>>,
+    /// SciPy's status: 0 max_nfev, 1 gtol, 2 ftol, 3 xtol, 4 ftol and xtol.
+    pub status: i32,
+    /// First-order optimality: ‖Jᵀf‖∞, scaled by the Coleman–Li vector under bounds.
+    pub optimality: f64,
+    /// Gradient `Jᵀf` of the cost at the solution.
+    pub grad: Vec<f64>,
+    /// −1 / 1 where a lower / upper bound is active, 0 otherwise.
+    pub active_mask: Vec<i8>,
 }
 
-/// Options for `least_squares`.
+/// Options for `least_squares`: SciPy's keyword arguments.
 #[derive(Debug, Clone, Copy)]
 pub struct LeastSquaresOptions {
+    /// `None` is SciPy's default: `Trf` for `least_squares`, `Lm` for an unbounded
+    /// `curve_fit`, `Trf` for a bounded one.
+    pub method: Option<LeastSquaresMethod>,
     /// Convergence tolerance on the gradient (gtol).
     pub gtol: f64,
     /// Convergence tolerance on the change in parameters (xtol).
     pub xtol: f64,
     /// Convergence tolerance on the change in cost (ftol).
     pub ftol: f64,
-    /// Maximum number of iterations.
+    /// Maximum number of function evaluations.
     pub max_nfev: Option<usize>,
-    /// Finite-difference step for Jacobian approximation.
-    pub diff_step: f64,
+    /// Relative finite-difference step; `None` is SciPy's default
+    /// `√ε·sign(x)·max(1, |x|)`.
+    pub diff_step: Option<f64>,
+    /// Robust loss (`Trf` only).
+    pub loss: LossKind,
+    /// Soft margin between inlier and outlier residuals for a robust loss.
+    pub f_scale: f64,
+    /// SciPy's `x_scale='jac'` (`Trf`); otherwise unit scale.
+    pub x_scale_jac: bool,
     /// Runtime mode.
     pub mode: RuntimeMode,
 }
@@ -52,15 +90,21 @@ pub struct LeastSquaresOptions {
 impl Default for LeastSquaresOptions {
     fn default() -> Self {
         Self {
+            method: None,
             gtol: 1.0e-8,
             xtol: 1.0e-8,
             ftol: 1.0e-8,
             max_nfev: None,
-            diff_step: 1.4901161193847656e-8, // sqrt(machine eps)
+            diff_step: None,
+            loss: LossKind::Linear,
+            f_scale: 1.0,
+            x_scale_jac: false,
             mode: RuntimeMode::Strict,
         }
     }
 }
+
+const SQRT_EPS: f64 = 1.490_116_119_384_765_6e-8;
 
 /// Result from `curve_fit`.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,12 +128,9 @@ pub struct CurveFitOptions {
     pub absolute_sigma: bool,
 }
 
-/// Solve a nonlinear least-squares problem using the Levenberg-Marquardt algorithm.
-///
-/// Finds `x` that minimizes `0.5 * sum(residuals(x)^2)` where `residuals` maps
-/// parameters to a vector of residuals.
-///
-/// Equivalent to `scipy.optimize.least_squares` with `method='lm'`.
+/// `scipy.optimize.least_squares(fun, x0, method=...)` without bounds: minimize
+/// `0.5·Σρ(residuals(x)²)`. The default method is SciPy's `trf`; `Lm` selects
+/// Levenberg–Marquardt. See [`least_squares_bounded`] for bounds.
 pub fn least_squares<F>(
     residuals: F,
     x0: &[f64],
@@ -98,7 +139,66 @@ pub fn least_squares<F>(
 where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
+    match options.method.unwrap_or(LeastSquaresMethod::Trf) {
+        LeastSquaresMethod::Trf => least_squares_trf(&residuals, x0, None, options),
+        LeastSquaresMethod::Lm => least_squares_lm(residuals, x0, options),
+    }
+}
+
+/// The result of an LM termination: gradient, optimality and (empty) active mask filled in.
+#[allow(clippy::too_many_arguments)]
+fn lm_result(
+    x: Vec<f64>,
+    fun: Vec<f64>,
+    cost: f64,
+    status: i32,
+    message: String,
+    nfev: usize,
+    njev: usize,
+    nit: usize,
+    jac: Vec<Vec<f64>>,
+) -> LeastSquaresResult {
+    let n = x.len();
+    let mut grad = vec![0.0; n];
+    for (row, &fi) in jac.iter().zip(&fun) {
+        for (g, &j) in grad.iter_mut().zip(row) {
+            *g += j * fi;
+        }
+    }
+    LeastSquaresResult {
+        optimality: grad.iter().fold(0.0_f64, |m, g| m.max(g.abs())),
+        grad,
+        active_mask: vec![0; n],
+        // status: SciPy's code for the test that stopped the iteration (0 = max_nfev)
+        success: status > 0,
+        status,
+        x,
+        fun,
+        cost,
+        message,
+        nfev,
+        njev,
+        nit,
+        jac,
+    }
+}
+
+/// Levenberg–Marquardt (`method='lm'`).
+fn least_squares_lm<F>(
+    residuals: F,
+    x0: &[f64],
+    options: LeastSquaresOptions,
+) -> Result<LeastSquaresResult, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64> + Sync,
+{
     let n = x0.len();
+    if options.loss != LossKind::Linear {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("method 'lm' supports only loss='linear'"),
+        });
+    }
+    let diff_step = options.diff_step.unwrap_or(SQRT_EPS);
     if n == 0 {
         return Err(OptError::InvalidArgument {
             detail: String::from("x0 must have at least one element"),
@@ -109,7 +209,7 @@ where
             detail: String::from("x0 must not contain NaN or Inf"),
         });
     }
-    if !options.diff_step.is_finite() || options.diff_step <= 0.0 {
+    if !diff_step.is_finite() || diff_step <= 0.0 {
         return Err(OptError::InvalidArgument {
             detail: String::from("diff_step must be finite and > 0"),
         });
@@ -159,14 +259,7 @@ where
     let mut cost = 0.5 * dot_vec(&r, &r);
     let mut jac = Vec::new();
     let mut x_perturbed = x.clone();
-    finite_diff_jacobian_parallel_into(
-        &residuals,
-        &x,
-        &r,
-        options.diff_step,
-        &mut jac,
-        &mut x_perturbed,
-    );
+    finite_diff_jacobian_parallel_into(&residuals, &x, &r, diff_step, &mut jac, &mut x_perturbed);
     nfev += n;
     njev += 1;
     // J^T J (O(n²·m)) and J^T r depend only on (jac, r), which change ONLY on an accepted
@@ -206,18 +299,19 @@ where
                 a.max(b)
             }
         });
+        // status 1: ‖Jᵀr‖_inf ≤ gtol (a NaN gradient fails this test)
         if grad_inf <= options.gtol {
-            return Ok(LeastSquaresResult {
+            return Ok(lm_result(
                 x,
-                fun: r,
+                r,
                 cost,
-                success: true,
-                message: String::from("gradient converged (||J^T r||_inf <= gtol)"),
+                1,
+                String::from("gradient converged (||J^T r||_inf <= gtol)"),
                 nfev,
                 njev,
                 nit,
                 jac,
-            });
+            ));
         }
 
         // Solve (J^T J + mu I) * step = -J^T r
@@ -238,18 +332,19 @@ where
         let x_norm = l2_norm(&x);
 
         // Check parameter convergence
+        // status 3: ‖step‖ ≤ xtol·(xtol + ‖x‖)
         if step_norm <= options.xtol * (options.xtol + x_norm) {
-            return Ok(LeastSquaresResult {
+            return Ok(lm_result(
                 x,
-                fun: r,
+                r,
                 cost,
-                success: true,
-                message: String::from("parameter change converged (xtol)"),
+                3,
+                String::from("parameter change converged (xtol)"),
                 nfev,
                 njev,
                 nit,
                 jac,
-            });
+            ));
         }
 
         // Trial step
@@ -283,23 +378,24 @@ where
                         &residuals,
                         &x,
                         &r,
-                        options.diff_step,
+                        diff_step,
                         &mut jac,
                         &mut x_perturbed,
                     );
                     nfev += n;
                     njev += 1;
-                    return Ok(LeastSquaresResult {
+                    // status 2: |Δcost|/(1+cost) ≤ ftol after an accepted step (rho > 0.25)
+                    return Ok(lm_result(
                         x,
-                        fun: r,
+                        r,
                         cost,
-                        success: true,
-                        message: String::from("cost change converged (ftol)"),
+                        2,
+                        String::from("cost change converged (ftol)"),
                         nfev,
                         njev,
                         nit,
                         jac,
-                    });
+                    ));
                 }
 
                 // Recompute Jacobian (and the derived J^T J / J^T r) — jac and r changed.
@@ -307,7 +403,7 @@ where
                     &residuals,
                     &x,
                     &r,
-                    options.diff_step,
+                    diff_step,
                     &mut jac,
                     &mut x_perturbed,
                 );
@@ -331,30 +427,241 @@ where
         }
 
         if nfev >= max_nfev {
-            return Ok(LeastSquaresResult {
+            return Ok(lm_result(
                 x,
-                fun: r,
+                r,
                 cost,
-                success: false,
-                message: format!("max function evaluations exceeded ({max_nfev})"),
+                0,
+                format!("max function evaluations exceeded ({max_nfev})"),
                 nfev,
                 njev,
                 nit,
                 jac,
-            });
+            ));
         }
     }
 
-    Ok(LeastSquaresResult {
+    Ok(lm_result(
         x,
-        fun: r,
+        r,
         cost,
-        success: false,
-        message: String::from("max iterations exceeded"),
+        0,
+        String::from("max iterations exceeded"),
         nfev,
         njev,
         nit,
         jac,
+    ))
+}
+
+/// SciPy's `approx_derivative(fun, x, method='2-point', rel_step, f0, bounds)` as
+/// `least_squares`' `VectorFunction` calls it.
+fn fd_jacobian_scipy<F>(
+    residuals: &F,
+    x: &[f64],
+    f0: &[f64],
+    lb: &[f64],
+    ub: &[f64],
+    rel_step: Option<f64>,
+) -> Vec<Vec<f64>>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let n = x.len();
+    let unbounded =
+        lb.iter().all(|v| *v == f64::NEG_INFINITY) && ub.iter().all(|v| *v == f64::INFINITY);
+    let mut columns = Vec::with_capacity(n);
+    let mut x1 = x.to_vec();
+    for i in 0..n {
+        let sign = if x[i] >= 0.0 { 1.0 } else { -1.0 };
+        let default_step = SQRT_EPS * sign * x[i].abs().max(1.0);
+        let mut h = match rel_step {
+            None => default_step,
+            Some(r) => {
+                let h = r * sign * x[i].abs();
+                if (x[i] + h) - x[i] == 0.0 {
+                    default_step
+                } else {
+                    h
+                }
+            }
+        };
+        if !unbounded {
+            let lower = x[i] - lb[i];
+            let upper = ub[i] - x[i];
+            let trial = x[i] + h;
+            let violated = trial < lb[i] || trial > ub[i];
+            let fitting = h.abs() <= lower.max(upper);
+            if violated && fitting {
+                h = -h;
+            } else if !fitting {
+                h = if upper >= lower { upper } else { -lower };
+            }
+        }
+        x1[i] = x[i] + h;
+        let dx = x1[i] - x[i];
+        let f1 = residuals(&x1);
+        x1[i] = x[i];
+        columns.push(
+            f1.iter()
+                .zip(f0)
+                .map(|(a, b)| (a - b) / dx)
+                .collect::<Vec<f64>>(),
+        );
+    }
+    (0..f0.len())
+        .map(|r| columns.iter().map(|col| col[r]).collect())
+        .collect()
+}
+
+/// `method='trf'` with optional bounds, as SciPy's `least_squares` sets it up: tolerance and
+/// bound validation, `x0` made strictly feasible, the initial residuals required finite, then
+/// [`trf::trf`].
+fn least_squares_trf<F>(
+    residuals: &F,
+    x0: &[f64],
+    bounds: Option<(&[f64], &[f64])>,
+    options: LeastSquaresOptions,
+) -> Result<LeastSquaresResult, OptError>
+where
+    F: Fn(&[f64]) -> Vec<f64>,
+{
+    let n = x0.len();
+    if n == 0 {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("x0 must have at least one element"),
+        });
+    }
+    if x0.iter().any(|v| !v.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("x0 must not contain NaN or Inf"),
+        });
+    }
+    let (lb, ub) = match bounds {
+        Some((lo, hi)) => (lo.to_vec(), hi.to_vec()),
+        None => (vec![f64::NEG_INFINITY; n], vec![f64::INFINITY; n]),
+    };
+    if lb.len() != n || ub.len() != n {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("Inconsistent shapes between bounds and `x0`."),
+        });
+    }
+    if lb
+        .iter()
+        .zip(&ub)
+        .any(|(l, u)| l.partial_cmp(u) != Some(std::cmp::Ordering::Less))
+    {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("Each lower bound must be strictly less than each upper bound."),
+        });
+    }
+    if x0
+        .iter()
+        .zip(lb.iter().zip(&ub))
+        .any(|(x, (l, u))| x < l || x > u)
+    {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("Initial guess is outside of provided bounds"),
+        });
+    }
+    for (name, tol) in [
+        ("ftol", options.ftol),
+        ("xtol", options.xtol),
+        ("gtol", options.gtol),
+    ] {
+        if tol.is_nan() || tol < 0.0 {
+            return Err(OptError::InvalidArgument {
+                detail: format!("{name} must be >= 0"),
+            });
+        }
+    }
+    if options.ftol < f64::EPSILON && options.xtol < f64::EPSILON && options.gtol < f64::EPSILON {
+        return Err(OptError::InvalidArgument {
+            detail: format!(
+                "At least one of the tolerances must be higher than machine epsilon ({:.2e}).",
+                f64::EPSILON
+            ),
+        });
+    }
+    if !(options.f_scale > 0.0 && options.f_scale.is_finite()) {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("f_scale must be positive and finite"),
+        });
+    }
+    if let Some(r) = options.diff_step
+        && !(r.is_finite() && r > 0.0)
+    {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("diff_step must be finite and > 0"),
+        });
+    }
+    let x0 = trf::make_strictly_feasible(x0, &lb, &ub, 1e-10);
+    let f0 = residuals(&x0);
+    if f0.iter().any(|v| !v.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("Residuals are not finite in the initial point."),
+        });
+    }
+    let m = f0.len();
+    let j0 = fd_jacobian_scipy(residuals, &x0, &f0, &lb, &ub, options.diff_step);
+    let loss = (options.loss != LossKind::Linear).then_some(Loss {
+        kind: options.loss,
+        f_scale: options.f_scale,
+    });
+    let x_scale = if options.x_scale_jac {
+        XScale::Jac
+    } else {
+        XScale::Fixed(vec![1.0; n])
+    };
+    let mut fun = |x: &[f64]| -> Result<Vec<f64>, OptError> {
+        let f = residuals(x);
+        if f.len() != m {
+            return Err(OptError::InvalidArgument {
+                detail: format!("residuals changed length from {m} to {}", f.len()),
+            });
+        }
+        Ok(f)
+    };
+    let mut jac = |x: &[f64], f: &[f64]| -> Result<Vec<Vec<f64>>, OptError> {
+        Ok(fd_jacobian_scipy(
+            residuals,
+            x,
+            f,
+            &lb,
+            &ub,
+            options.diff_step,
+        ))
+    };
+    let out = trf::trf(
+        &mut fun,
+        &mut jac,
+        &x0,
+        f0,
+        j0,
+        &lb,
+        &ub,
+        options.ftol,
+        options.xtol,
+        options.gtol,
+        options.max_nfev,
+        &x_scale,
+        loss.as_ref(),
+    )?;
+    Ok(LeastSquaresResult {
+        // status: SciPy's code; success = status > 0 (a gtol/ftol/xtol test passed)
+        success: out.status > 0,
+        message: termination_message(out.status).to_string(),
+        nit: out.njev.saturating_sub(1),
+        x: out.x,
+        fun: out.fun,
+        cost: out.cost,
+        nfev: out.nfev,
+        njev: out.njev,
+        jac: out.jac,
+        status: out.status,
+        optimality: out.optimality,
+        grad: out.grad,
+        active_mask: out.active_mask,
     })
 }
 
@@ -417,7 +724,13 @@ where
             .collect()
     };
 
-    let ls_result = least_squares(residuals, &p0, options.ls_options)?;
+    // SciPy's curve_fit(method=None) runs 'lm' when there are no bounds.
+    let ls_options = LeastSquaresOptions {
+        method: Some(options.ls_options.method.unwrap_or(LeastSquaresMethod::Lm)),
+        ..options.ls_options
+    };
+    let ls_result = least_squares(residuals, &p0, ls_options)?;
+    require_fit_converged(&ls_result)?;
 
     // Compute covariance: pcov = (J^T J)^{-1} * s^2
     // where s^2 = cost * 2 / (m - n) for relative sigma
@@ -436,89 +749,26 @@ where
     })
 }
 
-/// Numerically-stable `ln(1 + e^u)` (softplus); for `u` above ~30 it collapses to `u`.
-fn softplus(u: f64) -> f64 {
-    if u > 30.0 { u } else { u.exp().ln_1p() }
-}
-
-/// Inverse softplus `ln(e^y - 1)` for `y > 0`; for large `y` it collapses to `y`.
-fn softplus_inv(y: f64) -> f64 {
-    if y > 30.0 {
-        y
+/// SciPy's `curve_fit` raises `RuntimeError("Optimal parameters not found: " + res.message)`
+/// when the least-squares solve fails; returning its last iterate as `popt` hands the caller an
+/// unconverged fit with no signal short of inspecting `ls_result` (frankenscipy-szq1n.7).
+fn require_fit_converged(ls_result: &LeastSquaresResult) -> Result<(), OptError> {
+    if ls_result.success {
+        Ok(())
     } else {
-        (y.exp() - 1.0).max(f64::MIN_POSITIVE).ln()
+        Err(OptError::NotConverged {
+            detail: format!("Optimal parameters not found: {}", ls_result.message),
+        })
     }
 }
 
-/// Per-parameter smooth, monotone bijection between a box-constrained parameter
-/// `p` and an unconstrained `u ∈ ℝ`, so a bounded least-squares fit can reuse the
-/// unbounded Levenberg-Marquardt core. Two-sided bounds use the logistic map,
-/// one-sided bounds a softplus shift, and an unbounded coordinate the identity.
-/// This is the reparameterisation strategy `lmfit` uses; for an interior optimum
-/// it reaches the identical minimiser as `scipy.optimize.curve_fit(bounds=...)`.
-#[derive(Clone, Copy)]
-enum BoundKind {
-    Both(f64, f64),
-    Lower(f64),
-    Upper(f64),
-    Free,
-}
-
-impl BoundKind {
-    fn new(lo: f64, hi: f64) -> Self {
-        match (lo.is_finite(), hi.is_finite()) {
-            (true, true) => BoundKind::Both(lo, hi),
-            (true, false) => BoundKind::Lower(lo),
-            (false, true) => BoundKind::Upper(hi),
-            (false, false) => BoundKind::Free,
-        }
-    }
-
-    /// Map the unconstrained coordinate `u` to the bounded parameter `p`.
-    fn to_param(self, u: f64) -> f64 {
-        match self {
-            BoundKind::Both(lo, hi) => lo + (hi - lo) / (1.0 + (-u).exp()),
-            BoundKind::Lower(lo) => lo + softplus(u),
-            BoundKind::Upper(hi) => hi - softplus(-u),
-            BoundKind::Free => u,
-        }
-    }
-
-    /// Map the bounded parameter `p` (assumed strictly inside the box) to `u`.
-    fn to_unconstrained(self, p: f64) -> f64 {
-        match self {
-            BoundKind::Both(lo, hi) => ((p - lo) / (hi - p)).ln(),
-            BoundKind::Lower(lo) => softplus_inv(p - lo),
-            BoundKind::Upper(hi) => -softplus_inv(hi - p),
-            BoundKind::Free => p,
-        }
-    }
-
-    /// Clip `p` to lie strictly inside the box so `to_unconstrained` stays finite.
-    fn clip_inside(self, p: f64) -> f64 {
-        match self {
-            BoundKind::Both(lo, hi) => {
-                let eps = (hi - lo) * 1.0e-10;
-                p.clamp(lo + eps, hi - eps)
-            }
-            BoundKind::Lower(lo) => p.max(lo + 1.0e-10 * (1.0 + lo.abs())),
-            BoundKind::Upper(hi) => p.min(hi - 1.0e-10 * (1.0 + hi.abs())),
-            BoundKind::Free => p,
-        }
-    }
-}
-
-/// Box-constrained nonlinear least squares: minimise `0.5·‖residuals(p)‖²` subject
-/// to `lower ≤ p ≤ upper`, the bounded analogue of [`least_squares`].
+/// Box-constrained nonlinear least squares, `scipy.optimize.least_squares(fun, x0,
+/// bounds=(lower, upper))`: SciPy's Trust Region Reflective method, so a bound that is active
+/// at the solution is reached exactly and reported in `active_mask` (`±inf` = no bound).
+/// `method = Lm` is refused, as SciPy refuses it ("Method 'lm' doesn't support bounds").
 ///
-/// Mirrors `scipy.optimize.least_squares(..., bounds=(lower, upper))`. Each bounded
-/// coordinate is smoothly reparameterised to an unconstrained variable (logistic for
-/// two-sided bounds, softplus for one-sided, identity for `±inf`), and the existing
-/// Levenberg-Marquardt core solves the unconstrained problem — so the bounded solve is
-/// as fast as the unbounded one. For an interior optimum the minimiser is identical to
-/// SciPy's `trf`; when a bound is active the transform approaches it asymptotically.
-/// The returned `x`, `fun`, and `jac` are recomputed in parameter space at the optimum
-/// (so a downstream covariance is in `p`-space, not the internal `u`-space).
+/// This used to reparameterise each bounded coordinate (logistic / softplus) and run LM,
+/// which only approached an active bound asymptotically (frankenscipy-1ksfv.6).
 pub fn least_squares_bounded<F>(
     residuals: F,
     x0: &[f64],
@@ -539,52 +789,25 @@ where
             ),
         });
     }
-    let mut kinds = Vec::with_capacity(n);
-    let mut u0 = Vec::with_capacity(n);
-    for i in 0..n {
-        if lower[i].partial_cmp(&upper[i]) != Some(std::cmp::Ordering::Less) {
-            return Err(OptError::InvalidArgument {
-                detail: format!("require lower[{i}] < upper[{i}]"),
-            });
-        }
-        let kind = BoundKind::new(lower[i], upper[i]);
-        u0.push(kind.to_unconstrained(kind.clip_inside(x0[i])));
-        kinds.push(kind);
+    if options.method == Some(LeastSquaresMethod::Lm)
+        && (lower.iter().any(|v| *v != f64::NEG_INFINITY)
+            || upper.iter().any(|v| *v != f64::INFINITY))
+    {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("Method 'lm' doesn't support bounds."),
+        });
     }
-
-    let to_p = |u: &[f64]| -> Vec<f64> { (0..n).map(|i| kinds[i].to_param(u[i])).collect() };
-    let res_u = |u: &[f64]| -> Vec<f64> { residuals(&to_p(u)) };
-
-    let mut ls = least_squares(res_u, &u0, options)?;
-
-    // The LM ran in `u`-space; map the optimum back and recompute the residual and a
-    // finite-difference Jacobian in `p`-space so `x`/`fun`/`jac` (hence any covariance)
-    // are expressed in the original parameters.
-    let popt = to_p(&ls.x);
-    let r_p = residuals(&popt);
-    let mut jac_p = Vec::new();
-    let mut scratch = popt.clone();
-    finite_diff_jacobian_parallel_into(
-        &residuals,
-        &popt,
-        &r_p,
-        options.diff_step,
-        &mut jac_p,
-        &mut scratch,
-    );
-    ls.cost = 0.5 * dot_vec(&r_p, &r_p);
-    ls.x = popt;
-    ls.fun = r_p;
-    ls.jac = jac_p;
-    Ok(ls)
+    if options.method == Some(LeastSquaresMethod::Lm) {
+        return least_squares_lm(residuals, x0, options);
+    }
+    least_squares_trf(&residuals, x0, Some((lower, upper)), options)
 }
 
 /// Box-constrained curve fitting: the bounded analogue of [`curve_fit`], matching
 /// `scipy.optimize.curve_fit(f, xdata, ydata, p0=..., bounds=(lower, upper))`.
 ///
-/// Reuses [`least_squares_bounded`] (smooth reparameterisation + the fast LM core), so a
-/// bounded fit runs at unbounded-fit speed — dramatically faster than SciPy's `trf` path
-/// for the common case of sanity bounds with an interior optimum.
+/// Runs [`least_squares_bounded`], i.e. SciPy's `trf`, as `curve_fit` does whenever bounds
+/// are given.
 pub fn curve_fit_bounded<F>(
     f: F,
     xdata: &[f64],
@@ -632,6 +855,7 @@ where
     };
 
     let ls_result = least_squares_bounded(residuals, &p0, lower, upper, options.ls_options)?;
+    require_fit_converged(&ls_result)?;
 
     let pcov = compute_covariance(
         &ls_result.jac,
@@ -870,7 +1094,15 @@ pub fn leastsq<F>(
 where
     F: Fn(&[f64]) -> Vec<f64> + Sync,
 {
-    let ls = least_squares(func, x0, options)?;
+    // leastsq is SciPy's MINPACK (Levenberg–Marquardt) interface.
+    let ls = least_squares(
+        func,
+        x0,
+        LeastSquaresOptions {
+            method: Some(LeastSquaresMethod::Lm),
+            ..options
+        },
+    )?;
     let n = x0.len();
     let m = ls.fun.len();
 
@@ -1401,12 +1633,21 @@ mod tests {
         assert!(matches!(err, OptError::InvalidArgument { .. }));
     }
 
+    // SciPy: method='lm' refuses m < n; the default 'trf' accepts it (a constant residual has
+    // zero gradient: status 1, x unchanged).
     #[test]
-    fn least_squares_rejects_underdetermined() {
+    fn least_squares_lm_rejects_underdetermined_and_trf_accepts_it() {
         let residuals = |_: &[f64]| -> Vec<f64> { vec![1.0] };
-        let err = least_squares(residuals, &[1.0, 2.0, 3.0], LeastSquaresOptions::default())
-            .expect_err("should reject underdetermined");
+        let lm = LeastSquaresOptions {
+            method: Some(LeastSquaresMethod::Lm),
+            ..LeastSquaresOptions::default()
+        };
+        let err = least_squares(residuals, &[1.0, 2.0, 3.0], lm)
+            .expect_err("lm should reject underdetermined");
         assert!(matches!(err, OptError::InvalidArgument { .. }));
+        let trf = least_squares(residuals, &[1.0, 2.0, 3.0], LeastSquaresOptions::default())
+            .expect("trf accepts m < n");
+        assert_eq!((trf.status, trf.x.clone()), (1, vec![1.0, 2.0, 3.0]));
     }
 
     #[test]
@@ -1439,6 +1680,35 @@ mod tests {
             "c ~ 1.0, got {}",
             result.popt[2]
         );
+    }
+
+    // frankenscipy-szq1n.7: a least-squares solve that stops on its evaluation budget used to be
+    // returned as Ok(popt). SciPy raises "Optimal parameters not found".
+    #[test]
+    fn curve_fit_refuses_an_unconverged_fit_like_scipy() {
+        let xdata: Vec<f64> = (0..20).map(|i| f64::from(i) * 0.25).collect();
+        let ydata: Vec<f64> = xdata.iter().map(|&x| 3.0 * (-1.3 * x).exp()).collect();
+        let model = |x: f64, p: &[f64]| p[0] * (-p[1] * x).exp();
+        let starved = CurveFitOptions {
+            p0: Some(vec![1.0, 0.1]),
+            ls_options: LeastSquaresOptions {
+                max_nfev: Some(2),
+                ..LeastSquaresOptions::default()
+            },
+            ..CurveFitOptions::default()
+        };
+        let err = curve_fit(model, &xdata, &ydata, starved).expect_err("2 evaluations cannot fit");
+        println!("curve_fit starved: {err}");
+        assert!(
+            matches!(&err, OptError::NotConverged { detail } if detail.starts_with("Optimal parameters not found")),
+            "{err:?}"
+        );
+        let fine = CurveFitOptions {
+            p0: Some(vec![1.0, 0.1]),
+            ..CurveFitOptions::default()
+        };
+        let fit = curve_fit(model, &xdata, &ydata, fine).expect("converges");
+        assert!((fit.popt[0] - 3.0).abs() < 1e-6 && (fit.popt[1] - 1.3).abs() < 1e-6);
     }
 
     #[test]
@@ -1474,8 +1744,9 @@ mod tests {
         // pcov is finite and symmetric (recomputed in parameter space).
         assert!(r.pcov.iter().flatten().all(|v| v.is_finite()));
 
-        // (2) Active bound: cap the amplitude below the truth -> the fit pins it at the
-        //     bound (the transform approaches it from below) and stays feasible.
+        // (2) Active bound: cap the amplitude below the truth -> TRF pins it ON the bound and
+        //     reports it active, as SciPy's trf does (the old logistic reparameterisation only
+        //     approached it asymptotically).
         let upper2 = [2.0, 5.0, 5.0];
         let opts2 = CurveFitOptions {
             p0: Some(vec![1.0, 1.0, 0.0]),
@@ -1483,10 +1754,84 @@ mod tests {
         };
         let r2 =
             curve_fit_bounded(model, &xdata, &ydata, &lower, &upper2, opts2).expect("converges");
+        // SciPy 1.17.1 curve_fit(bounds=...) stops at 1.999999997496993 (ftol), active_mask
+        // [1, 0, 0]; the port takes the same path.
         assert!(
-            r2.popt[0] <= upper2[0] + 1.0e-9 && r2.popt[0] > 1.5,
-            "active-bound popt[0] = {} (want just below 2.0)",
+            (r2.popt[0] - 1.999_999_997_496_993).abs() < 1.0e-12,
+            "active-bound popt[0] = {} (SciPy 1.999999997496993)",
             r2.popt[0]
+        );
+        assert_eq!(r2.ls_result.active_mask, vec![1, 0, 0]);
+    }
+
+    // frankenscipy-1ksfv.6: least_squares defaults to SciPy's trf. SciPy 1.17.1 on
+    // p0·e^(−p1·t) − y, t = linspace(0, 4, 40), y = 2e^(−0.3t) with y[5] += 3, y[20] −= 2.5,
+    // x0 = [1, 1]: bounds ([0, 0.5], [10, 5]) -> x = [2.56323078, 0.5], active_mask [0, −1],
+    // status 4, 10 function evaluations; loss soft_l1 with f_scale 0.1 -> [2.01080623,
+    // 0.30341512], status 2, 11 evaluations. The port takes SciPy's path (same nfev).
+    #[test]
+    fn least_squares_trf_matches_scipy_with_bounds_and_robust_loss() {
+        let t: Vec<f64> = (0..40).map(|i| 4.0 * f64::from(i) / 39.0).collect();
+        let mut y: Vec<f64> = t.iter().map(|ti| 2.0 * (-0.3 * ti).exp()).collect();
+        y[5] += 3.0;
+        y[20] -= 2.5;
+        let residuals = |p: &[f64]| -> Vec<f64> {
+            t.iter()
+                .zip(&y)
+                .map(|(ti, yi)| p[0] * (-p[1] * ti).exp() - yi)
+                .collect()
+        };
+        let bounded = least_squares_bounded(
+            residuals,
+            &[1.0, 1.0],
+            &[0.0, 0.5],
+            &[10.0, 5.0],
+            LeastSquaresOptions::default(),
+        )
+        .expect("trf");
+        assert!(bounded.success, "{}", bounded.message);
+        assert!(
+            (bounded.x[0] - 2.563_230_78).abs() < 1e-7,
+            "{:?}",
+            bounded.x
+        );
+        assert!((bounded.x[1] - 0.5).abs() < 1e-12, "{:?}", bounded.x);
+        assert_eq!(bounded.active_mask, vec![0, -1]);
+        assert_eq!((bounded.status, bounded.nfev), (4, 10));
+
+        let robust = least_squares(
+            residuals,
+            &[1.0, 1.0],
+            LeastSquaresOptions {
+                loss: LossKind::SoftL1,
+                f_scale: 0.1,
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect("trf soft_l1");
+        assert!((robust.x[0] - 2.010_806_23).abs() < 1e-7, "{:?}", robust.x);
+        assert!((robust.x[1] - 0.303_415_12).abs() < 1e-7, "{:?}", robust.x);
+        assert_eq!((robust.status, robust.nfev), (2, 11));
+
+        // A plain linear fit with the outliers is pulled far from 2e^(−0.3t); the robust loss
+        // is what recovers it.
+        let plain = least_squares(residuals, &[1.0, 1.0], LeastSquaresOptions::default())
+            .expect("trf linear");
+        assert!((plain.x[1] - 0.3).abs() > 3.0 * (robust.x[1] - 0.3).abs());
+
+        let lm_refused = least_squares_bounded(
+            residuals,
+            &[1.0, 1.0],
+            &[0.0, 0.5],
+            &[10.0, 5.0],
+            LeastSquaresOptions {
+                method: Some(LeastSquaresMethod::Lm),
+                ..LeastSquaresOptions::default()
+            },
+        )
+        .expect_err("lm has no bounds");
+        assert!(
+            matches!(lm_refused, OptError::InvalidArgument { detail } if detail.contains("'lm'"))
         );
     }
 
@@ -1704,7 +2049,7 @@ mod tests {
             residuals,
             &[0.0],
             LeastSquaresOptions {
-                diff_step: 0.0,
+                diff_step: Some(0.0),
                 ..LeastSquaresOptions::default()
             },
         )

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_opt::{LeastSquaresOptions, least_squares};
+use fsci_opt::{LeastSquaresMethod, LeastSquaresOptions, least_squares};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -361,7 +361,12 @@ fn diff_opt_least_squares() {
 
         let case_clone = case.clone();
         let f = move |params: &[f64]| residuals_for(&case_clone, params);
-        let result = match least_squares(f, &case.x0, LeastSquaresOptions::default()) {
+        // The oracle runs method='lm'; least_squares' default is SciPy's 'trf'.
+        let lm = LeastSquaresOptions {
+            method: Some(LeastSquaresMethod::Lm),
+            ..LeastSquaresOptions::default()
+        };
+        let result = match least_squares(f, &case.x0, lm) {
             Ok(r) => r,
             Err(e) => {
                 diffs.push(CaseDiff {

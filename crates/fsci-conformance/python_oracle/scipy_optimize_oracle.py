@@ -453,7 +453,7 @@ def _run_case(case: Dict[str, Any], optimize: Any, np: Any) -> Dict[str, Any]:
                 "TrustKrylov": "trust-krylov",
                 "TrustConstr": "trust-constr",
                 "TrustExact": "trust-exact",
-                "DogLeg": "dogleg",
+                "Dogleg": "dogleg",
             }
             method = method_map.get(case.get("method"), case.get("method"))
 

@@ -1169,6 +1169,7 @@ where
                 && max_norm(&dx) <= options.x_tol
                 && max_norm(&dx) / options.x_rtol <= max_norm(&x))
         {
+            // status: ‖F‖=0, or ‖F‖ ≤ f_tol, f_rtol and ‖dx‖ ≤ x_tol, x_rtol (all four)
             success = true;
             break;
         }

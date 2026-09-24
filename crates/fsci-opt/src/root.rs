@@ -51,7 +51,9 @@ const fn scipy_root_flag(status: ConvergenceStatus) -> &'static str {
         ConvergenceStatus::MaxIterations
         | ConvergenceStatus::MaxEvaluations
         | ConvergenceStatus::PrecisionLoss
-        | ConvergenceStatus::CallbackStop => "convergence error",
+        | ConvergenceStatus::CallbackStop
+        | ConvergenceStatus::Infeasible
+        | ConvergenceStatus::LinAlgError => "convergence error",
         ConvergenceStatus::NanEncountered
         | ConvergenceStatus::OutOfBounds
         | ConvergenceStatus::NotImplemented
@@ -810,7 +812,10 @@ where
     let mut fa = eval.evaluate(a)?;
     let mut fb = eval.evaluate(b)?;
 
-    if fa * fb > 0.0 {
+    // SciPy: `np.sign(fa) * np.sign(fb) > 0`. The product of the VALUES underflows: with
+    // f = 1e-170*(1+x^2) on (-1, 1), fa*fb == 0.0 and a bracket with no sign change was accepted
+    // and "converged" (frankenscipy-szq1n.7). Exact zeros are handled just below.
+    if fa != 0.0 && fb != 0.0 && same_sign(fa, fb) {
         return Err(OptError::SignChangeRequired {
             detail: format!("f(a)={fa} and f(b)={fb} must have opposite signs"),
         });
@@ -1007,7 +1012,10 @@ where
     for iter in 0..options.maxiter {
         nfev += 1;
         let fx = f(x);
-        if fx.abs() < options.xtol {
+        // Only an EXACT zero short-circuits, as in SciPy's newton (`if fval == 0`). `|f| < xtol`
+        // compared a function value with an x-tolerance: f = 1e-13*(x-3) "converged" at x0 = 0
+        // (frankenscipy-szq1n.7). Everything else is decided by the step test below.
+        if fx == 0.0 {
             return Ok(RootResult::terminal(
                 RootMethod::Newton,
                 x,
@@ -1092,7 +1100,8 @@ where
     let mut fcurr = f(xcurr);
 
     for iter in 0..options.maxiter {
-        if fcurr.abs() < options.xtol {
+        // Exact zero only; see newton_scalar (frankenscipy-szq1n.7).
+        if fcurr == 0.0 {
             return Ok(RootResult::terminal(
                 RootMethod::Secant,
                 xcurr,
@@ -1177,7 +1186,8 @@ where
     for iter in 0..options.maxiter {
         nfev += 1;
         let fx = f(x);
-        if fx.abs() < options.xtol {
+        // Exact zero only; see newton_scalar (frankenscipy-szq1n.7).
+        if fx == 0.0 {
             return Ok(RootResult::terminal(
                 RootMethod::Halley,
                 x,
@@ -1204,37 +1214,39 @@ where
             ));
         }
 
-        let denom = 2.0 * dfx * dfx - fx * d2fx;
-        if denom.abs() < 1e-30 {
-            // Halley denominator degenerate; fall back to Newton step
-            let step = fx / dfx;
-            x -= step;
-            if step.abs() < options.xtol + options.rtol * x.abs() {
-                return Ok(RootResult::terminal(
-                    RootMethod::Halley,
-                    x,
-                    true,
-                    ConvergenceStatus::Success,
-                    iter + 1,
-                    nfev,
-                    "converged (Newton fallback)",
-                ));
-            }
-        } else {
-            let x_new = x - 2.0 * fx * dfx / denom;
-            if (x_new - x).abs() < options.xtol + options.rtol * x.abs() {
-                return Ok(RootResult::terminal(
-                    RootMethod::Halley,
-                    x_new,
-                    true,
-                    ConvergenceStatus::Success,
-                    iter + 1,
-                    nfev,
-                    "converged",
-                ));
-            }
-            x = x_new;
+        // SciPy's Halley update: the Newton step corrected by adj = step*f''/(2 f'), applied
+        // only while |adj| < 1 (otherwise a plain Newton step). The closed form
+        // 2 f f' / (2 f'^2 - f f'') it replaces overflowed to a ZERO step once f'^2 did, and a
+        // zero step then passed the convergence test (frankenscipy-szq1n.7).
+        let mut step = fx / dfx;
+        let adj = step * d2fx / dfx / 2.0;
+        if adj.abs() < 1.0 {
+            step /= 1.0 - adj;
         }
+        let x_new = x - step;
+        if !x_new.is_finite() {
+            return Ok(RootResult::terminal(
+                RootMethod::Halley,
+                x,
+                false,
+                ConvergenceStatus::NanEncountered,
+                iter,
+                nfev,
+                "halley produced a non-finite iterate",
+            ));
+        }
+        if (x_new - x).abs() < options.xtol + options.rtol * x.abs() {
+            return Ok(RootResult::terminal(
+                RootMethod::Halley,
+                x_new,
+                true,
+                ConvergenceStatus::Success,
+                iter + 1,
+                nfev,
+                "converged",
+            ));
+        }
+        x = x_new;
     }
 
     Ok(RootResult::terminal(
@@ -1684,6 +1696,7 @@ where
             return Ok(MultivariateRootResult {
                 x,
                 fun: fx,
+                // status: ‖F(x)‖₂ < tol
                 converged: true,
                 message: "fsolve converged".to_string(),
                 iterations: iteration,
@@ -2064,6 +2077,7 @@ where
             return Ok(MultivariateRootResult {
                 x,
                 fun: fx,
+                // status: ‖F(x)‖₂ < tol
                 converged: true,
                 message: "broyden1 converged".to_string(),
                 iterations: iteration,
@@ -2188,6 +2202,7 @@ where
             return Ok(MultivariateRootResult {
                 x,
                 fun: fx,
+                // status: ‖F(x)‖₂ < tol
                 converged: true,
                 message: "broyden2 converged".to_string(),
                 iterations: iteration,
@@ -2317,6 +2332,7 @@ where
             return Ok(MultivariateRootResult {
                 x,
                 fun: fx,
+                // status: ‖f(x)‖₂ < tol
                 converged: true,
                 message: "anderson converged".to_string(),
                 iterations: iteration,
@@ -2537,6 +2553,7 @@ where
             return Ok(MultivariateRootResult {
                 x,
                 fun: fx,
+                // status: ‖F(x)‖₂ < f_tol
                 converged: true,
                 message: "newton_krylov converged".to_string(),
                 iterations: iteration,
@@ -2640,6 +2657,7 @@ where
             return Ok(MultivariateRootResult {
                 x: x_k,
                 fun: f_k_res,
+                // status: ‖F(x_k)‖ < ftol·‖F(x₀)‖ + fatol
                 converged: true,
                 message: "df_sane converged".to_string(),
                 iterations: k,
@@ -2760,6 +2778,7 @@ where
             return Ok(MultivariateRootResult {
                 x,
                 fun: fx,
+                // status: ‖F(x)‖₂ < tol
                 converged: true,
                 message: "lm converged".to_string(),
                 iterations: iteration,
@@ -4639,6 +4658,60 @@ mod tests {
             "root = {}",
             result.root
         );
+    }
+
+    // frankenscipy-szq1n.7: `|f(x)| < xtol` compared a FUNCTION value with an x-tolerance, so a
+    // small-scale function "converged" wherever it started. f = 1e-13*(x-3): |f(0)| = 3e-13 is
+    // below the default xtol 2e-12, and all three kernels returned root 0.
+    #[test]
+    fn scalar_root_kernels_do_not_mistake_a_small_function_value_for_a_root() {
+        let f = |x: f64| 1e-13 * (x - 3.0);
+        let df = |_: f64| 1e-13;
+        let d2f = |_: f64| 0.0;
+        let opts = RootOptions::default();
+        for (name, r) in [
+            ("newton", newton_scalar(f, df, 0.0, opts).expect("newton")),
+            ("secant", secant(f, 0.0, None, opts).expect("secant")),
+            ("halley", halley(f, df, d2f, 0.0, opts).expect("halley")),
+        ] {
+            println!("{name}: root={} converged={}", r.root, r.converged);
+            assert!(r.converged, "{name}: {}", r.message);
+            assert!((r.root - 3.0).abs() < 1e-9, "{name} stopped at {}", r.root);
+        }
+        // Exact zero still short-circuits.
+        let at_root = newton_scalar(f, df, 3.0, opts).expect("newton");
+        assert_eq!(at_root.root, 3.0);
+        assert_eq!(at_root.iterations, 0);
+    }
+
+    // frankenscipy-szq1n.7: Halley's closed form 2ff'/(2f'^2 - ff'') overflowed its denominator
+    // to inf while the numerator stayed finite, giving a ZERO step that passed the step test:
+    // f = 1e155*(x-5) from 5.00001 "converged" at 5.00001.
+    #[test]
+    fn halley_survives_an_overflowing_derivative_square() {
+        let f = |x: f64| 1e155 * (x - 5.0);
+        let df = |_: f64| 1e155;
+        let d2f = |_: f64| 0.0;
+        let r = halley(f, df, d2f, 5.00001, RootOptions::default()).expect("halley");
+        println!("halley big f': root={} converged={}", r.root, r.converged);
+        assert!(r.converged, "{}", r.message);
+        assert!((r.root - 5.0).abs() < 1e-12, "stopped at {}", r.root);
+    }
+
+    // frankenscipy-szq1n.7: `fa*fb > 0` underflows to 0 for tiny values, so a bracket with NO
+    // sign change was accepted. SciPy tests np.sign(fa)*np.sign(fb).
+    #[test]
+    fn toms748_rejects_a_same_sign_bracket_even_when_the_product_underflows() {
+        let tiny_positive = |x: f64| 1e-170 * (1.0 + x * x);
+        let err = toms748(tiny_positive, (-1.0, 1.0), RootOptions::default())
+            .expect_err("no sign change");
+        assert!(
+            matches!(err, crate::OptError::SignChangeRequired { .. }),
+            "{err:?}"
+        );
+        let small_crossing = |x: f64| 1e-100 * x;
+        let r = toms748(small_crossing, (-1.0, 2.0), RootOptions::default()).expect("brackets 0");
+        assert!(r.converged && r.root.abs() < 1e-9, "root={}", r.root);
     }
 
     #[test]

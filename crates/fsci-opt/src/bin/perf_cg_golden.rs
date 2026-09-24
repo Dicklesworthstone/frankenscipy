@@ -24,7 +24,7 @@ fn nonconvex_saddle(x: &[f64]) -> f64 {
     x[0] * x[0] - x[1] * x[1] + 0.1 * x[1].powi(4)
 }
 
-fn options(maxiter: usize, maxfev: usize, tol: f64) -> MinimizeOptions {
+fn options(maxiter: usize, maxfev: usize, tol: f64) -> MinimizeOptions<'static> {
     MinimizeOptions {
         method: Some(OptimizeMethod::ConjugateGradient),
         tol: Some(tol),

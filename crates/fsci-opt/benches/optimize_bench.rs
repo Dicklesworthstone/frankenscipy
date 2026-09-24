@@ -56,7 +56,7 @@ fn sin_root(x: f64) -> f64 {
     x.sin()
 }
 
-fn opts(method: OptimizeMethod) -> MinimizeOptions {
+fn opts(method: OptimizeMethod) -> MinimizeOptions<'static> {
     MinimizeOptions {
         method: Some(method),
         mode: RuntimeMode::Strict,
@@ -464,7 +464,7 @@ fn report_bench_elf_sha256() -> Result<(), String> {
         .map_err(|error| format!("failed to hash benchmark executable: {error}"))
 }
 
-fn lbfgsb_opts() -> MinimizeOptions {
+fn lbfgsb_opts() -> MinimizeOptions<'static> {
     MinimizeOptions {
         method: Some(OptimizeMethod::LBfgsB),
         mode: RuntimeMode::Strict,

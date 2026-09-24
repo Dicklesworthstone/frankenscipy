@@ -467,7 +467,7 @@ for line in sys.stdin:
         format!("{:x}", digest.finalize())
     }
 
-    fn options() -> MinimizeOptions {
+    fn options() -> MinimizeOptions<'static> {
         MinimizeOptions {
             method: Some(OptimizeMethod::Bfgs),
             tol: Some(1.0e-8),

@@ -227,7 +227,7 @@ fn rosenbrock_nd(x: &[f64]) -> f64 {
     acc
 }
 
-fn options() -> MinimizeOptions {
+fn options() -> MinimizeOptions<'static> {
     MinimizeOptions {
         method: Some(OptimizeMethod::ConjugateGradient),
         mode: RuntimeMode::Strict,
@@ -853,6 +853,7 @@ fn result_from_error(
         }
         OptError::SignChangeRequired { detail } => (ConvergenceStatus::InvalidInput, detail),
         OptError::NotImplemented { detail } => (ConvergenceStatus::NotImplemented, detail),
+        OptError::NotConverged { detail } => (ConvergenceStatus::MaxIterations, detail),
     };
     OptimizeResult {
         x: clone_vec(x, profile),

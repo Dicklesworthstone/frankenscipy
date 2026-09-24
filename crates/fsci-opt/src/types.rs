@@ -15,6 +15,10 @@ pub enum OptimizeMethod {
     LBfgsB,
     NewtonCg,
     TrustExact,
+    /// SciPy `trust-ncg`: Newton conjugate-gradient trust region (Steihaug–Toint).
+    TrustNcg,
+    /// SciPy `dogleg`: Powell's dogleg trust region; needs a positive-definite Hessian.
+    Dogleg,
     Tnc,
     Slsqp,
     TrustConstr,
@@ -43,6 +47,12 @@ pub enum ConvergenceStatus {
     CallbackStop,
     NotImplemented,
     InvalidInput,
+    /// Stopped at a point that violates the constraints beyond tolerance (SciPy:
+    /// "Did not converge to a solution satisfying the constraints").
+    Infeasible,
+    /// A factorization the method depends on failed (SciPy trust-region status 3: "A linalg
+    /// error occurred, such as a non-psd Hessian").
+    LinAlgError,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -100,6 +110,8 @@ impl OptimizeResult {
 }
 
 pub type HesspFunc = fn(&[f64], &[f64]) -> Vec<f64>;
+/// SciPy `hess=`: the dense Hessian at `x`, as `n` rows of length `n`.
+pub type HessFunc = fn(&[f64]) -> Vec<Vec<f64>>;
 
 /// Bound constraint: (lower, upper) for one optimization variable.
 ///
@@ -107,7 +119,7 @@ pub type HesspFunc = fn(&[f64], &[f64]) -> Vec<f64>;
 pub type Bound = (Option<f64>, Option<f64>);
 
 #[derive(Debug, Clone, Copy)]
-pub struct MinimizeOptions {
+pub struct MinimizeOptions<'a> {
     pub method: Option<OptimizeMethod>,
     pub tol: Option<f64>,
     pub maxiter: Option<usize>,
@@ -115,16 +127,22 @@ pub struct MinimizeOptions {
     pub gradient_eps: f64,
     pub callback: Option<MinimizeCallback>,
     pub gradient: Option<GradientFunc>,
+    /// SciPy `hess=`: used by trust-exact, dogleg, trust-ncg and Newton-CG.
+    pub hess: Option<HessFunc>,
+    /// SciPy `hessp=`: used by trust-ncg and Newton-CG.
     pub hessp: Option<HesspFunc>,
-    pub bounds: Option<&'static [Bound]>,
-    pub has_general_constraints: bool,
+    pub bounds: Option<&'a [Bound]>,
+    /// SciPy `constraints=`: equality and inequality constraints. With `method: None` their
+    /// presence routes to SLSQP, as `scipy.optimize.minimize` does; a method that cannot
+    /// honour them refuses them.
+    pub constraints: &'a [Constraint<'a>],
     pub gradient_available: bool,
     pub fixture_id: Option<&'static str>,
     pub seed: Option<u64>,
     pub mode: RuntimeMode,
 }
 
-impl Default for MinimizeOptions {
+impl Default for MinimizeOptions<'_> {
     fn default() -> Self {
         Self {
             method: None,
@@ -134,9 +152,10 @@ impl Default for MinimizeOptions {
             gradient_eps: 1.0e-8,
             callback: None,
             gradient: None,
+            hess: None,
             hessp: None,
             bounds: None,
-            has_general_constraints: false,
+            constraints: &[],
             gradient_available: true,
             fixture_id: None,
             seed: None,
@@ -172,12 +191,29 @@ impl Default for RootOptions {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OptError {
-    InvalidArgument { detail: String },
-    InvalidBounds { detail: String },
-    SignChangeRequired { detail: String },
-    NonFiniteInput { detail: String },
-    EvaluationBudgetExceeded { detail: String },
-    NotImplemented { detail: String },
+    InvalidArgument {
+        detail: String,
+    },
+    InvalidBounds {
+        detail: String,
+    },
+    SignChangeRequired {
+        detail: String,
+    },
+    NonFiniteInput {
+        detail: String,
+    },
+    EvaluationBudgetExceeded {
+        detail: String,
+    },
+    NotImplemented {
+        detail: String,
+    },
+    /// The solver stopped without meeting its convergence criterion, where SciPy raises rather
+    /// than return a result (e.g. `curve_fit`'s "Optimal parameters not found").
+    NotConverged {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for OptError {
@@ -189,6 +225,7 @@ impl std::fmt::Display for OptError {
             Self::NonFiniteInput { detail } => write!(f, "{detail}"),
             Self::EvaluationBudgetExceeded { detail } => write!(f, "{detail}"),
             Self::NotImplemented { detail } => write!(f, "{detail}"),
+            Self::NotConverged { detail } => write!(f, "{detail}"),
         }
     }
 }
@@ -430,6 +467,160 @@ impl std::fmt::Debug for NonlinearConstraint {
             .field("lb", &self.lb)
             .field("ub", &self.ub)
             .field("fun", &"<function>")
+            .finish()
+    }
+}
+
+/// The `type` key of a SciPy constraint dict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintType {
+    /// `fun(x) == 0` componentwise.
+    Eq,
+    /// `fun(x) >= 0` componentwise.
+    Ineq,
+}
+
+/// Vector-valued constraint function.
+pub type ConstraintFn<'a> = Box<dyn Fn(&[f64]) -> Vec<f64> + Send + Sync + 'a>;
+/// Constraint Jacobian: one row per constraint component, one column per variable.
+pub type ConstraintJacFn<'a> = Box<dyn Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync + 'a>;
+
+/// A SciPy constraint dict `{'type': 'eq' | 'ineq', 'fun': fun, 'jac': jac}`, as `minimize`
+/// takes through [`MinimizeOptions::constraints`]. Without `jac`, SLSQP differentiates `fun`
+/// by forward differences with the step `gradient_eps`, as SciPy does with `eps`.
+///
+/// `LinearConstraint` and `NonlinearConstraint` convert with [`Constraint::from_linear`] and
+/// [`Constraint::from_nonlinear`], exactly as SciPy's `new_constraint_to_old` does for SLSQP.
+pub struct Constraint<'a> {
+    pub kind: ConstraintType,
+    pub fun: ConstraintFn<'a>,
+    pub jac: Option<ConstraintJacFn<'a>>,
+}
+
+impl<'a> Constraint<'a> {
+    /// `fun(x) == 0`.
+    pub fn eq(fun: impl Fn(&[f64]) -> Vec<f64> + Send + Sync + 'a) -> Self {
+        Self {
+            kind: ConstraintType::Eq,
+            fun: Box::new(fun),
+            jac: None,
+        }
+    }
+
+    /// `fun(x) >= 0`.
+    pub fn ineq(fun: impl Fn(&[f64]) -> Vec<f64> + Send + Sync + 'a) -> Self {
+        Self {
+            kind: ConstraintType::Ineq,
+            fun: Box::new(fun),
+            jac: None,
+        }
+    }
+
+    /// Attach the Jacobian of `fun` (one row per component).
+    #[must_use]
+    pub fn with_jac(mut self, jac: impl Fn(&[f64]) -> Vec<Vec<f64>> + Send + Sync + 'a) -> Self {
+        self.jac = Some(Box::new(jac));
+        self
+    }
+
+    /// SciPy `new_constraint_to_old` for `LinearConstraint(A, lb, ub)`: the rows with
+    /// `lb == ub` become one equality constraint `A_eq·x − lb_eq`, the finite sides of the rest
+    /// one inequality constraint `[A_lo·x − lb_lo, ub_hi − A_hi·x]`, both with the exact
+    /// Jacobian.
+    #[must_use]
+    pub fn from_linear(con: &'a LinearConstraint) -> Vec<Self> {
+        let rows = |x: &[f64]| -> Vec<f64> {
+            con.a
+                .iter()
+                .map(|row| row.iter().zip(x).map(|(a, xi)| a * xi).sum())
+                .collect()
+        };
+        let jac = |_: &[f64]| con.a.clone();
+        split_constraint(&con.lb, &con.ub, rows, Some(jac))
+    }
+
+    /// SciPy `new_constraint_to_old` for `NonlinearConstraint(fun, lb, ub)` (finite-difference
+    /// Jacobian, as SciPy uses when `jac` is not callable).
+    #[must_use]
+    pub fn from_nonlinear(con: &'a NonlinearConstraint) -> Vec<Self> {
+        let fun = con.fun;
+        split_constraint(&con.lb, &con.ub, fun, None::<fn(&[f64]) -> Vec<Vec<f64>>>)
+    }
+}
+
+/// Split `lb <= fun(x) <= ub` into SciPy's old-style equality and inequality constraints.
+fn split_constraint<'a, F, J>(lb: &[f64], ub: &[f64], fun: F, jac: Option<J>) -> Vec<Constraint<'a>>
+where
+    F: Fn(&[f64]) -> Vec<f64> + Clone + Send + Sync + 'a,
+    J: Fn(&[f64]) -> Vec<Vec<f64>> + Clone + Send + Sync + 'a,
+{
+    let is_eq: Vec<bool> = lb.iter().zip(ub).map(|(l, u)| l == u).collect();
+    let below: Vec<usize> = (0..lb.len())
+        .filter(|&i| !is_eq[i] && lb[i] != f64::NEG_INFINITY)
+        .collect();
+    let above: Vec<usize> = (0..ub.len())
+        .filter(|&i| !is_eq[i] && ub[i] != f64::INFINITY)
+        .collect();
+    let eq_rows: Vec<usize> = (0..lb.len()).filter(|&i| is_eq[i]).collect();
+    let mut out = Vec::new();
+    if !eq_rows.is_empty() {
+        let (rows, lo, f) = (eq_rows.clone(), lb.to_vec(), fun.clone());
+        let mut c = Constraint {
+            kind: ConstraintType::Eq,
+            fun: Box::new(move |x: &[f64]| {
+                let y = f(x);
+                rows.iter().map(|&i| y[i] - lo[i]).collect()
+            }),
+            jac: None,
+        };
+        if let Some(j) = jac.clone() {
+            let rows = eq_rows;
+            c.jac = Some(Box::new(move |x: &[f64]| {
+                let dy = j(x);
+                rows.iter().map(|&i| dy[i].clone()).collect()
+            }));
+        }
+        out.push(c);
+    }
+    if !below.is_empty() || !above.is_empty() {
+        let (lo, hi) = (lb.to_vec(), ub.to_vec());
+        let (b1, a1) = (below.clone(), above.clone());
+        let mut c = Constraint {
+            kind: ConstraintType::Ineq,
+            fun: Box::new(move |x: &[f64]| {
+                let y = fun(x);
+                b1.iter()
+                    .map(|&i| y[i] - lo[i])
+                    .chain(a1.iter().map(|&i| hi[i] - y[i]))
+                    .collect()
+            }),
+            jac: None,
+        };
+        if let Some(j) = jac {
+            c.jac = Some(Box::new(move |x: &[f64]| {
+                let dy = j(x);
+                below
+                    .iter()
+                    .map(|&i| dy[i].clone())
+                    .chain(
+                        above
+                            .iter()
+                            .map(|&i| dy[i].iter().map(|v| -v).collect::<Vec<f64>>()),
+                    )
+                    .collect()
+            }));
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl std::fmt::Debug for Constraint<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Constraint")
+            .field("kind", &self.kind)
+            .field("fun", &"<function>")
+            .field("jac", &self.jac.as_ref().map(|_| "<function>"))
             .finish()
     }
 }

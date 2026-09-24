@@ -5,7 +5,7 @@
 //! Resolves [frankenscipy-oh7zo]. The constructors compute dimension from
 //! x0.len(), variable_scale_ratio from x0 magnitudes, has_box_bounds from
 //! options.bounds (only if any limit is finite), has_general_constraints
-//! from options.has_general_constraints, gradient_available from
+//! from a non-empty options.constraints, gradient_available from
 //! options.gradient_available, and hessian_product_available from
 //! options.hessp.is_some(). The unbounded constructor must always report
 //! has_box_bounds=false and has_general_constraints=false regardless of
@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_opt::minimize::OptCaspProblem;
-use fsci_opt::types::{Bound, MinimizeOptions};
+use fsci_opt::types::{Bound, Constraint, MinimizeOptions};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -83,7 +83,7 @@ fn hessp_stub(_x: &[f64], p: &[f64]) -> Vec<f64> {
     p.to_vec()
 }
 
-// Static box-bound slices (MinimizeOptions::bounds is &'static [Bound])
+// Shared box-bound slices.
 static BOUNDS_FINITE: &[Bound] = &[(Some(-1.0), Some(1.0)), (Some(0.0), Some(10.0))];
 static BOUNDS_ALL_NONE: &[Bound] = &[(None, None), (None, None)];
 static BOUNDS_PARTIAL: &[Bound] = &[(Some(0.0), None), (None, None)];
@@ -155,12 +155,13 @@ fn diff_opt_casp_problem_constructors() {
         );
     }
 
-    // Probe 2: unbounded_from_x0 ignores options.bounds and options.has_general_constraints
+    // Probe 2: unbounded_from_x0 ignores options.bounds and options.constraints
     {
         let x0 = vec![0.5_f64, -0.25];
+        let constraints = [Constraint::ineq(|v: &[f64]| vec![v[0]])];
         let opts = MinimizeOptions {
             bounds: Some(BOUNDS_FINITE),
-            has_general_constraints: true,
+            constraints: &constraints,
             hessp: Some(hessp_stub),
             gradient_available: false,
             ..MinimizeOptions::default()
@@ -311,11 +312,12 @@ fn diff_opt_casp_problem_constructors() {
         );
     }
 
-    // Probe 7: from_x0_and_options with has_general_constraints=true and hessp=Some
+    // Probe 7: from_x0_and_options with a constraint and hessp=Some
     {
         let x0 = vec![1.0_f64, 2.0, 3.0, 4.0];
+        let constraints = [Constraint::eq(|v: &[f64]| vec![v[0] - 1.0])];
         let opts = MinimizeOptions {
-            has_general_constraints: true,
+            constraints: &constraints,
             hessp: Some(hessp_stub),
             gradient_available: false,
             ..MinimizeOptions::default()

@@ -4,9 +4,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::linesearch::{WolfeParams, line_search_wolfe2, line_search_wolfe2_with_gradient_probe};
+use crate::trust_region::{self, Subproblem, TrustObjective, TrustParams};
 use crate::types::{
-    Bound, Bounds, ConvergenceStatus, GradientFunc, MinimizeOptions, OptError, OptimizeMethod,
-    OptimizeResult, OptimizeTraceEntry,
+    Bound, Bounds, Constraint, ConstraintType, ConvergenceStatus, GradientFunc, HessFunc,
+    HesspFunc, MinimizeCallback, MinimizeOptions, OptError, OptimizeMethod, OptimizeResult,
+    OptimizeTraceEntry,
 };
 use fsci_runtime::{OptSolverAction, OptSolverEvidenceEntry, OptSolverPortfolio, RuntimeMode};
 
@@ -22,7 +24,7 @@ pub struct OptCaspProblem {
     pub has_general_constraints: bool,
     /// Whether a reliable gradient signal is available.
     pub gradient_available: bool,
-    /// Whether a Hessian-vector product is available.
+    /// Whether Hessian-vector products are available (`hessp`, or `hess` which gives them).
     pub hessian_product_available: bool,
 }
 
@@ -43,7 +45,7 @@ impl OptCaspProblem {
             has_box_bounds: false,
             has_general_constraints: false,
             gradient_available: options.gradient_available,
-            hessian_product_available: options.hessp.is_some(),
+            hessian_product_available: options.hessp.is_some() || options.hess.is_some(),
         }
     }
 
@@ -53,9 +55,9 @@ impl OptCaspProblem {
             dimension: x0.len(),
             variable_scale_ratio: variable_scale_ratio(x0),
             has_box_bounds: options.bounds.is_some_and(bounds_have_finite_limit),
-            has_general_constraints: options.has_general_constraints,
+            has_general_constraints: !options.constraints.is_empty(),
             gradient_available: options.gradient_available,
-            hessian_product_available: options.hessp.is_some(),
+            hessian_product_available: options.hessp.is_some() || options.hess.is_some(),
         }
     }
 }
@@ -66,8 +68,8 @@ impl OptCaspProblem {
 /// availability, dimension, and variable scale ratio. Evidence signals come
 /// from the public problem description rather than trial execution, so the
 /// selector is deterministic and side-effect free. The loss matrix prioritizes
-/// stability first: general constraints route to KKT-aware `trust-constr`, box
-/// constraints to projected `L-BFGS-B`, available curvature to Newton-CG or
+/// stability first: general constraints route to SLSQP (as `scipy.optimize.minimize`
+/// does), box constraints to projected `L-BFGS-B`, available curvature to Newton-CG or
 /// trust-region steps, high-dimensional finite-difference problems to CG, and
 /// ordinary smooth unconstrained problems to BFGS.
 pub fn select_minimize_method(problem: OptCaspProblem) -> Result<OptCaspDecision, OptError> {
@@ -84,8 +86,10 @@ pub fn select_minimize_method(problem: OptCaspProblem) -> Result<OptCaspDecision
 
     if problem.has_general_constraints {
         return Ok(OptCaspDecision {
-            method: OptimizeMethod::TrustConstr,
-            reason: String::from("general constraints require trust-constr KKT handling"),
+            method: OptimizeMethod::Slsqp,
+            reason: String::from(
+                "general constraints route to SLSQP, as scipy.optimize.minimize does",
+            ),
         });
     }
     if problem.has_box_bounds {
@@ -103,9 +107,9 @@ pub fn select_minimize_method(problem: OptCaspProblem) -> Result<OptCaspDecision
     if problem.hessian_product_available {
         if problem.dimension <= 4 && problem.variable_scale_ratio >= 1.0e4 {
             return Ok(OptCaspDecision {
-                method: OptimizeMethod::TrustExact,
+                method: OptimizeMethod::TrustNcg,
                 reason: String::from(
-                    "small ill-scaled problem with Hessian product uses trust-region stability",
+                    "small ill-scaled problem with Hessian products uses the trust-ncg trust region",
                 ),
             });
         }
@@ -150,6 +154,18 @@ where
         log_casp_decision(options, &decision);
         decision.method
     };
+    // SciPy warns and drops the constraints for a method that cannot use them; returning that
+    // unconstrained optimum as a success is exactly the silent wrong answer this refuses.
+    if !options.constraints.is_empty()
+        && !matches!(
+            selected_method,
+            OptimizeMethod::Slsqp | OptimizeMethod::TrustConstr
+        )
+    {
+        return Err(OptError::InvalidArgument {
+            detail: format!("method {selected_method:?} cannot handle constraints; use SLSQP"),
+        });
+    }
 
     match selected_method {
         OptimizeMethod::Bfgs => bfgs(&fun, x0, options),
@@ -159,6 +175,8 @@ where
         OptimizeMethod::LBfgsB => lbfgsb(&fun, x0, options, options.bounds),
         OptimizeMethod::NewtonCg => newton_cg(&fun, x0, options),
         OptimizeMethod::TrustExact => trust_exact(&fun, x0, options),
+        OptimizeMethod::TrustNcg => trust_ncg(&fun, x0, options),
+        OptimizeMethod::Dogleg => dogleg(&fun, x0, options),
         OptimizeMethod::Tnc => tnc(&fun, x0, options),
         OptimizeMethod::Slsqp => slsqp(&fun, x0, options),
         OptimizeMethod::TrustConstr => trust_constr(&fun, x0, options),
@@ -178,6 +196,8 @@ pub struct OptPortfolioResult {
 ///
 /// Dispatches across BFGS (smooth convex), TrustRegionNewtonCG (narrow valley / high curvature),
 /// DIRECT (multimodal global exploration), Nelder-Mead (noisy non-smooth), and L-BFGS-B (bounded).
+/// When `options.bounds` constrains any variable, only methods that honour bounds are
+/// candidates: L-BFGS-B, plus DIRECT when every bound is finite.
 pub fn minimize_with_casp_portfolio<F>(
     fun: F,
     x0: &[f64],
@@ -199,10 +219,37 @@ where
             detail: String::from("x0 must not contain NaN or Inf"),
         });
     }
+    // No portfolio member honours general constraints; `minimize` routes them to SLSQP.
+    if !options.constraints.is_empty() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from(
+                "the CASP portfolio has no constrained solver; use minimize, which routes constraints to SLSQP",
+            ),
+        });
+    }
+
+    // br-szq1n.9: bounds are a feasibility constraint, not a preference. L-BFGS-B
+    // and Nelder-Mead (which clips every trial point, as SciPy's does, since
+    // br-szq1n.7) honour arbitrary bounds, and DIRECT needs every side finite; BFGS
+    // and Newton-CG ignore `options.bounds` and would return an infeasible x
+    // reported as success. Restrict the candidates BEFORE the argmin.
+    let active_bounds = options
+        .bounds
+        .filter(|b| b.iter().any(|&(lo, hi)| lo.is_some() || hi.is_some()));
+    let feasible: Vec<OptSolverAction> = match active_bounds {
+        None => OptSolverAction::ALL.to_vec(),
+        Some(b) => {
+            let mut v = vec![OptSolverAction::LBFGSB, OptSolverAction::NelderMead];
+            if b.iter().all(|&(lo, hi)| lo.is_some() && hi.is_some()) {
+                v.push(OptSolverAction::DIRECT);
+            }
+            v
+        }
+    };
 
     let cond_estimate = variable_scale_ratio(x0);
     let (action, posterior, expected_losses, chosen_loss) =
-        portfolio.select_action(cond_estimate, is_noisy, is_multimodal);
+        portfolio.select_action_among(cond_estimate, is_noisy, is_multimodal, &feasible);
 
     let (result, fallback_active) = match action {
         OptSolverAction::BFGS => {
@@ -257,6 +304,8 @@ where
         }
     };
 
+    // The Hardened retry uses Nelder-Mead, which receives the same `options` and so
+    // honours the same bounds (br-szq1n.7).
     let (final_res, final_fallback) = if !result.success
         && action != OptSolverAction::DIRECT
         && portfolio.mode() == RuntimeMode::Hardened
@@ -484,6 +533,7 @@ where
             let result = OptimizeResult {
                 x: x.clone(),
                 fun: Some(f),
+                // status: ‖∇f‖₂ ≤ tol
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: String::from("optimization converged (gradient norm <= tol)"),
@@ -648,6 +698,7 @@ where
             let result = OptimizeResult {
                 x: x.clone(),
                 fun: Some(f),
+                // status: ‖∇f‖₂ ≤ tol
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: String::from("optimization converged (gradient norm <= tol)"),
@@ -872,19 +923,35 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    // Bounds as SciPy's Powell applies them: x0 clipped into the box, every line search limited
+    // to the feasible step interval, the extrapolated point capped at the boundary. They used to
+    // be ignored (frankenscipy-szq1n.7).
+    validate_bounds_for_x0(x0, options.bounds)?;
+    let bounds = options.bounds.filter(|b| bounds_have_finite_limit(b));
 
     let n = x0.len();
     let tol = requested_tolerance(options.tol);
+    // `minimize(method="Powell", tol=t)` sets xtol = ftol = t; the line searches get xtol·100.
+    let line_tol = tol * 100.0;
     let maxiter = options.maxiter.unwrap_or((150 * n).max(80));
     let maxfev = options.maxfev.unwrap_or((3000 * n).max(800));
     let mut objective = Objective::new(fun, options.mode, maxfev);
 
     let mut x = x0.to_vec();
+    if let Some(b) = bounds {
+        project_onto_bounds(&mut x, b);
+    }
     let mut f = match objective.eval(&x) {
         Ok(value) => value,
         Err(err) => return Ok(result_from_error(x0, 0, 0, 0, err)),
     };
     let mut directions = identity_matrix(n);
+    // SciPy's `x1`: where the previous sweep ENDED, before that iteration's extrapolation line
+    // search moved x again. The next extrapolation direction is `x − x1`. Measuring it from the
+    // start of the sweep instead (after the extrapolation search) builds a different direction
+    // set from the second iteration on; on bounded Rosenbrock that stalled at f = 0.2709 where
+    // SciPy reaches 0.2500169 in the same 26 iterations and 1266 evaluations it now takes.
+    let mut x1 = x.clone();
 
     for iteration in 0..maxiter {
         if let Some(callback) = options.callback
@@ -908,22 +975,18 @@ where
             return Ok(result);
         }
 
-        let x_start = x.clone();
         let f_start = f;
         let mut largest_drop = 0.0;
         let mut largest_drop_idx = 0usize;
 
         for (dir_idx, direction) in directions.iter().enumerate() {
-            let search = match golden_section_direction_search(
-                &mut objective,
-                &x,
-                f,
-                direction,
-                tol.max(1.0e-4),
-            ) {
-                Ok(value) => value,
-                Err(err) => return Ok(result_from_error(&x, iteration, objective.nfev, 0, err)),
-            };
+            let search =
+                match powell_line_search(&mut objective, &x, f, direction, line_tol, bounds) {
+                    Ok(value) => value,
+                    Err(err) => {
+                        return Ok(result_from_error(&x, iteration, objective.nfev, 0, err));
+                    }
+                };
             let drop = (f - search.f).max(0.0);
             if drop > largest_drop {
                 largest_drop = drop;
@@ -942,18 +1005,19 @@ where
             );
         }
 
-        let move_vec = sub_vectors(&x, &x_start);
-        let move_norm = l2_norm(&move_vec);
-        let f_delta = (f_start - f).abs();
-
-        // Convergence check
-        if move_norm <= tol || f_delta <= tol {
+        // SciPy's `_minimize_powell` stopping test, RELATIVE in f: 2(fx − fval) ≤
+        // ftol·(|fx| + |fval|) + 1e-20, with `tol` mapped to ftol (and to the line-search xtol)
+        // as `minimize(method="Powell", tol=...)` maps it. This was `‖Δx‖ ≤ tol || |Δf| ≤ tol`,
+        // absolute, which declared an objective scaled to tiny values converged after one sweep
+        // (frankenscipy-cjv9z).
+        if 2.0 * (f_start - f) <= tol * (f_start.abs() + f.abs()) + 1.0e-20 {
             let result = OptimizeResult {
                 x: x.clone(),
                 fun: Some(f),
+                // status: SciPy's relative f-decrease test over a full direction sweep
                 success: true,
                 status: ConvergenceStatus::Success,
-                message: String::from("optimization converged (step/f-value change <= tol)"),
+                message: String::from("optimization converged (relative f decrease <= tol)"),
                 nfev: objective.nfev,
                 njev: 0,
                 nhev: 0,
@@ -966,14 +1030,28 @@ where
             return Ok(result);
         }
 
-        // Direction set update (standard Powell criterion)
-        // x_start is point before iteration, x is point after n line searches
-        // x_ext = 2*x - x_start (extrapolated point)
-        let x_ext: Vec<f64> = x
-            .iter()
-            .zip(x_start.iter())
-            .map(|(&xi, &xs)| 2.0 * xi - xs)
-            .collect();
+        // Direction set update (standard Powell criterion): extrapolate along the move since
+        // the previous sweep ended, x_ext = x + (x − x1); with bounds, SciPy's
+        // x + min(lmax, 1)*(x − x1) so the extrapolation stays feasible.
+        let move_vec = sub_vectors(&x, &x1);
+        x1.clone_from(&x);
+        let x_ext: Vec<f64> = match bounds {
+            None => x
+                .iter()
+                .zip(move_vec.iter())
+                .map(|(&xi, &mi)| xi + mi)
+                .collect(),
+            Some(b) => {
+                let reach = feasible_step_interval(&x, &move_vec, b).1.min(1.0);
+                let mut capped: Vec<f64> = x
+                    .iter()
+                    .zip(move_vec.iter())
+                    .map(|(&xi, &mi)| xi + reach * mi)
+                    .collect();
+                project_onto_bounds(&mut capped, b);
+                capped
+            }
+        };
         let f_ext = match objective.eval(&x_ext) {
             Ok(v) => v,
             Err(err) => return Ok(result_from_error(&x, iteration, objective.nfev, 0, err)),
@@ -986,25 +1064,25 @@ where
             let rhs = largest_drop * term2 * term2;
 
             if lhs < rhs {
-                // Update direction set: replace direction of largest drop with total move
-                let search = match golden_section_direction_search(
-                    &mut objective,
-                    &x,
-                    f,
-                    &move_vec,
-                    tol.max(1.0e-4),
-                ) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return Ok(result_from_error(&x, iteration, objective.nfev, 0, err));
-                    }
-                };
+                // SciPy's direction update: search along the sweep's total move, then store
+                // the step actually taken (alpha·move, unnormalized, so the next searches keep
+                // its scale) as the last direction, the old last one taking the slot of the
+                // largest drop.
+                let search =
+                    match powell_line_search(&mut objective, &x, f, &move_vec, line_tol, bounds) {
+                        Ok(v) => v,
+                        Err(err) => {
+                            return Ok(result_from_error(&x, iteration, objective.nfev, 0, err));
+                        }
+                    };
                 x = search.x;
                 f = search.f;
 
-                if move_norm > 1.0e-12 {
-                    directions.remove(largest_drop_idx);
-                    directions.push(scale_vector(&move_vec, 1.0 / move_norm));
+                let taken = scale_vector(&move_vec, search.alpha);
+                if taken.iter().any(|&component| component != 0.0) {
+                    let last = directions.len() - 1;
+                    directions[largest_drop_idx] = directions[last].clone();
+                    directions[last] = taken;
                 }
             }
         }
@@ -1059,6 +1137,18 @@ where
         });
     }
 
+    // Bounds, as SciPy's `_minimize_neldermead` applies them: x0 is clipped into the box, and
+    // every trial point (reflection, expansion, both contractions, each shrunk vertex) is clipped
+    // before it is evaluated. They used to be ignored, so a bounded call returned an infeasible
+    // optimum under success = true (frankenscipy-szq1n.7).
+    validate_bounds_for_x0(x0, options.bounds)?;
+    let bounds = options.bounds.filter(|b| bounds_have_finite_limit(b));
+    let clip = |point: &mut Vec<f64>| {
+        if let Some(b) = bounds {
+            project_onto_bounds(point, b);
+        }
+    };
+
     let n = x0.len();
     let tol = options.tol.unwrap_or(1.0e-8);
     let xatol = tol;
@@ -1070,19 +1160,36 @@ where
     // Standard simplex coefficients — SciPy's default (adaptive=False) for all n.
     let (rho, chi, psi, sigma) = (1.0, 2.0, 0.5, 0.5);
 
+    let mut start = x0.to_vec();
+    clip(&mut start);
+
     // Build initial simplex: n+1 vertices
     let mut simplex: Vec<Vec<f64>> = Vec::with_capacity(n + 1);
-    simplex.push(x0.to_vec());
+    simplex.push(start.clone());
 
     for j in 0..n {
-        let mut vertex = x0.to_vec();
-        let h = if x0[j].abs() > 1e-12 {
-            0.05 * x0[j]
+        let mut vertex = start.clone();
+        let h = if start[j].abs() > 1e-12 {
+            0.05 * start[j]
         } else {
             0.00025
         };
         vertex[j] += h;
         simplex.push(vertex);
+    }
+    if let Some(b) = bounds {
+        // SciPy: a vertex pushed past an upper bound is reflected into the interior before
+        // clipping, so a start at the upper bound does not collapse the simplex onto it.
+        for vertex in &mut simplex {
+            for (value, &(_, hi)) in vertex.iter_mut().zip(b) {
+                if let Some(hi) = hi
+                    && *value > hi
+                {
+                    *value = 2.0 * hi - *value;
+                }
+            }
+            project_onto_bounds(vertex, b);
+        }
     }
 
     // Evaluate at all vertices
@@ -1133,6 +1240,7 @@ where
             let result = OptimizeResult {
                 x: simplex[0].clone(),
                 fun: Some(f_values[0]),
+                // status: simplex f-range ≤ fatol and max vertex offset (inf-norm) ≤ xatol
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: String::from("optimization converged (Nelder-Mead)"),
@@ -1182,11 +1290,12 @@ where
 
         // Reflection: x_r = centroid + rho * (centroid - worst)
         let worst = &simplex[n];
-        let x_r: Vec<f64> = centroid
+        let mut x_r: Vec<f64> = centroid
             .iter()
             .zip(worst.iter())
             .map(|(c, w)| c + rho * (c - w))
             .collect();
+        clip(&mut x_r);
         let f_r = match objective.eval(&x_r) {
             Ok(v) => v,
             Err(err) => return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err)),
@@ -1194,11 +1303,12 @@ where
 
         if f_r < f_values[0] {
             // Expansion: x_e = centroid + chi * (x_r - centroid)
-            let x_e: Vec<f64> = centroid
+            let mut x_e: Vec<f64> = centroid
                 .iter()
                 .zip(x_r.iter())
                 .map(|(c, r)| c + chi * (r - c))
                 .collect();
+            clip(&mut x_e);
             let f_e = match objective.eval(&x_e) {
                 Ok(v) => v,
                 Err(err) => return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err)),
@@ -1218,11 +1328,12 @@ where
             // Contraction
             if f_r < f_values[n] {
                 // Outside contraction: x_c = centroid + psi * (x_r - centroid)
-                let x_c: Vec<f64> = centroid
+                let mut x_c: Vec<f64> = centroid
                     .iter()
                     .zip(x_r.iter())
                     .map(|(c, r)| c + psi * (r - c))
                     .collect();
+                clip(&mut x_c);
                 let f_c = match objective.eval(&x_c) {
                     Ok(v) => v,
                     Err(err) => {
@@ -1234,8 +1345,14 @@ where
                     f_values[n] = f_c;
                 } else {
                     // Shrink
-                    match nelder_mead_shrink(&mut simplex, &mut f_values, sigma, &mut objective, n)
-                    {
+                    match nelder_mead_shrink(
+                        &mut simplex,
+                        &mut f_values,
+                        sigma,
+                        &mut objective,
+                        n,
+                        bounds,
+                    ) {
                         Ok(()) => {}
                         Err(err) => {
                             return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err));
@@ -1244,11 +1361,12 @@ where
                 }
             } else {
                 // Inside contraction: x_cc = centroid - psi * (centroid - worst)
-                let x_cc: Vec<f64> = centroid
+                let mut x_cc: Vec<f64> = centroid
                     .iter()
                     .zip(worst.iter())
                     .map(|(c, w)| c - psi * (c - w))
                     .collect();
+                clip(&mut x_cc);
                 let f_cc = match objective.eval(&x_cc) {
                     Ok(v) => v,
                     Err(err) => {
@@ -1260,8 +1378,14 @@ where
                     f_values[n] = f_cc;
                 } else {
                     // Shrink
-                    match nelder_mead_shrink(&mut simplex, &mut f_values, sigma, &mut objective, n)
-                    {
+                    match nelder_mead_shrink(
+                        &mut simplex,
+                        &mut f_values,
+                        sigma,
+                        &mut objective,
+                        n,
+                        bounds,
+                    ) {
                         Ok(()) => {}
                         Err(err) => {
                             return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err));
@@ -1311,6 +1435,7 @@ fn nelder_mead_shrink<F>(
     sigma: f64,
     objective: &mut Objective<'_, F>,
     n: usize,
+    bounds: Option<&[Bound]>,
 ) -> Result<(), OptError>
 where
     F: Fn(&[f64]) -> f64,
@@ -1319,6 +1444,9 @@ where
     for i in 1..=n {
         for j in 0..n {
             simplex[i][j] = best[j] + sigma * (simplex[i][j] - best[j]);
+        }
+        if let Some(b) = bounds {
+            project_onto_bounds(&mut simplex[i], b);
         }
         f_values[i] = objective.eval(&simplex[i]).map_err(|e| match e {
             OptError::EvaluationBudgetExceeded { detail } => {
@@ -1365,7 +1493,12 @@ where
     };
 
     let mut njev = 0usize;
-    let mut grad = match finite_diff_gradient(&mut objective, &x, options.gradient_eps) {
+    let mut grad = match evaluate_minimize_gradient(
+        &mut objective,
+        options.gradient,
+        &x,
+        options.gradient_eps,
+    ) {
         Ok(value) => {
             njev += 1;
             value
@@ -1395,6 +1528,7 @@ where
             let result = OptimizeResult {
                 x: x.clone(),
                 fun: Some(f),
+                // status: ‖projected ∇f‖₂ ≤ tol (plain ∇f when no bounds)
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: String::from("optimization converged (L-BFGS-B gradient norm <= tol)"),
@@ -1431,21 +1565,33 @@ where
             return Ok(result);
         }
 
-        // Two-loop recursion for L-BFGS direction
-        let direction = lbfgs_two_loop(&grad, &s_history, &y_history, &rho_history);
-
-        // Negate for descent direction
-        let direction: Vec<f64> = direction.iter().map(|&d| -d).collect();
+        // Two-loop recursion for the L-BFGS direction. With bounds this is an ACTIVE-SET
+        // projected method: a variable held at a bound by an outward gradient (the entries
+        // `projected_gradient` zeroed) stays fixed, and the quasi-Newton step is built from the
+        // projected gradient over the free variables. Building it from the full gradient and
+        // projecting afterwards failed the line search at an active bound and returned
+        // "maximum iterations" short of the optimum: bounded Rosenbrock stopped at
+        // [0.5, 0.2519] where SciPy returns [0.5, 0.25] (frankenscipy-szq1n.9).
+        let mut direction: Vec<f64> =
+            lbfgs_two_loop(&projected_grad, &s_history, &y_history, &rho_history)
+                .iter()
+                .map(|&d| -d)
+                .collect();
+        for ((d, &pg), &g) in direction.iter_mut().zip(&projected_grad).zip(&grad) {
+            if pg == 0.0 && g != 0.0 {
+                *d = 0.0;
+            }
+        }
 
         // Line search with bound projection
         let mut alpha = 1.0;
         let directional_deriv = dot(&grad, &direction);
         if directional_deriv >= 0.0 {
-            // Not a descent direction — reset history and use steepest descent
+            // Not a descent direction — reset history and use (projected) steepest descent
             s_history.clear();
             y_history.clear();
             rho_history.clear();
-            let direction: Vec<f64> = grad.iter().map(|&g| -g).collect();
+            let direction: Vec<f64> = projected_grad.iter().map(|&g| -g).collect();
             alpha = 1.0 / l2_norm(&direction).max(1.0);
             let candidate_x = add_scaled(&x, &direction, alpha);
             let mut projected_candidate = candidate_x;
@@ -1457,16 +1603,20 @@ where
                     let s = sub_vectors(&projected_candidate, &x);
                     x = projected_candidate;
                     f = fv;
-                    let new_grad =
-                        match finite_diff_gradient(&mut objective, &x, options.gradient_eps) {
-                            Ok(g) => {
-                                njev += 1;
-                                g
-                            }
-                            Err(err) => {
-                                return Ok(result_from_error(&x, nit, objective.nfev, njev, err));
-                            }
-                        };
+                    let new_grad = match evaluate_minimize_gradient(
+                        &mut objective,
+                        options.gradient,
+                        &x,
+                        options.gradient_eps,
+                    ) {
+                        Ok(g) => {
+                            njev += 1;
+                            g
+                        }
+                        Err(err) => {
+                            return Ok(result_from_error(&x, nit, objective.nfev, njev, err));
+                        }
+                    };
                     let y = sub_vectors(&new_grad, &grad);
                     let sy = dot(&s, &y);
                     if sy > 1e-10 {
@@ -1487,19 +1637,35 @@ where
             continue;
         }
 
-        // Strong-Wolfe line search for the unconstrained case. The curvature
-        // condition |g(x+αd)·d| ≤ c2·|g·d| guarantees s·y > 0, so every L-BFGS
-        // correction pair is valid; with Armijo-only steps the limited-memory
-        // model degrades to steepest descent and stalls (e.g. Rosenbrock from a
-        // hard start). scipy's L-BFGS-B uses an equivalent dcsrch line search.
-        if bounds.is_none() {
+        // Strong-Wolfe line search. The curvature condition |g(x+αd)·d| ≤ c2·|g·d|
+        // guarantees s·y > 0, so every L-BFGS correction pair is valid; with Armijo-only
+        // steps the limited-memory model degrades to steepest descent and stalls (e.g.
+        // Rosenbrock from a hard start). scipy's L-BFGS-B uses an equivalent dcsrch line
+        // search. With bounds the search is capped at the largest step that stays in the
+        // box (`amax`), so its trial points stay inside it (the central-difference gradient
+        // still probes ±1e-8·(1+|x|) at an active bound); bounded problems used to get
+        // projected Armijo only, and stalled the same way (Rosenbrock in a [-5, 5] box
+        // stopped at f = 3.47, SciPy reaches 1e-11).
+        let max_feasible_step = bounds.map_or(f64::INFINITY, |b| {
+            feasible_step_interval(&x, &direction, b).1
+        });
+        let wolfe_params = WolfeParams {
+            amax: WolfeParams::default().amax.min(max_feasible_step),
+            ..WolfeParams::default()
+        };
+        if wolfe_params.amax > wolfe_params.amin {
             let eps = options.gradient_eps;
             let counter = std::cell::Cell::new(0usize);
+            let gradient_calls = std::cell::Cell::new(0usize);
             let f_closure = |xv: &[f64]| {
                 counter.set(counter.get() + 1);
                 (fun)(xv)
             };
             let g_closure = |xv: &[f64]| {
+                if let Some(gradient) = options.gradient {
+                    gradient_calls.set(gradient_calls.get() + 1);
+                    return gradient(xv);
+                }
                 let mut g = vec![0.0; xv.len()];
                 let mut xp = xv.to_vec();
                 for i in 0..xv.len() {
@@ -1523,21 +1689,30 @@ where
                 &direction,
                 f,
                 &grad,
-                WolfeParams::default(),
+                wolfe_params,
             );
+            // Count the search's evaluations whether or not its step is used.
+            objective.nfev += counter.get();
+            njev += gradient_calls.get();
             if let Ok(ls) = wolfe {
-                objective.nfev += counter.get();
-                let new_x = add_scaled(&x, &direction, ls.alpha);
+                let mut new_x = add_scaled(&x, &direction, ls.alpha);
+                if let Some(b) = bounds {
+                    // ls.alpha ≤ amax keeps x + αd in the box up to rounding.
+                    project_onto_bounds(&mut new_x, b);
+                }
                 let s = sub_vectors(&new_x, &x);
                 x = new_x;
                 f = ls.f_at_alpha;
-                let new_grad = match finite_diff_gradient(&mut objective, &x, eps) {
-                    Ok(g) => {
-                        njev += 1;
-                        g
-                    }
-                    Err(err) => return Ok(result_from_error(&x, nit, objective.nfev, njev, err)),
-                };
+                let new_grad =
+                    match evaluate_minimize_gradient(&mut objective, options.gradient, &x, eps) {
+                        Ok(g) => {
+                            njev += 1;
+                            g
+                        }
+                        Err(err) => {
+                            return Ok(result_from_error(&x, nit, objective.nfev, njev, err));
+                        }
+                    };
                 let y = sub_vectors(&new_grad, &grad);
                 let sy = dot(&s, &y);
                 if sy > 1e-10 {
@@ -1566,25 +1741,46 @@ where
             // Wolfe search failed → fall through to the projected Armijo fallback.
         }
 
-        // Armijo backtracking with bound projection
+        // Armijo backtracking with bound projection. With bounds, a quasi-Newton direction
+        // that yields no acceptable step is not the end: the history is cleared and the
+        // search retried once along projected steepest descent.
         let c1 = 1e-4;
         let mut step_accepted = false;
-        for _ in 0..24 {
-            let mut candidate_x = add_scaled(&x, &direction, alpha);
-            if let Some(bounds) = bounds {
-                project_onto_bounds(&mut candidate_x, bounds);
+        let steepest: Vec<f64> = projected_grad.iter().map(|&g| -g).collect();
+        let mut attempts = vec![direction];
+        if bounds.is_some() && attempts[0] != steepest {
+            attempts.push(steepest);
+        }
+        for (attempt, direction) in attempts.iter().enumerate() {
+            if step_accepted {
+                break;
             }
-            match objective.eval(&candidate_x) {
-                Ok(fv) => {
-                    let actual_step = sub_vectors(&candidate_x, &x);
-                    let actual_directional_deriv = dot(&grad, &actual_step);
+            if attempt > 0 {
+                s_history.clear();
+                y_history.clear();
+                rho_history.clear();
+                alpha = 1.0;
+            }
+            for _ in 0..24 {
+                let mut candidate_x = add_scaled(&x, direction, alpha);
+                if let Some(bounds) = bounds {
+                    project_onto_bounds(&mut candidate_x, bounds);
+                }
+                match objective.eval(&candidate_x) {
+                    Ok(fv) => {
+                        let actual_step = sub_vectors(&candidate_x, &x);
+                        let actual_directional_deriv = dot(&grad, &actual_step);
 
-                    if fv <= f + c1 * actual_directional_deriv {
-                        let s = actual_step;
-                        x = candidate_x;
-                        f = fv;
-                        let new_grad =
-                            match finite_diff_gradient(&mut objective, &x, options.gradient_eps) {
+                        if fv <= f + c1 * actual_directional_deriv {
+                            let s = actual_step;
+                            x = candidate_x;
+                            f = fv;
+                            let new_grad = match evaluate_minimize_gradient(
+                                &mut objective,
+                                options.gradient,
+                                &x,
+                                options.gradient_eps,
+                            ) {
                                 Ok(g) => {
                                     njev += 1;
                                     g
@@ -1599,29 +1795,30 @@ where
                                     ));
                                 }
                             };
-                        let y = sub_vectors(&new_grad, &grad);
-                        let sy = dot(&s, &y);
-                        if sy > 1e-10 {
-                            push_lbfgs_history(
-                                &mut s_history,
-                                &mut y_history,
-                                &mut rho_history,
-                                s,
-                                y,
-                                sy,
-                                m,
-                            );
+                            let y = sub_vectors(&new_grad, &grad);
+                            let sy = dot(&s, &y);
+                            if sy > 1e-10 {
+                                push_lbfgs_history(
+                                    &mut s_history,
+                                    &mut y_history,
+                                    &mut rho_history,
+                                    s,
+                                    y,
+                                    sy,
+                                    m,
+                                );
+                            }
+                            grad = new_grad;
+                            step_accepted = true;
+                            break;
                         }
-                        grad = new_grad;
-                        step_accepted = true;
-                        break;
                     }
+                    Err(err) => return Ok(result_from_error(&x, nit, objective.nfev, njev, err)),
                 }
-                Err(err) => return Ok(result_from_error(&x, nit, objective.nfev, njev, err)),
-            }
-            alpha *= 0.5;
-            if alpha < 1e-12 {
-                break;
+                alpha *= 0.5;
+                if alpha < 1e-12 {
+                    break;
+                }
             }
         }
 
@@ -1750,9 +1947,11 @@ fn push_lbfgs_history(
 
 /// Newton-CG method: Newton's method with CG inner solver for the Newton equation.
 ///
-/// Matches `scipy.optimize.minimize(f, x0, method='Newton-CG')`.
-/// Uses finite-difference Hessian-vector products and CG to approximately
-/// solve H*d = -g at each outer iteration.
+/// API-level counterpart of `scipy.optimize.minimize(f, x0, method='Newton-CG')` (the
+/// outer iteration uses Armijo backtracking, not SciPy's Wolfe line search). CG solves
+/// H*d = -g at each outer iteration with Hessian-vector products from `options.hess`
+/// (preferred, as in SciPy), `options.hessp`, or finite differences of the gradient; the
+/// gradient is `options.gradient` when given, else forward differences.
 pub fn newton_cg<F>(
     fun: &F,
     x0: &[f64],
@@ -1777,7 +1976,7 @@ where
     };
     let mut njev = 0usize;
     let mut nhev = 0usize;
-    let mut grad = match finite_diff_gradient(&mut objective, &x, eps) {
+    let mut grad = match evaluate_minimize_gradient(&mut objective, options.gradient, &x, eps) {
         Ok(v) => {
             njev += 1;
             v
@@ -1791,6 +1990,7 @@ where
             let result = OptimizeResult {
                 x: x.clone(),
                 fun: Some(f),
+                // status: ‖∇f‖₂ ≤ tol
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: String::from("optimization converged (Newton-CG)"),
@@ -1827,19 +2027,35 @@ where
             return Ok(result);
         }
 
-        // Inner CG loop to solve H*d = -g approximately
-        // Using user-provided hessp or finite differences: H*v ≈ (∇f(x+εv) - ∇f(x)) / ε
+        // Inner CG loop to solve H*d = -g approximately. Products come from the caller's
+        // Hessian (evaluated once per outer iteration, as SciPy does), else their hessp, else
+        // finite differences: H*v ≈ (∇f(x+εv) - ∇f(x)) / ε.
         let cg_tol = grad_norm.min(0.5); // Eisenstat-Walker forcing term
+        let hessian = match options.hess {
+            Some(hess) => match validate_hessian_output(hess(&x), n) {
+                Ok(matrix) => {
+                    nhev += 1;
+                    Some(matrix)
+                }
+                Err(e) => return Ok(result_from_error(&x, iteration, objective.nfev, njev, e)),
+            },
+            None => None,
+        };
+        let products = match (&hessian, options.hessp) {
+            (Some(matrix), _) => HessianProducts::Matrix(matrix),
+            (None, Some(hessp)) => HessianProducts::Callback(hessp),
+            (None, None) => HessianProducts::FiniteDifference(options.gradient),
+        };
         let (direction, nhvp) =
-            match cg_newton_direction(&mut objective, &x, &grad, eps, cg_tol, n, options.hessp) {
+            match cg_newton_direction(&mut objective, &x, &grad, eps, cg_tol, n, products) {
                 Ok(v) => v,
                 Err(e) => return Ok(result_from_error(&x, iteration, objective.nfev, njev, e)),
             };
-        if options.hessp.is_some() {
-            nhev += nhvp;
-        } else {
+        match products {
+            HessianProducts::Matrix(_) => {}
+            HessianProducts::Callback(_) => nhev += nhvp,
             // Each finite-difference HVP requires one gradient evaluation.
-            njev += nhvp;
+            HessianProducts::FiniteDifference(_) => njev += nhvp,
         }
 
         // Line search along direction
@@ -1889,7 +2105,7 @@ where
         }
 
         // Update gradient
-        grad = match finite_diff_gradient(&mut objective, &x, eps) {
+        grad = match evaluate_minimize_gradient(&mut objective, options.gradient, &x, eps) {
             Ok(v) => {
                 njev += 1;
                 v
@@ -1926,11 +2142,13 @@ where
     Ok(result)
 }
 
-/// Trust-region exact method using finite-difference derivatives.
+/// `scipy.optimize.minimize(f, x0, method='trust-exact')`.
 ///
-/// Matches `scipy.optimize.minimize(f, x0, method='trust-exact')` at the
-/// observable API level, while approximating the missing Jacobian/Hessian
-/// inputs from function evaluations.
+/// With `options.hess` this is SciPy's algorithm: the `_minimize_trust_region` driver with the
+/// nearly-exact `IterativeSubproblem` (Moré–Sorensen λ iteration on Cholesky factors), taking
+/// SciPy's iteration path. SciPy requires `hess`; without it fsci runs its own trust region on
+/// a BFGS model of the Hessian (not SciPy's algorithm). Without `options.gradient` the
+/// gradient is forward-differenced (SciPy requires `jac`).
 pub fn trust_exact<F>(
     fun: &F,
     x0: &[f64],
@@ -1939,6 +2157,15 @@ pub fn trust_exact<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
+    if options.hess.is_some() {
+        return trust_region_minimize(
+            fun,
+            x0,
+            options,
+            OptimizeMethod::TrustExact,
+            Subproblem::Exact { maxiter: 25 },
+        );
+    }
     validate_minimize_options(options)?;
 
     let n = x0.len();
@@ -1955,7 +2182,7 @@ where
     };
     let mut njev = 0usize;
     let mut nhev = 0usize;
-    let mut grad = match finite_diff_gradient(&mut objective, &x, eps) {
+    let mut grad = match evaluate_minimize_gradient(&mut objective, options.gradient, &x, eps) {
         Ok(v) => {
             njev += 1;
             v
@@ -2014,6 +2241,7 @@ where
             let result = OptimizeResult {
                 x: x.clone(),
                 fun: Some(f),
+                // status: ‖∇f‖₂ ≤ tol
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: String::from("optimization converged (trust-exact)"),
@@ -2098,7 +2326,7 @@ where
             let grad_old = grad.clone();
             x = candidate;
             f = candidate_f;
-            grad = match finite_diff_gradient(&mut objective, &x, eps) {
+            grad = match evaluate_minimize_gradient(&mut objective, options.gradient, &x, eps) {
                 Ok(v) => {
                     njev += 1;
                     v
@@ -2165,8 +2393,227 @@ where
     Ok(result)
 }
 
+/// `scipy.optimize.minimize(f, x0, method='trust-ncg')`: SciPy's trust-region driver with the
+/// CG-Steihaug subproblem, taking SciPy's iteration path. Needs `options.hess` or
+/// `options.hessp` (products use `hessp` when both are given, as in SciPy). Without
+/// `options.gradient` the gradient is forward-differenced (SciPy requires `jac`).
+pub fn trust_ncg<F>(
+    fun: &F,
+    x0: &[f64],
+    options: MinimizeOptions,
+) -> Result<OptimizeResult, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    if options.hess.is_none() && options.hessp.is_none() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from(
+                "Either the Hessian or the Hessian-vector product is currently required for \
+                 trust-region methods",
+            ),
+        });
+    }
+    trust_region_minimize(
+        fun,
+        x0,
+        options,
+        OptimizeMethod::TrustNcg,
+        Subproblem::CgSteihaug,
+    )
+}
+
+/// `scipy.optimize.minimize(f, x0, method='dogleg')`: SciPy's trust-region driver with the
+/// dogleg subproblem, taking SciPy's iteration path. Needs `options.hess`; a Hessian that is
+/// not positive definite at an iterate ends the solve with [`ConvergenceStatus::LinAlgError`]
+/// (SciPy status 3). Without `options.gradient` the gradient is forward-differenced (SciPy
+/// requires `jac`).
+pub fn dogleg<F>(fun: &F, x0: &[f64], options: MinimizeOptions) -> Result<OptimizeResult, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    if options.hess.is_none() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("Hessian is required for dogleg minimization"),
+        });
+    }
+    trust_region_minimize(fun, x0, options, OptimizeMethod::Dogleg, Subproblem::Dogleg)
+}
+
+/// [`TrustObjective`] over fsci's evaluation machinery: `f` through [`Objective`] (evaluation
+/// budget and mode checks), the caller's gradient or forward differences, and their
+/// `hess` / `hessp`.
+struct TrustRegionAdapter<'o, 'f, F>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    objective: &'o mut Objective<'f, F>,
+    gradient: Option<GradientFunc>,
+    hess: Option<HessFunc>,
+    hessp: Option<HesspFunc>,
+    gradient_eps: f64,
+    callback: Option<MinimizeCallback>,
+    njev: usize,
+    nhev: usize,
+    /// The last point `f` was evaluated at, reported if an evaluation fails.
+    last_x: Vec<f64>,
+}
+
+impl<F> TrustObjective for TrustRegionAdapter<'_, '_, F>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    type Error = OptError;
+
+    fn fun(&mut self, x: &[f64]) -> Result<f64, OptError> {
+        self.last_x.clear();
+        self.last_x.extend_from_slice(x);
+        self.objective.eval(x)
+    }
+
+    fn grad(&mut self, x: &[f64]) -> Result<Vec<f64>, OptError> {
+        self.njev += 1;
+        evaluate_minimize_gradient(self.objective, self.gradient, x, self.gradient_eps)
+    }
+
+    fn has_hess(&self) -> bool {
+        self.hess.is_some()
+    }
+
+    fn hess(&mut self, x: &[f64]) -> Result<Vec<f64>, OptError> {
+        let Some(hess) = self.hess else {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("this trust-region method needs options.hess"),
+            });
+        };
+        self.nhev += 1;
+        validate_hessian_output(hess(x), x.len())
+    }
+
+    fn has_hessp(&self) -> bool {
+        self.hessp.is_some()
+    }
+
+    fn hessp(&mut self, x: &[f64], p: &[f64]) -> Result<Vec<f64>, OptError> {
+        let Some(hessp) = self.hessp else {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("this trust-region method needs options.hessp"),
+            });
+        };
+        self.nhev += 1;
+        validate_hessp_output(hessp(x, p), x.len())
+    }
+
+    fn callback(&mut self, x: &[f64], _fun: f64) -> bool {
+        self.callback.is_some_and(|callback| !callback(x))
+    }
+}
+
+/// SciPy `_minimize_trust_region` with its default options (initial radius 1, maximum radius
+/// 1000, η = 0.15, `gtol` = `tol` or 1e-4, `maxiter` = 200·n). SciPy has no evaluation cap, so
+/// one applies only when `options.maxfev` is set.
+fn trust_region_minimize<F>(
+    fun: &F,
+    x0: &[f64],
+    options: MinimizeOptions,
+    method: OptimizeMethod,
+    subproblem: Subproblem,
+) -> Result<OptimizeResult, OptError>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    validate_minimize_options(options)?;
+    let params = TrustParams {
+        initial_trust_radius: 1.0,
+        max_trust_radius: 1000.0,
+        eta: 0.15,
+        gtol: options.tol.unwrap_or(1.0e-4),
+        maxiter: options.maxiter.unwrap_or(200 * x0.len()),
+    };
+    let mut objective = Objective::new(fun, options.mode, options.maxfev.unwrap_or(usize::MAX));
+    let mut adapter = TrustRegionAdapter {
+        objective: &mut objective,
+        gradient: options.gradient,
+        hess: options.hess,
+        // SciPy hands `hessp` to trust-ncg only; dogleg and trust-exact use the Hessian.
+        hessp: if subproblem == Subproblem::CgSteihaug {
+            options.hessp
+        } else {
+            None
+        },
+        gradient_eps: options.gradient_eps,
+        callback: options.callback,
+        njev: 0,
+        nhev: 0,
+        last_x: x0.to_vec(),
+    };
+    let outcome = trust_region::minimize(&mut adapter, x0, subproblem, params);
+    let TrustRegionAdapter {
+        njev,
+        nhev,
+        hess,
+        last_x,
+        ..
+    } = adapter;
+    // SciPy's `ScalarFunction` evaluates a stand-in Hessian once when only `hessp` is given
+    // and counts it; the count is kept so `nhev` reads as SciPy's.
+    let nhev = nhev + usize::from(hess.is_none());
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            let mut result = result_from_error(&last_x, 0, objective.nfev, njev, err);
+            result.nhev = nhev;
+            log_completion(method, options, 0, &result);
+            return Ok(result);
+        }
+    };
+    let (success, status, message) = if outcome.stopped_by_callback {
+        (
+            false,
+            ConvergenceStatus::CallbackStop,
+            String::from("callback requested stop"),
+        )
+    } else {
+        let status = match outcome.status {
+            0 => ConvergenceStatus::Success,
+            1 => ConvergenceStatus::MaxIterations,
+            2 => ConvergenceStatus::PrecisionLoss,
+            _ => ConvergenceStatus::LinAlgError,
+        };
+        (
+            outcome.status == 0,
+            status,
+            String::from(trust_region::status_message(outcome.status)),
+        )
+    };
+    let result = OptimizeResult {
+        x: outcome.x,
+        fun: Some(outcome.fun),
+        success,
+        status,
+        message,
+        nfev: objective.nfev,
+        njev,
+        nhev,
+        nit: outcome.nit,
+        jac: Some(outcome.jac),
+        hess_inv: None,
+        maxcv: None,
+    };
+    log_completion(method, options, result.nit, &result);
+    Ok(result)
+}
+
+/// Where Newton-CG's Hessian-vector products come from.
+#[derive(Clone, Copy)]
+enum HessianProducts<'a> {
+    /// The caller's dense Hessian at `x`, row-major.
+    Matrix(&'a [f64]),
+    Callback(HesspFunc),
+    /// Forward differences of the gradient (the caller's, when given).
+    FiniteDifference(Option<GradientFunc>),
+}
+
 /// Inner CG solver for Newton equation H*d = -g.
-/// Uses Hessian-vector products via finite differences.
 /// Returns (direction, number_of_hvps).
 fn cg_newton_direction<F>(
     objective: &mut Objective<'_, F>,
@@ -2175,7 +2622,7 @@ fn cg_newton_direction<F>(
     eps: f64,
     tol: f64,
     n: usize,
-    hessp: Option<crate::types::HesspFunc>,
+    products: HessianProducts<'_>,
 ) -> Result<(Vec<f64>, usize), OptError>
 where
     F: Fn(&[f64]) -> f64,
@@ -2196,14 +2643,16 @@ where
             break;
         }
 
-        // Hessian-vector product: user-provided or via finite differences
-        let hp = match hessp {
-            Some(func) => {
-                nhvp += 1;
-                func(x, &p)
+        let hp = match products {
+            HessianProducts::Matrix(matrix) => {
+                matrix.chunks_exact(n).map(|row| dot(row, &p)).collect()
             }
-            None => {
-                let v = hessian_vector_product(objective, x, grad, &p, eps)?;
+            HessianProducts::Callback(func) => {
+                nhvp += 1;
+                validate_hessp_output(func(x, &p), n)?
+            }
+            HessianProducts::FiniteDifference(gradient) => {
+                let v = hessian_vector_product(objective, gradient, x, grad, &p, eps)?;
                 nhvp += 1;
                 v
             }
@@ -2235,9 +2684,11 @@ where
     Ok((d, nhvp))
 }
 
-/// Compute Hessian-vector product H*v via finite differences of gradient.
+/// Compute Hessian-vector product H*v via finite differences of the gradient (the caller's
+/// `gradient` when given, else itself forward-differenced).
 fn hessian_vector_product<F>(
     objective: &mut Objective<'_, F>,
+    gradient: Option<GradientFunc>,
     x: &[f64],
     grad_at_x: &[f64],
     v: &[f64],
@@ -2254,7 +2705,7 @@ where
     }
     let step = eps * (1.0 + l2_norm(x)) / v_norm;
     let x_pert = add_scaled(x, v, step);
-    let grad_pert = finite_diff_gradient(objective, &x_pert, eps)?;
+    let grad_pert = evaluate_minimize_gradient(objective, gradient, &x_pert, eps)?;
     let mut hv = Vec::with_capacity(x.len());
     for (gp, g) in grad_pert.iter().zip(grad_at_x.iter()) {
         hv.push((gp - g) / step);
@@ -2879,6 +3330,44 @@ fn validate_gradient_output(gradient: Vec<f64>, expected_len: usize) -> Result<V
     Ok(gradient)
 }
 
+/// Flatten the caller's `hess(x)` to row-major `n × n`, refusing a wrong shape or a non-finite
+/// entry as [`validate_gradient_output`] does for gradients.
+fn validate_hessian_output(rows: Vec<Vec<f64>>, n: usize) -> Result<Vec<f64>, OptError> {
+    if rows.len() != n || rows.iter().any(|row| row.len() != n) {
+        return Err(OptError::InvalidArgument {
+            detail: format!(
+                "hess callback returned {} rows of lengths {:?}, expected {n} x {n}",
+                rows.len(),
+                rows.iter().map(Vec::len).collect::<Vec<_>>()
+            ),
+        });
+    }
+    let matrix: Vec<f64> = rows.into_iter().flatten().collect();
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("hess callback returned NaN or Inf"),
+        });
+    }
+    Ok(matrix)
+}
+
+fn validate_hessp_output(product: Vec<f64>, n: usize) -> Result<Vec<f64>, OptError> {
+    if product.len() != n {
+        return Err(OptError::InvalidArgument {
+            detail: format!(
+                "hessp callback returned length {}, expected {n}",
+                product.len()
+            ),
+        });
+    }
+    if product.iter().any(|value| !value.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("hessp callback returned NaN or Inf"),
+        });
+    }
+    Ok(product)
+}
+
 fn armijo_backtracking<F>(
     objective: &mut Objective<'_, F>,
     x: &[f64],
@@ -2915,130 +3404,377 @@ where
     Ok(None)
 }
 
-fn golden_section_direction_search<F>(
+/// Step lengths `alpha` keeping `x + alpha*direction` inside the box: SciPy's `_line_for_search`.
+/// `x` must be feasible, so the interval always contains 0.
+fn feasible_step_interval(x: &[f64], direction: &[f64], bounds: &[Bound]) -> (f64, f64) {
+    let mut lo = f64::NEG_INFINITY;
+    let mut hi = f64::INFINITY;
+    for ((&xi, &di), &(lb, ub)) in x.iter().zip(direction).zip(bounds) {
+        if di == 0.0 {
+            continue;
+        }
+        let to_lb = lb.map(|l| (l - xi) / di);
+        let to_ub = ub.map(|u| (u - xi) / di);
+        let (low_side, high_side) = if di > 0.0 {
+            (to_lb, to_ub)
+        } else {
+            (to_ub, to_lb)
+        };
+        if let Some(a) = low_side {
+            lo = lo.max(a);
+        }
+        if let Some(a) = high_side {
+            hi = hi.min(a);
+        }
+    }
+    (lo.min(0.0), hi.max(0.0))
+}
+
+/// Powell's line search along `direction`: SciPy's `_linesearch_powell`. With no finite limit on
+/// the step it brackets from (0, 1) and runs Brent ([`brent_line_minimum`], relative
+/// `tolerance`); on a two-sided feasible interval it runs `fminbound`'s bounded Brent
+/// ([`bounded_line_minimum`], `xatol = tolerance/100`); on a one-sided interval the same over
+/// `alpha = tan(t)`, `t ∈ [atan(lo), atan(hi)]`. `tolerance` is SciPy's `xtol·100`.
+///
+/// This used to be a golden-section search that stopped at a bracket width of about 1e-4 in
+/// ABSOLUTE alpha on unit directions, which capped Powell's accuracy near 2e-5 and stalled it
+/// on curved valleys (frankenscipy-de6qs).
+fn powell_line_search<F>(
     objective: &mut Objective<'_, F>,
     x: &[f64],
     fx: f64,
     direction: &[f64],
     tolerance: f64,
+    bounds: Option<&[Bound]>,
 ) -> Result<LineSearchStep, OptError>
 where
     F: Fn(&[f64]) -> f64,
 {
-    const MAX_BRACKET_STEP: f64 = 1.0e10;
-    let mut candidate_x = vec![0.0; x.len()];
-
-    // 1. Bracket the minimum along the direction
-    // Simple bracketing: start with small step, expand until we find an increase
-    let mut b = 1.0;
-    add_scaled_into(&mut candidate_x, x, direction, b);
-    let mut fb = objective.eval(&candidate_x)?;
-
-    let (mut left, mut right) = if fb > fx {
-        // Try other direction
-        b = -1.0;
-        add_scaled_into(&mut candidate_x, x, direction, b);
-        fb = objective.eval(&candidate_x)?;
-        if fb > fx {
-            // Already bracketed by (-1, 1)?
-            (-1.0, 1.0)
-        } else {
-            // Decreasing in negative direction
-            let mut step = -2.0;
-            loop {
-                add_scaled_into(&mut candidate_x, x, direction, step);
-                let f_next = objective.eval(&candidate_x)?;
-                if f_next > fb {
-                    break (step, b);
-                }
-                b = step;
-                fb = f_next;
-                step *= 2.0;
-                if step.abs() > MAX_BRACKET_STEP {
-                    add_scaled_into(&mut candidate_x, x, direction, b);
-                    return Ok(LineSearchStep {
-                        alpha: b,
-                        x: candidate_x,
-                        f: fb,
-                        accepted_gradient: None,
-                    });
-                }
-            }
-        }
-    } else {
-        // Decreasing in positive direction
-        let mut step = 2.0;
-        loop {
-            add_scaled_into(&mut candidate_x, x, direction, step);
-            let f_next = objective.eval(&candidate_x)?;
-            if f_next > fb {
-                // fb is already lower than fa, and f_next > fb, so we have a bracket [a_orig, step]
-                // but specifically [0, step] contains a minimum since f(0) > f(1) and f(step) > f(1)
-                break (0.0, step);
-            }
-            b = step;
-            fb = f_next;
-            step *= 2.0;
-            if step > MAX_BRACKET_STEP {
-                add_scaled_into(&mut candidate_x, x, direction, b);
-                return Ok(LineSearchStep {
-                    alpha: b,
-                    x: candidate_x,
-                    f: fb,
-                    accepted_gradient: None,
-                });
-            }
-        }
-    };
-
-    let phi = 0.5 * (5.0_f64.sqrt() - 1.0);
-    let mut c = right - phi * (right - left);
-    let mut d = left + phi * (right - left);
-
-    add_scaled_into(&mut candidate_x, x, direction, c);
-    let mut fc = objective.eval(&candidate_x)?;
-    add_scaled_into(&mut candidate_x, x, direction, d);
-    let mut fd = objective.eval(&candidate_x)?;
-
-    for _ in 0..60 {
-        if (right - left).abs() <= tolerance * (1.0 + left.abs().max(right.abs())) {
-            break;
-        }
-        if fc < fd {
-            right = d;
-            d = c;
-            fd = fc;
-            c = right - phi * (right - left);
-            add_scaled_into(&mut candidate_x, x, direction, c);
-            fc = objective.eval(&candidate_x)?;
-        } else {
-            left = c;
-            c = d;
-            fc = fd;
-            d = left + phi * (right - left);
-            add_scaled_into(&mut candidate_x, x, direction, d);
-            fd = objective.eval(&candidate_x)?;
-        }
-    }
-
-    let alpha = 0.5 * (left + right);
-    add_scaled_into(&mut candidate_x, x, direction, alpha);
-    let candidate_f = objective.eval(&candidate_x)?;
-    if candidate_f <= fx {
-        return Ok(LineSearchStep {
-            alpha,
-            x: candidate_x,
-            f: candidate_f,
-            accepted_gradient: None,
-        });
-    }
-
-    Ok(LineSearchStep {
+    let stay = LineSearchStep {
         alpha: 0.0,
         x: x.to_vec(),
         f: fx,
         accepted_gradient: None,
+    };
+    if direction.iter().all(|&d| d == 0.0) {
+        return Ok(stay);
+    }
+    let (lo, hi) = bounds.map_or((f64::NEG_INFINITY, f64::INFINITY), |b| {
+        feasible_step_interval(x, direction, b)
+    });
+    let mut candidate_x = vec![0.0; x.len()];
+    let mut phi = |alpha: f64| -> Result<f64, OptError> {
+        add_scaled_into(&mut candidate_x, x, direction, alpha);
+        if let Some(b) = bounds {
+            // Rounding in x + alpha*d can overshoot a bound by an ulp; the objective must only
+            // ever see feasible points.
+            project_onto_bounds(&mut candidate_x, b);
+        }
+        objective.eval(&candidate_x)
+    };
+    let (alpha, f_alpha) = if lo == f64::NEG_INFINITY && hi == f64::INFINITY {
+        brent_line_minimum(&mut phi, tolerance)?
+    } else if lo == hi {
+        return Ok(stay);
+    } else if lo.is_finite() && hi.is_finite() {
+        bounded_line_minimum(&mut phi, lo, hi, tolerance / 100.0)?
+    } else {
+        let (t, f_t) = bounded_line_minimum(
+            &mut |t: f64| phi(t.tan()),
+            lo.atan(),
+            hi.atan(),
+            tolerance / 100.0,
+        )?;
+        (t.tan(), f_t)
+    };
+    // SciPy takes the scalar minimizer's point even when it is worse than `x` (`fminbound`
+    // never evaluates the interval ends, and `x` sits on one when it is on a bound); only the
+    // bracket-recovery NaN is refused here.
+    if alpha.is_nan() || f_alpha.is_nan() {
+        return Ok(stay);
+    }
+    let mut best_x = vec![0.0; x.len()];
+    add_scaled_into(&mut best_x, x, direction, alpha);
+    if let Some(b) = bounds {
+        project_onto_bounds(&mut best_x, b);
+    }
+    Ok(LineSearchStep {
+        alpha,
+        x: best_x,
+        f: f_alpha,
+        accepted_gradient: None,
     })
+}
+
+/// SciPy's `_minimize_scalar_brent(f, brack=None, xtol=tol)` as `_linesearch_powell` calls it:
+/// `bracket` grows a downhill bracket from (0, 1) (golden ratio, parabolic extrapolation capped
+/// at 110× the last interval, ≤ 1000 iterations), then Brent's method refines it (relative
+/// `tol` plus a 1e-11 floor, ≤ 500 iterations). When no valid bracket is found the best of its
+/// three points is returned, as `_recover_from_bracket_error` does.
+fn brent_line_minimum(
+    f: &mut impl FnMut(f64) -> Result<f64, OptError>,
+    tol: f64,
+) -> Result<(f64, f64), OptError> {
+    const GOLD: f64 = 1.618_034;
+    const VERY_SMALL: f64 = 1.0e-21;
+    const GROW_LIMIT: f64 = 110.0;
+    const BRACKET_MAXITER: usize = 1000;
+    const MINTOL: f64 = 1.0e-11;
+    const CG: f64 = 0.381_966;
+    const BRENT_MAXITER: usize = 500;
+
+    let (mut xa, mut xb) = (0.0_f64, 1.0_f64);
+    let (mut fa, mut fb) = (f(xa)?, f(xb)?);
+    if fa < fb {
+        std::mem::swap(&mut xa, &mut xb);
+        std::mem::swap(&mut fa, &mut fb);
+    }
+    let mut xc = xb + GOLD * (xb - xa);
+    let mut fc = f(xc)?;
+    let mut iterations = 0;
+    let mut exhausted = false;
+    while fc < fb {
+        let tmp1 = (xb - xa) * (fb - fc);
+        let tmp2 = (xb - xc) * (fb - fa);
+        let val = tmp2 - tmp1;
+        let denom = if val.abs() < VERY_SMALL {
+            2.0 * VERY_SMALL
+        } else {
+            2.0 * val
+        };
+        let mut w = xb - ((xb - xc) * tmp2 - (xb - xa) * tmp1) / denom;
+        let wlim = xb + GROW_LIMIT * (xc - xb);
+        if iterations > BRACKET_MAXITER {
+            exhausted = true;
+            break;
+        }
+        iterations += 1;
+        let mut fw;
+        if (w - xc) * (xb - w) > 0.0 {
+            fw = f(w)?;
+            if fw < fc {
+                xa = xb;
+                xb = w;
+                fa = fb;
+                fb = fw;
+                break;
+            } else if fw > fb {
+                xc = w;
+                fc = fw;
+                break;
+            }
+            w = xc + GOLD * (xc - xb);
+            fw = f(w)?;
+        } else if (w - wlim) * (wlim - xc) >= 0.0 {
+            w = wlim;
+            fw = f(w)?;
+        } else if (w - wlim) * (xc - w) > 0.0 {
+            fw = f(w)?;
+            if fw < fc {
+                xb = xc;
+                xc = w;
+                w = xc + GOLD * (xc - xb);
+                fb = fc;
+                fc = fw;
+                fw = f(w)?;
+            }
+        } else {
+            w = xc + GOLD * (xc - xb);
+            fw = f(w)?;
+        }
+        xa = xb;
+        xb = xc;
+        xc = w;
+        fa = fb;
+        fb = fc;
+        fc = fw;
+    }
+    let valid = !exhausted
+        && ((fb < fc && fb <= fa) || (fb < fa && fb <= fc))
+        && ((xa < xb && xb < xc) || (xc < xb && xb < xa))
+        && xa.is_finite()
+        && xb.is_finite()
+        && xc.is_finite();
+    if !valid {
+        let points = [(xa, fa), (xb, fb), (xc, fc)];
+        if points.iter().any(|(x, fx)| x.is_nan() || fx.is_nan()) {
+            return Ok((f64::NAN, f64::NAN));
+        }
+        let mut best = points[0];
+        for point in &points[1..] {
+            if point.1 < best.1 {
+                best = *point;
+            }
+        }
+        return Ok(best);
+    }
+
+    let (mut x, mut w, mut v) = (xb, xb, xb);
+    let (mut fx, mut fw, mut fv) = (fb, fb, fb);
+    let (mut a, mut b) = if xa < xc { (xa, xc) } else { (xc, xa) };
+    let mut deltax = 0.0_f64;
+    let mut rat = 0.0_f64;
+    for _ in 0..BRENT_MAXITER {
+        let tol1 = tol * x.abs() + MINTOL;
+        let tol2 = 2.0 * tol1;
+        let xmid = 0.5 * (a + b);
+        if (x - xmid).abs() < tol2 - 0.5 * (b - a) {
+            break;
+        }
+        if deltax.abs() <= tol1 {
+            deltax = if x >= xmid { a - x } else { b - x };
+            rat = CG * deltax;
+        } else {
+            let tmp1 = (x - w) * (fx - fv);
+            let mut tmp2 = (x - v) * (fx - fw);
+            let mut p = (x - v) * tmp2 - (x - w) * tmp1;
+            tmp2 = 2.0 * (tmp2 - tmp1);
+            if tmp2 > 0.0 {
+                p = -p;
+            }
+            tmp2 = tmp2.abs();
+            let dx_temp = deltax;
+            deltax = rat;
+            if p > tmp2 * (a - x) && p < tmp2 * (b - x) && p.abs() < (0.5 * tmp2 * dx_temp).abs() {
+                rat = p / tmp2;
+                let u = x + rat;
+                if (u - a) < tol2 || (b - u) < tol2 {
+                    rat = if xmid - x >= 0.0 { tol1 } else { -tol1 };
+                }
+            } else {
+                deltax = if x >= xmid { a - x } else { b - x };
+                rat = CG * deltax;
+            }
+        }
+        let u = if rat.abs() < tol1 {
+            if rat >= 0.0 { x + tol1 } else { x - tol1 }
+        } else {
+            x + rat
+        };
+        let fu = f(u)?;
+        if fu > fx {
+            if u < x {
+                a = u;
+            } else {
+                b = u;
+            }
+            if fu <= fw || w == x {
+                v = w;
+                w = u;
+                fv = fw;
+                fw = fu;
+            } else if fu <= fv || v == x || v == w {
+                v = u;
+                fv = fu;
+            }
+        } else {
+            if u >= x {
+                a = x;
+            } else {
+                b = x;
+            }
+            v = w;
+            w = x;
+            x = u;
+            fv = fw;
+            fw = fx;
+            fx = fu;
+        }
+    }
+    Ok((x, fx))
+}
+
+/// SciPy's `_minimize_scalar_bounded` (`fminbound`) on `[x1, x2]`: Brent's method with
+/// tolerance `√eps·|x| + xatol/3`, at most 500 evaluations. Returns the best point evaluated.
+fn bounded_line_minimum(
+    f: &mut impl FnMut(f64) -> Result<f64, OptError>,
+    x1: f64,
+    x2: f64,
+    xatol: f64,
+) -> Result<(f64, f64), OptError> {
+    const MAXFUN: usize = 500;
+    let sqrt_eps = 2.2e-16_f64.sqrt();
+    let golden_mean = 0.5 * (3.0 - 5.0_f64.sqrt());
+    // np.sign(v) + (v == 0): the sign, with 0 counted as positive.
+    let sign = |v: f64| if v < 0.0 { -1.0 } else { 1.0 };
+
+    let (mut a, mut b) = (x1, x2);
+    let mut fulc = a + golden_mean * (b - a);
+    let (mut nfc, mut xf) = (fulc, fulc);
+    let (mut rat, mut e) = (0.0_f64, 0.0_f64);
+    let mut fx = f(xf)?;
+    let mut num = 1;
+    let (mut ffulc, mut fnfc) = (fx, fx);
+    let mut xm = 0.5 * (a + b);
+    let mut tol1 = sqrt_eps * xf.abs() + xatol / 3.0;
+    let mut tol2 = 2.0 * tol1;
+    while (xf - xm).abs() > tol2 - 0.5 * (b - a) {
+        let mut golden = true;
+        if e.abs() > tol1 {
+            golden = false;
+            let r = (xf - nfc) * (fx - ffulc);
+            let mut q = (xf - fulc) * (fx - fnfc);
+            let mut p = (xf - fulc) * q - (xf - nfc) * r;
+            q = 2.0 * (q - r);
+            if q > 0.0 {
+                p = -p;
+            }
+            q = q.abs();
+            let r = e;
+            e = rat;
+            if p.abs() < (0.5 * q * r).abs() && p > q * (a - xf) && p < q * (b - xf) {
+                rat = p / q;
+                let x = xf + rat;
+                if (x - a) < tol2 || (b - x) < tol2 {
+                    rat = tol1 * sign(xm - xf);
+                }
+            } else {
+                golden = true;
+            }
+        }
+        if golden {
+            e = if xf >= xm { a - xf } else { b - xf };
+            rat = golden_mean * e;
+        }
+        let x = xf + sign(rat) * rat.abs().max(tol1);
+        let fu = f(x)?;
+        num += 1;
+        if fu <= fx {
+            if x >= xf {
+                a = xf;
+            } else {
+                b = xf;
+            }
+            fulc = nfc;
+            ffulc = fnfc;
+            nfc = xf;
+            fnfc = fx;
+            xf = x;
+            fx = fu;
+        } else {
+            if x < xf {
+                a = x;
+            } else {
+                b = x;
+            }
+            if fu <= fnfc || nfc == xf {
+                fulc = nfc;
+                ffulc = fnfc;
+                nfc = x;
+                fnfc = fu;
+            } else if fu <= ffulc || fulc == xf || fulc == nfc {
+                fulc = x;
+                ffulc = fu;
+            }
+        }
+        xm = 0.5 * (a + b);
+        tol1 = sqrt_eps * xf.abs() + xatol / 3.0;
+        tol2 = 2.0 * tol1;
+        if num >= MAXFUN {
+            break;
+        }
+    }
+    Ok((xf, fx))
 }
 
 fn result_from_error(
@@ -3058,6 +3794,7 @@ fn result_from_error(
         }
         OptError::SignChangeRequired { detail } => (ConvergenceStatus::InvalidInput, detail),
         OptError::NotImplemented { detail } => (ConvergenceStatus::NotImplemented, detail),
+        OptError::NotConverged { detail } => (ConvergenceStatus::MaxIterations, detail),
     };
     OptimizeResult {
         x: x.to_vec(),
@@ -3446,6 +4183,7 @@ where
             return Ok(MinimizeScalarResult {
                 x,
                 fun: fx,
+                // status: Brent bracket stop |x − mid| ≤ 2·tol1 − (b−a)/2
                 success: true,
                 nfev,
                 nit,
@@ -3627,7 +4365,8 @@ where
     let mut njev = 0usize;
 
     let mut grad = {
-        let value = finite_diff_gradient(&mut objective, &x, options.gradient_eps)?;
+        let value =
+            evaluate_minimize_gradient(&mut objective, options.gradient, &x, options.gradient_eps)?;
         njev += 1;
         value
     };
@@ -3651,6 +4390,7 @@ where
                 &OptimizeResult {
                     x: x.clone(),
                     fun: Some(f),
+                    // status: ‖projected ∇f‖₂ < tol (plain ∇f when no bounds)
                     success: true,
                     status: ConvergenceStatus::Success,
                     message: String::from("Convergence: gradient norm below tolerance"),
@@ -3666,6 +4406,7 @@ where
             return Ok(OptimizeResult {
                 x,
                 fun: Some(f),
+                // status: ‖projected ∇f‖₂ < tol (plain ∇f when no bounds)
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: String::from("Convergence: gradient norm below tolerance"),
@@ -3732,7 +4473,12 @@ where
             }
         };
 
-        let grad_new = match finite_diff_gradient(&mut objective, &x_new, options.gradient_eps) {
+        let grad_new = match evaluate_minimize_gradient(
+            &mut objective,
+            options.gradient,
+            &x_new,
+            options.gradient_eps,
+        ) {
             Ok(v) => {
                 njev += 1;
                 v
@@ -3858,210 +4604,358 @@ fn conjugate_gradient_solve(a: &[Vec<f64>], b: &[f64], tol: f64, max_iter: usize
 // SLSQP (Sequential Least Squares Programming)
 // ══════════════════════════════════════════════════════════════════════
 
+/// Refuse bounds and constraints for a kernel that cannot honour them yet.
+///
+/// `trust_constr` below is an UNCONSTRAINED quasi-Newton kernel; the constrained algorithm SciPy
+/// runs under that name is frankenscipy-1ksfv.2. SciPy honours bounds and constraints for it, so
+/// ignoring them returned an infeasible optimum under `success = true` (`(x-3)^2` with bounds
+/// `[(0,2)]` came back as `x = 3`; frankenscipy-szq1n.7). Bounds: SLSQP, L-BFGS-B, TNC or
+/// Nelder-Mead. General constraints: SLSQP.
+fn reject_unhonoured_constraints(method: &str, options: MinimizeOptions) -> Result<(), OptError> {
+    if options.bounds.is_some_and(bounds_have_finite_limit) {
+        return Err(OptError::InvalidArgument {
+            detail: format!(
+                "{method} does not implement bounds yet; use SLSQP, L-BFGS-B, TNC or Nelder-Mead for box constraints"
+            ),
+        });
+    }
+    if !options.constraints.is_empty() {
+        return Err(OptError::InvalidArgument {
+            detail: format!("{method} does not implement constraints yet; use SLSQP"),
+        });
+    }
+    Ok(())
+}
+
+/// `scipy.optimize.minimize(method='SLSQP')`: Kraft's sequential least-squares QP (see
+/// [`crate::slsqp`]) under `options.bounds` and `options.constraints`.
+///
+/// SciPy's option mapping: `tol` is `ftol` (default 1e-6), `maxiter` defaults to 100, and
+/// `gradient_eps` is `eps`, the absolute forward-difference step for the gradient (when
+/// `options.gradient` is absent) and for every constraint without `jac` — stepped backwards or
+/// shortened at a bound exactly as `approx_derivative(..., '2-point', abs_step=eps, bounds)`
+/// does. SciPy's default `eps` is √ε ≈ 1.49e-8; fsci's shared default is 1e-8. `x0` is clipped
+/// into the bounds first. The message is SciPy's exit-mode text; `maxcv` is the largest
+/// constraint violation at `x`. In Strict mode a non-finite objective value is passed to the
+/// algorithm as SciPy's is (its convergence tests never accept one); Hardened mode rejects it.
 pub fn slsqp<F>(fun: &F, x0: &[f64], options: MinimizeOptions) -> Result<OptimizeResult, OptError>
 where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
-
-    let n = x0.len();
-    let tol = requested_tolerance(options.tol);
-    let maxiter = options.maxiter.unwrap_or((200 * n).max(100));
-    let maxfev = options.maxfev.unwrap_or((2000 * n).max(400));
-    let mut objective = Objective::new(fun, options.mode, maxfev);
-
-    let mut x = x0.to_vec();
-    let mut f = objective.eval(&x)?;
-
-    let mut grad = finite_diff_gradient(&mut objective, &x, options.gradient_eps)?;
-    let mut hess_approx = vec![vec![0.0; n]; n];
-    for (i, row) in hess_approx.iter_mut().enumerate().take(n) {
-        row[i] = 1.0;
+    if x0.is_empty() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("x0 must be a finite 1-D vector with at least one element"),
+        });
     }
+    if x0.iter().any(|v| !v.is_finite()) {
+        return Err(OptError::NonFiniteInput {
+            detail: String::from("x0 must not contain NaN or Inf"),
+        });
+    }
+    validate_bounds_for_x0(x0, options.bounds)?;
+    let n = x0.len();
+    let (lb, ub): (Vec<f64>, Vec<f64>) = match options.bounds {
+        Some(bounds) => bounds
+            .iter()
+            .map(|&(lo, hi)| (lo.unwrap_or(f64::NEG_INFINITY), hi.unwrap_or(f64::INFINITY)))
+            .unzip(),
+        None => (vec![f64::NEG_INFINITY; n], vec![f64::INFINITY; n]),
+    };
+    let mut x: Vec<f64> = x0
+        .iter()
+        .zip(lb.iter().zip(&ub))
+        .map(|(&v, (&lo, &hi))| v.max(lo).min(hi))
+        .collect();
 
-    for iteration in 0..maxiter {
-        let grad_norm = grad.iter().map(|g| g * g).sum::<f64>().sqrt();
-        if grad_norm < tol {
-            log_completion(
-                OptimizeMethod::Slsqp,
-                options,
-                iteration,
-                &OptimizeResult {
-                    x: x.clone(),
-                    fun: Some(f),
-                    success: true,
-                    status: ConvergenceStatus::Success,
-                    message: String::from("Convergence: gradient norm below tolerance"),
-                    nfev: objective.nfev,
-                    njev: iteration,
-                    nhev: 0,
-                    nit: iteration,
-                    jac: Some(grad.clone()),
-                    hess_inv: None,
-                    maxcv: None,
-                },
-            );
-            return Ok(OptimizeResult {
+    // SciPy triages constraints into equalities then inequalities, each in the given order,
+    // and sizes them by one evaluation at the clipped x0.
+    let ordered: Vec<&Constraint<'_>> = options
+        .constraints
+        .iter()
+        .filter(|c| c.kind == ConstraintType::Eq)
+        .chain(
+            options
+                .constraints
+                .iter()
+                .filter(|c| c.kind == ConstraintType::Ineq),
+        )
+        .collect();
+    let sizes: Vec<usize> = ordered.iter().map(|c| (c.fun)(&x).len()).collect();
+    let meq: usize = ordered
+        .iter()
+        .zip(&sizes)
+        .filter(|(c, _)| c.kind == ConstraintType::Eq)
+        .map(|(_, &s)| s)
+        .sum();
+    let m: usize = sizes.iter().sum();
+    let acc = options.tol.unwrap_or(1.0e-6);
+    let maxiter = options.maxiter.unwrap_or(100);
+    let xl: Vec<f64> = lb
+        .iter()
+        .map(|&v| if v.is_finite() { v } else { f64::NAN })
+        .collect();
+    let xu: Vec<f64> = ub
+        .iter()
+        .map(|&v| if v.is_finite() { v } else { f64::NAN })
+        .collect();
+
+    let mut driver = SlsqpDriver {
+        fun,
+        constraints: ordered,
+        sizes,
+        m,
+        gradient: options.gradient,
+        callback: options.callback,
+        eps: options.gradient_eps,
+        lb,
+        ub,
+        mode: options.mode,
+        maxfev: options.maxfev.unwrap_or(usize::MAX),
+        nfev: 0,
+        njev: 0,
+        last_f: f64::NAN,
+    };
+    let outcome = crate::slsqp::run(&mut driver, &mut x, &xl, &xu, m, meq, acc, maxiter);
+    let maxcv = if m > 0 {
+        Some(driver.max_violation(&x))
+    } else {
+        None
+    };
+    let result = match outcome {
+        Ok(out) => {
+            let status = if out.stopped_by_callback {
+                ConvergenceStatus::CallbackStop
+            } else {
+                match out.mode {
+                    0 => ConvergenceStatus::Success,
+                    9 => ConvergenceStatus::MaxIterations,
+                    4 => ConvergenceStatus::Infeasible,
+                    2 => ConvergenceStatus::InvalidInput,
+                    _ => ConvergenceStatus::PrecisionLoss,
+                }
+            };
+            let message = if out.stopped_by_callback {
+                String::from("Optimization stopped by callback")
+            } else {
+                String::from(crate::slsqp::exit_message(out.mode))
+            };
+            OptimizeResult {
                 x,
-                fun: Some(f),
-                success: true,
-                status: ConvergenceStatus::Success,
-                message: String::from("Convergence: gradient norm below tolerance"),
-                nfev: objective.nfev,
-                njev: iteration,
+                fun: Some(out.fx),
+                // status: SciPy SLSQP exit mode 0 (KKT and step tests passed on a consistent QP)
+                success: out.mode == 0 && !out.stopped_by_callback,
+                status,
+                message,
+                nfev: driver.nfev,
+                njev: driver.njev,
                 nhev: 0,
-                nit: iteration,
-                jac: Some(grad),
+                nit: out.iter,
+                jac: Some(out.grad),
                 hess_inv: None,
-                maxcv: None,
+                maxcv,
+            }
+        }
+        Err(OptError::EvaluationBudgetExceeded { detail }) => OptimizeResult {
+            x,
+            fun: Some(driver.last_f),
+            success: false,
+            status: ConvergenceStatus::MaxEvaluations,
+            message: detail,
+            nfev: driver.nfev,
+            njev: driver.njev,
+            nhev: 0,
+            nit: 0,
+            jac: None,
+            hess_inv: None,
+            maxcv,
+        },
+        Err(err) => return Err(err),
+    };
+    log_completion(OptimizeMethod::Slsqp, options, result.nit, &result);
+    Ok(result)
+}
+
+/// The objective and constraints of one `slsqp` call, with SciPy's finite differences.
+struct SlsqpDriver<'a, F> {
+    fun: &'a F,
+    constraints: Vec<&'a Constraint<'a>>,
+    sizes: Vec<usize>,
+    m: usize,
+    gradient: Option<GradientFunc>,
+    callback: Option<crate::types::MinimizeCallback>,
+    eps: f64,
+    lb: Vec<f64>,
+    ub: Vec<f64>,
+    mode: RuntimeMode,
+    maxfev: usize,
+    nfev: usize,
+    njev: usize,
+    last_f: f64,
+}
+
+impl<F> SlsqpDriver<'_, F>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    fn eval_f(&mut self, x: &[f64]) -> Result<f64, OptError> {
+        if self.nfev >= self.maxfev {
+            return Err(OptError::EvaluationBudgetExceeded {
+                detail: format!("max function evaluations exceeded ({})", self.maxfev),
             });
         }
+        self.nfev += 1;
+        let value = (self.fun)(x);
+        if !value.is_finite() && self.mode == RuntimeMode::Hardened {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("hardened mode rejects non-finite objective values"),
+            });
+        }
+        Ok(value)
+    }
 
-        let direction = solve_qp_subproblem(&hess_approx, &grad);
-
-        let line = match armijo_backtracking(&mut objective, &x, f, &grad, &direction)? {
-            Some(value) => value,
-            None => {
-                return Ok(OptimizeResult {
-                    x,
-                    fun: Some(f),
-                    success: false,
-                    status: ConvergenceStatus::PrecisionLoss,
-                    message: String::from("SLSQP line search failed"),
-                    nfev: objective.nfev,
-                    njev: iteration,
-                    nhev: 0,
-                    nit: iteration,
-                    jac: Some(grad),
-                    hess_inv: None,
-                    maxcv: None,
+    /// All constraint values at `x`, equalities first.
+    fn eval_constraints(&self, x: &[f64]) -> Result<Vec<f64>, OptError> {
+        let mut out = Vec::with_capacity(self.m);
+        for (k, (con, &size)) in self.constraints.iter().zip(&self.sizes).enumerate() {
+            let values = (con.fun)(x);
+            if values.len() != size {
+                return Err(OptError::InvalidArgument {
+                    detail: format!(
+                        "constraint {k} returned {} values, {size} at x0",
+                        values.len()
+                    ),
                 });
             }
+            if self.mode == RuntimeMode::Hardened && values.iter().any(|v| !v.is_finite()) {
+                return Err(OptError::NonFiniteInput {
+                    detail: format!("hardened mode rejects non-finite values of constraint {k}"),
+                });
+            }
+            out.extend(values);
+        }
+        Ok(out)
+    }
+
+    /// SciPy `approx_derivative(method='2-point', abs_step=eps, bounds=(lb, ub))` steps.
+    fn fd_steps(&self, x: &[f64]) -> Vec<f64> {
+        let unbounded = self.lb.iter().all(|v| *v == f64::NEG_INFINITY)
+            && self.ub.iter().all(|v| *v == f64::INFINITY);
+        x.iter()
+            .enumerate()
+            .map(|(i, &xi)| {
+                let mut h = self.eps;
+                if (xi + h) - xi == 0.0 {
+                    let sign = if xi >= 0.0 { 1.0 } else { -1.0 };
+                    h = f64::EPSILON.sqrt() * sign * xi.abs().max(1.0);
+                }
+                if !unbounded {
+                    let lower = xi - self.lb[i];
+                    let upper = self.ub[i] - xi;
+                    let trial = xi + h;
+                    let violated = trial < self.lb[i] || trial > self.ub[i];
+                    let fitting = h.abs() <= lower.max(upper);
+                    if violated && fitting {
+                        h = -h;
+                    } else if !fitting {
+                        h = if upper >= lower { upper } else { -lower };
+                    }
+                }
+                h
+            })
+            .collect()
+    }
+
+    fn max_violation(&self, x: &[f64]) -> f64 {
+        let Ok(values) = self.eval_constraints(x) else {
+            return f64::NAN;
         };
-        let alpha = line.alpha;
-        let f_new = line.f;
-
-        let s: Vec<f64> = direction.iter().map(|d| alpha * d).collect();
-        let x_new: Vec<f64> = x.iter().zip(s.iter()).map(|(xi, si)| xi + si).collect();
-        let grad_new = finite_diff_gradient(&mut objective, &x_new, options.gradient_eps)?;
-
-        let y: Vec<f64> = grad_new
+        let meq: usize = self
+            .constraints
             .iter()
-            .zip(grad.iter())
-            .map(|(gn, go)| gn - go)
-            .collect();
-        let sy: f64 = s.iter().zip(y.iter()).map(|(si, yi)| si * yi).sum();
-
-        if sy > 1.0e-12 {
-            bfgs_update(&mut hess_approx, &s, &y, sy);
-        }
-
-        let step_norm: f64 = s.iter().map(|si| si * si).sum::<f64>().sqrt();
-        if step_norm < tol * (1.0 + x.iter().map(|xi| xi.abs()).sum::<f64>() / n as f64) {
-            log_completion(
-                OptimizeMethod::Slsqp,
-                options,
-                iteration + 1,
-                &OptimizeResult {
-                    x: x_new.clone(),
-                    fun: Some(f_new),
-                    success: true,
-                    status: ConvergenceStatus::Success,
-                    message: String::from("Convergence: step size below tolerance"),
-                    nfev: objective.nfev,
-                    njev: iteration + 1,
-                    nhev: 0,
-                    nit: iteration + 1,
-                    jac: Some(grad_new.clone()),
-                    hess_inv: None,
-                    maxcv: None,
-                },
-            );
-            return Ok(OptimizeResult {
-                x: x_new,
-                fun: Some(f_new),
-                success: true,
-                status: ConvergenceStatus::Success,
-                message: String::from("Convergence: step size below tolerance"),
-                nfev: objective.nfev,
-                njev: iteration + 1,
-                nhev: 0,
-                nit: iteration + 1,
-                jac: Some(grad_new),
-                hess_inv: None,
-                maxcv: None,
-            });
-        }
-
-        x = x_new;
-        f = f_new;
-        grad = grad_new;
-
-        if let Some(cb) = options.callback
-            && cb(&x)
-        {
-            return Ok(OptimizeResult {
-                x,
-                fun: Some(f),
-                success: false,
-                status: ConvergenceStatus::CallbackStop,
-                message: String::from("Optimization stopped by callback"),
-                nfev: objective.nfev,
-                njev: iteration + 1,
-                nhev: 0,
-                nit: iteration + 1,
-                jac: Some(grad),
-                hess_inv: None,
-                maxcv: None,
-            });
-        }
+            .zip(&self.sizes)
+            .filter(|(c, _)| c.kind == ConstraintType::Eq)
+            .map(|(_, &s)| s)
+            .sum();
+        values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| if i < meq { v.abs() } else { (-v).max(0.0) })
+            .fold(0.0, f64::max)
     }
-
-    Ok(OptimizeResult {
-        x,
-        fun: Some(f),
-        success: false,
-        status: ConvergenceStatus::MaxIterations,
-        message: String::from("Maximum iterations reached"),
-        nfev: objective.nfev,
-        njev: maxiter,
-        nhev: 0,
-        nit: maxiter,
-        jac: Some(grad),
-        hess_inv: None,
-        maxcv: None,
-    })
 }
 
-fn solve_qp_subproblem(h: &[Vec<f64>], g: &[f64]) -> Vec<f64> {
-    let n = g.len();
-    let mut direction = vec![0.0; n];
-    for i in 0..n {
-        if h[i][i].abs() > 1.0e-12 {
-            direction[i] = -g[i] / h[i][i];
+impl<F> crate::slsqp::SlsqpProblem for SlsqpDriver<'_, F>
+where
+    F: Fn(&[f64]) -> f64,
+{
+    type Error = OptError;
+
+    fn eval_fc(&mut self, x: &[f64], d: &mut [f64]) -> Result<f64, OptError> {
+        let f = self.eval_f(x)?;
+        self.last_f = f;
+        d.copy_from_slice(&self.eval_constraints(x)?);
+        Ok(f)
+    }
+
+    fn eval_gc(
+        &mut self,
+        x: &[f64],
+        fx: f64,
+        g: &mut [f64],
+        c: &mut [f64],
+    ) -> Result<(), OptError> {
+        self.njev += 1;
+        let n = x.len();
+        let steps = self.fd_steps(x);
+        if let Some(gradient) = self.gradient {
+            g.copy_from_slice(&validate_gradient_output(gradient(x), n)?);
         } else {
-            direction[i] = -g[i];
+            let mut xp = x.to_vec();
+            for i in 0..n {
+                xp[i] = x[i] + steps[i];
+                let dx = xp[i] - x[i];
+                g[i] = (self.eval_f(&xp)? - fx) / dx;
+                xp[i] = x[i];
+            }
         }
+        let lda = self.m.max(1);
+        let mut row = 0;
+        for (k, (con, &size)) in self.constraints.iter().zip(&self.sizes).enumerate() {
+            let jac: Vec<Vec<f64>> = if let Some(jac) = &con.jac {
+                jac(x)
+            } else {
+                let c0 = (con.fun)(x);
+                let mut cols = vec![vec![0.0; n]; size];
+                let mut xp = x.to_vec();
+                for i in 0..n {
+                    xp[i] = x[i] + steps[i];
+                    let dx = xp[i] - x[i];
+                    let c1 = (con.fun)(&xp);
+                    for r in 0..size.min(c1.len()).min(c0.len()) {
+                        cols[r][i] = (c1[r] - c0[r]) / dx;
+                    }
+                    xp[i] = x[i];
+                }
+                cols
+            };
+            if jac.len() != size || jac.iter().any(|r| r.len() != n) {
+                return Err(OptError::InvalidArgument {
+                    detail: format!("jacobian of constraint {k} must be {size}x{n}"),
+                });
+            }
+            for (r, jrow) in jac.iter().enumerate() {
+                for (i, &v) in jrow.iter().enumerate() {
+                    c[row + r + i * lda] = v;
+                }
+            }
+            row += size;
+        }
+        Ok(())
     }
-    direction
-}
 
-fn bfgs_update(h: &mut [Vec<f64>], s: &[f64], y: &[f64], sy: f64) {
-    let n = s.len();
-    let rho = 1.0 / sy;
-
-    let mut hy = vec![0.0; n];
-    for i in 0..n {
-        for j in 0..n {
-            hy[i] += h[i][j] * y[j];
-        }
-    }
-    let yhy: f64 = y.iter().zip(hy.iter()).map(|(yi, hyi)| yi * hyi).sum();
-
-    for i in 0..n {
-        for j in 0..n {
-            h[i][j] += rho * (1.0 + rho * yhy) * s[i] * s[j] - rho * (s[i] * hy[j] + hy[i] * s[j]);
-        }
+    fn callback(&mut self, x: &[f64], _fx: f64) -> bool {
+        self.callback.is_some_and(|cb| cb(x))
     }
 }
 
@@ -4078,6 +4972,7 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    reject_unhonoured_constraints("trust-constr", options)?;
 
     let n = x0.len();
     let tol = requested_tolerance(options.tol);
@@ -4088,7 +4983,8 @@ where
     let mut x = x0.to_vec();
     let mut f = objective.eval(&x)?;
 
-    let mut grad = finite_diff_gradient(&mut objective, &x, options.gradient_eps)?;
+    let mut grad =
+        evaluate_minimize_gradient(&mut objective, options.gradient, &x, options.gradient_eps)?;
     let mut trust_radius = 1.0;
     let eta = 0.15;
     // Quasi-Newton Hessian approximation B for the quadratic trust-region
@@ -4109,6 +5005,7 @@ where
                 &OptimizeResult {
                     x: x.clone(),
                     fun: Some(f),
+                    // status: KKT optimality ‖∇f‖_inf ≤ tol (unconstrained)
                     success: true,
                     status: ConvergenceStatus::Success,
                     message: format!(
@@ -4126,6 +5023,7 @@ where
             return Ok(OptimizeResult {
                 x,
                 fun: Some(f),
+                // status: KKT optimality ‖∇f‖_inf ≤ tol (unconstrained)
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: format!("Convergence: KKT optimality {kkt_optimality:.3e} <= tolerance"),
@@ -4185,7 +5083,12 @@ where
         }
 
         if rho > eta {
-            let grad_new = finite_diff_gradient(&mut objective, &x_new, options.gradient_eps)?;
+            let grad_new = evaluate_minimize_gradient(
+                &mut objective,
+                options.gradient,
+                &x_new,
+                options.gradient_eps,
+            )?;
             // BFGS update of the Hessian model:
             //   B_{k+1} = B_k - (B s)(B s)^T / (s^T B s) + (y y^T) / (y^T s).
             let y: Vec<f64> = grad_new
@@ -4210,6 +5113,7 @@ where
             return Ok(OptimizeResult {
                 x,
                 fun: Some(f),
+                // status: trust radius < tol·1e-6 (SciPy trust-constr xtol stop, status 2 = success)
                 success: true,
                 status: ConvergenceStatus::Success,
                 message: String::from("Convergence: trust radius below tolerance"),
@@ -4344,11 +5248,12 @@ mod tests {
     use super::{slsqp, tnc, trust_constr};
 
     use super::{
-        Objective, golden_section_direction_search, minimize_with_casp,
-        minimize_with_casp_portfolio,
+        Objective, feasible_step_interval, minimize_with_casp, minimize_with_casp_portfolio,
+        powell_line_search,
     };
     use crate::{
-        Bound, ConvergenceStatus, MinimizeOptions, MinimizeScalarOptions, OptCaspProblem, OptError,
+        Bound, Constraint, ConvergenceStatus, HessFunc, HesspFunc, LinearConstraint,
+        MinimizeOptions, MinimizeScalarOptions, NonlinearConstraint, OptCaspProblem, OptError,
         OptimizeMethod, OptimizeResult, bfgs, cg_pr_plus, get_optimize_traces, minimize,
         minimize_many, minimize_scalar, minimize_scalar_many, powell, select_minimize_method,
     };
@@ -4537,8 +5442,51 @@ mod tests {
             hessian_product_available: true,
         })
         .expect("selector");
-        assert_eq!(trust.method, OptimizeMethod::TrustExact);
-        assert!(trust.reason.contains("trust-region"));
+        // trust-ncg, which uses the products that selected it; the BFGS-model trust-exact
+        // this used to pick never called `hessp`.
+        assert_eq!(trust.method, OptimizeMethod::TrustNcg);
+        assert!(trust.reason.contains("trust-ncg"));
+    }
+
+    static SELECTED_HESSP_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn counted_offset_quadratic_hessp(_x: &[f64], p: &[f64]) -> Vec<f64> {
+        SELECTED_HESSP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        vec![2.0 * p[0], 2.0 * p[1]]
+    }
+
+    fn offset_quadratic_gradient(x: &[f64]) -> Vec<f64> {
+        vec![2.0 * (x[0] - 3.0), 2.0 * (x[1] - 1.0e8)]
+    }
+
+    #[test]
+    fn casp_trust_region_route_uses_the_hessian_products_that_selected_it() {
+        // x0 spans eight orders of magnitude, so CASP takes its small ill-scaled branch.
+        let options = MinimizeOptions {
+            gradient: Some(offset_quadratic_gradient),
+            hessp: Some(counted_offset_quadratic_hessp),
+            ..MinimizeOptions::default()
+        };
+        let x0 = [1.0, 1.0e8 + 1.0];
+        let decision =
+            select_minimize_method(OptCaspProblem::from_x0_and_options(&x0, options)).unwrap();
+        assert_eq!(decision.method, OptimizeMethod::TrustNcg);
+        let before = SELECTED_HESSP_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+        let result = minimize(
+            |x: &[f64]| (x[0] - 3.0).powi(2) + (x[1] - 1.0e8).powi(2),
+            &x0,
+            options,
+        )
+        .expect("minimize");
+        let calls = SELECTED_HESSP_CALLS.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(calls > 0, "the selected method never called hessp");
+        assert!(result.success, "{}", result.message);
+        assert!(
+            (result.x[0] - 3.0).abs() < 1e-4 && (result.x[1] - 1.0e8).abs() < 1e-4,
+            "x = {:?}",
+            result.x
+        );
     }
 
     #[test]
@@ -4689,21 +5637,35 @@ mod tests {
         );
     }
 
+    // frankenscipy-1ksfv.1: with constraints and no method, `minimize` routes to SLSQP exactly as
+    // `scipy.optimize.minimize` does, and honours them. SciPy 1.17.1:
+    // minimize((x-2)^2 + (y-1)^2, [0, 0], constraints=[{'type': 'ineq', 'fun': 1 - x - y}])
+    // -> x = [1, 0], fun = 2, success. The unconstrained optimum (2, 1) violates it by 2.
     #[test]
-    fn casp_default_minimize_uses_trust_constr_when_constraints_are_flagged() {
-        const FIXTURE_ID: &str = "casp-default-trust-constr";
+    fn casp_default_minimize_routes_constraints_to_slsqp() {
+        const FIXTURE_ID: &str = "casp-default-slsqp";
         let _ = get_optimize_traces();
+        let constraints = [Constraint::ineq(|v: &[f64]| vec![1.0 - v[0] - v[1]])];
         let options = MinimizeOptions {
             method: None,
-            has_general_constraints: true,
+            constraints: &constraints,
             fixture_id: Some(FIXTURE_ID),
-            tol: Some(1.0e-8),
-            maxiter: Some(10),
-            maxfev: Some(100),
             ..MinimizeOptions::default()
         };
-        let result = minimize(zero_function, &[0.0, 0.0], options).expect("trust-constr minimize");
-        assert!(result.success, "{}", result.message);
+        let r = minimize(
+            |v: &[f64]| (v[0] - 2.0).powi(2) + (v[1] - 1.0).powi(2),
+            &[0.0, 0.0],
+            options,
+        )
+        .expect("slsqp run");
+        assert!(r.success, "{}", r.message);
+        assert!(
+            (r.x[0] - 1.0).abs() < 1e-6 && r.x[1].abs() < 1e-6,
+            "x = {:?} (the unconstrained optimum is (2, 1))",
+            r.x
+        );
+        assert!((r.fun.expect("fun") - 2.0).abs() < 1e-8);
+        assert!(r.maxcv.expect("maxcv") <= 1e-8, "maxcv {:?}", r.maxcv);
 
         let traces = get_optimize_traces();
         let decision = traces
@@ -4712,7 +5674,7 @@ mod tests {
                 entry.event == "casp_decision" && entry.fixture_id.as_deref() == Some(FIXTURE_ID)
             })
             .expect("CASP decision trace");
-        assert_eq!(decision.method, OptimizeMethod::TrustConstr);
+        assert_eq!(decision.method, OptimizeMethod::Slsqp);
         assert!(
             decision
                 .reason
@@ -5420,6 +6382,33 @@ mod tests {
         );
     }
 
+    /// frankenscipy-cjv9z: Powell's stopping test must be relative in f, as SciPy's is. The
+    /// absolute `|Δf| ≤ tol` stopped `1e-12·rosen` after one sweep, far from x* = (1, 1).
+    /// SciPy 1.17.1, same x0 and tol=1e-6: x* to 2.4e-6 at scale 1e-12 and 4e-14 unscaled.
+    #[test]
+    fn powell_stopping_test_is_invariant_to_objective_scale() {
+        let rosen = |x: &[f64]| 100.0 * (x[1] - x[0] * x[0]).powi(2) + (1.0 - x[0]).powi(2);
+        let options = MinimizeOptions {
+            method: Some(OptimizeMethod::Powell),
+            tol: Some(1.0e-6),
+            mode: RuntimeMode::Strict,
+            ..MinimizeOptions::default()
+        };
+        for scale in [1.0, 1.0e-6, 1.0e-12] {
+            let scaled = |x: &[f64]| scale * rosen(x);
+            let result = powell(&scaled, &[-1.2, 1.0], options).expect("powell executes");
+            let err = (result.x[0] - 1.0).abs().max((result.x[1] - 1.0).abs());
+            assert!(
+                result.success && err < 1.0e-4,
+                "scale {scale}: x = {:?}, success {}, nit {}, nfev {}",
+                result.x,
+                result.success,
+                result.nit,
+                result.nfev
+            );
+        }
+    }
+
     #[test]
     fn minimize_scalar_many_byte_identical_to_per_param() {
         // 1-D minimization sweep: minimize (x - p0)^2 + p1 over a shared bracket for many params.
@@ -5459,12 +6448,11 @@ mod tests {
     }
 
     #[test]
-    fn golden_section_direction_search_returns_best_sample_when_no_bracket_exists() {
+    fn powell_line_search_returns_best_sample_when_no_bracket_exists() {
         let fun = |x: &[f64]| x[0].exp();
-        let mut objective = Objective::new(&fun, RuntimeMode::Strict, 512);
-        let search =
-            golden_section_direction_search(&mut objective, &[0.0], fun(&[0.0]), &[1.0], 1.0e-6)
-                .expect("line search succeeds");
+        let mut objective = Objective::new(&fun, RuntimeMode::Strict, 5000);
+        let search = powell_line_search(&mut objective, &[0.0], fun(&[0.0]), &[1.0], 1.0e-4, None)
+            .expect("line search succeeds");
         assert!(
             search.alpha < 0.0,
             "search should move downhill in the negative direction"
@@ -5474,6 +6462,32 @@ mod tests {
             search.f < 1.0,
             "best sampled point should improve the objective"
         );
+    }
+
+    /// frankenscipy-de6qs: the golden-section search this replaced resolved alpha only to about
+    /// 1e-4 absolute. Brent's parabolic steps land on a quadratic's minimum; the bounded
+    /// searches stop at the active bound.
+    #[test]
+    fn powell_line_search_is_precise_like_scipy_brent() {
+        let fun = |x: &[f64]| (x[0] - 0.3).powi(2) + (x[1] + 0.7).powi(2) + 1.0;
+        let run = |direction: &[f64], bounds: Option<&[Bound]>| {
+            let mut objective = Objective::new(&fun, RuntimeMode::Strict, 5000);
+            powell_line_search(&mut objective, &[0.0, 0.0], 1.58, direction, 1.0e-4, bounds)
+                .expect("line search")
+        };
+        let unbounded = run(&[1.0, 0.0], None);
+        assert!((unbounded.alpha - 0.3).abs() < 1e-9, "{}", unbounded.alpha);
+        // Scaled direction: the step is found in units of the direction.
+        let scaled = run(&[0.0, -1.0e-3], None);
+        assert!((scaled.alpha - 700.0).abs() < 1e-6, "{}", scaled.alpha);
+        // Bounded: fminbound stops within about xatol = 1e-6 of the active bound.
+        let two_sided: [Bound; 2] = [(Some(-1.0), Some(0.2)), (None, None)];
+        let capped = run(&[1.0, 0.0], Some(&two_sided));
+        assert!((capped.x[0] - 0.2).abs() < 5e-6, "{:?}", capped.x);
+        let one_sided: [Bound; 2] = [(None, Some(0.2)), (None, None)];
+        let capped = run(&[1.0, 0.0], Some(&one_sided));
+        assert!((capped.x[0] - 0.2).abs() < 5e-6, "{:?}", capped.x);
+        assert!(capped.x[0] <= 0.2);
     }
 
     #[test]
@@ -5894,6 +6908,203 @@ mod tests {
     }
 
     // ── Nelder-Mead tests ───────────────────────────────────────────
+
+    // frankenscipy-szq1n.7: Nelder-Mead ignored bounds and returned the unconstrained optimum
+    // under success = true. SciPy 1.17.1 clips every trial point:
+    //   (x0-3)^2+(x1+1)^2, x0=[0.5,0.5], bounds [(0,2),(0,1)] -> x=[2,0], fun=2.0
+    //   rosen, x0=[0,0], bounds [(None,0.5),(None,None)] -> x=[0.5,0.24999], fun=0.2500000152
+    #[test]
+    fn nelder_mead_honours_bounds_like_scipy() {
+        static BOX: [Bound; 2] = [(Some(0.0), Some(2.0)), (Some(0.0), Some(1.0))];
+        let options = MinimizeOptions {
+            method: Some(OptimizeMethod::NelderMead),
+            bounds: Some(&BOX),
+            ..MinimizeOptions::default()
+        };
+        let shifted = |x: &[f64]| (x[0] - 3.0).powi(2) + (x[1] + 1.0).powi(2);
+        let r = minimize(shifted, &[0.5, 0.5], options).expect("bounded nelder-mead");
+        println!("NM box: x={:?} fun={:?} success={}", r.x, r.fun, r.success);
+        assert!(r.success, "{}", r.message);
+        assert!(
+            (r.x[0] - 2.0).abs() < 1e-6 && r.x[1].abs() < 1e-6,
+            "x={:?}",
+            r.x
+        );
+        assert!((r.fun.unwrap() - 2.0).abs() < 1e-8);
+
+        static HALF: [Bound; 2] = [(None, Some(0.5)), (None, None)];
+        let options = MinimizeOptions {
+            method: Some(OptimizeMethod::NelderMead),
+            bounds: Some(&HALF),
+            ..MinimizeOptions::default()
+        };
+        let rosen = |x: &[f64]| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2);
+        let r = minimize(rosen, &[0.0, 0.0], options).expect("bounded rosenbrock");
+        println!("NM rosen x0<=0.5: x={:?} fun={:?}", r.x, r.fun);
+        assert!(r.x[0] <= 0.5, "infeasible x0 {}", r.x[0]);
+        assert!(
+            (r.x[0] - 0.5).abs() < 1e-4 && (r.x[1] - 0.25).abs() < 1e-3,
+            "x={:?}",
+            r.x
+        );
+        assert!((r.fun.unwrap() - 0.25).abs() < 1e-6);
+
+        // An x0 outside the box is clipped in, as SciPy does (it warns).
+        let r = minimize(
+            shifted,
+            &[5.0, -4.0],
+            MinimizeOptions {
+                method: Some(OptimizeMethod::NelderMead),
+                bounds: Some(&BOX),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("clipped start");
+        assert!(
+            r.x.iter()
+                .zip(&BOX)
+                .all(|(v, (lo, hi))| { *v >= lo.unwrap() && *v <= hi.unwrap() })
+        );
+    }
+
+    // frankenscipy-szq1n.7: Powell ignored bounds as well. SciPy 1.17.1 (whose own bounded
+    // Powell stops loosely, so the check is feasibility plus a near-optimal value):
+    //   (x0-3)^2+(x1+1)^2, x0=[0.5,0.5], bounds [(0,2),(0,1)] -> x=[2, 6.6e-5], fun=2.00013
+    //   rosen, x0=[0,0], bounds [(None,0.5),(None,None)] -> x=[0.5, 0.2515], fun=0.25023
+    #[test]
+    fn powell_honours_bounds() {
+        static BOX: [Bound; 2] = [(Some(0.0), Some(2.0)), (Some(0.0), Some(1.0))];
+        let shifted = |x: &[f64]| (x[0] - 3.0).powi(2) + (x[1] + 1.0).powi(2);
+        let r = minimize(
+            shifted,
+            &[0.5, 0.5],
+            MinimizeOptions {
+                method: Some(OptimizeMethod::Powell),
+                bounds: Some(&BOX),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("bounded powell");
+        println!(
+            "Powell box: x={:?} fun={:?} success={}",
+            r.x, r.fun, r.success
+        );
+        assert!(
+            r.x.iter()
+                .zip(&BOX)
+                .all(|(v, (lo, hi))| *v >= lo.unwrap() && *v <= hi.unwrap()),
+            "infeasible x={:?}",
+            r.x
+        );
+        // The old code returned the infeasible [3, -1] (fun 0); the feasibility check catches it.
+        assert!(r.fun.unwrap() <= 2.001, "fun={:?} (optimum 2.0)", r.fun);
+
+        static HALF: [Bound; 2] = [(None, Some(0.5)), (None, None)];
+        let rosen = |x: &[f64]| (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2);
+        let r = minimize(
+            rosen,
+            &[0.0, 0.0],
+            MinimizeOptions {
+                method: Some(OptimizeMethod::Powell),
+                bounds: Some(&HALF),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("one-sided bounded powell");
+        println!("Powell rosen x0<=0.5: x={:?} fun={:?}", r.x, r.fun);
+        assert!(r.x[0] <= 0.5, "infeasible x0 {}", r.x[0]);
+        assert!(r.fun.unwrap() <= 0.251, "fun={:?} (optimum 0.25)", r.fun);
+    }
+
+    #[test]
+    fn feasible_step_interval_matches_scipy_line_for_search() {
+        let bounds = [(Some(0.0), Some(2.0)), (None, Some(1.0))];
+        // x=[1,0.5], d=[1,-1]: x0 hits 2 at alpha=1 and 0 at alpha=-1; x1 hits 1 at alpha=-0.5.
+        assert_eq!(
+            feasible_step_interval(&[1.0, 0.5], &[1.0, -1.0], &bounds),
+            (-0.5, 1.0)
+        );
+        // Unconstrained along d=[0,-1] in the downward direction of x1.
+        assert_eq!(
+            feasible_step_interval(&[1.0, 0.5], &[0.0, -1.0], &bounds),
+            (-0.5, f64::INFINITY)
+        );
+    }
+
+    // frankenscipy-szq1n.7: these kernels used to ignore bounds and return x = 3 for (x-3)^2 on
+    // [0,2] under success = true. SLSQP now honours them (frankenscipy-1ksfv.1); trust-constr,
+    // whose constrained algorithm is frankenscipy-1ksfv.2, still refuses bounds and constraints.
+    #[test]
+    fn slsqp_honours_bounds_and_trust_constr_refuses_them() {
+        let bounds = [(Some(0.0), Some(2.0))];
+        let quad = |x: &[f64]| (x[0] - 3.0).powi(2);
+        let bounded = |method| MinimizeOptions {
+            method: Some(method),
+            bounds: Some(&bounds),
+            ..MinimizeOptions::default()
+        };
+        let r = minimize(quad, &[1.0], bounded(OptimizeMethod::Slsqp)).expect("slsqp");
+        assert!(r.success, "{}", r.message);
+        assert!((r.x[0] - 2.0).abs() < 1e-12, "x = {:?}", r.x);
+
+        let err = minimize(quad, &[1.0], bounded(OptimizeMethod::TrustConstr))
+            .expect_err("trust-constr must refuse bounds");
+        assert!(
+            matches!(&err, OptError::InvalidArgument { detail } if detail.contains("bounds")),
+            "{err:?}"
+        );
+        let constraints = [Constraint::ineq(|x: &[f64]| vec![2.0 - x[0]])];
+        let err = minimize(
+            quad,
+            &[1.0],
+            MinimizeOptions {
+                method: Some(OptimizeMethod::TrustConstr),
+                constraints: &constraints,
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect_err("trust-constr must refuse constraints");
+        assert!(
+            matches!(&err, OptError::InvalidArgument { detail } if detail.contains("constraints")),
+            "{err:?}"
+        );
+        for method in [OptimizeMethod::Slsqp, OptimizeMethod::TrustConstr] {
+            let free = MinimizeOptions {
+                method: Some(method),
+                ..MinimizeOptions::default()
+            };
+            let r = minimize(quad, &[1.0], free).expect("unbounded still runs");
+            assert!((r.x[0] - 3.0).abs() < 1e-4, "{method:?} x={:?}", r.x);
+        }
+    }
+
+    // A method that cannot use constraints refuses them rather than returning the unconstrained
+    // optimum (SciPy warns and drops them).
+    #[test]
+    fn unconstrained_methods_refuse_constraints() {
+        let constraints = [Constraint::ineq(|x: &[f64]| vec![2.0 - x[0]])];
+        for method in [
+            OptimizeMethod::Bfgs,
+            OptimizeMethod::NelderMead,
+            OptimizeMethod::LBfgsB,
+            OptimizeMethod::Powell,
+        ] {
+            let err = minimize(
+                |x: &[f64]| (x[0] - 3.0).powi(2),
+                &[1.0],
+                MinimizeOptions {
+                    method: Some(method),
+                    constraints: &constraints,
+                    ..MinimizeOptions::default()
+                },
+            )
+            .expect_err("constraints must be refused");
+            assert!(
+                matches!(&err, OptError::InvalidArgument { detail } if detail.contains("constraints")),
+                "{method:?}: {err:?}"
+            );
+        }
+    }
 
     #[test]
     fn nelder_mead_sphere_converges() {
@@ -6613,6 +7824,289 @@ mod tests {
         }
     }
 
+    // ── trust-ncg / dogleg / trust-exact with `hess` (SciPy's trust-region family) ──
+
+    fn rosenbrock_hess(x: &[f64]) -> Vec<Vec<f64>> {
+        vec![
+            vec![1200.0 * x[0] * x[0] - 400.0 * x[1] + 2.0, -400.0 * x[0]],
+            vec![-400.0 * x[0], 200.0],
+        ]
+    }
+
+    fn rosenbrock_hessp(x: &[f64], p: &[f64]) -> Vec<f64> {
+        vec![
+            (1200.0 * x[0] * x[0] - 400.0 * x[1] + 2.0) * p[0] - 400.0 * x[0] * p[1],
+            -400.0 * x[0] * p[0] + 200.0 * p[1],
+        ]
+    }
+
+    /// f = x₀⁴/4 − x₀²/2 + x₁² + x₀x₁/10 + x₂⁴/20 − x₂²: its Hessian is indefinite at
+    /// (0.1, 0.2, 0.3), where the trust-region methods must use negative curvature.
+    fn indefinite_start(x: &[f64]) -> f64 {
+        0.25 * x[0].powi(4) - 0.5 * x[0] * x[0]
+            + x[1] * x[1]
+            + 0.1 * x[0] * x[1]
+            + 0.05 * x[2].powi(4)
+            - x[2] * x[2]
+    }
+
+    fn indefinite_start_gradient(x: &[f64]) -> Vec<f64> {
+        vec![
+            x[0].powi(3) - x[0] + 0.1 * x[1],
+            2.0 * x[1] + 0.1 * x[0],
+            0.2 * x[2].powi(3) - 2.0 * x[2],
+        ]
+    }
+
+    fn indefinite_start_hess(x: &[f64]) -> Vec<Vec<f64>> {
+        vec![
+            vec![3.0 * x[0] * x[0] - 1.0, 0.1, 0.0],
+            vec![0.1, 2.0, 0.0],
+            vec![0.0, 0.0, 0.6 * x[2] * x[2] - 2.0],
+        ]
+    }
+
+    /// Every number below is live SciPy 1.17.1 (`minimize(rosen, [-1.2, 1],
+    /// method=..., jac=rosen_der, hess=rosen_hess | hessp=rosen_hess_prod)`). The counters are
+    /// the path: a transcription slip anywhere in the driver or a subproblem moves them.
+    #[test]
+    fn trust_region_family_takes_scipys_path_on_rosenbrock() {
+        type Case = (
+            OptimizeMethod,
+            bool,
+            (usize, usize, usize, usize),
+            [f64; 2],
+            f64,
+        );
+        let cases: [Case; 4] = [
+            (
+                OptimizeMethod::TrustNcg,
+                false,
+                (29, 30, 27, 26),
+                [0.9999996957772002, 0.9999993903385656],
+                9.269935987707732e-14,
+            ),
+            (
+                OptimizeMethod::TrustNcg,
+                true,
+                (29, 30, 27, 82),
+                [0.9999996957772002, 0.9999993903385656],
+                9.269935987707732e-14,
+            ),
+            (
+                OptimizeMethod::Dogleg,
+                false,
+                (23, 24, 21, 20),
+                [0.9999983082930026, 0.99999659792968],
+                2.89668909123374e-12,
+            ),
+            (
+                OptimizeMethod::TrustExact,
+                false,
+                (25, 26, 23, 26),
+                [0.9999999994467651, 0.9999999988770814],
+                3.331252984229145e-19,
+            ),
+        ];
+        for (method, use_hessp, counts, x_scipy, fun_scipy) in cases {
+            let options = MinimizeOptions {
+                method: Some(method),
+                gradient: Some(rosenbrock_gradient),
+                hess: (!use_hessp).then_some(rosenbrock_hess as HessFunc),
+                hessp: use_hessp.then_some(rosenbrock_hessp as HesspFunc),
+                ..MinimizeOptions::default()
+            };
+            let result = minimize(rosenbrock, &[-1.2, 1.0], options).expect("minimize");
+            let label = format!("{method:?} hessp={use_hessp}");
+            assert!(result.success, "{label}: {}", result.message);
+            assert_eq!(
+                (result.nit, result.nfev, result.njev, result.nhev),
+                counts,
+                "{label}: (nit, nfev, njev, nhev) differ from SciPy's"
+            );
+            for (ours, theirs) in result.x.iter().zip(x_scipy) {
+                assert!(
+                    (ours - theirs).abs() <= 1e-12,
+                    "{label}: x = {:?}",
+                    result.x
+                );
+            }
+            let fun = result.fun.unwrap();
+            assert!(
+                (fun - fun_scipy).abs() <= 1e-20_f64.max(1e-9 * fun_scipy),
+                "{label}: f = {fun:e}"
+            );
+        }
+    }
+
+    /// SciPy on the indefinite start: trust-ncg and trust-exact follow the negative curvature to
+    /// the minimizer near (1.0025, −0.0501, √10); dogleg's Cholesky fails at iteration 0
+    /// (status 3, "A linalg error occurred, such as a non-psd Hessian").
+    #[test]
+    fn trust_region_family_on_an_indefinite_hessian_matches_scipy() {
+        let run = |method| {
+            let options = MinimizeOptions {
+                method: Some(method),
+                gradient: Some(indefinite_start_gradient),
+                hess: Some(indefinite_start_hess),
+                ..MinimizeOptions::default()
+            };
+            minimize(indefinite_start, &[0.1, 0.2, 0.3], options).expect("minimize")
+        };
+        let ncg = run(OptimizeMethod::TrustNcg);
+        assert!(ncg.success, "{}", ncg.message);
+        assert_eq!((ncg.nit, ncg.nfev, ncg.njev, ncg.nhev), (10, 11, 9, 8));
+        let exact = run(OptimizeMethod::TrustExact);
+        assert!(exact.success, "{}", exact.message);
+        assert_eq!(
+            (exact.nit, exact.nfev, exact.njev, exact.nhev),
+            (8, 9, 8, 9)
+        );
+        for (result, x_scipy, fun_scipy) in [
+            (
+                &ncg,
+                [1.0024982177076796, -0.050124205636529244, 3.162277722018637],
+                -5.252506249997705,
+            ),
+            (
+                &exact,
+                [1.0024969852080294, -0.05012484926040148, 3.1622776601683795],
+                -5.252506249999989,
+            ),
+        ] {
+            for (ours, theirs) in result.x.iter().zip(x_scipy) {
+                assert!((ours - theirs).abs() <= 1e-12, "x = {:?}", result.x);
+            }
+            assert!((result.fun.unwrap() - fun_scipy).abs() <= 1e-13);
+        }
+
+        let dogleg = run(OptimizeMethod::Dogleg);
+        assert!(!dogleg.success);
+        assert_eq!(dogleg.status, ConvergenceStatus::LinAlgError);
+        assert_eq!(
+            (dogleg.nit, dogleg.nfev, dogleg.njev, dogleg.nhev),
+            (0, 1, 1, 1)
+        );
+        assert_eq!(dogleg.x, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn trust_region_methods_refuse_missing_curvature_like_scipy() {
+        let bare = |method| MinimizeOptions {
+            method: Some(method),
+            gradient: Some(rosenbrock_gradient),
+            ..MinimizeOptions::default()
+        };
+        for method in [OptimizeMethod::TrustNcg, OptimizeMethod::Dogleg] {
+            let outcome = minimize(rosenbrock, &[-1.2, 1.0], bare(method));
+            assert!(
+                matches!(outcome, Err(OptError::InvalidArgument { .. })),
+                "{method:?} without a Hessian must be refused, got {outcome:?}"
+            );
+        }
+        // hessp is enough for trust-ncg, not for dogleg (SciPy passes it to trust-ncg only).
+        let with_hessp = |method| MinimizeOptions {
+            hessp: Some(rosenbrock_hessp),
+            ..bare(method)
+        };
+        assert!(
+            minimize(
+                rosenbrock,
+                &[-1.2, 1.0],
+                with_hessp(OptimizeMethod::TrustNcg)
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            minimize(rosenbrock, &[-1.2, 1.0], with_hessp(OptimizeMethod::Dogleg)),
+            Err(OptError::InvalidArgument { .. })
+        ));
+        // A malformed Hessian is an error, not an index panic.
+        fn short_hess(_x: &[f64]) -> Vec<Vec<f64>> {
+            vec![vec![1.0, 0.0]]
+        }
+        let result = minimize(
+            rosenbrock,
+            &[-1.2, 1.0],
+            MinimizeOptions {
+                hess: Some(short_hess),
+                ..bare(OptimizeMethod::TrustExact)
+            },
+        )
+        .expect("minimize returns");
+        assert_eq!(result.status, ConvergenceStatus::InvalidInput);
+    }
+
+    static USER_GRADIENT_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    fn counted_rosenbrock_gradient(x: &[f64]) -> Vec<f64> {
+        USER_GRADIENT_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rosenbrock_gradient(x)
+    }
+
+    /// Newton-CG, the BFGS-model trust-exact, L-BFGS-B, TNC and trust-constr used to
+    /// finite-difference the gradient even when the caller supplied one, and Newton-CG
+    /// ignored `hess`.
+    #[test]
+    fn gradient_methods_use_the_callers_derivatives() {
+        for method in [OptimizeMethod::Tnc, OptimizeMethod::TrustConstr] {
+            let options = MinimizeOptions {
+                method: Some(method),
+                gradient: Some(counted_rosenbrock_gradient),
+                ..MinimizeOptions::default()
+            };
+            let before = USER_GRADIENT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let result = minimize(rosenbrock, &[-1.2, 1.0], options).expect("minimize");
+            let calls = USER_GRADIENT_CALLS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            assert!(
+                calls > 0,
+                "{method:?}: the caller's gradient was never called"
+            );
+            assert!(
+                result.x.iter().all(|v| v.is_finite()),
+                "{method:?}: {:?}",
+                result.x
+            );
+        }
+        for (method, hess) in [
+            (OptimizeMethod::NewtonCg, Some(rosenbrock_hess as HessFunc)),
+            (OptimizeMethod::NewtonCg, None),
+            (OptimizeMethod::TrustExact, None),
+            (OptimizeMethod::LBfgsB, None),
+        ] {
+            let options = MinimizeOptions {
+                method: Some(method),
+                gradient: Some(counted_rosenbrock_gradient),
+                hess,
+                tol: Some(1e-8),
+                ..MinimizeOptions::default()
+            };
+            let before = USER_GRADIENT_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+            let result = minimize(rosenbrock, &[-1.2, 1.0], options).expect("minimize");
+            let calls = USER_GRADIENT_CALLS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            let label = format!("{method:?} hess={}", hess.is_some());
+            assert!(calls > 0, "{label}: the caller's gradient was never called");
+            assert!(result.success, "{label}: {}", result.message);
+            assert!(
+                (result.x[0] - 1.0).abs() < 1e-6 && (result.x[1] - 1.0).abs() < 1e-6,
+                "{label}: x = {:?}",
+                result.x
+            );
+            if hess.is_some() {
+                // Products come from the Hessian: no finite-difference gradient differences,
+                // so the objective is evaluated only by the line search (the finite-difference
+                // path costs at least 7 evaluations per iteration here).
+                assert!(result.nhev > 0, "{label}: hess never evaluated");
+                assert!(
+                    result.nfev <= 4 * result.nit + 4,
+                    "{label}: nfev = {}",
+                    result.nfev
+                );
+            }
+        }
+    }
+
     // ── TNC / SLSQP / trust_constr unit coverage (per frankenscipy-rkk2) ──
 
     /// Convex quadratic bowl: f(x, y) = (x - 2)^2 + (y + 3)^2. Minimum at (2, -3).
@@ -6746,6 +8240,200 @@ mod tests {
         };
         let result = slsqp(&convex_bowl, &[f64::NAN, 0.0], options);
         assert!(result.is_err(), "NaN x0 should fail; got {result:?}");
+    }
+
+    fn hs71(v: &[f64]) -> f64 {
+        v[0] * v[3] * (v[0] + v[1] + v[2]) + v[2]
+    }
+
+    // frankenscipy-1ksfv.1: Hock–Schittkowski #71 (one inequality, one equality, 1 <= x <= 5)
+    // against SciPy 1.17.1 `minimize(..., method='SLSQP')` from (1, 5, 5, 1):
+    // x = [1, 4.7429961, 3.8211546, 1.3794077], fun = 17.01401725, success. With SciPy's
+    // default eps the port takes SciPy's 5 iterations; analytic derivatives reach the same point.
+    #[test]
+    fn slsqp_solves_hock_schittkowski_71_like_scipy() {
+        let want = [1.0, 4.742_996_1, 3.821_154_6, 1.379_407_7];
+        let bounds = [(Some(1.0), Some(5.0)); 4];
+        let fd = [
+            Constraint::ineq(|v: &[f64]| vec![v[0] * v[1] * v[2] * v[3] - 25.0]),
+            Constraint::eq(|v: &[f64]| vec![v.iter().map(|x| x * x).sum::<f64>() - 40.0]),
+        ];
+        let analytic = [
+            Constraint::ineq(|v: &[f64]| vec![v[0] * v[1] * v[2] * v[3] - 25.0]).with_jac(
+                |v: &[f64]| {
+                    vec![vec![
+                        v[1] * v[2] * v[3],
+                        v[0] * v[2] * v[3],
+                        v[0] * v[1] * v[3],
+                        v[0] * v[1] * v[2],
+                    ]]
+                },
+            ),
+            Constraint::eq(|v: &[f64]| vec![v.iter().map(|x| x * x).sum::<f64>() - 40.0])
+                .with_jac(|v: &[f64]| vec![v.iter().map(|x| 2.0 * x).collect()]),
+        ];
+        fn hs71_grad(v: &[f64]) -> Vec<f64> {
+            vec![
+                v[3] * (2.0 * v[0] + v[1] + v[2]),
+                v[0] * v[3],
+                v[0] * v[3] + 1.0,
+                v[0] * (v[0] + v[1] + v[2]),
+            ]
+        }
+        for (label, cons, gradient) in [
+            ("finite differences", &fd, None),
+            (
+                "analytic",
+                &analytic,
+                Some(hs71_grad as fn(&[f64]) -> Vec<f64>),
+            ),
+        ] {
+            let r = minimize(
+                hs71,
+                &[1.0, 5.0, 5.0, 1.0],
+                MinimizeOptions {
+                    method: Some(OptimizeMethod::Slsqp),
+                    bounds: Some(&bounds),
+                    constraints: cons,
+                    gradient,
+                    gradient_eps: f64::EPSILON.sqrt(),
+                    ..MinimizeOptions::default()
+                },
+            )
+            .expect("slsqp");
+            assert!(r.success, "{label}: {}", r.message);
+            for (xi, wi) in r.x.iter().zip(want) {
+                assert!((xi - wi).abs() < 1e-6, "{label}: x = {:?}", r.x);
+            }
+            assert!(
+                (r.fun.expect("fun") - 17.014_017_25).abs() < 1e-7,
+                "{label}"
+            );
+            // SLSQP's success test is Σ violation < ftol (1e-6); SciPy itself ends HS71 at a
+            // violation of 8.226e-8.
+            assert!(
+                r.maxcv.expect("maxcv") <= 1e-6,
+                "{label}: maxcv {:?}",
+                r.maxcv
+            );
+            if gradient.is_none() {
+                assert_eq!(r.nit, 5, "{label}: SciPy takes 5 iterations");
+            }
+        }
+    }
+
+    // SciPy converts LinearConstraint / NonlinearConstraint for SLSQP with
+    // `new_constraint_to_old`; these are its results (SciPy 1.17.1, default method).
+    #[test]
+    fn slsqp_converts_linear_and_nonlinear_constraints_like_scipy() {
+        let sphere2 = |v: &[f64]| v[0] * v[0] + v[1] * v[1];
+        fn run(f: &dyn Fn(&[f64]) -> f64, x0: &[f64], cons: &[Constraint<'_>]) -> OptimizeResult {
+            minimize(
+                f,
+                x0,
+                MinimizeOptions {
+                    constraints: cons,
+                    ..MinimizeOptions::default()
+                },
+            )
+            .expect("slsqp")
+        }
+        // lb == ub: one equality constraint.
+        let lin_eq = LinearConstraint::new(vec![vec![1.0, 1.0]], vec![1.0], vec![1.0]).unwrap();
+        let r = run(&sphere2, &[2.0, -1.0], &Constraint::from_linear(&lin_eq));
+        assert!(r.success);
+        assert!(
+            (r.x[0] - 0.5).abs() < 1e-8 && (r.x[1] - 0.5).abs() < 1e-8,
+            "{:?}",
+            r.x
+        );
+        // Two-sided and one-sided rows: 0.5 <= x <= 0.8, y <= 0.3 -> (0.8, 0.3).
+        let lin_box = LinearConstraint::new(
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            vec![0.5, f64::NEG_INFINITY],
+            vec![0.8, 0.3],
+        )
+        .unwrap();
+        let converted = Constraint::from_linear(&lin_box);
+        assert_eq!(
+            converted.len(),
+            1,
+            "no lb == ub row: a single inequality constraint"
+        );
+        assert_eq!((converted[0].fun)(&[0.6, 0.1]).len(), 3);
+        let r = run(
+            &|v: &[f64]| (v[0] - 1.0).powi(2) + (v[1] - 1.0).powi(2),
+            &[0.0, 0.0],
+            &converted,
+        );
+        assert!(r.success);
+        assert!(
+            (r.x[0] - 0.8).abs() < 1e-8 && (r.x[1] - 0.3).abs() < 1e-8,
+            "{:?}",
+            r.x
+        );
+        assert!((r.fun.unwrap() - 0.53).abs() < 1e-10);
+        // NonlinearConstraint x^2 + y^2 <= 1 on -xy -> (1/sqrt2, 1/sqrt2), fun -1/2.
+        fn disc(v: &[f64]) -> Vec<f64> {
+            vec![v[0] * v[0] + v[1] * v[1]]
+        }
+        let nl = NonlinearConstraint::new(disc, vec![f64::NEG_INFINITY], vec![1.0]).unwrap();
+        let r = run(
+            &|v: &[f64]| -(v[0] * v[1]),
+            &[0.5, 0.5],
+            &Constraint::from_nonlinear(&nl),
+        );
+        assert!(r.success);
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        assert!(
+            (r.x[0] - h).abs() < 1e-6 && (r.x[1] - h).abs() < 1e-6,
+            "{:?}",
+            r.x
+        );
+        assert!((r.fun.unwrap() + 0.5).abs() < 1e-8);
+    }
+
+    // SciPy exit modes carry through: maxiter=1 is "Iteration limit reached" (mode 9, never
+    // success); x >= 1 and x <= 0 together end in mode 8 "Positive directional derivative for
+    // linesearch" with the point infeasible (SciPy 1.17.1: x = 0.5, 19 iterations).
+    #[test]
+    fn slsqp_reports_scipy_exit_modes_without_claiming_success() {
+        let constraints = [Constraint::ineq(|v: &[f64]| vec![2.0 - v[0]])];
+        let r = minimize(
+            |v: &[f64]| (v[0] - 3.0).powi(2),
+            &[1.0],
+            MinimizeOptions {
+                constraints: &constraints,
+                maxiter: Some(1),
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("slsqp");
+        assert!(!r.success);
+        assert_eq!(r.status, ConvergenceStatus::MaxIterations);
+        assert_eq!(r.message, "Iteration limit reached");
+        assert_eq!(r.nit, 1);
+
+        let incompatible = [
+            Constraint::ineq(|v: &[f64]| vec![v[0] - 1.0]),
+            Constraint::ineq(|v: &[f64]| vec![-v[0]]),
+        ];
+        let r = minimize(
+            |v: &[f64]| v[0] * v[0],
+            &[0.5],
+            MinimizeOptions {
+                constraints: &incompatible,
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("slsqp");
+        assert!(!r.success, "an infeasible problem must not report success");
+        assert_eq!(r.message, "Positive directional derivative for linesearch");
+        assert!(
+            r.maxcv.expect("maxcv") >= 0.5 - 1e-12,
+            "maxcv {:?}",
+            r.maxcv
+        );
     }
 
     #[test]
@@ -6894,6 +8582,144 @@ mod tests {
         assert_eq!(res.chosen_action, OptSolverAction::DIRECT);
         assert!(res.result.success);
         assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    // br-szq1n.9: expected optima are live SciPy 1.17.1
+    // `minimize(..., method='L-BFGS-B', bounds=...)` results (and analytic).
+    #[test]
+    fn test_minimize_with_casp_honours_bounds_on_a_smooth_problem() {
+        static BOUNDS: [crate::types::Bound; 1] = [(Some(-1.0), Some(1.0))];
+        let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let options = MinimizeOptions {
+            bounds: Some(&BOUNDS),
+            ..MinimizeOptions::default()
+        };
+        let res = minimize_with_casp(
+            |x: &[f64]| (x[0] - 5.0).powi(2),
+            &[0.0],
+            options,
+            &mut portfolio,
+        )
+        .expect("bounded casp minimize");
+        // The unconstrained argmin is BFGS, which ignores bounds and returned x = 5.
+        assert_eq!(res.chosen_action, OptSolverAction::LBFGSB);
+        assert!(
+            (res.result.x[0] - 1.0).abs() <= 1e-8,
+            "x = {:?}",
+            res.result.x
+        );
+    }
+
+    /// frankenscipy-szq1n.9: bounded L-BFGS-B built its step from the full gradient and
+    /// projected it afterwards, with Armijo steps only. All three cases below failed: an
+    /// active upper bound stopped at [0.5, 0.2519] ("maximum iterations"), a wide box stalled
+    /// at f = 3.47, and an active lower bound accepted no step at f = 0.269. SciPy 1.17.1
+    /// L-BFGS-B: [0.5, 0.25]; [0.99999697, 0.99999396] (f = 9.2e-12); [1.5, 2.25].
+    #[test]
+    fn lbfgsb_converges_with_active_and_inactive_bounds_like_scipy() {
+        use crate::minimize::lbfgsb;
+        let rosen = |x: &[f64]| 100.0 * (x[1] - x[0] * x[0]).powi(2) + (1.0 - x[0]).powi(2);
+        let cases: [(&[f64], [Bound; 2], [f64; 2]); 3] = [
+            (
+                &[-1.0, -1.0],
+                [(Some(-2.0), Some(0.5)), (Some(-2.0), Some(0.5))],
+                [0.5, 0.25],
+            ),
+            (
+                &[-1.2, 1.0],
+                [(Some(-5.0), Some(5.0)), (Some(-5.0), Some(5.0))],
+                [1.0, 1.0],
+            ),
+            (
+                &[2.0, 2.0],
+                [(Some(1.5), Some(5.0)), (Some(-5.0), Some(5.0))],
+                [1.5, 2.25],
+            ),
+        ];
+        for (x0, bounds, expected) in cases {
+            let r = lbfgsb(&rosen, x0, MinimizeOptions::default(), Some(&bounds)).expect("lbfgsb");
+            assert!(r.success, "x0 {x0:?}: {} at {:?}", r.message, r.x);
+            for (got, want) in r.x.iter().zip(expected) {
+                assert!((got - want).abs() < 1e-5, "x0 {x0:?}: x = {:?}", r.x);
+            }
+            assert!(
+                r.x.iter()
+                    .zip(&bounds)
+                    .all(|(v, (lo, hi))| *v >= lo.unwrap() && *v <= hi.unwrap()),
+                "infeasible {:?}",
+                r.x
+            );
+        }
+    }
+
+    #[test]
+    fn test_minimize_with_casp_bounded_rosenbrock_matches_scipy() {
+        static BOUNDS: [crate::types::Bound; 2] =
+            [(Some(-2.0), Some(0.5)), (Some(-2.0), Some(0.5))];
+        let rosen = |x: &[f64]| 100.0 * (x[1] - x[0] * x[0]).powi(2) + (1.0 - x[0]).powi(2);
+        let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let options = MinimizeOptions {
+            bounds: Some(&BOUNDS),
+            ..MinimizeOptions::default()
+        };
+        let res = minimize_with_casp(rosen, &[-1.0, -1.0], options, &mut portfolio)
+            .expect("bounded rosenbrock");
+        // SciPy: x* = [0.5, 0.25], fun = 0.25 (the x <= 0.5 bound is active).
+        assert!(
+            (res.result.x[0] - 0.5).abs() <= 1e-6,
+            "x = {:?}",
+            res.result.x
+        );
+        assert!(
+            (res.result.x[1] - 0.25).abs() <= 1e-6,
+            "x = {:?}",
+            res.result.x
+        );
+    }
+
+    #[test]
+    fn test_minimize_with_casp_results_are_always_feasible() {
+        // 200 seeded convex quadratics whose unconstrained minimum is usually OUTSIDE
+        // the box: every CASP answer must lie inside it.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for case in 0..200 {
+            let dim = 1 + case % 3;
+            let bounds: Vec<crate::types::Bound> = (0..dim)
+                .map(|_| {
+                    let lo = -2.0 + 2.0 * next();
+                    (Some(lo), Some(lo + 0.5 + next()))
+                })
+                .collect();
+            let bounds: &'static [crate::types::Bound] = Box::leak(bounds.into_boxed_slice());
+            let center: Vec<f64> = (0..dim).map(|_| -6.0 + 12.0 * next()).collect();
+            let x0: Vec<f64> = bounds.iter().map(|b| b.0.unwrap()).collect();
+            let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 4);
+            let options = MinimizeOptions {
+                bounds: Some(bounds),
+                ..MinimizeOptions::default()
+            };
+            let res = minimize_with_casp(
+                |x: &[f64]| x.iter().zip(&center).map(|(a, c)| (a - c).powi(2)).sum(),
+                &x0,
+                options,
+                &mut portfolio,
+            )
+            .expect("bounded casp minimize");
+            for (i, (&xi, b)) in res.result.x.iter().zip(bounds).enumerate() {
+                let (lo, hi) = (b.0.unwrap(), b.1.unwrap());
+                assert!(
+                    xi >= lo - 1e-12 && xi <= hi + 1e-12,
+                    "case {case}: x[{i}] = {xi} outside [{lo}, {hi}] via {:?}",
+                    res.chosen_action
+                );
+            }
+        }
     }
 
     #[test]
