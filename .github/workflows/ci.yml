@@ -23,15 +23,14 @@ name: CI Gates (G1-G9)
 # fsci-runtime tests, tolerance ratchet), and the newest push cancels the ones still waiting;
 # the full evidence run (per-crate tests, the 15 live-SciPy shards, e2e, perf, evidence packs)
 # runs on the nightly schedule and on demand via workflow_dispatch, where a 40-job fan-out is
-# affordable and nothing races it. Bead syncs and doc-only pushes do not trigger a run at all,
-# so a docs/-only change to a sidecar-protected baseline is still caught only nightly.
+# affordable and nothing races it. Bead syncs do not trigger a run. A docs/ or markdown-only
+# push runs G0 (docs/ holds sidecar-protected baselines — the ffaebe504 reformat that staled four
+# of them touched nothing else) while G1 skips its fmt/clippy steps, since no Rust changed.
 on:
   push:
     branches: [main]
     paths-ignore:
       - ".beads/**"
-      - "docs/**"
-      - "**/*.md"
   pull_request:
     branches: [main]
   schedule:
@@ -65,11 +64,30 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # A push touching only docs/ or markdown has no Rust to format or lint: skip the steps
+      # below (the job still reports success). Anything else, or an unknown base, lints.
+      - name: Code changed in this push?
+        id: code
+        shell: bash
+        run: |
+          before="${{ github.event.before }}"
+          if [ "${{ github.event_name }}" != "push" ] || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "$before" "${{ github.sha }}" | grep -qvE '^docs/|\.md$'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: dtolnay/rust-toolchain@master
+        if: steps.code.outputs.changed == 'true'
         with:
           toolchain: nightly-2026-08-31
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        if: steps.code.outputs.changed == 'true'
         with:
           shared-key: workspace-dev
           cache-on-failure: true
@@ -82,7 +100,9 @@ jobs:
           channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           test "$channel" = "nightly-2026-08-31" || { echo "rust-toolchain.toml pins '$channel'; update ci.yml" >&2; exit 1; }
       - run: cargo fmt --all -- --check
+        if: steps.code.outputs.changed == 'true'
       - run: cargo clippy --workspace --all-targets -- -D warnings
+        if: steps.code.outputs.changed == 'true'
 
   # ── G0: integrity fast lane (every push) ─────────────────────────
   # Observed 2026-09-22/23 (frankenscipy-zbtht): a JSON pretty-print commit (ffaebe504) made
