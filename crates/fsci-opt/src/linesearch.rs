@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
+//! SciPy's public line searches over plain closures: [`line_search`]
+//! (`scipy.optimize.line_search`) and the typed [`line_search_wolfe1`] (MINPACK-2 `dcsrch`) /
+//! [`line_search_wolfe2`] (strong Wolfe) wrappers. All three run the transcriptions in
+//! [`crate::bfgs`] that BFGS, CG and Newton-CG use, so each search has one implementation.
 
+use crate::bfgs::{self, LineObjective, Wolfe2};
 use crate::types::OptError;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -83,13 +88,51 @@ fn validate_gradient_output_len(gradient: &[f64], expected: usize) -> Result<(),
     Ok(())
 }
 
-/// Weak Wolfe line search (Armijo + curvature).
+/// The caller's closures as a [`LineObjective`], counting evaluations as SciPy's `phi` /
+/// `derphi` count them (`fc`, `gc`).
+struct Closures<'a, F, G> {
+    f: &'a F,
+    grad: &'a G,
+    n: usize,
+    fc: usize,
+    gc: usize,
+}
+
+impl<F, G> LineObjective for Closures<'_, F, G>
+where
+    F: Fn(&[f64]) -> f64,
+    G: Fn(&[f64]) -> Vec<f64>,
+{
+    type Error = OptError;
+
+    fn fun(&mut self, x: &[f64]) -> Result<f64, OptError> {
+        self.fc += 1;
+        Ok((self.f)(x))
+    }
+
+    fn grad(&mut self, x: &[f64]) -> Result<Vec<f64>, OptError> {
+        self.gc += 1;
+        let g = (self.grad)(x);
+        validate_gradient_output_len(&g, self.n)?;
+        Ok(g)
+    }
+}
+
+fn no_wolfe_step(search: &str) -> OptError {
+    OptError::NotConverged {
+        detail: format!("{search} found no step satisfying the Wolfe conditions"),
+    }
+}
+
+/// SciPy's `line_search_wolfe1`: MINPACK-2's `dcsrch` (the transcription BFGS, CG and
+/// Newton-CG use, see [`crate::bfgs`]) on `[amin, amax]` with `xtol = 1e-14` and SciPy's 100
+/// iterations. The step satisfies the STRONG Wolfe conditions
+/// - Armijo:    f(x + α·d) ≤ f(x) + c1·α·g·d
+/// - Curvature: |g(x + α·d)·d| ≤ c2·|g·d|
 ///
-/// Finds alpha satisfying:
-/// - Armijo:    f(x + alpha*d) <= f(x) + c1*alpha*g'*d
-/// - Curvature: g(x + alpha*d)'*d >= c2*g(x)'*d
-///
-/// Matches `scipy.optimize.line_search` with `old_old_fval=None`.
+/// and a search that finds none is an error, where SciPy returns `stp = None`.
+/// `params.maxiter` is not used (it is `line_search_wolfe2`'s). `evaluations` counts function
+/// and gradient evaluations together.
 pub fn line_search_wolfe1<F, G>(
     f: &F,
     grad: &G,
@@ -111,18 +154,48 @@ where
             detail: "search direction is not a descent direction".to_string(),
         });
     }
-
-    line_search_wolfe_impl(f, grad, x, direction, f0, dg0, params, false)
+    let mut obj = Closures {
+        f,
+        grad,
+        n: x.len(),
+        fc: 0,
+        gc: 0,
+    };
+    let found = bfgs::line_search_wolfe1(
+        &mut obj,
+        x,
+        direction,
+        g0,
+        f0,
+        None,
+        params.c1,
+        params.c2,
+        params.amax,
+        params.amin,
+        1e-14,
+    )?
+    .ok_or_else(|| no_wolfe_step("dcsrch"))?;
+    // dcsrch evaluates f and ∇f together at every trial step, so the gradient is there.
+    let g = found.grad.ok_or_else(|| no_wolfe_step("dcsrch"))?;
+    Ok(LineSearchResult {
+        alpha: found.alpha,
+        f_at_alpha: found.fval,
+        directional_derivative: dot(&g, direction),
+        evaluations: obj.fc + obj.gc,
+    })
 }
 
-/// Strong Wolfe line search.
+/// SciPy's `line_search_wolfe2` (`scalar_search_wolfe2`: bracketing, then the
+/// cubic/quadratic/bisection zoom; the transcription BFGS and CG fall back on, see
+/// [`crate::bfgs`]) with `amax = params.amax` and at most `params.maxiter` bracketing steps.
+/// The step satisfies the strong Wolfe conditions
+/// - Armijo:       f(x + α·d) ≤ f(x) + c1·α·g·d
+/// - Strong Wolfe: |g(x + α·d)·d| ≤ c2·|g·d|
 ///
-/// Finds alpha satisfying:
-/// - Armijo:       f(x + alpha*d) <= f(x) + c1*alpha*g'*d
-/// - Strong Wolfe: |g(x + alpha*d)'*d| <= c2*|g(x)'*d|
-///
-/// Uses the zoom phase from Nocedal & Wright Algorithm 3.6.
-/// Matches `scipy.optimize.line_search`.
+/// and every way SciPy ends without one is an error: `alpha_star = None`, and SciPy's
+/// "did not converge" last trial step, whose curvature it never checked. `params.amin` is
+/// validated but unused (SciPy's Wolfe-2 search has none). `evaluations` counts function and
+/// gradient evaluations together.
 pub fn line_search_wolfe2<F, G>(
     f: &F,
     grad: &G,
@@ -144,172 +217,39 @@ where
             detail: "search direction is not a descent direction".to_string(),
         });
     }
-
-    line_search_wolfe_impl(f, grad, x, direction, f0, dg0, params, true)
-}
-
-/// Core Wolfe line search implementation (Nocedal & Wright Algorithm 3.5 + 3.6).
-#[allow(clippy::too_many_arguments)]
-fn line_search_wolfe_impl<F, G>(
-    f: &F,
-    grad: &G,
-    x: &[f64],
-    d: &[f64],
-    f0: f64,
-    dg0: f64,
-    params: WolfeParams,
-    strong: bool,
-) -> Result<LineSearchResult, OptError>
-where
-    F: Fn(&[f64]) -> f64,
-    G: Fn(&[f64]) -> Vec<f64>,
-{
-    let n = x.len();
-    let mut evals = 0;
-
-    let eval_f = |alpha: f64, evals: &mut usize| -> f64 {
-        let xp: Vec<f64> = (0..n).map(|i| x[i] + alpha * d[i]).collect();
-        *evals += 1;
-        f(&xp)
+    let mut obj = Closures {
+        f,
+        grad,
+        n: x.len(),
+        fc: 0,
+        gc: 0,
     };
-
-    let eval_dg = |alpha: f64, evals: &mut usize| -> Result<f64, OptError> {
-        let xp: Vec<f64> = (0..n).map(|i| x[i] + alpha * d[i]).collect();
-        let gp = grad(&xp);
-        *evals += 1;
-        validate_gradient_output_len(&gp, n)?;
-        Ok(dot(&gp, d))
+    let outcome = bfgs::line_search_wolfe2(
+        &mut obj,
+        x,
+        direction,
+        g0,
+        f0,
+        None,
+        params.c1,
+        params.c2,
+        Some(params.amax),
+        params.maxiter,
+        None,
+    )?;
+    let Wolfe2::Step(found) = outcome else {
+        return Err(no_wolfe_step("the Wolfe-2 search"));
     };
-
-    // Bracketing phase (Algorithm 3.5)
-    let mut alpha_prev = 0.0;
-    let mut f_prev = f0;
-    let mut alpha = 1.0_f64.min(params.amax);
-
-    for i in 0..params.maxiter {
-        let fi = eval_f(alpha, &mut evals);
-
-        // Armijo violation or function not decreasing
-        if fi > f0 + params.c1 * alpha * dg0 || (i > 0 && fi >= f_prev) {
-            return zoom(
-                f, grad, x, d, f0, dg0, alpha_prev, alpha, f_prev, fi, &params, strong, &mut evals,
-            );
-        }
-
-        let dgi = eval_dg(alpha, &mut evals)?;
-
-        // Curvature condition satisfied
-        let curvature_ok = if strong {
-            dgi.abs() <= params.c2 * dg0.abs()
-        } else {
-            dgi >= params.c2 * dg0
-        };
-
-        if curvature_ok {
-            return Ok(LineSearchResult {
-                alpha,
-                f_at_alpha: fi,
-                directional_derivative: dgi,
-                evaluations: evals,
-            });
-        }
-
-        // Positive slope means minimum is between alpha_prev and alpha
-        if dgi >= 0.0 {
-            return zoom(
-                f, grad, x, d, f0, dg0, alpha, alpha_prev, fi, f_prev, &params, strong, &mut evals,
-            );
-        }
-
-        alpha_prev = alpha;
-        f_prev = fi;
-        alpha = (2.0 * alpha).min(params.amax);
-    }
-
-    // Failed to find a step satisfying Wolfe — return best so far
-    let fi = eval_f(alpha, &mut evals);
+    // No gradient: SciPy's "did not converge" last trial step, whose curvature was never
+    // checked.
+    let g = found
+        .grad
+        .ok_or_else(|| no_wolfe_step("the Wolfe-2 search"))?;
     Ok(LineSearchResult {
-        alpha,
-        f_at_alpha: fi,
-        directional_derivative: dg0,
-        evaluations: evals,
-    })
-}
-
-/// Zoom phase (Nocedal & Wright Algorithm 3.6).
-/// Finds a step size in [alpha_lo, alpha_hi] satisfying Strong Wolfe conditions.
-#[allow(clippy::too_many_arguments)]
-fn zoom<F, G>(
-    f: &F,
-    grad: &G,
-    x: &[f64],
-    d: &[f64],
-    f0: f64,
-    dg0: f64,
-    mut alpha_lo: f64,
-    mut alpha_hi: f64,
-    mut f_lo: f64,
-    _f_hi: f64,
-    params: &WolfeParams,
-    strong: bool,
-    evals: &mut usize,
-) -> Result<LineSearchResult, OptError>
-where
-    F: Fn(&[f64]) -> f64,
-    G: Fn(&[f64]) -> Vec<f64>,
-{
-    let n = x.len();
-
-    for _ in 0..params.maxiter {
-        // Bisection (could use cubic interpolation for speed, but bisection is robust)
-        let alpha_j = 0.5 * (alpha_lo + alpha_hi);
-
-        let xj: Vec<f64> = (0..n).map(|i| x[i] + alpha_j * d[i]).collect();
-        *evals += 1;
-        let fj = f(&xj);
-
-        if fj > f0 + params.c1 * alpha_j * dg0 || fj >= f_lo {
-            alpha_hi = alpha_j;
-        } else {
-            let gj = grad(&xj);
-            *evals += 1;
-            validate_gradient_output_len(&gj, n)?;
-            let dgj = dot(&gj, d);
-
-            let curvature_ok = if strong {
-                dgj.abs() <= params.c2 * dg0.abs()
-            } else {
-                dgj >= params.c2 * dg0
-            };
-
-            if curvature_ok {
-                return Ok(LineSearchResult {
-                    alpha: alpha_j,
-                    f_at_alpha: fj,
-                    directional_derivative: dgj,
-                    evaluations: *evals,
-                });
-            }
-
-            if dgj * (alpha_hi - alpha_lo) >= 0.0 {
-                alpha_hi = alpha_lo;
-            }
-
-            alpha_lo = alpha_j;
-            f_lo = fj;
-        }
-
-        if (alpha_hi - alpha_lo).abs() < params.amin {
-            break;
-        }
-    }
-
-    // Return best found
-    Ok(LineSearchResult {
-        alpha: alpha_lo,
-        f_at_alpha: f_lo,
-        directional_derivative: dg0,
-        evaluations: *evals,
+        alpha: found.alpha,
+        f_at_alpha: found.fval,
+        directional_derivative: dot(&g, direction),
+        evaluations: obj.fc + obj.gc,
     })
 }
 
@@ -327,197 +267,27 @@ pub struct ScipyLineSearchResult {
     pub fc: usize,
     /// Number of gradient evaluations.
     pub gc: usize,
-    /// `f(xk + alpha·pk)` (the value at the accepted/last point).
-    pub new_fval: f64,
-    /// `f(xk)` (the starting value).
-    pub old_fval: f64,
+    /// `f(xk + alpha·pk)` at the returned step; `None` where SciPy returns `None` (the zoom
+    /// failed), and `f(xk)` when the step rounded to zero or passed `amax` (SciPy's
+    /// `phi_star = phi0`).
+    pub new_fval: Option<f64>,
+    /// `f(xk)`, except that SciPy hands back `old_old_fval` here when the step rounded to zero
+    /// or passed `amax`.
+    pub old_fval: Option<f64>,
     /// Gradient at `xk + alpha·pk`, or `None` if the search did not converge.
     pub new_grad: Option<Vec<f64>>,
 }
 
-// Minimizer of the cubic through (a,fa),(b,fb),(c,fc) with derivative fpa at a;
-// `None` if it cannot be computed (matches scipy `_cubicmin`).
-fn ls_cubicmin(a: f64, fa: f64, fpa: f64, b: f64, fb: f64, c: f64, fc: f64) -> Option<f64> {
-    let cc = fpa;
-    let db = b - a;
-    let dc = c - a;
-    let denom = (db * dc).powi(2) * (db - dc);
-    let v0 = fb - fa - cc * db;
-    let v1 = fc - fa - cc * dc;
-    let a_coef = (dc.powi(2) * v0 - db.powi(2) * v1) / denom;
-    let b_coef = (-dc.powi(3) * v0 + db.powi(3) * v1) / denom;
-    let radical = b_coef * b_coef - 3.0 * a_coef * cc;
-    let xmin = a + (-b_coef + radical.sqrt()) / (3.0 * a_coef);
-    if xmin.is_finite() { Some(xmin) } else { None }
-}
-
-// Minimizer of the quadratic through (a,fa),(b,fb) with derivative fpa at a;
-// `None` if it cannot be computed (matches scipy `_quadmin`).
-fn ls_quadmin(a: f64, fa: f64, fpa: f64, b: f64, fb: f64) -> Option<f64> {
-    let d = fa;
-    let cc = fpa;
-    let db = b - a;
-    let b_coef = (fb - d - cc * db) / (db * db);
-    let xmin = a - cc / (2.0 * b_coef);
-    if xmin.is_finite() { Some(xmin) } else { None }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn ls_zoom(
-    mut a_lo: f64,
-    mut a_hi: f64,
-    mut phi_lo: f64,
-    mut phi_hi: f64,
-    mut derphi_lo: f64,
-    phi: &dyn Fn(f64) -> f64,
-    derphi: &dyn Fn(f64) -> f64,
-    phi0: f64,
-    derphi0: f64,
-    c1: f64,
-    c2: f64,
-) -> (Option<f64>, Option<f64>, Option<f64>) {
-    let maxiter = 10;
-    let mut i = 0;
-    let delta1 = 0.2;
-    let delta2 = 0.1;
-    let mut phi_rec = phi0;
-    let mut a_rec = 0.0;
-    loop {
-        let dalpha = a_hi - a_lo;
-        let (a, b) = if dalpha < 0.0 {
-            (a_hi, a_lo)
-        } else {
-            (a_lo, a_hi)
-        };
-
-        let cchk = delta1 * dalpha;
-        let mut a_j: Option<f64> = None;
-        if i > 0 {
-            a_j = ls_cubicmin(a_lo, phi_lo, derphi_lo, a_hi, phi_hi, a_rec, phi_rec);
-        }
-        let use_quad =
-            i == 0 || a_j.is_none() || a_j.unwrap() > b - cchk || a_j.unwrap() < a + cchk;
-        if use_quad {
-            let qchk = delta2 * dalpha;
-            a_j = ls_quadmin(a_lo, phi_lo, derphi_lo, a_hi, phi_hi);
-            if a_j.is_none() || a_j.unwrap() > b - qchk || a_j.unwrap() < a + qchk {
-                a_j = Some(a_lo + 0.5 * dalpha);
-            }
-        }
-        let a_j = a_j.unwrap();
-
-        let phi_aj = phi(a_j);
-        if (phi_aj > phi0 + c1 * a_j * derphi0) || (phi_aj >= phi_lo) {
-            phi_rec = phi_hi;
-            a_rec = a_hi;
-            a_hi = a_j;
-            phi_hi = phi_aj;
-        } else {
-            let derphi_aj = derphi(a_j);
-            if derphi_aj.abs() <= -c2 * derphi0 {
-                return (Some(a_j), Some(phi_aj), Some(derphi_aj));
-            }
-            if derphi_aj * (a_hi - a_lo) >= 0.0 {
-                phi_rec = phi_hi;
-                a_rec = a_hi;
-                a_hi = a_lo;
-                phi_hi = phi_lo;
-            } else {
-                phi_rec = phi_lo;
-                a_rec = a_lo;
-            }
-            a_lo = a_j;
-            phi_lo = phi_aj;
-            derphi_lo = derphi_aj;
-        }
-        i += 1;
-        if i > maxiter {
-            return (None, None, None);
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scalar_search_wolfe2(
-    phi: &dyn Fn(f64) -> f64,
-    derphi: &dyn Fn(f64) -> f64,
-    phi0_opt: Option<f64>,
-    old_phi0: Option<f64>,
-    derphi0: f64,
-    c1: f64,
-    c2: f64,
-    amax: Option<f64>,
-    maxiter: usize,
-) -> (Option<f64>, f64, f64, Option<f64>) {
-    let mut phi0 = phi0_opt.unwrap_or_else(|| phi(0.0));
-
-    let mut alpha0 = 0.0_f64;
-    let mut alpha1 = match old_phi0 {
-        Some(op0) if derphi0 != 0.0 => (1.0_f64).min(1.01 * 2.0 * (phi0 - op0) / derphi0),
-        _ => 1.0,
-    };
-    if alpha1 < 0.0 {
-        alpha1 = 1.0;
-    }
-    if let Some(am) = amax {
-        alpha1 = alpha1.min(am);
-    }
-
-    let mut phi_a1 = phi(alpha1);
-    let mut phi_a0 = phi0;
-    let mut derphi_a0 = derphi0;
-
-    let mut i = 0;
-    while i < maxiter {
-        if alpha1 == 0.0 || (amax.is_some() && alpha0 > amax.unwrap()) {
-            // Rounding/amax failure: report no convergence.
-            let phi_star = phi0;
-            phi0 = old_phi0.unwrap_or(phi0);
-            return (None, phi_star, phi0, None);
-        }
-
-        let not_first = i > 0;
-        if (phi_a1 > phi0 + c1 * alpha1 * derphi0) || (phi_a1 >= phi_a0 && not_first) {
-            let (a, p, dp) = ls_zoom(
-                alpha0, alpha1, phi_a0, phi_a1, derphi_a0, phi, derphi, phi0, derphi0, c1, c2,
-            );
-            return (a, p.unwrap_or(phi_a1), phi0, dp);
-        }
-
-        let derphi_a1 = derphi(alpha1);
-        if derphi_a1.abs() <= -c2 * derphi0 {
-            return (Some(alpha1), phi_a1, phi0, Some(derphi_a1));
-        }
-        if derphi_a1 >= 0.0 {
-            let (a, p, dp) = ls_zoom(
-                alpha1, alpha0, phi_a1, phi_a0, derphi_a1, phi, derphi, phi0, derphi0, c1, c2,
-            );
-            return (a, p.unwrap_or(phi_a1), phi0, dp);
-        }
-
-        let mut alpha2 = 2.0 * alpha1;
-        if let Some(am) = amax {
-            alpha2 = alpha2.min(am);
-        }
-        alpha0 = alpha1;
-        alpha1 = alpha2;
-        phi_a0 = phi_a1;
-        phi_a1 = phi(alpha1);
-        derphi_a0 = derphi_a1;
-        i += 1;
-    }
-    // maxiter reached without converging.
-    (Some(alpha1), phi_a1, phi0, None)
-}
-
-/// Find a step length satisfying the strong Wolfe conditions, matching
-/// `scipy.optimize.line_search` (`line_search_wolfe2`).
+/// `scipy.optimize.line_search` (`line_search_wolfe2`): a step satisfying the strong Wolfe
+/// conditions, by the same transcription of `scalar_search_wolfe2` BFGS and CG use (see
+/// [`crate::bfgs`]).
 ///
-/// `phi(s) = f(xk + s·pk)`, `derphi(s) = ∇f(xk + s·pk)·pk`. `gfk` is the
-/// gradient at `xk` (computed if `None`); `old_fval`/`old_old_fval` are `f` at
-/// `xk` and the previous point (used to pick the initial step). Faithful port of
-/// scipy's `scalar_search_wolfe2` (cubic→quadratic→bisection zoom). Defaults:
-/// `c1 = 1e-4`, `c2 = 0.9`, `maxiter = 10`, `amax = None`.
+/// `phi(s) = f(xk + s·pk)` and `derphi(s) = ∇f(xk + s·pk)·pk` are counted in `fc` / `gc` as
+/// SciPy counts them. `gfk` is the gradient at `xk`, computed (and not counted, as in SciPy)
+/// when `None`; `old_fval` is `f(xk)`, evaluated as `phi(0)` (counted) when `None`;
+/// `old_old_fval` picks the first trial step. Defaults in SciPy: `c1 = 1e-4`, `c2 = 0.9`,
+/// `maxiter = 10`, `amax = None`. The result mirrors SciPy's tuple, `None`s included; the only
+/// error is a gradient of the wrong length.
 #[allow(clippy::too_many_arguments)]
 pub fn line_search<F, G>(
     f: &F,
@@ -531,62 +301,60 @@ pub fn line_search<F, G>(
     c2: f64,
     amax: Option<f64>,
     maxiter: usize,
-) -> ScipyLineSearchResult
+) -> Result<ScipyLineSearchResult, OptError>
 where
     F: Fn(&[f64]) -> f64,
     G: Fn(&[f64]) -> Vec<f64>,
 {
-    use std::cell::{Cell, RefCell};
     let n = xk.len();
-    let fc = Cell::new(0usize);
-    let gc = Cell::new(0usize);
-    let gval: RefCell<Option<Vec<f64>>> = RefCell::new(None);
-
-    let at = |alpha: f64| -> Vec<f64> { (0..n).map(|i| xk[i] + alpha * pk[i]).collect() };
-    let phi = |alpha: f64| -> f64 {
-        fc.set(fc.get() + 1);
-        f(&at(alpha))
-    };
-    let derphi = |alpha: f64| -> f64 {
-        gc.set(gc.get() + 1);
-        let g = grad(&at(alpha));
-        let d = dot(&g, pk);
-        *gval.borrow_mut() = Some(g);
-        d
-    };
-
-    let gfk_vec: Vec<f64> = match gfk {
+    let gfk = match gfk {
         Some(g) => g.to_vec(),
-        None => grad(xk), // direct call, not counted in gc (matches scipy)
+        None => {
+            let g = grad(xk);
+            validate_gradient_output_len(&g, n)?;
+            g
+        }
     };
-    let derphi0 = dot(&gfk_vec, pk);
-
-    let (alpha_star, phi_star, old_fval_out, derphi_star) = scalar_search_wolfe2(
-        &phi,
-        &derphi,
-        old_fval,
+    let mut obj = Closures {
+        f,
+        grad,
+        n,
+        fc: 0,
+        gc: 0,
+    };
+    let phi0 = match old_fval {
+        Some(value) => value,
+        None => {
+            let origin: Vec<f64> = xk.iter().zip(pk).map(|(x, p)| x + 0.0 * p).collect();
+            obj.fun(&origin)?
+        }
+    };
+    let outcome = bfgs::line_search_wolfe2(
+        &mut obj,
+        xk,
+        pk,
+        &gfk,
+        phi0,
         old_old_fval,
-        derphi0,
         c1,
         c2,
         amax,
         maxiter,
-    );
-
-    let new_grad = if derphi_star.is_some() {
-        gval.into_inner()
-    } else {
-        None
+        None,
+    )?;
+    let (alpha, new_fval, old_fval, new_grad) = match outcome {
+        Wolfe2::Step(found) => (Some(found.alpha), Some(found.fval), Some(phi0), found.grad),
+        Wolfe2::ZoomFailed => (None, None, Some(phi0), None),
+        Wolfe2::Stalled => (None, Some(phi0), old_old_fval, None),
     };
-
-    ScipyLineSearchResult {
-        alpha: alpha_star,
-        fc: fc.get(),
-        gc: gc.get(),
-        new_fval: phi_star,
-        old_fval: old_fval_out,
+    Ok(ScipyLineSearchResult {
+        alpha,
+        fc: obj.fc,
+        gc: obj.gc,
+        new_fval,
+        old_fval,
         new_grad,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -631,11 +399,12 @@ mod tests {
             0.9,
             None,
             10,
-        );
+        )
+        .expect("line_search");
         assert_eq!(r.alpha, Some(1.0));
         assert_eq!((r.fc, r.gc), (2, 1));
-        assert!((r.new_fval - 1.13).abs() < 1e-9);
-        assert!((r.old_fval - 6.13).abs() < 1e-9);
+        assert!((r.new_fval.unwrap() - 1.13).abs() < 1e-9);
+        assert!((r.old_fval.unwrap() - 6.13).abs() < 1e-9);
         let ng = r.new_grad.unwrap();
         assert!((ng[0] - 1.6).abs() < 1e-9 && (ng[1] - 1.4).abs() < 1e-9);
 
@@ -651,10 +420,62 @@ mod tests {
         let xk = [-1.2, 1.0];
         let gk = g2(&xk);
         let pk = [-gk[0], -gk[1]];
-        let r2 = line_search(&f2, &g2, &xk, &pk, None, None, None, 1e-4, 0.9, None, 10);
+        let r2 = line_search(&f2, &g2, &xk, &pk, None, None, None, 1e-4, 0.9, None, 10)
+            .expect("line_search");
         assert!((r2.alpha.unwrap() - 0.00093831027587526).abs() < 1e-12);
         assert_eq!((r2.fc, r2.gc), (11, 1));
-        assert!((r2.new_fval - 4.75058732).abs() < 1e-6);
+        assert!((r2.new_fval.unwrap() - 4.75058732).abs() < 1e-6);
+    }
+
+    /// SciPy 1.17.1's two ways of ending without a strong-Wolfe step, on a linear objective
+    /// (the bracket only expands). With no `amax` it returns its last trial step, α = 1024,
+    /// without a gradient (fc = 12, gc = 10, "did not converge"); with `amax = 3` the zoom
+    /// fails and α and `new_fval` are `None` (fc = 16, gc = 3). The typed
+    /// `line_search_wolfe2` reports both as errors.
+    #[test]
+    fn line_search_reports_scipys_non_convergence() {
+        let f = |x: &[f64]| -x[0] - x[1];
+        let g = |_x: &[f64]| vec![-1.0, -1.0];
+        let origin = [0.0, 0.0];
+        let pk = [1.0, 1.0];
+        let r = line_search(&f, &g, &origin, &pk, None, None, None, 1e-4, 0.9, None, 10)
+            .expect("line_search");
+        assert_eq!(r.alpha, Some(1024.0));
+        assert_eq!((r.fc, r.gc), (12, 10));
+        assert_eq!(r.new_fval, Some(-2048.0));
+        assert_eq!(r.old_fval.map(f64::to_bits), Some((-0.0_f64).to_bits()));
+        assert!(r.new_grad.is_none());
+
+        let r = line_search(
+            &f,
+            &g,
+            &origin,
+            &pk,
+            None,
+            None,
+            None,
+            1e-4,
+            0.9,
+            Some(3.0),
+            10,
+        )
+        .expect("line_search");
+        assert_eq!(r.alpha, None);
+        assert_eq!((r.fc, r.gc), (16, 3));
+        assert_eq!(r.new_fval, None);
+        assert!(r.new_grad.is_none());
+
+        let err = line_search_wolfe2(
+            &f,
+            &g,
+            &origin,
+            &pk,
+            0.0,
+            &[-1.0, -1.0],
+            WolfeParams::default(),
+        )
+        .expect_err("no strong-Wolfe step on a linear objective");
+        assert!(matches!(err, OptError::NotConverged { .. }));
     }
 
     #[test]

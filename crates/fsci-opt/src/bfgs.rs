@@ -706,6 +706,28 @@ fn zoom<O: LineObjective>(
     }
 }
 
+/// What SciPy's `scalar_search_wolfe2` hands back.
+pub(crate) enum Wolfe2 {
+    /// A step: a strong-Wolfe point (with its gradient), or SciPy's "did not converge" last
+    /// trial after `maxiter` expansions (`grad: None`).
+    Step(LineSearch),
+    /// The zoom ran out of iterations: `alpha_star = phi_star = None`.
+    ZoomFailed,
+    /// `alpha1` rounded to 0 or passed `amax`: `alpha_star = None`, `phi_star = phi0`, and SciPy
+    /// hands back `old_old_fval` in the `old_fval` slot.
+    Stalled,
+}
+
+impl Wolfe2 {
+    /// The step, when there is one (`_line_search_wolfe12`'s `ret[0] is not None`).
+    pub(crate) fn into_step(self) -> Option<LineSearch> {
+        match self {
+            Self::Step(step) => Some(step),
+            Self::ZoomFailed | Self::Stalled => None,
+        }
+    }
+}
+
 /// SciPy `line_search_wolfe2` → `scalar_search_wolfe2`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn line_search_wolfe2<O: LineObjective>(
@@ -720,7 +742,7 @@ pub(crate) fn line_search_wolfe2<O: LineObjective>(
     amax: Option<f64>,
     maxiter: usize,
     mut extra: Option<ExtraCondition<'_>>,
-) -> Result<Option<LineSearch>, O::Error> {
+) -> Result<Wolfe2, O::Error> {
     let derphi0 = dot(gfk, pk);
     let phi0 = old_fval;
     let mut f = Phi {
@@ -746,7 +768,7 @@ pub(crate) fn line_search_wolfe2<O: LineObjective>(
     let mut derphi_a0 = derphi0;
     for i in 0..maxiter {
         if alpha1 == 0.0 || amax.is_some_and(|m| alpha0 > m) {
-            return Ok(None);
+            return Ok(Wolfe2::Stalled);
         }
         let found = if phi_a1 > phi0 + c1 * alpha1 * derphi0 || (phi_a1 >= phi_a0 && i > 0) {
             zoom(
@@ -777,16 +799,19 @@ pub(crate) fn line_search_wolfe2<O: LineObjective>(
             }
         };
         // A zoom that fails is SciPy's `alpha_star = None`.
-        return Ok(found.map(|(alpha, fval)| LineSearch {
-            alpha,
-            fval,
-            old_fval: phi0,
-            grad: f.gval.take(),
-        }));
+        return Ok(match found {
+            Some((alpha, fval)) => Wolfe2::Step(LineSearch {
+                alpha,
+                fval,
+                old_fval: phi0,
+                grad: f.gval.take(),
+            }),
+            None => Wolfe2::ZoomFailed,
+        });
     }
     // SciPy's for-else: out of iterations, it still returns the last trial step, without a
     // gradient ("The line search algorithm did not converge").
-    Ok(Some(LineSearch {
+    Ok(Wolfe2::Step(LineSearch {
         alpha: alpha1,
         fval: phi_a1,
         old_fval: phi0,
@@ -836,7 +861,7 @@ pub(crate) fn line_search_wolfe12<O: LineObjective>(
             return Ok(Some(found));
         }
     }
-    line_search_wolfe2(
+    Ok(line_search_wolfe2(
         obj,
         xk,
         pk,
@@ -848,7 +873,8 @@ pub(crate) fn line_search_wolfe12<O: LineObjective>(
         step_bounds.map(|(_, amax)| amax),
         10,
         extra,
-    )
+    )?
+    .into_step())
 }
 
 pub(crate) struct BfgsParams {

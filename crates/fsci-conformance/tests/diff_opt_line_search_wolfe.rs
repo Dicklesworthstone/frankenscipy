@@ -80,8 +80,11 @@ fn diff_opt_line_search_wolfe() {
     for (label, x0, direction) in probes {
         let f0 = f(x0);
         let g0 = g(x0);
-        // Wolfe 1
-        if let Ok(res) = line_search_wolfe1(&f, &g, x0, direction, f0, &g0, params) {
+        // Wolfe 1 (dcsrch). Every probe must produce a step: an error used to be skipped, so a
+        // search that failed everywhere passed with nothing compared.
+        {
+            let res = line_search_wolfe1(&f, &g, x0, direction, f0, &g0, params)
+                .unwrap_or_else(|e| panic!("wolfe1 {label}: {e}"));
             // Verify Armijo
             let xp: Vec<f64> = x0
                 .iter()
@@ -103,7 +106,9 @@ fn diff_opt_line_search_wolfe() {
             });
         }
         // Wolfe 2 (strong)
-        if let Ok(res) = line_search_wolfe2(&f, &g, x0, direction, f0, &g0, params) {
+        {
+            let res = line_search_wolfe2(&f, &g, x0, direction, f0, &g0, params)
+                .unwrap_or_else(|e| panic!("wolfe2 {label}: {e}"));
             let xp: Vec<f64> = x0
                 .iter()
                 .zip(direction.iter())
@@ -144,6 +149,11 @@ fn diff_opt_line_search_wolfe() {
         }
     }
 
+    assert_eq!(
+        diffs.len(),
+        2 * probes.len(),
+        "every probe must be compared"
+    );
     assert!(
         all_pass,
         "line_search_wolfe conformance failed: {} cases",
