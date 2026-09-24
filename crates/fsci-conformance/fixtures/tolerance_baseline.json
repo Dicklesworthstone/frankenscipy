@@ -453,6 +453,8 @@
     "FD_FUN_ABS_TOL": 1e-9,
     "FD_X_REL_TOL": 1e-5,
     "FUN_REL_TOL": 1e-10,
+    "NEWTON_FD_FUN_ABS_TOL": 1e-8,
+    "NEWTON_FD_X_REL_TOL": 5e-5,
     "NIT_REL_TOL": 0.3,
     "X_REL_TOL": 1e-7
   },

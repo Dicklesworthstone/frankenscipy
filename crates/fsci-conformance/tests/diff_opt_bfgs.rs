@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
-//! Live SciPy differential coverage for `minimize(method='BFGS')` and `minimize(method='CG')`
-//! (frankenscipy-1ksfv.18): SciPy's `_minimize_bfgs` and `_minimize_cg` with their MINPACK-2
-//! `dcsrch` line search, on Rosenbrock in 2, 3 and 10 dimensions, a 50-dimensional convex
-//! quadratic and a function that is indefinite at the start — each with the analytic gradient
-//! and with SciPy's default forward difference (`eps = √ε`) — plus an iteration-limited run.
+//! Live SciPy differential coverage for `minimize(method='BFGS' | 'CG' | 'Newton-CG')`
+//! (frankenscipy-1ksfv.18): SciPy's `_minimize_bfgs`, `_minimize_cg` and `_minimize_newtoncg`
+//! with their MINPACK-2 `dcsrch` line search, on Rosenbrock in 2, 3 and 10 dimensions, a
+//! 50-dimensional convex quadratic and a function that is indefinite at the start. BFGS and CG
+//! run with the analytic gradient and with SciPy's default forward difference (`eps = √ε`), plus
+//! an iteration-limited run; Newton-CG (which requires the gradient) with the dense Hessian, the
+//! Hessian-vector product and forward-differenced products.
 //!
 //! Both sides evaluate the same function: the objectives are written out operation by operation
 //! in Rust and in the oracle's Python (sequential sums, explicit products), because SciPy's own
@@ -28,8 +30,15 @@
 //! on one of those five kernels: rosen10 with the analytic gradient takes 190 iterations there
 //! and 231 on the other four, 1.7e-5 apart in `x` (fsci matches the four exactly, and every
 //! other CG case on all five). So CG cases must match SciPy's status and iteration count (within
-//! `NIT_REL_TOL`), `x` to `CG_X_REL_TOL` and `fun` to `FD_FUN_ABS_TOL`; only BFGS with the analytic
-//! gradient, whose path no kernel moves, must reproduce SciPy's (nit, nfev, njev) exactly.
+//! `NIT_REL_TOL`), `x` to `CG_X_REL_TOL` and `fun` to `FD_FUN_ABS_TOL`.
+//!
+//! Newton-CG with the caller's Hessian or product takes the same path on all five kernels, and so
+//! does fsci (every counter, `nhev` = SciPy's `hcalls` included), so those cases — like BFGS with
+//! the analytic gradient — must reproduce (nit, nfev, njev, nhev) exactly and `x` to `X_REL_TOL`.
+//! With differenced products SciPy's own quad50 run ends "Hessian not positive definite" (3) on
+//! three kernels and in precision loss (2) on the other two (fsci matches the three bit for
+//! bit), and rosen10 spreads 8.4e-6 in `x` and 3.7e-9 in `fun`, so those cases take
+//! `NEWTON_FD_X_REL_TOL` and `NEWTON_FD_FUN_ABS_TOL` and quad50 one of SciPy's statuses.
 //!
 //! Every case must be compared: a SciPy failure or an fsci error is a FAILED case, not a skipped
 //! one (frankenscipy-olv0j.1).
@@ -42,7 +51,9 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_opt::{ConvergenceStatus, GradientFunc, MinimizeOptions, OptimizeMethod, minimize};
+use fsci_opt::{
+    ConvergenceStatus, GradientFunc, HessFunc, HesspFunc, MinimizeOptions, OptimizeMethod, minimize,
+};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-003";
@@ -51,6 +62,8 @@ const FUN_REL_TOL: f64 = 1.0e-10;
 const FD_X_REL_TOL: f64 = 1.0e-5;
 const FD_FUN_ABS_TOL: f64 = 1.0e-9;
 const CG_X_REL_TOL: f64 = 5.0e-5;
+const NEWTON_FD_X_REL_TOL: f64 = 5.0e-5;
+const NEWTON_FD_FUN_ABS_TOL: f64 = 1.0e-8;
 const NIT_REL_TOL: f64 = 0.3;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 const QUAD_N: usize = 50;
@@ -147,10 +160,79 @@ fn indefinite_der(x: &[f64]) -> Vec<f64> {
     ]
 }
 
+fn rosen_hess(x: &[f64]) -> Vec<Vec<f64>> {
+    let n = x.len();
+    let mut h = vec![vec![0.0; n]; n];
+    for i in 0..n - 1 {
+        h[i][i + 1] = -400.0 * x[i];
+        h[i + 1][i] = -400.0 * x[i];
+    }
+    h[0][0] = 1200.0 * x[0] * x[0] - 400.0 * x[1] + 2.0;
+    h[n - 1][n - 1] = 200.0;
+    for i in 1..n - 1 {
+        h[i][i] = 202.0 + 1200.0 * x[i] * x[i] - 400.0 * x[i + 1];
+    }
+    h
+}
+
+fn rosen_hessp(x: &[f64], p: &[f64]) -> Vec<f64> {
+    let n = x.len();
+    let mut hp = vec![0.0; n];
+    hp[0] = (1200.0 * x[0] * x[0] - 400.0 * x[1] + 2.0) * p[0] - 400.0 * x[0] * p[1];
+    for i in 1..n - 1 {
+        hp[i] = -400.0 * x[i - 1] * p[i - 1]
+            + (202.0 + 1200.0 * x[i] * x[i] - 400.0 * x[i + 1]) * p[i]
+            - 400.0 * x[i] * p[i + 1];
+    }
+    hp[n - 1] = -400.0 * x[n - 2] * p[n - 2] + 200.0 * p[n - 1];
+    hp
+}
+
+fn quad_hess(_x: &[f64]) -> Vec<Vec<f64>> {
+    quad_data().0.clone()
+}
+
+fn quad_hessp(_x: &[f64], p: &[f64]) -> Vec<f64> {
+    quad_data()
+        .0
+        .iter()
+        .map(|row| {
+            let mut s = 0.0;
+            for (r, v) in row.iter().zip(p) {
+                s += r * v;
+            }
+            s
+        })
+        .collect()
+}
+
+fn indefinite_hess(x: &[f64]) -> Vec<Vec<f64>> {
+    vec![
+        vec![3.0 * (x[0] * x[0]) - 1.0, 0.1, 0.0],
+        vec![0.1, 2.0, 0.0],
+        vec![0.0, 0.0, 0.6 * (x[2] * x[2]) - 2.0],
+    ]
+}
+
+fn indefinite_hessp(x: &[f64], p: &[f64]) -> Vec<f64> {
+    indefinite_hess(x)
+        .iter()
+        .map(|row| {
+            let mut s = 0.0;
+            for (r, v) in row.iter().zip(p) {
+                s += r * v;
+            }
+            s
+        })
+        .collect()
+}
+
 struct Problem {
     name: &'static str,
     fun: fn(&[f64]) -> f64,
     grad: GradientFunc,
+    hess: HessFunc,
+    hessp: HesspFunc,
     x0: Vec<f64>,
 }
 
@@ -161,6 +243,8 @@ struct Case {
     scipy_method: &'static str,
     problem: usize,
     analytic: bool,
+    /// Newton-CG's curvature: "hess", "hessp" or "fd" (products by differences); "" otherwise.
+    curvature: &'static str,
     maxiter: Option<usize>,
     /// SciPy statuses measured across OpenBLAS kernels when they differ; empty means the
     /// status is kernel-independent and must equal this runner's SciPy status.
@@ -172,6 +256,8 @@ fn problems() -> Vec<Problem> {
         name,
         fun: rosen,
         grad: rosen_der,
+        hess: rosen_hess,
+        hessp: rosen_hessp,
         x0,
     };
     vec![
@@ -187,12 +273,16 @@ fn problems() -> Vec<Problem> {
             name: "quad50",
             fun: quad,
             grad: quad_der,
+            hess: quad_hess,
+            hessp: quad_hessp,
             x0: vec![0.0; QUAD_N],
         },
         Problem {
             name: "indefinite_start",
             fun: indefinite,
             grad: indefinite_der,
+            hess: indefinite_hess,
+            hessp: indefinite_hessp,
             x0: vec![0.1, 0.2, 0.3],
         },
     ]
@@ -216,6 +306,7 @@ fn cases(problems: &[Problem]) -> Vec<Case> {
                     scipy_method,
                     problem: index,
                     analytic,
+                    curvature: "",
                     maxiter: None,
                     kernel_statuses: if method == OptimizeMethod::Bfgs
                         && problem.name == "rosen10"
@@ -234,9 +325,30 @@ fn cases(problems: &[Problem]) -> Vec<Case> {
             scipy_method,
             problem: 0,
             analytic: true,
+            curvature: "",
             maxiter: Some(3),
             kernel_statuses: &[],
         });
+    }
+    // Newton-CG requires the gradient; its curvature is the dense Hessian, the product, or
+    // SciPy's forward differences of the gradient.
+    for (index, problem) in problems.iter().enumerate() {
+        for curvature in ["hess", "hessp", "fd"] {
+            out.push(Case {
+                id: format!("Newton-CG/{}/{curvature}", problem.name),
+                method: OptimizeMethod::NewtonCg,
+                scipy_method: "Newton-CG",
+                problem: index,
+                analytic: true,
+                curvature,
+                maxiter: None,
+                kernel_statuses: if problem.name == "quad50" && curvature == "fd" {
+                    &[2, 3]
+                } else {
+                    &[]
+                },
+            });
+        }
     }
     out
 }
@@ -247,6 +359,7 @@ struct QueryCase {
     method: String,
     problem: String,
     analytic: bool,
+    curvature: String,
     maxiter: Option<usize>,
     x0: Vec<f64>,
 }
@@ -267,6 +380,7 @@ struct OracleArm {
     nit: Option<usize>,
     nfev: Option<usize>,
     njev: Option<usize>,
+    nhev: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -274,8 +388,9 @@ struct CaseDiff {
     case_id: String,
     fsci_status: String,
     scipy_status: i32,
-    fsci_counts: [usize; 3],
-    scipy_counts: [usize; 3],
+    /// (nit, nfev, njev, nhev)
+    fsci_counts: [usize; 4],
+    scipy_counts: [usize; 4],
     fsci_fun: f64,
     scipy_fun: f64,
     max_x_rel: f64,
@@ -371,16 +486,64 @@ def indefinite_der(x):
                      2.0 * x[1] + 0.1 * x[0],
                      0.2 * (x[2] * x[2] * x[2]) - 2.0 * x[2]])
 
-PROBLEMS = {"rosen": (rosen, rosen_der), "quad50": (quad, quad_der),
-            "indefinite_start": (indefinite, indefinite_der)}
+def rosen_hess(x):
+    x = [float(v) for v in x]
+    n = len(x)
+    h = [[0.0] * n for _ in range(n)]
+    for i in range(n - 1):
+        h[i][i + 1] = -400.0 * x[i]
+        h[i + 1][i] = -400.0 * x[i]
+    h[0][0] = 1200.0 * x[0] * x[0] - 400.0 * x[1] + 2.0
+    h[n - 1][n - 1] = 200.0
+    for i in range(1, n - 1):
+        h[i][i] = 202.0 + 1200.0 * x[i] * x[i] - 400.0 * x[i + 1]
+    return np.array(h)
+
+def rosen_hessp(x, p):
+    x = [float(v) for v in x]
+    p = [float(v) for v in p]
+    n = len(x)
+    hp = [0.0] * n
+    hp[0] = (1200.0 * x[0] * x[0] - 400.0 * x[1] + 2.0) * p[0] - 400.0 * x[0] * p[1]
+    for i in range(1, n - 1):
+        hp[i] = (-400.0 * x[i - 1] * p[i - 1] + (202.0 + 1200.0 * x[i] * x[i] - 400.0 * x[i + 1]) * p[i]
+                 - 400.0 * x[i] * p[i + 1])
+    hp[n - 1] = -400.0 * x[n - 2] * p[n - 2] + 200.0 * p[n - 1]
+    return np.array(hp)
+
+def rows_times(h, p):
+    p = [float(v) for v in p]
+    out = []
+    for row in h:
+        s = 0.0
+        for r, v in zip(row, p):
+            s += r * v
+        out.append(s)
+    return np.array(out)
+
+def indefinite_hess(x):
+    x = [float(v) for v in x]
+    return np.array([[3.0 * (x[0] * x[0]) - 1.0, 0.1, 0.0], [0.1, 2.0, 0.0],
+                     [0.0, 0.0, 0.6 * (x[2] * x[2]) - 2.0]])
+
+PROBLEMS = {
+    "rosen": (rosen, rosen_der, rosen_hess, rosen_hessp),
+    "quad50": (quad, quad_der, lambda x: np.array(A), lambda x, p: rows_times(A, p)),
+    "indefinite_start": (indefinite, indefinite_der, indefinite_hess,
+                         lambda x, p: rows_times(indefinite_hess(x).tolist(), p)),
+}
 
 out = []
 for case in q["cases"]:
     name = case["problem"]
-    f, g = PROBLEMS["rosen" if name.startswith("rosen") else name]
+    f, g, h, hp = PROBLEMS["rosen" if name.startswith("rosen") else name]
     arm = {"case_id": case["case_id"], "x": None, "fun": None, "status": None,
-           "nit": None, "nfev": None, "njev": None}
+           "nit": None, "nfev": None, "njev": None, "nhev": None}
     kw = {"jac": g} if case["analytic"] else {}
+    if case["curvature"] == "hess":
+        kw["hess"] = h
+    elif case["curvature"] == "hessp":
+        kw["hessp"] = hp
     options = {} if case["maxiter"] is None else {"maxiter": case["maxiter"]}
     try:
         with warnings.catch_warnings():
@@ -388,7 +551,8 @@ for case in q["cases"]:
             r = minimize(f, np.array(case["x0"], dtype=float), method=case["method"],
                          options=options, **kw)
         arm.update(x=[float(v) for v in r.x], fun=float(r.fun), status=int(r.status),
-                   nit=int(r.nit), nfev=int(r.nfev), njev=int(r.njev))
+                   nit=int(r.nit), nfev=int(r.nfev), njev=int(r.njev),
+                   nhev=int(getattr(r, "nhev", 0)))
     except Exception:
         pass
     out.append(arm)
@@ -440,13 +604,14 @@ print(json.dumps(out, allow_nan=False))
     Some(serde_json::from_str(&stdout).expect("parse BFGS oracle JSON"))
 }
 
-/// fsci's status in SciPy's BFGS / CG numbering (0 success, 1 maxiter, 2 precision loss, 3 NaN).
+/// fsci's status in SciPy's numbering (0 success, 1 maxiter, 2 precision loss, 3 NaN — and for
+/// Newton-CG also "CG iterations didn't converge", fsci's `LinAlgError`).
 fn scipy_status_of(status: ConvergenceStatus) -> Option<i32> {
     match status {
         ConvergenceStatus::Success => Some(0),
         ConvergenceStatus::MaxIterations => Some(1),
         ConvergenceStatus::PrecisionLoss => Some(2),
-        ConvergenceStatus::NanEncountered => Some(3),
+        ConvergenceStatus::NanEncountered | ConvergenceStatus::LinAlgError => Some(3),
         _ => None,
     }
 }
@@ -466,6 +631,7 @@ fn diff_opt_bfgs() {
                 method: c.scipy_method.to_string(),
                 problem: problems[c.problem].name.to_string(),
                 analytic: c.analytic,
+                curvature: c.curvature.to_string(),
                 maxiter: c.maxiter,
                 x0: problems[c.problem].x0.clone(),
             })
@@ -487,6 +653,8 @@ fn diff_opt_bfgs() {
         let options = MinimizeOptions {
             method: Some(case.method),
             gradient: case.analytic.then_some(problem.grad),
+            hess: (case.curvature == "hess").then_some(problem.hess),
+            hessp: (case.curvature == "hessp").then_some(problem.hessp),
             maxiter: case.maxiter,
             ..MinimizeOptions::default()
         };
@@ -495,12 +663,13 @@ fn diff_opt_bfgs() {
             arm.nit.unwrap_or(0),
             arm.nfev.unwrap_or(0),
             arm.njev.unwrap_or(0),
+            arm.nhev.unwrap_or(0),
         ];
         let mut diff = CaseDiff {
             case_id: case.id.clone(),
             fsci_status: String::new(),
             scipy_status: arm.status.unwrap_or(-1),
-            fsci_counts: [0; 3],
+            fsci_counts: [0; 4],
             scipy_counts,
             fsci_fun: f64::NAN,
             scipy_fun: arm.fun.unwrap_or(f64::NAN),
@@ -515,7 +684,7 @@ fn diff_opt_bfgs() {
             }
             (Ok(r), Some(status), Some(scipy_x)) => {
                 diff.fsci_status = format!("{:?}", r.status);
-                diff.fsci_counts = [r.nit, r.nfev, r.njev];
+                diff.fsci_counts = [r.nit, r.nfev, r.njev, r.nhev];
                 diff.fsci_fun = r.fun.unwrap_or(f64::NAN);
                 let mut problems_found = Vec::new();
                 let fsci_status = scipy_status_of(r.status);
@@ -536,10 +705,12 @@ fn diff_opt_bfgs() {
                         .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
                         .fold(0.0, f64::max);
                 diff.max_x_rel = dx;
-                // BFGS with the analytic gradient is the one kernel-invariant path.
-                let exact_path = case.method == OptimizeMethod::Bfgs && case.analytic;
+                let exact_path = is_kernel_invariant(case);
+                let newton_fd = case.method == OptimizeMethod::NewtonCg && case.curvature == "fd";
                 let x_tol = if case.method == OptimizeMethod::ConjugateGradient {
                     CG_X_REL_TOL
+                } else if newton_fd {
+                    NEWTON_FD_X_REL_TOL
                 } else if exact_path {
                     X_REL_TOL
                 } else {
@@ -552,6 +723,8 @@ fn diff_opt_bfgs() {
                 let dfun = (diff.fsci_fun - diff.scipy_fun).abs();
                 let fun_ok = if exact_path {
                     dfun <= FUN_REL_TOL * diff.scipy_fun.abs().max(1.0)
+                } else if newton_fd {
+                    dfun <= NEWTON_FD_FUN_ABS_TOL
                 } else {
                     dfun <= FD_FUN_ABS_TOL
                 };
@@ -576,7 +749,7 @@ fn diff_opt_bfgs() {
         .count();
     let log = DiffLog {
         test_id: "diff_opt_bfgs".into(),
-        category: "scipy.optimize.minimize(method='BFGS' | 'CG')".into(),
+        category: "scipy.optimize.minimize(method='BFGS' | 'CG' | 'Newton-CG')".into(),
         case_count: diffs.len(),
         same_path_count,
         pass: all_pass,
@@ -593,7 +766,7 @@ fn diff_opt_bfgs() {
     .expect("write diff log");
     for d in &diffs {
         println!(
-            "{} fsci {} (nit, nfev, njev)={:?} fun={:e} | scipy status {} {:?} fun={:e} \
+            "{} fsci {} (nit, nfev, njev, nhev)={:?} fun={:e} | scipy status {} {:?} fun={:e} \
              | x rel {:e} {}",
             d.case_id,
             d.fsci_status,
@@ -607,23 +780,29 @@ fn diff_opt_bfgs() {
         );
     }
     println!(
-        "{} cases compared, {same_path_count} with SciPy's exact (nit, nfev, njev)",
+        "{} cases compared, {same_path_count} with SciPy's exact (nit, nfev, njev, nhev)",
         diffs.len()
     );
 
-    assert_eq!(diffs.len(), 22, "every case must be compared");
+    assert_eq!(diffs.len(), 37, "every case must be compared");
     for d in &diffs {
         assert!(d.pass, "{}: {}", d.case_id, d.reason);
     }
-    // BFGS's analytic-gradient paths are SciPy's to the evaluation.
-    for d in diffs
-        .iter()
-        .filter(|d| d.case_id.starts_with("BFGS/") && d.case_id.contains("/jac"))
-    {
-        assert_eq!(
-            d.fsci_counts, d.scipy_counts,
-            "{}: (nit, nfev, njev) must be SciPy's",
-            d.case_id
-        );
+    // The kernel-invariant paths are SciPy's to the evaluation.
+    for (case, d) in cases.iter().zip(&diffs) {
+        if is_kernel_invariant(case) {
+            assert_eq!(
+                d.fsci_counts, d.scipy_counts,
+                "{}: (nit, nfev, njev, nhev) must be SciPy's",
+                d.case_id
+            );
+        }
     }
+}
+
+/// The paths no OpenBLAS kernel moves (all five agree on every counter): BFGS with the
+/// analytic gradient, and Newton-CG with the caller's Hessian or Hessian-vector product.
+fn is_kernel_invariant(case: &Case) -> bool {
+    (case.method == OptimizeMethod::Bfgs && case.analytic)
+        || (case.method == OptimizeMethod::NewtonCg && case.curvature != "fd")
 }

@@ -1,9 +1,10 @@
-//! SciPy's line searches, BFGS and CG, transcribed from `scipy/optimize/_dcsrch.py` (MINPACK-2
-//! `dcsrch` / `dcstep`), `_linesearch.py` (`line_search_wolfe1`, `scalar_search_wolfe2` with
-//! its `extra_condition`, `_zoom`, `_cubicmin`, `_quadmin`) and `_optimize.py`
-//! (`_line_search_wolfe12`, `_minimize_bfgs`, `_minimize_cg`) of SciPy 1.17.1, including their
-//! Python `min`/`max`/NaN semantics. std-only: the objective is reached through
-//! [`LineObjective`].
+//! SciPy's line searches, BFGS, CG and Newton-CG, transcribed from `scipy/optimize/_dcsrch.py`
+//! (MINPACK-2 `dcsrch` / `dcstep`), `_linesearch.py` (`line_search_wolfe1`,
+//! `scalar_search_wolfe2` with its `extra_condition`, `_zoom`, `_cubicmin`, `_quadmin`) and
+//! `_optimize.py` (`_line_search_wolfe12`, `_minimize_bfgs`, `_minimize_cg`,
+//! `_minimize_newtoncg`, `approx_fhess_p`) of SciPy 1.17.1, including their Python
+//! `min`/`max`/NaN semantics and numpy's summation order where it decides a branch. std-only: the
+//! objective is reached through [`LineObjective`] / [`NewtonObjective`].
 
 /// Python's `max(a, b)`: keeps `a` unless `b > a` (so a NaN `b` never wins).
 fn py_max(a: f64, b: f64) -> f64 {
@@ -739,10 +740,13 @@ pub(crate) fn line_search_wolfe12<O: LineObjective>(
     old_old_fval: Option<f64>,
     c1: f64,
     c2: f64,
-    amin: f64,
-    amax: f64,
+    step_bounds: Option<(f64, f64)>,
     mut extra: Option<ExtraCondition<'_>>,
 ) -> Result<Option<LineSearch>, O::Error> {
+    // `step_bounds = Some((amin, amax))` is a caller passing `amin` / `amax` (BFGS and CG pass
+    // 1e-100 / 1e100); `None` leaves SciPy's defaults: dcsrch on [1e-8, 50] and a Wolfe-2
+    // search with no `amax` (`_line_search_wolfe12` forwards only c1, c2 and amax to it).
+    let (amin, amax) = step_bounds.unwrap_or((1e-8, 50.0));
     if let Some(found) = line_search_wolfe1(
         obj,
         xk,
@@ -775,7 +779,7 @@ pub(crate) fn line_search_wolfe12<O: LineObjective>(
         old_old_fval,
         c1,
         c2,
-        Some(amax),
+        step_bounds.map(|(_, amax)| amax),
         10,
         extra,
     )
@@ -859,8 +863,7 @@ pub(crate) fn minimize_bfgs<O: LineObjective>(
             old_old_fval,
             params.c1,
             params.c2,
-            1e-100,
-            1e100,
+            Some((1e-100, 1e100)),
             None,
         )?
         else {
@@ -1041,8 +1044,7 @@ pub(crate) fn minimize_cg<O: LineObjective>(
                 old_old_fval,
                 params.c1,
                 params.c2,
-                1e-100,
-                1e100,
+                Some((1e-100, 1e100)),
                 Some(&mut descent),
             )?
         };
@@ -1089,6 +1091,245 @@ pub(crate) fn minimize_cg<O: LineObjective>(
         status: warnflag,
         stopped_by_callback,
     })
+}
+
+/// numpy's `add.reduce` over a contiguous float64 vector: the first element seeds the result
+/// and `pairwise_sum` adds the rest (a plain loop below 8 elements, 8 accumulators up to 128,
+/// halving above). Newton-CG's `norm(ord=1)` and `add.reduce(abs(r))` sum in this order.
+fn np_add_reduce(a: &[f64]) -> f64 {
+    fn pairwise(a: &[f64]) -> f64 {
+        let n = a.len();
+        if n < 8 {
+            let mut res = 0.0;
+            for v in a {
+                res += v;
+            }
+            res
+        } else if n <= 128 {
+            let mut r = [0.0; 8];
+            r.copy_from_slice(&a[..8]);
+            let mut i = 8;
+            while i < n - n % 8 {
+                for (acc, v) in r.iter_mut().zip(&a[i..i + 8]) {
+                    *acc += v;
+                }
+                i += 8;
+            }
+            let mut res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+            for v in &a[i..] {
+                res += v;
+            }
+            res
+        } else {
+            let mut n2 = n / 2;
+            n2 -= n2 % 8;
+            pairwise(&a[..n2]) + pairwise(&a[n2..])
+        }
+    }
+    match a.split_first() {
+        Some((first, rest)) => first + pairwise(rest),
+        None => 0.0,
+    }
+}
+
+/// Newton-CG's curvature, taken as SciPy takes it: the caller's dense Hessian (once per outer
+/// iteration), else the caller's Hessian-vector product, else forward differences of the
+/// gradient (`approx_fhess_p`).
+pub(crate) trait NewtonObjective: LineObjective {
+    fn has_hess(&self) -> bool;
+    /// Row-major n × n Hessian at `x`.
+    fn hess(&mut self, x: &[f64]) -> Result<Vec<f64>, Self::Error>;
+    fn has_hessp(&self) -> bool;
+    fn hessp(&mut self, x: &[f64], p: &[f64]) -> Result<Vec<f64>, Self::Error>;
+}
+
+pub(crate) struct NewtonCgParams {
+    /// SciPy's `xtol` (per-component; the stop is `‖update‖₁ ≤ n·xtol`).
+    pub xtol: f64,
+    pub maxiter: usize,
+    /// Forward-difference step of `approx_fhess_p`.
+    pub eps: f64,
+    pub c1: f64,
+    pub c2: f64,
+}
+
+/// How `_minimize_newtoncg` ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NewtonCgStop {
+    Success,
+    MaxIterations,
+    PrecisionLoss,
+    /// Status 3: the inner CG ran `20 n` iterations without converging.
+    HessianNotPositiveDefinite,
+    /// Status 3: NaN in `f` or the last update.
+    Nan,
+    Callback,
+}
+
+pub(crate) struct NewtonCgOutcome {
+    pub x: Vec<f64>,
+    pub fun: f64,
+    /// SciPy's `jac`: the gradient at the start of the last outer iteration (not at `x`), or
+    /// none if no iteration began.
+    pub jac: Option<Vec<f64>>,
+    pub nit: usize,
+    /// SciPy's `hcalls`: Hessian evaluations plus Hessian-vector products.
+    pub nhev: usize,
+    pub stop: NewtonCgStop,
+}
+
+/// SciPy `_minimize_newtoncg`: truncated-CG Newton directions on `_line_search_wolfe12`.
+pub(crate) fn minimize_newton_cg<O: NewtonObjective>(
+    obj: &mut O,
+    x0: &[f64],
+    params: &NewtonCgParams,
+) -> Result<NewtonCgOutcome, O::Error> {
+    let n = x0.len();
+    let cg_maxiter = 20 * n;
+    let xtol = n as f64 * params.xtol;
+    let mut update_l1norm = f64::MAX;
+    let mut xk = x0.to_vec();
+    let mut k = 0;
+    let mut gfk: Option<Vec<f64>> = None;
+    let mut old_fval = obj.fun(x0)?;
+    let mut old_old_fval = None;
+    let mut hcalls = 0;
+    let finish = |stop, xk: Vec<f64>, fun, jac, nit, nhev| NewtonCgOutcome {
+        x: xk,
+        fun,
+        jac,
+        nit,
+        nhev,
+        stop,
+    };
+    while update_l1norm > xtol {
+        if k >= params.maxiter {
+            return Ok(finish(
+                NewtonCgStop::MaxIterations,
+                xk,
+                old_fval,
+                gfk,
+                k,
+                hcalls,
+            ));
+        }
+        // Solve H p = -g by CG from p = 0, truncated at the forcing tolerance.
+        let b: Vec<f64> = obj.grad(&xk)?.iter().map(|g| -g).collect();
+        let abs_b: Vec<f64> = b.iter().map(|v| v.abs()).collect();
+        let maggrad = np_add_reduce(&abs_b);
+        let eta = py_min(0.5, maggrad.sqrt());
+        let termcond = eta * maggrad;
+        let mut xsupi = vec![0.0; n];
+        let mut ri: Vec<f64> = b.iter().map(|v| -v).collect();
+        let mut psupi: Vec<f64> = ri.iter().map(|v| -v).collect();
+        let mut dri0 = dot(&ri, &ri);
+        let hessian = if obj.has_hess() {
+            hcalls += 1;
+            Some(obj.hess(&xk)?)
+        } else {
+            None
+        };
+        let mut converged = false;
+        // `i` is SciPy's count of completed CG steps: every exit happens before it would advance.
+        for i in 0..cg_maxiter {
+            let abs_r: Vec<f64> = ri.iter().map(|v| v.abs()).collect();
+            if np_add_reduce(&abs_r) <= termcond {
+                converged = true;
+                break;
+            }
+            let ap: Vec<f64> = if let Some(a) = &hessian {
+                a.chunks_exact(n).map(|row| dot(row, &psupi)).collect()
+            } else if obj.has_hessp() {
+                hcalls += 1;
+                obj.hessp(&xk, &psupi)?
+            } else {
+                // `approx_fhess_p`: fprime(x) first (it may be cached), then fprime(x + ε p).
+                let f1 = obj.grad(&xk)?;
+                let f2 = obj.grad(&point(&xk, params.eps, &psupi))?;
+                f2.iter()
+                    .zip(&f1)
+                    .map(|(a, b)| (a - b) / params.eps)
+                    .collect()
+            };
+            let curv = dot(&psupi, &ap);
+            if (0.0..=3.0 * f64::EPSILON).contains(&curv) {
+                converged = true;
+                break;
+            } else if curv < 0.0 {
+                if i == 0 {
+                    // Fall back to the steepest-descent direction.
+                    let scale = dri0 / -curv;
+                    xsupi = b.iter().map(|v| scale * v).collect();
+                }
+                converged = true;
+                break;
+            }
+            let alphai = dri0 / curv;
+            for (x, p) in xsupi.iter_mut().zip(&psupi) {
+                *x += alphai * p;
+            }
+            for (r, a) in ri.iter_mut().zip(&ap) {
+                *r += alphai * a;
+            }
+            let dri1 = dot(&ri, &ri);
+            let betai = dri1 / dri0;
+            psupi = ri.iter().zip(&psupi).map(|(r, p)| -r + betai * p).collect();
+            dri0 = dri1;
+        }
+        if !converged {
+            return Ok(finish(
+                NewtonCgStop::HessianNotPositiveDefinite,
+                xk,
+                old_fval,
+                gfk,
+                k,
+                hcalls,
+            ));
+        }
+        let pk = xsupi;
+        let grad_k: Vec<f64> = b.iter().map(|v| -v).collect();
+        let Some(ls) = line_search_wolfe12(
+            obj,
+            &xk,
+            &pk,
+            &grad_k,
+            old_fval,
+            old_old_fval,
+            params.c1,
+            params.c2,
+            None,
+            None,
+        )?
+        else {
+            return Ok(finish(
+                NewtonCgStop::PrecisionLoss,
+                xk,
+                old_fval,
+                Some(grad_k),
+                k,
+                hcalls,
+            ));
+        };
+        gfk = Some(grad_k);
+        old_fval = ls.fval;
+        old_old_fval = Some(ls.old_fval);
+        let update: Vec<f64> = pk.iter().map(|p| ls.alpha * p).collect();
+        for (x, u) in xk.iter_mut().zip(&update) {
+            *x += u;
+        }
+        k += 1;
+        if obj.callback(&xk, old_fval) {
+            return Ok(finish(NewtonCgStop::Callback, xk, old_fval, gfk, k, hcalls));
+        }
+        let abs_u: Vec<f64> = update.iter().map(|v| v.abs()).collect();
+        update_l1norm = np_add_reduce(&abs_u);
+    }
+    let stop = if old_fval.is_nan() || update_l1norm.is_nan() {
+        NewtonCgStop::Nan
+    } else {
+        NewtonCgStop::Success
+    };
+    Ok(finish(stop, xk, old_fval, gfk, k, hcalls))
 }
 
 /// Row-major n × n product, accumulated over k in order for each entry (the loop order only

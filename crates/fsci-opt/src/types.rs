@@ -125,7 +125,7 @@ pub struct MinimizeOptions<'a> {
     pub maxiter: Option<usize>,
     pub maxfev: Option<usize>,
     /// SciPy `eps`, the finite-difference step when `gradient` is absent. `None` is the
-    /// method's SciPy default: √ε for BFGS, CG and SLSQP, 1e-8 for the others.
+    /// method's SciPy default: √ε for BFGS, CG, Newton-CG and SLSQP, 1e-8 for the others.
     pub gradient_eps: Option<f64>,
     pub callback: Option<MinimizeCallback>,
     pub gradient: Option<GradientFunc>,
