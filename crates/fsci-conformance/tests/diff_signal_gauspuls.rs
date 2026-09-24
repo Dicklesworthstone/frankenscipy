@@ -156,14 +156,16 @@ fn scipy_oracle_or_skip(cases: &[GauspulsCase]) -> Vec<GauspulsOracleResult> {
     let script = r#"
 import json
 import sys
+import numpy as np
 from scipy import signal
 
 cases = json.load(sys.stdin)
 results = []
 for c in cases:
     try:
+        # gausspulse multiplies t by numpy scalars: a plain list raises TypeError.
         i_arr, q_arr, env = signal.gausspulse(
-            c["t"], fc=c["fc"], bw=c["bw"], bwr=c["bwr"],
+            np.asarray(c["t"], dtype=float), fc=c["fc"], bw=c["bw"], bwr=c["bwr"],
             retquad=True, retenv=True,
         )
         results.append({

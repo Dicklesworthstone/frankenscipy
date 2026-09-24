@@ -173,7 +173,7 @@ fn timestamp_ms() -> u128 {
 
 fn scipy_oracle_or_skip(query: &[Case]) -> Option<Vec<OracleArm>> {
     let script = r#"
-import json, sys, warnings
+import json, math, sys, warnings
 import numpy as np
 from scipy.optimize import least_squares
 
@@ -204,7 +204,10 @@ for case in json.load(sys.stdin):
         if case["max_nfev"] is not None:
             kw["max_nfev"] = case["max_nfev"]
         if case["lb"] is not None:
-            kw["bounds"] = (case["lb"], case["ub"])
+            # JSON has no infinity: serde writes an infinite bound as null.
+            lb = [-math.inf if v is None else v for v in case["lb"]]
+            ub = [math.inf if v is None else v for v in case["ub"]]
+            kw["bounds"] = (lb, ub)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             r = least_squares(residuals(case["case_id"]), np.array(case["x0"]), **kw)

@@ -2747,16 +2747,32 @@ fn oracle_incumbent() -> Option<&'static ScipyIncumbent> {
 /// process, so a run's log now names the interpreter and both versions.
 ///
 /// # Panics
-/// Under `FSCI_REQUIRE_SCIPY_ORACLE`, unless the resolved incumbent is the PINNED pair
+/// Under `FSCI_REQUIRE_SCIPY_ORACLE`, when the resolved incumbent is NOT the pinned pair
 /// (`fsci_runtime::scipy_incumbent::{PINNED_SCIPY, PINNED_NUMPY}`); see
-/// [`enforce_pinned_oracle`].
+/// [`enforce_pinned_oracle`]. With no SciPy at all it does not panic: the bare `python3` it
+/// returns fails to import SciPy and each caller fails closed there under the requirement.
 #[must_use]
 pub fn scipy_oracle_command() -> Command {
     let incumbent = oracle_incumbent();
+    refuse_unpinned_incumbent(incumbent);
+    incumbent.map_or_else(|| Command::new("python3"), ScipyIncumbent::command)
+}
+
+/// Panic when a SciPy was resolved but is not the pinned pair while the oracle is required.
+///
+/// An ABSENT SciPy is deliberately left to the caller. `.rch.env` sets
+/// `FSCI_REQUIRE_SCIPY_ORACLE` and `build.rs` forwards it into every `cargo test` of this
+/// crate, including the CI lanes that install no SciPy (the lib unit tests, E2E, evidence
+/// packs), whose fixture-only oracles are built through these defaults and never spawn it.
+/// Refusing there failed those lanes wholesale; the callers that do spawn the oracle
+/// already fail closed when it cannot import SciPy under the requirement.
+fn refuse_unpinned_incumbent(incumbent: Option<&ScipyIncumbent>) {
+    if incumbent.is_none() {
+        return;
+    }
     if let Err(refusal) = enforce_pinned_oracle(incumbent, scipy_oracle_required()) {
         panic!("{refusal}");
     }
-    incumbent.map_or_else(|| Command::new("python3"), ScipyIncumbent::command)
 }
 
 /// Is the live-SciPy oracle REQUIRED for this run (`FSCI_REQUIRE_SCIPY_ORACLE` set)?
@@ -2802,9 +2818,6 @@ pub fn enforce_pinned_oracle(
 /// Interpreter an oracle config defaults to: the proven incumbent when there is one.
 fn default_oracle_python() -> PathBuf {
     let incumbent = oracle_incumbent();
-    if let Err(refusal) = enforce_pinned_oracle(incumbent, scipy_oracle_required()) {
-        panic!("{refusal}");
-    }
     incumbent.map_or_else(
         || PathBuf::from("python3"),
         |found| PathBuf::from(&found.python),
@@ -2816,8 +2829,14 @@ fn default_oracle_python() -> PathBuf {
 /// Without this the `PYTHONPATH` that made the import work during resolution would be absent
 /// from the run that matters, which is the difference between probing a code path and
 /// probing something that merely resembles it.
+///
+/// Every config-driven oracle spawn goes through here, so this is also where an unpinned
+/// SciPy is refused under `FSCI_REQUIRE_SCIPY_ORACLE` (the defaults that build those configs
+/// only resolve the interpreter; a fixture-only config never spawns it).
 fn apply_oracle_env(command: &mut Command) {
-    if let Some(incumbent) = oracle_incumbent() {
+    let incumbent = oracle_incumbent();
+    refuse_unpinned_incumbent(incumbent);
+    if let Some(incumbent) = incumbent {
         incumbent.apply_to(command);
     }
 }

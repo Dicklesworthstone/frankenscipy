@@ -192,7 +192,7 @@ fn generate_query() -> OracleQuery {
 fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
     let script = r#"
 import json
-import os
+import sys
 import numpy as np
 from scipy.signal import find_peaks
 
@@ -203,7 +203,7 @@ def cond(c):
         return c["min"]
     return (c["min"], c["max"])
 
-q = json.loads(os.environ.pop("FSCI_FIND_PEAKS_ORACLE_QUERY"))
+q = json.load(sys.stdin)
 points = []
 for case in q["points"]:
     cid = case["case_id"]
@@ -229,10 +229,12 @@ for case in q["points"]:
         points.append({"case_id": cid, "error": repr(e), "peaks": None, "props": None})
 print(json.dumps({"points": points}))
 "#;
+    // The query goes over stdin: 500 cases of JSON exceed Linux's 128 KiB limit on a single
+    // environment string, and the spawn failed with E2BIG when it was passed as one.
     let query_json = serde_json::to_string(query).expect("serialize find_peaks query");
     let mut child = match fsci_conformance::scipy_oracle_command()
-        .arg("-")
-        .env("FSCI_FIND_PEAKS_ORACLE_QUERY", query_json)
+        .arg("-c")
+        .arg(script)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -250,7 +252,7 @@ print(json.dumps({"points": points}))
     };
     {
         let stdin = child.stdin.as_mut().expect("open find_peaks oracle stdin");
-        if let Err(err) = stdin.write_all(script.as_bytes()) {
+        if let Err(err) = stdin.write_all(query_json.as_bytes()) {
             let output = child.wait_with_output().expect("wait for failed oracle");
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
