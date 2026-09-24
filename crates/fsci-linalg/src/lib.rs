@@ -855,21 +855,23 @@ fn triangle_selected_matrix(
 pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveResult, LinalgError> {
     let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
     let a = mirrored.as_deref().unwrap_or(a);
-    // Fast path for large general square systems: our own multithreaded blocked LU
-    // (trailing update on all cores). Restricted to the plain Strict / untransposed /
-    // General case so all the portfolio diagnostics (rcond, hardened checks, special
-    // assumptions, transposition) keep their exact behavior; a singular pivot or any
-    // unmet precondition falls through to the portfolio solver unchanged.
     let n = a.len();
+    // Fast path for large symmetric positive-definite systems: our own blocked
+    // Cholesky (parallel trailing update), for `assume_a = pos` and — as SciPy's
+    // auto-detection does — for an exactly symmetric matrix under `assume_a = None`
+    // (frankenscipy-7tb8d.14). A non-positive pivot (not actually PD) returns None and
+    // falls through: to the LU fast path below for `None`, and to the portfolio solver
+    // for `pos`, which preserves the exact `assume_a = pos` rejection behavior.
     if n >= solve_flat_min()
         && options.mode == RuntimeMode::Strict
         && !options.transposed
-        && matches!(options.assume_a, None | Some(MatrixAssumption::General))
         && b.len() == n
         && rows_are_rectangular(a, n)
         && a.iter().flatten().all(|v| v.is_finite())
         && b.iter().all(|v| v.is_finite())
-        && let Some(x) = lu_solve_mixed_precision(a, b).or_else(|| lu_solve_blocked(a, b))
+        && (options.assume_a == Some(MatrixAssumption::PositiveDefinite)
+            || (options.assume_a.is_none() && scipy_detects_symmetric(a, DetectionFor::Solve)))
+        && let Some(x) = cholesky_solve_blocked(a, b)
     {
         let backward_error = compute_backward_error_dense(a, &x, b);
         emit_trace(LinalgTrace {
@@ -887,19 +889,20 @@ pub fn solve(a: &[Vec<f64>], b: &[f64], options: SolveOptions) -> Result<SolveRe
             certificate: None,
         });
     }
-    // Fast path for large symmetric positive-definite systems: our own blocked
-    // Cholesky (parallel trailing update). A non-positive pivot (not actually PD)
-    // returns None and falls through to the portfolio solver, which preserves the
-    // exact `assume_a = pos` rejection behavior.
+    // Fast path for large general square systems: our own multithreaded blocked LU
+    // (trailing update on all cores). Restricted to the plain Strict / untransposed /
+    // General case so all the portfolio diagnostics (rcond, hardened checks, special
+    // assumptions, transposition) keep their exact behavior; a singular pivot or any
+    // unmet precondition falls through to the portfolio solver unchanged.
     if n >= solve_flat_min()
         && options.mode == RuntimeMode::Strict
         && !options.transposed
-        && options.assume_a == Some(MatrixAssumption::PositiveDefinite)
+        && matches!(options.assume_a, None | Some(MatrixAssumption::General))
         && b.len() == n
         && rows_are_rectangular(a, n)
         && a.iter().flatten().all(|v| v.is_finite())
         && b.iter().all(|v| v.is_finite())
-        && let Some(x) = cholesky_solve_blocked(a, b)
+        && let Some(x) = lu_solve_mixed_precision(a, b).or_else(|| lu_solve_blocked(a, b))
     {
         let backward_error = compute_backward_error_dense(a, &x, b);
         emit_trace(LinalgTrace {
@@ -1108,12 +1111,15 @@ pub fn inv(a: &[Vec<f64>], options: InvOptions) -> Result<InvResult, LinalgError
     // ~2x cheaper than an LU inverse, so declaring the matrix SPD should be FASTER —
     // but it was routing to the slow portfolio (3x slower than General @512). A
     // non-PD matrix makes `Cholesky::new` return None → falls through to the
-    // portfolio, preserving the exact `assume_a = pos` rejection behavior.
+    // portfolio, preserving the exact `assume_a = pos` rejection behavior. SciPy's
+    // auto-detection (`assume_a = None`) takes the same route for an exactly symmetric
+    // matrix, and a non-PD one falls through to the LU fast path (frankenscipy-7tb8d.14).
     if n >= inv_flat_min()
         && options.mode == RuntimeMode::Strict
-        && options.assume_a == Some(MatrixAssumption::PositiveDefinite)
         && rows_are_rectangular(a, n)
         && a.iter().flatten().all(|v| v.is_finite())
+        && (options.assume_a == Some(MatrixAssumption::PositiveDefinite)
+            || (options.assume_a.is_none() && scipy_detects_symmetric(a, DetectionFor::Inv)))
         && let Ok(matrix) = dmatrix_from_rows(a)
         && let Some(chol) = Cholesky::new(matrix)
         && let Some(inverse) = cholesky_solve_identity_rhs_rows_batched(&chol)
@@ -1417,8 +1423,41 @@ fn assumption_to_evidence(a: MatrixAssumption) -> fsci_runtime::StructuralEviden
         MatrixAssumption::UpperTriangular | MatrixAssumption::LowerTriangular => {
             fsci_runtime::StructuralEvidence::Triangular
         }
+        // `assume_a='pos'`: SciPy factors with Cholesky (potrf).
+        MatrixAssumption::PositiveDefinite => fsci_runtime::StructuralEvidence::Symmetric,
         _ => fsci_runtime::StructuralEvidence::General,
     }
+}
+
+/// Which SciPy routine's structure auto-detection (`assume_a=None`) a diagnostics pass follows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DetectionFor {
+    /// `solve`: a tridiagonal matrix with n > 3 is its own structure (tridiagonal LU), checked
+    /// before symmetry; no positive-definiteness probe.
+    Solve,
+    /// `inv` (and the public report): every exactly symmetric matrix goes to Cholesky; the
+    /// report also probes positive definiteness.
+    Inv,
+}
+
+/// SciPy 1.17's `solve` / `inv` with `assume_a=None` factor an EXACTLY symmetric matrix with
+/// Cholesky first (then LDLᵀ when a pivot fails): Hilbert(6) is solved by Cholesky, and one ulp
+/// of asymmetry makes it general LU (measured live, frankenscipy-7tb8d.14). A diagonal matrix
+/// is classified before symmetry, and `solve` also takes a tridiagonal n > 3 first.
+fn scipy_detects_symmetric(a: &[Vec<f64>], detection: DetectionFor) -> bool {
+    let n = a.len();
+    if n < 2 || !rows_are_rectangular(a, n) || !issymmetric(a, 0.0, 0.0).unwrap_or(false) {
+        return false;
+    }
+    // Exact bandwidth test, as SciPy's: every entry more than `k` off the diagonal is zero.
+    let within_band = |k: usize| {
+        a.iter().enumerate().all(|(i, row)| {
+            row.iter()
+                .enumerate()
+                .all(|(j, &value)| i.abs_diff(j) <= k || value == 0.0)
+        })
+    };
+    !(within_band(0) || (detection == DetectionFor::Solve && n > 3 && within_band(1)))
 }
 
 fn normalize_assumption_for_effective_matrix(
@@ -1473,21 +1512,22 @@ fn condition_diagnostics_with_assumption(
     a: &[Vec<f64>],
     assumption: Option<MatrixAssumption>,
 ) -> Result<ConditionDiagnosticsWork, LinalgError> {
-    condition_diagnostics_with_assumption_mode(a, assumption, true)
+    condition_diagnostics_with_assumption_mode(a, assumption, DetectionFor::Inv)
 }
 
 fn condition_diagnostics_for_solve(
     a: &[Vec<f64>],
     assumption: Option<MatrixAssumption>,
 ) -> Result<ConditionDiagnosticsWork, LinalgError> {
-    condition_diagnostics_with_assumption_mode(a, assumption, false)
+    condition_diagnostics_with_assumption_mode(a, assumption, DetectionFor::Solve)
 }
 
 fn condition_diagnostics_with_assumption_mode(
     a: &[Vec<f64>],
     assumption: Option<MatrixAssumption>,
-    evaluate_positive_definite: bool,
+    detection: DetectionFor,
 ) -> Result<ConditionDiagnosticsWork, LinalgError> {
+    let evaluate_positive_definite = detection == DetectionFor::Inv;
     let (rows, cols) = matrix_shape(a)?;
     let tol = structure_tolerance(a);
 
@@ -1531,6 +1571,8 @@ fn condition_diagnostics_with_assumption_mode(
         StructuralEvidence::Diagonal
     } else if upper_triangular || lower_triangular {
         StructuralEvidence::Triangular
+    } else if assumption.is_none() && symmetric && scipy_detects_symmetric(a, detection) {
+        StructuralEvidence::Symmetric
     } else {
         assumption
             .map(assumption_to_evidence)
@@ -1887,7 +1929,7 @@ fn build_solve_certificate(
     report: &ConditionReport,
     action: SolverAction,
     posterior: [f64; 4],
-    expected_losses: [f64; 5],
+    expected_losses: [f64; 6],
     fallback_active: bool,
 ) -> SolveCertificate {
     SolveCertificate {
@@ -1902,6 +1944,38 @@ fn build_solve_certificate(
     }
 }
 
+/// The action `solve` / `inv` try next, given the posterior's `candidate` and the actions
+/// already `tried`. Strict mode maximizes observable compatibility, so it follows SciPy's order
+/// rather than the posterior's: Cholesky first on an exactly symmetric matrix (SciPy's
+/// auto-detection), then LU (getrf) at every conditioning, and QR / SVD only once LU has failed
+/// its backward-error certificate. On a non-symmetric matrix at rcond 2.5e-5 the posterior's
+/// QR is not SciPy's answer; on Hilbert(6) SciPy's Cholesky is 1.8e-8 from the exact solution,
+/// where the posterior's QR was 7.6e-7 away from it (frankenscipy-7tb8d.14). Hardened mode
+/// keeps the posterior's choice.
+fn strict_order_action(
+    mode: RuntimeMode,
+    structural_evidence: StructuralEvidence,
+    candidate: SolverAction,
+    tried: &[SolverAction],
+) -> SolverAction {
+    if mode != RuntimeMode::Strict {
+        return candidate;
+    }
+    if structural_evidence == StructuralEvidence::Symmetric
+        && !tried.contains(&SolverAction::CholeskyFastPath)
+    {
+        return SolverAction::CholeskyFastPath;
+    }
+    if matches!(
+        candidate,
+        SolverAction::PivotedQR | SolverAction::SVDFallback
+    ) && !tried.contains(&SolverAction::DirectLU)
+    {
+        return SolverAction::DirectLU;
+    }
+    candidate
+}
+
 fn candidate_actions(structural_evidence: StructuralEvidence) -> Vec<SolverAction> {
     let mut actions = vec![
         SolverAction::DirectLU,
@@ -1911,9 +1985,16 @@ fn candidate_actions(structural_evidence: StructuralEvidence) -> Vec<SolverActio
     match structural_evidence {
         StructuralEvidence::Diagonal => actions.push(SolverAction::DiagonalFastPath),
         StructuralEvidence::Triangular => actions.push(SolverAction::TriangularFastPath),
+        StructuralEvidence::Symmetric => actions.push(SolverAction::CholeskyFastPath),
         StructuralEvidence::General => {}
     }
     actions
+}
+
+fn not_positive_definite() -> LinalgError {
+    LinalgError::InvalidArgument {
+        detail: "matrix is not positive definite".into(),
+    }
 }
 
 fn dispatch_solve_action(
@@ -1956,6 +2037,18 @@ fn dispatch_solve_action(
             report.lower_triangular,
             false,
         ),
+        SolverAction::CholeskyFastPath => {
+            let n = effective_a.len();
+            let l_flat = cholesky_lower_factor(effective_a, n).ok_or_else(not_positive_definite)?;
+            let x = cho_solve_lower_flat(&l_flat, n, b).ok_or(LinalgError::SingularMatrix)?;
+            let backward_error = compute_backward_error_dense(effective_a, &x, b);
+            Ok(SolveResult {
+                x,
+                warning: rcond_warning(report.rcond_estimate),
+                backward_error: Some(backward_error),
+                certificate: None,
+            })
+        }
     }
 }
 
@@ -1977,6 +2070,7 @@ const ATTEMPT_BACKWARD_ERROR_TOL: f64 = POLICY_FULL_VALIDATION_BACKWARD_ERROR_TH
 #[allow(clippy::too_many_arguments)]
 fn run_portfolio_attempts(
     portfolio: &mut SolverPortfolio,
+    mode: RuntimeMode,
     effective_a: &[Vec<f64>],
     b: &[f64],
     report: &ConditionReport,
@@ -1984,7 +2078,7 @@ fn run_portfolio_attempts(
     lu_cache: &mut Option<LU<f64, Dyn, Dyn>>,
     selected_action: SolverAction,
     posterior: [f64; 4],
-    expected_losses: [f64; 5],
+    expected_losses: [f64; 6],
 ) -> (SolverAction, Result<SolveResult, LinalgError>) {
     let applicable = candidate_actions(report.structural_evidence);
     let rcond = report.rcond_estimate;
@@ -2012,12 +2106,19 @@ fn run_portfolio_attempts(
                 }
             }
             Err(err) => {
-                portfolio.record_outcome(rcond, action, AttemptOutcome::Failed);
+                // A Cholesky breakdown refutes positive definiteness, which says nothing about
+                // the conditioning state the posterior tracks; like SciPy, move on to the next
+                // factorization without counting it.
+                if action != SolverAction::CholeskyFastPath {
+                    portfolio.record_outcome(rcond, action, AttemptOutcome::Failed);
+                }
                 last_error = Some(err);
             }
         }
         match portfolio.select_action_excluding(rcond, Some(report.structural_evidence), &tried) {
-            Some((next, ..)) if applicable.contains(&next) => action = next,
+            Some((next, ..)) if applicable.contains(&next) => {
+                action = strict_order_action(mode, report.structural_evidence, next, &tried);
+            }
             _ => break,
         }
     }
@@ -2119,11 +2220,18 @@ fn solve_with_portfolio_internal(
         });
     }
 
-    let (selected_action, posterior, expected_losses, _) =
+    let (posterior_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
+    let selected_action = strict_order_action(
+        options.mode,
+        report.structural_evidence,
+        posterior_action,
+        &[],
+    );
 
     let (actual_action, result) = run_portfolio_attempts(
         portfolio,
+        options.mode,
         &effective_a,
         b,
         &report,
@@ -2330,11 +2438,18 @@ pub fn solve_with_audit(
     }
 
     // CASP solver selection with audit
-    let (selected_action, posterior, expected_losses, _) =
+    let (posterior_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
+    let selected_action = strict_order_action(
+        options.mode,
+        report.structural_evidence,
+        posterior_action,
+        &[],
+    );
 
     let (actual_action, result) = run_portfolio_attempts(
         portfolio,
+        options.mode,
         &effective_a,
         b,
         &report,
@@ -2449,8 +2564,14 @@ pub fn inv_with_casp(
         return Err(LinalgError::SingularMatrix);
     }
 
-    let (selected_action, posterior, expected_losses, _) =
+    let (posterior_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
+    let selected_action = strict_order_action(
+        options.mode,
+        report.structural_evidence,
+        posterior_action,
+        &[],
+    );
 
     // For inv, we try actions in order of expected loss
     let mut actions = vec![
@@ -2458,10 +2579,24 @@ pub fn inv_with_casp(
         SolverAction::PivotedQR,
         SolverAction::SVDFallback,
     ];
+    if report.structural_evidence == StructuralEvidence::Symmetric {
+        actions.push(SolverAction::CholeskyFastPath);
+    }
     actions
         .sort_by(|lhs, rhs| expected_losses[lhs.index()].total_cmp(&expected_losses[rhs.index()]));
     if let Some(position) = actions.iter().position(|action| *action == selected_action) {
         actions.swap(0, position);
+    }
+    // Strict: after the first attempt SciPy's next factorization is LU (getrf / getri), ahead
+    // of the posterior's QR and SVD.
+    if options.mode == RuntimeMode::Strict
+        && let Some(lu) = actions
+            .iter()
+            .position(|action| *action == SolverAction::DirectLU)
+        && lu > 1
+    {
+        let lu_action = actions.remove(lu);
+        actions.insert(1, lu_action);
     }
 
     let mut last_error = None;
@@ -2530,6 +2665,43 @@ fn dispatch_inv_action(
     lu_cache: &Option<LU<f64, Dyn, Dyn>>,
 ) -> Result<InvResult, LinalgError> {
     match action {
+        SolverAction::CholeskyFastPath => {
+            // SciPy's inverse of a symmetric positive definite matrix (potrf / potri): factor
+            // once, solve L·Lᵀ·X = I, and return one triangle mirrored, so the inverse is
+            // exactly symmetric as potri's is.
+            let l_flat = cholesky_lower_factor(a, n).ok_or_else(not_positive_definite)?;
+            let columns = (0..n)
+                .map(|j| {
+                    let mut unit = vec![0.0; n];
+                    unit[j] = 1.0;
+                    cho_solve_lower_flat(&l_flat, n, &unit).ok_or(LinalgError::SingularMatrix)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let inverse: Vec<Vec<f64>> = (0..n)
+                .map(|i| (0..n).map(|j| columns[i.min(j)][i.max(j)]).collect())
+                .collect();
+            let a_norm_1 = matrix_norm1_rows(a, n);
+            let inv_norm_1 = matrix_norm1_rows(&inverse, n);
+            let rcond = if a_norm_1 > 0.0 && inv_norm_1 > 0.0 {
+                1.0 / (a_norm_1 * inv_norm_1)
+            } else {
+                0.0
+            };
+            if mode == RuntimeMode::Hardened && rcond < HARDENED_RCOND_THRESHOLD && rcond > 0.0 {
+                return Err(LinalgError::ConditionTooHigh {
+                    rcond,
+                    threshold: HARDENED_RCOND_THRESHOLD,
+                });
+            }
+            if rcond == 0.0 || rcond < f64::EPSILON {
+                return Err(LinalgError::SingularMatrix);
+            }
+            Ok(InvResult {
+                inverse,
+                warning: rcond_warning(rcond),
+                certificate: None,
+            })
+        }
         SolverAction::DirectLU
         | SolverAction::DiagonalFastPath
         | SolverAction::TriangularFastPath => {
@@ -27408,7 +27580,7 @@ mod tests {
 
     fn assert_certificate_populated(certificate: &SolveCertificate) {
         assert_eq!(certificate.posterior.len(), 4);
-        assert_eq!(certificate.expected_losses.len(), 5);
+        assert_eq!(certificate.expected_losses.len(), SolverAction::ALL.len());
     }
 
     #[test]
@@ -28273,7 +28445,8 @@ mod tests {
     fn condition_diagnostics_hilbert_reports_ill_conditioning() {
         let a = hilbert(6);
         let report = condition_diagnostics(&a).expect("hilbert diagnostics");
-        assert_eq!(report.structural_evidence, StructuralEvidence::General);
+        // Exactly symmetric: SciPy's structure detection tries Cholesky (frankenscipy-7tb8d.14).
+        assert_eq!(report.structural_evidence, StructuralEvidence::Symmetric);
         assert!(report.symmetric);
         assert!(report.positive_definite);
         assert!(report.rcond_estimate < 1e-6);
@@ -28425,9 +28598,12 @@ mod tests {
         assert_certificate_populated(&certificate);
     }
 
+    // The posterior's own choice is observable in Hardened mode; Strict tries SciPy's LU first
+    // (frankenscipy-7tb8d.14, `strict_solve_and_inv_try_scipys_lu_first`). Non-symmetric, so
+    // the evidence is General rather than the Cholesky-first Symmetric.
     #[test]
     fn casp_selects_qr_for_moderate_condition() {
-        let a = rotated_diagonal(1.0, 1e-4);
+        let a = vec![vec![1.0, 1.0], vec![1.0001, 1.0]];
         let b = vec![1.0, -1.0];
         let report = condition_diagnostics(&a).expect("condition diagnostics");
         assert!(
@@ -28436,7 +28612,11 @@ mod tests {
             report.rcond_estimate
         );
         assert_eq!(report.structural_evidence, StructuralEvidence::General);
-        let result = solve(&a, &b, SolveOptions::default()).expect("solve works");
+        let hardened = SolveOptions {
+            mode: RuntimeMode::Hardened,
+            ..SolveOptions::default()
+        };
+        let result = solve(&a, &b, hardened).expect("solve works");
         let certificate = result.certificate.expect("certificate populated");
         assert_eq!(certificate.action, SolverAction::PivotedQR);
         assert!(!certificate.fallback_active);
@@ -28445,7 +28625,7 @@ mod tests {
 
     #[test]
     fn casp_selects_svd_for_ill_conditioned() {
-        let a = rotated_diagonal(1.0, 1e-12);
+        let a = vec![vec![1.0, 1.0], vec![1.0 + 1e-12, 1.0]];
         let b = vec![1.0, -1.0];
         let report = condition_diagnostics(&a).expect("condition diagnostics");
         assert!(
@@ -28453,11 +28633,216 @@ mod tests {
             "expected ill-conditioned rcond, got {}",
             report.rcond_estimate
         );
-        let result = solve(&a, &b, SolveOptions::default()).expect("solve works");
+        assert_eq!(report.structural_evidence, StructuralEvidence::General);
+        let hardened = SolveOptions {
+            mode: RuntimeMode::Hardened,
+            ..SolveOptions::default()
+        };
+        let result = solve(&a, &b, hardened).expect("solve works");
         let certificate = result.certificate.expect("certificate populated");
         assert_eq!(certificate.action, SolverAction::SVDFallback);
         assert!(!certificate.fallback_active);
         assert_certificate_populated(&certificate);
+    }
+
+    /// frankenscipy-7tb8d.14. On a NON-symmetric matrix `scipy.linalg.solve` / `inv` (default
+    /// `assume_a=None`) factor with LU at every conditioning — SciPy 1.17.1's default answer is
+    /// bit-identical to `assume_a='gen'` on both matrices below. Where the posterior prefers QR
+    /// (rcond 2.5e-5) or SVD (rcond 2.5e-13), Strict mode must still answer with LU when LU's
+    /// certificate passes. (A symmetric matrix is SciPy's Cholesky path instead —
+    /// `strict_symmetric_solve_and_inv_take_scipys_cholesky`.)
+    #[test]
+    fn strict_solve_and_inv_try_scipys_lu_first() {
+        let moderate = vec![vec![1.0, 1.0], vec![1.0001, 1.0]];
+        let severe = vec![vec![1.0, 1.0], vec![1.0 + 1e-12, 1.0]];
+        let b = [1.0, -1.0];
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
+        let posterior = |a: &[Vec<f64>], portfolio: &SolverPortfolio| {
+            let rcond = condition_diagnostics(a)
+                .expect("diagnostics")
+                .rcond_estimate;
+            portfolio
+                .select_action(rcond, Some(StructuralEvidence::General))
+                .0
+        };
+        // Negative arm: the posterior alone would not pick LU on either matrix.
+        assert_eq!(posterior(&moderate, &portfolio), SolverAction::PivotedQR);
+        assert_eq!(posterior(&severe, &portfolio), SolverAction::SVDFallback);
+
+        let strict = solve_with_casp(&moderate, &b, SolveOptions::default(), &mut portfolio)
+            .expect("strict solve");
+        let certificate = strict.certificate.expect("certificate");
+        assert_eq!(certificate.action, SolverAction::DirectLU);
+        assert!(!certificate.fallback_active);
+        // SciPy 1.17.1: x = (-19999.99999999668, 20000.99999999668); cond ≈ 4e4, so 1e-9
+        // relative is above the conditioning's rounding floor.
+        for (got, want) in strict
+            .x
+            .iter()
+            .zip([-19_999.999_999_996_68, 20_000.999_999_996_68])
+        {
+            assert!(
+                (got - want).abs() <= 1e-9 * want.abs(),
+                "x = {:?}",
+                strict.x
+            );
+        }
+
+        let result = solve(&severe, &b, SolveOptions::default()).expect("strict solve");
+        let certificate = result.certificate.expect("certificate");
+        assert_eq!(certificate.action, SolverAction::DirectLU);
+        assert!(
+            result
+                .backward_error
+                .is_some_and(|omega| omega <= ATTEMPT_BACKWARD_ERROR_TOL)
+        );
+
+        // inv: LU (getrf / getri), as SciPy: inverse (-9999.99999999834, 9999.99999999834;
+        // 10000.99999999834, -9999.99999999834).
+        let inverse = inv_with_casp(&moderate, InvOptions::default(), &mut portfolio).expect("inv");
+        assert_eq!(
+            inverse.certificate.expect("certificate").action,
+            SolverAction::DirectLU
+        );
+        let want = [
+            [-9_999.999_999_998_34, 9_999.999_999_998_34],
+            [10_000.999_999_998_34, -9_999.999_999_998_34],
+        ];
+        for (row, want_row) in inverse.inverse.iter().zip(want) {
+            for (got, want) in row.iter().zip(want_row) {
+                assert!(
+                    (got - want).abs() <= 1e-9 * want.abs(),
+                    "inv = {:?}",
+                    inverse.inverse
+                );
+            }
+        }
+    }
+
+    /// frankenscipy-7tb8d.14. SciPy 1.17.1's default `solve` / `inv` factor an EXACTLY symmetric
+    /// matrix with Cholesky. On Hilbert(6) SciPy's own LU answer is 7.5e-7 from its default
+    /// (Cholesky) answer, which is what failed diff_linalg's 5e-7 contract.
+    #[test]
+    fn strict_symmetric_solve_and_inv_take_scipys_cholesky() {
+        let h = hilbert(6);
+        let ones = [1.0; 6];
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
+        let result =
+            solve_with_casp(&h, &ones, SolveOptions::default(), &mut portfolio).expect("solve");
+        let certificate = result.certificate.expect("certificate");
+        assert_eq!(
+            certificate.structural_evidence,
+            StructuralEvidence::Symmetric
+        );
+        assert_eq!(certificate.action, SolverAction::CholeskyFastPath);
+        assert!(!certificate.fallback_active);
+        // SciPy 1.17.1 `solve(hilbert(6), ones(6))`; an LU answer is 7.5e-7 away.
+        let scipy_x = [
+            -5.999_999_999_912_362,
+            209.999_999_998_218_1,
+            -1_679.999_999_990_899_1,
+            5_039.999_999_981_625_5,
+            -6_299.999_999_984_031,
+            2_771.999_999_995_018,
+        ];
+        for (got, want) in result.x.iter().zip(scipy_x) {
+            assert!((got - want).abs() <= 1e-8, "x = {:?}", result.x);
+        }
+
+        // inv: Cholesky (potrf / potri), exactly symmetric like SciPy's. SciPy's LU inverse
+        // is 1.4e-10 (relative, max-norm) from its default one.
+        let inverse = inv_with_casp(&h, InvOptions::default(), &mut portfolio).expect("inv");
+        assert_eq!(
+            inverse.certificate.expect("certificate").action,
+            SolverAction::CholeskyFastPath
+        );
+        for (i, row) in inverse.inverse.iter().enumerate() {
+            for (j, value) in row.iter().enumerate() {
+                assert_eq!(value.to_bits(), inverse.inverse[j][i].to_bits());
+            }
+        }
+        let scipy_row0 = [
+            35.999_999_999_695_07,
+            -629.999_999_992_433_2,
+            3_359.999_999_953_713,
+            -7_559.999_999_888_566,
+            7_559.999_999_884_368,
+            -2_771.999_999_956_691_7,
+        ];
+        for (got, want) in inverse.inverse[0].iter().zip(scipy_row0) {
+            assert!(
+                (got - want).abs() <= 1e-7,
+                "inv[0] = {:?}",
+                inverse.inverse[0]
+            );
+        }
+
+        // Negative arm: one ulp of asymmetry is a general matrix to SciPy, and LU to us.
+        let mut skew = h.clone();
+        skew[0][5] = f64::from_bits(skew[0][5].to_bits() + 1);
+        let certificate = solve_with_casp(&skew, &ones, SolveOptions::default(), &mut portfolio)
+            .expect("solve")
+            .certificate
+            .expect("certificate");
+        assert_eq!(certificate.structural_evidence, StructuralEvidence::General);
+        assert_eq!(certificate.action, SolverAction::DirectLU);
+
+        // Symmetric but indefinite: Cholesky breaks down and the solve moves on to LU (SciPy
+        // moves on to LDLᵀ) without counting the breakdown as conditioning evidence.
+        let indefinite = vec![vec![1.0, 2.0], vec![2.0, 1.0]];
+        let mut fresh = SolverPortfolio::new(RuntimeMode::Strict, 64);
+        let result = solve_with_casp(
+            &indefinite,
+            &[3.0, 3.0],
+            SolveOptions::default(),
+            &mut fresh,
+        )
+        .expect("solve");
+        let certificate = result.certificate.expect("certificate");
+        assert_eq!(
+            certificate.structural_evidence,
+            StructuralEvidence::Symmetric
+        );
+        assert_eq!(certificate.action, SolverAction::DirectLU);
+        assert!(certificate.fallback_active);
+        for got in &result.x {
+            assert!((got - 1.0).abs() <= 1e-15, "x = {:?}", result.x);
+        }
+        let recorded: f64 = fresh
+            .outcome_counts(certificate.rcond_estimate)
+            .iter()
+            .sum();
+        assert!((recorded - 1.0).abs() < 1e-12, "recorded {recorded}");
+
+        // Symmetric tridiagonal, n = 5: `solve` takes it to the tridiagonal LU (gtsv, the same
+        // answer as getrf here), `inv` to Cholesky.
+        let tridiagonal: Vec<Vec<f64>> = (0..5)
+            .map(|i: usize| {
+                (0..5)
+                    .map(|j: usize| match i.abs_diff(j) {
+                        0 => 4.0,
+                        1 => 1.0,
+                        _ => 0.0,
+                    })
+                    .collect()
+            })
+            .collect();
+        let certificate = solve_with_casp(
+            &tridiagonal,
+            &[1.0, 2.0, 3.0, 4.0, 5.0],
+            SolveOptions::default(),
+            &mut portfolio,
+        )
+        .expect("solve")
+        .certificate
+        .expect("certificate");
+        assert_eq!(certificate.structural_evidence, StructuralEvidence::General);
+        assert_eq!(certificate.action, SolverAction::DirectLU);
+        let certificate = inv_with_casp(&tridiagonal, InvOptions::default(), &mut portfolio)
+            .expect("inv")
+            .certificate
+            .expect("certificate");
+        assert_eq!(certificate.action, SolverAction::CholeskyFastPath);
     }
 
     #[test]

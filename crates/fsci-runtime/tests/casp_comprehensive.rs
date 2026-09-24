@@ -1248,7 +1248,7 @@ fn portfolio_chosen_loss_is_minimum() {
 #[test]
 fn portfolio_default_loss_matrix_shape() {
     let m = SolverPortfolio::default_loss_matrix();
-    assert_eq!(m.len(), 5);
+    assert_eq!(m.len(), 6);
     for row in &m {
         assert_eq!(row.len(), 4);
     }
@@ -1433,7 +1433,7 @@ fn mcs_debug() {
 
 #[test]
 fn sa_all_count() {
-    assert_eq!(SolverAction::ALL.len(), 5);
+    assert_eq!(SolverAction::ALL.len(), 6);
 }
 
 #[test]
@@ -1459,6 +1459,12 @@ fn sa_index_diag() {
 #[test]
 fn sa_index_tri() {
     assert_eq!(SolverAction::TriangularFastPath.index(), 4);
+}
+
+#[test]
+fn sa_index_cholesky() {
+    assert_eq!(SolverAction::CholeskyFastPath.index(), 5);
+    assert_eq!(SolverAction::ALL[5], SolverAction::CholeskyFastPath);
 }
 
 #[test]
@@ -2233,6 +2239,7 @@ fn golden_portfolio_well_cond_losses() {
     assert_close(losses[2], 15.0, 1e-12, 0.0); // SVDFallback
     assert_close(losses[3], 0.0, 1e-12, 0.0); // DiagonalFastPath
     assert_close(losses[4], 0.0, 1e-12, 0.0); // TriangularFastPath
+    assert_close(losses[5], 0.0, 1e-12, 0.0); // CholeskyFastPath
 }
 
 #[test]

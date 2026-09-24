@@ -77,6 +77,9 @@ pub enum StructuralEvidence {
     General,
     Diagonal,
     Triangular,
+    /// Exactly symmetric (and neither diagonal nor triangular): SciPy's structure detection
+    /// tries Cholesky on it first, so it may be positive definite. Cholesky's own pivots decide.
+    Symmetric,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,15 +89,17 @@ pub enum SolverAction {
     SVDFallback,
     DiagonalFastPath,
     TriangularFastPath,
+    CholeskyFastPath,
 }
 
 impl SolverAction {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::DirectLU,
         Self::PivotedQR,
         Self::SVDFallback,
         Self::DiagonalFastPath,
         Self::TriangularFastPath,
+        Self::CholeskyFastPath,
     ];
 
     #[must_use]
@@ -105,6 +110,7 @@ impl SolverAction {
             Self::SVDFallback => 2,
             Self::DiagonalFastPath => 3,
             Self::TriangularFastPath => 4,
+            Self::CholeskyFastPath => 5,
         }
     }
 }
@@ -125,7 +131,7 @@ pub struct SolverEvidenceEntry {
 
 /// Expected-loss solver selection engine (§0.4 alien-artifact).
 ///
-/// Loss matrix (5 actions × 4 states):
+/// Loss matrix (6 actions × 4 states):
 ///
 /// | Action \ State     | WellCond | Moderate | IllCond | NearSingular |
 /// |--------------------|----------|----------|---------|--------------|
@@ -134,12 +140,13 @@ pub struct SolverEvidenceEntry {
 /// | SVDFallback        |       15 |       10 |       1 |            1 |
 /// | DiagonalFastPath   |        0 |        0 |       0 |          100 |
 /// | TriangularFastPath |        0 |        0 |       0 |          100 |
+/// | CholeskyFastPath   |        0 |        0 |       0 |          100 |
 ///
 /// Decision: a* = argmin_a Σ_s L(a,s) × P(s|evidence)
 #[derive(Debug, Clone)]
 pub struct SolverPortfolio {
     mode: RuntimeMode,
-    loss_matrix: [[f64; 4]; 5],
+    loss_matrix: [[f64; 4]; 6],
     evidence: VecDeque<SolverEvidenceEntry>,
     evidence_capacity: usize,
     calibrator: ConformalCalibrator,
@@ -174,12 +181,13 @@ const STATE_SMOOTHING: f64 = 0.05;
 /// P(`AttemptOutcome::Ok` | state, action) for the observation model. Rows follow
 /// `SolverAction::index`, columns the condition states (well, moderate, ill, near-singular).
 /// Hand-set, like the loss matrix; a calibrated table is frankenscipy-7tb8d.2.
-const OK_PROBABILITY: [[f64; 4]; 5] = [
+const OK_PROBABILITY: [[f64; 4]; 6] = [
     [0.99, 0.95, 0.40, 0.05], // DirectLU
     [0.99, 0.98, 0.70, 0.20], // PivotedQR
     [0.99, 0.99, 0.95, 0.90], // SVDFallback
     [0.99, 0.99, 0.99, 0.30], // DiagonalFastPath
     [0.99, 0.99, 0.95, 0.30], // TriangularFastPath
+    [0.99, 0.99, 0.95, 0.30], // CholeskyFastPath (a not-positive-definite breakdown is not recorded)
 ];
 
 /// Share of the non-`Ok` probability that is `Inaccurate` (the rest is `Failed`).
@@ -290,13 +298,14 @@ impl SolverPortfolio {
     }
 
     #[must_use]
-    pub const fn default_loss_matrix() -> [[f64; 4]; 5] {
+    pub const fn default_loss_matrix() -> [[f64; 4]; 6] {
         [
             [1.0, 5.0, 40.0, 120.0], // DirectLU
             [3.0, 1.0, 8.0, 45.0],   // PivotedQR
             [15.0, 10.0, 1.0, 1.0],  // SVDFallback
             [0.0, 0.0, 0.0, 100.0],  // DiagonalFastPath
             [0.0, 0.0, 0.0, 100.0],  // TriangularFastPath
+            [0.0, 0.0, 0.0, 100.0],  // CholeskyFastPath
         ]
     }
 
@@ -306,7 +315,7 @@ impl SolverPortfolio {
         &self,
         rcond: f64,
         structure: Option<StructuralEvidence>,
-    ) -> (SolverAction, [f64; 4], [f64; 5], f64) {
+    ) -> (SolverAction, [f64; 4], [f64; 6], f64) {
         self.select_action_excluding(rcond, structure, &[])
             .expect("the three general solvers are never all excluded here")
     }
@@ -321,7 +330,7 @@ impl SolverPortfolio {
         rcond: f64,
         structure: Option<StructuralEvidence>,
         excluded: &[SolverAction],
-    ) -> Option<(SolverAction, [f64; 4], [f64; 5], f64)> {
+    ) -> Option<(SolverAction, [f64; 4], [f64; 6], f64)> {
         let posterior = self.posterior(rcond);
         let losses = self.compute_expected_losses(posterior);
 
@@ -336,9 +345,9 @@ impl SolverPortfolio {
         }
 
         // argmin over expected losses
-        // We consider general solvers (0, 1, 2) and applicable fast paths (3, 4)
-        // Use stack-allocated array to avoid heap allocation in tight loops.
-        let mut candidates = [0, 1, 2, 0, 0];
+        // We consider general solvers (0, 1, 2) and the one fast path the structure admits
+        // (3, 4 or 5). Use stack-allocated array to avoid heap allocation in tight loops.
+        let mut candidates = [0, 1, 2, 0];
         let mut count = 3;
         match structure {
             Some(StructuralEvidence::Diagonal) => {
@@ -349,7 +358,11 @@ impl SolverPortfolio {
                 candidates[3] = 4;
                 count = 4;
             }
-            _ => {}
+            Some(StructuralEvidence::Symmetric) => {
+                candidates[3] = 5;
+                count = 4;
+            }
+            Some(StructuralEvidence::General) | None => {}
         }
 
         let mut best: Option<(usize, f64)> = None;
@@ -424,8 +437,8 @@ impl SolverPortfolio {
         &self.calibrator
     }
 
-    fn compute_expected_losses(&self, posterior: [f64; 4]) -> [f64; 5] {
-        let mut losses = [0.0; 5];
+    fn compute_expected_losses(&self, posterior: [f64; 4]) -> [f64; 6] {
+        let mut losses = [0.0; 6];
         for (action_idx, row) in self.loss_matrix.iter().enumerate() {
             losses[action_idx] = row.iter().zip(posterior.iter()).map(|(l, p)| l * p).sum();
         }
@@ -1845,6 +1858,7 @@ mod tests {
         match structure {
             Some(StructuralEvidence::Diagonal) => candidates.push(3),
             Some(StructuralEvidence::Triangular) => candidates.push(4),
+            Some(StructuralEvidence::Symmetric) => candidates.push(5),
             _ => {}
         }
         let mut best = candidates[0];
@@ -1874,6 +1888,7 @@ mod tests {
                 None,
                 Some(StructuralEvidence::Diagonal),
                 Some(StructuralEvidence::Triangular),
+                Some(StructuralEvidence::Symmetric),
             ] {
                 let (action, posterior, _, _) = portfolio.select_action(rcond, structure);
                 assert_eq!(
@@ -2023,6 +2038,34 @@ mod tests {
         let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
         let (action, _, _, _) = portfolio.select_action(1e-2, Some(StructuralEvidence::Diagonal));
         assert_eq!(action, SolverAction::DiagonalFastPath);
+    }
+
+    // frankenscipy-7tb8d.14: Cholesky is a candidate only for symmetric evidence, and loses to
+    // SVD where the posterior is all near-singular.
+    #[test]
+    fn casp_offers_cholesky_only_for_symmetric_evidence() {
+        let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
+        let symmetric = Some(StructuralEvidence::Symmetric);
+        for rcond in [1e-2, 1e-6, 1e-11] {
+            assert_eq!(
+                portfolio.select_action(rcond, symmetric).0,
+                SolverAction::CholeskyFastPath
+            );
+            for other in [None, Some(StructuralEvidence::General)] {
+                assert_ne!(
+                    portfolio.select_action(rcond, other).0,
+                    SolverAction::CholeskyFastPath
+                );
+            }
+        }
+        assert_eq!(
+            portfolio.select_action(1e-16, symmetric).0,
+            SolverAction::SVDFallback
+        );
+        let excluded = portfolio
+            .select_action_excluding(1e-2, symmetric, &[SolverAction::CholeskyFastPath])
+            .expect("the general solvers remain");
+        assert_eq!(excluded.0, SolverAction::DirectLU);
     }
 
     #[test]

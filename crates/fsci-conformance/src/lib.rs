@@ -4490,6 +4490,7 @@ fn solver_action_name(action: &fsci_runtime::SolverAction) -> &'static str {
         fsci_runtime::SolverAction::SVDFallback => "svd_fallback",
         fsci_runtime::SolverAction::DiagonalFastPath => "diagonal_fast_path",
         fsci_runtime::SolverAction::TriangularFastPath => "triangular_fast_path",
+        fsci_runtime::SolverAction::CholeskyFastPath => "cholesky_fast_path",
     }
 }
 
