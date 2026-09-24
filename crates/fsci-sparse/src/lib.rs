@@ -2862,6 +2862,55 @@ mod tests {
         assert_eq!(portfolio.evidence_len(), 1);
     }
 
+    /// frankenscipy-7tb8d.7: in Strict mode an iterative arm that ran out of iterations was
+    /// returned as Ok (converged = false, no fallback); only Hardened fell back to the direct
+    /// LU. Three CG iterations cannot solve a 100-point 1-D Laplacian, so the fallback must run
+    /// in both modes and leave a solved system.
+    #[test]
+    fn test_solve_with_casp_portfolio_unconverged_iterate_falls_back_in_both_modes() {
+        let n = 100;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut data = Vec::new();
+        for i in 0..n {
+            rows.push(i);
+            cols.push(i);
+            data.push(2.0);
+            if i > 0 {
+                rows.extend([i, i - 1]);
+                cols.extend([i - 1, i]);
+                data.extend([-1.0, -1.0]);
+            }
+        }
+        let csr = CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+            .unwrap()
+            .to_csr()
+            .unwrap();
+        let b = vec![1.0; n];
+        let starved = IterativeSolveOptions {
+            max_iter: Some(3),
+            ..IterativeSolveOptions::default()
+        };
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(mode, 16);
+            let res = solve_with_casp_portfolio(&csr, &b, None, &mut portfolio, starved)
+                .expect("portfolio solve");
+            assert_ne!(res.chosen_action, fsci_runtime::SparseSolverAction::SuperLU);
+            assert!(
+                res.fallback_active,
+                "{mode:?}: no fallback after 3 iterations"
+            );
+            assert!(res.converged, "{mode:?}: residual {}", res.residual_norm);
+            let ax = spmv_csr(&csr, &res.x).unwrap();
+            let worst = ax
+                .iter()
+                .zip(&b)
+                .map(|(l, r)| (l - r).abs())
+                .fold(0.0, f64::max);
+            assert!(worst < 1e-9, "{mode:?}: |Ax - b| = {worst}");
+        }
+    }
+
     #[test]
     fn test_spsolve_with_casp_spd_system() {
         let n = 5;

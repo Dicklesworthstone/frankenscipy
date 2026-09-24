@@ -116,6 +116,7 @@ fn generate_query() -> OracleQuery {
         0.0, 2.0, 3.0, 5.0, 1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0,
         0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
     ];
+    let adj_6_copy = adj_6.clone();
 
     OracleQuery {
         points: vec![
@@ -137,8 +138,47 @@ fn generate_query() -> OracleQuery {
                 cols: 5,
                 adj_flat: adj_5_star,
             },
+            // br-szq1n.3: the symmetric cases above cannot see which triangle
+            // the implementation reads. These can.
+            PointCase {
+                case_id: "6n_classic_lower_only".into(),
+                rows: 6,
+                cols: 6,
+                adj_flat: triangle_only(&adj_6_copy, 6, true),
+            },
+            PointCase {
+                case_id: "6n_classic_upper_only".into(),
+                rows: 6,
+                cols: 6,
+                adj_flat: triangle_only(&adj_6_copy, 6, false),
+            },
+            PointCase {
+                case_id: "4n_asymmetric_weights".into(),
+                rows: 4,
+                cols: 4,
+                // (i,j) and (j,i) disagree; SciPy takes the lighter of each pair.
+                adj_flat: vec![
+                    0.0, 5.0, 0.0, 1.0, //
+                    1.0, 0.0, 9.0, 0.0, //
+                    0.0, 2.0, 0.0, 7.0, //
+                    8.0, 0.0, 3.0, 0.0,
+                ],
+            },
         ],
     }
+}
+
+/// Keep only the strict lower (or upper) triangle of a dense adjacency matrix.
+fn triangle_only(dense: &[f64], n: usize, lower: bool) -> Vec<f64> {
+    let mut out = vec![0.0; n * n];
+    for r in 0..n {
+        for c in 0..n {
+            if (lower && r > c) || (!lower && r < c) {
+                out[r * n + c] = dense[r * n + c];
+            }
+        }
+    }
+    out
 }
 
 fn scipy_oracle_or_skip(query: &OracleQuery) -> Option<OracleResult> {
@@ -240,8 +280,19 @@ fn diff_sparse_minimum_spanning_tree() {
             continue;
         };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
-        let Ok(res) = minimum_spanning_tree(&csr) else {
-            continue;
+        // An fsci error where SciPy returned a finite tree is a divergence, not a
+        // case to skip.
+        let res = match minimum_spanning_tree(&csr) {
+            Ok(res) => res,
+            Err(err) => {
+                eprintln!("mst: fsci error on {}: {err:?}", case.case_id);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    abs_diff: f64::INFINITY,
+                    pass: false,
+                });
+                continue;
+            }
         };
         let weight_d = (res.total_weight - scipy_total).abs();
         // Edge count should also match — both produce n-1 edges for connected graphs.
@@ -278,6 +329,16 @@ fn diff_sparse_minimum_spanning_tree() {
             eprintln!("mst mismatch: {} abs_diff={}", d.case_id, d.abs_diff);
         }
     }
+
+    // Every case must actually be compared: a skipped SciPy arm or an empty
+    // diff list would otherwise pass vacuously.
+    assert_eq!(
+        diffs.len(),
+        query.points.len(),
+        "mst: compared {} of {} cases",
+        diffs.len(),
+        query.points.len()
+    );
 
     assert!(
         all_pass,

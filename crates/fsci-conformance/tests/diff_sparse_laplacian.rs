@@ -111,12 +111,23 @@ fn generate_query() -> OracleQuery {
         0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0,
     ];
     let adj_3_triangle = vec![0.0, 2.0, 1.0, 2.0, 0.0, 3.0, 1.0, 3.0, 0.0];
+    // br-szq1n.3: every case above is symmetric and non-negative, where in-degree,
+    // out-degree and |w| row sums all coincide, so they could not see the degree bug.
+    // In-degree [1,2,3] vs out-degree [2,3,1]:
+    let adj_3_asymmetric = vec![0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0];
+    // Self-loops: SciPy ignores the input diagonal.
+    let adj_3_self_loops = vec![5.0, 1.0, 0.0, 1.0, 7.0, 2.0, 0.0, 2.0, 9.0];
+    // Signed and asymmetric, in-degrees [4,2,1] stay positive so normed is finite.
+    let adj_3_signed = vec![0.0, -2.0, 1.0, 3.0, 0.0, 0.0, 1.0, 4.0, 0.0];
 
     let mut points = Vec::new();
     let inputs: &[(&str, &[f64], usize)] = &[
         ("4n", &adj_4, 4),
         ("5n_cycle", &adj_5_cycle, 5),
         ("3n_triangle", &adj_3_triangle, 3),
+        ("3n_asymmetric", &adj_3_asymmetric, 3),
+        ("3n_self_loops", &adj_3_self_loops, 3),
+        ("3n_signed_asymmetric", &adj_3_signed, 3),
     ];
     for (label, adj, n) in inputs {
         for normed in [false, true] {
@@ -240,8 +251,18 @@ fn diff_sparse_laplacian() {
             continue;
         };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
-        let Ok(lap) = laplacian(&csr, case.normed) else {
-            continue;
+        let lap = match laplacian(&csr, case.normed) {
+            Ok(lap) => lap,
+            Err(err) => {
+                // SciPy returned a finite Laplacian; an fsci error is a divergence.
+                eprintln!("laplacian: fsci error on {}: {err:?}", case.case_id);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    abs_diff: f64::INFINITY,
+                    pass: false,
+                });
+                continue;
+            }
         };
         // `laplacian` returns canonical CSR (857ecbe9d), restored under
         // frankenscipy-laplacian-dense-regression-4lfu1, so this scatters the
@@ -305,6 +326,15 @@ fn diff_sparse_laplacian() {
             eprintln!("laplacian mismatch: {} abs_diff={}", d.case_id, d.abs_diff);
         }
     }
+
+    // Every case is finite in SciPy, so every case must be compared.
+    assert_eq!(
+        diffs.len(),
+        query.points.len(),
+        "laplacian: compared {} of {} cases",
+        diffs.len(),
+        query.points.len()
+    );
 
     assert!(
         all_pass,

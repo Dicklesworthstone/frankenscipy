@@ -626,10 +626,6 @@ const SPSOLVE_SPD_BANDED_CHOLESKY_MAX_NNZ_PER_ROW: usize = 8;
 const SPSOLVE_SPD_BANDED_MAX_HALF_BANDWIDTH: usize = 128;
 const SPSOLVE_SPD_BANDED_CHOLESKY_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 const SPSOLVE_SPD_BANDED_MIN_DIAGONAL: f64 = 1.0e-12;
-const SPSOLVE_SPD_CG_MIN_N: usize = 4_096;
-const SPSOLVE_SPD_CG_MAX_NNZ_PER_ROW: usize = 6;
-const SPSOLVE_SPD_CG_TOL: f64 = 1.0e-8;
-const SPSOLVE_SPD_CG_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 const SPLU_CUBIC_GRID_DIRICHLET_MIN_SIDE: usize = 8;
 const SPLU_CUBIC_GRID_DIRICHLET_ACCEPT_RESIDUAL: f64 = 1.0e-8;
 
@@ -5532,51 +5528,6 @@ fn spsolve_symmetric_banded_candidate(
     true
 }
 
-/// Large, very sparse SPD M-matrices (5/7-point stencils and the like) where an
-/// iterative solve beats a direct factorization: the LU of such a system fills in
-/// far past its stored nonzeros, while CG costs O(nnz) per iteration.
-fn spsolve_spd_cg_candidate(a: &CsrMatrix, options: SolveOptions) -> bool {
-    spsolve_spd_m_matrix_candidate(
-        a,
-        options,
-        SPSOLVE_SPD_CG_MIN_N,
-        SPSOLVE_SPD_CG_MAX_NNZ_PER_ROW,
-    )
-}
-
-/// Try the CG fast path, returning `None` when it is not applicable or its
-/// answer is not good enough to accept. Self-validating: the caller falls
-/// through to the direct factorization on `None`, so a slow-converging or
-/// non-SPD system is never silently returned at low accuracy.
-fn try_spsolve_spd_cg(
-    a: &CsrMatrix,
-    b: &[f64],
-    options: SolveOptions,
-) -> SparseResult<Option<IterativeSolveResult>> {
-    if !spsolve_spd_cg_candidate(a, options) {
-        return Ok(None);
-    }
-
-    let max_iter = a.shape().rows.clamp(64, 1_024);
-    let result = cg(
-        a,
-        b,
-        None,
-        IterativeSolveOptions {
-            mode: options.mode,
-            check_finite: false,
-            tol: SPSOLVE_SPD_CG_TOL,
-            max_iter: Some(max_iter),
-        },
-    )?;
-
-    if result.converged && result.residual_norm <= SPSOLVE_SPD_CG_ACCEPT_RESIDUAL {
-        Ok(Some(result))
-    } else {
-        Ok(None)
-    }
-}
-
 /// Pack CSR into LAPACK-style general banded storage (`2·bw + 1` diagonals).
 fn csr_to_banded_storage(a: &CsrMatrix, half_bandwidth: usize) -> Vec<Vec<f64>> {
     let n = a.shape().rows;
@@ -5795,18 +5746,12 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
             });
         }
 
-        if let Some(iterative) = try_spsolve_spd_cg(a, b, options)? {
-            return Ok(SolveResult {
-                solution: iterative.solution,
-                backend_used: SparseBackend::NativeSparseLu,
-                ordering_used: options.ordering,
-                warnings: vec![format!(
-                    "native sparse direct solve bypassed by SPD CG fast path; iterations={}, residual={:.3e}",
-                    iterative.iterations, iterative.residual_norm
-                )],
-            });
-        }
-
+        // br-szq1n.4: there used to be an SPD conjugate-gradient shortcut here for
+        // large 5/7-point stencils. It accepted a 1e-8 relative residual (forward
+        // error up to kappa*1e-8) and reported `NativeSparseLu`, while
+        // scipy.sparse.linalg.spsolve is a direct solve with machine-precision
+        // backward error. Speed does not license weakening that contract; callers
+        // who want the iterative trade-off call `cg` explicitly.
         let lu = NativeSparseLu::factorize_csr(a, 1.0, options.ordering)?;
         let solution = lu.solve(b)?;
         let warnings = if over_dense_guard {
@@ -6599,6 +6544,7 @@ pub fn cg(
         // b is zero, solution is zero
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -6651,6 +6597,7 @@ pub fn cg(
         if r_norm / b_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: ‖r‖/‖b‖ < tol
                 converged: true,
                 iterations: iteration,
                 residual_norm: r_norm / b_norm,
@@ -6896,6 +6843,7 @@ fn cg_persistent_workers(
         for iteration in 0..max_iter {
             let residual_norm = rs_old.sqrt();
             if residual_norm / b_norm < tolerance {
+                // status: ‖r‖/‖b‖ < tol
                 converged = true;
                 iterations = iteration;
                 break;
@@ -7105,6 +7053,7 @@ pub fn pcg(
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -7128,6 +7077,7 @@ pub fn pcg(
         if r_norm / b_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: ‖r‖/‖b‖ < tol
                 converged: true,
                 iterations: iteration,
                 residual_norm: r_norm / b_norm,
@@ -7227,6 +7177,7 @@ pub fn gmres(
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -7235,9 +7186,12 @@ pub fn gmres(
 
     let mut total_iter = 0;
 
-    // Outer restart loop
+    // Outer restart loop. As in SciPy (`info = 0 if rnorm <= atol else maxiter`), convergence is
+    // decided on the TRUE residual after each cycle: the Givens estimate can pass while the true
+    // residual does not (restart), and a lucky breakdown only means the Krylov space is exhausted,
+    // which for a singular A leaves a residual that no further cycle can reduce (stop, unconverged).
     for _ in 0..(max_iter / restart.max(1) + 1) {
-        let (converged, iters) = gmres_inner(
+        let (stop, iters) = gmres_inner(
             a,
             b,
             &mut x,
@@ -7248,9 +7202,10 @@ pub fn gmres(
         )?;
         total_iter += iters;
 
-        if converged || total_iter >= max_iter {
-            let ax = csr_matvec(a, &x);
-            let r_norm = vec_norm_diff(&ax, b) / b_norm;
+        let ax = csr_matvec(a, &x);
+        let r_norm = vec_norm_diff(&ax, b) / b_norm;
+        let converged = r_norm < options.tol;
+        if converged || stop == KrylovCycleStop::Breakdown || total_iter >= max_iter {
             return Ok(IterativeSolveResult {
                 solution: x,
                 converged,
@@ -7270,8 +7225,18 @@ pub fn gmres(
     })
 }
 
-/// Inner GMRES iteration (one restart cycle).
-/// Returns (converged, iterations_used).
+/// Why one GMRES restart cycle stopped. None of these is a convergence verdict: the caller
+/// decides that from the true residual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KrylovCycleStop {
+    /// The residual (true at cycle start, Givens estimate inside) met the tolerance.
+    Tolerance,
+    /// Arnoldi produced a vector in the span of the basis; the space cannot grow.
+    Breakdown,
+    /// The cycle used all of its `restart` / iteration budget.
+    Exhausted,
+}
+
 /// Breakdown floor for one Arnoldi step, scaled by the vector being
 /// orthogonalized.
 ///
@@ -7284,9 +7249,10 @@ pub fn gmres(
 ///
 /// Getting that wrong is worse here than in [`cg_curvature_floor`]: the branch
 /// this guards does not report failure, it declares a lucky breakdown and
-/// returns `converged = true`. A premature trip therefore truncates the Krylov
-/// space and hands back an inaccurate `x` under a success flag
-/// (frankenscipy-4u7vp).
+/// used to return `converged = true`. A premature trip therefore truncated the Krylov
+/// space and handed back an inaccurate `x` under a success flag
+/// (frankenscipy-4u7vp). Since frankenscipy-szq1n.7 the flag is decided on the
+/// true residual, so a breakdown now only ends the iteration.
 ///
 /// The floor is relative to `‖A·v_k‖`, the norm of `w` BEFORE orthogonalization,
 /// which is the textbook Arnoldi criterion and is invariant to scaling of `A`
@@ -7314,7 +7280,7 @@ fn gmres_inner(
     restart: usize,
     tol: f64,
     max_iter: usize,
-) -> SparseResult<(bool, usize)> {
+) -> SparseResult<(KrylovCycleStop, usize)> {
     let n = x.len();
     let m = restart.min(max_iter);
 
@@ -7324,7 +7290,7 @@ fn gmres_inner(
     let r_norm = vec_norm(&r);
 
     if r_norm / b_norm < tol {
-        return Ok((true, 0));
+        return Ok((KrylovCycleStop::Tolerance, 0));
     }
 
     // Arnoldi process with modified Gram-Schmidt. The basis is one contiguous
@@ -7375,7 +7341,7 @@ fn gmres_inner(
             apply_givens_to_column(&mut h, &cs, &sn, j);
             // Solve the triangular system and update x
             update_solution_slab(x, &v, n, &h, &g, j + 1);
-            return Ok((true, iters));
+            return Ok((KrylovCycleStop::Breakdown, iters));
         }
 
         // Normalize
@@ -7401,13 +7367,13 @@ fn gmres_inner(
         let residual = g[j + 1].abs() / b_norm;
         if residual < tol {
             update_solution_slab(x, &v, n, &h, &g, j + 1);
-            return Ok((true, iters));
+            return Ok((KrylovCycleStop::Tolerance, iters));
         }
     }
 
     // Update solution with current approximation
     update_solution_slab(x, &v, n, &h, &g, m);
-    Ok((false, iters))
+    Ok((KrylovCycleStop::Exhausted, iters))
 }
 
 /// Apply previous Givens rotations to column j of H.
@@ -7610,6 +7576,7 @@ pub fn lgmres(
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -7631,6 +7598,7 @@ pub fn lgmres(
         if r_norm / b_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: true residual ‖b − Ax‖/‖b‖ < tol
                 converged: true,
                 iterations: total_iter,
                 residual_norm: r_norm / b_norm,
@@ -7649,7 +7617,7 @@ pub fn lgmres(
         // (The old pre-projection also summed sequentially rather than projecting onto
         // the span, since the `Az` were never orthogonalised against each other. That
         // was measured at a 1.0006x cost -- negligible, and not why this changed.)
-        let (z, converged, iters) = lgmres_inner(
+        let (z, iters) = lgmres_inner(
             a,
             &r,
             inner_m,
@@ -7664,16 +7632,9 @@ pub fn lgmres(
             x[i] += z[i];
         }
 
-        if converged {
-            let ax = csr_matvec(a, &x);
-            let final_r_norm = vec_norm_diff(&ax, b) / b_norm;
-            return Ok(IterativeSolveResult {
-                solution: x,
-                converged: true,
-                iterations: total_iter,
-                residual_norm: final_r_norm,
-            });
-        }
+        // No verdict here: as in SciPy's lgmres, the TRUE residual at the top of the next cycle
+        // (or after the loop) decides convergence. The inner Givens estimate is unreliable
+        // after a lucky breakdown, where it is left at 0 for a singular A (frankenscipy-szq1n.7).
 
         // Store the correction for the next cycle, NORMALISED as scipy does
         // (`outer_v.append((dx/nx, ax/nx))`). Normalising matters now that these enter
@@ -7697,7 +7658,8 @@ pub fn lgmres(
     let r_norm = vec_norm_diff(&ax, b) / b_norm;
     Ok(IterativeSolveResult {
         solution: x,
-        converged: false,
+        // The last cycle may have converged exactly as the budget ran out.
+        converged: r_norm < options.tol,
         iterations: total_iter,
         residual_norm: r_norm,
     })
@@ -7727,9 +7689,8 @@ impl Default for LgmresOptions {
     }
 }
 
-/// Inner LGMRES iteration (simplified GMRES for error approximation).
-/// Returns (error_approximation, converged, iterations).
 /// One inner cycle of LGMRES: GMRES over `span(outer_v) + K_m(A, r0)`.
+/// Returns `(error_approximation, iterations)`; the caller judges convergence on the true residual.
 ///
 /// # The augmentation belongs INSIDE this iteration
 ///
@@ -7757,7 +7718,7 @@ fn lgmres_inner(
     tol: f64,
     iter_limit: usize,
     outer_v: &[(Vec<f64>, Vec<f64>)],
-) -> SparseResult<(Vec<f64>, bool, usize)> {
+) -> SparseResult<(Vec<f64>, usize)> {
     let n = r0.len();
     // scipy's `m = m + len(outer_v)`: the augmentation directions are extra work, not a
     // substitute for Krylov work. Capped at `n`, past which no further orthonormal image
@@ -7765,7 +7726,7 @@ fn lgmres_inner(
     let m = (max_iter.min(iter_limit) + outer_v.len()).min(n);
 
     if m == 0 {
-        return Ok((vec![0.0; n], false, 0));
+        return Ok((vec![0.0; n], 0));
     }
 
     let r_norm = vec_norm(r0);
@@ -7777,7 +7738,7 @@ fn lgmres_inner(
     // 1e-15 an iterate still 1e-3 away in RELATIVE terms was returned as a
     // success (frankenscipy-4u7vp).
     if r_norm <= tol {
-        return Ok((vec![0.0; n], true, 0));
+        return Ok((vec![0.0; n], 0));
     }
 
     // Arnoldi process with Givens rotations
@@ -7891,8 +7852,7 @@ fn lgmres_inner(
     // basis instead of the directions would solve a different problem entirely.
     update_solution(&mut z, &zs, &h, &g, k);
 
-    let converged = k > 0 && g[k].abs() < tol;
-    Ok((z, converged, k))
+    Ok((z, k))
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -7962,6 +7922,7 @@ pub fn bicg(
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -7992,6 +7953,7 @@ pub fn bicg(
         if r_norm / b_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: ‖r‖/‖b‖ < tol
                 converged: true,
                 iterations: iteration,
                 residual_norm: r_norm / b_norm,
@@ -8115,6 +8077,7 @@ pub fn cgs(
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -8144,6 +8107,7 @@ pub fn cgs(
         if r_norm / b_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: ‖r‖/‖b‖ < tol
                 converged: true,
                 iterations: iteration,
                 residual_norm: r_norm / b_norm,
@@ -8268,6 +8232,7 @@ pub fn bicgstab(
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -8296,6 +8261,7 @@ pub fn bicgstab(
         if r_norm / b_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: ‖r‖/‖b‖ < tol
                 converged: true,
                 iterations: iteration,
                 residual_norm: r_norm / b_norm,
@@ -8363,6 +8329,7 @@ pub fn bicgstab(
             }
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: half-step residual ‖s‖/‖b‖ < tol
                 converged: true,
                 iterations: iteration + 1,
                 residual_norm: s_norm / b_norm,
@@ -8419,11 +8386,12 @@ pub fn bicgstab(
 
 /// QMR solver for general non-symmetric sparse linear systems.
 ///
-/// Uses the look-ahead Lanczos process to build a quasi-minimal residual
-/// approximation. More stable than BiCG, avoids the irregular convergence
-/// of BiCGSTAB for some problems.
-///
-/// Matches `scipy.sparse.linalg.qmr(A, b)`.
+/// Freund–Nachtigal quasi-minimal residual in the coupled two-term form of the
+/// Templates book (Barrett et al. 1994), which is also what
+/// `scipy.sparse.linalg.qmr(A, b)` runs: two-sided Lanczos with `A` and `Aᵀ`,
+/// WITHOUT look-ahead, so a Lanczos breakdown (ρ, ξ, δ or ε vanishing) ends the
+/// iteration with `converged = false`. Smoother convergence than BiCG. Unlike
+/// SciPy there are no `M1`/`M2` preconditioners.
 pub fn qmr(
     a: &CsrMatrix,
     b: &[f64],
@@ -8462,6 +8430,7 @@ pub fn qmr(
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -8480,6 +8449,7 @@ pub fn qmr(
     if r_norm / b_norm < options.tol {
         return Ok(IterativeSolveResult {
             solution: x,
+            // status: initial guess already solves: ‖b − Ax0‖/‖b‖ < tol
             converged: true,
             iterations: 0,
             residual_norm: r_norm / b_norm,
@@ -8625,6 +8595,7 @@ pub fn qmr(
         if r_new_norm / b_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: true residual ‖b − Ax‖/‖b‖ < tol
                 converged: true,
                 iterations: iteration + 1,
                 residual_norm: r_new_norm / b_norm,
@@ -8743,6 +8714,7 @@ pub fn minres(
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -8768,6 +8740,7 @@ pub fn minres(
     if beta1 / b_norm <= options.tol {
         return Ok(IterativeSolveResult {
             solution: x,
+            // status: initial guess already solves: ‖b − Ax0‖/‖b‖ ≤ tol
             converged: true,
             iterations: 0,
             residual_norm: beta1 / b_norm,
@@ -9027,8 +9000,24 @@ fn lsqr_impl(
     let max_iter = options.max_iter.unwrap_or(2 * n);
     let b_norm = vec_norm(b);
     if rhs_is_zero(b_norm) {
+        if let Some(start) = x0 {
+            // With a guess, b = 0 is NOT a zero problem: the objective
+            // ‖Ax‖² + damp²‖x − x0‖² has a nonzero minimiser whenever damp > 0 (and for
+            // damp = 0 the answer from x0 is x0 minus its row-space part). It is exactly
+            // lsqr's correction problem, min ‖A·dx − r0‖² + damp²‖dx‖² with r0 = −A·x0,
+            // started from zero; x = x0 + dx. The zero early return used to answer 0
+            // here (frankenscipy-szq1n.7). `residual_norm` is then relative to ‖r0‖,
+            // since a residual relative to ‖b‖ = 0 is undefined.
+            let r0: Vec<f64> = csr_matvec(a, start).iter().map(|v| -v).collect();
+            let mut correction = lsqr_impl(a, &r0, damp, None, options)?;
+            for (xi, &si) in correction.solution.iter_mut().zip(start) {
+                *xi += si;
+            }
+            return Ok(correction);
+        }
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 and no guess, so x = 0 is the exact minimiser
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -9061,6 +9050,7 @@ fn lsqr_impl(
         // dividing by the residual norm below would produce NaN.
         return Ok(IterativeSolveResult {
             solution: x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec),
+            // status: β0 = ‖b − Ax0‖ = 0, so x0 zeroes the (damped) objective
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -9080,20 +9070,22 @@ fn lsqr_impl(
         vec![0.0; n]
     };
 
-    // SciPy's `arnorm = alfa * beta == 0` early return. `beta = ‖b‖ > 0` is
-    // already guaranteed above, so this is exactly `alpha == 0`, i.e. Aᵀb = 0:
-    // the normal equations are already satisfied at x = 0, so x = 0 IS the exact
-    // least-squares solution and the bidiagonalization has nothing to build from.
-    // Without this, the loop below divides by rho = 0 (frankenscipy-6bfm3).
+    // SciPy's `arnorm = alfa * beta == 0` early return. `beta_0 > 0` is
+    // already guaranteed above, so this is exactly `alpha == 0`, i.e. Aᵀr₀ = 0 for
+    // r₀ = b − A·x₀: the normal equations of the correction are already satisfied,
+    // the correction is 0, and the STARTING POINT is the least-squares solution --
+    // x₀ if one was given (it used to return zeros there, frankenscipy-szq1n.7),
+    // else 0. Without this, the loop below divides by rho = 0 (frankenscipy-6bfm3).
     if alpha == 0.0 {
         return Ok(IterativeSolveResult {
-            solution: vec![0.0; n],
+            solution: x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec),
+            // status: α = ‖Aᵀr0‖ = 0, normal equations hold at the start (istop 0)
             converged: true,
             iterations: 0,
-            // A·0 = 0, so the relative residual ‖A·0 − b‖/‖b‖ is exactly 1. It is
-            // NOT small, and that is correct: the least-squares residual here is
-            // ‖b‖ itself. Optimality is ‖Aᵀ(Ax − b)‖ = ‖Aᵀb‖ = 0, which holds.
-            residual_norm: 1.0,
+            // The residual of the starting point: 1 in the cold-start case, where it
+            // is b itself. It is NOT small, and that is correct for an inconsistent
+            // system: optimality is ‖Aᵀ(Ax − b)‖ = 0, which holds.
+            residual_norm: beta_0 / b_norm,
         });
     }
 
@@ -9202,6 +9194,7 @@ fn lsqr_impl(
         if res_norm < options.tol {
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: istop 1, estimated residual √(φ̄² + res2)/‖b‖ < tol
                 converged: true,
                 iterations: iteration + 1,
                 residual_norm: res_norm,
@@ -9238,6 +9231,7 @@ fn lsqr_impl(
             let ax = csr_matvec(a, &x);
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: istop 2, ‖Aᵀr‖/(‖A‖·‖r‖) ≤ tol (least-squares optimal)
                 converged: true,
                 iterations: iteration + 1,
                 // The TRUE relative residual, which for an inconsistent system is
@@ -9429,8 +9423,11 @@ fn lsmr_impl(
 
     let b_norm = vec_norm(b);
     if rhs_is_zero(b_norm) {
+        // Unlike lsqr_impl (where SciPy's answer for b = 0 with a guess divides by zero and fsci
+        // solves the damped correction problem instead), lsmr keeps SciPy's behaviour here.
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: SciPy parity -- lsmr returns x = 0 whenever ‖b‖ = 0, even with a guess
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -9468,6 +9465,7 @@ fn lsmr_impl(
         // compute and dividing by `beta_0` below would produce NaN.
         return Ok(IterativeSolveResult {
             solution: x0.map_or_else(|| vec![0.0; n], <[f64]>::to_vec),
+            // status: β0 = ‖b − Ax0‖ = 0, so x0 zeroes the (damped) objective
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -9644,6 +9642,7 @@ fn lsmr_impl(
             csr_matvec_into(a, &x, &mut av);
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: istop 2, ‖Aᵀr‖ estimate |ζ̄|/(‖A‖·‖r‖) ≤ tol (least-squares optimal)
                 converged: true,
                 iterations: iteration + 1,
                 // Reported honestly: for an inconsistent system this is the
@@ -9967,21 +9966,27 @@ pub fn solve_with_casp_portfolio(
         }
         SparseSolverAction::SuperLU => {
             let res = spsolve(a, b, SolveOptions::default())?;
-            (res.solution, true, 1, 0.0, false)
+            let (ok, residual) = direct_solve_status(a, b, &res.solution);
+            (res.solution, ok, 1, residual, false)
         }
     };
 
-    let (final_x, final_converged, final_iters, final_res, final_fallback) = if !converged
-        && action != SparseSolverAction::SuperLU
-        && portfolio.mode() == RuntimeMode::Hardened
-    {
-        match spsolve(a, b, SolveOptions::default()) {
-            Ok(slv) => (slv.solution, true, iters + 1, 0.0, true),
-            Err(_) => (x, converged, iters, res_norm, fallback_active),
-        }
-    } else {
-        (x, converged, iters, res_norm, fallback_active)
-    };
+    // An iterative arm that did not converge falls back to the direct LU in BOTH modes. The
+    // contract is `spsolve`'s, a solved system; Strict used to return the unconverged iterate
+    // as Ok with only a warning string (frankenscipy-7tb8d.7). The fallback is recorded as
+    // `fallback_active` in the result and the portfolio evidence.
+    let (final_x, final_converged, final_iters, final_res, final_fallback) =
+        if !converged && action != SparseSolverAction::SuperLU {
+            match spsolve(a, b, SolveOptions::default()) {
+                Ok(slv) => {
+                    let (ok, residual) = direct_solve_status(a, b, &slv.solution);
+                    (slv.solution, ok, iters + 1, residual, true)
+                }
+                Err(_) => (x, converged, iters, res_norm, fallback_active),
+            }
+        } else {
+            (x, converged, iters, res_norm, fallback_active)
+        };
 
     portfolio.record_evidence(SparseSolverEvidenceEntry {
         component: "fsci-sparse",
@@ -10028,7 +10033,8 @@ pub fn spsolve_with_casp(
 /// Matches the ergonomics of `fsci_linalg::solve_with_audit`.
 /// Records to the provided `SyncSharedAuditLedger`:
 /// - `FailClosed` events when input validation rejects malformed or non-finite inputs
-/// - `BoundedRecovery` events when iterative solver fails to converge and falls back to direct LU in hardened mode
+/// - `BoundedRecovery` events when the iterative solver fails to converge and falls back to
+///   direct LU (in either mode)
 pub fn spsolve_with_audit(
     a: &CsrMatrix,
     b: &[f64],
@@ -11002,6 +11008,16 @@ impl PeriodicCuboidSpectralLu {
 /// its absolute residual was small for the trivial reason that the whole problem
 /// was small; and tests asserting `< 1e-9` on a small-norm rhs passed vacuously,
 /// which is what hid two real GMRES defects for an iteration.
+/// Status of a direct solve for the CASP portfolio's evidence: the measured
+/// relative residual, and whether it meets the 1e-8 acceptance used by the other
+/// self-validating direct routes. br-szq1n.7: the SuperLU arm and its Hardened
+/// fallback used to record `converged = true, residual = 0.0` without computing
+/// either, so the calibrator could never see a bad direct answer.
+fn direct_solve_status(a: &CsrMatrix, b: &[f64], x: &[f64]) -> (bool, f64) {
+    let residual = relative_residual(a, b, x);
+    (residual.is_finite() && residual <= 1.0e-8, residual)
+}
+
 fn relative_residual(a: &CsrMatrix, b: &[f64], x: &[f64]) -> f64 {
     let mut residual_sq = 0.0_f64;
     let mut rhs_sq = 0.0_f64;
@@ -12703,11 +12719,14 @@ fn spmm_chunk_count(rows: usize, work: u64) -> usize {
     cores.min(16).min(rows / 128).max(1)
 }
 
-/// Compute one-norm estimate for a sparse matrix.
+/// The 1-norm (maximum absolute column sum) of a sparse matrix.
 ///
-/// Uses the Hager-Higham algorithm for efficient estimation
-/// without forming the dense matrix.
-/// Matches `scipy.sparse.linalg.onenormest`.
+/// Computed EXACTLY in one pass over the stored entries, not estimated.
+/// `scipy.sparse.linalg.onenormest` runs the block Hager–Higham estimator
+/// (t = 2), which returns a lower bound on this value; it is often, but not
+/// always, exact. For an explicit matrix the exact norm costs O(nnz), no more
+/// than the estimator's matrix products. SciPy's `onenormest` also accepts a
+/// LinearOperator; this function does not.
 pub fn onenormest(a: &CsrMatrix) -> f64 {
     // `"1"` is a supported ord by construction, so this cannot fail; the
     // signature stays `f64` because the caller never chooses the ord.
@@ -14261,13 +14280,67 @@ mod tests {
         assert!(result.canonical_meta().deduplicated);
         assert_eq!(result.indptr(), &[0, 3, 5, 7]);
         assert_eq!(result.indices(), &[0, 1, 2, 1, 2, 0, 2]);
-        let expected: [f64; 7] = [6.0, -4.0, -2.0, 0.0, 0.0, 2.0, 2.0];
+        // br-szq1n.3: live SciPy 1.17.1 `laplacian(csr_matrix((data, indices, indptr)))`
+        // COO entries: diagonal = signed in-degree [-2, 4, 2] (the stored 0.5 self-loop
+        // is overwritten), (0,1) duplicates -3 + -1, and the explicit zero at (1,2)
+        // negated to -0.0. The old row-|w|-sum degree gave [6, 0, 2] on this diagonal.
+        let expected: [f64; 7] = [-2.0, -4.0, -2.0, 4.0, -0.0, 2.0, 2.0];
         for (index, (&actual, &expected)) in result.data().iter().zip(&expected).enumerate() {
             assert_eq!(
                 actual.to_bits(),
                 expected.to_bits(),
                 "unexpected canonical value at entry {index}"
             );
+        }
+    }
+
+    // br-szq1n.3: an asymmetric graph is where in-degree vs out-degree shows. Values are
+    // live SciPy 1.17.1 `laplacian(A)` / `laplacian(A, normed=True)`.
+    #[test]
+    fn laplacian_asymmetric_graph_uses_in_degree_like_scipy() {
+        // A = [[0,2,0],[0,0,3],[1,0,0]]: column sums [1,2,3], row sums [2,3,1].
+        let graph = CsrMatrix::from_components(
+            Shape2D::new(3, 3),
+            vec![2.0, 3.0, 1.0],
+            vec![1, 2, 0],
+            vec![0, 1, 2, 3],
+            false,
+        )
+        .expect("asymmetric graph");
+        let dense = |m: &CsrMatrix| -> Vec<Vec<f64>> {
+            let mut out = vec![vec![0.0; 3]; 3];
+            for (r, row) in out.iter_mut().enumerate() {
+                for idx in m.indptr()[r]..m.indptr()[r + 1] {
+                    row[m.indices()[idx]] += m.data()[idx];
+                }
+            }
+            out
+        };
+        let l = dense(&laplacian(&graph, false).expect("laplacian"));
+        assert_eq!(
+            l,
+            vec![
+                vec![1.0, -2.0, 0.0],
+                vec![0.0, 2.0, -3.0],
+                vec![-1.0, 0.0, 3.0]
+            ],
+            "diagonal must be the in-degree [1,2,3] (old code gave the out-degree [2,3,1])"
+        );
+        let ln = dense(&laplacian(&graph, true).expect("normed laplacian"));
+        let expected_normed = [
+            [1.0, -1.414_213_562_373_095, 0.0],
+            [0.0, 1.0, -1.224_744_871_391_589],
+            [-0.577_350_269_189_625_8, 0.0, 1.0],
+        ];
+        for r in 0..3 {
+            for c in 0..3 {
+                assert!(
+                    (ln[r][c] - expected_normed[r][c]).abs() <= 1e-15,
+                    "normed[{r}][{c}] = {} vs SciPy {}",
+                    ln[r][c],
+                    expected_normed[r][c]
+                );
+            }
         }
     }
 
@@ -25178,12 +25251,19 @@ mod tests {
         );
     }
 
-    /// Restored with the SPD-CG spsolve fast path
-    /// (frankenscipy-sparse-rustfmt-deletion-495ga). A large, wide-bandwidth
-    /// 5-point stencil skips the banded routes and must be answered by CG, whose
-    /// LU would fill far past the stored nonzeros.
+    /// A large, wide-bandwidth 5-point stencil skips the banded routes. It used to be answered
+    /// by an SPD-CG shortcut to a 1e-8 residual; spsolve is a direct solve, as in SciPy
+    /// (frankenscipy-szq1n.4), so it must come back at direct-solve accuracy.
+    ///
+    /// Takes `PERF_TOGGLE_TEST_LOCK`: this factorization READS the splu arm toggles, and
+    /// `supernodal_wide_block_guard_declines_a_full_matrix_block` flips them and counts
+    /// declines exactly; unlocked, this solve ran on the flipped toggle and added its own
+    /// declines to that count (seen as 3 declines where 1 was expected).
     #[test]
-    fn spsolve_wide_bandwidth_spd_stencil_takes_the_cg_fast_path() {
+    fn spsolve_wide_bandwidth_spd_stencil_is_solved_directly_to_direct_accuracy() {
+        let _guard = PERF_TOGGLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let side = 140usize;
         let n = side * side;
         let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
@@ -25213,66 +25293,26 @@ mod tests {
         let b: Vec<f64> = (0..n).map(|row| 1.0 + (row % 9) as f64).collect();
         let options = SolveOptions::default();
 
-        // The banded routes must NOT intercept: bandwidth 140 exceeds their 128 cap.
+        // The banded routes must NOT intercept: bandwidth 140 exceeds their 128 cap,
+        // so this is exactly the system the removed SPD-CG shortcut used to take.
         assert!(!sparse_banded_direct_candidate(n, csr_bandwidth(&a)));
-        assert!(spsolve_spd_cg_candidate(&a, options));
 
-        let result = spsolve(&a, &b, options).expect("spd cg spsolve");
-        // The warning names the route, so this pins WHICH path produced the
-        // answer — an accuracy-only assertion would also pass on the direct
-        // factorization fallback.
+        let result = spsolve(&a, &b, options).expect("spd stencil spsolve");
+        // br-szq1n.4: spsolve is a direct solve (as in SciPy). The removed CG
+        // shortcut stopped at a 1e-8 relative residual and would fail the bound
+        // below; the direct factorization lands orders of magnitude inside it.
         assert!(
             result
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("SPD CG fast path")),
-            "expected the CG fast path to answer, got warnings {:?}",
+                .all(|warning| !warning.contains("CG")),
+            "spsolve must not answer through an iterative shortcut: {:?}",
             result.warnings
         );
-        assert!(relative_residual(&a, &b, &result.solution) <= 1.0e-8);
-    }
-
-    /// MUST-MISS arm for the CG gate: one positive off-diagonal is enough to
-    /// stop being an M-matrix, and the gate has to notice. A gate that blanket-
-    /// accepted would route indefinite systems to CG and silently return
-    /// whatever CG stalled at.
-    #[test]
-    fn spsolve_spd_cg_gate_rejects_a_single_positive_off_diagonal() {
-        let side = 140usize;
-        let n = side * side;
-        let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
-        for y in 0..side {
-            for x in 0..side {
-                let row = y * side + x;
-                data.push(5.0);
-                ri.push(row);
-                ci.push(row);
-                for (dy, dx) in [(0i64, 1i64), (1, 0), (0, -1), (-1, 0)] {
-                    let (ny, nx) = (y as i64 + dy, x as i64 + dx);
-                    if ny < 0 || nx < 0 || ny >= side as i64 || nx >= side as i64 {
-                        continue;
-                    }
-                    let col = ny as usize * side + nx as usize;
-                    // Symmetrically flip ONE neighbour pair positive.
-                    let value = if (row == 0 && col == 1) || (row == 1 && col == 0) {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    data.push(value);
-                    ri.push(row);
-                    ci.push(col);
-                }
-            }
-        }
-        let a = CooMatrix::from_triplets(Shape2D::new(n, n), data, ri, ci, true)
-            .expect("coo")
-            .to_csr()
-            .expect("csr");
-
+        let residual = relative_residual(&a, &b, &result.solution);
         assert!(
-            !spsolve_spd_cg_candidate(&a, SolveOptions::default()),
-            "a positive off-diagonal must fail the M-matrix gate"
+            residual <= 1.0e-12,
+            "direct-solve accuracy expected, relative residual = {residual:e}"
         );
     }
 
@@ -26092,6 +26132,50 @@ mod tests {
             lgmres_result.iterations
         );
         assert_close_slice(&lgmres_result.solution, &b, 1e-12);
+    }
+
+    /// frankenscipy-szq1n.7: a lucky breakdown on a SINGULAR matrix is not convergence.
+    /// A = [[0,1],[0,0]], b = e1. The system is consistent (x = e2 solves it), but from x0 = 0
+    /// the Krylov space is span(e1) because A·e1 = 0: Arnoldi breaks down at once and no iterate
+    /// in that space reduces the residual below 1. SciPy: gmres -> (x=[0,0], info=20), lgmres ->
+    /// (x=[0,0], info=1000). Both used to return converged = true with residual_norm 1.0.
+    #[test]
+    fn gmres_and_lgmres_breakdown_on_a_singular_matrix_is_not_convergence() {
+        let a = CsrMatrix::from_components(
+            Shape2D::new(2, 2),
+            vec![1.0],
+            vec![1],
+            vec![0, 1, 1],
+            false,
+        )
+        .expect("csr");
+        let b = [1.0, 0.0];
+        let g = gmres(&a, &b, None, IterativeSolveOptions::default()).expect("gmres runs");
+        println!(
+            "gmres singular: converged={} residual={} iters={}",
+            g.converged, g.residual_norm, g.iterations
+        );
+        assert!(
+            !g.converged,
+            "residual {} is not below tol",
+            g.residual_norm
+        );
+        assert!((g.residual_norm - 1.0).abs() < 1e-12);
+        let l = lgmres(&a, &b, None, LgmresOptions::default()).expect("lgmres runs");
+        println!(
+            "lgmres singular: converged={} residual={} iters={}",
+            l.converged, l.residual_norm, l.iterations
+        );
+        assert!(
+            !l.converged,
+            "residual {} is not below tol",
+            l.residual_norm
+        );
+        assert!((l.residual_norm - 1.0).abs() < 1e-12);
+        // Positive arm: from x0 = e2 the initial residual is exactly 0.
+        let solved =
+            gmres(&a, &b, Some(&[0.0, 1.0]), IterativeSolveOptions::default()).expect("gmres runs");
+        assert!(solved.converged, "x0 = e2 solves A x = e1 exactly");
     }
 
     #[test]
@@ -28105,6 +28189,114 @@ mod tests {
         }
     }
 
+    // br-szq1n.7: `converged` must come from the Ritz residuals. MUST-MISS arm: the
+    // Grcar matrix is highly non-normal with its eigenvalues on a curve, so a single
+    // 13-vector Arnoldi pass (k = 6) cannot resolve the top six; the old code said
+    // `converged: true` regardless.
+    #[test]
+    fn eigs_reports_nonconvergence_on_grcar() {
+        let n = 200usize;
+        let (mut data, mut ri, mut ci) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            if i > 0 {
+                data.push(-1.0);
+                ri.push(i);
+                ci.push(i - 1);
+            }
+            for j in i..(i + 4).min(n) {
+                data.push(1.0);
+                ri.push(i);
+                ci.push(j);
+            }
+        }
+        let a = CooMatrix::from_triplets(Shape2D::new(n, n), data, ri, ci, false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        let result = eigs(&a, 6, EigsOptions::default()).expect("eigs runs");
+        assert!(
+            !result.converged,
+            "one short Arnoldi pass on Grcar(200) cannot have converged: {:?}",
+            result.eigenvalues
+        );
+    }
+
+    // MUST-HIT arm: when the Krylov space is the whole space (m = n) the Ritz pairs
+    // are exact, including a complex-conjugate pair, and `converged` must be true.
+    #[test]
+    fn eigs_reports_convergence_when_krylov_space_is_exact() {
+        // 5x5 nonsymmetric: a 2x2 rotation block (eigenvalues 2 +- 3i) plus 7, 5, 1.
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(5, 5),
+            vec![2.0, -3.0, 3.0, 2.0, 7.0, 1.0, 5.0, 1.0],
+            vec![0, 0, 1, 1, 2, 2, 3, 4],
+            vec![0, 1, 0, 1, 2, 3, 3, 4],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let result = eigs(&a, 2, EigsOptions::default()).expect("eigs runs");
+        assert!(
+            result.converged,
+            "exact Krylov space must report convergence"
+        );
+        // And the pairs really are eigenpairs: ||A x - lambda x|| small (complex).
+        for idx in 0..result.eigenvalues.len() {
+            let (lr, li) = (result.eigenvalues[idx], result.eigenvalues_im[idx]);
+            let (xr, xi) = (&result.eigenvectors[idx], &result.eigenvectors_im[idx]);
+            let (axr, axi) = (csr_matvec(&a, xr), csr_matvec(&a, xi));
+            let resid: f64 = (0..5)
+                .map(|t| {
+                    let rr = axr[t] - (lr * xr[t] - li * xi[t]);
+                    let rim = axi[t] - (lr * xi[t] + li * xr[t]);
+                    rr * rr + rim * rim
+                })
+                .sum::<f64>()
+                .sqrt();
+            assert!(resid < 1e-8, "pair {idx} residual {resid:e}");
+        }
+    }
+
+    // br-szq1n.7: `converged = k_actual > 0` reported success with FEWER pairs than requested. On
+    // the identity every start vector is an eigenvector, the Arnoldi pass breaks down after one
+    // step, and one pair comes back for k = 3 (SciPy's ARPACK restarts and returns [1, 1, 1]).
+    #[test]
+    fn eigs_and_eigsh_with_fewer_pairs_than_requested_are_not_converged() {
+        let a = identity_csr(30);
+        let sym = eigsh(&a, 3, EigsOptions::default()).expect("eigsh runs");
+        println!(
+            "eigsh(I_30, 3): {} pairs, converged={}",
+            sym.eigenvalues.len(),
+            sym.converged
+        );
+        assert!(
+            sym.eigenvalues.len() == 3 || !sym.converged,
+            "{} pairs reported as converged",
+            sym.eigenvalues.len()
+        );
+        let general = eigs(&a, 3, EigsOptions::default()).expect("eigs runs");
+        assert!(
+            general.eigenvalues.len() == 3 || !general.converged,
+            "{} pairs reported as converged",
+            general.eigenvalues.len()
+        );
+        // Positive arm: a spectrum a single pass resolves exactly still converges.
+        let diag = CooMatrix::from_triplets(
+            Shape2D::new(4, 4),
+            vec![4.0, 3.0, 2.0, 1.0],
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 3],
+            false,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let exact = eigsh(&diag, 2, EigsOptions::default()).expect("eigsh runs");
+        assert_eq!(exact.eigenvalues.len(), 2);
+        assert!(exact.converged);
+    }
+
     #[test]
     fn eigs_identity() {
         let a = identity_csr(4);
@@ -28151,6 +28343,7 @@ mod tests {
         .expect("csr");
         let result = svds(&a, 2, EigsOptions::default()).expect("svds works");
         assert_eq!(result.singular_values.len(), 2);
+        assert!(result.converged, "a 3x3 diagonal is resolved exactly");
         // Should find 5.0 and 3.0 (largest by magnitude)
         assert!(
             (result.singular_values[0] - 5.0).abs() < 0.5,
@@ -28164,6 +28357,15 @@ mod tests {
         let a = identity_csr(3);
         let result = svds(&a, 1, EigsOptions::default()).expect("svds works");
         assert_eq!(result.singular_values.len(), 1);
+        assert!(result.converged);
+        // br-szq1n.7: svds used to drop the eigensolver's verdict; with k = 2 on the identity
+        // the single Krylov pass returns one value, which must not read as converged.
+        let short = svds(&identity_csr(30), 2, EigsOptions::default()).expect("svds works");
+        assert!(
+            short.singular_values.len() == 2 || !short.converged,
+            "{} values reported as converged",
+            short.singular_values.len()
+        );
         assert!(
             (result.singular_values[0] - 1.0).abs() < 0.1,
             "identity sv should be 1: {}",
@@ -28325,6 +28527,63 @@ mod tests {
                 evs[1],
                 4.0 * s
             );
+        }
+    }
+
+    #[test]
+    fn eigsh_restarts_beyond_the_krylov_window_at_every_scale() {
+        // frankenscipy-1ksfv.10. n = 200 > ncv = 20, so eigsh must restart: a single pass of
+        // the basis leaves percent-level errors. The convergence test must also be relative
+        // (ARPACK dsconv, max(|θ|, eps^(2/3))): with the old max(|θ|, 1) floor a port of this
+        // kernel reported converged with max rel err 1.5e-2 at s = 1e-9 and 1.5e-1 at
+        // s = 1e-11, against 2.5e-15..6.5e-15 for the relative test at all three scales.
+        let n = 200;
+        let (mut vals, mut rows, mut cols) = (Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            vals.push(1.0 + 0.05 * i as f64);
+            rows.push(i);
+            cols.push(i);
+            let j = (7 * i + 3) % n;
+            if j != i {
+                vals.extend([0.1, 0.1]);
+                rows.extend([i, j]);
+                cols.extend([j, i]);
+            }
+        }
+        let k = 6;
+        for s in [1.0, 1e-9, 1e-11] {
+            let scaled: Vec<f64> = vals.iter().map(|v| v * s).collect();
+            let a = CooMatrix::from_triplets(
+                Shape2D::new(n, n),
+                scaled,
+                rows.clone(),
+                cols.clone(),
+                true,
+            )
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+            let mut dense = DMatrix::<f64>::zeros(n, n);
+            for ((&v, &r), &c) in vals.iter().zip(&rows).zip(&cols) {
+                dense[(r, c)] += v * s;
+            }
+            let reference = nalgebra::SymmetricEigen::try_new(dense, f64::EPSILON, 30 * n)
+                .expect("dense reference converges");
+            let mut want: Vec<f64> = reference.eigenvalues.iter().copied().collect();
+            want.sort_by(|x, y| y.abs().total_cmp(&x.abs()));
+
+            let result = super::eigsh(&a, k, EigsOptions::default()).expect("eigsh");
+            assert!(result.converged, "s={s:e}: eigsh must report convergence");
+            let mut got = result.eigenvalues.clone();
+            got.sort_by(|x, y| y.abs().total_cmp(&x.abs()));
+            assert_eq!(got.len(), k, "s={s:e}");
+            for (g, w) in got.iter().zip(&want) {
+                let rel = (g - w).abs() / w.abs();
+                assert!(
+                    rel < 1e-10,
+                    "s={s:e}: eigenvalue {g:e} vs dense {w:e}, rel {rel:e}"
+                );
+            }
         }
     }
 
@@ -28493,6 +28752,70 @@ mod tests {
         assert_eq!(result.edges.len(), 2, "MST edges in disconnected graph");
     }
 
+    /// CSR built verbatim (no canonicalization) so explicit zeros stay stored.
+    fn csr_verbatim(n: usize, rows: &[(usize, &[(usize, f64)])]) -> CsrMatrix {
+        let mut data = Vec::new();
+        let mut indices = Vec::new();
+        let mut indptr = vec![0];
+        for r in 0..n {
+            if let Some((_, entries)) = rows.iter().find(|(row, _)| *row == r) {
+                for &(c, w) in *entries {
+                    indices.push(c);
+                    data.push(w);
+                }
+            }
+            indptr.push(data.len());
+        }
+        CsrMatrix::from_components(Shape2D::new(n, n), data, indices, indptr, false)
+            .expect("verbatim csr")
+    }
+
+    // br-szq1n.3: expected values are live SciPy 1.17.1
+    // `minimum_spanning_tree(csr)` results (total weight, stored edges, data).
+    #[test]
+    fn minimum_spanning_tree_uses_lower_triangle_edges() {
+        // [[0,0,0],[1,0,0],[3,2,0]] -> SciPy weight 3.0, edges (1,0)=1, (2,1)=2.
+        let g = csr_verbatim(3, &[(1, &[(0, 1.0)]), (2, &[(0, 3.0), (1, 2.0)])]);
+        let r = minimum_spanning_tree(&g).expect("mst");
+        assert_eq!(r.total_weight, 3.0, "lower-triangle graph: {r:?}");
+        assert_eq!(r.edges, vec![(1, 0, 1.0), (2, 1, 2.0)]);
+    }
+
+    #[test]
+    fn minimum_spanning_tree_asymmetric_pair_takes_lighter_weight() {
+        // (0,1)=5, (1,0)=1 -> SciPy weight 1.0 via the stored (1,0) entry.
+        let g = csr_verbatim(2, &[(0, &[(1, 5.0)]), (1, &[(0, 1.0)])]);
+        let r = minimum_spanning_tree(&g).expect("mst");
+        assert_eq!(r.total_weight, 1.0, "{r:?}");
+        assert_eq!(r.edges, vec![(1, 0, 1.0)]);
+    }
+
+    #[test]
+    fn minimum_spanning_tree_explicit_zero_connects_but_is_not_reported() {
+        // (0,1)=0 stored, (1,0)=4 -> SciPy weight 0.0, no reported edges: the zero
+        // edge joins the components first, so the weight-4 entry is a cycle.
+        let g = csr_verbatim(2, &[(0, &[(1, 0.0)]), (1, &[(0, 4.0)])]);
+        let r = minimum_spanning_tree(&g).expect("mst");
+        assert_eq!(r.total_weight, 0.0, "{r:?}");
+        assert!(r.edges.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn minimum_spanning_tree_negative_weights_and_self_loops() {
+        // (0,1)=-1, (0,2)=-5, (1,2)=2 -> SciPy weight -6.0, edges (0,1), (0,2).
+        let g = csr_verbatim(3, &[(0, &[(1, -1.0), (2, -5.0)]), (1, &[(2, 2.0)])]);
+        let r = minimum_spanning_tree(&g).expect("mst");
+        assert_eq!(r.total_weight, -6.0, "{r:?}");
+        let mut e = r.edges.clone();
+        e.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        assert_eq!(e, vec![(0, 1, -1.0), (0, 2, -5.0)]);
+        // Self-loop (0,0)=7 is never an MST edge -> SciPy weight 2.0.
+        let s = csr_verbatim(2, &[(0, &[(0, 7.0), (1, 2.0)])]);
+        let rs = minimum_spanning_tree(&s).expect("mst");
+        assert_eq!(rs.total_weight, 2.0, "{rs:?}");
+        assert_eq!(rs.edges, vec![(0, 1, 2.0)]);
+    }
+
     #[test]
     fn csgraph_rejects_non_square_adjacency() {
         let g = CooMatrix::from_triplets(
@@ -28620,6 +28943,37 @@ mod tests {
         let g = disconnected_graph_csr();
         let (order, _) = depth_first_order(&g, 0).expect("dfs");
         assert_eq!(order.len(), 2, "DFS only visits connected component");
+    }
+
+    // br-szq1n.3: predecessor trees from live SciPy 1.17.1 depth_first_order
+    // (SciPy prints -9999 where fsci uses -1 for "no predecessor").
+    #[test]
+    fn dfs_predecessors_match_scipy_descend_first_order() {
+        // 0->1, 0->2, 1->2: SciPy order [0,1,2], predecessors [-, 0, 1].
+        let a = CsrMatrix::from_components(
+            Shape2D::new(3, 3),
+            vec![1.0, 1.0, 1.0],
+            vec![1, 2, 2],
+            vec![0, 2, 3, 3],
+            false,
+        )
+        .expect("graph a");
+        let (order, pred) = depth_first_order(&a, 0).expect("dfs a");
+        assert_eq!(order, vec![0, 1, 2]);
+        assert_eq!(pred, vec![-1, 0, 1], "push-time marking gave pred[2] = 0");
+
+        // 0->1, 0->2, 1->3, 3->2: SciPy order [0,1,3,2], predecessors [-, 0, 3, 1].
+        let b = CsrMatrix::from_components(
+            Shape2D::new(4, 4),
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![1, 2, 3, 2],
+            vec![0, 2, 3, 3, 4],
+            false,
+        )
+        .expect("graph b");
+        let (order, pred) = depth_first_order(&b, 0).expect("dfs b");
+        assert_eq!(order, vec![0, 1, 3, 2]);
+        assert_eq!(pred, vec![-1, 0, 3, 1]);
     }
 
     #[test]
@@ -29752,6 +30106,20 @@ mod tests {
     }
 
     #[test]
+    fn eigsh_window_follows_scipy_ncv_rule_for_every_k() {
+        // br-szq1n.15: SciPy's ncv default is min(n, max(2k + 1, 20)). k == 6 used to
+        // get a benchmark-tuned 18.
+        for k in 1..=12 {
+            assert_eq!(
+                eigsh_krylov_window(10_000, k),
+                (2 * k + 1).max(20),
+                "k = {k}"
+            );
+        }
+        assert_eq!(eigsh_krylov_window(10, 6), 10, "window is capped at n");
+    }
+
+    #[test]
     fn eigsh_matches_scipy_reference_values() {
         // scipy.sparse.linalg.eigsh for diagonal matrix with eigenvalues 1, 4, 9
         // Request k=2 largest -> should get 9 and 4
@@ -30622,10 +30990,14 @@ pub fn spsolve_triangular(a: &CsrMatrix, b: &[f64], lower: bool) -> SparseResult
     Ok(x)
 }
 
-/// Compute the `k` largest eigenvalues/eigenvectors of a sparse symmetric matrix.
+/// Compute the `k` largest-magnitude eigenvalues/eigenvectors of a sparse symmetric matrix,
+/// as `scipy.sparse.linalg.eigsh(A, k=k, which='LM')`.
 ///
-/// Uses power iteration with deflation for multiple eigenvalues.
-/// Matches `scipy.sparse.linalg.eigsh(A, k=k, which='LM')` for symmetric A.
+/// Thick-restart Lanczos ([`thick_restart_lanczos`]) with SciPy's basis size
+/// `ncv = min(n, max(2k+1, 20))`, restarting until the k wanted Ritz pairs converge (as
+/// ARPACK's implicit restarts do) or `options.max_iter` restarts pass. `converged` also
+/// requires every returned pair's explicit residual ‖Ax − λx‖ ≤ tol·max(|λ|, 1). `which`,
+/// `sigma` (shift-invert) and `M` are not supported.
 pub fn eigsh(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<EigsResult> {
     let shape = a.shape();
     if !shape.is_square() {
@@ -30641,37 +31013,201 @@ pub fn eigsh(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<Eigs
     }
     let options = normalize_eigs_options(options);
 
-    // Symmetric Lanczos via the shared Krylov/Arnoldi solver: for a symmetric A
-    // the Arnoldi projection is tridiagonal with real Ritz values, so an
-    // m-dimensional Krylov subspace yields the top-k eigenpairs in O(m) matvecs —
-    // versus power-iteration-with-deflation's O(k·max_iter). A single subspace of
-    // max(2k+1, 20) (scipy's ncv default) resolves the extreme eigenpairs of a
-    // well-separated spectrum. The live k=6 sparse benchmark keeps the same Ritz
-    // contract at an 18-vector window, which trims two matvec/orthogonalization
-    // rounds without crossing the residual cliff seen at smaller windows. The
-    // `converged` flag is set from actual Ritz residuals (pathologically-clustered
-    // spectra would need implicit restarts, as in ARPACK — reported honestly via
-    // `converged = false` rather than looping).
+    // A single Lanczos subspace of this size (what this used to run) resolves only the
+    // extreme pairs of a well-separated spectrum; on ordinary sparse matrices it left 5-50%
+    // residuals, so the basis is restarted until the wanted pairs converge
+    // (frankenscipy-1ksfv.10).
+    //
+    // br-szq1n.15: k == 6 used to get an 18-vector window and skip the explicit
+    // residual check, both tuned to "the live k=6 sparse benchmark" (AGENTS #12:
+    // the measured path must be the path a user gets). One rule now holds for
+    // every k: SciPy's window, explicit residuals.
     let m = eigsh_krylov_window(n, k);
-    let mut result = krylov_arnoldi_eigs(|v| csr_matvec(a, v), n, k, &options, m, false);
-    // The Arnoldi residual certificate removes k post-hoc sparse matvecs and
-    // wins the live k=6 gap. A same-worker guard sample showed the k=8 row
-    // regressing despite fewer matvecs, so keep the older explicit residual
-    // check above k=6 until a broader sweep proves that path profitable too.
-    if k > 6 {
-        let (converged, resid_matvec) = eigsh_residual_check(a, &result, options.tol.max(1e-8));
-        result.nmatvec += resid_matvec;
-        result.converged = converged;
-    }
+    let mut result = thick_restart_lanczos(|v| csr_matvec(a, v), n, k, &options, m);
+    let (residuals_ok, resid_matvec) = eigsh_residual_check(a, &result, options.tol.max(1e-8));
+    result.nmatvec += resid_matvec;
+    // Both: every returned pair passes its residual test AND all k pairs came back (the Krylov
+    // kernel's flag). The residual check alone reported eigsh(I_30, k=3) -- one pair, the
+    // subspace collapses on the identity -- as converged (frankenscipy-szq1n.7).
+    result.converged = result.converged && residuals_ok;
     Ok(result)
 }
 
-fn eigsh_krylov_window(n: usize, k: usize) -> usize {
-    if k == 6 {
-        (3 * k).min(n)
-    } else {
-        (2 * k + 1).max(20).min(n)
+/// Thick-restart Lanczos (Wu & Simon 2000) for the `k` largest-magnitude eigenpairs of the
+/// symmetric operator `op` on `R^n`, with an `m`-vector basis (SciPy's `ncv`).
+///
+/// Each cycle extends the basis to `m` vectors with full (two-pass) reorthogonalization, takes
+/// the Ritz pairs of the projection, and stops when the `k` wanted residual estimates
+/// `|β·y_last|` are within `options.tol·max(|θ|, eps^(2/3))`. Otherwise it restarts from the best
+/// `k + (m−k)/2` Ritz vectors plus the normalized residual direction, which leaves the
+/// projection an arrowhead matrix that the next extension fills in. This plays the role of
+/// ARPACK `dsaupd`'s implicit restarts (SciPy's `eigsh`); at most `options.max_iter` cycles.
+///
+/// `eigsh` used to take a single pass of this basis. On ordinary sparse matrices with k = 6
+/// and n = 120..800 (random diagonally dominant SPD, random graph Laplacians, a clustered top
+/// spectrum) that left relative residuals of 4e-2 to 5e-1 on every one of 24 matrices
+/// (frankenscipy-1ksfv.10, found by the frankenscipy-szq1n.15 sweep).
+fn thick_restart_lanczos<F: FnMut(&[f64]) -> Vec<f64>>(
+    mut op: F,
+    n: usize,
+    k: usize,
+    options: &EigsOptions,
+    m: usize,
+) -> EigsResult {
+    let m = m.min(n).max(k.min(n));
+    let keep = (k + (m.saturating_sub(k)) / 2)
+        .min(m.saturating_sub(1))
+        .max(k.min(m));
+    let breakdown_rel_tol = f64::EPSILON.powf(2.0 / 3.0);
+    let tol = options.tol.max(f64::EPSILON);
+    let mut total_matvec = 0_usize;
+
+    // The same fixed-seed start vector as `krylov_arnoldi_eigs`.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut v0 = vec![0.0_f64; n];
+    for vi in v0.iter_mut() {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *vi = ((state >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
     }
+    let v0_norm = vec_norm(&v0);
+    for vi in &mut v0 {
+        *vi /= v0_norm;
+    }
+
+    let mut basis: Vec<Vec<f64>> = vec![v0];
+    let mut t = vec![vec![0.0; m]; m];
+    let mut theta: Vec<f64> = Vec::new();
+    let mut y = DMatrix::<f64>::zeros(0, 0);
+    let mut order: Vec<usize> = Vec::new();
+    let mut size = 0;
+    let mut converged = false;
+
+    for _cycle in 0..options.max_iter.max(1) {
+        // Extend the basis to m vectors; `residual` is the unnormalized next direction.
+        let mut residual = vec![0.0; n];
+        let mut beta = 0.0;
+        while basis.len() <= m {
+            let j = basis.len() - 1;
+            let mut w = op(&basis[j]);
+            total_matvec += 1;
+            let norm_before = vec_norm(&w);
+            let mut coeff = vec![0.0; basis.len()];
+            for _pass in 0..2 {
+                for (i, b) in basis.iter().enumerate() {
+                    let c = dot_product(&w, b);
+                    coeff[i] += c;
+                    for (wk, bk) in w.iter_mut().zip(b) {
+                        *wk -= c * bk;
+                    }
+                }
+            }
+            for (i, &c) in coeff.iter().enumerate() {
+                t[i][j] = c;
+                t[j][i] = c;
+            }
+            beta = vec_norm(&w);
+            if beta <= breakdown_rel_tol * norm_before || basis.len() == m {
+                residual = w;
+                if beta <= breakdown_rel_tol * norm_before {
+                    beta = 0.0; // invariant subspace: the Ritz pairs are exact
+                }
+                break;
+            }
+            for wk in &mut w {
+                *wk /= beta;
+            }
+            basis.push(w);
+        }
+        size = basis.len();
+
+        // Rayleigh–Ritz on the projection.
+        let projected = DMatrix::from_fn(size, size, |i, j| t[i][j]);
+        let Some(eigen) =
+            nalgebra::SymmetricEigen::try_new(projected, f64::EPSILON, 30 * size.max(10))
+        else {
+            break;
+        };
+        theta = eigen.eigenvalues.iter().copied().collect();
+        y = eigen.eigenvectors;
+        order = (0..size).collect();
+        order.sort_by(|&a, &b| theta[b].abs().total_cmp(&theta[a].abs()));
+
+        // ARPACK `dsconv` scales the test by max(|θ|, eps^(2/3)), not max(|θ|, 1): with the
+        // absolute floor a matrix of norm 1e-11 passes a 1e-10 tolerance on its first cycle
+        // whatever its Ritz values are.
+        let wanted = k.min(size);
+        let estimates_ok = order.iter().take(wanted).all(|&i| {
+            (beta * y[(size - 1, i)]).abs() <= tol * theta[i].abs().max(breakdown_rel_tol)
+        });
+        if (estimates_ok && wanted == k) || beta == 0.0 || keep >= size {
+            converged = estimates_ok && wanted == k;
+            break;
+        }
+
+        // Thick restart: the `keep` best Ritz vectors, then the residual direction.
+        let mut new_basis: Vec<Vec<f64>> = Vec::with_capacity(m + 1);
+        for &i in order.iter().take(keep) {
+            let mut ritz = vec![0.0; n];
+            for (j, b) in basis.iter().enumerate().take(size) {
+                let coef = y[(j, i)];
+                for (rk, bk) in ritz.iter_mut().zip(b) {
+                    *rk += coef * bk;
+                }
+            }
+            new_basis.push(ritz);
+        }
+        for row in &mut t {
+            row.fill(0.0);
+        }
+        for (slot, &i) in order.iter().take(keep).enumerate() {
+            t[slot][slot] = theta[i];
+            let arrow = beta * y[(size - 1, i)];
+            t[slot][keep] = arrow;
+            t[keep][slot] = arrow;
+        }
+        for rk in &mut residual {
+            *rk /= beta;
+        }
+        new_basis.push(residual);
+        basis = new_basis;
+    }
+
+    // The k wanted Ritz pairs of the last projection, largest magnitude first.
+    let k_actual = k.min(order.len());
+    let mut eigenvalues = Vec::with_capacity(k_actual);
+    let mut eigenvectors = Vec::with_capacity(k_actual);
+    for &i in order.iter().take(k_actual) {
+        eigenvalues.push(theta[i]);
+        let mut x = vec![0.0; n];
+        for (j, b) in basis.iter().enumerate().take(size) {
+            let coef = y[(j, i)];
+            for (xk, bk) in x.iter_mut().zip(b) {
+                *xk += coef * bk;
+            }
+        }
+        let norm = vec_norm(&x);
+        if norm > 0.0 {
+            for xk in &mut x {
+                *xk /= norm;
+            }
+        }
+        eigenvectors.push(x);
+    }
+    EigsResult {
+        eigenvalues_im: vec![0.0; k_actual],
+        eigenvectors_im: vec![vec![0.0; n]; k_actual],
+        eigenvalues,
+        eigenvectors,
+        nmatvec: total_matvec,
+        converged: converged && k_actual == k,
+    }
+}
+
+/// SciPy's `ncv` default for `eigsh`: `min(n, max(2k + 1, 20))`.
+fn eigsh_krylov_window(n: usize, k: usize) -> usize {
+    (2 * k + 1).max(20).min(n)
 }
 
 /// Returns `(all_top_k_converged, matvecs_used)` for an eigsh result by checking
@@ -30680,6 +31216,7 @@ fn eigsh_residual_check(a: &CsrMatrix, result: &EigsResult, tol: f64) -> (bool, 
     if result.eigenvalues.is_empty() {
         return (false, 0);
     }
+    // status: cleared below by any pair whose residual fails the test or is NaN
     let mut converged = true;
     let mut matvecs = 0;
     for (&lambda, x) in result.eigenvalues.iter().zip(result.eigenvectors.iter()) {
@@ -30691,7 +31228,9 @@ fn eigsh_residual_check(a: &CsrMatrix, result: &EigsResult, tol: f64) -> (bool, 
             .map(|(&axi, &xi)| (axi - lambda * xi).powi(2))
             .sum::<f64>()
             .sqrt();
-        if resid > tol * lambda.abs().max(1.0) {
+        // A NaN residual (a non-finite matrix reaches here: CSR accepts NaN) must fail the
+        // test; `resid > thr` alone is false for NaN (frankenscipy-szq1n.7).
+        if resid.is_nan() || resid > tol * lambda.abs().max(1.0) {
             converged = false;
         }
     }
@@ -30702,11 +31241,14 @@ fn eigsh_residual_check(a: &CsrMatrix, result: &EigsResult, tol: f64) -> (bool, 
 // eigs — Arnoldi-based eigenvalue solver for general sparse matrices
 // ══════════════════════════════════════════════════════════════════════
 
-/// Compute the `k` eigenvalues of largest magnitude of a general sparse matrix.
+/// Compute the `k` eigenvalues of largest magnitude of a general sparse matrix, as
+/// `scipy.sparse.linalg.eigs(A, k=k, which='LM')`.
 ///
-/// Uses Arnoldi iteration to build a Krylov subspace, then extracts eigenvalues
-/// from the upper Hessenberg matrix.
-/// Matches `scipy.sparse.linalg.eigs(A, k=k, which='LM')`.
+/// Arnoldi: ONE Krylov subspace of dimension `min(n, 2k+1)`, Ritz values from the projected
+/// upper-Hessenberg matrix. There are no implicit restarts (ARPACK restarts until
+/// convergence), so the result can be less accurate than SciPy's on a spectrum without a clear
+/// gap after the k-th eigenvalue. `converged` is true only when all `k` pairs came back.
+/// `which`, `sigma` and `M` are not supported.
 pub fn eigs(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<EigsResult> {
     let shape = a.shape();
     if !shape.is_square() {
@@ -30724,29 +31266,20 @@ pub fn eigs(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<EigsR
 
     // Krylov subspace dimension (larger than k for better convergence).
     let m = (2 * k + 1).min(n);
-    Ok(krylov_arnoldi_eigs(
-        |v| csr_matvec(a, v),
-        n,
-        k,
-        &options,
-        m,
-        true,
-    ))
+    Ok(krylov_arnoldi_eigs(|v| csr_matvec(a, v), n, k, &options, m))
 }
 
-/// Shared Arnoldi/Lanczos Krylov eigensolver used by both [`eigs`] (general) and
-/// [`eigsh`] (symmetric). Builds an `m`-dimensional Krylov subspace with full
-/// modified-Gram-Schmidt re-orthogonalization (no ghost eigenvalues), extracts
-/// Ritz values from the projected upper-Hessenberg matrix `H` (tridiagonal, with
-/// real Ritz values, when `A` is symmetric), and back-transforms the top-`k`-by-
-/// magnitude Ritz vectors into the original space. O(m) matvecs total.
+/// The Arnoldi eigensolver behind [`eigs`] (a general operator; the symmetric
+/// [`eigsh`]/[`svds`] run [`thick_restart_lanczos`]). Builds ONE `m`-dimensional Krylov
+/// subspace with full modified-Gram-Schmidt re-orthogonalization, takes the Ritz values of
+/// the projected upper-Hessenberg matrix `H`, and back-transforms the top-`k`-by-magnitude
+/// Ritz vectors. O(m) matvecs, no restarts (frankenscipy-1ksfv.10 tracks restarting it).
 fn krylov_arnoldi_eigs<F: FnMut(&[f64]) -> Vec<f64>>(
     mut op: F,
     n: usize,
     k: usize,
     options: &EigsOptions,
     m: usize,
-    general: bool,
 ) -> EigsResult {
     let mut total_matvec = 0;
 
@@ -30849,85 +31382,11 @@ fn krylov_arnoldi_eigs<F: FnMut(&[f64]) -> Vec<f64>>(
         v.push(w);
     }
 
-    if general {
-        // General (nonsymmetric) operator: the projected Hessenberg matrix can
-        // have complex-conjugate eigenpairs, which a real single-shift QR silently
-        // collapses to their real parts. Use the double-shift Francis QR (`hqr`)
-        // to recover the full complex spectrum, then complex back-substitution for
-        // the eigenvectors. Matches `scipy.sparse.linalg.eigs`, which returns a
-        // complex array.
-        return krylov_extract_general(&v, &h, actual_m, n, k, options, total_matvec);
-    }
-
-    // Symmetric operator (eigsh/svds): real Ritz values from the single-shift QR.
-    // Extract eigenvalues from the Hessenberg matrix H[0..actual_m, 0..actual_m].
-    let eig_vals = hessenberg_eigenvalues(&h, actual_m, options.max_iter, options.tol);
-
-    // Sort by magnitude (largest first) and take top k
-    let mut indexed: Vec<(usize, f64)> = eig_vals.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
-
-    let k_actual = k.min(indexed.len());
-    let mut eigenvalues = Vec::with_capacity(k_actual);
-    let mut eigenvectors = Vec::with_capacity(k_actual);
-    let mut converged = k_actual > 0;
-    let residual_tol = options.tol.max(1e-8);
-
-    for &(_, val) in indexed.iter().take(k_actual) {
-        eigenvalues.push(val);
-
-        // Back-transform the Ritz vector into the original space: the
-        // eigenvector of A is x = V @ y, where y is the eigenvector of the
-        // projected Hessenberg matrix H for this eigenvalue. Returning a raw
-        // Arnoldi basis vector v[idx] is wrong — those are not eigenpairs of A.
-        let y = hessenberg_eigenvector(&h, actual_m, val);
-        let y_norm = vec_norm(&y);
-        let projected_resid = if y_norm > 0.0 && actual_m > 0 {
-            let mut resid_sq = 0.0;
-            for row in 0..=actual_m {
-                let mut r = 0.0;
-                for col in 0..actual_m {
-                    r += h[row][col] * y[col];
-                }
-                if row < actual_m {
-                    r -= val * y[row];
-                }
-                resid_sq += r * r;
-            }
-            resid_sq.sqrt() / y_norm
-        } else {
-            f64::INFINITY
-        };
-        if projected_resid > residual_tol * val.abs().max(1.0) {
-            converged = false;
-        }
-        let mut evec = vec![0.0; n];
-        for (j, &yj) in y.iter().enumerate() {
-            if yj == 0.0 {
-                continue;
-            }
-            for (xi, vji) in evec.iter_mut().zip(v[j].iter()) {
-                *xi += yj * vji;
-            }
-        }
-        let norm = vec_norm(&evec);
-        if norm > 0.0 {
-            for xi in &mut evec {
-                *xi /= norm;
-            }
-        }
-        eigenvectors.push(evec);
-    }
-
-    let n_out = eigenvalues.len();
-    EigsResult {
-        eigenvalues,
-        eigenvalues_im: vec![0.0; n_out],
-        eigenvectors,
-        eigenvectors_im: vec![vec![0.0; n]; n_out],
-        nmatvec: total_matvec,
-        converged,
-    }
+    // The projected Hessenberg matrix can have complex-conjugate eigenpairs, which a real
+    // single-shift QR silently collapses to their real parts. Use the double-shift Francis QR
+    // (`hqr`) to recover the full complex spectrum, then complex back-substitution for the
+    // eigenvectors. Matches `scipy.sparse.linalg.eigs`, which returns a complex array.
+    krylov_extract_general(&v, &h, actual_m, n, k, options, total_matvec)
 }
 
 /// Top-`k`-by-magnitude complex eigenpairs of a general operator from its
@@ -30963,6 +31422,11 @@ fn krylov_extract_general(
     let mut eigenvalues_im = Vec::with_capacity(k_actual);
     let mut eigenvectors = Vec::with_capacity(k_actual);
     let mut eigenvectors_im = Vec::with_capacity(k_actual);
+    // br-szq1n.7: convergence is established per Ritz pair, as in the symmetric
+    // path. This used to be a literal `true` after one unrestarted Arnoldi pass.
+    // Fewer pairs than requested is not convergence either.
+    let mut converged = k_actual > 0 && k_actual == k;
+    let residual_tol = options.tol.max(1e-8);
 
     for &(_, (re, im)) in indexed.iter().take(k_actual) {
         eigenvalues.push(re);
@@ -30971,6 +31435,33 @@ fn krylov_extract_general(
         // Eigenvector y of the projected Hessenberg matrix, in complex arithmetic,
         // then x = V @ y back into the original space (V is real).
         let y = hessenberg_eigenvector_complex(h, m, (re, im));
+
+        // Arnoldi residual of the Ritz pair: ||A V y - lambda V y|| = ||H_bar y -
+        // lambda [y; 0]|| with H_bar the (m+1) x m Hessenberg matrix (V orthonormal).
+        let y_norm = y.iter().map(|&(r, i)| r * r + i * i).sum::<f64>().sqrt();
+        let projected_resid = if y_norm > 0.0 && m > 0 {
+            let mut resid_sq = 0.0;
+            for row in 0..=m.min(h.len() - 1) {
+                let (mut rr, mut ri) = (0.0, 0.0);
+                for (col, &(yr, yi)) in y.iter().enumerate().take(m) {
+                    let hv = h[row][col];
+                    rr += hv * yr;
+                    ri += hv * yi;
+                }
+                if row < m {
+                    let (yr, yi) = y[row];
+                    rr -= re * yr - im * yi;
+                    ri -= re * yi + im * yr;
+                }
+                resid_sq += rr * rr + ri * ri;
+            }
+            resid_sq.sqrt() / y_norm
+        } else {
+            f64::INFINITY
+        };
+        if projected_resid.is_nan() || projected_resid > residual_tol * re.hypot(im).max(1.0) {
+            converged = false;
+        }
         let mut evec_re = vec![0.0; n];
         let mut evec_im = vec![0.0; n];
         for (j, &(yr, yi)) in y.iter().enumerate() {
@@ -31005,136 +31496,15 @@ fn krylov_extract_general(
         eigenvectors,
         eigenvectors_im,
         nmatvec: total_matvec,
-        converged: true,
+        converged,
     }
-}
-
-/// Compute an eigenvector of the upper Hessenberg matrix `H[0..m, 0..m]` for
-/// the (real) eigenvalue `lambda`.
-///
-/// Solves `(H - lambda*I) y = 0` by back-substitution against the subdiagonal:
-/// with `y[m-1] = 1`, row `r` of the system determines `y[r-1]` from the
-/// already-known `y[r..m]`. When `lambda` is an exact eigenvalue the unused
-/// top row is satisfied automatically; for a converged Ritz value its residual
-/// is negligible.
-fn hessenberg_eigenvector(h: &[Vec<f64>], m: usize, lambda: f64) -> Vec<f64> {
-    if m == 0 {
-        return Vec::new();
-    }
-    if m == 1 {
-        return vec![1.0];
-    }
-    let mut y = vec![0.0; m];
-    y[m - 1] = 1.0;
-    for r in (1..m).rev() {
-        // Row r: h[r][r-1]*y[r-1] + sum_{c>=r} h[r][c]*y[c] - lambda*y[r] = 0.
-        let mut acc = -lambda * y[r];
-        for c in r..m {
-            acc += h[r][c] * y[c];
-        }
-        let sub = h[r][r - 1];
-        if sub.abs() < f64::MIN_POSITIVE {
-            // Decoupled block: leave the remaining components at zero.
-            break;
-        }
-        y[r - 1] = -acc / sub;
-    }
-    y
-}
-
-/// Extract eigenvalues from an upper Hessenberg matrix using QR iteration.
-fn hessenberg_eigenvalues(h: &[Vec<f64>], m: usize, max_iter: usize, tol: f64) -> Vec<f64> {
-    if m == 0 {
-        return Vec::new();
-    }
-    if m == 1 {
-        return vec![h[0][0]];
-    }
-
-    // Copy the m×m submatrix
-    let mut a = vec![vec![0.0; m]; m];
-    for i in 0..m {
-        for j in 0..m {
-            a[i][j] = h[i][j];
-        }
-    }
-
-    // Francis QR double shift algorithm (simplified single shift version)
-    let mut n = m;
-    let mut eigenvalues = Vec::with_capacity(m);
-
-    for _ in 0..max_iter * m {
-        if n <= 1 {
-            if n == 1 {
-                eigenvalues.push(a[0][0]);
-            }
-            break;
-        }
-
-        // Check for convergence at bottom
-        if a[n - 1][n - 2].abs() < tol * (a[n - 1][n - 1].abs() + a[n - 2][n - 2].abs()).max(tol) {
-            eigenvalues.push(a[n - 1][n - 1]);
-            n -= 1;
-            continue;
-        }
-
-        // Wilkinson shift
-        let shift = a[n - 1][n - 1];
-
-        // Apply shift
-        for (i, row) in a.iter_mut().enumerate().take(n) {
-            row[i] -= shift;
-        }
-
-        // QR step via Givens rotations
-        let mut cs_rot = vec![0.0; n - 1];
-        let mut sn_rot = vec![0.0; n - 1];
-        for i in 0..(n - 1) {
-            let (c, s) = givens_rotation(a[i][i], a[i + 1][i]);
-            cs_rot[i] = c;
-            sn_rot[i] = s;
-            // Apply rotation to rows i and i+1
-            let (upper, lower) = a.split_at_mut(i + 1);
-            let row_i = &mut upper[i];
-            let row_ip1 = &mut lower[0];
-            for (lhs, rhs) in row_i.iter_mut().zip(row_ip1.iter_mut()).skip(i).take(n - i) {
-                let temp = c * *lhs + s * *rhs;
-                *rhs = -s * *lhs + c * *rhs;
-                *lhs = temp;
-            }
-        }
-
-        // Multiply R * Q (apply rotations from the right)
-        for i in 0..(n - 1) {
-            let c = cs_rot[i];
-            let s = sn_rot[i];
-            for row in a.iter_mut().take(n.min(i + 3)) {
-                let temp = c * row[i] + s * row[i + 1];
-                row[i + 1] = -s * row[i] + c * row[i + 1];
-                row[i] = temp;
-            }
-        }
-
-        // Undo shift
-        for (i, row) in a.iter_mut().enumerate().take(n) {
-            row[i] += shift;
-        }
-    }
-
-    // Collect any remaining diagonal elements
-    while eigenvalues.len() < m && n > 0 {
-        eigenvalues.push(a[n - 1][n - 1]);
-        n -= 1;
-    }
-
-    eigenvalues
 }
 
 /// Complex eigenvalues of an upper-Hessenberg matrix `H[0..m, 0..m]` via the
 /// double-shift Francis QR (the classic EISPACK/Numerical-Recipes `hqr`).
 ///
-/// Unlike [`hessenberg_eigenvalues`] (a real single-shift QR that collapses a
-/// complex-conjugate pair onto its real part), this deflates 1×1 and 2×2 blocks
+/// Unlike a real single-shift QR (which collapses a complex-conjugate pair onto its
+/// real part), this deflates 1×1 and 2×2 blocks
 /// and returns each eigenvalue as a `(re, im)` pair — a 2×2 block with negative
 /// discriminant yields the conjugate pair `re ± im·i`. Operates on a private copy
 /// of `H`, so the caller's matrix is left intact for eigenvector recovery.
@@ -31360,10 +31730,9 @@ fn hessenberg_eigenvalues_complex(
 }
 
 /// Complex eigenvector of `H[0..m, 0..m]` for the (possibly complex) eigenvalue
-/// `lambda`. The complex analogue of [`hessenberg_eigenvector`]: solve
-/// `(H - lambda·I) y = 0` by back-substitution against the subdiagonal with
-/// `y[m-1] = 1`. For a real `lambda` and real `H` every component stays real,
-/// matching the real solver exactly.
+/// `lambda`: solve `(H - lambda·I) y = 0` by back-substitution against the
+/// subdiagonal with `y[m-1] = 1`. For a real `lambda` and real `H` every component
+/// stays real.
 fn hessenberg_eigenvector_complex(h: &[Vec<f64>], m: usize, lambda: (f64, f64)) -> Vec<(f64, f64)> {
     if m == 0 {
         return Vec::new();
@@ -31405,6 +31774,9 @@ pub struct SvdsResult {
     pub u: Vec<Vec<f64>>,
     /// Right singular vectors (columns of V).
     pub vt: Vec<Vec<f64>>,
+    /// Whether the underlying eigensolve of AᵀA converged for all `k` pairs (SciPy raises
+    /// `ArpackNoConvergence` where this is false). It used to be dropped (br-szq1n.7).
+    pub converged: bool,
 }
 
 /// Compute the `k` largest singular values of a sparse matrix.
@@ -31430,10 +31802,9 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
 
     // The top-k singular values of A are the square roots of the top-k eigenvalues
     // of the n×n SPSD matrix AᵀA, with right singular vectors = its eigenvectors.
-    // Build the k largest eigenpairs of AᵀA with the shared Lanczos/Arnoldi Krylov
-    // solver (operator v ↦ Aᵀ(A v)) — O(m) operator applications versus the
-    // previous power-iteration-with-deflation's O(k·max_iter). For a well-separated
-    // spectrum a single subspace of max(2k+1, 20) resolves the extremes.
+    // Build the k largest eigenpairs of AᵀA by thick-restart Lanczos on the operator
+    // v ↦ Aᵀ(A v), restarting until they converge (a single max(2k+1, 20) subspace,
+    // what this used to run, resolves only a well-separated spectrum).
     let ncv = (2 * k + 1).max(20).min(n);
     // AᵀA·v: reuse a hoisted `tmp` (rows-length) for the discarded intermediate
     // A·v instead of allocating it every Arnoldi step; the Aᵀ·tmp result is
@@ -31444,7 +31815,7 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
         csr_matvec_into(a, v, &mut tmp);
         csc_matvec(&a_csc, &tmp)
     };
-    let eig = krylov_arnoldi_eigs(ata_op, n, k, &options, ncv, false);
+    let eig = thick_restart_lanczos(ata_op, n, k, &options, ncv);
 
     let mut singular_values = Vec::with_capacity(k);
     let mut v_vecs: Vec<Vec<f64>> = Vec::with_capacity(k);
@@ -31484,6 +31855,7 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
         singular_values,
         u: u_vecs,
         vt: v_vecs,
+        converged: eig.converged,
     })
 }
 
@@ -31848,26 +32220,42 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
     let indptr = graph.indptr();
     let indices = graph.indices();
 
+    // br-szq1n.3: SciPy's `_depth_first_directed` descends into the FIRST unvisited
+    // neighbour immediately, recording it in the order and its predecessor at that
+    // moment, and backtracks when a node has no unvisited children. The previous
+    // version marked every neighbour visited when it was pushed, which yields the
+    // same order on many graphs but the wrong predecessor tree (0->1, 0->2, 1->2:
+    // SciPy predecessor of 2 is 1, the push-time version gave 0). `cursor[node]` is
+    // where that node's neighbour scan resumes; since visited flags only ever get
+    // set, resuming is equivalent to SciPy's rescan from `indptr[node]`.
     let mut visited = vec![false; n];
     let mut order = Vec::with_capacity(n);
     let mut predecessors = vec![-1_i64; n];
+    let mut cursor: Vec<usize> = indptr[..n].to_vec();
 
     let mut stack = vec![source];
     visited[source] = true;
+    order.push(source);
 
-    while let Some(node) = stack.pop() {
-        order.push(node);
-        // Push neighbors in reverse order so leftmost is visited first
-        let neighbors: Vec<usize> = (indptr[node]..indptr[node + 1])
-            .map(|idx| indices[idx])
-            .filter(|&neighbor| !visited[neighbor])
-            .collect();
-        for &neighbor in neighbors.iter().rev() {
-            if !visited[neighbor] {
-                visited[neighbor] = true;
-                predecessors[neighbor] = node as i64;
-                stack.push(neighbor);
+    while let Some(&node) = stack.last() {
+        let mut descended = false;
+        while cursor[node] < indptr[node + 1] {
+            let child = indices[cursor[node]];
+            cursor[node] += 1;
+            if !visited[child] {
+                visited[child] = true;
+                predecessors[child] = node as i64;
+                order.push(child);
+                stack.push(child);
+                descended = true;
+                break;
             }
+        }
+        if order.len() == n {
+            break;
+        }
+        if !descended {
+            stack.pop();
         }
     }
 
@@ -31879,7 +32267,11 @@ pub fn depth_first_order(graph: &CsrMatrix, source: usize) -> SparseResult<(Vec<
 /// The graph Laplacian is fundamental for spectral graph theory, spectral clustering,
 /// diffusion processes, and network analysis.
 ///
-/// Matches `scipy.sparse.csgraph.laplacian(graph, normed=normed)`.
+/// Matches `scipy.sparse.csgraph.laplacian(graph, normed=normed)` with SciPy's
+/// defaults: the degree is the signed in-degree (column sum, `use_out_degree=False`)
+/// excluding self-loops, the input diagonal is ignored, and `normed=True` divides
+/// each entry by `sqrt(w_i) * sqrt(w_j)` (1 for isolated nodes; NaN for a negative
+/// degree, as in SciPy).
 ///
 /// # Arguments
 /// * `graph` — Adjacency matrix in CSR format (edge weights as values).
@@ -31921,17 +32313,64 @@ pub static LAPLACIAN_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 pub static LAPLACIAN_FORCE_DENSE_REFERENCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Degree vector of `scipy.sparse.csgraph.laplacian` with its default
+/// `use_out_degree=False`: `m.sum(axis=0) - m.diagonal()`, the SIGNED in-degree
+/// (column sum) with self-loops excluded.
+///
+/// br-szq1n.3: this used to be the out-degree of `|w|` (a row sum of absolute
+/// values), which agrees with SciPy only for symmetric non-negative graphs;
+/// asymmetric or signed graphs got a different diagonal.
 fn laplacian_degrees(graph: &CsrMatrix) -> Vec<f64> {
     let n = graph.shape().rows;
     let indptr = graph.indptr();
+    let indices = graph.indices();
     let data = graph.data();
-    let mut degree: Vec<f64> = vec![0.0; n];
-    for i in 0..n {
-        for &value in data.iter().take(indptr[i + 1]).skip(indptr[i]) {
-            degree[i] += value.abs();
+    let mut column_sum = vec![0.0f64; n];
+    let mut diagonal = vec![0.0f64; n];
+    for row in 0..n {
+        for idx in indptr[row]..indptr[row + 1] {
+            let column = indices[idx];
+            column_sum[column] += data[idx];
+            if column == row {
+                diagonal[row] += data[idx];
+            }
         }
     }
+    column_sum
+        .iter()
+        .zip(&diagonal)
+        .map(|(sum, diag)| sum - diag)
+        .collect()
+}
+
+/// SciPy's normalization divisor per node: `sqrt(w)`, or 1 for an isolated node
+/// (`w == 0`). A negative degree yields NaN, exactly as SciPy's `np.sqrt` does.
+fn laplacian_norm_scale(degree: &[f64]) -> Vec<f64> {
     degree
+        .iter()
+        .map(|&w| if w == 0.0 { 1.0 } else { w.sqrt() })
+        .collect()
+}
+
+/// Off-diagonal Laplacian entry for adjacency weight `a` at (`row`, `column`),
+/// in SciPy's operation order (`data /= w[row]; data /= w[col]; data *= -1`).
+fn laplacian_offdiag(a: f64, row: usize, column: usize, normed: bool, scale: &[f64]) -> f64 {
+    if normed {
+        -(a / scale[row] / scale[column])
+    } else {
+        -a
+    }
+}
+
+/// Diagonal Laplacian entry. The input's own diagonal is ignored (SciPy's
+/// `setdiag` overwrites it): the degree, or 1 (0 for an isolated node) when
+/// normalized.
+fn laplacian_diag(row: usize, normed: bool, degree: &[f64]) -> f64 {
+    if normed {
+        if degree[row] == 0.0 { 0.0 } else { 1.0 }
+    } else {
+        degree[row]
+    }
 }
 
 #[cfg(any(test, feature = "sparse-incumbent-bench"))]
@@ -31941,41 +32380,24 @@ fn laplacian_dense_reference(graph: &CsrMatrix, normed: bool, degree: &[f64]) ->
     let indices = graph.indices();
     let data = graph.data();
 
-    let dedup = graph.canonical_meta().deduplicated;
-    // For the symmetric-normalized case on a DEDUPLICATED graph the scaling touches only
-    // the O(n+nnz) structurally-nonzero positions (diagonal + edges), so it FUSES into the
-    // per-row build (each row's scaling depends only on that row + d_inv_sqrt) — byte-
-    // identical to the build-then-scale loops. Non-dedup graphs keep the dense post-scan.
-    let d_inv_sqrt: Vec<f64> = if normed {
-        (0..n)
-            .map(|i| {
-                if degree[i] > 0.0 {
-                    1.0 / degree[i].sqrt()
-                } else {
-                    0.0
-                }
-            })
-            .collect()
+    // Normalization is applied per stored entry (SciPy scales each COO entry before
+    // duplicates are summed), so no dense post-scan is needed for either layout.
+    let scale: Vec<f64> = if normed {
+        laplacian_norm_scale(degree)
     } else {
         Vec::new()
     };
-    let scale_in_row = normed && dedup;
 
-    // Build one dense row of L = D - A (with fused dedup-normalized scaling). Rows are
-    // independent (each writes its own Vec), so the O(n²) dense materialization fans
-    // across cores BYTE-IDENTICALLY — the whole cost is the n allocations + zero-fills.
+    // Build one dense row of L. Rows are independent (each writes its own Vec), so the
+    // O(n²) dense materialization fans across cores BYTE-IDENTICALLY — the whole cost is
+    // the n allocations + zero-fills.
     let build_row = |i: usize| -> Vec<f64> {
         let mut row = vec![0.0f64; n];
-        row[i] = degree[i];
+        row[i] = laplacian_diag(i, normed, degree);
         for idx in indptr[i]..indptr[i + 1] {
-            row[indices[idx]] -= data[idx];
-        }
-        if scale_in_row {
-            row[i] *= d_inv_sqrt[i] * d_inv_sqrt[i];
-            for &j in &indices[indptr[i]..indptr[i + 1]] {
-                if j != i {
-                    row[j] *= d_inv_sqrt[i] * d_inv_sqrt[j];
-                }
+            let j = indices[idx];
+            if j != i {
+                row[j] += laplacian_offdiag(data[idx], i, j, normed, &scale);
             }
         }
         row
@@ -31985,7 +32407,7 @@ fn laplacian_dense_reference(graph: &CsrMatrix, normed: bool, degree: &[f64]) ->
         .map(std::num::NonZero::get)
         .unwrap_or(1)
         .min(n.max(1));
-    let mut lapl: Vec<Vec<f64>> = if cores <= 1
+    let lapl: Vec<Vec<f64>> = if cores <= 1
         || LAPLACIAN_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed)
         || n < 512
     {
@@ -32013,16 +32435,6 @@ fn laplacian_dense_reference(graph: &CsrMatrix, normed: bool, degree: &[f64]) ->
         })
     };
 
-    // Non-deduplicated graph + normalized: a stored position may repeat, so scale the
-    // full dense matrix (rare path, kept serial).
-    if normed && !dedup {
-        for i in 0..n {
-            for j in 0..n {
-                lapl[i][j] *= d_inv_sqrt[i] * d_inv_sqrt[j];
-            }
-        }
-    }
-
     lapl
 }
 
@@ -32045,19 +32457,6 @@ fn dense_laplacian_to_csr(dense: Vec<Vec<f64>>) -> CsrMatrix {
     CsrMatrix::from_components_trusted_canonical(Shape2D::new(n, n), data, indices, indptr)
 }
 
-fn scale_laplacian_value(
-    mut value: f64,
-    row: usize,
-    column: usize,
-    normed: bool,
-    d_inv_sqrt: &[f64],
-) -> f64 {
-    if normed {
-        value *= d_inv_sqrt[row] * d_inv_sqrt[column];
-    }
-    value
-}
-
 fn direct_canonical_laplacian(
     graph: &CsrMatrix,
     normed: bool,
@@ -32075,18 +32474,15 @@ fn direct_canonical_laplacian(
     let mut output_indptr = Vec::with_capacity(n + 1);
     output_indptr.push(0);
 
-    let d_inv_sqrt = if normed {
-        degree
-            .iter()
-            .map(|&value| if value > 0.0 { 1.0 / value.sqrt() } else { 0.0 })
-            .collect::<Vec<_>>()
+    let scale = if normed {
+        laplacian_norm_scale(degree)
     } else {
         Vec::new()
     };
 
     let input_meta = graph.canonical_meta();
     if input_meta.sorted_indices && input_meta.deduplicated {
-        for (row, &row_degree) in degree.iter().enumerate().take(n) {
+        for row in 0..n {
             let start = graph.indptr()[row];
             let end = graph.indptr()[row + 1];
             let mut diagonal_emitted = false;
@@ -32094,56 +32490,51 @@ fn direct_canonical_laplacian(
                 let column = graph.indices()[entry];
                 if !diagonal_emitted && column > row {
                     output_indices.push(row);
-                    output_data.push(scale_laplacian_value(
-                        row_degree,
-                        row,
-                        row,
-                        normed,
-                        &d_inv_sqrt,
-                    ));
+                    output_data.push(laplacian_diag(row, normed, degree));
                     diagonal_emitted = true;
                 }
-                let mut value = if column == row { row_degree } else { 0.0 };
-                value -= graph.data()[entry];
                 output_indices.push(column);
-                output_data.push(scale_laplacian_value(
-                    value,
-                    row,
-                    column,
-                    normed,
-                    &d_inv_sqrt,
-                ));
-                diagonal_emitted |= column == row;
+                if column == row {
+                    // The stored self-loop is overwritten, as SciPy's setdiag does.
+                    output_data.push(laplacian_diag(row, normed, degree));
+                    diagonal_emitted = true;
+                } else {
+                    output_data.push(laplacian_offdiag(
+                        graph.data()[entry],
+                        row,
+                        column,
+                        normed,
+                        &scale,
+                    ));
+                }
             }
             if !diagonal_emitted {
                 output_indices.push(row);
-                output_data.push(scale_laplacian_value(
-                    row_degree,
-                    row,
-                    row,
-                    normed,
-                    &d_inv_sqrt,
-                ));
+                output_data.push(laplacian_diag(row, normed, degree));
             }
             output_indptr.push(output_data.len());
         }
     } else {
-        for (row, &row_degree) in degree.iter().enumerate().take(n) {
+        for row in 0..n {
             let mut row_values = BTreeMap::new();
-            row_values.insert(row, row_degree);
+            row_values.insert(row, laplacian_diag(row, normed, degree));
             for entry in graph.indptr()[row]..graph.indptr()[row + 1] {
                 let column = graph.indices()[entry];
-                *row_values.entry(column).or_insert(0.0) -= graph.data()[entry];
+                if column == row {
+                    continue;
+                }
+                // Each stored entry is scaled on its own, then duplicates are summed
+                // (SciPy scales the COO entries before any conversion sums them). The
+                // first entry is inserted as-is so a lone -0.0 keeps its sign.
+                let value = laplacian_offdiag(graph.data()[entry], row, column, normed, &scale);
+                row_values
+                    .entry(column)
+                    .and_modify(|acc| *acc += value)
+                    .or_insert(value);
             }
             for (column, value) in row_values {
                 output_indices.push(column);
-                output_data.push(scale_laplacian_value(
-                    value,
-                    row,
-                    column,
-                    normed,
-                    &d_inv_sqrt,
-                ));
+                output_data.push(value);
             }
             output_indptr.push(output_data.len());
         }
@@ -32180,9 +32571,13 @@ pub struct MstResult {
 
 /// Compute the minimum spanning tree of a sparse graph using Kruskal's algorithm.
 ///
-/// Matches `scipy.sparse.csgraph.minimum_spanning_tree(graph)`.
+/// Matches `scipy.sparse.csgraph.minimum_spanning_tree(graph)` for finite weights.
 ///
-/// The CSR matrix is treated as an undirected weighted adjacency matrix.
+/// The CSR matrix is treated as undirected: every stored entry, in either
+/// triangle, is a candidate edge, so an asymmetric pair contributes its lighter
+/// weight. Explicit zeros are weight-0 edges that connect components but are
+/// omitted from `edges`, as SciPy's returned tree drops them. Unlike SciPy,
+/// non-finite weights are rejected (`NonFiniteInput`) instead of being ranked.
 pub fn minimum_spanning_tree(graph: &CsrMatrix) -> SparseResult<MstResult> {
     validate_csgraph(graph)?;
     let n = graph.shape().rows;
@@ -32196,20 +32591,24 @@ pub fn minimum_spanning_tree(graph: &CsrMatrix) -> SparseResult<MstResult> {
     let indices = graph.indices();
     let data = graph.data();
 
-    // Collect all edges (deduplicate for undirected by only taking i < j)
-    let mut edges: Vec<(f64, usize, usize)> = Vec::new();
+    // br-szq1n.3: SciPy runs Kruskal over EVERY stored entry, both triangles, so
+    // graph[i, j] and graph[j, i] both compete and the lighter one wins; a graph
+    // stored lower-triangular is still a graph. The old `i < j` filter dropped
+    // every lower-triangle edge and used the upper weight of an asymmetric pair.
+    // Self-loops fall out of the union-find. validate_csgraph has already
+    // rejected non-finite weights, so partial_cmp is total here.
+    let mut edges: Vec<(f64, usize, usize)> = Vec::with_capacity(data.len());
     for i in 0..n {
         for idx in indptr[i]..indptr[i + 1] {
-            let j = indices[idx];
-            let w = data[idx];
-            if i < j && w.is_finite() {
-                edges.push((w, i, j));
-            }
+            edges.push((data[idx], i, indices[idx]));
         }
     }
 
-    // Sort edges by weight (Kruskal's)
-    edges.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Stable sort in CSR storage order, as np.argsort(data, kind='stable').
+    edges.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .expect("csgraph weights are finite after validate_csgraph")
+    });
 
     // Union-Find
     let mut parent: Vec<usize> = (0..n).collect();
@@ -32217,15 +32616,21 @@ pub fn minimum_spanning_tree(graph: &CsrMatrix) -> SparseResult<MstResult> {
 
     let mut mst_edges = Vec::new();
     let mut total_weight = 0.0;
+    let mut unions = 0usize;
 
     for (w, u, v) in edges {
         let ru = uf_find(&mut parent, u);
         let rv = uf_find(&mut parent, v);
         if ru != rv {
             uf_union(&mut parent, &mut rank, ru, rv);
-            mst_edges.push((u, v, w));
+            // An explicit zero joins components but, like SciPy's
+            // eliminate_zeros() on the returned tree, is not reported.
+            if w != 0.0 {
+                mst_edges.push((u, v, w));
+            }
             total_weight += w;
-            if mst_edges.len() == n - 1 {
+            unions += 1;
+            if unions == n - 1 {
                 break;
             }
         }
@@ -34339,6 +34744,76 @@ mod lsqr_x0_tests {
             "a correctly sized guess was rejected"
         );
     }
+
+    /// frankenscipy-szq1n.7: b = 0 with a guess and damping is not a zero problem. The
+    /// minimiser of ‖Ax‖² + damp²‖x − x0‖² for A=[[2,0],[0,3],[1,1]], x0=[1,−2], damp=0.5
+    /// solves (AᵀA + damp²I)x = damp²·x0 -> [0.05798816568047337, −0.05443786982248521]. The
+    /// zero-rhs early return used to answer [0, 0] as converged.
+    #[test]
+    fn zero_rhs_with_a_guess_and_damping_solves_the_damped_problem() {
+        let a = CooMatrix::from_triplets(
+            Shape2D::new(3, 2),
+            vec![2.0, 3.0, 1.0, 1.0],
+            vec![0, 1, 2, 2],
+            vec![0, 1, 0, 1],
+            true,
+        )
+        .expect("coo")
+        .to_csr()
+        .expect("csr");
+        let options = IterativeSolveOptions {
+            tol: 1e-12,
+            ..IterativeSolveOptions::default()
+        };
+        let r = lsqr_regularized(&a, &[0.0; 3], 0.5, Some(&[1.0, -2.0]), options).expect("lsqr");
+        println!(
+            "zero rhs, x0, damp 0.5: x={:?} converged={}",
+            r.solution, r.converged
+        );
+        assert!(
+            (r.solution[0] - 0.057_988_165_680_473_37).abs() < 1e-10,
+            "{:?}",
+            r.solution
+        );
+        assert!(
+            (r.solution[1] + 0.054_437_869_822_485_21).abs() < 1e-10,
+            "{:?}",
+            r.solution
+        );
+        // Without a guess the zero answer is still exact.
+        let cold = lsqr_regularized(&a, &[0.0; 3], 0.5, None, options).expect("lsqr");
+        assert_eq!(cold.solution, vec![0.0, 0.0]);
+        assert!(cold.converged);
+    }
+
+    /// frankenscipy-szq1n.7: a guess that already minimises (Aᵀ(b − A·x0) = 0) must come back
+    /// as the answer. It used to return zeros under converged = true. SciPy:
+    /// lsqr([[1],[1]], [1,3], x0=[2]) -> x = [2], istop 0, r1norm 1.4142 (relative 0.4472).
+    #[test]
+    fn a_guess_that_already_minimises_is_returned_not_zeroed() {
+        let a = CsrMatrix::from_components(
+            Shape2D::new(2, 1),
+            vec![1.0, 1.0],
+            vec![0, 0],
+            vec![0, 1, 2],
+            false,
+        )
+        .expect("csr");
+        let b = [1.0, 3.0];
+        let r = lsqr_regularized(&a, &b, 0.0, Some(&[2.0]), opts()).expect("lsqr");
+        println!(
+            "lsqr at the minimiser: x={:?} residual={} converged={}",
+            r.solution, r.residual_norm, r.converged
+        );
+        assert_eq!(r.solution, vec![2.0]);
+        assert!((r.residual_norm - 0.447_213_595_499_957_9).abs() < 1e-12);
+        assert!(r.converged);
+        let cold = lsqr_regularized(&a, &b, 0.0, None, opts()).expect("lsqr");
+        assert!(
+            (cold.solution[0] - 2.0).abs() < 1e-8,
+            "cold start solves it too"
+        );
+    }
 }
 
 /// Transpose-Free Quasi-Minimal Residual -- `scipy.sparse.linalg.tfqmr`.
@@ -34409,6 +34884,7 @@ pub fn tfqmr(
     if rhs_is_zero(b_norm) {
         return Ok(IterativeSolveResult {
             solution: vec![0.0; n],
+            // status: ‖b‖ = 0 (rhs_is_zero), so x = 0 solves exactly
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -34444,6 +34920,7 @@ pub fn tfqmr(
     if r0_norm == 0.0 {
         return Ok(IterativeSolveResult {
             solution: x,
+            // status: initial guess already solves: ‖b − Ax0‖ = 0
             converged: true,
             iterations: 0,
             residual_norm: 0.0,
@@ -34498,6 +34975,7 @@ pub fn tfqmr(
             let residual_norm = vec_norm_diff(&ax, b) / b_norm;
             return Ok(IterativeSolveResult {
                 solution: x,
+                // status: SciPy's QMR residual bound τ·√(k+1) < atol = tol·‖r0‖
                 converged: true,
                 iterations: iteration + 1,
                 residual_norm,
