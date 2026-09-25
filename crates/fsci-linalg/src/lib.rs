@@ -30272,9 +30272,10 @@ mod tests {
             assert!(
                 true_error <= bound,
                 "bound {bound:e} < true error {true_error:e}: A = {ai:?}, b = {bi:?}, \
-                 x = {:?}, exact = {nums:?}/{den}, omega = {:e}",
+                 x = {:?}, exact = {nums:?}/{den}, omega = {:e}, rcond = {:e}",
                 result.x,
-                accuracy.componentwise_backward_error
+                accuracy.componentwise_backward_error,
+                certificate.rcond_estimate
             );
             worst_ratio = worst_ratio.max(true_error / bound);
             // The naive arm: signed A⁻¹ times r, no rounding term.
@@ -30467,6 +30468,94 @@ mod tests {
                 verify_solve_certificate(matrix, &[3.0, 5.0, 7.0], &result.x, &certificate);
             assert!(report.verified, "{}", report.reason);
         }
+    }
+
+    /// frankenscipy-7tb8d.6: TwoSum and TwoProd are exact, checked in i128 on inputs scaled
+    /// to integers, and the certificate's residual is the correctly rounded exact residual
+    /// where plain f64 arithmetic is not. Each must-hit arm has to fire, or the check could
+    /// not tell an exact kernel from a rounding one.
+    #[test]
+    fn compensated_residual_is_exact_where_plain_arithmetic_is_not() {
+        let mut rng = TestRng(0x7B8D_6000_0000_2202);
+        let pow2 = |k: i32| 2.0_f64.powi(k);
+        let mantissa = |rng: &mut TestRng| rng.int(-(1 << 52) + 1, (1 << 52) - 1);
+        let (mut sum_rounded, mut prod_rounded) = (0, 0);
+        for _ in 0..20_000 {
+            // a + b = s + e, everything a multiple of 2^-60.
+            let (ia, ib, k) = (
+                mantissa(&mut rng),
+                mantissa(&mut rng),
+                rng.int(0, 60) as i32,
+            );
+            let (a, b) = (ia as f64, ib as f64 * pow2(-k));
+            let (s, e) = two_sum(a, b);
+            let scaled = |v: f64| (v * pow2(60)) as i128;
+            assert_eq!(
+                scaled(s) + scaled(e),
+                (i128::from(ia) << 60) + (i128::from(ib) << (60 - k)),
+                "two_sum({a:e}, {b:e}) = ({s:e}, {e:e})"
+            );
+            sum_rounded += usize::from(e != 0.0);
+
+            // a · b = p + e, everything a multiple of 2^-(ka + kb).
+            let (ka, kb) = (rng.int(0, 30) as i32, rng.int(0, 30) as i32);
+            let (a, b) = (ia as f64 * pow2(-ka), ib as f64 * pow2(-kb));
+            let (p, e) = two_prod(a, b);
+            let scaled = |v: f64| (v * pow2(ka + kb)) as i128;
+            assert_eq!(
+                scaled(p) + scaled(e),
+                i128::from(ia) * i128::from(ib),
+                "two_prod({a:e}, {b:e}) = ({p:e}, {e:e})"
+            );
+            prod_rounded += usize::from(e != 0.0);
+        }
+        assert!(sum_rounded > 0 && prod_rounded > 0);
+
+        // Rows whose exact residual is the tiny rounding error of b = fl(A·x): the compensated
+        // residual must equal it rounded once, bit for bit; plain arithmetic must miss.
+        let (mut plain_wrong, mut rows) = (0, 0);
+        for _ in 0..500 {
+            let n = rng.int(2, 8) as usize;
+            let entry = |rng: &mut TestRng| rng.int(-(1 << 30), 1 << 30);
+            let ai: Vec<Vec<i64>> = (0..n)
+                .map(|_| (0..n).map(|_| entry(&mut rng)).collect())
+                .collect();
+            let xi: Vec<i64> = (0..n).map(|_| entry(&mut rng)).collect();
+            let products: Vec<i128> = ai
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .zip(&xi)
+                        .map(|(&v, &x)| i128::from(v) * i128::from(x))
+                        .sum()
+                })
+                .collect();
+            let a: Vec<Vec<f64>> = ai
+                .iter()
+                .map(|row| row.iter().map(|&v| v as f64).collect())
+                .collect();
+            let x: Vec<f64> = xi.iter().map(|&v| v as f64).collect();
+            let b: Vec<f64> = products.iter().map(|&p| p as f64).collect();
+            let (r, _) = residual_and_magnitude(&a, &x, &b);
+            for (i, row) in a.iter().enumerate() {
+                let exact = b[i] as i128 - products[i];
+                assert_eq!(
+                    r[i].to_bits(),
+                    (exact as f64).to_bits(),
+                    "row {row:?}, x = {x:?}, b = {}: residual {} vs exact {exact}",
+                    b[i],
+                    r[i]
+                );
+                let plain = row.iter().zip(&x).fold(b[i], |acc, (v, xj)| acc - v * xj);
+                plain_wrong += usize::from(plain.to_bits() != (exact as f64).to_bits());
+                rows += 1;
+            }
+        }
+        eprintln!("compensated residual: {rows} rows exact; plain f64 wrong on {plain_wrong}");
+        assert!(
+            plain_wrong > rows / 2,
+            "plain arithmetic was wrong on only {plain_wrong} of {rows}"
+        );
     }
 
     #[test]
