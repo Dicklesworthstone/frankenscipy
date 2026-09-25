@@ -13,7 +13,9 @@
 //! boundaries.
 
 pub use fsci_runtime::SyncSharedAuditLedger;
-use fsci_runtime::{AuditAction, AuditEvent, AuditLedger, casp_now_unix_ms};
+use fsci_runtime::{AuditAction, AuditEvent, AuditLedger, Fingerprinter, casp_now_unix_ms};
+
+use crate::types::SpecialTensor;
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -37,20 +39,45 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
+/// Feed a [`SpecialTensor`] to an audit fingerprint in full: its variant name, then every
+/// value (`Empty` has none), so two tensors share a fingerprint only if they are the same
+/// variant with the same values bit for bit (frankenscipy-3cu8u.1).
+pub(crate) fn fingerprint_tensor(fingerprinter: &mut Fingerprinter, tensor: &SpecialTensor) {
+    match tensor {
+        SpecialTensor::Empty => {
+            fingerprinter.str("Empty");
+        }
+        SpecialTensor::RealScalar(value) => {
+            fingerprinter.str("RealScalar").f64(*value);
+        }
+        SpecialTensor::ComplexScalar(value) => {
+            fingerprinter
+                .str("ComplexScalar")
+                .complex(&[(value.re, value.im)]);
+        }
+        SpecialTensor::RealVec(values) => {
+            fingerprinter.str("RealVec").f64s(values);
+        }
+        SpecialTensor::ComplexVec(values) => {
+            let pairs: Vec<(f64, f64)> = values.iter().map(|z| (z.re, z.im)).collect();
+            fingerprinter.str("ComplexVec").complex(&pairs);
+        }
+    }
+}
+
 /// Record a fail-closed audit event when Hardened mode rejects input.
 ///
-/// `input_bytes` is hashed into the event fingerprint; callers with
-/// numeric inputs should pass a byte representation that uniquely
-/// identifies the offending value (e.g. `x.to_le_bytes()` for an f64).
+/// `fingerprint` is the call's [`Fingerprinter`] digest over every input and mode
+/// (frankenscipy-3cu8u.1); it is stored as is.
 pub fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -60,16 +87,17 @@ pub fn record_fail_closed(
 }
 
 /// Record a bounded-recovery audit event when Hardened mode falls
-/// back to a degraded but safe computation path.
+/// back to a degraded but safe computation path. `fingerprint` is the call's
+/// [`Fingerprinter`] digest.
 pub fn record_bounded_recovery(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
@@ -106,8 +134,8 @@ mod tests {
             "ledger must be poisoned after panic"
         );
 
-        record_fail_closed(&ledger, b"x=NaN", "non_finite_input", "rejected");
-        record_bounded_recovery(&ledger, b"x=Inf", "clamp_to_max", "recovered");
+        record_fail_closed(&ledger, "x=NaN", "non_finite_input", "rejected");
+        record_bounded_recovery(&ledger, "x=Inf", "clamp_to_max", "recovered");
 
         let g = ledger.lock().expect("ledger should recover after poison");
         assert_eq!(g.len(), 2, "both audit events must be recorded");

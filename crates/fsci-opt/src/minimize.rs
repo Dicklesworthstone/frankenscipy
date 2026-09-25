@@ -13,7 +13,9 @@ use crate::types::{
     HesspFunc, MinimizeCallback, MinimizeOptions, OptError, OptimizeMethod, OptimizeResult,
     OptimizeTraceEntry,
 };
-use fsci_runtime::{OptSolverAction, OptSolverEvidenceEntry, OptSolverPortfolio, RuntimeMode};
+use fsci_runtime::{
+    Fingerprinter, OptSolverAction, OptSolverEvidenceEntry, OptSolverPortfolio, RuntimeMode,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OptCaspProblem {
@@ -431,15 +433,11 @@ pub fn minimize_with_audit<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
-    let input_fingerprint = format!(
-        "method={:?}; mode={:?}; x0={:?}; maxiter={:?}; maxfev={:?}",
-        options.method, options.mode, x0, options.maxiter, options.maxfev
-    );
     let result = minimize(fun, x0, options);
     match &result {
         Err(error) => crate::audit::record_fail_closed(
             ledger,
-            input_fingerprint.as_bytes(),
+            &minimize_audit_fingerprint(x0, &options),
             &format!("minimize::{error:?}"),
             "rejected",
         ),
@@ -454,7 +452,7 @@ where
         {
             crate::audit::record_fail_closed(
                 ledger,
-                input_fingerprint.as_bytes(),
+                &minimize_audit_fingerprint(x0, &options),
                 &format!("minimize::{:?}", output.status),
                 "rejected",
             );
@@ -462,6 +460,66 @@ where
         _ => {}
     }
     result
+}
+
+/// The audit fingerprint of a `minimize` call (frankenscipy-3cu8u.1): `x0`, then every field of
+/// `options` in declaration order — `Option<f64>`/`Option<usize>`/`Option<u64>` as a presence
+/// flag then the value, enums as their `Debug` rendering, `bounds` as presence, count and each
+/// `(lower, upper)` pair, `constraints` as count and each one's type and `jac` presence.
+///
+/// The objective and the function-valued options (`callback`, `gradient`, `hess`, `hessp`, a
+/// constraint's `fun`/`jac`) are code, not data: a function pointer's address is neither stable
+/// across processes nor unique, so only their presence is fed. It used to be a `Debug` string of
+/// `method`, `mode`, `x0`, `maxiter` and `maxfev` only, so calls differing in `tol`, `bounds`,
+/// `seed` or any other option shared a fingerprint, as did `x0`s differing only in a NaN payload.
+fn minimize_audit_fingerprint(x0: &[f64], options: &MinimizeOptions<'_>) -> String {
+    fn optional_f64(fingerprinter: &mut Fingerprinter, value: Option<f64>) {
+        fingerprinter.bool(value.is_some());
+        if let Some(value) = value {
+            fingerprinter.f64(value);
+        }
+    }
+    fn optional_u64(fingerprinter: &mut Fingerprinter, value: Option<u64>) {
+        fingerprinter.bool(value.is_some());
+        if let Some(value) = value {
+            fingerprinter.u64(value);
+        }
+    }
+
+    let mut fingerprinter = Fingerprinter::new("fsci_opt::minimize");
+    fingerprinter.f64s(x0).str(&format!("{:?}", options.method));
+    optional_f64(&mut fingerprinter, options.tol);
+    optional_u64(&mut fingerprinter, options.maxiter.map(|v| v as u64));
+    optional_u64(&mut fingerprinter, options.maxfev.map(|v| v as u64));
+    optional_f64(&mut fingerprinter, options.gradient_eps);
+    fingerprinter
+        .bool(options.callback.is_some())
+        .bool(options.gradient.is_some())
+        .bool(options.hess.is_some())
+        .bool(options.hessp.is_some())
+        .bool(options.bounds.is_some());
+    if let Some(bounds) = options.bounds {
+        fingerprinter.usize(bounds.len());
+        for &(lower, upper) in bounds {
+            optional_f64(&mut fingerprinter, lower);
+            optional_f64(&mut fingerprinter, upper);
+        }
+    }
+    fingerprinter.usize(options.constraints.len());
+    for constraint in options.constraints {
+        fingerprinter
+            .str(&format!("{:?}", constraint.kind))
+            .bool(constraint.jac.is_some());
+    }
+    fingerprinter
+        .bool(options.gradient_available)
+        .bool(options.fixture_id.is_some());
+    if let Some(fixture_id) = options.fixture_id {
+        fingerprinter.str(fixture_id);
+    }
+    optional_u64(&mut fingerprinter, options.seed);
+    fingerprinter.str(&format!("{:?}", options.mode));
+    fingerprinter.finish()
 }
 
 /// The convergence tolerance a caller actually asked for.
@@ -6198,6 +6256,48 @@ mod tests {
             guard.entries()[0].action,
             fsci_runtime::AuditAction::FailClosed { .. }
         ));
+    }
+
+    /// frankenscipy-3cu8u.1: the audit fingerprint covers `x0` and every option. It used to be
+    /// a `Debug` string of `method`, `mode`, `x0`, `maxiter` and `maxfev`, so calls differing
+    /// only in `tol` or `seed`, or in the payload of a NaN in `x0`, shared one fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        let fingerprint_of = |x0: &[f64], options: MinimizeOptions<'_>| {
+            let ledger = crate::audit::sync_audit_ledger();
+            let _ = super::minimize_with_audit(|_| f64::NAN, x0, options, &ledger);
+            let guard = ledger.lock().expect("audit ledger lock");
+            assert_eq!(guard.len(), 1, "one rejection, one event");
+            guard.entries()[0].input_fingerprint.clone()
+        };
+        let options = MinimizeOptions {
+            method: Some(OptimizeMethod::Bfgs),
+            mode: RuntimeMode::Hardened,
+            ..MinimizeOptions::default()
+        };
+
+        // Hardened NaN objective: `Ok` with `NanEncountered`.
+        let base = fingerprint_of(&[0.0, 1.0], options);
+        assert!(base.starts_with("blake3:"), "{base}");
+        assert_eq!(base, fingerprint_of(&[0.0, 1.0], options));
+        assert_ne!(base, fingerprint_of(&[0.0, 2.0], options));
+        let tighter = MinimizeOptions {
+            tol: Some(1.0e-3),
+            ..options
+        };
+        assert_ne!(base, fingerprint_of(&[0.0, 1.0], tighter));
+        let seeded = MinimizeOptions {
+            seed: Some(7),
+            ..options
+        };
+        assert_ne!(base, fingerprint_of(&[0.0, 1.0], seeded));
+
+        // Non-finite `x0`: `Err(NonFiniteInput)`; both render as `NaN` under `Debug`.
+        let quiet = fingerprint_of(&[f64::NAN], options);
+        assert_eq!(quiet, fingerprint_of(&[f64::NAN], options));
+        let payload = f64::from_bits(f64::NAN.to_bits() ^ 1);
+        assert!(payload.is_nan());
+        assert_ne!(quiet, fingerprint_of(&[payload], options));
     }
 
     #[test]

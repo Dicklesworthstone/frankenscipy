@@ -12,10 +12,10 @@
 
 use std::collections::BTreeMap;
 
-use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
+use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -33,16 +33,17 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
-/// Record a fail-closed audit event when Hardened mode rejects input.
+/// Record a fail-closed audit event when Hardened mode rejects input. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -51,16 +52,17 @@ pub fn record_fail_closed(
     lock_or_recover(ledger).record(event);
 }
 
-/// Record a bounded-recovery audit event when Hardened mode falls back.
+/// Record a bounded-recovery audit event when Hardened mode falls back. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_bounded_recovery(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
@@ -3121,6 +3123,14 @@ impl KDTree {
         mode: RuntimeMode,
         audit_ledger: Option<&SyncSharedAuditLedger>,
     ) -> Result<Self, SpatialError> {
+        // Audit fingerprint over the whole request: every point (rows), then `mode` (Debug).
+        // Computed only when an event is recorded.
+        let fingerprint = || {
+            Fingerprinter::new("fsci_spatial::KDTree::new_with_mode")
+                .rows(data)
+                .str(&format!("{mode:?}"))
+                .finish()
+        };
         if matches!(mode, RuntimeMode::Hardened)
             && (data.len() > HARDENED_MAX_DIM
                 || (!data.is_empty() && data[0].len() > HARDENED_MAX_DIM))
@@ -3128,7 +3138,7 @@ impl KDTree {
             if let Some(ledger) = audit_ledger {
                 record_fail_closed(
                     ledger,
-                    &data.len().to_le_bytes(),
+                    &fingerprint(),
                     "dimension exceeds hardened limit",
                     "rejected",
                 );
@@ -3156,7 +3166,7 @@ impl KDTree {
             if let (RuntimeMode::Hardened, Some(ledger)) = (mode, audit_ledger) {
                 record_fail_closed(
                     ledger,
-                    b"non-finite-points",
+                    &fingerprint(),
                     "points must be finite in hardened mode",
                     "rejected",
                 );
@@ -14895,5 +14905,43 @@ mod toggle_ab_mahalanobis_assembly {
             guard.entries()[0].action,
             crate::AuditAction::FailClosed { .. }
         ));
+    }
+
+    /// frankenscipy-3cu8u.1: the KDTree audit fingerprint covers every point. It used to be a
+    /// constant label on the non-finite path and the point count on the dimension-cap path,
+    /// so each pair below shared one fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        let fingerprint_of = |data: &[Vec<f64>]| {
+            let ledger = crate::sync_audit_ledger();
+            let result =
+                crate::KDTree::new_with_mode(data, crate::RuntimeMode::Hardened, Some(&ledger));
+            assert!(result.is_err());
+            let guard = ledger.lock().unwrap();
+            assert_eq!(guard.entries().len(), 1);
+            assert!(matches!(
+                guard.entries()[0].action,
+                crate::AuditAction::FailClosed { .. }
+            ));
+            guard.entries()[0].input_fingerprint.clone()
+        };
+
+        // Non-finite path: same shape, different values.
+        let nan = vec![vec![1.0, 2.0], vec![3.0, f64::NAN]];
+        let base = fingerprint_of(&nan);
+        assert!(base.starts_with("blake3:"));
+        assert_eq!(base, fingerprint_of(&nan));
+        assert_ne!(base, fingerprint_of(&[vec![1.0, 2.0], vec![4.0, f64::NAN]]));
+        // Same flattened values, different shape (two 2-D points vs one 4-D point).
+        assert_ne!(base, fingerprint_of(&[vec![1.0, 2.0, 3.0, f64::NAN]]));
+
+        // Dimension-cap path (one point wider than the limit): same count, different tail.
+        let wide = vec![vec![0.0; crate::HARDENED_MAX_DIM + 1]];
+        let mut wide_tail = wide.clone();
+        *wide_tail[0].last_mut().unwrap() = 1.0;
+        let capped = fingerprint_of(&wide);
+        assert!(capped.starts_with("blake3:"));
+        assert_eq!(capped, fingerprint_of(&wide));
+        assert_ne!(capped, fingerprint_of(&wide_tail));
     }
 }

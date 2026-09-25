@@ -1,6 +1,7 @@
-use crate::backend::ArrayApiBackend;
+use crate::backend::{ArrayApiArray, ArrayApiBackend};
 use crate::error::{ArrayApiError, ArrayApiErrorKind, ArrayApiResult};
 use crate::types::{IndexExpr, Shape};
+use fsci_runtime::Fingerprinter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexingMode {
@@ -41,12 +42,14 @@ pub fn getitem_with_audit<B: ArrayApiBackend>(
 ) -> ArrayApiResult<B::Array> {
     let result = getitem(backend, array, request);
     if let Err(err) = &result {
-        crate::audit::record_array_api_error(
-            ledger,
-            "getitem",
-            format!("shape={:?}; request={request:?}", backend.shape_of(array)).as_bytes(),
-            err.kind,
-        );
+        // frankenscipy-3cu8u.1: the backend configuration, the whole array, then the indexing
+        // mode and index expression. It used to carry the array's shape, not its values.
+        let mut fingerprinter = Fingerprinter::new("fsci_arrayapi::getitem");
+        backend.fingerprint_config(&mut fingerprinter);
+        array.fingerprint_into(&mut fingerprinter);
+        fingerprinter.str(&format!("{:?}", request.mode));
+        crate::audit::fingerprint_index(&mut fingerprinter, &request.index);
+        crate::audit::record_array_api_error(ledger, "getitem", &fingerprinter.finish(), err.kind);
     }
     result
 }
@@ -67,12 +70,13 @@ pub fn reshape_with_audit<B: ArrayApiBackend>(
 ) -> ArrayApiResult<B::Array> {
     let result = reshape(backend, array, new_shape);
     if let Err(err) = &result {
-        crate::audit::record_array_api_error(
-            ledger,
-            "reshape",
-            format!("from={:?}; to={new_shape:?}", backend.shape_of(array)).as_bytes(),
-            err.kind,
-        );
+        // frankenscipy-3cu8u.1: the backend configuration, the whole array, then the target
+        // shape. It used to carry the two shapes, not the array's values.
+        let mut fingerprinter = Fingerprinter::new("fsci_arrayapi::reshape");
+        backend.fingerprint_config(&mut fingerprinter);
+        array.fingerprint_into(&mut fingerprinter);
+        fingerprinter.shape(&new_shape.dims);
+        crate::audit::record_array_api_error(ledger, "reshape", &fingerprinter.finish(), err.kind);
     }
     result
 }

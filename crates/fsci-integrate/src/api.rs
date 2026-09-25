@@ -2,15 +2,18 @@
 
 use fsci_opt::root::brentq;
 use fsci_opt::types::RootOptions;
-use fsci_runtime::{OdeSolverAction, OdeSolverEvidenceEntry, OdeSolverPortfolio, RuntimeMode};
+use fsci_runtime::{
+    Fingerprinter, OdeSolverAction, OdeSolverEvidenceEntry, OdeSolverPortfolio, RuntimeMode,
+};
 
 use crate::IntegrateValidationError;
 use crate::bdf::{BdfSolver, BdfSolverConfig};
 use crate::rk::{RK23_TABLEAU, RK45_TABLEAU, RkSolver, RkSolverConfig};
 use crate::solver::{OdeSolver, OdeSolverState, StepFailure, StepOutcome};
 use crate::validation::{
-    SyncSharedAuditLedger, ToleranceValue, audit_fingerprint, record_fail_closed,
-    validate_first_step_with_audit, validate_max_step_with_audit, validate_tol_with_audit,
+    AuditScope, SyncSharedAuditLedger, ToleranceValue, fail_closed, fingerprint_optional_f64,
+    fingerprint_tolerance, validate_first_step_scoped, validate_max_step_scoped,
+    validate_tol_scoped,
 };
 
 pub type EventFn = fn(f64, &[f64]) -> f64;
@@ -142,18 +145,12 @@ fn validate_t_eval_with_audit(
     t_eval: &[f64],
     t0: f64,
     tf: f64,
-    audit_ledger: Option<&SyncSharedAuditLedger>,
+    audit: Option<&AuditScope<'_>>,
 ) -> Result<(), IntegrateValidationError> {
-    let fingerprint = audit_ledger.map_or_else(Vec::new, |_| {
-        audit_fingerprint(
-            "validate_t_eval",
-            format!("t_eval={t_eval:?};t0={t0};tf={tf}"),
-        )
-    });
     let t_min = t0.min(tf);
     let t_max = t0.max(tf);
     if t_eval.iter().any(|&te| te < t_min || te > t_max) {
-        record_fail_closed(audit_ledger, &fingerprint, "t_eval_out_of_span", "rejected");
+        fail_closed(audit, "t_eval_out_of_span", "rejected");
         return Err(IntegrateValidationError::TEvalOutOfSpan);
     }
 
@@ -163,7 +160,7 @@ fn validate_t_eval_with_audit(
         t_eval.windows(2).all(|window| window[1] < window[0])
     };
     if !is_sorted {
-        record_fail_closed(audit_ledger, &fingerprint, "t_eval_not_sorted", "rejected");
+        fail_closed(audit, "t_eval_not_sorted", "rejected");
         return Err(IntegrateValidationError::TEvalNotSorted);
     }
 
@@ -172,7 +169,7 @@ fn validate_t_eval_with_audit(
 
 fn validate_events_with_audit(
     events: Option<&[EventSpec]>,
-    audit_ledger: Option<&SyncSharedAuditLedger>,
+    audit: Option<&AuditScope<'_>>,
 ) -> Result<(), IntegrateValidationError> {
     let Some(events) = events else {
         return Ok(());
@@ -180,34 +177,58 @@ fn validate_events_with_audit(
 
     for (index, event) in events.iter().enumerate() {
         if !event.direction.is_finite() {
-            let fingerprint = audit_fingerprint(
-                "validate_events",
-                format!("event_index={index};direction={}", event.direction),
-            );
-            record_fail_closed(
-                audit_ledger,
-                &fingerprint,
-                "event_direction_must_be_finite",
-                "rejected",
-            );
+            fail_closed(audit, "event_direction_must_be_finite", "rejected");
             return Err(IntegrateValidationError::NonFiniteEventDirection { index });
         }
         if event.max_events == Some(0) {
-            let fingerprint = audit_fingerprint(
-                "validate_events",
-                format!("event_index={index};max_events=0"),
-            );
-            record_fail_closed(
-                audit_ledger,
-                &fingerprint,
-                "event_max_events_must_be_positive",
-                "rejected",
-            );
+            fail_closed(audit, "event_max_events_must_be_positive", "rejected");
             return Err(IntegrateValidationError::EventMaxEventsMustBePositive { index });
         }
     }
 
     Ok(())
+}
+
+/// The audit fingerprint of one `solve_ivp` request (frankenscipy-3cu8u.1): a
+/// [`Fingerprinter`] for `fsci_integrate::solve_ivp` over the [`SolveIvpOptions`] fields in
+/// declaration order — `t_span` (two `f64`), `y0` (`f64s`), `method` (`Debug`), `t_eval`
+/// (presence flag, then `f64s`), `dense_output`, `events` (presence flag, then the count and,
+/// per event, `direction` then `max_events` as presence flag and value), `rtol`, `atol`
+/// (variant name, then value or values), `first_step` (presence flag, then value), `max_step`
+/// and `mode` (`Debug`). The right-hand side and the event functions are code, not data, and
+/// are not part of it.
+fn solve_ivp_fingerprint(options: &SolveIvpOptions<'_>) -> String {
+    let mut fingerprinter = Fingerprinter::new("fsci_integrate::solve_ivp");
+    fingerprinter
+        .f64(options.t_span.0)
+        .f64(options.t_span.1)
+        .f64s(options.y0)
+        .str(&format!("{:?}", options.method))
+        .bool(options.t_eval.is_some());
+    if let Some(t_eval) = options.t_eval {
+        fingerprinter.f64s(t_eval);
+    }
+    fingerprinter
+        .bool(options.dense_output)
+        .bool(options.events.is_some());
+    if let Some(events) = &options.events {
+        fingerprinter.usize(events.len());
+        for event in events {
+            fingerprinter
+                .f64(event.direction)
+                .bool(event.max_events.is_some());
+            if let Some(max_events) = event.max_events {
+                fingerprinter.usize(max_events);
+            }
+        }
+    }
+    fingerprinter.f64(options.rtol);
+    fingerprint_tolerance(&mut fingerprinter, &options.atol);
+    fingerprint_optional_f64(&mut fingerprinter, options.first_step);
+    fingerprinter
+        .f64(options.max_step)
+        .str(&format!("{:?}", options.mode));
+    fingerprinter.finish()
 }
 
 fn validate_event_value(index: usize, value: f64) -> Result<f64, IntegrateValidationError> {
@@ -926,7 +947,9 @@ pub fn solve_ivp_with_audit<F>(
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
 {
-    solve_ivp_impl(fun, options, Some(audit_ledger))
+    let fingerprint_of = || solve_ivp_fingerprint(options);
+    let audit = AuditScope::new(audit_ledger, &fingerprint_of);
+    solve_ivp_impl(fun, options, Some(&audit))
 }
 
 impl From<OdeSolverAction> for SolverKind {
@@ -1079,10 +1102,12 @@ where
     out
 }
 
+/// `solve_ivp`; every audit event, including those of the validators it runs, is recorded
+/// under `audit`, whose fingerprint is [`solve_ivp_fingerprint`] of `options`.
 fn solve_ivp_impl<F>(
     fun: &mut F,
     options: &SolveIvpOptions<'_>,
-    audit_ledger: Option<&SyncSharedAuditLedger>,
+    audit: Option<&AuditScope<'_>>,
 ) -> Result<SolveIvpResult, IntegrateValidationError>
 where
     F: FnMut(f64, &[f64]) -> Vec<f64>,
@@ -1090,49 +1115,29 @@ where
     let (t0, tf) = options.t_span;
     let n = options.y0.len();
     if n == 0 {
-        let fingerprint = audit_fingerprint(
-            "solve_ivp",
-            format!("reason=empty_y0;t_span=({t0},{tf});mode={:?}", options.mode),
-        );
-        record_fail_closed(audit_ledger, &fingerprint, "empty_y0", "rejected");
+        fail_closed(audit, "empty_y0", "rejected");
         return Err(IntegrateValidationError::EmptyY0);
     }
     if !t0.is_finite() || !tf.is_finite() {
-        let fingerprint = audit_fingerprint(
-            "solve_ivp",
-            format!(
-                "reason=non_finite_span;t_span=({t0},{tf});mode={:?}",
-                options.mode
-            ),
-        );
-        record_fail_closed(audit_ledger, &fingerprint, "non_finite_span", "rejected");
+        fail_closed(audit, "non_finite_span", "rejected");
         return Err(IntegrateValidationError::NonFiniteSpan);
     }
     if options.y0.iter().any(|v| !v.is_finite()) {
-        let fingerprint = audit_ledger.map_or_else(Vec::new, |_| {
-            audit_fingerprint(
-                "solve_ivp",
-                format!(
-                    "reason=non_finite_y0;y0={:?};mode={:?}",
-                    options.y0, options.mode
-                ),
-            )
-        });
-        record_fail_closed(audit_ledger, &fingerprint, "non_finite_y0", "rejected");
+        fail_closed(audit, "non_finite_y0", "rejected");
         return Err(IntegrateValidationError::NonFiniteY0);
     }
 
-    let max_step = validate_max_step_with_audit(options.max_step, audit_ledger)?;
+    let max_step = validate_max_step_scoped(options.max_step, audit)?;
     let first_step = options
         .first_step
-        .map(|value| validate_first_step_with_audit(value, t0, tf, audit_ledger))
+        .map(|value| validate_first_step_scoped(value, t0, tf, audit))
         .transpose()?;
-    let validated_tol = validate_tol_with_audit(
+    let validated_tol = validate_tol_scoped(
         ToleranceValue::Scalar(options.rtol),
         options.atol.clone(),
         n,
         options.mode,
-        audit_ledger,
+        audit,
     )?;
     let rtol = validated_tol
         .rtol
@@ -1144,7 +1149,7 @@ where
     resolved_options.atol = atol.clone();
     resolved_options.first_step = first_step;
     resolved_options.max_step = max_step;
-    validate_events_with_audit(resolved_options.events.as_deref(), audit_ledger)?;
+    validate_events_with_audit(resolved_options.events.as_deref(), audit)?;
 
     // Validate the initial event values at (t0, y0) before constructing the solver, which evaluates
     // the RHS for initial step-size selection. This rejects a non-finite initial event value with
@@ -1157,7 +1162,7 @@ where
     }
 
     if let Some(t_eval) = resolved_options.t_eval {
-        validate_t_eval_with_audit(t_eval, t0, tf, audit_ledger)?;
+        validate_t_eval_with_audit(t_eval, t0, tf, audit)?;
     }
 
     match resolved_options.method {
@@ -1221,7 +1226,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsci_runtime::{AuditAction, AuditLedger};
+    use fsci_runtime::AuditAction;
 
     #[test]
     fn solve_ivp_harmonic_oscillator_system() {
@@ -1393,16 +1398,45 @@ mod tests {
         ));
     }
 
+    /// The documented `solve_ivp` audit fingerprint, rebuilt by hand for a request that sets
+    /// `t_span`, `y0`, `t_eval` and `mode` and leaves every other option at its default.
+    fn default_request_fingerprint(
+        t_span: (f64, f64),
+        y0: &[f64],
+        t_eval: Option<&[f64]>,
+        mode: &str,
+    ) -> String {
+        let mut fingerprinter = Fingerprinter::new("fsci_integrate::solve_ivp");
+        fingerprinter
+            .f64(t_span.0)
+            .f64(t_span.1)
+            .f64s(y0)
+            .str("Rk45")
+            .bool(t_eval.is_some());
+        if let Some(t_eval) = t_eval {
+            fingerprinter.f64s(t_eval);
+        }
+        fingerprinter
+            .bool(false) // dense_output
+            .bool(false) // events: None
+            .f64(1e-3) // rtol
+            .str("Scalar") // atol
+            .f64(1e-6)
+            .bool(false) // first_step: None
+            .f64(f64::INFINITY) // max_step
+            .str(mode);
+        fingerprinter.finish()
+    }
+
+    /// A t_eval rejection is fingerprinted by the whole solve_ivp request (frankenscipy-3cu8u.1).
+    /// It used to be a digest of `validate_t_eval`'s own `t_eval`, `t0` and `tf` alone.
     #[test]
     fn solve_ivp_with_audit_preserves_t_eval_fingerprint() {
         let t0 = 0.0;
         let tf = 1.0;
         let t_eval = [0.0, 0.5, 2.0];
-        let input_bytes = audit_fingerprint(
-            "validate_t_eval",
-            format!("t_eval={t_eval:?};t0={t0};tf={tf}"),
-        );
-        let expected_fingerprint = AuditLedger::fingerprint_bytes(&input_bytes);
+        let expected_fingerprint =
+            default_request_fingerprint((t0, tf), &[1.0], Some(&t_eval), "Strict");
         let audit_ledger = crate::sync_audit_ledger();
 
         let err = solve_ivp_with_audit(
@@ -1428,15 +1462,14 @@ mod tests {
         ));
     }
 
+    /// A non-finite y0 is fingerprinted by the whole request, `y0` bit for bit (`-0.0` and the
+    /// NaN payload included) (frankenscipy-3cu8u.1). It used to be a digest of a `Debug`
+    /// string of `y0` and `mode`, in which every NaN payload read `NaN`.
     #[test]
     fn solve_ivp_with_audit_preserves_non_finite_y0_fingerprint() {
         let y0 = [1.0, -0.0, f64::from_bits(0x7ff8_0000_0000_0042)];
         let mode = RuntimeMode::Strict;
-        let input_bytes = audit_fingerprint(
-            "solve_ivp",
-            format!("reason=non_finite_y0;y0={y0:?};mode={mode:?}"),
-        );
-        let expected_fingerprint = AuditLedger::fingerprint_bytes(&input_bytes);
+        let expected_fingerprint = default_request_fingerprint((0.0, 1.0), &y0, None, "Strict");
         let audit_ledger = crate::sync_audit_ledger();
         let mut rhs_calls = 0usize;
 
@@ -1529,6 +1562,138 @@ mod tests {
             ledger.entries()[0].action,
             AuditAction::FailClosed { ref reason } if reason == "rtol_must_not_be_nan"
         ));
+    }
+
+    /// frankenscipy-3cu8u.1: an audit event is fingerprinted by the whole request. The old
+    /// digests covered only the failing validator's own arguments (`max_step` alone, or
+    /// `t_eval` with the span) or a `Debug` string in which every NaN payload reads `NaN`, so
+    /// every pair compared below shared one fingerprint under them.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        // Run one audited request that is rejected before any step: its error, the fingerprint
+        // its events share, and how many events it recorded.
+        let rejected = |options: &SolveIvpOptions<'_>| {
+            let ledger = crate::sync_audit_ledger();
+            let err = solve_ivp_with_audit(&mut |_t, _y| Vec::new(), options, &ledger)
+                .expect_err("the request is rejected");
+            let guard = ledger.lock().expect("lock");
+            let entries = guard.entries();
+            assert!(!entries.is_empty(), "the rejection is recorded");
+            assert!(
+                entries
+                    .iter()
+                    .all(|entry| entry.input_fingerprint == entries[0].input_fingerprint),
+                "one call, one fingerprint"
+            );
+            (err, entries[0].input_fingerprint.clone(), entries.len())
+        };
+        let y0 = [1.0, 2.0];
+        let other_y0 = [1.0, 3.0];
+
+        // max_step = NaN: the old digest was `max_step` alone.
+        let nan_max_step = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &y0,
+            max_step: f64::NAN,
+            ..SolveIvpOptions::default()
+        };
+        let (err, fingerprint, _) = rejected(&nan_max_step);
+        assert_eq!(err, IntegrateValidationError::NonFiniteMaxStep);
+        assert!(fingerprint.starts_with("blake3:"));
+        assert_eq!(fingerprint, rejected(&nan_max_step).1);
+        let changed_y0 = SolveIvpOptions {
+            y0: &other_y0,
+            ..nan_max_step.clone()
+        };
+        assert_ne!(fingerprint, rejected(&changed_y0).1);
+        // The standalone validator is a different routine with the same argument.
+        let ledger = crate::sync_audit_ledger();
+        assert!(crate::validate_max_step_with_audit(f64::NAN, Some(&ledger)).is_err());
+        let standalone = ledger.lock().expect("lock").entries()[0]
+            .input_fingerprint
+            .clone();
+        assert_ne!(fingerprint, standalone);
+
+        // t_eval out of span: the old digest was `t_eval`, `t0` and `tf`.
+        let t_eval = [0.0, 2.0];
+        let out_of_span = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &y0,
+            t_eval: Some(&t_eval),
+            ..SolveIvpOptions::default()
+        };
+        let (err, fingerprint, _) = rejected(&out_of_span);
+        assert_eq!(err, IntegrateValidationError::TEvalOutOfSpan);
+        let tighter_rtol = SolveIvpOptions {
+            rtol: 1e-6,
+            ..out_of_span.clone()
+        };
+        assert_ne!(fingerprint, rejected(&tighter_rtol).1);
+        let bdf = SolveIvpOptions {
+            method: SolverKind::Bdf,
+            ..out_of_span.clone()
+        };
+        assert_ne!(fingerprint, rejected(&bdf).1);
+
+        // Non-finite y0 differing only in the NaN payload: the old digest read `NaN` for both.
+        let quiet_nan = [f64::NAN, 1.0];
+        let other_nan = [f64::from_bits(f64::NAN.to_bits() ^ 1), 1.0];
+        let nan_y0 = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &quiet_nan,
+            ..SolveIvpOptions::default()
+        };
+        let other_nan_y0 = SolveIvpOptions {
+            y0: &other_nan,
+            ..nan_y0.clone()
+        };
+        let (err, fingerprint, _) = rejected(&nan_y0);
+        assert_eq!(err, IntegrateValidationError::NonFiniteY0);
+        assert_ne!(fingerprint, rejected(&other_nan_y0).1);
+
+        // Hardened: the rtol clamp and then the atol shape rejection, two events of one call.
+        let clamp_then_reject = SolveIvpOptions {
+            t_span: (0.0, 1.0),
+            y0: &y0,
+            rtol: 0.0,
+            atol: ToleranceValue::Vector(vec![1e-6]),
+            mode: RuntimeMode::Hardened,
+            ..SolveIvpOptions::default()
+        };
+        let (err, _, events) = rejected(&clamp_then_reject);
+        assert_eq!(
+            err,
+            IntegrateValidationError::AtolWrongShape {
+                expected: 2,
+                actual: 1
+            }
+        );
+        assert_eq!(events, 2, "bounded recovery, then fail-closed");
+
+        // The standalone validate_tol: NaN rtol differing only in the payload.
+        let validate_tol_fingerprint = |rtol: f64| {
+            let ledger = crate::sync_audit_ledger();
+            let err = crate::validate_tol_with_audit(
+                ToleranceValue::Scalar(rtol),
+                ToleranceValue::Scalar(1e-6),
+                1,
+                RuntimeMode::Strict,
+                Some(&ledger),
+            )
+            .expect_err("NaN rtol is rejected");
+            assert_eq!(err, IntegrateValidationError::NonFiniteRtol);
+            let guard = ledger.lock().expect("lock");
+            assert_eq!(guard.len(), 1);
+            guard.entries()[0].input_fingerprint.clone()
+        };
+        assert_eq!(
+            validate_tol_fingerprint(f64::NAN),
+            validate_tol_fingerprint(f64::NAN)
+        );
+        assert_ne!(
+            validate_tol_fingerprint(f64::NAN),
+            validate_tol_fingerprint(f64::from_bits(f64::NAN.to_bits() ^ 1))
+        );
     }
 
     #[test]

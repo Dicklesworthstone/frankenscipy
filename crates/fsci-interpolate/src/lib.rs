@@ -14,10 +14,10 @@
 //! - `CloughTocher2DInterpolator` — Smooth scattered 2D interpolation
 //! - `SmoothBivariateSpline` — Smooth bivariate approximation for scattered 2D data
 
-use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
+use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
 use std::collections::HashMap;
 
 /// Create a new shared audit ledger for synchronous contexts.
@@ -36,16 +36,17 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
-/// Record a fail-closed audit event when Hardened mode rejects input.
+/// Record a fail-closed audit event when Hardened mode rejects input. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -54,16 +55,17 @@ pub fn record_fail_closed(
     lock_or_recover(ledger).record(event);
 }
 
-/// Record a bounded-recovery audit event when Hardened mode falls back.
+/// Record a bounded-recovery audit event when Hardened mode falls back. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_bounded_recovery(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
@@ -155,6 +157,33 @@ impl Default for Interp1dOptions {
     }
 }
 
+/// The audit fingerprint of one `Interp1d::new_with_audit` request (frankenscipy-3cu8u.1):
+/// `x`, `y`, then the options in declaration order — `kind` and `mode` as Debug, `fill_value`
+/// as a presence flag then the value, `bounds_error`, and `spline_bc` as its variant name
+/// followed, for `Clamped`, by both derivatives as bits (Debug would drop a NaN payload).
+fn interp1d_audit_fingerprint(x: &[f64], y: &[f64], options: &Interp1dOptions) -> String {
+    let mut fingerprinter = Fingerprinter::new("fsci_interpolate::Interp1d::new_with_audit");
+    fingerprinter
+        .f64s(x)
+        .f64s(y)
+        .str(&format!("{:?}", options.kind))
+        .str(&format!("{:?}", options.mode))
+        .bool(options.fill_value.is_some());
+    if let Some(fill_value) = options.fill_value {
+        fingerprinter.f64(fill_value);
+    }
+    fingerprinter.bool(options.bounds_error);
+    match options.spline_bc {
+        SplineBc::Clamped(left, right) => {
+            fingerprinter.str("Clamped").f64(left).f64(right);
+        }
+        other => {
+            fingerprinter.str(&format!("{other:?}"));
+        }
+    }
+    fingerprinter.finish()
+}
+
 /// 1D interpolation function object.
 ///
 /// Matches `scipy.interpolate.interp1d(x, y, kind=...)`.
@@ -189,7 +218,7 @@ impl Interp1d {
                 if let Some(ledger) = audit_ledger {
                     record_fail_closed(
                         ledger,
-                        &x.len().to_le_bytes(),
+                        &interp1d_audit_fingerprint(x, y, &options),
                         "dimension exceeds hardened limit",
                         "rejected",
                     );
@@ -205,7 +234,7 @@ impl Interp1d {
                 if let Some(ledger) = audit_ledger {
                     record_fail_closed(
                         ledger,
-                        b"non-finite-y",
+                        &interp1d_audit_fingerprint(x, y, &options),
                         "non-finite y values in hardened mode",
                         "rejected",
                     );
@@ -16147,5 +16176,64 @@ mod rch_source_freshness_tests {
             guard.entries()[0].action,
             crate::AuditAction::FailClosed { .. }
         ));
+    }
+
+    /// frankenscipy-3cu8u.1: the Interp1d audit fingerprint covers `x`, `y` and every option.
+    /// It used to be a constant label on the non-finite-y path and `x.len()` on the
+    /// dimension-cap path, so each pair below shared one fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        let fingerprint_of = |x: &[f64], y: &[f64], options: crate::Interp1dOptions| {
+            let ledger = crate::sync_audit_ledger();
+            let result = crate::Interp1d::new_with_audit(x, y, options, Some(&ledger));
+            assert!(result.is_err());
+            let guard = ledger.lock().unwrap();
+            assert_eq!(guard.entries().len(), 1);
+            assert!(matches!(
+                guard.entries()[0].action,
+                crate::AuditAction::FailClosed { .. }
+            ));
+            guard.entries()[0].input_fingerprint.clone()
+        };
+        let hardened = crate::Interp1dOptions {
+            mode: crate::RuntimeMode::Hardened,
+            ..Default::default()
+        };
+
+        // Non-finite-y path: same lengths, different values.
+        let x = [1.0, 2.0, 3.0];
+        let y = [1.0, f64::NAN, 3.0];
+        let base = fingerprint_of(&x, &y, hardened);
+        assert!(base.starts_with("blake3:"));
+        assert_eq!(base, fingerprint_of(&x, &y, hardened));
+        assert_ne!(base, fingerprint_of(&x, &[2.0, f64::NAN, 3.0], hardened));
+        assert_ne!(base, fingerprint_of(&[1.0, 2.0, 4.0], &y, hardened));
+        let clamped = crate::Interp1dOptions {
+            spline_bc: crate::SplineBc::Clamped(0.0, 1.0),
+            ..hardened
+        };
+        let clamped_other = crate::Interp1dOptions {
+            spline_bc: crate::SplineBc::Clamped(0.0, -1.0),
+            ..hardened
+        };
+        assert_ne!(base, fingerprint_of(&x, &y, clamped));
+        assert_ne!(
+            fingerprint_of(&x, &y, clamped),
+            fingerprint_of(&x, &y, clamped_other)
+        );
+        let filled = crate::Interp1dOptions {
+            fill_value: Some(0.0),
+            ..hardened
+        };
+        assert_ne!(base, fingerprint_of(&x, &y, filled));
+
+        // Dimension-cap path: same length, different last value.
+        let long_x: Vec<f64> = (0..=crate::HARDENED_MAX_DIM).map(|i| i as f64).collect();
+        let mut long_tail = long_x.clone();
+        *long_tail.last_mut().unwrap() += 0.5;
+        let capped = fingerprint_of(&long_x, &long_x, hardened);
+        assert_eq!(capped, fingerprint_of(&long_x, &long_x, hardened));
+        assert_ne!(capped, fingerprint_of(&long_tail, &long_x, hardened));
+        assert_ne!(capped, fingerprint_of(&long_x, &long_tail, hardened));
     }
 }

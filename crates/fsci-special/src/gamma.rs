@@ -160,6 +160,9 @@ pub fn gamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 /// non-finite/domain rejection records an `AuditAction::FailClosed`
 /// event on the provided ledger before returning the error. In Strict
 /// mode the ledger is left untouched. See br-egba-2.
+///
+/// The event's fingerprint covers all of `z` and `mode` (frankenscipy-3cu8u.1); it used to
+/// hash the error's static detail string, so every rejected input shared one fingerprint.
 pub fn gamma_with_audit(
     z: &SpecialTensor,
     mode: RuntimeMode,
@@ -170,7 +173,10 @@ pub fn gamma_with_audit(
         && let Err(err) = &result
     {
         let reason = format!("gamma::{:?}", err.kind);
-        crate::audit::record_fail_closed(ledger, err.detail.as_bytes(), &reason, "rejected");
+        let mut fingerprinter = fsci_runtime::Fingerprinter::new("fsci_special::gamma");
+        crate::audit::fingerprint_tensor(&mut fingerprinter, z);
+        let fingerprint = fingerprinter.str(&format!("{mode:?}")).finish();
+        crate::audit::record_fail_closed(ledger, &fingerprint, &reason, "rejected");
     }
     result
 }
@@ -5962,6 +5968,44 @@ mod tests {
             1,
             "hardened pole must emit once"
         );
+    }
+
+    /// frankenscipy-3cu8u.1: the audit fingerprint covers the whole input. It used to hash the
+    /// error's static detail string, so every rejected pole — any scalar, any vector holding
+    /// one — shared a single fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        let fingerprint_of = |z: SpecialTensor| {
+            let ledger = crate::audit::sync_audit_ledger();
+            let err = gamma_with_audit(&z, RuntimeMode::Hardened, &ledger)
+                .expect_err("hardened rejects a pole");
+            assert_eq!(err.kind, SpecialErrorKind::PoleInput);
+            let guard = ledger.lock().expect("audit ledger lock");
+            assert_eq!(guard.len(), 1, "one rejection, one event");
+            guard.entries()[0].input_fingerprint.clone()
+        };
+
+        let base = fingerprint_of(scalar(-2.0));
+        assert!(base.starts_with("blake3:"), "{base}");
+        assert_eq!(
+            base,
+            fingerprint_of(scalar(-2.0)),
+            "same input, same fingerprint"
+        );
+        // Same error kind and detail, different pole.
+        assert_ne!(base, fingerprint_of(scalar(-3.0)));
+        // Same pole, different non-pole element: the whole vector is hashed.
+        let vec_base = fingerprint_of(SpecialTensor::RealVec(vec![1.0, -2.0]));
+        assert_eq!(
+            vec_base,
+            fingerprint_of(SpecialTensor::RealVec(vec![1.0, -2.0]))
+        );
+        assert_ne!(
+            vec_base,
+            fingerprint_of(SpecialTensor::RealVec(vec![1.5, -2.0]))
+        );
+        // The variant is part of the record: a one-element vector is not the scalar.
+        assert_ne!(base, fingerprint_of(SpecialTensor::RealVec(vec![-2.0])));
     }
 
     #[test]

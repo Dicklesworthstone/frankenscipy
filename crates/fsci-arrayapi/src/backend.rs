@@ -2,6 +2,7 @@ use crate::broadcast::broadcast_shapes;
 use crate::dtype::default_float_dtype;
 use crate::error::{ArrayApiError, ArrayApiErrorKind, ArrayApiResult};
 use crate::types::{DType, ExecutionMode, IndexExpr, MemoryOrder, ScalarValue, Shape, SliceSpec};
+use fsci_runtime::Fingerprinter;
 use nalgebra::{DMatrix, DVector};
 use std::collections::VecDeque;
 use std::sync::Mutex;
@@ -12,6 +13,12 @@ pub trait ArrayApiArray {
     fn shape(&self) -> &Shape;
 
     fn dtype(&self) -> DType;
+
+    /// Feed this array to an audit fingerprint in full: its shape, dtype, layout and every
+    /// element (frankenscipy-3cu8u.1). The `*_with_audit` wrappers call it only when they
+    /// record an event. Only the implementation can see its storage, and a fingerprint of the
+    /// shape alone would merge different arrays, so there is no default.
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter);
 
     fn ndim(&self) -> usize {
         self.shape().rank()
@@ -26,6 +33,11 @@ pub trait ArrayApiBackend {
     type Array: ArrayApiArray;
 
     fn namespace_name(&self) -> &'static str;
+
+    /// Feed what identifies this backend's behaviour to an audit fingerprint: its namespace and
+    /// every setting that changes results, such as an execution mode (frankenscipy-3cu8u.1).
+    /// The `*_with_audit` wrappers feed it first, before the call's inputs.
+    fn fingerprint_config(&self, fingerprinter: &mut Fingerprinter);
 
     fn shape_of(&self, array: &Self::Array) -> Shape;
 
@@ -226,6 +238,15 @@ impl ArrayApiArray for CoreArray {
     fn dtype(&self) -> DType {
         self.dtype
     }
+
+    /// Shape, dtype and memory order (`Debug` renderings), then every element.
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter) {
+        fingerprinter
+            .shape(&self.shape.dims)
+            .str(&format!("{:?}", self.dtype))
+            .str(&format!("{:?}", self.order));
+        crate::audit::fingerprint_scalars(fingerprinter, &self.values);
+    }
 }
 
 #[derive(Debug)]
@@ -336,6 +357,13 @@ impl ArrayApiBackend for CoreArrayBackend {
 
     fn namespace_name(&self) -> &'static str {
         "array_api"
+    }
+
+    /// The namespace, then the execution mode (it sets the default dtype and validation).
+    fn fingerprint_config(&self, fingerprinter: &mut Fingerprinter) {
+        fingerprinter
+            .str(self.namespace_name())
+            .str(&format!("{:?}", self.mode));
     }
 
     fn shape_of(&self, array: &Self::Array) -> Shape {

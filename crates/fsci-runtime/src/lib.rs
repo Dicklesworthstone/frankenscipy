@@ -28,7 +28,7 @@ pub use booking_claim::{BookingClaim, ClaimRejection, FleetBooking};
 pub use eprocess::{EProcessConfig, EProcessMonitor, EProcessStatus};
 pub use evidence::{
     AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, DecisionEvidenceEntry,
-    PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
+    Fingerprinter, PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
 };
 pub use mode::{HARDENED_MAX_DIM, RuntimeMode};
 pub use policy::{PolicyAction, PolicyController, PolicyDecision, RiskState, decision_loss_matrix};

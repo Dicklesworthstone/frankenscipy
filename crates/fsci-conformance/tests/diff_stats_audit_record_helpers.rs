@@ -65,7 +65,7 @@ fn diff_stats_audit_record_helpers() {
     let ledger = sync_audit_ledger();
 
     let before = ledger_len(&ledger);
-    record_fail_closed(&ledger, b"stats-input-A", "nan_in_observation", "rejected");
+    record_fail_closed(&ledger, "stats-input-A", "nan_in_observation", "rejected");
     let after = ledger_len(&ledger);
     diffs.push(CaseDiff {
         case_id: "fail_closed_appends".into(),
@@ -77,7 +77,7 @@ fn diff_stats_audit_record_helpers() {
     let before = ledger_len(&ledger);
     record_bounded_recovery(
         &ledger,
-        b"stats-input-B",
+        "stats-input-B",
         "fallback_to_robust_estimator",
         "succeeded",
     );

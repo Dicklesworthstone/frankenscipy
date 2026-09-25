@@ -486,7 +486,7 @@ There are **two complementary records** in flight:
 ```rust,ignore
 pub struct AuditEvent {
     pub timestamp_ms:       u64,    // Unix milliseconds
-    pub input_fingerprint:  String, // BLAKE3 of a routine-specific input digest (see below)
+    pub input_fingerprint:  String, // "blake3:<hex>" of the routine and all its inputs (see below)
     pub action:             AuditAction,
     pub outcome:            String, // human-readable result summary
 }
@@ -513,7 +513,7 @@ Serialized via `serde_json` with `#[serde(tag = "kind", rename_all = "snake_case
 }
 ```
 
-The input fingerprint is not a hash of the full input: `fsci-linalg` hashes the first 1 KiB of the matrix, `fsci-fft` the first 64 values plus the shape, `fsci-stats` the first 8 values, and several crates hash only lengths or a constant label. Two different inputs can therefore share a fingerprint, so it identifies a call site and shape rather than scoping a request to exact data.
+The input fingerprint is `fsci_runtime::Fingerprinter`'s BLAKE3 over the routine's name and every input value, shape and option. Values are hashed bit for bit, so `-0.0` and NaN payloads count. The encoding is self-delimiting and documented on `Fingerprinter`, and each audited routine's records are listed at its audit site, so a caller can recompute a fingerprint. Function-valued inputs (objectives, right-hand sides, event functions) are hashed by presence only. Every event of one call carries the same fingerprint, and two requests share one only if the routine, inputs and options all match exactly.
 
 The portfolio's evidence buffer is bounded (`evidence_capacity` on `SolverPortfolio::new`) and evicts FIFO once full. The `AuditLedger` itself is an unbounded `Vec`; `AuditLedger::shared()` returns a new `Arc<Mutex<AuditLedger>>` (a `SyncSharedAuditLedger`) on every call, so to share one ledger across threads, clone that handle.
 
@@ -1625,7 +1625,7 @@ let x = fsci_linalg::solve_with_audit(&a, &b, options, &mut portfolio, &request_
 let events = request_ledger.lock().expect("poisoned").entries().to_vec();
 ```
 
-Scope events to a request by giving the request its own ledger. Filtering a shared ledger by `input_fingerprint` does not work: the fingerprint covers only a routine-specific digest of the input (for example the first 1 KiB of a matrix), not the full request.
+Scope events to a request by giving the request its own ledger, or filter a shared ledger by the request's `input_fingerprint`. The fingerprint covers the routine and all of its inputs and options, so it matches that request's events and no request with different inputs.
 
 #### Pattern 3: Count fail-closed events as a rate metric
 

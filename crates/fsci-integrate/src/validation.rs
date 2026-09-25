@@ -1,7 +1,11 @@
 #![forbid(unsafe_code)]
 
+use std::cell::OnceCell;
+
 pub use fsci_runtime::SyncSharedAuditLedger;
-use fsci_runtime::{AuditAction, AuditEvent, AuditLedger, RuntimeMode, casp_now_unix_ms};
+use fsci_runtime::{
+    AuditAction, AuditEvent, AuditLedger, Fingerprinter, RuntimeMode, casp_now_unix_ms,
+};
 
 /// Create a shared audit ledger for integrate validation APIs.
 #[must_use]
@@ -9,8 +13,53 @@ pub fn sync_audit_ledger() -> SyncSharedAuditLedger {
     AuditLedger::shared()
 }
 
-pub(crate) fn audit_fingerprint(context: &str, detail: impl Into<String>) -> Vec<u8> {
-    format!("{context}:{}", detail.into()).into_bytes()
+/// One audited public call: the ledger its events go to and the recipe for the call's
+/// fingerprint, a [`Fingerprinter`] digest of the public routine and every input it received
+/// (frankenscipy-3cu8u.1). The recipe runs at most once per call and only when an event is
+/// recorded, so an audited call that records nothing does not hash its inputs. `solve_ivp`
+/// hands its scope to the validators it runs, so every event of one `solve_ivp` request carries
+/// that request's fingerprint.
+pub(crate) struct AuditScope<'a> {
+    ledger: &'a SyncSharedAuditLedger,
+    fingerprint_of: &'a dyn Fn() -> String,
+    fingerprint: OnceCell<String>,
+}
+
+impl<'a> AuditScope<'a> {
+    pub(crate) fn new(
+        ledger: &'a SyncSharedAuditLedger,
+        fingerprint_of: &'a dyn Fn() -> String,
+    ) -> Self {
+        Self {
+            ledger,
+            fingerprint_of,
+            fingerprint: OnceCell::new(),
+        }
+    }
+
+    fn fingerprint(&self) -> &str {
+        self.fingerprint.get_or_init(self.fingerprint_of)
+    }
+}
+
+/// Feed an `Option<f64>` as a presence flag, then the value when present.
+pub(crate) fn fingerprint_optional_f64(fingerprinter: &mut Fingerprinter, value: Option<f64>) {
+    fingerprinter.bool(value.is_some());
+    if let Some(value) = value {
+        fingerprinter.f64(value);
+    }
+}
+
+/// Feed a tolerance as its variant name (`"Scalar"` / `"Vector"`), then its value(s).
+pub(crate) fn fingerprint_tolerance(fingerprinter: &mut Fingerprinter, tolerance: &ToleranceValue) {
+    match tolerance {
+        ToleranceValue::Scalar(value) => {
+            fingerprinter.str("Scalar").f64(*value);
+        }
+        ToleranceValue::Vector(values) => {
+            fingerprinter.str("Vector").f64s(values);
+        }
+    }
 }
 
 /// Acquire the ledger guard, recovering from a poisoned mutex so audit
@@ -26,19 +75,16 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
+/// Record a fail-closed event; `fingerprint` is the call's [`Fingerprinter`] digest.
 pub(crate) fn record_fail_closed(
-    ledger: Option<&SyncSharedAuditLedger>,
-    input_bytes: &[u8],
+    ledger: &SyncSharedAuditLedger,
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
-    let Some(ledger) = ledger else {
-        return;
-    };
-
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -47,25 +93,36 @@ pub(crate) fn record_fail_closed(
     lock_or_recover(ledger).record(event);
 }
 
+/// Record a bounded-recovery event; `fingerprint` is the call's [`Fingerprinter`] digest.
 pub(crate) fn record_bounded_recovery(
-    ledger: Option<&SyncSharedAuditLedger>,
-    input_bytes: &[u8],
+    ledger: &SyncSharedAuditLedger,
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
-    let Some(ledger) = ledger else {
-        return;
-    };
-
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
         outcome,
     );
     lock_or_recover(ledger).record(event);
+}
+
+/// Record a fail-closed event for an audited call; a no-op when the call is not audited.
+pub(crate) fn fail_closed(audit: Option<&AuditScope<'_>>, reason: &str, outcome: &str) {
+    if let Some(audit) = audit {
+        record_fail_closed(audit.ledger, audit.fingerprint(), reason, outcome);
+    }
+}
+
+/// Record a bounded recovery for an audited call; a no-op when the call is not audited.
+fn bounded_recovery(audit: Option<&AuditScope<'_>>, recovery_action: &str, outcome: &str) {
+    if let Some(audit) = audit {
+        record_bounded_recovery(audit.ledger, audit.fingerprint(), recovery_action, outcome);
+    }
 }
 
 pub const EPS: f64 = f64::EPSILON;
@@ -239,49 +296,42 @@ pub fn validate_first_step(
     validate_first_step_with_audit(first_step, t0, t_bound, None)
 }
 
+/// Audited `validate_first_step`. Its fingerprint is `fsci_integrate::validate_first_step`
+/// over `first_step`, `t0` and `t_bound`, each an `f64` record.
 pub fn validate_first_step_with_audit(
     first_step: f64,
     t0: f64,
     t_bound: f64,
     audit_ledger: Option<&SyncSharedAuditLedger>,
 ) -> Result<f64, IntegrateValidationError> {
+    let fingerprint_of = || {
+        Fingerprinter::new("fsci_integrate::validate_first_step")
+            .f64(first_step)
+            .f64(t0)
+            .f64(t_bound)
+            .finish()
+    };
+    let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint_of));
+    validate_first_step_scoped(first_step, t0, t_bound, audit.as_ref())
+}
+
+/// `validate_first_step`, recording its rejections under `audit`.
+pub(crate) fn validate_first_step_scoped(
+    first_step: f64,
+    t0: f64,
+    t_bound: f64,
+    audit: Option<&AuditScope<'_>>,
+) -> Result<f64, IntegrateValidationError> {
     if !first_step.is_finite() {
-        let fingerprint = audit_fingerprint(
-            "validate_first_step",
-            format!("first_step={first_step};t0={t0};t_bound={t_bound}"),
-        );
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
-            "first_step_must_be_finite",
-            "rejected",
-        );
+        fail_closed(audit, "first_step_must_be_finite", "rejected");
         return Err(IntegrateValidationError::NonFiniteFirstStep);
     }
     if first_step <= 0.0 {
-        let fingerprint = audit_fingerprint(
-            "validate_first_step",
-            format!("first_step={first_step};t0={t0};t_bound={t_bound}"),
-        );
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
-            "first_step_must_be_positive",
-            "rejected",
-        );
+        fail_closed(audit, "first_step_must_be_positive", "rejected");
         return Err(IntegrateValidationError::FirstStepMustBePositive);
     }
     if first_step > (t_bound - t0).abs() {
-        let fingerprint = audit_fingerprint(
-            "validate_first_step",
-            format!("first_step={first_step};t0={t0};t_bound={t_bound}"),
-        );
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
-            "first_step_exceeds_bounds",
-            "rejected",
-        );
+        fail_closed(audit, "first_step_exceeds_bounds", "rejected");
         return Err(IntegrateValidationError::FirstStepExceedsBounds);
     }
     Ok(first_step)
@@ -291,28 +341,32 @@ pub fn validate_max_step(max_step: f64) -> Result<f64, IntegrateValidationError>
     validate_max_step_with_audit(max_step, None)
 }
 
+/// Audited `validate_max_step`. Its fingerprint is `fsci_integrate::validate_max_step` over
+/// `max_step` as an `f64` record.
 pub fn validate_max_step_with_audit(
     max_step: f64,
     audit_ledger: Option<&SyncSharedAuditLedger>,
 ) -> Result<f64, IntegrateValidationError> {
+    let fingerprint_of = || {
+        Fingerprinter::new("fsci_integrate::validate_max_step")
+            .f64(max_step)
+            .finish()
+    };
+    let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint_of));
+    validate_max_step_scoped(max_step, audit.as_ref())
+}
+
+/// `validate_max_step`, recording its rejections under `audit`.
+pub(crate) fn validate_max_step_scoped(
+    max_step: f64,
+    audit: Option<&AuditScope<'_>>,
+) -> Result<f64, IntegrateValidationError> {
     if max_step.is_nan() {
-        let fingerprint = audit_fingerprint("validate_max_step", format!("max_step={max_step}"));
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
-            "max_step_must_not_be_nan",
-            "rejected",
-        );
+        fail_closed(audit, "max_step_must_not_be_nan", "rejected");
         return Err(IntegrateValidationError::NonFiniteMaxStep);
     }
     if max_step <= 0.0 {
-        let fingerprint = audit_fingerprint("validate_max_step", format!("max_step={max_step}"));
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
-            "max_step_must_be_positive",
-            "rejected",
-        );
+        fail_closed(audit, "max_step_must_be_positive", "rejected");
         return Err(IntegrateValidationError::MaxStepMustBePositive);
     }
     Ok(max_step)
@@ -327,6 +381,9 @@ pub fn validate_tol(
     validate_tol_with_audit(rtol, atol, n, mode, None)
 }
 
+/// Audited `validate_tol`. Its fingerprint is `fsci_integrate::validate_tol` over `rtol` and
+/// `atol` (each its variant name, then its value or values), `n` (`usize`) and `mode`
+/// (`Debug`), in that order.
 pub fn validate_tol_with_audit(
     rtol: ToleranceValue,
     atol: ToleranceValue,
@@ -334,56 +391,64 @@ pub fn validate_tol_with_audit(
     mode: RuntimeMode,
     audit_ledger: Option<&SyncSharedAuditLedger>,
 ) -> Result<ValidatedTolerance, IntegrateValidationError> {
-    let mut warnings = Vec::new();
-    let fingerprint = audit_ledger.map(|_| {
-        audit_fingerprint(
-            "validate_tol",
-            format!("rtol={rtol:?};atol={atol:?};n={n};mode={mode:?}"),
-        )
-    });
-    let fingerprint = fingerprint.as_deref().unwrap_or_default();
+    let fingerprint_of = || {
+        let mut fingerprinter = Fingerprinter::new("fsci_integrate::validate_tol");
+        fingerprint_tolerance(&mut fingerprinter, &rtol);
+        fingerprint_tolerance(&mut fingerprinter, &atol);
+        fingerprinter.usize(n).str(&format!("{mode:?}"));
+        fingerprinter.finish()
+    };
+    let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint_of));
+    let needs_clamp = check_tol(&rtol, &atol, n, mode, audit.as_ref())?;
+    Ok(resolve_tol(rtol, atol, mode, needs_clamp))
+}
+
+/// `validate_tol`, recording its events under `audit`.
+pub(crate) fn validate_tol_scoped(
+    rtol: ToleranceValue,
+    atol: ToleranceValue,
+    n: usize,
+    mode: RuntimeMode,
+    audit: Option<&AuditScope<'_>>,
+) -> Result<ValidatedTolerance, IntegrateValidationError> {
+    let needs_clamp = check_tol(&rtol, &atol, n, mode, audit)?;
+    Ok(resolve_tol(rtol, atol, mode, needs_clamp))
+}
+
+/// Every `validate_tol` check and audit event, in order, on borrowed tolerances (so the audit
+/// recipe can still read them); returns whether `rtol` needs the clamp to [`MIN_RTOL`].
+fn check_tol(
+    rtol: &ToleranceValue,
+    atol: &ToleranceValue,
+    n: usize,
+    mode: RuntimeMode,
+    audit: Option<&AuditScope<'_>>,
+) -> Result<bool, IntegrateValidationError> {
     // NaN in rtol or atol falls through every `<` and `<=` predicate
     // silently. Reject up front so Hardened callers see a fail-closed
     // error rather than NaN propagating into the adaptive step controller.
     // Per frankenscipy-i9vw.
     if rtol.any(|x| x.is_nan()) {
-        record_fail_closed(
-            audit_ledger,
-            fingerprint,
-            "rtol_must_not_be_nan",
-            "rejected",
-        );
+        fail_closed(audit, "rtol_must_not_be_nan", "rejected");
         return Err(IntegrateValidationError::NonFiniteRtol);
     }
     if atol.any(|x| x.is_nan()) {
-        record_fail_closed(
-            audit_ledger,
-            fingerprint,
-            "atol_must_not_be_nan",
-            "rejected",
-        );
+        fail_closed(audit, "atol_must_not_be_nan", "rejected");
         return Err(IntegrateValidationError::NonFiniteAtol);
     }
     let needs_clamp = rtol.any(|x| x < MIN_RTOL);
-    let rtol = if needs_clamp {
-        warnings.push(ToleranceWarning::RtolClamped { minimum: MIN_RTOL });
-        if mode == RuntimeMode::Hardened {
-            record_bounded_recovery(
-                audit_ledger,
-                fingerprint,
-                "clamp_rtol_to_min",
-                &format!("clamped_rtol_to_{MIN_RTOL:.3e}"),
-            );
-        }
-        rtol.map(|x| x.max(MIN_RTOL))
-    } else {
-        rtol
-    };
+    if needs_clamp && mode == RuntimeMode::Hardened {
+        bounded_recovery(
+            audit,
+            "clamp_rtol_to_min",
+            &format!("clamped_rtol_to_{MIN_RTOL:.3e}"),
+        );
+    }
 
     if let Some(len) = atol.len_if_vector()
         && len != n
     {
-        record_fail_closed(audit_ledger, fingerprint, "atol_wrong_shape", "rejected");
+        fail_closed(audit, "atol_wrong_shape", "rejected");
         return Err(IntegrateValidationError::AtolWrongShape {
             expected: n,
             actual: len,
@@ -391,21 +456,33 @@ pub fn validate_tol_with_audit(
     }
 
     if atol.any(|x| x < 0.0) {
-        record_fail_closed(
-            audit_ledger,
-            fingerprint,
-            "atol_must_be_positive",
-            "rejected",
-        );
+        fail_closed(audit, "atol_must_be_positive", "rejected");
         return Err(IntegrateValidationError::AtolMustBePositive);
     }
+    Ok(needs_clamp)
+}
 
-    Ok(ValidatedTolerance {
+/// The accepted tolerances: `rtol` clamped to [`MIN_RTOL`] (with its warning) when
+/// [`check_tol`] said so.
+fn resolve_tol(
+    rtol: ToleranceValue,
+    atol: ToleranceValue,
+    mode: RuntimeMode,
+    needs_clamp: bool,
+) -> ValidatedTolerance {
+    let mut warnings = Vec::new();
+    let rtol = if needs_clamp {
+        warnings.push(ToleranceWarning::RtolClamped { minimum: MIN_RTOL });
+        rtol.map(|x| x.max(MIN_RTOL))
+    } else {
+        rtol
+    };
+    ValidatedTolerance {
         rtol,
         atol,
         mode,
         warnings,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -852,18 +929,20 @@ mod tests {
         ));
     }
 
+    /// The recorded fingerprint is the documented `validate_tol` encoding: routine, `rtol`
+    /// and `atol` as variant name then value, `n`, `mode` (frankenscipy-3cu8u.1). It used to be
+    /// a digest of a `Debug` string, in which every NaN payload read `NaN`.
     #[test]
     fn test_validation_tol_nan_records_fail_closed() {
         let audit_ledger = sync_audit_ledger();
-        let expected_fingerprint = AuditLedger::fingerprint_bytes(&audit_fingerprint(
-            "validate_tol",
-            format!(
-                "rtol={:?};atol={:?};n=1;mode={:?}",
-                ToleranceValue::Scalar(f64::NAN),
-                ToleranceValue::Scalar(1e-6),
-                RuntimeMode::Hardened,
-            ),
-        ));
+        let expected_fingerprint = Fingerprinter::new("fsci_integrate::validate_tol")
+            .str("Scalar")
+            .f64(f64::NAN)
+            .str("Scalar")
+            .f64(1e-6)
+            .usize(1)
+            .str("Hardened")
+            .finish();
         let err = validate_tol_with_audit(
             ToleranceValue::Scalar(f64::NAN),
             ToleranceValue::Scalar(1e-6),
@@ -902,14 +981,14 @@ mod tests {
         );
 
         record_fail_closed(
-            Some(&audit_ledger),
-            b"bad first step",
+            &audit_ledger,
+            "bad first step",
             "first_step_must_be_positive",
             "rejected",
         );
         record_bounded_recovery(
-            Some(&audit_ledger),
-            b"small rtol",
+            &audit_ledger,
+            "small rtol",
             "clamp_rtol_to_min",
             "recovered",
         );

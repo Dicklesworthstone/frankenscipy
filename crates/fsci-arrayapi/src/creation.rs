@@ -1,6 +1,7 @@
 use crate::backend::ArrayApiBackend;
 use crate::error::{ArrayApiError, ArrayApiErrorKind, ArrayApiResult};
 use crate::types::{DType, MemoryOrder, ScalarValue, Shape};
+use fsci_runtime::Fingerprinter;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreationRequest {
@@ -102,12 +103,16 @@ pub fn arange_with_audit<B: ArrayApiBackend>(
 ) -> ArrayApiResult<B::Array> {
     let result = arange(backend, request);
     if let Err(err) = &result {
-        crate::audit::record_array_api_error(
-            ledger,
-            "arange",
-            format!("{request:?}").as_bytes(),
-            err.kind,
-        );
+        // frankenscipy-3cu8u.1: the backend configuration, then `start`, `stop`, `step` and
+        // `dtype`. It used to be the request's `Debug` string, which omits the backend's mode
+        // and renders every NaN alike.
+        let mut fingerprinter = Fingerprinter::new("fsci_arrayapi::arange");
+        backend.fingerprint_config(&mut fingerprinter);
+        for value in [request.start, request.stop, request.step] {
+            crate::audit::fingerprint_scalar(&mut fingerprinter, value);
+        }
+        fingerprinter.str(&format!("{:?}", request.dtype));
+        crate::audit::record_array_api_error(ledger, "arange", &fingerprinter.finish(), err.kind);
     }
     result
 }
@@ -142,10 +147,19 @@ pub fn from_slice_with_audit<B: ArrayApiBackend>(
 ) -> ArrayApiResult<B::Array> {
     let result = from_slice(backend, values, request);
     if let Err(err) = &result {
+        // frankenscipy-3cu8u.1: the backend configuration, every value, then the request's
+        // shape, dtype and order. It used to carry only `values.len()`, not the values.
+        let mut fingerprinter = Fingerprinter::new("fsci_arrayapi::from_slice");
+        backend.fingerprint_config(&mut fingerprinter);
+        crate::audit::fingerprint_scalars(&mut fingerprinter, values);
+        fingerprinter
+            .shape(&request.shape.dims)
+            .str(&format!("{:?}", request.dtype))
+            .str(&format!("{:?}", request.order));
         crate::audit::record_array_api_error(
             ledger,
             "from_slice",
-            format!("request={request:?}; values_len={}", values.len()).as_bytes(),
+            &fingerprinter.finish(),
             err.kind,
         );
     }

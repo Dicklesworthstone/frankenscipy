@@ -286,6 +286,141 @@ impl Default for AuditLedger {
     }
 }
 
+/// The canonical `AuditEvent::input_fingerprint`: BLAKE3 over a self-delimiting encoding of
+/// the routine's name and EVERY input, shape and option, returned as `"blake3:<64 hex>"`. Two
+/// calls share a fingerprint only if they feed the same records, value for value and bit for
+/// bit (`-0.0` and `0.0` differ, as do NaN payloads), in the same order — so a ledger can be
+/// filtered by the fingerprint of one request (frankenscipy-3cu8u.1).
+///
+/// Encoding, one record per call in call order; every integer is a little-endian `u64`:
+///
+/// | call | bytes |
+/// |------|-------|
+/// | `routine(name)` | `b'R'`, byte length, UTF-8 |
+/// | `shape(dims)` | `b'S'`, count, each dimension |
+/// | `f64s(values)` | `b'F'`, count, each `f64::to_bits` |
+/// | `complex(values)` | `b'C'`, count, each pair's real then imaginary `to_bits` |
+/// | `rows(rows)` | `b'M'`, row count, then per row: its length and each `to_bits` |
+/// | `u64(v)` / `usize(v)` | `b'U'`, `v` |
+/// | `i64(v)` | `b'I'`, `v` as two's-complement `u64` |
+/// | `f64(v)` | `b'D'`, `v.to_bits()` |
+/// | `bool(v)` | `b'B'`, one byte, 0 or 1 |
+/// | `str(s)` | `b'T'`, byte length, UTF-8 |
+/// | `bytes(b)` | `b'Y'`, length, the bytes |
+///
+/// Any caller can reproduce a fingerprint by feeding the same bytes to BLAKE3; the test
+/// `fingerprinter_matches_its_documented_encoding` rebuilds it that way.
+#[derive(Debug, Clone)]
+pub struct Fingerprinter {
+    hasher: blake3::Hasher,
+}
+
+impl Fingerprinter {
+    /// A fingerprint for `routine`, which is its first record.
+    #[must_use]
+    pub fn new(routine: &str) -> Self {
+        let mut fingerprinter = Self {
+            hasher: blake3::Hasher::new(),
+        };
+        fingerprinter.tagged_bytes(b'R', routine.as_bytes());
+        fingerprinter
+    }
+
+    fn word(&mut self, value: u64) {
+        self.hasher.update(&value.to_le_bytes());
+    }
+
+    fn tagged_bytes(&mut self, tag: u8, bytes: &[u8]) {
+        self.hasher.update(&[tag]);
+        self.word(bytes.len() as u64);
+        self.hasher.update(bytes);
+    }
+
+    pub fn shape(&mut self, dims: &[usize]) -> &mut Self {
+        self.hasher.update(b"S");
+        self.word(dims.len() as u64);
+        for &dim in dims {
+            self.word(dim as u64);
+        }
+        self
+    }
+
+    pub fn f64s(&mut self, values: &[f64]) -> &mut Self {
+        self.hasher.update(b"F");
+        self.word(values.len() as u64);
+        for value in values {
+            self.word(value.to_bits());
+        }
+        self
+    }
+
+    pub fn complex(&mut self, values: &[(f64, f64)]) -> &mut Self {
+        self.hasher.update(b"C");
+        self.word(values.len() as u64);
+        for &(re, im) in values {
+            self.word(re.to_bits());
+            self.word(im.to_bits());
+        }
+        self
+    }
+
+    /// A matrix as rows; each row's length is part of the record, so ragged inputs differ.
+    pub fn rows(&mut self, rows: &[Vec<f64>]) -> &mut Self {
+        self.hasher.update(b"M");
+        self.word(rows.len() as u64);
+        for row in rows {
+            self.word(row.len() as u64);
+            for value in row {
+                self.word(value.to_bits());
+            }
+        }
+        self
+    }
+
+    pub fn u64(&mut self, value: u64) -> &mut Self {
+        self.hasher.update(b"U");
+        self.word(value);
+        self
+    }
+
+    pub fn usize(&mut self, value: usize) -> &mut Self {
+        self.u64(value as u64)
+    }
+
+    pub fn i64(&mut self, value: i64) -> &mut Self {
+        self.hasher.update(b"I");
+        self.word(value as u64);
+        self
+    }
+
+    pub fn f64(&mut self, value: f64) -> &mut Self {
+        self.hasher.update(b"D");
+        self.word(value.to_bits());
+        self
+    }
+
+    pub fn bool(&mut self, value: bool) -> &mut Self {
+        self.hasher.update(&[b'B', u8::from(value)]);
+        self
+    }
+
+    pub fn str(&mut self, value: &str) -> &mut Self {
+        self.tagged_bytes(b'T', value.as_bytes());
+        self
+    }
+
+    pub fn bytes(&mut self, value: &[u8]) -> &mut Self {
+        self.tagged_bytes(b'Y', value);
+        self
+    }
+
+    /// `"blake3:<64 hex>"`.
+    #[must_use]
+    pub fn finish(&self) -> String {
+        format!("blake3:{}", self.hasher.finalize().to_hex())
+    }
+}
+
 /// Thread-safe audit ledger handle shared by synchronous crate APIs.
 pub type SharedAuditLedger = Arc<Mutex<AuditLedger>>;
 
@@ -295,6 +430,157 @@ pub type SyncSharedAuditLedger = SharedAuditLedger;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The documented encoding, rebuilt by hand: what an external caller would do.
+    #[test]
+    fn fingerprinter_matches_its_documented_encoding() {
+        let rows = vec![vec![1.0, -0.0], vec![f64::NAN]];
+        let mut fingerprinter = Fingerprinter::new("solve");
+        fingerprinter
+            .rows(&rows)
+            .f64s(&[2.5])
+            .shape(&[2, 2])
+            .complex(&[(1.0, -1.0)])
+            .usize(7)
+            .i64(-3)
+            .f64(0.1)
+            .bool(true)
+            .str("pos")
+            .bytes(b"\x00\x01");
+
+        let word = |bytes: &mut Vec<u8>, value: u64| bytes.extend_from_slice(&value.to_le_bytes());
+        let mut expected = Vec::new();
+        expected.push(b'R');
+        word(&mut expected, 5);
+        expected.extend_from_slice(b"solve");
+        expected.push(b'M');
+        word(&mut expected, 2);
+        for row in &rows {
+            word(&mut expected, row.len() as u64);
+            for value in row {
+                word(&mut expected, value.to_bits());
+            }
+        }
+        expected.push(b'F');
+        word(&mut expected, 1);
+        word(&mut expected, 2.5_f64.to_bits());
+        expected.push(b'S');
+        word(&mut expected, 2);
+        word(&mut expected, 2);
+        word(&mut expected, 2);
+        expected.push(b'C');
+        word(&mut expected, 1);
+        word(&mut expected, 1.0_f64.to_bits());
+        word(&mut expected, (-1.0_f64).to_bits());
+        expected.push(b'U');
+        word(&mut expected, 7);
+        expected.push(b'I');
+        word(&mut expected, (-3_i64) as u64);
+        expected.push(b'D');
+        word(&mut expected, 0.1_f64.to_bits());
+        expected.extend_from_slice(&[b'B', 1]);
+        expected.push(b'T');
+        word(&mut expected, 3);
+        expected.extend_from_slice(b"pos");
+        expected.push(b'Y');
+        word(&mut expected, 2);
+        expected.extend_from_slice(b"\x00\x01");
+
+        assert_eq!(
+            fingerprinter.finish(),
+            format!("blake3:{}", hash(&expected).to_hex())
+        );
+    }
+
+    /// The old fingerprints hashed a prefix (linalg: the first KiB of the matrix) or only a
+    /// length; these inputs collided under them and must not now.
+    #[test]
+    fn fingerprinter_distinguishes_inputs_the_old_digests_merged() {
+        let fingerprint = |build: &dyn Fn(&mut Fingerprinter)| {
+            let mut fingerprinter = Fingerprinter::new("routine");
+            build(&mut fingerprinter);
+            fingerprinter.finish()
+        };
+        // Identical in the first KiB (128 values), different in the last element.
+        let big: Vec<Vec<f64>> = (0..20).map(|i| vec![f64::from(i); 20]).collect();
+        let mut tail = big.clone();
+        tail[19][19] += 1.0;
+        assert_ne!(
+            fingerprint(&|f| {
+                f.rows(&big);
+            }),
+            fingerprint(&|f| {
+                f.rows(&tail);
+            })
+        );
+        // Same length, different values (the old length-only digests).
+        assert_ne!(
+            fingerprint(&|f| {
+                f.f64s(&[1.0, 2.0]);
+            }),
+            fingerprint(&|f| {
+                f.f64s(&[1.0, 3.0]);
+            })
+        );
+        // Signed zero and NaN payloads are bits, not values.
+        assert_ne!(
+            fingerprint(&|f| {
+                f.f64s(&[0.0]);
+            }),
+            fingerprint(&|f| {
+                f.f64s(&[-0.0]);
+            })
+        );
+        assert_ne!(
+            fingerprint(&|f| {
+                f.f64s(&[f64::NAN]);
+            }),
+            fingerprint(&|f| {
+                f.f64s(&[f64::from_bits(f64::NAN.to_bits() ^ 1)]);
+            })
+        );
+        // Ragged rows with the same flattened values, and a transposed shape.
+        assert_ne!(
+            fingerprint(&|f| {
+                f.rows(&[vec![1.0, 2.0], vec![3.0]]);
+            }),
+            fingerprint(&|f| {
+                f.rows(&[vec![1.0], vec![2.0, 3.0]]);
+            })
+        );
+        assert_ne!(
+            fingerprint(&|f| {
+                f.shape(&[2, 3]);
+            }),
+            fingerprint(&|f| {
+                f.shape(&[3, 2]);
+            })
+        );
+        // A record boundary cannot be moved: "ab" + "c" is not "a" + "bc".
+        assert_ne!(
+            fingerprint(&|f| {
+                f.str("ab").str("c");
+            }),
+            fingerprint(&|f| {
+                f.str("a").str("bc");
+            })
+        );
+        // Routines are separated, and the same records give the same fingerprint.
+        let mut solve = Fingerprinter::new("solve");
+        let mut inv = Fingerprinter::new("inv");
+        solve.f64s(&[1.0]);
+        inv.f64s(&[1.0]);
+        assert_ne!(solve.finish(), inv.finish());
+        assert_eq!(
+            fingerprint(&|f| {
+                f.rows(&big).bool(false);
+            }),
+            fingerprint(&|f| {
+                f.rows(&big).bool(false);
+            })
+        );
+        assert!(solve.finish().starts_with("blake3:") && solve.finish().len() == 7 + 64);
+    }
 
     #[test]
     fn audit_ledger_roundtrip_preserves_entries() {

@@ -11,8 +11,8 @@ use fsci_linalg::{
     solve_banded as dense_solve_banded, solveh_banded as dense_solveh_banded,
 };
 use fsci_runtime::{
-    RuntimeMode, SparseSolverAction, SparseSolverEvidenceEntry, SparseSolverPortfolio,
-    SparseStructuralEvidence,
+    Fingerprinter, RuntimeMode, SparseSolverAction, SparseSolverEvidenceEntry,
+    SparseSolverPortfolio, SparseStructuralEvidence,
 };
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use rayon::prelude::*;
@@ -9781,6 +9781,22 @@ pub fn casp_iterative_solve(
     casp_iterative_solve_inner(a, b, x0, options)
 }
 
+/// [`IterativeSolveOptions`] in an audit fingerprint, field by field in declaration order:
+/// `mode` as its `Debug` rendering, `max_iter` as a presence flag then the value.
+fn fingerprint_iterative_options(
+    fingerprinter: &mut Fingerprinter,
+    options: &IterativeSolveOptions,
+) {
+    fingerprinter
+        .str(&format!("{:?}", options.mode))
+        .bool(options.check_finite)
+        .f64(options.tol)
+        .bool(options.max_iter.is_some());
+    if let Some(max_iter) = options.max_iter {
+        fingerprinter.usize(max_iter);
+    }
+}
+
 /// Run the CASP-selected iterative sparse solver and emit the choice rationale.
 pub fn casp_iterative_solve_with_audit(
     a: &CsrMatrix,
@@ -9790,9 +9806,22 @@ pub fn casp_iterative_solve_with_audit(
     ledger: &crate::audit::SyncSharedAuditLedger,
 ) -> SparseResult<CaspIterativeSolveResult> {
     let solved = casp_iterative_solve_inner(a, b, x0, options)?;
+    // frankenscipy-3cu8u.1: `a`, `b`, `x0` and every option, in that order; it used to be the
+    // rationale string, which every problem routed the same way shared.
+    let mut fingerprinter = Fingerprinter::new("fsci_sparse::casp_iterative_solve");
+    crate::audit::fingerprint_csr(&mut fingerprinter, a);
+    fingerprinter.f64s(b).bool(x0.is_some());
+    if let Some(x0) = x0 {
+        fingerprinter.f64s(x0);
+    }
+    fingerprint_iterative_options(&mut fingerprinter, &options.iterative);
+    fingerprinter
+        .bool(options.preconditioner_available)
+        .str(&format!("{:?}", options.matrix_vector_cost))
+        .bool(options.prefer_low_memory);
     crate::audit::record_bounded_recovery(
         ledger,
-        solved.decision.rationale.as_bytes(),
+        &fingerprinter.finish(),
         &format!(
             "casp_sparse_iterative_solver={}",
             solved.decision.selected_solver.as_str()
@@ -10052,12 +10081,27 @@ fn spsolve_with_casp_internal(
     portfolio: &mut SparseSolverPortfolio,
     audit_ledger: Option<&crate::audit::SyncSharedAuditLedger>,
 ) -> SparseResult<SolveResult> {
+    // frankenscipy-3cu8u.1: every event this call records carries one fingerprint over `a`,
+    // `b` and `options` (`mode`, `backend`, `ordering`, `check_finite`). It is computed only
+    // when an event is recorded; the sites used to pass constant labels (`b"shape"`,
+    // `b"non_finite"`, `b"singular"`, `b"casp_fallback"`), shared by every input.
+    let fingerprint = || {
+        let mut fingerprinter = Fingerprinter::new("fsci_sparse::spsolve_with_casp");
+        crate::audit::fingerprint_csr(&mut fingerprinter, a);
+        fingerprinter
+            .f64s(b)
+            .str(&format!("{:?}", options.mode))
+            .str(&format!("{:?}", options.backend))
+            .str(&format!("{:?}", options.ordering))
+            .bool(options.check_finite);
+        fingerprinter.finish()
+    };
     let shape = a.shape();
     if !shape.is_square() {
         if let Some(ledger) = audit_ledger {
             crate::audit::record_fail_closed(
                 ledger,
-                b"shape",
+                &fingerprint(),
                 "spsolve_with_casp::non_square",
                 "rejected: matrix must be square",
             );
@@ -10070,7 +10114,7 @@ fn spsolve_with_casp_internal(
         if let Some(ledger) = audit_ledger {
             crate::audit::record_fail_closed(
                 ledger,
-                b"shape",
+                &fingerprint(),
                 "spsolve_with_casp::rhs_mismatch",
                 "rejected: rhs length must match matrix rows",
             );
@@ -10085,7 +10129,7 @@ fn spsolve_with_casp_internal(
         if let Some(ledger) = audit_ledger {
             crate::audit::record_fail_closed(
                 ledger,
-                b"non_finite",
+                &fingerprint(),
                 "spsolve_with_casp::non_finite",
                 "rejected: matrix/rhs contains NaN or Inf",
             );
@@ -10099,7 +10143,7 @@ fn spsolve_with_casp_internal(
         if let Some(ledger) = audit_ledger {
             crate::audit::record_fail_closed(
                 ledger,
-                b"singular",
+                &fingerprint(),
                 "spsolve_with_casp::empty_structural_row",
                 "rejected: detected empty structural row in hardened mode",
             );
@@ -10123,7 +10167,7 @@ fn spsolve_with_casp_internal(
     {
         crate::audit::record_bounded_recovery(
             ledger,
-            b"casp_fallback",
+            &fingerprint(),
             "casp_iterative_to_superlu_fallback",
             "recovered: direct solve succeeded after iterative non-convergence",
         );

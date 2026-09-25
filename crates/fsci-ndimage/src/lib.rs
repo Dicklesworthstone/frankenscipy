@@ -14,10 +14,10 @@ use fsci_interpolate::make_interp_spline;
 use std::simd::Simd;
 use std::simd::num::SimdFloat;
 
-use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
+use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -35,16 +35,17 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
-/// Record a fail-closed audit event when Hardened mode rejects input.
+/// Record a fail-closed audit event when Hardened mode rejects input. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -53,16 +54,17 @@ pub fn record_fail_closed(
     lock_or_recover(ledger).record(event);
 }
 
-/// Record a bounded-recovery audit event when Hardened mode falls back.
+/// Record a bounded-recovery audit event when Hardened mode falls back. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_bounded_recovery(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
@@ -3218,12 +3220,25 @@ pub fn gaussian_filter_with_mode(
     runtime_mode: RuntimeMode,
     audit_ledger: Option<&SyncSharedAuditLedger>,
 ) -> Result<NdArray, NdimageError> {
+    // Audit fingerprint over the whole request, in argument order: `input` as its shape then
+    // every element (its strides are the C-order strides of that shape), `sigma`, `mode`
+    // (Debug), `cval`, `runtime_mode` (Debug). Computed only when an event is recorded.
+    let fingerprint = || {
+        Fingerprinter::new("fsci_ndimage::gaussian_filter_with_mode")
+            .shape(&input.shape)
+            .f64s(&input.data)
+            .f64(sigma)
+            .str(&format!("{mode:?}"))
+            .f64(cval)
+            .str(&format!("{runtime_mode:?}"))
+            .finish()
+    };
     if matches!(runtime_mode, RuntimeMode::Hardened) {
         if input.shape.iter().any(|&d| d > HARDENED_MAX_DIM) {
             if let Some(ledger) = audit_ledger {
                 record_fail_closed(
                     ledger,
-                    &input.data.len().to_le_bytes(),
+                    &fingerprint(),
                     "dimension exceeds hardened limit",
                     "rejected",
                 );
@@ -3237,7 +3252,7 @@ pub fn gaussian_filter_with_mode(
             if let Some(ledger) = audit_ledger {
                 record_fail_closed(
                     ledger,
-                    &sigma.to_le_bytes(),
+                    &fingerprint(),
                     "non-finite parameter in hardened mode",
                     "rejected",
                 );
@@ -24244,5 +24259,61 @@ mod van22_knob_read_is_per_transform {
             guard.entries()[0].action,
             crate::AuditAction::FailClosed { .. }
         ));
+    }
+
+    /// frankenscipy-3cu8u.1: the gaussian_filter audit fingerprint covers the array (shape and
+    /// every element) and every parameter. It used to be `sigma` alone (non-finite parameter)
+    /// or the element count (dimension cap), so each pair below shared one fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        let fingerprint_of = |input: &NdArray, sigma: f64, mode: BoundaryMode, cval: f64| {
+            let ledger = crate::sync_audit_ledger();
+            let result = crate::gaussian_filter_with_mode(
+                input,
+                sigma,
+                mode,
+                cval,
+                crate::RuntimeMode::Hardened,
+                Some(&ledger),
+            );
+            assert!(result.is_err());
+            let guard = ledger.lock().unwrap();
+            assert_eq!(guard.entries().len(), 1);
+            assert!(matches!(
+                guard.entries()[0].action,
+                crate::AuditAction::FailClosed { .. }
+            ));
+            guard.entries()[0].input_fingerprint.clone()
+        };
+        let line = NdArray::new(vec![1.0, 2.0, 3.0, 4.0], vec![4]).unwrap();
+        let line_tail = NdArray::new(vec![1.0, 2.0, 3.0, 5.0], vec![4]).unwrap();
+        let square = NdArray::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]).unwrap();
+        let reflect = BoundaryMode::Reflect;
+
+        // Non-finite sigma: same sigma, different data, shape or boundary mode.
+        let base = fingerprint_of(&line, f64::NAN, reflect, 0.0);
+        assert!(base.starts_with("blake3:"));
+        assert_eq!(base, fingerprint_of(&line, f64::NAN, reflect, 0.0));
+        assert_ne!(base, fingerprint_of(&line_tail, f64::NAN, reflect, 0.0));
+        assert_ne!(base, fingerprint_of(&square, f64::NAN, reflect, 0.0));
+        assert_ne!(
+            base,
+            fingerprint_of(&line, f64::NAN, BoundaryMode::Nearest, 0.0)
+        );
+        // Non-finite cval: same (finite) sigma, different cval.
+        assert_ne!(
+            fingerprint_of(&line, 1.0, reflect, f64::NAN),
+            fingerprint_of(&line, 1.0, reflect, f64::INFINITY)
+        );
+
+        // Dimension cap: same element count, different last element.
+        let len = crate::HARDENED_MAX_DIM + 1;
+        let wide = NdArray::new(vec![0.0; len], vec![len]).unwrap();
+        let mut wide_tail = wide.clone();
+        *wide_tail.data.last_mut().unwrap() = 1.0;
+        let capped = fingerprint_of(&wide, 1.0, reflect, 0.0);
+        assert!(capped.starts_with("blake3:"));
+        assert_eq!(capped, fingerprint_of(&wide, 1.0, reflect, 0.0));
+        assert_ne!(capped, fingerprint_of(&wide_tail, 1.0, reflect, 0.0));
     }
 }

@@ -116,6 +116,105 @@ mod tests {
         );
     }
 
+    /// frankenscipy-3cu8u.1: the audit fingerprints cover the backend and every input. They
+    /// used to be `Debug` strings that left out the backend's mode, `from_slice`'s values
+    /// (only their count) and the array under `getitem`/`reshape` (only its shape), so each
+    /// differing pair below shared one fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        fn only_fingerprint(ledger: &SyncSharedAuditLedger) -> String {
+            let guard = ledger.lock().expect("audit ledger lock");
+            assert_eq!(guard.len(), 1, "one rejection, one event");
+            guard.entries()[0].input_fingerprint.clone()
+        }
+        let strict = CoreArrayBackend::new(ExecutionMode::Strict);
+        let hardened = CoreArrayBackend::new(ExecutionMode::Hardened);
+
+        // arange: one zero-step request on backends in different modes.
+        let zero_step = ArangeRequest {
+            start: ScalarValue::I64(0),
+            stop: ScalarValue::I64(3),
+            step: ScalarValue::I64(0),
+            dtype: Some(DType::Float64),
+        };
+        let arange_on = |backend: &CoreArrayBackend| {
+            let ledger = sync_audit_ledger();
+            let err =
+                arange_with_audit(backend, &zero_step, &ledger).expect_err("zero step must reject");
+            assert_eq!(err.kind, ArrayApiErrorKind::InvalidStep);
+            only_fingerprint(&ledger)
+        };
+        let base = arange_on(&hardened);
+        assert!(base.starts_with("blake3:"), "{base}");
+        assert_eq!(base, arange_on(&hardened), "same input, same fingerprint");
+        assert_ne!(base, arange_on(&strict));
+
+        // from_slice: same count, different values.
+        let square = CreationRequest {
+            shape: Shape::new(vec![2, 2]),
+            dtype: DType::Float64,
+            order: MemoryOrder::C,
+        };
+        let from_slice_of = |values: &[ScalarValue]| {
+            let ledger = sync_audit_ledger();
+            let err = from_slice_with_audit(&hardened, values, &square, &ledger)
+                .expect_err("length mismatch must reject");
+            assert_eq!(err.kind, ArrayApiErrorKind::InvalidShape);
+            only_fingerprint(&ledger)
+        };
+        let two = from_slice_of(&[ScalarValue::F64(1.0), ScalarValue::F64(2.0)]);
+        assert_eq!(
+            two,
+            from_slice_of(&[ScalarValue::F64(1.0), ScalarValue::F64(2.0)])
+        );
+        assert_ne!(
+            two,
+            from_slice_of(&[ScalarValue::F64(1.0), ScalarValue::F64(3.0)])
+        );
+
+        // getitem and reshape: same shape, different values.
+        let vector = CreationRequest {
+            shape: Shape::new(vec![2]),
+            dtype: DType::Float64,
+            order: MemoryOrder::C,
+        };
+        let array_of = |second: f64| {
+            from_slice(
+                &hardened,
+                &[ScalarValue::F64(1.0), ScalarValue::F64(second)],
+                &vector,
+            )
+            .expect("valid array")
+        };
+        let (a, b) = (array_of(2.0), array_of(5.0));
+        let mismatched = IndexRequest {
+            mode: IndexingMode::Basic,
+            index: IndexExpr::BooleanMask {
+                mask_shape: Shape::new(vec![2]),
+            },
+        };
+        let getitem_of = |array: &CoreArray| {
+            let ledger = sync_audit_ledger();
+            let err = getitem_with_audit(&hardened, array, &mismatched, &ledger)
+                .expect_err("mode/index mismatch must reject");
+            assert_eq!(err.kind, ArrayApiErrorKind::InvalidIndex);
+            only_fingerprint(&ledger)
+        };
+        assert_eq!(getitem_of(&a), getitem_of(&a));
+        assert_ne!(getitem_of(&a), getitem_of(&b));
+        let reshape_of = |array: &CoreArray| {
+            let ledger = sync_audit_ledger();
+            let err = reshape_with_audit(&hardened, array, &Shape::new(vec![3]), &ledger)
+                .expect_err("element-count mismatch must reject");
+            assert_eq!(err.kind, ArrayApiErrorKind::InvalidShape);
+            only_fingerprint(&ledger)
+        };
+        assert_eq!(reshape_of(&a), reshape_of(&a));
+        assert_ne!(reshape_of(&a), reshape_of(&b));
+        // The routine is part of the fingerprint.
+        assert_ne!(getitem_of(&a), reshape_of(&a));
+    }
+
     #[test]
     fn metamorphic_broadcast_shapes_are_permutation_and_scalar_invariant() {
         let base = [Shape::new(vec![2, 1, 3]), Shape::new(vec![1, 4, 3])];

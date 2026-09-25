@@ -39,10 +39,10 @@
 //! can match on the resulting enum variants instead of substring-parsing
 //! `Display` text.
 
-use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
+use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -60,16 +60,17 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
-/// Record a fail-closed audit event when Hardened mode rejects input.
+/// Record a fail-closed audit event when Hardened mode rejects input. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -78,16 +79,17 @@ pub fn record_fail_closed(
     lock_or_recover(ledger).record(event);
 }
 
-/// Record a bounded-recovery audit event when Hardened mode falls back.
+/// Record a bounded-recovery audit event when Hardened mode falls back. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_bounded_recovery(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
@@ -2590,6 +2592,20 @@ pub fn czt_with_mode_and_audit(
     mode: fsci_runtime::RuntimeMode,
     audit_ledger: Option<&SyncSharedAuditLedger>,
 ) -> Result<Vec<(f64, f64)>, SignalError> {
+    // Audit fingerprint over the whole request, in argument order: `x`, `m`, then `w` and `a`
+    // as given (a presence flag, then magnitude and angle), then `mode` (Debug). Computed only
+    // when an event is recorded.
+    let fingerprint = || {
+        let mut fingerprinter = Fingerprinter::new("fsci_signal::czt_with_mode_and_audit");
+        fingerprinter.f64s(x).usize(m);
+        for control in [w, a] {
+            fingerprinter.bool(control.is_some());
+            if let Some((magnitude, angle)) = control {
+                fingerprinter.f64(magnitude).f64(angle);
+            }
+        }
+        fingerprinter.str(&format!("{mode:?}")).finish()
+    };
     let n = x.len();
     if n == 0 {
         return Err(SignalError::InvalidArgument(
@@ -2605,7 +2621,7 @@ pub fn czt_with_mode_and_audit(
         if let Some(ledger) = audit_ledger {
             record_fail_closed(
                 ledger,
-                &n.to_le_bytes(),
+                &fingerprint(),
                 "dimension exceeds hardened limit",
                 "rejected",
             );
@@ -2618,7 +2634,7 @@ pub fn czt_with_mode_and_audit(
         if let (fsci_runtime::RuntimeMode::Hardened, Some(ledger)) = (mode, audit_ledger) {
             record_fail_closed(
                 ledger,
-                b"non-finite-input",
+                &fingerprint(),
                 "non-finite input samples",
                 "rejected",
             );
@@ -2635,23 +2651,13 @@ pub fn czt_with_mode_and_audit(
     if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
         if let Err(err) = validate_czt_polar_control("w", (w_mag, w_ang)) {
             if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    &w_mag.to_le_bytes(),
-                    "degenerate_czt_control",
-                    "rejected",
-                );
+                record_fail_closed(ledger, &fingerprint(), "degenerate_czt_control", "rejected");
             }
             return Err(err);
         }
         if let Err(err) = validate_czt_polar_control("a", (a_mag, a_ang)) {
             if let Some(ledger) = audit_ledger {
-                record_fail_closed(
-                    ledger,
-                    &a_mag.to_le_bytes(),
-                    "degenerate_czt_control",
-                    "rejected",
-                );
+                record_fail_closed(ledger, &fingerprint(), "degenerate_czt_control", "rejected");
             }
             return Err(err);
         }
@@ -32521,6 +32527,52 @@ mod tests {
             guard.entries()[1].action,
             AuditAction::FailClosed { .. }
         ));
+    }
+
+    /// frankenscipy-3cu8u.1: the czt audit fingerprint covers `x`, `m`, `w`, `a` and `mode`. It
+    /// used to be `x.len()` (dimension cap), a constant label (non-finite `x`), or only the
+    /// magnitude of the rejected control, so each pair below shared one fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        type Control = Option<(f64, f64)>;
+        let fingerprint_of = |x: &[f64], m: usize, w: Control, a: Control| {
+            let ledger = sync_audit_ledger();
+            let result = czt_with_mode_and_audit(x, m, w, a, RuntimeMode::Hardened, Some(&ledger));
+            assert!(result.is_err());
+            let guard = ledger.lock().unwrap();
+            assert_eq!(guard.entries().len(), 1);
+            assert!(matches!(
+                guard.entries()[0].action,
+                AuditAction::FailClosed { .. }
+            ));
+            guard.entries()[0].input_fingerprint.clone()
+        };
+        let x = [1.0, 2.0, 3.0];
+        let x_tail = [1.0, 2.0, 4.0];
+
+        // Dimension cap: same signal length, different samples.
+        let too_many = HARDENED_MAX_DIM + 1;
+        let capped = fingerprint_of(&x, too_many, None, None);
+        assert!(capped.starts_with("blake3:"));
+        assert_eq!(capped, fingerprint_of(&x, too_many, None, None));
+        assert_ne!(capped, fingerprint_of(&x_tail, too_many, None, None));
+
+        // Non-finite samples: same length, different finite neighbours.
+        let nan = fingerprint_of(&[1.0, f64::NAN, 3.0], 3, None, None);
+        assert!(nan.starts_with("blake3:"));
+        assert_ne!(nan, fingerprint_of(&[2.0, f64::NAN, 3.0], 3, None, None));
+
+        // Degenerate w: same (zero) magnitude, different angle or signal.
+        let w_zero = fingerprint_of(&x, 3, Some((0.0, 0.0)), None);
+        assert_eq!(w_zero, fingerprint_of(&x, 3, Some((0.0, 0.0)), None));
+        assert_ne!(w_zero, fingerprint_of(&x, 3, Some((0.0, 1.0)), None));
+        assert_ne!(w_zero, fingerprint_of(&x_tail, 3, Some((0.0, 0.0)), None));
+
+        // Degenerate a: same (zero) magnitude, different signal or m; and a is not w.
+        let a_zero = fingerprint_of(&x, 3, None, Some((0.0, 0.0)));
+        assert_ne!(a_zero, fingerprint_of(&x_tail, 3, None, Some((0.0, 0.0))));
+        assert_ne!(a_zero, fingerprint_of(&x, 4, None, Some((0.0, 0.0))));
+        assert_ne!(a_zero, w_zero);
     }
 
     #[test]

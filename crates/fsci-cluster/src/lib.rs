@@ -27,10 +27,10 @@ impl std::fmt::Display for ClusterError {
 
 impl std::error::Error for ClusterError {}
 
-use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
+use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -48,16 +48,17 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
-/// Record a fail-closed audit event when Hardened mode rejects input.
+/// Record a fail-closed audit event when Hardened mode rejects input. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -66,16 +67,17 @@ pub fn record_fail_closed(
     lock_or_recover(ledger).record(event);
 }
 
-/// Record a bounded-recovery audit event when Hardened mode falls back.
+/// Record a bounded-recovery audit event when Hardened mode falls back. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_bounded_recovery(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
@@ -2881,13 +2883,24 @@ pub fn kmeans_with_mode(
     mode: RuntimeMode,
     audit_ledger: Option<&SyncSharedAuditLedger>,
 ) -> Result<KMeansResult, ClusterError> {
+    // Audit fingerprint over the whole request, in argument order: `data` (rows), `k`,
+    // `max_iter`, `seed`, `mode` (Debug). Computed only when an event is recorded.
+    let fingerprint = || {
+        Fingerprinter::new("fsci_cluster::kmeans_with_mode")
+            .rows(data)
+            .usize(k)
+            .usize(max_iter)
+            .u64(seed)
+            .str(&format!("{mode:?}"))
+            .finish()
+    };
     if matches!(mode, RuntimeMode::Hardened)
         && (data.len() > HARDENED_MAX_DIM || k > HARDENED_MAX_DIM)
     {
         if let Some(ledger) = audit_ledger {
             record_fail_closed(
                 ledger,
-                &data.len().to_le_bytes(),
+                &fingerprint(),
                 "dimension exceeds hardened limit",
                 "rejected",
             );
@@ -2906,7 +2919,7 @@ pub fn kmeans_with_mode(
         if let (RuntimeMode::Hardened, Some(ledger)) = (mode, audit_ledger) {
             record_fail_closed(
                 ledger,
-                b"non-finite-kmeans-data",
+                &fingerprint(),
                 "kmeans input must be finite in hardened mode",
                 "rejected",
             );
@@ -12564,5 +12577,49 @@ mod max_rstat_matches_scipy {
             guard.entries()[0].action,
             crate::AuditAction::FailClosed { .. }
         ));
+    }
+
+    /// frankenscipy-3cu8u.1: the kmeans audit fingerprint covers the whole request. It used to
+    /// be a constant label on the non-finite path and the point count on the dimension-cap
+    /// path, so each pair below shared one fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        let fingerprint_of = |data: &[Vec<f64>], k: usize, seed: u64| {
+            let ledger = crate::sync_audit_ledger();
+            let result = crate::kmeans_with_mode(
+                data,
+                k,
+                10,
+                seed,
+                crate::RuntimeMode::Hardened,
+                Some(&ledger),
+            );
+            assert!(result.is_err());
+            let guard = ledger.lock().unwrap();
+            assert_eq!(guard.entries().len(), 1);
+            assert!(matches!(
+                guard.entries()[0].action,
+                crate::AuditAction::FailClosed { .. }
+            ));
+            guard.entries()[0].input_fingerprint.clone()
+        };
+
+        // Non-finite path: same shape, different values.
+        let nan = vec![vec![1.0, 2.0], vec![3.0, f64::NAN]];
+        let base = fingerprint_of(&nan, 1, 42);
+        assert!(base.starts_with("blake3:"));
+        assert_eq!(base, fingerprint_of(&nan, 1, 42));
+        let other = vec![vec![1.0, 2.0], vec![4.0, f64::NAN]];
+        assert_ne!(base, fingerprint_of(&other, 1, 42));
+        assert_ne!(base, fingerprint_of(&nan, 1, 7), "the seed is an input");
+
+        // Dimension-cap path (k over the limit): same point count, different points.
+        let too_many = crate::HARDENED_MAX_DIM + 1;
+        let a = vec![vec![1.0], vec![2.0]];
+        let b = vec![vec![1.0], vec![3.0]];
+        let capped = fingerprint_of(&a, too_many, 42);
+        assert!(capped.starts_with("blake3:"));
+        assert_eq!(capped, fingerprint_of(&a, too_many, 42));
+        assert_ne!(capped, fingerprint_of(&b, too_many, 42));
     }
 }

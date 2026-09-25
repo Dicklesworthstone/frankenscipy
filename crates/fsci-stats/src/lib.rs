@@ -500,11 +500,14 @@ pub trait ContinuousDistribution {
         let result = Self::try_fit(data);
         if let Err(err) = &result {
             let reason = format!("fit::{err}");
-            // Fingerprint the first few bytes of the sample so
-            // repeated identical rejections collide under the same
-            // event hash.
-            let head: Vec<u8> = data.iter().take(8).flat_map(|v| v.to_le_bytes()).collect();
-            record_fail_closed(ledger, &head, &reason, "rejected");
+            // frankenscipy-3cu8u.1: the whole sample, under the distribution's own routine
+            // name (`fsci_stats::Normal::try_fit`). It used to hash only the first 8 values, so
+            // samples differing past them, or fitted by a different family, collided.
+            let routine = format!("{}::try_fit", std::any::type_name::<Self>());
+            let fingerprint = fsci_runtime::Fingerprinter::new(&routine)
+                .f64s(data)
+                .finish();
+            record_fail_closed(ledger, &fingerprint, &reason, "rejected");
         }
         result
     }
@@ -76924,6 +76927,43 @@ mod tests {
             <NoFitDistribution as ContinuousDistribution>::try_fit_with_audit(&[1.0, 2.0], &ledger);
         assert!(matches!(r, Err(FitError::NotImplemented { .. })));
         assert_eq!(ledger.lock().unwrap().len(), 3, "NotImplemented must emit");
+    }
+
+    /// frankenscipy-3cu8u.1: the audit fingerprint covers the whole sample and the family. It
+    /// used to hash the first 8 values only, so these rejections all shared one fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        fn fingerprint_of<D: ContinuousDistribution>(data: &[f64]) -> String {
+            let ledger = super::sync_audit_ledger();
+            assert!(
+                D::try_fit_with_audit(data, &ledger).is_err(),
+                "fit must reject"
+            );
+            let guard = ledger.lock().expect("audit ledger lock");
+            assert_eq!(guard.len(), 1, "one rejection, one event");
+            guard.entries()[0].input_fingerprint.clone()
+        }
+        let head = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let sample = |tail: &[f64]| -> Vec<f64> { head.iter().chain(tail).copied().collect() };
+
+        let base = fingerprint_of::<Normal>(&sample(&[f64::NAN, 1.0]));
+        assert!(base.starts_with("blake3:"), "{base}");
+        assert_eq!(
+            base,
+            fingerprint_of::<Normal>(&sample(&[f64::NAN, 1.0])),
+            "same sample, same fingerprint"
+        );
+        // Identical first 8 values and identical rejection reason; different tail.
+        assert_ne!(base, fingerprint_of::<Normal>(&sample(&[f64::NAN, 2.0])));
+        assert_ne!(
+            base,
+            fingerprint_of::<Normal>(&sample(&[f64::INFINITY, 1.0]))
+        );
+        // Same sample, different family.
+        assert_ne!(
+            base,
+            fingerprint_of::<NoFitDistribution>(&sample(&[f64::NAN, 1.0]))
+        );
     }
 
     #[test]

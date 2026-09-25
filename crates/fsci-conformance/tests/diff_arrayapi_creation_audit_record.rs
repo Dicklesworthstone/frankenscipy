@@ -17,7 +17,7 @@ use fsci_arrayapi::{
     ScalarValue, Shape, arange_with_audit, backend::CoreArrayBackend, from_slice_with_audit,
     sync_audit_ledger,
 };
-use fsci_runtime::{AuditAction, AuditLedger};
+use fsci_runtime::{AuditAction, Fingerprinter};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -241,9 +241,9 @@ fn diff_arrayapi_creation_audit_record() {
         });
     }
 
-    // === Ledger entries carry a blake3 hex fingerprint of the input bytes ===
-    // The fingerprint is computed from format!("{request:?}") for arange,
-    // and from format!("request={request:?}; values_len={n}") for from_slice.
+    // === Ledger entries carry the canonical input fingerprint (frankenscipy-3cu8u.1) ===
+    // `fsci_arrayapi::arange`'s records, rebuilt from the documented encoding: the backend's
+    // namespace and mode, then `start`, `stop`, `step` (variant name, value), then `dtype`.
     {
         let ledger = sync_audit_ledger();
         let req = ArangeRequest {
@@ -255,8 +255,13 @@ fn diff_arrayapi_creation_audit_record() {
         let _ = arange_with_audit(&backend, &req, &ledger);
         let g = ledger.lock().expect("acquire");
         let entry = &g.entries()[0];
-        // Expected fingerprint from raw input bytes
-        let expected_fp = AuditLedger::fingerprint_bytes(format!("{req:?}").as_bytes());
+        let mut expected = Fingerprinter::new("fsci_arrayapi::arange");
+        expected.str("array_api").str("Strict");
+        for value in [0.0, 3.0, 0.0] {
+            expected.str("F64").f64(value);
+        }
+        expected.str("Some(Float64)");
+        let expected_fp = expected.finish();
         diffs.push(CaseDiff {
             case_id: "arange_fingerprint_matches".into(),
             pass: entry.input_fingerprint == expected_fp,

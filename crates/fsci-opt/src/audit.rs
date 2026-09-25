@@ -21,15 +21,18 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
+/// Record a fail-closed audit event. `fingerprint` is the call's
+/// [`fsci_runtime::Fingerprinter`] digest over every input and option
+/// (frankenscipy-3cu8u.1); it is stored as is.
 pub fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -38,15 +41,17 @@ pub fn record_fail_closed(
     lock_or_recover(ledger).record(event);
 }
 
+/// Record a Spec §6 decision event. `fingerprint` is the call's
+/// [`fsci_runtime::Fingerprinter`] digest.
 pub fn record_alien_artifact_decision(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     decision: AlienArtifactDecision,
     outcome: &str,
 ) {
     lock_or_recover(ledger).record_alien_artifact_decision(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         decision,
         outcome.to_string(),
     );
@@ -75,7 +80,7 @@ mod tests {
 
         record_alien_artifact_decision(
             &ledger,
-            b"optimize-input",
+            "optimize-input",
             entry.alien_artifact_decision(),
             "validated",
         );

@@ -70,7 +70,7 @@ fn diff_sparse_audit_record_helpers() {
 
     // record_fail_closed adds 1
     let before = ledger_len(&ledger);
-    record_fail_closed(&ledger, b"input-A", "test_reason_A", "rejected");
+    record_fail_closed(&ledger, "input-A", "test_reason_A", "rejected");
     let after = ledger_len(&ledger);
     diffs.push(CaseDiff {
         case_id: "fail_closed_appends_one".into(),
@@ -81,7 +81,7 @@ fn diff_sparse_audit_record_helpers() {
 
     // record_bounded_recovery adds 1 more
     let before = ledger_len(&ledger);
-    record_bounded_recovery(&ledger, b"input-B", "restart_quad", "succeeded");
+    record_bounded_recovery(&ledger, "input-B", "restart_quad", "succeeded");
     let after = ledger_len(&ledger);
     diffs.push(CaseDiff {
         case_id: "bounded_recovery_appends_one".into(),
@@ -93,12 +93,7 @@ fn diff_sparse_audit_record_helpers() {
     // Multiple calls accumulate
     let before = ledger_len(&ledger);
     for i in 0..5 {
-        record_fail_closed(
-            &ledger,
-            format!("input-{i}").as_bytes(),
-            "loop_reason",
-            "rejected",
-        );
+        record_fail_closed(&ledger, &format!("input-{i}"), "loop_reason", "rejected");
     }
     let after = ledger_len(&ledger);
     diffs.push(CaseDiff {

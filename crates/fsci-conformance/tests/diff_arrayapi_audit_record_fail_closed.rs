@@ -67,7 +67,7 @@ fn diff_arrayapi_audit_record_fail_closed() {
     let before = ledger_len(&ledger);
     record_fail_closed(
         &ledger,
-        b"input-arrayapi",
+        "input-arrayapi",
         "broadcast_incompatible",
         "rejected",
     );
@@ -82,12 +82,7 @@ fn diff_arrayapi_audit_record_fail_closed() {
     // Five calls accumulate five events
     let before = ledger_len(&ledger);
     for i in 0..5 {
-        record_fail_closed(
-            &ledger,
-            format!("input-{i}").as_bytes(),
-            "loop_reason",
-            "rejected",
-        );
+        record_fail_closed(&ledger, &format!("input-{i}"), "loop_reason", "rejected");
     }
     let after = ledger_len(&ledger);
     diffs.push(CaseDiff {

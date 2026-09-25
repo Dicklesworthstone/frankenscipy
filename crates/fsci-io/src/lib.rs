@@ -30,10 +30,10 @@
 // `push_str(&format!(...))` allocates per cell/entry on the hot write paths.
 use std::fmt::Write as _;
 
-use fsci_runtime::casp_now_unix_ms;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
+use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -51,16 +51,17 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
-/// Record a fail-closed audit event when Hardened mode rejects input.
+/// Record a fail-closed audit event when Hardened mode rejects input. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -69,16 +70,17 @@ pub fn record_fail_closed(
     lock_or_recover(ledger).record(event);
 }
 
-/// Record a bounded-recovery audit event when Hardened mode falls back.
+/// Record a bounded-recovery audit event when Hardened mode falls back. `fingerprint` is the
+/// call's `fsci_runtime::Fingerprinter` digest over every input and option.
 pub fn record_bounded_recovery(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
@@ -371,9 +373,14 @@ pub fn mmread_with_mode(
         && (info.rows > HARDENED_MAX_DIM || info.cols > HARDENED_MAX_DIM)
     {
         if let Some(ledger) = audit_ledger {
+            // The whole request: every byte of `content`, then `mode` (Debug).
+            let fingerprint = Fingerprinter::new("fsci_io::mmread_with_mode")
+                .bytes(content.as_bytes())
+                .str(&format!("{mode:?}"))
+                .finish();
             record_fail_closed(
                 ledger,
-                &info.rows.to_le_bytes(),
+                &fingerprint,
                 "dimension exceeds hardened limit",
                 "rejected",
             );
@@ -8266,5 +8273,36 @@ mod accuracy_contract_ratchet {
             guard.entries()[0].action,
             crate::AuditAction::FailClosed { .. }
         ));
+    }
+
+    /// frankenscipy-3cu8u.1: the mmread audit fingerprint covers the whole file. It used to be
+    /// the row count alone, so every pair of over-limit files below shared one fingerprint.
+    #[test]
+    fn audit_fingerprints_cover_every_input() {
+        let fingerprint_of = |content: &str| {
+            let ledger = crate::sync_audit_ledger();
+            let result =
+                crate::mmread_with_mode(content, crate::RuntimeMode::Hardened, Some(&ledger));
+            assert!(result.is_err());
+            let guard = ledger.lock().unwrap();
+            assert_eq!(guard.entries().len(), 1);
+            assert!(matches!(
+                guard.entries()[0].action,
+                crate::AuditAction::FailClosed { .. }
+            ));
+            guard.entries()[0].input_fingerprint.clone()
+        };
+        let rows = crate::HARDENED_MAX_DIM + 1;
+        let file = |cols: usize, value: &str| {
+            format!("%%MatrixMarket matrix coordinate real general\n{rows} {cols} 1\n1 1 {value}\n")
+        };
+
+        let base = fingerprint_of(&file(10, "1.0"));
+        assert!(base.starts_with("blake3:"));
+        assert_eq!(base, fingerprint_of(&file(10, "1.0")));
+        // Same row count, different entry value (the tail of the file).
+        assert_ne!(base, fingerprint_of(&file(10, "2.0")));
+        // Same row count, different column count.
+        assert_ne!(base, fingerprint_of(&file(11, "1.0")));
     }
 }

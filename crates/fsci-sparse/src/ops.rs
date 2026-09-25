@@ -284,9 +284,19 @@ fn csr_to_csc_with_mode_inner(
 ) -> SparseResult<(CscMatrix, ConversionLogEntry)> {
     if mode == RuntimeMode::Hardened && !csr.canonical.sorted_indices {
         if let Some(ledger) = ledger {
+            // frankenscipy-3cu8u.1: the whole matrix, `mode` and `operation_id`; it used to be
+            // the shape alone, so every rejected matrix of one shape shared a fingerprint.
+            let operation_id: String = operation_id.into();
+            let mut fingerprinter =
+                fsci_runtime::Fingerprinter::new("fsci_sparse::csr_to_csc_with_mode");
+            crate::audit::fingerprint_csr(&mut fingerprinter, csr);
+            let fingerprint = fingerprinter
+                .str(&format!("{mode:?}"))
+                .str(&operation_id)
+                .finish();
             crate::audit::record_fail_closed(
                 ledger,
-                format!("csr_shape={:?}", csr.shape()).as_bytes(),
+                &fingerprint,
                 "csr_to_csc::unsorted_indices",
                 "rejected",
             );

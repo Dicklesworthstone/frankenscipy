@@ -1,6 +1,7 @@
 use crate::backend::ArrayApiBackend;
 use crate::error::{ArrayApiError, ArrayApiErrorKind, ArrayApiResult};
 use crate::types::Shape;
+use fsci_runtime::Fingerprinter;
 
 pub fn broadcast_shapes(shapes: &[Shape]) -> ArrayApiResult<Shape> {
     if shapes.is_empty() {
@@ -38,10 +39,16 @@ pub fn broadcast_shapes_with_audit(
 ) -> ArrayApiResult<Shape> {
     let result = broadcast_shapes(shapes);
     if let Err(err) = &result {
+        // frankenscipy-3cu8u.1: the shape count, then every shape's dimensions.
+        let mut fingerprinter = Fingerprinter::new("fsci_arrayapi::broadcast_shapes");
+        fingerprinter.usize(shapes.len());
+        for shape in shapes {
+            fingerprinter.shape(&shape.dims);
+        }
         crate::audit::record_array_api_error(
             ledger,
             "broadcast_shapes",
-            format!("{shapes:?}").as_bytes(),
+            &fingerprinter.finish(),
             err.kind,
         );
     }

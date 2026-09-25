@@ -849,7 +849,7 @@ pub fn emit_audit_ledger_named(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fsci_runtime::{AuditAction, AuditEvent, casp_now_unix_ms};
+    use fsci_runtime::{AuditAction, AuditEvent, Fingerprinter, casp_now_unix_ms};
     use std::io::BufRead;
     use tempfile::TempDir;
 
@@ -891,7 +891,7 @@ mod tests {
 
         ledger.record(AuditEvent::new(
             casp_now_unix_ms(),
-            AuditLedger::fingerprint_bytes(b"test1"),
+            Fingerprinter::new("test1").finish(),
             AuditAction::FailClosed {
                 reason: "test_fail".to_string(),
             },
@@ -899,7 +899,7 @@ mod tests {
         ));
         ledger.record(AuditEvent::new(
             casp_now_unix_ms(),
-            AuditLedger::fingerprint_bytes(b"test2"),
+            Fingerprinter::new("test2").finish(),
             AuditAction::BoundedRecovery {
                 recovery_action: "test_recovery".to_string(),
             },

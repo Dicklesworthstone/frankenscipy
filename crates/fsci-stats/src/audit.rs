@@ -33,15 +33,18 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
+/// Record a fail-closed audit event. `fingerprint` is the call's
+/// [`fsci_runtime::Fingerprinter`] digest over every input (frankenscipy-3cu8u.1); it is
+/// stored as is.
 pub fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -50,15 +53,17 @@ pub fn record_fail_closed(
     lock_or_recover(ledger).record(event);
 }
 
+/// Record a bounded-recovery audit event. `fingerprint` is the call's
+/// [`fsci_runtime::Fingerprinter`] digest.
 pub fn record_bounded_recovery(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
@@ -97,8 +102,8 @@ mod tests {
         );
 
         // The fixed record_fail_closed must still land an event.
-        record_fail_closed(&ledger, b"x=NaN", "non_finite_input", "rejected");
-        record_bounded_recovery(&ledger, b"x=Inf", "clamp_to_max", "recovered");
+        record_fail_closed(&ledger, "x=NaN", "non_finite_input", "rejected");
+        record_bounded_recovery(&ledger, "x=Inf", "clamp_to_max", "recovered");
 
         // After clear_poison + into_inner the lock is healthy again.
         let g = ledger

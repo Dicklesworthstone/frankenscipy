@@ -23,6 +23,7 @@ use fsci_arrayapi::{
     CoreArrayBackend, CreationRequest, DType, ExecutionMode, FullRequest, IndexExpr, MemoryOrder,
     ScalarValue, Shape, SliceSpec, broadcast_shapes, from_slice, full, zeros,
 };
+use fsci_runtime::Fingerprinter;
 use serde::Serialize;
 use std::time::Instant;
 
@@ -134,6 +135,13 @@ impl ArrayApiArray for ProfileArray {
     fn dtype(&self) -> DType {
         self.dtype
     }
+
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter) {
+        fingerprinter
+            .shape(&self.shape.dims)
+            .str(&format!("{:?}", self.dtype));
+        fsci_arrayapi::audit::fingerprint_scalars(fingerprinter, &self.values);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -144,6 +152,10 @@ impl ArrayApiBackend for ProfileArrayBackend {
 
     fn namespace_name(&self) -> &'static str {
         "profile_array_api"
+    }
+
+    fn fingerprint_config(&self, fingerprinter: &mut Fingerprinter) {
+        fingerprinter.str(self.namespace_name());
     }
 
     fn shape_of(&self, array: &Self::Array) -> Shape {

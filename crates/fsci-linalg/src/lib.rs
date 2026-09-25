@@ -81,8 +81,8 @@ use bunch_kaufman::{BunchKaufman, Triangle};
 
 pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
-    AttemptOutcome, AuditAction, AuditEvent, AuditLedger, DecisionSignals, PolicyAction,
-    PolicyController, PolicyDecision, RuntimeMode, SolverAction, SolverEvidenceEntry,
+    AttemptOutcome, AuditAction, AuditEvent, AuditLedger, DecisionSignals, Fingerprinter,
+    PolicyAction, PolicyController, PolicyDecision, RuntimeMode, SolverAction, SolverEvidenceEntry,
     SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
 };
 use std::{borrow::Cow, fmt, simd::Simd};
@@ -141,16 +141,17 @@ fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, 
     }
 }
 
-/// Record a fail-closed audit event when validation rejects input.
+/// Record a fail-closed audit event when validation rejects input. `fingerprint` is the
+/// call's [`Fingerprinter`] digest.
 fn record_fail_closed(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     reason: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::FailClosed {
             reason: reason.to_string(),
         },
@@ -162,13 +163,13 @@ fn record_fail_closed(
 /// Record a bounded recovery audit event when hardened mode recovers from an issue.
 fn record_bounded_recovery(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     recovery_action: &str,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::BoundedRecovery {
             recovery_action: recovery_action.to_string(),
         },
@@ -180,7 +181,7 @@ fn record_bounded_recovery(
 /// Record a CASP solver selection decision for audit trail.
 fn record_casp_decision(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     action: SolverAction,
     rcond: f64,
     fallback: bool,
@@ -192,7 +193,7 @@ fn record_casp_decision(
     };
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::ModeDecision {
             mode: RuntimeMode::Strict, // CASP operates in both modes
         },
@@ -203,13 +204,13 @@ fn record_casp_decision(
 
 fn record_mode_decision(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     mode: RuntimeMode,
     outcome: &str,
 ) {
     let event = AuditEvent::new(
         casp_now_unix_ms(),
-        AuditLedger::fingerprint_bytes(input_bytes),
+        fingerprint,
         AuditAction::ModeDecision { mode },
         outcome,
     );
@@ -238,25 +239,25 @@ fn fail_closed_reason(error: &LinalgError) -> Option<&'static str> {
 
 fn record_operation_audit<T>(
     ledger: &SyncSharedAuditLedger,
-    input_bytes: &[u8],
+    fingerprint: &str,
     operation: &str,
     mode: RuntimeMode,
     result: &Result<T, LinalgError>,
 ) {
     match result {
-        Ok(_) => record_mode_decision(ledger, input_bytes, mode, &format!("{operation} executed")),
+        Ok(_) => record_mode_decision(ledger, fingerprint, mode, &format!("{operation} executed")),
         Err(error) => {
             if let Some(reason) = fail_closed_reason(error) {
                 record_fail_closed(
                     ledger,
-                    input_bytes,
+                    fingerprint,
                     reason,
                     &format!("{operation} rejected: {error}"),
                 );
             } else {
                 record_mode_decision(
                     ledger,
-                    input_bytes,
+                    fingerprint,
                     mode,
                     &format!("{operation} errored: {error}"),
                 );
@@ -265,21 +266,82 @@ fn record_operation_audit<T>(
     }
 }
 
-/// Compute a fingerprint for matrix input (first 1KB of flattened data).
-fn matrix_fingerprint(a: &[Vec<f64>]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(1024);
-    for row in a {
-        for &val in row {
-            if bytes.len() >= 1024 {
-                break;
-            }
-            bytes.extend_from_slice(&val.to_le_bytes());
-        }
-        if bytes.len() >= 1024 {
-            break;
-        }
+/// A call's options in its audit fingerprint, field by field in declaration order: enums and
+/// optional enums as their `Debug` rendering (`Strict`, `Some(Symmetric)`), `Option<f64>` as a
+/// presence flag then the value (frankenscipy-3cu8u.1; see [`Fingerprinter`] for the bytes).
+trait FingerprintOptions {
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter);
+}
+
+fn fingerprint_optional(fingerprinter: &mut Fingerprinter, value: Option<f64>) {
+    fingerprinter.bool(value.is_some());
+    if let Some(value) = value {
+        fingerprinter.f64(value);
     }
-    bytes
+}
+
+impl FingerprintOptions for SolveOptions {
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter) {
+        fingerprinter
+            .str(&format!("{:?}", self.mode))
+            .bool(self.check_finite)
+            .str(&format!("{:?}", self.assume_a))
+            .bool(self.lower)
+            .bool(self.transposed);
+    }
+}
+
+impl FingerprintOptions for InvOptions {
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter) {
+        fingerprinter
+            .str(&format!("{:?}", self.mode))
+            .bool(self.check_finite)
+            .str(&format!("{:?}", self.assume_a))
+            .bool(self.lower);
+    }
+}
+
+impl FingerprintOptions for TriangularSolveOptions {
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter) {
+        fingerprinter
+            .str(&format!("{:?}", self.mode))
+            .bool(self.check_finite)
+            .str(&format!("{:?}", self.trans))
+            .bool(self.lower)
+            .bool(self.unit_diagonal);
+    }
+}
+
+impl FingerprintOptions for LstsqOptions {
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter) {
+        fingerprinter
+            .str(&format!("{:?}", self.mode))
+            .bool(self.check_finite);
+        fingerprint_optional(fingerprinter, self.cond);
+        fingerprinter.str(&format!("{:?}", self.driver));
+    }
+}
+
+impl FingerprintOptions for PinvOptions {
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter) {
+        fingerprinter
+            .str(&format!("{:?}", self.mode))
+            .bool(self.check_finite);
+        fingerprint_optional(fingerprinter, self.atol);
+        fingerprint_optional(fingerprinter, self.rtol);
+    }
+}
+
+/// The audit fingerprint of `routine` over its data inputs (fed by `inputs`) and `options`.
+fn audit_fingerprint(
+    routine: &str,
+    options: &dyn FingerprintOptions,
+    inputs: impl FnOnce(&mut Fingerprinter),
+) -> String {
+    let mut fingerprinter = Fingerprinter::new(routine);
+    inputs(&mut fingerprinter);
+    options.fingerprint_into(&mut fingerprinter);
+    fingerprinter.finish()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1039,7 +1101,9 @@ pub fn solve_triangular_with_audit(
     options: TriangularSolveOptions,
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<SolveResult, LinalgError> {
-    let fingerprint = matrix_fingerprint(a);
+    let fingerprint = audit_fingerprint("fsci_linalg::solve_triangular", &options, |f| {
+        f.rows(a).f64s(b);
+    });
     let result = solve_triangular(a, b, options);
     record_operation_audit(
         audit_ledger,
@@ -1111,7 +1175,9 @@ pub fn solve_banded_with_audit(
     options: SolveOptions,
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<SolveResult, LinalgError> {
-    let fingerprint = matrix_fingerprint(ab);
+    let fingerprint = audit_fingerprint("fsci_linalg::solve_banded", &options, |f| {
+        f.usize(l_and_u.0).usize(l_and_u.1).rows(ab).f64s(b);
+    });
     let result = solve_banded(l_and_u, ab, b, options);
     record_operation_audit(
         audit_ledger,
@@ -1205,7 +1271,9 @@ pub fn inv_with_audit(
     options: InvOptions,
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<InvResult, LinalgError> {
-    let fingerprint = matrix_fingerprint(a);
+    let fingerprint = audit_fingerprint("fsci_linalg::inv", &options, |f| {
+        f.rows(a);
+    });
     let result = inv(a, options);
     record_operation_audit(audit_ledger, &fingerprint, "inv", options.mode, &result);
     result
@@ -1275,7 +1343,11 @@ pub fn det_with_audit(
     check_finite: bool,
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<f64, LinalgError> {
-    let fingerprint = matrix_fingerprint(a);
+    let fingerprint = Fingerprinter::new("fsci_linalg::det")
+        .rows(a)
+        .str(&format!("{mode:?}"))
+        .bool(check_finite)
+        .finish();
     let result = det(a, mode, check_finite);
     record_operation_audit(audit_ledger, &fingerprint, "det", mode, &result);
     result
@@ -1292,7 +1364,9 @@ pub fn lstsq_with_audit(
     options: LstsqOptions,
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<LstsqResult, LinalgError> {
-    let fingerprint = matrix_fingerprint(a);
+    let fingerprint = audit_fingerprint("fsci_linalg::lstsq", &options, |f| {
+        f.rows(a).f64s(b);
+    });
     let result = lstsq(a, b, options);
     record_operation_audit(audit_ledger, &fingerprint, "lstsq", options.mode, &result);
     result
@@ -1308,7 +1382,9 @@ pub fn pinv_with_audit(
     options: PinvOptions,
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<PinvResult, LinalgError> {
-    let fingerprint = matrix_fingerprint(a);
+    let fingerprint = audit_fingerprint("fsci_linalg::pinv", &options, |f| {
+        f.rows(a);
+    });
     let result = pinv(a, options);
     record_operation_audit(audit_ledger, &fingerprint, "pinv", options.mode, &result);
     result
@@ -2505,7 +2581,9 @@ pub fn solve_with_audit(
     portfolio: &mut SolverPortfolio,
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<SolveResult, LinalgError> {
-    let fingerprint = matrix_fingerprint(a);
+    let fingerprint = audit_fingerprint("fsci_linalg::solve", &options, |f| {
+        f.rows(a).f64s(b);
+    });
     let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
     let a = mirrored.as_deref().unwrap_or(a);
     let (rows, cols) = matrix_shape(a)?;
@@ -27920,15 +27998,15 @@ mod tests {
             "ledger must be poisoned after panic"
         );
 
-        record_fail_closed(&audit_ledger, b"bad matrix", "non_finite_input", "rejected");
+        record_fail_closed(&audit_ledger, "bad matrix", "non_finite_input", "rejected");
         record_bounded_recovery(
             &audit_ledger,
-            b"recovered matrix",
+            "recovered matrix",
             "svd_fallback",
             "recovered",
         );
-        record_casp_decision(&audit_ledger, b"casp", SolverAction::DirectLU, 1.0, false);
-        record_mode_decision(&audit_ledger, b"mode", RuntimeMode::Strict, "executed");
+        record_casp_decision(&audit_ledger, "casp", SolverAction::DirectLU, 1.0, false);
+        record_mode_decision(&audit_ledger, "mode", RuntimeMode::Strict, "executed");
 
         let ledger = audit_ledger
             .lock()
@@ -39800,19 +39878,56 @@ mod tests {
         assert!(entry.outcome.contains("det rejected"));
     }
 
+    /// frankenscipy-3cu8u.1: the audit fingerprint covers every input and option. It used to
+    /// hash only the first KiB of `a`, so these calls all shared one fingerprint.
     #[test]
-    fn matrix_fingerprint_is_deterministic() {
-        let a = vec![vec![1.0, 2.0], vec![3.0, 4.0]];
-        let fp1 = matrix_fingerprint(&a);
-        let fp2 = matrix_fingerprint(&a);
-        assert_eq!(fp1, fp2, "fingerprint should be deterministic");
-    }
+    fn audit_fingerprints_cover_every_input_and_option() {
+        let fingerprint_of = |a: &[Vec<f64>], b: &[f64], options: SolveOptions| {
+            let ledger = AuditLedger::shared();
+            let mut portfolio = SolverPortfolio::new(options.mode, 4);
+            let _ = solve_with_audit(a, b, options, &mut portfolio, &ledger);
+            let events = lock_or_recover(&ledger).entries().to_vec();
+            assert!(!events.is_empty(), "solve_with_audit records an event");
+            assert!(
+                events
+                    .iter()
+                    .all(|e| e.input_fingerprint == events[0].input_fingerprint),
+                "one call, one fingerprint"
+            );
+            events[0].input_fingerprint.clone()
+        };
+        // 20×20: the first KiB is the first 128 values; the last value is beyond it.
+        let a: Vec<Vec<f64>> = (0..20)
+            .map(|i| {
+                (0..20)
+                    .map(|j| if i == j { 40.0 } else { ((i + j) % 7) as f64 })
+                    .collect()
+            })
+            .collect();
+        let b = vec![1.0; 20];
+        let base = fingerprint_of(&a, &b, SolveOptions::default());
+        assert_eq!(base, fingerprint_of(&a, &b, SolveOptions::default()));
+        assert!(base.starts_with("blake3:"));
 
-    #[test]
-    fn matrix_fingerprint_truncates_large_input() {
-        let large: Vec<Vec<f64>> = (0..100).map(|i| vec![i as f64; 100]).collect();
-        let fp = matrix_fingerprint(&large);
-        assert!(fp.len() <= 1024, "fingerprint should be <= 1KB");
+        let mut tail = a.clone();
+        tail[19][19] += 1.0;
+        assert_ne!(base, fingerprint_of(&tail, &b, SolveOptions::default()));
+        let mut other_b = b.clone();
+        other_b[19] = 2.0;
+        assert_ne!(base, fingerprint_of(&a, &other_b, SolveOptions::default()));
+        let transposed = SolveOptions {
+            transposed: true,
+            ..SolveOptions::default()
+        };
+        assert_ne!(base, fingerprint_of(&a, &b, transposed));
+
+        // The routine is part of the fingerprint: `inv` of the same matrix differs.
+        let ledger = AuditLedger::shared();
+        let _ = inv_with_audit(&a, InvOptions::default(), &ledger);
+        assert_ne!(
+            base,
+            lock_or_recover(&ledger).entries()[0].input_fingerprint
+        );
     }
 }
 

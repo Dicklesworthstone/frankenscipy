@@ -65,7 +65,7 @@ fn diff_special_audit_record_helpers() {
     let ledger = sync_audit_ledger();
 
     let before = ledger_len(&ledger);
-    record_fail_closed(&ledger, b"input-special-A", "non_finite_input", "rejected");
+    record_fail_closed(&ledger, "input-special-A", "non_finite_input", "rejected");
     let after = ledger_len(&ledger);
     diffs.push(CaseDiff {
         case_id: "fail_closed_appends".into(),
@@ -77,7 +77,7 @@ fn diff_special_audit_record_helpers() {
     let before = ledger_len(&ledger);
     record_bounded_recovery(
         &ledger,
-        b"input-special-B",
+        "input-special-B",
         "scaled_argument_recovery",
         "succeeded",
     );
