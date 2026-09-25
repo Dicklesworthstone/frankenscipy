@@ -330,6 +330,25 @@ impl Fingerprinter {
         self.hasher.update(&value.to_le_bytes());
     }
 
+    /// `values` as consecutive little-endian words: the same bytes as one [`Self::word`] each,
+    /// packed so BLAKE3 sees one `update` per 16 KiB instead of one per word (an update spanning
+    /// many 1 KiB BLAKE3 chunks is what lets it hash them across SIMD lanes). Measured on hz2
+    /// for a 1024×1024 matrix (frankenscipy-3cu8u.1): word-at-a-time 17–21 ms, 11–16% of
+    /// `solve_with_audit`; 4 KiB updates 7.7–8.2 ms.
+    fn words(&mut self, values: impl IntoIterator<Item = u64>) {
+        let mut chunk = [0_u8; 16 * 1024];
+        let mut filled = 0;
+        for value in values {
+            chunk[filled..filled + 8].copy_from_slice(&value.to_le_bytes());
+            filled += 8;
+            if filled == chunk.len() {
+                self.hasher.update(&chunk);
+                filled = 0;
+            }
+        }
+        self.hasher.update(&chunk[..filled]);
+    }
+
     fn tagged_bytes(&mut self, tag: u8, bytes: &[u8]) {
         self.hasher.update(&[tag]);
         self.word(bytes.len() as u64);
@@ -339,28 +358,25 @@ impl Fingerprinter {
     pub fn shape(&mut self, dims: &[usize]) -> &mut Self {
         self.hasher.update(b"S");
         self.word(dims.len() as u64);
-        for &dim in dims {
-            self.word(dim as u64);
-        }
+        self.words(dims.iter().map(|&dim| dim as u64));
         self
     }
 
     pub fn f64s(&mut self, values: &[f64]) -> &mut Self {
         self.hasher.update(b"F");
         self.word(values.len() as u64);
-        for value in values {
-            self.word(value.to_bits());
-        }
+        self.words(values.iter().map(|value| value.to_bits()));
         self
     }
 
     pub fn complex(&mut self, values: &[(f64, f64)]) -> &mut Self {
         self.hasher.update(b"C");
         self.word(values.len() as u64);
-        for &(re, im) in values {
-            self.word(re.to_bits());
-            self.word(im.to_bits());
-        }
+        self.words(
+            values
+                .iter()
+                .flat_map(|&(re, im)| [re.to_bits(), im.to_bits()]),
+        );
         self
     }
 
@@ -368,12 +384,9 @@ impl Fingerprinter {
     pub fn rows(&mut self, rows: &[Vec<f64>]) -> &mut Self {
         self.hasher.update(b"M");
         self.word(rows.len() as u64);
-        for row in rows {
-            self.word(row.len() as u64);
-            for value in row {
-                self.word(value.to_bits());
-            }
-        }
+        self.words(rows.iter().flat_map(|row| {
+            std::iter::once(row.len() as u64).chain(row.iter().map(|value| value.to_bits()))
+        }));
         self
     }
 
@@ -486,6 +499,64 @@ mod tests {
         word(&mut expected, 2);
         expected.extend_from_slice(b"\x00\x01");
 
+        assert_eq!(
+            fingerprinter.finish(),
+            format!("blake3:{}", hash(&expected).to_hex())
+        );
+    }
+
+    /// Records longer than one 16 KiB (2048-word) chunk, ragged rows straddling chunk
+    /// boundaries, and a record ending exactly on a boundary hash to the same bytes as the
+    /// documented word-at-a-time encoding.
+    #[test]
+    fn fingerprinter_chunking_is_invisible_in_the_encoding() {
+        let long: Vec<f64> = (0..5000).map(|i| f64::from(i) * 0.25 - 7.0).collect();
+        // 2048 words: exactly one full chunk, then an empty tail.
+        let exact: Vec<f64> = (0..2048).map(f64::from).collect();
+        // 9 ragged rows, 3528 words with the lengths: crosses one boundary mid-row.
+        let rows: Vec<Vec<f64>> = (0..9)
+            .map(|r| (0..(r * 97 + 3)).map(|c| f64::from(r * 1000 + c)).collect())
+            .collect();
+        let pairs: Vec<(f64, f64)> = (0..1500).map(|i| (f64::from(i), -f64::from(i))).collect();
+        let dims: Vec<usize> = (0..600).collect();
+        let mut fingerprinter = Fingerprinter::new("chunks");
+        fingerprinter
+            .f64s(&long)
+            .f64s(&exact)
+            .rows(&rows)
+            .complex(&pairs)
+            .shape(&dims);
+
+        let word = |bytes: &mut Vec<u8>, value: u64| bytes.extend_from_slice(&value.to_le_bytes());
+        let mut expected = vec![b'R'];
+        word(&mut expected, 6);
+        expected.extend_from_slice(b"chunks");
+        for values in [&long, &exact] {
+            expected.push(b'F');
+            word(&mut expected, values.len() as u64);
+            for value in values.iter() {
+                word(&mut expected, value.to_bits());
+            }
+        }
+        expected.push(b'M');
+        word(&mut expected, rows.len() as u64);
+        for row in &rows {
+            word(&mut expected, row.len() as u64);
+            for value in row {
+                word(&mut expected, value.to_bits());
+            }
+        }
+        expected.push(b'C');
+        word(&mut expected, pairs.len() as u64);
+        for &(re, im) in &pairs {
+            word(&mut expected, re.to_bits());
+            word(&mut expected, im.to_bits());
+        }
+        expected.push(b'S');
+        word(&mut expected, dims.len() as u64);
+        for &dim in &dims {
+            word(&mut expected, dim as u64);
+        }
         assert_eq!(
             fingerprinter.finish(),
             format!("blake3:{}", hash(&expected).to_hex())
