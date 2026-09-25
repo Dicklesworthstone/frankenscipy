@@ -213,11 +213,13 @@ pub struct SolverEvidenceEntry {
 /// the failure rates and the rule (frankenscipy-7tb8d.2). Measured, LU's backward error passes
 /// the portfolio's acceptance test at every conditioning except where pivot growth defeats it,
 /// so LU has the least expected loss in every state. QR (twice LU's flops) is the fallback
-/// when LU's backward error fails. The SVD's truncation fails that test on a quarter of
-/// ill-conditioned matrices, so it comes last. The hand-set matrix this replaced sent moderate
-/// conditioning to QR and ill conditioning to the SVD.
+/// when LU's backward error fails. The SVD refuses a square system whose numerical rank is short
+/// (its rank cutoff), about a quarter of the ill-conditioned matrices, so it comes last. The
+/// hand-set matrix this replaced sent moderate conditioning to QR and ill conditioning to the SVD.
 ///
-/// Decision: a* = argmin_a Σ_s L(a,s) × P(s|evidence)
+/// Decision: a* = argmin_a Σ_s L(a,s) × P(s|evidence), where an action with attempts recorded
+/// at this rcond decade has the failure term of its loss replaced by what they showed
+/// (frankenscipy-3iekl, [`learned_loss`]).
 #[derive(Debug, Clone)]
 pub struct SolverPortfolio {
     mode: RuntimeMode,
@@ -228,6 +230,11 @@ pub struct SolverPortfolio {
     /// Dirichlet outcome counts over the four condition states, one row per decade of rcond
     /// (see [`rcond_decade`]). Filled by [`SolverPortfolio::record_outcome`].
     outcome_counts: [[f64; 4]; RCOND_DECADES],
+    /// `[failures, trials]` per rcond decade and action, from the same recorded outcomes
+    /// (frankenscipy-3iekl). They replace the calibrated failure term of an action's expected
+    /// loss (see [`learned_loss`]). Unlike the state counts they can move the decision: the
+    /// calibrated losses rank LU first in every state, so no state posterior can.
+    failure_counts: [[[f64; 2]; 6]; RCOND_DECADES],
 }
 
 /// How an attempted dense solve turned out, as fed back to the portfolio.
@@ -268,6 +275,42 @@ const OK_PROBABILITY: [[f64; 4]; 6] = [
 /// Share of the non-`Ok` probability that is `Inaccurate` (the rest is `Failed`).
 const INACCURATE_SHARE: f64 = 0.7;
 
+/// Pseudo-trials the calibrated failure rate carries in the Beta posterior of an action's
+/// failure rate at an rcond decade (frankenscipy-3iekl).
+const FAILURE_PRIOR_TRIALS: f64 = 4.0;
+
+/// An action's expected loss once attempts with it at this rcond decade have been recorded
+/// (frankenscipy-3iekl). The calibrated loss is `cost + p0 × r`: `p0` the measured failure rate
+/// under the state posterior and `r` the expected recovery cost it implies. The recorded
+/// attempts replace `p0` by the Beta posterior mean `(m·p0 + failures) / (m + trials)`, with `m`
+/// = [`FAILURE_PRIOR_TRIALS`], and keep `r`. An action the corpus never saw fail implies no
+/// `r`; its failure is priced at the cheapest other general solver, the one that would recover.
+fn learned_loss(
+    calibrated: f64,
+    action: usize,
+    posterior: [f64; 4],
+    failures: f64,
+    trials: f64,
+) -> f64 {
+    let cost = calibrated_losses::SOLVER_ACTION_COST[action];
+    let p0: f64 = calibrated_losses::SOLVER_FAILURE_RATE[action]
+        .iter()
+        .zip(posterior)
+        .map(|(rate, p)| rate * p)
+        .sum();
+    let failure_term = calibrated - cost;
+    let recovery = if p0 > 0.0 && failure_term > 0.0 {
+        failure_term / p0
+    } else {
+        (0..3)
+            .filter(|&other| other != action)
+            .map(|other| calibrated_losses::SOLVER_ACTION_COST[other])
+            .fold(f64::INFINITY, f64::min)
+    };
+    let failure_rate = (FAILURE_PRIOR_TRIALS * p0 + failures) / (FAILURE_PRIOR_TRIALS + trials);
+    cost + failure_rate * recovery
+}
+
 /// The decade row an rcond value's outcomes are counted in.
 fn rcond_decade(rcond: f64) -> usize {
     if !rcond.is_finite() || rcond <= 0.0 {
@@ -292,6 +335,7 @@ impl SolverPortfolio {
             evidence_capacity,
             calibrator: ConformalCalibrator::new(0.05, 200),
             outcome_counts: [[0.0; 4]; RCOND_DECADES],
+            failure_counts: [[[0.0; 2]; 6]; RCOND_DECADES],
         }
     }
 
@@ -345,6 +389,11 @@ impl SolverPortfolio {
     /// LU results at an rcond the map calls well conditioned therefore move that decade's
     /// posterior toward the ill-conditioned states, and the next decision there changes.
     pub fn record_outcome(&mut self, rcond: f64, action: SolverAction, outcome: AttemptOutcome) {
+        let tally = &mut self.failure_counts[rcond_decade(rcond)][action.index()];
+        tally[1] += 1.0;
+        if outcome != AttemptOutcome::Ok {
+            tally[0] += 1.0;
+        }
         let prior = self.smoothed_posterior(rcond);
         let ok = OK_PROBABILITY[action.index()];
         let mut responsibility = [0.0; 4];
@@ -400,7 +449,7 @@ impl SolverPortfolio {
         excluded: &[SolverAction],
     ) -> Option<(SolverAction, [f64; 4], [f64; 6], f64)> {
         let posterior = self.posterior(rcond);
-        let losses = self.compute_expected_losses(posterior);
+        let losses = self.compute_expected_losses(posterior, rcond);
 
         // If conformal calibrator detects drift, override to SVDFallback
         if self.calibrator.should_fallback() && !excluded.contains(&SolverAction::SVDFallback) {
@@ -480,7 +529,7 @@ impl SolverPortfolio {
     }
 
     /// A digest of everything [`Self::select_action`] reads: the mode, the loss matrix, the
-    /// outcome counts and the calibrator's state, as a [`Fingerprinter`] `"blake3:…"`
+    /// outcome and failure counts and the calibrator's state, as a [`Fingerprinter`] `"blake3:…"`
     /// (frankenscipy-7tb8d.12). Two portfolios with one digest decide identically. A solve
     /// certificate records the digest of the portfolio that made its decision, so the decision
     /// replays against a snapshot of that portfolio, and a snapshot in any other state is
@@ -492,7 +541,8 @@ impl SolverPortfolio {
         fingerprinter
             .str(&format!("{:?}", self.mode))
             .f64s(self.loss_matrix.as_flattened())
-            .f64s(self.outcome_counts.as_flattened());
+            .f64s(self.outcome_counts.as_flattened())
+            .f64s(self.failure_counts.as_flattened().as_flattened());
         self.calibrator.fingerprint_into(&mut fingerprinter);
         fingerprinter.finish()
     }
@@ -507,12 +557,29 @@ impl SolverPortfolio {
         &self.calibrator
     }
 
-    fn compute_expected_losses(&self, posterior: [f64; 4]) -> [f64; 6] {
+    /// Σ_s L(a,s) · P(s), with the failure term of every action that has recorded attempts at
+    /// `rcond`'s decade replaced by what they showed ([`learned_loss`]). An action with none
+    /// keeps the calibrated value exactly, so a fresh portfolio decides as before, bit for bit.
+    fn compute_expected_losses(&self, posterior: [f64; 4], rcond: f64) -> [f64; 6] {
         let mut losses = [0.0; 6];
         for (action_idx, row) in self.loss_matrix.iter().enumerate() {
             losses[action_idx] = row.iter().zip(posterior.iter()).map(|(l, p)| l * p).sum();
         }
+        let tallies = &self.failure_counts[rcond_decade(rcond)];
+        for (action_idx, loss) in losses.iter_mut().enumerate() {
+            let [failures, trials] = tallies[action_idx];
+            if trials > 0.0 {
+                *loss = learned_loss(*loss, action_idx, posterior, failures, trials);
+            }
+        }
         losses
+    }
+
+    /// `[failures, trials]` recorded per action at `rcond`'s decade, in `SolverAction::ALL`
+    /// order (for diagnostics and audit).
+    #[must_use]
+    pub fn failure_counts(&self, rcond: f64) -> [[f64; 2]; 6] {
+        self.failure_counts[rcond_decade(rcond)]
     }
 
     /// The PRIOR map from rcond to condition states: piecewise-linear in `log10(rcond)` between
@@ -1969,8 +2036,9 @@ mod tests {
     //
     // Whether the moved posterior moves the DECISION depends on the loss matrix. Under a
     // state-dependent one, the hand-set matrix fixed here, it does. Under the calibrated one
-    // (frankenscipy-7tb8d.2), LU has the least loss in every state, so it does not: LU fails by
-    // pivot growth, which a conditioning state does not describe.
+    // (frankenscipy-7tb8d.2), LU has the least loss in every state, so the posterior alone
+    // cannot: LU fails by pivot growth, which a conditioning state does not describe. What moves
+    // it there is the recorded failure rate of LU itself (frankenscipy-3iekl).
     #[test]
     fn recorded_outcomes_move_the_posterior_and_the_decision() {
         const HAND_SET: [[f64; 4]; 6] = [
@@ -2013,14 +2081,69 @@ mod tests {
         assert_eq!(ok.select_action(rcond, None).0, SolverAction::DirectLU);
         assert!(ok.posterior(rcond)[0] >= p0[0] - 0.05);
 
-        // Under the calibrated losses the same outcomes move the posterior, not the choice.
+        // Under the calibrated losses the same outcomes move the posterior, and LU's own
+        // failure rate moves the choice (frankenscipy-3iekl).
         let mut calibrated = SolverPortfolio::new(RuntimeMode::Strict, 8);
         for _ in 0..50 {
             calibrated.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Inaccurate);
         }
         let (choice, p2, ..) = calibrated.select_action(rcond, None);
         assert!(p2[2] + p2[3] > p0[2] + p0[3] + 0.5, "{p0:?} -> {p2:?}");
-        assert_eq!(choice, SolverAction::DirectLU);
+        assert_eq!(choice, SolverAction::PivotedQR);
+    }
+
+    /// frankenscipy-3iekl: under the calibrated losses, recorded failures of an action raise ITS
+    /// expected loss at that rcond decade until the next solver wins, and recorded successes
+    /// lower it again. A fresh portfolio decides exactly as the calibrated matrix does.
+    #[test]
+    fn recorded_failures_move_the_calibrated_decision() {
+        let rcond = 1e-3;
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 8);
+        let (cold, posterior, cold_losses, _) = portfolio.select_action(rcond, None);
+        assert_eq!(cold, SolverAction::DirectLU);
+        for (a, row) in SolverPortfolio::default_loss_matrix().iter().enumerate() {
+            let calibrated: f64 = row.iter().zip(posterior).map(|(l, p)| l * p).sum();
+            assert_eq!(cold_losses[a].to_bits(), calibrated.to_bits(), "action {a}");
+        }
+
+        // LU keeps failing at this decade: it holds for a few failures, then QR takes over.
+        let mut failures = 0;
+        while portfolio.select_action(rcond, None).0 == SolverAction::DirectLU {
+            portfolio.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Inaccurate);
+            failures += 1;
+            assert!(failures <= 10, "LU still chosen after {failures} failures");
+        }
+        let (switched, _, losses, _) = portfolio.select_action(rcond, None);
+        println!("rcond 1e-3: QR after {failures} LU failures, losses {losses:?}");
+        assert_eq!(switched, SolverAction::PivotedQR);
+        assert!(failures >= 2, "one failure must not be enough ({failures})");
+        assert_eq!(
+            portfolio.failure_counts(rcond)[SolverAction::DirectLU.index()],
+            [f64::from(failures), f64::from(failures)]
+        );
+
+        // Must-miss: the failures stay at their decade.
+        for other in [0.5, 1e-2, 1e-4, 1e-9] {
+            assert_eq!(
+                portfolio.select_action(other, None).0,
+                SolverAction::DirectLU,
+                "rcond {other:e}"
+            );
+        }
+
+        // Successes bring LU back.
+        let mut successes = 0;
+        while portfolio.select_action(rcond, None).0 != SolverAction::DirectLU {
+            portfolio.record_outcome(rcond, SolverAction::DirectLU, AttemptOutcome::Ok);
+            successes += 1;
+            assert!(successes <= 10, "LU not back after {successes} successes");
+        }
+        println!("rcond 1e-3: LU back after {successes} successes");
+
+        // The tallies are part of the state a certificate replays against.
+        let mut untallied = portfolio.clone();
+        untallied.failure_counts = [[[0.0; 2]; 6]; RCOND_DECADES];
+        assert_ne!(portfolio.state_digest(), untallied.state_digest());
     }
 
     // frankenscipy-7tb8d.1: the fallback re-ranks the REMAINING actions under the updated
@@ -2278,6 +2401,25 @@ mod tests {
                     rule.to_bits(),
                     loss.to_bits(),
                     "{} in state {s}: the rule gives {rule:e}, the loss is {loss:e}",
+                    names[a]
+                );
+            }
+        }
+
+        // frankenscipy-3iekl: the loss's two terms, as generated, are the report's too.
+        let rates = table("failure_rate");
+        for a in 0..6 {
+            assert_eq!(
+                calibrated_losses::SOLVER_ACTION_COST[a].to_bits(),
+                cost[a].to_bits(),
+                "{} cost",
+                names[a]
+            );
+            for s in 0..4 {
+                assert_eq!(
+                    calibrated_losses::SOLVER_FAILURE_RATE[a][s].to_bits(),
+                    rates[a][s].to_bits(),
+                    "{} failure rate in state {s}",
                     names[a]
                 );
             }

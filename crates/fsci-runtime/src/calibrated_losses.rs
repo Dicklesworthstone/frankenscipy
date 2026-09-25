@@ -19,3 +19,19 @@ pub(crate) const SOLVER_LOSS_MATRIX: [[f64; 4]; 6] = [
     [0.0, 0.0, 0.0, 0.0], // TriangularFastPath
     [0.5, 0.5, 0.5, 0.5], // SymmetricFastPath
 ];
+
+/// Each action's cost in the loss: leading-order flops relative to LU.
+#[rustfmt::skip]
+pub(crate) const SOLVER_ACTION_COST: [f64; 6] = [1.0, 2.0, 31.5, 0.0, 0.0, 0.5];
+
+/// The measured failure rate of each action in each state (state-weighted over the
+/// corpus; an unmeasured pair is 1).
+#[rustfmt::skip]
+pub(crate) const SOLVER_FAILURE_RATE: [[f64; 4]; 6] = [
+    [0.01599630495002933, 0.0003381254486868826, 0.0, 0.0], // DirectLU
+    [0.0, 0.0, 0.0, 0.0], // PivotedQR
+    [0.0, 0.0021466321814016215, 0.266468452116023, 0.9163039559984879], // SVDFallback
+    [0.0, 0.0, 0.0, 0.0], // DiagonalFastPath
+    [0.0, 0.0, 0.0, 0.0], // TriangularFastPath
+    [0.0, 0.0, 0.0, 0.0], // SymmetricFastPath
+];

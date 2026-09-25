@@ -658,6 +658,36 @@ fn main() {
         );
     }
     module.push_str("];\n");
+    // frankenscipy-3iekl: the two terms the loss is made of, so the portfolio can replace the
+    // failure term with what it observes. `loss(a, s) = COST[a] + FAILURE_RATE[a][s] × (the
+    // expected recovery cost of a failure)`.
+    let _ = write!(
+        module,
+        "\n/// Each action's cost in the loss: leading-order flops relative to LU.\n\
+         #[rustfmt::skip]\n\
+         pub(crate) const SOLVER_ACTION_COST: [f64; 6] = [{}];\n\
+         \n\
+         /// The measured failure rate of each action in each state (state-weighted over the\n\
+         /// corpus; an unmeasured pair is 1).\n\
+         #[rustfmt::skip]\n\
+         pub(crate) const SOLVER_FAILURE_RATE: [[f64; 4]; 6] = [\n",
+        COST.iter()
+            .map(|v| format!("{v:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for (a, row) in rates.iter().enumerate() {
+        let _ = writeln!(
+            module,
+            "    [{}], // {:?}",
+            row.iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            SolverAction::ALL[a]
+        );
+    }
+    module.push_str("];\n");
 
     println!("===BEGIN casp-calibration-solver.json===");
     print!("{report}");
