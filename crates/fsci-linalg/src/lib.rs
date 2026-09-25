@@ -765,8 +765,11 @@ pub struct ConditionReport {
 
 struct ConditionDiagnosticsWork {
     report: ConditionReport,
+    /// The matrix as a `DMatrix`, when the diagnostics built one (the nalgebra LU route).
     matrix_cache: Option<DMatrix<f64>>,
-    lu_cache: Option<LU<f64, Dyn, Dyn>>,
+    /// The LU factorization the rcond estimate came from; the portfolio's LU actions and the
+    /// accuracy certificate reuse it rather than factor again.
+    lu_cache: Option<LuFactorStorage>,
 }
 
 /// Result of LU decomposition with partial pivoting.
@@ -1948,6 +1951,18 @@ fn condition_diagnostics_with_assumption_mode(
         fast_rcond_triangular(a, true)
     } else if upper_triangular && !lower_triangular {
         fast_rcond_triangular(a, false)
+    } else if rows > 4
+        && rows >= lu_factor_flat_min()
+        && !flat_lu_factor_disabled()
+        && let Some(factors) = lu_factor_blocked(a)
+    {
+        // frankenscipy-u87cd: from `lu_factor`'s measured crossover up, the parallel blocked
+        // LU `solve()` and `lu_factor` use, not nalgebra's serial one; the rcond estimate is
+        // the same Higham iteration over it. A singular pivot falls through to nalgebra below,
+        // so singular matrices are diagnosed exactly as before.
+        let rcond = fast_rcond_from_flat_lu(&factors, matrix_norm1_rows(a, cols));
+        lu_cache = Some(LuFactorStorage::Flat(factors));
+        rcond
     } else {
         let (matrix, matrix_norm_1) = dmatrix_from_rows_with_norm1(a)?;
         let lu = matrix.clone().lu();
@@ -1960,7 +1975,7 @@ fn condition_diagnostics_with_assumption_mode(
             fast_rcond_from_lu(&lu, matrix_norm_1, rows)
         };
         matrix_cache = Some(matrix);
-        lu_cache = Some(lu);
+        lu_cache = Some(LuFactorStorage::Nalgebra(lu));
         rcond
     };
 
@@ -2452,6 +2467,8 @@ enum InverseAccess<'a> {
     Triangular { lower: bool },
     /// An LU factorization of `A`.
     Lu(&'a LU<f64, Dyn, Dyn>),
+    /// A blocked LU factorization of `A` (frankenscipy-u87cd).
+    Flat(&'a LuFactorsFlat),
 }
 
 /// LAPACK xGERFS's forward error bound (see [`AccuracyCertificate::forward_error_bound`]).
@@ -2504,6 +2521,23 @@ fn forward_error_bound(
                 None => return (None, ForwardBoundMethod::Unavailable),
             }
         }
+        InverseAccess::Flat(factors) if n <= FORWARD_BOUND_EXPLICIT_MAX_N => {
+            // Column j of A⁻¹ solves A·c = e_j.
+            let columns: Option<Vec<Vec<f64>>> = (0..n)
+                .map(|j| {
+                    let mut e = vec![0.0; n];
+                    e[j] = 1.0;
+                    lu_solve_flat_factored(factors, &e)
+                })
+                .collect();
+            match columns {
+                Some(columns) => (
+                    explicit(&|i, j| columns[j][i]),
+                    ForwardBoundMethod::ExplicitInverse,
+                ),
+                None => return (None, ForwardBoundMethod::Unavailable),
+            }
+        }
         // ‖ |A⁻¹| g ‖∞ = ‖ A⁻¹·diag(g) ‖∞ = ‖ M ‖₁ with M = diag(g)·A⁻ᵀ, as xGERFS estimates it.
         InverseAccess::Triangular { lower } => {
             let solve_with = |v: &mut Vec<f64>, trans: TriangularTranspose| {
@@ -2542,6 +2576,23 @@ fn forward_error_bound(
                     let rhs = DVector::from_iterator(n, v.iter().zip(&g).map(|(e, gi)| e * gi));
                     match lu.solve(&rhs) {
                         Some(w) => *v = w.iter().copied().collect(),
+                        None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                    }
+                },
+            );
+            (estimate, ForwardBoundMethod::Estimated)
+        }
+        InverseAccess::Flat(factors) => {
+            let estimate = one_norm_estimate(
+                n,
+                |v| match lu_subst_factored_transpose(factors, v) {
+                    Some(w) => *v = w.iter().zip(&g).map(|(e, gi)| e * gi).collect(),
+                    None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                },
+                |v| {
+                    let rhs: Vec<f64> = v.iter().zip(&g).map(|(e, gi)| e * gi).collect();
+                    match lu_solve_flat_factored(factors, &rhs) {
+                        Some(w) => *v = w,
                         None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
                     }
                 },
@@ -2598,7 +2649,7 @@ fn certify_accuracy(
     b: &[f64],
     x: &[f64],
     report: &ConditionReport,
-    lu: Option<&LU<f64, Dyn, Dyn>>,
+    lu: Option<&LuFactorStorage>,
 ) -> AccuracyCertificate {
     let part = solved_part(report);
     let solved = solved_matrix(a, part);
@@ -2609,7 +2660,8 @@ fn certify_accuracy(
         SolvedPart::LowerTriangle => Some(InverseAccess::Triangular { lower: true }),
         SolvedPart::UpperTriangle => Some(InverseAccess::Triangular { lower: false }),
         SolvedPart::Full => match lu {
-            Some(lu) => Some(InverseAccess::Lu(lu)),
+            Some(LuFactorStorage::Nalgebra(lu)) => Some(InverseAccess::Lu(lu)),
+            Some(LuFactorStorage::Flat(factors)) => Some(InverseAccess::Flat(factors)),
             None => match dmatrix_from_rows(&solved) {
                 Ok(matrix) => {
                     fresh_lu = matrix.lu();
@@ -2850,16 +2902,28 @@ fn dispatch_solve_action(
     report: &ConditionReport,
     symmetric: SymmetricFactorization,
     matrix_cache: &mut Option<DMatrix<f64>>,
-    lu_cache: &mut Option<LU<f64, Dyn, Dyn>>,
+    lu_cache: &mut Option<LuFactorStorage>,
 ) -> Result<SolveResult, LinalgError> {
     match action {
         SolverAction::DirectLU => {
+            // The diagnostics' blocked factorization (frankenscipy-u87cd); the backward error
+            // is the same quantity the nalgebra route computes, summed in another order.
+            if let Some(LuFactorStorage::Flat(factors)) = lu_cache.as_ref() {
+                let x = lu_solve_flat_factored(factors, b).ok_or(LinalgError::SingularMatrix)?;
+                let backward_error = compute_backward_error_dense(effective_a, &x, b);
+                return Ok(SolveResult {
+                    x,
+                    warning: rcond_warning(report.rcond_estimate),
+                    backward_error: Some(backward_error),
+                    certificate: None,
+                });
+            }
             let matrix = if let Some(matrix) = matrix_cache.take() {
                 matrix
             } else {
                 dmatrix_from_rows(effective_a)?
             };
-            let lu = if let Some(lu) = lu_cache.take() {
+            let lu = if let Some(LuFactorStorage::Nalgebra(lu)) = lu_cache.take() {
                 lu
             } else {
                 matrix.clone().lu()
@@ -2871,7 +2935,7 @@ fn dispatch_solve_action(
                 .map(|x| compute_backward_error(&matrix, x, &rhs));
             // Handed back: the accuracy certificate's forward bound reuses the factorization.
             *matrix_cache = Some(matrix);
-            *lu_cache = Some(lu);
+            *lu_cache = Some(LuFactorStorage::Nalgebra(lu));
             let x = solved.ok_or(LinalgError::SingularMatrix)?;
             let backward_err = backward_err.unwrap_or(f64::INFINITY);
             Ok(SolveResult {
@@ -2928,7 +2992,7 @@ fn run_portfolio_attempts(
     report: &ConditionReport,
     symmetric: SymmetricFactorization,
     matrix_cache: &mut Option<DMatrix<f64>>,
-    lu_cache: &mut Option<LU<f64, Dyn, Dyn>>,
+    lu_cache: &mut Option<LuFactorStorage>,
     selected_action: SolverAction,
     posterior: [f64; 4],
     expected_losses: [f64; 6],
@@ -3657,7 +3721,7 @@ fn dispatch_inv_action(
     symmetric: SymmetricFactorization,
     lower_triangular: bool,
     matrix_cache: &Option<DMatrix<f64>>,
-    lu_cache: &Option<LU<f64, Dyn, Dyn>>,
+    lu_cache: &Option<LuFactorStorage>,
 ) -> Result<InvResult, LinalgError> {
     match action {
         SolverAction::DiagonalFastPath | SolverAction::TriangularFastPath => {
@@ -3698,9 +3762,32 @@ fn dispatch_inv_action(
             })
         }
         SolverAction::DirectLU => {
+            // The diagnostics' blocked factorization (frankenscipy-u87cd): the same rcond,
+            // pivot and Hardened checks as the nalgebra route below, over its factors.
+            if let Some(LuFactorStorage::Flat(factors)) = lu_cache {
+                let a_norm_1 = matrix_norm1_rows(a, n);
+                let rcond = fast_rcond_from_flat_lu(factors, a_norm_1);
+                let pivot_tiny = (0..n)
+                    .any(|i| factors.data[i * n + i].abs() <= f64::EPSILON * a_norm_1.max(1.0));
+                if mode == RuntimeMode::Hardened && rcond < HARDENED_RCOND_THRESHOLD && rcond > 0.0
+                {
+                    return Err(LinalgError::ConditionTooHigh {
+                        rcond,
+                        threshold: HARDENED_RCOND_THRESHOLD,
+                    });
+                }
+                if rcond == 0.0 || rcond < f64::EPSILON || pivot_tiny {
+                    return Err(LinalgError::SingularMatrix);
+                }
+                return Ok(InvResult {
+                    inverse: inverse_from_flat_lu(factors).ok_or(LinalgError::SingularMatrix)?,
+                    warning: rcond_warning(rcond),
+                    certificate: None,
+                });
+            }
             // Use cached LU if available
             let (matrix, lu) = match (matrix_cache, lu_cache) {
-                (Some(m), Some(lu)) => (m.clone(), lu.clone()),
+                (Some(m), Some(LuFactorStorage::Nalgebra(lu))) => (m.clone(), lu.clone()),
                 _ => {
                     let m = dmatrix_from_rows(a)?;
                     let lu = m.clone().lu();
@@ -24217,7 +24304,9 @@ fn lu_subst_factored_f32(factors: &LuFactorsFlatF32, rhs: &[f64]) -> Option<Vec<
 pub static DISABLE_MIXED_LU: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Runtime switch to force `lu_factor` onto the original nalgebra storage path.
+/// Runtime switch to force `lu_factor`, and the CASP portfolio's condition diagnostics and
+/// LU actions (`solve_with_casp`, `solve_with_audit`, `inv_with_casp` and the portfolio
+/// fallback of `solve`/`inv`; frankenscipy-u87cd), onto the original nalgebra storage path.
 /// This exists for same-worker A/B Criterion evidence; production default is the
 /// flat blocked factor path for large matrices.
 #[doc(hidden)]
@@ -26014,15 +26103,23 @@ fn inv_blocked(a_in: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     if n == 0 || !rows_are_rectangular(a_in, n) {
         return None;
     }
-    let factors = lu_factor_blocked(a_in)?;
+    inverse_from_flat_lu(&lu_factor_blocked(a_in)?)
+}
 
+/// `A⁻¹` from a blocked LU factorization of `A`: `A·X = I` as a multi-RHS TRSM, in
+/// column-blocks across threads.
+fn inverse_from_flat_lu(factors: &LuFactorsFlat) -> Option<Vec<Vec<f64>>> {
+    let n = factors.n;
+    if n == 0 {
+        return None;
+    }
     // Solve A·X = I as a multi-RHS TRSM, in column-blocks across threads.
     let nthreads = matmul_thread_count(n, n, n);
     let blocks: Vec<Option<Vec<f64>>> = if nthreads <= 1 {
-        vec![trsm_inv_columns(&factors, 0, n)]
+        vec![trsm_inv_columns(factors, 0, n)]
     } else {
         let chunk = n.div_ceil(nthreads);
-        let factors_ref = &factors;
+        let factors_ref = factors;
         std::thread::scope(|scope| {
             let handles: Vec<_> = (0..nthreads)
                 .filter_map(|t| {
@@ -29502,6 +29599,114 @@ mod tests {
             rcond < 1e-12,
             "ill-conditioned matrix should have low rcond, got {rcond}"
         );
+    }
+
+    /// frankenscipy-u87cd: from `lu_factor`'s blocked-LU gate up, the CASP portfolio's
+    /// diagnostics factor with the blocked LU and its LU actions reuse that factorization;
+    /// below the gate they keep nalgebra's and the results are bit-identical to it. Above the
+    /// gate the answers agree with nalgebra's to the reassociation of the blocked update, and
+    /// the rcond estimate, the action and the posterior are the same. A matrix the blocked LU
+    /// finds singular is diagnosed on nalgebra's factorization, as before.
+    #[test]
+    fn portfolio_lu_actions_reuse_the_blocked_factorization_from_its_gate() {
+        let dominant = |n: usize, seed: u64| {
+            let mut state = seed;
+            let mut next = move || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 101) as f64 - 50.0
+            };
+            let a: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| next() + if i == j { 60.0 * n as f64 } else { 0.0 })
+                        .collect()
+                })
+                .collect();
+            let b: Vec<f64> = (0..n).map(|_| next()).collect();
+            (a, b)
+        };
+        let relative = |x: &[f64], reference: &[f64]| {
+            let scale = reference.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            x.iter()
+                .zip(reference)
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0_f64, f64::max)
+                / scale
+        };
+        for (n, flat) in [
+            (LU_FACTOR_FLAT_MIN_DIM - 1, false),
+            (LU_FACTOR_FLAT_MIN_DIM + 2, true),
+        ] {
+            let (a, b) = dominant(n, 0x0087_CD00 + n as u64);
+            let work = condition_diagnostics_for_solve(&a, None).expect("diagnostics");
+            assert_eq!(
+                matches!(work.lu_cache, Some(LuFactorStorage::Flat(_))),
+                flat,
+                "n = {n}"
+            );
+
+            // The nalgebra route, computed directly.
+            let matrix = dmatrix_from_rows(&a).expect("matrix");
+            let lu = matrix.clone().lu();
+            let reference_rcond = fast_rcond_from_lu(&lu, matrix_norm1(&matrix), n);
+            let reference_x: Vec<f64> = lu
+                .solve(&DVector::from_column_slice(&b))
+                .expect("nalgebra solve")
+                .iter()
+                .copied()
+                .collect();
+            let reference_inverse =
+                rows_from_dmatrix(&lu.solve(&DMatrix::identity(n, n)).expect("inverse"));
+            let rcond = work.report.rcond_estimate;
+            assert!(
+                (rcond - reference_rcond).abs() <= 1e-10 * reference_rcond,
+                "n = {n}: rcond {rcond:e} vs nalgebra {reference_rcond:e}"
+            );
+
+            let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 4);
+            let solved =
+                solve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio).expect("solve");
+            let certificate = solved.certificate.clone().expect("certificate");
+            assert_eq!(certificate.action, SolverAction::DirectLU, "n = {n}");
+            let (_, posterior, ..) = SolverPortfolio::new(RuntimeMode::Strict, 4)
+                .select_action(reference_rcond, Some(StructuralEvidence::General));
+            for (p, q) in certificate.posterior.iter().zip(posterior) {
+                assert!((p - q).abs() <= 1e-9, "n = {n}: posterior {p} vs {q}");
+            }
+            assert!(verify_solve_certificate(&a, &b, &solved.x, &certificate).verified);
+            let inverse = inv_with_casp(
+                &a,
+                InvOptions::default(),
+                &mut SolverPortfolio::new(RuntimeMode::Strict, 4),
+            )
+            .expect("inverse")
+            .inverse;
+            if flat {
+                assert!(relative(&solved.x, &reference_x) <= 1e-12, "n = {n}");
+                for (row, reference_row) in inverse.iter().zip(&reference_inverse) {
+                    assert!(relative(row, reference_row) <= 1e-12, "n = {n}");
+                }
+            } else {
+                for (p, q) in solved.x.iter().zip(&reference_x) {
+                    assert_eq!(p.to_bits(), q.to_bits(), "n = {n}: x differs from nalgebra");
+                }
+                for (row, reference_row) in inverse.iter().zip(&reference_inverse) {
+                    for (p, q) in row.iter().zip(reference_row) {
+                        assert_eq!(p.to_bits(), q.to_bits(), "n = {n}: inverse differs");
+                    }
+                }
+            }
+        }
+
+        // Two equal rows: an exact zero pivot, so the blocked LU declines and the diagnostics
+        // keep nalgebra's factorization and its rcond of a singular matrix.
+        let n = LU_FACTOR_FLAT_MIN_DIM + 2;
+        let (mut a, _) = dominant(n, 7);
+        a[n - 1] = a[0].clone();
+        let work = condition_diagnostics_for_solve(&a, None).expect("diagnostics");
+        assert!(matches!(work.lu_cache, Some(LuFactorStorage::Nalgebra(_))));
     }
 
     #[test]
