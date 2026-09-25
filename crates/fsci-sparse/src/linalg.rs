@@ -38,6 +38,18 @@ pub enum SparseBackend {
     NativeSparseLu,
     CubicSpectralLu,
     PeriodicCuboidSpectralLu,
+    /// Reported, not requested: Cholesky of a narrowly banded symmetric matrix in band
+    /// storage, validated against A before it is accepted.
+    BandedCholesky,
+    /// Reported, not requested: LU with partial pivoting of a narrowly banded matrix in band
+    /// storage.
+    BandedLu,
+    /// Reported, not requested: dense LU of the densified matrix (small or dense-pattern
+    /// systems).
+    DenseLu,
+    /// Reported, not requested: the CASP portfolio's iterative method produced the answer.
+    /// Never `SparseSolverAction::SuperLU`; a direct solve reports the arm that ran.
+    Iterative(SparseSolverAction),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5733,7 +5745,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
             {
                 return Ok(SolveResult {
                     solution,
-                    backend_used: SparseBackend::NativeSparseLu,
+                    backend_used: SparseBackend::BandedCholesky,
                     ordering_used: options.ordering,
                     warnings: banded_warnings(),
                 });
@@ -5741,7 +5753,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
             let solution = spsolve_banded_direct(a, b, options, bandwidth)?;
             return Ok(SolveResult {
                 solution,
-                backend_used: SparseBackend::NativeSparseLu,
+                backend_used: SparseBackend::BandedLu,
                 ordering_used: options.ordering,
                 warnings: banded_warnings(),
             });
@@ -5780,7 +5792,7 @@ pub fn spsolve(a: &CsrMatrix, b: &[f64], options: SolveOptions) -> SparseResult<
 
     Ok(SolveResult {
         solution: x.iter().copied().collect(),
-        backend_used: SparseBackend::Auto,
+        backend_used: SparseBackend::DenseLu,
         ordering_used: PermutationOrdering::Natural,
         warnings: Vec::new(),
     })
@@ -5886,7 +5898,7 @@ pub fn splu(a: &CscMatrix, options: LuOptions) -> SparseResult<SparseLuFactoriza
         let dense = csc_to_dense(a);
         let matrix = DMatrix::from_row_slice(n, n, &dense);
         (
-            SparseBackend::Auto,
+            SparseBackend::DenseLu,
             PermutationOrdering::Natural,
             SparseLuInternal::Dense(matrix.lu()),
         )
@@ -9864,6 +9876,9 @@ pub struct CaspPortfolioSolveResult {
     pub iterations: usize,
     pub residual_norm: f64,
     pub fallback_active: bool,
+    /// The arm `spsolve` reported when a direct solve produced `x` (the SuperLU action, or the
+    /// fallback after an unconverged iterate); `None` when the iterative method's answer stands.
+    pub direct_backend: Option<SparseBackend>,
 }
 
 /// Solve a sparse linear system using CASP Bayesian expected-loss portfolio selection.
@@ -9952,6 +9967,7 @@ pub fn solve_with_casp_portfolio(
     let (action, posterior, expected_losses, chosen_loss) =
         portfolio.select_action(cond_estimate, Some(structural));
 
+    let mut direct_backend = None;
     let (x, converged, iters, res_norm, fallback_active) = match action {
         SparseSolverAction::ConjugateGradient => {
             let res = cg(a, b, x0, iterative_opts)?;
@@ -10006,6 +10022,7 @@ pub fn solve_with_casp_portfolio(
         SparseSolverAction::SuperLU => {
             let res = spsolve(a, b, SolveOptions::default())?;
             let (ok, residual) = direct_solve_status(a, b, &res.solution);
+            direct_backend = Some(res.backend_used);
             (res.solution, ok, 1, residual, false)
         }
     };
@@ -10019,6 +10036,7 @@ pub fn solve_with_casp_portfolio(
             match spsolve(a, b, SolveOptions::default()) {
                 Ok(slv) => {
                     let (ok, residual) = direct_solve_status(a, b, &slv.solution);
+                    direct_backend = Some(slv.backend_used);
                     (slv.solution, ok, iters + 1, residual, true)
                 }
                 Err(_) => (x, converged, iters, res_norm, fallback_active),
@@ -10051,6 +10069,7 @@ pub fn solve_with_casp_portfolio(
         iterations: final_iters,
         residual_norm: final_res,
         fallback_active: final_fallback,
+        direct_backend,
     })
 }
 
@@ -10209,10 +10228,13 @@ fn spsolve_with_casp_internal(
         );
     }
 
-    let backend_used = match casp_res.chosen_action {
-        SparseSolverAction::SuperLU => SparseBackend::NativeSparseLu,
-        _ => SparseBackend::Auto,
-    };
+    // The arm that produced `x`: the direct solve's own report, or the iterative method whose
+    // converged iterate stands. This used to say NativeSparseLu for every SuperLU choice and
+    // Auto for every iterative one, even when the direct fallback had produced the answer
+    // (frankenscipy-szq1n.4).
+    let backend_used = casp_res
+        .direct_backend
+        .unwrap_or(SparseBackend::Iterative(casp_res.chosen_action));
 
     let mut warnings = Vec::new();
     if casp_res.fallback_active {
@@ -15394,7 +15416,8 @@ mod tests {
         let result = spsolve(&a, &b, SolveOptions::default())
             .expect("native sparse direct solve should avoid dense fallback guard");
 
-        assert_eq!(result.backend_used, SparseBackend::NativeSparseLu);
+        // A diagonal matrix is the narrowest band there is: the banded Cholesky arm takes it.
+        assert_eq!(result.backend_used, SparseBackend::BandedCholesky);
         assert_eq!(result.solution.len(), n);
         assert_eq!(result.solution[0], 1.0);
         assert_eq!(result.solution[n - 1], 1.0);
@@ -15420,7 +15443,9 @@ mod tests {
         let result = spsolve(&a, &b, SolveOptions::default())
             .expect("nonzero tiny pivots should remain solvable");
 
-        assert_eq!(result.backend_used, SparseBackend::NativeSparseLu);
+        // The banded Cholesky's self-validation rejects a 1e-300 diagonal, so the banded LU
+        // behind it is what solves this, and the label says so.
+        assert_eq!(result.backend_used, SparseBackend::BandedLu);
         assert!(
             result
                 .solution
@@ -15903,7 +15928,8 @@ mod tests {
         assert!(a.nnz() > n * 16, "should exceed the density gate");
         let b: Vec<f64> = (0..n).map(|i| 1.0 + (i % 5) as f64).collect();
         let result = spsolve(&a, &b, SolveOptions::default()).expect("spsolve");
-        assert_eq!(result.backend_used, SparseBackend::NativeSparseLu);
+        // Symmetric and strictly diagonally dominant: the banded Cholesky arm.
+        assert_eq!(result.backend_used, SparseBackend::BandedCholesky);
         let mut max_res = 0.0_f64;
         for i in 0..n {
             let mut ax = 0.0;
@@ -27859,12 +27885,10 @@ mod tests {
         )
         .expect("splu");
         assert_eq!(dense_route.ordering_used, PermutationOrdering::Natural);
-        // The remaining half of frankenscipy-h4yov, pinned as it stands rather
-        // than as it should be: a dense nalgebra LU still reports `Auto`, so
-        // `backend_used` cannot distinguish it from a routing decision that was
-        // never made. Change this assertion when that is split into its own
-        // variant; do not change it to make a relabelling look like a no-op.
-        assert_eq!(dense_route.backend_used, SparseBackend::Auto);
+        // The remaining half of frankenscipy-h4yov: the dense nalgebra LU used to
+        // report `Auto`, indistinguishable from a routing decision never made. It
+        // has its own variant now (frankenscipy-szq1n.4).
+        assert_eq!(dense_route.backend_used, SparseBackend::DenseLu);
     }
 
     /// frankenscipy-h4yov's second closing test: a cubic-grid factorization and

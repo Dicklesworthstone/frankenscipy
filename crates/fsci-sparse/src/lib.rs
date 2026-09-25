@@ -2911,6 +2911,90 @@ mod tests {
         }
     }
 
+    /// frankenscipy-szq1n.4: `backend_used` names the arm that produced x. Before, the banded
+    /// Cholesky and banded LU arms said NativeSparseLu, the dense LU said Auto, and the CASP
+    /// wrapper said Auto for every iterative choice even when its direct fallback had solved.
+    #[test]
+    fn backend_used_names_the_arm_that_produced_x() {
+        use fsci_runtime::SparseSolverAction;
+        // Tridiagonal (diag, below, above), plus an optional symmetric coupling at distance
+        // `far` that widens the band past the banded arms' 128 limit.
+        fn matrix(n: usize, diag: f64, below: f64, above: f64, far: Option<usize>) -> CsrMatrix {
+            let (mut rows, mut cols, mut data) = (Vec::new(), Vec::new(), Vec::new());
+            for i in 0..n {
+                rows.push(i);
+                cols.push(i);
+                data.push(diag);
+                if i > 0 {
+                    rows.extend([i, i - 1]);
+                    cols.extend([i - 1, i]);
+                    data.extend([below, above]);
+                }
+                if let Some(d) = far
+                    && i + d < n
+                {
+                    rows.extend([i, i + d]);
+                    cols.extend([i + d, i]);
+                    data.extend([-0.5, -0.5]);
+                }
+            }
+            CooMatrix::from_triplets(Shape2D::new(n, n), data, rows, cols, false)
+                .unwrap()
+                .to_csr()
+                .unwrap()
+        }
+        let arm = |a: &CsrMatrix| {
+            let b = vec![1.0; a.shape().rows];
+            let res = spsolve(a, &b, SolveOptions::default()).expect("spsolve");
+            let ax = spmv_csr(a, &res.solution).unwrap();
+            let worst = ax
+                .iter()
+                .zip(&b)
+                .map(|(l, r)| (l - r).abs())
+                .fold(0.0, f64::max);
+            assert!(worst < 1e-10, "{:?}: |Ax - b| = {worst}", res.backend_used);
+            res.backend_used
+        };
+        assert_eq!(
+            arm(&matrix(50, 4.0, -1.0, -1.0, None)),
+            SparseBackend::DenseLu
+        );
+        assert_eq!(
+            arm(&matrix(400, 4.0, -1.0, -1.0, None)),
+            SparseBackend::BandedCholesky
+        );
+        assert_eq!(
+            arm(&matrix(400, 4.0, -1.0, -2.0, None)),
+            SparseBackend::BandedLu
+        );
+        assert_eq!(
+            arm(&matrix(400, 4.0, -1.0, -1.0, Some(200))),
+            SparseBackend::NativeSparseLu
+        );
+
+        // CASP: a converged iterate reports its method; the direct fallback reports the arm
+        // the fallback ran.
+        let a = matrix(100, 2.0, -1.0, -1.0, None);
+        let b = vec![1.0; 100];
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = spsolve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio)
+            .expect("spsolve_with_casp");
+        assert!(
+            matches!(res.backend_used, SparseBackend::Iterative(action) if action != SparseSolverAction::SuperLU),
+            "{:?}",
+            res.backend_used
+        );
+        let starved = IterativeSolveOptions {
+            max_iter: Some(3),
+            ..IterativeSolveOptions::default()
+        };
+        let mut portfolio = fsci_runtime::SparseSolverPortfolio::new(RuntimeMode::Strict, 16);
+        let res = solve_with_casp_portfolio(&a, &b, None, &mut portfolio, starved)
+            .expect("portfolio solve");
+        assert!(res.fallback_active);
+        assert_eq!(res.direct_backend, Some(SparseBackend::DenseLu));
+    }
+
     #[test]
     fn test_spsolve_with_casp_spd_system() {
         let n = 5;
@@ -2968,7 +3052,9 @@ mod tests {
             .expect("spsolve_with_casp");
 
         assert_eq!(res.solution.len(), n);
-        assert_eq!(res.backend_used, SparseBackend::NativeSparseLu);
+        // The direct action's spsolve factors a 4x4 system densely, and says so
+        // (frankenscipy-szq1n.4; it used to report NativeSparseLu for every direct choice).
+        assert_eq!(res.backend_used, SparseBackend::DenseLu);
         assert_eq!(portfolio.evidence_len(), 1);
     }
 
