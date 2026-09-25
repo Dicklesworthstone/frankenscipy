@@ -42,8 +42,7 @@ fn portfolio_lu_arms() {
             let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 4);
             let start = Instant::now();
             let audited =
-                solve_with_audit(&a, &b, SolveOptions::default(), &mut portfolio, &ledger)
-                    .unwrap();
+                solve_with_audit(&a, &b, SolveOptions::default(), &mut portfolio, &ledger).unwrap();
             let audit_ms = start.elapsed().as_secs_f64() * 1e3;
             let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 4);
             let start = Instant::now();
