@@ -536,6 +536,107 @@ pub struct SolveCertificate {
     /// [`verify_solve_certificate`] recomputes from `(A, b, x)` alone, and a forward error bound.
     /// `None` for `inv`, `lstsq` and `pinv` certificates (frankenscipy-7tb8d.6).
     pub accuracy: Option<AccuracyCertificate>,
+    /// The CASP portfolio's decision, replayable with [`replay_decision`].
+    pub decision: PortfolioDecision,
+}
+
+/// What a certificate records of the CASP portfolio's decision beyond its inputs, the
+/// certificate's rcond estimate and structural evidence (frankenscipy-7tb8d.12).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PortfolioDecision {
+    /// The portfolio's own choice. The routine may then change it: SciPy's structure order in
+    /// Strict mode, the SVD `lstsq` and `pinv` always use, or a fallback. The result is the
+    /// certificate's `action`.
+    pub action: SolverAction,
+    /// [`SolverPortfolio::state_digest`] of the portfolio when it decided.
+    pub state_digest: String,
+}
+
+impl PortfolioDecision {
+    /// `portfolio`'s choice of `action`, read before anything records into it.
+    fn of(portfolio: &SolverPortfolio, action: SolverAction) -> Self {
+        Self {
+            action,
+            state_digest: portfolio.state_digest(),
+        }
+    }
+}
+
+/// What [`replay_decision`] found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplayReport {
+    /// The snapshot's state digest is the certificate's, and it decides the same way, bit for
+    /// bit.
+    pub replayed: bool,
+    /// Why not, or `"replayed"`.
+    pub reason: String,
+}
+
+/// Replay a certificate's CASP decision against a snapshot of the portfolio that made it
+/// (frankenscipy-7tb8d.12). The snapshot's `select_action` is fed the certificate's rcond
+/// estimate and structural evidence, and must give back the recorded portfolio choice, the
+/// posterior, every action's expected loss and the chosen action's, bit for bit.
+///
+/// A snapshot whose [`SolverPortfolio::state_digest`] differs from the certificate's is
+/// refused: its outcome counts, calibration or mode differ, so a replay would compute another
+/// decision, not check this one.
+#[must_use]
+pub fn replay_decision(certificate: &SolveCertificate, snapshot: &SolverPortfolio) -> ReplayReport {
+    let digest = snapshot.state_digest();
+    if digest != certificate.decision.state_digest {
+        return ReplayReport {
+            replayed: false,
+            reason: format!(
+                "portfolio state digest {digest} is not the certificate's {}",
+                certificate.decision.state_digest
+            ),
+        };
+    }
+    let (action, posterior, expected_losses, _) = snapshot.select_action(
+        certificate.rcond_estimate,
+        Some(certificate.structural_evidence),
+    );
+    let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+    let mut mismatches = Vec::new();
+    if action != certificate.decision.action {
+        mismatches.push(format!(
+            "portfolio choice {action:?}, recorded {:?}",
+            certificate.decision.action
+        ));
+    }
+    for (name, replayed, recorded) in [
+        ("posterior", &posterior[..], &certificate.posterior[..]),
+        (
+            "expected losses",
+            &expected_losses[..],
+            &certificate.expected_losses[..],
+        ),
+    ] {
+        if bits(replayed) != bits(recorded) {
+            mismatches.push(format!(
+                "{name} {replayed:?} (bits {:x?}), recorded {recorded:?} (bits {:x?})",
+                bits(replayed),
+                bits(recorded)
+            ));
+        }
+    }
+    let chosen = expected_losses[certificate.action.index()];
+    if chosen.to_bits() != certificate.chosen_expected_loss.to_bits() {
+        mismatches.push(format!(
+            "chosen expected loss {chosen:e} (bits {:x}), recorded {:e} (bits {:x})",
+            chosen.to_bits(),
+            certificate.chosen_expected_loss,
+            certificate.chosen_expected_loss.to_bits()
+        ));
+    }
+    ReplayReport {
+        replayed: mismatches.is_empty(),
+        reason: if mismatches.is_empty() {
+            "replayed".to_string()
+        } else {
+            mismatches.join("; ")
+        },
+    }
 }
 
 /// The checkable part of a solve certificate (frankenscipy-7tb8d.6). `r = b − A·x` is computed
@@ -2188,6 +2289,7 @@ fn build_solve_certificate(
     expected_losses: [f64; 6],
     fallback_active: bool,
     accuracy: AccuracyCertificate,
+    decision: PortfolioDecision,
 ) -> SolveCertificate {
     SolveCertificate {
         action,
@@ -2199,6 +2301,7 @@ fn build_solve_certificate(
         chosen_expected_loss: expected_losses[action.index()],
         fallback_active,
         accuracy: Some(accuracy),
+        decision,
     }
 }
 
@@ -2829,6 +2932,7 @@ fn run_portfolio_attempts(
     selected_action: SolverAction,
     posterior: [f64; 4],
     expected_losses: [f64; 6],
+    decision: PortfolioDecision,
 ) -> (SolverAction, Result<SolveResult, LinalgError>) {
     let applicable = candidate_actions(report.structural_evidence);
     let rcond = report.rcond_estimate;
@@ -2896,6 +3000,7 @@ fn run_portfolio_attempts(
                 expected_losses,
                 action != selected_action,
                 accuracy,
+                decision,
             ));
             (action, Ok(solve_result))
         }
@@ -2995,6 +3100,7 @@ fn solve_with_portfolio_internal(
         &[],
     );
 
+    let decision = PortfolioDecision::of(portfolio, posterior_action);
     let (actual_action, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
@@ -3007,6 +3113,7 @@ fn solve_with_portfolio_internal(
         selected_action,
         posterior,
         expected_losses,
+        decision,
     );
     let result = result.and_then(|solve_result| {
         enforce_policy_full_validation(policy_decision.as_ref(), &solve_result)?;
@@ -3210,6 +3317,7 @@ fn solve_audited(
         &[],
     );
 
+    let decision = PortfolioDecision::of(portfolio, posterior_action);
     let (actual_action, result) = run_portfolio_attempts(
         portfolio,
         options.mode,
@@ -3222,6 +3330,7 @@ fn solve_audited(
         selected_action,
         posterior,
         expected_losses,
+        decision,
     );
     let result = result.and_then(|solve_result| {
         enforce_policy_full_validation(policy_decision.as_ref(), &solve_result)?;
@@ -3336,6 +3445,7 @@ pub fn inv_with_casp(
 
     let (posterior_action, posterior, expected_losses, _) =
         portfolio.select_action(report.rcond_estimate, Some(report.structural_evidence));
+    let decision = PortfolioDecision::of(portfolio, posterior_action);
     let selected_action = strict_order_action(
         options.mode,
         report.structural_evidence,
@@ -3404,6 +3514,7 @@ pub fn inv_with_casp(
                     chosen_expected_loss: expected_losses[action.index()],
                     fallback_active,
                     accuracy: None,
+                    decision: decision.clone(),
                 });
                 actual_action = action;
                 result = Some(inv_result);
@@ -3738,6 +3849,7 @@ fn lstsq_with_casp_kernel(
     if let Some(fast) = lstsq_low_rank_tall(a, b, rows, cols, cond, LOW_RANK_PINV_MIN_COLS) {
         let (selected_action, posterior, expected_losses, _) =
             portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, selected_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -3750,6 +3862,7 @@ fn lstsq_with_casp_kernel(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: action != selected_action,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -3790,6 +3903,7 @@ fn lstsq_with_casp_kernel(
     {
         let (selected_action, posterior, expected_losses, _) =
             portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, selected_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -3802,6 +3916,7 @@ fn lstsq_with_casp_kernel(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: action != selected_action,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -3839,6 +3954,7 @@ fn lstsq_with_casp_kernel(
     {
         let (selected_action, posterior, expected_losses, _) =
             portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, selected_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -3851,6 +3967,7 @@ fn lstsq_with_casp_kernel(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: action != selected_action,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -3898,6 +4015,7 @@ fn lstsq_with_casp_kernel(
 
             let (selected_action, posterior, expected_losses, _) =
                 portfolio.select_action(rcond_estimate, None);
+            let decision = PortfolioDecision::of(portfolio, selected_action);
             let action = SolverAction::SVDFallback;
             let x = thin_svd.least_squares_solution(threshold, &rhs)?;
             let residual = &rhs - &matrix * x.clone();
@@ -3912,6 +4030,7 @@ fn lstsq_with_casp_kernel(
                 chosen_expected_loss: expected_losses[action.index()],
                 fallback_active: action != selected_action,
                 accuracy: None,
+                decision,
             };
 
             emit_trace(LinalgTrace {
@@ -3980,6 +4099,7 @@ fn lstsq_with_casp_kernel(
 
     let (selected_action, posterior, expected_losses, _) =
         portfolio.select_action(rcond_estimate, None);
+    let decision = PortfolioDecision::of(portfolio, selected_action);
 
     // For lstsq, QR can only solve square systems in nalgebra; use SVD for non-square
     // Also prefer SVD for ill-conditioned or rank-deficient cases
@@ -4047,6 +4167,7 @@ fn lstsq_with_casp_kernel(
         chosen_expected_loss: expected_losses[action.index()],
         fallback_active: action != selected_action,
         accuracy: None,
+        decision,
     };
 
     emit_trace(LinalgTrace {
@@ -4109,7 +4230,9 @@ pub fn pinv_with_casp(
     }
 
     if let Some(fast) = pinv_low_rank_tall(a, rows, cols, atol, rtol) {
-        let (_, posterior, expected_losses, _) = portfolio.select_action(fast.rcond_estimate, None);
+        let (portfolio_action, posterior, expected_losses, _) =
+            portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, portfolio_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -4122,6 +4245,7 @@ pub fn pinv_with_casp(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -4156,7 +4280,9 @@ pub fn pinv_with_casp(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = pinv_full_rank_tall_cholesky(&matrix, atol, rtol)
     {
-        let (_, posterior, expected_losses, _) = portfolio.select_action(fast.rcond_estimate, None);
+        let (portfolio_action, posterior, expected_losses, _) =
+            portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, portfolio_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -4169,6 +4295,7 @@ pub fn pinv_with_casp(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -4202,7 +4329,9 @@ pub fn pinv_with_casp(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = pinv_full_rank_wide_cholesky(a, &matrix, atol, rtol)
     {
-        let (_, posterior, expected_losses, _) = portfolio.select_action(fast.rcond_estimate, None);
+        let (portfolio_action, posterior, expected_losses, _) =
+            portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, portfolio_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -4215,6 +4344,7 @@ pub fn pinv_with_casp(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -4248,7 +4378,9 @@ pub fn pinv_with_casp(
     if options.mode == RuntimeMode::Strict
         && let Some(fast) = pinv_full_rank_square_lu(a, &matrix, atol, rtol)
     {
-        let (_, posterior, expected_losses, _) = portfolio.select_action(fast.rcond_estimate, None);
+        let (portfolio_action, posterior, expected_losses, _) =
+            portfolio.select_action(fast.rcond_estimate, None);
+        let decision = PortfolioDecision::of(portfolio, portfolio_action);
         let action = SolverAction::SVDFallback;
 
         let certificate = SolveCertificate {
@@ -4261,6 +4393,7 @@ pub fn pinv_with_casp(
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
             accuracy: None,
+            decision,
         };
 
         emit_trace(LinalgTrace {
@@ -4304,7 +4437,9 @@ pub fn pinv_with_casp(
                 .count();
             let pinv_matrix = thin_svd.pseudo_inverse(threshold);
 
-            let (_, posterior, expected_losses, _) = portfolio.select_action(rcond_estimate, None);
+            let (portfolio_action, posterior, expected_losses, _) =
+                portfolio.select_action(rcond_estimate, None);
+            let decision = PortfolioDecision::of(portfolio, portfolio_action);
             let action = SolverAction::SVDFallback;
 
             let certificate = SolveCertificate {
@@ -4317,6 +4452,7 @@ pub fn pinv_with_casp(
                 chosen_expected_loss: expected_losses[action.index()],
                 fallback_active: false,
                 accuracy: None,
+                decision,
             };
 
             emit_trace(LinalgTrace {
@@ -4373,7 +4509,9 @@ pub fn pinv_with_casp(
     let pinv_matrix = pseudo_inverse_from_svd(&svd, threshold)?;
 
     // For pinv, always SVD but record the portfolio decision for audit
-    let (_, posterior, expected_losses, _) = portfolio.select_action(rcond_estimate, None);
+    let (portfolio_action, posterior, expected_losses, _) =
+        portfolio.select_action(rcond_estimate, None);
+    let decision = PortfolioDecision::of(portfolio, portfolio_action);
     let action = SolverAction::SVDFallback;
 
     let certificate = SolveCertificate {
@@ -4386,6 +4524,7 @@ pub fn pinv_with_casp(
         chosen_expected_loss: expected_losses[action.index()],
         fallback_active: false,
         accuracy: None,
+        decision,
     };
 
     emit_trace(LinalgTrace {

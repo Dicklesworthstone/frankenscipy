@@ -485,6 +485,24 @@ impl SolverPortfolio {
         self.evidence.len()
     }
 
+    /// A digest of everything [`Self::select_action`] reads: the mode, the loss matrix, the
+    /// outcome counts and the calibrator's state, as a [`Fingerprinter`] `"blake3:…"`
+    /// (frankenscipy-7tb8d.12). Two portfolios with one digest decide identically. A solve
+    /// certificate records the digest of the portfolio that made its decision, so the decision
+    /// replays against a snapshot of that portfolio, and a snapshot in any other state is
+    /// refused rather than giving a different answer. The loss matrix stands in for a
+    /// calibration version: it is the calibration.
+    #[must_use]
+    pub fn state_digest(&self) -> String {
+        let mut fingerprinter = Fingerprinter::new("fsci_runtime::SolverPortfolio::state");
+        fingerprinter
+            .str(&format!("{:?}", self.mode))
+            .f64s(self.loss_matrix.as_flattened())
+            .f64s(self.outcome_counts.as_flattened());
+        self.calibrator.fingerprint_into(&mut fingerprinter);
+        fingerprinter.finish()
+    }
+
     #[must_use]
     pub const fn mode(&self) -> RuntimeMode {
         self.mode
@@ -555,6 +573,19 @@ pub struct ConformalCalibrator {
 }
 
 impl ConformalCalibrator {
+    /// Feed the calibrator's whole state to a fingerprint: its parameters, its counters and
+    /// its score window, oldest first.
+    fn fingerprint_into(&self, fingerprinter: &mut Fingerprinter) {
+        let scores: Vec<f64> = self.scores.iter().copied().collect();
+        fingerprinter
+            .f64(self.alpha)
+            .usize(self.capacity)
+            .f64(self.violation_threshold)
+            .usize(self.coverage_violations)
+            .usize(self.total_predictions)
+            .f64s(&scores);
+    }
+
     #[must_use]
     pub fn new(alpha: f64, capacity: usize) -> Self {
         let capacity = capacity.max(10);
