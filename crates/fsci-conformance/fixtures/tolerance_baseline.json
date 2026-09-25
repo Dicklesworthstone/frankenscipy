@@ -520,6 +520,8 @@
   "diff_opt_minimize_audit_equivalence.rs": {
     "ABS_TOL": 1e-12
   },
+  "diff_opt_minimize_casp_bounds.rs": {},
+  "diff_opt_minimize_options.rs": {},
   "diff_opt_minimize_quadratic.rs": {
     "ABS_TOL": 0.0001
   },
