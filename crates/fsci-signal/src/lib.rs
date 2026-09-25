@@ -42,7 +42,7 @@
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
+use fsci_runtime::{AuditScope, Fingerprinter, audit_finish, audit_reject, casp_now_unix_ms};
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -120,6 +120,24 @@ pub enum SignalError {
 }
 
 impl SignalError {
+    /// The audit reason code of this error (frankenscipy-3cu8u.2).
+    const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidWindowLength(_) => "invalid_window_length",
+            Self::InvalidPolyOrder(_) => "invalid_poly_order",
+            Self::InvalidInputLength { .. } => "invalid_input_length",
+            Self::InvalidInputShape { .. } => "invalid_input_shape",
+            Self::NonFiniteInput { .. } => "non_finite_input",
+            Self::UnsupportedMode { .. } => "unsupported_mode",
+            Self::FftFailure(_) => "fft_failure",
+            Self::ConvolutionModeError(_) => "convolution_mode_error",
+            Self::FrequencyOutOfBand { .. } => "frequency_out_of_band",
+            Self::NumericalFailure(_) => "numerical_failure",
+            Self::InvalidParameter { .. } => "invalid_parameter",
+            Self::UnclassifiedArgument(_) => "unclassified_argument",
+        }
+    }
+
     #[allow(non_snake_case)]
     fn InvalidArgument(detail: String) -> Self {
         Self::classify_invalid_argument(detail)
@@ -2606,6 +2624,20 @@ pub fn czt_with_mode_and_audit(
         }
         fingerprinter.str(&format!("{mode:?}")).finish()
     };
+    let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint));
+    let result = czt_audited(x, m, w, a, mode, audit.as_ref());
+    audit_finish(audit.as_ref(), result, SignalError::reason_code)
+}
+
+/// [`czt_with_mode_and_audit`]'s transform, recording its rejections under `audit`.
+fn czt_audited(
+    x: &[f64],
+    m: usize,
+    w: Option<(f64, f64)>,
+    a: Option<(f64, f64)>,
+    mode: fsci_runtime::RuntimeMode,
+    audit: Option<&AuditScope<'_>>,
+) -> Result<Vec<(f64, f64)>, SignalError> {
     let n = x.len();
     if n == 0 {
         return Err(SignalError::InvalidArgument(
@@ -2618,29 +2650,16 @@ pub fn czt_with_mode_and_audit(
     if matches!(mode, fsci_runtime::RuntimeMode::Hardened)
         && (n > HARDENED_MAX_DIM || m > HARDENED_MAX_DIM)
     {
-        if let Some(ledger) = audit_ledger {
-            record_fail_closed(
-                ledger,
-                &fingerprint(),
-                "dimension exceeds hardened limit",
-                "rejected",
-            );
-        }
+        audit_reject(
+            audit,
+            "resource_exhausted",
+            "rejected: dimension exceeds hardened limit",
+        );
         return Err(SignalError::InvalidArgument(format!(
             "czt dimension ({n}, {m}) exceeds hardened limit ({HARDENED_MAX_DIM})"
         )));
     }
-    if let Err(err) = validate_real_values_finite(x, "czt input samples must be finite") {
-        if let (fsci_runtime::RuntimeMode::Hardened, Some(ledger)) = (mode, audit_ledger) {
-            record_fail_closed(
-                ledger,
-                &fingerprint(),
-                "non-finite input samples",
-                "rejected",
-            );
-        }
-        return Err(err);
-    }
+    validate_real_values_finite(x, "czt input samples must be finite")?;
 
     let two_pi = 2.0 * std::f64::consts::PI;
 
@@ -2649,17 +2668,11 @@ pub fn czt_with_mode_and_audit(
     // Default a: z = 1
     let (a_mag, a_ang) = a.unwrap_or((1.0, 0.0));
     if matches!(mode, fsci_runtime::RuntimeMode::Hardened) {
-        if let Err(err) = validate_czt_polar_control("w", (w_mag, w_ang)) {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(ledger, &fingerprint(), "degenerate_czt_control", "rejected");
+        for (name, control) in [("w", (w_mag, w_ang)), ("a", (a_mag, a_ang))] {
+            if let Err(err) = validate_czt_polar_control(name, control) {
+                audit_reject(audit, "degenerate_czt_control", &format!("rejected: {err}"));
+                return Err(err);
             }
-            return Err(err);
-        }
-        if let Err(err) = validate_czt_polar_control("a", (a_mag, a_ang)) {
-            if let Some(ledger) = audit_ledger {
-                record_fail_closed(ledger, &fingerprint(), "degenerate_czt_control", "rejected");
-            }
-            return Err(err);
         }
     }
 

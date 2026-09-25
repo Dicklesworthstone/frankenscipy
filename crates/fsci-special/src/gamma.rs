@@ -156,10 +156,11 @@ pub fn gamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     gamma_dispatch("gamma", z, mode)
 }
 
-/// Audit-emitting variant of [`gamma`]. In Hardened mode, a pole/
-/// non-finite/domain rejection records an `AuditAction::FailClosed`
-/// event on the provided ledger before returning the error. In Strict
-/// mode the ledger is left untouched. See br-egba-2.
+/// Audit-emitting variant of [`gamma`]. Every error it returns, in either mode, records one
+/// `AuditAction::FailClosed` event, `gamma::<error kind>`, on the provided ledger
+/// (br-egba-2, frankenscipy-3cu8u.2). Strict mode follows SciPy (a negative-integer pole is
+/// NaN) and does not reject; Hardened rejects a negative-integer pole (`gamma::PoleInput`),
+/// its one failure mode. NaN in is NaN out in both modes.
 ///
 /// The event's fingerprint covers all of `z` and `mode` (frankenscipy-3cu8u.1); it used to
 /// hash the error's static detail string, so every rejected input shared one fingerprint.
@@ -169,9 +170,7 @@ pub fn gamma_with_audit(
     ledger: &crate::audit::SyncSharedAuditLedger,
 ) -> SpecialResult {
     let result = gamma_dispatch("gamma", z, mode);
-    if mode == RuntimeMode::Hardened
-        && let Err(err) = &result
-    {
+    if let Err(err) = &result {
         let reason = format!("gamma::{:?}", err.kind);
         let mut fingerprinter = fsci_runtime::Fingerprinter::new("fsci_special::gamma");
         crate::audit::fingerprint_tensor(&mut fingerprinter, z);
@@ -5952,8 +5951,8 @@ mod tests {
     #[test]
     fn gamma_with_audit_emits_failclosed_on_hardened_pole() {
         // br-egba-2: gamma_with_audit records AuditAction::FailClosed
-        // when Hardened mode rejects a pole input. Strict mode does
-        // not emit.
+        // when Hardened mode rejects a pole input. Strict mode follows
+        // SciPy and does not reject a pole, so there is nothing to record.
         let ledger = crate::audit::sync_audit_ledger();
         // Strict path: returns Ok (NaN), no emission.
         let _ = gamma_with_audit(&scalar(-2.0), RuntimeMode::Strict, &ledger);

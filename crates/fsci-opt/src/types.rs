@@ -234,6 +234,22 @@ impl std::fmt::Display for OptError {
 
 impl std::error::Error for OptError {}
 
+impl OptError {
+    /// The audit reason code of this error; audited APIs prefix it with their operation, as
+    /// in `minimize::non_finite_input` (frankenscipy-3cu8u.2).
+    pub(crate) const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidArgument { .. } => "invalid_argument",
+            Self::InvalidBounds { .. } => "invalid_bounds",
+            Self::SignChangeRequired { .. } => "sign_change_required",
+            Self::NonFiniteInput { .. } => "non_finite_input",
+            Self::EvaluationBudgetExceeded { .. } => "evaluation_budget_exceeded",
+            Self::NotImplemented { .. } => "not_implemented",
+            Self::NotConverged { .. } => "not_converged",
+        }
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Constraint Types
 // ══════════════════════════════════════════════════════════════════════

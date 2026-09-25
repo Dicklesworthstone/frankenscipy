@@ -435,11 +435,13 @@ where
 {
     let result = minimize(fun, x0, options);
     match &result {
+        // frankenscipy-3cu8u.2: a machine-matchable code; it used to be the error's `Debug`
+        // rendering, message and all.
         Err(error) => crate::audit::record_fail_closed(
             ledger,
             &minimize_audit_fingerprint(x0, &options),
-            &format!("minimize::{error:?}"),
-            "rejected",
+            &format!("minimize::{}", error.reason_code()),
+            &format!("rejected: {error}"),
         ),
         Ok(output)
             if options.mode == fsci_runtime::RuntimeMode::Hardened

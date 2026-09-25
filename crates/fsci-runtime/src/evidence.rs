@@ -4,7 +4,9 @@
 
 use blake3::hash;
 use serde::{Deserialize, Serialize};
+use std::cell::{Cell, OnceCell};
 use std::collections::VecDeque;
+use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
 use crate::mode::RuntimeMode;
@@ -440,9 +442,220 @@ pub type SharedAuditLedger = Arc<Mutex<AuditLedger>>;
 /// Canonical synchronous audit ledger handle.
 pub type SyncSharedAuditLedger = SharedAuditLedger;
 
+/// Lock a shared ledger, recovering from a poisoned mutex so events still record after another
+/// thread panicked while holding it.
+fn lock_ledger(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, AuditLedger> {
+    match ledger.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            ledger.clear_poison();
+            poisoned.into_inner()
+        }
+    }
+}
+
+/// One audited public call: the ledger its events go to, the recipe for its fingerprint, and
+/// whether it has failed closed (frankenscipy-3cu8u.2).
+///
+/// Every audited API keeps one contract through it: a call that returns `Err` records exactly
+/// one [`AuditAction::FailClosed`], after any other event of the call, under the call's
+/// fingerprint, in every runtime mode; a call that succeeds records none. A check that knows the
+/// specific cause calls [`reject`](Self::reject) just before returning its error, and
+/// [`finish`](Self::finish), at the call's exit, records one for any `Err` that no check
+/// rejected, with a reason derived from the error. Only a call's first `reject` records, so no
+/// error is recorded twice.
+///
+/// Reasons are machine-matchable codes (`non_finite_input`, `singular_matrix`), not prose; the
+/// event's outcome carries the error's message.
+///
+/// The fingerprint recipe (a [`Fingerprinter`] digest of the routine and every input,
+/// frankenscipy-3cu8u.1) runs at most once per call and only when an event is recorded, so a
+/// call that records nothing does not hash its inputs.
+pub struct AuditScope<'a> {
+    ledger: &'a SyncSharedAuditLedger,
+    fingerprint_of: &'a dyn Fn() -> String,
+    fingerprint: OnceCell<String>,
+    rejected: Cell<bool>,
+}
+
+impl<'a> AuditScope<'a> {
+    #[must_use]
+    pub fn new(ledger: &'a SyncSharedAuditLedger, fingerprint_of: &'a dyn Fn() -> String) -> Self {
+        Self {
+            ledger,
+            fingerprint_of,
+            fingerprint: OnceCell::new(),
+            rejected: Cell::new(false),
+        }
+    }
+
+    /// The call's fingerprint, computed on first use.
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        self.fingerprint.get_or_init(self.fingerprint_of)
+    }
+
+    /// The ledger this call records to, for events built outside the scope.
+    #[must_use]
+    pub const fn ledger(&self) -> &'a SyncSharedAuditLedger {
+        self.ledger
+    }
+
+    /// Record an event of this call.
+    pub fn record(&self, action: AuditAction, outcome: &str) {
+        let event = AuditEvent::new(
+            crate::casp_now_unix_ms(),
+            self.fingerprint(),
+            action,
+            outcome,
+        );
+        lock_ledger(self.ledger).record(event);
+    }
+
+    /// Record a bounded recovery of this call.
+    pub fn recover(&self, recovery_action: &str, outcome: &str) {
+        self.record(
+            AuditAction::BoundedRecovery {
+                recovery_action: recovery_action.to_string(),
+            },
+            outcome,
+        );
+    }
+
+    /// Fail this call closed with `reason`; the caller then returns its error. Only the call's
+    /// first rejection records.
+    pub fn reject(&self, reason: &str, outcome: &str) {
+        if self.rejected.replace(true) {
+            return;
+        }
+        self.record(
+            AuditAction::FailClosed {
+                reason: reason.to_string(),
+            },
+            outcome,
+        );
+    }
+
+    /// Whether this call has failed closed.
+    #[must_use]
+    pub fn has_rejected(&self) -> bool {
+        self.rejected.get()
+    }
+
+    /// The call's exit: `result`, unchanged, after failing the call closed with
+    /// `reason_of(error)` when it is an `Err` that no check rejected.
+    pub fn finish<T, E: Display, R: AsRef<str>>(
+        &self,
+        result: Result<T, E>,
+        reason_of: impl FnOnce(&E) -> R,
+    ) -> Result<T, E> {
+        match &result {
+            Err(error) => {
+                if !self.has_rejected() {
+                    self.reject(reason_of(error).as_ref(), &format!("rejected: {error}"));
+                }
+            }
+            Ok(_) => debug_assert!(
+                !self.has_rejected(),
+                "an audited call failed closed and then returned Ok"
+            ),
+        }
+        result
+    }
+}
+
+/// [`AuditScope::reject`] for a call that may not be audited.
+pub fn audit_reject(audit: Option<&AuditScope<'_>>, reason: &str, outcome: &str) {
+    if let Some(audit) = audit {
+        audit.reject(reason, outcome);
+    }
+}
+
+/// [`AuditScope::recover`] for a call that may not be audited.
+pub fn audit_recover(audit: Option<&AuditScope<'_>>, recovery_action: &str, outcome: &str) {
+    if let Some(audit) = audit {
+        audit.recover(recovery_action, outcome);
+    }
+}
+
+/// [`AuditScope::finish`] for a call that may not be audited.
+pub fn audit_finish<T, E: Display, R: AsRef<str>>(
+    audit: Option<&AuditScope<'_>>,
+    result: Result<T, E>,
+    reason_of: impl FnOnce(&E) -> R,
+) -> Result<T, E> {
+    match audit {
+        Some(audit) => audit.finish(result, reason_of),
+        None => result,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fail_closed_reasons(ledger: &SyncSharedAuditLedger) -> Vec<String> {
+        lock_ledger(ledger)
+            .entries()
+            .iter()
+            .filter_map(|event| match &event.action {
+                AuditAction::FailClosed { reason } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// frankenscipy-3cu8u.2: whichever way a call fails, the ledger gains one `FailClosed`, the
+    /// call's last event; a call that succeeds gains none, and its fingerprint is never
+    /// computed.
+    #[test]
+    fn audit_scope_fails_closed_exactly_once_per_error() {
+        let hashed = Cell::new(0);
+        let recipe = || {
+            hashed.set(hashed.get() + 1);
+            "blake3:call".to_string()
+        };
+
+        // A check rejects with its own reason; the exit must not record the error again.
+        let ledger = AuditLedger::shared();
+        let scope = AuditScope::new(&ledger, &recipe);
+        scope.recover("clamp", "clamped");
+        scope.reject("non_finite_input", "rejected");
+        scope.reject("second_check", "rejected");
+        let result: Result<(), &str> = scope.finish(Err("NaN"), |_| "from_error");
+        assert!(result.is_err());
+        assert_eq!(fail_closed_reasons(&ledger), ["non_finite_input"]);
+        let entries = lock_ledger(&ledger).entries().to_vec();
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[1].action, AuditAction::FailClosed { .. }));
+        assert!(entries.iter().all(|e| e.input_fingerprint == "blake3:call"));
+        assert_eq!(hashed.get(), 1, "the recipe runs once per call");
+
+        // No check knew the cause: the exit records one, from the error.
+        let ledger = AuditLedger::shared();
+        let scope = AuditScope::new(&ledger, &recipe);
+        let result: Result<(), &str> = scope.finish(Err("singular"), |e| format!("{e}_matrix"));
+        assert_eq!(result, Err("singular"));
+        assert_eq!(fail_closed_reasons(&ledger), ["singular_matrix"]);
+        assert_eq!(
+            lock_ledger(&ledger).entries()[0].outcome,
+            "rejected: singular"
+        );
+
+        // Success records nothing and hashes nothing; an unaudited call records nowhere.
+        let ledger = AuditLedger::shared();
+        hashed.set(0);
+        let scope = AuditScope::new(&ledger, &recipe);
+        assert_eq!(scope.finish(Ok::<_, &str>(3), |_| "unused"), Ok(3));
+        assert!(lock_ledger(&ledger).is_empty());
+        assert_eq!(hashed.get(), 0);
+        assert_eq!(
+            audit_finish(None, Err::<(), _>("x"), |_| "unused"),
+            Err("x")
+        );
+        audit_reject(None, "unused", "unused");
+        assert_eq!(hashed.get(), 0);
+    }
 
     /// The documented encoding, rebuilt by hand: what an external caller would do.
     #[test]

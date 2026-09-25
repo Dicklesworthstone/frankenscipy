@@ -264,43 +264,42 @@ pub fn csr_to_csc_with_mode(
 }
 
 /// Audit-emitting variant of [`csr_to_csc_with_mode`] (br-egba-4).
-/// Records an AuditAction::FailClosed event when Hardened mode
-/// rejects a non-canonical CSR. Strict mode never rejects, so no
-/// emission occurs.
+/// Records one `AuditAction::FailClosed` event for every error it returns: a non-canonical CSR
+/// that Hardened mode rejects as `csr_to_csc::unsorted_indices`, and any other error as
+/// `csr_to_csc::<error kind>` (frankenscipy-3cu8u.2).
 pub fn csr_to_csc_with_mode_and_audit(
     csr: &CsrMatrix,
     mode: RuntimeMode,
     operation_id: impl Into<String>,
     ledger: &crate::audit::SyncSharedAuditLedger,
 ) -> SparseResult<(CscMatrix, ConversionLogEntry)> {
-    csr_to_csc_with_mode_inner(csr, mode, operation_id, Some(ledger))
+    let operation_id: String = operation_id.into();
+    // frankenscipy-3cu8u.1: the whole matrix, `mode` and `operation_id`; it used to be the
+    // shape alone, so every rejected matrix of one shape shared a fingerprint.
+    let fingerprint = || {
+        let mut fingerprinter =
+            fsci_runtime::Fingerprinter::new("fsci_sparse::csr_to_csc_with_mode");
+        crate::audit::fingerprint_csr(&mut fingerprinter, csr);
+        fingerprinter
+            .str(&format!("{mode:?}"))
+            .str(&operation_id)
+            .finish()
+    };
+    let audit = fsci_runtime::AuditScope::new(ledger, &fingerprint);
+    let result = csr_to_csc_with_mode_inner(csr, mode, operation_id.as_str(), Some(&audit));
+    audit.finish(result, |error| {
+        format!("csr_to_csc::{}", error.reason_code())
+    })
 }
 
 fn csr_to_csc_with_mode_inner(
     csr: &CsrMatrix,
     mode: RuntimeMode,
     operation_id: impl Into<String>,
-    ledger: Option<&crate::audit::SyncSharedAuditLedger>,
+    audit: Option<&fsci_runtime::AuditScope<'_>>,
 ) -> SparseResult<(CscMatrix, ConversionLogEntry)> {
     if mode == RuntimeMode::Hardened && !csr.canonical.sorted_indices {
-        if let Some(ledger) = ledger {
-            // frankenscipy-3cu8u.1: the whole matrix, `mode` and `operation_id`; it used to be
-            // the shape alone, so every rejected matrix of one shape shared a fingerprint.
-            let operation_id: String = operation_id.into();
-            let mut fingerprinter =
-                fsci_runtime::Fingerprinter::new("fsci_sparse::csr_to_csc_with_mode");
-            crate::audit::fingerprint_csr(&mut fingerprinter, csr);
-            let fingerprint = fingerprinter
-                .str(&format!("{mode:?}"))
-                .str(&operation_id)
-                .finish();
-            crate::audit::record_fail_closed(
-                ledger,
-                &fingerprint,
-                "csr_to_csc::unsorted_indices",
-                "rejected",
-            );
-        }
+        fsci_runtime::audit_reject(audit, "csr_to_csc::unsorted_indices", "rejected");
         return Err(SparseError::InvalidSparseStructure {
             message: "hardened conversion requires sorted CSR indices".to_string(),
         });

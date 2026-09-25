@@ -27,8 +27,9 @@ pub mod supervision;
 pub use booking_claim::{BookingClaim, ClaimRejection, FleetBooking};
 pub use eprocess::{EProcessConfig, EProcessMonitor, EProcessStatus};
 pub use evidence::{
-    AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, DecisionEvidenceEntry,
-    Fingerprinter, PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
+    AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, AuditScope, DecisionEvidenceEntry,
+    Fingerprinter, PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger, audit_finish,
+    audit_recover, audit_reject,
 };
 pub use mode::{HARDENED_MAX_DIM, RuntimeMode};
 pub use policy::{PolicyAction, PolicyController, PolicyDecision, RiskState, decision_loss_matrix};

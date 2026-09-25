@@ -1,45 +1,14 @@
 #![forbid(unsafe_code)]
 
-use std::cell::OnceCell;
-
 pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
-    AuditAction, AuditEvent, AuditLedger, Fingerprinter, RuntimeMode, casp_now_unix_ms,
+    AuditLedger, AuditScope, Fingerprinter, RuntimeMode, audit_finish, audit_recover, audit_reject,
 };
 
 /// Create a shared audit ledger for integrate validation APIs.
 #[must_use]
 pub fn sync_audit_ledger() -> SyncSharedAuditLedger {
     AuditLedger::shared()
-}
-
-/// One audited public call: the ledger its events go to and the recipe for the call's
-/// fingerprint, a [`Fingerprinter`] digest of the public routine and every input it received
-/// (frankenscipy-3cu8u.1). The recipe runs at most once per call and only when an event is
-/// recorded, so an audited call that records nothing does not hash its inputs. `solve_ivp`
-/// hands its scope to the validators it runs, so every event of one `solve_ivp` request carries
-/// that request's fingerprint.
-pub(crate) struct AuditScope<'a> {
-    ledger: &'a SyncSharedAuditLedger,
-    fingerprint_of: &'a dyn Fn() -> String,
-    fingerprint: OnceCell<String>,
-}
-
-impl<'a> AuditScope<'a> {
-    pub(crate) fn new(
-        ledger: &'a SyncSharedAuditLedger,
-        fingerprint_of: &'a dyn Fn() -> String,
-    ) -> Self {
-        Self {
-            ledger,
-            fingerprint_of,
-            fingerprint: OnceCell::new(),
-        }
-    }
-
-    fn fingerprint(&self) -> &str {
-        self.fingerprint.get_or_init(self.fingerprint_of)
-    }
 }
 
 /// Feed an `Option<f64>` as a presence flag, then the value when present.
@@ -62,67 +31,17 @@ pub(crate) fn fingerprint_tolerance(fingerprinter: &mut Fingerprinter, tolerance
     }
 }
 
-/// Acquire the ledger guard, recovering from a poisoned mutex so audit
-/// events still record after any prior thread panicked.
-/// Resolves [frankenscipy-l2irg] for fsci-integrate.
-fn lock_or_recover(ledger: &SyncSharedAuditLedger) -> std::sync::MutexGuard<'_, AuditLedger> {
-    match ledger.lock() {
-        Ok(g) => g,
-        Err(poisoned) => {
-            ledger.clear_poison();
-            poisoned.into_inner()
-        }
-    }
-}
-
-/// Record a fail-closed event; `fingerprint` is the call's [`Fingerprinter`] digest.
-pub(crate) fn record_fail_closed(
-    ledger: &SyncSharedAuditLedger,
-    fingerprint: &str,
-    reason: &str,
-    outcome: &str,
-) {
-    let event = AuditEvent::new(
-        casp_now_unix_ms(),
-        fingerprint,
-        AuditAction::FailClosed {
-            reason: reason.to_string(),
-        },
-        outcome,
-    );
-    lock_or_recover(ledger).record(event);
-}
-
-/// Record a bounded-recovery event; `fingerprint` is the call's [`Fingerprinter`] digest.
-pub(crate) fn record_bounded_recovery(
-    ledger: &SyncSharedAuditLedger,
-    fingerprint: &str,
-    recovery_action: &str,
-    outcome: &str,
-) {
-    let event = AuditEvent::new(
-        casp_now_unix_ms(),
-        fingerprint,
-        AuditAction::BoundedRecovery {
-            recovery_action: recovery_action.to_string(),
-        },
-        outcome,
-    );
-    lock_or_recover(ledger).record(event);
-}
-
-/// Record a fail-closed event for an audited call; a no-op when the call is not audited.
+/// Fail an audited call closed with `reason`, which is always the
+/// [`IntegrateValidationError::reason_code`] of the error the call then returns; a no-op when
+/// the call is not audited. `solve_ivp` hands its scope to the validators it runs, so every
+/// event of one `solve_ivp` request carries that request's fingerprint.
 pub(crate) fn fail_closed(audit: Option<&AuditScope<'_>>, reason: &str, outcome: &str) {
-    if let Some(audit) = audit {
-        record_fail_closed(audit.ledger, audit.fingerprint(), reason, outcome);
-    }
+    audit_reject(audit, reason, outcome);
 }
 
 /// Record a bounded recovery for an audited call; a no-op when the call is not audited.
 fn bounded_recovery(audit: Option<&AuditScope<'_>>, recovery_action: &str, outcome: &str) {
-    if let Some(audit) = audit {
-        record_bounded_recovery(audit.ledger, audit.fingerprint(), recovery_action, outcome);
-    }
+    audit_recover(audit, recovery_action, outcome);
 }
 
 pub const EPS: f64 = f64::EPSILON;
@@ -278,6 +197,39 @@ impl std::fmt::Display for IntegrateValidationError {
 
 impl std::error::Error for IntegrateValidationError {}
 
+impl IntegrateValidationError {
+    /// The audit reason code of this error (frankenscipy-3cu8u.2), the same code the
+    /// validator that returns it records.
+    pub(crate) const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::EmptyY0 => "empty_y0",
+            Self::FirstStepMustBePositive => "first_step_must_be_positive",
+            Self::FirstStepExceedsBounds => "first_step_exceeds_bounds",
+            Self::MaxStepMustBePositive => "max_step_must_be_positive",
+            Self::NonFiniteFirstStep => "first_step_must_be_finite",
+            Self::NonFiniteMaxStep => "max_step_must_not_be_nan",
+            Self::NonFiniteRtol => "rtol_must_not_be_nan",
+            Self::NonFiniteAtol => "atol_must_not_be_nan",
+            Self::AtolWrongShape { .. } => "atol_wrong_shape",
+            Self::AtolMustBePositive => "atol_must_be_positive",
+            Self::NonFiniteY0 => "non_finite_y0",
+            Self::NonFiniteSpan => "non_finite_span",
+            Self::NonFiniteF0 => "non_finite_f0",
+            Self::RhsWrongShape { .. } => "rhs_wrong_shape",
+            Self::NonFiniteEventDirection { .. } => "event_direction_must_be_finite",
+            Self::EventMaxEventsMustBePositive { .. } => "event_max_events_must_be_positive",
+            Self::NonFiniteEventValue { .. } => "non_finite_event_value",
+            Self::TEvalOutOfSpan => "t_eval_out_of_span",
+            Self::TEvalNotSorted => "t_eval_not_sorted",
+            Self::NotYetImplemented { .. } => "not_yet_implemented",
+            Self::QuadInvalidBounds { .. } => "quad_invalid_bounds",
+            Self::QuadInvalidTolerance { .. } => "quad_invalid_tolerance",
+            Self::LebedevOrderUnavailable { .. } => "lebedev_order_unavailable",
+            Self::IntegrationFailed { .. } => "integration_failed",
+        }
+    }
+}
+
 pub(crate) fn validate_rhs_shape(
     actual: usize,
     expected: usize,
@@ -312,7 +264,12 @@ pub fn validate_first_step_with_audit(
             .finish()
     };
     let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint_of));
-    validate_first_step_scoped(first_step, t0, t_bound, audit.as_ref())
+    let result = validate_first_step_scoped(first_step, t0, t_bound, audit.as_ref());
+    audit_finish(
+        audit.as_ref(),
+        result,
+        IntegrateValidationError::reason_code,
+    )
 }
 
 /// `validate_first_step`, recording its rejections under `audit`.
@@ -353,7 +310,12 @@ pub fn validate_max_step_with_audit(
             .finish()
     };
     let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint_of));
-    validate_max_step_scoped(max_step, audit.as_ref())
+    let result = validate_max_step_scoped(max_step, audit.as_ref());
+    audit_finish(
+        audit.as_ref(),
+        result,
+        IntegrateValidationError::reason_code,
+    )
 }
 
 /// `validate_max_step`, recording its rejections under `audit`.
@@ -399,7 +361,11 @@ pub fn validate_tol_with_audit(
         fingerprinter.finish()
     };
     let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint_of));
-    let needs_clamp = check_tol(&rtol, &atol, n, mode, audit.as_ref())?;
+    let needs_clamp = audit_finish(
+        audit.as_ref(),
+        check_tol(&rtol, &atol, n, mode, audit.as_ref()),
+        IntegrateValidationError::reason_code,
+    )?;
     Ok(resolve_tol(rtol, atol, mode, needs_clamp))
 }
 
@@ -488,6 +454,7 @@ fn resolve_tol(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fsci_runtime::AuditAction;
 
     // ── validate_tol scalar tests ────────────────────────────────
 
@@ -980,18 +947,16 @@ mod tests {
             "ledger must be poisoned after panic"
         );
 
-        record_fail_closed(
-            &audit_ledger,
-            "bad first step",
-            "first_step_must_be_positive",
-            "rejected",
-        );
-        record_bounded_recovery(
-            &audit_ledger,
-            "small rtol",
-            "clamp_rtol_to_min",
-            "recovered",
-        );
+        // Through the public audited APIs: one rejection and one Hardened clamp.
+        assert!(validate_first_step_with_audit(0.0, 0.0, 1.0, Some(&audit_ledger)).is_err());
+        validate_tol_with_audit(
+            ToleranceValue::Scalar(1e-20),
+            ToleranceValue::Scalar(1e-9),
+            1,
+            RuntimeMode::Hardened,
+            Some(&audit_ledger),
+        )
+        .expect("clamped tolerance");
 
         let ledger = audit_ledger
             .lock()

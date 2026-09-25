@@ -1,4 +1,4 @@
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::fmt::{Display, Formatter};
@@ -2114,6 +2114,20 @@ impl Display for FftError {
 
 impl std::error::Error for FftError {}
 
+impl FftError {
+    /// The audit reason code of this error (frankenscipy-3cu8u.2).
+    const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidShape { .. } => "invalid_shape",
+            Self::InvalidAxes { .. } => "invalid_axes",
+            Self::InvalidWorkers { .. } => "invalid_workers",
+            Self::LengthMismatch { .. } => "length_mismatch",
+            Self::NonPositiveSampleSpacing => "non_positive_sample_spacing",
+            Self::NonFiniteInput => "non_finite_input",
+        }
+    }
+}
+
 /// Fast Walsh–Hadamard transform (natural / Hadamard ordering) in O(n·log n).
 ///
 /// Computes `H_n · x`, where `H_n` is the n×n Hadamard matrix
@@ -2229,7 +2243,7 @@ pub fn fft_with_audit(
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<Vec<Complex64>, FftError> {
     let audit = FftAudit::complex(audit_ledger, "fsci_fft::fft", input, options);
-    fft_impl(input, options, Some(&audit))
+    audit.finish(fft_impl(input, options, Some(&audit)))
 }
 
 /// 1D inverse complex FFT.
@@ -2244,7 +2258,7 @@ pub fn ifft_with_audit(
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<Vec<Complex64>, FftError> {
     let audit = FftAudit::complex(audit_ledger, "fsci_fft::ifft", input, options);
-    ifft_impl(input, options, Some(&audit))
+    audit.finish(ifft_impl(input, options, Some(&audit)))
 }
 
 /// 1D real-input FFT.
@@ -2259,7 +2273,7 @@ pub fn rfft_with_audit(
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<Vec<Complex64>, FftError> {
     let audit = FftAudit::real(audit_ledger, "fsci_fft::rfft", input, options);
-    rfft_impl(input, options, Some(&audit))
+    audit.finish(rfft_impl(input, options, Some(&audit)))
 }
 
 /// 1D inverse real FFT.
@@ -2280,7 +2294,7 @@ pub fn irfft_with_audit(
 ) -> Result<Vec<f64>, FftError> {
     let audit = FftAudit::complex(audit_ledger, "fsci_fft::irfft", input, options)
         .with_output_len(output_len);
-    irfft_impl(input, output_len, options, Some(&audit))
+    audit.finish(irfft_impl(input, output_len, options, Some(&audit)))
 }
 
 /// Worker count for a batched (across-rows) 1-D transform: each row is an O(ncols·log ncols) transform,
@@ -2665,7 +2679,7 @@ pub fn fft2_with_audit(
 ) -> Result<Vec<Complex64>, FftError> {
     let dims = [shape.0, shape.1];
     let audit = FftAudit::complex(audit_ledger, "fsci_fft::fft2", input, options).with_shape(&dims);
-    fft2_impl(input, &dims, options, Some(&audit))
+    audit.finish(fft2_impl(input, &dims, options, Some(&audit)))
 }
 
 /// 2D inverse complex FFT via row/column decomposition.
@@ -2688,7 +2702,7 @@ pub fn ifft2_with_audit(
     let dims = [shape.0, shape.1];
     let audit =
         FftAudit::complex(audit_ledger, "fsci_fft::ifft2", input, options).with_shape(&dims);
-    ifft2_impl(input, &dims, options, Some(&audit))
+    audit.finish(ifft2_impl(input, &dims, options, Some(&audit)))
 }
 
 /// N-dimensional forward complex FFT.
@@ -2708,7 +2722,7 @@ pub fn fftn_with_audit(
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<Vec<Complex64>, FftError> {
     let audit = FftAudit::complex(audit_ledger, "fsci_fft::fftn", input, options).with_shape(shape);
-    fftn_impl(input, shape, options, Some(&audit))
+    audit.finish(fftn_impl(input, shape, options, Some(&audit)))
 }
 
 /// N-dimensional inverse complex FFT.
@@ -2731,7 +2745,7 @@ pub fn ifftn_with_audit(
 ) -> Result<Vec<Complex64>, FftError> {
     let audit =
         FftAudit::complex(audit_ledger, "fsci_fft::ifftn", input, options).with_shape(shape);
-    ifftn_impl(input, shape, options, Some(&audit))
+    audit.finish(ifftn_impl(input, shape, options, Some(&audit)))
 }
 
 /// N-dimensional real-input FFT.
@@ -2753,7 +2767,7 @@ pub fn rfftn_with_audit(
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<Vec<Complex64>, FftError> {
     let audit = FftAudit::real(audit_ledger, "fsci_fft::rfftn", input, options).with_shape(shape);
-    rfftn_impl(input, shape, options, Some(&audit))
+    audit.finish(rfftn_impl(input, shape, options, Some(&audit)))
 }
 
 fn fft2_impl(
@@ -5071,6 +5085,8 @@ struct FftAudit<'a> {
     extent: FftAuditExtent<'a>,
     options: &'a FftOptions,
     fingerprint: OnceCell<String>,
+    /// Whether the call has failed closed; only its first rejection records.
+    rejected: Cell<bool>,
 }
 
 impl<'a> FftAudit<'a> {
@@ -5087,7 +5103,22 @@ impl<'a> FftAudit<'a> {
             extent: FftAuditExtent::Unsized,
             options,
             fingerprint: OnceCell::new(),
+            rejected: Cell::new(false),
         }
+    }
+
+    /// The audited call's exit (frankenscipy-3cu8u.2): `result`, unchanged, after recording
+    /// one `FailClosed` for an error no check rejected, so every error the call returns is
+    /// exactly one fail-closed event, after its other events.
+    fn finish<T>(&self, result: Result<T, FftError>) -> Result<T, FftError> {
+        if let Err(error) = &result {
+            record_fail_closed(
+                Some(self),
+                error.reason_code(),
+                format!("rejected: {error}"),
+            );
+        }
+        result
     }
 
     fn real(
@@ -5185,9 +5216,12 @@ fn record_mode_decision(
     }
 }
 
-/// Record a fail-closed rejection for an audited call; a no-op when the call is not audited.
+/// Record a fail-closed rejection for an audited call; a no-op when the call is not audited or
+/// has already failed closed.
 fn record_fail_closed(audit: Option<&FftAudit<'_>>, reason: &str, outcome: impl Into<String>) {
-    if let Some(audit) = audit {
+    if let Some(audit) = audit
+        && !audit.rejected.replace(true)
+    {
         record_audit_event(
             audit.ledger,
             audit.fingerprint(),
@@ -5424,7 +5458,7 @@ pub fn rfft2_with_audit(
 ) -> Result<Vec<Complex64>, FftError> {
     let dims = [shape.0, shape.1];
     let audit = FftAudit::real(audit_ledger, "fsci_fft::rfft2", input, options).with_shape(&dims);
-    rfft2_impl(input, &dims, options, Some(&audit))
+    audit.finish(rfft2_impl(input, &dims, options, Some(&audit)))
 }
 
 /// 2D inverse real FFT.
@@ -5449,7 +5483,7 @@ pub fn irfft2_with_audit(
     let dims = [shape.0, shape.1];
     let audit =
         FftAudit::complex(audit_ledger, "fsci_fft::irfft2", input, options).with_shape(&dims);
-    irfft2_impl(input, &dims, options, Some(&audit))
+    audit.finish(irfft2_impl(input, &dims, options, Some(&audit)))
 }
 
 /// N-dimensional inverse real FFT.
@@ -5472,7 +5506,7 @@ pub fn irfftn_with_audit(
 ) -> Result<Vec<f64>, FftError> {
     let audit =
         FftAudit::complex(audit_ledger, "fsci_fft::irfftn", input, options).with_shape(shape);
-    irfftn_impl(input, shape, options, Some(&audit))
+    audit.finish(irfftn_impl(input, shape, options, Some(&audit)))
 }
 
 /// Find the next fast length for FFT computation.
@@ -5568,7 +5602,7 @@ pub fn hfft_with_audit(
 ) -> Result<Vec<f64>, FftError> {
     let audit =
         FftAudit::complex(audit_ledger, "fsci_fft::hfft", input, options).with_output_len(n);
-    hfft_impl(input, n, options, Some(&audit))
+    audit.finish(hfft_impl(input, n, options, Some(&audit)))
 }
 
 /// Inverse of the Hermitian FFT (hfft).
@@ -5593,7 +5627,7 @@ pub fn ihfft_with_audit(
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<Vec<Complex64>, FftError> {
     let audit = FftAudit::real(audit_ledger, "fsci_fft::ihfft", input, options).with_output_len(n);
-    ihfft_impl(input, n, options, Some(&audit))
+    audit.finish(ihfft_impl(input, n, options, Some(&audit)))
 }
 
 /// 2D Hermitian FFT.
@@ -5618,7 +5652,7 @@ pub fn hfft2_with_audit(
     let dims = [shape.0, shape.1];
     let audit =
         FftAudit::complex(audit_ledger, "fsci_fft::hfft2", input, options).with_shape(&dims);
-    hfft2_impl(input, &dims, options, Some(&audit))
+    audit.finish(hfft2_impl(input, &dims, options, Some(&audit)))
 }
 
 /// 2D inverse Hermitian FFT.
@@ -5642,7 +5676,7 @@ pub fn ihfft2_with_audit(
 ) -> Result<Vec<Complex64>, FftError> {
     let dims = [shape.0, shape.1];
     let audit = FftAudit::real(audit_ledger, "fsci_fft::ihfft2", input, options).with_shape(&dims);
-    ihfft2_impl(input, &dims, options, Some(&audit))
+    audit.finish(ihfft2_impl(input, &dims, options, Some(&audit)))
 }
 
 /// N-dimensional Hermitian FFT.
@@ -5665,7 +5699,7 @@ pub fn hfftn_with_audit(
 ) -> Result<Vec<f64>, FftError> {
     let audit =
         FftAudit::complex(audit_ledger, "fsci_fft::hfftn", input, options).with_shape(shape);
-    hfftn_impl(input, shape, options, Some(&audit))
+    audit.finish(hfftn_impl(input, shape, options, Some(&audit)))
 }
 
 /// N-dimensional inverse Hermitian FFT.
@@ -5687,7 +5721,7 @@ pub fn ihfftn_with_audit(
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<Vec<Complex64>, FftError> {
     let audit = FftAudit::real(audit_ledger, "fsci_fft::ihfftn", input, options).with_shape(shape);
-    ihfftn_impl(input, shape, options, Some(&audit))
+    audit.finish(ihfftn_impl(input, shape, options, Some(&audit)))
 }
 
 fn rfft2_impl(

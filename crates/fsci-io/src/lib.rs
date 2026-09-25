@@ -33,7 +33,7 @@ use std::fmt::Write as _;
 pub use fsci_runtime::{
     AuditAction, AuditEvent, AuditLedger, HARDENED_MAX_DIM, RuntimeMode, SyncSharedAuditLedger,
 };
-use fsci_runtime::{Fingerprinter, casp_now_unix_ms};
+use fsci_runtime::{AuditScope, Fingerprinter, audit_finish, audit_reject, casp_now_unix_ms};
 
 /// Create a new shared audit ledger for synchronous contexts.
 #[must_use]
@@ -108,6 +108,17 @@ impl std::fmt::Display for IoError {
 }
 
 impl std::error::Error for IoError {}
+
+impl IoError {
+    /// The audit reason code of this error (frankenscipy-3cu8u.2).
+    const fn reason_code(&self) -> &'static str {
+        match self {
+            Self::InvalidFormat(_) => "invalid_format",
+            Self::IoFailed(_) => "io_failed",
+            Self::UnsupportedFeature(_) => "unsupported_feature",
+        }
+    }
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // Matrix Market Format
@@ -361,10 +372,32 @@ pub fn mmread(content: &str) -> Result<MmMatrix, IoError> {
 }
 
 /// Read a Matrix Market file under an explicit runtime policy with optional audit ledger.
+///
+/// With a ledger, every error it returns, in either mode, is recorded as one `FailClosed`
+/// event (frankenscipy-3cu8u.2).
 pub fn mmread_with_mode(
     content: &str,
     mode: RuntimeMode,
     audit_ledger: Option<&SyncSharedAuditLedger>,
+) -> Result<MmMatrix, IoError> {
+    // The whole request: every byte of `content`, then `mode` (Debug). Computed only when an
+    // event is recorded.
+    let fingerprint = || {
+        Fingerprinter::new("fsci_io::mmread_with_mode")
+            .bytes(content.as_bytes())
+            .str(&format!("{mode:?}"))
+            .finish()
+    };
+    let audit = audit_ledger.map(|ledger| AuditScope::new(ledger, &fingerprint));
+    let result = mmread_audited(content, mode, audit.as_ref());
+    audit_finish(audit.as_ref(), result, IoError::reason_code)
+}
+
+/// [`mmread_with_mode`]'s read, recording its rejections under `audit`.
+fn mmread_audited(
+    content: &str,
+    mode: RuntimeMode,
+    audit: Option<&AuditScope<'_>>,
 ) -> Result<MmMatrix, IoError> {
     let mut lines = content.lines();
     let info = parse_mm_info(&mut lines)?;
@@ -372,19 +405,11 @@ pub fn mmread_with_mode(
     if matches!(mode, RuntimeMode::Hardened)
         && (info.rows > HARDENED_MAX_DIM || info.cols > HARDENED_MAX_DIM)
     {
-        if let Some(ledger) = audit_ledger {
-            // The whole request: every byte of `content`, then `mode` (Debug).
-            let fingerprint = Fingerprinter::new("fsci_io::mmread_with_mode")
-                .bytes(content.as_bytes())
-                .str(&format!("{mode:?}"))
-                .finish();
-            record_fail_closed(
-                ledger,
-                &fingerprint,
-                "dimension exceeds hardened limit",
-                "rejected",
-            );
-        }
+        audit_reject(
+            audit,
+            "resource_exhausted",
+            "rejected: dimension exceeds hardened limit",
+        );
         return Err(IoError::InvalidFormat(format!(
             "Matrix Market dimensions {}x{} exceed hardened limit ({HARDENED_MAX_DIM})",
             info.rows, info.cols

@@ -81,9 +81,9 @@ use bunch_kaufman::{BunchKaufman, Triangle};
 
 pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
-    AttemptOutcome, AuditAction, AuditEvent, AuditLedger, DecisionSignals, Fingerprinter,
-    PolicyAction, PolicyController, PolicyDecision, RuntimeMode, SolverAction, SolverEvidenceEntry,
-    SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
+    AttemptOutcome, AuditAction, AuditEvent, AuditLedger, AuditScope, DecisionSignals,
+    Fingerprinter, PolicyAction, PolicyController, PolicyDecision, RuntimeMode, SolverAction,
+    SolverEvidenceEntry, SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
 };
 use std::{borrow::Cow, fmt, simd::Simd};
 
@@ -217,26 +217,29 @@ fn record_mode_decision(
     lock_or_recover(ledger).record(event);
 }
 
-fn fail_closed_reason(error: &LinalgError) -> Option<&'static str> {
+/// The audit reason code of an error an audited call returns (frankenscipy-3cu8u.2). Every
+/// error is a fail-closed event, a numerical refusal such as a singular matrix included.
+fn fail_closed_reason(error: &LinalgError) -> &'static str {
     match error {
-        LinalgError::RaggedMatrix => Some("ragged_matrix"),
-        LinalgError::ExpectedSquareMatrix => Some("non_square_matrix"),
-        LinalgError::IncompatibleShapes { .. } => Some("incompatible_shapes"),
-        LinalgError::NonFiniteInput => Some("non_finite_input"),
-        LinalgError::InvalidBandShape { .. } => Some("invalid_band_shape"),
-        LinalgError::InvalidPinvThreshold => Some("invalid_pinv_threshold"),
-        LinalgError::UnsupportedAssumption => Some("unsupported_assumption"),
-        LinalgError::PolicyRejected { .. } => Some("policy_rejected"),
-        LinalgError::ConditionTooHigh { .. } => Some("condition_too_high"),
-        LinalgError::ResourceExhausted { .. } => Some("resource_exhausted"),
-        LinalgError::InvalidArgument { .. } => Some("invalid_argument"),
-        LinalgError::NotSupported { .. } | LinalgError::ConvergenceFailure { .. } => {
-            Some("not_supported")
-        }
-        LinalgError::SingularMatrix => None,
+        LinalgError::RaggedMatrix => "ragged_matrix",
+        LinalgError::ExpectedSquareMatrix => "non_square_matrix",
+        LinalgError::IncompatibleShapes { .. } => "incompatible_shapes",
+        LinalgError::NonFiniteInput => "non_finite_input",
+        LinalgError::InvalidBandShape { .. } => "invalid_band_shape",
+        LinalgError::InvalidPinvThreshold => "invalid_pinv_threshold",
+        LinalgError::UnsupportedAssumption => "unsupported_assumption",
+        LinalgError::PolicyRejected { .. } => "policy_rejected",
+        LinalgError::ConditionTooHigh { .. } => "condition_too_high",
+        LinalgError::ResourceExhausted { .. } => "resource_exhausted",
+        LinalgError::InvalidArgument { .. } => "invalid_argument",
+        LinalgError::NotSupported { .. } => "not_supported",
+        LinalgError::ConvergenceFailure { .. } => "convergence_failure",
+        LinalgError::SingularMatrix => "singular_matrix",
     }
 }
 
+/// One event per audited call: its mode decision when it succeeds, and a fail-closed event
+/// when it returns an error.
 fn record_operation_audit<T>(
     ledger: &SyncSharedAuditLedger,
     fingerprint: &str,
@@ -246,23 +249,12 @@ fn record_operation_audit<T>(
 ) {
     match result {
         Ok(_) => record_mode_decision(ledger, fingerprint, mode, &format!("{operation} executed")),
-        Err(error) => {
-            if let Some(reason) = fail_closed_reason(error) {
-                record_fail_closed(
-                    ledger,
-                    fingerprint,
-                    reason,
-                    &format!("{operation} rejected: {error}"),
-                );
-            } else {
-                record_mode_decision(
-                    ledger,
-                    fingerprint,
-                    mode,
-                    &format!("{operation} errored: {error}"),
-                );
-            }
-        }
+        Err(error) => record_fail_closed(
+            ledger,
+            fingerprint,
+            fail_closed_reason(error),
+            &format!("{operation} rejected: {error}"),
+        ),
     }
 }
 
@@ -3040,9 +3032,11 @@ pub fn solve_with_casp(
 /// Solve linear system with full audit logging.
 ///
 /// Records to the provided `AuditLedger`:
-/// - `FailClosed` events when validation rejects input (non-finite, ill-conditioned)
 /// - CASP solver selection decisions
 /// - Bounded recovery events in hardened mode
+/// - one `FailClosed` event for every error it returns, in either mode, after the call's other
+///   events: validation rejections (non-finite, ill-conditioned) under their own reasons and
+///   every other error, a singular matrix included, under [`fail_closed_reason`]
 pub fn solve_with_audit(
     a: &[Vec<f64>],
     b: &[f64],
@@ -3050,27 +3044,38 @@ pub fn solve_with_audit(
     portfolio: &mut SolverPortfolio,
     audit_ledger: &SyncSharedAuditLedger,
 ) -> Result<SolveResult, LinalgError> {
-    let fingerprint = audit_fingerprint("fsci_linalg::solve", &options, |f| {
-        f.rows(a).f64s(b);
-    });
+    let fingerprint_of = || {
+        audit_fingerprint("fsci_linalg::solve", &options, |f| {
+            f.rows(a).f64s(b);
+        })
+    };
+    let audit = AuditScope::new(audit_ledger, &fingerprint_of);
+    let result = solve_audited(a, b, options, portfolio, &audit);
+    audit.finish(result, fail_closed_reason)
+}
+
+/// [`solve_with_audit`]'s solve, recording its events under `audit`.
+fn solve_audited(
+    a: &[Vec<f64>],
+    b: &[f64],
+    options: SolveOptions,
+    portfolio: &mut SolverPortfolio,
+    audit: &AuditScope<'_>,
+) -> Result<SolveResult, LinalgError> {
     let mirrored = triangle_selected_matrix(a, options.assume_a, options.lower);
     let a = mirrored.as_deref().unwrap_or(a);
     let (rows, cols) = matrix_shape(a)?;
 
     // Validation with audit logging
     if rows != cols {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
+        audit.reject(
             "non_square_matrix",
             &format!("rejected: {rows}x{cols} is not square"),
         );
         return Err(LinalgError::ExpectedSquareMatrix);
     }
     if b.len() != rows {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
+        audit.reject(
             "incompatible_shapes",
             &format!("rejected: b.len()={} != rows={rows}", b.len()),
         );
@@ -3083,9 +3088,7 @@ pub fn solve_with_audit(
     // Hardened dimension check with audit
     if options.mode == RuntimeMode::Hardened && (rows > HARDENED_MAX_DIM || cols > HARDENED_MAX_DIM)
     {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
+        audit.reject(
             "resource_exhausted",
             &format!("rejected: {rows}x{cols} exceeds hardened limit {HARDENED_MAX_DIM}"),
         );
@@ -3100,21 +3103,11 @@ pub fn solve_with_audit(
     let must_check = options.check_finite || options.mode == RuntimeMode::Hardened;
     if must_check {
         if a.iter().flatten().any(|v| !v.is_finite()) {
-            record_fail_closed(
-                audit_ledger,
-                &fingerprint,
-                "non_finite_matrix",
-                "rejected: matrix contains NaN or Inf",
-            );
+            audit.reject("non_finite_matrix", "rejected: matrix contains NaN or Inf");
             return Err(LinalgError::NonFiniteInput);
         }
         if b.iter().any(|v| !v.is_finite()) {
-            record_fail_closed(
-                audit_ledger,
-                &fingerprint,
-                "non_finite_vector",
-                "rejected: vector contains NaN or Inf",
-            );
+            audit.reject("non_finite_vector", "rejected: vector contains NaN or Inf");
             return Err(LinalgError::NonFiniteInput);
         }
     }
@@ -3149,12 +3142,7 @@ pub fn solve_with_audit(
                 match solve_policy_decision(options.mode, &report, metadata_incompatibility_score) {
                     Ok(decision) => decision,
                     Err(err) => {
-                        record_fail_closed(
-                            audit_ledger,
-                            &fingerprint,
-                            "policy_rejected",
-                            &format!("rejected: {err}"),
-                        );
+                        audit.reject("policy_rejected", &format!("rejected: {err}"));
                         return Err(err);
                     }
                 },
@@ -3168,9 +3156,7 @@ pub fn solve_with_audit(
         && report.rcond_estimate < HARDENED_RCOND_THRESHOLD
         && report.rcond_estimate > 0.0
     {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
+        audit.reject(
             "condition_too_high",
             &format!(
                 "rejected: rcond={:.2e} < threshold={:.2e}",
@@ -3210,20 +3196,12 @@ pub fn solve_with_audit(
         enforce_policy_full_validation(policy_decision.as_ref(), &solve_result)?;
         Ok(solve_result)
     });
-    if matches!(&result, Err(LinalgError::ConvergenceFailure { .. })) {
-        record_fail_closed(
-            audit_ledger,
-            &fingerprint,
-            "policy_full_validation",
-            "rejected: policy full validation failed",
-        );
-    }
 
     // Record CASP decision to audit ledger
     let fallback_active = actual_action != selected_action;
     record_casp_decision(
-        audit_ledger,
-        &fingerprint,
+        audit.ledger(),
+        audit.fingerprint(),
         actual_action,
         report.rcond_estimate,
         fallback_active,
@@ -3232,10 +3210,18 @@ pub fn solve_with_audit(
     // Record bounded recovery if fallback occurred in hardened mode
     if fallback_active && options.mode == RuntimeMode::Hardened {
         record_bounded_recovery(
-            audit_ledger,
-            &fingerprint,
+            audit.ledger(),
+            audit.fingerprint(),
             &format!("fallback from {:?} to {:?}", selected_action, actual_action),
             "recovered via safer solver",
+        );
+    }
+
+    // After the decision it failed under, so the fail-closed event is the call's last.
+    if matches!(&result, Err(LinalgError::ConvergenceFailure { .. })) {
+        audit.reject(
+            "policy_full_validation",
+            "rejected: policy full validation failed",
         );
     }
 
