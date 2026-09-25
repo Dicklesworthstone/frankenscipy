@@ -5,7 +5,7 @@
 use blake3::hash;
 use serde::{Deserialize, Serialize};
 use std::cell::{Cell, OnceCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Display;
 use std::sync::{Arc, Mutex};
 
@@ -173,12 +173,54 @@ pub enum AuditAction {
     AlienArtifactDecision {
         decision: Box<AlienArtifactDecision>,
     },
+    /// A CASP portfolio's solver choice (frankenscipy-7tb8d.11): which portfolio, the runtime
+    /// mode the call ran in, the action taken, the posterior over the portfolio's states, the
+    /// expected loss of every action (in the portfolio's action order) and of the chosen one,
+    /// whether it is a fallback from the action first selected, and the evidence that drove
+    /// the posterior, by name.
+    CaspDecision {
+        portfolio: String,
+        mode: RuntimeMode,
+        action: String,
+        posterior: Vec<f64>,
+        expected_losses: Vec<f64>,
+        chosen_expected_loss: f64,
+        fallback: bool,
+        evidence: BTreeMap<String, EvidenceValue>,
+    },
     // br-egba-1: `PolicyOverride { override_action: String }` was
     // defined here but never constructed by any crate in the workspace
     // (grep confirms zero call sites outside the enum definition).
     // Removed as dead code. If policy-override semantics are added
     // back, re-introduce the variant alongside at least one emission
     // site so it remains non-dead.
+}
+
+/// One piece of the evidence behind a CASP decision: a measurement (an rcond estimate) or a
+/// label (a structure class). JSON carries it as a plain number or string.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EvidenceValue {
+    Number(f64),
+    Label(String),
+}
+
+impl From<f64> for EvidenceValue {
+    fn from(value: f64) -> Self {
+        Self::Number(value)
+    }
+}
+
+impl From<&str> for EvidenceValue {
+    fn from(value: &str) -> Self {
+        Self::Label(value.to_string())
+    }
+}
+
+impl From<String> for EvidenceValue {
+    fn from(value: String) -> Self {
+        Self::Label(value)
+    }
 }
 
 /// Single audit event entry with input fingerprint and outcome.
@@ -207,23 +249,119 @@ impl AuditEvent {
     }
 }
 
-/// Append-only ledger for audit events.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Append-only ledger for audit events. Unbounded by default; with a capacity
+/// ([`AuditLedger::with_capacity`]) it keeps the newest `capacity` events, evicting the oldest
+/// first and counting what it evicted (frankenscipy-7tb8d.11). Both show in its JSON only when
+/// set, so an unbounded ledger serializes as `{"entries": [...]}`.
+#[derive(Debug, Clone)]
 pub struct AuditLedger {
-    entries: Vec<AuditEvent>,
+    /// The events are `buffer[start..]`. Evicted events are dropped from the front in
+    /// batches, so recording stays amortized O(1) and `entries()` stays one slice.
+    buffer: Vec<AuditEvent>,
+    start: usize,
+    capacity: Option<usize>,
+    evicted: u64,
+}
+
+/// [`AuditLedger`]'s JSON form.
+#[derive(Serialize, Deserialize)]
+struct AuditLedgerJson<'a> {
+    entries: std::borrow::Cow<'a, [AuditEvent]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capacity: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    evicted: u64,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` passes a reference
+const fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl Serialize for AuditLedger {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        AuditLedgerJson {
+            entries: std::borrow::Cow::Borrowed(self.entries()),
+            capacity: self.capacity,
+            evicted: self.evicted,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for AuditLedger {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let json = AuditLedgerJson::deserialize(deserializer)?;
+        let mut ledger = Self {
+            buffer: json.entries.into_owned(),
+            start: 0,
+            capacity: json.capacity,
+            evicted: json.evicted,
+        };
+        if let Some(capacity) = ledger.capacity {
+            let excess = ledger.buffer.len().saturating_sub(capacity);
+            ledger.buffer.drain(..excess);
+            ledger.evicted += excess as u64;
+        }
+        Ok(ledger)
+    }
+}
+
+impl PartialEq for AuditLedger {
+    fn eq(&self, other: &Self) -> bool {
+        self.entries() == other.entries()
+            && self.capacity == other.capacity
+            && self.evicted == other.evicted
+    }
 }
 
 impl AuditLedger {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            buffer: Vec::new(),
+            start: 0,
+            capacity: None,
+            evicted: 0,
         }
     }
 
-    /// Record an audit event (append-only).
+    /// A ledger that keeps the newest `capacity` events.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity: Some(capacity),
+            ..Self::new()
+        }
+    }
+
+    /// Record an audit event, evicting the oldest one when a bounded ledger is full.
     pub fn record(&mut self, event: AuditEvent) {
-        self.entries.push(event);
+        self.buffer.push(event);
+        let Some(capacity) = self.capacity else {
+            return;
+        };
+        if self.buffer.len() - self.start > capacity {
+            self.start += 1;
+            self.evicted += 1;
+            // Drop the evicted prefix once it is as long as a full ledger.
+            if self.start >= capacity.max(1) {
+                self.buffer.drain(..self.start);
+                self.start = 0;
+            }
+        }
+    }
+
+    /// The capacity of a bounded ledger; `None` when unbounded.
+    #[must_use]
+    pub const fn capacity(&self) -> Option<usize> {
+        self.capacity
+    }
+
+    /// How many events a bounded ledger has evicted.
+    #[must_use]
+    pub const fn evicted(&self) -> u64 {
+        self.evicted
     }
 
     /// Record a fully surfaced Spec §6 decision-theory event.
@@ -246,17 +384,18 @@ impl AuditLedger {
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.buffer.len() - self.start
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len() == 0
     }
 
+    /// The events held, oldest first.
     #[must_use]
     pub fn entries(&self) -> &[AuditEvent] {
-        &self.entries
+        &self.buffer[self.start..]
     }
 
     /// Serialize ledger as JSON.
@@ -279,6 +418,12 @@ impl AuditLedger {
     #[must_use]
     pub fn shared() -> SharedAuditLedger {
         Arc::new(Mutex::new(Self::new()))
+    }
+
+    /// A shared ledger that keeps the newest `capacity` events.
+    #[must_use]
+    pub fn shared_with_capacity(capacity: usize) -> SharedAuditLedger {
+        Arc::new(Mutex::new(Self::with_capacity(capacity)))
     }
 }
 
@@ -655,6 +800,96 @@ mod tests {
         );
         audit_reject(None, "unused", "unused");
         assert_eq!(hashed.get(), 0);
+    }
+
+    fn numbered_event(n: u64) -> AuditEvent {
+        AuditEvent::new(
+            n,
+            format!("blake3:{n}"),
+            AuditAction::FailClosed {
+                reason: "non_finite_input".to_string(),
+            },
+            "rejected",
+        )
+    }
+
+    /// frankenscipy-7tb8d.11: a bounded ledger keeps its newest `capacity` events, FIFO, and
+    /// counts what it evicted, in memory and through JSON; an unbounded one never evicts and
+    /// its JSON carries neither field.
+    #[test]
+    fn bounded_audit_ledger_evicts_fifo_and_counts_evictions() {
+        let capacity = 5;
+        let mut ledger = AuditLedger::with_capacity(capacity);
+        for n in 0..(capacity as u64 + 10) {
+            ledger.record(numbered_event(n));
+        }
+        assert_eq!(ledger.len(), capacity);
+        assert_eq!(ledger.evicted(), 10);
+        let kept: Vec<u64> = ledger.entries().iter().map(|e| e.timestamp_ms).collect();
+        assert_eq!(kept, [10, 11, 12, 13, 14]);
+
+        let json = ledger.to_json().expect("serialize");
+        assert!(json.contains("\"capacity\":5"), "{json}");
+        assert!(json.contains("\"evicted\":10"), "{json}");
+        assert_eq!(AuditLedger::from_json(&json).expect("deserialize"), ledger);
+
+        let mut unbounded = AuditLedger::new();
+        for n in 0..(capacity as u64 + 10) {
+            unbounded.record(numbered_event(n));
+        }
+        assert_eq!(unbounded.len(), capacity + 10);
+        assert_eq!((unbounded.capacity(), unbounded.evicted()), (None, 0));
+        let json = unbounded.to_json().expect("serialize");
+        assert!(
+            json.starts_with("{\"entries\":[") && !json.contains("\"evicted\""),
+            "{json}"
+        );
+
+        // A bounded ledger read from JSON that holds more than its capacity evicts on load.
+        let overfull = r#"{"entries":[
+            {"timestamp_ms":1,"input_fingerprint":"a","action":{"kind":"fail_closed","reason":"r"},"outcome":"o"},
+            {"timestamp_ms":2,"input_fingerprint":"b","action":{"kind":"fail_closed","reason":"r"},"outcome":"o"},
+            {"timestamp_ms":3,"input_fingerprint":"c","action":{"kind":"fail_closed","reason":"r"},"outcome":"o"}
+        ],"capacity":2,"evicted":4}"#;
+        let loaded = AuditLedger::from_json(overfull).expect("deserialize");
+        assert_eq!((loaded.len(), loaded.evicted()), (2, 5));
+        assert_eq!(loaded.entries()[0].timestamp_ms, 2);
+    }
+
+    /// frankenscipy-7tb8d.11: the CASP decision event's JSON, byte for byte (a new golden, not
+    /// a change to an existing one), and its round trip.
+    #[test]
+    fn casp_decision_event_json_is_stable_and_round_trips() {
+        let event = AuditEvent::new(
+            1_700_000_000_000,
+            "blake3:0f",
+            AuditAction::CaspDecision {
+                portfolio: "solver".to_string(),
+                mode: RuntimeMode::Hardened,
+                action: "PivotedQR".to_string(),
+                posterior: vec![0.125, 0.25, 0.5, 0.125],
+                expected_losses: vec![40.0, 8.0],
+                chosen_expected_loss: 8.0,
+                fallback: true,
+                evidence: BTreeMap::from([
+                    ("structural_evidence".to_string(), "General".into()),
+                    ("rcond_estimate".to_string(), 1e-9.into()),
+                ]),
+            },
+            "solved",
+        );
+        let json = serde_json::to_string(&event).expect("serialize");
+        assert_eq!(
+            json,
+            "{\"timestamp_ms\":1700000000000,\"input_fingerprint\":\"blake3:0f\",\"action\":\
+             {\"kind\":\"casp_decision\",\"portfolio\":\"solver\",\"mode\":\"Hardened\",\
+             \"action\":\"PivotedQR\",\"posterior\":[0.125,0.25,0.5,0.125],\
+             \"expected_losses\":[40.0,8.0],\"chosen_expected_loss\":8.0,\"fallback\":true,\
+             \"evidence\":{\"rcond_estimate\":1e-9,\"structural_evidence\":\"General\"}},\
+             \"outcome\":\"solved\"}"
+        );
+        let decoded: AuditEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, event);
     }
 
     /// The documented encoding, rebuilt by hand: what an external caller would do.

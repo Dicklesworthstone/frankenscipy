@@ -28,8 +28,8 @@ pub use booking_claim::{BookingClaim, ClaimRejection, FleetBooking};
 pub use eprocess::{EProcessConfig, EProcessMonitor, EProcessStatus};
 pub use evidence::{
     AlienArtifactDecision, AuditAction, AuditEvent, AuditLedger, AuditScope, DecisionEvidenceEntry,
-    Fingerprinter, PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger, audit_finish,
-    audit_recover, audit_reject,
+    EvidenceValue, Fingerprinter, PolicyEvidenceLedger, SharedAuditLedger, SyncSharedAuditLedger,
+    audit_finish, audit_recover, audit_reject,
 };
 pub use mode::{HARDENED_MAX_DIM, RuntimeMode};
 pub use policy::{PolicyAction, PolicyController, PolicyDecision, RiskState, decision_loss_matrix};
@@ -44,6 +44,76 @@ use serde::{Deserialize, Serialize};
 // ═══════════════════════════════════════════════════════════════════
 // CASP — Condition-Aware Solver Portfolio (§0.4)
 // ═══════════════════════════════════════════════════════════════════
+
+/// Read access to a CASP portfolio's recorded decisions, the same for all five portfolios
+/// (frankenscipy-7tb8d.11). Each keeps its newest `evidence_capacity` entries, oldest first.
+pub trait PortfolioEvidence {
+    /// One recorded decision.
+    type Entry: Serialize;
+    /// The portfolio's name in its JSONL lines: `solver`, `sparse`, `opt`, `ode` or `hyper`.
+    const NAME: &'static str;
+
+    /// The runtime mode the portfolio decides in.
+    fn mode(&self) -> RuntimeMode;
+
+    /// The recorded decisions, oldest first.
+    fn evidence(&self) -> &VecDeque<Self::Entry>;
+
+    /// The recorded decisions as JSONL, one object per line, oldest first: `portfolio` and
+    /// `mode`, then the entry's own fields. A line that fails to serialize is left out.
+    fn serialize_jsonl(&self) -> String {
+        #[derive(Serialize)]
+        struct Line<'a, E> {
+            portfolio: &'static str,
+            mode: RuntimeMode,
+            #[serde(flatten)]
+            entry: &'a E,
+        }
+        let mode = self.mode();
+        let mut output = Vec::with_capacity(self.evidence().len().saturating_mul(256));
+        for entry in self.evidence() {
+            let entry_start = output.len();
+            if entry_start != 0 {
+                output.push(b'\n');
+            }
+            let line = Line {
+                portfolio: Self::NAME,
+                mode,
+                entry,
+            };
+            if serde_json::to_writer(&mut output, &line).is_err() {
+                output.truncate(entry_start);
+            }
+        }
+        String::from_utf8(output).expect("serde_json always emits UTF-8")
+    }
+}
+
+/// [`PortfolioEvidence`] for the five portfolios, whose fields share names.
+macro_rules! portfolio_evidence {
+    ($($portfolio:ty => $entry:ty, $name:literal;)+) => {$(
+        impl PortfolioEvidence for $portfolio {
+            type Entry = $entry;
+            const NAME: &'static str = $name;
+
+            fn mode(&self) -> RuntimeMode {
+                self.mode
+            }
+
+            fn evidence(&self) -> &VecDeque<$entry> {
+                &self.evidence
+            }
+        }
+    )+};
+}
+
+portfolio_evidence! {
+    SolverPortfolio => SolverEvidenceEntry, "solver";
+    SparseSolverPortfolio => SparseSolverEvidenceEntry, "sparse";
+    OptSolverPortfolio => OptSolverEvidenceEntry, "opt";
+    OdeSolverPortfolio => OdeSolverEvidenceEntry, "ode";
+    HyperSolverPortfolio => HyperSolverEvidenceEntry, "hyper";
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MatrixConditionState {
@@ -408,22 +478,6 @@ impl SolverPortfolio {
     /// Update conformal calibrator with observed backward error.
     pub fn observe_backward_error(&mut self, backward_error: f64) {
         self.calibrator.observe(backward_error);
-    }
-
-    /// Serialize evidence ledger to JSONL format for audit trail (§0.19).
-    #[must_use]
-    pub fn serialize_jsonl(&self) -> String {
-        let mut output = Vec::with_capacity(self.evidence.len().saturating_mul(256));
-        for entry in &self.evidence {
-            let entry_start = output.len();
-            if entry_start != 0 {
-                output.push(b'\n');
-            }
-            if serde_json::to_writer(&mut output, entry).is_err() {
-                output.truncate(entry_start);
-            }
-        }
-        String::from_utf8(output).expect("serde_json always emits UTF-8")
     }
 
     #[must_use]
@@ -2124,10 +2178,17 @@ mod tests {
             fallback_active: true,
             backward_error: Some(1e-14),
         });
+        // Each line is the entry's own JSON with `portfolio` and `mode` spliced in front.
         let former = portfolio
             .evidence
             .iter()
             .filter_map(|entry| serde_json::to_string(entry).ok())
+            .map(|json| {
+                format!(
+                    "{{\"portfolio\":\"solver\",\"mode\":\"Strict\",{}",
+                    &json[1..]
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n");
         let jsonl = portfolio.serialize_jsonl();
@@ -2137,6 +2198,124 @@ mod tests {
         )
         .expect("invalid JSONL evidence entry");
         assert_eq!(parsed["component"], "test\"entry");
+    }
+
+    /// frankenscipy-7tb8d.11: every portfolio's recorded decision reads back through its JSONL
+    /// with the portfolio, the mode, the action and, bit for bit, the posterior and the losses.
+    #[test]
+    fn every_portfolio_round_trips_a_decision_through_jsonl() {
+        fn check<P: PortfolioEvidence>(
+            portfolio: &P,
+            action: impl Serialize,
+            posterior: &[f64],
+            losses: &[f64],
+        ) {
+            let jsonl = portfolio.serialize_jsonl();
+            assert_eq!(jsonl.lines().count(), 1, "{jsonl}");
+            let line: serde_json::Value = serde_json::from_str(&jsonl).expect("one JSON line");
+            assert_eq!(line["portfolio"], P::NAME, "{jsonl}");
+            assert_eq!(line["mode"], "Hardened", "{jsonl}");
+            assert_eq!(
+                line["chosen_action"],
+                serde_json::to_value(action).expect("action"),
+                "{jsonl}"
+            );
+            let bits = |values: &[f64]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            for (key, expected) in [("posterior", posterior), ("expected_losses", losses)] {
+                let read: Vec<f64> = line[key]
+                    .as_array()
+                    .expect(key)
+                    .iter()
+                    .map(|v| v.as_f64().expect("number"))
+                    .collect();
+                assert_eq!(bits(&read), bits(expected), "{key} in {jsonl}");
+            }
+        }
+        let mode = RuntimeMode::Hardened;
+
+        let mut solver = SolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) =
+            solver.select_action(3.7e-7, Some(StructuralEvidence::General));
+        solver.record_evidence(SolverEvidenceEntry {
+            component: "test",
+            matrix_shape: (3, 3),
+            rcond_estimate: 3.7e-7,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: false,
+            backward_error: Some(1.25e-16),
+        });
+        check(&solver, action, &posterior, &losses);
+
+        let mut sparse = SparseSolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) = sparse.select_action(
+            1.3e5,
+            Some(SparseStructuralEvidence {
+                is_symmetric: true,
+                is_positive_definite_hint: Some(true),
+            }),
+        );
+        sparse.record_evidence(SparseSolverEvidenceEntry {
+            component: "test",
+            matrix_shape: (5, 5),
+            nnz: 13,
+            cond_estimate: 1.3e5,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: false,
+            relative_residual: None,
+        });
+        check(&sparse, action, &posterior, &losses);
+
+        let mut opt = OptSolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) = opt.select_action(2.2e4, false, true);
+        opt.record_evidence(OptSolverEvidenceEntry {
+            component: "test",
+            dimension: 7,
+            condition_number_estimate: 2.2e4,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: true,
+            gradient_norm: Some(3.1e-9),
+        });
+        check(&opt, action, &posterior, &losses);
+
+        let mut ode = OdeSolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) = ode.select_action(250.0, false);
+        ode.record_evidence(OdeSolverEvidenceEntry {
+            component: "test",
+            system_dim: 2,
+            stiffness_ratio_estimate: 250.0,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: false,
+            step_rejections: Some(1),
+        });
+        check(&ode, action, &posterior, &losses);
+
+        let mut hyper = HyperSolverPortfolio::new(mode, 4);
+        let (action, posterior, losses, chosen) = hyper.select_action(0.7, 0.3, false);
+        hyper.record_evidence(HyperSolverEvidenceEntry {
+            component: "test",
+            function_kind: "hyp2f1",
+            z_abs: 0.7,
+            parameter_stability_margin: 0.3,
+            chosen_action: action,
+            posterior: posterior.to_vec(),
+            expected_losses: losses.to_vec(),
+            chosen_expected_loss: chosen,
+            fallback_active: false,
+            term_count: Some(31),
+        });
+        check(&hyper, action, &posterior, &losses);
     }
 
     #[test]

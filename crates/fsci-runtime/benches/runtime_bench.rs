@@ -1,8 +1,8 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 use fsci_runtime::{
     ConformalCalibrator, DecisionEvidenceEntry, DecisionSignals, MatrixConditionState,
-    PolicyAction, PolicyController, PolicyEvidenceLedger, RiskState, RuntimeMode, SolverAction,
-    SolverEvidenceEntry, SolverPortfolio,
+    PolicyAction, PolicyController, PolicyEvidenceLedger, PortfolioEvidence, RiskState,
+    RuntimeMode, SolverAction, SolverEvidenceEntry, SolverPortfolio,
 };
 use std::hint::black_box;
 
@@ -62,10 +62,18 @@ fn solver_evidence(sequence: usize) -> SolverEvidenceEntry {
     }
 }
 
+/// The naive serializer the streaming one is measured against: each entry's JSON with the
+/// portfolio's name and mode spliced in front, collected and joined.
 fn serialize_jsonl_collect_join(entries: &[SolverEvidenceEntry]) -> String {
     entries
         .iter()
         .filter_map(|entry| serde_json::to_string(entry).ok())
+        .map(|json| {
+            format!(
+                "{{\"portfolio\":\"solver\",\"mode\":\"Strict\",{}",
+                &json[1..]
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

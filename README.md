@@ -481,7 +481,7 @@ The mode split is implemented per crate, not uniformly. What exists today:
 There are **two complementary records** in flight:
 
 1. **`SolveCertificate`** is synchronously returned on every `solve_with_casp`-style call. It carries the full CASP decision data needed for replay (action, rcond estimate, structural evidence, posterior over condition states, expected losses, chosen expected loss, fallback-active flag).
-2. **`AuditEvent`** is appended to the configured `SyncSharedAuditLedger` for *forensic* events: mode decisions, bounded recoveries, fail-closed rejections, and alien-artifact decisions. The shape, taken straight from `crates/fsci-runtime/src/evidence.rs`:
+2. **`AuditEvent`** is appended to the configured `SyncSharedAuditLedger` for *forensic* events: mode decisions, bounded recoveries, fail-closed rejections, CASP decisions, and alien-artifact decisions. The shape, taken straight from `crates/fsci-runtime/src/evidence.rs`:
 
 ```rust,ignore
 pub struct AuditEvent {
@@ -494,8 +494,18 @@ pub struct AuditEvent {
 pub enum AuditAction {
     ModeDecision         { mode: RuntimeMode },
     BoundedRecovery      { recovery_action: String },
-    FailClosed           { reason: String },
+    FailClosed           { reason: String },   // a machine-matchable code
     AlienArtifactDecision{ decision: Box<AlienArtifactDecision> },
+    CaspDecision {
+        portfolio: String,                     // "solver", "sparse", ...
+        mode: RuntimeMode,                     // the mode the call ran in
+        action: String,                        // the action that produced the answer
+        posterior: Vec<f64>,
+        expected_losses: Vec<f64>,             // every action's, in the portfolio's order
+        chosen_expected_loss: f64,
+        fallback: bool,
+        evidence: BTreeMap<String, EvidenceValue>, // e.g. rcond_estimate, structural_evidence
+    },
 }
 ```
 
@@ -507,15 +517,17 @@ Serialized via `serde_json` with `#[serde(tag = "kind", rename_all = "snake_case
   "input_fingerprint": "blake3:8f4e…",
   "action": {
     "kind":   "fail_closed",
-    "reason": "rejected: 10x11 is not square"
+    "reason": "non_square_matrix"
   },
-  "outcome": "non_square_matrix"
+  "outcome": "rejected: 10x11 is not square"
 }
 ```
 
+Every error an audited routine returns is recorded as exactly one `FailClosed` event, in either mode, after the call's other events, with a code (`non_finite_input`, `singular_matrix`, `spsolve_with_casp::rhs_mismatch`) as its reason. `crates/fsci-conformance/tests/audit_failclosed_property.rs` checks this for all 46 audited routines. `solve_with_audit` and `spsolve_with_audit` record their CASP choice as a `CaspDecision`.
+
 The input fingerprint is `fsci_runtime::Fingerprinter`'s BLAKE3 over the routine's name and every input value, shape and option. Values are hashed bit for bit, so `-0.0` and NaN payloads count. The encoding is self-delimiting and documented on `Fingerprinter`, and each audited routine's records are listed at its audit site, so a caller can recompute a fingerprint. Function-valued inputs (objectives, right-hand sides, event functions) are hashed by presence only. Every event of one call carries the same fingerprint, and two requests share one only if the routine, inputs and options all match exactly.
 
-The portfolio's evidence buffer is bounded (`evidence_capacity` on `SolverPortfolio::new`) and evicts FIFO once full. The `AuditLedger` itself is an unbounded `Vec`; `AuditLedger::shared()` returns a new `Arc<Mutex<AuditLedger>>` (a `SyncSharedAuditLedger`) on every call, so to share one ledger across threads, clone that handle.
+Each of the five portfolios (solver, sparse, opt, ODE, hypergeometric) keeps its evidence in a buffer bounded by `evidence_capacity` that evicts FIFO once full, and exports it through the `PortfolioEvidence` trait: `evidence()` and `serialize_jsonl()`, one line per decision, carrying the portfolio's name and mode beside the entry. The `AuditLedger` is unbounded by default. `AuditLedger::with_capacity(n)` (or `shared_with_capacity(n)`) keeps the newest `n` events, evicting the oldest first and counting the evictions (`evicted()`, serialized as `evicted`). `AuditLedger::shared()` returns a new `Arc<Mutex<AuditLedger>>` (a `SyncSharedAuditLedger`) on every call, so to share one ledger across threads, clone that handle.
 
 CASP decisions are replayable through the *certificate*: feed the same `(rcond_estimate, structural_evidence)` back into `SolverPortfolio::select_action()` and you get back the same `(action, posterior, expected_losses, chosen_expected_loss)`, modulo the calibrator-drift override. No conformance test performs this replay yet.
 
@@ -1001,7 +1013,7 @@ Reading any one of these gives you ~70% of the conventions used in the others, s
 | **Loss matrix** | The 5-action × 4-state table of costs that drives CASP. `SolverPortfolio::default_loss_matrix()`. |
 | **Conformal calibrator** | The drift detector that watches CASP's empirical miscoverage and falls back to SVD when CASP becomes unreliable. |
 | **SolveCertificate** | The synchronously-returned record of a CASP decision: action, rcond, structural evidence, posterior, expected losses, chosen loss, fallback flag. |
-| **AuditEvent** | The asynchronous, forensic event written into the `SyncSharedAuditLedger`: timestamp, input fingerprint, action variant (`ModeDecision` / `BoundedRecovery` / `FailClosed` / `AlienArtifactDecision`), outcome. |
+| **AuditEvent** | The asynchronous, forensic event written into the `SyncSharedAuditLedger`: timestamp, input fingerprint, action variant (`ModeDecision` / `BoundedRecovery` / `FailClosed` / `AlienArtifactDecision` / `CaspDecision`), outcome. |
 | **Strict mode** | `RuntimeMode::Strict`: SciPy-parity behavior, no auto-repair, fail-closed on malformed input. |
 | **Hardened mode** | `RuntimeMode::Hardened`: preserves the API contract, applies bounded recovery for malformed inputs, caps resource use at `HARDENED_MAX_DIM`. |
 | **Conformance packet** | A `FSCI-P2C-NNN` (or legacy `P2C-NNN`) directory under `crates/fsci-conformance/fixtures/artifacts/` containing oracle captures, parity reports, RaptorQ sidecars, and per-case diffs for one slice of SciPy. |

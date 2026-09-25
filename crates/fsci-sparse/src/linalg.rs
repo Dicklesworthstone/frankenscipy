@@ -11,8 +11,9 @@ use fsci_linalg::{
     solve_banded as dense_solve_banded, solveh_banded as dense_solveh_banded,
 };
 use fsci_runtime::{
-    AuditScope, Fingerprinter, RuntimeMode, SparseSolverAction, SparseSolverEvidenceEntry,
-    SparseSolverPortfolio, SparseStructuralEvidence, audit_recover, audit_reject,
+    AuditAction, AuditScope, Fingerprinter, PortfolioEvidence, RuntimeMode, SparseSolverAction,
+    SparseSolverEvidenceEntry, SparseSolverPortfolio, SparseStructuralEvidence, audit_recover,
+    audit_reject,
 };
 use nalgebra::{DMatrix, DVector, Dyn, LU};
 use rayon::prelude::*;
@@ -9855,6 +9856,9 @@ pub struct CaspPortfolioSolveResult {
     pub chosen_action: SparseSolverAction,
     pub posterior: [f64; 4],
     pub expected_losses: [f64; 6],
+    /// The condition estimate and structure the posterior was computed from.
+    pub cond_estimate: f64,
+    pub structure: SparseStructuralEvidence,
     pub x: Vec<f64>,
     pub converged: bool,
     pub iterations: usize,
@@ -10040,6 +10044,8 @@ pub fn solve_with_casp_portfolio(
         chosen_action: action,
         posterior,
         expected_losses,
+        cond_estimate,
+        structure: structural,
         x: final_x,
         converged: final_converged,
         iterations: final_iters,
@@ -10161,6 +10167,39 @@ fn spsolve_with_casp_internal(
     };
 
     let casp_res = solve_with_casp_portfolio(a, b, None, portfolio, iterative_opts)?;
+
+    // frankenscipy-7tb8d.11: the CASP choice, in the mode the call ran in. After an iterative
+    // arm fell back, the answer is the direct LU's, and that is the action recorded.
+    if let Some(audit) = audit {
+        let taken = if casp_res.fallback_active {
+            SparseSolverAction::SuperLU
+        } else {
+            casp_res.chosen_action
+        };
+        audit.record(
+            AuditAction::CaspDecision {
+                portfolio: <SparseSolverPortfolio as PortfolioEvidence>::NAME.to_string(),
+                mode: options.mode,
+                action: format!("{taken:?}"),
+                posterior: casp_res.posterior.to_vec(),
+                expected_losses: casp_res.expected_losses.to_vec(),
+                chosen_expected_loss: casp_res.expected_losses[taken.index()],
+                fallback: casp_res.fallback_active,
+                evidence: std::collections::BTreeMap::from([
+                    ("cond_estimate".to_string(), casp_res.cond_estimate.into()),
+                    (
+                        "is_symmetric".to_string(),
+                        casp_res.structure.is_symmetric.to_string().into(),
+                    ),
+                    (
+                        "is_positive_definite_hint".to_string(),
+                        format!("{:?}", casp_res.structure.is_positive_definite_hint).into(),
+                    ),
+                ]),
+            },
+            &format!("CASP selected {:?}", casp_res.chosen_action),
+        );
+    }
 
     if casp_res.fallback_active {
         audit_recover(
@@ -27028,6 +27067,61 @@ mod tests {
             decision.rationale,
             "large_very_sparse_nonsymmetric_transpose_stabilization"
         );
+    }
+
+    /// frankenscipy-7tb8d.11: `spsolve_with_audit` records its CASP choice as a `CaspDecision`
+    /// in the mode the call ran in, with the posterior and losses its portfolio recorded.
+    #[test]
+    fn spsolve_with_audit_records_casp_decision_in_its_mode() {
+        let a = spd_csr_3x3();
+        let b = vec![5.0, 5.0, 3.0];
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let ledger = crate::audit::sync_audit_ledger();
+            let mut portfolio = SparseSolverPortfolio::new(mode, 4);
+            let options = SolveOptions {
+                mode,
+                ..SolveOptions::default()
+            };
+            spsolve_with_audit(&a, &b, options, &mut portfolio, &ledger).expect("solve");
+            let recorded = portfolio.evidence().back().expect("evidence").clone();
+            let guard = ledger.lock().expect("ledger");
+            let decisions: Vec<_> = guard
+                .entries()
+                .iter()
+                .filter_map(|event| match &event.action {
+                    fsci_runtime::AuditAction::CaspDecision {
+                        portfolio,
+                        mode,
+                        action,
+                        posterior,
+                        expected_losses,
+                        fallback,
+                        ..
+                    } => Some((
+                        portfolio.clone(),
+                        *mode,
+                        action.clone(),
+                        posterior.clone(),
+                        expected_losses.clone(),
+                        *fallback,
+                    )),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(decisions.len(), 1, "{mode:?}: {:?}", guard.entries());
+            let (name, event_mode, action, posterior, losses, fallback) = &decisions[0];
+            assert_eq!(name, "sparse");
+            assert_eq!(*event_mode, mode);
+            assert_eq!(*fallback, recorded.fallback_active);
+            let taken = if recorded.fallback_active {
+                SparseSolverAction::SuperLU
+            } else {
+                recorded.chosen_action
+            };
+            assert_eq!(action, &format!("{taken:?}"));
+            assert_eq!(posterior, &recorded.posterior);
+            assert_eq!(losses, &recorded.expected_losses);
+        }
     }
 
     #[test]

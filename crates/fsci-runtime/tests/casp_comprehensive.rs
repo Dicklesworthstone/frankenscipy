@@ -4,9 +4,10 @@
 
 use fsci_runtime::{
     ConformalCalibrator, DecisionEvidenceEntry, DecisionSignals, MatrixConditionState,
-    PolicyAction, PolicyController, PolicyDecision, PolicyEvidenceLedger, RiskState, RuntimeMode,
-    SignalSequence, SolverAction, SolverEvidenceEntry, SolverPortfolio, TestLogEntry, TestLogLevel,
-    TestResult, assert_close, assert_close_slice, casp_now_unix_ms, within_tolerance,
+    PolicyAction, PolicyController, PolicyDecision, PolicyEvidenceLedger, PortfolioEvidence,
+    RiskState, RuntimeMode, SignalSequence, SolverAction, SolverEvidenceEntry, SolverPortfolio,
+    TestLogEntry, TestLogLevel, TestResult, assert_close, assert_close_slice, casp_now_unix_ms,
+    within_tolerance,
 };
 use proptest::prelude::*;
 

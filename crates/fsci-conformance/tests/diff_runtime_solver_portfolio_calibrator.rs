@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use fsci_runtime::{
-    ConformalCalibrator, RuntimeMode, SolverAction, SolverEvidenceEntry, SolverPortfolio,
-    StructuralEvidence,
+    ConformalCalibrator, PortfolioEvidence, RuntimeMode, SolverAction, SolverEvidenceEntry,
+    SolverPortfolio, StructuralEvidence,
 };
 use serde::Serialize;
 

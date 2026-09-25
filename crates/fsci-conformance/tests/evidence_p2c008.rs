@@ -15,7 +15,8 @@ use blake3::hash;
 use fsci_conformance::{RaptorQSidecar, chunk_payload, generate_raptorq_sidecar};
 use fsci_runtime::{
     AuditLedger, ConformalCalibrator, DecisionSignals, MatrixConditionState, PolicyAction,
-    PolicyController, RiskState, RuntimeMode, SignalSequence, SolverAction, SolverPortfolio,
+    PolicyController, PortfolioEvidence, RiskState, RuntimeMode, SignalSequence, SolverAction,
+    SolverPortfolio,
 };
 use serde::Serialize;
 use std::path::Path;

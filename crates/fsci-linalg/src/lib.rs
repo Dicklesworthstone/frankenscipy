@@ -82,8 +82,8 @@ use bunch_kaufman::{BunchKaufman, Triangle};
 pub use fsci_runtime::SyncSharedAuditLedger;
 use fsci_runtime::{
     AttemptOutcome, AuditAction, AuditEvent, AuditLedger, AuditScope, DecisionSignals,
-    Fingerprinter, PolicyAction, PolicyController, PolicyDecision, RuntimeMode, SolverAction,
-    SolverEvidenceEntry, SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
+    Fingerprinter, PolicyAction, PolicyController, PolicyDecision, PortfolioEvidence, RuntimeMode,
+    SolverAction, SolverEvidenceEntry, SolverPortfolio, StructuralEvidence, casp_now_unix_ms,
 };
 use std::{borrow::Cow, fmt, simd::Simd};
 
@@ -179,25 +179,56 @@ fn record_bounded_recovery(
 }
 
 /// Record a CASP solver selection decision for audit trail.
-fn record_casp_decision(
-    ledger: &SyncSharedAuditLedger,
-    fingerprint: &str,
+/// A CASP solver choice, as the audit ledger records it (frankenscipy-7tb8d.11).
+#[derive(Clone, Copy)]
+struct CaspChoice {
+    /// The mode the call ran in.
+    mode: RuntimeMode,
+    /// The action that produced the answer (the fallback, when there was one).
     action: SolverAction,
-    rcond: f64,
+    posterior: [f64; 4],
+    expected_losses: [f64; 6],
+    /// Whether `action` is a fallback from the action first selected.
     fallback: bool,
-) {
-    let decision_desc = if fallback {
-        format!("CASP fallback to {:?} (rcond={rcond:.2e})", action)
+    rcond: f64,
+    structure: StructuralEvidence,
+}
+
+/// Record a CASP solver choice: the portfolio, the real mode, the action, the posterior, every
+/// action's expected loss and the chosen one's, and the rcond and structure that drove it. It
+/// used to be a `ModeDecision` that always said Strict and carried the action and rcond only.
+fn record_casp_decision(ledger: &SyncSharedAuditLedger, fingerprint: &str, choice: CaspChoice) {
+    let outcome = if choice.fallback {
+        format!(
+            "CASP fallback to {:?} (rcond={:.2e})",
+            choice.action, choice.rcond
+        )
     } else {
-        format!("CASP selected {:?} (rcond={rcond:.2e})", action)
+        format!(
+            "CASP selected {:?} (rcond={:.2e})",
+            choice.action, choice.rcond
+        )
     };
     let event = AuditEvent::new(
         casp_now_unix_ms(),
         fingerprint,
-        AuditAction::ModeDecision {
-            mode: RuntimeMode::Strict, // CASP operates in both modes
+        AuditAction::CaspDecision {
+            portfolio: <SolverPortfolio as PortfolioEvidence>::NAME.to_string(),
+            mode: choice.mode,
+            action: format!("{:?}", choice.action),
+            posterior: choice.posterior.to_vec(),
+            expected_losses: choice.expected_losses.to_vec(),
+            chosen_expected_loss: choice.expected_losses[choice.action.index()],
+            fallback: choice.fallback,
+            evidence: std::collections::BTreeMap::from([
+                ("rcond_estimate".to_string(), choice.rcond.into()),
+                (
+                    "structural_evidence".to_string(),
+                    format!("{:?}", choice.structure).into(),
+                ),
+            ]),
         },
-        decision_desc,
+        outcome,
     );
     lock_or_recover(ledger).record(event);
 }
@@ -3202,9 +3233,15 @@ fn solve_audited(
     record_casp_decision(
         audit.ledger(),
         audit.fingerprint(),
-        actual_action,
-        report.rcond_estimate,
-        fallback_active,
+        CaspChoice {
+            mode: options.mode,
+            action: actual_action,
+            posterior,
+            expected_losses,
+            fallback: fallback_active,
+            rcond: report.rcond_estimate,
+            structure: report.structural_evidence,
+        },
     );
 
     // Record bounded recovery if fallback occurred in hardened mode
@@ -28472,7 +28509,19 @@ mod tests {
             "svd_fallback",
             "recovered",
         );
-        record_casp_decision(&audit_ledger, "casp", SolverAction::DirectLU, 1.0, false);
+        record_casp_decision(
+            &audit_ledger,
+            "casp",
+            CaspChoice {
+                mode: RuntimeMode::Strict,
+                action: SolverAction::DirectLU,
+                posterior: [1.0, 0.0, 0.0, 0.0],
+                expected_losses: [1.0; 6],
+                fallback: false,
+                rcond: 1.0,
+                structure: StructuralEvidence::General,
+            },
+        );
         record_mode_decision(&audit_ledger, "mode", RuntimeMode::Strict, "executed");
 
         let ledger = audit_ledger
@@ -40521,36 +40570,71 @@ mod tests {
 
     // ═══ AuditLedger Integration Tests (§0.19) ═══
 
+    /// frankenscipy-7tb8d.11: `solve_with_audit` records its CASP choice as a `CaspDecision` in
+    /// the mode the call ran in (it used to say Strict whatever the mode), with the action,
+    /// posterior, losses and evidence the certificate carries, under the call's fingerprint.
     #[test]
     fn solve_with_audit_records_casp_decision() {
         let a = vec![vec![3.0, 2.0], vec![1.0, 2.0]];
         let b = vec![5.0, 5.0];
-        let audit_ledger = sync_audit_ledger();
-        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 16);
+        for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+            let audit_ledger = sync_audit_ledger();
+            let mut portfolio = SolverPortfolio::new(mode, 16);
+            let options = SolveOptions {
+                mode,
+                ..SolveOptions::default()
+            };
+            let certificate = solve_with_audit(&a, &b, options, &mut portfolio, &audit_ledger)
+                .expect("solve")
+                .certificate
+                .expect("certificate");
 
-        let result = solve_with_audit(
-            &a,
-            &b,
-            SolveOptions::default(),
-            &mut portfolio,
-            &audit_ledger,
-        );
-        assert!(result.is_ok());
-
-        let ledger = lock_audit_ledger(&audit_ledger);
-        assert_eq!(ledger.len(), 1, "should have exactly one audit entry");
-
-        let entry = &ledger.entries()[0];
-        match &entry.action {
-            AuditAction::ModeDecision { .. } => {}
-            other => {
-                unreachable!("expected ModeDecision, got {other:?}");
-            }
+            let ledger = lock_audit_ledger(&audit_ledger);
+            let decisions: Vec<&AuditEvent> = ledger
+                .entries()
+                .iter()
+                .filter(|event| matches!(event.action, AuditAction::CaspDecision { .. }))
+                .collect();
+            assert_eq!(decisions.len(), 1, "{mode:?}: {:?}", ledger.entries());
+            let fingerprint = audit_fingerprint("fsci_linalg::solve", &options, |f| {
+                f.rows(&a).f64s(&b);
+            });
+            assert_eq!(decisions[0].input_fingerprint, fingerprint);
+            let AuditAction::CaspDecision {
+                portfolio,
+                mode: recorded_mode,
+                action,
+                posterior,
+                expected_losses,
+                chosen_expected_loss,
+                fallback,
+                evidence,
+            } = &decisions[0].action
+            else {
+                unreachable!("filtered to CaspDecision");
+            };
+            assert_eq!(portfolio, "solver");
+            assert_eq!(*recorded_mode, mode, "{:?}", decisions[0]);
+            assert_eq!(action, &format!("{:?}", certificate.action));
+            assert_eq!(posterior, &certificate.posterior);
+            assert_eq!(expected_losses, &certificate.expected_losses);
+            assert_eq!(
+                chosen_expected_loss.to_bits(),
+                certificate.chosen_expected_loss.to_bits()
+            );
+            assert_eq!(*fallback, certificate.fallback_active);
+            assert_eq!(
+                evidence["rcond_estimate"],
+                fsci_runtime::EvidenceValue::Number(certificate.rcond_estimate)
+            );
+            assert_eq!(
+                evidence["structural_evidence"],
+                fsci_runtime::EvidenceValue::Label(format!(
+                    "{:?}",
+                    certificate.structural_evidence
+                ))
+            );
         }
-        assert!(
-            entry.outcome.contains("CASP"),
-            "outcome should mention CASP"
-        );
     }
 
     #[test]

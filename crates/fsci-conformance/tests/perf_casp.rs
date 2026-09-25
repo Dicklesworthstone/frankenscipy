@@ -6,8 +6,8 @@
 //! Covers PolicyController, SolverPortfolio, ConformalCalibrator, DecisionSignals.
 
 use fsci_runtime::{
-    ConformalCalibrator, DecisionSignals, MatrixConditionState, PolicyController, RuntimeMode,
-    SolverAction, SolverPortfolio,
+    ConformalCalibrator, DecisionSignals, MatrixConditionState, PolicyController,
+    PortfolioEvidence, RuntimeMode, SolverAction, SolverPortfolio,
 };
 use serde::Serialize;
 use std::time::Instant;
