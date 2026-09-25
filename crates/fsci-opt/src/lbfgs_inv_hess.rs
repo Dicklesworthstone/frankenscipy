@@ -104,6 +104,21 @@ impl LbfgsInvHessProduct {
         Ok(Self { sk, yk, rho, n })
     }
 
+    /// [`Self::new`] for an optimizer that knows the dimension even with no corrections
+    /// stored: `_minimize_lbfgsb`'s `LbfgsInvHessProduct(s[:n_corrs], y[:n_corrs])` keeps `n`
+    /// from the `(0, n)` shape (frankenscipy-6ycp2).
+    pub(crate) fn with_dimension(
+        sk: Vec<Vec<f64>>,
+        yk: Vec<Vec<f64>>,
+        n: usize,
+    ) -> Result<Self, OptError> {
+        let mut operator = Self::new(sk, yk)?;
+        if operator.sk.is_empty() {
+            operator.n = n;
+        }
+        Ok(operator)
+    }
+
     /// The operator's shape, `(n, n)`.
     #[must_use]
     pub fn shape(&self) -> (usize, usize) {

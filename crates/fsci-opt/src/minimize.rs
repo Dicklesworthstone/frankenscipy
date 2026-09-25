@@ -6,12 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::bfgs::{
     self, BfgsParams, CgParams, LineObjective, NewtonCgParams, NewtonCgStop, NewtonObjective,
 };
+use crate::lbfgs_inv_hess::LbfgsInvHessProduct;
 use crate::lbfgsb::{self, LbfgsbObjective, LbfgsbStop};
 use crate::trust_region::{self, Subproblem, TrustObjective, TrustParams};
 use crate::types::{
-    Bound, Bounds, Constraint, ConstraintType, ConvergenceStatus, GradientFunc, HessFunc,
-    HesspFunc, MinimizeCallback, MinimizeOptions, OptError, OptimizeMethod, OptimizeResult,
-    OptimizeTraceEntry,
+    Bound, Bounds, Constraint, ConstraintType, ConvergenceStatus, GradientFunc, HessFunc, HessInv,
+    HesspFunc, MinimizeCallback, MinimizeMethodOptions, MinimizeOptions, OptError, OptimizeMethod,
+    OptimizeResult, OptimizeTraceEntry,
 };
 use fsci_runtime::{
     Fingerprinter, OptSolverAction, OptSolverEvidenceEntry, OptSolverPortfolio, RuntimeMode,
@@ -585,14 +586,17 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::Bfgs, options)?;
     let n = x0.len();
+    // An explicit option wins over `tol`, which only fills `gtol` (SciPy's `setdefault`).
+    let method_options = options.method_options;
     let params = BfgsParams {
-        gtol: options.tol.unwrap_or(1.0e-5),
-        norm_inf: true,
+        gtol: method_options.gtol.or(options.tol).unwrap_or(1.0e-5),
+        norm: method_options.norm.unwrap_or(f64::INFINITY),
         maxiter: options.maxiter.unwrap_or(200 * n),
-        xrtol: 0.0,
-        c1: 1.0e-4,
-        c2: 0.9,
+        xrtol: method_options.xrtol.unwrap_or(0.0),
+        c1: method_options.c1.unwrap_or(1.0e-4),
+        c2: method_options.c2.unwrap_or(0.9),
     };
     let mut adapter = ScalarFunction::new(fun, options, OptimizeMethod::Bfgs, x0);
     let outcome = bfgs::minimize_bfgs(&mut adapter, x0, &params);
@@ -610,13 +614,13 @@ where
                 nhev: 0,
                 nit: outcome.nit,
                 jac: Some(outcome.jac),
-                hess_inv: Some(
+                hess_inv: Some(HessInv::Dense(
                     outcome
                         .hess_inv
                         .chunks(n.max(1))
                         .map(<[f64]>::to_vec)
                         .collect(),
-                ),
+                )),
                 maxcv: None,
                 x: outcome.x,
             }
@@ -922,12 +926,14 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::ConjugateGradient, options)?;
+    let method_options = options.method_options;
     let params = CgParams {
-        gtol: options.tol.unwrap_or(1.0e-5),
-        norm_inf: true,
+        gtol: method_options.gtol.or(options.tol).unwrap_or(1.0e-5),
+        norm: method_options.norm.unwrap_or(f64::INFINITY),
         maxiter: options.maxiter.unwrap_or(200 * x0.len()),
-        c1: 1.0e-4,
-        c2: 0.4,
+        c1: method_options.c1.unwrap_or(1.0e-4),
+        c2: method_options.c2.unwrap_or(0.4),
     };
     let mut adapter = ScalarFunction::new(fun, options, OptimizeMethod::ConjugateGradient, x0);
     let outcome = bfgs::minimize_cg(&mut adapter, x0, &params);
@@ -972,6 +978,7 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::Powell, options)?;
     // Bounds as SciPy's Powell applies them: x0 clipped into the box, every line search limited
     // to the feasible step interval, the extrapolated point capped at the boundary. They used to
     // be ignored (frankenscipy-szq1n.7).
@@ -979,9 +986,12 @@ where
     let bounds = options.bounds.filter(|b| bounds_have_finite_limit(b));
 
     let n = x0.len();
-    let tol = requested_tolerance(options.tol);
-    // `minimize(method="Powell", tol=t)` sets xtol = ftol = t; the line searches get xtol·100.
-    let line_tol = tol * 100.0;
+    // `_minimize_powell(xtol=1e-4, ftol=1e-4)`; `minimize(method="Powell", tol=t)` fills both
+    // with t unless given as options (frankenscipy-6ycp2). The line searches get xtol·100.
+    let method_options = options.method_options;
+    let xtol = method_options.xtol.or(options.tol).unwrap_or(1.0e-4);
+    let tol = method_options.ftol.or(options.tol).unwrap_or(1.0e-4);
+    let line_tol = xtol * 100.0;
     let maxiter = options.maxiter.unwrap_or((150 * n).max(80));
     let maxfev = options.maxfev.unwrap_or((3000 * n).max(800));
     let mut objective = Objective::new(fun, options.mode, maxfev);
@@ -994,7 +1004,18 @@ where
         Ok(value) => value,
         Err(err) => return Ok(result_from_error(x0, 0, 0, 0, err)),
     };
-    let mut directions = identity_matrix(n);
+    // SciPy's `direc`: the starting direction set, one per row (default the identity).
+    let mut directions = match method_options.direc {
+        Some(direc) => {
+            if direc.len() != n || direc.iter().any(|row| row.len() != n) {
+                return Err(OptError::InvalidArgument {
+                    detail: format!("direc must be {n} x {n}, one direction per row"),
+                });
+            }
+            direc.to_vec()
+        }
+        None => identity_matrix(n),
+    };
     // SciPy's `x1`: where the previous sweep ENDED, before that iteration's extrapolation line
     // search moved x again. The next extrapolation direction is `x − x1`. Measuring it from the
     // start of the sweep instead (after the extrapolation search) builds a different direction
@@ -1155,13 +1176,20 @@ where
     Ok(result)
 }
 
-/// Nelder-Mead simplex (downhill simplex) method for derivative-free optimization.
+/// `scipy.optimize.minimize(method='Nelder-Mead')`: SciPy 1.17's `_minimize_neldermead`,
+/// transcribed (frankenscipy-6ycp2).
 ///
-/// Matches `scipy.optimize.minimize(f, x0, method='Nelder-Mead')`.
-/// Uses the standard simplex coefficients (rho=1, chi=2, psi=0.5, sigma=0.5),
-/// which is SciPy's default (`adaptive=False`). SciPy's adaptive Gao-Han
-/// coefficients are an opt-in and are NOT the default — using them for n>=2
-/// reproduces SciPy's `adaptive=True` stagnation on higher-dim Rosenbrock.
+/// Options, SciPy's names and defaults: `xatol` and `fatol` 1e-4 (`tol` fills both unless given
+/// as options), `adaptive` (Gao & Han's dimension-dependent coefficients, default off),
+/// `initial_simplex` (the n + 1 starting vertices, replacing the ones built around x0 by
+/// scaling each coordinate by 1.05, or setting it to 0.00025 when it is 0). `maxiter` and
+/// `maxfev` default to 200·n when neither is given, and one given alone leaves the other
+/// unlimited. Evaluations past `maxfev` are refused, ending the run with SciPy's `maxfev`
+/// status, which also wins over convergence reached on the last allowed evaluation. Bounds, as
+/// SciPy applies them: x0 and every trial point are clipped, and a starting vertex past an upper
+/// bound is first reflected into the interior (frankenscipy-szq1n.7). In Strict mode a
+/// non-finite objective value is used as SciPy uses it (an objective returning `inf` outside a
+/// region is a standard device); Hardened mode rejects it.
 pub fn nelder_mead<F>(
     fun: &F,
     x0: &[f64],
@@ -1170,7 +1198,6 @@ pub fn nelder_mead<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
-    // Nelder-Mead doesn't use gradient_eps, but we still validate other options
     if let Some(maxiter) = options.maxiter
         && maxiter == 0
     {
@@ -1185,51 +1212,77 @@ where
             detail: String::from("maxfev must be >= 1"),
         });
     }
-
-    // Bounds, as SciPy's `_minimize_neldermead` applies them: x0 is clipped into the box, and
-    // every trial point (reflection, expansion, both contractions, each shrunk vertex) is clipped
-    // before it is evaluated. They used to be ignored, so a bounded call returned an infeasible
-    // optimum under success = true (frankenscipy-szq1n.7).
+    check_method_options(OptimizeMethod::NelderMead, options)?;
+    if x0.is_empty() {
+        return Err(OptError::InvalidArgument {
+            detail: String::from("x0 must have at least one element"),
+        });
+    }
     validate_bounds_for_x0(x0, options.bounds)?;
     let bounds = options.bounds.filter(|b| bounds_have_finite_limit(b));
-    let clip = |point: &mut Vec<f64>| {
+    let clip = |point: &mut [f64]| {
         if let Some(b) = bounds {
             project_onto_bounds(point, b);
         }
     };
 
-    let n = x0.len();
-    let tol = options.tol.unwrap_or(1.0e-8);
-    let xatol = tol;
-    let fatol = tol;
-    let maxiter = options.maxiter.unwrap_or(200 * n);
-    let maxfev = options.maxfev.unwrap_or(200 * n);
-    let mut objective = Objective::new(fun, options.mode, maxfev);
-
-    // Standard simplex coefficients — SciPy's default (adaptive=False) for all n.
-    let (rho, chi, psi, sigma) = (1.0, 2.0, 0.5, 0.5);
+    let method_options = options.method_options;
+    let xatol = method_options.xatol.or(options.tol).unwrap_or(1.0e-4);
+    let fatol = method_options.fatol.or(options.tol).unwrap_or(1.0e-4);
 
     let mut start = x0.to_vec();
     clip(&mut start);
+    let n = start.len();
+    let (rho, chi, psi, sigma) = if method_options.adaptive == Some(true) {
+        let dim = n as f64;
+        (
+            1.0,
+            1.0 + 2.0 / dim,
+            0.75 - 1.0 / (2.0 * dim),
+            1.0 - 1.0 / dim,
+        )
+    } else {
+        (1.0, 2.0, 0.5, 0.5)
+    };
 
-    // Build initial simplex: n+1 vertices
-    let mut simplex: Vec<Vec<f64>> = Vec::with_capacity(n + 1);
-    simplex.push(start.clone());
-
-    for j in 0..n {
-        let mut vertex = start.clone();
-        let h = if start[j].abs() > 1e-12 {
-            0.05 * start[j]
-        } else {
-            0.00025
-        };
-        vertex[j] += h;
-        simplex.push(vertex);
-    }
+    let mut sim: Vec<Vec<f64>> = match method_options.initial_simplex {
+        None => {
+            let mut sim = Vec::with_capacity(n + 1);
+            sim.push(start.clone());
+            for k in 0..n {
+                let mut y = start.clone();
+                if y[k] != 0.0 {
+                    y[k] *= 1.0 + 0.05;
+                } else {
+                    y[k] = 0.00025;
+                }
+                sim.push(y);
+            }
+            sim
+        }
+        Some(given) => {
+            let width = given.first().map_or(0, Vec::len);
+            if given.len() != width + 1 || given.iter().any(|row| row.len() != width) {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("`initial_simplex` should be an array of shape (N+1,N)"),
+                });
+            }
+            if width != n {
+                return Err(OptError::InvalidArgument {
+                    detail: String::from("Size of `initial_simplex` is not consistent with `x0`"),
+                });
+            }
+            given.to_vec()
+        }
+    };
+    let (maxiter, maxfun) = match (options.maxiter, options.maxfev) {
+        (None, None) => (200 * n, 200 * n),
+        (None, Some(maxfun)) => (usize::MAX, maxfun),
+        (Some(maxiter), None) => (maxiter, usize::MAX),
+        (Some(maxiter), Some(maxfun)) => (maxiter, maxfun),
+    };
     if let Some(b) = bounds {
-        // SciPy: a vertex pushed past an upper bound is reflected into the interior before
-        // clipping, so a start at the upper bound does not collapse the simplex onto it.
-        for vertex in &mut simplex {
+        for vertex in &mut sim {
             for (value, &(_, hi)) in vertex.iter_mut().zip(b) {
                 if let Some(hi) = hi
                     && *value > hi
@@ -1241,270 +1294,225 @@ where
         }
     }
 
-    // Evaluate at all vertices
-    let mut f_values: Vec<f64> = Vec::with_capacity(n + 1);
-    for vertex in &simplex {
-        let fval = match objective.eval(vertex) {
-            Ok(v) => v,
-            Err(err) => return Ok(result_from_error(x0, 0, objective.nfev, 0, err)),
-        };
-        f_values.push(fval);
+    // SciPy's `_wrap_scalar_function_maxfun_validation`: an evaluation past `maxfun` is refused
+    // (`None` here, `_MaxFuncCallError` there) and ends the current step.
+    let mut nfev = 0_usize;
+    let eval = |x: &[f64], nfev: &mut usize| -> Result<Option<f64>, OptError> {
+        if *nfev >= maxfun {
+            return Ok(None);
+        }
+        *nfev += 1;
+        let value = fun(x);
+        if !value.is_finite() && options.mode == RuntimeMode::Hardened {
+            return Err(OptError::NonFiniteInput {
+                detail: String::from("hardened mode rejects non-finite objective values"),
+            });
+        }
+        Ok(Some(value))
+    };
+
+    let mut fsim = vec![f64::INFINITY; n + 1];
+    for (vertex, value) in sim.iter().zip(fsim.iter_mut()) {
+        match eval(vertex, &mut nfev)? {
+            Some(f) => *value = f,
+            None => break,
+        }
     }
+    nelder_mead_sort(&mut sim, &mut fsim);
 
-    let mut nit = 0usize;
-
-    for iteration in 0..maxiter {
-        nit = iteration + 1;
-
-        // Sort simplex by function values
-        let mut pairs: Vec<(f64, Vec<f64>)> = f_values.into_iter().zip(simplex).collect();
-        pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let (sorted_f, sorted_simplex): (Vec<f64>, Vec<Vec<f64>>) = pairs.into_iter().unzip();
-        simplex = sorted_simplex;
-        f_values = sorted_f;
-
-        // Check convergence: range of function values and simplex diameter
-        let f_range = f_values[n] - f_values[0];
-        let mut max_delta = 0.0_f64;
-        for vertex in simplex.iter().skip(1) {
-            let delta: f64 = vertex
-                .iter()
-                .zip(simplex[0].iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, |a: f64, b: f64| {
-                    if a.is_nan() || b.is_nan() {
-                        f64::NAN
-                    } else {
-                        a.max(b)
-                    }
-                });
-            max_delta = if max_delta.is_nan() || delta.is_nan() {
-                f64::NAN
-            } else {
-                max_delta.max(delta)
-            };
-        }
-
-        if f_range <= fatol && max_delta <= xatol {
-            let result = OptimizeResult {
-                x: simplex[0].clone(),
-                fun: Some(f_values[0]),
-                // status: simplex f-range ≤ fatol and max vertex offset (inf-norm) ≤ xatol
-                success: true,
-                status: ConvergenceStatus::Success,
-                message: String::from("optimization converged (Nelder-Mead)"),
-                nfev: objective.nfev,
-                njev: 0,
-                nhev: 0,
-                nit,
-                jac: None,
-                hess_inv: None,
-                maxcv: None,
-            };
-            log_completion(OptimizeMethod::NelderMead, options, iteration, &result);
-            return Ok(result);
-        }
-
-        if let Some(callback) = options.callback
-            && !callback(&simplex[0])
-        {
-            let result = OptimizeResult {
-                x: simplex[0].clone(),
-                fun: Some(f_values[0]),
-                success: false,
-                status: ConvergenceStatus::CallbackStop,
-                message: String::from("callback requested stop"),
-                nfev: objective.nfev,
-                njev: 0,
-                nhev: 0,
-                nit,
-                jac: None,
-                hess_inv: None,
-                maxcv: None,
-            };
-            log_completion(OptimizeMethod::NelderMead, options, iteration, &result);
-            return Ok(result);
-        }
-
-        // Centroid of best n vertices (exclude worst)
-        let mut centroid = vec![0.0; n];
-        for vertex in simplex.iter().take(n) {
-            for (j, c) in centroid.iter_mut().enumerate() {
-                *c += vertex[j];
-            }
-        }
-        for c in &mut centroid {
-            *c /= n as f64;
-        }
-
-        // Reflection: x_r = centroid + rho * (centroid - worst)
-        let worst = &simplex[n];
-        let mut x_r: Vec<f64> = centroid
+    let mut iterations = 1_usize;
+    let mut stopped_by_callback = false;
+    while nfev < maxfun && iterations < maxiter {
+        let x_spread = sim[1..]
             .iter()
-            .zip(worst.iter())
-            .map(|(c, w)| c + rho * (c - w))
-            .collect();
-        clip(&mut x_r);
-        let f_r = match objective.eval(&x_r) {
-            Ok(v) => v,
-            Err(err) => return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err)),
-        };
-
-        if f_r < f_values[0] {
-            // Expansion: x_e = centroid + chi * (x_r - centroid)
-            let mut x_e: Vec<f64> = centroid
-                .iter()
-                .zip(x_r.iter())
-                .map(|(c, r)| c + chi * (r - c))
-                .collect();
-            clip(&mut x_e);
-            let f_e = match objective.eval(&x_e) {
-                Ok(v) => v,
-                Err(err) => return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err)),
-            };
-            if f_e < f_r {
-                simplex[n] = x_e;
-                f_values[n] = f_e;
-            } else {
-                simplex[n] = x_r;
-                f_values[n] = f_r;
-            }
-        } else if f_r < f_values[n - 1] {
-            // Accept reflection
-            simplex[n] = x_r;
-            f_values[n] = f_r;
-        } else {
-            // Contraction
-            if f_r < f_values[n] {
-                // Outside contraction: x_c = centroid + psi * (x_r - centroid)
-                let mut x_c: Vec<f64> = centroid
-                    .iter()
-                    .zip(x_r.iter())
-                    .map(|(c, r)| c + psi * (r - c))
-                    .collect();
-                clip(&mut x_c);
-                let f_c = match objective.eval(&x_c) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err));
-                    }
-                };
-                if f_c <= f_r {
-                    simplex[n] = x_c;
-                    f_values[n] = f_c;
-                } else {
-                    // Shrink
-                    match nelder_mead_shrink(
-                        &mut simplex,
-                        &mut f_values,
-                        sigma,
-                        &mut objective,
-                        n,
-                        bounds,
-                    ) {
-                        Ok(()) => {}
-                        Err(err) => {
-                            return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err));
-                        }
-                    }
-                }
-            } else {
-                // Inside contraction: x_cc = centroid - psi * (centroid - worst)
-                let mut x_cc: Vec<f64> = centroid
-                    .iter()
-                    .zip(worst.iter())
-                    .map(|(c, w)| c - psi * (c - w))
-                    .collect();
-                clip(&mut x_cc);
-                let f_cc = match objective.eval(&x_cc) {
-                    Ok(v) => v,
-                    Err(err) => {
-                        return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err));
-                    }
-                };
-                if f_cc < f_values[n] {
-                    simplex[n] = x_cc;
-                    f_values[n] = f_cc;
-                } else {
-                    // Shrink
-                    match nelder_mead_shrink(
-                        &mut simplex,
-                        &mut f_values,
-                        sigma,
-                        &mut objective,
-                        n,
-                        bounds,
-                    ) {
-                        Ok(()) => {}
-                        Err(err) => {
-                            return Ok(result_from_error(&simplex[0], nit, objective.nfev, 0, err));
-                        }
-                    }
-                }
-            }
+            .flat_map(|vertex| vertex.iter().zip(&sim[0]).map(|(a, b)| (a - b).abs()))
+            .fold(0.0_f64, nan_max);
+        let f_spread = fsim[1..]
+            .iter()
+            .map(|f| (fsim[0] - f).abs())
+            .fold(0.0_f64, nan_max);
+        if x_spread <= xatol && f_spread <= fatol {
+            break;
         }
 
+        'step: {
+            let mut xbar = vec![0.0; n];
+            for vertex in &sim[..n] {
+                for (acc, v) in xbar.iter_mut().zip(vertex) {
+                    *acc += v;
+                }
+            }
+            for value in &mut xbar {
+                *value /= n as f64;
+            }
+            let along = |a: f64, b: f64| -> Vec<f64> {
+                xbar.iter()
+                    .zip(&sim[n])
+                    .map(|(xb, worst)| a * xb - b * worst)
+                    .collect()
+            };
+
+            let mut xr = along(1.0 + rho, rho);
+            clip(&mut xr);
+            let Some(fxr) = eval(&xr, &mut nfev)? else {
+                break 'step;
+            };
+            let mut doshrink = false;
+            if fxr < fsim[0] {
+                let mut xe = along(1.0 + rho * chi, rho * chi);
+                clip(&mut xe);
+                let Some(fxe) = eval(&xe, &mut nfev)? else {
+                    break 'step;
+                };
+                if fxe < fxr {
+                    sim[n] = xe;
+                    fsim[n] = fxe;
+                } else {
+                    sim[n] = xr;
+                    fsim[n] = fxr;
+                }
+            } else if fxr < fsim[n - 1] {
+                sim[n] = xr;
+                fsim[n] = fxr;
+            } else if fxr < fsim[n] {
+                let mut xc = along(1.0 + psi * rho, psi * rho);
+                clip(&mut xc);
+                let Some(fxc) = eval(&xc, &mut nfev)? else {
+                    break 'step;
+                };
+                if fxc <= fxr {
+                    sim[n] = xc;
+                    fsim[n] = fxc;
+                } else {
+                    doshrink = true;
+                }
+            } else {
+                // `(1 - psi) * xbar + psi * sim[-1]`
+                let mut xcc: Vec<f64> = xbar
+                    .iter()
+                    .zip(&sim[n])
+                    .map(|(xb, worst)| (1.0 - psi) * xb + psi * worst)
+                    .collect();
+                clip(&mut xcc);
+                let Some(fxcc) = eval(&xcc, &mut nfev)? else {
+                    break 'step;
+                };
+                if fxcc < fsim[n] {
+                    sim[n] = xcc;
+                    fsim[n] = fxcc;
+                } else {
+                    doshrink = true;
+                }
+            }
+            if doshrink {
+                for j in 1..=n {
+                    let shrunk: Vec<f64> = sim[0]
+                        .iter()
+                        .zip(&sim[j])
+                        .map(|(best, v)| best + sigma * (v - best))
+                        .collect();
+                    sim[j] = shrunk;
+                    clip(&mut sim[j]);
+                    let Some(f) = eval(&sim[j], &mut nfev)? else {
+                        break 'step;
+                    };
+                    fsim[j] = f;
+                }
+            }
+            iterations += 1;
+        }
+
+        nelder_mead_sort(&mut sim, &mut fsim);
         log_iteration(
             OptimizeMethod::NelderMead,
             options,
-            iteration,
-            f_values[0],
+            iterations,
+            fsim[0],
             0.0,
             0.0,
-            objective.nfev,
+            nfev,
         );
+        if let Some(callback) = options.callback
+            && !callback(&sim[0])
+        {
+            stopped_by_callback = true;
+            break;
+        }
     }
 
-    // Max iterations reached
-    let mut indices: Vec<usize> = (0..=n).collect();
-    indices.sort_by(|&a, &b| f_values[a].total_cmp(&f_values[b]));
-    let best_idx = indices[0];
-
+    let fval = fsim.iter().copied().fold(f64::INFINITY, nan_min);
+    let (success, status, message) = if stopped_by_callback {
+        (
+            false,
+            ConvergenceStatus::CallbackStop,
+            "`callback` raised `StopIteration`.",
+        )
+    } else if nfev >= maxfun {
+        (
+            false,
+            ConvergenceStatus::MaxEvaluations,
+            "Maximum number of function evaluations has been exceeded.",
+        )
+    } else if iterations >= maxiter {
+        (
+            false,
+            ConvergenceStatus::MaxIterations,
+            "Maximum number of iterations has been exceeded.",
+        )
+    } else {
+        (
+            true,
+            ConvergenceStatus::Success,
+            "Optimization terminated successfully.",
+        )
+    };
     let result = OptimizeResult {
-        x: simplex[best_idx].clone(),
-        fun: Some(f_values[best_idx]),
-        success: false,
-        status: ConvergenceStatus::MaxIterations,
-        message: format!("maximum iterations reached ({maxiter})"),
-        nfev: objective.nfev,
+        x: sim[0].clone(),
+        fun: Some(fval),
+        success,
+        status,
+        message: String::from(message),
+        nfev,
         njev: 0,
         nhev: 0,
-        nit,
+        nit: iterations,
         jac: None,
         hess_inv: None,
         maxcv: None,
     };
-    log_completion(OptimizeMethod::NelderMead, options, nit, &result);
+    log_completion(OptimizeMethod::NelderMead, options, iterations, &result);
     Ok(result)
 }
 
-fn nelder_mead_shrink<F>(
-    simplex: &mut [Vec<f64>],
-    f_values: &mut [f64],
-    sigma: f64,
-    objective: &mut Objective<'_, F>,
-    n: usize,
-    bounds: Option<&[Bound]>,
-) -> Result<(), OptError>
-where
-    F: Fn(&[f64]) -> f64,
-{
-    let best = simplex[0].clone();
-    for i in 1..=n {
-        for j in 0..n {
-            simplex[i][j] = best[j] + sigma * (simplex[i][j] - best[j]);
-        }
-        if let Some(b) = bounds {
-            project_onto_bounds(&mut simplex[i], b);
-        }
-        f_values[i] = objective.eval(&simplex[i]).map_err(|e| match e {
-            OptError::EvaluationBudgetExceeded { detail } => {
-                OptError::EvaluationBudgetExceeded { detail }
-            }
-            other => other,
-        })?;
+/// numpy's `argsort` of the simplex values applied to both arrays; NaN sorts last, as numpy's
+/// does. A stable sort, as numpy's is for these sizes (insertion sort below 16 elements).
+fn nelder_mead_sort(sim: &mut Vec<Vec<f64>>, fsim: &mut Vec<f64>) {
+    let mut order: Vec<usize> = (0..fsim.len()).collect();
+    order.sort_by(|&a, &b| {
+        fsim[a]
+            .partial_cmp(&fsim[b])
+            .unwrap_or_else(|| fsim[a].is_nan().cmp(&fsim[b].is_nan()))
+    });
+    *sim = order.iter().map(|&i| sim[i].clone()).collect();
+    *fsim = order.iter().map(|&i| fsim[i]).collect();
+}
+
+/// `np.max`'s propagation of NaN, as a fold.
+fn nan_max(acc: f64, value: f64) -> f64 {
+    if acc.is_nan() || value.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(value)
     }
-    Ok(())
+}
+
+/// `np.min`'s propagation of NaN, as a fold.
+fn nan_min(acc: f64, value: f64) -> f64 {
+    if acc.is_nan() || value.is_nan() {
+        f64::NAN
+    } else {
+        acc.min(value)
+    }
 }
 
 /// `scipy.optimize.minimize(method='L-BFGS-B')`: SciPy's `_minimize_lbfgsb` driving L-BFGS-B 3.0
@@ -1517,10 +1525,11 @@ where
 /// default to 15000; `maxcor` is 10 and `maxls` 20. `gradient_eps` is `eps` (default 1e-8), the
 /// absolute forward-difference step when `options.gradient` is absent, stepped backwards or
 /// shortened at a bound as `approx_derivative(..., '2-point', abs_step=eps, bounds)` does. `x0`
-/// is clipped into the bounds. The message is SciPy's task text. `hess_inv` is not materialized:
-/// SciPy returns it as a lazy `LbfgsInvHessProduct`, and a dense `n × n` copy is what a
-/// large-scale method must not allocate. In Strict mode a non-finite objective value is passed
-/// to the algorithm as SciPy's is; Hardened mode rejects it.
+/// is clipped into the bounds. The message is SciPy's task text. `hess_inv` is SciPy's lazy
+/// `LbfgsInvHessProduct` ([`HessInv::Lbfgs`]) over the stored corrections, read from the
+/// workspace as `_minimize_lbfgsb` reads them; no `n × n` matrix is formed unless `todense` is
+/// asked for (frankenscipy-6ycp2). In Strict mode a non-finite objective value is passed to
+/// the algorithm as SciPy's is; Hardened mode rejects it.
 pub fn lbfgsb<F>(
     fun: &F,
     x0: &[f64],
@@ -1531,6 +1540,7 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::LBfgsB, options)?;
     validate_bounds_for_x0(x0, bounds)?;
     let n = x0.len();
     let (lower, upper): (Vec<f64>, Vec<f64>) = match bounds {
@@ -1555,13 +1565,16 @@ where
         })
         .collect();
     let (l, u, nbd) = lbfgsb::encode_bounds(&lower, &upper);
+    // An explicit option wins over `tol`, which only fills `ftol` and `gtol` (SciPy's
+    // `setdefault`); SciPy's `factr` is `ftol / eps`.
+    let method_options = options.method_options;
     let params = lbfgsb::LbfgsbParams {
-        m: 10,
-        factr: options.tol.unwrap_or(LBFGSB_FTOL) / f64::EPSILON,
-        pgtol: options.tol.unwrap_or(1.0e-5),
+        m: method_options.maxcor.unwrap_or(10),
+        factr: method_options.ftol.or(options.tol).unwrap_or(LBFGSB_FTOL) / f64::EPSILON,
+        pgtol: method_options.gtol.or(options.tol).unwrap_or(1.0e-5),
         maxfun: options.maxfev.unwrap_or(15_000),
         maxiter: options.maxiter.unwrap_or(15_000),
-        maxls: 20,
+        maxls: method_options.maxls.unwrap_or(20),
     };
     // SciPy checks `maxfun` between iterations; the adapter must not cut an evaluation off.
     let adapter_options = MinimizeOptions {
@@ -1582,6 +1595,12 @@ where
                 LbfgsbStop::Callback => ConvergenceStatus::CallbackStop,
                 LbfgsbStop::Abnormal => ConvergenceStatus::PrecisionLoss,
             };
+            // Stored pairs passed L-BFGS-B's own curvature test, so construction does not
+            // fail; if it ever did, no operator is better than a wrong one.
+            let (sk, yk) = outcome.corrections;
+            let hess_inv = LbfgsInvHessProduct::with_dimension(sk, yk, n)
+                .ok()
+                .map(HessInv::Lbfgs);
             OptimizeResult {
                 x: outcome.x,
                 fun: Some(outcome.fun),
@@ -1594,7 +1613,7 @@ where
                 nhev: 0,
                 nit: outcome.nit,
                 jac: Some(outcome.jac),
-                hess_inv: None,
+                hess_inv,
                 maxcv: None,
             }
         }
@@ -1667,6 +1686,7 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::NewtonCg, options)?;
     let params = NewtonCgParams {
         xtol: options.tol.unwrap_or(1.0e-5),
         maxiter: options.maxiter.unwrap_or(200 * x0.len()),
@@ -1752,6 +1772,7 @@ pub fn trust_exact<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
+    check_method_options(OptimizeMethod::TrustExact, options)?;
     if options.hess.is_some() {
         return trust_region_minimize(
             fun,
@@ -2000,6 +2021,7 @@ pub fn trust_ncg<F>(
 where
     F: Fn(&[f64]) -> f64,
 {
+    check_method_options(OptimizeMethod::TrustNcg, options)?;
     if options.hess.is_none() && options.hessp.is_none() {
         return Err(OptError::InvalidArgument {
             detail: String::from(
@@ -2026,6 +2048,7 @@ pub fn dogleg<F>(fun: &F, x0: &[f64], options: MinimizeOptions) -> Result<Optimi
 where
     F: Fn(&[f64]) -> f64,
 {
+    check_method_options(OptimizeMethod::Dogleg, options)?;
     if options.hess.is_none() {
         return Err(OptError::InvalidArgument {
             detail: String::from("Hessian is required for dogleg minimization"),
@@ -3278,6 +3301,112 @@ fn validate_minimize_options(options: MinimizeOptions) -> Result<(), OptError> {
     Ok(())
 }
 
+/// The SciPy option names each method reads from [`MinimizeMethodOptions`]
+/// (frankenscipy-6ycp2). The other methods read none of them yet.
+fn accepted_method_options(method: OptimizeMethod) -> &'static [&'static str] {
+    match method {
+        OptimizeMethod::Bfgs => &["gtol", "norm", "c1", "c2", "xrtol"],
+        OptimizeMethod::ConjugateGradient => &["gtol", "norm", "c1", "c2"],
+        OptimizeMethod::LBfgsB => &["gtol", "ftol", "maxcor", "maxls"],
+        OptimizeMethod::NelderMead => &["xatol", "fatol", "adaptive", "initial_simplex"],
+        OptimizeMethod::Powell => &["xtol", "ftol", "direc"],
+        _ => &[],
+    }
+}
+
+/// The names of the options set in `options`.
+fn set_method_options(options: &MinimizeMethodOptions<'_>) -> Vec<&'static str> {
+    [
+        ("gtol", options.gtol.is_some()),
+        ("norm", options.norm.is_some()),
+        ("c1", options.c1.is_some()),
+        ("c2", options.c2.is_some()),
+        ("xrtol", options.xrtol.is_some()),
+        ("maxcor", options.maxcor.is_some()),
+        ("maxls", options.maxls.is_some()),
+        ("ftol", options.ftol.is_some()),
+        ("xtol", options.xtol.is_some()),
+        ("xatol", options.xatol.is_some()),
+        ("fatol", options.fatol.is_some()),
+        ("adaptive", options.adaptive.is_some()),
+        ("initial_simplex", options.initial_simplex.is_some()),
+        ("direc", options.direc.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect()
+}
+
+/// SciPy's `_check_unknown_options` and the per-option checks its solvers make
+/// (frankenscipy-6ycp2). An option the method does not read is an `OptimizeWarning` in SciPy,
+/// which then proceeds: Strict does the same and records it in the optimize trace; Hardened
+/// refuses it. The values SciPy itself refuses (`0 < c1 < c2 < 1`, `maxls` and `maxcor` at
+/// least 1) are refused in both modes.
+fn check_method_options(method: OptimizeMethod, options: MinimizeOptions) -> Result<(), OptError> {
+    let method_options = options.method_options;
+    let accepted = accepted_method_options(method);
+    let unknown: Vec<&str> = set_method_options(&method_options)
+        .into_iter()
+        .filter(|name| !accepted.contains(name))
+        .collect();
+    if !unknown.is_empty() {
+        let detail = format!(
+            "Unknown solver options for {method:?}: {}",
+            unknown.join(", ")
+        );
+        if options.mode == RuntimeMode::Hardened {
+            return Err(OptError::InvalidArgument { detail });
+        }
+        push_trace(OptimizeTraceEntry {
+            ts_unix_ms: now_unix_ms(),
+            event: String::from("unknown_solver_options"),
+            method,
+            iter_num: 0,
+            f_val: None,
+            grad_norm: None,
+            step_size: None,
+            mode: options.mode,
+            reason: Some(detail),
+            final_x: None,
+            final_f: None,
+            total_nfev: 0,
+            fixture_id: options.fixture_id.map(ToOwned::to_owned),
+            seed: options.seed,
+        });
+    }
+    if matches!(
+        method,
+        OptimizeMethod::Bfgs | OptimizeMethod::ConjugateGradient
+    ) {
+        let c1 = method_options.c1.unwrap_or(1.0e-4);
+        let c2 = method_options
+            .c2
+            .unwrap_or(if method == OptimizeMethod::Bfgs {
+                0.9
+            } else {
+                0.4
+            });
+        if !(0.0 < c1 && c1 < c2 && c2 < 1.0) {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("'c1' and 'c2' do not satisfy '0 < c1 < c2 < 1'."),
+            });
+        }
+    }
+    if method == OptimizeMethod::LBfgsB {
+        if method_options.maxls == Some(0) {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("maxls must be positive."),
+            });
+        }
+        if method_options.maxcor == Some(0) {
+            return Err(OptError::InvalidArgument {
+                detail: String::from("maxcor must be positive."),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn validate_bounds_for_x0(x0: &[f64], bounds: Option<&[Bound]>) -> Result<(), OptError> {
     let Some(bounds) = bounds else {
         return Ok(());
@@ -3739,6 +3868,7 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::Tnc, options)?;
 
     let n = x0.len();
     let tol = requested_tolerance(options.tol);
@@ -4040,6 +4170,7 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::Slsqp, options)?;
     if x0.is_empty() {
         return Err(OptError::InvalidArgument {
             detail: String::from("x0 must be a finite 1-D vector with at least one element"),
@@ -4345,6 +4476,7 @@ where
     F: Fn(&[f64]) -> f64,
 {
     validate_minimize_options(options)?;
+    check_method_options(OptimizeMethod::TrustConstr, options)?;
     reject_unhonoured_constraints("trust-constr", options)?;
 
     let n = x0.len();
@@ -6474,7 +6606,7 @@ mod tests {
                 ..MinimizeOptions::default()
             };
             let result = bfgs(&sphere, &x0, options).expect("bfgs executes");
-            let h_inv = result.hess_inv.as_ref().expect("hessian inverse is present");
+            let h_inv = result.hess_inv.as_ref().expect("hessian inverse is present").todense();
             prop_assert_eq!(h_inv.len(), 2);
             prop_assert!((h_inv[0][1] - h_inv[1][0]).abs() <= 1.0e-6);
             prop_assert!(h_inv[0][0] > 0.0);
@@ -8755,5 +8887,613 @@ mod tests {
         assert!((res.result.x[0] - 2.0).abs() < 1e-4);
         assert!((res.result.x[1] + 3.0).abs() < 1e-4);
         assert_eq!(portfolio.evidence_len(), 1);
+    }
+
+    /// frankenscipy-6ycp2: SciPy's per-method options, each row against SciPy 1.17.1 running
+    /// `minimize(rosen, x0, jac=rosen_der, method=..., tol=..., options={...})` (Nelder-Mead and
+    /// Powell without `jac`), pinned interpreter, numpy 2.4.3. Every option row differs from its
+    /// method's default row in SciPy and here (must-differ); `tol` fills only the unset options.
+    /// (nit, nfev) must be SciPy's exactly. x agrees to 1e-7: Nelder-Mead, Powell and CG land
+    /// on SciPy's x bit for bit, while L-BFGS-B and BFGS differ in the last digits of the
+    /// arithmetic that SciPy itself moves by as much between OpenBLAS kernels (the live
+    /// `diff_opt_*` rows use the same x tolerance).
+    #[test]
+    fn per_method_options_take_scipys_path() {
+        use crate::MinimizeMethodOptions;
+        fn rosen(x: &[f64]) -> f64 {
+            (0..x.len() - 1)
+                .map(|i| 100.0 * (x[i + 1] - x[i] * x[i]).powi(2) + (1.0 - x[i]).powi(2))
+                .sum()
+        }
+        fn rosen_der(x: &[f64]) -> Vec<f64> {
+            let n = x.len();
+            let mut d = vec![0.0; n];
+            for i in 1..n - 1 {
+                d[i] = 200.0 * (x[i] - x[i - 1] * x[i - 1])
+                    - 400.0 * (x[i + 1] - x[i] * x[i]) * x[i]
+                    - 2.0 * (1.0 - x[i]);
+            }
+            d[0] = -400.0 * x[0] * (x[1] - x[0] * x[0]) - 2.0 * (1.0 - x[0]);
+            d[n - 1] = 200.0 * (x[n - 1] - x[n - 2] * x[n - 2]);
+            d
+        }
+        let x5 = [-1.2, 1.0, -1.2, 1.0, -1.2];
+        let x4 = [-1.2, 1.0, -1.2, 1.0];
+        let x3 = [-1.2, 1.0, 0.5];
+        let simplex = vec![
+            vec![-1.2, 1.0, 0.5],
+            vec![-1.0, 1.0, 0.5],
+            vec![-1.2, 1.2, 0.5],
+            vec![-1.2, 1.0, 0.7],
+        ];
+        let direc = vec![
+            vec![0.0, 0.0, 1.0],
+            vec![0.0, 1.0, 0.0],
+            vec![1.0, 0.0, 0.0],
+        ];
+        let none = MinimizeMethodOptions::default();
+        type Row<'a> = (
+            &'static str,
+            OptimizeMethod,
+            &'a [f64],
+            MinimizeMethodOptions<'a>,
+            Option<f64>,
+            (usize, usize),
+            Vec<f64>,
+        );
+        let rows: Vec<Row<'_>> = vec![
+            (
+                "lbfgsb/default",
+                OptimizeMethod::LBfgsB,
+                &x5,
+                none,
+                None,
+                (49, 66),
+                vec![
+                    1.0000002716142677,
+                    1.000000476026837,
+                    1.0000009965844259,
+                    1.0000018855760335,
+                    1.0000034963341937,
+                ],
+            ),
+            (
+                "lbfgsb/maxcor=3",
+                OptimizeMethod::LBfgsB,
+                &x5,
+                MinimizeMethodOptions {
+                    maxcor: Some(3),
+                    ..none
+                },
+                None,
+                (58, 75),
+                vec![
+                    0.9999996963852181,
+                    0.9999992014580509,
+                    0.9999977907921979,
+                    0.9999962772844899,
+                    0.9999915868868214,
+                ],
+            ),
+            (
+                "lbfgsb/maxls=2",
+                OptimizeMethod::LBfgsB,
+                &x5,
+                MinimizeMethodOptions {
+                    maxls: Some(2),
+                    ..none
+                },
+                None,
+                (58, 75),
+                vec![
+                    0.9999999937972197,
+                    0.9999999925159285,
+                    0.999999988884144,
+                    0.999999980832507,
+                    0.9999999724375375,
+                ],
+            ),
+            (
+                "lbfgsb/maxls=3",
+                OptimizeMethod::LBfgsB,
+                &x5,
+                MinimizeMethodOptions {
+                    maxls: Some(3),
+                    ..none
+                },
+                None,
+                (46, 67),
+                vec![
+                    1.0000006967978263,
+                    1.0000009980473656,
+                    1.0000015563607503,
+                    1.0000034609928912,
+                    1.0000068963849624,
+                ],
+            ),
+            (
+                "lbfgsb/gtol=0.1",
+                OptimizeMethod::LBfgsB,
+                &x5,
+                MinimizeMethodOptions {
+                    gtol: Some(0.1),
+                    ..none
+                },
+                None,
+                (45, 62),
+                vec![
+                    0.9999028732430887,
+                    0.9998223816502801,
+                    0.9996087746157547,
+                    0.9992252427339321,
+                    0.9984663374275495,
+                ],
+            ),
+            (
+                "lbfgsb/ftol=1e-4",
+                OptimizeMethod::LBfgsB,
+                &x5,
+                MinimizeMethodOptions {
+                    ftol: Some(1e-4),
+                    ..none
+                },
+                None,
+                (46, 63),
+                vec![
+                    1.0000200960523424,
+                    1.0000594676253218,
+                    1.0001004093079977,
+                    1.0001680582101513,
+                    1.0002674513822452,
+                ],
+            ),
+            (
+                // tol fills ftol; the explicit gtol wins over it.
+                "lbfgsb/tol=1e-4,gtol=1e-9",
+                OptimizeMethod::LBfgsB,
+                &x5,
+                MinimizeMethodOptions {
+                    gtol: Some(1e-9),
+                    ..none
+                },
+                Some(1e-4),
+                (46, 63),
+                vec![
+                    1.0000200960523424,
+                    1.0000594676253218,
+                    1.0001004093079977,
+                    1.0001680582101513,
+                    1.0002674513822452,
+                ],
+            ),
+            (
+                "bfgs5/default",
+                OptimizeMethod::Bfgs,
+                &x5,
+                none,
+                None,
+                (49, 60),
+                vec![
+                    0.9999999920157406,
+                    0.9999999890213155,
+                    0.9999999860453902,
+                    0.9999999540064021,
+                    0.9999999189310969,
+                ],
+            ),
+            (
+                "bfgs5/gtol=0.1",
+                OptimizeMethod::Bfgs,
+                &x5,
+                MinimizeMethodOptions {
+                    gtol: Some(0.1),
+                    ..none
+                },
+                None,
+                (44, 55),
+                vec![
+                    0.999814761308239,
+                    0.999679921781256,
+                    0.9991663802602391,
+                    0.998318522772607,
+                    0.9965395433960469,
+                ],
+            ),
+            (
+                "bfgs5/norm=2",
+                OptimizeMethod::Bfgs,
+                &x5,
+                MinimizeMethodOptions {
+                    norm: Some(2.0),
+                    ..none
+                },
+                None,
+                (50, 61),
+                vec![
+                    1.0000000001088962,
+                    1.000000000283706,
+                    1.0000000004844876,
+                    1.0000000008672074,
+                    1.0000000016702875,
+                ],
+            ),
+            (
+                "bfgs5/xrtol=1e-3",
+                OptimizeMethod::Bfgs,
+                &x5,
+                MinimizeMethodOptions {
+                    xrtol: Some(1e-3),
+                    ..none
+                },
+                None,
+                (46, 57),
+                vec![
+                    0.9999876361859859,
+                    0.999989753822751,
+                    0.9999791482727433,
+                    0.9999697708313129,
+                    0.9999344723508423,
+                ],
+            ),
+            (
+                "bfgs4/default",
+                OptimizeMethod::Bfgs,
+                &x4,
+                none,
+                None,
+                (38, 47),
+                vec![
+                    0.9999999127358445,
+                    0.9999998321105728,
+                    0.999999686510974,
+                    0.9999993800315787,
+                ],
+            ),
+            (
+                "bfgs4/c2=0.5",
+                OptimizeMethod::Bfgs,
+                &x4,
+                MinimizeMethodOptions {
+                    c2: Some(0.5),
+                    ..none
+                },
+                None,
+                (34, 48),
+                vec![
+                    0.9999999573089223,
+                    0.9999999190622244,
+                    0.9999998486148944,
+                    0.999999689279727,
+                ],
+            ),
+            (
+                "cg4/default",
+                OptimizeMethod::ConjugateGradient,
+                &x4,
+                none,
+                None,
+                (100, 182),
+                vec![
+                    1.0000008314568956,
+                    1.0000016662529765,
+                    1.0000033408989533,
+                    1.000006698459287,
+                ],
+            ),
+            (
+                "cg4/gtol=1e-3",
+                OptimizeMethod::ConjugateGradient,
+                &x4,
+                MinimizeMethodOptions {
+                    gtol: Some(1e-3),
+                    ..none
+                },
+                None,
+                (69, 132),
+                vec![
+                    0.9998979459958574,
+                    0.999794601969902,
+                    0.999585730941003,
+                    0.9991685645231335,
+                ],
+            ),
+            (
+                "nm/default",
+                OptimizeMethod::NelderMead,
+                &x3,
+                none,
+                None,
+                (208, 373),
+                vec![1.0000160542863308, 1.0000294440802586, 1.0000624769428637],
+            ),
+            (
+                "nm/adaptive",
+                OptimizeMethod::NelderMead,
+                &x3,
+                MinimizeMethodOptions {
+                    adaptive: Some(true),
+                    ..none
+                },
+                None,
+                (250, 437),
+                vec![0.9999994511501469, 1.0000016029593437, 1.0000012879107845],
+            ),
+            (
+                "nm/initial_simplex",
+                OptimizeMethod::NelderMead,
+                &x3,
+                MinimizeMethodOptions {
+                    initial_simplex: Some(&simplex),
+                    ..none
+                },
+                None,
+                (205, 361),
+                vec![1.0000018670271915, 1.0000050320049534, 1.0000095411892593],
+            ),
+            (
+                "nm/xatol=fatol=1e-2",
+                OptimizeMethod::NelderMead,
+                &x3,
+                MinimizeMethodOptions {
+                    xatol: Some(1e-2),
+                    fatol: Some(1e-2),
+                    ..none
+                },
+                None,
+                (28, 50),
+                vec![-0.8842530566339224, 0.7952657856053376, 0.6374529897190208],
+            ),
+            (
+                "powell/default",
+                OptimizeMethod::Powell,
+                &x3,
+                none,
+                None,
+                (33, 1155),
+                vec![1.0000000000000402, 1.0000000000000722, 1.0000000000001463],
+            ),
+            (
+                "powell/direc",
+                OptimizeMethod::Powell,
+                &x3,
+                MinimizeMethodOptions {
+                    direc: Some(&direc),
+                    ..none
+                },
+                None,
+                (28, 983),
+                vec![0.9999999999999847, 0.9999999999999516, 0.9999999999998933],
+            ),
+            (
+                "powell/xtol=1e-2",
+                OptimizeMethod::Powell,
+                &x3,
+                MinimizeMethodOptions {
+                    xtol: Some(1e-2),
+                    ..none
+                },
+                None,
+                (27, 641),
+                vec![1.000000000000124, 1.000000000000257, 1.0000000000005351],
+            ),
+            (
+                "powell/ftol=1e-3",
+                OptimizeMethod::Powell,
+                &x3,
+                MinimizeMethodOptions {
+                    ftol: Some(1e-3),
+                    ..none
+                },
+                None,
+                (3, 98),
+                vec![-0.8802148388065856, 0.7855771312603995, 0.6210472979630902],
+            ),
+        ];
+
+        let mut mismatches = Vec::new();
+        let mut defaults: Vec<(&str, (usize, usize, Vec<f64>))> = Vec::new();
+        for (name, method, x0, method_options, tol, (nit, nfev), x) in &rows {
+            let gradient = matches!(
+                method,
+                OptimizeMethod::LBfgsB | OptimizeMethod::Bfgs | OptimizeMethod::ConjugateGradient
+            )
+            .then_some(rosen_der as GradientFunc);
+            let options = MinimizeOptions {
+                method: Some(*method),
+                tol: *tol,
+                gradient,
+                method_options: *method_options,
+                ..MinimizeOptions::default()
+            };
+            let result = minimize(rosen, x0, options).expect(name);
+            let x_error = result
+                .x
+                .iter()
+                .zip(x)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            println!(
+                "{name}: fsci (nit, nfev) = ({}, {}), SciPy ({nit}, {nfev}); max |x - x_scipy| = {x_error:e}",
+                result.nit, result.nfev
+            );
+            if (result.nit, result.nfev) != (*nit, *nfev) || x_error > 1e-7 {
+                mismatches.push(*name);
+            }
+            let family = name.split('/').next().expect("family");
+            let run = (result.nit, result.nfev, result.x.clone());
+            if name.ends_with("/default") {
+                defaults.push((family, run));
+            } else if let Some((_, default)) = defaults.iter().find(|(f, _)| *f == family) {
+                assert_ne!(&run, default, "{name}: the option did not change the run");
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "rows off SciPy's path: {mismatches:?}"
+        );
+    }
+
+    /// frankenscipy-6ycp2: L-BFGS-B's `hess_inv` is SciPy's lazy `LbfgsInvHessProduct` over
+    /// the stored corrections. SciPy 1.17.1, `minimize(rosen, x5, jac=rosen_der,
+    /// method='L-BFGS-B', options={'maxls': 2, ...})`: `hess_inv.matvec([1, -2, 0.5, 3, -1])`
+    /// with 10 corrections, and with `maxcor=3` (no correction stored at the end: the identity,
+    /// a different operator and the must-differ arm).
+    #[test]
+    fn lbfgsb_hess_inv_is_scipys_operator() {
+        use crate::{HessInv, MinimizeMethodOptions};
+        fn rosen(x: &[f64]) -> f64 {
+            (0..x.len() - 1)
+                .map(|i| 100.0 * (x[i + 1] - x[i] * x[i]).powi(2) + (1.0 - x[i]).powi(2))
+                .sum()
+        }
+        fn rosen_der(x: &[f64]) -> Vec<f64> {
+            let n = x.len();
+            let mut d = vec![0.0; n];
+            for i in 1..n - 1 {
+                d[i] = 200.0 * (x[i] - x[i - 1] * x[i - 1])
+                    - 400.0 * (x[i + 1] - x[i] * x[i]) * x[i]
+                    - 2.0 * (1.0 - x[i]);
+            }
+            d[0] = -400.0 * x[0] * (x[1] - x[0] * x[0]) - 2.0 * (1.0 - x[0]);
+            d[n - 1] = 200.0 * (x[n - 1] - x[n - 2] * x[n - 2]);
+            d
+        }
+        let v = [1.0, -2.0, 0.5, 3.0, -1.0];
+        // (maxcor, (nit, nfev), SciPy's hess_inv.matvec(v)). maxls = 2 in both: there fsci's
+        // iterates match SciPy's to 1e-15, so the stored corrections do too. (At the defaults
+        // x agrees to 1e-10 and the operator only to ~3e-4: near the optimum the steps s_k are
+        // ~1e-7 long, so a 1e-10 difference in x is a 1e-3 difference in s.) With maxcor = 3 the
+        // run ends with no correction stored and SciPy's operator is the identity.
+        let cases: [(Option<usize>, (usize, usize), [f64; 5]); 2] = [
+            (
+                None,
+                (58, 75),
+                [
+                    1.9838301175840392,
+                    4.852811425105005,
+                    8.1946217963063,
+                    14.358352695675844,
+                    29.037623422295617,
+                ],
+            ),
+            (Some(3), (12, 19), [1.0, -2.0, 0.5, 3.0, -1.0]),
+        ];
+        let mut products = Vec::new();
+        for (maxcor, (nit, nfev), expected) in cases {
+            let options = MinimizeOptions {
+                method: Some(OptimizeMethod::LBfgsB),
+                gradient: Some(rosen_der as GradientFunc),
+                method_options: MinimizeMethodOptions {
+                    maxcor,
+                    maxls: Some(2),
+                    ..MinimizeMethodOptions::default()
+                },
+                ..MinimizeOptions::default()
+            };
+            let result = minimize(rosen, &[-1.2, 1.0, -1.2, 1.0, -1.2], options).expect("L-BFGS-B");
+            assert_eq!((result.nit, result.nfev), (nit, nfev), "maxcor {maxcor:?}");
+            let Some(HessInv::Lbfgs(operator)) = &result.hess_inv else {
+                unreachable!(
+                    "L-BFGS-B returns the lazy operator, got {:?}",
+                    result.hess_inv
+                );
+            };
+            assert_eq!(operator.shape(), (5, 5));
+            let product = result
+                .hess_inv
+                .as_ref()
+                .expect("present")
+                .matvec(&v)
+                .expect("matvec");
+            let error = product
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs() / b.abs())
+                .fold(0.0_f64, f64::max);
+            println!("maxcor {maxcor:?}: matvec {product:?}, max rel error vs SciPy {error:e}");
+            // Measured 1.8e-7 with 10 corrections (two stored steps are ~2e-5 long, so last-bit
+            // differences in the iterates reach the operator at that level). The defect this
+            // must catch, a wrong correction order, moves SciPy's own product by 0.35 (rotated
+            // by one slot) to 0.95 (reversed).
+            assert!(
+                error <= 1e-6,
+                "maxcor {maxcor:?}: {product:?} vs SciPy {expected:?}"
+            );
+            products.push(product);
+        }
+        assert_ne!(products[0], products[1], "maxcor must change the operator");
+    }
+
+    /// frankenscipy-6ycp2: an option the method does not read is SciPy's unknown solver option:
+    /// Strict proceeds and records it in the optimize trace, Hardened refuses it; the values
+    /// SciPy itself refuses are refused in both modes.
+    #[test]
+    fn unknown_and_invalid_method_options() {
+        use crate::MinimizeMethodOptions;
+        let f = |x: &[f64]| (x[0] - 1.0).powi(2) + (x[1] + 2.0).powi(2);
+        let stray = MinimizeMethodOptions {
+            maxcor: Some(3),
+            direc: None,
+            ..MinimizeMethodOptions::default()
+        };
+        let strict = MinimizeOptions {
+            method: Some(OptimizeMethod::Bfgs),
+            method_options: stray,
+            seed: Some(0x6_7C92),
+            ..MinimizeOptions::default()
+        };
+        let result = minimize(f, &[0.0, 0.0], strict).expect("Strict proceeds");
+        assert!(result.success);
+        assert!(get_optimize_traces().iter().any(|t| {
+            t.event == "unknown_solver_options"
+                && t.seed == Some(0x6_7C92)
+                && t.reason.as_deref().is_some_and(|r| r.contains("maxcor"))
+        }));
+        let hardened = MinimizeOptions {
+            mode: RuntimeMode::Hardened,
+            ..strict
+        };
+        assert!(matches!(
+            minimize(f, &[0.0, 0.0], hardened),
+            Err(OptError::InvalidArgument { detail }) if detail.contains("Unknown solver options")
+        ));
+        // A read option is not unknown: the same maxcor under L-BFGS-B leaves no trace.
+        let known = MinimizeOptions {
+            method: Some(OptimizeMethod::LBfgsB),
+            mode: RuntimeMode::Hardened,
+            ..strict
+        };
+        assert!(minimize(f, &[0.0, 0.0], known).is_ok());
+
+        let bad_wolfe = MinimizeOptions {
+            method: Some(OptimizeMethod::Bfgs),
+            method_options: MinimizeMethodOptions {
+                c1: Some(0.9),
+                c2: Some(0.5),
+                ..MinimizeMethodOptions::default()
+            },
+            ..MinimizeOptions::default()
+        };
+        assert!(minimize(f, &[0.0, 0.0], bad_wolfe).is_err());
+        let wrong_simplex = vec![vec![0.0, 0.0], vec![1.0, 0.0]];
+        let bad_simplex = MinimizeOptions {
+            method: Some(OptimizeMethod::NelderMead),
+            method_options: MinimizeMethodOptions {
+                initial_simplex: Some(&wrong_simplex),
+                ..MinimizeMethodOptions::default()
+            },
+            ..MinimizeOptions::default()
+        };
+        assert!(minimize(f, &[0.0, 0.0], bad_simplex).is_err());
+        let wrong_direc = vec![vec![1.0, 0.0]];
+        let bad_direc = MinimizeOptions {
+            method: Some(OptimizeMethod::Powell),
+            method_options: MinimizeMethodOptions {
+                direc: Some(&wrong_direc),
+                ..MinimizeMethodOptions::default()
+            },
+            ..MinimizeOptions::default()
+        };
+        assert!(minimize(f, &[0.0, 0.0], bad_direc).is_err());
     }
 }

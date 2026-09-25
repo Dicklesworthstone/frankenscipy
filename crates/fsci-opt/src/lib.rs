@@ -79,8 +79,9 @@ pub use root::{
 };
 pub use types::{
     Bound, Bounds, Constraint, ConstraintFn, ConstraintJacFn, ConstraintType, ConvergenceStatus,
-    GradientFunc, HessFunc, HesspFunc, LinearConstraint, MinimizeOptions, NonlinearConstraint,
-    OptError, OptimizeMethod, OptimizeResult, RootMethod, RootOptions,
+    GradientFunc, HessFunc, HessInv, HesspFunc, LinearConstraint, MinimizeMethodOptions,
+    MinimizeOptions, NonlinearConstraint, OptError, OptimizeMethod, OptimizeResult, RootMethod,
+    RootOptions,
 };
 
 /// Warning emitted during optimization routines, matching `scipy.optimize.OptimizeWarning`.

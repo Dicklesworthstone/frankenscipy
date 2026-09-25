@@ -73,6 +73,52 @@ pub struct OptimizeTraceEntry {
     pub seed: Option<u64>,
 }
 
+/// SciPy's `OptimizeResult.hess_inv`: a dense matrix (BFGS), or L-BFGS-B's lazy
+/// `LbfgsInvHessProduct`, which applies the limited-memory approximation without forming an
+/// `n × n` matrix (frankenscipy-6ycp2).
+#[derive(Debug, Clone, PartialEq)]
+pub enum HessInv {
+    Dense(Vec<Vec<f64>>),
+    Lbfgs(crate::lbfgs_inv_hess::LbfgsInvHessProduct),
+}
+
+impl HessInv {
+    /// `hess_inv @ x` (`hess_inv.matvec(x)` for L-BFGS-B's operator).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OptError::InvalidArgument`] when `x` has the wrong length.
+    pub fn matvec(&self, x: &[f64]) -> Result<Vec<f64>, OptError> {
+        match self {
+            Self::Dense(rows) => {
+                if rows.iter().any(|row| row.len() != x.len()) {
+                    return Err(OptError::InvalidArgument {
+                        detail: format!(
+                            "hess_inv.matvec: x has length {}, expected {}",
+                            x.len(),
+                            rows.len()
+                        ),
+                    });
+                }
+                Ok(rows
+                    .iter()
+                    .map(|row| row.iter().zip(x).map(|(a, b)| a * b).sum())
+                    .collect())
+            }
+            Self::Lbfgs(operator) => operator.matvec(x),
+        }
+    }
+
+    /// The matrix itself (`hess_inv.todense()` for L-BFGS-B's operator).
+    #[must_use]
+    pub fn todense(&self) -> Vec<Vec<f64>> {
+        match self {
+            Self::Dense(rows) => rows.clone(),
+            Self::Lbfgs(operator) => operator.todense(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OptimizeResult {
     pub x: Vec<f64>,
@@ -85,7 +131,7 @@ pub struct OptimizeResult {
     pub nhev: usize,
     pub nit: usize,
     pub jac: Option<Vec<f64>>,
-    pub hess_inv: Option<Vec<Vec<f64>>>,
+    pub hess_inv: Option<HessInv>,
     pub maxcv: Option<f64>,
 }
 
@@ -118,6 +164,46 @@ pub type HessFunc = fn(&[f64]) -> Vec<Vec<f64>>;
 /// `None` means unbounded in that direction.
 pub type Bound = (Option<f64>, Option<f64>);
 
+/// SciPy's `minimize(..., options={...})`: the per-method solver options, with SciPy's names
+/// and defaults (frankenscipy-6ycp2). `None` is the method's default; each method reads the
+/// fields it accepts. As in SciPy, an option given here wins over `tol`, which only fills the
+/// options left unset. A field set for a method that does not accept it is SciPy's unknown
+/// solver option: Strict records a warning in the optimize trace and proceeds (SciPy warns and
+/// proceeds), Hardened refuses.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct MinimizeMethodOptions<'a> {
+    /// BFGS, CG, L-BFGS-B, trust-exact / trust-ncg / dogleg: the gradient-norm tolerance
+    /// (SciPy default 1e-5; 1e-8 for the trust-region methods).
+    pub gtol: Option<f64>,
+    /// BFGS, CG: the order of the gradient norm tested against `gtol` (default ∞).
+    pub norm: Option<f64>,
+    /// BFGS, CG: the Wolfe line search's sufficient-decrease constant (default 1e-4).
+    pub c1: Option<f64>,
+    /// BFGS, CG: the Wolfe line search's curvature constant (default 0.9 for BFGS, 0.4 for CG).
+    pub c2: Option<f64>,
+    /// BFGS: relative tolerance on the step in x (default 0).
+    pub xrtol: Option<f64>,
+    /// L-BFGS-B: the number of stored corrections (default 10).
+    pub maxcor: Option<usize>,
+    /// L-BFGS-B: the most line-search steps per iteration (default 20).
+    pub maxls: Option<usize>,
+    /// L-BFGS-B, Powell: the relative function-reduction tolerance (L-BFGS-B default
+    /// 2.22e-9, Powell 1e-4).
+    pub ftol: Option<f64>,
+    /// Powell: the relative x tolerance of the line searches (default 1e-4).
+    pub xtol: Option<f64>,
+    /// Nelder-Mead: the absolute x and f tolerances of the simplex (default 1e-4 each).
+    pub xatol: Option<f64>,
+    pub fatol: Option<f64>,
+    /// Nelder-Mead: dimension-dependent reflection / expansion / contraction / shrink
+    /// coefficients (Gao & Han 2012; default false).
+    pub adaptive: Option<bool>,
+    /// Nelder-Mead: the n + 1 starting vertices, replacing the one built around x0.
+    pub initial_simplex: Option<&'a [Vec<f64>]>,
+    /// Powell: the initial direction set, one direction per row (default the identity).
+    pub direc: Option<&'a [Vec<f64>]>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MinimizeOptions<'a> {
     pub method: Option<OptimizeMethod>,
@@ -142,6 +228,8 @@ pub struct MinimizeOptions<'a> {
     pub fixture_id: Option<&'static str>,
     pub seed: Option<u64>,
     pub mode: RuntimeMode,
+    /// SciPy `options={...}`, the per-method solver options.
+    pub method_options: MinimizeMethodOptions<'a>,
 }
 
 impl Default for MinimizeOptions<'_> {
@@ -162,6 +250,7 @@ impl Default for MinimizeOptions<'_> {
             fixture_id: None,
             seed: None,
             mode: RuntimeMode::Strict,
+            method_options: MinimizeMethodOptions::default(),
         }
     }
 }
