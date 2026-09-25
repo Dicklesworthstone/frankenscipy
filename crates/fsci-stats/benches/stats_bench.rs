@@ -581,7 +581,12 @@ fn bench_distribution_batch(c: &mut Criterion) {
     let bin_ks: Vec<u64> = (0..=2000).collect();
     group.bench_function("binomial/pmf_many", |b| b.iter(|| bin.pmf_many(&bin_ks)));
     group.bench_function("binomial/map_pmf", |b| {
-        b.iter(|| bin_ks.iter().map(|&k| bin.pmf(k as i64)).collect::<Vec<_>>())
+        b.iter(|| {
+            bin_ks
+                .iter()
+                .map(|&k| bin.pmf(k as i64))
+                .collect::<Vec<_>>()
+        })
     });
 
     // Negative binomial: parameter-only lnGamma/log terms hoisted across a long tail.
@@ -589,7 +594,12 @@ fn bench_distribution_batch(c: &mut Criterion) {
     let tail_ks: Vec<u64> = (0..n as u64).collect();
     group.bench_function("negbinom/pmf_many", |b| b.iter(|| nbin.pmf_many(&tail_ks)));
     group.bench_function("negbinom/map_pmf", |b| {
-        b.iter(|| tail_ks.iter().map(|&k| nbin.pmf(k as i64)).collect::<Vec<_>>())
+        b.iter(|| {
+            tail_ks
+                .iter()
+                .map(|&k| nbin.pmf(k as i64))
+                .collect::<Vec<_>>()
+        })
     });
 
     // Beta-binomial: 5 lgamma/point hoisted over a bounded support.
