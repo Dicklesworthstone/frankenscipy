@@ -1511,7 +1511,8 @@ impl ContinuousDistribution for StudentT {
     }
 
     fn mean(&self) -> f64 {
-        if self.df > 1.0 { 0.0 } else { f64::NAN }
+        // scipy.stats.t reports inf, not NaN, for df <= 1 (frankenscipy-szq1n.14 sweep).
+        if self.df > 1.0 { 0.0 } else { f64::INFINITY }
     }
 
     fn var(&self) -> f64 {
@@ -1641,8 +1642,12 @@ impl ContinuousDistribution for StudentT {
     }
 
     fn kurtosis(&self) -> f64 {
+        // scipy.stats.t: 6/(df-4) for df > 4, inf for 2 < df <= 4 (the fourth moment diverges
+        // while the variance exists), NaN for df <= 2 (frankenscipy-szq1n.14 sweep).
         if self.df > 4.0 {
             6.0 / (self.df - 4.0)
+        } else if self.df > 2.0 {
+            f64::INFINITY
         } else {
             f64::NAN
         }
@@ -68029,6 +68034,35 @@ mod tests {
         assert!(t.var().is_nan(), "t(1) has no finite variance");
     }
 
+    /// frankenscipy-szq1n.14 sweep: `scipy.stats.t(df).stats('mvsk')` (1.17.1) at every
+    /// threshold. The mean was NaN for df <= 1 and the kurtosis NaN for 2 < df <= 4, where SciPy
+    /// reports inf.
+    #[test]
+    fn student_t_moments_follow_scipy_at_every_df_threshold() {
+        let inf = f64::INFINITY;
+        let nan = f64::NAN;
+        for (df, m, v, s, k) in [
+            (0.5, inf, nan, nan, nan),
+            (1.0, inf, nan, nan, nan),
+            (1.5, 0.0, inf, nan, nan),
+            (2.0, 0.0, inf, nan, nan),
+            (2.5, 0.0, 5.0, nan, inf),
+            (3.0, 0.0, 3.0, nan, inf),
+            (4.0, 0.0, 2.0, 0.0, inf),
+            (4.5, 0.0, 1.8, 0.0, 12.0),
+        ] {
+            let t = StudentT::new(df);
+            let same = |got: f64, want: f64| {
+                (got.is_nan() && want.is_nan()) || got == want || (got - want).abs() <= 1e-14
+            };
+            let got = [t.mean(), t.var(), t.skewness(), t.kurtosis()];
+            assert!(
+                same(got[0], m) && same(got[1], v) && same(got[2], s) && same(got[3], k),
+                "t({df}) mvsk {got:?}, scipy [{m}, {v}, {s}, {k}]"
+            );
+        }
+    }
+
     // ── Chi-squared distribution ────────────────────────────────────
 
     #[test]
@@ -92287,9 +92321,18 @@ mod tests {
         let t10 = StudentT::new(10.0);
         assert_close(t10.kurtosis(), 1.0, 1e-10, "StudentT(10) kurtosis");
 
-        // df <= 4: undefined
+        // 2 < df <= 4: the fourth moment diverges; scipy.stats.t(3).stats('k') is inf
+        // (this asserted NaN until the szq1n.14 sweep). df <= 2: NaN, as in SciPy.
         let t3 = StudentT::new(3.0);
-        assert!(t3.kurtosis().is_nan(), "StudentT(3) kurtosis should be NaN");
+        assert_eq!(
+            t3.kurtosis(),
+            f64::INFINITY,
+            "StudentT(3) kurtosis should be inf"
+        );
+        assert!(
+            StudentT::new(2.0).kurtosis().is_nan(),
+            "StudentT(2) kurtosis should be NaN"
+        );
     }
 
     #[test]
