@@ -10,7 +10,7 @@
 //! cdf with the named `scipy.stats` distribution at several points. A wrong
 //! alias, or a wrong parameter convention behind a right one, fails here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::Stdio;
 
@@ -18,8 +18,8 @@ use fsci_stats::{
     Beta, Betabinom, Betanbinom, Binom, Burr, Chi2, ContinuousDistribution, Cosine,
     CosineDistribution, Dgamma, DiscreteDistribution, Dlaplace, Dweibull, Expon, Exponweib, F,
     Foldcauchy, Foldnorm, Gamma, Genexpon, Geom, GumbelL, GumbelR, HalfNormal, Halfnorm, Hypergeom,
-    Invgamma, Invgauss, LevyL, Lognorm, Logser, Nbinom, Ncf, Nct, Ncx2, Nhypergeom, Norm, T,
-    Triang, Truncnorm, WeibullMin,
+    Invgamma, Invgauss, LevyL, Lognorm, Logser, Nbinom, Ncf, NchypergeomFisher, Nct, Ncx2,
+    Nhypergeom, Norm, Reciprocal, T, Triang, Truncnorm, Wald, WeibullMin, rv_histogram,
 };
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,10 @@ fn cases() -> Vec<AliasCase> {
         eval,
     };
     let halfnorm: Halfnorm = HalfNormal;
+    // NoncentralHypergeomFisher has inherent pmf/cdf on usize, not the DiscreteDistribution trait.
+    let fisher = NchypergeomFisher::new(20, 7, 12, 2.5);
+    let nchypergeom_fisher: Eval =
+        Box::new(move |k| (fisher.pmf(k as usize), fisher.cdf(k as usize)));
     let cosine: Cosine = CosineDistribution;
     vec![
         c(
@@ -271,6 +275,36 @@ fn cases() -> Vec<AliasCase> {
             &[0.3, 1.5, 4.0],
             cont(WeibullMin::new(1.8, 1.5)),
         ),
+        c(
+            "Reciprocal",
+            "stats.reciprocal(0.5, 4)",
+            &[0.6, 1.5, 3.9],
+            cont(Reciprocal::new(0.5, 4.0)),
+        ),
+        // scipy.stats.wald has no shape parameter: it is invgauss with mu = 1.
+        c(
+            "Wald",
+            "stats.wald()",
+            &[0.2, 1.0, 3.0],
+            cont(Wald::new(1.0)),
+        ),
+        d(
+            "NchypergeomFisher",
+            "stats.nchypergeom_fisher(20, 7, 12, 2.5)",
+            &[2.0, 5.0, 7.0],
+            nchypergeom_fisher,
+        ),
+        c(
+            "rv_histogram",
+            // SciPy's default density=None means density=True (heights are densities, which
+            // matters with unequal bin widths); explicit here to silence its warning.
+            "stats.rv_histogram(([1.0, 3.0, 2.0], [0.0, 1.0, 2.5, 3.0]), density=True)",
+            &[0.5, 1.7, 2.9],
+            cont(
+                rv_histogram::new(&[1.0, 3.0, 2.0], &[0.0, 1.0, 2.5, 3.0], true)
+                    .expect("histogram"),
+            ),
+        ),
         c("Cosine", "stats.cosine()", &[-2.0, 0.0, 1.0], cont(cosine)),
         c(
             "Exponweib",
@@ -353,6 +387,40 @@ print(json.dumps(rows))
 
 fn close(actual: f64, expected: f64) -> bool {
     (actual - expected).abs() <= ABS_TOL + REL_TOL * expected.abs()
+}
+
+/// Every top-level `pub type` in fsci-stats is a SciPy-name alias with a row in `cases()`, so a
+/// new alias cannot land unguarded (br-szq1n.2 found three that had none: Reciprocal, Wald,
+/// NchypergeomFisher). Needs no SciPy.
+#[test]
+fn every_stats_alias_has_a_row() {
+    // Not distribution aliases: a trait-object alias and a result tuple.
+    const NOT_ALIASES: [&str; 2] = ["rv_continuous", "StatPValueMatrices"];
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../fsci-stats/src/lib.rs"
+    ))
+    .expect("read fsci-stats/src/lib.rs");
+    let aliases: Vec<&str> = src
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub type "))
+        .filter_map(|rest| rest.split([' ', '<', '=']).next())
+        .filter(|name| !NOT_ALIASES.contains(name))
+        .collect();
+    // Must-hit: a scan that finds nothing would pass the check below vacuously.
+    assert!(
+        aliases.len() >= 41,
+        "found only {} aliases; the scan is broken",
+        aliases.len()
+    );
+    let cases = cases();
+    let covered: HashSet<&str> = cases.iter().map(|c| c.alias).collect();
+    let missing: Vec<&str> = aliases
+        .iter()
+        .copied()
+        .filter(|a| !covered.contains(a))
+        .collect();
+    assert!(missing.is_empty(), "aliases without a row: {missing:?}");
 }
 
 #[test]
