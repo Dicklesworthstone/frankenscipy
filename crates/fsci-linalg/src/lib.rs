@@ -11119,7 +11119,7 @@ fn schur_parlett_complex(
     f: impl Fn(Complex<f64>) -> Complex<f64>,
 ) -> DMatrix<f64> {
     // f(A) = Q · Re(W F_tri Wᴴ) · Qᵀ.
-    let ft = schur_parlett_complex_schur_basis(t, n, f, false);
+    let ft = schur_parlett_complex_schur_basis(t, n, f, false).f_schur_basis;
     let mut ft_real = DMatrix::<f64>::zeros(n, n);
     for i in 0..n {
         for j in 0..n {
@@ -11143,7 +11143,7 @@ fn schur_parlett_complex_schur_basis(
     n: usize,
     f: impl Fn(Complex<f64>) -> Complex<f64>,
     scipy_confluent: bool,
-) -> DMatrix<Complex<f64>> {
+) -> SchurParlett {
     let zero = Complex::new(0.0, 0.0);
     let mut tc = DMatrix::<Complex<f64>>::from_element(n, n, zero);
     for i in 0..n {
@@ -11188,6 +11188,11 @@ fn schur_parlett_complex_schur_basis(
     for i in 0..n {
         fmat[(i, i)] = f(tt[(i, i)]);
     }
+    let mut min_separation = if n > 0 {
+        tt[(0, 0)].norm()
+    } else {
+        f64::INFINITY
+    };
     for j in 1..n {
         for i in (0..j).rev() {
             let mut sum = tt[(i, j)] * (fmat[(j, j)] - fmat[(i, i)]);
@@ -11195,6 +11200,7 @@ fn schur_parlett_complex_schur_basis(
                 sum += tt[(i, k)] * fmat[(k, j)] - fmat[(i, k)] * tt[(k, j)];
             }
             let denom = tt[(j, j)] - tt[(i, i)];
+            min_separation = min_separation.min(denom.norm());
             fmat[(i, j)] = if scipy_confluent {
                 if denom != zero { sum / denom } else { sum }
             } else if denom.norm() > 1e-300 {
@@ -11204,8 +11210,26 @@ fn schur_parlett_complex_schur_basis(
             };
         }
     }
+    let upper_norm1 = (1..n)
+        .map(|j| (0..j).map(|i| tt[(i, j)].norm()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
 
-    &w * &fmat * w.adjoint()
+    SchurParlett {
+        f_schur_basis: &w * &fmat * w.adjoint(),
+        min_separation,
+        upper_norm1,
+    }
+}
+
+/// [`schur_parlett_complex_schur_basis`]'s result: `f(T)` in the Schur basis, plus the two
+/// inputs of SciPy's `funm` error estimate.
+struct SchurParlett {
+    f_schur_basis: DMatrix<Complex<f64>>,
+    /// Smallest `|T[j,j] - T[i,i]|` the recurrence divided by, seeded with `|T[0,0]|` as
+    /// SciPy's `minden` is.
+    min_separation: f64,
+    /// 1-norm of the strictly upper triangle of the complex triangular factor.
+    upper_norm1: f64,
 }
 
 /// Matrix function `f(A)` of a real square matrix, matching
@@ -11226,19 +11250,53 @@ fn schur_parlett_complex_schur_basis(
 /// br-szq1n.6: this used to take `Fn(f64) -> f64` and evaluate it on the REAL
 /// Schur diagonal, which is wrong (or NaN) whenever `A` has complex eigenvalues:
 /// the 2×2 real-Schur blocks were treated as if `func(t[i,i])` were `f(λ)`.
+///
+/// When SciPy's error estimate (see [`funm_with_error`]) exceeds `1000·eps`, the
+/// warning SciPy prints ("funm result may be inaccurate, approximate err = ...")
+/// is emitted as a trace, so a confluent spectrum does not pass silently.
 pub fn funm(
     a: &[Vec<f64>],
     func: impl Fn(Complex<f64>) -> Complex<f64>,
     options: DecompOptions,
 ) -> Result<Vec<Vec<f64>>, LinalgError> {
+    let (f, err) = funm_with_error(a, func, options)?;
+    if err > 1000.0 * f64::EPSILON {
+        emit_trace(LinalgTrace {
+            operation: "funm",
+            matrix_size: (f.len(), f.len()),
+            mode: options.mode,
+            rcond: None,
+            warning: Some(format!(
+                "funm result may be inaccurate, approximate err = {err:e}"
+            )),
+            error: None,
+        });
+    }
+    Ok(f)
+}
+
+/// `scipy.linalg.funm(A, func, disp=False)`: `f(A)` with SciPy's error estimate
+/// `err = min(1, max(eps, eps/minden · ‖triu(T, 1)‖₁))`, where `T` is the complex
+/// Schur factor and `minden` the smallest `|T[j,j] - T[i,i]|` the Parlett
+/// recurrence divided by, seeded with `|T[0,0]|` (0 is replaced by eps), and
+/// `err = inf` when every entry of `f(A)` is non-finite. A repeated eigenvalue
+/// the recurrence cannot resolve gives `err = 1` (frankenscipy-szq1n.6: the value
+/// was wrong and nothing said so). The estimate depends on the Schur form's
+/// eigenvalue order through `|T[0,0]|`, as SciPy's does.
+pub fn funm_with_error(
+    a: &[Vec<f64>],
+    func: impl Fn(Complex<f64>) -> Complex<f64>,
+    options: DecompOptions,
+) -> Result<(Vec<Vec<f64>>, f64), LinalgError> {
     let matrix = validated_square_dmatrix(a, options)?;
     let n = matrix.nrows();
     if n == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), f64::EPSILON));
     }
     let schur = bounded_schur(matrix)?;
     let (q, t) = schur.unpack();
-    let ft = schur_parlett_complex_schur_basis(&t, n, func, true);
+    let parlett = schur_parlett_complex_schur_basis(&t, n, func, true);
+    let ft = &parlett.f_schur_basis;
     let mut ft_re = DMatrix::<f64>::zeros(n, n);
     let mut ft_im = DMatrix::<f64>::zeros(n, n);
     for i in 0..n {
@@ -11260,7 +11318,21 @@ pub fn funm(
             ),
         });
     }
-    Ok(rows_from_dmatrix(&(&q * ft_re * q.transpose())))
+    let f = &q * ft_re * q.transpose();
+    let eps = f64::EPSILON;
+    let min_separation = if parlett.min_separation == 0.0 {
+        eps
+    } else {
+        parlett.min_separation
+    };
+    let err = if f.iter().all(|v| !v.is_finite()) {
+        f64::INFINITY
+    } else {
+        (eps / min_separation * parlett.upper_norm1)
+            .max(eps)
+            .min(1.0)
+    };
+    Ok((rows_from_dmatrix(&f), err))
 }
 
 /// General logm for non-symmetric matrices. A real spectrum (no 2×2 Schur
@@ -43619,6 +43691,48 @@ mod proptest_tests {
             matches!(err, LinalgError::InvalidArgument { .. }),
             "{err:?}"
         );
+    }
+
+    /// frankenscipy-szq1n.6: the confluent value above is wrong, and SciPy says so with
+    /// `funm(A, func, disp=False)`'s error estimate. Every expected err is live SciPy 1.17.1
+    /// (these inputs are triangular or normal, so both Schur forms keep SciPy's T).
+    #[test]
+    fn funm_error_estimate_flags_what_the_recurrence_cannot_resolve() {
+        let estimate = |a: &[Vec<f64>]| {
+            funm_with_error(a, |z| z.exp(), DecompOptions::default())
+                .expect("funm_with_error")
+                .1
+        };
+        let eps = f64::EPSILON;
+        // Repeated eigenvalues: err = 1 (min(1, ...) with minden = 0 -> eps).
+        assert_eq!(estimate(&[vec![1.0, 1.0], vec![0.0, 1.0]]), 1.0);
+        assert_eq!(
+            estimate(&[
+                vec![2.0, 1.0, 0.0],
+                vec![0.0, 2.0, 1.0],
+                vec![0.0, 0.0, 2.0],
+            ]),
+            1.0
+        );
+        // Nearly repeated: eps / 1e-9 * ||triu(T,1)||_1. SciPy 2.2204458655297983e-07.
+        let near = estimate(&[vec![1.0, 1.0], vec![0.0, 1.0 + 1e-9]]);
+        assert!((near - 2.2204458655297983e-07).abs() <= 1e-15, "{near:e}");
+        // Well separated: SciPy 4.440892098500626e-16 (eps / 1 * 2) and eps.
+        assert_eq!(estimate(&[vec![1.0, 2.0], vec![0.0, 3.0]]), 2.0 * eps);
+        assert_eq!(estimate(&[vec![0.0, -1.0], vec![1.0, 0.0]]), eps);
+        // SciPy's seed quirk, kept: |T[0,0]| = 0 counts as a zero separation.
+        assert_eq!(estimate(&[vec![0.0, 1.0], vec![0.0, 2.0]]), 1.0);
+        // The value itself is unchanged by the estimate.
+        let (f, _) = funm_with_error(
+            &[vec![0.0, -1.0], vec![1.0, 0.0]],
+            |z| z.exp(),
+            DecompOptions::default(),
+        )
+        .expect("rotation");
+        let (c, s) = (1.0_f64.cos(), 1.0_f64.sin());
+        for (got, want) in f.iter().flatten().zip([c, -s, s, c]) {
+            assert!((got - want).abs() <= 1e-14, "{got} vs {want}");
+        }
     }
 
     #[test]
