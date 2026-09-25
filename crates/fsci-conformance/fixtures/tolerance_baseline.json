@@ -557,6 +557,11 @@
   "diff_opt_numerical_grad_jac_hess.rs": {
     "ABS_TOL": 0.0001
   },
+  "diff_opt_powell.rs": {
+    "ROSEN_TOL6_ABS_TOL": 1e-10,
+    "SCALE_INVARIANCE_TOL": 0.0001,
+    "X_ABS_TOL": 1e-8
+  },
   "diff_opt_projected_gradient_descent.rs": {},
   "diff_opt_root_brenth_ridder_toms748.rs": {
     "RESID_ABS_TOL": 1e-10,
@@ -793,6 +798,9 @@
   },
   "diff_signal_preemphasis_db_xcorr.rs": {
     "ABS_TOL": 1e-12
+  },
+  "diff_signal_remez_even.rs": {
+    "REMEZ_TAP_TOL": 1e-10
   },
   "diff_signal_resample.rs": {
     "ABS_TOL": 1e-10
@@ -2158,6 +2166,9 @@
   },
   "diff_stats_polynomial_regression.rs": {
     "ABS_TOL": 1e-9
+  },
+  "diff_stats_power.rs": {
+    "POWER_SE_TOL": 3.0
   },
   "diff_stats_power_divergence.rs": {
     "ABS_TOL": 1e-9
