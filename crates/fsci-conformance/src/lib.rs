@@ -19177,6 +19177,7 @@ mod pinned_oracle_tests {
             numpy_version: numpy.to_string(),
             fsci_loaded: false,
             executable: "/fake/python3".to_string(),
+            blas_core: "unknown".to_string(),
             probe_trail: Vec::new(),
         }
     }

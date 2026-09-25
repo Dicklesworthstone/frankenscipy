@@ -312,7 +312,13 @@ fn run_solve_with_casp_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) 
                 d,
                 d < tol && has_certificate,
                 format!("{:?}", scipy.x),
-                format!("{:?} (cert={})", rust.x, has_certificate),
+                format!(
+                    "{:?} (cert={}, action={:?}, fallback={:?})",
+                    rust.x,
+                    has_certificate,
+                    rust.certificate.as_ref().map(|c| c.action),
+                    rust.certificate.as_ref().map(|c| c.fallback_active)
+                ),
             )
         }
         (Err(e), None) => (0.0, true, "error".into(), format!("{:?}", e)),
@@ -348,7 +354,14 @@ fn run_solve_with_casp_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) 
     } else {
         eprintln!("  FAIL: {} — diff={:.2e}", test_id, diff);
     }
-    assert!(pass, "Differential test {} failed: diff={}", test_id, diff);
+    // Both vectors in the failure: on an ill-conditioned matrix SciPy's own answer moves with
+    // the OpenBLAS kernel (named on the `scipy_incumbent` line), so a CI failure must show
+    // which side moved.
+    assert!(
+        pass,
+        "Differential test {} failed: diff={}; scipy={}; fsci={}",
+        test_id, diff, log.expected, log.actual
+    );
 }
 
 fn run_solve_with_audit_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64) {
@@ -379,8 +392,12 @@ fn run_solve_with_audit_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64)
                 d < tol && has_certificate && recorded_audit,
                 format!("{:?}", scipy.x),
                 format!(
-                    "{:?} (cert={}, audit_recorded={})",
-                    rust.x, has_certificate, recorded_audit
+                    "{:?} (cert={}, action={:?}, fallback={:?}, audit_recorded={})",
+                    rust.x,
+                    has_certificate,
+                    rust.certificate.as_ref().map(|c| c.action),
+                    rust.certificate.as_ref().map(|c| c.fallback_active),
+                    recorded_audit
                 ),
             )
         }
@@ -424,8 +441,8 @@ fn run_solve_with_audit_diff(test_id: &str, a: &[Vec<f64>], b: &[f64], tol: f64)
     }
     assert!(
         pass,
-        "Differential test {} failed: diff={}, audit_recorded={}",
-        test_id, diff, recorded_audit
+        "Differential test {} failed: diff={}, audit_recorded={}; scipy={}; fsci={}",
+        test_id, diff, recorded_audit, log.expected, log.actual
     );
 }
 

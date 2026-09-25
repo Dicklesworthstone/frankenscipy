@@ -116,9 +116,34 @@ else:
     _fsci = any(
         name.startswith("fsci") or name.startswith("franken") for name in sys.modules
     )
+    # The OpenBLAS kernel SciPy's own bundled OpenBLAS selected on this CPU. SciPy's answers
+    # on ill-conditioned inputs move with it, so a row is only comparable to rows on the same
+    # kernel. Best effort: "unknown" when the library or symbol is not found.
+    _blas = "unknown"
+    try:
+        import ctypes
+        import glob
+        import os
+        import scipy.linalg
+
+        _root = os.path.dirname(os.path.dirname(scipy.__file__))
+        _paths = sorted(glob.glob(os.path.join(_root, "scipy.libs", "*openblas*")))
+        _paths += sorted(glob.glob(os.path.join(_root, "scipy_openblas*", "lib", "*.so*")))
+        for _path in _paths:
+            _lib = ctypes.CDLL(_path)
+            for _symbol in ("scipy_openblas_get_corename", "openblas_get_corename"):
+                _get = getattr(_lib, _symbol, None)
+                if _get is not None:
+                    _get.restype = ctypes.c_char_p
+                    _blas = _get().decode().replace(" ", "_") or "unknown"
+                    break
+            if _blas != "unknown":
+                break
+    except BaseException:
+        pass
     sys.stdout.write(
-        "FSCI_PROBE ok=1 scipy=%s numpy=%s fsci_loaded=%s executable=%s\n"
-        % (scipy.__version__, numpy.__version__, int(_fsci), sys.executable)
+        "FSCI_PROBE ok=1 scipy=%s numpy=%s fsci_loaded=%s blas=%s executable=%s\n"
+        % (scipy.__version__, numpy.__version__, int(_fsci), _blas, sys.executable)
     )
 sys.stdout.flush()
 "#;
@@ -142,6 +167,10 @@ pub struct ScipyIncumbent {
     pub fsci_loaded: bool,
     /// Interpreter's own `sys.executable`, which is not always the path we invoked.
     pub executable: String,
+    /// The OpenBLAS kernel (`openblas_get_corename`) SciPy's bundled OpenBLAS selected on this
+    /// CPU, or `"unknown"`. SciPy's own answers on ill-conditioned problems differ between
+    /// kernels, so provenance names it.
+    pub blas_core: String,
     /// Every `(interpreter, pythonpath) -> outcome` pair the resolver tried, in order.
     pub probe_trail: Vec<String>,
 }
@@ -190,13 +219,14 @@ impl ScipyIncumbent {
     pub fn provenance_line(&self) -> String {
         format!(
             "scipy_incumbent: python={} pythonpath={} scipy={} numpy={} fsci_loaded={} \
-             genuine={} pinned_scipy={PINNED_SCIPY} pinned_numpy={PINNED_NUMPY}",
+             genuine={} pinned_scipy={PINNED_SCIPY} pinned_numpy={PINNED_NUMPY} blas={}",
             self.python,
             self.pythonpath.as_deref().unwrap_or("<default>"),
             self.scipy_version,
             self.numpy_version,
             self.fsci_loaded,
             self.genuine(),
+            self.blas_core,
         )
     }
 
@@ -298,6 +328,7 @@ impl ScipyIncumbent {
                             numpy_version: report.numpy_version,
                             fsci_loaded: report.fsci_loaded,
                             executable: report.executable,
+                            blas_core: report.blas_core,
                             probe_trail,
                         });
                     }
@@ -359,6 +390,7 @@ struct ProbeReport {
     numpy_version: String,
     fsci_loaded: bool,
     executable: String,
+    blas_core: String,
 }
 
 fn probe(
@@ -413,6 +445,7 @@ fn parse_probe_line(line: &str) -> Result<ProbeReport, String> {
         numpy_version: (*fields.get("numpy").ok_or("probe-line-missing-numpy")?).to_string(),
         fsci_loaded: fields.get("fsci_loaded").copied() == Some("1"),
         executable: (*fields.get("executable").unwrap_or(&"<unknown>")).to_string(),
+        blas_core: (*fields.get("blas").unwrap_or(&"unknown")).to_string(),
     })
 }
 
@@ -429,6 +462,7 @@ mod tests {
             numpy_version: numpy.to_string(),
             fsci_loaded,
             executable: "python3.13".to_string(),
+            blas_core: "Haswell".to_string(),
             probe_trail: Vec::new(),
         }
     }
@@ -485,6 +519,14 @@ mod tests {
         assert_eq!(good.scipy_version, "1.17.1");
         assert_eq!(good.numpy_version, "2.4.3");
         assert!(!good.fsci_loaded);
+        // An older probe line carries no `blas=`; the kernel is then unknown, not guessed.
+        assert_eq!(good.blas_core, "unknown");
+        let with_kernel = parse_probe_line(
+            "FSCI_PROBE ok=1 scipy=1.17.1 numpy=2.4.3 fsci_loaded=0 blas=SkylakeX \
+             executable=/bin/python3.13",
+        )
+        .expect("well-formed report");
+        assert_eq!(with_kernel.blas_core, "SkylakeX");
 
         let contaminated = parse_probe_line(
             "FSCI_PROBE ok=1 scipy=1.17.1 numpy=2.4.3 fsci_loaded=1 executable=/bin/python3.13",
