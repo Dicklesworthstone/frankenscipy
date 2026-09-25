@@ -2970,8 +2970,55 @@ fn dispatch_solve_action(
 
 /// Backward error above which an attempt that returned `Ok` still counts as a FAILED attempt:
 /// the portfolio records it as `Inaccurate` and the next action is tried. Same bar as the
-/// drift counter and the full-validation policy.
-const ATTEMPT_BACKWARD_ERROR_TOL: f64 = POLICY_FULL_VALIDATION_BACKWARD_ERROR_THRESHOLD;
+/// drift counter and the full-validation policy, and the bar the CASP loss calibration counts
+/// failures against (frankenscipy-7tb8d.2).
+pub const ATTEMPT_BACKWARD_ERROR_TOL: f64 = POLICY_FULL_VALIDATION_BACKWARD_ERROR_THRESHOLD;
+
+/// Solve `A·x = b` with exactly one CASP action, bypassing the portfolio's choice
+/// (frankenscipy-7tb8d.2): the loss calibration measures every action on every matrix through
+/// it, and a caller who knows which factorization they want can ask for it. The structure is
+/// detected as `solve` detects it for `assume_a=None`; an action that structure does not admit
+/// (a triangular solve of a full matrix) is `NotSupported`. The result carries the action's
+/// backward error and no certificate.
+pub fn solve_with_action(
+    a: &[Vec<f64>],
+    b: &[f64],
+    action: SolverAction,
+) -> Result<SolveResult, LinalgError> {
+    let (rows, cols) = matrix_shape(a)?;
+    if rows != cols {
+        return Err(LinalgError::ExpectedSquareMatrix);
+    }
+    if b.len() != rows {
+        return Err(LinalgError::IncompatibleShapes {
+            a_shape: (rows, cols),
+            b_len: b.len(),
+        });
+    }
+    validate_finite_matrix_and_vector(a, b, RuntimeMode::Strict, true)?;
+    let ConditionDiagnosticsWork {
+        report,
+        mut matrix_cache,
+        mut lu_cache,
+    } = condition_diagnostics_for_solve(a, None)?;
+    if !candidate_actions(report.structural_evidence).contains(&action) {
+        return Err(LinalgError::NotSupported {
+            detail: format!(
+                "{action:?} does not apply to a matrix with {:?} structure",
+                report.structural_evidence
+            ),
+        });
+    }
+    dispatch_solve_action(
+        action,
+        a,
+        b,
+        &report,
+        SymmetricFactorization::new(None, false),
+        &mut matrix_cache,
+        &mut lu_cache,
+    )
+}
 
 /// Try portfolio actions until one returns an accurate solution; returns the action that
 /// produced the result (or `selected_action` when every attempt errored).
@@ -29906,56 +29953,48 @@ mod tests {
 
     // The posterior's own choice is observable in Hardened mode; Strict tries SciPy's LU first
     // (frankenscipy-7tb8d.14, `strict_solve_and_inv_try_scipys_lu_first`). Non-symmetric, so
-    // the evidence is General rather than the Cholesky-first Symmetric.
+    // the evidence is General rather than the Cholesky-first Symmetric. Under the calibrated
+    // losses (frankenscipy-7tb8d.2) that choice is LU at moderate and at ill conditioning,
+    // where the hand-set matrix took QR and the SVD, and LU's backward error passes on both.
     #[test]
-    fn casp_selects_qr_for_moderate_condition() {
-        let a = vec![vec![1.0, 1.0], vec![1.0001, 1.0]];
-        let b = vec![1.0, -1.0];
-        let report = condition_diagnostics(&a).expect("condition diagnostics");
-        assert!(
-            report.rcond_estimate < 1e-2 && report.rcond_estimate > 1e-6,
-            "expected moderate rcond, got {}",
-            report.rcond_estimate
-        );
-        assert_eq!(report.structural_evidence, StructuralEvidence::General);
+    fn hardened_casp_takes_lu_at_moderate_and_ill_conditioning() {
         let hardened = SolveOptions {
             mode: RuntimeMode::Hardened,
             ..SolveOptions::default()
         };
-        let result = solve(&a, &b, hardened).expect("solve works");
-        let certificate = result.certificate.expect("certificate populated");
-        assert_eq!(certificate.action, SolverAction::PivotedQR);
-        assert!(!certificate.fallback_active);
-        assert_certificate_populated(&certificate);
-    }
-
-    #[test]
-    fn casp_selects_svd_for_ill_conditioned() {
-        let a = vec![vec![1.0, 1.0], vec![1.0 + 1e-12, 1.0]];
         let b = vec![1.0, -1.0];
-        let report = condition_diagnostics(&a).expect("condition diagnostics");
-        assert!(
-            report.rcond_estimate < 1e-9,
-            "expected ill-conditioned rcond, got {}",
-            report.rcond_estimate
-        );
-        assert_eq!(report.structural_evidence, StructuralEvidence::General);
-        let hardened = SolveOptions {
-            mode: RuntimeMode::Hardened,
-            ..SolveOptions::default()
-        };
-        let result = solve(&a, &b, hardened).expect("solve works");
-        let certificate = result.certificate.expect("certificate populated");
-        assert_eq!(certificate.action, SolverAction::SVDFallback);
-        assert!(!certificate.fallback_active);
-        assert_certificate_populated(&certificate);
+        for (a, low, high) in [
+            (vec![vec![1.0, 1.0], vec![1.0001, 1.0]], 1e-6, 1e-2),
+            (vec![vec![1.0, 1.0], vec![1.0 + 1e-12, 1.0]], 0.0, 1e-9),
+        ] {
+            let report = condition_diagnostics(&a).expect("condition diagnostics");
+            assert!(
+                report.rcond_estimate > low && report.rcond_estimate < high,
+                "rcond {} outside ({low:e}, {high:e})",
+                report.rcond_estimate
+            );
+            assert_eq!(report.structural_evidence, StructuralEvidence::General);
+            let result = solve(&a, &b, hardened).expect("solve works");
+            assert!(
+                result
+                    .backward_error
+                    .is_some_and(|omega| omega <= ATTEMPT_BACKWARD_ERROR_TOL),
+                "{:?}",
+                result.backward_error
+            );
+            let certificate = result.certificate.expect("certificate populated");
+            assert_eq!(certificate.action, SolverAction::DirectLU);
+            assert!(!certificate.fallback_active);
+            assert_certificate_populated(&certificate);
+        }
     }
 
     /// frankenscipy-7tb8d.14. On a NON-symmetric matrix `scipy.linalg.solve` / `inv` (default
     /// `assume_a=None`) factor with LU at every conditioning — SciPy 1.17.1's default answer is
-    /// bit-identical to `assume_a='gen'` on both matrices below. Where the posterior prefers QR
-    /// (rcond 2.5e-5) or SVD (rcond 2.5e-13), Strict mode must still answer with LU when LU's
-    /// certificate passes. (A symmetric matrix is SciPy's Cholesky path instead —
+    /// bit-identical to `assume_a='gen'` on both matrices below. Where the portfolio prefers
+    /// something else (here the SVD, once its calibrator has drifted), Strict mode must still
+    /// answer with LU when LU's certificate passes. (A symmetric matrix is SciPy's Cholesky path
+    /// instead —
     /// `strict_symmetric_solve_and_inv_take_scipys_cholesky`.)
     #[test]
     fn strict_solve_and_inv_try_scipys_lu_first() {
@@ -29971,8 +30010,15 @@ mod tests {
                 .select_action(rcond, Some(StructuralEvidence::General))
                 .0
         };
-        // Negative arm: the posterior alone would not pick LU on either matrix.
-        assert_eq!(posterior(&moderate, &portfolio), SolverAction::PivotedQR);
+        // Negative arm: the portfolio alone would not pick LU. Under the calibrated losses
+        // (frankenscipy-7tb8d.2) its own choice is LU at every conditioning, so the case where
+        // it disagrees with SciPy is the drift override: once the calibrator sees its accepted
+        // answers miss, it sends every decision to the SVD.
+        for _ in 0..20 {
+            portfolio.observe_backward_error(1.0);
+        }
+        assert!(portfolio.calibrator().should_fallback());
+        assert_eq!(posterior(&moderate, &portfolio), SolverAction::SVDFallback);
         assert_eq!(posterior(&severe, &portfolio), SolverAction::SVDFallback);
 
         let strict = solve_with_casp(&moderate, &b, SolveOptions::default(), &mut portfolio)

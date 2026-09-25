@@ -1,135 +1,135 @@
 {
-  "generated_at": "unix:1779662458",
+  "generated_at": "unix:1790338395",
   "operation_benchmarks": [
     {
       "operation": "policy_decide",
       "input_desc": "strict_benign",
       "iterations": 100,
-      "median_ns": 1252,
-      "p95_ns": 1553,
-      "min_ns": 1222,
-      "max_ns": 5821,
-      "mean_ns": 1360
+      "median_ns": 1143,
+      "p95_ns": 3655,
+      "min_ns": 1051,
+      "max_ns": 22744,
+      "mean_ns": 1694
     },
     {
       "operation": "policy_decide",
       "input_desc": "strict_high_risk",
       "iterations": 100,
-      "median_ns": 1553,
-      "p95_ns": 1683,
-      "min_ns": 1493,
-      "max_ns": 1793,
-      "mean_ns": 1569
+      "median_ns": 1602,
+      "p95_ns": 6591,
+      "min_ns": 1362,
+      "max_ns": 83316,
+      "mean_ns": 2826
     },
     {
       "operation": "policy_decide",
       "input_desc": "hardened_benign",
       "iterations": 100,
-      "median_ns": 1062,
-      "p95_ns": 1383,
-      "min_ns": 1031,
-      "max_ns": 1903,
-      "mean_ns": 1156
+      "median_ns": 1222,
+      "p95_ns": 4086,
+      "min_ns": 1111,
+      "max_ns": 6299,
+      "mean_ns": 1548
     },
     {
       "operation": "solver_select",
       "input_desc": "WellConditioned",
       "iterations": 100,
-      "median_ns": 631,
-      "p95_ns": 641,
-      "min_ns": 631,
-      "max_ns": 691,
-      "mean_ns": 633
+      "median_ns": 852,
+      "p95_ns": 1482,
+      "min_ns": 800,
+      "max_ns": 2213,
+      "mean_ns": 917
     },
     {
       "operation": "solver_select",
       "input_desc": "ModerateCondition",
       "iterations": 100,
-      "median_ns": 661,
-      "p95_ns": 672,
-      "min_ns": 641,
-      "max_ns": 701,
-      "mean_ns": 658
+      "median_ns": 882,
+      "p95_ns": 1041,
+      "min_ns": 831,
+      "max_ns": 2754,
+      "mean_ns": 930
     },
     {
       "operation": "solver_select",
       "input_desc": "IllConditioned",
       "iterations": 100,
-      "median_ns": 652,
-      "p95_ns": 662,
-      "min_ns": 651,
-      "max_ns": 682,
-      "mean_ns": 655
+      "median_ns": 901,
+      "p95_ns": 1702,
+      "min_ns": 842,
+      "max_ns": 2544,
+      "mean_ns": 970
     },
     {
       "operation": "solver_select",
       "input_desc": "NearSingular",
       "iterations": 100,
-      "median_ns": 631,
-      "p95_ns": 632,
-      "min_ns": 621,
-      "max_ns": 691,
-      "mean_ns": 629
+      "median_ns": 861,
+      "p95_ns": 1492,
+      "min_ns": 810,
+      "max_ns": 2243,
+      "mean_ns": 922
     },
     {
       "operation": "calibrator_observe",
       "input_desc": "10_observations",
       "iterations": 100,
-      "median_ns": 251,
-      "p95_ns": 281,
-      "min_ns": 170,
-      "max_ns": 320,
-      "mean_ns": 245
+      "median_ns": 300,
+      "p95_ns": 370,
+      "min_ns": 199,
+      "max_ns": 431,
+      "mean_ns": 291
     },
     {
       "operation": "calibrator_observe",
       "input_desc": "100_observations",
       "iterations": 100,
-      "median_ns": 2285,
-      "p95_ns": 2335,
-      "min_ns": 2264,
-      "max_ns": 2365,
-      "mean_ns": 2292
+      "median_ns": 2584,
+      "p95_ns": 3025,
+      "min_ns": 2364,
+      "max_ns": 3094,
+      "mean_ns": 2632
     },
     {
       "operation": "calibrator_observe",
       "input_desc": "500_observations",
       "iterations": 100,
-      "median_ns": 10810,
-      "p95_ns": 11382,
-      "min_ns": 10740,
-      "max_ns": 19897,
-      "mean_ns": 10997
+      "median_ns": 13600,
+      "p95_ns": 14762,
+      "min_ns": 12699,
+      "max_ns": 25488,
+      "mean_ns": 13723
     },
     {
       "operation": "calibrator_fallback_check",
       "input_desc": "100_obs",
       "iterations": 100,
-      "median_ns": 30,
-      "p95_ns": 31,
-      "min_ns": 20,
-      "max_ns": 31,
-      "mean_ns": 28
+      "median_ns": 40,
+      "p95_ns": 50,
+      "min_ns": 29,
+      "max_ns": 80,
+      "mean_ns": 38
     },
     {
       "operation": "signal_create",
       "input_desc": "new(8.0,0.5,0.3)",
       "iterations": 100,
-      "median_ns": 20,
-      "p95_ns": 30,
-      "min_ns": 20,
-      "max_ns": 50,
-      "mean_ns": 23
+      "median_ns": 30,
+      "p95_ns": 31,
+      "min_ns": 19,
+      "max_ns": 121,
+      "mean_ns": 28
     },
     {
       "operation": "portfolio_serialize",
       "input_desc": "jsonl_2entries",
       "iterations": 100,
-      "median_ns": 60,
-      "p95_ns": 70,
-      "min_ns": 50,
-      "max_ns": 81,
-      "mean_ns": 56
+      "median_ns": 90,
+      "p95_ns": 150,
+      "min_ns": 70,
+      "max_ns": 190,
+      "mean_ns": 98
     }
   ],
   "hotspot_ranking": [
@@ -137,43 +137,43 @@
       "rank": 1,
       "operation": "calibrator_observe",
       "input_desc": "500_observations",
-      "median_ns": 10810,
-      "fraction_of_total": 0.8570522476809641
+      "median_ns": 13600,
+      "fraction_of_total": 0.8584232784194913
     },
     {
       "rank": 2,
       "operation": "policy_decide",
       "input_desc": "hardened_benign",
-      "median_ns": 1062,
-      "fraction_of_total": 0.08419884246412432
+      "median_ns": 1222,
+      "fraction_of_total": 0.07713185634033959
     },
     {
       "rank": 3,
       "operation": "solver_select",
       "input_desc": "NearSingular",
-      "median_ns": 631,
-      "fraction_of_total": 0.05002774914770475
+      "median_ns": 861,
+      "fraction_of_total": 0.054345767846998676
     },
     {
       "rank": 4,
       "operation": "portfolio_serialize",
       "input_desc": "jsonl_2entries",
-      "median_ns": 60,
-      "fraction_of_total": 0.004756996749385555
+      "median_ns": 90,
+      "fraction_of_total": 0.005680742283658398
     },
     {
       "rank": 5,
       "operation": "calibrator_fallback_check",
       "input_desc": "100_obs",
-      "median_ns": 30,
-      "fraction_of_total": 0.0023784983746927774
+      "median_ns": 40,
+      "fraction_of_total": 0.0025247743482926213
     },
     {
       "rank": 6,
       "operation": "signal_create",
       "input_desc": "new(8.0,0.5,0.3)",
-      "median_ns": 20,
-      "fraction_of_total": 0.0015856655831285181
+      "median_ns": 30,
+      "fraction_of_total": 0.0018935807612194661
     }
   ],
   "memory_notes": [
@@ -204,9 +204,9 @@
         "note": "action=DirectLU"
       },
       {
-        "operation": "ill_conditioned_svd",
+        "operation": "ill_conditioned_lu",
         "passes": true,
-        "note": "action=SVDFallback"
+        "note": "action=DirectLU losses=[1.0, 2.0, 31.821903845312676, 0.0, 0.0, 0.5]"
       },
       {
         "operation": "calibrator_initial_no_fallback",

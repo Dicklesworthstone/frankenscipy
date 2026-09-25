@@ -271,35 +271,40 @@ fn check_portfolio_well_conditioned() -> ParityGate {
     }
 }
 
-/// Verify that moderate-condition state selects PivotedQR.
+/// Verify that the moderate-condition state selects DirectLU, with PivotedQR next. The
+/// calibrated losses (frankenscipy-7tb8d.2) rank LU first at every conditioning; the hand-set
+/// matrix sent this state to QR.
 fn check_portfolio_moderate() -> ParityGate {
     let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
     let (action, _, losses, _) = portfolio.select_action(1e-6, None);
 
-    let pass = action == SolverAction::PivotedQR;
+    let pass = action == SolverAction::DirectLU
+        && losses[SolverAction::PivotedQR.index()] < losses[SolverAction::SVDFallback.index()];
 
     ParityGate {
         fixture_id: "portfolio_moderate_condition".into(),
         subsystem: "solver_portfolio",
         pass,
-        description: "ModerateCondition → PivotedQR".into(),
+        description: "ModerateCondition → DirectLU, PivotedQR next (calibrated)".into(),
         detail: format!("action={action:?}, losses={losses:?}"),
     }
 }
 
-/// Verify that ill-conditioned and near-singular states select SVDFallback.
+/// Verify that the ill-conditioned and near-singular states select DirectLU too. Measured, the
+/// SVD fallback's truncation fails the acceptance test there most often, so it has the largest
+/// loss of the general solvers (frankenscipy-7tb8d.2).
 fn check_portfolio_ill_conditioned() -> ParityGate {
     let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
     let (action_ill, _, _, _) = portfolio.select_action(1e-12, None);
     let (action_near, _, _, _) = portfolio.select_action(1e-18, None);
 
-    let pass = action_ill == SolverAction::SVDFallback && action_near == SolverAction::SVDFallback;
+    let pass = action_ill == SolverAction::DirectLU && action_near == SolverAction::DirectLU;
 
     ParityGate {
         fixture_id: "portfolio_ill_and_near_singular".into(),
         subsystem: "solver_portfolio",
         pass,
-        description: "IllConditioned/NearSingular → SVDFallback".into(),
+        description: "IllConditioned/NearSingular → DirectLU (calibrated)".into(),
         detail: format!("ill={action_ill:?}, near_singular={action_near:?}"),
     }
 }
@@ -360,32 +365,26 @@ fn check_loss_matrix_properties() -> ParityGate {
         detail_parts.push("negative loss value found".to_string());
     }
 
-    // Property 2: SVDFallback should have lowest loss for ill-conditioned states
-    let svd_idx = SolverAction::SVDFallback.index();
-    for &col in &[2, 3] {
-        // IllConditioned=2, NearSingular=3
-        let svd_loss = lm[svd_idx][col];
-        for (row_idx, row) in lm.iter().enumerate().take(3) {
-            if row[col] < svd_loss && row_idx != svd_idx {
-                pass = false;
-                detail_parts.push(format!(
-                    "action {row_idx} has lower loss than SVD in column {col}"
-                ));
-            }
-        }
-    }
-
-    // Property 3: DirectLU should have lowest loss for well-conditioned state
-    let lu_well = lm[SolverAction::DirectLU.index()][0];
-    for (i, row) in lm.iter().enumerate().take(3) {
-        if row[0] < lu_well && i != SolverAction::DirectLU.index() {
+    // Property 2 (frankenscipy-7tb8d.2, the calibrated ranking): in every state, DirectLU has
+    // the least loss of the general solvers, PivotedQR the next, and SVDFallback the most. The
+    // hand-set matrix this replaced gave the SVD the least loss when ill conditioned.
+    let (lu, qr, svd) = (
+        SolverAction::DirectLU.index(),
+        SolverAction::PivotedQR.index(),
+        SolverAction::SVDFallback.index(),
+    );
+    for col in 0..4 {
+        if !(lm[lu][col] <= lm[qr][col] && lm[qr][col] < lm[svd][col]) {
             pass = false;
-            detail_parts.push(format!("action {i} beats DirectLU for WellConditioned"));
+            detail_parts.push(format!(
+                "column {col}: LU {}, QR {}, SVD {} is not LU <= QR < SVD",
+                lm[lu][col], lm[qr][col], lm[svd][col]
+            ));
         }
     }
 
     let detail = if detail_parts.is_empty() {
-        "Loss matrix satisfies: non-negative, SVD dominates ill-conditioned, LU dominates well-conditioned".into()
+        "Loss matrix satisfies: non-negative, and in every state LU <= QR < SVD (calibrated)".into()
     } else {
         detail_parts.join("; ")
     };
@@ -758,7 +757,7 @@ fn evidence_p2c008_final_pack() {
             FixtureEntry {
                 fixture_id: "portfolio_moderate_condition".into(),
                 subsystem: "solver_portfolio",
-                description: "ModerateCondition state → PivotedQR selection".into(),
+                description: "ModerateCondition state → DirectLU selection (calibrated)".into(),
                 signal_triple: None,
                 matrix_condition: Some("ModerateCondition"),
                 mode: "Strict",
@@ -766,7 +765,7 @@ fn evidence_p2c008_final_pack() {
             FixtureEntry {
                 fixture_id: "portfolio_ill_and_near_singular".into(),
                 subsystem: "solver_portfolio",
-                description: "IllConditioned/NearSingular → SVDFallback".into(),
+                description: "IllConditioned/NearSingular → DirectLU (calibrated)".into(),
                 signal_triple: None,
                 matrix_condition: Some("IllConditioned+NearSingular"),
                 mode: "Strict",

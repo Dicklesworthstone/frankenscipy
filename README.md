@@ -66,21 +66,19 @@ CASP is the design feature that separates this project from a generic numerical 
 
 For a linear solve, CASP:
 
-1. **Probes** the matrix for evidence: reciprocal condition number `rcond` and structural form (general / diagonal / triangular).
-2. **Computes** a weighting over four condition states (`WellConditioned`, `ModerateCondition`, `IllConditioned`, `NearSingular`). Today this is a fixed piecewise-linear function of `log10(rcond)` (see **CASP: The Decision Surface** below); it does not yet update from observed outcomes.
-3. **Minimizes expected loss** over five solver actions against a hand-set 5×4 loss matrix (the literal `SolverPortfolio::default_loss_matrix()`):
-
-   ```text
-   Action \ State      | WellCond | ModerateCond | IllCond | NearSingular
-   DirectLU            |        1 |            5 |      40 |          120
-   PivotedQR           |        3 |            1 |       8 |           45
-   SVDFallback         |       15 |           10 |       1 |            1
-   DiagonalFastPath    |        0 |            0 |       0 |          100
-   TriangularFastPath  |        0 |            0 |       0 |          100
-   ```
+1. **Probes** the matrix for evidence: reciprocal condition number `rcond` and structural form (general / diagonal / triangular / symmetric).
+2. **Computes** a posterior over four condition states (`WellConditioned`, `ModerateCondition`, `IllConditioned`, `NearSingular`): a piecewise-linear prior in `log10(rcond)` (see **CASP: The Decision Surface** below), updated per decade of `rcond` by the outcomes the portfolio has recorded.
+3. **Minimizes expected loss** over six solver actions against a 6×4 loss matrix measured by `cargo run --release -p fsci-linalg --bin casp_calibrate`. The binary writes the generated constants `crates/fsci-runtime/src/calibrated_losses.rs` and the report `artifacts/casp-calibration-solver.json`, and a test holds the two to each other.
+   - The corpus is seeded and deterministic: 324 matrices at n = 8, 32 and 128. It covers Higham's `randsvd` at κ = 1e0..1e16, exactly singular matrices, Hilbert, Lotkin, Kahan, Wilkinson's pivot-growth matrix, graded matrices, and diagonal, triangular and symmetric instances.
+   - An action fails a matrix where the portfolio would fall back: an error, a non-finite answer, or a backward error above `ATTEMPT_BACKWARD_ERROR_TOL`.
+   - `loss(a, s) = cost(a) + E[recovery cost of a failure of a | s]`. `cost` is leading-order flops relative to LU, and a failure costs the cheapest action that succeeds on that matrix.
+   - Measured, LU fails only where pivot growth defeats it, as on Wilkinson's matrix at n = 128. So LU has the least expected loss in every state, as SciPy's `gesv` does.
+   - QR (twice LU's flops) is the fallback when LU's backward error fails.
+   - The SVD fallback refuses a square system whose numerical rank is short (its rank cutoff): about a quarter of the ill-conditioned matrices and most near-singular ones. So it comes last. On the corpus it never rescues a solve that LU and QR could not; whether to keep it is `frankenscipy-qmgrm`.
+   - The hand-set matrix this replaced sent moderate conditioning to QR and ill conditioning to the SVD.
 
 4. **Returns a certificate** (`SolveCertificate`) with the chosen action, the `rcond` estimate, the structural evidence, the state weights, the expected loss of each action and a fallback flag, and records the decision in the portfolio's evidence ledger.
-5. **Falls back** if the primary solver returns an error: the remaining actions are tried in the order of the same expected-loss ranking. A conformal-style drift counter over recent backward errors (threshold 1e-8) can override the choice to `SVDFallback`.
+5. **Falls back** if the chosen solver returns an error or a backward error above `ATTEMPT_BACKWARD_ERROR_TOL`: the remaining actions are re-ranked under the updated posterior and tried in that order. A conformal-style drift counter over recent backward errors (threshold 1e-8) can override the choice to `SVDFallback`.
 
 Three other crates ship rule-based selectors that share the CASP name but not its machinery: `fsci_sparse::select_casp_iterative_solver` (CG / MINRES / LGMRES / BiCGSTAB / QMR / GMRES / LSQR / LSMR from symmetry, diagonal dominance, density and matvec cost), `fsci_opt::select_minimize_method` (constraint and gradient availability, dimension, scaling), and `fsci_special::select_hypergeometric_branch` (series / transformation / connection-formula branches for `0F1`, `1F1`, `2F1`). Each returns a decision with a written rationale; none consults a loss matrix. Separately, `fsci-runtime` has opt-in expected-loss portfolios for those domains — `SparseSolverPortfolio` (`spsolve_with_casp`), `OptSolverPortfolio` (`minimize_with_casp_portfolio`), `OdeSolverPortfolio` (`solve_ivp_with_casp_portfolio`) and `HyperSolverPortfolio` (`select_hypergeometric_branch_with_casp`) — with hand-set loss matrices and mostly caller-supplied features; the default entry points (`spsolve`, `minimize`, `solve_ivp`, `hyp2f1`) do not use them.
 
@@ -405,7 +403,7 @@ What follows is the technical-depth pass: which algorithms FrankenSciPy actually
 
 | Routine | What FrankenSciPy uses |
 |---|---|
-| `solve` (dense) | Plain `solve` does not go through CASP: in Strict mode for n ≥ 128 (general / symmetric / positive-definite) it factors in `f32` and refines to `f64`, falling back to an in-house blocked LU or Cholesky; below 128 it uses the linalg portfolio on a throwaway `SolverPortfolio`. `solve_with_casp` chooses among nalgebra LU with partial pivoting (`DirectLU`), nalgebra QR (`PivotedQR`; no column pivoting despite the name) and nalgebra SVD (`SVDFallback`, preferred below rcond ≈ 1.5e-9 by the default loss matrix), with diagonal and triangular fast paths. |
+| `solve` (dense) | Plain `solve` does not go through CASP: in Strict mode for n ≥ 128 (general / symmetric / positive-definite) it factors in `f32` and refines to `f64`, falling back to an in-house blocked LU or Cholesky; below 128 it uses the linalg portfolio on a throwaway `SolverPortfolio`. `solve_with_casp` chooses among LU with partial pivoting (`DirectLU`: nalgebra's below n = 128, the blocked in-house LU from there), nalgebra QR (`PivotedQR`; no column pivoting despite the name) and nalgebra SVD (`SVDFallback`), with diagonal, triangular and symmetric fast paths. With the calibrated loss matrix, LU is chosen at every conditioning; QR, then the SVD, are the fallbacks when LU's backward error fails. |
 | `lstsq` | SVD-based by default (in-house thin SVD); QR only for square full-rank systems. Strict-mode fast paths use normal equations via Cholesky plus one refinement step for tall systems (cols ≥ 128), a wide Cholesky path and a low-rank path. |
 | `expm` | Adaptive Padé (degree 3/5/7/9/13) with scaling and squaring (Higham 2005, the algorithm SciPy uses); a 20-term Taylor series is used only if the Padé solve fails. |
 | `logm` | Symmetric input: eigendecomposition. Otherwise real Schur form with an element-wise Parlett recurrence (repeated eigenvalues via the first-derivative limit), and a complex Schur–Parlett when the Schur form has 2×2 blocks. No inverse scaling-and-squaring (SciPy's method); negative real eigenvalues give `NaN` rather than a complex logarithm. |
@@ -450,7 +448,7 @@ Every routine that participates in CASP is parameterized by a `RuntimeMode`. The
 | Malformed input (non-square matrix, mismatched dimensions) | Fail-closed with `LinalgError`; emit a `FailClosed` audit event with the input fingerprint and reason | Same as Strict; malformed input is *always* fail-closed |
 | Non-finite entries (NaN, Inf) | Rejected when `SolveOptions::check_finite = true` (the default) | Rejected, including when `check_finite = false` in the routines that check it; no routine repairs non-finite input |
 | Very large matrices | No dimension cap (resource budgeting is the caller's job) | Hard cap at `HARDENED_MAX_DIM = 10_000` in the crates listed below; oversize input is fail-closed |
-| Ill-conditioned input near `rcond ≈ 0` | CASP routes to the SVD fallback; result returned with `warning = Some(LinalgWarning::IllConditioned { reciprocal_condition })` and the audit certificate records the chosen action and posterior | Rejected with `ConditionTooHigh` below `rcond = 1e-14` rather than solved; no regularization is applied |
+| Ill-conditioned input near `rcond ≈ 0` | CASP solves with LU, falling back to QR and then the SVD if LU's backward error fails; result returned with `warning = Some(LinalgWarning::IllConditioned { reciprocal_condition })` and the audit certificate records the chosen action and posterior | Rejected with `ConditionTooHigh` below `rcond = 1e-14` rather than solved; no regularization is applied |
 | Calibrator drift | When the drift counter's miscoverage exceeds its target, `SolverPortfolio::select_action` overrides the loss-minimizing pick and returns `SolverAction::SVDFallback` directly | Same |
 
 In practice Hardened mode mostly **rejects** more than Strict does; it does not repair input. A typical migration pattern: use `Strict` in the conformance harness and during local development (so behavior matches SciPy), and `Hardened` where a caller would rather get a typed rejection than a result computed from dubious input.
@@ -694,13 +692,13 @@ The choice of centers is deliberate: the boundaries align with the regimes where
 
 #### 2. Expected loss per action
 
-For each candidate action `a`, the expected loss is the inner product of that action's row of the 5×4 loss matrix with the posterior:
+For each candidate action `a`, the expected loss is the inner product of that action's row of the 6×4 loss matrix with the posterior:
 
 ```text
 E[loss(a)] = Σ_s  loss_matrix[a][s] · posterior[s]
 ```
 
-The action chosen is `argmin_a E[loss(a)]`, but the candidate set itself depends on the structural evidence. Only when the input is `Diagonal` does `DiagonalFastPath` enter the candidate set; only when it is `Triangular` does `TriangularFastPath`. General matrices choose among `{DirectLU, PivotedQR, SVDFallback}`.
+The action chosen is `argmin_a E[loss(a)]`, but the candidate set itself depends on the structural evidence. Only when the input is `Diagonal` does `DiagonalFastPath` enter the candidate set; only when it is `Triangular` does `TriangularFastPath`; only when it is `Symmetric` does `SymmetricFastPath`. General matrices choose among `{DirectLU, PivotedQR, SVDFallback}`.
 
 #### 3. Conformal calibrator
 
@@ -1010,7 +1008,7 @@ Reading any one of these gives you ~70% of the conventions used in the others, s
 | Term | Meaning |
 |---|---|
 | **CASP** | Condition-Aware Solver Portfolio. The runtime algorithm-selection engine that minimizes expected loss over a calibrated decision matrix. |
-| **Loss matrix** | The 5-action × 4-state table of costs that drives CASP. `SolverPortfolio::default_loss_matrix()`. |
+| **Loss matrix** | The 6-action × 4-state table of expected costs that drives CASP, measured by `casp_calibrate`. `SolverPortfolio::default_loss_matrix()`. |
 | **Conformal calibrator** | The drift detector that watches CASP's empirical miscoverage and falls back to SVD when CASP becomes unreliable. |
 | **SolveCertificate** | The synchronously-returned record of a CASP decision: action, rcond, structural evidence, posterior, expected losses, chosen loss, fallback flag. |
 | **AuditEvent** | The asynchronous, forensic event written into the `SyncSharedAuditLedger`: timestamp, input fingerprint, action variant (`ModeDecision` / `BoundedRecovery` / `FailClosed` / `AlienArtifactDecision` / `CaspDecision`), outcome. |

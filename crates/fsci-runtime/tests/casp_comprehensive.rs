@@ -1162,25 +1162,40 @@ fn portfolio_lu_for_well_conditioned() {
     assert_eq!(a, SolverAction::DirectLU);
 }
 
+// frankenscipy-7tb8d.2: with the calibrated loss matrix, LU has the least expected loss at
+// every conditioning; the hand-set matrix sent moderate conditioning to QR and ill
+// conditioning to the SVD, which the measurements do not support.
 #[test]
-fn portfolio_qr_for_moderate() {
-    let p = SolverPortfolio::new(RuntimeMode::Strict, 64);
-    let (a, _, _, _) = p.select_action(1e-6, None);
-    assert_eq!(a, SolverAction::PivotedQR);
+fn portfolio_lu_at_every_conditioning() {
+    for mode in [RuntimeMode::Strict, RuntimeMode::Hardened] {
+        let p = SolverPortfolio::new(mode, 64);
+        for state in &MatrixConditionState::ALL {
+            let (a, _, _, _) = p.select_action(state_to_rcond(state), None);
+            assert_eq!(a, SolverAction::DirectLU, "{mode:?} {state:?}");
+        }
+    }
 }
 
+// frankenscipy-7tb8d.2: the fallback order the calibration implies: QR once LU has failed its
+// backward error, the SVD only once QR has too.
 #[test]
-fn portfolio_svd_for_ill() {
+fn portfolio_fallback_order_is_qr_then_svd() {
     let p = SolverPortfolio::new(RuntimeMode::Strict, 64);
-    let (a, _, _, _) = p.select_action(1e-11, None);
-    assert_eq!(a, SolverAction::SVDFallback);
-}
-
-#[test]
-fn portfolio_svd_for_near_singular() {
-    let p = SolverPortfolio::new(RuntimeMode::Strict, 64);
-    let (a, _, _, _) = p.select_action(1e-16, None);
-    assert_eq!(a, SolverAction::SVDFallback);
+    for state in &MatrixConditionState::ALL {
+        let rcond = state_to_rcond(state);
+        let (second, ..) = p
+            .select_action_excluding(rcond, None, &[SolverAction::DirectLU])
+            .expect("QR and SVD remain");
+        assert_eq!(second, SolverAction::PivotedQR, "{state:?}");
+        let (third, ..) = p
+            .select_action_excluding(
+                rcond,
+                None,
+                &[SolverAction::DirectLU, SolverAction::PivotedQR],
+            )
+            .expect("SVD remains");
+        assert_eq!(third, SolverAction::SVDFallback, "{state:?}");
+    }
 }
 
 #[test]
@@ -1188,13 +1203,6 @@ fn portfolio_hardened_lu_for_well() {
     let p = SolverPortfolio::new(RuntimeMode::Hardened, 64);
     let (a, _, _, _) = p.select_action(1e-2, None);
     assert_eq!(a, SolverAction::DirectLU);
-}
-
-#[test]
-fn portfolio_hardened_qr_for_moderate() {
-    let p = SolverPortfolio::new(RuntimeMode::Hardened, 64);
-    let (a, _, _, _) = p.select_action(1e-6, None);
-    assert_eq!(a, SolverAction::PivotedQR);
 }
 
 #[test]
@@ -1225,14 +1233,30 @@ fn portfolio_posterior_near_singular() {
     assert_eq!(posterior, [0.0, 0.0, 0.0, 1.0]);
 }
 
+/// At a state's center the posterior is one-hot, so the expected losses are that state's
+/// column of the loss matrix, exactly. The matrix is measured (frankenscipy-7tb8d.2), so the
+/// comparison is with it, not with typed numbers.
+fn assert_losses_are_column(rcond: f64, state: usize) {
+    let p = SolverPortfolio::new(RuntimeMode::Strict, 64);
+    let (_, posterior, losses, _) = p.select_action(rcond, None);
+    let mut one_hot = [0.0; 4];
+    one_hot[state] = 1.0;
+    assert_eq!(posterior, one_hot, "rcond {rcond:e}");
+    let m = SolverPortfolio::default_loss_matrix();
+    for (a, &loss) in losses.iter().enumerate() {
+        assert_eq!(
+            loss.to_bits(),
+            m[a][state].to_bits(),
+            "{:?} at rcond {rcond:e}: {loss:e} vs {:e}",
+            SolverAction::ALL[a],
+            m[a][state]
+        );
+    }
+}
+
 #[test]
 fn portfolio_expected_losses_well() {
-    let p = SolverPortfolio::new(RuntimeMode::Strict, 64);
-    let (_, _, losses, _) = p.select_action(1e-2, None);
-    // WellConditioned: posterior=[1,0,0,0], losses = first column of matrix
-    assert_close(losses[0], 1.0, 1e-12, 0.0);
-    assert_close(losses[1], 3.0, 1e-12, 0.0);
-    assert_close(losses[2], 15.0, 1e-12, 0.0);
+    assert_losses_are_column(1e-2, 0);
 }
 
 #[test]
@@ -1255,14 +1279,37 @@ fn portfolio_default_loss_matrix_shape() {
     }
 }
 
+/// The ranking the calibration measured (frankenscipy-7tb8d.2), state by state: LU no costlier
+/// than QR, QR cheaper than the SVD, the diagonal and triangular fast paths no costlier than
+/// LU, and every loss at least its action's flop cost (LU 1, QR 2, SVD 31.5).
+fn calibrated_ranking_holds(m: &[[f64; 4]; 6]) -> bool {
+    (0..4).all(|s| {
+        m[0][s] <= m[1][s]
+            && m[1][s] < m[2][s]
+            && m[3][s] <= m[0][s]
+            && m[4][s] <= m[0][s]
+            && m[0][s] >= 1.0
+            && m[1][s] >= 2.0
+            && m[2][s] >= 31.5
+    }) && m.iter().flatten().all(|v| v.is_finite() && *v >= 0.0)
+}
+
 #[test]
 fn portfolio_default_loss_matrix_values() {
-    let m = SolverPortfolio::default_loss_matrix();
-    assert_eq!(m[0], [1.0, 5.0, 40.0, 120.0]);
-    assert_eq!(m[1], [3.0, 1.0, 8.0, 45.0]);
-    assert_eq!(m[2], [15.0, 10.0, 1.0, 1.0]);
-    assert_eq!(m[3], [0.0, 0.0, 0.0, 100.0]);
-    assert_eq!(m[4], [0.0, 0.0, 0.0, 100.0]);
+    assert!(calibrated_ranking_holds(
+        &SolverPortfolio::default_loss_matrix()
+    ));
+    // Must-miss: the hand-set matrix the calibration replaced ranks QR first at moderate
+    // conditioning and the SVD first at ill conditioning.
+    let hand_set = [
+        [1.0, 5.0, 40.0, 120.0],
+        [3.0, 1.0, 8.0, 45.0],
+        [15.0, 10.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0, 100.0],
+        [0.0, 0.0, 0.0, 100.0],
+        [0.0, 0.0, 0.0, 100.0],
+    ];
+    assert!(!calibrated_ranking_holds(&hand_set));
 }
 
 fn make_solver_evidence(action: SolverAction) -> SolverEvidenceEntry {
@@ -1902,11 +1949,9 @@ fn adv_portfolio_oscillation() {
     for i in 0..100 {
         let state = &MatrixConditionState::ALL[i % 4];
         let (action, _, _, _) = p.select_action(state_to_rcond(state), None);
-        match state {
-            MatrixConditionState::WellConditioned => assert_eq!(action, SolverAction::DirectLU),
-            MatrixConditionState::ModerateCondition => assert_eq!(action, SolverAction::PivotedQR),
-            _ => assert_eq!(action, SolverAction::SVDFallback),
-        }
+        // frankenscipy-7tb8d.2: the calibrated choice is LU in every state, so the decision
+        // does not oscillate as the state does.
+        assert_eq!(action, SolverAction::DirectLU, "{state:?}");
     }
 }
 
@@ -2230,45 +2275,26 @@ fn golden_logit_incompatible_at_meta1() {
 }
 
 // Golden: solver portfolio expected losses verification
+// Golden: the expected losses at each state's center are that state's column of the loss
+// matrix, bit for bit (see `assert_losses_are_column`).
 #[test]
 fn golden_portfolio_well_cond_losses() {
-    let p = SolverPortfolio::new(RuntimeMode::Strict, 64);
-    let (_, _, losses, _) = p.select_action(1e-2, None);
-    // posterior=[1,0,0,0], losses = column 0 of loss matrix
-    assert_close(losses[0], 1.0, 1e-12, 0.0); // DirectLU
-    assert_close(losses[1], 3.0, 1e-12, 0.0); // PivotedQR
-    assert_close(losses[2], 15.0, 1e-12, 0.0); // SVDFallback
-    assert_close(losses[3], 0.0, 1e-12, 0.0); // DiagonalFastPath
-    assert_close(losses[4], 0.0, 1e-12, 0.0); // TriangularFastPath
-    assert_close(losses[5], 0.0, 1e-12, 0.0); // SymmetricFastPath
+    assert_losses_are_column(1e-2, 0);
 }
 
 #[test]
 fn golden_portfolio_moderate_losses() {
-    let p = SolverPortfolio::new(RuntimeMode::Strict, 64);
-    let (_, _, losses, _) = p.select_action(1e-6, None);
-    assert_close(losses[0], 5.0, 1e-12, 0.0);
-    assert_close(losses[1], 1.0, 1e-12, 0.0);
-    assert_close(losses[2], 10.0, 1e-12, 0.0);
+    assert_losses_are_column(1e-6, 1);
 }
 
 #[test]
 fn golden_portfolio_ill_losses() {
-    let p = SolverPortfolio::new(RuntimeMode::Strict, 64);
-    let (_, _, losses, _) = p.select_action(1e-11, None);
-    assert_close(losses[0], 40.0, 1e-12, 0.0);
-    assert_close(losses[1], 8.0, 1e-12, 0.0);
-    assert_close(losses[2], 1.0, 1e-12, 0.0);
+    assert_losses_are_column(1e-11, 2);
 }
 
 #[test]
 fn golden_portfolio_near_singular_losses() {
-    let p = SolverPortfolio::new(RuntimeMode::Strict, 64);
-    let (_, _, losses, _) = p.select_action(1e-16, None);
-    assert_close(losses[0], 120.0, 1e-12, 0.0);
-    assert_close(losses[1], 45.0, 1e-12, 0.0);
-    assert_close(losses[2], 1.0, 1e-12, 0.0);
-    assert_close(losses[3], 100.0, 1e-12, 0.0);
+    assert_losses_are_column(1e-16, 3);
 }
 
 #[test]

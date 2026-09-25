@@ -360,15 +360,17 @@ fn perf_p2c008_casp_profile() {
         });
     }
 
-    // IllConditioned → SVDFallback
+    // IllConditioned → DirectLU: the calibrated losses (frankenscipy-7tb8d.2) rank LU first at
+    // every conditioning and the SVD last of the general solvers.
     {
         let portfolio = SolverPortfolio::new(RuntimeMode::Strict, 64);
-        let (action, _, _, _) = portfolio.select_action(1e-12, None);
-        let pass = matches!(action, SolverAction::SVDFallback);
+        let (action, _, losses, _) = portfolio.select_action(1e-12, None);
+        let pass = matches!(action, SolverAction::DirectLU)
+            && losses[SolverAction::SVDFallback.index()] > losses[SolverAction::PivotedQR.index()];
         iso_details.push(IsomorphismDetail {
-            operation: "ill_conditioned_svd".into(),
+            operation: "ill_conditioned_lu".into(),
             passes: pass,
-            note: format!("action={action:?}"),
+            note: format!("action={action:?} losses={losses:?}"),
         });
     }
 

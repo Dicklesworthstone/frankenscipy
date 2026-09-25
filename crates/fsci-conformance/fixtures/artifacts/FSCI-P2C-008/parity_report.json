@@ -41,17 +41,17 @@
     {
       "case_id": "solver_moderate_condition",
       "passed": true,
-      "message": "solver action matched: pivoted_qr"
+      "message": "solver action matched: direct_lu"
     },
     {
       "case_id": "solver_ill_conditioned",
       "passed": true,
-      "message": "solver action matched: svd_fallback"
+      "message": "solver action matched: direct_lu"
     },
     {
       "case_id": "solver_near_singular",
       "passed": true,
-      "message": "solver action matched: svd_fallback"
+      "message": "solver action matched: direct_lu"
     },
     {
       "case_id": "solver_well_conditioned_hardened",
@@ -81,5 +81,5 @@
   ],
   "passed_cases": 15,
   "failed_cases": 0,
-  "generated_unix_ms": 1777873167003
+  "generated_unix_ms": 1790338453480
 }

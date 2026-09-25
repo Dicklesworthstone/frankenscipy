@@ -130,14 +130,18 @@ fn diff_runtime_solver_portfolio_calibrator() {
         );
     }
 
-    // === 3. select_action: ill-conditioned (rcond=1e-11) → SVDFallback ===
+    // === 3. select_action: ill-conditioned (rcond=1e-11) → DirectLU ===
+    // frankenscipy-7tb8d.2: the calibrated losses rank LU first at every conditioning (the
+    // hand-set matrix took the SVD here), and the SVD last of the general solvers.
     {
         let p = SolverPortfolio::new(RuntimeMode::Strict, 8);
-        let (action, _, _, _) = p.select_action(1.0e-11, None);
+        let (action, _, losses, _) = p.select_action(1.0e-11, None);
         check(
-            "select_ill_action_svd",
-            matches!(action, SolverAction::SVDFallback),
-            format!("action={action:?}"),
+            "select_ill_action_lu",
+            matches!(action, SolverAction::DirectLU)
+                && losses[SolverAction::SVDFallback.index()]
+                    > losses[SolverAction::PivotedQR.index()],
+            format!("action={action:?} losses={losses:?}"),
         );
     }
 

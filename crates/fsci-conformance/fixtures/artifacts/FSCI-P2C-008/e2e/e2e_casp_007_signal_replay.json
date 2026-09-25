@@ -7,7 +7,7 @@
       "action": "create",
       "input_summary": "4 signals: benign, adversarial, benign, benign",
       "output_summary": "len=4",
-      "duration_ns": 3347,
+      "duration_ns": 2914,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -17,7 +17,7 @@
       "action": "decide",
       "input_summary": "replay 4 signals",
       "output_summary": "actions=[Allow,FailClosed,Allow,Allow]",
-      "duration_ns": 21491,
+      "duration_ns": 17917,
       "mode": "strict",
       "outcome": "ok"
     },
@@ -27,21 +27,21 @@
       "action": "check",
       "input_summary": "adversarial action != benign action",
       "output_summary": "benign_action=Allow, adversarial_action=FailClosed",
-      "duration_ns": 591,
+      "duration_ns": 661,
       "mode": "strict",
       "outcome": "ok"
     }
   ],
   "artifacts": [],
   "environment": {
-    "rust_version": "0.1.0",
+    "rust_version": "0.2.0",
     "os": "linux",
-    "cpu_count": 64,
+    "cpu_count": 8,
     "total_memory_mb": "unknown"
   },
   "overall": {
     "status": "pass",
-    "total_duration_ns": 121731,
+    "total_duration_ns": 85498,
     "replay_command": "cargo test -p fsci-conformance --test e2e_casp -- e2e_casp_007_signal_replay --nocapture"
   }
 }
