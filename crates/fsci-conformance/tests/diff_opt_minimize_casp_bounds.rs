@@ -23,6 +23,15 @@ use serde::Deserialize;
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
+/// The bounded 1-D quadratic's minimizer sits exactly on its active bound x = 1.
+const ACTIVE_BOUND_X_TOL: f64 = 1e-8;
+/// The same quadratic without bounds, minimized at x = 5 (the must-differ arm).
+const FREE_MINIMUM_X_TOL: f64 = 1e-6;
+/// Worst relative error against the analytic optimum of the seeded boxed quadratics.
+const SEEDED_BOX_REL_TOL: f64 = 1e-5;
+/// Bounded Rosenbrock x against SciPy's L-BFGS-B x.
+const SCIPY_X_ABS_TOL: f64 = 1e-6;
+
 fn bounded_methods(action: OptSolverAction) -> bool {
     matches!(
         action,
@@ -55,7 +64,7 @@ fn casp_bounded_scalar_lands_on_the_bound() {
         out.result.x
     );
     assert!(
-        (out.result.x[0] - 1.0).abs() <= 1e-8,
+        (out.result.x[0] - 1.0).abs() <= ACTIVE_BOUND_X_TOL,
         "x = {:?}, expected the bound 1",
         out.result.x
     );
@@ -70,7 +79,7 @@ fn casp_bounded_scalar_lands_on_the_bound() {
         free.chosen_action, free.result.x
     );
     assert!(
-        (free.result.x[0] - 5.0).abs() <= 1e-6,
+        (free.result.x[0] - 5.0).abs() <= FREE_MINIMUM_X_TOL,
         "x = {:?}",
         free.result.x
     );
@@ -173,7 +182,7 @@ fn casp_bounded_quadratics_are_feasible_and_optimal() {
             .fold(0.0_f64, f64::max);
         worst = worst.max(error);
         assert!(
-            error <= 1e-5,
+            error <= SEEDED_BOX_REL_TOL,
             "case {case}: x = {:?}, optimum {optimum:?} ({:?})",
             out.result.x,
             out.chosen_action
@@ -269,7 +278,7 @@ fn diff_opt_minimize_casp_bounded_rosenbrock_scipy() {
         assert!(scipy.success, "SciPy's own run failed");
         for (fsci, reference) in out.result.x.iter().zip(&scipy.x) {
             assert!(
-                (fsci - reference).abs() <= 1e-6,
+                (fsci - reference).abs() <= SCIPY_X_ABS_TOL,
                 "x = {:?}, SciPy {:?}",
                 out.result.x,
                 scipy.x

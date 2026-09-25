@@ -246,6 +246,9 @@
   "diff_linalg_eigvalsh.rs": {
     "ABS_TOL": 1e-9
   },
+  "diff_linalg_funm_complex.rs": {
+    "FUNM_REL_TOL": 1e-12
+  },
   "diff_linalg_interpolative_norm.rs": {},
   "diff_linalg_interpolative_reconstruct.rs": {
     "REL_TOL": 1e-11
@@ -520,8 +523,15 @@
   "diff_opt_minimize_audit_equivalence.rs": {
     "ABS_TOL": 1e-12
   },
-  "diff_opt_minimize_casp_bounds.rs": {},
-  "diff_opt_minimize_options.rs": {},
+  "diff_opt_minimize_casp_bounds.rs": {
+    "ACTIVE_BOUND_X_TOL": 1e-8,
+    "FREE_MINIMUM_X_TOL": 1e-6,
+    "SCIPY_X_ABS_TOL": 1e-6,
+    "SEEDED_BOX_REL_TOL": 1e-5
+  },
+  "diff_opt_minimize_options.rs": {
+    "X_ABS_TOL": 1e-7
+  },
   "diff_opt_minimize_quadratic.rs": {
     "ABS_TOL": 0.0001
   },
@@ -2036,7 +2046,23 @@
   "diff_stats_multipletests.rs": {
     "ABS_TOL": 1e-12
   },
-  "diff_stats_multivariate.rs": {},
+  "diff_stats_multivariate.rs": {
+    "CLOSED_FORM_ABS_TOL": 1e-11,
+    "CLOSED_FORM_REL_TOL": 1e-10,
+    "CORRELATION_DIAG_TOL": 1e-7,
+    "FROM_COVARIANCE_IDENTITY_TOL": 1e-14,
+    "MATRIX_T_RVS_MEAN_TOL": 0.35,
+    "MVHYPERGEOM_RVS_MEAN_TOL": 0.2,
+    "ORTHONORMALITY_TOL": 1e-10,
+    "ORTHO_DET_TOL": 1e-8,
+    "RVS_MEAN_TOL": 0.25,
+    "SERIES_ENTROPY_ABS_TOL": 1e-9,
+    "SERIES_ENTROPY_REL_TOL": 1e-8,
+    "SPECIAL_FN_ABS_TOL": 1e-10,
+    "SPECIAL_FN_REL_TOL": 1e-9,
+    "TABLE_MARGIN_TOL": 1e-12,
+    "UNIT_NORM_ERR_TOL": 1e-9
+  },
   "diff_stats_mvn.rs": {
     "ABS_TOL": 1e-12
   },

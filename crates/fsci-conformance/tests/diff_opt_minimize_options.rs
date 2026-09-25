@@ -42,6 +42,10 @@ struct ScipyRow {
     x: Vec<f64>,
 }
 
+/// max |x - x_scipy| on a row whose (nit, nfev) already match SciPy's exactly. The iterates
+/// agree to the BLAS-kernel level (up to 5e-8 observed for L-BFGS-B and BFGS), not bit for bit.
+const X_ABS_TOL: f64 = 1e-7;
+
 const X5: [f64; 5] = [-1.2, 1.0, -1.2, 1.0, -1.2];
 const X4: [f64; 4] = [-1.2, 1.0, -1.2, 1.0];
 const X3: [f64; 3] = [-1.2, 1.0, 0.5];
@@ -327,7 +331,7 @@ fn diff_opt_minimize_options() {
             "{}: fsci ({}, {}), SciPy ({}, {}); max |x - x_scipy| = {x_error:e}",
             row.name, result.nit, result.nfev, row.nit, row.nfev
         );
-        if (result.nit, result.nfev) != (row.nit, row.nfev) || x_error > 1e-7 {
+        if (result.nit, result.nfev) != (row.nit, row.nfev) || x_error > X_ABS_TOL {
             failures.push(row.name.clone());
         }
         let family = row.name.split('/').next().expect("family").to_string();

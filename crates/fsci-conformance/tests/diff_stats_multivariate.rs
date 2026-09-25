@@ -25,6 +25,46 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 
+// Tolerance contracts. Every comparison below names one of these instead of
+// passing a literal: G9's ratchet (`tolerance_lint`) reads `*_TOL` consts, and
+// literal arguments to `check_pair` were invisible to it, so a 10x loosening at
+// a call site passed the gate (zbtht.4). Tiers are `artifacts/TOLERANCE_POLICY.md` §1.
+
+/// Closed-form moments, covariances, Mahalanobis distances, Cholesky entries,
+/// and the Gaussian / Student-t densities: T3 rtol, atol one decade tighter.
+const CLOSED_FORM_ABS_TOL: f64 = 1e-11;
+const CLOSED_FORM_REL_TOL: f64 = 1e-10;
+/// Densities and entropies built on multigammaln / digamma / Bessel series
+/// (Wishart, InvWishart, MatrixNormal, MatrixT, VonMisesFisher, Dirichlet, and
+/// the discrete pmfs): T4 ("special-function series") allows 1e-8.
+const SPECIAL_FN_ABS_TOL: f64 = 1e-10;
+const SPECIAL_FN_REL_TOL: f64 = 1e-9;
+/// Entropies that sum a support or a Bessel-ratio series (VonMisesFisher,
+/// Multinomial): T4.
+const SERIES_ENTROPY_ABS_TOL: f64 = 1e-9;
+const SERIES_ENTROPY_REL_TOL: f64 = 1e-8;
+/// Worst deviation from unit norm of von Mises-Fisher samples, fsci vs SciPy: T4.
+const UNIT_NORM_ERR_TOL: f64 = 1e-9;
+/// SciPy's ortho_group / special_ortho_group determinant against 1: T4.
+const ORTHO_DET_TOL: f64 = 1e-8;
+/// random_table margins (integer counts carried as f64): T2.
+const TABLE_MARGIN_TOL: f64 = 1e-12;
+/// Identities between two fsci constructions of one distribution
+/// (`from_covariance` vs direct): a few roundings apart.
+const FROM_COVARIANCE_IDENTITY_TOL: f64 = 1e-14;
+/// Orthonormality / unitarity residual of a sampled matrix, fsci and SciPy.
+const ORTHONORMALITY_TOL: f64 = 1e-10;
+/// Unit diagonal of a random_correlation sample, fsci and SciPy: T5.
+const CORRELATION_DIAG_TOL: f64 = 1e-7;
+/// Sample means of fsci's seeded rvs (N = 1000-2000 draws) against the exact
+/// mean. These check a sampler's consistency, not SciPy agreement, and they sit
+/// ABOVE the policy's T6 ceiling (1e-1) without a §5 exception. They are named
+/// here so they cannot loosen further; replacing them with a z-score bound is
+/// frankenscipy-el4n5.
+const MVHYPERGEOM_RVS_MEAN_TOL: f64 = 0.2;
+const RVS_MEAN_TOL: f64 = 0.25;
+const MATRIX_T_RVS_MEAN_TOL: f64 = 0.35;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DiffRecord {
     case_id: String,
@@ -997,8 +1037,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateNormal",
             rust_pdf,
             resp.pdf,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1006,8 +1046,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateNormal",
             rust_logpdf,
             resp.logpdf,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1018,8 +1058,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateNormal",
             rust_entropy,
             resp.entropy,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1030,8 +1070,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateNormal",
             rust_maha_sq,
             resp.mahalanobis_sq,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
         let rust_maha = dist.mahalanobis(&case.x).expect("mvn maha");
@@ -1040,8 +1080,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateNormal",
             rust_maha,
             resp.mahalanobis_sq.sqrt(),
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1052,9 +1092,10 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.dim(), dist_from_cov.dim());
         assert_eq!(dist.mean(), dist_from_cov.mean());
         assert_eq!(dist.cov(), dist_from_cov.cov());
-        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < 1e-14);
+        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < FROM_COVARIANCE_IDENTITY_TOL);
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
     }
 
@@ -1071,8 +1112,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateT",
             rust_pdf,
             resp.pdf,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1080,8 +1121,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateT",
             rust_logpdf,
             resp.logpdf,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1092,8 +1133,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateT",
             rust_maha_sq,
             resp.mahalanobis_sq,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1105,8 +1146,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "MultivariateT",
                 rust_cov[0][0],
                 scipy_c00,
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         } else {
@@ -1122,7 +1163,8 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.shape(), dist_from_cov.shape());
         assert_eq!(dist.df(), dist_from_cov.df());
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
     }
 
@@ -1139,8 +1181,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1148,8 +1190,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1160,8 +1202,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_entropy,
             resp.entropy,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1172,8 +1214,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_mean[0][0],
             resp.mean_00,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1185,8 +1227,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_chol[0][0],
             resp.chol_00,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1194,8 +1236,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Wishart",
             rust_chol[1][0],
             resp.chol_10,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1205,9 +1247,10 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.dim(), dist_from_cov.dim());
         assert_eq!(dist.df(), dist_from_cov.df());
         assert_eq!(dist.scale(), dist_from_cov.scale());
-        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < 1e-14);
+        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < FROM_COVARIANCE_IDENTITY_TOL);
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
     }
 
@@ -1224,8 +1267,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "InvWishart",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1233,8 +1276,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "InvWishart",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1246,8 +1289,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "InvWishart",
                 rust_mean[0][0],
                 scipy_m00,
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         }
@@ -1260,8 +1303,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "InvWishart",
             rust_chol[0][0],
             resp.chol_00,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1269,8 +1312,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "InvWishart",
             rust_chol[1][0],
             resp.chol_10,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1282,7 +1325,8 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.df(), dist_from_cov.df());
         assert_eq!(dist.scale(), dist_from_cov.scale());
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
     }
 
@@ -1304,8 +1348,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MatrixNormal",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1313,8 +1357,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MatrixNormal",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1324,8 +1368,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MatrixNormal",
             rust_entropy,
             resp.entropy,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1335,9 +1379,10 @@ fn diff_multivariate_stats_scipy_oracle() {
         let dist_from_cov =
             MatrixNormal::from_covariance(&case.mean, &cov_u, &cov_v).expect("from_covariance");
         assert_eq!(dist.dims(), dist_from_cov.dims());
-        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < 1e-14);
+        assert!((dist.entropy() - dist_from_cov.entropy()).abs() < FROM_COVARIANCE_IDENTITY_TOL);
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
 
         // rvs differential test
@@ -1365,8 +1410,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "MatrixNormal",
                     m_est,
                     case.mean[r][c],
-                    0.25,
-                    0.25,
+                    RVS_MEAN_TOL,
+                    RVS_MEAN_TOL,
                     &mut records,
                 );
             }
@@ -1392,8 +1437,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MatrixT",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1401,8 +1446,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MatrixT",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1414,7 +1459,8 @@ fn diff_multivariate_stats_scipy_oracle() {
         assert_eq!(dist.dims(), dist_from_cov.dims());
         assert_eq!(dist.df(), dist_from_cov.df());
         assert!(
-            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs() < 1e-14
+            (dist.logpdf(&case.x).unwrap() - dist_from_cov.logpdf(&case.x).unwrap()).abs()
+                < FROM_COVARIANCE_IDENTITY_TOL
         );
 
         // rvs differential test
@@ -1442,8 +1488,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "MatrixT",
                     m_est,
                     case.mean[r][c],
-                    0.35,
-                    0.35,
+                    MATRIX_T_RVS_MEAN_TOL,
+                    MATRIX_T_RVS_MEAN_TOL,
                     &mut records,
                 );
             }
@@ -1466,8 +1512,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "VonMisesFisher",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1475,8 +1521,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "VonMisesFisher",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1486,8 +1532,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "VonMisesFisher",
             rust_entropy,
             resp.entropy,
-            1e-9,
-            1e-8,
+            SERIES_ENTROPY_ABS_TOL,
+            SERIES_ENTROPY_REL_TOL,
             &mut records,
         );
 
@@ -1510,8 +1556,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "VonMisesFisher",
             max_norm_err,
             resp.rvs_norm_err,
-            1e-9,
-            1e-9,
+            UNIT_NORM_ERR_TOL,
+            UNIT_NORM_ERR_TOL,
             &mut records,
         );
         let dot_mu: f64 = mean_dir.iter().zip(&case.mu).map(|(&d, &m)| d * m).sum();
@@ -1532,8 +1578,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Dirichlet",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1541,8 +1587,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Dirichlet",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1553,8 +1599,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "Dirichlet",
                 rm,
                 sm,
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         }
@@ -1566,8 +1612,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "Dirichlet",
                 rv,
                 sv,
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         }
@@ -1580,8 +1626,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "Dirichlet",
                     rust_cov[i][j],
                     resp.cov[i][j],
-                    1e-11,
-                    1e-10,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
                     &mut records,
                 );
             }
@@ -1605,8 +1651,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateHypergeom",
             rust_pmf,
             resp.pmf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1614,8 +1660,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "MultivariateHypergeom",
             rust_logpmf,
             resp.logpmf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1626,8 +1672,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "MultivariateHypergeom",
                 rm,
                 sm,
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         }
@@ -1639,8 +1685,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "MultivariateHypergeom",
                 rv,
                 sv,
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         }
@@ -1653,8 +1699,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "MultivariateHypergeom",
                     rust_cov[i][j],
                     resp.cov[i][j],
-                    1e-11,
-                    1e-10,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
                     &mut records,
                 );
             }
@@ -1685,8 +1731,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "MultivariateHypergeom",
                 m_est,
                 exp_m,
-                0.2,
-                0.2,
+                MVHYPERGEOM_RVS_MEAN_TOL,
+                MVHYPERGEOM_RVS_MEAN_TOL,
                 &mut records,
             );
         }
@@ -1709,8 +1755,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             rust_pdf,
             resp.pdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1718,8 +1764,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             rust_logpdf,
             resp.logpdf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1729,8 +1775,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             mean_x,
             resp.mean_x,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1738,8 +1784,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             mean_s2,
             resp.mean_s2,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1749,8 +1795,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             var_x,
             resp.var_x,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1758,8 +1804,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             var_s2,
             resp.var_s2,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -1785,8 +1831,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             est_mean_x,
             resp.mean_x,
-            0.25,
-            0.25,
+            RVS_MEAN_TOL,
+            RVS_MEAN_TOL,
             &mut records,
         );
         check_pair(
@@ -1794,8 +1840,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "NormalInverseGamma",
             est_mean_s2,
             resp.mean_s2,
-            0.25,
-            0.25,
+            RVS_MEAN_TOL,
+            RVS_MEAN_TOL,
             &mut records,
         );
     }
@@ -1816,8 +1862,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Multinomial",
             rust_pmf,
             resp.pmf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1825,8 +1871,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Multinomial",
             rust_logpmf,
             resp.logpmf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1837,8 +1883,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "Multinomial",
                 rm,
                 sm,
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         }
@@ -1851,8 +1897,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "Multinomial",
                     rust_cov[i][j],
                     resp.cov[i][j],
-                    1e-11,
-                    1e-10,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
                     &mut records,
                 );
             }
@@ -1865,8 +1911,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "Multinomial",
                 rv,
                 resp.cov[k][k],
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         }
@@ -1877,8 +1923,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "Multinomial",
             rust_entropy,
             resp.entropy,
-            1e-9,
-            1e-8,
+            SERIES_ENTROPY_ABS_TOL,
+            SERIES_ENTROPY_REL_TOL,
             &mut records,
         );
 
@@ -1904,8 +1950,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "Multinomial",
                 m_est,
                 exp_m,
-                0.25,
-                0.25,
+                RVS_MEAN_TOL,
+                RVS_MEAN_TOL,
                 &mut records,
             );
         }
@@ -1930,8 +1976,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "DirichletMultinomial",
             rust_pmf,
             resp.pmf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
         check_pair(
@@ -1939,8 +1985,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "DirichletMultinomial",
             rust_logpmf,
             resp.logpmf,
-            1e-10,
-            1e-9,
+            SPECIAL_FN_ABS_TOL,
+            SPECIAL_FN_REL_TOL,
             &mut records,
         );
 
@@ -1951,8 +1997,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "DirichletMultinomial",
                 rm,
                 sm,
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         }
@@ -1964,8 +2010,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                 "DirichletMultinomial",
                 rv,
                 sv,
-                1e-11,
-                1e-10,
+                CLOSED_FORM_ABS_TOL,
+                CLOSED_FORM_REL_TOL,
                 &mut records,
             );
         }
@@ -1978,8 +2024,8 @@ fn diff_multivariate_stats_scipy_oracle() {
                     "DirichletMultinomial",
                     rust_cov[i][j],
                     resp.cov[i][j],
-                    1e-11,
-                    1e-10,
+                    CLOSED_FORM_ABS_TOL,
+                    CLOSED_FORM_REL_TOL,
                     &mut records,
                 );
             }
@@ -2005,28 +2051,37 @@ fn diff_multivariate_stats_scipy_oracle() {
                 max_ortho_err = max_ortho_err.max((dot - expected).abs());
             }
         }
-        assert!(max_ortho_err < 1e-10, "rust ortho_group orthonormality");
-        assert!(resp.q_ortho_err < 1e-10, "scipy ortho_group orthonormality");
+        assert!(
+            max_ortho_err < ORTHONORMALITY_TOL,
+            "rust ortho_group orthonormality"
+        );
+        assert!(
+            resp.q_ortho_err < ORTHONORMALITY_TOL,
+            "scipy ortho_group orthonormality"
+        );
         check_pair(
             &format!("{}_q_det", case.case_id),
             "ortho_group",
             1.0,
             resp.q_det,
-            1e-8,
-            1e-7,
+            ORTHO_DET_TOL,
+            ORTHO_DET_TOL,
             &mut records,
         );
 
         // special_ortho_group
         let _so = special_ortho_group::rvs_with_rng(n, &mut rng);
-        assert!((resp.so_det - 1.0).abs() < 1e-8, "scipy SO(N) det is 1.0");
+        assert!(
+            (resp.so_det - 1.0).abs() < ORTHO_DET_TOL,
+            "scipy SO(N) det is 1.0"
+        );
         check_pair(
             &format!("{}_so_det", case.case_id),
             "special_ortho_group",
             1.0,
             resp.so_det,
-            1e-8,
-            1e-7,
+            ORTHO_DET_TOL,
+            ORTHO_DET_TOL,
             &mut records,
         );
 
@@ -2047,9 +2102,12 @@ fn diff_multivariate_stats_scipy_oracle() {
                 max_unit_err = max_unit_err.max((re_dot - expected_re).abs().max(im_dot.abs()));
             }
         }
-        assert!(max_unit_err < 1e-10, "rust unitary_group unitarity");
         assert!(
-            resp.u_unitarity_err < 1e-10,
+            max_unit_err < ORTHONORMALITY_TOL,
+            "rust unitary_group unitarity"
+        );
+        assert!(
+            resp.u_unitarity_err < ORTHONORMALITY_TOL,
             "scipy unitary_group unitarity"
         );
 
@@ -2061,8 +2119,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "uniform_direction",
             rust_v_norm,
             resp.v_norm,
-            1e-11,
-            1e-10,
+            CLOSED_FORM_ABS_TOL,
+            CLOSED_FORM_REL_TOL,
             &mut records,
         );
 
@@ -2080,9 +2138,12 @@ fn diff_multivariate_stats_scipy_oracle() {
         for i in 0..n {
             max_diag_err = max_diag_err.max((r_corr[i][i] - 1.0).abs());
         }
-        assert!(max_diag_err < 1e-7, "rust random_correlation diag is 1.0");
         assert!(
-            resp.corr_diag_err < 1e-7,
+            max_diag_err < CORRELATION_DIAG_TOL,
+            "rust random_correlation diag is 1.0"
+        );
+        assert!(
+            resp.corr_diag_err < CORRELATION_DIAG_TOL,
             "scipy random_correlation diag is 1.0"
         );
 
@@ -2097,8 +2158,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "random_table",
             rust_row0 as f64,
             resp.tbl_row0,
-            1e-12,
-            1e-12,
+            TABLE_MARGIN_TOL,
+            TABLE_MARGIN_TOL,
             &mut records,
         );
         check_pair(
@@ -2106,8 +2167,8 @@ fn diff_multivariate_stats_scipy_oracle() {
             "random_table",
             rust_col0 as f64,
             resp.tbl_col0,
-            1e-12,
-            1e-12,
+            TABLE_MARGIN_TOL,
+            TABLE_MARGIN_TOL,
             &mut records,
         );
     }
