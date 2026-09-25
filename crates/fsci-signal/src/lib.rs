@@ -12880,10 +12880,10 @@ pub enum RemezFilterType {
 }
 
 /// Parks-McClellan FIR design with an explicit response `type`, matching
-/// `scipy.signal.remez(..., type=...)`. `Bandpass` is the symmetric design
-/// (Types I/II); `Hilbert` is the antisymmetric Hilbert-transformer (Types
-/// III/IV). The minimax optimum is unique, so each matches SciPy to machine
-/// precision.
+/// `scipy.signal.remez(..., type=...)` (fs = 1: band edges in [0, 0.5]). `Bandpass` is the
+/// symmetric design (Types I/II); `Hilbert` and `Differentiator` are antisymmetric (Types
+/// III/IV). The exchange is a port of SciPy's own (see `mpr_remez`), so the taps are SciPy's
+/// and so are the refusals.
 pub fn remez_with_type(
     numtaps: usize,
     bands: &[f64],
@@ -12891,36 +12891,47 @@ pub fn remez_with_type(
     weight: Option<&[f64]>,
     filter_type: RemezFilterType,
 ) -> Result<Vec<f64>, SignalError> {
-    let differentiator = match filter_type {
-        RemezFilterType::Bandpass => return remez(numtaps, bands, desired, weight),
-        RemezFilterType::Hilbert => false,
-        RemezFilterType::Differentiator => true,
-    };
-    // Antisymmetric (Hilbert / differentiator) path.
-    if numtaps < 1 {
+    if numtaps < 2 {
         return Err(SignalError::InvalidArgument(
-            "numtaps must be >= 1".to_string(),
+            "The number of taps must be greater than 1.".to_string(),
         ));
     }
-    if !bands.len().is_multiple_of(2) || bands.is_empty() {
-        return Err(SignalError::InvalidArgument(
-            "bands must have even number of elements".to_string(),
-        ));
-    }
-    let nbands = bands.len() / 2;
-    if desired.len() != nbands {
-        return Err(SignalError::InvalidArgument(format!(
-            "desired length {} must equal number of bands {nbands}",
-            desired.len()
-        )));
-    }
+    let nbands = desired.len();
     let weights: Vec<f64> = weight.map_or_else(|| vec![1.0; nbands], |w| w.to_vec());
-    if weights.len() != nbands {
+    if nbands == 0 || bands.len() != 2 * nbands || weights.len() != nbands {
         return Err(SignalError::InvalidArgument(
-            "weight length must equal number of bands".to_string(),
+            "The inputs desired and weight must have same length. The input bands must have \
+             twice this length."
+                .to_string(),
         ));
     }
-    remez_hilbert_pm(numtaps, bands, desired, &weights, differentiator)
+    // SciPy's checks, edge by edge and in its order. A non-finite edge, which SciPy would
+    // carry into the grid, is refused (fail closed).
+    let mut previous = 0.0;
+    for &edge in bands {
+        if !edge.is_finite() {
+            return Err(SignalError::InvalidArgument(
+                "band edges must be finite".to_string(),
+            ));
+        }
+        if edge < previous {
+            return Err(SignalError::InvalidArgument(
+                "Bands must be monotonic starting at zero.".to_string(),
+            ));
+        }
+        if edge * 2.0 > 1.0 {
+            return Err(SignalError::InvalidArgument(
+                "Band edges should be less than 1/2 the sampling frequency".to_string(),
+            ));
+        }
+        previous = edge;
+    }
+    let jtype = match filter_type {
+        RemezFilterType::Bandpass => REMEZ_BANDPASS,
+        RemezFilterType::Hilbert => REMEZ_HILBERT,
+        RemezFilterType::Differentiator => REMEZ_DIFFERENTIATOR,
+    };
+    mpr_remez(numtaps, bands, desired, &weights, jtype)
 }
 
 /// Design a FIR filter using the Parks-McClellan (Remez exchange) algorithm.
@@ -12941,848 +12952,685 @@ pub fn remez(
     desired: &[f64],
     weight: Option<&[f64]>,
 ) -> Result<Vec<f64>, SignalError> {
-    if numtaps < 1 {
-        return Err(SignalError::InvalidArgument(
-            "numtaps must be >= 1".to_string(),
-        ));
-    }
-    if !bands.len().is_multiple_of(2) || bands.is_empty() {
-        return Err(SignalError::InvalidArgument(
-            "bands must have even number of elements".to_string(),
-        ));
-    }
-    let nbands = bands.len() / 2;
-    if desired.len() != nbands {
-        return Err(SignalError::InvalidArgument(format!(
-            "desired length {} must equal number of bands {}",
-            desired.len(),
-            nbands
-        )));
-    }
-    // SciPy's _remez: every edge must lie in [0, fs/2] (fs = 1 here) and the whole
-    // edge sequence must be nondecreasing -- not just each band on its own.
-    if bands
-        .iter()
-        .any(|&edge| !edge.is_finite() || !(0.0..=0.5).contains(&edge))
-    {
-        return Err(SignalError::InvalidArgument(
-            "Band edges should be less than 1/2 the sampling frequency".to_string(),
-        ));
-    }
-    if bands.windows(2).any(|pair| pair[1] < pair[0]) {
-        return Err(SignalError::InvalidArgument(
-            "Bands must be monotonic starting at zero.".to_string(),
-        ));
-    }
-
-    let weights: Vec<f64> = weight.map_or_else(|| vec![1.0; nbands], |w| w.to_vec());
-    if weights.len() != nbands {
-        return Err(SignalError::InvalidArgument(
-            "weight length must equal number of bands".to_string(),
-        ));
-    }
-
-    // Odd numtaps: true Parks-McClellan (Type I equiripple). Even numtaps:
-    // Type-II Parks-McClellan via the cos(ω/2) factorization. Both are the
-    // unique equiripple minimax optimum, so they match scipy.signal.remez to
-    // machine precision.
-    //
     // br-szq1n.13: when the even-length exchange failed, this used to return a
     // frequency-sampling least-squares design instead -- a different filter
     // (not equiripple) handed back as if it were the minimax one. SciPy's remez
-    // raises ("Failure to converge ..., try reducing transition band width"), so
-    // the Parks-McClellan error is propagated.
-    if numtaps % 2 == 1 {
-        return remez_type1_pm(numtaps, bands, desired, &weights);
-    }
-    remez_type2_pm(numtaps, bands, desired, &weights)
+    // raises ("Failure to converge ..., try reducing transition band width"), and
+    // so does this: the exchange is SciPy's own, ported.
+    remez_with_type(numtaps, bands, desired, weight, RemezFilterType::Bandpass)
 }
 
-/// Parks-McClellan (Remez exchange) for a Type-I (odd `numtaps`, symmetric)
-/// linear-phase FIR filter — the true equiripple/minimax design, matching
-/// `scipy.signal.remez` (the minimax optimum is unique, so a correct exchange
-/// converges to scipy's coefficients to ~1e-6). Approximates the desired
-/// piecewise-constant gain on the band grid; transition bands are unconstrained.
-fn remez_type1_pm(
+/// SciPy's `type` codes for `_sigtools._remez`.
+const REMEZ_BANDPASS: i64 = 1;
+const REMEZ_DIFFERENTIATOR: i64 = 2;
+const REMEZ_HILBERT: i64 = 3;
+/// SciPy's `remez` defaults: `maxiter=25`, `grid_density=16`.
+const REMEZ_MAXITER: i64 = 25;
+const REMEZ_GRID_DENSITY: usize = 16;
+
+/// A faithful port of SciPy's Remez exchange (`scipy/signal/_sigtoolsmodule.cc`:
+/// `pre_remez`, `remez`, `lagrange_interp`, `freq_eval`, `eff`, `wate` — Kvaleberg's C
+/// translation of the McClellan-Parks-Rabiner FORTRAN), so fsci designs the filter SciPy
+/// designs and refuses what SciPy refuses (frankenscipy-szq1n.13). The previous hand-written
+/// exchanges picked extremal points by their own rules; on low-order multiband specs they
+/// returned designs whose max weighted band error was up to 38x the minimax optimum that
+/// SciPy (and an independent LP) reach.
+///
+/// Arrays are 1-based as in the C (index 0 unused), and every arithmetic step keeps the C's
+/// order, so the taps agree with SciPy's to rounding. `bands` are normalised (fs = 1) and
+/// already validated; `jtype` is SciPy's type code.
+fn mpr_remez(
     numtaps: usize,
     bands: &[f64],
     desired: &[f64],
     weights: &[f64],
+    jtype: i64,
 ) -> Result<Vec<f64>, SignalError> {
-    use std::f64::consts::PI;
-    let nbands = bands.len() / 2;
-    let m = (numtaps - 1) / 2;
-    let nfcns = m + 1; // # cosine basis functions / unknown coefficients
-    let nz = nfcns + 1; // # extremal frequencies (alternations)
-
-    // Dense frequency grid over the bands (scipy grid_density = 16).
-    let grid_density = 16usize;
-    let delf = 0.5 / (grid_density as f64 * nfcns as f64);
-    let mut gridf: Vec<f64> = Vec::new();
-    let mut gdes: Vec<f64> = Vec::new();
-    let mut gwt: Vec<f64> = Vec::new();
-    let mut band_bounds: Vec<(usize, usize)> = Vec::new();
-    for b in 0..nbands {
-        let lo = bands[2 * b];
-        let hi = bands[2 * b + 1];
-        if hi < lo {
-            return Err(SignalError::InvalidArgument(
-                "band edges must be ascending".to_string(),
-            ));
+    let fail = |niter: i64| {
+        SignalError::NumericalFailure(format!(
+            "Failure to converge at iteration {niter}, try reducing transition band width."
+        ))
+    };
+    let nfilt = numtaps;
+    let nbands = desired.len();
+    let lgrid = REMEZ_GRID_DENSITY;
+    let dimsize = (numtaps as f64 / 2.0 + 2.0).ceil() as usize;
+    let wrksize = lgrid * dimsize;
+    // 1-based views of the inputs.
+    let edge: Vec<f64> = std::iter::once(0.0).chain(bands.iter().copied()).collect();
+    let fx: Vec<f64> = std::iter::once(0.0)
+        .chain(desired.iter().copied())
+        .collect();
+    let wtx: Vec<f64> = std::iter::once(0.0)
+        .chain(weights.iter().copied())
+        .collect();
+    let eff = |freq: f64, lband: usize| {
+        if jtype != REMEZ_DIFFERENTIATOR {
+            fx[lband]
+        } else {
+            fx[lband] * freq
         }
-        let npts = (((hi - lo) / delf).floor() as usize).max(1) + 1;
-        let start = gridf.len();
-        for j in 0..npts {
-            let f = if j == npts - 1 {
-                hi
-            } else {
-                lo + j as f64 * delf
-            };
-            gridf.push(f);
-            gdes.push(desired[b]);
-            gwt.push(weights[b]);
+    };
+    let wate = |freq: f64, lband: usize| {
+        if jtype != REMEZ_DIFFERENTIATOR {
+            wtx[lband]
+        } else if fx[lband] >= 0.0001 {
+            wtx[lband] / freq
+        } else {
+            wtx[lband]
         }
-        band_bounds.push((start, gridf.len() - 1));
-    }
-    let ngrid = gridf.len();
-    if ngrid < nz {
-        return Err(SignalError::InvalidArgument(
-            "too few grid points for remez".to_string(),
-        ));
-    }
-    let x: Vec<f64> = gridf.iter().map(|&f| (2.0 * PI * f).cos()).collect();
-
-    // Initial extremal set: evenly spaced grid indices.
-    let mut iext: Vec<usize> = (0..nz).map(|k| k * (ngrid - 1) / (nz - 1)).collect();
-
-    let mut y = vec![0.0_f64; nfcns];
-    let mut adp = vec![0.0_f64; nfcns];
-    let mut xe = vec![0.0_f64; nz];
-
-    // Compute (dev, y, adp) for the current `iext`; returns the eval data via the
-    // closure-free out-params. Defined inline below per iteration.
-    for _iter in 0..64 {
-        for k in 0..nz {
-            xe[k] = x[iext[k]];
-        }
-        let mut ad = vec![0.0_f64; nz];
-        for k in 0..nz {
-            let mut p = 1.0;
-            for j in 0..nz {
-                if j != k {
-                    p *= xe[k] - xe[j];
-                }
-            }
-            ad[k] = 1.0 / p;
-        }
-        let mut dnum = 0.0;
-        let mut dden = 0.0;
-        for k in 0..nz {
-            dnum += ad[k] * gdes[iext[k]];
-            let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-            dden += s * ad[k] / gwt[iext[k]];
-        }
-        let dev = dnum / dden;
-        for k in 0..nfcns {
-            let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-            y[k] = gdes[iext[k]] - s * dev / gwt[iext[k]];
-        }
-        for k in 0..nfcns {
-            let mut p = 1.0;
-            for j in 0..nfcns {
-                if j != k {
-                    p *= xe[k] - xe[j];
-                }
-            }
-            adp[k] = 1.0 / p;
-        }
-        let eval_a = |xq: f64| -> f64 {
-            let mut num = 0.0;
-            let mut den = 0.0;
-            for k in 0..nfcns {
-                let d = xq - xe[k];
-                if d.abs() < 1e-13 {
-                    return y[k];
-                }
-                let t = adp[k] / d;
-                num += t * y[k];
-                den += t;
-            }
-            num / den
-        };
-        let err: Vec<f64> = (0..ngrid)
-            .map(|i| gwt[i] * (eval_a(x[i]) - gdes[i]))
-            .collect();
-
-        // Candidate extrema: band edges + interior local maxima of |err|.
-        let mut cand: Vec<usize> = Vec::new();
-        for &(s, e) in &band_bounds {
-            cand.push(s);
-            for i in (s + 1)..e {
-                let a = err[i] - err[i - 1];
-                let b2 = err[i + 1] - err[i];
-                if (a > 0.0 && b2 <= 0.0) || (a < 0.0 && b2 >= 0.0) {
-                    cand.push(i);
-                }
-            }
-            if e != s {
-                cand.push(e);
-            }
-        }
-        // Collapse same-sign consecutive candidates, keeping the larger |err|.
-        let mut alt: Vec<usize> = Vec::new();
-        for &ci in &cand {
-            if let Some(&last) = alt.last()
-                && (err[ci] >= 0.0) == (err[last] >= 0.0)
-            {
-                if err[ci].abs() > err[last].abs() {
-                    *alt.last_mut().unwrap() = ci;
-                }
-                continue;
-            }
-            alt.push(ci);
-        }
-        // Trim to nz alternations by dropping the smaller-|err| endpoint.
-        while alt.len() > nz {
-            if err[alt[0]].abs() <= err[*alt.last().unwrap()].abs() {
-                alt.remove(0);
-            } else {
-                alt.pop();
-            }
-        }
-        if alt.len() != nz {
-            break; // could not form nz alternations; keep current iext
-        }
-        let maxerr = alt.iter().map(|&i| err[i].abs()).fold(0.0_f64, f64::max);
-        let changed = alt != iext;
-        iext = alt;
-        if !changed || (maxerr - dev.abs()).abs() <= 1e-12 * maxerr.max(1e-30) {
-            break;
-        }
-    }
-
-    // Recompute interpolation data for the final extremal set.
-    for k in 0..nz {
-        xe[k] = x[iext[k]];
-    }
-    let mut ad = vec![0.0_f64; nz];
-    for k in 0..nz {
-        let mut p = 1.0;
-        for j in 0..nz {
-            if j != k {
-                p *= xe[k] - xe[j];
-            }
-        }
-        ad[k] = 1.0 / p;
-    }
-    let mut dnum = 0.0;
-    let mut dden = 0.0;
-    for k in 0..nz {
-        dnum += ad[k] * gdes[iext[k]];
-        let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-        dden += s * ad[k] / gwt[iext[k]];
-    }
-    let dev = dnum / dden;
-    for k in 0..nfcns {
-        let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-        y[k] = gdes[iext[k]] - s * dev / gwt[iext[k]];
-    }
-    for k in 0..nfcns {
-        let mut p = 1.0;
-        for j in 0..nfcns {
-            if j != k {
-                p *= xe[k] - xe[j];
-            }
-        }
-        adp[k] = 1.0 / p;
-    }
-    let eval_a = |xq: f64| -> f64 {
-        let mut num = 0.0;
-        let mut den = 0.0;
-        for k in 0..nfcns {
-            let d = xq - xe[k];
-            if d.abs() < 1e-13 {
-                return y[k];
-            }
-            let t = adp[k] / d;
-            num += t * y[k];
-            den += t;
-        }
-        num / den
     };
 
-    // Recover cosine coefficients a_k via a Chebyshev DCT-II. A(x) is a degree-M
-    // polynomial in x = cos(2π f); sampling at Chebyshev nodes and inverting gives
-    // the exact T_k (= cos 2πkf) coefficients a_k.
-    let nn = nfcns;
-    let samp: Vec<f64> = (0..nn)
-        .map(|j| eval_a((PI * (j as f64 + 0.5) / nn as f64).cos()))
-        .collect();
-    let mut a = vec![0.0_f64; nfcns];
-    for (k, ak) in a.iter_mut().enumerate() {
-        let mut s = 0.0;
-        for (j, &sj) in samp.iter().enumerate() {
-            s += sj * (PI * k as f64 * (j as f64 + 0.5) / nn as f64).cos();
-        }
-        *ak = 2.0 / nn as f64 * s;
+    let mut des = vec![0.0_f64; wrksize + 2];
+    let mut grid = vec![0.0_f64; wrksize + 2];
+    let mut wt = vec![0.0_f64; wrksize + 2];
+    let mut alpha = vec![0.0_f64; dimsize + 2];
+    let mut iext = vec![0_usize; dimsize + 2];
+
+    let neg: usize = usize::from(jtype != REMEZ_BANDPASS);
+    let nodd = nfilt % 2;
+    let mut nfcns = nfilt / 2;
+    if nodd == 1 && neg == 0 {
+        nfcns += 1;
     }
-    a[0] *= 0.5;
 
-    // Symmetric impulse response: h[m] = a_0, h[m±k] = a_k/2.
-    let mut h = vec![0.0_f64; numtaps];
-    h[m] = a[0];
-    for k in 1..nfcns {
-        h[m - k] = a[k] / 2.0;
-        h[m + k] = a[k] / 2.0;
+    // The dense grid: (filter length + 1) * grid density / 2 points.
+    grid[1] = edge[1];
+    let delf = 0.5 / (lgrid * nfcns) as f64;
+    if neg != 0 && edge[1] < delf {
+        grid[1] = delf;
     }
-    Ok(h)
-}
-
-/// Parks-McClellan (Remez exchange) for a Type-II (even `numtaps`, symmetric)
-/// linear-phase FIR filter. The Type-II amplitude response factors as
-/// `A(ω) = cos(ω/2)·P(ω)` with `P(ω) = Σ_{k=0}^{m-1} b̃_k cos(kω)`, `m = N/2`.
-/// Folding the `cos(ω/2)` factor into the desired/weight (`D' = D/cos(ω/2)`,
-/// `W' = W·cos(ω/2)`) turns the weighted minimax problem into the same Type-I
-/// exchange on `P`; the recovered cosine coefficients map to the Type-II taps.
-/// The minimax optimum is unique, so a correct equiripple solution matches
-/// `scipy.signal.remez` to machine precision. Forces `A(0.5)=0` (the Type-II
-/// constraint at Nyquist), so grid points there carry no constraint and are
-/// dropped. Matches scipy for lowpass/bandpass; highpass is not Type-II-realizable.
-fn remez_type2_pm(
-    numtaps: usize,
-    bands: &[f64],
-    desired: &[f64],
-    weights: &[f64],
-) -> Result<Vec<f64>, SignalError> {
-    use std::f64::consts::PI;
-    let nbands = bands.len() / 2;
-    let m = numtaps / 2; // # cos((k-1/2)ω) terms == # b̃_k cosine functions
-    let nfcns = m;
-    let nz = nfcns + 1; // # alternations
-
-    // Dense grid over the bands, with the Type-II transform D' = D/cos(πf),
-    // W' = W·cos(πf). Grid points within `nyq_eps` of Nyquist (where cos(πf)≈0,
-    // the forced A(0.5)=0) carry no constraint and are dropped.
-    let grid_density = 16usize;
-    let delf = 0.5 / (grid_density as f64 * nfcns as f64);
-    let nyq_eps = 1e-5;
-    let mut gridf: Vec<f64> = Vec::new();
-    let mut gdes: Vec<f64> = Vec::new();
-    let mut gwt: Vec<f64> = Vec::new();
-    let mut band_bounds: Vec<(usize, usize)> = Vec::new();
-    for b in 0..nbands {
-        let lo = bands[2 * b];
-        let hi = bands[2 * b + 1];
-        if hi < lo {
-            return Err(SignalError::InvalidArgument(
-                "band edges must be ascending".to_string(),
-            ));
-        }
-        let npts = (((hi - lo) / delf).floor() as usize).max(1) + 1;
-        let start = gridf.len();
-        for j in 0..npts {
-            let f = if j == npts - 1 {
-                hi
-            } else {
-                lo + j as f64 * delf
-            };
-            let q = (PI * f).cos();
-            if q.abs() < nyq_eps {
-                continue; // Nyquist: A is forced to 0, no constraint
+    let (mut j, mut l, mut lband) = (1_usize, 1_usize, 1_usize);
+    loop {
+        let fup = edge[l + 1];
+        loop {
+            let temp = grid[j];
+            des[j] = eff(temp, lband);
+            wt[j] = wate(temp, lband);
+            j += 1;
+            if j > wrksize {
+                // Too many points, or too dense a grid: SciPy reports it as a convergence
+                // failure with the iteration count it never set.
+                return Err(fail(-1));
             }
-            gridf.push(f);
-            gdes.push(desired[b] / q);
-            gwt.push(weights[b] * q);
-        }
-        if gridf.len() > start {
-            band_bounds.push((start, gridf.len() - 1));
-        }
-    }
-    let ngrid = gridf.len();
-    if ngrid < nz {
-        return Err(SignalError::InvalidArgument(
-            "too few grid points for remez (type II)".to_string(),
-        ));
-    }
-    let x: Vec<f64> = gridf.iter().map(|&f| (2.0 * PI * f).cos()).collect();
-
-    let mut iext: Vec<usize> = (0..nz).map(|k| k * (ngrid - 1) / (nz - 1)).collect();
-    let mut y = vec![0.0_f64; nfcns];
-    let mut adp = vec![0.0_f64; nfcns];
-    let mut xe = vec![0.0_f64; nz];
-
-    for _iter in 0..64 {
-        for k in 0..nz {
-            xe[k] = x[iext[k]];
-        }
-        let mut ad = vec![0.0_f64; nz];
-        for k in 0..nz {
-            let mut p = 1.0;
-            for j in 0..nz {
-                if j != k {
-                    p *= xe[k] - xe[j];
-                }
-            }
-            ad[k] = 1.0 / p;
-        }
-        let mut dnum = 0.0;
-        let mut dden = 0.0;
-        for k in 0..nz {
-            dnum += ad[k] * gdes[iext[k]];
-            let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-            dden += s * ad[k] / gwt[iext[k]];
-        }
-        let dev = dnum / dden;
-        for k in 0..nfcns {
-            let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-            y[k] = gdes[iext[k]] - s * dev / gwt[iext[k]];
-        }
-        for k in 0..nfcns {
-            let mut p = 1.0;
-            for j in 0..nfcns {
-                if j != k {
-                    p *= xe[k] - xe[j];
-                }
-            }
-            adp[k] = 1.0 / p;
-        }
-        let eval_p = |xq: f64| -> f64 {
-            let mut num = 0.0;
-            let mut den = 0.0;
-            for k in 0..nfcns {
-                let d = xq - xe[k];
-                if d.abs() < 1e-13 {
-                    return y[k];
-                }
-                let t = adp[k] / d;
-                num += t * y[k];
-                den += t;
-            }
-            num / den
-        };
-        let err: Vec<f64> = (0..ngrid)
-            .map(|i| gwt[i] * (eval_p(x[i]) - gdes[i]))
-            .collect();
-
-        let mut cand: Vec<usize> = Vec::new();
-        for &(s, e) in &band_bounds {
-            cand.push(s);
-            for i in (s + 1)..e {
-                let a = err[i] - err[i - 1];
-                let b2 = err[i + 1] - err[i];
-                if (a > 0.0 && b2 <= 0.0) || (a < 0.0 && b2 >= 0.0) {
-                    cand.push(i);
-                }
-            }
-            if e != s {
-                cand.push(e);
+            grid[j] = temp + delf;
+            if !(grid[j] <= fup) {
+                break;
             }
         }
-        let mut alt: Vec<usize> = Vec::new();
-        for &ci in &cand {
-            if let Some(&last) = alt.last()
-                && (err[ci] >= 0.0) == (err[last] >= 0.0)
-            {
-                if err[ci].abs() > err[last].abs() {
-                    *alt.last_mut().unwrap() = ci;
-                }
-                continue;
-            }
-            alt.push(ci);
-        }
-        while alt.len() > nz {
-            if err[alt[0]].abs() <= err[*alt.last().unwrap()].abs() {
-                alt.remove(0);
-            } else {
-                alt.pop();
-            }
-        }
-        if alt.len() != nz {
+        grid[j - 1] = fup;
+        des[j - 1] = eff(fup, lband);
+        wt[j - 1] = wate(fup, lband);
+        lband += 1;
+        l += 2;
+        if lband > nbands {
             break;
         }
-        let maxerr = alt.iter().map(|&i| err[i].abs()).fold(0.0_f64, f64::max);
-        let changed = alt != iext;
-        iext = alt;
-        if !changed || (maxerr - dev.abs()).abs() <= 1e-12 * maxerr.max(1e-30) {
-            break;
-        }
+        grid[j] = edge[l];
+    }
+    let mut ngrid = j - 1;
+    if neg == nodd && grid[ngrid] > 0.5 - delf {
+        ngrid -= 1;
+    }
+    if ngrid < 2 {
+        // SciPy runs on into divisions by zero here; refuse instead of indexing below 1.
+        return Err(fail(-1));
     }
 
-    // Final interpolation data.
-    for k in 0..nz {
-        xe[k] = x[iext[k]];
-    }
-    let mut dnum = 0.0;
-    let mut dden = 0.0;
-    {
-        let mut ad = vec![0.0_f64; nz];
-        for k in 0..nz {
-            let mut p = 1.0;
-            for j in 0..nz {
-                if j != k {
-                    p *= xe[k] - xe[j];
-                }
-            }
-            ad[k] = 1.0 / p;
-        }
-        for k in 0..nz {
-            dnum += ad[k] * gdes[iext[k]];
-            let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-            dden += s * ad[k] / gwt[iext[k]];
-        }
-    }
-    let dev = dnum / dden;
-    for k in 0..nfcns {
-        let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-        y[k] = gdes[iext[k]] - s * dev / gwt[iext[k]];
-    }
-    for k in 0..nfcns {
-        let mut p = 1.0;
-        for j in 0..nfcns {
-            if j != k {
-                p *= xe[k] - xe[j];
+    // An equivalent approximation problem.
+    if neg == 0 {
+        if nodd != 1 {
+            for j in 1..=ngrid {
+                let change = (std::f64::consts::PI * grid[j]).cos();
+                des[j] /= change;
+                wt[j] *= change;
             }
         }
-        adp[k] = 1.0 / p;
-    }
-    let eval_p = |xq: f64| -> f64 {
-        let mut num = 0.0;
-        let mut den = 0.0;
-        for k in 0..nfcns {
-            let d = xq - xe[k];
-            if d.abs() < 1e-13 {
-                return y[k];
-            }
-            let t = adp[k] / d;
-            num += t * y[k];
-            den += t;
+    } else if nodd != 1 {
+        for j in 1..=ngrid {
+            let change = (std::f64::consts::PI * grid[j]).sin();
+            des[j] /= change;
+            wt[j] *= change;
         }
-        num / den
-    };
-
-    // Recover P's cosine coefficients b̃_k via Chebyshev DCT-II (P is degree m-1
-    // in x = cos(2πf)).
-    let nn = nfcns;
-    let samp: Vec<f64> = (0..nn)
-        .map(|j| eval_p((PI * (j as f64 + 0.5) / nn as f64).cos()))
-        .collect();
-    let mut bt = vec![0.0_f64; nfcns];
-    for (k, bk) in bt.iter_mut().enumerate() {
-        let mut s = 0.0;
-        for (j, &sj) in samp.iter().enumerate() {
-            s += sj * (PI * k as f64 * (j as f64 + 0.5) / nn as f64).cos();
-        }
-        *bk = 2.0 / nn as f64 * s;
-    }
-    bt[0] *= 0.5;
-
-    // Transform b̃_k (coeffs of P) to a_j (coeffs of A = Σ_{j=1}^{m} a_j cos((j-½)ω)).
-    //   a_1 = b̃_0 + b̃_1/2;  a_j = (b̃_{j-1}+b̃_j)/2 (2≤j≤m-1);  a_m = b̃_{m-1}/2.
-    let mut a = vec![0.0_f64; m + 1]; // a[1..=m] used
-    if m == 1 {
-        a[1] = bt[0];
     } else {
-        a[1] = bt[0] + bt[1] / 2.0;
-        for j in 2..m {
-            a[j] = (bt[j - 1] + bt[j]) / 2.0;
+        for j in 1..=ngrid {
+            let change = (std::f64::consts::TAU * grid[j]).sin();
+            des[j] /= change;
+            wt[j] *= change;
         }
-        a[m] = bt[m - 1] / 2.0;
     }
 
-    // Symmetric Type-II taps (length 2m): h[m-j] = h[m-1+j] = a_j/2, j=1..m.
-    let mut h = vec![0.0_f64; numtaps];
-    for j in 1..=m {
-        h[m - j] = a[j] / 2.0;
-        h[m - 1 + j] = a[j] / 2.0;
+    let temp = (ngrid - 1) as f64 / nfcns as f64;
+    for j in 1..=nfcns {
+        iext[j] = ((j - 1) as f64 * temp) as usize + 1;
     }
-    Ok(h)
-}
-
-/// Parks-McClellan for an ANTISYMMETRIC (Hilbert-transformer) linear-phase FIR.
-/// Type III (odd `numtaps`): `A(ω)=sin(ω)·P(ω)`, forced zeros at ω=0 and ω=π.
-/// Type IV (even `numtaps`): `A(ω)=sin(ω/2)·P(ω)`, forced zero at ω=0 only.
-/// In both cases `P(ω)=Σ_{k=0}^{m-1} b_k cos(kω)`, so folding the sine factor into
-/// the desired/weight (`D'=D/sinfold`, `W'=W·sinfold`) reduces the weighted
-/// minimax problem to the same Type-I exchange used elsewhere; the recovered
-/// cosine coefficients map to the antisymmetric taps. The minimax optimum is
-/// unique, so this matches `scipy.signal.remez(type='hilbert')` to machine
-/// precision. Grid points where the sine fold ≈0 (DC, and Nyquist for Type III)
-/// carry no constraint and are dropped.
-fn remez_hilbert_pm(
-    numtaps: usize,
-    bands: &[f64],
-    desired: &[f64],
-    weights: &[f64],
-    differentiator: bool,
-) -> Result<Vec<f64>, SignalError> {
-    use std::f64::consts::PI;
-    let nbands = bands.len() / 2;
-    let odd = numtaps % 2 == 1;
-    let m = if odd { (numtaps - 1) / 2 } else { numtaps / 2 };
-    if m == 0 {
-        return Err(SignalError::InvalidArgument(
-            "numtaps too small for a Hilbert filter".to_string(),
-        ));
-    }
-    let nfcns = m;
+    iext[nfcns + 1] = ngrid;
+    let nm1 = nfcns - 1;
     let nz = nfcns + 1;
 
-    // Sine fold: Type III uses sin(ω)=sin(2πf) (zeros at f=0 and 0.5); Type IV
-    // uses sin(ω/2)=sin(πf) (zero at f=0 only).
-    let sinfold = |f: f64| -> f64 {
-        if odd {
-            (2.0 * PI * f).sin()
+    let mut niter = -1_i64;
+    if !mpr_remez_exchange(
+        &des,
+        &mut grid,
+        &edge,
+        &wt,
+        ngrid,
+        nbands,
+        &mut iext,
+        &mut alpha,
+        nfcns,
+        REMEZ_MAXITER,
+        dimsize,
+        &mut niter,
+    ) {
+        return Err(fail(niter));
+    }
+
+    // The impulse response (1-based).
+    let mut h = vec![0.0_f64; nfilt + 2];
+    if neg == 0 {
+        if nodd != 0 {
+            for j in 1..=nm1 {
+                h[j] = 0.5 * alpha[nz - j];
+            }
+            h[nfcns] = alpha[1];
         } else {
-            (PI * f).sin()
+            h[1] = 0.25 * alpha[nfcns];
+            for j in 2..=nm1 {
+                h[j] = 0.25 * (alpha[nz - j] + alpha[nfcns + 2 - j]);
+            }
+            h[nfcns] = 0.5 * alpha[1] + 0.25 * alpha[2];
         }
-    };
+    } else if nodd != 0 {
+        h[1] = 0.25 * alpha[nfcns];
+        h[2] = 0.25 * alpha[nm1];
+        for j in 3..=nm1 {
+            h[j] = 0.25 * (alpha[nz - j] - alpha[nfcns + 3 - j]);
+        }
+        h[nfcns] = 0.5 * alpha[1] - 0.25 * alpha[3];
+        h[nz] = 0.0;
+    } else {
+        h[1] = 0.25 * alpha[nfcns];
+        for j in 2..=nm1 {
+            h[j] = 0.25 * (alpha[nz - j] - alpha[nfcns + 2 - j]);
+        }
+        h[nfcns] = 0.5 * alpha[1] - 0.25 * alpha[2];
+    }
+    for j in 1..=nfcns {
+        let k = nfilt + 1 - j;
+        h[k] = if neg == 0 { h[j] } else { -h[j] };
+    }
+    if neg == 1 && nodd == 1 {
+        h[nz] = 0.0;
+    }
+    Ok(h[1..=nfilt].to_vec())
+}
 
-    let grid_density = 16usize;
-    let delf = 0.5 / (grid_density as f64 * nfcns as f64);
-    let eps = 1e-5;
-    let mut gridf: Vec<f64> = Vec::new();
-    let mut gdes: Vec<f64> = Vec::new();
-    let mut gwt: Vec<f64> = Vec::new();
-    let mut band_bounds: Vec<(usize, usize)> = Vec::new();
-    for b in 0..nbands {
-        let lo = bands[2 * b];
-        let hi = bands[2 * b + 1];
-        if hi < lo {
-            return Err(SignalError::InvalidArgument(
-                "band edges must be ascending".to_string(),
-            ));
-        }
-        let npts = (((hi - lo) / delf).floor() as usize).max(1) + 1;
-        let start = gridf.len();
-        for j in 0..npts {
-            let f = if j == npts - 1 {
-                hi
-            } else {
-                lo + j as f64 * delf
-            };
-            let q = sinfold(f);
-            if q.abs() < eps {
-                continue; // forced zero of A: no constraint here
-            }
-            // Hilbert: D(f)=desired, W(f)=weight. Differentiator (canonical
-            // McClellan-Parks-Rabiner convention): D(f)=desired·f (response ∝
-            // frequency), W(f)=weight/f (constant RELATIVE error). f≈0 is already
-            // dropped above as the forced DC zero, so W=weight/f never blows up.
-            let (d_eff, w_eff) = if differentiator {
-                (desired[b] * f, weights[b] / f)
-            } else {
-                (desired[b], weights[b])
-            };
-            gridf.push(f);
-            gdes.push(d_eff / q);
-            gwt.push(w_eff * q);
-        }
-        if gridf.len() > start {
-            band_bounds.push((start, gridf.len() - 1));
-        }
-    }
-    let ngrid = gridf.len();
-    if ngrid < nz {
-        return Err(SignalError::InvalidArgument(
-            "too few grid points for remez (hilbert)".to_string(),
-        ));
-    }
-    let x: Vec<f64> = gridf.iter().map(|&f| (2.0 * PI * f).cos()).collect();
-
-    let mut iext: Vec<usize> = (0..nz).map(|k| k * (ngrid - 1) / (nz - 1)).collect();
-    let mut y = vec![0.0_f64; nfcns];
-    let mut adp = vec![0.0_f64; nfcns];
-    let mut xe = vec![0.0_f64; nz];
-
-    for _iter in 0..64 {
-        for k in 0..nz {
-            xe[k] = x[iext[k]];
-        }
-        let mut ad = vec![0.0_f64; nz];
-        for k in 0..nz {
-            let mut p = 1.0;
-            for j in 0..nz {
-                if j != k {
-                    p *= xe[k] - xe[j];
-                }
-            }
-            ad[k] = 1.0 / p;
-        }
-        let mut dnum = 0.0;
-        let mut dden = 0.0;
-        for k in 0..nz {
-            dnum += ad[k] * gdes[iext[k]];
-            let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-            dden += s * ad[k] / gwt[iext[k]];
-        }
-        let dev = dnum / dden;
-        for k in 0..nfcns {
-            let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-            y[k] = gdes[iext[k]] - s * dev / gwt[iext[k]];
-        }
-        for k in 0..nfcns {
-            let mut p = 1.0;
-            for j in 0..nfcns {
-                if j != k {
-                    p *= xe[k] - xe[j];
-                }
-            }
-            adp[k] = 1.0 / p;
-        }
-        let eval_p = |xq: f64| -> f64 {
-            let mut num = 0.0;
-            let mut den = 0.0;
-            for k in 0..nfcns {
-                let d = xq - xe[k];
-                if d.abs() < 1e-13 {
-                    return y[k];
-                }
-                let t = adp[k] / d;
-                num += t * y[k];
-                den += t;
-            }
-            num / den
-        };
-        let err: Vec<f64> = (0..ngrid)
-            .map(|i| gwt[i] * (eval_p(x[i]) - gdes[i]))
-            .collect();
-
-        let mut cand: Vec<usize> = Vec::new();
-        for &(s, e) in &band_bounds {
-            cand.push(s);
-            for i in (s + 1)..e {
-                let a = err[i] - err[i - 1];
-                let b2 = err[i + 1] - err[i];
-                if (a > 0.0 && b2 <= 0.0) || (a < 0.0 && b2 >= 0.0) {
-                    cand.push(i);
-                }
-            }
-            if e != s {
-                cand.push(e);
-            }
-        }
-        let mut alt: Vec<usize> = Vec::new();
-        for &ci in &cand {
-            if let Some(&last) = alt.last()
-                && (err[ci] >= 0.0) == (err[last] >= 0.0)
-            {
-                if err[ci].abs() > err[last].abs() {
-                    *alt.last_mut().unwrap() = ci;
-                }
-                continue;
-            }
-            alt.push(ci);
-        }
-        while alt.len() > nz {
-            if err[alt[0]].abs() <= err[*alt.last().unwrap()].abs() {
-                alt.remove(0);
-            } else {
-                alt.pop();
-            }
-        }
-        if alt.len() != nz {
-            break;
-        }
-        let maxerr = alt.iter().map(|&i| err[i].abs()).fold(0.0_f64, f64::max);
-        let changed = alt != iext;
-        iext = alt;
-        if !changed || (maxerr - dev.abs()).abs() <= 1e-12 * maxerr.max(1e-30) {
-            break;
-        }
-    }
-
-    for k in 0..nz {
-        xe[k] = x[iext[k]];
-    }
-    let mut dnum = 0.0;
-    let mut dden = 0.0;
-    {
-        let mut ad = vec![0.0_f64; nz];
-        for k in 0..nz {
-            let mut p = 1.0;
-            for j in 0..nz {
-                if j != k {
-                    p *= xe[k] - xe[j];
-                }
-            }
-            ad[k] = 1.0 / p;
-        }
-        for k in 0..nz {
-            dnum += ad[k] * gdes[iext[k]];
-            let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-            dden += s * ad[k] / gwt[iext[k]];
-        }
-    }
-    let dev = dnum / dden;
-    for k in 0..nfcns {
-        let s = if k % 2 == 0 { 1.0 } else { -1.0 };
-        y[k] = gdes[iext[k]] - s * dev / gwt[iext[k]];
-    }
-    for k in 0..nfcns {
-        let mut p = 1.0;
-        for j in 0..nfcns {
+/// SciPy's `lagrange_interp` (the FORTRAN `d`): Lagrange interpolation coefficient `k`.
+fn mpr_lagrange_interp(k: usize, n: usize, m: usize, x: &[f64]) -> f64 {
+    let mut retval = 1.0_f64;
+    let q = x[k];
+    for l in 1..=m {
+        let mut j = l;
+        while j <= n {
             if j != k {
-                p *= xe[k] - xe[j];
+                retval *= 2.0 * (q - x[j]);
             }
+            j += m;
         }
-        adp[k] = 1.0 / p;
     }
-    let eval_p = |xq: f64| -> f64 {
-        let mut num = 0.0;
-        let mut den = 0.0;
-        for k in 0..nfcns {
-            let d = xq - xe[k];
-            if d.abs() < 1e-13 {
-                return y[k];
-            }
-            let t = adp[k] / d;
-            num += t * y[k];
-            den += t;
-        }
-        num / den
+    1.0 / retval
+}
+
+/// SciPy's `freq_eval` (the FORTRAN `gee`): the barycentric Lagrange form at `grid[k]`.
+fn mpr_freq_eval(k: usize, n: usize, grid: &[f64], x: &[f64], y: &[f64], ad: &[f64]) -> f64 {
+    let (mut d, mut p) = (0.0_f64, 0.0_f64);
+    let xf = (std::f64::consts::TAU * grid[k]).cos();
+    for j in 1..=n {
+        let c = ad[j] / (xf - x[j]);
+        d += c;
+        p += c * y[j];
+    }
+    p / d
+}
+
+/// The labels of SciPy's `remez` subroutine, whose control flow is a goto state machine.
+#[derive(Clone, Copy)]
+enum MprLabel {
+    L200,
+    L210,
+    L215,
+    L220,
+    L225,
+    L230,
+    L235,
+    L240,
+    L250,
+    L255,
+    L260,
+    L300,
+    L310,
+    L315,
+    L320,
+    L325,
+    L330,
+    L340,
+    L350,
+    L370,
+}
+
+/// SciPy's `remez` subroutine: the exchange iterations, then the cosine coefficients `alpha`.
+/// Returns false where SciPy returns -1 (the deviation stopped growing: "Failure to converge"),
+/// with the iteration count in `niter_out`. Exceeding `itrmax` is NOT a failure in SciPy: the
+/// loop ends and the coefficients of the current extremal set are returned.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn mpr_remez_exchange(
+    des: &[f64],
+    grid: &mut [f64],
+    edge: &[f64],
+    wt: &[f64],
+    ngrid: usize,
+    nbands: usize,
+    iext: &mut [usize],
+    alpha: &mut [f64],
+    nfcns: usize,
+    itrmax: i64,
+    dimsize: usize,
+    niter_out: &mut i64,
+) -> bool {
+    use MprLabel::{
+        L200, L210, L215, L220, L225, L230, L235, L240, L250, L255, L260, L300, L310, L315, L320,
+        L325, L330, L340, L350, L370,
     };
+    const TWOPI: f64 = std::f64::consts::TAU;
+    let mut a = vec![0.0_f64; dimsize + 2];
+    let mut p = vec![0.0_f64; dimsize + 2];
+    let mut q = vec![0.0_f64; dimsize + 2];
+    let mut ad = vec![0.0_f64; dimsize + 2];
+    let mut x = vec![0.0_f64; dimsize + 2];
+    let mut y = vec![0.0_f64; dimsize + 2];
+    let nz = nfcns + 1;
+    let nzz = nfcns + 2;
+    let mut devl = -1.0_f64;
+    let mut niter = 0_i64;
+    let mut dev;
+    // Signed like the C ints (`klow` and `l` go to 0). Those the C sets afresh at L100 are
+    // declared there; these carry across the search labels and iterations.
+    let (mut kup, mut l) = (0_i64, 0_i64);
+    let (mut nut1, mut luck) = (0_i64, 0_i64);
+    let (mut ynz, mut comp, mut y1) = (0.0_f64, 0.0_f64, 0.0_f64);
+    let mut err: f64 = 0.0;
 
-    // P's cosine coefficients b_k via Chebyshev DCT-II.
-    let nn = nfcns;
-    let samp: Vec<f64> = (0..nn)
-        .map(|j| eval_p((PI * (j as f64 + 0.5) / nn as f64).cos()))
-        .collect();
-    let mut bt = vec![0.0_f64; nfcns + 2]; // zero-padded so b_m = b_{m+1} = 0
-    for (k, btk) in bt.iter_mut().enumerate().take(nfcns) {
-        let mut s = 0.0;
-        for (j, &sj) in samp.iter().enumerate() {
-            s += sj * (PI * k as f64 * (j as f64 + 0.5) / nn as f64).cos();
+    'outer: loop {
+        // L100
+        iext[nzz] = ngrid + 1;
+        niter += 1;
+        if niter > itrmax {
+            break 'outer;
         }
-        *btk = 2.0 / nn as f64 * s;
-    }
-    bt[0] *= 0.5;
+        for jj in 1..=nz {
+            x[jj] = (grid[iext[jj]] * TWOPI).cos();
+        }
+        let jet = (nfcns - 1) / 15 + 1;
+        for jj in 1..=nz {
+            ad[jj] = mpr_lagrange_interp(jj, nz, jet, &x);
+        }
+        let (mut dnum, mut dden) = (0.0_f64, 0.0_f64);
+        let mut k = 1.0_f64;
+        for jj in 1..=nz {
+            let li = iext[jj];
+            dnum += ad[jj] * des[li];
+            dden += k * ad[jj] / wt[li];
+            k = -k;
+        }
+        dev = dnum / dden;
+        let nu: i64 = if dev > 0.0 { -1 } else { 1 };
+        dev *= -(nu as f64);
+        let mut kk = nu as f64;
+        for jj in 1..=nz {
+            let li = iext[jj];
+            y[jj] = des[li] + kk * dev / wt[li];
+            kk = -kk;
+        }
+        if dev <= devl {
+            *niter_out = niter;
+            return false;
+        }
+        devl = dev;
+        let mut jchnge = 0_i64;
+        let mut k1 = iext[1] as i64;
+        let mut knz = iext[nz] as i64;
+        let mut klow = 0_i64;
+        let mut nut = -nu;
+        let mut j = 1_i64;
 
-    // Antisymmetric taps. Recover the sine coefficients c_j (coeffs of
-    // A = Σ_{j=1}^{m} c_j · sin(j ω) [Type III] or sin((j-½)ω) [Type IV]) from b,
-    // then h[m-j] = c_j/2, h[(odd? m : m-1)+j] = -c_j/2; the Type-III centre tap
-    // h[m] stays 0.
-    let mut h = vec![0.0_f64; numtaps];
-    for j in 1..=m {
-        let c_j = if odd {
-            // Type III: c_1 = b_0 - b_2/2; c_j = (b_{j-1} - b_{j+1})/2.
-            if j == 1 {
-                bt[0] - bt[2] / 2.0
-            } else {
-                (bt[j - 1] - bt[j + 1]) / 2.0
-            }
-        } else {
-            // Type IV: d_1 = b_0 - b_1/2; d_j = (b_{j-1} - b_j)/2.
-            if j == 1 {
-                bt[0] - bt[1] / 2.0
-            } else {
-                (bt[j - 1] - bt[j]) / 2.0
-            }
+        let e = |l: i64, x: &[f64], y: &[f64], ad: &[f64], grid: &[f64]| {
+            let li = l as usize;
+            (mpr_freq_eval(li, nz, grid, x, y, ad) - des[li]) * wt[li]
         };
-        h[m - j] = c_j / 2.0;
-        let hi = if odd { m + j } else { m - 1 + j };
-        h[hi] = -c_j / 2.0;
+        let mut label = L200;
+        loop {
+            match label {
+                L200 => {
+                    if j == nzz as i64 {
+                        ynz = comp;
+                    }
+                    if j >= nzz as i64 {
+                        label = L300;
+                        continue;
+                    }
+                    kup = iext[(j + 1) as usize] as i64;
+                    l = iext[j as usize] as i64 + 1;
+                    nut = -nut;
+                    if j == 2 {
+                        y1 = comp;
+                    }
+                    comp = dev;
+                    if l >= kup {
+                        label = L220;
+                        continue;
+                    }
+                    err = e(l, &x, &y, &ad, grid);
+                    if (nut as f64) * err - comp <= 0.0 {
+                        label = L220;
+                        continue;
+                    }
+                    comp = (nut as f64) * err;
+                    label = L210;
+                }
+                L210 => {
+                    l += 1;
+                    if l >= kup {
+                        label = L215;
+                        continue;
+                    }
+                    err = e(l, &x, &y, &ad, grid);
+                    if (nut as f64) * err - comp <= 0.0 {
+                        label = L215;
+                        continue;
+                    }
+                    comp = (nut as f64) * err;
+                    label = L210;
+                }
+                L215 => {
+                    iext[j as usize] = (l - 1) as usize;
+                    j += 1;
+                    klow = l - 1;
+                    jchnge += 1;
+                    label = L200;
+                }
+                L220 => {
+                    l -= 1;
+                    label = L225;
+                }
+                L225 => {
+                    l -= 1;
+                    if l <= klow {
+                        label = L250;
+                        continue;
+                    }
+                    err = e(l, &x, &y, &ad, grid);
+                    if (nut as f64) * err - comp > 0.0 {
+                        label = L230;
+                        continue;
+                    }
+                    label = if jchnge <= 0 { L225 } else { L260 };
+                }
+                L230 => {
+                    comp = (nut as f64) * err;
+                    label = L235;
+                }
+                L235 => {
+                    l -= 1;
+                    if l <= klow {
+                        label = L240;
+                        continue;
+                    }
+                    err = e(l, &x, &y, &ad, grid);
+                    if (nut as f64) * err - comp <= 0.0 {
+                        label = L240;
+                        continue;
+                    }
+                    comp = (nut as f64) * err;
+                    label = L235;
+                }
+                L240 => {
+                    klow = iext[j as usize] as i64;
+                    iext[j as usize] = (l + 1) as usize;
+                    j += 1;
+                    jchnge += 1;
+                    label = L200;
+                }
+                L250 => {
+                    l = iext[j as usize] as i64 + 1;
+                    label = if jchnge > 0 { L215 } else { L255 };
+                }
+                L255 => {
+                    l += 1;
+                    if l >= kup {
+                        label = L260;
+                        continue;
+                    }
+                    err = e(l, &x, &y, &ad, grid);
+                    if (nut as f64) * err - comp <= 0.0 {
+                        label = L255;
+                        continue;
+                    }
+                    comp = (nut as f64) * err;
+                    label = L210;
+                }
+                L260 => {
+                    klow = iext[j as usize] as i64;
+                    j += 1;
+                    label = L200;
+                }
+                L300 => {
+                    if j > nzz as i64 {
+                        label = L320;
+                        continue;
+                    }
+                    if k1 > iext[1] as i64 {
+                        k1 = iext[1] as i64;
+                    }
+                    if knz < iext[nz] as i64 {
+                        knz = iext[nz] as i64;
+                    }
+                    nut1 = nut;
+                    nut = -nu;
+                    l = 0;
+                    kup = k1;
+                    comp = ynz * 1.00001;
+                    luck = 1;
+                    label = L310;
+                }
+                L310 => {
+                    l += 1;
+                    if l >= kup {
+                        label = L315;
+                        continue;
+                    }
+                    err = e(l, &x, &y, &ad, grid);
+                    if (nut as f64) * err - comp <= 0.0 {
+                        label = L310;
+                        continue;
+                    }
+                    comp = (nut as f64) * err;
+                    j = nzz as i64;
+                    label = L210;
+                }
+                L315 => {
+                    luck = 6;
+                    label = L325;
+                }
+                L320 => {
+                    if luck > 9 {
+                        label = L350;
+                        continue;
+                    }
+                    if comp > y1 {
+                        y1 = comp;
+                    }
+                    k1 = iext[nzz] as i64;
+                    label = L325;
+                }
+                L325 => {
+                    l = ngrid as i64 + 1;
+                    klow = knz;
+                    nut = -nut1;
+                    comp = y1 * 1.00001;
+                    label = L330;
+                }
+                L330 => {
+                    l -= 1;
+                    if l <= klow {
+                        label = L340;
+                        continue;
+                    }
+                    err = e(l, &x, &y, &ad, grid);
+                    if (nut as f64) * err - comp <= 0.0 {
+                        label = L330;
+                        continue;
+                    }
+                    j = nzz as i64;
+                    comp = (nut as f64) * err;
+                    luck += 10;
+                    label = L235;
+                }
+                L340 => {
+                    if luck == 6 {
+                        label = L370;
+                        continue;
+                    }
+                    for jj in 1..=nfcns {
+                        iext[nzz - jj] = iext[nz - jj];
+                    }
+                    iext[1] = k1 as usize;
+                    continue 'outer;
+                }
+                L350 => {
+                    let kn = iext[nzz];
+                    for jj in 1..=nfcns {
+                        iext[jj] = iext[jj + 1];
+                    }
+                    iext[nz] = kn;
+                    continue 'outer;
+                }
+                L370 => {
+                    if jchnge > 0 {
+                        continue 'outer;
+                    }
+                    break 'outer;
+                }
+            }
+        }
     }
-    Ok(h)
+
+    // The coefficients of the best approximation, by an inverse discrete Fourier transform.
+    let nm1 = nfcns - 1;
+    let fsh = 1.0e-06;
+    let gtemp = grid[1];
+    x[nzz] = -2.0;
+    let cn = 2 * nfcns - 1;
+    let delf = 1.0 / cn as f64;
+    let mut li = 1_usize;
+    let mut kkk = 0;
+    if edge[1] == 0.0 && edge[2 * nbands] == 0.5 {
+        kkk = 1;
+    }
+    if nfcns <= 3 {
+        kkk = 1;
+    }
+    let (mut aa, mut bb) = (0.0_f64, 0.0_f64);
+    if kkk != 1 {
+        let dtemp = (TWOPI * grid[1]).cos();
+        let dnum = (TWOPI * grid[ngrid]).cos();
+        aa = 2.0 / (dtemp - dnum);
+        bb = -(dtemp + dnum) / (dtemp - dnum);
+    }
+    for jj in 1..=nfcns {
+        let mut ft = (jj - 1) as f64 * delf;
+        let mut xt = (TWOPI * ft).cos();
+        if kkk != 1 {
+            xt = (xt - bb) / aa;
+            ft = xt.acos() / TWOPI;
+        }
+        loop {
+            // L410
+            let xe = x[li];
+            if xt > xe {
+                // L420
+                if (xt - xe) < fsh {
+                    a[jj] = y[li];
+                } else {
+                    grid[1] = ft;
+                    a[jj] = mpr_freq_eval(1, nz, grid, &x, &y, &ad);
+                }
+                break;
+            }
+            if (xe - xt) < fsh {
+                // L415
+                a[jj] = y[li];
+                break;
+            }
+            li += 1;
+        }
+        // L425
+        if li > 1 {
+            li -= 1;
+        }
+    }
+    grid[1] = gtemp;
+    let dden = TWOPI / cn as f64;
+    for jj in 1..=nfcns {
+        let mut dtemp = 0.0_f64;
+        let dnum = (jj - 1) as f64 * dden;
+        if nm1 >= 1 {
+            for k in 1..=nm1 {
+                dtemp += a[k + 1] * (dnum * k as f64).cos();
+            }
+        }
+        alpha[jj] = 2.0 * dtemp + a[1];
+    }
+    for jj in 2..=nfcns {
+        alpha[jj] *= 2.0 / cn as f64;
+    }
+    alpha[1] /= cn as f64;
+
+    if kkk != 1 {
+        p[1] = 2.0 * alpha[nfcns] * bb + alpha[nm1];
+        p[2] = 2.0 * aa * alpha[nfcns];
+        q[1] = alpha[nfcns - 2] - alpha[nfcns];
+        for jj in 2..=nm1 {
+            if jj >= nm1 {
+                aa *= 0.5;
+                bb *= 0.5;
+            }
+            p[jj + 1] = 0.0;
+            for k in 1..=jj {
+                a[k] = p[k];
+                p[k] = 2.0 * bb * a[k];
+            }
+            p[2] += a[1] * 2.0 * aa;
+            for k in 1..jj {
+                p[k] += q[k] + aa * a[k + 1];
+            }
+            for k in 3..=jj + 1 {
+                p[k] += aa * a[k - 1];
+            }
+            if jj != nm1 {
+                for k in 1..=jj {
+                    q[k] = -a[k];
+                }
+                q[1] += alpha[nfcns - 1 - jj];
+            }
+        }
+        alpha[1..=nfcns].copy_from_slice(&p[1..=nfcns]);
+    }
+    if nfcns <= 3 {
+        alpha[nfcns + 1] = 0.0;
+        alpha[nfcns + 2] = 0.0;
+    }
+    true
 }
 
 /// Design a linear-phase FIR filter using least-squares.
