@@ -509,6 +509,53 @@ pub struct SolveCertificate {
     pub expected_losses: Vec<f64>,
     pub chosen_expected_loss: f64,
     pub fallback_active: bool,
+    /// What a third party can check about the ANSWER, for a linear solve: backward errors that
+    /// [`verify_solve_certificate`] recomputes from `(A, b, x)` alone, and a forward error bound.
+    /// `None` for `inv`, `lstsq` and `pinv` certificates (frankenscipy-7tb8d.6).
+    pub accuracy: Option<AccuracyCertificate>,
+}
+
+/// The checkable part of a solve certificate (frankenscipy-7tb8d.6). `r = b − A·x` is computed
+/// in double-double (compensated TwoProd / TwoSum dot products, rounded once), so its own error
+/// is about `(n + 2)·u²·(|A||x| + |b|)`, far below what these quantities resolve.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AccuracyCertificate {
+    /// Oettli–Prager componentwise backward error `ω = max_i |r_i| / (|A||x| + |b|)_i`: the
+    /// smallest relative componentwise perturbation of `A` and `b` for which `x` is exact.
+    pub componentwise_backward_error: f64,
+    /// Rigal–Gaches normwise backward error `‖r‖∞ / (‖A‖∞‖x‖∞ + ‖b‖∞)`.
+    pub normwise_backward_error: f64,
+    /// A bound on `‖x − x*‖∞ / ‖x‖∞`, where `x*` is the exact solution: LAPACK xGERFS's FERR,
+    /// `‖ |A⁻¹| (|r| + (n+1)·u·(|A||x| + |b|)) ‖∞ / ‖x‖∞`, which follows from
+    /// `x − x* = −A⁻¹·r_exact`. `None` when it cannot be trusted: `n·u/rcond ≥ 1/2` (the
+    /// computed `A⁻¹` itself is unreliable), `‖x‖∞ = 0`, or a non-finite value.
+    pub forward_error_bound: Option<f64>,
+    /// How `|A⁻¹|` entered [`Self::forward_error_bound`].
+    pub forward_bound_method: ForwardBoundMethod,
+    /// The part of `A` the solve read, which is the matrix these quantities are about.
+    pub solved_part: SolvedPart,
+}
+
+/// The part of `A` a solve reads: a diagonal solve reads the diagonal, a triangular one its
+/// triangle, the rest the whole (already mirrored) matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SolvedPart {
+    Full,
+    Diagonal,
+    UpperTriangle,
+    LowerTriangle,
+}
+
+/// How the forward error bound's `‖ |A⁻¹| g ‖∞` was obtained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum ForwardBoundMethod {
+    /// From an explicit `A⁻¹` (n ≤ [`FORWARD_BOUND_EXPLICIT_MAX_N`], or diagonal `A`).
+    ExplicitInverse,
+    /// Higham's 1-norm estimator (LAPACK `dlacn2`) on `A⁻¹·diag(g)`, as xGERFS does: an
+    /// estimate, not a proof, and almost always an overestimate.
+    Estimated,
+    /// No bound (see [`AccuracyCertificate::forward_error_bound`]).
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2117,6 +2164,7 @@ fn build_solve_certificate(
     posterior: [f64; 4],
     expected_losses: [f64; 6],
     fallback_active: bool,
+    accuracy: AccuracyCertificate,
 ) -> SolveCertificate {
     SolveCertificate {
         action,
@@ -2127,6 +2175,417 @@ fn build_solve_certificate(
         expected_losses: expected_losses.to_vec(),
         chosen_expected_loss: expected_losses[action.index()],
         fallback_active,
+        accuracy: Some(accuracy),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Verifiable accuracy certificates (frankenscipy-7tb8d.6)
+// ═══════════════════════════════════════════════════════════════════
+
+/// `n` up to which the forward error bound uses an explicit `A⁻¹` (O(n³), about the cost of
+/// the solve's own factorization); above it, Higham's estimator in O(n²) per step.
+pub const FORWARD_BOUND_EXPLICIT_MAX_N: usize = 64;
+
+/// `a + b = s + e` exactly (Knuth's TwoSum).
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b;
+    let bb = s - a;
+    (s, (a - (s - bb)) + (b - bb))
+}
+
+/// `a · b = p + e` exactly: a fused multiply-add rounds `a·b − p` once, and that value is
+/// representable, so `e` is exact (barring overflow and underflow).
+fn two_prod(a: f64, b: f64) -> (f64, f64) {
+    let p = a * b;
+    (p, a.mul_add(b, -p))
+}
+
+/// `r = b − A·x`, each component a compensated dot product (Ogita–Rump–Oishi Dot2: as accurate
+/// as double-double, rounded once), and `|A||x| + |b|` beside it.
+fn residual_and_magnitude(a: &[Vec<f64>], x: &[f64], b: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    a.iter()
+        .zip(b)
+        .map(|(row, &bi)| {
+            let (mut hi, mut lo) = (bi, 0.0);
+            let mut magnitude = bi.abs();
+            for (&aij, &xj) in row.iter().zip(x) {
+                let (p, pe) = two_prod(aij, xj);
+                let (s, se) = two_sum(hi, -p);
+                hi = s;
+                lo += se - pe;
+                magnitude += p.abs();
+            }
+            let (s, e) = two_sum(hi, lo);
+            (s + e, magnitude)
+        })
+        .unzip()
+}
+
+/// Oettli–Prager `ω = max_i |r_i| / (|A||x| + |b|)_i`; a zero denominator contributes 0 with a
+/// zero residual and ∞ otherwise.
+fn componentwise_backward_error(r: &[f64], magnitude: &[f64]) -> f64 {
+    r.iter().zip(magnitude).fold(0.0_f64, |omega, (&ri, &mi)| {
+        let term = if ri == 0.0 {
+            0.0
+        } else if mi == 0.0 {
+            f64::INFINITY
+        } else {
+            ri.abs() / mi
+        };
+        if term.is_nan() {
+            f64::NAN
+        } else {
+            omega.max(term)
+        }
+    })
+}
+
+/// `‖r‖∞ / (‖A‖∞‖x‖∞ + ‖b‖∞)`.
+fn normwise_backward_error(a: &[Vec<f64>], x: &[f64], b: &[f64], r: &[f64]) -> f64 {
+    let inf = |v: &[f64]| v.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+    let a_inf = a
+        .iter()
+        .map(|row| row.iter().map(|e| e.abs()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    let residual = inf(r);
+    let denominator = a_inf * inf(x) + inf(b);
+    if residual == 0.0 {
+        0.0
+    } else if denominator == 0.0 {
+        f64::INFINITY
+    } else {
+        residual / denominator
+    }
+}
+
+/// Higham's estimate of `‖M‖₁` for an `n × n` operator known only through `apply` (`v ← M·v`)
+/// and `apply_t` (`v ← Mᵀ·v`): LAPACK `dlacn2`, including its alternating-sign safeguard.
+fn one_norm_estimate(
+    n: usize,
+    mut apply: impl FnMut(&mut Vec<f64>),
+    mut apply_t: impl FnMut(&mut Vec<f64>),
+) -> f64 {
+    const ITMAX: usize = 5;
+    let sum_abs = |v: &[f64]| v.iter().map(|e| e.abs()).sum::<f64>();
+    let argmax_abs = |v: &[f64]| {
+        v.iter()
+            .enumerate()
+            .fold((0, -1.0_f64), |best, (i, e)| {
+                if e.abs() > best.1 { (i, e.abs()) } else { best }
+            })
+            .0
+    };
+    let sign = |e: f64| if e >= 0.0 { 1.0 } else { -1.0 };
+    let mut x = vec![1.0 / n as f64; n];
+    apply(&mut x);
+    if n == 1 {
+        return x[0].abs();
+    }
+    let mut est = sum_abs(&x);
+    let mut signs: Vec<f64> = x.iter().map(|&e| sign(e)).collect();
+    let mut z = signs.clone();
+    apply_t(&mut z);
+    let mut j = argmax_abs(&z);
+    let mut iteration = 2;
+    loop {
+        let mut e_j = vec![0.0; n];
+        e_j[j] = 1.0;
+        apply(&mut e_j);
+        let previous = est;
+        est = sum_abs(&e_j);
+        let new_signs: Vec<f64> = e_j.iter().map(|&e| sign(e)).collect();
+        if new_signs == signs || est <= previous {
+            break;
+        }
+        signs = new_signs;
+        let mut z = signs.clone();
+        apply_t(&mut z);
+        let last = j;
+        j = argmax_abs(&z);
+        if z[last] == z[j].abs() || iteration >= ITMAX {
+            break;
+        }
+        iteration += 1;
+    }
+    let mut alternating: Vec<f64> = (0..n)
+        .map(|i| {
+            let magnitude = 1.0 + i as f64 / (n - 1) as f64;
+            if i % 2 == 0 { magnitude } else { -magnitude }
+        })
+        .collect();
+    apply(&mut alternating);
+    est.max(2.0 * sum_abs(&alternating) / (3.0 * n as f64))
+}
+
+/// How the certificate reaches `A⁻¹`.
+enum InverseAccess<'a> {
+    /// Only the diagonal was solved: `A⁻¹ = diag(1/d)`.
+    Diagonal,
+    /// Only one triangle was solved.
+    Triangular { lower: bool },
+    /// An LU factorization of `A`.
+    Lu(&'a LU<f64, Dyn, Dyn>),
+}
+
+/// LAPACK xGERFS's forward error bound (see [`AccuracyCertificate::forward_error_bound`]).
+fn forward_error_bound(
+    a: &[Vec<f64>],
+    x: &[f64],
+    r: &[f64],
+    magnitude: &[f64],
+    rcond: f64,
+    inverse: &InverseAccess<'_>,
+) -> (Option<f64>, ForwardBoundMethod) {
+    let n = a.len();
+    let unit_roundoff = f64::EPSILON / 2.0;
+    let x_inf = x.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+    // The computed A⁻¹ is itself only accurate to about n·u·κ.
+    let trustworthy = rcond > 0.0 && (n as f64) * unit_roundoff / rcond < 0.5;
+    if n == 0 || x_inf == 0.0 || !x_inf.is_finite() || !trustworthy {
+        return (None, ForwardBoundMethod::Unavailable);
+    }
+    let g: Vec<f64> = r
+        .iter()
+        .zip(magnitude)
+        .map(|(ri, mi)| ri.abs() + (n as f64 + 1.0) * unit_roundoff * mi)
+        .collect();
+    let explicit = |inv: &dyn Fn(usize, usize) -> f64| {
+        (0..n)
+            .map(|i| (0..n).map(|j| inv(i, j).abs() * g[j]).sum::<f64>())
+            .fold(0.0_f64, f64::max)
+    };
+    let (norm, method) = match inverse {
+        InverseAccess::Diagonal => (
+            (0..n).map(|i| g[i] / a[i][i].abs()).fold(0.0_f64, f64::max),
+            ForwardBoundMethod::ExplicitInverse,
+        ),
+        InverseAccess::Triangular { lower } if n <= FORWARD_BOUND_EXPLICIT_MAX_N => {
+            match triangular_inverse(a, n, *lower) {
+                Ok(inv) => (
+                    explicit(&|i, j| inv[i][j]),
+                    ForwardBoundMethod::ExplicitInverse,
+                ),
+                Err(_) => return (None, ForwardBoundMethod::Unavailable),
+            }
+        }
+        InverseAccess::Lu(lu) if n <= FORWARD_BOUND_EXPLICIT_MAX_N => {
+            match lu.solve(&DMatrix::identity(n, n)) {
+                Some(inv) => (
+                    explicit(&|i, j| inv[(i, j)]),
+                    ForwardBoundMethod::ExplicitInverse,
+                ),
+                None => return (None, ForwardBoundMethod::Unavailable),
+            }
+        }
+        // ‖ |A⁻¹| g ‖∞ = ‖ A⁻¹·diag(g) ‖∞ = ‖ M ‖₁ with M = diag(g)·A⁻ᵀ, as xGERFS estimates it.
+        InverseAccess::Triangular { lower } => {
+            let solve_with = |v: &mut Vec<f64>, trans: TriangularTranspose| {
+                if let Ok(result) = solve_triangular_internal(a, v, trans, *lower, false) {
+                    *v = result.x;
+                } else {
+                    v.iter_mut().for_each(|e| *e = f64::INFINITY);
+                }
+            };
+            let estimate = one_norm_estimate(
+                n,
+                |v| {
+                    solve_with(v, TriangularTranspose::Transpose);
+                    v.iter_mut().zip(&g).for_each(|(e, gi)| *e *= gi);
+                },
+                |v| {
+                    v.iter_mut().zip(&g).for_each(|(e, gi)| *e *= gi);
+                    solve_with(v, TriangularTranspose::NoTranspose);
+                },
+            );
+            (estimate, ForwardBoundMethod::Estimated)
+        }
+        InverseAccess::Lu(lu) => {
+            let estimate = one_norm_estimate(
+                n,
+                |v| {
+                    let rhs = DVector::from_column_slice(v);
+                    match solve_lu_transpose(lu, &rhs) {
+                        Some(w) => {
+                            *v = w.iter().zip(&g).map(|(e, gi)| e * gi).collect();
+                        }
+                        None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                    }
+                },
+                |v| {
+                    let rhs = DVector::from_iterator(n, v.iter().zip(&g).map(|(e, gi)| e * gi));
+                    match lu.solve(&rhs) {
+                        Some(w) => *v = w.iter().copied().collect(),
+                        None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                    }
+                },
+            );
+            (estimate, ForwardBoundMethod::Estimated)
+        }
+    };
+    let bound = norm / x_inf;
+    if bound.is_finite() {
+        (Some(bound), method)
+    } else {
+        (None, ForwardBoundMethod::Unavailable)
+    }
+}
+
+/// The part of `A` a solve with this report read, decided as `dispatch_solve_action` decides it.
+fn solved_part(report: &ConditionReport) -> SolvedPart {
+    match report.structural_evidence {
+        StructuralEvidence::Diagonal => SolvedPart::Diagonal,
+        StructuralEvidence::Triangular if report.lower_triangular => SolvedPart::LowerTriangle,
+        StructuralEvidence::Triangular => SolvedPart::UpperTriangle,
+        StructuralEvidence::General | StructuralEvidence::Symmetric => SolvedPart::Full,
+    }
+}
+
+/// `a` restricted to the part a solve read; the certificate is about that matrix.
+fn solved_matrix(a: &[Vec<f64>], part: SolvedPart) -> Cow<'_, [Vec<f64>]> {
+    let keep = |i: usize, j: usize| match part {
+        SolvedPart::Full => true,
+        SolvedPart::Diagonal => i == j,
+        SolvedPart::UpperTriangle => j >= i,
+        SolvedPart::LowerTriangle => j <= i,
+    };
+    if part == SolvedPart::Full {
+        return Cow::Borrowed(a);
+    }
+    Cow::Owned(
+        a.iter()
+            .enumerate()
+            .map(|(i, row)| {
+                row.iter()
+                    .enumerate()
+                    .map(|(j, &v)| if keep(i, j) { v } else { 0.0 })
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// The accuracy part of a solve certificate for `x` from a solve of `A·x = b`. `lu` is the
+/// diagnostics' factorization of `A`, when there is one.
+fn certify_accuracy(
+    a: &[Vec<f64>],
+    b: &[f64],
+    x: &[f64],
+    report: &ConditionReport,
+    lu: Option<&LU<f64, Dyn, Dyn>>,
+) -> AccuracyCertificate {
+    let part = solved_part(report);
+    let solved = solved_matrix(a, part);
+    let (r, magnitude) = residual_and_magnitude(&solved, x, b);
+    let fresh_lu;
+    let inverse = match part {
+        SolvedPart::Diagonal => Some(InverseAccess::Diagonal),
+        SolvedPart::LowerTriangle => Some(InverseAccess::Triangular { lower: true }),
+        SolvedPart::UpperTriangle => Some(InverseAccess::Triangular { lower: false }),
+        SolvedPart::Full => match lu {
+            Some(lu) => Some(InverseAccess::Lu(lu)),
+            None => match dmatrix_from_rows(&solved) {
+                Ok(matrix) => {
+                    fresh_lu = matrix.lu();
+                    Some(InverseAccess::Lu(&fresh_lu))
+                }
+                Err(_) => None,
+            },
+        },
+    };
+    let (forward_error_bound, forward_bound_method) = match &inverse {
+        Some(inverse) => {
+            forward_error_bound(&solved, x, &r, &magnitude, report.rcond_estimate, inverse)
+        }
+        None => (None, ForwardBoundMethod::Unavailable),
+    };
+    AccuracyCertificate {
+        componentwise_backward_error: componentwise_backward_error(&r, &magnitude),
+        normwise_backward_error: normwise_backward_error(&solved, x, b, &r),
+        forward_error_bound,
+        forward_bound_method,
+        solved_part: part,
+    }
+}
+
+/// The outcome of [`verify_solve_certificate`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VerifyReport {
+    /// ω recomputed from `(A, b, x)` with the double-double residual.
+    pub componentwise_backward_error: f64,
+    /// η recomputed the same way.
+    pub normwise_backward_error: f64,
+    /// Whether both recomputed backward errors are within the certified ones (plus
+    /// [`VERIFY_RELATIVE_SLACK`]).
+    pub verified: bool,
+    /// Why verification failed; empty when it passed.
+    pub reason: String,
+}
+
+/// Relative slack allowed between a recomputed and a certified backward error. The two are
+/// computed by the same deterministic code from the same `(A, b, x)`, so they agree exactly
+/// unless the inputs differ; the slack only absorbs a caller that re-serialized the certificate
+/// through a text format with fewer digits.
+pub const VERIFY_RELATIVE_SLACK: f64 = 1e-12;
+
+/// Checks a solve certificate against `(A, b, x)` in O(n²), without trusting the solver:
+/// recomputes `r = b − A·x` in double-double and both backward errors, and accepts only if they
+/// do not exceed the certified ones. A certificate without an accuracy section, or for a
+/// different shape, does not verify.
+///
+/// `a` is the matrix of the system actually solved: the matrix passed in, transposed for
+/// `transposed`, and for `assume_a` symmetric / Hermitian / positive definite the triangle SciPy
+/// reads, mirrored. For a diagonal or triangular solve, the certificate's
+/// [`AccuracyCertificate::solved_part`] selects the part that was read.
+#[must_use]
+pub fn verify_solve_certificate(
+    a: &[Vec<f64>],
+    b: &[f64],
+    x: &[f64],
+    certificate: &SolveCertificate,
+) -> VerifyReport {
+    let fail = |reason: &str| VerifyReport {
+        componentwise_backward_error: f64::NAN,
+        normwise_backward_error: f64::NAN,
+        verified: false,
+        reason: reason.to_string(),
+    };
+    let n = a.len();
+    if certificate.matrix_shape != (n, n)
+        || !rows_are_rectangular(a, n)
+        || b.len() != n
+        || x.len() != n
+    {
+        return fail("shape does not match the certificate");
+    }
+    let Some(accuracy) = certificate.accuracy.as_ref() else {
+        return fail("certificate carries no accuracy section");
+    };
+    let solved = solved_matrix(a, accuracy.solved_part);
+    let (r, magnitude) = residual_and_magnitude(&solved, x, b);
+    let omega = componentwise_backward_error(&r, &magnitude);
+    let eta = normwise_backward_error(&solved, x, b, &r);
+    let within = |recomputed: f64, certified: f64| {
+        recomputed.is_finite() && recomputed <= certified * (1.0 + VERIFY_RELATIVE_SLACK)
+    };
+    let mut reasons = Vec::new();
+    if !within(omega, accuracy.componentwise_backward_error) {
+        reasons.push(format!(
+            "componentwise backward error {omega:e} exceeds the certified {:e}",
+            accuracy.componentwise_backward_error
+        ));
+    }
+    if !within(eta, accuracy.normwise_backward_error) {
+        reasons.push(format!(
+            "normwise backward error {eta:e} exceeds the certified {:e}",
+            accuracy.normwise_backward_error
+        ));
+    }
+    VerifyReport {
+        componentwise_backward_error: omega,
+        normwise_backward_error: eta,
+        verified: reasons.is_empty(),
+        reason: reasons.join("; "),
     }
 }
 
@@ -2280,8 +2739,15 @@ fn dispatch_solve_action(
                 matrix.clone().lu()
             };
             let rhs = DVector::from_column_slice(b);
-            let x = lu.solve(&rhs).ok_or(LinalgError::SingularMatrix)?;
-            let backward_err = compute_backward_error(&matrix, &x, &rhs);
+            let solved = lu.solve(&rhs);
+            let backward_err = solved
+                .as_ref()
+                .map(|x| compute_backward_error(&matrix, x, &rhs));
+            // Handed back: the accuracy certificate's forward bound reuses the factorization.
+            *matrix_cache = Some(matrix);
+            *lu_cache = Some(lu);
+            let x = solved.ok_or(LinalgError::SingularMatrix)?;
+            let backward_err = backward_err.unwrap_or(f64::INFINITY);
             Ok(SolveResult {
                 x: x.iter().copied().collect(),
                 warning: rcond_warning(report.rcond_estimate),
@@ -2398,12 +2864,15 @@ fn run_portfolio_attempts(
     }
     match accepted.or(least_inaccurate) {
         Some((action, mut solve_result)) => {
+            let accuracy =
+                certify_accuracy(effective_a, b, &solve_result.x, report, lu_cache.as_ref());
             solve_result.certificate = Some(build_solve_certificate(
                 report,
                 action,
                 posterior,
                 expected_losses,
                 action != selected_action,
+                accuracy,
             ));
             (action, Ok(solve_result))
         }
@@ -2911,6 +3380,7 @@ pub fn inv_with_casp(
                     expected_losses: expected_losses.to_vec(),
                     chosen_expected_loss: expected_losses[action.index()],
                     fallback_active,
+                    accuracy: None,
                 });
                 actual_action = action;
                 result = Some(inv_result);
@@ -3256,6 +3726,7 @@ fn lstsq_with_casp_kernel(
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: action != selected_action,
+            accuracy: None,
         };
 
         emit_trace(LinalgTrace {
@@ -3307,6 +3778,7 @@ fn lstsq_with_casp_kernel(
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: action != selected_action,
+            accuracy: None,
         };
 
         emit_trace(LinalgTrace {
@@ -3355,6 +3827,7 @@ fn lstsq_with_casp_kernel(
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: action != selected_action,
+            accuracy: None,
         };
 
         emit_trace(LinalgTrace {
@@ -3415,6 +3888,7 @@ fn lstsq_with_casp_kernel(
                 expected_losses: expected_losses.to_vec(),
                 chosen_expected_loss: expected_losses[action.index()],
                 fallback_active: action != selected_action,
+                accuracy: None,
             };
 
             emit_trace(LinalgTrace {
@@ -3549,6 +4023,7 @@ fn lstsq_with_casp_kernel(
         expected_losses: expected_losses.to_vec(),
         chosen_expected_loss: expected_losses[action.index()],
         fallback_active: action != selected_action,
+        accuracy: None,
     };
 
     emit_trace(LinalgTrace {
@@ -3623,6 +4098,7 @@ pub fn pinv_with_casp(
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
+            accuracy: None,
         };
 
         emit_trace(LinalgTrace {
@@ -3669,6 +4145,7 @@ pub fn pinv_with_casp(
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
+            accuracy: None,
         };
 
         emit_trace(LinalgTrace {
@@ -3714,6 +4191,7 @@ pub fn pinv_with_casp(
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
+            accuracy: None,
         };
 
         emit_trace(LinalgTrace {
@@ -3759,6 +4237,7 @@ pub fn pinv_with_casp(
             expected_losses: expected_losses.to_vec(),
             chosen_expected_loss: expected_losses[action.index()],
             fallback_active: false,
+            accuracy: None,
         };
 
         emit_trace(LinalgTrace {
@@ -3814,6 +4293,7 @@ pub fn pinv_with_casp(
                 expected_losses: expected_losses.to_vec(),
                 chosen_expected_loss: expected_losses[action.index()],
                 fallback_active: false,
+                accuracy: None,
             };
 
             emit_trace(LinalgTrace {
@@ -3882,6 +4362,7 @@ pub fn pinv_with_casp(
         expected_losses: expected_losses.to_vec(),
         chosen_expected_loss: expected_losses[action.index()],
         fallback_active: false,
+        accuracy: None,
     };
 
     emit_trace(LinalgTrace {
@@ -29632,6 +30113,360 @@ mod tests {
             .certificate
             .expect("certificate");
         assert_eq!(certificate.action, SolverAction::DirectLU);
+    }
+
+    /// xorshift64, for deterministic test systems.
+    struct TestRng(u64);
+    impl TestRng {
+        fn int(&mut self, lo: i64, hi: i64) -> i64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            lo + (self.0 % ((hi - lo + 1) as u64)) as i64
+        }
+    }
+
+    /// Fraction-free (Bareiss) determinant, exact in i128 while every minor fits: for n ≤ 8
+    /// and |entries| ≤ 50, Hadamard's bound keeps them under 2^58.
+    fn det_bareiss(m: &[Vec<i128>]) -> i128 {
+        let n = m.len();
+        let mut a = m.to_vec();
+        let mut sign = 1;
+        let mut previous = 1_i128;
+        for k in 0..n {
+            if a[k][k] == 0 {
+                let Some(p) = (k + 1..n).find(|&i| a[i][k] != 0) else {
+                    return 0;
+                };
+                a.swap(k, p);
+                sign = -sign;
+            }
+            for i in k + 1..n {
+                for j in k + 1..n {
+                    a[i][j] = (a[i][j] * a[k][k] - a[i][k] * a[k][j]) / previous;
+                }
+            }
+            previous = a[k][k];
+        }
+        sign * a[n - 1][n - 1]
+    }
+
+    /// `|x − num/den|` for exact integers `num`, `den` (|·| < 2^106), evaluated in
+    /// double-double and rounded once.
+    fn error_from_exact(x: f64, num: i128, den: i128) -> f64 {
+        let dd = |v: i128| {
+            let hi = v as f64;
+            (hi, (v - hi as i128) as f64)
+        };
+        let (nh, nl) = dd(num);
+        let (dh, dl) = dd(den);
+        let q1 = nh / dh;
+        let (p, pe) = two_prod(q1, dh);
+        let (s, se) = two_sum(nh, -p);
+        let q2 = (s + (se - pe + nl - q1 * dl)) / dh;
+        let (d, de) = two_sum(x, -q1);
+        (d + (de - q2)).abs()
+    }
+
+    /// frankenscipy-7tb8d.6. 10,000 integer systems (n = 2..=8, entries in [−50, 50], a
+    /// quarter of them with two nearly equal rows) solved by `solve_with_casp`; the exact
+    /// rational solution by Cramer's rule over Bareiss determinants. The certified forward error
+    /// bound must hold on every case that has one, and the unavailable ones are counted. A naive
+    /// "bound" `‖A⁻¹r‖∞` (signed inverse, no rounding term) must fail somewhere, or this test
+    /// could not see a violation.
+    #[test]
+    fn forward_error_bound_holds_against_exact_rational_solutions() {
+        let mut rng = TestRng(0x7B8D_6000_0000_0001);
+        let (mut cases, mut unavailable, mut naive_violations) = (0, 0, 0);
+        let mut solved = 0;
+        let mut perturbed_rejected = 0;
+        let mut worst_ratio = 0.0_f64;
+        while cases < 10_000 {
+            let n = rng.int(2, 8) as usize;
+            let mut ai: Vec<Vec<i128>> = (0..n)
+                .map(|_| (0..n).map(|_| i128::from(rng.int(-50, 50))).collect())
+                .collect();
+            if cases % 4 == 3 {
+                let (s, t) = (rng.int(0, n as i64 - 1), rng.int(0, n as i64 - 1));
+                if s != t {
+                    ai[t as usize] = ai[s as usize]
+                        .iter()
+                        .map(|&v| {
+                            v + if rng.int(0, 3) == 0 {
+                                i128::from(rng.int(-1, 1))
+                            } else {
+                                0
+                            }
+                        })
+                        .collect();
+                }
+            }
+            let bi: Vec<i128> = (0..n).map(|_| i128::from(rng.int(-50, 50))).collect();
+            let den = det_bareiss(&ai);
+            if den == 0 {
+                continue;
+            }
+            cases += 1;
+            let nums: Vec<i128> = (0..n)
+                .map(|i| {
+                    let replaced: Vec<Vec<i128>> = ai
+                        .iter()
+                        .zip(&bi)
+                        .map(|(row, &bj)| {
+                            (0..n).map(|j| if j == i { bj } else { row[j] }).collect()
+                        })
+                        .collect();
+                    det_bareiss(&replaced)
+                })
+                .collect();
+            let a: Vec<Vec<f64>> = ai
+                .iter()
+                .map(|row| row.iter().map(|&v| v as f64).collect())
+                .collect();
+            let b: Vec<f64> = bi.iter().map(|&v| v as f64).collect();
+            let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 4);
+            let Ok(result) = solve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio)
+            else {
+                unavailable += 1;
+                continue;
+            };
+            solved += 1;
+            let certificate = result.certificate.clone().expect("certificate");
+            let accuracy = certificate
+                .accuracy
+                .clone()
+                .expect("every portfolio solve certifies its accuracy");
+            let x_inf = result.x.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+            // The answer verifies; the same answer moved by a thousand times its certified
+            // forward error, in its largest component, does not.
+            let verified = verify_solve_certificate(&a, &b, &result.x, &certificate);
+            assert!(verified.verified, "{}", verified.reason);
+            let largest = (0..n)
+                .max_by(|&i, &j| result.x[i].abs().total_cmp(&result.x[j].abs()))
+                .unwrap_or(0);
+            let mut moved = result.x.clone();
+            moved[largest] += 1e3
+                * accuracy
+                    .forward_error_bound
+                    .unwrap_or(f64::EPSILON)
+                    .max(f64::EPSILON)
+                * x_inf;
+            if !verify_solve_certificate(&a, &b, &moved, &certificate).verified {
+                perturbed_rejected += 1;
+            }
+            let true_error = result
+                .x
+                .iter()
+                .zip(&nums)
+                .map(|(&xi, &ni)| error_from_exact(xi, ni, den))
+                .fold(0.0_f64, f64::max)
+                / x_inf;
+            let Some(bound) = accuracy.forward_error_bound else {
+                unavailable += 1;
+                continue;
+            };
+            assert_eq!(
+                accuracy.forward_bound_method,
+                ForwardBoundMethod::ExplicitInverse
+            );
+            assert!(
+                true_error <= bound,
+                "bound {bound:e} < true error {true_error:e}: A = {ai:?}, b = {bi:?}, \
+                 x = {:?}, exact = {nums:?}/{den}, omega = {:e}",
+                result.x,
+                accuracy.componentwise_backward_error
+            );
+            worst_ratio = worst_ratio.max(true_error / bound);
+            // The naive arm: signed A⁻¹ times r, no rounding term.
+            let inverse = inv(&a, InvOptions::default()).map(|r| r.inverse);
+            if let Ok(inverse) = inverse {
+                let (r, _) = residual_and_magnitude(&a, &result.x, &b);
+                let naive = inverse
+                    .iter()
+                    .map(|row| row.iter().zip(&r).map(|(v, ri)| v * ri).sum::<f64>().abs())
+                    .fold(0.0_f64, f64::max)
+                    / x_inf;
+                if true_error > naive {
+                    naive_violations += 1;
+                }
+            }
+        }
+        eprintln!(
+            "forward bound: {cases} cases, {unavailable} unavailable, max true/bound \
+             {worst_ratio:.3}, naive bound violated on {naive_violations}; perturbed answer \
+             rejected on {perturbed_rejected} of {solved} solved"
+        );
+        assert!(
+            unavailable < cases / 100,
+            "{unavailable} of {cases} unavailable"
+        );
+        assert_eq!(
+            perturbed_rejected, solved,
+            "every perturbed answer must fail verification"
+        );
+        assert!(
+            naive_violations > 0,
+            "the naive arm never failed, so this test cannot see a violation"
+        );
+    }
+
+    /// frankenscipy-7tb8d.6: a certificate is checkable from `(A, b, x)` alone, and the check
+    /// rejects an answer the certificate does not describe.
+    #[test]
+    fn verify_solve_certificate_accepts_the_answer_and_rejects_others() {
+        let a = vec![
+            vec![4.0, -2.0, 1.0],
+            vec![3.0, 6.0, -4.0],
+            vec![2.0, 1.0, 8.0],
+        ];
+        let b = [12.0, -25.0, 32.0];
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 4);
+        let result =
+            solve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio).expect("solve");
+        let certificate = result.certificate.expect("certificate");
+        let accuracy = certificate.accuracy.clone().expect("accuracy");
+        assert!(accuracy.componentwise_backward_error <= 16.0 * f64::EPSILON);
+        assert_eq!(accuracy.solved_part, SolvedPart::Full);
+        let report = verify_solve_certificate(&a, &b, &result.x, &certificate);
+        assert!(report.verified, "{}", report.reason);
+        assert_eq!(
+            report.componentwise_backward_error.to_bits(),
+            accuracy.componentwise_backward_error.to_bits()
+        );
+
+        // Must-miss: x moved by a thousand times its certified forward error.
+        let bound = accuracy.forward_error_bound.expect("bound");
+        let mut moved = result.x.clone();
+        moved[1] += 1e3 * bound * moved[1].abs().max(1.0);
+        let report = verify_solve_certificate(&a, &b, &moved, &certificate);
+        assert!(!report.verified);
+        assert!(
+            report.reason.contains("componentwise backward error"),
+            "{}",
+            report.reason
+        );
+
+        // A wrong kernel under a genuine certificate: unpivoted elimination on a system with a
+        // tiny leading pivot loses the answer, and the certificate for the pivoted solve must
+        // not verify it.
+        let tiny = vec![vec![1e-17, 1.0], vec![1.0, 1.0]];
+        let rhs = [1.0, 2.0];
+        let genuine = solve_with_casp(&tiny, &rhs, SolveOptions::default(), &mut portfolio)
+            .expect("solve")
+            .certificate
+            .expect("certificate");
+        let multiplier = tiny[1][0] / tiny[0][0];
+        let u22 = tiny[1][1] - multiplier * tiny[0][1];
+        let x2 = (rhs[1] - multiplier * rhs[0]) / u22;
+        let x1 = (rhs[0] - tiny[0][1] * x2) / tiny[0][0];
+        let report = verify_solve_certificate(&tiny, &rhs, &[x1, x2], &genuine);
+        assert!(!report.verified, "unpivoted x = {:?} verified", [x1, x2]);
+
+        // Certificates without an accuracy section, or for another shape, do not verify.
+        let inverse = inv(&a, InvOptions::default()).expect("inv");
+        let inv_certificate = inverse.certificate.expect("inv certificate");
+        assert!(!verify_solve_certificate(&a, &b, &result.x, &inv_certificate).verified);
+        assert!(!verify_solve_certificate(&tiny, &rhs, &[x1, x2], &certificate).verified);
+    }
+
+    /// frankenscipy-7tb8d.6: above [`FORWARD_BOUND_EXPLICIT_MAX_N`] the bound comes from
+    /// Higham's estimator, and it still covers the true error; diagonal and triangular solves
+    /// are certified against the part they read.
+    #[test]
+    fn accuracy_certificates_cover_estimated_diagonal_and_triangular_solves() {
+        let mut rng = TestRng(0x5EED_0000_0000_7B86);
+        // n = 80 > 64, exact integer solution: b = A·x* is exact in f64 (|entries| ≤ 80·50·9).
+        let n = 80;
+        let a: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        let v = rng.int(-50, 50) as f64;
+                        if i == j { v + 1000.0 } else { v }
+                    })
+                    .collect()
+            })
+            .collect();
+        let exact: Vec<f64> = (0..n).map(|_| rng.int(-9, 9) as f64).collect();
+        let b: Vec<f64> = a
+            .iter()
+            .map(|row| row.iter().zip(&exact).map(|(v, x)| v * x).sum())
+            .collect();
+        let mut portfolio = SolverPortfolio::new(RuntimeMode::Strict, 4);
+        let result =
+            solve_with_casp(&a, &b, SolveOptions::default(), &mut portfolio).expect("solve");
+        let certificate = result.certificate.expect("certificate");
+        let accuracy = certificate.accuracy.clone().expect("accuracy");
+        assert_eq!(accuracy.forward_bound_method, ForwardBoundMethod::Estimated);
+        let x_inf = result.x.iter().fold(0.0_f64, |m, e| m.max(e.abs()));
+        let true_error = result
+            .x
+            .iter()
+            .zip(&exact)
+            .map(|(x, e)| (x - e).abs())
+            .fold(0.0_f64, f64::max)
+            / x_inf;
+        let bound = accuracy.forward_error_bound.expect("bound");
+        assert!(
+            true_error <= bound,
+            "true {true_error:e} > estimated bound {bound:e}"
+        );
+        assert!(verify_solve_certificate(&a, &b, &result.x, &certificate).verified);
+
+        // Diagonal: exact inverse, and the certificate ignores entries a diagonal solve never
+        // reads.
+        let mut diagonal = vec![vec![0.0; 3]; 3];
+        for (i, d) in [2.0, -4.0, 0.5].into_iter().enumerate() {
+            diagonal[i][i] = d;
+        }
+        let options = SolveOptions {
+            assume_a: Some(MatrixAssumption::Diagonal),
+            ..SolveOptions::default()
+        };
+        let result = solve_with_casp(&diagonal, &[1.0, 2.0, 3.0], options, &mut portfolio)
+            .expect("diagonal solve");
+        let certificate = result.certificate.expect("certificate");
+        let accuracy = certificate.accuracy.clone().expect("accuracy");
+        assert_eq!(accuracy.solved_part, SolvedPart::Diagonal);
+        assert_eq!(
+            accuracy.forward_bound_method,
+            ForwardBoundMethod::ExplicitInverse
+        );
+        assert_eq!(accuracy.componentwise_backward_error, 0.0);
+        let mut noisy = diagonal.clone();
+        noisy[0][2] = 7.0;
+        for matrix in [&diagonal, &noisy] {
+            let report =
+                verify_solve_certificate(matrix, &[1.0, 2.0, 3.0], &result.x, &certificate);
+            assert!(report.verified, "{}", report.reason);
+        }
+
+        // Lower triangular: the certificate is about the lower triangle, so the same answer
+        // verifies against a matrix that adds an upper triangle the solve never read.
+        let lower = vec![
+            vec![3.0, 0.0, 0.0],
+            vec![1.0, 4.0, 0.0],
+            vec![-2.0, 5.0, 6.0],
+        ];
+        let result = solve_with_casp(
+            &lower,
+            &[3.0, 5.0, 7.0],
+            SolveOptions::default(),
+            &mut portfolio,
+        )
+        .expect("triangular solve");
+        let certificate = result.certificate.expect("certificate");
+        let accuracy = certificate.accuracy.clone().expect("accuracy");
+        assert_eq!(accuracy.solved_part, SolvedPart::LowerTriangle);
+        assert!(accuracy.componentwise_backward_error <= 16.0 * f64::EPSILON);
+        let mut full = lower.clone();
+        full[0][1] = 9.0;
+        full[1][2] = 9.0;
+        for matrix in [&lower, &full] {
+            let report =
+                verify_solve_certificate(matrix, &[3.0, 5.0, 7.0], &result.x, &certificate);
+            assert!(report.verified, "{}", report.reason);
+        }
     }
 
     #[test]

@@ -278,16 +278,32 @@ mod tests {
         // batch and fail this.
         use std::collections::BTreeSet;
         let seen = Mutex::new(BTreeSet::new());
+        let second_thread = Condvar::new();
         const BATCHES: usize = 40;
         with_panel_pool(4, |pool| {
-            for _ in 0..BATCHES {
+            for batch in 0..BATCHES {
+                let first = batch == 0;
+                let (seen, second_thread) = (&seen, &second_thread);
                 let tasks: Vec<Task<'_>> = (0..8)
                     .map(|_| {
-                        Box::new(|| {
+                        Box::new(move || {
                             let id = format!("{:?}", std::thread::current().id());
-                            seen.lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .insert(id);
+                            let mut ids = seen.lock().unwrap_or_else(PoisonError::into_inner);
+                            ids.insert(id);
+                            second_thread.notify_all();
+                            // First batch only: hold the task (at most 200 ms) until a second
+                            // thread has run one, so on a loaded host a single worker cannot
+                            // drain every trivial batch before the others wake. A serial pool
+                            // still sees one thread and fails the must-hit arm below.
+                            if first && ids.len() < 2 {
+                                let _ = second_thread
+                                    .wait_timeout_while(
+                                        ids,
+                                        std::time::Duration::from_millis(200),
+                                        |ids| ids.len() < 2,
+                                    )
+                                    .unwrap_or_else(PoisonError::into_inner);
+                            }
                         }) as Task<'_>
                     })
                     .collect();
