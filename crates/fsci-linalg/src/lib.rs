@@ -770,6 +770,31 @@ struct ConditionDiagnosticsWork {
     /// The LU factorization the rcond estimate came from; the portfolio's LU actions and the
     /// accuracy certificate reuse it rather than factor again.
     lu_cache: Option<LuFactorStorage>,
+    /// The Cholesky factorization of an exactly symmetric matrix, when the diagnostics tried it.
+    cholesky_cache: CholeskyProbe,
+}
+
+/// What the diagnostics learned by factoring an exactly symmetric `A` as `L·Lᵀ`
+/// (frankenscipy-w8bjb). The rcond estimate, the symmetric actions, the accuracy certificate and
+/// the `inv` detection's positive-definiteness verdict share one factorization; the symmetric
+/// action used to pay the LU the estimate took, and then a Cholesky on top.
+enum CholeskyProbe {
+    NotTried,
+    /// [`cholesky_lower_factor`]'s flat lower factor, as the symmetric actions would compute it.
+    Factor(Vec<f64>),
+    /// Not positive definite: the factorization broke down.
+    BrokeDown,
+}
+
+impl CholeskyProbe {
+    /// `A`'s lower Cholesky factor: the probe's, or factored now when the probe was not tried.
+    fn factor<'p>(&'p self, a: &[Vec<f64>], n: usize) -> Option<Cow<'p, [f64]>> {
+        match self {
+            Self::Factor(l_flat) => Some(Cow::Borrowed(l_flat)),
+            Self::BrokeDown => None,
+            Self::NotTried => cholesky_lower_factor(a, n).map(Cow::Owned),
+        }
+    }
 }
 
 /// Result of LU decomposition with partial pivoting.
@@ -1890,6 +1915,7 @@ fn condition_diagnostics_with_assumption_mode(
         diagonal || assumption == Some(MatrixAssumption::UpperTriangular) || bandwidth.0 == 0;
     let lower_triangular =
         diagonal || assumption == Some(MatrixAssumption::LowerTriangular) || bandwidth.1 == 0;
+    let exactly_symmetric = rows == cols && issymmetric(a, 0.0, 0.0)?;
     let symmetric = matches!(
         assumption,
         Some(
@@ -1897,9 +1923,7 @@ fn condition_diagnostics_with_assumption_mode(
                 | MatrixAssumption::Hermitian
                 | MatrixAssumption::PositiveDefinite
         )
-    ) || (rows == cols && issymmetric(a, 0.0, 0.0)?);
-    let positive_definite = assumption == Some(MatrixAssumption::PositiveDefinite)
-        || (evaluate_positive_definite && symmetric && is_positive_definite(a));
+    ) || exactly_symmetric;
     let banded = rows > 0
         && cols > 0
         && (diagonal
@@ -1939,6 +1963,37 @@ fn condition_diagnostics_with_assumption_mode(
         },
     };
 
+    // frankenscipy-w8bjb: an exactly symmetric matrix that the symmetric action will factor by
+    // Cholesky (or whose positive definiteness `inv`'s detection asks for) is factored here,
+    // once, and the rcond estimate is taken from that factor, as LAPACK's `pocon` takes it.
+    // Only an exactly symmetric matrix: under an explicit 'pos' the factor of one triangle is
+    // not the factor of `A`. An explicit 'sym' / 'her' goes to LDLᵀ and needs no Cholesky.
+    let cholesky_route = !matches!(
+        assumption,
+        Some(MatrixAssumption::Symmetric | MatrixAssumption::Hermitian)
+    );
+    let cholesky_cache = if rows > 4
+        && exactly_symmetric
+        && !diagonal
+        && ((cholesky_route && structural_evidence == StructuralEvidence::Symmetric)
+            || evaluate_positive_definite)
+    {
+        match cholesky_lower_factor(a, rows) {
+            Some(l_flat) => CholeskyProbe::Factor(l_flat),
+            None => CholeskyProbe::BrokeDown,
+        }
+    } else {
+        CholeskyProbe::NotTried
+    };
+    let positive_definite = assumption == Some(MatrixAssumption::PositiveDefinite)
+        || (evaluate_positive_definite
+            && symmetric
+            && match &cholesky_cache {
+                CholeskyProbe::Factor(_) => true,
+                CholeskyProbe::BrokeDown => false,
+                CholeskyProbe::NotTried => is_positive_definite(a),
+            });
+
     let mut matrix_cache = None;
     let mut lu_cache = None;
     let rcond_estimate = if rows == 0 || cols == 0 {
@@ -1951,6 +2006,8 @@ fn condition_diagnostics_with_assumption_mode(
         fast_rcond_triangular(a, true)
     } else if upper_triangular && !lower_triangular {
         fast_rcond_triangular(a, false)
+    } else if let CholeskyProbe::Factor(l_flat) = &cholesky_cache {
+        fast_rcond_from_cholesky(l_flat, rows, matrix_norm1_rows(a, cols))
     } else if rows > 4
         && rows >= lu_factor_flat_min()
         && !flat_lu_factor_disabled()
@@ -1996,6 +2053,7 @@ fn condition_diagnostics_with_assumption_mode(
         },
         matrix_cache,
         lu_cache,
+        cholesky_cache,
     })
 }
 
@@ -2469,6 +2527,8 @@ enum InverseAccess<'a> {
     Lu(&'a LU<f64, Dyn, Dyn>),
     /// A blocked LU factorization of `A` (frankenscipy-u87cd).
     Flat(&'a LuFactorsFlat),
+    /// The flat lower Cholesky factor of a symmetric `A` (frankenscipy-w8bjb); `A⁻ᵀ = A⁻¹`.
+    Cholesky(&'a [f64]),
 }
 
 /// LAPACK xGERFS's forward error bound (see [`AccuracyCertificate::forward_error_bound`]).
@@ -2528,6 +2588,22 @@ fn forward_error_bound(
                     let mut e = vec![0.0; n];
                     e[j] = 1.0;
                     lu_solve_flat_factored(factors, &e)
+                })
+                .collect();
+            match columns {
+                Some(columns) => (
+                    explicit(&|i, j| columns[j][i]),
+                    ForwardBoundMethod::ExplicitInverse,
+                ),
+                None => return (None, ForwardBoundMethod::Unavailable),
+            }
+        }
+        InverseAccess::Cholesky(l_flat) if n <= FORWARD_BOUND_EXPLICIT_MAX_N => {
+            let columns: Option<Vec<Vec<f64>>> = (0..n)
+                .map(|j| {
+                    let mut e = vec![0.0; n];
+                    e[j] = 1.0;
+                    cho_solve_lower_flat(l_flat, n, &e)
                 })
                 .collect();
             match columns {
@@ -2599,6 +2675,23 @@ fn forward_error_bound(
             );
             (estimate, ForwardBoundMethod::Estimated)
         }
+        InverseAccess::Cholesky(l_flat) => {
+            let estimate = one_norm_estimate(
+                n,
+                |v| match cho_solve_lower_flat(l_flat, n, v) {
+                    Some(w) => *v = w.iter().zip(&g).map(|(e, gi)| e * gi).collect(),
+                    None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                },
+                |v| {
+                    let rhs: Vec<f64> = v.iter().zip(&g).map(|(e, gi)| e * gi).collect();
+                    match cho_solve_lower_flat(l_flat, n, &rhs) {
+                        Some(w) => *v = w,
+                        None => v.iter_mut().for_each(|e| *e = f64::INFINITY),
+                    }
+                },
+            );
+            (estimate, ForwardBoundMethod::Estimated)
+        }
     };
     let bound = norm / x_inf;
     if bound.is_finite() {
@@ -2642,14 +2735,15 @@ fn solved_matrix(a: &[Vec<f64>], part: SolvedPart) -> Cow<'_, [Vec<f64>]> {
     )
 }
 
-/// The accuracy part of a solve certificate for `x` from a solve of `A·x = b`. `lu` is the
-/// diagnostics' factorization of `A`, when there is one.
+/// The accuracy part of a solve certificate for `x` from a solve of `A·x = b`. `lu` and
+/// `cholesky` are the diagnostics' factorizations of `A`, when there are any.
 fn certify_accuracy(
     a: &[Vec<f64>],
     b: &[f64],
     x: &[f64],
     report: &ConditionReport,
     lu: Option<&LuFactorStorage>,
+    cholesky: &CholeskyProbe,
 ) -> AccuracyCertificate {
     let part = solved_part(report);
     let solved = solved_matrix(a, part);
@@ -2659,10 +2753,11 @@ fn certify_accuracy(
         SolvedPart::Diagonal => Some(InverseAccess::Diagonal),
         SolvedPart::LowerTriangle => Some(InverseAccess::Triangular { lower: true }),
         SolvedPart::UpperTriangle => Some(InverseAccess::Triangular { lower: false }),
-        SolvedPart::Full => match lu {
-            Some(LuFactorStorage::Nalgebra(lu)) => Some(InverseAccess::Lu(lu)),
-            Some(LuFactorStorage::Flat(factors)) => Some(InverseAccess::Flat(factors)),
-            None => match dmatrix_from_rows(&solved) {
+        SolvedPart::Full => match (lu, cholesky) {
+            (Some(LuFactorStorage::Nalgebra(lu)), _) => Some(InverseAccess::Lu(lu)),
+            (Some(LuFactorStorage::Flat(factors)), _) => Some(InverseAccess::Flat(factors)),
+            (None, CholeskyProbe::Factor(l_flat)) => Some(InverseAccess::Cholesky(l_flat)),
+            (None, _) => match dmatrix_from_rows(&solved) {
                 Ok(matrix) => {
                     fresh_lu = matrix.lu();
                     Some(InverseAccess::Lu(&fresh_lu))
@@ -2838,6 +2933,7 @@ fn symmetric_solve(
     a: &[Vec<f64>],
     b: &[f64],
     factorization: SymmetricFactorization,
+    cholesky: &CholeskyProbe,
 ) -> Result<Vec<f64>, LinalgError> {
     let n = a.len();
     let ldl = || {
@@ -2850,7 +2946,7 @@ fn symmetric_solve(
     if factorization.route == SymmetricRoute::Ldl {
         return ldl();
     }
-    match cholesky_lower_factor(a, n) {
+    match cholesky.factor(a, n) {
         Some(l_flat) => cho_solve_lower_flat(&l_flat, n, b).ok_or(LinalgError::SingularMatrix),
         None if factorization.route == SymmetricRoute::CholeskyThenLdl => ldl(),
         None => Err(LinalgError::SingularMatrix),
@@ -2863,6 +2959,7 @@ fn symmetric_solve(
 fn symmetric_inverse(
     a: &[Vec<f64>],
     factorization: SymmetricFactorization,
+    cholesky: &CholeskyProbe,
 ) -> Result<Vec<Vec<f64>>, LinalgError> {
     let n = a.len();
     let ldl = || {
@@ -2875,7 +2972,7 @@ fn symmetric_inverse(
     if factorization.route == SymmetricRoute::Ldl {
         return ldl();
     }
-    let Some(l_flat) = cholesky_lower_factor(a, n) else {
+    let Some(l_flat) = cholesky.factor(a, n) else {
         return if factorization.route == SymmetricRoute::CholeskyThenLdl {
             ldl()
         } else {
@@ -2903,9 +3000,21 @@ fn dispatch_solve_action(
     symmetric: SymmetricFactorization,
     matrix_cache: &mut Option<DMatrix<f64>>,
     lu_cache: &mut Option<LuFactorStorage>,
+    cholesky_cache: &CholeskyProbe,
 ) -> Result<SolveResult, LinalgError> {
     match action {
         SolverAction::DirectLU => {
+            // A matrix the diagnostics factored by Cholesky has no LU yet (frankenscipy-w8bjb):
+            // take the one they would have taken, so LU on it is the same factorization.
+            let n = effective_a.len();
+            if lu_cache.is_none()
+                && matches!(cholesky_cache, CholeskyProbe::Factor(_))
+                && n >= lu_factor_flat_min()
+                && !flat_lu_factor_disabled()
+                && let Some(factors) = lu_factor_blocked(effective_a)
+            {
+                *lu_cache = Some(LuFactorStorage::Flat(factors));
+            }
             // The diagnostics' blocked factorization (frankenscipy-u87cd); the backward error
             // is the same quantity the nalgebra route computes, summed in another order.
             if let Some(LuFactorStorage::Flat(factors)) = lu_cache.as_ref() {
@@ -2956,7 +3065,7 @@ fn dispatch_solve_action(
             false,
         ),
         SolverAction::SymmetricFastPath => {
-            let x = symmetric_solve(effective_a, b, symmetric)?;
+            let x = symmetric_solve(effective_a, b, symmetric, cholesky_cache)?;
             let backward_error = compute_backward_error_dense(effective_a, &x, b);
             Ok(SolveResult {
                 x,
@@ -3000,6 +3109,7 @@ pub fn solve_with_action(
         report,
         mut matrix_cache,
         mut lu_cache,
+        cholesky_cache,
     } = condition_diagnostics_for_solve(a, None)?;
     if !candidate_actions(report.structural_evidence).contains(&action) {
         return Err(LinalgError::NotSupported {
@@ -3017,6 +3127,7 @@ pub fn solve_with_action(
         SymmetricFactorization::new(None, false),
         &mut matrix_cache,
         &mut lu_cache,
+        &cholesky_cache,
     )
 }
 
@@ -3040,6 +3151,7 @@ fn run_portfolio_attempts(
     symmetric: SymmetricFactorization,
     matrix_cache: &mut Option<DMatrix<f64>>,
     lu_cache: &mut Option<LuFactorStorage>,
+    cholesky_cache: &CholeskyProbe,
     selected_action: SolverAction,
     posterior: [f64; 4],
     expected_losses: [f64; 6],
@@ -3062,6 +3174,7 @@ fn run_portfolio_attempts(
             symmetric,
             matrix_cache,
             lu_cache,
+            cholesky_cache,
         ) {
             Ok(solve_result) => {
                 let omega = solve_result.backward_error.unwrap_or(0.0);
@@ -3102,8 +3215,14 @@ fn run_portfolio_attempts(
     }
     match accepted.or(least_inaccurate) {
         Some((action, mut solve_result)) => {
-            let accuracy =
-                certify_accuracy(effective_a, b, &solve_result.x, report, lu_cache.as_ref());
+            let accuracy = certify_accuracy(
+                effective_a,
+                b,
+                &solve_result.x,
+                report,
+                lu_cache.as_ref(),
+                cholesky_cache,
+            );
             solve_result.certificate = Some(build_solve_certificate(
                 report,
                 action,
@@ -3179,6 +3298,7 @@ fn solve_with_portfolio_internal(
         report,
         mut matrix_cache,
         mut lu_cache,
+        cholesky_cache,
     } = diagnostics;
     let policy_decision =
         if should_apply_solve_policy(options.mode, options.check_finite, &effective_a, b) {
@@ -3221,6 +3341,7 @@ fn solve_with_portfolio_internal(
         SymmetricFactorization::new(effective_assumption, options.lower),
         &mut matrix_cache,
         &mut lu_cache,
+        &cholesky_cache,
         selected_action,
         posterior,
         expected_losses,
@@ -3384,6 +3505,7 @@ fn solve_audited(
         report,
         mut matrix_cache,
         mut lu_cache,
+        cholesky_cache,
     } = diagnostics;
     let policy_decision =
         if should_apply_solve_policy(options.mode, options.check_finite, &effective_a, b) {
@@ -3438,6 +3560,7 @@ fn solve_audited(
         SymmetricFactorization::new(effective_assumption, options.lower),
         &mut matrix_cache,
         &mut lu_cache,
+        &cholesky_cache,
         selected_action,
         posterior,
         expected_losses,
@@ -3547,6 +3670,7 @@ pub fn inv_with_casp(
         report,
         matrix_cache,
         lu_cache,
+        cholesky_cache,
     } = diagnostics;
 
     // For truly singular matrices, error immediately - inv() should not fall back to pinv
@@ -3612,6 +3736,7 @@ pub fn inv_with_casp(
             lower_triangular,
             &matrix_cache,
             &lu_cache,
+            &cholesky_cache,
         ) {
             Ok(mut inv_result) => {
                 let fallback_active = action != selected_action;
@@ -3769,6 +3894,7 @@ fn dispatch_inv_action(
     lower_triangular: bool,
     matrix_cache: &Option<DMatrix<f64>>,
     lu_cache: &Option<LuFactorStorage>,
+    cholesky_cache: &CholeskyProbe,
 ) -> Result<InvResult, LinalgError> {
     match action {
         SolverAction::DiagonalFastPath | SolverAction::TriangularFastPath => {
@@ -3791,7 +3917,7 @@ fn dispatch_inv_action(
             })
         }
         SolverAction::SymmetricFastPath => {
-            let inverse = symmetric_inverse(a, symmetric)?;
+            let inverse = symmetric_inverse(a, symmetric, cholesky_cache)?;
             let rcond = rcond_from_inverse(a, &inverse, n);
             if mode == RuntimeMode::Hardened && rcond < HARDENED_RCOND_THRESHOLD && rcond > 0.0 {
                 return Err(LinalgError::ConditionTooHigh {
@@ -3809,6 +3935,18 @@ fn dispatch_inv_action(
             })
         }
         SolverAction::DirectLU => {
+            // A matrix the diagnostics factored by Cholesky has no LU yet (frankenscipy-w8bjb):
+            // take the one they would have taken.
+            let fresh = if lu_cache.is_none()
+                && matches!(cholesky_cache, CholeskyProbe::Factor(_))
+                && n >= lu_factor_flat_min()
+                && !flat_lu_factor_disabled()
+            {
+                lu_factor_blocked(a).map(LuFactorStorage::Flat)
+            } else {
+                None
+            };
+            let lu_cache = fresh.as_ref().or(lu_cache.as_ref());
             // The diagnostics' blocked factorization (frankenscipy-u87cd): the same rcond,
             // pivot and Hardened checks as the nalgebra route below, over its factors.
             if let Some(LuFactorStorage::Flat(factors)) = lu_cache {
@@ -24038,7 +24176,34 @@ fn lu_solve_flat_factored(factors: &LuFactorsFlat, b: &[f64]) -> Option<Vec<f64>
 }
 
 fn fast_rcond_from_flat_lu(factors: &LuFactorsFlat, a_norm: f64) -> f64 {
-    let n = factors.n;
+    rcond_from_solves(
+        factors.n,
+        a_norm,
+        |v| lu_subst_factored_transpose(factors, v),
+        |v| lu_solve_flat_factored(factors, v),
+    )
+}
+
+/// [`fast_rcond_from_flat_lu`]'s estimate over a Cholesky factor `A = L·Lᵀ` (frankenscipy-w8bjb):
+/// `A` is symmetric, so `A⁻ᵀ = A⁻¹` and both solves go through the factor, as LAPACK's `pocon`
+/// estimates from it.
+fn fast_rcond_from_cholesky(l_flat: &[f64], n: usize, a_norm: f64) -> f64 {
+    rcond_from_solves(
+        n,
+        a_norm,
+        |v| cho_solve_lower_flat(l_flat, n, v),
+        |v| cho_solve_lower_flat(l_flat, n, v),
+    )
+}
+
+/// The Higham-style 1-norm estimate of `‖A⁻¹‖₁` from a solve with `Aᵀ` and a solve with `A`,
+/// as `1 / (‖A‖₁ · ‖A⁻¹‖₁)`; a failed solve reads as singular.
+fn rcond_from_solves(
+    n: usize,
+    a_norm: f64,
+    solve_transpose: impl Fn(&[f64]) -> Option<Vec<f64>>,
+    solve: impl Fn(&[f64]) -> Option<Vec<f64>>,
+) -> f64 {
     if n == 0 {
         return 1.0;
     }
@@ -24053,7 +24218,7 @@ fn fast_rcond_from_flat_lu(factors: &LuFactorsFlat, a_norm: f64) -> f64 {
             .iter()
             .map(|&value| if value >= 0.0 { 1.0 } else { -1.0 })
             .collect();
-        let w = match lu_subst_factored_transpose(factors, &sign_x) {
+        let w = match solve_transpose(&sign_x) {
             Some(w) => w,
             None => return 0.0,
         };
@@ -24061,7 +24226,7 @@ fn fast_rcond_from_flat_lu(factors: &LuFactorsFlat, a_norm: f64) -> f64 {
             .iter()
             .map(|&value| if value >= 0.0 { 1.0 } else { -1.0 })
             .collect();
-        let x_new = match lu_solve_flat_factored(factors, &sign_w) {
+        let x_new = match solve(&sign_w) {
             Some(x_new) => x_new,
             None => return 0.0,
         };
@@ -29754,6 +29919,170 @@ mod tests {
         a[n - 1] = a[0].clone();
         let work = condition_diagnostics_for_solve(&a, None).expect("diagnostics");
         assert!(matches!(work.lu_cache, Some(LuFactorStorage::Nalgebra(_))));
+    }
+
+    /// frankenscipy-w8bjb: an exactly symmetric matrix is factored by Cholesky once, in the
+    /// diagnostics, and the rcond estimate, the symmetric actions and the certificate share the
+    /// factor; no LU is taken for it. The answers are the ones factoring afresh gives, bit for
+    /// bit; only the rcond estimate's route changes, and it estimates the same quantity.
+    #[test]
+    fn symmetric_diagnostics_share_one_cholesky_factorization() {
+        let spd = |n: usize, shift: f64| -> Vec<Vec<f64>> {
+            (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| {
+                            let v = (0.01 * (i + j) as f64 + 0.3).sin();
+                            if i == j { v + shift } else { v * 0.1 }
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        // Either side of the blocked LU's and the blocked Cholesky's crossovers.
+        for n in [20, LU_FACTOR_FLAT_MIN_DIM + 2, CHOL_FACTOR_FLAT_MIN_DIM + 4] {
+            let a = spd(n, n as f64);
+            let b: Vec<f64> = (0..n).map(|i| (i as f64 * 0.37).cos()).collect();
+            let work = condition_diagnostics_for_solve(&a, None).expect("diagnostics");
+            assert_eq!(
+                work.report.structural_evidence,
+                StructuralEvidence::Symmetric
+            );
+            assert!(
+                matches!(work.cholesky_cache, CholeskyProbe::Factor(_)),
+                "n = {n}: an SPD matrix is factored by Cholesky in the diagnostics"
+            );
+            let CholeskyProbe::Factor(l_flat) = &work.cholesky_cache else {
+                unreachable!("asserted above");
+            };
+            assert!(
+                work.lu_cache.is_none() && work.matrix_cache.is_none(),
+                "n = {n}"
+            );
+            let fresh = cholesky_lower_factor(&a, n).expect("SPD");
+            assert!(
+                l_flat
+                    .iter()
+                    .zip(&fresh)
+                    .all(|(p, q)| p.to_bits() == q.to_bits()),
+                "n = {n}: the cached factor is the one the action would compute"
+            );
+
+            // The rcond estimate: the same quantity as the LU route's, to rounding.
+            let matrix = dmatrix_from_rows(&a).expect("matrix");
+            let lu_rcond = fast_rcond_from_lu(&matrix.clone().lu(), matrix_norm1(&matrix), n);
+            let rcond = work.report.rcond_estimate;
+            assert!(
+                (rcond - lu_rcond).abs() <= 1e-10 * lu_rcond,
+                "n = {n}: rcond {rcond:e} vs the LU route's {lu_rcond:e}"
+            );
+
+            // The symmetric action and inverse: bit for bit what factoring afresh gives.
+            let factorization = SymmetricFactorization::new(None, false);
+            let solved = solve_with_action(&a, &b, SolverAction::SymmetricFastPath).expect("solve");
+            let afresh =
+                symmetric_solve(&a, &b, factorization, &CholeskyProbe::NotTried).expect("solve");
+            assert!(
+                solved
+                    .x
+                    .iter()
+                    .zip(&afresh)
+                    .all(|(p, q)| p.to_bits() == q.to_bits()),
+                "n = {n}: symmetric solve differs"
+            );
+            let inverse = symmetric_inverse(&a, factorization, &work.cholesky_cache).expect("inv");
+            let inverse_afresh =
+                symmetric_inverse(&a, factorization, &CholeskyProbe::NotTried).expect("inv");
+            assert!(
+                inverse
+                    .iter()
+                    .flatten()
+                    .zip(inverse_afresh.iter().flatten())
+                    .all(|(p, q)| p.to_bits() == q.to_bits()),
+                "n = {n}: symmetric inverse differs"
+            );
+
+            // LU on an SPD matrix is still the factorization the diagnostics used to take.
+            let lu = solve_with_action(&a, &b, SolverAction::DirectLU).expect("LU");
+            if n >= LU_FACTOR_FLAT_MIN_DIM {
+                let factors = lu_factor_blocked(&a).expect("blocked LU");
+                let expected = lu_solve_flat_factored(&factors, &b).expect("solve");
+                assert!(
+                    lu.x.iter()
+                        .zip(&expected)
+                        .all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "n = {n}: LU on an SPD matrix left the blocked factorization"
+                );
+            }
+
+            // The portfolio path certifies from the factor, and the certificate checks out.
+            let mut portfolio = SolverPortfolio::new(RuntimeMode::Hardened, 4);
+            let casp = solve_with_casp(
+                &a,
+                &b,
+                SolveOptions {
+                    mode: RuntimeMode::Hardened,
+                    ..SolveOptions::default()
+                },
+                &mut portfolio,
+            )
+            .expect("casp");
+            let certificate = casp.certificate.expect("certificate");
+            assert_eq!(
+                certificate.action,
+                SolverAction::SymmetricFastPath,
+                "n = {n}"
+            );
+            assert!(
+                certificate
+                    .accuracy
+                    .as_ref()
+                    .is_some_and(|accuracy| accuracy.forward_error_bound.is_some())
+            );
+            assert!(verify_solve_certificate(&a, &b, &casp.x, &certificate).verified);
+
+            // `inv`'s detection reads positive definiteness off the same factorization.
+            let inv_work = condition_diagnostics_with_assumption(&a, None).expect("diagnostics");
+            assert!(inv_work.report.positive_definite, "n = {n}");
+            assert!(matches!(inv_work.cholesky_cache, CholeskyProbe::Factor(_)));
+        }
+
+        // Must-miss arms. Symmetric indefinite: the probe breaks down, the diagnostics keep the
+        // LU route, and the symmetric action goes straight to LDLᵀ.
+        let n = LU_FACTOR_FLAT_MIN_DIM + 2;
+        let mut indefinite = spd(n, n as f64);
+        indefinite[3][3] = -(n as f64);
+        let b: Vec<f64> = (0..n).map(|i| (i as f64 * 0.37).cos()).collect();
+        let work = condition_diagnostics_for_solve(&indefinite, None).expect("diagnostics");
+        assert!(matches!(work.cholesky_cache, CholeskyProbe::BrokeDown));
+        assert!(matches!(work.lu_cache, Some(LuFactorStorage::Flat(_))));
+        let solved =
+            solve_with_action(&indefinite, &b, SolverAction::SymmetricFastPath).expect("LDL");
+        let ldl = BunchKaufman::factor(&indefinite, Triangle::Upper).solve(&b);
+        assert!(
+            solved
+                .x
+                .iter()
+                .zip(&ldl)
+                .all(|(p, q)| p.to_bits() == q.to_bits())
+        );
+        let inv_work =
+            condition_diagnostics_with_assumption(&indefinite, None).expect("diagnostics");
+        assert!(!inv_work.report.positive_definite);
+
+        // An explicit 'sym' is LDLᵀ, a non-symmetric matrix is LU, and n <= 4 keeps the exact
+        // SVD estimate: none of them tries Cholesky.
+        let a = spd(n, n as f64);
+        let sym = condition_diagnostics_for_solve(&a, Some(MatrixAssumption::Symmetric))
+            .expect("diagnostics");
+        assert!(matches!(sym.cholesky_cache, CholeskyProbe::NotTried));
+        let mut general = a.clone();
+        general[0][1] += 1e-3;
+        let work = condition_diagnostics_for_solve(&general, None).expect("diagnostics");
+        assert!(matches!(work.cholesky_cache, CholeskyProbe::NotTried));
+        assert!(work.lu_cache.is_some());
+        let small = condition_diagnostics_for_solve(&spd(4, 4.0), None).expect("diagnostics");
+        assert!(matches!(small.cholesky_cache, CholeskyProbe::NotTried));
     }
 
     #[test]

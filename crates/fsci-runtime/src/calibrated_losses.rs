@@ -12,9 +12,9 @@
 /// column per state (well conditioned, moderate, ill conditioned, near singular).
 #[rustfmt::skip]
 pub(crate) const SOLVER_LOSS_MATRIX: [[f64; 4]; 6] = [
-    [1.0319926099000587, 1.0006762508974, 1.0, 1.0], // DirectLU
+    [1.0319926099000587, 1.0006762508973737, 1.0, 1.0], // DirectLU
     [2.0, 2.0, 2.0, 2.0], // PivotedQR
-    [31.5, 31.502146632181486, 31.72701398450975, 32.201463288524366], // SVDFallback
+    [31.5, 31.5021466321814, 31.727013976223127, 32.201463282742864], // SVDFallback
     [0.0, 0.0, 0.0, 0.0], // DiagonalFastPath
     [0.0, 0.0, 0.0, 0.0], // TriangularFastPath
     [0.5, 0.5, 0.5, 0.5], // SymmetricFastPath

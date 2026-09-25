@@ -1,8 +1,9 @@
 use fsci_linalg::{
-    DISABLE_FLAT_LU_FACTOR, InvOptions, SolveOptions, inv, matmul, solve, solve_with_audit,
+    DISABLE_FLAT_LU_FACTOR, DecompOptions, InvOptions, SolveOptions, cholesky,
+    condition_diagnostics, inv, matmul, solve, solve_with_action, solve_with_audit,
     solve_with_casp, verify_solve_certificate,
 };
-use fsci_runtime::{AuditLedger, Fingerprinter, RuntimeMode, SolverPortfolio};
+use fsci_runtime::{AuditLedger, Fingerprinter, RuntimeMode, SolverAction, SolverPortfolio};
 use std::hint::black_box;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -91,7 +92,83 @@ fn portfolio_lu_arms() {
     }
 }
 
+/// frankenscipy-w8bjb: where the portfolio's symmetric path spends its time next to the LU
+/// path, on one symmetric positive definite matrix per n: each action through
+/// `solve_with_action` (both run the same solve diagnostics, so their difference is what the
+/// symmetric action adds), a Cholesky factorization alone, and the public
+/// `condition_diagnostics` (the `inv` detection, which also tests positive definiteness).
+/// Arms interleave, rotating the order per round.
+fn symmetric_path_components() {
+    let threads = std::thread::available_parallelism().map_or(0, |p| p.get());
+    let host = std::fs::read_to_string("/etc/hostname").unwrap_or_default();
+    for n in [128usize, 512, 1024] {
+        let a: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        let v = (0.01 * (i + j) as f64 + 0.3).sin();
+                        if i == j { v + n as f64 } else { v * 0.1 }
+                    })
+                    .collect()
+            })
+            .collect();
+        let b: Vec<f64> = (0..n).map(|i| (i as f64 * 0.01).cos()).collect();
+        let arms: [(&str, &dyn Fn()); 5] = [
+            ("lu_action", &|| {
+                black_box(solve_with_action(&a, &b, SolverAction::DirectLU).unwrap());
+            }),
+            ("symmetric_action", &|| {
+                black_box(solve_with_action(&a, &b, SolverAction::SymmetricFastPath).unwrap());
+            }),
+            ("inv_diagnostics", &|| {
+                black_box(condition_diagnostics(&a).unwrap());
+            }),
+            ("cholesky", &|| {
+                black_box(cholesky(&a, true, DecompOptions::default()).unwrap());
+            }),
+            // A/A null: the LU arm again; lu_null / lu must come out near 1.
+            ("lu_null", &|| {
+                black_box(solve_with_action(&a, &b, SolverAction::DirectLU).unwrap());
+            }),
+        ];
+        let mut times = [Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for (_, arm) in &arms {
+            arm();
+        }
+        // Sub-millisecond arms need more rounds for the A/A null to settle.
+        let rounds = if n <= 128 { 35 } else { 7 };
+        for round in 0..rounds {
+            for k in 0..arms.len() {
+                let index = (k + round) % arms.len();
+                let start = Instant::now();
+                arms[index].1();
+                times[index].push(start.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        let medians: Vec<f64> = times.iter_mut().map(|t| median(t)).collect();
+        println!(
+            "w8bjb n={n} host={} threads={threads}: {} (medians of {rounds} ms); \
+             symmetric/lu {:.2}; A/A null lu_null/lu {:.2}; symmetric - lu {:.2} ms vs \
+             cholesky {:.2} ms",
+            host.trim(),
+            arms.iter()
+                .zip(&medians)
+                .map(|((name, _), ms)| format!("{name} {ms:.2}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            medians[1] / medians[0],
+            medians[4] / medians[0],
+            medians[1] - medians[0],
+            medians[3],
+        );
+    }
+}
+
 fn main() {
+    if std::env::args().any(|arg| arg == "--symmetric") {
+        symmetric_path_components();
+        return;
+    }
     portfolio_lu_arms();
     for n in [1024usize, 2048] {
         let a = mk(n, 0.3);
