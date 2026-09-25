@@ -923,6 +923,7 @@ dependencies = [
  "criterion",
  "fsci-opt",
  "fsci-runtime",
+ "fsci-sparse",
  "nalgebra",
  "proptest",
  "serde_json",
