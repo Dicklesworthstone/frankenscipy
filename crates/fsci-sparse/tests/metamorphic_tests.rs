@@ -853,7 +853,7 @@ fn mr_floyd_warshall_zero_diagonal() {
     let g = coo_to_csr_with_mode(&coo, RuntimeMode::Strict, "test_floyd")
         .unwrap()
         .0;
-    let dist = floyd_warshall(&g, true);
+    let dist = floyd_warshall(&g, true).expect("floyd_warshall");
     for (i, row) in dist.iter().enumerate().take(n) {
         assert!(
             row[i].abs() < 1e-12,

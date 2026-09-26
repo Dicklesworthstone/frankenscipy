@@ -257,23 +257,22 @@ fn diff_sparse_centrality() {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
 
-        let closeness = closeness_centrality(&csr);
+        let closeness = closeness_centrality(&csr).ok();
         let betweenness = betweenness_centrality(&csr);
         let arms = [
             (
                 "closeness",
                 scipy_arm.closeness.as_deref(),
-                closeness.as_slice(),
+                closeness.as_deref(),
             ),
             (
                 "betweenness",
                 scipy_arm.betweenness.as_deref(),
-                betweenness.as_slice(),
+                Some(betweenness.as_slice()),
             ),
         ];
         for (op, scipy, fsci) in arms {
-            let Some((expected, fsci_v)) = ledger.slices(op, &case.case_id, scipy, Some(fsci))
-            else {
+            let Some((expected, fsci_v)) = ledger.slices(op, &case.case_id, scipy, fsci) else {
                 continue;
             };
             let abs_d = fsci_v

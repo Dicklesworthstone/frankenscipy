@@ -394,32 +394,40 @@ fn compare_mode(
         }
     }
 
-    // fsci's floyd_warshall does not detect negative cycles and returns a Vec, so it cannot
-    // refuse. SciPy raises NegativeCycleError there, which the oracle sends as None; the case is
-    // allowlisted under the bead that makes it refuse (the arm's minimum still counts every
-    // other case, so a broken oracle cannot hide behind this).
+    // SciPy raises NegativeCycleError on a negative cycle, which the oracle sends as None, and
+    // fsci's floyd_warshall refuses it too (frankenscipy-lna36).
     let fw = floyd_warshall(csr, directed);
     match &answer.floyd {
-        None => ledger.allowlisted(
-            "floyd_warshall",
-            &tag,
-            "frankenscipy-lna36",
-            "SciPy raises NegativeCycleError; fsci returns a matrix",
-        ),
-        Some(scipy) => {
-            counts.matrices += 1;
-            let same = fw.len() == scipy.len()
-                && fw
-                    .iter()
-                    .zip(scipy)
-                    .all(|(a, b)| distances_close(a, &with_infinity(b)));
-            ledger.compared("floyd_warshall", &tag, same);
-            if !same {
-                failures.push(format!(
-                    "{tag} floyd_warshall: fsci {fw:?}, SciPy {scipy:?}"
-                ));
+        None => {
+            ledger.expected_raise("floyd_warshall", &tag, fw.is_err());
+            if fw.is_err() {
+                counts.refusals += 1;
+            } else {
+                failures.push(format!("{tag} floyd_warshall: SciPy refused / fsci solved"));
             }
         }
+        Some(scipy) => match &fw {
+            Err(err) => {
+                ledger.compared("floyd_warshall", &tag, false);
+                failures.push(format!(
+                    "{tag} floyd_warshall: SciPy solved / fsci refused ({err})"
+                ));
+            }
+            Ok(fw) => {
+                counts.matrices += 1;
+                let same = fw.len() == scipy.len()
+                    && fw
+                        .iter()
+                        .zip(scipy)
+                        .all(|(a, b)| distances_close(a, &with_infinity(b)));
+                ledger.compared("floyd_warshall", &tag, same);
+                if !same {
+                    failures.push(format!(
+                        "{tag} floyd_warshall: fsci {fw:?}, SciPy {scipy:?}"
+                    ));
+                }
+            }
+        },
     }
     let got = johnson(csr, directed);
     match &answer.johnson {
@@ -629,8 +637,6 @@ fn diff_sparse_csgraph_directedness() {
         "csgraph directedness disagrees: {failures:#?}"
     );
     // floyd_warshall, johnson, cc_weak and cc_strong each have one case per graph and mode, the
-    // smallest case set of any arm.
-    // floyd_warshall has one case (asymmetric5_negative_edge, undirected) allowlisted under
-    // frankenscipy-lna36, which leaves it one compared case short of the per-graph-and-mode set.
-    ledger.finish(2 * graphs.len() - 1);
+    // smallest case set of any arm; a refusal SciPy shares counts as compared.
+    ledger.finish(2 * graphs.len());
 }

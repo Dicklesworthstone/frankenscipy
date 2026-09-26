@@ -11202,10 +11202,20 @@ fn has_empty_structural_row(a: &CsrMatrix) -> bool {
 ///
 /// Matches `scipy.sparse.csgraph.floyd_warshall(graph, directed)`; with `directed = false`
 /// the pair `(i, j)` starts from the smaller of its two stored weights, as in SciPy.
-pub fn floyd_warshall(graph: &CsrMatrix, directed: bool) -> Vec<Vec<f64>> {
+///
+/// A negative cycle is an error, as SciPy's `NegativeCycleError`: after the relaxation any
+/// `dist[i][i] < 0` refuses the whole matrix, whose distances through the cycle are unbounded
+/// below (frankenscipy-lna36). With `directed = false` one negative edge is such a cycle. A
+/// non-square graph is an error too, as SciPy's `ValueError`.
+pub fn floyd_warshall(graph: &CsrMatrix, directed: bool) -> SparseResult<Vec<Vec<f64>>> {
     let shape = graph.shape();
     if shape.rows != shape.cols {
-        return vec![];
+        return Err(SparseError::InvalidShape {
+            message: format!(
+                "floyd_warshall needs a square graph, got {}x{}",
+                shape.rows, shape.cols
+            ),
+        });
     }
     let n = shape.rows;
 
@@ -11264,7 +11274,17 @@ pub fn floyd_warshall(graph: &CsrMatrix, directed: bool) -> Vec<Vec<f64>> {
         floyd_warshall_blocked(&mut d, n);
     }
 
-    d.chunks_exact(n).map(<[f64]>::to_vec).collect()
+    // SciPy: `if dist_matrix[i, i] < 0: raise NegativeCycleError("Negative cycle in nodes
+    // ...")` over the whole diagonal once the relaxation is done.
+    let cycle: Vec<usize> = (0..n).filter(|&i| d[i * n + i] < 0.0).collect();
+    if !cycle.is_empty() {
+        return Err(SparseError::InvalidArgument {
+            message: format!(
+                "graph contains a negative-weight cycle: Negative cycle in nodes {cycle:?}"
+            ),
+        });
+    }
+    Ok(d.chunks_exact(n).map(<[f64]>::to_vec).collect())
 }
 
 /// Block-pivot Floyd-Warshall. Pivots are processed B at a time (`n/B` rounds).
@@ -13447,12 +13467,10 @@ pub fn pagerank(graph: &CsrMatrix, damping: f64, max_iter: usize, tol: f64) -> V
 
 /// Compute the graph diameter (longest shortest path between any two nodes).
 ///
-/// Uses Floyd-Warshall internally. Returns 0.0 for non-square matrices.
-pub fn graph_diameter(graph: &CsrMatrix) -> f64 {
-    let dist = floyd_warshall(graph, true);
-    if dist.is_empty() {
-        return 0.0;
-    }
+/// Uses Floyd-Warshall internally, so a non-square graph or a negative cycle is an error
+/// ([`floyd_warshall`]); an empty graph has diameter 0.
+pub fn graph_diameter(graph: &CsrMatrix) -> SparseResult<f64> {
+    let dist = floyd_warshall(graph, true)?;
     let mut max_d = 0.0f64;
     for row in &dist {
         for &d in row {
@@ -13461,17 +13479,15 @@ pub fn graph_diameter(graph: &CsrMatrix) -> f64 {
             }
         }
     }
-    max_d
+    Ok(max_d)
 }
 
 /// Compute the eccentricity of each node (max shortest path distance).
-/// Returns empty vec for non-square matrices.
-pub fn eccentricity(graph: &CsrMatrix) -> Vec<f64> {
-    let dist = floyd_warshall(graph, true);
-    if dist.is_empty() {
-        return vec![];
-    }
-    dist.iter()
+/// A non-square graph or a negative cycle is an error ([`floyd_warshall`]).
+pub fn eccentricity(graph: &CsrMatrix) -> SparseResult<Vec<f64>> {
+    let dist = floyd_warshall(graph, true)?;
+    Ok(dist
+        .iter()
         .map(|row| {
             row.iter()
                 .filter(|&&d| d.is_finite())
@@ -13484,7 +13500,7 @@ pub fn eccentricity(graph: &CsrMatrix) -> Vec<f64> {
                     }
                 })
         })
-        .collect()
+        .collect())
 }
 
 /// Compute the clustering coefficient for each node.
@@ -13611,14 +13627,12 @@ pub fn betweenness_centrality(graph: &CsrMatrix) -> Vec<f64> {
 }
 
 /// Compute closeness centrality for each node.
-pub fn closeness_centrality(graph: &CsrMatrix) -> Vec<f64> {
+/// A non-square graph or a negative cycle is an error ([`floyd_warshall`]).
+pub fn closeness_centrality(graph: &CsrMatrix) -> SparseResult<Vec<f64>> {
     let n = graph.shape().rows;
-    let dist = floyd_warshall(graph, true);
-    if dist.is_empty() {
-        return vec![0.0; n];
-    }
+    let dist = floyd_warshall(graph, true)?;
 
-    (0..n)
+    Ok((0..n)
         .map(|i| {
             let reachable: Vec<f64> = dist[i]
                 .iter()
@@ -13638,7 +13652,7 @@ pub fn closeness_centrality(graph: &CsrMatrix) -> Vec<f64> {
                 }
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Apply an element-wise function to all nonzero entries of a CSR matrix.
@@ -14846,7 +14860,7 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let fw = floyd_warshall(&g, true);
+        let fw = floyd_warshall(&g, true).expect("floyd_warshall");
         let ap = dijkstra_all_pairs(&g, true).expect("dijkstra_all_pairs");
         assert_eq!(ap.len(), n);
         for (i, (api, fwi)) in ap.iter().zip(fw.iter()).enumerate() {
@@ -14887,7 +14901,7 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let fw = floyd_warshall(&g, true);
+        let fw = floyd_warshall(&g, true).expect("floyd_warshall");
         let sources = [3usize, 17, 42, 0, 59];
         let ms = dijkstra_multi_source(&g, true, &sources).expect("multi-source");
         assert_eq!(ms.len(), sources.len());
@@ -15000,7 +15014,7 @@ mod tests {
             .expect("coo")
             .to_csr()
             .expect("csr");
-        let fw = floyd_warshall(&g, true);
+        let fw = floyd_warshall(&g, true).expect("floyd_warshall");
         let sources = [1usize, 9, 30, 54, 0];
         let bf = bellman_ford_multi_source(&g, true, &sources).expect("bf multi");
         assert_eq!(bf.len(), sources.len());
@@ -15048,7 +15062,7 @@ mod tests {
             .to_csr()
             .expect("csr");
 
-        let fw = floyd_warshall(&g, true);
+        let fw = floyd_warshall(&g, true).expect("floyd_warshall");
         let jh = johnson(&g, true).expect("johnson");
         assert_eq!(jh.len(), n);
         for (i, (jhi, fwi)) in jh.iter().zip(fw.iter()).enumerate() {
@@ -15304,7 +15318,7 @@ mod tests {
         )
         .unwrap();
         // closeness = reachable_count / sum_dist: center=2/2=1, endpoints=2/3.
-        let cc = closeness_centrality(&g);
+        let cc = closeness_centrality(&g).expect("closeness_centrality");
         assert!(
             (cc[0] - 2.0 / 3.0).abs() < 1e-12
                 && (cc[1] - 1.0).abs() < 1e-12
@@ -15389,8 +15403,11 @@ mod tests {
         )
         .unwrap();
         assert!(is_connected(&g), "connected");
-        assert!((graph_diameter(&g) - 2.0).abs() < 1e-12, "diameter");
-        assert_eq!(eccentricity(&g), vec![2.0, 1.0, 2.0]);
+        assert!(
+            (graph_diameter(&g).expect("diameter") - 2.0).abs() < 1e-12,
+            "diameter"
+        );
+        assert_eq!(eccentricity(&g).expect("eccentricity"), vec![2.0, 1.0, 2.0]);
         assert!(average_clustering(&g).abs() < 1e-12, "no triangles -> 0");
         let mut deg = degree_sequence(&g);
         deg.sort_unstable_by(|a, b| b.cmp(a));
@@ -27414,7 +27431,7 @@ mod tests {
         .to_csr()
         .expect("csr");
 
-        let distances = floyd_warshall(&looped, true);
+        let distances = floyd_warshall(&looped, true).expect("floyd_warshall");
         assert_eq!(
             distances[0][0], 0.0,
             "distance from a node to itself is the empty path, not its self-loop              (scipy gives 0 for a self-loop of weight 5, we gave {})",
@@ -27454,7 +27471,7 @@ mod tests {
             "unreachable node must be inf, got {}",
             reach.distances[3]
         );
-        let all_pairs = floyd_warshall(&disconnected, true);
+        let all_pairs = floyd_warshall(&disconnected, true).expect("floyd_warshall");
         assert!(all_pairs[0][3].is_infinite());
         assert_eq!(all_pairs[3][3], 0.0);
     }
@@ -29231,6 +29248,88 @@ mod tests {
         assert!(matches!(err, SparseError::InvalidArgument { .. }));
     }
 
+    /// frankenscipy-lna36. floyd_warshall returned a distance matrix through a negative cycle.
+    /// scipy 1.17.1, live:
+    /// - the 3-cycle 0→1 (1), 1→2 (−1), 2→0 (−1), directed: NegativeCycleError "Negative cycle
+    ///   in nodes [0 1 2]";
+    /// - 0→1 (−1), 1→2 (2) undirected: nodes [0 1 2] (one negative edge is a 2-cycle);
+    ///   0→1 (1), 1→2 (−1) undirected: nodes [1 2];
+    /// - a 2×3 graph: ValueError "csgraph should be a square matrix";
+    /// - must not change, 0→1 (−1), 1→2 (2) directed: [[0, −1, 1], [inf, 0, 2], [inf, inf, 0]].
+    ///
+    /// The refusal is the parity; the node list is diagnostics. It must contain every node ON
+    /// the negative cycle. scipy's can list more: its inner loop re-reads `dist[i, k]` after
+    /// updating it within pass k, so node 2 above, which only reaches the 0–1 cycle, gets a
+    /// negative diagonal there; fsci hoists `d[i][k]` (identical whenever there is no negative
+    /// cycle) and lists [0, 1].
+    #[test]
+    fn floyd_warshall_refuses_a_negative_cycle_like_scipy() {
+        let graph = |weights: Vec<f64>, rows: Vec<usize>, cols: Vec<usize>| {
+            CooMatrix::from_triplets(Shape2D::new(3, 3), weights, rows, cols, false)
+                .expect("coo")
+                .to_csr()
+                .expect("csr")
+        };
+        let cycle = graph(vec![1.0, -1.0, -1.0], vec![0, 1, 2], vec![1, 2, 0]);
+        let neg_edge = graph(vec![-1.0, 2.0], vec![0, 1], vec![1, 2]);
+        let late_neg = graph(vec![1.0, -1.0], vec![0, 1], vec![1, 2]);
+        let cases: [(&str, &CsrMatrix, bool, &[usize]); 3] = [
+            ("cycle3", &cycle, true, &[0, 1, 2]),
+            ("negative edge, undirected", &neg_edge, false, &[0, 1]),
+            (
+                "second edge negative, undirected",
+                &late_neg,
+                false,
+                &[1, 2],
+            ),
+        ];
+        for (label, g, directed, on_cycle) in cases {
+            let result = floyd_warshall(g, directed);
+            // The reported node list, e.g. "... Negative cycle in nodes [0, 1]".
+            let reported: Option<Vec<usize>> = match &result {
+                Err(SparseError::InvalidArgument { message }) => message
+                    .split_once("Negative cycle in nodes [")
+                    .and_then(|(_, rest)| rest.split_once(']'))
+                    .map(|(list, _)| {
+                        list.split(", ")
+                            .filter_map(|node| node.parse().ok())
+                            .collect()
+                    }),
+                _ => None,
+            };
+            assert!(
+                reported
+                    .as_ref()
+                    .is_some_and(|listed| on_cycle.iter().all(|node| listed.contains(node))),
+                "{label}: scipy raises NegativeCycleError; nodes {on_cycle:?} are on the cycle, \
+                 got {result:?}"
+            );
+        }
+        let directed = floyd_warshall(&neg_edge, true).expect("no cycle when directed");
+        let inf = f64::INFINITY;
+        assert_eq!(
+            directed,
+            vec![
+                vec![0.0, -1.0, 1.0],
+                vec![inf, 0.0, 2.0],
+                vec![inf, inf, 0.0]
+            ]
+        );
+
+        let wide = CooMatrix::from_triplets(Shape2D::new(2, 3), vec![1.0], vec![0], vec![2], false)
+            .expect("coo")
+            .to_csr()
+            .expect("csr");
+        assert!(matches!(
+            floyd_warshall(&wide, true),
+            Err(SparseError::InvalidShape { .. })
+        ));
+        assert!(matches!(
+            graph_diameter(&cycle),
+            Err(SparseError::InvalidArgument { .. })
+        ));
+    }
+
     #[test]
     fn bellman_ford_unreachable() {
         let g = disconnected_graph_csr();
@@ -29313,7 +29412,7 @@ mod tests {
         assert_eq!(bf.distances, vec![0.0, 1.0, 3.0]);
         let (order, _) = breadth_first_order(&lower, 0, false).expect("bfs");
         assert_eq!(order, vec![0, 1, 2]);
-        let fw = floyd_warshall(&lower, false);
+        let fw = floyd_warshall(&lower, false).expect("floyd_warshall");
         assert_eq!(fw[0], vec![0.0, 1.0, 3.0]);
         assert_eq!(fw[2][0], 3.0);
         // A negative stored edge is a negative cycle once it can be walked both ways.
@@ -30526,7 +30625,7 @@ mod tests {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let dist = super::floyd_warshall(&g, true);
+        let dist = super::floyd_warshall(&g, true).expect("floyd_warshall");
         assert!((dist[0][0] - 0.0).abs() < 1e-10);
         assert!((dist[0][1] - 1.0).abs() < 1e-10);
         assert!((dist[0][2] - 3.0).abs() < 1e-10);

@@ -272,22 +272,21 @@ fn diff_sparse_clustering_diameter_eccentricity() {
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
 
         let clustering = clustering_coefficient(&csr);
-        let ecc = eccentricity(&csr);
+        let ecc = eccentricity(&csr).ok();
         let vector_arms = [
             (
                 "clustering",
                 scipy_arm.clustering.as_deref(),
-                clustering.as_slice(),
+                Some(clustering.as_slice()),
             ),
             (
                 "eccentricity",
                 scipy_arm.eccentricity.as_deref(),
-                ecc.as_slice(),
+                ecc.as_deref(),
             ),
         ];
         for (op, scipy, fsci) in vector_arms {
-            let Some((expected, fsci_v)) = ledger.slices(op, &case.case_id, scipy, Some(fsci))
-            else {
+            let Some((expected, fsci_v)) = ledger.slices(op, &case.case_id, scipy, fsci) else {
                 continue;
             };
             let abs_d = fsci_v
@@ -309,7 +308,7 @@ fn diff_sparse_clustering_diameter_eccentricity() {
             "diameter",
             &case.case_id,
             scipy_arm.diameter,
-            Some(graph_diameter(&csr)),
+            graph_diameter(&csr).ok(),
         ) else {
             continue;
         };
