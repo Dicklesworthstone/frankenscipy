@@ -392,8 +392,13 @@ trait IvpSolver<F> {
     fn njev(&self) -> usize;
     fn nlu(&self) -> usize;
     fn ivp_state(&self) -> OdeSolverState;
+    /// Build the last step's dense output where that costs evaluations (SciPy's
+    /// `solver.dense_output()`); only DOP853 does. Called at most once per step.
+    fn prepare_dense_output(&mut self, _fun: &mut F) -> Result<(), crate::solver::StepFailure> {
+        Ok(())
+    }
     /// Solver-specific dense output at `t`, or `None` to fall back to the
-    /// generic cubic Hermite. RK45 (frankenscipy-3m5ip) and BDF provide SciPy's.
+    /// generic cubic Hermite. Every RK method, BDF and Radau provide SciPy's.
     fn dense_output_at(&self, _t: f64) -> Option<Vec<f64>> {
         None
     }
@@ -435,6 +440,9 @@ where
     }
     fn ivp_state(&self) -> OdeSolverState {
         self.state()
+    }
+    fn prepare_dense_output(&mut self, fun: &mut F) -> Result<(), crate::solver::StepFailure> {
+        self.prepare_dense_output(fun)
     }
     fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
         self.dense_output_at(t)
@@ -752,6 +760,13 @@ where
         }
     }
 
+    fn prepare_dense_output(&mut self, fun: &mut F) -> Result<(), crate::solver::StepFailure> {
+        match &mut self.mode {
+            LsodaMode::Adams(rk) => rk.prepare_dense_output(fun),
+            LsodaMode::Bdf(_) => Ok(()),
+        }
+    }
+
     fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
         match &self.mode {
             LsodaMode::Adams(rk) => rk.dense_output_at(t),
@@ -799,11 +814,15 @@ where
         None
     };
 
+    // SciPy samples a t_eval point at t0 from the FIRST step's dense output (its value is y0
+    // exactly), so that step builds dense output even when no other sample falls in it.
+    let mut t0_sample_pending = false;
     if let Some(t_eval) = options.t_eval {
         if matches!(t_eval.first(), Some(&first) if (first - t0).abs() < 1e-14) {
             ts.push(t0);
             ys.push(options.y0.to_vec());
             next_t_eval_index = 1;
+            t0_sample_pending = true;
         }
     } else {
         ts.push(t0);
@@ -821,6 +840,44 @@ where
                 let t_old = solver.t_old().unwrap_or(t0);
                 let y_old = solver.y_old().unwrap_or(options.y0).to_vec();
                 let f_old = solver.f_old().map(<[f64]>::to_vec).or_else(|| f.clone());
+
+                // Each event at the new point, once per event per step.
+                let new_event_vals = match options.events.as_ref() {
+                    Some(evs) => {
+                        let mut vals = Vec::with_capacity(evs.len());
+                        for (i, ev) in evs.iter().enumerate() {
+                            vals.push(validate_event_value(i, (ev.func)(t, &y))?);
+                        }
+                        Some(vals)
+                    }
+                    None => None,
+                };
+                // SciPy builds a step's dense output only when something reads it:
+                // dense_output=True, an active event, or a t_eval point inside the step. For
+                // DOP853 building it costs three counted evaluations, so prepare it on exactly
+                // those steps.
+                let any_event_active = match (
+                    options.events.as_ref(),
+                    event_vals.as_ref(),
+                    new_event_vals.as_ref(),
+                ) {
+                    (Some(evs), Some(old), Some(new)) => evs
+                        .iter()
+                        .enumerate()
+                        .any(|(i, ev)| event_active(old[i], new[i], ev.direction)),
+                    _ => false,
+                };
+                let t_eval_in_step = std::mem::take(&mut t0_sample_pending)
+                    || options
+                        .t_eval
+                        .and_then(|t_eval| t_eval.get(next_t_eval_index))
+                        .is_some_and(|&te| eval_time_in_range(te, t_old, t, direction));
+                if (options.dense_output || any_event_active || t_eval_in_step)
+                    && solver.prepare_dense_output(fun).is_err()
+                {
+                    break;
+                }
+
                 // The step's interpolant, for t_eval samples AND event roots.
                 let interp = |te: f64| {
                     sample_state(
@@ -837,13 +894,14 @@ where
 
                 let mut terminal_event: Option<(f64, Vec<f64>)> = None;
 
-                if let (Some(evs), Some(old_vals), Some(counts)) = (
+                if let (Some(evs), Some(old_vals), Some(counts), Some(new_vals)) = (
                     options.events.as_ref(),
                     event_vals.as_mut(),
                     event_counts.as_mut(),
+                    new_event_vals.as_ref(),
                 ) {
                     for (i, ev_spec) in evs.iter().enumerate() {
-                        let val = validate_event_value(i, (ev_spec.func)(t, &y))?;
+                        let val = new_vals[i];
                         if event_active(old_vals[i], val, ev_spec.direction) {
                             let t_ev = solve_event_equation(i, ev_spec.func, t_old, t, &interp)?;
                             let y_ev = interp(t_ev);

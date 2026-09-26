@@ -184,9 +184,38 @@ static RK45_P: [[f64; 4]; 7] = [
     ],
 ];
 
-/// Number of stage derivatives RK45's dense output consumes (SciPy's `K` has
-/// `n_stages + 1` rows; our tableau counts the FSAL stage inside `n_stages`).
-const RK45_DENSE_STAGES: usize = 7;
+/// SciPy's `RkDenseOutput` over the step's stage derivatives `k` (SciPy's `K`, whose rows
+/// our FSAL tableaus hold in `k[0..=n_stages - 1]`): `Q = Kᵀ P`, then
+/// `y_old + h · Q · p` with `p = cumprod([x; M]) = [x, x², …, x^M]`, summed in SciPy's order.
+fn rk_dense<const M: usize>(
+    k: &[Vec<f64>],
+    p: &[[f64; M]],
+    y_old: &[f64],
+    h: f64,
+    x: f64,
+) -> Vec<f64> {
+    let mut powers = [0.0; M];
+    let mut power = 1.0;
+    for pj in &mut powers {
+        power *= x;
+        *pj = power;
+    }
+    y_old
+        .iter()
+        .enumerate()
+        .map(|(i, &y0)| {
+            let mut dot = 0.0;
+            for (j, &pj) in powers.iter().enumerate() {
+                let q_ij = p
+                    .iter()
+                    .enumerate()
+                    .fold(0.0, |acc, (s, row)| acc + k[s][i] * row[j]);
+                dot += q_ij * pj;
+            }
+            h * dot + y0
+        })
+        .collect()
+}
 
 // ═══════════════════════════════════════════════════════════════
 // RK23: Bogacki-Shampine 3(2) Butcher tableau
@@ -216,6 +245,15 @@ pub static RK23_TABLEAU: ButcherTableau = ButcherTableau {
     fsal: true,
     e3: None,
 };
+
+/// Dense-output interpolation matrix for RK23: SciPy's `RK23.P` (4 × 3), the cubic
+/// `y(t) = y_old + h · (Kᵀ P) · [x, x², x³]` over the three stages and `f(t + h, y_new)`.
+static RK23_P: [[f64; 3]; 4] = [
+    [1.0, -4.0 / 3.0, 5.0 / 9.0],
+    [0.0, 1.0, -2.0 / 3.0],
+    [0.0, 4.0 / 3.0, -8.0 / 9.0],
+    [0.0, -1.0, 1.0],
+];
 
 // ═══════════════════════════════════════════════════════════════
 // DOP853: Dormand-Prince 8(5,3) Butcher tableau
@@ -402,6 +440,134 @@ pub static DOP853_TABLEAU: ButcherTableau = ButcherTableau {
     e3: Some(DOP853_E3),
 };
 
+// DOP853's 7th-order dense output (SciPy's `_dense_output_impl`,
+// `dop853_coefficients.A[13:16]`, `C[13:16]`, `D`), as the doubles SciPy uses. Three extra
+// stages extend the step's K[0..=12] (K[12] = f(t + h, y_new)); the interpolant's seven
+// coefficient rows are then Δy, h·f_old − Δy, 2Δy − h·(f + f_old) and h·D·K.
+static DOP853_C_EXTRA: [f64; 3] = [0.1, 0.2, 0.777_777_777_777_777_8];
+static DOP853_A13: [f64; 13] = [
+    0.056_167_502_283_047_954,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.253_500_210_216_624_83,
+    -0.246_239_037_470_802_5,
+    -0.124_191_423_263_816_37,
+    0.153_291_798_278_765_68,
+    0.008_201_052_295_634_69,
+    0.007_567_897_660_545_699,
+    -0.008_298,
+];
+static DOP853_A14: [f64; 14] = [
+    0.031_834_648_163_502_14,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.028_300_909_672_366_776,
+    0.053_541_988_307_438_566,
+    -0.054_923_748_571_390_99,
+    0.0,
+    0.0,
+    -0.000_108_347_328_697_249_32,
+    0.000_382_571_090_835_658_4,
+    -0.000_340_465_008_687_404_56,
+    0.141_312_443_674_632_5,
+];
+static DOP853_A15: [f64; 15] = [
+    -0.428_896_301_583_791_94,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    -4.697_621_415_361_164,
+    7.683_421_196_062_599,
+    4.068_989_818_397_11,
+    0.356_727_187_455_281_1,
+    0.0,
+    0.0,
+    0.0,
+    -0.001_399_024_165_159_014_5,
+    2.947_514_789_152_772_4,
+    -9.150_958_472_179_87,
+];
+static DOP853_D: [[f64; 16]; 4] = [
+    [
+        -8.428_938_276_109_013,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.566_714_953_519_377_7,
+        -3.068_949_945_949_891_7,
+        2.384_667_656_512_07,
+        2.117_034_582_445_028,
+        -0.871_391_583_777_973,
+        2.240_437_430_260_788_3,
+        0.631_578_778_769_468_8,
+        -0.088_990_336_451_333_31,
+        18.148_505_520_854_727,
+        -9.194_632_392_478_356,
+        -4.436_036_387_594_894,
+    ],
+    [
+        10.427_508_642_579_134,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        242.283_491_775_258_17,
+        165.200_451_717_270_28,
+        -374.546_754_722_690_2,
+        -22.113_666_853_125_306,
+        7.733_432_668_472_264,
+        -30.674_084_731_089_398,
+        -9.332_130_526_430_229,
+        15.697_238_121_770_845,
+        -31.139_403_219_565_178,
+        -9.352_924_358_844_48,
+        35.816_841_486_394_08,
+    ],
+    [
+        19.985_053_242_002_433,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -387.037_308_749_351_8,
+        -189.178_138_195_167_58,
+        527.808_159_205_423_6,
+        -11.573_902_539_959_63,
+        6.881_232_694_696_3,
+        -1.000_605_096_691_083_8,
+        0.777_713_779_805_344_3,
+        -2.778_205_752_353_508,
+        -60.196_695_231_264_12,
+        84.320_405_506_677_16,
+        11.992_291_136_182_79,
+    ],
+    [
+        -25.693_933_462_703_75,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -154.189_748_690_236_43,
+        -231.529_379_176_045_5,
+        357.639_117_910_614_1,
+        93.405_324_183_624_32,
+        -37.458_323_136_451_63,
+        104.099_649_508_962_3,
+        29.840_293_426_660_5,
+        -43.533_456_590_011_14,
+        96.324_553_959_188_28,
+        -39.177_261_675_615_44,
+        -149.726_836_257_985_64,
+    ],
+];
+
 // ═══════════════════════════════════════════════════════════════
 // Core RK step function
 // ═══════════════════════════════════════════════════════════════
@@ -571,6 +737,9 @@ pub struct RkSolver {
     nfev: usize,
     // Stored ODE function for trait-object stepping (Some if created with new_owned)
     fun: Option<OdeFn>,
+    /// DOP853's seven interpolation rows for the last step, once
+    /// [`Self::prepare_dense_output`] built them; cleared by every step.
+    dop853_dense: Option<Vec<Vec<f64>>>,
 }
 
 impl RkSolver {
@@ -680,6 +849,7 @@ impl RkSolver {
             y_stage,
             nfev,
             fun: None,
+            dop853_dense: None,
         })
     }
 
@@ -794,6 +964,7 @@ impl RkSolver {
             y_stage,
             nfev,
             fun: Some(fun_box),
+            dop853_dense: None,
         })
     }
 
@@ -832,48 +1003,116 @@ impl RkSolver {
         self.nfev
     }
 
-    /// Solver-specific dense output at `t`, matching SciPy's `RkDenseOutput`.
+    /// Solver-specific dense output at `t` for the last step, SciPy's interpolant for each
+    /// method.
     ///
-    /// Returns `None` when this solver has no solver-specific interpolant
-    /// implemented (RK23 and DOP853 today) or when no step has been taken yet,
-    /// so callers fall back to cubic Hermite exactly as before.
-    ///
-    /// For RK45 this reproduces SciPy's construction: with `Q = Kᵀ P` and
-    /// `x = (t - t_old) / h`,
+    /// RK45 and RK23 are SciPy's `RkDenseOutput`: with `Q = Kᵀ P` and `x = (t - t_old) / h`,
     ///
     /// ```text
-    /// y(t) = y_old + h · Q · [x, x², x³, x⁴]ᵀ
+    /// y(t) = y_old + h · Q · [x, x², …]ᵀ
     /// ```
     ///
-    /// evaluated as `y_old + h · Σⱼ (Σₛ K[s]·P[s][j]) · x^{j+1}`. Cubic Hermite
-    /// through the endpoints is one order lower and drifts from SciPy's samples
-    /// mid-step even when the step endpoints agree — frankenscipy-3m5ip.
+    /// (a quartic for RK45, a cubic for RK23). DOP853 is SciPy's 7th-order
+    /// `Dop853DenseOutput`, which needs [`Self::prepare_dense_output`] first. Returns `None`
+    /// before the first step and for an unprepared DOP853 step; callers then fall back to the
+    /// cubic Hermite through the endpoints, which is one order lower and drifts from SciPy's
+    /// samples mid-step even when the step endpoints agree (frankenscipy-3m5ip).
     #[must_use]
     pub fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
-        if !std::ptr::eq(self.tableau, &RK45_TABLEAU) {
-            return None;
-        }
         let (t_old, y_old) = (self.t_old?, self.y_old.as_deref()?);
         let h = self.t - t_old;
         if h == 0.0 {
             return Some(y_old.to_vec());
         }
         let x = (t - t_old) / h;
-
-        let mut out = y_old.to_vec();
-        for (i, out_i) in out.iter_mut().enumerate() {
-            // Horner in x over the quartic, accumulating Q[i][j] on the fly so
-            // no n×4 scratch matrix is allocated per sample.
-            let mut acc = 0.0;
-            for j in (0..4).rev() {
-                let q_ij: f64 = (0..RK45_DENSE_STAGES)
-                    .map(|s| self.k[s][i] * RK45_P[s][j])
-                    .sum();
-                acc = acc * x + q_ij;
+        if std::ptr::eq(self.tableau, &RK45_TABLEAU) {
+            Some(rk_dense(&self.k, &RK45_P, y_old, h, x))
+        } else if std::ptr::eq(self.tableau, &RK23_TABLEAU) {
+            Some(rk_dense(&self.k, &RK23_P, y_old, h, x))
+        } else if std::ptr::eq(self.tableau, &DOP853_TABLEAU) {
+            // SciPy's Dop853DenseOutput: for i, f in enumerate(reversed(F)):
+            // y += f; y *= x if i is even else (1 - x); then y += y_old.
+            let rows = self.dop853_dense.as_ref()?;
+            let mut y = vec![0.0; y_old.len()];
+            for (i, row) in rows.iter().rev().enumerate() {
+                let factor = if i % 2 == 0 { x } else { 1.0 - x };
+                for (yj, fj) in y.iter_mut().zip(row) {
+                    *yj = (*yj + fj) * factor;
+                }
             }
-            *out_i += h * acc * x;
+            for (yj, y0) in y.iter_mut().zip(y_old) {
+                *yj += y0;
+            }
+            Some(y)
+        } else {
+            None
         }
-        Some(out)
+    }
+
+    /// SciPy's `solver.dense_output()` for the last step, where building it costs
+    /// evaluations: DOP853 evaluates three extra stages (counted in `nfev`, as SciPy's
+    /// `self.fun` counts them) and forms its seven interpolation rows. A no-op for RK23 and
+    /// RK45, whose interpolants reuse the step's stages, and for a DOP853 step already
+    /// prepared. `solve_ivp` calls it at most once per step, on the steps where SciPy builds
+    /// dense output: `dense_output=True`, an active event, or a `t_eval` point in the step.
+    pub fn prepare_dense_output<F>(&mut self, fun: &mut F) -> Result<(), StepFailure>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64> + ?Sized,
+    {
+        if !std::ptr::eq(self.tableau, &DOP853_TABLEAU) || self.dop853_dense.is_some() {
+            return Ok(());
+        }
+        let (Some(t_old), Some(y_old)) = (self.t_old, self.y_old.clone()) else {
+            return Ok(());
+        };
+        let n = self.n;
+        let h = self.t - t_old;
+        let mut k_ext: Vec<Vec<f64>> = self.k[..=DOP853_TABLEAU.n_stages].to_vec();
+        let extra: [&[f64]; 3] = [&DOP853_A13, &DOP853_A14, &DOP853_A15];
+        for (a, &c) in extra.iter().zip(&DOP853_C_EXTRA) {
+            // SciPy: dy = np.dot(K[:s].T, a[:s]) * h; K[s] = fun(t_old + c * h, y_old + dy)
+            let y_stage: Vec<f64> = (0..n)
+                .map(|i| {
+                    let dot = a
+                        .iter()
+                        .enumerate()
+                        .fold(0.0, |acc, (j, &aj)| acc + k_ext[j][i] * aj);
+                    y_old[i] + dot * h
+                })
+                .collect();
+            let stage = fun(t_old + c * h, &y_stage);
+            self.nfev += 1;
+            validate_stage_rhs_shape(stage.len(), n)?;
+            k_ext.push(stage);
+        }
+        let f_old = &k_ext[0];
+        let delta: Vec<f64> = (0..n).map(|i| self.y[i] - y_old[i]).collect();
+        let mut rows = Vec::with_capacity(7);
+        rows.push(
+            (0..n)
+                .map(|i| h * f_old[i] - delta[i])
+                .collect::<Vec<f64>>(),
+        );
+        rows.push(
+            (0..n)
+                .map(|i| 2.0 * delta[i] - h * (self.f[i] + f_old[i]))
+                .collect(),
+        );
+        for d in &DOP853_D {
+            rows.push(
+                (0..n)
+                    .map(|i| {
+                        h * d
+                            .iter()
+                            .enumerate()
+                            .fold(0.0, |acc, (s, &ds)| acc + ds * k_ext[s][i])
+                    })
+                    .collect(),
+            );
+        }
+        rows.insert(0, delta);
+        self.dop853_dense = Some(rows);
+        Ok(())
     }
 
     /// Returns true if this solver supports standalone `OdeSolver::step()`.
@@ -897,6 +1136,8 @@ impl RkSolver {
                 "Attempt to step on a finished or failed solver.",
             ));
         }
+        // The DOP853 interpolant belongs to the step it was built for.
+        self.dop853_dense = None;
 
         // Handle empty system or already at boundary
         if self.n == 0 || self.t == self.t_bound {
@@ -1098,6 +1339,8 @@ impl RkSolver {
                 "Attempt to step on a finished or failed solver.",
             ));
         }
+        // The DOP853 interpolant belongs to the step it was built for.
+        self.dop853_dense = None;
 
         // Handle empty system or already at boundary
         if self.n == 0 || self.t == self.t_bound {
@@ -1378,20 +1621,51 @@ mod tests {
         }
     }
 
-    /// RK23 and DOP853 have their own `P` matrices that are not implemented
-    /// yet, so they must return `None` and keep the cubic-Hermite fallback
-    /// rather than silently borrowing RK45's interpolant.
+    /// Each method samples its OWN SciPy interpolant (RK23's cubic, RK45's quartic, DOP853's
+    /// 7th-order polynomial over three extra stages), and DOP853 counts those stages in nfev
+    /// exactly once per step, as SciPy's `dense_output()` does.
     #[test]
-    fn dense_output_is_none_for_solvers_without_one() {
+    fn dense_output_is_scipys_interpolant_for_every_rk_method() {
+        // Pinned SciPy 1.17.1: `cls(lambda t, y: -y, 0, [1.0], 1.0, rtol=1e-6, atol=1e-9)`,
+        // one `step()`, then `dense_output()` sampled at a half and a quarter of the step.
+        // DOP853's dense_output() spends three evaluations (nfev 14 -> 17); RK23/RK45 none.
+        let cases = [
+            (
+                "RK23",
+                &RK23_TABLEAU,
+                0.002_155_152_595_679_83,
+                5,
+                5,
+                0.998_923_004_078_507_8,
+                0.999_461_356_971_178_5,
+            ),
+            (
+                "DOP853",
+                &DOP853_TABLEAU,
+                0.100_012_494_534_665_5,
+                14,
+                17,
+                0.951_223_481_934_774_5,
+                0.975_306_865_522_214_7,
+            ),
+            (
+                "RK45",
+                &RK45_TABLEAU,
+                0.025_123_886_079_654_528,
+                8,
+                8,
+                0.987_516_628_814_516_6,
+                0.993_738_712_546_065_7,
+            ),
+        ];
         let mut fun = |_t: f64, y: &[f64]| vec![-y[0]];
-        let y0 = [1.0];
-        for tableau in [&RK23_TABLEAU, &DOP853_TABLEAU] {
+        for (name, tableau, t_step, nfev_step, nfev_dense, mid, quarter) in cases {
             let mut solver = RkSolver::new(
                 &mut fun,
                 RkSolverConfig {
                     mode: RuntimeMode::Strict,
                     t0: 0.0,
-                    y0: &y0,
+                    y0: &[1.0],
                     t_bound: 1.0,
                     rtol: 1e-6,
                     atol: ToleranceValue::Scalar(1e-9),
@@ -1402,10 +1676,30 @@ mod tests {
             )
             .expect("solver init");
             solver.step_with(&mut fun).expect("step");
-            assert!(
-                solver.dense_output_at(solver.t()).is_none(),
-                "only RK45 provides a solver-specific dense output today"
+            assert!((solver.t() - t_step).abs() <= 1e-15 * t_step, "{name}: t");
+            assert_eq!(solver.nfev(), nfev_step, "{name}: nfev after the step");
+            if name == "DOP853" {
+                assert!(
+                    solver.dense_output_at(0.5 * t_step).is_none(),
+                    "DOP853 must not sample an interpolant it has not built"
+                );
+            }
+            solver.prepare_dense_output(&mut fun).expect("dense output");
+            solver.prepare_dense_output(&mut fun).expect("idempotent");
+            assert_eq!(
+                solver.nfev(),
+                nfev_dense,
+                "{name}: nfev after dense_output()"
             );
+            for (x, expected) in [(0.5, mid), (0.25, quarter)] {
+                let y = solver
+                    .dense_output_at(x * solver.t())
+                    .expect("dense output")[0];
+                assert!(
+                    (y - expected).abs() <= 1e-14 * expected,
+                    "{name}: y({x}·h) = {y:e}, SciPy {expected:e}"
+                );
+            }
         }
     }
 

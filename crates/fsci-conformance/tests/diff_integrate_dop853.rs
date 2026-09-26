@@ -72,6 +72,8 @@ struct Case {
     y0: Vec<f64>,
     rtol: f64,
     atol: f64,
+    /// Sample times; `None` for the step-by-step rows.
+    t_eval: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +84,8 @@ struct Answer {
     y_end: Vec<f64>,
     /// Largest move of SciPy's y(t_end), in units of rtol·|y| + atol, over the 1-ulp y0 changes.
     envelope: f64,
+    /// SciPy's y at every output time (its `t_eval` samples when given).
+    ys: Vec<Vec<f64>>,
 }
 
 fn rhs(problem: &str, t: f64, y: &[f64]) -> Vec<f64> {
@@ -130,6 +134,7 @@ fn cases() -> Vec<Case> {
                     y0: y0.clone(),
                     rtol,
                     atol: 1e-3 * rtol,
+                    t_eval: None,
                 });
             }
         }
@@ -164,7 +169,7 @@ def rhs(problem):
 
 def run(c, y0):
     return solve_ivp(rhs(c["problem"]), (0.0, c["t_end"]), y0, method=c["method"],
-                     rtol=c["rtol"], atol=c["atol"])
+                     rtol=c["rtol"], atol=c["atol"], t_eval=c["t_eval"])
 
 out = []
 for c in json.load(sys.stdin):
@@ -179,7 +184,8 @@ for c in json.load(sys.stdin):
             p = run(c, y0)
             envelope = max(envelope, float(np.max(np.abs(p.y[:, -1] - y_end) / scale)))
     out.append({"status": int(r.status), "nfev": int(r.nfev), "n_t": int(len(r.t)),
-                "y_end": [float(v) for v in y_end], "envelope": envelope})
+                "y_end": [float(v) for v in y_end], "envelope": envelope,
+                "ys": [[float(v) for v in col] for col in r.y.T]})
 print(json.dumps(out))
 "#;
     let query = serde_json::to_string(cases).expect("serialize cases");
@@ -368,4 +374,120 @@ fn diff_integrate_dop853() {
         "only {well_conditioned} rows were well conditioned enough to compare y"
     );
     assert!(failures.is_empty(), "solve_ivp disagrees: {failures:#?}");
+}
+
+/// `t_eval` samples come from each method's own interpolant: SciPy's `RkDenseOutput` cubic
+/// (RK23) and quartic (RK45), and DOP853's 7th-order polynomial over three extra stages, which
+/// SciPy evaluates, and counts in nfev, on every step that holds a sample. Each row samples 21
+/// evenly spaced times; every sample must lie within Y_SCALE_FACTOR_TOL units of SciPy's
+/// `rtol·|y| + atol`, and nfev must differ from SciPy's by whole evaluation groups (3 for
+/// DOP853, whose steps cost 12 and whose dense outputs cost 3; 6 for RK45; 3 for RK23) and by
+/// at most COUNT_REL_TOL. Leaving DOP853's dense-output evaluations uncounted would miss
+/// SciPy's nfev by ~15% on these rows.
+#[test]
+fn diff_integrate_rk_t_eval_samples() {
+    let problems: [(&str, f64, Vec<f64>); 2] = [
+        ("cos_decay", 10.0, vec![1.0]),
+        ("lorenz", 1.0, vec![1.0, 1.0, 1.0]),
+    ];
+    let mut cases = Vec::new();
+    for method in ["DOP853", "RK45", "RK23"] {
+        for (problem, t_end, y0) in &problems {
+            for rtol in [1e-6, 1e-10] {
+                if method == "RK23" && rtol < 1e-8 {
+                    continue;
+                }
+                cases.push(Case {
+                    name: format!("{method}_{problem}_rtol{rtol:e}_t_eval"),
+                    problem: (*problem).to_string(),
+                    method: method.to_string(),
+                    t_end: *t_end,
+                    y0: y0.clone(),
+                    rtol,
+                    atol: 1e-3 * rtol,
+                    t_eval: Some((0..=20).map(|i| t_end * f64::from(i) / 20.0).collect()),
+                });
+            }
+        }
+    }
+    let Some(answers) = scipy_answers(&cases) else {
+        return;
+    };
+    assert_eq!(
+        answers.len(),
+        cases.len(),
+        "the oracle must answer every case"
+    );
+    let mut samples_compared = 0;
+    let mut failures = Vec::new();
+    for (case, answer) in cases.iter().zip(&answers) {
+        let problem = case.problem.clone();
+        let mut fun = move |t: f64, y: &[f64]| rhs(&problem, t, y);
+        let t_eval = case.t_eval.as_deref().expect("t_eval rows");
+        let options = SolveIvpOptions {
+            t_span: (0.0, case.t_end),
+            y0: &case.y0,
+            method: method_of(&case.method),
+            rtol: case.rtol,
+            atol: ToleranceValue::Scalar(case.atol),
+            t_eval: Some(t_eval),
+            ..SolveIvpOptions::default()
+        };
+        let result = match solve_ivp(&mut fun, &options) {
+            Ok(r) => r,
+            Err(e) => {
+                failures.push(format!("{}: fsci Err({e:?})", case.name));
+                continue;
+            }
+        };
+        if result.y.len() != answer.ys.len() || result.status != 0 || answer.status != 0 {
+            failures.push(format!(
+                "{}: {} samples (SciPy {}), status fsci {} SciPy {}",
+                case.name,
+                result.y.len(),
+                answer.ys.len(),
+                result.status,
+                answer.status
+            ));
+            continue;
+        }
+        let mut worst = 0.0_f64;
+        for (ours, theirs) in result.y.iter().zip(&answer.ys) {
+            samples_compared += 1;
+            for (f, s) in ours.iter().zip(theirs) {
+                worst = worst.max((f - s).abs() / (case.rtol * s.abs() + case.atol));
+            }
+        }
+        let group = if case.method == "RK45" { 6 } else { 3 };
+        println!(
+            "{}: worst sample gap {worst:.3e} units (SciPy 1-ulp envelope {:.3e}) | nfev fsci {} SciPy {}",
+            case.name, answer.envelope, result.nfev, answer.nfev
+        );
+        if answer.envelope > WELL_CONDITIONED_ENVELOPE {
+            failures.push(format!(
+                "{}: SciPy's envelope {:e} is too wide to compare samples",
+                case.name, answer.envelope
+            ));
+        }
+        if worst.is_nan() || worst > Y_SCALE_FACTOR_TOL {
+            failures.push(format!("{}: sample gap {worst:e} units", case.name));
+        }
+        if result.nfev.abs_diff(answer.nfev) % group != 0
+            || count_gap(result.nfev, answer.nfev) > COUNT_REL_TOL
+        {
+            failures.push(format!(
+                "{}: nfev {} vs SciPy {}",
+                case.name, result.nfev, answer.nfev
+            ));
+        }
+    }
+    println!(
+        "{samples_compared} t_eval samples compared over {} rows",
+        cases.len()
+    );
+    assert_eq!(samples_compared, 21 * cases.len());
+    assert!(
+        failures.is_empty(),
+        "t_eval samples disagree: {failures:#?}"
+    );
 }
