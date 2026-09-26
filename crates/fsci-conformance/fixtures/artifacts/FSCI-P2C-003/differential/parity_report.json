@@ -6,47 +6,47 @@
     {
       "case_id": "diff_rosenbrock_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=1.66e-11, fun_diff=7.18e-23, success=true)"
+      "message": "minimize matched (x_diff=2.39e-6, fun_diff=3.35e-12, success=false)"
     },
     {
       "case_id": "diff_rosenbrock_cg",
       "passed": true,
-      "message": "minimize matched (x_diff=1.24e-8, fun_diff=3.82e-17, success=true)"
+      "message": "minimize matched (x_diff=1.74e-6, fun_diff=7.65e-13, success=false)"
     },
     {
       "case_id": "diff_rosenbrock_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=1.69e-5, fun_diff=9.02e-8, success=true)"
+      "message": "minimize matched (x_diff=2.62e-13, fun_diff=4.27e-26, success=true)"
     },
     {
       "case_id": "diff_ackley_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=8.98e-17, fun_diff=0.00e0, success=true)"
+      "message": "minimize matched (x_diff=4.74e-9, fun_diff=1.34e-8, success=false)"
     },
     {
       "case_id": "diff_ackley_cg",
       "passed": true,
-      "message": "minimize matched (x_diff=1.92e-4, fun_diff=7.71e-4, success=false)"
+      "message": "minimize matched (x_diff=3.78e-9, fun_diff=1.49e-8, success=false)"
     },
     {
       "case_id": "diff_ackley_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=9.59e-6, fun_diff=3.84e-5, success=true)"
+      "message": "minimize matched (x_diff=9.98e-14, fun_diff=2.81e-13, success=true)"
     },
     {
       "case_id": "diff_rastrigin_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=1.11e-16, fun_diff=0.00e0, success=true)"
+      "message": "minimize matched (x_diff=9.09e-17, fun_diff=0.00e0, success=true)"
     },
     {
       "case_id": "diff_rastrigin_cg",
       "passed": true,
-      "message": "minimize matched (x_diff=1.05e-9, fun_diff=0.00e0, success=false)"
+      "message": "minimize matched (x_diff=7.42e-9, fun_diff=2.13e-14, success=true)"
     },
     {
       "case_id": "diff_rastrigin_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=9.59e-6, fun_diff=3.65e-8, success=true)"
+      "message": "minimize matched (x_diff=8.28e-11, fun_diff=0.00e0, success=true)"
     },
     {
       "case_id": "diff_shifted_quadratic_trust_exact",
@@ -61,7 +61,7 @@
     {
       "case_id": "diff_scaled_quadratic_newton_cg_hessp",
       "passed": true,
-      "message": "minimize matched (x_diff=2.22e-16, fun_diff=1.97e-30, success=true)"
+      "message": "minimize matched (x_diff=7.45e-9, fun_diff=2.78e-15, success=true)"
     },
     {
       "case_id": "diff_rosenbrock_differential_evolution_seeded",
@@ -71,12 +71,12 @@
     {
       "case_id": "diff_rastrigin_dual_annealing_seeded",
       "passed": true,
-      "message": "minimize matched (x_diff=6.48e-11, fun_diff=0.00e0, success=true)"
+      "message": "minimize matched (x_diff=6.92e-9, fun_diff=1.60e-14, success=true)"
     },
     {
       "case_id": "diff_himmelblau_basinhopping_seeded",
       "passed": true,
-      "message": "minimize matched (x_diff=1.42e-14, fun_diff=1.41e-26, success=true)"
+      "message": "minimize matched (x_diff=1.06e-8, fun_diff=7.73e-15, success=true)"
     },
     {
       "case_id": "diff_ackley_differential_evolution_seeded",
@@ -101,7 +101,7 @@
     {
       "case_id": "diff_sphere_basinhopping_seeded",
       "passed": true,
-      "message": "minimize matched (x_diff=6.52e-19, fun_diff=6.63e-37, success=true)"
+      "message": "minimize matched (x_diff=8.62e-9, fun_diff=8.15e-17, success=true)"
     },
     {
       "case_id": "diff_sphere_brute_seeded",
@@ -146,32 +146,32 @@
     {
       "case_id": "meta_scaling_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=9.16e-13, fun_diff=3.76e-23, success=true)"
+      "message": "minimize matched (x_diff=7.45e-9, fun_diff=2.78e-15, success=true)"
     },
     {
       "case_id": "meta_scaling_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=2.53e-5, fun_diff=1.01e-8, success=true)"
+      "message": "minimize matched (x_diff=2.22e-15, fun_diff=8.09e-29, success=true)"
     },
     {
       "case_id": "meta_translation_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=8.57e-11, fun_diff=1.93e-20, success=true)"
+      "message": "minimize matched (x_diff=7.56e-9, fun_diff=1.68e-16, success=true)"
     },
     {
       "case_id": "meta_translation_cg",
       "passed": true,
-      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)"
+      "message": "minimize matched (x_diff=1.07e-9, fun_diff=2.97e-18, success=false)"
     },
     {
       "case_id": "meta_rotation_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=7.41e-12, fun_diff=7.70e-23, success=true)"
+      "message": "minimize matched (x_diff=6.38e-9, fun_diff=1.89e-16, success=true)"
     },
     {
       "case_id": "meta_rotation_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=2.47e-5, fun_diff=1.57e-9, success=true)"
+      "message": "minimize matched (x_diff=6.66e-16, fun_diff=6.49e-31, success=true)"
     },
     {
       "case_id": "adv_minimize_empty_x0",
@@ -256,12 +256,12 @@
     {
       "case_id": "br_7470_de_rosenbrock_linear_x0_plus_x1_eq_1",
       "passed": true,
-      "message": "minimize matched (x_diff=1.05e-5, fun_diff=3.78e-10, success=true)"
+      "message": "minimize matched (x_diff=9.52e-8, fun_diff=8.17e-12, success=true)"
     },
     {
       "case_id": "br_7470_de_rastrigin_nonlinear_unit_disk",
       "passed": true,
-      "message": "minimize matched (x_diff=3.26e-7, fun_diff=2.90e-11, success=true)"
+      "message": "minimize matched (x_diff=1.78e-7, fun_diff=1.01e-11, success=true)"
     },
     {
       "case_id": "br_7470_de_sphere_box_only",
@@ -271,7 +271,7 @@
     {
       "case_id": "br_7470_de_sphere_linear_sum_ge_2",
       "passed": true,
-      "message": "minimize matched (x_diff=3.97e-3, fun_diff=1.19e-2, success=true)"
+      "message": "minimize matched (x_diff=6.43e-7, fun_diff=1.04e-10, success=true)"
     }
   ],
   "passed_cases": 54,
@@ -284,8 +284,8 @@
     {
       "case_id": "diff_rosenbrock_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=1.66e-11, fun_diff=7.18e-23, success=true)",
-      "max_diff": 1.65868430102023e-11,
+      "message": "minimize matched (x_diff=2.39e-6, fun_diff=3.35e-12, success=false)",
+      "max_diff": 2.394992320464695e-6,
       "tolerance_used": {
         "atol": 0.005,
         "rtol": 0.005,
@@ -298,8 +298,8 @@
     {
       "case_id": "diff_rosenbrock_cg",
       "passed": true,
-      "message": "minimize matched (x_diff=1.24e-8, fun_diff=3.82e-17, success=true)",
-      "max_diff": 1.237275437659946e-8,
+      "message": "minimize matched (x_diff=1.74e-6, fun_diff=7.65e-13, success=false)",
+      "max_diff": 1.7382989889735967e-6,
       "tolerance_used": {
         "atol": 0.01,
         "rtol": 0.01,
@@ -312,8 +312,8 @@
     {
       "case_id": "diff_rosenbrock_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=1.69e-5, fun_diff=9.02e-8, success=true)",
-      "max_diff": 0.000016941320126528936,
+      "message": "minimize matched (x_diff=2.62e-13, fun_diff=4.27e-26, success=true)",
+      "max_diff": 2.62234678416462e-13,
       "tolerance_used": {
         "atol": 0.02,
         "rtol": 0.02,
@@ -326,8 +326,8 @@
     {
       "case_id": "diff_ackley_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=8.98e-17, fun_diff=0.00e0, success=true)",
-      "max_diff": 8.983462031989659e-17,
+      "message": "minimize matched (x_diff=4.74e-9, fun_diff=1.34e-8, success=false)",
+      "max_diff": 1.3413107069482066e-8,
       "tolerance_used": {
         "atol": 0.1,
         "rtol": 0.1,
@@ -340,8 +340,8 @@
     {
       "case_id": "diff_ackley_cg",
       "passed": true,
-      "message": "minimize matched (x_diff=1.92e-4, fun_diff=7.71e-4, success=false)",
-      "max_diff": 0.0007708638233019371,
+      "message": "minimize matched (x_diff=3.78e-9, fun_diff=1.49e-8, success=false)",
+      "max_diff": 1.4896095024141687e-8,
       "tolerance_used": {
         "atol": 0.12,
         "rtol": 0.12,
@@ -354,8 +354,8 @@
     {
       "case_id": "diff_ackley_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=9.59e-6, fun_diff=3.84e-5, success=true)",
-      "max_diff": 0.00003836940558699098,
+      "message": "minimize matched (x_diff=9.98e-14, fun_diff=2.81e-13, success=true)",
+      "max_diff": 2.8066438062523957e-13,
       "tolerance_used": {
         "atol": 0.12,
         "rtol": 0.12,
@@ -368,8 +368,8 @@
     {
       "case_id": "diff_rastrigin_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=1.11e-16, fun_diff=0.00e0, success=true)",
-      "max_diff": 1.1102230246251565e-16,
+      "message": "minimize matched (x_diff=9.09e-17, fun_diff=0.00e0, success=true)",
+      "max_diff": 9.092899185083282e-17,
       "tolerance_used": {
         "atol": 0.05,
         "rtol": 0.05,
@@ -382,8 +382,8 @@
     {
       "case_id": "diff_rastrigin_cg",
       "passed": true,
-      "message": "minimize matched (x_diff=1.05e-9, fun_diff=0.00e0, success=false)",
-      "max_diff": 1.0473085196080316e-9,
+      "message": "minimize matched (x_diff=7.42e-9, fun_diff=2.13e-14, success=true)",
+      "max_diff": 7.416544165541055e-9,
       "tolerance_used": {
         "atol": 0.15,
         "rtol": 0.15,
@@ -396,8 +396,8 @@
     {
       "case_id": "diff_rastrigin_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=9.59e-6, fun_diff=3.65e-8, success=true)",
-      "max_diff": 9.591126628556243e-6,
+      "message": "minimize matched (x_diff=8.28e-11, fun_diff=0.00e0, success=true)",
+      "max_diff": 8.275290269105244e-11,
       "tolerance_used": {
         "atol": 0.15,
         "rtol": 0.15,
@@ -438,8 +438,8 @@
     {
       "case_id": "diff_scaled_quadratic_newton_cg_hessp",
       "passed": true,
-      "message": "minimize matched (x_diff=2.22e-16, fun_diff=1.97e-30, success=true)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "minimize matched (x_diff=7.45e-9, fun_diff=2.78e-15, success=true)",
+      "max_diff": 7.450580596923828e-9,
       "tolerance_used": {
         "atol": 1e-8,
         "rtol": 1e-8,
@@ -466,8 +466,8 @@
     {
       "case_id": "diff_rastrigin_dual_annealing_seeded",
       "passed": true,
-      "message": "minimize matched (x_diff=6.48e-11, fun_diff=0.00e0, success=true)",
-      "max_diff": 6.47770990725556e-11,
+      "message": "minimize matched (x_diff=6.92e-9, fun_diff=1.60e-14, success=true)",
+      "max_diff": 6.9175057046015825e-9,
       "tolerance_used": {
         "atol": 1e-6,
         "rtol": 1e-6,
@@ -480,8 +480,8 @@
     {
       "case_id": "diff_himmelblau_basinhopping_seeded",
       "passed": true,
-      "message": "minimize matched (x_diff=1.42e-14, fun_diff=1.41e-26, success=true)",
-      "max_diff": 1.4210854715202004e-14,
+      "message": "minimize matched (x_diff=1.06e-8, fun_diff=7.73e-15, success=true)",
+      "max_diff": 1.0590817556277443e-8,
       "tolerance_used": {
         "atol": 0.01,
         "rtol": 0.01,
@@ -550,8 +550,8 @@
     {
       "case_id": "diff_sphere_basinhopping_seeded",
       "passed": true,
-      "message": "minimize matched (x_diff=6.52e-19, fun_diff=6.63e-37, success=true)",
-      "max_diff": 6.515461802702559e-19,
+      "message": "minimize matched (x_diff=8.62e-9, fun_diff=8.15e-17, success=true)",
+      "max_diff": 8.620628011098622e-9,
       "tolerance_used": {
         "atol": 0.001,
         "rtol": 0.001,
@@ -676,8 +676,8 @@
     {
       "case_id": "meta_scaling_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=9.16e-13, fun_diff=3.76e-23, success=true)",
-      "max_diff": 9.161560399206792e-13,
+      "message": "minimize matched (x_diff=7.45e-9, fun_diff=2.78e-15, success=true)",
+      "max_diff": 7.450581041013038e-9,
       "tolerance_used": {
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -690,8 +690,8 @@
     {
       "case_id": "meta_scaling_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=2.53e-5, fun_diff=1.01e-8, success=true)",
-      "max_diff": 0.000025250612175398146,
+      "message": "minimize matched (x_diff=2.22e-15, fun_diff=8.09e-29, success=true)",
+      "max_diff": 2.220446049250313e-15,
       "tolerance_used": {
         "atol": 0.001,
         "rtol": 0.001,
@@ -704,8 +704,8 @@
     {
       "case_id": "meta_translation_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=8.57e-11, fun_diff=1.93e-20, success=true)",
-      "max_diff": 8.574785326231904e-11,
+      "message": "minimize matched (x_diff=7.56e-9, fun_diff=1.68e-16, success=true)",
+      "max_diff": 7.559495251996395e-9,
       "tolerance_used": {
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -718,8 +718,8 @@
     {
       "case_id": "meta_translation_cg",
       "passed": true,
-      "message": "minimize matched (x_diff=0.00e0, fun_diff=0.00e0, success=true)",
-      "max_diff": 0.0,
+      "message": "minimize matched (x_diff=1.07e-9, fun_diff=2.97e-18, success=false)",
+      "max_diff": 1.065068477856812e-9,
       "tolerance_used": {
         "atol": 0.001,
         "rtol": 0.001,
@@ -732,8 +732,8 @@
     {
       "case_id": "meta_rotation_bfgs",
       "passed": true,
-      "message": "minimize matched (x_diff=7.41e-12, fun_diff=7.70e-23, success=true)",
-      "max_diff": 7.41162686779262e-12,
+      "message": "minimize matched (x_diff=6.38e-9, fun_diff=1.89e-16, success=true)",
+      "max_diff": 6.383392481268402e-9,
       "tolerance_used": {
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -746,8 +746,8 @@
     {
       "case_id": "meta_rotation_powell",
       "passed": true,
-      "message": "minimize matched (x_diff=2.47e-5, fun_diff=1.57e-9, success=true)",
-      "max_diff": 0.000024727025983883877,
+      "message": "minimize matched (x_diff=6.66e-16, fun_diff=6.49e-31, success=true)",
+      "max_diff": 6.661338147750939e-16,
       "tolerance_used": {
         "atol": 0.001,
         "rtol": 0.001,
@@ -952,8 +952,8 @@
     {
       "case_id": "br_7470_de_rosenbrock_linear_x0_plus_x1_eq_1",
       "passed": true,
-      "message": "minimize matched (x_diff=1.05e-5, fun_diff=3.78e-10, success=true)",
-      "max_diff": 0.00001052082476227234,
+      "message": "minimize matched (x_diff=9.52e-8, fun_diff=8.17e-12, success=true)",
+      "max_diff": 9.524465183208264e-8,
       "tolerance_used": {
         "atol": 0.1,
         "rtol": 0.1,
@@ -966,8 +966,8 @@
     {
       "case_id": "br_7470_de_rastrigin_nonlinear_unit_disk",
       "passed": true,
-      "message": "minimize matched (x_diff=3.26e-7, fun_diff=2.90e-11, success=true)",
-      "max_diff": 3.258732062428105e-7,
+      "message": "minimize matched (x_diff=1.78e-7, fun_diff=1.01e-11, success=true)",
+      "max_diff": 1.7835854129495092e-7,
       "tolerance_used": {
         "atol": 0.1,
         "rtol": 0.5,
@@ -994,8 +994,8 @@
     {
       "case_id": "br_7470_de_sphere_linear_sum_ge_2",
       "passed": true,
-      "message": "minimize matched (x_diff=3.97e-3, fun_diff=1.19e-2, success=true)",
-      "max_diff": 0.011874050146052362,
+      "message": "minimize matched (x_diff=6.43e-7, fun_diff=1.04e-10, success=true)",
+      "max_diff": 6.425006859878124e-7,
       "tolerance_used": {
         "atol": 0.2,
         "rtol": 0.2,
@@ -1006,6 +1006,6 @@
       }
     }
   ],
-  "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788666501949
+  "report_kind": "self_check",
+  "generated_unix_ms": 1790392909970
 }

@@ -121,17 +121,17 @@
     {
       "case_id": "cubature_scalar_unit_square_product",
       "passed": true,
-      "message": "integrate scalar matched (diff=0.00e0)"
+      "message": "integrate scalar matched (diff=3.33e-16)"
     },
     {
       "case_id": "cubature_vector_1d_powers",
       "passed": true,
-      "message": "integrate array matched len=2 (max_diff=4.34e-14)"
+      "message": "integrate array matched len=2 (max_diff=5.55e-17)"
     },
     {
       "case_id": "cubature_reversed_bounds_preserve_orientation",
       "passed": true,
-      "message": "integrate scalar matched (diff=0.00e0)"
+      "message": "integrate scalar matched (diff=2.22e-16)"
     },
     {
       "case_id": "cubature_zero_dim_vector",
@@ -161,12 +161,12 @@
     {
       "case_id": "ivp_solve_stiff_decay_bdf",
       "passed": true,
-      "message": "integrate ivp matched (3 steps, 1 vars, max_diff=7.30e-8)"
+      "message": "integrate ivp matched (3 steps, 1 vars, max_diff=7.44e-8)"
     },
     {
       "case_id": "ivp_solve_linear_growth_terminal_event",
       "passed": true,
-      "message": "integrate ivp matched (2 steps, 1 vars, max_diff=0.00e0)"
+      "message": "integrate ivp matched (2 steps, 1 vars, max_diff=1.11e-16)"
     },
     {
       "case_id": "ivp_solve_nan_rtol_hardened",
@@ -186,7 +186,7 @@
     {
       "case_id": "quad_x_squared_unit",
       "passed": true,
-      "message": "integrate scalar matched (diff=2.22e-16)"
+      "message": "integrate scalar matched (diff=5.55e-17)"
     },
     {
       "case_id": "quad_vec_linear_square_unit",
@@ -196,22 +196,22 @@
     {
       "case_id": "dblquad_xy_unit_square",
       "passed": true,
-      "message": "integrate scalar matched (diff=2.22e-16)"
+      "message": "integrate scalar matched (diff=2.78e-17)"
     },
     {
       "case_id": "tplquad_xyz_unit_cube",
       "passed": true,
-      "message": "integrate scalar matched (diff=1.67e-16)"
+      "message": "integrate scalar matched (diff=1.39e-17)"
     },
     {
       "case_id": "quad_x_over_0_1",
       "passed": true,
-      "message": "integrate scalar matched (diff=2.22e-16)"
+      "message": "integrate scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "quad_sin_over_0_pi",
       "passed": true,
-      "message": "integrate scalar matched (diff=8.88e-16)"
+      "message": "integrate scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "quad_vec_linear_square",
@@ -221,17 +221,17 @@
     {
       "case_id": "dblquad_xy_prod_unit",
       "passed": true,
-      "message": "integrate scalar matched (diff=2.50e-16)"
+      "message": "integrate scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "tplquad_xyz_prod_unit",
       "passed": true,
-      "message": "integrate scalar matched (diff=1.80e-16)"
+      "message": "integrate scalar matched (diff=0.00e0)"
     },
     {
       "case_id": "ivp_lsoda_robertson_short",
       "passed": true,
-      "message": "integrate ivp matched (4 steps, 3 vars, max_diff=2.68e-10)"
+      "message": "integrate ivp matched (4 steps, 3 vars, max_diff=1.36e-10)"
     },
     {
       "case_id": "ivp_lsoda_linear_growth",
@@ -241,7 +241,7 @@
     {
       "case_id": "ivp_lsoda_exponential_decay",
       "passed": true,
-      "message": "integrate ivp matched (5 steps, 1 vars, max_diff=7.85e-8)"
+      "message": "integrate ivp matched (5 steps, 1 vars, max_diff=1.51e-8)"
     },
     {
       "case_id": "ivp_dense_rk45_expdecay",
@@ -606,8 +606,8 @@
     {
       "case_id": "cubature_scalar_unit_square_product",
       "passed": true,
-      "message": "integrate scalar matched (diff=0.00e0)",
-      "max_diff": 0.0,
+      "message": "integrate scalar matched (diff=3.33e-16)",
+      "max_diff": 3.3306690738754696e-16,
       "tolerance_used": {
         "atol": 1e-8,
         "rtol": 1e-8,
@@ -620,8 +620,8 @@
     {
       "case_id": "cubature_vector_1d_powers",
       "passed": true,
-      "message": "integrate array matched len=2 (max_diff=4.34e-14)",
-      "max_diff": 4.340972026284362e-14,
+      "message": "integrate array matched len=2 (max_diff=5.55e-17)",
+      "max_diff": 5.551115123125783e-17,
       "tolerance_used": {
         "atol": 1e-8,
         "rtol": 1e-8,
@@ -634,8 +634,8 @@
     {
       "case_id": "cubature_reversed_bounds_preserve_orientation",
       "passed": true,
-      "message": "integrate scalar matched (diff=0.00e0)",
-      "max_diff": 0.0,
+      "message": "integrate scalar matched (diff=2.22e-16)",
+      "max_diff": 2.220446049250313e-16,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -714,8 +714,8 @@
     {
       "case_id": "ivp_solve_stiff_decay_bdf",
       "passed": true,
-      "message": "integrate ivp matched (3 steps, 1 vars, max_diff=7.30e-8)",
-      "max_diff": 7.299948784345034e-8,
+      "message": "integrate ivp matched (3 steps, 1 vars, max_diff=7.44e-8)",
+      "max_diff": 7.442081674611384e-8,
       "tolerance_used": {
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -728,8 +728,8 @@
     {
       "case_id": "ivp_solve_linear_growth_terminal_event",
       "passed": true,
-      "message": "integrate ivp matched (2 steps, 1 vars, max_diff=0.00e0)",
-      "max_diff": 0.0,
+      "message": "integrate ivp matched (2 steps, 1 vars, max_diff=1.11e-16)",
+      "max_diff": 1.1102230246251565e-16,
       "tolerance_used": {
         "atol": 1e-6,
         "rtol": 1e-6,
@@ -776,8 +776,8 @@
     {
       "case_id": "quad_x_squared_unit",
       "passed": true,
-      "message": "integrate scalar matched (diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "integrate scalar matched (diff=5.55e-17)",
+      "max_diff": 5.551115123125783e-17,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -804,8 +804,8 @@
     {
       "case_id": "dblquad_xy_unit_square",
       "passed": true,
-      "message": "integrate scalar matched (diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "integrate scalar matched (diff=2.78e-17)",
+      "max_diff": 2.7755575615628914e-17,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -818,8 +818,8 @@
     {
       "case_id": "tplquad_xyz_unit_cube",
       "passed": true,
-      "message": "integrate scalar matched (diff=1.67e-16)",
-      "max_diff": 1.6653345369377348e-16,
+      "message": "integrate scalar matched (diff=1.39e-17)",
+      "max_diff": 1.3877787807814457e-17,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -832,8 +832,8 @@
     {
       "case_id": "quad_x_over_0_1",
       "passed": true,
-      "message": "integrate scalar matched (diff=2.22e-16)",
-      "max_diff": 2.220446049250313e-16,
+      "message": "integrate scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -846,8 +846,8 @@
     {
       "case_id": "quad_sin_over_0_pi",
       "passed": true,
-      "message": "integrate scalar matched (diff=8.88e-16)",
-      "max_diff": 8.881784197001252e-16,
+      "message": "integrate scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -874,8 +874,8 @@
     {
       "case_id": "dblquad_xy_prod_unit",
       "passed": true,
-      "message": "integrate scalar matched (diff=2.50e-16)",
-      "max_diff": 2.498001805406602e-16,
+      "message": "integrate scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -888,8 +888,8 @@
     {
       "case_id": "tplquad_xyz_prod_unit",
       "passed": true,
-      "message": "integrate scalar matched (diff=1.80e-16)",
-      "max_diff": 1.8041124150158794e-16,
+      "message": "integrate scalar matched (diff=0.00e0)",
+      "max_diff": 0.0,
       "tolerance_used": {
         "atol": 1e-10,
         "rtol": 1e-10,
@@ -902,8 +902,8 @@
     {
       "case_id": "ivp_lsoda_robertson_short",
       "passed": true,
-      "message": "integrate ivp matched (4 steps, 3 vars, max_diff=2.68e-10)",
-      "max_diff": 2.6826798725163026e-10,
+      "message": "integrate ivp matched (4 steps, 3 vars, max_diff=1.36e-10)",
+      "max_diff": 1.3636471118960714e-10,
       "tolerance_used": {
         "atol": 0.05,
         "rtol": 0.05,
@@ -930,8 +930,8 @@
     {
       "case_id": "ivp_lsoda_exponential_decay",
       "passed": true,
-      "message": "integrate ivp matched (5 steps, 1 vars, max_diff=7.85e-8)",
-      "max_diff": 7.846080374296349e-8,
+      "message": "integrate ivp matched (5 steps, 1 vars, max_diff=1.51e-8)",
+      "max_diff": 1.5080714899085024e-8,
       "tolerance_used": {
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -1026,6 +1026,6 @@
       }
     }
   ],
-  "report_kind": "oracle_backed",
-  "generated_unix_ms": 1789523529993
+  "report_kind": "self_check",
+  "generated_unix_ms": 1790392934352
 }

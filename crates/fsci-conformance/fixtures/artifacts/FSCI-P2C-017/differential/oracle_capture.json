@@ -1,16 +1,16 @@
 {
   "packet_id": "FSCI-P2C-017",
   "family": "io_core",
-  "generated_unix_ms": 1777085195782,
+  "generated_unix_ms": 1790392936313,
   "runtime": {
-    "python_version": "3.13.7",
+    "python_version": "3.13.12",
     "numpy_version": "2.4.3",
     "scipy_version": "1.17.1"
   },
   "provenance": {
-    "fixture_input_blake3": "5a0d1ee8d2985b2879f7f47be3ba383403a7e8fd35cae0537a903911a94eaac1",
-    "oracle_output_blake3": "90379493eeaef0dbb61449ab4c3fa0e5c1456af7dcfbf66b2a76860dab9ac6ef",
-    "capture_blake3": "a7710fc2e654f5ac483a7441363db4532815656d3638398af209d6588122f731"
+    "fixture_input_blake3": "14e91fe3d5a431c31e74796dff54623959b318ee7e5c70f02f1faf7329e785a8",
+    "oracle_output_blake3": "3e6041986ae4a722a9d6fc00cd0541f218acf0242d289a9ab671ce6db58802af",
+    "capture_blake3": "df0c451184b7f2672fcfc6cafaf82beba1ef90dc11f5e6d584001d6d3d7e8942"
   },
   "case_outputs": [
     {
@@ -85,6 +85,21 @@
       "error": null
     },
     {
+      "case_id": "loadmat_v4_row_vector_scipy_bytes",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "cols": 3,
+        "rows": 1,
+        "values": [
+          5.0,
+          6.0,
+          7.0
+        ]
+      },
+      "error": null
+    },
+    {
       "case_id": "savemat_v4_real_double_roundtrip",
       "status": "ok",
       "result_kind": "matrix",
@@ -96,6 +111,24 @@
           2.5,
           3.5,
           4.5
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "savemat_v4_rectangular_roundtrip",
+      "status": "ok",
+      "result_kind": "matrix",
+      "result": {
+        "cols": 3,
+        "rows": 2,
+        "values": [
+          1.0,
+          2.0,
+          3.0,
+          4.0,
+          5.0,
+          6.0
         ]
       },
       "error": null
@@ -149,6 +182,32 @@
           0.999969482421875,
           -0.999969482421875
         ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "wav_write_stereo_int16_quantization",
+      "status": "ok",
+      "result_kind": "wav",
+      "result": {
+        "bits_per_sample": 16,
+        "channels": 2,
+        "sample_rate": 48000,
+        "values": [
+          0.249969482421875,
+          -0.249969482421875,
+          0.749969482421875,
+          -0.749969482421875
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "loadmat_v4_truncated_header_reject",
+      "status": "ok",
+      "result_kind": "error",
+      "result": {
+        "error": "truncated MAT v4 header"
       },
       "error": null
     },

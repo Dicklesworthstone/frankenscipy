@@ -1,0 +1,602 @@
+{
+  "packet_id": "FSCI-P2C-004",
+  "family": "sparse_ops",
+  "generated_unix_ms": 1790392910473,
+  "runtime": {
+    "python_version": "3.13.12",
+    "numpy_version": "2.4.3",
+    "scipy_version": "1.17.1"
+  },
+  "provenance": {
+    "fixture_input_blake3": "d66044732226366c948054392791442130ccf7f93d3c205e05df8df229dd882a",
+    "oracle_output_blake3": "86774930b9f70745cebf9eded50ce5d0642534b61161e7a5c46315c533b6dbd3",
+    "capture_blake3": "eaebe4b6f8e0eb9d921d4c1b15da3ca2b1a5575c12cecc69eb5aae5a8f58ef27"
+  },
+  "case_outputs": [
+    {
+      "case_id": "spmv_coo_identity_3x3",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.0,
+          -1.0,
+          3.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spmv_csr_general_3x3",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.0,
+          5.0,
+          -4.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spmv_csc_general_3x3",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.0,
+          5.0,
+          -4.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spmv_csr_rectangular_2x4",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          5.0,
+          -3.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spmv_coo_empty_matrix",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "format_roundtrip_3x3",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          0,
+          1,
+          2,
+          2
+        ],
+        "data": [
+          1.0,
+          -3.0,
+          2.0,
+          4.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          1,
+          0,
+          2
+        ],
+        "shape": [
+          3,
+          3
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "format_roundtrip_empty",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [],
+        "data": [],
+        "format": "coo",
+        "row": [],
+        "shape": [
+          4,
+          5
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "format_roundtrip_single_element",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          0
+        ],
+        "data": [
+          7.0
+        ],
+        "format": "coo",
+        "row": [
+          0
+        ],
+        "shape": [
+          1,
+          1
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "format_roundtrip_with_duplicates",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          0,
+          1
+        ],
+        "data": [
+          3.0,
+          3.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          1
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "add_self_doubles_values",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          1,
+          0
+        ],
+        "data": [
+          2.0,
+          -1.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          1
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "add_self_identity_3x3",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          0,
+          1,
+          2
+        ],
+        "data": [
+          2.0,
+          3.0,
+          4.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          1,
+          2
+        ],
+        "shape": [
+          3,
+          3
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "add_self_shape_2x2",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          0,
+          1
+        ],
+        "data": [
+          2.0,
+          4.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          1
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "add_self_vector_2x2",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          0,
+          1
+        ],
+        "data": [
+          2.0,
+          3.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          1
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "scale_by_minus_two",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          1,
+          0
+        ],
+        "data": [
+          -2.0,
+          4.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          1
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "scale_by_zero",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          0,
+          1
+        ],
+        "data": [
+          0.0,
+          0.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          1
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "scale_shape_preserves_nnz",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          0,
+          1,
+          2
+        ],
+        "data": [
+          2.0,
+          4.0,
+          6.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          1,
+          2
+        ],
+        "shape": [
+          3,
+          3
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "scale_vector_2x2",
+      "status": "ok",
+      "result_kind": "matrix_triplets",
+      "result": {
+        "col": [
+          0,
+          1,
+          1
+        ],
+        "data": [
+          3.0,
+          -3.0,
+          6.0
+        ],
+        "format": "coo",
+        "row": [
+          0,
+          0,
+          1
+        ],
+        "shape": [
+          2,
+          2
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spsolve_identity_2x2",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.0,
+          2.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spsolve_non_square_error",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: matrix must be square (has shape (2, 3))"
+    },
+    {
+      "case_id": "spsolve_singular_error",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          "NaN",
+          "NaN"
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spmv_csr_dimension_mismatch",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: matmul: dimension mismatch with signature (n,k=3),(k=2,1?)->(n,1?)"
+    },
+    {
+      "case_id": "spsolve_rhs_mismatch_error",
+      "status": "error",
+      "result_kind": "exception",
+      "result": {},
+      "error": "ValueError: matrix - rhs dimension mismatch ((2, 2) - 1)"
+    },
+    {
+      "case_id": "spsolve_hardened_empty_row_error",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          "NaN",
+          "NaN"
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spsolve_tridiag_3x3",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.9999999999999999,
+          0.9999999999999998,
+          0.9999999999999999
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spsolve_diag_3x3",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          2.0,
+          3.0,
+          2.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spsolve_sparse_4x4",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          0.2727272727272727,
+          0.0909090909090909,
+          0.0909090909090909,
+          0.2727272727272727
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spsolve_lower_tri_3x3",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          1.0,
+          -1.0,
+          0.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spsolve_hardened_nan_data_rejected",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          "NaN",
+          "NaN"
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "spsolve_hardened_inf_rhs_rejected",
+      "status": "ok",
+      "result_kind": "vector",
+      "result": {
+        "values": [
+          "Infinity",
+          2.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "eigsh_diag_4x4_top2",
+      "status": "ok",
+      "result_kind": "eigenvalues_abs_sorted",
+      "result": {
+        "values": [
+          4.0,
+          3.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "svds_5x4_top2",
+      "status": "ok",
+      "result_kind": "eigenvalues_abs_sorted",
+      "result": {
+        "values": [
+          5.0990195135927845,
+          4.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "eigsh_diag_5x5_top3",
+      "status": "ok",
+      "result_kind": "eigenvalues_abs_sorted",
+      "result": {
+        "values": [
+          4.999999999999999,
+          4.000000000000001,
+          3.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "svds_3x3_top1",
+      "status": "ok",
+      "result_kind": "eigenvalues_abs_sorted",
+      "result": {
+        "values": [
+          3.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "eigs_uppertri_4x4_top2",
+      "status": "ok",
+      "result_kind": "eigenvalues_abs_sorted",
+      "result": {
+        "values": [
+          5.000000000000002,
+          3.999999999999994
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "eigsh_diag_6x6_top2",
+      "status": "ok",
+      "result_kind": "eigenvalues_abs_sorted",
+      "result": {
+        "values": [
+          10.0,
+          8.0
+        ]
+      },
+      "error": null
+    },
+    {
+      "case_id": "eigsh_tridiag_4x4_top2",
+      "status": "ok",
+      "result_kind": "eigenvalues_abs_sorted",
+      "result": {
+        "values": [
+          3.618033988749895,
+          2.6180339887498945
+        ]
+      },
+      "error": null
+    }
+  ]
+}

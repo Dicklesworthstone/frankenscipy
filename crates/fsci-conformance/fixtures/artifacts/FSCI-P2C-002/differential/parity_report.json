@@ -206,7 +206,7 @@
     {
       "case_id": "solve_hilbert_4x4",
       "passed": true,
-      "message": "vector matched (max_diff=5.08e-11)"
+      "message": "vector matched (max_diff=3.21e-11)"
     },
     {
       "case_id": "det_hilbert_4x4",
@@ -853,8 +853,8 @@
     {
       "case_id": "solve_hilbert_4x4",
       "passed": true,
-      "message": "vector matched (max_diff=5.08e-11)",
-      "max_diff": 5.078959475213196e-11,
+      "message": "vector matched (max_diff=3.21e-11)",
+      "max_diff": 3.211653165635653e-11,
       "tolerance_used": {
         "atol": 0.0001,
         "rtol": 0.0001,
@@ -1145,6 +1145,6 @@
       }
     }
   ],
-  "report_kind": "oracle_backed",
-  "generated_unix_ms": 1788666501910
+  "report_kind": "self_check",
+  "generated_unix_ms": 1790392909632
 }
