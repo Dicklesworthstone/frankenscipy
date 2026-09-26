@@ -217,7 +217,7 @@ module = "scipy.cluster.hierarchy"
 name = "dendrogram"
 disposition = "missing"
 reason = "no dendrogram layout (ivl, leaves, icoord, dcoord)"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.cluster.hierarchy"
@@ -230,70 +230,70 @@ module = "scipy.fftpack"
 name = "hilbert"
 disposition = "wrong_alias"
 reason = "fsci_fft::hilbert is scipy.signal.hilbert's analytic signal; fftpack.hilbert is the real periodic Hilbert transform of a sequence"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.fftpack"
 name = "diff"
 disposition = "missing"
 reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.fftpack"
 name = "tilbert"
 disposition = "missing"
 reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.fftpack"
 name = "itilbert"
 disposition = "missing"
 reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.fftpack"
 name = "ihilbert"
 disposition = "missing"
 reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.fftpack"
 name = "cs_diff"
 disposition = "missing"
 reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.fftpack"
 name = "sc_diff"
 disposition = "missing"
 reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.fftpack"
 name = "ss_diff"
 disposition = "missing"
 reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.fftpack"
 name = "cc_diff"
 disposition = "missing"
 reason = "legacy fftpack pseudo-differential operator on a periodic sequence; not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.fftpack"
 name = "shift"
 disposition = "missing"
 reason = "legacy fftpack Fourier shift of a periodic sequence; not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.io.arff"
@@ -314,14 +314,14 @@ module = "scipy.io.arff"
 name = "ArffError"
 disposition = "missing"
 reason = "ARFF failures are IoError::InvalidFormat, not a distinct error class"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.io.arff"
 name = "ParseArffError"
 disposition = "missing"
 reason = "ARFF failures are IoError::InvalidFormat, not a distinct error class"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.io.matlab"
@@ -412,14 +412,14 @@ module = "scipy.io.wavfile"
 name = "WavFileWarning"
 disposition = "missing"
 reason = "no warning channel for skipped or malformed WAV chunks"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.linalg.interpolative"
 name = "estimate_rank"
 disposition = "missing"
 reason = "randomized rank estimate to a tolerance; matrix_rank and numerical_rank are the SVD rank"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.signal.windows"
@@ -661,7 +661,7 @@ module = "scipy.stats.mstats"
 name = "trimmed_mean"
 disposition = "missing"
 reason = "asymmetric limits and inclusive flags; stats.trim_mean covers only the symmetric proportiontocut case"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.stats.qmc"
@@ -696,25 +696,25 @@ module = "scipy.stats.sampling"
 name = "FastGeneratorInversion"
 disposition = "missing"
 reason = "UNU.RAN generators are not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.stats.sampling"
 name = "NumericalInversePolynomial"
 disposition = "missing"
 reason = "UNU.RAN generators are not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.stats.sampling"
 name = "SimpleRatioUniforms"
 disposition = "missing"
 reason = "UNU.RAN generators are not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"
 
 [[entry]]
 module = "scipy.stats.sampling"
 name = "UNURANError"
 disposition = "missing"
 reason = "UNU.RAN generators are not ported"
-bead = "frankenscipy-9fbpm"
+bead = "frankenscipy-yrlc3"

@@ -14,7 +14,7 @@
    },
    "na": 1,
    "not_real": {
-    "dendrogram": "missing: no dendrogram layout (ivl, leaves, icoord, dcoord) (frankenscipy-9fbpm)",
+    "dendrogram": "missing: no dendrogram layout (ivl, leaves, icoord, dcoord) (frankenscipy-yrlc3)",
     "set_link_color_palette": "na: sets matplotlib link colours; fsci does not plot"
    },
    "real": 30,
@@ -188,16 +188,16 @@
    },
    "na": 0,
    "not_real": {
-    "cc_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
-    "cs_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
-    "diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
-    "hilbert": "wrong_alias: fsci_fft::hilbert is scipy.signal.hilbert's analytic signal; fftpack.hilbert is the real periodic Hilbert transform of a sequence (frankenscipy-9fbpm)",
-    "ihilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
-    "itilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
-    "sc_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
-    "shift": "missing: legacy fftpack Fourier shift of a periodic sequence; not ported (frankenscipy-9fbpm)",
-    "ss_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)",
-    "tilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-9fbpm)"
+    "cc_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
+    "cs_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
+    "diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
+    "hilbert": "wrong_alias: fsci_fft::hilbert is scipy.signal.hilbert's analytic signal; fftpack.hilbert is the real periodic Hilbert transform of a sequence (frankenscipy-yrlc3)",
+    "ihilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
+    "itilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
+    "sc_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
+    "shift": "missing: legacy fftpack Fourier shift of a periodic sequence; not ported (frankenscipy-yrlc3)",
+    "ss_diff": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)",
+    "tilbert": "missing: legacy fftpack pseudo-differential operator on a periodic sequence; not ported (frankenscipy-yrlc3)"
    },
    "real": 0,
    "real_not_compared": [],
@@ -353,8 +353,8 @@
    },
    "na": 0,
    "not_real": {
-    "ArffError": "missing: ARFF failures are IoError::InvalidFormat, not a distinct error class (frankenscipy-9fbpm)",
-    "ParseArffError": "missing: ARFF failures are IoError::InvalidFormat, not a distinct error class (frankenscipy-9fbpm)"
+    "ArffError": "missing: ARFF failures are IoError::InvalidFormat, not a distinct error class (frankenscipy-yrlc3)",
+    "ParseArffError": "missing: ARFF failures are IoError::InvalidFormat, not a distinct error class (frankenscipy-yrlc3)"
    },
    "real": 2,
    "real_not_compared": [
@@ -406,7 +406,7 @@
    },
    "na": 0,
    "not_real": {
-    "WavFileWarning": "missing: no warning channel for skipped or malformed WAV chunks (frankenscipy-9fbpm)"
+    "WavFileWarning": "missing: no warning channel for skipped or malformed WAV chunks (frankenscipy-yrlc3)"
    },
    "real": 2,
    "real_not_compared": [
@@ -485,7 +485,7 @@
    },
    "na": 0,
    "not_real": {
-    "estimate_rank": "missing: randomized rank estimate to a tolerance; matrix_rank and numerical_rank are the SVD rank (frankenscipy-9fbpm)"
+    "estimate_rank": "missing: randomized rank estimate to a tolerance; matrix_rank and numerical_rank are the SVD rank (frankenscipy-yrlc3)"
    },
    "real": 7,
    "real_not_compared": [
@@ -1296,7 +1296,7 @@
    "not_real": {
     "argstoarray": "na: builds a masked array; fsci has no masked-array type",
     "trim": "na: returns a masked array with the tails masked; fsci has no masked-array type (stats.trimboth is the plain form)",
-    "trimmed_mean": "missing: asymmetric limits and inclusive flags; stats.trim_mean covers only the symmetric proportiontocut case (frankenscipy-9fbpm)"
+    "trimmed_mean": "missing: asymmetric limits and inclusive flags; stats.trim_mean covers only the symmetric proportiontocut case (frankenscipy-yrlc3)"
    },
    "real": 28,
    "real_not_compared": [
@@ -1361,10 +1361,10 @@
    },
    "na": 0,
    "not_real": {
-    "FastGeneratorInversion": "missing: UNU.RAN generators are not ported (frankenscipy-9fbpm)",
-    "NumericalInversePolynomial": "missing: UNU.RAN generators are not ported (frankenscipy-9fbpm)",
-    "SimpleRatioUniforms": "missing: UNU.RAN generators are not ported (frankenscipy-9fbpm)",
-    "UNURANError": "missing: UNU.RAN generators are not ported (frankenscipy-9fbpm)"
+    "FastGeneratorInversion": "missing: UNU.RAN generators are not ported (frankenscipy-yrlc3)",
+    "NumericalInversePolynomial": "missing: UNU.RAN generators are not ported (frankenscipy-yrlc3)",
+    "SimpleRatioUniforms": "missing: UNU.RAN generators are not ported (frankenscipy-yrlc3)",
+    "UNURANError": "missing: UNU.RAN generators are not ported (frankenscipy-yrlc3)"
    },
    "real": 5,
    "real_not_compared": [
