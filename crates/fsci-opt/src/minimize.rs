@@ -4383,11 +4383,19 @@ where
             .filter(|(c, _)| c.kind == ConstraintType::Eq)
             .map(|(_, &s)| s)
             .sum();
+        // NaN-propagating: `(-v).max(0.0)` and `f64::max` both drop a NaN, which reported a
+        // constraint that had gone NaN as maxcv 0.
         values
             .iter()
             .enumerate()
-            .map(|(i, &v)| if i < meq { v.abs() } else { (-v).max(0.0) })
-            .fold(0.0, f64::max)
+            .map(|(i, &v)| if i < meq { v.abs() } else { -v })
+            .fold(0.0, |worst: f64, v| {
+                if worst.is_nan() || v.is_nan() {
+                    f64::NAN
+                } else {
+                    worst.max(v)
+                }
+            })
     }
 }
 
@@ -8298,6 +8306,39 @@ mod tests {
 
     // SciPy converts LinearConstraint / NonlinearConstraint for SLSQP with
     // `new_constraint_to_old`; these are its results (SciPy 1.17.1, default method).
+    #[test]
+    fn slsqp_does_not_report_a_nan_constraint_as_satisfied() {
+        // SciPy: minimize(f, [0, 0], method="SLSQP", constraints=[{"type": "ineq",
+        // "fun": lambda x: nan}]) fails (status 4, "Inequality constraints incompatible").
+        // maxcv used to come out 0 here, the NaN dropped by `max`.
+        let f = |v: &[f64]| (v[0] - 1.0).powi(2) + (v[1] - 2.0).powi(2);
+        let cons = [Constraint::ineq(|_: &[f64]| vec![f64::NAN])];
+        let r = minimize(
+            f,
+            &[0.0, 0.0],
+            MinimizeOptions {
+                constraints: &cons,
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("slsqp");
+        assert!(!r.success, "{r:?}");
+        assert!(r.maxcv.is_some_and(f64::is_nan), "maxcv {:?}", r.maxcv);
+        // A satisfied constraint still reports maxcv 0.
+        let ok_cons = [Constraint::ineq(|v: &[f64]| vec![2.0 - v[0]])];
+        let ok = minimize(
+            f,
+            &[0.0, 0.0],
+            MinimizeOptions {
+                constraints: &ok_cons,
+                ..MinimizeOptions::default()
+            },
+        )
+        .expect("slsqp");
+        assert!(ok.success, "{ok:?}");
+        assert_eq!(ok.maxcv, Some(0.0));
+    }
+
     #[test]
     fn slsqp_converts_linear_and_nonlinear_constraints_like_scipy() {
         let sphere2 = |v: &[f64]| v[0] * v[0] + v[1] * v[1];
