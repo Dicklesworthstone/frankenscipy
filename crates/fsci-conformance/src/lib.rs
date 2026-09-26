@@ -59,12 +59,15 @@
 pub struct ReadmeDoctests;
 
 pub mod ci_gates;
+pub mod compare_ledger;
 pub mod dashboard;
 pub mod e2e;
 pub mod forensics;
 pub mod metamorphic;
 pub mod perf_gate;
 pub mod quality_gates;
+
+pub use compare_ledger::{ArmCounts, CompareLedger};
 
 use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
 use asupersync::raptorq::systematic::SystematicEncoder;

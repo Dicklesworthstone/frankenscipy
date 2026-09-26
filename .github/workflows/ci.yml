@@ -145,6 +145,12 @@ jobs:
       # found eight that were accepted and silently ignored.
       - name: Public option fields are read
         run: python3 scripts/unread_option_fields.py
+      # A diff test must end in fsci_conformance::CompareLedger::finish, which fails a test that
+      # compared nothing; `all(|d| d.pass)` over zero cases is true, and four columns shipped
+      # comparing nothing (frankenscipy-olv0j.1/.2). Unmigrated files are listed, and the list
+      # only shrinks.
+      - name: Diff tests end in a compared-case ledger
+        run: python3 scripts/unledgered_diff_tests.py
       - name: Every diff_*.rs belongs to exactly one G3 shard
         shell: bash
         run: |
