@@ -258,7 +258,7 @@ jobs:
           - { shard: ndimage,       glob: "diff_ndimage_*" }
           - { shard: fft-integrate, glob: "diff_@(fft|integrate)*" }
           - { shard: spatial-interp-cluster, glob: "diff_@(spatial|interpolate|cluster)*" }
-          - { shard: runtime-misc,  glob: "diff_@(runtime|constants|arrayapi|odr)*" }
+          - { shard: runtime-misc,  glob: "diff_@(runtime|constants|arrayapi|odr|scipy)*" }
           # The bare family roots (diff_linalg.rs, diff_stats.rs, ...) and diff_stats_2x2_*
           # matched no shard glob, so no CI job ever ran them (frankenscipy-olv0j.4).
           - { shard: family-roots,  glob: "@(diff_linalg|diff_special|diff_stats|diff_signal|diff_sparse|diff_ndimage|diff_stats_[0-9]*)" }
