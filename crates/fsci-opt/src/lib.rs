@@ -3096,6 +3096,23 @@ impl gsa::Uniform for SimpleRng {
     }
 }
 
+/// The violation `cobyla` charges a constraint that evaluates to NaN: the maxcv SciPy's
+/// COBYLA reports for one.
+pub const COBYLA_NAN_VIOLATION: f64 = 1e30;
+
+/// The violation of `constraint >= 0` for a value `cv`, ignoring shortfalls within `slack`.
+/// NaN is `COBYLA_NAN_VIOLATION`: `(-cv).max(0.0)` would make it 0, so a constraint that
+/// had gone NaN read as satisfied and the final point was reported feasible.
+fn cobyla_violation(cv: f64, slack: f64) -> f64 {
+    if cv.is_nan() {
+        COBYLA_NAN_VIOLATION
+    } else if cv < -slack {
+        -cv
+    } else {
+        0.0
+    }
+}
+
 /// Derivative-free constrained minimization under SciPy's COBYLA name.
 ///
 /// Minimizes `func(x)` subject to `constraints[i](x) >= 0` for all i.
@@ -3105,7 +3122,8 @@ impl gsa::Uniform for SimpleRng {
 /// when no coordinate move improves it. It shares the signature of
 /// `scipy.optimize.fmin_cobyla` but not its iterates or results; a real COBYLA is
 /// tracked separately. `success` is true only when the step contracted below
-/// 1e-12 AND the final point satisfies every constraint to 1e-8 (`maxcv`).
+/// 1e-12 AND the final point satisfies every constraint to 1e-8 (`maxcv`); a
+/// constraint that evaluates to NaN counts as violated by `COBYLA_NAN_VIOLATION`.
 pub fn cobyla<F, G>(
     func: F,
     x0: &[f64],
@@ -3151,10 +3169,7 @@ where
         // Check constraints
         let mut max_violation = 0.0_f64;
         for constraint in constraints {
-            let cv = constraint(&x);
-            if cv < 0.0 {
-                max_violation = max_violation.max(-cv);
-            }
+            max_violation = max_violation.max(cobyla_violation(constraint(&x), 0.0));
         }
 
         // Try coordinate-wise descent with constraint penalty
@@ -3170,10 +3185,7 @@ where
                 // Check all constraints
                 let mut trial_violation = 0.0;
                 for constraint in constraints {
-                    let cv = constraint(&x_trial);
-                    if cv < -1e-10 {
-                        trial_violation += -cv;
-                    }
+                    trial_violation += cobyla_violation(constraint(&x_trial), 1e-10);
                 }
 
                 // Accept if: (feasible and better) or (less infeasible)
@@ -3204,7 +3216,7 @@ where
     // exhausted iteration budget.
     let maxcv = constraints
         .iter()
-        .map(|constraint| (-constraint(&x)).max(0.0))
+        .map(|constraint| cobyla_violation(constraint(&x), 0.0))
         .fold(0.0_f64, f64::max);
     let (success, status, message) = if maxcv > 1.0e-8 {
         (
@@ -8665,6 +8677,23 @@ mod tests {
     }
 
     // ── COBYLA tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn cobyla_counts_a_nan_constraint_as_violated() {
+        // SciPy: minimize(f, [0, 0], method="COBYLA", constraints=[{"type": "ineq",
+        // "fun": lambda x: nan}]) reports success=False with maxcv 1e30. Here the NaN used to
+        // clamp to a violation of 0 and the result read as a feasible success.
+        let f = |x: &[f64]| (x[0] - 1.0).powi(2) + (x[1] - 2.0).powi(2);
+        let nan_constraint = [|_: &[f64]| f64::NAN];
+        let result = cobyla(f, &[0.0, 0.0], &nan_constraint, 500, 0.5).expect("cobyla");
+        assert!(!result.success, "{result:?}");
+        assert_eq!(result.status, ConvergenceStatus::Infeasible);
+        assert!(result.message.contains("1.000e30"), "{}", result.message);
+        // The same problem with a satisfiable constraint still succeeds.
+        let x_below_2 = [|x: &[f64]| 2.0 - x[0]];
+        let ok = cobyla(f, &[0.0, 0.0], &x_below_2, 5000, 0.5).expect("cobyla");
+        assert!(ok.success, "{ok:?}");
+    }
 
     #[test]
     fn cobyla_unconstrained_quadratic() {
