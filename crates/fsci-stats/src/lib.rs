@@ -4349,6 +4349,11 @@ impl StudentizedRange {
 
     /// Survival function: P(Q > q)
     pub fn sf(&self, q: f64) -> f64 {
+        // SciPy 1.17.1: studentized_range.{cdf,sf,pdf}(nan, 3, 10) are all nan; the
+        // `!q.is_finite()` branches below are for ±inf and used to answer NaN with 0 / 1.
+        if q.is_nan() {
+            return f64::NAN;
+        }
         if q <= 0.0 {
             return 1.0;
         }
@@ -4365,6 +4370,9 @@ impl StudentizedRange {
     ///
     /// where f_chi is the PDF of sqrt(chi2(df)/df).
     pub fn cdf(&self, q: f64) -> f64 {
+        if q.is_nan() {
+            return f64::NAN;
+        }
         if q <= 0.0 {
             return 0.0;
         }
@@ -4427,6 +4435,9 @@ impl StudentizedRange {
     ///
     /// `f_Q(q) = ∫_0^∞ f_chi2(v; df) · F_R'(q·s) · s dv`, `s = sqrt(v/df)`.
     pub fn pdf(&self, q: f64) -> f64 {
+        if q.is_nan() {
+            return f64::NAN;
+        }
         if q <= 0.0 || !q.is_finite() {
             return 0.0;
         }
@@ -66578,6 +66589,30 @@ mod tests {
                 d.statistic
             );
         }
+    }
+
+    /// SciPy 1.17.1: studentized_range cdf, sf, pdf and ppf of nan (k = 3, df = 10) are nan. At
+    /// q = 2 the cdf is 0.6294553249645047, the sf 0.37054467503549526, and the pdf
+    /// 0.3325724982523169. fsci's ±inf branches used to catch NaN and answer cdf 1, sf 0 and
+    /// pdf 0.
+    #[test]
+    fn studentized_range_at_nan_is_nan_like_scipy() {
+        let d = StudentizedRange::new(3, 10.0);
+        for (name, v) in [
+            ("cdf", d.cdf(f64::NAN)),
+            ("sf", d.sf(f64::NAN)),
+            ("pdf", d.pdf(f64::NAN)),
+            ("ppf", d.ppf(f64::NAN)),
+        ] {
+            assert!(v.is_nan(), "{name}(nan) = {v}, scipy nan");
+        }
+        // Finite q is untouched by the NaN guard; 1e-6 is the bar the pdf/ppf reference test
+        // above already holds this integrator to.
+        let (cdf, sf, pdf) = (d.cdf(2.0), d.sf(2.0), d.pdf(2.0));
+        assert!((cdf - 0.6294553249645047).abs() < 1e-6, "cdf(2) = {cdf}");
+        assert!((sf - 0.37054467503549526).abs() < 1e-6, "sf(2) = {sf}");
+        assert!((pdf - 0.3325724982523169).abs() < 1e-6, "pdf(2) = {pdf}");
+        assert_eq!((d.cdf(f64::INFINITY), d.sf(f64::INFINITY)), (1.0, 0.0));
     }
 
     #[test]
