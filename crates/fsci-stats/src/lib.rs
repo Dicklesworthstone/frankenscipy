@@ -52689,9 +52689,12 @@ pub fn r_to_d(r: f64) -> f64 {
 
 /// Cramér's V: association measure for contingency tables.
 ///
-/// V = sqrt(χ²/(n * min(r-1, c-1))), where χ² is the chi-squared statistic.
+/// V = sqrt(χ²/(n * min(r-1, c-1))), where χ² is the chi-squared statistic WITHOUT Yates'
+/// continuity correction, as `scipy.stats.contingency.association(method='cramer')` computes it
+/// by default (`correction=False`). The correction only changes 2x2 tables, which is why a 2x3
+/// reference value could not tell the two apart.
 pub fn cramers_v(observed: &[Vec<f64>]) -> f64 {
-    let result = chi2_contingency(observed, true);
+    let result = chi2_contingency(observed, false);
     let n: f64 = observed.iter().flat_map(|row| row.iter()).sum();
     let r = observed.len();
     if r == 0 {
@@ -103150,6 +103153,14 @@ mod tests {
         assert!(
             (result - 0.07273929674533079).abs() < 1e-10,
             "cramers_v got {result}, expected 0.07273929674533079"
+        );
+        // A 2x2 table is where Yates' correction would bite: SciPy 1.17.1
+        // `association([[15, 5], [3, 17]], method='cramer')` = 0.6030226891555273, and with
+        // correction=True it is 0.5527707983925666 (what fsci returned before).
+        let two_by_two = cramers_v(&[vec![15.0, 5.0], vec![3.0, 17.0]]);
+        assert!(
+            (two_by_two - 0.6030226891555273).abs() < 1e-12,
+            "2x2 cramers_v got {two_by_two}, expected SciPy's uncorrected 0.6030226891555273"
         );
     }
 
