@@ -950,6 +950,9 @@ pub fn interp1d_linear(x: &[f64], y: &[f64], x_new: &[f64]) -> Result<Vec<f64>, 
 pub struct CubicSplineStandalone {
     x: Vec<f64>,
     coeffs: Vec<[f64; 4]>,
+    /// Built with [`SplineBc::Periodic`]: scipy then defaults `extrapolate='periodic'`, which
+    /// [`Self::integrate`] follows outside `[x[0], x[n-1]]`.
+    periodic: bool,
 }
 
 /// SciPy-compatible type alias for [`CubicSplineStandalone`], matching `scipy.interpolate.CubicSpline`.
@@ -979,6 +982,7 @@ impl CubicSplineStandalone {
         Ok(Self {
             x: x.to_vec(),
             coeffs,
+            periodic: matches!(bc, SplineBc::Periodic),
         })
     }
 
@@ -1042,17 +1046,74 @@ impl CubicSplineStandalone {
         }
     }
 
+    /// Definite integral over `[a, b]`, matching `scipy.interpolate.CubicSpline.integrate(a, b)`.
+    ///
+    /// Bounds are not clamped to the data range: like scipy's default `extrapolate`, the end
+    /// pieces are extended for every non-periodic `bc`, and a periodic spline is integrated
+    /// periodically (whole periods plus the wrapped remainder). A NaN bound, and an infinite
+    /// bound on a periodic spline, return NaN: scipy raises
+    /// `ValueError("Integral bounds not in order")` there, which this `f64` return cannot carry.
     pub fn integrate(&self, a: f64, b: f64) -> f64 {
+        if a.is_nan() || b.is_nan() {
+            return f64::NAN;
+        }
         if (b - a).abs() < 1e-15 {
             return 0.0;
         }
         let sign = if a > b { -1.0 } else { 1.0 };
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        if !self.periodic {
+            return sign * self.integrate_pieces(lo, hi);
+        }
+        // scipy `PPoly.integrate` with extrapolate='periodic' (after its bound swap).
+        let n = self.x.len();
+        let (xs, xe) = (self.x[0], self.x[n - 1]);
+        let period = xe - xs;
+        let interval = hi - lo;
+        if !interval.is_finite() {
+            return f64::NAN;
+        }
+        // Python `divmod(interval, period)` for interval >= 0 and period > 0.
+        let left = interval % period;
+        let div = (interval - left) / period;
+        let mut n_periods = div.floor();
+        if div - n_periods > 0.5 {
+            n_periods += 1.0;
+        }
+        let mut total = if n_periods > 0.0 {
+            self.integrate_pieces(xs, xe) * n_periods
+        } else {
+            0.0
+        };
+        // Map lo into [xs, xe) with Python's `%` (non-negative for a positive period).
+        let mut offset = (lo - xs) % period;
+        if offset < 0.0 {
+            offset += period;
+        }
+        let start = xs + offset;
+        let end = start + left;
+        if end <= xe {
+            total += self.integrate_pieces(start, end);
+        } else {
+            total += self.integrate_pieces(start, xe);
+            total += self.integrate_pieces(xs, xs + left + start - xe);
+        }
+        sign * total
+    }
+
+    /// `∫_lo^hi` over the pieces for `lo <= hi`, with the first and last pieces extended past
+    /// the data range (scipy `_ppoly.integrate` with `extrapolate=True`), the same pieces
+    /// [`Self::eval`] uses outside `[x[0], x[n-1]]`.
+    fn integrate_pieces(&self, lo: f64, hi: f64) -> f64 {
         let n = self.x.len();
         let mut total = 0.0;
         for i in 0..n - 1 {
-            let seg_lo = self.x[i].max(lo);
-            let seg_hi = self.x[i + 1].min(hi);
+            let seg_lo = if i == 0 { lo } else { self.x[i].max(lo) };
+            let seg_hi = if i == n - 2 {
+                hi
+            } else {
+                self.x[i + 1].min(hi)
+            };
             if seg_lo >= seg_hi {
                 continue;
             }
@@ -1064,7 +1125,7 @@ impl CubicSplineStandalone {
             };
             total += anti(dx_hi) - anti(dx_lo);
         }
-        sign * total
+        total
     }
 }
 
@@ -1864,6 +1925,10 @@ fn aaa_min_singular_vector(a: &[Vec<f64>]) -> Result<Vec<f64>, InterpError> {
 /// `max_terms` caps the support set). The approximant is evaluated in barycentric
 /// form and interpolates the data at the support points.
 ///
+/// As in scipy, a non-finite point is an error ([`InterpError::NonFiniteX`]) and a
+/// non-finite value is dropped along with its point before fitting; if no finite
+/// value remains the result is [`InterpError::TooFewPoints`].
+///
 /// The Froissart-doublet `clean_up` post-process (scipy's `clean_up=True`) is not
 /// performed; the result equals scipy's for well-conditioned data, where no
 /// spurious poles arise.
@@ -1896,6 +1961,28 @@ impl Aaa {
         if max_terms < 1 {
             return Err(InterpError::InvalidArgument {
                 detail: "max_terms must be >= 1".to_string(),
+            });
+        }
+        // scipy checks the points (ValueError "`x` must be finite.") BEFORE it drops the
+        // non-finite values, so a non-finite point is an error even when its value is dropped.
+        if z.iter().any(|v| !v.is_finite()) {
+            return Err(InterpError::NonFiniteX);
+        }
+        // scipy then keeps only the finite values (`to_keep = isfinite(f)`) and fits the rest;
+        // with none left its greedy argmax over an empty set raises (frankenscipy-no7rr). A NaN
+        // value used to make every residual NaN, so no point was ever selected and `z[jj]`
+        // indexed out of bounds.
+        let (z, f): (Vec<f64>, Vec<f64>) = z
+            .iter()
+            .zip(f)
+            .filter(|&(_, fv)| fv.is_finite())
+            .map(|(&zv, &fv)| (zv, fv))
+            .unzip();
+        let m_total = z.len();
+        if m_total == 0 {
+            return Err(InterpError::TooFewPoints {
+                minimum: 1,
+                actual: 0,
             });
         }
         let rtol = rtol.unwrap_or(f64::EPSILON.powf(0.75));
@@ -1937,7 +2024,14 @@ impl Aaa {
                 .iter()
                 .map(|&i| (0..ncol).map(|c| (f[i] - fj[c]) * cols_c[c][i]).collect())
                 .collect();
-            let wj = aaa_min_singular_vector(&asub)?;
+            // With no row left (every point is a support point) scipy's `null_space` of the empty
+            // Loewner matrix is the identity, so the weights are `ones / sqrt(ncol)`; the SVD
+            // path would index an empty spectrum. Reached when one finite value survives.
+            let wj = if masked_rows.is_empty() {
+                vec![1.0 / (ncol as f64).sqrt(); ncol]
+            } else {
+                aaa_min_singular_vector(&asub)?
+            };
 
             // Rational approximant R at every point (= f at support points).
             let mut new_r = vec![0.0_f64; m_total];
@@ -2078,8 +2172,15 @@ impl UnivariateSpline {
         if x.windows(2).any(|w| w[1] <= w[0]) {
             return Err(InterpError::UnsortedX);
         }
+        // scipy `UnivariateSpline.validate_input`: `not s >= 0.0` raises ValueError (after the
+        // x-order and length checks), so a negative or NaN `s` is an error, not a clamp to 0.
+        if !(s >= 0.0) {
+            return Err(InterpError::InvalidArgument {
+                detail: "s should be s >= 0.0".to_string(),
+            });
+        }
 
-        let spline = if s <= 0.0 {
+        let spline = if s == 0.0 {
             make_interp_spline(x, y, 3)?
         } else {
             make_smoothing_spline_impl(x, y, s, 3)?
@@ -2087,7 +2188,7 @@ impl UnivariateSpline {
 
         Ok(Self {
             spline,
-            smoothing_factor: s.max(0.0),
+            smoothing_factor: s,
         })
     }
 
@@ -2210,12 +2311,42 @@ pub fn make_interp_spline(x: &[f64], y: &[f64], k: usize) -> Result<BSpline, Int
     BSpline::new(t, c, k)
 }
 
+/// Least-squares B-spline fit, matching `scipy.interpolate.make_lsq_spline(x, y, t, k)`.
+///
+/// Like scipy's default `check_finite=True`, a non-finite `x` ([`InterpError::NonFiniteX`]),
+/// `y` or `t` (`"Array must not contain infs or nans."`) is rejected before any other check.
+/// scipy's `LSQUnivariateSpline` and `splrep` do not check, so [`lsq_univariate_spline`] and
+/// [`splrep`] keep propagating a non-finite `y` into the coefficients.
+pub fn make_lsq_spline(x: &[f64], y: &[f64], t: &[f64], k: usize) -> Result<BSpline, InterpError> {
+    reject_non_finite_spline_data(x, &[y, t])?;
+    lsq_spline_fit(x, y, t, k)
+}
+
+/// scipy `_bsplines._as_float_array(arr, check_finite=True)` applied to `x` and then to each
+/// of `rest` in order, as `make_interp_spline`/`make_lsq_spline` do before any other
+/// validation: scipy raises `ValueError("Array must not contain infs or nans.")` for any of
+/// them; a non-finite `x` maps to the crate's [`InterpError::NonFiniteX`].
+fn reject_non_finite_spline_data(x: &[f64], rest: &[&[f64]]) -> Result<(), InterpError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(InterpError::NonFiniteX);
+    }
+    if rest.iter().any(|a| a.iter().any(|v| !v.is_finite())) {
+        return Err(InterpError::InvalidArgument {
+            detail: "Array must not contain infs or nans.".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// [`make_lsq_spline`] without the finiteness check, for the scipy entry points that do not
+/// check (`LSQUnivariateSpline`, `splrep`): a non-finite `y` propagates into the coefficients.
+///
 /// Index-driven numeric kernel: the loop variables are the recurrence/band
 /// indices and several address more than one array per iteration, so iterator
 /// form would obscure the index algebra this is checked against rather than
 /// simplify it (frankenscipy-9yyez).
 #[allow(clippy::needless_range_loop, clippy::explicit_counter_loop)]
-pub fn make_lsq_spline(x: &[f64], y: &[f64], t: &[f64], k: usize) -> Result<BSpline, InterpError> {
+fn lsq_spline_fit(x: &[f64], y: &[f64], t: &[f64], k: usize) -> Result<BSpline, InterpError> {
     let m = x.len();
     if m != y.len() {
         return Err(InterpError::LengthMismatch {
@@ -2351,7 +2482,8 @@ pub fn lsq_univariate_spline(
     let mut t = vec![xb; k + 1];
     t.extend_from_slice(t_interior);
     t.extend(std::iter::repeat_n(xe, k + 1));
-    let bs = make_lsq_spline(x, y, &t, k)?;
+    // scipy `LSQUnivariateSpline(check_finite=False)`: a non-finite y propagates, no raise.
+    let bs = lsq_spline_fit(x, y, &t, k)?;
     Ok((bs.t.clone(), bs.c.clone(), k))
 }
 
@@ -6852,9 +6984,16 @@ pub fn splrep(
             actual: x.len(),
         });
     }
+    // scipy's FITPACK `curfit` wrapper rejects `s` (after the length and m > k checks):
+    // "(s>=0.0) failed for 4th keyword s", so a negative or NaN `s` is not interpolation.
+    if !(s >= 0.0) {
+        return Err(InterpError::InvalidArgument {
+            detail: format!("(s>=0.0) failed for 4th keyword s: curfit:s={s}"),
+        });
+    }
 
     // For s=0 (interpolating), use make_interp_spline
-    if s <= 0.0 {
+    if s == 0.0 {
         let bspl = make_interp_spline(x, y, k)?;
         return Ok((
             bspl.knots().to_vec(),
@@ -6883,7 +7022,8 @@ pub fn splrep(
         knots.push(x[n - 1]);
     }
 
-    let bspl = make_lsq_spline(x, y, &knots, k)?;
+    // scipy `splrep` does not check finiteness: a non-finite y propagates, no raise.
+    let bspl = lsq_spline_fit(x, y, &knots, k)?;
     Ok((
         bspl.knots().to_vec(),
         pad_tck_coeffs(bspl.knots(), bspl.coeffs()),
@@ -6905,6 +7045,9 @@ pub fn make_splrep(x: &[f64], y: &[f64], k: usize, s: f64) -> Result<BSpline, In
         });
     }
     if s == 0.0 {
+        // scipy's s == 0 branch is `make_interp_spline(x, y, k)` with its default
+        // `check_finite=True`: a non-finite x or y raises before any other check.
+        reject_non_finite_spline_data(x, &[y])?;
         return make_interp_spline(x, y, k);
     }
     // Smoothing spline: place knots via the FITPACK LSQ loop, then fit the
@@ -7497,6 +7640,14 @@ pub fn make_smoothing_spline(
         }
         None => vec![1.0; n],
     };
+    // scipy solves `solve_banded((2, 2), X + lam*wE, y)` with its default `check_finite=True`
+    // (inside GCV too when lam is None), which raises "array must not contain infs or NaNs"
+    // for a non-finite y or lam after every check above; a NaN lam also slips past `< 0`.
+    if y.iter().any(|v| !v.is_finite()) || matches!(lam, Some(l) if !l.is_finite()) {
+        return Err(InterpError::InvalidArgument {
+            detail: "array must not contain infs or NaNs".to_string(),
+        });
+    }
 
     // Knot vector: triple-clamped at the ends with data points in between.
     let mut t = vec![x[0]; 3];
@@ -12000,6 +12151,91 @@ mod tests {
         assert_eq!(ag.support_points().len(), 3, "runge nterms");
     }
 
+    /// frankenscipy-no7rr. A NaN value made every residual NaN, so the greedy pick `jj` stayed
+    /// `usize::MAX` and `z[jj]` panicked. scipy 1.17.1 `AAA(z, f)`, live:
+    /// - f = exp(z) with f[37] = nan and f[64] = inf: no raise; the non-finite values are
+    ///   dropped (`to_keep = isfinite(f)`), giving 6 terms and r(-0.3, 0.1, 0.77) =
+    ///   0.7408182206817913, 1.1051709180756524, 2.1597662537849724, bitwise the fit of the
+    ///   data with those two points removed;
+    /// - a non-finite point raises ValueError("`x` must be finite.") even when its value is
+    ///   the dropped one (checked first);
+    /// - all values NaN raises ValueError("attempt to get argmax of an empty sequence");
+    /// - one finite value left gives support [0.4], values [2.5], weights [1.0].
+    ///
+    /// Must-not-change: the finite exp(z) data still fits as scipy's 6 terms with
+    /// r = 0.7408182206817886, 1.105170918075652, 2.159766253784972.
+    #[test]
+    fn aaa_drops_non_finite_values_like_scipy() {
+        let z: Vec<f64> = (0..100).map(|i| -1.0 + i as f64 * (2.0 / 99.0)).collect();
+        let f: Vec<f64> = z.iter().map(|&x| x.exp()).collect();
+        let xs = [-0.3_f64, 0.1, 0.77];
+
+        let full = Aaa::new(&z, &f, None, 100).expect("finite data");
+        assert_eq!(full.support_points().len(), 6, "finite nterms");
+        let scipy_full = [0.7408182206817886, 1.105170918075652, 2.159766253784972];
+        for (&x, e) in xs.iter().zip(scipy_full) {
+            assert!(
+                (full.eval(x) - e).abs() < 1e-9,
+                "finite r({x}) = {}",
+                full.eval(x)
+            );
+        }
+
+        let mut fb = f.clone();
+        fb[37] = f64::NAN;
+        fb[64] = f64::INFINITY;
+        let with_bad = Aaa::new(&z, &fb, None, 100).expect("scipy drops non-finite values");
+        assert_eq!(with_bad.support_points().len(), 6, "dropped nterms");
+        let scipy_dropped = [0.7408182206817913, 1.1051709180756524, 2.1597662537849724];
+        for (&x, e) in xs.iter().zip(scipy_dropped) {
+            let got = with_bad.eval(x);
+            assert!((got - e).abs() < 1e-9, "dropped r({x}) = {got}");
+        }
+        let (zk, fk): (Vec<f64>, Vec<f64>) = z
+            .iter()
+            .zip(&fb)
+            .filter(|&(_, v)| v.is_finite())
+            .map(|(&zv, &fv)| (zv, fv))
+            .unzip();
+        assert_eq!(zk.len(), 98);
+        let kept = Aaa::new(&zk, &fk, None, 100).expect("filtered data");
+        for (got, want) in [
+            (with_bad.support_points(), kept.support_points()),
+            (with_bad.support_values(), kept.support_values()),
+            (with_bad.weights(), kept.weights()),
+        ] {
+            assert_eq!(got.len(), want.len());
+            assert!(
+                got.iter()
+                    .zip(want)
+                    .all(|(g, w)| g.to_bits() == w.to_bits()),
+                "dropping differs from fitting the filtered data: {got:?} vs {want:?}"
+            );
+        }
+
+        let mut zb = z.clone();
+        zb[37] = f64::NAN;
+        assert!(matches!(
+            Aaa::new(&zb, &fb, None, 100),
+            Err(InterpError::NonFiniteX)
+        ));
+        let all_nan = vec![f64::NAN; z.len()];
+        assert!(matches!(
+            Aaa::new(&z, &all_nan, None, 100),
+            Err(InterpError::TooFewPoints {
+                minimum: 1,
+                actual: 0
+            })
+        ));
+        let one = Aaa::new(&[0.0, 0.4, 1.0], &[f64::NAN, 2.5, f64::NAN], None, 100)
+            .expect("one finite value");
+        assert_eq!(one.support_points().len(), 1);
+        assert_eq!(one.support_points()[0].to_bits(), 0.4_f64.to_bits());
+        assert_eq!(one.support_values()[0].to_bits(), 2.5_f64.to_bits());
+        assert_eq!(one.weights()[0].to_bits(), 1.0_f64.to_bits());
+        assert!((one.eval(0.25) - 2.5).abs() < 1e-14);
+    }
+
     #[test]
     fn floater_hormann_matches_scipy() {
         let x = [0.0_f64, 1.0, 2.0, 3.0, 4.0, 5.0];
@@ -12170,6 +12406,173 @@ mod tests {
         let integral = spline.integral(0.0, 3.0).expect("integral");
         assert!(integral.is_finite());
         assert!(integral > 0.0);
+    }
+
+    /// `np.linspace(0.0, 3.0, 8)` bit for bit (`i * (3/7)`, last point exactly 3.0).
+    fn linspace_0_3_8() -> Vec<f64> {
+        vec![
+            0.0,
+            0.42857142857142855,
+            0.8571428571428571,
+            1.2857142857142856,
+            1.7142857142857142,
+            2.142857142857143,
+            2.571428571428571,
+            3.0,
+        ]
+    }
+
+    /// frankenscipy-no7rr. `UnivariateSpline::new` clamped a negative `s` to 0
+    /// (`s.max(0.0)`, i.e. interpolated) and `splrep` read any `s <= 0` as interpolation.
+    /// scipy 1.17.1, live, x = linspace(0, 3, 8), y = sin(x):
+    /// - `UnivariateSpline(x, y, s=-1)` and `s=nan` raise ValueError("s should be s >= 0.0");
+    /// - `splrep(x, y, s=-1)` / `s=nan` raise "(s>=0.0) failed for 4th keyword s: curfit:s=-1".
+    ///
+    /// Must-not-change: `s = 0` and `s = -0.0` are accepted by both and interpolate, with
+    /// values 0.3894707620934854, 0.9916605300427761, 0.2397119789184895 at 0.4, 1.7, 2.9.
+    #[test]
+    fn negative_or_nan_smoothing_factor_raises_like_scipy() {
+        let x = linspace_0_3_8();
+        let y: Vec<f64> = x.iter().map(|v| v.sin()).collect();
+        let detail_of = |err: InterpError| match err {
+            InterpError::InvalidArgument { detail } => Some(detail),
+            _ => None,
+        };
+        for s in [-1.0, f64::NAN] {
+            let err = UnivariateSpline::new(&x, &y, s).expect_err("scipy raises on s < 0 / nan");
+            let detail = detail_of(err);
+            assert_eq!(
+                detail.as_deref(),
+                Some("s should be s >= 0.0"),
+                "UnivariateSpline s={s}"
+            );
+            let err = splrep(&x, &y, 3, s).expect_err("scipy curfit raises on s < 0 / nan");
+            let detail = detail_of(err).unwrap_or_default();
+            assert!(
+                detail.starts_with("(s>=0.0) failed for 4th keyword s"),
+                "splrep s={s}: {detail}"
+            );
+        }
+
+        let q = [0.4, 1.7, 2.9];
+        let scipy_s0 = [0.3894707620934854, 0.9916605300427761, 0.2397119789184895];
+        for s in [0.0, -0.0] {
+            let spline = UnivariateSpline::new(&x, &y, s).expect("scipy accepts s = 0");
+            let tck = splrep(&x, &y, 3, s).expect("scipy accepts s = 0");
+            let from_tck = splev(&q, &tck).expect("splev");
+            for ((&qi, e), g) in q.iter().zip(scipy_s0).zip(from_tck) {
+                let u = spline.eval(qi);
+                assert!((u - e).abs() < 1e-12, "UnivariateSpline s={s} at {qi}: {u}");
+                assert!((g - e).abs() < 1e-12, "splrep s={s} at {qi}: {g}");
+            }
+        }
+        let smooth = UnivariateSpline::new(&x, &y, 0.5).expect("positive s still smooths");
+        assert_eq!(smooth.smoothing_factor().to_bits(), 0.5_f64.to_bits());
+    }
+
+    /// frankenscipy-no7rr. The fits whose scipy default is `check_finite=True` let a non-finite
+    /// y through (all-NaN coefficients, `Ok`). scipy 1.17.1, live, x = linspace(0, 3, 8),
+    /// y = sin(x) with y[2] = nan or inf, t = [0, 0, 0, 0, 1.5, 3, 3, 3, 3]:
+    /// - `make_lsq_spline(x, y, t)` raises ValueError("Array must not contain infs or nans.")
+    ///   (x, y, t are checked first, so also with a length mismatch); a NaN in t raises the same;
+    ///   a NaN in x maps to the crate's `NonFiniteX`;
+    /// - `make_splrep(x, y, s=0)` raises ValueError("Array must not contain infs or nans.");
+    /// - `make_smoothing_spline(x, y)` and `lam=0.1` raise ValueError("array must not contain
+    ///   infs or NaNs"), as does a finite y with `lam=nan`.
+    ///
+    /// Must-not-change: the entry points without that check still return a spline whose
+    /// values are not finite (scipy: nan), since scipy does not raise there:
+    /// `UnivariateSpline(s=0)`, `splrep`, `LSQUnivariateSpline`. And the finite data still fit:
+    /// `make_lsq_spline` = 0.39100389544256503, 0.992872507279989, 0.24142782624160664,
+    /// `make_splrep(s=0)` = 0.3894707620934856, 0.9916605300427755, 0.23971197891848942,
+    /// `make_smoothing_spline(lam=0.1)` = 0.4049069216089018, 0.9389682357634399,
+    /// 0.29910027705584963 at 0.4, 1.7, 2.9.
+    #[test]
+    fn check_finite_spline_fits_reject_non_finite_y_like_scipy() {
+        let x = linspace_0_3_8();
+        let y: Vec<f64> = x.iter().map(|v| v.sin()).collect();
+        let t = [0.0, 0.0, 0.0, 0.0, 1.5, 3.0, 3.0, 3.0, 3.0];
+        let array_msg = "Array must not contain infs or nans.";
+        let banded_msg = "array must not contain infs or NaNs";
+        let is_invalid = |r: Result<BSpline, InterpError>, msg: &str| match r {
+            Err(InterpError::InvalidArgument { detail }) => detail == msg,
+            _ => false,
+        };
+        for bad in [f64::NAN, f64::INFINITY] {
+            let mut yb = y.clone();
+            yb[2] = bad;
+            assert!(
+                is_invalid(make_lsq_spline(&x, &yb, &t, 3), array_msg),
+                "lsq y={bad}"
+            );
+            assert!(
+                is_invalid(make_lsq_spline(&x, &yb[..7], &t, 3), array_msg),
+                "lsq checks finiteness before length, y={bad}"
+            );
+            assert!(
+                is_invalid(make_splrep(&x, &yb, 3, 0.0), array_msg),
+                "make_splrep y={bad}"
+            );
+            assert!(
+                is_invalid(make_smoothing_spline(&x, &yb, None, Some(0.1)), banded_msg),
+                "smoothing lam=0.1 y={bad}"
+            );
+            assert!(
+                is_invalid(make_smoothing_spline(&x, &yb, None, None), banded_msg),
+                "smoothing gcv y={bad}"
+            );
+
+            let uni = UnivariateSpline::new(&x, &yb, 0.0).expect("scipy check_finite=False");
+            assert!(!uni.eval(1.7).is_finite(), "UnivariateSpline y={bad}");
+            let tck = splrep(&x, &yb, 3, 0.0).expect("scipy splrep does not check");
+            assert!(
+                !splev(&[1.7], &tck).expect("splev")[0].is_finite(),
+                "splrep y={bad}"
+            );
+            let lsq = lsq_univariate_spline(&x, &yb, &[1.5], 3).expect("check_finite=False");
+            assert!(
+                !splev(&[1.7], &lsq).expect("splev")[0].is_finite(),
+                "LSQ y={bad}"
+            );
+        }
+        let mut xb = x.clone();
+        xb[2] = f64::NAN;
+        assert!(matches!(
+            make_lsq_spline(&xb, &y, &t, 3),
+            Err(InterpError::NonFiniteX)
+        ));
+        let mut tb = t.to_vec();
+        tb[4] = f64::NAN;
+        assert!(is_invalid(make_lsq_spline(&x, &y, &tb, 3), array_msg));
+        assert!(is_invalid(
+            make_smoothing_spline(&x, &y, None, Some(f64::NAN)),
+            banded_msg
+        ));
+
+        let q = [0.4, 1.7, 2.9];
+        let lsq = make_lsq_spline(&x, &y, &t, 3).expect("finite lsq");
+        let splrep0 = make_splrep(&x, &y, 3, 0.0).expect("finite make_splrep");
+        let smooth = make_smoothing_spline(&x, &y, None, Some(0.1)).expect("finite smoothing");
+        let scipy = [
+            (
+                &lsq,
+                [0.39100389544256503, 0.992872507279989, 0.24142782624160664],
+            ),
+            (
+                &splrep0,
+                [0.3894707620934856, 0.9916605300427755, 0.23971197891848942],
+            ),
+            (
+                &smooth,
+                [0.4049069216089018, 0.9389682357634399, 0.29910027705584963],
+            ),
+        ];
+        for (spline, want) in scipy {
+            for (&qi, e) in q.iter().zip(want) {
+                let got = spline.eval(qi);
+                assert!((got - e).abs() < 1e-10, "finite fit at {qi}: {got} vs {e}");
+            }
+        }
     }
 
     // ── RBF Interpolator tests ───────────────────────────────────────
@@ -13234,6 +13637,83 @@ mod tests {
         let y = vec![0.0, 1.0, 0.5, 0.25];
         let err = CubicSplineStandalone::new(&x, &y, SplineBc::Periodic).expect_err("periodic");
         assert!(matches!(err, InterpError::InvalidArgument { .. }));
+    }
+
+    /// frankenscipy-no7rr. `CubicSpline::integrate` clamped both bounds to `[x[0], x[n-1]]`
+    /// (`x[i].max(lo)`, `x[i+1].min(hi)`), which also swallowed a NaN bound into a finite
+    /// number. scipy 1.17.1 `CubicSpline(x, y, bc_type).integrate(a, b)`, live, on
+    /// x = [0, 1, 2, 3, 4], y = [0, 1, 0, 1, 0] (periodic: y = [1, 2, 0.5, -1, 1]), extrapolates
+    /// (non-periodic: the end pieces; periodic: whole periods plus the wrapped remainder):
+    /// - natural: (-1, 5) = 0.9285714285714283, (5, -1) = -0.9285714285714283,
+    ///   (-2.5, 7.3) = 15.74689285714286, (4, 5) = -0.6785714285714288;
+    /// - not-a-knot: (-1, 5) = -4.5, (-2.5, 7.3) = -139.77631666666667;
+    /// - clamped: (-1, 5) = 5.0, (-2.5, 7.3) = 132.3893;
+    /// - periodic: (-1, 5) = 4.0625, (5, -1) = -4.0625, (-2.5, 7.3) = 4.78210625,
+    ///   (10, 13) = 1.09375, (0, 12) = 7.5;
+    /// - a NaN bound raises ValueError("Integral bounds not in order") for every bc_type, as
+    ///   does an infinite bound on a periodic spline; the `f64` return gives NaN there.
+    ///
+    /// Must-not-change: in-range bounds, (0.5, 3.5) = 1.8794642857142858 (natural),
+    /// 1.96875 (not-a-knot), 1.8125 (clamped), 1.57421875 (periodic).
+    #[test]
+    fn cubic_spline_integrate_extrapolates_bounds_like_scipy() {
+        let x = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let y = [0.0, 1.0, 0.0, 1.0, 0.0];
+        let yp = [1.0, 2.0, 0.5, -1.0, 1.0];
+        let cases: [(SplineBc, &[f64], &[(f64, f64, f64)]); 4] = [
+            (
+                SplineBc::Natural,
+                &y,
+                &[
+                    (0.5, 3.5, 1.8794642857142858),
+                    (-1.0, 5.0, 0.9285714285714283),
+                    (5.0, -1.0, -0.9285714285714283),
+                    (-2.5, 7.3, 15.74689285714286),
+                    (4.0, 5.0, -0.6785714285714288),
+                ],
+            ),
+            (
+                SplineBc::NotAKnot,
+                &y,
+                &[
+                    (0.5, 3.5, 1.96875),
+                    (-1.0, 5.0, -4.5),
+                    (-2.5, 7.3, -139.77631666666667),
+                ],
+            ),
+            (
+                SplineBc::Clamped(0.0, 0.0),
+                &y,
+                &[(0.5, 3.5, 1.8125), (-1.0, 5.0, 5.0), (-2.5, 7.3, 132.3893)],
+            ),
+            (
+                SplineBc::Periodic,
+                &yp,
+                &[
+                    (0.5, 3.5, 1.57421875),
+                    (-1.0, 5.0, 4.0625),
+                    (5.0, -1.0, -4.0625),
+                    (-2.5, 7.3, 4.78210625),
+                    (10.0, 13.0, 1.09375),
+                    (0.0, 12.0, 7.5),
+                ],
+            ),
+        ];
+        for (bc, values, expected) in cases {
+            let spline = CubicSplineStandalone::new(&x, values, bc).expect("cubic spline");
+            for &(a, b, e) in expected {
+                let got = spline.integrate(a, b);
+                assert!(
+                    (got - e).abs() <= 1e-12 * e.abs().max(1.0),
+                    "{bc:?} integrate({a}, {b}) = {got}, scipy {e}"
+                );
+            }
+            assert!(spline.integrate(f64::NAN, 2.0).is_nan(), "{bc:?} nan lower");
+            assert!(spline.integrate(1.0, f64::NAN).is_nan(), "{bc:?} nan upper");
+        }
+        let periodic = CubicSplineStandalone::new(&x, &yp, SplineBc::Periodic).expect("periodic");
+        assert!(periodic.integrate(1.0, f64::INFINITY).is_nan());
+        assert!(periodic.integrate(f64::NEG_INFINITY, 1.0).is_nan());
     }
 
     #[test]
