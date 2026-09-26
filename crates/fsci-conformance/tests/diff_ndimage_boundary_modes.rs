@@ -34,12 +34,14 @@
 //! spellings it is claimed NOT to equal, wherever the incumbent itself distinguishes them. A
 //! mapping that merely matched something would otherwise pass while pointing at the wrong row.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{BoundaryMode, NdArray, shift};
 use serde::{Deserialize, Serialize};
 
@@ -205,6 +207,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     compared_cases: usize,
     total_comparisons: usize,
     discriminating_comparisons: usize,
@@ -418,6 +421,8 @@ fn diff_ndimage_boundary_modes() {
     let mut divergences_seen = 0usize;
     let mut refusals_seen = 0usize;
     let mut agreements = 0usize;
+    let mode_arms: Vec<&str> = EXPECTED_MAPPING.iter().map(|(ours, _)| *ours).collect();
+    let mut ledger = CompareLedger::new("diff_ndimage_boundary_modes", &mode_arms);
 
     for (case, arm) in query.points.iter().zip(&oracle.points) {
         assert_eq!(
@@ -454,33 +459,42 @@ fn diff_ndimage_boundary_modes() {
             // A refusal is itself a divergence worth recording: SciPy accepts every
             // (order, mode, shape) combination in this query, so an error here is a capability
             // restriction we impose and the incumbent does not.
-            let ours_flat = match shift(&input, &shifts, case.order, our_mode(our_name), cval) {
-                Ok(result) => result.data,
-                Err(error) => {
-                    // SciPy accepts every combination in this query, so a refusal is a
-                    // restriction we impose. Ratcheted like a divergence: an unlisted refusal
-                    // fails, and a listed one that starts succeeding fails too.
-                    if !is_known_refusal(&case.case_id, our_name) {
-                        mismatches.push(format!(
-                            "case {} [shape {:?}, order {}]: BoundaryMode::{our_name} REFUSED \
-                             where scipy '{claimed}' succeeded, and it is NOT in \
-                             KNOWN_REFUSALS_TO_FIX: {error}",
-                            case.case_id, case.shape, case.order
-                        ));
-                    } else {
-                        refusals_seen += 1;
-                    }
-                    comparisons += 1;
-                    continue;
+            let ours = shift(&input, &shifts, case.order, our_mode(our_name), cval);
+            if let Err(error) = &ours {
+                // SciPy accepts every combination in this query, so a refusal is a
+                // restriction we impose. Ratcheted like a divergence: an unlisted refusal
+                // fails, and a listed one that starts succeeding fails too.
+                if !is_known_refusal(&case.case_id, our_name) {
+                    mismatches.push(format!(
+                        "case {} [shape {:?}, order {}]: BoundaryMode::{our_name} REFUSED \
+                         where scipy '{claimed}' succeeded, and it is NOT in \
+                         KNOWN_REFUSALS_TO_FIX: {error}",
+                        case.case_id, case.shape, case.order
+                    ));
+                } else {
+                    refusals_seen += 1;
                 }
-            };
+                comparisons += 1;
+            }
+            let ours = ours.ok().map(|result| result.data);
 
             let claimed_index = SCIPY_MODES
                 .iter()
                 .position(|m| *m == claimed)
                 .expect("claimed mode is one scipy accepts");
-            let claimed_values = as_floats(&results[claimed_index]);
-            let difference = max_relative_difference(&ours_flat, &claimed_values);
+            let claimed_vec = as_floats(&results[claimed_index]);
+            // A refusal, or a NaN the relative-difference fold would swallow, is recorded as an
+            // fsci failure; a length mismatch is recorded as a failed comparison.
+            let Some((claimed_values, ours_flat)) = ledger.slices(
+                our_name,
+                &case.case_id,
+                Some(claimed_vec.as_slice()),
+                ours.as_deref(),
+            ) else {
+                continue;
+            };
+            let mismatches_before = mismatches.len();
+            let difference = max_relative_difference(ours_flat, claimed_values);
             let known = is_known_divergence(&case.case_id, our_name);
             // Collected rather than panicked on, so ONE run reports the whole picture: failing
             // at the first cell hides how widespread a divergence is, which is the first thing
@@ -525,13 +539,13 @@ fn diff_ndimage_boundary_modes() {
                 }
                 let other_values = as_floats(&results[index]);
                 let incumbent_separates =
-                    max_relative_difference(&claimed_values, &other_values) > REL_TOL;
+                    max_relative_difference(claimed_values, &other_values) > REL_TOL;
                 if !incumbent_separates {
                     // scipy itself treats these as the same here, so there is nothing to
                     // discriminate and no claim to make.
                     continue;
                 }
-                let ours_vs_other = max_relative_difference(&ours_flat, &other_values);
+                let ours_vs_other = max_relative_difference(ours_flat, &other_values);
                 if ours_vs_other <= REL_TOL && !known {
                     mismatches.push(format!(
                         "case {}: BoundaryMode::{our_name} is claimed to be '{claimed}' but \
@@ -552,6 +566,13 @@ fn diff_ndimage_boundary_modes() {
                 max_relative_difference: difference,
                 distinguished_from: distinguished,
             });
+            // The test's own verdict for this cell: the ratchet held (a listed divergence still
+            // diverges, an unlisted cell still matches) and the mapping was not ambiguous.
+            ledger.compared(
+                our_name,
+                &case.case_id,
+                mismatches.len() == mismatches_before,
+            );
         }
 
         compared += 1;
@@ -568,6 +589,7 @@ fn diff_ndimage_boundary_modes() {
         test_id: "diff_ndimage_boundary_modes".to_string(),
         category: "ndimage".to_string(),
         case_count: query.points.len(),
+        compared: ledger.counts().clone(),
         compared_cases: compared,
         total_comparisons: comparisons,
         discriminating_comparisons: discriminating,
@@ -627,6 +649,7 @@ fn diff_ndimage_boundary_modes() {
         agreements >= 70,
         "only {agreements} cells verified against the incumbent; coverage has shrunk"
     );
+    ledger.finish(query.points.len());
 }
 
 /// MUST-HIT / MUST-MISS control for the comparator.

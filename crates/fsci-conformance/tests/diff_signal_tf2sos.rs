@@ -5,13 +5,14 @@
 //! filters compare the reconstructed transfer function because valid SOS
 //! section ordering is not uniquely specified.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{sos2tf, tf2sos};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -256,47 +258,56 @@ fn diff_signal_tf2sos() -> TestResult<()> {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_tf2sos", &["tf2sos"]);
 
     for case in &query.points {
         let Some(scipy_arm) = pmap.get(case.case_id) else {
             return Err("oracle omitted a query case".into());
         };
-        let Ok(sos) = tf2sos(&case.b, &case.a) else {
-            diffs.push(CaseDiff {
-                case_id: case.case_id,
-                abs_diff: f64::INFINITY,
-                pass: false,
-                note: "fsci_signal::tf2sos returned an error",
-            });
-            max_overall = f64::INFINITY;
-            continue;
-        };
+        let sos = tf2sos(&case.b, &case.a).ok();
 
         let (abs_d, tol, note) = if case.compare_direct_sos {
-            let Some(expected_sos) = scipy_arm.sos_flat.as_ref() else {
+            let fsci_flat = sos.as_deref().map(flatten_sos);
+            let Some((expected_sos, fsci_flat)) = ledger.slices(
+                "tf2sos",
+                case.case_id,
+                scipy_arm.sos_flat.as_deref(),
+                fsci_flat.as_deref(),
+            ) else {
                 continue;
             };
             (
-                max_abs_diff(&flatten_sos(&sos), expected_sos),
+                max_abs_diff(fsci_flat, expected_sos),
                 DIRECT_ABS_TOL,
                 "direct SOS coefficients",
             )
         } else {
-            let (Some(b_expected), Some(a_expected)) = (
-                scipy_arm.b_reconstructed.as_ref(),
-                scipy_arm.a_reconstructed.as_ref(),
+            let ba = sos.as_deref().map(sos2tf);
+            let Some((b_expected, b_fsci)) = ledger.slices(
+                "tf2sos",
+                case.case_id,
+                scipy_arm.b_reconstructed.as_deref(),
+                ba.as_ref().map(|ba| ba.b.as_slice()),
             ) else {
                 continue;
             };
-            let ba = sos2tf(&sos);
+            let Some((a_expected, a_fsci)) = ledger.slices(
+                "tf2sos",
+                case.case_id,
+                scipy_arm.a_reconstructed.as_deref(),
+                ba.as_ref().map(|ba| ba.a.as_slice()),
+            ) else {
+                continue;
+            };
             (
-                max_abs_diff(&ba.b, b_expected).max(max_abs_diff(&ba.a, a_expected)),
+                max_abs_diff(b_fsci, b_expected).max(max_abs_diff(a_fsci, a_expected)),
                 ABS_TOL,
                 "reconstructed transfer function",
             )
         };
 
         max_overall = max_overall.max(abs_d);
+        ledger.compared("tf2sos", case.case_id, abs_d <= tol);
         diffs.push(CaseDiff {
             case_id: case.case_id,
             abs_diff: abs_d,
@@ -310,6 +321,7 @@ fn diff_signal_tf2sos() -> TestResult<()> {
         test_id: "diff_signal_tf2sos".into(),
         category: "scipy.signal.tf2sos".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -334,5 +346,6 @@ fn diff_signal_tf2sos() -> TestResult<()> {
             max_overall
         ));
     }
+    ledger.finish(query.points.len());
     Ok(())
 }

@@ -12,13 +12,14 @@
 //!
 //! Every case must be compared: a SciPy failure or an fsci error is a FAILED case (olv0j.1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{LeastSquaresOptions, LossKind, least_squares, least_squares_bounded};
 use serde::{Deserialize, Serialize};
 
@@ -155,6 +156,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     same_nfev_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -277,6 +279,7 @@ fn diff_opt_least_squares_trf() {
     let (t, y) = exp_data();
 
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_opt_least_squares_trf", &["least_squares_trf"]);
     for case in &cases {
         let arm = &arms[&case.case_id];
         let options = LeastSquaresOptions {
@@ -303,35 +306,56 @@ fn diff_opt_least_squares_trf() {
             pass: false,
             reason: String::new(),
         };
-        match (fsci, &arm.x, arm.cost, &arm.active_mask) {
-            (Err(e), ..) => diff.reason = format!("fsci error {e}"),
-            (Ok(r), Some(x), Some(cost), Some(mask)) => {
-                diff.fsci_status = r.status;
-                diff.fsci_nfev = r.nfev;
-                diff.x_rel_diff =
-                    r.x.iter()
-                        .zip(x)
-                        .map(|(a, b)| (a - b).abs() / b.abs().max(1e-6))
-                        .fold(0.0, f64::max);
-                diff.cost_rel_diff = (r.cost - cost).abs() / cost.abs().max(1e-12);
-                let mut problems = Vec::new();
-                if r.status != diff.scipy_status {
-                    problems.push(format!("status {} vs {}", r.status, diff.scipy_status));
-                }
-                if &r.active_mask != mask {
-                    problems.push(format!("active_mask {:?} vs {mask:?}", r.active_mask));
-                }
-                if diff.x_rel_diff.is_nan() || diff.x_rel_diff > X_REL_TOL {
-                    problems.push(format!("x rel diff {:e}", diff.x_rel_diff));
-                }
-                // A zero-cost solution compares on the absolute scale (cost ≤ 1e-12 both).
-                if diff.cost_rel_diff.is_nan() || diff.cost_rel_diff > COST_REL_TOL {
-                    problems.push(format!("cost rel diff {:e}", diff.cost_rel_diff));
-                }
-                diff.pass = problems.is_empty();
-                diff.reason = problems.join("; ");
+        let scipy = match (&arm.x, arm.cost, &arm.active_mask) {
+            (Some(x), Some(cost), Some(mask)) => Some((x.as_slice(), cost, mask)),
+            _ => None,
+        };
+        match (&fsci, scipy) {
+            (Err(e), _) => diff.reason = format!("fsci error {e}"),
+            (Ok(_), None) => diff.reason = "SciPy produced no result".to_string(),
+            (Ok(_), Some(_)) => {}
+        }
+        // `None` is recorded by the ledger: SciPy gave no result, or fsci returned an error.
+        if let Some(((x, cost, mask), r)) =
+            ledger.both("least_squares_trf", &case.case_id, scipy, fsci.ok())
+        {
+            diff.fsci_status = r.status;
+            diff.fsci_nfev = r.nfev;
+            // The ledger rejects a length mismatch and a NaN coordinate (recording the case);
+            // the zip below would truncate the one and the max fold swallow the other.
+            let x_pair = ledger.slices(
+                "least_squares_trf",
+                &case.case_id,
+                Some(x),
+                Some(r.x.as_slice()),
+            );
+            diff.x_rel_diff = x_pair.map_or(f64::NAN, |(x, fsci_x)| {
+                fsci_x
+                    .iter()
+                    .zip(x)
+                    .map(|(a, b)| (a - b).abs() / b.abs().max(1e-6))
+                    .fold(0.0, f64::max)
+            });
+            diff.cost_rel_diff = (r.cost - cost).abs() / cost.abs().max(1e-12);
+            let mut problems = Vec::new();
+            if r.status != diff.scipy_status {
+                problems.push(format!("status {} vs {}", r.status, diff.scipy_status));
             }
-            (Ok(_), ..) => diff.reason = "SciPy produced no result".to_string(),
+            if &r.active_mask != mask {
+                problems.push(format!("active_mask {:?} vs {mask:?}", r.active_mask));
+            }
+            if diff.x_rel_diff.is_nan() || diff.x_rel_diff > X_REL_TOL {
+                problems.push(format!("x rel diff {:e}", diff.x_rel_diff));
+            }
+            // A zero-cost solution compares on the absolute scale (cost ≤ 1e-12 both).
+            if diff.cost_rel_diff.is_nan() || diff.cost_rel_diff > COST_REL_TOL {
+                problems.push(format!("cost rel diff {:e}", diff.cost_rel_diff));
+            }
+            diff.pass = problems.is_empty();
+            diff.reason = problems.join("; ");
+            if x_pair.is_some() {
+                ledger.compared("least_squares_trf", &case.case_id, diff.pass);
+            }
         }
         diffs.push(diff);
     }
@@ -345,6 +369,7 @@ fn diff_opt_least_squares_trf() {
         test_id: "diff_opt_least_squares_trf".into(),
         category: "scipy.optimize.least_squares(method='trf')".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         same_nfev_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -375,4 +400,5 @@ fn diff_opt_least_squares_trf() {
     );
     assert_eq!(diffs.len(), cases.len(), "every case must be compared");
     assert!(all_pass, "least_squares(trf) vs scipy failed");
+    ledger.finish(cases.len());
 }

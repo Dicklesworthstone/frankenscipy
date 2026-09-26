@@ -9,13 +9,14 @@
 //! scipy.spatial.distance.minkowski uses the current `w_i * |x-y|^p`
 //! convention. Not a defect.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{mahalanobis, seuclidean};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -337,22 +339,30 @@ fn diff_spatial_weighted_distances() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_spatial_weighted_distances",
+        &["seuclidean", "mahalanobis"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
-        };
         let fsci_v = match case.op.as_str() {
-            "seuclidean" => seuclidean(&case.x, &case.y, &case.v),
+            "seuclidean" => Some(seuclidean(&case.x, &case.y, &case.v)),
             "mahalanobis" => {
                 let vi_mat = rows_of(&case.vi, case.n, case.n);
-                mahalanobis(&case.x, &case.y, &vi_mat)
+                Some(mahalanobis(&case.x, &case.y, &vi_mat))
             }
-            _ => continue,
+            // An unknown op is an undeclared arm: the ledger call below panics on it.
+            _ => None,
+        };
+        let Some((expected, fsci_v)) =
+            ledger.pair(&case.op, &case.case_id, scipy_arm.value, fsci_v)
+        else {
+            continue;
         };
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -367,6 +377,7 @@ fn diff_spatial_weighted_distances() {
         test_id: "diff_spatial_weighted_distances".into(),
         category: "scipy.spatial.distance seuclidean + mahalanobis".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -387,4 +398,6 @@ fn diff_spatial_weighted_distances() {
         diffs.len(),
         max_overall
     );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(per_op("seuclidean").min(per_op("mahalanobis")));
 }

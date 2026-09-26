@@ -6,10 +6,12 @@
 //!
 //! Resolves [frankenscipy-nrqqx].
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{
     ToleranceValue, sync_audit_ledger, validate_first_step, validate_first_step_with_audit,
     validate_max_step, validate_max_step_with_audit, validate_tol, validate_tol_with_audit,
@@ -31,6 +33,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -58,11 +61,39 @@ fn emit_log(log: &DiffLog) {
     fs::write(path, json).expect("write log");
 }
 
+/// The reference side is fsci's own non-audit call. A probe labelled `err_*` is designed to be
+/// refused: the plain call refusing there is the reference answer, and the audited call must
+/// refuse too. Anywhere else a failed plain call is a missing reference value and a failed
+/// audited call an fsci failure.
+fn record_equivalence<T: PartialEq, E>(
+    compare: &mut CompareLedger,
+    op: &str,
+    label: &str,
+    case_id: &str,
+    plain: Result<T, E>,
+    audit: Result<T, E>,
+) {
+    match plain {
+        Err(_) if label.starts_with("err_") => {
+            compare.expected_raise(op, case_id, audit.is_err());
+        }
+        plain => {
+            if let Some((p, a)) = compare.both(op, case_id, plain.ok(), audit.ok()) {
+                compare.compared(op, case_id, p == a);
+            }
+        }
+    }
+}
+
 #[test]
 fn diff_integrate_validate_audit_equivalence() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let ledger = sync_audit_ledger();
+    let mut compare = CompareLedger::new(
+        "diff_integrate_validate_audit_equivalence",
+        &["first_step", "max_step", "tol"],
+    );
 
     // validate_first_step probes
     let fs_probes: &[(&str, f64, f64, f64)] = &[
@@ -76,13 +107,15 @@ fn diff_integrate_validate_audit_equivalence() {
     for (label, fs_val, t0, tb) in fs_probes {
         let plain = validate_first_step(*fs_val, *t0, *tb);
         let audit = validate_first_step_with_audit(*fs_val, *t0, *tb, Some(&ledger));
-        let pass = match (plain, audit) {
+        let pass = match (&plain, &audit) {
             (Ok(p), Ok(a)) => p == a,
             (Err(_), Err(_)) => true,
             _ => false,
         };
+        let case_id = format!("first_step_{label}");
+        record_equivalence(&mut compare, "first_step", label, &case_id, plain, audit);
         diffs.push(CaseDiff {
-            case_id: format!("first_step_{label}"),
+            case_id,
             op: "first_step".into(),
             pass,
         });
@@ -99,13 +132,15 @@ fn diff_integrate_validate_audit_equivalence() {
     for (label, ms_val) in ms_probes {
         let plain = validate_max_step(*ms_val);
         let audit = validate_max_step_with_audit(*ms_val, Some(&ledger));
-        let pass = match (plain, audit) {
+        let pass = match (&plain, &audit) {
             (Ok(p), Ok(a)) => p == a,
             (Err(_), Err(_)) => true,
             _ => false,
         };
+        let case_id = format!("max_step_{label}");
+        record_equivalence(&mut compare, "max_step", label, &case_id, plain, audit);
         diffs.push(CaseDiff {
-            case_id: format!("max_step_{label}"),
+            case_id,
             op: "max_step".into(),
             pass,
         });
@@ -145,13 +180,15 @@ fn diff_integrate_validate_audit_equivalence() {
     for (label, rtol, atol, n, mode) in tol_probes {
         let plain = validate_tol(rtol.clone(), atol.clone(), *n, *mode);
         let audit = validate_tol_with_audit(rtol.clone(), atol.clone(), *n, *mode, Some(&ledger));
-        let pass = match (plain, audit) {
+        let pass = match (&plain, &audit) {
             (Ok(p), Ok(a)) => p == a,
             (Err(_), Err(_)) => true,
             _ => false,
         };
+        let case_id = format!("tol_{label}");
+        record_equivalence(&mut compare, "tol", label, &case_id, plain, audit);
         diffs.push(CaseDiff {
-            case_id: format!("tol_{label}"),
+            case_id,
             op: "tol".into(),
             pass,
         });
@@ -163,6 +200,7 @@ fn diff_integrate_validate_audit_equivalence() {
         test_id: "diff_integrate_validate_audit_equivalence".into(),
         category: "fsci_integrate validation audit variants equivalent to non-audit".into(),
         case_count: diffs.len(),
+        compared: compare.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -181,4 +219,5 @@ fn diff_integrate_validate_audit_equivalence() {
         "validate_audit_equiv conformance failed: {} cases",
         diffs.len(),
     );
+    compare.finish(fs_probes.len().min(ms_probes.len()).min(tol_probes.len()));
 }

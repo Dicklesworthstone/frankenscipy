@@ -15,6 +15,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_linalg::{DecompOptions, eigvals, funm_with_error};
 use serde::{Deserialize, Serialize};
 
@@ -118,7 +119,7 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-fn fsci_funm(a: &[Vec<f64>], func: &str) -> (Vec<Vec<f64>>, f64) {
+fn fsci_funm(a: &[Vec<f64>], func: &str) -> Option<(Vec<Vec<f64>>, f64)> {
     let options = DecompOptions::default();
     let out = match func {
         "exp" => funm_with_error(a, |z| z.exp(), options),
@@ -127,7 +128,7 @@ fn fsci_funm(a: &[Vec<f64>], func: &str) -> (Vec<Vec<f64>>, f64) {
         "poly" => funm_with_error(a, |z| z * z * z - z * 2.0 + 1.0, options),
         other => unreachable!("FUNCS has no {other}"),
     };
-    out.expect("funm_with_error")
+    out.ok()
 }
 
 fn rel_diff(got: &[Vec<f64>], want: &[Vec<f64>]) -> f64 {
@@ -224,33 +225,54 @@ fn diff_linalg_funm_complex() {
     let flag = 1000.0 * f64::EPSILON;
     let mut compared = 0;
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new("diff_linalg_funm_complex", &FUNCS);
     for row in &rows {
         let case = cases
             .iter()
             .find(|c| c.case_id == row.case_id)
             .expect("case");
-        let (fsci, err) = fsci_funm(&case.a, &row.func);
-        let scipy = row
-            .funm
-            .as_ref()
-            .expect("SciPy's funm is real for these cases");
+        // SciPy's funm is real for these cases; a complex result arrives as null.
+        let Some((scipy, (fsci, err))) = ledger.both(
+            &row.func,
+            &row.case_id,
+            row.funm.as_ref(),
+            fsci_funm(&case.a, &row.func),
+        ) else {
+            continue;
+        };
+        // A NaN entry vanishes in rel_diff's max fold, so check the flattened matrices.
+        let (scipy_flat, fsci_flat) = (scipy.concat(), fsci.concat());
+        let Some(_) = ledger.slices(
+            &row.func,
+            &row.case_id,
+            Some(scipy_flat.as_slice()),
+            Some(fsci_flat.as_slice()),
+        ) else {
+            continue;
+        };
+        // A NaN error estimate compares false both ways and would pass every flag check below.
+        let Some((_, err)) = ledger.pair(&row.func, &row.case_id, Some(row.funm_err), Some(err))
+        else {
+            continue;
+        };
         let vs_funm = rel_diff(&fsci, scipy);
         let vs_reference = rel_diff(&fsci, &row.reference);
         println!(
             "{}/{}: pairs {} | vs SciPy funm {vs_funm:.2e} | vs SciPy dedicated {vs_reference:.2e} | err fsci {err:.2e} SciPy {:.2e}",
             row.case_id, row.func, row.complex_pairs, row.funm_err
         );
-        if row.case_id == "jordan2" {
+        let failed = if row.case_id == "jordan2" {
             // The recurrence cannot resolve it: agree with SciPy's funm (not expm), and say so.
-            if vs_funm > FUNM_REL_TOL || err < row.funm_err || err <= flag {
-                failures.push(format!("{}/{}", row.case_id, row.func));
-            }
-        } else if vs_funm > FUNM_REL_TOL
-            || vs_reference > FUNM_REL_TOL
-            || (err > flag) != (row.funm_err > flag)
-        {
+            vs_funm > FUNM_REL_TOL || err < row.funm_err || err <= flag
+        } else {
+            vs_funm > FUNM_REL_TOL
+                || vs_reference > FUNM_REL_TOL
+                || (err > flag) != (row.funm_err > flag)
+        };
+        if failed {
             failures.push(format!("{}/{}", row.case_id, row.func));
         }
+        ledger.compared(&row.func, &row.case_id, !failed);
         compared += 1;
     }
     let random = rows
@@ -262,9 +284,26 @@ fn diff_linalg_funm_complex() {
         "SciPy sees {} complex pairs in the random case",
         random.complex_pairs
     );
-    assert_eq!(compared, expected_rows);
+    assert_eq!(
+        compared,
+        expected_rows,
+        "every row must be compared; {}",
+        ledger.verdict(1, false).err().unwrap_or_default()
+    );
     assert!(
         failures.is_empty(),
         "funm disagrees with SciPy: {failures:?}"
     );
+    // Every function is designed to be compared on each case that lists it.
+    let min_per_arm = FUNCS
+        .iter()
+        .map(|f| {
+            cases
+                .iter()
+                .filter(|c| c.funcs.iter().any(|g| g.as_str() == *f))
+                .count()
+        })
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_arm);
 }

@@ -5,7 +5,7 @@
 //! and `nbdtrin`, the inverse-with-respect-to-shape variants adjacent to the
 //! existing binomial and negative-binomial CDF helpers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fs;
 use std::io::{Error as IoError, Write};
@@ -13,12 +13,15 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{bdtrik, bdtrin, nbdtrik, nbdtrin};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 const BINOMIAL_INVERSE_TOL: f64 = 2.0e-6;
+/// One ledger arm per SciPy function compared.
+const ARMS: [&str; 4] = ["bdtrik", "bdtrin", "nbdtrik", "nbdtrin"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -59,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -90,6 +94,7 @@ fn timestamp_ms() -> u128 {
 }
 
 fn fsci_eval(func: &str, a: f64, b: f64, c: f64) -> Option<f64> {
+    // A non-finite value is returned as is: the ledger classifies it against SciPy's.
     let value = match func {
         "bdtrik" => bdtrik(a, b, c),
         "bdtrin" => bdtrin(a, b, c),
@@ -97,7 +102,7 @@ fn fsci_eval(func: &str, a: f64, b: f64, c: f64) -> Option<f64> {
         "nbdtrin" => nbdtrin(a, b, c),
         _ => return None,
     };
-    value.is_finite().then_some(value)
+    Some(value)
 }
 
 fn generate_query() -> OracleQuery {
@@ -238,28 +243,35 @@ fn diff_special_binomial_inverses() -> Result<(), Box<dyn Error>> {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_binomial_inverses", &ARMS);
 
     for case in &query.points {
         let oracle = pmap
             .get(&case.case_id)
             .ok_or_else(|| test_error(format!("missing oracle point {}", case.case_id)))?;
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.a, case.b, case.c)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let pass = abs_diff <= BINOMIAL_INVERSE_TOL * scale;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.a, case.b, case.c),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let pass = abs_diff <= BINOMIAL_INVERSE_TOL * scale;
+        ledger.compared(arm, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -267,6 +279,7 @@ fn diff_special_binomial_inverses() -> Result<(), Box<dyn Error>> {
         test_id: "diff_special_binomial_inverses".into(),
         category: "scipy.special bdtrik/bdtrin/nbdtrik/nbdtrin".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -294,5 +307,12 @@ fn diff_special_binomial_inverses() -> Result<(), Box<dyn Error>> {
         )));
     }
 
+    // Arms have different case sets; each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
     Ok(())
 }

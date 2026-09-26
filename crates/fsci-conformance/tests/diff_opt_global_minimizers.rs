@@ -12,10 +12,12 @@
 //! as defect frankenscipy-p8c1x (returns f ≈ 18 for x²+y² on
 //! [-5,5]², far from the true minimum of 0).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{BasinhoppingOptions, basinhopping, shgo};
 use serde::Serialize;
 
@@ -35,6 +37,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -86,50 +89,56 @@ fn diff_opt_global_minimizers() {
         minimizer_tol: Some(1e-8),
     };
 
-    // basinhopping(quadratic, x0=[5,5]) → expect f ≈ 0
-    if let Ok(res) = basinhopping(quadratic, &[5.0, 5.0], bh_opts.clone()) {
-        let f = res.fun.unwrap_or(f64::INFINITY);
-        max_overall = max_overall.max(f);
-        diffs.push(CaseDiff {
-            case_id: "bh_quad".into(),
-            op: "basinhopping".into(),
-            abs_diff: f,
-            pass: f <= TOL,
-        });
-    }
-    // basinhopping(shifted_quadratic, x0=[10,10]) → expect f ≈ 0 at x=[1,-2]
-    if let Ok(res) = basinhopping(shifted_quadratic, &[10.0, 10.0], bh_opts) {
-        let f = res.fun.unwrap_or(f64::INFINITY);
-        max_overall = max_overall.max(f);
-        diffs.push(CaseDiff {
-            case_id: "bh_shifted".into(),
-            op: "basinhopping".into(),
-            abs_diff: f,
-            pass: f <= TOL,
-        });
-    }
+    // (case id, op, fsci's minimum value). Both objectives have the analytic global minimum 0,
+    // which is the reference side of every case.
+    let cases: [(&str, &str, Option<f64>); 4] = [
+        // basinhopping(quadratic, x0=[5,5]) → expect f ≈ 0
+        (
+            "bh_quad",
+            "basinhopping",
+            basinhopping(quadratic, &[5.0, 5.0], bh_opts.clone())
+                .ok()
+                .and_then(|res| res.fun),
+        ),
+        // basinhopping(shifted_quadratic, x0=[10,10]) → expect f ≈ 0 at x=[1,-2]
+        (
+            "bh_shifted",
+            "basinhopping",
+            basinhopping(shifted_quadratic, &[10.0, 10.0], bh_opts)
+                .ok()
+                .and_then(|res| res.fun),
+        ),
+        // dual_annealing — dropped (defect frankenscipy-p8c1x: fails to
+        // converge on simple quadratic; returns f ≈ 18 for x²+y² on
+        // [-5,5]²).
 
-    // dual_annealing — dropped (defect frankenscipy-p8c1x: fails to
-    // converge on simple quadratic; returns f ≈ 18 for x²+y² on
-    // [-5,5]²).
+        // shgo — bounded simplicial homology global optimization
+        (
+            "shgo_quad",
+            "shgo",
+            shgo(quadratic, &[(-5.0, 5.0), (-5.0, 5.0)])
+                .ok()
+                .and_then(|res| res.fun),
+        ),
+        (
+            "shgo_shifted",
+            "shgo",
+            shgo(shifted_quadratic, &[(-5.0, 5.0), (-5.0, 5.0)])
+                .ok()
+                .and_then(|res| res.fun),
+        ),
+    ];
+    let mut ledger = CompareLedger::new("diff_opt_global_minimizers", &["basinhopping", "shgo"]);
 
-    // shgo — bounded simplicial homology global optimization
-    if let Ok(res) = shgo(quadratic, &[(-5.0, 5.0), (-5.0, 5.0)]) {
-        let f = res.fun.unwrap_or(f64::INFINITY);
+    for &(case_id, op, fsci_fun) in &cases {
+        let Some((_true_min, f)) = ledger.pair(op, case_id, Some(0.0), fsci_fun) else {
+            continue;
+        };
         max_overall = max_overall.max(f);
+        ledger.compared(op, case_id, f <= TOL);
         diffs.push(CaseDiff {
-            case_id: "shgo_quad".into(),
-            op: "shgo".into(),
-            abs_diff: f,
-            pass: f <= TOL,
-        });
-    }
-    if let Ok(res) = shgo(shifted_quadratic, &[(-5.0, 5.0), (-5.0, 5.0)]) {
-        let f = res.fun.unwrap_or(f64::INFINITY);
-        max_overall = max_overall.max(f);
-        diffs.push(CaseDiff {
-            case_id: "shgo_shifted".into(),
-            op: "shgo".into(),
+            case_id: case_id.into(),
+            op: op.into(),
             abs_diff: f,
             pass: f <= TOL,
         });
@@ -141,6 +150,7 @@ fn diff_opt_global_minimizers() {
         test_id: "diff_opt_global_minimizers".into(),
         category: "fsci_opt::{basinhopping, dual_annealing, shgo} property test".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -161,4 +171,5 @@ fn diff_opt_global_minimizers() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.iter().filter(|(_, op, _)| *op == "shgo").count());
 }

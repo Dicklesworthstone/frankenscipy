@@ -12,12 +12,14 @@
 //! `diff_opt_lbfgsb_scipy_path` (frankenscipy-1ksfv.18) compares the PATH, live: 18 cases against
 //! SciPy's L-BFGS-B 3.0 per evaluation — see its section comment for the kernel-spread rules.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::types::Bound;
 use fsci_opt::{MinimizeOptions, lbfgsb};
 use serde::{Deserialize, Serialize};
@@ -38,6 +40,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -146,51 +149,73 @@ fn diff_opt_lbfgsb_minimize() {
         ..MinimizeOptions::default()
     };
 
+    // `None` only when python3/SciPy is unavailable and FSCI_REQUIRE_SCIPY_ORACLE is unset (the
+    // oracle asserts otherwise); the SciPy arm is then not declared, the way every other live test
+    // skips without its oracle. The analytic arm compares against the known minimizers.
+    let scipy = scipy_oracle_rosen_lbfgsb_or_skip();
+    let arms: &[&str] = if scipy.is_some() {
+        &["analytic", "scipy"]
+    } else {
+        &["analytic"]
+    };
+    let mut ledger = CompareLedger::new("diff_opt_lbfgsb_minimize", arms);
+
     // === 1. Unconstrained scalar quadratic: minimize (x - 3)² → x = 3 ===
     {
+        let id = "unconstrained_scalar_quadratic_finds_3";
         let f = |x: &[f64]| (x[0] - 3.0).powi(2);
-        let r = lbfgsb(&f, &[0.0], opts, None).expect("scalar quadratic");
-        check(
-            "unconstrained_scalar_quadratic_finds_3",
-            (r.x[0] - 3.0).abs() < ABS_TOL,
-            format!("x={:?}", r.x),
-        );
+        let x = lbfgsb(&f, &[0.0], opts, None).ok().map(|r| r.x);
+        let fsci = x.as_ref().and_then(|x| x.first().copied());
+        if let Some((want, got)) = ledger.pair("analytic", id, Some(3.0), fsci) {
+            let ok = (got - want).abs() < ABS_TOL;
+            ledger.compared("analytic", id, ok);
+            check(id, ok, format!("x={:?}", x.unwrap_or_default()));
+        }
     }
 
     // === 2. Bounded scalar: minimize (x - 5)² with x ∈ [0, 2] → x = 2 ===
     {
+        let id = "bounded_clipped_to_upper";
         let f = |x: &[f64]| (x[0] - 5.0).powi(2);
         let bounds: [Bound; 1] = [(Some(0.0), Some(2.0))];
-        let r = lbfgsb(&f, &[1.0], opts, Some(&bounds)).expect("bounded scalar");
-        check(
-            "bounded_clipped_to_upper",
-            (r.x[0] - 2.0).abs() < ABS_TOL,
-            format!("x={:?}", r.x),
-        );
+        let x = lbfgsb(&f, &[1.0], opts, Some(&bounds)).ok().map(|r| r.x);
+        let fsci = x.as_ref().and_then(|x| x.first().copied());
+        if let Some((want, got)) = ledger.pair("analytic", id, Some(2.0), fsci) {
+            let ok = (got - want).abs() < ABS_TOL;
+            ledger.compared("analytic", id, ok);
+            check(id, ok, format!("x={:?}", x.unwrap_or_default()));
+        }
     }
 
     // === 3. Bounded scalar: minimize (x + 5)² with x ∈ [0, 2] → x = 0 ===
     {
+        let id = "bounded_clipped_to_lower";
         let f = |x: &[f64]| (x[0] + 5.0).powi(2);
         let bounds: [Bound; 1] = [(Some(0.0), Some(2.0))];
-        let r = lbfgsb(&f, &[1.0], opts, Some(&bounds)).expect("bounded scalar");
-        check(
-            "bounded_clipped_to_lower",
-            (r.x[0]).abs() < ABS_TOL,
-            format!("x={:?}", r.x),
-        );
+        let x = lbfgsb(&f, &[1.0], opts, Some(&bounds)).ok().map(|r| r.x);
+        let fsci = x.as_ref().and_then(|x| x.first().copied());
+        if let Some((want, got)) = ledger.pair("analytic", id, Some(0.0), fsci) {
+            let ok = (got - want).abs() < ABS_TOL;
+            ledger.compared("analytic", id, ok);
+            check(id, ok, format!("x={:?}", x.unwrap_or_default()));
+        }
     }
 
     // === 4. Multivariate sum of squares: minimize Σ x_i² → x = 0 ===
     {
+        let id = "multivariate_sum_of_squares_to_origin";
         let f = |x: &[f64]| x.iter().map(|v| v.powi(2)).sum::<f64>();
-        let r = lbfgsb(&f, &[1.0, -2.0, 3.0, -0.5], opts, None).expect("sum sq");
-        let max_abs = r.x.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-        check(
-            "multivariate_sum_of_squares_to_origin",
-            max_abs < ABS_TOL,
-            format!("x={:?}", r.x),
-        );
+        let x = lbfgsb(&f, &[1.0, -2.0, 3.0, -0.5], opts, None)
+            .ok()
+            .map(|r| r.x);
+        let origin = [0.0_f64; 4];
+        // The ledger rejects a NaN coordinate, which the max fold below would swallow.
+        if let Some((_, got)) = ledger.slices("analytic", id, Some(origin.as_slice()), x.as_deref())
+        {
+            let max_abs = got.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+            ledger.compared("analytic", id, max_abs < ABS_TOL);
+            check(id, max_abs < ABS_TOL, format!("x={got:?}"));
+        }
     }
 
     // === 5. scipy parity: Rosenbrock at standard init point ===
@@ -200,38 +225,45 @@ fn diff_opt_lbfgsb_minimize() {
                 .map(|i| 100.0 * (x[i + 1] - x[i].powi(2)).powi(2) + (1.0 - x[i]).powi(2))
                 .sum()
         };
-        let fsci_r = lbfgsb(&rosen, &[-1.2, 1.0], opts, None).expect("rosen");
-        let fsci_close = (fsci_r.x[0] - 1.0).abs() < 1.0e-3 && (fsci_r.x[1] - 1.0).abs() < 1.0e-3;
-        check(
-            "rosenbrock_fsci_converges_near_one",
-            fsci_close,
-            format!("x={:?} fun={:?}", fsci_r.x, fsci_r.fun),
-        );
-
-        if let Some(scipy) = scipy_oracle_rosen_lbfgsb_or_skip()
-            && scipy.converged
-            && let Some(scipy_x) = scipy.x.as_ref()
-        {
-            let close_to_scipy = (fsci_r.x[0] - scipy_x[0]).abs() < 1.0e-3
-                && (fsci_r.x[1] - scipy_x[1]).abs() < 1.0e-3;
+        let fsci_r = lbfgsb(&rosen, &[-1.2, 1.0], opts, None).ok();
+        let fsci_x = fsci_r.as_ref().map(|r| r.x.as_slice());
+        let id = "rosenbrock_fsci_converges_near_one";
+        let ones = [1.0_f64, 1.0];
+        if let Some((_, x)) = ledger.slices("analytic", id, Some(ones.as_slice()), fsci_x) {
+            let fsci_close = (x[0] - 1.0).abs() < 1.0e-3 && (x[1] - 1.0).abs() < 1.0e-3;
+            ledger.compared("analytic", id, fsci_close);
             check(
-                "rosenbrock_close_to_scipy",
-                close_to_scipy,
-                format!("fsci={:?} scipy={:?}", fsci_r.x, scipy_x),
+                id,
+                fsci_close,
+                format!("x={:?} fun={:?}", x, fsci_r.as_ref().and_then(|r| r.fun)),
             );
+        }
+
+        if let Some(scipy) = &scipy {
+            let id = "rosenbrock_close_to_scipy";
+            // SciPy reports x only when it converged; otherwise the case is `oracle_missing`.
+            let scipy_x = scipy.x.as_deref().filter(|_| scipy.converged);
+            if let Some((scipy_x, x)) = ledger.slices("scipy", id, scipy_x, fsci_x) {
+                let close_to_scipy =
+                    (x[0] - scipy_x[0]).abs() < 1.0e-3 && (x[1] - scipy_x[1]).abs() < 1.0e-3;
+                ledger.compared("scipy", id, close_to_scipy);
+                check(id, close_to_scipy, format!("fsci={x:?} scipy={scipy_x:?}"));
+            }
         }
     }
 
     // === 6. Bounds-with-x0-outside: x0 = -1.0 outside bounds [0, 5] should be projected ===
     {
+        let id = "x0_outside_bounds_projected_then_solved";
         let f = |x: &[f64]| (x[0] - 2.0).powi(2);
         let bounds: [Bound; 1] = [(Some(0.0), Some(5.0))];
-        let r = lbfgsb(&f, &[-1.0], opts, Some(&bounds)).expect("projected x0");
-        check(
-            "x0_outside_bounds_projected_then_solved",
-            (r.x[0] - 2.0).abs() < ABS_TOL,
-            format!("x={:?}", r.x),
-        );
+        let x = lbfgsb(&f, &[-1.0], opts, Some(&bounds)).ok().map(|r| r.x);
+        let fsci = x.as_ref().and_then(|x| x.first().copied());
+        if let Some((want, got)) = ledger.pair("analytic", id, Some(2.0), fsci) {
+            let ok = (got - want).abs() < ABS_TOL;
+            ledger.compared("analytic", id, ok);
+            check(id, ok, format!("x={:?}", x.unwrap_or_default()));
+        }
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -239,6 +271,7 @@ fn diff_opt_lbfgsb_minimize() {
         test_id: "diff_opt_lbfgsb_minimize".into(),
         category: "fsci_opt::lbfgsb (L-BFGS-B) coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -253,6 +286,8 @@ fn diff_opt_lbfgsb_minimize() {
     }
 
     assert!(all_pass, "lbfgsb coverage failed: {} cases", diffs.len());
+    // The smaller arm: `scipy` has the one Rosenbrock case (`analytic` has six).
+    ledger.finish(1);
 }
 
 // ════════════════════════════════════════════════════════════════════════════════════════════
@@ -785,6 +820,7 @@ fn diff_opt_lbfgsb_scipy_path() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut exact_paths = 0usize;
+    let mut ledger = CompareLedger::new("diff_opt_lbfgsb_scipy_path", &["lbfgsb"]);
     for case in &cases {
         let arm = &arms[case.id];
         let options = MinimizeOptions {
@@ -795,70 +831,79 @@ fn diff_opt_lbfgsb_scipy_path() {
             ..MinimizeOptions::default()
         };
         let mut reasons = Vec::new();
-        match (
-            lbfgsb(&case.fun, &case.x0, options, Some(&case.bounds)),
-            arm.x.as_ref(),
-            arm.fun,
-            arm.status,
-        ) {
-            (Err(e), ..) => reasons.push(format!("fsci error {e}")),
-            (Ok(_), None, ..) | (Ok(_), _, None, _) | (Ok(_), _, _, None) => {
-                reasons.push("SciPy produced no result".to_string());
+        let fsci = lbfgsb(&case.fun, &case.x0, options, Some(&case.bounds))
+            .inspect_err(|e| reasons.push(format!("fsci error {e}")))
+            .ok();
+        let scipy = match (arm.x.as_deref(), arm.fun, arm.status) {
+            (Some(scipy_x), Some(scipy_fun), Some(scipy_status)) => {
+                Some((scipy_x, scipy_fun, scipy_status))
             }
-            (Ok(r), Some(scipy_x), Some(scipy_fun), Some(scipy_status)) => {
-                let fsci_counts = (r.nit, r.nfev, r.njev);
-                let scipy_counts = (
-                    arm.nit.unwrap_or(0),
-                    arm.nfev.unwrap_or(0),
-                    arm.njev.unwrap_or(0),
-                );
-                let status = lbfgsb_scipy_status(r.status);
-                if !case.statuses.contains(&status) || (case.invariant && status != scipy_status) {
+            _ => None,
+        };
+        if fsci.is_some() && scipy.is_none() {
+            reasons.push("SciPy produced no result".to_string());
+        }
+        // `None` is recorded by the ledger: SciPy gave no result, or fsci returned an error.
+        if let Some(((scipy_x, scipy_fun, scipy_status), r)) =
+            ledger.both("lbfgsb", case.id, scipy, fsci)
+        {
+            let fsci_counts = (r.nit, r.nfev, r.njev);
+            let scipy_counts = (
+                arm.nit.unwrap_or(0),
+                arm.nfev.unwrap_or(0),
+                arm.njev.unwrap_or(0),
+            );
+            let status = lbfgsb_scipy_status(r.status);
+            if !case.statuses.contains(&status) || (case.invariant && status != scipy_status) {
+                reasons.push(format!(
+                    "status {status} vs SciPy {scipy_status} (kernel statuses {:?})",
+                    case.statuses
+                ));
+            }
+            // The ledger rejects a length mismatch and a NaN coordinate (recording the case),
+            // which the max fold below would otherwise read as agreement.
+            let x_pair = ledger.slices("lbfgsb", case.id, Some(scipy_x), Some(r.x.as_slice()));
+            let dx = x_pair.map_or(f64::NAN, |(scipy_x, fsci_x)| {
+                fsci_x
+                    .iter()
+                    .zip(scipy_x)
+                    .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+                    .fold(0.0, f64::max)
+            });
+            // NaN in any measure fails the case.
+            if !(dx <= case.x_tol) {
+                reasons.push(format!("x rel diff {dx:e} > {:e}", case.x_tol));
+            }
+            let fun = r.fun.unwrap_or(f64::NAN);
+            let dfun = (fun - scipy_fun).abs();
+            if !(dfun <= case.fun_tol * scipy_fun.abs().max(1.0)) {
+                reasons.push(format!("fun {fun:e} vs SciPy {scipy_fun:e}"));
+            }
+            if case.invariant {
+                if fsci_counts != scipy_counts {
                     reasons.push(format!(
-                        "status {status} vs SciPy {scipy_status} (kernel statuses {:?})",
-                        case.statuses
+                        "(nit, nfev, njev) {fsci_counts:?} vs SciPy {scipy_counts:?}"
                     ));
                 }
-                let dx = if r.x.len() == scipy_x.len() {
-                    r.x.iter()
-                        .zip(scipy_x)
-                        .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
-                        .fold(0.0, f64::max)
-                } else {
-                    f64::NAN
-                };
-                // NaN in any measure fails the case.
-                if !(dx <= case.x_tol) {
-                    reasons.push(format!("x rel diff {dx:e} > {:e}", case.x_tol));
+            } else {
+                let slack = (3 * scipy_counts.0).div_ceil(10);
+                let (lo, hi) = case.nit_range;
+                let in_range =
+                    (lo as f64) * 0.7 <= r.nit as f64 && r.nit as f64 <= (hi as f64) * 1.3;
+                if r.nit.abs_diff(scipy_counts.0) > slack && !in_range {
+                    reasons.push(format!("nit {} vs SciPy {}", r.nit, scipy_counts.0));
                 }
-                let fun = r.fun.unwrap_or(f64::NAN);
-                let dfun = (fun - scipy_fun).abs();
-                if !(dfun <= case.fun_tol * scipy_fun.abs().max(1.0)) {
-                    reasons.push(format!("fun {fun:e} vs SciPy {scipy_fun:e}"));
-                }
-                if case.invariant {
-                    if fsci_counts != scipy_counts {
-                        reasons.push(format!(
-                            "(nit, nfev, njev) {fsci_counts:?} vs SciPy {scipy_counts:?}"
-                        ));
-                    }
-                } else {
-                    let slack = (3 * scipy_counts.0).div_ceil(10);
-                    let (lo, hi) = case.nit_range;
-                    let in_range =
-                        (lo as f64) * 0.7 <= r.nit as f64 && r.nit as f64 <= (hi as f64) * 1.3;
-                    if r.nit.abs_diff(scipy_counts.0) > slack && !in_range {
-                        reasons.push(format!("nit {} vs SciPy {}", r.nit, scipy_counts.0));
-                    }
-                }
-                if reasons.is_empty() && fsci_counts == scipy_counts {
-                    exact_paths += 1;
-                }
-                println!(
-                    "{}: fsci {:?} {fsci_counts:?} fun={fun:e} | scipy {scipy_status} \
+            }
+            if reasons.is_empty() && fsci_counts == scipy_counts {
+                exact_paths += 1;
+            }
+            println!(
+                "{}: fsci {:?} {fsci_counts:?} fun={fun:e} | scipy {scipy_status} \
                      {scipy_counts:?} fun={scipy_fun:e} | x rel {dx:e}",
-                    case.id, r.status
-                );
+                case.id, r.status
+            );
+            if x_pair.is_some() {
+                ledger.compared("lbfgsb", case.id, reasons.is_empty());
             }
         }
         diffs.push(CaseDiff {
@@ -873,6 +918,7 @@ fn diff_opt_lbfgsb_scipy_path() {
         test_id: "diff_opt_lbfgsb_scipy_path".into(),
         category: "scipy.optimize.minimize(method='L-BFGS-B') path, live".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -886,4 +932,5 @@ fn diff_opt_lbfgsb_scipy_path() {
     for d in &diffs {
         assert!(d.pass, "{}: {}", d.case_id, d.note);
     }
+    ledger.finish(cases.len());
 }

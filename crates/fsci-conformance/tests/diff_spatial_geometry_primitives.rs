@@ -11,13 +11,14 @@
 //!
 //! 4 fixtures × 4 functions = 16 cases. Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{centroid, diameter, medoid, spread};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -247,18 +249,27 @@ fn diff_spatial_geometry_primitives() {
 
     let start = Instant::now();
     let mut cases = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_spatial_geometry_primitives",
+        &["centroid", "medoid", "diameter", "spread"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
 
-        // centroid
-        if let Some(scipy_c) = scipy_arm.centroid.as_ref() {
-            let rust_c = centroid(&case.points);
-            let pass = rust_c.len() == scipy_c.len()
-                && rust_c
-                    .iter()
-                    .zip(scipy_c.iter())
-                    .all(|(r, s)| (r - s).abs() <= ABS_TOL);
+        // centroid. slices rejects a length mismatch and a non-finite fsci component.
+        let rust_c = centroid(&case.points);
+        if let Some((scipy_c, rust_c)) = ledger.slices(
+            "centroid",
+            &case.case_id,
+            scipy_arm.centroid.as_deref(),
+            Some(rust_c.as_slice()),
+        ) {
+            let pass = rust_c
+                .iter()
+                .zip(scipy_c.iter())
+                .all(|(r, s)| (r - s).abs() <= ABS_TOL);
+            ledger.compared("centroid", &case.case_id, pass);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "centroid".into(),
@@ -268,21 +279,31 @@ fn diff_spatial_geometry_primitives() {
         }
 
         // medoid
-        if let Some(scipy_m) = scipy_arm.medoid
-            && let Some(rust_m) = medoid(&case.points)
-        {
+        if let Some((scipy_m, rust_m)) = ledger.both(
+            "medoid",
+            &case.case_id,
+            scipy_arm.medoid,
+            medoid(&case.points),
+        ) {
+            let pass = rust_m as i64 == scipy_m;
+            ledger.compared("medoid", &case.case_id, pass);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "medoid".into(),
                 detail: format!("rust={rust_m}, scipy={scipy_m}"),
-                pass: rust_m as i64 == scipy_m,
+                pass,
             });
         }
 
         // diameter
-        if let Some(scipy_d) = scipy_arm.diameter {
-            let rust_d = diameter(&case.points);
+        if let Some((scipy_d, rust_d)) = ledger.pair(
+            "diameter",
+            &case.case_id,
+            scipy_arm.diameter,
+            Some(diameter(&case.points)),
+        ) {
             let abs_diff = (rust_d - scipy_d).abs();
+            ledger.compared("diameter", &case.case_id, abs_diff <= ABS_TOL);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "diameter".into(),
@@ -292,9 +313,14 @@ fn diff_spatial_geometry_primitives() {
         }
 
         // spread
-        if let Some(scipy_s) = scipy_arm.spread {
-            let rust_s = spread(&case.points);
+        if let Some((scipy_s, rust_s)) = ledger.pair(
+            "spread",
+            &case.case_id,
+            scipy_arm.spread,
+            Some(spread(&case.points)),
+        ) {
             let abs_diff = (rust_s - scipy_s).abs();
+            ledger.compared("spread", &case.case_id, abs_diff <= ABS_TOL);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "spread".into(),
@@ -311,6 +337,7 @@ fn diff_spatial_geometry_primitives() {
         test_id: "diff_spatial_geometry_primitives".into(),
         category: "fsci_spatial::{centroid,medoid,diameter,spread}".into(),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -335,4 +362,5 @@ fn diff_spatial_geometry_primitives() {
         pass_count,
         cases.len()
     );
+    ledger.finish(query.points.len());
 }

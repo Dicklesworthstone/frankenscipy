@@ -14,6 +14,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_signal::remez;
 use serde::{Deserialize, Serialize};
 
@@ -234,11 +235,37 @@ fn diff_signal_remez_even() {
     let (mut compared, mut both_designed, mut both_refused) = (0, 0, 0);
     let mut worst = (0.0_f64, 0usize);
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new("diff_signal_remez_even", &["remez"]);
     for (i, (spec, answer)) in specs.iter().zip(&answers).enumerate() {
+        let case_id = format!("spec_{i}");
         let fsci = remez(spec.numtaps, &spec.bands, &spec.desired, Some(&spec.weight));
         compared += 1;
-        match (&fsci, &answer.taps) {
-            (Ok(taps), Some(want)) => {
+        match &answer.taps {
+            None => {
+                // SciPy refused: its exchange raises on many of the arbitrary specs (see
+                // `arbitrary_specs`), and the rule is that fsci then refuses too.
+                ledger.expected_raise("remez", &case_id, fsci.is_err());
+                if fsci.is_err() {
+                    both_refused += 1;
+                } else {
+                    failures.push(format!(
+                        "spec {i} (numtaps {}, bands {:?}): fsci designed, SciPy refused: {:?}",
+                        spec.numtaps, spec.bands, answer.error
+                    ));
+                }
+            }
+            Some(want) => {
+                let Some((want, taps)) =
+                    ledger.both("remez", &case_id, Some(want), fsci.as_ref().ok())
+                else {
+                    failures.push(format!(
+                        "spec {i} (numtaps {}, bands {:?}): SciPy designed, fsci refused: {:?}",
+                        spec.numtaps,
+                        spec.bands,
+                        fsci.as_ref().err()
+                    ));
+                    continue;
+                };
                 both_designed += 1;
                 // Non-finite taps must sit at the same positions on both sides.
                 let same_finiteness = taps.len() == want.len()
@@ -260,7 +287,9 @@ fn diff_signal_remez_even() {
                 if err > worst.0 || err.is_nan() {
                     worst = (err, i);
                 }
-                if !same_finiteness || err.is_nan() || err > REMEZ_TAP_TOL {
+                let failed = !same_finiteness || err.is_nan() || err > REMEZ_TAP_TOL;
+                ledger.compared("remez", &case_id, !failed);
+                if failed {
                     let want: Vec<f64> = want.iter().map(|b| b.unwrap_or(f64::NAN)).collect();
                     // Which design is the minimax one? The smaller max weighted band error wins.
                     failures.push(format!(
@@ -274,15 +303,6 @@ fn diff_signal_remez_even() {
                     ));
                 }
             }
-            (Err(_), None) => both_refused += 1,
-            (Ok(_), None) => failures.push(format!(
-                "spec {i} (numtaps {}, bands {:?}): fsci designed, SciPy refused: {:?}",
-                spec.numtaps, spec.bands, answer.error
-            )),
-            (Err(e), Some(_)) => failures.push(format!(
-                "spec {i} (numtaps {}, bands {:?}): SciPy designed, fsci refused: {e:?}",
-                spec.numtaps, spec.bands
-            )),
         }
     }
     let even = specs.iter().filter(|s| s.numtaps.is_multiple_of(2)).count();
@@ -304,4 +324,5 @@ fn diff_signal_remez_even() {
         failures.len(),
         failures.join("\n")
     );
+    ledger.finish(specs.len());
 }

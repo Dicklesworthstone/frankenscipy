@@ -9,11 +9,15 @@
 //!   * Cheby1/Elliptic without rp → error
 //!   * Cheby2/Elliptic without rs → error
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_signal::{FilterType, IirFamily, bessel, butter, cheby1, cheby2, ellip, iirfilter};
+use fsci_conformance::{ArmCounts, CompareLedger};
+use fsci_signal::{
+    BaCoeffs, FilterType, IirFamily, bessel, butter, cheby1, cheby2, ellip, iirfilter,
+};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -31,6 +35,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -65,6 +70,16 @@ fn max_abs(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// b then a in one vector, so a NaN or a length mismatch goes through the ledger's slice check
+/// instead of vanishing in `max_abs`'s fold; the caller checks the b/a split.
+fn packed(c: Option<&BaCoeffs>) -> Option<Vec<f64>> {
+    c.map(|c| {
+        let mut v = c.b.clone();
+        v.extend(c.a.iter().copied());
+        v
+    })
+}
+
 #[test]
 fn diff_signal_iirfilter_dispatch() {
     let start = Instant::now();
@@ -82,111 +97,106 @@ fn diff_signal_iirfilter_dispatch() {
     let btype = FilterType::Lowpass;
     let rp = 0.5;
     let rs = 40.0;
+    let mut ledger = CompareLedger::new(
+        "diff_signal_iirfilter_dispatch",
+        &["dispatch", "missing_param"],
+    );
 
-    // === Butterworth ===
-    {
-        let direct = butter(order, &wn, btype).expect("butter");
-        let dispatched = iirfilter(order, &wn, btype, IirFamily::Butterworth, None, None)
-            .expect("iirfilter butter");
-        let mab = max_abs(&direct.b, &dispatched.b);
-        let maa = max_abs(&direct.a, &dispatched.a);
-        check(
+    // Each family's dispatched design against its direct designer, which is the reference side:
+    // a direct designer that fails is recorded as a missing reference.
+    let families = [
+        (
             "butterworth_matches_direct",
-            mab <= ABS_TOL && maa <= ABS_TOL,
-            format!("b_max={mab} a_max={maa}"),
-        );
-    }
-
-    // === Chebyshev1 ===
-    {
-        let direct = cheby1(order, rp, &wn, btype).expect("cheby1");
-        let dispatched = iirfilter(order, &wn, btype, IirFamily::Chebyshev1, Some(rp), None)
-            .expect("iirfilter cheby1");
-        let mab = max_abs(&direct.b, &dispatched.b);
-        let maa = max_abs(&direct.a, &dispatched.a);
-        check(
+            IirFamily::Butterworth,
+            None,
+            None,
+            butter(order, &wn, btype).ok(),
+        ),
+        (
             "chebyshev1_matches_direct",
-            mab <= ABS_TOL && maa <= ABS_TOL,
-            format!("b_max={mab} a_max={maa}"),
-        );
-    }
-
-    // === Chebyshev2 ===
-    {
-        let direct = cheby2(order, rs, &wn, btype).expect("cheby2");
-        let dispatched = iirfilter(order, &wn, btype, IirFamily::Chebyshev2, None, Some(rs))
-            .expect("iirfilter cheby2");
-        let mab = max_abs(&direct.b, &dispatched.b);
-        let maa = max_abs(&direct.a, &dispatched.a);
-        check(
+            IirFamily::Chebyshev1,
+            Some(rp),
+            None,
+            cheby1(order, rp, &wn, btype).ok(),
+        ),
+        (
             "chebyshev2_matches_direct",
-            mab <= ABS_TOL && maa <= ABS_TOL,
-            format!("b_max={mab} a_max={maa}"),
-        );
-    }
-
-    // === Bessel ===
-    {
-        let direct = bessel(order, &wn, btype).expect("bessel");
-        let dispatched =
-            iirfilter(order, &wn, btype, IirFamily::Bessel, None, None).expect("iirfilter bessel");
-        let mab = max_abs(&direct.b, &dispatched.b);
-        let maa = max_abs(&direct.a, &dispatched.a);
-        check(
+            IirFamily::Chebyshev2,
+            None,
+            Some(rs),
+            cheby2(order, rs, &wn, btype).ok(),
+        ),
+        (
             "bessel_matches_direct",
-            mab <= ABS_TOL && maa <= ABS_TOL,
-            format!("b_max={mab} a_max={maa}"),
-        );
-    }
-
-    // === Elliptic ===
-    {
-        let direct = ellip(order, rp, rs, &wn, btype).expect("ellip");
-        let dispatched = iirfilter(order, &wn, btype, IirFamily::Elliptic, Some(rp), Some(rs))
-            .expect("iirfilter ellip");
-        let mab = max_abs(&direct.b, &dispatched.b);
-        let maa = max_abs(&direct.a, &dispatched.a);
-        check(
+            IirFamily::Bessel,
+            None,
+            None,
+            bessel(order, &wn, btype).ok(),
+        ),
+        (
             "elliptic_matches_direct",
-            mab <= ABS_TOL && maa <= ABS_TOL,
-            format!("b_max={mab} a_max={maa}"),
-        );
+            IirFamily::Elliptic,
+            Some(rp),
+            Some(rs),
+            ellip(order, rp, rs, &wn, btype).ok(),
+        ),
+    ];
+    let n_families = families.len();
+    for (id, family, family_rp, family_rs, direct) in families {
+        let dispatched = iirfilter(order, &wn, btype, family, family_rp, family_rs).ok();
+        let (direct_v, dispatched_v) = (packed(direct.as_ref()), packed(dispatched.as_ref()));
+        let Some((direct_v, dispatched_v)) =
+            ledger.slices("dispatch", id, direct_v.as_deref(), dispatched_v.as_deref())
+        else {
+            continue;
+        };
+        let nb = direct.as_ref().map_or(0, |c| c.b.len());
+        let (mab, maa) = if dispatched.as_ref().map(|c| c.b.len()) == Some(nb) {
+            (
+                max_abs(&direct_v[..nb], &dispatched_v[..nb]),
+                max_abs(&direct_v[nb..], &dispatched_v[nb..]),
+            )
+        } else {
+            (f64::INFINITY, f64::INFINITY)
+        };
+        let pass = mab <= ABS_TOL && maa <= ABS_TOL;
+        ledger.compared("dispatch", id, pass);
+        check(id, pass, format!("b_max={mab} a_max={maa}"));
     }
 
-    // === Missing-rp errors for cheby1 and elliptic ===
-    {
-        let r = iirfilter(order, &wn, btype, IirFamily::Chebyshev1, None, None);
-        check(
+    // === Missing-rp errors for cheby1 and elliptic; missing-rs errors for cheby2 and elliptic ===
+    // SciPy 1.17.1's iirfilter raises ValueError for each of these too.
+    let missing = [
+        (
             "chebyshev1_missing_rp_errors",
-            r.is_err(),
-            format!("res={r:?}"),
-        );
-    }
-    {
-        let r = iirfilter(order, &wn, btype, IirFamily::Elliptic, None, Some(rs));
-        check(
+            IirFamily::Chebyshev1,
+            None,
+            None,
+        ),
+        (
             "elliptic_missing_rp_errors",
-            r.is_err(),
-            format!("res={r:?}"),
-        );
-    }
-
-    // === Missing-rs errors for cheby2 and elliptic ===
-    {
-        let r = iirfilter(order, &wn, btype, IirFamily::Chebyshev2, None, None);
-        check(
+            IirFamily::Elliptic,
+            None,
+            Some(rs),
+        ),
+        (
             "chebyshev2_missing_rs_errors",
-            r.is_err(),
-            format!("res={r:?}"),
-        );
-    }
-    {
-        let r = iirfilter(order, &wn, btype, IirFamily::Elliptic, Some(rp), None);
-        check(
+            IirFamily::Chebyshev2,
+            None,
+            None,
+        ),
+        (
             "elliptic_missing_rs_errors",
-            r.is_err(),
-            format!("res={r:?}"),
-        );
+            IirFamily::Elliptic,
+            Some(rp),
+            None,
+        ),
+    ];
+    let n_missing = missing.len();
+    for (id, family, family_rp, family_rs) in missing {
+        let r = iirfilter(order, &wn, btype, family, family_rp, family_rs);
+        ledger.expected_raise("missing_param", id, r.is_err());
+        check(id, r.is_err(), format!("res={r:?}"));
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -194,6 +204,7 @@ fn diff_signal_iirfilter_dispatch() {
         test_id: "diff_signal_iirfilter_dispatch".into(),
         category: "fsci_signal::iirfilter dispatch coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -212,4 +223,5 @@ fn diff_signal_iirfilter_dispatch() {
         "iirfilter dispatch coverage failed: {} cases",
         diffs.len()
     );
+    ledger.finish(n_families.min(n_missing));
 }

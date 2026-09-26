@@ -72,14 +72,8 @@ fn max_abs_diff_complex(a: &[Complex64], b: &[Complex64]) -> f64 {
     assert_eq!(a.len(), b.len());
     a.iter()
         .zip(b.iter())
-        .map(|(x, y)| ((x.0 - y.0).abs()).max((x.1 - y.1).abs()))
-        .fold(0.0_f64, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
-            }
-        })
+        .map(|(x, y)| nan_max((x.0 - y.0).abs(), (x.1 - y.1).abs()))
+        .fold(0.0_f64, nan_max)
 }
 
 fn max_abs_diff_real(a: &[f64], b: &[f64]) -> f64 {
@@ -87,13 +81,17 @@ fn max_abs_diff_real(a: &[f64], b: &[f64]) -> f64 {
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, |a: f64, b: f64| {
-            if a.is_nan() || b.is_nan() {
-                f64::NAN
-            } else {
-                a.max(b)
-            }
-        })
+        .fold(0.0_f64, nan_max)
+}
+
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
 }
 
 /// Naive DFT reference implementation for oracle comparison.
@@ -646,8 +644,8 @@ fn meta_004_conjugate_symmetry_real_input() {
     for k in 1..n / 2 {
         let xk = spectrum[k];
         let xnk = spectrum[n - k];
-        let d = ((xk.0 - xnk.0).abs()).max((xk.1 + xnk.1).abs());
-        max_diff = max_diff.max(d);
+        let d = nan_max((xk.0 - xnk.0).abs(), (xk.1 + xnk.1).abs());
+        max_diff = nan_max(max_diff, d);
     }
     run_diff_test(
         "meta_004_conj_sym",
@@ -687,7 +685,7 @@ fn meta_006_ortho_unitary_preservation() {
     let spectrum_energy: f64 = spectrum.iter().map(|c| complex_mag_sq(*c)).sum();
     let energy_diff = (input_energy - spectrum_energy).abs();
 
-    let diff = diff_roundtrip.max(energy_diff);
+    let diff = nan_max(diff_roundtrip, energy_diff);
     run_diff_test(
         "meta_006_ortho_unitary",
         "metamorphic",

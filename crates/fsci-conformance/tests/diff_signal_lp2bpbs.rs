@@ -9,13 +9,14 @@
 //! agreement at tol 1e-12. Skips cleanly if scipy/python3 is
 //! unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{lp2bp, lp2bs};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     abs_tol: f64,
     pass: bool,
@@ -217,11 +219,17 @@ print(json.dumps({"bp": bp_results, "bs": bs_results}))
     Some(serde_json::from_str(&stdout).expect("parse lp2bpbs oracle JSON"))
 }
 
+/// b then a in one vector, so the ledger's slice check sees a NaN or a length mismatch in either.
+fn packed(b: &[f64], a: &[f64]) -> Vec<f64> {
+    b.iter().chain(a).copied().collect()
+}
+
 fn diff_arm(
+    ledger: &mut CompareLedger,
     family: &str,
     cases: &[BpBsCase],
     oracle_arm: &[OracleArm],
-    rust_call: impl Fn(&BpBsCase) -> (Vec<f64>, Vec<f64>),
+    rust_call: impl Fn(&BpBsCase) -> Option<(Vec<f64>, Vec<f64>)>,
 ) -> (Vec<CaseDiff>, f64) {
     let oracle_map: HashMap<String, OracleArm> = oracle_arm
         .iter()
@@ -233,35 +241,34 @@ fn diff_arm(
         let oracle = oracle_map
             .get(&case.case_id)
             .expect("validated complete oracle map");
-        let (Some(scipy_b), Some(scipy_a)) = (&oracle.b, &oracle.a) else {
+        let scipy_ba = match (&oracle.b, &oracle.a) {
+            (Some(b), Some(a)) => Some((b, a)),
+            _ => None,
+        };
+        let rust_ba = rust_call(case);
+        let scipy_v = scipy_ba.map(|(b, a)| packed(b, a));
+        let rust_v = rust_ba.as_ref().map(|(b, a)| packed(b, a));
+        let Some((scipy_v, rust_v)) =
+            ledger.slices(family, &case.case_id, scipy_v.as_deref(), rust_v.as_deref())
+        else {
             continue;
         };
-        let (rust_b, rust_a) = rust_call(case);
-        assert_eq!(
-            rust_b.len(),
-            scipy_b.len(),
-            "{family}/{}: b length mismatch (rust={}, scipy={})",
-            case.case_id,
-            rust_b.len(),
-            scipy_b.len()
-        );
-        assert_eq!(
-            rust_a.len(),
-            scipy_a.len(),
-            "{family}/{}: a length mismatch (rust={}, scipy={})",
-            case.case_id,
-            rust_a.len(),
-            scipy_a.len()
-        );
-        let mut max_b_diff = 0.0_f64;
-        for (rb, sb) in rust_b.iter().zip(scipy_b.iter()) {
-            max_b_diff = max_b_diff.max((rb - sb).abs());
-        }
-        let mut max_a_diff = 0.0_f64;
-        for (ra, sa) in rust_a.iter().zip(scipy_a.iter()) {
-            max_a_diff = max_a_diff.max((ra - sa).abs());
+        // The packed lengths agree; the b/a split must agree too.
+        let nb = scipy_ba.map_or(0, |(b, _)| b.len());
+        let split_matches = rust_ba.as_ref().map(|(b, _)| b.len()) == Some(nb);
+        let (mut max_b_diff, mut max_a_diff) = (f64::INFINITY, f64::INFINITY);
+        if split_matches {
+            max_b_diff = 0.0_f64;
+            for (rb, sb) in rust_v[..nb].iter().zip(&scipy_v[..nb]) {
+                max_b_diff = max_b_diff.max((rb - sb).abs());
+            }
+            max_a_diff = 0.0_f64;
+            for (ra, sa) in rust_v[nb..].iter().zip(&scipy_v[nb..]) {
+                max_a_diff = max_a_diff.max((ra - sa).abs());
+            }
         }
         let pass = max_b_diff <= ABS_TOL && max_a_diff <= ABS_TOL;
+        ledger.compared(family, &case.case_id, pass);
         max_overall = max_overall.max(max_b_diff).max(max_a_diff);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -284,11 +291,12 @@ fn diff_signal_lp2bpbs() {
     assert_eq!(oracle.bs.len(), cases.len());
 
     let start = Instant::now();
-    let (mut diffs, mut max_overall) = diff_arm("lp2bp", &cases, &oracle.bp, |c| {
-        lp2bp(&c.b, &c.a, c.wo, c.bw).expect("lp2bp")
+    let mut ledger = CompareLedger::new("diff_signal_lp2bpbs", &["lp2bp", "lp2bs"]);
+    let (mut diffs, mut max_overall) = diff_arm(&mut ledger, "lp2bp", &cases, &oracle.bp, |c| {
+        lp2bp(&c.b, &c.a, c.wo, c.bw).ok()
     });
-    let (bs_diffs, bs_max) = diff_arm("lp2bs", &cases, &oracle.bs, |c| {
-        lp2bs(&c.b, &c.a, c.wo, c.bw).expect("lp2bs")
+    let (bs_diffs, bs_max) = diff_arm(&mut ledger, "lp2bs", &cases, &oracle.bs, |c| {
+        lp2bs(&c.b, &c.a, c.wo, c.bw).ok()
     });
     diffs.extend(bs_diffs);
     max_overall = max_overall.max(bs_max);
@@ -299,6 +307,7 @@ fn diff_signal_lp2bpbs() {
         test_id: "diff_signal_lp2bpbs".into(),
         category: "scipy.signal.lp2bp+lp2bs".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         abs_tol: ABS_TOL,
         pass: all_pass,
@@ -324,4 +333,5 @@ fn diff_signal_lp2bpbs() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(cases.len());
 }

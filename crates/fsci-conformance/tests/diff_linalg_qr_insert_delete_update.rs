@@ -6,10 +6,12 @@
 //! sign of columns, so this harness checks the invariant Q*R ≈ modified A
 //! rather than element-wise parity. No scipy oracle required.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, qr, qr_delete, qr_insert, qr_update};
 use serde::Serialize;
 
@@ -29,6 +31,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -125,62 +128,94 @@ fn diff_linalg_qr_insert_delete_update() {
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
 
-    for (label, a) in fixtures() {
+    let fixtures = fixtures();
+    let mut ledger = CompareLedger::new(
+        "diff_linalg_qr_insert_delete_update",
+        &["qr_insert", "qr_delete", "qr_update"],
+    );
+
+    for (label, a) in &fixtures {
         let m = a.len();
         let n = a[0].len();
-        let Ok(qra) = qr(&a, opts) else { continue };
+        // A failed base factorization fails all three arms for this fixture.
+        let qra = qr(a, opts).ok();
 
         // qr_insert: insert a row at position k=1
         let new_row: Vec<f64> = (1..=n).map(|i| i as f64 * 0.5).collect();
-        if let Ok(res) = qr_insert(&qra.q, &qra.r, &new_row, 1, opts) {
-            // Build expected matrix: original with new row inserted at index 1
-            let mut expected = a.clone();
-            expected.insert(1, new_row.clone());
-            let qr_mat = matmul(&res.q, &res.r);
-            let abs_d = frob_diff(&expected, &qr_mat);
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: format!("insert_{label}_k1"),
-                op: "qr_insert".into(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
+        // Build expected matrix: original with new row inserted at index 1
+        let mut expected_insert = a.clone();
+        expected_insert.insert(1, new_row.clone());
+        let fsci_insert = qra
+            .as_ref()
+            .and_then(|qra| qr_insert(&qra.q, &qra.r, &new_row, 1, opts).ok());
 
-        // qr_delete: delete row k=0
-        if m > 1
-            && let Ok(res) = qr_delete(&qra.q, &qra.r, 0, opts)
-        {
-            let mut expected = a.clone();
-            expected.remove(0);
-            let qr_mat = matmul(&res.q, &res.r);
-            let abs_d = frob_diff(&expected, &qr_mat);
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: format!("delete_{label}_k0"),
-                op: "qr_delete".into(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
+        // qr_delete: delete row k=0 (every fixture has m > 1)
+        let mut expected_delete = a.clone();
+        expected_delete.remove(0);
+        let fsci_delete = qra
+            .as_ref()
+            .and_then(|qra| qr_delete(&qra.q, &qra.r, 0, opts).ok());
 
         // qr_update: rank-1 update A + u vᵀ
         let u: Vec<f64> = (0..m).map(|i| (i + 1) as f64 * 0.1).collect();
         let v: Vec<f64> = (0..n).map(|j| (j + 1) as f64 * 0.2).collect();
-        if let Ok(res) = qr_update(&qra.q, &qra.r, &u, &v, opts) {
-            // expected = A + u * vᵀ
-            let mut expected = a.clone();
-            for i in 0..m {
-                for j in 0..n {
-                    expected[i][j] += u[i] * v[j];
-                }
+        // expected = A + u * vᵀ
+        let mut expected_update = a.clone();
+        for i in 0..m {
+            for j in 0..n {
+                expected_update[i][j] += u[i] * v[j];
             }
-            let qr_mat = matmul(&res.q, &res.r);
+        }
+        let fsci_update = qra
+            .as_ref()
+            .and_then(|qra| qr_update(&qra.q, &qra.r, &u, &v, opts).ok());
+
+        let arms = [
+            (
+                "qr_insert",
+                format!("insert_{label}_k1"),
+                expected_insert,
+                fsci_insert,
+            ),
+            (
+                "qr_delete",
+                format!("delete_{label}_k0"),
+                expected_delete,
+                fsci_delete,
+            ),
+            (
+                "qr_update",
+                format!("update_{label}_rank1"),
+                expected_update,
+                fsci_update,
+            ),
+        ];
+        for (op, case_id, expected, res) in arms {
+            let qr_mat = res.map(|res| matmul(&res.q, &res.r));
+            let Some((expected, qr_mat)) = ledger.both(op, &case_id, Some(expected), qr_mat) else {
+                continue;
+            };
+            // The flat check catches a NaN the max fold in frob_diff would swallow;
+            // frob_diff still rejects a shape mismatch with the same element count.
+            let expected_flat: Vec<f64> = expected.iter().flatten().copied().collect();
+            let fsci_flat: Vec<f64> = qr_mat.iter().flatten().copied().collect();
+            if ledger
+                .slices(
+                    op,
+                    &case_id,
+                    Some(expected_flat.as_slice()),
+                    Some(fsci_flat.as_slice()),
+                )
+                .is_none()
+            {
+                continue;
+            }
             let abs_d = frob_diff(&expected, &qr_mat);
             max_overall = max_overall.max(abs_d);
+            ledger.compared(op, &case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
-                case_id: format!("update_{label}_rank1"),
-                op: "qr_update".into(),
+                case_id,
+                op: op.into(),
                 abs_diff: abs_d,
                 pass: abs_d <= ABS_TOL,
             });
@@ -193,6 +228,7 @@ fn diff_linalg_qr_insert_delete_update() {
         test_id: "diff_linalg_qr_insert_delete_update".into(),
         category: "fsci_linalg QR rank-update reconstruction".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -213,4 +249,5 @@ fn diff_linalg_qr_insert_delete_update() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(fixtures.len());
 }

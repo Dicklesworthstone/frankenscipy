@@ -9,12 +9,14 @@
 //! which the old unpivoted `ldl` factored wrongly while returning `Ok`. Every case must be
 //! compared: an `Err` from either side fails the test.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, ldl};
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_factor_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -241,30 +244,47 @@ fn diff_linalg_ldl_reconstruct() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let mut ledger = CompareLedger::new("diff_linalg_ldl_reconstruct", &["lower", "upper"]);
     for (case, arm) in query.points.iter().zip(&oracle.points) {
         assert_eq!(case.case_id, arm.case_id);
         let n = case.n;
         let a = rows_of(&case.a, n);
         let scale = max_abs(case.a.iter().copied()).max(f64::MIN_POSITIVE);
         for (lower, scipy) in [(true, &arm.lower), (false, &arm.upper)] {
-            let ours = match ldl(&a, lower, DecompOptions::default()) {
-                Ok(ours) => ours,
-                Err(e) => {
-                    // A failing case, not a skipped one: the final assertions count it.
-                    eprintln!("ldl {} lower={lower}: {e}", case.case_id);
-                    diffs.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        lower,
-                        perm_equal: false,
-                        factor_rel_diff: f64::INFINITY,
-                        reconstruction_rel_diff: f64::INFINITY,
-                        pass: false,
-                    });
-                    continue;
-                }
+            let triangle = if lower { "lower" } else { "upper" };
+            // A failing case, not a skipped one: the ledger records it and the final
+            // assertions count it.
+            let failed = |perm_equal: bool| CaseDiff {
+                case_id: case.case_id.clone(),
+                lower,
+                perm_equal,
+                factor_rel_diff: f64::INFINITY,
+                reconstruction_rel_diff: f64::INFINITY,
+                pass: false,
+            };
+            let ours = ldl(&a, lower, DecompOptions::default())
+                .inspect_err(|e| eprintln!("ldl {} lower={lower}: {e}", case.case_id))
+                .ok();
+            let Some((scipy, ours)) = ledger.both(triangle, &case.case_id, Some(scipy), ours)
+            else {
+                diffs.push(failed(false));
+                continue;
             };
             let lu: Vec<f64> = ours.lu.concat();
             let d: Vec<f64> = ours.d.concat();
+            // lu then d: `slices` records a length mismatch or a non-finite entry, which the
+            // max folds below would swallow.
+            let scipy_factors: Vec<f64> = scipy.lu.iter().chain(&scipy.d).copied().collect();
+            let our_factors: Vec<f64> = lu.iter().chain(&d).copied().collect();
+            let Some(_) = ledger.slices(
+                triangle,
+                &case.case_id,
+                Some(scipy_factors.as_slice()),
+                Some(our_factors.as_slice()),
+            ) else {
+                diffs.push(failed(ours.perm == scipy.perm));
+                continue;
+            };
             let factor_rel_diff = max_abs(
                 lu.iter()
                     .zip(&scipy.lu)
@@ -291,6 +311,7 @@ fn diff_linalg_ldl_reconstruct() {
                 && d.len() == scipy.d.len()
                 && factor_rel_diff <= REL_TOL
                 && reconstruction_rel_diff <= 1e-12;
+            ledger.compared(triangle, &case.case_id, pass);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 lower,
@@ -307,6 +328,7 @@ fn diff_linalg_ldl_reconstruct() {
         test_id: "diff_linalg_ldl_reconstruct".into(),
         category: "fsci_linalg.ldl vs scipy.linalg.ldl (lu, d, perm; both triangles)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_factor_rel_diff: max_abs(diffs.iter().map(|d| d.factor_rel_diff)),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -323,4 +345,5 @@ fn diff_linalg_ldl_reconstruct() {
         "every case must be compared"
     );
     assert!(all_pass, "ldl conformance failed: {log:?}");
+    ledger.finish(query.points.len());
 }

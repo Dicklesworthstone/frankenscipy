@@ -16,13 +16,14 @@
 //! Shi(30)) — tracked alongside the broader special-function
 //! precision sweep in frankenscipy-0om9c.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{fresnel, shichi};
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +32,8 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL_FRESNEL_SHI: f64 = 1.0e-5;
 const ABS_TOL_CHI: f64 = 1.0e-12;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per output.
+const ARMS: [&str; 4] = ["FresnelS", "FresnelC", "Shi", "Chi"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -68,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -244,33 +248,40 @@ fn diff_special_fresnel_shichi() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_fresnel_shichi", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            let tol = if case.func == "Chi" {
-                // Chi grows like e^x/(2x): Chi(30) ≈ 1.845e11, where one ULP is
-                // 3.05e-5 — a flat 1e-12 abs floor there demands sub-ULP agreement,
-                // which no pair of independent f64 implementations can meet
-                // (scipy's own value is 1 ULP off mpmath at 30 dps; the observed
-                // fsci-vs-scipy gap was 3.05e-5 ≈ 1 ULP). Keep the abs floor where
-                // it bites (small x) and add a 4-ULP relative ceiling for the
-                // exponential tail. frankenscipy-wkf10 item 5.
-                ABS_TOL_CHI.max(4.0 * f64::EPSILON * scipy_v.abs())
-            } else {
-                ABS_TOL_FRESNEL_SHI
-            };
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                pass: abs_diff <= tol,
-            });
-        }
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.x),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        let tol = if case.func == "Chi" {
+            // Chi grows like e^x/(2x): Chi(30) ≈ 1.845e11, where one ULP is
+            // 3.05e-5 — a flat 1e-12 abs floor there demands sub-ULP agreement,
+            // which no pair of independent f64 implementations can meet
+            // (scipy's own value is 1 ULP off mpmath at 30 dps; the observed
+            // fsci-vs-scipy gap was 3.05e-5 ≈ 1 ULP). Keep the abs floor where
+            // it bites (small x) and add a 4-ULP relative ceiling for the
+            // exponential tail. frankenscipy-wkf10 item 5.
+            ABS_TOL_CHI.max(4.0 * f64::EPSILON * scipy_v.abs())
+        } else {
+            ABS_TOL_FRESNEL_SHI
+        };
+        ledger.compared(arm, &case.case_id, abs_diff <= tol);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= tol,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -279,6 +290,7 @@ fn diff_special_fresnel_shichi() {
         test_id: "diff_special_fresnel_shichi".into(),
         category: "scipy.special.fresnel/shichi".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -303,4 +315,11 @@ fn diff_special_fresnel_shichi() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (Chi has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

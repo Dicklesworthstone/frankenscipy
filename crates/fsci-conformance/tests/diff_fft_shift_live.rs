@@ -7,6 +7,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_fft::{fftshift, ifftshift};
 use serde::{Deserialize, Serialize};
 
@@ -192,21 +193,41 @@ fn fftshift_duplicate_and_empty_axes_match_scipy() -> Result<(), String> {
         return Ok(());
     };
 
+    let mut ledger = CompareLedger::new(
+        "fftshift_duplicate_and_empty_axes_match_scipy",
+        &["fftshift", "ifftshift"],
+    );
     for case in &CASES {
         let arm = oracle
             .points
             .iter()
             .find(|point| point.case_id == case.case_id)
             .ok_or_else(|| missing_oracle_case(case.case_id))?;
-        let expected = arm
-            .values
-            .as_ref()
-            .ok_or_else(|| oracle_error(case.case_id, arm.error.as_deref()))?;
-        let actual = fsci_shift(case)?;
-        if actual != *expected {
+        if arm.values.is_none() {
+            eprintln!("{}", oracle_error(case.case_id, arm.error.as_deref()));
+        }
+        let actual = fsci_shift(case);
+        if let Err(err) = &actual {
+            eprintln!("fsci {} failed: {err}", case.case_id);
+        }
+        let Some((expected, actual)) =
+            ledger.both(case.op, case.case_id, arm.values.as_ref(), actual.ok())
+        else {
+            continue;
+        };
+        let pass = actual == *expected;
+        ledger.compared(case.op, case.case_id, pass);
+        if !pass {
             return Err(mismatch_error(case.case_id, &actual, expected));
         }
     }
+    // Each op has its own case set; every arm must compare all of its cases.
+    let min_per_arm = ["fftshift", "ifftshift"]
+        .iter()
+        .map(|op| CASES.iter().filter(|c| c.op == *op).count())
+        .min()
+        .expect("two ops");
+    ledger.finish(min_per_arm);
     Ok(())
 }
 

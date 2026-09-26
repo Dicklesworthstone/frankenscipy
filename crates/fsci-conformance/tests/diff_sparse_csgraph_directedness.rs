@@ -30,6 +30,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_sparse::{
     Connection, CsrMatrix, Shape2D, bellman_ford, breadth_first_order, connected_components,
     depth_first_order, dijkstra, floyd_warshall, johnson,
@@ -340,6 +341,7 @@ fn compare_mode(
     answer: &ModeAnswer,
     counts: &mut Counts,
     failures: &mut Vec<String>,
+    ledger: &mut CompareLedger,
 ) {
     let tag = format!("{} directed={directed}", graph.name);
     let has_negative = graph.dense.iter().any(|&w| w < 0.0);
@@ -347,14 +349,19 @@ fn compare_mode(
         ("dijkstra", dijkstra, &answer.dijkstra),
         ("bellman_ford", bellman_ford, &answer.bellman_ford),
     ];
+    // A graph with a negative weight is not a dijkstra case: SciPy's dijkstra only warns there,
+    // the oracle does not run it (it sends None), and fsci runs Bellman-Ford.
+    let path_arms = path_arms
+        .into_iter()
+        .filter(|(name, _, _)| !(*name == "dijkstra" && has_negative));
     for (name, fsci_fn, scipy) in path_arms {
-        if name == "dijkstra" && has_negative {
-            continue; // SciPy's dijkstra warns on negative weights; fsci runs Bellman-Ford.
-        }
         match scipy {
             None => {
+                // The oracle sends None here only for SciPy's NegativeCycleError.
                 counts.refusals += 1;
-                if fsci_fn(csr, directed, 0).is_ok() {
+                let refused = fsci_fn(csr, directed, 0).is_err();
+                ledger.expected_raise(name, &tag, refused);
+                if !refused {
                     failures.push(format!(
                         "{tag} {name}: SciPy raised a negative cycle, fsci did not"
                     ));
@@ -363,101 +370,138 @@ fn compare_mode(
             Some(rows) => {
                 for (s, (dist, pred)) in rows.iter().enumerate() {
                     counts.paths += 1;
+                    let case_id = format!("{tag} source {s}");
                     let dist = with_infinity(dist);
-                    match fsci_fn(csr, directed, s) {
-                        Ok(r) => {
-                            if !distances_close(&r.distances, &dist) || &r.predecessors != pred {
-                                failures.push(format!(
-                                    "{tag} {name} source {s}: fsci {:?} / {:?}, SciPy {dist:?} / {pred:?}",
-                                    r.distances, r.predecessors
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            failures.push(format!("{tag} {name} source {s}: fsci Err({e:?})"))
-                        }
+                    let got = fsci_fn(csr, directed, s);
+                    if let Err(e) = &got {
+                        failures.push(format!("{tag} {name} source {s}: fsci Err({e:?})"));
+                    }
+                    let Some(((dist, pred), r)) =
+                        ledger.both(name, &case_id, Some((&dist, pred)), got.ok())
+                    else {
+                        continue;
+                    };
+                    let pass = distances_close(&r.distances, dist) && &r.predecessors == pred;
+                    ledger.compared(name, &case_id, pass);
+                    if !pass {
+                        failures.push(format!(
+                            "{tag} {name} source {s}: fsci {:?} / {:?}, SciPy {dist:?} / {pred:?}",
+                            r.distances, r.predecessors
+                        ));
                     }
                 }
             }
         }
     }
 
-    // fsci's floyd_warshall does not detect negative cycles (that is bellman_ford's job), so
-    // only the graphs SciPy solves are compared.
-    if let Some(scipy) = &answer.floyd {
-        let fw = floyd_warshall(csr, directed);
-        counts.matrices += 1;
-        let same = fw.len() == scipy.len()
-            && fw
-                .iter()
-                .zip(scipy)
-                .all(|(a, b)| distances_close(a, &with_infinity(b)));
-        if !same {
-            failures.push(format!(
-                "{tag} floyd_warshall: fsci {fw:?}, SciPy {scipy:?}"
-            ));
-        }
-    }
-    match (&answer.johnson, johnson(csr, directed)) {
-        (Some(scipy), Ok(ours)) => {
+    // fsci's floyd_warshall does not detect negative cycles and returns a Vec, so it cannot
+    // refuse. SciPy raises NegativeCycleError there, which the oracle sends as None; the case is
+    // allowlisted under the bead that makes it refuse (the arm's minimum still counts every
+    // other case, so a broken oracle cannot hide behind this).
+    let fw = floyd_warshall(csr, directed);
+    match &answer.floyd {
+        None => ledger.allowlisted(
+            "floyd_warshall",
+            &tag,
+            "frankenscipy-lna36",
+            "SciPy raises NegativeCycleError; fsci returns a matrix",
+        ),
+        Some(scipy) => {
             counts.matrices += 1;
-            let same = ours.len() == scipy.len()
-                && ours
+            let same = fw.len() == scipy.len()
+                && fw
                     .iter()
                     .zip(scipy)
-                    .all(|(a, b)| distances_close(&a.distances, &with_infinity(b)));
+                    .all(|(a, b)| distances_close(a, &with_infinity(b)));
+            ledger.compared("floyd_warshall", &tag, same);
             if !same {
-                failures.push(format!("{tag} johnson distances differ"));
+                failures.push(format!(
+                    "{tag} floyd_warshall: fsci {fw:?}, SciPy {scipy:?}"
+                ));
             }
         }
-        (None, Err(_)) => counts.refusals += 1,
-        (s, o) => failures.push(format!(
-            "{tag} johnson: SciPy {} / fsci {}",
-            if s.is_some() { "solved" } else { "refused" },
-            if o.is_ok() { "solved" } else { "refused" }
-        )),
+    }
+    let got = johnson(csr, directed);
+    match &answer.johnson {
+        None => {
+            // SciPy's NegativeCycleError.
+            ledger.expected_raise("johnson", &tag, got.is_err());
+            if got.is_err() {
+                counts.refusals += 1;
+            } else {
+                failures.push(format!("{tag} johnson: SciPy refused / fsci solved"));
+            }
+        }
+        Some(scipy) => {
+            if got.is_err() {
+                failures.push(format!("{tag} johnson: SciPy solved / fsci refused"));
+            }
+            if let Some((scipy, ours)) = ledger.both("johnson", &tag, Some(scipy), got.ok()) {
+                counts.matrices += 1;
+                let same = ours.len() == scipy.len()
+                    && ours
+                        .iter()
+                        .zip(scipy)
+                        .all(|(a, b)| distances_close(&a.distances, &with_infinity(b)));
+                ledger.compared("johnson", &tag, same);
+                if !same {
+                    failures.push(format!("{tag} johnson distances differ"));
+                }
+            }
+        }
     }
 
     for (name, scipy) in [("bfs", &answer.bfs), ("dfs", &answer.dfs)] {
         for (s, want) in scipy.iter().enumerate() {
             counts.traversals += 1;
+            let case_id = format!("{tag} source {s}");
             let got = if name == "bfs" {
                 breadth_first_order(csr, s, directed)
             } else {
                 depth_first_order(csr, s, directed)
             };
-            match got {
-                Ok((order, pred)) => {
-                    let order: Vec<i64> = order.iter().map(|&v| v as i64).collect();
-                    if order != want.order || pred != want.pred {
-                        failures.push(format!(
-                            "{tag} {name} from {s}: fsci {order:?} / {pred:?}, SciPy {:?} / {:?}",
-                            want.order, want.pred
-                        ));
-                    }
-                }
-                Err(e) => failures.push(format!("{tag} {name} from {s}: fsci Err({e:?})")),
+            if let Err(e) = &got {
+                failures.push(format!("{tag} {name} from {s}: fsci Err({e:?})"));
+            }
+            let Some((want, (order, pred))) = ledger.both(name, &case_id, Some(want), got.ok())
+            else {
+                continue;
+            };
+            let order: Vec<i64> = order.iter().map(|&v| v as i64).collect();
+            let pass = order == want.order && pred == want.pred;
+            ledger.compared(name, &case_id, pass);
+            if !pass {
+                failures.push(format!(
+                    "{tag} {name} from {s}: fsci {order:?} / {pred:?}, SciPy {:?} / {:?}",
+                    want.order, want.pred
+                ));
             }
         }
     }
 
-    for (connection, (n_components, labels)) in [
-        (Connection::Weak, &answer.cc_weak),
-        (Connection::Strong, &answer.cc_strong),
+    for (arm, connection, (n_components, labels)) in [
+        ("cc_weak", Connection::Weak, &answer.cc_weak),
+        ("cc_strong", Connection::Strong, &answer.cc_strong),
     ] {
         counts.components += 1;
-        match connected_components(csr, directed, connection) {
-            Ok(r) => {
-                if r.n_components != *n_components || &r.labels != labels {
-                    failures.push(format!(
-                        "{tag} connected_components {connection:?}: fsci {} {:?}, SciPy {n_components} {labels:?}",
-                        r.n_components, r.labels
-                    ));
-                }
-            }
-            Err(e) => failures.push(format!(
+        let got = connected_components(csr, directed, connection);
+        if let Err(e) = &got {
+            failures.push(format!(
                 "{tag} connected_components {connection:?}: Err({e:?})"
-            )),
+            ));
+        }
+        let Some(((n_components, labels), r)) =
+            ledger.both(arm, &tag, Some((n_components, labels)), got.ok())
+        else {
+            continue;
+        };
+        let pass = r.n_components == *n_components && &r.labels == labels;
+        ledger.compared(arm, &tag, pass);
+        if !pass {
+            failures.push(format!(
+                "{tag} connected_components {connection:?}: fsci {} {:?}, SciPy {n_components} {labels:?}",
+                r.n_components, r.labels
+            ));
         }
     }
 }
@@ -531,6 +575,19 @@ fn diff_sparse_csgraph_directedness() {
     );
     let mut counts = Counts::default();
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_csgraph_directedness",
+        &[
+            "dijkstra",
+            "bellman_ford",
+            "floyd_warshall",
+            "johnson",
+            "bfs",
+            "dfs",
+            "cc_weak",
+            "cc_strong",
+        ],
+    );
     for (graph, answer) in graphs.iter().zip(&answers) {
         let csr = dense_to_csr(graph.n, &graph.dense);
         compare_mode(
@@ -540,6 +597,7 @@ fn diff_sparse_csgraph_directedness() {
             &answer.directed,
             &mut counts,
             &mut failures,
+            &mut ledger,
         );
         compare_mode(
             graph,
@@ -548,6 +606,7 @@ fn diff_sparse_csgraph_directedness() {
             &answer.undirected,
             &mut counts,
             &mut failures,
+            &mut ledger,
         );
     }
     println!(
@@ -569,4 +628,9 @@ fn diff_sparse_csgraph_directedness() {
         failures.is_empty(),
         "csgraph directedness disagrees: {failures:#?}"
     );
+    // floyd_warshall, johnson, cc_weak and cc_strong each have one case per graph and mode, the
+    // smallest case set of any arm.
+    // floyd_warshall has one case (asymmetric5_negative_edge, undirected) allowlisted under
+    // frankenscipy-lna36, which leaves it one compared case short of the per-graph-and-mode set.
+    ledger.finish(2 * graphs.len() - 1);
 }

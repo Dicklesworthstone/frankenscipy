@@ -8,12 +8,14 @@
 //! and odd) — the even/odd FFT-bin scaling paths take different
 //! code branches in fsci.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{FftOptions, hilbert};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -221,48 +224,37 @@ fn diff_fft_hilbert_analytic() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let opts = FftOptions::default();
+    let mut ledger = CompareLedger::new("diff_fft_hilbert_analytic", &["hilbert"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let (Some(exp_re), Some(exp_im)) = (o.real.as_ref(), o.imag.as_ref()) else {
-            continue;
-        };
+        // Both sides interleaved [re, im, re, im, ...]: the max element-wise |diff| over this is
+        // the max over samples of max(|d_re|, |d_im|), and the ledger sees length and NaN.
+        let scipy_z: Option<Vec<f64>> = o
+            .real
+            .as_ref()
+            .zip(o.imag.as_ref())
+            .map(|(re, im)| re.iter().zip(im).flat_map(|(&r, &i)| [r, i]).collect());
+        let fsci_z: Option<Vec<f64>> = hilbert(&case.signal, &opts)
+            .ok()
+            .map(|z| z.iter().flat_map(|&(re, im)| [re, im]).collect());
 
         let n = case.signal.len();
-        let result = match hilbert(&case.signal, &opts) {
-            Ok(z) => z,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    n,
-                    max_abs_diff: f64::INFINITY,
-                    pass: false,
-                    note: format!("hilbert error: {e:?}"),
-                });
-                continue;
-            }
-        };
-        if result.len() != exp_re.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                n,
-                max_abs_diff: f64::INFINITY,
-                pass: false,
-                note: format!(
-                    "length mismatch: fsci={} scipy={}",
-                    result.len(),
-                    exp_re.len()
-                ),
-            });
+        let Some((exp_z, got_z)) = ledger.slices(
+            "hilbert",
+            &case.case_id,
+            scipy_z.as_deref(),
+            fsci_z.as_deref(),
+        ) else {
             continue;
-        }
-        let mut max_abs = 0.0_f64;
-        for (i, &(re, im)) in result.iter().enumerate() {
-            let dr = (re - exp_re[i]).abs();
-            let di = (im - exp_im[i]).abs();
-            max_abs = max_abs.max(dr.max(di));
-        }
+        };
+        let max_abs = got_z
+            .iter()
+            .zip(exp_z)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         let pass = max_abs <= ABS_TOL;
+        ledger.compared("hilbert", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             n,
@@ -277,6 +269,7 @@ fn diff_fft_hilbert_analytic() {
         test_id: "diff_fft_hilbert_analytic".into(),
         category: "fsci_fft::hilbert vs scipy.signal.hilbert".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -294,4 +287,5 @@ fn diff_fft_hilbert_analytic() {
     }
 
     assert!(all_pass, "hilbert parity failed: {} cases", diffs.len());
+    ledger.finish(query.points.len());
 }

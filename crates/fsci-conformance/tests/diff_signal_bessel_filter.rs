@@ -6,12 +6,14 @@
 //! polynomial poles, scales by the Bessel phase normalization, and
 //! digitizes through bilinear transform — same algorithm scipy uses.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{FilterType, bessel};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -206,17 +209,29 @@ fn diff_signal_bessel_filter() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_signal_bessel_filter", &["b", "a"]);
 
     for (c, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(c.case_id, o.case_id);
-        let (Some(exp_b), Some(exp_a)) = (o.b.as_ref(), o.a.as_ref()) else {
-            continue;
-        };
-
         let result = bessel(c.order, &c.wn, ftype_from(&c.btype));
-        let ba = match result {
-            Ok(r) => r,
-            Err(e) => {
+        let ba = result.as_ref().ok();
+        let arms = [
+            ("b", o.b.as_deref(), ba.map(|r| r.b.as_slice())),
+            ("a", o.a.as_deref(), ba.map(|r| r.a.as_slice())),
+        ];
+        let mut arm_diffs = [f64::NAN; 2];
+        for (slot, (arm, scipy, fsci)) in arm_diffs.iter_mut().zip(arms) {
+            let Some((s, f)) = ledger.slices(arm, &c.case_id, scipy, fsci) else {
+                continue;
+            };
+            let d = max_abs(f, s);
+            ledger.compared(arm, &c.case_id, d <= ABS_TOL);
+            *slot = d;
+        }
+        if arm_diffs.iter().any(|d| d.is_nan()) {
+            // The ledger recorded why this case was not compared; keep the fsci error in the
+            // diff log where SciPy gave both coefficient vectors, as before.
+            if let (Err(e), Some(_), Some(_)) = (&result, &o.b, &o.a) {
                 diffs.push(CaseDiff {
                     case_id: c.case_id.clone(),
                     max_abs_diff_b: f64::INFINITY,
@@ -224,27 +239,10 @@ fn diff_signal_bessel_filter() {
                     pass: false,
                     note: format!("error: {e:?}"),
                 });
-                continue;
             }
-        };
-        if ba.b.len() != exp_b.len() || ba.a.len() != exp_a.len() {
-            diffs.push(CaseDiff {
-                case_id: c.case_id.clone(),
-                max_abs_diff_b: f64::INFINITY,
-                max_abs_diff_a: f64::INFINITY,
-                pass: false,
-                note: format!(
-                    "length mismatch: fsci b={} a={} scipy b={} a={}",
-                    ba.b.len(),
-                    ba.a.len(),
-                    exp_b.len(),
-                    exp_a.len()
-                ),
-            });
             continue;
         }
-        let mab = max_abs(&ba.b, exp_b);
-        let maa = max_abs(&ba.a, exp_a);
+        let [mab, maa] = arm_diffs;
         let pass = mab <= ABS_TOL && maa <= ABS_TOL;
         diffs.push(CaseDiff {
             case_id: c.case_id.clone(),
@@ -260,6 +258,7 @@ fn diff_signal_bessel_filter() {
         test_id: "diff_signal_bessel_filter".into(),
         category: "fsci_signal::bessel vs scipy.signal.bessel".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -277,4 +276,5 @@ fn diff_signal_bessel_filter() {
     }
 
     assert!(all_pass, "bessel parity failed: {} cases", diffs.len());
+    ledger.finish(query.points.len());
 }

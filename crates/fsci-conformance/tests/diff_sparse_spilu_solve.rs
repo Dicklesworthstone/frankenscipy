@@ -13,12 +13,14 @@
 //!
 //! Each probe also runs scipy spilu(A).solve(b) as a sanity baseline.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, FormatConvertible, IluOptions, Shape2D, spilu};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +72,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -265,6 +268,19 @@ fn matvec_triplets(triplets: &[(usize, usize, f64)], x: &[f64], rows: usize) -> 
     out
 }
 
+/// fsci's COO → CSC → spilu → solve chain; the error names the failing step.
+fn fsci_spilu_solve(case: &CasePoint) -> Result<Vec<f64>, String> {
+    let data: Vec<f64> = case.triplets.iter().map(|t| t.2).collect();
+    let rs: Vec<usize> = case.triplets.iter().map(|t| t.0).collect();
+    let cs: Vec<usize> = case.triplets.iter().map(|t| t.1).collect();
+    let coo = CooMatrix::from_triplets(Shape2D::new(case.rows, case.cols), data, rs, cs, true)
+        .map_err(|e| format!("COO build error: {e:?}"))?;
+    let csc = coo.to_csc().map_err(|e| format!("to_csc error: {e:?}"))?;
+    let ilu = spilu(&csc, IluOptions::default()).map_err(|e| format!("spilu error: {e:?}"))?;
+    ilu.solve(&case.b)
+        .map_err(|e| format!("ilu.solve error: {e:?}"))
+}
+
 #[test]
 fn diff_sparse_spilu_solve() {
     let query = build_query();
@@ -272,6 +288,7 @@ fn diff_sparse_spilu_solve() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_sparse_spilu_solve", &["spilu_solve"]);
 
     for (i, case) in query.points.iter().enumerate() {
         let scipy_res = oracle
@@ -279,80 +296,41 @@ fn diff_sparse_spilu_solve() {
             .and_then(|o| o.points.get(i))
             .and_then(|p| p.scipy_residual_inf);
 
-        let data: Vec<f64> = case.triplets.iter().map(|t| t.2).collect();
-        let rs: Vec<usize> = case.triplets.iter().map(|t| t.0).collect();
-        let cs: Vec<usize> = case.triplets.iter().map(|t| t.1).collect();
-        let coo = match CooMatrix::from_triplets(
-            Shape2D::new(case.rows, case.cols),
-            data,
-            rs,
-            cs,
-            true,
-        ) {
-            Ok(m) => m,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    fsci_residual_inf: f64::INFINITY,
-                    scipy_residual_inf: scipy_res,
-                    residual_tol: case.residual_tol,
-                    pass: false,
-                    note: format!("COO build error: {e:?}"),
-                });
-                continue;
-            }
-        };
-        let csc = match coo.to_csc() {
-            Ok(m) => m,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    fsci_residual_inf: f64::INFINITY,
-                    scipy_residual_inf: scipy_res,
-                    residual_tol: case.residual_tol,
-                    pass: false,
-                    note: format!("to_csc error: {e:?}"),
-                });
-                continue;
-            }
-        };
-        let ilu = match spilu(&csc, IluOptions::default()) {
-            Ok(f) => f,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    fsci_residual_inf: f64::INFINITY,
-                    scipy_residual_inf: scipy_res,
-                    residual_tol: case.residual_tol,
-                    pass: false,
-                    note: format!("spilu error: {e:?}"),
-                });
-                continue;
-            }
-        };
-        let x = match ilu.solve(&case.b) {
-            Ok(v) => v,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    fsci_residual_inf: f64::INFINITY,
-                    scipy_residual_inf: scipy_res,
-                    residual_tol: case.residual_tol,
-                    pass: false,
-                    note: format!("ilu.solve error: {e:?}"),
-                });
-                continue;
-            }
+        let solved = fsci_spilu_solve(case);
+        // Compute A x for the residual against b. The reference side is the right-hand side b
+        // (always present); SciPy's residual is context only and is not compared. slices rejects
+        // a non-finite A x element, which the max fold below would otherwise swallow.
+        let ax = solved
+            .as_ref()
+            .ok()
+            .map(|x| matvec_triplets(&case.triplets, x, case.rows));
+        let Some((b, ax)) = ledger.slices(
+            "spilu_solve",
+            &case.case_id,
+            Some(case.b.as_slice()),
+            ax.as_deref(),
+        ) else {
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                fsci_residual_inf: f64::INFINITY,
+                scipy_residual_inf: scipy_res,
+                residual_tol: case.residual_tol,
+                pass: false,
+                note: solved
+                    .err()
+                    .unwrap_or_else(|| "non-finite A x element".to_owned()),
+            });
+            continue;
         };
 
         // Compute residual A x − b
-        let ax = matvec_triplets(&case.triplets, &x, case.rows);
         let mut residual_inf = 0.0_f64;
-        for (axi, bi) in ax.iter().zip(case.b.iter()) {
+        for (axi, bi) in ax.iter().zip(b.iter()) {
             residual_inf = residual_inf.max((axi - bi).abs());
         }
 
         let pass = residual_inf <= case.residual_tol;
+        ledger.compared("spilu_solve", &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             fsci_residual_inf: residual_inf,
@@ -368,6 +346,7 @@ fn diff_sparse_spilu_solve() {
         test_id: "diff_sparse_spilu_solve".into(),
         category: "fsci_sparse::spilu factorization + .solve(b) residual quality".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -389,4 +368,5 @@ fn diff_sparse_spilu_solve() {
         "spilu residual coverage failed: {} cases",
         diffs.len()
     );
+    ledger.finish(query.points.len());
 }

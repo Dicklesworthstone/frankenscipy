@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-2om4f]. 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{binom, zetac_scalar};
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +19,8 @@ const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-10;
 const REL_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per op.
+const ARMS: [&str; 2] = ["binom", "zetac"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -56,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -215,16 +219,19 @@ fn diff_special_binom_zetac() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_binom_zetac", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
-        };
-        let fsci_v = match case.op.as_str() {
+        let fsci = match case.op.as_str() {
             "binom" => binom(case.a, case.b),
             "zetac" => zetac_scalar(case.a),
-            _ => continue,
+            other => panic!("unknown op {other} in {}", case.case_id),
+        };
+        let Some((expected, fsci_v)) =
+            ledger.pair(&case.op, &case.case_id, scipy_arm.value, Some(fsci))
+        else {
+            continue;
         };
         let abs_d = (fsci_v - expected).abs();
         let rel = if expected.abs() > 0.0 {
@@ -233,6 +240,7 @@ fn diff_special_binom_zetac() {
             abs_d
         };
         let pass = abs_d <= ABS_TOL || rel <= REL_TOL;
+        ledger.compared(&case.op, &case.case_id, pass);
         max_overall = max_overall.max(rel);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -248,6 +256,7 @@ fn diff_special_binom_zetac() {
         test_id: "diff_special_binom_zetac".into(),
         category: "scipy.special binom + zetac".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -268,4 +277,11 @@ fn diff_special_binom_zetac() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets; each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

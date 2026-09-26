@@ -16,19 +16,30 @@
 //! floor matches the cylindrical Bessel precision that the residual is
 //! computed against — frankenscipy-0om9c).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{jn_zeros, jnp_zeros, y0_zeros, y1_zeros, y1p_zeros, yn_zeros, ynp_zeros};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-7;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function compared.
+const ARMS: [&str; 7] = [
+    "jn_zeros",
+    "yn_zeros",
+    "jnp_zeros",
+    "ynp_zeros",
+    "y0_zeros",
+    "y1_zeros",
+    "y1p_zeros",
+];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -67,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -96,6 +108,7 @@ fn emit_log(log: &DiffLog) {
 }
 
 fn fsci_eval(func: &str, n: u32, k: usize) -> Option<Vec<f64>> {
+    // A non-finite entry is returned as is: the ledger classifies it against SciPy's.
     let zs = match func {
         "jn_zeros" => jn_zeros(n, k),
         "yn_zeros" => yn_zeros(n, k),
@@ -115,11 +128,7 @@ fn fsci_eval(func: &str, n: u32, k: usize) -> Option<Vec<f64>> {
         }
         _ => return None,
     };
-    if zs.iter().all(|z| z.is_finite()) {
-        Some(zs)
-    } else {
-        None
-    }
+    Some(zs)
 }
 
 fn generate_query() -> OracleQuery {
@@ -270,34 +279,33 @@ fn diff_special_bessel_zeros() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_bessel_zeros", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_zs) = oracle.values.as_ref()
-            && let Some(rust_zs) = fsci_eval(&case.func, case.n, case.k)
-        {
-            if rust_zs.len() != scipy_zs.len() {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    func: case.func.clone(),
-                    abs_diff: f64::INFINITY,
-                    pass: false,
-                });
-                continue;
-            }
-            let max_abs = rust_zs
-                .iter()
-                .zip(scipy_zs.iter())
-                .map(|(r, s)| (r - s).abs())
-                .fold(0.0_f64, f64::max);
-            max_overall = max_overall.max(max_abs);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: max_abs,
-                pass: max_abs <= ABS_TOL,
-            });
-        }
+        let arm = case.func.as_str();
+        let fsci = fsci_eval(&case.func, case.n, case.k);
+        let Some((scipy_zs, rust_zs)) = ledger.slices(
+            arm,
+            &case.case_id,
+            oracle.values.as_deref(),
+            fsci.as_deref(),
+        ) else {
+            continue;
+        };
+        let max_abs = rust_zs
+            .iter()
+            .zip(scipy_zs.iter())
+            .map(|(r, s)| (r - s).abs())
+            .fold(0.0_f64, f64::max);
+        max_overall = max_overall.max(max_abs);
+        ledger.compared(arm, &case.case_id, max_abs <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff: max_abs,
+            pass: max_abs <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -307,6 +315,7 @@ fn diff_special_bessel_zeros() {
         category: "scipy.special.jn_zeros/yn_zeros/jnp_zeros/ynp_zeros/y0_zeros/y1_zeros/y1p_zeros"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -331,4 +340,12 @@ fn diff_special_bessel_zeros() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (the order-specific y0/y1/y1p zeros have the fewest);
+    // each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

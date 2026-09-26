@@ -9,19 +9,21 @@
 //! - polyfromroots ↔ np.poly  (np.polynomial.polynomial.polyfromroots is
 //!   the LOW-FIRST convention, which fsci does not match).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::{polyder, polyfromroots, polyint};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-006";
 const ABS_TOL: f64 = 1.0e-10;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 3] = ["polyder", "polyint", "polyfromroots"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -65,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -259,33 +262,32 @@ fn diff_interpolate_poly_helpers() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_interpolate_poly_helpers", &ARMS);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let fsci_v: Option<Vec<f64>> = match case.op.as_str() {
+            "polyder" => Some(polyder(&case.input, case.m)),
+            "polyint" => Some(polyint(&case.input, case.m, case.k)),
+            "polyfromroots" => Some(polyfromroots(&case.input)),
+            _ => None,
+        };
+        // `slices` records a length mismatch as a compared failure.
+        let Some((expected, fsci_v)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            fsci_v.as_deref(),
+        ) else {
             continue;
         };
-        let fsci_v: Vec<f64> = match case.op.as_str() {
-            "polyder" => polyder(&case.input, case.m),
-            "polyint" => polyint(&case.input, case.m, case.k),
-            "polyfromroots" => polyfromroots(&case.input),
-            _ => continue,
-        };
-        if fsci_v.len() != expected.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let abs_d = fsci_v
             .iter()
             .zip(expected.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -300,6 +302,7 @@ fn diff_interpolate_poly_helpers() {
         test_id: "diff_interpolate_poly_helpers".into(),
         category: "numpy.polyder + polyint + poly (HIGH-FIRST)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -320,4 +323,10 @@ fn diff_interpolate_poly_helpers() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_arm);
 }

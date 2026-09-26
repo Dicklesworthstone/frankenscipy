@@ -26,6 +26,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_runtime::{RuntimeMode, catch_warnings};
 use fsci_special::{
     SpecialErrConfig, SpecialErrMode, SpecialErrorKind, SpecialResult, SpecialTensor, errstate,
@@ -689,6 +690,17 @@ fn diff_scipy_warnings_errstate() {
         "oracle answered a different grid"
     );
 
+    // Every arm's answer is definite on both sides: a `None` raised code means "does not
+    // raise", and a scenario's SciPy exception arrives as a `raise:<Class>` entry.
+    let mut ledger = CompareLedger::new(
+        "diff_scipy_warnings_errstate",
+        &[
+            "errstate_raise",
+            "errstate_warn_count",
+            "warning_classes",
+            "scenario_values",
+        ],
+    );
     let mut failures = Vec::new();
     let mut scipy_raises = 0usize;
     let mut fsci_raises = 0usize;
@@ -696,6 +708,8 @@ fn diff_scipy_warnings_errstate() {
         let fsci = fsci_raised(row);
         scipy_raises += usize::from(scipy.is_some());
         fsci_raises += usize::from(fsci.is_some());
+        let case_id = format!("{}{:?}", row.func, row.args);
+        ledger.compared("errstate_raise", &case_id, &fsci == scipy);
         if &fsci != scipy {
             failures.push(format!(
                 "errstate {}{:?}: scipy raises {scipy:?}, fsci {fsci:?}",
@@ -709,6 +723,7 @@ fn diff_scipy_warnings_errstate() {
     for (func, scipy_count) in &oracle.warn_counts {
         let mine: Vec<&GridRow> = rows.iter().filter(|r| r.func == func.as_str()).collect();
         let fsci_count = fsci_warn_count(func, &mine);
+        ledger.compared("errstate_warn_count", func, fsci_count == *scipy_count);
         if fsci_count != *scipy_count {
             failures.push(format!(
                 "errstate warn {func}: scipy {scipy_count} SpecialFunctionWarnings, fsci {fsci_count}"
@@ -726,13 +741,16 @@ fn diff_scipy_warnings_errstate() {
             "{}: scipy {:?} {:?} | fsci {classes:?} {values:?}",
             s.name, s.classes, s.values
         );
+        ledger.compared("warning_classes", &s.name, classes == s.classes);
         if classes != s.classes {
             failures.push(format!(
                 "{}: scipy raised {:?}, fsci {classes:?}",
                 s.name, s.classes
             ));
         }
-        if !values_agree(&s.name, &values, &s.values) {
+        let values_match = values_agree(&s.name, &values, &s.values);
+        ledger.compared("scenario_values", &s.name, values_match);
+        if !values_match {
             failures.push(format!(
                 "{}: scipy values {:?}, fsci {values:?}",
                 s.name, s.values
@@ -765,4 +783,7 @@ fn diff_scipy_warnings_errstate() {
     );
     // Four scenarios are the quiet neighbours; the rest must warn or raise on both sides.
     assert_eq!(warned_scenarios, WARNING_SCENARIOS - 4);
+    // The smallest arms are the scenario pair (WARNING_SCENARIOS) and the warn counts (one
+    // per function); the grid arm compares every row.
+    ledger.finish(funcs.len().min(WARNING_SCENARIOS));
 }

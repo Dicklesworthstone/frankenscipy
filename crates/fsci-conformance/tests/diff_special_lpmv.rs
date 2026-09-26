@@ -10,13 +10,14 @@
 //! 4 (l, m) pairs × 11 x-values = 44 cases via subprocess.
 //! Tolerances: 1e-12 abs (canonical recurrence).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::lpmv;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -88,9 +90,9 @@ fn emit_log(log: &DiffLog) {
     fs::write(path, json).expect("write lpmv diff log");
 }
 
-fn fsci_eval(m: i32, l: u32, x: f64) -> Option<f64> {
-    let v = lpmv(m, l, x);
-    if v.is_finite() { Some(v) } else { None }
+fn fsci_eval(m: i32, l: u32, x: f64) -> f64 {
+    // A non-finite value is returned as is: the ledger classifies it against SciPy's.
+    lpmv(m, l, x)
 }
 
 fn generate_query() -> OracleQuery {
@@ -205,20 +207,26 @@ fn diff_special_lpmv() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_lpmv", &["lpmv"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(case.m, case.l, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            "lpmv",
+            &case.case_id,
+            oracle.value,
+            Some(fsci_eval(case.m, case.l, case.x)),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared("lpmv", &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -227,6 +235,7 @@ fn diff_special_lpmv() {
         test_id: "diff_special_lpmv".into(),
         category: "scipy.special.lpmv".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -248,4 +257,5 @@ fn diff_special_lpmv() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

@@ -7,13 +7,14 @@
 //! Compares against analytic derivatives computed in numpy.
 //! Tolerance: 1e-6 abs (central differences are O(h^2) at h=1e-5).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_special::{central_diff, central_diff2, gradient_approx, hessian_approx, jacobian_approx};
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +22,14 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-6;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
 const H_STEP: f64 = 1.0e-5;
+/// One ledger arm per helper.
+const ARMS: [&str; 5] = [
+    "central_diff",
+    "central_diff2",
+    "gradient_approx",
+    "jacobian_approx",
+    "hessian_approx",
+];
 
 // Function identifiers shared between Rust closures and the python oracle.
 // Each `func` string keys a fixed analytic form in both layers.
@@ -101,6 +110,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -491,16 +501,22 @@ fn diff_special_finite_difference() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_finite_difference", &ARMS);
 
     // central_diff
     for case in &query.central1 {
-        let Some(expected) = c1_map.get(&case.case_id).and_then(|a| a.value) else {
+        let f = |x: f64| scalar_f(&case.func, x);
+        let Some((expected, actual)) = ledger.pair(
+            "central_diff",
+            &case.case_id,
+            c1_map.get(&case.case_id).and_then(|a| a.value),
+            Some(central_diff(f, case.x, case.h)),
+        ) else {
             continue;
         };
-        let f = |x: f64| scalar_f(&case.func, x);
-        let actual = central_diff(f, case.x, case.h);
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("central_diff", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "central_diff".into(),
@@ -512,13 +528,18 @@ fn diff_special_finite_difference() {
     // central_diff2 (relaxed tol for second derivative, h^2 cancellation)
     let d2_tol = 1.0e-4;
     for case in &query.central2 {
-        let Some(expected) = c2_map.get(&case.case_id).and_then(|a| a.value) else {
+        let f = |x: f64| scalar_f(&case.func, x);
+        let Some((expected, actual)) = ledger.pair(
+            "central_diff2",
+            &case.case_id,
+            c2_map.get(&case.case_id).and_then(|a| a.value),
+            Some(central_diff2(f, case.x, case.h)),
+        ) else {
             continue;
         };
-        let f = |x: f64| scalar_f(&case.func, x);
-        let actual = central_diff2(f, case.x, case.h);
         let abs_d = (actual - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("central_diff2", &case.case_id, abs_d <= d2_tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "central_diff2".into(),
@@ -529,21 +550,24 @@ fn diff_special_finite_difference() {
 
     // gradient_approx
     for case in &query.gradient {
-        let Some(expected) = g_map.get(&case.case_id).and_then(|a| a.values.clone()) else {
+        let f = |x: &[f64]| multi_f(&case.func, x);
+        let grad = gradient_approx(f, &case.x, case.h);
+        // `slices` records a length mismatch or a non-finite element as a failure.
+        let Some((expected, actual)) = ledger.slices(
+            "gradient_approx",
+            &case.case_id,
+            g_map.get(&case.case_id).and_then(|a| a.values.as_deref()),
+            Some(grad.as_slice()),
+        ) else {
             continue;
         };
-        let f = |x: &[f64]| multi_f(&case.func, x);
-        let actual = gradient_approx(f, &case.x, case.h);
-        let abs_d = if actual.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            actual
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("gradient_approx", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "gradient_approx".into(),
@@ -555,24 +579,32 @@ fn diff_special_finite_difference() {
     // jacobian_approx
     for case in &query.jacobian {
         let arm = j_map.get(&case.case_id).expect("validated jacobian arm");
-        let (Some(expected), Some(rows), Some(cols)) = (arm.values.clone(), arm.rows, arm.cols)
-        else {
-            continue;
-        };
         let f = |x: &[f64]| vec_f(&case.func, x);
         let actual = jacobian_approx(f, &case.x, case.h);
         // fsci returns Vec<Vec<f64>>; flatten row-major (n rows = len(x) or m?).
         // jacobian_approx returns a vector of m rows × n cols where m = f(x).len().
         let flat: Vec<f64> = actual.iter().flat_map(|r| r.iter().copied()).collect();
-        let abs_d = if actual.len() != rows || actual.first().map(|r| r.len()) != Some(cols) {
-            f64::INFINITY
-        } else {
-            flat.iter()
+        let Some((expected, got)) = ledger.slices(
+            "jacobian_approx",
+            &case.case_id,
+            arm.values.as_deref(),
+            Some(flat.as_slice()),
+        ) else {
+            continue;
+        };
+        // Same element count but a different shape is still a mismatch.
+        let shape_ok =
+            arm.rows == Some(actual.len()) && arm.cols == actual.first().map(|r| r.len());
+        let abs_d = if shape_ok {
+            got.iter()
                 .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max)
+        } else {
+            f64::INFINITY
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared("jacobian_approx", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "jacobian_approx".into(),
@@ -585,22 +617,30 @@ fn diff_special_finite_difference() {
     let h_tol = 1.0e-3;
     for case in &query.hessian {
         let arm = h_map.get(&case.case_id).expect("validated hessian arm");
-        let (Some(expected), Some(rows), Some(cols)) = (arm.values.clone(), arm.rows, arm.cols)
-        else {
-            continue;
-        };
         let f = |x: &[f64]| multi_f(&case.func, x);
         let actual = hessian_approx(f, &case.x, case.h);
         let flat: Vec<f64> = actual.iter().flat_map(|r| r.iter().copied()).collect();
-        let abs_d = if actual.len() != rows || actual.first().map(|r| r.len()) != Some(cols) {
-            f64::INFINITY
-        } else {
-            flat.iter()
+        let Some((expected, got)) = ledger.slices(
+            "hessian_approx",
+            &case.case_id,
+            arm.values.as_deref(),
+            Some(flat.as_slice()),
+        ) else {
+            continue;
+        };
+        // Same element count but a different shape is still a mismatch.
+        let shape_ok =
+            arm.rows == Some(actual.len()) && arm.cols == actual.first().map(|r| r.len());
+        let abs_d = if shape_ok {
+            got.iter()
                 .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max)
+        } else {
+            f64::INFINITY
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared("hessian_approx", &case.case_id, abs_d <= h_tol);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "hessian_approx".into(),
@@ -615,6 +655,7 @@ fn diff_special_finite_difference() {
         test_id: "diff_special_finite_difference".into(),
         category: "fsci_special FD helpers vs analytic derivatives".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -635,4 +676,17 @@ fn diff_special_finite_difference() {
         diffs.len(),
         max_overall
     );
+    // Each helper has its own case list (jacobian/hessian have the fewest); each arm must
+    // compare all of its own.
+    let min_per_arm = [
+        query.central1.len(),
+        query.central2.len(),
+        query.gradient.len(),
+        query.jacobian.len(),
+        query.hessian.len(),
+    ]
+    .into_iter()
+    .min()
+    .expect("five case lists");
+    ledger.finish(min_per_arm);
 }

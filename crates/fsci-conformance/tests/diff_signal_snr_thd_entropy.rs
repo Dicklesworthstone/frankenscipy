@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-zzeyt]. 1e-12 abs (exact float arithmetic).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{short_time_energy, snr, spectral_entropy, spectral_flatness, thd};
 use serde::{Deserialize, Serialize};
 
@@ -89,6 +90,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -389,15 +391,22 @@ fn diff_signal_snr_thd_entropy() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_signal_snr_thd_entropy",
+        &["snr", "thd", "entropy", "flatness", "short_time_energy"],
+    );
 
     for case in &query.snr {
         let scipy_arm = snr_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
+        let fsci_v = snr(&case.signal, &case.noise);
+        let Some((expected, fsci_v)) =
+            ledger.pair("snr", &case.case_id, scipy_arm.value, Some(fsci_v))
+        else {
             continue;
         };
-        let fsci_v = snr(&case.signal, &case.noise);
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("snr", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "snr".into(),
@@ -408,12 +417,15 @@ fn diff_signal_snr_thd_entropy() {
 
     for case in &query.thd {
         let scipy_arm = thd_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
+        let fsci_v = thd(&case.magnitudes, case.fundamental_bin);
+        let Some((expected, fsci_v)) =
+            ledger.pair("thd", &case.case_id, scipy_arm.value, Some(fsci_v))
+        else {
             continue;
         };
-        let fsci_v = thd(&case.magnitudes, case.fundamental_bin);
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared("thd", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "thd".into(),
@@ -424,16 +436,19 @@ fn diff_signal_snr_thd_entropy() {
 
     for case in &query.entropy {
         let scipy_arm = entropy_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
-        };
         let fsci_v = match case.op.as_str() {
             "entropy" => spectral_entropy(&case.magnitudes),
             "flatness" => spectral_flatness(&case.magnitudes),
-            _ => continue,
+            other => panic!("unknown entropy op {other}"),
+        };
+        let Some((expected, fsci_v)) =
+            ledger.pair(&case.op, &case.case_id, scipy_arm.value, Some(fsci_v))
+        else {
+            continue;
         };
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -444,20 +459,22 @@ fn diff_signal_snr_thd_entropy() {
 
     for case in &query.energy {
         let scipy_arm = energy_map.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.values.as_ref() else {
+        let fsci_v = short_time_energy(&case.x, case.frame_len, case.hop_len);
+        let Some((expected, fsci_v)) = ledger.slices(
+            "short_time_energy",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            Some(fsci_v.as_slice()),
+        ) else {
             continue;
         };
-        let fsci_v = short_time_energy(&case.x, case.frame_len, case.hop_len);
-        let abs_d = if fsci_v.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            fsci_v
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
-        };
+        let abs_d = fsci_v
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared("short_time_energy", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: "short_time_energy".into(),
@@ -472,6 +489,7 @@ fn diff_signal_snr_thd_entropy() {
         test_id: "diff_signal_snr_thd_entropy".into(),
         category: "fsci_signal snr/thd/entropy/flatness/short_time_energy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -491,5 +509,18 @@ fn diff_signal_snr_thd_entropy() {
         "snr_thd_entropy conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    let entropy_ops = |op: &str| query.entropy.iter().filter(|c| c.op == op).count();
+    ledger.finish(
+        [
+            query.snr.len(),
+            query.thd.len(),
+            entropy_ops("entropy"),
+            entropy_ops("flatness"),
+            query.energy.len(),
+        ]
+        .into_iter()
+        .min()
+        .unwrap_or(0),
     );
 }

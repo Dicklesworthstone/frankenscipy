@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-us3t5]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, clustering_coefficient, eccentricity, graph_diameter};
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -260,62 +262,66 @@ fn diff_sparse_clustering_diameter_eccentricity() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_clustering_diameter_eccentricity",
+        &["clustering", "diameter", "eccentricity"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
 
-        if let Some(expected) = scipy_arm.clustering.as_ref() {
-            let fsci_v = clustering_coefficient(&csr);
-            let abs_d = if fsci_v.len() != expected.len() {
-                f64::INFINITY
-            } else {
-                fsci_v
-                    .iter()
-                    .zip(expected.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max)
+        let clustering = clustering_coefficient(&csr);
+        let ecc = eccentricity(&csr);
+        let vector_arms = [
+            (
+                "clustering",
+                scipy_arm.clustering.as_deref(),
+                clustering.as_slice(),
+            ),
+            (
+                "eccentricity",
+                scipy_arm.eccentricity.as_deref(),
+                ecc.as_slice(),
+            ),
+        ];
+        for (op, scipy, fsci) in vector_arms {
+            let Some((expected, fsci_v)) = ledger.slices(op, &case.case_id, scipy, Some(fsci))
+            else {
+                continue;
             };
+            let abs_d = fsci_v
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
             max_overall = max_overall.max(abs_d);
+            ledger.compared(op, &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
-                case_id: format!("{}_clustering", case.case_id),
-                op: "clustering".into(),
+                case_id: format!("{}_{op}", case.case_id),
+                op: op.into(),
                 abs_diff: abs_d,
                 pass: abs_d <= ABS_TOL,
             });
         }
 
-        if let Some(expected) = scipy_arm.diameter {
-            let fsci_v = graph_diameter(&csr);
-            let abs_d = (fsci_v - expected).abs();
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: format!("{}_diameter", case.case_id),
-                op: "diameter".into(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
-
-        if let Some(expected) = scipy_arm.eccentricity.as_ref() {
-            let fsci_v = eccentricity(&csr);
-            let abs_d = if fsci_v.len() != expected.len() {
-                f64::INFINITY
-            } else {
-                fsci_v
-                    .iter()
-                    .zip(expected.iter())
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0_f64, f64::max)
-            };
-            max_overall = max_overall.max(abs_d);
-            diffs.push(CaseDiff {
-                case_id: format!("{}_eccentricity", case.case_id),
-                op: "eccentricity".into(),
-                abs_diff: abs_d,
-                pass: abs_d <= ABS_TOL,
-            });
-        }
+        let Some((expected, fsci_v)) = ledger.pair(
+            "diameter",
+            &case.case_id,
+            scipy_arm.diameter,
+            Some(graph_diameter(&csr)),
+        ) else {
+            continue;
+        };
+        let abs_d = (fsci_v - expected).abs();
+        max_overall = max_overall.max(abs_d);
+        ledger.compared("diameter", &case.case_id, abs_d <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: format!("{}_diameter", case.case_id),
+            op: "diameter".into(),
+            abs_diff: abs_d,
+            pass: abs_d <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -324,6 +330,7 @@ fn diff_sparse_clustering_diameter_eccentricity() {
         test_id: "diff_sparse_clustering_diameter_eccentricity".into(),
         category: "fsci_sparse graph metrics vs networkx".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -344,4 +351,5 @@ fn diff_sparse_clustering_diameter_eccentricity() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

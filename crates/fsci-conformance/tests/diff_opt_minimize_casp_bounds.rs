@@ -16,6 +16,7 @@
 
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_opt::types::Bound;
 use fsci_opt::{MinimizeOptions, minimize_with_casp};
 use fsci_runtime::{OptSolverAction, OptSolverPortfolio, RuntimeMode};
@@ -31,6 +32,8 @@ const FREE_MINIMUM_X_TOL: f64 = 1e-6;
 const SEEDED_BOX_REL_TOL: f64 = 1e-5;
 /// Bounded Rosenbrock x against SciPy's L-BFGS-B x.
 const SCIPY_X_ABS_TOL: f64 = 1e-6;
+/// How many seeded boxed quadratics `casp_bounded_quadratics_are_feasible_and_optimal` runs.
+const SEEDED_BOX_CASES: usize = 200;
 
 fn bounded_methods(action: OptSolverAction) -> bool {
     matches!(
@@ -107,7 +110,11 @@ impl Rng {
 fn casp_bounded_quadratics_are_feasible_and_optimal() {
     let mut rng = Rng(0x5A71_0009_B0D5_0001);
     let (mut cases, mut binding, mut worst) = (0_usize, 0_usize, 0.0_f64);
-    for case in 0..200 {
+    let mut ledger = CompareLedger::new(
+        "casp_bounded_quadratics_are_feasible_and_optimal",
+        &["boxed_quadratic"],
+    );
+    for case in 0..SEEDED_BOX_CASES {
         let n = 1 + (rng.next() % 6) as usize;
         let weights: Vec<f64> = (0..n).map(|_| rng.uniform(0.5, 20.0)).collect();
         let centres: Vec<f64> = (0..n).map(|_| rng.uniform(-8.0, 8.0)).collect();
@@ -157,15 +164,30 @@ fn casp_bounded_quadratics_are_feasible_and_optimal() {
             ..MinimizeOptions::default()
         };
         let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 4);
-        let out = minimize_with_casp(f, &x0, options, &mut portfolio);
-        assert!(out.is_ok(), "case {case}: {:?}", out.as_ref().err());
-        let out = out.expect("checked above");
+        let case_id = format!("case{case}");
+        let out = minimize_with_casp(f, &x0, options, &mut portfolio)
+            .inspect_err(|e| eprintln!("case {case}: {e:?}"))
+            .ok();
+        // The analytic optimum against fsci's x: the ledger records an fsci error, a length
+        // mismatch (the zips below would truncate) and a NaN coordinate.
+        let Some((expected, out)) = ledger.both("boxed_quadratic", &case_id, Some(optimum), out)
+        else {
+            continue;
+        };
+        let Some((optimum, x)) = ledger.slices(
+            "boxed_quadratic",
+            &case_id,
+            Some(expected.as_slice()),
+            Some(out.result.x.as_slice()),
+        ) else {
+            continue;
+        };
         assert!(
             bounded_methods(out.chosen_action),
             "case {case}: {:?} ignores bounds",
             out.chosen_action
         );
-        for (i, (&xi, &(lo, hi))) in out.result.x.iter().zip(&bounds).enumerate() {
+        for (i, (&xi, &(lo, hi))) in x.iter().zip(&bounds).enumerate() {
             assert!(
                 lo.is_none_or(|lo| xi >= lo) && hi.is_none_or(|hi| xi <= hi),
                 "case {case}: x[{i}] = {xi} outside {:?} ({:?})",
@@ -173,14 +195,13 @@ fn casp_bounded_quadratics_are_feasible_and_optimal() {
                 out.chosen_action
             );
         }
-        let error = out
-            .result
-            .x
+        let error = x
             .iter()
-            .zip(&optimum)
+            .zip(optimum)
             .map(|(x, o)| (x - o).abs() / o.abs().max(1.0))
             .fold(0.0_f64, f64::max);
         worst = worst.max(error);
+        ledger.compared("boxed_quadratic", &case_id, error <= SEEDED_BOX_REL_TOL);
         assert!(
             error <= SEEDED_BOX_REL_TOL,
             "case {case}: x = {:?}, optimum {optimum:?} ({:?})",
@@ -190,9 +211,10 @@ fn casp_bounded_quadratics_are_feasible_and_optimal() {
         cases += 1;
     }
     println!("{cases} bounded quadratics, {binding} with a binding bound, worst error {worst:e}");
-    assert_eq!(cases, 200);
+    assert_eq!(cases, SEEDED_BOX_CASES);
     // Must-hit: most cases have their unconstrained optimum outside the box.
     assert!(binding >= 100, "only {binding} cases bind a bound");
+    ledger.finish(SEEDED_BOX_CASES);
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,38 +279,55 @@ fn diff_opt_minimize_casp_bounded_rosenbrock_scipy() {
     };
     let mut portfolio = OptSolverPortfolio::new(RuntimeMode::Strict, 8);
     let out = minimize_with_casp(rosen, &[-1.2, 1.0], options, &mut portfolio)
-        .expect("bounded Rosenbrock");
-    println!(
-        "fsci: action={:?} x={:?} fun={:?}",
-        out.chosen_action, out.result.x, out.result.fun
-    );
-    assert!(bounded_methods(out.chosen_action));
-    assert!(
-        out.result.x.iter().all(|&v| (-2.0..=0.5).contains(&v)),
-        "infeasible x = {:?}",
-        out.result.x
-    );
-
-    let mut compared = 0;
-    if let Some(scipy) = scipy_bounded_rosenbrock_or_skip() {
+        .inspect_err(|e| eprintln!("bounded Rosenbrock: {e:?}"))
+        .ok();
+    if let Some(out) = &out {
         println!(
-            "scipy: success={} x={:?} fun={}",
-            scipy.success, scipy.x, scipy.fun
+            "fsci: action={:?} x={:?} fun={:?}",
+            out.chosen_action, out.result.x, out.result.fun
         );
-        assert!(scipy.success, "SciPy's own run failed");
-        for (fsci, reference) in out.result.x.iter().zip(&scipy.x) {
+        assert!(bounded_methods(out.chosen_action));
+        assert!(
+            out.result.x.iter().all(|&v| (-2.0..=0.5).contains(&v)),
+            "infeasible x = {:?}",
+            out.result.x
+        );
+    }
+
+    // `None` only when python3/SciPy is unavailable and FSCI_REQUIRE_SCIPY_ORACLE is unset: the
+    // oracle asserts otherwise, so this is the usual skip-without-an-oracle.
+    let Some(scipy) = scipy_bounded_rosenbrock_or_skip() else {
+        println!("SciPy unavailable: the live row was not compared");
+        return;
+    };
+    println!(
+        "scipy: success={} x={:?} fun={}",
+        scipy.success, scipy.x, scipy.fun
+    );
+    let mut ledger = CompareLedger::new(
+        "diff_opt_minimize_casp_bounded_rosenbrock_scipy",
+        &["bounded_rosenbrock"],
+    );
+    let mut compared = 0;
+    // SciPy's x is the reference only when its own run succeeded; otherwise `oracle_missing`.
+    let scipy_x = scipy.success.then_some(scipy.x.as_slice());
+    let fsci_x = out.as_ref().map(|out| out.result.x.as_slice());
+    if let Some((scipy_x, x)) = ledger.slices("bounded_rosenbrock", "x", scipy_x, fsci_x) {
+        let pass = x
+            .iter()
+            .zip(scipy_x)
+            .all(|(fsci, reference)| (fsci - reference).abs() <= SCIPY_X_ABS_TOL);
+        ledger.compared("bounded_rosenbrock", "x", pass);
+        for (fsci, reference) in x.iter().zip(scipy_x) {
             assert!(
                 (fsci - reference).abs() <= SCIPY_X_ABS_TOL,
-                "x = {:?}, SciPy {:?}",
-                out.result.x,
-                scipy.x
+                "x = {x:?}, SciPy {scipy_x:?}"
             );
         }
         compared += 1;
     }
     if std::env::var(REQUIRE_SCIPY_ENV).is_ok() {
         assert_eq!(compared, 1, "the live SciPy row was not compared");
-    } else if compared == 0 {
-        println!("SciPy unavailable: the live row was not compared");
     }
+    ledger.finish(1);
 }

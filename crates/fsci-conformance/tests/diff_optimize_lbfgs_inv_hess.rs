@@ -34,12 +34,14 @@
 //! absent from the query — comparing an error against NaN would test nothing — and is pinned
 //! on our side by `inputs_that_would_silently_produce_nan_are_rejected` in the unit tests.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::LbfgsInvHessProduct;
 use serde::{Deserialize, Serialize};
 
@@ -99,6 +101,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     compared_cases: usize,
     total_entries_compared: usize,
     max_relative_difference: f64,
@@ -360,6 +363,7 @@ fn diff_optimize_lbfgs_inv_hess() {
     let mut compared = 0usize;
     let mut total_entries = 0usize;
     let mut worst = 0.0f64;
+    let mut ledger = CompareLedger::new("diff_optimize_lbfgs_inv_hess", &["matvec", "todense"]);
 
     for (case, arm) in query.points.iter().zip(&oracle.points) {
         assert_eq!(
@@ -373,15 +377,9 @@ fn diff_optimize_lbfgs_inv_hess() {
             case.case_id,
             arm.error
         );
-        let (Some(matvec_bits), Some(dense_bits)) =
-            (arm.matvec_bits.as_ref(), arm.dense_bits.as_ref())
-        else {
-            panic!(
-                "case {} came back with a null field and no error; a half-populated arm \
-                 would compare vacuously",
-                case.case_id
-            );
-        };
+        // A null field with no error (a half-populated arm) is recorded as a missing SciPy value.
+        let scipy_matvec = arm.matvec_bits.as_deref().map(as_floats);
+        let scipy_dense = arm.dense_bits.as_deref().map(as_floats);
 
         let (n_corrs, n, probe_count) = (case.n_corrs, case.n, case.probe_count);
         let sk = reshape(&case.sk_bits, n_corrs, n);
@@ -389,28 +387,67 @@ fn diff_optimize_lbfgs_inv_hess() {
         let probe_rows = reshape(&case.probes_bits, probe_count, n);
 
         let operator = LbfgsInvHessProduct::new(sk, yk)
-            .unwrap_or_else(|e| panic!("case {}: construction failed: {e}", case.case_id));
-        assert_eq!(operator.shape(), (n, n), "case {}", case.case_id);
-        assert_eq!(operator.n_corrs(), n_corrs, "case {}", case.case_id);
+            .inspect_err(|e| eprintln!("case {}: construction failed: {e}", case.case_id))
+            .ok();
+        if let Some(operator) = &operator {
+            assert_eq!(operator.shape(), (n, n), "case {}", case.case_id);
+            assert_eq!(operator.n_corrs(), n_corrs, "case {}", case.case_id);
+        }
 
-        let ours_matvec: Vec<f64> = probe_rows
-            .iter()
-            .flat_map(|p| {
-                operator
-                    .matvec(p)
-                    .unwrap_or_else(|e| panic!("case {}: matvec failed: {e}", case.case_id))
-            })
-            .collect();
-        let matvec_diff = max_relative_difference(&ours_matvec, &as_floats(matvec_bits));
+        let ours_matvec: Option<Vec<f64>> = operator.as_ref().and_then(|operator| {
+            probe_rows
+                .iter()
+                .map(|p| {
+                    operator
+                        .matvec(p)
+                        .inspect_err(|e| eprintln!("case {}: matvec failed: {e}", case.case_id))
+                })
+                .collect::<Result<Vec<Vec<f64>>, _>>()
+                .ok()
+                .map(|rows| rows.into_iter().flatten().collect())
+        });
+        let dense = operator.as_ref().map(LbfgsInvHessProduct::todense);
+        let ours_dense: Option<Vec<f64>> = dense
+            .as_ref()
+            .map(|dense| dense.iter().flat_map(|row| row.iter().copied()).collect());
+
+        let matvec = ledger
+            .slices(
+                "matvec",
+                &case.case_id,
+                scipy_matvec.as_deref(),
+                ours_matvec.as_deref(),
+            )
+            .map(|(theirs, ours)| (theirs.len(), max_relative_difference(ours, theirs)));
+        if let Some((_, d)) = matvec {
+            ledger.compared("matvec", &case.case_id, d <= REL_TOL);
+        }
+        let todense = ledger
+            .slices(
+                "todense",
+                &case.case_id,
+                scipy_dense.as_deref(),
+                ours_dense.as_deref(),
+            )
+            .map(|(theirs, ours)| (theirs.len(), max_relative_difference(ours, theirs)));
+        if let Some((_, d)) = todense {
+            ledger.compared("todense", &case.case_id, d <= REL_TOL);
+        }
+        let (
+            Some((matvec_entries, matvec_diff)),
+            Some((dense_entries, dense_diff)),
+            Some(operator),
+            Some(dense),
+        ) = (matvec, todense, operator, dense)
+        else {
+            continue; // the ledger recorded why this case was not compared
+        };
+
         assert!(
             matvec_diff <= REL_TOL,
             "case {}: matvec differs by {matvec_diff:e}, above {REL_TOL:e}",
             case.case_id
         );
-
-        let dense = operator.todense();
-        let ours_dense: Vec<f64> = dense.iter().flat_map(|row| row.iter().copied()).collect();
-        let dense_diff = max_relative_difference(&ours_dense, &as_floats(dense_bits));
         assert!(
             dense_diff <= REL_TOL,
             "case {}: todense differs by {dense_diff:e}, above {REL_TOL:e}",
@@ -434,13 +471,13 @@ fn diff_optimize_lbfgs_inv_hess() {
 
         let case_worst = matvec_diff.max(dense_diff);
         worst = worst.max(case_worst);
-        total_entries += matvec_bits.len() + dense_bits.len();
+        total_entries += matvec_entries + dense_entries;
         compared += 1;
         cases.push(CaseDiff {
             case_id: case.case_id.clone(),
             n_corrs,
             n,
-            entries_compared: matvec_bits.len() + dense_bits.len(),
+            entries_compared: matvec_entries + dense_entries,
             max_relative_difference: case_worst,
             pass: true,
         });
@@ -450,6 +487,7 @@ fn diff_optimize_lbfgs_inv_hess() {
         test_id: "diff_optimize_lbfgs_inv_hess".to_string(),
         category: "optimize".to_string(),
         case_count: query.points.len(),
+        compared: ledger.counts().clone(),
         compared_cases: compared,
         total_entries_compared: total_entries,
         max_relative_difference: worst,
@@ -472,6 +510,7 @@ fn diff_optimize_lbfgs_inv_hess() {
         total_entries > 1000,
         "only {total_entries} entries compared; the larger cases did not run"
     );
+    ledger.finish(query.points.len());
 }
 
 /// MUST-HIT / MUST-MISS control for the comparator, including the shape case that would

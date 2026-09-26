@@ -17,6 +17,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_opt::{MinimizeOptions, OptimizeMethod, minimize};
 use serde::{Deserialize, Serialize};
 
@@ -258,6 +259,7 @@ fn diff_opt_powell() {
     let mut same_nfev = 0;
     let mut failures = Vec::new();
     let mut solutions = std::collections::HashMap::new();
+    let mut ledger = CompareLedger::new("diff_opt_powell", &["powell"]);
     for (problem, answer) in problems.iter().zip(&answers) {
         let (kind, p) = (problem.kind, problem.p.clone());
         let options = MinimizeOptions {
@@ -265,15 +267,33 @@ fn diff_opt_powell() {
             tol: problem.tol,
             ..MinimizeOptions::default()
         };
-        let result = match minimize(move |x: &[f64]| eval(kind, &p, x), &problem.x0, options) {
-            Ok(r) => r,
-            Err(e) => {
-                failures.push(format!("{}: fsci Err({e:?})", problem.name));
-                compared += 1;
-                continue;
+        let result = minimize(move |x: &[f64]| eval(kind, &p, x), &problem.x0, options)
+            .map_err(|e| format!("{e:?}"));
+        let Some((answer, result)) =
+            ledger.both("powell", &problem.name, Some(answer), result.as_ref().ok())
+        else {
+            if let Err(e) = &result {
+                failures.push(format!("{}: fsci Err({e})", problem.name));
             }
+            compared += 1;
+            continue;
         };
-        let d = max_abs_diff(&result.x, &answer.x);
+        solutions.insert(problem.name.clone(), result.x.clone());
+        // Rejects a length mismatch and a NaN in fsci's x that `max_abs_diff`'s fold would drop.
+        let Some((expected_x, fsci_x)) = ledger.slices(
+            "powell",
+            &problem.name,
+            Some(answer.x.as_slice()),
+            Some(result.x.as_slice()),
+        ) else {
+            failures.push(format!(
+                "{}: x {:?} vs SciPy {:?}",
+                problem.name, result.x, answer.x
+            ));
+            compared += 1;
+            continue;
+        };
+        let d = max_abs_diff(fsci_x, expected_x);
         let fsci_success = result.success;
         if result.nfev == answer.nfev {
             same_nfev += 1;
@@ -282,13 +302,14 @@ fn diff_opt_powell() {
             "{}: |x - x_scipy| {d:.2e} | success fsci {fsci_success} SciPy {} | nfev fsci {} SciPy {}",
             problem.name, answer.success, result.nfev, answer.nfev
         );
-        if d.is_nan() || d > X_ABS_TOL || fsci_success != answer.success {
+        let row_fails = d.is_nan() || d > X_ABS_TOL || fsci_success != answer.success;
+        ledger.compared("powell", &problem.name, !row_fails);
+        if row_fails {
             failures.push(format!(
                 "{}: x {:?} vs SciPy {:?}, success {fsci_success} vs {}",
                 problem.name, result.x, answer.x, answer.success
             ));
         }
-        solutions.insert(problem.name.clone(), result.x.clone());
         compared += 1;
     }
 
@@ -312,4 +333,5 @@ fn diff_opt_powell() {
     println!("{compared} problems compared; nfev equal to SciPy's on {same_nfev}");
     assert_eq!(compared, problems.len());
     assert!(failures.is_empty(), "Powell disagrees: {failures:#?}");
+    ledger.finish(problems.len());
 }

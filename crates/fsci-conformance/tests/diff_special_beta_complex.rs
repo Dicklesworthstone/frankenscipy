@@ -10,13 +10,14 @@
 //! Resolves [frankenscipy-6pfey]. Tolerance: 1e-9 abs for betaln (real
 //! and imaginary, mod 2π); rel 1e-9 for beta values where |β| > 1e-12.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::Complex64 as FsciComplex;
 use fsci_special::types::SpecialTensor;
@@ -69,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -241,23 +243,27 @@ fn diff_special_beta_complex() {
     let mut max_overall = 0.0_f64;
 
     let two_pi = 2.0 * std::f64::consts::PI;
+    let mut ledger = CompareLedger::new("diff_special_beta_complex", &["betaln", "beta"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(eb_re), Some(eb_im), Some(ebv_re), Some(ebv_im)) =
-            (arm.betaln_re, arm.betaln_im, arm.beta_re, arm.beta_im)
-        else {
-            continue;
-        };
+        let oracle = pmap.get(&case.case_id);
+        // (re, im) pairs: a NaN part makes the distance below NaN, which fails its
+        // tolerance check, so it cannot pass silently.
+        let scipy_betaln = oracle.and_then(|o| o.betaln_re.zip(o.betaln_im));
+        let scipy_beta = oracle.and_then(|o| o.beta_re.zip(o.beta_im));
 
         // betaln
-        if let Some((re, im)) = fsci_eval("betaln", case.a_re, case.a_im, case.b_re, case.b_im) {
+        if let Some(((eb_re, eb_im), (re, im))) = ledger.both(
+            "betaln",
+            &case.case_id,
+            scipy_betaln,
+            fsci_eval("betaln", case.a_re, case.a_im, case.b_re, case.b_im),
+        ) {
             let im_diff_full = ((im - eb_im) / two_pi).round();
             let im_adj = im - im_diff_full * two_pi;
             let abs_d = ((re - eb_re).powi(2) + (im_adj - eb_im).powi(2)).sqrt();
             max_overall = max_overall.max(abs_d);
+            ledger.compared("betaln", &case.case_id, abs_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: format!("{}_betaln", case.case_id),
                 op: "betaln".into(),
@@ -267,12 +273,18 @@ fn diff_special_beta_complex() {
         }
 
         // beta (use rel for large magnitudes)
-        if let Some((re, im)) = fsci_eval("beta", case.a_re, case.a_im, case.b_re, case.b_im) {
+        if let Some(((ebv_re, ebv_im), (re, im))) = ledger.both(
+            "beta",
+            &case.case_id,
+            scipy_beta,
+            fsci_eval("beta", case.a_re, case.a_im, case.b_re, case.b_im),
+        ) {
             let abs_d = ((re - ebv_re).powi(2) + (im - ebv_im).powi(2)).sqrt();
             let mag = (ebv_re * ebv_re + ebv_im * ebv_im).sqrt();
             let rel_d = if mag > 1.0e-12 { abs_d / mag } else { abs_d };
             max_overall = max_overall.max(rel_d);
             let pass = rel_d <= REL_TOL || abs_d <= ABS_TOL;
+            ledger.compared("beta", &case.case_id, pass);
             diffs.push(CaseDiff {
                 case_id: format!("{}_beta", case.case_id),
                 op: "beta".into(),
@@ -289,6 +301,7 @@ fn diff_special_beta_complex() {
         category: "fsci_special::beta + betaln (ComplexScalar) vs scipy.special.loggamma formula"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -309,4 +322,5 @@ fn diff_special_beta_complex() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

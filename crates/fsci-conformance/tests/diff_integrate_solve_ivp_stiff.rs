@@ -29,10 +29,13 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_integrate::{SolveIvpOptions, SolverKind, ToleranceValue, solve_ivp};
 use serde::{Deserialize, Serialize};
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per `solve_ivp` method; a row's verdict is every check on it passing.
+const METHODS: [&str; 2] = ["BDF", "Radau"];
 /// |fsci - SciPy| <= Y_SCALE_FACTOR_TOL * (rtol * |y_scipy| + atol) per component of y(t_end).
 const Y_SCALE_FACTOR_TOL: f64 = 1.0;
 /// Exact solutions: |y - exact| <= EXACT_SCALE_FACTOR_TOL * (rtol * |exact| + atol) per component.
@@ -216,6 +219,7 @@ fn diff_integrate_solve_ivp_stiff() {
     let mut compared = 0;
     let mut worst_scaled = 0.0_f64;
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new("diff_integrate_solve_ivp_stiff", &METHODS);
     for (case, answer) in cases.iter().zip(&answers) {
         let problem = case.problem.clone();
         let mut fun = move |t: f64, y: &[f64]| rhs(&problem, t, y);
@@ -232,21 +236,35 @@ fn diff_integrate_solve_ivp_stiff() {
             ..SolveIvpOptions::default()
         };
         compared += 1;
-        let result = match solve_ivp(&mut fun, &options) {
-            Ok(r) => r,
-            Err(e) => {
-                failures.push(format!("{}: fsci Err({e:?})", case.name));
-                continue;
-            }
+        let arm = case.method.as_str();
+        let failures_before = failures.len();
+        let result = solve_ivp(&mut fun, &options);
+        if let Err(e) = &result {
+            failures.push(format!("{}: fsci Err({e:?})", case.name));
+        }
+        let Some((answer, result)) = ledger.both(arm, &case.name, Some(answer), result.ok()) else {
+            continue;
         };
-        let y_end = result.y.last().cloned().unwrap_or_default();
-        if y_end.len() != answer.y_end.len() || result.status != 0 || answer.status != 0 {
+        let fsci_y_end = result.y.last().cloned().unwrap_or_default();
+        if result.status != 0 || answer.status != 0 {
             failures.push(format!(
-                "{}: status fsci {} SciPy {}, y_end {y_end:?}",
+                "{}: status fsci {} SciPy {}, y_end {fsci_y_end:?}",
                 case.name, result.status, answer.status
             ));
-            continue;
         }
+        // Length, and a NaN in any component, which the max folds below would swallow.
+        let Some((_, y_end)) = ledger.slices(
+            arm,
+            &case.name,
+            Some(answer.y_end.as_slice()),
+            Some(fsci_y_end.as_slice()),
+        ) else {
+            failures.push(format!(
+                "{}: y_end {fsci_y_end:?} against SciPy {:?}",
+                case.name, answer.y_end
+            ));
+            continue;
+        };
         let scaled = y_end
             .iter()
             .zip(&answer.y_end)
@@ -304,6 +322,7 @@ fn diff_integrate_solve_ivp_stiff() {
                 ));
             }
         }
+        ledger.compared(arm, &case.name, failures.len() == failures_before);
     }
     println!("{compared} integrations compared; worst scaled y gap {worst_scaled:.3e}");
     assert_eq!(compared, cases.len());
@@ -311,4 +330,10 @@ fn diff_integrate_solve_ivp_stiff() {
         failures.is_empty(),
         "stiff solve_ivp disagrees: {failures:#?}"
     );
+    let min_per_arm = METHODS
+        .iter()
+        .map(|m| cases.iter().filter(|c| c.method == *m).count())
+        .min()
+        .expect("METHODS is non-empty");
+    ledger.finish(min_per_arm);
 }

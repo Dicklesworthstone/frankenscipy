@@ -10,13 +10,14 @@
 //!
 //! Tolerance: 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{downsample, normalize_minmax, normalize_signal, upsample};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -238,31 +240,38 @@ fn diff_signal_normalize_down_up() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let op_arms = [
+        "normalize_signal",
+        "normalize_minmax",
+        "downsample",
+        "upsample",
+    ];
+    let mut ledger = CompareLedger::new("diff_signal_normalize_down_up", &op_arms);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
         let actual: Vec<f64> = match case.op.as_str() {
             "normalize_signal" => normalize_signal(&case.x),
             "normalize_minmax" => normalize_minmax(&case.x),
             "downsample" => downsample(&case.x, case.factor),
             "upsample" => upsample(&case.x, case.factor),
-            _ => continue,
+            other => panic!("unknown op {other}"),
         };
-        let abs_d = if actual.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            actual
-                .iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
+        let Some((expected, actual)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            pmap.get(&case.case_id)
+                .and_then(|arm| arm.values.as_deref()),
+            Some(actual.as_slice()),
+        ) else {
+            continue;
         };
+        let abs_d = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -278,6 +287,7 @@ fn diff_signal_normalize_down_up() {
         category: "fsci_signal normalize_signal/normalize_minmax/downsample/upsample vs numpy"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -297,5 +307,12 @@ fn diff_signal_normalize_down_up() {
         "normalize_du conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        op_arms
+            .iter()
+            .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+            .min()
+            .unwrap_or(0),
     );
 }

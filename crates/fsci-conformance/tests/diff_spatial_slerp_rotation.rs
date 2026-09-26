@@ -13,13 +13,14 @@
 //! 4 fixtures. Tol 1e-12 abs (closed-form trig, no iterative
 //! algorithms).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{geometric_slerp, rotate_point, rotation_matrix};
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +72,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -284,77 +286,112 @@ fn diff_spatial_slerp_rotation() {
 
     let start = Instant::now();
     let mut cases = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_spatial_slerp_rotation",
+        &["geometric_slerp", "rotation_matrix", "rotate_point"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
 
-        // geometric_slerp
-        if let Some(scipy_rows) = scipy_arm.slerp_rows.as_ref() {
-            match geometric_slerp(&case.slerp_start, &case.slerp_end, &case.slerp_t) {
-                Ok(rust_rows) => {
-                    let pass = rust_rows.len() == scipy_rows.len()
-                        && rust_rows.iter().zip(scipy_rows.iter()).all(|(rr, sr)| {
-                            rr.len() == sr.len()
-                                && rr
-                                    .iter()
-                                    .zip(sr.iter())
-                                    .all(|(r, s)| (r - s).abs() <= ABS_TOL)
-                        });
-                    cases.push(CaseDiff {
-                        case_id: case.case_id.clone(),
-                        sub_check: "geometric_slerp".into(),
-                        detail: format!(
-                            "rust_rows={}, scipy_rows={}",
-                            rust_rows.len(),
-                            scipy_rows.len()
-                        ),
-                        pass,
+        // geometric_slerp. Element values go through slices on the row-major flattening
+        // (non-finite fsci elements are rejected); the row structure is checked below.
+        let rust_res = geometric_slerp(&case.slerp_start, &case.slerp_end, &case.slerp_t);
+        let scipy_flat = scipy_arm.slerp_rows.as_ref().map(|rows| rows.concat());
+        let rust_flat = rust_res.as_ref().ok().map(|rows| rows.concat());
+        let gate = ledger.slices(
+            "geometric_slerp",
+            &case.case_id,
+            scipy_flat.as_deref(),
+            rust_flat.as_deref(),
+        );
+        // gate is Some only when both the SciPy rows and the fsci rows are present.
+        match (gate, scipy_arm.slerp_rows.as_ref(), rust_res.as_ref()) {
+            (Some(_), Some(scipy_rows), Ok(rust_rows)) => {
+                let pass = rust_rows.len() == scipy_rows.len()
+                    && rust_rows.iter().zip(scipy_rows.iter()).all(|(rr, sr)| {
+                        rr.len() == sr.len()
+                            && rr
+                                .iter()
+                                .zip(sr.iter())
+                                .all(|(r, s)| (r - s).abs() <= ABS_TOL)
                     });
-                }
-                Err(e) => cases.push(CaseDiff {
+                ledger.compared("geometric_slerp", &case.case_id, pass);
+                cases.push(CaseDiff {
                     case_id: case.case_id.clone(),
                     sub_check: "geometric_slerp".into(),
-                    detail: format!("rust err: {e:?}"),
-                    pass: false,
-                }),
+                    detail: format!(
+                        "rust_rows={}, scipy_rows={}",
+                        rust_rows.len(),
+                        scipy_rows.len()
+                    ),
+                    pass,
+                });
             }
+            (_, Some(_), Err(e)) => cases.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                sub_check: "geometric_slerp".into(),
+                detail: format!("rust err: {e:?}"),
+                pass: false,
+            }),
+            _ => {} // the ledger recorded why this case was not compared
         }
 
         // rotation_matrix
-        if let Some(scipy_m) = scipy_arm.rot_matrix {
-            let rust_m = rotation_matrix(&case.rot_axis, case.rot_angle);
+        let rust_m = rotation_matrix(&case.rot_axis, case.rot_angle);
+        let scipy_m_flat = scipy_arm.rot_matrix.map(|m| m.concat());
+        let rust_m_flat = rust_m.concat();
+        if let (Some(_), Some(scipy_m)) = (
+            ledger.slices(
+                "rotation_matrix",
+                &case.case_id,
+                scipy_m_flat.as_deref(),
+                Some(rust_m_flat.as_slice()),
+            ),
+            scipy_arm.rot_matrix,
+        ) {
             let mut max_d = 0.0_f64;
             for i in 0..3 {
                 for j in 0..3 {
                     max_d = max_d.max((rust_m[i][j] - scipy_m[i][j]).abs());
                 }
             }
+            ledger.compared("rotation_matrix", &case.case_id, max_d <= ABS_TOL);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "rotation_matrix".into(),
                 detail: format!("max_abs={max_d}"),
                 pass: max_d <= ABS_TOL,
             });
+        }
 
-            // rotate_point — apply Rust matrix, compare to scipy's
-            // (matrix @ point).
-            if let Some(scipy_rp) = scipy_arm.rotated_point {
-                let rust_rp = rotate_point(&rust_m, &case.rot_point);
-                let max_d = [
-                    (rust_rp[0] - scipy_rp[0]).abs(),
-                    (rust_rp[1] - scipy_rp[1]).abs(),
-                    (rust_rp[2] - scipy_rp[2]).abs(),
-                ]
-                .iter()
-                .cloned()
-                .fold(0.0_f64, f64::max);
-                cases.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    sub_check: "rotate_point".into(),
-                    detail: format!("rust={rust_rp:?}, scipy={scipy_rp:?}"),
-                    pass: max_d <= ABS_TOL,
-                });
-            }
+        // rotate_point — apply Rust matrix, compare to scipy's
+        // (matrix @ point). It needs only fsci's matrix, so it no longer waits on SciPy's.
+        let rust_rp = rotate_point(&rust_m, &case.rot_point);
+        if let (Some(_), Some(scipy_rp)) = (
+            ledger.slices(
+                "rotate_point",
+                &case.case_id,
+                scipy_arm.rotated_point.as_ref().map(|p| p.as_slice()),
+                Some(rust_rp.as_slice()),
+            ),
+            scipy_arm.rotated_point,
+        ) {
+            let max_d = [
+                (rust_rp[0] - scipy_rp[0]).abs(),
+                (rust_rp[1] - scipy_rp[1]).abs(),
+                (rust_rp[2] - scipy_rp[2]).abs(),
+            ]
+            .iter()
+            .cloned()
+            .fold(0.0_f64, f64::max);
+            ledger.compared("rotate_point", &case.case_id, max_d <= ABS_TOL);
+            cases.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                sub_check: "rotate_point".into(),
+                detail: format!("rust={rust_rp:?}, scipy={scipy_rp:?}"),
+                pass: max_d <= ABS_TOL,
+            });
         }
     }
 
@@ -365,6 +402,7 @@ fn diff_spatial_slerp_rotation() {
         test_id: "diff_spatial_slerp_rotation".into(),
         category: "fsci_spatial::{geometric_slerp,rotation_matrix,rotate_point}".into(),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -389,4 +427,5 @@ fn diff_spatial_slerp_rotation() {
         pass_count,
         cases.len()
     );
+    ledger.finish(query.points.len());
 }

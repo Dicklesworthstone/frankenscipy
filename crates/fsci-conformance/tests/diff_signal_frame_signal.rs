@@ -7,13 +7,14 @@
 //!
 //! Tolerance: exact (no floating-point ops applied to data).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::frame_signal;
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -216,6 +218,7 @@ fn diff_signal_frame_signal() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.points.len(), query.points.len());
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -226,17 +229,24 @@ fn diff_signal_frame_signal() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_frame_signal", &["frame_signal"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(eflat), Some(enf)) = (arm.flat.as_ref(), arm.n_frames) else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
         let frames = frame_signal(&case.x, case.frame_len, case.hop_len);
         let flat: Vec<f64> = frames.iter().flatten().copied().collect();
-        let abs_d = if frames.len() != enf || flat.len() != eflat.len() {
+        // SciPy's side needs both the flattened frames and the frame count.
+        let scipy_flat = arm.n_frames.and(arm.flat.as_deref());
+        let Some((eflat, flat)) = ledger.slices(
+            "frame_signal",
+            &case.case_id,
+            scipy_flat,
+            Some(flat.as_slice()),
+        ) else {
+            continue;
+        };
+        let enf = arm.n_frames.expect("scipy_flat requires n_frames");
+        let abs_d = if frames.len() != enf {
             f64::INFINITY
         } else {
             flat.iter()
@@ -245,6 +255,7 @@ fn diff_signal_frame_signal() {
                 .fold(0.0_f64, f64::max)
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared("frame_signal", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -258,6 +269,7 @@ fn diff_signal_frame_signal() {
         test_id: "diff_signal_frame_signal".into(),
         category: "fsci_signal::frame_signal vs numpy slicing".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -278,4 +290,5 @@ fn diff_signal_frame_signal() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

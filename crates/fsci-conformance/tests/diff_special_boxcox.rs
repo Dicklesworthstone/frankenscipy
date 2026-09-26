@@ -9,6 +9,7 @@ use std::error::Error;
 use std::io::{Error as IoError, Write};
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_special::boxcox_scalar;
 use serde::{Deserialize, Serialize};
 
@@ -187,6 +188,7 @@ fn diff_special_boxcox() -> Result<(), Box<dyn Error>> {
         )));
     }
 
+    let mut ledger = CompareLedger::new("diff_special_boxcox", &["boxcox"]);
     for (case, oracle) in query.points.iter().zip(oracle.points.iter()) {
         if case.case_id != oracle.case_id {
             return Err(test_error(format!(
@@ -195,24 +197,36 @@ fn diff_special_boxcox() -> Result<(), Box<dyn Error>> {
             )));
         }
         let actual = boxcox_scalar(parse_case_f64(&case.x)?, parse_case_f64(&case.lam)?);
-        let (actual_kind, actual_value) = value_kind(actual);
+        let (actual_kind, _) = value_kind(actual);
         if actual_kind != oracle.kind {
             return Err(test_error(format!(
                 "{} kind mismatch: got {}, expected {}",
                 case.case_id, actual_kind, oracle.kind
             )));
         }
-        if let (Some(actual), Some(expected)) = (actual_value, oracle.value) {
-            let scale = expected.abs().max(1.0);
-            let abs_diff = (actual - expected).abs();
-            if abs_diff > BOXCOX_TOL * scale {
-                return Err(test_error(format!(
-                    "{} value mismatch: got {actual}, expected {expected}, abs_diff={abs_diff}",
-                    case.case_id
-                )));
-            }
+        // The oracle sends a NaN/inf answer as its kind with a null value; restore the number so
+        // the ledger compares it as a matching non-finite case rather than a missing oracle.
+        let scipy = match oracle.kind.as_str() {
+            "nan" => Some(f64::NAN),
+            "pos_inf" => Some(f64::INFINITY),
+            "neg_inf" => Some(f64::NEG_INFINITY),
+            _ => oracle.value,
+        };
+        let Some((expected, actual)) = ledger.pair("boxcox", &case.case_id, scipy, Some(actual))
+        else {
+            continue;
+        };
+        let scale = expected.abs().max(1.0);
+        let abs_diff = (actual - expected).abs();
+        ledger.compared("boxcox", &case.case_id, abs_diff <= BOXCOX_TOL * scale);
+        if abs_diff > BOXCOX_TOL * scale {
+            return Err(test_error(format!(
+                "{} value mismatch: got {actual}, expected {expected}, abs_diff={abs_diff}",
+                case.case_id
+            )));
         }
     }
 
+    ledger.finish(query.points.len());
     Ok(())
 }

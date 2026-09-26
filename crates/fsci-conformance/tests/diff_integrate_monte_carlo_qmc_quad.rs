@@ -11,15 +11,26 @@
 //!   * QMC reports n_estimates < 2 → error (variance needs ≥2 blocks).
 //!   * QMC reports dimension > 32 → error (out of pinned-prime table).
 
+use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{monte_carlo_integrate, qmc_quad};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+/// (case id prefix, ledger arm): one arm per routine.
+const ARMS: [(&str, &str); 2] = [("mc_", "monte_carlo_integrate"), ("qmc_", "qmc_quad")];
+
+fn arm_of(case_id: &str) -> &'static str {
+    ARMS.into_iter()
+        .find(|(prefix, _)| case_id.starts_with(*prefix))
+        .map(|(_, arm)| arm)
+        .unwrap_or_else(|| panic!("case {case_id} names no declared arm"))
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -33,6 +44,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -64,7 +76,14 @@ fn emit_log(log: &DiffLog) {
 fn diff_integrate_monte_carlo_qmc_quad() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_integrate_monte_carlo_qmc_quad",
+        &ARMS.map(|(_, arm)| arm),
+    );
+    // Every check records one CaseDiff, so `diffs` is the designed case list, and one ledger
+    // verdict (a NaN estimate fails its own comparison).
     let mut check = |id: &str, ok: bool, note: String| {
+        ledger.compared(arm_of(id), id, ok);
         diffs.push(CaseDiff {
             case_id: id.into(),
             pass: ok,
@@ -208,6 +227,7 @@ fn diff_integrate_monte_carlo_qmc_quad() {
         test_id: "diff_integrate_monte_carlo_qmc_quad".into(),
         category: "fsci_integrate::{monte_carlo_integrate, qmc_quad} coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -222,4 +242,11 @@ fn diff_integrate_monte_carlo_qmc_quad() {
     }
 
     assert!(all_pass, "mc/qmc coverage failed: {} cases", diffs.len());
+    // monte_carlo_integrate has 5 checks and qmc_quad 6; each arm must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|(_, arm)| diffs.iter().filter(|d| arm_of(&d.case_id) == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

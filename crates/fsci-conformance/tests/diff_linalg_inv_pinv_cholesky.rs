@@ -9,13 +9,14 @@
 //!
 //! 4 fixtures × {applicable fns} ≈ 10 cases. Tol 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_linalg::{DecompOptions, InvOptions, PinvOptions, cholesky, inv, pinv};
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +63,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -98,6 +100,22 @@ fn max_abs_diff_mat(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
         }
     }
     m
+}
+
+/// `slices` over the row-major flattening records a missing side, a length mismatch, or a
+/// non-finite entry (which the max fold in `max_abs_diff_mat` would swallow); the metric is
+/// still `max_abs_diff_mat`.
+fn matrix_diff(
+    ledger: &mut CompareLedger,
+    arm: &str,
+    case_id: &str,
+    scipy: Option<&[Vec<f64>]>,
+    fsci: Option<&[Vec<f64>]>,
+) -> Option<f64> {
+    let scipy_flat: Option<Vec<f64>> = scipy.map(<[Vec<f64>]>::concat);
+    let fsci_flat: Option<Vec<f64>> = fsci.map(<[Vec<f64>]>::concat);
+    ledger.slices(arm, case_id, scipy_flat.as_deref(), fsci_flat.as_deref())?;
+    Some(max_abs_diff_mat(fsci?, scipy?))
 }
 
 fn generate_query() -> OracleQuery {
@@ -262,30 +280,48 @@ fn diff_linalg_inv_pinv_cholesky() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    // Each arm covers the cases its function applies to (the same flags that select what the
+    // oracle computes).
+    let mut ledger = CompareLedger::new(
+        "diff_linalg_inv_pinv_cholesky",
+        &["inv", "pinv", "cholesky_lower"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
 
         // inv
-        if let Some(scipy_inv_m) = scipy_arm.inv.as_ref()
-            && let Ok(rust_res) = inv(&case.a, InvOptions::default())
-        {
-            let max_d = max_abs_diff_mat(&rust_res.inverse, scipy_inv_m);
-            max_overall = max_overall.max(max_d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                sub_check: "inv".into(),
-                max_abs_diff: max_d,
-                pass: max_d <= ABS_TOL,
-            });
+        if case.is_square_invertible {
+            let rust_res = inv(&case.a, InvOptions::default()).ok();
+            if let Some(max_d) = matrix_diff(
+                &mut ledger,
+                "inv",
+                &case.case_id,
+                scipy_arm.inv.as_deref(),
+                rust_res.as_ref().map(|r| r.inverse.as_slice()),
+            ) {
+                max_overall = max_overall.max(max_d);
+                ledger.compared("inv", &case.case_id, max_d <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    sub_check: "inv".into(),
+                    max_abs_diff: max_d,
+                    pass: max_d <= ABS_TOL,
+                });
+            }
         }
 
-        // pinv
-        if let Some(scipy_pinv_m) = scipy_arm.pinv.as_ref()
-            && let Ok(rust_res) = pinv(&case.a, PinvOptions::default())
-        {
-            let max_d = max_abs_diff_mat(&rust_res.pseudo_inverse, scipy_pinv_m);
+        // pinv (every case)
+        let rust_res = pinv(&case.a, PinvOptions::default()).ok();
+        if let Some(max_d) = matrix_diff(
+            &mut ledger,
+            "pinv",
+            &case.case_id,
+            scipy_arm.pinv.as_deref(),
+            rust_res.as_ref().map(|r| r.pseudo_inverse.as_slice()),
+        ) {
             max_overall = max_overall.max(max_d);
+            ledger.compared("pinv", &case.case_id, max_d <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "pinv".into(),
@@ -295,17 +331,24 @@ fn diff_linalg_inv_pinv_cholesky() {
         }
 
         // cholesky (lower)
-        if let Some(scipy_chol_m) = scipy_arm.chol_lower.as_ref()
-            && let Ok(rust_res) = cholesky(&case.a, true, DecompOptions::default())
-        {
-            let max_d = max_abs_diff_mat(&rust_res.factor, scipy_chol_m);
-            max_overall = max_overall.max(max_d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                sub_check: "cholesky_lower".into(),
-                max_abs_diff: max_d,
-                pass: max_d <= ABS_TOL,
-            });
+        if case.is_spd {
+            let rust_res = cholesky(&case.a, true, DecompOptions::default()).ok();
+            if let Some(max_d) = matrix_diff(
+                &mut ledger,
+                "cholesky_lower",
+                &case.case_id,
+                scipy_arm.chol_lower.as_deref(),
+                rust_res.as_ref().map(|r| r.factor.as_slice()),
+            ) {
+                max_overall = max_overall.max(max_d);
+                ledger.compared("cholesky_lower", &case.case_id, max_d <= ABS_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    sub_check: "cholesky_lower".into(),
+                    max_abs_diff: max_d,
+                    pass: max_d <= ABS_TOL,
+                });
+            }
         }
     }
 
@@ -315,6 +358,7 @@ fn diff_linalg_inv_pinv_cholesky() {
         test_id: "diff_linalg_inv_pinv_cholesky".into(),
         category: "fsci_linalg::{inv,pinv,cholesky}".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -339,4 +383,12 @@ fn diff_linalg_inv_pinv_cholesky() {
         diffs.len(),
         max_overall
     );
+    // inv covers the square invertible cases, pinv every case, cholesky the SPD ones.
+    let inv_cases = query
+        .points
+        .iter()
+        .filter(|c| c.is_square_invertible)
+        .count();
+    let chol_cases = query.points.iter().filter(|c| c.is_spd).count();
+    ledger.finish(inv_cases.min(chol_cases).min(query.points.len()));
 }

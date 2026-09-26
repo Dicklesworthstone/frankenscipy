@@ -11,13 +11,14 @@
 //! marked nodes visited at push time and so built the wrong predecessor tree.
 //! The asymmetric cases below are the ones where that showed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, breadth_first_order, depth_first_order};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -283,42 +285,44 @@ fn diff_sparse_bfs_dfs_order() -> Result<(), String> {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    let arms = ["bfs", "dfs"];
+    let mut ledger = CompareLedger::new("diff_sparse_bfs_dfs_order", &arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let (Some(scipy_order), Some(scipy_preds)) =
-            (scipy_arm.order.as_ref(), scipy_arm.predecessors.as_ref())
-        else {
-            return Err(format!(
-                "{}: SciPy raised on a valid traversal case",
-                case.case_id
-            ));
-        };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
         let fsci_result = match case.op.as_str() {
             "bfs" => breadth_first_order(&csr, case.source, true),
             "dfs" => depth_first_order(&csr, case.source, true),
             other => return Err(format!("unknown op {other}")),
         };
-        let (pass, note) = match fsci_result {
-            Err(err) => (false, format!("fsci_error {err:?}")),
-            Ok((fsci_order, fsci_preds)) => {
-                let fsci_order: Vec<i64> = fsci_order.iter().map(|&v| v as i64).collect();
-                if &fsci_order != scipy_order {
-                    (
-                        false,
-                        format!("order fsci={fsci_order:?} scipy={scipy_order:?}"),
-                    )
-                } else if &fsci_preds != scipy_preds {
-                    (
-                        false,
-                        format!("predecessors fsci={fsci_preds:?} scipy={scipy_preds:?}"),
-                    )
-                } else {
-                    (true, "ok".to_string())
-                }
-            }
+        // SciPy raising on a valid traversal case is recorded as oracle_missing.
+        let Some(((scipy_order, scipy_preds), (fsci_order, fsci_preds))) = ledger.both(
+            &case.op,
+            &case.case_id,
+            scipy_arm
+                .order
+                .as_ref()
+                .zip(scipy_arm.predecessors.as_ref()),
+            fsci_result.ok(),
+        ) else {
+            continue;
         };
+        let fsci_order: Vec<i64> = fsci_order.iter().map(|&v| v as i64).collect();
+        let (pass, note) = if &fsci_order != scipy_order {
+            (
+                false,
+                format!("order fsci={fsci_order:?} scipy={scipy_order:?}"),
+            )
+        } else if &fsci_preds != scipy_preds {
+            (
+                false,
+                format!("predecessors fsci={fsci_preds:?} scipy={scipy_preds:?}"),
+            )
+        } else {
+            (true, "ok".to_string())
+        };
+        ledger.compared(&case.op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -333,6 +337,7 @@ fn diff_sparse_bfs_dfs_order() -> Result<(), String> {
         test_id: "diff_sparse_bfs_dfs_order".into(),
         category: "scipy.sparse.csgraph BFS/DFS order + predecessors (directed=True)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -359,5 +364,11 @@ fn diff_sparse_bfs_dfs_order() -> Result<(), String> {
         "bfs_dfs_order conformance failed: {} cases",
         diffs.len()
     );
+    let min_per_arm = arms
+        .iter()
+        .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_arm);
     Ok(())
 }

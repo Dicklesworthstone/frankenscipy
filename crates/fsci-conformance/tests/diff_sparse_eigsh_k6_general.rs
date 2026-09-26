@@ -14,13 +14,14 @@
 //! (frankenscipy-1ksfv.10); before that a single pass of the basis left relative residuals of
 //! 4e-2 to 5e-1 on all 24 of these matrices, and an unconverged result is a failed case.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CooMatrix, EigsOptions, FormatConvertible, Shape2D, eigsh};
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +59,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     converged_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -259,11 +261,12 @@ fn diff_sparse_eigsh_k6_general() -> Result<(), String> {
         .collect();
 
     let mut diffs = Vec::new();
+    let mut converged_count = 0_usize;
+    let mut ledger = CompareLedger::new("diff_sparse_eigsh_k6_general", &["eigsh"]);
     for case in &cases {
-        let scipy = arms[&case.case_id]
-            .eigvals_by_magnitude
-            .clone()
-            .ok_or_else(|| format!("{}: SciPy produced no eigenvalues", case.case_id))?;
+        let scipy = arms
+            .get(&case.case_id)
+            .and_then(|arm| arm.eigvals_by_magnitude.as_deref());
         let csr = CooMatrix::from_triplets(
             Shape2D::new(case.n, case.n),
             case.vals.clone(),
@@ -274,42 +277,52 @@ fn diff_sparse_eigsh_k6_general() -> Result<(), String> {
         .expect("coo")
         .to_csr()
         .expect("csr");
-        let result = eigsh(&csr, K, EigsOptions::default())
-            .map_err(|e| format!("{}: fsci eigsh failed: {e:?}", case.case_id))?;
-        let mut fsci = result.eigenvalues.clone();
-        fsci.sort_by(|x, y| y.abs().total_cmp(&x.abs()));
-        let (max_rel_diff, pass) = if result.converged {
-            let worst = if fsci.len() == scipy.len() {
-                fsci.iter()
-                    .zip(&scipy)
-                    .map(|(f, s)| (f - s).abs() / s.abs().max(1.0))
-                    .fold(0.0_f64, f64::max)
-            } else {
-                f64::INFINITY
-            };
-            (Some(worst), worst <= EIG_REL_TOL)
-        } else {
-            (None, false)
-        };
+        let result = eigsh(&csr, K, EigsOptions::default());
+        let fsci_converged = result.as_ref().is_ok_and(|r| r.converged);
+        if fsci_converged {
+            converged_count += 1;
+        }
+        let fsci_sorted = result.as_ref().ok().map(|r| {
+            let mut v = r.eigenvalues.clone();
+            v.sort_by(|x, y| y.abs().total_cmp(&x.abs()));
+            v
+        });
         println!(
-            "{} n={} converged={} fsci={fsci:?} scipy={scipy:?} max_rel={max_rel_diff:?}",
-            case.case_id, case.n, result.converged
+            "{} n={} converged={fsci_converged} fsci={fsci_sorted:?} scipy={scipy:?} err={:?}",
+            case.case_id,
+            case.n,
+            result.as_ref().err()
         );
+        // An unconverged result is a failed case: it reaches the ledger as no fsci value.
+        let fsci = fsci_sorted.filter(|_| fsci_converged);
+        let Some((scipy, fsci)) = ledger.slices("eigsh", &case.case_id, scipy, fsci.as_deref())
+        else {
+            continue;
+        };
+        let worst = fsci
+            .iter()
+            .zip(scipy)
+            .map(|(f, s)| (f - s).abs() / s.abs().max(1.0))
+            .fold(0.0_f64, f64::max);
+        let max_rel_diff = Some(worst);
+        let pass = worst <= EIG_REL_TOL;
+        ledger.compared("eigsh", &case.case_id, pass);
+        println!("{} max_rel={max_rel_diff:?}", case.case_id);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             n: case.n,
-            fsci_converged: result.converged,
+            fsci_converged,
             max_rel_diff,
             pass,
         });
     }
 
-    let converged_count = diffs.iter().filter(|d| d.fsci_converged).count();
     let all_pass = diffs.iter().all(|d| d.pass);
     let log = DiffLog {
         test_id: "diff_sparse_eigsh_k6_general".into(),
         category: "scipy.sparse.linalg.eigsh(k=6, which='LM') on runtime-generated matrices".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         converged_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -322,7 +335,7 @@ fn diff_sparse_eigsh_k6_general() -> Result<(), String> {
     )
     .expect("write eigsh k6 log");
 
-    println!("{converged_count} of {} converged", diffs.len());
+    println!("{converged_count} of {} converged", cases.len());
     assert_eq!(diffs.len(), cases.len(), "every matrix must be compared");
     assert_eq!(
         converged_count,
@@ -331,5 +344,6 @@ fn diff_sparse_eigsh_k6_general() -> Result<(), String> {
         diffs.len()
     );
     assert!(all_pass, "an eigsh result disagrees with SciPy");
+    ledger.finish(cases.len());
     Ok(())
 }

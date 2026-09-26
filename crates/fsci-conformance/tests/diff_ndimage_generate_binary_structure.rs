@@ -4,13 +4,14 @@
 //!
 //! Resolves [frankenscipy-p1lr2]. 1e-12 abs (0/1 values).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::generate_binary_structure;
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +55,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -187,24 +189,33 @@ fn diff_ndimage_generate_binary_structure() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_ndimage_generate_binary_structure",
+        &["generate_binary_structure"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let (Some(expected), Some(shape)) = (scipy_arm.values.as_ref(), scipy_arm.shape.as_ref())
-        else {
+        let fsci = generate_binary_structure(case.ndim, case.connectivity);
+        let Some((expected, fsci_data)) = ledger.slices(
+            "generate_binary_structure",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            Some(fsci.data.as_slice()),
+        ) else {
             continue;
         };
-        let fsci = generate_binary_structure(case.ndim, case.connectivity);
-        let abs_d = if fsci.shape != *shape || fsci.data.len() != expected.len() {
+        let abs_d = if scipy_arm.shape.as_ref() != Some(&fsci.shape) {
             f64::INFINITY
         } else {
-            fsci.data
+            fsci_data
                 .iter()
                 .zip(expected.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max)
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared("generate_binary_structure", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -218,6 +229,7 @@ fn diff_ndimage_generate_binary_structure() {
         test_id: "diff_ndimage_generate_binary_structure".into(),
         category: "scipy.ndimage.generate_binary_structure".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -241,4 +253,5 @@ fn diff_ndimage_generate_binary_structure() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

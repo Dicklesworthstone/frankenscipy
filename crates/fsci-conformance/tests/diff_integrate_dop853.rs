@@ -37,10 +37,13 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_integrate::{SolveIvpOptions, SolverKind, ToleranceValue, solve_ivp};
 use serde::{Deserialize, Serialize};
 
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per `solve_ivp` method; a row's verdict is every check on it passing.
+const METHODS: [&str; 3] = ["DOP853", "RK45", "RK23"];
 /// Well-conditioned rows: |fsci - SciPy| <= Y_SCALE_FACTOR_TOL * (rtol * |y_scipy| + atol) per
 /// component, i.e. inside SciPy's own error-control scale (the acceptance allowed 50).
 const Y_SCALE_FACTOR_TOL: f64 = 1.0;
@@ -274,6 +277,7 @@ fn diff_integrate_dop853() {
     let mut well_conditioned = 0;
     let mut worst_scaled = 0.0_f64;
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new("diff_integrate_dop853", &METHODS);
     for (case, answer) in cases.iter().zip(&answers) {
         let problem = case.problem.clone();
         let mut fun = move |t: f64, y: &[f64]| rhs(&problem, t, y);
@@ -289,21 +293,35 @@ fn diff_integrate_dop853() {
         if case.method == "DOP853" {
             dop853_compared += 1;
         }
-        let result = match solve_ivp(&mut fun, &options) {
-            Ok(r) => r,
-            Err(e) => {
-                failures.push(format!("{}: fsci Err({e:?})", case.name));
-                continue;
-            }
+        let arm = case.method.as_str();
+        let failures_before = failures.len();
+        let result = solve_ivp(&mut fun, &options);
+        if let Err(e) = &result {
+            failures.push(format!("{}: fsci Err({e:?})", case.name));
+        }
+        let Some((answer, result)) = ledger.both(arm, &case.name, Some(answer), result.ok()) else {
+            continue;
         };
-        let y_end = result.y.last().cloned().unwrap_or_default();
-        if y_end.len() != answer.y_end.len() || result.status != 0 || answer.status != 0 {
+        let fsci_y_end = result.y.last().cloned().unwrap_or_default();
+        if result.status != 0 || answer.status != 0 {
             failures.push(format!(
-                "{}: status fsci {} SciPy {}, y_end {y_end:?}",
+                "{}: status fsci {} SciPy {}, y_end {fsci_y_end:?}",
                 case.name, result.status, answer.status
             ));
-            continue;
         }
+        // Length, and a NaN in any component, which the max folds below would swallow.
+        let Some((_, y_end)) = ledger.slices(
+            arm,
+            &case.name,
+            Some(answer.y_end.as_slice()),
+            Some(fsci_y_end.as_slice()),
+        ) else {
+            failures.push(format!(
+                "{}: y_end {fsci_y_end:?} against SciPy {:?}",
+                case.name, answer.y_end
+            ));
+            continue;
+        };
         // Largest |fsci - SciPy| in units of SciPy's own error scale rtol*|y| + atol.
         let scaled = y_end
             .iter()
@@ -350,7 +368,7 @@ fn diff_integrate_dop853() {
             }
         }
         if case.problem == "arenstorf" {
-            let (fsci_gap, scipy_gap) = (return_gap(&y_end), return_gap(&answer.y_end));
+            let (fsci_gap, scipy_gap) = (return_gap(y_end), return_gap(&answer.y_end));
             println!(
                 "{}: return gap max|y(T) - y0| fsci {fsci_gap:.3e} SciPy {scipy_gap:.3e}",
                 case.name
@@ -362,6 +380,7 @@ fn diff_integrate_dop853() {
                 ));
             }
         }
+        ledger.compared(arm, &case.name, failures.len() == failures_before);
     }
     println!(
         "{compared} integrations compared ({dop853_compared} DOP853, {well_conditioned} well \
@@ -374,6 +393,13 @@ fn diff_integrate_dop853() {
         "only {well_conditioned} rows were well conditioned enough to compare y"
     );
     assert!(failures.is_empty(), "solve_ivp disagrees: {failures:#?}");
+    // Each method has its own rows (RK23 runs at rtol 1e-6 only); each must compare all of them.
+    let min_per_arm = METHODS
+        .iter()
+        .map(|m| cases.iter().filter(|c| c.method == *m).count())
+        .min()
+        .expect("METHODS is non-empty");
+    ledger.finish(min_per_arm);
 }
 
 /// `t_eval` samples come from each method's own interpolant: SciPy's `RkDenseOutput` cubic
@@ -420,6 +446,7 @@ fn diff_integrate_rk_t_eval_samples() {
     );
     let mut samples_compared = 0;
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new("diff_integrate_rk_t_eval_samples", &METHODS);
     for (case, answer) in cases.iter().zip(&answers) {
         let problem = case.problem.clone();
         let mut fun = move |t: f64, y: &[f64]| rhs(&problem, t, y);
@@ -433,12 +460,14 @@ fn diff_integrate_rk_t_eval_samples() {
             t_eval: Some(t_eval),
             ..SolveIvpOptions::default()
         };
-        let result = match solve_ivp(&mut fun, &options) {
-            Ok(r) => r,
-            Err(e) => {
-                failures.push(format!("{}: fsci Err({e:?})", case.name));
-                continue;
-            }
+        let arm = case.method.as_str();
+        let failures_before = failures.len();
+        let result = solve_ivp(&mut fun, &options);
+        if let Err(e) = &result {
+            failures.push(format!("{}: fsci Err({e:?})", case.name));
+        }
+        let Some((answer, result)) = ledger.both(arm, &case.name, Some(answer), result.ok()) else {
+            continue;
         };
         if result.y.len() != answer.ys.len() || result.status != 0 || answer.status != 0 {
             failures.push(format!(
@@ -448,6 +477,24 @@ fn diff_integrate_rk_t_eval_samples() {
                 answer.ys.len(),
                 result.status,
                 answer.status
+            ));
+        }
+        // Every sample flattened: the total length, and a NaN in any component, which the max
+        // fold below would swallow.
+        let scipy_flat: Vec<f64> = answer.ys.iter().flatten().copied().collect();
+        let fsci_flat: Vec<f64> = result.y.iter().flatten().copied().collect();
+        if ledger
+            .slices(
+                arm,
+                &case.name,
+                Some(scipy_flat.as_slice()),
+                Some(fsci_flat.as_slice()),
+            )
+            .is_none()
+        {
+            failures.push(format!(
+                "{}: samples {:?} against SciPy {:?}",
+                case.name, result.y, answer.ys
             ));
             continue;
         }
@@ -480,6 +527,7 @@ fn diff_integrate_rk_t_eval_samples() {
                 case.name, result.nfev, answer.nfev
             ));
         }
+        ledger.compared(arm, &case.name, failures.len() == failures_before);
     }
     println!(
         "{samples_compared} t_eval samples compared over {} rows",
@@ -490,4 +538,11 @@ fn diff_integrate_rk_t_eval_samples() {
         failures.is_empty(),
         "t_eval samples disagree: {failures:#?}"
     );
+    // Each method has its own rows (RK23 runs at rtol 1e-6 only); each must compare all of them.
+    let min_per_arm = METHODS
+        .iter()
+        .map(|m| cases.iter().filter(|c| c.method == *m).count())
+        .min()
+        .expect("METHODS is non-empty");
+    ledger.finish(min_per_arm);
 }

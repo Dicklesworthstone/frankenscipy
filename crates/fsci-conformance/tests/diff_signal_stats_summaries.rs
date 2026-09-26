@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-j0uvi]. 1e-12 abs (exact float arithmetic).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{
     crest_factor, peak_to_peak, rms, signal_energy, signal_power, zero_crossing_rate,
 };
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -244,12 +246,18 @@ fn diff_signal_stats_summaries() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let op_arms = [
+        "rms",
+        "signal_energy",
+        "signal_power",
+        "crest_factor",
+        "peak_to_peak",
+        "zero_crossing_rate",
+    ];
+    let mut ledger = CompareLedger::new("diff_signal_stats_summaries", &op_arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(expected) = scipy_arm.value else {
-            continue;
-        };
         let fsci_v = match case.op.as_str() {
             "rms" => rms(&case.x),
             "signal_energy" => signal_energy(&case.x),
@@ -257,10 +265,16 @@ fn diff_signal_stats_summaries() {
             "crest_factor" => crest_factor(&case.x),
             "peak_to_peak" => peak_to_peak(&case.x),
             "zero_crossing_rate" => zero_crossing_rate(&case.x),
-            _ => continue,
+            other => panic!("unknown op {other}"),
+        };
+        let Some((expected, fsci_v)) =
+            ledger.pair(&case.op, &case.case_id, scipy_arm.value, Some(fsci_v))
+        else {
+            continue;
         };
         let abs_d = (fsci_v - expected).abs();
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -275,6 +289,7 @@ fn diff_signal_stats_summaries() {
         test_id: "diff_signal_stats_summaries".into(),
         category: "fsci_signal time-domain summary stats vs numpy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -294,5 +309,12 @@ fn diff_signal_stats_summaries() {
         "signal_stats_summaries conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        op_arms
+            .iter()
+            .map(|op| query.points.iter().filter(|c| c.op == *op).count())
+            .min()
+            .unwrap_or(0),
     );
 }

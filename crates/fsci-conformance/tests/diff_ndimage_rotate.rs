@@ -8,12 +8,14 @@
 //! since spline interpolation order > 0 has implementation-dependent
 //! boundary handling at sub-pixel offsets.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_ndimage::{BoundaryMode, NdArray, rotate};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -265,13 +268,10 @@ fn diff_ndimage_rotate() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_ndimage_rotate", &["rotate"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let (Some(exp_rows), Some(exp_cols), Some(exp_data)) = (o.rows, o.cols, o.data.as_ref())
-        else {
-            continue;
-        };
 
         let arr = NdArray::new(case.data.clone(), vec![case.rows, case.cols]).expect("ndarray");
         let result = match rotate(
@@ -282,22 +282,36 @@ fn diff_ndimage_rotate() {
             mode_from(&case.mode),
             0.0,
         ) {
-            Ok(r) => r,
+            Ok(r) => Some(r),
             Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    rows: 0,
-                    cols: 0,
-                    max_abs_diff: f64::INFINITY,
-                    pass: false,
-                    note: format!("rotate error: {e:?}"),
-                });
-                continue;
+                if o.data.is_some() {
+                    diffs.push(CaseDiff {
+                        case_id: case.case_id.clone(),
+                        rows: 0,
+                        cols: 0,
+                        max_abs_diff: f64::INFINITY,
+                        pass: false,
+                        note: format!("rotate error: {e:?}"),
+                    });
+                }
+                None
             }
         };
-        let rows = result.shape[0];
-        let cols = result.shape[1];
-        if rows != exp_rows || cols != exp_cols {
+        let fsci_shape = result.as_ref().map(|r| (r.shape[0], r.shape[1]));
+        // SciPy's rows, cols and data are all present or all null. A differing element count is a
+        // shape mismatch, which the ledger records as a failed comparison.
+        let Some((exp_data, got)) = ledger.slices(
+            "rotate",
+            &case.case_id,
+            o.data.as_deref(),
+            result.as_ref().map(|r| r.data.as_slice()),
+        ) else {
+            continue;
+        };
+        let (rows, cols) = fsci_shape.unwrap_or_default();
+        if fsci_shape != o.rows.zip(o.cols) {
+            let (exp_rows, exp_cols) = o.rows.zip(o.cols).unwrap_or_default();
+            ledger.compared("rotate", &case.case_id, false);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 rows,
@@ -306,21 +320,22 @@ fn diff_ndimage_rotate() {
                 pass: false,
                 note: format!("shape mismatch: fsci {rows}x{cols} scipy {exp_rows}x{exp_cols}"),
             });
-            continue;
+        } else {
+            let mut max_abs = 0.0_f64;
+            for (a, e) in got.iter().zip(exp_data.iter()) {
+                max_abs = max_abs.max((a - e).abs());
+            }
+            let pass = max_abs <= ABS_TOL;
+            ledger.compared("rotate", &case.case_id, pass);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                rows,
+                cols,
+                max_abs_diff: max_abs,
+                pass,
+                note: String::new(),
+            });
         }
-        let mut max_abs = 0.0_f64;
-        for (a, e) in result.data.iter().zip(exp_data.iter()) {
-            max_abs = max_abs.max((a - e).abs());
-        }
-        let pass = max_abs <= ABS_TOL;
-        diffs.push(CaseDiff {
-            case_id: case.case_id.clone(),
-            rows,
-            cols,
-            max_abs_diff: max_abs,
-            pass,
-            note: String::new(),
-        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -328,6 +343,7 @@ fn diff_ndimage_rotate() {
         test_id: "diff_ndimage_rotate".into(),
         category: "fsci_ndimage::rotate vs scipy.ndimage.rotate".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -345,4 +361,5 @@ fn diff_ndimage_rotate() {
     }
 
     assert!(all_pass, "rotate parity failed: {} cases", diffs.len());
+    ledger.finish(query.points.len());
 }

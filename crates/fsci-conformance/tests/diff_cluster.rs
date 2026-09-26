@@ -4,7 +4,7 @@
 //! Tests FrankenSciPy cluster.hierarchy functions against SciPy subprocess oracle
 //! across deterministic input families.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ use fsci_cluster::{
     LinkageMethod, cophenet, fcluster, inconsistent, is_monotonic, is_valid_linkage, leaves_list,
     linkage,
 };
+use fsci_conformance::{ArmCounts, CompareLedger};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-012";
@@ -57,6 +58,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_z_diff: f64,
     max_cophenet_diff: f64,
     tolerance: f64,
@@ -127,9 +129,11 @@ fn deterministic_clustered_points(
     points
 }
 
+const LINKAGE_METHODS: [&str; 4] = ["single", "complete", "average", "ward"];
+
 fn generate_linkage_cases() -> Vec<LinkageCase> {
     let mut cases = Vec::new();
-    let methods = ["single", "complete", "average", "ward"];
+    let methods = LINKAGE_METHODS;
     let sizes = [5, 8, 12, 20];
     let dims = [2, 3];
 
@@ -336,48 +340,51 @@ fn diff_cluster_linkage() {
     let mut diffs = Vec::new();
     let mut max_z_diff = 0.0_f64;
     let mut max_cophenet_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_cluster_linkage", &LINKAGE_METHODS);
 
     for case in &cases {
         let rust_result = compute_rust_linkage(case);
         let scipy_result = oracle_map
             .get(&case.case_id)
             .expect("validated complete linkage oracle map");
+        // The oracle sends an empty `z` when SciPy raised.
+        let scipy_value = (!scipy_result.z.is_empty()).then_some(scipy_result);
+        let Some((scipy_result, (rust_z, rust_valid, rust_mono, rust_leaves, rust_coph))) =
+            ledger.both(&case.method, &case.case_id, scipy_value, rust_result)
+        else {
+            continue;
+        };
 
-        let (pass, z_diff, coph_diff, valid_match, mono_match, leaves_match) =
-            if let Some((rust_z, rust_valid, rust_mono, rust_leaves, rust_coph)) = rust_result {
-                let valid_match = rust_valid && scipy_result.is_valid;
-                let mono_match = rust_mono && scipy_result.is_monotonic;
+        let (pass, z_diff, coph_diff, valid_match, mono_match, leaves_match) = {
+            let valid_match = rust_valid && scipy_result.is_valid;
+            let mono_match = rust_mono && scipy_result.is_monotonic;
 
-                let rust_z_len = rust_z.len();
-                let scipy_z_len = scipy_result.z.len();
-                let z_len_match = rust_z_len == scipy_z_len;
+            let rust_z_len = rust_z.len();
+            let scipy_z_len = scipy_result.z.len();
+            let z_len_match = rust_z_len == scipy_z_len;
 
-                let mut rust_dists: Vec<f64> = rust_z.iter().map(|r| r[2]).collect();
-                rust_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let mut scipy_dists: Vec<f64> = scipy_result.z.iter().map(|r| r[2]).collect();
-                scipy_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                let z_dists_diff = max_vec_diff(&rust_dists, &scipy_dists);
+            let mut rust_dists: Vec<f64> = rust_z.iter().map(|r| r[2]).collect();
+            rust_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut scipy_dists: Vec<f64> = scipy_result.z.iter().map(|r| r[2]).collect();
+            scipy_dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let z_dists_diff = max_vec_diff(&rust_dists, &scipy_dists);
 
-                let coph_len_match = rust_coph.len() == scipy_result.cophenet.len();
+            let coph_len_match = rust_coph.len() == scipy_result.cophenet.len();
 
-                let leaves_match = rust_leaves.len() == scipy_result.leaves.len();
+            let leaves_match = rust_leaves.len() == scipy_result.leaves.len();
 
-                let pass =
-                    z_len_match && valid_match && mono_match && leaves_match && coph_len_match;
+            let pass = z_len_match && valid_match && mono_match && leaves_match && coph_len_match;
 
-                (
-                    pass,
-                    z_dists_diff,
-                    0.0,
-                    valid_match,
-                    mono_match,
-                    leaves_match,
-                )
-            } else if scipy_result.z.is_empty() {
-                (true, 0.0, 0.0, true, true, true)
-            } else {
-                (false, f64::INFINITY, f64::INFINITY, false, false, false)
-            };
+            (
+                pass,
+                z_dists_diff,
+                0.0,
+                valid_match,
+                mono_match,
+                leaves_match,
+            )
+        };
+        ledger.compared(&case.method, &case.case_id, pass);
 
         max_z_diff = max_z_diff.max(z_diff);
         max_cophenet_diff = max_cophenet_diff.max(coph_diff);
@@ -400,6 +407,7 @@ fn diff_cluster_linkage() {
         test_id: "diff_cluster_linkage".into(),
         category: "scipy.cluster.hierarchy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_z_diff,
         max_cophenet_diff,
         tolerance: TOL,
@@ -432,6 +440,12 @@ fn diff_cluster_linkage() {
         max_z_diff,
         max_cophenet_diff
     );
+    let min_per_arm = LINKAGE_METHODS
+        .iter()
+        .map(|method| cases.iter().filter(|c| c.method == *method).count())
+        .min()
+        .expect("LINKAGE_METHODS is non-empty");
+    ledger.finish(min_per_arm);
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -588,46 +602,47 @@ fn diff_cluster_fcluster() {
 
     let mut diffs = Vec::new();
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_cluster_fcluster", &["fcluster"]);
 
     for (case_id, _data, max_clusters) in &cases {
-        let scipy_result = oracle_map.get(case_id);
-
-        let (pass, partitions_match, num_clusters_match) = match scipy_result {
-            Some(scipy) if !scipy.z.is_empty() => {
-                let scipy_z: Vec<[f64; 4]> = scipy
-                    .z
-                    .iter()
-                    .map(|row| [row[0], row[1], row[2], row[3]])
-                    .collect();
-
-                match fcluster(&scipy_z, *max_clusters) {
-                    Ok(rust_labels) => {
-                        let rust_n_clusters = rust_labels
-                            .iter()
-                            .copied()
-                            .collect::<std::collections::HashSet<_>>()
-                            .len();
-                        let scipy_n_clusters = scipy
-                            .labels
-                            .iter()
-                            .copied()
-                            .collect::<std::collections::HashSet<_>>()
-                            .len();
-                        let both_within_max =
-                            rust_n_clusters <= *max_clusters && scipy_n_clusters <= *max_clusters;
-                        let labels_len_match = rust_labels.len() == scipy.labels.len();
-                        (
-                            both_within_max && labels_len_match,
-                            labels_len_match,
-                            both_within_max,
-                        )
-                    }
-                    Err(_) => (false, false, false),
-                }
-            }
-            Some(_) => (true, true, true),
-            None => (false, false, false),
+        // The oracle sends an empty `z` when SciPy raised; fsci clusters SciPy's own `z`.
+        let scipy_result = oracle_map.get(case_id).filter(|scipy| !scipy.z.is_empty());
+        let rust_labels = scipy_result.and_then(|scipy| {
+            let scipy_z: Vec<[f64; 4]> = scipy
+                .z
+                .iter()
+                .map(|row| [row[0], row[1], row[2], row[3]])
+                .collect();
+            fcluster(&scipy_z, *max_clusters).ok()
+        });
+        let Some((scipy, rust_labels)) =
+            ledger.both("fcluster", case_id, scipy_result, rust_labels)
+        else {
+            continue;
         };
+
+        let (pass, partitions_match, num_clusters_match) = {
+            let rust_n_clusters = rust_labels
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            let scipy_n_clusters = scipy
+                .labels
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            let both_within_max =
+                rust_n_clusters <= *max_clusters && scipy_n_clusters <= *max_clusters;
+            let labels_len_match = rust_labels.len() == scipy.labels.len();
+            (
+                both_within_max && labels_len_match,
+                labels_len_match,
+                both_within_max,
+            )
+        };
+        ledger.compared("fcluster", case_id, pass);
 
         if !pass {
             all_pass = false;
@@ -654,6 +669,7 @@ fn diff_cluster_fcluster() {
         all_pass,
         "scipy.cluster.hierarchy.fcluster conformance failed"
     );
+    ledger.finish(cases.len());
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -795,19 +811,31 @@ fn diff_cluster_inconsistent() {
 
     let mut max_diff = 0.0_f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_cluster_inconsistent", &["inconsistent"]);
 
     for case in &cases {
-        let scipy_result = oracle_map.get(&case.case_id);
+        // The oracle sends an empty `r` when SciPy raised.
+        let scipy_result = oracle_map
+            .get(&case.case_id)
+            .filter(|scipy| !scipy.r.is_empty());
         let rust_result = inconsistent(&case.z, case.depth);
-
-        let pass = match scipy_result {
-            Some(scipy) => {
-                let diff = max_array_diff(&rust_result, &scipy.r);
-                max_diff = max_diff.max(diff);
-                diff <= TOL
-            }
-            None => rust_result.is_empty(),
+        let Some((scipy, rust_result)) = ledger.both(
+            "inconsistent",
+            &case.case_id,
+            scipy_result,
+            Some(rust_result),
+        ) else {
+            continue;
         };
+
+        let pass = {
+            let diff = max_array_diff(&rust_result, &scipy.r);
+            max_diff = max_diff.max(diff);
+            // The max fold in `max_array_diff` swallows a NaN in fsci's matrix.
+            let no_nan = rust_result.iter().flatten().all(|v| !v.is_nan());
+            diff <= TOL && no_nan
+        };
+        ledger.compared("inconsistent", &case.case_id, pass);
 
         if !pass {
             all_pass = false;
@@ -820,4 +848,5 @@ fn diff_cluster_inconsistent() {
         "scipy.cluster.hierarchy.inconsistent conformance failed: max_diff={}",
         max_diff
     );
+    ledger.finish(cases.len());
 }

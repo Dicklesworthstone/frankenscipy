@@ -98,10 +98,20 @@ fn frob_diff(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
             return f64::INFINITY;
         }
         for (va, vb) in r_a.iter().zip(r_b.iter()) {
-            max = max.max((va - vb).abs());
+            max = nan_max(max, (va - vb).abs());
         }
     }
     max
+}
+
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
 }
 
 /// BB upper triangular and AA quasi-upper-triangular with non-overlapping 2×2 blocks.
@@ -314,7 +324,7 @@ fn diff_linalg_ordqz_property() -> Result<(), String> {
             let n = r.q.len();
             let d_q_orth = frob_diff(&product(&qt, &r.q), &ident(n));
             let d_z_orth = frob_diff(&product(&transpose(&r.z), &r.z), &ident(n));
-            let abs_d = d_aa.max(d_bb).max(d_q_orth).max(d_z_orth);
+            let abs_d = [d_bb, d_q_orth, d_z_orth].into_iter().fold(d_aa, nan_max);
             max_overall = max_overall.max(abs_d);
             let schur_form = is_generalized_schur_form(&r.aa, &r.bb);
             let sorted = selected_first(&r.aa, &r.bb, sort);

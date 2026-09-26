@@ -9,13 +9,14 @@
 //! Per case every output sample must agree to `OUT_ABS_TOL + OUT_REL_TOL·|y_scipy|`. Every
 //! case must be compared: a SciPy failure or an fsci error is a FAILED case (olv0j.1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::Lti;
 use serde::{Deserialize, Serialize};
 
@@ -196,6 +197,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     cases: Vec<CaseDiff>,
@@ -296,44 +298,41 @@ fn diff_signal_lti_exact_discretization() {
         .collect();
 
     let mut diffs = Vec::new();
+    let op_arms = ["step", "impulse", "lsim"];
+    let mut ledger = CompareLedger::new("diff_signal_lti_exact_discretization", &op_arms);
     for case in &cases {
         let arm = &arms[&case.case_id];
-        let fsci =
-            Lti::new(case.num.clone(), case.den.clone()).and_then(|sys| match case.op.as_str() {
+        let fsci = Lti::new(case.num.clone(), case.den.clone())
+            .and_then(|sys| match case.op.as_str() {
                 "step" => sys.step(&case.t),
                 "impulse" => sys.impulse(&case.t),
                 _ => sys.lsim(&case.u, &case.t, case.x0.as_deref(), case.interp),
-            });
-        let mut diff = CaseDiff {
-            case_id: case.case_id.clone(),
-            max_abs_diff: f64::NAN,
-            pass: false,
-            reason: String::new(),
+            })
+            .ok();
+        let Some((want, y)) =
+            ledger.slices(&case.op, &case.case_id, arm.y.as_deref(), fsci.as_deref())
+        else {
+            continue;
         };
-        match (fsci, &arm.y) {
-            (Err(e), _) => diff.reason = format!("fsci error {e}"),
-            (Ok(_), None) => diff.reason = "SciPy produced no result".to_string(),
-            (Ok(y), Some(want)) => {
-                if y.len() == want.len() {
-                    diff.max_abs_diff = y
-                        .iter()
-                        .zip(want)
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0.0, f64::max);
-                    let bad = y.iter().zip(want).position(|(a, b)| {
-                        let d = (a - b).abs();
-                        d.is_nan() || d > OUT_ABS_TOL + OUT_REL_TOL * b.abs()
-                    });
-                    diff.pass = bad.is_none();
-                    if let Some(i) = bad {
-                        diff.reason = format!("sample {i}: {} vs {}", y[i], want[i]);
-                    }
-                } else {
-                    diff.reason = format!("{} samples vs {}", y.len(), want.len());
-                }
-            }
-        }
-        diffs.push(diff);
+        let max_abs_diff = y
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        let bad = y.iter().zip(want).position(|(a, b)| {
+            let d = (a - b).abs();
+            d.is_nan() || d > OUT_ABS_TOL + OUT_REL_TOL * b.abs()
+        });
+        let reason = bad.map_or_else(String::new, |i| {
+            format!("sample {i}: {} vs {}", y[i], want[i])
+        });
+        ledger.compared(&case.op, &case.case_id, bad.is_none());
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            max_abs_diff,
+            pass: bad.is_none(),
+            reason,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -341,6 +340,7 @@ fn diff_signal_lti_exact_discretization() {
         test_id: "diff_signal_lti_exact_discretization".into(),
         category: "scipy.signal.step / impulse / lsim (exact discretization)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         cases: diffs.clone(),
@@ -359,4 +359,11 @@ fn diff_signal_lti_exact_discretization() {
     }
     assert_eq!(diffs.len(), cases.len(), "every case must be compared");
     assert!(all_pass, "Lti step/impulse/lsim vs scipy.signal failed");
+    ledger.finish(
+        op_arms
+            .iter()
+            .map(|op| cases.iter().filter(|c| c.op == *op).count())
+            .min()
+            .unwrap_or(0),
+    );
 }

@@ -6,12 +6,14 @@
 //! objectives; verify converged solutions reach the known global
 //! minimum at 1e-3 abs on the function value.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use fsci_opt::MinimizeOptions;
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::minimize::{newton_cg, slsqp, tnc, trust_constr, trust_exact};
+use fsci_opt::{MinimizeOptions, OptError, OptimizeResult};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
@@ -30,6 +32,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -66,31 +69,51 @@ fn rosen(x: &[f64]) -> f64 {
     (1.0 - x[0]).powi(2) + 100.0 * (x[1] - x[0] * x[0]).powi(2)
 }
 
+/// fsci's final function value, or `None` when the optimizer erred, reported no convergence, or
+/// returned no value. The analytic minimum is always reachable, so each of these is a failure.
+fn converged_fun(res: Result<OptimizeResult, OptError>) -> Option<f64> {
+    res.ok().filter(|r| r.success).and_then(|r| r.fun)
+}
+
+/// fsci's final function value whatever its success flag; `None` only on an error or a missing
+/// value. newton_cg here runs on finite-difference gradients (SciPy's Newton-CG refuses to run
+/// without an analytic Jacobian), so there is no SciPy status to hold its flag to; its value is
+/// still held to the analytic minimum (frankenscipy-fd4wz tracks its success flag on this run).
+fn final_fun(res: Result<OptimizeResult, OptError>) -> Option<f64> {
+    res.ok().and_then(|r| r.fun)
+}
+
 #[test]
 fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let mut max_overall = 0.0_f64;
     let opts = MinimizeOptions::default();
+    let mut ledger = CompareLedger::new(
+        "diff_opt_tnc_slsqp_newton_cg_trust_constr",
+        &["tnc", "trust_constr", "slsqp", "newton_cg", "trust_exact"],
+    );
 
+    // Both objectives have the global minimum value 0 (SciPy's side is the analytic answer).
     // tnc/trust_constr: quadratic only (defect do5nd: weak on Rosen).
     let q_x0 = vec![2.0_f64, -1.0];
-    if let Ok(res) = tnc(&quadratic, &q_x0, opts) {
-        let fval = res.fun.unwrap_or(f64::INFINITY);
+    let single = [
+        ("tnc", converged_fun(tnc(&quadratic, &q_x0, opts))),
+        (
+            "trust_constr",
+            converged_fun(trust_constr(&quadratic, &q_x0, opts)),
+        ),
+    ];
+    for (op, fsci_fun) in single {
+        let case_id = format!("{op}_quad");
+        let Some((_, fval)) = ledger.pair(op, &case_id, Some(0.0), fsci_fun) else {
+            continue;
+        };
         max_overall = max_overall.max(fval);
+        ledger.compared(op, &case_id, fval <= TOL);
         diffs.push(CaseDiff {
-            case_id: "tnc_quad".into(),
-            op: "tnc".into(),
-            abs_diff: fval,
-            pass: fval <= TOL,
-        });
-    }
-    if let Ok(res) = trust_constr(&quadratic, &q_x0, opts) {
-        let fval = res.fun.unwrap_or(f64::INFINITY);
-        max_overall = max_overall.max(fval);
-        diffs.push(CaseDiff {
-            case_id: "trust_constr_quad".into(),
-            op: "trust_constr".into(),
+            case_id,
+            op: op.into(),
             abs_diff: fval,
             pass: fval <= TOL,
         });
@@ -101,32 +124,21 @@ fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
         ("quad", quadratic as fn(&[f64]) -> f64, vec![2.0_f64, -1.0]),
         ("rosen", rosen as fn(&[f64]) -> f64, vec![0.0_f64, 0.0]),
     ] {
-        if let Ok(res) = slsqp(&f, &x0, opts) {
-            let fval = res.fun.unwrap_or(f64::INFINITY);
+        let runs = [
+            ("slsqp", converged_fun(slsqp(&f, &x0, opts))),
+            ("newton_cg", final_fun(newton_cg(&f, &x0, opts))),
+            ("trust_exact", converged_fun(trust_exact(&f, &x0, opts))),
+        ];
+        for (op, fsci_fun) in runs {
+            let case_id = format!("{op}_{label}");
+            let Some((_, fval)) = ledger.pair(op, &case_id, Some(0.0), fsci_fun) else {
+                continue;
+            };
             max_overall = max_overall.max(fval);
+            ledger.compared(op, &case_id, fval <= TOL);
             diffs.push(CaseDiff {
-                case_id: format!("slsqp_{label}"),
-                op: "slsqp".into(),
-                abs_diff: fval,
-                pass: fval <= TOL,
-            });
-        }
-        if let Ok(res) = newton_cg(&f, &x0, opts) {
-            let fval = res.fun.unwrap_or(f64::INFINITY);
-            max_overall = max_overall.max(fval);
-            diffs.push(CaseDiff {
-                case_id: format!("newton_cg_{label}"),
-                op: "newton_cg".into(),
-                abs_diff: fval,
-                pass: fval <= TOL,
-            });
-        }
-        if let Ok(res) = trust_exact(&f, &x0, opts) {
-            let fval = res.fun.unwrap_or(f64::INFINITY);
-            max_overall = max_overall.max(fval);
-            diffs.push(CaseDiff {
-                case_id: format!("trust_exact_{label}"),
-                op: "trust_exact".into(),
+                case_id,
+                op: op.into(),
                 abs_diff: fval,
                 pass: fval <= TOL,
             });
@@ -140,6 +152,7 @@ fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
         category: "fsci_opt::{tnc, slsqp, newton_cg, trust_constr, trust_exact} property test"
             .into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -160,4 +173,6 @@ fn diff_opt_tnc_slsqp_newton_cg_trust_constr() {
         diffs.len(),
         max_overall
     );
+    // The smallest arms: tnc and trust_constr run one case each, the other three two.
+    ledger.finish(1);
 }

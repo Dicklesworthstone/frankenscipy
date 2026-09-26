@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-uquh5]. Rel 1e-7 (fsci ships CODATA-2018).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_constants as fc;
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +82,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -341,20 +343,22 @@ fn diff_constants_value_lookup() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_constants_value_lookup", &["value"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_v) = scipy_arm.value else {
-            continue;
-        };
-        let Some(fsci_v) = fc::value(&case.fsci_key) else {
-            // fsci doesn't know this key — count as failure to surface
-            // any naming regressions.
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                rel_diff: f64::INFINITY,
-                pass: false,
-            });
+        let fsci_v = fc::value(&case.fsci_key);
+        let Some((scipy_v, fsci_v)) = ledger.pair("value", &case.case_id, scipy_arm.value, fsci_v)
+        else {
+            if scipy_arm.value.is_some() && fsci_v.is_none() {
+                // fsci doesn't know this key — count as failure to surface
+                // any naming regressions.
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    rel_diff: f64::INFINITY,
+                    pass: false,
+                });
+            }
             continue;
         };
         let r = if scipy_v.abs() > 0.0 {
@@ -363,6 +367,7 @@ fn diff_constants_value_lookup() {
             (fsci_v - scipy_v).abs()
         };
         max_overall = max_overall.max(r);
+        ledger.compared("value", &case.case_id, r <= REL_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             rel_diff: r,
@@ -376,6 +381,7 @@ fn diff_constants_value_lookup() {
         test_id: "diff_constants_value_lookup".into(),
         category: "scipy.constants.value() name-based lookup".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -396,6 +402,7 @@ fn diff_constants_value_lookup() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }
 
 #[test]
@@ -424,32 +431,46 @@ fn diff_constants_unit_and_precision_for_every_supported_key() {
         .map(|point| (point.case_id.clone(), point))
         .collect();
 
+    let mut ledger = CompareLedger::new(
+        "diff_constants_unit_and_precision_for_every_supported_key",
+        &["unit", "precision"],
+    );
+
     for case in &query.points {
         let scipy = pmap.get(&case.case_id).expect("validated metadata oracle");
-        let scipy_unit = scipy
-            .unit
-            .as_deref()
-            .expect("SciPy constants unit lookup should succeed");
-        let scipy_precision_bits = scipy
-            .precision_bits
-            .expect("SciPy constants precision lookup should succeed");
-        let fsci_unit =
-            fc::unit(&case.fsci_key).expect("FrankenSciPy constants unit lookup should succeed");
-        let fsci_precision = fc::precision(&case.fsci_key)
-            .expect("FrankenSciPy constants precision lookup should succeed");
-
-        assert_eq!(
-            fsci_unit, scipy_unit,
-            "unit mismatch for {:?}",
-            case.scipy_key
-        );
-        assert_eq!(
-            fsci_precision.to_bits(),
-            scipy_precision_bits,
-            "precision mismatch for {:?}: fsci={fsci_precision:.17e}, scipy_bits={scipy_precision_bits:#018x}",
-            case.scipy_key
-        );
+        if let Some((scipy_unit, fsci_unit)) = ledger.both(
+            "unit",
+            &case.case_id,
+            scipy.unit.as_deref(),
+            fc::unit(&case.fsci_key),
+        ) {
+            ledger.compared("unit", &case.case_id, fsci_unit == scipy_unit);
+            assert_eq!(
+                fsci_unit, scipy_unit,
+                "unit mismatch for {:?}",
+                case.scipy_key
+            );
+        }
+        if let Some((scipy_precision_bits, fsci_precision)) = ledger.both(
+            "precision",
+            &case.case_id,
+            scipy.precision_bits,
+            fc::precision(&case.fsci_key),
+        ) {
+            ledger.compared(
+                "precision",
+                &case.case_id,
+                fsci_precision.to_bits() == scipy_precision_bits,
+            );
+            assert_eq!(
+                fsci_precision.to_bits(),
+                scipy_precision_bits,
+                "precision mismatch for {:?}: fsci={fsci_precision:.17e}, scipy_bits={scipy_precision_bits:#018x}",
+                case.scipy_key
+            );
+        }
     }
+    ledger.finish(query.points.len());
 }
 
 #[test]
@@ -480,6 +501,7 @@ fn diff_constants_find_queries_include_scipy_values() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_constants_find_queries", &["find"]);
 
     for case in &expectations {
         let scipy_arm = pmap.get(case.case_id).expect("validated find oracle");
@@ -487,29 +509,31 @@ fn diff_constants_find_queries_include_scipy_values() {
             .into_iter()
             .find(|(name, _)| *name == case.fsci_name)
             .map(|(_, value)| value);
-        let pass = if let (true, Some(scipy_v), Some(fsci_v)) =
-            (scipy_arm.found, scipy_arm.value, fsci_v)
-        {
-            let rel_diff = if scipy_v.abs() > 0.0 {
-                (fsci_v - scipy_v).abs() / scipy_v.abs()
+        // SciPy's value counts only when constants.find returned the expected key.
+        let scipy_v = scipy_arm.value.filter(|_| scipy_arm.found);
+        let pass =
+            if let Some((scipy_v, fsci_v)) = ledger.pair("find", case.case_id, scipy_v, fsci_v) {
+                let rel_diff = if scipy_v.abs() > 0.0 {
+                    (fsci_v - scipy_v).abs() / scipy_v.abs()
+                } else {
+                    (fsci_v - scipy_v).abs()
+                };
+                max_overall = max_overall.max(rel_diff);
+                ledger.compared("find", case.case_id, rel_diff <= REL_TOL);
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.into(),
+                    rel_diff,
+                    pass: rel_diff <= REL_TOL,
+                });
+                true
             } else {
-                (fsci_v - scipy_v).abs()
+                diffs.push(CaseDiff {
+                    case_id: case.case_id.into(),
+                    rel_diff: f64::INFINITY,
+                    pass: false,
+                });
+                false
             };
-            max_overall = max_overall.max(rel_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.into(),
-                rel_diff,
-                pass: rel_diff <= REL_TOL,
-            });
-            true
-        } else {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.into(),
-                rel_diff: f64::INFINITY,
-                pass: false,
-            });
-            false
-        };
 
         if !pass {
             eprintln!(
@@ -525,6 +549,7 @@ fn diff_constants_find_queries_include_scipy_values() {
         test_id: "diff_constants_find_queries".into(),
         category: "scipy.constants.find() query membership and value lookup".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -539,6 +564,7 @@ fn diff_constants_find_queries_include_scipy_values() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(expectations.len());
 }
 
 #[test]
@@ -565,20 +591,38 @@ fn diff_constants_find_preserves_scipy_order_for_supported_names() {
         "neutron g factor",
         "proton g factor",
     ];
-    let scipy_supported: Vec<&str> = scipy_arm
-        .names
-        .iter()
-        .map(String::as_str)
-        .filter(|name| supported.contains(name))
-        .collect();
-    let fsci_supported: Vec<&str> = fc::find("g factor")
-        .into_iter()
-        .map(|(name, _)| name)
-        .filter(|name| supported.contains(name))
-        .collect();
-
-    assert_eq!(
-        fsci_supported, scipy_supported,
-        "constants.find should preserve scipy's sorted result order for supported keys"
+    let mut ledger = CompareLedger::new(
+        "diff_constants_find_preserves_scipy_order_for_supported_names",
+        &["find_order"],
     );
+    // The oracle sends no names when constants.find raised.
+    let scipy_names = (!scipy_arm.names.is_empty()).then_some(&scipy_arm.names);
+    if let Some((scipy_names, fsci_found)) = ledger.both(
+        "find_order",
+        &scipy_arm.case_id,
+        scipy_names,
+        Some(fc::find("g factor")),
+    ) {
+        let scipy_supported: Vec<&str> = scipy_names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| supported.contains(name))
+            .collect();
+        let fsci_supported: Vec<&str> = fsci_found
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| supported.contains(name))
+            .collect();
+
+        ledger.compared(
+            "find_order",
+            &scipy_arm.case_id,
+            fsci_supported == scipy_supported,
+        );
+        assert_eq!(
+            fsci_supported, scipy_supported,
+            "constants.find should preserve scipy's sorted result order for supported keys"
+        );
+    }
+    ledger.finish(query.finds.len());
 }

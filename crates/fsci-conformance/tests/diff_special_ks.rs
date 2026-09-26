@@ -13,13 +13,14 @@
 //! series); 5e-3 abs for smirnov (fsci uses an O(1/n)-corrected
 //! asymptotic, scipy uses the exact Birnbaum-Tingey series).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{kolmogorov, smirnov};
@@ -31,6 +32,8 @@ const KOLMOGOROV_TOL: f64 = 1.0e-9;
 // 5e-2 absorbs cleanly across n ∈ [50, 500].
 const SMIRNOV_TOL: f64 = 5.0e-2;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function compared.
+const ARMS: [&str; 2] = ["kolmogorov", "smirnov"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -69,6 +72,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -106,10 +110,8 @@ fn fsci_eval(func: &str, n: i32, arg: f64) -> Option<f64> {
                 _ => None,
             }
         }
-        "smirnov" => {
-            let v = smirnov(n, arg);
-            if v.is_finite() { Some(v) } else { None }
-        }
+        // A non-finite value is returned as is: the ledger classifies it against SciPy's.
+        "smirnov" => Some(smirnov(n, arg)),
         _ => None,
     }
 }
@@ -243,26 +245,33 @@ fn diff_special_ks() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_ks", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.n, case.arg)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            let tol = match case.func.as_str() {
-                "kolmogorov" => KOLMOGOROV_TOL,
-                "smirnov" => SMIRNOV_TOL,
-                _ => 0.0,
-            };
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                pass: abs_diff <= tol,
-            });
-        }
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.n, case.arg),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        let tol = match case.func.as_str() {
+            "kolmogorov" => KOLMOGOROV_TOL,
+            "smirnov" => SMIRNOV_TOL,
+            _ => 0.0,
+        };
+        ledger.compared(arm, &case.case_id, abs_diff <= tol);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= tol,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -271,6 +280,7 @@ fn diff_special_ks() {
         test_id: "diff_special_ks".into(),
         category: "scipy.special.kolmogorov/smirnov".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -292,4 +302,12 @@ fn diff_special_ks() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (kolmogorov has the fewest); each must compare all of its
+    // own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

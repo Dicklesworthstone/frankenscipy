@@ -9,6 +9,7 @@
 
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_opt::{GradientFunc, MinimizeMethodOptions, MinimizeOptions, OptimizeMethod, minimize};
 use serde::Deserialize;
 
@@ -45,6 +46,8 @@ struct ScipyRow {
 /// max |x - x_scipy| on a row whose (nit, nfev) already match SciPy's exactly. The iterates
 /// agree to the BLAS-kernel level (up to 5e-8 observed for L-BFGS-B and BFGS), not bit for bit.
 const X_ABS_TOL: f64 = 1e-7;
+/// The oracle's row count; every row must be compared.
+const ROWS: usize = 22;
 
 const X5: [f64; 5] = [-1.2, 1.0, -1.2, 1.0, -1.2];
 const X4: [f64; 4] = [-1.2, 1.0, -1.2, 1.0];
@@ -306,6 +309,7 @@ fn diff_opt_minimize_options() {
     let mut compared = 0;
     let mut failures = Vec::new();
     let mut defaults: Vec<(String, (usize, usize), (usize, usize))> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_opt_minimize_options", &["minimize"]);
     for row in &rows {
         let (method, x0, tol, method_options) = fsci_row(&row.name, &simplex, &direc);
         let gradient = matches!(
@@ -320,18 +324,36 @@ fn diff_opt_minimize_options() {
             method_options,
             ..MinimizeOptions::default()
         };
-        let result = minimize(rosen, x0, options).expect(&row.name);
-        let x_error = result
-            .x
+        let result = minimize(rosen, x0, options)
+            .inspect_err(|e| eprintln!("{}: fsci error {e:?}", row.name))
+            .ok();
+        let Some((scipy_x, result)) =
+            ledger.both("minimize", &row.name, Some(row.x.as_slice()), result)
+        else {
+            continue;
+        };
+        // The ledger rejects a length mismatch (the zip below would truncate) and a NaN
+        // coordinate (the max fold would swallow it).
+        let Some((scipy_x, fsci_x)) = ledger.slices(
+            "minimize",
+            &row.name,
+            Some(scipy_x),
+            Some(result.x.as_slice()),
+        ) else {
+            continue;
+        };
+        let x_error = fsci_x
             .iter()
-            .zip(&row.x)
+            .zip(scipy_x)
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
         println!(
             "{}: fsci ({}, {}), SciPy ({}, {}); max |x - x_scipy| = {x_error:e}",
             row.name, result.nit, result.nfev, row.nit, row.nfev
         );
-        if (result.nit, result.nfev) != (row.nit, row.nfev) || x_error > X_ABS_TOL {
+        let off_path = (result.nit, result.nfev) != (row.nit, row.nfev) || x_error > X_ABS_TOL;
+        ledger.compared("minimize", &row.name, !off_path);
+        if off_path {
             failures.push(row.name.clone());
         }
         let family = row.name.split('/').next().expect("family").to_string();
@@ -356,5 +378,6 @@ fn diff_opt_minimize_options() {
     }
     println!("{compared} rows compared");
     assert!(failures.is_empty(), "rows off SciPy's path: {failures:?}");
-    assert_eq!(compared, 22, "every row was compared");
+    assert_eq!(compared, ROWS, "every row was compared");
+    ledger.finish(ROWS);
 }

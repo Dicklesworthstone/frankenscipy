@@ -15,7 +15,7 @@
 //! Every case must be compared: a SciPy failure or an fsci error is a FAILED case, not a
 //! skipped one (frankenscipy-olv0j.1).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{
     ConvergenceStatus, GradientFunc, HessFunc, HesspFunc, MinimizeOptions, OptimizeMethod, minimize,
 };
@@ -290,6 +291,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     same_path_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -436,9 +438,24 @@ fn diff_opt_trust_region_family() {
 
     let start = Instant::now();
     let mut diffs = Vec::new();
+    // One arm per (method, second-derivative kind); each runs every problem once.
+    let mut ledger = CompareLedger::new(
+        "diff_opt_trust_region_family",
+        &[
+            "trust-ncg/hess",
+            "trust-ncg/hessp",
+            "dogleg/hess",
+            "trust-exact/hess",
+        ],
+    );
     for case in &cases {
         let problem = &problems[case.problem];
         let arm = &arms[&case.id];
+        let ledger_arm = format!(
+            "{}/{}",
+            case.scipy_method,
+            if case.use_hessp { "hessp" } else { "hess" }
+        );
         let options = MinimizeOptions {
             method: Some(case.method),
             gradient: Some(problem.grad),
@@ -465,30 +482,47 @@ fn diff_opt_trust_region_family() {
             pass: false,
             reason: String::new(),
         };
-        match (fsci, arm.status, &arm.x) {
-            (Err(e), _, _) => diff.reason = format!("fsci error {e}"),
-            (Ok(_), None, _) | (Ok(_), _, None) => {
-                diff.reason = "SciPy produced no result".to_string();
+        let scipy_result = arm.status.zip(arm.x.as_deref());
+        match ledger.both(&ledger_arm, &case.id, scipy_result, fsci.as_ref().ok()) {
+            // Recorded by the ledger: SciPy produced nothing (oracle_missing) or fsci erred.
+            None => {
+                diff.reason = match &fsci {
+                    Err(e) => format!("fsci error {e}"),
+                    Ok(_) => "SciPy produced no result".to_string(),
+                };
             }
-            (Ok(r), Some(status), Some(scipy_x)) => {
+            Some(((status, scipy_x), r)) => {
                 diff.fsci_status = format!("{:?}", r.status);
                 diff.fsci_counts = [r.nit, r.nfev, r.njev, r.nhev];
                 diff.fsci_fun = r.fun.unwrap_or(f64::NAN);
                 let mut problems_found = Vec::new();
+                // Set when `slices` below already recorded this case's single ledger outcome.
+                let mut recorded = false;
                 if scipy_status_of(r.status) != Some(status) {
                     problems_found.push(format!("status {:?} vs SciPy {status}", r.status));
                 }
-                let dx =
-                    r.x.iter()
-                        .zip(scipy_x)
-                        .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
-                        .fold(0.0, f64::max);
-                diff.max_x_rel = dx;
+                // `slices` rejects a length mismatch and a NaN in fsci's x, which the
+                // `f64::max` fold below would otherwise drop.
+                match ledger.slices(&ledger_arm, &case.id, Some(scipy_x), Some(r.x.as_slice())) {
+                    None => {
+                        recorded = true;
+                        problems_found
+                            .push(format!("x {:?} rejected against SciPy {scipy_x:?}", r.x));
+                    }
+                    Some((scipy_x, fsci_x)) => {
+                        let dx = fsci_x
+                            .iter()
+                            .zip(scipy_x)
+                            .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+                            .fold(0.0, f64::max);
+                        diff.max_x_rel = dx;
+                        if dx.is_nan() || dx > X_REL_TOL {
+                            problems_found.push(format!("x rel diff {dx:e}"));
+                        }
+                    }
+                }
                 let dfun = (diff.fsci_fun - diff.scipy_fun).abs() / diff.scipy_fun.abs().max(1.0);
                 // NaN in any measure fails the case.
-                if r.x.len() != scipy_x.len() || dx.is_nan() || dx > X_REL_TOL {
-                    problems_found.push(format!("x rel diff {dx:e}"));
-                }
                 if dfun.is_nan() || dfun > FUN_REL_TOL {
                     problems_found.push(format!("fun rel diff {dfun:e}"));
                 }
@@ -498,6 +532,9 @@ fn diff_opt_trust_region_family() {
                 }
                 diff.pass = problems_found.is_empty();
                 diff.reason = problems_found.join("; ");
+                if !recorded {
+                    ledger.compared(&ledger_arm, &case.id, diff.pass);
+                }
             }
         }
         diffs.push(diff);
@@ -512,6 +549,7 @@ fn diff_opt_trust_region_family() {
         test_id: "diff_opt_trust_region_family".into(),
         category: "scipy.optimize.minimize(method='trust-ncg' | 'dogleg' | 'trust-exact')".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         same_path_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -549,4 +587,5 @@ fn diff_opt_trust_region_family() {
     for d in &diffs {
         assert!(d.pass, "{}: {}", d.case_id, d.reason);
     }
+    ledger.finish(problems.len());
 }

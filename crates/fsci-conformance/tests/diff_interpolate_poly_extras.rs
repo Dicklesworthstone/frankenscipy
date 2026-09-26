@@ -10,11 +10,12 @@
 //!   * polyroots(coeffs): real-root finder; descending-order coeffs
 //!     matching the polyval convention
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::{polyroots, polyval_der, ratval};
 use serde::Serialize;
 
@@ -33,6 +34,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -64,7 +66,14 @@ fn emit_log(log: &DiffLog) {
 fn diff_interpolate_poly_extras() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
-    let mut check = |id: &str, ok: bool, note: String| {
+    // Each check compares an infallible fsci value against its analytic answer, so every check
+    // is one compared case of its function's arm.
+    let mut ledger = CompareLedger::new(
+        "diff_interpolate_poly_extras",
+        &["polyval_der", "ratval", "polyroots"],
+    );
+    let mut check = |arm: &str, id: &str, ok: bool, note: String| {
+        ledger.compared(arm, id, ok);
         diffs.push(CaseDiff {
             case_id: id.into(),
             pass: ok,
@@ -80,6 +89,7 @@ fn diff_interpolate_poly_extras() {
         let derivs = polyval_der(&coeffs, 4.0, 2);
         // p(4) = 16 - 20 + 6 = 2; p'(4) = 3; p''(4) = 2
         check(
+            "polyval_der",
             "polyval_der_quadratic_at_x4_returns_3_values",
             derivs.len() == 3
                 && (derivs[0] - 2.0).abs() < ABS_TOL
@@ -93,6 +103,7 @@ fn diff_interpolate_poly_extras() {
         let coeffs = vec![7.0_f64];
         let derivs = polyval_der(&coeffs, 3.0, 2);
         check(
+            "polyval_der",
             "polyval_der_constant_higher_order_zero",
             derivs.len() == 3
                 && (derivs[0] - 7.0).abs() < ABS_TOL
@@ -107,6 +118,7 @@ fn diff_interpolate_poly_extras() {
         let coeffs = vec![1.0_f64, 0.0, 0.0, 0.0];
         let derivs = polyval_der(&coeffs, 2.0, 3);
         check(
+            "polyval_der",
             "polyval_der_cubic_x3_at_x2",
             derivs.len() == 4
                 && (derivs[0] - 8.0).abs() < ABS_TOL
@@ -120,6 +132,7 @@ fn diff_interpolate_poly_extras() {
     {
         let derivs = polyval_der(&[], 1.0, 2);
         check(
+            "polyval_der",
             "polyval_der_empty_returns_zeros",
             derivs.len() == 3 && derivs.iter().all(|&v| v == 0.0),
             format!("derivs={derivs:?}"),
@@ -135,16 +148,19 @@ fn diff_interpolate_poly_extras() {
         let p = vec![1.0_f64, 2.0]; // 1 + 2x
         let q = vec![1.0_f64, 1.0]; // 1 + x
         check(
+            "ratval",
             "ratval_simple_at_zero",
             (ratval(&p, &q, 0.0) - 1.0).abs() < ABS_TOL,
             String::new(),
         );
         check(
+            "ratval",
             "ratval_simple_at_one",
             (ratval(&p, &q, 1.0) - 1.5).abs() < ABS_TOL,
             String::new(),
         );
         check(
+            "ratval",
             "ratval_simple_at_two",
             (ratval(&p, &q, 2.0) - 5.0 / 3.0).abs() < ABS_TOL,
             String::new(),
@@ -155,7 +171,12 @@ fn diff_interpolate_poly_extras() {
         let p = vec![1.0_f64, 0.0];
         let q = vec![0.0_f64, 0.0]; // q(x) = 0
         let v = ratval(&p, &q, 1.0);
-        check("ratval_zero_denom_nan", v.is_nan(), format!("v={v}"));
+        check(
+            "ratval",
+            "ratval_zero_denom_nan",
+            v.is_nan(),
+            format!("v={v}"),
+        );
     }
     // q has only constant term 5: f(x) = p(x) / 5
     {
@@ -163,6 +184,7 @@ fn diff_interpolate_poly_extras() {
         let q = vec![5.0_f64];
         // f(3) = (10 + 9) / 5 = 19/5 = 3.8
         check(
+            "ratval",
             "ratval_constant_denom",
             (ratval(&p, &q, 3.0) - 3.8).abs() < ABS_TOL,
             String::new(),
@@ -174,6 +196,7 @@ fn diff_interpolate_poly_extras() {
     {
         let roots = polyroots(&[1.0_f64, -3.0]);
         check(
+            "polyroots",
             "polyroots_linear",
             roots.len() == 1 && (roots[0] - 3.0).abs() < ABS_TOL,
             format!("roots={roots:?}"),
@@ -185,6 +208,7 @@ fn diff_interpolate_poly_extras() {
         let set: HashSet<i64> = roots.iter().map(|r| r.round() as i64).collect();
         let expected: HashSet<i64> = [2_i64, 3].iter().copied().collect();
         check(
+            "polyroots",
             "polyroots_quadratic_distinct",
             roots.len() == 2 && set == expected,
             format!("roots={roots:?}"),
@@ -194,6 +218,7 @@ fn diff_interpolate_poly_extras() {
     {
         let roots = polyroots(&[1.0_f64, 0.0, 1.0]);
         check(
+            "polyroots",
             "polyroots_no_real_roots_empty",
             roots.is_empty(),
             format!("roots={roots:?}"),
@@ -203,6 +228,7 @@ fn diff_interpolate_poly_extras() {
     {
         let roots = polyroots(&[5.0_f64]);
         check(
+            "polyroots",
             "polyroots_constant_no_roots",
             roots.is_empty(),
             format!("roots={roots:?}"),
@@ -214,6 +240,7 @@ fn diff_interpolate_poly_extras() {
         test_id: "diff_interpolate_poly_extras".into(),
         category: "fsci_interpolate::{polyval_der, ratval, polyroots} coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -232,4 +259,7 @@ fn diff_interpolate_poly_extras() {
         "poly extras coverage failed: {} cases",
         diffs.len()
     );
+    // The checks are inline, not a case vector: polyval_der and polyroots each have 4 designed
+    // checks and ratval 5, so every arm must compare at least 4.
+    ledger.finish(4);
 }

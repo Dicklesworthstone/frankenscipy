@@ -13,13 +13,14 @@
 //! so far-x tightening is dominated by absolute scale; we
 //! report relative tolerance separately for x ≥ 5.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{i0, i1, kv};
@@ -29,6 +30,8 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-7;
 const REL_TOL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function compared.
+const ARMS: [&str; 4] = ["i0", "i1", "k0", "k1"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -67,6 +70,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -253,35 +257,42 @@ fn diff_special_bessel_modified() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_bessel_modified", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.x)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let rel_diff = if scipy_v.abs() > 1.0 {
-                abs_diff / scipy_v.abs()
-            } else {
-                abs_diff
-            };
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            // For values with |scipy| > 1, fall back to relative
-            // tolerance (I_n grows exponentially); else use absolute.
-            let pass = if scipy_v.abs() > 1.0 {
-                rel_diff <= REL_TOL
-            } else {
-                abs_diff <= ABS_TOL
-            };
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.x),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let rel_diff = if scipy_v.abs() > 1.0 {
+            abs_diff / scipy_v.abs()
+        } else {
+            abs_diff
+        };
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        // For values with |scipy| > 1, fall back to relative
+        // tolerance (I_n grows exponentially); else use absolute.
+        let pass = if scipy_v.abs() > 1.0 {
+            rel_diff <= REL_TOL
+        } else {
+            abs_diff <= ABS_TOL
+        };
+        ledger.compared(arm, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -290,6 +301,7 @@ fn diff_special_bessel_modified() {
         test_id: "diff_special_bessel_modified".into(),
         category: "scipy.special.i0/i1/k0/k1".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -316,4 +328,10 @@ fn diff_special_bessel_modified() {
         max_abs_overall,
         max_rel_overall
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

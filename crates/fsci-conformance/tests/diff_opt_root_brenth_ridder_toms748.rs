@@ -11,13 +11,14 @@
 //! frankenscipy-88gz), so it should match scipy's brenth at roughly
 //! the same precision because both converge to the same true root.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{RootOptions, brenth, ridder, toms748};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -234,32 +236,34 @@ fn diff_opt_root_brenth_ridder_toms748() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_opt_root_brenth_ridder_toms748",
+        &["brenth", "ridder", "toms748"],
+    );
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(scipy_x) = arm.x else {
-            continue;
-        };
+        let scipy_x = pmap.get(&case.case_id).and_then(|arm| arm.x);
         let fname = case.func.clone();
         let f = move |x: f64| eval_func(&fname, x);
         let res = match case.method.as_str() {
             "brenth" => brenth(&f, (case.a, case.b), opts),
             "ridder" => ridder(&f, (case.a, case.b), opts),
             "toms748" => toms748(&f, (case.a, case.b), opts),
-            _ => continue,
+            other => panic!("unknown method {other} in {}", case.case_id),
         };
-        let Ok(rr) = res else { continue };
-        if !rr.converged {
+        // SciPy reports a root only when it converged; an unconverged fsci run is a failure.
+        let fsci_root = res.ok().filter(|rr| rr.converged).map(|rr| rr.root);
+        let Some((scipy_x, root)) = ledger.pair(&case.method, &case.case_id, scipy_x, fsci_root)
+        else {
             continue;
-        }
-        let fsci_residual = eval_func(&case.func, rr.root).abs();
+        };
+        let fsci_residual = eval_func(&case.func, root).abs();
         let scipy_residual = eval_func(&case.func, scipy_x).abs();
-        let abs_diff_x = (rr.root - scipy_x).abs();
+        let abs_diff_x = (root - scipy_x).abs();
         let pass = abs_diff_x <= X_ABS_TOL
             && fsci_residual <= RESID_ABS_TOL
             && scipy_residual <= RESID_ABS_TOL;
+        ledger.compared(&case.method, &case.case_id, pass);
         max_overall = max_overall.max(abs_diff_x);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -276,6 +280,7 @@ fn diff_opt_root_brenth_ridder_toms748() {
         test_id: "diff_opt_root_brenth_ridder_toms748".into(),
         category: "fsci_opt::{brenth, ridder, toms748} vs scipy.optimize".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -299,4 +304,6 @@ fn diff_opt_root_brenth_ridder_toms748() {
         diffs.len(),
         max_overall
     );
+    // Every method runs the same six functions; brenth's count is each arm's count.
+    ledger.finish(query.points.iter().filter(|c| c.method == "brenth").count());
 }

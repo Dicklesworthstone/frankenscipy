@@ -33,12 +33,14 @@
 //! identical bits — it did exactly that in this test's sibling — and equally large enough to
 //! ERASE a real one. Integers do not have that problem, so bits are what travel.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{BracketOptions, bracket_root};
 use serde::{Deserialize, Serialize};
 
@@ -134,6 +136,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     compared_cases: usize,
     schedule_matches: usize,
     lockstep_divergences: usize,
@@ -441,6 +444,7 @@ fn diff_optimize_bracket_root() {
     let mut matched = 0usize;
     let mut lockstep = 0usize;
     let mut non_brackets = 0usize;
+    let mut ledger = CompareLedger::new("diff_optimize_bracket_root", &["bracket_root"]);
 
     for (case, arm) in query.points.iter().zip(&oracle.points) {
         assert_eq!(
@@ -454,26 +458,38 @@ fn diff_optimize_bracket_root() {
             case.case_id,
             arm.error
         );
-        let (Some(sampled), Some(bracket), Some(f_bracket), Some(nit), Some(nfev), Some(success)) = (
+        // A half-populated arm (a null field and no error) is recorded as a missing SciPy value.
+        let scipy = match (
             arm.sampled_bits.as_ref(),
             arm.bracket_bits.as_ref(),
             arm.f_bracket_bits.as_ref(),
             arm.nit,
             arm.nfev,
             arm.success,
-        ) else {
-            panic!(
-                "case {} came back with a null field and no error; a half-populated arm \
-                 would compare vacuously",
-                case.case_id
-            );
+        ) {
+            (
+                Some(sampled),
+                Some(bracket),
+                Some(f_bracket),
+                Some(nit),
+                Some(nfev),
+                Some(success),
+            ) => Some((sampled, bracket, f_bracket, nit, nfev, success)),
+            _ => {
+                eprintln!(
+                    "case {} came back with a null field and no error; a half-populated arm \
+                     would compare vacuously",
+                    case.case_id
+                );
+                None
+            }
         };
 
         // Our arm, recording its own schedule the same way the oracle records scipy's.
         let visited = std::cell::RefCell::new(Vec::new());
         let kind = case.kind;
         let c = case.c;
-        let result = bracket_root(
+        let fsci = bracket_root(
             |x| {
                 visited.borrow_mut().push(x);
                 kind.eval(x, c)
@@ -487,8 +503,14 @@ fn diff_optimize_bracket_root() {
                 maxiter: case.maxiter,
             },
         )
-        .unwrap_or_else(|e| panic!("case {} failed on our arm: {e}", case.case_id));
+        .inspect_err(|e| eprintln!("case {} failed on our arm: {e}", case.case_id))
+        .ok();
         let ours = visited.into_inner();
+        let Some(((sampled, bracket, f_bracket, nit, nfev, success), result)) =
+            ledger.both("bracket_root", &case.case_id, scipy, fsci)
+        else {
+            continue;
+        };
 
         let verdict = match classify_schedule(&ours, sampled) {
             Ok(v) => v,
@@ -554,6 +576,8 @@ fn diff_optimize_bracket_root() {
             );
         }
 
+        // Every check above is an assertion, so reaching here means this case matched.
+        ledger.compared("bracket_root", &case.case_id, true);
         compared += 1;
         cases.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -571,6 +595,7 @@ fn diff_optimize_bracket_root() {
         test_id: "diff_optimize_bracket_root".to_string(),
         category: "optimize.elementwise".to_string(),
         case_count: query.points.len(),
+        compared: ledger.counts().clone(),
         compared_cases: compared,
         schedule_matches: matched,
         lockstep_divergences: lockstep,
@@ -612,6 +637,7 @@ fn diff_optimize_bracket_root() {
         "the divergence split changed; expected 8 exact matches, 10 trailing-lockstep cases \
          and 3 incumbent non-brackets"
     );
+    ledger.finish(query.points.len());
 }
 
 /// MUST-MISS control for the comparator itself. Every assertion in the differential test above

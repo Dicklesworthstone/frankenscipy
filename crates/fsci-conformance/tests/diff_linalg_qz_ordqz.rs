@@ -19,6 +19,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_linalg::{DecompOptions, OrdQzSort, QzResult, ordqz, qz};
 use serde::{Deserialize, Serialize};
 
@@ -290,6 +291,15 @@ fn selected(eig: &Eig, sort: OrdQzSort) -> bool {
 fn check(pencil: &Pencil, result: &QzResult) -> (Vec<String>, Vec<Eig>) {
     let n = pencil.a.len() as f64;
     let mut reasons = Vec::new();
+    // A NaN entry would vanish in the max folds below and pass every `> tol` check.
+    let non_finite = [&result.q, &result.z, &result.aa, &result.bb]
+        .iter()
+        .flat_map(|m| m.iter().flatten())
+        .filter(|v| !v.is_finite())
+        .count();
+    if non_finite > 0 {
+        reasons.push(format!("{non_finite} non-finite entries in Q/Z/AA/BB"));
+    }
     let orth = orthogonality(&result.q).max(orthogonality(&result.z));
     if orth > ORTHOGONALITY_TOL * n {
         reasons.push(format!("orthogonality {orth:.2e}"));
@@ -307,6 +317,15 @@ fn check(pencil: &Pencil, result: &QzResult) -> (Vec<String>, Vec<Eig>) {
         reasons.push(format!("structure {structure:.2e}"));
     }
     let eigs = eigenvalues(&result.aa, &result.bb, frobenius(&pencil.b));
+    // multiset_distance keeps the first NaN distance as a best match and its max fold drops
+    // it, so a NaN finite-beta eigenvalue would otherwise match anything.
+    let nan_eigs = eigs
+        .iter()
+        .filter(|e| !e.infinite() && (e.re.is_nan() || e.im.is_nan()))
+        .count();
+    if nan_eigs > 0 {
+        reasons.push(format!("{nan_eigs} NaN eigenvalues"));
+    }
     (reasons, eigs)
 }
 
@@ -396,47 +415,68 @@ fn diff_linalg_qz_ordqz() {
     let options = DecompOptions::default();
     let mut compared = 0;
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new("diff_linalg_qz_ordqz", &["qz", "ordqz_lhp", "ordqz_iuc"]);
     for (pencil, answer) in pencils.iter().zip(&answers) {
         assert_eq!(pencil.case_id, answer.case_id);
         compared += 3;
-        let result = match qz(&pencil.a, &pencil.b, options) {
-            Ok(result) => result,
-            Err(e) => {
-                failures.push(format!("{} qz: Err({e:?})", pencil.case_id));
-                continue;
-            }
-        };
-        let (mut reasons, eigs) = check(pencil, &result);
         let (metric, bound): (fn(&Eig, &Eig) -> f64, f64) = if pencil.chordal {
             (chordal, EIGENVALUE_CHORDAL_TOL)
         } else {
             (relative, EIGENVALUE_REL_TOL)
         };
-        let distance = multiset_distance(&eigs, &answer.eigenvalues, metric);
-        if distance > bound {
-            reasons.push(format!("eigenvalues {distance:.2e}"));
-        }
-        println!(
-            "{} qz: n {} complex pairs {} infinite {} | eigenvalue distance {distance:.2e} | {reasons:?}",
-            pencil.case_id,
-            pencil.a.len(),
-            answer.complex_pairs,
-            eigs.iter().filter(|e| e.infinite()).count(),
-        );
-        if !reasons.is_empty() {
-            failures.push(format!("{} qz: {reasons:?}", pencil.case_id));
+        // A qz failure no longer skips this pencil's ordqz arms.
+        let qz_result = match qz(&pencil.a, &pencil.b, options) {
+            Ok(result) => Some(result),
+            Err(e) => {
+                failures.push(format!("{} qz: Err({e:?})", pencil.case_id));
+                None
+            }
+        };
+        if let Some((answer, result)) = ledger.both("qz", &pencil.case_id, Some(answer), qz_result)
+        {
+            let (mut reasons, eigs) = check(pencil, &result);
+            let distance = multiset_distance(&eigs, &answer.eigenvalues, metric);
+            if distance > bound {
+                reasons.push(format!("eigenvalues {distance:.2e}"));
+            }
+            println!(
+                "{} qz: n {} complex pairs {} infinite {} | eigenvalue distance {distance:.2e} | {reasons:?}",
+                pencil.case_id,
+                pencil.a.len(),
+                answer.complex_pairs,
+                eigs.iter().filter(|e| e.infinite()).count(),
+            );
+            ledger.compared("qz", &pencil.case_id, reasons.is_empty());
+            if !reasons.is_empty() {
+                failures.push(format!("{} qz: {reasons:?}", pencil.case_id));
+            }
         }
 
-        for (sort, name, scipy_selected) in [
-            (OrdQzSort::LeftHalfPlane, "lhp", answer.lhp_selected),
-            (OrdQzSort::InsideUnitCircle, "iuc", answer.iuc_selected),
+        for (sort, name, arm, scipy_selected) in [
+            (
+                OrdQzSort::LeftHalfPlane,
+                "lhp",
+                "ordqz_lhp",
+                answer.lhp_selected,
+            ),
+            (
+                OrdQzSort::InsideUnitCircle,
+                "iuc",
+                "ordqz_iuc",
+                answer.iuc_selected,
+            ),
         ] {
             let result = match ordqz(&pencil.a, &pencil.b, sort, options) {
-                Ok(result) => result,
+                Ok(result) => Some(result),
                 Err(e) => {
                     failures.push(format!("{} ordqz {name}: Err({e:?})", pencil.case_id));
-                    continue;
+                    None
                 }
+            };
+            let Some((scipy_selected, result)) =
+                ledger.both(arm, &pencil.case_id, Some(scipy_selected), result)
+            else {
+                continue;
             };
             let (mut reasons, eigs) = check(pencil, &result);
             let distance = multiset_distance(&eigs, &answer.eigenvalues, metric);
@@ -456,6 +496,7 @@ fn diff_linalg_qz_ordqz() {
                 "{} ordqz {name}: selected {total} (SciPy {scipy_selected}) | eigenvalue distance {distance:.2e} | {reasons:?}",
                 pencil.case_id
             );
+            ledger.compared(arm, &pencil.case_id, reasons.is_empty());
             if !reasons.is_empty() {
                 failures.push(format!("{} ordqz {name}: {reasons:?}", pencil.case_id));
             }
@@ -473,4 +514,5 @@ fn diff_linalg_qz_ordqz() {
     );
     assert_eq!(compared, 3 * pencils.len());
     assert!(failures.is_empty(), "qz/ordqz disagree: {failures:#?}");
+    ledger.finish(pencils.len());
 }

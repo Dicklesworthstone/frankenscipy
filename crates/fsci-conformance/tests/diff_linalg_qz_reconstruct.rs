@@ -92,7 +92,7 @@ fn frob_diff(a: &[Vec<f64>], b: &[Vec<f64>]) -> f64 {
     let mut max = 0.0_f64;
     for (ra, rb) in a.iter().zip(b.iter()) {
         for (&va, &vb) in ra.iter().zip(rb.iter()) {
-            max = max.max((va - vb).abs());
+            max = nan_max(max, (va - vb).abs());
         }
     }
     max
@@ -104,10 +104,20 @@ fn identity_diff(m: &[Vec<f64>]) -> f64 {
     for i in 0..n {
         for j in 0..n {
             let target = if i == j { 1.0 } else { 0.0 };
-            max = max.max((m[i][j] - target).abs());
+            max = nan_max(max, (m[i][j] - target).abs());
         }
     }
     max
+}
+
+/// `f64::max` returns the other operand when one is NaN, so folding residuals with it reads a
+/// NaN entry as agreement. This keeps the NaN, and `NaN <= tol` then fails the case.
+fn nan_max(acc: f64, d: f64) -> f64 {
+    if acc.is_nan() || d.is_nan() {
+        f64::NAN
+    } else {
+        acc.max(d)
+    }
 }
 
 fn fixtures() -> Vec<(String, Vec<Vec<f64>>, Vec<Vec<f64>>)> {

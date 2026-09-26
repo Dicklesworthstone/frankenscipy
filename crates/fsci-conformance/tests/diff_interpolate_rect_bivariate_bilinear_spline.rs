@@ -9,19 +9,21 @@
 //! degree, and z-data. Compare grid evaluation against scipy at
 //! 1e-9 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_interpolate::{rect_bilinear_spline, rect_bivariate_spline};
 use serde::{Deserialize, Serialize};
 
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+const ARMS: [&str; 2] = ["bilinear", "bicubic"];
 
 #[derive(Debug, Clone, Serialize)]
 struct Case {
@@ -64,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -260,35 +263,39 @@ fn diff_interpolate_rect_bivariate_bilinear_spline() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_interpolate_rect_bivariate_bilinear_spline", &ARMS);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
+        let expected = pmap
+            .get(&case.case_id)
+            .and_then(|arm| arm.values.as_deref());
         let sp = match case.kind.as_str() {
-            "bilinear" => rect_bilinear_spline(&case.x, &case.y, &case.z),
-            "bicubic" => rect_bivariate_spline(&case.x, &case.y, &case.z),
-            _ => continue,
+            "bilinear" => rect_bilinear_spline(&case.x, &case.y, &case.z).ok(),
+            "bicubic" => rect_bivariate_spline(&case.x, &case.y, &case.z).ok(),
+            _ => None,
         };
-        let Ok(sp) = sp else { continue };
-        let grid = sp.eval_grid(&case.xi, &case.yi);
-        // Row-major flatten
-        let mut flat = Vec::with_capacity(case.xi.len() * case.yi.len());
-        for row in &grid {
-            flat.extend_from_slice(row);
-        }
-        let abs_d = if flat.len() != expected.len() {
-            f64::INFINITY
-        } else {
-            flat.iter()
-                .zip(expected.iter())
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0_f64, f64::max)
+        let flat: Option<Vec<f64>> = sp.map(|sp| {
+            let grid = sp.eval_grid(&case.xi, &case.yi);
+            // Row-major flatten
+            let mut flat = Vec::with_capacity(case.xi.len() * case.yi.len());
+            for row in &grid {
+                flat.extend_from_slice(row);
+            }
+            flat
+        });
+        // `slices` records a length mismatch as a compared failure.
+        let Some((expected, flat)) =
+            ledger.slices(&case.kind, &case.case_id, expected, flat.as_deref())
+        else {
+            continue;
         };
+        let abs_d = flat
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.kind, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             kind: case.kind.clone(),
@@ -303,6 +310,7 @@ fn diff_interpolate_rect_bivariate_bilinear_spline() {
         test_id: "diff_interpolate_rect_bivariate_bilinear_spline".into(),
         category: "fsci_interpolate::rect_bivariate_spline + rect_bilinear_spline vs scipy".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -323,4 +331,10 @@ fn diff_interpolate_rect_bivariate_bilinear_spline() {
         diffs.len(),
         max_overall
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.kind == *arm).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(min_per_arm);
 }

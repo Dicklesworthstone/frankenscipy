@@ -8,13 +8,14 @@
 //!
 //! Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{impulse_response, step_response};
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -224,6 +226,7 @@ fn diff_signal_impulse_step_response() {
     let Some(oracle) = scipy_oracle_or_skip(&query) else {
         return;
     };
+    assert_eq!(oracle.points.len(), query.points.len());
 
     let pmap: HashMap<String, PointArm> = oracle
         .points
@@ -234,22 +237,27 @@ fn diff_signal_impulse_step_response() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_signal_impulse_step_response", &["impulse", "step"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.values.as_ref() else {
-            continue;
-        };
+        let arm = pmap.get(&case.case_id).expect("validated oracle");
         let res = match case.op.as_str() {
             "impulse" => impulse_response(&case.b, &case.a, case.n),
             "step" => step_response(&case.b, &case.a, case.n),
-            _ => continue,
+            other => unreachable!("generate_query emits only impulse and step cases, got {other}"),
         };
-        let Ok(y) = res else { continue };
-        let abs_d = vec_max_diff(&y, expected);
+        let res = res.ok();
+        let Some((expected, y)) = ledger.slices(
+            &case.op,
+            &case.case_id,
+            arm.values.as_deref(),
+            res.as_deref(),
+        ) else {
+            continue;
+        };
+        let abs_d = vec_max_diff(y, expected);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.op, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -264,6 +272,7 @@ fn diff_signal_impulse_step_response() {
         test_id: "diff_signal_impulse_step_response".into(),
         category: "fsci_signal::impulse_response + step_response vs scipy.signal.lfilter".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -284,4 +293,6 @@ fn diff_signal_impulse_step_response() {
         diffs.len(),
         max_overall
     );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(per_op("impulse").min(per_op("step")));
 }

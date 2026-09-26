@@ -4,13 +4,14 @@
 //! Tests FrankenSciPy optimization functions against SciPy subprocess oracle
 //! across deterministic input families.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{
     MinimizeScalarOptions, RootOptions, bisect, brenth, brentq, golden, minimize_scalar, ridder,
     toms748,
@@ -65,6 +66,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     tolerance: f64,
     pass: bool,
@@ -192,7 +194,8 @@ fn minimize_cases() -> Vec<MinimizeCase> {
     cases
 }
 
-fn run_scipy_root_oracle(cases: &[RootCase]) -> HashMap<String, f64> {
+/// Every case the oracle answered, with `None` where SciPy produced no root.
+fn run_scipy_root_oracle(cases: &[RootCase]) -> HashMap<String, Option<f64>> {
     let python_code = r#"
 import sys
 import json
@@ -265,13 +268,11 @@ print(json.dumps(results))
     let results: Vec<OracleResult> =
         serde_json::from_slice(&output.stdout).expect("parse oracle output");
 
-    results
-        .into_iter()
-        .filter_map(|r| r.root.map(|v| (r.case_id, v)))
-        .collect()
+    results.into_iter().map(|r| (r.case_id, r.root)).collect()
 }
 
-fn run_scipy_minimize_oracle(cases: &[MinimizeCase]) -> HashMap<String, f64> {
+/// Every case the oracle answered, with `None` where SciPy produced no minimum.
+fn run_scipy_minimize_oracle(cases: &[MinimizeCase]) -> HashMap<String, Option<f64>> {
     let python_code = r#"
 import sys
 import json
@@ -331,36 +332,44 @@ print(json.dumps(results))
 
     results
         .into_iter()
-        .filter_map(|r| r.minimum.map(|v| (r.case_id, v)))
+        .map(|r| (r.case_id, r.minimum))
         .collect()
 }
 
-fn run_rust_root(case: &RootCase) -> f64 {
+/// fsci's root, or `None` when the finder returned an error or did not converge (SciPy's
+/// finders raise rather than return an unconverged root).
+fn run_rust_root(case: &RootCase) -> Option<f64> {
     let f = |x: f64| eval_func(&case.func_id, x);
     let bracket = (case.a, case.b);
     let opts = RootOptions::default();
-    match case.method.as_str() {
-        "bisect" => bisect(f, bracket, opts).map_or(f64::NAN, |r| r.root),
-        "brentq" => brentq(f, bracket, opts).map_or(f64::NAN, |r| r.root),
-        "brenth" => brenth(f, bracket, opts).map_or(f64::NAN, |r| r.root),
-        "ridder" => ridder(f, bracket, opts).map_or(f64::NAN, |r| r.root),
-        "toms748" => toms748(f, bracket, opts).map_or(f64::NAN, |r| r.root),
-        _ => f64::NAN,
-    }
+    let result = match case.method.as_str() {
+        "bisect" => bisect(f, bracket, opts),
+        "brentq" => brentq(f, bracket, opts),
+        "brenth" => brenth(f, bracket, opts),
+        "ridder" => ridder(f, bracket, opts),
+        "toms748" => toms748(f, bracket, opts),
+        _ => return None,
+    };
+    result.ok().filter(|r| r.converged).map(|r| r.root)
 }
 
-fn run_rust_minimize(case: &MinimizeCase) -> f64 {
+/// fsci's minimizer, or `None` when `minimize_scalar` returned an error or reported no
+/// convergence. `golden` returns a bare pair; a non-finite x reaches the ledger as a failure.
+fn run_rust_minimize(case: &MinimizeCase) -> Option<f64> {
     let f = |x: f64| eval_func(&case.func_id, x);
     match case.method.as_str() {
         "brent" => {
             let opts = MinimizeScalarOptions::default();
-            minimize_scalar(f, (case.bracket_a, case.bracket_b), opts).map_or(f64::NAN, |r| r.x)
+            minimize_scalar(f, (case.bracket_a, case.bracket_b), opts)
+                .ok()
+                .filter(|r| r.success)
+                .map(|r| r.x)
         }
         "golden" => {
             let (x, _fval) = golden(f, case.bracket_a, case.bracket_b, 1e-6, 500);
-            x
+            Some(x)
         }
-        _ => f64::NAN,
+        _ => None,
     }
 }
 
@@ -386,24 +395,32 @@ fn diff_root_finding() {
     let mut diffs = Vec::new();
     let mut max_diff = 0.0f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new(
+        "diff_root_finding",
+        &["bisect", "brentq", "brenth", "ridder", "toms748"],
+    );
 
     for case in &cases {
-        let rust_val = run_rust_root(case);
-        if let Some(&scipy_val) = scipy_results.get(&case.case_id) {
-            let abs_diff = (rust_val - scipy_val).abs();
-            let pass = abs_diff <= ROOT_TOL || (rust_val.is_nan() && scipy_val.is_nan());
-            max_diff = max_diff.max(abs_diff);
-            all_pass = all_pass && pass;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: case.method.clone(),
-                rust_value: rust_val,
-                scipy_value: scipy_val,
-                abs_diff,
-                tolerance: ROOT_TOL,
-                pass,
-            });
-        }
+        let scipy_val = scipy_results.get(&case.case_id).copied().flatten();
+        let Some((scipy_val, rust_val)) =
+            ledger.pair(&case.method, &case.case_id, scipy_val, run_rust_root(case))
+        else {
+            continue;
+        };
+        let abs_diff = (rust_val - scipy_val).abs();
+        let pass = abs_diff <= ROOT_TOL || (rust_val.is_nan() && scipy_val.is_nan());
+        ledger.compared(&case.method, &case.case_id, pass);
+        max_diff = max_diff.max(abs_diff);
+        all_pass = all_pass && pass;
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            method: case.method.clone(),
+            rust_value: rust_val,
+            scipy_value: scipy_val,
+            abs_diff,
+            tolerance: ROOT_TOL,
+            pass,
+        });
     }
     all_pass = all_pass && diffs.len() == cases.len();
 
@@ -411,6 +428,7 @@ fn diff_root_finding() {
         test_id: "root_finding".into(),
         category: "optimize".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: ROOT_TOL,
         pass: all_pass,
@@ -422,6 +440,8 @@ fn diff_root_finding() {
     emit_log(&log);
     assert_all_cases_compared("root_finding", log.case_count, cases.len());
     assert!(all_pass, "root finding diff failed: max_diff={max_diff}");
+    // Every method runs the same four functions; bisect's count is each arm's count.
+    ledger.finish(cases.iter().filter(|c| c.method == "bisect").count());
 }
 
 #[test]
@@ -446,24 +466,32 @@ fn diff_minimize_scalar() {
     let mut diffs = Vec::new();
     let mut max_diff = 0.0f64;
     let mut all_pass = true;
+    let mut ledger = CompareLedger::new("diff_minimize_scalar", &["brent", "golden"]);
 
     for case in &cases {
-        let rust_val = run_rust_minimize(case);
-        if let Some(&scipy_val) = scipy_results.get(&case.case_id) {
-            let abs_diff = (rust_val - scipy_val).abs();
-            let pass = abs_diff <= MIN_TOL || (rust_val.is_nan() && scipy_val.is_nan());
-            max_diff = max_diff.max(abs_diff);
-            all_pass = all_pass && pass;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: case.method.clone(),
-                rust_value: rust_val,
-                scipy_value: scipy_val,
-                abs_diff,
-                tolerance: MIN_TOL,
-                pass,
-            });
-        }
+        let scipy_val = scipy_results.get(&case.case_id).copied().flatten();
+        let Some((scipy_val, rust_val)) = ledger.pair(
+            &case.method,
+            &case.case_id,
+            scipy_val,
+            run_rust_minimize(case),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_val - scipy_val).abs();
+        let pass = abs_diff <= MIN_TOL || (rust_val.is_nan() && scipy_val.is_nan());
+        ledger.compared(&case.method, &case.case_id, pass);
+        max_diff = max_diff.max(abs_diff);
+        all_pass = all_pass && pass;
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            method: case.method.clone(),
+            rust_value: rust_val,
+            scipy_value: scipy_val,
+            abs_diff,
+            tolerance: MIN_TOL,
+            pass,
+        });
     }
     all_pass = all_pass && diffs.len() == cases.len();
 
@@ -471,6 +499,7 @@ fn diff_minimize_scalar() {
         test_id: "minimize_scalar".into(),
         category: "optimize".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_diff,
         tolerance: MIN_TOL,
         pass: all_pass,
@@ -482,4 +511,6 @@ fn diff_minimize_scalar() {
     emit_log(&log);
     assert_all_cases_compared("minimize_scalar", log.case_count, cases.len());
     assert!(all_pass, "minimize_scalar diff failed: max_diff={max_diff}");
+    // Both methods run the same two functions; brent's count is each arm's count.
+    ledger.finish(cases.iter().filter(|c| c.method == "brent").count());
 }

@@ -8,15 +8,25 @@
 //! tighter than scipys oracle (both implementations chain quad and
 //! drift similarly at the inner-loop tolerance).
 
+use std::collections::BTreeMap;
 use std::f64::consts::PI;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_integrate::{QuadOptions, nquad, romberg};
 use serde::Serialize;
 
 const PACKET_ID: &str = "FSCI-P2C-007";
+/// One ledger arm per routine; a case's arm is its id prefix.
+const ARMS: [&str; 2] = ["romberg", "nquad"];
+
+fn arm_of(case_id: &str) -> &'static str {
+    ARMS.into_iter()
+        .find(|arm| case_id.starts_with(&format!("{arm}_")))
+        .unwrap_or_else(|| panic!("case {case_id} names no declared arm"))
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct CaseDiff {
@@ -36,6 +46,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -67,8 +78,12 @@ fn emit_log(log: &DiffLog) {
 fn diff_integrate_romberg_nquad() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_integrate_romberg_nquad", &ARMS);
 
-    let push = |diffs: &mut Vec<CaseDiff>,
+    // Every case pushes exactly one CaseDiff, so `diffs` is the designed case list; the ledger
+    // records whether each was compared.
+    let push = |ledger: &mut CompareLedger,
+                diffs: &mut Vec<CaseDiff>,
                 case_id: &str,
                 actual: f64,
                 expected: f64,
@@ -78,6 +93,14 @@ fn diff_integrate_romberg_nquad() {
         let denom = expected.abs().max(1.0e-300);
         let rel_diff = abs_diff / denom;
         let pass = converged && (abs_diff <= tol || rel_diff <= tol);
+        let arm = arm_of(case_id);
+        // A non-finite integral against a finite closed form is recorded as an fsci failure.
+        if ledger
+            .pair(arm, case_id, Some(expected), Some(actual))
+            .is_some()
+        {
+            ledger.compared(arm, case_id, pass);
+        }
         diffs.push(CaseDiff {
             case_id: case_id.into(),
             actual,
@@ -96,6 +119,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = romberg(|_| 5.0, 0.0, 2.0, 1.0e-10, 12);
         push(
+            &mut ledger,
             &mut diffs,
             "romberg_constant",
             r.integral,
@@ -108,6 +132,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = romberg(|x| 2.0 * x + 1.0, 0.0, 3.0, 1.0e-10, 12);
         push(
+            &mut ledger,
             &mut diffs,
             "romberg_linear",
             r.integral,
@@ -120,6 +145,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = romberg(|x| x * x, 0.0, 1.0, 1.0e-10, 12);
         push(
+            &mut ledger,
             &mut diffs,
             "romberg_quadratic",
             r.integral,
@@ -132,6 +158,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = romberg(|x| x * x * x, 0.0, 2.0, 1.0e-10, 12);
         push(
+            &mut ledger,
             &mut diffs,
             "romberg_cubic",
             r.integral,
@@ -144,6 +171,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = romberg(|x: f64| x.sin(), 0.0, PI, 1.0e-10, 12);
         push(
+            &mut ledger,
             &mut diffs,
             "romberg_sin",
             r.integral,
@@ -156,6 +184,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = romberg(|x: f64| x.cos(), 0.0, PI, 1.0e-10, 12);
         push(
+            &mut ledger,
             &mut diffs,
             "romberg_cos",
             r.integral,
@@ -169,6 +198,7 @@ fn diff_integrate_romberg_nquad() {
         let r = romberg(|x: f64| x.exp(), 0.0, 1.0, 1.0e-10, 12);
         let expected = std::f64::consts::E - 1.0;
         push(
+            &mut ledger,
             &mut diffs,
             "romberg_exp",
             r.integral,
@@ -181,6 +211,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = romberg(|_| 1.0, 0.0, 1.0, f64::NAN, 12);
         let pass = !r.converged && r.integral.is_nan();
+        ledger.compared("romberg", "romberg_nan_tol_errors", pass);
         diffs.push(CaseDiff {
             case_id: "romberg_nan_tol_errors".into(),
             actual: r.integral,
@@ -204,6 +235,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = nquad(|_x| 1.0, &[(0.0, 1.0), (0.0, 1.0)], opts).expect("nquad const");
         push(
+            &mut ledger,
             &mut diffs,
             "nquad_2d_const",
             r.integral,
@@ -217,6 +249,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = nquad(|v| v[0] + v[1], &[(0.0, 1.0), (0.0, 1.0)], opts).expect("nquad sum");
         push(
+            &mut ledger,
             &mut diffs,
             "nquad_2d_xpy",
             r.integral,
@@ -234,6 +267,7 @@ fn diff_integrate_romberg_nquad() {
         )
         .expect("nquad sin*sin");
         push(
+            &mut ledger,
             &mut diffs,
             "nquad_2d_sin_sin",
             r.integral,
@@ -251,6 +285,7 @@ fn diff_integrate_romberg_nquad() {
         )
         .expect("nquad xyz");
         push(
+            &mut ledger,
             &mut diffs,
             "nquad_3d_xyz",
             r.integral,
@@ -263,6 +298,7 @@ fn diff_integrate_romberg_nquad() {
     {
         let r = nquad(|_| 7.5, &[], opts).expect("nquad 0d");
         push(
+            &mut ledger,
             &mut diffs,
             "nquad_0d_const",
             r.integral,
@@ -277,6 +313,7 @@ fn diff_integrate_romberg_nquad() {
         test_id: "diff_integrate_romberg_nquad".into(),
         category: "fsci_integrate::{romberg, nquad} closed-form coverage".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -298,4 +335,11 @@ fn diff_integrate_romberg_nquad() {
         "romberg/nquad coverage failed: {} cases",
         diffs.len()
     );
+    // romberg has 8 cases and nquad 5; each arm must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| diffs.iter().filter(|d| arm_of(&d.case_id) == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

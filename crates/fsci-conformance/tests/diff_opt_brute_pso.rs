@@ -7,10 +7,12 @@
 //! global minimum. Tolerance generous for the grid (depends on
 //! resolution); 1e-1 for pso (population-based stochastic).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{brute, pso};
 use serde::Serialize;
 
@@ -31,6 +33,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -72,11 +75,18 @@ fn diff_opt_brute_pso() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let mut max_overall = 0.0_f64;
+    // The analytic global minimum (f* = 0 for both objectives) is the reference side; an fsci
+    // error or a missing `fun` is `rust_failed`.
+    let mut ledger = CompareLedger::new("diff_opt_brute_pso", &["brute", "pso"]);
 
     // brute — quadratic on [-2, 2]² with 21 grid points
-    if let Ok(res) = brute(quadratic, &[(-2.0, 2.0), (-2.0, 2.0)], 21) {
-        let f = res.fun.unwrap_or(f64::INFINITY);
+    let brute_quad = brute(quadratic, &[(-2.0, 2.0), (-2.0, 2.0)], 21)
+        .ok()
+        .and_then(|res| res.fun);
+    if let Some((f_star, f)) = ledger.pair("brute", "brute_quad", Some(0.0), brute_quad) {
+        let f = f - f_star;
         max_overall = max_overall.max(f);
+        ledger.compared("brute", "brute_quad", f <= BRUTE_TOL);
         diffs.push(CaseDiff {
             case_id: "brute_quad".into(),
             op: "brute".into(),
@@ -84,9 +94,13 @@ fn diff_opt_brute_pso() {
             pass: f <= BRUTE_TOL,
         });
     }
-    if let Ok(res) = brute(shifted_quadratic, &[(-2.0, 2.0), (-2.0, 2.0)], 41) {
-        let f = res.fun.unwrap_or(f64::INFINITY);
+    let brute_shifted = brute(shifted_quadratic, &[(-2.0, 2.0), (-2.0, 2.0)], 41)
+        .ok()
+        .and_then(|res| res.fun);
+    if let Some((f_star, f)) = ledger.pair("brute", "brute_shifted", Some(0.0), brute_shifted) {
+        let f = f - f_star;
         max_overall = max_overall.max(f);
+        ledger.compared("brute", "brute_shifted", f <= BRUTE_TOL);
         diffs.push(CaseDiff {
             case_id: "brute_shifted".into(),
             op: "brute".into(),
@@ -97,21 +111,29 @@ fn diff_opt_brute_pso() {
 
     // pso — quadratic on [-3, 3]² with 30 particles and 100 iters
     let (_, f1) = pso(quadratic, &[-3.0, -3.0], &[3.0, 3.0], 30, 100, 42);
-    max_overall = max_overall.max(f1);
-    diffs.push(CaseDiff {
-        case_id: "pso_quad".into(),
-        op: "pso".into(),
-        abs_diff: f1,
-        pass: f1 <= PSO_TOL,
-    });
+    if let Some((f_star, f1)) = ledger.pair("pso", "pso_quad", Some(0.0), Some(f1)) {
+        let f1 = f1 - f_star;
+        max_overall = max_overall.max(f1);
+        ledger.compared("pso", "pso_quad", f1 <= PSO_TOL);
+        diffs.push(CaseDiff {
+            case_id: "pso_quad".into(),
+            op: "pso".into(),
+            abs_diff: f1,
+            pass: f1 <= PSO_TOL,
+        });
+    }
     let (_, f2) = pso(shifted_quadratic, &[-3.0, -3.0], &[3.0, 3.0], 30, 100, 42);
-    max_overall = max_overall.max(f2);
-    diffs.push(CaseDiff {
-        case_id: "pso_shifted".into(),
-        op: "pso".into(),
-        abs_diff: f2,
-        pass: f2 <= PSO_TOL,
-    });
+    if let Some((f_star, f2)) = ledger.pair("pso", "pso_shifted", Some(0.0), Some(f2)) {
+        let f2 = f2 - f_star;
+        max_overall = max_overall.max(f2);
+        ledger.compared("pso", "pso_shifted", f2 <= PSO_TOL);
+        diffs.push(CaseDiff {
+            case_id: "pso_shifted".into(),
+            op: "pso".into(),
+            abs_diff: f2,
+            pass: f2 <= PSO_TOL,
+        });
+    }
 
     let all_pass = diffs.iter().all(|d| d.pass);
 
@@ -119,6 +141,7 @@ fn diff_opt_brute_pso() {
         test_id: "diff_opt_brute_pso".into(),
         category: "fsci_opt::{brute, pso} property test".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -139,4 +162,6 @@ fn diff_opt_brute_pso() {
         diffs.len(),
         max_overall
     );
+    // Two objectives per method, each compared once.
+    ledger.finish(2);
 }

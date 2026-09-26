@@ -29,13 +29,14 @@
 //! machine, fsci then agrees with SciPy on all 500: 477 under both dispatches, 23 under the
 //! portable path only, 0 under neither.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::{FindPeaksOptions, FindPeaksResult, PeakCondition, find_peaks};
 use serde::{Deserialize, Serialize};
 
@@ -111,7 +112,9 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
-    compared: usize,
+    compared: BTreeMap<String, ArmCounts>,
+    /// Cases judged against SciPy (every case pushes a diff row).
+    cases_judged: usize,
     max_diff: f64,
     pass: bool,
     /// Cases where SciPy's default-dispatch and portable numpy disagree.
@@ -459,6 +462,7 @@ fn diff_signal_find_peaks_full() {
     let mut max_overall = 0.0_f64;
     let (mut agree_both, mut agree_default_only, mut agree_portable_only) = (0, 0, 0);
     let mut isa_sensitive = 0;
+    let mut ledger = CompareLedger::new("diff_signal_find_peaks_full", &["find_peaks"]);
     for case in &query.points {
         let default_arm = default_arms.get(&case.case_id).expect("validated oracle");
         let portable_arm = portable_arms.get(&case.case_id).expect("validated oracle");
@@ -491,6 +495,14 @@ fn diff_signal_find_peaks_full() {
                 case.case_id, case.x
             );
         }
+        let fsci_refused = find_peaks(&case.x, options_for(case)).is_err();
+        let scipy_raised = default_arm.error.is_some() && portable_arm.error.is_some();
+        match (scipy_raised, fsci_refused) {
+            // The oracle records SciPy's raise as an answer; `judge` passes a matching refusal.
+            (true, refused) => ledger.expected_raise("find_peaks", &case.case_id, refused),
+            (false, true) if !pass => ledger.rust_failed("find_peaks", &case.case_id, &detail),
+            (false, _) => ledger.compared("find_peaks", &case.case_id, pass),
+        }
         max_overall = max_overall.max(max_diff);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
@@ -522,7 +534,8 @@ fn diff_signal_find_peaks_full() {
         test_id: "diff_signal_find_peaks_full".into(),
         category: "scipy.signal.find_peaks".into(),
         case_count: query.points.len(),
-        compared,
+        compared: ledger.counts().clone(),
+        cases_judged: compared,
         max_diff: max_overall,
         pass: failures == 0,
         isa_sensitive,
@@ -546,4 +559,5 @@ fn diff_signal_find_peaks_full() {
         failures, 0,
         "find_peaks: {failures} of {compared} cases disagree with SciPy"
     );
+    ledger.finish(query.points.len());
 }

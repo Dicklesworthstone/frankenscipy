@@ -5,13 +5,14 @@
 //!
 //! Resolves [frankenscipy-acmec]. 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_sparse::{CsrMatrix, Shape2D, minimum_spanning_tree};
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +57,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -270,36 +272,46 @@ fn diff_sparse_minimum_spanning_tree() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_sparse_minimum_spanning_tree",
+        &["total_weight", "edge_count"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_total) = scipy_arm.total_weight else {
-            continue;
-        };
-        let Some(scipy_nnz) = scipy_arm.nnz else {
-            continue;
-        };
         let csr = dense_to_csr(case.rows, case.cols, &case.adj_flat);
         // An fsci error where SciPy returned a finite tree is a divergence, not a
-        // case to skip.
-        let res = match minimum_spanning_tree(&csr) {
-            Ok(res) => res,
-            Err(err) => {
-                eprintln!("mst: fsci error on {}: {err:?}", case.case_id);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    abs_diff: f64::INFINITY,
-                    pass: false,
-                });
-                continue;
-            }
-        };
-        let weight_d = (res.total_weight - scipy_total).abs();
+        // case to skip: the ledger records it as an fsci failure.
+        let res = minimum_spanning_tree(&csr);
+        if let Err(err) = &res {
+            eprintln!("mst: fsci error on {}: {err:?}", case.case_id);
+        }
+        let res = res.ok();
+        let mut weight_d = None;
+        if let Some((scipy_total, fsci_total)) = ledger.pair(
+            "total_weight",
+            &case.case_id,
+            scipy_arm.total_weight,
+            res.as_ref().map(|r| r.total_weight),
+        ) {
+            let d = (fsci_total - scipy_total).abs();
+            ledger.compared("total_weight", &case.case_id, d <= ABS_TOL);
+            weight_d = Some(d);
+        }
         // Edge count should also match — both produce n-1 edges for connected graphs.
-        let edge_d = if res.edges.len() == scipy_nnz {
-            0.0
-        } else {
-            1.0
+        let mut edge_d = None;
+        if let Some((scipy_nnz, fsci_edges)) = ledger.both(
+            "edge_count",
+            &case.case_id,
+            scipy_arm.nnz,
+            res.as_ref().map(|r| r.edges.len()),
+        ) {
+            let d = if fsci_edges == scipy_nnz { 0.0 } else { 1.0 };
+            ledger.compared("edge_count", &case.case_id, d <= ABS_TOL);
+            edge_d = Some(d);
+        }
+        let (Some(weight_d), Some(edge_d)) = (weight_d, edge_d) else {
+            continue; // the ledger recorded why this case was not compared
         };
         let abs_d = weight_d.max(edge_d);
         max_overall = max_overall.max(abs_d);
@@ -316,6 +328,7 @@ fn diff_sparse_minimum_spanning_tree() {
         test_id: "diff_sparse_minimum_spanning_tree".into(),
         category: "scipy.sparse.csgraph.minimum_spanning_tree".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -346,4 +359,5 @@ fn diff_sparse_minimum_spanning_tree() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

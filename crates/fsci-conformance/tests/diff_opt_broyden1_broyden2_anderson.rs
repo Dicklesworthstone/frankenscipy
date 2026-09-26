@@ -8,13 +8,14 @@
 //! ones. The harness uses a property-based check: verify that BOTH fsci
 //! and scipy solutions satisfy ||F(x)||∞ < 1e-5.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_opt::{anderson, broyden1, broyden2};
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -227,27 +229,31 @@ fn diff_opt_broyden1_broyden2_anderson() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let methods = ["broyden1", "broyden2", "anderson"];
+    let mut ledger = CompareLedger::new("diff_opt_broyden1_broyden2_anderson", &methods);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let Some(expected) = arm.x.as_ref() else {
-            continue;
-        };
+        // The oracle sends x only when SciPy's root converged.
+        let expected = pmap.get(&case.case_id).and_then(|arm| arm.x.as_deref());
         let f = |x: &[f64]| func(&case.func, x);
         let res = match case.method.as_str() {
             "broyden1" => broyden1(f, &case.x0, 1.0e-10, 1000),
             "broyden2" => broyden2(f, &case.x0, 1.0e-10, 1000),
             "anderson" => anderson(f, &case.x0, 1.0e-10, 1000, 5, 1.0),
-            _ => continue,
+            other => panic!("unknown method {other} in {}", case.case_id),
         };
-        let Ok(rr) = res else { continue };
-        if !rr.converged {
+        // Not converging where SciPy converged is an fsci failure, not a skip.
+        let rr = res.ok().filter(|rr| rr.converged);
+        let Some((expected, fsci_x)) = ledger.slices(
+            &case.method,
+            &case.case_id,
+            expected,
+            rr.as_ref().map(|rr| rr.x.as_slice()),
+        ) else {
             continue;
-        }
+        };
         // Property-based: residual |F(x)| ≈ 0 for both fsci and scipy.
-        let fsci_residual = func(&case.func, &rr.x)
+        let fsci_residual = func(&case.func, fsci_x)
             .iter()
             .map(|v| v.abs())
             .fold(0.0_f64, f64::max);
@@ -257,6 +263,7 @@ fn diff_opt_broyden1_broyden2_anderson() {
             .fold(0.0_f64, f64::max);
         let abs_d = fsci_residual.max(scipy_residual);
         max_overall = max_overall.max(abs_d);
+        ledger.compared(&case.method, &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.method.clone(),
@@ -271,6 +278,7 @@ fn diff_opt_broyden1_broyden2_anderson() {
         test_id: "diff_opt_broyden1_broyden2_anderson".into(),
         category: "fsci_opt::{broyden1, broyden2, anderson} vs scipy.optimize.root".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -290,5 +298,12 @@ fn diff_opt_broyden1_broyden2_anderson() {
         "broyden/anderson conformance failed: {} cases, max_diff={}",
         diffs.len(),
         max_overall
+    );
+    ledger.finish(
+        methods
+            .iter()
+            .map(|m| query.points.iter().filter(|c| c.method == *m).count())
+            .min()
+            .unwrap_or(0),
     );
 }

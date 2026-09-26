@@ -2,12 +2,14 @@
 //! Live SciPy differential coverage for `scipy.special.betaincc` and
 //! `scipy.special.betainccinv`.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{betaincc, betainccinv};
@@ -17,6 +19,8 @@ const PACKET_ID: &str = "FSCI-P2C-007";
 const TOL_ABS: f64 = 1.0e-10;
 const TOL_REL: f64 = 1.0e-9;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per SciPy function compared.
+const ARMS: [&str; 2] = ["betaincc", "betainccinv"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -56,6 +60,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -247,13 +252,21 @@ fn diff_special_betaincc() {
     let mut cases = Vec::new();
     let mut max_abs_diff = 0.0_f64;
     let mut max_rel_diff = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_betaincc", &ARMS);
     for (case, oracle_point) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, oracle_point.case_id);
-        let actual = fsci_eval(case).unwrap_or(f64::NAN);
-        let expected = oracle_point.value.unwrap_or(f64::NAN);
+        let arm = case.op.as_str();
+        // A missing value on either side is recorded by the ledger instead of being read as
+        // NaN, which `close_enough` would have accepted when both sides were missing.
+        let Some((expected, actual)) =
+            ledger.pair(arm, &case.case_id, oracle_point.value, fsci_eval(case))
+        else {
+            continue;
+        };
         let (abs_diff, rel_diff, pass) = close_enough(actual, expected);
         max_abs_diff = max_abs_diff.max(abs_diff);
         max_rel_diff = max_rel_diff.max(rel_diff);
+        ledger.compared(arm, &case.case_id, pass);
         cases.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff,
@@ -267,6 +280,7 @@ fn diff_special_betaincc() {
         test_id: "diff_special_betaincc".into(),
         category: "scipy.special.betaincc/betainccinv".into(),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff,
         max_rel_diff,
         pass,
@@ -281,4 +295,10 @@ fn diff_special_betaincc() {
         "betaincc conformance failed: {} cases, max_abs={} max_rel={}",
         log.case_count, log.max_abs_diff, log.max_rel_diff
     );
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.op == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

@@ -8,12 +8,14 @@
 //! by diff_fft_audit_variants_nd_equivalence; this fills the missing
 //! numerical-parity gap against the canonical numpy reference.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_fft::{Complex64, FftOptions, fft2, ifft2};
 use serde::{Deserialize, Serialize};
 
@@ -67,6 +69,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -242,11 +245,21 @@ fn diff_fft_fft2_ifft2_numpy_parity() {
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
     let opts = FftOptions::default();
+    let mut ledger = CompareLedger::new("diff_fft_fft2_ifft2_numpy_parity", &["fft2", "ifft2"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let (Some(exp_re), Some(exp_im)) = (o.real.as_ref(), o.imag.as_ref()) else {
-            continue;
+        // Complex values as [re0, im0, re1, im1, ...] on both sides; the max over it is the
+        // per-element max(|d re|, |d im|).
+        let expected: Option<Vec<f64>> = match (o.real.as_ref(), o.imag.as_ref()) {
+            (Some(exp_re), Some(exp_im)) if exp_re.len() == exp_im.len() => Some(
+                exp_re
+                    .iter()
+                    .zip(exp_im)
+                    .flat_map(|(&re, &im)| [re, im])
+                    .collect(),
+            ),
+            _ => None,
         };
 
         let signal: Vec<Complex64> = case
@@ -261,42 +274,22 @@ fn diff_fft_fft2_ifft2_numpy_parity() {
             "ifft2" => ifft2(&signal, (case.rows, case.cols), &opts),
             other => panic!("unknown op {other}"),
         };
-        let out = match result {
-            Ok(v) => v,
-            Err(e) => {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    op: case.op.clone(),
-                    rows: case.rows,
-                    cols: case.cols,
-                    max_abs_diff: f64::INFINITY,
-                    pass: false,
-                    note: format!("fft2/ifft2 error: {e:?}"),
-                });
-                continue;
-            }
+        let out: Option<Vec<f64>> = result
+            .ok()
+            .map(|v| v.iter().flat_map(|&(re, im)| [re, im]).collect());
+        let Some((expected, out)) =
+            ledger.slices(&case.op, &case.case_id, expected.as_deref(), out.as_deref())
+        else {
+            continue;
         };
 
-        if out.len() != exp_re.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                op: case.op.clone(),
-                rows: case.rows,
-                cols: case.cols,
-                max_abs_diff: f64::INFINITY,
-                pass: false,
-                note: format!("length mismatch: fsci={} numpy={}", out.len(), exp_re.len()),
-            });
-            continue;
-        }
-
-        let mut max_abs = 0.0_f64;
-        for (idx, &(re, im)) in out.iter().enumerate() {
-            let dr = (re - exp_re[idx]).abs();
-            let di = (im - exp_im[idx]).abs();
-            max_abs = max_abs.max(dr.max(di));
-        }
+        let max_abs = out
+            .iter()
+            .zip(expected)
+            .map(|(f, e)| (f - e).abs())
+            .fold(0.0_f64, f64::max);
         let pass = max_abs <= ABS_TOL;
+        ledger.compared(&case.op, &case.case_id, pass);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             op: case.op.clone(),
@@ -313,6 +306,7 @@ fn diff_fft_fft2_ifft2_numpy_parity() {
         test_id: "diff_fft_fft2_ifft2_numpy_parity".into(),
         category: "fsci_fft::{fft2, ifft2} vs numpy.fft".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -334,4 +328,6 @@ fn diff_fft_fft2_ifft2_numpy_parity() {
         "fft2/ifft2 numpy parity failed: {} cases",
         diffs.len()
     );
+    let per_op = |op: &str| query.points.iter().filter(|c| c.op == op).count();
+    ledger.finish(per_op("fft2").min(per_op("ifft2")));
 }

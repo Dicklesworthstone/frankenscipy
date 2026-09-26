@@ -4,13 +4,14 @@
 //! The ODR covariance path must marginalize over fitted input corrections, not
 //! just invert the beta-only normal matrix.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_odr::{Data, ODR, unilinear};
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +73,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_rel_diff: f64,
     tolerance: f64,
     pass: bool,
@@ -305,6 +307,16 @@ fn max_rel_diff_diag(left: &[Vec<f64>], right: &[Vec<f64>]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
+/// The diagonal the covariance metric reads, for the ledger's presence and non-finite checks.
+/// A row too short to hold its diagonal element reads as NaN.
+fn diagonal(matrix: &[Vec<f64>]) -> Vec<f64> {
+    matrix
+        .iter()
+        .enumerate()
+        .map(|(idx, row)| row.get(idx).copied().unwrap_or(f64::NAN))
+        .collect()
+}
+
 #[test]
 fn diff_odr_covariance_coupling() -> TestResult<()> {
     let query = generate_query();
@@ -327,17 +339,73 @@ fn diff_odr_covariance_coupling() -> TestResult<()> {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_rel = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_odr_covariance_coupling",
+        &["beta", "sd_beta", "cov_diag", "res_var"],
+    );
 
     for case in &query.points {
         let Some(expected) = oracle_by_id.get(case.case_id) else {
             return Err(format!("oracle omitted case {}", case.case_id));
         };
-        let actual = run_fsci_case(case)?;
-        let beta_rel_diff = max_rel_diff_vec(&actual.beta, &expected.beta);
-        let sd_beta_rel_diff = max_rel_diff_vec(&actual.sd_beta, &expected.sd_beta);
-        let cov_diag_rel_diff =
-            max_rel_diff_diag(&actual.cov_beta_scaled, &expected.cov_beta_scaled);
-        let res_var_rel_diff = rel_diff(actual.res_var, expected.res_var);
+        let id = case.case_id;
+        let actual = run_fsci_case(case)
+            .inspect_err(|err| eprintln!("odr fsci failure: {id} {err}"))
+            .ok();
+        let scipy_diag = diagonal(&expected.cov_beta_scaled);
+        let fsci_diag = actual.as_ref().map(|a| diagonal(&a.cov_beta_scaled));
+        let beta = ledger
+            .slices(
+                "beta",
+                id,
+                Some(expected.beta.as_slice()),
+                actual.as_ref().map(|a| a.beta.as_slice()),
+            )
+            .map(|(s, f)| max_rel_diff_vec(f, s));
+        let sd_beta = ledger
+            .slices(
+                "sd_beta",
+                id,
+                Some(expected.sd_beta.as_slice()),
+                actual.as_ref().map(|a| a.sd_beta.as_slice()),
+            )
+            .map(|(s, f)| max_rel_diff_vec(f, s));
+        let cov_diag = ledger
+            .slices(
+                "cov_diag",
+                id,
+                Some(scipy_diag.as_slice()),
+                fsci_diag.as_deref(),
+            )
+            .and(actual.as_ref())
+            .map(|a| max_rel_diff_diag(&a.cov_beta_scaled, &expected.cov_beta_scaled));
+        let res_var = ledger
+            .pair(
+                "res_var",
+                id,
+                Some(expected.res_var),
+                actual.as_ref().map(|a| a.res_var),
+            )
+            .map(|(s, f)| rel_diff(f, s));
+        for (arm, d) in [
+            ("beta", beta),
+            ("sd_beta", sd_beta),
+            ("cov_diag", cov_diag),
+            ("res_var", res_var),
+        ] {
+            if let Some(d) = d {
+                ledger.compared(arm, id, d <= REL_TOL);
+            }
+        }
+        let (
+            Some(beta_rel_diff),
+            Some(sd_beta_rel_diff),
+            Some(cov_diag_rel_diff),
+            Some(res_var_rel_diff),
+        ) = (beta, sd_beta, cov_diag, res_var)
+        else {
+            continue; // the ledger recorded why this case was not compared
+        };
         let case_max = beta_rel_diff
             .max(sd_beta_rel_diff)
             .max(cov_diag_rel_diff)
@@ -358,6 +426,7 @@ fn diff_odr_covariance_coupling() -> TestResult<()> {
         test_id: "diff_odr_covariance_coupling".into(),
         category: "scipy.odr.covariance".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_rel_diff: max_rel,
         tolerance: REL_TOL,
         pass: all_pass,
@@ -386,5 +455,6 @@ fn diff_odr_covariance_coupling() -> TestResult<()> {
             diffs.len()
         ));
     }
+    ledger.finish(query.points.len());
     Ok(())
 }

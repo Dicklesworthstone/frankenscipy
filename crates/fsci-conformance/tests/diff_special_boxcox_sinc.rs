@@ -10,13 +10,14 @@
 //!
 //! Tolerances: 1e-13 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_runtime::RuntimeMode;
 use fsci_special::types::SpecialTensor;
 use fsci_special::{boxcox_transform, boxcox1p, inv_boxcox, sinc};
@@ -25,6 +26,8 @@ use serde::{Deserialize, Serialize};
 const PACKET_ID: &str = "FSCI-P2C-007";
 const ABS_TOL: f64 = 1.0e-13;
 const REQUIRE_SCIPY_ENV: &str = "FSCI_REQUIRE_SCIPY_ORACLE";
+/// One ledger arm per function.
+const ARMS: [&str; 4] = ["boxcox", "boxcox1p", "inv_boxcox", "sinc"];
 
 #[derive(Debug, Clone, Serialize)]
 struct PointCase {
@@ -42,6 +45,12 @@ struct OracleQuery {
 #[derive(Debug, Clone, Deserialize)]
 struct PointArm {
     case_id: String,
+    // The inv_boxcox grid crosses the domain edge (1 + lam*y <= 0 for lam < 0), where SciPy's
+    // answer is NaN or inf; it arrives as "nan"/"inf", distinct from null.
+    #[serde(
+        default,
+        deserialize_with = "fsci_conformance::compare_ledger::oracle_f64"
+    )]
     value: Option<f64>,
 }
 
@@ -63,6 +72,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -166,12 +176,13 @@ import sys
 from scipy import special
 import numpy as np
 
-def finite_or_none(v):
+def fval(v):
     try:
         v = float(v)
     except Exception:
         return None
-    return v if math.isfinite(v) else None
+    # A NaN/inf answer is sent as "nan"/"inf"/"-inf", so it is not read as a raised call.
+    return v if math.isfinite(v) else ("nan" if math.isnan(v) else ("inf" if v > 0 else "-inf"))
 
 q = json.load(sys.stdin)
 points = []
@@ -184,7 +195,7 @@ for case in q["points"]:
         elif func == "inv_boxcox":value = special.inv_boxcox(a1, a2)
         elif func == "sinc":     value = float(np.sinc(a1))
         else: value = None
-        points.append({"case_id": cid, "value": finite_or_none(value)})
+        points.append({"case_id": cid, "value": fval(value)})
     except Exception:
         points.append({"case_id": cid, "value": None})
 print(json.dumps({"points": points}))
@@ -255,21 +266,28 @@ fn diff_special_boxcox_sinc() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_special_boxcox_sinc", &ARMS);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.func, case.arg1, case.arg2)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        let arm = case.func.as_str();
+        let Some((scipy_v, rust_v)) = ledger.pair(
+            arm,
+            &case.case_id,
+            oracle.value,
+            fsci_eval(&case.func, case.arg1, case.arg2),
+        ) else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -278,6 +296,7 @@ fn diff_special_boxcox_sinc() {
         test_id: "diff_special_boxcox_sinc".into(),
         category: "scipy.special.boxcox/boxcox1p/inv_boxcox/sinc".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -302,4 +321,11 @@ fn diff_special_boxcox_sinc() {
         diffs.len(),
         max_overall
     );
+    // Arms have different case sets (sinc has the fewest); each must compare all of its own.
+    let min_per_arm = ARMS
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.func == *arm).count())
+        .min()
+        .expect("ARMS is non-empty");
+    ledger.finish(min_per_arm);
 }

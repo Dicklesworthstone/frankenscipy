@@ -12,13 +12,14 @@
 //! 4-D for dot/angle/normalize) × per-fn applicability ≈ 16 cases.
 //! Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_spatial::{angle_between, cross_3d, dot, normalize};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass_count: usize,
     pass: bool,
     timestamp_ms: u128,
@@ -242,13 +244,22 @@ fn diff_spatial_vector_ops() {
 
     let start = Instant::now();
     let mut cases = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_spatial_vector_ops",
+        &["dot", "angle_between", "cross_3d", "normalize"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
 
         // dot
-        if let Some(scipy_d) = scipy_arm.dot {
-            let r = dot(&case.a, &case.b);
+        if let Some((scipy_d, r)) = ledger.pair(
+            "dot",
+            &case.case_id,
+            scipy_arm.dot,
+            Some(dot(&case.a, &case.b)),
+        ) {
+            ledger.compared("dot", &case.case_id, (r - scipy_d).abs() <= ABS_TOL);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "dot".into(),
@@ -258,8 +269,17 @@ fn diff_spatial_vector_ops() {
         }
 
         // angle_between
-        if let Some(scipy_ang) = scipy_arm.angle {
-            let r = angle_between(&case.a, &case.b);
+        if let Some((scipy_ang, r)) = ledger.pair(
+            "angle_between",
+            &case.case_id,
+            scipy_arm.angle,
+            Some(angle_between(&case.a, &case.b)),
+        ) {
+            ledger.compared(
+                "angle_between",
+                &case.case_id,
+                (r - scipy_ang).abs() <= ABS_TOL,
+            );
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "angle_between".into(),
@@ -268,31 +288,49 @@ fn diff_spatial_vector_ops() {
             });
         }
 
-        // cross_3d (only when is_3d)
-        if let Some(scipy_c) = scipy_arm.cross {
+        // cross_3d (only when is_3d: the oracle computes it only for those cases)
+        if case.is_3d {
             let a3 = [case.a[0], case.a[1], case.a[2]];
             let b3 = [case.b[0], case.b[1], case.b[2]];
             let r = cross_3d(&a3, &b3);
-            let abs_diff = [
-                (r[0] - scipy_c[0]).abs(),
-                (r[1] - scipy_c[1]).abs(),
-                (r[2] - scipy_c[2]).abs(),
-            ];
-            cases.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                sub_check: "cross_3d".into(),
-                detail: format!("rust={r:?}, numpy={scipy_c:?}"),
-                pass: abs_diff.iter().all(|d| *d <= ABS_TOL),
-            });
+            if let (Some(_), Some(scipy_c)) = (
+                ledger.slices(
+                    "cross_3d",
+                    &case.case_id,
+                    scipy_arm.cross.as_ref().map(|c| c.as_slice()),
+                    Some(r.as_slice()),
+                ),
+                scipy_arm.cross,
+            ) {
+                let abs_diff = [
+                    (r[0] - scipy_c[0]).abs(),
+                    (r[1] - scipy_c[1]).abs(),
+                    (r[2] - scipy_c[2]).abs(),
+                ];
+                let pass = abs_diff.iter().all(|d| *d <= ABS_TOL);
+                ledger.compared("cross_3d", &case.case_id, pass);
+                cases.push(CaseDiff {
+                    case_id: case.case_id.clone(),
+                    sub_check: "cross_3d".into(),
+                    detail: format!("rust={r:?}, numpy={scipy_c:?}"),
+                    pass,
+                });
+            }
         }
 
-        // normalize(a)
-        if let Some(scipy_n) = scipy_arm.norm_a.as_ref() {
-            let r = normalize(&case.a);
+        // normalize(a). slices rejects a length mismatch and a non-finite component.
+        let r = normalize(&case.a);
+        if let Some((scipy_n, _)) = ledger.slices(
+            "normalize",
+            &case.case_id,
+            scipy_arm.norm_a.as_deref(),
+            Some(r.as_slice()),
+        ) {
             let pass = r.len() == scipy_n.len()
                 && r.iter()
                     .zip(scipy_n.iter())
                     .all(|(rv, sv)| (rv - sv).abs() <= ABS_TOL);
+            ledger.compared("normalize", &case.case_id, pass);
             cases.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 sub_check: "normalize".into(),
@@ -309,6 +347,7 @@ fn diff_spatial_vector_ops() {
         test_id: "diff_spatial_vector_ops".into(),
         category: "fsci_spatial::{dot,angle_between,cross_3d,normalize}".into(),
         case_count: cases.len(),
+        compared: ledger.counts().clone(),
         pass_count,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -333,4 +372,6 @@ fn diff_spatial_vector_ops() {
         pass_count,
         cases.len()
     );
+    // cross_3d is designed for the 3-D cases only; every other arm covers all points.
+    ledger.finish(query.points.iter().filter(|c| c.is_3d).count());
 }

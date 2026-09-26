@@ -7,12 +7,14 @@
 //! filter designs: Butterworth/Chebyshev/elliptic lowpass, simple
 //! moving-average FIR, and identity all-pass.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_signal::group_delay_from_ba;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     pass: bool,
     timestamp_ms: u128,
     duration_ns: u128,
@@ -234,45 +237,49 @@ fn diff_signal_group_delay_from_ba() {
 
     let start = Instant::now();
     let mut diffs: Vec<CaseDiff> = Vec::new();
+    let mut ledger = CompareLedger::new("diff_signal_group_delay_from_ba", &["w", "gd"]);
 
     for (case, o) in query.points.iter().zip(oracle.points.iter()) {
         assert_eq!(case.case_id, o.case_id);
-        let (Some(exp_w), Some(exp_gd)) = (o.w.as_ref(), o.gd.as_ref()) else {
-            continue;
-        };
 
         let (w_actual, gd_actual) = group_delay_from_ba(&case.b, &case.a, case.n_freqs);
 
-        if w_actual.len() != exp_w.len() || gd_actual.len() != exp_gd.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                max_abs_diff_w: f64::INFINITY,
-                max_abs_diff_gd: f64::INFINITY,
-                max_rel_diff_gd: f64::INFINITY,
-                pass: false,
-                note: format!(
-                    "length mismatch: fsci_w={} scipy_w={} fsci_gd={} scipy_gd={}",
-                    w_actual.len(),
-                    exp_w.len(),
-                    gd_actual.len(),
-                    exp_gd.len()
-                ),
-            });
-            continue;
+        // NaN marks an arm the ledger did not hand back for comparison.
+        let mut max_abs_w = f64::NAN;
+        if let Some((exp_w, w_actual)) = ledger.slices(
+            "w",
+            &case.case_id,
+            o.w.as_deref(),
+            Some(w_actual.as_slice()),
+        ) {
+            max_abs_w = 0.0_f64;
+            for (a, e) in w_actual.iter().zip(exp_w.iter()) {
+                max_abs_w = max_abs_w.max((a - e).abs());
+            }
+            ledger.compared("w", &case.case_id, max_abs_w <= ABS_TOL);
         }
 
-        let mut max_abs_w = 0.0_f64;
-        for (a, e) in w_actual.iter().zip(exp_w.iter()) {
-            max_abs_w = max_abs_w.max((a - e).abs());
+        let mut max_abs_gd = f64::NAN;
+        let mut max_rel_gd = f64::NAN;
+        if let Some((exp_gd, gd_actual)) = ledger.slices(
+            "gd",
+            &case.case_id,
+            o.gd.as_deref(),
+            Some(gd_actual.as_slice()),
+        ) {
+            max_abs_gd = 0.0_f64;
+            max_rel_gd = 0.0_f64;
+            for (a, e) in gd_actual.iter().zip(exp_gd.iter()) {
+                let abs_d = (a - e).abs();
+                let denom = e.abs().max(1.0e-300);
+                max_abs_gd = max_abs_gd.max(abs_d);
+                max_rel_gd = max_rel_gd.max(abs_d / denom);
+            }
+            let gd_pass = max_rel_gd <= REL_TOL || max_abs_gd <= ABS_TOL;
+            ledger.compared("gd", &case.case_id, gd_pass);
         }
-
-        let mut max_abs_gd = 0.0_f64;
-        let mut max_rel_gd = 0.0_f64;
-        for (a, e) in gd_actual.iter().zip(exp_gd.iter()) {
-            let abs_d = (a - e).abs();
-            let denom = e.abs().max(1.0e-300);
-            max_abs_gd = max_abs_gd.max(abs_d);
-            max_rel_gd = max_rel_gd.max(abs_d / denom);
+        if max_abs_w.is_nan() || max_abs_gd.is_nan() {
+            continue; // the ledger recorded why this case was not compared
         }
 
         let w_pass = max_abs_w <= ABS_TOL;
@@ -293,6 +300,7 @@ fn diff_signal_group_delay_from_ba() {
         test_id: "diff_signal_group_delay_from_ba".into(),
         category: "fsci_signal::group_delay_from_ba vs scipy.signal.group_delay".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
         duration_ns: start.elapsed().as_nanos(),
@@ -310,4 +318,5 @@ fn diff_signal_group_delay_from_ba() {
     }
 
     assert!(all_pass, "group_delay parity failed: {} cases", diffs.len());
+    ledger.finish(query.points.len());
 }
