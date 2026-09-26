@@ -5235,7 +5235,12 @@ pub fn gammaincinv(
 
 /// Scalar helper for the inverse regularized incomplete gamma function.
 pub fn gammaincinv_scalar(a: f64, y: f64) -> f64 {
-    if !(0.0..=1.0).contains(&y) {
+    // A NaN or negative `a` makes the bracket `hi = a + 4·√a + 10` NaN, and
+    // `x0.clamp(lo + 1e-300, hi)` below PANICS on a NaN bound (frankenscipy-qu5po). SciPy
+    // 1.17.1 rejects both before its p = 0 / p = 1 shortcuts: gammaincinv(nan, y) and
+    // gammaincinv(-1, y) are nan for y = 0, 0.3, 0.95 and 1. A signed zero is not negative
+    // there, so gammaincinv(-0.0, 0) = 0.0 and gammaincinv(-0.0, 1) = inf still.
+    if a.is_nan() || a < 0.0 || !(0.0..=1.0).contains(&y) {
         return f64::NAN;
     }
     if y == 0.0 {
@@ -5347,7 +5352,10 @@ pub fn gammainccinv(
 
 /// Scalar helper for the inverse complemented regularized incomplete gamma function.
 pub fn gammainccinv_scalar(a: f64, y: f64) -> f64 {
-    if !(0.0..=1.0).contains(&y) {
+    // Same domain as `gammaincinv_scalar`, whose clamp panicked when this delegated a NaN or
+    // negative `a` to it (frankenscipy-qu5po). SciPy 1.17.1: gammainccinv(nan, y) and
+    // gammainccinv(-1, y) are nan for y = 0, 0.3, 0.95 and 1.
+    if a.is_nan() || a < 0.0 || !(0.0..=1.0).contains(&y) {
         return f64::NAN;
     }
     if y == 1.0 {
@@ -10077,6 +10085,53 @@ mod tests {
                 "gammainccinv({a},{y}) = {got}, scipy {expected}"
             );
         }
+    }
+
+    /// frankenscipy-qu5po. A NaN or negative `a` made the bracket `hi = a + 4·√a + 10` NaN,
+    /// and `x0.clamp(lo + 1e-300, hi)` panicked on the NaN bound. gammainccinv panicked too,
+    /// through its delegation to gammaincinv. SciPy 1.17.1 is nan for all of these:
+    /// gammaincinv(nan, y), gammaincinv(-1, y), gammainccinv(nan, y) and gammainccinv(-1, y)
+    /// at y = 0, 0.3, 0.95 and 1.
+    ///
+    /// Must not change. The signed zero is not negative, so SciPy's p = 0 / p = 1 edges still
+    /// answer: gammaincinv(-0.0, 0) = 0.0, gammaincinv(-0.0, 1) = inf,
+    /// gammainccinv(-0.0, 0) = inf and gammainccinv(-0.0, 1) = 0.0. A guard written as
+    /// `a <= 0.0` or `is_sign_negative` would break these. The finite path is also unchanged
+    /// (existing goldens): gammaincinv(2, 0.5) = 1.6783469900166612 and
+    /// gammainccinv(0.5, 0.5) = 0.2274682115597862.
+    #[test]
+    fn gammaincinv_nan_or_negative_shape_is_nan_not_a_panic() {
+        // Interior y first, where the clamp panicked. The y = 0 and y = 1 edges did not panic,
+        // but they answered 0 or inf where SciPy gives nan.
+        for a in [f64::NAN, -1.0] {
+            for y in [0.3, 0.95, 0.0, 1.0] {
+                let p = gammaincinv_scalar(a, y);
+                let q = gammainccinv_scalar(a, y);
+                assert!(
+                    p.is_nan(),
+                    "gammaincinv({a}, {y}) = {p}, SciPy 1.17.1 gives nan"
+                );
+                assert!(
+                    q.is_nan(),
+                    "gammainccinv({a}, {y}) = {q}, SciPy 1.17.1 gives nan"
+                );
+            }
+        }
+
+        assert_eq!(gammaincinv_scalar(-0.0, 0.0), 0.0);
+        assert_eq!(gammaincinv_scalar(-0.0, 1.0), f64::INFINITY);
+        assert_eq!(gammainccinv_scalar(-0.0, 0.0), f64::INFINITY);
+        assert_eq!(gammainccinv_scalar(-0.0, 1.0), 0.0);
+        let p = gammaincinv_scalar(2.0, 0.5);
+        assert!(
+            ((p - 1.678_346_990_016_661_2) / 1.678_346_990_016_661_2).abs() < 1e-11,
+            "gammaincinv(2, 0.5) = {p}, SciPy 1.17.1 gives 1.6783469900166612"
+        );
+        let q = gammainccinv_scalar(0.5, 0.5);
+        assert!(
+            ((q - 0.227_468_211_559_786_2) / 0.227_468_211_559_786_2).abs() < 1e-11,
+            "gammainccinv(0.5, 0.5) = {q}, SciPy 1.17.1 gives 0.2274682115597862"
+        );
     }
 
     #[test]

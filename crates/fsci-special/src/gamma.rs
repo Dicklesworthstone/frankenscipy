@@ -3399,6 +3399,18 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     if x.is_nan() || df.is_nan() || nc.is_nan() {
         return f64::NAN;
     }
+    if nc == f64::INFINITY {
+        // λ = ∞ has no Poisson mode to walk from: j₀ = ∞ and `j -= 1.0` never reaches 0, so
+        // the downward loop below never ended (frankenscipy-qu5po). SciPy 1.17.1 returns
+        // the limit, 0, at finite x ≥ 0 with df > 0: chndtr(x, 3, inf) = 0.0 at x = 0,
+        // 1e-300, 5, 1e300, and chndtr(5, inf, inf) = 0.0. It returns nan at x = ±inf, at
+        // x = -2, and at df = 0 or -1.
+        return if (0.0..f64::INFINITY).contains(&x) && df > 0.0 {
+            0.0
+        } else {
+            f64::NAN
+        };
+    }
     if x <= 0.0 {
         return 0.0;
     }
@@ -3407,6 +3419,10 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     }
     let lam = nc / 2.0;
     let j0 = lam.floor();
+    // frankenscipy-qu5po: the walk cannot step from here (see `crate::beta::POISSON_INDEX_LIMIT`).
+    if j0 >= crate::beta::POISSON_INDEX_LIMIT {
+        return f64::NAN;
+    }
     // Poisson weight at the mode j0, formed in log space to avoid underflow.
     let logw0 =
         -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
@@ -3429,6 +3445,10 @@ pub fn chndtr(x: f64, df: f64, nc: f64) -> f64 {
     let p0 = chdtr(df + 2.0 * j0, x); // = P(a0, y)
     let t0 =
         (a0 * y.ln() - y - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)).exp();
+    // frankenscipy-qu5po: the all-zero exit (see `crate::beta::POISSON_INDEX_LIMIT`).
+    if p0 == 0.0 && t0 == 0.0 {
+        return 0.0;
+    }
 
     let mut total = 0.0_f64;
     // Upward from the mode.
@@ -3520,11 +3540,21 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
     if x <= 0.0 {
         return 1.0;
     }
+    if nc == f64::INFINITY {
+        // No Poisson mode to walk from (frankenscipy-qu5po; see `chndtr`).
+        // scipy.stats.ncx2.sf(x, 3, inf), which this mirrors, is nan at x = 5 and x = 1e300
+        // and 0.0 at x = inf in 1.17.1. Its x = 0 → 1.0 is the return above.
+        return if x == f64::INFINITY { 0.0 } else { f64::NAN };
+    }
     if nc <= 0.0 {
         return chdtrc(df, x);
     }
     let lam = nc / 2.0;
     let j0 = lam.floor();
+    // frankenscipy-qu5po: the walk cannot step from here (see `crate::beta::POISSON_INDEX_LIMIT`).
+    if j0 >= crate::beta::POISSON_INDEX_LIMIT {
+        return f64::NAN;
+    }
     let logw0 =
         -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
     let w0 = logw0.exp();
@@ -3534,6 +3564,10 @@ pub fn chndtrc(x: f64, df: f64, nc: f64) -> f64 {
     let q0 = chdtrc(df + 2.0 * j0, x); // = Q(a0, y), computed directly, never as 1 - P
     let t0 =
         (a0 * y.ln() - y - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)).exp();
+    // frankenscipy-qu5po: the all-zero exit (see `crate::beta::POISSON_INDEX_LIMIT`).
+    if q0 == 0.0 && t0 == 0.0 {
+        return 0.0;
+    }
 
     let mut total = 0.0_f64;
     // Upward from the mode: Q grows by adding positive t — the stable direction here.
@@ -3586,6 +3620,11 @@ pub fn chndtrix(p: f64, df: f64, nc: f64) -> f64 {
     if p.is_nan() || df.is_nan() || nc.is_nan() || !(0.0..=1.0).contains(&p) {
         return f64::NAN;
     }
+    // nc = inf: SciPy 1.17.1 returns nan for p = 0, 0.5 and 1. Without this, chndtr's limit
+    // of 0 would double `hi` up to 1e300 and answer +inf (frankenscipy-qu5po).
+    if nc == f64::INFINITY {
+        return f64::NAN;
+    }
     if p == 0.0 {
         return 0.0;
     }
@@ -3600,6 +3639,11 @@ pub fn chndtrix(p: f64, df: f64, nc: f64) -> f64 {
             return f64::INFINITY;
         }
         fhi = chndtr(hi, df, nc);
+    }
+    // A NaN CDF (the `crate::beta::POISSON_INDEX_LIMIT` exit) ends the doubling without
+    // bracketing anything. SciPy 1.17.1: chndtrix(0.5, 3, 2^60) = nan.
+    if fhi.is_nan() {
+        return f64::NAN;
     }
     // chndtr(·, df, nc) is increasing in x with chndtr(0, ·) = 0, so
     // f(x) = chndtr(x, df, nc) − p is increasing with f(0) = −p < 0 < f(hi).
@@ -3651,7 +3695,10 @@ fn invert_monotone(f: impl Fn(f64) -> f64, target: f64, a: f64, b: f64) -> f64 {
 /// `df`, so the root is found by bisection. `p ∉ (0, 1)` (or NaN) → NaN.
 #[must_use]
 pub fn chndtridf(x: f64, p: f64, nc: f64) -> f64 {
-    if x.is_nan() || p.is_nan() || nc.is_nan() || p <= 0.0 || p >= 1.0 {
+    // nc = inf: SciPy 1.17.1 chndtridf(5, 0.5, inf) = nan. Without this, chndtr's limit of 0
+    // at both bracket ends would make `invert_monotone` return its 1e-6 bound
+    // (frankenscipy-qu5po).
+    if x.is_nan() || p.is_nan() || nc.is_nan() || p <= 0.0 || p >= 1.0 || nc == f64::INFINITY {
         return f64::NAN;
     }
     invert_monotone(|df| chndtr(x, df, nc), p, 1e-6, 1e10)

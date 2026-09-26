@@ -535,6 +535,42 @@ pub fn fdtridfd(dfn: f64, p: f64, x: f64) -> f64 {
     if dfd <= 0.0 { LOWER_SENTINEL } else { dfd }
 }
 
+/// 2^53: the first Poisson mode `j₀ = ⌊λ⌋` from which the noncentral walks cannot step.
+///
+/// [`ncfdtr`], [`ncfdtrc`], [`nctdtr`], [`crate::gamma::chndtr`] and
+/// [`crate::gamma::chndtrc`] sum their Poisson mixture outward from `j₀`, moving the index by
+/// `j ± 1.0` and stopping on a relative weight test. From 2^53 up, f64 integers are no longer
+/// all representable: `j₀ + 1.0 == j₀` at `j₀ = 2^53`, and above it `j₀ − 1.0` can round back
+/// to `j₀` (it does for `λ = 0.5·1.35e8²` and for `λ = 2^59`). Then `j` and the weight stop
+/// moving and the downward loop never ends. That was the frankenscipy-qu5po hang. The other
+/// trigger, `nc = inf` (`j₀ = ∞`), is answered before the walk with SciPy's value.
+///
+/// Each walk now has two exits (frankenscipy-qu5po):
+///
+/// 1. **`j₀ ≥ 2^53` → NaN, before any anchor is formed.** The mixture cannot be summed in
+///    f64 here. SciPy 1.17.1 (Boost) is nan at the centre too: `chndtr(2^60, 3, 2^60)`,
+///    `ncfdtr(3, 5, 2^60, 2^60/3)` and `nctdtr(5, 1.35e8, 1.35e8)` are all nan. In the far
+///    tails SciPy instead answers 0 or 1, and this exit does not follow it, on purpose. The
+///    mode anchors are formed in log space as differences of terms of size `j₀·ln j₀`, so their
+///    exponent carries an absolute error of that size times ε. The probe measured chndtr's
+///    `t0` exponent in f64 (Python `math.lgamma` standing in for `gammaln`) against mpmath.
+///    At `nc = 2^60` the error reached 4075. In 168 of 401 points within 10 sd of the mean
+///    the f64 anchor underflowed to 0 while the exact one is about e^-21. A zero anchor
+///    here therefore proves nothing, and returning a tail value from it would put a silent
+///    0 at the centre.
+/// 2. **Below 2^53, both mode anchors exactly zero → return the value of an all-zero
+///    series.** The anchors are the mixture term at the mode and its recurrence increment.
+///    When both are zero, the recurrence keeps every term at `w·0`, so the walk can only add
+///    zeros. This exit is the walk's own result without the walk. Without it, `total` stayed
+///    at 0 and the relative stop test degenerated to `w < 1e-317`, so the walk crossed the
+///    whole Poisson left tail, about `38·√λ` steps. For `nctdtr(5, 1.3e8, 2)`, where
+///    `λ = 8.45e15`, that is about 3.5e9 steps. SciPy 1.17.1 gives the same values:
+///    `nctdtr(5, 1.3e8, 2) = 0`, `chndtr(5, 3, 1e16) = 0`, `ncfdtr(3, 5, 1e16, 2) = 0`.
+///
+/// The limit is a property of f64 index arithmetic, not a tolerance, so it is the same for
+/// every family.
+pub(crate) const POISSON_INDEX_LIMIT: f64 = 9_007_199_254_740_992.0;
+
 /// Non-central F cumulative distribution function.
 ///
 /// Matches `scipy.special.ncfdtr(dfn, dfd, nc, f)`: the CDF at `f` of a
@@ -560,6 +596,13 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     if dfn <= 0.0 || dfd <= 0.0 || nc < 0.0 {
         return f64::NAN;
     }
+    if nc == f64::INFINITY {
+        // λ = ∞ has no Poisson mode to walk from: j₀ = ∞ and `j -= 1.0` never reaches 0, so
+        // the downward loop below never ended (frankenscipy-qu5po). SciPy 1.17.1 answers
+        // 1.0 at f = inf and NaN at every other f, f = 0 included:
+        // ncfdtr(3, 5, inf, inf) = 1.0; ncfdtr(3, 5, inf, f) = nan for f = -inf, -2, 0, 2, 1e300.
+        return if f == f64::INFINITY { 1.0 } else { f64::NAN };
+    }
     if f <= 0.0 {
         return 0.0;
     }
@@ -569,6 +612,10 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     }
     let lam = nc / 2.0;
     let j0 = lam.floor();
+    // frankenscipy-qu5po: the walk cannot step from here (see `POISSON_INDEX_LIMIT`).
+    if j0 >= POISSON_INDEX_LIMIT {
+        return f64::NAN;
+    }
     let logw0 =
         -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
     let w0 = logw0.exp();
@@ -594,6 +641,10 @@ pub fn ncfdtr(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
         - gammaln_scalar(b, RuntimeMode::Strict).unwrap_or(f64::NAN))
     .exp();
+    // frankenscipy-qu5po: the all-zero exit (see `POISSON_INDEX_LIMIT`).
+    if p0 == 0.0 && u0 == 0.0 {
+        return 0.0;
+    }
 
     let mut total = 0.0_f64;
     // Upward from the mode.
@@ -715,6 +766,12 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         // dfn·f overflowed; the whole mass is below f.
         return 0.0;
     }
+    if nc == f64::INFINITY {
+        // No Poisson mode to walk from (frankenscipy-qu5po; see `POISSON_INDEX_LIMIT`).
+        // scipy.stats.ncf.sf(f, 3, 5, inf) in 1.17.1 is nan at f = 2 and f = 1e300; its
+        // f = 0 → 1.0 and f = inf → 0.0 are the two returns above.
+        return f64::NAN;
+    }
     let y = dfn * f / denom;
     // 1 − y in closed form. NOT `1.0 - y`: for a tail query y → 1 and the
     // subtraction would discard the digits this function is built to keep.
@@ -728,6 +785,10 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
     }
     let lam = nc / 2.0;
     let j0 = lam.floor();
+    // frankenscipy-qu5po: the walk cannot step from here (see `POISSON_INDEX_LIMIT`).
+    if j0 >= POISSON_INDEX_LIMIT {
+        return f64::NAN;
+    }
     let logw0 =
         -lam + j0 * lam.ln() - gammaln_scalar(j0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN);
     let w0 = logw0.exp();
@@ -743,6 +804,10 @@ pub fn ncfdtrc(dfn: f64, dfd: f64, nc: f64, f: f64) -> f64 {
         - gammaln_scalar(a0 + 1.0, RuntimeMode::Strict).unwrap_or(f64::NAN)
         - gammaln_scalar(b, RuntimeMode::Strict).unwrap_or(f64::NAN))
     .exp();
+    // frankenscipy-qu5po: the all-zero exit (see `POISSON_INDEX_LIMIT`).
+    if q0 == 0.0 && u0 == 0.0 {
+        return 0.0;
+    }
 
     let mut total = 0.0_f64;
     // Upward from the Poisson mode: Q(a+1) = Q(a) + u(a). THE STABLE DIRECTION
@@ -809,7 +874,9 @@ pub fn ncfdtri(dfn: f64, dfd: f64, nc: f64, p: f64) -> f64 {
     if dfn.is_nan() || dfd.is_nan() || nc.is_nan() || p.is_nan() || !(0.0..=1.0).contains(&p) {
         return f64::NAN;
     }
-    if dfn <= 0.0 || dfd <= 0.0 || nc < 0.0 {
+    // nc = inf: SciPy 1.17.1 returns nan for every p, the p = 0 and p = 1 edges included
+    // (frankenscipy-qu5po).
+    if dfn <= 0.0 || dfd <= 0.0 || nc < 0.0 || nc == f64::INFINITY {
         return f64::NAN;
     }
     if p == 0.0 {
@@ -826,6 +893,12 @@ pub fn ncfdtri(dfn: f64, dfd: f64, nc: f64, p: f64) -> f64 {
             return f64::INFINITY;
         }
         fhi = ncfdtr(dfn, dfd, nc, hi) - p;
+    }
+    // A NaN CDF (the `POISSON_INDEX_LIMIT` exit) ends the doubling without bracketing
+    // anything, and `illinois_root` would turn it into an arbitrary midpoint.
+    // SciPy 1.17.1: ncfdtri(3, 5, 2^60, 0.5) = nan.
+    if fhi.is_nan() {
+        return f64::NAN;
     }
     let lo = 0.0_f64;
     let flo = ncfdtr(dfn, dfd, nc, lo) - p; // ncfdtr(f=0) = 0 < p
@@ -868,6 +941,11 @@ pub fn ncfdtrinc(dfn: f64, dfd: f64, p: f64, f: f64) -> f64 {
     // g(lo) < 0 (guaranteed by the p ≥ ncfdtr(…,0,…) guard above) < g(hi).
     let flo = p - ncfdtr(dfn, dfd, lo, f);
     let fhi = p - ncfdtr(dfn, dfd, hi, f);
+    // The doubling can stop on a NaN CDF (hi reached the `POISSON_INDEX_LIMIT` exit,
+    // frankenscipy-qu5po). That is no bracket.
+    if fhi.is_nan() {
+        return f64::NAN;
+    }
     illinois_root(|x| p - ncfdtr(dfn, dfd, x, f), lo, hi, flo, fhi)
 }
 
@@ -953,7 +1031,9 @@ pub fn nctdtrit(df: f64, nc: f64, p: f64) -> f64 {
     if df.is_nan() || nc.is_nan() || p.is_nan() {
         return f64::NAN;
     }
-    if df <= 0.0 {
+    // nc = ±inf: SciPy 1.17.1 returns nan for every p, including the p = 0 and p = 1
+    // edges that otherwise return +inf below (frankenscipy-qu5po).
+    if df <= 0.0 || nc.is_infinite() {
         return f64::NAN;
     }
     if p <= 0.0 || p >= 1.0 {
@@ -977,6 +1057,11 @@ pub fn nctdtrit(df: f64, nc: f64, p: f64) -> f64 {
             return f64::INFINITY;
         }
         fhi = nctdtr(df, nc, hi) - p;
+    }
+    // A NaN CDF (the `POISSON_INDEX_LIMIT` exit) ends a doubling loop without bracketing
+    // anything. SciPy 1.17.1: nctdtrit(5, 1.35e8, 0.5) = nan.
+    if flo.is_nan() || fhi.is_nan() {
+        return f64::NAN;
     }
     illinois_root(|t| nctdtr(df, nc, t) - p, lo, hi, flo, fhi)
 }
@@ -1021,6 +1106,11 @@ pub fn nctdtrinc(df: f64, p: f64, t: f64) -> f64 {
     // g(lo) ≤ 0 ≤ g(hi) from the brackets above.
     let flo = p - nctdtr(df, lo, t);
     let fhi = p - nctdtr(df, hi, t);
+    // A doubling loop can stop on a NaN CDF (|nc| reached the `POISSON_INDEX_LIMIT` exit,
+    // frankenscipy-qu5po). That is no bracket.
+    if flo.is_nan() || fhi.is_nan() {
+        return f64::NAN;
+    }
     illinois_root(|x| p - nctdtr(df, x, t), lo, hi, flo, fhi)
 }
 
@@ -1130,6 +1220,19 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     if df <= 0.0 {
         return f64::NAN;
     }
+    if nc.is_infinite() {
+        // λ = nc²/2 = ∞ has no Poisson mode to walk from: j₀ = ∞ and `j -= 1.0` never
+        // reaches 0 (frankenscipy-qu5po). SciPy 1.17.1 keeps only the limits at t = ±inf:
+        // nctdtr(5, ±inf, inf) = 1.0, nctdtr(5, ±inf, -inf) = 0.0, and nan for every
+        // finite t (-1e300, -2, 0, 2, 1e300).
+        return if t == f64::INFINITY {
+            1.0
+        } else if t == f64::NEG_INFINITY {
+            0.0
+        } else {
+            f64::NAN
+        };
+    }
     if t < 0.0 {
         return 1.0 - nctdtr(df, -nc, -t);
     }
@@ -1145,6 +1248,11 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     }
 
     let j0 = lam.floor();
+    // frankenscipy-qu5po: the walk cannot step from here (see `POISSON_INDEX_LIMIT`). This
+    // also catches a finite |nc| above ~1.3e154, where nc² overflows and λ = ∞.
+    if j0 >= POISSON_INDEX_LIMIT {
+        return f64::NAN;
+    }
     let lg = |z: f64| gammaln_scalar(z, RuntimeMode::Strict).unwrap_or(f64::NAN);
     let p0 = (-lam + j0 * lam.ln() - lg(j0 + 1.0)).exp();
     let q_sign = if nc >= 0.0 { 1.0 } else { -1.0 };
@@ -1171,6 +1279,11 @@ pub fn nctdtr(df: f64, nc: f64, t: f64) -> f64 {
     let iq0 = btdtr(aq0, half_df, x);
     let tp0 = t_seed(ap0);
     let tq0 = t_seed(aq0);
+    // frankenscipy-qu5po: the all-zero exit (see `POISSON_INDEX_LIMIT`). With every anchor
+    // zero the series `s` is exactly 0 and the CDF is Φ(−δ).
+    if ip0 == 0.0 && iq0 == 0.0 && tp0 == 0.0 && tq0 == 0.0 {
+        return phi.clamp(0.0, 1.0);
+    }
 
     let mut s = 0.0_f64;
     // Upward from the mode.
@@ -4391,5 +4504,150 @@ mod tests {
             (mid - 0.232_623_918_000_078_6).abs() < 1e-12,
             "nc=0 mid-range should match scipy.stats.f.sf(2, 3, 5), got {mid}"
         );
+    }
+
+    /// frankenscipy-qu5po. The noncentral χ², F and t CDFs, and the inverses built on them,
+    /// hung at `nc = ±inf`, where the Poisson mode `j₀` is infinite, and once `j₀ ≥ 2^53`,
+    /// where `j -= 1.0` stops moving (see `POISSON_INDEX_LIMIT`). They also walked the whole
+    /// Poisson left tail when every term was zero: about 2.7e9 steps for chndtr(5, 3, 1e16)
+    /// and 3.5e9 for nctdtr(5, 1.3e8, 2), both below 2^53. Every trigger runs on one worker
+    /// thread and the test waits at most 10 s, so a regression fails here instead of hanging
+    /// the suite.
+    ///
+    /// Expected values are SciPy 1.17.1, read live. chndtrc and ncfdtrc mirror
+    /// scipy.stats.ncx2.sf and ncf.sf.
+    ///
+    /// ```text
+    /// chndtr(5, 3, inf) = 0.0             chndtr(inf, 3, inf) = nan
+    /// chndtr(5, 3, 1e16) = 0.0            chndtr(2^60, 3, 2^60) = nan
+    /// ncx2.sf(5, 3, inf) = nan            ncx2.sf(inf, 3, inf) = 0.0
+    /// ncfdtr(3, 5, inf, 2) = nan          ncfdtr(3, 5, inf, inf) = 1.0
+    /// ncfdtr(3, 5, 1e16, 2) = 0.0         ncfdtr(3, 5, 2^60, 2^60/3) = nan
+    /// ncf.sf(2, 3, 5, inf) = nan
+    /// nctdtr(5, inf, 2) = nan             nctdtr(5, -inf, 2) = nan
+    /// nctdtr(5, inf, inf) = 1.0           nctdtr(5, -inf, -inf) = 0.0
+    /// nctdtr(5, 1.3e8, 2) = 0.0           nctdtr(5, -1.3e8, 2) = 1.0
+    /// nctdtr(5, 1.3e8, -2) = 0.0          nctdtr(5, 1.35e8, 1.35e8) = nan
+    /// chndtrix(0.5, 3, inf) = nan         chndtridf(5, 0.5, inf) = nan
+    /// ncfdtri(3, 5, inf, 0.5) = nan       nctdtrit(5, inf, 0.5) = nan
+    /// nctdtridf(0.5, inf, 2) = nan        ncfdtridfd(3, 0.5, inf, 2) = nan
+    /// ncfdtridfn(0.5, 5, inf, 2) = nan    chndtrix(0.5, 3, 2^60) = nan
+    /// ncfdtri(3, 5, 2^60, 0.5) = nan      nctdtrit(5, 1.35e8, 0.5) = nan
+    /// ```
+    ///
+    /// Known divergence, deliberately not asserted: at `j₀ ≥ 2^53` fsci is nan in the far
+    /// tails too. SciPy there gives chndtr(5, 3, 2^60) = 0.0 and nctdtr(5, ±1.35e8, 2) = 0.0
+    /// and 1.0; `POISSON_INDEX_LIMIT` explains why a zero anchor there cannot be trusted.
+    ///
+    /// Must not change: these existing goldens run the full walk. chndtr(2, 4, 100) =
+    /// 2.0596217576094693e-19 is a deep left tail whose mode anchors are about 5e-69, small
+    /// but not zero, so the all-zero exit must not take it. The others are
+    /// chndtr(2000, 2, 2000) = 0.49553941086177933, ncfdtr(10, 20, 40, 3) = 0.10716411882720595
+    /// and nctdtr(8, 5, 4) = 0.21027058165197615.
+    #[test]
+    fn noncentral_families_return_on_infinite_and_huge_noncentrality() {
+        const TWO_POW_60: f64 = 1_152_921_504_606_846_976.0;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let inf = f64::INFINITY;
+            let nan = f64::NAN;
+            let big = TWO_POW_60;
+            let rows: Vec<(&str, f64, f64)> = vec![
+                ("chndtr(5, 3, inf)", gamma::chndtr(5.0, 3.0, inf), 0.0),
+                ("chndtr(inf, 3, inf)", gamma::chndtr(inf, 3.0, inf), nan),
+                ("chndtr(5, 3, 1e16)", gamma::chndtr(5.0, 3.0, 1e16), 0.0),
+                ("chndtr(2^60, 3, 2^60)", gamma::chndtr(big, 3.0, big), nan),
+                ("chndtrc(5, 3, inf)", gamma::chndtrc(5.0, 3.0, inf), nan),
+                ("chndtrc(inf, 3, inf)", gamma::chndtrc(inf, 3.0, inf), 0.0),
+                ("ncfdtr(3, 5, inf, 2)", ncfdtr(3.0, 5.0, inf, 2.0), nan),
+                ("ncfdtr(3, 5, inf, inf)", ncfdtr(3.0, 5.0, inf, inf), 1.0),
+                ("ncfdtr(3, 5, 1e16, 2)", ncfdtr(3.0, 5.0, 1e16, 2.0), 0.0),
+                (
+                    "ncfdtr(3, 5, 2^60, 2^60/3)",
+                    ncfdtr(3.0, 5.0, big, big / 3.0),
+                    nan,
+                ),
+                ("ncfdtrc(3, 5, inf, 2)", ncfdtrc(3.0, 5.0, inf, 2.0), nan),
+                ("nctdtr(5, inf, 2)", nctdtr(5.0, inf, 2.0), nan),
+                ("nctdtr(5, -inf, 2)", nctdtr(5.0, -inf, 2.0), nan),
+                ("nctdtr(5, inf, inf)", nctdtr(5.0, inf, inf), 1.0),
+                ("nctdtr(5, -inf, -inf)", nctdtr(5.0, -inf, -inf), 0.0),
+                ("nctdtr(5, 1.3e8, 2)", nctdtr(5.0, 1.3e8, 2.0), 0.0),
+                ("nctdtr(5, -1.3e8, 2)", nctdtr(5.0, -1.3e8, 2.0), 1.0),
+                ("nctdtr(5, 1.3e8, -2)", nctdtr(5.0, 1.3e8, -2.0), 0.0),
+                (
+                    "nctdtr(5, 1.35e8, 1.35e8)",
+                    nctdtr(5.0, 1.35e8, 1.35e8),
+                    nan,
+                ),
+                ("chndtrix(0.5, 3, inf)", gamma::chndtrix(0.5, 3.0, inf), nan),
+                (
+                    "chndtridf(5, 0.5, inf)",
+                    gamma::chndtridf(5.0, 0.5, inf),
+                    nan,
+                ),
+                ("ncfdtri(3, 5, inf, 0.5)", ncfdtri(3.0, 5.0, inf, 0.5), nan),
+                ("nctdtrit(5, inf, 0.5)", nctdtrit(5.0, inf, 0.5), nan),
+                ("nctdtridf(0.5, inf, 2)", nctdtridf(0.5, inf, 2.0), nan),
+                (
+                    "ncfdtridfd(3, 0.5, inf, 2)",
+                    ncfdtridfd(3.0, 0.5, inf, 2.0),
+                    nan,
+                ),
+                (
+                    "ncfdtridfn(0.5, 5, inf, 2)",
+                    ncfdtridfn(0.5, 5.0, inf, 2.0),
+                    nan,
+                ),
+                (
+                    "chndtrix(0.5, 3, 2^60)",
+                    gamma::chndtrix(0.5, 3.0, big),
+                    nan,
+                ),
+                ("ncfdtri(3, 5, 2^60, 0.5)", ncfdtri(3.0, 5.0, big, 0.5), nan),
+                ("nctdtrit(5, 1.35e8, 0.5)", nctdtrit(5.0, 1.35e8, 0.5), nan),
+            ];
+            let _ = tx.send(rows);
+        });
+        let rows = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a noncentral CDF or inverse did not return within 10 s (frankenscipy-qu5po)");
+        for (label, got, want) in rows {
+            let matches = if want.is_nan() {
+                got.is_nan()
+            } else {
+                got == want
+            };
+            assert!(matches, "{label} = {got}, SciPy 1.17.1 gives {want}");
+        }
+
+        for (label, got, want) in [
+            (
+                "chndtr(2, 4, 100)",
+                gamma::chndtr(2.0, 4.0, 100.0),
+                2.059_621_757_609_469_3e-19,
+            ),
+            (
+                "chndtr(2000, 2, 2000)",
+                gamma::chndtr(2000.0, 2.0, 2000.0),
+                0.495_539_410_861_779_33,
+            ),
+            (
+                "ncfdtr(10, 20, 40, 3)",
+                ncfdtr(10.0, 20.0, 40.0, 3.0),
+                0.107_164_118_827_205_95,
+            ),
+            (
+                "nctdtr(8, 5, 4)",
+                nctdtr(8.0, 5.0, 4.0),
+                0.210_270_581_651_976_15,
+            ),
+        ] {
+            // The existing goldens' own bound (chndtr_matches_scipy_reference_values et al.).
+            assert!(
+                (got - want).abs() <= 1e-10 * want.abs().max(1e-12),
+                "{label} = {got}, SciPy 1.17.1 gives {want}"
+            );
+        }
     }
 }

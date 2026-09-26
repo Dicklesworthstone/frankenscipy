@@ -6503,7 +6503,19 @@ pub fn lmbda(v: f64, x: f64) -> (Vec<f64>, Vec<f64>) {
     // A NaN order is rejected too: scipy's `int(v)` raises ValueError ("cannot convert
     // float NaN to integer"), while `v.floor().max(0.0)` below would turn NaN into n = 0
     // and lmbda(NaN, 0.0) would answer ([1.0], [0.0]).
-    if v.is_nan() || v < 0.0 {
+    //
+    // So is any order of i32::MAX (2^31 - 1) or more, +inf included (frankenscipy-qu5po).
+    // `v.floor() as usize` saturates at inf and 1e20, so `n + 1` overflowed (a panic in
+    // debug builds). Finite orders short of that sized all three work vectors by n, a
+    // multi-GiB allocation. SciPy 1.17.1 raises for every integer order in this range (its
+    // lamn takes a C int), and we signal that with the same NaN pair:
+    //   lmbda(inf, 1.0)          -> OverflowError: cannot convert float infinity to integer
+    //   lmbda(1e20, 1.0)         -> OverflowError: Python int too large to convert to C long
+    //   lmbda(2147483648.0, 1.0) -> OverflowError: value too large to convert to int
+    //   lmbda(2147483647.0, 1.0) -> ValueError: negative dimensions are not allowed
+    // A non-integer order in that range asks numpy for >= 16 GiB per array.
+    // lmbda(2147483647.5, 1.0) raised MemoryError under an 8 GB address-space cap.
+    if v.is_nan() || v < 0.0 || v >= f64::from(i32::MAX) {
         return (vec![f64::NAN], vec![f64::NAN]);
     }
     let n = v.floor().max(0.0) as usize;
@@ -7375,6 +7387,60 @@ mod tests {
         }
         assert_eq!(lmbda(0.5, 0.0), (vec![1.0], vec![0.0]));
         assert_eq!(lmbda(2.0, 0.0), (vec![1.0, 0.0, 0.0], vec![0.0, 0.5, 0.0]));
+    }
+
+    /// frankenscipy-qu5po. `v.floor() as usize` saturates at v = inf and v = 1e20, so the
+    /// `n + 1` that sizes the output overflowed. That panics in a debug build and wraps to an
+    /// empty answer in release. SciPy 1.17.1 raises for both, and fsci signals it with the
+    /// NaN pair it already uses for v < 0 and v = NaN:
+    ///   lmbda(inf, 1.0), lmbda(inf, 0.0)
+    ///     -> OverflowError: cannot convert float infinity to integer
+    ///   lmbda(1e20, 1.0)
+    ///     -> OverflowError: Python int too large to convert to C long
+    /// Must not change, SciPy 1.17.1: lmbda(2.5, 1.5) =
+    ///   ([0.6649966577360363, 0.7923459414244445, 0.8489952245893881],
+    ///    [-0.39617297071222224, -0.25469856737681645, -0.18883094388314534]).
+    /// A float emulation of this kernel agrees with those to 1.3e-15.
+    #[test]
+    fn lmbda_signals_an_order_scipy_cannot_convert_like_scipy_raises() {
+        for (v, x) in [(f64::INFINITY, 1.0), (f64::INFINITY, 0.0), (1e20, 1.0)] {
+            let (vl, dl) = lmbda(v, x);
+            assert!(
+                vl.len() == 1 && dl.len() == 1 && vl[0].is_nan() && dl[0].is_nan(),
+                "lmbda({v}, {x}) must be the NaN pair, got vl={vl:?} dl={dl:?}"
+            );
+        }
+
+        let (vl, dl) = lmbda(2.5, 1.5);
+        let want_vl = [
+            0.664_996_657_736_036_3,
+            0.792_345_941_424_444_5,
+            0.848_995_224_589_388_1,
+        ];
+        let want_dl = [
+            -0.396_172_970_712_222_24,
+            -0.254_698_567_376_816_45,
+            -0.188_830_943_883_145_34,
+        ];
+        assert_eq!(
+            (vl.len(), dl.len()),
+            (3, 3),
+            "lmbda(2.5, 1.5) has orders 0.5, 1.5, 2.5"
+        );
+        for i in 0..3 {
+            assert!(
+                ((vl[i] - want_vl[i]) / want_vl[i]).abs() < 1e-12,
+                "lmbda(2.5, 1.5) vl[{i}] = {}, SciPy 1.17.1 gives {}",
+                vl[i],
+                want_vl[i]
+            );
+            assert!(
+                ((dl[i] - want_dl[i]) / want_dl[i]).abs() < 1e-12,
+                "lmbda(2.5, 1.5) dl[{i}] = {}, SciPy 1.17.1 gives {}",
+                dl[i],
+                want_dl[i]
+            );
+        }
     }
 
     #[test]
