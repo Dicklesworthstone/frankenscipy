@@ -1000,6 +1000,11 @@
   "diff_sparse_splu_solve.rs": {
     "ABS_TOL": 1e-8
   },
+  "diff_sparse_spsolve_accuracy_contract.rs": {
+    "BACKWARD_ERR_TOL": 1e-13,
+    "FORWARD_REL_TOL": 1e-10,
+    "OLD_SHORTCUT_CG_TOL": 1e-8
+  },
   "diff_sparse_spsolve_triangular.rs": {
     "ABS_TOL": 1e-10
   },
