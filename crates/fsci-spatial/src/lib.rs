@@ -684,7 +684,8 @@ pub fn braycurtis(a: &[f64], b: &[f64]) -> f64 {
         }
         (num, den)
     };
-    if den == 0.0 { 0.0 } else { num / den }
+    // Plain IEEE division, as SciPy: Σ|a+b| = 0 gives inf (a = -b ≠ 0) or NaN (a = b = 0).
+    num / den
 }
 
 fn relative_entropy(x: f64, y: f64) -> f64 {
@@ -2451,15 +2452,14 @@ fn cdist_row_canberra_soa(ai: &[f64], b: &[Vec<f64>], nb: usize) -> Vec<f64> {
 }
 
 /// SoA-across-pairs Bray-Curtis cdist row (small `d`): per-lane
-/// `Σ|ai[k]-b[k][lane]| / Σ|ai[k]+b[k][lane]|` with the `den==0 ⇒ 0` guard. The
-/// numerator/denominator left-folds over `k=0..d` match the scalar `braycurtis`
-/// helper's two `.sum()` passes (same accumulation order), so this is bit-identical
-/// for `d < 8`.
+/// `Σ|ai[k]-b[k][lane]| / Σ|ai[k]+b[k][lane]|` by plain IEEE division, as SciPy (a zero
+/// denominator gives inf or NaN). The numerator/denominator left-folds over `k=0..d` match
+/// the scalar `braycurtis` helper's two `.sum()` passes (same accumulation order), so this is
+/// bit-identical for `d < 8`.
 fn cdist_row_braycurtis_soa(ai: &[f64], b: &[Vec<f64>], nb: usize) -> Vec<f64> {
-    use std::simd::{Select, Simd, cmp::SimdPartialEq, num::SimdFloat};
+    use std::simd::{Simd, num::SimdFloat};
     const L: usize = 8;
     let d = ai.len();
-    let zero = Simd::<f64, L>::splat(0.0);
     let mut row = vec![0.0_f64; nb];
     let mut j = 0usize;
     while j + L <= nb {
@@ -2471,7 +2471,7 @@ fn cdist_row_braycurtis_soa(ai: &[f64], b: &[Vec<f64>], nb: usize) -> Vec<f64> {
             num += (av - bv).abs();
             den += (av + bv).abs();
         }
-        let res = den.simd_eq(zero).select(zero, num / den);
+        let res = num / den;
         res.copy_to_slice(&mut row[j..j + L]);
         j += L;
     }
@@ -2481,7 +2481,7 @@ fn cdist_row_braycurtis_soa(ai: &[f64], b: &[Vec<f64>], nb: usize) -> Vec<f64> {
             num += (ai[k] - b[k][j]).abs();
             den += (ai[k] + b[k][j]).abs();
         }
-        row[j] = if den == 0.0 { 0.0 } else { num / den };
+        row[j] = num / den;
         j += 1;
     }
     row
@@ -11583,6 +11583,24 @@ mod tests {
     #[test]
     fn braycurtis_identical() {
         assert!(braycurtis(&[5.0, 10.0], &[5.0, 10.0]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn braycurtis_zero_denominator_is_ieee_like_scipy() {
+        // SciPy 1.17.1: braycurtis([1,0], [-1,0]) = inf and braycurtis([0,0], [0,0]) = nan,
+        // in the scalar function and in pdist/cdist alike. fsci used to return 0.0 for both.
+        assert_eq!(braycurtis(&[1.0, 0.0], &[-1.0, 0.0]), f64::INFINITY);
+        assert!(braycurtis(&[0.0, 0.0], &[0.0, 0.0]).is_nan());
+        // the cdist row kernel: 9 columns so both the 8-lane body and the scalar tail run
+        let zeros = vec![vec![0.0; 9], vec![0.0; 9]];
+        let row = cdist_row_braycurtis_soa(&[0.0, 0.0], &zeros, 9);
+        assert!(row.iter().all(|v| v.is_nan()), "{row:?}");
+        let mut opposite = vec![vec![0.0; 9], vec![0.0; 9]];
+        opposite[0][8] = -1.0;
+        opposite[0][0] = -1.0;
+        let row = cdist_row_braycurtis_soa(&[1.0, 0.0], &opposite, 9);
+        assert_eq!((row[0], row[8]), (f64::INFINITY, f64::INFINITY));
+        assert_eq!(row[1], 1.0);
     }
 
     #[test]
