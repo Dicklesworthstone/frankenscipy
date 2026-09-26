@@ -9,13 +9,14 @@
 //! (Owen's T computed via 10-pt Gauss-Legendre quadrature).
 //! Skips cleanly if scipy/python3 is unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, SkewNorm};
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +80,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -238,38 +240,31 @@ fn diff_stats_skewnorm() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_skewnorm",
+        &["pdf", "cdf", "sf", "mean", "var", "skew", "kurt"],
+    );
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle map");
         let dist = SkewNorm::new(case.a);
-        if let Some(spdf) = oracle.pdf {
-            let d = (dist.pdf(case.x) - spdf).abs();
+        let arms = [
+            ("pdf", oracle.pdf, dist.pdf(case.x), PDF_TOL),
+            ("cdf", oracle.cdf, dist.cdf(case.x), CDF_TOL),
+            ("sf", oracle.sf, dist.sf(case.x), CDF_TOL),
+        ];
+        for (family, scipy, fsci, tol) in arms {
+            let Some((s, f)) = ledger.pair(family, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = (f - s).abs();
             max_overall = max_overall.max(d);
+            ledger.compared(family, &case.case_id, d <= tol);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                family: "pdf".into(),
+                family: family.into(),
                 abs_diff: d,
-                pass: d <= PDF_TOL,
-            });
-        }
-        if let Some(scdf) = oracle.cdf {
-            let d = (dist.cdf(case.x) - scdf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "cdf".into(),
-                abs_diff: d,
-                pass: d <= CDF_TOL,
-            });
-        }
-        if let Some(ssf) = oracle.sf {
-            let d = (dist.sf(case.x) - ssf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "sf".into(),
-                abs_diff: d,
-                pass: d <= CDF_TOL,
+                pass: d <= tol,
             });
         }
     }
@@ -283,16 +278,18 @@ fn diff_stats_skewnorm() {
             ("skew", dist.skewness(), oracle.skew),
             ("kurt", dist.kurtosis(), oracle.kurt),
         ] {
-            if let Some(s) = scipy_v {
-                let d = (rust_v - s).abs();
-                max_overall = max_overall.max(d);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    family: label.into(),
-                    abs_diff: d,
-                    pass: d <= 1e-12,
-                });
-            }
+            let Some((s, rust_v)) = ledger.pair(label, &case.case_id, scipy_v, Some(rust_v)) else {
+                continue;
+            };
+            let d = (rust_v - s).abs();
+            max_overall = max_overall.max(d);
+            ledger.compared(label, &case.case_id, d <= 1e-12);
+            diffs.push(CaseDiff {
+                case_id: case.case_id.clone(),
+                family: label.into(),
+                abs_diff: d,
+                pass: d <= 1e-12,
+            });
         }
     }
 
@@ -302,6 +299,7 @@ fn diff_stats_skewnorm() {
         test_id: "diff_stats_skewnorm".into(),
         category: "scipy.stats.skewnorm".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -326,4 +324,6 @@ fn diff_stats_skewnorm() {
         diffs.len(),
         max_overall
     );
+    // pdf/cdf/sf compare every point case; the moment arms have one case per a-value.
+    ledger.finish(query.points.len().min(query.moments.len()));
 }

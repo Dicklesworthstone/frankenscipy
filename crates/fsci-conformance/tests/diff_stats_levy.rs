@@ -9,13 +9,14 @@
 //! + 5 q-values for ppf via subprocess. Skips cleanly if scipy
 //!   is unavailable.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{ContinuousDistribution, Levy, LevyLeft};
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +79,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -249,6 +251,19 @@ fn diff_stats_levy() {
 
     let levy = Levy::new(0.0, 1.0);
     let levy_l = LevyLeft::new(0.0, 1.0);
+    let mut ledger = CompareLedger::new(
+        "diff_stats_levy",
+        &[
+            "levy.pdf",
+            "levy.cdf",
+            "levy.sf",
+            "levy.ppf",
+            "levy_l.pdf",
+            "levy_l.cdf",
+            "levy_l.sf",
+            "levy_l.ppf",
+        ],
+    );
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
@@ -257,56 +272,49 @@ fn diff_stats_levy() {
             "levy_l" => (levy_l.pdf(case.x), levy_l.cdf(case.x), levy_l.sf(case.x)),
             other => panic!("unknown variant: {other}"),
         };
-        if let Some(spdf) = oracle.pdf {
-            let d = (pdf_v - spdf).abs();
+        let arms = [
+            ("pdf", oracle.pdf, pdf_v, PDF_TOL),
+            ("cdf", oracle.cdf, cdf_v, CDF_TOL),
+            ("sf", oracle.sf, sf_v, CDF_TOL),
+        ];
+        for (name, scipy, fsci, tol) in arms {
+            let family = format!("{}.{name}", case.variant);
+            let Some((s, f)) = ledger.pair(&family, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = (f - s).abs();
             max_overall = max_overall.max(d);
+            ledger.compared(&family, &case.case_id, d <= tol);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                family: format!("{}.pdf", case.variant),
+                family,
                 abs_diff: d,
-                pass: d <= PDF_TOL,
-            });
-        }
-        if let Some(scdf) = oracle.cdf {
-            let d = (cdf_v - scdf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: format!("{}.cdf", case.variant),
-                abs_diff: d,
-                pass: d <= CDF_TOL,
-            });
-        }
-        if let Some(ssf) = oracle.sf {
-            let d = (sf_v - ssf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: format!("{}.sf", case.variant),
-                abs_diff: d,
-                pass: d <= CDF_TOL,
+                pass: d <= tol,
             });
         }
     }
 
     for case in &query.ppf {
         let oracle = ppfmap.get(&case.case_id).expect("validated oracle");
-        if let Some(sppf) = oracle.ppf {
-            let rust = match case.variant.as_str() {
-                "levy" => levy.ppf(case.q),
-                "levy_l" => levy_l.ppf(case.q),
-                other => panic!("unknown variant: {other}"),
-            };
-            let d = (rust - sppf).abs();
-            let scale = sppf.abs().max(1.0);
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: format!("{}.ppf", case.variant),
-                abs_diff: d,
-                pass: d <= PPF_TOL_REL * scale,
-            });
-        }
+        let rust = match case.variant.as_str() {
+            "levy" => levy.ppf(case.q),
+            "levy_l" => levy_l.ppf(case.q),
+            other => panic!("unknown variant: {other}"),
+        };
+        let family = format!("{}.ppf", case.variant);
+        let Some((sppf, rust)) = ledger.pair(&family, &case.case_id, oracle.ppf, Some(rust)) else {
+            continue;
+        };
+        let d = (rust - sppf).abs();
+        let scale = sppf.abs().max(1.0);
+        max_overall = max_overall.max(d);
+        ledger.compared(&family, &case.case_id, d <= PPF_TOL_REL * scale);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            family,
+            abs_diff: d,
+            pass: d <= PPF_TOL_REL * scale,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -315,6 +323,7 @@ fn diff_stats_levy() {
         test_id: "diff_stats_levy".into(),
         category: "scipy.stats.levy + scipy.stats.levy_l".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -339,4 +348,17 @@ fn diff_stats_levy() {
         diffs.len(),
         max_overall
     );
+    // Each variant's pdf/cdf/sf arms compare its x-points; its ppf arm compares its
+    // (smaller) q-grid. The minimum is the smallest of those per-variant counts.
+    let per_arm_min = ["levy", "levy_l"]
+        .iter()
+        .flat_map(|v| {
+            [
+                query.points.iter().filter(|c| c.variant == *v).count(),
+                query.ppf.iter().filter(|c| c.variant == *v).count(),
+            ]
+        })
+        .min()
+        .expect("two variants");
+    ledger.finish(per_arm_min);
 }

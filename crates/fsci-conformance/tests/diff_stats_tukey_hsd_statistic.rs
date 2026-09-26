@@ -7,13 +7,14 @@
 //!
 //! Tolerance: 1e-10 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::tukey_hsd;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -230,14 +232,11 @@ fn diff_stats_tukey_hsd_statistic() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_tukey_hsd_statistic", &["statistic"]);
 
     for case in &query.points {
-        let Some(arm) = pmap.get(&case.case_id) else {
-            continue;
-        };
-        let (Some(estat), Some(ek)) = (arm.statistic.as_ref(), arm.k) else {
-            continue;
-        };
+        // A missing oracle row or a null statistic is recorded by the ledger as oracle_missing.
+        let arm = pmap.get(&case.case_id);
 
         // Unflatten case data into groups.
         let mut groups: Vec<&[f64]> = Vec::new();
@@ -252,20 +251,29 @@ fn diff_stats_tukey_hsd_statistic() {
         }
 
         let result = tukey_hsd(&groups);
-        if result.statistic.len() != ek {
-            continue;
-        }
         let flat_actual: Vec<f64> = result.statistic.iter().flatten().copied().collect();
-        let abs_d = if flat_actual.len() != estat.len() {
-            f64::INFINITY
-        } else {
+        // slices rejects a flat-length mismatch and a NaN the max fold below would swallow.
+        let Some((estat, flat_actual)) = ledger.slices(
+            "statistic",
+            &case.case_id,
+            arm.and_then(|a| a.statistic.as_deref()),
+            Some(flat_actual.as_slice()),
+        ) else {
+            continue;
+        };
+        // A k x k shape that disagrees with SciPy's k is a compared failure, not a skip.
+        let k_ok = arm.and_then(|a| a.k) == Some(result.statistic.len());
+        let abs_d = if k_ok {
             flat_actual
                 .iter()
                 .zip(estat.iter())
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0_f64, f64::max)
+        } else {
+            f64::INFINITY
         };
         max_overall = max_overall.max(abs_d);
+        ledger.compared("statistic", &case.case_id, abs_d <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: abs_d,
@@ -279,6 +287,7 @@ fn diff_stats_tukey_hsd_statistic() {
         test_id: "diff_stats_tukey_hsd_statistic".into(),
         category: "fsci_stats::tukey_hsd statistic vs scipy.stats.tukey_hsd".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -299,4 +308,5 @@ fn diff_stats_tukey_hsd_statistic() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

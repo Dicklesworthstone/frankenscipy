@@ -11,13 +11,14 @@
 //! scalar at 4 percentiles} = 32 cases. Tol 1e-12 abs
 //! (closed-form linear-interpolation chain).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{percentile, quantile};
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -236,42 +238,46 @@ fn diff_stats_quantile_percentile() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_quantile_percentile",
+        &["quantile", "percentile"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_vec) = &scipy_arm.values else {
+        let rust_vec: Option<Vec<f64>> = match case.func.as_str() {
+            "quantile" => Some(quantile(&case.data, &case.probs)),
+            "percentile" => Some(
+                case.probs
+                    .iter()
+                    .map(|&p| percentile(&case.data, p))
+                    .collect(),
+            ),
+            _ => None,
+        };
+        // `slices` rejects a length mismatch and any non-finite fsci element
+        // against numpy's finite one, so every element below is compared.
+        let Some((scipy_vec, rust_vec)) = ledger.slices(
+            &case.func,
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            rust_vec.as_deref(),
+        ) else {
             continue;
         };
-        let rust_vec: Vec<f64> = match case.func.as_str() {
-            "quantile" => quantile(&case.data, &case.probs),
-            "percentile" => case
-                .probs
-                .iter()
-                .map(|&p| percentile(&case.data, p))
-                .collect(),
-            _ => continue,
-        };
-        if rust_vec.len() != scipy_vec.len() {
+        let mut case_pass = true;
+        for (i, (r, s)) in rust_vec.iter().zip(scipy_vec.iter()).enumerate() {
+            let abs_diff = (r - s).abs();
+            max_overall = max_overall.max(abs_diff);
+            case_pass &= abs_diff <= ABS_TOL;
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
+                func: format!("{}.q{}", case.func, case.probs[i]),
+                abs_diff,
+                pass: abs_diff <= ABS_TOL,
             });
-            continue;
         }
-        for (i, (r, s)) in rust_vec.iter().zip(scipy_vec.iter()).enumerate() {
-            if r.is_finite() {
-                let abs_diff = (r - s).abs();
-                max_overall = max_overall.max(abs_diff);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    func: format!("{}.q{}", case.func, case.probs[i]),
-                    abs_diff,
-                    pass: abs_diff <= ABS_TOL,
-                });
-            }
-        }
+        ledger.compared(&case.func, &case.case_id, case_pass);
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -280,6 +286,7 @@ fn diff_stats_quantile_percentile() {
         test_id: "diff_stats_quantile_percentile".into(),
         category: "numpy.{quantile, percentile} (method=linear)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -304,4 +311,10 @@ fn diff_stats_quantile_percentile() {
         diffs.len(),
         max_overall
     );
+    let per_func = ["quantile", "percentile"]
+        .iter()
+        .map(|f| query.points.iter().filter(|c| c.func == *f).count())
+        .min()
+        .unwrap_or(0);
+    ledger.finish(per_func);
 }

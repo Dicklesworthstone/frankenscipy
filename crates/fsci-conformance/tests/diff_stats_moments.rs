@@ -16,13 +16,14 @@
 //! TukeyLambda) compute via numerical integration so the rel
 //! fallback is essential.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{
     BetaDist, Cauchy, ChiSquared, ContinuousDistribution, Exponential, FDistribution, GammaDist,
     Gumbel, Laplace, Logistic, Lognormal, Normal, Pareto, Rayleigh, StudentT, Uniform, Weibull,
@@ -75,6 +76,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     max_rel_diff: f64,
     pass: bool,
@@ -104,8 +106,8 @@ fn emit_log(log: &DiffLog) {
     fs::write(path, json).expect("write moments diff log");
 }
 
-fn fsci_eval(dist: &str, moment: &str, params: &[f64]) -> Option<f64> {
-    let v = match dist {
+fn fsci_eval(dist: &str, moment: &str, params: &[f64]) -> f64 {
+    match dist {
         "norm" => {
             let d = Normal::new(params[0], params[1]);
             match moment {
@@ -266,9 +268,8 @@ fn fsci_eval(dist: &str, moment: &str, params: &[f64]) -> Option<f64> {
                 _ => f64::NAN,
             }
         }
-        _ => return None,
-    };
-    if v.is_finite() { Some(v) } else { None }
+        other => panic!("unknown dist {other}"),
+    }
 }
 
 fn generate_query() -> OracleQuery {
@@ -429,27 +430,31 @@ fn diff_stats_moments() {
     let mut diffs = Vec::new();
     let mut max_abs_overall = 0.0_f64;
     let mut max_rel_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_moments", &["mean", "var", "skew", "kurt"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = oracle.value
-            && let Some(rust_v) = fsci_eval(&case.dist, &case.moment, &case.params)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            let scale = scipy_v.abs().max(1.0);
-            let rel_diff = abs_diff / scale;
-            max_abs_overall = max_abs_overall.max(abs_diff);
-            max_rel_overall = max_rel_overall.max(rel_diff);
-            let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                dist: case.dist.clone(),
-                moment: case.moment.clone(),
-                abs_diff,
-                rel_diff,
-                pass,
-            });
-        }
+        let rust_v = fsci_eval(&case.dist, &case.moment, &case.params);
+        let Some((scipy_v, rust_v)) =
+            ledger.pair(&case.moment, &case.case_id, oracle.value, Some(rust_v))
+        else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        let scale = scipy_v.abs().max(1.0);
+        let rel_diff = abs_diff / scale;
+        max_abs_overall = max_abs_overall.max(abs_diff);
+        max_rel_overall = max_rel_overall.max(rel_diff);
+        let pass = abs_diff <= ABS_TOL || abs_diff <= REL_TOL * scale;
+        ledger.compared(&case.moment, &case.case_id, pass);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            dist: case.dist.clone(),
+            moment: case.moment.clone(),
+            abs_diff,
+            rel_diff,
+            pass,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -458,6 +463,7 @@ fn diff_stats_moments() {
         test_id: "diff_stats_moments".into(),
         category: "scipy.stats.<dist>.stats(moments='mvsk')".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_abs_overall,
         max_rel_diff: max_rel_overall,
         pass: all_pass,
@@ -484,4 +490,6 @@ fn diff_stats_moments() {
         max_abs_overall,
         max_rel_overall
     );
+    // Every pinned distribution is queried for all four moments.
+    ledger.finish(query.points.iter().filter(|c| c.moment == "mean").count());
 }

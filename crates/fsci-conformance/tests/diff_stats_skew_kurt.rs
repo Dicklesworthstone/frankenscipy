@@ -16,13 +16,14 @@
 //! these same quantities through the full `describe()`
 //! 7-tuple — this harness pins the standalone entry points.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{kurtosis, skew};
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +67,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -232,26 +234,29 @@ fn diff_stats_skew_kurt() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_skew_kurt", &["skew", "kurtosis"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = scipy_arm.value {
-            let rust_v = match case.func.as_str() {
-                "skew" => skew(&case.data),
-                "kurtosis" => kurtosis(&case.data),
-                _ => continue,
-            };
-            if rust_v.is_finite() {
-                let abs_diff = (rust_v - scipy_v).abs();
-                max_overall = max_overall.max(abs_diff);
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    func: case.func.clone(),
-                    abs_diff,
-                    pass: abs_diff <= ABS_TOL,
-                });
-            }
-        }
+        let (arm, rust_v) = match case.func.as_str() {
+            "skew" => ("skew", skew(&case.data)),
+            "kurtosis" => ("kurtosis", kurtosis(&case.data)),
+            other => panic!("unknown func {other} in {}", case.case_id),
+        };
+        let Some((scipy_v, rust_v)) =
+            ledger.pair(arm, &case.case_id, scipy_arm.value, Some(rust_v))
+        else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(arm, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -260,6 +265,7 @@ fn diff_stats_skew_kurt() {
         test_id: "diff_stats_skew_kurt".into(),
         category: "scipy.stats.skew + kurtosis".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -284,4 +290,6 @@ fn diff_stats_skew_kurt() {
         diffs.len(),
         max_overall
     );
+    // Every dataset feeds both functions, so each arm is designed to compare this many.
+    ledger.finish(query.points.iter().filter(|c| c.func == "skew").count());
 }

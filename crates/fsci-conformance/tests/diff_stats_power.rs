@@ -16,6 +16,7 @@
 
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_stats::{PowerResult, power, power_simulate, ttest_1samp};
 use serde::Deserialize;
 
@@ -198,14 +199,24 @@ fn diff_stats_power() {
             se(oracle.analytic_01),
         ),
     ];
+    // One arm; each row is a case. The target is the reference side (the analytic value, SciPy's
+    // estimate, or the nominal size) and the estimate the side under test.
+    let mut ledger = CompareLedger::new("diff_stats_power", &["power"]);
     let mut failures = Vec::new();
     for (label, estimate, target, sigma) in rows {
+        let Some((target, estimate)) = ledger.pair("power", label, Some(target), Some(estimate))
+        else {
+            continue;
+        };
         let z = (estimate - target).abs() / sigma;
         println!("{label}: {estimate:.5} vs {target:.5} ({z:.2} SE)");
-        if z.is_nan() || z > POWER_SE_TOL {
+        let fail = z.is_nan() || z > POWER_SE_TOL;
+        ledger.compared("power", label, !fail);
+        if fail {
             failures.push(format!("{label}: {estimate} vs {target} ({z:.2} SE)"));
         }
     }
     assert_eq!(alt.pvalues.len(), N_RESAMPLES);
     assert!(failures.is_empty(), "power disagrees: {failures:#?}");
+    ledger.finish(rows.len());
 }

@@ -13,13 +13,14 @@
 //! element-wise (length match + max-abs aggregation).
 //! Tol 1e-12 abs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::histogram_bin_edges;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -223,22 +225,21 @@ fn diff_stats_histogram_bin_edges() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let arms = ["sqrt", "rice", "scott", "fd", "sturges"];
+    let mut ledger = CompareLedger::new("diff_stats_histogram_bin_edges", &arms);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_edges) = &scipy_arm.edges else {
+        let rust_edges = histogram_bin_edges(&case.data, &case.method);
+        // slices rejects a length mismatch and a non-finite fsci edge against SciPy's value.
+        let Some((scipy_edges, rust_edges)) = ledger.slices(
+            &case.method,
+            &case.case_id,
+            scipy_arm.edges.as_deref(),
+            Some(rust_edges.as_slice()),
+        ) else {
             continue;
         };
-        let rust_edges = histogram_bin_edges(&case.data, &case.method);
-        if rust_edges.len() != scipy_edges.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                method: case.method.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let mut max_local = 0.0_f64;
         for (a, b) in rust_edges.iter().zip(scipy_edges.iter()) {
             if a.is_finite() {
@@ -246,6 +247,7 @@ fn diff_stats_histogram_bin_edges() {
             }
         }
         max_overall = max_overall.max(max_local);
+        ledger.compared(&case.method, &case.case_id, max_local <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             method: case.method.clone(),
@@ -260,6 +262,7 @@ fn diff_stats_histogram_bin_edges() {
         test_id: "diff_stats_histogram_bin_edges".into(),
         category: "numpy.histogram_bin_edges".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -284,4 +287,11 @@ fn diff_stats_histogram_bin_edges() {
         diffs.len(),
         max_overall
     );
+    // every method runs once per dataset
+    let min_per_arm = arms
+        .iter()
+        .map(|arm| query.points.iter().filter(|c| c.method == *arm).count())
+        .min()
+        .expect("arms declared");
+    ledger.finish(min_per_arm);
 }

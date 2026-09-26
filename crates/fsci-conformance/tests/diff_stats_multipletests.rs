@@ -16,13 +16,14 @@
 //! pvalues + reject mask) = 32 cases. Tol 1e-12 abs (closed-
 //! form scaling and monotone running-max / running-min).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{
     multipletests_bonferroni, multipletests_fdr_bh, multipletests_holm, multipletests_sidak,
 };
@@ -70,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -280,6 +282,19 @@ fn diff_stats_multipletests() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_multipletests",
+        &[
+            "bonferroni.pvalues_corrected",
+            "bonferroni.reject",
+            "sidak.pvalues_corrected",
+            "sidak.reject",
+            "holm.pvalues_corrected",
+            "holm.reject",
+            "fdr_bh.pvalues_corrected",
+            "fdr_bh.reject",
+        ],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
@@ -288,41 +303,57 @@ fn diff_stats_multipletests() {
             "sidak" => multipletests_sidak(&case.pvalues, case.alpha),
             "holm" => multipletests_holm(&case.pvalues, case.alpha),
             "fdr_bh" => multipletests_fdr_bh(&case.pvalues, case.alpha),
-            _ => continue,
+            other => unreachable!("generate_query emits no func `{other}`"),
         };
 
-        if let Some(scipy_p) = &scipy_arm.pvalues_corrected
-            && result.pvalues_corrected.len() == scipy_p.len()
-        {
+        // corrected p-values: slices records a missing oracle, a length mismatch, and a
+        // non-finite fsci p-value against a finite SciPy one.
+        let p_arm = format!("{}.pvalues_corrected", case.func);
+        if let Some((scipy_p, rust_p)) = ledger.slices(
+            &p_arm,
+            &case.case_id,
+            scipy_arm.pvalues_corrected.as_deref(),
+            Some(result.pvalues_corrected.as_slice()),
+        ) {
             let mut max_local = 0.0_f64;
-            for (r, s) in result.pvalues_corrected.iter().zip(scipy_p.iter()) {
+            for (r, s) in rust_p.iter().zip(scipy_p.iter()) {
+                // Only a non-finite value slices already matched against SciPy's is skipped.
                 if r.is_finite() {
                     max_local = max_local.max((r - s).abs());
                 }
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared(&p_arm, &case.case_id, max_local <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: format!("{}.pvalues_corrected", case.func),
+                arm: p_arm,
                 abs_diff: max_local,
                 pass: max_local <= ABS_TOL,
             });
         }
-        if let Some(scipy_r) = &scipy_arm.reject
-            && result.reject.len() == scipy_r.len()
-        {
-            let mismatches = result
-                .reject
+
+        // reject mask: a length mismatch is a compared failure, not a skip.
+        let r_arm = format!("{}.reject", case.func);
+        if let Some((scipy_r, rust_r)) = ledger.both(
+            &r_arm,
+            &case.case_id,
+            scipy_arm.reject.as_deref(),
+            Some(result.reject.as_slice()),
+        ) {
+            let shape_ok = rust_r.len() == scipy_r.len();
+            let mismatches = rust_r
                 .iter()
                 .zip(scipy_r.iter())
                 .filter(|(r, s)| r != s)
                 .count() as f64;
-            max_overall = max_overall.max(mismatches);
+            let abs_diff = if shape_ok { mismatches } else { f64::INFINITY };
+            max_overall = max_overall.max(abs_diff);
+            ledger.compared(&r_arm, &case.case_id, shape_ok && mismatches == 0.0);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                arm: format!("{}.reject", case.func),
-                abs_diff: mismatches,
-                pass: mismatches == 0.0,
+                arm: r_arm,
+                abs_diff,
+                pass: shape_ok && mismatches == 0.0,
             });
         }
     }
@@ -333,6 +364,7 @@ fn diff_stats_multipletests() {
         test_id: "diff_stats_multipletests".into(),
         category: "multipletests {bonferroni, sidak, holm, fdr_bh} (numpy reference)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -356,5 +388,14 @@ fn diff_stats_multipletests() {
         "multipletests conformance failed: {} cases, max_abs={}",
         diffs.len(),
         max_overall
+    );
+    // Every func runs on every fixture, so each arm is designed to compare that many cases.
+    let per_func = |f: &str| query.points.iter().filter(|c| c.func == f).count();
+    ledger.finish(
+        ["bonferroni", "sidak", "holm", "fdr_bh"]
+            .into_iter()
+            .map(per_func)
+            .min()
+            .expect("four funcs"),
     );
 }

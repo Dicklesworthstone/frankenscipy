@@ -11,13 +11,14 @@
 //! value) ≈ 30 cases via subprocess. Tol 1e-12 abs (closed-
 //! form polynomial in n, x, mean, var).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::obrientransform;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -239,40 +241,54 @@ fn diff_stats_obrientransform() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    // One arm; each transformed group is a compared case.
+    let mut ledger = CompareLedger::new("diff_stats_obrientransform", &["obrientransform"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_groups) = &scipy_arm.transformed else {
-            continue;
-        };
         let group_refs: Vec<&[f64]> = case.groups.iter().map(|g| g.as_slice()).collect();
         let rust_groups = obrientransform(&group_refs);
+        // SciPy raising (or a non-finite SciPy value, which the oracle maps to null) is
+        // recorded once for the whole case.
+        let Some((scipy_groups, rust_groups)) = ledger.both(
+            "obrientransform",
+            &case.case_id,
+            scipy_arm.transformed.as_ref(),
+            Some(&rust_groups),
+        ) else {
+            continue;
+        };
         if rust_groups.len() != scipy_groups.len() {
+            // Recorded as a failure; the zip below still compares the overlapping groups.
+            ledger.compared("obrientransform", &case.case_id, false);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: "shape".into(),
                 abs_diff: f64::INFINITY,
                 pass: false,
             });
-            continue;
         }
         for (gi, (rust_g, scipy_g)) in rust_groups.iter().zip(scipy_groups.iter()).enumerate() {
-            if rust_g.len() != scipy_g.len() {
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    arm: format!("group{gi}.shape"),
-                    abs_diff: f64::INFINITY,
-                    pass: false,
-                });
+            let group_id = format!("{}_group{gi}", case.case_id);
+            // slices records a group length mismatch, and a non-finite fsci value that the
+            // max fold below would swallow.
+            let Some((scipy_g, rust_g)) = ledger.slices(
+                "obrientransform",
+                &group_id,
+                Some(scipy_g.as_slice()),
+                Some(rust_g.as_slice()),
+            ) else {
                 continue;
-            }
+            };
             let mut max_local = 0.0_f64;
             for (r, s) in rust_g.iter().zip(scipy_g.iter()) {
+                // Only a non-finite value slices already matched against SciPy's is skipped.
                 if r.is_finite() {
                     max_local = max_local.max((r - s).abs());
                 }
             }
             max_overall = max_overall.max(max_local);
+            ledger.compared("obrientransform", &group_id, max_local <= ABS_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
                 arm: format!("group{gi}"),
@@ -288,6 +304,7 @@ fn diff_stats_obrientransform() {
         test_id: "diff_stats_obrientransform".into(),
         category: "scipy.stats.obrientransform".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -312,4 +329,6 @@ fn diff_stats_obrientransform() {
         diffs.len(),
         max_overall
     );
+    // Every group of every fixture is designed to be compared.
+    ledger.finish(query.points.iter().map(|c| c.groups.len()).sum());
 }

@@ -14,13 +14,14 @@
 //! Each case compares the coefficient vector with max-abs
 //! aggregation. Tol 1e-9 abs (linear-system solve precision).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::polynomial_regression;
 use serde::{Deserialize, Serialize};
 
@@ -64,6 +65,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -249,28 +251,30 @@ fn diff_stats_polynomial_regression() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_polynomial_regression",
+        &["polynomial_regression"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_coeffs) = &scipy_arm.coeffs else {
+        let rust_coeffs = polynomial_regression(&case.x, &case.y, case.degree as usize);
+        // `slices` rejects a length mismatch and any non-finite fsci
+        // coefficient against SciPy's finite one.
+        let Some((scipy_coeffs, rust_coeffs)) = ledger.slices(
+            "polynomial_regression",
+            &case.case_id,
+            scipy_arm.coeffs.as_deref(),
+            Some(rust_coeffs.as_slice()),
+        ) else {
             continue;
         };
-        let rust_coeffs = polynomial_regression(&case.x, &case.y, case.degree as usize);
-        if rust_coeffs.len() != scipy_coeffs.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let mut max_local = 0.0_f64;
         for (a, b) in rust_coeffs.iter().zip(scipy_coeffs.iter()) {
-            if a.is_finite() {
-                max_local = max_local.max((a - b).abs());
-            }
+            max_local = max_local.max((a - b).abs());
         }
         max_overall = max_overall.max(max_local);
+        ledger.compared("polynomial_regression", &case.case_id, max_local <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: max_local,
@@ -284,6 +288,7 @@ fn diff_stats_polynomial_regression() {
         test_id: "diff_stats_polynomial_regression".into(),
         category: "numpy.polyfit (compared via fsci's polynomial_regression)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -308,4 +313,5 @@ fn diff_stats_polynomial_regression() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

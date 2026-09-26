@@ -16,13 +16,14 @@
 //! 3 datasets × 5 configs × 6 functions ≈ 30+ cases via
 //! subprocess. Tol 1e-12 abs (closed-form filter + sum/var).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::{tmax, tmean, tmin, tsem, tstd, tvar};
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +71,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -110,7 +112,8 @@ fn fsci_eval(case: &PointCase) -> Option<f64> {
         "tmax" => tmax(&case.data, case.hi, case.inc_hi),
         _ => return None,
     };
-    if v.is_finite() { Some(v) } else { None }
+    // A non-finite value reaches the ledger, which records it as an fsci failure.
+    Some(v)
 }
 
 fn generate_query() -> OracleQuery {
@@ -261,21 +264,27 @@ fn diff_stats_trimmed() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new(
+        "diff_stats_trimmed",
+        &["tmean", "tvar", "tstd", "tsem", "tmin", "tmax"],
+    );
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        if let Some(scipy_v) = scipy_arm.value
-            && let Some(rust_v) = fsci_eval(case)
-        {
-            let abs_diff = (rust_v - scipy_v).abs();
-            max_overall = max_overall.max(abs_diff);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                func: case.func.clone(),
-                abs_diff,
-                pass: abs_diff <= ABS_TOL,
-            });
-        }
+        let Some((scipy_v, rust_v)) =
+            ledger.pair(&case.func, &case.case_id, scipy_arm.value, fsci_eval(case))
+        else {
+            continue;
+        };
+        let abs_diff = (rust_v - scipy_v).abs();
+        max_overall = max_overall.max(abs_diff);
+        ledger.compared(&case.func, &case.case_id, abs_diff <= ABS_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            func: case.func.clone(),
+            abs_diff,
+            pass: abs_diff <= ABS_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -284,6 +293,7 @@ fn diff_stats_trimmed() {
         test_id: "diff_stats_trimmed".into(),
         category: "scipy.stats trimmed family".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -308,4 +318,6 @@ fn diff_stats_trimmed() {
         diffs.len(),
         max_overall
     );
+    // every func runs the same datasets x configs grid
+    ledger.finish(query.points.iter().filter(|c| c.func == "tmean").count());
 }

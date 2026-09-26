@@ -19,6 +19,7 @@
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_stats::{
     BetaNegativeBinomial, ContinuousDistribution, DiscreteDistribution, GeneralizedExponential,
     NegHypergeometric, WrapCauchy,
@@ -154,46 +155,88 @@ fn diff_stats_moments_modes_regressions() {
     };
     let mut compared = 0;
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new(
+        "diff_stats_moments_modes_regressions",
+        &[
+            "wrapcauchy.mean",
+            "wrapcauchy.var",
+            "wrapcauchy.skew",
+            "wrapcauchy.kurt",
+            "genexpon.mode",
+            "betanbinom.mode",
+            "nhypergeom.mode",
+        ],
+    );
 
     for (&c, want) in WRAPCAUCHY_C.iter().zip(&answer.wrapcauchy) {
         let d = WrapCauchy::new(c);
         let got = [d.mean(), d.var(), d.skewness(), d.kurtosis()];
+        let case_id = format!("c{c}");
         for (name, (g, w)) in ["mean", "var", "skew", "kurt"]
             .iter()
             .zip(got.iter().zip(want))
         {
             let r = rel(*g, *w);
             println!("wrapcauchy({c}) {name}: fsci {g:e} SciPy {w:e} rel {r:.1e}");
-            if r.is_nan() || r > MOMENT_REL_TOL {
+            compared += 1;
+            let arm = format!("wrapcauchy.{name}");
+            // A non-finite fsci moment is recorded by the ledger as an fsci failure.
+            let Some((w, g)) = ledger.pair(&arm, &case_id, Some(*w), Some(*g)) else {
+                continue;
+            };
+            let pass = !(r.is_nan() || r > MOMENT_REL_TOL);
+            ledger.compared(&arm, &case_id, pass);
+            if !pass {
                 failures.push(format!("wrapcauchy({c}) {name}: {g:e} vs {w:e}"));
             }
-            compared += 1;
         }
     }
     for (&(a, b, c), &want) in GENEXPON.iter().zip(&answer.genexpon) {
         let got = GeneralizedExponential::new(a, b, c).mode();
         println!("genexpon({a},{b},{c}) mode: fsci {got} SciPy argmax {want}");
+        compared += 1;
+        let case_id = format!("a{a}_b{b}_c{c}");
+        let Some((want, got)) = ledger.pair("genexpon.mode", &case_id, Some(want), Some(got))
+        else {
+            continue;
+        };
         let err = (got - want).abs();
-        if err.is_nan() || err > MODE_ABS_TOL {
+        let pass = !(err.is_nan() || err > MODE_ABS_TOL);
+        ledger.compared("genexpon.mode", &case_id, pass);
+        if !pass {
             failures.push(format!("genexpon({a},{b},{c}) mode {got} vs {want}"));
         }
-        compared += 1;
     }
     for (&(n, a, b), want) in BETANBINOM.iter().zip(&answer.betanbinom) {
         let got = BetaNegativeBinomial::new(n, a, b).mode();
         println!("betanbinom({n},{a},{b}) mode: fsci {got} SciPy pmf maximum at {want:?}");
-        if !want.contains(&got) {
+        compared += 1;
+        let case_id = format!("n{n}_a{a}_b{b}");
+        // The SciPy side is the set of k at the pmf maximum; a NaN mode is in no set.
+        let Some((want, got)) = ledger.both("betanbinom.mode", &case_id, Some(want), Some(got))
+        else {
+            continue;
+        };
+        let pass = want.contains(&got);
+        ledger.compared("betanbinom.mode", &case_id, pass);
+        if !pass {
             failures.push(format!("betanbinom({n},{a},{b}) mode {got} vs {want:?}"));
         }
-        compared += 1;
     }
     for (&(m, n, r), want) in NHYPERGEOM.iter().zip(&answer.nhypergeom) {
         let got = NegHypergeometric::new(m, n, r).mode();
         println!("nhypergeom({m},{n},{r}) mode: fsci {got} SciPy pmf maximum at {want:?}");
-        if !want.contains(&got) {
+        compared += 1;
+        let case_id = format!("M{m}_n{n}_r{r}");
+        let Some((want, got)) = ledger.both("nhypergeom.mode", &case_id, Some(want), Some(got))
+        else {
+            continue;
+        };
+        let pass = want.contains(&got);
+        ledger.compared("nhypergeom.mode", &case_id, pass);
+        if !pass {
             failures.push(format!("nhypergeom({m},{n},{r}) mode {got} vs {want:?}"));
         }
-        compared += 1;
     }
 
     let expected = 4 * WRAPCAUCHY_C.len() + GENEXPON.len() + BETANBINOM.len() + NHYPERGEOM.len();
@@ -201,5 +244,14 @@ fn diff_stats_moments_modes_regressions() {
     assert!(
         failures.is_empty(),
         "moments/modes disagree with SciPy: {failures:#?}"
+    );
+    // Each arm must compare every row of its family; the smallest family sets the floor.
+    ledger.finish(
+        query
+            .wrapcauchy
+            .len()
+            .min(query.genexpon.len())
+            .min(query.betanbinom.len())
+            .min(query.nhypergeom.len()),
     );
 }

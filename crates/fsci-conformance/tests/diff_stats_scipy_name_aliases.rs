@@ -14,6 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::Stdio;
 
+use fsci_conformance::CompareLedger;
 use fsci_stats::{
     Beta, Betabinom, Betanbinom, Binom, Burr, Chi2, ContinuousDistribution, Cosine,
     CosineDistribution, Dgamma, DiscreteDistribution, Dlaplace, Dweibull, Expon, Exponweib, F,
@@ -441,22 +442,38 @@ fn diff_stats_scipy_name_aliases() {
 
     let mut compared = 0usize;
     let mut failures = Vec::new();
+    let mut ledger = CompareLedger::new("diff_stats_scipy_name_aliases", &["density", "cdf"]);
     for case in &cases {
-        let Some(Some(expected)) = oracle.get(case.alias) else {
+        let expected = oracle.get(case.alias).and_then(Option::as_ref);
+        if expected.is_none() {
             failures.push(format!(
                 "{}: SciPy did not evaluate `{}`",
                 case.alias, case.scipy
             ));
-            continue;
-        };
-        for (&x, &(e_dens, e_cdf)) in case.points.iter().zip(expected) {
+        }
+        for (i, &x) in case.points.iter().enumerate() {
+            let case_id = format!("{}_x{x}", case.alias);
             let (dens, cdf) = (case.eval)(x);
-            compared += 1;
-            if !close(dens, e_dens) || !close(cdf, e_cdf) {
-                failures.push(format!(
-                    "{} vs {} at x={x}: density {dens:e} vs {e_dens:e}, cdf {cdf:e} vs {e_cdf:e}",
-                    case.alias, case.scipy
-                ));
+            // A point SciPy did not evaluate is recorded per arm as a missing oracle value.
+            let scipy = expected.and_then(|v| v.get(i)).copied();
+            let arms = [
+                ("density", scipy.map(|(e_dens, _)| e_dens), dens),
+                ("cdf", scipy.map(|(_, e_cdf)| e_cdf), cdf),
+            ];
+            for (arm, e, got) in arms {
+                let Some((s, f)) = ledger.pair(arm, &case_id, e, Some(got)) else {
+                    continue;
+                };
+                ledger.compared(arm, &case_id, close(f, s));
+            }
+            if let Some((e_dens, e_cdf)) = scipy {
+                compared += 1;
+                if !close(dens, e_dens) || !close(cdf, e_cdf) {
+                    failures.push(format!(
+                        "{} vs {} at x={x}: density {dens:e} vs {e_dens:e}, cdf {cdf:e} vs {e_cdf:e}",
+                        case.alias, case.scipy
+                    ));
+                }
             }
         }
     }
@@ -471,4 +488,6 @@ fn diff_stats_scipy_name_aliases() {
         "alias divergences:\n{}",
         failures.join("\n")
     );
+    // Both arms are designed to compare every point of every alias row.
+    ledger.finish(expected_points);
 }

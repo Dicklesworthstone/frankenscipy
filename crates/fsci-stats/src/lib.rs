@@ -2812,6 +2812,13 @@ impl ContinuousDistribution for Uniform {
         self.loc + 0.5 * self.scale
     }
 
+    /// The midpoint. Every point of the support maximises the pdf, so the trait's NaN default
+    /// for a non-unique mode would apply, but SciPy does define one: `Uniform._mode_formula`
+    /// returns `a + 0.5*(b - a)`.
+    fn mode(&self) -> f64 {
+        self.loc + 0.5 * self.scale
+    }
+
     fn var(&self) -> f64 {
         self.scale * self.scale / 12.0
     }
@@ -68241,6 +68248,16 @@ mod tests {
         let u = Uniform::new(0.0, 12.0);
         assert_eq!(u.mean(), 6.0);
         assert_eq!(u.var(), 12.0);
+    }
+
+    /// SciPy 1.17.1: `stats.Uniform(a=1, b=5).mode()` is 3.0 (`_mode_formula` = a + 0.5*(b-a)),
+    /// not the trait's NaN default for a non-unique mode and not either endpoint.
+    #[test]
+    fn uniform_mode_is_scipys_midpoint() {
+        let u = Uniform::new(1.0, 4.0);
+        assert_eq!(u.mode(), 3.0);
+        assert_ne!(u.mode(), u.loc);
+        assert_eq!(Uniform::new(-2.0, 1.0).mode(), -1.5);
     }
 
     // ── ContinuousDistribution trait ────────────────────────────────

@@ -13,13 +13,14 @@
 //! per-element max-abs aggregation. Tol 1e-12 abs (closed-form
 //! mean-and-std normalisation).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::zmap_ddof;
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -226,28 +228,27 @@ fn diff_stats_zmap_ddof() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_zmap_ddof", &["zmap_ddof"]);
 
     for case in &query.points {
         let scipy_arm = pmap.get(&case.case_id).expect("validated oracle");
-        let Some(scipy_vec) = &scipy_arm.values else {
+        let fsci_vec = zmap_ddof(&case.scores, &case.compare, case.ddof);
+        // slices rejects a length mismatch and a non-finite fsci element against a finite SciPy
+        // one, which the old `r.is_finite()` guard skipped silently.
+        let Some((scipy_vec, rust_vec)) = ledger.slices(
+            "zmap_ddof",
+            &case.case_id,
+            scipy_arm.values.as_deref(),
+            Some(fsci_vec.as_slice()),
+        ) else {
             continue;
         };
-        let rust_vec = zmap_ddof(&case.scores, &case.compare, case.ddof);
-        if rust_vec.len() != scipy_vec.len() {
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                abs_diff: f64::INFINITY,
-                pass: false,
-            });
-            continue;
-        }
         let mut max_local = 0.0_f64;
         for (r, s) in rust_vec.iter().zip(scipy_vec.iter()) {
-            if r.is_finite() {
-                max_local = max_local.max((r - s).abs());
-            }
+            max_local = max_local.max((r - s).abs());
         }
         max_overall = max_overall.max(max_local);
+        ledger.compared("zmap_ddof", &case.case_id, max_local <= ABS_TOL);
         diffs.push(CaseDiff {
             case_id: case.case_id.clone(),
             abs_diff: max_local,
@@ -261,6 +262,7 @@ fn diff_stats_zmap_ddof() {
         test_id: "diff_stats_zmap_ddof".into(),
         category: "scipy.stats.zmap (ddof=0, ddof=1)".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -282,4 +284,5 @@ fn diff_stats_zmap_ddof() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }

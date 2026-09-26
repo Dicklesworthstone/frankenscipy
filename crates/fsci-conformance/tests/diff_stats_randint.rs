@@ -9,13 +9,14 @@
 //! (k-low+1)/(high-low); ppf returns the integer at the q-quantile.
 //! All are exact arithmetic on small ints, so 1e-14 abs holds.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::RandInt;
 use serde::{Deserialize, Serialize};
 
@@ -77,6 +78,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -244,26 +246,25 @@ fn diff_stats_randint() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_randint", &["pmf", "cdf", "ppf"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
         let dist = RandInt::new(case.low, case.high);
-        if let Some(spmf) = oracle.pmf {
-            let d = (dist.pmf(case.k) - spmf).abs();
+        let arms = [
+            ("pmf", oracle.pmf, dist.pmf(case.k)),
+            ("cdf", oracle.cdf, dist.cdf(case.k)),
+        ];
+        for (family, scipy, fsci) in arms {
+            let Some((s, f)) = ledger.pair(family, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = (f - s).abs();
             max_overall = max_overall.max(d);
+            ledger.compared(family, &case.case_id, d <= POINT_TOL);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                family: "pmf".into(),
-                abs_diff: d,
-                pass: d <= POINT_TOL,
-            });
-        }
-        if let Some(scdf) = oracle.cdf {
-            let d = (dist.cdf(case.k) - scdf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "cdf".into(),
+                family: family.into(),
                 abs_diff: d,
                 pass: d <= POINT_TOL,
             });
@@ -272,31 +273,25 @@ fn diff_stats_randint() {
 
     for case in &query.ppf {
         let oracle = ppfmap.get(&case.case_id).expect("validated oracle");
-        if let Some(sppf) = oracle.ppf {
-            let dist = RandInt::new(case.low, case.high);
-            let rust = dist.ppf(case.q);
-            // Both scipy and fsci return integer-valued floats.
-            // scipy may return ±inf at q-extremes for unbounded
-            // edge cases — guard with a finite check.
-            if !sppf.is_finite() || !rust.is_finite() {
-                let pass = sppf == rust;
-                diffs.push(CaseDiff {
-                    case_id: case.case_id.clone(),
-                    family: "ppf".into(),
-                    abs_diff: if pass { 0.0 } else { f64::INFINITY },
-                    pass,
-                });
-                continue;
-            }
-            let d = (rust - sppf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "ppf".into(),
-                abs_diff: d,
-                pass: d <= POINT_TOL,
-            });
-        }
+        let dist = RandInt::new(case.low, case.high);
+        // Both scipy and fsci return integer-valued floats. A non-finite
+        // value on either side is classified by the ledger: matching
+        // infinities compare equal, anything else against SciPy's finite
+        // value is an fsci failure.
+        let Some((sppf, rust)) =
+            ledger.pair("ppf", &case.case_id, oracle.ppf, Some(dist.ppf(case.q)))
+        else {
+            continue;
+        };
+        let d = (rust - sppf).abs();
+        max_overall = max_overall.max(d);
+        ledger.compared("ppf", &case.case_id, d <= POINT_TOL);
+        diffs.push(CaseDiff {
+            case_id: case.case_id.clone(),
+            family: "ppf".into(),
+            abs_diff: d,
+            pass: d <= POINT_TOL,
+        });
     }
 
     let all_pass = diffs.iter().all(|d| d.pass);
@@ -305,6 +300,7 @@ fn diff_stats_randint() {
         test_id: "diff_stats_randint".into(),
         category: "scipy.stats.randint".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -329,4 +325,6 @@ fn diff_stats_randint() {
         diffs.len(),
         max_overall
     );
+    // pmf/cdf compare every point case; ppf has its own (smaller) q-grid.
+    ledger.finish(query.points.len().min(query.ppf.len()));
 }

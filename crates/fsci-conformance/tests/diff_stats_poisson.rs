@@ -6,13 +6,14 @@
 //! 6 μ-values × 20 k-values × 2 families (pmf, cdf) via
 //! subprocess.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use fsci_conformance::{ArmCounts, CompareLedger};
 use fsci_stats::Poisson;
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,7 @@ struct DiffLog {
     test_id: String,
     category: String,
     case_count: usize,
+    compared: BTreeMap<String, ArmCounts>,
     max_abs_diff: f64,
     pass: bool,
     timestamp_ms: u128,
@@ -188,28 +190,27 @@ fn diff_stats_poisson() {
     let start = Instant::now();
     let mut diffs = Vec::new();
     let mut max_overall = 0.0_f64;
+    let mut ledger = CompareLedger::new("diff_stats_poisson", &["pmf", "cdf"]);
 
     for case in &query.points {
         let oracle = pmap.get(&case.case_id).expect("validated oracle");
         let dist = Poisson::new(case.mu);
-        if let Some(spmf) = oracle.pmf {
-            let d = (dist.pmf(case.k) - spmf).abs();
+        let arms = [
+            ("pmf", oracle.pmf, dist.pmf(case.k), PMF_TOL),
+            ("cdf", oracle.cdf, dist.cdf(case.k), CDF_TOL),
+        ];
+        for (family, scipy, fsci, tol) in arms {
+            let Some((s, f)) = ledger.pair(family, &case.case_id, scipy, Some(fsci)) else {
+                continue;
+            };
+            let d = (f - s).abs();
             max_overall = max_overall.max(d);
+            ledger.compared(family, &case.case_id, d <= tol);
             diffs.push(CaseDiff {
                 case_id: case.case_id.clone(),
-                family: "pmf".into(),
+                family: family.into(),
                 abs_diff: d,
-                pass: d <= PMF_TOL,
-            });
-        }
-        if let Some(scdf) = oracle.cdf {
-            let d = (dist.cdf(case.k) - scdf).abs();
-            max_overall = max_overall.max(d);
-            diffs.push(CaseDiff {
-                case_id: case.case_id.clone(),
-                family: "cdf".into(),
-                abs_diff: d,
-                pass: d <= CDF_TOL,
+                pass: d <= tol,
             });
         }
     }
@@ -220,6 +221,7 @@ fn diff_stats_poisson() {
         test_id: "diff_stats_poisson".into(),
         category: "scipy.stats.poisson".into(),
         case_count: diffs.len(),
+        compared: ledger.counts().clone(),
         max_abs_diff: max_overall,
         pass: all_pass,
         timestamp_ms: timestamp_ms(),
@@ -244,4 +246,5 @@ fn diff_stats_poisson() {
         diffs.len(),
         max_overall
     );
+    ledger.finish(query.points.len());
 }
