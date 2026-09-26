@@ -6002,7 +6002,10 @@ fn ord_digital_prewarp(
             "{name}: wp and ws must lie in (0, 1) (Nyquist-normalized digital frequencies)"
         )));
     }
-    if gpass <= 0.0 || gstop <= 0.0 || gpass >= gstop {
+    // Written as the positive condition so a NaN fails it: SciPy 1.17.1 raises ValueError
+    // ("cannot convert float NaN to integer") for a NaN gpass or gstop in buttord, cheb1ord,
+    // cheb2ord and ellipord, where the old `<=`/`>=` tests let NaN through to a NaN order.
+    if !(gpass > 0.0 && gstop > 0.0 && gpass < gstop) {
         return Err(SignalError::InvalidArgument(format!(
             "{name}: require 0 < gpass < gstop"
         )));
@@ -7010,61 +7013,85 @@ pub static PHASE_RESPONSE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 
 /// Combine roots that are within `tol` of each other into unique groups.
 ///
-/// Matches `scipy.signal.unique_roots(p, tol, rtype)`. Sorts the
-/// input, then walks the sorted array greedily grouping consecutive
-/// entries where the gap from the group's first element is within
-/// `tol`. Each group is collapsed via `rtype` ("min", "max", or
-/// "avg"); unknown rtype falls back to "avg" (matching scipy's
-/// permissive default).
+/// Matches `scipy.signal.unique_roots(p, tol, rtype)` (1.17.1): walk `p` in INPUT order; each
+/// root not yet used starts a group of every unused root within `tol` of it (SciPy's
+/// `cKDTree.query_ball_point`, `|p_j − p_i| <= tol`), reduced with `rtype` ("max"/"maximum",
+/// "min"/"minimum", "avg"/"mean"). Groups come out in order of first appearance.
 ///
-/// Returns `(unique, multiplicities)` — a vector of representative
-/// roots and a vector of how many input roots fell into each group.
+/// Errors, in SciPy's order: an unknown `rtype` (SciPy raises before looking at `p`), then a
+/// non-finite root (cKDTree raises "data must be finite").
 ///
-/// Resolves [frankenscipy-sx2yp].
-pub fn unique_roots(p: &[f64], tol: f64, rtype: &str) -> (Vec<f64>, Vec<usize>) {
-    if p.is_empty() {
-        return (Vec::new(), Vec::new());
+/// This used to sort `p` and chain runs within `tol` of each run's smallest member, and to
+/// average for any unknown `rtype`. Both differ from SciPy: `[2, 1, 3]` at `tol = 1` is one
+/// group in SciPy and two when chained from the sorted `1`; `"maximum"` averaged; `"garbage"`
+/// was accepted.
+///
+/// Returns `(unique, multiplicities)`. Resolves [frankenscipy-sx2yp].
+pub fn unique_roots(
+    p: &[f64],
+    tol: f64,
+    rtype: &str,
+) -> Result<(Vec<f64>, Vec<usize>), SignalError> {
+    #[derive(Clone, Copy)]
+    enum Reduce {
+        Max,
+        Min,
+        Mean,
     }
-    let mut sorted: Vec<f64> = p.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-
+    let reduce = match rtype {
+        "max" | "maximum" => Reduce::Max,
+        "min" | "minimum" => Reduce::Min,
+        "avg" | "mean" => Reduce::Mean,
+        _ => {
+            return Err(SignalError::InvalidArgument(
+                "`rtype` must be one of {'max', 'maximum', 'min', 'minimum', 'avg', 'mean'}"
+                    .to_string(),
+            ));
+        }
+    };
+    if p.iter().any(|v| !v.is_finite()) {
+        return Err(SignalError::InvalidArgument(
+            "data must be finite, check for nan or inf values".to_string(),
+        ));
+    }
     let mut roots = Vec::new();
     let mut mult = Vec::new();
-    let mut group: Vec<f64> = Vec::with_capacity(sorted.len());
-    for &val in &sorted {
-        let extend = match group.first() {
-            Some(&first) => (val - first).abs() <= tol,
-            None => true,
-        };
-        if extend {
-            group.push(val);
-        } else {
-            collapse_unique_root_group(&mut roots, &mut mult, &group, rtype);
-            group.clear();
-            group.push(val);
+    let mut used = vec![false; p.len()];
+    let mut group: Vec<f64> = Vec::with_capacity(p.len());
+    for i in 0..p.len() {
+        if used[i] {
+            continue;
         }
+        group.clear();
+        for j in 0..p.len() {
+            // cKDTree's ball with a negative radius takes every point (SciPy 1.17.1:
+            // unique_roots([1, 2], -1, "max") = ([2], [2])); a NaN radius takes none.
+            if !used[j] && (tol < 0.0 || (p[j] - p[i]).abs() <= tol) {
+                used[j] = true;
+                group.push(p[j]);
+            }
+        }
+        // An empty group (NaN tol) is what SciPy reduces too: np.max/np.min raise and np.mean
+        // is NaN, so unique_roots([1, 2], nan, "avg") = ([nan, nan], [0, 0]).
+        let r = match reduce {
+            Reduce::Max | Reduce::Min if group.is_empty() => {
+                return Err(SignalError::InvalidArgument(format!(
+                    "zero-size array to reduction operation {} which has no identity",
+                    if matches!(reduce, Reduce::Max) {
+                        "maximum"
+                    } else {
+                        "minimum"
+                    }
+                )));
+            }
+            Reduce::Max => group.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            Reduce::Min => group.iter().copied().fold(f64::INFINITY, f64::min),
+            Reduce::Mean => group.iter().sum::<f64>() / group.len() as f64,
+        };
+        roots.push(r);
+        mult.push(group.len());
     }
-    if !group.is_empty() {
-        collapse_unique_root_group(&mut roots, &mut mult, &group, rtype);
-    }
-    (roots, mult)
-}
-
-fn collapse_unique_root_group(
-    roots: &mut Vec<f64>,
-    mult: &mut Vec<usize>,
-    group: &[f64],
-    rtype: &str,
-) {
-    let n = group.len();
-    let r = match rtype {
-        "min" => group.iter().copied().fold(f64::INFINITY, f64::min),
-        "max" => group.iter().copied().fold(f64::NEG_INFINITY, f64::max),
-        // "avg" or any other value — match scipy's permissive behaviour.
-        _ => group.iter().sum::<f64>() / n as f64,
-    };
-    roots.push(r);
-    mult.push(n);
+    Ok((roots, mult))
 }
 
 /// When `true`, [`normalize_signal`] runs its `(v-mean)/std` output map serially (the ORIG behaviour);
@@ -28702,26 +28729,25 @@ mod tests {
 
     #[test]
     fn unique_roots_empty_returns_empty() {
-        let (r, m) = unique_roots(&[], 1e-3, "min");
+        let (r, m) = unique_roots(&[], 1e-3, "min").expect("scipy returns empty arrays");
         assert!(r.is_empty() && m.is_empty());
     }
 
     #[test]
     fn unique_roots_all_distinct_returns_each_with_multiplicity_one() {
         let p = [1.0, 5.0, 10.0];
-        let (r, m) = unique_roots(&p, 0.5, "min");
+        let (r, m) = unique_roots(&p, 0.5, "min").expect("valid");
         assert_eq!(r, vec![1.0, 5.0, 10.0]);
         assert_eq!(m, vec![1, 1, 1]);
     }
 
     #[test]
     fn unique_roots_groups_within_tolerance() {
-        // tol comparison is `|x - leader| <= tol` (inclusive). Use
-        // exact f64 values to avoid float-precision artifacts.
-        // tol=1.0, leader 0.0: 0.5 ≤ 1, 1.0 ≤ 1 → all join. 2.5 starts
-        // new cluster. 5.0 is also outside |2.5-5.0|=2.5 > 1 → another.
+        // Ball membership is `|p_j - p_i| <= tol` (inclusive) around the first unused root.
+        // tol=1.0 around 0.0: 0.5 ≤ 1, 1.0 ≤ 1 → all join. 2.5 starts a new group; 5.0 is
+        // 2.5 away → another. SciPy 1.17.1: ([0.0, 2.5, 5.0], [3, 1, 1]).
         let p = [0.0, 0.5, 1.0, 2.5, 5.0];
-        let (r, m) = unique_roots(&p, 1.0, "min");
+        let (r, m) = unique_roots(&p, 1.0, "min").expect("valid");
         assert_eq!(r.len(), 3, "expected 3 clusters, got {r:?}");
         assert_eq!(r, vec![0.0, 2.5, 5.0]);
         assert_eq!(m, vec![3, 1, 1]);
@@ -28730,7 +28756,7 @@ mod tests {
     #[test]
     fn unique_roots_avg_combine() {
         let p = [1.0, 2.0, 3.0];
-        let (r, m) = unique_roots(&p, 5.0, "avg");
+        let (r, m) = unique_roots(&p, 5.0, "avg").expect("valid");
         assert_eq!(r.len(), 1);
         assert!((r[0] - 2.0).abs() < 1e-15);
         assert_eq!(m, vec![3]);
@@ -28739,7 +28765,7 @@ mod tests {
     #[test]
     fn unique_roots_max_combine() {
         let p = [1.0, 2.0, 3.0];
-        let (r, m) = unique_roots(&p, 5.0, "max");
+        let (r, m) = unique_roots(&p, 5.0, "max").expect("valid");
         assert_eq!(r, vec![3.0]);
         assert_eq!(m, vec![3]);
     }
@@ -28748,18 +28774,83 @@ mod tests {
     fn unique_roots_zero_tol_keeps_only_exact_duplicates_together() {
         // tol = 0: only equal values are grouped.
         let p = [1.0, 1.0, 2.0];
-        let (r, m) = unique_roots(&p, 0.0, "min");
+        let (r, m) = unique_roots(&p, 0.0, "min").expect("valid");
         assert_eq!(r, vec![1.0, 2.0]);
         assert_eq!(m, vec![2, 1]);
     }
 
+    /// The premise this test used to encode ("scipy is permissive; unknown rtype averages") is
+    /// false for SciPy 1.17.1: `unique_roots([1, 2, 3], 5, "garbage")` raises ValueError "`rtype`
+    /// must be one of {...}", before `p` is looked at. The aliases SciPy does accept, "maximum",
+    /// "minimum" and "mean", used to fall into the old average fallback.
     #[test]
-    fn unique_roots_unknown_rtype_falls_back_to_avg() {
-        // scipy is permissive — unknown rtype shouldn't panic; we treat
-        // it as "avg" to match the documented permissive behaviour.
+    fn unique_roots_rejects_unknown_rtype_and_non_finite_roots_like_scipy() {
         let p = [1.0, 2.0, 3.0];
-        let (r, _) = unique_roots(&p, 5.0, "garbage");
-        assert!((r[0] - 2.0).abs() < 1e-15);
+        let err = unique_roots(&p, 5.0, "garbage").expect_err("scipy raises");
+        assert!(
+            format!("{err:?}").contains("`rtype` must be one of"),
+            "{err:?}"
+        );
+        // rtype is checked first: a bad rtype with NaN roots reports the rtype.
+        let err = unique_roots(&[f64::NAN], 5.0, "garbage").expect_err("scipy raises");
+        assert!(format!("{err:?}").contains("`rtype`"), "{err:?}");
+        for bad in [f64::NAN, f64::INFINITY] {
+            let err = unique_roots(&[1.0, bad, 1.0], 1e-3, "avg").expect_err("scipy raises");
+            assert!(
+                format!("{err:?}").contains("data must be finite"),
+                "{err:?}"
+            );
+        }
+        // SciPy 1.17.1 aliases: maximum / minimum / mean.
+        assert_eq!(
+            unique_roots(&p, 5.0, "maximum").expect("valid"),
+            (vec![3.0], vec![3])
+        );
+        assert_eq!(
+            unique_roots(&p, 5.0, "minimum").expect("valid"),
+            (vec![1.0], vec![3])
+        );
+        assert_eq!(
+            unique_roots(&p, 5.0, "mean").expect("valid"),
+            (vec![2.0], vec![3])
+        );
+    }
+
+    /// SciPy 1.17.1 groups by a BALL around each first-unused root, in input order, not by
+    /// chaining sorted runs:
+    /// - `unique_roots([2, 1, 3], 1, "avg")` = ([2.0], [3]) (sorted chaining gave [1.5, 3.0]);
+    /// - `unique_roots([3, 1, 2], 1, "min")` = ([2.0, 1.0], [2, 1]) (first-appearance order);
+    /// - `unique_roots([5, 1, 5, 1], 0.1, "maximum")` = ([5.0, 1.0], [2, 2]).
+    ///
+    /// cKDTree edge radii: `([1, 2], -1, "max")` = ([2.0], [2]) (a negative radius takes every
+    /// point), `([1, 2], nan, "avg")` = ([nan, nan], [0, 0]), and `([1, 2], nan, "max")` raises
+    /// "zero-size array to reduction operation maximum which has no identity".
+    #[test]
+    fn unique_roots_groups_by_ball_in_input_order_like_scipy() {
+        assert_eq!(
+            unique_roots(&[2.0, 1.0, 3.0], 1.0, "avg").expect("valid"),
+            (vec![2.0], vec![3])
+        );
+        assert_eq!(
+            unique_roots(&[3.0, 1.0, 2.0], 1.0, "min").expect("valid"),
+            (vec![2.0, 1.0], vec![2, 1])
+        );
+        assert_eq!(
+            unique_roots(&[5.0, 1.0, 5.0, 1.0], 0.1, "maximum").expect("valid"),
+            (vec![5.0, 1.0], vec![2, 2])
+        );
+        assert_eq!(
+            unique_roots(&[1.0, 2.0], -1.0, "max").expect("valid"),
+            (vec![2.0], vec![2])
+        );
+        let (r, m) = unique_roots(&[1.0, 2.0], f64::NAN, "avg").expect("valid");
+        assert!(r.len() == 2 && r.iter().all(|v| v.is_nan()), "{r:?}");
+        assert_eq!(m, vec![0, 0]);
+        let err = unique_roots(&[1.0, 2.0], f64::NAN, "max").expect_err("scipy raises");
+        assert!(
+            format!("{err:?}").contains("reduction operation maximum"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -33400,6 +33491,31 @@ mod tests {
         assert!(cheb1ord(0.2, 0.4, 40.0, 1.0).is_err()); // gpass >= gstop
         assert!(cheb1ord(-0.1, 0.4, 1.0, 40.0).is_err()); // wp <= 0
         assert!(cheb1ord(0.2, 1.5, 1.0, 40.0).is_err()); // ws >= 1
+    }
+
+    /// SciPy 1.17.1 raises ValueError ("cannot convert float NaN to integer") for a NaN gpass
+    /// or gstop in all four order selectors, e.g. `cheb1ord(0.2, 0.3, nan, 40)`; with finite
+    /// specs `cheb1ord(0.2, 0.3, 1, 40)` = (6, 0.2) and `buttord(0.2, 0.3, 1, 40)` =
+    /// (12, 0.21077527313622169). The old `gpass <= 0 || gstop <= 0 || gpass >= gstop` test let
+    /// a NaN through.
+    #[test]
+    fn order_selectors_reject_nan_losses_like_scipy() {
+        type Ord = fn(f64, f64, f64, f64) -> Result<(u32, f64), SignalError>;
+        let selectors: [(&str, Ord); 4] = [
+            ("buttord", buttord),
+            ("cheb1ord", cheb1ord),
+            ("cheb2ord", cheb2ord),
+            ("ellipord", ellipord),
+        ];
+        for (name, f) in selectors {
+            assert!(f(0.2, 0.3, f64::NAN, 40.0).is_err(), "{name} gpass nan");
+            assert!(f(0.2, 0.3, 1.0, f64::NAN).is_err(), "{name} gstop nan");
+            assert!(f(0.2, 0.3, 1.0, 40.0).is_ok(), "{name} finite");
+        }
+        assert_eq!(cheb1ord(0.2, 0.3, 1.0, 40.0).expect("finite").0, 6);
+        let (n, wn) = buttord(0.2, 0.3, 1.0, 40.0).expect("finite");
+        assert_eq!(n, 12);
+        assert!((wn - 0.21077527313622169).abs() < 1e-12, "{wn}");
     }
 
     #[test]

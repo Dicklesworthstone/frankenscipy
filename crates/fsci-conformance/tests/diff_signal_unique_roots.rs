@@ -92,6 +92,11 @@ fn generate_cases() -> Vec<UniqueRootsCase> {
         ("single", vec![3.14], 1e-3),
         ("two_close", vec![1.0, 1.0001], 1e-3),
         ("scattered", vec![0.1, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], 0.4),
+        // Unsorted inputs: SciPy groups by a ball around each first-unused root in INPUT
+        // order, so these separate that from sorting and chaining runs.
+        ("unsorted_ball", vec![2.0, 1.0, 3.0], 1.0),
+        ("unsorted_order", vec![3.0, 1.0, 2.0], 1.0),
+        ("interleaved_pairs", vec![5.0, 1.0, 5.0, 1.0], 0.1),
     ];
 
     for (label, p, tol) in inputs {
@@ -225,26 +230,24 @@ fn diff_signal_unique_roots() {
             "unique_roots",
             &case.case_id,
             oracle.roots.as_ref().zip(oracle.mult.as_ref()),
-            Some(unique_roots(&case.p, case.tol, &case.rtype)),
+            unique_roots(&case.p, case.tol, &case.rtype).ok(),
         ) else {
             continue;
         };
 
-        // Sort both sides by root value for comparison (scipy returns
-        // groups in greedy order; we return in sorted order; for unique
-        // group representatives the multiset is order-independent).
-        let mut rust_pairs: Vec<(f64, usize)> = rust_roots
+        // Compared in order: both sides return groups in order of first appearance (fsci used
+        // to return them sorted, and a sort here hid that its grouping differed on unsorted
+        // input).
+        let rust_pairs: Vec<(f64, usize)> = rust_roots
             .iter()
             .copied()
             .zip(rust_mult.iter().copied())
             .collect();
-        let mut scipy_pairs: Vec<(f64, usize)> = scipy_roots
+        let scipy_pairs: Vec<(f64, usize)> = scipy_roots
             .iter()
             .copied()
             .zip(scipy_mult.iter().copied())
             .collect();
-        rust_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        scipy_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut max_root_diff = 0.0_f64;
         let mut mult_match = rust_pairs.len() == scipy_pairs.len();
