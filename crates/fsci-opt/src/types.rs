@@ -305,6 +305,14 @@ pub enum OptError {
     NotConverged {
         detail: String,
     },
+    /// `scipy.optimize.NoConvergence`: a nonlinear solver (`broyden1`, `broyden2`,
+    /// `anderson`, `newton_krylov`, `diagbroyden`, `linearmixing`, `excitingmixing`) ran out
+    /// of iterations before its tolerance was met. SciPy raises it from those functions;
+    /// `root(method=...)` reports the same failure as a result with `success=False` instead.
+    /// Unlike SciPy's exception it does not carry the last iterate.
+    NoConvergence {
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for OptError {
@@ -317,6 +325,7 @@ impl std::fmt::Display for OptError {
             Self::EvaluationBudgetExceeded { detail } => write!(f, "{detail}"),
             Self::NotImplemented { detail } => write!(f, "{detail}"),
             Self::NotConverged { detail } => write!(f, "{detail}"),
+            Self::NoConvergence { detail } => write!(f, "{detail}"),
         }
     }
 }
@@ -335,6 +344,7 @@ impl OptError {
             Self::EvaluationBudgetExceeded { .. } => "evaluation_budget_exceeded",
             Self::NotImplemented { .. } => "not_implemented",
             Self::NotConverged { .. } => "not_converged",
+            Self::NoConvergence { .. } => "no_convergence",
         }
     }
 }

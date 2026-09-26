@@ -204,7 +204,16 @@ fn erfc_real_vec_simd(values: &[f64]) -> Vec<f64> {
     out
 }
 
+/// Under `errstate`, `|y| > 1` is SciPy's "domain error" (`erfinv`).
 pub fn erfinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = erfinv_dispatch(y, mode)?;
+    crate::sf_error_unary("erfinv", y, mode, |v| {
+        (!(-1.0..=1.0).contains(&v) && !v.is_nan()).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
+}
+
+fn erfinv_dispatch(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     // Infallible batch. `erfinv_scalar` can only return `Err` on an out-of-domain input, so
     // an array with none cannot fail, and building a `Result<f64, SpecialError>` — two
     // `&'static str` plus two enums, around 56 bytes — for every element of it is pure
@@ -258,7 +267,16 @@ pub static ERFINV_INFALLIBLE_BATCH: std::sync::atomic::AtomicBool =
 pub static ERFINV_INFALLIBLE_BATCH_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Under `errstate`, `y < 0` or `y > 2` is SciPy's "domain error" (`erfcinv`).
 pub fn erfcinv(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = erfcinv_dispatch(y, mode)?;
+    crate::sf_error_unary("erfcinv", y, mode, |v| {
+        (!(0.0..=2.0).contains(&v) && !v.is_nan()).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
+}
+
+fn erfcinv_dispatch(y: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     // The arm is read ONCE for the whole batch and passed down as a `bool`, never read per
     // element: a relaxed load inside a per-item loop is an optimisation barrier this crate
     // has already paid 13% for, and a per-element `fetch_add` costs 2 instructions more.

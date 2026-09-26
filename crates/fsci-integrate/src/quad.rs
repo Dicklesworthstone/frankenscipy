@@ -246,6 +246,10 @@ pub struct QuadInfo {
 /// 2^limit panels), refined every unconverged panel, had no extrapolation, rejected infinite
 /// bounds, and truncated [`quad_inf`]'s mapped range at `t = 1 − 1e-10` (frankenscipy-1ksfv.8).
 ///
+/// When QUADPACK stops short (`ier` 1–5) this raises SciPy's `IntegrationWarning` with
+/// SciPy's message, as `quad` without `full_output` does; [`quad_full_output`] returns the
+/// message instead.
+///
 /// # Errors
 /// NaN bounds, negative or non-finite tolerances, and QUADPACK's invalid input
 /// (`epsabs <= 0` with `epsrel < max(50·eps, 5e-29)`, SciPy's ValueError).
@@ -258,7 +262,19 @@ pub fn quad<F>(
 where
     F: Fn(f64) -> f64,
 {
-    quad_full_output(f, a, b, &[], options).map(|(result, _)| result)
+    quad_full_output(f, a, b, &[], options).map(warn_unless_converged)
+}
+
+/// SciPy's `quad` without `full_output` turns QUADPACK's `ier` 1–5 into an `IntegrationWarning`
+/// carrying the message `full_output` would have returned.
+fn warn_unless_converged((result, info): (QuadResult, QuadInfo)) -> QuadResult {
+    if info.ier != 0 {
+        fsci_runtime::warn(
+            fsci_runtime::WarningCategory::IntegrationWarning,
+            info.message,
+        );
+    }
+    result
 }
 
 /// [`quad`] with breakpoints: `scipy.integrate.quad(f, a, b, points=points)`. The points
@@ -278,7 +294,7 @@ pub fn quad_points<F>(
 where
     F: Fn(f64) -> f64,
 {
-    quad_full_output(f, a, b, points, options).map(|(result, _)| result)
+    quad_full_output(f, a, b, points, options).map(warn_unless_converged)
 }
 
 /// [`quad`] / [`quad_points`] with SciPy's `full_output=1` diagnostics.
@@ -3922,7 +3938,8 @@ pub fn quad_explain<F>(f: F, a: f64, b: f64, options: QuadOptions) -> (QuadResul
 where
     F: Fn(f64) -> f64,
 {
-    let result = quad(&f, a, b, options);
+    // `full_output` returns the message rather than warning it.
+    let result = quad_full_output(&f, a, b, &[], options).map(|(result, _)| result);
     match result {
         Ok(r) => {
             let msg = if r.converged {
@@ -5646,6 +5663,50 @@ mod tests {
             err,
             IntegrateValidationError::QuadInvalidTolerance { .. }
         ));
+    }
+
+    #[test]
+    fn quad_warns_integration_warning_where_scipy_does() {
+        // SciPy: quad(lambda x: sin(1/x) if x else 0, 0, 1, limit=5) warns IntegrationWarning
+        // ("The maximum number of subdivisions (5) has been achieved. ...") and returns
+        // 0.5057893582392152; with full_output=1 the message is returned, not warned.
+        let f = |x: f64| if x == 0.0 { 0.0 } else { (1.0 / x).sin() };
+        let options = QuadOptions {
+            limit: 5,
+            ..QuadOptions::default()
+        };
+        let (r, warnings) = fsci_runtime::catch_warnings(|| quad(f, 0.0, 1.0, options));
+        let r = r.expect("quad");
+        assert!(!r.converged);
+        assert!(
+            (r.integral - 0.505_789_358_239_215_2).abs() < 1e-12,
+            "{}",
+            r.integral
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(
+            warnings[0].category,
+            fsci_runtime::WarningCategory::IntegrationWarning
+        );
+        assert!(
+            warnings[0]
+                .message
+                .starts_with("The maximum number of subdivisions (5) has been achieved."),
+            "{}",
+            warnings[0].message
+        );
+
+        let (full, warnings) =
+            fsci_runtime::catch_warnings(|| quad_full_output(f, 0.0, 1.0, &[], options));
+        assert_eq!(full.expect("full output").1.ier, 1);
+        assert!(
+            warnings.is_empty(),
+            "full_output must not warn: {warnings:?}"
+        );
+
+        let (_, warnings) =
+            fsci_runtime::catch_warnings(|| quad(|x| x * x, 0.0, 1.0, QuadOptions::default()));
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

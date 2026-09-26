@@ -1057,9 +1057,10 @@ pub fn lb_to_kg(lb: f64) -> f64 {
     lb * POUND
 }
 
-/// Warning emitted for obsolete or precision issues with constants, matching `scipy.constants.ConstantWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConstantWarning(pub String);
+// `scipy.constants.ConstantWarning` is not applicable: SciPy raises it when `value`/`unit`/
+// `precision` are asked for an obsolete CODATA key, and this table carries only current
+// keys. A struct of that name that nothing raised used to be counted as covered
+// (frankenscipy-8dndw.1).
 
 #[cfg(test)]
 mod tests {

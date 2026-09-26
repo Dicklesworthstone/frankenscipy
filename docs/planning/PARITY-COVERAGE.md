@@ -58,18 +58,20 @@ covered. Spot checks did not find such a case, but the census cannot rule it out
 
 ## The residual, itemised
 
-**Residual count: not 0.** The 2026-09-15 census counted all 1,300 callable symbols as mapped, but 25 of those names were no-op stand-ins (frankenscipy-8dndw.1). Nine have been removed as not applicable or missing (the BLAS/LAPACK introspection functions, the FFT backend hooks, `show_options`, `make_distribution`); the rest are listed with their real status below. A declared / real / compared recount is frankenscipy-8dndw.2.
+**Residual count: not 0.** The 2026-09-15 census counted all 1,300 callable symbols as mapped, but 25 of those names were no-op stand-ins (frankenscipy-8dndw.1). Every one is now either implemented or recorded below as not applicable (N/A) or missing, and N/A and missing names must not be counted as covered: the BLAS/LAPACK introspection functions, the FFT backend hooks, `show_options`, `make_distribution`, `ConstantWarning`, `SparseWarning`, `SparseEfficiencyWarning` and `ODEintWarning` (thirteen names). A declared / real / compared recount is frankenscipy-8dndw.2.
 
 ### Previously unmapped categories (now fully wired)
 
 | Category | Symbols | Status |
 |---|---|---|
-| Warning/exception types | `ConstantWarning`, `SparseWarning`, `SparseEfficiencyWarning`, `OptimizeWarning`, `NoConvergence`, `IntegrationWarning`, `ODEintWarning`, `BadCoefficients`, `SpecialFunctionError`, `SpecialFunctionWarning`, `ConstantInputWarning`, `DegenerateDataWarning`, `NearConstantInputWarning` | Names exist; none is emitted anywhere yet (frankenscipy-8dndw.1) |
+| Warning classes | `ConstantInputWarning`, `NearConstantInputWarning`, `DegenerateDataWarning`, `OptimizeWarning`, `IntegrationWarning`, `BadCoefficients`, `SpecialFunctionWarning` | Complete: `fsci_runtime::WarningCategory` variants, raised where SciPy raises them (`pearsonr`/`spearmanr`/`pointbiserialr`, `bootstrap`, `curve_fit`, `quad`, `normalize` and the transforms built on it, `errstate` "warn") and recorded by `catch_warnings`; compared live in `diff_scipy_warnings_errstate` |
+| Exceptions | `NoConvergence`, `SpecialFunctionError` | Complete: `OptError::NoConvergence` from `broyden1`/`broyden2`/`anderson`/`newton_krylov`/`diagbroyden`/`linearmixing`/`excitingmixing`; `SpecialErrorKind::Errstate` under `errstate` "raise" |
+| Warning classes, not applicable | `ConstantWarning`, `SparseWarning`, `SparseEfficiencyWarning`, `ODEintWarning` | N/A: no obsolete CODATA keys; no CSR/CSC element insertion or format-converting solver inputs; `odeint` returns an error where SciPy warns and returns unfinished rows. The no-op structs were removed |
 | Plotting representations | `convex_hull_plot_2d`, `delaunay_plot_2d`, `voronoi_plot_2d` | Complete |
 | BLAS/LAPACK introspection | `get_blas_funcs`, `get_lapack_funcs`, `find_best_blas_type` | N/A: no BLAS/LAPACK underneath; the fabricated-string no-ops were removed |
 | Backend configuration | `set_backend`, `set_global_backend`, `register_backend`, `skip_backend` | N/A: one native backend, no uarray protocol; the no-ops were removed |
-| Error-state guards | `errstate`, `geterr`, `seterr` | No-ops: no special function reads the state yet (frankenscipy-8dndw.1) |
-| Solver types and aliases | `RK23`, `RK45`, `DOP853`, `Radau`, `BDF`, `OdeSolver`, `DenseOutput`, `ode` | Complete; `LSODA` is still an empty type (frankenscipy-8dndw.1) |
+| Error-state guards | `errstate`, `geterr`, `seterr` | Partial: per-thread state as in SciPy, honoured by 18 functions at SciPy's explicit `sf_error` conditions (`gamma`, `gammaln`, `digamma`/`psi`, `loggamma`, `ndtri`, `erfinv`, `erfcinv`, `y0`, `y1`, `yn`, `k0`, `k1`, `ellipk`, `ellipkm1`, `spence`, `gammainc`, `gammaincc`). SciPy's reports that come from floating-point exception flags inside its C kernels (NaN in, subnormal in, intermediate overflow) are not reproduced, and the other special functions do not consult the state |
+| Solver types and aliases | `RK23`, `RK45`, `DOP853`, `Radau`, `BDF`, `LSODA`, `OdeSolver`, `DenseOutput`, `ode` | Complete as step-by-step solver objects; `LSODA` is the RK45-then-BDF stepper `solve_ivp(method="LSODA")` runs, not ODEPACK (frankenscipy-1ksfv.9) |
 | Interactive/CLI helpers | `linprog_verbose_callback` | Complete; `show_options` N/A (interactive doc printer) and removed |
 | Multivariate/random generators | `ortho_group`, `special_ortho_group`, `unitary_group`, `uniform_direction`, `random_correlation`, `random_table` | Complete |
 

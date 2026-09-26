@@ -45,13 +45,11 @@ pub use io::{
     save_npz_to_writer,
 };
 
-/// Base warning class for sparse matrix operations, matching `scipy.sparse.SparseWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SparseWarning(pub String);
-
-/// Warning emitted for potentially inefficient sparse operations, matching `scipy.sparse.SparseEfficiencyWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SparseEfficiencyWarning(pub String);
+// `scipy.sparse.SparseWarning` and `SparseEfficiencyWarning` are not applicable: SciPy raises
+// the latter when a CSR/CSC structure is changed element by element or a solver is handed a
+// format it must convert, and the typed API here has no CSR/CSC element insertion and takes
+// solver inputs in the format they need. Structs of those names that nothing raised used to
+// be counted as covered (frankenscipy-8dndw.1).
 
 // SciPy-compatible lowercase type aliases (e.g. `csr_matrix` mirrors
 // `scipy.sparse.csr_matrix`). The names are intentionally non-CamelCase for API

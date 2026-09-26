@@ -538,7 +538,26 @@ enum LsodaMode {
     Bdf(BdfSolver),
 }
 
-struct LsodaSolver {
+/// Configuration for constructing an [`LsodaSolver`].
+pub struct LsodaSolverConfig<'a> {
+    pub t0: f64,
+    pub y0: &'a [f64],
+    pub t_bound: f64,
+    pub rtol: f64,
+    pub atol: ToleranceValue,
+    pub max_step: f64,
+    pub first_step: Option<f64>,
+    pub mode: RuntimeMode,
+}
+
+/// The stepper behind `solve_ivp(method="LSODA")` and `odeint`, as a step-by-step solver
+/// object like [`RkSolver`] and [`BdfSolver`] (`scipy.integrate.LSODA`).
+///
+/// It is NOT ODEPACK's LSODA: it starts with RK45 and switches once, for good, to BDF when a
+/// stiffness estimate from consecutive steps crosses a threshold or RK45 cannot take a step.
+/// ODEPACK switches both ways between Adams and BDF families of varying order, so step
+/// counts and step sequences differ from SciPy's (frankenscipy-1ksfv.9).
+pub struct LsodaSolver {
     mode: LsodaMode,
     t_bound: f64,
     rtol: f64,
@@ -551,33 +570,68 @@ struct LsodaSolver {
 }
 
 impl LsodaSolver {
-    fn new<F>(fun: &mut F, options: &SolveIvpOptions<'_>) -> Result<Self, IntegrateValidationError>
+    /// Create the solver at `(t0, y0)`, starting in its RK45 phase.
+    ///
+    /// # Errors
+    /// The same tolerance, step and state validation as [`RkSolver::new`].
+    pub fn new<F>(
+        fun: &mut F,
+        config: LsodaSolverConfig<'_>,
+    ) -> Result<Self, IntegrateValidationError>
     where
         F: FnMut(f64, &[f64]) -> Vec<f64>,
     {
-        let config = RkSolverConfig {
-            t0: options.t_span.0,
-            y0: options.y0,
-            t_bound: options.t_span.1,
-            rtol: options.rtol,
-            atol: options.atol.clone(),
-            max_step: options.max_step,
-            first_step: options.first_step,
-            mode: options.mode,
+        let rk_config = RkSolverConfig {
+            t0: config.t0,
+            y0: config.y0,
+            t_bound: config.t_bound,
+            rtol: config.rtol,
+            atol: config.atol.clone(),
+            max_step: config.max_step,
+            first_step: config.first_step,
+            mode: config.mode,
             tableau: &RK45_TABLEAU,
         };
-        let solver = RkSolver::new(fun, config)?;
+        let solver = RkSolver::new(fun, rk_config)?;
         Ok(Self {
             mode: LsodaMode::Adams(solver),
-            t_bound: options.t_span.1,
-            rtol: options.rtol,
-            atol: options.atol.clone(),
-            max_step: options.max_step,
-            first_step: options.first_step,
-            runtime_mode: options.mode,
+            t_bound: config.t_bound,
+            rtol: config.rtol,
+            atol: config.atol,
+            max_step: config.max_step,
+            first_step: config.first_step,
+            runtime_mode: config.mode,
             pending_bdf_switch: false,
             nfev_offset: 0,
         })
+    }
+
+    fn from_options<F>(
+        fun: &mut F,
+        options: &SolveIvpOptions<'_>,
+    ) -> Result<Self, IntegrateValidationError>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
+        Self::new(
+            fun,
+            LsodaSolverConfig {
+                t0: options.t_span.0,
+                y0: options.y0,
+                t_bound: options.t_span.1,
+                rtol: options.rtol,
+                atol: options.atol.clone(),
+                max_step: options.max_step,
+                first_step: options.first_step,
+                mode: options.mode,
+            },
+        )
+    }
+
+    /// Whether the solver has switched to its BDF phase.
+    #[must_use]
+    pub fn is_stiff_phase(&self) -> bool {
+        matches!(self.mode, LsodaMode::Bdf(_))
     }
 
     fn should_switch_to_bdf(rk: &RkSolver, t_bound: f64) -> bool {
@@ -647,11 +701,15 @@ impl LsodaSolver {
     }
 }
 
-impl<F> IvpSolver<F> for LsodaSolver
-where
-    F: FnMut(f64, &[f64]) -> Vec<f64>,
-{
-    fn step_with(&mut self, fun: &mut F) -> Result<StepOutcome, crate::solver::StepFailure> {
+impl LsodaSolver {
+    /// Advance one step (switching to BDF first if the previous step flagged stiffness).
+    ///
+    /// # Errors
+    /// The step failures of the active RK45 or BDF phase.
+    pub fn step_with<F>(&mut self, fun: &mut F) -> Result<StepOutcome, crate::solver::StepFailure>
+    where
+        F: FnMut(f64, &[f64]) -> Vec<f64>,
+    {
         if self.pending_bdf_switch {
             let preferred_first_step = match &self.mode {
                 LsodaMode::Adams(rk) => rk.t_old().map(|t_old| (rk.t() - t_old).abs()),
@@ -689,14 +747,16 @@ where
         }
     }
 
-    fn t(&self) -> f64 {
+    #[must_use]
+    pub fn t(&self) -> f64 {
         match &self.mode {
             LsodaMode::Adams(rk) => rk.t(),
             LsodaMode::Bdf(bdf) => bdf.t(),
         }
     }
 
-    fn y(&self) -> &[f64] {
+    #[must_use]
+    pub fn y(&self) -> &[f64] {
         match &self.mode {
             LsodaMode::Adams(rk) => rk.y(),
             LsodaMode::Bdf(bdf) => bdf.y(),
@@ -710,7 +770,8 @@ where
         }
     }
 
-    fn t_old(&self) -> Option<f64> {
+    #[must_use]
+    pub fn t_old(&self) -> Option<f64> {
         match &self.mode {
             LsodaMode::Adams(rk) => rk.t_old(),
             LsodaMode::Bdf(bdf) => bdf.t_old(),
@@ -731,7 +792,9 @@ where
         }
     }
 
-    fn nfev(&self) -> usize {
+    /// Right-hand-side evaluations over both phases.
+    #[must_use]
+    pub fn nfev(&self) -> usize {
         self.nfev_offset
             + match &self.mode {
                 LsodaMode::Adams(rk) => rk.nfev(),
@@ -739,39 +802,86 @@ where
             }
     }
 
-    fn njev(&self) -> usize {
+    #[must_use]
+    pub fn njev(&self) -> usize {
         match &self.mode {
             LsodaMode::Adams(_) => 0,
             LsodaMode::Bdf(bdf) => bdf.njev(),
         }
     }
 
-    fn nlu(&self) -> usize {
+    #[must_use]
+    pub fn nlu(&self) -> usize {
         match &self.mode {
             LsodaMode::Adams(_) => 0,
             LsodaMode::Bdf(bdf) => bdf.nlu(),
         }
     }
 
-    fn ivp_state(&self) -> OdeSolverState {
+    #[must_use]
+    pub fn state(&self) -> OdeSolverState {
         match &self.mode {
             LsodaMode::Adams(rk) => rk.state(),
             LsodaMode::Bdf(bdf) => bdf.state(),
         }
     }
 
+    /// The last step's interpolant at `t` (SciPy's `solver.dense_output()(t)`): RK45's in the
+    /// first phase, BDF's after the switch.
+    #[must_use]
+    pub fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
+        match &self.mode {
+            LsodaMode::Adams(rk) => rk.dense_output_at(t),
+            LsodaMode::Bdf(bdf) => bdf.dense_output_at(t),
+        }
+    }
+}
+
+impl<F> IvpSolver<F> for LsodaSolver
+where
+    F: FnMut(f64, &[f64]) -> Vec<f64>,
+{
+    fn step_with(&mut self, fun: &mut F) -> Result<StepOutcome, crate::solver::StepFailure> {
+        self.step_with(fun)
+    }
+    fn t(&self) -> f64 {
+        self.t()
+    }
+    fn y(&self) -> &[f64] {
+        self.y()
+    }
+    fn f(&self) -> Option<&[f64]> {
+        self.f()
+    }
+    fn t_old(&self) -> Option<f64> {
+        self.t_old()
+    }
+    fn y_old(&self) -> Option<&[f64]> {
+        self.y_old()
+    }
+    fn f_old(&self) -> Option<&[f64]> {
+        self.f_old()
+    }
+    fn nfev(&self) -> usize {
+        self.nfev()
+    }
+    fn njev(&self) -> usize {
+        self.njev()
+    }
+    fn nlu(&self) -> usize {
+        self.nlu()
+    }
+    fn ivp_state(&self) -> OdeSolverState {
+        self.state()
+    }
     fn prepare_dense_output(&mut self, fun: &mut F) -> Result<(), crate::solver::StepFailure> {
         match &mut self.mode {
             LsodaMode::Adams(rk) => rk.prepare_dense_output(fun),
             LsodaMode::Bdf(_) => Ok(()),
         }
     }
-
     fn dense_output_at(&self, t: f64) -> Option<Vec<f64>> {
-        match &self.mode {
-            LsodaMode::Adams(rk) => rk.dense_output_at(t),
-            LsodaMode::Bdf(bdf) => bdf.dense_output_at(t),
-        }
+        self.dense_output_at(t)
     }
 }
 
@@ -1312,7 +1422,7 @@ where
             solve_ivp_core(fun, solver, &resolved_options)
         }
         SolverKind::Lsoda => {
-            let solver = LsodaSolver::new(fun, &resolved_options)?;
+            let solver = LsodaSolver::from_options(fun, &resolved_options)?;
             solve_ivp_core(fun, solver, &resolved_options)
         }
     }
@@ -2276,7 +2386,7 @@ mod tests {
             ..SolveIvpOptions::default()
         };
         let mut fun = |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())];
-        let mut solver = LsodaSolver::new(&mut fun, &options).expect("LSODA init");
+        let mut solver = LsodaSolver::from_options(&mut fun, &options).expect("LSODA init");
 
         let mut switched = false;
         for _ in 0..2000 {
@@ -2304,6 +2414,63 @@ mod tests {
             final_y,
             expected
         );
+    }
+
+    /// `scipy.integrate.LSODA` used to be an empty unit struct (frankenscipy-8dndw.1). The
+    /// public handle must drive exactly the stepper `solve_ivp(method="LSODA")` runs.
+    #[test]
+    fn public_lsoda_handle_steps_like_solve_ivp() {
+        let mut fun = |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())];
+        let mut solver = crate::LSODA::new(
+            &mut fun,
+            LsodaSolverConfig {
+                t0: 0.0,
+                y0: &[1.0],
+                t_bound: 0.1,
+                rtol: 1e-4,
+                atol: ToleranceValue::Scalar(1e-6),
+                max_step: f64::INFINITY,
+                first_step: Some(1e-6),
+                mode: RuntimeMode::Strict,
+            },
+        )
+        .expect("LSODA init");
+        let mut ts = vec![solver.t()];
+        while solver.state() == OdeSolverState::Running {
+            solver.step_with(&mut fun).expect("LSODA step");
+            ts.push(solver.t());
+            let t_old = solver.t_old().expect("a step was taken");
+            let midpoint = solver
+                .dense_output_at(0.5 * (t_old + solver.t()))
+                .expect("dense output inside the last step");
+            assert!(midpoint[0].is_finite());
+        }
+        assert!(
+            solver.is_stiff_phase(),
+            "stiff problem must reach the BDF phase"
+        );
+        assert_eq!(solver.state(), OdeSolverState::Finished);
+
+        let options = SolveIvpOptions {
+            t_span: (0.0, 0.1),
+            y0: &[1.0],
+            method: SolverKind::Lsoda,
+            rtol: 1e-4,
+            atol: ToleranceValue::Scalar(1e-6),
+            first_step: Some(1e-6),
+            ..SolveIvpOptions::default()
+        };
+        let mut fun2 = |t: f64, y: &[f64]| vec![-1000.0 * (y[0] - t.cos())];
+        let reference = solve_ivp(&mut fun2, &options).expect("solve_ivp LSODA");
+        assert_eq!(
+            ts, reference.t,
+            "the handle and solve_ivp took different steps"
+        );
+        assert_eq!(
+            solver.y()[0].to_bits(),
+            reference.y.last().expect("final state")[0].to_bits()
+        );
+        assert_eq!(solver.nfev(), reference.nfev);
     }
 
     #[test]

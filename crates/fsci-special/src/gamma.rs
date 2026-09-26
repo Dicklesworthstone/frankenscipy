@@ -152,8 +152,11 @@ const LANCZOS_COEFFS: [f64; 9] = [
     0.000_000_150_563_273_514_931_16,
 ];
 
+/// Under `errstate`, a negative-integer pole is SciPy's "singularity" (`Gamma`).
 pub fn gamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    gamma_dispatch("gamma", z, mode)
+    let value = gamma_dispatch("gamma", z, mode)?;
+    crate::sf_error_unary("Gamma", z, mode, crate::sf_negative_integer_pole)?;
+    Ok(value)
 }
 
 /// Audit-emitting variant of [`gamma`]. Every error it returns, in either mode, records one
@@ -180,8 +183,11 @@ pub fn gamma_with_audit(
     result
 }
 
+/// Under `errstate`, a non-positive integer is SciPy's "singularity" (`lgam`).
 pub fn gammaln(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    gammaln_dispatch("gammaln", x, mode)
+    let value = gammaln_dispatch("gammaln", x, mode)?;
+    crate::sf_error_unary("lgam", x, mode, crate::sf_nonpositive_integer_pole)?;
+    Ok(value)
 }
 
 pub fn gammasgn(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
@@ -194,8 +200,14 @@ pub fn gammasgn(x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     )
 }
 
+/// Under `errstate`, a real zero is SciPy's "singularity" (`lgam`); the real negative axis
+/// returns NaN without an error, as in SciPy.
 pub fn loggamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    loggamma_dispatch("loggamma", z, mode)
+    let value = loggamma_dispatch("loggamma", z, mode)?;
+    crate::sf_error_unary("lgam", z, mode, |x| {
+        (x == 0.0).then_some(crate::SpecialErrorCode::Singular)
+    })?;
+    Ok(value)
 }
 
 /// Evaluate `f(0..n)` into a `Vec<T>`, parallel over index chunks for large `n`.
@@ -728,12 +740,18 @@ fn loggamma_dispatch(
     }
 }
 
+/// Under `errstate`, a non-positive integer is SciPy's "singularity" (`psi`).
 pub fn digamma(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    digamma_dispatch("digamma", z, mode)
+    let value = digamma_dispatch("digamma", z, mode)?;
+    crate::sf_error_unary("psi", z, mode, crate::sf_nonpositive_integer_pole)?;
+    Ok(value)
 }
 
+/// [`digamma`] under SciPy's other name.
 pub fn psi(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    digamma_dispatch("psi", z, mode)
+    let value = digamma_dispatch("psi", z, mode)?;
+    crate::sf_error_unary("psi", z, mode, crate::sf_nonpositive_integer_pole)?;
+    Ok(value)
 }
 
 fn digamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
@@ -794,12 +812,23 @@ fn digamma_dispatch(function: &'static str, z: &SpecialTensor, mode: RuntimeMode
     }
 }
 
-pub fn gammainc(a: &SpecialTensor, x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    gammainc_dispatch("gammainc", a, x, mode, true)
+/// SciPy's `gammainc`/`gammaincc` domain test: a negative `a` or `x`.
+fn sf_incomplete_gamma_domain(a: f64, x: f64) -> Option<crate::SpecialErrorCode> {
+    (a < 0.0 || x < 0.0).then_some(crate::SpecialErrorCode::Domain)
 }
 
+/// Under `errstate`, a negative `a` or `x` is SciPy's "domain error".
+pub fn gammainc(a: &SpecialTensor, x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = gammainc_dispatch("gammainc", a, x, mode, true)?;
+    crate::sf_error_binary("gammainc", a, x, mode, sf_incomplete_gamma_domain)?;
+    Ok(value)
+}
+
+/// Under `errstate`, a negative `a` or `x` is SciPy's "domain error".
 pub fn gammaincc(a: &SpecialTensor, x: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    gammainc_dispatch("gammaincc", a, x, mode, false)
+    let value = gammainc_dispatch("gammaincc", a, x, mode, false)?;
+    crate::sf_error_binary("gammaincc", a, x, mode, sf_incomplete_gamma_domain)?;
+    Ok(value)
 }
 
 fn gammainc_dispatch(

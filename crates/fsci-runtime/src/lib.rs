@@ -13,6 +13,7 @@
 //! | `policy`    | [`PolicyController`], loss matrices, risk-state model      |
 //! | `scipy_incumbent` | [`ScipyIncumbent`]: the one live-SciPy oracle resolver |
 //! | `booking_claim` | [`BookingClaim`]: verifies the fleet measurement booking a timed row cites |
+//! | `warnings`  | SciPy's warning classes, [`warn`] and [`catch_warnings`]    |
 
 pub mod booking_claim;
 mod calibrated_losses;
@@ -23,6 +24,7 @@ pub mod policy;
 pub mod scipy_incumbent;
 pub mod signals;
 pub mod supervision;
+pub mod warnings;
 
 // ── Re-exports: preserve the flat public API ────────────────────────
 pub use booking_claim::{BookingClaim, ClaimRejection, FleetBooking};
@@ -36,6 +38,7 @@ pub use mode::{HARDENED_MAX_DIM, RuntimeMode};
 pub use policy::{PolicyAction, PolicyController, PolicyDecision, RiskState, decision_loss_matrix};
 pub use signals::{DecisionSignals, SignalSequence};
 pub use supervision::{PolicySupervisor, SupervisionConfig, SupervisionEvent, SupervisionStatus};
+pub use warnings::{Warning, WarningCategory, catch_warnings, warn};
 
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
