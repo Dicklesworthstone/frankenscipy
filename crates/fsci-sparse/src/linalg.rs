@@ -12395,13 +12395,20 @@ pub fn sparse_norm(a: &CsrMatrix, kind: &str) -> SparseResult<f64> {
                 return Ok(0.0);
             }
             let result = svds(a, 1, EigsOptions::default())?;
-            result
-                .singular_values
-                .first()
-                .copied()
-                .ok_or_else(|| SparseError::InvalidArgument {
+            let sigma = result.singular_values.first().copied().ok_or_else(|| {
+                SparseError::InvalidArgument {
                     message: "spectral norm: svds returned no singular value".to_string(),
-                })
+                }
+            })?;
+            // A NaN or an infinity in A (or an AᵀA that overflows) leaves the Krylov basis
+            // NaN. SciPy's ARPACK raises there ("ARPACK error -9999: Could not build an
+            // Arnoldi factorization"); this used to return Ok(0.0).
+            if !sigma.is_finite() {
+                return Err(SparseError::NonFiniteInput {
+                    message: "spectral norm: svds produced a non-finite singular value".to_string(),
+                });
+            }
+            Ok(sigma)
         }
         // SciPy raises `ValueError: Invalid norm order for matrices.` and so
         // does this now. The two predecessors of this arm are why the signature
@@ -27700,6 +27707,56 @@ mod tests {
         assert_eq!(sparse_norm(&zero, "2").expect("ord 2"), 0.0);
     }
 
+    /// A NaN anywhere in A makes every Krylov vector of AᵀA NaN. Live scipy 1.17.1 on
+    /// [[4,1,0],[1,3,1],[0,1,2]] with A[2,2] = NaN, and again with A[0,1] = NaN: both
+    /// `norm(A, 2)` and `svds(A, k=1)` raise `ArpackError: ARPACK error -9999: Could not
+    /// build an Arnoldi factorization`. On the finite matrix `norm(A, 2)` is
+    /// 4.732050807568877 = 3 + √3. fsci used to fold the NaN eigenvalue of AᵀA through
+    /// `f64::max(0.0)` into σ = 0 and return Ok(0.0) as the spectral norm.
+    #[test]
+    fn sparse_norm_spectral_refuses_a_nan_matrix_like_scipy() {
+        let matrix = |corrupt: Option<usize>| {
+            let mut data = vec![4.0, 1.0, 1.0, 3.0, 1.0, 1.0, 2.0];
+            if let Some(slot) = corrupt {
+                data[slot] = f64::NAN;
+            }
+            CooMatrix::from_triplets(
+                Shape2D::new(3, 3),
+                data,
+                vec![0, 0, 1, 1, 1, 2, 2],
+                vec![0, 1, 0, 1, 2, 1, 2],
+                false,
+            )
+            .expect("coo")
+            .to_csr()
+            .expect("csr")
+        };
+        // Slot 6 is A[2,2], slot 1 is A[0,1].
+        for slot in [6, 1] {
+            let a = matrix(Some(slot));
+            let norm = sparse_norm(&a, "2");
+            assert!(
+                matches!(norm, Err(SparseError::NonFiniteInput { .. })),
+                "slot {slot}: SciPy raises; fsci returned {norm:?}"
+            );
+            // svds keeps its flag convention (converged = false where SciPy raises), and
+            // the singular value it reports is NaN, not a fabricated 0.
+            let svd = svds(&a, 1, EigsOptions::default()).expect("svds");
+            assert!(!svd.converged, "slot {slot}: {svd:?}");
+            assert!(
+                svd.singular_values.first().is_some_and(|s| s.is_nan()),
+                "slot {slot}: {:?}",
+                svd.singular_values
+            );
+        }
+        // MUST-NOT-CHANGE: the finite matrix still has its spectral norm.
+        let finite = sparse_norm(&matrix(None), "2").expect("finite matrix");
+        assert!(
+            (finite - (3.0 + 3.0_f64.sqrt())).abs() < 1e-9,
+            "spectral norm {finite} vs scipy 4.732050807568877"
+        );
+    }
+
     /// Graph Laplacian conventions, pinned to live scipy 1.17.1
     /// (`scripts/scipy_laplacian_probe.py`). Both modes, and the edge case that
     /// separates a correct normalized Laplacian from a plausible one.
@@ -32176,8 +32233,14 @@ pub fn svds(a: &CsrMatrix, k: usize, options: EigsOptions) -> SparseResult<SvdsR
         .fold(0.0f64, |acc, &e| acc.max(e.max(0.0).sqrt()));
 
     for (eigenvalue, v) in eig.eigenvalues.iter().zip(eig.eigenvectors.iter()) {
-        // Eigenvalues of AᵀA are non-negative; clamp tiny negatives from rounding.
-        let sigma = eigenvalue.max(0.0).sqrt();
+        // Eigenvalues of AᵀA are non-negative; clamp tiny negatives from rounding. A NaN
+        // eigenvalue stays NaN: `f64::max` would drop it and report σ = 0 for a matrix
+        // holding a NaN, where SciPy's ARPACK raises.
+        let sigma = if eigenvalue.is_nan() {
+            f64::NAN
+        } else {
+            eigenvalue.max(0.0).sqrt()
+        };
         singular_values.push(sigma);
         v_vecs.push(v.clone());
 

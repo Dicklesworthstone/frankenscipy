@@ -15687,7 +15687,10 @@ pub fn wiener(data: &[f64], mysize: usize, noise: Option<f64>) -> Result<Vec<f64
         let sumsq = cumsq[hi] - cumsq[lo];
         let mean = sum / window_area;
         local_mean[i] = mean;
-        local_var[i] = (sumsq / window_area - mean * mean).max(0.0);
+        // Clamp cancellation's tiny negatives, but keep a NaN (squares that overflow to inf):
+        // SciPy's lVar is NaN there, and `max(0.0)` would read it as a zero-variance window.
+        let var = sumsq / window_area - mean * mean;
+        local_var[i] = if var.is_nan() { f64::NAN } else { var.max(0.0) };
     }
 
     let noise_power =
@@ -16656,10 +16659,18 @@ fn overlap_add_binsums(
 pub fn check_COLA(window: &[f64], nperseg: usize, noverlap: usize) -> Result<bool, SignalError> {
     let binsums = overlap_add_binsums(window, nperseg, noverlap, |w| w)?;
     let median = median_of(&binsums);
+    // NaN-propagating like SciPy's `np.max(np.abs(deviation))`: bins that overflow to inf make
+    // `inf - inf` deviations, and `f64::max` would drop them and report COLA.
     let max_dev = binsums
         .iter()
         .map(|&b| (b - median).abs())
-        .fold(0.0_f64, f64::max);
+        .fold(0.0_f64, |m, d| {
+            if m.is_nan() || d.is_nan() {
+                f64::NAN
+            } else {
+                m.max(d)
+            }
+        });
     Ok(max_dev < 1e-10)
 }
 
@@ -21903,6 +21914,27 @@ mod tests {
                 detail: "COLA/NOLA window samples must be finite".to_string(),
             })
         );
+    }
+
+    /// A finite window whose overlap-add overflows: the bin sums are inf, the median is inf, and
+    /// every deviation is `inf - inf = NaN`. SciPy 1.17.1 computes `np.max(np.abs(deviation)) <
+    /// tol` with a NaN maximum and returns False for `check_COLA([1e308, 1e308], 2, 1)`,
+    /// `([1e308] * 3, 3, 2)` and `([1e308] * 4, 4, 2)`; it returns True for `([1.0, 1.0], 2, 1)`.
+    /// fsci's `f64::max` fold dropped the NaN deviations, read a maximum of 0 and reported COLA.
+    #[test]
+    fn check_cola_overflowing_window_is_not_cola_like_scipy() {
+        for (window, nperseg, noverlap) in [
+            (vec![1e308; 2], 2, 1),
+            (vec![1e308; 3], 3, 2),
+            (vec![1e308; 4], 4, 2),
+        ] {
+            assert_eq!(
+                check_COLA(&window, nperseg, noverlap),
+                Ok(false),
+                "SciPy returns False for {window:?}, nperseg={nperseg}, noverlap={noverlap}"
+            );
+        }
+        assert_eq!(check_COLA(&[1.0, 1.0], 2, 1), Ok(true));
     }
 
     #[test]
@@ -29235,6 +29267,27 @@ mod tests {
                 detail: "wiener input samples must be finite".to_string(),
             })
         );
+    }
+
+    /// Finite samples whose squares overflow make the local variance NaN. SciPy 1.17.1's
+    /// `wiener([1e200, 1, 2, 3, 4, 5], 3)` is all NaN: the NaN lVar makes the estimated noise
+    /// NaN, which poisons every output. fsci's `.max(0.0)` clamp read each NaN variance as 0,
+    /// estimated zero noise and returned the local means `[3.3e199, 3.3e199, 0, 0, 0, 0]`.
+    /// `wiener([1, 2, 3, 4, 5], 3)` is `[1, 2, 3, 4, 4.37142857]` in SciPy and stays so here.
+    #[test]
+    fn wiener_overflowing_variance_is_nan_like_scipy() {
+        let filtered = wiener(&[1e200, 1.0, 2.0, 3.0, 4.0, 5.0], 3, None)
+            .expect("finite samples are accepted");
+        assert!(
+            filtered.iter().all(|v| v.is_nan()),
+            "SciPy returns all NaN; fsci returned {filtered:?}"
+        );
+        let finite = wiener(&[1.0, 2.0, 3.0, 4.0, 5.0], 3, None).expect("finite samples");
+        let scipy = [1.0, 2.0, 3.0, 4.0, 4.371_428_571_428_572];
+        assert_eq!(finite.len(), scipy.len());
+        for (got, want) in finite.iter().zip(scipy) {
+            assert!((got - want).abs() < 1e-12, "{finite:?} vs SciPy {scipy:?}");
+        }
     }
 
     // ── get_window tests ───────────────────────────────────────────

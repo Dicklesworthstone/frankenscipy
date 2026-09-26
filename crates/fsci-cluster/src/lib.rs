@@ -5617,6 +5617,14 @@ fn collect_depths(z: &[[f64; 4]], node: usize, n: usize, depth: usize, dists: &m
     }
 }
 
+/// SciPy's `_hierarchy` subtree maximum, `max(acc, child)` in Cython: `acc` is kept
+/// unless `child > acc`. So a NaN in a node's own value makes that node's entry NaN,
+/// while a NaN child is skipped. `f64::max` would instead drop a NaN `acc` and report
+/// the children's maximum.
+fn subtree_max(acc: f64, child: f64) -> f64 {
+    if child > acc { child } else { acc }
+}
+
 /// Maximum linkage distance within each non-singleton cluster's subtree.
 ///
 /// Matches `scipy.cluster.hierarchy.maxdists`. `MD[i]` is the largest link
@@ -5634,10 +5642,10 @@ pub fn maxdists(z: &[[f64; 4]]) -> Vec<f64> {
         let c1 = row[0] as usize;
         let c2 = row[1] as usize;
         if c1 >= n {
-            m = m.max(md[c1 - n]);
+            m = subtree_max(m, md[c1 - n]);
         }
         if c2 >= n {
-            m = m.max(md[c2 - n]);
+            m = subtree_max(m, md[c2 - n]);
         }
         md[i] = m;
     }
@@ -5753,10 +5761,10 @@ pub fn max_rstat(z: &[[f64; 4]], r: &[[f64; 4]], i: usize) -> Result<Vec<f64>, C
         let c1 = row[0] as usize;
         let c2 = row[1] as usize;
         if c1 >= n {
-            m = m.max(out[c1 - n]);
+            m = subtree_max(m, out[c1 - n]);
         }
         if c2 >= n {
-            m = m.max(out[c2 - n]);
+            m = subtree_max(m, out[c2 - n]);
         }
         out[j] = m;
     }
@@ -12042,6 +12050,80 @@ mod tests {
         assert_eq!(m2, vec![2, 1]);
         // Invalid (cluster split across two subtrees) is rejected.
         assert!(leaders(&z, &[1, 2, 1, 2, 1]).is_err());
+    }
+
+    /// SciPy takes these subtree maxima as Cython's `max(acc, child)`, which keeps `acc` unless
+    /// `child > acc`: a node whose own value is NaN reports NaN, and a NaN child is skipped.
+    /// Neither `is_valid_linkage` nor `is_valid_im` rejects a NaN. SciPy 1.17.1, with
+    /// Z = [[0,1,l,2],[2,3,r,2],[4,5,root,4]] and R = [[1,0,1,0],[2,0,1,0],[2,1,3,1]]
+    /// (inconsistent(Z) for l, r, root = 1, 2, 3):
+    /// - maxdists, root = nan: [1, 2, nan]. fsci's `f64::max` fold dropped the NaN: [1, 2, 2].
+    /// - maxdists on the chain [[0,1,1,2],[4,2,nan,3],[5,3,3,4]]: [1, nan, 3]. fsci: [1, 1, 3].
+    /// - maxRstat(Z, R, 0), R[2,0] = nan: [1, 2, nan]. maxinconsts, R[2,3] = nan: [0, 0, nan].
+    ///
+    /// Must not change. A NaN child is skipped: l = nan, r = 5 gives maxdists [nan, 5, 5], and
+    /// R[0,0] = nan gives maxRstat(Z, R, 0) = [nan, 2, 2]. A fold that propagated every NaN would
+    /// break both. Finite: maxdists [1, 2, 3], the inversion l = 5 gives [5, 2, 5], and
+    /// maxRstat(Z, R, 0) = [1, 2, 2].
+    #[test]
+    fn subtree_maxima_keep_scipys_nan_semantics() {
+        let same = |got: &[f64], want: &[f64]| {
+            got.len() == want.len()
+                && got
+                    .iter()
+                    .zip(want)
+                    .all(|(g, w)| (g.is_nan() && w.is_nan()) || g == w)
+        };
+        let nan = f64::NAN;
+        let tree = |left: f64, right: f64, root: f64| {
+            [
+                [0.0, 1.0, left, 2.0],
+                [2.0, 3.0, right, 2.0],
+                [4.0, 5.0, root, 4.0],
+            ]
+        };
+        let r_base = [
+            [1.0, 0.0, 1.0, 0.0],
+            [2.0, 0.0, 1.0, 0.0],
+            [2.0, 1.0, 3.0, 1.0],
+        ];
+        let z = tree(1.0, 2.0, 3.0);
+
+        // SciPy keeps a node's own NaN.
+        let got = maxdists(&tree(1.0, 2.0, nan));
+        assert!(same(&got, &[1.0, 2.0, nan]), "root NaN: {got:?}");
+        let chain = [
+            [0.0, 1.0, 1.0, 2.0],
+            [4.0, 2.0, nan, 3.0],
+            [5.0, 3.0, 3.0, 4.0],
+        ];
+        let got = maxdists(&chain);
+        assert!(same(&got, &[1.0, nan, 3.0]), "chain middle NaN: {got:?}");
+        let mut r = r_base;
+        r[2][0] = nan;
+        let got = max_rstat(&z, &r, 0).expect("valid Z and R");
+        assert!(same(&got, &[1.0, 2.0, nan]), "maxRstat root NaN: {got:?}");
+        let mut r = r_base;
+        r[2][3] = nan;
+        let got = maxinconsts(&z, &r).expect("valid Z and R");
+        assert!(
+            same(&got, &[0.0, 0.0, nan]),
+            "maxinconsts root NaN: {got:?}"
+        );
+
+        // Must not change: SciPy skips a NaN child, and finite inputs are untouched.
+        let got = maxdists(&tree(nan, 5.0, 3.0));
+        assert!(same(&got, &[nan, 5.0, 5.0]), "NaN child: {got:?}");
+        let mut r = r_base;
+        r[0][0] = nan;
+        let got = max_rstat(&z, &r, 0).expect("valid Z and R");
+        assert!(same(&got, &[nan, 2.0, 2.0]), "maxRstat NaN child: {got:?}");
+        assert_eq!(maxdists(&z), vec![1.0, 2.0, 3.0]);
+        assert_eq!(maxdists(&tree(5.0, 2.0, 3.0)), vec![5.0, 2.0, 5.0]);
+        assert_eq!(
+            max_rstat(&z, &r_base, 0).expect("valid Z and R"),
+            vec![1.0, 2.0, 2.0]
+        );
     }
 
     #[test]

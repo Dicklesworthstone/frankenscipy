@@ -3620,6 +3620,12 @@ pub fn chndtrix(p: f64, df: f64, nc: f64) -> f64 {
 /// by `f(a)..f(b)`, the nearer bound is returned (the unsolvable-tail clamp).
 fn invert_monotone(f: impl Fn(f64) -> f64, target: f64, a: f64, b: f64) -> f64 {
     let (fa, fb) = (f(a), f(b));
+    // `f64::min`/`max` drop a NaN, so a NaN endpoint used to read as the other endpoint's
+    // value and return a bound (or hand Illinois NaN residuals). SciPy returns NaN there:
+    // chndtrinc(inf, 3, 0.5) and chndtridf(inf, 0.5, 2) are both nan in 1.17.1.
+    if fa.is_nan() || fb.is_nan() {
+        return f64::NAN;
+    }
     if target <= fa.min(fb) {
         return if fa <= fb { a } else { b };
     }
@@ -7038,6 +7044,33 @@ mod tests {
         // p ∉ (0,1) → NaN.
         assert!(chndtridf(8.0, 0.0, 3.0).is_nan());
         assert!(chndtrinc(8.0, 5.0, 1.0).is_nan());
+    }
+
+    /// A NaN endpoint value leaves the chndtr inversion undefined. SciPy 1.17.1:
+    /// chndtrinc(inf, 3, 0.5) = nan, chndtridf(inf, 0.5, 2) = nan, chndtrinc(1, inf, 0.5) = nan.
+    /// fsci's chndtr is NaN at those bracket endpoints (x = inf with nc > 0, df = inf), and
+    /// `invert_monotone` folded fa/fb with `f64::min`/`max`, which drop the NaN: chndtrinc
+    /// returned the nc = 1e8 bound and chndtridf an Illinois iterate on NaN residuals.
+    /// Must not change, SciPy 1.17.1: chndtrinc(5, 3, 0.5) = 2.8985299934839217,
+    /// chndtridf(5, 0.5, 2) = 3.8373619908260497, and the below-range clamp
+    /// chndtrinc(2, 3, 0.5) = 2.65249474e-315 (fsci returns the nc = 0 bound).
+    #[test]
+    fn chndtr_inverses_return_nan_on_a_nan_endpoint_like_scipy() {
+        assert!(chndtrinc(f64::INFINITY, 3.0, 0.5).is_nan());
+        assert!(chndtridf(f64::INFINITY, 0.5, 2.0).is_nan());
+        assert!(chndtrinc(1.0, f64::INFINITY, 0.5).is_nan());
+        let nc = chndtrinc(5.0, 3.0, 0.5);
+        assert!(
+            (nc - 2.898_529_993_483_921_7).abs() < 1e-7,
+            "chndtrinc {nc}"
+        );
+        let df = chndtridf(5.0, 0.5, 2.0);
+        assert!(
+            (df - 3.837_361_990_826_049_7).abs() < 1e-7,
+            "chndtridf {df}"
+        );
+        let clamped = chndtrinc(2.0, 3.0, 0.5);
+        assert!(clamped.abs() < 1e-300, "chndtrinc clamp {clamped}");
     }
 
     #[test]

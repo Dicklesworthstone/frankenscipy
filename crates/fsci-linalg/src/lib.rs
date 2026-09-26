@@ -21235,6 +21235,13 @@ pub fn matrix_balance(
     permute: bool,
     scale: bool,
 ) -> Result<MatrixBalance, LinalgError> {
+    // SciPy validates with `check_finite=True` before anything else. Without it, the scaling
+    // loop's column/row maxima `ca`/`ra` (folded with `f64::max`) dropped a NaN that only they
+    // saw and the balance returned Ok with the NaN in it; a NaN inside the active block kept
+    // resetting `conv` and never terminated (LAPACK `dgebal` exits on `DISNAN` for this).
+    if a.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(LinalgError::NonFiniteInput);
+    }
     let n = a.len();
     if a.iter().any(|r| r.len() != n) {
         return Err(LinalgError::InvalidArgument {
@@ -24680,7 +24687,15 @@ fn lu_solve_mixed_precision(a_in: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
             }
             let ri = b[i] - s;
             r[i] = ri;
-            res = res.max(ri.abs());
+            // numpy's `max(abs(r))`: one NaN entry makes it NaN. `f64::max` dropped it, so a NaN
+            // in `x` (the f32 back substitution forms `inf·0` when an entry of `A` exceeds f32's
+            // range) made every `r_i` NaN, `res` read as 0 and passed the bar below. A NaN `res`
+            // passes neither that bar nor the stall test, so the loop runs out and returns None.
+            res = if res.is_nan() || ri.is_nan() {
+                f64::NAN
+            } else {
+                res.max(ri.abs())
+            };
         }
         let xnorm = x.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
         // Backward-stability bar that an f64 LU solve itself satisfies.
@@ -28673,6 +28688,80 @@ mod tests {
                 "mixed precision accepted a bad x: {max_diff:e}"
             );
         }
+    }
+
+    /// A NaN in the mixed-precision `x` must not pass as refined. A = I₁₂₈ with
+    /// A[0][1] = 1e39 (beyond f32's range, so the f32 factor holds +inf there) and
+    /// A[127][2] = 0.5 (so the structure detection says general and `solve` takes this path).
+    /// With b = 1 except b[1] = 0 the f32 back substitution forms `inf·0` = NaN in x[0], every
+    /// residual entry is NaN, and the `f64::max` fold read that residual as 0. With b = 1 it
+    /// forms x[0] = -inf, and the fold kept only r[0] = inf, against a bar that was inf too.
+    ///
+    /// SciPy 1.17.1 `scipy.linalg.solve(A, b)` returns (with LinAlgWarning rcond = 1e-78):
+    /// - b[1] = 0: x[0] = 1.0, x[1] = 0.0, x[2..127] = 1.0, x[127] = 0.5.
+    /// - b = 1: x[0] = -1e39, x[1] = 1.0, x[127] = 0.5.
+    ///
+    /// Must not change: a diagonally dominant general 128×128 system with x = 1, which SciPy
+    /// solves to max |x − 1| = 2.7e-15, still takes the mixed-precision path here.
+    #[test]
+    fn solve_mixed_precision_refuses_a_nan_residual_like_scipy() {
+        let n = 128;
+        let mut a = vec![vec![0.0; n]; n];
+        for (i, row) in a.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        a[0][1] = 1e39;
+        a[127][2] = 0.5;
+        let mut b = vec![1.0; n];
+        b[1] = 0.0;
+
+        let refined = lu_solve_mixed_precision(&a, &b);
+        assert!(
+            refined
+                .as_ref()
+                .is_none_or(|x| x.iter().all(|v| v.is_finite())),
+            "mixed precision accepted a non-finite x: x[0] = {:?}",
+            refined.as_ref().map(|x| x[0])
+        );
+        let x = solve(&a, &b, SolveOptions::default())
+            .expect("SciPy solves this system")
+            .x;
+        assert_eq!(x[0], 1.0, "x[0]");
+        assert_eq!(x[1], 0.0, "x[1]");
+        assert!(x[2..127].iter().all(|&v| v == 1.0), "x[2..127]: {x:?}");
+        assert_eq!(x[127], 0.5, "x[127]");
+
+        let ones = vec![1.0; n];
+        let x = solve(&a, &ones, SolveOptions::default())
+            .expect("SciPy solves this system")
+            .x;
+        assert_eq!(x[0], -1e39, "x[0]");
+        assert_eq!(x[1], 1.0, "x[1]");
+        assert_eq!(x[127], 0.5, "x[127]");
+
+        // Must not change: an ordinary general system still refines to f64 quality.
+        let m: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                (0..n)
+                    .map(|j| {
+                        if i == j {
+                            2.0 * n as f64
+                        } else {
+                            (((i * 7 + j * 13) % 11) as f64 - 5.0) / 11.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let bm: Vec<f64> = m.iter().map(|row| row.iter().sum()).collect();
+        assert!(
+            lu_solve_mixed_precision(&m, &bm).is_some(),
+            "the mixed path declined a well-conditioned system"
+        );
+        let x = solve(&m, &bm, SolveOptions::default())
+            .expect("well-conditioned solve")
+            .x;
+        assert!(x.iter().all(|v| (v - 1.0).abs() < 1e-12), "x != 1: {x:?}");
     }
 
     #[test]
@@ -39745,6 +39834,50 @@ mod tests {
         assert!(matches!(err, LinalgError::ExpectedSquareMatrix));
     }
 
+    /// With `check_finite = false` a NaN reaches the block swap. For A = [[1, nan], [0, -1]],
+    /// B = I, `qz` returns the pencil unchanged, as SciPy's does, and sorting 'lhp' swaps its
+    /// two 1×1 blocks. That swap turns both blocks into NaN; its residual was folded with
+    /// `f64::max`, which dropped the NaN, so the swap was accepted and `ordqz` returned Ok.
+    ///
+    /// SciPy 1.17.1 `ordqz(A, B, sort='lhp', check_finite=False)` raises `ValueError:
+    /// Reordering of (A, B) failed because the transformed matrix pair (A, B) would be too far
+    /// from generalized Schur form` (dtgsen INFO = 1); with `check_finite=True` it raises
+    /// `ValueError: array must not contain infs or NaNs`. Must not change: the finite pencil
+    /// [[1, 2], [0, -1]], I sorts to AA = [[-1, 2], [0, 1]], BB = I (ratios [-1, 1]).
+    #[test]
+    fn ordqz_refuses_a_nan_block_swap_like_scipy() {
+        let b = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let unchecked = DecompOptions {
+            mode: RuntimeMode::Strict,
+            check_finite: false,
+        };
+        let a_nan = vec![vec![1.0, f64::NAN], vec![0.0, -1.0]];
+        let err = ordqz(&a_nan, &b, OrdQzSort::LeftHalfPlane, unchecked)
+            .expect_err("SciPy's dtgsen refuses this swap");
+        assert!(
+            matches!(err, LinalgError::ConvergenceFailure { .. }),
+            "{err:?}"
+        );
+        let err = ordqz(
+            &a_nan,
+            &b,
+            OrdQzSort::LeftHalfPlane,
+            DecompOptions::default(),
+        )
+        .expect_err("check_finite rejects NaN");
+        assert_eq!(err, LinalgError::NonFiniteInput);
+
+        let a = vec![vec![1.0, 2.0], vec![0.0, -1.0]];
+        let sorted =
+            ordqz(&a, &b, OrdQzSort::LeftHalfPlane, unchecked).expect("a finite pencil sorts");
+        assert_qz_form(&a, &b, &sorted);
+        let ratios: Vec<f64> = (0..2).map(|i| sorted.aa[i][i] / sorted.bb[i][i]).collect();
+        assert!(
+            (ratios[0] + 1.0).abs() < 1e-14 && (ratios[1] - 1.0).abs() < 1e-14,
+            "{ratios:?}"
+        );
+    }
+
     // ── Matrix exponential tests ──────────────────────────────────────
 
     #[test]
@@ -40349,6 +40482,42 @@ mod tests {
         assert!(res.transform.is_empty());
         assert!(res.scaling.is_empty());
         assert!(res.perm.is_empty());
+    }
+
+    /// SciPy 1.17.1's `matrix_balance` validates with `check_finite=True` first:
+    /// [[1, nan, 0], [0, 2, 3], [0, 4, 5]] and [[1, inf], [1, 1]] both raise
+    /// `ValueError: array must not contain infs or NaNs`. In the first, the permutation isolates
+    /// column 0, so the NaN sits outside the active block where only the column maximum `ca`
+    /// sees it; `f64::max` dropped it and the balance returned Ok with the NaN in it. Must not
+    /// change: with 7 in place of the NaN, SciPy returns B = A and T = I.
+    #[test]
+    fn matrix_balance_rejects_non_finite_input_like_scipy() {
+        let nan = vec![
+            vec![1.0, f64::NAN, 0.0],
+            vec![0.0, 2.0, 3.0],
+            vec![0.0, 4.0, 5.0],
+        ];
+        assert_eq!(
+            matrix_balance(&nan, true, true).map(|res| res.balanced),
+            Err(LinalgError::NonFiniteInput)
+        );
+        let inf = vec![vec![1.0, f64::INFINITY], vec![1.0, 1.0]];
+        assert_eq!(
+            matrix_balance(&inf, true, true).map(|res| res.balanced),
+            Err(LinalgError::NonFiniteInput)
+        );
+
+        let finite = vec![
+            vec![1.0, 7.0, 0.0],
+            vec![0.0, 2.0, 3.0],
+            vec![0.0, 4.0, 5.0],
+        ];
+        let res = matrix_balance(&finite, true, true).expect("SciPy balances a finite matrix");
+        assert_eq!(res.balanced, finite);
+        let identity: Vec<Vec<f64>> = (0..3)
+            .map(|i| (0..3).map(|j| if i == j { 1.0 } else { 0.0 }).collect())
+            .collect();
+        assert_eq!(res.transform, identity);
     }
 
     #[test]

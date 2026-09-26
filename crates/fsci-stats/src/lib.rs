@@ -17631,7 +17631,9 @@ impl ContinuousDistribution for InverseGaussian {
         let sqrt_x = x.sqrt();
         let t1 = standard_normal_cdf(-(sqrt_x / mu - 1.0 / sqrt_x));
         let t2 = (2.0 / mu).exp() * standard_normal_cdf(-(sqrt_x / mu + 1.0 / sqrt_x));
-        (t1 - t2).max(0.0)
+        let sf = t1 - t2;
+        // The clamp is for rounding below zero; `NaN.max(0.0)` would turn sf(NaN) into 0.0.
+        if sf.is_nan() { f64::NAN } else { sf.max(0.0) }
     }
 
     fn mean(&self) -> f64 {
@@ -25659,7 +25661,8 @@ pub(crate) fn kstwobign_pdf_large(x: f64) -> f64 {
             break;
         }
     }
-    sum.max(0.0)
+    // The clamp is for rounding below zero; `NaN.max(0.0)` would turn pdf(NaN) into 0.0.
+    if sum.is_nan() { f64::NAN } else { sum.max(0.0) }
 }
 
 pub(crate) fn kstwobign_cdf_large(x: f64) -> f64 {
@@ -26395,6 +26398,11 @@ impl IrwinHall {
 
 impl ContinuousDistribution for IrwinHall {
     fn pdf(&self, x: f64) -> f64 {
+        // SciPy's pdf(NaN) is NaN. Without this, n = 1 answers 0.0 from the range test and
+        // n > 1 from the final `.max(0.0)` clamp, which turns the NaN sum into 0.0.
+        if x.is_nan() {
+            return f64::NAN;
+        }
         let nf = self.n as f64;
         // n=1 collapses to Uniform(0, 1). Handle directly so the
         // closed boundary at x=0 and x=1 returns 1 (matches scipy's
@@ -30326,6 +30334,12 @@ pub static NANMINMAX_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 /// zeros, so the chunk-then-merge result equals the left fold, and NaN is filtered per chunk
 /// identically. Work-gated (the syscall + spawn cost more than the fold below the gate).
 fn par_nan_fold(data: &[f64], ident: f64, reduce: fn(f64, f64) -> f64) -> f64 {
+    // numpy's nanmin/nanmax of an all-NaN slice is NaN ("All-NaN slice encountered"); the
+    // NaN-skipping fold would return its ±inf seed. `all` stops at the first non-NaN, so
+    // ordinary input pays one comparison. Empty input keeps its seed as before.
+    if !data.is_empty() && data.iter().all(|x| x.is_nan()) {
+        return f64::NAN;
+    }
     let n = data.len();
     let serial = |d: &[f64]| {
         d.iter()
@@ -33200,7 +33214,12 @@ pub fn alexander_govern(groups: &[&[f64]]) -> TtestResult {
     }
 
     let df = (k - 1) as f64;
-    let pvalue = 1.0 - ChiSquared::new(df).cdf(a_stat.max(0.0));
+    // `NaN.max(0.0)` is 0.0, which would turn a NaN statistic into p = 1; SciPy returns NaN.
+    let pvalue = if a_stat.is_nan() {
+        f64::NAN
+    } else {
+        1.0 - ChiSquared::new(df).cdf(a_stat.max(0.0))
+    };
 
     TtestResult {
         statistic: a_stat,
@@ -40336,7 +40355,14 @@ pub fn mjci(data: &[f64], prob: &[f64]) -> Vec<f64> {
                 c1 += w * d;
                 c2 += w * d * d;
             }
-            (c2 - c1 * c1).max(0.0).sqrt()
+            // An infinite datum makes `c2 − c1²` NaN; SciPy's sqrt keeps it, where
+            // `NaN.max(0.0)` would report 0.0. The clamp stays for rounding below zero.
+            let var = c2 - c1 * c1;
+            if var.is_nan() {
+                f64::NAN
+            } else {
+                var.max(0.0).sqrt()
+            }
         })
         .collect()
 }
@@ -42094,22 +42120,32 @@ where
 
 /// The trimmed minimum, or NaN if no values remain.
 pub fn tmin(data: &[f64], lowerlimit: f64, inclusive: bool) -> f64 {
+    // A NaN is kept and propagates, as under scipy.stats.tmin's default nan_policy='propagate';
+    // `f64::min` alone would drop it.
     let keep = |x: f64| {
-        x.is_finite()
-            && if inclusive {
-                x >= lowerlimit
-            } else {
-                x > lowerlimit
-            }
+        x.is_nan()
+            || (x.is_finite()
+                && if inclusive {
+                    x >= lowerlimit
+                } else {
+                    x > lowerlimit
+                })
+    };
+    let nan_min: fn(f64, f64) -> f64 = |a, b| {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else {
+            a.min(b)
+        }
     };
     if TMINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
         let filtered: Vec<f64> = data.iter().copied().filter(|&x| keep(x)).collect();
         if filtered.is_empty() {
             return f64::NAN;
         }
-        return filtered.iter().copied().fold(f64::INFINITY, f64::min);
+        return filtered.iter().copied().fold(f64::INFINITY, nan_min);
     }
-    par_filter_fold(data, f64::INFINITY, keep, f64::min).unwrap_or(f64::NAN)
+    par_filter_fold(data, f64::INFINITY, keep, nan_min).unwrap_or(f64::NAN)
 }
 
 /// Compute the trimmed maximum.
@@ -42126,22 +42162,32 @@ pub fn tmin(data: &[f64], lowerlimit: f64, inclusive: bool) -> f64 {
 /// # Returns
 /// The trimmed maximum, or NaN if no values remain.
 pub fn tmax(data: &[f64], upperlimit: f64, inclusive: bool) -> f64 {
+    // A NaN is kept and propagates, as under scipy.stats.tmax's default nan_policy='propagate';
+    // `f64::max` alone would drop it.
     let keep = |x: f64| {
-        x.is_finite()
-            && if inclusive {
-                x <= upperlimit
-            } else {
-                x < upperlimit
-            }
+        x.is_nan()
+            || (x.is_finite()
+                && if inclusive {
+                    x <= upperlimit
+                } else {
+                    x < upperlimit
+                })
+    };
+    let nan_max: fn(f64, f64) -> f64 = |a, b| {
+        if a.is_nan() || b.is_nan() {
+            f64::NAN
+        } else {
+            a.max(b)
+        }
     };
     if TMINMAX_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
         let filtered: Vec<f64> = data.iter().copied().filter(|&x| keep(x)).collect();
         if filtered.is_empty() {
             return f64::NAN;
         }
-        return filtered.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        return filtered.iter().copied().fold(f64::NEG_INFINITY, nan_max);
     }
-    par_filter_fold(data, f64::NEG_INFINITY, keep, f64::max).unwrap_or(f64::NAN)
+    par_filter_fold(data, f64::NEG_INFINITY, keep, nan_max).unwrap_or(f64::NAN)
 }
 
 /// Compute the expectile at a given alpha level.
@@ -55746,6 +55792,12 @@ pub fn logsumexp(x: &[f64]) -> f64 {
     }
     let max_x = par_max_fold(x);
     if !max_x.is_finite() {
+        // `par_max_fold` skips a NaN, so ±inf here can hide one, and an all-NaN input reads as
+        // −inf. numpy's max is NaN there, and so is scipy.special.logsumexp. On the finite path
+        // a NaN already reaches the sum.
+        if x.iter().any(|v| v.is_nan()) {
+            return f64::NAN;
+        }
         return max_x;
     }
     // `Σ exp(xᵢ − max_x)` — the per-element `exp` is a heavy transcendental (compute-bound). Sum it in
@@ -55792,6 +55844,11 @@ pub fn logsumexp_weighted(a: &[f64], b: &[f64]) -> f64 {
     }
     let max_a = a.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     if !max_a.is_finite() {
+        // As in `logsumexp`: the fold skipped any NaN in `a`, and this early return also skips
+        // the sum that would carry a NaN in `b`. scipy.special.logsumexp is NaN for either.
+        if a.iter().chain(b).any(|v| v.is_nan()) {
+            return f64::NAN;
+        }
         return max_a;
     }
     let sum = a
@@ -62849,14 +62906,23 @@ pub fn gof_statistic<D: ContinuousDistribution>(
             -nf - s
         }
         GofStatistic::KolmogorovSmirnov => {
+            // NaN-propagating, as the numpy `max` in SciPy's `_ks_statistic` is: `f64::max` would
+            // drop a NaN cdf value and report the distance over the remaining points.
+            let nan_max = |a: f64, b: f64| {
+                if a.is_nan() || b.is_nan() {
+                    f64::NAN
+                } else {
+                    a.max(b)
+                }
+            };
             let mut d_plus = f64::NEG_INFINITY;
             let mut d_minus = f64::NEG_INFINITY;
             for (i, &xi) in x.iter().enumerate() {
                 let f = dist.cdf(xi);
-                d_plus = d_plus.max((i + 1) as f64 / nf - f);
-                d_minus = d_minus.max(f - i as f64 / nf);
+                d_plus = nan_max(d_plus, (i + 1) as f64 / nf - f);
+                d_minus = nan_max(d_minus, f - i as f64 / nf);
             }
-            d_plus.max(d_minus)
+            nan_max(d_plus, d_minus)
         }
         GofStatistic::CramerVonMises => {
             let mut acc = 0.0;
@@ -63397,7 +63463,16 @@ impl<D: ContinuousDistribution> Mixture<D> {
                 }
             })
             .collect();
-        let hi = terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        // NaN-propagating, as numpy's max is: `f64::max` would drop a NaN term, and when every
+        // term is NaN (x = NaN) the −inf seed would pass the test below and return −inf where
+        // SciPy's Mixture returns NaN.
+        let hi = terms.iter().copied().fold(f64::NEG_INFINITY, |m, t| {
+            if m.is_nan() || t.is_nan() {
+                f64::NAN
+            } else {
+                m.max(t)
+            }
+        });
         if hi == f64::NEG_INFINITY {
             return f64::NEG_INFINITY;
         }
@@ -63623,6 +63698,29 @@ mod mixture_matches_scipy {
             Mixture::new(vec![Normal::standard(), Normal::new(3.0, 1.0)], &[0.0, 1.0]).is_ok(),
             "one zero weight is legal"
         );
+    }
+
+    /// SciPy 1.17.1, same fixture: `logpdf`, `logcdf` and `logccdf` at NaN are all NaN; at 0.0
+    /// they are -2.439546171981445, -0.8082737199525145 and -0.5899169546601949. fsci's
+    /// log-sum-exp folded its terms with `f64::max`, so an all-NaN set of terms left the −inf
+    /// seed, which took the "every term is −inf" exit and returned −inf.
+    #[test]
+    fn log_forms_at_nan_are_nan_like_scipy() {
+        let m = fixture();
+        for (name, v) in [
+            ("logpdf", m.logpdf(f64::NAN)),
+            ("logcdf", m.logcdf(f64::NAN)),
+            ("logsf", m.logsf(f64::NAN)),
+        ] {
+            assert!(v.is_nan(), "{name}(NaN): SciPy is NaN, fsci gave {v}");
+        }
+        for (got, want) in [
+            (m.logpdf(0.0), -2.439_546_171_981_445),
+            (m.logcdf(0.0), -0.808_273_719_952_514_5),
+            (m.logsf(0.0), -0.589_916_954_660_194_9),
+        ] {
+            assert!((got - want).abs() < 1e-12, "got {got}, SciPy {want}");
+        }
     }
 }
 
@@ -107635,6 +107733,143 @@ mod tests {
              sharing TOGGLE_LOCK"
         );
     }
+
+    /// SciPy 1.17.1 `scipy.special.logsumexp`: [NaN], [NaN, inf] and [NaN, -inf] are all NaN,
+    /// as is `b = [NaN]` with a = [-inf]; [1, 2] is 2.313261687518223, [1, inf] is inf and
+    /// [-inf, -inf] is -inf. fsci's `f64::max` fold skipped the NaN, so the non-finite-max early
+    /// return answered -inf, inf and -inf for the first three.
+    #[test]
+    fn logsumexp_nan_beside_a_nonfinite_max_is_nan_like_scipy() {
+        for x in [
+            vec![f64::NAN],
+            vec![f64::NAN, f64::INFINITY],
+            vec![f64::NAN, f64::NEG_INFINITY],
+        ] {
+            let got = logsumexp(&x);
+            assert!(got.is_nan(), "logsumexp({x:?}): SciPy NaN, fsci {got}");
+            let ones = vec![1.0; x.len()];
+            let got = logsumexp_weighted(&x, &ones);
+            assert!(got.is_nan(), "logsumexp({x:?}, b=1): SciPy NaN, fsci {got}");
+        }
+        let got = logsumexp_weighted(&[f64::NEG_INFINITY], &[f64::NAN]);
+        assert!(
+            got.is_nan(),
+            "logsumexp([-inf], b=[NaN]): SciPy NaN, fsci {got}"
+        );
+        assert!((logsumexp(&[1.0, 2.0]) - 2.313_261_687_518_223).abs() < 1e-14);
+        assert!(
+            (logsumexp_weighted(&[1.0, 2.0], &[1.0, 1.0]) - 2.313_261_687_518_223).abs() < 1e-14
+        );
+        assert_eq!(logsumexp(&[1.0, f64::INFINITY]), f64::INFINITY);
+        assert_eq!(
+            logsumexp(&[f64::NEG_INFINITY, f64::NEG_INFINITY]),
+            f64::NEG_INFINITY
+        );
+    }
+
+    /// SciPy 1.17.1 (default nan_policy='propagate'): `tmax([1, NaN, 3], 7)`,
+    /// `tmax([9, NaN], 4)` and `tmin([1, NaN, 3], 0)` are NaN; `tmax([1, 5, 3], 4)` and
+    /// `tmin([1, 5, 3], 2)` are 3.0. fsci's `keep` filter dropped the NaN before the fold.
+    #[test]
+    fn tmax_tmin_propagate_nan_like_scipy() {
+        assert!(tmax(&[1.0, f64::NAN, 3.0], 7.0, true).is_nan());
+        assert!(tmax(&[9.0, f64::NAN], 4.0, true).is_nan());
+        assert!(tmin(&[1.0, f64::NAN, 3.0], 0.0, true).is_nan());
+        assert_eq!(tmax(&[1.0, 5.0, 3.0], 4.0, true), 3.0);
+        assert_eq!(tmin(&[1.0, 5.0, 3.0], 2.0, true), 3.0);
+        assert!(
+            tmax(&[9.0], 4.0, true).is_nan(),
+            "all above the limit stays NaN"
+        );
+    }
+
+    /// SciPy 1.17.1 `alexandergovern([1, 2, NaN, 4], [2, 3, 5, 6])` is (NaN, NaN); with 3.5 in
+    /// place of the NaN it is (1.096458164282565, 0.2950447051938173). fsci clamped the NaN
+    /// statistic with `.max(0.0)` before the chi-squared cdf and reported p = 1.
+    #[test]
+    fn alexander_govern_nan_group_gives_nan_pvalue_like_scipy() {
+        let with_nan: &[f64] = &[1.0, 2.0, f64::NAN, 4.0];
+        let finite: &[f64] = &[1.0, 2.0, 3.5, 4.0];
+        let other: &[f64] = &[2.0, 3.0, 5.0, 6.0];
+        let r = alexander_govern(&[with_nan, other]);
+        assert!(
+            r.statistic.is_nan() && r.pvalue.is_nan(),
+            "SciPy (NaN, NaN), fsci {r:?}"
+        );
+        let r = alexander_govern(&[finite, other]);
+        assert!((r.statistic - 1.096_458_164_282_565).abs() < 1e-12, "{r:?}");
+        assert!((r.pvalue - 0.295_044_705_193_817_3).abs() < 1e-12, "{r:?}");
+    }
+
+    /// SciPy 1.17.1: `invgauss(1.5).sf(nan)` is NaN and `invgauss(1.5).sf(2)` is
+    /// 0.21912087830523477. fsci's `.max(0.0)` rounding clamp turned the NaN into 0.0.
+    #[test]
+    fn inverse_gaussian_sf_at_nan_is_nan_like_scipy() {
+        let ig = InverseGaussian::new(1.5);
+        let v = ig.sf(f64::NAN);
+        assert!(v.is_nan(), "SciPy NaN, fsci {v}");
+        assert!((ig.sf(2.0) - 0.219_120_878_305_234_77).abs() < 1e-12);
+    }
+
+    /// SciPy 1.17.1: `kstwobign.pdf(nan)` is NaN and `kstwobign.pdf(2)` is
+    /// 0.005367402045629683. fsci's `.max(0.0)` rounding clamp turned the NaN into 0.0.
+    #[test]
+    fn kstwobign_pdf_at_nan_is_nan_like_scipy() {
+        let v = KsTwoBign.pdf(f64::NAN);
+        assert!(v.is_nan(), "SciPy NaN, fsci {v}");
+        assert!((KsTwoBign.pdf(2.0) - 0.005_367_402_045_629_683).abs() < 1e-13);
+    }
+
+    /// SciPy 1.17.1: `irwinhall(3).pdf(nan)` and `irwinhall(1).pdf(nan)` are NaN;
+    /// `irwinhall(3).pdf(1.2)` = 0.6599999999999999 and `irwinhall(1).pdf(0.5)` = 1.0. fsci's
+    /// `.max(0.0)` rounding clamp turned the NaN sum into 0.0 for n > 1, and n = 1 answered 0.0
+    /// from its range test.
+    #[test]
+    fn irwin_hall_pdf_at_nan_is_nan_like_scipy() {
+        for n in [3_u32, 1] {
+            let v = IrwinHall::new(n).pdf(f64::NAN);
+            assert!(v.is_nan(), "IrwinHall({n}).pdf(NaN): SciPy NaN, fsci {v}");
+        }
+        assert!((IrwinHall::new(3).pdf(1.2) - 0.66).abs() < 1e-12);
+        assert_eq!(IrwinHall::new(1).pdf(0.5), 1.0);
+    }
+
+    /// SciPy 1.17.1 `mstats.mjci(data, prob=[0.25, 0.5, 0.75])`: data 1..=10 gives
+    /// [1.3428021800481427, 1.5976788815406902, 1.3428021800481522]; with the 10 replaced by inf
+    /// every entry is NaN (`c2 − c1²` is inf − inf). fsci's `.max(0.0)` turned that NaN into 0.0.
+    #[test]
+    fn mjci_infinite_datum_gives_nan_like_scipy() {
+        let mut data: Vec<f64> = (1..=10).map(f64::from).collect();
+        let prob = [0.25, 0.5, 0.75];
+        let got = mjci(&data, &prob);
+        let want = [
+            1.342_802_180_048_142_7,
+            1.597_678_881_540_690_2,
+            1.342_802_180_048_152_2,
+        ];
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() <= 1e-9, "got {got:?}, SciPy {want:?}");
+        }
+        data[9] = f64::INFINITY;
+        let got = mjci(&data, &prob);
+        assert!(
+            got.iter().all(|v| v.is_nan()),
+            "SciPy all NaN, fsci {got:?}"
+        );
+    }
+
+    /// numpy 2.4.3 (under SciPy 1.17.1): `nanmax([nan, nan])` and `nanmin([nan, nan])` are NaN
+    /// ("All-NaN slice encountered"); `nanmax([nan, 2, 1])` = 2.0, `nanmin([nan, 2, 1])` = 1.0,
+    /// `nanmax([-inf, nan])` = -inf. fsci's NaN-skipping fold returned its ±inf seed when nothing
+    /// was left.
+    #[test]
+    fn nanmax_nanmin_all_nan_is_nan_like_numpy() {
+        assert!(nanmax(&[f64::NAN, f64::NAN]).is_nan());
+        assert!(nanmin(&[f64::NAN, f64::NAN]).is_nan());
+        assert_eq!(nanmax(&[f64::NAN, 2.0, 1.0]), 2.0);
+        assert_eq!(nanmin(&[f64::NAN, 2.0, 1.0]), 1.0);
+        assert_eq!(nanmax(&[f64::NEG_INFINITY, f64::NAN]), f64::NEG_INFINITY);
+    }
 }
 
 /// frankenscipy-clttw — the tie predicate must be EXACT EQUALITY, not a tolerance.
@@ -109453,6 +109688,27 @@ mod goodness_of_fit_matches_scipy {
         let empty: Result<super::GofOutcome<Normal>, _> =
             goodness_of_fit(&[], GofStatistic::AndersonDarling, 99, 1);
         assert!(empty.is_err(), "an empty sample cannot be fitted");
+    }
+
+    /// SciPy 1.17.1, `goodness_of_fit(norm, data, known_params={'loc': 0, 'scale': 1},
+    /// statistic='ks')`: on [0.1, -0.4, NaN, 0.7, -1.1] the statistic is NaN (`kstest` agrees);
+    /// on [0.1, -0.4, 1.3, 0.7, -1.1] it is 0.158036347776927. fsci's KS branch took its max
+    /// with `f64::max`, which dropped the NaN cdf value and reported the other points' distance.
+    #[test]
+    fn ks_statistic_propagates_a_nan_point_like_scipy() {
+        let d = Normal::standard();
+        let with_nan = [0.1, -0.4, f64::NAN, 0.7, -1.1];
+        let got = gof_statistic(&d, &with_nan, GofStatistic::KolmogorovSmirnov);
+        assert!(
+            got.is_nan(),
+            "SciPy's KS statistic is NaN here; fsci gave {got}"
+        );
+        let finite = [0.1, -0.4, 1.3, 0.7, -1.1];
+        let got = gof_statistic(&d, &finite, GofStatistic::KolmogorovSmirnov);
+        assert!(
+            (got - 0.158_036_347_776_927).abs() < 1e-12,
+            "SciPy 0.158036347776927, fsci {got}"
+        );
     }
 }
 

@@ -658,16 +658,26 @@ fn swap_adjacent_blocks(fx: &mut Factors<'_>, k: usize, p: usize, q: usize) -> R
         .map(|v| v * v)
         .sum::<f64>()
         .sqrt();
+    // `f64::max` dropped a NaN, so a swap that turned the blocks into NaN read as residual 0 and
+    // was accepted. dtgex2's stability tests are `.LE.` comparisons, which a NaN fails
+    // (INFO = 1, SciPy's "Reordering of (A, B) failed"), so a NaN residual is refused too.
+    let nan_max = |acc: f64, v: f64| {
+        if acc.is_nan() || v.is_nan() {
+            f64::NAN
+        } else {
+            acc.max(v)
+        }
+    };
     let mut residual: f64 = 0.0;
     for i in 0..m {
         for j in 0..i {
-            residual = residual.max(fx.t[k + i][k + j].abs());
+            residual = nan_max(residual, fx.t[k + i][k + j].abs());
             if i >= q && j < q {
-                residual = residual.max(fx.h[k + i][k + j].abs());
+                residual = nan_max(residual, fx.h[k + i][k + j].abs());
             }
         }
     }
-    if residual > 1e3 * f64::EPSILON * scale.max(f64::MIN_POSITIVE) {
+    if residual.is_nan() || residual > 1e3 * f64::EPSILON * scale.max(f64::MIN_POSITIVE) {
         return Err(format!(
             "ordqz: swapping the blocks at {k} is too ill-conditioned (residual {residual:e})"
         ));

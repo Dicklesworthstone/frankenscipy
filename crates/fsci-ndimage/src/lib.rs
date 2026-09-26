@@ -6117,8 +6117,15 @@ pub fn extrema_labels(
     for i in 0..input.size() {
         let lbl = labels.data[i] as usize;
         if lbl > 0 && lbl <= num_labels {
-            mins[lbl - 1] = mins[lbl - 1].min(input.data[i]);
-            maxs[lbl - 1] = maxs[lbl - 1].max(input.data[i]);
+            let value = input.data[i];
+            mins[lbl - 1] = mins[lbl - 1].min(value);
+            // `scipy.ndimage.maximum` with an index sorts NaN last and keeps the last value per
+            // label, so one NaN makes the label's maximum NaN; `f64::max` would drop it.
+            maxs[lbl - 1] = if maxs[lbl - 1].is_nan() || value.is_nan() {
+                f64::NAN
+            } else {
+                maxs[lbl - 1].max(value)
+            };
         }
     }
 
@@ -12494,10 +12501,10 @@ pub static NDIMAGE_SQRT_ARRAY_FORCE_SERIAL: std::sync::atomic::AtomicBool =
 pub fn sqrt_array(input: &NdArray) -> NdArray {
     // `sqrt` (with a `max(0.0)` clamp) is a moderately heavy per-element op, so this map is
     // compute-bound at large `n`; fan it across cores. BYTE-IDENTICAL to the serial map — each output
-    // element is `input.data[flat].max(0.0).sqrt()` written in flat order, a pure function of its
+    // element is `sqrt_clamped(input.data[flat])` written in flat order, a pure function of its
     // index. `NDIMAGE_SQRT_ARRAY_FORCE_SERIAL` restores the serial map (same-binary A/B).
     if NDIMAGE_SQRT_ARRAY_FORCE_SERIAL.load(std::sync::atomic::Ordering::Relaxed) {
-        let data: Vec<f64> = input.data.iter().map(|&v| v.max(0.0).sqrt()).collect();
+        let data: Vec<f64> = input.data.iter().map(|&v| sqrt_clamped(v)).collect();
         return NdArray {
             data,
             shape: input.shape.clone(),
@@ -12510,9 +12517,20 @@ pub fn sqrt_array(input: &NdArray) -> NdArray {
         strides: input.strides.clone(),
     };
     fill_pixels_parallel(&mut output, 4, |flat, _scratch| {
-        input.data[flat].max(0.0).sqrt()
+        sqrt_clamped(input.data[flat])
     });
     output
+}
+
+/// `sqrt(max(v, 0))` keeping a NaN, as `sqrt_array`'s oracle `np.sqrt(np.maximum(a, 0.0))` does;
+/// `f64::max` alone maps a NaN to 0.
+#[inline]
+fn sqrt_clamped(v: f64) -> f64 {
+    if v.is_nan() {
+        f64::NAN
+    } else {
+        v.max(0.0).sqrt()
+    }
 }
 
 /// Apply element-wise power.
@@ -14117,6 +14135,14 @@ pub fn watershed_ift(
             )
         }
     } else {
+        // SciPy takes only uint8/uint16 `input` and raises TypeError on anything that can hold a
+        // NaN. The float heap path would read `cost.max(NaN)` as `cost` and flood a NaN pixel as
+        // if it were free, so refuse it instead of returning labels.
+        if input.data.iter().any(|v| v.is_nan()) {
+            return Err(NdimageError::InvalidArgument(
+                "watershed_ift input must not contain NaN".to_string(),
+            ));
+        }
         watershed_ift_heap_output(
             input,
             markers,
@@ -20926,6 +20952,35 @@ mod tests {
         );
     }
 
+    /// SciPy 1.17.1 `watershed_ift([[0, nan, 9], [1, 9, 2]], [[1, 0, 0], [0, 0, 2]])` raises
+    /// `TypeError: only 8 and 16 unsigned inputs are supported` (it never floods a NaN); the
+    /// uint8 `[[0, 1, 9], [1, 9, 2]]` with the same markers returns `[[1, 1, 2], [1, 2, 2]]`.
+    /// fsci's float heap path read `cost.max(NaN)` as `cost`, flooded the NaN pixel at cost 0
+    /// and returned labels. A finite non-integer input is fsci's float extension (SciPy raises
+    /// for every float dtype) and must still run.
+    #[test]
+    fn watershed_ift_refuses_a_nan_input_like_scipy() {
+        let markers = NdArray::new(vec![1.0, 0.0, 0.0, 0.0, 0.0, 2.0], vec![2, 3]).expect("shape");
+        let nan_input =
+            NdArray::new(vec![0.0, f64::NAN, 9.0, 1.0, 9.0, 2.0], vec![2, 3]).expect("shape");
+        let refused = watershed_ift(&nan_input, &markers, None);
+        assert!(
+            matches!(refused, Err(NdimageError::InvalidArgument(_))),
+            "SciPy raises on a NaN input; fsci {refused:?}"
+        );
+        let uint8_like =
+            NdArray::new(vec![0.0, 1.0, 9.0, 1.0, 9.0, 2.0], vec![2, 3]).expect("shape");
+        assert_eq!(
+            watershed_ift(&uint8_like, &markers, None)
+                .expect("SciPy labels a uint8 input")
+                .data,
+            vec![1.0, 1.0, 2.0, 1.0, 2.0, 2.0]
+        );
+        let float_input =
+            NdArray::new(vec![0.0, 0.5, 9.0, 1.0, 9.0, 2.0], vec![2, 3]).expect("shape");
+        assert!(watershed_ift(&float_input, &markers, None).is_ok());
+    }
+
     #[test]
     fn watershed_ift_validates_structure_shape() {
         let input = NdArray::new(vec![0.0; 4], vec![2, 2]).unwrap();
@@ -22096,6 +22151,45 @@ mod tests {
         assert_eq!(maxs[0], 4.0); // max of [3, 1, 4]
         assert_eq!(mins[1], 1.0); // min of [1, 5, 9]
         assert_eq!(maxs[1], 9.0); // max of [1, 5, 9]
+    }
+
+    /// A NaN in a label makes that label's maximum NaN, as `scipy.ndimage.maximum` does with an
+    /// index (it sorts NaN last and keeps the last value per label). SciPy 1.17.1, labels
+    /// `[1, 1, 2, 2, 2]`, index `[1, 2]`: `maximum([1, nan, 3, 4, 5])` and
+    /// `maximum([nan, 1, 3, 4, 5])` are both `[nan, 5.0]`, with `minimum` `[1.0, 3.0]`; the finite
+    /// `[1, 2, 3, 4, 5]` gives maximum `[2.0, 5.0]` and minimum `[1.0, 3.0]`. fsci's `f64::max`
+    /// accumulator dropped the NaN and returned 1.0 for label 1.
+    #[test]
+    fn extrema_labels_max_keeps_a_nan_like_scipy() {
+        let labels = NdArray::new(vec![1.0, 1.0, 2.0, 2.0, 2.0], vec![5]).expect("valid shape");
+        for data in [
+            vec![1.0, f64::NAN, 3.0, 4.0, 5.0],
+            vec![f64::NAN, 1.0, 3.0, 4.0, 5.0],
+        ] {
+            let input = NdArray::new(data, vec![5]).expect("valid shape");
+            let (mins, maxs) = extrema_labels(&input, &labels, 2);
+            assert!(maxs[0].is_nan(), "SciPy maximum is [nan, 5]; fsci {maxs:?}");
+            assert_eq!(maxs[1], 5.0);
+            assert_eq!(mins, vec![1.0, 3.0]);
+        }
+        let finite = NdArray::new(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5]).expect("valid shape");
+        assert_eq!(
+            extrema_labels(&finite, &labels, 2),
+            (vec![1.0, 3.0], vec![2.0, 5.0])
+        );
+    }
+
+    /// `sqrt_array` has no SciPy counterpart; its oracle in fsci-conformance
+    /// (`diff_ndimage_array_api_ops`) is `np.sqrt(np.maximum(a, 0.0))`, which numpy 2.4.3 (the
+    /// SciPy 1.17.1 install) evaluates on `[nan, -4, 0, 2.25, 9]` as `[nan, 0, 0, 1.5, 3]`.
+    /// `f64::max(NaN, 0.0)` is 0, so fsci returned 0 for the NaN.
+    #[test]
+    fn sqrt_array_keeps_a_nan_like_its_numpy_oracle() {
+        let input =
+            NdArray::new(vec![f64::NAN, -4.0, 0.0, 2.25, 9.0], vec![5]).expect("valid shape");
+        let out = sqrt_array(&input).data;
+        assert!(out[0].is_nan(), "the oracle gives nan; fsci {out:?}");
+        assert_eq!(&out[1..], &[0.0, 0.0, 1.5, 3.0]);
     }
 
     #[test]

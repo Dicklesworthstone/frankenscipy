@@ -7002,7 +7002,18 @@ pub fn mahalanobis(x: &[f64], y: &[f64], vi: &[Vec<f64>]) -> f64 {
         *vd = simd_dot(row, &diff);
     }
     let result = simd_dot(&diff, &vi_diff);
-    result.max(0.0).sqrt()
+    mahalanobis_root(result)
+}
+
+/// `sqrt(max(q, 0))` of a Mahalanobis quadratic form, keeping a NaN form NaN. `f64::max` alone
+/// would turn a NaN coordinate into distance 0 where SciPy's `np.sqrt` returns NaN.
+#[inline]
+fn mahalanobis_root(q: f64) -> f64 {
+    if q.is_nan() {
+        f64::NAN
+    } else {
+        q.max(0.0).sqrt()
+    }
 }
 
 /// Pairwise Mahalanobis distance matrix between the rows of `xa` and `xb` given the inverse
@@ -7088,7 +7099,7 @@ pub fn cdist_mahalanobis(
         let qxi = qx[i];
         let ci = &cross[i];
         (0..nb)
-            .map(|j| (qxi + qy[j] - 2.0 * ci[j]).max(0.0).sqrt())
+            .map(|j| mahalanobis_root(qxi + qy[j] - 2.0 * ci[j]))
             .collect()
     };
     // The assembly is a CHEAP per-cell op (one sqrt), so it needs a much higher work gate than the
@@ -7193,7 +7204,7 @@ pub fn pdist_mahalanobis(x: &[Vec<f64>], vi: &[Vec<f64>]) -> Result<Vec<f64>, Sp
             let qi = q[i];
             let gi = &g[i];
             for j in (i + 1)..n {
-                out.push((qi + q[j] - 2.0 * gi[j]).max(0.0).sqrt());
+                out.push(mahalanobis_root(qi + q[j] - 2.0 * gi[j]));
             }
         }
         return Ok(out);
@@ -7216,7 +7227,7 @@ pub fn pdist_mahalanobis(x: &[Vec<f64>], vi: &[Vec<f64>]) -> Result<Vec<f64>, Sp
                     let gi = &g_ref[i];
                     let k0 = offset(i) - base;
                     for (slot, j) in head[k0..].iter_mut().zip((i + 1)..n) {
-                        *slot = (qi + q_ref[j] - 2.0 * gi[j]).max(0.0).sqrt();
+                        *slot = mahalanobis_root(qi + q_ref[j] - 2.0 * gi[j]);
                     }
                 }
             });
@@ -7340,10 +7351,18 @@ fn minkowski_rowwise(
         }
         // Mirror scipy's exact three-way branch on p.
         let val = if p == f64::INFINITY {
+            // numpy's `amax` keeps a NaN; `f64::max` would drop it and report the largest
+            // finite coordinate gap instead.
             a.iter()
                 .zip(b.iter())
                 .map(|(&ai, &bi)| (bi - ai).abs())
-                .fold(0.0_f64, f64::max)
+                .fold(0.0_f64, |m, d| {
+                    if m.is_nan() || d.is_nan() {
+                        f64::NAN
+                    } else {
+                        m.max(d)
+                    }
+                })
         } else if p == 1.0 {
             a.iter()
                 .zip(b.iter())
@@ -14114,6 +14133,67 @@ mod tests {
         ];
         let n = num_obs_dm(&matrix);
         assert_eq!(n, 3, "num_obs_dm should return 3");
+    }
+
+    /// A NaN coordinate makes the p = ∞ row distance NaN, as numpy's `amax` does. SciPy 1.17.1:
+    /// `minkowski_distance([[nan, 1], [0, 3]], [[0, 0], [0, 0]], inf)` and `minkowski_distance_p`
+    /// on the same rows both return `[nan, 3.0]`; the finite `[[1, -3]]` vs `[[0, 0]]` returns
+    /// `[3.0]`. fsci's `fold(0.0, f64::max)` dropped the NaN and returned 1.0 for row 0.
+    #[test]
+    fn minkowski_distance_inf_keeps_a_nan_like_scipy() {
+        let x = vec![vec![f64::NAN, 1.0], vec![0.0, 3.0]];
+        let y = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+        for d in [
+            minkowski_distance(&x, &y, f64::INFINITY).expect("row counts match"),
+            minkowski_distance_p(&x, &y, f64::INFINITY).expect("row counts match"),
+        ] {
+            assert!(
+                d[0].is_nan(),
+                "SciPy returns NaN for the NaN row; fsci {d:?}"
+            );
+            assert_eq!(d[1], 3.0);
+        }
+        let finite = minkowski_distance(&[vec![1.0, -3.0]], &[vec![0.0, 0.0]], f64::INFINITY)
+            .expect("row counts match");
+        assert_eq!(finite, vec![3.0]);
+    }
+
+    /// A NaN coordinate makes the Mahalanobis distance NaN, as SciPy's `np.sqrt` of a NaN quadratic
+    /// form does. SciPy 1.17.1 with VI = I₂: `mahalanobis([nan, 1], [0, 0], VI)` is nan;
+    /// `cdist([[nan, 1], [0, 3]], [[0, 0], [0, 0]], 'mahalanobis', VI=VI)` is
+    /// `[[nan, nan], [3, 3]]`; `pdist([[nan, 1], [0, 3], [1, 1]], 'mahalanobis', VI=VI)` is
+    /// `[nan, nan, 2.23606797749979]`. Finite: `mahalanobis([3, 4], [0, 0], VI)` is 5.0 and
+    /// `pdist([[0, 0], [3, 4], [1, 1]], ...)` is `[5.0, 1.4142135623730951, 3.605551275463989]`.
+    /// fsci clamped the form with `f64::max(q, 0.0)`, which turned a NaN into distance 0.
+    #[test]
+    fn mahalanobis_family_keeps_a_nan_like_scipy() {
+        let vi = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        assert!(mahalanobis(&[f64::NAN, 1.0], &[0.0, 0.0], &vi).is_nan());
+        assert_eq!(mahalanobis(&[3.0, 4.0], &[0.0, 0.0], &vi), 5.0);
+
+        let xa = vec![vec![f64::NAN, 1.0], vec![0.0, 3.0]];
+        let xb = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+        let c = cdist_mahalanobis(&xa, &xb, &vi).expect("shapes agree");
+        assert!(
+            c[0].iter().all(|v| v.is_nan()),
+            "SciPy row 0 is [nan, nan]; fsci {c:?}"
+        );
+        assert_eq!(c[1], vec![3.0, 3.0]);
+
+        let with_nan = [vec![f64::NAN, 1.0], vec![0.0, 3.0], vec![1.0, 1.0]];
+        let p = pdist_mahalanobis(&with_nan, &vi).expect("shapes agree");
+        assert!(
+            p[0].is_nan() && p[1].is_nan(),
+            "SciPy [nan, nan, 2.236..]; fsci {p:?}"
+        );
+        assert!((p[2] - 2.23606797749979).abs() < 1e-12, "{p:?}");
+        let finite = [vec![0.0, 0.0], vec![3.0, 4.0], vec![1.0, 1.0]];
+        let q = pdist_mahalanobis(&finite, &vi).expect("shapes agree");
+        let expected = [5.0, 1.4142135623730951, 3.605551275463989];
+        assert_eq!(q.len(), expected.len());
+        for (got, want) in q.iter().zip(expected) {
+            assert!((got - want).abs() < 1e-12, "{q:?}");
+        }
     }
 }
 

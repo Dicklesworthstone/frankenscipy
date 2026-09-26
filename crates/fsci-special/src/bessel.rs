@@ -6499,7 +6499,11 @@ pub fn lmbda(v: f64, x: f64) -> (Vec<f64>, Vec<f64>) {
     // TAKE THE MEASURED DOMAIN, NOT THE MESSAGE: scipy says "argument must be
     // > 0." but v == 0.0 is ACCEPTED and returns 0.22389077914123562 at x = 2.
     // Only v < 0 is rejected.
-    if v < 0.0 {
+    //
+    // A NaN order is rejected too: scipy's `int(v)` raises ValueError ("cannot convert
+    // float NaN to integer"), while `v.floor().max(0.0)` below would turn NaN into n = 0
+    // and lmbda(NaN, 0.0) would answer ([1.0], [0.0]).
+    if v.is_nan() || v < 0.0 {
         return (vec![f64::NAN], vec![f64::NAN]);
     }
     let n = v.floor().max(0.0) as usize;
@@ -7352,6 +7356,25 @@ mod tests {
             "dl {}",
             dl[0]
         );
+    }
+
+    /// A NaN order must not become order 0. SciPy 1.17.1 raises ValueError ("cannot convert
+    /// float NaN to integer") for lmbda(nan, 0.0) and lmbda(nan, 2.0); fsci signals that
+    /// domain error with NaN, as it does for v < 0. `v.floor().max(0.0)` used to drop the
+    /// NaN, so lmbda(NaN, 0.0) took the x = 0 branch and answered ([1.0], [0.0]).
+    /// Must not change, SciPy 1.17.1: lmbda(0.5, 0.0) = ([1.0], [-0.0]) and
+    /// lmbda(2.0, 0.0) = ([1.0, 0.0, 0.0], [0.0, 0.5, 0.0]).
+    #[test]
+    fn lmbda_signals_a_nan_order_like_scipy_raises() {
+        for x in [0.0, 2.0] {
+            let (vl, dl) = lmbda(f64::NAN, x);
+            assert!(
+                vl.iter().all(|z| z.is_nan()) && dl.iter().all(|z| z.is_nan()),
+                "lmbda(NaN, {x}) must be NaN-signalled, got vl={vl:?} dl={dl:?}"
+            );
+        }
+        assert_eq!(lmbda(0.5, 0.0), (vec![1.0], vec![0.0]));
+        assert_eq!(lmbda(2.0, 0.0), (vec![1.0, 0.0, 0.0], vec![0.0, 0.5, 0.0]));
     }
 
     #[test]
