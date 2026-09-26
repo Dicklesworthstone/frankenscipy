@@ -565,13 +565,17 @@ fn compute_cubic_spline(x: &[f64], y: &[f64], bc: SplineBc) -> Result<Vec<[f64; 
     let m = n - 1; // number of intervals
     let h: Vec<f64> = (0..m).map(|i| x[i + 1] - x[i]).collect();
 
-    if let SplineBc::Periodic = bc {
-        let scale = y[0].abs().max(y[n - 1].abs()).max(1.0);
-        if (y[0] - y[n - 1]).abs() > 1e-12 * scale {
-            return Err(InterpError::InvalidArgument {
-                detail: "periodic spline requires y[0] == y[n-1]".to_string(),
-            });
-        }
+    // scipy `CubicSpline`: `np.allclose(y[0], y[-1], rtol=1e-15, atol=1e-15)`, relative to
+    // y[-1]. The test used to be 1e-12·max(|y|, 1), which accepted endpoints 1000 times further
+    // apart than scipy does; written as `!(… <= …)` so a NaN endpoint is refused.
+    if let SplineBc::Periodic = bc
+        && !((y[0] - y[n - 1]).abs() <= 1e-15 + 1e-15 * y[n - 1].abs())
+    {
+        return Err(InterpError::InvalidArgument {
+            detail: "The first and last `y` point along axis 0 must be identical (within \
+                     machine precision) when bc_type='periodic'."
+                .to_string(),
+        });
     }
     if let Some(coeffs) = cubic_spline_few_points(y, &h, bc) {
         return Ok(coeffs);
@@ -3917,25 +3921,27 @@ impl RegularGridInterpolator {
                 detail: format!("expected {ndim}D, got {}D", xi.len()),
             });
         }
-        if xi.iter().any(|x| x.is_nan()) {
-            self.reject_non_finite_pchip_values()?;
-            return Ok(f64::NAN);
-        }
+        // scipy's `_prepare_xi` tests `grid[0] <= p <= grid[-1]` per dimension before anything
+        // else when bounds_error is set, and a NaN coordinate fails it: "One of the requested xi
+        // is out of bounds". Without bounds_error a NaN query is NaN, ahead of the fill value.
         let mut out_of_bounds = false;
         for (dim, &x) in xi.iter().enumerate() {
             let axis = &self.points[dim];
-            if x < axis[0] || x > axis[axis.len() - 1] {
-                if self.bounds_error {
-                    return Err(InterpError::OutOfBounds {
-                        value: format!(
-                            "dim {dim}: {x} outside [{}, {}]",
-                            axis[0],
-                            axis[axis.len() - 1]
-                        ),
-                    });
-                }
-                out_of_bounds = true;
+            let inside = x >= axis[0] && x <= axis[axis.len() - 1];
+            if !inside && self.bounds_error {
+                return Err(InterpError::OutOfBounds {
+                    value: format!(
+                        "dim {dim}: {x} outside [{}, {}]",
+                        axis[0],
+                        axis[axis.len() - 1]
+                    ),
+                });
             }
+            out_of_bounds |= !inside;
+        }
+        if xi.iter().any(|x| x.is_nan()) {
+            self.reject_non_finite_pchip_values()?;
+            return Ok(f64::NAN);
         }
         if out_of_bounds && let Some(fill) = self.fill_value {
             self.reject_non_finite_pchip_values()?;
@@ -3948,6 +3954,33 @@ impl RegularGridInterpolator {
             RegularGridMethod::Cubic => self.eval_spline(xi, 3),
             RegularGridMethod::Quintic => self.eval_spline(xi, 5),
         }
+    }
+
+    /// scipy's `_prepare_xi` with bounds_error: every query's dimension count first, then
+    /// `grid[i][0] <= p <= grid[i][-1]` for dimension i = 0, 1, … across the WHOLE batch, before
+    /// any evaluation. So the error names the lowest failing dimension over all queries, a NaN
+    /// coordinate fails, and it comes ahead of pchip's non-finite-values error for an in-range
+    /// query earlier in the batch. scipy 1.17.1, live, on a 6 × 6 grid over [1, 6]²:
+    /// [[2.5, 9.0], [-5.0, 2.5]] raises for dimension 0, [[2.5, 2.5], [nan, 2.5]] for dimension 0.
+    fn check_batch_bounds(&self, xi: &[Vec<f64>]) -> Result<(), InterpError> {
+        let ndim = self.ndim();
+        if let Some(point) = xi.iter().find(|point| point.len() != ndim) {
+            return Err(InterpError::InvalidArgument {
+                detail: format!("expected {ndim}D, got {}D", point.len()),
+            });
+        }
+        for (dim, axis) in self.points.iter().enumerate() {
+            let (lo, hi) = (axis[0], axis[axis.len() - 1]);
+            if let Some(point) = xi
+                .iter()
+                .find(|point| !(point[dim] >= lo && point[dim] <= hi))
+            {
+                return Err(InterpError::OutOfBounds {
+                    value: format!("dim {dim}: {} outside [{lo}, {hi}]", point[dim]),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// scipy's pchip path fits `PchipInterpolator` over the whole value grid on every call
@@ -3965,6 +3998,9 @@ impl RegularGridInterpolator {
     pub fn eval_many(&self, xi: &[Vec<f64>]) -> Result<Vec<f64>, InterpError> {
         if xi.is_empty() {
             self.reject_non_finite_pchip_values()?;
+        }
+        if self.bounds_error {
+            self.check_batch_bounds(xi)?;
         }
         if self.method == RegularGridMethod::Nearest && self.ndim() == 3 {
             return self.eval_many_nearest_3d(xi);
@@ -4039,24 +4075,24 @@ impl RegularGridInterpolator {
                 detail: format!("expected {ndim}D, got {}D", xi.len()),
             });
         }
-        if xi.iter().any(|x| x.is_nan()) {
-            return Ok(f64::NAN);
-        }
+        // As in `eval`: with bounds_error a NaN coordinate is out of bounds.
         let mut out_of_bounds = false;
         for (dim, &x) in xi.iter().enumerate() {
             let axis = &self.points[dim];
-            if x < axis[0] || x > axis[axis.len() - 1] {
-                if self.bounds_error {
-                    return Err(InterpError::OutOfBounds {
-                        value: format!(
-                            "dim {dim}: {x} outside [{}, {}]",
-                            axis[0],
-                            axis[axis.len() - 1]
-                        ),
-                    });
-                }
-                out_of_bounds = true;
+            let inside = x >= axis[0] && x <= axis[axis.len() - 1];
+            if !inside && self.bounds_error {
+                return Err(InterpError::OutOfBounds {
+                    value: format!(
+                        "dim {dim}: {x} outside [{}, {}]",
+                        axis[0],
+                        axis[axis.len() - 1]
+                    ),
+                });
             }
+            out_of_bounds |= !inside;
+        }
+        if xi.iter().any(|x| x.is_nan()) {
+            return Ok(f64::NAN);
         }
         if out_of_bounds && let Some(fill) = self.fill_value {
             return Ok(fill);
@@ -4187,26 +4223,25 @@ impl RegularGridInterpolator {
                 });
             }
             let p = [point[0], point[1], point[2]];
-            if p[0].is_nan() || p[1].is_nan() || p[2].is_nan() {
-                return Ok(f64::NAN);
-            }
-
+            // As in `eval`: with bounds_error a NaN coordinate is out of bounds.
             let mut out_of_bounds = false;
             for dim in 0..3 {
                 let axis = ax[dim];
-                if p[dim] < axis[0] || p[dim] > axis[axis.len() - 1] {
-                    if self.bounds_error {
-                        return Err(InterpError::OutOfBounds {
-                            value: format!(
-                                "dim {dim}: {} outside [{}, {}]",
-                                p[dim],
-                                axis[0],
-                                axis[axis.len() - 1]
-                            ),
-                        });
-                    }
-                    out_of_bounds = true;
+                let inside = p[dim] >= axis[0] && p[dim] <= axis[axis.len() - 1];
+                if !inside && self.bounds_error {
+                    return Err(InterpError::OutOfBounds {
+                        value: format!(
+                            "dim {dim}: {} outside [{}, {}]",
+                            p[dim],
+                            axis[0],
+                            axis[axis.len() - 1]
+                        ),
+                    });
                 }
+                out_of_bounds |= !inside;
+            }
+            if p[0].is_nan() || p[1].is_nan() || p[2].is_nan() {
+                return Ok(f64::NAN);
             }
             if out_of_bounds && let Some(fill) = self.fill_value {
                 return Ok(fill);
@@ -15236,6 +15271,110 @@ mod tests {
         assert!(interp.eval(&[f64::NAN]).unwrap().is_nan());
     }
 
+    /// With bounds_error, scipy 1.17.1 `RegularGridInterpolator` raises "One of the requested xi
+    /// is out of bounds in dimension i" for a NaN coordinate (`grid[0] <= nan` is false), for
+    /// every method; fsci returned NaN. It checks the whole batch, dimension by dimension,
+    /// before evaluating, so on a 6 × 6 grid over [1, 6]² with v[i, j] = (i+1)²·√(j+1),
+    /// [[2.5, 9.0], [-5.0, 2.5]] raises for dimension 0 (not 1), and with v[1, 2] = nan pchip
+    /// raises the bounds error for [[2.5, 2.5], [-5.0, 2.5]] rather than "`y` must contain only
+    /// finite values." Must not change: without bounds_error a NaN query is NaN, and in range
+    /// linear gives 10.225359202311411 and pchip 9.869437470571906 at (2.5, 2.5).
+    #[test]
+    fn regular_grid_bounds_error_refuses_nan_query_like_scipy() {
+        let axis: Vec<f64> = (0..6).map(f64::from).collect();
+        let values: Vec<f64> = axis.iter().map(|v| v * v).collect();
+        let methods = [
+            RegularGridMethod::Linear,
+            RegularGridMethod::Nearest,
+            RegularGridMethod::Pchip,
+            RegularGridMethod::Cubic,
+            RegularGridMethod::Quintic,
+        ];
+        for method in methods {
+            let build = |bounds_error: bool| {
+                RegularGridInterpolator::new(
+                    vec![axis.clone()],
+                    values.clone(),
+                    method,
+                    bounds_error,
+                    None,
+                )
+                .expect("regular grid")
+            };
+            let strict = build(true);
+            assert!(
+                matches!(
+                    strict.eval(&[f64::NAN]),
+                    Err(InterpError::OutOfBounds { .. })
+                ),
+                "{method:?} eval nan"
+            );
+            assert!(
+                matches!(
+                    strict.eval_many(&[vec![0.5], vec![f64::NAN]]),
+                    Err(InterpError::OutOfBounds { .. })
+                ),
+                "{method:?} eval_many nan"
+            );
+            let lenient = build(false);
+            assert!(
+                lenient.eval(&[f64::NAN]).expect("nan query").is_nan(),
+                "{method:?} lenient"
+            );
+            let batch = lenient
+                .eval_many(&[vec![0.5], vec![f64::NAN]])
+                .expect("lenient batch");
+            assert!(
+                batch[0].is_finite() && batch[1].is_nan(),
+                "{method:?} {batch:?}"
+            );
+        }
+
+        let grid: Vec<f64> = (1..=6).map(f64::from).collect();
+        let v: Vec<f64> = (0..6)
+            .flat_map(|i| {
+                (0..6).map(move |j| f64::from((i + 1) * (i + 1)) * f64::from(j + 1).sqrt())
+            })
+            .collect();
+        let points = vec![grid.clone(), grid.clone()];
+        let make = |method, vals: Vec<f64>| {
+            RegularGridInterpolator::new(points.clone(), vals, method, true, None)
+                .expect("regular grid")
+        };
+        let dim_of = |result: Result<Vec<f64>, InterpError>| match result {
+            Err(InterpError::OutOfBounds { value }) => value.split(':').next().map(str::to_owned),
+            other => panic!("expected OutOfBounds, got {other:?}"),
+        };
+        let linear = make(RegularGridMethod::Linear, v.clone());
+        assert_eq!(
+            dim_of(linear.eval_many(&[vec![2.5, 9.0], vec![-5.0, 2.5]])).as_deref(),
+            Some("dim 0")
+        );
+        assert_eq!(
+            dim_of(linear.eval_many(&[vec![2.5, 2.5], vec![2.5, 9.0]])).as_deref(),
+            Some("dim 1")
+        );
+        let in_range = linear.eval_many(&[vec![2.5, 2.5]]).expect("in range");
+        assert!(
+            (in_range[0] - 10.225_359_202_311_411).abs() <= 1e-12,
+            "{in_range:?}"
+        );
+        let pchip = make(RegularGridMethod::Pchip, v.clone());
+        let in_range = pchip.eval_many(&[vec![2.5, 2.5]]).expect("in range");
+        assert!(
+            (in_range[0] - 9.869_437_470_571_906).abs() <= 1e-10,
+            "{in_range:?}"
+        );
+
+        let mut vn = v;
+        vn[6 + 2] = f64::NAN;
+        let pchip_nan = make(RegularGridMethod::Pchip, vn);
+        assert_eq!(
+            dim_of(pchip_nan.eval_many(&[vec![2.5, 2.5], vec![-5.0, 2.5]])).as_deref(),
+            Some("dim 0")
+        );
+    }
+
     #[test]
     fn regular_grid_rejects_nan_in_points() {
         let points = vec![vec![0.0, f64::NAN, 2.0]];
@@ -15846,6 +15985,42 @@ mod tests {
         let y = vec![0.0, 1.0, 0.5, 0.25];
         let err = CubicSplineStandalone::new(&x, &y, SplineBc::Periodic).expect_err("periodic");
         assert!(matches!(err, InterpError::InvalidArgument { .. }));
+    }
+
+    /// scipy 1.17.1 `CubicSpline(x, y, bc_type='periodic')` requires
+    /// `np.allclose(y[0], y[-1], rtol=1e-15, atol=1e-15)`; fsci allowed 1e-12·max(|y|, 1).
+    /// x = [0, 1, 2, 3], y = [y0, 1, 2, y_end] (1 for y0 where not given), live:
+    /// - raises: y_end = 1 + 1e-14, y = [0, …, 1.1e-15], and y = [1e300, …, 1e300·(1 + 2e-15)];
+    /// - accepts: y_end = 1 + 9·2⁻⁵² (≈ 1 + 2e-15; 0.7500000000000002 at 0.5),
+    ///   y = [0, …, 1e-15], and y = [-0.0, …, 0.0] (0.12500000000000006 at 0.5).
+    #[test]
+    fn cubic_spline_periodic_endpoint_tolerance_matches_scipy() {
+        let x = [0.0, 1.0, 2.0, 3.0];
+        let build = |y0: f64, y_end: f64| {
+            CubicSplineStandalone::new(&x, &[y0, 1.0, 2.0, y_end], SplineBc::Periodic)
+        };
+        for (y0, y_end) in [
+            (1.0, 1.0 + 1e-14),
+            (0.0, 1.1e-15),
+            (1e300, 1e300 * (1.0 + 2e-15)),
+        ] {
+            let result = build(y0, y_end);
+            assert!(
+                matches!(result, Err(InterpError::InvalidArgument { .. })),
+                "y0 = {y0:e}, y_end = {y_end:e}: scipy raises, got {result:?}"
+            );
+        }
+        for (y0, y_end) in [(1.0, 1.0 + 9.0 * f64::EPSILON), (0.0, 1e-15), (-0.0, 0.0)] {
+            let result = build(y0, y_end);
+            assert!(
+                result.is_ok(),
+                "y0 = {y0:e}, y_end = {y_end:e}: scipy accepts, got {result:?}"
+            );
+        }
+        let spline = build(1.0, 1.0 + 9.0 * f64::EPSILON).expect("scipy accepts");
+        assert!((spline.eval(0.5) - 0.750_000_000_000_000_2).abs() <= 1e-15);
+        let signed_zero = build(-0.0, 0.0).expect("scipy accepts");
+        assert!((signed_zero.eval(0.5) - 0.125_000_000_000_000_06).abs() <= 1e-15);
     }
 
     /// frankenscipy-no7rr. `CubicSpline::integrate` clamped both bounds to `[x[0], x[n-1]]`
