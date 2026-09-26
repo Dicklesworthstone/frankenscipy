@@ -3251,7 +3251,9 @@ fn result_from_error(
         }
         OptError::SignChangeRequired { detail } => (ConvergenceStatus::InvalidInput, detail),
         OptError::NotImplemented { detail } => (ConvergenceStatus::NotImplemented, detail),
-        OptError::NotConverged { detail } => (ConvergenceStatus::MaxIterations, detail),
+        OptError::NotConverged { detail } | OptError::NoConvergence { detail } => {
+            (ConvergenceStatus::MaxIterations, detail)
+        }
     };
     OptimizeResult {
         x: x.to_vec(),

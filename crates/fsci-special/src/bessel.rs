@@ -233,7 +233,15 @@ pub fn jn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
     map_real_binary("jn", n, z, mode, |order, x| jn_scalar(order, x, mode))
 }
 
+/// Under `errstate`, a negative argument is SciPy's "domain error" and zero its
+/// "singularity" (`y0`).
 pub fn y0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = y0_dispatch(z, mode)?;
+    crate::sf_error_unary("y0", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
+}
+
+fn y0_dispatch(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if BESSEL_Y01_HOIST_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
         BESSEL_Y01_HOIST_FLAG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cephes_large = BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed);
@@ -244,7 +252,15 @@ pub fn y0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_input("y0", z, mode, 1 << 16, |x| y0_scalar(x, mode))
 }
 
+/// Under `errstate`, a negative argument is SciPy's "domain error" and zero its
+/// "singularity" (`y1`).
 pub fn y1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = y1_dispatch(z, mode)?;
+    crate::sf_error_unary("y1", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
+}
+
+fn y1_dispatch(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if BESSEL_Y01_HOIST_FLAG.load(std::sync::atomic::Ordering::Relaxed) {
         BESSEL_Y01_HOIST_FLAG_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let cephes_large = BESSEL_Y01_CEPHES_LARGE.load(std::sync::atomic::Ordering::Relaxed);
@@ -270,8 +286,14 @@ pub static BESSEL_Y01_HOIST_FLAG: std::sync::atomic::AtomicBool =
 pub static BESSEL_Y01_HOIST_FLAG_HITS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Under `errstate`, a negative argument is SciPy's "domain error" and zero its
+/// "singularity" (`yn`), for every order.
 pub fn yn(n: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_binary("yn", n, z, mode, |order, x| yn_scalar(order, x, mode))
+    let value = map_real_binary("yn", n, z, mode, |order, x| yn_scalar(order, x, mode))?;
+    crate::sf_error_binary("yn", n, z, mode, |_, x| {
+        crate::sf_negative_domain_zero_pole(x)
+    })?;
+    Ok(value)
 }
 
 /// Bessel function of the first kind for real order v: J_v(z).
@@ -722,8 +744,15 @@ pub fn kv(v: &SpecialTensor, z: &SpecialTensor, mode: RuntimeMode) -> SpecialRes
 
 /// Modified Bessel function of the second kind of order 0: K_0(z).
 ///
-/// Convenience wrapper for kv(0, z). Matches `scipy.special.k0(z)`.
+/// Convenience wrapper for kv(0, z). Matches `scipy.special.k0(z)`. Under `errstate`, a
+/// negative argument is SciPy's "domain error" and zero its "singularity".
 pub fn k0(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = k0_dispatch(z, mode)?;
+    crate::sf_error_unary("k0", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
+}
+
+fn k0_dispatch(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if let Some(cephes) = hoisted_k01_flag() {
         return map_real_input("k0", z, mode, 1 << 12, move |x| {
             k0_order_scalar_with(x, mode, cephes, false)
@@ -812,8 +841,15 @@ fn k1_order_scalar_with(
 
 /// Modified Bessel function of the second kind of order 1: K_1(z).
 ///
-/// Convenience wrapper for kv(1, z). Matches `scipy.special.k1(z)`.
+/// Convenience wrapper for kv(1, z). Matches `scipy.special.k1(z)`. Under `errstate`, a
+/// negative argument is SciPy's "domain error" and zero its "singularity".
 pub fn k1(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = k1_dispatch(z, mode)?;
+    crate::sf_error_unary("k1", z, mode, crate::sf_negative_domain_zero_pole)?;
+    Ok(value)
+}
+
+fn k1_dispatch(z: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     if let Some(cephes) = hoisted_k01_flag() {
         return map_real_input("k1", z, mode, 1 << 12, move |x| {
             k1_order_scalar_with(x, mode, cephes, false)

@@ -74,16 +74,31 @@ pub const ELLIPTIC_DISPATCH_PLAN: &[DispatchPlan] = &[
 /// K(m) = ∫₀^{π/2} dθ / sqrt(1 - m sin²θ)
 ///
 /// Uses the arithmetic-geometric mean (AGM) iteration.
-/// Domain: m in [0, 1).
+/// Domain: m in [0, 1). Under `errstate`, `m = 1` is SciPy's "singularity" and `m > 1` its
+/// "domain error" (`ellpk`, which SciPy evaluates at `1 - m`).
 pub fn ellipk(m_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_or_complex_rp(
+    let value = map_real_or_complex_rp(
         "ellipk",
         m_tensor,
         mode,
         |m| ellipk_scalar(m, mode),
         ellipk_complex_scalar,
         1 << 20, // work-gated: serial small, par_map_indices for huge arrays (>=1M)
-    )
+    )?;
+    crate::sf_error_unary("ellpk", m_tensor, mode, |m| sf_ellpk(1.0 - m))?;
+    Ok(value)
+}
+
+/// SciPy's `ellpk(p)` test on the complementary parameter: `p < 0` is a domain error and
+/// `p = 0` a singularity.
+fn sf_ellpk(p: f64) -> Option<crate::SpecialErrorCode> {
+    if p < 0.0 {
+        Some(crate::SpecialErrorCode::Domain)
+    } else if p == 0.0 {
+        Some(crate::SpecialErrorCode::Singular)
+    } else {
+        None
+    }
 }
 
 /// Complete elliptic integral of the first kind with complementary argument.
@@ -91,16 +106,19 @@ pub fn ellipk(m_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
 /// K(1-p) where p = 1 - m is the complementary parameter.
 ///
 /// This is numerically stable when p is small (m close to 1).
-/// Matches `scipy.special.ellipkm1(p)`.
+/// Matches `scipy.special.ellipkm1(p)`. Under `errstate`, `p = 0` is SciPy's "singularity"
+/// and `p < 0` its "domain error" (`ellpk`).
 pub fn ellipkm1(p_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_or_complex_rp(
+    let value = map_real_or_complex_rp(
         "ellipkm1",
         p_tensor,
         mode,
         |p| ellipkm1_scalar(p, mode),
         |p| ellipkm1_complex_scalar(p, mode),
         1 << 20, // cheap Cephes ~20ns: serial until ~1M (matches ellipk); n/32 over-subscribes up to 21x
-    )
+    )?;
+    crate::sf_error_unary("ellpk", p_tensor, mode, sf_ellpk)?;
+    Ok(value)
 }
 
 /// Complete elliptic integral of the second kind E(m).

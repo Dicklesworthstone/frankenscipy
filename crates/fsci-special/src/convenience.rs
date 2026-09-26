@@ -430,9 +430,14 @@ pub fn ndtr_scalar(x: f64) -> f64 {
 
 /// Inverse standard normal cumulative distribution function Φ⁻¹(y).
 ///
-/// Matches `scipy.special.ndtri(y)`.
+/// Matches `scipy.special.ndtri(y)`. Under `errstate`, `y` outside `[0, 1]` is SciPy's
+/// "domain error".
 pub fn ndtri(y_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
-    map_real_wg("ndtri", y_tensor, mode, |y| Ok(ndtri_scalar(y)))
+    let value = map_real_wg("ndtri", y_tensor, mode, |y| Ok(ndtri_scalar(y)))?;
+    crate::sf_error_unary("ndtri", y_tensor, mode, |y| {
+        (!(0.0..=1.0).contains(&y) && !y.is_nan()).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
 }
 
 #[must_use]
@@ -4545,7 +4550,17 @@ pub fn log_softmax(x: &[f64]) -> Vec<f64> {
 /// (scipy accepts complex `spence` and `cspence`, returning finite values
 /// across the whole plane — our previous real-only kernel fail-closed on
 /// complex input).
+///
+/// Under `errstate`, a negative real argument is SciPy's "domain error".
 pub fn spence(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
+    let value = spence_dispatch(x_tensor, mode)?;
+    crate::sf_error_unary("spence", x_tensor, mode, |x| {
+        (x < 0.0).then_some(crate::SpecialErrorCode::Domain)
+    })?;
+    Ok(value)
+}
+
+fn spence_dispatch(x_tensor: &SpecialTensor, mode: RuntimeMode) -> SpecialResult {
     map_real_or_complex(
         "spence",
         x_tensor,

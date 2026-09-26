@@ -272,6 +272,8 @@ pub enum SpecialErrorKind {
     SingularityRisk,
     NotYetImplemented,
     ShapeMismatch,
+    /// SciPy's `SpecialFunctionError`: an error class set to "raise" by `seterr`/`errstate`.
+    Errstate(crate::SpecialErrorCode),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

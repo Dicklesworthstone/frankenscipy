@@ -84,13 +84,10 @@ pub use types::{
     RootOptions,
 };
 
-/// Warning emitted during optimization routines, matching `scipy.optimize.OptimizeWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OptimizeWarning(pub String);
-
-/// Error indicating solver failure to converge within iteration budget, matching `scipy.optimize.NoConvergence`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NoConvergence(pub String);
+// SciPy's `OptimizeWarning` is `WarningCategory::OptimizeWarning` (raised by `curve_fit` when
+// the covariance cannot be estimated), and its `NoConvergence` exception is
+// `OptError::NoConvergence`.
+pub use fsci_runtime::{Warning, WarningCategory, catch_warnings};
 
 /// Verbose display callback for linear programming, matching `scipy.optimize.linprog_verbose_callback`.
 pub fn linprog_verbose_callback(res: &OptimizeResult) {
@@ -3894,8 +3891,11 @@ where
     Ok(f0)
 }
 
+/// Every component within `NONLIN_FTOL`. A NaN component is not: the max-norm fold this
+/// replaced let `f64::max` drop the NaN, so a residual gone NaN (x^2 + 1 = 0 from
+/// linearmixing) was returned as a root where SciPy raises NoConvergence.
 fn nonlin_converged(fx: &[f64]) -> bool {
-    fx.iter().fold(0.0_f64, |m, &v| m.max(v.abs())) < NONLIN_FTOL
+    fx.iter().all(|v| v.abs() < NONLIN_FTOL)
 }
 
 fn validate_nonlin_maxiter(maxiter: usize) -> Result<(), OptError> {
@@ -3975,7 +3975,7 @@ where
             return Ok(x);
         }
     }
-    Err(OptError::EvaluationBudgetExceeded {
+    Err(OptError::NoConvergence {
         detail: format!("diagbroyden failed to converge in {maxiter} iterations"),
     })
 }
@@ -3986,8 +3986,8 @@ where
 /// The Jacobian is fixed at `-1/alpha`, so the step is `dx = alpha·F(x)`,
 /// globalized by an Armijo line search. As scipy warns, convergence depends
 /// strongly on a well-chosen (often negative) `alpha`; when `alpha` is `None`
-/// it is auto-scaled like scipy's. Returns the converged root or
-/// `EvaluationBudgetExceeded`.
+/// it is auto-scaled like scipy's. Returns the converged root or, where SciPy
+/// raises `NoConvergence`, [`OptError::NoConvergence`].
 pub fn linearmixing<F>(
     func: F,
     x0: &[f64],
@@ -4015,7 +4015,7 @@ where
             return Ok(x);
         }
     }
-    Err(OptError::EvaluationBudgetExceeded {
+    Err(OptError::NoConvergence {
         detail: format!("linearmixing failed to converge in {maxiter} iterations"),
     })
 }
@@ -4075,7 +4075,7 @@ where
             return Ok(x);
         }
     }
-    Err(OptError::EvaluationBudgetExceeded {
+    Err(OptError::NoConvergence {
         detail: format!("excitingmixing failed to converge in {maxiter} iterations"),
     })
 }
@@ -6710,6 +6710,19 @@ mod tests {
         assert!(linearmixing(f, &[0.0, 0.0], None, 0).is_err());
         assert!(linearmixing(f, &[0.0, 0.0], Some(0.0), 10).is_err());
         assert!(linearmixing(f, &[0.0, 0.0], Some(f64::INFINITY), 10).is_err());
+
+        // Running out of iterations is SciPy's NoConvergence, not an evaluation-budget error.
+        let no_root = |x: &[f64]| vec![x[0] * x[0] + 1.0];
+        for outcome in [
+            diagbroyden(no_root, &[1.0], None, 5),
+            linearmixing(no_root, &[1.0], None, 5),
+            crate::excitingmixing(no_root, &[1.0], None, 1.0, 5),
+        ] {
+            assert!(
+                matches!(outcome, Err(OptError::NoConvergence { .. })),
+                "{outcome:?}"
+            );
+        }
     }
 
     #[test]

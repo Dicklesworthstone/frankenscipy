@@ -98,9 +98,9 @@ pub fn record_bounded_recovery(
     lock_or_recover(ledger).record(event);
 }
 
-/// Warning emitted when filter coefficients are numerically unstable or degenerate, matching `scipy.signal.BadCoefficients`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BadCoefficients(pub String);
+// SciPy's `BadCoefficients` is `WarningCategory::BadCoefficients`, raised by `normalize`
+// (and so by `tf2zpk`, `tf2sos` and the `lp2*` transforms, which normalize their output).
+pub use fsci_runtime::{Warning, WarningCategory, catch_warnings};
 
 /// Error type for signal processing operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6519,7 +6519,7 @@ pub fn lp2lp(b: &[f64], a: &[f64], wo: f64) -> Result<(Vec<f64>, Vec<f64>), Sign
         .enumerate()
         .map(|(i, &ai)| ai / wo.powi((d - 1 - i) as i32))
         .collect();
-    normalize_filter(&new_b, &new_a)
+    normalize(&new_b, &new_a)
 }
 
 /// Transform a lowpass filter prototype to a highpass filter, in
@@ -6556,7 +6556,7 @@ pub fn lp2hp(b: &[f64], a: &[f64], wo: f64) -> Result<(Vec<f64>, Vec<f64>), Sign
     for j in 0..=ma {
         new_a[j] = a[ma - j] * wo.powi(j as i32);
     }
-    normalize_filter(&new_b, &new_a)
+    normalize(&new_b, &new_a)
 }
 
 /// Binomial coefficient as `f64`.
@@ -6634,7 +6634,7 @@ pub fn lp2bp(b: &[f64], a: &[f64], wo: f64, bw: f64) -> Result<(Vec<f64>, Vec<f6
         aprime[dp - j] = val;
     }
 
-    normalize_filter(&bprime, &aprime)
+    normalize(&bprime, &aprime)
 }
 
 /// Transform a lowpass filter prototype to a bandstop filter, in
@@ -6698,7 +6698,7 @@ pub fn lp2bs(b: &[f64], a: &[f64], wo: f64, bw: f64) -> Result<(Vec<f64>, Vec<f6
         aprime[np - j] = val;
     }
 
-    normalize_filter(&bprime, &aprime)
+    normalize(&bprime, &aprime)
 }
 
 /// Reject improper prototypes (more zeros than poles) — matches scipy's
@@ -7007,49 +7007,6 @@ pub fn phase_response(b: &[f64], a: &[f64], n_freqs: usize) -> (Vec<f64>, Vec<f6
 #[doc(hidden)]
 pub static PHASE_RESPONSE_FORCE_SERIAL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
-
-/// Normalize filter coefficients so the denominator is monic.
-///
-/// Matches `scipy.signal.normalize(b, a)`. Trims leading zeros from
-/// `a`, then divides both `b` and `a` by the resulting `a[0]` so the
-/// returned denominator starts with `1.0`.
-///
-/// Errors:
-///   * `a` is all-zero (or empty after trim) — degenerate filter.
-///   * `a` is empty — invalid input.
-///
-/// Resolves [frankenscipy-fx18c]. Distinct from the existing
-/// `normalize_signal` (zero-mean / unit-variance time-series scaler).
-pub fn normalize_filter(b: &[f64], a: &[f64]) -> Result<(Vec<f64>, Vec<f64>), SignalError> {
-    if a.is_empty() {
-        return Err(SignalError::InvalidArgument(
-            "denominator `a` must be non-empty".into(),
-        ));
-    }
-    // Reject non-finite coefficients up-front. Without this guard, NaN
-    // in `a` would slip past `v != 0.0` (NaN != 0 is true) and become
-    // the leading coefficient, propagating NaN through the normalized
-    // outputs with an Ok status — review-mode finding [n9ply].
-    if a.iter().any(|v| !v.is_finite()) {
-        return Err(SignalError::InvalidArgument(
-            "denominator `a` must contain only finite values".into(),
-        ));
-    }
-    if b.iter().any(|v| !v.is_finite()) {
-        return Err(SignalError::InvalidArgument(
-            "numerator `b` must contain only finite values".into(),
-        ));
-    }
-    let first_nonzero = a.iter().position(|&v| v != 0.0).ok_or_else(|| {
-        SignalError::InvalidArgument(
-            "denominator `a` must contain at least one nonzero coefficient".into(),
-        )
-    })?;
-    let leading = a[first_nonzero];
-    let a_norm: Vec<f64> = a[first_nonzero..].iter().map(|&v| v / leading).collect();
-    let b_norm: Vec<f64> = b.iter().map(|&v| v / leading).collect();
-    Ok((b_norm, a_norm))
-}
 
 /// Combine roots that are within `tol` of each other into unique groups.
 ///
@@ -10573,18 +10530,14 @@ pub type SosSection = [f64; 6];
 /// first error the worker hit. Used by the `*_axis_2d` parallel fan-outs.
 type ColumnBlocks = Vec<Result<(usize, Vec<Vec<f64>>), SignalError>>;
 
-/// Convert transfer function (b, a) to zero-pole-gain form.
-///
-/// Matches `scipy.signal.tf2zpk(b, a)`.
-///
-/// Finds zeros (roots of b) and poles (roots of a) via companion matrix eigenvalues.
 /// Normalize the coefficients of a transfer function `(b, a)`.
 ///
 /// Matches the 1-D form of `scipy.signal.normalize(b, a)`. Leading exact zeros
 /// in the denominator `a` are trimmed; both polynomials are then divided by the
 /// leading denominator coefficient so the result has `a[0] == 1`. Leading
 /// near-zero entries (`|·| <= 1e-14`) of the numerator are trimmed as well,
-/// keeping at least one coefficient.
+/// keeping at least one coefficient, and their presence raises SciPy's
+/// `BadCoefficients` warning.
 pub fn normalize(b: &[f64], a: &[f64]) -> Result<(Vec<f64>, Vec<f64>), SignalError> {
     if a.is_empty() {
         return Err(SignalError::InvalidArgument(
@@ -10605,7 +10558,14 @@ pub fn normalize(b: &[f64], a: &[f64]) -> Result<(Vec<f64>, Vec<f64>), SignalErr
     if num.is_empty() {
         num.push(0.0);
     }
-    // Trim leading near-zero numerator coefficients, leaving at least one.
+    // Trim leading near-zero numerator coefficients, leaving at least one. SciPy warns
+    // whenever there is one, including a numerator that is all near-zero.
+    if num[0].abs() <= 1e-14 {
+        fsci_runtime::warn(
+            WarningCategory::BadCoefficients,
+            "Badly conditioned filter coefficients (numerator): the results may be meaningless",
+        );
+    }
     let mut lead = 0usize;
     while lead < num.len() - 1 && num[lead].abs() <= 1e-14 {
         lead += 1;
@@ -10616,47 +10576,36 @@ pub fn normalize(b: &[f64], a: &[f64]) -> Result<(Vec<f64>, Vec<f64>), SignalErr
     Ok((num, den))
 }
 
+/// Convert transfer function (b, a) to zero-pole-gain form.
+///
+/// Matches `scipy.signal.tf2zpk(b, a)`: the coefficients go through [`normalize`] first, as
+/// SciPy's do, so leading zeros of `a` are trimmed and leading numerator coefficients within
+/// 1e-14 of zero are dropped with a `BadCoefficients` warning. The zeros and poles are then
+/// the roots of the monic polynomials, via companion-matrix eigenvalues.
 pub fn tf2zpk(b: &[f64], a: &[f64]) -> Result<ZpkCoeffs, SignalError> {
     if b.is_empty() || a.is_empty() {
         return Err(SignalError::InvalidArgument(
             "b and a must be non-empty".to_string(),
         ));
     }
-    if a[0] == 0.0 {
-        return Err(SignalError::InvalidArgument(
-            "a[0] must not be zero".to_string(),
-        ));
+    let (b, a_norm) = normalize(b, a)?;
+    let gain = b[0];
+    if gain == 0.0 {
+        // An all-zero numerator normalizes to [0]: no zeros and zero gain.
+        let (poles_re, poles_im) = if a_norm.len() > 1 {
+            poly_roots(&a_norm)?
+        } else {
+            (vec![], vec![])
+        };
+        return Ok(ZpkCoeffs {
+            zeros_re: vec![],
+            zeros_im: vec![],
+            poles_re,
+            poles_im,
+            gain: 0.0,
+        });
     }
-
-    // Find leading non-zero coefficient of b (effective degree may differ from length)
-    let b_lead_idx = match b.iter().position(|&v| v.abs() > 1e-30) {
-        Some(idx) => idx,
-        None => {
-            // All coefficients are essentially zero — zero polynomial
-            // Find poles from a but no zeros, gain = 0
-            let a_norm: Vec<f64> = a.iter().map(|&v| v / a[0]).collect();
-            let (poles_re, poles_im) = if a_norm.len() > 1 {
-                poly_roots(&a_norm)?
-            } else {
-                (vec![], vec![])
-            };
-            return Ok(ZpkCoeffs {
-                zeros_re: vec![],
-                zeros_im: vec![],
-                poles_re,
-                poles_im,
-                gain: 0.0,
-            });
-        }
-    };
-    let b_lead = b[b_lead_idx];
-
-    let gain = b_lead / a[0];
-
-    // Normalize: divide by leading non-zero coefficient
-    let b_effective = &b[b_lead_idx..];
-    let b_norm: Vec<f64> = b_effective.iter().map(|&v| v / b_lead).collect();
-    let a_norm: Vec<f64> = a.iter().map(|&v| v / a[0]).collect();
+    let b_norm: Vec<f64> = b.iter().map(|&v| v / gain).collect();
 
     // Find roots via companion matrix eigenvalues
     let (zeros_re, zeros_im) = if b_norm.len() > 1 {
@@ -28430,49 +28379,78 @@ mod tests {
         );
     }
 
-    // ── normalize_filter tests ─────────────────────────────────────
+    // ── normalize tests ────────────────────────────────────────────
 
     #[test]
-    fn normalize_filter_makes_denominator_monic() {
+    fn normalize_makes_denominator_monic() {
         // /porting-to-rust [frankenscipy-fx18c]: a[0] always 1 after
         // normalization; b scaled consistently.
-        let (b, a) = normalize_filter(&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0]).expect("normalize");
+        let (b, a) = normalize(&[1.0, 2.0, 3.0], &[2.0, 4.0, 6.0]).expect("normalize");
         assert_eq!(a[0], 1.0);
         assert_eq!(a, vec![1.0, 2.0, 3.0]);
         assert_eq!(b, vec![0.5, 1.0, 1.5]);
     }
 
     #[test]
-    fn normalize_filter_trims_leading_zeros_from_a() {
+    fn normalize_trims_leading_zeros_from_a() {
         // a = [0, 0, 2, 4, 6] trims to [2, 4, 6] then normalizes to
         // [1, 2, 3]; b is scaled by the trimmed leading 2.
-        let (b, a) = normalize_filter(&[1.0], &[0.0, 0.0, 2.0, 4.0, 6.0]).expect("normalize");
+        let (b, a) = normalize(&[1.0], &[0.0, 0.0, 2.0, 4.0, 6.0]).expect("normalize");
         assert_eq!(a, vec![1.0, 2.0, 3.0]);
         assert_eq!(b, vec![0.5]);
     }
 
     #[test]
-    fn normalize_filter_rejects_all_zero_a() {
-        assert!(normalize_filter(&[1.0], &[0.0, 0.0, 0.0]).is_err());
+    fn normalize_rejects_all_zero_a() {
+        assert!(normalize(&[1.0], &[0.0, 0.0, 0.0]).is_err());
     }
 
     #[test]
-    fn normalize_filter_rejects_empty_a() {
-        assert!(normalize_filter(&[1.0], &[]).is_err());
+    fn normalize_rejects_empty_a() {
+        assert!(normalize(&[1.0], &[]).is_err());
     }
 
     #[test]
-    fn normalize_filter_rejects_nonfinite_coefficients() {
-        // REVIEW MODE [LOW] regression for [frankenscipy-n9ply]:
-        // pre-fix the leading-zero scan `v != 0.0` returned true for
-        // NaN, so a leading NaN became the divisor and propagated
-        // NaN through the output with Ok status. Same for Inf.
-        assert!(normalize_filter(&[1.0], &[1.0, f64::NAN]).is_err());
-        assert!(normalize_filter(&[1.0], &[f64::NAN, 2.0]).is_err());
-        assert!(normalize_filter(&[1.0], &[1.0, f64::INFINITY]).is_err());
-        assert!(normalize_filter(&[1.0], &[f64::NEG_INFINITY, 1.0]).is_err());
-        assert!(normalize_filter(&[f64::NAN], &[1.0, 2.0]).is_err());
-        assert!(normalize_filter(&[f64::INFINITY], &[1.0]).is_err());
+    fn normalize_warns_bad_coefficients_where_scipy_does() {
+        // The lp2* transforms used to go through a second normalizer that neither trimmed
+        // the numerator nor warned, so lp2lp([0, 1], [1, 1], 2) returned ([0, 2], [1, 2])
+        // where SciPy returns ([2], [1, 2]) and warns.
+        let bad = |warnings: &[Warning]| {
+            warnings
+                .iter()
+                .filter(|w| w.category == WarningCategory::BadCoefficients)
+                .count()
+        };
+        let (out, warnings) = catch_warnings(|| normalize(&[1e-16, 1.0, 2.0], &[1.0, 2.0]));
+        assert_eq!(out.expect("normalize"), (vec![1.0, 2.0], vec![1.0, 2.0]));
+        assert_eq!(bad(&warnings), 1);
+        // 1e-13 is above SciPy's 1e-14 cut: kept, no warning.
+        let (out, warnings) = catch_warnings(|| normalize(&[1e-13, 1.0], &[1.0, 2.0]));
+        assert_eq!(out.expect("normalize").0, vec![1e-13, 1.0]);
+        assert!(warnings.is_empty());
+        // An all-zero numerator keeps one coefficient and still warns.
+        let (out, warnings) = catch_warnings(|| normalize(&[0.0, 0.0], &[2.0, 4.0]));
+        assert_eq!(out.expect("normalize"), (vec![0.0], vec![1.0, 2.0]));
+        assert_eq!(bad(&warnings), 1);
+        let (out, warnings) = catch_warnings(|| lp2lp(&[0.0, 1.0], &[1.0, 1.0], 2.0));
+        assert_eq!(out.expect("lp2lp"), (vec![2.0], vec![1.0, 2.0]));
+        assert_eq!(bad(&warnings), 1);
+        // tf2zpk normalizes first: SciPy finds the one zero -2 of [1e-16, 1, 2], not a
+        // spurious zero near -1e16 from the unnormalized quadratic.
+        let (zpk, warnings) = catch_warnings(|| tf2zpk(&[1e-16, 1.0, 2.0], &[1.0, 2.0, 3.0]));
+        let zpk = zpk.expect("tf2zpk");
+        assert_eq!(zpk.zeros_re.len(), 1);
+        assert!((zpk.zeros_re[0] + 2.0).abs() < 1e-12, "{zpk:?}");
+        assert_eq!(zpk.gain, 1.0);
+        assert_eq!(bad(&warnings), 1);
+        // A leading denominator zero is trimmed like SciPy's, not rejected.
+        let (zpk, warnings) = catch_warnings(|| tf2zpk(&[1.0, 2.0], &[0.0, 1.0, 2.0]));
+        let zpk = zpk.expect("tf2zpk");
+        assert_eq!(
+            (zpk.zeros_re.clone(), zpk.poles_re.clone(), zpk.gain),
+            (vec![-2.0], vec![-2.0], 1.0)
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -28753,18 +28731,18 @@ mod tests {
     }
 
     #[test]
-    fn normalize_filter_scale_invariance() {
+    fn normalize_scale_invariance() {
         // /testing-metamorphic for [frankenscipy-oi7hx]: for any non-zero
-        // k, normalize_filter(k·b, k·a) = normalize_filter(b, a). The k
+        // k, normalize(k·b, k·a) = normalize(b, a). The k
         // cancels in the division by the (post-trim) leading coefficient.
         let b: &[f64] = &[1.5, 2.0, 0.5];
         let a: &[f64] = &[3.0, 6.0, 9.0];
-        let (b_ref, a_ref) = normalize_filter(b, a).expect("baseline");
+        let (b_ref, a_ref) = normalize(b, a).expect("baseline");
 
         for &k in &[0.5_f64, 2.0, -1.0, 100.0, -0.25] {
             let b_scaled: Vec<f64> = b.iter().map(|&v| v * k).collect();
             let a_scaled: Vec<f64> = a.iter().map(|&v| v * k).collect();
-            let (b_out, a_out) = normalize_filter(&b_scaled, &a_scaled)
+            let (b_out, a_out) = normalize(&b_scaled, &a_scaled)
                 .unwrap_or_else(|e| unreachable!("scaled by k={k}: {e:?}"));
             assert_eq!(
                 b_out.len(),
@@ -28796,9 +28774,9 @@ mod tests {
     }
 
     #[test]
-    fn normalize_filter_idempotent_on_monic_input() {
+    fn normalize_idempotent_on_monic_input() {
         // Already-normalized filter stays the same.
-        let (b, a) = normalize_filter(&[0.5, 1.0, 1.5], &[1.0, 2.0, 3.0]).expect("normalize");
+        let (b, a) = normalize(&[0.5, 1.0, 1.5], &[1.0, 2.0, 3.0]).expect("normalize");
         assert_eq!(b, vec![0.5, 1.0, 1.5]);
         assert_eq!(a, vec![1.0, 2.0, 3.0]);
     }
@@ -34262,7 +34240,7 @@ mod tests {
         // should recover the original B(s)/A(s) — modulo coefficient-
         // vector zero-padding (each lp2hp call produces a result of
         // length max(b.len(), a.len()), so b can pick up leading zeros)
-        // and modulo a global scale (normalize_filter rescales so
+        // and modulo a global scale (normalize rescales so
         // a[0] = 1).
         //
         // We verify by evaluating B(s)/A(s) at multiple test points

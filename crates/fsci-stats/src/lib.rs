@@ -22615,17 +22615,42 @@ pub type Exponweib = ExponWeibull;
 // [-pi, pi] while VonMises is periodic). A name that returns another distribution's
 // numbers is worse than a missing name; real implementations are tracked separately.
 
-/// Warning emitted when input data is constant, matching `scipy.stats.ConstantInputWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConstantInputWarning(pub String);
+// SciPy's `ConstantInputWarning`, `NearConstantInputWarning` and `DegenerateDataWarning`
+// are the `WarningCategory` variants of those names. `pearsonr`, `pointbiserialr`,
+// `spearmanr` and `bootstrap` raise them under SciPy's conditions; `catch_warnings`
+// records them.
+pub use fsci_runtime::{Warning, WarningCategory, catch_warnings};
 
-/// Warning emitted when data is degenerate, matching `scipy.stats.DegenerateDataWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DegenerateDataWarning(pub String);
+const CONSTANT_INPUT_MESSAGE: &str =
+    "An input array is constant; the correlation coefficient is not defined.";
 
-/// Warning emitted when input data is nearly constant, matching `scipy.stats.NearConstantInputWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NearConstantInputWarning(pub String);
+/// SciPy's `const_x | const_y` test: an input whose elements all equal its first (so an
+/// input holding a NaN is not constant). A constant input raises `ConstantInputWarning`,
+/// and the correlation is NaN.
+fn correlation_input_is_constant(x: &[f64], y: &[f64]) -> bool {
+    let constant = |v: &[f64]| v.iter().all(|&e| e == v[0]);
+    let degenerate = constant(x) || constant(y);
+    if degenerate {
+        fsci_runtime::warn(
+            WarningCategory::ConstantInputWarning,
+            CONSTANT_INPUT_MESSAGE,
+        );
+    }
+    degenerate
+}
+
+/// SciPy's `pearsonr` near-constant test: an input whose centred norm is below
+/// `eps^0.75 * |mean|` has lost most of its digits to the subtraction of the mean.
+fn warn_if_nearly_constant(normxm: f64, xmean: f64, normym: f64, ymean: f64) {
+    let threshold = f64::EPSILON.powf(0.75);
+    if normxm < threshold * xmean.abs() || normym < threshold * ymean.abs() {
+        fsci_runtime::warn(
+            WarningCategory::NearConstantInputWarning,
+            "An input array is nearly constant; the computed correlation coefficient may be \
+             inaccurate.",
+        );
+    }
+}
 
 /// SciPy-compatible alias for continuous distribution trait object, matching `scipy.stats.rv_continuous`.
 #[allow(non_camel_case_types)]
@@ -36112,7 +36137,7 @@ fn par_two_means(x: &[f64], y: &[f64]) -> (f64, f64) {
 /// Tests for non-correlation: H0: ρ = 0 (no linear relationship).
 pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
     let n = x.len();
-    if n < 2 || n != y.len() {
+    if n < 2 || n != y.len() || correlation_input_is_constant(x, y) {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -36170,6 +36195,7 @@ pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
                 })
         };
 
+    warn_if_nearly_constant(ssxm.sqrt(), xmean, ssym.sqrt(), ymean);
     let denom = (ssxm * ssym).sqrt();
     if denom == 0.0 || denom.is_nan() || ssxym.is_nan() {
         return CorrelationResult {
@@ -36217,7 +36243,7 @@ pub fn pearsonr(x: &[f64], y: &[f64]) -> CorrelationResult {
 /// * `alternative` - "two-sided" (default), "less", or "greater"
 pub fn pearsonr_alternative(x: &[f64], y: &[f64], alternative: &str) -> CorrelationResult {
     let n = x.len();
-    if n < 2 || n != y.len() {
+    if n < 2 || n != y.len() || correlation_input_is_constant(x, y) {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -36247,6 +36273,7 @@ pub fn pearsonr_alternative(x: &[f64], y: &[f64], alternative: &str) -> Correlat
     }
     let normxm = xmax * xm.iter().map(|v| (v / xmax).powi(2)).sum::<f64>().sqrt();
     let normym = ymax * ym.iter().map(|v| (v / ymax).powi(2)).sum::<f64>().sqrt();
+    warn_if_nearly_constant(normxm, xmean, normym, ymean);
     if normxm == 0.0 || normym == 0.0 || normxm.is_nan() || normym.is_nan() {
         return CorrelationResult {
             statistic: f64::NAN,
@@ -36357,7 +36384,9 @@ fn rank_two_average(a: &[f64], b: &[f64]) -> (Vec<f64>, Vec<f64>) {
 
 pub fn spearmanr(x: &[f64], y: &[f64]) -> CorrelationResult {
     let n = x.len();
-    if n < 2 || n != y.len() {
+    // SciPy tests the raw inputs for constancy before ranking; ranks of a non-constant input
+    // are never constant, so the Pearson step below cannot warn a second time.
+    if n < 2 || n != y.len() || correlation_input_is_constant(x, y) {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -36377,7 +36406,7 @@ pub fn spearmanr(x: &[f64], y: &[f64]) -> CorrelationResult {
 /// Matches `scipy.stats.spearmanr(a, b, alternative=...)`.
 pub fn spearmanr_alternative(x: &[f64], y: &[f64], alternative: &str) -> CorrelationResult {
     let n = x.len();
-    if n < 2 || n != y.len() {
+    if n < 2 || n != y.len() || correlation_input_is_constant(x, y) {
         return CorrelationResult {
             statistic: f64::NAN,
             pvalue: f64::NAN,
@@ -52949,14 +52978,26 @@ where
         bootstrap_sorted_quantile(&ordered, alpha),
         bootstrap_sorted_quantile(&ordered, 1.0 - alpha),
     );
-    let confidence_interval = match method.method {
-        BootstrapIntervalMethod::Percentile => percentile,
-        BootstrapIntervalMethod::Basic => {
-            (2.0 * observed - percentile.1, 2.0 * observed - percentile.0)
-        }
+    // SciPy warns when the quantiles it takes of the bootstrap distribution (at the BCa-adjusted
+    // levels for BCa) come out NaN, before the basic interval reflects them about `observed`.
+    let quantiles = match method.method {
+        BootstrapIntervalMethod::Percentile | BootstrapIntervalMethod::Basic => percentile,
         BootstrapIntervalMethod::Bca => {
             bootstrap_bca_interval(data, &statistic, observed, &distribution, &ordered, alpha)
         }
+    };
+    if quantiles.0.is_nan() || quantiles.1.is_nan() {
+        fsci_runtime::warn(
+            WarningCategory::DegenerateDataWarning,
+            "The BCa confidence interval cannot be calculated. This problem is known to occur \
+             when the distribution is degenerate or the statistic is np.min.",
+        );
+    }
+    let confidence_interval = match method.method {
+        BootstrapIntervalMethod::Basic => {
+            (2.0 * observed - quantiles.1, 2.0 * observed - quantiles.0)
+        }
+        BootstrapIntervalMethod::Percentile | BootstrapIntervalMethod::Bca => quantiles,
     };
 
     Ok(BootstrapResult {
@@ -78233,6 +78274,64 @@ mod tests {
     }
 
     #[test]
+    fn correlations_raise_scipys_constant_input_warnings() {
+        let categories = |warnings: Vec<Warning>| -> Vec<WarningCategory> {
+            warnings.iter().map(|w| w.category).collect()
+        };
+        let x = [0.1, 0.1, 0.1];
+        let y = [1.0, 2.0, 3.0];
+        // 0.1 * 3 / 3 is not 0.1, so the centred values are not exactly zero; the result
+        // must still be SciPy's NaN, decided by the constancy test and not the arithmetic.
+        let named: [(&str, fn(&[f64], &[f64]) -> CorrelationResult); 4] = [
+            ("pearsonr", pearsonr),
+            ("spearmanr", spearmanr),
+            ("pointbiserialr", pointbiserialr),
+            ("pearsonr_alternative", |x, y| {
+                pearsonr_alternative(x, y, "less")
+            }),
+        ];
+        for (name, f) in named {
+            for (a, b) in [(&x[..], &y[..]), (&y[..], &x[..])] {
+                let (r, warnings) = catch_warnings(|| f(a, b));
+                assert!(r.statistic.is_nan() && r.pvalue.is_nan(), "{name}: {r:?}");
+                assert_eq!(
+                    categories(warnings),
+                    [WarningCategory::ConstantInputWarning],
+                    "{name}"
+                );
+            }
+        }
+        let (r, warnings) =
+            catch_warnings(|| spearmanr_alternative(&[2.0, 2.0], &[1.0, 3.0], "less"));
+        assert!(r.statistic.is_nan());
+        assert_eq!(
+            categories(warnings),
+            [WarningCategory::ConstantInputWarning]
+        );
+
+        // SciPy: pearsonr([1, 1+1e-15, 1, 1], [1, 2, 3, 4]) warns NearConstantInputWarning
+        // and still returns r = -0.2564945880212885.
+        let near = [1.0, 1.0 + 1e-15, 1.0, 1.0];
+        let ramp = [1.0, 2.0, 3.0, 4.0];
+        for (r, warnings) in [
+            catch_warnings(|| pearsonr(&near, &ramp)),
+            catch_warnings(|| pearsonr_alternative(&near, &ramp, "two-sided")),
+        ] {
+            assert!((r.statistic + 0.2564945880212885).abs() < 1e-12, "{r:?}");
+            assert_eq!(
+                categories(warnings),
+                [WarningCategory::NearConstantInputWarning]
+            );
+        }
+
+        // An input holding a NaN is not constant, and ordinary input warns nothing.
+        let (_, warnings) = catch_warnings(|| pearsonr(&[f64::NAN, f64::NAN, 1.0], &y));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (_, warnings) = catch_warnings(|| pearsonr(&[1.0, 3.0, 2.0], &y));
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
     fn pearsonr_length_two_pvalue_matches_scipy() {
         let positive = pearsonr(&[1.0, 2.0], &[3.0, 4.0]);
         assert_eq!(positive.statistic, 1.0);
@@ -91851,17 +91950,26 @@ mod tests {
             BootstrapIntervalMethod::Basic,
         ] {
             let method = BootstrapMethod::new(31, None, 0, interval_method).expect("valid method");
-            let result = bootstrap(&data, sample_mean, 0.95, &method).expect("bootstrap result");
+            let (result, warnings) =
+                catch_warnings(|| bootstrap(&data, sample_mean, 0.95, &method));
+            let result = result.expect("bootstrap result");
             assert_eq!(result.confidence_interval, (1.0, 1.0));
             assert_eq!(result.standard_error.to_bits(), 0.0_f64.to_bits());
+            assert!(
+                warnings.is_empty(),
+                "{interval_method:?} warned: {warnings:?}"
+            );
         }
 
         let method = BootstrapMethod::new(31, None, 0, BootstrapIntervalMethod::Bca)
             .expect("valid BCa method");
-        let result = bootstrap(&data, sample_mean, 0.95, &method).expect("bootstrap result");
+        let (result, warnings) = catch_warnings(|| bootstrap(&data, sample_mean, 0.95, &method));
+        let result = result.expect("bootstrap result");
         assert!(result.confidence_interval.0.is_nan());
         assert!(result.confidence_interval.1.is_nan());
         assert_eq!(result.standard_error.to_bits(), 0.0_f64.to_bits());
+        let categories: Vec<_> = warnings.iter().map(|w| w.category).collect();
+        assert_eq!(categories, [WarningCategory::DegenerateDataWarning]);
     }
 
     #[test]

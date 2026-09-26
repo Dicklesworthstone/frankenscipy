@@ -15,9 +15,9 @@ pub mod step_size;
 pub mod validation;
 
 pub use api::{
-    EventFn, EventSpec, OdePortfolioResult, OdeSolution, SolveIvpOptions, SolveIvpResult,
-    SolverKind, solve_ivp, solve_ivp_many, solve_ivp_with_audit, solve_ivp_with_casp,
-    solve_ivp_with_casp_portfolio,
+    EventFn, EventSpec, LsodaSolver, LsodaSolverConfig, OdePortfolioResult, OdeSolution,
+    SolveIvpOptions, SolveIvpResult, SolverKind, solve_ivp, solve_ivp_many, solve_ivp_with_audit,
+    solve_ivp_with_casp, solve_ivp_with_casp_portfolio,
 };
 pub use bdf::{BdfSolver, BdfSolverConfig};
 pub use bvp::{BvpBcJac, BvpError, BvpFunJac, BvpOptions, BvpResult, solve_bvp, solve_bvp_many};
@@ -69,9 +69,9 @@ pub type BDF = BdfSolver;
 /// SciPy-compatible alias for continuous solution output, matching `scipy.integrate.DenseOutput`.
 pub type DenseOutput = OdeSolution;
 
-/// LSODA solver representation, matching `scipy.integrate.LSODA`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LSODA;
+/// SciPy-compatible alias for the LSODA stepper, matching `scipy.integrate.LSODA` (see
+/// [`LsodaSolver`] for how it differs from ODEPACK's).
+pub type LSODA = LsodaSolver;
 
 /// Object-oriented ODE integrator interface, matching `scipy.integrate.ode`.
 #[derive(Debug)]
@@ -137,13 +137,11 @@ impl<F: FnMut(f64, &[f64]) -> Vec<f64>> Ode<F> {
 #[allow(non_camel_case_types)]
 pub type ode<F> = Ode<F>;
 
-/// Warning emitted during integration, matching `scipy.integrate.IntegrationWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IntegrationWarning(pub String);
-
-/// Warning emitted by legacy odeint, matching `scipy.integrate.ODEintWarning`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ODEintWarning(pub String);
+// SciPy's `IntegrationWarning` is `WarningCategory::IntegrationWarning`, raised by `quad` (and
+// the routines built on it) when QUADPACK stops short. SciPy's `ODEintWarning` has no
+// counterpart: where SciPy warns and returns the rows it could not compute, `odeint` returns
+// `IntegrateValidationError::IntegrationFailed`.
+pub use fsci_runtime::{Warning, WarningCategory, catch_warnings};
 
 /// Legacy `odeint`-style interface.
 ///

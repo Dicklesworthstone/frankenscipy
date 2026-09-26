@@ -622,6 +622,10 @@
   "diff_runtime_policy_evidence_ledger.rs": {},
   "diff_runtime_solver_portfolio_calibrator.rs": {},
   "diff_runtime_test_log_entry_builder.rs": {},
+  "diff_scipy_warnings_errstate.rs": {
+    "FIT_VALUE_ABS_TOL": 1e-6,
+    "VALUE_REL_TOL": 1e-9
+  },
   "diff_signal.rs": {
     "CONV_TOL": 1e-10,
     "LOMBSCARGLE_TOL": 1e-10,
