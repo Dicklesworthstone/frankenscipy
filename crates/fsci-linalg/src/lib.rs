@@ -10231,6 +10231,12 @@ pub fn expm_frechet(
     e: &[Vec<f64>],
     options: DecompOptions,
 ) -> Result<(DenseMatrix, DenseMatrix), LinalgError> {
+    // SciPy 1.17.1 raises "array must not contain infs or NaNs" for a non-finite A or E, first
+    // (asarray_chkfinite) and even with check_finite=False (its internal solve re-checks), so
+    // `options.check_finite` cannot switch this off. It used to be ignored and NaN came back
+    // as Ok(NaN).
+    validate_finite_matrix(a, options.mode, true)?;
+    validate_finite_matrix(e, options.mode, true)?;
     let (n, nc) = matrix_shape(a)?;
     if n != nc {
         return Err(LinalgError::ExpectedSquareMatrix);
@@ -10242,7 +10248,6 @@ pub fn expm_frechet(
         });
     }
 
-    let _ = options;
     let a_m = dmatrix_from_rows(a)?;
     let e_m = dmatrix_from_rows(e)?;
     let (expm_a, frechet) = expm_frechet_blocks(&a_m, &e_m);
@@ -47572,6 +47577,38 @@ mod proptest_tests {
         let x1 = solve_lyapunov(&a, &q, DecompOptions::default()).unwrap();
         let x2 = solve_continuous_lyapunov(&a, &q, DecompOptions::default()).unwrap();
         assert_eq!(x1, x2);
+    }
+
+    #[test]
+    fn expm_frechet_rejects_non_finite_input_like_scipy() {
+        // SciPy 1.17.1: expm_frechet([[1, nan], [0, 2]], I) raises "array must not contain infs
+        // or NaNs", with check_finite=False too, and so does a NaN in E. [[1, 2], [0, 3]] with
+        // E = I gives expm = [[2.71828183, 17.36725509], [0, 20.08553692]].
+        let nan_a = vec![vec![1.0, f64::NAN], vec![0.0, 2.0]];
+        let eye = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let nan_e = vec![vec![f64::NAN, 0.0], vec![0.0, 0.0]];
+        for check_finite in [true, false] {
+            let options = DecompOptions {
+                check_finite,
+                ..DecompOptions::default()
+            };
+            for (a, e) in [(&nan_a, &eye), (&eye, &nan_e)] {
+                assert!(
+                    matches!(
+                        expm_frechet(a, e, options),
+                        Err(LinalgError::NonFiniteInput)
+                    ),
+                    "check_finite={check_finite}: scipy raises"
+                );
+            }
+        }
+        let (expm, _) = expm_frechet(
+            &[vec![1.0, 2.0], vec![0.0, 3.0]],
+            &eye,
+            DecompOptions::default(),
+        )
+        .expect("finite input");
+        assert!((expm[0][1] - 17.36725509).abs() < 1e-7, "{expm:?}");
     }
 
     #[test]
