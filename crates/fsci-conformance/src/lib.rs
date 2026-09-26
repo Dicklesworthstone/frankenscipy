@@ -13810,8 +13810,24 @@ pub struct ConformanceReport {
     pub oracle_status: OracleStatus,
     /// Per-case results with max_diff and tolerance information.
     pub per_case_results: Vec<DifferentialCaseResult>,
+    /// Cases compared against SciPy output captured in THIS run. It is what makes the report
+    /// `OracleBacked`: a runner that only probes the oracle, or captures its output and then
+    /// checks the fixture's embedded values anyway, reports 0 and is a self-check whatever
+    /// `oracle_status` says (frankenscipy-olv0j.8).
+    #[serde(default)]
+    pub oracle_compared_cases: usize,
     /// Timestamp when this report was generated.
     pub generated_unix_ms: u128,
+}
+
+/// The cases of a fixture that have a captured SciPy output to be compared against.
+fn oracle_compared_count<'a, V>(
+    case_ids: impl Iterator<Item = &'a str>,
+    oracle_cases: Option<&std::collections::HashMap<&str, V>>,
+) -> usize {
+    oracle_cases.map_or(0, |cases| {
+        case_ids.filter(|id| cases.contains_key(id)).count()
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -13975,10 +13991,11 @@ impl From<&ConformanceReport> for PacketReport {
             fixture_path: Some(report.fixture_path.clone()),
             oracle_status: Some(report.oracle_status.clone()),
             differential_case_results: Some(report.per_case_results.clone()),
-            // ConformanceReport comes from the differential lane; mark as
-            // OracleBacked when the oracle_status indicates availability,
-            // otherwise SelfCheck. Per frankenscipy-fytm.
-            report_kind: if matches!(report.oracle_status, OracleStatus::Available) {
+            // OracleBacked only when this run compared cases against captured SciPy output.
+            // It used to follow `oracle_status`, so a runner that merely found SciPy installed
+            // and then checked the fixture's embedded values published a self-check as live
+            // evidence (frankenscipy-olv0j.8; the rule was frankenscipy-fytm's).
+            report_kind: if report.oracle_compared_cases > 0 {
                 ReportKind::OracleBacked
             } else {
                 ReportKind::SelfCheck
@@ -14109,14 +14126,16 @@ fn recover_sync_audit_ledger<'a>(
 ///
 /// # Oracle wiring state
 ///
-/// Step 4 currently captures Python oracle output for linalg packet
-/// helpers and for the generic differential lanes that explicitly call
-/// `capture_python_oracle_inner` (stats, array_api, constants). Other
-/// family-specific scripts may exist on disk and be routable through
-/// `default_differential_oracle_script_path(family)`, but a runner that
-/// only probes availability and then compares Rust output against the
-/// fixture's embedded expected values remains **self-checking**, not
-/// oracle-backed.
+/// A report is `OracleBacked` only when its runner compared cases against SciPy output
+/// captured in the same run (`ConformanceReport::oracle_compared_cases > 0`); otherwise it
+/// is `SelfCheck`, whatever `oracle_status` says (frankenscipy-olv0j.8).
+/// - Compare against a capture: array_api, interpolate, io, ndimage, stats, constants.
+/// - Probe availability, then compare the fixture's embedded expected values (self-checks):
+///   validate_tol, linalg, optimize, special, integrate, signal, spatial, cluster, casp, fft.
+/// - Capture, but still compare the fixture's expected values (self-check): sparse.
+///
+/// The linalg packet's live lane is `run_linalg_packet_with_oracle_capture`, not this entry
+/// point.
 pub fn run_differential_test(
     fixture_path: &Path,
     oracle_config: &DifferentialOracleConfig,
@@ -14291,6 +14310,8 @@ fn run_differential_validate_tol(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14338,6 +14359,8 @@ fn run_differential_linalg(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14435,6 +14458,10 @@ fn run_differential_array_api(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14483,6 +14510,8 @@ fn run_differential_optimize(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14583,6 +14612,10 @@ fn run_differential_interpolate(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14680,6 +14713,10 @@ fn run_differential_io(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14777,6 +14814,10 @@ fn run_differential_ndimage(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14825,6 +14866,8 @@ fn run_differential_special(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14866,6 +14909,8 @@ fn run_differential_integrate(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -14963,6 +15008,10 @@ fn run_differential_stats(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15011,6 +15060,8 @@ fn run_differential_signal(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15062,6 +15113,8 @@ fn run_differential_spatial(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15113,6 +15166,8 @@ fn run_differential_cluster(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15164,6 +15219,8 @@ fn run_differential_casp(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15214,6 +15271,8 @@ fn run_differential_fft(
         fail_count,
         oracle_status,
         per_case_results,
+        // Probes the oracle, compares against the fixture's expected values.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15683,6 +15742,10 @@ fn run_differential_constants(
         fail_count,
         oracle_status,
         per_case_results,
+        oracle_compared_cases: oracle_compared_count(
+            fixture.cases.iter().map(|case| case.case_id()),
+            oracle_cases.as_ref(),
+        ),
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -15775,6 +15838,9 @@ fn run_differential_sparse(
         fail_count,
         oracle_status,
         per_case_results,
+        // Captures SciPy's output but compares the fixture's expected values, so nothing in
+        // this report was checked against the capture.
+        oracle_compared_cases: 0,
         generated_unix_ms: now_unix_ms(),
     })
 }
@@ -24373,6 +24439,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
                 }),
                 oracle_status: OracleStatus::Available,
             }],
+            oracle_compared_cases: 1,
             generated_unix_ms: 42,
         };
 
@@ -24397,6 +24464,45 @@ Path(args.output).write_text(json.dumps(result, indent=2))
         );
         assert!(artifacts.sidecar_path.exists());
         assert!(artifacts.decode_proof_path.exists());
+        assert_eq!(parsed.report_kind, super::ReportKind::OracleBacked);
+    }
+
+    /// frankenscipy-olv0j.8: the kind follows what was compared, not whether SciPy was found.
+    #[test]
+    fn report_kind_is_oracle_backed_only_when_cases_were_compared_against_a_capture() {
+        let report =
+            |oracle_status: OracleStatus, oracle_compared_cases: usize| ConformanceReport {
+                fixture_path: "FSCI-P2C-002_linalg_core.json".to_owned(),
+                packet_id: "FSCI-P2C-002".to_owned(),
+                family: "linalg_core".to_owned(),
+                pass_count: 1,
+                fail_count: 0,
+                oracle_status,
+                per_case_results: Vec::new(),
+                oracle_compared_cases,
+                generated_unix_ms: 0,
+            };
+        // Probe-only: SciPy was found but nothing was compared with it.
+        let probed = PacketReport::from(&report(OracleStatus::Available, 0));
+        assert_eq!(probed.report_kind, super::ReportKind::SelfCheck);
+        assert_eq!(probed.oracle_status, Some(OracleStatus::Available));
+        let compared = PacketReport::from(&report(OracleStatus::Available, 3));
+        assert_eq!(compared.report_kind, super::ReportKind::OracleBacked);
+        let missing = PacketReport::from(&report(
+            OracleStatus::Missing {
+                reason: "no python".to_owned(),
+            },
+            0,
+        ));
+        assert_eq!(missing.report_kind, super::ReportKind::SelfCheck);
+        // A report written before the field existed reads as compared-nothing.
+        let mut legacy = serde_json::to_value(report(OracleStatus::Available, 5)).expect("json");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("oracle_compared_cases");
+        let legacy: ConformanceReport = serde_json::from_value(legacy).expect("legacy parses");
+        assert_eq!(legacy.oracle_compared_cases, 0);
     }
 
     #[test]
@@ -24436,6 +24542,7 @@ Path(args.output).write_text(json.dumps(result, indent=2))
                     oracle_status: OracleStatus::Available,
                 },
             ],
+            oracle_compared_cases: 2,
             generated_unix_ms: 123,
         };
 
