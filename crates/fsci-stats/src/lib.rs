@@ -5114,9 +5114,10 @@ impl Weibull {
 }
 
 /// Same-binary A/B toggle for `Weibull::fit`: when `true`, the MLE Newton loop
-/// recomputes `x.powf(c)` each iteration (powf recomputes `ln(x)`); when `false`
-/// (default) it reuses the precomputed `ln_data` as `(c·lx).exp()`, dropping one
-/// `ln` per element per iteration. Agrees to ~1e-15; the fixed point is unchanged.
+/// recomputes `(x / x_max).powf(c)` each iteration (powf recomputes `ln`); when `false`
+/// (default) it reuses the precomputed `ln_data` as `(c·(lx − ln x_max)).exp()`, dropping one
+/// `ln` per element per iteration. Both arms are anchored at the largest sample. Agrees to
+/// ~1e-15; the fixed point is unchanged.
 pub static WEIBULL_FIT_LN_REUSE_DISABLE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -5292,14 +5293,24 @@ impl ContinuousDistribution for Weibull {
         let n = data.len() as f64;
         let ln_data: Vec<f64> = data.iter().map(|&x| x.ln()).collect();
         let mean_ln: f64 = ln_data.iter().sum::<f64>() / n;
+        // Every x^c below is anchored at the largest sample, (x / x_max)^c ∈ (0, 1]: the Newton
+        // terms are ratios in which the common factor x_max^c cancels, so the iteration is the
+        // same, but a large shape can no longer overflow. Unanchored, tight data at 1e10 (MLE
+        // shape ≈ 2127) sent exp(c·ln x) to inf, the iterate to NaN, and `c.max(1e-6)` reset
+        // it, returning c ≈ 1.05 where SciPy's weibull_min.fit(floc=0) gives 2127.25.
+        let x_max = data.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let ln_max = x_max.ln();
         // powf(x,c) = exp(c·ln(x)); ln(x) is already in `ln_data`, so reuse it and
         // drop powf's internal `ln` on every element of every Newton iteration.
         let reuse = !WEIBULL_FIT_LN_REUSE_DISABLE.load(std::sync::atomic::Ordering::Relaxed);
         let pow_c = |c: f64| -> Vec<f64> {
             if reuse {
-                ln_data.iter().map(|&lx| (c * lx).exp()).collect()
+                ln_data
+                    .iter()
+                    .map(|&lx| (c * (lx - ln_max)).exp())
+                    .collect()
             } else {
-                data.iter().map(|&x| x.powf(c)).collect()
+                data.iter().map(|&x| (x / x_max).powf(c)).collect()
             }
         };
 
@@ -5326,7 +5337,8 @@ impl ContinuousDistribution for Weibull {
             c = c.max(1e-6);
         }
         let xc_sum: f64 = pow_c(c).iter().sum();
-        let scale = (xc_sum / n).powf(1.0 / c);
+        // ((1/n) Σ x^c)^{1/c} with the anchor restored: x_max · ((1/n) Σ (x/x_max)^c)^{1/c}.
+        let scale = x_max * (xc_sum / n).powf(1.0 / c);
         Self { c, scale }
     }
 
@@ -66589,6 +66601,115 @@ mod tests {
                 d.statistic
             );
         }
+    }
+
+    /// Weibull MLE (loc = 0), against the exact root of the shape equation (mpmath, 50 digits)
+    /// and SciPy 1.17.1's `weibull_min.fit(x, floc=0)`. SciPy's fit is a generic optimizer, so it
+    /// only lands within about 1e-5 of the MLE:
+    /// - tight data 1e10·(1 + 1e-3·N(0,1)), 20 points (numpy default_rng(1)): exact c =
+    ///   2127.2454068940533, scale = 10003097126.688257; SciPy c = 2127.2453338826363. Before
+    ///   the anchoring fix, exp(c·ln x) overflowed at this shape and the Newton iterate went
+    ///   NaN; `c.max(1e-6)` then reset it, and fsci returned c ≈ 1.05.
+    /// - ordinary data weibull_min.rvs(2.5, scale=3, size=30, rng 2), must not change: exact
+    ///   c = 2.827993736301038, scale = 2.871746696837021; SciPy c = 2.828020734616824.
+    ///
+    /// Both toggle arms are checked. Newton stops at |score| < 1e-10, and at c ≈ 2127 the score's
+    /// slope is ≈ −2/c², so the tight shape is only determined to ~1e-7 relative.
+    #[test]
+    fn weibull_fit_anchors_large_shapes_like_scipy() {
+        let tight = [
+            10003455841.920649,
+            10008216181.435013,
+            10003304370.761833,
+            9986968427.683956,
+            10009053558.66673,
+            10004463745.72364,
+            9994630467.646397,
+            10005811181.041964,
+            10003645723.96186,
+            10002941324.966555,
+            10000284222.413158,
+            10005467129.866123,
+            9992635459.129984,
+            9998370900.52007,
+            9995178806.873201,
+            10005988462.126347,
+            10000397221.074818,
+            9997075432.490349,
+            9992180915.376432,
+            9997428077.593811,
+        ];
+        let moderate = [
+            1.8614964687386608,
+            1.981428523692351,
+            3.694689255368862,
+            1.1770233989829517,
+            2.8972249595942814,
+            3.336064478771532,
+            1.6012447863774533,
+            0.9519906072864844,
+            1.9055309187578797,
+            3.083782652859963,
+            2.779350793208036,
+            1.4506449139033082,
+            2.390431709594365,
+            3.1239738785027744,
+            2.361135693409575,
+            3.003472194428614,
+            4.908654653395088,
+            3.1714512275850537,
+            2.2680418532802205,
+            1.5987855113806138,
+            2.1296500900769866,
+            2.624048383669289,
+            4.1260239979482165,
+            3.5227401769091666,
+            2.043496134869586,
+            4.38289485026411,
+            2.5041881540429785,
+            3.2090116636839983,
+            1.2559368828660777,
+            1.242633411354162,
+        ];
+        // This test is the only test-side writer of the toggle, and its two arms agree to
+        // ~1e-15, so a concurrent Weibull::fit elsewhere cannot observe the flip.
+        for disable in [false, true] {
+            WEIBULL_FIT_LN_REUSE_DISABLE.store(disable, std::sync::atomic::Ordering::Relaxed);
+            for (label, data, c_want, scale_want, c_scipy) in [
+                (
+                    "tight",
+                    &tight[..],
+                    2127.2454068940533,
+                    10003097126.688257,
+                    2127.2453338826363,
+                ),
+                (
+                    "moderate",
+                    &moderate[..],
+                    2.827993736301038,
+                    2.871746696837021,
+                    2.828020734616824,
+                ),
+            ] {
+                let fit = Weibull::fit(data);
+                let (c_rel, s_rel) = (
+                    (fit.c - c_want).abs() / c_want,
+                    (fit.scale - scale_want).abs() / scale_want,
+                );
+                assert!(
+                    c_rel < 1e-6 && s_rel < 1e-9,
+                    "{label} disable={disable}: c {} vs MLE {c_want}, scale {} vs {scale_want}",
+                    fit.c,
+                    fit.scale
+                );
+                assert!(
+                    (fit.c - c_scipy).abs() / c_scipy < 1e-4,
+                    "{label}: c {} vs SciPy's fit {c_scipy}",
+                    fit.c
+                );
+            }
+        }
+        WEIBULL_FIT_LN_REUSE_DISABLE.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// SciPy 1.17.1: studentized_range cdf, sf, pdf and ppf of nan (k = 3, df = 10) are nan. At
