@@ -5544,6 +5544,7 @@ pub fn svd(a: &[Vec<f64>], options: DecompOptions) -> Result<SvdResult, LinalgEr
     let (rows, cols) = matrix_shape(a)?;
     hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix(a, options.mode, options.check_finite)?;
+    reject_nan_for_svd(a)?;
 
     if rows == 0 || cols == 0 {
         return Ok(SvdResult {
@@ -5874,6 +5875,7 @@ pub fn svdvals(a: &[Vec<f64>], options: DecompOptions) -> Result<Vec<f64>, Linal
     let (rows, cols) = matrix_shape(a)?;
     hardened_dimension_check(options.mode, rows, cols)?;
     validate_finite_matrix(a, options.mode, options.check_finite)?;
+    reject_nan_for_svd(a)?;
 
     if rows == 0 || cols == 0 {
         return Ok(Vec::new());
@@ -13260,6 +13262,17 @@ fn matrix_shape(a: &[Vec<f64>]) -> Result<(usize, usize), LinalgError> {
         return Err(LinalgError::RaggedMatrix);
     }
     Ok((a.len(), cols))
+}
+
+/// SciPy 1.17.1 `svd` / `svdvals` raise "A has a NaN entry" for any NaN even with
+/// `check_finite=False` (an infinity there is not refused: `svdvals([[inf, 1], [1, 2]],
+/// check_finite=False)` returns `[nan, nan]`). Without this, a single NaN column came back as
+/// `Ok` with s = [0] from the one-column Jacobi path.
+fn reject_nan_for_svd(a: &[Vec<f64>]) -> Result<(), LinalgError> {
+    if a.iter().flatten().any(|v| v.is_nan()) {
+        return Err(LinalgError::NonFiniteInput);
+    }
+    Ok(())
 }
 
 fn validate_finite_matrix(
@@ -47577,6 +47590,33 @@ mod proptest_tests {
         let x1 = solve_lyapunov(&a, &q, DecompOptions::default()).unwrap();
         let x2 = solve_continuous_lyapunov(&a, &q, DecompOptions::default()).unwrap();
         assert_eq!(x1, x2);
+    }
+
+    #[test]
+    fn svd_rejects_nan_even_without_check_finite_like_scipy() {
+        // SciPy 1.17.1: svd / svdvals of [[nan], [1]] and [[nan, 1], [1, 2]] raise "A has a NaN
+        // entry" with check_finite=False (and "array must not contain infs or NaNs" with True).
+        // svdvals([[1, 2], [3, 4]]) = [5.464985704219043, 0.3659661906262578].
+        let unchecked = DecompOptions {
+            check_finite: false,
+            ..DecompOptions::default()
+        };
+        for a in [
+            vec![vec![f64::NAN], vec![1.0]],
+            vec![vec![f64::NAN, 1.0], vec![1.0, 2.0]],
+        ] {
+            assert!(
+                matches!(svd(&a, unchecked), Err(LinalgError::NonFiniteInput)),
+                "svd {a:?}"
+            );
+            assert!(
+                matches!(svdvals(&a, unchecked), Err(LinalgError::NonFiniteInput)),
+                "svdvals {a:?}"
+            );
+        }
+        let s = svdvals(&[vec![1.0, 2.0], vec![3.0, 4.0]], unchecked).expect("finite");
+        assert!((s[0] - 5.464985704219043).abs() < 1e-12, "{s:?}");
+        assert!((s[1] - 0.3659661906262578).abs() < 1e-12, "{s:?}");
     }
 
     #[test]
