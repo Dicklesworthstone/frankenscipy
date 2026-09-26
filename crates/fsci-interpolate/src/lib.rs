@@ -15341,9 +15341,11 @@ mod tests {
             RegularGridInterpolator::new(points.clone(), vals, method, true, None)
                 .expect("regular grid")
         };
+        // The failing dimension of an OutOfBounds error; None for any other result, which the
+        // `Some("dim …")` comparisons below then reject.
         let dim_of = |result: Result<Vec<f64>, InterpError>| match result {
             Err(InterpError::OutOfBounds { value }) => value.split(':').next().map(str::to_owned),
-            other => panic!("expected OutOfBounds, got {other:?}"),
+            _ => None,
         };
         let linear = make(RegularGridMethod::Linear, v.clone());
         assert_eq!(
